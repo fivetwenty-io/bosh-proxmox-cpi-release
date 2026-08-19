@@ -321,6 +321,21 @@ volume has already been deleted from storage does not block the destroy.
 the Director database disk. The guard runs on both the synchronous delete path
 and the fast-path (`fast_path_delete: true`) delete path.
 
+## Detached-disk ownership
+
+Detached disks are parked by default. `detached_disk_strategy` defaults to
+`parked`, which attaches a detached disk to a dedicated parker VM with
+`protection=1`, making ownership visible in the PVE UI and blocking accidental
+deletion.
+
+Setting it to `free` leaves the disk floating as an unattached volume inside its
+synthetic VMID container instead. PVE has no first-class volume object, so an
+administrator scanning for unused VMs can delete that container and destroy the
+disk.
+
+See [Persistent Disk Strategy](persistent-disk-strategy.md) for the full analysis
+and configuration details.
+
 ## Known limitations
 
 - **Snapshots require the disk to be attached.** PVE provides no per-volume snapshot primitive; `snapshot_disk` takes a VM snapshot of the host VM. Detached-disk snapshots would require a worker-VM workaround (tracked separately).
@@ -330,7 +345,5 @@ and the fast-path (`fast_path_delete: true`) delete path.
 - **`set_disk_metadata`** stashes BOSH metadata in the host VM's description (sentinel comment block). Detached disks log a warning and persist nothing.
 
 - **Shrink not supported.** PVE's resize endpoint is additive only; requesting a smaller size returns `NotSupported`. Enable `pve.resize_wait_for_convergence` to poll until the guest filesystem reports the new size after an additive resize.
-
-- **Detached disks have no PVE-side ownership protection by default.** A detached disk floats as an unattached volume inside its synthetic VMID container. PVE has no first-class volume object, so an administrator scanning for unused VMs can delete that container and destroy the disk. The opt-in `detached_disk_strategy: parked` mode attaches detached disks to a dedicated parker VM with `protection=1`, making ownership visible in the PVE UI and blocking accidental deletion. See [Persistent Disk Strategy](persistent-disk-strategy.md) for the full analysis and configuration details.
 
 Refer to [configuration.md](configuration.md) for the full property reference.

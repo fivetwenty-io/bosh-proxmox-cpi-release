@@ -28,6 +28,96 @@ var pvePushbackPhrases = []string{
 	"got timeout",
 }
 
+// WrapConfigReadError classifies a VM-config read failure for the paths that
+// scan configs to find who holds a volume: the cluster-wide holder scan, the
+// parker listing, and the holder resolve.
+//
+// It exists because those paths used to force every non-404 into a retriable
+// error, which turns a missing VM.Audit grant into a Director that re-drives a
+// detach forever against a permission only a human can add. WrapError makes the
+// real split -- except that its fallback is permanent, and these scans see
+// transient transport shapes (a cycling pveproxy, a 5xx with no APIError
+// wrapper) that must stay retriable. IsTransientTransport is the wider of the
+// two tests, so it goes first.
+func WrapConfigReadError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsTransientTransport(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE transient transport fault: "+err.Error())
+	}
+	// Any 5xx on a config read is the server failing, not a verdict about the
+	// request: a cycling pvedaemon worker answers this way and comes back within
+	// seconds. IsTransientTransport catches the wrapped shapes; this catches a
+	// bare APIError carrying only the code. The permanent 500-with-text shapes
+	// are excluded for the same reason IsTransientTransport excludes them.
+	if code, ok := apiHTTPCode(err); ok && code >= 500 && !IsVolumeFormatUnknown(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+err.Error())
+	}
+	return WrapError(err)
+}
+
+// WrapMutationError classifies a failure from a mutating parker call: an
+// attach, a detach, a protection write, a task await.
+//
+// It differs from WrapError in its default. WrapError ends with a permanent
+// wrap, which is right for a caller that can enumerate what it might see; these
+// calls cannot. PVE reports plenty of transient conditions as prose the
+// classifiers do not recognize, and a park that fails permanently on one of them
+// fails the whole detach_disk with no retry, leaving the disk free-floating --
+// the state parking exists to avoid. So the default here is retriable, and only
+// the shapes that are provably a verdict about the request stay permanent: a
+// 4xx that is not 429 (a denied grant, a malformed request), and a not-found.
+func WrapMutationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsNotFound(err) {
+		return WrapError(err)
+	}
+	// pmxcfs "Configuration file ... does not exist" arrives as a 500 with prose,
+	// so neither test above catches it -- and it is a verdict, not a wobble: the
+	// guest this call names is not there. Without this, every write against a
+	// parker somebody deleted mid-window is retried until the Director gives up.
+	if IsPmxcfsConfigMissing(err) {
+		return cpierrors.Cloud("PVE reports the guest config is gone: %s", err.Error())
+	}
+	if code, ok := apiHTTPCode(err); ok && code >= 400 && code < 500 && code != 429 {
+		return WrapError(err)
+	}
+	if IsVolumeFormatUnknown(err) {
+		return WrapError(err)
+	}
+	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE call failed: "+err.Error())
+}
+
+// apiHTTPCode extracts the HTTP status code from an SDK error, whichever
+// concrete type carries it. The SDK's ParseAPIError does not always return
+// *APIError: 403 dispatches to *PermissionError, 400 to *ParameterError, and
+// 401 to *AuthenticationError, each embedding APIError by VALUE -- so an
+// errors.As against *APIError misses exactly the codes that are a verdict
+// about the request. Every classifier that branches on a 4xx must go through
+// this, not a bare errors.As.
+func apiHTTPCode(err error) (int, bool) {
+	var apiErr *sdkerrors.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPCode, true
+	}
+	var permErr *sdkerrors.PermissionError
+	if errors.As(err, &permErr) {
+		return permErr.HTTPCode, true
+	}
+	var paramErr *sdkerrors.ParameterError
+	if errors.As(err, &paramErr) {
+		return paramErr.HTTPCode, true
+	}
+	var authErr *sdkerrors.AuthenticationError
+	if errors.As(err, &authErr) {
+		return authErr.HTTPCode, true
+	}
+	return 0, false
+}
+
 // WrapError maps an SDK or network error to the appropriate BOSH CPI error type:
 //   - nil → nil
 //   - SDK 404 (APIError.IsNotFound) → non-retriable CloudError

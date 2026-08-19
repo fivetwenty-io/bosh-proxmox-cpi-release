@@ -366,7 +366,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		logger.Debug("delete_vm: VM located", log.String("node", node))
 
 		// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
-		if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid); parkerErr != nil {
+		if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid, vmTags); parkerErr != nil {
 			return nil, parkerErr
 		} else if alreadyGone {
 			return nil, nil
@@ -514,44 +514,59 @@ func parseDeleteVMArgs(args []json.RawMessage) (string, int, error) {
 
 // refuseIfParkerVM is the belt-and-braces PVE-level backstop against deleting
 // a parker VM. The Director should never hand a parker CID to delete_vm
-// (parkers are internal CPI state); this guard catches misconfiguration or
-// operator error. Classification is presence-based: range check first (zero
-// extra API calls when not in range), then one config read to confirm the
-// bosh-parker tag only when the VMID falls in the configured range. When the
-// parker range is not configured (ParkedStrategyActive=false), it returns
-// (false, nil) with zero API calls — byte-identical behavior.
+// (parkers are internal CPI state), but `bosh delete-vm` and cloud-check's
+// "delete VM reference" both reach this handler with an operator-supplied CID.
 //
-// Returns alreadyGone=true when the VM vanished during the config read (the
-// caller should treat delete_vm as already complete).
-func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int) (alreadyGone bool, err error) {
-	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+// Classification is by tag, not by band membership. The band is a
+// configuration value and the tag is a fact about the VM: an operator who
+// opts out of parking without carrying the band forward would otherwise
+// disarm this guard over exactly the parkers their change stranded. The fast
+// path issues skiplock=true + purge=true, which bypasses protection=1 and
+// would destroy every disk that parker holds -- up to 31 of them, from
+// deployments this call has nothing to do with.
+//
+// vmTags comes from the /cluster/resources?type=vm row the handler has already
+// read to locate the VM, so the check normally costs nothing. PVE populates
+// tags on that row (cleanupAdvertisedRoutes relies on the same field), and a
+// non-empty value is authoritative. An empty one is not: it cannot distinguish
+// a genuinely untagged VM from a PVE that omits the field, so it falls back to
+// reading the config. Every parker the CPI creates is tagged, so on a
+// CPI-managed cluster that fallback never fires.
+//
+// Returns alreadyGone=true when the VM vanished during the fallback config
+// read (the caller should treat delete_vm as already complete).
+func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int, vmTags string) (alreadyGone bool, err error) {
+	if deps.Config == nil {
 		return false, nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
+	if pve.TagsMarkParker(vmTags) {
+		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 	}
-	// Range-first: only read the VM config when vmid is in the parker band.
-	if vmid < parkerCfg.VMIDRangeStart || vmid > parkerCfg.VMIDRangeEnd {
+	if strings.TrimSpace(vmTags) != "" {
+		// The row carried tags and they do not mark a parker: authoritative.
 		return false, nil
 	}
-	// Fail-closed: a transient config read error on an in-band VMID must
-	// NOT proceed. The fast path uses skiplock=true + purge=true, which
-	// bypasses protection=1 and destroys all parked disks. Any doubt →
-	// retriable so the Director retries when PVE recovers.
+	// No tags on the row. That is either a VM with no tags -- which no parker
+	// ever is, since the CPI stamps bosh-cpi and bosh-parker at creation -- or a
+	// PVE that does not populate the field, in which case the row proves
+	// nothing and the config is the only place the answer lives. Read it. The
+	// cost lands only on untagged VMs, which for a CPI-managed cluster is none,
+	// and the alternative is a band-gated fallback that goes quiet for exactly
+	// the operator who dropped the band while parkers were still standing.
+	// Fail-closed: a transient config read error must NOT proceed to a purge.
+	// Any doubt is retriable so the Director retries when PVE recovers.
 	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if cfgErr != nil {
 		if pve.IsNotFound(cfgErr) {
-			// VM gone during the read — treat as already deleted.
+			// VM gone during the read -- treat as already deleted.
 			return true, nil
 		}
 		return false, cpierrors.Retriable(
-			"delete_vm: could not read config for in-band VMID %d to verify parker status: %s (retry when PVE recovers)",
+			"delete_vm: could not read config for VMID %d to verify parker status: %s (retry when PVE recovers)",
 			vmid, cfgErr.Error())
 	}
 	tagsRaw, _ := vmCfg[jsonKeyTags].(string)
-	if pve.IsParkerVM(vmid, tagsRaw, parkerCfg) {
+	if pve.TagsMarkParker(tagsRaw) {
 		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 	}
 	return false, nil

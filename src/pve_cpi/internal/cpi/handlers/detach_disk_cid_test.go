@@ -27,6 +27,9 @@ func detachDepsWithNodes(qemuSvc qemu.Service, nodesSvc nodes.Service) handlers.
 		Config: &config.CPIConfig{
 			Node:         testNode,
 			VMDiskFormat: "qcow2",
+			// Sentinel-removal tests care about the CID bookkeeping, not the
+			// parker lifecycle, so opt out of the parked default.
+			DetachedDiskStrategy: "free",
 		},
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc, nodesSvc: nodesSvc},
 		Agent:  &mockAgentService{},

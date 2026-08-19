@@ -108,13 +108,12 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Unpark disk (parked strategy only).
+		// 3. Resolve the volume's current holder, then unpark or refuse.
 		//
-		// When parked strategy is active, the disk may be held on a parker VM's
-		// scsi slot. Unpark it cluster-wide before snapshot guard and slot
-		// selection so subsequent PVE calls see the disk as a free-floating
-		// volume. Not-parked → fast nil (no API calls beyond IsDiskParked
-		// cluster scan). Unpark failure → retriable error; the disk remains
+		// One cluster scan answers both questions this handler has to settle
+		// before it writes a volid into a VM config: a parker holder must be
+		// unparked first, and any other holder means the volume is already
+		// attached elsewhere. Unpark failure → retriable error; the disk remains
 		// parked and the next BOSH retry will re-attempt here.
 		//
 		// Co-location check (local backend) is unaffected: UnparkDisk performs
@@ -122,7 +121,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// nodes, so the disk node established by attachDiskResolveNode remains
 		// valid.
 		// --------------------------------------------------------------------
-		if err := unparkBeforeAttach(ctx, deps, diskCID, bareDiskCID); err != nil {
+		if err := guardAndUnparkBeforeAttach(ctx, deps, diskCID, bareDiskCID, vmid); err != nil {
 			return nil, err
 		}
 
@@ -658,23 +657,65 @@ func devicePathByID(diskID string) (string, error) {
 	return fmt.Sprintf("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi%d", idx), nil
 }
 
-// unparkBeforeAttach detaches the disk from its parker VM when the parked
-// strategy is active. A no-op when strategy is unset (zero extra API calls).
-// Unpark failure returns a retriable error; the disk stays parked and the
-// next BOSH retry will re-attempt here.
-func unparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
-	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+// guardAndUnparkBeforeAttach settles who currently holds the volume, then acts:
+// a parker holder is unparked, the target VM itself is left alone (the attach
+// that follows is idempotent), and any other VM is a hard stop.
+//
+// The holder scan is unconditional, unlike the unpark it gates. PVE will happily
+// let two VM configs reference one volume; nothing downstream detects it, and
+// the damage only surfaces when whichever holder is destroyed takes the volume
+// out from under the other. The parked strategy makes that state reachable
+// without anyone doing anything wrong — an operator who sets
+// detached_disk_strategy to "free" while disks are still parked leaves the
+// parker holding volumes no unpark probe will ever look for, and the same is
+// true of a release rolled back to one that has no concept of parking. A single
+// cluster scan per attach_disk is a cheap price for turning silent volume loss
+// into a message naming the VM to look at.
+//
+// The scan cost is one ListResources plus a config read per VM, and only the
+// opted-out configuration pays it as new work: under the parked strategy the
+// unpark probe was already paying for the same scan.
+func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID string, targetVMID int) error {
+	if deps.Config == nil {
 		return nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
+	parkerCfg := parkerReadConfigFor(deps)
+	holder, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
+	if err != nil {
+		return wrapHolderScanError(err, fmt.Sprintf("attach_disk: resolve current holder of disk %s", diskCID))
 	}
-	if unErr := pve.UnparkDisk(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg); unErr != nil {
-		return cpierrors.Retriable("attach_disk: unpark disk %s failed: %s", diskCID, unErr.Error())
+
+	if holder.Found && !holder.IsParker && holder.VMID != targetVMID {
+		return foreignHolderError(deps, diskCID, targetVMID, holder)
+	}
+
+	// UnparkDiskAt reuses the holder just resolved, so the parked path still
+	// costs one cluster scan rather than the two a plain UnparkDisk would.
+	if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, holder, parkerCfg); unErr != nil {
+		// Keep the class the unpark chose. Most of what it returns is transport
+		// shaped and retriable, but two of its outcomes are not: a permission
+		// the operator has to grant, and a detach that succeeded while leaving
+		// an unusedN reference behind. Flattening those into a retriable makes
+		// the Director drive the first forever, and drive the second straight
+		// into attaching a volume the parker still references.
+		return retriableUnlessPermanent(unErr, fmt.Sprintf("attach_disk: unpark disk %s", diskCID))
 	}
 	return nil
+}
+
+// foreignHolderError builds the refusal for a volume already attached to a VM
+// other than the target, separating the two cases an operator handles
+// differently: a parker stranded outside the configured band by a strategy or
+// band change, and a genuine second attachment.
+func foreignHolderError(deps Deps, diskCID string, targetVMID int, holder pve.DiskHolder) error {
+	if strandedErr := strandedParkerRefusal(deps, "attach_disk", diskCID, holder); strandedErr != nil {
+		return strandedErr
+	}
+	return cpierrors.Cloud(
+		"attach_disk: disk %s is already attached to VM %d (node %s) and cannot be attached to VM %d as well; "+
+			"attaching one volume to two VMs corrupts it. Detach it from VM %d first",
+		diskCID, holder.VMID, holder.Node, targetVMID, holder.VMID,
+	)
 }
 
 // nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is

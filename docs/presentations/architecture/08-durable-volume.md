@@ -94,11 +94,11 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Free["Free-floating — default"]
+    subgraph Free["Free-floating — opt-in"]
         F1["Bare unattached volume"]
         F2["No native signal it is a BOSH disk;<br/>an admin or GC script may delete it"]
     end
-    subgraph Parked["Parked — opt-in"]
+    subgraph Parked["Parked — default"]
         P1["Hung in a never-started parker VM"]
         P2["Deletion-protected, provenance recorded,<br/>visibly owned"]
     end
@@ -110,11 +110,11 @@ flowchart TB
 
 <!--
 - Tension: the detached window is where a disk is most exposed — a bare unattached volume has no PVE-native signal it belongs to BOSH; an admin or GC script can delete it.
-- Default will be free (cheap: 1 API op per detach). Opt-in parked will attach the disk to a never-started parker VM with protection=1, onboot=0 — visible ownership in the PVE UI.
+- Parked will be the default: the disk will attach to a never-started parker VM with protection=1, onboot=0 — visible ownership in the PVE UI. Free (cheap: 1 API op per detach) will be the opt-out.
 - We propose ruling out a native volume-tag/ownership approach — an open decision: PVE has no volume metadata, tag, or ownership API, so the parker VM is the only durable carrier of protection.
 - Parkers will be node-scoped — local disks will park on their own node, so locality is honored even at rest.
 - Capacity: 31 scsiN slots per parker (scsi0–scsi30); when one fills, we will pack the next disk into the lowest parker with a free slot before creating another, so the band fills densely.
-- Cost of parked: 3–5 API calls per detach vs 1 for free — that's the tradeoff, not free safety.
+- Cost of parked: roughly 4–7 API calls per detach vs 1 for free, plus a cluster-wide holder scan (one config read per VM) that both strategies pay before an attach or a delete — that's the tradeoff, not free safety. We will pay it by default because the failure it prevents is unrecoverable.
 -->
 
 ---

@@ -181,26 +181,32 @@ func coerceTagMap(v any) map[string]string {
 // volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
 // to prevent false matches on diskCIDs that are substrings of other volids.
 //
-// When the parked-disk strategy is active (ParkedStrategyActive), VMs
-// classified as parker VMs via pve.IsParkerVM are silently skipped. The
-// classification uses the vmid and tags fields already present in the
-// cluster-resources item — no additional API calls are made. A disk parked on
-// a parker VM produces 0 matches, which flows into the existing warn+nil path
+// VMs carrying the bosh-parker tag are silently skipped. A disk parked on a
+// parker VM produces 0 matches, which flows into the existing warn+nil path
 // ("disk not attached; metadata not persisted"). This is correct: metadata
 // for a parked disk is irrelevant until the disk is attached to a real VM.
 //
-// The IsParkerVM call is guarded by ParkedStrategyActive so that zero-range
-// configs (VMIDRangeStart=0, VMIDRangeEnd=0) never classify any VM as a
-// parker — IsParkerVM with a zero range would pass the range check for all
-// VMIDs ≥ 0, making the tag check the only discriminator, which is unsafe.
+// The tag is tested twice and costs no extra API call either time. First on the
+// cluster-resources item, which the scan already has. Then on the VM config,
+// which the scan reads for every VM anyway: an empty tags field on the item
+// cannot tell an untagged VM from a PVE that does not populate the field, and
+// deciding on it alone would treat a parker as an ordinary holder.
+//
+// Classification is by the bosh-parker tag alone, with no band test. A band
+// test can only narrow this one, and it narrows it in the wrong place: an
+// operator who dropped the parker band while parkers still stood would have
+// this treat one as an ordinary holder and merge deployment metadata into its
+// description, which is where the provenance record for every disk it holds
+// lives.
 //
 // Transport errors from ListResources propagate as wrapped retriable errors.
 // Per-VM Config errors are skipped only when they are not-found (the VM was
 // deleted concurrently or its config is gone); any other Config error is
-// returned as TypeRetriableCloud so a transient fault mid-scan cannot produce
-// a false 0-match (silent metadata loss) or a false 1-match (masked
-// multi-attach). The scan never short-circuits on the first match: visiting
-// every VM is what makes ambiguity detection possible.
+// classified by pve.WrapConfigReadError, so a transient fault mid-scan is
+// retriable -- it must not produce a false 0-match (silent metadata loss) or a
+// false 1-match (masked multi-attach) -- while a denied VM.Audit grant stays
+// permanent and names itself. The scan never short-circuits on the first match:
+// visiting every VM is what makes ambiguity detection possible.
 func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
 	typeStr := "vm"
 	var resources *sdkcluster.ListResourcesResponse
@@ -218,16 +224,6 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")
 	}
 
-	// Build ParkerConfig once for the scan. Only used when ParkedStrategyActive.
-	parkerActive := deps.Config != nil && deps.Config.ParkedStrategyActive()
-	var parkerCfg pve.ParkerConfig
-	if parkerActive {
-		parkerCfg = pve.ParkerConfig{
-			VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-			VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-			DirectorID:     deps.RequestDirectorUUID,
-		}
-	}
 
 	type resourceEntry struct {
 		VMID int64  `json:"vmid"`
@@ -255,9 +251,15 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 
 		// Skip parker VMs: a parked disk on a parker VM should not be treated
 		// as "attached to a real VM". Uses only data from the cluster-resources
-		// item — no extra API calls. Gated on ParkedStrategyActive to prevent
-		// false positives when the parker range is unconfigured (zero range).
-		if parkerActive && pve.IsParkerVM(vmid, entry.Tags, parkerCfg) {
+		// item — no extra API calls.
+		//
+		// The tag alone decides. IsParkerVM is the tag test AND a band test, so
+		// it can only ever be a subset of this one, and the band half goes quiet
+		// exactly when it matters: an operator who dropped the band while
+		// parkers still stood would otherwise have this merge deployment
+		// metadata into a parker's description — the field carrying the
+		// provenance sentinel for every disk it holds.
+		if pve.TagsMarkParker(entry.Tags) {
 			continue
 		}
 
@@ -267,8 +269,19 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 				// VM deleted concurrently or config gone: cannot host the disk.
 				continue
 			}
-			return nil, cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("set_disk_metadata: transient Config error for vm %d on node %s", vmid, vmNode))
+			return nil, cpierrors.Wrap(pve.WrapConfigReadError(cfgErr),
+				fmt.Sprintf("set_disk_metadata: Config error for vm %d on node %s", vmid, vmNode))
+		}
+
+		// Second parker test, on the config just read. An empty tags field on
+		// the cluster-resources row proves nothing -- it cannot tell an untagged
+		// VM from a PVE that does not populate the field -- and treating a
+		// parker as a real holder here writes deployment metadata into the
+		// description that carries its provenance sentinel. delete_vm makes the
+		// same fallback for the same reason; here the config is already in hand,
+		// so it costs nothing.
+		if cfgTags, _ := cfg["tags"].(string); pve.TagsMarkParker(cfgTags) {
+			continue
 		}
 
 		// Use exact volid matching with option-string tolerance: a config value of

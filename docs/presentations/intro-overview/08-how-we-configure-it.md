@@ -71,9 +71,9 @@ flowchart LR
 
 ## Defaults that protect, defaults that sleep
 
-- **Protective, on:** template cloning · placement scoring · duplicate-IP scan · ballooning *off*
-- **Sleeping, off:** telemetry, hooks, HA features, parked disks, perf tuning…
-- **Additive upgrades:** unchanged manifest ⇒ unchanged behavior — every switch arrives off
+- **Protective, on:** template cloning · placement scoring · duplicate-IP scan · parked disks · ballooning *off*
+- **Sleeping, off:** telemetry, hooks, HA features, perf tuning…
+- **Additive upgrades:** every switch arrives off; a default we conclude was wrong changes only with a changelog argument
 
 <!--
 - Ballooning off is the counterintuitive one worth saying aloud: BOSH sizes machines deterministically; a hypervisor quietly reclaiming memory produces OOM kills that masquerade as application bugs.

@@ -6045,12 +6045,14 @@ func TestPlacementFallbackMax_OmitWhenNil(t *testing.T) {
 // detached_disk_strategy + parked VMID range
 // --------------------------------------------------------------------------
 
-// TestDetachedDiskStrategy_DefaultFree confirms empty/unset strategy resolves to "free",
-// DetachedDiskParkedEnabled returns false, and ParkedStrategyActive returns false.
-func TestDetachedDiskStrategy_DefaultFree(t *testing.T) {
+// TestDetachedDiskStrategy_DefaultParked confirms empty/unset strategy resolves
+// to "parked", DetachedDiskParkedEnabled and ParkedStrategyActive return true,
+// and ApplyDefaults fills the parker band. A nil receiver stays inert (free) so
+// no parker code path fires without a loaded config.
+func TestDetachedDiskStrategy_DefaultParked(t *testing.T) {
 	t.Parallel()
 
-	// nil receiver: safe defaults.
+	// nil receiver: inert, never parked.
 	var nilCfg *config.CPIConfig
 	if nilCfg.DetachedDiskStrategyValue() != "free" {
 		t.Error("nil receiver: DetachedDiskStrategyValue() should be free")
@@ -6070,25 +6072,26 @@ func TestDetachedDiskStrategy_DefaultFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := cfg.DetachedDiskStrategyValue(); got != "free" {
-		t.Errorf("DetachedDiskStrategyValue() = %q, want free", got)
+	if got := cfg.DetachedDiskStrategyValue(); got != "parked" {
+		t.Errorf("DetachedDiskStrategyValue() = %q, want parked", got)
 	}
-	if cfg.DetachedDiskParkedEnabled() {
-		t.Error("DetachedDiskParkedEnabled() should be false when strategy unset")
+	if !cfg.DetachedDiskParkedEnabled() {
+		t.Error("DetachedDiskParkedEnabled() should be true when strategy unset (parked default)")
 	}
-	if cfg.ParkedStrategyActive() {
-		t.Error("ParkedStrategyActive() should be false when strategy unset and ranges zero")
+	if !cfg.ParkedStrategyActive() {
+		t.Error("ParkedStrategyActive() should be true when strategy unset (parked default)")
 	}
-	// Parker defaults must NOT be filled when strategy != parked.
-	if cfg.ParkedDiskVMIDRangeStartValue() != 0 {
-		t.Errorf("ParkedDiskVMIDRangeStartValue() = %d, want 0 (no fill when not parked)", cfg.ParkedDiskVMIDRangeStartValue())
+	// Parker band defaults are filled by the parked default.
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("ParkedDiskVMIDRangeStartValue() = %d, want 90000", got)
 	}
-	if cfg.ParkedDiskVMIDRangeEndValue() != 0 {
-		t.Errorf("ParkedDiskVMIDRangeEndValue() = %d, want 0 (no fill when not parked)", cfg.ParkedDiskVMIDRangeEndValue())
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 90999 {
+		t.Errorf("ParkedDiskVMIDRangeEndValue() = %d, want 90999", got)
 	}
 }
 
-// TestDetachedDiskStrategy_ExplicitFreeIsNormalized confirms explicit "free" normalizes.
+// TestDetachedDiskStrategy_ExplicitFreeIsNormalized confirms explicit "free" (the
+// opt-out) normalizes and disables the parked strategy.
 func TestDetachedDiskStrategy_ExplicitFreeIsNormalized(t *testing.T) {
 	t.Parallel()
 	for _, v := range []string{"free", "FREE", " Free "} {
@@ -6102,9 +6105,10 @@ func TestDetachedDiskStrategy_ExplicitFreeIsNormalized(t *testing.T) {
 	}
 }
 
-// TestDetachedDiskStrategy_ParkedOptIn confirms strategy="parked" enables parked mode
-// and ApplyDefaults fills 90000/90999 when both range fields are zero.
-func TestDetachedDiskStrategy_ParkedOptIn(t *testing.T) {
+// TestDetachedDiskStrategy_ParkedExplicit confirms an explicit strategy="parked"
+// enables parked mode and ApplyDefaults fills 90000/90999 when both range fields
+// are zero, exactly as the unset default does.
+func TestDetachedDiskStrategy_ParkedExplicit(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -6288,26 +6292,27 @@ func TestParkedRange_OverlapWithVMBand(t *testing.T) {
 	assertCloudError(t, cfg.Validate(), "parker VMID range")
 }
 
-// TestParkedRange_RangeOnlySetNoStrategyParkedStrategyActive confirms that setting
-// only the VMID range (without strategy="parked") makes ParkedStrategyActive true
-// but does NOT trigger ApplyDefaults default fill (fields were explicitly set).
-func TestParkedRange_RangeOnlySetNoStrategy(t *testing.T) {
+// TestParkedRange_RangeOnlySetUnderFree confirms that setting only the VMID range
+// while opting out with strategy="free" keeps ParkedStrategyActive true (so
+// unpark probes still run for disks parked earlier) without enabling parking,
+// and does NOT trigger the ApplyDefaults fill (fields were explicitly set).
+func TestParkedRange_RangeOnlySetUnderFree(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"free",
 		"parked_disk_vmid_range_start":90000,
 		"parked_disk_vmid_range_end":90999
 	}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Strategy defaults to "free" when not set.
 	if got := cfg.DetachedDiskStrategyValue(); got != "free" {
 		t.Errorf("DetachedDiskStrategyValue() = %q, want free", got)
 	}
 	if cfg.DetachedDiskParkedEnabled() {
-		t.Error("DetachedDiskParkedEnabled() should be false when strategy unset")
+		t.Error("DetachedDiskParkedEnabled() should be false under strategy=free")
 	}
 	// Range-only: ParkedStrategyActive must be true.
 	if !cfg.ParkedStrategyActive() {
@@ -6330,26 +6335,530 @@ func TestParkedRange_ParkedStrategyActiveVariants(t *testing.T) {
 	if !(&config.CPIConfig{DetachedDiskStrategy: "parked"}).ParkedStrategyActive() {
 		t.Error("strategy=parked alone: ParkedStrategyActive() should be true")
 	}
-	// start-only (non-zero raw field, no strategy).
-	if !(&config.CPIConfig{ParkedDiskVMIDRangeStart: 90000}).ParkedStrategyActive() {
-		t.Error("start-only: ParkedStrategyActive() should be true")
+	// unset strategy alone: the parked default applies.
+	if !(&config.CPIConfig{}).ParkedStrategyActive() {
+		t.Error("unset strategy: ParkedStrategyActive() should be true (parked default)")
 	}
-	// end-only (non-zero raw field, no strategy).
-	if !(&config.CPIConfig{ParkedDiskVMIDRangeEnd: 90999}).ParkedStrategyActive() {
-		t.Error("end-only: ParkedStrategyActive() should be true")
+	// start-only, opted out of parking (non-zero raw field).
+	if !(&config.CPIConfig{DetachedDiskStrategy: "free", ParkedDiskVMIDRangeStart: 90000}).ParkedStrategyActive() {
+		t.Error("start-only under free: ParkedStrategyActive() should be true")
 	}
-	// never opted in: all zero.
-	if (&config.CPIConfig{}).ParkedStrategyActive() {
-		t.Error("no strategy, no range: ParkedStrategyActive() should be false")
+	// end-only, opted out of parking (non-zero raw field).
+	if !(&config.CPIConfig{DetachedDiskStrategy: "free", ParkedDiskVMIDRangeEnd: 90999}).ParkedStrategyActive() {
+		t.Error("end-only under free: ParkedStrategyActive() should be true")
+	}
+	// fully opted out: strategy=free and no explicit band.
+	if (&config.CPIConfig{DetachedDiskStrategy: "free"}).ParkedStrategyActive() {
+		t.Error("strategy=free, no range: ParkedStrategyActive() should be false")
+	}
+}
+
+// TestValidate_ParkerBandOverlap_UnderDefaultStrategy pins the upgrade guard: a
+// config that never mentions the strategy and whose VM range swallows
+// 90000-90999 still loads. Failing it would take an existing deployment down at
+// the first CPI call after upgrade, since the binary is exec'd per request and
+// nothing surfaces the error at deploy time.
+func TestValidate_ParkerBandOverlap_UnderDefaultStrategy(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_start":89000,
+		"vmid_range_end":91000
+	}`)
+	if err != nil {
+		t.Fatalf("a defaulted strategy must stand down rather than fail the load: %v", err)
+	}
+	if cfg.DetachedDiskStrategyValue() != config.DetachedDiskStrategyFree {
+		t.Errorf("strategy should have stood down to free, got %q", cfg.DetachedDiskStrategyValue())
+	}
+	if cfg.ParkedStrategyActive() {
+		t.Error("a stood-down config must leave every parker gate inert")
+	}
+	if cfg.ParkedDiskVMIDRangeStart != 0 || cfg.ParkedDiskVMIDRangeEnd != 0 {
+		t.Errorf("no band should be filled on stand-down, got [%d,%d]",
+			cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd)
+	}
+}
+
+// TestValidate_ParkerBandOverlap_ExplicitParkedStillFails confirms the stand-down
+// is scoped to the defaulted strategy. An operator who asks for parking by name
+// against a colliding VM range gets the hard error, because there the collision
+// is between two things they configured.
+func TestValidate_ParkerBandOverlap_ExplicitParkedStillFails(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"parked",
+		"vmid_range_start":89000,
+		"vmid_range_end":91000
+	}`)
+	if err == nil {
+		t.Fatal("expected a validation error when parking is requested into an occupied band")
+	}
+	assertCloudError(t, err, "parker VMID range")
+}
+
+// TestValidate_ParkerBandOverlap_ExplicitBandStandsItsGround confirms a
+// configured band is honored even when the strategy is defaulted: the operator
+// named the band, so a collision with it is a real misconfiguration to report.
+func TestValidate_ParkerBandOverlap_ExplicitBandStandsItsGround(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"parked_disk_vmid_range_start":89500,
+		"parked_disk_vmid_range_end":89600,
+		"vmid_range_start":89000,
+		"vmid_range_end":91000
+	}`)
+	if err == nil {
+		t.Fatal("expected a validation error for an explicit band inside the VM range")
+	}
+	assertCloudError(t, err, "parker VMID range")
+}
+
+// TestValidate_ParkerDefault_NoCollision_StaysParked guards the guard: a config
+// with a widened VM range that stops short of the parker band keeps the new
+// default, so the stand-down cannot quietly disable parking for everyone.
+func TestValidate_ParkerDefault_NoCollision_StaysParked(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_start":100,
+		"vmid_range_end":8999
+	}`)
+	if err != nil {
+		t.Fatalf("a non-colliding config must load: %v", err)
+	}
+	if !cfg.DetachedDiskParkedEnabled() {
+		t.Error("parked must remain the default when the built-in band fits")
+	}
+	if cfg.ParkedDiskVMIDRangeStart != 90000 || cfg.ParkedDiskVMIDRangeEnd != 90999 {
+		t.Errorf("expected the built-in band, got [%d,%d]",
+			cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd)
+	}
+}
+
+// TestParkedBand_HalfZeroedOverride_FallsBackPerBound covers the cpi-config
+// entry that moves one bound and leaves the other at the 0 the job spec
+// documents. The pair-wise fallback used to skip such a config entirely,
+// handing pve.ParkDisk the band [0,90499] and failing every request against
+// that entry permanently.
+func TestParkedBand_HalfZeroedOverride_FallsBackPerBound(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	// ApplyContextOverrides validates without re-running ApplyDefaults, which is
+	// the path where one zeroed bound reaches Validate unaccompanied.
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parked_disk_vmid_range_start": 0,
+		"pve_parked_disk_vmid_range_end":   90499,
+	})
+	if ovErr != nil {
+		t.Fatalf("a half-zeroed band override must not fail the request: %v", ovErr)
+	}
+	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("start should fall back to the built-in bound, got %d", got)
+	}
+	if got := eff.ParkedDiskVMIDRangeEndValue(); got != 90499 {
+		t.Errorf("end should keep the operator value, got %d", got)
+	}
+}
+
+// TestParkedDefault_OverrideWidensBand_StandsDown covers the cpi-config entry
+// that widens vmid_range over the built-in parker band. ApplyDefaults saw no
+// collision against the job-level bands, so the parked default is on; the
+// entry creates the overlap afterwards. Failing validation there would break
+// every request routed to that cluster, so the defaulted strategy stands down
+// exactly as it does at load time.
+func TestParkedDefault_OverrideWidensBand_StandsDown(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	if !base.DetachedDiskParkedEnabled() {
+		t.Fatal("precondition: the job-level config must be parked")
+	}
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_vmid_range_start": 40000,
+		"pve_vmid_range_end":   200000,
+	})
+	if ovErr != nil {
+		t.Fatalf("a widened vmid_range must not fail every request: %v", ovErr)
+	}
+	if eff.DetachedDiskParkedEnabled() {
+		t.Error("parked must stand down when the entry's bands swallow [90000,90999]")
+	}
+	if got := eff.ParkedDefaultStoodDown(); got == "" {
+		t.Error("the stand-down must record the colliding band for the operator")
+	}
+	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 0 {
+		t.Errorf("a stood-down band must read back as unset, got %d", got)
+	}
+}
+
+// TestParkedDefault_EntryOptsOutWithWideBands_Loads is the cpi-config entry the
+// multi-cluster manifest recommends: a cluster whose VMID layout has no room for
+// a parker band opts out with "free". Its own bands swallow 90000-90999, and
+// because the CPI is exec'd per request, rejecting that entry would be a
+// permanent outage for that cluster rather than an authoring error. Nothing
+// creates a parker under "free", so there is no allocation to collide.
+func TestParkedDefault_EntryOptsOutWithWideBands_Loads(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_detached_disk_strategy": "free",
+		"pve_vmid_range_start":       40000,
+		"pve_vmid_range_end":         200000,
+	})
+	if ovErr != nil {
+		t.Fatalf("an opted-out entry with wide bands must not fail every request: %v", ovErr)
+	}
+	if eff.DetachedDiskParkedEnabled() {
+		t.Error("the entry asked for free")
+	}
+	if !eff.ParkedStrategyActive() {
+		t.Error("the inherited band must keep the unpark probes running for disks parked earlier")
+	}
+}
+
+// TestParkedDefault_EntryRendersZeroBand_StandsDown covers the director that
+// renders an entry's full pve.* property set, including the 0 the job spec
+// documents as the default for both parker bounds. A rendered 0 says what an
+// absent key says, so it must not disarm the upgrade stand-down.
+func TestParkedDefault_EntryRendersZeroBand_StandsDown(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parked_disk_vmid_range_start": 0,
+		"pve_parked_disk_vmid_range_end":   0,
+		"pve_vmid_range_start":             40000,
+		"pve_vmid_range_end":               200000,
+	})
+	if ovErr != nil {
+		t.Fatalf("a rendered zero band must not fail every request: %v", ovErr)
+	}
+	if eff.DetachedDiskParkedEnabled() {
+		t.Error("the parked default must stand down against a band that swallows [90000,90999]")
+	}
+	if eff.ParkedDefaultStoodDown() == "" {
+		t.Error("the stand-down must record the colliding band")
+	}
+}
+
+// TestParkedDefault_EntryMovesOneBound_KeepsItsOwnBand confirms an entry that
+// names one bound gets that bound plus the built-in fallback for the other,
+// rather than inheriting a bound ApplyDefaults filled in for the job-level
+// config.
+// TestParkedDefault_EntryMovesOneBound_DoesNotInheritDerivedPartner covers the
+// job-level config that names one bound and lets ApplyDefaults derive the other,
+// then an entry that names its own start. The derived partner must not survive
+// into the entry: inheriting it would give the entry a band 42,000 VMIDs wide
+// that nobody described, and parkers would be allocated across all of it. The
+// entry gets the same-width partner its own bound implies.
+func TestParkedDefault_EntryMovesOneBound_DoesNotInheritDerivedPartner(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"parked_disk_vmid_range_start":91000
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	if got := base.ParkedDiskVMIDRangeEndValue(); got != 91999 {
+		t.Fatalf("precondition: the job-level end is derived at the same width, got %d", got)
+	}
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parked_disk_vmid_range_start": 50000,
+	})
+	if ovErr != nil {
+		t.Fatalf("an entry naming one bound must not fail the request: %v", ovErr)
+	}
+	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 50000 {
+		t.Errorf("start should be the entry value, got %d", got)
+	}
+	if got := eff.ParkedDiskVMIDRangeEndValue(); got != 50999 {
+		t.Errorf("end should be derived at the same width from the entry bound, got %d", got)
+	}
+}
+
+// TestParkedDefault_StoodDownAtLoad_EntryWithRoomParksAgain covers the
+// job-level config whose bands collide, standing the default down, and the entry
+// that narrows those bands back. The stand-down is a decision about a set of
+// bands, not a property of the deployment, so an entry that leaves 90000-90999
+// free gets the default it would have had on its own.
+func TestParkedDefault_StoodDownAtLoad_EntryWithRoomParksAgain(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"vmid_range_start":40000,"vmid_range_end":95000
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load (the stand-down keeps it loadable): %v", err)
+	}
+	if base.DetachedDiskParkedEnabled() {
+		t.Fatal("precondition: the job-level config must have stood the default down")
+	}
+	eff, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_vmid_range_end": 50000,
+	})
+	if ovErr != nil {
+		t.Fatalf("unexpected error: %v", ovErr)
+	}
+	if !eff.DetachedDiskParkedEnabled() {
+		t.Error("an entry whose bands leave the parker band free must get the parked default")
+	}
+	if eff.ParkedDefaultStoodDown() != "" {
+		t.Errorf("the stale collision must be cleared, got %q", eff.ParkedDefaultStoodDown())
+	}
+	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("the band must be filled for that entry, got %d", got)
+	}
+}
+
+// TestParkedExplicit_OverrideWidensBand_StillFails is the other half: an entry
+// that names "parked" itself asked for the thing that collides, so it gets the
+// hard error rather than a silent stand-down.
+func TestParkedExplicit_OverrideWidensBand_StillFails(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"parked"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	_, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_vmid_range_start": 40000,
+		"pve_vmid_range_end":   200000,
+	})
+	if ovErr == nil {
+		t.Fatal("an explicitly parked entry must fail on a colliding band")
+	}
+	if !strings.Contains(ovErr.Error(), "parker VMID range") {
+		t.Errorf("error must name the parker band overlap; got %v", ovErr)
+	}
+}
+
+// TestParkedBand_HalfZeroedUnderFree_FallsBackPerBound covers the opt-out that
+// keeps a band so the unpark probes keep draining disks parked earlier, and
+// moves one bound while leaving the other at the 0 the job spec documents. The
+// band is read-only under free -- no parker is ever created there -- so the
+// per-bound fallback applies exactly as it does under parked, rather than
+// failing the load over a bound nobody meaningfully set.
+func TestParkedBand_HalfZeroedUnderFree_FallsBackPerBound(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"free",
+		"parked_disk_vmid_range_end":90499
+	}`)
+	if err != nil {
+		t.Fatalf("a half-set band under free must not fail the load: %v", err)
+	}
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("start should fall back to the built-in bound, got %d", got)
+	}
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 90499 {
+		t.Errorf("end should keep the operator value, got %d", got)
+	}
+	if !cfg.ParkedStrategyActive() {
+		t.Error("an explicit band under free must keep the unpark probes running")
+	}
+	if cfg.DetachedDiskParkedEnabled() {
+		t.Error("the opt-out must still be an opt-out")
+	}
+}
+
+// TestParkedBand_SingleBoundOutsideBuiltIn_DerivesWidth covers the operator who
+// moves the band somewhere else entirely and names one bound. The built-in
+// partner bound would either invert the pair or open a window tens of thousands
+// of VMIDs wide that nothing validates, so the missing bound is derived from
+// the one they named, at the same width as the built-in band.
+func TestParkedBand_SingleBoundOutsideBuiltIn_DerivesWidth(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		json       string
+		start, end int
+	}{
+		{
+			name:  "low start, no end",
+			json:  `"parked_disk_vmid_range_start":50000`,
+			start: 50000, end: 50999,
+		},
+		{
+			name:  "start above the built-in band",
+			json:  `"parked_disk_vmid_range_start":91000`,
+			start: 91000, end: 91999,
+		},
+		{
+			name:  "end below the built-in band",
+			json:  `"parked_disk_vmid_range_end":89000`,
+			start: 88001, end: 89000,
+		},
+		{
+			name:  "end inside the built-in band keeps the built-in start",
+			json:  `"parked_disk_vmid_range_end":90499`,
+			start: 90000, end: 90499,
+		},
+		{
+			name:  "start inside the built-in band keeps the built-in end",
+			json:  `"parked_disk_vmid_range_start":90500`,
+			start: 90500, end: 90999,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := mustLoad(t, `{
+				"host":"h","user":"u","password":"p",
+				"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+				`+tc.json+`
+			}`)
+			if err != nil {
+				t.Fatalf("config must load: %v", err)
+			}
+			if got := cfg.ParkedDiskVMIDRangeStartValue(); got != tc.start {
+				t.Errorf("start = %d, want %d", got, tc.start)
+			}
+			if got := cfg.ParkedDiskVMIDRangeEndValue(); got != tc.end {
+				t.Errorf("end = %d, want %d", got, tc.end)
+			}
+		})
+	}
+}
+
+// TestParkedBand_NoBandUnderFree_StaysInert confirms the fallback does not
+// resurrect a band for the deployment that opted out and set none: parker code
+// must stay entirely inert there.
+func TestParkedBand_NoBandUnderFree_StaysInert(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"free"
+	}`)
+	if err != nil {
+		t.Fatalf("config must load: %v", err)
+	}
+	if cfg.ParkedStrategyActive() {
+		t.Error("free with no band must leave every parker gate inert")
+	}
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 0 {
+		t.Errorf("start must stay 0, got %d", got)
+	}
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 0 {
+		t.Errorf("end must stay 0, got %d", got)
+	}
+}
+
+// TestContextOverride_DetachedDiskStrategy confirms a cpi-config entry can opt
+// its own cluster out of parking. Without the key the entry-level value was
+// dropped into the unknown-keys warning while every detach kept parking.
+func TestContextOverride_DetachedDiskStrategy(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	eff, applied, unknown, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_detached_disk_strategy": "free",
+	})
+	if ovErr != nil {
+		t.Fatalf("entry-level opt-out must apply: %v", ovErr)
+	}
+	if len(unknown) != 0 {
+		t.Errorf("the key must be recognized, got unknown=%v", unknown)
+	}
+	if len(applied) != 1 || applied[0] != "pve_detached_disk_strategy" {
+		t.Errorf("expected the key in applied, got %v", applied)
+	}
+	if eff.DetachedDiskParkedEnabled() {
+		t.Error("the entry must be opted out of parking")
+	}
+	// The band the base config defaulted stays set, which is what keeps the
+	// unpark probes running for disks parked before the opt-out.
+	if !eff.ParkedStrategyActive() {
+		t.Error("an inherited band must keep the unpark probes running after opt-out")
+	}
+}
+
+// TestContextOverride_DetachedDiskStrategy_Invalid confirms enum validation is
+// not skipped on the override path.
+func TestContextOverride_DetachedDiskStrategy_Invalid(t *testing.T) {
+	t.Parallel()
+	base, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br"
+	}`)
+	if err != nil {
+		t.Fatalf("base config must load: %v", err)
+	}
+	if _, _, _, ovErr := config.ApplyContextOverrides(base, map[string]any{
+		"pve_detached_disk_strategy": "parkd",
+	}); ovErr == nil {
+		t.Fatal("expected a validation error for an unknown strategy value")
+	}
+}
+
+// TestValidate_ParkerBandOverlapIgnored_UnderFree confirms the same config
+// loads once the operator opts out of parking: with strategy=free and no
+// explicit band, there is no parker band to collide with.
+func TestValidate_ParkerBandOverlapIgnored_UnderFree(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"h","user":"u","password":"p",
+		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
+		"detached_disk_strategy":"free",
+		"vmid_range_start":89000,
+		"vmid_range_end":91000
+	}`)
+	if err != nil {
+		t.Fatalf("strategy=free must not validate a parker band: %v", err)
+	}
+	if cfg.ParkedStrategyActive() {
+		t.Error("ParkedStrategyActive() should be false under free with no explicit band")
 	}
 }
 
 // TestParkedRange_DefaultsNotFilledWhenFree confirms ApplyDefaults never fills
-// range fields when strategy != parked, preserving byte-identical output.
+// range fields when the operator opts out with strategy=free.
 func TestParkedRange_DefaultsNotFilledWhenFree(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "s"
+	cfg.DetachedDiskStrategy = "free"
 	cfg.ApplyDefaults()
 
 	if cfg.ParkedDiskVMIDRangeStart != 0 {

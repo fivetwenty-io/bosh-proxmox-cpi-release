@@ -238,7 +238,9 @@ func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 		return nil, cpierrors.Wrap(WrapError(err), "vmid: list cluster resources")
 	}
 	if resp == nil {
-		return nil, cpierrors.Cloud("vmid: nil response from cluster resources")
+		// Retriable: a pvedaemon coming back up answers with an empty body, and
+		// this listing gates every VMID allocation, parkers included.
+		return nil, cpierrors.Retriable("vmid: nil response from cluster resources")
 	}
 
 	used := make(map[int]struct{}, len(*resp))
@@ -446,7 +448,13 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 		return inner
 	})
 	if err != nil {
-		return nil, cpierrors.Wrap(err, fmt.Sprintf("vmid: list storage %q content on node %q", storage, node))
+		// WrapError first, as the cluster listing above and the create below both
+		// do: RetryOnTransient hands back the raw SDK error, and cpierrors.Wrap
+		// of an untyped error is permanent. A storage plugin that times out past
+		// the retry budget would then fail a park -- and with it a detach_disk --
+		// for good, rather than being re-driven.
+		return nil, cpierrors.Wrap(WrapError(err),
+			fmt.Sprintf("vmid: list storage %q content on node %q", storage, node))
 	}
 	used := make(map[int]struct{})
 	if resp == nil {

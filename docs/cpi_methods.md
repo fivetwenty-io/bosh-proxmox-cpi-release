@@ -208,13 +208,24 @@ Every VM is also created with `serial0=socket`, adding a virtual serial console.
 
 Both paths protect persistent disks before destroying the VM. `detachForeignActiveDisks` detects disks whose volume ID belongs to a different VMID (foreign disks), detaches them from the VM config, and preserves them. Destroy is blocked (fail-closed, retriable) if a detach cannot be confirmed. `guardUnusedVolumes` then checks the `unusedN` slots and refuses to proceed if a persistent volume cannot be confirmed absent from storage. If the VM does not exist, the call returns success.
 
+**Parker refusal:** A VM tagged `bosh-parker` is refused before either destroy
+path runs. The Director never hands a parker CID to `delete_vm`, but `bosh
+delete-vm` and cloud-check's "delete VM reference" both reach this handler with
+an operator-supplied CID, and the fast path issues `skiplock=true` with
+`purge=true`, which bypasses `protection=1` and would destroy every disk that
+parker holds. The tag is read from the cluster-resources row the handler already
+scans to locate the VM, so the guard is band-independent and costs no extra API
+call.
+
 **Ephemeral disk retention:** When the VM carries the `bosh-retain-ephemeral` tag (set by `cloud_properties.retain_ephemeral_on_delete: true` at `create_vm` time), `delete_vm` unlinks the ephemeral disk slot from the VM config without freeing storage, then proceeds to destroy the VM. The ephemeral volume survives and is logged at WARN level for operator recovery. Without this tag, the ephemeral disk is destroyed with the VM.
 
 ```mermaid
 flowchart TD
     A([delete_vm called]) --> B{VM found?}
     B -- No --> Z([return success])
-    B -- Yes --> C{fast_path_delete\nenabled?}
+    B -- Yes --> PK{Tagged\nbosh-parker?}
+    PK -- Yes --> PKE([CloudError\nrefuse])
+    PK -- No --> C{fast_path_delete\nenabled?}
     C -- Yes --> FP[fastPathDeleteVM]
     C -- No --> SP[stopVMBeforeDelete]
     FP --> D[detachForeignActiveDisks]
@@ -345,7 +356,9 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 **Notes:** The disk must be detached before deletion. The Director calls `detach_disk` first.
 
-**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, detached disks are held on dedicated parker VMs (VMID range 90000–90999 by default) rather than left free-floating. When `delete_disk` is called, the CPI first unparks the disk from its parker VM before deleting the volume. Unpark failure returns a retriable error; the disk remains safely on the parker VM and the next Director retry re-attempts the unpark. When the strategy is not active, `delete_disk` proceeds directly to volume deletion with no extra API calls.
+**Parked disk strategy:** Under `pve.detached_disk_strategy: parked` (the default), detached disks are held on dedicated parker VMs (VMID range 90000–90999 by default) rather than left free-floating. `delete_disk` resolves the volume's holder before deleting, using the same single cluster scan `attach_disk` uses, and unparks the disk from its parker VM first. Unpark failure is returned with the class the unpark chose, and the disk remains safely on the parker VM either way. Most failures are retriable, so the next Director retry re-attempts the unpark. Two are permanent, because no number of retries improves them and each names the command that repairs it: a denied PVE grant, and a reference the CPI could not sweep out of the parker's `unusedN` keys.
+
+The scan runs regardless of the strategy, and a holder that carries the `bosh-parker` tag while sitting outside the configured band is refused rather than deleted. That combination means the band was moved or unset while disks were still parked, and freeing the volume would leave the parker's slot referencing storage that no longer exists. The message names the property to set.
 
 ---
 
@@ -388,7 +401,15 @@ The disk CID is an envelope (`pvd-`, or `pvz-` when compression is on) that may 
 
 **Notes:** Attaches the disk to the VM's PVE config with a synchronous config PUT — PVE returns no UPID for this call, so there is no task to await. Returns the device path assigned to the disk. This is a v2 change: v1 returned void and updated the registry instead. A snapshot pre-flight guard runs first: if the VM has snapshots, attach is rejected with an actionable error, because a disk attached after a snapshot is invisible to that snapshot on rollback. Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
-**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, `attach_disk` runs an unpark step before the snapshot guard and slot selection. The CPI detaches the disk from its parker VM, making the volume free-floating so the normal attach path can proceed. Unpark failure returns a retriable error; the disk remains safely parked and the Director retries. When the strategy is not active, no extra API calls are made.
+**Holder resolution:** Before the snapshot guard and slot selection, `attach_disk` resolves which VM currently references the volume, using one cluster scan. What it finds decides what happens next.
+
+- The target VM itself, or nothing at all: the attach proceeds. Attaching a volume the target already holds is idempotent.
+
+- A parker VM inside the configured band: the CPI detaches the disk from its parker so the normal attach path sees a free-floating volume. Unpark failure keeps the class the unpark chose and the disk remains safely parked. Most failures are retriable and the Director retries; a denied PVE grant and a reference the CPI could not sweep out of the parker's `unusedN` keys are permanent, and each names the command that repairs it.
+
+- Any other VM: the call is refused, naming the holding VM and its node. PVE permits two VM configs referencing one volume, nothing downstream detects it, and the volume is destroyed when either holder is. If the holder carries the `bosh-parker` tag but sits outside the configured band, the message says so and names the property to set, since that is the signature of a parker band that was moved or unset while disks were still parked.
+
+The scan runs regardless of the strategy. Opting out with `free` is exactly the configuration that can leave disks stranded on a parker no unpark probe will look for, so it is the configuration that most needs the refusal.
 
 ---
 
@@ -407,7 +428,7 @@ The disk CID is an envelope (`pvd-`, or `pvz-` when compression is on) that may 
 
 **Notes:** Removes the disk from the VM's PVE config with a synchronous config PUT (`{delete: <slot>}`) — PVE returns no UPID for this call, so there is no task to await. The Director notifies the agent of the detach directly; the CPI makes no additional calls afterward. A snapshot pre-flight guard runs first: if the VM has snapshots that reference the disk, detach is rejected with an actionable error naming the blocking snapshots (PVE would otherwise reject it with a raw message). Set `pve.allow_disk_ops_with_snapshots` to bypass. See [Snapshot guard on disk operations](#snapshot-guard-on-disk-operations).
 
-**Parked disk strategy:** When `pve.detached_disk_strategy: parked` is configured, `detach_disk` parks the disk on a dedicated parker VM after the physical detach completes. A park failure returns a retriable error; the disk remains free-floating and the Director retries. On retry, if the disk is already parked, the handler returns success without making further API calls (idempotent). If the disk arrives at `detach_disk` already in the detached state (a retry scenario), the CPI checks whether it is already parked and re-parks it if not. Parker VMs use VMIDs in the range configured by `pve.parked_disk_vmid_range_start` and `pve.parked_disk_vmid_range_end` (default 90000–90999). See [persistent-disks.md](persistent-disks.md) for the full parked disk lifecycle.
+**Parked disk strategy:** Under `pve.detached_disk_strategy: parked` (the default), `detach_disk` parks the disk on a dedicated parker VM after the physical detach completes. A park failure returns a retriable error; the disk remains free-floating and the Director retries. On retry, if the disk is already parked, the handler returns success without making further API calls (idempotent). If the disk arrives at `detach_disk` already in the detached state (a retry scenario), the CPI checks whether it is already parked and re-parks it if not. Parker VMs use VMIDs in the range configured by `pve.parked_disk_vmid_range_start` and `pve.parked_disk_vmid_range_end` (default 90000–90999). See [persistent-disks.md](persistent-disks.md) for the full parked disk lifecycle.
 
 ---
 
@@ -448,6 +469,13 @@ The CPI locates the VM via a cluster scan (`FindVMNodeViaCluster`) before fetchi
 
 The disk must be attached to exactly one VM at call time. Calling `snapshot_disk` on an unattached disk returns a `CloudError`.
 
+A holder carrying the `bosh-parker` tag is refused, whatever the configured
+parker band says. A PVE snapshot takes the whole VM, so snapshotting a parker
+would entangle every disk it holds, from every deployment that parked one there.
+The classification is by tag rather than by band so a parker stranded by a
+strategy or band change is still recognized, and the tag comes from the holder
+scan the call already performs.
+
 Only the `description` key from the metadata hash is forwarded to PVE as the snapshot description; all other keys are ignored. The snapshot and its underlying task are retried on transient transport errors and storage lock timeouts via `RetryOnTransientOrLock`.
 
 ```mermaid
@@ -456,7 +484,9 @@ flowchart LR
     B --> C[FindVMByDiskVolid\ncluster scan]
     C --> D{Disk attached\nto a VM?}
     D -- No --> E([CloudError])
-    D -- Yes --> F[generateSnapName\nbosh-timestamp-hex4]
+    D -- Yes --> P{Holder tagged\nbosh-parker?}
+    P -- Yes --> E
+    P -- No --> F[generateSnapName\nbosh-timestamp-hex4]
     F --> G[RetryOnTransientOrLock\nQEMU.Snapshot vmid]
     G --> H[AwaitTask UPID]
     H --> I([return snapshot_cid\nvmid:snap_name])

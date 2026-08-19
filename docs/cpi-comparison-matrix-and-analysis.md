@@ -222,7 +222,7 @@ report)** were recommendations in the previous roadmap that have since shipped.
   race across Director workers (`internal/pve/cluster_lock.go`) — the on-premises
   analogue of Azure's `flock` and vSphere's custom-field distributed mutex.
 
-- **Opt-in parked detached-disk strategy (new).** Detached disks can be held in parker
+- **Parked detached-disk strategy, on by default (new).** Detached disks are held in parker
   VMs (VMID range 90000–90999) with `protection=1` and a full-volid provenance sentinel,
   rather than freed back to bare storage. Slot assignment uses dense fill to minimise parker
   VM count (`internal/pve/parker.go`).

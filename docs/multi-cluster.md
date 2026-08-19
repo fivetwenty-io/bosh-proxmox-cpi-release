@@ -145,9 +145,13 @@ Because of this, **disjoint VMID banding across CPI entries sharing storage is n
 | VM | `vmid_range_start` / `vmid_range_end` |
 | Persistent disk | `disk_vmid_range_start` / `disk_vmid_range_end` |
 | Stemcell template cache | `stemcell_template_vmid_range_start` / `stemcell_template_vmid_range_end` |
-| Parker VM (only when `detached_disk_strategy: parked`) | `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` |
+| Parker VM (in play unless the CPI job sets `detached_disk_strategy: free`, since `parked` is the default) | `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` |
 
 The repository's `manifests/envs/lab/vmid-range.yml` is the existing single-cluster precedent for this pattern (reserving 100–199 for hand-managed bastions); apply the same idea per CPI entry when clusters share storage, as in the worked example above.
+
+The parker band deserves particular attention after the strategy default became `parked`: an entry that names no parker band inherits the same `90000`–`90999` default as its siblings, so two entries sharing storage will allocate parker VMs from one band. Both parker range keys are per-entry overridable, so give each entry its own slice as the example above does. `detached_disk_strategy` is overridable per entry as well, which is how we turn parking off for one cluster whose VMID topology has no room for a parker band while the rest of the deployment keeps it.
+
+Parker VMs carry a `director--<uuid>` tag naming the director that created them, and a park adopts only parkers that are unattributed or attributed to the director making the call. Two directors sharing one PVE cluster therefore keep separate parkers rather than filling each other's. A call that has no director UUID to hand adopts any parker, since it has no basis on which to prefer one.
 
 The CPI validates that its own four bands are mutually disjoint *within one config*. It cannot validate a second, independent cpi-config entry's bands against the first — there is no in-process visibility into a sibling CPI's configuration. Banding across entries is an operator convention this document exists to make explicit, not something the CPI can enforce for you.
 

@@ -103,6 +103,10 @@ func detachDeps(qemuSvc qemu.Service) handlers.Deps {
 		Config: &config.CPIConfig{
 			Node:         testNode,
 			VMDiskFormat: "qcow2",
+			// Opt out of the parked default so these tests exercise the
+			// free-floating detach path only; parker behavior has its own
+			// helpers (detachDepsParked*) below.
+			DetachedDiskStrategy: "free",
 		},
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
 		Agent:  &mockAgentService{}, // detach_disk does not call UpdateDiskHints
@@ -403,6 +407,7 @@ func detachDepsWithCfg(qemuSvc qemu.Service, allow, require bool) handlers.Deps 
 			VMDiskFormat:              "qcow2",
 			AllowDiskOpsWithSnapshots: allow,
 			RequireSnapshotCheckPass:  require,
+			DetachedDiskStrategy:      "free", // snapshot-guard tests: no parker path
 		},
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
 		Agent:  &mockAgentService{},
@@ -976,14 +981,14 @@ func detachDepsParkedWithDiskStorage(qemuSvc qemu.Service, clusterSvc cluster.Se
 	}
 }
 
-// detachDepsStrategyFree builds Deps with no strategy set (byte-identical behavior
-// expected: zero parker calls).
+// detachDepsStrategyFree builds Deps with the strategy explicitly opted out of
+// parking (expected: zero parker calls).
 func detachDepsStrategyFree(qemuSvc qemu.Service) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:         testNode,
-			VMDiskFormat: "qcow2",
-			// DetachedDiskStrategy deliberately not set → free path.
+			Node:                 testNode,
+			VMDiskFormat:         "qcow2",
+			DetachedDiskStrategy: "free",
 		},
 		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
 		Agent:  &mockAgentService{},
@@ -1053,6 +1058,67 @@ func TestHandleDetachDisk_ParkedStrategy_DetachAndPark(t *testing.T) {
 	}
 }
 
+// TestHandleDetachDisk_DefaultStrategy_ParksDisk is the same happy path with
+// pve.detached_disk_strategy left unset, which is how nearly every deployment
+// runs: the empty value resolves to "parked" and ApplyDefaults fills the
+// 90000-90999 parker band, so the disk must be parked without the operator
+// naming a strategy anywhere.
+func TestHandleDetachDisk_DefaultStrategy_ParksDisk(t *testing.T) {
+	t.Parallel()
+	const (
+		vmCID       = "100"
+		parkedVolid = "local-lvm:vm-9001-disk-0"
+	)
+
+	var attachedVolid, attachedSlot string
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      100,
+		parkerVMIDStart: 90000,
+		sourceCfg:       map[string]any{diskSlot: parkedVolid},
+		parkerCfg:       map[string]any{"tags": "bosh-parker"},
+		attachDiskFn: func(_ context.Context, _ string, _ int, vol, _ string, opts *qemu.AttachOpts) (string, error) {
+			attachedVolid = vol
+			if opts != nil {
+				attachedSlot = opts.DiskID
+			}
+			return "", nil
+		},
+	}
+
+	// Deps built from a defaulted config: no DetachedDiskStrategy, no parker
+	// band, exactly what a manifest that never mentions either produces once
+	// config.Load has run ApplyDefaults.
+	cfg := &config.CPIConfig{Node: testNode, VMDiskFormat: "qcow2"}
+	cfg.ApplyDefaults()
+	if !cfg.DetachedDiskParkedEnabled() {
+		t.Fatal("unset strategy must resolve to parked")
+	}
+	deps := handlers.Deps{
+		Config: cfg,
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			tasksSvc:   &mockTasksService{},
+			clusterSvc: parkerEmptyClusterSvc(),
+		},
+		Agent:  &mockAgentService{},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDetachDisk(deps)
+	if _, err := h.Handle(context.Background(), detachArgs(t, vmCID, parkedVolid), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !qemuSvc.detachCalled {
+		t.Error("DetachDisk must be called on source VM")
+	}
+	if attachedVolid != parkedVolid {
+		t.Errorf("park attach volid: want %q, got %q", parkedVolid, attachedVolid)
+	}
+	if attachedSlot != "scsi0" {
+		t.Errorf("park attach slot: want scsi0, got %q", attachedSlot)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Parker park-fail → retriable
 // ---------------------------------------------------------------------------
@@ -1093,6 +1159,44 @@ func TestHandleDetachDisk_ParkedStrategy_ParkFail_Retriable(t *testing.T) {
 	}
 	if !cpiErr.OkToRetry() {
 		t.Errorf("park-fail error must be retriable; OkToRetry()=false")
+	}
+}
+
+// TestHandleDetachDisk_ParkedStrategy_ParkDenied_Permanent is the other half of
+// the park-failure contract. A denied grant is not a transient fault: the
+// Director cannot fix it by re-driving, and a retriable label buries the one
+// message that says which privilege to add. The class the park chose has to
+// survive the handler's wrap.
+func TestHandleDetachDisk_ParkedStrategy_ParkDenied_Permanent(t *testing.T) {
+	t.Parallel()
+	const (
+		vmCID       = "100"
+		parkedVolid = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      100,
+		parkerVMIDStart: 90000,
+		sourceCfg:       map[string]any{diskSlot: parkedVolid},
+		parkerCfg:       map[string]any{"tags": "bosh-parker"},
+		attachDiskFn: func(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
+			return "", &sdkerrors.APIError{HTTPCode: 403, Message: "Permission check failed (/vms/90000, VM.Config.Disk)"}
+		},
+	}
+	clusterSvc := parkerEmptyClusterSvc()
+
+	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
+
+	_, err := h.Handle(context.Background(), detachArgs(t, vmCID, parkedVolid), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected an error when ParkDisk is denied")
+	}
+	cpiErr, ok := err.(interface{ OkToRetry() bool })
+	if !ok {
+		t.Fatalf("error must implement OkToRetry; got %T", err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Errorf("a denied park must be permanent; OkToRetry()=true, err=%v", err)
 	}
 }
 
@@ -1294,13 +1398,57 @@ func TestHandleDetachDisk_ParkedStrategy_RealVMHolder_NoPark(t *testing.T) {
 	}
 }
 
+// TestHandleDetachDisk_RealVMHolder_OneClusterSweep pins the cost of the
+// already-detached path. "Is it parked?" and "does a real VM hold it?" are two
+// readings of one holder, and the sweep that resolves it reads the config of
+// every VM in the cluster. Asking twice doubled the most expensive call in the
+// detach path on every stale-Director retry.
+func TestHandleDetachDisk_RealVMHolder_OneClusterSweep(t *testing.T) {
+	t.Parallel()
+	const (
+		sourceVMID  = 100
+		realVMID    = 200
+		parkedVolid = "local-lvm:vm-9001-disk-0"
+	)
+
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      sourceVMID,
+		parkerVMIDStart: 90000,
+		sourceCfg:       map[string]any{"scsi0": testDiskCID},
+		realHolderVMID:  realVMID,
+		realHolderCfg:   map[string]any{"scsi1": parkedVolid},
+		parkerCfg:       map[string]any{},
+	}
+	sweeps := 0
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			sweeps++
+			sourceRaw, _ := json.Marshal(map[string]any{"vmid": sourceVMID, "node": testNode, "type": "qemu"})
+			realRaw, _ := json.Marshal(map[string]any{"vmid": realVMID, "node": testNode, "type": "qemu"})
+			resp := cluster.ListResourcesResponse{sourceRaw, realRaw}
+			return &resp, nil
+		},
+	}
+
+	h := handlers.HandleDetachDisk(detachDepsParked(qemuSvc, clusterSvc))
+	if _, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{}); err != nil {
+		t.Fatalf("expected idempotent success; got: %v", err)
+	}
+	// Two sweeps total: one locates the source VM's node, one resolves the
+	// disk's holder. The holder sweep used to run twice -- once for the parked
+	// check, once for the real-VM check -- against the same unchanged answer.
+	if sweeps != 2 {
+		t.Errorf("already-detached path must resolve the holder with a single sweep (2 total); got %d", sweeps)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Strategy-free: zero parker calls
 // ---------------------------------------------------------------------------
 
-// TestHandleDetachDisk_StrategyFree_NoParkerCalls verifies that when
-// detached_disk_strategy is unset (default free path), HandleDetachDisk follows
-// byte-identical control flow and makes zero parker/cluster API calls.
+// TestHandleDetachDisk_StrategyFree_NoParkerCalls verifies that an operator who
+// opts out with detached_disk_strategy=free and configures no parker band gets
+// the pre-parking control flow exactly: zero parker and cluster API calls.
 // The mock panics on AttachDisk, Create, and ListResources to enforce this.
 func TestHandleDetachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	t.Parallel()

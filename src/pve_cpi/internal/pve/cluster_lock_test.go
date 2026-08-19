@@ -173,6 +173,14 @@ func TestAcquireClusterLock_HeldLiveOwnerTimesOutRetriable(t *testing.T) {
 	if !strings.Contains(strings.ToLower(err.Error()), "timed out") {
 		t.Errorf("error should mention timeout; got %v", err)
 	}
+	// The sentinel is the contract withParkerProtectionLock branches on: a
+	// timeout means a live holder was inside the window throughout, so the
+	// caller must NOT proceed unserialized the way it does for every other
+	// acquire failure. A timeout that stops carrying it silently reopens the
+	// unlocked-window path under contention.
+	if !errors.Is(err, ErrClusterLockTimeout) {
+		t.Errorf("timeout error must carry ErrClusterLockTimeout; got %v", err)
+	}
 }
 
 func TestAcquireClusterLock_HeldExpiredOwnerSteals(t *testing.T) {
@@ -430,5 +438,84 @@ func TestDefaultLockClock_SleepReturnsContextErrOnCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled; got %v", err)
+	}
+}
+
+// TestRelease_ExpiredClaimUnreadableComment_LeavesSentinel covers the one
+// branch where Release must NOT fall through to the delete: the comment read
+// failed AND this handle's own claim has lapsed. A lapsed claim is one a later
+// acquirer is entitled to steal, so the sentinel standing there is more likely
+// theirs -- deleting it would let a third caller in while they are mid-window.
+func TestRelease_ExpiredClaimUnreadableComment_LeavesSentinel(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("stealer", time.Unix(9000, 0))
+	f.getFn = func(string) (string, bool, error, bool) {
+		return "", false, fmt.Errorf("transport down"), true
+	}
+	now := time.Unix(2000, 0)
+	h := &ClusterLockHandle{
+		pool:   "bosh-lock-web",
+		owner:  "me",
+		pools:  f,
+		expiry: time.Unix(1000, 0), // lapsed relative to now
+		now:    func() time.Time { return now },
+	}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if f.deleteN != 0 {
+		t.Errorf("expired handle with unreadable comment must not delete the sentinel; deletes=%d", f.deleteN)
+	}
+	if !h.released {
+		t.Error("handle should latch released: its own claim is gone either way")
+	}
+	if _, ok := f.pools["bosh-lock-web"]; !ok {
+		t.Error("the (probable stealer's) sentinel must survive")
+	}
+}
+
+// TestRelease_LiveClaimUnreadableComment_StillDeletes pins the other half of
+// the same branch: while this handle's claim is live, an unreadable comment
+// falls through to the delete, since leaving the pool behind would block every
+// acquire until the TTL lapses.
+func TestRelease_LiveClaimUnreadableComment_StillDeletes(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("me", time.Unix(9000, 0))
+	f.getFn = func(string) (string, bool, error, bool) {
+		return "", false, fmt.Errorf("transport down"), true
+	}
+	now := time.Unix(2000, 0)
+	h := &ClusterLockHandle{
+		pool:   "bosh-lock-web",
+		owner:  "me",
+		pools:  f,
+		expiry: time.Unix(3000, 0), // still live
+		now:    func() time.Time { return now },
+	}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if f.deleteN != 1 {
+		t.Errorf("live handle must fall through to the delete; deletes=%d", f.deleteN)
+	}
+}
+
+// TestRelease_CommentNamesAnotherOwner_LeavesSentinel: a readable comment that
+// names somebody else is proof the lock was stolen; ours is already gone.
+func TestRelease_CommentNamesAnotherOwner_LeavesSentinel(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("stealer", time.Unix(9000, 0))
+	h := &ClusterLockHandle{pool: "bosh-lock-web", owner: "me", pools: f}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if f.deleteN != 0 {
+		t.Errorf("stolen lock must not be deleted by the old owner; deletes=%d", f.deleteN)
+	}
+	if !h.released {
+		t.Error("handle should latch released")
 	}
 }

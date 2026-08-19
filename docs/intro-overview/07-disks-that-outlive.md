@@ -4,7 +4,7 @@
 
 BOSH's most important promise is the one from Chapter 3: data survives compute. Kill a VM, recreate it, move it — the persistent disk comes back attached and intact. Every real cloud backs that promise with a first-class volume object carrying its own identity, metadata, and ownership. Proxmox has none of that. A volume's entire identity is a string like `nfs-disks:vm-9003-disk-0`, with no metadata API, no tags, and no record of who made it or whether deleting it is safe. The CPI has to invent the durable volume out of almost nothing.
 
-*The idea this chapter rests on: when the platform lacks the object our abstraction needs, build it from the durable carriers that do exist — an identifier BOSH never loses, a numbered namespace everyone can read, and, when we opt in, a guardian machine whose only job is to say "this is ours."*
+*The idea this chapter rests on: when the platform lacks the object our abstraction needs, build it from the durable carriers that do exist — an identifier BOSH never loses, a numbered namespace everyone can read, and, by default, a guardian machine whose only job is to say "this is ours."*
 
 ## The identifier that carries its own paperwork
 
@@ -22,22 +22,22 @@ The second carrier is one we already know: the disk's synthetic VMID from the 90
 
 ## The detach window, and the coat-check
 
-A disk's most dangerous hours are the ones between machines — detached from an old VM, not yet attached to its replacement. By default, such a disk floats as a bare unattached volume. BOSH knows exactly what it is; the Director's records and the ID envelope keep it safe from *BOSH*. But a Proxmox administrator browsing storage sees only an anonymous volume with no native signal that it is a live disk full of production data. A tidy-minded human, or a storage cleanup script, might delete it.
+A disk's most dangerous hours are the ones between machines — detached from an old VM, not yet attached to its replacement. Left alone, such a disk floats as a bare unattached volume. BOSH knows exactly what it is; the Director's records and the ID envelope keep it safe from *BOSH*. But a Proxmox administrator browsing storage sees only an anonymous volume with no native signal that it is a live disk full of production data. A tidy-minded human, or a storage cleanup script, might delete it.
 
-For a shop where everyone touching Proxmox knows about the 9000–29999 band, the default is fine. For everyone else there is an opt-in strategy best described as a coat-check. Each detached disk is immediately hung on a **parker VM** — a machine in the 90000–90999 band that is never started, marked deletion-protected so Proxmox itself refuses to remove it, and tagged as BOSH property. The disk is now visibly owned and physically guarded, at the cost of a few extra API calls per detach. Each park also writes a provenance note — which disk, from which VM, when — so an audit months later can reconstruct the history.
+So the default is a coat-check. Each detached disk is immediately hung on a **parker VM** — a machine in the 90000–90999 band that is never started, marked deletion-protected so Proxmox itself refuses to remove it, and tagged as BOSH property. The disk is visibly owned and physically guarded, at the cost of a few extra API calls per detach. Each park also writes a provenance note — which disk, from which VM, when — so an audit months later can reconstruct the history. A shop where everyone touching Proxmox knows about the 9000–29999 band can trade that protection back for the cheaper anonymous volume, by asking for the free-floating strategy in the manifest.
 
 ```mermaid
 flowchart TB
-    subgraph F["free-floating — default"]
+    subgraph F["free-floating — opt-in"]
         F1["bare unattached volume"]
         F2["anonymous to PVE admins"]
     end
-    subgraph P["parked — opt-in"]
+    subgraph P["parked — default"]
         P1["held by a never-started parker VM"]
         P2["deletion-protected, tagged, documented"]
     end
 ```
-*Free-floating is cheap and anonymous; parking trades a few API calls for a visible, protected home.*
+*Parking trades a few API calls for a visible, protected home; free-floating gives that back for cheapness and anonymity.*
 
 ## Trust, then verify
 

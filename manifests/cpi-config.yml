@@ -28,7 +28,11 @@
 #   - stemcell_storage should be a shared pool with `import` content that
 #     BOTH clusters mount (the `:light:` one-file-every-cluster scenario);
 #   - destroy_unreferenced_disks stays unset (default false);
-#   - parker bands are omitted (detached_disk_strategy is not `parked` here).
+#   - parker bands are split per entry, because detached_disk_strategy
+#     defaults to `parked` and both entries would otherwise allocate parker
+#     VMs out of the same 90000-90999 band on shared storage. An entry whose
+#     VMID topology has no room for a parker band can instead set
+#     `detached_disk_strategy: free` for itself; it is per-entry overridable.
 # ============================================================================
 
 cpis:
@@ -63,6 +67,8 @@ cpis:
       disk_vmid_range_end: 19999
       stemcell_template_vmid_range_start: 30000
       stemcell_template_vmid_range_end: 30499
+      parked_disk_vmid_range_start: 90000
+      parked_disk_vmid_range_end: 90499
 
 - name: pve-az2
   type: pve
@@ -95,3 +101,5 @@ cpis:
       disk_vmid_range_end: 29999
       stemcell_template_vmid_range_start: 30500
       stemcell_template_vmid_range_end: 30999
+      parked_disk_vmid_range_start: 90500
+      parked_disk_vmid_range_end: 90999

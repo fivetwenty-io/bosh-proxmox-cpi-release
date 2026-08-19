@@ -27,6 +27,7 @@ Standalone usage (CI smoke / debugging):
     ./scripts/_pve_verify.py --config cpi.json vnet itvnet
     ./scripts/_pve_verify.py --config cpi.json vm 901
     ./scripts/_pve_verify.py --config cpi.json subnet itvnet 10.250.0.0/24
+    ./scripts/_pve_verify.py --config cpi.json parked pvd-... 90000 90999
 Exit 0 when the resource exists, 1 when absent, 2 on usage/transport error.
 """
 
@@ -56,8 +57,44 @@ class PVEVerifyError(RuntimeError):
 _MAX_ENVELOPE_BYTES = 64 * 1024
 
 
-def _bare_disk_cid(disk_cid: str) -> str:
-    """Decode a disk CID to its bare '<storage>:<volid>' form.
+# The BOSH sentinel block the CPI embeds in a VM description, e.g.
+# <!--BOSH:{"bosh_parked_disks":{...}}-->  (internal/pve/sentinel.go).
+_SENTINEL_RE = re.compile(r"<!--BOSH:(.*?)-->", re.DOTALL)
+
+# QEMU config keys that can reference a storage volume: the bus slots a disk is
+# attached through, plus the unusedN keys PVE demotes a volume to when it is
+# taken off a bus without being deleted. The parked strategy only ever uses
+# scsiN, but a verification that ignored the others could not tell "detached and
+# gone" from "detached and left dangling in unused0". "scsihw" must not match,
+# so the digit is required.
+#
+# One pattern, used by both the holder probe and the slot probe: two spellings
+# of the same key set drift, and a holder probe that stopped matching what the
+# slot probe matches would report a referenced volume as free.
+_DISK_SLOT_RE = re.compile(r"^(?:scsi|virtio|ide|sata|unused)\d+$")
+
+
+# Tag separators, mirroring splitTagString in internal/pve/parker.go: PVE writes
+# semicolons, but a hand-edited tag field can carry commas or spaces, and a
+# separator this splitter does not know turns every parker assertion into a
+# vacuous pass rather than a failure.
+_TAG_SEP_RE = re.compile(r"[;, ]+")
+
+
+def _tags_contain(tag_str: str, want: str) -> bool:
+    """True when a PVE tag string carries want as a whole tag.
+
+    Separators are ';', ',', and ' ', and matching is case-insensitive, both
+    mirroring splitTagString / tagContainsParker in internal/pve/parker.go —
+    PVE normalizes tag case, so an exact match would be fragile.
+    """
+    return any(
+        t.strip().lower() == want.lower() for t in _TAG_SEP_RE.split(tag_str) if t.strip()
+    )
+
+
+def _decode_cid_payload(disk_cid: str) -> dict:
+    """Decode a pvd-/pvz- envelope CID to its JSON payload dict.
 
     Mirrors the Go codec's decode order (internal/pve/disk.go
     ParseEncodedDiskCID), which accepts ONLY the two envelope forms below —
@@ -78,10 +115,10 @@ def _bare_disk_cid(disk_cid: str) -> str:
             if not re.fullmatch(r"[A-Za-z0-9_-]+", payload):
                 raise ValueError("payload is not unpadded base64url")
             raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
-            volid = json.loads(raw)["v"]
-            if not isinstance(volid, str) or not volid:
-                raise ValueError("envelope volid is empty")
-            return volid
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("envelope payload is not an object")
+            return data
         except (ValueError, KeyError, TypeError) as exc:
             raise PVEVerifyError(
                 f"disk_cid {disk_cid!r}: invalid pvd envelope: {exc}"
@@ -97,21 +134,47 @@ def _bare_disk_cid(disk_cid: str) -> str:
             # that fills the cap without reaching EOF is over the limit.
             decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
             data = decomp.decompress(raw, _MAX_ENVELOPE_BYTES + 1)
-            if len(data) > _MAX_ENVELOPE_BYTES or not decomp.eof:
-                raise ValueError("decompressed envelope exceeds size cap")
-            if decomp.unused_data:
-                raise ValueError("trailing bytes after gzip stream")
-            volid = json.loads(data)["v"]
-            if not isinstance(volid, str) or not volid:
-                raise ValueError("envelope volid is empty")
-            return volid
+            if decomp.unconsumed_tail or len(data) > _MAX_ENVELOPE_BYTES:
+                raise ValueError(
+                    f"decompressed payload exceeds {_MAX_ENVELOPE_BYTES} bytes"
+                )
+            obj = json.loads(data)
+            if not isinstance(obj, dict):
+                raise ValueError("envelope payload is not an object")
+            return obj
         except (ValueError, KeyError, TypeError, zlib.error) as exc:
             raise PVEVerifyError(
                 f"disk_cid {disk_cid!r}: invalid pvz envelope: {exc}"
             ) from exc
     raise PVEVerifyError(
-        f"disk_cid {disk_cid!r}: expected a 'pvd-' or 'pvz-' envelope prefix"
+        f"disk_cid {disk_cid!r} is not a pvd-/pvz- envelope CID (the only forms the CPI emits)"
     )
+
+
+def _bare_disk_cid(disk_cid: str) -> str:
+    """Decode a disk CID to its bare '<storage>:<volid>' form (payload "v")."""
+    volid = _decode_cid_payload(disk_cid).get("v")
+    if not isinstance(volid, str) or not volid:
+        raise PVEVerifyError(f"disk_cid {disk_cid!r}: envelope volid is empty")
+    return volid
+
+
+def _cid_node(disk_cid: str) -> str:
+    """Return the node recorded in a CID's metadata, or "" when it carries none.
+
+    Path-form CIDs embed the node the volume was created on ("m"."node"), which
+    is the node whose storage listing can actually see a node-local volume on a
+    multi-node cluster. Best-effort: an envelope without metadata answers "",
+    and the caller falls back to scanning wider.
+    """
+    try:
+        meta = _decode_cid_payload(disk_cid).get("m")
+    except PVEVerifyError:
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    node = meta.get("node")
+    return node if isinstance(node, str) else ""
 
 
 def parse_stemcell_cid(cid: str) -> "tuple[str, str]":
@@ -305,12 +368,20 @@ class PVEVerifier:
     # -- predicates -----------------------------------------------------------
 
     def vm_exists(self, vmid: int | str) -> bool:
-        node = self._require_node()
+        """True when vmid exists anywhere in the cluster.
+
+        Cluster-wide, like parker discovery and holder lookup. A parker lands on
+        the disk's own node, so a node-scoped presence check on a multi-node
+        cluster answers False for a parker that is plainly there -- and the
+        assertion built on it reports that the parker was destroyed, which is the
+        most alarming way to be wrong about it.
+        """
         want = str(vmid).strip()
-        for e in self._as_list(self._get(f"/nodes/{urllib.parse.quote(node)}/qemu")):
-            if str(e.get("vmid", "")).strip() == want:
-                return True
-        return False
+        # cluster_vms already falls back to the configured node's own listing
+        # when /cluster/resources cannot be read, so there is no second fallback
+        # to write here -- and an empty result means an empty cluster, which is a
+        # real answer rather than a reason to go looking somewhere else.
+        return any(str(candidate) == want for candidate, _node in self.cluster_vms())
 
     def vnet_exists(self, vnet: str) -> bool:
         for e in self._as_list(self._get("/cluster/sdn/vnets")):
@@ -372,19 +443,242 @@ class PVEVerifier:
         so decode the CID to its bare form (mirroring the Go codec's decode
         order in internal/pve/disk.go) before matching.
         """
-        node = self._require_node()
         bare_cid = _bare_disk_cid(disk_cid)
         if ":" not in bare_cid:
             raise PVEVerifyError(f"disk_cid {disk_cid!r} is not '<storage>:<volid>'")
         storage = bare_cid.split(":", 1)[0]
-        path = (
-            f"/nodes/{urllib.parse.quote(node)}"
-            f"/storage/{urllib.parse.quote(storage)}/content"
-        )
-        for e in self._as_list(self._get(path)):
-            if e.get("volid") == bare_cid:
+        # A node-local storage's content listing is per node, and the CPI places
+        # a disk on whichever node has headroom -- not necessarily the configured
+        # one. Ask the node the CID's own metadata names first, then every node
+        # that hosts a VM, then the configured node, deduplicated in that order.
+        # A node whose listing cannot be read is skipped only when another node
+        # answers: node-local storage is not defined on every node, so a per-node
+        # 404 is expected. When EVERY node fails, the last error is raised
+        # rather than answering False -- a 401 that reads as "volume gone" would
+        # pass the post-delete absence assertion without proving anything.
+        nodes: list[str] = []
+        cid_node = _cid_node(disk_cid)
+        if cid_node:
+            nodes.append(cid_node)
+        try:
+            for _vmid, vm_node in self.cluster_vms():
+                if vm_node not in nodes:
+                    nodes.append(vm_node)
+        except PVEVerifyError:
+            pass
+        if self.node and self.node not in nodes:
+            nodes.append(self.node)
+        if not nodes:
+            nodes.append(self._require_node())
+        answered = False
+        last_err: PVEVerifyError | None = None
+        for node in nodes:
+            path = (
+                f"/nodes/{urllib.parse.quote(node)}"
+                f"/storage/{urllib.parse.quote(storage)}/content"
+            )
+            try:
+                entries = self._as_list(self._get(path))
+            except PVEVerifyError as exc:
+                last_err = exc
+                continue
+            answered = True
+            if any(e.get("volid") == bare_cid for e in entries):
                 return True
+        if not answered and last_err is not None:
+            raise last_err
         return False
+
+    # -- parked-disk (parker VM) inspection -----------------------------------
+    #
+    # These read the same cluster state the parked detached-disk strategy
+    # writes: a detached persistent disk is attached to a scsi slot of a
+    # never-started "parker" VM inside the configured parker VMID band, and the
+    # parker records provenance in its description sentinel.
+    #
+    # Parker discovery and holder lookup are both cluster-wide. A park lands on
+    # the disk's own node, which is not necessarily the configured one, so a
+    # node-scoped parker scan on a multi-node cluster would classify a real
+    # parker as an ordinary VM and turn "no parker was created" into a vacuous
+    # pass. The same reasoning applies to holder lookup: a "nobody holds this
+    # volume" assertion that only looked at one node would pass while another
+    # node still had the disk attached.
+
+    def _node_hosting(self, vmid: int | str) -> str:
+        """Return the node hosting vmid, falling back to the configured node.
+
+        A parker lands on the disk's own node, which on a multi-node cluster is
+        not necessarily the configured one, so reads that assumed the configured
+        node would 404 on a VM that is plainly there.
+        """
+        try:
+            wanted = int(str(vmid).strip())
+        except ValueError:
+            return self._require_node()
+        try:
+            listing = self.cluster_vms()
+        except PVEVerifyError:
+            # No cluster listing to consult. The configured node is the only
+            # answer left, and a read that then 404s says so plainly.
+            return self._require_node()
+        for candidate, node in listing:
+            if candidate == wanted:
+                return node
+        return self._require_node()
+
+    def qemu_config(self, vmid: int | str, node: str | None = None) -> dict[str, Any]:
+        """Return the QEMU config of vmid, on its own node unless told otherwise.
+
+        Raises PVEVerifyError when the VM does not exist, so callers that expect
+        a VM to be there get a failure rather than an empty dict.
+        """
+        node = node or self._node_hosting(vmid)
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(str(vmid))}/config"
+        data = self._get(path)
+        if not isinstance(data, dict):
+            raise PVEVerifyError(f"qemu config for vmid {vmid} is not an object")
+        return data
+
+    def vmids_in_range(self, start: int, end: int) -> list[int]:
+        """Return the cluster VMIDs that fall within [start, end], ascending."""
+        return sorted(
+            vmid for vmid, _node in self.cluster_vms() if start <= vmid <= end
+        )
+
+    def parker_vmids(self, start: int, end: int) -> list[int]:
+        """Return the parker VMIDs in the cluster, ascending.
+
+        A parker is a VM inside the band that also carries the bosh-parker tag,
+        matching pve.IsParkerVM in internal/pve/parker.go: the band alone is not
+        enough, or an unrelated VM parked in the same VMID range would be
+        mistaken for one.
+
+        A VM whose config cannot be read is not counted. It cannot be proven to
+        be a parker, and raising here would fail the whole lifecycle over a VM
+        that migrated or went away mid-scan.
+        """
+        parkers: list[int] = []
+        for vmid, node in self.cluster_vms():
+            if not (start <= vmid <= end):
+                continue
+            try:
+                config = self.qemu_config(vmid, node)
+            except PVEVerifyError:
+                continue
+            if _tags_contain(str(config.get("tags", "")), "bosh-parker"):
+                parkers.append(vmid)
+        return sorted(parkers)
+
+    def disk_holders(self, disk_cid: str) -> list[tuple[int, str]]:
+        """Return every (vmid, slot) in the CLUSTER whose config references disk_cid.
+
+        Scans every VM on every node, and every disk-bearing config key on each,
+        including the unusedN
+        slots PVE demotes a volume to when it is removed from a bus without
+        being deleted. disk_cid must be a pvd-/pvz- envelope CID, the only form
+        the CPI emits — the same requirement volume_exists makes.
+
+        The list is what makes the answer useful: an empty one means the volume
+        is free-floating, one entry names its owner, and more than one is a
+        double-attach — the corruption the park path's real-VM guard exists to
+        prevent — which a single-holder lookup would hide.
+        """
+        bare = _bare_disk_cid(disk_cid)
+        holders: list[tuple[int, str]] = []
+        for vmid, node in self.cluster_vms():
+            try:
+                config = self.qemu_config(vmid, node)
+            except PVEVerifyError:
+                # The VM went away between the listing and the read, or PVE
+                # refused the read while it was locked or migrating. It cannot
+                # be proven to hold the disk, and aborting the whole lifecycle
+                # run over an unrelated guest would be worse than skipping it.
+                # internal/pve/parker.go treats the same case the same way.
+                continue
+            for key, value in config.items():
+                if not _DISK_SLOT_RE.match(key):
+                    continue
+                if str(value).split(",", 1)[0].strip() == bare:
+                    holders.append((vmid, key))
+        return sorted(holders)
+
+    def cluster_vms(self) -> list[tuple[int, str]]:
+        """Return every (vmid, node) VM in the cluster, ascending by VMID.
+
+        Read fresh on every call, deliberately. The lifecycle harness holds one
+        verifier for a whole run and asserts on cluster state immediately after
+        creating a VM, parking a disk, and deleting a VM; a cached listing turns
+        every one of those into an answer about the cluster as it was earlier in
+        the run. The handful of extra GETs is not worth a verifier that cannot
+        see what it is verifying.
+
+        Uses /cluster/resources so a holder on another node is visible. When the
+        token cannot read that endpoint, falls back to the configured node's own
+        listing rather than failing: a narrower answer is still worth having,
+        and every caller that needs certainty asserts on a non-empty result.
+        """
+        vms: list[tuple[int, str]] = []
+        try:
+            entries = self._as_list(self._get("/cluster/resources?type=vm"))
+        except PVEVerifyError:
+            node = self._require_node()
+            entries = [
+                dict(e, node=node)
+                for e in self._as_list(self._get(f"/nodes/{urllib.parse.quote(node)}/qemu"))
+            ]
+        for e in entries:
+            try:
+                vmid = int(str(e.get("vmid", "")).strip())
+            except ValueError:
+                continue
+            # /cluster/resources?type=vm returns LXC containers alongside QEMU
+            # guests, and none of these predicates read a container config. A
+            # row that elides the field is kept, mirroring the leniency of
+            # ListParkersForNode in internal/pve/parker.go.
+            kind = str(e.get("type", "") or "").strip()
+            if kind and kind != "qemu":
+                continue
+            node = str(e.get("node", "") or self.node or "")
+            if node:
+                vms.append((vmid, node))
+        return sorted(vms)
+
+    def parker_disk_slots(self, vmid: int | str) -> dict[str, str]:
+        """Return the disk-bearing slots of a VM, keyed by slot.
+
+        Covers the active buses and the unusedN keys PVE demotes a detached
+        volume to, because an unused entry is still a reference: destroying the
+        VM with --purge takes that volume too. Reads what the VM config actually
+        holds rather than the provenance sentinel, which is best-effort and can
+        be empty on a parker that holds disks.
+        """
+        out: dict[str, str] = {}
+        for key, val in self.qemu_config(vmid).items():
+            if not _DISK_SLOT_RE.match(str(key)):
+                continue
+            volid = str(val).split(",", 1)[0].strip()
+            if volid and volid != "none":
+                out[str(key)] = volid
+        return out
+
+    def parked_disks(self, vmid: int | str) -> dict[str, Any]:
+        """Return the bosh_parked_disks provenance map from a parker's description.
+
+        Empty dict when the parker carries no sentinel or the sentinel holds no
+        parked-disk key — provenance is best-effort in the CPI (a park never
+        fails because the description write did), so callers must treat an empty
+        map as "no record", not as "not parked".
+        """
+        desc = str(self.qemu_config(vmid).get("description", ""))
+        match = _SENTINEL_RE.search(desc)
+        if not match:
+            return {}
+        try:
+            sentinel = json.loads(match.group(1))
+        except ValueError:
+            return {}
+        disks = sentinel.get("bosh_parked_disks") if isinstance(sentinel, dict) else None
+        return disks if isinstance(disks, dict) else {}
 
     # -- assertion helpers ----------------------------------------------------
 
@@ -421,6 +715,10 @@ def main(argv: list[str]) -> int:
     p_subnet.add_argument("cidr")
     sub.add_parser("bridge").add_argument("iface")
     sub.add_parser("volume").add_argument("disk_cid")
+    p_parked = sub.add_parser("parked")
+    p_parked.add_argument("disk_cid")
+    p_parked.add_argument("range_start", type=int)
+    p_parked.add_argument("range_end", type=int)
 
     args = parser.parse_args(argv)
 
@@ -438,6 +736,13 @@ def main(argv: list[str]) -> int:
             present = v.bridge_exists(args.iface)
         elif args.check == "volume":
             present = v.volume_exists(args.disk_cid)
+        elif args.check == "parked":
+            holders = v.disk_holders(args.disk_cid)
+            parkers = v.parker_vmids(args.range_start, args.range_end)
+            present = any(vmid in parkers for vmid, _ in holders)
+            for vmid, slot in holders:
+                kind = "parker" if vmid in parkers else "vm"
+                print(f"held by {kind} {vmid} slot {slot}")
         else:  # pragma: no cover - argparse enforces choices
             parser.error(f"unknown check {args.check!r}")
     except PVEVerifyError as exc:

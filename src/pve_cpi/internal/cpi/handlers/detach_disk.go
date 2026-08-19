@@ -274,8 +274,22 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		// the same createParkerVM/NextVMID allocation and must close the same
 		// cross-cluster parker-VMID collision gap.
 		DiskStorage: deps.Config.DiskStorage,
+		// See parkerReadConfigFor: a cluster-resources row without a node is
+		// dropped by the holder scan unless there is a fallback to attribute it
+		// to, and a dropped row reads as "nobody holds this volume".
+		FallbackNode: deps.Config.Node,
 	}
-	_, _, _, isParked, parkedErr := pve.IsDiskParked(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
+	// "Is it already parked?" and "is a real VM holding it?" are two readings of
+	// one fact, and the cluster-wide sweep that establishes that fact is the
+	// expensive call in this whole path — it reads the config of every VM and
+	// cannot short-circuit for a free-floating disk, which is what a
+	// just-detached disk is. Resolve the holder once and read both from it.
+	holder, holderErr := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
+	if holderErr != nil {
+		return wrapHolderScanError(holderErr,
+			fmt.Sprintf("detach_disk: already-detached parker check for disk %s", diskCID))
+	}
+	_, _, _, isParked, parkedErr := pve.ParkedFromHolder(holder, bareDiskCID)
 	if parkedErr != nil {
 		return cpierrors.WrapAs(parkedErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("detach_disk: already-detached parker check for disk %s", diskCID))
@@ -291,15 +305,25 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	// reached on a stale-Director retry where the disk was re-attached to a
 	// different VM after the original detach; parking it would double-reference
 	// the volume. Preserve the old idempotent warn+nil semantics.
-	heldByReal, realVMID, _, heldErr := pve.DiskHeldByRealVM(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
-	if heldErr != nil {
-		return cpierrors.WrapAs(heldErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("detach_disk: already-detached real-VM holder check for disk %s", diskCID))
-	}
-	if heldByReal {
+	if holder.Found && !holder.IsParker {
+		// A holder carrying the bosh-parker tag from outside the configured band
+		// is not an ordinary VM: it is a parker the band no longer recognizes,
+		// and the disk on it cannot be attached or deleted until the band comes
+		// back. detach_disk itself is safe either way -- the downstream guards
+		// refuse -- but it is the call the operator is watching, so say so here
+		// rather than leaving them to discover it at the next attach.
+		if pve.TagsMarkParker(holder.Tags) {
+			deps.Log(ctx).Warn("detach_disk: disk is held by a bosh-parker VM outside the configured parker band; "+
+				"it stays there and attach_disk and delete_disk will refuse it until "+
+				"parked_disk_vmid_range_start/end cover that VMID again",
+				log.String("disk_cid", diskCID),
+				log.Int("holder_vmid", holder.VMID),
+			)
+			return nil
+		}
 		deps.Log(ctx).Warn("detach_disk: disk attached to a non-parker VM — skipping park (idempotent)",
 			log.String("disk_cid", diskCID),
-			log.Int("holder_vmid", realVMID),
+			log.Int("holder_vmid", holder.VMID),
 		)
 		return nil
 	}
@@ -313,7 +337,11 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		return resolveErr
 	}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
-		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
+		// Keep the class the park chose. A 403 on creating bosh-parker-*, an
+		// exhausted VMID band, and an unswept reference are all permanent and
+		// each names what to do; relabelling them retriable hides the message
+		// behind a Director retry loop that cannot end.
+		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", diskCID))
 	}
 	return nil
@@ -385,7 +413,9 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
-		return cpierrors.WrapAs(parkErr, cpierrors.TypeRetriableCloud,
+		// Same reasoning as the free-floating park above: the class the park
+		// chose is the one the Director should see.
+		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park disk %s after detach (fail-closed: retry will re-park)", diskCID))
 	}
 	return nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -547,6 +549,65 @@ func TestHandleDeleteDisk_Parker_NotParked_DirectDelete(t *testing.T) {
 	}
 }
 
+// TestHandleDeleteDisk_StrandedParker_Refused covers the configuration an
+// operator lands in by opting out of parking without carrying the band forward:
+// a parker still holds the volume, but the zeroed band means the CPI no longer
+// recognizes it. Deleting the volume there would leave the parker's scsi slot
+// referencing storage that no longer exists, so the call must be refused.
+func TestHandleDeleteDisk_StrandedParker_Refused(t *testing.T) {
+	t.Parallel()
+	deleteCalled := false
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{
+				"scsi3": diskCID,
+				"tags":  "bosh-cpi;bosh-parker",
+				"name":  "bosh-parker-90000",
+			}, nil
+		},
+	}
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			raw, _ := json.Marshal(map[string]any{"vmid": 90000, "node": testNode, "type": "qemu"})
+			resp := sdkclusterapi.ListResourcesResponse{raw}
+			return &resp, nil
+		},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 testNode,
+			DiskStorage:          storageName,
+			DetachedDiskStrategy: "free",
+			DiskDeleteStateGuard: "off",
+		},
+		PVE: &mockPVEClient{
+			storageSvc: storageSvc,
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(),
+		[]json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected a refusal when a parker outside the band still holds the volume")
+	}
+	if !strings.Contains(err.Error(), "parked_disk_vmid_range_start") {
+		t.Errorf("the message must name the property that fixes it, got: %v", err)
+	}
+	if deleteCalled {
+		t.Error("the volume must not be deleted while a parker still references it")
+	}
+}
+
 // TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls verifies that when
 // neither DetachedDiskStrategy=parked nor range fields are set,
 // ParkedStrategyActive() returns false and zero parker API calls are made.
@@ -555,6 +616,7 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 
 	deleteCalled := false
 	configCalled := false
+	detachCalled := false
 	storageSvc := &mockStorageService{
 		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
 			deleteCalled = true
@@ -566,6 +628,10 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			configCalled = true
 			return map[string]any{}, nil
+		},
+		detachDiskFn: func(_ context.Context, _ string, _ int, _ string) error {
+			detachCalled = true
+			return nil
 		},
 	}
 	// Cluster returns a parker-range VM so that if the handler mistakenly calls
@@ -590,7 +656,9 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 		Config: &config.CPIConfig{
 			Node:        testNode,
 			DiskStorage: storageName,
-			// DetachedDiskStrategy unset and no range → ParkedStrategyActive()=false
+			// strategy=free opts out of the parked default, and no range is set
+			// → ParkedStrategyActive()=false.
+			DetachedDiskStrategy: "free",
 			// disk_delete_state_guard explicitly off: this test isolates the
 			// parker-gate's own QEMU Config() call count from the (Phase 1
 			// default-on) owner-lock guard, which would otherwise also call
@@ -610,8 +678,14 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 	if !deleteCalled {
 		t.Error("delete_disk: volume delete must be called when strategy=free")
 	}
-	if configCalled {
-		t.Error("delete_disk: QEMU Config must NOT be called (zero parker calls) when strategy=free")
+	// The holder scan is unconditional, so a config read is expected. What must
+	// not happen under strategy=free with no band is a parker mutation: the
+	// VM at 90000 is not recognized as a parker, so nothing is unparked.
+	if !configCalled {
+		t.Error("delete_disk: the holder scan must read the candidate holder's config")
+	}
+	if detachCalled {
+		t.Error("delete_disk: no parker detach may run when the band leaves 90000 unrecognized")
 	}
 }
 
@@ -626,9 +700,9 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 // This validates the delete_disk handler does NOT call NextDiskVMID.
 func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	t.Parallel()
-	clusterCalled := false
+	clusterCalls := 0
 	listFn := func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
-		clusterCalled = true
+		clusterCalls++
 		resp := sdkclusterapi.ListResourcesResponse{}
 		return &resp, nil
 	}
@@ -641,8 +715,9 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:        testNode,
-			DiskStorage: storageName,
+			Node:                 testNode,
+			DiskStorage:          storageName,
+			DetachedDiskStrategy: "free",
 			// disk_delete_state_guard explicitly off: this test's assertion is
 			// about NextDiskVMID-style cluster calls, not the (Phase 1
 			// default-on) owner-lock guard, which also calls the cluster
@@ -661,8 +736,10 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if clusterCalled {
-		t.Error("delete_disk must not call the cluster service (no VMID allocation needed)")
+	// Exactly one cluster call: the unconditional holder scan. Allocating a disk
+	// VMID, which delete_disk must never do, would add another.
+	if clusterCalls != 1 {
+		t.Errorf("delete_disk should make exactly one cluster call (the holder scan); got %d", clusterCalls)
 	}
 }
 
@@ -847,6 +924,7 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 			Node:                 testNode,
 			DiskStorage:          storageName,
 			DiskDeleteStateGuard: "off",
+			DetachedDiskStrategy: "free",
 		},
 		PVE:    client,
 		Logger: log.NewNopLogger(),
@@ -861,8 +939,148 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 	if !deleteCalled {
 		t.Error("guard off: delete must proceed")
 	}
-	if *configReads != 0 || *listCalls != 0 {
-		t.Errorf("guard off: must not query owner (config=%d, list=%d)", *configReads, *listCalls)
+	// The delete-state guard is off, so the only lookups left belong to the
+	// unconditional holder scan: one cluster listing and one config read to find
+	// the volume in that VM. The stranded-parker decision reads the tags that
+	// same read returned, so it adds nothing -- which is also what keeps it from
+	// having to decide what an unreadable config means on a path whose fallback
+	// is destroying the volume. The guard would add its own owner lookup on top.
+	if *listCalls != 1 || *configReads != 1 {
+		t.Errorf("guard off: only the holder scan should look (config=%d, list=%d)", *configReads, *listCalls)
+	}
+}
+
+// TestHandleDeleteDisk_StrandedParker_DecidesFromScanRead is the regression for
+// the worst outcome this handler has. The stranded-parker decision used to
+// issue a config read of its own and treat a failed read as "not a parker", so
+// a transient PVE fault sent delete_disk straight through to destroying a
+// volume a parker's scsi slot still referenced -- silently, with no log line.
+// It now reads the tags the holder scan carried out with it, so there is no
+// second read and therefore no unreadable-config case to get wrong. A second
+// read would be a decision with a failure mode, and the only answer available on
+// that path is the one that destroys the volume.
+func TestHandleDeleteDisk_StrandedParker_DecidesFromScanRead(t *testing.T) {
+	t.Parallel()
+
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	const strandedParkerVMID = 90010
+
+	configReads := 0
+	deleteCalled := false
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configReads++
+			return map[string]any{"scsi3": diskCID, "tags": "bosh-cpi;bosh-parker"}, nil
+		},
+	}
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			raw, _ := json.Marshal(map[string]any{
+				"vmid": strandedParkerVMID, "node": testNode, "type": "qemu",
+			})
+			resp := sdkclusterapi.ListResourcesResponse{raw}
+			return &resp, nil
+		},
+	}
+
+	// Parking disarmed: free, no band. The parker is outside anything the
+	// config can recognize, which is exactly the stranded state.
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{Node: testNode, DetachedDiskStrategy: "free"},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			storageSvc: storageSvc,
+			clusterSvc: clusterSvc,
+			nodesSvc:   &mockNodesService{},
+			tasksSvc:   &mockTasksService{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(context.Background(),
+		[]json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected a refusal for a volume a stranded parker still holds")
+	}
+	if !strings.Contains(err.Error(), "bosh-parker") {
+		t.Errorf("the refusal must name the parker tag; got %q", err.Error())
+	}
+	if deleteCalled {
+		t.Fatal("the volume must NOT be destroyed while a parker slot references it")
+	}
+	if configReads == 0 {
+		t.Error("the holder scan must have read the holder's config")
+	}
+	// The exact read count for this path is pinned by
+	// TestHandleDeleteDisk_Guard_Off_NoOwnerLookup, which asserts the holder
+	// scan's single read with the delete-state guard switched off.
+}
+
+// TestHandleDeleteDisk_HolderScanClusterFault_Retriable pins the retriability of
+// the holder scan's cluster listing. That scan is now on every delete_disk, so
+// a cluster-endpoint fault that outlives the retry budget -- a corosync blip,
+// quorum loss, a pvedaemon restart -- decides whether the Director re-drives the
+// call or gives up on it. The SDK error arriving from ListResources is not a
+// *cpierrors.Error, so wrapping it without classifying it first labels every one
+// of those as permanent.
+func TestHandleDeleteDisk_HolderScanClusterFault_Retriable(t *testing.T) {
+	t.Parallel()
+
+	const diskCID = "local-lvm:vm-9001-disk-0"
+	deleteCalled := false
+
+	storageSvc := &mockStorageService{
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return nil, &sdkerrors.ConnectionError{Host: "pve.example.com", Port: 8006, Message: "refused"}
+		},
+	}
+
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{Node: testNode},
+		PVE: &mockPVEClient{
+			qemuSvc:    &mockQEMUService{},
+			storageSvc: storageSvc,
+			clusterSvc: clusterSvc,
+			nodesSvc:   &mockNodesService{},
+			tasksSvc:   &mockTasksService{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	// Collapse the retry curve: this test is about how the exhausted budget is
+	// LABELLED, not how long it takes to exhaust.
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+
+	h := handlers.HandleDeleteDisk(deps)
+	_, err := h.Handle(ctx,
+		[]json.RawMessage{marshal(mustEncodeDiskCID(t, diskCID, nil))}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("a cluster-listing fault must fail the call, not fall through to the delete")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("a transient cluster fault must be retriable so the Director re-drives; got %v", err)
+	}
+	if deleteCalled {
+		t.Error("the volume must not be deleted when the holder is unknown")
 	}
 }
 

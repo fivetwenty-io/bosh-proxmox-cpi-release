@@ -150,6 +150,31 @@ tier1:
     bridge:
       iface:     vmbr9          # UNUSED bridge iface to create then delete
 
+  # Replicate the stemcell template to every cluster node (optional). Required
+  # when the cluster has more than one node and stemcell_storage is node-local;
+  # absent keeps the CPI default (false).
+  # stemcell_replicate_local: true
+
+  # Parked detached-disk strategy (optional). scripts/lifecycle drives a
+  # detached disk through both pve.detached_disk_strategy settings and verifies
+  # the resulting parker VM against the cluster. It runs by default, so this
+  # block is only needed to turn it off or to move the parker VMID band away
+  # from guests the lab already has there.
+  #
+  # The pass leaves its parker VM behind on purpose: a parker is durable
+  # infrastructure that outlives any single disk, and later runs reuse it.
+  # Removing one by hand needs the protection flag cleared first:
+  #   qm set <parker-vmid> --protection 0 && qm destroy <parker-vmid> --purge
+  parked_disk:
+    enabled:     true           # false skips the pass entirely
+    # Uncomment to move the parker band. These set the band in the generated
+    # CPI config AND the band the pass verifies against, so the two cannot
+    # disagree; a PARKER_RANGE_* env var that contradicts the CPI config aborts
+    # the pass, because looking for parkers outside the band the CPI parks into
+    # reads a real parker as an ordinary VM.
+    # range_start: 91000
+    # range_end:   91999
+
 # Tier 2: BOSH director smoke test.
 tier2:
   bosh_env_alias:  pve         # Alias registered via bosh alias-env

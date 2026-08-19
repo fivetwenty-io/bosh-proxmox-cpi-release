@@ -47,11 +47,11 @@ Globals state cluster-wide truths: default storage, default bridge, the VMID ban
 
 The defaults divide into two families, and knowing which is which is knowing the system's character.
 
-A small set defaults *protective* — they act on our behalf out of the box. Template-based cloning is on, because four-minute VM creation is a defect. Placement scoring is on. The duplicate-IP scan from Chapter 6 is on. Memory ballooning is *off*, deliberately, because BOSH sizes machines deterministically and a hypervisor quietly reclaiming memory underneath it produces failures that masquerade as application bugs. Each of these has a documented rationale, and each can be overridden.
+A small set defaults *protective* — they act on our behalf out of the box. Template-based cloning is on, because four-minute VM creation is a defect. Placement scoring is on. The duplicate-IP scan from Chapter 6 is on. The parked-disk coat-check from Chapter 7 is on, because a deleted disk is the one mistake nothing recovers from. Memory ballooning is *off*, deliberately, because BOSH sizes machines deterministically and a hypervisor quietly reclaiming memory underneath it produces failures that masquerade as application bugs. Each of these has a documented rationale, and each can be overridden.
 
-Everything else — telemetry, hooks, HA integration, the parked-disk coat-check, disk performance tuning, the load balancer, all of it — defaults to off, unset, and inert. The closing line of the configuration reference says it plainly: everything not required adds no privilege requirement and no behavior until switched on.
+Everything else — telemetry, hooks, HA integration, disk performance tuning, the load balancer, all of it — defaults to off, unset, and inert. The closing line of the configuration reference says it plainly: everything not required adds no privilege requirement and no behavior until switched on.
 
-That inertness is a maintained promise: **additive upgrades**. Upgrading this release with an unchanged manifest changes nothing — new capabilities arrive as new switches, every switch arrives off, and each feature's configuration tests prove that leaving its fields out is valid, so the absent case is the tested case. For us, that converts upgrades from a risk assessment into a routine.
+That inertness is a maintained promise: **additive upgrades**. New capabilities arrive as new switches, every switch arrives off, and each feature's configuration tests prove that leaving its fields out is valid, so the absent case is the tested case. The rare exception is a default we conclude was wrong — parking detached disks became the default that way — and those changes are argued in the changelog rather than slipped in. For us, that converts upgrades from a risk assessment into a routine.
 
 ## Where this leads
 

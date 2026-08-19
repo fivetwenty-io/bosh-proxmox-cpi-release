@@ -33,10 +33,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
@@ -89,6 +93,13 @@ type ParkerConfig struct {
 	// zero-value default) makes the scan a no-op — byte-identical to prior
 	// releases for callers that do not set it.
 	DiskStorage string
+	// FallbackNode names the node to attribute a cluster-resources row to when
+	// the row itself elides "node". A row without a node cannot be read, and
+	// dropping it silently is how the holder scan concludes a volume is free
+	// while a running VM still has it on a bus slot -- two configs referencing
+	// one volume. Empty (the zero value) keeps the previous behavior of
+	// skipping such rows, which is correct only when no node is known.
+	FallbackNode string
 	// NowFunc returns the current time. Nil defaults to time.Now().UTC().
 	// Tests inject a fixed clock to assert parked_at values deterministically.
 	NowFunc func() time.Time
@@ -260,6 +271,13 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, _ ParkerConfig) {
 	vmidStr := fmt.Sprintf("%d", parkerVMID)
 
+	// Detached and bounded: this runs after the volume has already left the
+	// parker, so a context stopped by the protection window's deadline would
+	// leave a provenance entry naming a volume that is no longer there -- the
+	// stale record disk-audit would then report against every future scan.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerProvenanceRemoveTimeout)
+	defer cancel()
+
 	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
 	if err != nil {
 		if logger != nil {
@@ -338,24 +356,106 @@ func parkerVMName(vmid int) string {
 // stemcell provenance pattern).
 func buildParkerTags(cfg ParkerConfig) string {
 	tags := []string{CpiOwnershipTag, ParkerTag}
-	if cfg.DirectorID != "" {
-		if sd := sanitizeParkerTagValue(cfg.DirectorID); sd != "" {
-			tags = append(tags, "director--"+sd)
-		}
+	if dt := parkerDirectorTag(cfg.DirectorID); dt != "" {
+		tags = append(tags, dt)
 	}
 	return strings.Join(tags, ";")
 }
 
-// tagContainsParker reports whether a semicolon-separated PVE tag string
-// contains ParkerTag as a whole token. Comparison is case-insensitive to
-// tolerate PVE tag normalization.
+// parkerDirectorTagPrefix marks the tag that attributes a parker to the
+// director that created it.
+const parkerDirectorTagPrefix = "director--"
+
+// parkerDirectorTag returns the attribution tag for a director ID, or "" when
+// there is no ID or nothing survives sanitizing.
+func parkerDirectorTag(directorID string) string {
+	if directorID == "" {
+		return ""
+	}
+	sd := sanitizeParkerTagValue(directorID)
+	if sd == "" {
+		return ""
+	}
+	return parkerDirectorTagPrefix + sd
+}
+
+// parkerBelongsToDirector reports whether a parker carrying tagStr may be
+// adopted by the director identified by directorID.
+//
+// Two directors sharing one PVE cluster is a supported configuration, and each
+// writes its own attribution tag, but every parker lookup matched on the
+// bosh-parker tag alone — so the first director to park a disk created a parker
+// the second one then filled with its own disks. That is not corruption, but it
+// couples the two deployments: neither can be torn down without reasoning about
+// the other's volumes, which is exactly what the attribution tag exists to
+// prevent.
+//
+// A parker with no attribution tag is adoptable by anyone. Parkers created
+// before the tag existed, or by a configuration with no director UUID to hand,
+// carry none, and refusing them would strand their disks.
+func parkerBelongsToDirector(tagStr, directorID string) bool {
+	want := parkerDirectorTag(directorID)
+	if want == "" {
+		return true
+	}
+	// Every attribution tag is considered, not just the first. A parker carrying
+	// two of them (an operator edit, or a rename mid-flight) would otherwise be
+	// adopted or refused on tag order, which is not a property anything should
+	// depend on. Any match means ours.
+	sawAttribution := false
+	for _, t := range splitTagString(tagStr) {
+		if !strings.HasPrefix(strings.ToLower(t), parkerDirectorTagPrefix) {
+			continue
+		}
+		sawAttribution = true
+		if strings.EqualFold(t, want) {
+			return true
+		}
+	}
+	return !sawAttribution
+}
+
+// tagContainsParker reports whether a PVE tag string contains ParkerTag as a
+// whole token. Comparison is case-insensitive to tolerate PVE tag
+// normalization.
+//
+// All three of PVE's separators are accepted — its pve-tag-list format is
+// `tag(?:[;, ]tag)*` — matching what PVE's own API accepts on the way in and
+// what handlers.parseTagsField already assumed on the way out. Splitting on a
+// space cannot produce a false positive, because a legal PVE tag contains none. Splitting on ";" alone was survivable while the tag was one signal
+// among several; it is not now that this string is what stands between
+// delete_vm's skiplock+purge and a parker holding up to 31 other deployments'
+// disks. A tag string this function fails to tokenize is a guard that silently
+// does not fire.
 func tagContainsParker(tagStr string) bool {
-	for _, t := range strings.Split(tagStr, ";") {
-		if strings.EqualFold(strings.TrimSpace(t), ParkerTag) {
+	for _, t := range splitTagString(tagStr) {
+		if strings.EqualFold(t, ParkerTag) {
 			return true
 		}
 	}
 	return false
+}
+
+// splitTagString tokenizes a PVE tag string on either separator, dropping empty
+// entries and surrounding space. One tokenizer for every parker tag decision.
+func splitTagString(tagStr string) []string {
+	parts := strings.FieldsFunc(tagStr, func(r rune) bool { return r == ';' || r == ',' || r == ' ' })
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// TagsMarkParker reports whether a PVE tag string carries the bosh-parker tag,
+// independent of any VMID band. It exists for diagnostics: a VM outside the
+// configured band that is nonetheless tagged as a parker is the signature of a
+// band that was moved or unset while disks were still parked, and saying so is
+// far more useful than reporting the volume as attached to a stranger.
+func TagsMarkParker(tags string) bool {
+	return tagContainsParker(tags)
 }
 
 // IsParkerVM reports whether vmid is a parker VM: both the VMID must fall
@@ -391,9 +491,25 @@ func FindParkerForNode(ctx context.Context, c Client, node string, cfg ParkerCon
 }
 
 // ListParkersForNode returns all parker VMIDs on node in ascending VMID order.
-// It scans cluster resources for VMs in the parker VMID range, then fetches
-// each VM's config to confirm the bosh-parker tag. VMs whose config is
-// missing (deleted concurrently) are silently skipped.
+//
+// One /cluster/resources?type=vm request carries the vmid, the node, and the
+// tag string of every guest, which is everything the band check and the
+// parker-tag check need. A row in the band on this node whose tags are empty
+// gets one config read to settle the question, since an empty field means
+// either an untagged VM or a PVE that does not populate it there.
+//
+// An earlier shape walked the band VMID by VMID and issued a fresh cluster
+// listing plus a config read for each occupied one — 1+2K requests where K is
+// the number of guests anywhere in the band. That is on the detach path, and an
+// operator whose cluster already used 9xxxx VMIDs before upgrading would have
+// paid it on every single detach.
+//
+// When cfg.DirectorID is set, a parker attributed to a DIFFERENT director is
+// skipped: this list drives which parker a park adopts, and two directors
+// sharing a cluster should not fill each other's parkers. Unattributed parkers
+// remain adoptable — see parkerBelongsToDirector. Lookups that have to find a
+// disk wherever it sits (IsDiskParked, UnparkDisk) deliberately do not filter,
+// so a disk parked under one attribution is still reachable under another.
 //
 // Returns an empty slice (not an error) when no parkers exist.
 func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerConfig) ([]int, error) {
@@ -408,38 +524,87 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 			cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
 	}
 
-	used, err := listClusterVMIDs(ctx, c)
-	if err != nil {
-		return nil, cpierrors.Wrap(err, "ListParkersForNode: list cluster VMIDs")
+	typeStr := "vm"
+	var resp *sdkcluster.ListResourcesResponse
+	listErr := RetryOnTransient(ctx, nil, "list_parkers_for_node", 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
+		return inner
+	})
+	if listErr != nil {
+		return nil, cpierrors.Wrap(WrapConfigReadError(listErr), "ListParkersForNode: list cluster resources")
+	}
+	if resp == nil {
+		// Retriable, matching the same condition in FindVMByDiskVolid and
+		// listClusterVMIDs: a pvedaemon coming back up answers with an empty
+		// body, and this listing runs on every park -- a permanent class here
+		// fails the detach_disk that triggered it for good.
+		return nil, cpierrors.Retriable("ListParkersForNode: nil response from cluster resources")
 	}
 
 	var result []int
-	for vmid := cfg.VMIDRangeStart; vmid <= cfg.VMIDRangeEnd; vmid++ {
-		if _, exists := used[vmid]; !exists {
+	for _, raw := range *resp {
+		var entry struct {
+			VMID int64  `json:"vmid"`
+			Node string `json:"node"`
+			Tags string `json:"tags"`
+			Type string `json:"type"`
+		}
+		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
-		// Confirm this VMID lives on the target node and carries bosh-parker tag.
-		vmNode, found, nodeErr := FindVMNodeViaCluster(ctx, c, vmid)
-		if nodeErr != nil {
-			return nil, cpierrors.WrapAs(nodeErr, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("ListParkersForNode: node lookup for vmid %d", vmid))
-		}
-		if !found || vmNode != node {
+		// The cluster resource type "vm" covers both QEMU guests and LXC
+		// containers, and every read below this point goes through the QEMU
+		// config endpoint. An LXC container that happens to sit in the parker
+		// band would fail that read, and because an untagged row's read is
+		// fail-loud, one container in the band would break every park and
+		// unpark on the node. A container is never a parker; skip it. A row
+		// that elides "type" is kept: dropping it would be the same
+		// band-exhausting mistake as dropping a row with no node.
+		if entry.Type != "" && entry.Type != "qemu" {
 			continue
 		}
-		cfg2, cfgErr := c.QEMU().Config(ctx, node, vmid)
-		if cfgErr != nil {
-			if IsNotFound(cfgErr) {
-				continue
+		vmid := int(entry.VMID)
+		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
+			continue
+		}
+		// A row that elides "node" is rare but real on some PVE versions, and
+		// FindVMByDiskVolid already carries a fallback for exactly that. Treat
+		// an empty node as the node being asked about: dropping such rows makes
+		// this function always return empty, so every park creates a fresh
+		// parker and exhausts the band it exists to conserve.
+		rowNode := entry.Node
+		if rowNode == "" {
+			rowNode = node
+		}
+		if rowNode != node {
+			continue
+		}
+		tags := entry.Tags
+		if tags == "" {
+			// The row carries no tags. That is either a genuinely untagged VM
+			// sharing the band, or a PVE that does not populate the field, and
+			// the two are indistinguishable from here. Confirm with a config
+			// read rather than assume: assuming "not a parker" would create a
+			// fresh parker on every park and exhaust the band.
+			vmCfg, cfgErr := c.QEMU().Config(ctx, node, vmid)
+			if cfgErr != nil {
+				if parkerConfigGone(cfgErr) {
+					continue
+				}
+				// WrapError, not a blanket retriable: a 403 on this read is a
+				// grant only a human can add, and re-driving every detach on the
+				// node forever does not add it.
+				return nil, cpierrors.Wrap(WrapConfigReadError(cfgErr),
+					fmt.Sprintf("ListParkersForNode: config fetch for vmid %d", vmid))
 			}
-			return nil, cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("ListParkersForNode: config fetch for vmid %d", vmid))
+			tags, _ = vmCfg["tags"].(string)
 		}
-		tagsRaw, _ := cfg2["tags"].(string)
-		if tagContainsParker(tagsRaw) {
+		if tagContainsParker(tags) && parkerBelongsToDirector(tags, cfg.DirectorID) {
 			result = append(result, vmid)
 		}
 	}
+	sort.Ints(result)
 	return result, nil
 }
 
@@ -504,7 +669,10 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 			}
 			if upid != "" {
 				if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
-					return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
+					// Classified: AwaitTask reports a task PVE rejected outright
+					// ("task failed: exit status ...") the same way it reports a
+					// poll that timed out, and only the second is worth retrying.
+					return cpierrors.Wrap(WrapMutationError(awaitErr),
 						fmt.Sprintf("%s: await create task for vmid %d", opLabel, vmid))
 				}
 			}
@@ -580,10 +748,82 @@ func EnsureFreshParker(ctx context.Context, c Client, logger *log.Logger, node s
 	return createParkerVM(ctx, c, logger, node, cfg, "ensure_fresh_parker_create")
 }
 
+// diskHolder is the outcome of one cluster-wide search for whichever VM holds a
+// volid. slot is set only when the holder is a parker and the disk was located
+// in its config.
+type diskHolder struct {
+	found    bool
+	vmid     int
+	node     string
+	isParker bool
+	slot     string
+	// tags is the holder's raw tag string as the scan read it. It carries the
+	// answer to "what kind of VM is this?" out of the scan, so a caller that
+	// finds a holder outside the parker band can still tell a stranded parker
+	// from an ordinary VM without a second config read.
+	tags string
+}
+
+// resolveDiskHolder answers "who holds this volid, and is it a parker?" in a
+// single pass: one cluster-wide scan plus at most one config read.
+//
+// It exists because that scan is the expensive operation in the whole parked
+// lifecycle — FindVMByDiskVolid reads the config of every VM in the cluster and
+// cannot short-circuit for a free-floating disk, which is exactly the state a
+// just-detached disk is in. IsDiskParked and DiskHeldByRealVM ask two questions
+// of the same answer, so ParkDisk resolves the holder once and reads both from
+// it rather than paying for the sweep twice on every detach.
+func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (diskHolder, error) {
+	holderVMID, holderNode, holderTags, found, err := FindVMByDiskVolidOrNoneTagged(
+		ctx, c, cfg.FallbackNode, bareVolid)
+	if err != nil {
+		return diskHolder{}, err
+	}
+	if !found {
+		return diskHolder{}, nil
+	}
+
+	// Out of the parker band → a real VM, no config read needed. The tags come
+	// from the scan, so a caller that needs to tell a stranded parker from an
+	// ordinary VM can do it without a second read.
+	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
+		return diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: holderTags}, nil
+	}
+
+	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
+	if cfgErr != nil {
+		if parkerConfigGone(cfgErr) {
+			// Holder vanished between the scan and the read — the disk is
+			// free-floating as far as this call is concerned.
+			return diskHolder{}, nil
+		}
+		// WrapError keeps a 403 permanent: it names a grant to add, and no
+		// number of retries adds it.
+		return diskHolder{}, cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			fmt.Sprintf("config fetch for vmid %d on node %s", holderVMID, holderNode))
+	}
+
+	tagsRaw, _ := vmCfg["tags"].(string)
+	if !tagContainsParker(tagsRaw) {
+		if logger != nil {
+			logger.Warn("disk holder is in the parker range but carries no bosh-parker tag — treating it as a real VM",
+				log.Int("vmid", holderVMID),
+				log.String("node", holderNode),
+				log.String("volid", bareVolid),
+				log.String("tags", tagsRaw),
+			)
+		}
+		return diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw}, nil
+	}
+
+	slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
+	return diskHolder{found: true, vmid: holderVMID, node: holderNode, isParker: true, slot: slot, tags: tagsRaw}, nil
+}
+
 // IsDiskParked reports whether bareVolid is currently held on a parker VM.
 //
 // Algorithm:
-//  1. FindVMByDiskVolidOrNone — cluster-wide scan. Not found → false,nil.
+//  1. Cluster-wide holder scan. Not found → false,nil.
 //  2. Holder VMID not in [VMIDRangeStart, VMIDRangeEnd] → false,nil (no config read).
 //  3. One config read: check bosh-parker tag. Missing → false + WARN.
 //  4. Find slot via pve.FindDiskIDByVolID. Slot miss → retriable (config listed it).
@@ -597,51 +837,28 @@ func IsDiskParked(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 		return 0, "", "", false, cpierrors.Cloud("IsDiskParked: bareVolid must not be empty")
 	}
 
-	holderVMID, holderNode, found, err := FindVMByDiskVolidOrNone(ctx, c, "", bareVolid)
+	holder, err := resolveDiskHolder(ctx, c, logger, bareVolid, cfg)
 	if err != nil {
 		return 0, "", "", false, cpierrors.Wrap(err, "IsDiskParked: cluster scan")
 	}
-	if !found {
+	return parkedFromHolder(holder, bareVolid)
+}
+
+// parkedFromHolder converts a resolved holder into IsDiskParked's return shape.
+// A parker holder whose slot could not be located is unexpected — the scan just
+// confirmed the disk is on that VM — so it is reported as a transient
+// config-read race rather than "not parked".
+func parkedFromHolder(holder diskHolder, bareVolid string) (int, string, string, bool, error) {
+	if !holder.found || !holder.isParker {
 		return 0, "", "", false, nil
 	}
-
-	// Range check: if holder is not in the parker range, it's a real VM — no
-	// parker config read needed.
-	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
-		return 0, "", "", false, nil
-	}
-
-	// One config read to confirm bosh-parker tag and find the slot.
-	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
-	if cfgErr != nil {
-		return 0, "", "", false, cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("IsDiskParked: config fetch for vmid %d on node %s", holderVMID, holderNode))
-	}
-
-	tagsRaw, _ := vmCfg["tags"].(string)
-	if !tagContainsParker(tagsRaw) {
-		if logger != nil {
-			logger.Warn("IsDiskParked: vmid in parker range but missing bosh-parker tag — treating as non-parker",
-				log.Int("vmid", holderVMID),
-				log.String("node", holderNode),
-				log.String("volid", bareVolid),
-				log.String("tags", tagsRaw),
-			)
-		}
-		return 0, "", "", false, nil
-	}
-
-	// Locate the slot the disk occupies. Miss here is unexpected (the scan just
-	// confirmed the disk is on this VM). Treat as a transient config-read race.
-	diskID, ok := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
-	if !ok {
+	if holder.slot == "" {
 		return 0, "", "", false, cpierrors.Retriable(
 			"IsDiskParked: disk %q confirmed on parker vmid %d but slot not found in config (possible race)",
-			bareVolid, holderVMID,
+			bareVolid, holder.vmid,
 		)
 	}
-
-	return holderVMID, holderNode, diskID, true, nil
+	return holder.vmid, holder.node, holder.slot, true, nil
 }
 
 // DiskHeldByRealVM reports whether bareVolid is currently attached to a VM that
@@ -665,43 +882,81 @@ func DiskHeldByRealVM(ctx context.Context, c Client, logger *log.Logger, bareVol
 		return false, 0, "", cpierrors.Cloud("DiskHeldByRealVM: bareVolid must not be empty")
 	}
 
-	holderVMID, holderNode, found, scanErr := FindVMByDiskVolidOrNone(ctx, c, "", bareVolid)
+	holder, scanErr := resolveDiskHolder(ctx, c, logger, bareVolid, cfg)
 	if scanErr != nil {
 		return false, 0, "", cpierrors.Wrap(scanErr, "DiskHeldByRealVM: cluster scan")
 	}
-	if !found {
+	return realHolder(holder)
+}
+
+// realHolder converts a resolved holder into DiskHeldByRealVM's return shape:
+// anything found that is not a parker is a real VM.
+func realHolder(holder diskHolder) (held bool, vmid int, node string, err error) {
+	if !holder.found || holder.isParker {
 		return false, 0, "", nil
 	}
+	return true, holder.vmid, holder.node, nil
+}
 
-	// Out of parker range → definitely a real VM.
-	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
-		return true, holderVMID, holderNode, nil
-	}
+// DiskHolder describes the VM that currently references a volume, in the exported
+// shape callers outside this package need.
+type DiskHolder struct {
+	// Found is false when no VM in the cluster references the volume.
+	Found bool
+	// VMID and Node identify the holder when Found is true.
+	VMID int
+	Node string
+	// IsParker is true when the holder is a bosh-parker VM inside the
+	// configured band. A zero band (the opted-out configuration) can never
+	// produce IsParker=true, so a parker left over from a previous
+	// configuration is reported as an ordinary holder rather than skipped.
+	IsParker bool
+	// Slot is the parker's scsiN key holding the volume; set only for parkers.
+	Slot string
+	// Tags is the holder's raw tag string, from the same scan. A holder that is
+	// not IsParker but whose tags mark a parker is one the configured band no
+	// longer covers -- the state every stranded-parker refusal keys on.
+	Tags string
+}
 
-	// In range: confirm via tag. A parker carries bosh-parker; anything else in
-	// the range is a real (mis-placed) VM.
-	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
-	if cfgErr != nil {
-		if IsNotFound(cfgErr) {
-			// VM vanished mid-scan — treat as free-floating.
-			return false, 0, "", nil
-		}
-		return false, 0, "", cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("DiskHeldByRealVM: config fetch for vmid %d on node %s", holderVMID, holderNode))
+// ResolveDiskHolder answers "who holds this volid, and is it a parker?" with one
+// cluster-wide scan plus at most one config read.
+//
+// attach_disk needs both halves of that answer before it writes a volid into a
+// VM config: a parker holder must be unparked first, and a non-parker holder
+// means the volume is already attached somewhere else and attaching it again
+// would leave two VM configs referencing one volume — a state PVE permits and
+// nothing later detects, until whichever holder is destroyed takes the volume
+// with it.
+func ResolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (DiskHolder, error) {
+	if c == nil {
+		return DiskHolder{}, cpierrors.Cloud("ResolveDiskHolder: client must not be nil")
 	}
-	tagsRaw, _ := vmCfg["tags"].(string)
-	if tagContainsParker(tagsRaw) {
-		// Held by a parker — not a real VM.
-		return false, 0, "", nil
+	if bareVolid == "" {
+		return DiskHolder{}, cpierrors.Cloud("ResolveDiskHolder: bareVolid must not be empty")
 	}
-	if logger != nil {
-		logger.Warn("DiskHeldByRealVM: disk attached to VM in parker range without bosh-parker tag — treating as real VM",
-			log.Int("vmid", holderVMID),
-			log.String("node", holderNode),
-			log.String("volid", bareVolid),
-		)
+	h, err := resolveDiskHolder(ctx, c, logger, bareVolid, cfg)
+	if err != nil {
+		return DiskHolder{}, cpierrors.Wrap(err, "ResolveDiskHolder: cluster scan")
 	}
-	return true, holderVMID, holderNode, nil
+	return DiskHolder{
+		Found: h.found, VMID: h.vmid, Node: h.node, IsParker: h.isParker, Slot: h.slot, Tags: h.tags,
+	}, nil
+}
+
+// ParkedFromHolder answers IsDiskParked's question from a DiskHolder a caller
+// has already resolved, so a code path that needs both "is it parked?" and "is
+// a real VM holding it?" pays one cluster scan instead of two. The return shape
+// and the empty-slot race handling match IsDiskParked exactly.
+func ParkedFromHolder(h DiskHolder, bareVolid string) (vmid int, node, slot string, parked bool, err error) {
+	return parkedFromHolder(diskHolder{
+		found:    h.Found,
+		vmid:     h.VMID,
+		node:     h.Node,
+		isParker: h.IsParker,
+		slot:     h.Slot,
+		tags:     h.Tags,
+	}, bareVolid)
 }
 
 // ParkDisk attaches bareVolid to a parker VM on node. It is idempotent: if the
@@ -711,11 +966,13 @@ func DiskHeldByRealVM(ctx context.Context, c Client, logger *log.Logger, bareVol
 // Pass a zero ParkContext when the source VM or full disk CID are unavailable.
 //
 // The algorithm:
-//  1. IsDiskParked cluster-wide — already parked → nil.
-//  2. EnsureParker for node.
-//  3. Read parker VM config to find a free slot.
-//  4. AttachDisk with explicit DiskID (scsiN).
-//  5. ErrNoSlots → EnsureFreshParker + retry attach once.
+//  1. One cluster-wide holder scan, read two ways: already parked -> nil, held
+//     by a real VM -> refuse (parking would double-reference a live volume).
+//  2. List the parkers on node and attach to the lowest one with a free slot,
+//     creating a parker only when none exists or all are full.
+//  3. AttachDisk with an explicit DiskID (scsiN), then re-read to confirm the
+//     slot holds this volume -- a concurrent park can win the same slot.
+//  4. Re-assert protection=1 and write the provenance record.
 //
 // All PVE mutations are wrapped with RetryOnTransientOrLock.
 func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
@@ -729,10 +986,26 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 		return cpierrors.Cloud("ParkDisk: bareVolid must not be empty")
 	}
 
+	// One holder scan answers both questions below. The scan reads every VM
+	// config in the cluster, so resolving it twice would double the cost of the
+	// detach path that now runs by default.
+	//
+	// The disk's own node is the fallback for a cluster-resources row that
+	// elides "node": on a single-node PVE that is every row, and skipping them
+	// would report the volume free while the workload VM still holds it, which
+	// is precisely what the refusal below exists to catch.
+	if cfg.FallbackNode == "" {
+		cfg.FallbackNode = node
+	}
+	holder, scanErr := resolveDiskHolder(ctx, c, logger, bareVolid, cfg)
+	if scanErr != nil {
+		return cpierrors.Wrap(scanErr, "ParkDisk: holder scan")
+	}
+
 	// Idempotency: already parked → nil.
-	_, _, _, alreadyParked, checkErr := IsDiskParked(ctx, c, logger, bareVolid, cfg)
-	if checkErr != nil {
-		return cpierrors.Wrap(checkErr, "ParkDisk: idempotency check")
+	_, _, _, alreadyParked, parkedErr := parkedFromHolder(holder, bareVolid)
+	if parkedErr != nil {
+		return cpierrors.Wrap(parkedErr, "ParkDisk: idempotency check")
 	}
 	if alreadyParked {
 		return nil
@@ -742,10 +1015,7 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 	// would add a second config reference to a volume a running VM owns
 	// (double-attach). This guards a stale-Director-retry path where the disk
 	// was re-attached elsewhere between the failed detach and this re-park.
-	heldByReal, realVMID, _, heldErr := DiskHeldByRealVM(ctx, c, logger, bareVolid, cfg)
-	if heldErr != nil {
-		return cpierrors.Wrap(heldErr, "ParkDisk: real-VM holder check")
-	}
+	heldByReal, realVMID, _, _ := realHolder(holder)
 	if heldByReal {
 		if logger != nil {
 			logger.Warn("ParkDisk: disk attached to a non-parker VM — refusing to park (idempotent no-op)",
@@ -780,10 +1050,9 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if ensureErr != nil {
 			return cpierrors.Wrap(ensureErr, "ParkDisk: ensure parker")
 		}
-		if attachErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid); attachErr != nil {
+		if attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx); attachErr != nil {
 			return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
 		}
-		updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		return nil
 	}
 
@@ -791,9 +1060,8 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 	// with a free slot. ErrNoSlots on a parker means it is full — move to the
 	// next. Any other error is a real failure and propagates.
 	for _, parkerVMID := range parkers {
-		attachErr := attachToParker(ctx, c, logger, node, parkerVMID, bareVolid)
+		attachErr := attachAndSecure(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 		if attachErr == nil {
-			updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 			return nil
 		}
 		if errors.Is(attachErr, ErrNoSlots) {
@@ -802,27 +1070,101 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
 	}
 
-	// All existing parkers are full → create a fresh one and attach there.
-	freshVMID, freshErr := EnsureFreshParker(ctx, c, logger, node, cfg)
-	if freshErr != nil {
-		return cpierrors.Wrap(freshErr, "ParkDisk: ensure fresh parker after all parkers full")
+	// All existing parkers are full → create fresh ones until one takes the
+	// disk. EnsureFreshParker's VMID-conflict branch adopts the lowest existing
+	// parker, which at this point is by definition full, so a single attempt can
+	// come back ErrNoSlots on a parker nobody can use. That is a capacity
+	// condition with an obvious next step -- allocate another -- not a reason to
+	// fail the detach permanently, which is what wrapping ErrNoSlots as a Cloud
+	// error used to do the moment a node's parkers filled up.
+	var freshErr error
+	for attempt := 0; attempt < freshParkerAttempts; attempt++ {
+		var freshVMID int
+		freshVMID, freshErr = EnsureFreshParker(ctx, c, logger, node, cfg)
+		if freshErr != nil {
+			return cpierrors.Wrap(freshErr, "ParkDisk: ensure fresh parker after all parkers full")
+		}
+		attachErr := attachAndSecure(ctx, c, logger, node, freshVMID, bareVolid, cfg, pctx)
+		if attachErr == nil {
+			return nil
+		}
+		if !errors.Is(attachErr, ErrNoSlots) {
+			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
+		}
+		if logger != nil {
+			logger.Warn("parker: freshly ensured parker had no free slot; allocating another",
+				log.Int("parker_vmid", freshVMID),
+				log.String("node", node),
+				log.Int("attempt", attempt+1),
+			)
+		}
 	}
-	if attachErr := attachToParker(ctx, c, logger, node, freshVMID, bareVolid); attachErr != nil {
-		return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
+	return cpierrors.Retriable(
+		"ParkDisk: could not find a parker with a free slot on node %s after %d fresh-parker attempts",
+		node, freshParkerAttempts)
+}
+
+// parkerWindowMaxAttempts bounds every retry loop that runs inside a parker's
+// protection window. The window is guarded by a cluster lock with a TTL
+// (parkerProtectionLockTTL), and a later acquirer steals a lock whose TTL has
+// expired -- so a call that retries past the TTL does not just run slowly, it
+// runs on past the point where another park or unpark is entitled to enter the
+// same window. The storage-lock curve alone would sleep past two minutes over
+// its default ten attempts, before the calls around it. Four attempts keeps the
+// worst case at roughly ten seconds of backoff per call, and a genuinely stuck
+// storage layer is better handed back to the Director than retried under a lock
+// we are about to lose.
+//
+// This bounds each loop; the window deadline in withParkerProtectionLock bounds
+// their sum. Both are needed: per-loop bounds keep a single stuck call short,
+// and the deadline is what a composition of bounded loops cannot exceed.
+const parkerWindowMaxAttempts = 4
+
+// freshParkerAttempts bounds the overflow loop. EnsureFreshParker can hand back
+// a full parker when its VMID-conflict branch adopts an existing one, so a
+// single attempt is not enough; an unbounded loop would spin against a genuinely
+// exhausted band.
+const freshParkerAttempts = 3
+
+// attachAndSecure performs one park onto a known parker with that parker's
+// protection window held: attach, put protection back, record provenance.
+//
+// The lock is what makes the unpark window safe. An unpark clears protection,
+// issues the detach, and PVE demotes the volume to an unusedN key that a second
+// request removes; a park writing protection=1 into that gap makes PVE refuse
+// the second request and the in-window sweep, leaving the volume referenced by a
+// key no probe can see while the unpark reports a retriable failure. Serializing
+// the park's protection write against the unpark's window closes that, and it
+// also stops a park claiming a slot an unpark is about to detach by name.
+func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
+	if lockErr := withParkerProtectionLock(ctx, c, logger, parkerVMID, "park", func(wctx context.Context) error {
+		if attachErr := attachToParkerLocked(wctx, c, logger, node, parkerVMID, bareVolid); attachErr != nil {
+			return attachErr
+		}
+		reassertParkerProtection(wctx, c, logger, node, parkerVMID)
+		return nil
+	}); lockErr != nil {
+		return lockErr
 	}
-	updateParkerProvenance(ctx, c, logger, node, freshVMID, bareVolid, cfg, pctx)
+	// Provenance is written OUTSIDE the window on purpose. It is advisory
+	// metadata for disk-audit whose lost-update race is already declared
+	// acceptable (see the ParkContext doc), so serializing it protects nothing
+	// that matters -- while a config read plus a description write on a parker
+	// carrying up to 31 sentinel entries is real time added to a critical
+	// section that must finish inside the lock's TTL.
+	updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
 	return nil
 }
 
 // attachParkerVerifyRetries bounds the read-after-write slot-verify loop in
-// attachToParker. Each iteration reads config, chooses a free slot, attaches,
+// attachToParkerLocked. Each iteration reads config, chooses a free slot, attaches,
 // then re-reads to confirm the chosen slot holds our volid. A concurrent park
 // that won the same slot demotes our disk to unusedN; on mismatch we retry the
 // next free slot. The bound caps how many concurrent parkers we tolerate
 // stealing slots before giving up retriably.
 const attachParkerVerifyRetries = 5
 
-// attachToParker reads the current config of parkerVMID, selects the first free
+// attachToParkerLocked reads the current config of parkerVMID, selects the first free
 // scsiN slot, calls AttachDisk with an explicit DiskID, then re-reads the
 // config to confirm the chosen slot actually holds bareVolid.
 //
@@ -836,46 +1178,120 @@ const attachParkerVerifyRetries = 5
 // attachParkerVerifyRetries. Exhausting free slots returns ErrNoSlots so the
 // caller falls through to a fresh parker; exhausting the retry budget returns a
 // retriable error so the Director re-drives the park.
-func attachToParker(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) error {
+func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) (err error) {
 	// Slots proven to hold someone else's volid after our attach — never retry these.
 	stolen := make(map[string]bool)
+	// Set once a slot is lost to a concurrent park, which is the moment PVE
+	// demotes our volid to an unusedN key on this parker. Every exit from the
+	// loop then has to sweep that key, including the two failure exits: leaving
+	// it behind strands a reference no holder probe in this package can see, and
+	// the caller goes on to park the same volume on a different parker.
+	demoted := false
+	defer func() {
+		if !demoted {
+			return
+		}
+		// Cleanup, so it runs on a detached, bounded context. A cancelled or
+		// timed-out park is exactly when the stranded reference matters most,
+		// and both the sentinel-pool acquire and the detach it guards would
+		// otherwise fail instantly on the dead context and leave the unusedN
+		// key behind for good.
+		sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+		defer sweepCancel()
+		// The *Locked* variant: this runs with the parker's protection lock
+		// already held by attachAndSecure, and AcquireClusterLock is not
+		// reentrant -- taking it again here would wait out its own timeout.
+		if sweepParkerUnusedSlotsProtectedLocked(sweepCtx, c, logger, node, parkerVMID, bareVolid) {
+			return
+		}
+		// The reference survived, and it is invisible: every holder probe in
+		// this package matches active-bus keys only. Whatever this call was
+		// about to return, returning it unchanged sends the caller on to park
+		// the same volume somewhere else -- the next slot, the next parker, or
+		// the Director's own retry -- while this parker still names it. That is
+		// the double reference the sweep exists to prevent, and purging either
+		// holder then frees a live volume.
+		//
+		// So every failing exit is rewritten, not just ErrNoSlots: a permanent
+		// unswept-reference error naming the parker and the commands that clear
+		// it. Permanent because a retry does not sweep -- it re-runs the holder
+		// scan, which cannot see an unusedN key, concludes the volume is free,
+		// and parks it again.
+		if err != nil {
+			reportUnsweptReference(logger, node, parkerVMID, bareVolid, err)
+			err = unsweptReferenceErrorFor(
+				"ParkDisk", "lost the slot holding", node, parkerVMID, bareVolid, err)
+			return
+		}
+		// The attach succeeded on another slot, so this parker legitimately
+		// holds the volume and the stranded key names a volume the same parker
+		// already carries -- discoverable, unlike the failure exits. Say so
+		// loudly and let the park stand: failing a park that worked would leave
+		// the disk free-floating, which is worse.
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid,
+			cpierrors.Cloud("attachToParker: park succeeded on parker vmid %d but a demoted reference to %q "+
+				"survived the sweep", parkerVMID, bareVolid))
+	}()
 
 	for attempt := 0; attempt < attachParkerVerifyRetries; attempt++ {
 		// Fresh config read for slot selection.
 		vmCfg, cfgErr := c.QEMU().Config(ctx, node, parkerVMID)
 		if cfgErr != nil {
-			return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+			// Classified, not forced retriable: a 403 for a missing
+			// VM.Audit/VM.Config.Disk grant never comes right on its own, and
+			// labelling it retriable makes the Director drive a park forever
+			// against a permission that has to be granted by hand.
+			return cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
 		}
 
 		slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(vmCfg), stolen)
 		if slotErr != nil {
-			return slotErr // ErrNoSlots — caller decides what to do
+			// A full parker that already names our volume on an unusedN key is
+			// not a parker to walk away from. ErrNoSlots sends the caller to the
+			// next parker, and attaching the volume there while this one still
+			// references it is the double reference the sweep exists to prevent.
+			// The config is already in hand, so the check costs nothing.
+			//
+			// demoted is what makes the deferred sweep run on the way out, and
+			// it is the right flag: the reference is exactly the one it clears.
+			if unusedEntriesReference(vmCfg, bareVolid) {
+				demoted = true
+			}
+			// ErrNoSlots — caller decides what to do, unless the deferred sweep
+			// above finds this parker still references the volume, in which case
+			// it converts this into a permanent unswept-reference error.
+			return slotErr
 		}
 
-		var upid string
+		// AttachDisk returns the disk key it wrote ("scsi3"), NOT a UPID: the
+		// attach is a synchronous config PUT, exactly like every other call
+		// site treats it. An earlier version fed that key to AwaitTask, which
+		// asked PVE for the status of task "scsi0" and failed every park the
+		// first time this code met a real cluster. There is no task to await;
+		// the read-after-write below is the completion check.
 		var attachErr error
-		retryErr := RetryOnTransientOrLock(ctx, logger, "park_disk_attach", 0, func() error {
-			upid, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, bareVolid, "scsi", &qemu.AttachOpts{
+		retryErr := RetryOnTransientOrLock(ctx, logger, "park_disk_attach", parkerWindowMaxAttempts, func() error {
+			_, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, bareVolid, "scsi", &qemu.AttachOpts{
 				DiskID: slot,
 			})
 			return attachErr
 		})
 		if retryErr != nil {
-			return cpierrors.WrapAs(retryErr, cpierrors.TypeRetriableCloud,
+			return cpierrors.Wrap(WrapMutationError(retryErr),
 				fmt.Sprintf("attachToParker: attach %q at slot %s on parker vmid %d", bareVolid, slot, parkerVMID))
 		}
-		if upid != "" {
-			if awaitErr := AwaitTask(ctx, c, node, upid); awaitErr != nil {
-				return cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("attachToParker: await attach task for %q on parker vmid %d", bareVolid, parkerVMID))
-			}
-		}
 
-		// Read-after-write: confirm our volid landed in the chosen slot.
+		// Read-after-write: confirm our volid landed in the chosen slot. The
+		// protection lock already serializes parks against each other on the
+		// happy path, so this is the backstop for the paths where it does not:
+		// no pool service, an identity without Pool.Allocate, a lock stolen
+		// past its TTL, or an older release parking without a lock at all.
+		// Losing the slot is silent otherwise -- PVE demotes our volume to an
+		// unusedN key and answers 200.
 		verifyCfg, verifyErr := c.QEMU().Config(ctx, node, parkerVMID)
 		if verifyErr != nil {
-			return cpierrors.WrapAs(verifyErr, cpierrors.TypeRetriableCloud,
+			return cpierrors.Wrap(WrapConfigReadError(verifyErr),
 				fmt.Sprintf("attachToParker: verify config read for parker vmid %d", parkerVMID))
 		}
 		if slotHoldsVolid(qemu.ParseDisks(verifyCfg), slot, bareVolid) {
@@ -886,6 +1302,7 @@ func attachToParker(ctx context.Context, c Client, logger *log.Logger, node stri
 		// slot. Our disk was demoted to unusedN by PVE; the next attach with an
 		// explicit DiskID at a different slot re-references the same volid.
 		stolen[slot] = true
+		demoted = true
 		if logger != nil {
 			logger.Warn("attachToParker: chosen slot lost to concurrent park, retrying next slot",
 				log.Int("parker_vmid", parkerVMID),
@@ -941,8 +1358,12 @@ func slotHoldsVolid(disks map[string]string, slot, bareVolid string) bool {
 // disk is not parked the call returns nil.
 //
 // The algorithm:
-//  1. IsDiskParked cluster-wide — not parked → nil.
-//  2. DetachDisk(node, parkerVMID, slot) with RetryOnTransientOrLock.
+//  1. One cluster-wide holder scan -- not held by a parker -> nil.
+//  2. Take the parker's protection-window lock.
+//  3. Clear protection=1, which PVE otherwise honors by refusing the detach.
+//  4. DetachDisk(node, parkerVMID, slot) with RetryOnTransientOrLock, then
+//     sweep any unusedN key still naming this volume.
+//  5. Restore protection and drop the provenance record.
 func UnparkDisk(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) error {
 	if c == nil {
 		return cpierrors.Cloud("UnparkDisk: client must not be nil")
@@ -958,15 +1379,671 @@ func UnparkDisk(ctx context.Context, c Client, logger *log.Logger, bareVolid str
 	if !parked {
 		return nil
 	}
+	return unparkAt(ctx, c, logger, bareVolid, parkerVMID, parkerNode, slot, cfg)
+}
 
-	retryErr := RetryOnTransientOrLock(ctx, logger, "unpark_disk_detach", 0, func() error {
+// UnparkDiskAt detaches bareVolid from a parker whose location the caller has
+// already resolved, skipping the cluster-wide scan UnparkDisk performs.
+//
+// It exists for callers that had to resolve the holder for their own reasons
+// anyway — attach_disk resolves it to refuse a volume already attached to
+// another VM — so the parked path costs the same single scan it did before that
+// guard was added. A holder that is not a parker is not an error: there is
+// nothing to unpark, and the caller has already decided what that means.
+func UnparkDiskAt(ctx context.Context, c Client, logger *log.Logger, bareVolid string, holder DiskHolder, cfg ParkerConfig) error {
+	if c == nil {
+		return cpierrors.Cloud("UnparkDiskAt: client must not be nil")
+	}
+	if bareVolid == "" {
+		return cpierrors.Cloud("UnparkDiskAt: bareVolid must not be empty")
+	}
+	if !holder.Found || !holder.IsParker {
+		return nil
+	}
+	if holder.Slot == "" {
+		// The scan placed the disk on this parker, so a missing slot means the
+		// config moved underneath the read rather than that the disk is free.
+		return cpierrors.Retriable(
+			"UnparkDiskAt: disk %q confirmed on parker vmid %d but slot not found in config (possible race)",
+			bareVolid, holder.VMID)
+	}
+	return unparkAt(ctx, c, logger, bareVolid, holder.VMID, holder.Node, holder.Slot, cfg)
+}
+
+// parkerProtectionLockTTL bounds how long a held protection-window lock is
+// considered live. A holder whose recorded expiry has passed is treated as
+// crashed and its lock is stolen, so this has to exceed the longest window any
+// caller can legitimately hold — otherwise the lock is taken from a process
+// that is still inside its own window, which is the exact race it exists to
+// prevent, now silent.
+//
+// The longest window is the park path: up to attachParkerVerifyRetries
+// iterations of config read, attach, task await, and verify read, then a
+// protection write and a provenance write. Rather than assume 180s covers the
+// sum of those retry curves -- it does not, on the pushback curve -- the window
+// runs under a deadline derived from this TTL (parkerWindowBudget), so work
+// that would outlive the lock is cut off instead of continuing past the point
+// where another caller may enter. A waiter that times out is handed a retriable
+// error rather than proceeding unserialized, since reaching the deadline means a
+// live holder was inside the window throughout.
+const parkerProtectionLockTTL = 180 * time.Second
+
+// parkerProtectionLockTimeout bounds the wait for the lock. On timeout the
+// window runs unserialized rather than failing, which is what every release
+// before the lock existed did; see withParkerProtectionLock.
+const parkerProtectionLockTimeout = 15 * time.Second
+
+// parkerLockReleaseTimeout bounds the deferred sentinel-pool delete.
+const parkerLockReleaseTimeout = 10 * time.Second
+
+// parkerLockTimeoutsKey carries a test override for the protection-window
+// lock's TTL and acquire timeout. The production values are tuned for a real
+// cluster -- a 15s wait and a 180s TTL -- and a test that exercises the
+// contended paths would otherwise have to spend them in wall-clock time.
+// Test-only, like WithTestBackoff: production code must leave the constants in
+// place.
+type parkerLockTimeoutsKey struct{}
+
+type parkerLockTimeouts struct {
+	ttl     time.Duration
+	timeout time.Duration
+}
+
+// withTestParkerLockTimeouts returns a context that shortens the
+// protection-window lock's TTL and acquire timeout.
+func withTestParkerLockTimeouts(ctx context.Context, ttl, timeout time.Duration) context.Context {
+	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: timeout})
+}
+
+// parkerLockTimeoutsFrom returns the override installed by
+// withTestParkerLockTimeouts, or the production constants.
+func parkerLockTimeoutsFrom(ctx context.Context) (time.Duration, time.Duration) {
+	if o, ok := ctx.Value(parkerLockTimeoutsKey{}).(parkerLockTimeouts); ok && o.ttl > 0 && o.timeout > 0 {
+		return o.ttl, o.timeout
+	}
+	return parkerProtectionLockTTL, parkerProtectionLockTimeout
+}
+
+// parkerProvenanceRemoveTimeout bounds the detached provenance removal that runs
+// after a volume leaves its parker. Two calls, a config read and a description
+// write, on a context the window deadline cannot stop.
+const parkerProvenanceRemoveTimeout = 20 * time.Second
+
+// parkerDemotedSweepTimeout bounds the detached cleanup that clears an unusedN
+// key left by a slot lost to a concurrent park. It covers a lock acquire, a
+// config read, and a detach, so it is generous relative to the lock's own wait.
+const parkerDemotedSweepTimeout = 45 * time.Second
+
+// withParkerProtectionLock serializes the protection windows on one parker VM.
+//
+// Every window is clear protection -> mutate -> restore protection, and two of
+// them interleaved on the same parker produce a restore that lands while the
+// other caller is still mid-detach: PVE then refuses that detach, because
+// protection "will disable the remove VM and remove disk operations". The
+// caller sees a retriable failure on work that was in fact fine. Worse, the
+// loser's restore can be the last write, leaving the flag down on a parker that
+// may hold other deployments' disks.
+//
+// The key is the same "vm-<vmid>" scheme the handlers use for per-VMID
+// read-modify-write serialization, so a parker is serialized under one name
+// cluster-wide. Nothing here ever holds a second lock, so there is no ordering
+// to deadlock on.
+//
+// An acquire failure the CPI causes is not fatal: the mechanism is advisory, the
+// uncontended path is correct without it, and refusing to unpark a disk because
+// the CPI cannot create a sentinel pool would be a worse trade than the race it
+// prevents. A missing pool service, a denied grant, and a transport fault all
+// proceed unlocked and say so. A timeout is the one exception and is returned
+// retriably: reaching the deadline means a live holder was inside the window the
+// whole time, which is exactly the interleaving this lock exists to prevent.
+func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger, parkerVMID int, purpose string, fn func(context.Context) error) error {
+	var pools PoolService
+	if c != nil {
+		pools = c.Pools()
+	}
+	if pools == nil {
+		if logger != nil {
+			logger.Warn("parker: no pool service; running the protection window unserialized",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("purpose", purpose),
+			)
+		}
+		return fn(ctx)
+	}
+	owner := fmt.Sprintf("%s/%d/%d", purpose, os.Getpid(), parkerVMID)
+	ttl, timeout := parkerLockTimeoutsFrom(ctx)
+	handle, lockErr := AcquireClusterLock(ctx, pools,
+		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout)
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrClusterLockTimeout) {
+			// A timeout is not "the lock is unavailable to me", it is "somebody
+			// else is inside the window right now": an expired or unreadable
+			// holder is stolen rather than waited on, so the only way to reach
+			// the deadline is for a live holder to have held it throughout.
+			// Proceeding here would run the exact interleaving this lock exists
+			// to prevent, and it would do so precisely when contention is
+			// highest. Hand it back retriable and let the Director re-drive.
+			return lockErr
+		}
+		// Every other acquire failure means the mechanism is unavailable, not
+		// that somebody holds it: no pool service, a denied CreatePool, a
+		// transport fault. Proceed unserialized rather than fail. An identity
+		// without Pool.Allocate on bosh-lock-* would otherwise never complete an
+		// attach_disk or delete_disk for a parked disk, and running unlocked is
+		// what every release before this one did. Matches the nil-pool branch
+		// above and stampDeletingTag's fallback.
+		if logger != nil {
+			logger.Warn("parker: could not acquire the protection-window lock; running the window unserialized",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("purpose", purpose),
+				log.Err(lockErr),
+			)
+		}
+		// No lock, no TTL to stay inside: run on the caller's own deadline.
+		return fn(ctx)
+	}
+	defer func() {
+		// Release on a detached context: an already-cancelled request would
+		// otherwise fail the delete instantly and strand the sentinel pool
+		// until a later acquirer steals it past the TTL.
+		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerLockReleaseTimeout)
+		defer relCancel()
+		if relErr := handle.Release(relCtx); relErr != nil && logger != nil {
+			logger.Warn("parker: could not release the protection-window lock (non-fatal)",
+				log.Int("parker_vmid", parkerVMID),
+				log.Err(relErr),
+			)
+		}
+	}()
+	// The window runs on a deadline derived from the lock's own TTL, less the
+	// release budget. Bounding each retry loop separately is not enough: their
+	// worst cases compose, and a window that outlives its TTL is stolen by the
+	// next acquirer while this one is still inside it -- protection restored
+	// mid-detach, the sweep refused, exactly the interleaving the lock exists to
+	// prevent. A deadline is the one bound that cannot be composed past.
+	//
+	// Restores use context.WithoutCancel, so protection still goes back on when
+	// this deadline is what stopped the work.
+	windowCtx, windowCancel := context.WithTimeout(ctx, parkerWindowBudget(ttl))
+	defer windowCancel()
+	return fn(windowCtx)
+}
+
+// parkerProtectionRestoreReserve is time set aside for the protection restore
+// that runs after the window body, on a detached context so a cancelled call
+// still puts the flag back. Four attempts on the pushback curve (5s, 7.5s,
+// 11.25s) plus the writes themselves land under 30s.
+const parkerProtectionRestoreReserve = 30 * time.Second
+
+// parkerWindowBudget is how long work may run inside a protection window whose
+// lock carries the given TTL.
+//
+// Not simply the TTL: three things run AFTER the body, all on detached contexts
+// precisely so a deadline cannot stop them -- the deferred unusedN sweep
+// (parkerDemotedSweepTimeout), the protection restore
+// (parkerProtectionRestoreReserve), and the sentinel release
+// (parkerLockReleaseTimeout). Give the body the whole TTL and those three run
+// past the recorded expiry, where a waiter is entitled to steal the lock and
+// enter its own window -- so the deadline would move the interleaving past the
+// fence rather than remove it. The reserve is subtracted instead.
+//
+// Never less than a second, so a test clock that sets a tiny TTL still runs its
+// body rather than expiring before the first call.
+func parkerWindowBudget(ttl time.Duration) time.Duration {
+	reserve := parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
+	budget := ttl - reserve
+	if budget < time.Second {
+		return time.Second
+	}
+	return budget
+}
+
+// unparkAt performs the detach itself once the parker, its node, and the slot
+// are known. Shared by UnparkDisk and UnparkDiskAt so both spend the protection
+// flag the same way.
+func unparkAt(ctx context.Context, c Client, logger *log.Logger, bareVolid string, parkerVMID int, parkerNode, slot string, cfg ParkerConfig) error {
+	return withParkerProtectionLock(ctx, c, logger, parkerVMID, "unpark", func(wctx context.Context) error {
+		return unparkAtLocked(wctx, c, logger, bareVolid, parkerVMID, parkerNode, slot, cfg)
+	})
+}
+
+// unparkAtLocked is unparkAt's body, run with the parker's protection window
+// held. Split out so the lock scope is exactly the window and nothing else.
+func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid string, parkerVMID int, parkerNode, slot string, cfg ParkerConfig) error {
+	// Re-resolve the slot under the lock. The caller's slot came from a scan
+	// taken before the lock was held, and detaching a slot by name is a blind
+	// write: PVE detaches whatever occupies scsiN now, not the volume we looked
+	// up. Two unparks of the same disk that overlap -- a Director retry after a
+	// timeout, or two CPI processes racing -- would otherwise have the second
+	// one detach a volume a concurrent park had just placed in the freed slot,
+	// silently un-parking a disk whose own detach_disk already reported success.
+	// One config read inside the window is a small price for not detaching
+	// someone else's volume.
+	verifyCfg, verifyErr := c.QEMU().Config(ctx, parkerNode, parkerVMID)
+	if verifyErr != nil {
+		if parkerConfigGone(verifyErr) {
+			// The parker is gone, and with it the reference. Nothing to unpark.
+			return nil
+		}
+		return cpierrors.Wrap(WrapConfigReadError(verifyErr),
+			fmt.Sprintf("UnparkDisk: re-read parker vmid %d on node %s before detach", parkerVMID, parkerNode))
+	}
+	actualSlot, onActiveBus := FindDiskIDByVolID(qemu.ParseDisks(verifyCfg), bareVolid)
+	if onActiveBus {
+		if actualSlot != slot && logger != nil {
+			logger.Info("parker: disk moved slots between the holder scan and the unpark; using the current one",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("volid", bareVolid),
+				log.String("scanned_slot", slot),
+				log.String("actual_slot", actualSlot),
+			)
+		}
+		slot = actualSlot
+	} else {
+		// Not on any active bus. Either another caller already detached it, or a
+		// previous attempt failed between PVE's demotion to unusedN and the key
+		// removal. The first case is done; the second still has to be swept, and
+		// the sweep needs the protection window.
+		if !unusedEntriesReference(verifyCfg, bareVolid) {
+			// The volume is off this parker entirely. Drop the provenance entry
+			// as every other success path does: the record exists to name what
+			// this parker holds, and one that outlives the disk it names is what
+			// a later audit reads as a parker still holding a volume.
+			removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
+			return nil
+		}
+		return sweepDemotedUnderProtection(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
+	}
+
+	// Every parker carries protection=1, and PVE states that the flag "will
+	// disable the remove VM and remove disk operations" — detaching a disk from
+	// its slot is exactly such an operation, so PVE rejects it while the flag is
+	// set. Clear protection for the length of the detach and put it straight
+	// back. Failing to clear it is fail-closed: without this the detach cannot
+	// succeed, so there is no point attempting it.
+	if protErr := setParkerProtection(ctx, c, logger, parkerNode, parkerVMID, false); protErr != nil {
+		// Classify rather than assume: a 403 for a missing VM.Config.Options
+		// grant never comes right on its own, and labelling it retriable makes
+		// the Director drive an unpark forever against a permission that has to
+		// be granted by hand.
+		return cpierrors.Wrap(WrapMutationError(protErr),
+			fmt.Sprintf("UnparkDisk: clear protection on parker vmid %d on node %s", parkerVMID, parkerNode))
+	}
+
+	retryErr := RetryOnTransientOrLock(ctx, logger, "unpark_disk_detach", parkerWindowMaxAttempts, func() error {
 		return c.QEMU().DetachDisk(ctx, parkerNode, parkerVMID, slot)
 	})
+
+	// PVE does not free a detached volume: it demotes it to an unusedN key. The
+	// SDK's DetachDisk clears that key as a second request, so a transient
+	// failure between the two leaves the volume referenced as unusedN — and the
+	// retry then finds the active slot already gone and reports success.
+	//
+	// Nothing downstream can see that reference. Every holder probe here matches
+	// on the active-bus keys only, so IsDiskParked answers "not parked" forever,
+	// attach_disk's holder guard sees no holder, and the volume is attached to a
+	// workload VM while the parker still points at it. Purging the parker then
+	// frees a live persistent disk along with it: qm destroy walks the config's
+	// unused entries too. Sweep it while protection is still down,
+	// which is the only window in which PVE will accept the removal.
+	//
+	// Detached and separately bounded, like the park path's deferred sweep and
+	// for the same reason: the detach has already happened, so a cancelled or
+	// deadline-stopped unpark is exactly when the stranded reference matters
+	// most. On the window context this sweep would fail on the dead context
+	// without looking at the parker at all, and report a permanent action item
+	// telling the operator to unlink a key the SDK's second request had probably
+	// already removed. The window budget reserves this time (parkerWindowBudget).
+	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, parkerNode, parkerVMID, bareVolid)
+	sweepCancel()
+
+	// Restore protection whether or not the detach succeeded: leaving a parker
+	// unprotected is the one outcome worse than a failed unpark, since the
+	// parker may still hold other deployments' disks. context.WithoutCancel
+	// keeps the restore reachable when the request context is already done —
+	// a cancelled or timed-out unpark is exactly when the window would otherwise
+	// stay open indefinitely. A restore failure is logged rather than returned:
+	// the detach result is what the caller acts on, and the park path re-asserts
+	// the flag on every attach.
+	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, parkerNode, parkerVMID, true); protErr != nil && logger != nil {
+		logger.Warn("UnparkDisk: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", parkerNode),
+			log.Err(protErr),
+		)
+	}
+
 	if retryErr != nil {
-		return cpierrors.WrapAs(retryErr, cpierrors.TypeRetriableCloud,
+		// Classified like the protection write one line up: a 403 for a missing
+		// VM.Config.Disk grant is a permission to add, not a fault to re-drive.
+		return cpierrors.Wrap(WrapMutationError(retryErr),
 			fmt.Sprintf("UnparkDisk: detach %q from parker vmid %d slot %s on node %s",
 				bareVolid, parkerVMID, slot, parkerNode))
 	}
+	if sweepErr != nil {
+		// The active slot is gone but PVE's unusedN key for this volume is not.
+		// Nothing downstream can see that reference: every holder probe here
+		// matches active-bus keys only, so a retry of this call finds the disk
+		// free and attaches it to a workload VM while the parker still points
+		// at it.
+		//
+		// The retry does NOT clear it. Control only reaches here with the detach
+		// already successful, so the retry's holder scan finds nothing on this
+		// parker, UnparkDiskAt returns early, and no sweep runs. A later park
+		// starts with demoted=false, so its defer never fires either. The
+		// reference stands until an operator clears it -- which is why the error
+		// below is permanent and carries the commands that clear it.
+		reportUnsweptReference(logger, parkerNode, parkerVMID, bareVolid, sweepErr)
+		return unsweptReferenceError(parkerNode, parkerVMID, bareVolid, sweepErr)
+	}
 	removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
 	return nil
+}
+
+// unusedEntriesReference reports whether any unusedN key in cfg names bareVolid.
+// A demoted volume is invisible to every active-bus probe, so this is the only
+// way to tell "already unparked" from "unparked but still referenced".
+func unusedEntriesReference(cfg map[string]any, bareVolid string) bool {
+	for _, volid := range FindUnusedDiskEntries(cfg) {
+		if volid == bareVolid {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepDemotedUnderProtection opens the protection window for a sweep alone,
+// for the unpark that finds its volume already off the active bus but still
+// named by an unusedN key. Returns nil when the reference is cleared.
+func sweepDemotedUnderProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig) error {
+	if protErr := setParkerProtection(ctx, c, logger, node, parkerVMID, false); protErr != nil {
+		return cpierrors.Wrap(WrapMutationError(protErr),
+			fmt.Sprintf("UnparkDisk: clear protection on parker vmid %d to sweep a demoted reference", parkerVMID))
+	}
+	// Detached and bounded, as in unparkAtLocked: this sweep is the whole point
+	// of the call, and running it on a context that may already be done would
+	// report an action item for work never attempted.
+	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, node, parkerVMID, bareVolid)
+	sweepCancel()
+	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
+		logger.Warn("UnparkDisk: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.Err(protErr),
+		)
+	}
+	if sweepErr != nil {
+		// Same condition, same consequence as the detach path: see
+		// reportUnsweptReference.
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid, sweepErr)
+		return unsweptReferenceError(node, parkerVMID, bareVolid, sweepErr)
+	}
+	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+	return nil
+}
+
+// unsweptReferenceError is the failure an unpark returns when the volume left
+// its active slot but the unusedN key PVE demoted it to could not be removed.
+//
+// Permanent, and that is the whole point. The detach has already succeeded, so
+// the Director's retry resolves the holder, finds none -- every holder probe
+// here matches active-bus keys only -- and goes on to attach the volume to the
+// workload VM while the parker still references it. A retriable class would not
+// re-run the sweep; it would skip straight past it to exactly the double
+// reference the sweep exists to prevent. Fail the call, name the parker, and
+// carry the commands that clear it.
+func unsweptReferenceError(node string, parkerVMID int, bareVolid string, cause error) error {
+	return unsweptReferenceErrorFor(
+		"UnparkDisk", "detached", node, parkerVMID, bareVolid, cause)
+}
+
+// unsweptReferenceErrorFor is unsweptReferenceError with the operation named by
+// the caller. The park path emits the same class for the same condition, and the
+// unpark's wording ("detached ... from parker") tells an operator a false story
+// about what happened when nothing was detached -- on the one error whose entire
+// purpose is to be acted on by hand.
+func unsweptReferenceErrorFor(
+	op, verb, node string, parkerVMID int, bareVolid string, cause error,
+) error {
+	return cpierrors.Cloud(
+		"%s: %s %q on parker vmid %d (node %s) and could not clear the unused reference PVE "+
+			"left behind, and nothing clears it on its own. Until it is cleared the parker holds an invisible "+
+			"reference to a live volume and must not be purged. Clear it with: "+
+			"qm set %d --protection 0 && qm unlink %d --idlist <unusedN> && qm set %d --protection 1, "+
+			"then retry. Cause: %s",
+		op, verb, bareVolid, parkerVMID, node, parkerVMID, parkerVMID, parkerVMID, cause.Error())
+}
+
+// reportUnsweptReference announces the one parker state nothing recovers from on
+// its own: PVE demoted a volume to an unusedN key and the CPI could not remove
+// it. Every holder probe here matches active-bus keys only, so the reference is
+// invisible — a later unpark of this volume finds no holder and returns early, a
+// later park only sweeps a slot it lost in that same call, and destroying the
+// parker by hand frees a live persistent disk along with it -- qm destroy walks
+// the config's unused entries too. ERROR, with the commands
+// that clear it, because it is an action item rather than a warning.
+func reportUnsweptReference(logger *log.Logger, node string, parkerVMID int, bareVolid string, cause error) {
+	if logger == nil {
+		return
+	}
+	logger.Error("parker: could not clear the unused reference PVE left behind; "+
+		"nothing clears this on its own — this parker holds an invisible reference to a live volume and "+
+		"must not be purged until it is cleared by hand: "+
+		"qm set <parker-vmid> --protection 0 && qm unlink <parker-vmid> --idlist <unusedN> "+
+		"&& qm set <parker-vmid> --protection 1",
+		log.Int("parker_vmid", parkerVMID),
+		log.String("node", node),
+		log.String("volid", bareVolid),
+		log.Err(cause),
+	)
+}
+
+// parkerConfigGone reports whether err means the parker's config is not there
+// to read. PVE answers that question two ways: a 404 from the HTTP layer, and a
+// task-level "Configuration file ... does not exist" from pmxcfs when the conf
+// went away between calls. Both mean the VM carries no reference to anything,
+// which for every caller here is the same as an empty config rather than a
+// failure to read one.
+func parkerConfigGone(err error) bool {
+	return IsNotFound(err) || IsPmxcfsConfigMissing(err)
+}
+
+// sweepParkerUnusedSlots removes every unusedN key on a parker whose value is
+// bareVolid. Callers must hold the parker's protection window open: PVE refuses
+// to remove an unused disk entry while protection is set, exactly as it refuses
+// the active-slot detach.
+//
+// It is idempotent and cheap on the common path — one config read that finds
+// nothing to do. It exists because a volume demoted to unusedN is invisible to
+// every holder probe in this package, so an unswept entry is a reference no
+// later call can find and no later call can clear.
+//
+// The removal is verified with one re-read after the loop. Every other write in
+// this file is read-after-write checked, and this one has the quietest failure:
+// PVE routes an unused-key removal through a deallocation whose result gates the
+// config-key removal, so a non-error response is not by itself proof the key is
+// gone.
+//
+// A read that fails is a failed sweep, not a clean one. Callers act on the
+// result -- one of them has already SEEN the unusedN entry and calls this to
+// clear it -- so answering "nothing to do" from a read that never arrived would
+// report a reference cleared that is still there, and then delete the
+// provenance record that names it. A config that is gone is the one exception:
+// no config, no reference.
+//
+// Note that a LATER call does not generally sweep again -- an unpark whose
+// detach already succeeded finds no holder and returns early, and a park only
+// sweeps when it lost a slot in that same call -- so a reference left behind
+// here stands until an operator clears it.
+func sweepParkerUnusedSlots(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) error {
+	cfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+	if err != nil {
+		if parkerConfigGone(err) {
+			return nil
+		}
+		return cpierrors.Wrap(WrapConfigReadError(err),
+			fmt.Sprintf("parker: read config to sweep unused disk slots on parker vmid %d", parkerVMID))
+	}
+	swept := 0
+	for slot, volid := range FindUnusedDiskEntries(cfg) {
+		if volid != bareVolid {
+			continue
+		}
+		// Never remove an unused entry whose volume belongs to this parker's own
+		// VMID. Under an overlapping band a parked volume can be named for the
+		// parker holding it, and PVE deallocates a disk it considers the VM's
+		// own -- so the removal that is meant to clear a stale reference would
+		// destroy the volume instead. Leave it and say so.
+		if embedded, ok := EmbeddedDiskVMID(volid); ok && embedded == parkerVMID {
+			// The reference stands, and this call cannot clear it. Report it as
+			// the unswept reference it is rather than counting it as swept:
+			// returning success here tells the unpark the volume is free while
+			// the parker still names it.
+			refusal := cpierrors.Cloud(
+				"parker: unused entry %s on parker vmid %d references %q, whose volume ID is named for this "+
+					"parker; removing it would deallocate the volume rather than drop the reference. The parker "+
+					"band overlaps the disk band -- correct parked_disk_vmid_range_start/end",
+				slot, parkerVMID, volid)
+			reportUnsweptReference(logger, node, parkerVMID, bareVolid, refusal)
+			return refusal
+		}
+		sweepErr := RetryOnTransientOrLock(ctx, logger, "parker_sweep_unused", parkerWindowMaxAttempts, func() error {
+			return c.QEMU().DetachDisk(ctx, node, parkerVMID, slot)
+		})
+		if sweepErr != nil {
+			if IsNotFound(sweepErr) {
+				continue
+			}
+			return cpierrors.Wrap(WrapMutationError(sweepErr),
+				fmt.Sprintf("parker: remove lingering %s referencing %q on parker vmid %d",
+					slot, bareVolid, parkerVMID))
+		}
+		swept++
+		if logger != nil {
+			logger.Info("parker: removed lingering unused disk slot",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("slot", slot),
+				log.String("volid", bareVolid),
+			)
+		}
+	}
+	if swept == 0 {
+		return nil
+	}
+	// Read-after-write. A non-error response is not proof the key is gone.
+	//
+	// A read that cannot be completed is a failure, not a shrug. Nothing reads
+	// this parker again on the CPI's own initiative -- a later unpark of this
+	// volume finds no holder and returns early, and a later park only sweeps a
+	// slot it lost in that same call -- so "the next read catches it" describes
+	// a read that never happens. Reporting success here hands attach_disk a
+	// volume the parker may still reference on an unusedN key, and deletes the
+	// provenance entry that named it.
+	var verifyCfg map[string]any
+	verifyErr := RetryOnTransient(ctx, logger, "parker_sweep_verify", parkerWindowMaxAttempts, func() error {
+		cfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+		if err != nil {
+			return err
+		}
+		verifyCfg = cfg
+		return nil
+	})
+	if verifyErr != nil {
+		if parkerConfigGone(verifyErr) {
+			// No config, no reference. The parker went away between the removal
+			// and the read, which takes the unusedN key with it.
+			return nil
+		}
+		unverified := cpierrors.Cloud(
+			"parker: removed the unused entry referencing %q on parker vmid %d but could not read the config "+
+				"back to confirm it: %s",
+			bareVolid, parkerVMID, verifyErr.Error())
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid, unverified)
+		return unverified
+	}
+	if unusedEntriesReference(verifyCfg, bareVolid) {
+		// Permanent, for the same reason the caller's own failure is: a retry
+		// re-drives an unpark whose detach already succeeded, so its holder scan
+		// finds nothing on the parker, it returns early without sweeping, and
+		// the attach it guards proceeds against a volume this parker still
+		// references.
+		survived := cpierrors.Cloud(
+			"parker: unused entry referencing %q survived removal on parker vmid %d", bareVolid, parkerVMID)
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid, survived)
+		return survived
+	}
+	return nil
+}
+
+// sweepParkerUnusedSlotsProtectedLocked opens the protection window around a
+// sweep and closes it again. The caller must already hold the parker's
+// protection lock -- AcquireClusterLock is not reentrant, so taking it again
+// here would wait out its own timeout against a lock this process holds.
+//
+// Every failure is logged rather than returned: the caller is a deferred
+// cleanup with no result of its own to report.
+// Returns false when the reference may still stand, so a caller whose next step
+// depends on the volume being free can change course.
+func sweepParkerUnusedSlotsProtectedLocked(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) bool {
+	if protErr := setParkerProtection(ctx, c, logger, node, parkerVMID, false); protErr != nil {
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid, protErr)
+		return false
+	}
+	sweepErr := sweepParkerUnusedSlots(ctx, c, logger, node, parkerVMID, bareVolid)
+	if sweepErr != nil {
+		reportUnsweptReference(logger, node, parkerVMID, bareVolid, sweepErr)
+	}
+	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
+		logger.Warn("parker: could not restore protection after a sweep — re-set it by hand (qm set <vmid> --protection 1)",
+			log.Int("parker_vmid", parkerVMID),
+			log.Err(protErr),
+		)
+	}
+	return sweepErr == nil
+}
+
+// reassertParkerProtection puts protection back on a parker after a successful
+// attach. It is the counterpart to the unpark window: a restore that failed, a
+// request cancelled mid-unpark, or a CPI process killed between the clear and
+// the restore all leave a parker unprotected with no other caller able to
+// notice. Since the park path already knows it just wrote to this parker, one
+// idempotent PUT here closes that window at the next use.
+//
+// A failure is logged, never returned: the disk is parked either way, and
+// failing the park would be a worse outcome than a protection flag that stays
+// down until the next park.
+func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int) {
+	if protErr := setParkerProtection(ctx, c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
+		logger.Warn("parker: could not re-assert protection after a park — re-set it by hand (qm set <vmid> --protection 1)",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.Err(protErr),
+		)
+	}
+}
+
+// setParkerProtection sets or clears the PVE protection flag on a parker VM.
+// Used by UnparkDisk to open a bounded window for the detach, and by the park
+// path to re-assert the flag on every successful attach, which is what closes
+// the window a failed restore, a cancelled request, or a killed CPI process
+// would otherwise leave open. A nil nodes service (test stubs without
+// injection) is a no-op.
+func setParkerProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, on bool) error {
+	nodesSvc := c.Nodes()
+	if nodesSvc == nil {
+		return nil
+	}
+	vmidStr := strconv.Itoa(parkerVMID)
+	value := on
+	// Bounded like every other in-window call: the default ten attempts on the
+	// storage-lock curve sleep past two minutes, and on the pushback curve past
+	// four, either of which outlives the lock TTL guarding the window this write
+	// opens and closes.
+	return RetryOnTransientOrLock(ctx, logger, "parker_set_protection", parkerWindowMaxAttempts, func() error {
+		return nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+			Protection: &value,
+		})
+	})
 }

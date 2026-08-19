@@ -505,7 +505,7 @@ Persistent disks use synthetic VMIDs 9000–29999 and survive `qm destroy` only 
 Inspect before destroying:
 
 ```bash
-qm config <vmid> | grep -E '^(scsi|unused)'
+qm config <vmid> | grep -E '^(scsi|unused)[0-9]+:'
 ```
 
 Identify any `vm-9NNN` volumes in the output. If they belong to a still-tracked persistent disk, detach them via BOSH or `bosh cck` first, or copy the volume ID for manual preservation before proceeding.
@@ -647,7 +647,7 @@ After the last director is gone, confirm nothing was left behind. `pve-cid` ship
 python3 scripts/disk-audit --config <path-to-audit-config.json>
 ```
 
-The first command surfaces stemcell qcow2 files with zero remaining director references, or cache templates whose backing file is gone — either is now safe to remove by hand if it was not already cleaned up automatically. The second inventories persistent-disk volumes, including any parked disks under `detached_disk_strategy: parked`, that no longer correspond to a live VM.
+The first command surfaces stemcell qcow2 files with zero remaining director references, or cache templates whose backing file is gone — either is now safe to remove by hand if it was not already cleaned up automatically. The second inventories persistent-disk volumes, including any parked disks, that no longer correspond to a live VM.
 
 ### Known limitation: fast-path delete skips the pool reaper
 
@@ -965,7 +965,7 @@ See [Configuration — Storage properties](configuration.md) for the full set of
 
 ## Parked Disk Strategy
 
-When `detached_disk_strategy: parked` is enabled, the CPI holds detached disks on dedicated parker VMs rather than leaving them as free-floating storage volumes. Parker VMs carry the `bosh-parker` tag and occupy VMIDs in the range **90000–90999**. Each parker can hold up to 31 disks across its SCSI slots. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md) for the full mechanics and trade-off discussion.
+Under `detached_disk_strategy: parked` (the default), the CPI holds detached disks on dedicated parker VMs rather than leaving them as free-floating storage volumes. Parker VMs carry the `bosh-parker` tag and occupy VMIDs in the range **90000–90999**. Each parker can hold up to 31 disks across its SCSI slots. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md) for the full mechanics and trade-off discussion.
 
 ### Auditing parked disks with `scripts/disk-audit`
 
@@ -1013,19 +1013,25 @@ python3 scripts/disk-audit --config /path/to/audit-config.json --json
 
 The script prints warnings to stderr when:
 
-- Parked disks exist but `detached_disk_strategy` in the config file is not `"parked"`.
+- Parked disks exist but `detached_disk_strategy` in the config file is set to `"free"`.
 
-- Empty parker VMs are found (0 disks held). Each empty parker is a teardown candidate.
+- Empty parker VMs are found (no bus disk and no `unusedN` reference). Each empty parker is a teardown candidate.
+
+- A parker carries an `unusedN` reference to a live volume, left by a sweep that did not complete. The warning names the `qm unlink` sequence that clears it. That parker is not a teardown candidate: `qm destroy --purge` frees the volume behind an `unusedN` entry as readily as one in a `scsiN` slot.
+
+- A parker's config did not come back, so its contents are unknown and it is not reported as empty.
 
 ### Recovering empty parker VMs
 
-The script prints a `qm destroy` command for each empty parker VM. Verify before running:
+The script prints the removal commands for each empty parker VM. Verify before running. The digit anchor matters: every parker carries a `scsihw:` line, so a bare `^scsi` matches on an empty parker too and the check never clears.
 
 ```bash
 # Confirm the parker holds no disks
-qm config <parker-vmid> | grep -E '^(scsi|virtio|ide|sata)'
-# Proceed only when the above is empty
-qm destroy <parker-vmid> --purge 1
+qm config <parker-vmid> | grep -E '^(scsi|virtio|ide|sata|unused)[0-9]+:'
+# Proceed only when the above is empty. Every parker carries protection=1,
+# which PVE honors by refusing the destroy, so clear it in the same breath.
+qm set <parker-vmid> --protection 0
+qm destroy <parker-vmid> --purge
 ```
 
 A parker VM that still holds disks must not be destroyed — doing so deletes those disks permanently. If the parked disk is no longer needed, delete it via BOSH (`bosh delete-disk <cid>`) first.

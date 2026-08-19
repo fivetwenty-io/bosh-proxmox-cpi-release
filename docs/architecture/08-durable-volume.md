@@ -56,22 +56,22 @@ Identity also needs a namespace. Persistent disks get their own synthetic VMID b
 
 ## The detach window and the coat-check
 
-Between detaching a disk and re-attaching or deleting it, a persistent disk has no owning VM. The default strategy lets it float as a bare unattached volume — cheap, unlimited, one API call. But a PVE administrator browsing storage sees an anonymous volume with zero native signal that it is a live BOSH disk. They might delete it. A cleanup script might garbage-collect it as an orphan. For a single BOSH-aware operator that risk is fine; for a shop with non-BOSH-aware admins or storage-scanning automation it is not.
+Between detaching a disk and re-attaching or deleting it, a persistent disk has no owning VM. The cheap reading of that window lets the disk float as a bare unattached volume — unlimited, one API call. But a PVE administrator browsing storage then sees an anonymous volume with zero native signal that it is a live BOSH disk. They might delete it. A cleanup script might garbage-collect it as an orphan. For a single BOSH-aware operator that risk is tolerable; for a shop with non-BOSH-aware admins or storage-scanning automation it is not, and the loss it ends in is unrecoverable. So floating is what we make operators ask for, not what they get by accident.
 
-The opt-in strategy gives every detached disk a visible, protected home. Think of it as a coat-check. Each detached disk is hung in an active slot of a dedicated parker VM. The parker is a machine in its own VMID band that is never started. It is marked deletion-protected, so PVE refuses to remove it. It exists for no reason other than to hold ownership — and a deletion block — onto bytes PVE would otherwise treat as anonymous. Parkers fill densely: each holds many disks, new parks reuse the lowest parker with a free slot, and a fresh parker is created only when the rest are full. Local disks park on a parker on their own node, honoring locality even at rest. The cost is a handful of extra API operations per detach instead of one — the price of making an invisible thing safe.
+The default strategy gives every detached disk a visible, protected home. Think of it as a coat-check. Each detached disk is hung in an active slot of a dedicated parker VM. The parker is a machine in its own VMID band that is never started. It is marked deletion-protected, so PVE refuses to remove it. It exists for no reason other than to hold ownership — and a deletion block — onto bytes PVE would otherwise treat as anonymous. Parkers fill densely: each holds many disks, new parks reuse the lowest parker with a free slot, and a fresh parker is created only when the rest are full. Local disks park on a parker on their own node, honoring locality even at rest. The cost is a handful of extra API operations per detach instead of one, on top of a cluster-wide holder scan that both strategies now pay before an attach or a delete — the price of making an invisible thing safe.
 
 ```mermaid
 flowchart TB
-    subgraph Free["Free-floating — default"]
+    subgraph Free["Free-floating — opt-in"]
         F1["Bare unattached volume"]
         F2["No native signal it is a BOSH disk;<br/>an admin or GC script may delete it"]
     end
-    subgraph Parked["Parked — opt-in"]
+    subgraph Parked["Parked — default"]
         P1["Hung in a never-started parker VM"]
         P2["Deletion-protected, provenance recorded,<br/>visibly owned"]
     end
 ```
-*Free-floating is cheap and anonymous; parking trades a few API calls for a visible, protected home.*
+*Parking trades a few API calls for a visible, protected home; free-floating gives that back for cheapness and anonymity.*
 
 ## The paperwork can race; the disk cannot
 

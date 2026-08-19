@@ -62,6 +62,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_stemcell_template_vmid_range_end",
 	"pve_parked_disk_vmid_range_start",
 	"pve_parked_disk_vmid_range_end",
+	"pve_detached_disk_strategy",
 	"pve_stemcell_replicate_local",
 	"pve_vm_prefix",
 	"pve_agent_mode",
@@ -273,6 +274,24 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.ParkedDiskVMIDRangeEnd = n
+		return nil
+	},
+	// The detached-disk strategy belongs here for the same reason the parker
+	// band does: it is a statement about the TARGET cluster's VMID topology.
+	// A cluster whose 90000-90999 band is already occupied by operator guests,
+	// or that is administered by someone who does not want BOSH creating
+	// parker VMs on it, needs to opt out for that cpi-config entry alone.
+	// Without this key the band is movable per entry but the feature is not
+	// switchable per entry, and an entry-level "free" would be silently
+	// dropped into the unknown-keys warning while every detach kept parking.
+	// Enum validation is delegated to the eff.Validate() call at the end of
+	// ApplyContextOverrides, matching every other value-constrained key here.
+	"pve_detached_disk_strategy": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.DetachedDiskStrategy = s
 		return nil
 	},
 	// Whether cache templates need per-node replicas is a property of the
@@ -575,6 +594,11 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	extra = flattenNestedContextOverrides(extra)
 
 	eff := *base // shallow copy — see doc comment above.
+	// Start from the pre-defaulting shape of the parker band, so an entry that
+	// sets one bound does not silently inherit the other from ApplyDefaults and
+	// an entry that sets none can be told apart from one that named the built-in
+	// band deliberately. reevaluateParkedDefaultAfterOverrides puts it back.
+	eff.clearDefaultedParkerBand()
 	var appliedKeys []string
 
 	for _, key := range contextOverrideFieldOrder {
@@ -623,6 +647,12 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// (handlers.Deps.WithRequestOverrides) wraps it as a non-retriable
 	// CloudError, matching every other coercion failure from this function —
 	// a manifest/cpi-config authoring bug, never a transient condition.
+	// Re-decide the parked default against this entry's bands: an entry that
+	// widened another VMID band over the built-in parker band, or that opted out
+	// of parking entirely, would otherwise fail validation below for every
+	// request routed to it. See reevaluateParkedDefaultAfterOverrides.
+	eff.reevaluateParkedDefaultAfterOverrides()
+
 	if validateErr := eff.Validate(); validateErr != nil {
 		return nil, nil, nil, fmt.Errorf("config: effective override config failed validation: %w", validateErr)
 	}

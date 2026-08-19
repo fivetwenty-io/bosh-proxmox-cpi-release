@@ -1383,6 +1383,9 @@ func invariantDivergenceSetup(t *testing.T, mode string) (*attachQEMUService, *c
 		VMDiskFormat:          "qcow2",
 		DiskPerfInvariantMode: mode,
 		DiskPerformance:       &config.DiskPerformanceDefaults{Iothread: &ioTrue},
+		// Invariant checks are independent of the disk's detached lifecycle;
+		// opt out of the parked default so no parker scan runs here.
+		DetachedDiskStrategy: "free",
 	}
 	return qemuSvc, cfg, encodedCID
 }
@@ -1562,9 +1565,12 @@ func parkedCfg() *config.CPIConfig {
 // Config call sequence driven by configCfgs:
 //
 //	Call 1: FindVMByDiskVolid — config read for parker VMID (disk present → match)
-//	Call 2: IsDiskParked — second config read for parker VMID (tags + slot lookup)
-//	Call 3: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
-//	Call 4: ResolveDiskID — target VM config after attach (scsi1 present)
+//	Call 2: holder resolution — second config read for parker VMID (tags + slot)
+//	Call 3: unpark — re-resolves the slot under the protection lock, because a
+//	        slot name resolved before the lock is a blind write by the time the
+//	        detach runs
+//	Call 4: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
+//	Call 5: ResolveDiskID — target VM config after attach (scsi1 present)
 func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	t.Parallel()
 
@@ -1587,9 +1593,10 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
 			parkerVMCfg,         // call 1: FindVMByDiskVolid config scan on parker VMID
-			parkerVMCfg,         // call 2: IsDiskParked config read (tags + slot)
-			targetVMCfgEmpty,    // call 3: chooseSCSISlotSkippingZero on target VM
-			targetVMCfgAttached, // call 4: ResolveDiskID on target VM after attach
+			parkerVMCfg,         // call 2: holder resolution reads tags + slot
+			parkerVMCfg,         // call 3: unpark re-resolves the slot under the lock
+			targetVMCfgEmpty,    // call 4: chooseSCSISlotSkippingZero on target VM
+			targetVMCfgAttached, // call 5: ResolveDiskID on target VM after attach
 		},
 	}
 	ag := &captureAgent{}
@@ -1717,12 +1724,16 @@ func TestHandleAttachDisk_Parked_UnparkFailRetriable(t *testing.T) {
 	}
 }
 
-// TestHandleAttachDisk_StrategyFree_NoParkerCalls verifies parker-free
-// behavior when strategy is unset (free, the default): no parker API calls
-// (unpark DetachDisk) are made. The VM-node lookup makes exactly ONE
-// ListResources call (attachDiskResolveNode locating the VM's owning node —
-// required on multi-node clusters); anything beyond that would indicate a
-// parker cluster scan and fails the test.
+// TestHandleAttachDisk_StrategyFree_NoParkerCalls verifies parker-free behavior
+// when the operator opts out with strategy=free: no parker is touched, no
+// unpark DetachDisk is issued, and the attach proceeds.
+//
+// Two ListResources calls are expected and required: attachDiskResolveNode
+// locating the VM's owning node, and the holder scan that refuses a volume
+// already attached elsewhere. The second one is deliberately not gated on the
+// strategy — opting out of parking is exactly the configuration that can leave
+// disks stranded on a parker, and a silent second attachment is the outcome
+// worth spending a scan to prevent.
 func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	t.Parallel()
 	const bareCID = "local-lvm:vm-9001-disk-0"
@@ -1747,7 +1758,9 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 		Config: &config.CPIConfig{
 			Node:         testNode,
 			VMDiskFormat: "qcow2",
-			// DetachedDiskStrategy unset → free (default); no range set → ParkedStrategyActive()=false
+			// strategy=free opts out of the parked default; no range set →
+			// ParkedStrategyActive()=false
+			DetachedDiskStrategy: "free",
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
@@ -1768,7 +1781,96 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
 	}
-	if listCalls > 1 {
-		t.Errorf("strategy=free: expected at most 1 ListResources call (VM-node lookup); got %d — extra calls indicate a parker cluster scan", listCalls)
+	if listCalls != 2 {
+		t.Errorf("strategy=free: expected 2 ListResources calls (VM-node lookup + holder guard); got %d", listCalls)
+	}
+}
+
+// TestHandleAttachDisk_HolderIsTarget_NotRefused pins the clause that keeps a
+// re-driven attach_disk idempotent. The Director retries attach_disk routinely,
+// and on a retry the target VM is already the holder -- refusing there would
+// turn every retry into a permanent deployment failure. Deleting
+// "&& holder.VMID != targetVMID" from the guard must fail this test.
+func TestHandleAttachDisk_HolderIsTarget_NotRefused(t *testing.T) {
+	t.Parallel()
+
+	const targetVMID = 101
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	// The target already holds the disk, which is what a retry looks like.
+	qemuSvc := &attachQEMUService{
+		configCfg: map[string]any{"scsi2": volid, "tags": "bosh-cpi"},
+	}
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			targetRaw, _ := json.Marshal(map[string]any{
+				"vmid": targetVMID, "node": "pve-node1", "type": "qemu", "tags": "bosh-cpi",
+			})
+			resp := sdkcluster.ListResourcesResponse{targetRaw}
+			return &resp, nil
+		},
+	}
+
+	deps := attachDeps(qemuSvc, &mockAgentService{})
+	if mc, ok := deps.PVE.(*mockPVEClient); ok {
+		mc.clusterSvc = clusterSvc
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	_, err := h.Handle(context.Background(),
+		marshalArgs("101", mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("a retry whose target already holds the disk must succeed; got: %v", err)
+	}
+}
+
+// TestHandleAttachDisk_ForeignHolder_Refused pins the guard that made the extra
+// scan worth paying for: a volume another VM already holds must not be attached
+// a second time. PVE permits two configs referencing one volume and nothing
+// downstream notices, so the refusal has to happen here.
+func TestHandleAttachDisk_ForeignHolder_Refused(t *testing.T) {
+	t.Parallel()
+	const bareCID = "local-lvm:vm-9001-disk-0"
+
+	// VM 101 holds the disk; the request asks to attach it to VM 100.
+	qemuSvc := &attachQEMUService{
+		attachReturnDiskID: "scsi1",
+		configCfg: map[string]any{
+			"scsi1": bareCID,
+			"name":  "some-workload",
+		},
+	}
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			a, _ := json.Marshal(map[string]any{"vmid": 100, "node": testNode})
+			b, _ := json.Marshal(map[string]any{"vmid": 101, "node": testNode})
+			resp := sdkcluster.ListResourcesResponse{a, b}
+			return &resp, nil
+		},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 testNode,
+			VMDiskFormat:         "qcow2",
+			DetachedDiskStrategy: "free",
+		},
+		PVE: &mockPVEClient{
+			qemuSvc:    qemuSvc,
+			clusterSvc: clusterSvc,
+		},
+		Agent:  &captureAgent{},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	_, err := h.Handle(context.Background(), attachArgs(t, "101", bareCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected a refusal when the volume is already attached to another VM")
+	}
+	if !strings.Contains(err.Error(), "already attached to VM 100") {
+		t.Errorf("the message must name the VM to look at, got: %v", err)
+	}
+	if qemuSvc.attachLastVolid != "" {
+		t.Errorf("no attach may be issued after the refusal; got %q", qemuSvc.attachLastVolid)
 	}
 }

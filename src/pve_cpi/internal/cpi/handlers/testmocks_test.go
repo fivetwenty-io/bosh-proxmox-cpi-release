@@ -45,12 +45,22 @@ type mockPVEClient struct {
 	poolsSvc          pve.PoolService
 }
 
-func (m *mockPVEClient) QEMU() qemu.Service                     { return m.qemuSvc }
-func (m *mockPVEClient) Nodes() nodes.Service                   { return m.nodesSvc }
-func (m *mockPVEClient) Tasks() tasks.Service                   { return m.tasksSvc }
-func (m *mockPVEClient) Storage() storage.Service               { return m.storageSvc }
-func (m *mockPVEClient) CloudInit() cloudinit.Service           { return m.cloudInitSvc }
-func (m *mockPVEClient) Cluster() cluster.Service               { return m.clusterSvc }
+func (m *mockPVEClient) QEMU() qemu.Service           { return m.qemuSvc }
+func (m *mockPVEClient) Nodes() nodes.Service         { return m.nodesSvc }
+func (m *mockPVEClient) Tasks() tasks.Service         { return m.tasksSvc }
+func (m *mockPVEClient) Storage() storage.Service     { return m.storageSvc }
+func (m *mockPVEClient) CloudInit() cloudinit.Service { return m.cloudInitSvc }
+
+// Cluster falls back to an empty-listing stub when a test wires no cluster
+// service. The parked detached-disk strategy is the default, so handlers scan
+// cluster resources for parker VMs on paths that never touched the cluster
+// before; an empty listing is what production sees when no parker exists.
+func (m *mockPVEClient) Cluster() cluster.Service {
+	if m.clusterSvc == nil {
+		return &mockClusterSvc{}
+	}
+	return m.clusterSvc
+}
 func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return m.clusterStorageSvc }
 func (m *mockPVEClient) Pools() pve.PoolService                 { return m.poolsSvc }
 
@@ -808,6 +818,12 @@ func clusterVMOnNode(vmid int, node string) *cluster.ListResourcesResponse {
 		"vmid": vmid,
 		"node": node,
 		"type": "qemu",
+		// Every VM the CPI creates is tagged, and handlers that classify a VM
+		// from its cluster row treat an EMPTY tag string as "this PVE may not
+		// populate the field" and fall back to a config read. An untagged
+		// fixture would exercise that fallback rather than the path production
+		// takes.
+		"tags": "bosh-cpi",
 	})
 	resp := cluster.ListResourcesResponse{raw}
 	return &resp

@@ -558,6 +558,125 @@ func TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues(t *testing.T
 	}
 }
 
+// TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues pins the container
+// skip. /cluster/resources?type=vm answers with LXC rows alongside QEMU ones,
+// and PVE answers a QEMU config read for a container with a pmxcfs
+// "Configuration file ... does not exist" error rather than a 404. Without the
+// skip, one container anywhere in the cluster aborts every holder scan, which
+// with parking as the default means every detach_disk and every attach_disk of
+// a persistent disk fails for as long as that container exists.
+func TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-402-disk-0"
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					// No "type": an older PVE that elides it, which is the only
+					// row shape that can still turn out to be a container.
+					map[string]any{"vmid": int64(200), "node": "pve-01"},
+					map[string]any{"vmid": int64(402), "node": "pve-01", "type": "qemu"},
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				if vmid == 200 {
+					return nil, errors.New(
+						"Configuration file 'nodes/pve-01/lxc/200.conf' does not exist")
+				}
+				return map[string]any{"scsi0": volid}, nil
+			},
+		},
+	}
+
+	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err != nil {
+		t.Fatalf("a container row must not abort the scan; got: %v", err)
+	}
+	if gotVMID != 402 {
+		t.Errorf("vmid: want 402, got %d", gotVMID)
+	}
+}
+
+// TestFindVMByDiskVolid_QemuRowConfigMissing_NotSkipped is the other side of
+// that skip. A row that named itself qemu and then answers "Configuration file
+// ... does not exist" is most likely a guest mid-migration, whose config moved
+// to a node the row does not name yet. Skipping it would conclude the volume is
+// held by nobody while a running VM has it on a bus slot -- the double reference
+// the scan exists to prevent -- so the scan fails instead, retriably, and
+// converges on the Director's next drive.
+func TestFindVMByDiskVolid_QemuRowConfigMissing_NotSkipped(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-402-disk-0"
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					map[string]any{"vmid": int64(105), "node": "pve-01", "type": "qemu"},
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, _ int) (map[string]any, error) {
+				return nil, errors.New(
+					"Configuration file 'nodes/pve-01/qemu-server/105.conf' does not exist")
+			},
+		},
+	}
+
+	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err == nil {
+		t.Fatal("a qemu guest whose config moved must not read as 'not attached to any VM'")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("a config that moved mid-migration is transient; got: %v", err)
+	}
+}
+
+// TestFindVMByDiskVolid_ContainerRow_NotReadAtAll pins the row filter itself
+// rather than the error handling behind it. The container's config read is made
+// to fail with a plain 500, a shape nothing else in the scan skips, so the test
+// passes only while the LXC row is skipped before the read happens.
+func TestFindVMByDiskVolid_ContainerRow_NotReadAtAll(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-402-disk-0"
+
+	read := map[int]bool{}
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(
+					map[string]any{"vmid": int64(200), "node": "pve-01", "type": "lxc"},
+					map[string]any{"vmid": int64(402), "node": "pve-01", "type": "qemu"},
+				), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				read[vmid] = true
+				if vmid == 200 {
+					return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "internal error"}
+				}
+				return map[string]any{"scsi0": volid}, nil
+			},
+		},
+	}
+
+	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	if err != nil {
+		t.Fatalf("a container row must never be read; got: %v", err)
+	}
+	if gotVMID != 402 {
+		t.Errorf("vmid: want 402, got %d", gotVMID)
+	}
+	if read[200] {
+		t.Error("the LXC row was read through the QEMU config endpoint")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // EncodeDiskCID / ParseEncodedDiskCID
 // ---------------------------------------------------------------------------

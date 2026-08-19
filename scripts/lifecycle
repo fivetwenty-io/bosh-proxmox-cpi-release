@@ -25,6 +25,7 @@ Sequence (mirrors the BOSH-CPI Director call order):
     9.  snapshot_disk
    10.  delete_snapshot          (clean mode; detach_disk in bypass mode)
    11.  detach_disk              (clean mode; delete_snapshot in bypass mode)
+   11c-11l. parked-disk pass    (only when PARKED_DISK_TEST != off)
    12.  delete_disk
    12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
@@ -38,7 +39,9 @@ selected steps assert real cluster state out-of-band via the PVE REST API
 (scripts/_pve_verify.py, same host+auth as CPI_CONFIG): create_network ->
 vnet/subnet or bridge present; create_vm -> VM present; create_disk -> volume
 present; delete_vm -> VM gone; delete_network -> vnet/bridge gone. A failed
-verification aborts the run exactly like a CPI error.
+verification aborts the run exactly like a CPI error. The parked-disk pass
+leans on this hardest: parking is invisible in the CPI's return values (every
+call returns null), so the only proof it happened is the cluster state.
 
 A failure in any step aborts the run and prints the failing JSON-RPC error.
 Cleanup is best-effort: resources created before the failure are torn down in
@@ -85,6 +88,31 @@ Snapshot/detach ordering (exercises detach_disk's snapshot guard):
                                 allow_disk_ops_with_snapshots=true to skip the
                                 guard (the test harness writes that config for the
                                 bypass pass)
+
+Parked-disk strategy (exercises pve.detached_disk_strategy end to end):
+    PARKED_DISK_TEST    on | off                   (default: on)
+                       Runs steps 11c-11l, which drive a detached disk through
+                       both strategies against live PVE and verify the cluster
+                       state after each transition. The pass pins the strategy
+                       per call in derived configs, so it proves the same thing
+                       whatever CPI_CONFIG happens to set.
+    PARKER_RANGE_START  first parker VMID   (default: the band CPI_CONFIG uses)
+    PARKER_RANGE_END    last parker VMID    (default: the band CPI_CONFIG uses)
+                       These may only restate the band CPI_CONFIG already sets.
+                       A value that disagrees aborts the run: the pass would
+                       otherwise look for parkers outside the band the CPI parks
+                       into and read a real parker as an ordinary VM. A lab that
+                       already has guests in 90000-90999 moves the band in the
+                       CPI config, which scripts/test integration does from
+                       tier1.parked_disk.range_start/range_end; these env vars
+                       then restate it.
+
+The pass leaves its parker VM behind, which is the design working as intended:
+a parker is durable infrastructure that outlives any one disk, and the CPI has
+no call that removes one. Later runs reuse it. To remove it by hand, clear the
+protection flag first, or PVE refuses:
+
+    qm set <parker-vmid> --protection 0 && qm destroy <parker-vmid> --purge
 """
 
 from __future__ import annotations
@@ -176,9 +204,48 @@ if not os.access(CPI_CONFIG, os.R_OK):
 if not os.access(STEMCELL_PATH, os.R_OK):
     sys.exit(f"STEMCELL_PATH not readable: {STEMCELL_PATH}")
 
+PARKED_DISK_TEST = env("PARKED_DISK_TEST", "on").strip().lower()
+if PARKED_DISK_TEST not in ("on", "off"):
+    sys.exit(f"PARKED_DISK_TEST must be on|off, got {PARKED_DISK_TEST!r}")
+
+# The band comes from CPI_CONFIG, falling back to the CPI's own default. Looking
+# for parkers in a band other than the one the base config uses is actively
+# dangerous rather than merely wrong: step 11 detaches under CPI_CONFIG and may
+# park the disk in the config's band, and a pass looking elsewhere would read
+# that parker as an ordinary VM and treat the disk as free.
+#
+# PARKER_RANGE_START/END therefore only confirm what the base config already
+# says. Setting them to anything else is refused rather than honored, because
+# honoring them would recreate exactly the mismatch this comment describes.
+try:
+    with open(CPI_CONFIG) as _cfg_f:
+        _base_cfg = json.load(_cfg_f)
+except (OSError, ValueError) as _cfg_exc:
+    sys.exit(f"CPI_CONFIG is not readable JSON: {_cfg_exc}")
+if not isinstance(_base_cfg, dict):
+    sys.exit(f"CPI_CONFIG must contain a JSON object, got {type(_base_cfg).__name__}")
+
+_CFG_PARKER_START = int(_base_cfg.get("parked_disk_vmid_range_start") or 90000)
+_CFG_PARKER_END = int(_base_cfg.get("parked_disk_vmid_range_end") or 90999)
+try:
+    PARKER_RANGE_START = int(env("PARKER_RANGE_START", str(_CFG_PARKER_START)))
+    PARKER_RANGE_END = int(env("PARKER_RANGE_END", str(_CFG_PARKER_END)))
+except ValueError as _parker_exc:
+    sys.exit(f"PARKER_RANGE_START/PARKER_RANGE_END must be integers: {_parker_exc}")
+if (PARKER_RANGE_START, PARKER_RANGE_END) != (_CFG_PARKER_START, _CFG_PARKER_END):
+    sys.exit(
+        f"parker range [{PARKER_RANGE_START}, {PARKER_RANGE_END}] does not match the band "
+        f"CPI_CONFIG uses [{_CFG_PARKER_START}, {_CFG_PARKER_END}]; move the band in "
+        f"{CPI_CONFIG} instead, or the pass would look for parkers where the CPI never puts them"
+    )
+if PARKER_RANGE_START < 100 or PARKER_RANGE_END <= PARKER_RANGE_START:
+    sys.exit(
+        f"parker range [{PARKER_RANGE_START}, {PARKER_RANGE_END}] is not a valid VMID band "
+        "(start must be >=100 and below end)"
+    )
+
 if not NETWORK_BRIDGE:
-    with open(CPI_CONFIG) as f:
-        NETWORK_BRIDGE = json.load(f).get("network_bridge", "vmbr0")
+    NETWORK_BRIDGE = _base_cfg.get("network_bridge", "vmbr0")
 
 _SDN_VNET_RE = re.compile(r'^[a-z0-9]{1,8}$')
 
@@ -234,6 +301,11 @@ state: dict[str, Any] = {
     "snapshot_cid": "",
     "network_cid": "",
     "disk_attached": False,
+    # Config that teardown must use for the disk. The parked pass sets it to a
+    # parked-pinned config: once a disk is on a parker, only a call that knows
+    # about parking can unpark and delete it, and a base config with the
+    # strategy opted out would leave the volume stranded.
+    "disk_cleanup_cfg": "",
 }
 
 
@@ -347,19 +419,73 @@ def call(method: str, args: list[Any], config_path: str = "") -> Any:
     return resp.get("result")
 
 
-def write_reboot_config(mode: str) -> str:
-    """Derive a temp CPI config from CPI_CONFIG with reboot_mode overridden.
+# Temp CPI configs derived from CPI_CONFIG, removed once teardown is done.
+# They outlive the step that created them because cleanup() may still need one:
+# a disk left on a parker can only be deleted by a call whose config knows about
+# parking.
+_derived_configs: list[str] = []
 
-    Lets the harness exercise the hard-reset path without mutating the primary
-    config. The caller must unlink the returned path.
+
+def derive_config(prefix: str, **overrides: Any) -> str:
+    """Write a temp CPI config that is CPI_CONFIG plus overrides.
+
+    Lets the harness exercise config-selected code paths without mutating the
+    primary config, and without depending on what the primary config happens to
+    say. Removal is handled centrally by purge_derived_configs().
     """
     with open(CPI_CONFIG) as f:
         cfg = json.load(f)
-    cfg["reboot_mode"] = mode
-    fd, path = tempfile.mkstemp(prefix="cpi-reboot-", suffix=".json")
+    cfg.update(overrides)
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
+    _derived_configs.append(path)
     return path
+
+
+def purge_derived_configs() -> None:
+    """Remove every derived config. Call once teardown can no longer need one."""
+    for path in _derived_configs:
+        Path(path).unlink(missing_ok=True)
+    _derived_configs.clear()
+
+
+def write_reboot_config(mode: str) -> str:
+    """Derive a temp CPI config from CPI_CONFIG with reboot_mode overridden."""
+    return derive_config("cpi-reboot-", reboot_mode=mode)
+
+
+def write_strategy_config(strategy: str) -> str:
+    """Derive a temp CPI config pinning detached_disk_strategy and the parker band.
+
+    Both keys are pinned together on purpose. The band is what lets the CPI
+    recognize a parker at all, so keeping it set under strategy="free" models
+    the supported opt-out: parking stops, but disks parked earlier are still
+    reachable. write_stranded_parker_config covers the unsupported one.
+    """
+    return derive_config(
+        f"cpi-{strategy}-",
+        detached_disk_strategy=strategy,
+        parked_disk_vmid_range_start=PARKER_RANGE_START,
+        parked_disk_vmid_range_end=PARKER_RANGE_END,
+    )
+
+
+def write_stranded_parker_config() -> str:
+    """Derive a temp CPI config that opts out of parking AND drops the band.
+
+    This is the shape an operator lands in by setting detached_disk_strategy to
+    "free" without carrying the band forward: the CPI can no longer recognize a
+    parker, so a disk still sitting on one looks like a volume attached to an
+    ordinary VM. The harness uses it to prove attach_disk refuses that rather
+    than writing a second reference to the same volume.
+    """
+    return derive_config(
+        "cpi-stranded-",
+        detached_disk_strategy="free",
+        parked_disk_vmid_range_start=0,
+        parked_disk_vmid_range_end=0,
+    )
 
 
 def build_network_spec() -> dict[str, Any]:
@@ -389,20 +515,312 @@ def build_network_spec() -> dict[str, Any]:
     }
 
 
+def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
+    """Drive a detached disk through both detached-disk strategies against live PVE.
+
+    Entered after step 11 with the disk detached and the VM still running. What
+    the base config did with that disk is deliberately not assumed: the pass
+    re-attaches first, then drives every transition with a strategy pinned per
+    call, so it proves the same thing on a lab whose CPI_CONFIG sets parked,
+    free, or nothing at all.
+
+    Every claim is checked against the cluster rather than against the CPI's
+    answer, because parking is invisible in the JSON-RPC results — detach_disk
+    returns null whether it parked the disk or left it floating.
+
+    Paths covered:
+
+      detach (parked)
+        the disk lands on a parker VM: inside the band, tagged bosh-parker,
+        protected, set not to start with the node, and named in the parker's
+        provenance sentinel
+
+      has_disk (parked)
+        a parked disk still exists
+
+      set_disk_metadata (parked)
+        the parker is skipped rather than written to
+
+      snapshot_disk (parked)
+        refused, because a PVE snapshot takes the whole parker and with it
+        every other deployment's parked disk
+
+      snapshot_disk (free, no band)
+        still refused, because the holder is classified by its bosh-parker tag
+        rather than by the band the config happens to name
+
+      attach (free, no band)
+        refused, because a parker the config can no longer recognize still
+        holds the volume and attaching it again would double-reference it
+
+      attach (parked)
+        the unpark path: protection is cleared for the detach and put back
+        afterwards, and the slot and provenance entry are released
+
+      detach (free)
+        the opt-out leaves the volume free-floating, with no parker holding it
+
+      detach (parked) again
+        the existing parker is reused instead of a second one being created
+
+      delete (free, no band)
+        refused for the same reason the attach is, because freeing the volume
+        would leave the parker's slot pointing at storage that is gone
+
+      delete_vm on the parker
+        refused, because a parker may still hold other deployments' disks
+
+    Returns the parker VMID so the caller can assert it survives delete_vm.
+    """
+    parked_cfg = write_strategy_config("parked")
+    # Kept separately from disk_cleanup_cfg, which teardown clears once the disk
+    # is gone. Step 15a still needs a config that pins the parked strategy: run
+    # under the lab's base config instead and the step proves whatever that
+    # config happens to say, which for a lab configured "free" with no band is
+    # nothing at all.
+    state["parked_cfg"] = parked_cfg
+    free_cfg = write_strategy_config("free")
+    stranded_cfg = write_stranded_parker_config()
+    # From here on the disk may be parked, so teardown has to speak parked too.
+    state["disk_cleanup_cfg"] = parked_cfg
+
+    vm_cid, disk_cid = state["vm_cid"], state["disk_cid"]
+    bare_volid = bare_disk_volid(disk_cid)
+    parkers_before = verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END)
+    print(f"    parkers already on the node: {parkers_before or '(none)'}")
+
+    step("11c. attach_disk (strategy=parked; unparks the disk if step 11 parked it)")
+    call("attach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    state["disk_attached"] = True
+    print("attach_disk=ok")
+
+    step("11d. detach_disk (strategy=parked)")
+    call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    state["disk_attached"] = False
+    print("detach_disk=ok")
+
+    holders = verifier.disk_holders(disk_cid)
+    if len(holders) != 1:
+        raise RuntimeError(
+            f"expected exactly one VM to hold {bare_volid} after a parked detach, got {holders}"
+        )
+    parker_vmid, slot = holders[0]
+    parkers = verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END)
+    verifier.assert_true(
+        f"disk held by parker {parker_vmid} at slot {slot}", parker_vmid in parkers
+    )
+    if not slot.startswith("scsi"):
+        raise RuntimeError(
+            f"parked disk landed in {slot!r}; the parked strategy attaches to scsi0-scsi30"
+        )
+    if len(parkers) > len(parkers_before) + 1:
+        raise RuntimeError(
+            f"parking one disk created more than one parker: {parkers_before} -> {parkers}"
+        )
+
+    parker_cfg = verifier.qemu_config(parker_vmid)
+    verifier.assert_true(
+        f"parker {parker_vmid} is named bosh-parker-{parker_vmid}",
+        str(parker_cfg.get("name", "")) == f"bosh-parker-{parker_vmid}",
+    )
+    verifier.assert_true(
+        f"parker {parker_vmid} is protected against disk and VM removal",
+        str(parker_cfg.get("protection", "0")) == "1",
+    )
+    verifier.assert_true(
+        f"parker {parker_vmid} does not start with the node",
+        str(parker_cfg.get("onboot", "0")) == "0",
+    )
+    # The CPI writes provenance best-effort and never fails a park over it, so
+    # nothing in production surfaces a broken sentinel. This harness is the only
+    # place it can surface, which is why the assertion is hard here.
+    verifier.assert_true(
+        f"parker {parker_vmid} records the disk in its provenance sentinel",
+        bare_volid in verifier.parked_disks(parker_vmid),
+    )
+    parker_tags = str(parker_cfg.get("tags", ""))
+    verifier.assert_true(
+        f"parker {parker_vmid} carries the CPI ownership tag",
+        any(t.strip().lower() == "bosh-cpi" for t in parker_tags.split(";")),
+    )
+
+    step("11d-bis. detach_disk again (parked: the already-parked path is idempotent)")
+    call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    verifier.assert_true(
+        f"the second detach left the disk on parker {parker_vmid} at {slot}",
+        verifier.disk_holders(disk_cid) == [(parker_vmid, slot)],
+    )
+
+    # has_disk reads storage content and has no parker logic of its own, so this
+    # proves the volume survived the park rather than anything about parking.
+    # That is still worth asserting: a park that moved or renamed the volume
+    # would make the Director believe the disk is gone.
+    step("11e. has_disk (the volume survives the park)")
+    if call("has_disk", [disk_cid], config_path=parked_cfg) is not True:
+        raise RuntimeError("has_disk returned false for a parked disk")
+    print("has_disk=true")
+
+    step("11f. set_disk_metadata (parked: the parker must be skipped, not written)")
+    desc_before = str(verifier.qemu_config(parker_vmid).get("description", ""))
+    call(
+        "set_disk_metadata",
+        [disk_cid, {"deployment": "lifecycle-test", "director": "local-harness"}],
+        config_path=parked_cfg,
+    )
+    desc_after = str(verifier.qemu_config(parker_vmid).get("description", ""))
+    verifier.assert_true(
+        f"parker {parker_vmid} description untouched by set_disk_metadata",
+        desc_after == desc_before,
+    )
+
+    step("11g. snapshot_disk (parked: must be refused)")
+    try:
+        snap_cid = call("snapshot_disk", [disk_cid, {}], config_path=parked_cfg)
+    except RuntimeError as exc:
+        if "held by a parker vm" not in str(exc).lower():
+            raise RuntimeError(
+                f"snapshot_disk on a parked disk failed for the wrong reason: {exc}"
+            ) from exc
+        print("snapshot_disk refused the parked disk as expected")
+    else:
+        # It succeeded, so a snapshot of the whole parker now exists. Record it
+        # for teardown before failing, or the run leaks it.
+        state["snapshot_cid"] = snap_cid
+        raise RuntimeError(
+            f"snapshot_disk snapshotted parker {parker_vmid} (snapshot_cid={snap_cid}); "
+            "the parker guard did not fire"
+        )
+
+    step("11g-bis. snapshot_disk (strategy=free with no band: still refused)")
+    # The guard classifies the holder by its bosh-parker tag, not by whether its
+    # VMID sits in a configured band, so clearing the band must not open a path
+    # to snapshotting the parker.
+    try:
+        snap_cid = call("snapshot_disk", [disk_cid, {}], config_path=stranded_cfg)
+    except RuntimeError as exc:
+        if "held by a parker vm" not in str(exc).lower():
+            raise RuntimeError(
+                f"snapshot_disk on a stranded parker failed for the wrong reason: {exc}"
+            ) from exc
+        print("snapshot_disk refused the stranded parked disk as expected")
+    else:
+        state["snapshot_cid"] = snap_cid
+        raise RuntimeError(
+            f"snapshot_disk snapshotted parker {parker_vmid} with the band cleared "
+            f"(snapshot_cid={snap_cid}); the parker guard is still band-gated"
+        )
+
+    step("11h. attach_disk (strategy=free with no band: the stranded-parker refusal)")
+    try:
+        call("attach_disk", [vm_cid, disk_cid], config_path=stranded_cfg)
+    except RuntimeError as exc:
+        if "bosh-parker" not in str(exc):
+            raise RuntimeError(
+                f"attach_disk refused the stranded parked disk for the wrong reason: {exc}"
+            ) from exc
+        print("attach_disk refused the disk and named the parker as expected")
+    else:
+        # The attach went through, so the volume is now referenced by both the
+        # parker and the VM. Record the attachment so teardown detaches it, then
+        # fail: this is the double-reference the guard exists to prevent.
+        state["disk_attached"] = True
+        raise RuntimeError(
+            f"attach_disk attached a disk parker {parker_vmid} still holds; "
+            f"holders are now {verifier.disk_holders(disk_cid)}"
+        )
+    holders = verifier.disk_holders(disk_cid)
+    if [h[0] for h in holders] != [parker_vmid]:
+        raise RuntimeError(
+            f"the refused attach should have left the disk on parker {parker_vmid}, got {holders}"
+        )
+
+    step("11h-bis. delete_disk (strategy=free with no band: the stranded-parker refusal)")
+    try:
+        call("delete_disk", [disk_cid], config_path=stranded_cfg)
+    except RuntimeError as exc:
+        if "bosh-parker" not in str(exc):
+            raise RuntimeError(
+                f"delete_disk refused the stranded parked disk for the wrong reason: {exc}"
+            ) from exc
+        print("delete_disk refused the disk and named the parker as expected")
+    else:
+        # The volume is gone while the parker's slot still references it. Nothing
+        # downstream can recover from that, so say exactly what happened.
+        state["disk_cid"] = ""
+        raise RuntimeError(
+            f"delete_disk freed a volume parker {parker_vmid} still holds; "
+            "the parker's slot now references storage that no longer exists"
+        )
+    verifier.assert_true(
+        "the refused delete left the volume in place", verifier.volume_exists(disk_cid)
+    )
+
+    step("11i. attach_disk (strategy=parked: unpark, which clears and restores protection)")
+    call("attach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    state["disk_attached"] = True
+    holders = verifier.disk_holders(disk_cid)
+    if [str(h[0]) for h in holders] != [str(vm_cid).strip()]:
+        raise RuntimeError(
+            f"after unpark the disk should be held only by VM {vm_cid}, got {holders}"
+        )
+    verifier.assert_true(
+        f"parker {parker_vmid} protection restored after the unpark detach",
+        str(verifier.qemu_config(parker_vmid).get("protection", "0")) == "1",
+    )
+    verifier.assert_true(
+        f"parker {parker_vmid} dropped the disk from its provenance sentinel",
+        bare_volid not in verifier.parked_disks(parker_vmid),
+    )
+
+    step("11j. detach_disk (strategy=free: the opt-out leaves the volume free-floating)")
+    call("detach_disk", [vm_cid, disk_cid], config_path=free_cfg)
+    state["disk_attached"] = False
+    verifier.assert_true(
+        "no VM holds the disk under strategy=free", verifier.disk_holders(disk_cid) == []
+    )
+    verifier.assert_true(
+        "the free-floating volume still exists", verifier.volume_exists(disk_cid)
+    )
+
+    step("11k. attach_disk (strategy=free: a free-floating disk re-attaches)")
+    call("attach_disk", [vm_cid, disk_cid], config_path=free_cfg)
+    state["disk_attached"] = True
+    verifier.assert_true(
+        f"VM {vm_cid} is the sole holder after the free re-attach",
+        [str(h[0]) for h in verifier.disk_holders(disk_cid)] == [str(vm_cid).strip()],
+    )
+
+    step("11l. detach_disk (strategy=parked: the existing parker is reused)")
+    call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    state["disk_attached"] = False
+    holders = verifier.disk_holders(disk_cid)
+    if [h[0] for h in holders] != [parker_vmid]:
+        raise RuntimeError(
+            f"re-parking should have returned the disk to parker {parker_vmid}, got {holders}"
+        )
+    verifier.assert_true(
+        "no second parker VM was created",
+        verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END) == parkers,
+    )
+
+    return parker_vmid
+
+
 def cleanup() -> None:
     if state["snapshot_cid"]:
         try:
             call("delete_snapshot", [state["snapshot_cid"]])
         except Exception:
             pass
+    disk_cfg = state["disk_cleanup_cfg"]
     if state["disk_attached"] and state["vm_cid"] and state["disk_cid"]:
         try:
-            call("detach_disk", [state["vm_cid"], state["disk_cid"]])
+            call("detach_disk", [state["vm_cid"], state["disk_cid"]], config_path=disk_cfg)
         except Exception:
             pass
     if state["disk_cid"]:
         try:
-            call("delete_disk", [state["disk_cid"]])
+            call("delete_disk", [state["disk_cid"]], config_path=disk_cfg)
         except Exception:
             pass
     if state["vm_cid"]:
@@ -494,6 +912,16 @@ def main() -> int:
 
         step(f"3. create_vm (agent_id={AGENT_ID}, stemcell_cid={state['stemcell_cid']})")
         cloud_props = {"cores": VM_CORES, "memory": VM_MEMORY_MIB}
+        if NETWORK_TEST_MODE == "bridge":
+            # A plain Linux bridge exists on ONE node -- create_network built it
+            # on the CPI config's node -- while create_vm places by headroom
+            # anywhere in the cluster. Pin the VM to the bridge's node, or on a
+            # multi-node cluster it starts on a node where the bridge does not
+            # exist and qmstart fails. SDN vnets need no pin: the zone realizes
+            # them on every node.
+            _pin = str(_base_cfg.get("node", "")).strip()
+            if _pin:
+                cloud_props["target_node"] = _pin
         networks = {
             "default": {
                 "type": "manual",
@@ -624,14 +1052,36 @@ def main() -> int:
             state["disk_attached"] = False
             print("detach_disk=ok")
 
+        # Steps 11c-11l: the parked detached-disk strategy, end to end. Left
+        # until after the snapshot ordering above so it starts from a plain
+        # detached disk with no snapshot in the way.
+        parker_vmid = 0
+        if PARKED_DISK_TEST == "on":
+            parker_vmid = run_parked_disk_pass(verifier)
+
+        # delete_disk runs against whichever config the disk's state requires:
+        # after the parked pass the disk is on a parker, and only a call that
+        # knows about parking will unpark it before freeing the volume.
+        delete_cfg = state["disk_cleanup_cfg"]
         step("12. delete_disk")
-        call("delete_disk", [state["disk_cid"]])
+        deleted_disk_cid = state["disk_cid"]
+        call("delete_disk", [state["disk_cid"]], config_path=delete_cfg)
         step("12a. has_disk (post-delete)")
-        hd = call("has_disk", [state["disk_cid"]])
+        hd = call("has_disk", [state["disk_cid"]], config_path=delete_cfg)
         if hd is not False:
             raise RuntimeError(f"has_disk post-delete returned {hd}, expected false")
         print("has_disk=false")
+        if parker_vmid:
+            verifier.assert_true(
+                f"parker {parker_vmid} released the slot on delete_disk",
+                verifier.disk_holders(deleted_disk_cid) == [],
+            )
+            verifier.assert_true(
+                f"parker {parker_vmid} dropped the disk from its provenance sentinel",
+                bare_disk_volid(deleted_disk_cid) not in verifier.parked_disks(parker_vmid),
+            )
         state["disk_cid"] = ""
+        state["disk_cleanup_cfg"] = ""
         print("delete_disk=ok")
 
         # reboot_vm is exercised here, while the VM is still running, before
@@ -647,14 +1097,11 @@ def main() -> int:
         print("reboot_vm(soft)=ok")
 
         hard_cfg = write_reboot_config("hard")
-        try:
-            step("14. reboot_vm (hard reset, reboot_mode=hard)")
-            call("reboot_vm", [state["vm_cid"]], config_path=hard_cfg)
-            if call("has_vm", [state["vm_cid"]]) is not True:
-                raise RuntimeError("has_vm returned false after hard reboot_vm")
-            print("reboot_vm(hard)=ok")
-        finally:
-            os.unlink(hard_cfg)
+        step("14. reboot_vm (hard reset, reboot_mode=hard)")
+        call("reboot_vm", [state["vm_cid"]], config_path=hard_cfg)
+        if call("has_vm", [state["vm_cid"]]) is not True:
+            raise RuntimeError("has_vm returned false after hard reboot_vm")
+        print("reboot_vm(hard)=ok")
 
         step("15. delete_vm")
         deleted_vm_cid = state["vm_cid"]
@@ -665,6 +1112,50 @@ def main() -> int:
             f"vm {deleted_vm_cid!r} gone from pve",
             verifier.vm_exists(deleted_vm_cid),
         )
+        if parker_vmid:
+            # delete_vm refuses to destroy a parker: it is shared infrastructure
+            # that may still hold other deployments' disks. Hand the parker's own
+            # VMID to delete_vm, because that is the only argument the refusal
+            # reads. Asserting the parker survived the workload VM's deletion
+            # would pass with the guard removed entirely.
+            # The assertion is made by ATTEMPTING the destroy, so a regressed
+            # guard runs it for real: the fast path issues skiplock + purge,
+            # which bypasses protection=1 and takes every disk in the parker's
+            # slots. That is acceptable against a parker this run filled and
+            # emptied, and not acceptable against one holding somebody else's
+            # disks, so check before betting the lab on it.
+            foreign = [
+                slot
+                for slot, volid in verifier.parker_disk_slots(parker_vmid).items()
+                if volid
+            ]
+            if foreign:
+                # Skip the destructive assertion, but keep going: steps 16 and
+                # 16a still have to run or this run leaks a stemcell and a
+                # network. A skip is not a failure.
+                print(
+                    f"15a. SKIPPED: parker {parker_vmid} holds {len(foreign)} disk(s) "
+                    f"({', '.join(sorted(foreign))}) this run did not put there; "
+                    "a regressed guard would destroy them"
+                )
+            else:
+                step(f"15a. delete_vm refuses parker {parker_vmid}")
+                try:
+                    call("delete_vm", [str(parker_vmid)], config_path=state["parked_cfg"])
+                except RuntimeError as exc:
+                    if "parker" not in str(exc).lower():
+                        raise RuntimeError(
+                            f"delete_vm on parker {parker_vmid} failed for the wrong reason: {exc}"
+                        ) from exc
+                    print("delete_vm refused the parker as expected")
+                else:
+                    raise RuntimeError(
+                        f"delete_vm destroyed or accepted parker {parker_vmid}; "
+                        "the parker guard did not fire"
+                    )
+                verifier.assert_true(
+                    f"parker {parker_vmid} still present", verifier.vm_exists(parker_vmid)
+                )
 
         step("16. delete_stemcell")
         call("delete_stemcell", [state["stemcell_cid"]])
@@ -688,6 +1179,14 @@ def main() -> int:
                     verifier.bridge_exists(deleted_net_cid),
                 )
 
+        if parker_vmid:
+            print()
+            print(
+                f"==> parker VM {parker_vmid} left in place (durable by design; later runs "
+                f"reuse it).\n    Remove it with: qm set {parker_vmid} --protection 0 && "
+                f"qm destroy {parker_vmid} --purge"
+            )
+
         print()
         print("==> lifecycle complete")
         print()
@@ -698,6 +1197,8 @@ def main() -> int:
         print()
         cleanup()
         return 1
+    finally:
+        purge_derived_configs()
 
 
 if __name__ == "__main__":

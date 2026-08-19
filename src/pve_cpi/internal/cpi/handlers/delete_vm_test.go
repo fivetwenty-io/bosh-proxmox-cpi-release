@@ -1755,6 +1755,38 @@ func parkerDepsWithRange(vmid int, qemuSvc *mockQEMUService, nodesSvc *mockNodes
 	deps := testDepsFoundVMWithStorage(vmid, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, &mockStorageService{})
 	deps.Config.ParkedDiskVMIDRangeStart = 90000
 	deps.Config.ParkedDiskVMIDRangeEnd = 90999
+	// A real parker carries its tags on the cluster-resources row as well as in
+	// its config, which is the path the guard takes first.
+	if mc, ok := deps.PVE.(*mockPVEClient); ok {
+		mc.clusterSvc = &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				raw, _ := json.Marshal(map[string]any{
+					"vmid": vmid, "node": "pve-node1", "type": "qemu",
+					"tags": "bosh-cpi;bosh-parker",
+				})
+				resp := cluster.ListResourcesResponse{raw}
+				return &resp, nil
+			},
+		}
+	}
+	return deps
+}
+
+// parkerDepsUntaggedRow is parkerDepsWithRange with a cluster row that carries
+// NO tags, standing in for a PVE that does not populate the field. The guard
+// cannot read an empty row as proof of anything, so it must fall back to the
+// VM config rather than let the delete through.
+func parkerDepsUntaggedRow(vmid int, qemuSvc *mockQEMUService, nodesSvc *mockNodesService) handlers.Deps {
+	deps := parkerDepsWithRange(vmid, qemuSvc, nodesSvc)
+	if mc, ok := deps.PVE.(*mockPVEClient); ok {
+		mc.clusterSvc = &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "pve-node1", "type": "qemu"})
+				resp := cluster.ListResourcesResponse{raw}
+				return &resp, nil
+			},
+		}
+	}
 	return deps
 }
 
@@ -1865,10 +1897,88 @@ func TestHandleDeleteVM_RefusesParkerVM_FastPath(t *testing.T) {
 	}
 }
 
-// TestHandleDeleteVM_NormalVM_NoParkerCheck_WhenRangeUnset verifies that when
-// the parker range is not configured (ParkedStrategyActive=false), delete_vm
-// proceeds normally with zero extra API calls for the parker check.
-func TestHandleDeleteVM_NormalVM_NoParkerCheck_WhenRangeUnset(t *testing.T) {
+// TestHandleDeleteVM_ParkerRowTag_RefusedWithBandUnset verifies the guard is
+// band-independent: a VM whose /cluster/resources row carries the bosh-parker
+// tag is refused even when the parker band is unset and the strategy is free
+// (an operator who opted out of parking without carrying the band forward).
+// The refusal must come off the row tags alone -- no extra config read.
+func TestHandleDeleteVM_ParkerRowTag_RefusedWithBandUnset(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90040
+	configCalls := 0
+	deleteCalled := false
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			configCalls++
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+	}
+
+	deps := testDepsFoundVM(parkerVMID, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{})
+	// Parking fully disarmed in config: free strategy, no band.
+	deps.Config.DetachedDiskStrategy = "free"
+	deps.Config.ParkedDiskVMIDRangeStart = 0
+	deps.Config.ParkedDiskVMIDRangeEnd = 0
+	// The cluster row carries the tag, as real PVE reports it.
+	if mc, ok := deps.PVE.(*mockPVEClient); ok {
+		mc.clusterSvc = &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				raw, _ := json.Marshal(map[string]any{
+					"vmid": parkerVMID,
+					"node": "pve-node1",
+					"type": "qemu",
+					"tags": "bosh-cpi;bosh-parker",
+				})
+				resp := cluster.ListResourcesResponse{raw}
+				return &resp, nil
+			},
+		}
+	}
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(parkerVMID)), jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected refusal for a row-tagged parker with the band unset, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("parker refusal must be non-retriable")
+	}
+	if !strings.Contains(err.Error(), "parker") {
+		t.Errorf("error must mention 'parker'; got %q", err.Error())
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must NOT be called for a parker VM")
+	}
+	if configCalls != 0 {
+		t.Errorf("row tags are authoritative; expected 0 config reads, got %d", configCalls)
+	}
+}
+
+// TestHandleDeleteVM_TaggedRow_NoParkerConfigFallback verifies that a
+// cluster-resources row carrying tags settles the parker question on its own:
+// the guard reads those tags, sees no bosh-parker among them, and never falls
+// back to a config read.
+//
+// The band is irrelevant to it. The guard used to be gated on
+// ParkedStrategyActive, and this test used to claim an unset range was what made
+// the check free; it is not, since classification is now tag-based and
+// band-independent. What keeps it free is the row having tags at all.
+func TestHandleDeleteVM_TaggedRow_NoParkerConfigFallback(t *testing.T) {
 	t.Parallel()
 
 	configCalls := 0
@@ -1948,7 +2058,9 @@ func TestHandleDeleteVM_InBandVMID_ConfigReadError_Retriable(t *testing.T) {
 
 	for _, fastPath := range []bool{false, true} {
 		deleteCalled = false
-		deps := parkerDepsWithRange(vmid, qemuSvc, nodesSvc)
+		// An untagged row is what forces the config-read fallback, which is the
+		// read this test makes fail.
+		deps := parkerDepsUntaggedRow(vmid, qemuSvc, nodesSvc)
 		if fastPath {
 			enabled := true
 			deps.Config.FastPathDelete = &enabled
@@ -2003,7 +2115,9 @@ func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 		},
 	}
 
-	deps := parkerDepsWithRange(vmid, qemuSvc, nodesSvc)
+	// No row tags, so the guard falls back to the config -- which says this is
+	// an ordinary VM that merely happens to sit in the band.
+	deps := parkerDepsUntaggedRow(vmid, qemuSvc, nodesSvc)
 	h := handlers.HandleDeleteVM(deps)
 	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
 

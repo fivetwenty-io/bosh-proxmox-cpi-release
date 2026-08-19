@@ -729,7 +729,12 @@ class TestVolumeExists(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestPasswordAuth(unittest.TestCase):
-    """Ticket fetch is triggered when no api_token is present."""
+    """Ticket fetch is triggered when no api_token is present.
+
+    These drive the auth flow through vnet_exists rather than vm_exists because
+    they count HTTP calls: vnet_exists is exactly one GET, so the counts measure
+    the ticket flow instead of some other predicate's request pattern.
+    """
 
     def _ticket_response(self) -> dict:
         return {"data": {"ticket": "PVE:root@pam:DEADBEEF", "CSRFPreventionToken": "token"}}
@@ -752,7 +757,7 @@ class TestPasswordAuth(unittest.TestCase):
             return data_resp
 
         with unittest.mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
-            result = v.vm_exists(101)
+            result = v.vnet_exists("cpitest0")
         self.assertEqual(call_count, 2)
         self.assertFalse(result)
 
@@ -760,7 +765,7 @@ class TestPasswordAuth(unittest.TestCase):
         v = PVEVerifier(_password_config())
         with unittest.mock.patch("urllib.request.urlopen", side_effect=_make_http_error(401, "Unauthorized")):
             with self.assertRaises(PVEVerifyError) as ctx:
-                v.vm_exists(101)
+                v.vnet_exists("cpitest0")
             self.assertIn("401", str(ctx.exception))
 
     def test_ticket_fetch_malformed_json_raises(self) -> None:
@@ -771,7 +776,7 @@ class TestPasswordAuth(unittest.TestCase):
         bad.__exit__ = unittest.mock.MagicMock(return_value=False)
         with unittest.mock.patch("urllib.request.urlopen", return_value=bad):
             with self.assertRaises(PVEVerifyError):
-                v.vm_exists(101)
+                v.vnet_exists("cpitest0")
 
     def test_ticket_cached_on_second_call(self) -> None:
         """Second GET does not re-fetch the ticket."""
@@ -781,8 +786,8 @@ class TestPasswordAuth(unittest.TestCase):
 
         call_returns = [ticket_resp, data_resp, data_resp]
         with unittest.mock.patch("urllib.request.urlopen", side_effect=call_returns):
-            v.vm_exists(101)
-            v.vm_exists(101)
+            v.vnet_exists("cpitest0")
+            v.vnet_exists("cpitest0")
         # 1 ticket POST + 2 GET calls = 3 total; urlopen called exactly 3 times.
         # (If ticket were not cached, a 4th call would occur.)
 
@@ -938,6 +943,420 @@ class TestParseStemcellPathCID(unittest.TestCase):
     def test_kind_prefix_only_no_payload_raises(self) -> None:
         with self.assertRaises(PVEVerifyError):
             parse_stemcell_path_cid(":light:")
+
+
+# ---------------------------------------------------------------------------
+# Parked-disk (parker VM) inspection
+# ---------------------------------------------------------------------------
+
+class TestParkerInspection(unittest.TestCase):
+    """Tests for the helpers the lifecycle harness uses to verify parked disks.
+
+    Transport is stubbed at _get rather than at urlopen, because these helpers
+    make a different call per VM and the tests need each path to answer for
+    itself.
+    """
+
+    PARKED_VOLID = "local-lvm:vm-9001-disk-0"
+
+    def _verifier(self, cluster: dict) -> PVEVerifier:
+        """Build a verifier whose _get answers from a path -> payload dict."""
+        v = PVEVerifier(_token_config())
+
+        def fake_get(path: str):
+            if path not in cluster:
+                raise AssertionError(f"unexpected GET {path}")
+            return cluster[path]
+
+        v._get = fake_get  # type: ignore[method-assign]
+        return v
+
+    @staticmethod
+    def _pvd_cid(volid: str) -> str:
+        raw = json.dumps({"v": volid}, separators=(",", ":")).encode()
+        return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def _cluster(self, parker_cfg: dict, vm_cfg: dict | None = None) -> dict:
+        vms = [{"vmid": 90000}]
+        resources = [{"vmid": 90000, "node": "pve1"}]
+        cluster = {
+            "/nodes/pve1/qemu": vms,
+            "/cluster/resources?type=vm": resources,
+            "/nodes/pve1/qemu/90000/config": parker_cfg,
+        }
+        if vm_cfg is not None:
+            vms.append({"vmid": 101})
+            resources.append({"vmid": 101, "node": "pve1"})
+            cluster["/nodes/pve1/qemu/101/config"] = vm_cfg
+        return cluster
+
+    # -- cluster_vms / holder resilience -------------------------------------
+
+    def test_holder_on_another_node_is_found(self) -> None:
+        """A holder on a second node must not read as free-floating. This is the
+        one assertion in the harness that fails OPEN when it is wrong: a
+        node-scoped scan returns [] and 'no VM holds the disk' passes."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 105, "node": "pve2"}],
+            "/nodes/pve2/qemu/105/config": {"scsi1": self.PARKED_VOLID},
+        })
+        self.assertEqual(v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [(105, "scsi1")])
+
+    def test_unreadable_vm_config_is_skipped_not_fatal(self) -> None:
+        """A guest destroyed mid-scan, or one PVE refuses to read while it is
+        locked, must not abort the run. The Go side skips the same case."""
+        cluster = {
+            "/cluster/resources?type=vm": [
+                {"vmid": 101, "node": "pve1"},
+                {"vmid": 102, "node": "pve1"},
+            ],
+            "/nodes/pve1/qemu/102/config": {"scsi1": self.PARKED_VOLID},
+        }
+
+        def fake_get(path: str):
+            if path not in cluster:
+                raise PVEVerifyError(f"GET {path} failed: 500")
+            return cluster[path]
+
+        v = PVEVerifier(_token_config())
+        v._get = fake_get  # type: ignore[method-assign]
+        self.assertEqual(v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [(102, "scsi1")])
+
+    def test_cluster_vms_falls_back_to_node_listing(self) -> None:
+        """A token without /cluster/resources still gets the node's own VMs."""
+        cluster = {"/nodes/pve1/qemu": [{"vmid": 101}]}
+
+        def fake_get(path: str):
+            if path not in cluster:
+                raise PVEVerifyError(f"GET {path} forbidden")
+            return cluster[path]
+
+        v = PVEVerifier(_token_config())
+        v._get = fake_get  # type: ignore[method-assign]
+        self.assertEqual(v.cluster_vms(), [(101, "pve1")])
+
+    # -- parker_vmids --------------------------------------------------------
+
+    def test_parker_recognized_by_band_and_tag(self) -> None:
+        v = self._verifier(self._cluster({"tags": "bosh-cpi;bosh-parker"}))
+        self.assertEqual(v.parker_vmids(90000, 90999), [90000])
+
+    def test_vm_in_band_without_tag_is_not_a_parker(self) -> None:
+        """The band alone must not classify: an operator VM that happens to sit
+        at 90000 is not a parker, and treating it as one would let the harness
+        pass while the CPI parked nothing."""
+        v = self._verifier(self._cluster({"tags": "some-other-tag"}))
+        self.assertEqual(v.parker_vmids(90000, 90999), [])
+
+    def test_parker_tag_match_is_case_insensitive(self) -> None:
+        v = self._verifier(self._cluster({"tags": "BOSH-Parker"}))
+        self.assertEqual(v.parker_vmids(90000, 90999), [90000])
+
+    def test_parker_tag_match_accepts_comma_and_space_separators(self) -> None:
+        """splitTagString in internal/pve/parker.go tokenizes on ';', ',', and
+        ' '. A splitter that knew only ';' would return no parkers at all, which
+        turns every "no parker was created" assertion into a vacuous pass."""
+        for tags in ("bosh-cpi,bosh-parker", "bosh-cpi bosh-parker", "bosh-cpi; bosh-parker"):
+            with self.subTest(tags=tags):
+                v = self._verifier(self._cluster({"tags": tags}))
+                self.assertEqual(v.parker_vmids(90000, 90999), [90000])
+
+    def test_vm_outside_band_is_ignored(self) -> None:
+        v = self._verifier(self._cluster({"tags": "bosh-parker"}))
+        self.assertEqual(v.parker_vmids(91000, 91999), [])
+
+    def test_parker_on_another_node_is_found(self) -> None:
+        """A park lands on the disk's own node, not necessarily the configured
+        one. A node-scoped scan returns [] here, which makes "no parker was
+        created" pass while a parker holds the disk on the next node over."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 90001, "node": "pve2", "type": "qemu"}],
+            "/nodes/pve2/qemu/90001/config": {"tags": "bosh-cpi;bosh-parker"},
+        })
+        self.assertEqual(v.parker_vmids(90000, 90999), [90001])
+
+    def test_cluster_listing_is_read_fresh_every_call(self) -> None:
+        """The harness holds one verifier for a whole run and asserts on cluster
+        state right after creating a VM, parking a disk, and deleting a VM. A
+        cached listing answers every one of those with the cluster as it was
+        earlier in the run: the delete assertion sees the VM it just deleted, and
+        the parker assertions miss a parker created mid-run."""
+        v = PVEVerifier(_token_config())
+        state: list[dict] = [{"vmid": 101, "node": "pve1", "type": "qemu"}]
+
+        def fake_get(path: str):
+            if path == "/cluster/resources?type=vm":
+                return list(state)
+            if path == "/nodes/pve2/qemu/90001/config":
+                return {"tags": "bosh-cpi;bosh-parker"}
+            raise AssertionError(f"unexpected GET {path}")
+
+        v._get = fake_get  # type: ignore[method-assign]
+        self.assertTrue(v.vm_exists(101), "the VM is there before the delete")
+        self.assertEqual(v.parker_vmids(90000, 90999), [], "no parker yet")
+        state.clear()
+        self.assertFalse(v.vm_exists(101), "the VM must be gone after the delete")
+        state.append({"vmid": 90001, "node": "pve2", "type": "qemu"})
+        self.assertTrue(v.vm_exists(90001), "a VM created mid-run must be visible")
+        self.assertEqual(
+            v.parker_vmids(90000, 90999), [90001],
+            "a parker created mid-run must be visible",
+        )
+
+    def test_vm_exists_finds_a_vm_on_another_node(self) -> None:
+        """vm_exists has to match parker discovery: a node-scoped presence check
+        answers False for a parker on the next node over, and the assertion built
+        on it then reports that the parker was destroyed."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 90001, "node": "pve2", "type": "qemu"}],
+        })
+        self.assertTrue(v.vm_exists(90001))
+        self.assertFalse(v.vm_exists(90002))
+
+    def test_container_in_parker_band_is_skipped(self) -> None:
+        """/cluster/resources?type=vm lists LXC containers too, and none of
+        these predicates can read a container config."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [
+                {"vmid": 90001, "node": "pve1", "type": "lxc"},
+                {"vmid": 90002, "node": "pve1", "type": "qemu"},
+            ],
+            "/nodes/pve1/qemu/90002/config": {"tags": "bosh-parker"},
+        })
+        self.assertEqual(v.parker_vmids(90000, 90999), [90002])
+
+    # -- disk_holders --------------------------------------------------------
+
+    def test_holder_found_on_parker_slot(self) -> None:
+        v = self._verifier(
+            self._cluster({"tags": "bosh-parker", "scsi3": f"{self.PARKED_VOLID},size=1G"})
+        )
+        self.assertEqual(
+            v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [(90000, "scsi3")]
+        )
+
+    def test_free_floating_disk_has_no_holder(self) -> None:
+        v = self._verifier(self._cluster({"tags": "bosh-parker"}))
+        self.assertEqual(v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [])
+
+    def test_unused_slot_counts_as_a_holder(self) -> None:
+        """PVE demotes a volume to unusedN when it leaves a bus without being
+        deleted. That is still a config reference, and reporting it as free
+        would hide a half-finished detach."""
+        v = self._verifier(
+            self._cluster({"tags": "bosh-parker", "unused0": self.PARKED_VOLID})
+        )
+        self.assertEqual(
+            v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [(90000, "unused0")]
+        )
+
+    def test_double_attach_reports_both_holders(self) -> None:
+        v = self._verifier(
+            self._cluster(
+                {"tags": "bosh-parker", "scsi0": f"{self.PARKED_VOLID},size=1G"},
+                {"scsi1": f"{self.PARKED_VOLID},size=1G"},
+            )
+        )
+        self.assertEqual(
+            v.disk_holders(self._pvd_cid(self.PARKED_VOLID)),
+            [(101, "scsi1"), (90000, "scsi0")],
+        )
+
+    def test_volid_prefix_does_not_match(self) -> None:
+        """'vm-9001-disk-0' must not match 'vm-9001-disk-01'."""
+        v = self._verifier(
+            self._cluster({"tags": "bosh-parker", "scsi0": f"{self.PARKED_VOLID}1,size=1G"})
+        )
+        self.assertEqual(v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [])
+
+    def test_non_disk_config_key_is_ignored(self) -> None:
+        v = self._verifier(
+            self._cluster({"tags": "bosh-parker", "description": self.PARKED_VOLID})
+        )
+        self.assertEqual(v.disk_holders(self._pvd_cid(self.PARKED_VOLID)), [])
+
+    # -- parked_disks (provenance sentinel) ----------------------------------
+
+    def test_provenance_entry_read_from_sentinel(self) -> None:
+        desc = (
+            'parker\n<!--BOSH:{"bosh_parked_disks":{"'
+            + self.PARKED_VOLID
+            + '":{"disk_cid":"pvd-x","parked_at":"2026-08-19T00:00:00Z","node":"pve1"}}}-->'
+        )
+        v = self._verifier(self._cluster({"tags": "bosh-parker", "description": desc}))
+        self.assertIn(self.PARKED_VOLID, v.parked_disks(90000))
+
+    def test_no_sentinel_yields_empty_map(self) -> None:
+        v = self._verifier(self._cluster({"tags": "bosh-parker", "description": "plain"}))
+        self.assertEqual(v.parked_disks(90000), {})
+
+    def test_corrupt_sentinel_yields_empty_map(self) -> None:
+        """Provenance is best-effort in the CPI, so unreadable provenance must
+        not crash the verification that reads it."""
+        v = self._verifier(
+            self._cluster({"tags": "bosh-parker", "description": "<!--BOSH:{not json-->"})
+        )
+        self.assertEqual(v.parked_disks(90000), {})
+
+    def test_sentinel_without_parked_key_yields_empty_map(self) -> None:
+        v = self._verifier(
+            self._cluster(
+                {"tags": "bosh-parker", "description": '<!--BOSH:{"bosh_attached_disks":{}}-->'}
+            )
+        )
+        self.assertEqual(v.parked_disks(90000), {})
+
+    # -- qemu_config ---------------------------------------------------------
+
+    def test_qemu_config_rejects_non_object(self) -> None:
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 90000, "node": "pve1", "type": "qemu"}],
+            "/nodes/pve1/qemu/90000/config": None,
+        })
+        with self.assertRaises(PVEVerifyError):
+            v.qemu_config(90000)
+
+    def test_qemu_config_reads_the_node_hosting_the_vm(self) -> None:
+        """The configured node is a fallback, not the answer: a parker lands on
+        the disk's own node, and reading the wrong one 404s on a VM that is
+        plainly there."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 90000, "node": "pve2", "type": "qemu"}],
+            "/nodes/pve2/qemu/90000/config": {"name": "bosh-parker-90000"},
+        })
+        self.assertEqual(v.qemu_config(90000).get("name"), "bosh-parker-90000")
+
+
+class ParkerDiskSlotsTests(unittest.TestCase):
+    """parker_disk_slots reports what a --purge would actually destroy."""
+
+    @staticmethod
+    def _verifier(cfg: dict) -> PVEVerifier:
+        v = PVEVerifier.__new__(PVEVerifier)
+        v.node = "pve1"
+
+        def fake_get(path: str):
+            if path == "/cluster/resources?type=vm":
+                return [{"vmid": 90000, "node": "pve1", "type": "qemu"}]
+            if path != "/nodes/pve1/qemu/90000/config":
+                raise AssertionError(f"unexpected GET {path}")
+            return cfg
+
+        v._get = fake_get  # type: ignore[method-assign]
+        return v
+
+    def test_active_and_unused_slots_counted(self) -> None:
+        v = self._verifier(
+            {
+                "scsihw": "virtio-scsi-pci",
+                "scsi0": "local-lvm:vm-9001-disk-0,iothread=1",
+                "scsi3": "local-lvm:vm-9002-disk-0",
+                "unused0": "local-lvm:vm-9003-disk-0",
+                "protection": 1,
+                "name": "bosh-parker-1",
+            }
+        )
+        self.assertEqual(
+            v.parker_disk_slots(90000),
+            {
+                "scsi0": "local-lvm:vm-9001-disk-0",
+                "scsi3": "local-lvm:vm-9002-disk-0",
+                "unused0": "local-lvm:vm-9003-disk-0",
+            },
+        )
+
+    def test_scsihw_is_not_a_disk(self) -> None:
+        """The digit anchor is the point: every parker carries scsihw, so a bare
+        ^scsi match reads an empty parker as one holding a disk."""
+        v = self._verifier({"scsihw": "virtio-scsi-pci", "protection": 1})
+        self.assertEqual(v.parker_disk_slots(90000), {})
+
+
+# ---------------------------------------------------------------------------
+# volume_exists across nodes
+# ---------------------------------------------------------------------------
+
+class TestVolumeExistsMultiNode(unittest.TestCase):
+    """volume_exists on a multi-node cluster with node-local storage.
+
+    The CPI places a disk on whichever node has headroom, and a node-local
+    storage's content listing is per node — so a probe that only asked the
+    configured node answered False for a volume that is plainly there, and the
+    lifecycle run aborted right after create_disk.
+    """
+
+    VOLID = "local-lvm-data:vm-17000-disk-0"
+
+    @staticmethod
+    def _pvd_cid(volid: str, meta: dict | None = None) -> str:
+        payload: dict = {"v": volid}
+        if meta:
+            payload["m"] = meta
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def _verifier(self, routes: dict) -> PVEVerifier:
+        v = PVEVerifier(_token_config())
+
+        def fake_get(path: str):
+            if path not in routes:
+                raise PVEVerifyError(f"unrouted GET {path}")
+            return routes[path]
+
+        v._get = fake_get  # type: ignore[method-assign]
+        return v
+
+    def test_cid_metadata_node_is_asked_first(self) -> None:
+        """The CID's own metadata names the node the volume was created on;
+        that listing is the one that can actually see it."""
+        v = self._verifier({
+            "/nodes/pve2/storage/local-lvm-data/content": [{"volid": self.VOLID}],
+        })
+        cid = self._pvd_cid(self.VOLID, meta={"pool": "local-lvm-data", "node": "pve2"})
+        self.assertTrue(v.volume_exists(cid))
+
+    def test_volume_on_unconfigured_node_found_via_cluster(self) -> None:
+        """No metadata node: every node hosting a VM is asked, then the
+        configured one. The volume sits on pve2 only."""
+        v = self._verifier({
+            "/cluster/resources?type=vm": [
+                {"vmid": 101, "node": "pve1"},
+                {"vmid": 102, "node": "pve2"},
+            ],
+            "/nodes/pve1/storage/local-lvm-data/content": [],
+            "/nodes/pve2/storage/local-lvm-data/content": [{"volid": self.VOLID}],
+            "/nodes/pve/storage/local-lvm-data/content": [],
+        })
+        self.assertTrue(v.volume_exists(self._pvd_cid(self.VOLID)))
+
+    def test_absent_everywhere_is_false(self) -> None:
+        v = self._verifier({
+            "/cluster/resources?type=vm": [{"vmid": 101, "node": "pve1"}],
+            "/nodes/pve1/storage/local-lvm-data/content": [],
+            "/nodes/pve/storage/local-lvm-data/content": [],
+        })
+        self.assertFalse(v.volume_exists(self._pvd_cid(self.VOLID)))
+
+    def test_unreadable_node_listing_skipped(self) -> None:
+        """A node whose storage listing cannot be read is skipped: the volume
+        may still be visible from another node."""
+        routes = {
+            "/cluster/resources?type=vm": [
+                {"vmid": 101, "node": "pve1"},
+                {"vmid": 102, "node": "pve2"},
+            ],
+            # pve1's listing is deliberately unrouted -> PVEVerifyError.
+            "/nodes/pve2/storage/local-lvm-data/content": [{"volid": self.VOLID}],
+        }
+        self.assertTrue(self._verifier(routes).volume_exists(self._pvd_cid(self.VOLID)))
+
+    def test_cid_node_extraction(self) -> None:
+        mod = sys.modules[PVEVerifier.__module__]
+        self.assertEqual(
+            mod._cid_node(self._pvd_cid(self.VOLID, meta={"node": "pve7"})), "pve7"
+        )
+        self.assertEqual(mod._cid_node(self._pvd_cid(self.VOLID)), "")
+        self.assertEqual(mod._cid_node("not-an-envelope"), "")
 
 
 if __name__ == "__main__":

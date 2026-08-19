@@ -469,8 +469,9 @@
   config["disk_delete_state_guard"] = disk_delete_state_guard unless disk_delete_state_guard.to_s.empty?
 
   # Emit detached_disk_strategy only when set to a non-empty value. The Go
-  # accessor defaults empty string to "free"; omitting the key preserves that
-  # default and ensures byte-identical behaviour on existing deployments.
+  # accessor defaults an empty string to "parked"; omitting the key hands the
+  # decision to that default. Operators opting out set "free" explicitly, which
+  # this emits.
   detached_disk_strategy = p("pve.detached_disk_strategy", "")
   config["detached_disk_strategy"] = detached_disk_strategy unless detached_disk_strategy.to_s.empty?
 

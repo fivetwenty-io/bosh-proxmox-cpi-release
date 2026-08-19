@@ -12,6 +12,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -127,7 +128,11 @@ func (q *parkerQEMU) AttachDisk(_ context.Context, node string, vmid int, volid,
 	if q.attachFn != nil {
 		return q.attachFn(node, vmid, volid, bus, opts)
 	}
-	return "", nil
+	// The real SDK returns the disk key it wrote ("scsi3"), never a UPID --
+	// the attach is a synchronous config PUT. The stub matches so any code
+	// that mistakes this value for a task to await fails here the way it
+	// failed against live PVE, instead of passing on an empty string.
+	return slot, nil
 }
 
 func (q *parkerQEMU) DetachDisk(_ context.Context, node string, vmid int, diskID string) error {
@@ -178,8 +183,20 @@ func (q *parkerQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ stri
 // parkerNodesService is a minimal nodes.Service that intercepts UpdateQemuConfig.
 // All other methods panic if called unexpectedly.
 type parkerNodesService struct {
-	sdknodes.Service // embed for zero-value; override only UpdateQemuConfig
+	sdknodes.Service // embed for zero-value; override what a test needs
 	updateFn         func(node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
+	// storageContentFn intercepts ListStorageContent, the storage scan parker
+	// VMID allocation runs when ParkerConfig.DiskStorage is set.
+	storageContentFn func(node, storage string) (*sdknodes.ListStorageContentResponse, error)
+}
+
+func (n *parkerNodesService) ListStorageContent(
+	_ context.Context, node, storage string, _ *sdknodes.ListStorageContentParams,
+) (*sdknodes.ListStorageContentResponse, error) {
+	if n.storageContentFn != nil {
+		return n.storageContentFn(node, storage)
+	}
+	return &sdknodes.ListStorageContentResponse{}, nil
 }
 
 func (n *parkerNodesService) UpdateQemuConfig(_ context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
@@ -1110,6 +1127,114 @@ func TestParkDisk_SlotRaceRetriesNextSlot(t *testing.T) {
 	}
 }
 
+// TestParkDisk_SlotRaceSweepFails_FailsPermanently covers the park path's
+// deferred sweep. A slot lost to a concurrent park leaves our volume on an
+// unusedN key; the deferred sweep clears it, and when it cannot, the park must
+// not hand its caller an error that reads as "try again" or "try another
+// parker". Every holder probe matches active-bus keys only, so the retry's scan
+// sees a free volume and parks it a second time -- on this parker's neighbour if
+// this one is full -- giving one volume two config references, one invisible.
+// TestParkDisk_ParkerVMIDStorageScanFails_Retriable pins the classification of
+// the parker-CREATE path, which every other park test skips: they all find an
+// existing parker. A park that must allocate one runs the VMID storage scan
+// first, and a transient fault there used to reach the Director as permanent,
+// because cpierrors.Wrap of an untyped SDK error is permanent and detach_disk
+// now preserves whatever class the park chose instead of forcing retriable.
+func TestParkDisk_ParkerVMIDStorageScanFails_Retriable(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &parkerNodesService{
+		storageContentFn: func(_, _ string) (*sdknodes.ListStorageContentResponse, error) {
+			return nil, &sdkerrors.ConnectionError{
+				Host: "pve1", Port: 8006, Message: "connection reset by peer",
+			}
+		},
+	}
+	// No parkers exist, so the park must allocate a VMID and create one.
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	}, nodesSvc)
+
+	cfg := parkerTestCfg()
+	// DiskStorage is what parkAfterDetach sets, and what makes the scan run.
+	cfg.DiskStorage = "local-lvm"
+
+	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{})
+	if err == nil {
+		t.Fatal("expected an error when the parker VMID storage scan fails")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("a transient storage-scan fault must stay retriable; got: %v", err)
+	}
+}
+
+func TestParkDisk_SlotRaceSweepFails_FailsPermanently(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	otherVolid := "local-lvm:vm-9002-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				// Our volume is already demoted to unused0 by the racing park,
+				// so the sweep has something to find on every pass.
+				return map[string]any{
+					"tags":    "bosh-parker",
+					"scsi0":   otherVolid,
+					"unused0": bareVolid,
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		// The sweep's removal is refused: a role without VM.Config.Disk on the
+		// parker, which no retry repairs.
+		detachFn: func(_ string, _ int, _ string) error {
+			return errors.New("403 Permission check failed (/vms/90000, VM.Config.Disk)")
+		},
+	}
+	// Every attach loses its slot to the concurrent park, so the loop exhausts
+	// its budget with demoted set.
+	qemuSvc.attachFn = func(_ string, vmid int, _, _ string, opts *qemu.AttachOpts) (string, error) {
+		slot := ""
+		if opts != nil {
+			slot = opts.DiskID
+		}
+		qemuSvc.recordAttach(vmid, slot, otherVolid)
+		return "", nil
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{})
+	if err == nil {
+		t.Fatal("a park that stranded a reference must not report success")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("the failure must be permanent; a retry parks the volume a second time, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "qm unlink") {
+		t.Errorf("the error must carry the commands that clear the reference, got: %v", err)
+	}
+	// The commands are only half of it: the sentence has to describe what this
+	// call actually did. A park reporting "detached ... from parker" sends the
+	// operator looking for an unpark that never happened.
+	if strings.Contains(err.Error(), "UnparkDisk") || strings.Contains(err.Error(), "detached ") {
+		t.Errorf("a park failure must not describe itself as an unpark, got: %v", err)
+	}
+}
+
 func TestParkDisk_AttachesToFreeSlot(t *testing.T) {
 	t.Parallel()
 	node := "pve1"
@@ -1237,6 +1362,453 @@ func TestUnparkDisk_ParkedDiskDetachCalled(t *testing.T) {
 	}
 	if detachSlot != "scsi5" {
 		t.Errorf("detachSlot: want scsi5, got %q", detachSlot)
+	}
+}
+
+// TestUnparkDiskAt_SweepUnverified_FailsPermanently covers the quietest failure
+// in the parker path: PVE answers the unused-key removal without an error but
+// the key survives. Reporting success there leaves a live volume referenced by a
+// key no probe matches on, and a later purge of the parker destroys it.
+//
+// The failure has to be permanent. The detach already succeeded, so a retry
+// resolves no holder, returns early without sweeping, and attaches the volume
+// to the workload VM with the parker still referencing it.
+func TestUnparkDiskAt_SweepUnverified_FailsPermanently(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		// Never forgets unused0, however many times it is told to.
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker", "unused0": bareVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, _ string) error { return nil },
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	holder := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, parkerTestCfg())
+	if err == nil {
+		t.Fatal("a reference that survives removal must not be reported as a successful unpark")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("a retry cannot clear this: it finds no holder, skips the sweep, and attaches the volume anyway")
+	}
+	if !strings.Contains(err.Error(), "qm unlink") {
+		t.Errorf("the error must carry the commands that clear the reference, got: %v", err)
+	}
+}
+
+// TestUnparkDiskAt_SweepVerifyReadFails_FailsPermanently covers the read AFTER
+// the removal rather than the one before it. The removal was accepted, but a
+// non-error response is not proof the key is gone, and nothing reads this parker
+// again on the CPI's own initiative: a later unpark of this volume finds no
+// holder and returns early, and a later park only sweeps a slot it lost in that
+// same call. Reporting success here hands attach_disk a volume the parker may
+// still reference, and drops the provenance entry that named it.
+func TestUnparkDiskAt_SweepVerifyReadFails_FailsPermanently(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	reads := 0
+	descWrites := 0
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid != parkerVMID {
+				return map[string]any{}, nil
+			}
+			reads++
+			switch reads {
+			case 1, 2:
+				// The unpark's re-read, then the sweep's own read: the volume is
+				// off the active bus and sitting on unused0.
+				return map[string]any{"tags": "bosh-parker", "unused0": bareVolid}, nil
+			default:
+				// The read-after-write that would confirm the key is gone.
+				return nil, errors.New("500 pveproxy backend closed the connection")
+			}
+		},
+		detachFn: func(_ string, _ int, _ string) error { return nil },
+	}
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			// Protection clear and restore come through here too; only a
+			// description write touches the provenance sentinel.
+			if params != nil && params.Description != nil {
+				descWrites++
+			}
+			return nil
+		},
+	}
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	}, nodesSvc)
+
+	holder := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, parkerTestCfg())
+	if err == nil {
+		t.Fatal("an unverifiable sweep must not report the reference cleared")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("the failure must be permanent; a retry skips the sweep entirely, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "qm unlink") {
+		t.Errorf("the error must carry the commands that clear the reference, got: %v", err)
+	}
+	if descWrites != 0 {
+		t.Errorf("provenance must survive: it is the only record naming an unproven reference, got %d writes", descWrites)
+	}
+}
+
+// TestUnparkDiskAt_SweepSkipsSelfNamedVolume covers the overlapping-band case.
+// A volume named for the parker that holds it is the parker's own disk in PVE's
+// eyes, so removing the unused entry deallocates the volume instead of dropping
+// a stale reference. The sweep must leave it alone -- and must not then report
+// the unpark as clean, since the reference it could not clear is exactly the one
+// that gets a live volume attached twice.
+func TestUnparkDiskAt_SweepSkipsSelfNamedVolume(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	// Named for the parker itself.
+	bareVolid := "local-lvm:vm-90000-disk-3"
+	var detachSlots []string
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker", "unused0": bareVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, diskID string) error {
+			detachSlots = append(detachSlots, diskID)
+			return nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	holder := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, parkerTestCfg())
+	if err == nil {
+		t.Fatal("a reference the sweep cannot clear must not be reported as a successful unpark")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if cpiErr.OkToRetry() {
+		t.Error("the band overlap that causes this has to be corrected by hand; retrying never clears it")
+	}
+	if !strings.Contains(err.Error(), "parked_disk_vmid_range_start") {
+		t.Errorf("the error must name the band that has to change, got: %v", err)
+	}
+	for _, slot := range detachSlots {
+		if slot == "unused0" {
+			t.Error("removing this entry would deallocate the volume, not drop a reference")
+		}
+	}
+}
+
+// TestUnparkDiskAt_StaleSlot_DetachesTheVolumeNotTheSlot is the regression for
+// a blind write. The caller resolves the parker's slot BEFORE taking the
+// protection lock, and DetachDisk names a slot rather than a volume: by the
+// time the detach runs, a concurrent park can have placed a different disk in
+// that slot. Detaching it would silently un-park a volume whose own detach_disk
+// already reported success, and nothing downstream would notice.
+//
+// Here the holder scan says scsi5, but by the time the lock is held the volume
+// has moved to scsi7 and scsi5 belongs to somebody else.
+func TestUnparkDiskAt_StaleSlot_DetachesTheVolumeNotTheSlot(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	otherVolid := "local-lvm:vm-9999-disk-0"
+	var detachSlot string
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{
+					"tags":  "bosh-parker",
+					"scsi5": otherVolid,
+					"scsi7": bareVolid,
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, diskID string) error {
+			detachSlot = diskID
+			return nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	// The holder carries the slot a pre-lock scan found, which is now stale.
+	stale := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	if err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, stale, parkerTestCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if detachSlot != "scsi7" {
+		t.Errorf("must detach the slot holding the volume (scsi7), not the scanned slot; got %q", detachSlot)
+	}
+}
+
+// TestUnparkDiskAt_VolumeAlreadyGone_NoDetach covers the other half: a
+// concurrent caller already unparked the volume, so there is nothing on the
+// active bus and no unusedN reference. The call must be an idempotent no-op
+// rather than detaching whatever now occupies the scanned slot.
+func TestUnparkDiskAt_VolumeAlreadyGone_NoDetach(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	detached := false
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				// Somebody else's disk now occupies the scanned slot.
+				return map[string]any{"tags": "bosh-parker", "scsi5": "local-lvm:vm-9999-disk-0"}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, _ string) error {
+			detached = true
+			return nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	stale := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	if err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, stale, parkerTestCfg()); err != nil {
+		t.Fatalf("an already-unparked volume must be an idempotent no-op; got: %v", err)
+	}
+	if detached {
+		t.Error("must not detach a slot that no longer holds this volume")
+	}
+}
+
+// TestUnparkDiskAt_DemotedOnly_SweepsWithoutDetach covers the volume that is off
+// the active bus but still named by an unusedN key -- the state a partially
+// failed unpark leaves behind, invisible to every active-bus probe. The call
+// must open the protection window and clear the reference.
+func TestUnparkDiskAt_DemotedOnly_SweepsWithoutDetach(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	var detachSlots []string
+
+	// Stateful: the sweep verifies its own removal with a re-read, so the double
+	// has to actually forget the key it was told to drop.
+	cleared := false
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid != parkerVMID {
+				return map[string]any{}, nil
+			}
+			cfg := map[string]any{"tags": "bosh-parker"}
+			if !cleared {
+				cfg["unused0"] = bareVolid
+			}
+			return cfg, nil
+		},
+		detachFn: func(_ string, _ int, diskID string) error {
+			detachSlots = append(detachSlots, diskID)
+			if diskID == "unused0" {
+				cleared = true
+			}
+			return nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	stale := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	if err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, stale, parkerTestCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(detachSlots) != 1 || detachSlots[0] != "unused0" {
+		t.Errorf("must clear the demoted reference and nothing else; got %v", detachSlots)
+	}
+}
+
+// TestUnparkDisk_ClearsAndRestoresProtection pins the protection dance around
+// the detach. PVE documents the protection flag as disabling "the remove VM and
+// remove disk operations", so a detach against a parker still carrying
+// protection=1 is rejected: the flag must come off before the detach and go
+// back on after it.
+func TestUnparkDisk_ClearsAndRestoresProtection(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var events []string
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{
+					"tags":       "bosh-parker",
+					"scsi5":      bareVolid,
+					"protection": 1,
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, _ string) error {
+			events = append(events, "detach")
+			return nil
+		},
+	}
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Protection != nil {
+				events = append(events, fmt.Sprintf("protection=%t", *params.Protection))
+			}
+			return nil
+		},
+	}
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(parkerVMID), "node": node},
+		), nil
+	}, nodesSvc)
+
+	if err := pve.UnparkDisk(context.Background(), c, nopLogger(), bareVolid, parkerTestCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"protection=false", "detach", "protection=true"}
+	if len(events) != len(want) {
+		t.Fatalf("event sequence: want %v, got %v", want, events)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("event sequence: want %v, got %v", want, events)
+		}
+	}
+}
+
+// TestUnparkDisk_ProtectionRestoredAfterFailedDetach verifies the parker never
+// stays unprotected when the detach itself fails: the flag goes back on and the
+// caller still sees the retriable detach error.
+func TestUnparkDisk_ProtectionRestoredAfterFailedDetach(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var restored bool
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"tags": "bosh-parker", "scsi5": bareVolid}, nil
+			}
+			return map[string]any{}, nil
+		},
+		detachFn: func(_ string, _ int, _ string) error {
+			return errors.New("PVE rejected the detach")
+		},
+	}
+	nodesSvc := &parkerNodesService{
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Protection != nil && *params.Protection {
+				restored = true
+			}
+			return nil
+		},
+	}
+	c := buildParkerClientWithNodes(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(parkerVMID), "node": node},
+		), nil
+	}, nodesSvc)
+
+	err := pve.UnparkDisk(context.Background(), c, nopLogger(), bareVolid, parkerTestCfg())
+	if err == nil {
+		t.Fatal("expected the detach failure to surface")
+	}
+	if !restored {
+		t.Error("protection must be restored even when the detach fails")
+	}
+}
+
+// TestParkDisk_ScansClusterOnce pins the single-pass holder resolution: the
+// cluster sweep reads every VM config, so a park that resolved the holder twice
+// would double the cost of every detach now that parking is the default.
+func TestParkDisk_ScansClusterOnce(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var listCalls int
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid >= 90000 {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		listCalls++
+		// Disk is free-floating: no VM holds it, which is the state every
+		// post-detach park starts from.
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(90000), "node": node},
+		), nil
+	})
+
+	if err := pve.ParkDisk(context.Background(), c, nopLogger(), node, bareVolid, parkerTestCfg(), pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: %v", err)
+	}
+	// Breakdown: one holder scan (idempotency + real-VM check answered from the
+	// same result), then ListParkersForNode's cluster-VMID listing and its
+	// per-candidate node lookup. Resolving the holder twice — the shape before
+	// the parked strategy became the default — made it four.
+	if listCalls > 3 {
+		t.Errorf("cluster listings: want at most 3 (one holder scan + parker lookup), got %d", listCalls)
 	}
 }
 
@@ -1721,10 +2293,14 @@ func TestUnparkDisk_ProvenanceAbsentEntryNoUpdate(t *testing.T) {
 		otherVolid, otherVolid,
 	)
 
-	var updateCalled bool
+	// Only description writes count here: UnparkDisk also toggles the parker's
+	// protection flag through UpdateQemuConfig, which is a different concern.
+	var descUpdateCalled bool
 	nodesSvc := &parkerNodesService{
-		updateFn: func(_, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
-			updateCalled = true
+		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if params != nil && params.Description != nil {
+				descUpdateCalled = true
+			}
 			return nil
 		},
 	}
@@ -1754,8 +2330,8 @@ func TestUnparkDisk_ProvenanceAbsentEntryNoUpdate(t *testing.T) {
 		t.Fatalf("UnparkDisk: %v", err)
 	}
 
-	if updateCalled {
-		t.Error("UpdateQemuConfig must not be called when the volid has no provenance entry")
+	if descUpdateCalled {
+		t.Error("description must not be rewritten when the volid has no provenance entry")
 	}
 }
 
@@ -2009,4 +2585,90 @@ func containsTag(tagStr, tag string) bool {
 		}
 	}
 	return false
+}
+
+// TestListParkersForNode_SkipsContainers is the regression for a node-wide
+// wedge. The cluster resource type "vm" covers LXC containers as well as QEMU
+// guests, and every read this function makes goes through the QEMU config
+// endpoint. A container in the parker band -- an operator's, or one from a
+// tool that allocates high VMIDs -- would fail that read, and because an
+// untagged row is confirmed rather than assumed, the failure is returned: one
+// container would break every park and unpark on the node.
+func TestListParkersForNode_SkipsContainers(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	configReads := 0
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			configReads++
+			if vmid == 90001 {
+				return map[string]any{"tags": "bosh-cpi;bosh-parker"}, nil
+			}
+			// What PVE answers for a VMID that is a container, not a VM.
+			return nil, errors.New("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist")
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(90000), "node": node, "type": "lxc"},
+			map[string]any{"vmid": int64(90001), "node": node, "type": "qemu"},
+		), nil
+	})
+
+	parkers, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("a container in the band must not fail the listing: %v", err)
+	}
+	if len(parkers) != 1 || parkers[0] != 90001 {
+		t.Fatalf("parkers = %v, want [90001]", parkers)
+	}
+	if configReads != 1 {
+		t.Errorf("the container must not be read through the QEMU endpoint; config reads = %d", configReads)
+	}
+}
+
+// TestUnparkDiskAt_DemotedOnly_SweepReadFails_DoesNotReportSuccess covers a
+// sweep that cannot confirm its own work. This path has already SEEN the
+// unusedN entry naming the volume; if the sweep's config read fails and the
+// unpark still returns nil, attach_disk goes on to attach a volume the parker
+// still references, and the provenance record that would have named it is
+// deleted on the way out.
+func TestUnparkDiskAt_DemotedOnly_SweepReadFails_DoesNotReportSuccess(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+	reads := 0
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid != parkerVMID {
+				return map[string]any{}, nil
+			}
+			reads++
+			if reads == 1 {
+				// The unpark's own re-read: off the active bus, still referenced.
+				return map[string]any{"tags": "bosh-parker", "unused0": bareVolid}, nil
+			}
+			// The sweep's read.
+			return nil, errors.New("500 pveproxy backend closed the connection")
+		},
+		detachFn: func(_ string, _ int, _ string) error { return nil },
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{"vmid": int64(parkerVMID), "node": node}), nil
+	})
+
+	holder := pve.DiskHolder{
+		Found: true, VMID: parkerVMID, Node: node, IsParker: true,
+		Slot: "scsi5", Tags: "bosh-parker",
+	}
+	err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, parkerTestCfg())
+	if err == nil {
+		t.Fatal("a sweep that could not read the config must not report the reference cleared")
+	}
+	if !strings.Contains(err.Error(), "qm unlink") {
+		t.Errorf("the error must carry the commands that clear the reference, got: %v", err)
+	}
 }

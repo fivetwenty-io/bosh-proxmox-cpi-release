@@ -180,6 +180,7 @@ cp ci/integration.yml.example ci/integration.yml
 | `stemcell_path` | Absolute path to stemcell tarball; leave empty to use `STEMCELL_PATH` env | `""` |
 | `disk_storage_pools` | Optional. Empty list = single run on `pve_disk_storage`. A list of pool names runs Tier 1 once per pool. The string `auto` autodetects local image-capable pools (lvm/lvmthin/zfspool/dir) via the PVE API | `[]` |
 | `network_test` | Optional. Exercises `create_network`/`delete_network` against live PVE (see below) | *(see below)* |
+| `parked_disk` | Optional. Tunes the parked detached-disk pass, which runs by default (see below) | *(see below)* |
 
 #### `tier1.network_test` — managed-network handler coverage
 
@@ -206,6 +207,34 @@ Autodetect requires valid PVE credentials in `bosh_vars`. In `--dry-run` mode au
 - **`sdn` mode** requires an SDN-capable cluster. It creates a zone (if `sdn_auto_manage_zone`), vnet, and — when `range` is set — a subnet, applies the SDN config, and attaches the VM to the realized vnet bridge.
 - **`bridge` mode** creates a Linux bridge via the nodes API and attaches the VM to it. This changes the node's network configuration; always use an unused iface name.
 
+#### `tier1.parked_disk` — detached-disk strategy coverage
+
+Steps 11c–11l drive one detached disk through both settings of `pve.detached_disk_strategy` and check the cluster after every transition. They run inside the base Tier 1 pass, so no extra lifecycle run is added.
+
+The strategy is pinned per call in a derived CPI config rather than read from the lab's config, which is what lets the pass assert in both directions from any starting point:
+
+- Under `parked` (the default), a detach must leave the disk on a parker VM — inside the VMID band, tagged `bosh-parker`, protected, never booted, and named in the parker's provenance sentinel. A later attach must unpark it, clearing the protection flag for the detach and putting it back afterwards.
+
+- Under `free` (the opt-out), the same detach must leave the volume free-floating with no parker holding it.
+
+- Under `free` with no band configured, which is where an operator lands by opting out without carrying the band forward, both an attach and a delete must be refused: the CPI can no longer recognize the parker still holding the volume, so attaching would leave two VM configs referencing one volume and deleting would leave the parker's slot referencing storage that is gone.
+
+Along the way the pass confirms that the volume survives the park, that a second detach of an already-parked disk changes nothing, that `set_disk_metadata` skips the parker instead of writing to it, that `snapshot_disk` refuses a parked disk whether or not the band is configured (a PVE snapshot would take the whole parker and every other deployment's disk with it, and the holder is classified by its `bosh-parker` tag rather than by the band), that re-parking reuses the existing parker rather than creating a second one, and that `delete_vm` refuses the parker's own VMID.
+
+None of this is visible in the CPI's return values — every one of those calls returns `null` whether it parked the disk or not — so the pass is entirely dependent on the out-of-band verification described below.
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `parked_disk.enabled` | `false` skips steps 11c–11l | `true` |
+| `parked_disk.range_start` | Optional. May only restate the band the CPI config uses | *(from the CPI config)* |
+| `parked_disk.range_end` | Optional, under the same restriction | *(from the CPI config)* |
+
+The pass leaves its parker VM in place. That is the design working as intended — a parker is durable infrastructure that outlives any single disk, the CPI has no call that removes one, and later runs reuse it. Removing one by hand needs the protection flag cleared first, or PVE refuses:
+
+```bash
+qm set <parker-vmid> --protection 0 && qm destroy <parker-vmid> --purge
+```
+
 **`tier2` — BOSH director smoke**
 
 | Key | Description | Example |
@@ -229,7 +258,7 @@ Autodetect requires valid PVE credentials in `bosh_vars`. In `--dry-run` mode au
 
 Beyond asserting on the CPI binary's JSON-RPC return values, Tier 1 independently confirms real cluster state by querying the PVE REST API directly (`scripts/_pve_verify.py`). The verifier reuses the **same host and authentication as the CPI config** — `api_token` becomes an `Authorization: PVEAPIToken=` header; a `password` config performs a `/access/ticket` login and uses the `PVEAuthCookie`. It queries list endpoints (`/cluster/sdn/vnets`, `/cluster/sdn/zones`, `/nodes/{node}/qemu`, `/nodes/{node}/network`, and storage content) and tests membership, which sidesteps PVE's inconsistent 404/500 behavior on per-id GETs.
 
-Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present; `delete_vm` → VM gone; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke — e.g., `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
+Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present; `detach_disk` → the disk is on a parker VM (or free-floating, under the `free` strategy); `attach_disk` → the parker released the slot and its protection flag is back on; `delete_disk` → the volume is gone and no parker still references it; `delete_vm` → VM gone, parker still standing; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke — e.g., `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
 
 ### `scripts/lifecycle` environment variables
 
@@ -258,8 +287,11 @@ Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `creat
 | `SDN_GATEWAY` | *(empty)* | Gateway for the SDN subnet (mode=sdn) |
 | `SDN_IP` | *(empty)* | Test VM IP within `SDN_RANGE` (mode=sdn) |
 | `BRIDGE_TEST_IFACE` | *(empty)* | Bridge iface to create then delete (mode=bridge) |
+| `PARKED_DISK_TEST` | `on` | `on` \| `off` — run the parked detached-disk pass (steps 11c–11l) |
+| `PARKER_RANGE_START` | from `CPI_CONFIG` | First parker VMID. May only restate the band `CPI_CONFIG` uses; a different value aborts the run |
+| `PARKER_RANGE_END` | from `CPI_CONFIG` | Last parker VMID, under the same restriction |
 
-When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is set per pass from `tier1.network_test.modes`; the `SDN_*`/`BRIDGE_TEST_IFACE` values come from `tier1.network_test`.
+When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is set per pass from `tier1.network_test.modes`; the `SDN_*`/`BRIDGE_TEST_IFACE` values come from `tier1.network_test`, and the `PARKED_*`/`PARKER_*` values from `tier1.parked_disk`. The parker band belongs in the CPI config rather than here: the pass reads it from there and refuses a `PARKER_RANGE_*` that disagrees, because looking for parkers outside the band the CPI parks into would read a real parker as an ordinary VM.
 
 ---
 

@@ -619,6 +619,54 @@ func TestHandleSnapshotDisk_ParkedDisk_Rejected(t *testing.T) {
 	}
 }
 
+// TestHandleSnapshotDisk_StrandedParker_Rejected verifies the guard classifies
+// the holder by tag, not by band: a parker left outside a cleared band still
+// refuses the snapshot, because a PVE snapshot takes the whole VM and would
+// entangle every disk that parker holds.
+func TestHandleSnapshotDisk_StrandedParker_Rejected(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90001
+	const volid = "local-lvm:vm-9001-disk-0"
+
+	var snapshotCalled bool
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return map[string]any{"scsi5": volid, "tags": "bosh-cpi;bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			snapshotCalled = true
+			return "", nil
+		},
+	}
+	clusterSvc := &snapClusterService{
+		listFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+			return clusterRespWith(parkerVMID, testNode), nil
+		},
+	}
+
+	// Parking fully disarmed: free strategy, no band.
+	cfg := &config.CPIConfig{
+		Node:                 testNode,
+		DetachedDiskStrategy: "free",
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDepsWithConfig(cfg, qemuSvc, clusterSvc))
+	_, err := h.Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, volid, nil)), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected a refusal for a tagged parker holder even with the band cleared")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeCloud) || cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("refusal must be a non-retriable CloudError; got %T: %v", err, err)
+	}
+	if snapshotCalled {
+		t.Error("Snapshot must not be called for a parker holder")
+	}
+}
+
 // TestHandleSnapshotDisk_ParkedStrategyActive_RealVM_Proceeds verifies that
 // when parked strategy is active but the holder is a real VM (VMID outside
 // the parker range), snapshot proceeds normally with no extra Config calls

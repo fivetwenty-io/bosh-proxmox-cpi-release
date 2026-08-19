@@ -1241,6 +1241,40 @@ func TestHandleSetDiskMetadata_ParkerSkipped_RealVMMatches(t *testing.T) {
 	}
 }
 
+// TestHandleSetDiskMetadata_ParkerWithEmptyRowTags_StillSkipped covers the PVE
+// that does not populate "tags" on a cluster-resources row. An empty field
+// cannot tell an untagged VM from an unpopulated one, so deciding on it alone
+// would treat the parker as a real holder and merge deployment metadata into the
+// description that carries its provenance sentinel. The config read the scan
+// already performs carries the tags, so the second test costs nothing.
+func TestHandleSetDiskMetadata_ParkerWithEmptyRowTags_StillSkipped(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = int64(90001)
+
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			clusterResourceEntry{vmid: parkerVMID, node: testNode, tags: ""},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	parkerCfg := vmConfigWithDisk(testDiskCID, "")
+	parkerCfg["tags"] = "bosh-cpi;bosh-parker"
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(parkerVMID)): parkerCfg,
+	}
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeParkedDeps(client, 90000, 90999))
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("a parked disk is the warn-and-return-nil path, not an error: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil {
+		t.Errorf("metadata was written into the parker description: %s", *nodesSvc.capturedDesc)
+	}
+}
+
 // TestHandleSetDiskMetadata_ParkedDiskOnly_WarnAndNil verifies that when the
 // only VM holding the disk is a parker VM, findVMsHostingDisk returns 0
 // matches, and the handler logs a warn and returns nil (the existing
@@ -1294,16 +1328,14 @@ func TestHandleSetDiskMetadata_ParkedDiskOnly_WarnAndNil(t *testing.T) {
 	}
 }
 
-// TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored verifies that when
-// ParkedStrategyActive is false (no strategy knobs set), a VM carrying the
-// "bosh-parker" tag is NOT skipped — the tag alone cannot classify a VM as a
-// parker without an explicit VMID range. This ensures byte-identical behavior
-// for operators who have not opted into the parked strategy.
-func TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored(t *testing.T) {
+// TestHandleSetDiskMetadata_ZeroConfig_ParkerSkipped verifies that a VM in the
+// default parker band carrying the "bosh-parker" tag is skipped even when the
+// manifest names neither the strategy nor the band. Both come from the parked
+// default, so the exclusion that keeps deployment metadata off a parker VM
+// applies to a config that sets nothing.
+func TestHandleSetDiskMetadata_ZeroConfig_ParkerSkipped(t *testing.T) {
 	t.Parallel()
 
-	// VMID 90001 has bosh-parker tag but no strategy configured → must NOT be
-	// skipped; if it holds the disk the metadata must be persisted there.
 	const parkerTaggedVMID = int64(90001)
 
 	clusterSvc := &diskMetaClusterSvc{
@@ -1323,10 +1355,45 @@ func TestHandleSetDiskMetadata_ZeroConfig_ParkerTagIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("zero-config: unexpected error: %v", err)
 	}
-	// Metadata must be persisted — the parker-tagged VM is the host, and
-	// strategy is unset so no exclusion applies.
-	if nodesSvc.capturedDesc == nil {
-		t.Fatal("zero-config: UpdateQemuConfig not called — parker-tagged VM wrongly excluded when strategy unset")
+	if nodesSvc.capturedDesc != nil {
+		t.Errorf("zero-config: parker VM must be skipped under the parked default; got desc: %s", *nodesSvc.capturedDesc)
+	}
+}
+
+// TestHandleSetDiskMetadata_StrategyFree_StrandedParkerSkipped is the opt-out
+// counterpart. With strategy=free and no band nothing classifies a VM by its
+// VMID, but a "bosh-parker" tag still says what the VM is, and that is the
+// configuration an operator lands in by dropping the band while parkers still
+// stand. Writing there merges deployment metadata into the parker's
+// description — the field carrying the provenance sentinel for every disk it
+// holds. Skipping instead costs a warn and an unpersisted annotation for a disk
+// that is detached anyway.
+func TestHandleSetDiskMetadata_StrategyFree_StrandedParkerSkipped(t *testing.T) {
+	t.Parallel()
+
+	const parkerTaggedVMID = int64(90001)
+
+	clusterSvc := &diskMetaClusterSvc{
+		resp: clusterResourcesWithTaggedVMs(
+			clusterResourceEntry{vmid: parkerTaggedVMID, node: testNode, tags: "bosh-parker"},
+		),
+	}
+	nodesSvc := &diskMetaNodesMock{}
+	qemuCfgs := map[string]map[string]any{
+		diskKey(testNode, int(parkerTaggedVMID)): vmConfigWithDisk(testDiskCID, ""),
+	}
+	client := buildDiskMetaPVE(clusterSvc, qemuCfgs, nodesSvc)
+	deps := makeDiskMetaDeps(client)
+	deps.Config.DetachedDiskStrategy = "free"
+	h := handlers.HandleSetDiskMetadata(deps)
+
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, map[string]any{"deployment": "cf"}), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("strategy=free: unexpected error: %v", err)
+	}
+	if nodesSvc.capturedDesc != nil {
+		t.Errorf("strategy=free: a parker-tagged VM must be skipped whatever the band says; got desc: %s",
+			*nodesSvc.capturedDesc)
 	}
 }
 

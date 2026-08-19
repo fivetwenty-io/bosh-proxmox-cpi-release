@@ -60,6 +60,13 @@ type ClusterLockHandle struct {
 	owner    string
 	released bool
 	pools    PoolService
+	// expiry is when this handle's claim lapses, and now is the clock that
+	// judges it. Release consults them before falling through to a blind delete:
+	// past the expiry the lock is provably not ours any more, and deleting the
+	// sentinel would remove a stealer's claim while they are still inside their
+	// window.
+	expiry time.Time
+	now    func() time.Time
 }
 
 // nowFunc and sleepFunc are seams so tests can drive the acquire loop
@@ -144,11 +151,14 @@ func acquireClusterLockWithClock(
 	deadline := clk.now().Add(timeout)
 
 	for {
-		comment := encodeLockComment(owner, clk.now().Add(ttl))
+		expiry := clk.now().Add(ttl)
+		comment := encodeLockComment(owner, expiry)
 		createErr := pools.CreatePool(ctx, pool, comment)
 		if createErr == nil {
 			// Won the race: the sentinel pool is now ours.
-			return &ClusterLockHandle{pool: pool, owner: owner, pools: pools}, nil
+			return &ClusterLockHandle{
+				pool: pool, owner: owner, pools: pools, expiry: expiry, now: clk.now,
+			}, nil
 		}
 		if !isPoolAlreadyExists(createErr) {
 			// A non-duplicate failure (auth, transport, pmxcfs error) is mapped to
@@ -168,7 +178,7 @@ func acquireClusterLockWithClock(
 		// Held by a live owner: wait and retry until the timeout.
 		now := clk.now()
 		if !now.Before(deadline) {
-			return nil, cpierrors.WrapAs(createErr, cpierrors.TypeRetriableCloud,
+			return nil, cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: timed out after %s waiting for lock %q", timeout, pool))
 		}
 		wait := clusterLockPollInterval + time.Duration(jitterInt64N(int64(clusterLockPollInterval)))
@@ -254,7 +264,19 @@ func tryStealExpired(
 		return nil, nil
 	}
 
-	return &ClusterLockHandle{pool: pool, owner: owner, pools: pools}, nil
+	return &ClusterLockHandle{
+		pool: pool, owner: owner, pools: pools, expiry: clk.now().Add(ttl), now: clk.now,
+	}, nil
+}
+
+// expired reports whether this handle's claim has lapsed. A handle built without
+// a clock (a zero expiry) never expires, which keeps the previous behavior for
+// any construction path that does not set one.
+func (h *ClusterLockHandle) expired() bool {
+	if h == nil || h.now == nil || h.expiry.IsZero() {
+		return false
+	}
+	return h.now().After(h.expiry)
 }
 
 // Release deletes the sentinel pool, freeing the lock. It is idempotent: a
@@ -266,6 +288,29 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	if h == nil || h.released {
 		return nil
 	}
+	// Delete only a pool this handle still owns. A window that outlives its TTL
+	// is stolen by the next acquirer, and a blind delete here would then remove
+	// THEIR sentinel and let a third caller in while they are still inside their
+	// window -- one late holder cascading into unbounded concurrency. A read
+	// that fails, or a comment that cannot be parsed, falls through to the
+	// delete: leaving the pool behind would block acquires until the TTL lapses,
+	// which is the worse of the two.
+	if comment, found, readErr := h.pools.GetPoolComment(ctx, h.pool); readErr == nil && found {
+		if owner, ok := decodeLockOwner(comment); ok && owner != h.owner {
+			// Somebody else holds it now. Ours is already gone.
+			h.released = true
+			return nil
+		}
+	} else if h.expired() {
+		// The read did not answer, and our own claim has lapsed. A lapsed claim
+		// is one a later acquirer is entitled to steal, so the sentinel standing
+		// here is more likely theirs than ours -- and deleting theirs lets a
+		// third caller in while they are mid-window, which is the cascade the
+		// owner check exists to stop. Leave it: the worst case is a sentinel that
+		// outlives us until its own TTL lapses, which acquirers already handle.
+		h.released = true
+		return nil
+	}
 	if err := h.pools.DeletePool(ctx, h.pool); err != nil && !isPoolNotFound(err) {
 		// released stays false: a failed delete (cancelled ctx, transient
 		// API fault) must not latch the handle closed, or a retried Release
@@ -275,6 +320,24 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	}
 	h.released = true
 	return nil
+}
+
+// ErrClusterLockTimeout marks the acquire that ran out its timeout waiting for a
+// holder that was live on every attempt. It is distinct from every other acquire
+// failure: an expired or unreadable holder is stolen rather than waited on, so a
+// timeout is positive evidence that somebody else is inside the window right
+// now. Callers that would otherwise proceed unserialized use it to tell "nobody
+// can lock here" from "somebody is locked here".
+var ErrClusterLockTimeout = errors.New("cluster lock acquire timed out")
+
+// decodeLockOwner extracts the owner token from a sentinel pool comment.
+func decodeLockOwner(comment string) (string, bool) {
+	for _, field := range strings.Fields(comment) {
+		if strings.HasPrefix(field, lockCommentOwnerKey) {
+			return strings.TrimPrefix(field, lockCommentOwnerKey), true
+		}
+	}
+	return "", false
 }
 
 // lockCommentPrefix and lockCommentExpKey frame the structured comment stamped

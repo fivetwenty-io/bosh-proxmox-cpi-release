@@ -1345,3 +1345,84 @@ func TestRetryOnTransient_DoesNotRetryVolumeFormatUnknown(t *testing.T) {
 		t.Errorf("expected exactly 1 attempt (permanent error), got %d", calls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// WrapConfigReadError / WrapMutationError
+// ---------------------------------------------------------------------------
+
+// TestWrapConfigReadError covers the classifier the volume-holder scans use. Its
+// default is WrapError's -- permanent -- because a config read's failure shapes
+// are enumerable; what it adds is that a server fault stays retriable even when
+// it arrives as a bare code the generic mapper does not recognize.
+func TestWrapConfigReadError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{"nil", nil, false},
+		{"403 is a grant to add, not a fault to re-drive", makeAPIErr(403, "Permission check failed"), false},
+		{"404 is permanent", makeAPIErr(404, "not found"), false},
+		{"500 is a server fault", makeAPIErr(500, "internal error"), true},
+		{"596 transport shape", errors.New("pveproxy backend gone (code: 596)"), true},
+		{"unrecognized prose stays permanent", errors.New("something we do not model"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pve.WrapConfigReadError(tc.err)
+			if tc.err == nil {
+				if got != nil {
+					t.Fatalf("nil in, nil out; got %v", got)
+				}
+				return
+			}
+			if cpiErrIsRetriable(t, got) != tc.retriable {
+				t.Errorf("retriable = %v, want %v (err: %v)", !tc.retriable, tc.retriable, got)
+			}
+		})
+	}
+}
+
+// TestWrapMutationError covers the classifier the parker's attaches, detaches,
+// protection writes, and task awaits use. Its default is the INVERSE of
+// WrapError's: retriable, because PVE reports transient conditions as prose no
+// classifier models, and a park that failed permanently on one of those leaves
+// the disk free-floating -- the state parking exists to prevent. Only shapes
+// that are a verdict about the request stay permanent.
+func TestWrapMutationError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{"nil", nil, false},
+		{"403 is a verdict", makeAPIErr(403, "Permission check failed"), false},
+		{"400 is a verdict", makeAPIErr(400, "parameter verification failed"), false},
+		{"404 is a verdict", makeAPIErr(404, "not found"), false},
+		{"401 is a verdict", makeAPIErr(401, "authentication failure"), false},
+		{"429 is pushback, not a verdict", makeAPIErr(429, "too many requests"), true},
+		{"500 is a server fault", makeAPIErr(500, "internal error"), true},
+		{
+			"config gone is a verdict",
+			errors.New("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist"),
+			false,
+		},
+		{"unrecognized prose is retriable", errors.New("something we do not model"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pve.WrapMutationError(tc.err)
+			if tc.err == nil {
+				if got != nil {
+					t.Fatalf("nil in, nil out; got %v", got)
+				}
+				return
+			}
+			if cpiErrIsRetriable(t, got) != tc.retriable {
+				t.Errorf("retriable = %v, want %v (err: %v)", !tc.retriable, tc.retriable, got)
+			}
+		})
+	}
+}

@@ -260,6 +260,27 @@ def build_cpi_config(
         if _val is not None:
             cpi_cfg[_key] = int(_val)
 
+    # The parker band, from the same block that toggles the parked-disk pass.
+    # This is the knob a lab with guests already in 90000-90999 needs: the pass
+    # reads the band back out of this config and refuses a PARKER_RANGE_* that
+    # disagrees, so the band has to be settable here or it is not settable at
+    # all. Absent keys keep the CPI default.
+    # Multi-node labs with node-local stemcell storage need the CPI to
+    # replicate the template to every node; single-node labs must not pay for
+    # it. Absent key keeps the CPI default (false).
+    _replicate = tier1.get("stemcell_replicate_local")
+    if _replicate is not None:
+        cpi_cfg["stemcell_replicate_local"] = bool(_replicate)
+
+    _parked = tier1.get("parked_disk", {}) or {}
+    for _cfg_key, _src_key in (
+        ("parked_disk_vmid_range_start", "range_start"),
+        ("parked_disk_vmid_range_end", "range_end"),
+    ):
+        _val = _parked.get(_src_key)
+        if _val is not None:
+            cpi_cfg[_cfg_key] = int(_val)
+
     # Attach auth — api_token wins if non-empty (and not a dry-run placeholder).
     is_placeholder = api_token.startswith("<dry-run:")
     if api_token and not is_placeholder:
@@ -767,6 +788,26 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
             }
         )
 
+    # Optional parked-disk parameters consumed by the parked-disk pass in
+    # scripts/lifecycle. Absent block -> nothing added, and the pass runs
+    # enabled with the parker band the CPI config itself uses. range_start and
+    # range_end feed BOTH the generated CPI config (see tier1_cpi_config) and
+    # these env vars, so a lab that already has guests in 90000-90999 sets them
+    # once and both sides agree. The pass refuses a PARKER_RANGE_* that
+    # disagrees with its CPI config, because looking for parkers outside the
+    # band the CPI parks into would read a real parker as an ordinary VM.
+    parked = tier1.get("parked_disk", {}) or {}
+    if parked:
+        if "enabled" in parked:
+            env_out["PARKED_DISK_TEST"] = "on" if parked["enabled"] else "off"
+        # "is not None", matching tier1_cpi_config: a literal 0 reaching the CPI
+        # config but not the env var is exactly the disagreement the pass aborts
+        # on, and the two sides have to be filtered the same way to avoid it.
+        if parked.get("range_start") is not None:
+            env_out["PARKER_RANGE_START"] = str(int(parked["range_start"]))
+        if parked.get("range_end") is not None:
+            env_out["PARKER_RANGE_END"] = str(int(parked["range_end"]))
+
     return env_out
 
 
@@ -857,6 +898,14 @@ def _print_summary(cfg: dict, dry_run: bool) -> None:
             print(f"    bridge:         iface={bridge.get('iface')}")
     else:
         print("  network_test:     (disabled)")
+    parked = tier1.get("parked_disk", {}) or {}
+    if parked.get("enabled", True):
+        band = "(CPI default 90000-90999)"
+        if parked.get("range_start") or parked.get("range_end"):
+            band = f"{parked.get('range_start', '(default)')}-{parked.get('range_end', '(default)')}"
+        print(f"  parked_disk:      enabled band={band}")
+    else:
+        print("  parked_disk:      (disabled)")
     print()
     print("Tier 2 (bosh):")
     print(f"  bosh_env_alias:   {tier2.get('bosh_env_alias')}")

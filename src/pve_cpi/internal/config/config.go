@@ -609,17 +609,19 @@ type CPIConfig struct {
 	// in the detached state (i.e. after detach_disk and before the next
 	// attach_disk or delete_disk). Valid values:
 	//
-	//   ""       — same as "free" (byte-identical to prior releases)
-	//   "free"   — detached disks float as un-attached volumes on PVE storage.
-	//              PVE has no first-class volume object, so the disk is visible
-	//              only via its synthetic-VMID container VM's config. Risk:
-	//              administrators may delete the container VM thinking it is
-	//              unused. Default.
+	//   ""       — same as "parked" (the default)
 	//   "parked" — detached disks are attached to a dedicated parker VM
 	//              (bosh-parker-<n>) in an active scsi slot (scsi0..30) with
 	//              protection=1 and onboot=0. The parker VM is never started.
 	//              Provides PVE-side ownership visibility and accident protection
 	//              at the cost of slightly higher op counts per detach/attach.
+	//              Default.
+	//   "free"   — opt-in: detached disks float as un-attached volumes on PVE
+	//              storage. PVE has no first-class volume object, so the disk is
+	//              visible only via its synthetic-VMID container VM's config.
+	//              Risk: administrators may delete the container VM thinking it
+	//              is unused. Byte-identical to releases before the default
+	//              flipped to "parked".
 	//
 	// Use DetachedDiskStrategyValue() for the effective normalized value.
 	// Use DetachedDiskParkedEnabled() to gate parker logic.
@@ -639,7 +641,8 @@ type CPIConfig struct {
 	// reserved for parker VMs (bosh-parker-<n>). Parker VMs occupy this band;
 	// each parker VM holds up to 31 parked disk volumes in scsi0..30 slots.
 	// ApplyDefaults sets to 90000 when DetachedDiskParkedEnabled() is true
-	// and both range fields are zero. When set, the band must not overlap the
+	// (which includes the unset-strategy default) and both range fields are
+	// zero. When set, the band must not overlap the
 	// VM range, the persistent-disk range, or the stemcell-template range.
 	// validate-only-when-set; omit from ERB when zero.
 	ParkedDiskVMIDRangeStart int `json:"parked_disk_vmid_range_start,omitempty"`
@@ -650,6 +653,30 @@ type CPIConfig struct {
 	// zero (companion to ParkedDiskVMIDRangeStart default fill). Must not overlap
 	// any other VMID band. validate-only-when-set; omit from ERB when zero.
 	ParkedDiskVMIDRangeEnd int `json:"parked_disk_vmid_range_end,omitempty"`
+
+	// parkedDefaultBandCollision records why the DEFAULTED parked strategy is
+	// not in force for this config: it names the configured VMID band the
+	// built-in parker band 90000-90999 would have overlapped. Unexported and
+	// untagged, so it is neither decoded from nor emitted to cpi.json; Load
+	// reads it to warn, and it survives the shallow copy ApplyContextOverrides
+	// makes. Empty means no collision was detected.
+	parkedDefaultBandCollision string
+
+	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
+	// ApplyDefaults rather than the operator put the value in the range field.
+	// Same unexported/untagged treatment as parkedDefaultBandCollision.
+	// ApplyContextOverrides needs them to tell a defaulted bound from one an
+	// operator typed: only a defaulted bound may be cleared when a per-entry
+	// override arrives, and only a fully defaulted band may stand down when an
+	// entry moves another band on top of it.
+	//
+	// Per bound rather than per band, because the two are set independently. A
+	// job-level config naming only a start gets its end derived here; if that
+	// derived end survived into an entry that names its own start, the entry
+	// would silently inherit a partner it never described -- the very thing
+	// effectiveParkerBand's same-width rule exists to prevent.
+	parkerStartDefaulted bool
+	parkerEndDefaulted   bool
 
 	// NetworkResolveRetries bounds eventual-consistency polling for freshly
 	// created SDN networks. A newly applied SDN vnet is not immediately usable
@@ -1712,6 +1739,216 @@ func warnFastPathDeleteNonRootIdentity(cfg *CPIConfig, out io.Writer) {
 	)
 }
 
+// warnDetachedDiskStrategyFreeWithoutBand warns when an operator opts out of
+// parking without naming a parker band. Because parking is the default, a
+// deployment that switches to "free" almost certainly still has disks parked
+// under the old setting — and with no band configured, ParkedStrategyActive()
+// is false, so the unpark probes that would rescue those disks never run and
+// attach_disk would double-reference a volume the parker still holds. Keeping
+// the band set makes the opt-out safe; this diagnostic says so at load time
+// rather than leaving it in prose only.
+func warnDetachedDiskStrategyFreeWithoutBand(cfg *CPIConfig, out io.Writer) {
+	if cfg.DetachedDiskStrategyValue() != DetachedDiskStrategyFree {
+		return
+	}
+	// A stand-down gets its own message, which carries the same drain advice.
+	// Both would say the same thing twice.
+	if cfg.parkedDefaultBandCollision != "" {
+		return
+	}
+	if cfg.ParkedDiskVMIDRangeStart != 0 || cfg.ParkedDiskVMIDRangeEnd != 0 {
+		return
+	}
+	logger, err := log.NewLogger("warn", out)
+	if err != nil {
+		return
+	}
+	logger.Warn("config: detached_disk_strategy is \"free\" with no parked_disk_vmid_range configured; " +
+		"any disk parked while the default \"parked\" strategy was in effect stays on its parker VM and will " +
+		"no longer be unparked before attach_disk or delete_disk. Run scripts/disk-audit: if it reports parked " +
+		"disks, set parked_disk_vmid_range_start/end (90000/90999 unless you changed them) so the unpark probes " +
+		"keep running until those disks drain")
+}
+
+// applyParkerBandDefaults fills each parker bound with its built-in default
+// when the effective strategy is parked and that bound is zero, matching
+// effectiveParkerBand. Under strategy=free the band is left as the operator set
+// it. Call it only after the VM, disk, and template bands have been defaulted.
+//
+// It also carries the upgrade guard. When the strategy was DEFAULTED rather
+// than asked for, and no band was configured, the built-in band can collide
+// with a band the operator widened long before parking existed — a vmid_range
+// of 40000-200000 swallows 90000-90999. Validate rejects that overlap, and
+// because the CPI is exec'd once per JSON-RPC request the rejection is not a
+// deploy-time error: it is every subsequent CPI call failing, with the worst
+// case landing mid create-env after the old Director VM has already been
+// stopped. Turning a config that worked yesterday into an outage is not an
+// acceptable price for a changed default, so the parked default stands down for
+// that load and records why. An explicitly requested "parked", or an explicitly
+// configured band, still gets the hard error: there the operator asked for the
+// thing that collides.
+//
+// The stand-down is recorded in parkedDefaultBandCollision rather than written into
+// DetachedDiskStrategy, so it stays a decision the CPI took and can be taken
+// again -- differently -- for a cpi-config entry whose own bands leave the
+// parker band free. See reevaluateParkedDefaultAfterOverrides.
+func (c *CPIConfig) applyParkerBandDefaults() {
+	if !c.DetachedDiskParkedEnabled() {
+		return
+	}
+	strategyDefaulted := strings.TrimSpace(c.DetachedDiskStrategy) == ""
+	startUnset := c.ParkedDiskVMIDRangeStart == 0
+	endUnset := c.ParkedDiskVMIDRangeEnd == 0
+	bandUnset := startUnset && endUnset
+	// Recorded before the stand-down returns: a bound nobody set is a bound
+	// nobody set, whether or not the default it serves is in force. A cpi-config
+	// entry re-decides them together.
+	c.parkerStartDefaulted = startUnset
+	c.parkerEndDefaulted = endUnset
+	if strategyDefaulted && bandUnset {
+		if collision := c.defaultParkerBandCollision(); collision != "" {
+			c.parkedDefaultBandCollision = collision
+			return
+		}
+	}
+	// One rule for filling a missing bound, shared with the accessors, so a
+	// config that has been through ApplyDefaults and one that has not resolve to
+	// the same band.
+	c.ParkedDiskVMIDRangeStart, c.ParkedDiskVMIDRangeEnd = c.effectiveParkerBand()
+}
+
+// reevaluateParkedDefaultAfterOverrides re-decides the parked default against a
+// config a cpi-config entry has just rewritten.
+//
+// ApplyDefaults decides two things once, against the job-level bands: whether
+// the built-in parker band collides with another band, and what band to fill in
+// when it does not. An entry can invalidate both. It can widen vmid_range,
+// disk_vmid_range, or stemcell_template_vmid_range over 90000-90999, creating a
+// collision that would then reject every request routed to that entry -- and
+// because the CPI is exec'd per request, that rejection is an outage for one
+// cluster rather than a deploy-time authoring error. It can also go the other
+// way, narrowing the bands so a collision the job-level config had no longer
+// exists, in which case the entry deserves the default it would have had on its
+// own.
+//
+// Call it with the band already cleared of anything ApplyDefaults filled in (see
+// clearDefaultedParkerBand), so a band still standing here is one somebody typed
+// -- this entry, or the job-level config it inherits from. Either way it is
+// honored as written: it is a statement about VMID topology, and the stand-down
+// has nothing to say about it. (A job-level band the entry did not touch can
+// therefore still produce a parker-overlap error attributed to a band the entry
+// never named. That is unchanged from before the parked default, where the same
+// band was validated the same way.)
+func (c *CPIConfig) reevaluateParkedDefaultAfterOverrides() {
+	if c.ParkedDiskVMIDRangeStart != 0 || c.ParkedDiskVMIDRangeEnd != 0 {
+		// The entry named a bound. Whatever the job-level config concluded about
+		// the built-in band does not apply to it; the accessors derive whatever
+		// partner a single named bound needs, at the same width.
+		c.parkerStartDefaulted = false
+		c.parkerEndDefaulted = false
+		c.parkedDefaultBandCollision = ""
+		return
+	}
+	if !c.parkerStartDefaulted && !c.parkerEndDefaulted {
+		// No bound was defaulted and none is set: nothing to re-decide.
+		return
+	}
+	c.parkedDefaultBandCollision = ""
+	// The stand-down governs the DEFAULT only. An entry that named a strategy
+	// made the decision itself: under "parked" a colliding band is the error the
+	// entry asked for, and under "free" no parker is ever created, so the band is
+	// simply what keeps the unpark probes running for disks parked earlier --
+	// the same thing the entry would have inherited from the job-level config.
+	if strings.TrimSpace(c.DetachedDiskStrategy) == "" {
+		if collision := c.defaultParkerBandCollision(); collision != "" {
+			c.parkedDefaultBandCollision = collision
+			return
+		}
+	}
+	c.ParkedDiskVMIDRangeStart = defaultParkerVMIDStart
+	c.ParkedDiskVMIDRangeEnd = defaultParkerVMIDEnd
+}
+
+// clearDefaultedParkerBand removes a parker band that ApplyDefaults, not the
+// operator, put there. ApplyContextOverrides calls it before applying an entry's
+// keys so the entry starts from the shape the job-level config had before
+// defaulting: otherwise an entry that sets one bound inherits the other from a
+// default, and an entry that sets neither cannot be told from one that named the
+// built-in band on purpose.
+func (c *CPIConfig) clearDefaultedParkerBand() {
+	// Per bound: a job-level config that named only a start had its end derived
+	// by ApplyDefaults, and carrying that derived end into an entry that names
+	// its own start hands the entry a band it never described. Clearing only
+	// what was defaulted leaves anything an operator typed exactly as typed.
+	if c.parkerStartDefaulted {
+		c.ParkedDiskVMIDRangeStart = 0
+	}
+	if c.parkerEndDefaulted {
+		c.ParkedDiskVMIDRangeEnd = 0
+	}
+}
+
+// ParkedDefaultStoodDown reports the VMID band that made the defaulted parked
+// strategy stand down, or "" when parking is in force. Callers use it to
+// surface the decision; nothing in the CPI branches on it.
+func (c *CPIConfig) ParkedDefaultStoodDown() string {
+	if c == nil {
+		return ""
+	}
+	return c.parkedDefaultBandCollision
+}
+
+// defaultParkerBandCollision reports which configured VMID band the built-in
+// parker band 90000-90999 would overlap, as a human-readable clause, or "" when
+// it fits. Call it only after the VM, disk, and template bands have been
+// defaulted — it compares against whatever those fields currently hold.
+func (c *CPIConfig) defaultParkerBandCollision() string {
+	type band struct {
+		name       string
+		start, end int
+	}
+	for _, b := range []band{
+		{"vmid_range", c.VMIDRangeStart, c.VMIDRangeEnd},
+		{"disk_vmid_range", c.DiskVMIDRangeStart, c.DiskVMIDRangeEnd},
+		{"stemcell_template_vmid_range", c.StemcellTemplateVMIDRangeStart, c.StemcellTemplateVMIDRangeEnd},
+	} {
+		if b.start >= b.end {
+			continue
+		}
+		if rangesOverlap(b.start, b.end, defaultParkerVMIDStart, defaultParkerVMIDEnd) {
+			return fmt.Sprintf("%s [%d,%d]", b.name, b.start, b.end)
+		}
+	}
+	return ""
+}
+
+// warnParkedDefaultBandCollision announces that the defaulted parked strategy
+// was stood down for this load because the built-in band collides with a band
+// the operator configured. Silent when ApplyDefaults recorded no collision.
+//
+// The message names the remedy rather than the symptom: an operator who wants
+// parking on this cluster has to pick a band that fits their VMID layout, and
+// one who does not can pin detached_disk_strategy to "free" to stop the notice.
+func warnParkedDefaultBandCollision(cfg *CPIConfig, out io.Writer) {
+	if cfg.parkedDefaultBandCollision == "" {
+		return
+	}
+	logger, err := log.NewLogger("warn", out)
+	if err != nil {
+		return
+	}
+	logger.Warn("config: the default detached_disk_strategy \"parked\" is standing down for this load: "+
+		"its built-in parker band [90000,90999] overlaps the configured "+cfg.parkedDefaultBandCollision+". "+
+		"Detached persistent disks stay free-floating for as long as that is true. If this deployment ever ran "+
+		"with parking on -- the band was widened over 90000-90999 after the fact, say -- run scripts/disk-audit: "+
+		"disks already on a parker stay there, and attach_disk and delete_disk refuse them until a parker band is "+
+		"configured again. To park disks here, set parked_disk_vmid_range_start/end to a 1000-wide window that "+
+		"does not overlap any other VMID band. To silence this notice, set detached_disk_strategy to \"free\" "+
+		"explicitly",
+		log.String("colliding_range", cfg.parkedDefaultBandCollision),
+	)
+}
+
 // warnUnknownFields decodes raw into a flat map, finds keys absent from
 // knownConfigFields, and emits a single Warn entry listing them.
 // Uses a stderr logger so the warning surfaces even before the application
@@ -1814,6 +2051,8 @@ func Load(r io.Reader) (*CPIConfig, error) {
 	var strictErrs []string
 	cfg.validateStrictUnknownKeys(raw, &strictErrs)
 	warnFastPathDeleteNonRootIdentity(&cfg, os.Stderr)
+	warnParkedDefaultBandCollision(&cfg, os.Stderr)
+	warnDetachedDiskStrategyFreeWithoutBand(&cfg, os.Stderr)
 	if err := cfg.ValidateWithLogger(nil); err != nil {
 		if len(strictErrs) == 0 {
 			return nil, err
@@ -1954,14 +2193,9 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.StemcellTemplateVMIDRangeEnd == 0 {
 		c.StemcellTemplateVMIDRangeEnd = 30999 // pve.VMIDRangeTemplateEnd
 	}
-	// Parker VMID range: fill 90000/90999 ONLY when strategy=parked and both
-	// range fields are zero. When range-only is set (no strategy), leave them
-	// as-is so the operator's explicit values are honored and ParkedStrategyActive
-	// returns true without forcing a default fill.
-	if c.DetachedDiskParkedEnabled() && c.ParkedDiskVMIDRangeStart == 0 && c.ParkedDiskVMIDRangeEnd == 0 {
-		c.ParkedDiskVMIDRangeStart = 90000 // default parker band start
-		c.ParkedDiskVMIDRangeEnd = 90999   // default parker band end
-	}
+	// Parker band, and the upgrade guard around it. Must run after the VM, disk,
+	// and template bands above are filled: it compares against them.
+	c.applyParkerBandDefaults()
 	if c.CloneMode == "" {
 		c.CloneMode = CloneModeAuto
 	}
@@ -2646,24 +2880,48 @@ func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
 	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) != enumValueOff
 }
 
+// DetachedDiskStrategyParked and DetachedDiskStrategyFree are the two valid
+// detached_disk_strategy values. "parked" is the default an empty setting
+// resolves to; "free" is the opt-out that restores free-floating volumes.
+const (
+	DetachedDiskStrategyParked = "parked"
+	DetachedDiskStrategyFree   = "free"
+)
+
 // DetachedDiskStrategyValue returns the effective detached-disk lifecycle
 // strategy, normalized to lower case and trimmed. Empty or absent resolves to
-// "free" (byte-identical to prior releases). Valid return values: "free", "parked".
+// "parked", the safe default: a detached disk stays owned by a protected parker
+// VM instead of floating as an unattached volume. Operators who want the older
+// behavior set "free" explicitly. Valid return values: "parked", "free".
+//
+// A nil receiver means no configuration is loaded at all, so it resolves to
+// "free" to keep every parker code path inert (matching the nil guard in
+// ParkedStrategyActive) rather than driving parker calls off a nil config.
 func (c *CPIConfig) DetachedDiskStrategyValue() string {
 	if c == nil {
-		return "free"
+		return DetachedDiskStrategyFree
 	}
 	v := strings.ToLower(strings.TrimSpace(c.DetachedDiskStrategy))
 	if v == "" {
-		return "free"
+		if c.parkedDefaultBandCollision != "" {
+			// The default would be parked, but its built-in band collides with
+			// a band this config already uses. See applyParkerBandDefaults. The
+			// collision string is the single record of that decision: a
+			// companion boolean would let a future edit set one without the
+			// other, leaving a config that reports parked while warning that it
+			// stood down.
+			return DetachedDiskStrategyFree
+		}
+		return DetachedDiskStrategyParked
 	}
 	return v
 }
 
 // DetachedDiskParkedEnabled reports whether the "parked" detached-disk strategy
-// is active. Returns true only when DetachedDiskStrategyValue() == "parked".
+// is active. Returns true when DetachedDiskStrategyValue() == "parked", which
+// includes the unset default.
 func (c *CPIConfig) DetachedDiskParkedEnabled() bool {
-	return c.DetachedDiskStrategyValue() == "parked"
+	return c.DetachedDiskStrategyValue() == DetachedDiskStrategyParked
 }
 
 // ParkedStrategyActive reports whether any parker-related behavior should be
@@ -2672,11 +2930,12 @@ func (c *CPIConfig) DetachedDiskParkedEnabled() bool {
 //   - ParkedDiskVMIDRangeStart != 0 (raw field — operator set an explicit range)
 //   - ParkedDiskVMIDRangeEnd != 0 (raw field — operator set an explicit range)
 //
-// The raw-field check allows an operator who sets only the VMID range (without
-// strategy) to still gate parker reads (e.g. attach_disk unpark scan) without
-// requiring them to also set strategy=parked. ApplyDefaults only fills the
-// range defaults when strategy=parked, so a non-zero raw field at call time
-// always means the operator explicitly set it.
+// The raw-field check allows an operator who has opted out of parking
+// (strategy=free) but still holds previously parked disks to keep parker reads
+// running (e.g. the attach_disk unpark scan) by setting the band explicitly.
+// ApplyDefaults fills the range defaults only when the effective strategy is
+// parked, so a non-zero raw field under strategy=free is always an explicit
+// operator choice.
 func (c *CPIConfig) ParkedStrategyActive() bool {
 	if c == nil {
 		return false
@@ -2685,24 +2944,94 @@ func (c *CPIConfig) ParkedStrategyActive() bool {
 }
 
 // ParkedDiskVMIDRangeStartValue returns the effective parker-band lower bound.
-// Returns 0 when parked strategy is inactive and the field is unset (range-only
-// case with both fields zero is only possible when ParkedStrategyActive is false).
-// After ApplyDefaults, this always returns 90000 when strategy=parked.
+// Returns 0 under strategy=free with no explicit band, which is the only case
+// where parker code is inert.
+//
+// The zero-band fallback matters because ApplyDefaults is not the only way a
+// config reaches the handlers: ApplyContextOverrides merges per-CPI overrides
+// onto an already-defaulted base and validates the result WITHOUT re-running
+// ApplyDefaults, and both parker range keys are overridable — a cpi-config
+// entry carrying the spec's documented 0 for them zeroes a band the default
+// strategy still uses. Falling back to the band ApplyDefaults would have filled
+// keeps that from reaching pve.ParkDisk as an "invalid VMID range [0, 0]"
+// config error, which the detach path wraps as retriable and the Director then
+// retries forever.
 func (c *CPIConfig) ParkedDiskVMIDRangeStartValue() int {
 	if c == nil {
 		return 0
 	}
-	return c.ParkedDiskVMIDRangeStart
+	start, _ := c.effectiveParkerBand()
+	return start
 }
 
-// ParkedDiskVMIDRangeEndValue returns the effective parker-band upper bound.
-// Returns 0 when parked strategy is inactive and the field is unset.
-// After ApplyDefaults, this always returns 90999 when strategy=parked.
+// ParkedDiskVMIDRangeEndValue returns the effective parker-band upper bound,
+// with the same zero-band fallback as ParkedDiskVMIDRangeStartValue.
 func (c *CPIConfig) ParkedDiskVMIDRangeEndValue() int {
 	if c == nil {
 		return 0
 	}
-	return c.ParkedDiskVMIDRangeEnd
+	_, end := c.effectiveParkerBand()
+	return end
+}
+
+// effectiveParkerBand returns the parker band the parked strategy actually
+// uses, filling a bound the operator left at zero.
+//
+// The fill is per-bound rather than per-pair because a cpi-config entry
+// overrides one key at a time. jobs/pve_cpi/spec documents 0 as the default for
+// both range properties, so an operator who moves only the upper bound for one
+// cluster ("parked_disk_vmid_range_end: 90499") leaves the lower bound at that
+// documented 0 — and a pair-wise fallback would then hand pve.ParkDisk the band
+// [0, 90499], which Validate rejects as below the PVE reserved floor. Every
+// request against that entry would fail permanently, naming a bound the
+// operator never meaningfully set. validateVMIDBands checks these same
+// effective values so the two can never disagree.
+//
+// The missing bound comes from the built-in band when that produces a window no
+// wider than the built-in one, which is the case the property documentation
+// describes: narrowing 90000-90999 from one side. Otherwise it is derived from
+// the bound the operator DID name, keeping the same width. Reaching for the
+// built-in bound unconditionally would answer "parked_disk_vmid_range_start:
+// 50000" with the band [50000,90999] — 41,000 VMIDs of an operator's space
+// claimed by a config that names one of them, validated against nothing, since
+// only the three configured bands are ever compared. A band the operator did
+// not describe should not be wider than the one they did.
+//
+// Under strategy=free with no band at all the raw values are returned
+// untouched, so an opted-out config stays [0,0] and every parker gate is inert.
+// minVMID is the first VMID PVE lets a guest take; 1-99 are reserved.
+const minVMID = 100
+
+func (c *CPIConfig) effectiveParkerBand() (int, int) {
+	start, end := c.ParkedDiskVMIDRangeStart, c.ParkedDiskVMIDRangeEnd
+	if !c.ParkedStrategyActive() {
+		// Opted out with no band at all: parker code is inert, and [0,0] is the
+		// shape every parker gate reads as "off".
+		return start, end
+	}
+	const width = defaultParkerVMIDEnd - defaultParkerVMIDStart
+	switch {
+	case start == 0 && end == 0:
+		return defaultParkerVMIDStart, defaultParkerVMIDEnd
+	case start == 0:
+		if end > defaultParkerVMIDStart && end-defaultParkerVMIDStart <= width {
+			return defaultParkerVMIDStart, end
+		}
+		// Derived at the same width, but never below the first VMID PVE allows.
+		// Without the floor, an end of 100 derives a start of -899 and the bound
+		// error names a number the operator never wrote, which reads as a CPI
+		// defect rather than as "that end is too low to carry a band".
+		if derived := end - width; derived >= minVMID {
+			return derived, end
+		}
+		return minVMID, end
+	case end == 0:
+		if start < defaultParkerVMIDEnd && defaultParkerVMIDEnd-start <= width {
+			return start, defaultParkerVMIDEnd
+		}
+		return start, start + width
+	}
+	return start, end
 }
 
 // validateIPConflictProbeEnum appends an error when ip_conflict_probe is set to
@@ -2758,17 +3087,17 @@ func (c *CPIConfig) validateEphemeralDiskMinModeEnum(errs *[]string) {
 
 // validateDetachedDiskStrategyEnum appends an error when detached_disk_strategy
 // is set to a value other than free|parked. Empty (the default) is valid and
-// resolves to "free".
+// resolves to "parked".
 func (c *CPIConfig) validateDetachedDiskStrategyEnum(errs *[]string) {
 	if c.DetachedDiskStrategy == "" {
 		return
 	}
 	switch strings.ToLower(strings.TrimSpace(c.DetachedDiskStrategy)) {
-	case "free", "parked":
+	case DetachedDiskStrategyFree, DetachedDiskStrategyParked:
 		// valid
 	default:
 		*errs = append(*errs, fmt.Sprintf(
-			"detached_disk_strategy must be one of free|parked (or empty for default free), got %q",
+			"detached_disk_strategy must be one of free|parked (or empty for default parked), got %q",
 			c.DetachedDiskStrategy,
 		))
 	}
@@ -3834,6 +4163,8 @@ const (
 	defaultDiskVMIDEnd       = 29999
 	defaultTemplateVMIDStart = 30000
 	defaultTemplateVMIDEnd   = 30999
+	defaultParkerVMIDStart   = 90000
+	defaultParkerVMIDEnd     = 90999
 )
 
 // validateVMIDBands validates the three VMID allocation bands (VM, persistent
@@ -3853,9 +4184,9 @@ func (c *CPIConfig) validateVMIDBands(errs *[]string) {
 	const maxVMID = 999999999 // PVE maximum VMID
 
 	checkBounds := func(name string, start, end int) {
-		if start < 100 {
+		if start < minVMID {
 			*errs = append(*errs, fmt.Sprintf(
-				"%s_start must be ≥100 (PVE reserved range), got %d", name, start))
+				"%s_start must be ≥%d (PVE reserved range), got %d", name, minVMID, start))
 		}
 		if end > maxVMID {
 			*errs = append(*errs, fmt.Sprintf(
@@ -3909,13 +4240,29 @@ func (c *CPIConfig) validateVMIDBands(errs *[]string) {
 			tStart, tEnd, diskStart, diskEnd))
 	}
 
-	// Parker band validation: trigger when strategy=parked OR either range field
-	// is explicitly set (raw non-zero). Bounds-check + pairwise overlap against the
-	// effective VM, disk, and template bands.
-	parkerActive := c.ParkedDiskVMIDRangeStart != 0 || c.ParkedDiskVMIDRangeEnd != 0 || c.DetachedDiskParkedEnabled()
+	// Parker band validation: trigger when the effective strategy is parked (the
+	// default) OR either range field is explicitly set (raw non-zero).
+	// Bounds-check + pairwise overlap against the effective VM, disk, and
+	// template bands. A zero bound under the parked strategy means ApplyDefaults
+	// has not run on this value yet, so validate what effectiveParkerBand would
+	// fill rather than reporting a bogus zero-bound error (same treatment the
+	// disk and template bands get above). Validating the same effective values
+	// the accessors hand to pve.ParkDisk is what keeps a config that loads from
+	// failing at request time.
+	parkerActive := c.ParkedStrategyActive()
+	pStart, pEnd := c.effectiveParkerBand()
 	if parkerActive {
-		pStart, pEnd := c.ParkedDiskVMIDRangeStart, c.ParkedDiskVMIDRangeEnd
 		checkBounds("parked_disk_vmid_range", pStart, pEnd)
+	}
+	// The overlap checks exist to stop the CPI allocating a parker VMID that a
+	// VM, disk, or template will also claim. Only the parked strategy allocates
+	// one. Under "free" the band is read-only -- it keeps the unpark probes
+	// running for disks parked before the opt-out -- and every parker
+	// classification also requires the bosh-parker tag, so an overlap there
+	// cannot mistake a workload VM for a parker. Rejecting it anyway would fail
+	// every request routed to a cpi-config entry that opted out precisely
+	// because its VMID layout has no room for a parker band.
+	if c.DetachedDiskParkedEnabled() {
 		pOK := pStart < pEnd
 		if vmOK && pOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, pStart, pEnd) {
 			*errs = append(*errs, fmt.Sprintf(

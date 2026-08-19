@@ -10,25 +10,38 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
-// unparkBeforeDelete checks whether bareDiskCID is held by a parker VM and, if
-// so, detaches it before the volume is deleted. A no-op when the parked
-// strategy is unset (zero extra API calls, byte-identical fast path).
-// Unpark failure returns a retriable wrapped error; the disk stays safe on the
-// parker VM and the caller can retry.
+// unparkBeforeDelete resolves which VM holds bareDiskCID and, when that VM is a
+// parker, detaches the disk before the volume is deleted. Unpark failure
+// returns a retriable wrapped error; the disk stays safe on the parker VM and
+// the caller can retry.
+//
+// The holder scan is unconditional rather than gated on the parked strategy,
+// for the same reason attach_disk's is: a parker the configuration can no
+// longer recognize still holds the volume, and deleting it would leave that
+// parker's scsi slot referencing storage that no longer exists. Deleting a
+// volume out from under a live reference is not a failure mode worth saving a
+// cluster scan over. A holder that is an ordinary VM is left to the existing
+// behavior, which the optional disk_delete_state_guard governs.
 func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
-	if deps.Config == nil || !deps.Config.ParkedStrategyActive() {
+	if deps.Config == nil {
 		return nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
+	parkerCfg := parkerReadConfigFor(deps)
+	holder, resolveErr := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
+	if resolveErr != nil {
+		return wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
 	}
-	// UnparkDisk re-runs the is-parked check internally and is idempotent when
-	// the disk is not parked, so calling it directly avoids a redundant
-	// cluster scan and the TOCTOU window a separate IsDiskParked probe opens.
-	if unparkErr := pve.UnparkDisk(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg); unparkErr != nil {
-		deps.Log(ctx).Info("delete_disk: unpark failed, returning retriable error",
+	if strandedErr := strandedParkerRefusal(deps, "delete_disk", diskCID, holder); strandedErr != nil {
+		return strandedErr
+	}
+	// UnparkDiskAt reuses the holder just resolved and is a no-op when the disk
+	// is not on a parker, so the parked path still costs one cluster scan.
+	if unparkErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, holder, parkerCfg); unparkErr != nil {
+		// cpierrors.Wrap keeps whatever class the unpark chose. Most failures
+		// are retriable, but two are permanent on purpose: a denied grant, and
+		// a reference the sweep could not clear. Neither improves on a retry,
+		// and both carry the command that repairs them.
+		deps.Log(ctx).Info("delete_disk: unpark failed",
 			log.String("disk_cid", diskCID),
 		)
 		return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")

@@ -40,11 +40,11 @@ flowchart LR
 
 ```mermaid {scale: 0.85}
 flowchart LR
-    subgraph F["free-floating — default"]
+    subgraph F["free-floating — opt-in"]
         F1["bare unattached volume"]
         F2["anonymous to PVE admins"]
     end
-    subgraph P["parked — opt-in"]
+    subgraph P["parked — default"]
         P1["held by a never-started parker VM"]
         P2["deletion-protected, tagged, documented"]
     end
@@ -54,8 +54,8 @@ flowchart LR
 - Audit habit: `scripts/disk-audit` classifies every disk, stable exit codes
 
 <!--
-- Between machines, a detached disk is safe from BOSH but anonymous to a PVE admin browsing storage — a tidy human or cleanup script might delete it.
-- The parked opt-in is a coat-check: each detached disk hangs on a parker VM (90000–90999 band, never started, protection=1 so PVE itself refuses deletion, provenance note recording which disk/from which VM/when).
+- Between machines, a detached disk is safe from BOSH but anonymous to a PVE admin browsing storage — a tidy human or cleanup script might delete it. That is why parking is on unless a shop asks for the cheaper free-floating volume.
+- Parking is the default, and it is a coat-check: each detached disk hangs on a parker VM (90000–90999 band, never started, protection=1 so PVE itself refuses deletion, provenance note recording which disk/from which VM/when).
 - disk-audit: attached / parked / free-floating / unknown across all nodes; exit 1 on free-floating — works as a CI gate or a monthly habit.
 - Rule of thumb before deleting anything lonely-looking: bosh disks --orphaned first. A disk the Director tracks is not an orphan.
 - Performance settings (cache, iothread, throughput caps) ride in the envelope too; defaults auto-resolve from the storage backend.

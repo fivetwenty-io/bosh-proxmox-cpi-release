@@ -369,8 +369,10 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	_, _ = fmt.Fprintf(h, "disk_vmid_start=%d\x00disk_vmid_end=%d\x00tmpl_vmid_start=%d\x00tmpl_vmid_end=%d\x00",
 		cfg.DiskVMIDRangeStart, cfg.DiskVMIDRangeEnd,
 		cfg.StemcellTemplateVMIDRangeStart, cfg.StemcellTemplateVMIDRangeEnd)
-	_, _ = fmt.Fprintf(h, "parked_vmid_start=%d\x00parked_vmid_end=%d\x00replicate_local=%t\x00vm_prefix=%s\x00",
+	_, _ = fmt.Fprintf(h, "parked_vmid_start=%d\x00parked_vmid_end=%d\x00detached_disk_strategy=%s\x00",
 		cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd,
+		cfg.DetachedDiskStrategyValue())
+	_, _ = fmt.Fprintf(h, "replicate_local=%t\x00vm_prefix=%s\x00",
 		cfg.StemcellReplicateLocal, cfg.VMPrefix)
 	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
 		cfg.AgentMode, cfg.VMDiskFormat, cfg.AgentMBus)
@@ -497,6 +499,19 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		d.Log(ctx).Warn(
 			"cpi: request context carried pve_* properties this CPI does not support overriding per-request; job-level config is used for them",
 			log.Any("unsupported_keys", unknown),
+		)
+	}
+
+	// The per-entry bands this request just rewrote can put another VMID range
+	// on top of the built-in parker band. config.ApplyContextOverrides stands
+	// the defaulted parked strategy down rather than failing every request
+	// routed to this entry; say so, once per call, so the operator learns that
+	// this cluster's detached disks stay free-floating.
+	if stoodDown := effCfg.ParkedDefaultStoodDown(); stoodDown != "" && d.Config.ParkedDefaultStoodDown() == "" {
+		d.Log(ctx).Warn(
+			"cpi: the default detached_disk_strategy \"parked\" is standing down for this request: the overridden VMID bands overlap the built-in parker band [90000,90999]; "+
+				"set parked_disk_vmid_range_start/end on this cpi-config entry to park disks on this cluster",
+			log.String("colliding_range", stoodDown),
 		)
 	}
 

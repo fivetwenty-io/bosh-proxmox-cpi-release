@@ -18,8 +18,11 @@ Exit codes:
   2 — usage error or fatal transport failure
 
 Warnings are printed to stderr when:
-  - parked disks exist but detached_disk_strategy is not "parked"
+  - parked disks exist but detached_disk_strategy is set to "free"
   - empty parker VMs are found (teardown candidates)
+  - a parker carries an unusedN reference to a live volume (a sweep that did
+    not complete; the parker must NOT be destroyed until it is cleared)
+  - a parker's config did not come back, so its contents are unknown
 
 Config file format (JSON, subset of the CPI config):
 
@@ -36,7 +39,7 @@ Config file format (JSON, subset of the CPI config):
     "disk_vmid_range_end": 29999,        optional, default 29999
     "parked_disk_vmid_range_start": 90000, optional, default 90000
     "parked_disk_vmid_range_end": 90999,   optional, default 90999
-    "detached_disk_strategy": "parked"   optional, default ""
+    "detached_disk_strategy": "parked"   optional, default "" (→ "parked")
   }
 """
 
@@ -121,7 +124,10 @@ class AuditConfig:
                 f"less than parked_disk_vmid_range_end ({self.parker_vmid_end})"
             )
 
-        self.detached_disk_strategy = str(raw.get("detached_disk_strategy", "") or "").strip().lower()
+        # Empty resolves to "parked", matching the CPI's own default.
+        self.detached_disk_strategy = (
+            str(raw.get("detached_disk_strategy", "") or "").strip().lower() or "parked"
+        )
 
     def username_with_realm(self) -> str:
         if "@" in self.user:
@@ -349,9 +355,21 @@ def bare_volid(volid: str) -> str:
     return volid
 
 
+# Tag separators, mirroring splitTagString in internal/pve/parker.go: PVE writes
+# semicolons, but a hand-edited tag field can carry commas or spaces. A splitter
+# narrower than the CPI's finds no parkers at all, which silences the parked
+# classification, the empty-parker warning, and the unusedN warning together --
+# on the one tool an operator consults before a destructive qm destroy.
+_TAG_SEP_RE = re.compile(r"[;, ]+")
+
+
 def _tags_contain_parker(tags: str) -> bool:
-    """True when semicolon-separated tags include 'bosh-parker' (case-insensitive)."""
-    for t in tags.split(";"):
+    """True when the tag string includes 'bosh-parker' (case-insensitive).
+
+    Separators are ';', ',', and ' ', matching splitTagString /
+    tagContainsParker in internal/pve/parker.go.
+    """
+    for t in _TAG_SEP_RE.split(tags):
         if t.strip().lower() == PARKER_TAG:
             return True
     return False
@@ -427,15 +445,34 @@ class DiskRecord:
 class ParkerRecord:
     """Inventory record for one parker VM."""
 
-    __slots__ = ("vmid", "node", "name", "disk_count", "slot_capacity", "empty")
+    __slots__ = (
+        "vmid", "node", "name", "disk_count", "unused_count",
+        "config_read", "slot_capacity", "empty",
+    )
 
-    def __init__(self, vmid: int, node: str, name: str, disk_count: int) -> None:
+    def __init__(
+        self,
+        vmid: int,
+        node: str,
+        name: str,
+        disk_count: int,
+        unused_count: int = 0,
+        config_read: bool = True,
+    ) -> None:
         self.vmid = vmid
         self.node = node
         self.name = name
         self.disk_count = disk_count
+        # unusedN keys are references too: `qm destroy --purge` walks them and
+        # frees the volume behind each one.  A parker holding only unusedN
+        # entries still holds a live persistent disk, so it is not empty and
+        # must never be offered as a teardown candidate.
+        self.unused_count = unused_count
+        # False when the config read failed.  An unread config proves nothing
+        # about what the parker holds, so it is never called empty.
+        self.config_read = config_read
         self.slot_capacity = 31  # scsi0..scsi30
-        self.empty = disk_count == 0
+        self.empty = config_read and disk_count == 0 and unused_count == 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -443,6 +480,8 @@ class ParkerRecord:
             "node": self.node,
             "name": self.name,
             "disk_count": self.disk_count,
+            "unused_count": self.unused_count,
+            "config_read": self.config_read,
             "slot_capacity": self.slot_capacity,
             "empty": self.empty,
         }
@@ -457,11 +496,17 @@ class ParkerRecord:
 # Ranges: scsi 0-30 (parker uses scsi0..30), virtio 0-15, ide 0-3, sata 0-5.
 # efidisk0 and tpmstate0 carry boot firmware, not BOSH persistent disks, and
 # their volids never embed a disk-band VMID — they are safely skipped.
-# unusedN entries are NOT scanned here: FindVMByDiskVolid in disk.go only calls
-# qemu.ParseDisks (bus keys) when searching for a disk holder. unusedN volumes
-# are detached remnants that PVE may GC; the disk-band filter on storage content
-# already surfaces them as free-floating when no active bus slot holds them.
+# unusedN entries are deliberately NOT bus keys: FindVMByDiskVolid in disk.go
+# only calls qemu.ParseDisks (bus keys) when searching for a disk holder, so a
+# disk referenced only by an unusedN key reads as free-floating in the disk
+# inventory, which is what the classifier wants.
+#
+# The parker inventory needs the opposite answer.  `qm destroy --purge` walks
+# the unusedN entries too, so a parker carrying one still references a live
+# volume and must never be reported as an empty teardown candidate.  That is
+# what _UNUSED_KEY_RE is for; see _count_unused_refs.
 _BUS_KEY_RE = re.compile(r"^(scsi|virtio|ide|sata)\d+$")
+_UNUSED_KEY_RE = re.compile(r"^unused\d+$")
 
 
 def _parse_bus_disks(config: dict[str, Any]) -> dict[str, str]:
@@ -503,6 +548,25 @@ def _count_bus_disks(config: dict[str, Any]) -> int:
     return len(_parse_bus_disks(config))
 
 
+def _count_unused_refs(config: dict[str, Any]) -> int:
+    """Count unusedN volume references in a qemu VM config dict.
+
+    PVE demotes a detached volume to an unusedN key rather than dropping it.
+    The CPI sweeps those keys inside the protection window, but a sweep that
+    could not complete leaves one behind, invisible to every bus-slot probe.
+
+    Inputs:
+      config — raw qemu VM config dict from the PVE API
+
+    Failure modes:
+      non-dict config — treated as empty by caller (vm_config returns None)
+    """
+    return sum(
+        1 for key, val in config.items()
+        if _UNUSED_KEY_RE.match(key) and isinstance(val, str) and val
+    )
+
+
 def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRecord], list[ParkerRecord]]":
     """Collect the full disk and parker inventory from PVE.
 
@@ -527,6 +591,8 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
            - no holder in any VM config -> free-floating
       6. Enumerate parker VMs independently (catches empty parkers whose
          disk_count is 0 and therefore never appear as disk holders).
+         Count unusedN references alongside bus slots: a parker holding one
+         still references a live volume, so it is not a teardown candidate.
 
     Inputs:
       client — authenticated PVE API client
@@ -690,6 +756,12 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
     for vmid_int, info in vm_map.items():
         if not (cfg.parker_vmid_start <= vmid_int <= cfg.parker_vmid_end):
             continue
+        # Tags come from the cluster-resources row. An empty field is treated as
+        # "not a parker" here, where delete_vm.go falls back to the VM config for
+        # the same input -- it has to, since it is about to purge. This is an
+        # audit: reporting no parkers is visible in its output, and every warning
+        # it emits is advisory. A PVE that does not populate the field will show
+        # zero parkers here while the CPI still recognizes them.
         if not _tags_contain_parker(info["tags"]):
             continue
         vm_node = info["node"]
@@ -699,12 +771,15 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
         else:
             pconfig = client.vm_config(vm_node, vmid_int)
             vm_config_cache[vmid_int] = pconfig
-        disk_count = _count_bus_disks(pconfig) if pconfig else 0
+        disk_count = _count_bus_disks(pconfig) if pconfig is not None else 0
+        unused_count = _count_unused_refs(pconfig) if pconfig is not None else 0
         parker_records.append(ParkerRecord(
             vmid=vmid_int,
             node=vm_node,
             name=info["name"],
             disk_count=disk_count,
+            unused_count=unused_count,
+            config_read=pconfig is not None,
         ))
 
     parker_records.sort(key=lambda r: r.vmid)
@@ -817,11 +892,17 @@ def print_human_report(
     # Parker summary
     if parker_records:
         print("PARKER VMs")
-        print(f"  {'VMID':>7}  {'NODE':<15}  {'NAME':<30}  {'DISKS':>5}/{31}  {'EMPTY':>5}")
-        print(f"  {'-'*7}  {'-'*15}  {'-'*30}  {'-'*8}  {'-'*5}")
+        print(
+            f"  {'VMID':>7}  {'NODE':<15}  {'NAME':<30}  {'DISKS':>5}/{31}  "
+            f"{'UNUSED':>6}  {'EMPTY':>5}"
+        )
+        print(f"  {'-'*7}  {'-'*15}  {'-'*30}  {'-'*8}  {'-'*6}  {'-'*5}")
         for pr in parker_records:
-            empty_flag = "YES" if pr.empty else ""
-            print(f"  {pr.vmid:>7}  {pr.node:<15}  {_trunc(pr.name, 30):<30}  {pr.disk_count:>5}/{31}  {empty_flag:>5}")
+            empty_flag = "YES" if pr.empty else ("?" if not pr.config_read else "")
+            print(
+                f"  {pr.vmid:>7}  {pr.node:<15}  {_trunc(pr.name, 30):<30}  "
+                f"{pr.disk_count:>5}/{31}  {pr.unused_count:>6}  {empty_flag:>5}"
+            )
         print()
     else:
         print("PARKER VMs: none found")
@@ -864,23 +945,51 @@ def emit_warnings(
     """Emit advisory warnings to stderr."""
     parked_count = sum(1 for r in disk_records if r.classification == "parked")
 
-    # Warn when parked disks exist but strategy is not "parked"
+    # Warn when parked disks exist but the operator has opted out of parking
     strategy = cfg.detached_disk_strategy
-    if parked_count > 0 and strategy not in ("parked",):
+    if parked_count > 0 and strategy != "parked":
         _warn(
             f"{parked_count} parked disk(s) found but detached_disk_strategy="
             f"{strategy!r} (expected 'parked'). "
             "These disks may not be managed by the parker lifecycle."
         )
 
-    # Warn about empty parkers (teardown candidates)
+    # Warn about empty parkers (teardown candidates).  A parker is a teardown
+    # candidate only when its config was read and holds neither a bus disk nor
+    # an unusedN reference: `qm destroy --purge` frees the volume behind an
+    # unusedN entry just as readily as one in a bus slot.
     empty_parkers = [pr for pr in parker_records if pr.empty]
     for pr in empty_parkers:
         _warn(
             f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} is empty "
             "(0 disks) — teardown candidate: "
-            f"qm destroy {pr.vmid} --purge"
+            f"qm set {pr.vmid} --protection 0 && qm destroy {pr.vmid} --purge"
         )
+
+    # Warn about stranded unusedN references: a sweep that did not complete
+    # inside the protection window.  These hold live persistent disks.
+    for pr in parker_records:
+        if pr.unused_count > 0:
+            _warn(
+                f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} carries "
+                f"{pr.unused_count} unusedN reference(s) to a live volume; "
+                "do NOT destroy it. Clear each with: "
+                f"qm set {pr.vmid} --protection 0 && "
+                f"qm unlink {pr.vmid} --idlist <unusedN> && "
+                f"qm set {pr.vmid} --protection 1"
+            )
+
+    # Warn about parkers whose config did not come back. PVEClient.get exits the
+    # audit on a transport fault, so in practice this is the parker that vanished
+    # between the cluster listing and the config read (HTTP 404/501). Its
+    # contents are unknown either way, so it is not reported as empty.
+    for pr in parker_records:
+        if not pr.config_read:
+            _warn(
+                f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} config was "
+                "not returned (vanished during the scan, HTTP 404/501); its "
+                "contents are unknown and it is not reported as empty"
+            )
 
 
 # ---------------------------------------------------------------------------
