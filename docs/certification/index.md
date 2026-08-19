@@ -1,10 +1,16 @@
 # BOSH CPI Certification
 
-Three paths exist for certifying this CPI release against the BOSH CPI v2 contract.
+Four paths exist for certifying this CPI release against the BOSH CPI v2 contract. Each covers a surface the one before it does not.
 
 1. **Local lifecycle harness**: `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, and no full BOSH director required. **Recommended for day-to-day development and pre-merge validation.**
-2. **Local BOSH Acceptance Tests**: `scripts/bats` in this repo. Runs the upstream [BOSH Acceptance Test](https://github.com/cloudfoundry/bosh-acceptance-tests) rspec suite against the live director the e2e harness stands up, with the PVE tag-exclusion set, and records a committed run report under `docs/bats/`. See [Running BATS](bats.md). **Recommended before cutting a release.**
-3. **Upstream Concourse pipeline**: [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the BAT suite and the director-upgrade test in CI. No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
+
+2. **Local BOSH Acceptance Tests**: `scripts/bats` in this repo. Runs the upstream [BOSH Acceptance Test](https://github.com/cloudfoundry/bosh-acceptance-tests) rspec suite against the live director the e2e harness stands up, with the PVE tag-exclusion set, and records a committed run report under `docs/certification/bats/`. See [Running BATS](bats.md). **Recommended before cutting a release.**
+
+3. **Local BOSH Director Upgrade Test**: `scripts/certify` in this repo. Runs the upstream certification suite's director-upgrade scenario against a PVE lab: stand up a director on the previous CPI release, deploy the upstream certification release under it, upgrade the director in place onto the new CPI release, and recreate the deployment. See [BOSH Director Upgrade Test](upgrade.md). **Recommended before cutting a release, alongside BATS.**
+
+4. **Upstream Concourse pipeline**: [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the BAT suite and the director-upgrade test in CI. No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
+
+The first three run locally against a lab. Together they cover the CPI method surface, the director contract at one CPI version, and the director contract across two CPI versions. The fourth adds continuous automation on top.
 
 ## Local Lifecycle Harness
 
@@ -118,7 +124,7 @@ Read-path handlers — `has_vm`, `reboot_vm`, `set_vm_metadata`, `get_disks`, `d
 - **SDN path** — resolves the vnet by name from the SDN database, which is cluster-global. No node constraint applies.
 - **Bridge path** — issues the bridge deletion against `Config.Node`. If HA moves the broker VM to a different node between `create_network` and `delete_network`, the bridge delete targets the original node and may fail.
 
-**Operator requirement for bridge networks:** do not change `Config.Node` in `cpi.json` between creating and deleting the same network CID. See [CPI configuration reference](pve-settings.md) for the `node` field.
+**Operator requirement for bridge networks:** do not change `Config.Node` in `cpi.json` between creating and deleting the same network CID. See [CPI configuration reference](../pve-settings.md) for the `node` field.
 
 ### Running a Single Step
 
@@ -168,4 +174,4 @@ Reference: copy the `aws/` layout as a starting template and substitute:
 3. A Concourse instance with the credentials and resource workers to run the pipeline
 4. PR template additions to BATs ([cloudfoundry/bosh-acceptance-tests](https://github.com/cloudfoundry/bosh-acceptance-tests/tree/master/templates)) so the BAT manifest template lives upstream
 
-The upstream pipeline is a release-time concern, not a development-time one. The local lifecycle harness covers the same CPI-method surface area for day-to-day work, and `scripts/bats` runs the full BAT suite locally (see [Running BATS](bats.md)), so the Concourse pipeline adds continuous automation and the director-upgrade test rather than new coverage.
+The upstream pipeline is a release-time concern, not a development-time one. Every scenario it runs has a local equivalent in this repo: the lifecycle harness covers the CPI-method surface area for day-to-day work, `scripts/bats` runs the full BAT suite (see [Running BATS](bats.md)), and `scripts/certify` runs the director-upgrade test (see [BOSH Director Upgrade Test](upgrade.md)). What the Concourse pipeline adds is continuous automation on release triggers, not new coverage.

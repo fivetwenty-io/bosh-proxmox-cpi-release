@@ -1,0 +1,26 @@
+---
+# Ops file: add the `certification` vm_type the BOSH Director Upgrade Test
+# deploys into.
+#
+# This is the PVE equivalent of the upstream certification suite's
+# <iaas>/certification/cloud-config-ops.yml. It is layered by `scripts/certify`
+# on top of manifests/bosh/cloud-config.yml (plus the active env bundle's
+# cc-reserved.yml) when the runner uploads the director's cloud config, so the
+# certification deployment gets its own sizing without disturbing the vm_types
+# the rest of the lab uses.
+#
+# Vars come from the `certification:` section of ci/integration.yml, defaulted
+# by the runner:
+#   certification_vm_cores       default 2
+#   certification_vm_memory_mib  default 2048
+#   certification_vm_disk_mib    default 8192
+# pve_network_bridge comes from the active env bundle's vars.yml.
+- type: replace
+  path: /vm_types/name=certification?
+  value:
+    name: certification
+    cloud_properties:
+      cores:  ((certification_vm_cores))
+      memory: ((certification_vm_memory_mib))
+      disk:   ((certification_vm_disk_mib))
+      network_bridge: ((pve_network_bridge))

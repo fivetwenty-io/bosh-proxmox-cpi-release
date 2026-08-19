@@ -1,8 +1,8 @@
 """Resolve external upstream-repo checkouts (bosh-deployment, cf-deployment,
-bosh-acceptance-tests).
+bosh-acceptance-tests, bosh-cpi-certification).
 
 An explicit environment override (BOSH_DEPLOYMENT_DIR / CF_DEPLOYMENT /
-BATS_DIR) always
+BATS_DIR / BOSH_CPI_CERTIFICATION_DIR) always
 wins and must point at an existing directory — use it to test against a local
 fork or a pinned revision. Without an override, a shallow clone of the
 upstream repository is maintained under .deps/ at the repo root: cloned on
@@ -37,6 +37,10 @@ UPSTREAMS: dict[str, tuple[str, str]] = {
     "bosh-acceptance-tests": (
         "BATS_DIR",
         "https://github.com/cloudfoundry/bosh-acceptance-tests.git",
+    ),
+    "bosh-cpi-certification": (
+        "BOSH_CPI_CERTIFICATION_DIR",
+        "https://github.com/cloudfoundry/bosh-cpi-certification.git",
     ),
 }
 

@@ -22,7 +22,7 @@ We run BATS against a Proxmox VE lab with `./scripts/bats`, the same way `./scri
 
 4. Finalize
 
-   Restores the director's cloud config (BATS replaces it with its own generated one), then writes the run report under `docs/bats/runs/` and regenerates the `docs/bats/README.md` summary.
+   Restores the director's cloud config (BATS replaces it with its own generated one), then writes the run report under `docs/certification/bats/runs/` and regenerates the `docs/certification/bats/README.md` summary.
 
 ## Prerequisites
 
@@ -134,13 +134,13 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
   The rendered BAT deployment spec and the run's ephemeral keypair. These contain the ephemeral private key, which is why the whole directory stays gitignored.
 
-The committed record lives under `docs/bats/`:
+The committed record lives under `docs/certification/bats/`:
 
-- `docs/bats/runs/<date>.md`
+- `docs/certification/bats/runs/<date>.md`
 
   A generated per-run report: verdict, wall clock, per-phase and per-step timing tables, environment tuple (CPI release, BATS revision, director version, stemcell, PVE version), the exclusion table with reasons, and a per-example results table with durations.
 
-- `docs/bats/README.md`
+- `docs/certification/bats/README.md`
 
   A generated summary regenerated on every run: the latest verdict plus a history table linking every recorded run.
 

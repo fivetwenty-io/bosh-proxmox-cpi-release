@@ -36,9 +36,15 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Smoke-testing with `emptyvm`](emptyvm.md): Minimal post-deploy deployment that exercises the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent handshake).
 
-- [Running BATS](bats.md): How we run the upstream BOSH Acceptance Tests against a PVE lab with `./scripts/bats`, including configuration, the tag exclusion policy, and report generation.
+- [CPI Certification](certification/index.md): The hub for every path we certify this CPI against the BOSH CPI v2 contract — the local lifecycle harness, the BOSH Acceptance Tests, the BOSH Director Upgrade Test, and the upstream Concourse pipeline.
 
-- [BATS results](bats/README.md): The committed record of BATS runs, with the latest verdict, environment tuple, and per-run reports.
+- [Running BATS](certification/bats.md): How we run the upstream BOSH Acceptance Tests against a PVE lab with `./scripts/bats`, including configuration, the tag exclusion policy, and report generation.
+
+- [BATS results](certification/bats/README.md): The committed record of BATS runs, with the latest verdict, environment tuple, and per-run reports.
+
+- [BOSH Director Upgrade Test](certification/upgrade.md): How we run the upstream certification suite's director-upgrade scenario with `./scripts/certify`, upgrading a live director and its managed deployment across CPI releases.
+
+- [Director upgrade results](certification/upgrade/README.md): The committed record of director-upgrade runs, with the latest verdict, the version matrix, and per-run reports.
 
 - [PVE API Permissions](pve-api-permissions.md): Creating the API token and a minimum-privilege `bosh@pve` user with a custom `BoshOperator` role, plus the per-method privilege inventory.
 

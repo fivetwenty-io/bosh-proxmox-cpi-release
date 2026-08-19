@@ -1,0 +1,1690 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""BOSH Director Upgrade Test against the configured PVE lab.
+
+Runs the upstream cloudfoundry/bosh-cpi-certification suite's director-upgrade
+scenario locally, the same way scripts/bats runs the upstream acceptance suite:
+one command, the shared ci/integration.yml config, the same env bundles, and
+machine plus prose artifacts at the end.
+
+The scenario, from upstream's shared/tasks/test-upgrade.sh and the test-upgrade
+job in <iaas>/pipeline.yml:
+
+    1. Stand up a BOSH Director with the OLD CPI release.
+    2. Deploy the upstream certification release under it.
+    3. Run `bosh create-env` again with the NEW CPI release over the SAME
+       state.json, upgrading the Director VM in place.
+    4. Recreate the certification deployment through the new CPI.
+    5. Assert the upgrade preserved what it must, then tear down.
+
+BATS proves the CPI satisfies the Director contract at one version. This proves
+a Director and the deployment it manages survive a CPI version change: the VM
+and disk CIDs the old CPI wrote must still decode under the new one, and the
+Director VM must be upgraded rather than recreated.
+
+Usage:
+    ./scripts/certify [command] [flags]
+
+Commands:
+    upgrade      (default, alias `run`) preflight -> resolve -> deploy-old ->
+                 deploy-cert -> capture-pre -> upgrade -> recreate -> verify ->
+                 finalize -> teardown.
+    report       Re-print the summary table from the most recent run.
+    help         Show this message.
+
+DESTRUCTIVE: the run takes over this repo's Director slot (manifests/bosh/
+state.json and the env bundle's Director IP). A standing Director is refused by
+preflight unless --force is passed, which tears it down first. state.json and
+creds.yml are copied into the run directory before anything is deployed.
+
+Flags:
+    --config FILE       Integration config YAML (default: ci/integration.yml).
+    --env NAME          BOSH_PVE_ENV overlay selector (default: $BOSH_PVE_ENV
+                        or 'cpitest').
+    --old-cpi SPEC      CPI release for the pre-upgrade Director: a version
+                        ('0.1.1'), a path to a .tgz, or 'dev' to build from the
+                        working tree. Defaults to certification.old_cpi_version,
+                        and failing that to N-1 of the published GitHub
+                        releases.
+    --new-cpi SPEC      CPI release to upgrade onto. Same forms. Defaults to
+                        certification.new_cpi_version, and failing that to N,
+                        the latest published GitHub release.
+    --old-bosh-release VERSION
+                        bosh release for the pre-upgrade Director (downloaded
+                        from bosh.io and pinned). Default: held at whatever
+                        manifests/bosh/bosh-release.yml pins.
+    --new-bosh-release VERSION
+                        bosh release to upgrade onto. Default: held.
+    --old-stemcell WHAT 'light' (default) or a path to a stemcell .tgz.
+    --new-stemcell WHAT 'light' (default) or a path to a stemcell .tgz.
+    --force             Tear down a standing Director before starting.
+    --keep              Skip teardown; leave the upgraded Director and the
+                        certification deployment in place for post-mortem.
+    --results-dir DIR   Where to write artifacts (default: .e2e-results).
+    --skip-doc          Do not write docs/certification/upgrade/ documents.
+    --dry-run           Print every command without executing; exit 0.
+    --no-color          Disable ANSI color.
+
+Env:
+    BOSH_PVE_ENV        Env bundle selector (see manifests/envs/).
+    BOSH_CPI_CERTIFICATION_DIR
+                        Existing bosh-cpi-certification checkout to use instead
+                        of the managed .deps/ clone.
+
+Exit codes:
+    0    all steps passed
+    1    a step failed
+    2    usage error or a refused precondition
+    124  a step hit its timeout
+    130  interrupted
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+from pathlib import Path
+from typing import IO
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+sys.path.insert(0, str(SCRIPTS_DIR))
+import _checkouts  # noqa: E402
+import _integration  # noqa: E402
+import _lightstemcell  # noqa: E402
+from _report import (  # noqa: E402
+    FAIL,
+    PASS,
+    Color,
+    Reporter,
+    Runner,
+    fmt_hms,
+)
+
+BOSH_SCRIPT = str(SCRIPTS_DIR / "bosh")
+CREATE_RELEASE = str(SCRIPTS_DIR / "create-release")
+BOSH_DIR = REPO_ROOT / "manifests" / "bosh"
+BOSH_VARS = BOSH_DIR / "vars.yml"
+STATE = BOSH_DIR / "state.json"
+CREDS = BOSH_DIR / "creds.yml"
+ENVS_DIR = REPO_ROOT / "manifests" / "envs"
+CERT_MANIFESTS = REPO_ROOT / "manifests" / "certification"
+CC_OPS = CERT_MANIFESTS / "cloud-config-ops.yml"
+CC_CPI_OPS = CERT_MANIFESTS / "cloud-config-cpi-ops.yml"
+CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
+STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
+RELEASES_DIR = REPO_ROOT / "releases" / "bosh-pve-cpi"
+DEPS_CPI_RELEASES = _checkouts.DEPS_DIR / "cpi-releases"
+DEPS_BOSH_RELEASES = _checkouts.DEPS_DIR / "bosh-releases"
+
+DOCS_UPGRADE_DIR = REPO_ROOT / "docs" / "certification" / "upgrade"
+RUNS_DIR = DOCS_UPGRADE_DIR / "runs"
+DOCS_HOWTO = "docs/certification/upgrade.md"
+
+DEFAULT_CONFIG = "ci/integration.yml"
+DEFAULT_RESULTS_DIR = ".e2e-results"
+CHECKOUT_NAME = "bosh-cpi-certification"
+CERT_RELEASE_SUBPATH = "shared/assets/certification-release"
+JUNIT_STEPS = "junit-steps.xml"
+RUN_META_MARK = "certify-run-meta"
+
+DEFAULT_TIMEOUT_S = 7200
+CREATE_ENV_TIMEOUT_S = 3600
+DEPLOY_TIMEOUT_S = 2400
+SHORT_TIMEOUT_S = 300
+
+BOSH_IO_RELEASE = "https://bosh.io/d/github.com/cloudfoundry/bosh?v={version}"
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+
+def _bosh_int_opt(path: Path, json_path: str) -> "str | None":
+    """bosh int --path, returning None when the file or path is absent."""
+    if not path.exists():
+        return None
+    proc = subprocess.run(
+        ["bosh", "int", str(path), "--path", json_path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.rstrip("\n")
+
+
+def env_vars_file(env_name: str) -> "Path | None":
+    """manifests/envs/<env>/vars.yml when it exists (mirrors scripts/bosh)."""
+    f = ENVS_DIR / env_name / "vars.yml"
+    return f if f.exists() else None
+
+
+def layered_var(env_name: str, json_path: str) -> "str | None":
+    """Read a vars key with env-bundle layering: env vars.yml wins, base
+    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh)."""
+    env_f = env_vars_file(env_name)
+    if env_f is not None:
+        v = _bosh_int_opt(env_f, json_path)
+        if v is not None:
+            return v
+    return _bosh_int_opt(BOSH_VARS, json_path)
+
+
+def stemcell_manifest(path: Path) -> dict:
+    """Read stemcell.MF (name, version, ...) from a stemcell tarball."""
+    with tarfile.open(path, "r:gz") as tf:
+        member = None
+        for name in ("stemcell.MF", "./stemcell.MF"):
+            try:
+                member = tf.getmember(name)
+                break
+            except KeyError:
+                continue
+        if member is None:
+            raise ValueError(f"no stemcell.MF inside {path}")
+        fh = tf.extractfile(member)
+        assert fh is not None
+        return yaml.safe_load(fh.read())
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _md_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+class ScrubbedLog:
+    """File-like wrapper that redacts private-key blocks from a console log.
+
+    `bosh create-env` echoes the jumpbox keypair it generates into the
+    vars-store; the console capture should not persist it.
+    """
+
+    def __init__(self, fh: "IO[str]") -> None:
+        self.fh = fh
+        self._in_key = False
+
+    def write(self, line: str) -> None:
+        is_begin = "-----BEGIN" in line and "PRIVATE KEY" in line
+        is_end = "-----END" in line and "PRIVATE KEY" in line
+        if is_begin:
+            self.fh.write("[private key scrubbed]\n")
+            self._in_key = not is_end
+            return
+        if self._in_key:
+            if is_end:
+                self._in_key = False
+            return
+        self.fh.write(line)
+
+    def flush(self) -> None:
+        self.fh.flush()
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+# The default version matrix is N and N-1 of the published GitHub releases,
+# resolved at run time. Pinning literals here would rot the moment a release
+# is cut; "the last two releases" is the matrix operators actually upgrade
+# along, and it stays true without anyone editing this file.
+_VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+$")
+
+
+def gh_release_versions(limit: int = 20) -> list[str]:
+    """Published X.Y.Z release versions, newest first.
+
+    Reads the repo's GitHub releases rather than local git tags: a tag with no
+    published release has no downloadable tarball, so it is not a version this
+    test can upgrade from or to.
+    """
+    if shutil.which("gh") is None:
+        raise RuntimeError("gh is not on PATH; cannot resolve the release matrix")
+    proc = subprocess.run(
+        ["gh", "release", "list", "--limit", str(limit), "--json", "tagName,isDraft"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh release list failed:\n{proc.stderr.strip()}")
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh release list returned unparseable JSON: {exc}") from exc
+
+    versions: list[tuple[tuple[int, int, int], str]] = []
+    for row in rows:
+        if row.get("isDraft"):
+            continue
+        tag = str(row.get("tagName", "")).strip()
+        if not _VERSION_RE.match(tag):
+            continue
+        version = tag.lstrip("v")
+        major, minor, patch = (int(part) for part in version.split("."))
+        versions.append(((major, minor, patch), version))
+    versions.sort(reverse=True)
+    return [v for _, v in versions]
+
+
+def resolve_version_matrix(old_spec: str, new_spec: str) -> "tuple[str, str, bool]":
+    """Fill unset CPI legs from the published releases: new = N, old = N-1.
+
+    Returns (old, new, auto_resolved). An explicit flag or config value on
+    either side is left alone, so a run can pin one leg and let the other
+    follow the releases.
+    """
+    if old_spec and new_spec:
+        return old_spec, new_spec, False
+    versions = gh_release_versions()
+    if len(versions) < 2:
+        raise RuntimeError(
+            "fewer than two published releases; pass --old-cpi and --new-cpi "
+            f"explicitly (found: {', '.join(versions) or 'none'})"
+        )
+    return (old_spec or versions[1]), (new_spec or versions[0]), True
+
+
+def certification_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
+    """Resolve the `certification:` section of ci/integration.yml.
+
+    Everything with a sensible lab-wide answer defaults from the active env
+    bundle, matching how the `bats:` section behaves. Only cpi_id has no
+    default: a Director with a cpi-config applied rejects an AZ that names no
+    entry, and one without rejects an AZ that names one, so the operator must
+    say which shape the lab is in.
+    """
+    section = cfg.get("certification") or {}
+    if not isinstance(section, dict):
+        sys.exit(
+            "config key `certification` must be a mapping "
+            "(see ci/integration.yml.example)"
+        )
+
+    def _env_default(key: str, vars_path: str) -> str:
+        val = str(section.get(key, "") or "").strip()
+        if val:
+            return val
+        if dry_run:
+            return f"<dry-run:{vars_path}>"
+        resolved = layered_var(env_name, vars_path)
+        if not resolved:
+            sys.exit(
+                f"certification.{key} not set and {vars_path} not found in the "
+                f"{env_name} env vars or manifests/bosh/vars.yml"
+            )
+        return resolved
+
+    return {
+        "deployment_name": str(section.get("deployment_name") or "certification"),
+        "release_name": str(section.get("release_name") or "certification"),
+        "az": str(section.get("az") or "z1"),
+        "network_name": str(section.get("network_name") or "default"),
+        "disk_type": str(section.get("disk_type") or "default"),
+        "network_bridge": _env_default("network_bridge", "/pve_network_bridge"),
+        "cpi_id": str(section.get("cpi_id", "") or "").strip(),
+        "vm_cores": int(section.get("vm_cores", 2)),
+        "vm_memory_mib": int(section.get("vm_memory_mib", 2048)),
+        "vm_disk_mib": int(section.get("vm_disk_mib", 8192)),
+        "old_cpi_version": str(section.get("old_cpi_version") or "").strip(),
+        "new_cpi_version": str(section.get("new_cpi_version") or "").strip(),
+        "timeout_s": int(section.get("timeout_s", DEFAULT_TIMEOUT_S)),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Release + stemcell resolution
+# --------------------------------------------------------------------------- #
+
+def resolve_cpi_release(spec: str, side: str, dry_run: bool) -> "tuple[Path, str]":
+    """Resolve a CPI release spec to (tarball path, version string).
+
+    A spec is one of:
+      'dev'      build from the working tree via scripts/create-release dev
+      a path     used as-is
+      a version  'v0.1.1' or '0.1.1', resolved from releases/ when committed,
+                 otherwise downloaded from the GitHub release and verified
+                 against its published .sha256 asset
+    """
+    if dry_run:
+        return Path(f"<dry-run:{side}-cpi:{spec}>"), spec
+
+    if spec == "dev":
+        proc = subprocess.run(
+            [CREATE_RELEASE, "dev"], cwd=str(REPO_ROOT),
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"scripts/create-release dev failed:\n{proc.stderr}")
+        match = re.search(r"^RELEASE_TGZ=(.+)$", proc.stdout, re.M)
+        if not match:
+            raise RuntimeError("scripts/create-release dev printed no RELEASE_TGZ=")
+        path = Path(match.group(1).strip())
+        return path, f"dev ({path.name})"
+
+    candidate = Path(spec).expanduser()
+    if candidate.suffix == ".tgz" or candidate.exists():
+        if not candidate.exists():
+            raise RuntimeError(f"{side} CPI release tarball not found: {candidate}")
+        return candidate, candidate.name
+
+    if not _VERSION_RE.match(spec):
+        raise RuntimeError(
+            f"{side} CPI release spec {spec!r} is neither 'dev', a path to a "
+            ".tgz, nor an X.Y.Z version"
+        )
+    version = spec.lstrip("v")
+    committed = RELEASES_DIR / f"bosh-pve-cpi-{version}.tgz"
+    if committed.exists():
+        return committed, version
+
+    DEPS_CPI_RELEASES.mkdir(parents=True, exist_ok=True)
+    tarball = DEPS_CPI_RELEASES / f"bosh-pve-cpi-{version}.tgz"
+    checksum = DEPS_CPI_RELEASES / f"bosh-pve-cpi-{version}.tgz.sha256"
+    if not tarball.exists() or not checksum.exists():
+        if shutil.which("gh") is None:
+            raise RuntimeError(
+                f"CPI release {version} is not committed under releases/ and "
+                "gh is not on PATH to download it from the GitHub release"
+            )
+        proc = subprocess.run(
+            ["gh", "release", "download", f"v{version}",
+             "--pattern", f"bosh-pve-cpi-{version}.tgz*",
+             "--dir", str(DEPS_CPI_RELEASES), "--clobber"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"gh release download v{version} failed:\n{proc.stderr.strip()}"
+            )
+    if not tarball.exists():
+        raise RuntimeError(f"download produced no {tarball}")
+    if checksum.exists():
+        want = checksum.read_text().split()[0].strip()
+        got = sha256_file(tarball)
+        if want != got:
+            raise RuntimeError(
+                f"sha256 mismatch for {tarball.name}: published {want}, got {got}"
+            )
+    return tarball, version
+
+
+def resolve_bosh_release_ops(version: str, out_dir: Path, dry_run: bool) -> Path:
+    """Download a bosh release from bosh.io and write an ops file pinning it.
+
+    Mirrors the shape of manifests/bosh/bosh-release.yml, which is what the
+    generated file overrides when layered after it.
+    """
+    ops = out_dir / f"bosh-release-{version}.yml"
+    if dry_run:
+        return ops
+    DEPS_BOSH_RELEASES.mkdir(parents=True, exist_ok=True)
+    tarball = DEPS_BOSH_RELEASES / f"bosh-{version}.tgz"
+    url = BOSH_IO_RELEASE.format(version=version)
+    if not tarball.exists():
+        with urllib.request.urlopen(url, timeout=600) as resp:  # noqa: S310
+            tmp = tarball.with_suffix(".tgz.part")
+            with tmp.open("wb") as fh:
+                shutil.copyfileobj(resp, fh)
+            tmp.rename(tarball)
+    digest = sha256_file(tarball)
+    ops.write_text(yaml.safe_dump(
+        [{
+            "type": "replace",
+            "path": "/releases/name=bosh",
+            "value": {
+                "name": "bosh",
+                "version": version,
+                "url": url,
+                "sha1": f"sha256:{digest}",
+            },
+        }],
+        default_flow_style=False, sort_keys=False,
+    ))
+    return ops
+
+
+def resolve_stemcell(choice: str, env_name: str, dry_run: bool) -> "tuple[Path, str, str, str]":
+    """Resolve a stemcell choice to (path, name, version, mode)."""
+    if dry_run:
+        return Path(f"<dry-run-stemcell:{choice}>"), "<dry-run>", "<dry-run>", choice
+    if choice == "light":
+        light = _ensure_light_stemcell(env_name)
+        if light.create_env_tarball is None:
+            raise RuntimeError("light stemcell build produced no tarball")
+        path = Path(light.create_env_tarball)
+        mode = f"light ({light.mode})"
+    else:
+        path = Path(choice).expanduser()
+        if not path.exists():
+            raise RuntimeError(f"stemcell tarball not found: {path}")
+        mode = "tarball"
+    mf = stemcell_manifest(path)
+    name = str(mf.get("name", ""))
+    version = str(mf.get("version", ""))
+    if not name or not version:
+        raise RuntimeError(f"stemcell.MF in {path} lacks name/version")
+    return path, name, version, mode
+
+
+def _ensure_light_stemcell(env_name: str) -> "_lightstemcell.LightStemcell":
+    """Mirror scripts/bosh: derive the light stemcell from vars.yml with
+    env-bundle layering, ensure the qcow2 is on PVE, build the tarball."""
+    source_url = _bosh_int_opt(BOSH_VARS, "/stemcell_url")
+    source_sha1 = _bosh_int_opt(BOSH_VARS, "/stemcell_sha1")
+    if not source_url or not source_sha1:
+        raise RuntimeError(
+            "stemcell_url/stemcell_sha1 missing from manifests/bosh/vars.yml"
+        )
+    os_name, version = _lightstemcell.parse_os_version(source_url)
+    mode = (layered_var(env_name, "/light_stemcell_mode") or "preuploaded").strip()
+    fetch_url = (layered_var(env_name, "/stemcell_fetch_url") or "").strip()
+    token = (layered_var(env_name, "/stemcell_fetch_token") or "").strip()
+
+    def _reader(path: str) -> "str | None":
+        return layered_var(env_name, path)
+
+    cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_reader)
+    print(
+        f"    light stemcell ({mode}): ensuring {os_name} {version} "
+        f"is available on PVE (host {cpi_cfg['host']})"
+    )
+    return _lightstemcell.ensure_light_stemcell(
+        cpi_cfg=cpi_cfg,
+        mode=mode,
+        os_name=os_name,
+        version=version,
+        source_url=source_url,
+        source_sha1=source_sha1,
+        cache_dir=str(STEMCELL_CACHE),
+        image_url=(fetch_url or None),
+        token=(token or None),
+        build_create_env_tarball=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Deployment manifest ops
+# --------------------------------------------------------------------------- #
+
+def build_deployment_ops(ccfg: dict) -> list:
+    """Ops reshaping upstream's certification.yml for this lab.
+
+    Upstream's manifest names three AZs and the `default` vm_type, and attaches
+    no persistent disk. This lab has one AZ, its own certification vm_type, and
+    we add a persistent disk deliberately: without one the recreate proves only
+    that a VM can be built, while with one it proves the new CPI decodes and
+    reattaches a disk CID the old CPI wrote. That is the single most valuable
+    assertion in the whole scenario for a CPI whose disk CIDs are versioned
+    envelopes.
+    """
+    return [
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/azs",
+         "value": [ccfg["az"]]},
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/vm_type",
+         "value": "certification"},
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/networks/name=default/name",
+         "value": ccfg["network_name"]},
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/persistent_disk_type?",
+         "value": ccfg["disk_type"]},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Report documents
+# --------------------------------------------------------------------------- #
+
+def write_run_doc(
+    meta: dict,
+    phases: "list[dict] | None" = None,
+    steps: "list[dict] | None" = None,
+) -> Path:
+    """Write docs/certification/upgrade/runs/<date>.md and return its path."""
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    date = meta["date"]
+    doc = RUNS_DIR / f"{date}.md"
+
+    lines: list[str] = []
+    lines.append(f"# Director Upgrade Run Report: {date}")
+    lines.append("")
+    lines.append(f"<!-- {RUN_META_MARK} {json.dumps(meta, sort_keys=True)} -->")
+    lines.append("")
+    lines.append(
+        "`./scripts/certify` generated this report from a live run of the "
+        "[BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
+        "suite's Director Upgrade Test against a Proxmox VE lab. See "
+        "[BOSH Director Upgrade Test](../../upgrade.md) for how we run it."
+    )
+    lines.append("")
+    lines.append("## Verdict")
+    lines.append("")
+    lines.append(
+        f"**Result: {meta['verdict']}.** {meta['steps_passed']} steps passed, "
+        f"{meta['steps_failed']} failed, and {meta['steps_skipped']} skipped."
+    )
+    lines.append("")
+    lines.append(
+        f"- Wall clock: {meta['wall_hms']} ({meta['started']} to {meta['finished']})"
+    )
+    lines.append("")
+    lines.append(f"- Command: `{meta['command_line']}`")
+    lines.append("")
+    lines.append(f"- Exit code: {meta['exit_code']}")
+    lines.append("")
+
+    lines.append("## Version matrix")
+    lines.append("")
+    lines.append(
+        f"Matrix source: {meta.get('matrix_source', 'unknown')}."
+    )
+    lines.append("")
+    lines.append("| Leg | Before upgrade | After upgrade |")
+    lines.append("|---|---|---|")
+    lines.append(
+        f"| CPI release | {_md_escape(meta['old_cpi'])} | {_md_escape(meta['new_cpi'])} |"
+    )
+    lines.append(
+        f"| bosh release | {_md_escape(meta['old_bosh'])} | {_md_escape(meta['new_bosh'])} |"
+    )
+    lines.append(
+        f"| Stemcell | {_md_escape(meta['old_stemcell'])} | {_md_escape(meta['new_stemcell'])} |"
+    )
+    lines.append("")
+
+    if phases or steps:
+        lines.append("## Timings")
+        lines.append("")
+        if phases:
+            lines.append("| Phase | Duration |")
+            lines.append("|---|---|")
+            for ph in phases:
+                lines.append(f"| {_md_escape(ph['name'])} | {fmt_hms(ph['seconds'])} |")
+            lines.append("")
+        if steps:
+            lines.append("| Step | Result | Duration |")
+            lines.append("|---|---|---|")
+            for st in steps:
+                lines.append(
+                    f"| {_md_escape(st['name'])} | {st['status']} | "
+                    f"{fmt_hms(st['seconds'])} |"
+                )
+            lines.append("")
+
+    lines.append("## Environment")
+    lines.append("")
+    lines.append("| Item | Value |")
+    lines.append("|---|---|")
+    for label, key in (
+        ("Env bundle", "env"),
+        ("BOSH director", "director_version"),
+        ("Certification suite revision", "certification_ref"),
+        ("Certification release", "certification_release"),
+        ("Proxmox VE", "pve_version"),
+    ):
+        lines.append(f"| {label} | {_md_escape(str(meta.get(key) or 'unknown'))} |")
+    lines.append("")
+
+    lines.append("## Upgrade invariants")
+    lines.append("")
+    lines.append(
+        "These are what the run asserts beyond the two BOSH commands exiting "
+        "zero. Each is a claim about what the new CPI had to understand about "
+        "state the old CPI wrote."
+    )
+    lines.append("")
+    lines.append("| Invariant | Before | After | Held |")
+    lines.append("|---|---|---|---|")
+    for inv in meta.get("invariants", []):
+        held = "yes" if inv.get("held") else "NO"
+        lines.append(
+            f"| {_md_escape(inv['name'])} | {_md_escape(str(inv.get('before', '')))} | "
+            f"{_md_escape(str(inv.get('after', '')))} | {held} |"
+        )
+    lines.append("")
+
+    lines.append("## Artifacts")
+    lines.append("")
+    lines.append(
+        "Machine artifacts for this run live in the gitignored results "
+        f"directory `{meta.get('run_dir', '')}`: `results.json`, "
+        f"`{JUNIT_STEPS}`, `console.log`, the rendered deployment manifest, and "
+        "the pre- and post-upgrade state captures. This document is the "
+        "committed record."
+    )
+    lines.append("")
+    doc.write_text("\n".join(lines))
+    return doc
+
+
+def _collect_run_history() -> list[dict]:
+    """Read the metadata comment from every committed run document."""
+    history: list[dict] = []
+    if not RUNS_DIR.is_dir():
+        return history
+    pattern = re.compile(rf"<!-- {RUN_META_MARK} (\{{.*\}}) -->")
+    for doc in sorted(RUNS_DIR.glob("*.md")):
+        match = pattern.search(doc.read_text())
+        if not match:
+            continue
+        try:
+            meta = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        meta["_doc"] = doc.name
+        history.append(meta)
+    history.sort(key=lambda m: m.get("date", ""), reverse=True)
+    return history
+
+
+def write_summary_doc() -> Path:
+    """Regenerate docs/certification/upgrade/README.md from the run history."""
+    DOCS_UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
+    history = _collect_run_history()
+    latest = history[0] if history else None
+
+    lines: list[str] = []
+    lines.append("# BOSH Director Upgrade Test")
+    lines.append("")
+    lines.append(
+        "The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
+        "suite's Director Upgrade Test stands a Director up on one CPI release, "
+        "deploys the upstream certification release under it, upgrades the "
+        "Director in place onto a newer CPI release, and recreates the "
+        "deployment through it. We run it against a Proxmox VE lab with "
+        "`./scripts/certify`; [BOSH Director Upgrade Test](../upgrade.md) "
+        "documents the setup and invocation."
+    )
+    lines.append("")
+    if latest:
+        lines.append("## Latest run")
+        lines.append("")
+        lines.append(
+            f"**{latest['verdict']}** on {latest['date']}: "
+            f"{latest.get('old_cpi', '?')} to {latest.get('new_cpi', '?')}, "
+            f"{latest.get('steps_passed', '?')} steps passed, "
+            f"{latest.get('steps_failed', '?')} failed, in "
+            f"{latest.get('wall_hms', '?')}. "
+            f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
+        )
+        lines.append("")
+        lines.append("| Item | Value |")
+        lines.append("|---|---|")
+        for label, key in (
+            ("CPI release before", "old_cpi"),
+            ("CPI release after", "new_cpi"),
+            ("bosh release", "new_bosh"),
+            ("Stemcell", "new_stemcell"),
+            ("BOSH director", "director_version"),
+            ("Certification suite revision", "certification_ref"),
+            ("Proxmox VE", "pve_version"),
+        ):
+            lines.append(f"| {label} | {_md_escape(str(latest.get(key) or 'unknown'))} |")
+        lines.append("")
+    lines.append("## Run history")
+    lines.append("")
+    if history:
+        lines.append("| Date | Result | CPI upgrade | Steps failed | Wall clock | Report |")
+        lines.append("|---|---|---|---|---|---|")
+        for meta in history:
+            lines.append(
+                f"| {meta['date']} | {meta['verdict']} | "
+                f"{_md_escape(str(meta.get('old_cpi', '?')))} to "
+                f"{_md_escape(str(meta.get('new_cpi', '?')))} | "
+                f"{meta.get('steps_failed', '?')} | "
+                f"{meta.get('wall_hms', '?')} | "
+                f"[runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+            )
+    else:
+        lines.append("No runs recorded yet.")
+    lines.append("")
+    out = DOCS_UPGRADE_DIR / "README.md"
+    out.write_text("\n".join(lines))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# The runner
+# --------------------------------------------------------------------------- #
+
+class Certify:
+    def __init__(self, args: argparse.Namespace, rep: Reporter) -> None:
+        self.args = args
+        self.rep = rep
+        self.dry_run = args.dry_run
+        self.env_name = args.env
+
+        # Keep in-process env reads (layered vars) and every child process on
+        # the same env bundle. Must happen before load_config's passthrough.
+        os.environ["BOSH_PVE_ENV"] = self.env_name
+
+        results_dir = Path(args.results_dir)
+        if not results_dir.is_absolute():
+            results_dir = REPO_ROOT / results_dir
+        self.results_dir = results_dir
+        self.run_dir = rep.run_dir(results_dir)
+
+        self.console_fh: "IO[str] | None" = None
+        self.console_log: "ScrubbedLog | None" = None
+        if not self.dry_run:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.console_fh = (self.run_dir / "console.log").open("w")
+            self.console_log = ScrubbedLog(self.console_fh)
+
+        self.runner = Runner(
+            rep, {"BOSH_PVE_ENV": self.env_name}, self.dry_run, REPO_ROOT,
+            logfile=self.console_log,
+        )
+
+        self.cfg = _integration.load_config(args.config, dry_run=self.dry_run)
+        self.ccfg = certification_config(self.cfg, self.env_name, self.dry_run)
+
+        self.checkout: "Path | None" = None
+        self.old_cpi_path: "Path | None" = None
+        self.new_cpi_path: "Path | None" = None
+        self.old_cpi_label = ""
+        self.new_cpi_label = ""
+        self.old_bosh_ops: "Path | None" = None
+        self.new_bosh_ops: "Path | None" = None
+        self.old_bosh_label = "held"
+        self.new_bosh_label = "held"
+        self.old_stemcell: "tuple[Path, str, str, str] | None" = None
+        self.new_stemcell: "tuple[Path, str, str, str] | None" = None
+        self.director_version = ""
+        self.pve_version = ""
+        self.certification_ref = ""
+        self.certification_release = ""
+        self.deployed = False
+        self.director_up = False
+        self.pre: dict = {}
+        self.post: dict = {}
+        self.invariants: list[dict] = []
+
+    # -- env helpers -------------------------------------------------------- #
+
+    def _director_env(self) -> dict[str, str]:
+        return _integration.director_env(self.cfg, dry_run=self.dry_run)
+
+    def _record_inline(self, name: str, ok: bool, t0: float, detail: str = "",
+                       tail: "list[str] | None" = None) -> bool:
+        self.rep.record(name, PASS if ok else FAIL, time.monotonic() - t0,
+                        detail, tail)
+        return ok
+
+    def _bosh(self, name: str, argv: list[str], *, timeout: int) -> tuple[bool, list[str]]:
+        return self.runner.step(name, argv, env=self._director_env(), timeout=timeout)
+
+    def _capture_json(self, argv: list[str], *, timeout: int = SHORT_TIMEOUT_S) -> "dict | None":
+        ok, out = self.runner.capture(
+            "-".join(argv[:3]), argv, env=self._director_env(), timeout=timeout,
+        )
+        if not ok or not out.strip():
+            return None
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _rows(payload: "dict | None") -> list[dict]:
+        if not payload:
+            return []
+        tables = payload.get("Tables") or []
+        if not tables:
+            return []
+        return tables[0].get("Rows") or []
+
+    def _state(self) -> dict:
+        if self.dry_run or not STATE.exists():
+            return {}
+        try:
+            return json.loads(STATE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _director_identity(self) -> dict:
+        """The Director VM and disk identity `bosh create-env` records."""
+        state = self._state()
+        disks = state.get("disks") or []
+        return {
+            "vm_cid": str(state.get("current_vm_cid") or ""),
+            "disk_cids": sorted(str(d.get("cid") or "") for d in disks if d.get("cid")),
+        }
+
+    def _deployment_identity(self) -> dict:
+        """VM and persistent-disk CIDs the Director holds for the deployment."""
+        dep = self.ccfg["deployment_name"]
+        rows = self._rows(self._capture_json(
+            ["bosh", "-d", dep, "instances", "--details", "--json"],
+        ))
+        vm_cids: list[str] = []
+        disk_cids: list[str] = []
+        states: list[str] = []
+        for row in rows:
+            for key, value in row.items():
+                lowered = key.lower()
+                if not value:
+                    continue
+                if lowered in ("vm_cid", "vm cid"):
+                    vm_cids.append(str(value))
+                elif "disk_cid" in lowered or lowered in ("disk cids", "disk cid"):
+                    disk_cids.extend(
+                        part.strip() for part in str(value).split(",") if part.strip()
+                    )
+                elif lowered in ("process_state", "process state"):
+                    states.append(str(value))
+        return {
+            "vm_cids": sorted(vm_cids),
+            "disk_cids": sorted(disk_cids),
+            "process_states": sorted(states),
+        }
+
+    def _cpi_release_version(self) -> str:
+        for row in self._rows(self._capture_json(["bosh", "releases", "--json"])):
+            if str(row.get("name", "")).strip() == "bosh-pve-cpi":
+                return str(row.get("version", "")).strip().rstrip("*")
+        return ""
+
+    def _orphaned_disk_count(self) -> int:
+        return len(self._rows(self._capture_json(["bosh", "disks", "--orphaned", "--json"])))
+
+    def _pve_cfg(self) -> dict:
+        def _reader(path: str) -> "str | None":
+            return layered_var(self.env_name, path)
+        return _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_reader)
+
+    # -- preflight ----------------------------------------------------------- #
+
+    def preflight(self) -> bool:
+        self.rep.section("preflight")
+        ok = True
+
+        for tool in ("uv", "bosh", "git"):
+            present = shutil.which(tool) is not None
+            self.rep.record(
+                f"tool:{tool}", PASS if present else FAIL, 0.0,
+                "on PATH" if present else "MISSING from PATH",
+            )
+            ok = ok and present
+
+        gh_present = shutil.which("gh") is not None
+        self.rep.record(
+            "tool:gh", PASS if gh_present else FAIL, 0.0,
+            "on PATH" if gh_present
+            else "MISSING — needed to download released CPI tarballs",
+        )
+        ok = ok and gh_present
+
+        cfg_file = Path(self.args.config)
+        if not cfg_file.is_absolute():
+            cfg_file = REPO_ROOT / cfg_file
+        for label, path in (
+            (self.args.config, cfg_file),
+            ("manifests/bosh/vars.yml", BOSH_VARS),
+            ("manifests/certification/cloud-config-ops.yml", CC_OPS),
+            ("manifests/bosh/cloud-config.yml", CLOUD_CONFIG),
+        ):
+            present = path.exists() or self.dry_run
+            self.rep.record(
+                f"file:{label}", PASS if present else FAIL, 0.0,
+                "present" if present else "MISSING",
+            )
+            ok = ok and present
+
+        if self.dry_run:
+            env_var, _ = _checkouts.UPSTREAMS[CHECKOUT_NAME]
+            override = os.environ.get(env_var, "").strip()
+            where = override or str(_checkouts.DEPS_DIR / CHECKOUT_NAME)
+            self.checkout = Path(where)
+            self.rep.record(
+                f"checkout:{CHECKOUT_NAME}", PASS, 0.0,
+                f"{where} (dry-run: clone/refresh skipped)",
+            )
+        else:
+            t0 = time.monotonic()
+            try:
+                self.checkout = _checkouts.checkout_dir(CHECKOUT_NAME)
+                self.certification_ref = self._checkout_ref(self.checkout)
+                self.rep.record(
+                    f"checkout:{CHECKOUT_NAME}", PASS, time.monotonic() - t0,
+                    f"{self.checkout} @ {self.certification_ref}",
+                )
+            except SystemExit as exc:
+                self.rep.record(
+                    f"checkout:{CHECKOUT_NAME}", FAIL, time.monotonic() - t0, str(exc),
+                )
+                ok = False
+
+        if self.checkout is not None:
+            rel_dir = self.checkout / CERT_RELEASE_SUBPATH
+            present = rel_dir.is_dir() or self.dry_run
+            self.rep.record(
+                "checkout:certification-release", PASS if present else FAIL, 0.0,
+                str(rel_dir) if present else f"MISSING {rel_dir}",
+            )
+            ok = ok and present
+
+        ok = self._preflight_slot() and ok
+        ok = self._preflight_lab() and ok
+        return ok
+
+    @staticmethod
+    def _checkout_ref(path: Path) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+
+    def _preflight_slot(self) -> bool:
+        """The upgrade test takes over this repo's Director slot.
+
+        It deploys, upgrades, and deletes the Director recorded in
+        manifests/bosh/state.json, on the env bundle's Director IP. A standing
+        Director is therefore not something the run can leave alone, and
+        clobbering one silently would be the worst possible behavior — so
+        refuse unless the operator says otherwise with --force.
+        """
+        if self.dry_run:
+            self.rep.record("director:slot-free", PASS, 0.0, "dry-run")
+            return True
+        identity = self._director_identity()
+        occupied = bool(identity["vm_cid"])
+        if not occupied:
+            self.rep.record("director:slot-free", PASS, 0.0, "no Director in state.json")
+            return True
+        if self.args.force:
+            self.rep.record(
+                "director:slot-free", PASS, 0.0,
+                f"Director {identity['vm_cid']} present; --force will tear it down",
+            )
+            return True
+        self.rep.record(
+            "director:slot-free", FAIL, 0.0,
+            f"Director {identity['vm_cid']} is live in state.json — the upgrade "
+            "test replaces it. Run `./scripts/bosh teardown` first, or pass "
+            "--force to tear it down as part of this run.",
+        )
+        return False
+
+    def _preflight_lab(self) -> bool:
+        """The PVE API must answer before we spend 20 minutes finding out."""
+        if self.dry_run:
+            self.rep.record("lab:reachable", PASS, 0.0, "dry-run")
+            return True
+        t0 = time.monotonic()
+        try:
+            data = _integration.pve_api_get(self._pve_cfg(), "/version")
+            self.pve_version = str((data or {}).get("version", "")) or "unknown"
+        except (RuntimeError, OSError) as exc:
+            return self._record_inline("lab:reachable", False, t0, str(exc))
+        return self._record_inline(
+            "lab:reachable", True, t0, f"PVE {self.pve_version}",
+        )
+
+    # -- resolve ------------------------------------------------------------- #
+
+    def resolve(self) -> bool:
+        self.rep.section("resolve")
+        ok = True
+
+        for side, spec in (("old", self.args.old_cpi), ("new", self.args.new_cpi)):
+            t0 = time.monotonic()
+            try:
+                path, label = resolve_cpi_release(spec, side, self.dry_run)
+            except (RuntimeError, OSError) as exc:
+                ok = self._record_inline(f"release:{side}-cpi", False, t0, str(exc)) and ok
+                continue
+            if side == "old":
+                self.old_cpi_path, self.old_cpi_label = path, label
+            else:
+                self.new_cpi_path, self.new_cpi_label = path, label
+            self._record_inline(f"release:{side}-cpi", True, t0, f"{label} -> {path}")
+
+        for side, version in (("old", self.args.old_bosh_release),
+                              ("new", self.args.new_bosh_release)):
+            if not version:
+                continue
+            t0 = time.monotonic()
+            try:
+                ops = resolve_bosh_release_ops(version, self.run_dir, self.dry_run)
+            except (OSError, RuntimeError) as exc:
+                ok = self._record_inline(f"release:{side}-bosh", False, t0, str(exc)) and ok
+                continue
+            if side == "old":
+                self.old_bosh_ops, self.old_bosh_label = ops, version
+            else:
+                self.new_bosh_ops, self.new_bosh_label = ops, version
+            self._record_inline(f"release:{side}-bosh", True, t0, f"{version} -> {ops}")
+
+        for side, choice in (("old", self.args.old_stemcell),
+                             ("new", self.args.new_stemcell)):
+            t0 = time.monotonic()
+            try:
+                resolved = resolve_stemcell(choice, self.env_name, self.dry_run)
+            except (RuntimeError, OSError, ValueError) as exc:
+                ok = self._record_inline(f"stemcell:{side}", False, t0, str(exc)) and ok
+                continue
+            if side == "old":
+                self.old_stemcell = resolved
+            else:
+                self.new_stemcell = resolved
+            self._record_inline(
+                f"stemcell:{side}", True, t0,
+                f"{resolved[1]}/{resolved[2]} ({resolved[3]})",
+            )
+
+        return ok
+
+    # -- create-env legs ----------------------------------------------------- #
+
+    def _create_env_argv(self, side: str) -> list[str]:
+        """`scripts/bosh create-env` with this side's release and stemcell pins.
+
+        scripts/bosh appends passthrough args after its own, and both bosh's
+        `-o` and `-v` take the last value, so the extra ops and vars here
+        override the repo defaults without forking the ops list.
+        """
+        argv = [BOSH_SCRIPT, "create-env"]
+        ops = self.old_bosh_ops if side == "old" else self.new_bosh_ops
+        if ops is not None:
+            argv += ["-o", str(ops)]
+        stemcell = self.old_stemcell if side == "old" else self.new_stemcell
+        if stemcell is not None and getattr(self.args, f"{side}_stemcell") != "light":
+            path = stemcell[0]
+            digest = "<dry-run>" if self.dry_run else f"sha256:{sha256_file(path)}"
+            argv += [
+                "-v", f"stemcell_url=file://{path}",
+                "-v", f"stemcell_sha1={digest}",
+            ]
+        return argv
+
+    def _create_env_env(self, side: str) -> dict[str, str]:
+        path = self.old_cpi_path if side == "old" else self.new_cpi_path
+        assert path is not None
+        return {"PVE_CPI_RELEASE_PATH": str(path)}
+
+    def deploy_old(self) -> bool:
+        self.rep.section("deploy-old")
+
+        if self.args.force and not self.dry_run and self._director_identity()["vm_cid"]:
+            ok, _ = self.runner.step(
+                "director:teardown-existing", [BOSH_SCRIPT, "teardown"],
+                timeout=CREATE_ENV_TIMEOUT_S,
+            )
+            if not ok:
+                return False
+
+        self._backup_state("pre-upgrade-test")
+
+        ok, _ = self.runner.step(
+            "net:up", [BOSH_SCRIPT, "net-up"], timeout=SHORT_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+
+        ok, _ = self.runner.step(
+            "director:create-env-old", self._create_env_argv("old"),
+            env=self._create_env_env("old"), timeout=CREATE_ENV_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+        self.director_up = True
+
+        ok, _ = self.runner.step(
+            "director:alias", [BOSH_SCRIPT, "alias-env"], timeout=SHORT_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+
+        if self.ccfg["cpi_id"]:
+            ok, _ = self.runner.step(
+                "director:cpi-config", [BOSH_SCRIPT, "update-cpi-config"],
+                timeout=DEPLOY_TIMEOUT_S,
+            )
+            if not ok:
+                return False
+        else:
+            self.rep.skip("director:cpi-config", "certification.cpi_id not set")
+
+        return self._upload_cloud_config()
+
+    def _upload_cloud_config(self) -> bool:
+        argv = [
+            BOSH_SCRIPT, "ucc",
+            "-o", str(CC_OPS),
+            "-v", f"certification_vm_cores={self.ccfg['vm_cores']}",
+            "-v", f"certification_vm_memory_mib={self.ccfg['vm_memory_mib']}",
+            "-v", f"certification_vm_disk_mib={self.ccfg['vm_disk_mib']}",
+        ]
+        if self.ccfg["cpi_id"]:
+            argv += [
+                "-o", str(CC_CPI_OPS),
+                "-v", f"certification_cpi_id={self.ccfg['cpi_id']}",
+            ]
+        ok, _ = self.runner.step(
+            "director:cloud-config", argv, timeout=SHORT_TIMEOUT_S,
+        )
+        return ok
+
+    def _backup_state(self, tag: str) -> None:
+        """Copy the Director state and creds into the run directory.
+
+        The run overwrites both. Keeping a copy alongside the console log is
+        the difference between a recoverable failure and a lost Director.
+        """
+        if self.dry_run:
+            return
+        for src in (STATE, CREDS):
+            if src.exists():
+                shutil.copy2(src, self.run_dir / f"{src.name}.{tag}")
+
+    # -- certification deployment -------------------------------------------- #
+
+    def deploy_cert(self) -> bool:
+        self.rep.section("deploy-cert")
+        assert self.checkout is not None
+        rel_dir = self.checkout / CERT_RELEASE_SUBPATH
+        dep = self.ccfg["deployment_name"]
+        rel = self.ccfg["release_name"]
+
+        # Upstream's create-deployment.sh builds the release in place with
+        # --force. That writes dev_releases/ and .dev_builds/ into the checkout
+        # and deletes blobs/.gitkeep, which leaves the tree dirty and would
+        # block the next fast-forward in _checkouts.py. Reset it to upstream
+        # HEAD before building, so every run builds the same release from the
+        # same source and the checkout stays reusable.
+        if not self.dry_run:
+            for path in ("dev_releases", ".dev_builds", ".final_builds"):
+                shutil.rmtree(rel_dir / path, ignore_errors=True)
+            subprocess.run(
+                ["git", "-C", str(self.checkout), "checkout", "--", "."],
+                capture_output=True, text=True,
+            )
+
+        ok, _ = self.runner.step(
+            "cert:create-release",
+            ["bosh", "-n", "create-release", "--force", "--name", rel],
+            cwd=rel_dir, timeout=DEPLOY_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+
+        ok, _ = self.runner.step(
+            "cert:upload-release", ["bosh", "-n", "upload-release"],
+            env=self._director_env(), cwd=rel_dir, timeout=DEPLOY_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+
+        assert self.old_stemcell is not None
+        ok, _ = self._bosh(
+            "cert:upload-stemcell",
+            ["bosh", "-n", "upload-stemcell", str(self.old_stemcell[0])],
+            timeout=DEPLOY_TIMEOUT_S,
+        )
+        if not ok:
+            return False
+
+        manifest = self._render_deployment_manifest()
+        if manifest is None:
+            return False
+
+        ok, _ = self._bosh(
+            "cert:deploy",
+            ["bosh", "-n", "-d", dep, "deploy", str(manifest)],
+            timeout=DEPLOY_TIMEOUT_S,
+        )
+        self.deployed = ok
+        return ok
+
+    def _render_deployment_manifest(self) -> "Path | None":
+        """Interpolate upstream's certification.yml for this lab."""
+        self.rep.begin("cert:manifest")
+        t0 = time.monotonic()
+        assert self.checkout is not None
+        assert self.old_stemcell is not None
+        src = self.checkout / CERT_RELEASE_SUBPATH / "certification.yml"
+        ops_file = self.run_dir / "certification-ops.yml"
+        out = self.run_dir / "certification.yml"
+        if self.dry_run:
+            print(f"    DRY-RUN: bosh int {src} -o <generated ops> > {out}")
+            self.rep.record("cert:manifest", PASS, 0.0, "dry-run")
+            return out
+        try:
+            ops_file.write_text(yaml.safe_dump(
+                build_deployment_ops(self.ccfg),
+                default_flow_style=False, sort_keys=False,
+            ))
+            proc = subprocess.run(
+                ["bosh", "int", str(src),
+                 "-o", str(ops_file),
+                 "-v", f"deployment_name={self.ccfg['deployment_name']}",
+                 "-v", f"release_name={self.ccfg['release_name']}",
+                 "-v", f"stemcell_name={self.old_stemcell[1]}"],
+                capture_output=True, text=True, cwd=str(REPO_ROOT),
+            )
+            if proc.returncode != 0:
+                self._record_inline(
+                    "cert:manifest", False, t0, "bosh int failed",
+                    proc.stderr.splitlines()[-20:],
+                )
+                return None
+            out.write_text(proc.stdout)
+        except OSError as exc:
+            self._record_inline("cert:manifest", False, t0, str(exc))
+            return None
+        self._record_inline("cert:manifest", True, t0, str(out))
+        return out
+
+    # -- capture / upgrade / recreate ---------------------------------------- #
+
+    def capture(self, when: str) -> bool:
+        self.rep.section(f"capture-{when}")
+        target = self.pre if when == "pre" else self.post
+        self.rep.begin(f"capture:{when}")
+        t0 = time.monotonic()
+        if self.dry_run:
+            self.rep.record(f"capture:{when}", PASS, 0.0, "dry-run")
+            return True
+        target.update({
+            "director": self._director_identity(),
+            "deployment": self._deployment_identity(),
+            "cpi_release": self._cpi_release_version(),
+            "orphaned_disks": self._orphaned_disk_count(),
+        })
+        (self.run_dir / f"capture-{when}.json").write_text(
+            json.dumps(target, indent=2, sort_keys=True) + "\n"
+        )
+        return self._record_inline(
+            f"capture:{when}", True, t0,
+            f"director vm {target['director']['vm_cid'] or '?'}, "
+            f"cpi {target['cpi_release'] or '?'}, "
+            f"disks {len(target['deployment']['disk_cids'])}",
+        )
+
+    def upgrade(self) -> bool:
+        self.rep.section("upgrade")
+        ok, _ = self.runner.step(
+            "director:create-env-new", self._create_env_argv("new"),
+            env=self._create_env_env("new"), timeout=CREATE_ENV_TIMEOUT_S,
+        )
+        if ok:
+            self._backup_state("post-upgrade")
+        return ok
+
+    def recreate(self) -> bool:
+        self.rep.section("recreate")
+        dep = self.ccfg["deployment_name"]
+        ok, _ = self._bosh(
+            "cert:recreate", ["bosh", "-n", "-d", dep, "recreate"],
+            timeout=DEPLOY_TIMEOUT_S,
+        )
+        return ok
+
+    # -- verify --------------------------------------------------------------- #
+
+    def verify(self) -> bool:
+        self.rep.section("verify")
+        if self.dry_run:
+            for name in ("verify:director-vm-identity", "verify:director-disk-identity",
+                         "verify:deployment-disk-identity", "verify:cpi-upgraded",
+                         "verify:instance-running", "verify:no-new-orphans",
+                         "verify:cloud-check"):
+                self.rep.record(name, PASS, 0.0, "dry-run")
+            return True
+
+        ok = True
+        pre_dir = self.pre.get("director", {})
+        post_dir = self.post.get("director", {})
+        pre_dep = self.pre.get("deployment", {})
+        post_dep = self.post.get("deployment", {})
+
+        ok = self._invariant(
+            "verify:director-vm-identity",
+            "Director VM CID",
+            pre_dir.get("vm_cid", ""), post_dir.get("vm_cid", ""),
+            lambda a, b: bool(a) and a == b,
+            "the Director VM was upgraded in place, not recreated",
+        ) and ok
+
+        ok = self._invariant(
+            "verify:director-disk-identity",
+            "Director persistent disk CIDs",
+            ", ".join(pre_dir.get("disk_cids", [])),
+            ", ".join(post_dir.get("disk_cids", [])),
+            lambda a, b: bool(a) and a == b,
+            "the new CPI decoded and kept the disk CID the old CPI wrote",
+        ) and ok
+
+        ok = self._invariant(
+            "verify:deployment-disk-identity",
+            "Certification persistent disk CIDs",
+            ", ".join(pre_dep.get("disk_cids", [])),
+            ", ".join(post_dep.get("disk_cids", [])),
+            lambda a, b: bool(a) and a == b,
+            "the recreated VM reattached the disk the old CPI created",
+        ) and ok
+
+        want_new = self.new_cpi_label.lstrip("v")
+        ok = self._invariant(
+            "verify:cpi-upgraded",
+            "bosh-pve-cpi release on the Director",
+            self.pre.get("cpi_release", ""), self.post.get("cpi_release", ""),
+            lambda a, b: bool(b) and a != b and (want_new in b or b in want_new),
+            f"the Director now runs {want_new}",
+        ) and ok
+
+        states = post_dep.get("process_states", [])
+        running = bool(states) and all(s == "running" for s in states)
+        self.rep.record(
+            "verify:instance-running", PASS if running else FAIL, 0.0,
+            ", ".join(states) or "no instances reported",
+        )
+        ok = ok and running
+
+        pre_orphans = self.pre.get("orphaned_disks", 0)
+        post_orphans = self.post.get("orphaned_disks", 0)
+        no_new = post_orphans <= pre_orphans
+        self.rep.record(
+            "verify:no-new-orphans", PASS if no_new else FAIL, 0.0,
+            f"{pre_orphans} before, {post_orphans} after",
+        )
+        self.invariants.append({
+            "name": "Orphaned disks",
+            "before": pre_orphans, "after": post_orphans, "held": no_new,
+        })
+        ok = ok and no_new
+
+        dep = self.ccfg["deployment_name"]
+        cc_ok, _ = self._bosh(
+            "verify:cloud-check",
+            ["bosh", "-n", "-d", dep, "cloud-check", "--report"],
+            timeout=SHORT_TIMEOUT_S,
+        )
+        ok = ok and cc_ok
+
+        return ok
+
+    def _invariant(self, step: str, name: str, before: str, after: str,
+                   holds, detail: str) -> bool:
+        held = bool(holds(before, after))
+        self.rep.record(
+            step, PASS if held else FAIL, 0.0,
+            detail if held else f"{name}: {before or '(none)'} -> {after or '(none)'}",
+        )
+        self.invariants.append(
+            {"name": name, "before": before, "after": after, "held": held}
+        )
+        return held
+
+    # -- finalize + teardown --------------------------------------------------- #
+
+    def finalize(self, run_ok: bool) -> bool:
+        self.rep.section("finalize")
+        if self.args.skip_doc:
+            self.rep.skip("doc:run-report", "--skip-doc")
+            self.rep.skip("doc:summary", "--skip-doc")
+            return True
+        self.rep.begin("doc:run-report")
+        t0 = time.monotonic()
+        meta = self._run_meta(run_ok)
+        if self.dry_run:
+            self.rep.record("doc:run-report", PASS, 0.0, "dry-run")
+            self.rep.record("doc:summary", PASS, 0.0, "dry-run")
+            return True
+        try:
+            phases = [
+                {"name": n, "seconds": s} for n, s in self.rep.sections_snapshot()
+            ]
+            steps = [
+                {"name": r.name, "status": r.status, "seconds": r.seconds}
+                for r in self.rep.results
+            ]
+            doc = write_run_doc(meta, phases, steps)
+            self._record_inline("doc:run-report", True, t0, str(doc))
+            t1 = time.monotonic()
+            summary = write_summary_doc()
+            self._record_inline("doc:summary", True, t1, str(summary))
+        except OSError as exc:
+            return self._record_inline("doc:run-report", False, t0, str(exc))
+        return True
+
+    def _run_meta(self, run_ok: bool) -> dict:
+        totals = {PASS: 0, FAIL: 0, "SKIP": 0}
+        for r in self.rep.results:
+            totals[r.status] = totals.get(r.status, 0) + 1
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.rep.started))
+        return {
+            "date": time.strftime("%Y-%m-%d", time.localtime(self.rep.started)),
+            "verdict": "PASSED" if run_ok else "FAILED",
+            "command_line": self.rep.command,
+            "exit_code": 0 if run_ok else 1,
+            "env": self.env_name,
+            "started": started,
+            "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "wall_hms": fmt_hms(time.time() - self.rep.started),
+            "steps_passed": totals.get(PASS, 0),
+            "steps_failed": totals.get(FAIL, 0),
+            "steps_skipped": totals.get("SKIP", 0),
+            "old_cpi": self.old_cpi_label or self.args.old_cpi,
+            "new_cpi": self.new_cpi_label or self.args.new_cpi,
+            "matrix_source": (
+                "N-1 to N of the published releases"
+                if getattr(self.args, "auto_matrix", False) else "pinned"
+            ),
+            "old_bosh": self.old_bosh_label,
+            "new_bosh": self.new_bosh_label,
+            "old_stemcell": (
+                f"{self.old_stemcell[1]}/{self.old_stemcell[2]}"
+                if self.old_stemcell else "unresolved"
+            ),
+            "new_stemcell": (
+                f"{self.new_stemcell[1]}/{self.new_stemcell[2]}"
+                if self.new_stemcell else "unresolved"
+            ),
+            "director_version": self.director_version or "unknown",
+            "certification_ref": self.certification_ref or "unknown",
+            "certification_release": self.certification_release or self.ccfg["release_name"],
+            "pve_version": self.pve_version or "unknown",
+            "run_dir": str(self.run_dir.relative_to(REPO_ROOT))
+            if self.run_dir.is_relative_to(REPO_ROOT) else str(self.run_dir),
+            "invariants": self.invariants,
+        }
+
+    def teardown(self) -> None:
+        if self.args.keep:
+            self.rep.section("teardown")
+            self.rep.skip("cert:delete-deployment", "--keep")
+            self.rep.skip("director:delete-env", "--keep")
+            print(self.rep.color.yellow(
+                "    --keep: the upgraded Director and the certification "
+                "deployment are still running. Tear them down with "
+                "`./scripts/bosh teardown` when you are done."
+            ))
+            return
+        self.rep.section("teardown")
+        dep = self.ccfg["deployment_name"]
+        if self.deployed or self.dry_run:
+            self.runner.step(
+                "cert:delete-deployment",
+                ["bosh", "-n", "-d", dep, "delete-deployment", "--force"],
+                env=self._director_env(), timeout=DEPLOY_TIMEOUT_S,
+            )
+            self.runner.step(
+                "director:clean-up", ["bosh", "-n", "clean-up", "--all"],
+                env=self._director_env(), timeout=DEPLOY_TIMEOUT_S,
+            )
+        if self.director_up or self.dry_run:
+            self.runner.step(
+                "director:delete-env", [BOSH_SCRIPT, "teardown"],
+                timeout=CREATE_ENV_TIMEOUT_S,
+            )
+            self.runner.step(
+                "net:down", [BOSH_SCRIPT, "net-down"], timeout=SHORT_TIMEOUT_S,
+            )
+
+    # -- dispatch -------------------------------------------------------------- #
+
+    def dispatch(self) -> bool:
+        ok = False
+        try:
+            if not self.preflight():
+                return False
+            if not self.resolve():
+                return False
+            if not self.deploy_old():
+                return False
+            if not self.deploy_cert():
+                return False
+            if not self.capture("pre"):
+                return False
+            if not self.upgrade():
+                return False
+            if not self.recreate():
+                return False
+            if not self.capture("post"):
+                return False
+            ok = self.verify()
+        finally:
+            # The report is the point of the run; write it even when a phase
+            # blew up, then clean up regardless.
+            try:
+                self.finalize(ok)
+            finally:
+                self.teardown()
+        return ok
+
+    def close(self) -> None:
+        if self.console_fh is not None:
+            self.console_fh.close()
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def cmd_report(args: argparse.Namespace, color: Color) -> int:
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_absolute():
+        results_dir = REPO_ROOT / results_dir
+    latest = results_dir / "latest.json"
+    if not latest.exists():
+        print(color.yellow(f"no results found at {latest}"), file=sys.stderr)
+        return 2
+    payload = json.loads(latest.read_text())
+    print(color.bold(f"CERTIFY SUMMARY — command: {payload.get('command', '?')}"))
+    for row in payload.get("results", []):
+        status = row["status"]
+        tag = {
+            PASS: color.green(f"[{PASS}]"),
+            FAIL: color.red(f"[{FAIL}]"),
+        }.get(status, color.yellow(f"[{status}]"))
+        detail = f"  {color.dim(row['detail'])}" if row.get("detail") else ""
+        print(f"    {tag} {row['name']} {row['seconds']:.1f}s{detail}")
+    totals = payload.get("totals", {})
+    print(
+        f"  {totals.get('pass', 0)} pass  {totals.get('fail', 0)} fail  "
+        f"{totals.get('skip', 0)} skip   total {payload.get('total_hms', '?')}"
+    )
+    return int(payload.get("exit", 0))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="scripts/certify",
+        description="BOSH Director Upgrade Test against the configured PVE lab",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("command", nargs="?", default="upgrade",
+                   choices=["upgrade", "run", "report", "help"])
+    p.add_argument("--config", default=DEFAULT_CONFIG)
+    p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV") or "cpitest")
+    p.add_argument("--old-cpi", default="")
+    p.add_argument("--new-cpi", default="")
+    p.add_argument("--old-bosh-release", default="")
+    p.add_argument("--new-bosh-release", default="")
+    p.add_argument("--old-stemcell", default="light")
+    p.add_argument("--new-stemcell", default="light")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--keep", action="store_true")
+    p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    p.add_argument("--skip-doc", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    color = Color(not args.no_color and sys.stdout.isatty())
+
+    if args.command == "help":
+        print(__doc__)
+        return 0
+    if args.command == "report":
+        return cmd_report(args, color)
+
+    command = "./scripts/certify " + " ".join(argv or ["upgrade"])
+    rep = Reporter(color, command, args.dry_run, label="CERTIFY")
+
+    # Resolve the version matrix before anything else: an explicit flag wins,
+    # then ci/integration.yml, then the published releases (new = N,
+    # old = N-1). Doing it here means the run banner and the report both name
+    # concrete versions rather than "whatever was latest".
+    probe = _integration.load_config(args.config, dry_run=args.dry_run)
+    probe_ccfg = certification_config(probe, args.env, args.dry_run)
+    old_spec = args.old_cpi or probe_ccfg["old_cpi_version"]
+    new_spec = args.new_cpi or probe_ccfg["new_cpi_version"]
+    if args.dry_run and not (old_spec and new_spec):
+        old_spec, new_spec, auto = old_spec or "<dry-run:N-1>", new_spec or "<dry-run:N>", True
+    else:
+        try:
+            old_spec, new_spec, auto = resolve_version_matrix(old_spec, new_spec)
+        except RuntimeError as exc:
+            print(color.red(f"version matrix: {exc}"), file=sys.stderr)
+            return 2
+    args.old_cpi, args.new_cpi, args.auto_matrix = old_spec, new_spec, auto
+    print(color.bold(
+        f"  CPI upgrade matrix: {old_spec} -> {new_spec}"
+        + ("  (N-1 -> N from published releases)" if auto else "  (pinned)")
+    ))
+
+    runner = Certify(args, rep)
+    try:
+        ok = runner.dispatch()
+    except KeyboardInterrupt:
+        print(color.red("\ninterrupted"), file=sys.stderr)
+        return 130
+    finally:
+        runner.close()
+    rep.summary()
+    rep.write_artifacts(runner.results_dir, junit_name=JUNIT_STEPS)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

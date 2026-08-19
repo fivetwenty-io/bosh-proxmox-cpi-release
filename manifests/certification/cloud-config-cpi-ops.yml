@@ -1,0 +1,11 @@
+---
+# Ops file: bind the cloud config's AZ to a cpi-config entry.
+#
+# A director with manifests/cpi-config.yml applied rejects any cloud config
+# whose AZs do not name a cpi-config entry, so the certification cloud config
+# needs this layer on a multi-CPI director and must not carry it otherwise.
+# `scripts/certify` applies it only when `certification.cpi_id` is set in
+# ci/integration.yml. See docs/multi-cluster.md.
+- type: replace
+  path: /azs/name=z1/cpi?
+  value: ((certification_cpi_id))

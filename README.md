@@ -198,18 +198,29 @@ export STEMCELL_PATH=/path/to/bosh-stemcell-*.tgz
 ./scripts/lifecycle
 ```
 
-See [CPI certification](docs/bosh-cpi-certification.md) for the full prerequisites list, config schema, supported environment overrides, and the upstream Concourse certification path.
+See [CPI certification](docs/certification/index.md) for the full prerequisites list, config schema, supported environment overrides, and the upstream Concourse certification path.
 
 ## BOSH Acceptance Tests (BATS)
 
-The CPI passes the [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests), the CloudFoundry community's acceptance suite for BOSH directors and CPIs: real deploys, recreates, persistent disk lifecycles, cloud-check resolutions, manual networking with static IP changes, and the stemcell agent contract, all against a live director on a PVE cluster. Committed run reports with the exact versions, tag exclusions, and per-example results live in [docs/bats/](docs/bats/README.md).
+The CPI passes the [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests), the CloudFoundry community's acceptance suite for BOSH directors and CPIs: real deploys, recreates, persistent disk lifecycles, cloud-check resolutions, manual networking with static IP changes, and the stemcell agent contract, all against a live director on a PVE cluster. Committed run reports with the exact versions, tag exclusions, and per-example results live in [docs/certification/bats/](docs/certification/bats/README.md).
 
 ```bash
 make bats                        # full suite against the configured lab
 ./scripts/bats run --env <env>   # explicit env bundle selection
 ```
 
-See [Running BATS](docs/bats.md) for prerequisites, configuration, the tag exclusion policy, and how run reports are recorded.
+See [Running BATS](docs/certification/bats.md) for prerequisites, configuration, the tag exclusion policy, and how run reports are recorded.
+
+## BOSH Director Upgrade Test
+
+BATS proves the CPI satisfies the director contract at one version. The upstream certification suite's [director upgrade test](https://github.com/cloudfoundry/bosh-cpi-certification) proves what BATS never touches: that a live director and the deployment it manages survive a CPI version change in place. A director is stood up on the previous CPI release, the upstream certification release is deployed under it, the director is upgraded onto the new CPI release over the same state, and the deployment is recreated. Every VM CID, disk CID, and stemcell reference the old CPI wrote must still resolve under the new one.
+
+```bash
+make certify-upgrade                    # previous released CPI to current, against the configured lab
+./scripts/certify upgrade --env <env>   # explicit env bundle selection
+```
+
+See [BOSH Director Upgrade Test](docs/certification/upgrade.md) for the version matrix, configuration, what each verification step asserts, and the committed [run record](docs/certification/upgrade/README.md).
 
 ## Troubleshooting
 
@@ -244,11 +255,20 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 - [Best practices](docs/best-practices.md)
   PVE and BOSH best practices, and how the CPI meets, exceeds, or makes each one configurable.
 
-- [Running BATS](docs/bats.md)
+- [Running BATS](docs/certification/bats.md)
   How the BOSH Acceptance Tests run against a PVE lab, and the tag exclusion policy.
 
-- [BATS results](docs/bats/README.md)
+- [BATS results](docs/certification/bats/README.md)
   Committed run reports with versions, exclusions, and per-example results.
+
+- [CPI certification](docs/certification/index.md)
+  Every path we certify against the CPI v2 contract, and what each one covers.
+
+- [BOSH Director Upgrade Test](docs/certification/upgrade.md)
+  How a director and its deployment are upgraded across CPI releases, and what the run asserts.
+
+- [Director upgrade results](docs/certification/upgrade/README.md)
+  Committed run reports with the version matrix and per-step results.
 
 - [Troubleshooting](docs/troubleshooting.md)
   Symptom-first failure triage.

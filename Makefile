@@ -125,12 +125,20 @@ coverage-check: coverage ## Fail if total line coverage < $(COVERAGE_THRESHOLD)%
 	@echo "$(GREEN)✓ Coverage threshold met$(RESET)"
 
 .PHONY: bats
-bats: ## Run the BOSH Acceptance Tests against the configured PVE lab (see docs/bats.md)
+bats: ## Run the BOSH Acceptance Tests against the configured PVE lab (see docs/certification/bats.md)
 	@if command -v ruby >/dev/null 2>&1 && command -v bundle >/dev/null 2>&1; then \
 		./scripts/bats run; \
 	else \
 		echo "$(YELLOW)ruby/bundler not installed — skipping BATS. Install ruby 3.3+ (e.g. brew install ruby)$(RESET)"; \
 	fi
+
+.PHONY: certify-upgrade
+certify-upgrade: ## Run the BOSH Director Upgrade Test against the configured PVE lab (see docs/certification/upgrade.md)
+	@./scripts/certify upgrade
+
+.PHONY: certify-upgrade-dry-run
+certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would run, without executing any
+	@./scripts/certify upgrade --dry-run
 
 ##@ Code Quality
 
