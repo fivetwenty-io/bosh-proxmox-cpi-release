@@ -165,6 +165,36 @@ tier3:
   smoke_app:       httpbin-smoke     # CF app name pushed for the smoke test
   smoke_timeout_s: 900               # Seconds to wait for CF deploy + app push
 
+# BOSH Acceptance Tests (scripts/bats): network shape handed to the BATS
+# cloud config. Requires the tier 2 director to be up (scripts/e2e bootstrap).
+# cidr, gateway, and bridge default to the active env bundle's values
+# (internal_cidr, internal_gw, pve_network_bridge), so only the address bands
+# need declaring here. All four uncommented keys below are required; the bands
+# must lie inside the env's internal_cidr, keep clear of the Director and any
+# other reserved slots, and static_ip/second_static_ip must be two distinct
+# addresses inside the static band. Example values match the cpitest env
+# (172.31.0.0/24, Director .10, infra reserved below .20 and from .200 up).
+bats:
+  network_cidr:    ""             # Defaults to the env bundle's internal_cidr
+  network_gateway: ""             # Defaults to the env bundle's internal_gw
+  network_bridge:  ""             # Defaults to the env bundle's pve_network_bridge
+  network_reserved:               # Addresses BATS VMs must never take
+  - 172.31.0.1-172.31.0.19
+  - 172.31.0.200-172.31.0.254
+  network_static:                 # Static band BATS assigns addresses from
+  - 172.31.0.190-172.31.0.199
+  static_ip:        172.31.0.190  # Primary static IP (inside the static band)
+  second_static_ip: 172.31.0.191  # Redeploy target; same band, different address
+  cpi_id:           ""            # cpi-config entry name for the BATS AZ;
+                                  # REQUIRED when the director has a cpi-config
+                                  # applied (e.g. pve-az1), empty otherwise
+  vm_cores:      2                # Sizing for the BATS `default` vm_type
+  vm_memory_mib: 2048
+  vm_disk_mib:   8192
+  exclude_tags:  []               # Extra rspec tag exclusions on top of the
+                                  # built-in PVE set (see docs/bats.md)
+  rspec_timeout_s: 14400          # Wall-clock ceiling for the rspec run
+
 # Tier 4: Light stemcell upload + delete assertions.
 # Run with: ./scripts/test integration light
 #

@@ -1,0 +1,1360 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""BOSH Acceptance Tests (BATS) runner against the configured PVE lab.
+
+Drives the upstream cloudfoundry/bosh-acceptance-tests rspec suite against
+the live BOSH director this repo's e2e harness stands up, using the same env
+bundles, config file, and secret sources. It resolves the checkout, patches
+in the PVE cloud-config template (manifests/bats/cloud_config_pve.yml.erb),
+renders bat.yml from the active env bundle, runs rspec with the PVE tag
+exclusions, restores the director's cloud config afterward, and writes both
+machine artifacts (.e2e-results/<ts>/) and the committed proof documents
+(docs/bats/runs/<date>.md plus the docs/bats/README.md summary).
+
+Usage:
+    ./scripts/bats [command] [flags]
+
+Commands:
+    run          (default) preflight -> prepare -> rspec -> finalize.
+                 Requires a running director (see scripts/e2e bootstrap).
+    report       Re-print the summary table from the most recent run.
+    help         Show this message.
+
+Flags:
+    --config FILE       Integration config YAML (default: ci/integration.yml).
+    --env NAME          BOSH_PVE_ENV overlay selector (default: $BOSH_PVE_ENV
+                        or 'cpitest').
+    --stemcell WHAT     'light' (default) builds/reuses the light stemcell the
+                        env already uses, or a path to a stemcell .tgz.
+    --exclude TAG       Extra rspec tag to exclude, repeatable. Adds to the
+                        built-in PVE exclusion set.
+    --no-default-excludes
+                        Drop the built-in PVE exclusion set (run everything
+                        except --exclude tags).
+    --only TAG          Run only examples with this tag, repeatable.
+    --fail-fast         Stop rspec at the first failure.
+    --keep              Set BAT_DEBUG_MODE: fail fast and leave the failed
+                        deployment, stemcell, and release in place.
+    --results-dir DIR   Where to write artifacts (default: .e2e-results).
+    --skip-doc          Do not write docs/bats/ report documents.
+    --dry-run           Print every command without executing; exit 0.
+    --no-color          Disable ANSI color.
+
+Env:
+    BOSH_PVE_ENV        Env bundle selector (see manifests/envs/).
+    BATS_DIR            Existing bosh-acceptance-tests checkout to use instead
+                        of the managed .deps/ clone.
+    STEMCELL_PATH       Fallback stemcell tarball when --stemcell is a 'light'
+                        run and no light stemcell can be built.
+
+Exit codes:
+    0    all steps passed
+    1    a step failed (including rspec failures)
+    2    ruby or bundler not installed (soft skip), or usage error
+    124  a step hit its timeout
+    130  interrupted
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import IO
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+sys.path.insert(0, str(SCRIPTS_DIR))
+import _checkouts  # noqa: E402
+import _integration  # noqa: E402
+import _lightstemcell  # noqa: E402
+from _report import (  # noqa: E402
+    FAIL,
+    PASS,
+    SKIP,
+    Color,
+    Reporter,
+    Runner,
+    fmt_hms,
+    paren_hms,
+)
+
+BOSH_SCRIPT = str(SCRIPTS_DIR / "bosh")
+BOSH_VARS = REPO_ROOT / "manifests" / "bosh" / "vars.yml"
+ENVS_DIR = REPO_ROOT / "manifests" / "envs"
+TEMPLATE_SRC = REPO_ROOT / "manifests" / "bats" / "cloud_config_pve.yml.erb"
+STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
+DOCS_BATS_DIR = REPO_ROOT / "docs" / "bats"
+RUNS_DIR = DOCS_BATS_DIR / "runs"
+DOCS_HOWTO = "docs/bats.md"
+
+DEFAULT_CONFIG = "ci/integration.yml"
+DEFAULT_RESULTS_DIR = ".e2e-results"
+CPI_NAME = "pve"
+CHECKOUT_NAME = "bosh-acceptance-tests"
+JUNIT_RSPEC = "junit.xml"        # spec-level results written by rspec
+JUNIT_STEPS = "junit-steps.xml"  # harness step results written by Reporter
+DEFAULT_RSPEC_TIMEOUT_S = 14400
+RUN_META_MARK = "bats-run-meta"
+
+# Built-in tag exclusions with the reason each capability does not apply to
+# the PVE lab run. These reasons are reproduced verbatim in the run report.
+DEFAULT_EXCLUDED_TAGS: dict[str, str] = {
+    "vip_networking": (
+        "PVE has no floating IP or VIP allocation concept for the CPI to bind"
+    ),
+    "root_partition": (
+        "needs an IaaS flavor with no ephemeral disk; PVE vm_types size the "
+        "root disk explicitly"
+    ),
+    "raw_ephemeral_storage": "PVE VMs have no raw instance-store devices",
+    "raw_instance_storage": "PVE VMs have no raw instance-store devices",
+    "ipv6": "the lab network is IPv4 only",
+    "ipv6_manual_networking": "the lab network is IPv4 only",
+    "ipv6_prefix_allocation": (
+        "IPv6 prefix delegation is modeled only by the upstream AWS template"
+    ),
+    "dual_stack": "the lab network is IPv4 only",
+    "nic_groups": "the lab env provides a single vnet, one NIC per VM",
+    "multiple_manual_networks": "the lab env provides a single manual network",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+
+def _bosh_int_opt(path: Path, json_path: str) -> "str | None":
+    """bosh int --path, returning None when the file or path is absent."""
+    if not path.exists():
+        return None
+    proc = subprocess.run(
+        ["bosh", "int", str(path), "--path", json_path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.rstrip("\n")
+
+
+def env_vars_file(env_name: str) -> "Path | None":
+    """manifests/envs/<env>/vars.yml when it exists (mirrors scripts/bosh)."""
+    f = ENVS_DIR / env_name / "vars.yml"
+    return f if f.exists() else None
+
+
+def layered_var(env_name: str, json_path: str) -> "str | None":
+    """Read a vars key with env-bundle layering: env vars.yml wins, base
+    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh)."""
+    env_f = env_vars_file(env_name)
+    if env_f is not None:
+        v = _bosh_int_opt(env_f, json_path)
+        if v is not None:
+            return v
+    return _bosh_int_opt(BOSH_VARS, json_path)
+
+
+def stemcell_manifest(path: Path) -> dict:
+    """Read stemcell.MF (name, version, ...) from a stemcell tarball."""
+    with tarfile.open(path, "r:gz") as tf:
+        member = None
+        for name in ("stemcell.MF", "./stemcell.MF"):
+            try:
+                member = tf.getmember(name)
+                break
+            except KeyError:
+                continue
+        if member is None:
+            raise ValueError(f"no stemcell.MF inside {path}")
+        fh = tf.extractfile(member)
+        assert fh is not None
+        return yaml.safe_load(fh.read())
+
+
+class ScrubbedLog:
+    """File-like wrapper that redacts private-key blocks from a console log.
+
+    BATS prints the full deployment spec, which includes the run's ephemeral
+    ssh private key; the console capture should not persist it.
+    """
+
+    def __init__(self, fh: "IO[str]") -> None:
+        self.fh = fh
+        self._in_key = False
+
+    def write(self, line: str) -> None:
+        is_begin = "-----BEGIN" in line and "PRIVATE KEY" in line
+        is_end = "-----END" in line and "PRIVATE KEY" in line
+        if is_begin:
+            self.fh.write("[private key scrubbed]\n")
+            self._in_key = not is_end
+            return
+        if self._in_key:
+            if is_end:
+                self._in_key = False
+            return
+        self.fh.write(line)
+
+    def flush(self) -> None:
+        self.fh.flush()
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+_REQUIRED_BATS_KEYS = (
+    "network_reserved",
+    "network_static",
+    "static_ip",
+    "second_static_ip",
+)
+
+
+def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
+    """Resolve the `bats:` section of ci/integration.yml with env defaults.
+
+    Network shape (reserved bands, static band, the two static IPs) must be
+    explicit in the config; cidr, gateway, and bridge default to the active
+    env bundle's values (internal_cidr, internal_gw, pve_network_bridge).
+    """
+    section = cfg.get("bats") or {}
+    if not isinstance(section, dict):
+        sys.exit("config key `bats` must be a mapping (see ci/integration.yml.example)")
+    for key in _REQUIRED_BATS_KEYS:
+        if not section.get(key):
+            sys.exit(
+                f"missing required config key: bats.{key} "
+                "(see the bats section in ci/integration.yml.example)"
+            )
+
+    def _env_default(key: str, vars_path: str) -> str:
+        val = str(section.get(key, "") or "").strip()
+        if val:
+            return val
+        if dry_run:
+            return f"<dry-run:{vars_path}>"
+        resolved = layered_var(env_name, vars_path)
+        if not resolved:
+            sys.exit(
+                f"bats.{key} not set and {vars_path} not found in the "
+                f"{env_name} env vars or manifests/bosh/vars.yml"
+            )
+        return resolved
+
+    return {
+        "network_cidr": _env_default("network_cidr", "/internal_cidr"),
+        "network_gateway": _env_default("network_gateway", "/internal_gw"),
+        "network_bridge": _env_default("network_bridge", "/pve_network_bridge"),
+        "network_reserved": [str(r) for r in section["network_reserved"]],
+        "network_static": [str(s) for s in section["network_static"]],
+        "static_ip": str(section["static_ip"]),
+        "second_static_ip": str(section["second_static_ip"]),
+        "vm_cores": int(section.get("vm_cores", 2)),
+        "vm_memory_mib": int(section.get("vm_memory_mib", 2048)),
+        "vm_disk_mib": int(section.get("vm_disk_mib", 8192)),
+        "cpi_id": str(section.get("cpi_id", "") or "").strip(),
+        "exclude_tags": [str(t) for t in (section.get("exclude_tags") or [])],
+        "rspec_timeout_s": int(section.get("rspec_timeout_s", DEFAULT_RSPEC_TIMEOUT_S)),
+    }
+
+
+def build_bat_spec(
+    bcfg: dict,
+    stemcell_name: str,
+    stemcell_version: str,
+    public_key: str,
+    private_key: str,
+) -> dict:
+    """The bat.yml document handed to BATS via BAT_DEPLOYMENT_SPEC."""
+    spec: dict = {
+        "cpi": CPI_NAME,
+        "properties": {
+            "stemcell": {
+                "name": stemcell_name,
+                "version": str(stemcell_version),
+            },
+            "instances": 1,
+            "networks": [
+                {
+                    "name": "default",
+                    "type": "manual",
+                    "static_ip": bcfg["static_ip"],
+                    "cidr": bcfg["network_cidr"],
+                    "reserved": bcfg["network_reserved"],
+                    "static": bcfg["network_static"],
+                    "gateway": bcfg["network_gateway"],
+                    "cloud_properties": {
+                        "bridge": bcfg["network_bridge"],
+                    },
+                },
+            ],
+            "second_static_ip": bcfg["second_static_ip"],
+            "ssh_key_pair": {
+                "public_key": public_key,
+                "private_key": private_key,
+            },
+            "vm_cores": bcfg["vm_cores"],
+            "vm_memory": bcfg["vm_memory_mib"],
+            "vm_disk": bcfg["vm_disk_mib"],
+        },
+    }
+    # Only present when configured: the template's if_p('cpi_id') treats an
+    # absent key as "director has no cpi-config".
+    if bcfg["cpi_id"]:
+        spec["properties"]["cpi_id"] = bcfg["cpi_id"]
+    return spec
+
+
+# --------------------------------------------------------------------------- #
+# rspec junit parsing + report documents
+# --------------------------------------------------------------------------- #
+
+def parse_rspec_junit(path: Path) -> "dict | None":
+    """Parse the RspecJunitFormatter output into totals + per-example rows."""
+    if not path.exists():
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return None
+    suite = root if root.tag == "testsuite" else root.find("testsuite")
+    if suite is None:
+        return None
+    cases = []
+    for case in suite.iter("testcase"):
+        status = "passed"
+        detail = ""
+        failure = case.find("failure")
+        skipped = case.find("skipped")
+        if failure is not None:
+            status = "failed"
+            detail = (failure.get("message") or "").strip()
+        elif skipped is not None:
+            status = "skipped"
+            detail = (skipped.get("message") or "").strip()
+        cases.append({
+            "file": case.get("classname", ""),
+            "name": case.get("name", ""),
+            "seconds": float(case.get("time", "0") or 0),
+            "status": status,
+            "detail": detail,
+        })
+    return {
+        "tests": int(suite.get("tests", "0") or 0),
+        "failures": int(suite.get("failures", "0") or 0),
+        "errors": int(suite.get("errors", "0") or 0),
+        "skipped": int(suite.get("skipped", "0") or 0),
+        "seconds": float(suite.get("time", "0") or 0),
+        "cases": cases,
+    }
+
+
+def _md_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def write_run_doc(
+    meta: dict,
+    rspec: "dict | None",
+    phases: "list[dict] | None" = None,
+    steps: "list[dict] | None" = None,
+) -> Path:
+    """Write docs/bats/runs/<date>.md for this run and return its path.
+
+    phases and steps use the same dict shapes results.json records
+    (sections: name/seconds, results: name/status/seconds), so the doc can
+    be regenerated from a prior run's artifacts.
+    """
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    date = meta["date"]
+    doc = RUNS_DIR / f"{date}.md"
+
+    verdict = meta["verdict"]
+    lines: list[str] = []
+    lines.append(f"# BATS Run Report: {date}")
+    lines.append("")
+    lines.append(f"<!-- {RUN_META_MARK} {json.dumps(meta, sort_keys=True)} -->")
+    lines.append("")
+    lines.append(
+        "`./scripts/bats` generated this report from a live run of the "
+        "[BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
+        "against a Proxmox VE lab. See [Running BATS](../../bats.md) for how we "
+        "run the suite."
+    )
+    lines.append("")
+    lines.append("## Verdict")
+    lines.append("")
+    if rspec:
+        lines.append(
+            f"**Result: {verdict}.** {rspec['tests']} examples, "
+            f"{rspec['failures']} failures, {rspec['errors']} errors, and "
+            f"{rspec['skipped']} skipped."
+        )
+    else:
+        lines.append(f"**Result: {verdict}.** No rspec results were produced.")
+    lines.append("")
+    lines.append(f"- Wall clock: {meta['wall_hms']} ({meta['started']} to {meta['finished']})")
+    lines.append("")
+    lines.append(f"- Command: `{meta['command_line']}`")
+    lines.append("")
+    lines.append(f"- Exit code: {meta['exit_code']}")
+    lines.append("")
+    if phases or steps:
+        lines.append("## Timings")
+        lines.append("")
+        lines.append(
+            "The wall clock above covers the whole run. The tables below "
+            "break it down by phase and by harness step; per-example "
+            "durations appear in the Examples table. The report and "
+            "artifact writing steps run after this report is rendered, so "
+            "they are not listed."
+        )
+        lines.append("")
+        if phases:
+            lines.append("| Phase | Duration |")
+            lines.append("|---|---|")
+            for ph in phases:
+                lines.append(
+                    f"| {_md_escape(ph['name'])} | {fmt_hms(ph['seconds'])} |"
+                )
+            lines.append("")
+        if steps:
+            lines.append("| Step | Result | Duration |")
+            lines.append("|---|---|---|")
+            for st in steps:
+                dur = "-" if st["status"] == SKIP else fmt_hms(st["seconds"])
+                lines.append(
+                    f"| {_md_escape(st['name'])} | {st['status']} | {dur} |"
+                )
+            lines.append("")
+    lines.append("## Environment")
+    lines.append("")
+    lines.append("| Item | Value |")
+    lines.append("|---|---|")
+    for label, key in (
+        ("CPI release", "cpi_version"),
+        ("BATS revision", "bats_ref"),
+        ("BOSH director", "director_version"),
+        ("Stemcell", "stemcell"),
+        ("Stemcell source", "stemcell_mode"),
+        ("Proxmox VE", "pve_version"),
+        ("Ruby", "ruby_version"),
+        ("Env bundle", "env"),
+    ):
+        value = meta.get(key) or "unknown"
+        lines.append(f"| {label} | {_md_escape(str(value))} |")
+    lines.append("")
+    lines.append("## Tag exclusions")
+    lines.append("")
+    if meta["excluded_tags"]:
+        lines.append(
+            "We excluded the following rspec tags. Every IaaS provider excludes "
+            "the capability tags that do not map to its platform; the table below "
+            "lists each exclusion with its reason so the covered surface stays "
+            "explicit."
+        )
+        lines.append("")
+        lines.append("| Tag | Reason |")
+        lines.append("|---|---|")
+        for tag in sorted(meta["excluded_tags"]):
+            reason = meta["excluded_reasons"].get(tag, "operator-supplied exclusion")
+            lines.append(f"| `{tag}` | {_md_escape(reason)} |")
+    else:
+        lines.append("No tags were excluded.")
+    lines.append("")
+    lines.append("## Examples")
+    lines.append("")
+    if rspec and rspec["cases"]:
+        lines.append("| Example | Status | Duration |")
+        lines.append("|---|---|---|")
+        for case in rspec["cases"]:
+            status = case["status"].upper()
+            lines.append(
+                f"| {_md_escape(case['name'])} | {status} | {fmt_hms(case['seconds'])} |"
+            )
+    else:
+        lines.append("No example-level results were captured.")
+    lines.append("")
+    lines.append("## Artifacts")
+    lines.append("")
+    lines.append(
+        "The runner writes this run's machine-readable artifacts (rspec "
+        "junit.xml, harness results.json, and the full console log) to the "
+        "gitignored `.e2e-results/` directory; it does not commit them. This "
+        "document is the committed record."
+    )
+    lines.append("")
+    doc.write_text("\n".join(lines))
+    return doc
+
+
+def _collect_run_history() -> list[dict]:
+    """Read the metadata comment from every committed run document."""
+    history: list[dict] = []
+    if not RUNS_DIR.is_dir():
+        return history
+    pattern = re.compile(rf"<!-- {RUN_META_MARK} (\{{.*\}}) -->")
+    for doc in sorted(RUNS_DIR.glob("*.md")):
+        match = pattern.search(doc.read_text())
+        if not match:
+            continue
+        try:
+            meta = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        meta["_doc"] = doc.name
+        history.append(meta)
+    history.sort(key=lambda m: m.get("date", ""), reverse=True)
+    return history
+
+
+def write_summary_doc() -> Path:
+    """Regenerate docs/bats/README.md from the run history."""
+    DOCS_BATS_DIR.mkdir(parents=True, exist_ok=True)
+    history = _collect_run_history()
+    latest = history[0] if history else None
+
+    lines: list[str] = []
+    lines.append("# BOSH Acceptance Tests")
+    lines.append("")
+    lines.append(
+        "The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
+        "(BATS) exercise a live BOSH director end to end through the CPI under "
+        "test: deploys, recreates, persistent disks, cloud-check resolutions, "
+        "manual networking with static IP changes, and the stemcell's agent "
+        "and supervision contract. We run the suite against a Proxmox VE lab "
+        "with `./scripts/bats`; [Running BATS](../bats.md) documents the "
+        "setup and invocation."
+    )
+    lines.append("")
+    if latest:
+        lines.append("## Latest run")
+        lines.append("")
+        lines.append(
+            f"**{latest['verdict']}** on {latest['date']}: "
+            f"{latest.get('examples', '?')} examples, "
+            f"{latest.get('failures', '?')} failures, "
+            f"{latest.get('skipped', '?')} skipped, in "
+            f"{latest.get('wall_hms', '?')}. "
+            f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
+        )
+        lines.append("")
+        lines.append("| Item | Value |")
+        lines.append("|---|---|")
+        for label, key in (
+            ("CPI release", "cpi_version"),
+            ("BATS revision", "bats_ref"),
+            ("BOSH director", "director_version"),
+            ("Stemcell", "stemcell"),
+            ("Proxmox VE", "pve_version"),
+        ):
+            lines.append(f"| {label} | {_md_escape(str(latest.get(key) or 'unknown'))} |")
+        lines.append("")
+    lines.append("## Run history")
+    lines.append("")
+    if history:
+        lines.append("| Date | Result | Examples | Failures | Wall clock | Report |")
+        lines.append("|---|---|---|---|---|---|")
+        for meta in history:
+            lines.append(
+                f"| {meta['date']} | {meta['verdict']} | "
+                f"{meta.get('examples', '?')} | {meta.get('failures', '?')} | "
+                f"{meta.get('wall_hms', '?')} | [runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+            )
+    else:
+        lines.append("No runs recorded yet.")
+    lines.append("")
+    out = DOCS_BATS_DIR / "README.md"
+    out.write_text("\n".join(lines))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# The runner
+# --------------------------------------------------------------------------- #
+
+class BATS:
+    def __init__(self, args: argparse.Namespace, rep: Reporter) -> None:
+        self.args = args
+        self.rep = rep
+        self.dry_run = args.dry_run
+        self.env_name = args.env
+        self.soft_skip = False
+
+        # Keep in-process env reads (layered vars) and every child process on
+        # the same env bundle. Must happen before load_config's passthrough.
+        os.environ["BOSH_PVE_ENV"] = self.env_name
+
+        results_dir = Path(args.results_dir)
+        if not results_dir.is_absolute():
+            results_dir = REPO_ROOT / results_dir
+        self.results_dir = results_dir
+        self.run_dir = rep.run_dir(results_dir)
+
+        self.console_fh: "IO[str] | None" = None
+        self.console_log: "ScrubbedLog | None" = None
+        if not self.dry_run:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.console_fh = (self.run_dir / "console.log").open("w")
+            self.console_log = ScrubbedLog(self.console_fh)
+
+        self.runner = Runner(
+            rep, {"BOSH_PVE_ENV": self.env_name}, self.dry_run, REPO_ROOT,
+            logfile=self.console_log,
+        )
+
+        self.cfg = _integration.load_config(args.config, dry_run=self.dry_run)
+        self.bcfg = bats_config(self.cfg, self.env_name, self.dry_run)
+
+        self.checkout: "Path | None" = None
+        self.stemcell_path: "Path | None" = None
+        self.stemcell_name = ""
+        self.stemcell_version = ""
+        self.stemcell_mode = ""
+        self.director_version = ""
+        self.rspec_rc: "int | None" = None
+        self.excluded: dict[str, str] = {}
+
+    # -- env helpers -------------------------------------------------------- #
+
+    def _director_env(self) -> dict[str, str]:
+        return _integration.director_env(self.cfg, dry_run=self.dry_run)
+
+    def _bundle_env(self) -> dict[str, str]:
+        assert self.checkout is not None
+        return {"BUNDLE_PATH": str(self.checkout / "vendor" / "bundle")}
+
+    def _record_inline(self, name: str, ok: bool, t0: float, detail: str = "",
+                       tail: "list[str] | None" = None) -> bool:
+        self.rep.record(name, PASS if ok else FAIL, time.monotonic() - t0,
+                        detail, tail)
+        return ok
+
+    # -- preflight ----------------------------------------------------------- #
+
+    def preflight(self) -> bool:
+        self.rep.section("preflight")
+        ok = True
+
+        for tool in ("uv", "bosh", "git", "ssh-keygen"):
+            present = shutil.which(tool) is not None
+            self.rep.record(
+                f"tool:{tool}", PASS if present else FAIL, 0.0,
+                "on PATH" if present else "MISSING from PATH",
+            )
+            ok = ok and present
+
+        # ruby + bundler are a soft skip (exit 2), matching the repo's
+        # optional-interpreter convention (scripts/_test_erb_render.sh).
+        for tool in ("ruby", "bundle"):
+            if shutil.which(tool) is None:
+                self.rep.skip(f"tool:{tool}", "not installed — BATS needs ruby 3.3+ and bundler")
+                self.soft_skip = True
+        if self.soft_skip:
+            print(self.rep.color.yellow(
+                "    ruby/bundler not installed — skipping BATS. "
+                "Install ruby 3.3+ (e.g. `brew install ruby`) and retry."
+            ))
+            return False
+
+        cfg_file = Path(self.args.config)
+        if not cfg_file.is_absolute():
+            cfg_file = REPO_ROOT / cfg_file
+        present = cfg_file.exists()
+        self.rep.record(
+            f"file:{self.args.config}", PASS if present else FAIL, 0.0,
+            "present" if present else "MISSING config",
+        )
+        ok = ok and present
+
+        vars_present = BOSH_VARS.exists() or self.dry_run
+        self.rep.record(
+            "file:manifests/bosh/vars.yml", PASS if vars_present else FAIL, 0.0,
+            "present" if vars_present else "MISSING (copy from vars.yml.example)",
+        )
+        ok = ok and vars_present
+
+        template_present = TEMPLATE_SRC.exists()
+        self.rep.record(
+            "file:manifests/bats/cloud_config_pve.yml.erb",
+            PASS if template_present else FAIL, 0.0,
+            "present" if template_present else "MISSING template",
+        )
+        ok = ok and template_present
+
+        if self.dry_run:
+            env_var, _ = _checkouts.UPSTREAMS[CHECKOUT_NAME]
+            override = os.environ.get(env_var, "").strip()
+            where = override or str(_checkouts.DEPS_DIR / CHECKOUT_NAME)
+            self.checkout = Path(where)
+            self.rep.record(
+                f"checkout:{CHECKOUT_NAME}", PASS, 0.0,
+                f"{where} (dry-run: clone/refresh skipped)",
+            )
+        else:
+            t0 = time.monotonic()
+            try:
+                self.checkout = _checkouts.checkout_dir(CHECKOUT_NAME)
+                self.rep.record(
+                    f"checkout:{CHECKOUT_NAME}", PASS, time.monotonic() - t0,
+                    str(self.checkout),
+                )
+            except SystemExit as exc:
+                self.rep.record(
+                    f"checkout:{CHECKOUT_NAME}", FAIL, time.monotonic() - t0, str(exc),
+                )
+                ok = False
+
+        if not ok:
+            return False
+
+        return self._preflight_director()
+
+    def _preflight_director(self) -> bool:
+        """The director must be reachable and idle: BATS gates every example
+        on `bosh tasks` showing nothing in flight, so a busy director would
+        hang the suite rather than fail it."""
+        if self.dry_run:
+            self.rep.record("director:reachable", PASS, 0.0, "dry-run")
+            self.rep.record("director:idle", PASS, 0.0, "dry-run")
+            self.rep.record("director:addons", PASS, 0.0, "dry-run")
+            return True
+
+        denv = self._director_env()
+        t0 = time.monotonic()
+        ok, out = self.runner.capture(
+            "bosh-env", ["bosh", "env", "--json"], env=denv, timeout=60,
+        )
+        detail = "unreachable"
+        if ok:
+            try:
+                rows = json.loads(out)["Tables"][0]["Rows"]
+                row = rows[0] if rows else {}
+                self.director_version = str(row.get("version", "")).split(" ")[0]
+                detail = f"{row.get('name', '?')} bosh {self.director_version}"
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                detail = "reachable (unparsed)"
+        if not self._record_inline("director:reachable", ok, t0, detail,
+                                   out.splitlines()[-20:] if not ok else None):
+            return False
+
+        t0 = time.monotonic()
+        ok, out = self.runner.capture(
+            "bosh-tasks", ["bosh", "tasks", "--json"], env=denv, timeout=60,
+        )
+        busy: list[str] = []
+        if ok:
+            try:
+                rows = json.loads(out)["Tables"][0]["Rows"]
+                busy = [
+                    str(r.get("description", ""))
+                    for r in rows
+                    if not str(r.get("description", "")).startswith("ssh: cleanup")
+                ]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                busy = ["could not parse bosh tasks output"]
+        else:
+            busy = ["bosh tasks failed"]
+        idle = not busy
+        if not self._record_inline(
+            "director:idle", idle, t0,
+            "no tasks in flight" if idle else f"{len(busy)} task(s) in flight",
+            busy if not idle else None,
+        ):
+            return False
+
+        return self._preflight_addons(denv)
+
+    @staticmethod
+    def _addon_rides_on_bat(addon: dict) -> bool:
+        exclude = addon.get("exclude") or {}
+        if "bat" in (exclude.get("deployments") or []):
+            return False
+        include = addon.get("include") or {}
+        inc_deps = include.get("deployments")
+        if inc_deps and "bat" not in inc_deps:
+            return False
+        stemcells = include.get("stemcell")
+        if stemcells and not any(
+            str(s.get("os", "")).startswith("ubuntu") for s in stemcells
+        ):
+            return False
+        return True
+
+    def _preflight_addons(self, denv: dict[str, str]) -> bool:
+        """Runtime-config addons must not ride on the bat deployment: the
+        `os`-tagged service configuration specs compare monit's full process
+        list against the job's own pid, so any addon that adds a monitored
+        process (bosh-dns, for one) fails them. Addons need
+        `exclude: {deployments: [bat]}`."""
+        t0 = time.monotonic()
+        riders: list[str] = []
+        parse_error = ""
+        ok, out = self.runner.capture(
+            "bosh-configs", ["bosh", "configs", "--json"], env=denv, timeout=60,
+        )
+        if not ok:
+            parse_error = "bosh configs failed"
+        else:
+            try:
+                rows = json.loads(out)["Tables"][0]["Rows"]
+                names = [r["name"] for r in rows if r.get("type") == "runtime"]
+                for name in names:
+                    ok2, out2 = self.runner.capture(
+                        f"bosh-config-{name}",
+                        ["bosh", "config", "--type", "runtime",
+                         "--name", name, "--json"],
+                        env=denv, timeout=60,
+                    )
+                    if not ok2:
+                        parse_error = f"could not read runtime config {name}"
+                        break
+                    content = json.loads(out2)["Tables"][0]["Rows"][0]["content"]
+                    doc = yaml.safe_load(content) or {}
+                    for addon in doc.get("addons") or []:
+                        if self._addon_rides_on_bat(addon):
+                            riders.append(f"{name}/{addon.get('name', '?')}")
+            except (json.JSONDecodeError, yaml.YAMLError, KeyError,
+                    IndexError, TypeError) as exc:
+                parse_error = f"could not parse runtime configs: {exc}"
+
+        if parse_error:
+            return self._record_inline("director:addons", False, t0, parse_error)
+
+        only = self.args.only or []
+        os_selected = ("os" in only) if only else ("os" not in self.excluded_tags())
+        if riders and os_selected:
+            return self._record_inline(
+                "director:addons", False, t0,
+                f"{len(riders)} addon(s) ride on the bat deployment",
+                [f"{r}: add `exclude: {{deployments: [bat]}}` to this addon "
+                 "(the os specs expect monit to monitor only the job's own "
+                 "process)" for r in riders],
+            )
+        if riders:
+            return self._record_inline(
+                "director:addons", True, t0,
+                f"{len(riders)} addon(s) ride on bat, but the os specs are "
+                "not selected",
+            )
+        return self._record_inline("director:addons", True, t0,
+                                   "no addon riders on the bat deployment")
+
+    # -- prepare ------------------------------------------------------------- #
+
+    def prepare(self) -> bool:
+        self.rep.section("prepare")
+        assert self.checkout is not None
+
+        # Patch the checkout: the PVE cloud-config template plus the junit
+        # formatter gem. Re-applied every run because _checkouts refresh
+        # resets tracked files to upstream HEAD.
+        t0 = time.monotonic()
+        self.rep.begin("patch:cloud-config-template")
+        dest = self.checkout / "templates" / f"cloud_config_{CPI_NAME}.yml.erb"
+        if self.dry_run:
+            print(f"    DRY-RUN: cp {TEMPLATE_SRC} {dest}")
+            self.rep.record("patch:cloud-config-template", PASS, 0.0, "dry-run")
+        else:
+            try:
+                shutil.copyfile(TEMPLATE_SRC, dest)
+            except OSError as exc:
+                return self._record_inline(
+                    "patch:cloud-config-template", False, t0, str(exc))
+            self._record_inline("patch:cloud-config-template", True, t0, str(dest))
+
+        t0 = time.monotonic()
+        self.rep.begin("patch:gemfile-junit-formatter")
+        gemfile = self.checkout / "Gemfile"
+        if self.dry_run:
+            print(f"    DRY-RUN: append rspec_junit_formatter to {gemfile}")
+            self.rep.record("patch:gemfile-junit-formatter", PASS, 0.0, "dry-run")
+        else:
+            try:
+                text = gemfile.read_text()
+                if "rspec_junit_formatter" not in text:
+                    gemfile.write_text(text.rstrip("\n") + "\n\ngem 'rspec_junit_formatter'\n")
+                    detail = "appended"
+                else:
+                    detail = "already present"
+            except OSError as exc:
+                return self._record_inline(
+                    "patch:gemfile-junit-formatter", False, t0, str(exc))
+            self._record_inline("patch:gemfile-junit-formatter", True, t0, detail)
+
+        # BATS's ssh helper passes only key_data, so Net::SSH fills the rest
+        # from its defaults: it reads ~/.ssh/config (whose IdentityFile
+        # entries become :keys, offered BEFORE key_data and NOT excluded by
+        # keys_only) and connects to any ssh-agent it can find (including an
+        # IdentityAgent named in that config, so hiding SSH_AUTH_SOCK is not
+        # enough). Enough extra identities trip the stemcell sshd's
+        # MaxAuthTries and disconnect examples with "Too many authentication
+        # failures". Restrict Net::SSH to exactly the key BATS was given:
+        # ignore the OpenSSH config, never use an agent, and offer only
+        # key_data.
+        t0 = time.monotonic()
+        self.rep.begin("patch:ssh-keys-only")
+        helper = self.checkout / "lib" / "bat" / "bosh_helper.rb"
+        anchor = "ssh_options[:key_data] = [options[:private_key]]"
+        inject = (
+            "\n      ssh_options[:keys_only] = true"
+            "\n      ssh_options[:config] = false"
+            "\n      ssh_options[:use_agent] = false"
+        )
+        if self.dry_run:
+            print(f"    DRY-RUN: patch keys_only/config/use_agent into {helper}")
+            self.rep.record("patch:ssh-keys-only", PASS, 0.0, "dry-run")
+        else:
+            try:
+                text = helper.read_text()
+                if "use_agent" in text:
+                    detail = "already present"
+                elif anchor not in text:
+                    raise RuntimeError(
+                        "key_data anchor not found in bosh_helper.rb")
+                else:
+                    helper.write_text(text.replace(anchor, anchor + inject, 1))
+                    detail = "patched"
+            except (OSError, RuntimeError) as exc:
+                return self._record_inline(
+                    "patch:ssh-keys-only", False, t0, str(exc))
+            self._record_inline("patch:ssh-keys-only", True, t0, detail)
+
+        ok, _ = self.runner.step(
+            "bundle:install", ["bundle", "install"],
+            env=self._bundle_env(), cwd=self.checkout, timeout=900,
+        )
+        if not ok:
+            return False
+
+        if not self._prepare_stemcell():
+            return False
+        return self._prepare_bat_yml()
+
+    def _prepare_stemcell(self) -> bool:
+        self.rep.begin("stemcell:resolve")
+        t0 = time.monotonic()
+        choice = self.args.stemcell
+        if self.dry_run:
+            self.stemcell_path = Path("<dry-run-stemcell.tgz>")
+            self.stemcell_name = "<dry-run>"
+            self.stemcell_version = "<dry-run>"
+            self.stemcell_mode = choice
+            print(f"    DRY-RUN: resolve stemcell ({choice})")
+            self.rep.record("stemcell:resolve", PASS, 0.0, "dry-run")
+            return True
+
+        try:
+            if choice == "light":
+                light = self._ensure_light_stemcell()
+                if light.create_env_tarball is None:
+                    raise RuntimeError("light stemcell build produced no tarball")
+                self.stemcell_path = Path(light.create_env_tarball)
+                self.stemcell_mode = f"light ({light.mode})"
+            else:
+                self.stemcell_path = Path(choice).expanduser()
+                if not self.stemcell_path.exists():
+                    raise RuntimeError(f"stemcell tarball not found: {self.stemcell_path}")
+                self.stemcell_mode = "tarball"
+            mf = stemcell_manifest(self.stemcell_path)
+            self.stemcell_name = str(mf.get("name", ""))
+            self.stemcell_version = str(mf.get("version", ""))
+            if not self.stemcell_name or not self.stemcell_version:
+                raise RuntimeError(f"stemcell.MF in {self.stemcell_path} lacks name/version")
+        except (RuntimeError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+            return self._record_inline("stemcell:resolve", False, t0, str(exc))
+        return self._record_inline(
+            "stemcell:resolve", True, t0,
+            f"{self.stemcell_name}/{self.stemcell_version} ({self.stemcell_mode})",
+        )
+
+    def _ensure_light_stemcell(self) -> "_lightstemcell.LightStemcell":
+        """Mirror scripts/bosh: derive the light stemcell from vars.yml with
+        env-bundle layering, ensure the qcow2 is on PVE, build the tarball."""
+        source_url = _bosh_int_opt(BOSH_VARS, "/stemcell_url")
+        source_sha1 = _bosh_int_opt(BOSH_VARS, "/stemcell_sha1")
+        if not source_url or not source_sha1:
+            raise RuntimeError(
+                "stemcell_url/stemcell_sha1 missing from manifests/bosh/vars.yml"
+            )
+        os_name, version = _lightstemcell.parse_os_version(source_url)
+        mode = (layered_var(self.env_name, "/light_stemcell_mode") or "preuploaded").strip()
+        fetch_url = (layered_var(self.env_name, "/stemcell_fetch_url") or "").strip()
+        token = (layered_var(self.env_name, "/stemcell_fetch_token") or "").strip()
+
+        def _reader(path: str) -> "str | None":
+            return layered_var(self.env_name, path)
+
+        cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_reader)
+        print(
+            f"    light stemcell ({mode}): ensuring {os_name} {version} "
+            f"is available on PVE (host {cpi_cfg['host']})"
+        )
+        return _lightstemcell.ensure_light_stemcell(
+            cpi_cfg=cpi_cfg,
+            mode=mode,
+            os_name=os_name,
+            version=version,
+            source_url=source_url,
+            source_sha1=source_sha1,
+            cache_dir=str(STEMCELL_CACHE),
+            image_url=(fetch_url or None),
+            token=(token or None),
+            build_create_env_tarball=True,
+        )
+
+    def _prepare_bat_yml(self) -> bool:
+        self.rep.begin("bat.yml:render")
+        t0 = time.monotonic()
+        if self.dry_run:
+            print("    DRY-RUN: ssh-keygen ephemeral keypair; render bat.yml")
+            self.rep.record("bat.yml:render", PASS, 0.0, "dry-run")
+            return True
+
+        key_path = self.run_dir / "bats_ssh"
+        try:
+            if not key_path.exists():
+                subprocess.run(
+                    ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "bats-ephemeral",
+                     "-f", str(key_path)],
+                    check=True, capture_output=True, text=True,
+                )
+            public_key = (self.run_dir / "bats_ssh.pub").read_text().strip()
+            private_key = key_path.read_text()
+
+            spec = build_bat_spec(
+                self.bcfg, self.stemcell_name, self.stemcell_version,
+                public_key, private_key,
+            )
+            bat_yml = self.run_dir / "bat.yml"
+            bat_yml.write_text(yaml.safe_dump(spec, default_flow_style=False, sort_keys=False))
+            bat_yml.chmod(0o600)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return self._record_inline("bat.yml:render", False, t0, str(exc))
+        return self._record_inline(
+            "bat.yml:render", True, t0,
+            f"{self.run_dir / 'bat.yml'} (static {self.bcfg['static_ip']}, "
+            f"second {self.bcfg['second_static_ip']})",
+        )
+
+    # -- run ----------------------------------------------------------------- #
+
+    def excluded_tags(self) -> dict[str, str]:
+        excluded: dict[str, str] = {}
+        if not self.args.no_default_excludes:
+            excluded.update(DEFAULT_EXCLUDED_TAGS)
+        for tag in self.bcfg["exclude_tags"]:
+            excluded.setdefault(tag, "excluded via ci/integration.yml bats.exclude_tags")
+        for tag in self.args.exclude or []:
+            excluded.setdefault(tag, "excluded via --exclude")
+        return excluded
+
+    def run_rspec(self) -> bool:
+        self.rep.section("bats (rspec)")
+        assert self.checkout is not None
+        self.excluded = self.excluded_tags()
+
+        # A command-line --format replaces the .rspec one rather than adding
+        # to it, so name both: the checkout's verbose formatter keeps
+        # per-example lines in the console stream, and the junit formatter
+        # writes the spec-level XML (--out binds to the preceding --format).
+        argv = [
+            "bundle", "exec", "rspec", "spec/system",
+            "--require", "./spec/system/support/bats_verbose_formatter.rb",
+            "--format", "BatsVerboseFormatter",
+            "--format", "RspecJunitFormatter",
+            "--out", str(self.run_dir / JUNIT_RSPEC),
+        ]
+        for tag in sorted(self.excluded):
+            argv += ["--tag", f"~{tag}"]
+        for tag in self.args.only or []:
+            argv += ["--tag", tag]
+        if self.args.fail_fast:
+            argv.append("--fail-fast")
+
+        env = dict(self._bundle_env())
+        env.update(self._director_env())
+        env.update({
+            "BAT_STEMCELL": str(self.stemcell_path),
+            "BAT_DEPLOYMENT_SPEC": str(self.run_dir / "bat.yml"),
+            "BAT_BOSH_CLI": shutil.which("bosh") or "bosh",
+            "BAT_INFRASTRUCTURE": CPI_NAME,
+        })
+        if self.args.keep:
+            env["BAT_DEBUG_MODE"] = "1"
+
+        # BATS's Net::SSH helper offers every ssh-agent identity before the
+        # run's ephemeral key; a loaded agent trips sshd's MaxAuthTries and
+        # examples fail with "Too many authentication failures". Hide the
+        # agent so the ephemeral key is the only identity offered. bosh ssh
+        # is unaffected: the CLI passes explicit -o IdentityFile/-o
+        # IdentitiesOnly=yes options.
+        env.pop("SSH_AUTH_SOCK", None)
+
+        ok, _ = self.runner.step(
+            "bats:rspec", argv, env=env, cwd=self.checkout,
+            timeout=self.bcfg["rspec_timeout_s"],
+        )
+        self.rspec_rc = 0 if ok else 1
+        return ok
+
+    # -- finalize ------------------------------------------------------------ #
+
+    def finalize(self, rspec_ok: bool) -> bool:
+        self.rep.section("finalize")
+        ok = True
+
+        # BATS replaced the director's cloud config with its own generated
+        # one; put the env's cloud config back so the lab is usable again.
+        restore_ok, _ = self.runner.step(
+            "director:restore-cloud-config", [BOSH_SCRIPT, "ucc"], timeout=300,
+        )
+        ok = ok and restore_ok
+
+        if self.args.skip_doc or self.dry_run:
+            self.rep.skip("docs:report", "--skip-doc" if self.args.skip_doc else "dry-run")
+            return ok
+
+        t0 = time.monotonic()
+        self.rep.begin("docs:report")
+        try:
+            rspec = parse_rspec_junit(self.run_dir / JUNIT_RSPEC)
+            meta = self._run_meta(rspec, rspec_ok)
+            phases = [
+                {"name": n, "seconds": s}
+                for n, s in self.rep.sections_snapshot()
+            ]
+            steps = [
+                {"name": r.name, "status": r.status, "seconds": r.seconds}
+                for r in self.rep.results
+            ]
+            doc = write_run_doc(meta, rspec, phases=phases, steps=steps)
+            summary = write_summary_doc()
+        except (OSError, ValueError) as exc:
+            return self._record_inline("docs:report", False, t0, str(exc)) and ok
+        ok_doc = self._record_inline("docs:report", True, t0, f"{doc} + {summary}")
+        return ok and ok_doc
+
+    def _run_meta(self, rspec: "dict | None", rspec_ok: bool) -> dict:
+        started = _dt.datetime.fromtimestamp(self.rep.started)
+        now = _dt.datetime.now()
+        wall = time.time() - self.rep.started
+
+        ok, out = self.runner.capture(
+            "git-describe",
+            ["git", "describe", "--tags", "--always", "--dirty"], timeout=30,
+        )
+        cpi_version = out.strip() if ok else "unknown"
+
+        bats_ref = "unknown"
+        if self.checkout is not None:
+            ok, out = self.runner.capture(
+                "bats-ref", ["git", "-C", str(self.checkout), "rev-parse", "--short", "HEAD"],
+                timeout=30,
+            )
+            if ok:
+                bats_ref = out.strip()
+
+        ok, out = self.runner.capture("ruby-version", ["ruby", "--version"], timeout=30)
+        ruby_version = out.strip().split(" (")[0] if ok else "unknown"
+
+        pve_version = "unknown"
+        try:
+            cpi_cfg = _integration.build_cpi_config(self.cfg, dry_run=False)
+            data = _integration.pve_api_get(cpi_cfg, "/version")
+            if isinstance(data, dict) and data.get("version"):
+                pve_version = str(data["version"])
+        except (RuntimeError, SystemExit, ValueError):
+            pass
+
+        if rspec is None:
+            verdict = "FAILED" if not rspec_ok else "UNKNOWN"
+        elif rspec_ok and rspec["failures"] == 0 and rspec["errors"] == 0:
+            verdict = "PASSED"
+        else:
+            verdict = "FAILED"
+
+        flags: list[str] = []
+        if self.args.env:
+            flags.append(f"--env {self.env_name}")
+        if self.args.stemcell != "light":
+            flags.append(f"--stemcell {self.args.stemcell}")
+
+        return {
+            "date": started.strftime("%Y-%m-%d"),
+            "started": started.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "wall_hms": fmt_hms(wall),
+            "command_line": "./scripts/bats run " + " ".join(flags),
+            "exit_code": self.rspec_rc if self.rspec_rc is not None else 1,
+            "verdict": verdict,
+            "examples": rspec["tests"] if rspec else None,
+            "failures": (rspec["failures"] + rspec["errors"]) if rspec else None,
+            "skipped": rspec["skipped"] if rspec else None,
+            "cpi_version": cpi_version,
+            "bats_ref": bats_ref,
+            "director_version": self.director_version or "unknown",
+            "stemcell": f"{self.stemcell_name}/{self.stemcell_version}",
+            "stemcell_mode": self.stemcell_mode,
+            "pve_version": pve_version,
+            "ruby_version": ruby_version,
+            "env": self.env_name,
+            "excluded_tags": sorted(self.excluded),
+            "excluded_reasons": self.excluded,
+        }
+
+    # -- orchestration ------------------------------------------------------- #
+
+    def dispatch(self) -> bool:
+        if not self.preflight():
+            return False
+        if not self.prepare():
+            return False
+        rspec_ok = self.run_rspec()
+        finalize_ok = self.finalize(rspec_ok)
+        return rspec_ok and finalize_ok
+
+    def close(self) -> None:
+        if self.console_fh is not None:
+            self.console_fh.close()
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def cmd_report(args: argparse.Namespace, color: Color) -> int:
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_absolute():
+        results_dir = REPO_ROOT / results_dir
+    latest = results_dir / "latest.json"
+    if not latest.exists():
+        print(f"no prior run found at {latest}", file=sys.stderr)
+        return 1
+    data = json.loads(latest.read_text())
+    print(color.bold("=" * 64))
+    print(color.bold(f"  LAST RUN — command: {data['command']}   ({data['started']})"))
+    print(color.bold("=" * 64))
+    for r in data["results"]:
+        tag = {
+            PASS: color.green(f"[{PASS} {r['seconds']:6.1f}s]"),
+            FAIL: color.red(f"[{FAIL} {r['seconds']:6.1f}s]"),
+            SKIP: color.yellow(f"[{SKIP}]"),
+        }[r["status"]]
+        suffix = f"  {color.dim(r['detail'])}" if r["detail"] else ""
+        print(f"    {tag} {r['name']}{suffix}")
+    t = data["totals"]
+    total_s = data["total_seconds"]
+    print(color.bold("-" * 64))
+    print(f"  {color.green(str(t['pass']) + ' pass')}"
+          f"  {color.red(str(t['fail']) + ' fail')}"
+          f"  {color.yellow(str(t['skip']) + ' skip')}"
+          f"   total {total_s:.1f}s{paren_hms(total_s)}")
+    return int(data["exit"])
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="scripts/bats",
+        description="BOSH Acceptance Tests (BATS) runner for the PVE lab.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "command", nargs="?", default="run",
+        choices=["run", "report", "help"],
+        help="command to run (default: run)",
+    )
+    p.add_argument("--config", default=DEFAULT_CONFIG)
+    p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV", "cpitest"))
+    p.add_argument("--stemcell", default="light",
+                   help="'light' or a path to a stemcell .tgz (default: light)")
+    p.add_argument("--exclude", action="append", default=[], metavar="TAG")
+    p.add_argument("--no-default-excludes", action="store_true")
+    p.add_argument("--only", action="append", default=[], metavar="TAG")
+    p.add_argument("--fail-fast", action="store_true")
+    p.add_argument("--keep", action="store_true",
+                   help="BAT_DEBUG_MODE: fail fast, keep failed state for post-mortem")
+    p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    p.add_argument("--skip-doc", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    color_enabled = (
+        not args.no_color
+        and sys.stdout.isatty()
+        and os.environ.get("NO_COLOR") is None
+    )
+    color = Color(color_enabled)
+
+    if args.command == "help":
+        parser.print_help()
+        return 0
+    if args.command == "report":
+        return cmd_report(args, color)
+
+    rep = Reporter(color, args.command, args.dry_run, label="BATS")
+    print(color.bold(
+        f"bats: command={args.command} env={args.env} config={args.config}"
+        + ("  [DRY-RUN]" if args.dry_run else "")
+    ))
+
+    interrupted = False
+    bats: "BATS | None" = None
+    try:
+        bats = BATS(args, rep)
+        bats.dispatch()
+    except KeyboardInterrupt:
+        interrupted = True
+        print(color.red("\ninterrupted — writing partial results"), file=sys.stderr)
+    except SystemExit as exc:
+        # _integration.load_config and friends signal fatal config errors via
+        # sys.exit(<message>). Capture as a FAIL row so the summary + artifacts
+        # are still written instead of exiting silently before any report.
+        msg = str(exc.code) if exc.code not in (None, 0) else "exited"
+        rep.record("config-error", FAIL, 0.0, msg, [msg])
+    except Exception as exc:  # noqa: BLE001 — top-level guard: report, never crash silently
+        rep.record("internal-error", FAIL, 0.0, str(exc), [repr(exc)])
+    finally:
+        if bats is not None:
+            bats.close()
+
+    results_dir = Path(args.results_dir)
+    if not results_dir.is_absolute():
+        results_dir = REPO_ROOT / results_dir
+    rep.summary()
+    try:
+        rep.write_artifacts(results_dir, junit_name=JUNIT_STEPS)
+    except OSError as exc:
+        print(color.red(f"could not write artifacts: {exc}"), file=sys.stderr)
+
+    if interrupted:
+        return 130
+    if bats is not None and bats.soft_skip:
+        return 2
+    return rep.exit_code()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -113,6 +113,14 @@ coverage-check: coverage ## Fail if total line coverage < $(COVERAGE_THRESHOLD)%
 	fi
 	@echo "$(GREEN)✓ Coverage threshold met$(RESET)"
 
+.PHONY: bats
+bats: ## Run the BOSH Acceptance Tests against the configured PVE lab (see docs/bats.md)
+	@if command -v ruby >/dev/null 2>&1 && command -v bundle >/dev/null 2>&1; then \
+		./scripts/bats run; \
+	else \
+		echo "$(YELLOW)ruby/bundler not installed — skipping BATS. Install ruby 3.3+ (e.g. brew install ruby)$(RESET)"; \
+	fi
+
 ##@ Code Quality
 
 .PHONY: fmt
@@ -349,7 +357,7 @@ docs-intro-overview-html: ## Compile docs/intro-overview/*.md into a single docs
 clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 	@echo "$(GREEN)✓ Clean complete$(RESET)"
 
-.PHONY: help build install tidy test coverage coverage-html coverage-check fmt vet lint \
+.PHONY: help build install tidy test coverage coverage-html coverage-check bats fmt vet lint \
         staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean \
         slides-architecture slides-architecture-export slides-architecture-build \
