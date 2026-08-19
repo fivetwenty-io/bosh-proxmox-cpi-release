@@ -25,7 +25,7 @@ A custom image that bundles all of these tools is required for the integration j
 | `cf` | 8.0.0 | https://github.com/cloudfoundry/cli/releases |
 | `credhub` | 2.9.0 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
 | `uv` | 0.4.0 | https://github.com/astral-sh/uv/releases (or `curl -LsSf https://astral.sh/uv/install.sh`) |
-| `go` | 1.26.5 | https://go.dev/dl/ (must match `src/pve_cpi/go.mod`) |
+| `go` | 1.26.6 | https://go.dev/dl/ (must match `src/pve_cpi/go.mod`) |
 | `make` | 4.3 | System package (`apt-get install make`) |
 | `jq` | 1.6 | System package (`apt-get install jq`) |
 | `curl` | 7.88 | System package (`apt-get install curl`) |
@@ -45,7 +45,7 @@ This multi-stage Dockerfile pins every binary version so CI runs are reproducibl
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 ARG BOSH_CLI_VERSION=7.9.6
 ARG CF_CLI_VERSION=8.9.0
 ARG CREDHUB_CLI_VERSION=2.9.45
@@ -124,7 +124,7 @@ Build and push the image:
 
 ```
 docker build \
-  --build-arg GO_VERSION=1.26.5 \
+  --build-arg GO_VERSION=1.26.6 \
   --build-arg BOSH_CLI_VERSION=7.9.6 \
   --build-arg CF_CLI_VERSION=8.9.0 \
   --build-arg CREDHUB_CLI_VERSION=2.9.45 \
@@ -179,7 +179,7 @@ BOSH CLI version 7.9.6-...
 cf version 8.9.0+...
 credhub 2.9.45
 uv 0.4.30 (...)
-go version go1.26.5 linux/amd64
+go version go1.26.6 linux/amd64
 GNU Make 4.3
 ```
 

@@ -23,6 +23,17 @@ LDFLAGS := -X '$(PKG).Version=$(VERSION)' \
 
 COVERAGE_THRESHOLD := 80
 
+# Set REQUIRE_TOOLS=1 (CI does) to make a missing staticcheck, govulncheck,
+# gosec, or trivy a hard failure instead of a skip, so a broken install step
+# cannot quietly turn a gate into a no-op.
+REQUIRE_TOOLS ?= 0
+define require_tool
+	if [ "$(REQUIRE_TOOLS)" = "1" ]; then \
+		echo "$(RED)✗ $(1) is required (REQUIRE_TOOLS=1) but not installed$(RESET)"; \
+		exit 1; \
+	fi
+endef
+
 # BOSH release packaging
 RELEASE_NAME := bosh-pve-cpi
 # Tarballs are written under dev_releases/ (dev) or releases/ (final), never at the repo root.
@@ -39,11 +50,11 @@ GO_SOURCES := $(shell find $(SRC_ROOT) -type f -name '*.go' -not -path '*/vendor
 
 # BOSH release blob config
 BLOBS_DIR    := blobs
-GO_BLOB_VER  := 1.26.5
+GO_BLOB_VER  := 1.26.6
 GO_BLOB_NAME := go$(GO_BLOB_VER).linux-amd64.tar.gz
 GO_BLOB_KEY  := golang-1.26/$(GO_BLOB_NAME)
 GO_BLOB_URL  := https://dl.google.com/go/$(GO_BLOB_NAME)
-GO_BLOB_SHA  := 5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+GO_BLOB_SHA  := 708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
 
 ##@ General
 
@@ -157,7 +168,7 @@ lint: ## Run golangci-lint (binary if installed, else go run @pinned version)
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		cd $(SRC_ROOT) && golangci-lint run --timeout=5m ./...; \
 	else \
-		cd $(SRC_ROOT) && go run github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run --timeout=5m ./...; \
+		cd $(SRC_ROOT) && go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run --timeout=5m ./...; \
 	fi
 	@echo "$(GREEN)✓ Lint passed$(RESET)"
 
@@ -168,11 +179,25 @@ staticcheck: ## Run staticcheck (skip with notice if not installed)
 		(cd $(SRC_ROOT) && staticcheck ./...) || exit 1; \
 		echo "$(GREEN)✓ Staticcheck passed$(RESET)"; \
 	else \
+		$(call require_tool,staticcheck); \
 		echo "$(YELLOW)staticcheck not installed — skipping. Install: go install honnef.co/go/tools/cmd/staticcheck@latest$(RESET)"; \
 	fi
 
+.PHONY: go-blob-check
+go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchain requirement
+	@echo "$(GREEN)Checking Go blob against go.mod...$(RESET)"
+	@required=$$(awk '/^go [0-9]/ {print $$2; exit}' $(SRC_ROOT)/go.mod); \
+	oldest=$$(printf '%s\n%s\n' "$${required}" "$(GO_BLOB_VER)" | sort -V | head -1); \
+	if [ "$${required}" != "$(GO_BLOB_VER)" ] && [ "$${oldest}" = "$(GO_BLOB_VER)" ]; then \
+		echo "$(RED)✗ go.mod requires go $${required} but the packaged blob is $(GO_BLOB_VER)$(RESET)"; \
+		echo "$(RED)  BOSH compilation pins GOTOOLCHAIN=local, so the package build fails on a compile VM.$(RESET)"; \
+		echo "$(RED)  Bump GO_BLOB_VER (and packages/golang-1.26/*) to $${required}, then run 'make download-blobs upload-blobs'.$(RESET)"; \
+		exit 1; \
+	fi; \
+	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
+
 .PHONY: check
-check: fmt-check vet staticcheck lint coverage-check test ## Run fmt-check, vet, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
+check: fmt-check vet go-blob-check staticcheck lint coverage-check test ## Run fmt-check, vet, go-blob-check, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security
@@ -184,6 +209,7 @@ govulncheck: ## Run govulncheck for dependency vulnerabilities
 		(cd $(SRC_ROOT) && govulncheck ./...) || { echo "$(RED)✗ govulncheck found vulnerabilities$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ govulncheck passed$(RESET)"; \
 	else \
+		$(call require_tool,govulncheck); \
 		echo "$(YELLOW)govulncheck not installed — skipping. Install: go install golang.org/x/vuln/cmd/govulncheck@latest$(RESET)"; \
 	fi
 
@@ -194,6 +220,7 @@ gosec: ## Run gosec security scanner
 		(cd $(SRC_ROOT) && gosec -quiet -fmt text ./...) || { echo "$(RED)✗ gosec found issues$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ gosec passed$(RESET)"; \
 	else \
+		$(call require_tool,gosec); \
 		echo "$(YELLOW)gosec not installed — skipping. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)"; \
 	fi
 
@@ -213,6 +240,7 @@ trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if 
 		trivy fs --severity HIGH,CRITICAL --exit-code 1 $(TRIVY_SKIP) . || { echo "$(RED)✗ trivy found HIGH/CRITICAL CVEs$(RESET)"; exit 1; }; \
 		echo "$(GREEN)✓ trivy passed$(RESET)"; \
 	else \
+		$(call require_tool,trivy); \
 		echo "$(YELLOW)trivy not installed — skipping. Install: https://trivy.dev/latest/getting-started/installation/$(RESET)"; \
 	fi
 
