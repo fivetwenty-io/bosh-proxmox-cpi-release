@@ -10,6 +10,7 @@ updates:
       day: monday
     commit-message:
       prefix: "fix(deps)"
+    open-pull-requests-limit: 10
     groups:
       go-minor-patch:
         update-types: ["minor", "patch"]
@@ -27,9 +28,13 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Slidev presentation tooling only; no runtime dependencies.
+  # Slidev presentation tooling only; no runtime dependencies. Each deck
+  # carries its own package.json alongside the repository-root one.
   - package-ecosystem: npm
-    directory: /
+    directories:
+      - /
+      - /docs/architecture
+      - /docs/intro-overview
     schedule:
       interval: monthly
     commit-message:

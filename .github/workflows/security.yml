@@ -1,16 +1,28 @@
 name: Security
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   security:
     name: Security Scans
     runs-on: self-hosted
+    timeout-minutes: 30
+    # Fork pull requests must not run untrusted code on a self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Digest-pinned golang:1.26 (self-hosted runner has no build tools on the host)
       image: golang:1.26@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6
@@ -31,10 +43,10 @@ jobs:
           cache-dependency-path: src/pve_cpi/go.sum
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.26.1
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
 
       - name: Install trivy
         # SHA-pinned: upstream deletes old tags (v0.2.0 vanished and broke scheduled runs)
@@ -43,4 +55,6 @@ jobs:
           version: v0.74.0
 
       - name: Run security scans
-        run: make security
+        # REQUIRE_TOOLS makes a missing scanner a failure rather than
+        # a skip, so a broken install step cannot silently pass the gate.
+        run: make security REQUIRE_TOOLS=1

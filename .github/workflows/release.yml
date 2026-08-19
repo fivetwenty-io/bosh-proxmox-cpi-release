@@ -26,6 +26,7 @@ jobs:
     name: Build and Publish
     needs: check
     runs-on: self-hosted
+    timeout-minutes: 45
     container:
       # Digest-pinned golang:1.26 (self-hosted runner has no build tools on the host)
       image: golang:1.26@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6
@@ -151,7 +152,7 @@ jobs:
           SHA256: ${{ steps.build.outputs.sha256 }}
         run: |
           set -euo pipefail
-          cat > /tmp/release-notes.md <<EOF
+          cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
           BOSH release tarball for the Proxmox VE CPI.
 
           Reference it from a deployment manifest:
@@ -164,7 +165,7 @@ jobs:
             sha1: sha256:${SHA256}
           \`\`\`
           EOF
-          ARGS=(--verify-tag --title "${RELEASE_NAME} ${VERSION}" --notes-file /tmp/release-notes.md --generate-notes)
+          ARGS=(--verify-tag --title "${RELEASE_NAME} ${VERSION}" --notes-file "${RUNNER_TEMP}/release-notes.md" --generate-notes)
           if [[ "${PRERELEASE}" == "true" ]]; then
             ARGS+=(--prerelease)
           fi
