@@ -34,6 +34,10 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Smoke-testing with `emptyvm`](emptyvm.md): Minimal post-deploy deployment that exercises the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent handshake).
 
+- [Running BATS](bats.md): How we run the upstream BOSH Acceptance Tests against a PVE lab with `./scripts/bats`, including configuration, the tag exclusion policy, and report generation.
+
+- [BATS results](bats/README.md): The committed record of BATS runs, with the latest verdict, environment tuple, and per-run reports.
+
 - [PVE API Permissions](pve-api-permissions.md): Creating the API token and a minimum-privilege `bosh@pve` user with a custom `BoshOperator` role, plus the per-method privilege inventory.
 
 - [PVE Per-Storage Lockfile Behaviour](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.

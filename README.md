@@ -155,6 +155,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | `make coverage-html` | Write HTML coverage report to `src/pve_cpi/coverage.html` |
 | `make coverage-check` | Fail if total line coverage falls below `COVERAGE_THRESHOLD` |
 | `make check` | Run `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` |
+| `make bats` | Run the BOSH Acceptance Tests against the configured PVE lab |
 | `make fmt` | Format all Go sources with `gofmt` |
 | `make lint` | Run `golangci-lint` (pinned version via `go run` fallback) |
 | `make security` | Run `govulncheck` and `gosec` |
@@ -187,6 +188,17 @@ export STEMCELL_PATH=/path/to/bosh-stemcell-*.tgz
 
 See [CPI certification](docs/bosh-cpi-certification.md) for the full prerequisites list, config schema, supported environment overrides, and the upstream Concourse certification path.
 
+## BOSH Acceptance Tests (BATS)
+
+The CPI passes the [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests), the CloudFoundry community's acceptance suite for BOSH directors and CPIs: real deploys, recreates, persistent disk lifecycles, cloud-check resolutions, manual networking with static IP changes, and the stemcell agent contract, all against a live director on a PVE cluster. Committed run reports with the exact versions, tag exclusions, and per-example results live in [docs/bats/](docs/bats/README.md).
+
+```bash
+make bats                        # full suite against the configured lab
+./scripts/bats run --env <env>   # explicit env bundle selection
+```
+
+See [Running BATS](docs/bats.md) for prerequisites, configuration, the tag exclusion policy, and how run reports are recorded.
+
 ## Troubleshooting
 
 For symptom-first triage of deployment, VM creation, disk attachment, network, and stemcell failures, see the [troubleshooting guide](docs/troubleshooting.md). Common starting points:
@@ -213,6 +225,12 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 
 - [Best practices](docs/best-practices.md)
   PVE and BOSH best practices, and how the CPI meets, exceeds, or makes each one configurable.
+
+- [Running BATS](docs/bats.md)
+  How the BOSH Acceptance Tests run against a PVE lab, and the tag exclusion policy.
+
+- [BATS results](docs/bats/README.md)
+  Committed run reports with versions, exclusions, and per-example results.
 
 - [Troubleshooting](docs/troubleshooting.md)
   Symptom-first failure triage.
