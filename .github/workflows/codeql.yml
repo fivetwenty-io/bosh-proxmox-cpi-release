@@ -43,7 +43,10 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: src/pve_cpi/go.mod
-          cache-dependency-path: src/pve_cpi/go.sum
+          # This job runs on the host, where ~/go/pkg/mod persists between
+          # jobs. Restoring the action's cache over it fails in tar against
+          # Go's read-only module cache, and buys nothing.
+          cache: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
