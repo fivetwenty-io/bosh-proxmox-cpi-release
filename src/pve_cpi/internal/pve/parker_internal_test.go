@@ -539,4 +539,3 @@ func TestParkerWindowBudget(t *testing.T) {
 		t.Errorf("budget(1ms) = %v, want 1s floor", got)
 	}
 }
-

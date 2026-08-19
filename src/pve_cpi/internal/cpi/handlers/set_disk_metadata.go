@@ -224,7 +224,6 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")
 	}
 
-
 	type resourceEntry struct {
 		VMID int64  `json:"vmid"`
 		Node string `json:"node"`
