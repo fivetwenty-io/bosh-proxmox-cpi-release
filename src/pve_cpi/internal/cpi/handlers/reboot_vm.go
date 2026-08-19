@@ -13,7 +13,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // HandleRebootVM returns a handler for the reboot_vm CPI method.

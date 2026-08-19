@@ -15,8 +15,8 @@ import (
 	"strconv"
 	"strings"
 
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )

@@ -7,14 +7,14 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )

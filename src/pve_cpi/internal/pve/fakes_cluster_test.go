@@ -5,7 +5,7 @@ package pve
 import (
 	"context"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // fakeClusterService embeds the real generated interface (nil) and overrides

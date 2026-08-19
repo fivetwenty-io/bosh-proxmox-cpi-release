@@ -12,10 +12,10 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
 // ---------------------------------------------------------------------------

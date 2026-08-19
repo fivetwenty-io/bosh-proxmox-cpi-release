@@ -36,7 +36,7 @@ Packages are grouped by role. Each is described in one sentence.
 
 ### PVE and stemcell transport
 
-- `internal/pve` — wraps `github.com/fivetwenty-io/pve-apiclient-go/v3`: VM, disk, network, and storage CRUD, task UPID polling, retry and backoff, pushback detection, the cluster pool lock, SDN apply, the foreign-disk guard, and SDK-error normalization.
+- `internal/pve` — wraps `github.com/fivetwenty-io/proxmox-apiclient-go/v3`: VM, disk, network, and storage CRUD, task UPID polling, retry and backoff, pushback detection, the cluster pool lock, SDN apply, the foreign-disk guard, and SDK-error normalization.
 
 - `internal/pve/stemcell_fetch` — resolves and fetches a stemcell image from `https://`, `s3://`, `bosh+blobstore:`, or `oci://`, then extracts and uploads it. Per-node template replication lives in `internal/cpi/handlers` (`create_stemcell`), not here.
 

@@ -1,0 +1,176 @@
+// Package qemu is a hand-written convenience layer over a focused subset of
+// the PVE /nodes/{node}/qemu endpoints (create, config, status, lifecycle,
+// clone, disk attach/detach/resize, snapshots). It trades the generated
+// packages' full parameter and response typing for a smaller, opinionated
+// surface built around map[string]interface{}.
+//
+// The complete typed API for QEMU VMs — every parameter, every response
+// field, every endpoint under /nodes/{node}/qemu — lives in the generated
+// package github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes. Prefer
+// this package for common lifecycle operations (create, start, stop, clone,
+// snapshot) where the narrower surface reads more directly; reach for
+// pkg/api/nodes when you need a parameter or response field this package
+// does not expose, or when you want compile-time-checked request/response
+// types.
+package qemu
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+)
+
+// Service defines QEMU VM helpers.
+type Service interface {
+	Create(ctx context.Context, node string, params map[string]interface{}) (string, error)
+	Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error)
+	Start(ctx context.Context, node string, vmid int) (string, error)
+	Stop(ctx context.Context, node string, vmid int) (string, error)
+	Reset(ctx context.Context, node string, vmid int) (string, error)
+	Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error)
+	Template(ctx context.Context, node string, vmid int) (string, error)
+	AttachDisk(ctx context.Context, node string, vmid int, volid string, bus string, opts *AttachOpts) (string, error)
+	DetachDisk(ctx context.Context, node string, vmid int, diskID string) error
+	ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
+	Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (string, error)
+	DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error
+	ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error)
+	RollbackSnapshot(ctx context.Context, node string, vmid int, name string) (string, error)
+}
+
+type service struct {
+	c client.Client
+}
+
+// New returns a new QEMU service.
+//
+//nolint:ireturn // Factory pattern - returns interface to encapsulate implementation and enable mocking
+func New(c client.Client) Service { return &service{c: c} }
+
+func (s *service) Create(ctx context.Context, node string, params map[string]interface{}) (string, error) {
+	data, err := s.c.PostCtx(ctx, fmt.Sprintf("/nodes/%s/qemu", url.PathEscape(node)), params)
+	if err != nil {
+		return "", fmt.Errorf("failed to create VM: %w", err)
+	}
+
+	if upid, ok := data.(string); ok {
+		return upid, nil
+	}
+
+	if m, ok := data.(map[string]interface{}); ok {
+		if v, ok := m["upid"].(string); ok {
+			return v, nil
+		}
+	}
+
+	return "", nil
+}
+
+func (s *service) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/config", url.PathEscape(node), vmid), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VM config: %w", err)
+	}
+
+	if m, ok := data.(map[string]interface{}); ok {
+		return m, nil
+	}
+
+	return map[string]interface{}{}, nil
+}
+
+func (s *service) Status(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/current", url.PathEscape(node), vmid), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VM status: %w", err)
+	}
+
+	if m, ok := data.(map[string]interface{}); ok {
+		return m, nil
+	}
+
+	return map[string]interface{}{}, nil
+}
+
+func (s *service) Start(ctx context.Context, node string, vmid int) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/start", url.PathEscape(node), vmid), nil)
+}
+func (s *service) Stop(ctx context.Context, node string, vmid int) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/stop", url.PathEscape(node), vmid), nil)
+}
+func (s *service) Reset(ctx context.Context, node string, vmid int) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/status/reset", url.PathEscape(node), vmid), nil)
+}
+func (s *service) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/clone", url.PathEscape(node), vmid), params)
+}
+func (s *service) Template(ctx context.Context, node string, vmid int) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/template", url.PathEscape(node), vmid), nil)
+}
+
+func (s *service) Snapshot(ctx context.Context, node string, vmid int, name string, opts map[string]interface{}) (string, error) {
+	// Copy into a fresh map so the caller's opts are not mutated as a side effect.
+	params := make(map[string]interface{}, len(opts)+1)
+	for k, v := range opts {
+		params[k] = v
+	}
+
+	params["snapname"] = name
+
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", url.PathEscape(node), vmid), params)
+}
+
+func (s *service) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
+	_, err := s.c.DeleteCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s", url.PathEscape(node), vmid, url.PathEscape(name)), nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete snapshot: %w", err)
+	}
+
+	return nil
+}
+
+func (s *service) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+	data, err := s.c.GetCtx(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot", url.PathEscape(node), vmid), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list snapshots for VM %d on node %q: %w", vmid, node, err)
+	}
+	// PVE returns a list; normalize to []map[string]interface{}
+	if list, ok := data.([]interface{}); ok {
+		out := make([]map[string]interface{}, 0, len(list))
+		for _, it := range list {
+			if m, ok := it.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
+		}
+
+		return out, nil
+	}
+
+	return []map[string]interface{}{}, nil
+}
+
+func (s *service) RollbackSnapshot(ctx context.Context, node string, vmid int, name string) (string, error) {
+	return s.postUPID(ctx, fmt.Sprintf("/nodes/%s/qemu/%d/snapshot/%s/rollback", url.PathEscape(node), vmid, url.PathEscape(name)), nil)
+}
+
+func (s *service) postUPID(ctx context.Context, path string, params map[string]interface{}) (string, error) {
+	data, err := s.c.PostCtx(ctx, path, params)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute QEMU operation: %w", err)
+	}
+
+	if upid, ok := data.(string); ok {
+		return upid, nil
+	}
+
+	if m, ok := data.(map[string]interface{}); ok {
+		if v, ok := m["upid"].(string); ok {
+			return v, nil
+		}
+	}
+
+	return "", nil
+}

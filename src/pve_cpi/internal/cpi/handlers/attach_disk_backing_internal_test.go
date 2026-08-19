@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 )
 
 // backingListerFromEntries adapts a slice of row maps to pve.StorageLister.

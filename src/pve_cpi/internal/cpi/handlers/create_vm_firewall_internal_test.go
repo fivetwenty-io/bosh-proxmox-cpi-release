@@ -10,9 +10,9 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
 // fwClusterStubWithFirewall is a compile-time reminder that fwClusterStub already

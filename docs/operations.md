@@ -672,9 +672,9 @@ Collect the following before opening an issue.
 /var/vcap/jobs/pve_cpi/bin/cpi --version
 # Output format: "bosh-pve-cpi <version> (<commit>, built <date>)"
 
-# pve-apiclient-go version — in the release source
-grep pve-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod
-# Current release: v3.2.7
+# proxmox-apiclient-go version — in the release source
+grep proxmox-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod
+# Current release: v3.8.5
 
 # PVE version — on the PVE host
 pveversion -v

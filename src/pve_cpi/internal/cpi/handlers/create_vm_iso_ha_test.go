@@ -11,7 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 )
 
 // isoHAGroupEnv builds a minimal env map that instanceGroupName resolves to

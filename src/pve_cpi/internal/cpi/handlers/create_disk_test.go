@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -18,7 +18,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // mockStorageService is defined in testmocks_test.go (canonical taxonomy).

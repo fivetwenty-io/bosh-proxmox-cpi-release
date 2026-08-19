@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------

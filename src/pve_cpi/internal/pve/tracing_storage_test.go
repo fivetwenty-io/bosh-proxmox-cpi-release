@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
 )
 
 // storageCredentialErr is the shared error used across every error-path

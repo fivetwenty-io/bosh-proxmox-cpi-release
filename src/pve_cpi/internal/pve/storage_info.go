@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
@@ -260,7 +260,7 @@ func WarnDuplicateBackingStorages(ctx context.Context, infos []StorageInfo) {
 
 // StorageLister is the slice of the PVE SDK we depend on to classify storages.
 // In production it is satisfied by clusterstorage.Service from the
-// pve-apiclient-go SDK (see ClusterStorageAsLister, which adapts one to the
+// proxmox-apiclient-go SDK (see ClusterStorageAsLister, which adapts one to the
 // other); tests can substitute a fake.
 type StorageLister interface {
 	ListStorage(ctx context.Context, params *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error)

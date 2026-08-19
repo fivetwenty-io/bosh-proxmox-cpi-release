@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	sdkclusterstorage "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )

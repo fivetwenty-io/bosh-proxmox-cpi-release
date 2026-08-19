@@ -8,9 +8,9 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // guardFakeQEMU is a qemu.Service whose Config returns a canned map (the

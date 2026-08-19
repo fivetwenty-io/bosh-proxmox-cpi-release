@@ -10,9 +10,9 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
 // Deleting an HA/DLB-registered VM must deregister its HA state BEFORE the

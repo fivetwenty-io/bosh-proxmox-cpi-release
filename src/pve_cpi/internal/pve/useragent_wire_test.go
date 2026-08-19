@@ -134,7 +134,7 @@ func TestUserAgent_WireWithOperatorID(t *testing.T) {
 }
 
 // TestUserAgent_WireOverridesSDKDefault asserts that the CPI User-Agent
-// replaces the SDK default ("pve-apiclient-go/1.0"), not appended to it.
+// replaces the SDK default ("proxmox-apiclient-go/1.0"), not appended to it.
 func TestUserAgent_WireOverridesSDKDefault(t *testing.T) {
 	t.Parallel()
 	stub := newPVEStub(t)
@@ -142,7 +142,7 @@ func TestUserAgent_WireOverridesSDKDefault(t *testing.T) {
 	issueProbeRequest(t, cfg)
 
 	got, _ := stub.recorded.Load().(string)
-	sdkDefault := "pve-apiclient-go/1.0"
+	sdkDefault := "proxmox-apiclient-go/1.0"
 	if got == sdkDefault {
 		t.Errorf("User-Agent on wire is the SDK default %q: SetHeader did not override it", sdkDefault)
 	}

@@ -9,7 +9,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // agentChecksumPath is the in-guest path of the BOSH agent binary whose SHA-256
@@ -96,7 +96,7 @@ func assertAgentChecksum(
 		return nil
 	}
 
-	status, ok := awaitAgentExec(ctx, deps, node, vmidStr, execResp.Pid, logger)
+	status, ok := awaitAgentExec(ctx, deps, node, vmidStr, int64(execResp.Pid), logger)
 	if !ok {
 		// awaitAgentExec already logged the fail-open reason.
 		return nil

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )

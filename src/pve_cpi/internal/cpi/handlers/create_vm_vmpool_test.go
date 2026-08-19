@@ -9,7 +9,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // withPoolsSvc wires ps as the pool service on deps.PVE. deps.PVE must be the

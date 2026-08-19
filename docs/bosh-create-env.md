@@ -328,7 +328,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **`Method 'POST /nodes/<node>/qemu/<vmid>/resize' not implemented`**
 
-  PVE's `/resize` endpoint is PUT, not POST. Fixed in the CPI by calling raw `PutCtx` directly. Upstream SDK fix landed in `pve-apiclient-go` `qemu.ResizeDisk`. Rebuild if seen on an old release.
+  PVE's `/resize` endpoint is PUT, not POST. Fixed in the CPI by calling raw `PutCtx` directly. Upstream SDK fix landed in `proxmox-apiclient-go` `qemu.ResizeDisk`. Rebuild if seen on an old release.
 
 - **`Can't find property 'director.cpi_job'` during template render**
 
@@ -344,7 +344,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
   The fix has two layers:
 
-  - **SDK (`pve-apiclient-go` ≥ v3.1.2)**: `qemu.DetachDisk` issues a second `delete: unusedN` PUT after the bus-slot detach so the volume is no longer reachable from the VM config.
+  - **SDK (`proxmox-apiclient-go` ≥ v3.1.2, published as `pve-apiclient-go` before v3.4.0)**: `qemu.DetachDisk` issues a second `delete: unusedN` PUT after the bus-slot detach so the volume is no longer reachable from the VM config.
 
   - **CPI `delete_vm` guard**: before issuing the destroy, the CPI reads the VM config and refuses to proceed if any `unusedN` entry references a volume on `pve_disk_storage`. This catches future SDK regressions or any bypass path.
 

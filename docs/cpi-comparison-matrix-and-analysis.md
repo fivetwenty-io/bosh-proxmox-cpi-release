@@ -19,7 +19,7 @@ themes.
 | Google | Go | GCE/Compute, target pools + backend services |
 | Azure | Ruby | ARM — managed disks, Compute Gallery, LB/App Gateway |
 | Alicloud | Go | ECS/SLB/NLB, legacy SDK + Tea OpenAPI SDK |
-| **Proxmox (PVE)** | **Go** | **`pve-apiclient-go` v3 — this repository** |
+| **Proxmox (PVE)** | **Go** | **`proxmox-apiclient-go` v3 — this repository** |
 
 The OpenStack reference ships **two** CPI implementations. `bosh_openstack_cpi/` is the
 Ruby CPI wired into the `openstack_cpi` BOSH job — the production path that operators
@@ -1627,7 +1627,7 @@ routes to the CPI-owned `awaitTaskAdaptive` loop, so no call site changes. `adap
 applies the vSphere estimator — projected remaining time over five — clamped to 1–10s, and
 falls back to the fixed §7.25 cadence when `progress` is absent or non-positive (so
 progress-less short tasks poll exactly as before). The loop reads progress through a new
-single-shot `tasks.GetStatus` added to the vendored `pve-apiclient-go` SDK alongside a
+single-shot `tasks.GetStatus` added to the vendored `proxmox-apiclient-go` SDK alongside a
 `Status.Progress` field (both additive), and mirrors `AwaitTask`'s terminal/error
 classification via `classifyTaskExit`. Disabled (default) the SDK's fixed-interval `Wait` is
 used, byte-identical to prior releases. A warning header in the vendored file and a
@@ -2549,7 +2549,7 @@ User-Agent (`BOSH-AZURE-CPI/<version> pid-<guid>`). PVE API calls from this CPI 
 distinguishing User-Agent, so operators cannot attribute API load or throttling to BOSH in
 PVE access logs.
 
-**Build:** set a `BOSH-PVE-CPI/<version>` User-Agent header on the pve-apiclient-go HTTP
+**Build:** set a `BOSH-PVE-CPI/<version>` User-Agent header on the proxmox-apiclient-go HTTP
 client through its transport wrapper, and add an optional `operator_id` config key appended to
 the header for per-operator attribution.
 

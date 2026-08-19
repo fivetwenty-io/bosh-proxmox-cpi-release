@@ -12,7 +12,8 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // masterSwitchOptionsFn returns a listFirewallOptionsFn reporting the
@@ -20,7 +21,8 @@ import (
 // (enable == 0), matching PVE's integer-boolean encoding.
 func masterSwitchOptionsFn(enable int64) func(context.Context) (*sdkcluster.ListFirewallOptionsResponse, error) {
 	return func(context.Context) (*sdkcluster.ListFirewallOptionsResponse, error) {
-		return &sdkcluster.ListFirewallOptionsResponse{Enable: &enable}, nil
+		enabled := sdkclient.PVEInt(enable)
+		return &sdkcluster.ListFirewallOptionsResponse{Enable: &enabled}, nil
 	}
 }
 

@@ -8,7 +8,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 func nopLogger() *log.Logger { return log.NewNopLogger() }

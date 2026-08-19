@@ -12,7 +12,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // resourceTypeNode is the /cluster/resources item type identifying a PVE node.

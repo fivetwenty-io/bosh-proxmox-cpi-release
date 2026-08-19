@@ -4,7 +4,7 @@ package handlers_test
 import (
 	"encoding/json"
 
-	sdkcluster "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // rawVnet returns a GetSdnVnetsResponse containing the given zone field.

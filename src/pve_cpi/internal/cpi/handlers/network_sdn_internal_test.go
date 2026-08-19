@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"testing"
 
-	pveerr "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	pveerr "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 func TestIsSDNConflict(t *testing.T) {

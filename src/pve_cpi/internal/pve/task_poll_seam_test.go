@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
+	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
 // captureWaitOpts runs one AwaitTask against a mock that records the

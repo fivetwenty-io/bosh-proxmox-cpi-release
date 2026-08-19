@@ -11,9 +11,10 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	sdknodes "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	sdktasks "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // --------------------------------------------------------------------------
@@ -71,7 +72,7 @@ func (h *healthNodes) ListQemuStatusCurrent(ctx context.Context, node, vmid stri
 	if h.statusFn != nil {
 		return h.statusFn(ctx, node, vmid)
 	}
-	vmid64 := int64(100)
+	vmid64 := sdkclient.PVEInt(100)
 	return &sdknodes.ListQemuStatusCurrentResponse{Status: "running", Vmid: vmid64}, nil
 }
 
@@ -658,7 +659,7 @@ func readyPingFn() func(context.Context, string, string) (*sdknodes.CreateQemuAg
 func execStatusReturning(digest string, exitCode int64) func(context.Context, string, string, *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
 	return func(_ context.Context, _, _ string, _ *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
 		out := digest + "  /var/vcap/bosh/bin/bosh-agent\n"
-		ec := exitCode
+		ec := sdkclient.PVEInt(exitCode)
 		return &sdknodes.ListQemuAgentExecStatusResponse{Exited: true, Exitcode: &ec, OutData: &out}, nil
 	}
 }
@@ -765,7 +766,7 @@ func TestCreateVM_AgentChecksum_ExecError_FailOpen(t *testing.T) {
 // execPidFn returns an agentExecFn that always reports a started PID.
 func execPidFn(pid int64) func(context.Context, string, string, *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
 	return func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuAgentExecParams) (*sdknodes.CreateQemuAgentExecResponse, error) {
-		return &sdknodes.CreateQemuAgentExecResponse{Pid: pid}, nil
+		return &sdknodes.CreateQemuAgentExecResponse{Pid: sdkclient.PVEInt(pid)}, nil
 	}
 }
 
@@ -810,7 +811,7 @@ func TestCreateVM_AgentChecksum_Unparseable_FailOpen(t *testing.T) {
 	runChecksumFailOpenCase(t, "agent-checksum-unparseable",
 		func(_ context.Context, _, _ string, _ *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error) {
 			garbage := "not-a-digest\n"
-			ec := int64(0)
+			ec := sdkclient.PVEInt(0)
 			return &sdknodes.ListQemuAgentExecStatusResponse{Exited: true, Exitcode: &ec, OutData: &garbage}, nil
 		})
 }

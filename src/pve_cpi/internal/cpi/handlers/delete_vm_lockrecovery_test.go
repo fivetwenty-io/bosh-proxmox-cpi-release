@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"

@@ -7,7 +7,7 @@ package handlers_test
 import (
 	"context"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // panicClusterStub satisfies cluster.Service; every method panics on call.

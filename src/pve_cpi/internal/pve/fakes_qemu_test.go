@@ -5,7 +5,7 @@ package pve
 import (
 	"context"
 
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
 // fakeQEMUService implements qemu.Service for tests. Every method the

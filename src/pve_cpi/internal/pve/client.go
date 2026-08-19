@@ -11,16 +11,16 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cloudinit"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/cluster"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/clusterstorage"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/nodes"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/pools"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/qemu"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/storage"
-	"github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/api/tasks"
-	sdkclient "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/client"
-	sdkerrors "github.com/fivetwenty-io/pve-apiclient-go/v3/pkg/errors"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/pools"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
@@ -341,7 +341,7 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	}
 	// Set User-Agent on every outgoing PVE API request. The SDK's
 	// applyCustomHeaders runs after standard headers, so SetHeader overrides
-	// the SDK default "pve-apiclient-go/1.0". Both request paths (regular and
+	// the SDK default "proxmox-apiclient-go/1.0". Both request paths (regular and
 	// upload) call applyCustomHeaders, so a single SetHeader covers all calls.
 	// SetHeader is part of the public client.Client interface as of upstream
 	// v3.2.10, so no vendor patch is required.
