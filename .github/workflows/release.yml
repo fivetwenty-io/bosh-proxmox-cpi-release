@@ -32,6 +32,12 @@ jobs:
     permissions:
       contents: write
 
+    defaults:
+      run:
+        # The runner falls back to plain sh inside the container; the scripts
+        # below use bash features ([[ =~ ]], arrays)
+        shell: bash
+
     env:
       RELEASE_NAME: bosh-pve-cpi
       BOSH_CLI_VERSION: "7.10.9"
