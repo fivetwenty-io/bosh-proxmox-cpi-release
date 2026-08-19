@@ -10,11 +10,13 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [An Operator's Introduction](intro-overview/index.md): The one-hour operator walkthrough — how the CPI is put together, how it works, and how it is configured, in ten prose chapters with a matching [Slidev deck](presentations/intro-overview/README.md).
 
+- [An Architecture, From First Principles](architecture/index.md): The thirteen-chapter narrative that derives the design from fundamentals — problem first, principle next, feature last — for architects, engineering managers, and new team members, with a matching [Slidev deck](presentations/architecture/README.md). `make docs-architecture-html` compiles the whole narrative into a single-page HTML edition.
+
 - [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
 
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.
 
-- [Architecture](architecture.md): High-level overview of the CPI’s design and components.
+- [Architecture](architecture.md): High-level overview of the CPI’s design and components. For the reasoning behind that design, read the [architecture narrative](architecture/index.md).
 
 - [CPI Methods](cpi_methods.md): Detailed documentation of implemented CPI methods and their PVE interactions.
 
@@ -57,5 +59,7 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 - [Operations Runbook](operations.md): Day-2 operations and diagnostics — log access, PVE-side inspection commands, pre- and post-deploy health checks, orphan and lock recovery, and how to file a bug report.
 
 - [Examples](examples.md): Sample BOSH deployment manifests and usage scenarios.
+
+- [Changelog](../CHANGELOG.md): Operator-visible change by release, plus the work already merged for the next one.
 
 - [API Reference](https://pkg.go.dev/github.com/fivetwenty-io/bosh-pve-cpi): Package-level Go documentation on pkg.go.dev.

@@ -15,6 +15,18 @@ The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on 
 - [Light stemcells](docs/light-stemcells.md)
   Pre-uploaded or CPI-fetched qcow2 images, with no director-side re-upload on redeploy
 
+## Documentation
+
+The full documentation set is indexed in [docs/index.md](docs/index.md). Two long-form pieces are the best places to start, and each ships with a Slidev deck built from the same prose:
+
+- [An Operator's Introduction](docs/intro-overview/index.md)
+  A one-hour walkthrough for operators, in ten chapters: how the CPI is put together, how it works, and how it is configured. Deck in [docs/presentations/intro-overview/](docs/presentations/intro-overview/README.md).
+
+- [An Architecture, From First Principles](docs/architecture/index.md)
+  The thirteen-chapter narrative that derives the design from fundamentals, problem first and feature last, for architects, engineering managers, and new team members. Deck in [docs/presentations/architecture/](docs/presentations/architecture/README.md), and `make docs-architecture-html` compiles the whole narrative into a single-page HTML edition.
+
+Released and pending change is recorded in the [changelog](CHANGELOG.md).
+
 ## Quickstart
 
 The steps below take a fresh checkout through to a deployed Director on a PVE cluster.
@@ -211,6 +223,12 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 
 ## Reference
 
+- [Architecture narrative](docs/architecture/index.md)
+  Thirteen chapters deriving the architecture from first principles, with a [Slidev deck](docs/presentations/architecture/README.md).
+
+- [Operator's introduction](docs/intro-overview/index.md)
+  The one-hour operator walkthrough, with a [Slidev deck](docs/presentations/intro-overview/README.md).
+
 - [CPI methods reference](docs/cpi_methods.md)
   Every BOSH CPI v2 method with args, returns, errors, and notes.
 
@@ -252,6 +270,9 @@ For symptom-first triage of deployment, VM creation, disk attachment, network, a
 
 - [PVE settings](docs/pve-settings.md)
   Cluster-level settings the CPI assumes (storage content types, SDN enablement).
+
+- [Changelog](CHANGELOG.md)
+  Operator-visible change by release, plus the work already merged for the next one.
 
 ## External links
 

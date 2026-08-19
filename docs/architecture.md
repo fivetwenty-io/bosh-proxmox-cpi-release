@@ -4,6 +4,8 @@ The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification fo
 
 This document describes the structure: where code lives, how the packages depend on one another, what happens during a single request, the cross-cutting mechanisms that span packages, and how errors flow back to the director. For method signatures and per-method behavior, see [CPI Methods](cpi_methods.md).
 
+This is the structural view. For the reasoning behind it — why the design takes this shape, derived problem first and feature last — read [An Architecture, From First Principles](architecture/index.md), the thirteen-chapter narrative, which also ships as a [Slidev deck](presentations/architecture/README.md).
+
 ## Source Layout
 
 Go sources live under `src/pve_cpi/` so the directory shape matches the BOSH packaging spec (`packages/pve_cpi/spec` globs `pve_cpi/...`):

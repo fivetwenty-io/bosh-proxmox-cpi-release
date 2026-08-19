@@ -76,7 +76,9 @@ The harness needs a live Proxmox VE cluster and will create and destroy real VMs
 
 3. Run `make check` and make sure it passes.
 
-4. Open a pull request against `main`. Describe what the change does and why. Link the related issue if one exists.
+4. If the change is operator visible, add an entry to the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md). Behavior, properties, packaging, and documentation count; refactors, tests, and CI plumbing usually do not.
+
+5. Open a pull request against `main`. Describe what the change does and why. Link the related issue if one exists.
 
 Keep each pull request focused on one change. A small, focused pull request is easier to review and lands faster than a large one that mixes concerns.
 
@@ -88,7 +90,7 @@ Write commit messages that describe the code change, not the process that produc
 
 Releases are tag driven. Pushing a tag of the form `vX.Y.Z` on `main` runs the release workflow, which gates on the full CI check suite, builds the BOSH release tarball with a pinned `bosh` CLI, and publishes a GitHub Release with the tarball, a sha256 checksum file, and a manifest snippet ready to paste into a deployment.
 
-To cut a release:
+To cut a release, first rename the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) to the new version, date it, open a fresh empty `Unreleased` section above it, update the link references at the bottom of the file, and merge that to `main`. Then tag it:
 
 ```bash
 git tag -a v1.2.3 -m "Version 1.2.3"
