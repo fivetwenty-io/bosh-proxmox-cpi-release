@@ -96,3 +96,9 @@ addons:
     stemcell:
     - os: ubuntu-jammy
     - os: ubuntu-noble
+  # BATS (deployment "bat") expects VMs with no addon jobs: its service
+  # configuration spec compares the full monit process list against the
+  # job's own pid, so any rider breaks it. Keep BATS VMs stemcell-pristine.
+  exclude:
+    deployments:
+    - bat
