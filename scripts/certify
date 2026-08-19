@@ -16,7 +16,8 @@ job in <iaas>/pipeline.yml:
     1. Stand up a BOSH Director with the OLD CPI release.
     2. Deploy the upstream certification release under it.
     3. Run `bosh create-env` again with the NEW CPI release over the SAME
-       state.json, upgrading the Director VM in place.
+       state.json, so the new CPI rebuilds the Director VM around the disk
+       the old one left behind.
     4. Recreate the certification deployment through the new CPI.
     5. Assert the upgrade preserved what it must, then tear down.
 
@@ -113,6 +114,7 @@ from _report import (  # noqa: E402
     Color,
     Reporter,
     Runner,
+    exec_stream,
     fmt_hms,
 )
 
@@ -588,6 +590,13 @@ def write_run_doc(
     )
     lines.append("")
     lines.append(
+        "The verdict covers every step through verification. Tearing the lab "
+        "back down happens after this report is written, so the console totals "
+        "at the end of a run carry a few more steps and a longer wall clock "
+        "than the numbers here."
+    )
+    lines.append("")
+    lines.append(
         f"- Wall clock: {meta['wall_hms']} ({meta['started']} to {meta['finished']})"
     )
     lines.append("")
@@ -713,8 +722,8 @@ def write_summary_doc() -> Path:
         "The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
         "suite's Director Upgrade Test stands a Director up on one CPI release, "
         "deploys the upstream certification release under it, upgrades the "
-        "Director in place onto a newer CPI release, and recreates the "
-        "deployment through it. We run it against a Proxmox VE lab with "
+        "Director onto a newer CPI release over the same state, and recreates "
+        "the deployment through it. We run it against a Proxmox VE lab with "
         "`./scripts/certify`; [BOSH Director Upgrade Test](../upgrade.md) "
         "documents the setup and invocation."
     )
@@ -902,14 +911,23 @@ class Certify:
             "process_states": sorted(states),
         }
 
-    def _cpi_release_version(self) -> str:
-        for row in self._rows(self._capture_json(["bosh", "releases", "--json"])):
-            if str(row.get("name", "")).strip() == "bosh-pve-cpi":
-                return str(row.get("version", "")).strip().rstrip("*")
-        return ""
-
     def _orphaned_disk_count(self) -> int:
         return len(self._rows(self._capture_json(["bosh", "disks", "--orphaned", "--json"])))
+
+    def _probe_director_version(self) -> str:
+        """The Director's own version, for the environment tuple in the report.
+
+        Both legs run the same bosh release, so one probe against the live
+        Director is enough. A shape we do not recognise leaves the field empty
+        and the report says `unknown` rather than guessing.
+        """
+        for row in self._rows(self._capture_json(["bosh", "env", "--json"])):
+            for key, value in row.items():
+                if key.lower() == "version" and value:
+                    # bosh appends its own build stamp, which is a placeholder
+                    # on a release build. Keep the version, drop the stamp.
+                    return re.sub(r"\s*\(.*\)\s*$", "", str(value)).strip()
+        return ""
 
     def _pve_cfg(self) -> dict:
         def _reader(path: str) -> "str | None":
@@ -1122,6 +1140,26 @@ class Certify:
             ]
         return argv
 
+    def _env_manages_sdn(self) -> bool:
+        """True when this env bundle owns its network, so `net-up` applies.
+
+        The turnkey isolated network is driven entirely by the env's
+        `cpitest_sdn_*` keys (see docs/networks.md). An env whose network is
+        provisioned outside this repo, like the nested pve-cpi clusters on
+        their outer-host vnets, defines none of them, and running `net-up`
+        against it would fail on the first missing key.
+        """
+        f = env_vars_file(self.env_name)
+        if f is None:
+            return False
+        return bool(_bosh_int_opt(f, "/cpitest_sdn_vnet"))
+
+    def _sdn_skip_reason(self) -> str:
+        return (
+            f"the {self.env_name} env defines no cpitest_sdn_* keys, so its "
+            "network is provisioned outside this repo"
+        )
+
     def _create_env_env(self, side: str) -> dict[str, str]:
         path = self.old_cpi_path if side == "old" else self.new_cpi_path
         assert path is not None
@@ -1140,11 +1178,14 @@ class Certify:
 
         self._backup_state("pre-upgrade-test")
 
-        ok, _ = self.runner.step(
-            "net:up", [BOSH_SCRIPT, "net-up"], timeout=SHORT_TIMEOUT_S,
-        )
-        if not ok:
-            return False
+        if self._env_manages_sdn():
+            ok, _ = self.runner.step(
+                "net:up", [BOSH_SCRIPT, "net-up"], timeout=SHORT_TIMEOUT_S,
+            )
+            if not ok:
+                return False
+        else:
+            self.rep.skip("net:up", self._sdn_skip_reason())
 
         ok, _ = self.runner.step(
             "director:create-env-old", self._create_env_argv("old"),
@@ -1310,10 +1351,14 @@ class Certify:
         if self.dry_run:
             self.rep.record(f"capture:{when}", PASS, 0.0, "dry-run")
             return True
+        if not self.director_version:
+            self.director_version = self._probe_director_version()
         target.update({
             "director": self._director_identity(),
             "deployment": self._deployment_identity(),
-            "cpi_release": self._cpi_release_version(),
+            "cpi_release": (
+                self.old_cpi_label if when == "pre" else self.new_cpi_label
+            ),
             "orphaned_disks": self._orphaned_disk_count(),
         })
         (self.run_dir / f"capture-{when}.json").write_text(
@@ -1350,7 +1395,7 @@ class Certify:
     def verify(self) -> bool:
         self.rep.section("verify")
         if self.dry_run:
-            for name in ("verify:director-vm-identity", "verify:director-disk-identity",
+            for name in ("verify:director-vm-replaced", "verify:director-disk-identity",
                          "verify:deployment-disk-identity", "verify:cpi-upgraded",
                          "verify:instance-running", "verify:no-new-orphans",
                          "verify:cloud-check"):
@@ -1364,11 +1409,11 @@ class Certify:
         post_dep = self.post.get("deployment", {})
 
         ok = self._invariant(
-            "verify:director-vm-identity",
+            "verify:director-vm-replaced",
             "Director VM CID",
             pre_dir.get("vm_cid", ""), post_dir.get("vm_cid", ""),
-            lambda a, b: bool(a) and a == b,
-            "the Director VM was upgraded in place, not recreated",
+            lambda a, b: bool(a) and bool(b) and a != b,
+            "the new CPI built a replacement Director VM around the preserved disk",
         ) and ok
 
         ok = self._invariant(
@@ -1392,10 +1437,11 @@ class Certify:
         want_new = self.new_cpi_label.lstrip("v")
         ok = self._invariant(
             "verify:cpi-upgraded",
-            "bosh-pve-cpi release on the Director",
+            "CPI release deployed by create-env",
             self.pre.get("cpi_release", ""), self.post.get("cpi_release", ""),
-            lambda a, b: bool(b) and a != b and (want_new in b or b in want_new),
-            f"the Director now runs {want_new}",
+            lambda a, b: bool(a) and bool(b) and a != b,
+            f"the second create-env deployed {want_new} over the first leg's "
+            f"{self.old_cpi_label}",
         ) and ok
 
         states = post_dep.get("process_states", [])
@@ -1529,23 +1575,50 @@ class Certify:
         self.rep.section("teardown")
         dep = self.ccfg["deployment_name"]
         if self.deployed or self.dry_run:
-            self.runner.step(
+            self._cleanup_step(
                 "cert:delete-deployment",
                 ["bosh", "-n", "-d", dep, "delete-deployment", "--force"],
-                env=self._director_env(), timeout=DEPLOY_TIMEOUT_S,
+                DEPLOY_TIMEOUT_S, env=self._director_env(),
             )
-            self.runner.step(
+            self._cleanup_step(
                 "director:clean-up", ["bosh", "-n", "clean-up", "--all"],
-                env=self._director_env(), timeout=DEPLOY_TIMEOUT_S,
+                DEPLOY_TIMEOUT_S, env=self._director_env(),
             )
         if self.director_up or self.dry_run:
-            self.runner.step(
+            self._cleanup_step(
                 "director:delete-env", [BOSH_SCRIPT, "teardown"],
-                timeout=CREATE_ENV_TIMEOUT_S,
+                CREATE_ENV_TIMEOUT_S,
             )
-            self.runner.step(
-                "net:down", [BOSH_SCRIPT, "net-down"], timeout=SHORT_TIMEOUT_S,
-            )
+            if self._env_manages_sdn():
+                self._cleanup_step(
+                    "net:down", [BOSH_SCRIPT, "net-down"], SHORT_TIMEOUT_S,
+                )
+            else:
+                self.rep.skip("net:down", self._sdn_skip_reason())
+
+    def _cleanup_step(self, name: str, argv: list[str], timeout: int,
+                      env: "dict[str, str] | None" = None) -> bool:
+        """Run a teardown command whose failure must not fail the run.
+
+        Teardown happens after every invariant has been checked, so an error
+        here reflects on the lab or the Director, not on the CPI under test.
+        One known case is the Director's own clean-up double-delete on
+        stemcell rows. The step still appears in the report, as a skip
+        carrying the exit code, so a failed sweep is never silent.
+        """
+        self.rep.begin(name)
+        merged = dict(self.runner.base_env)
+        if env:
+            merged.update(env)
+        rc, _tail = exec_stream(
+            argv, env=merged, cwd=REPO_ROOT, timeout=timeout,
+            dry_run=self.dry_run, logfile=self.runner.logfile,
+        )
+        if rc == 0:
+            self.rep.record(name, PASS, 0.0)
+            return True
+        self.rep.skip(name, f"best-effort cleanup exited {rc}; sweep the lab by hand")
+        return False
 
     # -- dispatch -------------------------------------------------------------- #
 

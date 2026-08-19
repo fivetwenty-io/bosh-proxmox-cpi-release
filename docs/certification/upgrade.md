@@ -2,7 +2,7 @@
 
 The [BOSH CPI certification suite](https://github.com/cloudfoundry/bosh-cpi-certification) is the CloudFoundry community's release-gate harness for CPIs. It runs two scenarios: the acceptance suite, which we run separately with [`./scripts/bats`](bats.md), and the Director Upgrade Test, which nothing else covers.
 
-BATS proves the CPI satisfies the Director contract at one version, on a Director that the same CPI built. The upgrade test proves something different and, for an operator, more consequential: that a running Director and the deployment it manages survive a CPI version change in place. Every VM CID, disk CID, and stemcell reference the old CPI wrote has to still mean the same thing to the new one. For a CPI whose disk CIDs are versioned envelopes and whose stemcells are cached as per-cluster templates, that is not a property anyone should assume.
+BATS proves the CPI satisfies the Director contract at one version, on a Director that the same CPI built. The upgrade test proves something different and, for an operator, more consequential: that a running Director and the deployment it manages survive a CPI version change. Every disk CID and stemcell reference the old CPI wrote has to still mean the same thing to the new one. For a CPI whose disk CIDs are versioned envelopes and whose stemcells are cached as per-cluster templates, that is not a property anyone should assume.
 
 We run it against a Proxmox VE lab with `./scripts/certify`, the same way `./scripts/bats` runs the acceptance suite: one command, the shared `ci/integration.yml` config, the same env bundles, and machine and prose artifacts at the end.
 
@@ -21,7 +21,7 @@ flowchart TD
     G --> H[Teardown]
 ```
 
-The second `create-env` reuses the first run's `state.json` and `creds.yml`. That is the whole point: BOSH upgrades the Director VM in place rather than building a new one, so the new CPI inherits a VM and a persistent disk that the old CPI created and named.
+The second `create-env` reuses the first run's `state.json` and `creds.yml`. That is the whole point: the Director is upgraded over its own state rather than rebuilt from nothing, so the new CPI inherits a persistent disk that the old CPI created and named. A changed manifest makes `create-env` replace the Director VM itself, deleting the old one and attaching the preserved disk to a new one, so the new VM is built by the new CPI around storage the old CPI wrote.
 
 ## How the runner works
 
@@ -37,7 +37,7 @@ The second `create-env` reuses the first run's `state.json` and `creds.yml`. Tha
 
 3. Deploy-old
 
-   Brings up the env's SDN network, runs `bosh create-env` with the old CPI release, aliases the Director, applies the cpi-config when the lab is multi-CPI, and uploads the cloud config with the certification vm_type layered on.
+   Brings up the env's SDN network when the env bundle owns one, runs `bosh create-env` with the old CPI release, aliases the Director, applies the cpi-config when the lab is multi-CPI, and uploads the cloud config with the certification vm_type layered on.
 
 4. Deploy-cert
 
@@ -69,7 +69,7 @@ The second `create-env` reuses the first run's `state.json` and `creds.yml`. Tha
 
 11. Teardown
 
-    Deletes the certification deployment, cleans up the Director, deletes the Director VM, and tears the SDN network back down. Runs even when an earlier phase failed, and is skipped by `--keep`.
+    Deletes the certification deployment, cleans up the Director, deletes the Director VM, and tears the SDN network back down when the env bundle owns one. Runs even when an earlier phase failed, and is skipped by `--keep`.
 
 ## What the run asserts
 
@@ -77,10 +77,10 @@ Upstream's task stops at the two BOSH commands exiting zero. That catches a Dire
 
 | Invariant | What a failure would mean |
 |---|---|
-| Director VM CID unchanged | The upgrade recreated the Director rather than upgrading it in place, so nothing about CID continuity was actually tested |
+| Director VM CID changed | The second `create-env` was a no-op, so the new CPI never actually built anything and nothing was tested |
 | Director persistent disk CIDs unchanged | The new CPI could not decode, or chose not to reuse, the disk CID the old CPI wrote |
 | Certification deployment disk CIDs unchanged across the recreate | The recreated VM did not reattach the disk the old CPI created. This is the single most valuable assertion in the run |
-| `bosh-pve-cpi` release version changed to the new one | The Director is still running the old CPI, so the upgrade silently did not happen |
+| The two `create-env` legs deployed different CPI releases | The run compared a release against itself, so a passing result would prove nothing |
 | Every instance reports `running` | The recreated VM never came back |
 | Orphaned disk count did not grow | The upgrade or the recreate leaked storage |
 | `bosh cloud-check` reports no problems | The Director's view of the IaaS and the IaaS itself disagree after the upgrade |

@@ -213,7 +213,7 @@ See [Running BATS](docs/certification/bats.md) for prerequisites, configuration,
 
 ## BOSH Director Upgrade Test
 
-BATS proves the CPI satisfies the director contract at one version. The upstream certification suite's [director upgrade test](https://github.com/cloudfoundry/bosh-cpi-certification) proves what BATS never touches: that a live director and the deployment it manages survive a CPI version change in place. A director is stood up on the previous CPI release, the upstream certification release is deployed under it, the director is upgraded onto the new CPI release over the same state, and the deployment is recreated. Every VM CID, disk CID, and stemcell reference the old CPI wrote must still resolve under the new one.
+BATS proves the CPI satisfies the director contract at one version. The upstream certification suite's [director upgrade test](https://github.com/cloudfoundry/bosh-cpi-certification) proves what BATS never touches: that a live director and the deployment it manages survive a CPI version change. A director is stood up on the previous CPI release, the upstream certification release is deployed under it, the director is upgraded onto the new CPI release over the same state, and the deployment is recreated. Every disk CID and stemcell reference the old CPI wrote must still resolve under the new one.
 
 ```bash
 make certify-upgrade                    # previous released CPI to current, against the configured lab

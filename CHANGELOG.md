@@ -14,19 +14,27 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Added
 
-- BOSH Acceptance Tests (BATS) runner: `./scripts/bats`, a PVE cloud-config template, generated per-run reports, the [Running BATS](docs/certification/bats.md) guide, and the committed [run record](docs/certification/bats/README.md).
-
-- BOSH Director Upgrade Test runner: `./scripts/certify`, which stands a Director up on the previous CPI release, deploys the upstream [certification release](https://github.com/cloudfoundry/bosh-cpi-certification) under it, upgrades the Director in place onto the latest release, and recreates the deployment, asserting that VM CIDs, disk CIDs, and the disk attachment survive the version change. Ships with the [BOSH Director Upgrade Test](docs/certification/upgrade.md) guide and a committed [run record](docs/certification/upgrade/README.md).
-
-- Go toolchain blob drift gate, so a packaged Go blob that disagrees with `go.mod` fails the build instead of a release.
+- BOSH Director Upgrade Test runner: `./scripts/certify`, which stands a Director up on the previous CPI release, deploys the upstream [certification release](https://github.com/cloudfoundry/bosh-cpi-certification) under it, upgrades the Director onto the latest release over the same state, and recreates the deployment, asserting that disk CIDs and the disk attachment survive the version change. Ships with the [BOSH Director Upgrade Test](docs/certification/upgrade.md) guide and a committed [run record](docs/certification/upgrade/README.md).
 
 ### Changed
 
 - Consolidated the certification documentation under `docs/certification/`: the certification overview, the BATS guide, and the BATS run record moved there, joined by the Director upgrade guide and its run record.
 
+## [0.1.2] - 2026-08-19
+
+Supersedes the withdrawn 0.1.1. Upgrade to this release directly from 0.1.0.
+
+### Added
+
+- BOSH Acceptance Tests (BATS) runner: `./scripts/bats`, a PVE cloud-config template, generated per-run reports, the [Running BATS](docs/certification/bats.md) guide, and the committed [run record](docs/certification/bats/README.md).
+
+- Go toolchain blob drift gate, so a packaged Go blob that disagrees with `go.mod` fails the build instead of a release.
+
+### Changed
+
 - Migrated to `github.com/fivetwenty-io/proxmox-apiclient-go/v3` v3.8.5 (the SDK was renamed from `pve-apiclient-go`), and refreshed transitive dependencies.
 
-- Bumped the packaged Go toolchain blob to 1.26.6 to match the `go.mod` requirement.
+- Bumped the packaged Go toolchain blob to 1.26.6 to match the `go.mod` requirement, which is what made 0.1.1 undeployable.
 
 - Hardened the GitHub Actions workflows, widened security-scanner coverage, and moved the Go module and build caches onto mounted host volumes on the self-hosted runner.
 
@@ -36,7 +44,16 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The BATS runner pins its SSH identities without disabling the operator's OpenSSH configuration.
 
-## [0.1.1] - 2026-08-18
+## [0.1.1] - 2026-08-18 [YANKED]
+
+Withdrawn on 2026-08-19. The published tarball packaged the Go 1.26.5 toolchain blob
+while `go.mod` required 1.26.6, and the packaging script pins `GOTOOLCHAIN=local`, so
+compiling the `pve_cpi` package on a Director failed with `go: go.mod requires go >=
+1.26.6 (running go 1.26.5; GOTOOLCHAIN=local)`. No Director could deploy the release.
+The GitHub release, its assets, and the `v0.1.1` tag have all been deleted; the commit
+it pointed at (`b7ead4a`) stays reachable on `main`. Upgrade straight from 0.1.0 to
+0.1.2, which packages a matching toolchain. The blob drift gate that now fails the build
+on this mismatch landed after the tag was cut.
 
 ### Added
 
@@ -115,7 +132,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/b7ead4a1d2763f88a34baad9746f798cda8e68ef...v0.1.2
+[0.1.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.0...b7ead4a1d2763f88a34baad9746f798cda8e68ef
 [0.1.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/releases/tag/v0.0.1

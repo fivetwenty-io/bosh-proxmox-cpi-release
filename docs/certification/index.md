@@ -6,7 +6,7 @@ Four paths exist for certifying this CPI release against the BOSH CPI v2 contrac
 
 2. **Local BOSH Acceptance Tests**: `scripts/bats` in this repo. Runs the upstream [BOSH Acceptance Test](https://github.com/cloudfoundry/bosh-acceptance-tests) rspec suite against the live director the e2e harness stands up, with the PVE tag-exclusion set, and records a committed run report under `docs/certification/bats/`. See [Running BATS](bats.md). **Recommended before cutting a release.**
 
-3. **Local BOSH Director Upgrade Test**: `scripts/certify` in this repo. Runs the upstream certification suite's director-upgrade scenario against a PVE lab: stand up a director on the previous CPI release, deploy the upstream certification release under it, upgrade the director in place onto the new CPI release, and recreate the deployment. See [BOSH Director Upgrade Test](upgrade.md). **Recommended before cutting a release, alongside BATS.**
+3. **Local BOSH Director Upgrade Test**: `scripts/certify` in this repo. Runs the upstream certification suite's director-upgrade scenario against a PVE lab: stand up a director on the previous CPI release, deploy the upstream certification release under it, upgrade the director onto the new CPI release over the same state, and recreate the deployment. See [BOSH Director Upgrade Test](upgrade.md). **Recommended before cutting a release, alongside BATS.**
 
 4. **Upstream Concourse pipeline**: [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the BAT suite and the director-upgrade test in CI. No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
 
