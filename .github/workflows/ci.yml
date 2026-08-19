@@ -38,6 +38,12 @@ jobs:
         - /home/runner/gha-container-cache/go:/go
         - /home/runner/gha-container-cache/go-build:/root/.cache/go-build
 
+    env:
+      # The runner overrides HOME to /github/home inside the container, so the
+      # default GOCACHE would land there -- inside _work/_temp, wiped between
+      # jobs and outside the mount above. Point it at the mounted path.
+      GOCACHE: /root/.cache/go-build
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7

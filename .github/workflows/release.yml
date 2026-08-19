@@ -50,6 +50,10 @@ jobs:
         shell: bash
 
     env:
+      # The runner overrides HOME to /github/home inside the container, so the
+      # default GOCACHE would land there -- inside _work/_temp, wiped between
+      # jobs and outside the mount above. Point it at the mounted path.
+      GOCACHE: /root/.cache/go-build
       RELEASE_NAME: bosh-pve-cpi
       BOSH_CLI_VERSION: "7.10.9"
       # sha256 of bosh-cli-7.10.9-linux-amd64 from cloudfoundry/bosh-cli releases
