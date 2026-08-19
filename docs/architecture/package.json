@@ -6,7 +6,7 @@
     "build": "bun build-index.mjs"
   },
   "dependencies": {
-    "markdown-it": "^14.1.0"
+    "markdown-it": "^15.0.0"
   },
   "overrides": {
     "linkify-it": "^5.0.2"
