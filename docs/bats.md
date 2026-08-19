@@ -14,7 +14,7 @@ We run BATS against a Proxmox VE lab with `./scripts/bats`, the same way `./scri
 
 2. Prepare
 
-   Copies our cloud-config template (`manifests/bats/cloud_config_pve.yml.erb`) into the checkout as `templates/cloud_config_pve.yml.erb`, appends `rspec_junit_formatter` to the checkout's Gemfile, patches the checkout's ssh helper so Net::SSH ignores the workstation's OpenSSH config and ssh-agent and offers only the run's ephemeral key, runs `bundle install`, resolves the stemcell, generates an ephemeral ed25519 keypair, and renders `bat.yml` from the active env bundle plus the `bats:` config section.
+   Copies our cloud-config template (`manifests/bats/cloud_config_pve.yml.erb`) into the checkout as `templates/cloud_config_pve.yml.erb`, appends `rspec_junit_formatter` to the checkout's Gemfile, patches the checkout's ssh helper so Net::SSH offers only the run's ephemeral key rather than every identity in the workstation's OpenSSH config and ssh-agent, runs `bundle install`, resolves the stemcell, generates an ephemeral ed25519 keypair, and renders `bat.yml` from the active env bundle plus the `bats:` config section.
 
 3. rspec
 
@@ -170,7 +170,7 @@ BATS loads `templates/cloud_config_<cpi>.yml.erb` from inside its own checkout, 
 
 - Many ssh-based examples fail with `Net::SSH::Disconnect: Too many authentication failures`
 
-  BATS's direct ssh connections use Net::SSH, which reads the workstation's `~/.ssh/config` by default: `IdentityFile` entries there are offered before the run's ephemeral key (`keys_only` does not exclude them), and any reachable ssh-agent, including an `IdentityAgent` named in that config, contributes every loaded identity even when `SSH_AUTH_SOCK` is hidden. Enough extra identities trip sshd's `MaxAuthTries` and the server disconnects. The runner patches the checkout's ssh helper with `keys_only`, `config: false`, and `use_agent: false` so only the ephemeral key is ever offered; seeing this error means rspec was launched outside the runner against an unpatched checkout.
+  BATS's direct ssh connections use Net::SSH, which reads the workstation's `~/.ssh/config` by default: `IdentityFile` entries there are offered before the run's ephemeral key (`keys_only` does not exclude them, since it filters agent identities only), and any reachable ssh-agent contributes every loaded identity even when `SSH_AUTH_SOCK` is hidden. Enough extra identities trip sshd's `MaxAuthTries` and the server disconnects. The runner patches the checkout's ssh helper with `keys: []`, `keys_only`, and `use_agent: false` so the ephemeral key is the only identity offered, while config parsing stays on so directives such as `ProxyJump` keep working. Seeing this error means rspec was launched outside the runner against an unpatched checkout.
 
 - The pid-file example fails with `actual batlight pid (...) different from pid monitored by monit` listing several pids
 

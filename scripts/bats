@@ -899,26 +899,28 @@ class BATS:
             self._record_inline("patch:gemfile-junit-formatter", True, t0, detail)
 
         # BATS's ssh helper passes only key_data, so Net::SSH fills the rest
-        # from its defaults: it reads ~/.ssh/config (whose IdentityFile
-        # entries become :keys, offered BEFORE key_data and NOT excluded by
-        # keys_only) and connects to any ssh-agent it can find (including an
-        # IdentityAgent named in that config, so hiding SSH_AUTH_SOCK is not
-        # enough). Enough extra identities trip the stemcell sshd's
-        # MaxAuthTries and disconnect examples with "Too many authentication
-        # failures". Restrict Net::SSH to exactly the key BATS was given:
-        # ignore the OpenSSH config, never use an agent, and offer only
-        # key_data.
+        # from its defaults: every IdentityFile in ~/.ssh/config becomes :keys
+        # and is offered BEFORE key_data, and any reachable ssh-agent adds all
+        # of its loaded identities (hiding SSH_AUTH_SOCK does not stop it).
+        # Enough extra identities trip the stemcell sshd's MaxAuthTries and
+        # disconnect examples with "Too many authentication failures".
+        # keys_only alone is NOT enough: it filters agent identities but not
+        # the config file's. Clearing :keys as well pins the identity set to
+        # the run's ephemeral key while leaving config parsing on, so
+        # ProxyJump and friends keep working. Proposed upstream as
+        # cloudfoundry/bosh-acceptance-tests#67; this step no-ops once that
+        # merges.
         t0 = time.monotonic()
         self.rep.begin("patch:ssh-keys-only")
         helper = self.checkout / "lib" / "bat" / "bosh_helper.rb"
         anchor = "ssh_options[:key_data] = [options[:private_key]]"
         inject = (
+            "\n      ssh_options[:keys] = []"
             "\n      ssh_options[:keys_only] = true"
-            "\n      ssh_options[:config] = false"
             "\n      ssh_options[:use_agent] = false"
         )
         if self.dry_run:
-            print(f"    DRY-RUN: patch keys_only/config/use_agent into {helper}")
+            print(f"    DRY-RUN: patch keys/keys_only/use_agent into {helper}")
             self.rep.record("patch:ssh-keys-only", PASS, 0.0, "dry-run")
         else:
             try:
