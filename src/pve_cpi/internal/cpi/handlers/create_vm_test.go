@@ -58,10 +58,16 @@ type vmMockQEMU struct {
 	// the root disk grow path set this field. Tests that must not call ResizeDisk
 	// leave it nil so ResizeDisk panics on unexpected calls.
 	resizeDiskFn func(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error)
+	// detachDiskFn, when non-nil, is called by DetachDisk. The disk_cids
+	// pre-attach path unparks a parked disk (a DetachDisk on the parker VM)
+	// before attaching it; tests exercising that path set this field. All
+	// others leave it nil so the default panic reveals unexpected detaches.
+	detachDiskFn func(ctx context.Context, node string, vmid int, slot string) error
 
 	mu          sync.Mutex
 	createCalls []vmCreateCall
 	startCalls  []int
+	detachCalls []string
 }
 
 type vmCreateCall struct {
@@ -135,8 +141,14 @@ func (m *vmMockQEMU) Reset(_ context.Context, _ string, _ int) (string, error) {
 func (m *vmMockQEMU) Template(_ context.Context, _ string, _ int) (string, error) {
 	panic("vmMockQEMU.Template: not expected")
 }
-func (m *vmMockQEMU) DetachDisk(_ context.Context, _ string, _ int, _ string) error {
-	panic("vmMockQEMU.DetachDisk: not expected")
+func (m *vmMockQEMU) DetachDisk(ctx context.Context, node string, vmid int, slot string) error {
+	if m.detachDiskFn == nil {
+		panic("vmMockQEMU.DetachDisk: not expected")
+	}
+	m.mu.Lock()
+	m.detachCalls = append(m.detachCalls, fmt.Sprintf("%d:%s", vmid, slot))
+	m.mu.Unlock()
+	return m.detachDiskFn(ctx, node, vmid, slot)
 }
 func (m *vmMockQEMU) ResizeDisk(ctx context.Context, node string, vmid int, diskID string, sizeGiB int) (string, error) {
 	if m.resizeDiskFn != nil {
@@ -4814,5 +4826,123 @@ func TestCreateVM_AttachedDiskRecordsVerbatimCID(t *testing.T) {
 	if !found {
 		t.Fatalf("no UpdateQemuConfig call recorded the bosh_attached_disks sentinel mapping %q -> %q (%d config writes seen)",
 			bareVolid, envelopeCID, len(n.updateConfigCalls))
+	}
+}
+
+// TestCreateVM_DiskCIDs_ParkedUnparksBeforeAttach verifies that the disk_cids
+// pre-attach path runs the shared attach sequence attach_disk uses: a parked
+// disk handed to create_vm is detached from its parker BEFORE the target-VM
+// attach (unpark-then-attach), lands on scsi1+ (never scsi0), and ends the
+// call referenced only by the new VM — the parker's reference is gone, so no
+// double reference survives. Before the unification, this path wrote the bare
+// volid with nil options while the parker still held it.
+func TestCreateVM_DiskCIDs_ParkedUnparksBeforeAttach(t *testing.T) {
+	t.Parallel()
+
+	const parkerVMID = 90000
+
+	var mu sync.Mutex
+	var events []string
+	detached := false
+	attachedSlot := ""
+
+	q := &vmMockQEMU{}
+	q.detachDiskFn = func(_ context.Context, _ string, vmid int, slot string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, fmt.Sprintf("detach:%d:%s", vmid, slot))
+		if vmid == parkerVMID {
+			detached = true
+		}
+		return nil
+	}
+	q.attachDiskFn = func(_ context.Context, _ string, vmid int, volid, _ string, opts *sdkqemu.AttachOpts) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, fmt.Sprintf("attach:%d:%s", vmid, volid))
+		slot := "scsi1"
+		if opts != nil && opts.DiskID != "" {
+			slot = opts.DiskID
+		}
+		attachedSlot = slot
+		return slot, nil
+	}
+	q.configFn = func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if vmid == parkerVMID {
+			cfg := map[string]any{
+				"tags": "bosh-parker",
+				"name": "bosh-parker-90000",
+			}
+			if !detached {
+				cfg[parkerSlot] = parkedVolid
+			}
+			return cfg, nil
+		}
+		// Target VM: NIC MAC read-back plus the persistent disk once attached.
+		cfg := map[string]any{
+			"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+		}
+		if attachedSlot != "" {
+			cfg[attachedSlot] = parkedVolid
+		}
+		return cfg, nil
+	}
+
+	c := &vmMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			raw, _ := json.Marshal(map[string]any{
+				"vmid": parkerVMID,
+				"node": "pve",
+				"type": "qemu",
+			})
+			resp := sdkcluster.ListResourcesResponse{raw}
+			return &resp, nil
+		},
+	}
+
+	n := &vmMockNodes{}
+	deps := buildVMDeps(q, n, c, &vmMockAgent{})
+	deps.Config.DetachedDiskStrategy = "parked"
+	// Opt out of the iothread default so the attach volid assertion below is
+	// exact (same rationale as parkedCfg in attach_disk_test.go).
+	deps.Config.DiskPerformance = &config.DiskPerformanceDefaults{Iothread: boolPtr(false)}
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{mustEncodeDiskCID(t, parkedVolid, nil)}, map[string]any{})
+
+	h := handlers.HandleCreateVM(deps)
+	if _, err := h.Handle(context.Background(), args, mkCtx("parked-preattach")); err != nil {
+		t.Fatalf("create_vm with parked disk_cid: unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var detaches, attaches []string
+	for _, e := range events {
+		switch {
+		case strings.HasPrefix(e, "detach:"):
+			detaches = append(detaches, e)
+		case strings.HasPrefix(e, "attach:"):
+			attaches = append(attaches, e)
+		}
+	}
+	wantDetach := fmt.Sprintf("detach:%d:%s", parkerVMID, parkerSlot)
+	if len(detaches) != 1 || detaches[0] != wantDetach {
+		t.Fatalf("expected exactly one parker unpark detach %q, got %v", wantDetach, detaches)
+	}
+	if len(attaches) != 1 {
+		t.Fatalf("expected exactly one AttachDisk call (single reference), got %v", attaches)
+	}
+	if events[0] != wantDetach {
+		t.Errorf("unpark must precede the attach; events: %v", events)
+	}
+	if !strings.HasSuffix(attaches[0], ":"+parkedVolid) {
+		t.Errorf("attach must target the bare volid %q, got %q", parkedVolid, attaches[0])
+	}
+	if attachedSlot == "scsi0" {
+		t.Error("persistent disk must never land on scsi0")
 	}
 }

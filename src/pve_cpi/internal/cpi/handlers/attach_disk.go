@@ -121,7 +121,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// nodes, so the disk node established by attachDiskResolveNode remains
 		// valid.
 		// --------------------------------------------------------------------
-		if err := guardAndUnparkBeforeAttach(ctx, deps, diskCID, bareDiskCID, vmid); err != nil {
+		if err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", diskCID, bareDiskCID, vmid); err != nil {
 			return nil, err
 		}
 
@@ -156,100 +156,11 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 5. Attach disk via SDK at scsi1 or higher (NEVER scsi0).
-		//
-		// The SDK's default slot selection picks the lowest free index — 0 for
-		// a VM with no other scsi disks. That would yield /dev/sda inside the
-		// guest, which collides with the BOSH agent's mappedDevicePathResolver:
-		//
-		//   The resolver strips the "/dev/sd" prefix and probes "/dev/xvd",
-		//   "/dev/vd", "/dev/sd" in turn (see create_vm.go agent-Disks.System
-		//   note). With the default virtio0 root disk, /dev/vda exists, so the
-		//   resolver returns /dev/vda for any "/dev/sda" hint — including the
-		//   persistent disk hint. The agent then runs persistent-disk
-		//   partitioning against the root disk and fails with:
-		//
-		//     "Persistent disks with many partitions are not supported.
-		//      Expected 1, got 4."
-		//
-		//   Under pve.root_disk_bus=scsi, scsi0 IS the root disk (not merely a
-		//   collision risk with it) — reserving scsi0 here is what makes root
-		//   and persistent disks distinguishable at all in that mode, since
-		//   there is no virtio disk to fall through to.
-		//
-		// Reserving scsi0 forces persistent disks to scsi1+ (/dev/sdb+); the
-		// resolver finds no /dev/vdb, falls through to /dev/sdb, and operates
-		// on the correct disk.
-		//
-		// Bus is always "scsi" for persistent disks. PVE config disk values are
-		// canonical "<storage>:<volname>" (e.g. "data:vm-9003-disk-0"); pass the
-		// full disk_cid — a bare volname is rejected with
-		// "scsi0.file: invalid format ...".
+		// 5–8. Shared attach core: slot choice, perf merge + invariants, config
+		// PUT, confirmation, and the sentinel CID record. create_vm's disk_cids
+		// pre-attach runs the identical sequence (see attachDiskCore).
 		// --------------------------------------------------------------------
-		const bus = "scsi"
-
-		desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, node, vmid, bareDiskCID)
-		if prepErr != nil {
-			if pve.IsNotFound(prepErr) {
-				return nil, cpierrors.VMNotFound(vmCID)
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(prepErr), fmt.Sprintf("attach_disk: slot selection for VM %s disk %s", vmCID, diskCID))
-		}
-
-		// --------------------------------------------------------------------
-		// 5a. Compute effective per-disk performance options.
-		//
-		// Global defaults come from config (no call-level cloud_properties at
-		// attach time). Per-disk options stored in the CID metadata at
-		// create_disk time take precedence over globals. The merged set is
-		// bus-filtered (scsi keeps all) then baked into the volid argument
-		// passed to AttachDisk. When no options are present the call is
-		// byte-identical to the pre-feature behavior.
-		// --------------------------------------------------------------------
-		globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID)
-		if gerr != nil {
-			return nil, gerr
-		}
-		var metaOpts map[string]string
-		if meta != nil {
-			metaOpts = meta.Opts
-		}
-		effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
-
-		// --------------------------------------------------------------------
-		// 5b. Enforce creation-time disk-performance invariants (§7.26), before
-		// any mutating PVE call so an enforce-mode reject leaves no orphan.
-		// --------------------------------------------------------------------
-		if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), vmCID, diskCID, meta, effectiveOpts); err != nil {
-			return nil, err
-		}
-
-		// Build the volid arg: bake options in when present, bare CID otherwise.
-		volidArg := bareDiskCID
-		if len(effectiveOpts) > 0 {
-			volidArg = buildDiskOptStr(bareDiskCID, effectiveOpts)
-		}
-
-		var diskID string
-		err = pve.RetryOnTransient(ctx, deps.Log(ctx), "attach_disk", 0, func() error {
-			var attachErr error
-			diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volidArg, bus, &qemu.AttachOpts{
-				DiskID: desiredDiskID,
-			})
-			return attachErr
-		})
-		if err != nil {
-			wrapped := pve.WrapError(err)
-			if pve.IsNotFound(err) {
-				return nil, cpierrors.VMNotFound(vmCID)
-			}
-			return nil, cpierrors.Wrap(wrapped, fmt.Sprintf("attach_disk: AttachDisk failed for VM %s disk %s", vmCID, diskCID))
-		}
-
-		// --------------------------------------------------------------------
-		// 6+7. Confirm attachment (resolve diskID) and derive device path.
-		// --------------------------------------------------------------------
-		devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Log(ctx))
+		diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, bareDiskCID, meta)
 		if err != nil {
 			return nil, err
 		}
@@ -262,19 +173,120 @@ func HandleAttachDisk(deps Deps) Handler {
 		)
 
 		// --------------------------------------------------------------------
-		// 8. Record the Director's verbatim disk_cid against the bare volid on
-		//    the VM's description sentinel, so a later get_disks call can
-		//    return this exact string instead of the bare volid — cloudcheck
-		//    membership fidelity (see pve.UpdateAttachedDiskCID doc comment).
-		//    Best-effort: never fails the attach.
-		// --------------------------------------------------------------------
-		pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID, diskCID)
-
-		// --------------------------------------------------------------------
 		// 9. Return disk_hints (v2 spec: object with "path" key).
 		// --------------------------------------------------------------------
 		return diskHints{Path: devicePath}, nil
 	})
+}
+
+// attachDiskCore is the shared attach sequence used by attach_disk and by
+// create_vm's disk_cids pre-attach: slot choice → perf merge + invariants →
+// config PUT → confirm → sentinel record. The holder guard + unpark step is
+// invoked by each caller before this (attach_disk needs it ahead of its
+// snapshot guard; create_vm runs it inside attachPersistentDisks) so both
+// paths refuse a foreign holder and unpark a parked disk before any config
+// write. Everything that decides how a volid lands in a VM config lives here
+// so the two handlers cannot drift; node resolution, snapshot policy, and
+// rollback semantics stay with the callers. op is the CPI method name for
+// error and log prefixes.
+//
+// Slot selection detail (why scsi0 is never used): the SDK's default slot
+// selection picks the lowest free index — 0 for a VM with no other scsi
+// disks. That would yield /dev/sda inside the guest, which collides with the
+// BOSH agent's mappedDevicePathResolver: the resolver strips the "/dev/sd"
+// prefix and probes "/dev/xvd", "/dev/vd", "/dev/sd" in turn (see
+// create_vm.go agent-Disks.System note). With the default virtio0 root disk,
+// /dev/vda exists, so the resolver returns /dev/vda for any "/dev/sda" hint —
+// including the persistent disk hint — then runs persistent-disk partitioning
+// against the root disk and fails. Under pve.root_disk_bus=scsi, scsi0 IS the
+// root disk, so reserving scsi0 is what makes root and persistent disks
+// distinguishable at all in that mode. Reserving scsi0 forces persistent
+// disks to scsi1+ (/dev/sdb+); the resolver finds no /dev/vdb, falls through
+// to /dev/sdb, and operates on the correct disk.
+//
+// Perf options: global defaults come from config (no call-level
+// cloud_properties at attach time); per-disk options stored in the CID
+// metadata at create_disk time take precedence over globals. The merged set
+// is bus-filtered (scsi keeps all) then baked into the volid argument passed
+// to AttachDisk. When no options are present the call is byte-identical to
+// the pre-feature behavior.
+//
+// Bus is always "scsi" for persistent disks. PVE config disk values are
+// canonical "<storage>:<volname>" (e.g. "data:vm-9003-disk-0"); pass the
+// full disk_cid — a bare volname is rejected with
+// "scsi0.file: invalid format ...".
+func attachDiskCore(
+	ctx context.Context,
+	deps Deps,
+	op string,
+	vmCID string,
+	node string,
+	vmid int,
+	diskCID, bareDiskCID string,
+	meta *pve.DiskCIDMeta,
+) (diskID, devicePath string, err error) {
+	const bus = "scsi"
+
+	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, bareDiskCID)
+	if prepErr != nil {
+		if pve.IsNotFound(prepErr) {
+			return "", "", cpierrors.VMNotFound(vmCID)
+		}
+		return "", "", cpierrors.Wrap(pve.WrapError(prepErr), fmt.Sprintf("%s: slot selection for VM %s disk %s", op, vmCID, diskCID))
+	}
+
+	// Compute effective per-disk performance options (see doc comment).
+	globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID)
+	if gerr != nil {
+		return "", "", gerr
+	}
+	var metaOpts map[string]string
+	if meta != nil {
+		metaOpts = meta.Opts
+	}
+	effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
+
+	// Enforce creation-time disk-performance invariants (§7.26), before any
+	// mutating PVE call so an enforce-mode reject leaves no orphan.
+	if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), op, vmCID, diskCID, meta, effectiveOpts); err != nil {
+		return "", "", err
+	}
+
+	// Build the volid arg: bake options in when present, bare CID otherwise.
+	volidArg := bareDiskCID
+	if len(effectiveOpts) > 0 {
+		volidArg = buildDiskOptStr(bareDiskCID, effectiveOpts)
+	}
+
+	err = pve.RetryOnTransient(ctx, deps.Log(ctx), op, 0, func() error {
+		var attachErr error
+		diskID, attachErr = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, volidArg, bus, &qemu.AttachOpts{
+			DiskID: desiredDiskID,
+		})
+		return attachErr
+	})
+	if err != nil {
+		wrapped := pve.WrapError(err)
+		if pve.IsNotFound(err) {
+			return "", "", cpierrors.VMNotFound(vmCID)
+		}
+		return "", "", cpierrors.Wrap(wrapped, fmt.Sprintf("%s: AttachDisk failed for VM %s disk %s", op, vmCID, diskCID))
+	}
+
+	// Confirm attachment (resolve diskID) and derive device path.
+	devicePath, err = attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Log(ctx))
+	if err != nil {
+		return "", "", err
+	}
+
+	// Record the Director's verbatim disk_cid against the bare volid on the
+	// VM's description sentinel, so a later get_disks call can return this
+	// exact string instead of the bare volid — cloudcheck membership fidelity
+	// (see pve.UpdateAttachedDiskCID doc comment). Best-effort: never fails
+	// the attach.
+	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID, diskCID)
+
+	return diskID, devicePath, nil
 }
 
 // attachDiskGlobalPerfOpts resolves the global (no call-level cloud_properties)
@@ -337,6 +349,7 @@ func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string
 func enforceDiskPerfInvariants(
 	cfg *config.CPIConfig,
 	logger *log.Logger,
+	op string,
 	vmCID, diskCID string,
 	meta *pve.DiskCIDMeta,
 	effectiveOpts map[string]string,
@@ -353,7 +366,7 @@ func enforceDiskPerfInvariants(
 	case "off":
 		return nil
 	case "warn":
-		logger.Warn("attach_disk: disk-performance invariant divergence (warn mode — proceeding)",
+		logger.Warn(op+": disk-performance invariant divergence (warn mode — proceeding)",
 			log.String("vm_cid", vmCID),
 			log.String("disk_cid", diskCID),
 			log.String("violations", strings.Join(violations, "; ")),
@@ -361,11 +374,11 @@ func enforceDiskPerfInvariants(
 		return nil
 	default: // "enforce"
 		return cpierrors.Cloud(
-			"attach_disk: disk-performance invariant divergence for disk %s: %s."+
+			"%s: disk-performance invariant divergence for disk %s: %s."+
 				" The disk's structural options changed since create_disk."+
 				" Align CPI disk_performance config to the disk's creation-time options,"+
 				" or set pve.disk_perf_invariant_mode=warn|off to bypass this guard.",
-			diskCID, strings.Join(violations, "; "),
+			op, diskCID, strings.Join(violations, "; "),
 		)
 	}
 }
@@ -602,6 +615,7 @@ func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string
 func chooseSCSISlotSkippingZero(
 	ctx context.Context,
 	deps Deps,
+	op string,
 	node string,
 	vmid int,
 	volid string,
@@ -618,17 +632,17 @@ func chooseSCSISlotSkippingZero(
 		// Legacy scsi0 attachment from a prior CPI version. Detach so the
 		// reattach below lands on scsi1+. DetachDisk also sweeps the
 		// resulting unusedN entry, leaving the config clean.
-		deps.Log(ctx).Warn("attach_disk: migrating legacy scsi0 attachment to scsi1+",
+		deps.Log(ctx).Warn(op+": migrating legacy scsi0 attachment to scsi1+",
 			log.Int("vmid", vmid),
 			log.String("volid", volid),
 		)
 		if detachErr := deps.PVE.QEMU().DetachDisk(ctx, node, vmid, "scsi0"); detachErr != nil {
-			return "", cpierrors.Wrap(detachErr, "attach_disk: detach legacy scsi0")
+			return "", cpierrors.Wrap(detachErr, op+": detach legacy scsi0")
 		}
 		// Re-read config so NextFreeSCSIIndexAtLeast sees scsi0 as free.
 		cfg, err = deps.PVE.QEMU().Config(ctx, node, vmid)
 		if err != nil {
-			return "", cpierrors.Wrap(err, "attach_disk: re-read config after scsi0 detach")
+			return "", cpierrors.Wrap(err, op+": re-read config after scsi0 detach")
 		}
 	}
 
@@ -674,18 +688,18 @@ func devicePathByID(diskID string) (string, error) {
 //
 // The scan cost is one ListResources plus a config read per VM — the same scan
 // the unpark probe pays for under either strategy.
-func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID string, targetVMID int) error {
+func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, diskCID, bareDiskCID string, targetVMID int) error {
 	if deps.Config == nil {
 		return nil
 	}
 	parkerCfg := parkerReadConfigFor(deps)
 	holder, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if err != nil {
-		return wrapHolderScanError(err, fmt.Sprintf("attach_disk: resolve current holder of disk %s", diskCID))
+		return wrapHolderScanError(err, fmt.Sprintf("%s: resolve current holder of disk %s", op, diskCID))
 	}
 
 	if holder.Found && !holder.IsParker && holder.VMID != targetVMID {
-		return foreignHolderError(deps, diskCID, targetVMID, holder)
+		return foreignHolderError(deps, op, diskCID, targetVMID, holder)
 	}
 
 	// UnparkDiskAt reuses the holder just resolved, so the parked path still
@@ -697,7 +711,7 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDis
 		// an unusedN reference behind. Flattening those into a retriable makes
 		// the Director drive the first forever, and drive the second straight
 		// into attaching a volume the parker still references.
-		return retriableUnlessPermanent(unErr, fmt.Sprintf("attach_disk: unpark disk %s", diskCID))
+		return retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, diskCID))
 	}
 	return nil
 }
@@ -706,14 +720,14 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDis
 // other than the target, separating the two cases an operator handles
 // differently: a parker stranded outside the configured band by a strategy or
 // band change, and a genuine second attachment.
-func foreignHolderError(deps Deps, diskCID string, targetVMID int, holder pve.DiskHolder) error {
-	if strandedErr := strandedParkerRefusal(deps, "attach_disk", diskCID, holder); strandedErr != nil {
+func foreignHolderError(deps Deps, op, diskCID string, targetVMID int, holder pve.DiskHolder) error {
+	if strandedErr := strandedParkerRefusal(deps, op, diskCID, holder); strandedErr != nil {
 		return strandedErr
 	}
 	return cpierrors.Cloud(
-		"attach_disk: disk %s is already attached to VM %d (node %s) and cannot be attached to VM %d as well; "+
+		"%s: disk %s is already attached to VM %d (node %s) and cannot be attached to VM %d as well; "+
 			"attaching one volume to two VMs corrupts it. Detach it from VM %d first",
-		diskCID, holder.VMID, holder.Node, targetVMID, holder.VMID,
+		op, diskCID, holder.VMID, holder.Node, targetVMID, holder.VMID,
 	)
 }
 

@@ -146,7 +146,7 @@ func TestEnforceDiskPerfInvariants_Gate(t *testing.T) {
 	t.Run("nil meta → skip (no error)", func(t *testing.T) {
 		t.Parallel()
 		cfg := &config.CPIConfig{} // empty → enforce
-		if err := enforceDiskPerfInvariants(cfg, logger, "100", "cid", nil, diverging); err != nil {
+		if err := enforceDiskPerfInvariants(cfg, logger, "attach_disk", "100", "cid", nil, diverging); err != nil {
 			t.Errorf("nil meta must skip, got: %v", err)
 		}
 	})
@@ -155,7 +155,7 @@ func TestEnforceDiskPerfInvariants_Gate(t *testing.T) {
 		t.Parallel()
 		cfg := &config.CPIConfig{}
 		meta := &pve.DiskCIDMeta{Opts: map[string]string{}}
-		if err := enforceDiskPerfInvariants(cfg, logger, "100", "cid", meta, diverging); err != nil {
+		if err := enforceDiskPerfInvariants(cfg, logger, "attach_disk", "100", "cid", meta, diverging); err != nil {
 			t.Errorf("empty Opts must skip, got: %v", err)
 		}
 	})
@@ -165,7 +165,7 @@ func TestEnforceDiskPerfInvariants_Gate(t *testing.T) {
 		meta := &pve.DiskCIDMeta{Opts: map[string]string{"iothread": "1"}}
 		// effective adds cache=writeback (a structural key absent at creation).
 		effective := map[string]string{"iothread": "1", "cache": "writeback"}
-		err := enforceDiskPerfInvariants(nil, logger, "100", "cid", meta, effective)
+		err := enforceDiskPerfInvariants(nil, logger, "attach_disk", "100", "cid", meta, effective)
 		if err == nil {
 			t.Fatal("nil config + divergence must reject (enforce default), got nil")
 		}

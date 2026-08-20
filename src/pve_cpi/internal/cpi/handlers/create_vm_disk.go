@@ -1217,7 +1217,21 @@ func attachEphemeralDisk(
 }
 
 // attachPersistentDisks attaches each disk CID in parsed.diskCIDs to the VM
-// on the scsi bus.
+// through the same holder guard → unpark → slot choice → perf merge +
+// invariants → config PUT → confirm sequence attach_disk runs
+// (guardAndUnparkBeforeAttach + attachDiskCore), so a disk handed to
+// create_vm gets every protection the standalone handler provides. Before
+// this shared path existed, the pre-attach wrote the bare volid with nil
+// options: a parked disk ended up referenced by both the parker and the new
+// VM (the corruption case attach_disk's foreign-holder refusal exists to
+// prevent), and the disk landed on scsi0 where the virtio root disk shadows
+// it. Now a parked disk is unparked first, a disk held by any other VM is
+// refused, the slot choice skips scsi0, and per-disk performance options
+// merge and enforce exactly as they would on a later attach_disk call.
+//
+// Node note: the core targets shape.node — the node the VM was just created
+// on. Placement has already co-located local-backend disks with that node
+// (or failed the create); shared backends attach from any node.
 func attachPersistentDisks(
 	ctx context.Context,
 	deps Deps,
@@ -1226,36 +1240,36 @@ func attachPersistentDisks(
 	shape *createVMShape,
 	vmid int,
 ) error {
+	vmCID := strconv.Itoa(vmid)
 	for _, diskCID := range parsed.diskCIDs {
 		if diskCID == "" {
 			continue
 		}
 		// PVE disk config values are the canonical "<storage>:<volname>"
-		// form (e.g. "data:vm-9003-disk-0"). Strip any encoded metadata suffix
-		// before passing to AttachDisk; PVE rejects non-volid suffixes with
+		// form (e.g. "data:vm-9003-disk-0"). decodeDiskCID strips the encoded
+		// metadata suffix and logs the codec's rejection reason on failure;
+		// PVE rejects non-volid suffixes with
 		// "scsi0.file: invalid format - unable to parse volume ID ...".
-		bareDiskCID, _, decErr := pve.ParseEncodedDiskCID(diskCID)
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "create_vm", diskCID)
 		if decErr != nil {
-			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, decErr.Error())
+			return decErr
 		}
 		if _, _, parseErr := pve.ParseDiskCID(bareDiskCID); parseErr != nil {
 			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
 		}
-		diskID, err := deps.PVE.QEMU().AttachDisk(ctx, shape.node, vmid, bareDiskCID, "scsi", nil)
+		if err := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", diskCID, bareDiskCID, vmid); err != nil {
+			return err
+		}
+		diskID, devPath, err := attachDiskCore(ctx, deps, "create_vm", vmCID, shape.node, vmid, diskCID, bareDiskCID, meta)
 		if err != nil {
-			return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: attach disk %q to vmid=%d: %s", diskCID, vmid, err.Error()))
+			return err
 		}
 		logger.Info("create_vm: attached persistent disk",
 			log.Int(metadataKeyVMID, vmid),
 			log.String("disk_cid", diskCID),
 			log.String("disk_id", diskID),
+			log.String("device_path", devPath),
 		)
-		// Record the Director's verbatim disk_cid against the bare volid on
-		// the VM's description sentinel, exactly as attach_disk does, so a
-		// later get_disks returns this string instead of the bare volid —
-		// cloudcheck membership fidelity for disks attached at create time.
-		// Best-effort: never fails the create.
-		pve.UpdateAttachedDiskCID(ctx, deps.PVE, logger, shape.node, vmid, bareDiskCID, diskCID)
 	}
 	return nil
 }
