@@ -108,11 +108,52 @@ BATS uses rspec tags to mark capabilities that not every IaaS has, and every pro
 | `vip_networking` | PVE has no floating IP or VIP allocation concept for the CPI to bind |
 | `root_partition` | Needs an IaaS flavor with no ephemeral disk; PVE vm_types size the root disk explicitly |
 | `raw_ephemeral_storage`, `raw_instance_storage` | PVE VMs have no raw instance-store devices |
-| `ipv6`, `ipv6_manual_networking`, `ipv6_prefix_allocation`, `dual_stack` | The lab network is IPv4 only, and IPv6 prefix delegation is modeled only by the upstream AWS template |
-| `nic_groups` | The lab env provides a single vnet, one NIC per VM |
-| `multiple_manual_networks` | The lab env provides a single manual network |
+| `ipv6_prefix_allocation` | IPv6 prefix delegation is modeled only by the upstream AWS template; PVE has no prefix-delegation API for the CPI to call |
+| `nic_groups` | The upstream example never enables IPv6, so its job keeps one network and the "same group, same interface" assertion holds for a single interface no matter what the CPI does |
+| `ipv6`, `ipv6_manual_networking`, `dual_stack` | The stemcell's agent cannot hold two static addresses on one NIC (see [Dual stack](#dual-stack)); the pass is opt-in with `--only ipv6` |
+| `multiple_manual_networks` | Tags both the dual-stack example, which runs under `--only ipv6`, and an IPv4-only example that needs a second IPv4 manual network the `bats:` section cannot express |
 
 Everything else runs: the `core` lifecycle set, `ssh`, `manual_networking`, `changing_static_ip`, `reboot`, the persistent disk and cloud-check suites, and the `os` supervision contract. Each run report reproduces the exclusion table so the covered surface is always explicit.
+
+### Dual stack
+
+Filling in the IPv6 keys of the `bats:` section (`network_cidr_ipv6`, `network_gateway_ipv6`, `network_reserved_ipv6`, `network_static_ipv6`, `static_ip_ipv6`) adds a second manual network named `ipv6` to `bat.yml`.
+
+A run makes one rspec pass by default, over the job with a single manual network. It excludes `ipv6`, `ipv6_manual_networking`, `dual_stack`, and `multiple_manual_networks`, because the job it deploys carries one manual network and those examples need two.
+
+`./scripts/bats run --only ipv6` switches the run to the dual-stack pass, which deploys the job that carries both networks and runs the examples the default pass holds back. The pass is opt-in rather than automatic because it cannot pass today: see [What the agent does with two static addresses](#what-the-agent-does-with-two-static-addresses) below.
+
+A separate pass rather than one exclusion set, because the tags do not separate the two shapes. `multiple_manual_networks` tags both the dual-stack spec and an IPv4-only example that would then expect a second IPv4 address the lab does not have. For the same reason the harness rejects `--only multiple_manual_networks` outright: upstream pins `properties.ipv6` to `false`, so that example keeps a single network in either pass and its more-than-one-address assertion cannot hold.
+
+Both networks carry the same `nic_group` (default `1`), so the director places them on one interface and the CPI writes a single PVE NIC whose `ipconfig` entry carries `ip=`/`gw=` and `ip6=`/`gw6=`. Keep the value numeric: the director reads `nic_group` with `to_i`, so a name like `nic0` reaches the CPI as `0` and every group collapses into one. The IPv4 network stays first in the list, which is what gives it `default: [dns, gateway]` in the generated deployment.
+
+What the dual-stack pass proves, and what it does not. The example asserts that the instance carries more than one address and that every configured static IP shows up in `ip -o addr`. Two separate NICs would satisfy both, so the suite does not verify that the two networks landed on one interface. The single-NIC behaviour is covered by the CPI's own tests, which assert the `ipconfig` string the handler writes.
+
+### What the agent does with two static addresses
+
+The pass fails, and it fails past the CPI. A live run on the `pve-cpi` lab (Director 282.1.13, stemcell `ubuntu-noble/1.383`) got this far:
+
+- The CPI collapsed both networks onto one NIC and wrote `ipconfig0: ip=10.254.48.190/16,gw=10.254.0.1,ip6=fd36:afd4:2c42:1::48:190/64,gw6=fd36:afd4:2c42:1::1` against the single `net0`.
+
+- The agent settings on the ConfigDrive carried both networks, each with that NIC's MAC and its own address, netmask, and gateway.
+
+- The agent read them, and then wrote one file, `/etc/systemd/network/10_eth0.network`, holding the IPv4 address alone.
+
+- The Director timed out after 600 seconds waiting for the agent to ping.
+
+The agent builds one interface configuration per network and writes one systemd-networkd file per configuration, named after the interface. Two static configurations on a shared NIC therefore resolve to the same path and the second overwrites the first. The agent then validates that every static address it computed is present on its interface, the address that lost the write is missing, and bootstrap fails before NATS. Upstream RFC0038 grouped the DHCP configurations per interface and left the static ones one-per-file, so no stemcell line clears this today: the Noble agent in the lab already carries that change.
+
+Nothing here is CPI-side, and nothing in the CPI can work around it. Re-run `--only ipv6` when the agent groups static configurations the way it groups dynamic ones.
+
+`scripts/bats` validates the IPv6 keys before anything is deployed: address family, list-versus-scalar, range direction, every band inside the CIDR, reserved not overlapping static, `static_ip_ipv6` inside a static band, and a cap on how many addresses the static band covers. Each of those otherwise surfaces as a director exception tens of minutes into a run.
+
+Two constraints on the address bands:
+
+- Keep the static band small. The director enumerates every address in a static range, while reserved ranges collapse to CIDR lists, so a `/64` with a sixteen-address static band is cheap and a `/64` with a wide one is not.
+
+- Leave a dynamic gap outside the reserved bands. Nothing allocates dynamically on the IPv6 network today, because every dual-stack example asks for a static IP, but an empty pool turns a future dynamic reservation into a deployment failure rather than an address.
+
+One gap remains on the IPv4 side. The `deploys multiple manual networks` example under `manual_networking` never turns IPv6 on, so the helper filters the IPv6 network out and the example expects more than one IPv4 address on the instance. Only the dual-stack pass carries its tag, and that pass deploys the IPv6 job, so the example runs in neither shape. Covering it needs a second IPv4 manual network in the lab, which the `bats:` section cannot express yet.
 
 ## Results and reports
 
@@ -120,7 +161,7 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
 - `junit.xml`
 
-  Spec-level results from `rspec_junit_formatter`, one testcase per example.
+  Spec-level results from `rspec_junit_formatter`, one testcase per example. Every run makes exactly one rspec pass, so there is one file.
 
 - `junit-steps.xml` and `results.json`
 

@@ -34,7 +34,12 @@ Flags:
     --no-default-excludes
                         Drop the built-in PVE exclusion set (run everything
                         except --exclude tags).
-    --only TAG          Run only examples with this tag, repeatable.
+    --only TAG          Run only examples with this tag, repeatable. Naming a
+                        dual-stack tag (ipv6, dual_stack) switches the run to
+                        the dual-stack pass, which deploys a job on both the
+                        IPv4 and the IPv6 network. That pass is opt-in: the
+                        agent cannot hold two static addresses on one NIC yet,
+                        so a default run leaves it out.
     --fail-fast         Stop rspec at the first failure.
     --keep              Set BAT_DEBUG_MODE: fail fast and leave the failed
                         deployment, stemcell, and release in place.
@@ -62,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import ipaddress
 import json
 import os
 import re
@@ -124,14 +130,56 @@ DEFAULT_EXCLUDED_TAGS: dict[str, str] = {
     ),
     "raw_ephemeral_storage": "PVE VMs have no raw instance-store devices",
     "raw_instance_storage": "PVE VMs have no raw instance-store devices",
-    "ipv6": "the lab network is IPv4 only",
-    "ipv6_manual_networking": "the lab network is IPv4 only",
     "ipv6_prefix_allocation": (
-        "IPv6 prefix delegation is modeled only by the upstream AWS template"
+        "IPv6 prefix delegation is modeled only by the upstream AWS template; "
+        "PVE has no prefix-delegation API for the CPI to call"
     ),
-    "dual_stack": "the lab network is IPv4 only",
-    "nic_groups": "the lab env provides a single vnet, one NIC per VM",
-    "multiple_manual_networks": "the lab env provides a single manual network",
+}
+
+# The upstream nic_groups example never turns IPv6 on, so its job keeps the
+# single IPv4 network and the "same nic_group, same interface" assertion holds
+# for one interface no matter what the CPI does. Excluding it keeps a vacuous
+# pass out of the report; the dual-stack spec below is what actually exercises
+# grouping.
+DEFAULT_EXCLUDED_TAGS["nic_groups"] = (
+    "the upstream example never enables IPv6, so its job keeps one network and "
+    "the same-group-same-interface assertion holds for a single interface no "
+    "matter what the CPI does; grouping is covered by the CPI's own tests, not "
+    "by this suite"
+)
+
+# Tags carried only by examples that need a second manual network. The
+# dual-stack rspec pass is the one that runs them (see run_rspec); the IPv4
+# pass excludes them because a job with one manual network either fails their
+# assertions or passes them vacuously.
+_IPV4_PASS_REASON = (
+    "needs a second manual network in the job, which only the dual-stack pass "
+    "deploys; that pass runs under --only ipv6, with the IPv6 keys set in "
+    "ci/integration.yml"
+)
+
+# The dual-stack examples ask for a static IPv4 address and a static IPv6
+# address on one NIC. The CPI does its half: both families land in a single
+# PVE ipconfig and both networks carry the NIC's MAC in the agent settings.
+# The agent then writes one systemd-networkd file per static interface
+# configuration, named after the interface, so the second static address
+# overwrites the first; its static-address validation fails on the address
+# that lost, and the VM never reaches the Director. Upstream RFC0038 grouped
+# the DHCP configurations per interface and left the static ones alone, so no
+# stemcell line clears this today.
+_AGENT_STATIC_DUAL_STACK_REASON = (
+    "the stemcell's agent writes one systemd-networkd file per static "
+    "interface configuration, keyed by interface name, so the second static "
+    "address on a shared NIC overwrites the first and the agent's own "
+    "static-address validation then fails; upstream grouped only the DHCP "
+    "configurations (RFC0038). Run --only ipv6 to re-check once the agent "
+    "groups the static ones too"
+)
+DUAL_STACK_TAGS: dict[str, str] = {
+    "ipv6": _AGENT_STATIC_DUAL_STACK_REASON,
+    "ipv6_manual_networking": _AGENT_STATIC_DUAL_STACK_REASON,
+    "dual_stack": _AGENT_STATIC_DUAL_STACK_REASON,
+    "multiple_manual_networks": _IPV4_PASS_REASON,
 }
 
 
@@ -225,6 +273,136 @@ _REQUIRED_BATS_KEYS = (
     "second_static_ip",
 )
 
+# Required only once bats.network_cidr_ipv6 is declared.
+_REQUIRED_IPV6_KEYS = (
+    "network_gateway_ipv6",
+    "network_reserved_ipv6",
+    "network_static_ipv6",
+    "static_ip_ipv6",
+)
+
+
+def _require_ipv6_address(label: str, value: object) -> None:
+    try:
+        addr = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        sys.exit(f"{label} is not an IP address: {value!r}")
+    if addr.version != 6:
+        sys.exit(f"{label} must be an IPv6 address, got {value!r}")
+
+
+def _require_ipv6_network(label: str, value: object) -> None:
+    try:
+        net = ipaddress.ip_network(str(value).strip(), strict=False)
+    except ValueError:
+        sys.exit(f"{label} is not a CIDR: {value!r}")
+    if net.version != 6:
+        sys.exit(f"{label} must be an IPv6 CIDR, got {value!r}")
+
+
+def _require_ipv6_range(label: str, value: str) -> None:
+    """Accept the two forms a BOSH subnet range takes: CIDR or first-last."""
+    value = value.strip()
+    if "-" in value:
+        first, _, last = value.partition("-")
+        _require_ipv6_address(label, first)
+        _require_ipv6_address(label, last)
+        if ipaddress.ip_address(last.strip()) < ipaddress.ip_address(first.strip()):
+            sys.exit(f"{label} range runs backwards: {value!r}")
+        return
+    _require_ipv6_network(label, value)
+
+
+def _range_addresses(value: str) -> "list":
+    """Every address a `first-last` or CIDR band covers, as an iterator pair.
+
+    Returns [first, last] rather than the expansion: the bands here are large
+    enough that expanding them is the very cost these checks exist to prevent.
+    """
+    value = value.strip()
+    if "-" in value:
+        first, _, last = value.partition("-")
+        return [ipaddress.ip_address(first.strip()), ipaddress.ip_address(last.strip())]
+    net = ipaddress.ip_network(value, strict=False)
+    return [net.network_address, net.broadcast_address]
+
+
+def _check_subnet_consistency(
+    cidr: str, gateway: str, reserved: "list", static: "list", static_ip: str,
+    prefix: str, suffix: str, max_static: int = 1024,
+) -> None:
+    """Catch the band mistakes the director only reports mid-deploy.
+
+    Every one of these surfaces as a NetworkReservedIpOutOfRange or
+    NetworkStaticIpOutOfRange after the stemcell upload and the release
+    compile, tens of minutes into a run.
+    """
+    subnet = ipaddress.ip_network(cidr, strict=False)
+
+    def _inside(label: str, value: str) -> "list":
+        bounds = _range_addresses(value)
+        for addr in bounds:
+            if addr not in subnet:
+                sys.exit(f"{label} {value!r} falls outside {prefix}.network_cidr{suffix} {cidr}")
+        return bounds
+
+    reserved_bounds = [_inside(f"{prefix}.network_reserved{suffix}", r) for r in reserved]
+    static_bounds = [_inside(f"{prefix}.network_static{suffix}", r) for r in static]
+
+    if gateway and ipaddress.ip_address(gateway) not in subnet:
+        sys.exit(
+            f"{prefix}.network_gateway{suffix} {gateway} falls outside "
+            f"{prefix}.network_cidr{suffix} {cidr}"
+        )
+
+    # The director enumerates every static address, so a band written as a
+    # whole subnet by mistake pegs the update-cloud-config task.
+    total_static = sum(int(hi) - int(lo) + 1 for lo, hi in static_bounds)
+    if total_static > max_static:
+        sys.exit(
+            f"{prefix}.network_static{suffix} covers {total_static} addresses; "
+            f"the director enumerates every one of them, so keep the band under "
+            f"{max_static}"
+        )
+
+    for (rlo, rhi), rng in zip(reserved_bounds, reserved):
+        for (slo, shi), stat in zip(static_bounds, static):
+            if rlo <= shi and slo <= rhi:
+                sys.exit(
+                    f"{prefix}.network_reserved{suffix} {rng!r} overlaps "
+                    f"{prefix}.network_static{suffix} {stat!r}"
+                )
+
+    if static_ip:
+        addr = ipaddress.ip_address(static_ip)
+        if not any(lo <= addr <= hi for lo, hi in static_bounds):
+            sys.exit(
+                f"{prefix}.static_ip{suffix} {static_ip} is not inside any "
+                f"{prefix}.network_static{suffix} band"
+            )
+
+
+def _nic_group(section: dict) -> str:
+    """The nic_group value both networks of a dual-stack job carry.
+
+    The director reads it as an integer — job_network.rb does
+    `nic_group&.to_i`, so "nic0" arrives at the CPI as "0" and every name
+    collapses to the same group. Keep the value numeric so what the operator
+    writes is what the CPI sees.
+    """
+    raw = section.get("nic_group", 1)
+    if raw is None or str(raw).strip() == "":
+        raw = 1
+    value = str(raw).strip()
+    if not value.isdigit():
+        sys.exit(
+            f"bats.nic_group must be a non-negative integer (the director "
+            f"coerces it with to_i, so a name collapses to 0), got {raw!r}"
+        )
+    # The director sends the CPI what to_i produced, so "007" would reach it
+    # as "7". Normalize here so bat.yml shows what the CPI will see.
+    return str(int(value))
+
 
 def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
     """Resolve the `bats:` section of ci/integration.yml with env defaults.
@@ -257,6 +435,51 @@ def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
             )
         return resolved
 
+    # IPv6 is opt-in: declaring network_cidr_ipv6 adds a second manual network
+    # to bat.yml that shares a nic_group with the IPv4 one, which is what the
+    # upstream dual-stack specs deploy. Everything else in the group is then
+    # required, because a half-declared network cannot be rendered.
+    ipv6_cidr = str(section.get("network_cidr_ipv6", "") or "").strip()
+    if ipv6_cidr:
+        for key in _REQUIRED_IPV6_KEYS:
+            if not section.get(key):
+                sys.exit(
+                    f"missing required config key: bats.{key} "
+                    "(required once bats.network_cidr_ipv6 is set; see the "
+                    "bats section in ci/integration.yml.example)"
+                )
+        # Every one of these reaches the director as an address, and a wrong
+        # family or a scalar written where a list belongs surfaces hundreds of
+        # lines later as an unrelated reservation error. Check them here.
+        _require_ipv6_network("bats.network_cidr_ipv6", ipv6_cidr)
+        _require_ipv6_address("bats.network_gateway_ipv6", section["network_gateway_ipv6"])
+        _require_ipv6_address("bats.static_ip_ipv6", section["static_ip_ipv6"])
+        for key in ("network_reserved_ipv6", "network_static_ipv6"):
+            value = section[key]
+            if not isinstance(value, list):
+                sys.exit(
+                    f"bats.{key} must be a list of ranges, got "
+                    f"{type(value).__name__}: {value!r}"
+                )
+            for entry in value:
+                _require_ipv6_range(f"bats.{key}", str(entry))
+        _check_subnet_consistency(
+            cidr=ipv6_cidr,
+            gateway=str(section["network_gateway_ipv6"]).strip(),
+            reserved=[str(r) for r in section["network_reserved_ipv6"]],
+            static=[str(r) for r in section["network_static_ipv6"]],
+            static_ip=str(section["static_ip_ipv6"]).strip(),
+            prefix="bats",
+            suffix="_ipv6",
+        )
+
+    for key in ("network_reserved", "network_static"):
+        if not isinstance(section.get(key), list):
+            sys.exit(
+                f"bats.{key} must be a list of ranges, got "
+                f"{type(section.get(key)).__name__}: {section.get(key)!r}"
+            )
+
     return {
         "network_cidr": _env_default("network_cidr", "/internal_cidr"),
         "network_gateway": _env_default("network_gateway", "/internal_gw"),
@@ -265,6 +488,16 @@ def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
         "network_static": [str(s) for s in section["network_static"]],
         "static_ip": str(section["static_ip"]),
         "second_static_ip": str(section["second_static_ip"]),
+        "network_cidr_ipv6": ipv6_cidr,
+        "network_gateway_ipv6": str(section.get("network_gateway_ipv6", "") or "").strip(),
+        "network_reserved_ipv6": [
+            str(r) for r in (section.get("network_reserved_ipv6") or [])
+        ],
+        "network_static_ipv6": [
+            str(r) for r in (section.get("network_static_ipv6") or [])
+        ],
+        "static_ip_ipv6": str(section.get("static_ip_ipv6", "") or "").strip(),
+        "nic_group": _nic_group(section),
         "vm_cores": int(section.get("vm_cores", 2)),
         "vm_memory_mib": int(section.get("vm_memory_mib", 2048)),
         "vm_disk_mib": int(section.get("vm_disk_mib", 8192)),
@@ -282,6 +515,44 @@ def build_bat_spec(
     private_key: str,
 ) -> dict:
     """The bat.yml document handed to BATS via BAT_DEPLOYMENT_SPEC."""
+    default_network: dict = {
+        "name": "default",
+        "type": "manual",
+        "static_ip": bcfg["static_ip"],
+        "cidr": bcfg["network_cidr"],
+        "reserved": bcfg["network_reserved"],
+        "static": bcfg["network_static"],
+        "gateway": bcfg["network_gateway"],
+        "cloud_properties": {
+            "bridge": bcfg["network_bridge"],
+        },
+    }
+    networks = [default_network]
+
+    # Dual stack: the IPv6 network shares a nic_group with the IPv4 one, so the
+    # director puts both on a single interface and the CPI emits one PVE NIC
+    # carrying ip=/gw= and ip6=/gw6=. `default: [dns, gateway]` stays on the
+    # IPv4 network because the deployment template gives it to networks[0].
+    #
+    # upstream load_deployment_spec sets properties.ipv6 = false, so the IPv6
+    # network only reaches a job when a spec opts in with use_ipv6; the cloud
+    # config always carries both subnets.
+    if bcfg["network_cidr_ipv6"]:
+        default_network["nic_group"] = bcfg["nic_group"]
+        networks.append({
+            "name": "ipv6",
+            "type": "manual",
+            "static_ip": bcfg["static_ip_ipv6"],
+            "cidr": bcfg["network_cidr_ipv6"],
+            "reserved": bcfg["network_reserved_ipv6"],
+            "static": bcfg["network_static_ipv6"],
+            "gateway": bcfg["network_gateway_ipv6"],
+            "nic_group": bcfg["nic_group"],
+            "cloud_properties": {
+                "bridge": bcfg["network_bridge"],
+            },
+        })
+
     spec: dict = {
         "cpi": CPI_NAME,
         "properties": {
@@ -290,20 +561,7 @@ def build_bat_spec(
                 "version": str(stemcell_version),
             },
             "instances": 1,
-            "networks": [
-                {
-                    "name": "default",
-                    "type": "manual",
-                    "static_ip": bcfg["static_ip"],
-                    "cidr": bcfg["network_cidr"],
-                    "reserved": bcfg["network_reserved"],
-                    "static": bcfg["network_static"],
-                    "gateway": bcfg["network_gateway"],
-                    "cloud_properties": {
-                        "bridge": bcfg["network_bridge"],
-                    },
-                },
-            ],
+            "networks": networks,
             "second_static_ip": bcfg["second_static_ip"],
             "ssh_key_pair": {
                 "public_key": public_key,
@@ -365,6 +623,23 @@ def parse_rspec_junit(path: Path) -> "dict | None":
     }
 
 
+def merge_rspec_junit(paths: "list[Path]") -> "dict | None":
+    """Sum the junit files a multi-pass run produced into one result set."""
+    parsed = [r for r in (parse_rspec_junit(p) for p in paths) if r]
+    if not parsed:
+        return None
+    merged = {
+        "tests": 0, "failures": 0, "errors": 0, "skipped": 0,
+        "seconds": 0.0, "cases": [],
+    }
+    for result in parsed:
+        for key in ("tests", "failures", "errors", "skipped"):
+            merged[key] += result[key]
+        merged["seconds"] += result["seconds"]
+        merged["cases"].extend(result["cases"])
+    return merged
+
+
 def _md_escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
@@ -383,7 +658,10 @@ def write_run_doc(
     """
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     date = meta["date"]
-    doc = RUNS_DIR / f"{date}.md"
+    # A targeted run covers a slice of the suite, so it gets its own file
+    # rather than overwriting the day's certification report.
+    suffix = meta.get("doc_suffix") or ""
+    doc = RUNS_DIR / f"{date}{suffix}.md"
 
     verdict = meta["verdict"]
     lines: list[str] = []
@@ -456,6 +734,7 @@ def write_run_doc(
         ("Proxmox VE", "pve_version"),
         ("Ruby", "ruby_version"),
         ("Env bundle", "env"),
+        ("Dual stack", "dual_stack"),
     ):
         value = meta.get(key) or "unknown"
         lines.append(f"| {label} | {_md_escape(str(value))} |")
@@ -629,6 +908,8 @@ class BATS:
         self.stemcell_mode = ""
         self.director_version = ""
         self.rspec_rc: "int | None" = None
+        self.junit_paths: "list[Path]" = []
+        self.dual_stack_ran = False
         self.excluded: dict[str, str] = {}
 
     # -- env helpers -------------------------------------------------------- #
@@ -1057,20 +1338,110 @@ class BATS:
 
     # -- run ----------------------------------------------------------------- #
 
-    def excluded_tags(self) -> dict[str, str]:
+    def excluded_tags(self, dual_stack: bool = False) -> dict[str, str]:
+        """Tag exclusions for one rspec pass.
+
+        The dual-stack pass keeps the tags that need a second manual network;
+        the IPv4 pass drops them, because the job it deploys has one.
+        """
         excluded: dict[str, str] = {}
         if not self.args.no_default_excludes:
             excluded.update(DEFAULT_EXCLUDED_TAGS)
+            if not dual_stack:
+                excluded.update(DUAL_STACK_TAGS)
         for tag in self.bcfg["exclude_tags"]:
             excluded.setdefault(tag, "excluded via ci/integration.yml bats.exclude_tags")
         for tag in self.args.exclude or []:
             excluded.setdefault(tag, "excluded via --exclude")
         return excluded
 
+    def dual_stack_enabled(self) -> bool:
+        return bool(self.bcfg["network_cidr_ipv6"])
+
+    def rspec_passes(self) -> "list[tuple[str, bool, list[str]]]":
+        """(name, dual_stack, inclusion tags) for every rspec pass to run.
+
+        Without --only: the IPv4 pass alone. The dual-stack pass is opt-in
+        because the agent cannot hold two static addresses on one NIC
+        (_AGENT_STATIC_DUAL_STACK_REASON), so running it by default would
+        spend a deploy and the Director's full agent-ping timeout on a
+        failure the CPI cannot fix. With --only, one pass — the dual-stack
+        one when any requested tag belongs to it.
+        """
+        only = list(self.args.only or [])
+        if only:
+            if "multiple_manual_networks" in only:
+                sys.exit(
+                    "--only multiple_manual_networks cannot produce a green "
+                    "run: the tag also selects the IPv4-only 'deploys "
+                    "multiple manual networks' example, which needs a second "
+                    "IPv4 manual network the bats section cannot express, "
+                    "and upstream pins properties.ipv6 = false so the "
+                    "dual-stack pass filters the IPv6 network out of that "
+                    "example too. Use --only ipv6 for the dual-stack example"
+                )
+            dual = any(tag in DUAL_STACK_TAGS for tag in only)
+            if dual and not self.dual_stack_enabled():
+                sys.exit(
+                    f"--only {' '.join(only)} needs the dual-stack network; set "
+                    "bats.network_cidr_ipv6 in ci/integration.yml"
+                )
+            return [("dual-stack" if dual else "ipv4", dual, only)]
+        return [("ipv4", False, [])]
+
     def run_rspec(self) -> bool:
         self.rep.section("bats (rspec)")
         assert self.checkout is not None
-        self.excluded = self.excluded_tags()
+
+        passes = self.rspec_passes()
+        # The report lists what never ran. A tag the dual-stack pass covers is
+        # not an exclusion of the run, only of the IPv4 pass.
+        dual_stack_ran = any(p[1] for p in passes)
+        self.dual_stack_ran = dual_stack_ran
+        self.excluded = self.excluded_tags(dual_stack=dual_stack_ran)
+        if dual_stack_ran:
+            # multiple_manual_networks tags examples in both shapes. The
+            # dual-stack pass runs the IPv6 one; the IPv4 one needs a second
+            # IPv4 manual network the bats section cannot express, and runs in
+            # neither pass. Saying so beats dropping the tag from the table.
+            self.excluded["multiple_manual_networks"] = (
+                "partially covered: the dual-stack example runs, while the "
+                "IPv4-only example needs a second IPv4 manual network the "
+                "bats section cannot express"
+            )
+        self.junit_paths = []
+        # rspec_passes returns exactly one pass, so the run budget is the
+        # pass budget and the junit name never needs a pass suffix.
+        self.pass_timeout_s = max(1, self.bcfg["rspec_timeout_s"])
+        ok = True
+        for name, dual_stack, only in passes:
+            junit = self.run_dir / JUNIT_RSPEC
+            self.junit_paths.append(junit)
+            if not self._run_rspec_pass(name, dual_stack, only, junit):
+                ok = False
+                if self.args.fail_fast:
+                    break
+        if ok:
+            merged = merge_rspec_junit(self.junit_paths)
+            if merged is not None and merged["tests"] == 0:
+                # rspec exits 0 when a filter selects nothing, and tag
+                # filters are case-sensitive. A run that asserted nothing
+                # must not read as green.
+                print(
+                    "bats: rspec selected zero examples"
+                    + (f" (--only {' '.join(self.args.only)})" if self.args.only else "")
+                    + "; tag filters are case-sensitive",
+                    file=sys.stderr,
+                )
+                ok = False
+        self.rspec_rc = 0 if ok else 1
+        return ok
+
+    def _run_rspec_pass(
+        self, name: str, dual_stack: bool, only: "list[str]", junit: Path,
+    ) -> bool:
+        assert self.checkout is not None
+        excluded = self.excluded_tags(dual_stack=dual_stack)
 
         # A command-line --format replaces the .rspec one rather than adding
         # to it, so name both: the checkout's verbose formatter keeps
@@ -1081,11 +1452,11 @@ class BATS:
             "--require", "./spec/system/support/bats_verbose_formatter.rb",
             "--format", "BatsVerboseFormatter",
             "--format", "RspecJunitFormatter",
-            "--out", str(self.run_dir / JUNIT_RSPEC),
+            "--out", str(junit),
         ]
-        for tag in sorted(self.excluded):
+        for tag in sorted(excluded):
             argv += ["--tag", f"~{tag}"]
-        for tag in self.args.only or []:
+        for tag in only:
             argv += ["--tag", tag]
         if self.args.fail_fast:
             argv.append("--fail-fast")
@@ -1110,10 +1481,9 @@ class BATS:
         env.pop("SSH_AUTH_SOCK", None)
 
         ok, _ = self.runner.step(
-            "bats:rspec", argv, env=env, cwd=self.checkout,
-            timeout=self.bcfg["rspec_timeout_s"],
+            f"bats:rspec:{name}", argv, env=env, cwd=self.checkout,
+            timeout=self.pass_timeout_s,
         )
-        self.rspec_rc = 0 if ok else 1
         return ok
 
     # -- finalize ------------------------------------------------------------ #
@@ -1136,7 +1506,7 @@ class BATS:
         t0 = time.monotonic()
         self.rep.begin("docs:report")
         try:
-            rspec = parse_rspec_junit(self.run_dir / JUNIT_RSPEC)
+            rspec = merge_rspec_junit(self.junit_paths or [self.run_dir / JUNIT_RSPEC])
             meta = self._run_meta(rspec, rspec_ok)
             phases = [
                 {"name": n, "seconds": s}
@@ -1187,6 +1557,10 @@ class BATS:
 
         if rspec is None:
             verdict = "FAILED" if not rspec_ok else "UNKNOWN"
+        elif rspec["tests"] == 0:
+            # rspec exits 0 when a filter selects nothing. A run that asserted
+            # nothing is not a run that passed.
+            verdict = "UNKNOWN"
         elif rspec_ok and rspec["failures"] == 0 and rspec["errors"] == 0:
             verdict = "PASSED"
         else:
@@ -1197,6 +1571,14 @@ class BATS:
             flags.append(f"--env {self.env_name}")
         if self.args.stemcell != "light":
             flags.append(f"--stemcell {self.args.stemcell}")
+        # Selection flags change what the report covers, so the report has to
+        # carry them: a targeted run must not read like a certification run.
+        for tag in self.args.only or []:
+            flags.append(f"--only {tag}")
+        for tag in self.args.exclude or []:
+            flags.append(f"--exclude {tag}")
+        if self.args.no_default_excludes:
+            flags.append("--no-default-excludes")
 
         return {
             "date": started.strftime("%Y-%m-%d"),
@@ -1204,6 +1586,13 @@ class BATS:
             "finished": now.strftime("%Y-%m-%d %H:%M:%S"),
             "wall_hms": fmt_hms(wall),
             "command_line": "./scripts/bats run " + " ".join(flags),
+            "doc_suffix": (
+                "-" + "-".join(
+                    re.sub(r"[^a-z0-9]+", "-", tag.lower()).strip("-")
+                    for tag in self.args.only
+                )
+                if self.args.only else ""
+            ),
             "exit_code": self.rspec_rc if self.rspec_rc is not None else 1,
             "verdict": verdict,
             "examples": rspec["tests"] if rspec else None,
@@ -1217,9 +1606,26 @@ class BATS:
             "pve_version": pve_version,
             "ruby_version": ruby_version,
             "env": self.env_name,
+            "dual_stack": self._dual_stack_meta(),
             "excluded_tags": sorted(self.excluded),
             "excluded_reasons": self.excluded,
         }
+
+    def _dual_stack_meta(self) -> str:
+        """One line for the report: what the dual-stack network did this run."""
+        if self.dual_stack_ran:
+            return (
+                f"IPv4 {self.bcfg['network_cidr']} and IPv6 "
+                f"{self.bcfg['network_cidr_ipv6']} on one NIC "
+                f"(nic_group {self.bcfg['nic_group']})"
+            )
+        if self.dual_stack_enabled():
+            return (
+                f"configured (IPv6 {self.bcfg['network_cidr_ipv6']}, nic_group "
+                f"{self.bcfg['nic_group']}) but not run; the dual-stack pass is "
+                "opt-in via --only ipv6"
+            )
+        return "no; IPv4 only"
 
     # -- orchestration ------------------------------------------------------- #
 

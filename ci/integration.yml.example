@@ -210,6 +210,25 @@ bats:
   - 172.31.0.190-172.31.0.199
   static_ip:        172.31.0.190  # Primary static IP (inside the static band)
   second_static_ip: 172.31.0.191  # Redeploy target; same band, different address
+  # Dual stack (optional). Setting network_cidr_ipv6 adds a second manual
+  # network named `ipv6` to bat.yml and lets `./scripts/bats run --only ipv6`
+  # deploy a job on both networks. The other four ipv6 keys are then
+  # required. Both networks get the same nic_group, so the director places
+  # them on one interface and the CPI writes a single dual-stack ipconfig
+  # entry. The bridge is shared with the IPv4 network. Keep the static band
+  # small: the director enumerates every address in it, while reserved bands
+  # collapse to CIDRs. That pass is opt-in, not part of a default run: the
+  # agent writes one systemd-networkd file per static interface
+  # configuration, so a second static address on a shared NIC overwrites the
+  # first and the VM never reaches the Director. See docs/certification/bats.md.
+  network_cidr_ipv6:    ""        # e.g. fd36:afd4:2c42:1::/64; empty = IPv4 only
+  network_gateway_ipv6: ""        # e.g. fd36:afd4:2c42:1::1
+  network_reserved_ipv6: []       # e.g. [fd36:afd4:2c42:1::-fd36:afd4:2c42:1::48:18f]
+  network_static_ipv6:   []       # e.g. [fd36:afd4:2c42:1::48:190-fd36:afd4:2c42:1::48:19f]
+  static_ip_ipv6:       ""        # e.g. fd36:afd4:2c42:1::48:190
+  nic_group:        1             # Shared by both networks. Numeric: the
+                                  # director coerces nic_group with to_i, so a
+                                  # name would collapse to 0
   cpi_id:           ""            # cpi-config entry name for the BATS AZ;
                                   # REQUIRED when the director has a cpi-config
                                   # applied (e.g. pve-az1), empty otherwise
