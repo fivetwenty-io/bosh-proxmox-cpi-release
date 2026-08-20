@@ -53,5 +53,5 @@ This page collects every known limitation of the CPI in one place. Each entry is
 
 ## Validation status
 
-- The parked disk strategy has not been validated against a live cluster
-  The implementation is code-complete and unit-tested, and the lifecycle harness carries park and unpark coverage, but neither has run against live Proxmox VE yet. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md#residual-risk).
+- The parked disk strategy is live-validated on clusters only
+  Validated 2026-08-20 on a two-node Proxmox VE cluster: baseline and current code both ran the full tier 1 lifecycle green, including park, unpark, refusal, and drain coverage. No single-node lab is currently materialized, so single-node validation remains open. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md#residual-risk).

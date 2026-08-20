@@ -401,7 +401,35 @@ def step(msg: str) -> None:
     print()
 
 
+# The CPI marks transient failures with ok_to_retry=true and the Director
+# retries them with a delay; a client that gives up on the first transient
+# (a PVE config-lock timeout during reboot cleanup, for example) fails runs
+# the Director would have completed. call() honors the same contract.
+RETRIABLE_ATTEMPTS = 4
+RETRIABLE_DELAY_SEC = 15
+
+
 def call(method: str, args: list[Any], config_path: str = "") -> Any:
+    for attempt in range(1, RETRIABLE_ATTEMPTS + 1):
+        try:
+            return _call_once(method, args, config_path)
+        except RetriableCPIError as exc:
+            if attempt == RETRIABLE_ATTEMPTS:
+                raise RuntimeError(str(exc)) from exc
+            print(
+                f"call {method} retriable failure (attempt {attempt}/{RETRIABLE_ATTEMPTS}), "
+                f"retrying in {RETRIABLE_DELAY_SEC}s",
+                file=sys.stderr,
+            )
+            time.sleep(RETRIABLE_DELAY_SEC)
+    raise AssertionError("unreachable")
+
+
+class RetriableCPIError(RuntimeError):
+    """A CPI error envelope with ok_to_retry=true."""
+
+
+def _call_once(method: str, args: list[Any], config_path: str = "") -> Any:
     req_id = f"{time.time_ns()}-{random.randint(0, 1 << 32)}"
     req = {
         "method": method,
@@ -437,9 +465,14 @@ def call(method: str, args: list[Any], config_path: str = "") -> Any:
         print(f"call {method} failed:", file=sys.stderr)
         print(json.dumps(resp["error"], indent=2), file=sys.stderr)
         err_msg = ""
+        retriable = False
         if isinstance(resp["error"], dict):
             err_msg = str(resp["error"].get("message", "")).strip()
-        raise RuntimeError(f"{method} failed: {err_msg}" if err_msg else f"{method} failed")
+            retriable = resp["error"].get("ok_to_retry") is True
+        full_msg = f"{method} failed: {err_msg}" if err_msg else f"{method} failed"
+        if retriable:
+            raise RetriableCPIError(full_msg)
+        raise RuntimeError(full_msg)
 
     return resp.get("result")
 

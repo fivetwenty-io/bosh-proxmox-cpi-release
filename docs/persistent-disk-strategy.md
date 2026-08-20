@@ -544,10 +544,30 @@ expected state after a full strategy migration.
 ## Residual risk
 
 Parking is now the default, so every deployment that does not name a strategy
-gets it on upgrade. It has not been validated against a live Proxmox VE cluster.
-The implementation is code-complete and unit-tested, and `scripts/lifecycle`
-carries park and unpark coverage, but that coverage is itself new and has not
-been run against a live cluster either.
+gets it on upgrade. The strategy has now been validated against a live Proxmox
+VE cluster. Run record (pmx two-node nested cluster, lab-pmx-0 and lab-pmx-1,
+2026-08-20):
+
+- Baseline on the pre-change code
+  Full tier 1 lifecycle green across the bridge, SDN, and snapshot-detach
+  bypass passes, including both park passes and the parker refusal checks.
+
+- Same run on the current code
+  Green across all three passes, additionally covering the fresh-disk park on
+  create, the anchor and format fields in the CID envelope, the moved-band
+  refusals, unpark protection restore, free-strategy opt-out, parker reuse,
+  and the unset-band drain step.
+
+- Known flake, not a regression
+  PVE can hold the VM config lock for tens of seconds during reboot cleanup
+  on slow nested labs, so a `delete_vm` issued immediately after a reboot test
+  can fail with a qmstop lock timeout. The CPI correctly surfaces this as
+  retriable (`ok_to_retry: true`) and the Director retries it with a delay;
+  `scripts/lifecycle` now honors the same retry contract.
+
+- Open remainder
+  Both labs used for validation are clusters. No single-node lab is currently
+  materialized, so the single-node half of this validation remains open.
 
 There is no "before enabling" moment left, so treat the list below as
 post-upgrade verification, on the first cluster to take the new release:
