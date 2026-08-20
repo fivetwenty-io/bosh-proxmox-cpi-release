@@ -189,46 +189,10 @@ func applyVIPAllowedAddressPairs(
 	vmidStr := strconv.Itoa(vmid)
 	nodeSvc := deps.PVE.Nodes()
 
-	// Step 1: compute per-NIC state. Properties of a NIC shared by several
-	// networks are the union of its members': the firewall is on if any
-	// member enables it, VIP entries accumulate, and every member's address
-	// is one the NIC legitimately sends from.
-	states := make([]nicState, 0, len(plan))
-	for _, entry := range plan {
-		state := nicState{idx: entry.index}
-		for _, name := range entry.names {
-			spec := networks[name]
-			vips, err := parseVIPEntries(spec.CloudProperties)
-			if err != nil {
-				// Entry already validated early — this is a defensive path; treat as
-				// warn + skip-all (fail-open) rather than surface a post-mutation error.
-				logger.Warn("create_vm: applyVIPAllowedAddressPairs: unexpected parse error (fail-open)",
-					log.Int(metadataKeyVMID, vmid), log.String("net", name), log.Err(err))
-				return nil
-			}
-			state.vips = append(state.vips, vips...)
-			if nicFirewallEnabled(spec, deps.Config) {
-				state.fw = true
-			}
-			if nicIPForwardingEnabled(spec.CloudProperties) {
-				state.ipForward = true
-			}
-			if nicIsStatic(spec) {
-				state.static = true
-				state.ips = append(state.ips, spec.IP)
-			}
-		}
-		// A NIC counts as static only when no member leaves it dynamic:
-		// one DHCP member is enough to make its final address unknowable,
-		// which is exactly the lockout case step 4 refuses to risk.
-		for _, name := range entry.names {
-			spec := networks[name]
-			if !nicIsStatic(spec) && !strings.EqualFold(spec.Type, nicTypeVIP) {
-				state.static = false
-				break
-			}
-		}
-		states = append(states, state)
+	// Step 1: compute per-NIC state (union over each NIC's member networks).
+	states, ok := computeVIPNICStates(deps, networks, plan, vmid, logger)
+	if !ok {
+		return nil
 	}
 
 	// Step 2: bail if no NIC carries any VIP.
@@ -251,74 +215,25 @@ func applyVIPAllowedAddressPairs(
 		}
 	}
 
-	// Step 4: safety guard — skip if any firewalled, non-ip_forwarding NIC is
-	// DHCP/dynamic OR has an unparseable primary IP. Both cases would cause VM
-	// lockout if ipfilter were enabled. ip_forwarding NICs are excluded because
-	// they will have firewall=0 applied by applyIPForwarding and are never seeded
-	// into an ipset; including them in this guard would incorrectly abort ipfilter
-	// for the remaining static NICs.
-	for i := range states {
-		if !states[i].fw || states[i].ipForward {
-			continue
-		}
-		if !states[i].static {
-			logger.Warn("create_vm: VIP ipfilter skipped: firewalled DHCP/dynamic NIC present; cannot safely enable VM-global ipfilter",
-				log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)))
-			return nil
-		}
-		// Validate every address the NIC carries before seeding any ipsets.
-		for _, ip := range states[i].ips {
-			if _, err := normalizeVIPEntry(ip); err != nil {
-				logger.Warn("create_vm: VIP ipfilter skipped: firewalled NIC primary IP unparseable; cannot guarantee allowlist, ipfilter not enabled",
-					log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)),
-					log.String("ip", ip), log.Err(err))
-				return nil
-			}
-		}
+	// Step 4: safety guard — skip if enabling ipfilter could lock the VM out.
+	if !vipIpfilterSafe(states, vmid, logger) {
+		return nil
 	}
 
 	// Step 5: seed ipsets for ALL firewalled NICs that are NOT ip_forwarding.
 	// NICs with ip_forwarding=true are router/NAT NICs: they forward packets not
 	// in their own ipset, so applying ipfilter on them would silently drop
 	// forwarded traffic. Such NICs are excluded from both ipset seeding and the
-	// fwCount that gates the ipfilter enable.
+	// fwCount that gates the ipfilter enable (firewall=0 will be applied to
+	// them by applyIPForwarding; seeding an ipset would conflict with that).
 	fwCount := 0
 	for i := range states {
-		if !states[i].fw {
-			continue
-		}
-		// Skip ip_forwarding NICs — firewall=0 will be applied by applyIPForwarding;
-		// seeding an ipset for them would conflict with that intent.
-		if states[i].ipForward {
+		if !states[i].fw || states[i].ipForward {
 			continue
 		}
 		fwCount++
-		ipsetName := fmt.Sprintf("ipfilter-net%d", states[i].idx)
-
-		// Build deduplicated entry list: the NIC's own addresses first, then VIPs.
-		entries := buildIPSetEntries(states[i].ips, states[i].vips)
-
-		// Create the ipset; tolerate "already exists".
-		if createErr := nodeSvc.CreateQemuFirewallIpset(ctx, node, vmidStr,
-			&sdknodes.CreateQemuFirewallIpsetParams{Name: ipsetName}); createErr != nil {
-			if !strings.Contains(strings.ToLower(createErr.Error()), "already exists") {
-				logger.Warn("create_vm: ipset create failed (ipfilter not enabled, fail-open)",
-					log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName), log.Err(createErr))
-				return nil
-			}
-			logger.Debug("create_vm: ipset already exists, adding entries",
-				log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName))
-		}
-
-		// Add each entry.
-		for _, entry := range entries {
-			if entryErr := nodeSvc.CreateQemuFirewallIpset2(ctx, node, vmidStr, ipsetName,
-				&sdknodes.CreateQemuFirewallIpset2Params{Cidr: entry}); entryErr != nil {
-				logger.Warn("create_vm: ipset entry add failed (ipfilter not enabled, fail-open)",
-					log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName),
-					log.String("entry", entry), log.Err(entryErr))
-				return nil
-			}
+		if !seedVIPIpset(ctx, nodeSvc, node, vmidStr, vmid, &states[i], logger) {
+			return nil
 		}
 	}
 
@@ -344,6 +259,129 @@ func applyVIPAllowedAddressPairs(
 		log.Int(metadataKeyVMID, vmid), log.Int("firewalled_nics", fwCount))
 
 	return nil
+}
+
+// computeVIPNICStates computes the per-NIC state for applyVIPAllowedAddressPairs
+// step 1. Properties of a NIC shared by several networks are the union of its
+// members': the firewall is on if any member enables it, VIP entries
+// accumulate, and every member's address is one the NIC legitimately sends
+// from. Returns ok=false on the defensive parse failure (entries were already
+// validated early, so this is warn + skip-all fail-open, never a
+// post-mutation error).
+func computeVIPNICStates(
+	deps Deps,
+	networks map[string]createVMNetworkSpec,
+	plan []nicPlanEntry,
+	vmid int,
+	logger *log.Logger,
+) ([]nicState, bool) {
+	states := make([]nicState, 0, len(plan))
+	for _, entry := range plan {
+		state := nicState{idx: entry.index}
+		for _, name := range entry.names {
+			spec := networks[name]
+			vips, err := parseVIPEntries(spec.CloudProperties)
+			if err != nil {
+				logger.Warn("create_vm: applyVIPAllowedAddressPairs: unexpected parse error (fail-open)",
+					log.Int(metadataKeyVMID, vmid), log.String("net", name), log.Err(err))
+				return nil, false
+			}
+			state.vips = append(state.vips, vips...)
+			if nicFirewallEnabled(spec, deps.Config) {
+				state.fw = true
+			}
+			if nicIPForwardingEnabled(spec.CloudProperties) {
+				state.ipForward = true
+			}
+			if nicIsStatic(spec) {
+				state.static = true
+				state.ips = append(state.ips, spec.IP)
+			}
+		}
+		// A NIC counts as static only when no member leaves it dynamic:
+		// one DHCP member is enough to make its final address unknowable,
+		// which is exactly the lockout case the step-4 guard refuses to risk.
+		for _, name := range entry.names {
+			spec := networks[name]
+			if !nicIsStatic(spec) && !strings.EqualFold(spec.Type, nicTypeVIP) {
+				state.static = false
+				break
+			}
+		}
+		states = append(states, state)
+	}
+	return states, true
+}
+
+// vipIpfilterSafe is applyVIPAllowedAddressPairs' step-4 safety guard: false
+// when any firewalled, non-ip_forwarding NIC is DHCP/dynamic OR has an
+// unparseable primary IP — both cases would cause VM lockout if ipfilter were
+// enabled. ip_forwarding NICs are excluded because they will have firewall=0
+// applied by applyIPForwarding and are never seeded into an ipset; including
+// them in this guard would incorrectly abort ipfilter for the remaining
+// static NICs.
+func vipIpfilterSafe(states []nicState, vmid int, logger *log.Logger) bool {
+	for i := range states {
+		if !states[i].fw || states[i].ipForward {
+			continue
+		}
+		if !states[i].static {
+			logger.Warn("create_vm: VIP ipfilter skipped: firewalled DHCP/dynamic NIC present; cannot safely enable VM-global ipfilter",
+				log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)))
+			return false
+		}
+		// Validate every address the NIC carries before seeding any ipsets.
+		for _, ip := range states[i].ips {
+			if _, err := normalizeVIPEntry(ip); err != nil {
+				logger.Warn("create_vm: VIP ipfilter skipped: firewalled NIC primary IP unparseable; cannot guarantee allowlist, ipfilter not enabled",
+					log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)),
+					log.String("ip", ip), log.Err(err))
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// seedVIPIpset creates and populates the ipfilter-net{N} ipset for one
+// firewalled NIC (applyVIPAllowedAddressPairs step 5). Returns false on any
+// PVE failure so the caller skips the ipfilter enable (fail-open); an
+// already-existing ipset is tolerated.
+func seedVIPIpset(
+	ctx context.Context,
+	nodeSvc sdknodes.Service,
+	node, vmidStr string,
+	vmid int,
+	state *nicState,
+	logger *log.Logger,
+) bool {
+	ipsetName := fmt.Sprintf("ipfilter-net%d", state.idx)
+
+	// Build deduplicated entry list: the NIC's own addresses first, then VIPs.
+	entries := buildIPSetEntries(state.ips, state.vips)
+
+	// Create the ipset; tolerate "already exists".
+	if createErr := nodeSvc.CreateQemuFirewallIpset(ctx, node, vmidStr,
+		&sdknodes.CreateQemuFirewallIpsetParams{Name: ipsetName}); createErr != nil {
+		if !strings.Contains(strings.ToLower(createErr.Error()), "already exists") {
+			logger.Warn("create_vm: ipset create failed (ipfilter not enabled, fail-open)",
+				log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName), log.Err(createErr))
+			return false
+		}
+		logger.Debug("create_vm: ipset already exists, adding entries",
+			log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName))
+	}
+
+	for _, entry := range entries {
+		if entryErr := nodeSvc.CreateQemuFirewallIpset2(ctx, node, vmidStr, ipsetName,
+			&sdknodes.CreateQemuFirewallIpset2Params{Cidr: entry}); entryErr != nil {
+			logger.Warn("create_vm: ipset entry add failed (ipfilter not enabled, fail-open)",
+				log.Int(metadataKeyVMID, vmid), log.String("ipset", ipsetName),
+				log.String("entry", entry), log.Err(entryErr))
+			return false
+		}
+	}
+	return true
 }
 
 // buildIPSetEntries returns the deduplicated, stable-order list of CIDR entries

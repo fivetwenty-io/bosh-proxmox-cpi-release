@@ -236,101 +236,22 @@ func configureNICs(
 	// eventual-consistency gate can resolve them all on the target node before
 	// any config write (no partial netN= on a not-yet-realized bridge).
 	bridgeSet := make(map[string]struct{}, len(netNames))
-	// PVE's nameserver is one VM-global list, so it is the ordered union of
-	// every network's resolvers: a dual-stack pair whose IPv4 network names
-	// an IPv4 resolver and whose IPv6 network names an IPv6 one must end up
-	// with both, not with whichever came first.
+	// VM-global ordered union of every network's resolvers; rationale in
+	// appendGroupNameservers.
 	var nameservers []string
 	seenNS := make(map[string]struct{})
 
 	for _, entry := range plan {
-		i, name := entry.index, entry.primary()
-		spec := parsed.networks[name]
+		i := entry.index
 
-		attrs, attrErr := resolveNICAttributes(
-			deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel, name)
+		attrs, attrErr := resolveGroupNICAttributes(deps, parsed, entry, defaultBridge, defaultModel)
 		if attrErr != nil {
 			return nil, attrErr
 		}
-		// Every network on a shared NIC must resolve to the same physical
-		// attachment — one interface cannot sit on two bridges or carry two
-		// VLAN tags. Resolving each member and comparing turns a
-		// contradictory cloud-config into a create-time error instead of a
-		// NIC that silently honours only the first member's bridge.
-		//
-		// The firewall flag is the exception: it is a policy switch, not an
-		// attachment, and every other consumer (ip_forwarding, the ipfilter
-		// ipsets) already reads it as "any member asking for it turns it on
-		// for the whole NIC". Union it here so the operator does not have to
-		// repeat the flag on the IPv6 subnet's cloud_properties.
-		for _, other := range entry.names[1:] {
-			otherAttrs, otherErr := resolveNICAttributes(
-				deps, parsed.cloudProps.NetworkDefaults, parsed.networks[other].CloudProperties,
-				defaultBridge, defaultModel, other)
-			if otherErr != nil {
-				return nil, otherErr
-			}
-			attrs.firewall = attrs.firewall || otherAttrs.firewall
-			otherAttrs.firewall = attrs.firewall
-			if otherAttrs != attrs {
-				return nil, cpierrors.Cloud(
-					"create_vm: networks %q and %q share nic_group %q but resolve to different NIC attributes "+
-						"(bridge/model/vlan/mtu must match across a nic_group)",
-					name, other, strings.TrimSpace(string(spec.NicGroup)))
-			}
-		}
-		bridge, model, nicFirewall, vlan, mtu := attrs.bridge, attrs.model, attrs.firewall, attrs.vlan, attrs.mtu
 
-		// net0 = "virtio,bridge=vmbr0" (no MAC — PVE assigns one)
-		netMap[i] = fmt.Sprintf("%s,bridge=%s", model, bridge)
-		if nicFirewall {
-			netMap[i] += ",firewall=1"
-		}
-		if vlan != 0 {
-			netMap[i] += fmt.Sprintf(",tag=%d", vlan)
-			// An explicit vlan tag (Pattern A) on a bridge that is itself an SDN
-			// vnet (Pattern B) mixes the two documented alternatives — the vnet
-			// may already encode a VLAN of its own. Warn rather than fail: PVE
-			// is the authority on whether the combination is actually invalid,
-			// and will reject the config outright when it is.
-			if _, onVnet := vnetNames[bridge]; onVnet {
-				logger.Warn("create_vm: network sets an explicit vlan tag on a bridge that is itself an SDN vnet (mixing per-NIC VLAN tagging with an SDN vnet-per-VLAN pattern)",
-					log.String("network", name),
-					log.String("bridge", bridge),
-					log.Int("vlan", vlan),
-				)
-			}
-		}
-		// mtu is a virtio-only option (PVE rejects it on e1000/rtl8139) —
-		// resolveNICAttributes already validated that above for an explicit
-		// per-NIC/network_defaults value. An explicit mtu always wins over
-		// the automatic vnet-derived mtu=1 inheritance below — never emit
-		// both mtu= segments.
-		switch {
-		case mtu != 0:
-			netMap[i] += fmt.Sprintf(",mtu=%d", mtu)
-		default:
-			_, isVnet := vnetNames[bridge]
-			switch {
-			case isVnet && strings.HasPrefix(model, "virtio"):
-				netMap[i] += ",mtu=1"
-			case isVnet:
-				// Non-virtio model on an SDN vnet: the guest cannot inherit the
-				// vnet's (typically reduced, VXLAN-encapsulated) MTU the way a
-				// virtio NIC does, and stays at the PVE default of 1500. That
-				// mismatch is the "small packets pass, large packets hang"
-				// blackhole — see docs/troubleshooting.md's "Small packets pass,
-				// large packets hang (SDN MTU)" entry. Warn at create time rather
-				// than leaving the operator to discover it via a hung transfer.
-				logger.Warn("create_vm: non-virtio NIC model on an SDN vnet will not auto-track the vnet MTU",
-					log.String("network", name),
-					log.String("model", model),
-					log.String("vnet", bridge),
-				)
-			}
-		}
-		if bridge != "" {
-			bridgeSet[bridge] = struct{}{}
+		netMap[i] = buildNICNetValue(logger, entry.primary(), attrs, vnetNames)
+		if attrs.bridge != "" {
+			bridgeSet[attrs.bridge] = struct{}{}
 		}
 
 		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>. A NIC shared
@@ -344,19 +265,7 @@ func configureNICs(
 			ipconfigMap[i] = cfg
 		}
 
-		for _, member := range entry.names {
-			for _, ns := range parsed.networks[member].DNS {
-				ns = strings.TrimSpace(ns)
-				if ns == "" {
-					continue
-				}
-				if _, dup := seenNS[ns]; dup {
-					continue
-				}
-				seenNS[ns] = struct{}{}
-				nameservers = append(nameservers, ns)
-			}
-		}
+		nameservers = appendGroupNameservers(nameservers, seenNS, entry, parsed.networks)
 	}
 
 	nicParams := &sdknodes.UpdateQemuConfigParams{
@@ -396,6 +305,133 @@ func configureNICs(
 	}
 
 	return plan, nil
+}
+
+// resolveGroupNICAttributes resolves the NIC attributes for a plan entry.
+// Every network on a shared NIC (nic_group) must resolve to the same physical
+// attachment — one interface cannot sit on two bridges or carry two VLAN
+// tags. Resolving each member and comparing turns a contradictory
+// cloud-config into a create-time error instead of a NIC that silently
+// honours only the first member's bridge.
+//
+// The firewall flag is the exception: it is a policy switch, not an
+// attachment, and every other consumer (ip_forwarding, the ipfilter ipsets)
+// already reads it as "any member asking for it turns it on for the whole
+// NIC". Union it here so the operator does not have to repeat the flag on
+// the IPv6 subnet's cloud_properties.
+func resolveGroupNICAttributes(
+	deps Deps,
+	parsed *createVMParsedArgs,
+	entry nicPlanEntry,
+	defaultBridge, defaultModel string,
+) (nicAttributes, error) {
+	name := entry.primary()
+	spec := parsed.networks[name]
+
+	attrs, attrErr := resolveNICAttributes(
+		deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel, name)
+	if attrErr != nil {
+		return nicAttributes{}, attrErr
+	}
+	for _, other := range entry.names[1:] {
+		otherAttrs, otherErr := resolveNICAttributes(
+			deps, parsed.cloudProps.NetworkDefaults, parsed.networks[other].CloudProperties,
+			defaultBridge, defaultModel, other)
+		if otherErr != nil {
+			return nicAttributes{}, otherErr
+		}
+		attrs.firewall = attrs.firewall || otherAttrs.firewall
+		otherAttrs.firewall = attrs.firewall
+		if otherAttrs != attrs {
+			return nicAttributes{}, cpierrors.Cloud(
+				"create_vm: networks %q and %q share nic_group %q but resolve to different NIC attributes "+
+					"(bridge/model/vlan/mtu must match across a nic_group)",
+				name, other, strings.TrimSpace(string(spec.NicGroup)))
+		}
+	}
+	return attrs, nil
+}
+
+// buildNICNetValue renders the PVE netN= config value for a NIC:
+// "virtio,bridge=vmbr0" plus optional firewall, VLAN tag, and mtu segments
+// (no MAC — PVE assigns one).
+func buildNICNetValue(logger *log.Logger, name string, attrs nicAttributes, vnetNames map[string]struct{}) string {
+	v := fmt.Sprintf("%s,bridge=%s", attrs.model, attrs.bridge)
+	if attrs.firewall {
+		v += ",firewall=1"
+	}
+	if attrs.vlan != 0 {
+		v += fmt.Sprintf(",tag=%d", attrs.vlan)
+		// An explicit vlan tag (Pattern A) on a bridge that is itself an SDN
+		// vnet (Pattern B) mixes the two documented alternatives — the vnet
+		// may already encode a VLAN of its own. Warn rather than fail: PVE
+		// is the authority on whether the combination is actually invalid,
+		// and will reject the config outright when it is.
+		if _, onVnet := vnetNames[attrs.bridge]; onVnet {
+			logger.Warn("create_vm: network sets an explicit vlan tag on a bridge that is itself an SDN vnet (mixing per-NIC VLAN tagging with an SDN vnet-per-VLAN pattern)",
+				log.String("network", name),
+				log.String("bridge", attrs.bridge),
+				log.Int("vlan", attrs.vlan),
+			)
+		}
+	}
+	// mtu is a virtio-only option (PVE rejects it on e1000/rtl8139) —
+	// resolveNICAttributes already validated that above for an explicit
+	// per-NIC/network_defaults value. An explicit mtu always wins over
+	// the automatic vnet-derived mtu=1 inheritance below — never emit
+	// both mtu= segments.
+	switch {
+	case attrs.mtu != 0:
+		v += fmt.Sprintf(",mtu=%d", attrs.mtu)
+	default:
+		_, isVnet := vnetNames[attrs.bridge]
+		switch {
+		case isVnet && strings.HasPrefix(attrs.model, "virtio"):
+			v += ",mtu=1"
+		case isVnet:
+			// Non-virtio model on an SDN vnet: the guest cannot inherit the
+			// vnet's (typically reduced, VXLAN-encapsulated) MTU the way a
+			// virtio NIC does, and stays at the PVE default of 1500. That
+			// mismatch is the "small packets pass, large packets hang"
+			// blackhole — see docs/troubleshooting.md's "Small packets pass,
+			// large packets hang (SDN MTU)" entry. Warn at create time rather
+			// than leaving the operator to discover it via a hung transfer.
+			logger.Warn("create_vm: non-virtio NIC model on an SDN vnet will not auto-track the vnet MTU",
+				log.String("network", name),
+				log.String("model", attrs.model),
+				log.String("vnet", attrs.bridge),
+			)
+		}
+	}
+	return v
+}
+
+// appendGroupNameservers appends each member network's DNS entries to
+// nameservers, deduplicated across the whole VM via seen. PVE's nameserver is
+// one VM-global list, so it is the ordered union of every network's
+// resolvers: a dual-stack pair whose IPv4 network names an IPv4 resolver and
+// whose IPv6 network names an IPv6 one must end up with both, not with
+// whichever came first.
+func appendGroupNameservers(
+	nameservers []string,
+	seen map[string]struct{},
+	entry nicPlanEntry,
+	networks map[string]createVMNetworkSpec,
+) []string {
+	for _, member := range entry.names {
+		for _, ns := range networks[member].DNS {
+			ns = strings.TrimSpace(ns)
+			if ns == "" {
+				continue
+			}
+			if _, dup := seen[ns]; dup {
+				continue
+			}
+			seen[ns] = struct{}{}
+			nameservers = append(nameservers, ns)
+		}
+	}
+	return nameservers
 }
 
 // --------------------------------------------------------------------------
