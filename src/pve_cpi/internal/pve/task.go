@@ -345,8 +345,24 @@ func wrapPollError(err error, upid string) error {
 func AwaitTaskWithLogger(
 	ctx context.Context, c Client, node, upid string, logger *log.Logger, opts ...AwaitOption,
 ) error {
+	// AwaitTask polls the UPID's embedded node when it differs from the
+	// caller's (pveproxy may run a proxied request on the connection-handling
+	// node; see the note there). Log the node actually polled, not the
+	// caller's, so the log line matches the request PVE serves — plus a
+	// dedicated entry when the override fires, since that mismatch is the
+	// first clue in cross-node task confusion.
+	effectiveNode := node
+	if n := nodeFromUPID(upid); n != "" && n != node {
+		effectiveNode = n
+		if logger != nil {
+			logger.Debug("pve: task node overridden by UPID",
+				log.String("upid", upid),
+				log.String("caller_node", node),
+				log.String("effective_node", effectiveNode))
+		}
+	}
 	if logger != nil {
-		logger.Debug("pve: awaiting task", log.String("upid", upid), log.String("node", node))
+		logger.Debug("pve: awaiting task", log.String("upid", upid), log.String("node", effectiveNode))
 	}
 	err := AwaitTask(ctx, c, node, upid, opts...)
 	if err != nil {

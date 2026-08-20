@@ -19,6 +19,7 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
@@ -666,6 +667,76 @@ func TestAwaitTaskWithLogger_SuccessWithLogger(t *testing.T) {
 	err := pve.AwaitTaskWithLogger(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc", logger(t))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestAwaitTaskWithLogger_UPIDNodeOverride_LogsEffectiveNode verifies the log
+// lines follow the node AwaitTask actually polls: when the UPID embeds a
+// different node than the caller passed (pveproxy proxied-request behavior),
+// the awaiting entry carries the UPID's node and a dedicated debug entry
+// records the override.
+func TestAwaitTaskWithLogger_UPIDNodeOverride_LogsEffectiveNode(t *testing.T) {
+	t.Parallel()
+	var polledNode string
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, node, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			polledNode = node
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	obsLogger, obs := log.NewObservedLogger(log.LevelDebug)
+	err := pve.AwaitTaskWithLogger(context.Background(), newMockClient(svc), "node1", "UPID:node2:abc", obsLogger)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if polledNode != "node2" {
+		t.Errorf("polled node = %q; want the UPID's node2", polledNode)
+	}
+
+	var sawOverride, sawAwaiting bool
+	for _, e := range obs.All() {
+		switch e.Message {
+		case "pve: task node overridden by UPID":
+			sawOverride = true
+			if e.Attrs["caller_node"] != "node1" || e.Attrs["effective_node"] != "node2" {
+				t.Errorf("override entry attrs = %v; want caller_node=node1 effective_node=node2", e.Attrs)
+			}
+		case "pve: awaiting task":
+			sawAwaiting = true
+			if e.Attrs["node"] != "node2" {
+				t.Errorf("awaiting entry node = %v; want the effective node2", e.Attrs["node"])
+			}
+		}
+	}
+	if !sawOverride {
+		t.Error("expected a 'pve: task node overridden by UPID' debug entry")
+	}
+	if !sawAwaiting {
+		t.Error("expected a 'pve: awaiting task' debug entry")
+	}
+}
+
+// TestAwaitTaskWithLogger_MatchingNode_NoOverrideEntry verifies the override
+// entry is absent when the UPID's node matches the caller's.
+func TestAwaitTaskWithLogger_MatchingNode_NoOverrideEntry(t *testing.T) {
+	t.Parallel()
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	obsLogger, obs := log.NewObservedLogger(log.LevelDebug)
+	err := pve.AwaitTaskWithLogger(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc", obsLogger)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, e := range obs.All() {
+		if e.Message == "pve: task node overridden by UPID" {
+			t.Errorf("unexpected override entry: %v", e)
+		}
+		if e.Message == "pve: awaiting task" && e.Attrs["node"] != "node1" {
+			t.Errorf("awaiting entry node = %v; want node1", e.Attrs["node"])
+		}
 	}
 }
 
