@@ -20,6 +20,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D10 | qcow2 deletion policy | `:light:` files are never deleted by the CPI; `:heavy:` files are deleted only at the last director reference within a cluster |
 | D11 | HA versus the BOSH resurrector | An active, once-per-process warning plus a dedicated ownership doc; no change to `has_vm` behavior |
 | D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
+| D13 | Stable disk identity and ownership transfer | A drive `serial=` token becomes the disk's stable identity; ownership transfers by `move_disk` reassignment; the envelope volid becomes a birth record with legacy fallback forever |
 
 ---
 
@@ -252,6 +253,34 @@ Two guardrails matter operationally. First, a key inside the registry carrying a
 **Migration.** None for single-cluster deployments — a request with no `pve_*` context keys resolves to the job-level config unchanged. Multi-cluster operators should confirm every entry's bands are disjoint before applying a cpi-config with more than one `type: pve` entry.
 
 ---
+
+## D13: Stable disk identity via drive serial, ownership transfer via reassignment
+
+**Context.** Persistent-disk CIDs embed a PVE volid (`vm-<vmid>-disk-<n>`), but PVE's `move_disk` reassignment renames the volume to match its new owner, and BOSH CIDs are immutable once returned. Adopting reassignment as the ownership-transfer mechanism therefore requires a disk identity that survives the rename: the envelope's volid becomes a birth record, and a new stable ID becomes the identity the CPI resolves by. The open question was the identity's carrier on the PVE side, settled by a live spike rather than up front, with pre-agreed outcomes for both branches.
+
+**Live spike results** (two-node PVE 9.2.4 cluster, 2026-08-20, throwaway VMs and volumes on lvmthin, dir, and NFS storages):
+
+- Reassignment (`move_disk` with a target VM) completes in 0.8 to 1.5 seconds on all three storage families, and is metadata-only: an LV rename on lvmthin, a file move into the target's image directory on dir and NFS.
+
+- Reassigning an attached slot carries the full drive option string, including `serial=` and performance options, and the landed slot is selectable via the target-disk argument.
+
+- A running target VM accepts the reassignment and hotplugs the device live; the running QEMU immediately exposes the disk with its serial (verified through the QEMU monitor's device tree).
+
+- A running source VM refuses direct reassignment ("Cannot move disk to another VM while the source VM is running - detach first"). Detaching to an `unused` entry and reassigning that entry works from a running VM, but `unused` entries carry no drive options, so the serial drops on this path and we re-apply it on the landed slot after the transfer.
+
+- Editing a `serial=` on a running VM's attached disk updates the config silently while the live device keeps its original serial until the next full restart. A mid-life serial change is therefore an unbounded config-versus-guest divergence window: identity serials are written only at attach boundaries, never onto an already-attached disk.
+
+- PVE strictly validates drive option schemas ("property is not defined in schema and the schema does not allow additional properties"), so `serial=` is the only in-drive carrier available; arbitrary marker keys are rejected outright.
+
+- A disk referenced by a snapshot refuses reassignment immediately ("Can't move disk used by a snapshot to another VM"), before any task starts. Disks carrying snapshots keep the config-edit transfer path.
+
+- Reassignment is same-node only, even on shared storage ("Both VMs need to be on the same node"). Cross-node disk mobility needs a different vehicle and is out of scope here.
+
+**Chosen: drive serial as the carrier, reassignment as the transfer.** Both pre-agreed gate conditions passed (the carrier behaves, and a running target accepts reassignment), so the ownership-consistent design proceeds as planned. The serial wins over an owner-config marker because it rides the drive entry automatically through the parker-to-VM attach direction, which shrinks the unrecoverable crash window to the detach direction only, where write ordering covers it: the parker's provenance record is written before the holder's record is removed, so a scan always finds at least one carrier. A description-sentinel marker would survive no transfer automatically, and PVE's schema rejection rules out any other in-drive key. The serial is guest-visible by design and stable for the disk's life; because it is only ever written at attach boundaries, the guest only ever sees a serial appear on a freshly attached device, never a rename on a live one. PVE caps drive serials at 20 bytes, which bounds the token format.
+
+**Operator-visible consequences.** CID wire format is unchanged; new disks gain a stable ID inside the existing envelope. Legacy CIDs resolve through a volid fallback that can never be removed, since director databases keep old CIDs forever. Disks under the `free` detachment strategy stay on the legacy config-edit path entirely.
+
+**Follow-up recorded.** The attach path currently rebuilds drive option strings from the envelope's recorded options, and PVE rejects unknown keys, so any CPI-internal key that reaches the drive string is a live failure. The build verifies that CPI-internal option keys are filtered before the config write and adds a regression test.
 
 ## Out of scope
 

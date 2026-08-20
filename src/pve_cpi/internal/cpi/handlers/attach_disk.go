@@ -245,6 +245,10 @@ func attachDiskCore(
 		metaOpts = meta.Opts
 	}
 	effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
+	// CID opts are a mixed namespace: CPI-internal provenance keys (e.g.
+	// retain_on_delete) ride in meta.Opts but are not PVE drive options, and
+	// PVE rejects the whole config write on any key outside its drive schema.
+	stripCPIInternalDiskOpts(effectiveOpts)
 
 	// Enforce creation-time disk-performance invariants (§7.26), before any
 	// mutating PVE call so an enforce-mode reject leaves no orphan.

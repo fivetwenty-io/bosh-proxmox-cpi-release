@@ -242,6 +242,19 @@ func resolveDiskPerfIntOpt(opts map[string]string, r *layeredResolver, key strin
 //   - Unknown bus keeps all keys
 //
 // The input map is not mutated. nil or empty input returns an empty map.
+// cpiInternalDiskOptKeys are CID opts keys the CPI records for its own
+// bookkeeping. They are not PVE drive options, and PVE rejects a config
+// write carrying any key outside its drive schema, so they must be removed
+// from every option set that becomes a drive string.
+var cpiInternalDiskOptKeys = []string{diskOptRetainOnDelete}
+
+// stripCPIInternalDiskOpts removes CPI-internal bookkeeping keys in place.
+func stripCPIInternalDiskOpts(opts map[string]string) {
+	for _, k := range cpiInternalDiskOptKeys {
+		delete(opts, k)
+	}
+}
+
 func filterDiskPerfForBus(opts map[string]string, bus string) map[string]string {
 	out := make(map[string]string, len(opts))
 	for k, v := range opts {
