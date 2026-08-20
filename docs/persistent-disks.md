@@ -132,6 +132,8 @@ The payload is a JSON object with two fields:
 | `node` | PVE node that owns the disk. Set for local-backend volumes; empty for shared storage.     |
 | `az`   | Availability-zone label at create time. Empty when no AZ was resolved.                   |
 | `opts` | Per-disk performance settings map (iothread, cache, discard, ssd, mbps_rd, etc.).        |
+| `anchor` | Set when the disk was created under the parked strategy: it promises a parker anchor whenever the disk is detached (see `pve.parked_anchor_strict`). Omitted when false. |
+| `f`    | Disk-image format resolved at create time (`qcow2`, `raw`, `vmdk`). `attach_disk` prefers it over the current `pve.vm_disk_format` for discard/ssd auto-resolution, so a config change after creation cannot flip the disk's TRIM classification. Empty on CIDs from older releases; those fall back to the config-derived value. |
 
 The envelope uses RFC 4648 §5 base64url encoding with no padding, so an emitted
 CID contains only `[A-Za-z0-9_-]`. That charset is the point: PVE's own volids

@@ -1268,8 +1268,9 @@ func TestHandleCreateDisk_NoPerfOpts_CurrentDefaultBakesIothread(t *testing.T) {
 }
 
 // TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID verifies that an
-// explicit cloud_properties.iothread:false restores the exact pre-Phase-2
-// bare CID shape (no recorded Opts at all).
+// explicit cloud_properties.iothread:false records no Opts at all: the CID is
+// byte-identical to encoding the same placement meta (pool, node, and the
+// always-recorded format) with no performance options.
 func TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID(t *testing.T) {
 	t.Parallel()
 	var capturedVMID int
@@ -1300,14 +1301,15 @@ func TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID(t *testing.T) {
 	// Construct the expected CID as EncodeDiskCID would without Opts.
 	bareCID := fmt.Sprintf("%s:vm-%d-disk-0", capturedStorage, capturedVMID)
 	expectedCID, encErr := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
-		Pool: capturedStorage,
-		Node: deps.Config.Node,
+		Pool:   capturedStorage,
+		Node:   deps.Config.Node,
+		Format: "qcow2",
 	})
 	if encErr != nil {
 		t.Fatalf("EncodeDiskCID(%q): unexpected error: %v", bareCID, encErr)
 	}
 	if diskCID != expectedCID {
-		t.Errorf("explicit-opt-out CID not byte-identical to pre-Phase-2 form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
+		t.Errorf("explicit-opt-out CID not byte-identical to the no-Opts form:\n  got  = %q\n  want = %q", diskCID, expectedCID)
 	}
 
 	_, meta, parseErr := pve.ParseEncodedDiskCID(diskCID)

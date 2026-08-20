@@ -476,6 +476,10 @@ func HandleCreateDisk(deps Deps) Handler {
 			// tell a legitimately free-floating legacy disk from one whose
 			// parker vanished (see pve.parked_anchor_strict).
 			Anchor: deps.Config.DetachedDiskParkedEnabled(),
+			// Record the resolved disk-image format so attach_disk reuses the
+			// value this disk was created under instead of re-deriving it from
+			// whatever vm_disk_format says at attach time.
+			Format: format,
 		}
 		// With disk_cid_compression enabled, a CID whose pvd- form would
 		// overflow MySQL-backed Directors' varchar(255) disk_cid column is

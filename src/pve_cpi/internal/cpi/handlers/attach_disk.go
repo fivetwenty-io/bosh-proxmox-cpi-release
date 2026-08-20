@@ -236,7 +236,7 @@ func attachDiskCore(
 	}
 
 	// Compute effective per-disk performance options (see doc comment).
-	globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID)
+	globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID, meta)
 	if gerr != nil {
 		return "", "", gerr
 	}
@@ -296,17 +296,19 @@ func attachDiskCore(
 //
 // discard/ssd auto-resolution needs the target pool's storage type and
 // disk-image format (see resolveDiskPerfOptions). The pool name comes from
-// the disk CID itself; the format is not recorded anywhere for an existing
-// disk (DiskCIDMeta carries no format field), so this uses the CPI's
-// configured default format as the best available signal — the same
-// fallback create_disk applies when no per-call format is given. The
-// storage-type lookup only runs when auto-resolution would actually consult
-// it (needsDiskPerfStorageTypeLookup) — an operator who explicitly
+// the disk CID itself. The format prefers the value recorded in the CID
+// envelope at create_disk time (DiskCIDMeta.Format), so the disk keeps the
+// format it was created under even when vm_disk_format has changed since;
+// legacy CIDs carry no format, and for those this falls back to the CPI's
+// configured default — the same fallback create_disk applies when no
+// per-call format is given. The storage-type lookup only runs when
+// auto-resolution would actually consult it
+// (needsDiskPerfStorageTypeLookup) — an operator who explicitly
 // configures both discard and ssd never pays for the extra API round trip
 // on every attach_disk call. A failed/unresolvable lookup fails open to ""
 // (not TRIM-capable), matching resolveDiskPerfOptions's documented
 // fail-open contract — never an error from this function on that account.
-func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string) (map[string]string, error) {
+func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string, meta *pve.DiskCIDMeta) (map[string]string, error) {
 	globalR, gerr := newLayeredResolver(nil, deps.Config)
 	if gerr != nil {
 		return nil, gerr
@@ -320,6 +322,9 @@ func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string
 	format := diskFormatQCOW2
 	if deps.Config != nil && deps.Config.VMDiskFormat != "" {
 		format = deps.Config.VMDiskFormat
+	}
+	if meta != nil && meta.Format != "" {
+		format = meta.Format
 	}
 	return resolveDiskPerfOptions(globalR, deps.Config, storageType, format)
 }

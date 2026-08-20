@@ -175,6 +175,14 @@ type DiskCIDMeta struct {
 	// legacy CIDs and disks created under "free" decode to false and keep
 	// the permissive behavior — their anchor was never promised.
 	Anchor bool `json:"anchor,omitempty"`
+	// Format is the disk-image format ("qcow2", "raw", "vmdk") resolved at
+	// create_disk time — per-call cloud_properties, then vm_disk_format, then
+	// the qcow2 default. attach_disk prefers it over re-deriving the format
+	// from current config, so a vm_disk_format change between create and
+	// attach cannot flip the discard/ssd auto-resolution the disk was created
+	// under. Empty on legacy CIDs; consumers fall back to the config-derived
+	// guess.
+	Format string `json:"f,omitempty"`
 }
 
 // diskCIDPrefix marks the envelope disk CID format. Everything after the
@@ -249,7 +257,7 @@ func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) (string, error) {
 // (pvd-) and compressed (pvz-) encoders. A nil or all-zero meta is omitted.
 func marshalDiskCIDEnvelope(bareCID string, meta *DiskCIDMeta) ([]byte, error) {
 	env := diskCIDEnvelope{V: bareCID}
-	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0 || meta.Anchor) {
+	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0 || meta.Anchor || meta.Format != "") {
 		env.M = meta
 	}
 	return json.Marshal(env)

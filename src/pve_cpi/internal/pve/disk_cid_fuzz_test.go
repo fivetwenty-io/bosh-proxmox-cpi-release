@@ -27,13 +27,20 @@ func FuzzParseEncodedDiskCID(f *testing.F) {
 	// Valid pvd- envelope: nil meta.
 	f.Add(mustFuzzEncode(f, "local-lvm:vm-100-disk-0", nil))
 
-	// Valid pvd- envelope: full meta (pool, node, AZ, opts).
+	// Valid pvd- envelope: full meta (pool, node, AZ, opts, anchor, format).
 	f.Add(mustFuzzEncode(f, "data:vm-9003-disk-0", &pve.DiskCIDMeta{
-		Pool: "data",
-		Node: "pve1",
-		AZ:   "z1",
-		Opts: map[string]string{"iothread": "1", "cache": "writeback"},
+		Pool:   "data",
+		Node:   "pve1",
+		AZ:     "z1",
+		Opts:   map[string]string{"iothread": "1", "cache": "writeback"},
+		Anchor: true,
+		Format: "qcow2",
 	}))
+
+	// Valid pvd- envelope: anchor-only and format-only metas — each single
+	// field must survive marshalDiskCIDEnvelope's all-zero check on its own.
+	f.Add(mustFuzzEncode(f, "local-lvm:vm-9001-disk-0", &pve.DiskCIDMeta{Anchor: true}))
+	f.Add(mustFuzzEncode(f, "local-lvm:vm-9002-disk-0", &pve.DiskCIDMeta{Format: "raw"}))
 
 	// Valid pvd- envelope: path-form volid (dir-style storage, embeds "/" and ".").
 	f.Add(mustFuzzEncode(f, "local:9001/vm-9001-disk-0.qcow2", &pve.DiskCIDMeta{Pool: "local"}))
@@ -153,7 +160,7 @@ func metaEqual(a, b *pve.DiskCIDMeta) bool {
 	if aZero || bZero {
 		return aZero == bZero
 	}
-	if a.Pool != b.Pool || a.Node != b.Node || a.AZ != b.AZ {
+	if a.Pool != b.Pool || a.Node != b.Node || a.AZ != b.AZ || a.Anchor != b.Anchor || a.Format != b.Format {
 		return false
 	}
 	if len(a.Opts) == 0 && len(b.Opts) == 0 {
@@ -165,7 +172,7 @@ func metaEqual(a, b *pve.DiskCIDMeta) bool {
 // isZeroDiskCIDMeta reports whether m is nil or every field holds its zero
 // value (an empty, possibly non-nil, Opts map counts as zero).
 func isZeroDiskCIDMeta(m *pve.DiskCIDMeta) bool {
-	return m == nil || (m.Pool == "" && m.Node == "" && m.AZ == "" && len(m.Opts) == 0)
+	return m == nil || (m.Pool == "" && m.Node == "" && m.AZ == "" && len(m.Opts) == 0 && !m.Anchor && m.Format == "")
 }
 
 // mustFuzzEncode builds a pvd- seed corpus entry, failing the fuzz setup (not
