@@ -9,10 +9,10 @@ import (
 
 // parkerReadConfigFor builds the parker band and attribution a READ path should
 // use: resolving a volume's holder, deciding whether that holder is a parker,
-// and unparking from it. The band comes from the effective accessors, so an
-// opted-out config with no band yields the zero band that makes
-// pve.DiskHolder.IsParker permanently false -- which is precisely the state the
-// stranded-parker guards exist for.
+// and unparking from it. The band comes from the effective accessors, which
+// resolve unset bounds to the built-in band under every strategy; only a band
+// moved away from where parker VMs already live leaves a parker outside it --
+// which is precisely the state the stranded-parker guards exist for.
 //
 // It deliberately leaves DiskStorage empty. That field feeds the storage-content
 // scan pve.ParkDisk uses when it allocates a parker VMID, and no path built on
@@ -35,6 +35,10 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// refusal never fires. resize_disk already passes Config.Node to the
 		// same scan for the same reason.
 		FallbackNode: deps.Config.Node,
+		// Log-level hint only: the in-band-without-tag anomaly warns under
+		// "parked" and logs at debug under "free"/stand-down, where the band
+		// may legitimately overlap vmid_range.
+		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
 	}
 }
 
@@ -82,10 +86,11 @@ func isTypedCPIError(err error) bool {
 // strandedParkerRefusal returns a refusal when a volume's holder carries the
 // bosh-parker tag but sits outside the configured band, and nil otherwise.
 //
-// That combination has one cause: the parker band was moved or unset while
-// disks were still parked, most often by an operator setting
-// detached_disk_strategy to "free" without carrying the band forward. The CPI
-// can no longer recognize the parker, so it sees an ordinary VM holding the
+// That combination has one cause: the parker band was moved away from where
+// parker VMs already live while disks were still parked. (An unset band
+// resolves to the built-in one under every strategy, so opting out with
+// detached_disk_strategy "free" no longer creates this state on its own.) The
+// CPI can no longer recognize the parker, so it sees an ordinary VM holding the
 // volume -- and every operation that would then treat the volume as free
 // (attaching it elsewhere, deleting it) leaves the parker's scsi slot pointing
 // at bytes that are about to belong to someone else, or to no one.

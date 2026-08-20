@@ -982,7 +982,9 @@ func detachDepsParkedWithDiskStorage(qemuSvc qemu.Service, clusterSvc cluster.Se
 }
 
 // detachDepsStrategyFree builds Deps with the strategy explicitly opted out of
-// parking (expected: zero parker calls).
+// parking. detach_disk never parks or unparks under free, so its paths make
+// zero parker and cluster calls (the mockPVEClient's nil clusterSvc panics on
+// any cluster call, enforcing that).
 func detachDepsStrategyFree(qemuSvc qemu.Service) handlers.Deps {
 	return handlers.Deps{
 		Config: &config.CPIConfig{
@@ -1446,10 +1448,10 @@ func TestHandleDetachDisk_RealVMHolder_OneClusterSweep(t *testing.T) {
 // Strategy-free: zero parker calls
 // ---------------------------------------------------------------------------
 
-// TestHandleDetachDisk_StrategyFree_NoParkerCalls verifies that an operator who
-// opts out with detached_disk_strategy=free and configures no parker band gets
-// the pre-parking control flow exactly: zero parker and cluster API calls.
-// The mock panics on AttachDisk, Create, and ListResources to enforce this.
+// TestHandleDetachDisk_StrategyFree_NoParkerCalls verifies that a detach under
+// detached_disk_strategy=free makes zero parker and cluster API calls: nothing
+// parks after the detach. The mock panics on AttachDisk, Create, and
+// ListResources to enforce this.
 func TestHandleDetachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	t.Parallel()
 	const parkedVolid = "local-lvm:vm-9001-disk-0"
@@ -1469,4 +1471,29 @@ func TestHandleDetachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	// No panic = no cluster/attach/create calls were made. The mockPVEClient in
 	// detachDepsStrategyFree has nil clusterSvc/tasksSvc; any call to those
 	// would panic, proving the parker code path was not entered.
+}
+
+// TestHandleDetachDisk_StrategyFree_AlreadyDetached_NoClusterCalls verifies the
+// already-detached retry path under strategy=free: the handler returns success
+// without resolving the disk's holder. The holder answer cannot change the
+// outcome there — nothing parks under free, and a disk parked earlier drains on
+// its next attach_disk or delete_disk, not on a detach retry — so the retry
+// must not be exposed to a transient cluster-scan failure. The mockPVEClient's
+// nil clusterSvc panics on any cluster call, enforcing zero sweeps.
+func TestHandleDetachDisk_StrategyFree_AlreadyDetached_NoClusterCalls(t *testing.T) {
+	t.Parallel()
+
+	// The VM's config carries no disk slots: the disk is already detached.
+	qemuSvc := &detachQEMUService{
+		configCfg: map[string]any{},
+	}
+	h := handlers.HandleDetachDisk(detachDepsStrategyFree(qemuSvc))
+
+	_, err := h.Handle(context.Background(), detachArgs(t, "100", "local-lvm:vm-9001-disk-0"), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("strategy-free already-detached retry: unexpected error: %v", err)
+	}
+	if qemuSvc.detachCalled {
+		t.Error("no DetachDisk call may run when the disk is already detached")
+	}
 }

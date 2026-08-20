@@ -302,9 +302,9 @@ state: dict[str, Any] = {
     "network_cid": "",
     "disk_attached": False,
     # Config that teardown must use for the disk. The parked pass sets it to a
-    # parked-pinned config: once a disk is on a parker, only a call that knows
-    # about parking can unpark and delete it, and a base config with the
-    # strategy opted out would leave the volume stranded.
+    # parked-pinned config: once a disk is on a parker, delete must run with
+    # the band the parker lives in, and pinning the config keeps teardown
+    # independent of whatever band the lab config names.
     "disk_cleanup_cfg": "",
 }
 
@@ -458,10 +458,13 @@ def write_reboot_config(mode: str) -> str:
 def write_strategy_config(strategy: str) -> str:
     """Derive a temp CPI config pinning detached_disk_strategy and the parker band.
 
-    Both keys are pinned together on purpose. The band is what lets the CPI
-    recognize a parker at all, so keeping it set under strategy="free" models
-    the supported opt-out: parking stops, but disks parked earlier are still
-    reachable. write_stranded_parker_config covers the unsupported one.
+    Both keys are pinned so the pass always operates on the band the parker
+    was created in, whatever the lab config names — the band resolves under
+    every strategy, so pinning it is about determinism across labs, not
+    reachability. The strategy is the only semantic switch: under "free"
+    parking stops but disks parked earlier stay reachable.
+    write_stranded_parker_config covers the unsupported shape, the band moved
+    away from a live parker.
     """
     return derive_config(
         f"cpi-{strategy}-",
@@ -472,19 +475,22 @@ def write_strategy_config(strategy: str) -> str:
 
 
 def write_stranded_parker_config() -> str:
-    """Derive a temp CPI config that opts out of parking AND drops the band.
+    """Derive a temp CPI config that opts out of parking AND moves the band.
 
-    This is the shape an operator lands in by setting detached_disk_strategy to
-    "free" without carrying the band forward: the CPI can no longer recognize a
-    parker, so a disk still sitting on one looks like a volume attached to an
-    ordinary VM. The harness uses it to prove attach_disk refuses that rather
-    than writing a second reference to the same volume.
+    This is the shape an operator lands in by pointing the parker band at a
+    window away from where parker VMs already live. (Dropping the band no
+    longer strands anything: an unset band resolves to the built-in one under
+    every strategy, so the parker stays recognized and the disk drains.) With
+    the band moved, the CPI can no longer recognize a parker, so a disk still
+    sitting on one looks like a volume attached to an ordinary VM. The harness
+    uses it to prove attach_disk refuses that rather than writing a second
+    reference to the same volume.
     """
     return derive_config(
         "cpi-stranded-",
         detached_disk_strategy="free",
-        parked_disk_vmid_range_start=0,
-        parked_disk_vmid_range_end=0,
+        parked_disk_vmid_range_start=PARKER_RANGE_END + 1,
+        parked_disk_vmid_range_end=PARKER_RANGE_END + 1000,
     )
 
 
@@ -545,11 +551,11 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         refused, because a PVE snapshot takes the whole parker and with it
         every other deployment's parked disk
 
-      snapshot_disk (free, no band)
+      snapshot_disk (free, band moved)
         still refused, because the holder is classified by its bosh-parker tag
         rather than by the band the config happens to name
 
-      attach (free, no band)
+      attach (free, band moved)
         refused, because a parker the config can no longer recognize still
         holds the volume and attaching it again would double-reference it
 
@@ -563,7 +569,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
       detach (parked) again
         the existing parker is reused instead of a second one being created
 
-      delete (free, no band)
+      delete (free, band moved)
         refused for the same reason the attach is, because freeing the volume
         would leave the parker's slot pointing at storage that is gone
 
@@ -576,8 +582,8 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     # Kept separately from disk_cleanup_cfg, which teardown clears once the disk
     # is gone. Step 15a still needs a config that pins the parked strategy: run
     # under the lab's base config instead and the step proves whatever that
-    # config happens to say, which for a lab configured "free" with no band is
-    # nothing at all.
+    # config happens to say, which for a lab configured "free" is nothing at
+    # all.
     state["parked_cfg"] = parked_cfg
     free_cfg = write_strategy_config("free")
     stranded_cfg = write_stranded_parker_config()
@@ -691,9 +697,9 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
             "the parker guard did not fire"
         )
 
-    step("11g-bis. snapshot_disk (strategy=free with no band: still refused)")
+    step("11g-bis. snapshot_disk (strategy=free with the band moved: still refused)")
     # The guard classifies the holder by its bosh-parker tag, not by whether its
-    # VMID sits in a configured band, so clearing the band must not open a path
+    # VMID sits in a configured band, so moving the band must not open a path
     # to snapshotting the parker.
     try:
         snap_cid = call("snapshot_disk", [disk_cid, {}], config_path=stranded_cfg)
@@ -706,11 +712,11 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     else:
         state["snapshot_cid"] = snap_cid
         raise RuntimeError(
-            f"snapshot_disk snapshotted parker {parker_vmid} with the band cleared "
+            f"snapshot_disk snapshotted parker {parker_vmid} with the band moved "
             f"(snapshot_cid={snap_cid}); the parker guard is still band-gated"
         )
 
-    step("11h. attach_disk (strategy=free with no band: the stranded-parker refusal)")
+    step("11h. attach_disk (strategy=free with the band moved: the stranded-parker refusal)")
     try:
         call("attach_disk", [vm_cid, disk_cid], config_path=stranded_cfg)
     except RuntimeError as exc:
@@ -734,7 +740,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
             f"the refused attach should have left the disk on parker {parker_vmid}, got {holders}"
         )
 
-    step("11h-bis. delete_disk (strategy=free with no band: the stranded-parker refusal)")
+    step("11h-bis. delete_disk (strategy=free with the band moved: the stranded-parker refusal)")
     try:
         call("delete_disk", [disk_cid], config_path=stranded_cfg)
     except RuntimeError as exc:

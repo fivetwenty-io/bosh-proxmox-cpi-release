@@ -1497,7 +1497,7 @@ func TestHandleAttachDisk_Invariant_EnforceNoDivergence(t *testing.T) {
 // Test matrix:
 //   - strategy=parked, disk parked          → UnparkDisk called, normal attach proceeds
 //   - strategy=parked, disk free-floating   → UnparkDisk no-op (fast nil), attach proceeds
-//   - strategy=free (unset)                 → zero parker API calls, byte-identical
+//   - strategy=free                         → holder scan still runs, no unpark mutations
 //   - strategy=parked, unpark fails         → retriable error, AttachDisk not called
 // ---------------------------------------------------------------------------
 

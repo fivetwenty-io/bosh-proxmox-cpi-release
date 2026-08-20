@@ -1343,22 +1343,22 @@ properties:
                    stemcell-template range. A deployment that asks for parking
                    by name, or that names its own parker band, fails to load on
                    overlap. A deployment that sets neither and whose other bands
-                   reach into 90000-90999 keeps the pre-parking behavior for
-                   that load and warns, so an upgrade cannot take a working
-                   deployment down: set a free parker band to turn parking on
-                   there. Costs a few extra PVE API calls per detach and attach.
+                   reach into 90000-90999 keeps the pre-parking behavior for new
+                   detaches on that load and warns (the band stays in force
+                   read-only, so disks parked earlier still drain), so an
+                   upgrade cannot take a working deployment down: set a free
+                   parker band to turn parking on there. Costs a few extra PVE API calls per detach and attach.
         "free"   — opt out of parking: detached disks float as unattached volumes
                    in their synthetic VMID container. PVE has no first-class
                    volume object; the disk is visible only via its container VM
                    config. Risk: administrators may mistake the container VM for
                    an unused resource and delete it, destroying the disk with it.
                    This was the default before parking became the default.
-                   Disks parked under the default stay parked; set an explicit
-                   parker VMID band alongside "free" to keep the unpark probes
-                   running for them. Without a band, attach_disk and delete_disk
-                   refuse a volume a parker still holds and name the property to
-                   restore, rather than double-referencing or freeing it, and
-                   delete_vm and snapshot_disk still refuse a parker VM by tag.
+                   The parker band still resolves (90000/90999 unless set), so
+                   a disk parked while "parked" was in effect is recognized and
+                   unparked on its next attach_disk or delete_disk — switching
+                   to "free" only stops NEW detaches from parking. delete_vm
+                   and snapshot_disk still refuse a parker VM by tag.
     default: ""
   pve.disk_cid_compression:
     description: |
@@ -1375,23 +1375,20 @@ properties:
     description: |
       Inclusive lower bound of the VMID range reserved for parker VMs
       (bosh-parker-<n>). Each parker VM holds up to 31 parked disk volumes in
-      scsi0-30 slots. Applies whenever detached_disk_strategy resolves to
-      "parked" (the default), and under "free" when a range is set to enable the
-      hybrid parker gate, which keeps unpark probes running for disks parked
-      earlier. Whenever a parker band is in play, an unset (0) bound resolves
-      independently of the other, so a cpi-config entry may move one bound and
-      leave the other at 0. The resolved partner is the built-in bound when that
-      leaves a window no wider than 90000-90999, and otherwise is derived from
-      the bound that was set, at the same width: a start of 50000 alone gives
-      [50000,50999], not [50000,90999].
-
-      Both bounds unset under "free" means no band at all, and every parker gate
-      stays inert. A cpi-config entry that names "free" without a band inherits
-      90000-90999 only when the job-level config left the strategy unset, since
-      that is what gave the job level a defaulted band to pass down; the unpark
-      probes then keep draining disks parked before the opt-out. A job level that
-      already names "free" has no defaulted band, so an entry under it starts
-      with no band either. Set an explicit band wherever the probes need to run.
+      scsi0-30 slots. The band resolves under every detached_disk_strategy, at
+      the job level and in every cpi-config entry alike: under "parked" (the
+      default) it is where parker VMs are allocated, and under "free" it is
+      read-only — it lets the CPI recognize disks parked earlier and unpark
+      them on their next attach_disk or delete_disk instead of refusing them.
+      An unset (0) bound resolves independently of the other, so a cpi-config
+      entry may move one bound and leave the other at 0. The resolved partner
+      is the built-in bound when that leaves a window no wider than
+      90000-90999, and otherwise is derived from the bound that was set, at the
+      same width: a start of 50000 alone gives [50000,50999], not
+      [50000,90999]. Both bounds unset resolves to 90000-90999. Move the band
+      only to a window whose parker VMs move with it: a parked disk on a VM
+      outside the resolved band can no longer be unparked, and attach_disk and
+      delete_disk refuse it until the band covers that VM again.
 
       Must not overlap the VM range, the persistent-disk range, or the
       stemcell-template range under the parked strategy; under "free" nothing
@@ -1402,12 +1399,11 @@ properties:
   pve.parked_disk_vmid_range_end:
     description: |
       Inclusive upper bound of the VMID range for parker VMs. Must be >
-      parked_disk_vmid_range_start. Whenever a parker band is in play, an unset
-      (0) bound resolves to 90999 independently of the lower bound. Both bounds
-      unset under "free" means no band at all. Must not overlap the VM range,
-      the persistent-disk range, or the stemcell-template range under the parked
-      strategy; under "free" the overlap is accepted, since nothing allocates a
-      parker VMID there.
+      parked_disk_vmid_range_start. An unset (0) bound resolves to 90999
+      independently of the lower bound, under every strategy. Must not overlap
+      the VM range, the persistent-disk range, or the stemcell-template range
+      under the parked strategy; under "free" the overlap is accepted, since
+      nothing allocates a parker VMID there.
     default: 0
   pve.network_resolve_retries:
     description: |

@@ -482,13 +482,13 @@
   end
 
   # Emit parked_disk_vmid_range_start only when non-zero. Zero (default) means
-  # the field is unset; when strategy="parked" ApplyDefaults fills in 90000.
+  # the field is unset; ApplyDefaults fills in 90000 under every strategy.
   # Omitting when zero ensures the Go zero-value reaches ApplyDefaults unchanged.
   v = p("pve.parked_disk_vmid_range_start", 0).to_i
   config["parked_disk_vmid_range_start"] = v unless v == 0
 
   # Emit parked_disk_vmid_range_end only when non-zero. Zero (default) means
-  # the field is unset; when strategy="parked" ApplyDefaults fills in 90999.
+  # the field is unset; ApplyDefaults fills in 90999 under every strategy.
   # Omitting when zero ensures the Go zero-value reaches ApplyDefaults unchanged.
   v = p("pve.parked_disk_vmid_range_end", 0).to_i
   config["parked_disk_vmid_range_end"] = v unless v == 0

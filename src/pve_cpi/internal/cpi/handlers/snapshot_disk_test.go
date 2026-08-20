@@ -648,7 +648,8 @@ func TestHandleSnapshotDisk_StrandedParker_Rejected(t *testing.T) {
 		},
 	}
 
-	// Parking fully disarmed: free strategy, no band.
+	// Free strategy with the band unset (the effective accessors still resolve
+	// the built-in one); the refusal must key on the bosh-parker tag alone.
 	cfg := &config.CPIConfig{
 		Node:                 testNode,
 		DetachedDiskStrategy: "free",

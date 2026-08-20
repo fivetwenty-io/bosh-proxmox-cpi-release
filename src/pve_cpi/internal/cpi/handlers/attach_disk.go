@@ -665,16 +665,15 @@ func devicePathByID(diskID string) (string, error) {
 // let two VM configs reference one volume; nothing downstream detects it, and
 // the damage only surfaces when whichever holder is destroyed takes the volume
 // out from under the other. The parked strategy makes that state reachable
-// without anyone doing anything wrong — an operator who sets
-// detached_disk_strategy to "free" while disks are still parked leaves the
-// parker holding volumes no unpark probe will ever look for, and the same is
-// true of a release rolled back to one that has no concept of parking. A single
-// cluster scan per attach_disk is a cheap price for turning silent volume loss
-// into a message naming the VM to look at.
+// without anyone doing anything wrong — the parker band resolves under every
+// strategy, so setting detached_disk_strategy to "free" no longer hides a
+// parker, but a band moved away from live parkers still does, and so does a
+// release rolled back to one that has no concept of parking. A single cluster
+// scan per attach_disk is a cheap price for turning silent volume loss into a
+// message naming the VM to look at.
 //
-// The scan cost is one ListResources plus a config read per VM, and only the
-// opted-out configuration pays it as new work: under the parked strategy the
-// unpark probe was already paying for the same scan.
+// The scan cost is one ListResources plus a config read per VM — the same scan
+// the unpark probe pays for under either strategy.
 func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, diskCID, bareDiskCID string, targetVMID int) error {
 	if deps.Config == nil {
 		return nil

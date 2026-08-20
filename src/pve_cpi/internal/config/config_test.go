@@ -6347,9 +6347,16 @@ func TestParkedRange_ParkedStrategyActiveVariants(t *testing.T) {
 	if !(&config.CPIConfig{DetachedDiskStrategy: "free", ParkedDiskVMIDRangeEnd: 90999}).ParkedStrategyActive() {
 		t.Error("end-only under free: ParkedStrategyActive() should be true")
 	}
-	// fully opted out: strategy=free and no explicit band.
+	// strategy=free with no explicit band: raw fields are zero until
+	// ApplyDefaults fills the built-in band, so a config that never went
+	// through defaulting is the one remaining inert shape.
 	if (&config.CPIConfig{DetachedDiskStrategy: "free"}).ParkedStrategyActive() {
-		t.Error("strategy=free, no range: ParkedStrategyActive() should be false")
+		t.Error("strategy=free, no range, before ApplyDefaults: ParkedStrategyActive() should be false")
+	}
+	freeDefaulted := &config.CPIConfig{DetachedDiskStrategy: "free"}
+	freeDefaulted.ApplyDefaults()
+	if !freeDefaulted.ParkedStrategyActive() {
+		t.Error("strategy=free after ApplyDefaults: the filled band must keep parker reads active")
 	}
 }
 
@@ -6372,11 +6379,11 @@ func TestValidate_ParkerBandOverlap_UnderDefaultStrategy(t *testing.T) {
 	if cfg.DetachedDiskStrategyValue() != config.DetachedDiskStrategyFree {
 		t.Errorf("strategy should have stood down to free, got %q", cfg.DetachedDiskStrategyValue())
 	}
-	if cfg.ParkedStrategyActive() {
-		t.Error("a stood-down config must leave every parker gate inert")
+	if !cfg.ParkedStrategyActive() {
+		t.Error("a stood-down config must keep the parker read paths active")
 	}
-	if cfg.ParkedDiskVMIDRangeStart != 0 || cfg.ParkedDiskVMIDRangeEnd != 0 {
-		t.Errorf("no band should be filled on stand-down, got [%d,%d]",
+	if cfg.ParkedDiskVMIDRangeStart != 90000 || cfg.ParkedDiskVMIDRangeEnd != 90999 {
+		t.Errorf("the built-in band must stay in force read-only on stand-down, got [%d,%d]",
 			cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd)
 	}
 }
@@ -6504,8 +6511,8 @@ func TestParkedDefault_OverrideWidensBand_StandsDown(t *testing.T) {
 	if got := eff.ParkedDefaultStoodDown(); got == "" {
 		t.Error("the stand-down must record the colliding band for the operator")
 	}
-	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 0 {
-		t.Errorf("a stood-down band must read back as unset, got %d", got)
+	if got := eff.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("the built-in band must stay in force read-only on stand-down, got start %d", got)
 	}
 }
 
@@ -6756,10 +6763,11 @@ func TestParkedBand_SingleBoundOutsideBuiltIn_DerivesWidth(t *testing.T) {
 	}
 }
 
-// TestParkedBand_NoBandUnderFree_StaysInert confirms the fallback does not
-// resurrect a band for the deployment that opted out and set none: parker code
-// must stay entirely inert there.
-func TestParkedBand_NoBandUnderFree_StaysInert(t *testing.T) {
+// TestParkedBand_NoBandUnderFree_BuiltInFills confirms the opt-out with no band
+// still resolves the built-in band: parking never runs (strategy is free), but
+// the holder scans keep recognizing and unparking disks parked while the
+// "parked" default was in effect, instead of refusing them as stranded.
+func TestParkedBand_NoBandUnderFree_BuiltInFills(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -6769,14 +6777,17 @@ func TestParkedBand_NoBandUnderFree_StaysInert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config must load: %v", err)
 	}
-	if cfg.ParkedStrategyActive() {
-		t.Error("free with no band must leave every parker gate inert")
+	if !cfg.ParkedStrategyActive() {
+		t.Error("free with no band must keep the parker read paths active")
 	}
-	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 0 {
-		t.Errorf("start must stay 0, got %d", got)
+	if cfg.DetachedDiskParkedEnabled() {
+		t.Error("the filled band must not turn parking back on")
 	}
-	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 0 {
-		t.Errorf("end must stay 0, got %d", got)
+	if got := cfg.ParkedDiskVMIDRangeStartValue(); got != 90000 {
+		t.Errorf("start must resolve to the built-in 90000, got %d", got)
+	}
+	if got := cfg.ParkedDiskVMIDRangeEndValue(); got != 90999 {
+		t.Errorf("end must resolve to the built-in 90999, got %d", got)
 	}
 }
 
@@ -6833,8 +6844,9 @@ func TestContextOverride_DetachedDiskStrategy_Invalid(t *testing.T) {
 }
 
 // TestValidate_ParkerBandOverlapIgnored_UnderFree confirms the same config
-// loads once the operator opts out of parking: with strategy=free and no
-// explicit band, there is no parker band to collide with.
+// loads once the operator opts out of parking: the built-in band fills and
+// overlaps the widened vmid_range, but overlap validation only applies under
+// "parked" — under "free" the band is read-only, so the overlap is harmless.
 func TestValidate_ParkerBandOverlapIgnored_UnderFree(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
@@ -6845,27 +6857,28 @@ func TestValidate_ParkerBandOverlapIgnored_UnderFree(t *testing.T) {
 		"vmid_range_end":91000
 	}`)
 	if err != nil {
-		t.Fatalf("strategy=free must not validate a parker band: %v", err)
+		t.Fatalf("strategy=free must not reject a parker band overlap: %v", err)
 	}
-	if cfg.ParkedStrategyActive() {
-		t.Error("ParkedStrategyActive() should be false under free with no explicit band")
+	if !cfg.ParkedStrategyActive() {
+		t.Error("the filled band must keep the parker read paths active under free")
 	}
 }
 
-// TestParkedRange_DefaultsNotFilledWhenFree confirms ApplyDefaults never fills
-// range fields when the operator opts out with strategy=free.
-func TestParkedRange_DefaultsNotFilledWhenFree(t *testing.T) {
+// TestParkedRange_DefaultsFilledWhenFree confirms ApplyDefaults fills the
+// built-in band under strategy=free too: the strategy governs whether new
+// detaches park, never whether the band is known.
+func TestParkedRange_DefaultsFilledWhenFree(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 	cfg.VMStorage = "s"
 	cfg.DetachedDiskStrategy = "free"
 	cfg.ApplyDefaults()
 
-	if cfg.ParkedDiskVMIDRangeStart != 0 {
-		t.Errorf("ParkedDiskVMIDRangeStart filled without parked strategy, got %d", cfg.ParkedDiskVMIDRangeStart)
+	if cfg.ParkedDiskVMIDRangeStart != 90000 {
+		t.Errorf("ParkedDiskVMIDRangeStart must fill under free, got %d", cfg.ParkedDiskVMIDRangeStart)
 	}
-	if cfg.ParkedDiskVMIDRangeEnd != 0 {
-		t.Errorf("ParkedDiskVMIDRangeEnd filled without parked strategy, got %d", cfg.ParkedDiskVMIDRangeEnd)
+	if cfg.ParkedDiskVMIDRangeEnd != 90999 {
+		t.Errorf("ParkedDiskVMIDRangeEnd must fill under free, got %d", cfg.ParkedDiskVMIDRangeEnd)
 	}
 }
 

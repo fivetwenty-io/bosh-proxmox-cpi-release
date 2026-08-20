@@ -256,13 +256,17 @@ func HandleDetachDisk(deps Deps) Handler {
 }
 
 // handleAlreadyDetachedParked handles the alreadyDetached=true branch of
-// HandleDetachDisk when the parked strategy is active. It checks whether the
-// free-floating disk is already parked; if not and DetachedDiskParkedEnabled is
-// set, it re-resolves the disk's node and parks it so retries converge to parked
-// state. Returns nil on idempotent success (already parked, volume gone, or
-// strategy unset).
+// HandleDetachDisk under strategy "parked". It checks whether the free-floating
+// disk is already parked; if not, it re-resolves the disk's node and parks it
+// so retries converge to parked state. Under "free" it returns nil before any
+// cluster call: nothing parks there, so an already-detached disk is already in
+// its terminal state — a disk parked earlier drains on its next attach_disk or
+// delete_disk, not on a detach retry, and paying the holder sweep here would
+// only expose the retry to a transient scan failure for an answer that cannot
+// change the outcome. Returns nil on idempotent success (already parked or
+// volume gone).
 func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
-	if !deps.Config.ParkedStrategyActive() {
+	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
 	parkerCfg := pve.ParkerConfig{
@@ -278,6 +282,9 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		// dropped by the holder scan unless there is a fallback to attribute it
 		// to, and a dropped row reads as "nobody holds this volume".
 		FallbackNode: deps.Config.Node,
+		// Always true here (the gate above), recorded for the holder scan's
+		// log-level choice.
+		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
 	}
 	// "Is it already parked?" and "is a real VM holding it?" are two readings of
 	// one fact, and the cluster-wide sweep that establishes that fact is the
@@ -296,9 +303,6 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	}
 	if isParked {
 		// Already in parked state — idempotent success.
-		return nil
-	}
-	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
 	// Refuse to park a disk that a real (non-parker) VM holds. This path is
@@ -410,6 +414,9 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 		// VMID whose number is already claimed by orphaned volumes on the
 		// disk storage is skipped (same guard create_vm applies).
 		DiskStorage: deps.Config.DiskStorage,
+		// Always true here (the gate above), recorded for the holder scan's
+		// log-level choice.
+		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {

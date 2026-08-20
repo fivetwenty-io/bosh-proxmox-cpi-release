@@ -206,8 +206,8 @@ a reference the sweep could not clear.
 `findVMsHostingDisk` skips any VM carrying the `bosh-parker` tag, using only the
 tags the cluster-resources scan already carried and no extra API calls. The tag
 alone decides, band-independent and whatever the configured strategy is: an
-operator who dropped the band while parkers were still standing would otherwise
-have deployment metadata merged into a parker's description, the field that
+operator who moved the band away while parkers were still standing would
+otherwise have deployment metadata merged into a parker's description, the field that
 carries the provenance sentinel for every disk it holds. A disk held by a parker
 VM produces zero matches, which flows into the existing warn-and-return-nil path. This is correct: `set_disk_metadata` for
 a parked disk is irrelevant until the disk is re-attached to a workload VM.
@@ -294,11 +294,11 @@ Selects the lifecycle strategy for detached persistent disks.
 
 ### `pve.parked_disk_vmid_range_start`
 
-Inclusive lower bound of the VMID band reserved for parker VMs. Whenever a
-parker band is in play — the parked strategy, including the unset default, or
-`free` with a band set to keep the unpark probes running — a zero value
-resolves. Both bounds zero under `free` means no band at all, and every parker
-gate is inert.
+Inclusive lower bound of the VMID band reserved for parker VMs. The band
+resolves under every strategy, at the job level and in every cpi-config entry
+alike: under `parked` it is where parker VMs are allocated, and under `free` it
+is read-only, letting the holder scans recognize and unpark disks parked
+earlier. A zero value resolves to the built-in bound.
 
 ### `pve.parked_disk_vmid_range_end`
 
@@ -340,10 +340,10 @@ parkers, because every classification requires the tag as well.
 An unchanged config upgrading into the new default is treated differently. If the
 strategy was never set and no parker band was configured, and the built-in band
 `90000–90999` overlaps a band the operator did configure, the CPI stands the
-parked default down for that load, keeps the previous free-floating behavior, and
-warns:
+parked default down for that load, keeps the previous free-floating behavior for
+new detaches, and warns:
 
-> `config: the default detached_disk_strategy "parked" is standing down for this load: its built-in parker band [90000,90999] overlaps the configured vmid_range [40000,200000]. Detached persistent disks stay free-floating for as long as that is true. If this deployment ever ran with parking on -- the band was widened over 90000-90999 after the fact, say -- run scripts/disk-audit: disks already on a parker stay there, and attach_disk and delete_disk refuse them until a parker band is configured again. To park disks here, set parked_disk_vmid_range_start/end to a 1000-wide window that does not overlap any other VMID band. To silence this notice, set detached_disk_strategy to "free" explicitly`
+> `config: the default detached_disk_strategy "parked" is standing down for this load: its built-in parker band [90000,90999] overlaps the configured vmid_range [40000,200000]. Detached persistent disks stay free-floating for as long as that is true. The band itself remains in force read-only, so any disk parked before the overlap existed is still recognized and unparked on its next attach_disk or delete_disk. To park disks here, set parked_disk_vmid_range_start/end to a 1000-wide window that does not overlap any other VMID band. To silence this notice, set detached_disk_strategy to "free" explicitly`
 
 The alternative is worse than the warning. The CPI binary is executed once per
 JSON-RPC request, so a config that fails to load is not a deploy-time error: it is
@@ -352,11 +352,6 @@ the old Director VM has already been stopped. Set `parked_disk_vmid_range_start`
 and `parked_disk_vmid_range_end` to a free window to turn parking on for such a
 deployment, or set `detached_disk_strategy: free` to accept the pre-parking
 behavior and silence the notice.
-
-`ParkedStrategyActive()` returns `true` whenever the effective strategy is
-`parked`, and also when either range field is explicitly set to a non-zero value
-under `free`. That second case lets an operator who has opted out keep
-`IsParkerVM` and the unpark probes running for disks parked earlier.
 
 ### When to opt out
 
@@ -395,35 +390,41 @@ calls park immediately. When the Director next calls `attach_disk` or
 parked and the operation proceeds normally. The two states coexist transparently;
 `disk-audit` reports them separately.
 
-**Parked to free, with the range left configured:** existing parked disks
-self-heal on the next `attach_disk` or `delete_disk`. Both handlers resolve the
-volume's current holder before they act; when that holder is a parker they
-unpark first, and the disk becomes free-floating. No bulk migration step is
-required. Parker VMs that become empty remain in PVE; remove them manually
-following the teardown procedure above.
+**Parked to free:** existing parked disks self-heal on the next `attach_disk`
+or `delete_disk`. Both handlers resolve the volume's current holder before they
+act; when that holder is a parker they unpark first, and the disk becomes
+free-floating. The band resolves to `90000–90999` even when unset, so no
+property needs to be carried forward for the drain to work — switching the
+strategy is the whole migration. Parker VMs that become empty remain in PVE;
+remove them manually following the teardown procedure above.
 
 **Mixed state is safe.** `attach_disk` and `delete_disk` resolve the holder on
 every call, whatever `detached_disk_strategy` says, so free-floating and parked
 disks coexist and each is handled on its own terms.
 
-**Parked to free, with the range removed:** the range is what tells the CPI
-which VMIDs are parkers, so clearing it while disks are still parked leaves
-those parkers unrecognized. The CPI does not proceed blindly there. `attach_disk`
-and `delete_disk` still resolve the holder, read its tags, and refuse the call
-with an error naming `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end`
-when the holder turns out to be a `bosh-parker` VM; `delete_vm` refuses a parker
-VM on the tag its cluster-resources row carries, whatever the band says, falling
-back to the VM config when that row carries no tags at all. The refusals are non-retriable and say what to
-restore, so a disk is never double-referenced and a parker is never purged with
-disks in its slots.
+**Moving the band away from live parkers:** the band is what tells the CPI
+which VMIDs are parkers, so pointing it at a different window while disks are
+still parked in the old one leaves those parkers unrecognized. The CPI does not
+proceed blindly there. `attach_disk` and `delete_disk` still resolve the
+holder, read its tags, and refuse the call with an error naming
+`parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` when the holder
+turns out to be a `bosh-parker` VM; `delete_vm` refuses a parker VM on the tag
+its cluster-resources row carries, whatever the band says, falling back to the
+VM config when that row carries no tags at all. The refusals are non-retriable
+and say what to restore, so a disk is never double-referenced and a parker is
+never purged with disks in its slots.
 
-> **Drain before removing the `parked_disk_vmid_range_start` /
-> `parked_disk_vmid_range_end` knobs.** Removing them while disks remain parked
-> does not lose data, but it does stop those disks being attachable or deletable
-> until the range comes back. Run `disk-audit` first and confirm it reports zero
-> parked disks. To drain, leave the range configured and let the next
-> `attach_disk` or `delete_disk` on each disk unpark it (the "Parked to free"
-> procedure above), then remove the knobs once the audit is clean.
+> **Drain before moving the band — removing a custom band is a move too.**
+> Changing `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` while
+> disks remain parked in the old window does not lose data, but it does stop
+> those disks being attachable or deletable until the old band comes back.
+> Removing the knobs counts when the old band was not `90000`–`90999`: unset
+> bounds resolve to the built-in window, which is a move away from wherever the
+> custom band's parkers live. Run `disk-audit` first and confirm it reports
+> zero parked disks. To drain, leave the band where the parkers live and let
+> the next `attach_disk` or `delete_disk` on each disk unpark it (the "Parked
+> to free" procedure above), then move or remove the knobs once the audit is
+> clean.
 
 ## Three consequences worth knowing
 
@@ -433,9 +434,8 @@ every VM in the cluster. A node that is down answers its guests' config reads
 with a transport error rather than a 404, so both calls fail retriably until the
 node is back, including for disks and VMs on healthy nodes. The alternative is to
 skip the VMs we cannot read and conclude the volume is free, which is how a
-volume ends up attached to two VMs at once. Under `free` with no band configured
-this is new: those two calls made no cluster call at all before parking became
-the default.
+volume ends up attached to two VMs at once. Under `free` this is new: before
+parking became the default, those two calls made no cluster call at all.
 
 **Unparking re-reads the parker before it detaches.** PVE's detach names a slot,
 not a volume, so a slot resolved before the protection lock is held would be a

@@ -550,10 +550,12 @@ func TestHandleDeleteDisk_Parker_NotParked_DirectDelete(t *testing.T) {
 }
 
 // TestHandleDeleteDisk_StrandedParker_Refused covers the configuration an
-// operator lands in by opting out of parking without carrying the band forward:
-// a parker still holds the volume, but the zeroed band means the CPI no longer
-// recognizes it. Deleting the volume there would leave the parker's scsi slot
-// referencing storage that no longer exists, so the call must be refused.
+// operator lands in by moving the parker band away from where parker VMs
+// already live (an unset band resolves to the built-in one under every
+// strategy, so opting out alone no longer strands anything): a parker still
+// holds the volume, but the moved band means the CPI no longer recognizes it.
+// Deleting the volume there would leave the parker's scsi slot referencing
+// storage that no longer exists, so the call must be refused.
 func TestHandleDeleteDisk_StrandedParker_Refused(t *testing.T) {
 	t.Parallel()
 	deleteCalled := false
@@ -581,10 +583,12 @@ func TestHandleDeleteDisk_StrandedParker_Refused(t *testing.T) {
 	}
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:                 testNode,
-			DiskStorage:          storageName,
-			DetachedDiskStrategy: "free",
-			DiskDeleteStateGuard: "off",
+			Node:                     testNode,
+			DiskStorage:              storageName,
+			DetachedDiskStrategy:     "free",
+			DiskDeleteStateGuard:     "off",
+			ParkedDiskVMIDRangeStart: 95000,
+			ParkedDiskVMIDRangeEnd:   95999,
 		},
 		PVE: &mockPVEClient{
 			storageSvc: storageSvc,
@@ -608,9 +612,10 @@ func TestHandleDeleteDisk_StrandedParker_Refused(t *testing.T) {
 	}
 }
 
-// TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls verifies that when
-// neither DetachedDiskStrategy=parked nor range fields are set,
-// ParkedStrategyActive() returns false and zero parker API calls are made.
+// TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls verifies that under
+// strategy=free the holder scan still runs (an unset band resolves to the
+// built-in one), but a VM inside that band without the bosh-parker tag is
+// treated as a real VM: no unpark detach runs and the volume is deleted.
 func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 	t.Parallel()
 
@@ -634,8 +639,9 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 			return nil
 		},
 	}
-	// Cluster returns a parker-range VM so that if the handler mistakenly calls
-	// IsDiskParked it would find a result — confirming the gate truly fires.
+	// Cluster returns a VM inside the resolved parker band. The holder scan
+	// considers it, reads its config, and must classify it as a real VM (no
+	// bosh-parker tag) rather than unpark from it.
 	clusterSvc := &mockClusterSvc{
 		listResourcesFn: func(_ context.Context, _ *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
 			raw, _ := json.Marshal(map[string]any{
@@ -656,8 +662,8 @@ func TestHandleDeleteDisk_Parker_StrategyFree_NoParkerCalls(t *testing.T) {
 		Config: &config.CPIConfig{
 			Node:        testNode,
 			DiskStorage: storageName,
-			// strategy=free opts out of the parked default, and no range is set
-			// → ParkedStrategyActive()=false.
+			// strategy=free opts out of parking; the unset band resolves to the
+			// built-in 90000-90999 through the effective accessors.
 			DetachedDiskStrategy: "free",
 			// disk_delete_state_guard explicitly off: this test isolates the
 			// parker-gate's own QEMU Config() call count from the (Phase 1
@@ -989,10 +995,17 @@ func TestHandleDeleteDisk_StrandedParker_DecidesFromScanRead(t *testing.T) {
 		},
 	}
 
-	// Parking disarmed: free, no band. The parker is outside anything the
-	// config can recognize, which is exactly the stranded state.
+	// The parker band was moved away from where the parker VM lives (the
+	// built-in band would cover 90010, so an unset band no longer strands
+	// anything — the fill under "free" is what drains it). A parker outside
+	// the configured band is exactly the stranded state.
 	deps := handlers.Deps{
-		Config: &config.CPIConfig{Node: testNode, DetachedDiskStrategy: "free"},
+		Config: &config.CPIConfig{
+			Node:                     testNode,
+			DetachedDiskStrategy:     "free",
+			ParkedDiskVMIDRangeStart: 95000,
+			ParkedDiskVMIDRangeEnd:   95999,
+		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
 			storageSvc: storageSvc,

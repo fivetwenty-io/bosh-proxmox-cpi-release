@@ -1,7 +1,8 @@
-// Package config internal tests for warnDetachedDiskStrategyFreeWithoutBand:
-// the config-load Warn surfaced when an operator opts out of the parked default
-// without keeping a parker band configured, which silently strands any disk
-// parked while the default was in effect.
+// Package config internal tests for warnParkedDefaultBandCollision: the
+// config-load Warn surfaced when the defaulted parked strategy stands down
+// because its built-in band collides with another VMID band. The band itself
+// stays in force read-only, so the message no longer needs to carry drain
+// advice — previously parked disks keep unparking through the holder scans.
 package config
 
 import (
@@ -10,51 +11,7 @@ import (
 	"testing"
 )
 
-func TestWarnFreeWithoutBand_FreeAndNoBand_Warns(t *testing.T) {
-	var buf bytes.Buffer
-	cfg := &CPIConfig{DetachedDiskStrategy: "free"}
-	warnDetachedDiskStrategyFreeWithoutBand(cfg, &buf)
-	out := buf.String()
-	if out == "" {
-		t.Fatal("strategy=free with no band must warn")
-	}
-	if !strings.Contains(out, "parked_disk_vmid_range") {
-		t.Errorf("warning must name the property that fixes it, got: %s", out)
-	}
-	if !strings.Contains(out, "disk-audit") {
-		t.Errorf("warning must point at the audit that proves whether disks are parked, got: %s", out)
-	}
-}
-
-func TestWarnFreeWithoutBand_FreeWithBand_NoWarn(t *testing.T) {
-	var buf bytes.Buffer
-	cfg := &CPIConfig{
-		DetachedDiskStrategy:     "free",
-		ParkedDiskVMIDRangeStart: 90000,
-		ParkedDiskVMIDRangeEnd:   90999,
-	}
-	warnDetachedDiskStrategyFreeWithoutBand(cfg, &buf)
-	if buf.Len() > 0 {
-		t.Errorf("an explicit band keeps the unpark probes running; no warning expected, got: %s", buf.String())
-	}
-}
-
-func TestWarnFreeWithoutBand_DefaultStrategy_NoWarn(t *testing.T) {
-	var buf bytes.Buffer
-	cfg := &CPIConfig{}
-	warnDetachedDiskStrategyFreeWithoutBand(cfg, &buf)
-	if buf.Len() > 0 {
-		t.Errorf("the parked default must not warn, got: %s", buf.String())
-	}
-}
-
-// TestWarnStandDown_CarriesDrainAdvice pins the one message a stood-down load
-// gets. The free-without-band warning is suppressed on that path to avoid
-// saying the same thing twice, so this message has to carry the drain advice
-// itself: a collision created AFTER parking has been running strands disks on
-// parkers exactly the way an opt-out does, and the load cannot tell the two
-// apart.
-func TestWarnStandDown_CarriesDrainAdvice(t *testing.T) {
+func TestWarnStandDown_AnnouncesCollisionAndRemedy(t *testing.T) {
 	var buf bytes.Buffer
 	cfg := &CPIConfig{parkedDefaultBandCollision: "vmid_range [40000,200000]"}
 	warnParkedDefaultBandCollision(cfg, &buf)
@@ -62,23 +19,56 @@ func TestWarnStandDown_CarriesDrainAdvice(t *testing.T) {
 	if out == "" {
 		t.Fatal("a stand-down must be announced")
 	}
-	for _, want := range []string{"disk-audit", "parked_disk_vmid_range", "vmid_range [40000,200000]"} {
+	for _, want := range []string{"parked_disk_vmid_range", "vmid_range [40000,200000]", "read-only", "unparked"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stand-down warning must mention %q, got: %s", want, out)
 		}
 	}
 }
 
-// TestWarnFreeWithoutBand_StandDown_Suppressed confirms the suppression, so the
-// two messages never both fire for one load.
-func TestWarnFreeWithoutBand_StandDown_Suppressed(t *testing.T) {
+func TestWarnStandDown_NoCollision_Silent(t *testing.T) {
 	var buf bytes.Buffer
-	cfg := &CPIConfig{parkedDefaultBandCollision: "vmid_range [40000,200000]"}
+	cfg := &CPIConfig{}
+	warnParkedDefaultBandCollision(cfg, &buf)
+	if buf.Len() > 0 {
+		t.Errorf("no collision must mean no warning, got: %s", buf.String())
+	}
+}
+
+// TestFreeWithoutBand_BandStillFills pins the unified band semantics: an
+// explicit opt-out with no band typed still resolves the built-in parker band
+// after defaulting, so the holder scans keep recognizing and unparking disks
+// parked while the "parked" default was in effect. This replaces the removed
+// free-without-band load warning — the state it warned about (free with a
+// [0,0] band) no longer exists on a loaded config.
+func TestFreeWithoutBand_BandStillFills(t *testing.T) {
+	cfg := &CPIConfig{DetachedDiskStrategy: "free"}
+	cfg.ApplyDefaults()
+	if cfg.ParkedDiskVMIDRangeStart != defaultParkerVMIDStart || cfg.ParkedDiskVMIDRangeEnd != defaultParkerVMIDEnd {
+		t.Fatalf("strategy=free with no band must fill the built-in band, got [%d,%d]",
+			cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd)
+	}
+	if !cfg.ParkedStrategyActive() {
+		t.Fatal("the filled band must keep the parker read paths active")
+	}
+	if cfg.DetachedDiskParkedEnabled() {
+		t.Fatal("filling the band must not turn parking back on")
+	}
+}
+
+// TestStandDown_BandStillFills pins the same rule for the collision stand-down:
+// the strategy default stands down, the band does not.
+func TestStandDown_BandStillFills(t *testing.T) {
+	cfg := &CPIConfig{VMIDRangeStart: 40000, VMIDRangeEnd: 200000}
+	cfg.ApplyDefaults()
+	if cfg.ParkedDefaultStoodDown() == "" {
+		t.Fatal("precondition: the widened vmid_range must stand the parked default down")
+	}
 	if cfg.DetachedDiskStrategyValue() != DetachedDiskStrategyFree {
 		t.Fatal("precondition: a stood-down config must resolve to free")
 	}
-	warnDetachedDiskStrategyFreeWithoutBand(cfg, &buf)
-	if buf.Len() > 0 {
-		t.Errorf("the stand-down message covers this case; got a second warning: %s", buf.String())
+	if cfg.ParkedDiskVMIDRangeStart != defaultParkerVMIDStart || cfg.ParkedDiskVMIDRangeEnd != defaultParkerVMIDEnd {
+		t.Fatalf("a stood-down load must still fill the built-in band, got [%d,%d]",
+			cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd)
 	}
 }

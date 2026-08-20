@@ -145,7 +145,7 @@ Because of this, **disjoint VMID banding across CPI entries sharing storage is n
 | VM | `vmid_range_start` / `vmid_range_end` |
 | Persistent disk | `disk_vmid_range_start` / `disk_vmid_range_end` |
 | Stemcell template cache | `stemcell_template_vmid_range_start` / `stemcell_template_vmid_range_end` |
-| Parker VM (in play unless the CPI job sets `detached_disk_strategy: free`, since `parked` is the default) | `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` |
+| Parker VM (the band resolves under every `detached_disk_strategy` — allocated into under `parked`, read-only under `free`) | `parked_disk_vmid_range_start` / `parked_disk_vmid_range_end` |
 
 The repository's `manifests/envs/lab/vmid-range.yml` is the existing single-cluster precedent for this pattern (reserving 100–199 for hand-managed bastions); apply the same idea per CPI entry when clusters share storage, as in the worked example above.
 

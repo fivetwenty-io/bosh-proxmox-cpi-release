@@ -358,7 +358,7 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 **Parked disk strategy:** Under `pve.detached_disk_strategy: parked` (the default), detached disks are held on dedicated parker VMs (VMID range 90000–90999 by default) rather than left free-floating. `delete_disk` resolves the volume's holder before deleting, using the same single cluster scan `attach_disk` uses, and unparks the disk from its parker VM first. Unpark failure is returned with the class the unpark chose, and the disk remains safely on the parker VM either way. Most failures are retriable, so the next Director retry re-attempts the unpark. Two are permanent, because no number of retries improves them and each names the command that repairs it: a denied PVE grant, and a reference the CPI could not sweep out of the parker's `unusedN` keys.
 
-The scan runs regardless of the strategy, and a holder that carries the `bosh-parker` tag while sitting outside the configured band is refused rather than deleted. That combination means the band was moved or unset while disks were still parked, and freeing the volume would leave the parker's slot referencing storage that no longer exists. The message names the property to set.
+The scan runs regardless of the strategy, and a holder that carries the `bosh-parker` tag while sitting outside the configured band is refused rather than deleted. That combination means the band was moved away from live parkers while disks were still parked (an unset band resolves to the built-in one under every strategy, so opting out alone strands nothing), and freeing the volume would leave the parker's slot referencing storage that no longer exists. The message names the property to set.
 
 ---
 
@@ -407,9 +407,9 @@ The disk CID is an envelope (`pvd-`, or `pvz-` when compression is on) that may 
 
 - A parker VM inside the configured band: the CPI detaches the disk from its parker so the normal attach path sees a free-floating volume. Unpark failure keeps the class the unpark chose and the disk remains safely parked. Most failures are retriable and the Director retries; a denied PVE grant and a reference the CPI could not sweep out of the parker's `unusedN` keys are permanent, and each names the command that repairs it.
 
-- Any other VM: the call is refused, naming the holding VM and its node. PVE permits two VM configs referencing one volume, nothing downstream detects it, and the volume is destroyed when either holder is. If the holder carries the `bosh-parker` tag but sits outside the configured band, the message says so and names the property to set, since that is the signature of a parker band that was moved or unset while disks were still parked.
+- Any other VM: the call is refused, naming the holding VM and its node. PVE permits two VM configs referencing one volume, nothing downstream detects it, and the volume is destroyed when either holder is. If the holder carries the `bosh-parker` tag but sits outside the configured band, the message says so and names the property to set, since that is the signature of a parker band that was moved away from live parkers while disks were still parked.
 
-The scan runs regardless of the strategy. Opting out with `free` is exactly the configuration that can leave disks stranded on a parker no unpark probe will look for, so it is the configuration that most needs the refusal.
+The scan runs regardless of the strategy. The parker band resolves under `free` too, so an opt-out drains previously parked disks through this scan instead of stranding them; the refusal remains for a band moved away from live parkers and for a release rolled back to one with no concept of parking.
 
 ---
 

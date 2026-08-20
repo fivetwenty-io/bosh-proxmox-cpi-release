@@ -18,7 +18,9 @@ Exit codes:
   2 — usage error or fatal transport failure
 
 Warnings are printed to stderr when:
-  - parked disks exist but detached_disk_strategy is set to "free"
+  - parked disks exist but detached_disk_strategy is set to "free" (they stay
+    recognized and drain on their next attach_disk or delete_disk; no new
+    detaches will park)
   - empty parker VMs are found (teardown candidates)
   - a parker carries an unusedN reference to a live volume (a sweep that did
     not complete; the parker must NOT be destroyed until it is cleared)
@@ -945,13 +947,16 @@ def emit_warnings(
     """Emit advisory warnings to stderr."""
     parked_count = sum(1 for r in disk_records if r.classification == "parked")
 
-    # Warn when parked disks exist but the operator has opted out of parking
+    # Note when parked disks exist but the operator has opted out of parking.
+    # The parker band resolves under "free" too, so these disks still drain:
+    # each is unparked on its next attach_disk or delete_disk.
     strategy = cfg.detached_disk_strategy
     if parked_count > 0 and strategy != "parked":
         _warn(
             f"{parked_count} parked disk(s) found but detached_disk_strategy="
-            f"{strategy!r} (expected 'parked'). "
-            "These disks may not be managed by the parker lifecycle."
+            f"{strategy!r}. They stay recognized (the parker band resolves "
+            "under every strategy) and each unparks on its next attach_disk "
+            "or delete_disk; no new detaches will park."
         )
 
     # Warn about empty parkers (teardown candidates).  A parker is a teardown

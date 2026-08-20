@@ -1013,7 +1013,7 @@ python3 scripts/disk-audit --config /path/to/audit-config.json --json
 
 The script prints warnings to stderr when:
 
-- Parked disks exist but `detached_disk_strategy` in the config file is set to `"free"`.
+- Parked disks exist but `detached_disk_strategy` in the config file is set to `"free"`. These disks still drain — the parker band resolves under every strategy, so each unparks on its next `attach_disk` or `delete_disk` — but no new detaches will park.
 
 - Empty parker VMs are found (no bus disk and no `unusedN` reference). Each empty parker is a teardown candidate.
 

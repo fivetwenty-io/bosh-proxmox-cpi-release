@@ -100,6 +100,13 @@ type ParkerConfig struct {
 	// one volume. Empty (the zero value) keeps the previous behavior of
 	// skipping such rows, which is correct only when no node is known.
 	FallbackNode string
+	// ParkedEnabled reports whether detached_disk_strategy resolves to "parked"
+	// for this load. It controls only the log level of the in-band-without-tag
+	// anomaly in the holder scan: under "parked" a workload VM inside the parker
+	// band is surprising and warns; under "free" or a stood-down default the
+	// band can legitimately overlap vmid_range (overlap validation is relaxed
+	// there), so the same state logs at debug. Nothing gates behavior on it.
+	ParkedEnabled bool
 	// NowFunc returns the current time. Nil defaults to time.Now().UTC().
 	// Tests inject a fixed clock to assert parked_at values deterministically.
 	NowFunc func() time.Time
@@ -806,7 +813,15 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	tagsRaw, _ := vmCfg["tags"].(string)
 	if !tagContainsParker(tagsRaw) {
 		if logger != nil {
-			logger.Warn("disk holder is in the parker range but carries no bosh-parker tag — treating it as a real VM",
+			// Under "parked" a workload VM inside the parker band is surprising
+			// (overlap validation should have rejected the config). Under "free"
+			// or a stood-down default the band can legitimately overlap
+			// vmid_range, so the same state is routine — keep it at debug.
+			logUntagged := logger.Debug
+			if cfg.ParkedEnabled {
+				logUntagged = logger.Warn
+			}
+			logUntagged("disk holder is in the parker range but carries no bosh-parker tag — treating it as a real VM",
 				log.Int("vmid", holderVMID),
 				log.String("node", holderNode),
 				log.String("volid", bareVolid),
@@ -825,7 +840,8 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 // Algorithm:
 //  1. Cluster-wide holder scan. Not found → false,nil.
 //  2. Holder VMID not in [VMIDRangeStart, VMIDRangeEnd] → false,nil (no config read).
-//  3. One config read: check bosh-parker tag. Missing → false + WARN.
+//  3. One config read: check bosh-parker tag. Missing → false (logged at WARN
+//     when cfg.ParkedEnabled, debug otherwise).
 //  4. Find slot via pve.FindDiskIDByVolID. Slot miss → retriable (config listed it).
 //
 // Returns (vmid, node, slot, parked, err).
@@ -907,9 +923,10 @@ type DiskHolder struct {
 	VMID int
 	Node string
 	// IsParker is true when the holder is a bosh-parker VM inside the
-	// configured band. A zero band (the opted-out configuration) can never
-	// produce IsParker=true, so a parker left over from a previous
-	// configuration is reported as an ordinary holder rather than skipped.
+	// configured band. The band resolves to the built-in one under every
+	// strategy, so a false here for a tagged parker means the band was moved
+	// away from it; such a parker is reported as an ordinary holder rather
+	// than skipped.
 	IsParker bool
 	// Slot is the parker's scsiN key holding the volume; set only for parkers.
 	Slot string
