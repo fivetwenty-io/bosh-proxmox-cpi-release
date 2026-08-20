@@ -567,6 +567,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	sl := cfg.RetryStorageLock()
 	pve.ConfigureStorageLockBackoff(sl.BaseMs, sl.CapMs, sl.JitterPct)
 
+	// Apply the operator's transient attempt budget process-wide. With an
+	// unset retry.transient block this is 0 and the shipped default
+	// (DefaultTransientMaxAttempts) stays in force.
+	pve.ConfigureTransientRetry(cfg.RetryTransientMaxAttempts())
+
 	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
 	if otelDurationRecorder != nil {
 		dispatcherOpts = append(dispatcherOpts, cpi.WithDurationRecorder(otelDurationRecorder))

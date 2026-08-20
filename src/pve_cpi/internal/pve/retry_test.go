@@ -394,3 +394,37 @@ func TestRetryOnTransientOrUnplugBusy_NonRetryablePropagates(t *testing.T) {
 		t.Fatalf("expected exactly 1 call, got %d", calls)
 	}
 }
+
+// TestRetryOnTransient_ConfiguredBudgetOverride verifies the retry.transient
+// seam: a caller passing maxAttempts 0 gets the process-wide configured
+// budget instead of DefaultTransientMaxAttempts. Not parallel — the seam is a
+// package-level default.
+func TestRetryOnTransient_ConfiguredBudgetOverride(t *testing.T) {
+	defer SetTransientRetryForTest(1)()
+	calls := 0
+	transient := errors.New("HTTP 596 (code: 596)")
+	err := RetryOnTransient(context.Background(), nil, "test", 0, func() error {
+		calls++
+		return transient
+	})
+	if !errors.Is(err, transient) {
+		t.Fatalf("expected exhausted error to wrap last transient, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call under the configured budget, got %d", calls)
+	}
+}
+
+// TestConfigureTransientRetry_ZeroKeepsDefault verifies startup wiring with an
+// unset retry.transient block (0) leaves DefaultTransientMaxAttempts in force.
+func TestConfigureTransientRetry_ZeroKeepsDefault(t *testing.T) {
+	defer SetTransientRetryForTest(0)() // restore whatever the process had
+	ConfigureTransientRetry(0)
+	if got := transientMaxAttemptsDefault(); got != DefaultTransientMaxAttempts {
+		t.Fatalf("unconfigured budget = %d; want DefaultTransientMaxAttempts %d", got, DefaultTransientMaxAttempts)
+	}
+	ConfigureTransientRetry(3)
+	if got := transientMaxAttemptsDefault(); got != 3 {
+		t.Fatalf("configured budget = %d; want 3", got)
+	}
+}

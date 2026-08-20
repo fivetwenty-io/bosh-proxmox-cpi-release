@@ -169,6 +169,7 @@ func TestValidateRetry_RejectsBadValues(t *testing.T) {
 		wantSub string
 	}{
 		{"negative attempts", &config.RetryConfig{VMIDAlloc: &config.RetryPolicy{MaxAttempts: -1}}, "max_attempts must be >= 0"},
+		{"negative transient attempts", &config.RetryConfig{Transient: &config.RetryPolicy{MaxAttempts: -2}}, "retry.transient.max_attempts must be >= 0"},
 		{"negative base", &config.RetryConfig{StorageImport: &config.RetryPolicy{BaseMs: -5}}, "base_ms must be >= 0"},
 		{"jitter over 100", &config.RetryConfig{TaskPoll: &config.RetryPolicy{JitterPct: 150}}, "jitter_pct must be 0-100"},
 		{"cap below base", &config.RetryConfig{StorageImport: &config.RetryPolicy{BaseMs: 5000, CapMs: 1000}}, "effective cap_ms (1000) must be >= effective base_ms (5000)"},
@@ -185,6 +186,20 @@ func TestValidateRetry_RejectsBadValues(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.wantSub)
 			}
 		})
+	}
+}
+
+func TestRetryTransientMaxAttempts(t *testing.T) {
+	if got := (*config.CPIConfig)(nil).RetryTransientMaxAttempts(); got != 0 {
+		t.Errorf("nil receiver = %d; want 0 (caller default)", got)
+	}
+	c := baseValidCfg()
+	if got := c.RetryTransientMaxAttempts(); got != 0 {
+		t.Errorf("unset block = %d; want 0 (caller default)", got)
+	}
+	c.Retry = &config.RetryConfig{Transient: &config.RetryPolicy{MaxAttempts: 2}}
+	if got := c.RetryTransientMaxAttempts(); got != 2 {
+		t.Errorf("set attempts = %d; want 2", got)
 	}
 }
 

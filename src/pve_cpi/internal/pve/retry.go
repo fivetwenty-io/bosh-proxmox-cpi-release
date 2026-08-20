@@ -205,7 +205,8 @@ func PushbackBackoff(attempt int) time.Duration {
 // listings, login) but can still die to a pvedaemon worker recycling or a
 // temporary cluster-saturation pushback.
 //
-// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts.
+// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts, or the
+// operator override installed by ConfigureTransientRetry.
 func RetryOnTransient(
 	ctx context.Context,
 	logger *log.Logger,
@@ -214,7 +215,7 @@ func RetryOnTransient(
 	op func() error,
 ) error {
 	if maxAttempts <= 0 {
-		maxAttempts = DefaultTransientMaxAttempts
+		maxAttempts = transientMaxAttemptsDefault()
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -372,7 +373,8 @@ func RetryOnTransientOrLock(
 // Use for hot-unplug config edits (detach_disk); other callers have no
 // hot-unplug surface and should stay on RetryOnTransient.
 //
-// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts.
+// maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts, or the
+// operator override installed by ConfigureTransientRetry.
 func RetryOnTransientOrUnplugBusy(
 	ctx context.Context,
 	logger *log.Logger,
@@ -381,7 +383,7 @@ func RetryOnTransientOrUnplugBusy(
 	op func() error,
 ) error {
 	if maxAttempts <= 0 {
-		maxAttempts = DefaultTransientMaxAttempts
+		maxAttempts = transientMaxAttemptsDefault()
 	}
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {

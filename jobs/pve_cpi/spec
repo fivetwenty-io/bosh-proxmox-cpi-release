@@ -1594,6 +1594,15 @@ properties:
       base_ms if smaller.
     default: 0
 
+  pve.retry.transient.max_attempts:
+    description: |
+      Maximum attempts for transport-layer transient retries (pvedaemon
+      worker recycling, connection refusals, request timeouts). Zero
+      (default) applies the built-in budget of 8. The backoff curve for this
+      class is fixed (1s growing to 15s, plus/minus 30 percent jitter) and
+      is not configurable.
+    default: 0
+
   pve.retry.storage_lock.max_attempts:
     description: |
       Maximum attempts for the inner PVE storage-lock retry loop (the

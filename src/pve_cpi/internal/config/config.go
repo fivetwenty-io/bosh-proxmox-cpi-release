@@ -1123,6 +1123,14 @@ type RetryConfig struct {
 	// Defaults: max_attempts per-handler default, base_ms 5000, cap_ms 60000.
 	Pushback *RetryPolicy `json:"pushback,omitempty"`
 
+	// Transient governs the attempt budget for transport-layer retries
+	// (RetryOnTransient and friends): pvedaemon worker recycling, connection
+	// refusals, timeouts. Only max_attempts is consulted; the backoff curve is
+	// the fixed TransientBackoff (1s..15s, ±30% jitter), tuned to pvedaemon's
+	// sub-second worker restart, and base_ms/cap_ms/jitter_pct are ignored.
+	// Default: max_attempts 0 → pve.DefaultTransientMaxAttempts (8).
+	Transient *RetryPolicy `json:"transient,omitempty"`
+
 	// StorageLock governs the exponential backoff used between attempts inside
 	// RetryOnTransientOrLock when PVE responds with a "got timeout waiting for
 	// worker" or "storage locked" signal. This is a
@@ -3466,6 +3474,19 @@ func (c *CPIConfig) RetryStorageLock() EffectiveRetryPolicy {
 	return out
 }
 
+// RetryTransientMaxAttempts returns the operator's override for the
+// transport-layer transient retry budget (RetryOnTransient and friends), or 0
+// when unset so callers keep pve.DefaultTransientMaxAttempts. Only
+// max_attempts is meaningful for this class; the backoff curve is the fixed
+// TransientBackoff (see the RetryConfig.Transient doc comment).
+func (c *CPIConfig) RetryTransientMaxAttempts() int {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.Transient })
+	if p == nil {
+		return 0
+	}
+	return p.MaxAttempts
+}
+
 // OperationTimeoutEnabled reports whether the per-method deadline envelope is
 // active. Returns false when the block is nil, Enabled is nil, or Enabled is
 // *false. Only an explicit *true returns true.
@@ -4621,6 +4642,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkRaw("vmid_alloc", c.Retry.VMIDAlloc)
 	checkRaw("task_poll", c.Retry.TaskPoll)
 	checkRaw("pushback", c.Retry.Pushback)
+	checkRaw("transient", c.Retry.Transient)
 	checkRaw("storage_lock", c.Retry.StorageLock)
 
 	// Effective cap >= base. Only meaningful when the operator set at least one
