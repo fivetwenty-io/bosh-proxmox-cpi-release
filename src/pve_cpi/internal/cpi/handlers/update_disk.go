@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,19 +42,24 @@ import (
 // Returns: null on success (BOSH void method).
 //
 // Logic (full update semantics):
-//  1. Parse disk_cid and locate the attached VM + diskID.
-//     Detached disk → CloudError (cannot update options on detached disk).
+//  1. Parse disk_cid, resolve it through the identity seam, and locate the
+//     holder (a workload VM or a parker). Free-floating disk → DetachedDisk
+//     CloudError (no carrier exists for the update).
 //  2. If update_spec has "size", route through resize logic (delta computation).
-//  3. Read current disk option string from VM config.
-//  4. Parse current options into key-value map; preserve unspecified options.
-//  5. Merge new options from update_spec into the map.
-//  6. Reconstruct disk option string: "<volid>[,key=value,...]".
-//  7. PUT updated config via AttachDisk (with explicit DiskID to avoid slot re-allocation).
-//  8. Return nil.
+//  3. Record the option changes as the disk's override map — on the holder
+//     VM's bosh_disk_opt_overlays sentinel while attached, in the parker's
+//     provenance entry while parked — FAIL-CLOSED, before the drive string is
+//     touched. The record is what makes the update survive a detach/attach
+//     cycle, whose attach otherwise rebuilds the drive string from config and
+//     CID options alone.
+//  4. Attached: read the current drive option string, merge the new options
+//     over it (preserving unspecified options and the identity serial), and
+//     PUT it back via AttachDisk with the explicit DiskID.
+//     Parked: skip the in-place rewrite entirely — the parker slot's option
+//     string is CPI-owned (volid plus serial only) and the next attach bakes
+//     the merged string; the update takes effect then.
 //
 // Empty update_spec (all absent or zero-value fields): returns nil (no-op).
-//
-//nolint:gocognit // Orchestration shell: parse args, locate VM, resolve diskID, merge options, resize, PUT config. Sequential phases with per-step error handling; cognitive floor set by the step count.
 func HandleUpdateDisk(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
@@ -81,16 +85,15 @@ func HandleUpdateDisk(deps Deps) Handler {
 		if decErr != nil {
 			return nil, decErr
 		}
-		// Resolve to the volume's current name (identity seam): the locator,
-		// slot resolver, and option RMW below all read the VM config, which
-		// carries the post-reassignment name for stable-ID disks. The RMW
-		// merges from the live option string, so the identity serial is
+		// Resolve to the volume's current name (identity seam): the holder
+		// scan, slot resolver, and option RMW below all read the VM config,
+		// which carries the post-reassignment name for stable-ID disks. The
+		// RMW merges from the live option string, so the identity serial is
 		// preserved without special handling.
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "update_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
-		bareDiskCID = rd.volid
 
 		// update_spec may be null or missing; treat as empty map.
 		var updateSpec map[string]any
@@ -101,114 +104,187 @@ func HandleUpdateDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Validate disk_cid format. The locator and diskID resolver match
-		//    against the full canonical "<storage>:<volume>" form that PVE
-		//    stores in the VM config (e.g. "data:vm-9559-disk-0,size=2G"), so
-		//    pass bareDiskCID through — NOT the storage-stripped volume part.
+		// 2. Validate disk_cid format. The holder scan and diskID resolver
+		//    match against the full canonical "<storage>:<volume>" form that
+		//    PVE stores in the VM config (e.g. "data:vm-9559-disk-0,size=2G"),
+		//    so pass the resolved volid through — NOT the storage-stripped
+		//    volume part.
 		// ----------------------------------------------------------------
-		if _, _, err := pve.ParseDiskCID(bareDiskCID); err != nil {
+		if _, _, err := pve.ParseDiskCID(rd.volid); err != nil {
 			return nil, cpierrors.DiskNotFound(diskCID)
 		}
 
 		// ----------------------------------------------------------------
-		// 3. Locate attached VM + its node, then resolve diskID.
-		//    Detached disk → CloudError. FindVMByDiskVolid uses a cluster
-		//    scan, so update_disk works across nodes in a cluster deploy.
+		// 3. Locate the holder, parker-aware. The pre-override behavior wrote
+		//    updated options onto whatever VM held the volume — including a
+		//    parker, whose drive string the next unpark discards. Classifying
+		//    the holder routes a parked disk to the record-only path instead.
 		// ----------------------------------------------------------------
-		vmid, node, vmErr := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, bareDiskCID)
-		if vmErr != nil {
-			// Distinguish "disk not attached to any VM" (expected detached-disk path)
-			// from transport/cluster-scan errors (which must propagate so the caller
-			// can detect transient failures and retry).
-			//
-			// FindVMByDiskVolid wraps pve.ErrDiskNotAttachedToAnyVM via fmt.Errorf when
-			// the cluster scan completes with no match. Transport/cluster errors are
-			// distinct wrapped errors without that sentinel. errors.Is traverses the
-			// chain, so both direct and double-wrapped forms are caught.
-			// pve.IsNotFound handles SDK 404 shapes for callers that surface a 404
-			// instead of ErrDiskNotAttachedToAnyVM.
-			if pve.IsNotFound(vmErr) || errors.Is(vmErr, pve.ErrDiskNotAttachedToAnyVM) {
-				return nil, cpierrors.DetachedDisk(
-					"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
-				)
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(vmErr), fmt.Sprintf("update_disk: locate VM for disk %q", diskCID))
+		holder, holderErr := updateDiskHolder(ctx, deps, diskCID, &rd)
+		if holderErr != nil {
+			return nil, holderErr
 		}
-
-		diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, bareDiskCID)
-		if err != nil {
-			return nil, cpierrors.Wrap(err, fmt.Sprintf("update_disk: cannot resolve diskID for %s on VM %d", diskCID, vmid))
+		if !holder.Found {
+			return nil, cpierrors.DetachedDisk(
+				"update_disk: detached disk cannot be updated — disk %q not attached to any VM", diskCID,
+			)
 		}
-
-		// ----------------------------------------------------------------
-		// 4. Handle "size" field via resize logic.
-		// ----------------------------------------------------------------
-		if sizeRaw, hasSz := updateSpec["size"]; hasSz {
-			newSizeMB, ok := toInt(sizeRaw)
-			if !ok || newSizeMB <= 0 {
-				return nil, cpierrors.Cloud("update_disk: update_spec.size must be a positive integer (MiB), got %v", sizeRaw)
-			}
-			if err := resizeDiskInternal(ctx, deps, node, vmid, diskID, diskCID, newSizeMB); err != nil {
-				return nil, err
-			}
+		if strandedErr := strandedParkerRefusal(deps, "update_disk", diskCID, holder); strandedErr != nil {
+			return nil, strandedErr
 		}
-
-		// ----------------------------------------------------------------
-		// 5. Build option key-value map from remaining update_spec fields.
-		//    Only recognized option fields are applied; unknown fields are
-		//    silently ignored to maintain forward compatibility.
-		// ----------------------------------------------------------------
-		newOpts := updateSpecToOptions(updateSpec)
-
-		// No option changes (size-only update or truly empty spec).
-		if len(newOpts) == 0 {
-			return nil, nil
+		if holder.IsParker {
+			return nil, updateParkedDisk(ctx, deps, diskCID, rd, holder, updateSpec)
 		}
-
-		// ----------------------------------------------------------------
-		// 6. Read current disk option string and parse existing options.
-		// ----------------------------------------------------------------
-		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
-		if err != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config", vmid))
-		}
-
-		diskOptStr, ok := cfg[diskID].(string)
-		if !ok || diskOptStr == "" {
-			return nil, cpierrors.Cloud("update_disk: disk %q not found in VM %d config after locate", diskID, vmid)
-		}
-
-		// Split option string into the bare volid and existing option pairs.
-		bareVolid, existingOpts := splitDiskOptStr(diskOptStr)
-
-		// ----------------------------------------------------------------
-		// 7. Merge existing options with new options (new takes precedence).
-		// ----------------------------------------------------------------
-		merged := mergeDiskOptions(existingOpts, newOpts)
-
-		// ----------------------------------------------------------------
-		// 8. Reconstruct disk option string and PUT to VM config.
-		// ----------------------------------------------------------------
-		newOptStr := buildDiskOptStr(bareVolid, merged)
-
-		// Use AttachDisk with opts.DiskID set to the current slot so the SDK
-		// issues PUT /nodes/{node}/qemu/{vmid}/config with {diskID: newOptStr}.
-		_, err = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, newOptStr, "scsi", &qemu.AttachOpts{
-			DiskID: diskID,
-		})
-		if err != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: update disk options for %s on VM %d", diskCID, vmid))
-		}
-
-		deps.Log(ctx).Info("update_disk",
-			log.String("disk_cid", diskCID),
-			log.Int("vmid", vmid),
-			log.String("disk_id", diskID),
-			log.String("new_opt_str", newOptStr),
-		)
-
-		return nil, nil
+		return nil, updateAttachedDisk(ctx, deps, diskCID, rd, holder, updateSpec)
 	})
+}
+
+// updateDiskHolder resolves who currently holds the disk. A stable-ID disk's
+// holder came out of the identity resolution (after converging an interrupted
+// transfer, since this is a mutating handler); a legacy disk pays the same
+// cluster scan the other disk handlers do.
+func updateDiskHolder(ctx context.Context, deps Deps, diskCID string, rd *resolvedDisk) (pve.DiskHolder, error) {
+	if rd.stableID != "" {
+		refreshed, err := resumeTransferIfNeeded(ctx, deps, "update_disk", *rd)
+		if err != nil {
+			return pve.DiskHolder{}, err
+		}
+		*rd = refreshed
+		if rd.holder != nil {
+			return *rd.holder, nil
+		}
+		return pve.DiskHolder{}, nil
+	}
+	holder, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerReadConfigFor(deps))
+	if err != nil {
+		return pve.DiskHolder{}, wrapHolderScanError(err, fmt.Sprintf("update_disk: locate VM for disk %q", diskCID))
+	}
+	return holder, nil
+}
+
+// updateSpecSizeMB extracts and validates the optional "size" field. Returns
+// (size, present, err).
+func updateSpecSizeMB(updateSpec map[string]any) (int, bool, error) {
+	sizeRaw, hasSz := updateSpec["size"]
+	if !hasSz {
+		return 0, false, nil
+	}
+	newSizeMB, ok := toInt(sizeRaw)
+	if !ok || newSizeMB <= 0 {
+		return 0, false, cpierrors.Cloud("update_disk: update_spec.size must be a positive integer (MiB), got %v", sizeRaw)
+	}
+	return newSizeMB, true, nil
+}
+
+// updateAttachedDisk applies an update to a disk held by a workload VM:
+// resize, then the fail-closed override record, then the in-place drive
+// rewrite. The record is written before the drive so a failure between the
+// two converges forward — the recorded override is re-applied at the next
+// attach and a Director retry re-runs the rewrite — whereas the reverse order
+// would leave a drive updated with no record, the exact silent-revert state
+// this method exists to prevent.
+func updateAttachedDisk(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
+	node, vmid := holder.Node, holder.VMID
+
+	diskID, err := pve.ResolveDiskID(ctx, deps.PVE, node, vmid, rd.volid)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("update_disk: cannot resolve diskID for %s on VM %d", diskCID, vmid))
+	}
+
+	if newSizeMB, hasSz, sizeErr := updateSpecSizeMB(updateSpec); sizeErr != nil {
+		return sizeErr
+	} else if hasSz {
+		if err := resizeDiskInternal(ctx, deps, node, vmid, diskID, diskCID, newSizeMB); err != nil {
+			return err
+		}
+	}
+
+	// Build option key-value map from the remaining update_spec fields. Only
+	// recognized option fields are applied; unknown fields are silently
+	// ignored to maintain forward compatibility. An empty-string value is a
+	// deletion, of both the live drive key and any recorded override for it.
+	newOpts := updateSpecToOptions(updateSpec)
+	if len(newOpts) == 0 {
+		return nil // size-only update or truly empty spec
+	}
+
+	// Record the override map first, fail-closed: if the record cannot be
+	// written the drive is left untouched and the error is returned — the
+	// record carries the update's durability, so it cannot inherit the
+	// best-effort contract of the neighboring provenance writers.
+	if _, ovErr := pve.ApplyVMDiskOptOverlay(ctx, deps.PVE, node, vmid, rd.sentinelKey(),
+		[]string{rd.volid, rd.birth}, newOpts); ovErr != nil {
+		return retriableUnlessPermanent(ovErr,
+			fmt.Sprintf("update_disk: record option overrides for disk %s (fail-closed: the drive was not modified)", diskCID))
+	}
+
+	// Read the current drive option string and merge the new options over it.
+	// The merge starts from the live string, so unspecified options — the
+	// identity serial included — are preserved.
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config", vmid))
+	}
+	diskOptStr, ok := cfg[diskID].(string)
+	if !ok || diskOptStr == "" {
+		return cpierrors.Cloud("update_disk: disk %q not found in VM %d config after locate", diskID, vmid)
+	}
+	bareVolid, existingOpts := splitDiskOptStr(diskOptStr)
+	newOptStr := buildDiskOptStr(bareVolid, mergeDiskOptions(existingOpts, newOpts))
+
+	// Use AttachDisk with opts.DiskID set to the current slot so the SDK
+	// issues PUT /nodes/{node}/qemu/{vmid}/config with {diskID: newOptStr}.
+	_, err = deps.PVE.QEMU().AttachDisk(ctx, node, vmid, newOptStr, "scsi", &qemu.AttachOpts{
+		DiskID: diskID,
+	})
+	if err != nil {
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: update disk options for %s on VM %d", diskCID, vmid))
+	}
+
+	deps.Log(ctx).Info("update_disk",
+		log.String("disk_cid", diskCID),
+		log.Int("vmid", vmid),
+		log.String("disk_id", diskID),
+		log.String("new_opt_str", newOptStr),
+	)
+	return nil
+}
+
+// updateParkedDisk applies an update to a disk held by a parker: resize acts
+// on the volume directly through the parker slot, and option changes are
+// recorded in the parker's provenance entry only. The parker slot's drive
+// string stays CPI-owned (volid plus serial) — the next attach bakes the
+// merged string, which is when the option update takes effect.
+func updateParkedDisk(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
+	if newSizeMB, hasSz, sizeErr := updateSpecSizeMB(updateSpec); sizeErr != nil {
+		return sizeErr
+	} else if hasSz {
+		if holder.Slot == "" {
+			return cpierrors.Retriable(
+				"update_disk: disk %s confirmed on parker vmid %d but slot not found in config (possible race)",
+				diskCID, holder.VMID)
+		}
+		if err := resizeDiskInternal(ctx, deps, holder.Node, holder.VMID, holder.Slot, diskCID, newSizeMB); err != nil {
+			return err
+		}
+	}
+
+	newOpts := updateSpecToOptions(updateSpec)
+	if len(newOpts) == 0 {
+		return nil
+	}
+	merged, ovErr := pve.ApplyParkerDiskOverlay(ctx, deps.PVE, holder.Node, holder.VMID,
+		rd.volid, rd.stableID, rd.diskCID, newOpts, parkerReadConfigFor(deps))
+	if ovErr != nil {
+		return retriableUnlessPermanent(ovErr,
+			fmt.Sprintf("update_disk: record option overrides for parked disk %s (fail-closed: nothing was changed)", diskCID))
+	}
+	deps.Log(ctx).Info("update_disk: disk is parked; option overrides recorded and applied at the next attach",
+		log.String("disk_cid", diskCID),
+		log.Int("parker_vmid", holder.VMID),
+		log.Int("override_keys", len(merged)),
+	)
+	return nil
 }
 
 // resizeDiskInternal performs the additive GiB resize for a disk already located

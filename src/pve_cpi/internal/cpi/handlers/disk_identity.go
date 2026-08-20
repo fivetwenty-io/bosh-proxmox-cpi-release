@@ -89,7 +89,7 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 		log.String("disk_cid", rd.diskCID),
 		log.Int("parker_vmid", rd.intent.ParkerVMID),
 	)
-	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID}
+	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts}
 	if _, err := pve.ResumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerWriteConfigFor(deps), pctx); err != nil {
 		return resolvedDisk{}, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: resume interrupted transfer for disk %s", op, rd.diskCID))

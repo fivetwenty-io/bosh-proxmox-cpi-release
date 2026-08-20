@@ -208,6 +208,26 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
+		// 2b. Read the disk's recorded option overrides off the holder before
+		//     anything mutates, so the park below can carry them into the
+		//     parker's provenance entry. Fail-closed: proceeding without a
+		//     read that failed transiently would silently revert an
+		//     operator's update, and the Director retries a failed detach
+		//     safely. Skipped under strategy "free" — nothing parks there,
+		//     so the overrides have no carrier to ride and are dropped with
+		//     the holder's record below.
+		// --------------------------------------------------------------------
+		var overlay map[string]string
+		if deps.Config.DetachedDiskParkedEnabled() {
+			var ovErr error
+			overlay, ovErr = pve.GetVMDiskOptOverlay(ctx, deps.PVE, node, vmid, bareDiskCID)
+			if ovErr != nil {
+				return nil, retriableUnlessPermanent(ovErr,
+					fmt.Sprintf("detach_disk: read recorded option overrides for disk %s before detach", diskCID))
+			}
+		}
+
+		// --------------------------------------------------------------------
 		// 3. Snapshot pre-flight guard.
 		//
 		// PVE rejects DetachDisk while a snapshot references the disk slot.
@@ -260,9 +280,17 @@ func HandleDetachDisk(deps Deps) Handler {
 		//    on retry the disk is free-floating so ParkDisk's idempotency check
 		//    skips the IsDiskParked scan and re-parks directly.
 		// --------------------------------------------------------------------
-		if err := parkAfterDetach(ctx, deps, vmCID, diskCID, bareDiskCID, node); err != nil {
+		if err := parkAfterDetach(ctx, deps, vmCID, diskCID, bareDiskCID, node, overlay); err != nil {
 			return nil, err
 		}
+
+		// --------------------------------------------------------------------
+		// 5b. Remove the override record from the former holder, only after
+		//     the park has persisted it (or strategy "free" deliberately
+		//     dropped it). Best-effort: a leftover entry names a disk this VM
+		//     no longer holds and is overwritten by the disk's next attach.
+		// --------------------------------------------------------------------
+		pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID)
 
 		return nil, nil
 	})
@@ -314,7 +342,17 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, rd.diskCID, deps.Config, logger); err != nil {
 		return err
 	}
-	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID}
+	// The recorded option overrides ride the transfer inside the provenance
+	// intent record, which is written strictly before the source slot is
+	// deleted — so the fail-closed read here is the only added crash exposure,
+	// and a failed read fails the detach retriably rather than silently
+	// dropping an operator's update.
+	overlay, ovErr := pve.GetVMDiskOptOverlay(ctx, deps.PVE, node, vmid, rd.stableID, rd.volid, rd.birth)
+	if ovErr != nil {
+		return retriableUnlessPermanent(ovErr,
+			fmt.Sprintf("detach_disk: read recorded option overrides for disk %s before transfer", rd.diskCID))
+	}
+	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay}
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerWriteConfigFor(deps), pctx)
 	if transferErr != nil {
 		return retriableUnlessPermanent(transferErr,
@@ -324,6 +362,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	// side) was written before the source slot was touched, so the holder
 	// sentinel can now come off. Both keyings, in case an older write raced.
 	pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
+	pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid, rd.birth)
 
 	logger.Info("detach_disk: disk transferred to parker",
 		log.String("vm_cid", vmCID),
@@ -503,7 +542,13 @@ func detachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string,
 // strategy is not enabled. Failure is fail-closed retriable: the Director
 // retries detach_disk; on retry the disk is free-floating so ParkDisk's
 // idempotency check skips the IsDiskParked scan and re-parks directly.
-func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string) error {
+//
+// overlay is the disk's recorded option-override map, read off the holder
+// before the detach; the provenance entry carries it across the park. The
+// provenance write itself stays best-effort, so a park that succeeds while
+// its provenance write fails loses the overrides — narrow (one description
+// write after a successful attach) and logged by the provenance writer.
+func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string, overlay map[string]string) error {
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
@@ -522,7 +567,7 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
 		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
 	}
-	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
+	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID, Opts: overlay}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		// Same reasoning as the free-floating park above: the class the park
 		// chose is the one the Director should see.

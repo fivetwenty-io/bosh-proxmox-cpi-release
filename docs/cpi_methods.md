@@ -604,6 +604,12 @@ If `metadata` contains a `tags` sub-object (map of `key: value`), the entries ar
 
 **Notes:** Not part of the canonical BOSH CPI v2 specification. Provides full PVE disk option updates beyond what `resize_disk` covers. When `size` is provided, the same shrink-rejection rule as `resize_disk` applies.
 
+Updates are durable. Every option change is recorded as a per-disk override map before the drive string is touched, and each later attach merges options as global config, then CID-recorded options, then the recorded overrides, with the rightmost layer winning and an empty-string value deleting the key. Without the record, a detach/attach cycle would rebuild the drive string from config and CID options alone and the update would silently revert. The record lives on the holder VM's description sentinel (`bosh_disk_opt_overlays`) while the disk is attached, and rides the parker's `bosh_parked_disks` provenance entry (its `opts` field) while it is parked. If the record cannot be written, the call fails and the drive is left untouched.
+
+A detached disk held by a parker can be updated too: the CPI records the override (and applies `size` directly to the volume) without touching the parker slot's drive string, and the option change takes effect at the disk's next attach. A free-floating detached disk (strategy `free`) still returns `Bosh::Clouds::DetachedDisk`, since no carrier exists for the record there.
+
+The drive `serial` is the disk's stable identity and is never updatable through this method: it is preserved verbatim in the in-place rewrite and stripped from any recorded override.
+
 ---
 
 ## Network

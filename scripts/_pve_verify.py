@@ -876,6 +876,63 @@ class PVEVerifier:
                 return True
         return False
 
+    def parked_disk_overlay(self, vmid: "int | str", disk_cid: str) -> dict[str, Any]:
+        """Return the drive-option overrides a parker's provenance entry records.
+
+        The CPI stores operator updates made through update_disk in the
+        entry's "opts" field while the disk is parked, and merges them into
+        the drive string at the next attach. Empty dict when the entry is
+        absent or carries no overrides. Same dual-keyed matching as
+        parked_disk_recorded.
+        """
+        entries = self.parked_disks(vmid)
+        bare = _bare_disk_cid(disk_cid)
+        stable_id = disk_stable_id(disk_cid)
+        entry: Any = None
+        if stable_id and stable_id in entries:
+            entry = entries[stable_id]
+        elif bare in entries:
+            entry = entries[bare]
+        else:
+            current = self.current_disk_volid(disk_cid)
+            for candidate in entries.values():
+                if isinstance(candidate, dict) and candidate.get("volid") in (bare, current):
+                    entry = candidate
+                    break
+        if not isinstance(entry, dict):
+            return {}
+        opts = entry.get("opts")
+        return opts if isinstance(opts, dict) else {}
+
+    def disk_option_overlay(self, vmid: "int | str", disk_cid: str) -> dict[str, Any]:
+        """Return the bosh_disk_opt_overlays entry a VM's description records.
+
+        This is the attached-side carrier of the same overrides
+        parked_disk_overlay reads from a parker. Empty dict when the sentinel,
+        the key, or the entry is absent — the record moves with the disk, so
+        an ex-holder legitimately has none.
+        """
+        desc = str(self.qemu_config(vmid).get("description", ""))
+        match = _SENTINEL_RE.search(desc)
+        if not match:
+            return {}
+        try:
+            sentinel = json.loads(match.group(1))
+        except ValueError:
+            return {}
+        overlays = sentinel.get("bosh_disk_opt_overlays") if isinstance(sentinel, dict) else None
+        if not isinstance(overlays, dict):
+            return {}
+        for key in (
+            disk_stable_id(disk_cid),
+            _bare_disk_cid(disk_cid),
+            self.current_disk_volid(disk_cid),
+        ):
+            entry = overlays.get(key) if key else None
+            if isinstance(entry, dict):
+                return entry
+        return {}
+
     # -- assertion helpers ----------------------------------------------------
 
     def assert_true(self, label: str, cond: bool) -> None:

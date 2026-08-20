@@ -1623,6 +1623,49 @@ class TestStableDiskIdentity(unittest.TestCase):
             with unittest.mock.patch.object(v, "parked_disks", return_value={}):
                 self.assertFalse(v.parked_disk_recorded(90000, id_cid))
 
+    def test_parked_disk_overlay_reads_opts(self) -> None:
+        """The provenance entry's opts field is the parked-side carrier of the
+        overrides update_disk records; both keying generations expose it."""
+        v = self._verifier()
+        id_cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        legacy_cid = self._pvd_cid("data:vm-9001-disk-0")
+        id_entries = {
+            self.STABLE_ID: {
+                "disk_cid": id_cid,
+                "node": "pve1",
+                "opts": {"cache": "writeback", "mbps_rd": ""},
+            }
+        }
+        legacy_entries = {"data:vm-9001-disk-0": {"disk_cid": legacy_cid, "node": "pve1"}}
+        with unittest.mock.patch.object(v, "cluster_vms", return_value=[]):
+            with unittest.mock.patch.object(v, "parked_disks", return_value=id_entries):
+                self.assertEqual(
+                    v.parked_disk_overlay(90000, id_cid),
+                    {"cache": "writeback", "mbps_rd": ""},
+                )
+            with unittest.mock.patch.object(v, "parked_disks", return_value=legacy_entries):
+                self.assertEqual(v.parked_disk_overlay(90000, legacy_cid), {})
+            with unittest.mock.patch.object(v, "parked_disks", return_value={}):
+                self.assertEqual(v.parked_disk_overlay(90000, id_cid), {})
+
+    def test_disk_option_overlay_reads_vm_sentinel(self) -> None:
+        """The attached-side carrier: bosh_disk_opt_overlays on the holder VM's
+        description, dual-keyed like every other disk sentinel."""
+        v = self._verifier()
+        id_cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        desc = (
+            '<!--BOSH:{"bosh_disk_opt_overlays":{"'
+            + self.STABLE_ID
+            + '":{"cache":"writeback"}}}-->'
+        )
+        with unittest.mock.patch.object(v, "cluster_vms", return_value=[(700, "pve1")]):
+            with unittest.mock.patch.object(
+                v, "qemu_config", return_value={"description": desc}
+            ):
+                self.assertEqual(v.disk_option_overlay(700, id_cid), {"cache": "writeback"})
+            with unittest.mock.patch.object(v, "qemu_config", return_value={}):
+                self.assertEqual(v.disk_option_overlay(700, id_cid), {})
+
     def test_parked_disk_recorded_matches_entry_volid(self) -> None:
         """A stable-ID entry is found through its volid field when the caller
         resolves the current volid (mid-transfer intent records)."""

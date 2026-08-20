@@ -259,7 +259,11 @@ func attachDiskCore(
 	if rd.meta != nil {
 		metaOpts = rd.meta.Opts
 	}
-	effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
+	// Merge order: global < CID-recorded opts < recorded operator overrides
+	// (rightmost wins; an empty-string value deletes the key). The overrides
+	// layer applies to legacy disks too — a bare CID (meta nil) can still
+	// carry an overlay recorded by update_disk.
+	effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(mergeDiskOptions(globalOpts, metaOpts), plan.overlay), bus)
 	// CID opts are a mixed namespace: CPI-internal provenance keys (e.g.
 	// retain_on_delete) ride in meta.Opts but are not PVE drive options, and
 	// PVE rejects the whole config write on any key outside its drive schema.
@@ -267,7 +271,7 @@ func attachDiskCore(
 
 	// Enforce creation-time disk-performance invariants (§7.26), before any
 	// mutating PVE call so an enforce-mode reject leaves no orphan.
-	if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), op, vmCID, diskCID, rd.meta, effectiveOpts); err != nil {
+	if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), op, vmCID, diskCID, rd.meta, plan.overlay, effectiveOpts); err != nil {
 		return "", "", err
 	}
 
@@ -469,6 +473,11 @@ func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string
 // knob decides: enforce (default) → non-retriable CloudError; warn → log and
 // proceed; off → skip.
 //
+// The comparison baseline is the creation-time options with the disk's
+// recorded operator overrides layered on top: an option an operator updated
+// through update_disk is an intended change, not a divergence, while a global
+// config drift the disk never opted into still trips the guard.
+//
 // Ordering note: this runs after chooseSCSISlotSkippingZero, which may detach a
 // legacy scsi0 attachment (a config PUT) before this check. That migration is
 // data-loss-safe (a scsi0 persistent disk was never successfully partitioned by
@@ -484,12 +493,13 @@ func enforceDiskPerfInvariants(
 	op string,
 	vmCID, diskCID string,
 	meta *pve.DiskCIDMeta,
+	overlay map[string]string,
 	effectiveOpts map[string]string,
 ) error {
 	if meta == nil || len(meta.Opts) == 0 {
 		return nil
 	}
-	violations := diskPerfInvariantViolations(meta.Opts, effectiveOpts)
+	violations := diskPerfInvariantViolations(mergeDiskOptions(meta.Opts, overlay), effectiveOpts)
 	if len(violations) == 0 {
 		return nil
 	}
@@ -813,6 +823,11 @@ type attachPlan struct {
 	// parker is the holder the transfer moves the disk off; meaningful only
 	// when viaTransfer is true.
 	parker pve.DiskHolder
+	// overlay is the disk's recorded drive-option overrides, read from
+	// wherever the disk currently lives (a parker's provenance entry, or the
+	// target VM's own sentinel on an idempotent re-attach). attachDiskCore
+	// merges it as the rightmost layer over global and CID options.
+	overlay map[string]string
 }
 
 // guardAndUnparkBeforeAttach settles who currently holds the volume, then
@@ -868,9 +883,18 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 		return attachPlan{}, foreignHolderError(deps, op, rd.diskCID, targetVMID, holder)
 	}
 
+	// The disk's recorded drive-option overrides ride wherever it lives; read
+	// them now, and when they ride a parker, record them on the receiving VM
+	// before anything can remove the parker's record (the same
+	// receiving-side-first ordering D13 gives every transfer).
+	overlay, ovErr := attachOverlayForHolder(ctx, deps, op, rd, holder, node, targetVMID)
+	if ovErr != nil {
+		return attachPlan{}, ovErr
+	}
+
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if holder.Node == node {
-			return attachPlan{viaTransfer: true, parker: holder}, nil
+			return attachPlan{viaTransfer: true, parker: holder, overlay: overlay}, nil
 		}
 		// PVE reassignment is same-node only ("Both VMs need to be on the
 		// same node"). A birth-named volume can still take the config-edit
@@ -908,7 +932,52 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 		// into attaching a volume the parker still references.
 		return attachPlan{}, retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, rd.diskCID))
 	}
-	return attachPlan{}, nil
+	return attachPlan{overlay: overlay}, nil
+}
+
+// attachOverlayForHolder reads the disk's recorded drive-option overrides
+// from its current holder. For a parker holder it also records a non-empty
+// result on the receiving VM's own sentinel before returning, so the
+// receiving side carries the overrides before the unpark or transfer removes
+// the parker's provenance entry — a crash mid-attach then leaves at least one
+// carrier. A stale entry on a VM the attach never completes onto is harmless:
+// it is keyed by the disk and overwritten by the next successful attach.
+//
+// Fail-closed on read: concluding "no overrides" from a read that never
+// arrived is exactly the silent revert the record exists to prevent, and the
+// Director retries a failed attach safely.
+func attachOverlayForHolder(ctx context.Context, deps Deps, op string, rd *resolvedDisk, holder pve.DiskHolder, node string, targetVMID int) (map[string]string, error) {
+	if !holder.Found {
+		return nil, nil
+	}
+	if holder.IsParker {
+		overlay, err := pve.ReadParkerDiskOverlay(ctx, deps.PVE, holder.Node, holder.VMID, rd.volid, rd.stableID)
+		if err != nil {
+			return nil, retriableUnlessPermanent(err,
+				fmt.Sprintf("%s: read recorded option overrides for disk %s", op, rd.diskCID))
+		}
+		if len(overlay) == 0 {
+			return nil, nil
+		}
+		if setErr := pve.SetVMDiskOptOverlay(ctx, deps.PVE, node, targetVMID, rd.sentinelKey(), overlay, rd.volid, rd.birth); setErr != nil {
+			if pve.IsNotFound(setErr) {
+				return nil, cpierrors.VMNotFound(strconv.Itoa(targetVMID))
+			}
+			return nil, retriableUnlessPermanent(setErr,
+				fmt.Sprintf("%s: record option overrides for disk %s on VM %d", op, rd.diskCID, targetVMID))
+		}
+		return overlay, nil
+	}
+	if holder.VMID == targetVMID {
+		// Idempotent re-attach: the overrides already live on the target.
+		overlay, err := pve.GetVMDiskOptOverlay(ctx, deps.PVE, holder.Node, holder.VMID, rd.stableID, rd.volid, rd.birth)
+		if err != nil {
+			return nil, retriableUnlessPermanent(err,
+				fmt.Sprintf("%s: read recorded option overrides for disk %s", op, rd.diskCID))
+		}
+		return overlay, nil
+	}
+	return nil, nil
 }
 
 // foreignHolderError builds the refusal for a volume already attached to a VM

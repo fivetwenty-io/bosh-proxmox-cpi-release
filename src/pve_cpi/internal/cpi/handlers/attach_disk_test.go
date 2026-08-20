@@ -1566,11 +1566,14 @@ func parkedCfg() *config.CPIConfig {
 //
 //	Call 1: FindVMByDiskVolid — config read for parker VMID (disk present → match)
 //	Call 2: holder resolution — second config read for parker VMID (tags + slot)
-//	Call 3: unpark — re-resolves the slot under the protection lock, because a
+//	Call 3: option-override read — the parker's provenance entry is where a
+//	        parked disk's recorded overrides live, read before the unpark can
+//	        remove it
+//	Call 4: unpark — re-resolves the slot under the protection lock, because a
 //	        slot name resolved before the lock is a blind write by the time the
 //	        detach runs
-//	Call 4: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
-//	Call 5: ResolveDiskID — target VM config after attach (scsi1 present)
+//	Call 5: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
+//	Call 6: ResolveDiskID — target VM config after attach (scsi1 present)
 func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	t.Parallel()
 
@@ -1594,9 +1597,10 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 		configCfgs: []map[string]any{
 			parkerVMCfg,         // call 1: FindVMByDiskVolid config scan on parker VMID
 			parkerVMCfg,         // call 2: holder resolution reads tags + slot
-			parkerVMCfg,         // call 3: unpark re-resolves the slot under the lock
-			targetVMCfgEmpty,    // call 4: chooseSCSISlotSkippingZero on target VM
-			targetVMCfgAttached, // call 5: ResolveDiskID on target VM after attach
+			parkerVMCfg,         // call 3: option-override read on the parker
+			parkerVMCfg,         // call 4: unpark re-resolves the slot under the lock
+			targetVMCfgEmpty,    // call 5: chooseSCSISlotSkippingZero on target VM
+			targetVMCfgAttached, // call 6: ResolveDiskID on target VM after attach
 		},
 	}
 	ag := &captureAgent{}

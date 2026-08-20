@@ -128,7 +128,7 @@ Each park operation records a provenance entry in the parker VM's PVE
 description field inside a structured sentinel comment:
 
 ```
-<!--BOSH:{"bosh_parked_disks":{"<key>":{"disk_cid":"...","source_vm_cid":"...","parked_at":"<RFC3339>","node":"<node>","director_id":"...","volid":"...","slot":"..."}}}-->
+<!--BOSH:{"bosh_parked_disks":{"<key>":{"disk_cid":"...","source_vm_cid":"...","parked_at":"<RFC3339>","node":"<node>","director_id":"...","volid":"...","slot":"...","opts":{...}}}}-->
 ```
 
 Two keying generations coexist in the map. Legacy disks are keyed by the bare
@@ -151,6 +151,7 @@ Fields:
 | `director_id` | BOSH director UUID from the calling director's request context. Empty when the request carries no director UUID. Not a config property — no manifest setting controls it. |
 | `volid` | Stable-ID entries only. The volid the parker holds (or, mid-transfer, is about to hold) the volume under. During a detach-side transfer this is the intent record's pre-move volid, rewritten to the landed name when the transfer completes. |
 | `slot` | Stable-ID entries only. The parker bus slot the disk occupies, or the slot a detach-side transfer targets. |
+| `opts` | Either keying generation, optional. The disk's recorded drive-option overrides (operator updates made through `update_disk`) while it is parked — see [Durable disk option updates](#durable-disk-option-updates). Absent means no overrides are recorded. |
 
 Provenance writes are best-effort: a failure logs a warning but does not block
 the park. Because PVE has no atomic read-modify-write on VM descriptions,
@@ -383,9 +384,51 @@ uses that same sweep semantics on purpose, as the deletion itself.
   keeps it for the disk's life.
 
 - The description sentinels follow the token: `bosh_attached_disks`,
-  `bosh_parked_disks`, and `bosh_disk_metadata` entries for stable-ID disks
-  are keyed by the token instead of the volid, with volid-keyed legacy
-  entries readable forever.
+  `bosh_parked_disks`, `bosh_disk_metadata`, and `bosh_disk_opt_overlays`
+  entries for stable-ID disks are keyed by the token instead of the volid,
+  with volid-keyed legacy entries readable forever.
+
+## Durable disk option updates
+
+`update_disk` records every option change as a per-disk override map, and
+each attach builds the drive string by merging three layers: global
+`disk_performance` config, then the options recorded in the disk CID at
+`create_disk` time, then the recorded overrides. The rightmost layer wins,
+and an empty-string value at any layer deletes the key. Without the record,
+the attach-time rebuild would revert every operator update at the disk's
+first detach/attach cycle.
+
+The record lives wherever the disk lives, and moves with it:
+
+- While attached, it is the `bosh_disk_opt_overlays` sentinel key on the
+  holder VM's description — a distinct top-level key beside
+  `bosh_attached_disks`, keyed by the stable-ID token (bare volid for legacy
+  disks).
+
+- While parked, it is the `opts` field of the parker's `bosh_parked_disks`
+  provenance entry. Every detach path copies it there: the legacy config-edit
+  park hands it to the provenance writer, the reassignment transfer carries
+  it inside the intent record (written strictly before the source slot is
+  deleted), and `delete_vm`'s foreign-disk preservation threads it into the
+  transfer it already performs.
+
+- At attach, the CPI reads it off the parker, records it on the receiving
+  VM's sentinel before the parker's provenance entry is removed (the same
+  receiving-side-first ordering every transfer follows), and merges it into
+  the drive string it writes.
+
+`update_disk` writes the record fail-closed, before touching the drive
+string: a record that cannot be written fails the call with nothing changed,
+unlike the neighboring best-effort provenance writers. A disk parked at
+update time gets the record only — the parker slot's drive string stays
+CPI-owned — and the change takes effect at the next attach.
+
+Two paths drop the record by design, and say so in the logs: a detach under
+strategy `free` leaves the disk with no carrier for it, and `delete_vm`'s
+plain detach of a legacy foreign disk destroys the description that held it.
+Re-apply the update with `update_disk` after the next attach in those cases.
+The `serial` key is excluded everywhere: it is the disk's identity, owned by
+the attach boundaries, and every overlay read and write strips it.
 
 ## Strategy comparison
 

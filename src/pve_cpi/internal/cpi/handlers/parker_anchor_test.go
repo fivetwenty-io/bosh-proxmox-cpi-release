@@ -103,6 +103,7 @@ func TestHandleAttachDisk_AnchorPromise_HolderPresent_Unparks(t *testing.T) {
 		configCfgs: []map[string]any{
 			parkerVMCfg,        // FindVMByDiskVolid scan
 			parkerVMCfg,        // holder resolution (tags + slot)
+			parkerVMCfg,        // option-override read on the parker
 			parkerVMCfg,        // unpark re-resolve under the lock
 			{},                 // chooseSCSISlotSkippingZero on target
 			{"scsi1": bareCID}, // ResolveDiskID after attach

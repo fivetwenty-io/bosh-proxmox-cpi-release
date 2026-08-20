@@ -718,6 +718,9 @@ properties:
       Throttle options (mbps_*, iops_*) and discard are never enforced. The
       check is a no-op for any disk whose CID carries no performance options, so
       behavior is unchanged unless disk_performance options were recorded.
+      Options an operator updates through update_disk are recorded per disk
+      and join the expected baseline, so an intentional update never reads as
+      a divergence; only drift the disk never opted into trips the guard.
       Valid values: "" (empty, same as "enforce"), "enforce", "warn", "off".
     default: ""
   pve.cluster_lock_mode:
@@ -1789,7 +1792,9 @@ properties:
       creation-time record diverges from the newly-resolved default at the
       next attach is instead governed by disk_perf_invariant_mode (reject in
       enforce mode, warn in warn mode, ignore in off mode), same as any other
-      disk_performance configuration change.
+      disk_performance configuration change. A deliberate per-disk change is
+      still available at any time through update_disk, which records the
+      update so it survives detach/attach cycles.
 
   pve.disk_performance.cache:
     description: |
@@ -1822,12 +1827,14 @@ properties:
       An explicit true/false at any layer (cloud_properties, disk_type/
       vm_type profile, or this global default) always wins over auto
       resolution. The resolved value is baked at create/attach time only;
-      existing disks and VMs are never rewritten, and a disk whose recorded
-      creation-time value diverges from a later re-resolution follows the
-      normal cloud_properties/pve_config precedence — discard itself is not
-      governed by disk_perf_invariant_mode (see that property; it never was,
-      even before auto-resolution — discard can change on a live device
-      without a structural reconfiguration).
+      config changes never rewrite existing disks or VMs on their own, and a
+      disk whose recorded creation-time value diverges from a later
+      re-resolution follows the normal cloud_properties/pve_config
+      precedence — discard itself is not governed by
+      disk_perf_invariant_mode (see that property; it never was, even before
+      auto-resolution — discard can change on a live device without a
+      structural reconfiguration). An operator update through update_disk is
+      recorded per disk and wins over both layers at every later attach.
 
   pve.disk_performance.ssd:
     description: |

@@ -718,6 +718,10 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     print("attach_disk=ok")
     verify_stable_id_carrier("after the parked attach")
 
+    step("11c-bis. update_disk (records an option override that must survive the coming park)")
+    call("update_disk", [disk_cid, {"mbps_rd": 87}], config_path=parked_cfg)
+    print("update_disk=ok")
+
     step("11d. detach_disk (strategy=parked)")
     call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
     state["disk_attached"] = False
@@ -761,6 +765,13 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     verifier.assert_true(
         f"parker {parker_vmid} records the disk in its provenance sentinel",
         verifier.parked_disk_recorded(parker_vmid, disk_cid),
+    )
+    # The 11c-bis override must ride the park in the provenance entry's opts
+    # field — that record is what the next attach merges back into the drive
+    # string, so an empty one here means the update silently reverts.
+    verifier.assert_true(
+        f"parker {parker_vmid} provenance carries the recorded option override (mbps_rd=87)",
+        str(verifier.parked_disk_overlay(parker_vmid, disk_cid).get("mbps_rd", "")) == "87",
     )
     verify_stable_id_carrier("after the parked detach")
     parker_tags = str(parker_cfg.get("tags", ""))
@@ -895,6 +906,15 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     verifier.assert_true(
         f"parker {parker_vmid} dropped the disk from its provenance sentinel",
         not verifier.parked_disk_recorded(parker_vmid, disk_cid),
+    )
+    # The full durable-update round trip: the 11c-bis override, recorded on
+    # the holder, carried through the park, must now be baked into the live
+    # drive string the unpark attach produced.
+    unparked_vmid, unparked_slot = holders[0]
+    unparked_opt_str = str(verifier.qemu_config(unparked_vmid).get(unparked_slot, ""))
+    verifier.assert_true(
+        "the recorded option override survives the detach/attach cycle (mbps_rd=87 in the drive string)",
+        "mbps_rd=87" in unparked_opt_str,
     )
     verify_stable_id_carrier("after the unpark attach")
 

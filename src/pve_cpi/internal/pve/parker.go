@@ -158,6 +158,11 @@ type ParkContext struct {
 	// volid-keyed record would be orphaned by the first transfer. Empty for
 	// legacy disks, which keep the volid keying forever.
 	StableID string
+	// Opts carries the disk's recorded drive-option overrides (operator
+	// updates made through update_disk) into the provenance entry, so the
+	// overrides survive the park and are merged back into the drive string at
+	// the next attach. Empty means no overrides are recorded.
+	Opts map[string]string
 }
 
 // parkerProvEntry is a single parked-disk record stored in the sentinel.
@@ -178,6 +183,10 @@ type parkerProvEntry struct {
 	DirectorID  string `json:"director_id,omitempty"`
 	Volid       string `json:"volid,omitempty"`
 	Slot        string `json:"slot,omitempty"`
+	// Opts holds the disk's drive-option overrides while it is parked (see
+	// disk_opt_overlay.go). Either keying generation may carry it; absent
+	// means no overrides are recorded.
+	Opts map[string]string `json:"opts,omitempty"`
 }
 
 // parseParkerSentinel extracts the description text outside the sentinel
@@ -254,9 +263,10 @@ func parkerProvKey(bareVolid, stableID string) string {
 }
 
 // buildParkerProvEntry assembles one provenance record. Volid and Slot are
-// recorded only for stable-ID disks — legacy entries keep their exact
+// recorded only for stable-ID disks — legacy entries otherwise keep their
 // pre-stable-ID JSON shape, which external readers (scripts/disk-audit,
-// scripts/_pve_verify.py, pve-cid) parse.
+// scripts/_pve_verify.py, pve-cid) parse; those readers tolerate the
+// optional opts field, which either generation may carry.
 func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) parkerProvEntry {
 	// disk_cid: prefer the full encoded CID from ParkContext (as the Director
 	// knows it); fall back to bareVolid when context is absent.
@@ -274,6 +284,9 @@ func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx P
 	if pctx.StableID != "" {
 		entry.Volid = bareVolid
 		entry.Slot = slot
+	}
+	if len(pctx.Opts) > 0 {
+		entry.Opts = sanitizeDiskOptOverlay(pctx.Opts)
 	}
 	return entry
 }

@@ -909,6 +909,9 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 	if len(foreign) == 0 {
 		return nil
 	}
+	// The doomed VM's description is the disks' override-record carrier; it
+	// dies with the VM, so any recorded overrides must move now or be lost.
+	desc := pve.DescriptionFromConfig(cfg)
 	slots := make([]string, 0, len(foreign))
 	for slot := range foreign {
 		slots = append(slots, slot)
@@ -925,7 +928,11 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		if entry.StableID != "" {
 			logger.Warn("delete_vm: stable-ID persistent disk still attached on active slot -- transferring to a parker to preserve it before destroy",
 				log.String("slot", slot), log.String("volid", entry.Volid), log.String("stable_id", entry.StableID))
-			pctx := pve.ParkContext{SourceVMCID: vmCID, StableID: entry.StableID}
+			pctx := pve.ParkContext{
+				SourceVMCID: vmCID,
+				StableID:    entry.StableID,
+				Opts:        pve.DiskOptOverlayFromDesc(desc, entry.StableID, entry.Volid),
+			}
 			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerWriteConfigFor(deps), pctx); transferErr != nil {
 				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
 					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it (the volume would otherwise be destroyed; retry resumes the transfer)",
@@ -933,6 +940,13 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 			}
 			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, entry.StableID, entry.Volid)
 			continue
+		}
+		// A legacy foreign disk is plain-detached and left free-floating, and
+		// its override record dies with this VM's description — there is no
+		// carrier to move it to on this path.
+		if lost := pve.DiskOptOverlayFromDesc(desc, entry.Volid); len(lost) > 0 {
+			logger.Warn("delete_vm: recorded option overrides for this disk are lost with the VM -- re-apply them with update_disk after the next attach",
+				log.String("slot", slot), log.String("volid", entry.Volid))
 		}
 		logger.Warn("delete_vm: persistent disk still attached on active slot -- detaching to preserve volume before destroy",
 			log.String("slot", slot), log.String("volid", entry.Volid))

@@ -36,6 +36,20 @@ type idFakeClient struct {
 	configs   map[int]map[string]any
 	destroyed []string
 	renameN   map[int]int
+	// descWrites records every description write in order, so write-ordering
+	// assertions (receiving-side record before giving-side removal) are
+	// direct reads of the sequence.
+	descWrites []idDescWrite
+	// descWriteErr, when set, fails every description write with it —
+	// exercising the fail-closed contract of the override record writers.
+	descWriteErr error
+}
+
+// idDescWrite is one recorded description write: which VM, and the full
+// description that landed.
+type idDescWrite struct {
+	vmid int
+	desc string
 }
 
 func newIDFakeClient(configs map[int]map[string]any) *idFakeClient {
@@ -138,7 +152,11 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 		}
 	}
 	if params.Description != nil {
+		if n.c.descWriteErr != nil {
+			return n.c.descWriteErr
+		}
 		cfg["description"] = *params.Description
+		n.c.descWrites = append(n.c.descWrites, idDescWrite{vmid: vmid, desc: *params.Description})
 	}
 	if params.Protection != nil {
 		cfg["protection"] = *params.Protection
@@ -208,7 +226,9 @@ func TestGuardAndUnparkBeforeAttach_TransferPlanning(t *testing.T) {
 
 	t.Run("same-node parker plans a reassignment and leaves the disk parked", func(t *testing.T) {
 		t.Parallel()
-		deps := idTestDeps(newIDFakeClient(nil))
+		deps := idTestDeps(newIDFakeClient(map[int]map[string]any{
+			90000: {"tags": "bosh-cpi;bosh-parker", diskKeyScsi0: "data:vm-90000-disk-0,serial=" + idTestToken},
+		}))
 		holder := pve.DiskHolder{Found: true, VMID: 90000, Node: "pve1", IsParker: true, Slot: "scsi0"}
 		rd := resolvedDisk{diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-90000-disk-0", meta: meta, stableID: idTestToken, holder: &holder}
 		plan, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve1", 700)
@@ -222,7 +242,9 @@ func TestGuardAndUnparkBeforeAttach_TransferPlanning(t *testing.T) {
 
 	t.Run("cross-node parker with a parker-named volume is refused", func(t *testing.T) {
 		t.Parallel()
-		deps := idTestDeps(newIDFakeClient(nil))
+		deps := idTestDeps(newIDFakeClient(map[int]map[string]any{
+			90000: {"tags": "bosh-cpi;bosh-parker", diskKeyScsi0: "data:vm-90000-disk-0,serial=" + idTestToken},
+		}))
 		holder := pve.DiskHolder{Found: true, VMID: 90000, Node: "pve2", IsParker: true, Slot: "scsi0"}
 		rd := resolvedDisk{diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-90000-disk-0", meta: meta, stableID: idTestToken, holder: &holder}
 		_, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve1", 700)

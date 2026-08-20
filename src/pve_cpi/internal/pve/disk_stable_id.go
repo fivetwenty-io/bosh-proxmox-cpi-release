@@ -85,6 +85,10 @@ type DiskTransferIntent struct {
 	Volid string
 	// SourceVMCID is the VM the disk was being detached from, when recorded.
 	SourceVMCID string
+	// Opts is the disk's recorded drive-option overrides, carried in the
+	// record so a resumed transfer re-persists them instead of finalizing an
+	// entry that silently drops them.
+	Opts map[string]string
 }
 
 // DiskIdentity is the result of resolving a disk CID to the volid the
@@ -228,6 +232,7 @@ func findParkedDiskIntentByStableID(
 			Slot:        entry.Slot,
 			Volid:       entry.Volid,
 			SourceVMCID: entry.SourceVMCID,
+			Opts:        sanitizeDiskOptOverlay(entry.Opts),
 		}, true, nil
 	}
 	return DiskTransferIntent{}, false, nil

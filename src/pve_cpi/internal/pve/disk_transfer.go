@@ -480,6 +480,11 @@ func ResumeDiskTransferToParker(
 		return "", cpierrors.Cloud("ResumeDiskTransferToParker: stable ID and parker identity are required")
 	}
 	pctx.StableID = stableID
+	// The finalize rewrites the whole provenance entry from pctx, so a resume
+	// that omitted the recorded option overrides would silently drop them.
+	if len(pctx.Opts) == 0 {
+		pctx.Opts = intent.Opts
+	}
 
 	var landed string
 	lockErr := withParkerProtectionLock(ctx, c, logger, intent.ParkerVMID, "transfer_resume", func(wctx context.Context) error {
