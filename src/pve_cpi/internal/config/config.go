@@ -4200,17 +4200,20 @@ func (c *CPIConfig) validateVMIDBands(errs *[]string) {
 	tOK := tStart < tEnd
 	if vmOK && diskOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, diskStart, diskEnd) {
 		*errs = append(*errs, fmt.Sprintf(
-			"persistent disk VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+			"persistent disk VMID range [%d,%d] overlaps VM VMID range [%d,%d]; "+
+				"adjust disk_vmid_range_start/_end or vmid_range_start/_end so the bands are disjoint",
 			diskStart, diskEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
 	}
 	if vmOK && tOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, tStart, tEnd) {
 		*errs = append(*errs, fmt.Sprintf(
-			"stemcell template VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+			"stemcell template VMID range [%d,%d] overlaps VM VMID range [%d,%d]; "+
+				"adjust stemcell_template_vmid_range_start/_end or vmid_range_start/_end so the bands are disjoint",
 			tStart, tEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
 	}
 	if diskOK && tOK && rangesOverlap(diskStart, diskEnd, tStart, tEnd) {
 		*errs = append(*errs, fmt.Sprintf(
-			"stemcell template VMID range [%d,%d] overlaps persistent disk range [%d,%d]",
+			"stemcell template VMID range [%d,%d] overlaps persistent disk range [%d,%d]; "+
+				"adjust stemcell_template_vmid_range_start/_end or disk_vmid_range_start/_end so the bands are disjoint",
 			tStart, tEnd, diskStart, diskEnd))
 	}
 
@@ -4235,17 +4238,20 @@ func (c *CPIConfig) validateVMIDBands(errs *[]string) {
 		pOK := pStart < pEnd
 		if vmOK && pOK && rangesOverlap(c.VMIDRangeStart, c.VMIDRangeEnd, pStart, pEnd) {
 			*errs = append(*errs, fmt.Sprintf(
-				"parker VMID range [%d,%d] overlaps VM VMID range [%d,%d]",
+				"parker VMID range [%d,%d] overlaps VM VMID range [%d,%d]; "+
+					"adjust parked_disk_vmid_range_start/_end or vmid_range_start/_end so the bands are disjoint",
 				pStart, pEnd, c.VMIDRangeStart, c.VMIDRangeEnd))
 		}
 		if diskOK && pOK && rangesOverlap(diskStart, diskEnd, pStart, pEnd) {
 			*errs = append(*errs, fmt.Sprintf(
-				"parker VMID range [%d,%d] overlaps persistent disk range [%d,%d]",
+				"parker VMID range [%d,%d] overlaps persistent disk range [%d,%d]; "+
+					"adjust parked_disk_vmid_range_start/_end or disk_vmid_range_start/_end so the bands are disjoint",
 				pStart, pEnd, diskStart, diskEnd))
 		}
 		if tOK && pOK && rangesOverlap(tStart, tEnd, pStart, pEnd) {
 			*errs = append(*errs, fmt.Sprintf(
-				"parker VMID range [%d,%d] overlaps stemcell template range [%d,%d]",
+				"parker VMID range [%d,%d] overlaps stemcell template range [%d,%d]; "+
+					"adjust parked_disk_vmid_range_start/_end or stemcell_template_vmid_range_start/_end so the bands are disjoint",
 				pStart, pEnd, tStart, tEnd))
 		}
 	}
