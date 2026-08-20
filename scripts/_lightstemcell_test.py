@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -297,6 +298,82 @@ class SidecarTests(unittest.TestCase):
             )
             raw = (Path(d) / "x.qcow2.sha256.json").read_text()
             json.loads(raw)  # raises on malformed
+
+
+class StorageIsSharedTests(unittest.TestCase):
+    CFG = {"host": "h", "user": "u", "password": "p"}
+
+    def _with_api(self, reply):
+        return unittest.mock.patch.object(ls._integration, "pve_api_get", reply)
+
+    def test_shared_flag_one_is_shared(self) -> None:
+        # PVE returns integer booleans (1/0), never true/false.
+        with self._with_api(lambda *a, **k: {"storage": "nfs-images", "shared": 1}):
+            self.assertTrue(ls.storage_is_shared(self.CFG, "nfs-images"))
+
+    def test_shared_flag_zero_is_not_shared(self) -> None:
+        with self._with_api(lambda *a, **k: {"storage": "local-lvm-data", "shared": 0}):
+            self.assertFalse(ls.storage_is_shared(self.CFG, "local-lvm-data"))
+
+    def test_shared_flag_missing_is_not_shared(self) -> None:
+        with self._with_api(lambda *a, **k: {"storage": "local"}):
+            self.assertFalse(ls.storage_is_shared(self.CFG, "local"))
+
+    def test_endpoint_absent_is_not_shared(self) -> None:
+        with self._with_api(lambda *a, **k: None):
+            self.assertFalse(ls.storage_is_shared(self.CFG, "gone"))
+
+    def test_api_error_is_not_shared(self) -> None:
+        # Fail closed: an unreadable storage config keeps today's behavior
+        # (the node pin stays), rather than silently dropping the pin.
+        def boom(*a, **k):
+            raise RuntimeError("api down")
+        with self._with_api(boom):
+            self.assertFalse(ls.storage_is_shared(self.CFG, "nfs-images"))
+
+
+class SharedStoragePinTests(unittest.TestCase):
+    """Shared stemcell storage must not bake a node pin into the manifest.
+
+    Under a multi-CPI director, upload-stemcell fans out to every CPI; a baked
+    node name only exists in one cluster, and the others fail the existence
+    check with a 596 proxy error. On shared storage each CPI's own config.node
+    is the right query target, so the pin must be omitted.
+    """
+
+    CFG = {"host": "h", "user": "u", "password": "p", "node": "lab-pve-cpi-0",
+           "vm_storage": "nfs-images"}
+
+    def _ensure(self, shared: bool, cache_dir: str) -> "ls.LightStemcell":
+        ptr = {"sha256": SHA, "qcow2_filename": "bosh-stemcell-ubuntu-noble-1.383-deadbeef.qcow2"}
+        rows = [{"volid": "nfs-images:import/bosh-stemcell-ubuntu-noble-1.383-deadbeef.qcow2"}]
+        with unittest.mock.patch.object(ls, "storage_is_shared", lambda *a, **k: shared), \
+             unittest.mock.patch.object(ls, "read_source_pointer", lambda *a, **k: ptr), \
+             unittest.mock.patch.object(ls, "list_import_content", lambda *a, **k: rows):
+            return ls.ensure_light_stemcell(
+                cpi_cfg=self.CFG, mode="preuploaded", os_name="ubuntu-noble",
+                version="1.383", source_url="https://example.com/s.tgz",
+                source_sha1="a" * 40, cache_dir=cache_dir,
+                build_create_env_tarball=True, log=lambda m: None,
+            )
+
+    def test_shared_storage_omits_node_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            res = self._ensure(True, d)
+            mf = Path(res.manifest_path).read_text()
+            self.assertNotIn("node:", mf)
+            with tarfile.open(res.create_env_tarball) as tf:
+                inner = tf.extractfile("stemcell.MF").read().decode()
+            self.assertNotIn("node:", inner)
+
+    def test_local_storage_keeps_node_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            res = self._ensure(False, d)
+            mf = Path(res.manifest_path).read_text()
+            self.assertIn("node: lab-pve-cpi-0", mf)
+            with tarfile.open(res.create_env_tarball) as tf:
+                inner = tf.extractfile("stemcell.MF").read().decode()
+            self.assertIn("node: lab-pve-cpi-0", inner)
 
 
 if __name__ == "__main__":

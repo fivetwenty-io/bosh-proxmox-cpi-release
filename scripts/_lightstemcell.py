@@ -692,6 +692,33 @@ def list_import_content(cpi_cfg: dict, node: str, storage: str) -> "list[dict]":
     return rows if isinstance(rows, list) else []
 
 
+def storage_is_shared(cpi_cfg: dict, storage: str) -> bool:
+    """True when the datacenter storage config marks this storage shared.
+
+    Shared stemcell storage must not bake a cloud_properties.node pin into the
+    light manifest: a multi-CPI director fans upload-stemcell out to every CPI,
+    and a node name from one cluster does not exist in the others (their
+    pveproxy answers 596). Each CPI's own config.node is the right query
+    target, which is what the CPI falls back to when the pin is absent.
+
+    Fails closed: any API error, absent endpoint, or missing flag reads as not
+    shared, keeping the pin (today's behavior) rather than silently dropping it
+    for node-local storage. PVE reports the flag as integer 1/0.
+    """
+    try:
+        row = _integration.pve_api_get(
+            cpi_cfg, f"/storage/{urllib.parse.quote(storage)}", allow_missing=True,
+        )
+    except RuntimeError:
+        return False
+    if not isinstance(row, dict):
+        return False
+    try:
+        return int(row.get("shared", 0)) == 1
+    except (TypeError, ValueError):
+        return False
+
+
 def ensure_light_stemcell(
     *,
     cpi_cfg: dict,
@@ -721,6 +748,10 @@ def ensure_light_stemcell(
     cache_dir = Path(cache_dir)
     node = str(cpi_cfg.get("node", "")).strip()
     storage = str(cpi_cfg.get("stemcell_storage", "")).strip() or str(cpi_cfg.get("vm_storage", "")).strip()
+    # node stays the API handle for upload/list; pin is what the manifest
+    # carries. Shared storage drops the pin so a multi-CPI director's other
+    # clusters resolve their own config.node instead of this cluster's name.
+    pin = None if (storage and storage_is_shared(cpi_cfg, storage)) else (node or None)
 
     if mode == "fetch":
         if not image_url:
@@ -731,7 +762,7 @@ def ensure_light_stemcell(
         # tarball pointing at image_url.
         manifest = render_light_manifest(
             cache_dir, "fetch", os_name=os_name, version=version,
-            image_url=image_url, token=token, node=node or None,
+            image_url=image_url, token=token, node=pin,
         )
         result = LightStemcell(
             os_name=os_name, version=version, mode="fetch", sha256="",
@@ -742,7 +773,7 @@ def ensure_light_stemcell(
             tb = build_create_env_light_tarball(
                 cache_dir, os_name=os_name, version=version,
                 image_url=image_url, image_url_auth_token=token,
-                node=node or None,
+                node=pin,
             )
             result.create_env_tarball = tb
             result.create_env_tarball_sha1 = file_sha1(tb)
@@ -763,7 +794,7 @@ def ensure_light_stemcell(
             log(f"    light stemcell present on {storage}: {fname} (cached)")
             return _preuploaded_result(
                 cache_dir, os_name, version, sha256, storage, fname,
-                build_create_env_tarball, node=node,
+                build_create_env_tarball, node=pin,
             )
 
     # Expensive path — pay once.
@@ -783,7 +814,7 @@ def ensure_light_stemcell(
     )
     return _preuploaded_result(
         cache_dir, os_name, version, sha256, storage, fname,
-        build_create_env_tarball, node=node,
+        build_create_env_tarball, node=pin,
     )
 
 
