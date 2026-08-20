@@ -35,6 +35,10 @@ func (f *fakePoolServiceForEnsure) AddVM(_ context.Context, _ string, _ int64) e
 	panic("fakePoolServiceForEnsure: AddVM unexpected call")
 }
 
+func (f *fakePoolServiceForEnsure) MoveVMToPool(_ context.Context, _ string, _ int64) error {
+	panic("fakePoolServiceForEnsure: MoveVMToPool unexpected call")
+}
+
 func (f *fakePoolServiceForEnsure) CreatePool(ctx context.Context, poolID, comment string) error {
 	f.createCalls++
 	f.lastPoolID = poolID

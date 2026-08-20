@@ -20,9 +20,10 @@ import (
 // refsPoolSvc is a PoolService that always succeeds — allows lock acquisition.
 type refsPoolSvc struct{}
 
-func (p *refsPoolSvc) AddVM(_ context.Context, _ string, _ int64) error { return nil }
-func (p *refsPoolSvc) CreatePool(_ context.Context, _, _ string) error  { return nil }
-func (p *refsPoolSvc) DeletePool(_ context.Context, _ string) error     { return nil }
+func (p *refsPoolSvc) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (p *refsPoolSvc) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
+func (p *refsPoolSvc) CreatePool(_ context.Context, _, _ string) error         { return nil }
+func (p *refsPoolSvc) DeletePool(_ context.Context, _ string) error            { return nil }
 func (p *refsPoolSvc) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }

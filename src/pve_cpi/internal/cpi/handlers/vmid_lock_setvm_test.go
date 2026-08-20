@@ -35,6 +35,11 @@ func (p *recordingPoolService) record(ev string) {
 
 func (p *recordingPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
 
+func (p *recordingPoolService) MoveVMToPool(_ context.Context, poolID string, vmid int64) error {
+	p.record(fmt.Sprintf("move:%s:%d", poolID, vmid))
+	return nil
+}
+
 func (p *recordingPoolService) CreatePool(_ context.Context, poolID, _ string) error {
 	p.record("create:" + poolID)
 	if p.createErr != nil {

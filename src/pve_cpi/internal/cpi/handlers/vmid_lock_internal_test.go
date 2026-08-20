@@ -31,7 +31,8 @@ func (p *vmidLockPools) record(ev string) {
 	}
 }
 
-func (p *vmidLockPools) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (p *vmidLockPools) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (p *vmidLockPools) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
 
 func (p *vmidLockPools) CreatePool(_ context.Context, poolID, comment string) error {
 	p.record("create:" + poolID)

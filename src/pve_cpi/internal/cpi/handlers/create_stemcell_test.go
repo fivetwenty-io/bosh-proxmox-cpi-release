@@ -38,9 +38,10 @@ import (
 // Used by mocks when pool assignment is not under test.
 type noopPoolService struct{}
 
-func (n *noopPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
-func (n *noopPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
-func (n *noopPoolService) DeletePool(_ context.Context, _ string) error     { return nil }
+func (n *noopPoolService) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (n *noopPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
+func (n *noopPoolService) CreatePool(_ context.Context, _, _ string) error         { return nil }
+func (n *noopPoolService) DeletePool(_ context.Context, _ string) error            { return nil }
 func (n *noopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
 }

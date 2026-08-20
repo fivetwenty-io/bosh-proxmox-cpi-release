@@ -175,17 +175,18 @@
   vm_pool = p("pve.vm_pool", "bosh")
   config["vm_pool"] = vm_pool unless vm_pool.to_s.empty?
 
-  # Emit vm_pool_template only when the operator supplies a non-empty value.
-  # When absent or empty (the default), the key is omitted and the template
-  # layer is disabled — resolution falls straight to call/vm_type/vm_pool.
-  vm_pool_template = p("pve.vm_pool_template", "")
+  # Emit vm_pool_template only when the value is non-empty. Default
+  # "bosh-{director}-{deployment}" (per-deployment pools); an explicit ""
+  # still omits the key here so the Go zero value disables the template
+  # layer — resolution falls straight to call/vm_type/vm_pool.
+  vm_pool_template = p("pve.vm_pool_template", "bosh-{director}-{deployment}")
   config["vm_pool_template"] = vm_pool_template unless vm_pool_template.to_s.empty?
 
-  # Emit pool_reap_empty only when the operator opts in. The Go config
-  # defaults to no reaping (pools accumulate) when the key is omitted.
-  if p("pve.pool_reap_empty", false)
-    config["pool_reap_empty"] = true
-  end
+  # Always emit pool_reap_empty: the release default is true (per-deployment
+  # pools are reaped with their deployments), and only an unconditional emit
+  # lets an explicit false reach the Go config — an omit-when-falsy pattern
+  # could never express it against a true default.
+  config["pool_reap_empty"] = p("pve.pool_reap_empty", true) ? true : false
 
   # Emit destroy_unreferenced_disks only when the operator opts in. The Go
   # config defaults to false (safe on shared storage) when the key is

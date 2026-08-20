@@ -242,10 +242,15 @@ func run() int {
 }
 
 // preflightPoolAccess probes PVE resource-pool visibility for every
-// configured pool layer (pve.vm_pool, pve.stemcell_template_pool) before the
-// CPI serves its first request. Both default on ("bosh" / "bosh-templates"
-// per jobs/pve_cpi/spec), so this runs for a zero-config deployment unless
-// the operator explicitly opts both out.
+// statically named pool layer (pve.vm_pool, pve.stemcell_template_pool)
+// before the CPI serves its first request. Both default on ("bosh" /
+// "bosh-templates" per jobs/pve_cpi/spec), so this runs for a zero-config
+// deployment unless the operator explicitly opts both out. The
+// pve.vm_pool_template layer (default on, "bosh-{director}-{deployment}")
+// cannot be probed here: its names are rendered per create_vm call and do
+// not exist until first use, so a missing /pool grant for those surfaces as
+// a named, non-retriable create_vm error (see ensureResolvedPool in
+// internal/cpi/handlers) rather than at boot.
 //
 // Design: the cheapest side-effect-free signal that proves the CPI's
 // identity can read a pool path is GET /pools/{poolid}

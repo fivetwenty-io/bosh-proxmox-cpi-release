@@ -651,7 +651,7 @@ The first command surfaces stemcell qcow2 files with zero remaining director ref
 
 ### Known limitation: fast-path delete skips the pool reaper
 
-`pve.fast_path_delete: true` optimizes `delete_vm` for latency and deliberately skips the empty-pool reaper step that the synchronous delete path runs. The reaper itself is opt-in (`pve.pool_reap_empty`, default `false`) — with the default config nothing ever reaps an empty pool on any path. When `pool_reap_empty: true` is also set, a resource pool emptied by a fast-path delete is reaped only by a later synchronous-path delete, or manually:
+`pve.fast_path_delete: true` optimizes `delete_vm` for latency and deliberately skips the empty-pool reaper step that the synchronous delete path runs. The reaper is on by default (`pve.pool_reap_empty`, default `true`), matching the per-deployment pools the `pve.vm_pool_template` default creates, but it only runs on the synchronous path: a resource pool emptied by a fast-path delete is reaped by a later synchronous-path delete, or manually:
 
 ```bash
 pvesh delete /pools/<poolid>

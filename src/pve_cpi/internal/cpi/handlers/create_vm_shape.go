@@ -151,50 +151,49 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if poolRErr != nil {
 		return nil, poolRErr
 	}
-	resolvedPool, poolErr := resolvePoolName(deps.Config, poolR, parsed.env)
+	resolvedPool, resolvedPoolLayer, poolErr := resolvePoolName(deps.Config, poolR, parsed.env)
 	if poolErr != nil {
 		return nil, poolErr
 	}
-	var vmPoolComment string
+	var vmPoolComment, poolDirector, poolDeployment, poolInstanceGroup string
 	if resolvedPool != "" {
-		// Mirror renderPoolTemplate's own job/deployment derivation
-		// (cloudprops instanceGroupName + extractDeploymentFromEnv, falling
-		// back to Config.CreateEnvDeployment) so the director extracted here
-		// is consistent with whatever produced a template-rendered pool name.
-		job := instanceGroupName(parsed.env)
-		deployment := extractDeploymentFromEnv(parsed.env, job)
-		if deployment == "" {
-			deployment = deps.Config.CreateEnvDeployment
-		}
-		director := extractDirectorFromEnv(parsed.env, deployment, job)
-		vmPoolComment = pve.PoolProvenance(director)
+		// poolTemplateTokensFromEnv is renderPoolTemplate's own derivation,
+		// so the director extracted here (for the provenance comment) and the
+		// three tokens persisted in the bosh_pool sentinel are consistent
+		// with whatever produced a template-rendered pool name.
+		poolDirector, poolDeployment, poolInstanceGroup = poolTemplateTokensFromEnv(deps.Config, parsed.env)
+		vmPoolComment = pve.PoolProvenance(poolDirector)
 	}
 
 	return &createVMShape{
-		node:             node,
-		vmStorage:        vmStorage,
-		vmStorageType:    vmStorageType,
-		vmDiskFormat:     vmDiskFormat,
-		rootDiskGiB:      rootDiskGiB,
-		cores:            cores,
-		sockets:          sockets,
-		memMiB:           memMiB,
-		hotplug:          hotplug,
-		numaEnabled:      numaEnabled,
-		initialTags:      initialTags,
-		rangeStart:       rangeStart,
-		maxAttempts:      maxAttempts,
-		initialName:      initialName,
-		cloudPropsMap:    parsed.cloudPropsMap,
-		rootDiskPerfOpts: rootDiskPerfOpts,
-		rootDiskKey:      rootDiskKeyVal,
-		scsihw:           scsihwVal,
-		ephemeralDiskGiB: ephemeralDiskGiB,
-		ephemeralStorage: ephemeralStorage,
-		cpuType:          cpuTypeVal,
-		balloonMiB:       balloonMiB,
-		vmPool:           resolvedPool,
-		vmPoolComment:    vmPoolComment,
+		node:              node,
+		vmStorage:         vmStorage,
+		vmStorageType:     vmStorageType,
+		vmDiskFormat:      vmDiskFormat,
+		rootDiskGiB:       rootDiskGiB,
+		cores:             cores,
+		sockets:           sockets,
+		memMiB:            memMiB,
+		hotplug:           hotplug,
+		numaEnabled:       numaEnabled,
+		initialTags:       initialTags,
+		rangeStart:        rangeStart,
+		maxAttempts:       maxAttempts,
+		initialName:       initialName,
+		cloudPropsMap:     parsed.cloudPropsMap,
+		rootDiskPerfOpts:  rootDiskPerfOpts,
+		rootDiskKey:       rootDiskKeyVal,
+		scsihw:            scsihwVal,
+		ephemeralDiskGiB:  ephemeralDiskGiB,
+		ephemeralStorage:  ephemeralStorage,
+		cpuType:           cpuTypeVal,
+		balloonMiB:        balloonMiB,
+		vmPool:            resolvedPool,
+		vmPoolComment:     vmPoolComment,
+		vmPoolLayer:       resolvedPoolLayer,
+		vmPoolDirector:    poolDirector,
+		vmPoolDeployment:  poolDeployment,
+		vmPoolInstanceGrp: poolInstanceGroup,
 	}, nil
 }
 
@@ -565,12 +564,46 @@ func ensureResolvedPool(ctx context.Context, deps Deps, shape *createVMShape, lo
 		return nil
 	}
 	if err := pve.EnsurePoolExists(ctx, deps.PVE, shape.vmPool, shape.vmPoolComment); err != nil {
+		// A permission-denied here is a reduced-ACL cluster whose token
+		// cannot create pools (no Pool.Allocate at /pool). That is a
+		// permanent configuration condition with a config-side fix, so name
+		// it instead of surfacing a bare 403.
+		if pve.IsPoolPermissionDenied(err) {
+			return cpierrors.Cloud(
+				"create_vm: PVE token may not create resource pool %q (Pool.Allocate denied); grant "+
+					"Pool.Allocate at /pool (per-deployment pools are created on demand), or set "+
+					"pve.vm_pool_template: \"\" to keep the single static pool on clusters whose token "+
+					"cannot create pools: %s",
+				shape.vmPool, err.Error(),
+			)
+		}
 		return err
 	}
 	logger.Debug("create_vm: resolved pool ensured",
 		log.String("pool", shape.vmPool),
 	)
 	return nil
+}
+
+// persistPoolMembership records the VM's create-time pool resolution (name,
+// winning layer, and template tokens) in the bosh_pool description sentinel.
+// Called after the VM exists on both create paths — on the clone path this
+// must run after the post-clone description clear (the clone strips the
+// inherited template identity wholesale), which happens inside the allocate
+// attempt, so any post-allocation call site is safe. Best-effort: a failed
+// write is logged inside pve.UpdatePoolMembership and degrades that VM to
+// the legacy-adoption reconciliation rules, never failing create_vm.
+func persistPoolMembership(ctx context.Context, deps Deps, logger *log.Logger, shape *createVMShape, vmid int) {
+	if shape.vmPool == "" {
+		return
+	}
+	pve.UpdatePoolMembership(ctx, deps.PVE, logger, shape.node, vmid, &pve.PoolMembership{
+		Name:          shape.vmPool,
+		Layer:         shape.vmPoolLayer,
+		Director:      shape.vmPoolDirector,
+		Deployment:    shape.vmPoolDeployment,
+		InstanceGroup: shape.vmPoolInstanceGrp,
+	})
 }
 
 // composeVMName builds the PVE VM name from prefix + deployment + job +

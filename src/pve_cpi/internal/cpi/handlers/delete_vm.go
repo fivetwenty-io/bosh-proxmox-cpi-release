@@ -1169,8 +1169,8 @@ func cleanupAgentForVM(ctx context.Context, deps Deps, node string, vmid int, lo
 
 // capturePoolForReap returns the VM's current pool membership for the
 // post-destroy reaper, or "" when the reaper is disabled or the lookup fails.
-// Only runs when the operator opted in (pve.pool_reap_empty); best-effort: a
-// lookup error just means the reaper no-ops after destroy.
+// Only runs when pve.pool_reap_empty is enabled (the release default);
+// best-effort: a lookup error just means the reaper no-ops after destroy.
 func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Logger) string {
 	if deps.Config == nil || !deps.Config.PoolReapEmpty {
 		return ""
@@ -1185,8 +1185,9 @@ func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Lo
 
 // reapEmptyPoolIfManaged deletes poolID when it is empty AND was created by
 // this CPI (provenance comment prefix pve.PoolProvenanceComment), tolerating
-// the two live PVE races this can hit. It is the opt-in delete_vm reaper for
-// pve.pool_reap_empty and is called ONLY from the synchronous (non-fast-path)
+// the two live PVE races this can hit. It is the delete_vm reaper for
+// pve.pool_reap_empty (release default true; per-deployment pools go away
+// with their deployments) and is called ONLY from the synchronous (non-fast-path)
 // delete after the destroy task has been awaited, so PVE has already dropped
 // the destroyed VM's pool membership by the time GetPoolComment/DeletePool run.
 //
@@ -1195,7 +1196,9 @@ func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Lo
 //   - poolID == "" (the VM was not in any pool, or the pre-destroy lookup
 //     failed and the caller already reset reapPool to ""), or
 //   - deps.PVE.Pools() is nil (test fixtures / wiring gaps that never
-//     configured a pool service).
+//     configured a pool service), or
+//   - poolID names the static vm_pool or the stemcell_template_pool (shared
+//     long-lived pools, never reaped regardless of emptiness or comment).
 //
 // Otherwise:
 //  1. GetPoolComment(poolID): a lookup error or a not-found pool both return
@@ -1219,6 +1222,16 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 		return
 	}
 	if deps.PVE == nil || deps.PVE.Pools() == nil {
+		return
+	}
+	// The static vm_pool and the stemcell template pool are long-lived shared
+	// pools (create-if-missing at boot/first use), not per-deployment ones:
+	// reaping either would churn create/delete on every last-VM delete and,
+	// for the stemcell pool, momentarily drop the ACL boundary templates live
+	// behind. Refuse both by name before any API call.
+	if poolID == deps.Config.VMPool || poolID == deps.Config.StemcellTemplatePool {
+		logger.Debug("delete_vm: reaper: pool is the static vm_pool or stemcell_template_pool; never reaped",
+			log.String("pool", poolID))
 		return
 	}
 

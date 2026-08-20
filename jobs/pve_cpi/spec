@@ -415,33 +415,47 @@ properties:
     default: "bosh"
   pve.vm_pool_template:
     description: |
-      Optional director-level pool-name template rendered at create_vm time
-      when neither the call-level nor the vm_type-level cloud_properties.pool
+      Director-level pool-name template rendered at create_vm time when
+      neither the call-level nor the vm_type-level cloud_properties.pool
       is set (precedence position 3, above the pve.vm_pool global default;
       see pve.vm_pool for the full pipeline). Supports four variables:
       "{prefix}" (pve.vm_prefix), "{director}", "{deployment}", and
       "{instance_group}"; any other "{...}" token is rejected at config
       load. The rendered name is sanitized (repeated separators collapsed to
       one, leading/trailing "-" trimmed); a render that collapses to ""
-      falls through to pve.vm_pool. Must not contain "/" (flat names only —
+      falls through to pve.vm_pool. Must not contain "/" (flat names only,
       the CPI never creates nested pools); the same PVE poolid charset rules
-      that apply to vm_pool also apply to the rendered result. Empty
-      (default) disables this layer entirely, so resolution falls straight
-      from call/vm_type to pve.vm_pool.
-    default: ""
+      that apply to vm_pool also apply to the rendered result, and a render
+      that equals pve.stemcell_template_pool fails create_vm with a named
+      error. The default "bosh-{director}-{deployment}" gives every
+      deployment its own pool; set explicitly to "" to disable this layer
+      entirely, so resolution falls straight from call/vm_type to
+      pve.vm_pool (the single static pool, and the right choice on clusters
+      whose CPI token cannot create pools).
+
+      On a create-env path (bosh create-env, no director VM yet) the
+      {director} token is underivable and {deployment} falls back to
+      pve.create_env_deployment, so this default renders "bosh-create-env",
+      shared by every create-env director on the cluster unless
+      pve.create_env_deployment is set per bundle.
+    default: "bosh-{director}-{deployment}"
   pve.pool_reap_empty:
     description: |
       When true, delete_vm deletes a CPI-managed pool (tagged with the
       "managed by bosh-pve-cpi" provenance comment) once the destroyed VM's
       pool membership, captured before destroy, is reported empty by PVE.
       An operator-created pool without that provenance comment is never
-      reaped, and a pool that is still non-empty or already gone (a race
-      with another creator) is tolerated silently, never failing delete_vm.
-      Only the main delete_vm path reaps; the fast-path delete does not.
-      Requires the CPI's PVE token to hold Pool.Allocate on the pool being
-      reaped. Default false: empty pools accumulate and are left for the
-      operator to manage.
-    default: false
+      reaped, the static pve.vm_pool and pve.stemcell_template_pool are
+      refused by name regardless of comment, and a pool that is still
+      non-empty or already gone (a race with another creator) is tolerated
+      silently, never failing delete_vm. Only the main delete_vm path
+      reaps; the fast-path delete skips the reaper, so some empty pools
+      persist until a later synchronous delete. Requires the CPI's PVE
+      token to hold Pool.Allocate on the pool being reaped. Default true:
+      the per-deployment pools the pve.vm_pool_template default creates are
+      reaped with their deployments. Set to false to keep empty pools for
+      the operator to manage.
+    default: true
   pve.destroy_unreferenced_disks:
     description: |
       When true, delete_vm passes DestroyUnreferencedDisks=true to PVE's

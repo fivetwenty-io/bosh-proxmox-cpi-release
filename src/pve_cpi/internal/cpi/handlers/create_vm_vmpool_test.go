@@ -42,7 +42,8 @@ type poolCreateCall struct {
 	comment string
 }
 
-func (p *poolCallRecorder) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (p *poolCallRecorder) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (p *poolCallRecorder) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
 
 func (p *poolCallRecorder) CreatePool(_ context.Context, poolID, comment string) error {
 	p.createPoolCalls = append(p.createPoolCalls, poolCreateCall{poolID: poolID, comment: comment})

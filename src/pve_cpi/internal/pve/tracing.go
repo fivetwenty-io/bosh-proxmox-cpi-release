@@ -605,10 +605,10 @@ func (t *tracedClusterStorageService) ListStorage(ctx context.Context, params *c
 }
 
 // -----------------------------------------------------------------------
-// Pools (4 overridden methods: AddVM, CreatePool, DeletePool,
-// GetPoolComment — decorates the CPI-owned PoolService interface the same
-// way the 6 SDK-generated services above are decorated, for one consistent
-// span-naming convention across every PVE service call)
+// Pools (5 overridden methods: AddVM, CreatePool, DeletePool,
+// GetPoolComment, MoveVMToPool — decorates the CPI-owned PoolService
+// interface the same way the 6 SDK-generated services above are decorated,
+// for one consistent span-naming convention across every PVE service call)
 // -----------------------------------------------------------------------
 
 type tracedPoolService struct {
@@ -621,6 +621,13 @@ func (t *tracedPoolService) AddVM(ctx context.Context, poolID string, vmid int64
 		attribute.String("pve.pool_id", poolID), attribute.String("pve.vmid", strconv.FormatInt(vmid, 10))))
 	defer func() { finishSpan(span, err) }()
 	return t.PoolService.AddVM(ctx, poolID, vmid)
+}
+
+func (t *tracedPoolService) MoveVMToPool(ctx context.Context, poolID string, vmid int64) (err error) {
+	ctx, span := t.tracer.Start(ctx, "pve.pools.move_vm_to_pool", trace.WithAttributes(
+		attribute.String("pve.pool_id", poolID), attribute.String("pve.vmid", strconv.FormatInt(vmid, 10))))
+	defer func() { finishSpan(span, err) }()
+	return t.PoolService.MoveVMToPool(ctx, poolID, vmid)
 }
 
 func (t *tracedPoolService) CreatePool(ctx context.Context, poolID, comment string) (err error) {

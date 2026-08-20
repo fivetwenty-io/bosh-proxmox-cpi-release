@@ -32,8 +32,9 @@ type reaperPoolService struct {
 	deletePoolCalls []string
 }
 
-func (p *reaperPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
-func (p *reaperPoolService) CreatePool(_ context.Context, _, _ string) error  { return nil }
+func (p *reaperPoolService) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (p *reaperPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
+func (p *reaperPoolService) CreatePool(_ context.Context, _, _ string) error         { return nil }
 
 func (p *reaperPoolService) DeletePool(ctx context.Context, poolID string) error {
 	p.deletePoolCalls = append(p.deletePoolCalls, poolID)
@@ -337,5 +338,46 @@ func TestDeleteVM_ReaperPoolLookupFails_NoOp(t *testing.T) {
 	}
 	if len(fx.pools.deletePoolCalls) != 0 {
 		t.Errorf("DeletePool: want 0 calls when the pre-destroy pool lookup failed, got %v", fx.pools.deletePoolCalls)
+	}
+}
+
+func TestDeleteVM_ReaperRefusesStaticVMPool(t *testing.T) {
+	t.Parallel()
+
+	// The static vm_pool is a long-lived shared pool: even CPI-managed and
+	// empty, the reaper must refuse it by name before any pool API call.
+	const vmid = 9010
+	fx := newReaperTestFixture(t, vmid, true, "bosh")
+	fx.deps.Config.VMPool = "bosh"
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.getCommentCalls) != 0 {
+		t.Errorf("GetPoolComment: want 0 calls for the static vm_pool, got %v", fx.pools.getCommentCalls)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls for the static vm_pool, got %v", fx.pools.deletePoolCalls)
+	}
+	if !strings.Contains(fx.logBuf.String(), "never reaped") {
+		t.Errorf("expected the by-name refusal debug log; log=%s", fx.logBuf.String())
+	}
+}
+
+func TestDeleteVM_ReaperRefusesStemcellTemplatePool(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 9011
+	fx := newReaperTestFixture(t, vmid, true, "bosh-templates")
+	fx.deps.Config.StemcellTemplatePool = "bosh-templates"
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.getCommentCalls) != 0 {
+		t.Errorf("GetPoolComment: want 0 calls for the stemcell template pool, got %v", fx.pools.getCommentCalls)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls for the stemcell template pool, got %v", fx.pools.deletePoolCalls)
 	}
 }

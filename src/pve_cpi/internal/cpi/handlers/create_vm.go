@@ -473,6 +473,21 @@ type createVMShape struct {
 	// with the director name extracted from env.bosh.group). Empty whenever
 	// vmPool is empty — no pool is created, so no comment is needed.
 	vmPoolComment string
+	// vmPoolLayer is the pipeline layer that produced vmPool (a
+	// pve.PoolLayer* constant), persisted in the bosh_pool description
+	// sentinel so set_vm_metadata's reconciler knows whether the pool was a
+	// template render (movable) or an explicit choice (never moved). Empty
+	// whenever vmPool is empty.
+	vmPoolLayer string
+	// vmPoolDirector, vmPoolDeployment, and vmPoolInstanceGrp are the
+	// env-derived template tokens (poolTemplateTokensFromEnv) persisted
+	// alongside vmPoolLayer, making the reconciler's re-render a pure
+	// function of stored create-time inputs. All empty whenever vmPool is
+	// empty; individually empty when underivable (e.g. director on a
+	// create-env path).
+	vmPoolDirector    string
+	vmPoolDeployment  string
+	vmPoolInstanceGrp string
 }
 
 // HandleCreateVM returns a cpi.Handler that implements the BOSH CPI create_vm method.
@@ -624,6 +639,11 @@ func createVM(
 		log.String("storage", shape.vmStorage),
 		log.Int("root_disk_gib", shape.rootDiskGiB),
 	)
+
+	// Record the pool-resolution provenance now that the VM exists (the
+	// clone path's post-clone description clear already ran inside the
+	// allocate attempt). Best-effort — see persistPoolMembership.
+	persistPoolMembership(ctx, deps, logger, shape, vmid)
 
 	// -----------------------------------------------------------------------
 	// 4b. Grow virtio0 to the requested root disk size.
@@ -1328,6 +1348,11 @@ func buildAndStartVMAttempt(
 	if err != nil {
 		return 0, nil, cpierrors.Wrap(err, "create_vm: allocate+create VM"), nil, nil
 	}
+
+	// Record the pool-resolution provenance now that the VM exists (the
+	// clone path's post-clone description clear already ran inside the
+	// allocate attempt). Best-effort — see persistPoolMembership.
+	persistPoolMembership(ctx, deps, logger, &nodeShape, vmid)
 
 	vmName := nodeShape.initialName
 	if vmName == "" {

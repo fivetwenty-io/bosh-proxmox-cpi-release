@@ -6,6 +6,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
 // poolIDCharsetRE matches the PVE poolid charset: letters, digits, '.', '_',
@@ -57,29 +58,54 @@ func newPoolResolver(callCP map[string]any, cfg *config.CPIConfig) (*layeredReso
 // exclude disk_type) — passing the general-purpose newLayeredResolver result
 // would let a disk_type profile's "pool" key outrank vm_type.
 //
-// Returns ("", nil) when every layer resolves empty — no pool is assigned,
-// byte-identical to pre-feature behavior. Returns a non-retriable CloudError
-// when a resolved (non-empty) name fails validateResolvedPoolName; resolution
-// stops at the first non-empty candidate and does not fall through to a lower
-// layer on validation failure — an operator-set invalid name must surface,
-// not be silently overridden by the global default.
-func resolvePoolName(cfg *config.CPIConfig, r *layeredResolver, env map[string]any) (string, error) {
-	if v, ok := r.String("pool"); ok {
-		return validateResolvedPoolName(v)
+// Returns the winning layer (a pve.PoolLayer* constant) alongside the name so
+// callers can persist it in the bosh_pool sentinel — set_vm_metadata's pool
+// reconciler moves only layer-"template" VMs. The layer walk relies on
+// newPoolResolver's construction invariant: layer 0 is always the call-level
+// cloud_properties map, and layer 1 (when present) is the vm_type profile.
+//
+// Returns ("", "", nil) when every layer resolves empty — no pool is
+// assigned, byte-identical to pre-feature behavior. Returns a non-retriable
+// CloudError when a resolved (non-empty) name fails validateResolvedPoolName;
+// resolution stops at the first non-empty candidate and does not fall through
+// to a lower layer on validation failure — an operator-set invalid name must
+// surface, not be silently overridden by the global default.
+func resolvePoolName(cfg *config.CPIConfig, r *layeredResolver, env map[string]any) (name, layer string, err error) {
+	for i, l := range r.layers {
+		single := &layeredResolver{layers: []map[string]any{l}}
+		if v, ok := single.String("pool"); ok {
+			layer = pve.PoolLayerCall
+			if i > 0 {
+				layer = pve.PoolLayerVMType
+			}
+			name, err = validateResolvedPoolName(cfg, v)
+			if err != nil {
+				return "", "", err
+			}
+			return name, layer, nil
+		}
 	}
 
 	if cfg.VMPoolTemplate != "" {
 		if rendered := renderPoolTemplate(cfg, env); rendered != "" {
-			return validateResolvedPoolName(rendered)
+			name, err = validateResolvedPoolName(cfg, rendered)
+			if err != nil {
+				return "", "", err
+			}
+			return name, pve.PoolLayerTemplate, nil
 		}
 		// Render collapsed to "" (every token empty): fall through to global.
 	}
 
 	if cfg.VMPool != "" {
-		return validateResolvedPoolName(cfg.VMPool)
+		name, err = validateResolvedPoolName(cfg, cfg.VMPool)
+		if err != nil {
+			return "", "", err
+		}
+		return name, pve.PoolLayerStatic, nil
 	}
 
-	return "", nil
+	return "", "", nil
 }
 
 // renderPoolTemplate substitutes cfg.VMPoolTemplate's "{prefix}", "{director}",
@@ -93,13 +119,33 @@ func resolvePoolName(cfg *config.CPIConfig, r *layeredResolver, env map[string]a
 // (internal/config) rejects them at config-load time, so any template reaching
 // here is known to contain only the four supported tokens (or none).
 func renderPoolTemplate(cfg *config.CPIConfig, env map[string]any) string {
-	job := instanceGroupName(env)
-	deployment := extractDeploymentFromEnv(env, job)
+	director, deployment, job := poolTemplateTokensFromEnv(cfg, env)
+	return renderPoolTemplateTokens(cfg, director, deployment, job)
+}
+
+// poolTemplateTokensFromEnv derives the {director}/{deployment}/{instance_group}
+// substitution values from a create_vm env map, applying the create-env
+// deployment fallback (cfg.CreateEnvDeployment) when env carries no
+// deployment. This is the single env-side token derivation — the create-time
+// bosh_pool sentinel persists exactly these values, and set_vm_metadata's
+// reconciler feeds the persisted values back through
+// renderPoolTemplateTokens, so the two paths cannot diverge.
+func poolTemplateTokensFromEnv(cfg *config.CPIConfig, env map[string]any) (director, deployment, job string) {
+	job = instanceGroupName(env)
+	deployment = extractDeploymentFromEnv(env, job)
 	if deployment == "" {
 		deployment = cfg.CreateEnvDeployment
 	}
-	director := extractDirectorFromEnv(env, deployment, job)
+	director = extractDirectorFromEnv(env, deployment, job)
+	return director, deployment, job
+}
 
+// renderPoolTemplateTokens substitutes cfg.VMPoolTemplate's tokens from
+// already-derived values and sanitizes the result. Shared by the create-time
+// render (env-derived tokens) and the set_vm_metadata reconciler (tokens
+// re-read from the persisted bosh_pool sentinel or the metadata map) so both
+// produce byte-identical names from identical inputs.
+func renderPoolTemplateTokens(cfg *config.CPIConfig, director, deployment, job string) string {
 	rendered := cfg.VMPoolTemplate
 	rendered = strings.ReplaceAll(rendered, "{prefix}", cfg.VMPrefix)
 	rendered = strings.ReplaceAll(rendered, "{director}", director)
@@ -139,11 +185,16 @@ func extractDirectorFromEnv(env map[string]any, deployment, job string) string {
 }
 
 // validateResolvedPoolName enforces the flat-name + PVE poolid-charset +
-// reserved-namespace rules on a resolved (non-empty) pool name. name must
-// already be non-empty; callers only invoke this on a winning candidate.
-// Returns (name, nil) when valid, or a non-retriable CloudError describing
-// exactly which rule failed.
-func validateResolvedPoolName(name string) (string, error) {
+// reserved-namespace rules on a resolved (non-empty) pool name, plus the
+// stemcell-pool collision rule: a workload VM must never land in
+// cfg.StemcellTemplatePool, whose whole purpose is an ACL boundary between
+// workload VMs and shared templates. The collision is reachable by naming
+// alone now that vm_pool_template defaults on — e.g. a director or
+// deployment literally named so that "bosh-{director}-{deployment}" renders
+// the stemcell pool's name. name must already be non-empty; callers only
+// invoke this on a winning candidate. Returns (name, nil) when valid, or a
+// non-retriable CloudError describing exactly which rule failed.
+func validateResolvedPoolName(cfg *config.CPIConfig, name string) (string, error) {
 	if strings.Contains(name, "/") {
 		return "", cpierrors.Cloud(
 			"resolved pool name %q must be flat (contains '/'): the CPI does not create nested pools",
@@ -160,6 +211,15 @@ func validateResolvedPoolName(name string) (string, error) {
 		return "", cpierrors.Cloud(
 			"resolved pool name %q uses the reserved cluster-lock namespace %q",
 			name, reservedPoolLockPrefix,
+		)
+	}
+	if cfg != nil && cfg.StemcellTemplatePool != "" && name == cfg.StemcellTemplatePool {
+		return "", cpierrors.Cloud(
+			"resolved pool name %q collides with pve.stemcell_template_pool: workload VMs must not share the "+
+				"stemcell template pool (it is the ACL boundary between VMs and templates); check "+
+				"cloud_properties.pool, the pve.vm_pool_template tokens ({prefix}/{director}/{deployment}/"+
+				"{instance_group}) whose rendered value produced this name, and pve.vm_pool",
+			name,
 		)
 	}
 	return name, nil

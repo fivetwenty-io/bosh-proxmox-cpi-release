@@ -36,7 +36,8 @@ func newFakeLockPools() *fakeLockPools {
 	return &fakeLockPools{pools: map[string]string{}}
 }
 
-func (f *fakeLockPools) AddVM(_ context.Context, _ string, _ int64) error { return nil }
+func (f *fakeLockPools) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
+func (f *fakeLockPools) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
 
 func (f *fakeLockPools) CreatePool(_ context.Context, poolID, comment string) error {
 	f.mu.Lock()

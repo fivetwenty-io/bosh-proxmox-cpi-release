@@ -525,9 +525,10 @@ type fakePoolService struct {
 	err error
 }
 
-func (f *fakePoolService) AddVM(context.Context, string, int64) error       { return f.err }
-func (f *fakePoolService) CreatePool(context.Context, string, string) error { return f.err }
-func (f *fakePoolService) DeletePool(context.Context, string) error         { return f.err }
+func (f *fakePoolService) AddVM(context.Context, string, int64) error        { return f.err }
+func (f *fakePoolService) MoveVMToPool(context.Context, string, int64) error { return f.err }
+func (f *fakePoolService) CreatePool(context.Context, string, string) error  { return f.err }
+func (f *fakePoolService) DeletePool(context.Context, string) error          { return f.err }
 func (f *fakePoolService) GetPoolComment(context.Context, string) (string, bool, error) {
 	return "", false, f.err
 }

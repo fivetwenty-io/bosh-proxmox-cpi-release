@@ -52,6 +52,15 @@ type PoolService interface {
 	// GET /pools?poolid=<poolID>. found is false (with a nil error) when the pool
 	// does not exist. A nil/absent comment is returned as the empty string.
 	GetPoolComment(ctx context.Context, poolID string) (comment string, found bool, err error)
+
+	// MoveVMToPool assigns vmid to poolID even when the guest already belongs
+	// to another pool: PVE removes it from its current pool and adds it to
+	// this one. Corresponds to PUT /pools/{poolid} with vms=[vmid] and
+	// allow-move=1 — without allow-move, PVE rejects adding a guest that is
+	// already a pool member, which is why AddVM alone cannot reconcile
+	// membership. Returns an error when the pool does not exist or the PVE
+	// API rejects the call.
+	MoveVMToPool(ctx context.Context, poolID string, vmid int64) error
 }
 
 // Client wraps SDK services for mockability.
@@ -111,6 +120,25 @@ func (s *sdkPoolService) AddVM(ctx context.Context, poolID string, vmid int64) e
 	vms := fmt.Sprintf("%d", vmid)
 	if err := s.svc.UpdatePools2(ctx, poolID, &pools.UpdatePools2Params{Vms: &vms}); err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("PoolService.AddVM: assign vmid %d to pool %q", vmid, poolID))
+	}
+	return nil
+}
+
+// MoveVMToPool assigns vmid to the named PVE resource pool with allow-move=1,
+// so a guest already in another pool is moved rather than rejected.
+// Input validation: poolID empty → error. vmid <= 0 → error.
+// PVE API error (pool not found, auth failure, etc.) → wrapped error returned.
+func (s *sdkPoolService) MoveVMToPool(ctx context.Context, poolID string, vmid int64) error {
+	if poolID == "" {
+		return cpierrors.Cloud("PoolService.MoveVMToPool: poolID must not be empty")
+	}
+	if vmid <= 0 {
+		return cpierrors.Cloud("PoolService.MoveVMToPool: vmid must be a positive integer, got %d", vmid)
+	}
+	vms := fmt.Sprintf("%d", vmid)
+	allowMove := true
+	if err := s.svc.UpdatePools2(ctx, poolID, &pools.UpdatePools2Params{Vms: &vms, AllowMove: &allowMove}); err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("PoolService.MoveVMToPool: move vmid %d to pool %q", vmid, poolID))
 	}
 	return nil
 }

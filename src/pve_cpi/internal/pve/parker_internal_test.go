@@ -290,7 +290,8 @@ type recordingPoolService struct {
 	createErr error
 }
 
-func (r *recordingPoolService) AddVM(context.Context, string, int64) error { return nil }
+func (r *recordingPoolService) AddVM(context.Context, string, int64) error              { return nil }
+func (r *recordingPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
 func (r *recordingPoolService) CreatePool(_ context.Context, poolID, _ string) error {
 	r.events = append(r.events, "create:"+poolID)
 	return r.createErr

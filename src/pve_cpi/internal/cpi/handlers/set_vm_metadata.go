@@ -136,7 +136,16 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// Pool service absent (nil) → retriable error so the director re-drives.
 		lockOwner := fmt.Sprintf("set_vm_metadata/%d", vmid)
 		lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
-			return setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, logger)
+			if rmwErr := setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, logger); rmwErr != nil {
+				return rmwErr
+			}
+			// Reconcile the VM's resource-pool membership against the
+			// director-level vm_pool_template, inside the same lock so a
+			// concurrent set_vm_metadata cannot interleave a second
+			// read-render-move. Warn-only: pool placement never fails the
+			// metadata write the Director asked for.
+			reconcileVMPoolMembership(ctx, deps, node, vmid, metadata, logger)
+			return nil
 		})
 		if lockErr != nil {
 			return nil, lockErr

@@ -430,7 +430,12 @@ type CPIConfig struct {
 	// (repeated separators collapsed, leading/trailing '-' trimmed) and must
 	// still pass the same flat-name and charset rules as VMPool; a render
 	// that collapses to "" falls through to the global VMPool default.
-	// Empty (default) disables this layer entirely.
+	// Empty disables this layer entirely (the Go zero value); the release
+	// default is "bosh-{director}-{deployment}" (job spec), so a director
+	// gets per-deployment pools unless the operator sets the property to ""
+	// explicitly. On a create-env path the director token is underivable and
+	// the deployment token falls back to CreateEnvDeployment, so the default
+	// renders "bosh-create-env".
 	// validate-only-when-set; omit from ERB when empty.
 	VMPoolTemplate string `json:"vm_pool_template,omitempty"`
 
@@ -468,14 +473,19 @@ type CPIConfig struct {
 	// No validation; any bool value is accepted. omit from ERB when false.
 	DestroyUnreferencedDisks bool `json:"destroy_unreferenced_disks,omitempty"`
 
-	// PoolReapEmpty opts in to an empty-pool reaper at delete_vm: when the
+	// PoolReapEmpty enables an empty-pool reaper at delete_vm: when the
 	// destroyed VM's pool membership (captured before destroy) is a
 	// CPI-managed pool (provenance comment "managed by bosh-pve-cpi") that
 	// PVE reports empty after the destroy, the CPI deletes it. An
-	// operator-created pool without the provenance comment is never reaped.
-	// Default false — pools accumulate and are left for the operator to
-	// manage. No validation; any bool value is accepted.
-	// omit from ERB when false.
+	// operator-created pool without the provenance comment is never reaped,
+	// and the static VMPool and StemcellTemplatePool are refused by name
+	// regardless of comment (see reapEmptyPoolIfManaged). The release
+	// default is true (the ERB always emits the key), so per-deployment
+	// pools created by the vm_pool_template default are reaped with their
+	// deployments; the Go zero value of a raw config without the key remains
+	// false. The fast-path delete never reaps, so some empty pools persist
+	// until a later synchronous delete. No validation; any bool value is
+	// accepted.
 	PoolReapEmpty bool `json:"pool_reap_empty,omitempty"`
 
 	// StemcellTemplateNode is the PVE node on which template VMs are created.

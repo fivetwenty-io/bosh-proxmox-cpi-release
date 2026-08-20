@@ -27,6 +27,10 @@ func (f *fakePreflightPoolService) AddVM(context.Context, string, int64) error {
 	panic("preflightPoolAccess must never call AddVM")
 }
 
+func (f *fakePreflightPoolService) MoveVMToPool(context.Context, string, int64) error {
+	panic("preflightPoolAccess must never call MoveVMToPool")
+}
+
 func (f *fakePreflightPoolService) CreatePool(context.Context, string, string) error {
 	panic("preflightPoolAccess must never call CreatePool")
 }

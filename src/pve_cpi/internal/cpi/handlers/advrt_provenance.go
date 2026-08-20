@@ -1,10 +1,12 @@
 // advrt_provenance.go — provenance tags linking a VM to the SDN subnets its
 // advertised_routes created, so delete_vm can clean them up.
 //
-// Why tags: set_vm_metadata overwrites the VM Description wholesale, so the
-// description cannot carry provenance. Tags outside the reserved BOSH
-// prefixes survive the set_vm_metadata read-modify-write, and the PVE tag
-// charset ([A-Za-z0-9-]) forbids raw CIDRs — hence the hash encoding.
+// Why tags: set_vm_metadata rebuilds the VM Description's human-readable
+// text wholesale — only the <!--BOSH:{...}--> sentinel block survives its
+// read-modify-write — so free-text description content cannot carry
+// provenance. Tags outside the reserved BOSH prefixes survive the
+// set_vm_metadata read-modify-write, and the PVE tag charset ([A-Za-z0-9-])
+// forbids raw CIDRs — hence the hash encoding.
 //
 // Tag format: "advrt-<vnet>-<hash8>" where hash8 is the first 8 hex digits
 // of FNV-1a-64 over "<vnet>/<cidr>". Vnet names are 1–8 chars of [a-z0-9]
