@@ -412,7 +412,7 @@ func HandleCreateDisk(deps Deps) Handler {
 
 		// Recording only; formatArg (what is sent to PVE) is untouched, and
 		// an operator-set format at any layer still wins verbatim.
-		format = recordedDiskFormat(format, formatFound, deps.Config.VMDiskFormat, storageType)
+		format = recordedDiskFormat(format, storageType)
 
 		maxAttempts, lockAttempts := createDiskAttemptBudgets(deps)
 
@@ -619,17 +619,15 @@ func applyCreateDiskTags(ctx context.Context, deps Deps, node, vmCID, diskCID st
 // recordedDiskFormat returns the disk-image format to record in the CID
 // envelope. The recorded format must describe the volume PVE actually
 // creates: block-native storages (lvm/lvmthin/zfspool/rbd) have no file
-// format at all — PVE always allocates raw and rejects qcow2 — so when no
-// layer expressed a preference (neither a call/profile disk_format nor the
-// global vm_disk_format), the built-in qcow2 fallback would record a format
-// the volume does not have. An operator-expressed format at any layer is
-// returned verbatim, and an unknown storage type ("") keeps the resolved
-// default — the fail-open shape every other type-dependent decision in
-// create_disk takes.
-func recordedDiskFormat(resolved string, formatFound bool, vmDiskFormat, storageType string) string {
-	if formatFound || strings.TrimSpace(vmDiskFormat) != "" {
-		return resolved
-	}
+// format at all — PVE allocates raw no matter what format any config layer
+// expressed — so the block-native answer is always raw; recording an
+// expressed qcow2 there would describe a volume that does not exist (and
+// trips the out-of-band format verification against the storage content
+// listing). On file-based storages the resolved format (expressed at any
+// layer, or the built-in qcow2 fallback) is what PVE creates and is recorded
+// verbatim. An unknown storage type ("") keeps the resolved default — the
+// fail-open shape every other type-dependent decision in create_disk takes.
+func recordedDiskFormat(resolved, storageType string) string {
 	if pve.IsBlockNativeStorage(storageType) {
 		return diskFormatRaw
 	}

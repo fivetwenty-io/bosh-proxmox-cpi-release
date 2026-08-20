@@ -18,7 +18,8 @@ import (
 // ---------------------------------------------------------------------------
 
 // createDiskMetaFor runs create_disk with the given cloud_properties against a
-// thick-lvm pool (no discard/ssd noise) and returns the decoded CID metadata.
+// thick-lvm pool (no discard/ssd noise; block-native, so the recorded format
+// is always raw) and returns the decoded CID metadata.
 func createDiskMetaFor(t *testing.T, cloudProps map[string]any) *pve.DiskCIDMeta {
 	t.Helper()
 	storageSvc := &mockStorageService{
@@ -51,13 +52,14 @@ func createDiskMetaFor(t *testing.T, cloudProps map[string]any) *pve.DiskCIDMeta
 }
 
 // TestHandleCreateDisk_RecordsResolvedFormatInCID verifies the CID envelope
-// carries the format the disk was created under: the config default when no
-// per-call preference exists, and the per-call disk_format when one does.
+// carries the format the disk was actually created under: on a block-native
+// pool that is raw regardless of the config default, and per-call raw is
+// recorded verbatim.
 func TestHandleCreateDisk_RecordsResolvedFormatInCID(t *testing.T) {
 	t.Parallel()
 
-	if got := createDiskMetaFor(t, map[string]any{}).Format; got != "qcow2" {
-		t.Errorf("meta.Format = %q; want the config default qcow2", got)
+	if got := createDiskMetaFor(t, map[string]any{}).Format; got != "raw" {
+		t.Errorf("meta.Format = %q; want raw on a block-native pool", got)
 	}
 	if got := createDiskMetaFor(t, map[string]any{"disk_format": "raw"}).Format; got != "raw" {
 		t.Errorf("meta.Format = %q; want the per-call raw", got)

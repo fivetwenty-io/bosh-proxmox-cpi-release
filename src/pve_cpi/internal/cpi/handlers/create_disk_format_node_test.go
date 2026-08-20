@@ -109,14 +109,15 @@ func TestHandleCreateDisk_RecordedFormat_Matrix(t *testing.T) {
 		{"zfspool no preference records raw", "zfspool", "", nil, "raw"},
 		{"dir no preference records qcow2", "dir", "", nil, "qcow2"},
 		{"nfs no preference records qcow2", "nfs", "", nil, "qcow2"},
-		// An explicit per-call format wins verbatim, even where the derived
-		// answer would differ.
-		{"explicit qcow2 wins on rbd", "rbd", "", map[string]any{"disk_format": "qcow2"}, "qcow2"},
+		// On file-based storages an expressed format is what PVE creates
+		// and is recorded verbatim.
 		{"explicit raw wins on nfs", "nfs", "", map[string]any{"disk_format": "raw"}, "raw"},
-		// The global vm_disk_format is an operator preference too; the
-		// derivation never overrides it.
-		{"config qcow2 wins on rbd", "rbd", "qcow2", nil, "qcow2"},
 		{"config raw honored on dir", "dir", "raw", nil, "raw"},
+		// Block-native storages allocate raw no matter what any layer
+		// expressed; recording the expressed qcow2 would describe a volume
+		// that does not exist.
+		{"explicit qcow2 still records raw on rbd", "rbd", "", map[string]any{"disk_format": "qcow2"}, "raw"},
+		{"config qcow2 still records raw on rbd", "rbd", "qcow2", nil, "raw"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
