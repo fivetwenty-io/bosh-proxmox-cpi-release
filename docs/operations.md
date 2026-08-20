@@ -674,7 +674,7 @@ Collect the following before opening an issue.
 
 # proxmox-apiclient-go version — in the release source
 grep proxmox-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod
-# Current release: v3.8.5
+# Current release: v3.8.6
 
 # PVE version — on the PVE host
 pveversion -v
