@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-19
+
 ### Added
 
 - BOSH Director Upgrade Test runner: `./scripts/certify`, which stands a Director up on the previous CPI release, deploys the upstream [certification release](https://github.com/cloudfoundry/bosh-cpi-certification) under it, upgrades the Director onto the latest release over the same state, and recreates the deployment, asserting that disk CIDs and the disk attachment survive the version change. Ships with the [BOSH Director Upgrade Test](docs/certification/upgrade.md) guide and a committed [run record](docs/certification/upgrade/README.md).
@@ -186,7 +188,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/b7ead4a1d2763f88a34baad9746f798cda8e68ef...v0.1.2
 [0.1.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.0...b7ead4a1d2763f88a34baad9746f798cda8e68ef
 [0.1.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.0.1...v0.1.0
