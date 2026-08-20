@@ -236,20 +236,19 @@ const diskCIDPrefix = "pvd-"
 
 // diskCIDCompressedPrefix marks the gzip-compressed envelope disk CID format.
 // The payload is base64url(gzip(json)) with the same JSON envelope and charset
-// guarantee as diskCIDPrefix. Emitted only by EncodeDiskCIDCompressed (behind
-// the opt-in disk_cid_compression config property) and only when the plain
-// pvd- form would exceed DiskCIDLengthTarget; decoded unconditionally by
-// ParseEncodedDiskCID, because the Director replays stored CIDs indefinitely
-// for the lifetime of a deployment.
+// guarantee as diskCIDPrefix. Emitted only by EncodeDiskCIDCompressed and only
+// when the plain pvd- form would exceed DiskCIDLengthTarget; decoded
+// unconditionally by ParseEncodedDiskCID, because the Director replays stored
+// CIDs indefinitely for the lifetime of a deployment.
 const diskCIDCompressedPrefix = "pvz-"
 
 // DiskCIDLengthTarget is the longest disk CID guaranteed to fit every BOSH
 // Director database backend: MySQL (and the newer dynamic_disks table on all
 // backends) stores disk_cid in a varchar(255) column. PostgreSQL's classic
-// disk tables use unbounded text and do not need the compressed format —
-// which is why compression is opt-in rather than automatic. Exported so
-// callers (e.g. create_disk) can enforce the same bound as a hard error when
-// even the compressed form overflows it.
+// disk tables use unbounded text, but the CPI cannot know which backend the
+// Director runs, so the bound is enforced universally. Exported so callers
+// (e.g. create_disk) can enforce the same bound as a hard error when even the
+// compressed form overflows it.
 const DiskCIDLengthTarget = 255
 
 // maxDiskCIDEnvelopeBytes caps the decompressed size of a pvz- envelope so a
@@ -305,10 +304,10 @@ func marshalDiskCIDEnvelope(bareCID string, meta *DiskCIDMeta) ([]byte, error) {
 	return json.Marshal(env)
 }
 
-// EncodeDiskCIDCompressed is the encoder behind the opt-in
-// disk_cid_compression config property. It emits the same pvd- envelope as
-// EncodeDiskCID whenever that form fits DiskCIDLengthTarget — the common case
-// stays byte-identical and operator-inspectable — and switches to
+// EncodeDiskCIDCompressed is the overflow-safe disk CID encoder. It emits the
+// same pvd- envelope as EncodeDiskCID whenever that form fits
+// DiskCIDLengthTarget — the common case stays byte-identical and
+// operator-inspectable — and switches to
 //
 //	pvz-<base64url(gzip(json({"v":…,"m":{…}})))>
 //

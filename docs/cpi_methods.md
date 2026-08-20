@@ -334,7 +334,7 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 **Errors:** `Bosh::Clouds::CloudError` on storage or PVE API failure
 
-**Notes:** Allocates a disk on `disk_storage`. The disk CID encodes the storage pool and disk identifier in the `pvd-` envelope format (see [Disk CID Encoding](persistent-disks.md#disk-cid-encoding)); with `pve.disk_cid_compression` enabled, a CID whose `pvd-` form would exceed 255 characters is emitted as the gzip-compressed `pvz-` variant instead. Disks use VMIDs in `[disk_vmid_range_start, disk_vmid_range_end]` (default `[9000, 29999]`).
+**Notes:** Allocates a disk on `disk_storage`. The disk CID encodes the storage pool and disk identifier in the `pvd-` envelope format (see [Disk CID Encoding](persistent-disks.md#disk-cid-encoding)); a CID whose `pvd-` form would exceed 255 characters is emitted as the gzip-compressed `pvz-` variant instead. Disks use VMIDs in `[disk_vmid_range_start, disk_vmid_range_end]` (default `[9000, 29999]`).
 
 `cloud_properties.tags` (map of `key: value`) is applied to the PVE tags field on the VM identified by `vm_cid`. PVE has no native disk-volume tag field — tags ride on the hosting VM. When `vm_cid` is empty (Director is creating an unattached disk), the tags are deferred and applied on the next `set_disk_metadata` call. See [Custom Tags](configuration.md#custom-tags).
 

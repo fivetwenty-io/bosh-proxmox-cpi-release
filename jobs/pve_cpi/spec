@@ -1394,14 +1394,13 @@ properties:
       their anchor was never promised.
   pve.disk_cid_compression:
     description: |
-      Opt-in: when true, a disk CID whose standard pvd- envelope would exceed
-      255 characters is emitted as pvz-<base64url(gzip(json))> instead, so it
-      fits the varchar(255) disk_cid column of MySQL-backed Directors (and the
-      dynamic_disks table on all database backends). CIDs that fit 255
-      characters are unaffected, and the CPI decodes every previously emitted
-      format regardless of this setting, so the flag can be toggled at any
-      time without migrating existing disks. Leave false on PostgreSQL-backed
-      Directors, whose classic disk tables store CIDs as unbounded text.
+      Retained for compatibility; the behavior it opted into is now always
+      on. A disk CID whose standard pvd- envelope would exceed 255 characters
+      is emitted as pvz-<base64url(gzip(json))> so it fits the varchar(255)
+      disk_cid column of MySQL-backed Directors (and the dynamic_disks table
+      on all database backends). CIDs that fit 255 characters stay pvd- and
+      byte-identical, and the CPI decodes every previously emitted format
+      unconditionally, so no disk migration is ever needed.
     default: false
   pve.parked_disk_vmid_range_start:
     description: |

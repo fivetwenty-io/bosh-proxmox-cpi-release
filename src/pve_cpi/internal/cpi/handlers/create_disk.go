@@ -501,17 +501,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			Format: format,
 			ID:     stableID,
 		}
-		// With disk_cid_compression enabled, a CID whose pvd- form would
-		// overflow MySQL-backed Directors' varchar(255) disk_cid column is
-		// emitted as a pvz- gzip envelope instead; CIDs that fit are
-		// unaffected. Decode accepts both forms unconditionally, so the flag
-		// is safe to toggle at any time.
+		// A CID whose pvd- form would overflow MySQL-backed Directors'
+		// varchar(255) disk_cid column is emitted as a pvz- gzip envelope
+		// instead; CIDs that fit stay pvd- and byte-identical. The fallback is
+		// unconditional (not gated on the disk_cid_compression property, which
+		// is retained as an accepted no-op): the stable-identity field makes
+		// richly-annotated envelopes overflow in ordinary configurations, and
+		// decode has always accepted both forms, so the only alternative to a
+		// pvz- CID here is failing the disk's creation outright.
 		var diskCID string
-		if deps.Config.DiskCIDCompression {
-			diskCID, err = pve.EncodeDiskCIDCompressed(bareDiskCID, meta)
-		} else {
-			diskCID, err = pve.EncodeDiskCID(bareDiskCID, meta)
-		}
+		diskCID, err = pve.EncodeDiskCIDCompressed(bareDiskCID, meta)
 		if err != nil {
 			// Unreachable in practice: bareDiskCID is always non-empty here
 			// (attemptCreateVolume guarantees it). Kept as a hard error rather
@@ -530,21 +529,15 @@ func HandleCreateDisk(deps Deps) Handler {
 		)
 
 		// MySQL-backed Directors store disk_cid in a VARCHAR(255) column
-		// (Postgres uses TEXT). A CID that still overflows this bound after
-		// encoding (or after compression, when disk_cid_compression is
-		// enabled) would silently truncate or be rejected by such a
-		// Director on the next create_disk-adjacent write, orphaning the
-		// volume just created above — so this is a hard error, not a
-		// warning, and the deferred rollback above reclaims the volume.
+		// (Postgres uses TEXT). A CID that still overflows this bound even
+		// after the compressed-encoding fallback would silently truncate or
+		// be rejected by such a Director on the next create_disk-adjacent
+		// write, orphaning the volume just created above — so this is a hard
+		// error, not a warning, and the deferred rollback above reclaims the
+		// volume.
 		if len(diskCID) > pve.DiskCIDLengthTarget {
-			if deps.Config.DiskCIDCompression {
-				return nil, cpierrors.Cloud(
-					"create_disk: encoded disk CID is %d characters even after gzip compression, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); reduce per-disk metadata (fewer performance options, shorter storage/node names) to bring it under the limit",
-					len(diskCID), pve.DiskCIDLengthTarget,
-				)
-			}
 			return nil, cpierrors.Cloud(
-				"create_disk: encoded disk CID is %d characters, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); set pve.disk_cid_compression: true in the CPI manifest to enable gzip envelope compression",
+				"create_disk: encoded disk CID is %d characters even after gzip compression, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); reduce per-disk metadata (fewer performance options, shorter storage/node names) to bring it under the limit",
 				len(diskCID), pve.DiskCIDLengthTarget,
 			)
 		}

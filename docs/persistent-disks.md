@@ -159,8 +159,9 @@ strings — so a corrupted or hand-edited CID fails at the CPI boundary instead
 of propagating a half-parsed volid into PVE API calls. A CID longer than 255
 characters is likewise rejected at `create_disk` time (with the just-created
 volume rolled back) because a MySQL-backed Director would truncate it and
-orphan the disk; enable `pve.disk_cid_compression` if rich `disk_pool` option
-sets push the envelope over the limit. Use the bundled `pve-cid` tool
+orphan the disk; the compressed `pvz-` fallback below engages automatically
+before that rejection, so only an envelope gzip cannot shrink under the limit
+fails. Use the bundled `pve-cid` tool
 (`pve-cid decode <cid>`, installed on the Director VM at
 `/var/vcap/packages/pve_cpi/bin/pve-cid`, not on `PATH` by default) to inspect
 any CID offline.
@@ -173,11 +174,11 @@ the offending CID. When a disk operation fails with "disk not found" on a
 volume that is visibly present in PVE, that log line is where we look: it means
 the CID never decoded, and the volume was never the problem.
 
-### Compressed CIDs (`pvz-`, opt-in)
+### Compressed CIDs (`pvz-`)
 
-Setting `pve.disk_cid_compression: true` opts `create_disk` into a compressed
-variant for exactly the over-limit case above. When the standard `pvd-` form
-would exceed 255 characters, the CID is emitted as:
+`create_disk` falls back to a compressed variant for exactly the over-limit
+case above. When the standard `pvd-` form would exceed 255 characters, the CID
+is emitted as:
 
 ```
 pvz-<base64url(gzip(JSON payload))>
@@ -185,21 +186,23 @@ pvz-<base64url(gzip(JSON payload))>
 
 The JSON payload, the charset guarantee, and the decode rules are identical to
 `pvd-`; only the container changes. CIDs that fit 255 characters are emitted as
-`pvd-` unchanged, byte-identical to the flag-off encoding, so enabling the flag
-never alters the common case. If gzip cannot shorten an unusually high-entropy
-payload, the plain form is kept — both forms overflow, so `create_disk` fails
-with the same hard error either way and rolls the just-created volume back.
+`pvd-` unchanged, so the fallback never alters the common case. If gzip cannot
+shorten an unusually high-entropy payload, the plain form is kept — both forms
+overflow, so `create_disk` fails with the same hard error either way and rolls
+the just-created volume back.
 
-The flag exists for MySQL-backed Directors, whose `disk_cid` column is a hard
-`VARCHAR(255)` (strict mode rejects longer values; legacy non-strict mode
-silently truncates them). PostgreSQL-backed Directors store CIDs in unbounded
-`text` columns and gain nothing from compression — leave the flag off there.
-(The one PostgreSQL exception is the newer `dynamic_disks` Director table,
-which is `varchar(255)` on every backend.)
+The fallback was originally opt-in behind `pve.disk_cid_compression`; the
+stable-identity field made richly-annotated envelopes overflow in ordinary
+configurations, so it now engages automatically and the property is retained
+as an accepted no-op. The bound exists for MySQL-backed Directors, whose
+`disk_cid` column is a hard `VARCHAR(255)` (strict mode rejects longer values;
+legacy non-strict mode silently truncates them). PostgreSQL-backed Directors
+store CIDs in unbounded `text` columns, but the newer `dynamic_disks` Director
+table is `varchar(255)` on every backend, so the CPI enforces the bound
+universally.
 
-The CPI decodes `pvz-` unconditionally and forever, regardless of the flag —
-like every format it has ever emitted — so the flag can be enabled or disabled
-at any time without migrating existing disks. A storage literally named
+The CPI decodes `pvz-` unconditionally and forever — like every format it has
+ever emitted — so no disk migration is ever needed. A storage literally named
 `pvz-…` falls back to the legacy paths by the same `:`-based rule as `pvd-`,
 and a hostile CID cannot decompression-bomb the CPI: inflation is capped at
 64 KiB.

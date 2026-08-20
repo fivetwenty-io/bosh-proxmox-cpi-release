@@ -29,7 +29,7 @@
 //	                [--opt k=v ...] [--compress] [--json]
 //	    Build a pvd-/pvz- disk CID envelope offline. --compress allows the
 //	    gzip-compressed pvz- form when the plain form would exceed the
-//	    varchar(255) target (mirrors the pve.disk_cid_compression config knob).
+//	    varchar(255) target (mirrors create_disk's automatic fallback).
 //
 //	pve-cid locate <cid|volid> [--config PATH] [--json]
 //	    Online. Accepts a disk CID (pvd-/pvz-), a raw PVE volid
