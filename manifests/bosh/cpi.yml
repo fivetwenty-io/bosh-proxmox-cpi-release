@@ -33,6 +33,11 @@
     cpu: ((director_cpu))
     memory: ((director_memory))
     disk: ((director_disk))
+    # Pin the Director VM to the configured node. create-env has no azs, and
+    # on node-local vm_storage an unpinned Director can land on a node that
+    # holds neither the stemcell cache template nor the Director's own
+    # persistent disk.
+    target_node: ((pve_node))
 
 - type: replace
   path: /disk_pools/name=disks/cloud_properties?

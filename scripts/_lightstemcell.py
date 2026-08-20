@@ -151,6 +151,7 @@ def stemcell_mf(
     image_url_auth_token: "str | None" = None,
     image_sha1: str = PLACEHOLDER_SHA1,
     sha256: "str | None" = None,
+    node: "str | None" = None,
 ) -> str:
     """Render the stemcell.MF document text for a light stemcell.
 
@@ -193,6 +194,10 @@ def stemcell_mf(
             lines.append("  image_url_auth:")
             lines.append("    type: bearer")
             lines.append(f"    bearer_token: {image_url_auth_token}")
+    if node:
+        # Multi-node clusters with node-local stemcell storage require the
+        # pin; single-node clusters and shared storage ignore it harmlessly.
+        lines.append(f"  node: {node}")
     lines += [
         f"  name: {os_name}",
         f'  version: "{version}"',
@@ -212,6 +217,7 @@ def build_create_env_light_tarball(
     image_url: "str | None" = None,
     image_url_auth_token: "str | None" = None,
     sha256: "str | None" = None,
+    node: "str | None" = None,
 ) -> str:
     """Pack a light stemcell tarball for `bosh create-env`.
 
@@ -228,6 +234,7 @@ def build_create_env_light_tarball(
     mf = stemcell_mf(
         os_name, version, image_id=image_id, image_url=image_url,
         image_url_auth_token=image_url_auth_token, image_sha1=image_sha1,
+        node=node,
         sha256=sha256,
     ).encode("utf-8")
 
@@ -655,6 +662,7 @@ def render_light_manifest(
     image_url: "str | None" = None,
     token: "str | None" = None,
     sha256: "str | None" = None,
+    node: "str | None" = None,
 ) -> str:
     """Write a concrete upload-stemcell manifest to dest_dir and return its path.
 
@@ -666,7 +674,7 @@ def render_light_manifest(
     text = stemcell_mf(
         os_name, version, image_id=image_id, image_url=image_url,
         image_url_auth_token=token if mode == "fetch" else None,
-        sha256=sha256,
+        sha256=sha256, node=node,
     )
     out = Path(dest_dir) / f"light-stemcell-{mode}.rendered.yml"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -723,7 +731,7 @@ def ensure_light_stemcell(
         # tarball pointing at image_url.
         manifest = render_light_manifest(
             cache_dir, "fetch", os_name=os_name, version=version,
-            image_url=image_url, token=token,
+            image_url=image_url, token=token, node=node or None,
         )
         result = LightStemcell(
             os_name=os_name, version=version, mode="fetch", sha256="",
@@ -734,6 +742,7 @@ def ensure_light_stemcell(
             tb = build_create_env_light_tarball(
                 cache_dir, os_name=os_name, version=version,
                 image_url=image_url, image_url_auth_token=token,
+                node=node or None,
             )
             result.create_env_tarball = tb
             result.create_env_tarball_sha1 = file_sha1(tb)
@@ -754,7 +763,7 @@ def ensure_light_stemcell(
             log(f"    light stemcell present on {storage}: {fname} (cached)")
             return _preuploaded_result(
                 cache_dir, os_name, version, sha256, storage, fname,
-                build_create_env_tarball,
+                build_create_env_tarball, node=node,
             )
 
     # Expensive path — pay once.
@@ -774,18 +783,19 @@ def ensure_light_stemcell(
     )
     return _preuploaded_result(
         cache_dir, os_name, version, sha256, storage, fname,
-        build_create_env_tarball,
+        build_create_env_tarball, node=node,
     )
 
 
 def _preuploaded_result(
     cache_dir: "str | Path", os_name: str, version: str,
     sha256: str, storage: str, fname: str, build_create_env_tarball: bool,
+    node: "str | None" = None,
 ) -> LightStemcell:
     volid = import_volid(storage, fname)
     manifest = render_light_manifest(
         cache_dir, "preuploaded", os_name=os_name, version=version, image_id=volid,
-        sha256=sha256,
+        sha256=sha256, node=node,
     )
     result = LightStemcell(
         os_name=os_name, version=version, mode="preuploaded", sha256=sha256,
@@ -794,7 +804,7 @@ def _preuploaded_result(
     if build_create_env_tarball:
         tb = build_create_env_light_tarball(
             cache_dir, os_name=os_name, version=version, image_id=volid,
-            sha256=sha256,
+            sha256=sha256, node=node,
         )
         result.create_env_tarball = tb
         result.create_env_tarball_sha1 = file_sha1(tb)

@@ -34,6 +34,7 @@ operating_system: ubuntu-noble
 stemcell_formats:
 - proxmox-kvm
 cloud_properties:
+  node: ((pve_node))
   image_url: "((stemcell_url))"
   image_url_auth:
     type: bearer

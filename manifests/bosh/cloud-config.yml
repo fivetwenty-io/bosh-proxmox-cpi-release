@@ -5,6 +5,14 @@
 
 azs:
 - name: z1
+  # BOSH merges az cloud_properties into every VM in the az (vm_type keys win
+  # on conflict), so this pin reaches compilation VMs too. It is required when
+  # vm_storage is node-local: PVE cannot cross-node clone local storage, and a
+  # light-preuploaded qcow2 on node-local stemcell storage cannot be
+  # replicated by the CPI (the operator owns the upload, so the CPI has no
+  # bytes to copy). Shared storage clusters may drop the pin.
+  cloud_properties:
+    target_node: ((pve_node))
 
 vm_types:
 - name: default

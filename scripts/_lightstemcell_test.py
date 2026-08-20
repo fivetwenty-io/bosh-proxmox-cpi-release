@@ -102,6 +102,20 @@ class StemcellMFTests(unittest.TestCase):
         self.assertIn('version: "1.383"', mf)
         self.assertIn("proxmox-kvm", mf)
 
+    def test_node_pin_emitted_when_set(self) -> None:
+        # Multi-node clusters with node-local stemcell storage require the
+        # cloud_properties.node pin; the generator emits it only when given.
+        mf = ls.stemcell_mf(
+            "ubuntu-noble", "1.383", image_id="local:import/x.qcow2",
+            sha256=SHA, node="lab-pmx-0",
+        )
+        self.assertIn("  node: lab-pmx-0", mf)
+        self.assertLess(mf.index("cloud_properties:"), mf.index("node: lab-pmx-0"))
+
+    def test_node_pin_absent_by_default(self) -> None:
+        mf = ls.stemcell_mf("ubuntu-noble", "1.383", image_id="local:import/x.qcow2", sha256=SHA)
+        self.assertNotIn("node:", mf)
+
     def test_fetch_carries_image_url(self) -> None:
         mf = ls.stemcell_mf(
             "ubuntu-noble", "1.383", image_url="https://example.com/x.qcow2"

@@ -72,6 +72,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - Consolidated the certification documentation under `docs/certification/`: the certification overview, the BATS guide, and the BATS run record moved there, joined by the Director upgrade guide and its run record.
 
+- The create-env harness and example manifests now pin work to the configured node, which multi-node clusters with node-local storage require. The light stemcell manifests the harness generates carry `cloud_properties.node` (the light preuploaded validation demands one on a multi-node cluster), and `manifests/bosh/cloud-config.yml` and `manifests/bosh/cpi.yml` pin the AZ and the Director's resource pool to `((pve_node))` — without the pin, placement can pick a node that holds neither the stemcell cache template nor the VM's persistent disk, and an operator-owned preuploaded qcow2 is nothing the CPI can replicate across nodes. Single-node clusters and shared-storage layouts are unaffected; shared-storage clusters may drop the pins.
+
 ## [0.1.2] - 2026-08-19
 
 Supersedes the withdrawn 0.1.1. Upgrade to this release directly from 0.1.0.

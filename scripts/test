@@ -704,6 +704,14 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
 
     preuploaded_manifest = str(REPO_ROOT / "manifests" / "bosh" / "light-stemcell-preuploaded.yml")
 
+    # The light manifests pin cloud_properties.node: multi-node clusters with
+    # node-local stemcell storage reject an unpinned light stemcell. Resolve
+    # the pin the same way Tier 1 places uploads: the configured tier1 node.
+    stemcell_node = str(cfg.get("tier1", {}).get("node", "")).strip()
+    if not stemcell_node and not _dry_run:
+        print("tier 4 failed: tier1.node is required (light stemcell node pin)", file=sys.stderr)
+        return 1
+
     d_env = _integration.director_env(cfg, dry_run=_dry_run)
 
     # ----------------------------------------------------------------
@@ -713,6 +721,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     rc = run_with_retries(
         [
             "bosh", "-e", alias, "upload-stemcell", preuploaded_manifest,
+            "-v", f"pve_node={stemcell_node}",
             "-v", f"stemcell_version={stemcell_version}",
             "-v", f"stemcell_storage={stemcell_storage}",
             "-v", f"stemcell_filename={stemcell_filename}",
@@ -784,6 +793,7 @@ def tier_light(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         rendered_fetch = _lightstemcell.render_light_manifest(
             str(fetch_cache), "fetch", os_name=light_os, version=stemcell_version,
             image_url=stemcell_url, token=(stemcell_token or None),
+            node=(stemcell_node or None),
         )
         print("==> tier 4: light fetch — upload-stemcell")
         rc = run_with_retries(
