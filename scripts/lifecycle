@@ -244,6 +244,31 @@ if PARKER_RANGE_START < 100 or PARKER_RANGE_END <= PARKER_RANGE_START:
         "(start must be >=100 and below end)"
     )
 
+# PVE rejects VMIDs above this ceiling, and the CPI's config validation
+# enforces it on the parker band, so a derived band crossing it would fail
+# config load mid-pass with an error naming a temp file instead of the cause.
+_PVE_MAX_VMID = 999999999
+# The band the CPI resolves when both parked_disk_vmid_range keys are absent.
+_BUILTIN_PARKER_BAND = (90000, 90999)
+
+# The stranded-parker steps (11g-bis/11h/11h-bis) need a second band that
+# cannot contain the lab's parker. Prefer the 1000-VMID window just above the
+# lab band; when the lab band ends too close to the VMID ceiling, fall back to
+# the window just below it. Computed here so a lab band that fits neither side
+# aborts with the cause before the run touches the cluster.
+if PARKER_RANGE_END + 1000 <= _PVE_MAX_VMID:
+    STRANDED_BAND_START, STRANDED_BAND_END = PARKER_RANGE_END + 1, PARKER_RANGE_END + 1000
+elif PARKER_RANGE_START - 1000 >= 100:
+    STRANDED_BAND_START, STRANDED_BAND_END = PARKER_RANGE_START - 1000, PARKER_RANGE_START - 1
+else:
+    sys.exit(
+        "cannot derive a moved parker band for the stranded-parker steps (11g-bis/11h/11h-bis): "
+        f"the lab band [{PARKER_RANGE_START}, {PARKER_RANGE_END}] leaves no free 1000-VMID window "
+        f"above it (that would cross PVE's maximum VMID {_PVE_MAX_VMID}) or below it (that would "
+        f"go under VMID 100); shrink or move parked_disk_vmid_range_start/_end in {CPI_CONFIG} "
+        "so at least 1000 VMIDs stay clear on one side of the band"
+    )
+
 if not NETWORK_BRIDGE:
     NETWORK_BRIDGE = _base_cfg.get("network_bridge", "vmbr0")
 
@@ -429,13 +454,19 @@ _derived_configs: list[str] = []
 def derive_config(prefix: str, **overrides: Any) -> str:
     """Write a temp CPI config that is CPI_CONFIG plus overrides.
 
+    An override of None REMOVES the key instead of setting it, so a derived
+    config can also exercise what the CPI does when a property is absent.
     Lets the harness exercise config-selected code paths without mutating the
     primary config, and without depending on what the primary config happens to
     say. Removal is handled centrally by purge_derived_configs().
     """
     with open(CPI_CONFIG) as f:
         cfg = json.load(f)
-    cfg.update(overrides)
+    for key, value in overrides.items():
+        if value is None:
+            cfg.pop(key, None)
+        else:
+            cfg[key] = value
     fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
@@ -485,12 +516,36 @@ def write_stranded_parker_config() -> str:
     sitting on one looks like a volume attached to an ordinary VM. The harness
     uses it to prove attach_disk refuses that rather than writing a second
     reference to the same volume.
+
+    The moved band is the 1000-VMID window next to the lab band — above it
+    normally, below it when the lab band ends too close to PVE's maximum VMID
+    (the CPI's config validation rejects a band crossing the ceiling). The
+    window is chosen and validated at startup, so a band it cannot fit around
+    aborts the run before anything touches the cluster.
     """
     return derive_config(
         "cpi-stranded-",
         detached_disk_strategy="free",
-        parked_disk_vmid_range_start=PARKER_RANGE_END + 1,
-        parked_disk_vmid_range_end=PARKER_RANGE_END + 1000,
+        parked_disk_vmid_range_start=STRANDED_BAND_START,
+        parked_disk_vmid_range_end=STRANDED_BAND_END,
+    )
+
+
+def write_unset_band_config() -> str:
+    """Derive a temp CPI config with strategy=free and the band keys REMOVED.
+
+    This is the shape an operator lands in by reverting to "free" and deleting
+    the band properties outright: the CPI must resolve the built-in
+    90000-90999 band on its own so a disk parked while "parked" was in effect
+    still drains. Only meaningful on a lab whose configured band IS the
+    built-in one — anywhere else the resolved band cannot contain the lab's
+    parker, which is the stranded shape write_stranded_parker_config covers.
+    """
+    return derive_config(
+        "cpi-unsetband-",
+        detached_disk_strategy="free",
+        parked_disk_vmid_range_start=None,
+        parked_disk_vmid_range_end=None,
     )
 
 
@@ -568,6 +623,13 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
 
       detach (parked) again
         the existing parker is reused instead of a second one being created
+
+      attach (free, band unset)
+        the self-drain path an operator lands in by reverting to "free" and
+        deleting the band properties: the CPI resolves the built-in band on
+        its own, still recognizes the parker, and drains the disk — run only
+        on labs whose band is the built-in one, announced as a SKIP with the
+        reason anywhere else
 
       delete (free, band moved)
         refused for the same reason the attach is, because freeing the volume
@@ -808,6 +870,54 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         "no second parker VM was created",
         verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END) == parkers,
     )
+
+    step("11l-bis. attach_disk (strategy=free, band keys removed: the built-in band still drains)")
+    if (PARKER_RANGE_START, PARKER_RANGE_END) != _BUILTIN_PARKER_BAND:
+        print(
+            f"==> SKIP: this lab's parker band [{PARKER_RANGE_START}, {PARKER_RANGE_END}] is not "
+            f"the built-in {_BUILTIN_PARKER_BAND[0]}-{_BUILTIN_PARKER_BAND[1]}. With the band "
+            "keys removed the CPI resolves the built-in band, which cannot contain this lab's "
+            "parker — that stranded shape is already proven by steps 11g-bis/11h/11h-bis. To run "
+            f"this step live, point parked_disk_vmid_range_start/_end in {CPI_CONFIG} at the "
+            "built-in band."
+        )
+        return parker_vmid
+
+    unset_band_cfg = write_unset_band_config()
+    try:
+        call("attach_disk", [vm_cid, disk_cid], config_path=unset_band_cfg)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "attach_disk with detached_disk_strategy=free and no parked_disk_vmid_range keys "
+            f"failed to drain the disk off parker {parker_vmid}: {exc}\n"
+            "An unset band must resolve to the built-in 90000-90999 under every strategy "
+            '(ApplyDefaults in internal/config); an operator who reverts to "free" and deletes '
+            "the band properties would otherwise strand every previously parked disk"
+        ) from exc
+    state["disk_attached"] = True
+    holders = verifier.disk_holders(disk_cid)
+    if [str(h[0]) for h in holders] != [str(vm_cid).strip()]:
+        raise RuntimeError(
+            f"after the unset-band drain the disk should be held only by VM {vm_cid}, got {holders}"
+        )
+    verifier.assert_true(
+        f"parker {parker_vmid} protection restored after the unset-band drain",
+        str(verifier.qemu_config(parker_vmid).get("protection", "0")) == "1",
+    )
+    verifier.assert_true(
+        f"parker {parker_vmid} dropped the disk from its provenance sentinel",
+        bare_volid not in verifier.parked_disks(parker_vmid),
+    )
+
+    step("11l-ter. detach_disk (strategy=parked: re-park so the pass ends where it started)")
+    call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
+    state["disk_attached"] = False
+    holders = verifier.disk_holders(disk_cid)
+    if [h[0] for h in holders] != [parker_vmid]:
+        raise RuntimeError(
+            "re-parking after the unset-band drain should have returned the disk to "
+            f"parker {parker_vmid}, got {holders}"
+        )
 
     return parker_vmid
 
