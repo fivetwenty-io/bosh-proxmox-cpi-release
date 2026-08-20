@@ -74,6 +74,13 @@ _SENTINEL_RE = re.compile(r"<!--BOSH:(.*?)-->", re.DOTALL)
 _DISK_SLOT_RE = re.compile(r"^(?:scsi|virtio|ide|sata|unused)\d+$")
 
 
+# Storage types PVE marks shared by definition, mirroring StorageInfo.IsShared
+# in internal/pve/storage_info.go: rbd/cephfs/nfs/cifs/glusterfs/pbs are
+# cluster-visible by type; every other type is shared only when storage.cfg
+# flags it so (the entry's integer "shared" field).
+_SHARED_STORAGE_TYPES = frozenset({"rbd", "cephfs", "nfs", "cifs", "glusterfs", "pbs"})
+
+
 # Tag separators, mirroring splitTagString in internal/pve/parker.go: PVE writes
 # semicolons, but a hand-edited tag field can carry commas or spaces, and a
 # separator this splitter does not know turns every parker assertion into a
@@ -175,6 +182,24 @@ def _cid_node(disk_cid: str) -> str:
         return ""
     node = meta.get("node")
     return node if isinstance(node, str) else ""
+
+
+def _cid_format(disk_cid: str) -> str:
+    """Return the disk-image format recorded in a CID's metadata, or "".
+
+    The CPI records the resolved format under "m"."f" (DiskCIDMeta.Format in
+    internal/pve/disk.go) so attach_disk can reuse the value the disk was
+    created under. Best-effort like _cid_node: a legacy envelope without the
+    field answers "", and the caller treats that as "nothing to compare".
+    """
+    try:
+        meta = _decode_cid_payload(disk_cid).get("m")
+    except PVEVerifyError:
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    fmt = meta.get("f")
+    return fmt if isinstance(fmt, str) else ""
 
 
 def parse_stemcell_cid(cid: str) -> "tuple[str, str]":
@@ -437,11 +462,21 @@ class PVEVerifier:
     def volume_exists(self, disk_cid: str) -> bool:
         """True when a storage volume with volid == the bare disk_cid exists.
 
+        Thin wrapper over volume_entry, which carries the node-fallback scan
+        and the raise-when-every-node-failed rule; see it for the details.
+        """
+        return self.volume_entry(disk_cid) is not None
+
+    def volume_entry(self, disk_cid: str) -> "dict[str, Any] | None":
+        """Return the storage content entry matching disk_cid, or None.
+
         The CPI emits only pvd- ('pvd-<base64url(json)>') or, opt-in, pvz-
         (gzip-compressed) envelope CIDs, with the bare volid in the payload's
         "v" field. PVE's storage content listing reports only the bare volid,
         so decode the CID to its bare form (mirroring the Go codec's decode
-        order in internal/pve/disk.go) before matching.
+        order in internal/pve/disk.go) before matching. The matched entry is
+        returned whole so callers can assert on its other fields (format,
+        size) rather than just on presence.
         """
         bare_cid = _bare_disk_cid(disk_cid)
         if ":" not in bare_cid:
@@ -483,11 +518,84 @@ class PVEVerifier:
                 last_err = exc
                 continue
             answered = True
-            if any(e.get("volid") == bare_cid for e in entries):
-                return True
+            for e in entries:
+                if e.get("volid") == bare_cid:
+                    return e
         if not answered and last_err is not None:
             raise last_err
-        return False
+        return None
+
+    # -- storage classification ----------------------------------------------
+
+    def storage_entry(self, storage: str) -> "dict[str, Any] | None":
+        """Return the /storage index entry for the named storage, or None.
+
+        The cluster-wide /storage listing is the same index the CPI's
+        StorageInfoCache classifies from, so type/shared answers here match
+        what the CPI itself resolved.
+        """
+        for e in self._as_list(self._get("/storage")):
+            if e.get("storage") == storage:
+                return e
+        return None
+
+    def storage_type(self, storage: str) -> str:
+        """Return the storage's PVE type ("rbd", "lvmthin", ...), or ""."""
+        entry = self.storage_entry(storage)
+        if entry is None:
+            return ""
+        stype = entry.get("type")
+        return str(stype).strip().lower() if isinstance(stype, str) else ""
+
+    def storage_is_shared(self, storage: str) -> bool:
+        """True when the storage is cluster-visible ("shared").
+
+        Mirrors StorageInfo.IsShared in internal/pve/storage_info.go: shared
+        by type (rbd/cephfs/nfs/cifs/glusterfs/pbs), or explicitly flagged
+        shared in storage.cfg — PVE reports the flag as an integer 1/0. A
+        storage absent from the index answers False, matching the CPI's
+        treat-unknown-as-local safety default.
+        """
+        entry = self.storage_entry(storage)
+        if entry is None:
+            return False
+        if entry.get("shared") in (1, "1", True):
+            return True
+        stype = str(entry.get("type", "") or "").strip().lower()
+        return stype in _SHARED_STORAGE_TYPES
+
+    def check_volume_format(self, disk_cid: str) -> str:
+        """Compare the CID envelope's recorded format with the volume's.
+
+        The CPI records the resolved disk-image format in the CID metadata
+        ("m"."f") and attach_disk trusts it, so a recorded format that
+        contradicts what PVE actually created (rbd volumes are always raw,
+        whatever the CID says) is a CPI defect this check exists to catch.
+
+        Returns "ok" when both sides carry a format and they agree, or a
+        "skipped (...)" string when either side carries none — a legacy CID
+        predates the field, and some storage plugins elide "format" from
+        their content listings; neither is a mismatch. Raises PVEVerifyError
+        when the volume is absent or the two formats disagree.
+        """
+        entry = self.volume_entry(disk_cid)
+        if entry is None:
+            raise PVEVerifyError(
+                f"check_volume_format: no volume found for disk_cid {disk_cid!r}"
+            )
+        recorded = _cid_format(disk_cid).strip().lower()
+        actual_raw = entry.get("format")
+        actual = str(actual_raw).strip().lower() if isinstance(actual_raw, str) else ""
+        if not recorded:
+            return "skipped (CID envelope records no format)"
+        if not actual:
+            return "skipped (content listing reports no format)"
+        if recorded != actual:
+            raise PVEVerifyError(
+                f"verify FAILED: disk_cid {disk_cid!r} records format {recorded!r} "
+                f"but PVE reports the volume as {actual!r}"
+            )
+        return "ok"
 
     # -- parked-disk (parker VM) inspection -----------------------------------
     #

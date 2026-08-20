@@ -196,6 +196,94 @@ class TestSelectLocalDiskPools(unittest.TestCase):
         result = _integration.select_local_disk_pools(entries, types=("lvm",))
         self.assertEqual(result, ["my-lvm"])
 
+    def test_widened_types_include_rbd(self) -> None:
+        """A types tuple naming rbd keeps rbd pools that the local-only
+        default excludes."""
+        entries = [
+            {"storage": "ceph-rbd", "type": "rbd", "content": "images"},
+            {"storage": "local-lvm", "type": "lvm", "content": "images"},
+            {"storage": "nfs-data", "type": "nfs", "content": "images"},
+        ]
+        result = _integration.select_local_disk_pools(
+            entries, types=("lvm", "rbd")
+        )
+        self.assertEqual(result, ["ceph-rbd", "local-lvm"])
+
+
+class TestDiskStorageTypes(unittest.TestCase):
+    """Tests for the tier1.disk_storage_types override plumbing."""
+
+    def _cfg(self, tier1: dict) -> dict:
+        return {"tier1": tier1}
+
+    def test_absent_key_returns_default(self) -> None:
+        self.assertEqual(
+            _integration.disk_storage_types(self._cfg({})),
+            _integration._LOCAL_DISK_TYPES,
+        )
+
+    def test_empty_list_returns_default(self) -> None:
+        self.assertEqual(
+            _integration.disk_storage_types(self._cfg({"disk_storage_types": []})),
+            _integration._LOCAL_DISK_TYPES,
+        )
+
+    def test_default_excludes_shared_types(self) -> None:
+        """The default stays local-only: nfs, cephfs, and rbd are not in it."""
+        types = _integration.disk_storage_types(self._cfg({}))
+        for shared_type in ("nfs", "cephfs", "rbd"):
+            self.assertNotIn(shared_type, types)
+
+    def test_override_returned_lowercased(self) -> None:
+        cfg = self._cfg({"disk_storage_types": ["LVMThin", " rbd "]})
+        self.assertEqual(_integration.disk_storage_types(cfg), ("lvmthin", "rbd"))
+
+    def test_non_list_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _integration.disk_storage_types(
+                self._cfg({"disk_storage_types": "rbd"})
+            )
+
+    def test_non_string_entry_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _integration.disk_storage_types(
+                self._cfg({"disk_storage_types": ["lvm", 3]})
+            )
+
+    def test_empty_string_entry_raises(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _integration.disk_storage_types(
+                self._cfg({"disk_storage_types": ["lvm", "  "]})
+            )
+
+    def test_detect_pools_uses_override(self) -> None:
+        """detect_disk_storage_pools must thread the configured types into the
+        pool filter — the caller-side plumbing the default tuple bypassed."""
+        entries = [
+            {"storage": "ceph-rbd", "type": "rbd", "content": "images"},
+            {"storage": "local-lvm", "type": "lvm", "content": "images"},
+        ]
+        cfg = self._cfg({"disk_storage_types": ["rbd"]})
+        with unittest.mock.patch.object(
+            _integration, "build_cpi_config", return_value={}
+        ), unittest.mock.patch.object(
+            _integration, "fetch_storage_index", return_value=entries
+        ):
+            self.assertEqual(_integration.detect_disk_storage_pools(cfg), ["ceph-rbd"])
+
+    def test_detect_pools_default_stays_local(self) -> None:
+        entries = [
+            {"storage": "ceph-rbd", "type": "rbd", "content": "images"},
+            {"storage": "local-lvm", "type": "lvm", "content": "images"},
+        ]
+        cfg = self._cfg({})
+        with unittest.mock.patch.object(
+            _integration, "build_cpi_config", return_value={}
+        ), unittest.mock.patch.object(
+            _integration, "fetch_storage_index", return_value=entries
+        ):
+            self.assertEqual(_integration.detect_disk_storage_pools(cfg), ["local-lvm"])
+
 
 class TestSelectNetworkModes(unittest.TestCase):
     """Tests for _integration.select_network_modes (pure decision logic)."""

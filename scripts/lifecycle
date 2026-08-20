@@ -1114,6 +1114,27 @@ def main() -> int:
             verifier.volume_exists(state["disk_cid"]),
         )
 
+        # The CID envelope records the format the disk was created under and
+        # attach_disk trusts it, so it must match what PVE actually created:
+        # on block-native storage (lvm/lvmthin/zfspool/rbd) PVE always
+        # allocates raw whatever a file-format default says. Tolerant when
+        # either side carries no format (legacy CID, plugin that elides the
+        # field); a real mismatch aborts the run like any other verify.
+        fmt_result = verifier.check_volume_format(state["disk_cid"])
+        print(f"    verify: disk format matches CID envelope = {fmt_result}")
+
+        # DiskCIDMeta.Node is documented "populated for node-local backends;
+        # empty for shared storage" — a shared volume is reachable from any
+        # node, and a stale pin would steer verification and placement at a
+        # node that means nothing. Only assertable when the pool really is a
+        # shared type; on local pools the pin is correct and expected.
+        _disk_pool = bare_disk_volid(state["disk_cid"]).split(":", 1)[0]
+        if verifier.storage_is_shared(_disk_pool):
+            verifier.assert_false(
+                f"node pin in CID for shared storage {_disk_pool!r}",
+                bool(_pve_verify._cid_node(state["disk_cid"])),
+            )
+
         # The parked strategy parks a fresh disk at create, before anything
         # attaches it, so it is never exposed as an unowned free-floating
         # volume. Assert the parker holds it already. Under strategy=free the
@@ -1142,6 +1163,11 @@ def main() -> int:
         call("attach_disk", [state["vm_cid"], state["disk_cid"]])
         state["disk_attached"] = True
         print("attach_disk=ok")
+        # Re-check the format agreement now that the volume is on a VM bus:
+        # attach_disk is the call that consumes the recorded format, so this
+        # is the point where a drifted envelope would have just done damage.
+        fmt_result = verifier.check_volume_format(state["disk_cid"])
+        print(f"    verify: disk format matches CID envelope = {fmt_result}")
 
         step("7a. set_disk_metadata")
         call("set_disk_metadata", [state["disk_cid"], {

@@ -27,6 +27,24 @@ var trimCapableBlockTypes = map[string]struct{}{
 	StorageTypeRBD:     {},
 }
 
+// IsBlockNativeStorage reports whether the given PVE storage type stores disk
+// images as block-native volumes, where PVE has no file format to choose and
+// always allocates raw: the thin-provisioned TRIM-capable set (lvmthin,
+// zfspool, rbd) plus thick lvm, which is block-native but deliberately
+// excluded from the TRIM classification above. Callers use this to record the
+// format PVE actually created (raw) rather than a file-format default that is
+// meaningless on these backends. Matching is case-insensitive; empty or
+// unknown types return false, so an unclassified storage keeps whatever
+// default the caller already had.
+func IsBlockNativeStorage(storageType string) bool {
+	st := strings.ToLower(strings.TrimSpace(storageType))
+	if st == StorageTypeLVM {
+		return true
+	}
+	_, ok := trimCapableBlockTypes[st]
+	return ok
+}
+
 // IsTrimCapable reports whether discard/TRIM passthrough is meaningful for a
 // disk on the given PVE storage type with the given disk image format. Used
 // to auto-resolve pve.disk_performance.discard and .ssd to "on" only where

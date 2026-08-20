@@ -124,6 +124,16 @@ coverage-check: coverage ## Fail if total line coverage < $(COVERAGE_THRESHOLD)%
 	fi
 	@echo "$(GREEN)✓ Coverage threshold met$(RESET)"
 
+.PHONY: py-test
+py-test: ## Run every scripts/*_test.py unit suite with python3 (offline; mocks all PVE traffic)
+	@echo "$(GREEN)Running Python script tests...$(RESET)"
+	@command -v python3 >/dev/null 2>&1 || { echo "$(RED)✗ python3 is required for py-test but not installed$(RESET)"; exit 1; }
+	@set -e; for t in scripts/*_test.py; do \
+		echo "$(CYAN)== $$t$(RESET)"; \
+		python3 "$$t"; \
+	done
+	@echo "$(GREEN)✓ Python script tests passed$(RESET)"
+
 .PHONY: bats
 bats: ## Run the BOSH Acceptance Tests against the configured PVE lab (see docs/certification/bats.md)
 	@if command -v ruby >/dev/null 2>&1 && command -v bundle >/dev/null 2>&1; then \
@@ -205,7 +215,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
 .PHONY: check
-check: fmt-check vet go-blob-check staticcheck lint coverage-check test ## Run fmt-check, vet, go-blob-check, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
+check: fmt-check vet go-blob-check py-test staticcheck lint coverage-check test ## Run fmt-check, vet, go-blob-check, py-test, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security
@@ -393,7 +403,7 @@ docs-intro-overview-html: ## Compile docs/intro-overview/*.md into a single docs
 clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 	@echo "$(GREEN)✓ Clean complete$(RESET)"
 
-.PHONY: help build install tidy test coverage coverage-html coverage-check bats fmt vet lint \
+.PHONY: help build install tidy test coverage coverage-html coverage-check py-test bats fmt vet lint \
         staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean \
         slides-architecture slides-architecture-export slides-architecture-build \

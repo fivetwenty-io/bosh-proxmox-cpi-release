@@ -1359,5 +1359,192 @@ class TestVolumeExistsMultiNode(unittest.TestCase):
         self.assertEqual(mod._cid_node("not-an-envelope"), "")
 
 
+# ---------------------------------------------------------------------------
+# volume_entry / rbd volids
+# ---------------------------------------------------------------------------
+
+class TestVolumeEntry(unittest.TestCase):
+    """volume_entry returns the whole content entry, not just presence, so
+    format and size assertions can be built on it. volume_exists delegates to
+    it, so the node-fallback and raise-when-all-nodes-failed behavior above
+    covers both."""
+
+    @staticmethod
+    def _pvd_cid(volid: str, meta: dict | None = None) -> str:
+        payload: dict = {"v": volid}
+        if meta:
+            payload["m"] = meta
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def _verifier(self) -> PVEVerifier:
+        return PVEVerifier(_token_config())
+
+    def _urlopen_with(self, vol_list: list) -> unittest.mock.MagicMock:
+        payload = {"data": vol_list}
+        return unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(payload))
+
+    def test_returns_matching_entry_whole(self) -> None:
+        v = self._verifier()
+        entry = {"volid": "local-lvm:vm-101-disk-0", "format": "raw", "size": 1073741824}
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
+        with self._urlopen_with([{"volid": "local-lvm:vm-200-disk-0"}, entry]):
+            self.assertEqual(v.volume_entry(cid), entry)
+
+    def test_returns_none_when_absent(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid("local-lvm:vm-101-disk-0")
+        with self._urlopen_with([{"volid": "local-lvm:vm-200-disk-0"}]):
+            self.assertIsNone(v.volume_entry(cid))
+
+    def test_rbd_shaped_volid_matches(self) -> None:
+        """rbd volids are bare '<storage>:vm-<vmid>-disk-N' with no path
+        component and a raw-only format; they must keep matching."""
+        v = self._verifier()
+        cid = self._pvd_cid("ceph-rbd:vm-9001-disk-0", {"pool": "ceph-rbd"})
+        listing = [{"volid": "ceph-rbd:vm-9001-disk-0", "format": "raw", "size": 1073741824}]
+        with self._urlopen_with(listing):
+            self.assertTrue(v.volume_exists(cid))
+            entry = v.volume_entry(cid)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["format"], "raw")
+
+
+# ---------------------------------------------------------------------------
+# check_volume_format
+# ---------------------------------------------------------------------------
+
+class TestCheckVolumeFormat(unittest.TestCase):
+    """check_volume_format compares the CID envelope's recorded format ("m"."f")
+    against the content entry's "format" field."""
+
+    VOLID = "ceph-rbd:vm-9001-disk-0"
+
+    @staticmethod
+    def _pvd_cid(volid: str, meta: dict | None = None) -> str:
+        payload: dict = {"v": volid}
+        if meta:
+            payload["m"] = meta
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def _verifier(self) -> PVEVerifier:
+        return PVEVerifier(_token_config())
+
+    def _urlopen_with(self, vol_list: list) -> unittest.mock.MagicMock:
+        payload = {"data": vol_list}
+        return unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(payload))
+
+    def test_matching_formats_ok(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"pool": "ceph-rbd", "f": "raw"})
+        with self._urlopen_with([{"volid": self.VOLID, "format": "raw"}]):
+            self.assertEqual(v.check_volume_format(cid), "ok")
+
+    def test_match_is_case_insensitive(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"f": "RAW"})
+        with self._urlopen_with([{"volid": self.VOLID, "format": "raw"}]):
+            self.assertEqual(v.check_volume_format(cid), "ok")
+
+    def test_mismatch_raises(self) -> None:
+        """The latent-defect shape: the CID says qcow2 over a volume PVE
+        created as raw (block-native storage ignores file formats)."""
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"f": "qcow2"})
+        with self._urlopen_with([{"volid": self.VOLID, "format": "raw"}]):
+            with self.assertRaises(PVEVerifyError) as ctx:
+                v.check_volume_format(cid)
+        self.assertIn("qcow2", str(ctx.exception))
+        self.assertIn("raw", str(ctx.exception))
+
+    def test_cid_without_format_skips(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"pool": "ceph-rbd"})
+        with self._urlopen_with([{"volid": self.VOLID, "format": "raw"}]):
+            result = v.check_volume_format(cid)
+        self.assertTrue(result.startswith("skipped"))
+
+    def test_entry_without_format_skips(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"f": "raw"})
+        with self._urlopen_with([{"volid": self.VOLID}]):
+            result = v.check_volume_format(cid)
+        self.assertTrue(result.startswith("skipped"))
+
+    def test_absent_volume_raises(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid(self.VOLID, {"f": "raw"})
+        with self._urlopen_with([]):
+            with self.assertRaises(PVEVerifyError):
+                v.check_volume_format(cid)
+
+    def test_cid_format_extraction(self) -> None:
+        mod = sys.modules[PVEVerifier.__module__]
+        self.assertEqual(mod._cid_format(self._pvd_cid(self.VOLID, {"f": "raw"})), "raw")
+        self.assertEqual(mod._cid_format(self._pvd_cid(self.VOLID)), "")
+        self.assertEqual(mod._cid_format("not-an-envelope"), "")
+
+
+# ---------------------------------------------------------------------------
+# storage classification (/storage index)
+# ---------------------------------------------------------------------------
+
+class TestStorageClassification(unittest.TestCase):
+    """storage_type / storage_is_shared mirror StorageInfo.IsShared in
+    internal/pve/storage_info.go so the harness gates its per-type assertions
+    the same way the CPI classifies backends."""
+
+    INDEX = [
+        {"storage": "ceph-rbd", "type": "rbd", "content": "images"},
+        {"storage": "local-lvm-thin", "type": "lvmthin", "content": "images"},
+        {"storage": "shared-dir", "type": "dir", "content": "images", "shared": 1},
+        {"storage": "plain-dir", "type": "dir", "content": "images", "shared": 0},
+        {"storage": "ceph-fs", "type": "cephfs", "content": "images"},
+    ]
+
+    def _verifier(self) -> PVEVerifier:
+        v = PVEVerifier(_token_config())
+
+        def fake_get(path: str):
+            if path != "/storage":
+                raise AssertionError(f"unexpected GET {path}")
+            return self.INDEX
+
+        v._get = fake_get  # type: ignore[method-assign]
+        return v
+
+    def test_storage_entry_found(self) -> None:
+        v = self._verifier()
+        self.assertEqual(v.storage_entry("ceph-rbd"), self.INDEX[0])
+
+    def test_storage_entry_absent_is_none(self) -> None:
+        self.assertIsNone(self._verifier().storage_entry("nope"))
+
+    def test_storage_type(self) -> None:
+        v = self._verifier()
+        self.assertEqual(v.storage_type("ceph-rbd"), "rbd")
+        self.assertEqual(v.storage_type("local-lvm-thin"), "lvmthin")
+        self.assertEqual(v.storage_type("nope"), "")
+
+    def test_shared_by_type(self) -> None:
+        v = self._verifier()
+        self.assertTrue(v.storage_is_shared("ceph-rbd"))
+        self.assertTrue(v.storage_is_shared("ceph-fs"))
+
+    def test_local_types_not_shared(self) -> None:
+        v = self._verifier()
+        self.assertFalse(v.storage_is_shared("local-lvm-thin"))
+        self.assertFalse(v.storage_is_shared("plain-dir"))
+
+    def test_shared_flag_wins_over_local_type(self) -> None:
+        """PVE reports the storage.cfg shared flag as an integer boolean; a
+        dir storage flagged shared=1 is shared even though the type is not."""
+        self.assertTrue(self._verifier().storage_is_shared("shared-dir"))
+
+    def test_unknown_storage_not_shared(self) -> None:
+        self.assertFalse(self._verifier().storage_is_shared("nope"))
+
+
 if __name__ == "__main__":
     unittest.main()

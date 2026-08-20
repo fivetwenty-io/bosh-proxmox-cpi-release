@@ -539,11 +539,45 @@ def fetch_storage_index(cpi_cfg: dict) -> "list[dict]":
     return data
 
 
+def disk_storage_types(cfg: dict) -> "tuple[str, ...]":
+    """Return the storage types disk-pool autodetection accepts.
+
+    tier1.disk_storage_types (a YAML list of PVE storage type names, e.g.
+    ``[lvmthin, rbd]``) overrides the built-in local-only default, letting a
+    lab widen autodetection to shared types like rbd without naming pools
+    explicitly. Absent or empty keeps the default tuple, so existing configs
+    behave identically.
+
+    Args:
+        cfg: Validated config dict from load_config.
+
+    Returns:
+        Tuple of lowercase storage type names.
+
+    Raises:
+        RuntimeError: tier1.disk_storage_types present but not a list of
+                      non-empty strings.
+    """
+    raw = cfg.get("tier1", {}).get("disk_storage_types")
+    if raw is None or raw == []:
+        return _LOCAL_DISK_TYPES
+    if not isinstance(raw, list) or not all(
+        isinstance(t, str) and t.strip() for t in raw
+    ):
+        raise RuntimeError(
+            "tier1.disk_storage_types must be a list of non-empty storage type "
+            f"names (e.g. [lvmthin, rbd]), got {raw!r}"
+        )
+    return tuple(t.strip().lower() for t in raw)
+
+
 def detect_disk_storage_pools(cfg: dict) -> "list[str]":
-    """Autodetect local disk storage pools on the PVE host.
+    """Autodetect disk storage pools on the PVE host.
 
     Calls build_cpi_config to resolve connection details, fetches the PVE
-    storage index via the API, and filters to local image-capable pools.
+    storage index via the API, and filters to image-capable pools whose type
+    is accepted (the local-only default, or tier1.disk_storage_types when
+    set — see disk_storage_types).
 
     Args:
         cfg: Validated config dict from load_config.
@@ -552,11 +586,13 @@ def detect_disk_storage_pools(cfg: dict) -> "list[str]":
         Sorted list of storage pool names suitable for disk_storage_override.
 
     Raises:
-        RuntimeError: Network error, auth failure, or malformed response.
+        RuntimeError: Network error, auth failure, malformed response, or an
+                      invalid tier1.disk_storage_types value.
     """
+    types = disk_storage_types(cfg)
     cpi_cfg = build_cpi_config(cfg, dry_run=False)
     entries = fetch_storage_index(cpi_cfg)
-    return select_local_disk_pools(entries)
+    return select_local_disk_pools(entries, types=types)
 
 
 # ---------------------------------------------------------------------------

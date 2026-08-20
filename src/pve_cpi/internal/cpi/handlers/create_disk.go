@@ -410,6 +410,10 @@ func HandleCreateDisk(deps Deps) Handler {
 			volExt = "." + formatArg
 		}
 
+		// Recording only; formatArg (what is sent to PVE) is untouched, and
+		// an operator-set format at any layer still wins verbatim.
+		format = recordedDiskFormat(format, formatFound, deps.Config.VMDiskFormat, storageType)
+
 		maxAttempts, lockAttempts := createDiskAttemptBudgets(deps)
 
 		// ----------------------------------------------------------------
@@ -465,9 +469,20 @@ func HandleCreateDisk(deps Deps) Handler {
 		// local-backend deployments). AZ is set from
 		// cloud_properties.availability_zone when provided; otherwise left
 		// empty so the CID carries no AZ constraint.
+		//
+		// DiskCIDMeta.Node documents "populated for node-local backends;
+		// empty for shared storage" — a shared-storage volume is reachable
+		// from any node, so the node the create happened to run on is not a
+		// property of the disk, and the fault-domain reader only consults
+		// Node for local backends anyway. Honor the contract here rather
+		// than recording a meaningless pin.
+		metaNode := node
+		if backend.Kind() == pve.BackendShared {
+			metaNode = ""
+		}
 		meta := &pve.DiskCIDMeta{
 			Pool: storage,
-			Node: node,
+			Node: metaNode,
 			AZ:   cloudProps.AvailabilityZone,
 			Opts: diskPerfOpts,
 			// The parked strategy promises this disk a parker anchor whenever
@@ -584,6 +599,26 @@ func applyCreateDiskTags(ctx context.Context, deps Deps, node, vmCID, diskCID st
 			log.Err(applyErr),
 		)
 	}
+}
+
+// recordedDiskFormat returns the disk-image format to record in the CID
+// envelope. The recorded format must describe the volume PVE actually
+// creates: block-native storages (lvm/lvmthin/zfspool/rbd) have no file
+// format at all — PVE always allocates raw and rejects qcow2 — so when no
+// layer expressed a preference (neither a call/profile disk_format nor the
+// global vm_disk_format), the built-in qcow2 fallback would record a format
+// the volume does not have. An operator-expressed format at any layer is
+// returned verbatim, and an unknown storage type ("") keeps the resolved
+// default — the fail-open shape every other type-dependent decision in
+// create_disk takes.
+func recordedDiskFormat(resolved string, formatFound bool, vmDiskFormat, storageType string) string {
+	if formatFound || strings.TrimSpace(vmDiskFormat) != "" {
+		return resolved
+	}
+	if pve.IsBlockNativeStorage(storageType) {
+		return diskFormatRaw
+	}
+	return resolved
 }
 
 // attemptCreateVolume allocates a synthetic disk VMID and calls CreateVolume,

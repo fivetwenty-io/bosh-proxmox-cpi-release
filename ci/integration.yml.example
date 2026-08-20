@@ -102,6 +102,19 @@ tier1:
   #   disk_storage_pools: auto
   disk_storage_pools: []
 
+  # Storage types the `auto` detection accepts (optional). The default keeps
+  # autodetection local-only: lvm, lvmthin, zfspool, dir. Set a list to widen
+  # or narrow it; adding rbd, for example, lets an `auto` run pick up Ceph
+  # rbd pools alongside the local types. Shared pools named explicitly in
+  # disk_storage_pools work without this key; it only governs `auto`.
+  # The per-pool lifecycle pass exercises persistent disks only: vm_storage
+  # and stemcell_storage still come from bosh_vars, so the root disk does not
+  # move to the detected pool.
+  #
+  # Example widening autodetect to Ceph rbd:
+  #   disk_storage_types: [lvm, lvmthin, zfspool, dir, rbd]
+  # disk_storage_types: []
+
   # Network-handler matrix (optional). Exercises create_network / delete_network
   # — the BOSH CPI managed-network methods — against live PVE, with out-of-band
   # verification (scripts/_pve_verify.py confirms real cluster state, not just the

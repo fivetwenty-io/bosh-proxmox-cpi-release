@@ -189,7 +189,14 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
     _auto = raw_pools == "auto" or raw_pools == ["auto"]
     if _auto:
         if _dry_run:
-            print("==> tier 1: would autodetect local disk storage pools (lvm/lvmthin/zfspool/dir)")
+            try:
+                _types = _integration.disk_storage_types(cfg)
+            except RuntimeError as exc:
+                print(f"tier 1: disk_storage_types error: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"==> tier 1: would autodetect disk storage pools ({'/'.join(_types)})"
+            )
             pools = []  # fall through to single-run path below
         else:
             try:

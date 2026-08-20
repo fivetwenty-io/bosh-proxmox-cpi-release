@@ -178,7 +178,8 @@ cp ci/integration.yml.example ci/integration.yml
 | `vm_memory_mib` | RAM for the test VM in MiB | `1024` |
 | `disk_size_mib` | Persistent disk size in MiB | `1024` |
 | `stemcell_path` | Absolute path to stemcell tarball; leave empty to use `STEMCELL_PATH` env | `""` |
-| `disk_storage_pools` | Optional. Empty list = single run on `pve_disk_storage`. A list of pool names runs Tier 1 once per pool. The string `auto` autodetects local image-capable pools (lvm/lvmthin/zfspool/dir) via the PVE API | `[]` |
+| `disk_storage_pools` | Optional. Empty list = single run on `pve_disk_storage`. A list of pool names runs Tier 1 once per pool. The string `auto` autodetects image-capable pools via the PVE API, accepting the types in `disk_storage_types` (default: lvm/lvmthin/zfspool/dir) | `[]` |
+| `disk_storage_types` | Optional. Storage types the `auto` detection accepts; absent or empty keeps the local-only default `[lvm, lvmthin, zfspool, dir]`. Add `rbd` to let `auto` pick up Ceph rbd pools (see the Ceph and rbd section below) | `[]` |
 | `network_test` | Optional. Exercises `create_network`/`delete_network` against live PVE (see below) | *(see below)* |
 | `parked_disk` | Optional. Tunes the parked detached-disk pass, which runs by default (see below) | *(see below)* |
 
@@ -237,6 +238,26 @@ The pass leaves its parker VM in place. That is the design working as intended �
 qm set <parker-vmid> --protection 0 && qm destroy <parker-vmid> --purge
 ```
 
+#### Ceph and rbd storage
+
+The harness is storage-type aware: it looks up each disk pool's type in the same `/storage` index the CPI classifies backends from, and gates two assertions on what it finds.
+
+- Format agreement, on every pool type. The CID envelope records the disk-image format the disk was created under, and `attach_disk` trusts that record, so the harness compares it against the `format` PVE reports in the storage content listing after `create_disk` and again after `attach_disk`. Block-native pools (lvm, lvmthin, zfspool, and rbd) always hold raw volumes, so this is where a file-format default leaking into the envelope gets caught. The check reports `skipped` when either side carries no format, and fails the run on a real mismatch.
+
+- No node pin on shared pools. A shared-storage volume is reachable from any node, so its CID must carry no node pin. This assertion activates only when the disk pool's type is shared (rbd, cephfs, nfs, cifs, glusterfs, or pbs, or a pool flagged `shared` in storage.cfg); on local pools the pin is correct and expected.
+
+To run the lifecycle pass against an rbd pool, we can either name it explicitly in `disk_storage_pools` (shared pools are always accepted there), or widen autodetection with `disk_storage_types`:
+
+```yaml
+tier1:
+  disk_storage_pools: auto
+  disk_storage_types: [lvm, lvmthin, zfspool, dir, rbd]
+```
+
+Stemcells stay on file-based storage. The CPI's storage policy accepts cephfs for `pve_stemcell_storage` (it is a filesystem and holds the imported qcow2 like any dir or nfs pool) and rejects rbd, which has no file content type. A Ceph cluster therefore pairs `pve_stemcell_storage` on cephfs with disk pools on rbd.
+
+One coverage caveat: the per-pool matrix overrides `disk_storage` only. `vm_storage` (the root and ephemeral disks) and `stemcell_storage` still come from `bosh_vars`, so an rbd pass exercises the persistent-disk paths against rbd while the VM's root disk stays wherever `pve_vm_storage` points.
+
 **`tier2` — BOSH director smoke**
 
 | Key | Description | Example |
@@ -260,7 +281,7 @@ qm set <parker-vmid> --protection 0 && qm destroy <parker-vmid> --purge
 
 Beyond asserting on the CPI binary's JSON-RPC return values, Tier 1 independently confirms real cluster state by querying the PVE REST API directly (`scripts/_pve_verify.py`). The verifier reuses the **same host and authentication as the CPI config** — `api_token` becomes an `Authorization: PVEAPIToken=` header; a `password` config performs a `/access/ticket` login and uses the `PVEAuthCookie`. It queries list endpoints (`/cluster/sdn/vnets`, `/cluster/sdn/zones`, `/nodes/{node}/qemu`, `/nodes/{node}/network`, and storage content) and tests membership, which sidesteps PVE's inconsistent 404/500 behavior on per-id GETs.
 
-Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present (and already on a parker VM, under the parked strategy); `detach_disk` → the disk is on a parker VM (or free-floating, under the `free` strategy); `attach_disk` → the parker released the slot and its protection flag is back on; `delete_disk` → the volume is gone and no parker still references it; `delete_vm` → VM gone, parker still standing; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke — e.g., `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
+Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `create_vm` → VM present; `create_disk` → volume present, the CID's recorded disk-image format matches the `format` PVE reports for the volume, no node pin in the CID when the pool is a shared type, and the disk is already on a parker VM under the parked strategy; `detach_disk` → the disk is on a parker VM (or free-floating, under the `free` strategy); `attach_disk` → the parker released the slot, its protection flag is back on, and the format agreement is re-checked; `delete_disk` → the volume is gone and no parker still references it; `delete_vm` → VM gone, parker still standing; `delete_network` → vnet/bridge gone. A failed verification aborts the run exactly like a CPI error. `scripts/_pve_verify.py` is stdlib-only and can be run standalone for a connectivity smoke — e.g., `./scripts/_pve_verify.py --config cpi.json vnet itvnet`.
 
 ### `scripts/lifecycle` environment variables
 

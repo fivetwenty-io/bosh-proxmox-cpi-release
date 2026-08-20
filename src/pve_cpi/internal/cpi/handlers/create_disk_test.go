@@ -1298,11 +1298,12 @@ func TestHandleCreateDisk_ExplicitOptOut_ByteIdenticalCID(t *testing.T) {
 		t.Fatalf("expected non-empty string result, got %T %v", result, result)
 	}
 
-	// Construct the expected CID as EncodeDiskCID would without Opts.
+	// Construct the expected CID as EncodeDiskCID would without Opts. Node is
+	// empty: the default test resolver classifies every storage as shared,
+	// and shared-backend CIDs carry no node pin (DiskCIDMeta.Node contract).
 	bareCID := fmt.Sprintf("%s:vm-%d-disk-0", capturedStorage, capturedVMID)
 	expectedCID, encErr := pve.EncodeDiskCID(bareCID, &pve.DiskCIDMeta{
 		Pool:   capturedStorage,
-		Node:   deps.Config.Node,
 		Format: "qcow2",
 	})
 	if encErr != nil {
