@@ -128,8 +128,17 @@ Each park operation records a provenance entry in the parker VM's PVE
 description field inside a structured sentinel comment:
 
 ```
-<!--BOSH:{"bosh_parked_disks":{"<bare-volid>":{"disk_cid":"...","source_vm_cid":"...","parked_at":"<RFC3339>","node":"<node>","director_id":"..."}}}-->
+<!--BOSH:{"bosh_parked_disks":{"<key>":{"disk_cid":"...","source_vm_cid":"...","parked_at":"<RFC3339>","node":"<node>","director_id":"...","volid":"...","slot":"..."}}}-->
 ```
+
+Two keying generations coexist in the map. Legacy disks are keyed by the bare
+volid and omit `volid` and `slot`. Stable-ID disks (see
+[Stable disk identity and ownership transfer](#stable-disk-identity-and-ownership-transfer))
+are keyed by their `bpd-` identity token, because a reassignment renames the
+volume and a volid-keyed record would be orphaned by the first transfer.
+Readers must accept both: match the key against the bare volid and the token,
+and match the `volid` field against the volume's current name. Both
+`disk-audit` and `pve-cid locate` do.
 
 Fields:
 
@@ -140,6 +149,8 @@ Fields:
 | `parked_at` | RFC 3339 timestamp of the park operation. |
 | `node` | PVE cluster node the disk lives on. |
 | `director_id` | BOSH director UUID from the calling director's request context. Empty when the request carries no director UUID. Not a config property — no manifest setting controls it. |
+| `volid` | Stable-ID entries only. The volid the parker holds (or, mid-transfer, is about to hold) the volume under. During a detach-side transfer this is the intent record's pre-move volid, rewritten to the landed name when the transfer completes. |
+| `slot` | Stable-ID entries only. The parker bus slot the disk occupies, or the slot a detach-side transfer targets. |
 
 Provenance writes are best-effort: a failure logs a warning but does not block
 the park. Because PVE has no atomic read-modify-write on VM descriptions,
@@ -294,6 +305,87 @@ them, and `qm destroy --purge` frees the volume behind an `unusedN` entry as
 readily as one in a `scsiN` slot.
 
 ---
+
+## Stable disk identity and ownership transfer
+
+Disks created under the parked strategy carry a stable identity token in
+their CID metadata: `bpd-` plus 16 lowercase hex characters, 20 bytes,
+exactly PVE's drive-serial cap. On the PVE side the token rides the drive
+entry as a `serial=` option, and that is the identity that survives what the
+envelope volid cannot: PVE's `move_disk` reassignment renames a volume to
+match its new owner, so after the first transfer the CID's embedded volid is
+only a birth record. Every disk handler resolves a CID in this order: a
+cluster scan matching the serial (and the birth volid, in the same pass),
+then the parker provenance sentinel (which covers a transfer a crash left
+mid-flight), then the birth volid itself. Legacy CIDs skip all of it and stay
+volid-resolved forever, since Director databases keep old CIDs indefinitely.
+
+We deliberately do not adopt legacy disks into the scheme. A CID is immutable
+once the Director stores it, so a token generated after the fact could never
+be recorded where resolution looks for it; a serial not present in any CID is
+useless for CID-to-volume resolution. Legacy disks keep the config-edit
+transfer path for life, and disks created under the `free` strategy get no
+token at all.
+
+### How a stable-ID disk moves
+
+The attach direction (parker to VM) reassigns the attached parker slot
+directly onto the target VM's slot. A parker is never running, so PVE permits
+the direct move, and the full drive option string — serial and performance
+options, baked onto the parker slot just before the move — rides along. The
+volume lands renamed for the VM, the holder sentinel is written, and only
+then is the parker's provenance entry removed, so a crash at any point leaves
+at least one carrier of the identity.
+
+The detach direction (VM to parker) cannot move the attached slot — a running
+source VM refuses direct reassignment — so it detaches the slot to an
+`unusedN` entry and reassigns that. Unused entries carry no options, so the
+serial is re-applied on the landed parker slot afterwards. The ordering
+covers the window in between: the parker's provenance record (the intent,
+naming the volid and the target slot) is written before the source slot is
+deleted, and a retry resumes the transfer from whichever step the failure
+left behind.
+
+Two operations deliberately avoid the SDK's ordinary detach for these disks.
+After a transfer the volume is named for whichever VM holds it, and PVE
+physically removes an unused volume its holder owns when the entry is swept —
+so a config-edit detach of a renamed disk would delete it. `delete_vm`
+therefore preserves a still-attached stable-ID disk by transferring it to a
+parker (the drive serial marks it as persistent even though the embedded VMID
+matches the VM being deleted), and `delete_disk` of a parked renamed disk
+uses that same sweep semantics on purpose, as the deletion itself.
+
+### Consequences worth knowing
+
+- A stable-ID disk's detached state is always parked, whatever
+  `detached_disk_strategy` currently says. A renamed volume cannot safely be
+  made free-floating (removing its last config reference deallocates it), so
+  the anchor promise recorded in the CID outlives a strategy flip to `free`.
+
+- PVE reassignment is same-node only. Under the parked strategy the detach
+  parks on the source VM's own node, so the parker and a VM recreated on that
+  node are co-located by construction. When a shared-storage VM is recreated
+  on a different node, a fresh (never-transferred, still birth-named) disk
+  attaches through the config-edit path as before; a previously transferred
+  (parker-named) disk cannot, and `attach_disk` refuses with the two operator
+  escapes: migrate the stopped parker to the VM's node (`qm migrate`), or
+  recreate the VM pinned to the disk's node.
+
+- A volume a snapshot references refuses reassignment outright. For a
+  birth-named disk the attach falls back to the config-edit path, which the
+  snapshot machinery already governs; for a parker-named disk there is no
+  safe fallback and the error names the snapshot as the thing to remove.
+
+- The serial is written only at attach boundaries, never onto an
+  already-attached disk: a mid-life serial edit on a running VM diverges
+  silently from the live device until the next full restart (live-spike
+  result). The guest sees the serial appear on a freshly attached device and
+  keeps it for the disk's life.
+
+- The description sentinels follow the token: `bosh_attached_disks`,
+  `bosh_parked_disks`, and `bosh_disk_metadata` entries for stable-ID disks
+  are keyed by the token instead of the volid, with volid-keyed legacy
+  entries readable forever.
 
 ## Strategy comparison
 

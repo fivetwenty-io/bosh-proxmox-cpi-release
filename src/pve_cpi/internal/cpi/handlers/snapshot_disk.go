@@ -52,10 +52,18 @@ func HandleSnapshotDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("snapshot_disk: args[0] disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "snapshot_disk", diskCID)
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "snapshot_disk", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
+		// Resolve to the volume's current name (identity seam): the holder
+		// scan below matches VM config entries, which carry the
+		// post-reassignment name for stable-ID disks.
+		rd, resolveErr := resolveDiskForOp(ctx, deps, "snapshot_disk", diskCID, bareDiskCID, meta)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		bareDiskCID = rd.volid
 
 		// metadata arg is optional and may be null or absent.
 		var metadata map[string]any

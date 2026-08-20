@@ -166,6 +166,43 @@ def _bare_disk_cid(disk_cid: str) -> str:
     return volid
 
 
+def disk_stable_id(disk_cid: str) -> str:
+    """Return the stable identity token recorded in a CID's metadata, or "".
+
+    The CPI records the token under "m"."id" (DiskCIDMeta.ID in
+    internal/pve/disk.go) for disks created under the parked strategy. The
+    token also rides the PVE side as a drive serial= option, which is what
+    survives the volume rename PVE performs on every move_disk reassignment —
+    so identity-aware matching here mirrors the CPI's own resolution order:
+    serial first, envelope volid as the birth-record fallback. Best-effort
+    like _cid_node: a legacy envelope answers "".
+    """
+    try:
+        meta = _decode_cid_payload(disk_cid).get("m")
+    except PVEVerifyError:
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    sid = meta.get("id")
+    return sid if isinstance(sid, str) else ""
+
+
+def _drive_entry_matches(value: str, bare_volid: str, stable_id: str) -> bool:
+    """True when a PVE drive value names the disk, by volid or by serial.
+
+    Mirrors internal/pve/disk.go matchDiskIdentity: the value matches when its
+    bare volid equals bare_volid, or (for stable-ID disks) when its option
+    string carries serial=<stable_id> — the identity that survives the rename
+    a reassignment performs.
+    """
+    parts = value.split(",")
+    if parts[0].strip() == bare_volid:
+        return True
+    if not stable_id:
+        return False
+    return any(p.strip() == f"serial={stable_id}" for p in parts[1:])
+
+
 def _cid_node(disk_cid: str) -> str:
     """Return the node recorded in a CID's metadata, or "" when it carries none.
 
@@ -481,6 +518,11 @@ class PVEVerifier:
         bare_cid = _bare_disk_cid(disk_cid)
         if ":" not in bare_cid:
             raise PVEVerifyError(f"disk_cid {disk_cid!r} is not '<storage>:<volid>'")
+        # A stable-ID disk's volume is renamed by every reassignment; the
+        # storage content listing then names it by its CURRENT volid, not the
+        # envelope's birth record. Accept either. The storage prefix is stable
+        # across renames, so the listing path below stays correct.
+        accepted = {bare_cid, self.current_disk_volid(disk_cid)}
         storage = bare_cid.split(":", 1)[0]
         # A node-local storage's content listing is per node, and the CPI places
         # a disk on whichever node has headroom -- not necessarily the configured
@@ -519,7 +561,7 @@ class PVEVerifier:
                 continue
             answered = True
             for e in entries:
-                if e.get("volid") == bare_cid:
+                if e.get("volid") in accepted:
                     return e
         if not answered and last_err is not None:
             raise last_err
@@ -692,6 +734,7 @@ class PVEVerifier:
         prevent — which a single-holder lookup would hide.
         """
         bare = _bare_disk_cid(disk_cid)
+        stable_id = disk_stable_id(disk_cid)
         holders: list[tuple[int, str]] = []
         for vmid, node in self.cluster_vms():
             try:
@@ -706,9 +749,33 @@ class PVEVerifier:
             for key, value in config.items():
                 if not _DISK_SLOT_RE.match(key):
                     continue
-                if str(value).split(",", 1)[0].strip() == bare:
+                if _drive_entry_matches(str(value), bare, stable_id):
                     holders.append((vmid, key))
         return sorted(holders)
+
+    def current_disk_volid(self, disk_cid: str) -> str:
+        """Return the volid the cluster currently knows the disk's volume by.
+
+        For a stable-ID disk a move_disk reassignment renames the volume, so
+        the envelope volid is only its birth record; the drive entry carrying
+        the serial= token names it now. Falls back to the birth volid when no
+        holder carries the serial (never transferred, or free-floating).
+        """
+        bare = _bare_disk_cid(disk_cid)
+        stable_id = disk_stable_id(disk_cid)
+        if not stable_id:
+            return bare
+        for vmid, node in self.cluster_vms():
+            try:
+                config = self.qemu_config(vmid, node)
+            except PVEVerifyError:
+                continue
+            for key, value in config.items():
+                if not _DISK_SLOT_RE.match(key):
+                    continue
+                if _drive_entry_matches(str(value), bare, stable_id):
+                    return str(value).split(",", 1)[0].strip()
+        return bare
 
     def cluster_vms(self) -> list[tuple[int, str]]:
         """Return every (vmid, node) VM in the cluster, ascending by VMID.
@@ -787,6 +854,27 @@ class PVEVerifier:
             return {}
         disks = sentinel.get("bosh_parked_disks") if isinstance(sentinel, dict) else None
         return disks if isinstance(disks, dict) else {}
+
+    def parked_disk_recorded(self, vmid: "int | str", disk_cid: str) -> bool:
+        """True when a parker's provenance sentinel records this disk.
+
+        Dual-keyed like the CPI's own removal: legacy entries are keyed by the
+        bare volid; stable-ID entries are keyed by the bpd- token and name the
+        current volid in their "volid" field. All three matches are accepted so
+        the harness keeps proving provenance across both generations.
+        """
+        entries = self.parked_disks(vmid)
+        bare = _bare_disk_cid(disk_cid)
+        stable_id = disk_stable_id(disk_cid)
+        if stable_id and stable_id in entries:
+            return True
+        if bare in entries:
+            return True
+        current = self.current_disk_volid(disk_cid)
+        for entry in entries.values():
+            if isinstance(entry, dict) and entry.get("volid") in (bare, current):
+                return True
+        return False
 
     # -- assertion helpers ----------------------------------------------------
 

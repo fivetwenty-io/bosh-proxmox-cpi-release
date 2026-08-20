@@ -70,6 +70,15 @@ func printDecodedTable(w io.Writer, d *DecodedCID) {
 		if d.AZ != "" {
 			_, _ = fmt.Fprintf(w, "az: %s\n", d.AZ)
 		}
+		if d.Anchor {
+			_, _ = fmt.Fprintln(w, "anchor: true")
+		}
+		if d.Format != "" {
+			_, _ = fmt.Fprintf(w, "format: %s\n", d.Format)
+		}
+		if d.StableID != "" {
+			_, _ = fmt.Fprintf(w, "stable_id: %s\n", d.StableID)
+		}
 		optKeys := make([]string, 0, len(d.Opts))
 		for k := range d.Opts {
 			optKeys = append(optKeys, k)

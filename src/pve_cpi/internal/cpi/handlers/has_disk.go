@@ -49,10 +49,27 @@ func HandleHasDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("has_disk: disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "has_disk", diskCID)
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "has_disk", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
+		// Resolve the CID to the volume's current name. A stable-ID disk the
+		// identity scan finds on any VM (or mid-transfer, findable only via
+		// its parker's intent record) exists by definition — a config entry
+		// references it — so the storage probe below is only needed for the
+		// unreferenced case, against the resolved name.
+		rd, resolveErr := resolveDiskForOp(ctx, deps, "has_disk", diskCID, bareDiskCID, meta)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		if rd.holder != nil || rd.intent != nil {
+			deps.Log(ctx).Debug("has_disk: resolved by identity scan",
+				log.String("disk_cid", diskCID),
+				log.String("volid", rd.volid),
+			)
+			return true, nil
+		}
+		bareDiskCID = rd.volid
 
 		// ----------------------------------------------------------------
 		// 2. Parse disk CID → storage + volume.

@@ -1715,8 +1715,20 @@ func TestHandleCreateDisk_ParkedStrategy_ParksFreshDisk(t *testing.T) {
 	if !ok || diskCID == "" {
 		t.Fatalf("expected non-empty string disk_cid, got %#v", result)
 	}
-	if attachedVolid != createdVolid {
-		t.Errorf("park attach volid: want %q, got %q", createdVolid, attachedVolid)
+	// The park attach bakes the stable-ID serial into the volid argument so
+	// the parker slot carries the disk's identity (D13).
+	wantPrefix := createdVolid + ",serial=bpd-"
+	if !strings.HasPrefix(attachedVolid, wantPrefix) {
+		t.Errorf("park attach volid: want prefix %q, got %q", wantPrefix, attachedVolid)
+	}
+	serial := strings.TrimPrefix(attachedVolid, createdVolid+",serial=")
+	if len(serial) != 20 {
+		t.Errorf("park attach serial: want 20-byte bpd- token, got %q (%d bytes)", serial, len(serial))
+	}
+	// The serial baked onto the parker slot must be the one recorded in the
+	// returned CID envelope.
+	if _, meta, decErr := pve.ParseEncodedDiskCID(diskCID); decErr != nil || meta == nil || meta.ID != serial {
+		t.Errorf("CID stable ID: want %q recorded in the envelope, got meta=%+v (err=%v)", serial, meta, decErr)
 	}
 	if attachedSlot != "scsi0" {
 		t.Errorf("park attach slot: want scsi0, got %q", attachedSlot)

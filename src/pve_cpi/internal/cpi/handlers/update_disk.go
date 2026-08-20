@@ -77,10 +77,20 @@ func HandleUpdateDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("update_disk: args[0] disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "update_disk", diskCID)
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "update_disk", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
+		// Resolve to the volume's current name (identity seam): the locator,
+		// slot resolver, and option RMW below all read the VM config, which
+		// carries the post-reassignment name for stable-ID disks. The RMW
+		// merges from the live option string, so the identity serial is
+		// preserved without special handling.
+		rd, resolveErr := resolveDiskForOp(ctx, deps, "update_disk", diskCID, bareDiskCID, meta)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		bareDiskCID = rd.volid
 
 		// update_spec may be null or missing; treat as empty map.
 		var updateSpec map[string]any

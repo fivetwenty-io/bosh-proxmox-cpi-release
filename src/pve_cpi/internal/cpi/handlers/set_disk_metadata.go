@@ -80,10 +80,20 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("set_disk_metadata: disk_cid must be a non-empty string")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "set_disk_metadata", diskCID)
+		bareDiskCID, decodedMeta, decErr := decodeDiskCID(ctx, deps, "set_disk_metadata", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
+		// Resolve to the volume's current name (identity seam): the hosting
+		// scan matches VM config entries, which carry the post-reassignment
+		// name for stable-ID disks. The metadata sentinel is keyed by
+		// rd.sentinelKey() — the stable ID when the disk has one — so the
+		// record survives future renames.
+		rd, resolveErr := resolveDiskForOp(ctx, deps, "set_disk_metadata", diskCID, bareDiskCID, decodedMeta)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		bareDiskCID = rd.volid
 
 		var metadata map[string]any
 		if err := json.Unmarshal(args[1], &metadata); err != nil {
@@ -129,7 +139,7 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			vmid := matches[0].vmid
 			lockOwner := fmt.Sprintf("set_disk_metadata/%d", vmid)
 			lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, deps.Log(ctx), func() error {
-				if err := persistMetadata(ctx, deps, matches[0], bareDiskCID, metadata); err != nil {
+				if err := persistMetadata(ctx, deps, matches[0], rd.sentinelKey(), metadata); err != nil {
 					return err
 				}
 				if len(diskTags) > 0 {

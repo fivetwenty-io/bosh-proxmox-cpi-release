@@ -155,7 +155,7 @@ func HandleGetDisks(deps Deps) Handler {
 				continue
 			}
 
-			if recordedCID, ok := recordedCIDs[bareVolid]; ok && recordedCID != "" {
+			if recordedCID := recordedCIDForDrive(recordedCIDs, optStr, bareVolid); recordedCID != "" {
 				diskCIDs = append(diskCIDs, recordedCID)
 				recordedCount++
 			} else {
@@ -187,6 +187,19 @@ func HandleGetDisks(deps Deps) Handler {
 
 		return diskCIDs, nil
 	})
+}
+
+// recordedCIDForDrive looks up the Director-supplied CID recorded for one
+// drive entry, dual-keyed: stable-ID disks are recorded under the bpd- serial
+// their drive entry carries (rename-proof), legacy disks under the bare
+// volid. Empty when neither key has an entry.
+func recordedCIDForDrive(recordedCIDs map[string]string, optStr, bareVolid string) string {
+	if serial, hasSerial := pve.StableIDFromDriveOptStr(optStr); hasSerial {
+		if cid := recordedCIDs[serial]; cid != "" {
+			return cid
+		}
+	}
+	return recordedCIDs[bareVolid]
 }
 
 // isCloudinitDrive reports whether a disk option string represents a cloudinit

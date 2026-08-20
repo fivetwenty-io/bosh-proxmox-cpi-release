@@ -480,6 +480,10 @@ func HandleCreateDisk(deps Deps) Handler {
 		if backend.Kind() == pve.BackendShared {
 			metaNode = ""
 		}
+		stableID, idErr := stableIDForNewDisk(deps)
+		if idErr != nil {
+			return nil, idErr
+		}
 		meta := &pve.DiskCIDMeta{
 			Pool: storage,
 			Node: metaNode,
@@ -495,6 +499,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			// value this disk was created under instead of re-deriving it from
 			// whatever vm_disk_format says at attach time.
 			Format: format,
+			ID:     stableID,
 		}
 		// With disk_cid_compression enabled, a CID whose pvd- form would
 		// overflow MySQL-backed Directors' varchar(255) disk_cid column is
@@ -548,7 +553,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// to the Director unowned (see parkFreshDisk). Runs after the CID
 		// length check: a CID that is about to be rejected should not spend
 		// the parker round trips first.
-		if parkErr := parkFreshDisk(ctx, deps, node, diskCID, bareDiskCID); parkErr != nil {
+		if parkErr := parkFreshDisk(ctx, deps, node, diskCID, bareDiskCID, stableID); parkErr != nil {
 			return nil, parkErr
 		}
 
@@ -561,6 +566,23 @@ func HandleCreateDisk(deps Deps) Handler {
 		success = true
 		return diskCID, nil
 	})
+}
+
+// stableIDForNewDisk generates the disk's stable identity token (D13) when
+// the parked strategy is enabled. The token is recorded in the CID and baked
+// onto the parker slot as a drive serial, and is the identity the CPI
+// resolves by after a move_disk reassignment renames the volume — the
+// envelope volid becomes a birth record. Free-strategy disks stay fully
+// legacy: no token, volid-resolved, config-edit transfers.
+func stableIDForNewDisk(deps Deps) (string, error) {
+	if !deps.Config.DetachedDiskParkedEnabled() {
+		return "", nil
+	}
+	stableID, err := pve.GenerateDiskStableID()
+	if err != nil {
+		return "", cpierrors.Wrap(err, "create_disk: generate stable disk ID")
+	}
+	return stableID, nil
 }
 
 // applyCreateDiskTags applies cloud_properties.tags to the VM the new disk
@@ -788,7 +810,7 @@ func rollbackCreatedVolume(
 // Failure is fail-closed: the caller returns the error, the deferred rollback
 // unparks (best-effort, in case the park half-committed) and deletes the
 // volume, and a Director retry re-creates from scratch.
-func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID string) error {
+func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID, stableID string) error {
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
@@ -807,7 +829,9 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID st
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
 		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
 	}
-	pctx := pve.ParkContext{DiskCID: diskCID}
+	// StableID makes the park attach bake the serial= identity onto the
+	// parker slot, and keys the provenance record by the token.
+	pctx := pve.ParkContext{DiskCID: diskCID, StableID: stableID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("create_disk: park fresh disk %s (fail-closed: rollback deletes the volume)", diskCID))

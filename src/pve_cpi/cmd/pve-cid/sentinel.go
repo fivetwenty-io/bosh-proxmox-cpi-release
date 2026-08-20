@@ -15,6 +15,11 @@ type parkedDiskEntry struct {
 	ParkedAt    string `json:"parked_at"`
 	Node        string `json:"node"`
 	DirectorID  string `json:"director_id,omitempty"`
+	// Volid and Slot appear on stable-ID entries only: the volid the parker
+	// holds (or is receiving) the volume under, and the parker bus slot a
+	// transfer targets. Legacy entries are keyed by the bare volid instead.
+	Volid string `json:"volid,omitempty"`
+	Slot  string `json:"slot,omitempty"`
 }
 
 // Sentinel top-level JSON keys, mirrored from internal/pve/attached_disks.go
@@ -31,7 +36,9 @@ const (
 // the block is malformed, or bareVolid has no entry in it — pve-cid treats
 // all three as "no sentinel data", matching the CPI's own best-effort
 // decode contract (GetAttachedDiskCIDs in internal/pve/attached_disks.go).
-func readAttachedDiskCID(description, bareVolid string) (string, bool) {
+// Stable-ID disks are recorded under their bpd- token instead of the bare
+// volid; callers pass both candidate keys and the first hit wins.
+func readAttachedDiskCID(description string, keys ...string) (string, bool) {
 	_, raw := pve.ParseSentinel(description)
 	rawDisks, ok := raw[attachedDisksSentinelKey]
 	if !ok {
@@ -41,16 +48,25 @@ func readAttachedDiskCID(description, bareVolid string) (string, bool) {
 	if err := json.Unmarshal(rawDisks, &disks); err != nil {
 		return "", false
 	}
-	cid, ok := disks[bareVolid]
-	return cid, ok
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if cid, hit := disks[key]; hit {
+			return cid, true
+		}
+	}
+	return "", false
 }
 
 // readParkedDiskEntry extracts the parker provenance entry recorded for
-// bareVolid in a VM description's bosh_parked_disks sentinel.
+// bareVolid (legacy keying) or stableID (bpd- keying) in a VM description's
+// bosh_parked_disks sentinel. A stable-ID entry whose Volid field names
+// bareVolid also matches, mirroring the CPI's own dual-match removal.
 //
 // Returns (zero, false) when description carries no bosh_parked_disks block,
-// the block is malformed, or bareVolid has no entry in it.
-func readParkedDiskEntry(description, bareVolid string) (parkedDiskEntry, bool) {
+// the block is malformed, or no entry matches.
+func readParkedDiskEntry(description, bareVolid, stableID string) (parkedDiskEntry, bool) {
 	_, raw := pve.ParseSentinel(description)
 	rawDisks, ok := raw[parkedDisksSentinelKey]
 	if !ok {
@@ -60,6 +76,18 @@ func readParkedDiskEntry(description, bareVolid string) (parkedDiskEntry, bool) 
 	if err := json.Unmarshal(rawDisks, &disks); err != nil {
 		return parkedDiskEntry{}, false
 	}
-	entry, ok := disks[bareVolid]
-	return entry, ok
+	if stableID != "" {
+		if entry, hit := disks[stableID]; hit {
+			return entry, true
+		}
+	}
+	if entry, hit := disks[bareVolid]; hit {
+		return entry, true
+	}
+	for _, entry := range disks {
+		if entry.Volid != "" && entry.Volid == bareVolid {
+			return entry, true
+		}
+	}
+	return parkedDiskEntry{}, false
 }

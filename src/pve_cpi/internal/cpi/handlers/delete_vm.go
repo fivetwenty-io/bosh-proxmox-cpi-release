@@ -876,14 +876,20 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 // to this VM but has not yet detached (e.g. an interrupted recreate). PVE's
 // DELETE /qemu/{vmid} with purge=true destroys EVERY disk referenced by the VM
 // config, including persistent volumes on active bus slots (scsi1, ...). Such a
-// volume is recognised by its embedded VMID label differing from the VM's own
-// VMID: create_disk allocates persistent volumes under a synthetic free VMID,
-// so a disk "zfs-1:vm-15689-disk-0" attached to VM 6031 is foreign.
+// volume is recognised two ways: by its embedded VMID label differing from the
+// VM's own VMID (create_disk allocates persistent volumes under a synthetic
+// free VMID, so a disk "zfs-1:vm-15689-disk-0" attached to VM 6031 is
+// foreign), or by a bpd- stable-ID serial on the drive entry — a move_disk
+// reassignment renames a persistent volume for its new owner, so a
+// transferred disk fails the VMID heuristic and the serial is what still
+// marks it persistent.
 //
-// For each foreign disk on an active slot, DetachDisk fully unreferences the
-// volume (the SDK demotes the slot to unusedN and sweeps it), leaving the
-// volume intact on storage. Only after every foreign disk is detached does
-// delete_vm proceed to destroy the VM.
+// A legacy foreign disk is detached: DetachDisk fully unreferences the volume
+// (the SDK demotes the slot to unusedN and sweeps it), leaving the volume
+// intact on storage. A stable-ID disk is instead transferred to a parker —
+// its volume is owner-named, and the detach's unusedN sweep would let PVE
+// deallocate it. Only after every foreign disk is off the VM does delete_vm
+// proceed to destroy it.
 //
 // Fail-closed: if a foreign disk cannot be detached, or any foreign disk still
 // remains on an active slot after the attempt, a RETRIABLE error is returned
@@ -899,7 +905,7 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		return cpierrors.Wrap(pve.WrapError(cfgErr),
 			fmt.Sprintf("delete_vm: read config for VM %s before foreign-disk detach", vmCID))
 	}
-	foreign := pve.FindForeignActiveDisks(cfg, vmid)
+	foreign := pve.FindForeignActiveDiskDetails(cfg, vmid)
 	if len(foreign) == 0 {
 		return nil
 	}
@@ -909,16 +915,34 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 	}
 	sort.Strings(slots)
 	for _, slot := range slots {
-		volid := foreign[slot]
+		entry := foreign[slot]
+		// A stable-ID disk moves to a parker by reassignment instead of a
+		// plain detach. Two reasons: after a reassignment the volume is named
+		// for THIS VM, and the SDK detach's unusedN sweep would let PVE
+		// deallocate a volume its holder owns — the exact data loss this
+		// guard exists to prevent; and the disk's CID promises a parker
+		// anchor, which a plain detach would leave unhonored.
+		if entry.StableID != "" {
+			logger.Warn("delete_vm: stable-ID persistent disk still attached on active slot -- transferring to a parker to preserve it before destroy",
+				log.String("slot", slot), log.String("volid", entry.Volid), log.String("stable_id", entry.StableID))
+			pctx := pve.ParkContext{SourceVMCID: vmCID, StableID: entry.StableID}
+			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerWriteConfigFor(deps), pctx); transferErr != nil {
+				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
+					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it (the volume would otherwise be destroyed; retry resumes the transfer)",
+					vmCID, slot, entry.Volid))
+			}
+			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, entry.StableID, entry.Volid)
+			continue
+		}
 		logger.Warn("delete_vm: persistent disk still attached on active slot -- detaching to preserve volume before destroy",
-			log.String("slot", slot), log.String("volid", volid))
+			log.String("slot", slot), log.String("volid", entry.Volid))
 		detachErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.foreign_detach", 0, func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
 		})
 		if detachErr != nil {
 			return cpierrors.Retriable(
 				"delete_vm: refusing to destroy VM %s -- could not detach persistent disk %s=%s to preserve it: %s (the volume would otherwise be destroyed; retry re-attempts detach)",
-				vmCID, slot, volid, detachErr.Error())
+				vmCID, slot, entry.Volid, detachErr.Error())
 		}
 	}
 	// Re-read config: a detach that silently no-ops (SDK regression / race) must

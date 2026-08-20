@@ -45,6 +45,9 @@ type DecodedCID struct {
 	Node          string            `json:"node,omitempty"`
 	AZ            string            `json:"az,omitempty"`
 	Opts          map[string]string `json:"opts,omitempty"`
+	Anchor        bool              `json:"anchor,omitempty"`
+	Format        string            `json:"format,omitempty"`
+	StableID      string            `json:"stable_id,omitempty"`
 	EncodedLength int               `json:"encoded_length,omitempty"`
 	LengthTarget  int               `json:"length_target,omitempty"`
 	OverTarget    bool              `json:"over_target,omitempty"`
@@ -180,6 +183,9 @@ func decodeDiskCID(raw string) (*DecodedCID, error) {
 		d.Node = meta.Node
 		d.AZ = meta.AZ
 		d.Opts = meta.Opts
+		d.Anchor = meta.Anchor
+		d.Format = meta.Format
+		d.StableID = meta.ID
 	}
 	return d, nil
 }

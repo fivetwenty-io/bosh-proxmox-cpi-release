@@ -69,13 +69,16 @@ func runEncode(args []string, stdout, stderr io.Writer) int {
 	pool := fs.String("pool", "", "PVE storage pool name to embed in the CID metadata")
 	node := fs.String("node", "", "PVE node name to embed in the CID metadata")
 	az := fs.String("az", "", "availability-zone label to embed in the CID metadata")
+	anchor := fs.Bool("anchor", false, "embed the parked-strategy anchor promise in the CID metadata")
+	format := fs.String("format", "", "disk-image format (qcow2/raw/vmdk) to embed in the CID metadata")
+	id := fs.String("id", "", "stable disk identity token (bpd- + 16 hex chars) to embed in the CID metadata")
 	compress := fs.Bool("compress", false,
 		"allow the gzip-compressed pvz- envelope when the plain pvd- form would exceed the varchar(255) target")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON instead of plain text")
 	opts := optFlag{}
 	fs.Var(opts, "opt", "per-disk performance option key=value (repeatable, e.g. --opt iothread=1 --opt cache=writeback)")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--opt k=v ...] [--compress] [--json]")
+		_, _ = fmt.Fprintln(stderr, "Usage: pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--anchor] [--format F] [--id BPD] [--opt k=v ...] [--compress] [--json]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -96,10 +99,14 @@ func runEncode(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "pve-cid encode: invalid --volid: %s\n", err)
 		return exitError
 	}
+	if len(*id) > pve.DiskStableIDLen {
+		_, _ = fmt.Fprintf(stderr, "pve-cid encode: --id %q exceeds the %d-byte PVE drive-serial cap\n", *id, pve.DiskStableIDLen)
+		return exitError
+	}
 
 	var meta *pve.DiskCIDMeta
-	if *pool != "" || *node != "" || *az != "" || len(opts) > 0 {
-		m := pve.DiskCIDMeta{Pool: *pool, Node: *node, AZ: *az}
+	if *pool != "" || *node != "" || *az != "" || *anchor || *format != "" || *id != "" || len(opts) > 0 {
+		m := pve.DiskCIDMeta{Pool: *pool, Node: *node, AZ: *az, Anchor: *anchor, Format: *format, ID: *id}
 		if len(opts) > 0 {
 			m.Opts = map[string]string(opts)
 		}

@@ -1546,5 +1546,95 @@ class TestStorageClassification(unittest.TestCase):
         self.assertFalse(self._verifier().storage_is_shared("nope"))
 
 
+# ---------------------------------------------------------------------------
+# Stable disk identity (D13)
+# ---------------------------------------------------------------------------
+
+class TestStableDiskIdentity(unittest.TestCase):
+    """disk_stable_id, drive-entry matching, and the dual-keyed provenance
+    lookup that keep the harness identity-aware after a move_disk rename."""
+
+    STABLE_ID = "bpd-0011223344556677"
+
+    @staticmethod
+    def _pvd_cid(volid: str, meta: dict | None = None) -> str:
+        payload: dict = {"v": volid}
+        if meta:
+            payload["m"] = meta
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    def _verifier(self) -> PVEVerifier:
+        return PVEVerifier(_token_config())
+
+    def test_disk_stable_id_present(self) -> None:
+        cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        self.assertEqual(_pve_verify.disk_stable_id(cid), self.STABLE_ID)
+
+    def test_disk_stable_id_absent(self) -> None:
+        self.assertEqual(_pve_verify.disk_stable_id(self._pvd_cid("data:vm-9001-disk-0")), "")
+        self.assertEqual(
+            _pve_verify.disk_stable_id(self._pvd_cid("data:vm-9001-disk-0", {"pool": "data"})), ""
+        )
+
+    def test_disk_stable_id_garbage_cid(self) -> None:
+        self.assertEqual(_pve_verify.disk_stable_id("not-a-cid"), "")
+
+    def test_drive_entry_matches(self) -> None:
+        match = _pve_verify._drive_entry_matches
+        self.assertTrue(match("data:vm-9001-disk-0,size=10G", "data:vm-9001-disk-0", ""))
+        self.assertTrue(
+            match(
+                f"data:vm-700-disk-1,serial={self.STABLE_ID},size=10G",
+                "data:vm-9001-disk-0",
+                self.STABLE_ID,
+            )
+        )
+        self.assertFalse(
+            match("data:vm-700-disk-1,serial=other,size=10G", "data:vm-9001-disk-0", self.STABLE_ID)
+        )
+        self.assertFalse(match("data:vm-700-disk-1,size=10G", "data:vm-9001-disk-0", ""))
+
+    def test_disk_holders_matches_renamed_volume_by_serial(self) -> None:
+        v = self._verifier()
+        cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        with unittest.mock.patch.object(v, "cluster_vms", return_value=[(700, "pve1")]):
+            with unittest.mock.patch.object(
+                v,
+                "qemu_config",
+                return_value={"scsi1": f"data:vm-700-disk-1,serial={self.STABLE_ID},size=10G"},
+            ):
+                self.assertEqual(v.disk_holders(cid), [(700, "scsi1")])
+                self.assertEqual(v.current_disk_volid(cid), "data:vm-700-disk-1")
+
+    def test_parked_disk_recorded_dual_keying(self) -> None:
+        v = self._verifier()
+        legacy_cid = self._pvd_cid("data:vm-9001-disk-0")
+        id_cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        legacy_entries = {"data:vm-9001-disk-0": {"disk_cid": legacy_cid, "node": "pve1"}}
+        id_entries = {
+            self.STABLE_ID: {"disk_cid": id_cid, "node": "pve1", "volid": "data:vm-90000-disk-2"}
+        }
+        with unittest.mock.patch.object(v, "cluster_vms", return_value=[]):
+            with unittest.mock.patch.object(v, "parked_disks", return_value=legacy_entries):
+                self.assertTrue(v.parked_disk_recorded(90000, legacy_cid))
+            with unittest.mock.patch.object(v, "parked_disks", return_value=id_entries):
+                self.assertTrue(v.parked_disk_recorded(90000, id_cid))
+            with unittest.mock.patch.object(v, "parked_disks", return_value={}):
+                self.assertFalse(v.parked_disk_recorded(90000, id_cid))
+
+    def test_parked_disk_recorded_matches_entry_volid(self) -> None:
+        """A stable-ID entry is found through its volid field when the caller
+        resolves the current volid (mid-transfer intent records)."""
+        v = self._verifier()
+        id_cid = self._pvd_cid("data:vm-9001-disk-0", {"id": self.STABLE_ID})
+        entries = {"bpd-otherkey000000000": {"volid": "data:vm-700-disk-1", "node": "pve1"}}
+        with unittest.mock.patch.object(v, "parked_disks", return_value=entries):
+            with unittest.mock.patch.object(
+                v, "current_disk_volid", return_value="data:vm-700-disk-1"
+            ):
+                self.assertTrue(v.parked_disk_recorded(90000, id_cid))
+
+
 if __name__ == "__main__":
     unittest.main()

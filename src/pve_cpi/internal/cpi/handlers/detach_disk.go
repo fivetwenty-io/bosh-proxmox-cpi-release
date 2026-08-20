@@ -169,7 +169,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 		// Strip optional metadata suffix; PVE API and volid comparisons need
 		// the bare "<storage>:<volid>" form.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "detach_disk", diskCID)
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "detach_disk", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
@@ -180,6 +180,19 @@ func HandleDetachDisk(deps Deps) Handler {
 		vmid, err := strconv.Atoi(vmCID)
 		if err != nil || vmid <= 0 {
 			return nil, cpierrors.VMNotFound(vmCID)
+		}
+
+		// Stable-ID disks detach by ownership transfer: the volume is
+		// reassigned onto a parker rather than config-edited off the VM. The
+		// two flows share nothing past this point — a renamed volume must
+		// never meet the SDK's detach-and-sweep, whose unused sweep would let
+		// PVE deallocate a volume its holder owns.
+		rd, resolveErr := resolveDiskForOp(ctx, deps, "detach_disk", diskCID, bareDiskCID, meta)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		if rd.stableID != "" {
+			return nil, handleDetachStableID(ctx, deps, vmCID, vmid, rd)
 		}
 
 		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, vmid, bareDiskCID)
@@ -253,6 +266,91 @@ func HandleDetachDisk(deps Deps) Handler {
 
 		return nil, nil
 	})
+}
+
+// handleDetachStableID is the whole detach flow for a stable-ID disk. The
+// detached state for such a disk is "parked with its serial applied", and
+// every branch converges there:
+//
+//   - interrupted transfer → resume it (that finishes the detach);
+//   - attached to this VM → transfer to a parker by reassignment;
+//   - already on a parker → idempotent success;
+//   - attached to another VM → stale-Director retry; warn and succeed, as the
+//     legacy path does;
+//   - free-floating → park it (the CID promises a parker anchor, and the
+//     promise outlives a detached_disk_strategy flip — an identity disk left
+//     free-floating would be one rename away from unresolvable).
+//
+// Fail-closed: a transfer failure is returned (retriable unless the transfer
+// classified it otherwise) so the Director re-drives detach_disk, and the
+// retry resumes from whatever step the failure left behind.
+func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int, rd resolvedDisk) error {
+	logger := deps.Log(ctx)
+	if rd.intent != nil {
+		refreshed, err := resumeTransferIfNeeded(ctx, deps, "detach_disk", rd)
+		if err != nil {
+			return err
+		}
+		rd = refreshed
+	}
+	switch {
+	case rd.holder == nil:
+		return parkFreeFloatingStableID(ctx, deps, rd)
+	case rd.holder.IsParker:
+		// Already in the detached (parked) state — idempotent success.
+		return nil
+	case rd.holder.VMID != vmid:
+		// Stale-Director retry: the disk was re-attached elsewhere after the
+		// original detach. Preserve the legacy idempotent warn+nil semantics.
+		logger.Warn("detach_disk: disk attached to a different VM — treating as already detached from this one",
+			log.String("vm_cid", vmCID),
+			log.String("disk_cid", rd.diskCID),
+			log.Int("holder_vmid", rd.holder.VMID),
+		)
+		return nil
+	}
+
+	node := rd.holder.Node
+	if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, rd.diskCID, deps.Config, logger); err != nil {
+		return err
+	}
+	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID}
+	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerWriteConfigFor(deps), pctx)
+	if transferErr != nil {
+		return retriableUnlessPermanent(transferErr,
+			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
+	}
+	// Giving side's record last: the parker's provenance entry (the receiving
+	// side) was written before the source slot was touched, so the holder
+	// sentinel can now come off. Both keyings, in case an older write raced.
+	pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
+
+	logger.Info("detach_disk: disk transferred to parker",
+		log.String("vm_cid", vmCID),
+		log.String("disk_cid", rd.diskCID),
+		log.String("volid_before", rd.volid),
+		log.String("volid_after", landed),
+	)
+	return nil
+}
+
+// parkFreeFloatingStableID parks a free-floating stable-ID disk so a detach
+// retry converges to the parked state. A volume that vanished between calls
+// is idempotent success, matching the legacy already-detached path.
+func parkFreeFloatingStableID(ctx context.Context, deps Deps, rd resolvedDisk) error {
+	node, resolveErr := resolveNodeForDetachedDisk(ctx, deps, rd.volid)
+	if resolveErr != nil {
+		if cpierrors.IsType(resolveErr, cpierrors.TypeDiskNotFound) {
+			return nil
+		}
+		return resolveErr
+	}
+	pctx := pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, rd.volid, parkerWriteConfigFor(deps), pctx); parkErr != nil {
+		return retriableUnlessPermanent(parkErr,
+			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", rd.diskCID))
+	}
+	return nil
 }
 
 // handleAlreadyDetachedParked handles the alreadyDetached=true branch of

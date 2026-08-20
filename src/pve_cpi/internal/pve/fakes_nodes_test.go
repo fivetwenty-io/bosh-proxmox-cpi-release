@@ -27,6 +27,7 @@ type fakeNodesService struct {
 	createQemuAgentPingFn               func(ctx context.Context, node string, vmid string) (*nodes.CreateQemuAgentPingResponse, error)
 	createQemuCloneFn                   func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuCloneParams) (*nodes.CreateQemuCloneResponse, error)
 	updateQemuConfigFn                  func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error
+	createQemuMoveDiskFn                func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error)
 	listQemuStatusCurrentFn             func(ctx context.Context, node string, vmid string) (*nodes.ListQemuStatusCurrentResponse, error)
 	createQemuStatusRebootFn            func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
 	createQemuTemplateFn                func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuTemplateParams) (*nodes.CreateQemuTemplateResponse, error)
@@ -42,6 +43,10 @@ type fakeNodesService struct {
 	createQemuFirewallIpset2Fn          func(ctx context.Context, node string, vmid string, name string, params *nodes.CreateQemuFirewallIpset2Params) error
 	createQemuFirewallRulesFn           func(ctx context.Context, node, vmid string, params *nodes.CreateQemuFirewallRulesParams) error
 	updateQemuFirewallOptionsFn         func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuFirewallOptionsParams) error
+}
+
+func (f *fakeNodesService) CreateQemuMoveDisk(ctx context.Context, node string, vmid string, params *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
+	return f.createQemuMoveDiskFn(ctx, node, vmid, params)
 }
 
 func (f *fakeNodesService) CreateNetwork(ctx context.Context, node string, params *nodes.CreateNetworkParams) error {

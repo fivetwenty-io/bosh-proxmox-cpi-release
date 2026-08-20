@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -99,29 +100,41 @@ func HandleAttachDisk(deps Deps) Handler {
 			return nil, err
 		}
 
-		// --------------------------------------------------------------------
-		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
-		// --------------------------------------------------------------------
-		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, bareDiskCID)
+		// Resolve the CID to the volid the cluster currently knows the volume
+		// by (the identity seam): legacy CIDs come back as-is with no API
+		// cost; stable-ID CIDs pay one cluster scan and may surface an
+		// interrupted transfer, which the guard below resumes.
+		rd, err := resolveDiskForOp(ctx, deps, "attach_disk", diskCID, bareDiskCID, meta)
 		if err != nil {
 			return nil, err
 		}
 
 		// --------------------------------------------------------------------
-		// 3. Resolve the volume's current holder, then unpark or refuse.
+		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
+		// --------------------------------------------------------------------
+		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid)
+		if err != nil {
+			return nil, err
+		}
+
+		// --------------------------------------------------------------------
+		// 3. Resolve the volume's current holder, then unpark, plan a
+		// reassignment transfer, or refuse.
 		//
 		// One cluster scan answers both questions this handler has to settle
 		// before it writes a volid into a VM config: a parker holder must be
-		// unparked first, and any other holder means the volume is already
-		// attached elsewhere. Unpark failure → retriable error; the disk remains
-		// parked and the next BOSH retry will re-attempt here.
+		// unparked (or reassigned) first, and any other holder means the
+		// volume is already attached elsewhere. Unpark failure → retriable
+		// error; the disk remains parked and the next BOSH retry will
+		// re-attempt here.
 		//
 		// Co-location check (local backend) is unaffected: UnparkDisk performs
 		// a DetachDisk on the parker VM but does not move the volume between
 		// nodes, so the disk node established by attachDiskResolveNode remains
 		// valid.
 		// --------------------------------------------------------------------
-		if err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", diskCID, bareDiskCID, meta, vmid); err != nil {
+		plan, err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", &rd, node, vmid)
+		if err != nil {
 			return nil, err
 		}
 
@@ -156,11 +169,12 @@ func HandleAttachDisk(deps Deps) Handler {
 		}
 
 		// --------------------------------------------------------------------
-		// 5–8. Shared attach core: slot choice, perf merge + invariants, config
-		// PUT, confirmation, and the sentinel CID record. create_vm's disk_cids
-		// pre-attach runs the identical sequence (see attachDiskCore).
+		// 5–8. Shared attach core: slot choice, perf merge + invariants, the
+		// reassignment transfer or config PUT, confirmation, and the sentinel
+		// CID record. create_vm's disk_cids pre-attach runs the identical
+		// sequence (see attachDiskCore).
 		// --------------------------------------------------------------------
-		diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, bareDiskCID, meta)
+		diskID, devicePath, err := attachDiskCore(ctx, deps, "attach_disk", vmCID, node, vmid, diskCID, rd, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -222,12 +236,13 @@ func attachDiskCore(
 	vmCID string,
 	node string,
 	vmid int,
-	diskCID, bareDiskCID string,
-	meta *pve.DiskCIDMeta,
+	diskCID string,
+	rd resolvedDisk,
+	plan attachPlan,
 ) (diskID, devicePath string, err error) {
 	const bus = "scsi"
 
-	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, bareDiskCID)
+	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, rd.volid)
 	if prepErr != nil {
 		if pve.IsNotFound(prepErr) {
 			return "", "", cpierrors.VMNotFound(vmCID)
@@ -236,13 +251,13 @@ func attachDiskCore(
 	}
 
 	// Compute effective per-disk performance options (see doc comment).
-	globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, bareDiskCID, meta)
+	globalOpts, gerr := attachDiskGlobalPerfOpts(ctx, deps, rd.volid, rd.meta)
 	if gerr != nil {
 		return "", "", gerr
 	}
 	var metaOpts map[string]string
-	if meta != nil {
-		metaOpts = meta.Opts
+	if rd.meta != nil {
+		metaOpts = rd.meta.Opts
 	}
 	effectiveOpts := filterDiskPerfForBus(mergeDiskOptions(globalOpts, metaOpts), bus)
 	// CID opts are a mixed namespace: CPI-internal provenance keys (e.g.
@@ -252,14 +267,47 @@ func attachDiskCore(
 
 	// Enforce creation-time disk-performance invariants (§7.26), before any
 	// mutating PVE call so an enforce-mode reject leaves no orphan.
-	if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), op, vmCID, diskCID, meta, effectiveOpts); err != nil {
+	if err := enforceDiskPerfInvariants(deps.Config, deps.Log(ctx), op, vmCID, diskCID, rd.meta, effectiveOpts); err != nil {
 		return "", "", err
 	}
 
+	// The stable ID rides the drive entry as its serial: a genuine PVE drive
+	// key, injected after the invariant check (it is identity, not a
+	// performance option) and at an attach boundary, the only point D13
+	// permits writing one.
+	if rd.stableID != "" {
+		effectiveOpts["serial"] = rd.stableID
+	}
+
+	if plan.viaTransfer {
+		return attachDiskViaTransfer(ctx, deps, op, vmCID, node, vmid, diskCID, rd, plan, desiredDiskID, effectiveOpts)
+	}
+	return attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, desiredDiskID, effectiveOpts)
+}
+
+// attachDiskConfigPut is the config-edit attach tail: the volid (plus baked
+// options) is written into the target slot by a config PUT. The only path for
+// legacy disks, and the fallback for stable-ID disks whose reassignment is
+// not available (cross-node parker with a birth-named volume, or a snapshot
+// refusal).
+func attachDiskConfigPut(
+	ctx context.Context,
+	deps Deps,
+	op string,
+	vmCID string,
+	node string,
+	vmid int,
+	diskCID string,
+	rd resolvedDisk,
+	desiredDiskID string,
+	effectiveOpts map[string]string,
+) (diskID, devicePath string, err error) {
+	const bus = "scsi"
+
 	// Build the volid arg: bake options in when present, bare CID otherwise.
-	volidArg := bareDiskCID
+	volidArg := rd.volid
 	if len(effectiveOpts) > 0 {
-		volidArg = buildDiskOptStr(bareDiskCID, effectiveOpts)
+		volidArg = buildDiskOptStr(rd.volid, effectiveOpts)
 	}
 
 	err = pve.RetryOnTransient(ctx, deps.Log(ctx), op, 0, func() error {
@@ -278,19 +326,94 @@ func attachDiskCore(
 	}
 
 	// Confirm attachment (resolve diskID) and derive device path.
-	devicePath, err = attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, bareDiskCID, diskID, deps.Log(ctx))
+	devicePath, err = attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, rd.volid, diskID, deps.Log(ctx))
 	if err != nil {
 		return "", "", err
 	}
 
-	// Record the Director's verbatim disk_cid against the bare volid on the
-	// VM's description sentinel, so a later get_disks call can return this
-	// exact string instead of the bare volid — cloudcheck membership fidelity
-	// (see pve.UpdateAttachedDiskCID doc comment). Best-effort: never fails
-	// the attach.
-	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, bareDiskCID, diskCID)
+	// Record the Director's verbatim disk_cid on the VM's description
+	// sentinel — keyed by the stable ID when the disk has one, the volid
+	// otherwise — so a later get_disks call can return this exact string
+	// instead of the bare volid: cloudcheck membership fidelity (see
+	// pve.UpdateAttachedDiskCID doc comment). Best-effort: never fails the
+	// attach.
+	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
 
 	return diskID, devicePath, nil
+}
+
+// attachDiskViaTransfer attaches a parked stable-ID disk by move_disk
+// reassignment: the volume moves from the parker slot straight onto the
+// target VM's slot, renamed for its new owner, with the full drive option
+// string (serial included) riding along. The receiving side's record (the
+// holder sentinel) is written before the giving side's (the parker
+// provenance entry) is removed — D13's crash-window ordering.
+//
+// A snapshot refusal from PVE falls back to the config-edit path when the
+// volume is not named for the parker (the unpark cannot deallocate it); a
+// parker-named volume has no safe fallback and returns a hard error naming
+// the snapshot as the thing to remove.
+func attachDiskViaTransfer(
+	ctx context.Context,
+	deps Deps,
+	op string,
+	vmCID string,
+	node string,
+	vmid int,
+	diskCID string,
+	rd resolvedDisk,
+	plan attachPlan,
+	targetSlot string,
+	effectiveOpts map[string]string,
+) (string, string, error) {
+	preVolid := rd.volid
+	optStr := buildDiskOptStr(preVolid, effectiveOpts)
+	parkerCfg := parkerReadConfigFor(deps)
+
+	landed, terr := pve.TransferDiskFromParker(ctx, deps.PVE, deps.Log(ctx), plan.parker, vmid, targetSlot, preVolid, optStr, parkerCfg)
+	if terr != nil {
+		if errors.Is(terr, pve.ErrMoveDiskSnapshotRefused) {
+			if embedded, ok := pve.EmbeddedDiskVMID(preVolid); ok && embedded == plan.parker.VMID {
+				return "", "", cpierrors.Cloud(
+					"%s: disk %s is parked on parker VM %d as %q and a snapshot references it, which blocks the "+
+						"reassignment transfer; the config-edit fallback would let PVE deallocate a volume its parker "+
+						"owns, so there is no safe automatic path. Remove the snapshot referencing the volume, then retry",
+					op, diskCID, plan.parker.VMID, preVolid,
+				)
+			}
+			deps.Log(ctx).Warn(op+": reassignment refused because a snapshot references the disk; falling back to the config-edit attach",
+				log.String("disk_cid", diskCID),
+				log.Int("parker_vmid", plan.parker.VMID),
+			)
+			if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerCfg); unErr != nil {
+				return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (snapshot fallback)", op, diskCID))
+			}
+			return attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts)
+		}
+		return "", "", retriableUnlessPermanent(terr, fmt.Sprintf("%s: reassign disk %s from parker to VM %s", op, diskCID, vmCID))
+	}
+	rd.volid = landed
+
+	devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, landed, targetSlot, deps.Log(ctx))
+	if err != nil {
+		return "", "", err
+	}
+
+	// Receiving side first: record the Director's CID on the VM, then drop
+	// the parker's provenance entry (matched by the pre-move volid it
+	// recorded). Both best-effort — the drive serial is the authoritative
+	// carrier by this point.
+	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
+	pve.RemoveParkerProvenanceEntry(ctx, deps.PVE, deps.Log(ctx), plan.parker.Node, plan.parker.VMID, preVolid, parkerCfg)
+
+	deps.Log(ctx).Info(op+": persistent disk attached by reassignment",
+		log.String("vm_cid", vmCID),
+		log.String("disk_cid", diskCID),
+		log.String("volid_before", preVolid),
+		log.String("volid_after", landed),
+		log.String("disk_id", targetSlot),
+	)
+	return targetSlot, devicePath, nil
 }
 
 // attachDiskGlobalPerfOpts resolves the global (no call-level cloud_properties)
@@ -680,9 +803,25 @@ func devicePathByID(diskID string) (string, error) {
 	return fmt.Sprintf("/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi%d", idx), nil
 }
 
-// guardAndUnparkBeforeAttach settles who currently holds the volume, then acts:
-// a parker holder is unparked, the target VM itself is left alone (the attach
-// that follows is idempotent), and any other VM is a hard stop.
+// attachPlan is the pre-attach holder guard's verdict on how the volume
+// reaches the target VM.
+type attachPlan struct {
+	// viaTransfer is true when the disk sits on a same-node parker and moves
+	// by move_disk reassignment (stable-ID disks only). The guard leaves such
+	// a disk parked; attachDiskCore performs the transfer.
+	viaTransfer bool
+	// parker is the holder the transfer moves the disk off; meaningful only
+	// when viaTransfer is true.
+	parker pve.DiskHolder
+}
+
+// guardAndUnparkBeforeAttach settles who currently holds the volume, then
+// acts: a parker holding a stable-ID disk on the target's node is planned for
+// a reassignment transfer (and left in place for attachDiskCore to move), any
+// other parker holder is unparked, the target VM itself is left alone (the
+// attach that follows is idempotent), and any other VM is a hard stop. An
+// interrupted detach-side transfer is resumed first, so the disk the rest of
+// this function reasons about is in a settled state.
 //
 // The holder scan is unconditional, unlike the unpark it gates. PVE will happily
 // let two VM configs reference one volume; nothing downstream detects it, and
@@ -693,42 +832,83 @@ func devicePathByID(diskID string) (string, error) {
 // parker, but a band moved away from live parkers still does, and so does a
 // release rolled back to one that has no concept of parking. A single cluster
 // scan per attach_disk is a cheap price for turning silent volume loss into a
-// message naming the VM to look at.
-//
-// The scan cost is one ListResources plus a config read per VM — the same scan
-// the unpark probe pays for under either strategy.
-func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, diskCID, bareDiskCID string, meta *pve.DiskCIDMeta, targetVMID int) error {
+// message naming the VM to look at. For stable-ID disks the identity
+// resolution already paid that scan, so the holder comes from rd.
+func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *resolvedDisk, node string, targetVMID int) (attachPlan, error) {
 	if deps.Config == nil {
-		return nil
+		return attachPlan{}, nil
 	}
+	refreshed, resumeErr := resumeTransferIfNeeded(ctx, deps, op, *rd)
+	if resumeErr != nil {
+		return attachPlan{}, resumeErr
+	}
+	*rd = refreshed
+
 	parkerCfg := parkerReadConfigFor(deps)
-	holder, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
-	if err != nil {
-		return wrapHolderScanError(err, fmt.Sprintf("%s: resolve current holder of disk %s", op, diskCID))
+	var holder pve.DiskHolder
+	if rd.stableID != "" {
+		if rd.holder != nil {
+			holder = *rd.holder
+		}
+	} else {
+		var err error
+		holder, err = pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerCfg)
+		if err != nil {
+			return attachPlan{}, wrapHolderScanError(err, fmt.Sprintf("%s: resolve current holder of disk %s", op, rd.diskCID))
+		}
 	}
 
 	// A disk whose CID promises a parker anchor must have a holder while
 	// detached; no holder at all means the parker vanished out-of-band.
-	if anchorErr := anchorMissingRefusal(ctx, deps, op, diskCID, meta, holder); anchorErr != nil {
-		return anchorErr
+	if anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder); anchorErr != nil {
+		return attachPlan{}, anchorErr
 	}
 
 	if holder.Found && !holder.IsParker && holder.VMID != targetVMID {
-		return foreignHolderError(deps, op, diskCID, targetVMID, holder)
+		return attachPlan{}, foreignHolderError(deps, op, rd.diskCID, targetVMID, holder)
+	}
+
+	if holder.Found && holder.IsParker && rd.stableID != "" {
+		if holder.Node == node {
+			return attachPlan{viaTransfer: true, parker: holder}, nil
+		}
+		// PVE reassignment is same-node only ("Both VMs need to be on the
+		// same node"). A birth-named volume can still take the config-edit
+		// path safely — the unpark preserves a volume the parker does not
+		// own — so cross-node attach of a fresh parked disk works as it
+		// always has. A parker-NAMED volume cannot: the config-edit unpark's
+		// sweep would let PVE deallocate it, so it is refused with the two
+		// operator escapes.
+		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {
+			return attachPlan{}, cpierrors.Cloud(
+				"%s: disk %s is parked as %q on parker VM %d (node %s) but VM %s runs on node %s, and PVE "+
+					"reassignment is same-node only. Either migrate the parker to the VM's node "+
+					"(qm migrate %d %s — parkers are always stopped) and retry, or recreate the VM pinned to "+
+					"node %s (cloud_properties.node or an AZ on that node)",
+				op, rd.diskCID, rd.volid, holder.VMID, holder.Node, strconv.Itoa(targetVMID), node,
+				holder.VMID, node, holder.Node,
+			)
+		}
+		deps.Log(ctx).Warn(op+": stable-ID disk is parked on another node; using the config-edit attach path (birth-named volume, safe)",
+			log.String("disk_cid", rd.diskCID),
+			log.Int("parker_vmid", holder.VMID),
+			log.String("parker_node", holder.Node),
+			log.String("vm_node", node),
+		)
 	}
 
 	// UnparkDiskAt reuses the holder just resolved, so the parked path still
 	// costs one cluster scan rather than the two a plain UnparkDisk would.
-	if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, holder, parkerCfg); unErr != nil {
+	if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), rd.volid, holder, parkerCfg); unErr != nil {
 		// Keep the class the unpark chose. Most of what it returns is transport
 		// shaped and retriable, but two of its outcomes are not: a permission
 		// the operator has to grant, and a detach that succeeded while leaving
 		// an unusedN reference behind. Flattening those into a retriable makes
 		// the Director drive the first forever, and drive the second straight
 		// into attaching a volume the parker still references.
-		return retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, diskCID))
+		return attachPlan{}, retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, rd.diskCID))
 	}
-	return nil
+	return attachPlan{}, nil
 }
 
 // foreignHolderError builds the refusal for a volume already attached to a VM

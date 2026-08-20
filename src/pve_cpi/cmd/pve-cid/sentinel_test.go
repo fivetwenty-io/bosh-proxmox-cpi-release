@@ -73,7 +73,7 @@ func TestReadParkedDiskEntry_Found(t *testing.T) {
 			},
 		},
 	})
-	entry, ok := readParkedDiskEntry(desc, "local-lvm:vm-100-disk-0")
+	entry, ok := readParkedDiskEntry(desc, "local-lvm:vm-100-disk-0", "")
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -88,7 +88,7 @@ func TestReadParkedDiskEntry_NotFound(t *testing.T) {
 			"local-lvm:vm-100-disk-0": {ParkedAt: "2026-08-01T00:00:00Z", Node: "pve1"},
 		},
 	})
-	if _, ok := readParkedDiskEntry(desc, "local-lvm:vm-999-disk-0"); ok {
+	if _, ok := readParkedDiskEntry(desc, "local-lvm:vm-999-disk-0", ""); ok {
 		t.Error("expected ok=false for an unmatched volid")
 	}
 }
@@ -101,7 +101,7 @@ func TestSentinels_CoexistOnOneDescription(t *testing.T) {
 	if _, ok := readAttachedDiskCID(desc, "a:v1"); !ok {
 		t.Error("expected attached sentinel to be found alongside parked sentinel")
 	}
-	if _, ok := readParkedDiskEntry(desc, "b:v2"); !ok {
+	if _, ok := readParkedDiskEntry(desc, "b:v2", ""); !ok {
 		t.Error("expected parked sentinel to be found alongside attached sentinel")
 	}
 }

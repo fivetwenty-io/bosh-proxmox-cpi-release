@@ -36,7 +36,15 @@ type SentinelMatch struct {
 // DiskLocateResult is the result of locating a disk volume across the
 // cluster.
 type DiskLocateResult struct {
-	BareVolid       string          `json:"bare_volid"`
+	BareVolid string `json:"bare_volid"`
+	// StableID is the bpd- identity token from the CID envelope, when the
+	// located CID carries one; the scan then also matches drive entries by
+	// their serial= option (the identity survives PVE's move_disk rename,
+	// the birth volid does not).
+	StableID string `json:"stable_id,omitempty"`
+	// CurrentVolid is the volid the holder's drive entry actually carries.
+	// Differs from BareVolid after a reassignment renamed the volume.
+	CurrentVolid    string          `json:"current_volid,omitempty"`
 	Holder          *DiskHolder     `json:"holder,omitempty"`
 	SentinelMatches []SentinelMatch `json:"sentinel_matches,omitempty"`
 }
@@ -54,7 +62,7 @@ type DiskLocateResult struct {
 //
 // Returns an error only when the initial cluster VM listing itself fails;
 // per-VM config fetch failures are silently skipped.
-func locateDisk(ctx context.Context, r Reader, bareVolid string) (*DiskLocateResult, error) {
+func locateDisk(ctx context.Context, r Reader, bareVolid, stableID string) (*DiskLocateResult, error) {
 	if bareVolid == "" {
 		return nil, fmt.Errorf("pve-cid: locateDisk: bareVolid must not be empty")
 	}
@@ -69,7 +77,7 @@ func locateDisk(ctx context.Context, r Reader, bareVolid string) (*DiskLocateRes
 	// response ordering).
 	sort.Slice(vms, func(i, j int) bool { return vms[i].VMID < vms[j].VMID })
 
-	result := &DiskLocateResult{BareVolid: bareVolid}
+	result := &DiskLocateResult{BareVolid: bareVolid, StableID: stableID}
 
 	for _, vm := range vms {
 		cfg, cfgErr := r.VMConfig(ctx, vm.Node, vm.VMID)
@@ -78,18 +86,32 @@ func locateDisk(ctx context.Context, r Reader, bareVolid string) (*DiskLocateRes
 		}
 
 		disks := qemu.ParseDisks(cfg)
-		if slot, ok := pve.FindDiskIDByVolID(disks, bareVolid); ok && result.Holder == nil {
-			result.Holder = &DiskHolder{VMID: vm.VMID, Node: vm.Node, Slot: slot}
+		if result.Holder == nil {
+			if slot, ok := pve.FindDiskIDByVolID(disks, bareVolid); ok {
+				result.Holder = &DiskHolder{VMID: vm.VMID, Node: vm.Node, Slot: slot}
+				result.CurrentVolid = bareVolid
+			} else if stableID != "" {
+				// Mirror the CPI's identity resolution: a serial=<stableID>
+				// drive option identifies the disk after a reassignment
+				// renamed the volume away from its birth volid.
+				for slot, optStr := range disks {
+					if serial, has := pve.StableIDFromDriveOptStr(optStr); has && serial == stableID {
+						result.Holder = &DiskHolder{VMID: vm.VMID, Node: vm.Node, Slot: slot}
+						result.CurrentVolid = bareVolidFromDriveOptStr(optStr)
+						break
+					}
+				}
+			}
 		}
 
 		desc := pve.DescriptionFromConfig(cfg)
 		match := SentinelMatch{VMID: vm.VMID, Node: vm.Node}
 		matched := false
-		if cid, ok := readAttachedDiskCID(desc, bareVolid); ok {
+		if cid, ok := readAttachedDiskCID(desc, stableID, bareVolid); ok {
 			match.AttachedCID = cid
 			matched = true
 		}
-		if entry, ok := readParkedDiskEntry(desc, bareVolid); ok {
+		if entry, ok := readParkedDiskEntry(desc, bareVolid, stableID); ok {
 			e := entry
 			match.Parked = &e
 			matched = true
@@ -100,6 +122,14 @@ func locateDisk(ctx context.Context, r Reader, bareVolid string) (*DiskLocateRes
 	}
 
 	return result, nil
+}
+
+// bareVolidFromDriveOptStr strips the option suffix from a PVE drive value.
+func bareVolidFromDriveOptStr(optStr string) string {
+	if idx := strings.IndexByte(optStr, ','); idx >= 0 {
+		return optStr[:idx]
+	}
+	return optStr
 }
 
 // StemcellTemplateHit is one cache template matched by sha8 during a
@@ -197,22 +227,25 @@ func locateStemcell(ctx context.Context, r Reader, decoded *DecodedCID) (*Stemce
 // (an operator convenience "decode" deliberately does not extend to, since
 // bare volids are never a Director-visible CID — see DecodeCID's doc
 // comment).
-func resolveBareVolid(raw string) (string, error) {
+func resolveBareVolid(raw string) (bareVolid, stableID string, err error) {
 	if strings.HasPrefix(raw, "pvd-") || strings.HasPrefix(raw, "pvz-") {
-		bareCID, _, err := pve.ParseEncodedDiskCID(raw)
-		if err != nil {
-			return "", fmt.Errorf("pve-cid: %w", err)
+		bareCID, meta, decErr := pve.ParseEncodedDiskCID(raw)
+		if decErr != nil {
+			return "", "", fmt.Errorf("pve-cid: %w", decErr)
 		}
-		return bareCID, nil
+		if meta != nil {
+			stableID = meta.ID
+		}
+		return bareCID, stableID, nil
 	}
-	if _, _, err := pve.ParseDiskCID(raw); err != nil {
-		return "", fmt.Errorf(
+	if _, _, parseErr := pve.ParseDiskCID(raw); parseErr != nil {
+		return "", "", fmt.Errorf(
 			"pve-cid: locate: %q is neither a stemcell CID (\":light:\"/\":heavy:\"), "+
 				"a disk CID (\"pvd-\"/\"pvz-\"), nor a raw volid (\"<storage>:<volume>\"): %w",
-			raw, err,
+			raw, parseErr,
 		)
 	}
-	return raw, nil
+	return raw, "", nil
 }
 
 // runLocate implements "pve-cid locate <cid|volid> [--config PATH] [--json]".
@@ -262,12 +295,12 @@ func runLocate(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	}
 
-	bareVolid, resErr := resolveBareVolid(raw)
+	bareVolid, stableID, resErr := resolveBareVolid(raw)
 	if resErr != nil {
 		_, _ = fmt.Fprintln(stderr, resErr)
 		return exitUsage
 	}
-	result, locErr := locateDisk(ctx, reader, bareVolid)
+	result, locErr := locateDisk(ctx, reader, bareVolid, stableID)
 	if locErr != nil {
 		_, _ = fmt.Fprintln(stderr, locErr)
 		return exitError
@@ -281,6 +314,12 @@ func runLocate(args []string, stdout, stderr io.Writer) int {
 
 func printDiskLocateResult(w io.Writer, result *DiskLocateResult) {
 	_, _ = fmt.Fprintf(w, "volid: %s\n", result.BareVolid)
+	if result.StableID != "" {
+		_, _ = fmt.Fprintf(w, "stable_id: %s\n", result.StableID)
+	}
+	if result.CurrentVolid != "" && result.CurrentVolid != result.BareVolid {
+		_, _ = fmt.Fprintf(w, "current_volid: %s (renamed by reassignment; envelope volid is the birth record)\n", result.CurrentVolid)
+	}
 	if result.Holder != nil {
 		_, _ = fmt.Fprintf(w, "holder: vmid=%d node=%s slot=%s\n", result.Holder.VMID, result.Holder.Node, result.Holder.Slot)
 	} else {

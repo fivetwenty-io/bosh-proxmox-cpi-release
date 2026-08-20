@@ -105,19 +105,50 @@ func EmbeddedDiskVMID(volid string) (int, bool) {
 // Slots whose volid carries no "vm-<n>-disk-<n>" label (cdrom/ISO, cloudinit)
 // are skipped — not persistent BOSH disks. Slots whose embedded VMID equals
 // ownerVMID are the VM's own root/ephemeral disks and are NOT returned (they
-// are destroyed with the VM). Returned volids are bare (option suffix stripped).
+// are destroyed with the VM) — UNLESS the drive entry carries a bpd- stable-ID
+// serial: a move_disk reassignment renames a persistent volume to match its
+// new owner, so after a transfer the embedded-VMID heuristic reads the disk
+// as the VM's own, and the guard built on it would let delete_vm destroy a
+// persistent disk. The serial is written only on CPI persistent disks, so its
+// presence is authoritative: such an entry is ALWAYS foreign. Returned volids
+// are bare (option suffix stripped).
 func FindForeignActiveDisks(cfg map[string]any, ownerVMID int) map[string]string {
 	out := make(map[string]string)
+	for slot, entry := range FindForeignActiveDiskDetails(cfg, ownerVMID) {
+		out[slot] = entry.Volid
+	}
+	return out
+}
+
+// ForeignActiveDisk is one foreign persistent-disk entry on an active bus
+// slot, with the stable-ID serial the drive carries (empty for legacy disks
+// recognized by the embedded-VMID heuristic alone).
+type ForeignActiveDisk struct {
+	Volid    string
+	StableID string
+}
+
+// FindForeignActiveDiskDetails is FindForeignActiveDisks with the stable-ID
+// serial preserved, for callers (delete_vm) that must pick a preservation
+// mechanism per disk: a renamed identity disk is owner-named, and a plain
+// detach would let PVE's unusedN sweep deallocate it, so it moves by
+// reassignment instead.
+func FindForeignActiveDiskDetails(cfg map[string]any, ownerVMID int) map[string]ForeignActiveDisk {
+	out := make(map[string]ForeignActiveDisk)
 	for slot, optstr := range qemu.ParseDisks(cfg) {
 		bare := optstr
 		if comma := strings.Index(optstr, ","); comma >= 0 {
 			bare = optstr[:comma]
 		}
+		if id, has := StableIDFromDriveOptStr(optstr); has {
+			out[slot] = ForeignActiveDisk{Volid: bare, StableID: id}
+			continue
+		}
 		vmid, ok := EmbeddedDiskVMID(bare)
 		if !ok || vmid == ownerVMID {
 			continue
 		}
-		out[slot] = bare
+		out[slot] = ForeignActiveDisk{Volid: bare}
 	}
 	return out
 }
@@ -183,6 +214,17 @@ type DiskCIDMeta struct {
 	// under. Empty on legacy CIDs; consumers fall back to the config-derived
 	// guess.
 	Format string `json:"f,omitempty"`
+	// ID is the disk's stable identity token ("bpd-" + 16 lowercase hex
+	// characters, 20 bytes — exactly PVE's drive-serial cap). Generated at
+	// create_disk time under the parked strategy and carried on the PVE side
+	// as a drive serial= option, so the identity survives the volume rename
+	// PVE performs on every move_disk reassignment. The envelope volid then
+	// becomes a birth record: consumers resolve the current volid through the
+	// stable-ID scan first and fall back to the birth volid for legacy CIDs
+	// (which stay volid-resolved forever — CIDs are immutable once stored by
+	// the Director, so a legacy disk can never gain an ID). Empty on legacy
+	// CIDs and on disks created under the "free" strategy.
+	ID string `json:"id,omitempty"`
 }
 
 // diskCIDPrefix marks the envelope disk CID format. Everything after the
@@ -257,7 +299,7 @@ func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) (string, error) {
 // (pvd-) and compressed (pvz-) encoders. A nil or all-zero meta is omitted.
 func marshalDiskCIDEnvelope(bareCID string, meta *DiskCIDMeta) ([]byte, error) {
 	env := diskCIDEnvelope{V: bareCID}
-	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0 || meta.Anchor || meta.Format != "") {
+	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0 || meta.Anchor || meta.Format != "" || meta.ID != "") {
 		env.M = meta
 	}
 	return json.Marshal(env)
@@ -407,6 +449,14 @@ func unmarshalDiskCIDEnvelope(cid string, raw []byte) (string, *DiskCIDMeta, err
 	if env.V == "" {
 		return "", nil, cpierrors.Cloud("invalid disk CID %q: envelope volid is empty", cid)
 	}
+	// A stable ID longer than PVE's drive-serial cap can never have been
+	// written to a drive entry, so no volume can carry it and no scan can
+	// resolve it — the CID is invalid, not merely unresolvable.
+	if env.M != nil && len(env.M.ID) > DiskStableIDLen {
+		return "", nil, cpierrors.Cloud(
+			"invalid disk CID %q: stable ID %q exceeds the %d-byte PVE drive-serial cap",
+			cid, env.M.ID, DiskStableIDLen)
+	}
 	return env.V, env.M, nil
 }
 
@@ -502,11 +552,35 @@ func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string
 // snapshot_disk asking whether the holder is a parker -- would otherwise pay a
 // second read of a config this function just discarded.
 func FindVMByDiskVolidTagged(ctx context.Context, c Client, fallbackNode, volid string) (int, string, string, error) {
+	hit, err := findVMByDiskIdentityScan(ctx, c, fallbackNode, volid, "")
+	return hit.VMID, hit.Node, hit.Tags, err
+}
+
+// DiskScanHit is one identity-scan result: the VM whose config references the
+// disk, plus everything the scan read on its way there — the tag string, the
+// bus slot, and the volid the config actually carries (which differs from the
+// birth volid after a move_disk reassignment renamed the volume).
+type DiskScanHit struct {
+	VMID  int
+	Node  string
+	Tags  string
+	Slot  string
+	Volid string
+}
+
+// findVMByDiskIdentityScan is the single cluster-wide disk scan behind
+// FindVMByDiskVolid and the stable-ID resolver. It reads every QEMU guest
+// config once and matches each active-bus drive entry two ways in the same
+// pass: by volid (exact or option-string prefix), and — when stableID is
+// non-empty — by a serial=<stableID> drive option. The serial match is what
+// finds a volume move_disk renamed, at zero extra API cost over the volid
+// scan every caller already paid.
+func findVMByDiskIdentityScan(ctx context.Context, c Client, fallbackNode, volid, stableID string) (DiskScanHit, error) {
 	if c == nil {
-		return 0, "", "", cpierrors.Cloud("FindVMByDiskVolid: client must not be nil")
+		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: client must not be nil")
 	}
 	if volid == "" {
-		return 0, "", "", cpierrors.Cloud("FindVMByDiskVolid: volid must not be empty")
+		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: volid must not be empty")
 	}
 
 	typeStr := "vm"
@@ -523,14 +597,14 @@ func FindVMByDiskVolidTagged(ctx context.Context, c Client, fallbackNode, volid 
 		// pvedaemon restart as permanent. The Director would give up on
 		// delete_disk and detach_disk instead of re-driving them. WrapError
 		// makes the retriable/permanent split on what the error actually is.
-		return 0, "", "", cpierrors.Wrap(WrapError(listErr), "FindVMByDiskVolid: list cluster resources")
+		return DiskScanHit{}, cpierrors.Wrap(WrapError(listErr), "FindVMByDiskVolid: list cluster resources")
 	}
 	if resources == nil {
 		// Retriable: a pvedaemon coming back up answers with an empty body, and
 		// the scan now runs on delete_disk, attach_disk, and detach_disk alike,
 		// so a permanent failure here fails all three during a restart that
 		// resolves itself in seconds.
-		return 0, "", "", cpierrors.Retriable("FindVMByDiskVolid: nil response from cluster resources")
+		return DiskScanHit{}, cpierrors.Retriable("FindVMByDiskVolid: nil response from cluster resources")
 	}
 
 	type resourceEntry struct {
@@ -552,7 +626,7 @@ func FindVMByDiskVolidTagged(ctx context.Context, c Client, fallbackNode, volid 
 		// retriably. One container anywhere in the cluster would then fail every
 		// park, unpark, and holder probe until somebody deleted it. A row that
 		// elides the field is kept, matching ListParkersForNode.
-		if entry.Type != "" && entry.Type != "qemu" {
+		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
 			continue
 		}
 
@@ -590,19 +664,41 @@ func FindVMByDiskVolidTagged(ctx context.Context, c Client, fallbackNode, volid 
 			if IsNotFound(cfgErr) || (entry.Type == "" && IsPmxcfsConfigMissing(cfgErr)) {
 				continue
 			}
-			return 0, "", "", cpierrors.Wrap(
+			return DiskScanHit{}, cpierrors.Wrap(
 				WrapConfigReadError(cfgErr),
 				fmt.Sprintf("FindVMByDiskVolid: Config error for vm %d on node %s", vmid, vmNode),
 			)
 		}
 
-		if DiskOptStrContainsVolid(qemu.ParseDisks(cfg), volid) {
+		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(cfg), volid, stableID); ok {
 			tags, _ := cfg["tags"].(string)
-			return vmid, vmNode, tags, nil
+			return DiskScanHit{VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current}, nil
 		}
 	}
 
-	return 0, "", "", fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+	return DiskScanHit{}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+}
+
+// matchDiskIdentity matches one parsed disk map against a disk identity: the
+// volid itself (exact or "<volid>,options" prefix), or — when stableID is
+// non-empty — a serial=<stableID> option on any entry. Returns the slot and
+// the bare volid the entry actually carries.
+func matchDiskIdentity(disks map[string]string, volid, stableID string) (slot, currentVolid string, ok bool) {
+	for id, v := range disks {
+		if v == volid || strings.HasPrefix(v, volid+",") {
+			return id, volid, true
+		}
+		if stableID != "" {
+			if serial, has := StableIDFromDriveOptStr(v); has && serial == stableID {
+				bare := v
+				if comma := strings.Index(v, ","); comma >= 0 {
+					bare = v[:comma]
+				}
+				return id, bare, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // FindVMByDiskVolidOrNone is a wrapper around FindVMByDiskVolid that maps the

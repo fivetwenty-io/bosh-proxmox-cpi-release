@@ -687,13 +687,36 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
 
     vm_cid, disk_cid = state["vm_cid"], state["disk_cid"]
     bare_volid = bare_disk_volid(disk_cid)
+    stable_id = _pve_verify.disk_stable_id(disk_cid)
+    if stable_id:
+        print(f"    disk carries stable ID {stable_id}: transfers move by reassignment")
     parkers_before = verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END)
     print(f"    parkers already on the node: {parkers_before or '(none)'}")
+
+    def verify_stable_id_carrier(note: str) -> None:
+        """Assert the disk's sole holder carries the serial= identity.
+
+        Self-gating: a legacy CID (no stable ID) skips with a note, so the
+        pass still runs against labs and configs that predate D13.
+        """
+        if not stable_id:
+            print(f"    stable-id verify skipped ({note}): CID carries no stable ID")
+            return
+        id_holders = verifier.disk_holders(disk_cid)
+        if len(id_holders) != 1:
+            raise RuntimeError(f"{note}: expected exactly one holder, got {id_holders}")
+        holder_vmid, holder_slot = id_holders[0]
+        opt_str = str(verifier.qemu_config(holder_vmid).get(holder_slot, ""))
+        verifier.assert_true(
+            f"{note}: holder {holder_vmid} slot {holder_slot} carries serial {stable_id}",
+            f"serial={stable_id}" in opt_str,
+        )
 
     step("11c. attach_disk (strategy=parked; unparks the disk if step 11 parked it)")
     call("attach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
     state["disk_attached"] = True
     print("attach_disk=ok")
+    verify_stable_id_carrier("after the parked attach")
 
     step("11d. detach_disk (strategy=parked)")
     call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
@@ -737,8 +760,9 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     # place it can surface, which is why the assertion is hard here.
     verifier.assert_true(
         f"parker {parker_vmid} records the disk in its provenance sentinel",
-        bare_volid in verifier.parked_disks(parker_vmid),
+        verifier.parked_disk_recorded(parker_vmid, disk_cid),
     )
+    verify_stable_id_carrier("after the parked detach")
     parker_tags = str(parker_cfg.get("tags", ""))
     verifier.assert_true(
         f"parker {parker_vmid} carries the CPI ownership tag",
@@ -870,17 +894,32 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     )
     verifier.assert_true(
         f"parker {parker_vmid} dropped the disk from its provenance sentinel",
-        bare_volid not in verifier.parked_disks(parker_vmid),
+        not verifier.parked_disk_recorded(parker_vmid, disk_cid),
     )
+    verify_stable_id_carrier("after the unpark attach")
 
     step("11j. detach_disk (strategy=free: the opt-out leaves the volume free-floating)")
     call("detach_disk", [vm_cid, disk_cid], config_path=free_cfg)
     state["disk_attached"] = False
+    if stable_id:
+        # A stable-ID disk's detached state is always parked, whatever the
+        # strategy says: its volume is named for whichever VM holds it, and
+        # PVE physically removes an owner-named volume when its last config
+        # reference is swept, so free-floating is not a state a renamed
+        # volume can safely reach. The CID's anchor promise outlives the
+        # strategy flip (see docs/persistent-disk-strategy.md).
+        id_holders = verifier.disk_holders(disk_cid)
+        verifier.assert_true(
+            "stable-ID disk stays parked even under strategy=free",
+            [h[0] for h in id_holders] == [parker_vmid],
+        )
+        verify_stable_id_carrier("after the strategy=free detach")
+    else:
+        verifier.assert_true(
+            "no VM holds the disk under strategy=free", verifier.disk_holders(disk_cid) == []
+        )
     verifier.assert_true(
-        "no VM holds the disk under strategy=free", verifier.disk_holders(disk_cid) == []
-    )
-    verifier.assert_true(
-        "the free-floating volume still exists", verifier.volume_exists(disk_cid)
+        "the detached volume still exists", verifier.volume_exists(disk_cid)
     )
 
     step("11k. attach_disk (strategy=free: a free-floating disk re-attaches)")
@@ -939,7 +978,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     )
     verifier.assert_true(
         f"parker {parker_vmid} dropped the disk from its provenance sentinel",
-        bare_volid not in verifier.parked_disks(parker_vmid),
+        not verifier.parked_disk_recorded(parker_vmid, disk_cid),
     )
 
     step("11l-ter. detach_disk (strategy=parked: re-park so the pass ends where it started)")
@@ -1271,7 +1310,7 @@ def main() -> int:
             )
             verifier.assert_true(
                 f"parker {parker_vmid} dropped the disk from its provenance sentinel",
-                bare_disk_volid(deleted_disk_cid) not in verifier.parked_disks(parker_vmid),
+                not verifier.parked_disk_recorded(parker_vmid, deleted_disk_cid),
             )
         state["disk_cid"] = ""
         state["disk_cleanup_cfg"] = ""

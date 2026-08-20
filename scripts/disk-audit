@@ -733,14 +733,20 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
                 else:
                     parker_provenance_cache[holder_vmid] = {}
             prov_map = parker_provenance_cache.get(holder_vmid, {})
-            # The sentinel map in parker.go is keyed by bareVolid (parker.go:229),
-            # where bareVolid is passed from detach_disk as bareDiskCID, which is
-            # ParseEncodedDiskCID(diskCID) — the full "storage:vm-N-disk-n" string
-            # with only the "|metadata" suffix stripped. The storage prefix is
-            # preserved. The PVE storage-content API returns the same full volid
-            # form, so look up by volid directly — not bare_volid() which would
-            # strip the storage prefix and produce a lookup miss.
+            # Two keying generations coexist in the sentinel map (parker.go):
+            # legacy entries are keyed by the full "storage:vm-N-disk-n" volid
+            # (the storage prefix preserved — the same form the PVE
+            # storage-content API returns, so look up by volid directly, not
+            # bare_volid() which would strip the prefix and miss); stable-ID
+            # entries are keyed by the disk's bpd- token and name the volid
+            # the parker currently holds the volume under in their "volid"
+            # field. Match either.
             prov = prov_map.get(volid) or {}
+            if not prov:
+                for entry in prov_map.values():
+                    if isinstance(entry, dict) and entry.get("volid") == volid:
+                        prov = entry
+                        break
             if isinstance(prov, dict):
                 rec.disk_cid = str(prov.get("disk_cid", "") or "")
                 rec.source_vm_cid = str(prov.get("source_vm_cid", "") or "")

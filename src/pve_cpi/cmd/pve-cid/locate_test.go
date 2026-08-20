@@ -88,7 +88,7 @@ func TestLocateDisk_HolderFoundOnBusSlot(t *testing.T) {
 		},
 	}
 
-	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0")
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0", "")
 	if err != nil {
 		t.Fatalf("locateDisk error = %v", err)
 	}
@@ -119,7 +119,7 @@ func TestLocateDisk_SentinelOnlyMatch(t *testing.T) {
 		},
 	}
 
-	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0")
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0", "")
 	if err != nil {
 		t.Fatalf("locateDisk error = %v", err)
 	}
@@ -147,7 +147,7 @@ func TestLocateDisk_Unattached(t *testing.T) {
 		},
 	}
 
-	result, err := locateDisk(context.Background(), r, "local-lvm:vm-does-not-exist-disk-0")
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-does-not-exist-disk-0", "")
 	if err != nil {
 		t.Fatalf("locateDisk error = %v", err)
 	}
@@ -169,7 +169,7 @@ func TestLocateDisk_SkipsVMsWithConfigFetchFailure(t *testing.T) {
 			"pve1/200": diskCfg("", map[string]string{"scsi1": "local-lvm:vm-500-disk-0"}),
 		},
 	}
-	result, err := locateDisk(context.Background(), r, "local-lvm:vm-500-disk-0")
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-500-disk-0", "")
 	if err != nil {
 		t.Fatalf("locateDisk error = %v", err)
 	}
@@ -178,9 +178,39 @@ func TestLocateDisk_SkipsVMsWithConfigFetchFailure(t *testing.T) {
 	}
 }
 
+func TestLocateDisk_SerialMatchesRenamedVolume(t *testing.T) {
+	const stableID = "bpd-0011223344556677"
+	r := &fakeReader{
+		vms: []ClusterVM{
+			{VMID: 700, Node: "pve1", Name: "vm-a"},
+		},
+		configs: map[string]map[string]any{
+			// The birth volid (vm-9500) is gone: a reassignment renamed the
+			// volume for VM 700. The drive serial is the surviving identity.
+			"pve1/700": diskCfg("", map[string]string{
+				"scsi1": "local-lvm:vm-700-disk-2,serial=" + stableID + ",size=64G",
+			}),
+		},
+	}
+
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0", stableID)
+	if err != nil {
+		t.Fatalf("locateDisk error = %v", err)
+	}
+	if result.Holder == nil || result.Holder.VMID != 700 || result.Holder.Slot != "scsi1" {
+		t.Fatalf("holder = %+v, want the serial-matched slot", result.Holder)
+	}
+	if result.CurrentVolid != "local-lvm:vm-700-disk-2" {
+		t.Errorf("current_volid = %q, want the renamed name", result.CurrentVolid)
+	}
+	if result.StableID != stableID {
+		t.Errorf("stable_id = %q", result.StableID)
+	}
+}
+
 func TestLocateDisk_ListClusterVMsError(t *testing.T) {
 	r := &fakeReader{listClusterVMsErr: fmt.Errorf("boom")}
-	if _, err := locateDisk(context.Background(), r, "x:y"); err == nil {
+	if _, err := locateDisk(context.Background(), r, "x:y", ""); err == nil {
 		t.Fatal("expected error to propagate from ListClusterVMs")
 	}
 }
@@ -305,25 +335,44 @@ func TestResolveBareVolid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeDiskCID: %v", err)
 	}
-	got, err := resolveBareVolid(cid)
+	got, gotID, err := resolveBareVolid(cid)
 	if err != nil {
 		t.Fatalf("resolveBareVolid(pvd-): %v", err)
 	}
 	if got != "local:vm-1-disk-0" {
 		t.Errorf("got %q, want %q", got, "local:vm-1-disk-0")
 	}
+	if gotID != "" {
+		t.Errorf("stable ID for meta-less CID: got %q, want empty", gotID)
+	}
+
+	// pvd- envelope carrying a stable ID
+	idCID, err := pve.EncodeDiskCID("local:vm-3-disk-0", &pve.DiskCIDMeta{ID: "bpd-0011223344556677"})
+	if err != nil {
+		t.Fatalf("EncodeDiskCID with ID: %v", err)
+	}
+	got, gotID, err = resolveBareVolid(idCID)
+	if err != nil {
+		t.Fatalf("resolveBareVolid(pvd- with ID): %v", err)
+	}
+	if got != "local:vm-3-disk-0" || gotID != "bpd-0011223344556677" {
+		t.Errorf("got (%q, %q), want (%q, %q)", got, gotID, "local:vm-3-disk-0", "bpd-0011223344556677")
+	}
 
 	// raw volid passthrough
-	got, err = resolveBareVolid("local:vm-2-disk-0")
+	got, gotID, err = resolveBareVolid("local:vm-2-disk-0")
 	if err != nil {
 		t.Fatalf("resolveBareVolid(raw volid): %v", err)
 	}
 	if got != "local:vm-2-disk-0" {
 		t.Errorf("got %q, want %q", got, "local:vm-2-disk-0")
 	}
+	if gotID != "" {
+		t.Errorf("stable ID for raw volid: got %q, want empty", gotID)
+	}
 
 	// garbage
-	if _, err := resolveBareVolid("not-a-volid-or-cid"); err == nil {
+	if _, _, err := resolveBareVolid("not-a-volid-or-cid"); err == nil {
 		t.Error("expected error for garbage input")
 	}
 }

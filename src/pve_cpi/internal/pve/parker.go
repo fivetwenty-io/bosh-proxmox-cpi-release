@@ -151,16 +151,33 @@ type ParkContext struct {
 	// SourceVMCID is the BOSH VM CID from which the disk was detached. Omitted
 	// when unknown (e.g. re-park on retry when only the bare volid is available).
 	SourceVMCID string
+	// StableID is the disk's stable identity token (DiskCIDMeta.ID). When set,
+	// the parker attach carries it as a serial= drive option so the identity
+	// rides the drive entry, and the provenance record is keyed by it instead
+	// of the volid — a move_disk reassignment renames the volume, so a
+	// volid-keyed record would be orphaned by the first transfer. Empty for
+	// legacy disks, which keep the volid keying forever.
+	StableID string
 }
 
 // parkerProvEntry is a single parked-disk record stored in the sentinel.
 // Optional fields are omitted when empty so the JSON stays minimal.
+//
+// Legacy entries are keyed by the bare volid and omit Volid/Slot. Stable-ID
+// entries are keyed by the disk's bpd- token and carry Volid (the volid the
+// parker currently — or imminently, during a transfer — holds the volume
+// under) plus Slot (the parker bus slot a detach-side transfer targets).
+// During a transfer the entry is the intent record D13's write ordering
+// requires: written before the source VM's slot is deleted, finalized with
+// the landed volid after the serial is re-applied.
 type parkerProvEntry struct {
 	DiskCID     string `json:"disk_cid"`
 	SourceVMCID string `json:"source_vm_cid,omitempty"`
 	ParkedAt    string `json:"parked_at"`
 	Node        string `json:"node"`
 	DirectorID  string `json:"director_id,omitempty"`
+	Volid       string `json:"volid,omitempty"`
+	Slot        string `json:"slot,omitempty"`
 }
 
 // parseParkerSentinel extracts the description text outside the sentinel
@@ -213,26 +230,34 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 // park different disks on the same parker may each overwrite the other's
 // provenance entry. The disk itself remains correctly attached; provenance
 // is advisory metadata for disk-audit.
-func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig, pctx ParkContext) {
-	vmidStr := fmt.Sprintf("%d", parkerVMID)
-
-	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
-	if err != nil {
+func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) {
+	entry := buildParkerProvEntry(node, bareVolid, slot, cfg, pctx)
+	if err := writeParkerProvenance(ctx, c, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry); err != nil {
 		if logger != nil {
-			logger.Warn("parker provenance: config fetch failed — provenance not updated",
+			logger.Warn("parker provenance: provenance not updated",
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
 				log.Err(err),
 			)
 		}
-		return
 	}
+}
 
-	currentDesc := DescriptionFromConfig(vmCfg)
+// parkerProvKey is the sentinel key a provenance entry lives under: the
+// stable ID when the disk has one (rename-proof), the bare volid otherwise.
+func parkerProvKey(bareVolid, stableID string) string {
+	if stableID != "" {
+		return stableID
+	}
+	return bareVolid
+}
 
-	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
-
+// buildParkerProvEntry assembles one provenance record. Volid and Slot are
+// recorded only for stable-ID disks — legacy entries keep their exact
+// pre-stable-ID JSON shape, which external readers (scripts/disk-audit,
+// scripts/_pve_verify.py, pve-cid) parse.
+func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) parkerProvEntry {
 	// disk_cid: prefer the full encoded CID from ParkContext (as the Director
 	// knows it); fall back to bareVolid when context is absent.
 	diskCIDField := bareVolid
@@ -246,38 +271,44 @@ func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 		Node:        node,
 		DirectorID:  cfg.DirectorID,
 	}
-	disks[bareVolid] = entry
+	if pctx.StableID != "" {
+		entry.Volid = bareVolid
+		entry.Slot = slot
+	}
+	return entry
+}
+
+// writeParkerProvenance is the strict read-modify-write behind every
+// provenance update. Ordinary parks treat a failure as advisory (the
+// best-effort wrapper above); the detach-side transfer does not — its intent
+// record is the crash-window identity carrier, so the transfer refuses to
+// delete the source slot until this write has landed.
+func writeParkerProvenance(ctx context.Context, c Client, node string, parkerVMID int, key string, entry parkerProvEntry) error {
+	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+	if err != nil {
+		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
+	}
+
+	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	disks[key] = entry
 
 	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: marshal failed — provenance not updated",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("volid", bareVolid),
-				log.Err(marshalErr),
-			)
-		}
-		return
+		return cpierrors.Wrap(marshalErr, "parker provenance: marshal")
 	}
 
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {
 		// No nodes service available (e.g. test stub without injection). Skip silently.
-		return
+		return nil
 	}
-	updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
+	vmidStr := fmt.Sprintf("%d", parkerVMID)
+	if updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
 		Description: &newDesc,
-	})
-	if updateErr != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: UpdateQemuConfig failed — provenance not updated",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("node", node),
-				log.String("volid", bareVolid),
-				log.Err(updateErr),
-			)
-		}
+	}); updateErr != nil {
+		return cpierrors.Wrap(WrapMutationError(updateErr), "parker provenance: UpdateQemuConfig")
 	}
+	return nil
 }
 
 // removeParkerProvenance removes the bareVolid entry from the parker VM
@@ -311,11 +342,21 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 
 	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
 
+	// Match both keyings: legacy entries are keyed by the bare volid; stable-ID
+	// entries are keyed by the bpd- token and name the volid in their Volid
+	// field. The caller only ever knows the volid it just moved off the parker,
+	// and that matches exactly one entry under either scheme.
+	removed := false
+	for key, entry := range disks {
+		if key == bareVolid || entry.Volid == bareVolid {
+			delete(disks, key)
+			removed = true
+		}
+	}
 	// Absent entry — nothing to remove; skip the API call.
-	if _, exists := disks[bareVolid]; !exists {
+	if !removed {
 		return
 	}
-	delete(disks, bareVolid)
 
 	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
@@ -577,7 +618,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		// unpark on the node. A container is never a parker; skip it. A row
 		// that elides "type" is kept: dropping it would be the same
 		// band-exhausting mistake as dropping a row with no node.
-		if entry.Type != "" && entry.Type != "qemu" {
+		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
 			continue
 		}
 		vmid := int(entry.VMID)
@@ -1178,10 +1219,13 @@ const freshParkerAttempts = 3
 // the park's protection write against the unpark's window closes that, and it
 // also stops a park claiming a slot an unpark is about to detach by name.
 func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
+	var landedSlot string
 	if lockErr := withParkerProtectionLock(ctx, c, logger, parkerVMID, "park", func(wctx context.Context) error {
-		if attachErr := attachToParkerLocked(wctx, c, logger, node, parkerVMID, bareVolid); attachErr != nil {
+		slot, attachErr := attachToParkerLocked(wctx, c, logger, node, parkerVMID, bareVolid, pctx.StableID)
+		if attachErr != nil {
 			return attachErr
 		}
+		landedSlot = slot
 		reassertParkerProtection(wctx, c, logger, node, parkerVMID)
 		return nil
 	}); lockErr != nil {
@@ -1193,7 +1237,7 @@ func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node str
 	// that matters -- while a config read plus a description write on a parker
 	// carrying up to 31 sentinel entries is real time added to a critical
 	// section that must finish inside the lock's TTL.
-	updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg, pctx)
+	updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, landedSlot, cfg, pctx)
 	return nil
 }
 
@@ -1207,7 +1251,11 @@ const attachParkerVerifyRetries = 5
 
 // attachToParkerLocked reads the current config of parkerVMID, selects the first free
 // scsiN slot, calls AttachDisk with an explicit DiskID, then re-reads the
-// config to confirm the chosen slot actually holds bareVolid.
+// config to confirm the chosen slot actually holds bareVolid. Returns the
+// slot the volume landed on. When stableID is non-empty the attach bakes a
+// serial=<stableID> option into the drive entry — the parker slot is the
+// disk's identity carrier while it is parked, and a reassignment to a
+// workload VM carries the whole option string with it (D13).
 //
 // Slot-race verify (F-W6-03): the PVE config PUT for an explicit DiskID is
 // blind — two concurrent parks can both pick scsi0, and PVE replaces the slot
@@ -1219,7 +1267,7 @@ const attachParkerVerifyRetries = 5
 // attachParkerVerifyRetries. Exhausting free slots returns ErrNoSlots so the
 // caller falls through to a fresh parker; exhausting the retry budget returns a
 // retriable error so the Director re-drives the park.
-func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string) (err error) {
+func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, stableID string) (landedSlot string, err error) {
 	// Slots proven to hold someone else's volid after our attach — never retry these.
 	stolen := make(map[string]bool)
 	// Set once a slot is lost to a concurrent park, which is the moment PVE
@@ -1282,7 +1330,7 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 			// VM.Audit/VM.Config.Disk grant never comes right on its own, and
 			// labelling it retriable makes the Director drive a park forever
 			// against a permission that has to be granted by hand.
-			return cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			return "", cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
 		}
 
@@ -1302,7 +1350,7 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 			// ErrNoSlots — caller decides what to do, unless the deferred sweep
 			// above finds this parker still references the volume, in which case
 			// it converts this into a permanent unswept-reference error.
-			return slotErr
+			return "", slotErr
 		}
 
 		// AttachDisk returns the disk key it wrote ("scsi3"), NOT a UPID: the
@@ -1311,15 +1359,22 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 		// asked PVE for the status of task "scsi0" and failed every park the
 		// first time this code met a real cluster. There is no task to await;
 		// the read-after-write below is the completion check.
+		// The serial rides in the volid argument: PVE accepts the full drive
+		// option string there, and this is the attach boundary — the only
+		// point D13 permits writing an identity serial.
+		volidArg := bareVolid
+		if stableID != "" {
+			volidArg = bareVolid + ",serial=" + stableID
+		}
 		var attachErr error
 		retryErr := RetryOnTransientOrLock(ctx, logger, "park_disk_attach", parkerWindowMaxAttempts, func() error {
-			_, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, bareVolid, "scsi", &qemu.AttachOpts{
+			_, attachErr = c.QEMU().AttachDisk(ctx, node, parkerVMID, volidArg, "scsi", &qemu.AttachOpts{
 				DiskID: slot,
 			})
 			return attachErr
 		})
 		if retryErr != nil {
-			return cpierrors.Wrap(WrapMutationError(retryErr),
+			return "", cpierrors.Wrap(WrapMutationError(retryErr),
 				fmt.Sprintf("attachToParker: attach %q at slot %s on parker vmid %d", bareVolid, slot, parkerVMID))
 		}
 
@@ -1332,11 +1387,11 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 		// unusedN key and answers 200.
 		verifyCfg, verifyErr := c.QEMU().Config(ctx, node, parkerVMID)
 		if verifyErr != nil {
-			return cpierrors.Wrap(WrapConfigReadError(verifyErr),
+			return "", cpierrors.Wrap(WrapConfigReadError(verifyErr),
 				fmt.Sprintf("attachToParker: verify config read for parker vmid %d", parkerVMID))
 		}
 		if slotHoldsVolid(qemu.ParseDisks(verifyCfg), slot, bareVolid) {
-			return nil
+			return slot, nil
 		}
 
 		// A concurrent park won this slot. Mark it stolen and retry the next free
@@ -1353,7 +1408,7 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 		}
 	}
 
-	return cpierrors.Retriable(
+	return "", cpierrors.Retriable(
 		"attachToParker: slot verify failed after %d attempts for %q on parker vmid %d (concurrent park contention)",
 		attachParkerVerifyRetries, bareVolid, parkerVMID,
 	)
@@ -1707,6 +1762,26 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 			return nil
 		}
 		return sweepDemotedUnderProtection(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
+	}
+
+	// A volume named for the parker that holds it must never take this path.
+	// The SDK's DetachDisk sweeps the unusedN entry PVE demotes the volume to,
+	// and PVE physically removes an unused volume its holder owns — so a
+	// legacy unpark of a parker-owned volume deletes the disk it is meant to
+	// free. Two states produce that name: a stable-ID disk a reassignment
+	// transferred onto this parker (the normal renamed state, moved off by
+	// reassignment only), and a legacy volume whose synthetic creation VMID
+	// collides with the parker band (a band-overlap misconfiguration the
+	// sweep's own guard also refuses). Refusing up front turns a silent
+	// deletion into an actionable error either way.
+	if embedded, ok := EmbeddedDiskVMID(bareVolid); ok && embedded == parkerVMID {
+		return cpierrors.Cloud(
+			"UnparkDisk: volume %q is named for parker vmid %d, which owns it; a config-edit detach would let "+
+				"PVE deallocate it. A stable-ID disk moves off its parker by reassignment (attach_disk does this "+
+				"itself); a legacy volume with this name means the parker band overlaps the disk VMID band -- "+
+				"correct parked_disk_vmid_range_start/end",
+			bareVolid, parkerVMID,
+		)
 	}
 
 	// Every parker carries protection=1, and PVE states that the flag "will

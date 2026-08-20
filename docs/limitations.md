@@ -19,6 +19,12 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - Free-floating disks carry no PVE-side provenance
   PVE volumes have no metadata field independent of a VM config slot, so under the free-floating strategy the CID suffix in the Director database is the only provenance record. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md#what-is-not-recorded).
 
+- Reassignment transfer is same-node only
+  PVE's `move_disk` refuses to reassign a volume between VMs on different nodes, even on shared storage. A stable-ID disk that was previously transferred (its volume is named for its parker) cannot attach to a VM on another node until the stopped parker is migrated there (`qm migrate`) or the VM is recreated on the disk's node; `attach_disk` refuses with both escapes in the message. Fresh parked disks, still under their birth name, attach cross-node through the config-edit path as before. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
+
+- Stable-ID disks always park on detach
+  A volume renamed by a reassignment cannot safely be left free-floating (PVE deallocates an owner-named volume when its last config reference is swept), so a stable-ID disk's detached state is parked even under `detached_disk_strategy: free`. Legacy disks keep the configured strategy's behavior. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
+
 ## Storage and stemcells
 
 - `:heavy:` stemcells and a cross-cluster shared export do not mix

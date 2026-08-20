@@ -24,6 +24,12 @@ import (
 
 // attachedDisksSentinelKey is the top-level sentinel JSON key holding the
 // bare-volid -> director-supplied-disk_cid map on a workload VM's description.
+//
+// Keying: legacy disks use the bare volid; stable-ID disks use the bpd-
+// token, because a move_disk reassignment renames the volume and a
+// volid-keyed entry would be orphaned by the first transfer. Readers
+// (get_disks) look up by the drive entry's serial first and fall back to the
+// bare volid, so both generations of entries stay readable forever.
 const attachedDisksSentinelKey = "bosh_attached_disks"
 
 // parseAttachedDisksSentinel extracts the nonBOSH prefix and the current
@@ -147,13 +153,22 @@ func UpdateAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 	}
 }
 
-// RemoveAttachedDiskCID removes the bareVolid entry from the workload VM's
-// description sentinel. When no entry exists, no API call is made.
+// RemoveAttachedDiskCID removes the entries stored under any of the given
+// keys from the workload VM's description sentinel — callers pass the bare
+// volid and, for stable-ID disks, the bpd- token, so both keying generations
+// are cleared in one read-modify-write. When no entry exists under any key,
+// no API call is made.
 //
 // Best-effort: any failure is logged at WARN and the function returns
 // without error — detach_disk's success is never gated on this write.
-func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, node string, vmid int, bareVolid string) {
-	if c == nil || node == "" || vmid <= 0 || bareVolid == "" {
+func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, node string, vmid int, keys ...string) {
+	live := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k != "" {
+			live = append(live, k)
+		}
+	}
+	if c == nil || node == "" || vmid <= 0 || len(live) == 0 {
 		return
 	}
 	vmidStr := fmt.Sprintf("%d", vmid)
@@ -164,7 +179,7 @@ func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 			logger.Warn("attached-disk CID: config fetch failed on remove — CID not removed",
 				log.Int("vmid", vmid),
 				log.String("node", node),
-				log.String("volid", bareVolid),
+				log.String("volid", live[0]),
 				log.Err(err),
 			)
 		}
@@ -173,11 +188,18 @@ func RemoveAttachedDiskCID(ctx context.Context, c Client, logger *log.Logger, no
 
 	nonBOSH, disks, rawOther := parseAttachedDisksSentinel(DescriptionFromConfig(vmCfg))
 
-	// Absent entry — nothing to remove; skip the API call.
-	if _, exists := disks[bareVolid]; !exists {
+	removed := false
+	for _, k := range live {
+		if _, exists := disks[k]; exists {
+			delete(disks, k)
+			removed = true
+		}
+	}
+	// Absent entries — nothing to remove; skip the API call.
+	if !removed {
 		return
 	}
-	delete(disks, bareVolid)
+	bareVolid := live[0]
 
 	newDesc, marshalErr := renderAttachedDisksSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
