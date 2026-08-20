@@ -1747,8 +1747,9 @@ func warnFastPathDeleteNonRootIdentity(cfg *CPIConfig, out io.Writer) {
 // VMs are allocated, and under "free" it is read-only — it lets the holder
 // scans recognize disks parked earlier (bosh-parker tag inside the band) and
 // unpark them on the next attach_disk or delete_disk, instead of refusing them
-// as stranded. detached_disk_strategy therefore controls exactly one thing:
-// whether newly detached disks get parked. Call it only after the VM, disk,
+// as stranded. detached_disk_strategy decides whether newly detached disks get
+// parked and whether a parker-band overlap is a hard load error (Validate
+// checks the overlap only under "parked"). Call it only after the VM, disk,
 // and template bands have been defaulted.
 //
 // It also carries the upgrade guard. When the strategy was DEFAULTED rather
