@@ -66,6 +66,8 @@ func TestCreateDisk_StorageTypes(t *testing.T) {
 			}
 
 			cfg := testConfigWith(WithStorageType(tc.storageType))
+			// Opt out of the parked default; parker paths have dedicated tests.
+			cfg.DetachedDiskStrategy = "free"
 			deps := handlers.Deps{
 				Config: cfg,
 				PVE:    newHandlerMockClient(storageSvc, nil),

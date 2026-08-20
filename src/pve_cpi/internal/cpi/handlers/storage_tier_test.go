@@ -86,7 +86,9 @@ func TestStorageTier_TypeMatch(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"block": {Types: []string{"lvmthin"}},
 		},
@@ -126,7 +128,9 @@ func TestStorageTier_SharedMatch(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"shared": {Shared: boolPtr(true)},
 		},
@@ -167,7 +171,9 @@ func TestStorageTier_CombinedCriteria(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"shared-zfs": {Types: []string{"zfspool"}, Shared: boolPtr(true)},
 		},
@@ -209,7 +215,9 @@ func TestStorageTier_LexicographicFirst(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"zfs": {Types: []string{"zfspool"}},
 		},
@@ -245,8 +253,10 @@ func TestStorageTier_UnknownTier(t *testing.T) {
 
 	cs := &multiClusterStorage{}
 	cfg := &config.CPIConfig{
-		Node:         testNode,
-		StorageTiers: map[string]config.StorageTierCriteria{},
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
+		StorageTiers:         map[string]config.StorageTierCriteria{},
 	}
 	deps := depsWithTierCS(cfg, cs, nil)
 
@@ -286,7 +296,9 @@ func TestStorageTier_ZeroMatches(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"ssd": {Types: []string{"rbd"}},
 		},
@@ -326,7 +338,9 @@ func TestStorageTier_ExplicitPoolWinsNoLiveQuery(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"shared": {Shared: boolPtr(true)},
 		},
@@ -371,8 +385,10 @@ func TestStorageTier_NoKey_NoLiveQuery(t *testing.T) {
 
 	cs := &multiClusterStorage{}
 	cfg := &config.CPIConfig{
-		Node:        testNode,
-		DiskStorage: storageName,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
+		DiskStorage:          storageName,
 	}
 	storageSvc := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, _ int, _ string) (string, error) {
@@ -408,7 +424,9 @@ func TestStorageTier_ListAPIError(t *testing.T) {
 		listErr: errors.New("PVE cluster unreachable"),
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"fast": {Types: []string{"lvmthin"}},
 		},
@@ -439,7 +457,9 @@ func TestStorageTier_EmptyTypesWithSharedConstraint(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		// No Types restriction — any storage type; Shared must be true.
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"any-shared": {Shared: boolPtr(true)},
@@ -482,7 +502,9 @@ func TestStorageTier_LocalTierFilter(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"local": {Shared: boolPtr(false)},
 		},
@@ -529,11 +551,13 @@ func TestStorageTier_CreateVM_TierResolvesPool(t *testing.T) {
 	}
 
 	cfg := &config.CPIConfig{
-		Node:           vmNode,
-		VMStorage:      "", // force tier resolution path
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMIDRangeStart: 100,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 vmNode,
+		VMStorage:            "", // force tier resolution path
+		NetworkBridge:        "vmbr0",
+		AgentMode:            "noagent",
+		VMIDRangeStart:       100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"shared": {Shared: boolPtr(true)},
 		},

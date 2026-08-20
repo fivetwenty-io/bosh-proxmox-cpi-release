@@ -27,6 +27,8 @@ func depsForCreateDiskWithStorageType(storageSvc *mockStorageService, storageTyp
 			Node:         testNode,
 			DiskStorage:  storageName,
 			VMDiskFormat: "qcow2",
+			// Opt out of the parked default; parker paths have dedicated tests.
+			DetachedDiskStrategy: "free",
 		},
 		PVE: client,
 	}

@@ -94,9 +94,11 @@ the CID, confirms it still exists on the expected node, and attaches it.
 
 When `detached_disk_strategy` is `parked` (or absent), the CPI maintains a fleet of
 dedicated "parker" VMs. A detached disk is immediately attached to a parker VM
-in an active `scsiN` slot. The parker VM is never started, carries
-`protection=1`, and has `onboot=0`. Its sole purpose is to give every detached
-disk a PVE-visible, protected home.
+in an active `scsiN` slot, and a freshly created disk is parked the same way
+before `create_disk` returns its CID, so a volume is never exposed unowned in
+the window between creation and its first attach. The parker VM is never
+started, carries `protection=1`, and has `onboot=0`. Its sole purpose is to
+give every detached disk a PVE-visible, protected home.
 
 ### Parker VM properties
 
@@ -150,6 +152,22 @@ Free-floating disks have no provenance entry because PVE provides no field to
 write one. That gap is why `disk-audit` classifies free-floating volumes
 separately: their presence is inferred from the CID band rather than a recorded
 origin.
+
+### Create lifecycle (parked strategy)
+
+1. BOSH calls `create_disk`.
+2. The CPI creates the volume and encodes its CID.
+3. The CPI calls `ParkDisk` on the fresh volume before returning the CID, so
+   the disk already sits on a protected parker when the Director first learns
+   its name. The provenance entry carries the disk CID but no
+   `source_vm_cid` (the disk was never attached to a VM).
+4. Park failure is fail-closed: `create_disk` returns the error, unparks
+   best-effort in case the park half-committed, deletes the volume, and the
+   Director's retry re-creates from scratch.
+
+The first `attach_disk` (or a `create_vm` carrying `disk_cids`) unparks the
+disk through the same holder guard every attach path uses, exactly as it
+would for a disk parked by `detach_disk`.
 
 ### Detach lifecycle (parked strategy)
 

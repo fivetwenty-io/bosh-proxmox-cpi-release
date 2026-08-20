@@ -1081,6 +1081,24 @@ def main() -> int:
             verifier.volume_exists(state["disk_cid"]),
         )
 
+        # The parked strategy parks a fresh disk at create, before anything
+        # attaches it, so it is never exposed as an unowned free-floating
+        # volume. Assert the parker holds it already. Under strategy=free the
+        # fresh disk stays free-floating; nothing to assert there.
+        base_strategy = str(_base_cfg.get("detached_disk_strategy") or "parked").strip().lower()
+        if PARKED_DISK_TEST == "on" and base_strategy == "parked":
+            fresh_holders = verifier.disk_holders(state["disk_cid"])
+            if len(fresh_holders) != 1:
+                raise RuntimeError(
+                    "expected exactly one parker to hold the fresh disk after "
+                    f"create_disk, got {fresh_holders}"
+                )
+            fresh_parker, fresh_slot = fresh_holders[0]
+            verifier.assert_true(
+                f"fresh disk parked on parker {fresh_parker} at {fresh_slot}",
+                fresh_parker in verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END),
+            )
+
         step("6a. has_disk (post-create)")
         hd = call("has_disk", [state["disk_cid"]])
         if hd is not True:

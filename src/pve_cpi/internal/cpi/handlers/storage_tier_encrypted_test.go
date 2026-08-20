@@ -36,7 +36,9 @@ func encryptedCSEntries() []map[string]any {
 // they are valid (at least one of Types/Shared must be set per validateStorageTiers).
 func cfgWithEncryptedTiers() *config.CPIConfig {
 	return &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier":   {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 			"plain-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(false)},
@@ -173,7 +175,9 @@ func TestStorageTierEncrypted_NoEncryptedTierError(t *testing.T) {
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			// no encrypted:true marker on any tier
 			"plain-tier": {Types: []string{"rbd"}},
@@ -353,11 +357,13 @@ func TestStorageTierEncrypted_EphemeralEncryptedTierSelected(t *testing.T) {
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 
 	cfg := &config.CPIConfig{
-		Node:           vmNode,
-		VMStorage:      "plain-pool",
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMIDRangeStart: 100,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 vmNode,
+		VMStorage:            "plain-pool",
+		NetworkBridge:        "vmbr0",
+		AgentMode:            "noagent",
+		VMIDRangeStart:       100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 		},
@@ -442,7 +448,9 @@ func TestStorageTierEncrypted_AutoSelectNoTierNamed(t *testing.T) {
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	// Config has two encrypted tiers; lex-first is "a-enc-tier" → enc-pool.
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"a-enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 			"b-enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
@@ -486,7 +494,9 @@ func TestStorageTierEncrypted_AutoSelectDeterministicTwoTiers(t *testing.T) {
 		},
 	}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			// lex order: "tier-a" < "tier-b"
 			"tier-a": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
@@ -526,7 +536,9 @@ func TestStorageTierEncrypted_AutoSelectNoEncryptedTierInConfig(t *testing.T) {
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node: testNode,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 testNode,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"plain-tier": {Types: []string{"rbd"}}, // no Encrypted:*true
 		},
@@ -597,11 +609,13 @@ func TestStorageTierEncrypted_EphemeralExplicitPoolContradictsEncrypted(t *testi
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node:           vmNode,
-		VMStorage:      "plain-pool",
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMIDRangeStart: 100,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 vmNode,
+		VMStorage:            "plain-pool",
+		NetworkBridge:        "vmbr0",
+		AgentMode:            "noagent",
+		VMIDRangeStart:       100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 		},
@@ -676,11 +690,13 @@ func TestStorageTierEncrypted_EphemeralAutoSelectNoTierNamed(t *testing.T) {
 
 	cs := &multiClusterStorage{entries: encryptedCSEntries()}
 	cfg := &config.CPIConfig{
-		Node:           vmNode,
-		VMStorage:      "plain-pool",
-		NetworkBridge:  "vmbr0",
-		AgentMode:      "noagent",
-		VMIDRangeStart: 100,
+		// Opt out of the parked default; parker paths have dedicated tests.
+		DetachedDiskStrategy: "free",
+		Node:                 vmNode,
+		VMStorage:            "plain-pool",
+		NetworkBridge:        "vmbr0",
+		AgentMode:            "noagent",
+		VMIDRangeStart:       100,
 		StorageTiers: map[string]config.StorageTierCriteria{
 			"enc-tier": {Types: []string{"rbd"}, Encrypted: boolPtr(true)},
 		},

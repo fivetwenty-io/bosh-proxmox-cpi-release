@@ -340,6 +340,8 @@ As a side effect, `set_vm_metadata` renames the PVE VM display name to `<vm_pref
 
 `cloud_properties.retain_on_delete` (Boolean, optional) — when `true`, the CPI encodes `retain_on_delete=1` into the disk CID metadata. On `delete_vm`, this flag causes the disk to appear in WARN logs as operator-retained rather than incidentally foreign. Persistent disks are already protected by the foreign-VMID guard; this field adds an explicit audit trail. The encoded intent is carried in the disk CID and is readable without querying PVE VM config.
 
+**Parked disk strategy:** Under `pve.detached_disk_strategy: parked` (the default), the fresh volume is parked on a dedicated parker VM before the CID is returned, so a created-but-not-yet-attached disk is never exposed as an unowned free-floating volume. The first attach unparks it through the same holder guard every attach path uses. A park failure is fail-closed: `create_disk` returns the error, deletes the volume (unparking first, best-effort), and the Director's retry re-creates from scratch. See [persistent-disk-strategy.md](persistent-disk-strategy.md).
+
 ---
 
 ### `delete_disk`

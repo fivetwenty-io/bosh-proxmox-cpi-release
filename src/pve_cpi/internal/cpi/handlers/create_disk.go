@@ -448,6 +448,13 @@ func HandleCreateDisk(deps Deps) Handler {
 			if success {
 				return
 			}
+			// Under the parked strategy the disk may already sit on a parker
+			// slot by the time a later step fails; delete would then rip the
+			// volume out from under that reference. Unpark first (best-effort;
+			// a no-op when the park never ran or never committed).
+			if deps.Config.DetachedDiskParkedEnabled() {
+				unparkCreatedDiskForRollback(ctx, deps, bareDiskCID)
+			}
 			rollbackCreatedVolume(ctx, deps, node, storage, canonicalVolID, deps.Log(ctx))
 		}()
 
@@ -510,6 +517,14 @@ func HandleCreateDisk(deps Deps) Handler {
 				"create_disk: encoded disk CID is %d characters, exceeding the %d-character limit enforced by MySQL-backed BOSH Directors (varchar(255) disk_cid column); set pve.disk_cid_compression: true in the CPI manifest to enable gzip envelope compression",
 				len(diskCID), pve.DiskCIDLengthTarget,
 			)
+		}
+
+		// Park the fresh disk before returning the CID so it is never handed
+		// to the Director unowned (see parkFreshDisk). Runs after the CID
+		// length check: a CID that is about to be rejected should not spend
+		// the parker round trips first.
+		if parkErr := parkFreshDisk(ctx, deps, node, diskCID, bareDiskCID); parkErr != nil {
+			return nil, parkErr
 		}
 
 		// Apply operator-supplied tags to the attached VM, if any. PVE has
@@ -714,4 +729,69 @@ func rollbackCreatedVolume(
 	logger.Info("create_disk: rolled back created volume after failure",
 		log.String("volid", canonicalVolID),
 	)
+}
+
+// parkFreshDisk parks a just-created volume onto a parker VM when
+// detached_disk_strategy=parked, so create_disk never returns a CID for an
+// unowned disk. Between create_disk and the eventual attach_disk the volume
+// otherwise carries no protection flag and no tags (a real window during
+// deploys, indefinite when the deploy fails before attaching), leaving it
+// fully exposed to orphan sweeps. attach_disk and create_vm both unpark
+// through the shared holder guard, so a disk parked here attaches exactly
+// like one parked by detach_disk. No-op under strategy=free.
+//
+// Failure is fail-closed: the caller returns the error, the deferred rollback
+// unparks (best-effort, in case the park half-committed) and deletes the
+// volume, and a Director retry re-creates from scratch.
+func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID string) error {
+	if !deps.Config.DetachedDiskParkedEnabled() {
+		return nil
+	}
+	parkerCfg := pve.ParkerConfig{
+		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
+		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
+		DirectorID:     deps.RequestDirectorUUID,
+		// DiskStorage feeds WithStorageScan on parker VMID allocation so a
+		// VMID whose number is already claimed by orphaned volumes on the
+		// disk storage is skipped (same guard detach_disk's park applies).
+		DiskStorage: deps.Config.DiskStorage,
+		// Always true here (the gate above), recorded for the holder scan's
+		// log-level choice.
+		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
+	}
+	pctx := pve.ParkContext{DiskCID: diskCID}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
+		return retriableUnlessPermanent(parkErr,
+			fmt.Sprintf("create_disk: park fresh disk %s (fail-closed: rollback deletes the volume)", diskCID))
+	}
+	return nil
+}
+
+// unparkCreatedDiskForRollback best-effort detaches a possibly-parked fresh
+// disk from its parker before the rollback delete, so a half-registered
+// parker slot never outlives the volume it references. Runs on a detached,
+// bounded context like rollbackCreatedVolume. All failures are logged and
+// swallowed: the volume delete still runs, and the provenance-tagged
+// disk-audit sweep covers whatever a crash mid-rollback leaves behind.
+func unparkCreatedDiskForRollback(ctx context.Context, deps Deps, bareDiskCID string) {
+	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer rbCancel()
+	logger := deps.Log(rollbackCtx)
+	parkerCfg := parkerReadConfigFor(deps)
+	holder, resolveErr := pve.ResolveDiskHolder(rollbackCtx, deps.PVE, logger, bareDiskCID, parkerCfg)
+	if resolveErr != nil {
+		logger.Warn("create_disk: rollback holder scan failed; volume delete may be refused while a parker still references it",
+			log.String("volid", bareDiskCID),
+			log.Err(resolveErr),
+		)
+		return
+	}
+	// UnparkDiskAt is a no-op when the resolved holder is not a parker,
+	// which covers every failure path that never reached parkFreshDisk.
+	if unparkErr := pve.UnparkDiskAt(rollbackCtx, deps.PVE, logger, bareDiskCID, holder, parkerCfg); unparkErr != nil {
+		logger.Warn("create_disk: rollback unpark failed",
+			log.String("volid", bareDiskCID),
+			log.Err(unparkErr),
+		)
+	}
 }

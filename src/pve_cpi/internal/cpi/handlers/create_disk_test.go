@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 
@@ -53,6 +54,10 @@ func baseDepsForCreate(t *testing.T, storageSvc *mockStorageService, clusterVMID
 			Node:         testNode,
 			DiskStorage:  storageName,
 			VMDiskFormat: "qcow2",
+			// Opt out of the parked default so these tests exercise the
+			// volume-creation mechanics without parker mocks; the parked
+			// create path has dedicated tests below.
+			DetachedDiskStrategy: "free",
 		},
 		PVE:    newHandlerMockClient(storageSvc, clusterVMIDs),
 		Logger: log.NewNopLogger(),
@@ -1632,5 +1637,161 @@ func TestHandleCreateDisk_CompressionHardErrorsWhenStillOver255(t *testing.T) {
 	}
 	if deletedVolume == "" {
 		t.Error("expected the just-created volume to be rolled back (DeleteVolumeAsync called), got none")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parked strategy: fresh disks are parked at create
+// ---------------------------------------------------------------------------
+
+// createDiskDepsParked builds Deps with detached_disk_strategy=parked and a
+// parker-capable PVE mock, mirroring detachDepsParked but with a storage
+// service wired for volume creation. The cluster lists only workload VM 100,
+// so the disk VMID allocator picks 9000 and EnsureParker allocates 90000.
+func createDiskDepsParked(storageSvc *mockStorageService, qemuSvc *parkerQEMUService) handlers.Deps {
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                     testNode,
+			DiskStorage:              storageName,
+			VMDiskFormat:             "qcow2",
+			DetachedDiskStrategy:     "parked",
+			ParkedDiskVMIDRangeStart: 90000,
+			ParkedDiskVMIDRangeEnd:   90999,
+		},
+		PVE: &mockPVEClient{
+			storageSvc: storageSvc,
+			qemuSvc:    qemuSvc,
+			tasksSvc:   &mockTasksService{},
+			clusterSvc: parkerEmptyClusterSvc(),
+		},
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleCreateDisk_ParkedStrategy_ParksFreshDisk verifies that under the
+// parked strategy the just-created volume is attached to a parker VM before
+// create_disk returns, so the disk is never handed back to the Director
+// unowned (no protection flag, no tags, full orphan-sweep exposure).
+func TestHandleCreateDisk_ParkedStrategy_ParksFreshDisk(t *testing.T) {
+	t.Parallel()
+
+	var createdVolid string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			createdVolid = fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid)
+			return createdVolid, nil
+		},
+	}
+	var attachedVolid, attachedSlot string
+	var attachedVMID int
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      100,
+		parkerVMIDStart: 90000,
+		sourceCfg:       map[string]any{"name": "vm-100"},
+		parkerCfg:       map[string]any{"tags": "bosh-parker"},
+		attachDiskFn: func(_ context.Context, _ string, vmid int, vol, _ string, opts *sdkqemu.AttachOpts) (string, error) {
+			attachedVMID = vmid
+			attachedVolid = vol
+			if opts != nil {
+				attachedSlot = opts.DiskID
+			}
+			return "", nil
+		},
+	}
+
+	h := handlers.HandleCreateDisk(createDiskDepsParked(storageSvc, qemuSvc))
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+		json.RawMessage(`null`),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	diskCID, ok := result.(string)
+	if !ok || diskCID == "" {
+		t.Fatalf("expected non-empty string disk_cid, got %#v", result)
+	}
+	if attachedVolid != createdVolid {
+		t.Errorf("park attach volid: want %q, got %q", createdVolid, attachedVolid)
+	}
+	if attachedSlot != "scsi0" {
+		t.Errorf("park attach slot: want scsi0, got %q", attachedSlot)
+	}
+	if attachedVMID < 90000 || attachedVMID > 90999 {
+		t.Errorf("park attach vmid: want in parker band 90000-90999, got %d", attachedVMID)
+	}
+}
+
+// TestHandleCreateDisk_ParkedStrategy_ParkFailureRollsBack verifies the
+// fail-closed contract: when the park cannot complete, create_disk returns
+// the error and the deferred rollback deletes the just-created volume so
+// nothing leaks. The rollback's best-effort unpark is a no-op here (the
+// attach never committed, so the holder scan finds the disk free-floating).
+func TestHandleCreateDisk_ParkedStrategy_ParkFailureRollsBack(t *testing.T) {
+	t.Parallel()
+
+	var createdVolid, deletedVolid string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			createdVolid = fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid)
+			return createdVolid, nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, volume string) (string, error) {
+			deletedVolid = volume
+			return "", nil
+		},
+	}
+	qemuSvc := &parkerQEMUService{
+		sourceVMID:      100,
+		parkerVMIDStart: 90000,
+		sourceCfg:       map[string]any{"name": "vm-100"},
+		parkerCfg:       map[string]any{"tags": "bosh-parker"},
+		attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+			return "", errors.New("parker attach exploded")
+		},
+	}
+
+	h := handlers.HandleCreateDisk(createDiskDepsParked(storageSvc, qemuSvc))
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+		json.RawMessage(`null`),
+	}, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected error when parking the fresh disk fails")
+	}
+	if !strings.Contains(err.Error(), "park fresh disk") {
+		t.Errorf("error must name the park step, got: %v", err)
+	}
+	if deletedVolid != createdVolid {
+		t.Errorf("rollback delete: want %q, got %q", createdVolid, deletedVolid)
+	}
+}
+
+// TestHandleCreateDisk_FreeStrategy_NeverTouchesParker proves the opt-out:
+// under strategy=free the create path makes no parker, cluster, or task
+// calls at all. baseDepsForCreate wires no QEMU and no task service, so any
+// park attempt would panic.
+func TestHandleCreateDisk_FreeStrategy_NeverTouchesParker(t *testing.T) {
+	t.Parallel()
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, storage string, _ int, _ string, vmid int, _ string) (string, error) {
+			return fmt.Sprintf("%s:vm-%d-disk-0", storage, vmid), nil
+		},
+	}
+	deps := baseDepsForCreate(t, storageSvc, nil)
+
+	h := handlers.HandleCreateDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+		json.RawMessage(`null`),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cid, ok := result.(string); !ok || cid == "" {
+		t.Fatalf("expected non-empty string disk_cid, got %#v", result)
 	}
 }

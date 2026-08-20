@@ -96,6 +96,8 @@ func suGateLoggerDeps(
 			DiskStorage:  storageName,
 			VMDiskFormat: "qcow2",
 			Storage:      storageCfg,
+			// Opt out of the parked default; parker paths have dedicated tests.
+			DetachedDiskStrategy: "free",
 		},
 		PVE: &mockPVEClient{
 			storageSvc: storageSvc,
