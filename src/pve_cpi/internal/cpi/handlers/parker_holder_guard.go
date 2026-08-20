@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 )
 
@@ -39,6 +41,10 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// "parked" and logs at debug under "free"/stand-down, where the band
 		// may legitimately overlap vmid_range.
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
+		// A parker that vanishes between the cluster listing and its config
+		// read (or before an unpark detach) is refused under strict rather
+		// than silently treated as free-floating. See ParkerConfig.AnchorStrict.
+		AnchorStrict: deps.Config.ParkedAnchorStrictValue(),
 	}
 }
 
@@ -81,6 +87,47 @@ func retriableUnlessPermanent(err error, msg string) error {
 func isTypedCPIError(err error) bool {
 	var typed *cpierrors.Error
 	return errors.As(err, &typed)
+}
+
+// anchorMissingRefusal returns the strict-mode refusal for a disk whose CID
+// envelope promises a parker anchor while the holder scan found no holder at
+// all. Under the parked strategy a promised disk is on a parker whenever it is
+// detached (create_disk parks it at birth, detach_disk re-parks it), so
+// "promised and free-floating" has one cause: a parker VM was deleted
+// out-of-band, and every operation that then treats the volume as free runs
+// against a disk whose anchor — protection flag, provenance, PVE-visible
+// ownership — silently vanished.
+//
+// Permissive outcomes, in order: a holder was found (the normal guards apply);
+// the CID carries no promise (legacy disks and disks created under "free" —
+// their anchor was never promised); the strategy is not "parked" (free-floating
+// is the expected detached state there); pve.parked_anchor_strict is false
+// (the escape hatch for labs that intentionally delete parkers — logged so the
+// choice is visible).
+func anchorMissingRefusal(ctx context.Context, deps Deps, method, diskCID string, meta *pve.DiskCIDMeta, holder pve.DiskHolder) error {
+	if holder.Found {
+		return nil
+	}
+	if meta == nil || !meta.Anchor {
+		return nil
+	}
+	if !deps.Config.DetachedDiskParkedEnabled() {
+		return nil
+	}
+	if !deps.Config.ParkedAnchorStrictValue() {
+		deps.Log(ctx).Warn("parked anchor missing; proceeding because pve.parked_anchor_strict is false",
+			log.String("method", method),
+			log.String("disk_cid", diskCID),
+		)
+		return nil
+	}
+	return cpierrors.Cloud(
+		"%s: disk %s was created under the parked strategy and its CID promises a parker anchor, but no VM "+
+			"in the cluster references the volume; the parker holding it was likely deleted out-of-band. "+
+			"Verify the volume is intact on storage, then set pve.parked_anchor_strict: false to proceed "+
+			"against the free-floating volume and retry",
+		method, diskCID,
+	)
 }
 
 // strandedParkerRefusal returns a refusal when a volume's holder carries the

@@ -1257,7 +1257,7 @@ func attachPersistentDisks(
 		if _, _, parseErr := pve.ParseDiskCID(bareDiskCID); parseErr != nil {
 			return cpierrors.Cloud("create_vm: parse disk_cid %q: %s", diskCID, parseErr.Error())
 		}
-		if err := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", diskCID, bareDiskCID, vmid); err != nil {
+		if err := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", diskCID, bareDiskCID, meta, vmid); err != nil {
 			return err
 		}
 		diskID, devPath, err := attachDiskCore(ctx, deps, "create_vm", vmCID, shape.node, vmid, diskCID, bareDiskCID, meta)

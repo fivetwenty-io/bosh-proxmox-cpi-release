@@ -167,6 +167,14 @@ type DiskCIDMeta struct {
 	// no options were requested; the encoded CID is byte-identical to prior
 	// releases.
 	Opts map[string]string `json:"opts,omitempty"`
+	// Anchor records that the disk was created under the parked strategy and
+	// is promised a parker anchor whenever it is detached. The attach and
+	// delete holder guards read it: a detached disk carrying this promise
+	// with no holder anywhere in the cluster means a parker VM was deleted
+	// out-of-band (see pve.parked_anchor_strict). Omitted when false, so
+	// legacy CIDs and disks created under "free" decode to false and keep
+	// the permissive behavior — their anchor was never promised.
+	Anchor bool `json:"anchor,omitempty"`
 }
 
 // diskCIDPrefix marks the envelope disk CID format. Everything after the
@@ -241,7 +249,7 @@ func EncodeDiskCID(bareCID string, meta *DiskCIDMeta) (string, error) {
 // (pvd-) and compressed (pvz-) encoders. A nil or all-zero meta is omitted.
 func marshalDiskCIDEnvelope(bareCID string, meta *DiskCIDMeta) ([]byte, error) {
 	env := diskCIDEnvelope{V: bareCID}
-	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0) {
+	if meta != nil && (meta.Pool != "" || meta.Node != "" || meta.AZ != "" || len(meta.Opts) > 0 || meta.Anchor) {
 		env.M = meta
 	}
 	return json.Marshal(env)

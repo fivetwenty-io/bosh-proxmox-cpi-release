@@ -22,7 +22,7 @@ import (
 // volume out from under a live reference is not a failure mode worth saving a
 // cluster scan over. A holder that is an ordinary VM is left to the existing
 // behavior, which the optional disk_delete_state_guard governs.
-func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID string) error {
+func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID string, meta *pve.DiskCIDMeta) error {
 	if deps.Config == nil {
 		return nil
 	}
@@ -30,6 +30,13 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, diskCID, bareDiskCID str
 	holder, resolveErr := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if resolveErr != nil {
 		return wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
+	}
+	// A disk whose CID promises a parker anchor must have a holder while
+	// detached; no holder at all means the parker vanished out-of-band, and
+	// deleting the volume would destroy the one copy of the data before
+	// anyone has looked at why its protected home disappeared.
+	if anchorErr := anchorMissingRefusal(ctx, deps, "delete_disk", diskCID, meta, holder); anchorErr != nil {
+		return anchorErr
 	}
 	if strandedErr := strandedParkerRefusal(deps, "delete_disk", diskCID, holder); strandedErr != nil {
 		return strandedErr
@@ -86,7 +93,8 @@ func HandleDeleteDisk(deps Deps) Handler {
 			return nil, cpierrors.Cloud("delete_disk: disk_cid must not be empty")
 		}
 		// Strip optional metadata suffix before any PVE API or storage lookup.
-		bareDiskCID, _, decErr := decodeDiskCID(ctx, deps, "delete_disk", diskCID)
+		// meta feeds the anchor-missing check in unparkBeforeDelete.
+		bareDiskCID, meta, decErr := decodeDiskCID(ctx, deps, "delete_disk", diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}
@@ -146,7 +154,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		//     Unpark failure → retriable; the disk is still safe on the
 		//     parker VM and the caller can retry.
 		// ----------------------------------------------------------------
-		if err := unparkBeforeDelete(ctx, deps, diskCID, bareDiskCID); err != nil {
+		if err := unparkBeforeDelete(ctx, deps, diskCID, bareDiskCID, meta); err != nil {
 			return nil, err
 		}
 

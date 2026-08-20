@@ -470,6 +470,12 @@ func HandleCreateDisk(deps Deps) Handler {
 			Node: node,
 			AZ:   cloudProps.AvailabilityZone,
 			Opts: diskPerfOpts,
+			// The parked strategy promises this disk a parker anchor whenever
+			// it is detached (parkFreshDisk below parks it right away). The
+			// promise rides in the CID so the attach/delete holder guards can
+			// tell a legitimately free-floating legacy disk from one whose
+			// parker vanished (see pve.parked_anchor_strict).
+			Anchor: deps.Config.DetachedDiskParkedEnabled(),
 		}
 		// With disk_cid_compression enabled, a CID whose pvd- form would
 		// overflow MySQL-backed Directors' varchar(255) disk_cid column is
@@ -757,7 +763,10 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID st
 		DiskStorage: deps.Config.DiskStorage,
 		// Always true here (the gate above), recorded for the holder scan's
 		// log-level choice.
+		// Same strict anchor invariant the read paths apply; see
+		// ParkerConfig.AnchorStrict.
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
+		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {

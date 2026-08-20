@@ -2672,3 +2672,146 @@ func TestUnparkDiskAt_DemotedOnly_SweepReadFails_DoesNotReportSuccess(t *testing
 		t.Errorf("the error must carry the commands that clear the reference, got: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Anchor-missing invariant (pve.parked_anchor_strict) — the two library-level
+// races where a parker the scan identified vanishes before it can be used.
+// ---------------------------------------------------------------------------
+
+// anchorStrictCfg returns the default parker band with the strict anchor
+// invariant armed the way the handlers arm it under the parked strategy.
+func anchorStrictCfg() pve.ParkerConfig {
+	cfg := parkerTestCfg()
+	cfg.ParkedEnabled = true
+	cfg.AnchorStrict = true
+	return cfg
+}
+
+// vanishingHolderQEMU returns a parkerQEMU whose config read for holderVMID
+// succeeds once (the cluster-wide volid scan) and 404s afterwards (the
+// follow-up read), simulating a parker deleted out-of-band between the two.
+func vanishingHolderQEMU(holderVMID int, bareVolid string, configCalls *int) *parkerQEMU {
+	return &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid != holderVMID {
+				return map[string]any{}, nil
+			}
+			*configCalls++
+			if *configCalls == 1 {
+				return map[string]any{"scsi0": bareVolid}, nil
+			}
+			return nil, makeAPIErr(404, "no such VM")
+		},
+	}
+}
+
+// TestResolveDiskHolder_AnchorStrict_VanishedMidScan_Refused: the cluster scan
+// finds the disk on an in-band VMID, and the follow-up config read 404s (the
+// parker was deleted out-of-band between the two reads). Strict must refuse
+// with an error naming the vanished VMID and the escape hatch, where the
+// permissive default treats the disk as free-floating.
+func TestResolveDiskHolder_AnchorStrict_VanishedMidScan_Refused(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	holderVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var configCalls int
+	qemuSvc := vanishingHolderQEMU(holderVMID, bareVolid, &configCalls)
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(holderVMID), "node": node},
+		), nil
+	})
+
+	_, err := pve.ResolveDiskHolder(context.Background(), c, nopLogger(), bareVolid, anchorStrictCfg())
+	if err == nil {
+		t.Fatal("expected the strict anchor refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "90000") || !strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("refusal must name the vanished VMID and the escape hatch, got: %v", err)
+	}
+}
+
+// TestResolveDiskHolder_AnchorPermissive_VanishedMidScan_FreeFloating pins the
+// permissive behavior the strict flag replaces: without AnchorStrict the same
+// race resolves to "no holder".
+func TestResolveDiskHolder_AnchorPermissive_VanishedMidScan_FreeFloating(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	holderVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var configCalls int
+	qemuSvc := vanishingHolderQEMU(holderVMID, bareVolid, &configCalls)
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(holderVMID), "node": node},
+		), nil
+	})
+
+	holder, err := pve.ResolveDiskHolder(context.Background(), c, nopLogger(), bareVolid, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("permissive config must not error, got: %v", err)
+	}
+	if holder.Found {
+		t.Errorf("permissive config must report no holder, got vmid %d", holder.VMID)
+	}
+}
+
+// TestUnparkDiskAt_AnchorStrict_ParkerVanished_Refused: the caller resolved a
+// parker holder, and the parker's config read under the unpark lock 404s.
+// Strict must refuse instead of reporting an unpark that never ran.
+func TestUnparkDiskAt_AnchorStrict_ParkerVanished_Refused(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return nil, makeAPIErr(404, "no such VM")
+			}
+			return map[string]any{}, nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	})
+
+	holder := pve.DiskHolder{Found: true, VMID: parkerVMID, Node: node, IsParker: true, Slot: "scsi0"}
+	err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, anchorStrictCfg())
+	if err == nil {
+		t.Fatal("expected the strict anchor refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "90000") || !strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("refusal must name the vanished parker and the escape hatch, got: %v", err)
+	}
+}
+
+// TestUnparkDiskAt_AnchorPermissive_ParkerVanished_NoError pins the permissive
+// behavior: without AnchorStrict a vanished parker means nothing to unpark.
+func TestUnparkDiskAt_AnchorPermissive_ParkerVanished_NoError(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	parkerVMID := 90000
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == parkerVMID {
+				return nil, makeAPIErr(404, "no such VM")
+			}
+			return map[string]any{}, nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil
+	})
+
+	holder := pve.DiskHolder{Found: true, VMID: parkerVMID, Node: node, IsParker: true, Slot: "scsi0"}
+	if err := pve.UnparkDiskAt(context.Background(), c, nopLogger(), bareVolid, holder, parkerTestCfg()); err != nil {
+		t.Fatalf("permissive config must not error, got: %v", err)
+	}
+}

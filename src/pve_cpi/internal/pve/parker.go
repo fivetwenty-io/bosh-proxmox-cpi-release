@@ -110,6 +110,15 @@ type ParkerConfig struct {
 	// NowFunc returns the current time. Nil defaults to time.Now().UTC().
 	// Tests inject a fixed clock to assert parked_at values deterministically.
 	NowFunc func() time.Time
+	// AnchorStrict enforces the anchor-missing invariant: when a parker the
+	// holder scan identified vanishes before its config can be read
+	// (resolveDiskHolder) or before the unpark detach runs (unparkAtLocked),
+	// strict refuses with a Cloud error naming the vanished parker and the
+	// recovery, instead of silently treating the volume as free-floating.
+	// A parker is durable infrastructure the CPI never deletes, so a vanished
+	// one means an out-of-band deletion. Gated on ParkedEnabled: under "free"
+	// or a stood-down default the permissive behavior stands regardless.
+	AnchorStrict bool
 }
 
 // parkerNow returns the configured clock time or time.Now().UTC() when NowFunc is nil.
@@ -800,8 +809,23 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
 	if cfgErr != nil {
 		if parkerConfigGone(cfgErr) {
-			// Holder vanished between the scan and the read — the disk is
-			// free-floating as far as this call is concerned.
+			// Holder vanished between the scan and the read. The cluster
+			// listing said a VM inside the parker band references the volume,
+			// and now that VM has no config: the CPI never deletes parkers, so
+			// under the strict invariant this is an out-of-band deletion, not
+			// a benign race, and proceeding as free-floating would run against
+			// a volume whose anchor vanished.
+			if cfg.AnchorStrict && cfg.ParkedEnabled {
+				return diskHolder{}, cpierrors.Cloud(
+					"disk holder vmid %d (node %s) sits inside the parker band [%d,%d] but its config "+
+						"vanished mid-scan; a parker VM holding %s was likely deleted out-of-band. Verify the "+
+						"volume is intact, then set pve.parked_anchor_strict: false to treat it as "+
+						"free-floating and retry",
+					holderVMID, holderNode, cfg.VMIDRangeStart, cfg.VMIDRangeEnd, bareVolid,
+				)
+			}
+			// Permissive: the disk is free-floating as far as this call is
+			// concerned.
 			return diskHolder{}, nil
 		}
 		// WrapError keeps a 403 permanent: it names a grant to add, and no
@@ -1639,7 +1663,20 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	verifyCfg, verifyErr := c.QEMU().Config(ctx, parkerNode, parkerVMID)
 	if verifyErr != nil {
 		if parkerConfigGone(verifyErr) {
-			// The parker is gone, and with it the reference. Nothing to unpark.
+			// The parker vanished between the holder scan and this read. The
+			// CPI never deletes parkers, so under the strict invariant this is
+			// an out-of-band deletion: refuse rather than report an unpark
+			// that never ran against a volume whose anchor is missing.
+			if cfg.AnchorStrict && cfg.ParkedEnabled {
+				return cpierrors.Cloud(
+					"UnparkDisk: parker vmid %d (node %s) vanished before the detach of %s; the parker "+
+						"anchor is missing (deleted out-of-band). Verify the volume is intact, then set "+
+						"pve.parked_anchor_strict: false to treat it as free-floating and retry",
+					parkerVMID, parkerNode, bareVolid,
+				)
+			}
+			// Permissive: the parker is gone, and with it the reference.
+			// Nothing to unpark.
 			return nil
 		}
 		return cpierrors.Wrap(WrapConfigReadError(verifyErr),

@@ -475,6 +475,11 @@
   detached_disk_strategy = p("pve.detached_disk_strategy", "")
   config["detached_disk_strategy"] = detached_disk_strategy unless detached_disk_strategy.to_s.empty?
 
+  # Emit parked_anchor_strict only when the operator set it. The property
+  # carries no spec default, so if_p fires only on an operator-provided value;
+  # the Go accessor treats an absent key as strict (true).
+  if_p("pve.parked_anchor_strict") { |v| config["parked_anchor_strict"] = v }
+
   # Emit disk_cid_compression only when enabled. An absent key keeps the Go
   # zero value (false), byte-identical to prior releases.
   if p("pve.disk_cid_compression", false)

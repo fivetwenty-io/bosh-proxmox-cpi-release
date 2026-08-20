@@ -169,6 +169,22 @@ The first `attach_disk` (or a `create_vm` carrying `disk_cids`) unparks the
 disk through the same holder guard every attach path uses, exactly as it
 would for a disk parked by `detach_disk`.
 
+### Anchor invariant
+
+A disk created under the parked strategy carries a promise in its CID
+envelope (`anchor`) that a parker VM holds it whenever it is detached. The
+CPI never deletes parkers, so a promised disk with no holder anywhere in the
+cluster means the parker was deleted out-of-band. Under
+`pve.parked_anchor_strict` (unset or `true`, the default), `attach_disk`,
+`create_vm` with `disk_cids`, and `delete_disk` refuse that state with an
+error naming the recovery; the same applies when a parker the holder scan
+identified vanishes before its config can be read or before the unpark
+detach runs. Setting the property to `false` restores the permissive
+treat-as-free-floating behavior for labs that intentionally delete parkers.
+Disks created before this release, or under the `free` strategy, carry no
+promise and are always handled permissively. See
+[Troubleshooting](troubleshooting.md#parker-anchor-missing-parked-disk-with-no-holder).
+
 ### Detach lifecycle (parked strategy)
 
 1. BOSH calls `detach_disk`.

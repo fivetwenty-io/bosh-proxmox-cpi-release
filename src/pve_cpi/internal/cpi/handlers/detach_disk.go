@@ -284,7 +284,10 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		FallbackNode: deps.Config.Node,
 		// Always true here (the gate above), recorded for the holder scan's
 		// log-level choice.
+		// Same strict anchor invariant the read paths apply; see
+		// ParkerConfig.AnchorStrict.
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
+		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
 	}
 	// "Is it already parked?" and "is a real VM holding it?" are two readings of
 	// one fact, and the cluster-wide sweep that establishes that fact is the
@@ -416,7 +419,10 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 		DiskStorage: deps.Config.DiskStorage,
 		// Always true here (the gate above), recorded for the holder scan's
 		// log-level choice.
+		// Same strict anchor invariant the read paths apply; see
+		// ParkerConfig.AnchorStrict.
 		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
+		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
 	}
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID}
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {

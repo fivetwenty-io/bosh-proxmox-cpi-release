@@ -628,6 +628,21 @@ type CPIConfig struct {
 	// Use DetachedDiskParkedEnabled() to gate parker logic.
 	DetachedDiskStrategy string `json:"detached_disk_strategy,omitempty"`
 
+	// ParkedAnchorStrict controls the anchor-missing invariant of the parked
+	// strategy. A disk whose CID envelope promises a parker anchor
+	// (created under "parked") should always be held by a parker VM while
+	// detached; when the holder scan finds no holder at all, or a parker the
+	// scan identified vanishes before it can be read or unparked, the anchor
+	// is missing — a parker VM was deleted out-of-band. Strict (nil or true,
+	// the default) refuses the operation with a Cloud error naming the
+	// recovery; false restores the permissive behavior of treating the volume
+	// as free-floating, for labs that intentionally delete parkers. Disks
+	// without the envelope promise (legacy, or created under "free") are
+	// always permissive — their anchor was never promised.
+	// Use ParkedAnchorStrictValue() for the effective value. Omit from ERB
+	// when unset.
+	ParkedAnchorStrict *bool `json:"parked_anchor_strict,omitempty"`
+
 	// DiskCIDCompression opts create_disk into the pvz- compressed disk CID
 	// format for CIDs whose standard pvd- envelope would exceed 255 characters
 	// (the varchar(255) disk_cid column of MySQL-backed Directors). CIDs that
@@ -2897,6 +2912,16 @@ func (c *CPIConfig) DetachedDiskStrategyValue() string {
 // includes the unset default.
 func (c *CPIConfig) DetachedDiskParkedEnabled() bool {
 	return c.DetachedDiskStrategyValue() == DetachedDiskStrategyParked
+}
+
+// ParkedAnchorStrictValue resolves pve.parked_anchor_strict: unset (nil) means
+// strict, the default. See the ParkedAnchorStrict field comment for what the
+// invariant covers.
+func (c *CPIConfig) ParkedAnchorStrictValue() bool {
+	if c == nil || c.ParkedAnchorStrict == nil {
+		return true
+	}
+	return *c.ParkedAnchorStrict
 }
 
 // ParkedStrategyActive reports whether any parker-related behavior should be

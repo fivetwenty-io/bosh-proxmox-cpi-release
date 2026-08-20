@@ -121,7 +121,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// nodes, so the disk node established by attachDiskResolveNode remains
 		// valid.
 		// --------------------------------------------------------------------
-		if err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", diskCID, bareDiskCID, vmid); err != nil {
+		if err := guardAndUnparkBeforeAttach(ctx, deps, "attach_disk", diskCID, bareDiskCID, meta, vmid); err != nil {
 			return nil, err
 		}
 
@@ -688,7 +688,7 @@ func devicePathByID(diskID string) (string, error) {
 //
 // The scan cost is one ListResources plus a config read per VM — the same scan
 // the unpark probe pays for under either strategy.
-func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, diskCID, bareDiskCID string, targetVMID int) error {
+func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, diskCID, bareDiskCID string, meta *pve.DiskCIDMeta, targetVMID int) error {
 	if deps.Config == nil {
 		return nil
 	}
@@ -696,6 +696,12 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, diskC
 	holder, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, parkerCfg)
 	if err != nil {
 		return wrapHolderScanError(err, fmt.Sprintf("%s: resolve current holder of disk %s", op, diskCID))
+	}
+
+	// A disk whose CID promises a parker anchor must have a holder while
+	// detached; no holder at all means the parker vanished out-of-band.
+	if anchorErr := anchorMissingRefusal(ctx, deps, op, diskCID, meta, holder); anchorErr != nil {
+		return anchorErr
 	}
 
 	if holder.Found && !holder.IsParker && holder.VMID != targetVMID {

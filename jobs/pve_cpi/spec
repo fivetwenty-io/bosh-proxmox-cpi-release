@@ -1360,6 +1360,21 @@ properties:
                    to "free" only stops NEW detaches from parking. delete_vm
                    and snapshot_disk still refuse a parker VM by tag.
     default: ""
+  pve.parked_anchor_strict:
+    description: |
+      Anchor-missing invariant for the parked strategy. A disk created under
+      "parked" carries a promise in its CID that a parker VM holds it whenever
+      it is detached. When the cluster-wide holder scan then finds no holder
+      at all, or a parker the scan identified vanishes before it can be read
+      or unparked, the anchor is missing: a parker VM was deleted out-of-band.
+      Unset or true (strict, the default): attach_disk, create_vm with
+      disk_cids, and delete_disk refuse with an error naming the recovery
+      instead of proceeding against a volume whose protected home silently
+      disappeared. Set false to restore the permissive behavior (the volume
+      is treated as free-floating), for labs that intentionally delete parker
+      VMs. Disks without the promise in their CID (created before this
+      release, or under the "free" strategy) are always handled permissively;
+      their anchor was never promised.
   pve.disk_cid_compression:
     description: |
       Opt-in: when true, a disk CID whose standard pvd- envelope would exceed

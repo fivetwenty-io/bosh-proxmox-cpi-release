@@ -511,6 +511,33 @@ The resize operation returns a PVE error indicating the new size is smaller than
 
 PVE does not support disk shrink. You can only increase disk size. See [Persistent Disks — Known Limitations](persistent-disks.md#known-limitations).
 
+### Parker anchor missing (parked disk with no holder)
+
+**Symptom**
+
+```text
+attach_disk: disk <cid> was created under the parked strategy and its CID promises a parker anchor, but no VM in the cluster references the volume; the parker holding it was likely deleted out-of-band. Verify the volume is intact on storage, then set pve.parked_anchor_strict: false to proceed against the free-floating volume and retry
+```
+
+or, when a parker vanishes between the cluster listing and its config read:
+
+```text
+disk holder vmid <N> (node X) sits inside the parker band [90000,90999] but its config vanished mid-scan; a parker VM holding <volid> was likely deleted out-of-band. ...
+```
+
+**Diagnosis**
+
+A disk created under the parked strategy is held by a parker VM whenever it is detached; the CPI never deletes parkers, so a promised disk with no holder means someone removed the parker out-of-band (`qm destroy` after clearing protection, a cluster restore, a cleanup script). The volume itself may still be intact on storage. Check:
+
+```bash
+pvesm list <disk_storage> | grep <volid>
+./scripts/disk-audit --config cpi.json
+```
+
+**Fix**
+
+Verify the volume exists and its data is intact. Then set `pve.parked_anchor_strict: false` in the CPI manifest (or cpi-config entry) and retry: the CPI treats the disk as free-floating, and the next detach re-parks it onto a fresh parker, restoring the anchor. Re-enable strict afterwards (remove the property). Labs that intentionally delete parkers can leave the property false. See [Persistent Disk Strategy](persistent-disk-strategy.md).
+
 ### delete_vm refuses to destroy VM with attached unused disks
 
 **Symptom**
