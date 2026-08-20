@@ -1,7 +1,8 @@
 # ci/tasks/integration.yml
 #
 # Runs the full integration test suite (Tier 1 + Tier 2 + Tier 3).
-# Requires a lab-network Concourse worker (192.168.1.0/24 reachable).
+# Requires a Concourse worker that can reach the selected env bundle's PVE
+# API endpoint and director subnet.
 #
 # Image: ubuntu:24.04 (noble) — minimal, stable, reproducible base with
 # apt-get available.  All required CLIs (bosh, cf, credhub, uv, jq, curl,

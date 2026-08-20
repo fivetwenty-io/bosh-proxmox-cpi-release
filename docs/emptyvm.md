@@ -32,7 +32,7 @@ Key fields:
 
 - **`disk_types[*]`** — `disk_size` is in MiB. Persistent disks are placed on `pve_disk_storage`.
 
-- **`networks[*]`** — one `manual` subnet covering the same `192.168.1.0/24` the Director sits on. `reserved` excludes the gateway and the Director IP so the next free address goes to the smoke-test VM (typically `192.168.1.2`).
+- **`networks[*]`** — one `manual` subnet covering the same network the Director sits on (the env bundle's cloud config supplies the CIDR). `reserved` excludes the gateway and the Director IP so the next free address in that subnet goes to the smoke-test VM.
 
 - **`compilation`** — minimal one-AZ pool. Cloud-config validation requires it even when no release will compile.
 

@@ -19,7 +19,7 @@ flowchart LR
 | Tier | Name | What it does | Infrastructure required |
 |------|------|-------------|------------------------|
 | 0 | Unit | `make check` — go vet, staticcheck, go test | None |
-| 1 | Lifecycle | CPI binary roundtrip: create stemcell, (optionally) create network, create VM, attach disk, then exercise has_disk, set_disk_metadata, resize_disk, update_disk, and snapshot disk, reboot VM (soft + hard), delete all resources (has_disk re-checked false after delete). Each major step is additionally verified out-of-band against the PVE REST API (real cluster state, not just CPI return values) | Live PVE cluster, lab network (192.168.1.x) |
+| 1 | Lifecycle | CPI binary roundtrip: create stemcell, (optionally) create network, create VM, attach disk, then exercise has_disk, set_disk_metadata, resize_disk, update_disk, and snapshot disk, reboot VM (soft + hard), delete all resources (has_disk re-checked false after delete). Each major step is additionally verified out-of-band against the PVE REST API (real cluster state, not just CPI return values) | Live PVE cluster, reachability to the configured test subnet |
 | 2 | BOSH | `bosh create-env` full director deploy, cloud/runtime-config upload, `emptyvm` smoke deployment, director health assertion | Live PVE cluster, lab network |
 | 3 | CF | CF deployment via `scripts/cf deploy`, smoke app push (go-httpbin), map-route, HTTP 200 assertion | Live PVE cluster, lab network, routable system domain |
 
@@ -78,7 +78,7 @@ A BOSH stemcell tarball (`.tgz`) must be available. Supply the path in `ci/integ
 
 ### Network
 
-The machine running the tests must have IP reachability to the Proxmox VE API endpoint and to the `192.168.1.0/24` lab subnet. Tier 1 creates a VM at a static IP you configure; Tier 2 and 3 reach the BOSH director and CF router on that subnet.
+The machine running the tests must have IP reachability to the Proxmox VE API endpoint and to the test subnet you configure (`NETWORK_RANGE`, and the env bundle's director subnet for the higher tiers). Tier 1 creates a VM at a static IP you configure; Tier 2 and 3 reach the BOSH director and CF router on that subnet.
 
 ---
 
@@ -317,7 +317,7 @@ Triggers automatically on every push to `main`. Runs `make check` (go vet + stat
 
 Manual trigger only. Requires the `unit` job to have passed (`passed: [unit]`). Runs `./scripts/test integration all` — the full destructive sequence.
 
-**Worker requirement:** the Concourse worker running the `integration` job must have IP reachability to the `192.168.1.0/24` lab subnet. Workers without lab network access fail at the first PVE API call.
+**Worker requirement:** the Concourse worker running the `integration` job must have IP reachability to the selected env bundle's PVE API endpoint and director subnet. Workers without that access fail at the first PVE API call.
 
 ### Secrets
 

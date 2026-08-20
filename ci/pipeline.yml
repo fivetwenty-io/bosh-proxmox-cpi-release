@@ -3,8 +3,9 @@
 # Set via: fly -t lab sp -p bosh-pve-cpi -c ci/pipeline.yml -l ci/params.yml
 # Secrets supplied by Vault/CredHub or a local fly -l params file (gitignored).
 #
-# WORKER REQUIREMENT: the `integration` job must run on a Concourse worker that
-# can reach 192.168.1.0/24 (lab subnet — PVE API, BOSH director, CF ingress).
+# WORKER REQUIREMENT: the `integration` job must run on a Concourse worker
+# with IP reachability to the selected env bundle's PVE API endpoint and its
+# director/CF subnet (see manifests/envs/<env>/vars.yml for the addresses).
 # The `unit` job has no network requirements and runs on any worker.
 
 resources:
