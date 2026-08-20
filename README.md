@@ -222,6 +222,10 @@ make certify-upgrade                    # previous released CPI to current, agai
 
 See [BOSH Director Upgrade Test](docs/certification/upgrade.md) for the version matrix, configuration, what each verification step asserts, and the committed [run record](docs/certification/upgrade/README.md).
 
+## Limitations
+
+The CPI has a small set of known limitations: snapshot and cross-node constraints on persistent disks, node-local bridge networking, multi-cluster VMID coordination that rests on operator-configured disjoint bands, and features whose live validation is still pending. The consolidated list, one sentence per item with a link to the owning page, lives in [Known Limitations](docs/limitations.md).
+
 ## Troubleshooting
 
 For symptom-first triage of deployment, VM creation, disk attachment, network, and stemcell failures, see the [troubleshooting guide](docs/troubleshooting.md). Common starting points:

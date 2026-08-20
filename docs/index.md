@@ -14,6 +14,8 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
 
+- [Known Limitations](limitations.md): The consolidated list of what the CPI does not do, covering disk, storage, networking, topology, and permissions constraints, one sentence per item with a link to the page that owns the detail.
+
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.
 
 - [Architecture](architecture.md): High-level overview of the CPI’s design and components. For the reasoning behind that design, read the [architecture narrative](architecture/index.md).
