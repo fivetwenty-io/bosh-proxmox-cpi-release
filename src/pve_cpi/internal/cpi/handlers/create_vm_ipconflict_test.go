@@ -53,30 +53,42 @@ func ipListResp(entries ...json.RawMessage) *sdkcluster.ListResourcesResponse {
 // Unit tests for private helper functions
 // --------------------------------------------------------------------------
 
-func TestExtractStaticIP(t *testing.T) {
+func TestExtractStaticIPs(t *testing.T) {
 	cases := []struct {
 		name     string
 		ipconfig string
-		want     string
+		want     []string
 	}{
-		{"dhcp", "ip=dhcp", ""},
-		{"static with prefix", "ip=10.0.0.5/24,gw=10.0.0.1", "10.0.0.5"},
-		{"static no prefix", "ip=10.0.0.5", "10.0.0.5"},
-		{"static no gw", "ip=192.168.1.100/24", "192.168.1.100"},
-		{"ip6 auto", "ip6=auto", ""},
-		{"ip6 static ignored", "ip6=fd00::1/64", ""},
-		{"empty string", "", ""},
-		{"only gw", "gw=10.0.0.1", ""},
-		{"mixed ip6 and ip4 static", "ip6=auto,ip=10.0.0.5/24", "10.0.0.5"},
-		{"DHCP uppercase", "ip=DHCP", ""},
-		{"trailing comma", "ip=10.1.2.3/24,", "10.1.2.3"},
+		{"dhcp", "ip=dhcp", nil},
+		{"static with prefix", "ip=10.0.0.5/24,gw=10.0.0.1", []string{"10.0.0.5"}},
+		{"static no prefix", "ip=10.0.0.5", []string{"10.0.0.5"}},
+		{"static no gw", "ip=192.168.1.100/24", []string{"192.168.1.100"}},
+		{"ip6 auto", "ip6=auto", nil},
+		{"ip6 static", "ip6=fd00::1/64", []string{"fd00::1"}},
+		{"empty string", "", nil},
+		{"only gw", "gw=10.0.0.1", nil},
+		{"mixed ip6 auto and ip4 static", "ip6=auto,ip=10.0.0.5/24", []string{"10.0.0.5"}},
+		{"DHCP uppercase", "ip=DHCP", nil},
+		{"trailing comma", "ip=10.1.2.3/24,", []string{"10.1.2.3"}},
+		{
+			"dual stack",
+			"ip=10.0.0.5/24,gw=10.0.0.1,ip6=fd00::5/64,gw6=fd00::1",
+			[]string{"10.0.0.5", "fd00::5"},
+		},
+		{"ip6 first still orders v4 first", "ip6=fd00::5/64,ip=10.0.0.5/24", []string{"10.0.0.5", "fd00::5"}},
+		{"ip6 dhcp keyword", "ip=10.0.0.5/24,ip6=dhcp", []string{"10.0.0.5"}},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			got := extractStaticIP(tc.ipconfig)
-			if got != tc.want {
-				t.Errorf("extractStaticIP(%q) = %q; want %q", tc.ipconfig, got, tc.want)
+			got := extractStaticIPs(tc.ipconfig)
+			if len(got) != len(tc.want) {
+				t.Fatalf("extractStaticIPs(%q) = %v; want %v", tc.ipconfig, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("extractStaticIPs(%q)[%d] = %q; want %q", tc.ipconfig, i, got[i], tc.want[i])
+				}
 			}
 		})
 	}

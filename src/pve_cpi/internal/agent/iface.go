@@ -70,6 +70,12 @@ type NetworkSpec struct {
 	Gateway string   `json:"gateway"`
 	DNS     []string `json:"dns"`
 	Default []string `json:"default"`
+	// MAC is the hardware address of the interface this network is
+	// configured on. The BOSH agent uses it to bind a network's settings to a
+	// real device; several networks may name the same MAC when they share one
+	// NIC (dual stack). Omitted when unknown, which the agent tolerates only
+	// for a lone network on a lone interface.
+	MAC string `json:"mac,omitempty"`
 }
 
 // BlobstoreSpec identifies the blobstore provider and its configuration options

@@ -93,6 +93,10 @@ const nicTypeDynamic = "dynamic"
 // Compared case-insensitively against spec.Type throughout the handler.
 const nicTypeManual = "manual"
 
+// nicTypeVIP is the BOSH network spec type for a virtual/floating IP. It is
+// routing-level only: no PVE NIC address is configured for it.
+const nicTypeVIP = "vip"
+
 // nicCPKeyBridge, nicCPKeyModel, nicCPKeyFirewall, nicCPKeyVLAN, and
 // nicCPKeyMTU are the cloud_properties map keys used in both per-NIC network
 // specs and VM-level network_defaults (§7.34). Defined as constants to
@@ -306,6 +310,43 @@ type createVMNetworkSpec struct {
 	Range           string         `json:"range,omitempty"` // CIDR for static-IP containment validation
 	CloudProperties map[string]any `json:"cloud_properties"`
 	MAC             string         `json:"mac,omitempty"` // filled in response
+	// NicGroup names the group of networks that share a single NIC. Networks
+	// carrying the same non-empty value are configured onto one PVE net{N}
+	// (the dual-stack case: one IPv4 and one IPv6 network on one interface).
+	// Empty — the default and the only shape a director without nic_group
+	// support emits — means this network gets a NIC of its own.
+	//
+	// The value is opaque: only equality between networks matters. Directors
+	// and IaaS templates write it both ways (`nic_group: 1` in the upstream
+	// BATS templates, `nic_group: nic0` here), so it decodes from a JSON
+	// string or a JSON number.
+	NicGroup jsonScalarString `json:"nic_group,omitempty"`
+}
+
+// jsonScalarString is a string that also accepts a JSON number, so a numeric
+// value in a manifest cannot fail the whole create_vm at unmarshal time.
+type jsonScalarString string
+
+func (v *jsonScalarString) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	switch {
+	case trimmed == "" || trimmed == "null":
+		*v = ""
+		return nil
+	case trimmed[0] == '"':
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*v = jsonScalarString(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err != nil {
+		return fmt.Errorf("expected a string or a number, got %s", trimmed)
+	}
+	*v = jsonScalarString(n.String())
+	return nil
 }
 
 // createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
@@ -602,7 +643,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 5. Configure NICs from networks map
 	// -----------------------------------------------------------------------
-	netNames, err := configureNICs(ctx, deps, logger, parsed, shape, vmid)
+	nicPlan, err := configureNICs(ctx, deps, logger, parsed, shape, vmid)
 	if err != nil {
 		return nil, err
 	}
@@ -642,7 +683,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 8. Start VM + read back VM config to extract assigned MAC addresses
 	// -----------------------------------------------------------------------
-	responseNetworks, err := startVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, netNames)
+	responseNetworks, err := startVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
 	if err != nil {
 		return nil, err
 	}
@@ -1297,7 +1338,7 @@ func buildAndStartVMAttempt(
 		return vmid, nil, nil, nil, err
 	}
 
-	netNames, err := configureNICs(ctx, deps, logger, parsed, &nodeShape, vmid)
+	nicPlan, err := configureNICs(ctx, deps, logger, parsed, &nodeShape, vmid)
 	if err != nil {
 		return vmid, nil, nil, nil, err
 	}
@@ -1319,7 +1360,7 @@ func buildAndStartVMAttempt(
 		return vmid, nil, nil, nil, err
 	}
 
-	responseNetworks, err = startVMAndReadConfig(ctx, deps, logger, parsed, &nodeShape, vmid, netNames)
+	responseNetworks, err = startVMAndReadConfig(ctx, deps, logger, parsed, &nodeShape, vmid, nicPlan)
 	if err != nil {
 		return vmid, nil, nil, err, nil
 	}
@@ -1894,7 +1935,7 @@ func startVMAndReadConfig(
 	parsed *createVMParsedArgs,
 	shape *createVMShape,
 	vmid int,
-	netNames []string,
+	nicPlan []nicPlanEntry,
 ) (map[string]createVMNetworkSpec, error) {
 	// -----------------------------------------------------------------------
 	// 8. Start VM
@@ -1931,5 +1972,5 @@ func startVMAndReadConfig(
 		vmCfg = map[string]any{}
 	}
 
-	return buildResponseNetworks(parsed.networks, netNames, vmCfg), nil
+	return buildResponseNetworks(parsed.networks, nicPlan, vmCfg), nil
 }

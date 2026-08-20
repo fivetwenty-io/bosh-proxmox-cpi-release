@@ -195,8 +195,8 @@ func resolveCloneMode(cfg *config.CPIConfig, cpMap map[string]any) (string, erro
 }
 
 // configureNICs builds and applies the NIC configuration for the new VM from
-// the networks map. Returns the ordered list of network names (used later for
-// MAC extraction) and any error.
+// the networks map. Returns the NIC plan (network-name → net{N} assignment,
+// used later for MAC extraction) and any error.
 func configureNICs(
 	ctx context.Context,
 	deps Deps,
@@ -204,9 +204,11 @@ func configureNICs(
 	parsed *createVMParsedArgs,
 	shape *createVMShape,
 	vmid int,
-) ([]string, error) {
-	// Build an ordered list of network names for deterministic NIC assignment.
-	netNames := sortedNetworkNames(parsed.networks)
+) ([]nicPlanEntry, error) {
+	// Assign networks to NIC slots. Without nic_group this is one NIC per
+	// network in sortedNetworkNames order; with it, a group shares one NIC.
+	plan := planNICs(parsed.networks)
+	netNames := planNetworkNames(plan)
 
 	// VM-level bridge and model defaults via layered resolver.
 	// Per-NIC spec.CloudProperties["bridge"]/["model"] overrides are applied below.
@@ -225,7 +227,7 @@ func configureNICs(
 	// get mtu=1 even under network_mode: bridge). The list itself is cached
 	// (pve.CachedVnetNames, short TTL) so a plain-bridge cluster pays the
 	// cost at most once per TTL window, not once per create_vm.
-	vnetNames := sdnVnetNameSet(ctx, deps, logger, len(netNames))
+	vnetNames := sdnVnetNameSet(ctx, deps, logger, len(plan))
 
 	// Build net map[int]string and ipconfig map[int]string for UpdateQemuConfigParams
 	netMap := make(map[int]string, len(netNames))
@@ -234,16 +236,48 @@ func configureNICs(
 	// eventual-consistency gate can resolve them all on the target node before
 	// any config write (no partial netN= on a not-yet-realized bridge).
 	bridgeSet := make(map[string]struct{}, len(netNames))
+	// PVE's nameserver is one VM-global list, so it is the ordered union of
+	// every network's resolvers: a dual-stack pair whose IPv4 network names
+	// an IPv4 resolver and whose IPv6 network names an IPv6 one must end up
+	// with both, not with whichever came first.
 	var nameservers []string
-	firstNS := true
+	seenNS := make(map[string]struct{})
 
-	for i, name := range netNames {
+	for _, entry := range plan {
+		i, name := entry.index, entry.primary()
 		spec := parsed.networks[name]
 
 		attrs, attrErr := resolveNICAttributes(
 			deps, parsed.cloudProps.NetworkDefaults, spec.CloudProperties, defaultBridge, defaultModel, name)
 		if attrErr != nil {
 			return nil, attrErr
+		}
+		// Every network on a shared NIC must resolve to the same physical
+		// attachment — one interface cannot sit on two bridges or carry two
+		// VLAN tags. Resolving each member and comparing turns a
+		// contradictory cloud-config into a create-time error instead of a
+		// NIC that silently honours only the first member's bridge.
+		//
+		// The firewall flag is the exception: it is a policy switch, not an
+		// attachment, and every other consumer (ip_forwarding, the ipfilter
+		// ipsets) already reads it as "any member asking for it turns it on
+		// for the whole NIC". Union it here so the operator does not have to
+		// repeat the flag on the IPv6 subnet's cloud_properties.
+		for _, other := range entry.names[1:] {
+			otherAttrs, otherErr := resolveNICAttributes(
+				deps, parsed.cloudProps.NetworkDefaults, parsed.networks[other].CloudProperties,
+				defaultBridge, defaultModel, other)
+			if otherErr != nil {
+				return nil, otherErr
+			}
+			attrs.firewall = attrs.firewall || otherAttrs.firewall
+			otherAttrs.firewall = attrs.firewall
+			if otherAttrs != attrs {
+				return nil, cpierrors.Cloud(
+					"create_vm: networks %q and %q share nic_group %q but resolve to different NIC attributes "+
+						"(bridge/model/vlan/mtu must match across a nic_group)",
+					name, other, strings.TrimSpace(string(spec.NicGroup)))
+			}
 		}
 		bridge, model, nicFirewall, vlan, mtu := attrs.bridge, attrs.model, attrs.firewall, attrs.vlan, attrs.mtu
 
@@ -299,36 +333,29 @@ func configureNICs(
 			bridgeSet[bridge] = struct{}{}
 		}
 
-		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>
-		switch strings.ToLower(spec.Type) {
-		case nicTypeDynamic, "":
-			ipconfigMap[i] = "ip=dhcp"
-		case nicTypeManual:
-			if spec.IP != "" {
-				// Warn when a static IP has no gateway — this is likely an
-				// operator oversight. The VM still deploys; routing may be
-				// impaired without a default gateway.
-				if spec.Gateway == "" {
-					logger.Warn("create_vm: manual network has no gateway",
-						log.String("network", name))
-				}
-				cidr := ipToCIDR(spec.IP, spec.Netmask)
-				cfg := "ip=" + cidr
-				if spec.Gateway != "" {
-					cfg += ",gw=" + spec.Gateway
-				}
-				ipconfigMap[i] = cfg
-			} else {
-				ipconfigMap[i] = "ip=dhcp"
-			}
-		case "vip":
-			// VIP networks are routing-level, no ipconfig needed
+		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>. A NIC shared
+		// by several networks (nic_group) folds them into one entry, which is
+		// how PVE expresses dual stack: "ip=<v4>,gw=<v4gw>,ip6=<v6>,gw6=<v6gw>".
+		cfg, cfgErr := buildIPConfig(entry, parsed.networks, logger)
+		if cfgErr != nil {
+			return nil, cfgErr
+		}
+		if cfg != "" {
+			ipconfigMap[i] = cfg
 		}
 
-		// Collect DNS servers from all specs (first spec's DNS takes precedence)
-		if firstNS && len(spec.DNS) > 0 {
-			nameservers = spec.DNS
-			firstNS = false
+		for _, member := range entry.names {
+			for _, ns := range parsed.networks[member].DNS {
+				ns = strings.TrimSpace(ns)
+				if ns == "" {
+					continue
+				}
+				if _, dup := seenNS[ns]; dup {
+					continue
+				}
+				seenNS[ns] = struct{}{}
+				nameservers = append(nameservers, ns)
+			}
 		}
 	}
 
@@ -359,7 +386,195 @@ func configureNICs(
 		return nil, cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("create_vm: configure NICs vmid=%d: %s", vmid, err.Error()))
 	}
 
-	return netNames, nil
+	// PVE generates a MAC for every net{N} written without one. Read them back
+	// now, while the config write is the most recent thing to have happened,
+	// and stamp them onto the specs: the agent settings need them (see
+	// resolveNICMACs) and they are written to the config drive in step 7,
+	// before the VM is started in step 8.
+	if err := resolveNICMACs(ctx, deps, logger, parsed, shape, vmid, plan); err != nil {
+		return nil, err
+	}
+
+	return plan, nil
+}
+
+// --------------------------------------------------------------------------
+// resolveNICMACs reads the freshly written VM config and records the MAC PVE
+// assigned to each NIC on every network sharing it.
+//
+// The BOSH agent matches its network settings to real interfaces by MAC. It
+// tolerates a missing MAC in exactly one case — a single network on a single
+// interface — and otherwise falls through to configuring EVERY interface as
+// DHCP, which on a lab with no DHCP server means a VM that never comes up. So
+// a multi-NIC or multi-network VM whose MACs could not be read is failed here
+// rather than handed to the agent to mis-bootstrap.
+// --------------------------------------------------------------------------
+func resolveNICMACs(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	parsed *createVMParsedArgs,
+	shape *createVMShape,
+	vmid int,
+	plan []nicPlanEntry,
+) error {
+	// createVMWithFallback reuses one parsed args struct across candidate
+	// nodes, and the VM from a failed attempt is destroyed. Clear anything a
+	// previous attempt stamped so a fail-open path below cannot leave the
+	// agent settings pointing at a MAC that no longer exists anywhere.
+	for _, entry := range plan {
+		for _, name := range entry.names {
+			spec := parsed.networks[name]
+			spec.MAC = ""
+			parsed.networks[name] = spec
+		}
+	}
+
+	// The fail-open below is safe only for a single network on a single
+	// interface — the one shape the agent can match without a MAC. A shared
+	// nic_group is one NIC but MORE than one network, so count networks, not
+	// plan entries.
+	totalNetworks := 0
+	for _, entry := range plan {
+		totalNetworks += len(entry.names)
+	}
+
+	var vmCfg map[string]any
+	err := pve.RetryOnTransient(ctx, logger, "create_vm.read_nic_macs", 0, func() error {
+		var inner error
+		vmCfg, inner = deps.PVE.QEMU().Config(ctx, shape.node, vmid)
+		return inner
+	})
+	if err != nil {
+		// Single-network VMs bootstrapped fine without a MAC long before this
+		// readback existed; keep that path fail-open rather than turning a
+		// transient read into a failed create.
+		if totalNetworks <= 1 {
+			logger.Warn("create_vm: could not read VM config for MAC extraction; agent settings will omit the MAC",
+				log.Int(metadataKeyVMID, vmid), log.Err(err))
+			return nil
+		}
+		return cpierrors.Wrap(pve.WrapError(err),
+			fmt.Sprintf("create_vm: read NIC MACs for multi-network VM vmid=%d", vmid))
+	}
+
+	macByIndex := extractMACsFromConfig(vmCfg)
+	for _, entry := range plan {
+		mac, ok := macByIndex[entry.index]
+		if !ok || mac == "" {
+			if totalNetworks <= 1 {
+				continue
+			}
+			return cpierrors.Cloud(
+				"create_vm: PVE reported no MAC for net%d (networks %s) on vmid=%d; "+
+					"the BOSH agent cannot match its network settings to an interface without one",
+				entry.index, strings.Join(entry.names, ","), vmid)
+		}
+		for _, name := range entry.names {
+			spec := parsed.networks[name]
+			spec.MAC = mac
+			parsed.networks[name] = spec
+		}
+	}
+	return nil
+}
+
+// --------------------------------------------------------------------------
+// buildIPConfig renders the PVE ipconfig{N} value for one NIC.
+//
+// One NIC carries at most one address per family. PVE's syntax keeps the two
+// families in separate keys — "ip="/"gw=" for IPv4, "ip6="/"gw6=" for IPv6 —
+// so a dual-stack NIC (two networks sharing a nic_group) produces a single
+// combined entry. Returns "" when the NIC needs no ipconfig at all, which is
+// the VIP-only case.
+// --------------------------------------------------------------------------
+func buildIPConfig(
+	entry nicPlanEntry,
+	networks map[string]createVMNetworkSpec,
+	logger *log.Logger,
+) (string, error) {
+	// Per family: the rendered "ip=..."/"gw=..." pair, plus the name of the
+	// network that claimed it so a second claimant can be reported precisely.
+	var (
+		v4, v6         string
+		v4gw, v6gw     string
+		v4from, v6from string
+	)
+
+	for _, name := range entry.names {
+		spec := networks[name]
+		switch strings.ToLower(spec.Type) {
+		case nicTypeDynamic, "":
+			// A dynamic network carries no address and so no family signal.
+			// DHCP is the IPv4 request, and that is the only claim it may
+			// make: guessing IPv6 for it because IPv4 happens to be taken
+			// would turn one operator's DHCP network into SLAAC purely on
+			// the alphabetical order of the network names. IPv6
+			// autoconfiguration needs no ipconfig of its own — leaving ip6
+			// unset is already what PVE does for it.
+			if v4from != "" {
+				return "", cpierrors.Cloud(
+					"create_vm: networks %q and %q share a nic_group but both claim the IPv4 address of the NIC",
+					v4from, name)
+			}
+			v4, v4from = "dhcp", name
+		case nicTypeManual:
+			if spec.IP == "" {
+				// The director sent a manual network with no address. On a
+				// NIC of its own that has always meant DHCP; inside a group
+				// it must not out-claim a sibling that does carry one.
+				if len(entry.names) > 1 {
+					logger.Warn("create_vm: manual network in a nic_group has no address; contributing nothing to the NIC",
+						log.String("network", name))
+					continue
+				}
+				v4, v4from = "dhcp", name
+				continue
+			}
+			// Warn when a static IP has no gateway — this is likely an
+			// operator oversight. The VM still deploys; routing may be
+			// impaired without a default gateway.
+			if spec.Gateway == "" {
+				logger.Warn("create_vm: manual network has no gateway",
+					log.String("network", name))
+			}
+			isV6 := isIPv6Address(spec.IP)
+			cidr := ipToCIDR(spec.IP, spec.Netmask, spec.Range, logger, name)
+			warnGatewayOffLink(cidr, spec.Gateway, name, logger)
+			if isV6 {
+				if v6from != "" {
+					return "", cpierrors.Cloud(
+						"create_vm: networks %q and %q share a nic_group but both claim the IPv6 address of the NIC",
+						v6from, name)
+				}
+				v6, v6gw, v6from = cidr, spec.Gateway, name
+				continue
+			}
+			if v4from != "" {
+				return "", cpierrors.Cloud(
+					"create_vm: networks %q and %q share a nic_group but both claim the IPv4 address of the NIC",
+					v4from, name)
+			}
+			v4, v4gw, v4from = cidr, spec.Gateway, name
+		case nicTypeVIP:
+			// VIP networks are routing-level, no ipconfig needed
+		}
+	}
+
+	segments := make([]string, 0, 4)
+	if v4 != "" {
+		segments = append(segments, "ip="+v4)
+		if v4gw != "" {
+			segments = append(segments, "gw="+v4gw)
+		}
+	}
+	if v6 != "" {
+		segments = append(segments, "ip6="+v6)
+		if v6gw != "" {
+			segments = append(segments, "gw6="+v6gw)
+		}
+	}
+	return strings.Join(segments, ","), nil
 }
 
 // sdnVnetNameSet returns the set of SDN vnet names currently defined
@@ -580,33 +795,152 @@ func sortedNetworkNames(networks map[string]createVMNetworkSpec) []string {
 // ipToCIDR converts a dotted-decimal netmask to a prefix length and returns
 // "ip/prefix". Falls back to "/32" if the netmask cannot be parsed.
 // --------------------------------------------------------------------------
-func ipToCIDR(ip, netmask string) string {
-	prefix := netmaskToCIDR(netmask)
+func ipToCIDR(ip, netmask, subnetRange string, logger *log.Logger, network string) string {
+	v6 := isIPv6Address(ip)
+	// Render the address the way Go canonicalizes it. An IPv4-mapped literal
+	// ("::ffff:10.0.0.5") is an IPv4 address by every other reading in this
+	// package — isIPv6Address, the conflict scan, the ipfilter entries — and
+	// PVE's ipconfig parser rejects the mapped spelling outright.
+	if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+		if v4 := parsed.To4(); v4 != nil {
+			ip = v4.String()
+		} else {
+			ip = parsed.String()
+		}
+	}
+	prefix, ok := parseNetmask(netmask, v6)
+	if !ok {
+		// No usable netmask. The subnet's own CIDR carries the same prefix
+		// length, and using it beats defaulting to a host route: /128 (or
+		// /32) puts the gateway off-link, and IPv6 then never routes.
+		if fromRange, rangeOK := prefixFromRange(subnetRange, v6); rangeOK {
+			if logger != nil {
+				logger.Warn("create_vm: network has no usable netmask; taking the prefix length from its range",
+					log.String("network", network),
+					log.String("range", subnetRange),
+					log.Int("prefix", fromRange))
+			}
+			return fmt.Sprintf("%s/%d", ip, fromRange)
+		}
+		if logger != nil {
+			logger.Warn("create_vm: network has neither a usable netmask nor a range; configuring the address as a host route",
+				log.String("network", network),
+				log.String("netmask", netmask),
+				log.Int("prefix", prefix))
+		}
+	}
 	return fmt.Sprintf("%s/%d", ip, prefix)
 }
 
-// netmaskToCIDR counts set bits in a dotted-decimal subnet mask.
-func netmaskToCIDR(netmask string) int {
+// warnGatewayOffLink flags a gateway outside the prefix the NIC is about to be
+// configured with. Cloud-init's route add then fails inside the guest, the
+// agent never reaches the director, and the deploy hangs on a VM the CPI
+// reported as created — a create-time warning is the only place this is cheap
+// to see.
+func warnGatewayOffLink(cidr, gateway, network string, logger *log.Logger) {
+	gateway = strings.TrimSpace(gateway)
+	if gateway == "" || logger == nil {
+		return
+	}
+	gwIP := net.ParseIP(gateway)
+	_, subnet, err := net.ParseCIDR(cidr)
+	if gwIP == nil || err != nil || subnet == nil {
+		return
+	}
+	if subnet.Contains(gwIP) {
+		return
+	}
+	logger.Warn("create_vm: gateway is outside the prefix the NIC is configured with; the guest cannot install a default route through it",
+		log.String("network", network),
+		log.String("address", cidr),
+		log.String("gateway", gateway))
+}
+
+// prefixFromRange reads the prefix length off a subnet CIDR ("10.0.0.0/24",
+// "fd00::/64"), rejecting one whose family does not match the address being
+// configured.
+func prefixFromRange(subnetRange string, v6 bool) (int, bool) {
+	subnetRange = strings.TrimSpace(subnetRange)
+	if subnetRange == "" {
+		return 0, false
+	}
+	ip, ipNet, err := net.ParseCIDR(subnetRange)
+	if err != nil || ipNet == nil {
+		return 0, false
+	}
+	if isIPv6Address(ip.String()) != v6 {
+		return 0, false
+	}
+	ones, _ := ipNet.Mask.Size()
+	return ones, true
+}
+
+// isIPv6Address reports whether s parses as an IPv6 address. An
+// IPv4-in-IPv6 form ("::ffff:10.0.0.5") is IPv4 for addressing purposes and
+// is reported as such, matching net.IP.To4.
+func isIPv6Address(s string) bool {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	return ip != nil && ip.To4() == nil
+}
+
+// netmaskToCIDR converts a BOSH `netmask` value into a prefix length.
+//
+// The director derives it from the subnet range, so the wire form follows the
+// family: dotted-decimal for IPv4 ("255.255.0.0") and the fully expanded hex
+// groups for IPv6 ("ffff:ffff:ffff:ffff:0000:0000:0000:0000"). A bare prefix
+// length ("64") is accepted too, since it costs nothing and some callers find
+// it the natural thing to pass. Anything unrecognised — including an empty
+// value — falls back to the family's host length, preserving the historical
+// IPv4 /32 default.
+func netmaskToCIDR(netmask string, v6 bool) int {
+	prefix, _ := parseNetmask(netmask, v6)
+	return prefix
+}
+
+// parseNetmask is netmaskToCIDR plus the answer to "did the netmask actually
+// say anything?". The false case still returns the host length, so callers
+// that cannot do better keep the old behavior.
+func parseNetmask(netmask string, v6 bool) (int, bool) {
+	hostBits := 32
+	if v6 {
+		hostBits = 128
+	}
+	netmask = strings.TrimSpace(netmask)
 	if netmask == "" {
-		return 32
+		return hostBits, false
 	}
-	parts := strings.Split(netmask, ".")
-	if len(parts) != 4 {
-		return 32
-	}
-	bits := 0
-	for _, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 || n > 255 {
-			return 32
+
+	// Bare prefix length.
+	if n, err := strconv.Atoi(netmask); err == nil {
+		if n >= 0 && n <= hostBits {
+			return n, true
 		}
-		for b := 7; b >= 0; b-- {
-			if (n>>uint(b))&1 == 1 {
-				bits++
-			}
-		}
+		return hostBits, false
 	}
-	return bits
+
+	// Dotted-decimal (IPv4) or hex-group (IPv6) mask. net.ParseIP handles
+	// both; the byte length it yields tells us which family we actually got,
+	// which need not be the family of the address being configured (a
+	// mismatched pair is a config error, and falling back to the host length
+	// is the safe, non-crashing reading of it).
+	ip := net.ParseIP(netmask)
+	if ip == nil {
+		return hostBits, false
+	}
+	mask := ip.To4()
+	if v6 || mask == nil {
+		mask = ip.To16()
+	}
+	if mask == nil || len(mask)*8 != hostBits {
+		return hostBits, false
+	}
+	ones, bits := net.IPMask(mask).Size()
+	if bits != hostBits {
+		// Non-contiguous mask: net.IPMask.Size reports (0, 0). Nothing
+		// sensible to derive, so use the host length.
+		return hostBits, false
+	}
+	return ones, true
 }
 
 // --------------------------------------------------------------------------
@@ -677,6 +1011,12 @@ func buildAgentNetworks(networks map[string]createVMNetworkSpec) map[string]agen
 			Gateway: spec.Gateway,
 			DNS:     spec.DNS,
 			Default: spec.Default,
+			// The agent matches settings to interfaces by MAC. It only gets
+			// to skip that when there is exactly one network AND one
+			// interface; for anything else an absent MAC means every
+			// interface is configured as DHCP. resolveNICMACs fills this in
+			// before the settings reach the config drive.
+			MAC: spec.MAC,
 		}
 	}
 	return out
@@ -689,21 +1029,25 @@ func buildAgentNetworks(networks map[string]createVMNetworkSpec) map[string]agen
 // --------------------------------------------------------------------------
 func buildResponseNetworks(
 	networks map[string]createVMNetworkSpec,
-	orderedNames []string,
+	plan []nicPlanEntry,
 	vmCfg map[string]any,
 ) map[string]createVMNetworkSpec {
 	// Build index → MAC lookup from VM config
 	macByIndex := extractMACsFromConfig(vmCfg)
 
 	out := make(map[string]createVMNetworkSpec, len(networks))
-	for i, name := range orderedNames {
-		spec := networks[name]
-		if mac, ok := macByIndex[i]; ok {
-			spec.MAC = mac
+	for _, entry := range plan {
+		mac, ok := macByIndex[entry.index]
+		// Every network sharing a NIC reports that NIC's MAC.
+		for _, name := range entry.names {
+			spec := networks[name]
+			if ok {
+				spec.MAC = mac
+			}
+			out[name] = spec
 		}
-		out[name] = spec
 	}
-	// Copy any names not in orderedNames (defensive)
+	// Copy any names not covered by the plan (defensive)
 	for name := range networks {
 		if _, exists := out[name]; !exists {
 			out[name] = networks[name]

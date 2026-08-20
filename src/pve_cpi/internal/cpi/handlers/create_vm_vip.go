@@ -143,12 +143,14 @@ func nicFirewallEnabled(spec createVMNetworkSpec, cfg *config.CPIConfig) bool {
 // nicState captures resolved per-NIC properties for a single VIP-apply pass.
 type nicState struct {
 	idx       int
-	name      string
-	spec      createVMNetworkSpec
 	fw        bool
 	static    bool
 	vips      []string // normalized CIDRs; nil if none
 	ipForward bool     // true when cloud_properties.ip_forwarding=true
+	// ips holds every static address the NIC carries, in NIC-member order.
+	// A plain NIC has one; a dual-stack NIC (nic_group) has its IPv4 and
+	// IPv6 address, and both must be allowed through ipfilter.
+	ips []string
 }
 
 // applyVIPAllowedAddressPairs seeds PVE ipfilter ipsets for every firewalled NIC
@@ -158,13 +160,14 @@ type nicState struct {
 // lockout from an incomplete allowlist.
 //
 // Algorithm (strict ordering guarantees no lockout):
-//  1. Enumerate NICs in sortedNetworkNames order; compute per-NIC fw/static/vips.
+//  1. Enumerate NICs in planNICs order; compute per-NIC fw/static/vips as the
+//     union over the networks sharing each NIC.
 //  2. If no NIC has any VIP entries → return nil (byte-identical path; no PVE calls).
 //  3. Warn for any NIC that carries VIPs but has firewall disabled (ipfilter would
 //     not apply to it; operator probably misconfigured).
 //  4. Safety guard: if ANY firewalled NIC is DHCP/dynamic → warn + return nil.
 //     Enabling VM-global ipfilter without knowing that NIC's IP would lock it out.
-//  5. For each firewalled NIC: build entry list = {primaryIP/32} ∪ vips, dedup,
+//  5. For each firewalled NIC: build entry list = {its own addresses} ∪ vips, dedup,
 //     stable order. Create ipset "ipfilter-net{N}"; tolerate "already exists".
 //     Add each entry via CreateQemuFirewallIpset2; any error → warn + return nil.
 //  6. After ALL firewalled NICs are fully seeded: UpdateQemuFirewallOptions{Ipfilter:&true}.
@@ -180,31 +183,52 @@ func applyVIPAllowedAddressPairs(
 	networks map[string]createVMNetworkSpec,
 	logger *log.Logger,
 ) error {
-	netNames := sortedNetworkNames(networks)
+	// Same NIC plan configureNICs used — ipfilter ipsets are named after the
+	// NIC index, so a nic_group must not be allowed to shift them.
+	plan := planNICs(networks)
 	vmidStr := strconv.Itoa(vmid)
 	nodeSvc := deps.PVE.Nodes()
 
-	// Step 1: compute per-NIC state.
-	states := make([]nicState, 0, len(netNames))
-	for i, name := range netNames {
-		spec := networks[name]
-		vips, err := parseVIPEntries(spec.CloudProperties)
-		if err != nil {
-			// Entry already validated early — this is a defensive path; treat as
-			// warn + skip-all (fail-open) rather than surface a post-mutation error.
-			logger.Warn("create_vm: applyVIPAllowedAddressPairs: unexpected parse error (fail-open)",
-				log.Int(metadataKeyVMID, vmid), log.String("net", name), log.Err(err))
-			return nil
+	// Step 1: compute per-NIC state. Properties of a NIC shared by several
+	// networks are the union of its members': the firewall is on if any
+	// member enables it, VIP entries accumulate, and every member's address
+	// is one the NIC legitimately sends from.
+	states := make([]nicState, 0, len(plan))
+	for _, entry := range plan {
+		state := nicState{idx: entry.index}
+		for _, name := range entry.names {
+			spec := networks[name]
+			vips, err := parseVIPEntries(spec.CloudProperties)
+			if err != nil {
+				// Entry already validated early — this is a defensive path; treat as
+				// warn + skip-all (fail-open) rather than surface a post-mutation error.
+				logger.Warn("create_vm: applyVIPAllowedAddressPairs: unexpected parse error (fail-open)",
+					log.Int(metadataKeyVMID, vmid), log.String("net", name), log.Err(err))
+				return nil
+			}
+			state.vips = append(state.vips, vips...)
+			if nicFirewallEnabled(spec, deps.Config) {
+				state.fw = true
+			}
+			if nicIPForwardingEnabled(spec.CloudProperties) {
+				state.ipForward = true
+			}
+			if nicIsStatic(spec) {
+				state.static = true
+				state.ips = append(state.ips, spec.IP)
+			}
 		}
-		states = append(states, nicState{
-			idx:       i,
-			name:      name,
-			spec:      spec,
-			fw:        nicFirewallEnabled(spec, deps.Config),
-			static:    nicIsStatic(spec),
-			vips:      vips,
-			ipForward: nicIPForwardingEnabled(spec.CloudProperties),
-		})
+		// A NIC counts as static only when no member leaves it dynamic:
+		// one DHCP member is enough to make its final address unknowable,
+		// which is exactly the lockout case step 4 refuses to risk.
+		for _, name := range entry.names {
+			spec := networks[name]
+			if !nicIsStatic(spec) && !strings.EqualFold(spec.Type, nicTypeVIP) {
+				state.static = false
+				break
+			}
+		}
+		states = append(states, state)
 	}
 
 	// Step 2: bail if no NIC carries any VIP.
@@ -242,12 +266,14 @@ func applyVIPAllowedAddressPairs(
 				log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)))
 			return nil
 		}
-		// Validate primary IP is parseable before seeding any ipsets.
-		if _, err := normalizeVIPEntry(states[i].spec.IP); err != nil {
-			logger.Warn("create_vm: VIP ipfilter skipped: firewalled NIC primary IP unparseable; cannot guarantee allowlist, ipfilter not enabled",
-				log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)),
-				log.String("ip", states[i].spec.IP), log.Err(err))
-			return nil
+		// Validate every address the NIC carries before seeding any ipsets.
+		for _, ip := range states[i].ips {
+			if _, err := normalizeVIPEntry(ip); err != nil {
+				logger.Warn("create_vm: VIP ipfilter skipped: firewalled NIC primary IP unparseable; cannot guarantee allowlist, ipfilter not enabled",
+					log.Int(metadataKeyVMID, vmid), log.String("net", fmt.Sprintf("net%d", states[i].idx)),
+					log.String("ip", ip), log.Err(err))
+				return nil
+			}
 		}
 	}
 
@@ -269,8 +295,8 @@ func applyVIPAllowedAddressPairs(
 		fwCount++
 		ipsetName := fmt.Sprintf("ipfilter-net%d", states[i].idx)
 
-		// Build deduplicated entry list: primaryIP/32 first, then VIPs.
-		entries := buildIPSetEntries(states[i].spec.IP, states[i].vips)
+		// Build deduplicated entry list: the NIC's own addresses first, then VIPs.
+		entries := buildIPSetEntries(states[i].ips, states[i].vips)
 
 		// Create the ipset; tolerate "already exists".
 		if createErr := nodeSvc.CreateQemuFirewallIpset(ctx, node, vmidStr,
@@ -321,10 +347,10 @@ func applyVIPAllowedAddressPairs(
 }
 
 // buildIPSetEntries returns the deduplicated, stable-order list of CIDR entries
-// for an ipset: primaryIP/32 first (so primary connectivity is always first),
-// followed by the VIP entries in their normalized order. Duplicates are dropped
-// preserving first-seen occurrence.
-func buildIPSetEntries(primaryIP string, vips []string) []string {
+// for an ipset: the NIC's own addresses first (so primary connectivity is
+// always first), followed by the VIP entries in their normalized order.
+// Duplicates are dropped preserving first-seen occurrence.
+func buildIPSetEntries(nicIPs []string, vips []string) []string {
 	seen := make(map[string]struct{})
 	var out []string
 
@@ -339,9 +365,13 @@ func buildIPSetEntries(primaryIP string, vips []string) []string {
 		out = append(out, entry)
 	}
 
-	// Primary IP always first. Normalize it: if bare IP, append /32.
-	if primaryIP != "" && !strings.EqualFold(primaryIP, "dhcp") {
-		normalized, err := normalizeVIPEntry(primaryIP)
+	// The NIC's own addresses always come first, in member order. Normalize
+	// each: a bare IP gains /32 (IPv4) or /128 (IPv6).
+	for _, ip := range nicIPs {
+		if ip == "" || strings.EqualFold(ip, "dhcp") {
+			continue
+		}
+		normalized, err := normalizeVIPEntry(ip)
 		if err == nil {
 			add(normalized)
 		}
@@ -349,6 +379,20 @@ func buildIPSetEntries(primaryIP string, vips []string) []string {
 
 	for _, v := range vips {
 		add(v)
+	}
+
+	// A NIC carrying an IPv6 address needs its link-local and multicast
+	// ranges in the set. PVE only auto-generates ipfilter-net{N} while no
+	// ipset of that name exists; creating our own replaces that generation
+	// wholesale, and a set holding just the global address drops the
+	// neighbor and router solicitations IPv6 sources from fe80::/10 and
+	// sends to ff02::/16. Neighbor resolution would never complete and the
+	// NIC's IPv6 would be dead while its IPv4 kept working.
+	for _, entry := range out {
+		if strings.Contains(entry, ":") {
+			out = append(out, "fe80::/10", "ff02::/16")
+			break
+		}
 	}
 	return out
 }

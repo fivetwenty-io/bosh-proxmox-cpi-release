@@ -98,7 +98,15 @@ func (m *vmMockQEMU) Config(ctx context.Context, node string, vmid int) (map[str
 	if m.configFn != nil {
 		return m.configFn(ctx, node, vmid)
 	}
-	return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+	// PVE always reports a generated MAC for every NIC it holds; the CPI reads
+	// them back to stamp onto the agent settings. Cover more slots than any
+	// single test needs so a multi-NIC case does not have to restate this.
+	return map[string]any{
+		"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+		"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+		"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+		"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+	}, nil
 }
 func (m *vmMockQEMU) AttachDisk(ctx context.Context, node string, vmid int, volid, bus string, opts *sdkqemu.AttachOpts) (string, error) {
 	if m.attachDiskFn != nil {
@@ -2805,7 +2813,15 @@ func TestCreateVM_IPConflict_StaticIP_Refused(t *testing.T) {
 			}, nil
 		}
 		// For any new VM created during the test, return normal config.
-		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+		// PVE always reports a generated MAC for every NIC it holds; the CPI reads
+		// them back to stamp onto the agent settings. Cover more slots than any
+		// single test needs so a multi-NIC case does not have to restate this.
+		return map[string]any{
+			"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+			"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+			"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+		}, nil
 	}
 
 	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), conflictingVMListFn, a, func(c *config.CPIConfig) {
@@ -2868,7 +2884,15 @@ func TestCreateVM_IPConflict_Clear_Proceeds(t *testing.T) {
 				"net0":      "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
 			}, nil
 		}
-		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+		// PVE always reports a generated MAC for every NIC it holds; the CPI reads
+		// them back to stamp onto the agent settings. Cover more slots than any
+		// single test needs so a multi-NIC case does not have to restate this.
+		return map[string]any{
+			"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+			"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+			"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+		}, nil
 	}
 
 	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), noConflictFn, a, func(c *config.CPIConfig) {
@@ -2917,7 +2941,15 @@ func TestCreateVM_IPConflict_DynamicNetworkSkipped(t *testing.T) {
 	}
 	// Config for VMID 9999: return "ip=dhcp" — safe; extractStaticIP returns "".
 	q.configFn = func(_ context.Context, _ string, _ int) (map[string]any, error) {
-		return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+		// PVE always reports a generated MAC for every NIC it holds; the CPI reads
+		// them back to stamp onto the agent settings. Cover more slots than any
+		// single test needs so a multi-NIC case does not have to restate this.
+		return map[string]any{
+			"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+			"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+			"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+			"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+		}, nil
 	}
 
 	deps := buildVMDepsPlacement(q, n, listStatusSingleNode(), conflictCheckListFn, a, func(c *config.CPIConfig) {
@@ -3660,7 +3692,15 @@ func TestHandleCreateVM_Ephemeral_Success(t *testing.T) {
 		// so readVirtio0SizeGiB falls back to defaultStemcellDiskGiB, and no
 		// scsi slots taken so nextFreeSCSIIndexAtLeast returns 1.
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0"}, nil
+			// PVE always reports a generated MAC for every NIC it holds; the CPI reads
+			// them back to stamp onto the agent settings. Cover more slots than any
+			// single test needs so a multi-NIC case does not have to restate this.
+			return map[string]any{
+				"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+				"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+				"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+				"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+			}, nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, _ int, gotVolid, bus string, _ *sdkqemu.AttachOpts) (string, error) {
 			if gotVolid == volid {

@@ -15,6 +15,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,11 +110,13 @@ func detectIPConflict(
 		return nil, nil
 	}
 
-	// Build a lookup set for O(1) target-IP checks.
+	// Build a lookup set for O(1) target-IP checks. Keys are canonicalized so
+	// that two spellings of the same IPv6 address (fd00:0:0::5 and fd00::5)
+	// compare equal; IPv4 is unaffected.
 	targetSet := make(map[string]struct{}, len(targetIPs))
 	for _, ip := range targetIPs {
-		if ip != "" {
-			targetSet[ip] = struct{}{}
+		if key := canonicalIPString(ip); key != "" {
+			targetSet[key] = struct{}{}
 		}
 	}
 	if len(targetSet) == 0 {
@@ -345,7 +349,16 @@ func parseIPConflict(
 	vmName string,
 ) *IPConflict {
 	_ = bridge // used only for clarity in the caller; logged via IPConflictCloudError
-	for key, val := range cfg {
+	// Scan in key order. A VM that collides on both its IPv4 and its IPv6
+	// address has two answers, and map iteration would report a different
+	// one each run.
+	keys := make([]string, 0, len(cfg))
+	for key := range cfg {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := cfg[key]
 		if !strings.HasPrefix(key, "ipconfig") {
 			continue
 		}
@@ -367,53 +380,85 @@ func parseIPConflict(
 		if !ok {
 			continue
 		}
-		ip := extractStaticIP(ipStr)
-		if ip == "" {
-			continue
-		}
-		if _, hit := targetSet[ip]; hit {
-			return &IPConflict{
-				VMID: vmid,
-				Name: vmName,
-				IP:   ip,
+		// A NIC can hold one address per family, so check both.
+		for _, ip := range extractStaticIPs(ipStr) {
+			key := canonicalIPString(ip)
+			if key == "" {
+				continue
+			}
+			if _, hit := targetSet[key]; hit {
+				return &IPConflict{
+					VMID: vmid,
+					Name: vmName,
+					IP:   ip,
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// extractStaticIP parses a PVE ipconfig value and returns the bare IP address
-// when the entry is static (not "dhcp" or "auto6"). Returns "" for dynamic or
-// unrecognised entries.
+// extractStaticIPs parses a PVE ipconfig value and returns every bare static
+// address it configures — at most one per family, IPv4 first. Dynamic entries
+// ("dhcp", "auto", "auto6") and unrecognised values contribute nothing, so a
+// fully dynamic NIC yields an empty slice.
 //
 // PVE ipconfig format examples:
 //
-//	"ip=dhcp"                        → "" (dynamic)
-//	"ip=10.0.0.5/24,gw=10.0.0.1"   → "10.0.0.5"
-//	"ip6=auto"                       → "" (dynamic)
-//	"ip=10.0.0.5/24"                → "10.0.0.5"
-//	"ip=10.0.0.5"                   → "10.0.0.5" (no prefix, still static)
-func extractStaticIP(ipconfig string) string {
+//	"ip=dhcp"                                  → []            (dynamic)
+//	"ip=10.0.0.5/24,gw=10.0.0.1"               → ["10.0.0.5"]
+//	"ip6=auto"                                 → []            (dynamic)
+//	"ip=10.0.0.5/24"                           → ["10.0.0.5"]
+//	"ip=10.0.0.5"                              → ["10.0.0.5"]  (no prefix, still static)
+//	"ip=10.0.0.5/24,ip6=fd00::5/64,gw6=fd00::1" → ["10.0.0.5", "fd00::5"]
+func extractStaticIPs(ipconfig string) []string {
+	var v4, v6 string
 	for _, seg := range strings.Split(ipconfig, ",") {
 		kv := strings.SplitN(seg, "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(kv[0]))
-		val := strings.TrimSpace(kv[1])
-
-		// Only consider "ip" (IPv4); skip "ip6" (different conflict domain).
-		if key != "ip" {
+		if key != "ip" && key != "ip6" {
 			continue
 		}
-		if val == "" || strings.EqualFold(val, "dhcp") {
-			return ""
+		val := strings.TrimSpace(kv[1])
+		if val == "" ||
+			strings.EqualFold(val, "dhcp") ||
+			strings.EqualFold(val, "auto") ||
+			strings.EqualFold(val, "auto6") {
+			continue
 		}
 		// Strip CIDR prefix when present.
 		if idx := strings.Index(val, "/"); idx >= 0 {
-			return val[:idx]
+			val = val[:idx]
 		}
-		return val
+		if val == "" {
+			continue
+		}
+		if key == "ip" {
+			v4 = val
+		} else {
+			v6 = val
+		}
 	}
-	return ""
+	out := make([]string, 0, 2)
+	if v4 != "" {
+		out = append(out, v4)
+	}
+	if v6 != "" {
+		out = append(out, v6)
+	}
+	return out
+}
+
+// canonicalIPString reduces an address string to the form canonicalIP produces,
+// so two spellings of one address compare equal. Returns "" when s is not an
+// IP address at all.
+func canonicalIPString(s string) string {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return ""
+	}
+	return canonicalIP(ip)
 }

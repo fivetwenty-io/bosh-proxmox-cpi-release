@@ -63,6 +63,7 @@ type fwNodesStub struct {
 	ruleActions   []string // "<type>:<action>" per CreateQemuFirewallRules call
 	enableOptCall int      // count of UpdateQemuFirewallOptions{Enable:true}
 	lastNet       map[int]string
+	lastIpconfig  map[int]string
 	ruleErr       error
 	optErr        error
 	// VIP ipset recording fields (§7.14).
@@ -104,6 +105,9 @@ func (s *fwNodesStub) UpdateQemuFirewallOptions(_ context.Context, _ string, _ s
 
 func (s *fwNodesStub) UpdateQemuConfig(_ context.Context, _ string, _ string, p *sdknodes.UpdateQemuConfigParams) error {
 	s.lastNet = p.Net
+	if p.Ipconfig != nil {
+		s.lastIpconfig = p.Ipconfig
+	}
 	return nil
 }
 
@@ -159,7 +163,16 @@ func (s *fwQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]any,
 	if s.configResult != nil {
 		return s.configResult, nil
 	}
-	return map[string]any{}, nil
+	// Default: the NIC slots PVE would report for a freshly configured VM,
+	// each with the MAC PVE generated. configureNICs reads these back to fill
+	// in the agent settings, which cannot bind a network to an interface
+	// without one.
+	return map[string]any{
+		"net0": "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
+		"net1": "virtio=aa:bb:cc:dd:ee:01,bridge=vmbr1",
+		"net2": "virtio=aa:bb:cc:dd:ee:02,bridge=vmbr2",
+		"net3": "virtio=aa:bb:cc:dd:ee:03,bridge=vmbr3",
+	}, nil
 }
 
 func fwDeps(cl *fwClusterStub, nd *fwNodesStub, cfg *config.CPIConfig) Deps {

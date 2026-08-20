@@ -615,7 +615,7 @@ func TestApplyVIPAllowedAddressPairs_TwoFirewalledNICs_VMFirewallEnabled(t *test
 // entry — no duplicates.
 func TestBuildIPSetEntries_PrimaryEqualsVIP_Deduped(t *testing.T) {
 	// primary "10.0.0.5" → "10.0.0.5/32"; VIP "10.0.0.5" also → "10.0.0.5/32"
-	entries := buildIPSetEntries("10.0.0.5", []string{"10.0.0.5/32"})
+	entries := buildIPSetEntries([]string{"10.0.0.5"}, []string{"10.0.0.5/32"})
 	if len(entries) != 1 {
 		t.Fatalf("buildIPSetEntries with primary==VIP got %v (len=%d); want exactly 1 entry", entries, len(entries))
 	}

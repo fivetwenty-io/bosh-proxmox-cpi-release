@@ -219,11 +219,14 @@ func applyIPForwarding(
 	networks map[string]createVMNetworkSpec,
 	logger *log.Logger,
 ) error {
-	netNames := sortedNetworkNames(networks)
+	// Derive NIC indices from the same plan configureNICs used, so a
+	// nic_group that folded two networks onto one interface does not shift
+	// every later index and send this write to the wrong NIC.
+	plan := planNICs(networks)
 
 	// Quick-exit when no NIC needs forwarding — zero API calls (byte-identical).
 	anyForwarding := false
-	for _, name := range netNames {
+	for name := range networks {
 		if nicIPForwardingEnabled(networks[name].CloudProperties) {
 			anyForwarding = true
 			break
@@ -244,9 +247,18 @@ func applyIPForwarding(
 	nodeSvc := deps.PVE.Nodes()
 	vmidStr := strconv.Itoa(vmid)
 
-	for i, name := range netNames {
-		spec := networks[name]
-		if !nicIPForwardingEnabled(spec.CloudProperties) {
+	for _, entry := range plan {
+		i := entry.index
+		// On a shared NIC the flag is a property of the interface, so any
+		// member asking for forwarding turns it on for the whole NIC.
+		name := ""
+		for _, member := range entry.names {
+			if nicIPForwardingEnabled(networks[member].CloudProperties) {
+				name = member
+				break
+			}
+		}
+		if name == "" {
 			continue
 		}
 
