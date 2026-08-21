@@ -2118,8 +2118,12 @@ func handleLightStemcellFetch(
 	// Address storage-scoped calls (dedup scans, upload, and the server-side
 	// download attempt below) to a node that actually owns the storage when it
 	// carries a nodes restriction — same retarget the heavy path applies via
-	// resolveStemcellStorageAndNode.
-	node = stemcellStorageOwningNode(ctx, deps, node, storage)
+	// resolveStemcellStorageAndNode. An explicit cloud_properties.node pin
+	// (chosenNode != "") outranks the restriction, matching the pre-uploaded
+	// path: the operator's pin is never silently overridden.
+	if chosenNode == "" {
+		node = stemcellStorageOwningNode(ctx, deps, node, storage)
+	}
 
 	fetchTemplateNode := node
 	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
