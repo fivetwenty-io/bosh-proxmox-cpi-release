@@ -499,7 +499,7 @@ def write_run_doc(
     phases: "list[dict] | None" = None,
     steps: "list[dict] | None" = None,
 ) -> Path:
-    """Write docs/certification/upgrade/runs/<date>.md and return its path."""
+    """Write docs/certification/upgrade/runs/<date>-<hhmmss>.md and return its path."""
     pre_timings: list[str] = []
     pre_timings.append("## Version matrix")
     pre_timings.append("")

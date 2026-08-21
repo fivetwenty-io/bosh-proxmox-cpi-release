@@ -138,6 +138,20 @@ def run_meta_bullets(meta: dict) -> list[str]:
     ]
 
 
+def start_time_suffix(meta: dict) -> str:
+    """Time-of-day filename part derived from meta['started'].
+
+    Run documents used to be named by date alone, so two runs on the same
+    day overwrote each other locally and produced add/add conflicts between
+    the CI report PRs. Deriving the suffix from the recorded start time keeps
+    regeneration from a prior run's artifacts deterministic.
+    """
+    m = re.search(r"\b(\d{2}):(\d{2}):(\d{2})$", str(meta.get("started", "")))
+    if not m:
+        return ""
+    return "-" + "".join(m.groups())
+
+
 def write_run_doc(
     *,
     runs_dir: Path,
@@ -156,7 +170,7 @@ def write_run_doc(
     artifacts_lines: "list[str] | None" = None,
     doc_suffix: str = "",
 ) -> Path:
-    """Write runs_dir/<date><doc_suffix>.md for this run and return its path.
+    """Write runs_dir/<date>-<hhmmss><doc_suffix>.md and return its path.
 
     phases and steps use the same dict shapes results.json records
     (sections: name/seconds, results: name/status/seconds), so the doc can
@@ -165,7 +179,7 @@ def write_run_doc(
     collect_run_history scrapes to rebuild the README summary.
     """
     runs_dir.mkdir(parents=True, exist_ok=True)
-    doc = runs_dir / f"{meta['date']}{doc_suffix}.md"
+    doc = runs_dir / f"{meta['date']}{start_time_suffix(meta)}{doc_suffix}.md"
 
     lines: list[str] = []
     lines.append(f"# {title}")
@@ -239,7 +253,10 @@ def collect_run_history(runs_dir: Path, meta_mark: str) -> list[dict]:
             continue
         meta["_doc"] = doc.name
         history.append(meta)
-    history.sort(key=lambda m: m.get("date", ""), reverse=True)
+    # started tiebreaks same-day runs (old date-only docs carry it too).
+    history.sort(
+        key=lambda m: (m.get("date", ""), m.get("started", "")), reverse=True,
+    )
     return history
 
 

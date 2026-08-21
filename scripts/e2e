@@ -13,7 +13,7 @@ reporting layer the underlying wrappers lack — per-step timing, a final
 PASS/FAIL/SKIP summary table, failure call-outs with the tail of the offending
 command's output, and machine-readable results.json + junit.xml artifacts.
 Real runs also write the committed proof documents
-(docs/certification/e2e/runs/<date>.md plus the README.md summary).
+(docs/certification/e2e/runs/<date>-<hhmmss>.md plus the README.md summary).
 
 Usage:
     ./scripts/e2e [command] [flags]
@@ -112,7 +112,7 @@ def write_run_doc(
     phases: "list[dict] | None" = None,
     steps: "list[dict] | None" = None,
 ) -> Path:
-    """Write docs/certification/e2e/runs/<date>.md and return its path."""
+    """Write docs/certification/e2e/runs/<date>-<hhmmss>.md and return its path."""
     return _rundoc.write_run_doc(
         runs_dir=E2E_RUNS_DIR,
         meta=meta,
@@ -663,7 +663,7 @@ class E2E:
     # -- committed run report ---------------------------------------------- #
 
     def finalize_doc(self, ok: bool) -> bool:
-        """Write docs/certification/e2e/runs/<date>.md + README for this run.
+        """Write docs/certification/e2e/runs/<date>-<hhmmss>.md + README for this run.
 
         Skipped under --skip-doc and --dry-run. Returns ok combined with the
         report-writing step's own success so a failed write is never silent.

@@ -177,7 +177,7 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
 The committed record lives under `docs/certification/bats/`:
 
-- `docs/certification/bats/runs/<date>.md`
+- `docs/certification/bats/runs/<date>-<hhmmss>.md`
 
   A generated per-run report: verdict, wall clock, per-phase and per-step timing tables, environment tuple (CPI release, BATS revision, director version, stemcell, PVE version), the exclusion table with reasons, and a per-example results table with durations.
 
