@@ -87,8 +87,8 @@ jobs:
       BOSH_PVE_ENV: cpitest
       # scripts/certify and the release-resolution step shell out to gh.
       GH_TOKEN: ${{ github.token }}
-      # The job container has no known_hosts; accept-new on first contact
-      # with the lab node (scripts/bosh _pve_ssh honors this knob).
+      # The container has no known_hosts; accept the lab node's key on first
+      # contact (lab-only trust, per the scripts/bosh _pve_ssh contract).
       SCRIPTS_PVE_SSH_INSECURE: "1"
 
     steps:
@@ -140,26 +140,26 @@ jobs:
           umask 077
           printf '%s\n' "${LAB_BOSH_VARS_YML}" > manifests/bosh/vars.yml
 
-      - name: Install lab SSH key
-        # scripts/bosh net-up (run directly below and by certify's bootstrap)
-        # and the cpitest firewall ensure reach the PVE node with
-        # `ssh root@<pve_host>`. The lab node's authorized_keys entry for this
-        # key is source-restricted to the runner's SNAT address; the fleet
-        # runbook in the lab repository documents the host.fw rules that
-        # admit it.
+      - name: Write lab SSH key
+        # scripts/bosh net-up/net-down and the firewall ensure run pvesh on
+        # the PVE node over `ssh root@<pve_host>`; the key is authorized on
+        # lab-pmx-0 restricted to the pipes node's SNAT address.
         env:
           LAB_PVE_SSH_KEY: ${{ secrets.LAB_PVE_SSH_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${LAB_PVE_SSH_KEY}" ]]; then
             echo "ERROR: the LAB_PVE_SSH_KEY secret is not configured for this repository." >&2
-            echo "Add the dedicated lab SSH private key:" >&2
-            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release --body-file <keyfile>" >&2
+            echo "Generate a dedicated key, authorize it for root on the lab PVE node, then:" >&2
+            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release < <keyfile>" >&2
             exit 1
           fi
           umask 077
-          mkdir -p "${HOME}/.ssh"
-          printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${HOME}/.ssh/id_ed25519"
+          # OpenSSH expands ~ from the passwd entry, not $HOME, and container
+          # jobs run with HOME=/github/home while the passwd home is /root.
+          ssh_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          mkdir -p "${ssh_home}/.ssh"
+          printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${ssh_home}/.ssh/id_ed25519"
 
       - name: Restore director state from the runner host
         # creds.yml and state.json are create-env products. Without them a
@@ -256,6 +256,16 @@ jobs:
             exit 0
           fi
           git commit -m "docs(certification): scheduled run reports $(date -u +%F)"
+          # Rebase onto the current main tip: a report branch cut from the
+          # sha this run tested inherits any failure that sha carried and
+          # its PR wedges until someone update-branches it. -X theirs keeps
+          # this run's regenerated README when a same-day report PR already
+          # touched it; the next run regenerates it from all run docs anyway.
+          git fetch origin main
+          if ! git rebase -X theirs origin/main; then
+            git rebase --abort
+            echo "WARN: rebase onto origin/main conflicted; report PR keeps the tested sha as its base" >&2
+          fi
           git push origin "HEAD:refs/heads/${REPORT_BRANCH}"
           gh pr create --repo "${GITHUB_REPOSITORY}" \
             --head "${REPORT_BRANCH}" --base main \
@@ -282,6 +292,7 @@ jobs:
         # The workspace persists between jobs on a self-hosted runner; the
         # state just persisted above is restored from the state dir next run.
         run: |
+          ssh_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
           rm -f manifests/bosh/vars.yml manifests/bosh/creds.yml \
             manifests/bosh/state.json ci/integration.yml \
-            "${HOME}/.ssh/id_ed25519"
+            "${ssh_home}/.ssh/id_ed25519"
