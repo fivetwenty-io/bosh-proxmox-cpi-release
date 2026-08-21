@@ -256,6 +256,16 @@ jobs:
             exit 0
           fi
           git commit -m "docs(certification): scheduled run reports $(date -u +%F)"
+          # Rebase onto the current main tip: a report branch cut from the
+          # sha this run tested inherits any failure that sha carried and
+          # its PR wedges until someone update-branches it. -X theirs keeps
+          # this run's regenerated README when a same-day report PR already
+          # touched it; the next run regenerates it from all run docs anyway.
+          git fetch origin main
+          if ! git rebase -X theirs origin/main; then
+            git rebase --abort
+            echo "WARN: rebase onto origin/main conflicted; report PR keeps the tested sha as its base" >&2
+          fi
           git push origin "HEAD:refs/heads/${REPORT_BRANCH}"
           gh pr create --repo "${GITHUB_REPOSITORY}" \
             --head "${REPORT_BRANCH}" --base main \
