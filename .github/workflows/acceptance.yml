@@ -87,6 +87,9 @@ jobs:
       BOSH_PVE_ENV: cpitest
       # scripts/certify and the release-resolution step shell out to gh.
       GH_TOKEN: ${{ github.token }}
+      # The container has no known_hosts; accept the lab node's key on first
+      # contact (lab-only trust, per the scripts/bosh _pve_ssh contract).
+      SCRIPTS_PVE_SSH_INSECURE: "1"
 
     steps:
       - name: Checkout
@@ -136,6 +139,24 @@ jobs:
           fi
           umask 077
           printf '%s\n' "${LAB_BOSH_VARS_YML}" > manifests/bosh/vars.yml
+
+      - name: Write lab SSH key
+        # scripts/bosh net-up/net-down and the firewall ensure run pvesh on
+        # the PVE node over `ssh root@<pve_host>`; the key is authorized on
+        # lab-pmx-0 restricted to the pipes node's SNAT address.
+        env:
+          LAB_PVE_SSH_KEY: ${{ secrets.LAB_PVE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LAB_PVE_SSH_KEY}" ]]; then
+            echo "ERROR: the LAB_PVE_SSH_KEY secret is not configured for this repository." >&2
+            echo "Generate a dedicated key, authorize it for root on the lab PVE node, then:" >&2
+            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release < <keyfile>" >&2
+            exit 1
+          fi
+          umask 077
+          mkdir -p "${HOME}/.ssh"
+          printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${HOME}/.ssh/id_ed25519"
 
       - name: Restore director state from the runner host
         # creds.yml and state.json are create-env products. Without them a
@@ -259,4 +280,5 @@ jobs:
         # state just persisted above is restored from the state dir next run.
         run: |
           rm -f manifests/bosh/vars.yml manifests/bosh/creds.yml \
-            manifests/bosh/state.json ci/integration.yml
+            manifests/bosh/state.json ci/integration.yml \
+            "${HOME}/.ssh/id_ed25519"

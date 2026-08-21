@@ -719,14 +719,14 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		c,
 		func(vmid int) error {
 			params := map[string]any{
-				"vmid":       vmid,
-				"name":       parkerVMName(vmid),
-				cfgKeyTags:   tags,
+				"vmid":          vmid,
+				"name":          parkerVMName(vmid),
+				cfgKeyTags:      tags,
 				paramProtection: protection,
-				"onboot":     onboot,
-				"memory":     memory,
-				"cores":      cores,
-				"scsihw":     scsihw,
+				"onboot":        onboot,
+				"memory":        memory,
+				"cores":         cores,
+				"scsihw":        scsihw,
 			}
 			var upid string
 			var innerErr error

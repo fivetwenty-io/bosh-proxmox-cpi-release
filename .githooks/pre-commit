@@ -1,0 +1,15 @@
+#!/bin/sh
+# Fast pre-commit gate: refuse to commit unformatted Go files.
+# Install with `make hooks`. Bypass a single commit with `git commit --no-verify`.
+
+set -e
+
+staged_go=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go' | grep -v '/vendor/' || true)
+[ -z "$staged_go" ] && exit 0
+
+unformatted=$(gofmt -l $staged_go)
+if [ -n "$unformatted" ]; then
+    echo "pre-commit: files need gofmt (run 'make fmt' and re-stage):" >&2
+    echo "$unformatted" | sed 's/^/  /' >&2
+    exit 1
+fi

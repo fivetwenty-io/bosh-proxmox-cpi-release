@@ -206,9 +206,9 @@ func TestMigrateDiskViaMover_ConvergesWhenAlreadyMigrated(t *testing.T) {
 	t.Parallel()
 	c := newDMFakeClient(map[int]map[string]any{
 		90007: {
-			"tags":       "bosh-cpi;bosh-parker;bosh-disk-mover",
+			"tags":          "bosh-cpi;bosh-parker;bosh-disk-mover",
 			paramProtection: false, // the interrupted run dropped it for the migrate
-			"scsi2":      "data:vm-90007-disk-3,serial=" + dmToken + ",size=10G",
+			"scsi2":         "data:vm-90007-disk-3,serial=" + dmToken + ",size=10G",
 		},
 	}, map[int]string{90007: "pve2"})
 
@@ -349,7 +349,7 @@ func TestDestroyEmptyMover_Guards(t *testing.T) {
 		t.Parallel()
 		c := newDMFakeClient(map[int]map[string]any{
 			90007: {
-				"tags":       "bosh-cpi;bosh-parker;bosh-disk-mover",
+				"tags":          "bosh-cpi;bosh-parker;bosh-disk-mover",
 				paramProtection: true,
 			},
 		}, map[int]string{90007: "pve1"})
