@@ -849,11 +849,13 @@ func stemcellBackingQCow2Exists(ctx context.Context, deps Deps, node, storage, q
 //     concurrently-built lower-VMID twin is now visible, delete our duplicate
 //     and adopt the survivor's (VMID, node).
 //  7. Pool assignment: if deps.Config.StemcellTemplatePool != "", the pool is
-//     create-if-missing (pve.EnsurePoolExists) then the WINNING template
-//     (ours, or the survivor when we lost the race — closing the gap where a
-//     race winner built without a pool configured could leave the cache
-//     outside the operator's intended pool) is assigned via AssignVMToPool.
-//     Both calls are fatal on error.
+//     create-if-missing (pve.EnsurePoolExists) BEFORE step 4 and passed as the
+//     qemu-create "pool" param, so our own template is born a pool member (and
+//     a token whose only VM.Allocate grant lives on the pool path can create
+//     it at all). Only a lost race assigns afterward: the survivor may have
+//     been built without a pool configured — closing the gap where that would
+//     leave the cache outside the operator's intended pool — via
+//     AssignVMToPool. Both calls are fatal on error.
 //
 // Returns the (VMID, node) of the resulting cache template on success. node
 // may differ from templateNode when a cluster-scoped dedup hit or a lost
@@ -1018,6 +1020,22 @@ func ensureTemplateVM(
 		CreatingDirectorUUID: creatingDirectorUUID,
 	}
 
+	// The configured template pool must exist before the create loop below:
+	// attemptCreateTemplateVM passes it as the qemu-create "pool" param, and
+	// PVE rejects a create referencing a non-existent pool.
+	// pve.EnsurePoolExists creates it with a "managed by bosh-pve-cpi"
+	// provenance comment (create_stemcell has no env.bosh, so the director is
+	// not derivable — the comment carries no director suffix here, unlike
+	// create_vm's per-director comment) and tolerates the pool already
+	// existing (idempotent).
+	if deps.Config.StemcellTemplatePool != "" {
+		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
+			pve.PoolProvenance("")); ensureErr != nil {
+			return 0, "", fmt.Errorf("ensureTemplateVM: ensure pool %q exists: %w",
+				deps.Config.StemcellTemplatePool, ensureErr)
+		}
+	}
+
 	// pve.WithStorageScan(templateNode, deps.Config.VMStorage): the template's
 	// disk lands on deps.Config.VMStorage (spec.TargetStorage above — importVolid/
 	// storage is only the import SOURCE and is intentionally not scanned here),
@@ -1100,34 +1118,24 @@ func ensureTemplateVM(
 		}
 	}
 
-	// Step 7: Pool assignment — create-if-missing the configured PVE resource
-	// pool, then assign the WINNING template (ours, or the survivor when we
-	// lost the race) to it, when StemcellTemplatePool is set. Re-ensuring on
-	// the lost-race arm closes a gap where the race winner's own create call
-	// configured no pool (or a different one) — this caller's pool preference
-	// must still apply to whichever template survives. The pool is no longer
-	// assign-only: pve.EnsurePoolExists creates it with a "managed by
-	// bosh-pve-cpi" provenance comment (create_stemcell has no env.bosh, so
-	// the director is not derivable — the comment carries no director suffix
-	// here, unlike create_vm's per-director comment) and tolerates the pool
-	// already existing (idempotent). AssignVMToPool remains the assignment
-	// mechanism afterward: PVE has no create+assign-in-one-call for an
-	// EXISTING template VM — the one-shot `pool=` create param only applies at
-	// qemu-create, and the template VM already exists by this point.
-	// Assignment uses PUT /pools/{poolid} with vms=[vmid] via
-	// pve.AssignVMToPool (VMID-scoped; no node parameter needed, so this is
-	// safe to call for a survivor hosted on a different node).
+	// Step 7: Pool assignment for the lost-race arm only. Our own create
+	// already placed the template in the configured pool via the qemu-create
+	// "pool" param (attemptCreateTemplateVM), so when we won the race there is
+	// nothing to assign — and re-adding a pool member via PUT /pools/{poolid}
+	// would be rejected by PVE ("already a pool member"). When we LOST the
+	// race, the surviving twin's create call may have configured no pool (or a
+	// different one) — this caller's pool preference must still apply to
+	// whichever template survives, so the survivor is assigned via
+	// pve.AssignVMToPool (PUT /pools/{poolid} with vms=[vmid]; VMID-scoped, no
+	// node parameter needed, so this is safe for a survivor hosted on a
+	// different node). The pool itself was already ensured before the create
+	// loop above.
 	//
-	// Both EnsurePoolExists and AssignVMToPool failures are fatal: the operator
-	// explicitly named a pool; a create/assign failure indicates misconfiguration
-	// that must surface immediately rather than leaving a template silently
-	// outside the expected pool.
-	if deps.Config.StemcellTemplatePool != "" {
-		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
-			pve.PoolProvenance("")); ensureErr != nil {
-			return 0, "", fmt.Errorf("ensureTemplateVM: ensure pool %q exists for template vmid=%d: %w",
-				deps.Config.StemcellTemplatePool, winnerVMID, ensureErr)
-		}
+	// An AssignVMToPool failure is fatal: the operator explicitly named a
+	// pool; an assign failure indicates misconfiguration that must surface
+	// immediately rather than leaving a template silently outside the
+	// expected pool.
+	if deps.Config.StemcellTemplatePool != "" && winnerVMID != allocatedVMID {
 		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, winnerVMID); poolErr != nil {
 			return 0, "", fmt.Errorf("ensureTemplateVM: assign template vmid=%d to pool %q: %w",
 				winnerVMID, deps.Config.StemcellTemplatePool, poolErr)
@@ -1426,6 +1434,18 @@ func attemptCreateTemplateVM(
 		"onboot":            0,
 	}
 
+	// Create directly into the configured template pool. Passing "pool" at
+	// create time (rather than assigning after) lets a token whose only
+	// VM.Allocate grant lives on /pool/<stemcell_template_pool> create the
+	// template at all: PVE's qemu-create permission check accepts VM.Allocate
+	// on the target pool as an alternative to /vms/{vmid}, but only when the
+	// create request itself names the pool. The caller ensures the pool
+	// exists before the allocation loop — PVE rejects a create referencing a
+	// non-existent pool.
+	if deps.Config.StemcellTemplatePool != "" {
+		createParams["pool"] = deps.Config.StemcellTemplatePool
+	}
+
 	// Provenance is unconditional: every cache template gets full
 	// notes JSON (name/version/os_type/disk_format/sha8/sha256/kind/cid/
 	// created_by/created/director_refs seeded with the creating director) and
@@ -1449,10 +1469,18 @@ func attemptCreateTemplateVM(
 	}
 	createParams[pveConfigKeyDescription] = notes
 
+	// The identity tags are deliberately NOT passed at create time. PVE's
+	// create worker checks tag permissions strictly against /vms/{vmid}
+	// (assert_tag_permissions passes no pool to check_vm_perm) and runs that
+	// check BEFORE registering the VM in the pool named by the "pool" create
+	// param — so a token whose VM.Config.Options grant lives only on the pool
+	// path can never create a tagged VM in one call. Creating untagged and
+	// writing the tags immediately after (below) closes the gap: by then the
+	// VM is a pool member and the pool ACL satisfies the /vms/{vmid} check.
 	directorTagTokens := buildDirectorTagTokens(cp.DirectorTags)
 	provTags := buildStemcellProvenanceTags(cp, "")
 	allTags := mergeTagList(baseTags, provTags, 0)
-	createParams[jsonKeyTags] = mergeTagList(strings.Split(allTags, ";"), directorTagTokens, maxTagLength)
+	templateTags := mergeTagList(strings.Split(allTags, ";"), directorTagTokens, maxTagLength)
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, node, createParams)
 	if cerr != nil {
@@ -1485,6 +1513,18 @@ func attemptCreateTemplateVM(
 			}
 			return werr
 		}
+	}
+
+	// Stamp the identity tags now that the VM exists and is a pool member
+	// (see the note above the create call). A failure here leaves a VM whose
+	// tags — the exact keys the stemcell lookups, delete_stemcell's sha8
+	// sweep, and the orphan prune match on — are absent, so the VM is
+	// unmanageable as a cache template: destroy it rather than leak it.
+	tagParams := &sdknodes.UpdateQemuConfigParams{Tags: &templateTags}
+	if tagErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(candidate), tagParams); tagErr != nil {
+		cleanupLeakedTemplateVM(ctx, deps, node, int64(candidate), logger, "tag after create")
+		return cpierrors.Wrap(pve.WrapError(tagErr),
+			fmt.Sprintf("attemptCreateTemplateVM: tag template vmid %d", candidate))
 	}
 
 	logger.Info("ensureTemplateVM: VM disk imported",
@@ -3544,6 +3584,18 @@ func ensureReplicaTemplateVM(
 		// ExtraBaseTags carries the per-node replica tag so attemptCreateTemplateVM
 		// includes it in the base tag set alongside stemcellCacheTag/ShaTag.
 		ExtraBaseTags: []string{nodeTag},
+	}
+
+	// The configured template pool must exist before the create loop:
+	// attemptCreateTemplateVM passes it as the qemu-create "pool" param, and a
+	// dedup hit on the primary can reach replica creation without ever running
+	// ensureTemplateVM's own pool ensure. Idempotent when already ensured.
+	if deps.Config.StemcellTemplatePool != "" {
+		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
+			pve.PoolProvenance("")); ensureErr != nil {
+			return 0, fmt.Errorf("ensureReplicaTemplateVM: ensure pool %q exists: %w",
+				deps.Config.StemcellTemplatePool, ensureErr)
+		}
 	}
 
 	// pve.WithStorageScan(node, deps.Config.VMStorage): mirrors the primary's

@@ -393,6 +393,7 @@ type countingNodesService struct {
 	listStorageContentFn func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
 	deleteQemuFn         func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
 	createQemuTemplateFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error)
+	updateQemuConfigFn   func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 }
 
 func (c *countingNodesService) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -407,6 +408,16 @@ func (c *countingNodesService) ListQemu(ctx context.Context, node string, params
 	}
 	empty := sdknodes.ListQemuResponse{}
 	return &empty, nil
+}
+
+// UpdateQemuConfig is the post-create identity-tag write inside
+// attemptCreateTemplateVM (tags are applied after create, not at create
+// time). Default: no-op success.
+func (c *countingNodesService) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
+	if c.updateQemuConfigFn != nil {
+		return c.updateQemuConfigFn(ctx, node, vmid, params)
+	}
+	return nil
 }
 
 func (c *countingNodesService) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
@@ -570,22 +581,24 @@ func TestReplicateStemcellToNodes_Enabled_TwoNodes(t *testing.T) {
 		},
 	}
 
+	// Identity tags land via the post-create config update (not the create
+	// call); verify the per-node sha + replica-node tags there.
+	tagsByNode := make(map[string]string)
+	nodesSvc.updateQemuConfigFn = func(_ context.Context, node, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+		if params != nil && params.Tags != nil {
+			if _, seen := tagsByNode[node]; !seen {
+				tagsByNode[node] = *params.Tags
+			}
+		}
+		return nil
+	}
+
 	qemuCreateCallCount := 0
 	qemuSvc := &replicationMockQEMU{
-		createFn: func(_ context.Context, node string, params map[string]any) (string, error) {
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
 			qemuCreateCallCount++
 			vmid := 30100 + qemuCreateCallCount
 			createdVMIDs[node] = append(createdVMIDs[node], vmid)
-			// Verify combined tags present in params.
-			tags, _ := params["tags"].(string)
-			shaTag := "bosh-stemcell-sha-" + sha8
-			nodeTag := pve.ReplicaNodeTagForNode(node)
-			if !strings.Contains(tags, shaTag) {
-				return "", fmt.Errorf("missing sha tag %q in tags %q", shaTag, tags)
-			}
-			if !strings.Contains(tags, nodeTag) {
-				return "", fmt.Errorf("missing node tag %q in tags %q", nodeTag, tags)
-			}
 			return "", nil // synchronous create
 		},
 	}
@@ -651,6 +664,14 @@ func TestReplicateStemcellToNodes_Enabled_TwoNodes(t *testing.T) {
 		if len(createdVMIDs[n]) != 1 {
 			t.Errorf("node %s: expected 1 VM created, got %d", n, len(createdVMIDs[n]))
 		}
+		shaTag := "bosh-stemcell-sha-" + sha8
+		nodeTag := pve.ReplicaNodeTagForNode(n)
+		if !strings.Contains(tagsByNode[n], shaTag) {
+			t.Errorf("node %s: missing sha tag %q in tags %q", n, shaTag, tagsByNode[n])
+		}
+		if !strings.Contains(tagsByNode[n], nodeTag) {
+			t.Errorf("node %s: missing node tag %q in tags %q", n, nodeTag, tagsByNode[n])
+		}
 		if frozenNodes[n] != 1 {
 			t.Errorf("node %s: expected 1 MakeTemplate call, got %d", n, frozenNodes[n])
 		}
@@ -715,21 +736,29 @@ func TestReplicateStemcellToNodes_PartialFailure(t *testing.T) {
 		},
 	}
 
+	// Identity tags land via the post-create config update (not the create
+	// call); verify the combined sha + replica-node tags there.
+	nodesSvc.updateQemuConfigFn = func(_ context.Context, node, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+		if params == nil || params.Tags == nil {
+			return nil
+		}
+		tags := *params.Tags
+		shaTag := "bosh-stemcell-sha-" + sha8
+		nodeTag := pve.ReplicaNodeTagForNode(node)
+		if !strings.Contains(tags, shaTag) {
+			t.Errorf("node %s: missing sha tag %q in %q", node, shaTag, tags)
+		}
+		if !strings.Contains(tags, nodeTag) {
+			t.Errorf("node %s: missing node tag %q in %q", node, nodeTag, tags)
+		}
+		return nil
+	}
+
 	createSeq := 0
 	qemuSvc := &replicationMockQEMU{
-		createFn: func(_ context.Context, node string, params map[string]any) (string, error) {
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
 			createSeq++
 			createdVMIDsByNode[node]++
-			// Verify combined tags.
-			tags, _ := params["tags"].(string)
-			shaTag := "bosh-stemcell-sha-" + sha8
-			nodeTag := pve.ReplicaNodeTagForNode(node)
-			if !strings.Contains(tags, shaTag) {
-				t.Errorf("node %s: missing sha tag %q in %q", node, shaTag, tags)
-			}
-			if !strings.Contains(tags, nodeTag) {
-				t.Errorf("node %s: missing node tag %q in %q", node, nodeTag, tags)
-			}
 			return "", nil
 		},
 	}

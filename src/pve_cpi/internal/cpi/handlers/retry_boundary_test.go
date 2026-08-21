@@ -4,8 +4,9 @@
 // Scope: this file verifies that errors from PVE SDK calls in create_stemcell
 // are correctly typed when they reach the handler's return boundary, so the
 // dispatcher can set ok_to_retry faithfully. The primary gap closed here is
-// pool assignment (AssignVMToPool): a transient 503 from the pools API must
-// produce TypeRetriableCloud; a 400 must stay non-retriable.
+// the pools API on the template-create path (EnsurePoolExists before the
+// create loop; AssignVMToPool on a lost race): a transient 503 must produce
+// TypeRetriableCloud; a 400 must stay non-retriable.
 package handlers_test
 
 import (
@@ -39,7 +40,11 @@ func makeSdkAPIErr(httpCode int, msg string) error {
 	return sdkerrors.ParseAPIError(httpCode, body)
 }
 
-// retryBoundaryPoolService is a pve.PoolService whose AddVM always returns err.
+// retryBoundaryPoolService is a pve.PoolService whose mutating methods
+// (AddVM, MoveVMToPool, CreatePool) always return err. With the template
+// pool passed at qemu-create time, the first pools-API call on the critical
+// path is EnsurePoolExists' CreatePool — that is the boundary these tests
+// classify.
 type retryBoundaryPoolService struct {
 	err error
 }
@@ -50,7 +55,7 @@ func (s *retryBoundaryPoolService) AddVM(_ context.Context, _ string, _ int64) e
 func (s *retryBoundaryPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error {
 	return s.err
 }
-func (s *retryBoundaryPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
+func (s *retryBoundaryPoolService) CreatePool(_ context.Context, _, _ string) error { return s.err }
 func (s *retryBoundaryPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
 func (s *retryBoundaryPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
 	return "", false, nil
@@ -73,8 +78,9 @@ func assertHandlerRetriable(t *testing.T, err error, want bool) {
 }
 
 // buildPoolBoundaryDeps constructs Deps for create_stemcell pool-boundary tests.
-// Pool is named "test-pool" so ensureTemplateVM reaches AssignVMToPool.
-// QEMU.Create, MakeTemplate, and task-wait all succeed; pool AddVM uses poolSvc.
+// Pool is named "test-pool" so ensureTemplateVM reaches EnsurePoolExists
+// before its create loop. QEMU.Create, MakeTemplate, and task-wait all
+// succeed; the pools API uses poolSvc.
 func buildPoolBoundaryDeps(t *testing.T, poolSvc pve.PoolService) handlers.Deps {
 	t.Helper()
 
@@ -115,12 +121,13 @@ func buildPoolBoundaryDeps(t *testing.T, poolSvc pve.PoolService) handlers.Deps 
 }
 
 // ---------------------------------------------------------------------------
-// create_stemcell → ensureTemplateVM → AssignVMToPool boundary
+// create_stemcell → ensureTemplateVM → pools API boundary
 // ---------------------------------------------------------------------------
 
 // TestCreateStemcell_PoolAssign_503_IsRetriable verifies that a transient 503
-// from the pools API propagates as TypeRetriableCloud from the handler. Before
-// the fix in AssignVMToPool, the raw SDK error reached the dispatcher catch-all
+// from the pools API (EnsurePoolExists' CreatePool, the first pools call on
+// the template-create path) propagates as TypeRetriableCloud from the handler.
+// Before the wrapping fix, the raw SDK error reached the dispatcher catch-all
 // and became non-retriable (OkToRetry=false).
 func TestCreateStemcell_PoolAssign_503_IsRetriable(t *testing.T) {
 	t.Parallel()

@@ -683,16 +683,21 @@ func TestCreateStemcell_SourceURL_ReplicateLocal_DownloadsOnOtherNode(t *testing
 			listStorageFn: listFn,
 		},
 	}
+	// Identity tags land via the post-create config update (not the create
+	// call); the replica's tag write is the pve-node2 one.
+	templateNodes.updateConfigFn = func(_ context.Context, node, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+		if node == "pve-node2" && params != nil && params.Tags != nil && replicaTags == "" {
+			replicaTags = *params.Tags
+		}
+		return nil
+	}
 	downloadNodes := &wbDownloadNodes{
 		wbTemplateNodes:            templateNodes,
 		createStorageDownloadURLFn: dlFn,
 	}
 	qemuSvc := &wbMockQEMU{
-		createFn: func(_ context.Context, node string, params map[string]any) (string, error) {
+		createFn: func(_ context.Context, node string, _ map[string]any) (string, error) {
 			createNodes = append(createNodes, node)
-			if node == "pve-node2" {
-				replicaTags, _ = params["tags"].(string)
-			}
 			return "", nil
 		},
 	}

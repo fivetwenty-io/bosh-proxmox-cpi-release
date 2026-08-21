@@ -436,8 +436,8 @@ func TestCreateStemcell_HappyPath_NewFlow(t *testing.T) {
 }
 
 // TestCreateStemcell_BoshCPITag verifies that the "bosh-cpi" ownership tag is
-// present in the QEMU.Create params["tags"] field on every successful
-// create_stemcell call, regardless of other stemcell cloud_properties.
+// present in the post-create tag write on every successful create_stemcell
+// call, regardless of other stemcell cloud_properties.
 func TestCreateStemcell_BoshCPITag(t *testing.T) {
 	t.Parallel()
 
@@ -449,13 +449,20 @@ func TestCreateStemcell_BoshCPITag(t *testing.T) {
 	)
 
 	q := &stemcellMockQEMU{
-		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "UPID:node1:create:ok", nil
+		},
+	}
+	// Identity tags land via the post-create config update (the create call
+	// carries none); capture the first Tags-bearing update.
+	nodesSvc := &stemcellMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			mu.Lock()
-			if v, ok := params["tags"].(string); ok {
-				createTags = v
+			if params != nil && params.Tags != nil && createTags == "" {
+				createTags = *params.Tags
 			}
 			mu.Unlock()
-			return "UPID:node1:create:ok", nil
+			return nil
 		},
 	}
 
@@ -466,7 +473,7 @@ func TestCreateStemcell_BoshCPITag(t *testing.T) {
 		},
 	}
 
-	client := buildStemcellClient(q, &stemcellMockNodes{}, &stemcellMockTasks{}, &stemcellMockCluster{})
+	client := buildStemcellClient(q, nodesSvc, &stemcellMockTasks{}, &stemcellMockCluster{})
 	client.storageSvc = storageSvc
 
 	deps := makeDeps(client)
