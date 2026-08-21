@@ -27,6 +27,15 @@ import (
 	pmetrics "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/metrics"
 )
 
+// ErrHostOverrideFingerprint is returned when a request carries a WithHost
+// override while TLS fingerprint pinning is enabled. Fingerprint verification
+// replaces standard certificate checks (InsecureSkipVerify) and validates the
+// pin against the configured base host only, so honoring the override would
+// silently accept the base host's pin for a different node. Construct a
+// dedicated client for the target node instead.
+var ErrHostOverrideFingerprint = errors.New(
+	"per-request host override is not supported with TLS fingerprint pinning")
+
 // Client implements the HTTP client for PVE API communication.
 type Client struct {
 	baseURL       string
@@ -148,9 +157,23 @@ func createHTTPTransport(options *Options) *http.Transport {
 		t.TLSHandshakeTimeout = time.Duration(options.TLSHandshakeTimeoutSec) * time.Second
 	}
 
-	// Dial context: set only when at least one dial-level knob is non-zero so that
-	// the zero-knob path leaves DialContext nil (byte-identical to the prior transport).
-	if options.DialTimeoutSec > 0 || options.TCPKeepAliveSec > 0 {
+	// Proxy: nil unless the caller supplied one, preserving this transport's
+	// long-standing direct-connection behaviour. A caller that wants the
+	// standard library's environment-driven proxying passes
+	// http.ProxyFromEnvironment explicitly.
+	if options.Proxy != nil {
+		t.Proxy = options.Proxy
+	}
+
+	// Dial context: a caller-supplied DialContext replaces the dial outright
+	// and wins over the timeout knobs, which only exist to configure the
+	// dialer it is replacing. Otherwise set only when at least one dial-level
+	// knob is non-zero, so that the zero-knob path leaves DialContext nil
+	// (byte-identical to the prior transport).
+	switch {
+	case options.DialContext != nil:
+		t.DialContext = options.DialContext
+	case options.DialTimeoutSec > 0 || options.TCPKeepAliveSec > 0:
 		dialer := &net.Dialer{}
 		if options.DialTimeoutSec > 0 {
 			dialer.Timeout = time.Duration(options.DialTimeoutSec) * time.Second
@@ -566,6 +589,14 @@ func (c *Client) UploadWithContext(ctx context.Context, path string, fields map[
 
 	resp, err := c.executeWithMiddleware(req)
 	if err != nil {
+		// The transport closes the request body once it sends the request, but
+		// a middleware failure can surface before any send. For a streamed
+		// body that would leave the writer goroutine blocked on the pipe
+		// forever; closing here is idempotent and unblocks it.
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+
 		c.recordRequestError(start)
 
 		return nil, err
@@ -770,6 +801,13 @@ func (c *Client) needsLogin() bool {
 }
 
 func (c *Client) buildUploadRequest(ctx context.Context, path string, fields map[string]string, fileField, filename string, file io.Reader) (*http.Request, error) {
+	// Resolve the host override before building the body so a disallowed
+	// override fails before any streaming machinery is set up.
+	overrideHost, overrideErr := c.hostOverrideFromContext(ctx)
+	if overrideErr != nil {
+		return nil, overrideErr
+	}
+
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
@@ -783,14 +821,34 @@ func (c *Client) buildUploadRequest(ctx context.Context, path string, fields map
 
 	requestBuilder.AddFile(fileField, filename, file)
 
-	body, contentType, err := requestBuilder.BuildBody()
+	body, contentType, contentLength, err := requestBuilder.BuildBody()
 	if err != nil {
 		return nil, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, body)
 	if err != nil {
+		// A streamed body is fed by a writer goroutine; close it so that
+		// goroutine terminates instead of blocking on a body nobody reads.
+		if closer, ok := body.(io.Closer); ok {
+			_ = closer.Close()
+		}
+
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// Streamed bodies are an opaque reader to net/http, which would fall back
+	// to chunked transfer-encoding (rejected by PVE's proxy with 501). The
+	// builder knows the exact body length, so declare it explicitly. Buffered
+	// bodies already carry the same value via their concrete type, along with
+	// GetBody; for streamed bodies GetBody stays nil deliberately — replaying
+	// a drained stream is impossible, callers re-open the source instead.
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+
+	if overrideHost != "" {
+		applyHostOverride(req.URL, overrideHost)
 	}
 
 	req.Header.Set("Content-Type", contentType)
@@ -875,7 +933,52 @@ func (c *Client) logResponse(req *http.Request, resp *http.Response, bodyBytes [
 	}
 }
 
+// hostOverrideFromContext returns the per-request host override, if any. It
+// fails fast when the override cannot be honored safely: TLS fingerprint
+// pinning verifies the pin against the configured base host only, so a
+// host-overridden request would be verified against the wrong pin.
+func (c *Client) hostOverrideFromContext(ctx context.Context) (string, error) {
+	opts := FromContext(ctx)
+	if opts == nil || opts.Host == nil || *opts.Host == "" {
+		return "", nil
+	}
+
+	if c.options != nil && fingerprintVerificationEnabled(c.options) {
+		return "", fmt.Errorf("%w: the pin is verified against configured host %q, not override %q",
+			ErrHostOverrideFingerprint, c.options.Host, *opts.Host)
+	}
+
+	return *opts.Host, nil
+}
+
+// applyHostOverride replaces the URL's host[:port] with the override. An
+// override without a port keeps the URL's existing port. With req.Host unset,
+// net/http derives the dial target, Host header, and TLS ServerName from the
+// URL, so standard certificate verification follows the override.
+func applyHostOverride(reqURL *url.URL, override string) {
+	host := override
+
+	_, _, splitErr := net.SplitHostPort(override)
+	if splitErr != nil {
+		// No port in the override: keep the original request port when there
+		// is one, bracketing bare IPv6 literals as URL syntax requires.
+		switch {
+		case reqURL.Port() != "":
+			host = net.JoinHostPort(override, reqURL.Port())
+		case strings.Contains(override, ":"):
+			host = "[" + override + "]"
+		}
+	}
+
+	reqURL.Host = host
+}
+
 func (c *Client) buildRequestWithContext(ctx context.Context, method, path string, params map[string]interface{}) (*http.Request, error) {
+	overrideHost, overrideErr := c.hostOverrideFromContext(ctx)
+	if overrideErr != nil {
+		return nil, overrideErr
+	}
+
 	// Ensure path starts with /
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -916,6 +1019,10 @@ func (c *Client) buildRequestWithContext(ctx context.Context, method, path strin
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	if overrideHost != "" {
+		applyHostOverride(req.URL, overrideHost)
 	}
 
 	// Set content type if needed
@@ -1095,6 +1202,15 @@ func (c *Client) handleAuthenticationRetry(req *http.Request, resp *http.Respons
 	// Refresh() would mask the real 401 behind a synthetic re-auth error.
 	// Surface the original 401 response to the caller untouched.
 	if !canReauthenticate(c.authenticator) {
+		return resp, nil
+	}
+
+	// A drained body without GetBody cannot be rewound: streamed upload bodies
+	// deliberately have no GetBody (re-reading a consumed stream is
+	// impossible), and replaying anyway would send zero bytes against the
+	// declared Content-Length. Surface the original 401 instead; callers with
+	// re-openable sources retry the whole operation themselves.
+	if req.Body != nil && req.GetBody == nil {
 		return resp, nil
 	}
 
@@ -1359,7 +1475,7 @@ func (c *Client) retryMiddleware(req *http.Request, next Handler) (*http.Respons
 	// req.GetBody is populated by http.NewRequestWithContext for the in-memory
 	// body readers this client uses; capture it before the first send because
 	// the first send drains req.Body.
-	getBody, err := c.captureRequestBody(req)
+	getBody, err := c.captureRetryBody(req, retryAllowed, retries)
 	if err != nil {
 		return nil, err
 	}
@@ -1557,6 +1673,18 @@ func (c *Client) resolveRetryPolicy(req *http.Request) (int, time.Duration, bool
 	}
 
 	return retries, delay, force
+}
+
+// captureRetryBody buffers the request body for retries via
+// captureRequestBody, but only when a retry can actually happen. For a request
+// that will never be retried, the buffering fallback would pointlessly read a
+// streamed upload body into memory (and overwrite its declared ContentLength).
+func (c *Client) captureRetryBody(req *http.Request, retryAllowed bool, retries int) (func() (io.ReadCloser, error), error) {
+	if !retryAllowed || retries <= 0 {
+		return nil, nil //nolint:nilnil // nil getter signals "no capture"; callers handle nil getter explicitly
+	}
+
+	return c.captureRequestBody(req)
 }
 
 // captureRequestBody returns a function that produces a fresh ReadCloser for the

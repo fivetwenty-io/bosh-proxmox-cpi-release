@@ -15,6 +15,20 @@ func WithRetryDelay(ctx context.Context, d time.Duration) context.Context {
 	return pvehttp.WithRetryDelay(ctx, d)
 }
 
+// WithHost overrides the host[:port] this request is sent to, keeping the
+// client's protocol and path — for endpoints that must be reached on a
+// specific cluster node (e.g. uploading to the node that owns a local
+// storage). When the override carries no port the client's configured port is
+// kept. Authentication is unaffected: PVE tokens and tickets are cluster-wide,
+// and any re-authentication still goes to the configured base host.
+//
+// TLS: standard CA verification follows the request URL, so the target node's
+// certificate must carry a SAN for the dialed host. TLS fingerprint pinning
+// verifies only the configured base host; to avoid silently accepting the
+// wrong pin, a request with a host override fails fast with
+// ErrHostOverrideFingerprint when fingerprint pinning is enabled.
+func WithHost(ctx context.Context, host string) context.Context { return pvehttp.WithHost(ctx, host) }
+
 // WithLogging toggles request logging on or off for this request via the context.
 func WithLogging(ctx context.Context, enabled bool) context.Context {
 	return pvehttp.WithLogging(ctx, enabled)

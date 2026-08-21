@@ -1,9 +1,13 @@
 package client
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants"
@@ -114,6 +118,23 @@ type Options struct {
 	MaxIdleConnsPerHost    int // max idle conns per host; 0 = falls back to KeepAlive
 	IdleConnTimeoutSec     int // idle connection timeout seconds; 0 = constants.LongTimeout()
 	TCPKeepAliveSec        int // TCP keepalive probe interval seconds; 0 = Go default
+
+	// DialContext, when non-nil, establishes every connection the client
+	// makes, replacing the TCP dial entirely. This is the hook for reaching a
+	// PVE host that is not directly routable: an ssh jump host, a tunnel, or
+	// a test harness handing back an in-memory pipe. It takes precedence over
+	// DialTimeoutSec and TCPKeepAliveSec, which configure the dialer it
+	// replaces; a caller supplying its own dial function owns its own
+	// timeouts, and should honour the context's deadline. Opt-in; nil
+	// (default) keeps the client's existing dialing.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Proxy, when non-nil, selects the proxy for a request, exactly as
+	// http.Transport.Proxy does. Opt-in; nil (default) sends every request
+	// direct, which is this client's long-standing behaviour and the reason
+	// HTTP_PROXY/HTTPS_PROXY have no effect on it. Pass
+	// http.ProxyFromEnvironment to honour those variables.
+	Proxy func(*http.Request) (*url.URL, error)
 
 	// Caching
 	CacheConfig *CacheConfig // Cache configuration (nil = disabled)

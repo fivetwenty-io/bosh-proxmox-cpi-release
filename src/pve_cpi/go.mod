@@ -48,7 +48,7 @@ require (
 	github.com/docker/cli v29.7.2+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.8 // indirect
 	github.com/elliotwutingfeng/asciiset v0.0.0-20260801111138-45c5fff54b41 // indirect
-	github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.8.6
+	github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.0
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect

@@ -591,6 +591,25 @@ func (a *internalHTTPAdapter) Close() error {
 	return nil
 }
 
+// adaptManualVerifyCallback bridges the public FingerprintVerificationRequest
+// to the internal ssl package's own request type, returning nil for a nil
+// callback so the internal client keeps its "no manual verification" default.
+func adaptManualVerifyCallback(
+	callback func(FingerprintVerificationRequest) bool,
+) func(issl.ManualVerificationRequest) bool {
+	if callback == nil {
+		return nil
+	}
+
+	return func(req issl.ManualVerificationRequest) bool {
+		return callback(FingerprintVerificationRequest{
+			Fingerprint: req.Fingerprint,
+			Certificate: req.Certificate,
+			Host:        req.Host,
+		})
+	}
+}
+
 // internalHTTPNew constructs the real internal HTTP client.
 func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 	// Map client.Options to internal/http.Options
@@ -602,19 +621,6 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 			CACert:         opts.SSLOptions.CACert,
 			ClientCert:     opts.SSLOptions.ClientCert,
 			ClientKey:      opts.SSLOptions.ClientKey,
-		}
-	}
-
-	var manualVerifyCallback func(issl.ManualVerificationRequest) bool
-
-	if opts.ManualVerifyCallback != nil {
-		cb := opts.ManualVerifyCallback
-		manualVerifyCallback = func(req issl.ManualVerificationRequest) bool {
-			return cb(FingerprintVerificationRequest{
-				Fingerprint: req.Fingerprint,
-				Certificate: req.Certificate,
-				Host:        req.Host,
-			})
 		}
 	}
 
@@ -637,6 +643,8 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		MaxIdleConnsPerHost:         opts.MaxIdleConnsPerHost,
 		IdleConnTimeoutSec:          opts.IdleConnTimeoutSec,
 		TCPKeepAliveSec:             opts.TCPKeepAliveSec,
+		DialContext:                 opts.DialContext,
+		Proxy:                       opts.Proxy,
 		CacheConfig:                 opts.CacheConfig,
 		CookieName:                  opts.CookieName,
 		PVENewFormat:                opts.PVENewFormat,
@@ -644,7 +652,7 @@ func internalHTTPNew(opts *Options) (*pvehttp.Client, error) {
 		ManualVerification:          opts.ManualVerification,
 		RegisterFingerprintCallback: opts.RegisterFingerprintCallback,
 		VerifyFingerprintCallback:   opts.VerifyFingerprintCallback,
-		ManualVerifyCallback:        manualVerifyCallback,
+		ManualVerifyCallback:        adaptManualVerifyCallback(opts.ManualVerifyCallback),
 		FingerprintCachePath:        opts.FingerprintCachePath,
 	}
 

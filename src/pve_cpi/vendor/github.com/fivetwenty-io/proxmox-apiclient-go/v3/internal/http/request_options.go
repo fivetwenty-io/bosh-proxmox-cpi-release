@@ -19,6 +19,9 @@ type RequestOptions struct {
 	// effects (e.g. VM create/clone). When false (the default) only
 	// idempotent methods (GET/HEAD/OPTIONS) are auto-retried.
 	ForceRetry *bool
+	// Host, when non-nil and non-empty, replaces the host[:port] of the
+	// request URL, keeping the configured protocol and path. See WithHost.
+	Host *string
 }
 
 // FromContext extracts RequestOptions from context.
@@ -58,6 +61,11 @@ func with(ctx context.Context, update func(*RequestOptions)) context.Context {
 		opts.ForceRetry = &f
 	}
 
+	if existing.Host != nil {
+		h := *existing.Host
+		opts.Host = &h
+	}
+
 	if existing.Fields != nil {
 		opts.Fields = make(map[string]interface{}, len(existing.Fields))
 		for k, v := range existing.Fields {
@@ -85,6 +93,22 @@ func WithRetryDelay(ctx context.Context, d time.Duration) context.Context {
 // safe to repeat; otherwise a retry may duplicate server-side side effects.
 func WithForceRetry(ctx context.Context, enabled bool) context.Context {
 	return with(ctx, func(opts *RequestOptions) { opts.ForceRetry = &enabled })
+}
+
+// WithHost overrides the host[:port] this request is sent to, keeping the
+// client's protocol and path — for endpoints that must be reached on a
+// specific cluster node (e.g. uploading to the node that owns a local
+// storage). When the override carries no port the client's configured port is
+// kept. Authentication is unaffected: PVE tokens and tickets are cluster-wide,
+// and any re-authentication still goes to the configured base host.
+//
+// TLS: standard CA verification follows the request URL, so the target node's
+// certificate must carry a SAN for the dialed host. TLS fingerprint pinning
+// verifies only the configured base host; to avoid silently accepting the
+// wrong pin, a request with a host override fails fast with
+// ErrHostOverrideFingerprint when fingerprint pinning is enabled.
+func WithHost(ctx context.Context, host string) context.Context {
+	return with(ctx, func(opts *RequestOptions) { opts.Host = &host })
 }
 
 // WithLogging toggles logging for this request.

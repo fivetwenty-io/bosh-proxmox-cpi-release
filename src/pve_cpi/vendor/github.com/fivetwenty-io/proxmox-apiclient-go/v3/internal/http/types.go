@@ -1,8 +1,12 @@
 package http
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"time"
 
 	issl "github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/ssl"
@@ -90,6 +94,20 @@ type Options struct {
 	MaxIdleConnsPerHost    int // max idle conns per host; 0 = falls back to KeepAlive
 	IdleConnTimeoutSec     int // idle connection timeout seconds; 0 = constants.LongTimeout()
 	TCPKeepAliveSec        int // TCP keepalive probe interval seconds; 0 = Go default
+
+	// DialContext, when non-nil, establishes every connection the transport
+	// makes, replacing the TCP dial entirely. It takes precedence over
+	// DialTimeoutSec and TCPKeepAliveSec, which configure a dialer this field
+	// replaces; a caller supplying its own dial function owns its own
+	// timeouts. Opt-in; nil (default) keeps the transport's existing dialing.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Proxy, when non-nil, selects the proxy for a request, exactly as
+	// http.Transport.Proxy does. Opt-in; nil (default) sends every request
+	// direct, which is this transport's long-standing behaviour and the
+	// reason HTTP_PROXY/HTTPS_PROXY have no effect on it. Pass
+	// http.ProxyFromEnvironment to honour those variables.
+	Proxy func(*http.Request) (*url.URL, error)
 
 	// Caching configuration
 	CacheConfig *cache.Config
