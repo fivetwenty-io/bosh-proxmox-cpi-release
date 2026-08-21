@@ -245,7 +245,6 @@ func (c *scanFakeClient) createQemuMoveDisk(_ context.Context, _ string, vmidStr
 	return &resp, nil
 }
 
-
 // clusterRow builds one /cluster/resources row for a QEMU guest. Shared by
 // every fake listing here so the JSON key literals live in one place.
 func clusterRow(vmid int, tags string) map[string]any {
@@ -311,7 +310,7 @@ func TestTransferDiskToParker_ProtocolAndOrdering(t *testing.T) {
 	c := newScanFakeClient(map[int]map[string]any{
 		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
 		90000: {
-			cfgKeyTags:   "bosh-cpi;bosh-parker",
+			cfgKeyTags:      "bosh-cpi;bosh-parker",
 			paramProtection: true,
 		},
 	})
@@ -367,7 +366,7 @@ func TestTransferDiskToParker_SnapshotRefusalLeavesResumableState(t *testing.T) 
 	c := newScanFakeClient(map[int]map[string]any{
 		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
 		90000: {
-			cfgKeyTags:   "bosh-cpi;bosh-parker",
+			cfgKeyTags:      "bosh-cpi;bosh-parker",
 			paramProtection: true,
 		},
 	})
@@ -407,9 +406,9 @@ func TestTransferDiskFromParker_CarriesOptionsAndRenames(t *testing.T) {
 	t.Parallel()
 	c := newScanFakeClient(map[int]map[string]any{
 		90000: {
-			cfgKeyTags:   "bosh-cpi;bosh-parker",
+			cfgKeyTags:      "bosh-cpi;bosh-parker",
 			paramProtection: true,
-			"scsi0":      "data:vm-90000-disk-0,serial=" + transferStableID,
+			"scsi0":         "data:vm-90000-disk-0,serial=" + transferStableID,
 		},
 		700: {},
 	})
@@ -602,10 +601,10 @@ func TestDeleteParkedOwnedDisk_DeallocatesAndCleansProvenance(t *testing.T) {
 		`"node":"pve1","volid":"data:vm-90000-disk-2","slot":"scsi1"}}}-->`
 	c := newScanFakeClient(map[int]map[string]any{
 		90000: {
-			cfgKeyTags:    "bosh-cpi;bosh-parker",
-			paramProtection:  true,
-			"scsi1":       "data:vm-90000-disk-2,serial=" + transferStableID,
-			"description": desc,
+			cfgKeyTags:      "bosh-cpi;bosh-parker",
+			paramProtection: true,
+			"scsi1":         "data:vm-90000-disk-2,serial=" + transferStableID,
+			"description":   desc,
 		},
 	})
 	err := DeleteParkedOwnedDisk(context.Background(), c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferTestCfg)
