@@ -53,11 +53,10 @@ jobs:
     if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
 
     container:
-      # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Once the
-      # first ci-image.yml run prints the pushed digest, pin this reference
-      # to ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:... the way the
-      # other workflows pin golang:1.26.
-      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci:latest
+      # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
+      # digest the way the other workflows pin golang:1.26; update the pin
+      # from the digest a ci-image.yml run prints after a Dockerfile change.
+      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:ecac55fe1a5fb3bb76e0ba053337899debbb80e0221c01c2b1ac890342f55097
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
       # gha-lab-state is DIFFERENT in kind: it persists the director's
       # create-env products (creds.yml, state.json) between runs, because
