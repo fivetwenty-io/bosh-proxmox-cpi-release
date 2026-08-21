@@ -12,6 +12,8 @@ Four paths exist for certifying this CPI release against the BOSH CPI v2 contrac
 
 The first three run locally against a lab. Together they cover the CPI method surface, the director contract at one CPI version, and the director contract across two CPI versions. The fourth adds continuous automation on top.
 
+Paths 2 and 3 also run unattended every Saturday against the `cpitest` lab, via `.github/workflows/acceptance.yml`. See [Scheduled Acceptance Workflow](scheduled.md) for its setup, its report-landing machinery, and its troubleshooting notes.
+
 Alongside these, `./scripts/e2e` runs the full-stack end-to-end flow: it bootstraps a BOSH director and CloudFoundry from nothing, then exercises the CPI lifecycle, a real `cf push`, and a real `cf ssh`. It proves more than the CPI contract, so we track its committed run reports beside the certification paths, under `docs/certification/e2e/` (see [End-to-end results](e2e/README.md)).
 
 ## Local Lifecycle Harness
