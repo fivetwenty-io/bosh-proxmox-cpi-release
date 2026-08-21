@@ -14,11 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
@@ -491,6 +493,26 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		case "preuploaded":
 			return handleLightStemcellPreUploaded(ctx, deps, cp, reqCtx.DirectorUUID)
 		case "fetch":
+			// Prefer the PVE server-side download-url path when the image_url
+			// qualifies (https, no credentials, sha256 present): PVE streams
+			// the bytes itself and the CPI never transfers them, which
+			// sidesteps the cluster-proxy upload problem class entirely. Both
+			// paths derive the same digest-based filename and ":heavy:" CID,
+			// so a failed server-side attempt falls back to the CPI-side
+			// fetch below without changing the stemcell's identity.
+			if serverSideFetchEligible(deps, cp) {
+				sd := cp
+				sd.SourceURL = cp.ImageURL
+				sd.ImageURL = ""
+				out, sdErr := handleStemcellDownloadURL(ctx, deps, sd, reqCtx.DirectorUUID)
+				if sdErr == nil {
+					return out, nil
+				}
+				deps.Log(ctx).Warn("create_stemcell: server-side download for image_url failed; falling back to the CPI-side fetch",
+					log.URL("image_url", cp.ImageURL),
+					log.Err(sdErr),
+				)
+			}
 			return handleLightStemcellFetch(ctx, deps, cp, reqCtx.DirectorUUID)
 		case "server-download":
 			return handleStemcellDownloadURL(ctx, deps, cp, reqCtx.DirectorUUID)
@@ -1486,11 +1508,13 @@ func buildDirectorTagTokens(directorTags map[string]string) []string {
 // resolveStemcellStorageAndNode resolves the target PVE node and storage for a
 // heavy-stemcell upload (steps 4-5 of the eleven-step flow).
 //
-// node comes from deps.Config.Node (required; empty is a cloud error).
-// storage is deps.Config.StemcellStorage with a fallback to VMStorage (both
-// empty is a cloud error). After the storage name is determined,
-// validateStemcellStorageShared enforces that local-only storage is rejected
-// when the cluster has more than one node.
+// node comes from deps.Config.Node (required; empty is a cloud error), then is
+// retargeted to one of the storage's owning nodes when the storage carries a
+// PVE "nodes" restriction that excludes the configured node — see
+// stemcellStorageOwningNode. storage is deps.Config.StemcellStorage with a
+// fallback to VMStorage (both empty is a cloud error). After the storage name
+// is determined, validateStemcellStorageShared enforces that local-only
+// storage is rejected when the cluster has more than one node.
 func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storage string, err error) {
 	node = deps.Config.Node
 	if node == "" {
@@ -1508,7 +1532,49 @@ func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storag
 	if validateErr := validateStemcellStorageShared(ctx, deps, storage); validateErr != nil {
 		return "", "", validateErr
 	}
+	node = stemcellStorageOwningNode(ctx, deps, node, storage)
 	return node, storage, nil
+}
+
+// stemcellStorageOwningNode returns the node that storage-scoped API calls
+// derived from this stemcell's storage resolution — the multipart upload, the
+// download-url call, and content listings — should be addressed to.
+//
+// PVE storages may carry a "nodes" restriction (storage.cfg); a
+// storage-scoped API path addressed to a node outside that set fails with
+// "storage not available on node". When the storage is unrestricted (empty
+// Nodes, meaning available on every node) or the configured node is itself an
+// owner, the configured node is kept unchanged. Otherwise the call is
+// retargeted to the lexicographically first owning node — the same
+// deterministic canonical ordering canonicalNodeSet applies to a storage's
+// node set — and the retarget is logged at info.
+//
+// This changes API-path semantics only: the CPI still connects to the same
+// configured PVE endpoint, which proxies the request to the node named in the
+// path. A per-request host override that changes which node actually executes
+// the transfer is a separate, audit-gated item and is deliberately not part of
+// this addressing decision.
+//
+// Classification failure (liveStorageInfo not ok) keeps the configured node —
+// fail open, matching every other liveStorageInfo consumer.
+func stemcellStorageOwningNode(ctx context.Context, deps Deps, configuredNode, storage string) string {
+	info, ok := liveStorageInfo(ctx, deps, storage)
+	if !ok || len(info.Nodes) == 0 {
+		return configuredNode
+	}
+	owners := append([]string(nil), info.Nodes...)
+	sort.Strings(owners)
+	for _, owner := range owners {
+		if owner == configuredNode {
+			return configuredNode
+		}
+	}
+	deps.Log(ctx).Info("create_stemcell: storage is node-restricted and the configured node is not an owner; addressing storage-scoped calls to an owning node",
+		log.String("storage", storage),
+		log.String("configured_node", configuredNode),
+		log.String("owning_node", owners[0]),
+	)
+	return owners[0]
 }
 
 // stemcellDedupResult bundles the outputs of buildAndDeduplicateStemcellCID
@@ -1880,6 +1946,40 @@ func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcel
 	return stemcellfetch.ResolveSourceWith(rawURL, tc)
 }
 
+// serverSideFetchEligible reports whether an image_url stemcell can ride the
+// PVE server-side download-url path instead of the CPI-side fetch+upload:
+//
+//   - a verified content identity must exist up front
+//     (cloud_properties.sha256) because PVE, not the CPI, streams the bytes
+//     and the download-url path derives filename, CID, and dedup identity
+//     from that digest;
+//   - the URL must be plain https:// — PVE's download-url endpoint speaks no
+//     s3://, oci://, or bosh+blobstore: and attaches no auth headers;
+//   - credential resolution (per-stemcell image_url_auth, then the config's
+//     FetchCredentialDefaults longest-prefix match) must come up empty, or
+//     the server-side fetch would silently drop the credentials the CPI-side
+//     fetch would have sent.
+//
+// A malformed auth payload also returns false: the CPI-side fetch surfaces
+// that error with its full context instead.
+func serverSideFetchEligible(deps Deps, cp stemcellCloudProps) bool {
+	if !isValidSHA256Hex(cp.ExpectedSHA256) {
+		return false
+	}
+	if !strings.HasPrefix(strings.ToLower(cp.ImageURL), "https://") {
+		return false
+	}
+	var defaults []config.FetchCredentialDefault
+	if deps.Config != nil {
+		defaults = deps.Config.FetchCredentialDefaults
+	}
+	creds, err := stemcellfetch.ResolveCredentials(cp.ImageURLAuth, defaults, cp.ImageURL)
+	if err != nil {
+		return false
+	}
+	return creds.Kind() == "none"
+}
+
 // handleLightStemcellFetch fetches a remote stemcell qcow2, uploads it to PVE
 // storage, and returns the canonical light: CID. Entered when cloud_properties
 // sets image_url.
@@ -1948,6 +2048,11 @@ func handleLightStemcellFetch(
 	if node == "" {
 		return nil, cpierrors.Cloud("create_stemcell: config.node must not be empty")
 	}
+	// Address storage-scoped calls (dedup scans, upload, and the server-side
+	// download attempt below) to a node that actually owns the storage when it
+	// carries a nodes restriction — same retarget the heavy path applies via
+	// resolveStemcellStorageAndNode.
+	node = stemcellStorageOwningNode(ctx, deps, node, storage)
 
 	fetchTemplateNode := node
 	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
@@ -2964,6 +3069,49 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 	return nodes, nil
 }
 
+// replicaOutcome records the terminal outcome of one node's replication
+// attempt. Stage names the step the attempt ended at ("existing-check",
+// "adopt", "upload", "inflight-gate", "ensure-template", "panic", or a success
+// marker: "replicated" / "already-exists" / "adopted"). Err is nil for every
+// successful outcome and non-nil exactly when the node ended up without a
+// usable replica.
+type replicaOutcome struct {
+	Node  string
+	Stage string
+	Err   error
+}
+
+// logReplicationSummary emits exactly one summary line for a completed
+// replication fan-out: warn when any node failed (failed count, failed node
+// list, and each failed node's terminal stage and first error), info when
+// every node succeeded. Replication is best-effort, so the warn is
+// informational — the stemcell the caller returned is unaffected; the named
+// nodes simply have no replica until a later create_stemcell re-drives them.
+func logReplicationSummary(logger *log.Logger, label string, outcomes []replicaOutcome) {
+	if len(outcomes) == 0 {
+		return
+	}
+	fields := []log.Field{log.Int("replica_nodes", len(outcomes))}
+	var failedNodes []string
+	for _, o := range outcomes {
+		if o.Err == nil {
+			continue
+		}
+		failedNodes = append(failedNodes, o.Node)
+		fields = append(fields, log.String("error_"+o.Node, o.Stage+": "+o.Err.Error()))
+	}
+	if len(failedNodes) == 0 {
+		logger.Info(label+": all replicas succeeded", fields...)
+		return
+	}
+	fields = append(fields,
+		log.Int("failed", len(failedNodes)),
+		log.String("failed_nodes", strings.Join(failedNodes, ",")),
+	)
+	logger.Warn(label+": some replicas failed (non-fatal; the stemcell itself succeeded — "+
+		"affected nodes have no replica until a later create_stemcell re-drives them)", fields...)
+}
+
 // replicateStemcellToNodes uploads qcow2 and builds a template VM on every
 // cluster node in targetNodes except for primaryNode (which already has the
 // primary template). Each replica VM carries both the sha tag and a per-node
@@ -2991,12 +3139,18 @@ func listClusterNodes(ctx context.Context, deps Deps) ([]string, error) {
 //     under concurrent different-node calls from multiple goroutines.
 //   - VMID allocation uses AllocateWithRetry which regenerates on conflict — safe
 //     under concurrent cluster-wide allocation from parallel goroutines.
-//   - No mutable state is shared between goroutines; all results are logged directly.
+//   - No mutable state is shared between goroutines beyond the outcomes
+//     slice, where each goroutine writes only its own index and the slice is
+//     read only after wg.Wait().
 //
 // kind is the primary template's path-identity kind and is stamped into each
 // replica's provenance unchanged: a replica of a light stemcell's cache
 // template is still CPI-owned (the operator owns only the qcow2), but its
 // provenance must not claim the CPI uploaded the underlying bytes.
+//
+// After the fan-out completes, the per-node replicaOutcomes are condensed by
+// logReplicationSummary into a single aggregate line. The outcomes carry
+// observability only — failures stay best-effort and never propagate.
 func replicateStemcellToNodes(
 	ctx context.Context,
 	deps Deps,
@@ -3036,9 +3190,13 @@ func replicateStemcellToNodes(
 	// this is exactly the serial behavior of the original loop.
 	sem := make(chan struct{}, workerLimit)
 
+	// One slot per replica node; each goroutine writes only its own index, and
+	// the slice is read only after wg.Wait(), so no lock is needed.
+	outcomes := make([]replicaOutcome, len(replicaNodes))
+
 	var wg sync.WaitGroup
-	for _, node := range replicaNodes {
-		node := node // capture per iteration
+	for i, node := range replicaNodes {
+		i, node := i, node // capture per iteration
 		nodeLogger := logger.With(log.String("replica_node", node))
 
 		wg.Add(1)
@@ -3080,21 +3238,30 @@ func replicateStemcellToNodes(
 						log.Any("panic", r),
 						log.String("stack", string(debug.Stack())),
 					)
+					outcomes[i] = replicaOutcome{
+						Node:  node,
+						Stage: "panic",
+						Err:   fmt.Errorf("worker panicked: %v", r),
+					}
 				}
 			}()
 
-			replicateOneNode(ctx, deps, nodeLogger, node, storage,
+			outcomes[i] = replicateOneNode(ctx, deps, nodeLogger, node, storage,
 				qcow2Filename, sha256hex, sha8, uploadSourcePath, uploadStagingDir,
 				stemcellCID, creatingDirectorUUID, kind, cp, source)
 		}()
 	}
 	wg.Wait()
+	logReplicationSummary(logger, "create_stemcell: replication", outcomes)
 }
 
 // replicateOneNode performs the full upload+ensureTemplate sequence for a single
 // replica node. It is called from a goroutine inside replicateStemcellToNodes.
-// All failures are best-effort: logged as warnings, never returned as errors.
-// The function is self-contained — it holds no references to shared mutable state.
+// All failures are best-effort: logged as warnings, never returned as errors —
+// the returned replicaOutcome names the terminal stage (and its error, when the
+// node ended up without a usable replica) purely so the caller can log one
+// aggregate summary. The function is self-contained — it holds no references to
+// shared mutable state.
 //
 // Replicas do NOT register a director reference of their own: the returned
 // CID's ref set lives on the primary (or cluster-scoped dedup-hit) cache
@@ -3114,20 +3281,20 @@ func replicateOneNode(
 	kind pve.StemcellKind,
 	cp stemcellCloudProps,
 	source string,
-) {
+) replicaOutcome {
 	// Check whether a replica already exists on this node (idempotent).
 	existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
 	if checkErr != nil {
 		nodeLogger.Warn("create_stemcell: replication: cannot check existing replica (skipping node)",
 			log.Err(checkErr),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "existing-check", Err: checkErr}
 	}
 	if alreadyExists {
 		nodeLogger.Info("create_stemcell: replication: replica already exists (skipping upload)",
 			log.Int(metadataKeyVMID, existingVMID),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "already-exists"}
 	}
 
 	// Adopt-and-wait on a racing concurrent replica clone: another CPI process may
@@ -3146,12 +3313,12 @@ func replicateOneNode(
 			nodeLogger.Warn("create_stemcell: replication: adopt-and-wait on racing replica timed out (skipping node)",
 				log.Err(adoptErr),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "adopt", Err: adoptErr}
 		case adopted:
 			nodeLogger.Info("create_stemcell: replication: adopted in-flight replica from concurrent builder (skipping upload)",
 				log.Int(metadataKeyVMID, adoptedVMID),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "adopted"}
 		}
 	}
 
@@ -3171,12 +3338,13 @@ func replicateOneNode(
 		// classification failure, not a normal configuration.
 		nodeLogger.Warn("create_stemcell: replication: no upload source and stemcell storage not " +
 			"classifiable as shared; skipping node")
-		return
+		return replicaOutcome{Node: node, Stage: "upload",
+			Err: fmt.Errorf("no upload source and stemcell storage not classifiable as shared")}
 	} else if uploadErr := uploadStemcellImage(ctx, deps, node, storage, qcow2Filename, uploadSourcePath, uploadStagingDir); uploadErr != nil {
 		nodeLogger.Warn("create_stemcell: replication: upload failed (non-fatal; replica not created)",
 			log.Err(uploadErr),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "upload", Err: uploadErr}
 	}
 
 	// Build template VM on this node. The replica carries both sha tag and
@@ -3190,7 +3358,7 @@ func replicateOneNode(
 	// other's semaphore channels.
 	replicaCP := cp
 	replicaCP.Node = node
-	func() {
+	return func() replicaOutcome {
 		if deps.Config != nil {
 			replicaRelease, replicaInflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
 			if replicaInflightErr != nil {
@@ -3198,7 +3366,7 @@ func replicateOneNode(
 					log.String("node", node),
 					log.Err(replicaInflightErr),
 				)
-				return
+				return replicaOutcome{Node: node, Stage: "inflight-gate", Err: replicaInflightErr}
 			}
 			defer replicaRelease()
 		}
@@ -3227,11 +3395,12 @@ func replicateOneNode(
 				nodeLogger.Warn("create_stemcell: replication: skipping upload cleanup — storage is shared or " +
 					"its classification is unknown, and the returned stemcell CID may name this same file")
 			}
-			return
+			return replicaOutcome{Node: node, Stage: "ensure-template", Err: tmplErr}
 		}
 		nodeLogger.Info("create_stemcell: replication: replica template created",
 			log.Int64(metadataKeyVMID, replicaVMID),
 		)
+		return replicaOutcome{Node: node, Stage: "replicated"}
 	}()
 }
 
@@ -3390,9 +3559,14 @@ func replicateServerDownloadToNodes(
 	}
 
 	sem := make(chan struct{}, workerLimit)
+
+	// Same single-writer-per-index discipline as replicateStemcellToNodes:
+	// read only after wg.Wait().
+	outcomes := make([]replicaOutcome, len(replicaNodes))
+
 	var wg sync.WaitGroup
-	for _, node := range replicaNodes {
-		node := node // capture per iteration
+	for i, node := range replicaNodes {
+		i, node := i, node // capture per iteration
 		nodeLogger := logger.With(log.String("replica_node", node))
 
 		wg.Add(1)
@@ -3413,20 +3587,27 @@ func replicateServerDownloadToNodes(
 						log.Any("panic", r),
 						log.String("stack", string(debug.Stack())),
 					)
+					outcomes[i] = replicaOutcome{
+						Node:  node,
+						Stage: "panic",
+						Err:   fmt.Errorf("worker panicked: %v", r),
+					}
 				}
 			}()
 
-			replicateOneNodeServerDownload(ctx, deps, nodeLogger, node, storage,
+			outcomes[i] = replicateOneNodeServerDownload(ctx, deps, nodeLogger, node, storage,
 				qcow2Filename, sha256hex, sha8, sourceURL, stemcellCID, creatingDirectorUUID, cp)
 		}()
 	}
 	wg.Wait()
+	logReplicationSummary(logger, "create_stemcell: server-download replication", outcomes)
 }
 
 // replicateOneNodeServerDownload performs the download+ensureTemplate
 // sequence for a single replica node in the server-download path. Called from
 // a goroutine inside replicateServerDownloadToNodes. All failures are
-// best-effort: logged as warnings, never returned as errors.
+// best-effort: logged as warnings, never returned as errors — the returned
+// replicaOutcome names the terminal stage for the caller's aggregate summary.
 //
 // Like replicateOneNode, a replica built here does NOT register its own
 // director reference — the returned CID's ref set lives on the primary
@@ -3436,7 +3617,8 @@ func replicateServerDownloadToNodes(
 // replicateOneNodeServerDownload (no per-node download happened, so
 // onFailure is nil) or the post-download arm (onFailure is the download
 // cleanup for this node's own local copy). Applies the per-node in-flight
-// gate in both arms. Best-effort: failures are logged and never propagate.
+// gate in both arms. Best-effort: failures are logged and never propagate;
+// the returned replicaOutcome carries the terminal stage for the summary.
 func buildServerDownloadReplica(
 	ctx context.Context,
 	deps Deps,
@@ -3445,7 +3627,7 @@ func buildServerDownloadReplica(
 	stemcellCID, creatingDirectorUUID string,
 	cp stemcellCloudProps,
 	onFailure func(filename string),
-) {
+) replicaOutcome {
 	replicaCP := cp
 	replicaCP.Node = node
 	if deps.Config != nil {
@@ -3455,7 +3637,7 @@ func buildServerDownloadReplica(
 				log.String("node", node),
 				log.Err(replicaInflightErr),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "inflight-gate", Err: replicaInflightErr}
 		}
 		defer replicaRelease()
 	}
@@ -3468,11 +3650,12 @@ func buildServerDownloadReplica(
 		if onFailure != nil {
 			onFailure(qcow2Filename)
 		}
-		return
+		return replicaOutcome{Node: node, Stage: "ensure-template", Err: tmplErr}
 	}
 	nodeLogger.Info("create_stemcell: server-download replication: replica template created",
 		log.Int64(metadataKeyVMID, replicaVMID),
 	)
+	return replicaOutcome{Node: node, Stage: "replicated"}
 }
 
 func replicateOneNodeServerDownload(
@@ -3482,20 +3665,20 @@ func replicateOneNodeServerDownload(
 	node, storage, qcow2Filename, sha256hex, sha8, sourceURL string,
 	stemcellCID, creatingDirectorUUID string,
 	cp stemcellCloudProps,
-) {
+) replicaOutcome {
 	// Idempotent: skip when a replica already exists on this node.
 	existingVMID, alreadyExists, checkErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, node, sha8)
 	if checkErr != nil {
 		nodeLogger.Warn("create_stemcell: server-download replication: cannot check existing replica (skipping node)",
 			log.Err(checkErr),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "existing-check", Err: checkErr}
 	}
 	if alreadyExists {
 		nodeLogger.Info("create_stemcell: server-download replication: replica already exists (skipping download)",
 			log.Int(metadataKeyVMID, existingVMID),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "already-exists"}
 	}
 
 	// Adopt-and-wait on a racing concurrent replica build (same mechanism as
@@ -3508,18 +3691,19 @@ func replicateOneNodeServerDownload(
 			nodeLogger.Warn("create_stemcell: server-download replication: adopt-and-wait on racing replica timed out (skipping node)",
 				log.Err(adoptErr),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "adopt", Err: adoptErr}
 		case adopted:
 			nodeLogger.Info("create_stemcell: server-download replication: adopted in-flight replica from concurrent builder (skipping download)",
 				log.Int(metadataKeyVMID, adoptedVMID),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "adopted"}
 		}
 	}
 
 	if deps.PVE == nil || deps.PVE.Nodes() == nil {
 		nodeLogger.Warn("create_stemcell: server-download replication: nodes service unavailable (skipping node)")
-		return
+		return replicaOutcome{Node: node, Stage: "download",
+			Err: fmt.Errorf("nodes service unavailable")}
 	}
 
 	// Shared stemcell pool: the primary's download is already visible on this
@@ -3528,9 +3712,8 @@ func replicateOneNodeServerDownload(
 	// node-local vm_storage).
 	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
 		nodeLogger.Info("create_stemcell: server-download replication: stemcell storage is shared; skipping per-node download")
-		buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, qcow2Filename,
+		return buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, qcow2Filename,
 			sha256hex, sourceURL, stemcellCID, creatingDirectorUUID, cp, nil)
-		return
 	}
 
 	params := &sdknodes.CreateStorageDownloadUrlParams{
@@ -3571,7 +3754,7 @@ func replicateOneNodeServerDownload(
 		nodeLogger.Warn("create_stemcell: server-download replication: download failed (non-fatal; replica not created)",
 			log.Err(dlErr),
 		)
-		return
+		return replicaOutcome{Node: node, Stage: "download", Err: dlErr}
 	}
 	if resp != nil && len(*resp) > 0 {
 		upid, upidErr := pve.UPIDFromRaw(*resp)
@@ -3579,7 +3762,7 @@ func replicateOneNodeServerDownload(
 			nodeLogger.Warn("create_stemcell: server-download replication: cannot parse task UPID (non-fatal; replica not created)",
 				log.Err(upidErr),
 			)
-			return
+			return replicaOutcome{Node: node, Stage: "download", Err: upidErr}
 		}
 		if upid != "" {
 			if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, nodeLogger,
@@ -3588,7 +3771,7 @@ func replicateOneNodeServerDownload(
 					log.Err(awaitErr),
 				)
 				cleanupOnFailure(qcow2Filename)
-				return
+				return replicaOutcome{Node: node, Stage: "download", Err: awaitErr}
 			}
 		}
 	}
@@ -3605,6 +3788,6 @@ func replicateOneNodeServerDownload(
 		}
 	}
 
-	buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, actualFilename,
+	return buildServerDownloadReplica(ctx, deps, nodeLogger, node, storage, actualFilename,
 		sha256hex, sourceURL, stemcellCID, creatingDirectorUUID, cp, cleanupOnFailure)
 }

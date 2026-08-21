@@ -139,6 +139,8 @@ The operator uploads the qcow2 to PVE storage manually and declares its SHA-256 
 
 The CPI fetches the qcow2 from a remote URL, streams it into PVE storage while computing its SHA-256 in one pass, builds (or reuses) a frozen cache template, and returns a `:heavy:` CID (see the [naming note](#a-naming-note-image_url-produces-heavy-not-light) above — this mode is covered by the "light stemcell" umbrella term because of the historical feature name, but the CPI transferred the bytes, so it owns deleting them). Subsequent `bosh upload-stemcell` calls for the same content skip the download entirely.
 
+When the `image_url` qualifies, we route it through PVE's own download-url API first, the same server-side transfer [Mode 3](#mode-3-server-side-download-heavy) uses: PVE streams the bytes directly into storage and the CPI never carries them, which also sidesteps upload proxying across cluster nodes. Three conditions must all hold: the URL is plain `https://`, `cloud_properties.sha256` is present (the server-side path derives filename, dedup, and CID identity from the digest), and no credentials apply to the URL (neither `image_url_auth` nor a matching entry in the CPI config's centralized credentials, since PVE would not send them). Both paths derive the same digest-based filename and `:heavy:` CID, so if the server-side attempt fails we log a warning and fall back to the CPI-side fetch described here, with no change to the stemcell's identity.
+
 ### URL schemes
 
 | Scheme | Format | Notes |

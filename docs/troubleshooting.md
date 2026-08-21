@@ -390,6 +390,22 @@ create_stemcell: stemcell storage "X" is local-only but the cluster has N nodes;
 
 Set `pve.stemcell_storage` to a storage pool that is shared across nodes (`shared=1` in `storage.cfg`). Acceptable types: `nfs`, `cifs`, `glusterfs`, `cephfs`, `dir` with shared=1. See [Configuration](configuration.md#stemcell-storage).
 
+### Storage not available on the configured node
+
+**Symptom**
+
+```text
+PVE API error: storage 'X' is not available on node 'Y'
+```
+
+**Diagnosis**
+
+The storage carries a `nodes` restriction in `storage.cfg` that excludes the node the call was addressed to. For stemcell uploads this should not occur on current releases: when the stemcell storage is node-restricted and `pve.node` is not an owner, we address the storage-scoped calls (upload, server-side download, and content listings) to the restriction set's first owning node and log the retarget at info. Seeing this error means some other storage (for example `pve.vm_storage` during clone) excludes the node the VM landed on.
+
+**Fix**
+
+Either widen the storage's `nodes` restriction in `storage.cfg` to include the node, or pin placement to an owning node (`pve.node`, an AZ `target_node`, or `cloud_properties.node`).
+
 ### Block storage rejects qcow2 upload
 
 **Symptom**
