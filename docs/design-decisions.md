@@ -282,6 +282,24 @@ Two guardrails matter operationally. First, a key inside the registry carrying a
 
 **Follow-up recorded.** The attach path currently rebuilds drive option strings from the envelope's recorded options, and PVE rejects unknown keys, so any CPI-internal key that reaches the drive string is a live failure. The build verifies that CPI-internal option keys are filtered before the config write and adds a regression test.
 
+## D14 — Upload node targeting: address the node, no direct dial
+
+**Question.** The CPI opens one HTTPS connection to `pve.host` and keeps it for every API call. A stemcell upload addressed to a different node (`POST /nodes/<other>/storage/<pool>/upload`) therefore always transits the connection node's `pveproxy`. Does a multi-gigabyte multipart body survive that proxy hop, or does the CPI need a `pve.upload_direct_node` knob that resolves the target node's address and dials it directly?
+
+**Audit.** Run live against a two-node cluster (pve-manager 9.2.4) with a 1.3 GB qcow2, connected to node A throughout:
+
+- Upload addressed to node A's own node-local storage (baseline): HTTP 200 in 47.0 s, volume lands on node A.
+
+- Upload addressed to node B's node-local storage: HTTP 200 in 47.5 s, volume lands on node B. The proxy hop neither drops nor measurably slows the transfer.
+
+- Storage restricted to node B (`nodes` set), upload addressed to node B: HTTP 200, volume lands on node B under the restricted storage's path.
+
+- The same restricted storage addressed to node A (not an owner): HTTP 500 after the body transfer completes. A misaddressed upload wastes the transfer but fails closed; nothing lands.
+
+**Chosen: keep addressing the owning node through the shared connection.** The failure mode the knob would guard against does not exist on the PVE versions we support, so the knob is not built. Addressing is still load-bearing: the owning-node retarget in `create_stemcell` picks a node that owns the storage, and the audit confirms PVE then places the volume there. This also avoids the TLS cost a direct dial would carry (node IPs would need to appear in certificate SANs).
+
+**One quirk worth knowing.** The upload task's UPID names the connection node, not the addressed node, even though the volume lands on the addressed node. Task polling must follow the node embedded in the UPID rather than the node the request addressed; `AwaitTask` already does this (it re-targets to `nodeFromUPID` whenever the two disagree), so no CPI change was needed.
+
 ## Out of scope
 
 A few adjacent ideas were explicitly weighed and rejected for this pass:
