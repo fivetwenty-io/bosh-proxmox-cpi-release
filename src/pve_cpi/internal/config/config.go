@@ -2153,6 +2153,13 @@ func (c *CPIConfig) SDNAutoManageZoneEnabled() bool {
 // ApplyDefaults sets zero-value optional fields to their documented defaults.
 // Callers must invoke this before Validate when constructing a CPIConfig manually.
 func (c *CPIConfig) ApplyDefaults() {
+	// Accept the Authorization-header form of an API token
+	// ("PVEAPIToken=user@realm!tokenid=secret") alongside the bare
+	// "user@realm!tokenid=secret" form. PVE surfaces the prefixed form in its
+	// own header examples, so operators paste both; the SDK's ParseAPIToken
+	// splits on the first '=' and would otherwise read the prefix as the
+	// token ID.
+	c.APIToken = strings.TrimPrefix(c.APIToken, "PVEAPIToken=")
 	if c.Port == 0 {
 		c.Port = 8006
 	}

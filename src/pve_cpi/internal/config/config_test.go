@@ -1307,11 +1307,27 @@ func TestLoad_APIToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.APIToken == "" {
-		t.Error("APIToken should be set")
+	// The Authorization-header prefix is stripped so the SDK's ParseAPIToken
+	// (which splits on the first '=') sees "user@realm!tokenid=secret".
+	if got, want := cfg.APIToken, "root@pam!mytoken=abc123"; got != want {
+		t.Errorf("APIToken = %q, want %q", got, want)
 	}
 	if cfg.Password != "" {
 		t.Error("Password should be empty")
+	}
+}
+
+func TestLoad_APITokenBareForm(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host":"pve.example.com","user":"root@pam","api_token":"root@pam!mytoken=abc123",
+		"vm_storage":"local-lvm","disk_storage":"local-lvm","network_bridge":"vmbr0"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := cfg.APIToken, "root@pam!mytoken=abc123"; got != want {
+		t.Errorf("APIToken = %q, want %q", got, want)
 	}
 }
 
