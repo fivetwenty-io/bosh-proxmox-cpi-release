@@ -12,7 +12,7 @@ in the PVE cloud-config template (manifests/bats/cloud_config_pve.yml.erb),
 renders bat.yml from the active env bundle, runs rspec with the PVE tag
 exclusions, restores the director's cloud config afterward, and writes both
 machine artifacts (.e2e-results/<ts>/) and the committed proof documents
-(docs/certification/bats/runs/<date>.md plus the README.md summary).
+(docs/certification/bats/runs/<date>-<hhmmss>.md plus the README.md summary).
 
 Usage:
     ./scripts/bats [command] [flags]
@@ -585,7 +585,7 @@ def write_run_doc(
     phases: "list[dict] | None" = None,
     steps: "list[dict] | None" = None,
 ) -> Path:
-    """Write docs/certification/bats/runs/<date>.md for this run and return its path.
+    """Write docs/certification/bats/runs/<date>-<hhmmss>.md for this run and return its path.
 
     phases and steps use the same dict shapes results.json records
     (sections: name/seconds, results: name/status/seconds), so the doc can

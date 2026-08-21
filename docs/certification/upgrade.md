@@ -236,7 +236,7 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
 The committed record lives under `docs/certification/upgrade/`:
 
-- `docs/certification/upgrade/runs/<date>.md`
+- `docs/certification/upgrade/runs/<date>-<hhmmss>.md`
 
   A generated per-run report: verdict, wall clock, the version matrix and where it came from, per-phase and per-step timing tables, the environment tuple, and the invariant table with before and after values.
 

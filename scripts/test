@@ -475,7 +475,7 @@ def _lifecycle_run_meta(
 
 
 def _write_lifecycle_docs(meta: dict, passes: list[dict]) -> "tuple[Path, Path]":
-    """Write docs/certification/lifecycle/runs/<date>.md + README.md."""
+    """Write docs/certification/lifecycle/runs/<date>-<hhmmss>.md + README.md."""
     doc = _rundoc.write_run_doc(
         runs_dir=LIFECYCLE_RUNS_DIR,
         meta=meta,
