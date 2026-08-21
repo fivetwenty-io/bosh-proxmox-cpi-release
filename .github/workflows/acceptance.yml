@@ -28,11 +28,14 @@ on:
         type: boolean
         default: false
 
-# contents: write is required for the report auto-commit push; packages: read
-# lets the job's GITHUB_TOKEN pull the private CI image from ghcr.
+# contents: write is required to push the report branch; pull-requests: write
+# opens and auto-merges the report PR (main is protected, so reports land
+# through a PR gated on the required checks); packages: read lets the job's
+# GITHUB_TOKEN pull the private CI image from ghcr.
 permissions:
   contents: write
   packages: read
+  pull-requests: write
 
 # Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
 # touches the lab (its PVE API, the director slot, or the cpitest network)
@@ -58,7 +61,7 @@ jobs:
       # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
       # digest the way the other workflows pin golang:1.26; update the pin
       # from the digest a ci-image.yml run prints after a Dockerfile change.
-      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:ecac55fe1a5fb3bb76e0ba053337899debbb80e0221c01c2b1ac890342f55097
+      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:1bed77dbc5af4e9a26aac03c37f0888071b7f72933fc83a16c9ada05f6943ad4
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
       # gha-lab-state is DIFFERENT in kind: it persists the director's
       # create-env products (creds.yml, state.json) between runs, because
@@ -203,21 +206,6 @@ jobs:
           ./scripts/certify upgrade --env cpitest --force \
             --headline-pass-fail-only --no-color
 
-      - name: Commit upgrade run report
-        if: ${{ always() && !inputs.skip_certify }}
-        run: |
-          set -euo pipefail
-          git add docs/certification
-          if git diff --cached --quiet; then
-            echo "no certification doc changes to commit"
-            exit 0
-          fi
-          git commit -m "docs(certification): scheduled upgrade run report $(date -u +%F)"
-          # Scheduled runs ride the default branch; rebase in case another
-          # push landed while the certification ran.
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-
       - name: Bootstrap director on the latest release
         timeout-minutes: 90
         # Minimal director bring-up (the emptyvm smoke and CF are out of
@@ -252,8 +240,14 @@ jobs:
           fi
           exit "${rc}"
 
-      - name: Commit BATS run report
-        if: ${{ always() && !inputs.skip_bats }}
+      - name: Commit run reports
+        if: always()
+        # main is protected by required status checks the job's token cannot
+        # bypass, so reports ride a per-run branch whose PR auto-merges once
+        # those checks pass. One step at the end covers both the certify and
+        # BATS reports; always() still fires it when a lab phase fails.
+        env:
+          REPORT_BRANCH: certification-reports-${{ github.run_id }}
         run: |
           set -euo pipefail
           git add docs/certification
@@ -261,9 +255,13 @@ jobs:
             echo "no certification doc changes to commit"
             exit 0
           fi
-          git commit -m "docs(certification): scheduled bats run report $(date -u +%F)"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git commit -m "docs(certification): scheduled run reports $(date -u +%F)"
+          git push origin "HEAD:refs/heads/${REPORT_BRANCH}"
+          gh pr create --repo "${GITHUB_REPOSITORY}" \
+            --head "${REPORT_BRANCH}" --base main \
+            --title "docs(certification): scheduled run reports $(date -u +%F)" \
+            --body "Automated certification reports from acceptance run ${GITHUB_RUN_ID}."
+          gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
 
       - name: Persist director state to the runner host
         if: always()
