@@ -32,9 +32,15 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Sys.Audit` | `/` | All `info`, `has_vm`, `has_disk`, task polling, `GET /cluster/status` (also feeds VXLAN peer derivation for CPI-created zones), `/cluster/resources`, `/cluster/storage`, `/cluster/config/nodes`, `/nodes` (most handlers); HA-rule reads (`GET /cluster/ha/rules`, `/cluster/ha/resources`) when HA placement is enabled; `GET /cluster/firewall/options` — `create_vm.go`'s once-per-process datacenter firewall master-switch probe, triggered only when the VM being created requests `security_groups`, `pve.vm_firewall`, or `allowed_address_pairs` (see [Configuration — Firewall](configuration.md#firewall)); a probe failure (missing `Sys.Audit`, etc.) logs a warning and never fails `create_vm` |
 | `VM.Allocate` | `/vms` | `create_vm.go`, `delete_vm.go` (`POST /nodes/{n}/qemu`, `DELETE /nodes/{n}/qemu/{vmid}`) |
 | `VM.Audit` | `/vms` | `has_vm.go`, `get_disks.go`, `has_disk.go`, `reboot_vm.go` (`GET /nodes/{n}/qemu/{vmid}/status/current` power-state pre-check), every config-read path (`GET /nodes/{n}/qemu/{vmid}/config`) |
+| `VM.Clone` | `/vms` | `create_vm.go` (`POST /nodes/{n}/qemu/{vmid}/clone` — checked against the **source template's** VMID; the new VMID is covered by `VM.Allocate`), `create_stemcell.go` replica cloning |
+| `VM.Migrate` | `/vms` | `disk_migrate.go` (`POST /nodes/{n}/qemu/{vmid}/migrate` — cross-node disk migration moves the disk on a mover VM) |
 | `VM.Config.Disk` | `/vms` | `attach_disk.go`, `detach_disk.go`, `update_disk.go`, `resize_disk.go`, `create_disk.go`, `delete_disk.go` |
+| `VM.Config.CDROM` | `/vms` | `create_vm.go` (ConfigDrive ISO attach — the `ide2 ... media=cdrom` config write is checked per-option as `VM.Config.CDROM`, not `VM.Config.Disk`) |
 | `VM.Config.Network` | `/vms` | `create_vm.go`, `create_network.go`, `delete_network.go` (NIC attach/detach) |
-| `VM.Config.Options` | `/vms` | `set_vm_metadata.go`, `set_disk_metadata.go`, `tags.go` (description + tags) |
+| `VM.Config.CPU` | `/vms` | `create_vm.go` (`cores`, `cpu` type, `numa` — PVE checks each config option's own privilege class at submit time, so VM creation needs these even though the endpoint-level check is `VM.Allocate`) |
+| `VM.Config.Memory` | `/vms` | `create_vm.go` (`memory`, `balloon`) |
+| `VM.Config.HWType` | `/vms` | `create_vm.go` and `create_stemcell.go` (`scsihw`, `tablet`, `machine`, `bios`, `agent` — per-option check as above) |
+| `VM.Config.Options` | `/vms` | `set_vm_metadata.go`, `set_disk_metadata.go`, `tags.go` (description + tags); also PVE's own tag validation on any config write that carries `tags` |
 | `VM.Config.Cloudinit` | `/vms` | `create_vm.go` (ConfigDrive delivery via the `cloudinit` config field) |
 | `VM.PowerMgmt` | `/vms` | `create_vm.go` (start), `delete_vm.go` (stop), `reboot_vm.go` (soft mode: graceful `/status/reboot` with `/status/reset` fallback; hard mode: `/status/reset`; stopped VM started via `/status/start`) |
 | `VM.Snapshot` | `/vms` | `snapshot_disk.go`, `delete_snapshot.go` |
@@ -43,6 +49,7 @@ Derived from the API endpoint inventory under `src/pve_cpi/internal/cpi/handlers
 | `Datastore.AllocateTemplate` | `stemcell_storage`, `iso_storage` | `create_stemcell.go` (`POST .../upload` with `content=import`), ConfigDrive ISO upload (`content=iso`) |
 | `Datastore.Audit` | same four storage paths | `create_stemcell.go`, `get_disks.go`, `has_disk.go` (list/check volume) |
 | `SDN.Allocate` | `/sdn` | `create_network.go`, `delete_network.go` (zone create/delete check it on `/sdn/zones` and `/sdn/zones/{zone}`, covered by a propagated `/sdn` grant), `create_vm.go` (`advertised_routes` subnet injection) — opt-in, needed only when `network_mode: sdn` is set (or a network is marked `managed: true`, or `advertised_routes` is used); the default (`network_mode: bridge`) makes zero SDN calls and needs no grant |
+| `SDN.Use` | `/sdn/zones/localnetwork` (propagated; covers every local bridge) or `/sdn/zones/<zone>/<vnet>` for SDN vnets | `create_vm.go` NIC attach — **required even in the default `network_mode: bridge`**: PVE checks `SDN.Use` on the bridge for every `net{i}` config write by a non-root identity, treating plain Linux bridges as members of the implicit `localnetwork` zone. Not bundled in `BoshOperator`; granted via the small dedicated `BoshBridgeUse` role in §3c |
 | `Sys.Console` | `/` | HA-rule writes — `POST`/`DELETE /cluster/ha/resources`, `POST`/`DELETE /cluster/ha/rules` driven by `placement.pin_az_via_ha_rules`, `anti_affinity.use_ha_rules`, and DLB (`placement.dlb` configured) — see note below |
 | `Pool.Allocate` | `/pool` (parent, propagated — per-deployment pool names are dynamic) | `pool.go`'s `EnsurePoolExists` (`POST /pools`) — create-if-missing for every template-rendered per-deployment pool (`pve.vm_pool_template`, default `bosh-{director}-{deployment}`) and the static `pve.vm_pool` fallback (default `bosh`) at `create_vm` time, for `pve.stemcell_template_pool` (default `bosh-templates`) at `create_stemcell` time, and again at `set_vm_metadata` time when pool reconciliation moves a VM (`PUT /pools/{poolid}` with `allow-move=1`); `cluster_lock.go` (`POST`/`DELETE /pools` — create/delete sentinel pools `bosh-lock-*`: when `cluster_lock_mode: pool`, and on every park and unpark, which serializes the parker's protection window under `bosh-lock-vm-<vmid>` — advisory there, so a denial degrades to an unserialized window with a warning rather than a failure); `delete_vm.go`'s empty-pool reaper (`DELETE /pools/{poolid}`, on by default via `pve.pool_reap_empty`). Required by default; set `vm_pool_template`, `vm_pool`, and `stemcell_template_pool` all to `""` and leave `cluster_lock_mode`/`pool_reap_empty` unused to avoid needing it. This privilege alone is sufficient — no `Permissions.Modify` grant is needed; see the note below |
 | `Pool.Audit` | `/pool` (parent, propagated) | `GetPoolComment` (`GET /pools`/`GET /pools/{poolid}`) — probed at CPI startup by `preflightPoolAccess` (`cmd/cpi/main.go`) against the configured static pools; read by `cluster_lock.go` to check a lock pool's owner/expiry when stealing a lock, and again on every release to confirm the sentinel still belongs to the releasing caller (under `cluster_lock_mode: pool`, and on every park and unpark), and by `delete_vm.go`'s default-on empty-pool reaper (`pve.pool_reap_empty`) to check a pool's provenance comment before deleting it. Required by default, on the same condition as `Pool.Allocate` above — the startup preflight reads each static pool before the CPI serves its first request, and a denial (HTTP 401/403) is fatal |
@@ -58,6 +65,10 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   -d 'propagate=1' \
   https://$PVE_HOST/api2/json/access/acl
 ```
+
+**`SDN.Use` note:** this one is easy to miss because it applies to the *default* network mode. Since PVE 8, every `net{i}` bridge assignment by a non-root identity is checked for `SDN.Use` on the bridge's SDN path; a plain Linux bridge (`vmbr0`) resolves to `/sdn/zones/localnetwork/<bridge>`. None of the built-in audit roles and none of the privileges in `BoshOperator` cover it, so a token built from this doc's §3 grants alone fails `create_vm` at NIC attach with `Permission check failed (/sdn/zones/localnetwork/vmbr0, SDN.Use)`. §3c adds a dedicated single-privilege `BoshBridgeUse` role granted on `/sdn/zones/localnetwork` with propagation, which covers every local bridge on every node. Verified live on PVE 9.2.4.
+
+**Create-time tag check note:** PVE validates the `tags` field of any VM config write with a check for `VM.Config.Options` that runs **only against `/vms/{vmid}`** — unlike the create endpoint's own `VM.Allocate` check, it has no `/pool/{pool}` alternative, and in `POST /nodes/{n}/qemu` it runs inside the create worker *before* the new VM is registered into the requested pool (verified in the PVE 9.2.4 source: `PVE/API2/Qemu.pm` calls `assert_tag_permissions` ahead of `add_vm_to_pool`). A token whose VM privileges come only from pool grants therefore can never create a VM with tags in the create call itself, while tagging the same VM immediately afterward succeeds because pool membership then satisfies the `/vms/{vmid}` check. The CPI accounts for this: template and clone creation submit without `tags` and apply the identity tags in a follow-up config write. The one exception is `stemcell_strategy: import` (per-VM or global), whose fresh-create path still passes tags at create and therefore needs a real `/vms` grant; the default `stemcell_strategy: template` is unaffected (see §7).
 
 **`Sys.Console` note:** PVE checks `Sys.Console` on `/` for HA resource and rule writes — `POST`/`DELETE /cluster/ha/resources` and `POST`/`DELETE /cluster/ha/rules` (the matching `GET` reads check `Sys.Audit`, already granted on `/`). These endpoints are called when `placement.pin_az_via_ha_rules: true`, `anti_affinity.use_ha_rules: true`, or DLB is configured (`placement.dlb` present with `enabled: true` or an `az_name` sentinel in use — `delete_vm.go` gates its HA cleanup path on `AntiAffinityUseHaRulesEnabled() || DLBConfigured()`); a deployment that leaves all three off needs neither `Sys.Console` nor the HA-read grant. The privilege names are taken from the PVE API schema (`apidoc.json`: HA writes → `["perm", "/", ["Sys.Console"]]`, HA reads → `["perm", "/", ["Sys.Audit"]]`).
 
@@ -127,7 +138,7 @@ UI:
 
 2. Name: `BoshOperator`.
 
-3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Config.Disk`, `VM.Config.Network`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `Pool.Allocate` and `Pool.Audit` (both required by default — `vm_pool` and `stemcell_template_pool` both default to a create-if-missing pool name, and the CPI's startup preflight reads each one; omit both only when both pool names are set to `""`), `SDN.Allocate` (opt-in — only if `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used), `Sys.Console` (if using HA placement features or DLB), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
+3. Privileges: select `VM.Allocate`, `VM.Audit`, `VM.Clone`, `VM.Migrate`, `VM.Config.Disk`, `VM.Config.CDROM`, `VM.Config.Network`, `VM.Config.CPU`, `VM.Config.Memory`, `VM.Config.HWType`, `VM.Config.Options`, `VM.Config.Cloudinit`, `VM.PowerMgmt`, `VM.Snapshot`, `Datastore.Allocate`, `Datastore.AllocateSpace`, `Datastore.AllocateTemplate`, `Datastore.Audit`, `Pool.Allocate` and `Pool.Audit` (both required by default — `vm_pool` and `stemcell_template_pool` both default to a create-if-missing pool name, and the CPI's startup preflight reads each one; omit both only when both pool names are set to `""`), `SDN.Allocate` (opt-in — only if `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used), `Sys.Console` (if using HA placement features or DLB), and `Sys.Modify` (if using `placement.dlb.manage_cluster_crs`).
 
 4. Create.
 
@@ -137,15 +148,24 @@ API:
 # Base role — VM, disk, and storage operations.
 curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'roleid=BoshOperator' \
-  --data-urlencode 'privs=VM.Allocate,VM.Audit,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.Config.Cloudinit,VM.PowerMgmt,VM.Snapshot,Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,SDN.Allocate,Sys.Console,Pool.Allocate,Pool.Audit,Sys.Modify' \
+  --data-urlencode 'privs=VM.Allocate,VM.Audit,VM.Clone,VM.Migrate,VM.Config.Disk,VM.Config.CDROM,VM.Config.Network,VM.Config.CPU,VM.Config.Memory,VM.Config.HWType,VM.Config.Options,VM.Config.Cloudinit,VM.PowerMgmt,VM.Snapshot,Datastore.Allocate,Datastore.AllocateSpace,Datastore.AllocateTemplate,Datastore.Audit,SDN.Allocate,Sys.Console,Pool.Allocate,Pool.Audit,Sys.Modify' \
+  https://$PVE_HOST/api2/json/access/roles
+
+# Bridge-attach role — SDN.Use is deliberately kept out of BoshOperator so
+# the broad role never lands on SDN paths; this one-privilege role goes on
+# the localnetwork zone (or specific vnets) in §3c. Required even for the
+# default network_mode: bridge.
+curl -sk -X POST -H "Authorization: $PVE_TOKEN" \
+  --data-urlencode 'roleid=BoshBridgeUse' \
+  --data-urlencode 'privs=SDN.Use' \
   https://$PVE_HOST/api2/json/access/roles
 ```
 
-`Pool.Allocate` and `Pool.Audit` both belong in the default grant — the per-deployment pools `pve.vm_pool_template` renders (default `bosh-{director}-{deployment}`), the static `pve.vm_pool` fallback (default `bosh`), and `pve.stemcell_template_pool` (default `bosh-templates`) are all create-if-missing, and the CPI's startup preflight reads each static pool before serving a request. `SDN.Allocate`, `Sys.Console`, and `Sys.Modify` are opt-in only, since `network_mode: bridge` is the default and a default deployment makes zero SDN calls. A deployment that sets `network_mode: sdn` (or marks a network `managed: true`, or uses `advertised_routes`) needs `SDN.Allocate`; one that uses HA placement features or DLB needs `Sys.Console`; one that enables `placement.dlb.manage_cluster_crs` needs `Sys.Modify`. The two pool privileges drop out together, and only when `vm_pool_template`, `vm_pool`, and `stemcell_template_pool` are all set to `""` (with `cluster_lock_mode: pool` and `pool_reap_empty` unused). The minimum set for a bridge-mode deployment with no resource pools, no HA placement, and no DLB is `VM.*,Datastore.*` as listed in the privilege table above. Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
+`Pool.Allocate` and `Pool.Audit` both belong in the default grant — the per-deployment pools `pve.vm_pool_template` renders (default `bosh-{director}-{deployment}`), the static `pve.vm_pool` fallback (default `bosh`), and `pve.stemcell_template_pool` (default `bosh-templates`) are all create-if-missing, and the CPI's startup preflight reads each static pool before serving a request. `SDN.Allocate`, `Sys.Console`, and `Sys.Modify` are opt-in only, since `network_mode: bridge` is the default and a default deployment makes zero SDN calls. A deployment that sets `network_mode: sdn` (or marks a network `managed: true`, or uses `advertised_routes`) needs `SDN.Allocate`; one that uses HA placement features or DLB needs `Sys.Console`; one that enables `placement.dlb.manage_cluster_crs` needs `Sys.Modify`. The two pool privileges drop out together, and only when `vm_pool_template`, `vm_pool`, and `stemcell_template_pool` are all set to `""` (with `cluster_lock_mode: pool` and `pool_reap_empty` unused). The minimum set for a bridge-mode deployment with no resource pools, no HA placement, and no DLB is `VM.*,Datastore.*` as listed in the privilege table above, plus `SDN.Use` on the bridge path via `BoshBridgeUse` — that one applies to every deployment that attaches a NIC, bridge mode included. Note that the `VM.Config.*` list is wider than the CPI's own config writes suggest: PVE checks each config option's privilege class at submit time, so a VM create that sets `cores`, `memory`, and `scsihw` needs `VM.Config.CPU`, `VM.Config.Memory`, and `VM.Config.HWType` even though the CPI never updates those fields afterward (each was confirmed by a live `Permission check failed` denial when omitted). Note that `delete_vm`'s `skiplock` flag is separate from this role: it is gated on the `root@pam` user, not on any privilege (see the `delete_vm` note above), so granting `BoshOperator` does not enable it.
 
 ### 3c. Grant ACLs
 
-Four ACL grant categories apply by default — cluster-wide audit, VM operations, one storage grant per configured storage pool, and the resource-pool grant at the `/pool` parent (needed by default: per-deployment pools are created on demand with dynamic names, so a per-poolid grant cannot cover them) — plus two conditional categories: SDN (only when `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used) and root-path (only when HA placement, DLB, or CPI-managed cluster CRS is used). The resource-pool grant drops out only when `vm_pool_template`, `vm_pool`, and `stemcell_template_pool` are all set to `""` and `cluster_lock_mode: pool`/`pool_reap_empty` are unused.
+Five ACL grant categories apply by default — cluster-wide audit, VM operations, the bridge-attach grant (`SDN.Use` on the `localnetwork` zone — needed even in the default `network_mode: bridge`), one storage grant per configured storage pool, and the resource-pool grant at the `/pool` parent (needed by default: per-deployment pools are created on demand with dynamic names, so a per-poolid grant cannot cover them) — plus two conditional categories: SDN (only when `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used) and root-path (only when HA placement, DLB, or CPI-managed cluster CRS is used). The resource-pool grant drops out only when `vm_pool_template`, `vm_pool`, and `stemcell_template_pool` are all set to `""` and `cluster_lock_mode: pool`/`pool_reap_empty` are unused.
 
 UI (repeat for each row below):
 
@@ -166,6 +186,7 @@ UI (repeat for each row below):
 | `/` | `PVEAuditor` | Built-in role; grants `Sys.Audit` cluster-wide |
 | `/` | `BoshOperator` | Required for `Sys.Console` (HA-rule management) — only if using HA placement features or DLB; also required for `Sys.Modify` (`PUT /cluster/options`) — only if `placement.dlb.manage_cluster_crs: true` |
 | `/vms` | `BoshOperator` | All VM and disk mutation |
+| `/sdn/zones/localnetwork` | `BoshBridgeUse` | `SDN.Use` for NIC bridge attach — required for **every** deployment, including the default `network_mode: bridge`; propagation covers each local bridge (`vmbr0`, ...) on every node. For SDN vnets, grant it on `/sdn/zones/<zone>` (or the specific vnet path) instead |
 | `/sdn` | `BoshOperator` | Required for `SDN.Allocate` — opt-in, needed only when `network_mode: sdn` is set, a network is marked `managed: true`, or `advertised_routes` is used. `network_mode: bridge` (the default) needs no grant here |
 | `/storage/<vm_storage>` | `BoshOperator` | From `pve.vm_storage` |
 | `/storage/<disk_storage>` | `BoshOperator` | From `pve.disk_storage` |
@@ -201,6 +222,16 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
   --data-urlencode 'path=/vms' \
   --data-urlencode 'users=bosh@pve' \
   --data-urlencode 'roles=BoshOperator' \
+  -d 'propagate=1' \
+  https://$PVE_HOST/api2/json/access/acl
+
+# Bridge attach — required for every deployment that attaches a NIC,
+# including the default network_mode: bridge. Plain Linux bridges live
+# under the implicit localnetwork SDN zone.
+curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
+  --data-urlencode 'path=/sdn/zones/localnetwork' \
+  --data-urlencode 'users=bosh@pve' \
+  --data-urlencode 'roles=BoshBridgeUse' \
   -d 'propagate=1' \
   https://$PVE_HOST/api2/json/access/acl
 
@@ -288,8 +319,10 @@ In `manifests/bosh/vars.yml`:
 ```yaml
 pve_user:      bosh@pve
 pve_password:  ""
-pve_api_token: 'PVEAPIToken=bosh@pve!bosh-cpi=<secret-from-3d>'
+pve_api_token: 'bosh@pve!bosh-cpi=<secret-from-3d>'
 ```
+
+The canonical token format is the bare `<user>@<realm>!<token-id>=<secret>` form. The CPI also accepts the Authorization-header form (`PVEAPIToken=bosh@pve!bosh-cpi=<secret>`) and strips the prefix on load, so pasting either shape works.
 
 The CPI requires exactly one of `pve_password` or `pve_api_token` — leave the unused field as an empty string so BOSH var interpolation resolves it (see [bosh-create-env.md — Authentication](bosh-create-env.md#authentication)).
 
@@ -357,7 +390,7 @@ In short: a `bosh@pve` token with `privsep=0` and the §3 ACLs can upload stemce
 
 ## 7. Shared-cluster variant: scoping VM mutation to a resource pool
 
-Every grant in §3 that lands on `/vms` is cluster-wide: on a cluster that also runs VMs the CPI does not manage, a `bosh@pve` token with those ACLs can mutate every guest, not only the ones it created. `pve.vm_pool` (see [Configuration](configuration.md)) closes that gap by assigning every CPI-created VM to a dedicated resource pool at create/clone time, so the six `/vms`-scoped privileges below can be granted on `/pool/<bosh-pool>` instead.
+Every grant in §3 that lands on `/vms` is cluster-wide: on a cluster that also runs VMs the CPI does not manage, a `bosh@pve` token with those ACLs can mutate every guest, not only the ones it created. `pve.vm_pool` (see [Configuration](configuration.md)) closes that gap by assigning every CPI-created VM to a dedicated resource pool at create/clone time, so the `/vms`-scoped privileges can be granted on `/pool/<bosh-pool>` instead.
 
 **This single-pool model requires `pve.vm_pool_template: ""`.** The default `pve.vm_pool_template` (`bosh-{director}-{deployment}`) creates a pool per deployment with names that do not exist until first use, and PVE has no wildcard ACL path — a single `/pool/<bosh-pool>` grant cannot cover them. On a reduced-ACL cluster (one `/pool/<name>` grant, no parent-path grants), set `pve.vm_pool_template: ""` explicitly so every VM lands in the one static `pve.vm_pool`; the CPI fails `create_vm` with an error naming exactly this fix when its token cannot create a per-deployment pool. To keep per-deployment pools under a scoped token instead, move the pool grants to the `/pool` parent with propagation — broader than a single pool path, but still far short of `/vms`.
 
@@ -376,19 +409,21 @@ The clone endpoint's `VM.Clone` check runs against the **template's own VMID**, 
 Two ways to close this, pick one:
 
 - Grant `VM.Clone` (bundled in `BoshOperator`) on `/pool/<stemcell-template-pool>` too, if `stemcell_template_pool` is set — a second, narrower pool-scoped grant, still far short of cluster-wide `/vms`.
-- Grant `VM.Clone` on `/vms` specifically (leaving the other five VM.\* privileges pool-scoped) — templates are CPI-owned infrastructure, not guest VMs, so a `VM.Clone`-only cluster-wide grant is a much smaller blast radius than the full `/vms` grant in §3.
+- Grant `VM.Clone` on `/vms` specifically (leaving the other VM.\* privileges pool-scoped) — templates are CPI-owned infrastructure, not guest VMs, so a `VM.Clone`-only cluster-wide grant is a much smaller blast radius than the full `/vms` grant in §3.
 
 The reduced-ACL table below assumes `stemcell_template_pool` is set and takes the first option.
 
 ### Reduced ACL table
 
-Replaces the `/vms` row from §3c's table; every other row (root-path, SDN, storage) is unchanged.
+Replaces the `/vms` row from §3c's table; every other row (root-path, bridge-attach, SDN, storage) is unchanged — the `BoshBridgeUse` grant on `/sdn/zones/localnetwork` in particular is still required, since NIC attach checks `SDN.Use` on the bridge path regardless of pool scoping.
 
 | Path | Role | Notes |
 |---|---|---|
 | `/pool/<bosh-pool>` | `BoshOperator` | Replaces `/vms`. Covers `VM.Allocate` (create/clone into the pool), `Pool.Allocate` (create-if-missing for `<bosh-pool>` itself — the CPI creates it on demand if it does not already exist; `Permissions.Modify` is not needed, see §2), and every other VM.\* privilege for VMs that are members of `<bosh-pool>` — i.e. every VM this CPI creates once `pve.vm_pool: <bosh-pool>` is set |
 | `/pool/<stemcell-template-pool>` | `BoshOperator` | Additional grant closing the cloning gap above — required whenever `stemcell_template_pool` is set alongside `vm_pool`. Omit and grant `VM.Clone` on `/vms` instead if you took the second option above |
 | `/pool/bosh-lock-*` | `Pool.Allocate`, `Pool.Audit` | Sentinel-pool locks. A `/pool/<bosh-pool>`-scoped grant does not cover them: the lock pools live at their own paths. Parking and unparking create and delete `bosh-lock-vm-<vmid>` on every call. Without this grant those windows run unserialized rather than failing, so the grant is strongly recommended rather than required. PVE has no wildcard ACL path, so the grant has to go on a parent: `/pool`, which covers every pool, or `/`, which covers everything |
+
+**Live-validated.** We exercised this exact table against a PVE 9.2.4 cluster with a `bosh-d3@pve` token (privsep=0) holding *only* the grants above plus §3c's audit, bridge-attach, storage, and `/pool` rows — no `/vms` grant at all — and ran the full 16-step CPI lifecycle (`create_stemcell` through `delete_stemcell`, including disk create/attach/resize/snapshot/detach/delete and both reboot modes) with `detached_disk_strategy: free`. Every step passed: the create/clone pool-fallback works, and PVE's pool-permission propagation covers every subsequent config, status, disk, and snapshot operation on pool-member VMs, including template freeze and final cleanup. Re-run the §5 smoke test after any PVE upgrade all the same.
 
 No prerequisite pool-creation step is required: `pve.vm_pool` is create-if-missing, so the CPI creates `<bosh-pool>` itself the first time `create_vm` needs it, provided the token holds `Pool.Allocate` on `/pool/<bosh-pool>` per the table above. To pre-create the pool anyway — for example to set a custom comment before the first deploy — use an admin token:
 
@@ -414,6 +449,10 @@ curl -sk -X PUT -H "Authorization: $PVE_TOKEN" \
 
 - **Template-layer VMs are reconciled; everything else is not.** VMs whose pool came from the rendered `pve.vm_pool_template` are moved by `set_vm_metadata` on the next `bosh deploy` whenever the template's current render of their persisted create-time tokens differs from their actual pool, and a legacy VM (created before pool provenance existed) sitting in the static `pve.vm_pool` is adopted into that flow the same way. VMs whose pool came from a call-level `cloud_properties.pool`, a `vm_type` profile, or the static `pve.vm_pool` layer are never moved by a config change: they stay in the pool they were created under, and re-pointing `pve.vm_pool` at a new name only affects VMs created afterward.
 - **VMs with no pool membership at all are not retroactively covered.** A VM created when every pool layer was `""` is not a member of any pool, and a token scoped only to `/pool/...` paths cannot manage it — either leave `/vms` granted alongside the pool scope until every such VM is replaced, or manually add old VMIDs to a pool as a one-time migration step.
+- **Set `detached_disk_strategy: free`.** The default `parked` strategy anchors every created and detached disk to parker VMs in a dedicated VMID band, and parkers are deliberately created outside every resource pool — so a pool-scoped token cannot attach to, detach from, or configure them (`create_disk` fails at the park step with a `/vms/<parker-vmid>` denial). Under the reduced table, either set `pve.detached_disk_strategy: free` or keep a real `/vms` grant.
+- **Cross-node disk migration is unavailable.** `disk_migrate.go` moves a disk by attaching it to a mover VM (same out-of-pool band as parkers) and migrating that VM (`VM.Migrate` on `/vms/<mover-vmid>`). A pool-scoped token cannot drive it; deployments that rely on cross-node persistent-disk moves need the `/vms` grant.
+- **`stemcell_strategy: import` is unavailable.** Its fresh-create path passes `tags` in the create call, and PVE's create-time tag check accepts only a `/vms/{vmid}` grant (see the create-time tag check note in §2). The default `template` strategy creates untagged and tags after pool registration, which pool grants cover.
 - **`delete_vm`'s `skiplock` behavior is unaffected either way** — it remains gated on the `root@pam` user regardless of pool scoping (see the `delete_vm` note in §2).
-- **Verify before relying on this in production.** The create/clone pool-fallback is directly confirmed against the PVE API schema; the propagation to config/status/disk/snapshot operations is PVE's documented general pool-permission behavior but was not exercised against a live cluster as part of this change. Run the §5 smoke test against a `bosh@pve` token scoped *only* to the reduced ACL table above (temporarily drop the `/vms` grant) before committing to it, and re-run it after any PVE upgrade.
+- **Read visibility stays cluster-wide.** The `/` `PVEAuditor` grant means the token can still *list and read* every VM and storage object on the cluster (`/cluster/resources` returns all guests); the pool scoping bounds mutation, not visibility. The CPI needs that read breadth for node selection, task polling, and VMID-collision scans.
+- **Grants on not-yet-existing pools work.** PVE accepts an ACL on `/pool/<name>` before the pool exists, so the reduced table can be granted up front and the CPI's create-if-missing pool creation then succeeds under the reduced token itself (verified live — the CPI created its `stemcell_template_pool` with its provenance comment on first use).
 - **Pool membership on delete.** `DELETE /nodes/{node}/qemu/{vmid}?purge=1`'s own API description covers cleanup of backup/replication/HA job references and VM-specific permissions; it does not explicitly document resource-pool membership cleanup. A deleted VM's stale pool membership entry (if one persists) carries no capability risk — there is no VM behind that VMID to act on — but do not rely on it disappearing from `pvesh get /pools/<bosh-pool>` output without checking your PVE version.
