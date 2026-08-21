@@ -317,6 +317,18 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	if rd.intent != nil {
 		refreshed, err := resumeTransferIfNeeded(ctx, deps, "detach_disk", rd)
 		if err != nil {
+			if pve.IsMoveDiskSnapshotRefusal(err) {
+				// A deferred park (see the transfer fallback below) whose
+				// snapshot still exists: the disk is already off the bus — the
+				// refusal comes from reassigning the demoted unused entry — so
+				// this retry is an idempotent success. The park completes on
+				// the disk's next mutating call once the snapshot is deleted.
+				logger.Warn("detach_disk: deferred park still blocked by a snapshot; the disk stays off the bus and the transfer resumes once the snapshot is deleted",
+					log.String("vm_cid", vmCID),
+					log.String("disk_cid", rd.diskCID),
+				)
+				return nil
+			}
 			return err
 		}
 		rd = refreshed
@@ -355,6 +367,26 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay}
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerWriteConfigFor(deps), pctx)
 	if transferErr != nil {
+		if pve.IsMoveDiskSnapshotRefusal(transferErr) {
+			// PVE refuses to reassign a snapshot-referenced volume, and the
+			// refusal comes from the reassignment step — after the source slot
+			// was deleted, so the disk is already off the bus and the detach
+			// contract is met. The parker's intent record (written before the
+			// slot delete) carries the identity and the recorded option
+			// overrides, so report success and leave the park deferred: the
+			// transfer resumes on the disk's next mutating call once the
+			// snapshot is deleted. This mirrors the legacy bypass semantics,
+			// where the demoted unused entry lingers until a later sweep, and
+			// delete_vm's unused-volume guard keeps the window destroy-safe.
+			logger.Warn("detach_disk: a snapshot blocks the reassignment to the parker; the disk is off the bus and parks after the snapshot is deleted",
+				log.String("vm_cid", vmCID),
+				log.String("disk_cid", rd.diskCID),
+				log.String("volid", rd.volid),
+			)
+			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
+			pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid, rd.birth)
+			return nil
+		}
 		return retriableUnlessPermanent(transferErr,
 			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
 	}

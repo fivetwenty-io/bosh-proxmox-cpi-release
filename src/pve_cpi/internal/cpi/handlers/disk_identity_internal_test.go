@@ -43,6 +43,9 @@ type idFakeClient struct {
 	// descWriteErr, when set, fails every description write with it —
 	// exercising the fail-closed contract of the override record writers.
 	descWriteErr error
+	// moveErr, when set, fails the next CreateQemuMoveDisk with it and
+	// clears itself (one-shot), e.g. PVE's snapshot refusal.
+	moveErr error
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -167,6 +170,11 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 func (n *idFakeNodes) CreateQemuMoveDisk(_ context.Context, _ string, vmidStr string, params *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
+	if n.c.moveErr != nil {
+		err := n.c.moveErr
+		n.c.moveErr = nil
+		return nil, err
+	}
 	srcVMID, _ := strconv.Atoi(vmidStr)
 	srcCfg := n.c.configs[srcVMID]
 	raw, present := srcCfg[params.Disk]

@@ -548,6 +548,8 @@ Two settings tune the behavior:
 
 - `pve.require_snapshot_check_pass` (default `false`) — controls behavior when the snapshot check itself cannot reach PVE. Default is fail-open: log a warning and proceed. Set `true` to fail-closed: abort the operation if the snapshot list cannot be fetched.
 
+A bypassed detach behaves differently for the two disk generations, because PVE refuses to reassign a snapshot-referenced volume to another VM ("Can't move disk used by a snapshot"). A legacy disk is taken off the bus and its volume lingers on an `unusedN` entry until the snapshot is deleted and a retried `detach_disk` sweeps it. A stable-ID disk detaches the same way — the call succeeds with the disk off the bus — but its park onto the parker is deferred: the parker's intent record keeps the disk's identity and recorded option overrides, and the transfer completes on the disk's next mutating call (`detach_disk`, `attach_disk`, `update_disk`, or `delete_disk`) after the snapshot is gone. In both generations `delete_vm` refuses to destroy the VM while the volume waits on the `unusedN` entry, so the deferral window cannot lose the disk.
+
 ---
 
 ### `set_disk_metadata`

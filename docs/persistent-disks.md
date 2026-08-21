@@ -322,6 +322,13 @@ while any such volume still exists. This refusal is not retriable: remove the
 snapshot (or the unused slot) before deleting the VM. An `unusedN` slot whose
 volume has already been deleted from storage does not block the destroy.
 
+For a stable-ID disk the lingering `unusedN` slot marks a deferred park: PVE
+refuses to reassign a snapshot-referenced volume to the parker, so a bypassed
+detach succeeds with the disk off the bus and leaves an intent record on the
+parker carrying the disk's identity and recorded option overrides. The park
+completes on the disk's next mutating call after the snapshot is deleted, and
+the `delete_vm` refusal above keeps the volume safe in the meantime.
+
 **Operator note:** An interrupted `create-env` recreate sequence no longer risks
 the Director database disk. The guard runs on both the synchronous delete path
 and the fast-path (`fast_path_delete: true`) delete path.

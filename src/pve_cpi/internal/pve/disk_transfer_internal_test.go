@@ -39,6 +39,10 @@ type scanFakeClient struct {
 	destroyed []string
 	// moveErr, when set, fails the next CreateQemuMoveDisk with it.
 	moveErr error
+	// configErr, when set for a vmid, fails every config read for it with
+	// that error (e.g. PVE's "Configuration file ... does not exist" for a
+	// destroyed VM).
+	configErr map[int]error
 	// renameCounter numbers vm-<target>-disk-<n> names per target VM.
 	renameCounter map[int]int
 }
@@ -82,6 +86,9 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
+			if err, forced := c.configErr[vmid]; forced {
+				return nil, err
+			}
 			cfg, ok := c.configCopy(vmid)
 			if !ok {
 				return nil, fmt.Errorf("fake: no config for vmid %d", vmid)
@@ -358,6 +365,47 @@ func TestTransferDiskToParker_ProtocolAndOrdering(t *testing.T) {
 	}
 }
 
+func TestTransferDiskToParker_SnapshotRefusalLeavesResumableState(t *testing.T) {
+	t.Parallel()
+	c := newScanFakeClient(map[int]map[string]any{
+		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
+		90000: {
+			cfgKeyTags:   "bosh-cpi;bosh-parker",
+			"protection": true,
+		},
+	})
+	c.moveErr = errors.New("Can't move disk used by a snapshot to another VM")
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+	_, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg, pctx)
+	if !IsMoveDiskSnapshotRefusal(err) {
+		t.Fatalf("err = %v, want a detectable snapshot refusal", err)
+	}
+	// The state the detach handler's deferred-park fallback relies on: the
+	// source slot is off the bus (demoted to unusedN, where the snapshot
+	// keeps the volume anchored) and the intent record already names the
+	// disk on the parker, so a later resume can finish the park.
+	srcDisks := qemu.ParseDisks(c.configs[700])
+	if _, onBus := FindDiskIDByVolID(srcDisks, "data:vm-700-disk-1"); onBus {
+		t.Error("volume still on an active source slot after the refused transfer")
+	}
+	unused := FindUnusedDiskEntries(c.configs[700])
+	found := false
+	for _, volid := range unused {
+		if volid == "data:vm-700-disk-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("source unused entries = %v, want the demoted volume kept", unused)
+	}
+	if _, ok := c.parkedEntries(t)[transferStableID]; !ok {
+		t.Errorf("parker provenance = %+v, want the intent record kept", c.parkedEntries(t))
+	}
+	if len(c.destroyed) != 0 {
+		t.Errorf("volumes destroyed: %v", c.destroyed)
+	}
+}
+
 func TestTransferDiskFromParker_CarriesOptionsAndRenames(t *testing.T) {
 	t.Parallel()
 	c := newScanFakeClient(map[int]map[string]any{
@@ -489,6 +537,52 @@ func TestResumeDiskTransferToParker_Windows(t *testing.T) {
 		}
 		if got, _ := c.configs[90000]["scsi4"].(string); !strings.Contains(got, "serial="+transferStableID) {
 			t.Errorf("claimed slot = %q, want the serial applied", got)
+		}
+	})
+
+	t.Run("source VM destroyed after a bypassed detach: config-edit park converges", func(t *testing.T) {
+		t.Parallel()
+		c := newScanFakeClient(map[int]map[string]any{
+			90000: {cfgKeyTags: "bosh-cpi;bosh-parker"},
+		})
+		c.configErr = map[int]error{
+			700: errors.New("Configuration file 'nodes/pve1/qemu-server/700.conf' does not exist"),
+		}
+		// The volume is foreign-named for the destroyed source VM, so PVE's
+		// purge left it on storage; only the intent record still names it.
+		intent := DiskTransferIntent{ParkerVMID: 90000, ParkerNode: "pve1", Slot: "scsi4", Volid: "data:vm-11949-disk-0", SourceVMCID: "700"}
+		landed, err := ResumeDiskTransferToParker(context.Background(), c, nil, intent, transferStableID, transferTestCfg, ParkContext{})
+		if err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if landed != "data:vm-11949-disk-0" {
+			t.Errorf("landed = %q, want the birth-named volume parked under its own name", landed)
+		}
+		got, _ := c.configs[90000]["scsi0"].(string)
+		if !strings.Contains(got, "data:vm-11949-disk-0") || !strings.Contains(got, "serial="+transferStableID) {
+			t.Errorf("parker slot = %q, want the volume config-edit attached with the serial", got)
+		}
+		if entry := c.parkedEntries(t)[transferStableID]; entry.Volid != landed {
+			t.Errorf("finalized entry = %+v", entry)
+		}
+	})
+
+	t.Run("source VM exists but released the volume: config-edit park converges", func(t *testing.T) {
+		t.Parallel()
+		c := newScanFakeClient(map[int]map[string]any{
+			700:   {},
+			90000: {cfgKeyTags: "bosh-cpi;bosh-parker"},
+		})
+		intent := DiskTransferIntent{ParkerVMID: 90000, ParkerNode: "pve1", Slot: "", Volid: "data:vm-11949-disk-0", SourceVMCID: "700"}
+		landed, err := ResumeDiskTransferToParker(context.Background(), c, nil, intent, transferStableID, transferTestCfg, ParkContext{})
+		if err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if landed != "data:vm-11949-disk-0" {
+			t.Errorf("landed = %q", landed)
+		}
+		if got, _ := c.configs[90000]["scsi0"].(string); !strings.Contains(got, "serial="+transferStableID) {
+			t.Errorf("parker slot = %q, want the serial applied", got)
 		}
 	})
 

@@ -578,6 +578,43 @@ func ResumeDiskTransferToParker(
 			}
 		}
 
+		// Window: the move never ran and the source VM no longer exists (or no
+		// longer references the volume anywhere). A snapshot-deferred detach
+		// leaves the volume on the source VM's unusedN entry until the snapshot
+		// is deleted; a delete_vm in that window destroys the source VM while
+		// the volume — still birth-named, since only move_disk renames —
+		// survives free-floating (PVE only deallocates volumes named for the
+		// VM being destroyed). With no source config entry left there is
+		// nothing to reassign, so converge by the config-edit park: attach the
+		// recorded volid onto this parker with the serial baked, the same
+		// attach boundary a legacy park uses. PVE validates the volid on
+		// attach, so a volume that truly vanished fails the attach instead of
+		// parking a dangling reference.
+		if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
+			srcCfg, srcErr := c.QEMU().Config(wctx, intent.ParkerNode, srcVMID)
+			sourceReleased := false
+			switch {
+			case srcErr != nil:
+				// Window 2 already returned every non-gone read error, so a
+				// second failing read here is either the same gone answer or a
+				// fault that appeared mid-resume; only the gone answer proves
+				// the source released the volume.
+				sourceReleased = parkerConfigGone(srcErr)
+			default:
+				_, onBus := FindDiskIDByVolID(qemu.ParseDisks(srcCfg), intent.Volid)
+				sourceReleased = !onBus && !unusedEntriesReference(srcCfg, intent.Volid)
+			}
+			if sourceReleased {
+				slot, attachErr := attachToParkerLocked(wctx, c, logger, intent.ParkerNode, intent.ParkerVMID, intent.Volid, stableID)
+				if attachErr != nil {
+					return attachErr
+				}
+				landed = intent.Volid
+				finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, intent.Volid, cfg, pctx)
+				return nil
+			}
+		}
+
 		return cpierrors.Cloud(
 			"transfer resume: disk %s has an intent record on parker vmid %d (node %s, slot %q, recorded volid %q, source %q) "+
 				"but neither the parker nor the source VM holds a state this transfer can converge; inspect the parker's "+
