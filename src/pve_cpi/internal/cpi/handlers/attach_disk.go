@@ -112,7 +112,7 @@ func HandleAttachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 2. Parse vm_cid → VMID; parse disk_cid → storage + volid.
 		// --------------------------------------------------------------------
-		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid)
+		node, vmid, err := attachDiskResolveNode(ctx, deps, vmCID, rd.volid, rd.stableID)
 		if err != nil {
 			return nil, err
 		}
@@ -417,6 +417,21 @@ func attachDiskViaTransfer(
 		log.String("volid_after", landed),
 		log.String("disk_id", targetSlot),
 	)
+
+	// A single-purpose migration mover has served its purpose once the disk
+	// is on the VM. Destroy it through the guard that refuses a mover still
+	// referencing any volume — best-effort, never failing the attach that
+	// already landed: a leftover mover carries the parker provenance tags,
+	// and the next attach (or an operator) cleans it.
+	if plan.destroyMover {
+		if dErr := pve.DestroyEmptyMover(ctx, deps.PVE, deps.Log(ctx), plan.parker); dErr != nil {
+			deps.Log(ctx).Warn(op+": could not destroy the migration mover after the attach; it holds no disks and a later attach or operator cleanup removes it",
+				log.Int("mover_vmid", plan.parker.VMID),
+				log.String("node", plan.parker.Node),
+				log.Err(dErr),
+			)
+		}
+	}
 	return targetSlot, devicePath, nil
 }
 
@@ -560,6 +575,15 @@ func attachDiskParseArgs(args []json.RawMessage) (vmCID, diskCID string, err err
 // component, resolves the storage backend, and determines which cluster node
 // holds the disk. For local backends it also verifies VM/disk co-location.
 //
+// stableID is the disk's identity token ("" for legacy disks). It decides
+// what a local-backend co-location mismatch means: with pve.disk_migration
+// resolving to "on_attach" and a stable ID present, the mismatch is not an
+// error — the node retargets to the VM's node (like the shared-backend
+// retarget) and the holder guard's mover flow moves the volume there. With
+// migration off the mismatch is refused naming the knob; a legacy disk is
+// refused regardless, because the migration renames the volume and a legacy
+// CID is the volume name.
+//
 // Returns (node, vmid, err).
 //
 // Failures:
@@ -568,8 +592,8 @@ func attachDiskParseArgs(args []json.RawMessage) (vmCID, diskCID string, err err
 //   - backend resolution error            → Wrap(Cloud)
 //   - NodeForExisting: not-found          → DiskNotFound
 //   - NodeForExisting: other error        → Wrap
-//   - local backend + node mismatch       → Cloud error
-func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID string) (node string, vmid int, err error) {
+//   - local backend + node mismatch and no migration path → Cloud error
+func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stableID string) (node string, vmid int, err error) {
 	vmid, err = strconv.Atoi(vmCID)
 	if err != nil || vmid <= 0 {
 		return "", 0, cpierrors.VMNotFound(vmCID)
@@ -624,10 +648,29 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID string
 	}
 	if backend.Kind() == pve.BackendLocal {
 		if found && vmNode != "" && vmNode != node {
-			return "", 0, cpierrors.Cloud(
-				"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s — local-storage disks cannot cross nodes",
-				diskCID, node, vmCID, vmNode,
-			)
+			switch {
+			case !deps.Config.DiskMigrationOnAttachEnabled():
+				return "", 0, cpierrors.Cloud(
+					"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s, and cross-node "+
+						"disk migration is disabled by configuration (pve.disk_migration: \"off\"). Set "+
+						"pve.disk_migration: \"on_attach\" to let the CPI migrate the disk, or use a shared "+
+						"storage backend for pve.disk_storage",
+					diskCID, node, vmCID, vmNode,
+				)
+			case stableID == "":
+				return "", 0, cpierrors.Cloud(
+					"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s, and this is a "+
+						"legacy disk whose CID is its volume name — the migration PVE performs renames the volume, "+
+						"which would orphan the CID, so the CPI cannot migrate it automatically. Recreate the VM "+
+						"pinned to node %s (cloud_properties.node or an AZ on that node), or move the volume by hand",
+					diskCID, node, vmCID, vmNode, node,
+				)
+			default:
+				// Migration is on and the disk carries a stable ID: target the
+				// VM's node and let the holder guard's mover flow bring the
+				// volume there (guardAndUnparkBeforeAttach → attachViaMigration).
+				node = vmNode
+			}
 		}
 	} else if found && vmNode != "" {
 		node = vmNode
@@ -768,7 +811,7 @@ func chooseSCSISlotSkippingZero(
 	}
 
 	if existing, ok := pve.FindDiskIDByVolID(qemu.ParseDisks(cfg), volid); ok {
-		if existing != "scsi0" {
+		if existing != diskKeyScsi0 {
 			return existing, nil
 		}
 		// Legacy scsi0 attachment from a prior CPI version. Detach so the
@@ -828,6 +871,12 @@ type attachPlan struct {
 	// target VM's own sentinel on an idempotent re-attach). attachDiskCore
 	// merges it as the rightmost layer over global and CID options.
 	overlay map[string]string
+	// destroyMover is true when parker is a single-purpose migration mover
+	// (created by this call's cross-node migration, or adopted from an
+	// interrupted one): once the transfer lands, attachDiskViaTransfer
+	// destroys it through the guard that refuses a mover still referencing
+	// any volume. Meaningful only when viaTransfer is true.
+	destroyMover bool
 }
 
 // guardAndUnparkBeforeAttach settles who currently holds the volume, then
@@ -894,26 +943,60 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if holder.Node == node {
-			return attachPlan{viaTransfer: true, parker: holder, overlay: overlay}, nil
+			// A mover already on the target node is an interrupted migration
+			// resuming: the ordinary transfer drains it, then destroys it.
+			return attachPlan{
+				viaTransfer:  true,
+				parker:       holder,
+				overlay:      overlay,
+				destroyMover: pve.TagsMarkDiskMover(holder.Tags),
+			}, nil
 		}
 		// PVE reassignment is same-node only ("Both VMs need to be on the
-		// same node"). A birth-named volume can still take the config-edit
-		// path safely — the unpark preserves a volume the parker does not
-		// own — so cross-node attach of a fresh parked disk works as it
-		// always has. A parker-NAMED volume cannot: the config-edit unpark's
-		// sweep would let PVE deallocate it, so it is refused with the two
-		// operator escapes.
+		// same node"), so a cross-node parker means the volume itself has to
+		// move before the attach can land. Which paths exist depends on the
+		// volume's name and the disk's backend:
+		//
+		//   - a parker-NAMED volume can never take the config-edit path (the
+		//     unpark's sweep would let PVE deallocate a volume its parker
+		//     owns), on any backend;
+		//   - a birth-named volume on a LOCAL backend has data on the wrong
+		//     node — the config-edit attach would reference a volume the
+		//     target node cannot see;
+		//   - a birth-named volume on SHARED storage still takes the cheap
+		//     config-edit path below, no data move needed.
+		//
+		// With pve.disk_migration resolving to "on_attach" (the default) the
+		// first two route through the mover migration; with it off they are
+		// refused naming the knob.
+		parkerNamed := false
 		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {
-			return attachPlan{}, cpierrors.Cloud(
-				"%s: disk %s is parked as %q on parker VM %d (node %s) but VM %s runs on node %s, and PVE "+
-					"reassignment is same-node only. Either migrate the parker to the VM's node "+
-					"(qm migrate %d %s — parkers are always stopped) and retry, or recreate the VM pinned to "+
-					"node %s (cloud_properties.node or an AZ on that node)",
-				op, rd.diskCID, rd.volid, holder.VMID, holder.Node, strconv.Itoa(targetVMID), node,
-				holder.VMID, node, holder.Node,
-			)
+			parkerNamed = true
 		}
-		deps.Log(ctx).Warn(op+": stable-ID disk is parked on another node; using the config-edit attach path (birth-named volume, safe)",
+		needsMove := parkerNamed || pve.TagsMarkDiskMover(holder.Tags)
+		var localBacked bool
+		if !needsMove || deps.Config.DiskMigrationOnAttachEnabled() {
+			var backErr error
+			localBacked, backErr = diskBackendIsLocal(ctx, deps, op, rd.volid)
+			if backErr != nil {
+				return attachPlan{}, backErr
+			}
+			needsMove = needsMove || localBacked
+		}
+		if needsMove {
+			if !deps.Config.DiskMigrationOnAttachEnabled() {
+				return attachPlan{}, cpierrors.Cloud(
+					"%s: disk %s is parked as %q on parker VM %d (node %s) but VM %s runs on node %s, and "+
+						"cross-node disk migration is disabled by configuration (pve.disk_migration: \"off\"). "+
+						"Set pve.disk_migration: \"on_attach\" to let the CPI migrate the disk, or migrate the "+
+						"parker to the VM's node by hand (qm migrate %d %s — parkers are always stopped) and retry",
+					op, rd.diskCID, rd.volid, holder.VMID, holder.Node, strconv.Itoa(targetVMID), node,
+					holder.VMID, node,
+				)
+			}
+			return attachViaMigration(ctx, deps, op, rd, holder, node, overlay, localBacked)
+		}
+		deps.Log(ctx).Warn(op+": stable-ID disk is parked on another node; using the config-edit attach path (birth-named volume on shared storage, safe)",
 			log.String("disk_cid", rd.diskCID),
 			log.Int("parker_vmid", holder.VMID),
 			log.String("parker_node", holder.Node),

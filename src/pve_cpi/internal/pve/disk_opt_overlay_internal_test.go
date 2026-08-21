@@ -146,7 +146,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 	t.Run("park context opts land in the provenance entry and read back", func(t *testing.T) {
 		t.Parallel()
 		c := newScanFakeClient(map[int]map[string]any{
-			90000: {"tags": "bosh-cpi;bosh-parker", "protection": true},
+			90000: {"tags": "bosh-cpi;bosh-parker", paramProtection: true},
 		})
 		pctx := ParkContext{
 			DiskCID:  "pvd-x",

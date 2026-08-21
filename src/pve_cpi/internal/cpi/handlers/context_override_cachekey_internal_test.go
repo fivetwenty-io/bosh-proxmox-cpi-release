@@ -72,6 +72,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_parked_disk_vmid_range_start":       float64(90100),
 		"pve_parked_disk_vmid_range_end":         float64(90900),
 		"pve_detached_disk_strategy":             "free",
+		"pve_disk_migration":                     "off",
 		"pve_stemcell_replicate_local":           true,
 		"pve_vm_prefix":                          "az2",
 		"pve_agent_mode":                         config.AgentModeNoAgent,

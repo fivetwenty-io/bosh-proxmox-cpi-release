@@ -818,6 +818,25 @@ class PVEVerifier:
                 vms.append((vmid, node))
         return sorted(vms)
 
+    def cluster_nodes(self, online_only: bool = True) -> list[str]:
+        """Return the cluster's node names, ascending; online ones by default.
+
+        Reads GET /nodes, the same endpoint `pvesh get /nodes` uses. A node
+        whose status is not "online" is excluded unless online_only is False:
+        the callers that exist gate multi-node passes (a disk cannot migrate
+        to or from a node that is down), so an offline node must not count
+        toward "this cluster can move disks between nodes".
+        """
+        nodes: list[str] = []
+        for e in self._as_list(self._get("/nodes")):
+            name = str(e.get("node", "") or "").strip()
+            if not name:
+                continue
+            if online_only and str(e.get("status", "") or "").strip() != "online":
+                continue
+            nodes.append(name)
+        return sorted(nodes)
+
     def parker_disk_slots(self, vmid: int | str) -> dict[str, str]:
         """Return the disk-bearing slots of a VM, keyed by slot.
 

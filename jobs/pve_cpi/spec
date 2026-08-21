@@ -1392,6 +1392,30 @@ properties:
       VMs. Disks without the promise in their CID (created before this
       release, or under the "free" strategy) are always handled permissively;
       their anchor was never promised.
+  pve.disk_migration:
+    description: |
+      Cross-node persistent-disk migration on attach. One of:
+        ""          — same as "on_attach" (the default).
+        "on_attach" — when a stable-ID disk sits on one node and the target
+                      VM runs on another, attach_disk moves the disk instead
+                      of erroring: the disk is isolated onto a fresh
+                      single-purpose mover parker VM on its own node (a
+                      metadata-only reassignment, so sibling parked disks
+                      never travel), the never-started mover is
+                      offline-migrated to the VM's node through the PVE
+                      migrate API (a metadata move on shared storage, a
+                      volume copy on node-local storage), the disk attaches
+                      from the mover, and the now-empty mover is destroyed
+                      through a guard that refuses to destroy a mover still
+                      referencing any volume.
+        "off"       — restore the hard cross-node errors; attach_disk names
+                      this property in the refusal.
+      Legacy disks (created before stable disk identities) are never migrated
+      under either setting: the migration renames the volume and a legacy CID
+      is the volume name. Disks on an offline node cannot migrate either; PVE
+      needs the source node online to run the migration task. Overridable per
+      cpi-config entry as pve_disk_migration.
+    default: ""
   pve.disk_cid_compression:
     description: |
       Retained for compatibility; the behavior it opted into is now always
@@ -1642,6 +1666,24 @@ properties:
     description: |
       Plus/minus jitter percentage (0-100) applied to each storage-lock
       backoff delay. Zero (default) applies the built-in 30.
+    default: 0
+
+  pve.retry.disk_migrate.max_attempts:
+    description: |
+      Maximum attempts for transient retries of the cross-node disk-migration
+      request attach_disk issues when pve.disk_migration resolves to
+      "on_attach". Zero (default) applies the built-in budget of 4. The
+      request runs while the mover's protection flag is down, so a long
+      budget widens that window.
+    default: 0
+  pve.retry.disk_migrate.cap_ms:
+    description: |
+      Wall-clock budget in milliseconds for awaiting the PVE migrate task the
+      cross-node disk migration starts. Zero (default) applies the built-in
+      1800000 ms (30 minutes), sized for a node-local volume copy. When the
+      budget is exhausted while the task still runs, attach_disk returns a
+      retriable error saying the copy continues server-side; the Director's
+      retried attach re-enters the migration and completes once it lands.
     default: 0
 
   pve.max_inflight_per_node:

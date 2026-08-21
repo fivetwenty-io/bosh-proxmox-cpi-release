@@ -172,7 +172,7 @@ func (c *scanFakeClient) updateQemuConfig(_ context.Context, _ string, vmidStr s
 		c.logEvent("description:%d", vmid)
 	}
 	if params.Protection != nil {
-		cfg["protection"] = *params.Protection
+		cfg[paramProtection] = *params.Protection
 		c.logEvent("protection:%d:%v", vmid, *params.Protection)
 	}
 	return nil
@@ -245,9 +245,6 @@ func (c *scanFakeClient) createQemuMoveDisk(_ context.Context, _ string, vmidStr
 	return &resp, nil
 }
 
-// cfgKeyTags is the QEMU config key for the tag string, shared by the test
-// fixtures here and in disk_stable_id_internal_test.go.
-const cfgKeyTags = "tags"
 
 // clusterRow builds one /cluster/resources row for a QEMU guest. Shared by
 // every fake listing here so the JSON key literals live in one place.
@@ -315,7 +312,7 @@ func TestTransferDiskToParker_ProtocolAndOrdering(t *testing.T) {
 		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
 		90000: {
 			cfgKeyTags:   "bosh-cpi;bosh-parker",
-			"protection": true,
+			paramProtection: true,
 		},
 	})
 	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
@@ -371,7 +368,7 @@ func TestTransferDiskToParker_SnapshotRefusalLeavesResumableState(t *testing.T) 
 		700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
 		90000: {
 			cfgKeyTags:   "bosh-cpi;bosh-parker",
-			"protection": true,
+			paramProtection: true,
 		},
 	})
 	c.moveErr = errors.New("Can't move disk used by a snapshot to another VM")
@@ -411,7 +408,7 @@ func TestTransferDiskFromParker_CarriesOptionsAndRenames(t *testing.T) {
 	c := newScanFakeClient(map[int]map[string]any{
 		90000: {
 			cfgKeyTags:   "bosh-cpi;bosh-parker",
-			"protection": true,
+			paramProtection: true,
 			"scsi0":      "data:vm-90000-disk-0,serial=" + transferStableID,
 		},
 		700: {},
@@ -465,7 +462,7 @@ func TestTransferDiskFromParker_SnapshotRefusalIsDetectable(t *testing.T) {
 		t.Fatalf("err = %v, want ErrMoveDiskSnapshotRefused", err)
 	}
 	// Protection must be back on after the refused move.
-	if prot, _ := c.configs[90000]["protection"].(bool); !prot {
+	if prot, _ := c.configs[90000][paramProtection].(bool); !prot {
 		t.Error("protection not restored after the refused move")
 	}
 }
@@ -606,7 +603,7 @@ func TestDeleteParkedOwnedDisk_DeallocatesAndCleansProvenance(t *testing.T) {
 	c := newScanFakeClient(map[int]map[string]any{
 		90000: {
 			cfgKeyTags:    "bosh-cpi;bosh-parker",
-			"protection":  true,
+			paramProtection:  true,
 			"scsi1":       "data:vm-90000-disk-2,serial=" + transferStableID,
 			"description": desc,
 		},
@@ -621,7 +618,7 @@ func TestDeleteParkedOwnedDisk_DeallocatesAndCleansProvenance(t *testing.T) {
 	if len(c.parkedEntries(t)) != 0 {
 		t.Errorf("provenance entries remain: %+v", c.parkedEntries(t))
 	}
-	if prot, _ := c.configs[90000]["protection"].(bool); !prot {
+	if prot, _ := c.configs[90000][paramProtection].(bool); !prot {
 		t.Error("protection not restored after the delete")
 	}
 }

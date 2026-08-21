@@ -248,16 +248,18 @@ func TestGuardAndUnparkBeforeAttach_TransferPlanning(t *testing.T) {
 		}
 	})
 
-	t.Run("cross-node parker with a parker-named volume is refused", func(t *testing.T) {
+	t.Run("cross-node parker with a parker-named volume is refused when migration is off", func(t *testing.T) {
 		t.Parallel()
 		deps := idTestDeps(newIDFakeClient(map[int]map[string]any{
 			90000: {"tags": "bosh-cpi;bosh-parker", diskKeyScsi0: "data:vm-90000-disk-0,serial=" + idTestToken},
 		}))
+		deps.Config.DiskMigration = config.DiskMigrationOff
 		holder := pve.DiskHolder{Found: true, VMID: 90000, Node: "pve2", IsParker: true, Slot: "scsi0"}
 		rd := resolvedDisk{diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-90000-disk-0", meta: meta, stableID: idTestToken, holder: &holder}
 		_, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve1", 700)
-		if err == nil || !strings.Contains(err.Error(), "same-node only") {
-			t.Fatalf("err = %v, want the same-node-only refusal", err)
+		if err == nil || !strings.Contains(err.Error(), "disabled by configuration") ||
+			!strings.Contains(err.Error(), "pve.disk_migration") {
+			t.Fatalf("err = %v, want the migration-disabled refusal naming the knob", err)
 		}
 	})
 

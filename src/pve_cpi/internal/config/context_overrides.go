@@ -63,6 +63,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_parked_disk_vmid_range_start",
 	"pve_parked_disk_vmid_range_end",
 	"pve_detached_disk_strategy",
+	"pve_disk_migration",
 	"pve_stemcell_replicate_local",
 	"pve_vm_prefix",
 	"pve_agent_mode",
@@ -292,6 +293,22 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.DetachedDiskStrategy = s
+		return nil
+	},
+	// Cross-node disk migration belongs here for the same reason the
+	// detached-disk strategy does: whether the CPI may move volumes between
+	// a cluster's nodes (and create the transient mover VMs that move needs,
+	// in that cluster's parker band) is a statement about the TARGET
+	// cluster, so an entry must be able to turn it off for its cluster
+	// alone. Enum validation is delegated to the eff.Validate() call at the
+	// end of ApplyContextOverrides, matching every other value-constrained
+	// key here.
+	"pve_disk_migration": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.DiskMigration = s
 		return nil
 	},
 	// Whether cache templates need per-node replicas is a property of the

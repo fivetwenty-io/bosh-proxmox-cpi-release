@@ -481,6 +481,13 @@
   # the Go accessor treats an absent key as strict (true).
   if_p("pve.parked_anchor_strict") { |v| config["parked_anchor_strict"] = v }
 
+  # Emit disk_migration only when set to a non-empty value. The Go accessor
+  # defaults an empty string to "on_attach"; omitting the key hands the
+  # decision to that default. Operators opting out set "off" explicitly,
+  # which this emits.
+  disk_migration = p("pve.disk_migration", "")
+  config["disk_migration"] = disk_migration unless disk_migration.to_s.empty?
+
   # Emit disk_cid_compression only when enabled. An absent key keeps the Go
   # zero value (false), byte-identical to prior releases.
   if p("pve.disk_cid_compression", false)
@@ -616,6 +623,7 @@
     "pushback"       => ["base_ms", "cap_ms"],
     "transient"      => ["max_attempts"],
     "storage_lock"   => ["max_attempts", "base_ms", "cap_ms", "jitter_pct"],
+    "disk_migrate"   => ["max_attempts", "cap_ms"],
   }.each do |klass, fields|
     policy = {}
     fields.each do |f|

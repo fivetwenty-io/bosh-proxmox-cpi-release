@@ -7,8 +7,11 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - Snapshots require the disk to be attached
   PVE provides no per-volume snapshot primitive, so `snapshot_disk` takes a VM snapshot of the host VM and a detached disk cannot be snapshotted. See [Persistent Disks](persistent-disks.md#known-limitations).
 
-- No cross-node move for local-storage disks
-  Once a local-backend disk lives on one node, `attach_disk` rejects attaching it to a VM on another node; move it manually with `pvesm move` or use a shared backend. See [Persistent Disks](persistent-disks.md#known-limitations).
+- Legacy disks cannot cross nodes
+  `attach_disk` migrates a stranded stable-ID disk to the VM's node by default (`pve.disk_migration: on_attach`), but a disk created before stable disk identities existed is still refused: the migration renames the volume, and a legacy CID is the volume name. Move such a disk by hand or recreate the VM on its node. See [Persistent Disks](persistent-disks.md#known-limitations).
+
+- Cross-node migration needs the source node online
+  The migration runs as a PVE task on the node holding the disk, so a disk stranded on an offline node cannot move until that node returns; `attach_disk` surfaces PVE's own error for that case. The placement-time refusal when a target node is under maintenance is likewise unchanged. See [Persistent Disks](persistent-disks.md#known-limitations).
 
 - `set_disk_metadata` persists nothing for detached disks
   Metadata lives in the host VM's description sentinel, so a detached disk logs a warning and stores nothing. See [Persistent Disks](persistent-disks.md#known-limitations).
@@ -19,8 +22,8 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - Free-floating disks carry no PVE-side provenance
   PVE volumes have no metadata field independent of a VM config slot, so under the free-floating strategy the CID suffix in the Director database is the only provenance record. See [Persistent Disk Lifecycle Strategy](persistent-disk-strategy.md#what-is-not-recorded).
 
-- Reassignment transfer is same-node only
-  PVE's `move_disk` refuses to reassign a volume between VMs on different nodes, even on shared storage. A stable-ID disk that was previously transferred (its volume is named for its parker) cannot attach to a VM on another node until the stopped parker is migrated there (`qm migrate`) or the VM is recreated on the disk's node; `attach_disk` refuses with both escapes in the message. Fresh parked disks, still under their birth name, attach cross-node through the config-edit path as before. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
+- Reassignment transfer is same-node only, so cross-node attaches ride a mover
+  PVE's `move_disk` refuses to reassign a volume between VMs on different nodes, even on shared storage. By default (`pve.disk_migration: on_attach`) we work around it: `attach_disk` isolates the disk onto a fresh single-purpose mover parker on the disk's node, offline-migrates the mover to the VM's node, attaches from it, and destroys it. Setting `pve.disk_migration: off` restores the hard refusal, which names the knob and the manual `qm migrate` escape. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
 
 - Stable-ID disks always park on detach
   A volume renamed by a reassignment cannot safely be left free-floating (PVE deallocates an owner-named volume when its last config reference is swept), so a stable-ID disk's detached state is parked even under `detached_disk_strategy: free`. Legacy disks keep the configured strategy's behavior. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).

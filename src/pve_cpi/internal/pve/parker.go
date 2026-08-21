@@ -721,8 +721,8 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 			params := map[string]any{
 				"vmid":       vmid,
 				"name":       parkerVMName(vmid),
-				"tags":       tags,
-				"protection": protection,
+				cfgKeyTags:   tags,
+				paramProtection: protection,
 				"onboot":     onboot,
 				"memory":     memory,
 				"cores":      cores,
@@ -2172,6 +2172,13 @@ func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger,
 // the window a failed restore, a cancelled request, or a killed CPI process
 // would otherwise leave open. A nil nodes service (test stubs without
 // injection) is a no-op.
+// cfgKeyTags is the QEMU create/update config key for the tag string.
+const cfgKeyTags = "tags"
+
+// paramProtection is the QEMU create/update config key for the PVE
+// protection flag.
+const paramProtection = "protection"
+
 func setParkerProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, on bool) error {
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {

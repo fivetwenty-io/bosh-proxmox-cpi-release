@@ -26,6 +26,10 @@ Sequence (mirrors the BOSH-CPI Director call order):
    10.  delete_snapshot          (clean mode; detach_disk in bypass mode)
    11.  detach_disk              (clean mode; delete_snapshot in bypass mode)
    11c-11l. parked-disk pass    (only when PARKED_DISK_TEST != off)
+   11m-11q. disk-migration pass (only when DISK_MIGRATION_TEST != off; SKIPs
+                                 on single-node clusters and on shared
+                                 disk_storage, where the cross-node case this
+                                 pass drives cannot arise)
    12.  delete_disk
    12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
@@ -106,6 +110,18 @@ Parked-disk strategy (exercises pve.detached_disk_strategy end to end):
                        CPI config, which scripts/test integration does from
                        tier1.parked_disk.range_start/range_end; these env vars
                        then restate it.
+
+Cross-node disk migration (exercises pve.disk_migration end to end):
+    DISK_MIGRATION_TEST  on | off                  (default: on)
+                       Runs steps 11m-11q: a fresh disk is created pinned to a
+                       node other than the VM's, a cross-node attach under
+                       disk_migration=off must fail naming the knob, and the
+                       same attach under the on_attach default must migrate
+                       the disk to the VM's node and leave no mover VM
+                       behind. The pass SKIPs (exit stays 0) when the cluster
+                       has fewer than two online nodes, or when disk_storage
+                       is shared: the co-location conflict it drives only
+                       arises on node-local storage.
 
 The pass leaves its parker VM behind, which is the design working as intended:
 a parker is durable infrastructure that outlives any one disk, and the CPI has
@@ -207,6 +223,10 @@ if not os.access(STEMCELL_PATH, os.R_OK):
 PARKED_DISK_TEST = env("PARKED_DISK_TEST", "on").strip().lower()
 if PARKED_DISK_TEST not in ("on", "off"):
     sys.exit(f"PARKED_DISK_TEST must be on|off, got {PARKED_DISK_TEST!r}")
+
+DISK_MIGRATION_TEST = env("DISK_MIGRATION_TEST", "on").strip().lower()
+if DISK_MIGRATION_TEST not in ("on", "off"):
+    sys.exit(f"DISK_MIGRATION_TEST must be on|off, got {DISK_MIGRATION_TEST!r}")
 
 # The band comes from CPI_CONFIG, falling back to the CPI's own default. Looking
 # for parkers in a band other than the one the base config uses is actively
@@ -331,6 +351,11 @@ state: dict[str, Any] = {
     # the band the parker lives in, and pinning the config keeps teardown
     # independent of whatever band the lab config names.
     "disk_cleanup_cfg": "",
+    # The disk-migration pass's own disk (created pinned to a node away from
+    # the VM), plus the migration-enabled config its teardown must use.
+    "mig_disk_cid": "",
+    "mig_disk_attached": False,
+    "mig_cleanup_cfg": "",
 }
 
 
@@ -1014,10 +1039,202 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     return parker_vmid
 
 
+def write_migration_config(mode: str) -> str:
+    """Derive a temp CPI config for the cross-node disk-migration pass.
+
+    Pins detached_disk_strategy=parked so create_disk parks the fresh disk on
+    a parker on its own node (the shape the mover flow adopts) and pins the
+    band for the same determinism reasons as write_strategy_config. mode ""
+    REMOVES the disk_migration key entirely, so the pass proves the built-in
+    default resolves to on_attach rather than whatever the lab config says;
+    "off" pins the refusal shape.
+    """
+    return derive_config(
+        "cpi-migration-",
+        detached_disk_strategy="parked",
+        parked_disk_vmid_range_start=PARKER_RANGE_START,
+        parked_disk_vmid_range_end=PARKER_RANGE_END,
+        disk_migration=(mode or None),
+    )
+
+
+def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier") -> None:
+    """Drive pve.disk_migration end to end against a multi-node cluster.
+
+    The shape under test is the one the Director produces: a stable-ID disk
+    parked on one node while the VM runs on another. create_disk pinned to a
+    foreign node under strategy=parked lands exactly there — the fresh disk
+    parks on that node's parker — without needing a second VM (or a stemcell
+    replica) on the foreign node.
+
+    Steps:
+
+      11m  create_disk pinned to a node other than the VM's; assert it parked
+           on a parker there
+      11n  attach_disk under disk_migration=off: must refuse naming the knob
+           and leave the disk parked where it was
+      11o  the same attach with the key REMOVED (the on_attach default): the
+           disk must migrate via a single-purpose mover, land attached to the
+           VM carrying its serial, the mover must be destroyed, and the
+           foreign parker must have dropped the disk
+      11p  detach_disk: the migrated disk parks on the VM's node
+      11q  delete_disk: unparks and frees the migrated volume
+
+    SKIPs (exit stays 0) when the cluster has fewer than two online nodes or
+    when disk_storage is shared — the co-location conflict this pass drives
+    only arises on node-local storage. Every claim is checked against the
+    cluster, mirroring run_parked_disk_pass.
+    """
+    nodes = verifier.cluster_nodes()
+    if len(nodes) < 2:
+        step(
+            "11m. SKIPPED: the disk-migration pass needs at least 2 online "
+            f"nodes; this cluster has {len(nodes)}"
+        )
+        return
+    with open(CPI_CONFIG) as f:
+        base_cfg = json.load(f)
+    disk_storage = str(base_cfg.get("disk_storage", "") or "")
+    if disk_storage and verifier.storage_is_shared(disk_storage):
+        step(
+            f"11m. SKIPPED: disk_storage {disk_storage!r} is shared; the "
+            "cross-node co-location conflict this pass drives cannot arise"
+        )
+        return
+
+    vm_cid = state["vm_cid"]
+
+    def node_of(vmid: "int | str") -> str:
+        wanted = int(str(vmid).strip())
+        for candidate, node in verifier.cluster_vms():
+            if candidate == wanted:
+                return node
+        return ""
+
+    vm_node = node_of(vm_cid)
+    foreign_nodes = [n for n in nodes if n != vm_node]
+    if not vm_node or not foreign_nodes:
+        step(
+            f"11m. SKIPPED: cannot pick a foreign node (vm node {vm_node!r}, "
+            f"online nodes {nodes})"
+        )
+        return
+    foreign = foreign_nodes[0]
+
+    on_cfg = write_migration_config("")
+    off_cfg = write_migration_config("off")
+    # From here on the pass owns a disk; teardown must speak parked+migration.
+    state["mig_cleanup_cfg"] = on_cfg
+
+    step(f"11m. create_disk pinned to node {foreign} (strategy=parked: the fresh disk parks there)")
+    mig_cid = call("create_disk", [DISK_SIZE_MIB, {"node": foreign}], config_path=on_cfg)
+    state["mig_disk_cid"] = mig_cid
+    stable_id = _pve_verify.disk_stable_id(mig_cid)
+    if not stable_id:
+        raise RuntimeError(
+            f"the fresh disk's CID carries no stable ID ({mig_cid!r}); "
+            "cross-node migration requires one, so this CPI build cannot pass"
+        )
+    holders = verifier.disk_holders(mig_cid)
+    if len(holders) != 1:
+        raise RuntimeError(f"fresh parked disk should have exactly one holder, got {holders}")
+    foreign_parker, _ = holders[0]
+    verifier.assert_true(
+        f"fresh disk parked in the band on parker {foreign_parker}",
+        PARKER_RANGE_START <= foreign_parker <= PARKER_RANGE_END,
+    )
+    verifier.assert_true(
+        f"parker {foreign_parker} lives on the foreign node {foreign}",
+        node_of(foreign_parker) == foreign,
+    )
+    print(f"create_disk={mig_cid} (parked on parker {foreign_parker}, node {foreign})")
+
+    step("11n. attach_disk under disk_migration=off (must refuse naming the knob)")
+    try:
+        call("attach_disk", [vm_cid, mig_cid], config_path=off_cfg)
+    except RuntimeError as exc:
+        if "pve.disk_migration" not in str(exc):
+            raise RuntimeError(
+                f"attach_disk under disk_migration=off refused for the wrong reason: {exc}"
+            ) from exc
+        print("attach_disk refused the cross-node disk and named the knob as expected")
+    else:
+        raise RuntimeError("attach_disk under disk_migration=off unexpectedly succeeded")
+    verifier.assert_true(
+        f"the refusal left the disk parked on parker {foreign_parker}",
+        verifier.disk_holders(mig_cid) == holders,
+    )
+
+    step("11o. attach_disk with the key removed (default on_attach): migrates via a mover")
+    call("attach_disk", [vm_cid, mig_cid], config_path=on_cfg)
+    state["mig_disk_attached"] = True
+    print("attach_disk=ok")
+    attached = verifier.disk_holders(mig_cid)
+    if [h[0] for h in attached] != [int(vm_cid)]:
+        raise RuntimeError(
+            f"the migrated disk should be held only by VM {vm_cid}, got {attached}"
+        )
+    _, vm_slot = attached[0]
+    opt_str = str(verifier.qemu_config(vm_cid).get(vm_slot, ""))
+    verifier.assert_true(
+        f"the attached drive entry carries serial {stable_id}",
+        f"serial={stable_id}" in opt_str,
+    )
+    verifier.assert_true(
+        f"parker {foreign_parker} dropped the disk from its provenance sentinel",
+        not verifier.parked_disk_recorded(foreign_parker, mig_cid),
+    )
+    for pv in verifier.parker_vmids(PARKER_RANGE_START, PARKER_RANGE_END):
+        tags = str(verifier.qemu_config(pv).get("tags", ""))
+        verifier.assert_false(
+            f"no mover VM left behind in the band (parker {pv})",
+            "bosh-disk-mover" in tags,
+        )
+
+    step("11p. detach_disk (the migrated disk parks on the VM's node)")
+    call("detach_disk", [vm_cid, mig_cid], config_path=on_cfg)
+    state["mig_disk_attached"] = False
+    post = verifier.disk_holders(mig_cid)
+    if len(post) != 1:
+        raise RuntimeError(f"the detached disk should have exactly one holder, got {post}")
+    home_parker, _ = post[0]
+    verifier.assert_true(
+        f"post-migration park landed in the band on parker {home_parker}",
+        PARKER_RANGE_START <= home_parker <= PARKER_RANGE_END,
+    )
+    verifier.assert_true(
+        f"parker {home_parker} lives on the VM's node {vm_node}",
+        node_of(home_parker) == vm_node,
+    )
+
+    step("11q. delete_disk (unparks and frees the migrated volume)")
+    call("delete_disk", [mig_cid], config_path=on_cfg)
+    state["mig_disk_cid"] = ""
+    state["mig_cleanup_cfg"] = ""
+    verifier.assert_false(
+        f"migrated disk {mig_cid!r} gone from pve",
+        verifier.volume_exists(mig_cid),
+    )
+    print("delete_disk=ok")
+
+
 def cleanup() -> None:
     if state["snapshot_cid"]:
         try:
             call("delete_snapshot", [state["snapshot_cid"]])
+        except Exception:
+            pass
+    # The migration pass's own disk first: it can only be freed by a config
+    # that speaks parked+migration (state["mig_cleanup_cfg"]).
+    mig_cfg = state["mig_cleanup_cfg"]
+    if state["mig_disk_attached"] and state["vm_cid"] and state["mig_disk_cid"]:
+        try:
+            call("detach_disk", [state["vm_cid"], state["mig_disk_cid"]], config_path=mig_cfg)
+        except Exception:
+            pass
+    if state["mig_disk_cid"]:
+        try:
+            call("delete_disk", [state["mig_disk_cid"]], config_path=mig_cfg)
         except Exception:
             pass
     disk_cfg = state["disk_cleanup_cfg"]
@@ -1310,6 +1527,12 @@ def main() -> int:
         parker_vmid = 0
         if PARKED_DISK_TEST == "on":
             parker_vmid = run_parked_disk_pass(verifier)
+
+        # Steps 11m-11q: cross-node disk migration, on its own fresh disk so
+        # the main disk's state is untouched. SKIPs itself on clusters where
+        # the cross-node case cannot arise.
+        if DISK_MIGRATION_TEST == "on":
+            run_disk_migration_pass(verifier)
 
         # delete_disk runs against whichever config the disk's state requires:
         # after the parked pass the disk is on a parker, and only a call that

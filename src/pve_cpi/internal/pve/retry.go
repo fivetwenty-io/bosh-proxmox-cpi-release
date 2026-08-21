@@ -44,6 +44,13 @@ const DefaultStorageLockMaxAttempts = 10
 // sub-second so a higher attempt count is cheap and rarely consumed in full.
 const DefaultTransientMaxAttempts = 8
 
+// DefaultDiskMigrateMaxAttempts bounds transient retries of the cross-node
+// migrate request MigrateDiskViaMover issues (retry.disk_migrate.max_attempts
+// overrides it when > 0). Deliberately the same small bound as
+// parkerWindowMaxAttempts: the request runs while the mover's protection flag
+// is down, so a long retry curve widens the unprotected window.
+const DefaultDiskMigrateMaxAttempts = 4
+
 // TransientBackoff returns the sleep duration after the attempt-th (0-indexed)
 // failed transport call: exponential 1s × 1.5^attempt with ±30% jitter, capped
 // at 15s. Tuned for pvedaemon worker recycling, which completes in roughly a

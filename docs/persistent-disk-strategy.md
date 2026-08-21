@@ -368,9 +368,15 @@ uses that same sweep semantics on purpose, as the deletion itself.
   node are co-located by construction. When a shared-storage VM is recreated
   on a different node, a fresh (never-transferred, still birth-named) disk
   attaches through the config-edit path as before; a previously transferred
-  (parker-named) disk cannot, and `attach_disk` refuses with the two operator
-  escapes: migrate the stopped parker to the VM's node (`qm migrate`), or
-  recreate the VM pinned to the disk's node.
+  (parker-named) disk, or any disk on node-local storage, cannot. By default
+  (`pve.disk_migration: on_attach`) `attach_disk` moves such a disk itself:
+  it is isolated onto a fresh single-purpose mover parker on its own node (a
+  metadata-only reassignment, so sibling parked disks never travel), the
+  never-started mover is offline-migrated to the VM's node, the disk attaches
+  from the mover through the ordinary same-node transfer, and the empty mover
+  is destroyed. With `pve.disk_migration: off` the attach refuses instead,
+  naming the knob and the manual escape (`qm migrate` the stopped parker, or
+  recreate the VM pinned to the disk's node).
 
 - A volume a snapshot references refuses reassignment outright. For a
   birth-named disk the attach falls back to the config-edit path, which the

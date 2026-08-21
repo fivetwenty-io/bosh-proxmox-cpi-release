@@ -104,10 +104,14 @@ behavior (no attachment lookup).
 
 - Local backend: cluster-wide scan via `Storage.Exists()` on every candidate node; the first node that reports the volume present wins.
 
-**attach_disk** also verifies co-location when the backend is local: if the VM
-runs on `pve-01` but the disk lives on `pve-02`, the call fails with a clear
-"local-storage disks cannot cross nodes" error rather than producing a stale
-or unattachable disk.
+**attach_disk** also checks co-location when the backend is local. When the VM
+runs on `pve-01` but the disk lives on `pve-02`, the default
+(`pve.disk_migration: on_attach`) migrates the disk to the VM's node through a
+single-purpose mover parker VM before attaching, so the deploy proceeds the
+way an operator would fix it by hand. With `pve.disk_migration: off` the call
+fails with a clear error naming the knob, and a legacy disk (created before
+stable disk identities) always fails with an explanation, because the
+migration renames the volume and a legacy CID is the volume name.
 
 ## Disk CID encoding
 
@@ -352,7 +356,7 @@ and configuration details.
 
 - **Snapshots require the disk to be attached.** PVE provides no per-volume snapshot primitive; `snapshot_disk` takes a VM snapshot of the host VM. Detached-disk snapshots would require a worker-VM workaround (tracked separately).
 
-- **No cross-node move.** Once a local-storage disk lives on `pve-01`, recreating its owner VM on `pve-02` is rejected by `attach_disk`. Use `pvesm move` manually, or switch to a shared backend.
+- **Cross-node moves need a stable-ID disk and an online source node.** By default (`pve.disk_migration: on_attach`), recreating a disk's owner VM on another node migrates the disk there automatically: `attach_disk` isolates it onto a fresh mover parker VM, offline-migrates the mover (a metadata move on shared storage, a volume copy on local storage), attaches, and destroys the mover. What remains out of reach: legacy disks (their CID is the volume name the migration would rename), disks on an offline node (PVE runs the migration on the source node), and deployments that set `pve.disk_migration: off` to keep the old hard errors.
 
 - **`set_disk_metadata`** stashes BOSH metadata in the host VM's description (sentinel comment block). Detached disks log a warning and persist nothing.
 

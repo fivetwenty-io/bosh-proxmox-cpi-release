@@ -482,12 +482,18 @@ Delete all snapshots before attaching persistent disks. If you understand the da
 **Symptom**
 
 ```text
-attach_disk: local-backend disk <cid> lives on node X but VM <vmid> runs on node Y — local-storage disks cannot cross nodes
+attach_disk: local-backend disk <cid> lives on node X but VM <vmid> runs on node Y, and cross-node disk migration is disabled by configuration (pve.disk_migration: "off"). ...
+```
+
+or, for a disk created before stable disk identities:
+
+```text
+attach_disk: local-backend disk <cid> lives on node X but VM <vmid> runs on node Y, and this is a legacy disk whose CID is its volume name ...
 ```
 
 **Fix**
 
-Local-backend disks are pinned to a node and cannot be attached to a VM on a different node. Use a shared storage backend (`nfs`, `cephfs`, `cifs`, etc.) for `pve.disk_storage` if you need cross-node disk attachment. See [Persistent Disks](persistent-disks.md).
+By default (`pve.disk_migration: on_attach`) we migrate a stranded stable-ID disk to the VM's node automatically, so the first message only appears when the knob was set to `off`: remove the override (or set `on_attach`) and retry, or move the disk by hand. The second message is a real limitation: the migration renames the volume, and a legacy disk's CID is the volume name, so migrating it would orphan the CID. Recreate the VM pinned to the disk's node, move the volume manually, or use a shared storage backend (`nfs`, `cephfs`, `cifs`, etc.) for `pve.disk_storage`. See [Persistent Disks](persistent-disks.md).
 
 ### Resize with unsupported unit
 

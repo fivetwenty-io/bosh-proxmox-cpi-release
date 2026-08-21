@@ -62,7 +62,7 @@ func TestAttachDiskResolveNode_TwoIDsOneExport_BothClassifyShared(t *testing.T) 
 			t.Parallel()
 			deps := Deps{Resolver: resolver}
 			diskCID := storageID + ":vm-100-disk-0"
-			node, vmid, err := attachDiskResolveNode(context.Background(), deps, "100", diskCID)
+			node, vmid, err := attachDiskResolveNode(context.Background(), deps, "100", diskCID, "")
 			if err != nil {
 				t.Fatalf("attachDiskResolveNode(%s): unexpected error: %v", storageID, err)
 			}

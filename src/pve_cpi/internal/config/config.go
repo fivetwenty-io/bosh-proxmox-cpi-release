@@ -653,6 +653,34 @@ type CPIConfig struct {
 	// when unset.
 	ParkedAnchorStrict *bool `json:"parked_anchor_strict,omitempty"`
 
+	// DiskMigration selects whether attach_disk may move a persistent disk
+	// between cluster nodes when the disk and the target VM are not
+	// co-located. Valid values:
+	//
+	//   ""          — same as "on_attach" (the default)
+	//   "on_attach" — when a stable-ID disk sits on one node and the VM runs
+	//                 on another, attach_disk isolates the disk onto a fresh
+	//                 single-purpose mover parker VM on the disk's node,
+	//                 offline-migrates the never-started mover to the VM's
+	//                 node through the PVE migrate API (a metadata move on
+	//                 shared storage, a volume copy on node-local storage),
+	//                 attaches from the mover, and destroys the now-empty
+	//                 mover. Default: a stranded disk moves instead of
+	//                 erroring.
+	//   "off"       — restore the hard cross-node errors: attach_disk refuses
+	//                 a local-backend disk on another node and a parked disk
+	//                 whose parker sits on another node, naming this knob in
+	//                 the message.
+	//
+	// Legacy disks (no stable ID in the CID) are never migrated regardless of
+	// this setting: the migration renames the volume, and a legacy CID is the
+	// volume name. Disks on an OFFLINE node cannot migrate either — PVE needs
+	// the source node online to run the migration task.
+	//
+	// Use DiskMigrationValue() for the effective normalized value and
+	// DiskMigrationOnAttachEnabled() to gate the migration path.
+	DiskMigration string `json:"disk_migration,omitempty"`
+
 	// DiskCIDCompression is retained for compatibility and no longer gates
 	// anything: create_disk always falls back to the pvz- compressed disk CID
 	// format when the standard pvd- envelope would exceed 255 characters (the
@@ -1149,6 +1177,19 @@ type RetryConfig struct {
 	// Defaults: max_attempts 0 (→ DefaultStorageLockMaxAttempts), base_ms 2000,
 	// cap_ms 30000, jitter_pct 30.
 	StorageLock *RetryPolicy `json:"storage_lock,omitempty"`
+
+	// DiskMigrate governs the cross-node offline migration attach_disk runs
+	// when pve.disk_migration resolves to "on_attach" and a persistent disk
+	// must follow its VM to another node. Only two fields are consulted:
+	// max_attempts bounds transient retries of the migrate request itself
+	// (0 → pve.DefaultDiskMigrateMaxAttempts, 4), and cap_ms is the
+	// wall-clock budget in milliseconds for awaiting the PVE migrate task
+	// (0 → 1800000, 30 minutes). A volume copy that outlives the budget
+	// surfaces as a retriable error while the copy continues server-side;
+	// the Director's retried attach re-enters the migration and completes
+	// once it lands. base_ms and jitter_pct are ignored (the task-poll
+	// cadence comes from retry.task_poll).
+	DiskMigrate *RetryPolicy `json:"disk_migrate,omitempty"`
 }
 
 // RetryPolicy is the parameter bag shared by every retry class. Each consuming
@@ -2931,6 +2972,41 @@ func (c *CPIConfig) DetachedDiskParkedEnabled() bool {
 	return c.DetachedDiskStrategyValue() == DetachedDiskStrategyParked
 }
 
+// DiskMigrationOnAttach and DiskMigrationOff are the two valid disk_migration
+// values. "on_attach" is the default an empty setting resolves to; "off" is
+// the opt-out that restores the hard cross-node errors.
+const (
+	DiskMigrationOnAttach = "on_attach"
+	DiskMigrationOff      = "off"
+)
+
+// DiskMigrationValue returns the effective cross-node disk-migration mode,
+// normalized to lower case and trimmed. Empty or absent resolves to
+// "on_attach", the default: a stranded disk moves instead of erroring. Valid
+// return values: "on_attach", "off".
+//
+// A nil receiver means no configuration is loaded at all, so it resolves to
+// "off" to keep the migration path inert (matching the nil guard rationale in
+// DetachedDiskStrategyValue) rather than driving mover creation off a nil
+// config.
+func (c *CPIConfig) DiskMigrationValue() string {
+	if c == nil {
+		return DiskMigrationOff
+	}
+	v := strings.ToLower(strings.TrimSpace(c.DiskMigration))
+	if v == "" {
+		return DiskMigrationOnAttach
+	}
+	return v
+}
+
+// DiskMigrationOnAttachEnabled reports whether attach_disk may migrate a
+// stranded disk cross-node. Returns true when DiskMigrationValue() ==
+// "on_attach", which includes the unset default.
+func (c *CPIConfig) DiskMigrationOnAttachEnabled() bool {
+	return c.DiskMigrationValue() == DiskMigrationOnAttach
+}
+
 // ParkedAnchorStrictValue resolves pve.parked_anchor_strict: unset (nil) means
 // strict, the default. See the ParkedAnchorStrict field comment for what the
 // invariant covers.
@@ -3115,6 +3191,24 @@ func (c *CPIConfig) validateDetachedDiskStrategyEnum(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"detached_disk_strategy must be one of free|parked (or empty for default parked), got %q",
 			c.DetachedDiskStrategy,
+		))
+	}
+}
+
+// validateDiskMigrationEnum appends an error when disk_migration is set to a
+// value other than on_attach|off. Empty (the default) is valid and resolves
+// to "on_attach".
+func (c *CPIConfig) validateDiskMigrationEnum(errs *[]string) {
+	if c.DiskMigration == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.DiskMigration)) {
+	case DiskMigrationOnAttach, DiskMigrationOff:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"disk_migration must be one of on_attach|off (or empty for default on_attach), got %q",
+			c.DiskMigration,
 		))
 	}
 }
@@ -3370,6 +3464,11 @@ const (
 	defaultStorageLockBaseMs    = 2000
 	defaultStorageLockCapMs     = 30000
 	defaultStorageLockJitterPct = 30 // matches StorageLockBackoff shipped curve (±30% jitter)
+
+	// defaultDiskMigrateCapMs is the wall-clock budget for awaiting a
+	// cross-node disk-migration task: 30 minutes, sized for a node-local
+	// volume copy rather than the metadata move shared storage needs.
+	defaultDiskMigrateCapMs = 1800000
 )
 
 // retryPolicyOrNil returns the named sub-policy, or nil when the retry block or
@@ -3479,6 +3578,24 @@ func (c *CPIConfig) RetryStorageLock() EffectiveRetryPolicy {
 		out.BaseMs = resolveField(p.BaseMs, defaultStorageLockBaseMs)
 		out.CapMs = resolveField(p.CapMs, defaultStorageLockCapMs)
 		out.JitterPct = resolveField(p.JitterPct, defaultStorageLockJitterPct)
+	}
+	return out
+}
+
+// RetryDiskMigrate returns the resolved cross-node disk-migration policy.
+// MaxAttempts bounds transient retries of the migrate request and is left at
+// 0 when the operator has not set it, signaling callers to fall back to
+// pve.DefaultDiskMigrateMaxAttempts. CapMs is the wall-clock budget in
+// milliseconds for awaiting the PVE migrate task (default 30 minutes).
+// BaseMs and JitterPct are not consulted by this class and are always 0.
+func (c *CPIConfig) RetryDiskMigrate() EffectiveRetryPolicy {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.DiskMigrate })
+	out := EffectiveRetryPolicy{
+		CapMs: defaultDiskMigrateCapMs,
+	}
+	if p != nil {
+		out.MaxAttempts = p.MaxAttempts // 0 → caller falls back to DefaultDiskMigrateMaxAttempts
+		out.CapMs = resolveField(p.CapMs, defaultDiskMigrateCapMs)
 	}
 	return out
 }
@@ -3745,6 +3862,9 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 
 	// DetachedDiskStrategy enum: validate only when non-empty.
 	c.validateDetachedDiskStrategyEnum(errs)
+
+	// DiskMigration enum: validate only when non-empty.
+	c.validateDiskMigrationEnum(errs)
 
 	// DiskPerfInvariantMode enum: validate only when non-empty.
 	c.validateDiskPerfInvariantModeEnum(errs)
@@ -4653,6 +4773,10 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkRaw("pushback", c.Retry.Pushback)
 	checkRaw("transient", c.Retry.Transient)
 	checkRaw("storage_lock", c.Retry.StorageLock)
+	// disk_migrate consults only max_attempts and cap_ms (a wall-clock await
+	// budget, not a backoff ceiling), so like transient it gets the raw-bounds
+	// check without the cap-vs-base ordering check.
+	checkRaw("disk_migrate", c.Retry.DiskMigrate)
 
 	// Effective cap >= base. Only meaningful when the operator set at least one
 	// of the two fields for that class (an entirely-absent policy resolves to
