@@ -113,7 +113,9 @@ jobs:
           umask 077
           sed "s|\${BATS_TARGET_NODE}|${LAB_BATS_TARGET_NODE}|g" \
             ci/integration.scheduled.yml > ci/integration.yml
-          if grep -n '\${' ci/integration.yml; then
+          # Comment lines in the fixture legitimately mention ${VAR}; only a
+          # placeholder outside a comment means the substitution missed one.
+          if grep -nE '^[^#]*\$\{' ci/integration.yml; then
             echo "ERROR: unsubstituted placeholder left in ci/integration.yml" >&2
             exit 1
           fi
