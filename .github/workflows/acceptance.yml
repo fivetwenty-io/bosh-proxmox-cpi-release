@@ -28,9 +28,11 @@ on:
         type: boolean
         default: false
 
-# contents: write is required for the report auto-commit push; nothing else.
+# contents: write is required for the report auto-commit push; packages: read
+# lets the job's GITHUB_TOKEN pull the private CI image from ghcr.
 permissions:
   contents: write
+  packages: read
 
 # Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
 # touches the lab (its PVE API, the director slot, or the cpitest network)
