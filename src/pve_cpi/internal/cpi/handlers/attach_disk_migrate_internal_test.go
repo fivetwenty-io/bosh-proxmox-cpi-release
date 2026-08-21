@@ -64,11 +64,11 @@ func newMigFakeClient(configs map[int]map[string]any, nodes map[int]string) *mig
 	return &migFakeClient{configs: configs, nodes: nodes, renameN: map[int]int{}}
 }
 
-func (c *migFakeClient) Pools() pve.PoolService                    { return nil }
-func (c *migFakeClient) ClusterStorage() clusterstorage.Service    { return nil }
-func (c *migFakeClient) QEMU() qemu.Service                        { return &migFakeQEMU{c: c} }
-func (c *migFakeClient) Nodes() sdknodes.Service                   { return &migFakeNodes{c: c} }
-func (c *migFakeClient) Cluster() sdkcluster.Service               { return &migFakeCluster{c: c} }
+func (c *migFakeClient) Pools() pve.PoolService                 { return nil }
+func (c *migFakeClient) ClusterStorage() clusterstorage.Service { return nil }
+func (c *migFakeClient) QEMU() qemu.Service                     { return &migFakeQEMU{c: c} }
+func (c *migFakeClient) Nodes() sdknodes.Service                { return &migFakeNodes{c: c} }
+func (c *migFakeClient) Cluster() sdkcluster.Service            { return &migFakeCluster{c: c} }
 
 func (c *migFakeClient) bareOf(val string) string {
 	if comma := strings.IndexByte(val, ','); comma >= 0 {

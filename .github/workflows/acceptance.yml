@@ -28,9 +28,14 @@ on:
         type: boolean
         default: false
 
-# contents: write is required for the report auto-commit push; nothing else.
+# contents: write is required to push the report branch; pull-requests: write
+# opens and auto-merges the report PR (main is protected, so reports land
+# through a PR gated on the required checks); packages: read lets the job's
+# GITHUB_TOKEN pull the private CI image from ghcr.
 permissions:
   contents: write
+  packages: read
+  pull-requests: write
 
 # Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
 # touches the lab (its PVE API, the director slot, or the cpitest network)
@@ -53,11 +58,10 @@ jobs:
     if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
 
     container:
-      # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Once the
-      # first ci-image.yml run prints the pushed digest, pin this reference
-      # to ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:... the way the
-      # other workflows pin golang:1.26.
-      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci:latest
+      # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
+      # digest the way the other workflows pin golang:1.26; update the pin
+      # from the digest a ci-image.yml run prints after a Dockerfile change.
+      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:1bed77dbc5af4e9a26aac03c37f0888071b7f72933fc83a16c9ada05f6943ad4
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
       # gha-lab-state is DIFFERENT in kind: it persists the director's
       # create-env products (creds.yml, state.json) between runs, because
@@ -83,8 +87,8 @@ jobs:
       BOSH_PVE_ENV: cpitest
       # scripts/certify and the release-resolution step shell out to gh.
       GH_TOKEN: ${{ github.token }}
-      # The job container has no known_hosts; accept-new on first contact
-      # with the lab node (scripts/bosh _pve_ssh honors this knob).
+      # The container has no known_hosts; accept the lab node's key on first
+      # contact (lab-only trust, per the scripts/bosh _pve_ssh contract).
       SCRIPTS_PVE_SSH_INSECURE: "1"
 
     steps:
@@ -115,7 +119,9 @@ jobs:
           umask 077
           sed "s|\${BATS_TARGET_NODE}|${LAB_BATS_TARGET_NODE}|g" \
             ci/integration.scheduled.yml > ci/integration.yml
-          if grep -n '\${' ci/integration.yml; then
+          # Comment lines in the fixture legitimately mention ${VAR}; only a
+          # placeholder outside a comment means the substitution missed one.
+          if grep -nE '^[^#]*\$\{' ci/integration.yml; then
             echo "ERROR: unsubstituted placeholder left in ci/integration.yml" >&2
             exit 1
           fi
@@ -134,26 +140,26 @@ jobs:
           umask 077
           printf '%s\n' "${LAB_BOSH_VARS_YML}" > manifests/bosh/vars.yml
 
-      - name: Install lab SSH key
-        # scripts/bosh net-up (run directly below and by certify's bootstrap)
-        # and the cpitest firewall ensure reach the PVE node with
-        # `ssh root@<pve_host>`. The lab node's authorized_keys entry for this
-        # key is source-restricted to the runner's SNAT address; the fleet
-        # runbook in the lab repository documents the host.fw rules that
-        # admit it.
+      - name: Write lab SSH key
+        # scripts/bosh net-up/net-down and the firewall ensure run pvesh on
+        # the PVE node over `ssh root@<pve_host>`; the key is authorized on
+        # lab-pmx-0 restricted to the pipes node's SNAT address.
         env:
           LAB_PVE_SSH_KEY: ${{ secrets.LAB_PVE_SSH_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${LAB_PVE_SSH_KEY}" ]]; then
             echo "ERROR: the LAB_PVE_SSH_KEY secret is not configured for this repository." >&2
-            echo "Add the dedicated lab SSH private key:" >&2
-            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release --body-file <keyfile>" >&2
+            echo "Generate a dedicated key, authorize it for root on the lab PVE node, then:" >&2
+            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release < <keyfile>" >&2
             exit 1
           fi
           umask 077
-          mkdir -p "${HOME}/.ssh"
-          printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${HOME}/.ssh/id_ed25519"
+          # OpenSSH expands ~ from the passwd entry, not $HOME, and container
+          # jobs run with HOME=/github/home while the passwd home is /root.
+          ssh_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          mkdir -p "${ssh_home}/.ssh"
+          printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${ssh_home}/.ssh/id_ed25519"
 
       - name: Restore director state from the runner host
         # creds.yml and state.json are create-env products. Without them a
@@ -200,21 +206,6 @@ jobs:
           ./scripts/certify upgrade --env cpitest --force \
             --headline-pass-fail-only --no-color
 
-      - name: Commit upgrade run report
-        if: ${{ always() && !inputs.skip_certify }}
-        run: |
-          set -euo pipefail
-          git add docs/certification
-          if git diff --cached --quiet; then
-            echo "no certification doc changes to commit"
-            exit 0
-          fi
-          git commit -m "docs(certification): scheduled upgrade run report $(date -u +%F)"
-          # Scheduled runs ride the default branch; rebase in case another
-          # push landed while the certification ran.
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-
       - name: Bootstrap director on the latest release
         timeout-minutes: 90
         # Minimal director bring-up (the emptyvm smoke and CF are out of
@@ -249,8 +240,14 @@ jobs:
           fi
           exit "${rc}"
 
-      - name: Commit BATS run report
-        if: ${{ always() && !inputs.skip_bats }}
+      - name: Commit run reports
+        if: always()
+        # main is protected by required status checks the job's token cannot
+        # bypass, so reports ride a per-run branch whose PR auto-merges once
+        # those checks pass. One step at the end covers both the certify and
+        # BATS reports; always() still fires it when a lab phase fails.
+        env:
+          REPORT_BRANCH: certification-reports-${{ github.run_id }}
         run: |
           set -euo pipefail
           git add docs/certification
@@ -258,9 +255,13 @@ jobs:
             echo "no certification doc changes to commit"
             exit 0
           fi
-          git commit -m "docs(certification): scheduled bats run report $(date -u +%F)"
-          git pull --rebase origin "${GITHUB_REF_NAME}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git commit -m "docs(certification): scheduled run reports $(date -u +%F)"
+          git push origin "HEAD:refs/heads/${REPORT_BRANCH}"
+          gh pr create --repo "${GITHUB_REPOSITORY}" \
+            --head "${REPORT_BRANCH}" --base main \
+            --title "docs(certification): scheduled run reports $(date -u +%F)" \
+            --body "Automated certification reports from acceptance run ${GITHUB_RUN_ID}."
+          gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
 
       - name: Persist director state to the runner host
         if: always()
@@ -281,6 +282,7 @@ jobs:
         # The workspace persists between jobs on a self-hosted runner; the
         # state just persisted above is restored from the state dir next run.
         run: |
+          ssh_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
           rm -f manifests/bosh/vars.yml manifests/bosh/creds.yml \
             manifests/bosh/state.json ci/integration.yml \
-            "${HOME}/.ssh/id_ed25519"
+            "${ssh_home}/.ssh/id_ed25519"
