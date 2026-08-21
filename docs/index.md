@@ -40,6 +40,10 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [CPI Certification](certification/index.md): The hub for every path we certify this CPI against the BOSH CPI v2 contract — the local lifecycle harness, the BOSH Acceptance Tests, the BOSH Director Upgrade Test, and the upstream Concourse pipeline.
 
+- [Lifecycle results](certification/lifecycle/README.md): The committed record of CPI lifecycle harness runs, with the latest verdict, per-pass timings, and per-run reports.
+
+- [End-to-end results](certification/e2e/README.md): The committed record of full-stack end-to-end runs, from director and CloudFoundry bootstrap through `cf push` and `cf ssh`, with the latest verdict and per-run reports.
+
 - [Running BATS](certification/bats.md): How we run the upstream BOSH Acceptance Tests against a PVE lab with `./scripts/bats`, including configuration, the tag exclusion policy, and report generation.
 
 - [BATS results](certification/bats/README.md): The committed record of BATS runs, with the latest verdict, environment tuple, and per-run reports.

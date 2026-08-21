@@ -12,6 +12,8 @@ feature: the CPI lifecycle, a real `cf push`, and a real `cf ssh`. It adds the
 reporting layer the underlying wrappers lack — per-step timing, a final
 PASS/FAIL/SKIP summary table, failure call-outs with the tail of the offending
 command's output, and machine-readable results.json + junit.xml artifacts.
+Real runs also write the committed proof documents
+(docs/certification/e2e/runs/<date>.md plus the README.md summary).
 
 Usage:
     ./scripts/e2e [command] [flags]
@@ -42,6 +44,7 @@ Flags:
     --app NAME        Smoke app name (default: e2e-smoke).
     --ssh-cmd CMD     Command to run over `cf ssh` (default: a marker echo).
     --results-dir DIR Where to write results.json + junit.xml (default: .e2e-results).
+    --skip-doc        Do not write docs/certification/e2e/ report documents.
     --dry-run         Print every command without executing; exit 0. Primary
                       validation path when no lab is available.
     --no-color        Disable ANSI color.
@@ -68,6 +71,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 import _integration  # noqa: E402
 import _checkouts  # noqa: E402
+import _rundoc  # noqa: E402
 from _report import (  # noqa: E402
     FAIL,
     PASS,
@@ -93,6 +97,110 @@ DEFAULT_APP = "e2e-smoke"
 DEFAULT_RESULTS_DIR = ".e2e-results"
 SSH_MARKER = "E2E-SSH-OK"
 STATIC_BODY = "e2e-OK"
+
+DOCS_E2E_DIR = REPO_ROOT / "docs" / "certification" / "e2e"
+E2E_RUNS_DIR = DOCS_E2E_DIR / "runs"
+E2E_RUN_META_MARK = "e2e-run-meta"
+
+
+# --------------------------------------------------------------------------- #
+# Report documents
+# --------------------------------------------------------------------------- #
+
+def write_run_doc(
+    meta: dict,
+    phases: "list[dict] | None" = None,
+    steps: "list[dict] | None" = None,
+) -> Path:
+    """Write docs/certification/e2e/runs/<date>.md and return its path."""
+    return _rundoc.write_run_doc(
+        runs_dir=E2E_RUNS_DIR,
+        meta=meta,
+        meta_mark=E2E_RUN_META_MARK,
+        title=f"End-to-End Run Report: {meta['date']}",
+        provenance=(
+            "`./scripts/e2e` generated this report from a live run of the "
+            "end-to-end harness against a Proxmox VE lab: it bootstraps a "
+            "BOSH director and CloudFoundry from nothing, then exercises the "
+            "CPI lifecycle, a real `cf push`, and a real `cf ssh`. See "
+            "[BOSH CPI Certification](../../index.md) for the certification "
+            "paths this run sits alongside."
+        ),
+        verdict_lines=[
+            f"**Result: {meta['verdict']}.** {meta['steps_passed']} steps "
+            f"passed, {meta['steps_failed']} failed, and "
+            f"{meta['steps_skipped']} skipped.",
+            "",
+        ] + _rundoc.run_meta_bullets(meta),
+        timings_intro=[
+            "The wall clock above covers the whole run. The tables below "
+            "break it down by phase and by harness step. The report and "
+            "artifact writing steps run after this report is rendered, so "
+            "they are not listed.",
+            "",
+        ],
+        phases=phases,
+        steps=steps,
+        skip_duration_dash=True,
+        env_table=[
+            ("Command scope", "command"),
+            ("CPI release", "cpi_version"),
+            ("Proxmox VE", "pve_version"),
+            ("Stemcell", "stemcell"),
+            ("Env bundle", "env"),
+        ],
+        artifacts_lines=[
+            "The runner writes this run's machine-readable artifacts "
+            "(results.json and junit.xml) to the gitignored `.e2e-results/` "
+            "directory; it does not commit them. This document is the "
+            "committed record.",
+            "",
+        ],
+        # A partial run covers a slice of the flow, so it gets its own file
+        # rather than overwriting the day's full-run report.
+        doc_suffix=meta.get("doc_suffix") or "",
+    )
+
+
+def write_summary_doc() -> Path:
+    """Regenerate docs/certification/e2e/README.md from the run history."""
+    return _rundoc.write_summary_doc(
+        docs_dir=DOCS_E2E_DIR,
+        runs_dir=E2E_RUNS_DIR,
+        meta_mark=E2E_RUN_META_MARK,
+        title="End-to-End Runs",
+        intro=(
+            "The end-to-end harness (`./scripts/e2e`) bootstraps a BOSH "
+            "director and CloudFoundry from nothing against a Proxmox VE "
+            "lab, then exercises the CPI lifecycle, a real `cf push`, and a "
+            "real `cf ssh`. Each run below is one committed proof document; "
+            "the [certification hub](../index.md) places these runs "
+            "alongside the other certification paths."
+        ),
+        latest_headline=lambda latest: (
+            f"**{latest['verdict']}** on {latest['date']}: "
+            f"{latest.get('steps_passed', '?')} steps passed, "
+            f"{latest.get('steps_failed', '?')} failed, in "
+            f"{latest.get('wall_hms', '?')}. "
+            f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
+        ),
+        latest_table=[
+            ("Command scope", "command"),
+            ("CPI release", "cpi_version"),
+            ("Proxmox VE", "pve_version"),
+            ("Stemcell", "stemcell"),
+            ("Env bundle", "env"),
+        ],
+        history_header=[
+            "| Date | Result | Scope | Steps failed | Wall clock | Report |",
+            "|---|---|---|---|---|---|",
+        ],
+        history_row=lambda meta: (
+            f"| {meta['date']} | {meta['verdict']} | "
+            f"{meta.get('command', '?')} | {meta.get('steps_failed', '?')} | "
+            f"{meta.get('wall_hms', '?')} | [runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +362,8 @@ class E2E:
         if not self.build_cpi_binary():
             return False
         argv = [TEST, "integration", "lifecycle", "--config", self.config_path]
+        if self.args.skip_doc:
+            argv.append("--skip-doc")
         if self.dry_run:
             argv.append("--dry-run")
         ok, _ = self.runner.step("lifecycle", argv, timeout=1800)
@@ -550,6 +660,110 @@ class E2E:
         ok_bosh, _ = self.runner.step("bosh:teardown", [BOSH, "teardown"], timeout=1800)
         return ok_cf and ok_bosh
 
+    # -- committed run report ---------------------------------------------- #
+
+    def finalize_doc(self, ok: bool) -> bool:
+        """Write docs/certification/e2e/runs/<date>.md + README for this run.
+
+        Skipped under --skip-doc and --dry-run. Returns ok combined with the
+        report-writing step's own success so a failed write is never silent.
+        """
+        if self.args.skip_doc or self.dry_run:
+            self.rep.skip("docs:report", "--skip-doc" if self.args.skip_doc else "dry-run")
+            return ok
+        t0 = time.monotonic()
+        self.rep.begin("docs:report")
+        try:
+            meta = self._run_meta(ok)
+            phases = [
+                {"name": n, "seconds": s}
+                for n, s in self.rep.sections_snapshot()
+            ]
+            steps = [
+                {"name": r.name, "status": r.status, "seconds": r.seconds}
+                for r in self.rep.results
+            ]
+            doc = write_run_doc(meta, phases=phases, steps=steps)
+            summary = write_summary_doc()
+        except (OSError, ValueError) as exc:
+            self.rep.record("docs:report", FAIL, time.monotonic() - t0, str(exc))
+            return False
+        self.rep.record(
+            "docs:report", PASS, time.monotonic() - t0, f"{doc} + {summary}"
+        )
+        return ok
+
+    def _run_meta(self, ok: bool) -> dict:
+        """Assemble the committed-report metadata for this run.
+
+        Committed reports are clean by construction: versions, step and phase
+        names, and durations only. No IP addresses, no hostnames, and no CIDs.
+        """
+        totals = {PASS: 0, FAIL: 0, SKIP: 0}
+        for r in self.rep.results:
+            totals[r.status] = totals.get(r.status, 0) + 1
+        if not self.rep.results:
+            # The harness broke before any step completed; nothing was
+            # asserted, so nothing passed or failed.
+            verdict = "UNKNOWN"
+        elif totals[FAIL] or not ok:
+            verdict = "FAILED"
+        else:
+            verdict = "PASSED"
+
+        ok_cap, out = self.runner.capture(
+            "git-describe",
+            ["git", "describe", "--tags", "--always", "--dirty"], timeout=30,
+        )
+        cpi_version = out.strip() if ok_cap else "unknown"
+
+        pve_version = "unknown"
+        try:
+            cpi_cfg = _integration.build_cpi_config(self.cfg, dry_run=False)
+            data = _integration.pve_api_get(cpi_cfg, "/version")
+            if isinstance(data, dict) and data.get("version"):
+                pve_version = str(data["version"])
+        except (RuntimeError, SystemExit, ValueError):
+            pass
+
+        stemcell = "unknown"
+        url = _rundoc.layered_var(self.env_name, "/stemcell_url")
+        if url:
+            stemcell = url.rstrip("/").rsplit("/", 1)[-1] or "unknown"
+
+        # Selection flags change what the report covers, so the report has to
+        # carry them: a partial run must not read like a full-flow run.
+        flags = [f"--env {self.env_name}"]
+        if self.args.clean:
+            flags.append("--clean")
+        if self.args.skip_build:
+            flags.append("--skip-build")
+        if getattr(self.args, "with_artifacts", False):
+            flags.append("--with-artifacts")
+        if self.app != DEFAULT_APP:
+            flags.append(f"--app {self.app}")
+
+        cmd = self.args.command
+        started = time.localtime(self.rep.started)
+        return {
+            "date": time.strftime("%Y-%m-%d", started),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S", started),
+            "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "wall_hms": fmt_hms(time.time() - self.rep.started),
+            "command_line": f"./scripts/e2e {cmd} " + " ".join(flags),
+            "doc_suffix": "" if cmd == "all" else f"-{cmd}",
+            "exit_code": self.rep.exit_code(),
+            "verdict": verdict,
+            "command": cmd,
+            "steps_passed": totals[PASS],
+            "steps_failed": totals[FAIL],
+            "steps_skipped": totals[SKIP],
+            "cpi_version": cpi_version,
+            "pve_version": pve_version,
+            "stemcell": stemcell,
+            "env": self.env_name,
+        }
+
 
 # --------------------------------------------------------------------------- #
 # Command dispatch
@@ -570,6 +784,10 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
     e2e = E2E(args, rep)
     cmd = args.command
 
+    # Every test-bearing command finishes by writing the committed run report
+    # (docs/certification/e2e/). A failed preflight writes none — there is no
+    # run to record — and a pure teardown asserts nothing, so it writes none
+    # either.
     if cmd == "all":
         if args.clean:
             if not args.dry_run and not confirm_destructive(args, "--clean teardown"):
@@ -579,18 +797,20 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
                 return False
         if not e2e.preflight(need_director=True, need_cf=True, need_cpi=True):
             return False
-        return (
+        ok = (
             e2e.run_lifecycle_with_artifacts()
             and e2e.bootstrap_director()
             and e2e.cf_deploy()
             and e2e.cf_push()
             and e2e.cf_ssh()
         )
+        return e2e.finalize_doc(ok)
 
     if cmd == "bootstrap":
         if not e2e.preflight(need_director=True, need_cf=True, need_cpi=False):
             return False
-        return e2e.artifacts_bootstrap() and e2e.bootstrap_director() and e2e.cf_deploy()
+        ok = e2e.artifacts_bootstrap() and e2e.bootstrap_director() and e2e.cf_deploy()
+        return e2e.finalize_doc(ok)
 
     if cmd == "teardown":
         if not args.dry_run and not confirm_destructive(args, "teardown"):
@@ -601,22 +821,22 @@ def run_command(args: argparse.Namespace, rep: Reporter) -> bool:
     if cmd == "lifecycle":
         if not e2e.preflight(need_director=False, need_cf=False, need_cpi=True):
             return False
-        return e2e.lifecycle()
+        return e2e.finalize_doc(e2e.lifecycle())
 
     if cmd == "cf-deploy":
         if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
             return False
-        return e2e.cf_deploy()
+        return e2e.finalize_doc(e2e.cf_deploy())
 
     if cmd == "cf-push":
         if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
             return False
-        return e2e.cf_push()
+        return e2e.finalize_doc(e2e.cf_push())
 
     if cmd == "cf-ssh":
         if not e2e.preflight(need_director=False, need_cf=True, need_cpi=False):
             return False
-        return e2e.cf_ssh()
+        return e2e.finalize_doc(e2e.cf_ssh())
 
     raise ValueError(f"unhandled command: {cmd}")
 
@@ -679,6 +899,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--app", default=DEFAULT_APP)
     p.add_argument("--ssh-cmd", default=None)
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    p.add_argument("--skip-doc", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-color", action="store_true")
     p.add_argument(

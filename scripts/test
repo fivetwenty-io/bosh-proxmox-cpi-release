@@ -21,6 +21,7 @@ Integration flags:
     --config FILE   Path to integration config YAML (default: ci/integration.yml).
     --dry-run       Print each command without executing; exit 0.
     --keep          Skip cleanup steps after each tier (leave resources running).
+    --skip-doc      Do not write docs/certification/lifecycle/ report documents.
     --yes, -y       Skip the DESTRUCTIVE confirmation prompt for 'all' (required in CI/non-TTY).
 """
 
@@ -145,6 +146,12 @@ def run_with_retries(
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
+import _rundoc  # noqa: E402
+from _report import fmt_hms  # noqa: E402
+
+DOCS_LIFECYCLE_DIR = REPO_ROOT / "docs" / "certification" / "lifecycle"
+LIFECYCLE_RUNS_DIR = DOCS_LIFECYCLE_DIR / "runs"
+LIFECYCLE_RUN_META_MARK = "lifecycle-run-meta"
 
 
 # ---------------------------------------------------------------------------
@@ -152,17 +159,68 @@ import _lightstemcell  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
+def _run_lifecycle_pass(passes: list[dict], name: str, env: dict) -> int:
+    """Run one scripts/lifecycle pass, recording name/status/seconds for the
+    committed run report."""
+    t0 = time.monotonic()
+    rc = run(["./scripts/lifecycle"], env=env, cwd=REPO_ROOT, check=False)
+    passes.append({
+        "name": name,
+        "status": "PASS" if rc == 0 else "FAIL",
+        "seconds": time.monotonic() - t0,
+    })
+    return rc
+
+
+def tier_lifecycle(
+    cfg: dict,
+    cpi_config_path: str,
+    keep: bool,
+    doc_ctx: "dict | None" = None,
+) -> int:
     """Build bin/cpi then run scripts/lifecycle with the Tier 1 env.
+
+    Runs the base pass plus the per-pool, per-network-mode, and
+    snapshot-bypass passes, then writes the committed run report under
+    docs/certification/lifecycle/ (unless doc_ctx disables it).
 
     Args:
         cfg:             Validated config dict.
         cpi_config_path: Path to the synthesized CPI JSON config.
         keep:            Unused for lifecycle (lifecycle self-cleans).
+        doc_ctx:         Report context: {"skip_doc": bool, "command_line":
+                         str, "config": str}. None writes no report (used by
+                         tests importing this module directly).
 
     Returns:
         0 on success, 1 on failure.
     """
+    started = time.time()
+    passes: list[dict] = []
+    try:
+        rc = _lifecycle_passes(cfg, cpi_config_path, keep, passes)
+    except subprocess.CalledProcessError as exc:
+        # A checked helper step (e.g. make bin/cpi) failed before or between
+        # passes; record the harness failure so the report still lands.
+        print(
+            f"step failed with exit code {exc.returncode}: {shlex.join(exc.cmd)}",
+            file=sys.stderr,
+        )
+        rc = 1
+    if doc_ctx is not None and not doc_ctx.get("skip_doc") and not _dry_run:
+        try:
+            meta = _lifecycle_run_meta(cfg, passes, rc, started, doc_ctx)
+            doc, summary = _write_lifecycle_docs(meta, passes)
+            print(f"==> tier 1: wrote {doc} + {summary}")
+        except Exception as exc:  # noqa: BLE001 — the report must never fail the run
+            print(f"warn: could not write lifecycle run report: {exc}", file=sys.stderr)
+    return rc
+
+
+def _lifecycle_passes(
+    cfg: dict, cpi_config_path: str, keep: bool, passes: list[dict],
+) -> int:
+    """The lifecycle pass sequence, appending a record per executed pass."""
     print("==> tier 1: lifecycle")
 
     rc = run(["make", "bin/cpi"], cwd=REPO_ROOT)
@@ -215,7 +273,7 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         pools = list(raw_pools)
 
     if not pools:
-        rc = run(["./scripts/lifecycle"], env=t1_env, cwd=REPO_ROOT)
+        rc = _run_lifecycle_pass(passes, "base", t1_env)
         if rc != 0:
             print("tier 1 failed: scripts/lifecycle", file=sys.stderr)
             return 1
@@ -233,7 +291,7 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
                 )
                 pool_env = {**t1_env, "CPI_CONFIG": pool_cfg}
                 print(f"==> tier 1: lifecycle [{pool}]")
-                rc = run(["./scripts/lifecycle"], env=pool_env, cwd=REPO_ROOT)
+                rc = _run_lifecycle_pass(passes, f"pool:{pool}", pool_env)
             finally:
                 if not _dry_run:
                     Path(pool_cfg).unlink(missing_ok=True)
@@ -309,7 +367,7 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
                 "NETWORK_TEST_MODE": lifecycle_mode,
                 **(p.get("env") or {}),
             }
-            rc = run(["./scripts/lifecycle"], env=mode_env, cwd=REPO_ROOT)
+            rc = _run_lifecycle_pass(passes, f"network:{mode}", mode_env)
         finally:
             if tmp_cfg is not None:
                 Path(tmp_cfg).unlink(missing_ok=True)
@@ -326,10 +384,9 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
         print("==> tier 1: lifecycle pass (SNAPSHOT_DETACH_MODE=bypass)")
         if _dry_run:
             print("==> tier 1: would write CPI config with allow_disk_ops_with_snapshots=true")
-            rc = run(
-                ["./scripts/lifecycle"],
-                env={**t1_env, "SNAPSHOT_DETACH_MODE": "bypass"},
-                cwd=REPO_ROOT,
+            rc = _run_lifecycle_pass(
+                passes, "snapshot-detach-bypass",
+                {**t1_env, "SNAPSHOT_DETACH_MODE": "bypass"},
             )
         else:
             fd, bypass_cfg = tempfile.mkstemp(prefix="cpi-snap-bypass-", suffix=".json")
@@ -338,10 +395,9 @@ def tier_lifecycle(cfg: dict, cpi_config_path: str, keep: bool) -> int:
                 _integration.write_cpi_config(
                     cfg, bypass_cfg, dry_run=False, allow_disk_ops_with_snapshots=True
                 )
-                rc = run(
-                    ["./scripts/lifecycle"],
-                    env={**t1_env, "CPI_CONFIG": bypass_cfg, "SNAPSHOT_DETACH_MODE": "bypass"},
-                    cwd=REPO_ROOT,
+                rc = _run_lifecycle_pass(
+                    passes, "snapshot-detach-bypass",
+                    {**t1_env, "CPI_CONFIG": bypass_cfg, "SNAPSHOT_DETACH_MODE": "bypass"},
                 )
             finally:
                 Path(bypass_cfg).unlink(missing_ok=True)
@@ -359,6 +415,153 @@ def _cfg_with_stemcell(cfg: dict, path: str) -> dict:
     cfg2 = copy.deepcopy(cfg)
     cfg2["tier1"]["stemcell_path"] = path
     return cfg2
+
+
+def _lifecycle_run_meta(
+    cfg: dict, passes: list[dict], rc: int, started: float, doc_ctx: dict,
+) -> dict:
+    """Assemble the committed-report metadata for a lifecycle run.
+
+    Committed reports are clean by construction: versions, pass names, pool
+    and mode names, and durations only. No IP addresses, no hostnames, and
+    no CIDs.
+    """
+    failed = sum(1 for p in passes if p["status"] != "PASS")
+    if not passes:
+        # The harness broke before any pass completed (build or autodetect
+        # failure); nothing was asserted, so nothing passed or failed.
+        verdict = "UNKNOWN"
+    elif failed:
+        verdict = "FAILED"
+    else:
+        verdict = "PASSED" if rc == 0 else "FAILED"
+
+    proc = subprocess.run(
+        ["git", "describe", "--tags", "--always", "--dirty"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    cpi_version = proc.stdout.strip() if proc.returncode == 0 else "unknown"
+
+    pve_version = "unknown"
+    try:
+        cpi_cfg = _integration.build_cpi_config(cfg, dry_run=False)
+        data = _integration.pve_api_get(cpi_cfg, "/version")
+        if isinstance(data, dict) and data.get("version"):
+            pve_version = str(data["version"])
+    except (RuntimeError, SystemExit, ValueError):
+        pass
+
+    stemcell = "unknown"
+    try:
+        stemcell = Path(_integration.stemcell_path(cfg)).name
+    except (RuntimeError, SystemExit, ValueError):
+        pass
+
+    return {
+        "date": time.strftime("%Y-%m-%d", time.localtime(started)),
+        "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+        "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "wall_hms": fmt_hms(time.time() - started),
+        "command_line": doc_ctx.get("command_line", "./scripts/test integration lifecycle"),
+        "exit_code": rc,
+        "verdict": verdict,
+        "passes_run": len(passes),
+        "passes_failed": failed,
+        "cpi_version": cpi_version,
+        "pve_version": pve_version,
+        "stemcell": stemcell,
+        "config": doc_ctx.get("config", "ci/integration.yml"),
+    }
+
+
+def _write_lifecycle_docs(meta: dict, passes: list[dict]) -> "tuple[Path, Path]":
+    """Write docs/certification/lifecycle/runs/<date>.md + README.md."""
+    doc = _rundoc.write_run_doc(
+        runs_dir=LIFECYCLE_RUNS_DIR,
+        meta=meta,
+        meta_mark=LIFECYCLE_RUN_META_MARK,
+        title=f"Lifecycle Run Report: {meta['date']}",
+        provenance=(
+            "`./scripts/test integration lifecycle` generated this report from "
+            "a live run of the CPI lifecycle harness (`scripts/lifecycle`) "
+            "against a Proxmox VE lab. The harness exercises every CPI method "
+            "a BOSH Director calls during a deploy, redeploy, and teardown "
+            "cycle, one pass per configured disk storage pool, network mode, "
+            "and snapshot-detach mode. See "
+            "[BOSH CPI Certification](../../index.md) for how we run it."
+        ),
+        verdict_lines=[
+            f"**Result: {meta['verdict']}.** {meta['passes_run']} lifecycle "
+            f"passes run, {meta['passes_failed']} failed.",
+            "",
+        ] + _rundoc.run_meta_bullets(meta),
+        timings_intro=[
+            "Each step below is one full pass of the lifecycle harness under "
+            "the named configuration: `base` uses the synthesized CPI config "
+            "as-is, `pool:` passes override the disk storage pool, `network:` "
+            "passes exercise create_network and delete_network under the "
+            "named mode, and `snapshot-detach-bypass` detaches with a "
+            "snapshot still present.",
+            "",
+        ],
+        steps=passes,
+        env_table=[
+            ("CPI release", "cpi_version"),
+            ("Proxmox VE", "pve_version"),
+            ("Stemcell", "stemcell"),
+            ("Config", "config"),
+        ],
+        artifacts_lines=[
+            "The harness streams its output to the console and keeps no "
+            "machine-readable artifacts. This document is the committed "
+            "record.",
+            "",
+        ],
+    )
+    summary = write_lifecycle_summary_doc()
+    return doc, summary
+
+
+def write_lifecycle_summary_doc() -> Path:
+    """Regenerate docs/certification/lifecycle/README.md from the run history."""
+    return _rundoc.write_summary_doc(
+        docs_dir=DOCS_LIFECYCLE_DIR,
+        runs_dir=LIFECYCLE_RUNS_DIR,
+        meta_mark=LIFECYCLE_RUN_META_MARK,
+        title="CPI Lifecycle Harness",
+        intro=(
+            "The CPI lifecycle harness (`scripts/lifecycle`) exercises every "
+            "CPI method a BOSH Director calls during a deploy, redeploy, and "
+            "teardown cycle, end to end against a live Proxmox VE cluster. We "
+            "run it with `./scripts/test integration lifecycle`, which adds "
+            "one pass per configured disk storage pool, network mode, and "
+            "snapshot-detach mode; the "
+            "[certification hub](../index.md) documents the setup and "
+            "invocation."
+        ),
+        latest_headline=lambda latest: (
+            f"**{latest['verdict']}** on {latest['date']}: "
+            f"{latest.get('passes_run', '?')} passes run, "
+            f"{latest.get('passes_failed', '?')} failed, in "
+            f"{latest.get('wall_hms', '?')}. "
+            f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
+        ),
+        latest_table=[
+            ("CPI release", "cpi_version"),
+            ("Proxmox VE", "pve_version"),
+            ("Stemcell", "stemcell"),
+            ("Config", "config"),
+        ],
+        history_header=[
+            "| Date | Result | Passes | Failed | Wall clock | Report |",
+            "|---|---|---|---|---|---|",
+        ],
+        history_row=lambda meta: (
+            f"| {meta['date']} | {meta['verdict']} | "
+            f"{meta.get('passes_run', '?')} | {meta.get('passes_failed', '?')} | "
+            f"{meta.get('wall_hms', '?')} | [runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+        ),
+    )
 
 
 # Tracks whether an atexit resurrection-re-enable callback has been registered
@@ -918,6 +1121,11 @@ def cmd_integration(argv: list[str]) -> int:
         help="Skip cleanup after each tier (leave resources running).",
     )
     parser.add_argument(
+        "--skip-doc",
+        action="store_true",
+        help="Do not write docs/certification/lifecycle/ report documents.",
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         "--force",
@@ -1001,6 +1209,20 @@ def cmd_integration(argv: list[str]) -> int:
     tiers = cfg.get("tiers", {})
     keep = args.keep
 
+    # Report context for the lifecycle tier's committed run document. The
+    # command line is reproduced in the report so a partial or non-default
+    # invocation never reads like a full certification run.
+    command_line = f"./scripts/test integration {args.action}"
+    if args.config != "ci/integration.yml":
+        command_line += f" --config {args.config}"
+    if args.keep:
+        command_line += " --keep"
+    doc_ctx = {
+        "skip_doc": args.skip_doc,
+        "command_line": command_line,
+        "config": args.config,
+    }
+
     try:
         if args.action == "teardown":
             return teardown(cfg)
@@ -1009,7 +1231,7 @@ def cmd_integration(argv: list[str]) -> int:
             if not tiers.get("lifecycle", True):
                 print("tier lifecycle disabled in config; skipping")
                 return 0
-            return tier_lifecycle(cfg, cpi_config_path, keep)
+            return tier_lifecycle(cfg, cpi_config_path, keep, doc_ctx)
 
         if args.action == "bosh":
             if not tiers.get("bosh", True):
@@ -1062,7 +1284,7 @@ def cmd_integration(argv: list[str]) -> int:
             return rc
 
         if tiers.get("lifecycle", True):
-            rc = tier_lifecycle(cfg, cpi_config_path, keep)
+            rc = tier_lifecycle(cfg, cpi_config_path, keep, doc_ctx)
             if rc != 0:
                 return rc
 

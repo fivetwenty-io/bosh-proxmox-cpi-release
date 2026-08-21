@@ -2,7 +2,7 @@
 
 Four paths exist for certifying this CPI release against the BOSH CPI v2 contract. Each covers a surface the one before it does not.
 
-1. **Local lifecycle harness**: `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, and no full BOSH director required. **Recommended for day-to-day development and pre-merge validation.**
+1. **Local lifecycle harness**: `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, and no full BOSH director required. Driven through `./scripts/test integration lifecycle`, it records a committed run report under `docs/certification/lifecycle/` (see [Lifecycle results](lifecycle/README.md)). **Recommended for day-to-day development and pre-merge validation.**
 
 2. **Local BOSH Acceptance Tests**: `scripts/bats` in this repo. Runs the upstream [BOSH Acceptance Test](https://github.com/cloudfoundry/bosh-acceptance-tests) rspec suite against the live director the e2e harness stands up, with the PVE tag-exclusion set, and records a committed run report under `docs/certification/bats/`. See [Running BATS](bats.md). **Recommended before cutting a release.**
 
@@ -11,6 +11,8 @@ Four paths exist for certifying this CPI release against the BOSH CPI v2 contrac
 4. **Upstream Concourse pipeline**: [`cloudfoundry/bosh-cpi-certification`](https://github.com/cloudfoundry/bosh-cpi-certification). Runs the BAT suite and the director-upgrade test in CI. No `pve/` directory exists upstream yet; adding one is future work (see [Upstream Path](#upstream-path) below).
 
 The first three run locally against a lab. Together they cover the CPI method surface, the director contract at one CPI version, and the director contract across two CPI versions. The fourth adds continuous automation on top.
+
+Alongside these, `./scripts/e2e` runs the full-stack end-to-end flow: it bootstraps a BOSH director and CloudFoundry from nothing, then exercises the CPI lifecycle, a real `cf push`, and a real `cf ssh`. It proves more than the CPI contract, so we track its committed run reports beside the certification paths, under `docs/certification/e2e/` (see [End-to-end results](e2e/README.md)).
 
 ## Local Lifecycle Harness
 
@@ -58,6 +60,8 @@ export CPI_CONFIG=~/.bosh-pve-cpi/cpi.json
 export STEMCELL_PATH=/path/to/bosh-stemcell-*-pve-ubuntu-jammy-go_agent.tgz
 ./scripts/lifecycle
 ```
+
+Running the harness through `./scripts/test integration lifecycle` instead adds one pass per configured disk storage pool, network mode, and snapshot-detach mode, and writes the committed run report under `docs/certification/lifecycle/runs/` plus the regenerated [Lifecycle results](lifecycle/README.md) summary. Pass `--skip-doc` to leave the documents untouched.
 
 Optional overrides:
 

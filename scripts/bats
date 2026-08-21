@@ -74,7 +74,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -89,6 +88,14 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import _checkouts  # noqa: E402
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
+import _rundoc  # noqa: E402
+from _rundoc import (  # noqa: E402
+    ScrubbedLog,
+    _bosh_int_opt,
+    _md_escape,
+    layered_var,
+    stemcell_manifest,
+)
 from _report import (  # noqa: E402
     FAIL,
     PASS,
@@ -181,85 +188,6 @@ DUAL_STACK_TAGS: dict[str, str] = {
     "dual_stack": _AGENT_STATIC_DUAL_STACK_REASON,
     "multiple_manual_networks": _IPV4_PASS_REASON,
 }
-
-
-# --------------------------------------------------------------------------- #
-# Small helpers
-# --------------------------------------------------------------------------- #
-
-def _bosh_int_opt(path: Path, json_path: str) -> "str | None":
-    """bosh int --path, returning None when the file or path is absent."""
-    if not path.exists():
-        return None
-    proc = subprocess.run(
-        ["bosh", "int", str(path), "--path", json_path],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.rstrip("\n")
-
-
-def env_vars_file(env_name: str) -> "Path | None":
-    """manifests/envs/<env>/vars.yml when it exists (mirrors scripts/bosh)."""
-    f = ENVS_DIR / env_name / "vars.yml"
-    return f if f.exists() else None
-
-
-def layered_var(env_name: str, json_path: str) -> "str | None":
-    """Read a vars key with env-bundle layering: env vars.yml wins, base
-    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh)."""
-    env_f = env_vars_file(env_name)
-    if env_f is not None:
-        v = _bosh_int_opt(env_f, json_path)
-        if v is not None:
-            return v
-    return _bosh_int_opt(BOSH_VARS, json_path)
-
-
-def stemcell_manifest(path: Path) -> dict:
-    """Read stemcell.MF (name, version, ...) from a stemcell tarball."""
-    with tarfile.open(path, "r:gz") as tf:
-        member = None
-        for name in ("stemcell.MF", "./stemcell.MF"):
-            try:
-                member = tf.getmember(name)
-                break
-            except KeyError:
-                continue
-        if member is None:
-            raise ValueError(f"no stemcell.MF inside {path}")
-        fh = tf.extractfile(member)
-        assert fh is not None
-        return yaml.safe_load(fh.read())
-
-
-class ScrubbedLog:
-    """File-like wrapper that redacts private-key blocks from a console log.
-
-    BATS prints the full deployment spec, which includes the run's ephemeral
-    ssh private key; the console capture should not persist it.
-    """
-
-    def __init__(self, fh: "IO[str]") -> None:
-        self.fh = fh
-        self._in_key = False
-
-    def write(self, line: str) -> None:
-        is_begin = "-----BEGIN" in line and "PRIVATE KEY" in line
-        is_end = "-----END" in line and "PRIVATE KEY" in line
-        if is_begin:
-            self.fh.write("[private key scrubbed]\n")
-            self._in_key = not is_end
-            return
-        if self._in_key:
-            if is_end:
-                self._in_key = False
-            return
-        self.fh.write(line)
-
-    def flush(self) -> None:
-        self.fh.flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -646,10 +574,6 @@ def merge_rspec_junit(paths: "list[Path]") -> "dict | None":
     return merged
 
 
-def _md_escape(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ")
-
-
 def write_run_doc(
     meta: dict,
     rspec: "dict | None",
@@ -662,212 +586,138 @@ def write_run_doc(
     (sections: name/seconds, results: name/status/seconds), so the doc can
     be regenerated from a prior run's artifacts.
     """
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    date = meta["date"]
-    # A targeted run covers a slice of the suite, so it gets its own file
-    # rather than overwriting the day's certification report.
-    suffix = meta.get("doc_suffix") or ""
-    doc = RUNS_DIR / f"{date}{suffix}.md"
-
     verdict = meta["verdict"]
-    lines: list[str] = []
-    lines.append(f"# BATS Run Report: {date}")
-    lines.append("")
-    lines.append(f"<!-- {RUN_META_MARK} {json.dumps(meta, sort_keys=True)} -->")
-    lines.append("")
-    lines.append(
-        "`./scripts/bats` generated this report from a live run of the "
-        "[BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
-        "against a Proxmox VE lab. See [Running BATS](../../bats.md) for how we "
-        "run the suite."
-    )
-    lines.append("")
-    lines.append("## Verdict")
-    lines.append("")
     if rspec:
-        lines.append(
+        headline = (
             f"**Result: {verdict}.** {rspec['tests']} examples, "
             f"{rspec['failures']} failures, {rspec['errors']} errors, and "
             f"{rspec['skipped']} skipped."
         )
     else:
-        lines.append(f"**Result: {verdict}.** No rspec results were produced.")
-    lines.append("")
-    lines.append(f"- Wall clock: {meta['wall_hms']} ({meta['started']} to {meta['finished']})")
-    lines.append("")
-    lines.append(f"- Command: `{meta['command_line']}`")
-    lines.append("")
-    lines.append(f"- Exit code: {meta['exit_code']}")
-    lines.append("")
-    if phases or steps:
-        lines.append("## Timings")
-        lines.append("")
-        lines.append(
-            "The wall clock above covers the whole run. The tables below "
-            "break it down by phase and by harness step; per-example "
-            "durations appear in the Examples table. The report and "
-            "artifact writing steps run after this report is rendered, so "
-            "they are not listed."
-        )
-        lines.append("")
-        if phases:
-            lines.append("| Phase | Duration |")
-            lines.append("|---|---|")
-            for ph in phases:
-                lines.append(
-                    f"| {_md_escape(ph['name'])} | {fmt_hms(ph['seconds'])} |"
-                )
-            lines.append("")
-        if steps:
-            lines.append("| Step | Result | Duration |")
-            lines.append("|---|---|---|")
-            for st in steps:
-                dur = "-" if st["status"] == SKIP else fmt_hms(st["seconds"])
-                lines.append(
-                    f"| {_md_escape(st['name'])} | {st['status']} | {dur} |"
-                )
-            lines.append("")
-    lines.append("## Environment")
-    lines.append("")
-    lines.append("| Item | Value |")
-    lines.append("|---|---|")
-    for label, key in (
-        ("CPI release", "cpi_version"),
-        ("BATS revision", "bats_ref"),
-        ("BOSH director", "director_version"),
-        ("Stemcell", "stemcell"),
-        ("Stemcell source", "stemcell_mode"),
-        ("Proxmox VE", "pve_version"),
-        ("Ruby", "ruby_version"),
-        ("Env bundle", "env"),
-        ("Dual stack", "dual_stack"),
-    ):
-        value = meta.get(key) or "unknown"
-        lines.append(f"| {label} | {_md_escape(str(value))} |")
-    lines.append("")
-    lines.append("## Tag exclusions")
-    lines.append("")
+        headline = f"**Result: {verdict}.** No rspec results were produced."
+
+    extra: list[str] = []
+    extra.append("## Tag exclusions")
+    extra.append("")
     if meta["excluded_tags"]:
-        lines.append(
+        extra.append(
             "We excluded the following rspec tags. Every IaaS provider excludes "
             "the capability tags that do not map to its platform; the table below "
             "lists each exclusion with its reason so the covered surface stays "
             "explicit."
         )
-        lines.append("")
-        lines.append("| Tag | Reason |")
-        lines.append("|---|---|")
+        extra.append("")
+        extra.append("| Tag | Reason |")
+        extra.append("|---|---|")
         for tag in sorted(meta["excluded_tags"]):
             reason = meta["excluded_reasons"].get(tag, "operator-supplied exclusion")
-            lines.append(f"| `{tag}` | {_md_escape(reason)} |")
+            extra.append(f"| `{tag}` | {_md_escape(reason)} |")
     else:
-        lines.append("No tags were excluded.")
-    lines.append("")
-    lines.append("## Examples")
-    lines.append("")
+        extra.append("No tags were excluded.")
+    extra.append("")
+    extra.append("## Examples")
+    extra.append("")
     if rspec and rspec["cases"]:
-        lines.append("| Example | Status | Duration |")
-        lines.append("|---|---|---|")
+        extra.append("| Example | Status | Duration |")
+        extra.append("|---|---|---|")
         for case in rspec["cases"]:
             status = case["status"].upper()
-            lines.append(
+            extra.append(
                 f"| {_md_escape(case['name'])} | {status} | {fmt_hms(case['seconds'])} |"
             )
     else:
-        lines.append("No example-level results were captured.")
-    lines.append("")
-    lines.append("## Artifacts")
-    lines.append("")
-    lines.append(
-        "The runner writes this run's machine-readable artifacts (rspec "
-        "junit.xml, harness results.json, and the full console log) to the "
-        "gitignored `.e2e-results/` directory; it does not commit them. This "
-        "document is the committed record."
+        extra.append("No example-level results were captured.")
+    extra.append("")
+
+    return _rundoc.write_run_doc(
+        runs_dir=RUNS_DIR,
+        meta=meta,
+        meta_mark=RUN_META_MARK,
+        title=f"BATS Run Report: {meta['date']}",
+        provenance=(
+            "`./scripts/bats` generated this report from a live run of the "
+            "[BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
+            "against a Proxmox VE lab. See [Running BATS](../../bats.md) for how we "
+            "run the suite."
+        ),
+        verdict_lines=[headline, ""] + _rundoc.run_meta_bullets(meta),
+        timings_intro=[
+            "The wall clock above covers the whole run. The tables below "
+            "break it down by phase and by harness step; per-example "
+            "durations appear in the Examples table. The report and "
+            "artifact writing steps run after this report is rendered, so "
+            "they are not listed.",
+            "",
+        ],
+        phases=phases,
+        steps=steps,
+        skip_duration_dash=True,
+        env_table=[
+            ("CPI release", "cpi_version"),
+            ("BATS revision", "bats_ref"),
+            ("BOSH director", "director_version"),
+            ("Stemcell", "stemcell"),
+            ("Stemcell source", "stemcell_mode"),
+            ("Proxmox VE", "pve_version"),
+            ("Ruby", "ruby_version"),
+            ("Env bundle", "env"),
+            ("Dual stack", "dual_stack"),
+        ],
+        extra_sections=extra,
+        artifacts_lines=[
+            "The runner writes this run's machine-readable artifacts (rspec "
+            "junit.xml, harness results.json, and the full console log) to the "
+            "gitignored `.e2e-results/` directory; it does not commit them. This "
+            "document is the committed record.",
+            "",
+        ],
+        # A targeted run covers a slice of the suite, so it gets its own file
+        # rather than overwriting the day's certification report.
+        doc_suffix=meta.get("doc_suffix") or "",
     )
-    lines.append("")
-    doc.write_text("\n".join(lines))
-    return doc
-
-
-def _collect_run_history() -> list[dict]:
-    """Read the metadata comment from every committed run document."""
-    history: list[dict] = []
-    if not RUNS_DIR.is_dir():
-        return history
-    pattern = re.compile(rf"<!-- {RUN_META_MARK} (\{{.*\}}) -->")
-    for doc in sorted(RUNS_DIR.glob("*.md")):
-        match = pattern.search(doc.read_text())
-        if not match:
-            continue
-        try:
-            meta = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        meta["_doc"] = doc.name
-        history.append(meta)
-    history.sort(key=lambda m: m.get("date", ""), reverse=True)
-    return history
 
 
 def write_summary_doc() -> Path:
     """Regenerate docs/certification/bats/README.md from the run history."""
-    DOCS_BATS_DIR.mkdir(parents=True, exist_ok=True)
-    history = _collect_run_history()
-    latest = history[0] if history else None
-
-    lines: list[str] = []
-    lines.append("# BOSH Acceptance Tests")
-    lines.append("")
-    lines.append(
-        "The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
-        "(BATS) exercise a live BOSH director end to end through the CPI under "
-        "test: deploys, recreates, persistent disks, cloud-check resolutions, "
-        "manual networking with static IP changes, and the stemcell's agent "
-        "and supervision contract. We run the suite against a Proxmox VE lab "
-        "with `./scripts/bats`; [Running BATS](../bats.md) documents the "
-        "setup and invocation."
-    )
-    lines.append("")
-    if latest:
-        lines.append("## Latest run")
-        lines.append("")
-        lines.append(
+    return _rundoc.write_summary_doc(
+        docs_dir=DOCS_BATS_DIR,
+        runs_dir=RUNS_DIR,
+        meta_mark=RUN_META_MARK,
+        title="BOSH Acceptance Tests",
+        intro=(
+            "The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
+            "(BATS) exercise a live BOSH director end to end through the CPI under "
+            "test: deploys, recreates, persistent disks, cloud-check resolutions, "
+            "manual networking with static IP changes, and the stemcell's agent "
+            "and supervision contract. We run the suite against a Proxmox VE lab "
+            "with `./scripts/bats`; [Running BATS](../bats.md) documents the "
+            "setup and invocation."
+        ),
+        latest_headline=lambda latest: (
             f"**{latest['verdict']}** on {latest['date']}: "
             f"{latest.get('examples', '?')} examples, "
             f"{latest.get('failures', '?')} failures, "
             f"{latest.get('skipped', '?')} skipped, in "
             f"{latest.get('wall_hms', '?')}. "
             f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
-        )
-        lines.append("")
-        lines.append("| Item | Value |")
-        lines.append("|---|---|")
-        for label, key in (
+        ),
+        latest_table=[
             ("CPI release", "cpi_version"),
             ("BATS revision", "bats_ref"),
             ("BOSH director", "director_version"),
             ("Stemcell", "stemcell"),
             ("Proxmox VE", "pve_version"),
-        ):
-            lines.append(f"| {label} | {_md_escape(str(latest.get(key) or 'unknown'))} |")
-        lines.append("")
-    lines.append("## Run history")
-    lines.append("")
-    if history:
-        lines.append("| Date | Result | Examples | Failures | Wall clock | Report |")
-        lines.append("|---|---|---|---|---|---|")
-        for meta in history:
-            lines.append(
-                f"| {meta['date']} | {meta['verdict']} | "
-                f"{meta.get('examples', '?')} | {meta.get('failures', '?')} | "
-                f"{meta.get('wall_hms', '?')} | [runs/{meta['_doc']}](runs/{meta['_doc']}) |"
-            )
-    else:
-        lines.append("No runs recorded yet.")
-    lines.append("")
-    out = DOCS_BATS_DIR / "README.md"
-    out.write_text("\n".join(lines))
-    return out
+        ],
+        history_header=[
+            "| Date | Result | Examples | Failures | Wall clock | Report |",
+            "|---|---|---|---|---|---|",
+        ],
+        history_row=lambda meta: (
+            f"| {meta['date']} | {meta['verdict']} | "
+            f"{meta.get('examples', '?')} | {meta.get('failures', '?')} | "
+            f"{meta.get('wall_hms', '?')} | [runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

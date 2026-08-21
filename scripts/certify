@@ -93,7 +93,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 import urllib.request
 from pathlib import Path
@@ -108,6 +107,15 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import _checkouts  # noqa: E402
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
+import _rundoc  # noqa: E402
+from _rundoc import (  # noqa: E402
+    ScrubbedLog,
+    _bosh_int_opt,
+    _md_escape,
+    env_vars_file,
+    layered_var,
+    stemcell_manifest,
+)
 from _report import (  # noqa: E402
     FAIL,
     PASS,
@@ -157,91 +165,12 @@ BOSH_IO_RELEASE = "https://bosh.io/d/github.com/cloudfoundry/bosh?v={version}"
 # Small helpers
 # --------------------------------------------------------------------------- #
 
-def _bosh_int_opt(path: Path, json_path: str) -> "str | None":
-    """bosh int --path, returning None when the file or path is absent."""
-    if not path.exists():
-        return None
-    proc = subprocess.run(
-        ["bosh", "int", str(path), "--path", json_path],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.rstrip("\n")
-
-
-def env_vars_file(env_name: str) -> "Path | None":
-    """manifests/envs/<env>/vars.yml when it exists (mirrors scripts/bosh)."""
-    f = ENVS_DIR / env_name / "vars.yml"
-    return f if f.exists() else None
-
-
-def layered_var(env_name: str, json_path: str) -> "str | None":
-    """Read a vars key with env-bundle layering: env vars.yml wins, base
-    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh)."""
-    env_f = env_vars_file(env_name)
-    if env_f is not None:
-        v = _bosh_int_opt(env_f, json_path)
-        if v is not None:
-            return v
-    return _bosh_int_opt(BOSH_VARS, json_path)
-
-
-def stemcell_manifest(path: Path) -> dict:
-    """Read stemcell.MF (name, version, ...) from a stemcell tarball."""
-    with tarfile.open(path, "r:gz") as tf:
-        member = None
-        for name in ("stemcell.MF", "./stemcell.MF"):
-            try:
-                member = tf.getmember(name)
-                break
-            except KeyError:
-                continue
-        if member is None:
-            raise ValueError(f"no stemcell.MF inside {path}")
-        fh = tf.extractfile(member)
-        assert fh is not None
-        return yaml.safe_load(fh.read())
-
-
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _md_escape(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ")
-
-
-class ScrubbedLog:
-    """File-like wrapper that redacts private-key blocks from a console log.
-
-    `bosh create-env` echoes the jumpbox keypair it generates into the
-    vars-store; the console capture should not persist it.
-    """
-
-    def __init__(self, fh: "IO[str]") -> None:
-        self.fh = fh
-        self._in_key = False
-
-    def write(self, line: str) -> None:
-        is_begin = "-----BEGIN" in line and "PRIVATE KEY" in line
-        is_end = "-----END" in line and "PRIVATE KEY" in line
-        if is_begin:
-            self.fh.write("[private key scrubbed]\n")
-            self._in_key = not is_end
-            return
-        if self._in_key:
-            if is_end:
-                self._in_key = False
-            return
-        self.fh.write(line)
-
-    def flush(self) -> None:
-        self.fh.flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -566,183 +495,113 @@ def write_run_doc(
     steps: "list[dict] | None" = None,
 ) -> Path:
     """Write docs/certification/upgrade/runs/<date>.md and return its path."""
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    date = meta["date"]
-    doc = RUNS_DIR / f"{date}.md"
-
-    lines: list[str] = []
-    lines.append(f"# Director Upgrade Run Report: {date}")
-    lines.append("")
-    lines.append(f"<!-- {RUN_META_MARK} {json.dumps(meta, sort_keys=True)} -->")
-    lines.append("")
-    lines.append(
-        "`./scripts/certify` generated this report from a live run of the "
-        "[BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
-        "suite's Director Upgrade Test against a Proxmox VE lab. See "
-        "[BOSH Director Upgrade Test](../../upgrade.md) for how we run it."
-    )
-    lines.append("")
-    lines.append("## Verdict")
-    lines.append("")
-    lines.append(
-        f"**Result: {meta['verdict']}.** {meta['steps_passed']} steps passed, "
-        f"{meta['steps_failed']} failed, and {meta['steps_skipped']} skipped."
-    )
-    lines.append("")
-    lines.append(
-        "The verdict covers every step through verification. Tearing the lab "
-        "back down happens after this report is written, so the console totals "
-        "at the end of a run carry a few more steps and a longer wall clock "
-        "than the numbers here."
-    )
-    lines.append("")
-    lines.append(
-        f"- Wall clock: {meta['wall_hms']} ({meta['started']} to {meta['finished']})"
-    )
-    lines.append("")
-    lines.append(f"- Command: `{meta['command_line']}`")
-    lines.append("")
-    lines.append(f"- Exit code: {meta['exit_code']}")
-    lines.append("")
-
-    lines.append("## Version matrix")
-    lines.append("")
-    lines.append(
+    pre_timings: list[str] = []
+    pre_timings.append("## Version matrix")
+    pre_timings.append("")
+    pre_timings.append(
         f"Matrix source: {meta.get('matrix_source', 'unknown')}."
     )
-    lines.append("")
-    lines.append("| Leg | Before upgrade | After upgrade |")
-    lines.append("|---|---|---|")
-    lines.append(
+    pre_timings.append("")
+    pre_timings.append("| Leg | Before upgrade | After upgrade |")
+    pre_timings.append("|---|---|---|")
+    pre_timings.append(
         f"| CPI release | {_md_escape(meta['old_cpi'])} | {_md_escape(meta['new_cpi'])} |"
     )
-    lines.append(
+    pre_timings.append(
         f"| bosh release | {_md_escape(meta['old_bosh'])} | {_md_escape(meta['new_bosh'])} |"
     )
-    lines.append(
+    pre_timings.append(
         f"| Stemcell | {_md_escape(meta['old_stemcell'])} | {_md_escape(meta['new_stemcell'])} |"
     )
-    lines.append("")
+    pre_timings.append("")
 
-    if phases or steps:
-        lines.append("## Timings")
-        lines.append("")
-        if phases:
-            lines.append("| Phase | Duration |")
-            lines.append("|---|---|")
-            for ph in phases:
-                lines.append(f"| {_md_escape(ph['name'])} | {fmt_hms(ph['seconds'])} |")
-            lines.append("")
-        if steps:
-            lines.append("| Step | Result | Duration |")
-            lines.append("|---|---|---|")
-            for st in steps:
-                lines.append(
-                    f"| {_md_escape(st['name'])} | {st['status']} | "
-                    f"{fmt_hms(st['seconds'])} |"
-                )
-            lines.append("")
-
-    lines.append("## Environment")
-    lines.append("")
-    lines.append("| Item | Value |")
-    lines.append("|---|---|")
-    for label, key in (
-        ("Env bundle", "env"),
-        ("BOSH director", "director_version"),
-        ("Certification suite revision", "certification_ref"),
-        ("Certification release", "certification_release"),
-        ("Proxmox VE", "pve_version"),
-    ):
-        lines.append(f"| {label} | {_md_escape(str(meta.get(key) or 'unknown'))} |")
-    lines.append("")
-
-    lines.append("## Upgrade invariants")
-    lines.append("")
-    lines.append(
+    extra: list[str] = []
+    extra.append("## Upgrade invariants")
+    extra.append("")
+    extra.append(
         "These are what the run asserts beyond the two BOSH commands exiting "
         "zero. Each is a claim about what the new CPI had to understand about "
         "state the old CPI wrote."
     )
-    lines.append("")
-    lines.append("| Invariant | Before | After | Held |")
-    lines.append("|---|---|---|---|")
+    extra.append("")
+    extra.append("| Invariant | Before | After | Held |")
+    extra.append("|---|---|---|---|")
     for inv in meta.get("invariants", []):
         held = "yes" if inv.get("held") else "NO"
-        lines.append(
+        extra.append(
             f"| {_md_escape(inv['name'])} | {_md_escape(str(inv.get('before', '')))} | "
             f"{_md_escape(str(inv.get('after', '')))} | {held} |"
         )
-    lines.append("")
+    extra.append("")
 
-    lines.append("## Artifacts")
-    lines.append("")
-    lines.append(
-        "Machine artifacts for this run live in the gitignored results "
-        f"directory `{meta.get('run_dir', '')}`: `results.json`, "
-        f"`{JUNIT_STEPS}`, `console.log`, the rendered deployment manifest, and "
-        "the pre- and post-upgrade state captures. This document is the "
-        "committed record."
+    return _rundoc.write_run_doc(
+        runs_dir=RUNS_DIR,
+        meta=meta,
+        meta_mark=RUN_META_MARK,
+        title=f"Director Upgrade Run Report: {meta['date']}",
+        provenance=(
+            "`./scripts/certify` generated this report from a live run of the "
+            "[BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
+            "suite's Director Upgrade Test against a Proxmox VE lab. See "
+            "[BOSH Director Upgrade Test](../../upgrade.md) for how we run it."
+        ),
+        verdict_lines=[
+            f"**Result: {meta['verdict']}.** {meta['steps_passed']} steps passed, "
+            f"{meta['steps_failed']} failed, and {meta['steps_skipped']} skipped.",
+            "",
+            "The verdict covers every step through verification. Tearing the lab "
+            "back down happens after this report is written, so the console totals "
+            "at the end of a run carry a few more steps and a longer wall clock "
+            "than the numbers here.",
+            "",
+        ] + _rundoc.run_meta_bullets(meta),
+        pre_timings=pre_timings,
+        phases=phases,
+        steps=steps,
+        env_table=[
+            ("Env bundle", "env"),
+            ("BOSH director", "director_version"),
+            ("Certification suite revision", "certification_ref"),
+            ("Certification release", "certification_release"),
+            ("Proxmox VE", "pve_version"),
+        ],
+        extra_sections=extra,
+        artifacts_lines=[
+            "Machine artifacts for this run live in the gitignored results "
+            f"directory `{meta.get('run_dir', '')}`: `results.json`, "
+            f"`{JUNIT_STEPS}`, `console.log`, the rendered deployment manifest, and "
+            "the pre- and post-upgrade state captures. This document is the "
+            "committed record.",
+            "",
+        ],
     )
-    lines.append("")
-    doc.write_text("\n".join(lines))
-    return doc
-
-
-def _collect_run_history() -> list[dict]:
-    """Read the metadata comment from every committed run document."""
-    history: list[dict] = []
-    if not RUNS_DIR.is_dir():
-        return history
-    pattern = re.compile(rf"<!-- {RUN_META_MARK} (\{{.*\}}) -->")
-    for doc in sorted(RUNS_DIR.glob("*.md")):
-        match = pattern.search(doc.read_text())
-        if not match:
-            continue
-        try:
-            meta = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        meta["_doc"] = doc.name
-        history.append(meta)
-    history.sort(key=lambda m: m.get("date", ""), reverse=True)
-    return history
 
 
 def write_summary_doc() -> Path:
     """Regenerate docs/certification/upgrade/README.md from the run history."""
-    DOCS_UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
-    history = _collect_run_history()
-    latest = history[0] if history else None
-
-    lines: list[str] = []
-    lines.append("# BOSH Director Upgrade Test")
-    lines.append("")
-    lines.append(
-        "The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
-        "suite's Director Upgrade Test stands a Director up on one CPI release, "
-        "deploys the upstream certification release under it, upgrades the "
-        "Director onto a newer CPI release over the same state, and recreates "
-        "the deployment through it. We run it against a Proxmox VE lab with "
-        "`./scripts/certify`; [BOSH Director Upgrade Test](../upgrade.md) "
-        "documents the setup and invocation."
-    )
-    lines.append("")
-    if latest:
-        lines.append("## Latest run")
-        lines.append("")
-        lines.append(
+    return _rundoc.write_summary_doc(
+        docs_dir=DOCS_UPGRADE_DIR,
+        runs_dir=RUNS_DIR,
+        meta_mark=RUN_META_MARK,
+        title="BOSH Director Upgrade Test",
+        intro=(
+            "The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
+            "suite's Director Upgrade Test stands a Director up on one CPI release, "
+            "deploys the upstream certification release under it, upgrades the "
+            "Director onto a newer CPI release over the same state, and recreates "
+            "the deployment through it. We run it against a Proxmox VE lab with "
+            "`./scripts/certify`; [BOSH Director Upgrade Test](../upgrade.md) "
+            "documents the setup and invocation."
+        ),
+        latest_headline=lambda latest: (
             f"**{latest['verdict']}** on {latest['date']}: "
             f"{latest.get('old_cpi', '?')} to {latest.get('new_cpi', '?')}, "
             f"{latest.get('steps_passed', '?')} steps passed, "
             f"{latest.get('steps_failed', '?')} failed, in "
             f"{latest.get('wall_hms', '?')}. "
             f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
-        )
-        lines.append("")
-        lines.append("| Item | Value |")
-        lines.append("|---|---|")
-        for label, key in (
+        ),
+        latest_table=[
             ("CPI release before", "old_cpi"),
             ("CPI release after", "new_cpi"),
             ("bosh release", "new_bosh"),
@@ -750,29 +609,20 @@ def write_summary_doc() -> Path:
             ("BOSH director", "director_version"),
             ("Certification suite revision", "certification_ref"),
             ("Proxmox VE", "pve_version"),
-        ):
-            lines.append(f"| {label} | {_md_escape(str(latest.get(key) or 'unknown'))} |")
-        lines.append("")
-    lines.append("## Run history")
-    lines.append("")
-    if history:
-        lines.append("| Date | Result | CPI upgrade | Steps failed | Wall clock | Report |")
-        lines.append("|---|---|---|---|---|---|")
-        for meta in history:
-            lines.append(
-                f"| {meta['date']} | {meta['verdict']} | "
-                f"{_md_escape(str(meta.get('old_cpi', '?')))} to "
-                f"{_md_escape(str(meta.get('new_cpi', '?')))} | "
-                f"{meta.get('steps_failed', '?')} | "
-                f"{meta.get('wall_hms', '?')} | "
-                f"[runs/{meta['_doc']}](runs/{meta['_doc']}) |"
-            )
-    else:
-        lines.append("No runs recorded yet.")
-    lines.append("")
-    out = DOCS_UPGRADE_DIR / "README.md"
-    out.write_text("\n".join(lines))
-    return out
+        ],
+        history_header=[
+            "| Date | Result | CPI upgrade | Steps failed | Wall clock | Report |",
+            "|---|---|---|---|---|---|",
+        ],
+        history_row=lambda meta: (
+            f"| {meta['date']} | {meta['verdict']} | "
+            f"{_md_escape(str(meta.get('old_cpi', '?')))} to "
+            f"{_md_escape(str(meta.get('new_cpi', '?')))} | "
+            f"{meta.get('steps_failed', '?')} | "
+            f"{meta.get('wall_hms', '?')} | "
+            f"[runs/{meta['_doc']}](runs/{meta['_doc']}) |"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
