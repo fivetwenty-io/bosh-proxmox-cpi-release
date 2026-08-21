@@ -245,6 +245,11 @@ bats:
   cpi_id:           ""            # cpi-config entry name for the BATS AZ;
                                   # REQUIRED when the director has a cpi-config
                                   # applied (e.g. pve-az1), empty otherwise
+  target_node:      ""            # PVE node pin for the BATS az; REQUIRED when
+                                  # the stemcell storage is node-local on a
+                                  # multi-node cluster (matches the director
+                                  # cloud-config's ((pve_node)) pin), empty on
+                                  # shared-storage or single-node labs
   vm_cores:      2                # Sizing for the BATS `default` vm_type
   vm_memory_mib: 2048
   vm_disk_mib:   8192

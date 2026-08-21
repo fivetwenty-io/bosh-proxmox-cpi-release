@@ -502,6 +502,7 @@ def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
         "vm_memory_mib": int(section.get("vm_memory_mib", 2048)),
         "vm_disk_mib": int(section.get("vm_disk_mib", 8192)),
         "cpi_id": str(section.get("cpi_id", "") or "").strip(),
+        "target_node": str(section.get("target_node", "") or "").strip(),
         "exclude_tags": [str(t) for t in (section.get("exclude_tags") or [])],
         "rspec_timeout_s": int(section.get("rspec_timeout_s", DEFAULT_RSPEC_TIMEOUT_S)),
     }
@@ -576,6 +577,11 @@ def build_bat_spec(
     # absent key as "director has no cpi-config".
     if bcfg["cpi_id"]:
         spec["properties"]["cpi_id"] = bcfg["cpi_id"]
+    # Same shape for the node pin: absent means unpinned placement, which is
+    # only safe when the stemcell cache template is reachable from every node
+    # (shared storage, or replication enabled in the director's CPI config).
+    if bcfg["target_node"]:
+        spec["properties"]["target_node"] = bcfg["target_node"]
     return spec
 
 
