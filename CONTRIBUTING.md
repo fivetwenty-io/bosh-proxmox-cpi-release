@@ -48,6 +48,22 @@ make check
 
 This runs `fmt-check`, `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
 
+### Installing the git hooks
+
+```bash
+make hooks
+```
+
+This points `core.hooksPath` at the repo's `.githooks/` directory. Two hooks run from then on:
+
+- `pre-commit`
+
+  Checks the staged Go files with `gofmt` and refuses the commit if any need formatting. It takes well under a second. Bypass one commit with `git commit --no-verify`.
+
+- `pre-push`
+
+  Runs the same `make check` suite CI runs, so a push never lands a commit CI will reject. Bypass one push with `SKIP_CHECKS=1 git push` when you know CI already covered the commit.
+
 ### Running security scans
 
 ```bash
