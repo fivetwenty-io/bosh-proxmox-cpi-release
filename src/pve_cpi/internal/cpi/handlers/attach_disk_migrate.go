@@ -76,6 +76,17 @@ func parkFreeFloatingCrossNodeDisk(
 		return pve.DiskHolder{}, false, wrapHolderScanError(reErr,
 			fmt.Sprintf("%s: resolve holder of disk %s after its pre-migration park", op, rd.diskCID))
 	}
+	if !newHolder.Found {
+		// The park succeeded but the holder scan (which enumerates guests via
+		// /cluster/resources, served from the pvestatd broadcast cache) does
+		// not see the just-created parker yet. Proceeding with a zero holder
+		// would skip the parker branch and config-edit the parked volume onto
+		// the VM node — two configs referencing one volume. The disk is safely
+		// parked, so surface a retriable error; the retried attach resolves
+		// the parker as holder and enters the migration flow normally.
+		return pve.DiskHolder{}, false, cpierrors.Retriable(
+			"%s: disk %s was parked on node %s but its parker is not visible in the cluster resource listing yet — retry the attach", op, rd.diskCID, diskNode)
+	}
 	return newHolder, true, nil
 }
 
