@@ -30,9 +30,11 @@ on:
 
 # contents: write is required to push the report branch; pull-requests: write
 # opens and auto-merges the report PR (main is protected, so reports land
-# through a PR gated on the required checks); packages: read lets the job's
+# through a PR gated on the required checks); actions: write dispatches the
+# check workflows on the report branch; packages: read lets the job's
 # GITHUB_TOKEN pull the private CI image from ghcr.
 permissions:
+  actions: write
   contents: write
   packages: read
   pull-requests: write
@@ -272,6 +274,15 @@ jobs:
             --title "docs(certification): scheduled run reports $(date -u +%F)" \
             --body "Automated certification reports from acceptance run ${GITHUB_RUN_ID}."
           gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
+          # A branch pushed with the job's GITHUB_TOKEN raises no push or
+          # pull_request events (GitHub suppresses workflow triggers from
+          # GITHUB_TOKEN actions), so the required checks would never report
+          # and the auto-merge above would wait forever. workflow_dispatch is
+          # exempt from that suppression: dispatch the check workflows on the
+          # report branch so their check runs land on its head sha.
+          for wf in ci.yml security.yml codeql.yml; do
+            gh workflow run "${wf}" --repo "${GITHUB_REPOSITORY}" --ref "${REPORT_BRANCH}"
+          done
 
       - name: Persist director state to the runner host
         if: always()
