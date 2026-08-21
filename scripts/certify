@@ -66,6 +66,11 @@ Flags:
                         certification deployment in place for post-mortem.
     --results-dir DIR   Where to write artifacts (default: .e2e-results).
     --skip-doc          Do not write docs/certification/upgrade/ documents.
+    --headline-pass-fail-only
+                        Regenerate the README "Latest run" headline only from
+                        runs with a definite PASS/FAIL verdict; an UNKNOWN run
+                        still commits its run document but leaves the headline
+                        on the last decisive run. Scheduled CI runs pass this.
     --dry-run           Print every command without executing; exit 0.
     --no-color          Disable ANSI color.
 
@@ -577,12 +582,13 @@ def write_run_doc(
     )
 
 
-def write_summary_doc() -> Path:
+def write_summary_doc(headline_pass_fail_only: bool = False) -> Path:
     """Regenerate docs/certification/upgrade/README.md from the run history."""
     return _rundoc.write_summary_doc(
         docs_dir=DOCS_UPGRADE_DIR,
         runs_dir=RUNS_DIR,
         meta_mark=RUN_META_MARK,
+        headline_pass_fail_only=headline_pass_fail_only,
         title="BOSH Director Upgrade Test",
         intro=(
             "The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certification) "
@@ -1363,7 +1369,7 @@ class Certify:
             doc = write_run_doc(meta, phases, steps)
             self._record_inline("doc:run-report", True, t0, str(doc))
             t1 = time.monotonic()
-            summary = write_summary_doc()
+            summary = write_summary_doc(self.args.headline_pass_fail_only)
             self._record_inline("doc:summary", True, t1, str(summary))
         except OSError as exc:
             return self._record_inline("doc:run-report", False, t0, str(exc))
@@ -1556,6 +1562,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep", action="store_true")
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     p.add_argument("--skip-doc", action="store_true")
+    p.add_argument("--headline-pass-fail-only", action="store_true",
+                   help="README headline tracks only PASS/FAIL runs; an "
+                        "UNKNOWN run keeps its run doc without moving the "
+                        "headline")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-color", action="store_true")
     return p

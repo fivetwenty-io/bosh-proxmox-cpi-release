@@ -45,6 +45,11 @@ Flags:
                         deployment, stemcell, and release in place.
     --results-dir DIR   Where to write artifacts (default: .e2e-results).
     --skip-doc          Do not write docs/certification/bats/ report documents.
+    --headline-pass-fail-only
+                        Regenerate the README "Latest run" headline only from
+                        runs with a definite PASS/FAIL verdict; an UNKNOWN run
+                        still commits its run document but leaves the headline
+                        on the last decisive run. Scheduled CI runs pass this.
     --dry-run           Print every command without executing; exit 0.
     --no-color          Disable ANSI color.
 
@@ -654,6 +659,7 @@ def write_run_doc(
         skip_duration_dash=True,
         env_table=[
             ("CPI release", "cpi_version"),
+            ("Director CPI release", "director_cpi_release"),
             ("BATS revision", "bats_ref"),
             ("BOSH director", "director_version"),
             ("Stemcell", "stemcell"),
@@ -677,12 +683,13 @@ def write_run_doc(
     )
 
 
-def write_summary_doc() -> Path:
+def write_summary_doc(headline_pass_fail_only: bool = False) -> Path:
     """Regenerate docs/certification/bats/README.md from the run history."""
     return _rundoc.write_summary_doc(
         docs_dir=DOCS_BATS_DIR,
         runs_dir=RUNS_DIR,
         meta_mark=RUN_META_MARK,
+        headline_pass_fail_only=headline_pass_fail_only,
         title="BOSH Acceptance Tests",
         intro=(
             "The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-tests) "
@@ -1373,7 +1380,7 @@ class BATS:
                 for r in self.rep.results
             ]
             doc = write_run_doc(meta, rspec, phases=phases, steps=steps)
-            summary = write_summary_doc()
+            summary = write_summary_doc(self.args.headline_pass_fail_only)
         except (OSError, ValueError) as exc:
             return self._record_inline("docs:report", False, t0, str(exc)) and ok
         ok_doc = self._record_inline("docs:report", True, t0, f"{doc} + {summary}")
@@ -1401,6 +1408,18 @@ class BATS:
 
         ok, out = self.runner.capture("ruby-version", ["ruby", "--version"], timeout=30)
         ruby_version = out.strip().split(" (")[0] if ok else "unknown"
+
+        # The CPI release the director actually runs is frozen at create-env
+        # time and never appears in `bosh releases`, so the only honest source
+        # is the tarball create-env was pointed at. When the caller (the
+        # scheduled acceptance workflow, or a local shell that just ran
+        # create-env) still has PVE_CPI_RELEASE_PATH exported, record its
+        # basename; otherwise say so rather than guess from the working tree.
+        release_path = os.environ.get("PVE_CPI_RELEASE_PATH", "").strip()
+        director_cpi_release = (
+            Path(release_path).name if release_path
+            else "unknown (PVE_CPI_RELEASE_PATH not set)"
+        )
 
         pve_version = "unknown"
         try:
@@ -1455,6 +1474,7 @@ class BATS:
             "failures": (rspec["failures"] + rspec["errors"]) if rspec else None,
             "skipped": rspec["skipped"] if rspec else None,
             "cpi_version": cpi_version,
+            "director_cpi_release": director_cpi_release,
             "bats_ref": bats_ref,
             "director_version": self.director_version or "unknown",
             "stemcell": f"{self.stemcell_name}/{self.stemcell_version}",
@@ -1556,6 +1576,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="BAT_DEBUG_MODE: fail fast, keep failed state for post-mortem")
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     p.add_argument("--skip-doc", action="store_true")
+    p.add_argument("--headline-pass-fail-only", action="store_true",
+                   help="README headline tracks only PASS/FAIL runs; an "
+                        "UNKNOWN run keeps its run doc without moving the "
+                        "headline")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-color", action="store_true")
     return p

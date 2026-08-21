@@ -1,0 +1,89 @@
+name: Lab Probe
+
+# Manual reachability probe: settles whether the self-hosted runner can reach
+# the PVE lab before the scheduled acceptance workflow is trusted with a
+# 6-hour slot. Runs on the runner HOST (no container) so it measures the same
+# network position a container with host networking would get, without any
+# image dependency. The targets arrive as dispatch inputs, so this workflow
+# needs no secret and hardcodes no lab address.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pve_api_url:
+        description: "PVE API base URL (e.g. https://10.0.0.5:8006)"
+        required: true
+        type: string
+      director_ip:
+        description: "BOSH director IP to TCP-probe"
+        required: true
+        type: string
+      director_port:
+        description: "BOSH director port"
+        required: false
+        type: string
+        default: "25555"
+
+permissions: {}
+
+jobs:
+  probe:
+    name: Probe lab reachability
+    runs-on: self-hosted
+    timeout-minutes: 10
+    # Not PR-triggered, but keep the head-repo guard shape used by every
+    # workflow in this repo: a fork's dispatch must never reach our runner.
+    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+
+    steps:
+      - name: Probe PVE API endpoint
+        id: pve
+        env:
+          PVE_API_URL: ${{ inputs.pve_api_url }}
+        run: |
+          set -uo pipefail
+          # Any HTTP status (200/401/...) proves the API answers; only a
+          # transport failure (curl code 000) means unreachable. -k because
+          # lab PVE certs are self-signed.
+          url="${PVE_API_URL%/}/api2/json/version"
+          code="$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 20 "${url}" || true)"
+          if [[ "${code}" != "000" && -n "${code}" ]]; then
+            echo "PASS: PVE API at ${url} answered with HTTP ${code}"
+            echo "ok=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "FAIL: PVE API at ${url} did not answer (transport failure)"
+            echo "ok=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Probe director TCP port
+        id: director
+        env:
+          DIRECTOR_IP: ${{ inputs.director_ip }}
+          DIRECTOR_PORT: ${{ inputs.director_port }}
+        run: |
+          set -uo pipefail
+          # Pure-bash TCP connect (the runner host has no nc). Success means
+          # routing and any firewall between runner and director allow the
+          # director API port AND something is listening; run it while the
+          # director is up for a meaningful answer.
+          if timeout 15 bash -c "exec 3<>/dev/tcp/${DIRECTOR_IP}/${DIRECTOR_PORT}" 2>/dev/null; then
+            echo "PASS: TCP connect to ${DIRECTOR_IP}:${DIRECTOR_PORT} succeeded"
+            echo "ok=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "FAIL: TCP connect to ${DIRECTOR_IP}:${DIRECTOR_PORT} failed (timeout or refused)"
+            echo "ok=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Verdict
+        env:
+          PVE_OK: ${{ steps.pve.outputs.ok }}
+          DIRECTOR_OK: ${{ steps.director.outputs.ok }}
+        run: |
+          set -euo pipefail
+          echo "PVE API probe:      $([[ "${PVE_OK}" == "true" ]] && echo PASS || echo FAIL)"
+          echo "Director TCP probe: $([[ "${DIRECTOR_OK}" == "true" ]] && echo PASS || echo FAIL)"
+          if [[ "${PVE_OK}" != "true" || "${DIRECTOR_OK}" != "true" ]]; then
+            echo "Overall: FAIL — the runner cannot reach part of the lab." >&2
+            exit 1
+          fi
+          echo "Overall: PASS — the runner reaches both lab endpoints."

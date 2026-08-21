@@ -1,0 +1,117 @@
+# ci/integration.scheduled.yml
+#
+# Scheduled-run integration config for the acceptance workflow
+# (.github/workflows/acceptance.yml). The workflow materializes this file to
+# the gitignored ci/integration.yml after substituting the ${...} placeholders
+# from repository variables, then runs scripts/certify and scripts/bats
+# against the cpitest env bundle.
+#
+# This file is COMMITTED and must stay SECRET-FREE: every literal value here
+# is either an integration.yml.example default or cpitest topology already
+# committed in manifests/envs/cpitest/vars.yml. Values that are lab topology
+# but not committed anywhere (the BATS target node) are ${VAR} placeholders
+# the workflow fills from repository variables — topology, never credentials.
+# Secrets stay in manifests/bosh/vars.yml (materialized from a GitHub secret)
+# and manifests/bosh/creds.yml (persisted create-env product).
+#
+# Placeholders:
+#   ${BATS_TARGET_NODE}  PVE node pin for the BATS az, from the repository
+#                        variable LAB_BATS_TARGET_NODE. Required when the
+#                        stemcell storage is node-local on a multi-node
+#                        cluster; set it to "" on shared-storage or
+#                        single-node labs.
+
+# The scheduled workflow drives scripts/certify and scripts/bats directly, so
+# no scripts/test integration tier runs from this config. The tiers block and
+# the tier1/tier2/tier3 sections below exist because the config loader
+# requires them; their values are the committed example defaults and are
+# inert for scheduled runs.
+tiers:
+  lifecycle: false
+  bosh:      false
+  cf:        false
+  light:     false
+
+# Secret manifest files (relative to repo root, all gitignored). vars.yml is
+# materialized from the LAB_BOSH_VARS_YML secret; creds.yml is restored from
+# the runner-host state directory before the run.
+bosh_vars:  manifests/bosh/vars.yml
+bosh_creds: manifests/bosh/creds.yml
+cf_vars:    manifests/cf/vars.yml
+
+# Isolated SDN test env (committed in manifests/envs/cpitest/). Exported as
+# BOSH_PVE_ENV so scripts/bosh layers the cpitest network onto create-env.
+env_name: "cpitest"
+
+# The workflow exports PVE_CPI_RELEASE_PATH pointing at the downloaded latest
+# published release tarball, which wins over this empty value.
+cpi_release_path: ""
+
+# Inert for scheduled runs (schema-required; example defaults).
+tier1:
+  vmid_range_start: 900
+  vmid_range_end:   999
+  network_ip:       192.168.1.250
+  network_range:    192.168.1.0/24
+  network_gateway:  192.168.1.1
+  network_bridge:   vmbr0
+  network_dns:      [1.1.1.1]
+  vm_cores:         1
+  vm_memory_mib:    1024
+  disk_size_mib:    1024
+
+tier2:
+  bosh_env_alias:  pve
+  deployment_name: emptyvm
+  deploy_timeout_s: 1800
+
+tier3:
+  deployment_name: cf
+  smoke_org:       integration-smoke
+  smoke_space:     test
+  smoke_app:       httpbin-smoke
+  smoke_timeout_s: 900
+
+# BOSH Acceptance Tests (scripts/bats). cidr, gateway, and bridge default to
+# the cpitest env bundle's committed values (internal_cidr 172.31.0.0/24,
+# internal_gw 172.31.0.1, pve_network_bridge cpitest0); the bands below are
+# the documented cpitest layout from ci/integration.yml.example (Director
+# .10, infra reserved below .20 and from .200 up, static band .190-.199).
+bats:
+  network_cidr:    ""
+  network_gateway: ""
+  network_bridge:  ""
+  network_reserved:
+  - 172.31.0.1-172.31.0.19
+  - 172.31.0.200-172.31.0.254
+  network_static:
+  - 172.31.0.190-172.31.0.199
+  static_ip:        172.31.0.190
+  second_static_ip: 172.31.0.191
+  nic_group:        1
+  # The bootstrap job creates the director with plain create-env and applies
+  # no cpi-config, so the BATS az needs no cpi-config entry name.
+  cpi_id:           ""
+  target_node:      "${BATS_TARGET_NODE}"
+  vm_cores:      2
+  vm_memory_mib: 2048
+  vm_disk_mib:   8192
+  exclude_tags:  []
+  rspec_timeout_s: 14400
+
+# BOSH Director Upgrade Test (scripts/certify). Versions stay empty so the
+# runner resolves the published-release matrix N-1 -> N at run time.
+certification:
+  deployment_name: certification
+  release_name:    certification
+  az:              z1
+  network_name:    default
+  disk_type:       default
+  network_bridge:  ""
+  cpi_id:          ""
+  vm_cores:      2
+  vm_memory_mib: 2048
+  vm_disk_mib:   8192
+  old_cpi_version: ""
+  new_cpi_version: ""
+  timeout_s: 7200

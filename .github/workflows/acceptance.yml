@@ -1,0 +1,261 @@
+name: Acceptance
+
+# Scheduled acceptance runs against the latest published release: the
+# Director Upgrade certification (scripts/certify, N-1 -> N of the published
+# releases) followed by a fresh director bootstrap on the latest tag and the
+# BOSH Acceptance Tests (scripts/bats). Run reports are committed under
+# docs/certification/ with the pass/fail-only headline policy: every run
+# commits its run document, but the README "Latest run" headline only moves
+# for a definite PASS or FAIL verdict, never UNKNOWN.
+#
+# The weekly slot is Saturday 02:30 UTC, well clear of the Monday 01:30
+# (codeql) and Monday 06:00 (security) crons, so the lab and the runner are
+# not contended.
+
+on:
+  schedule:
+    - cron: "30 2 * * 6"
+  workflow_dispatch:
+    inputs:
+      skip_certify:
+        description: "Skip the upgrade certification (supervised first runs)"
+        required: false
+        type: boolean
+        default: false
+      skip_bats:
+        description: "Skip BATS (supervised first runs)"
+        required: false
+        type: boolean
+        default: false
+
+# contents: write is required for the report auto-commit push; nothing else.
+permissions:
+  contents: write
+
+# Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
+# touches the lab (its PVE API, the director slot, or the cpitest network)
+# MUST declare this same `lab` concurrency group; today this is the only one.
+# cancel-in-progress stays false: killing a certify or BATS run mid-flight
+# leaves the lab in a state the next run has to dig itself out of.
+concurrency:
+  group: lab
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: Certify and BATS
+    runs-on: self-hosted
+    # BATS alone has taken 2h22m and certify 56m on this lab; six hours gives
+    # both room plus the bootstrap without masking a wedged run forever.
+    timeout-minutes: 360
+    # Not PR-triggered, but keep the head-repo guard shape used by every
+    # workflow in this repo: only this repository may use our runner.
+    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+
+    container:
+      # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Once the
+      # first ci-image.yml run prints the pushed digest, pin this reference
+      # to ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:... the way the
+      # other workflows pin golang:1.26.
+      image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci:latest
+      # Host-path caches follow the gha-container-cache pattern from ci.yml.
+      # gha-lab-state is DIFFERENT in kind: it persists the director's
+      # create-env products (creds.yml, state.json) between runs, because
+      # losing them means every run rebuilds the director and orphans the old
+      # one. It holds lab credentials — it must stay on the runner host
+      # (mode 0700, owner runner) and never be copied off it.
+      volumes:
+        - /home/runner/gha-container-cache/go:/go
+        - /home/runner/gha-container-cache/go-build:/root/.cache/go-build
+        - /home/runner/gha-container-cache/uv:/root/.cache/uv
+        - /home/runner/gha-lab-state:/var/lib/lab-state
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # The runner overrides HOME to /github/home inside the container; point
+      # the caches at the mounted paths (same reasoning as ci.yml).
+      GOCACHE: /root/.cache/go-build
+      UV_CACHE_DIR: /root/.cache/uv
+      LAB_STATE_DIR: /var/lib/lab-state
+      BOSH_PVE_ENV: cpitest
+      # scripts/certify and the release-resolution step shell out to gh.
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history: the report meta runs `git describe --tags` and the
+          # report auto-commit rebases onto the remote before pushing.
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        # The host-mounted workspace has a different owner than the container
+        # user; without this, git commands fail with "dubious ownership"
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Configure commit identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898024+github-actions[bot]@users.noreply.github.com"
+
+      - name: Materialize ci/integration.yml from the committed fixture
+        env:
+          # Repository VARIABLE (not a secret): lab topology, the PVE node
+          # the BATS az pins to. Empty is valid on shared-storage labs.
+          LAB_BATS_TARGET_NODE: ${{ vars.LAB_BATS_TARGET_NODE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          sed "s|\${BATS_TARGET_NODE}|${LAB_BATS_TARGET_NODE}|g" \
+            ci/integration.scheduled.yml > ci/integration.yml
+          if grep -n '\${' ci/integration.yml; then
+            echo "ERROR: unsubstituted placeholder left in ci/integration.yml" >&2
+            exit 1
+          fi
+
+      - name: Write lab secrets (manifests/bosh/vars.yml)
+        env:
+          LAB_BOSH_VARS_YML: ${{ secrets.LAB_BOSH_VARS_YML }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LAB_BOSH_VARS_YML}" ]]; then
+            echo "ERROR: the LAB_BOSH_VARS_YML secret is not configured for this repository." >&2
+            echo "Add it from a checkout that has the lab vars file:" >&2
+            echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-pve-cpi-release --body-file manifests/bosh/vars.yml" >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "${LAB_BOSH_VARS_YML}" > manifests/bosh/vars.yml
+
+      - name: Restore director state from the runner host
+        # creds.yml and state.json are create-env products. Without them a
+        # standing director from the previous run is invisible: create-env
+        # would build a second director on the same IP instead of updating,
+        # and certify's --force teardown would have nothing to tear down.
+        run: |
+          set -euo pipefail
+          umask 077
+          for f in creds.yml state.json; do
+            if [[ -f "${LAB_STATE_DIR}/${f}" ]]; then
+              install -m 0600 "${LAB_STATE_DIR}/${f}" "manifests/bosh/${f}"
+              echo "restored manifests/bosh/${f}"
+            else
+              echo "no persisted ${f} (first run, or the last run tore down cleanly)"
+            fi
+          done
+
+      - name: Resolve the latest published release
+        id: release
+        run: |
+          set -euo pipefail
+          TAG="$(gh release view --json tagName --jq .tagName)"
+          VERSION="${TAG#v}"
+          mkdir -p .deps/cpi-releases
+          gh release download "${TAG}" \
+            --pattern "bosh-pve-cpi-${VERSION}.tgz*" \
+            --dir .deps/cpi-releases --clobber
+          (cd .deps/cpi-releases && sha256sum -c "bosh-pve-cpi-${VERSION}.tgz.sha256")
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          # The director bootstrap and BATS both read this: create-env bakes
+          # the CPI it points at, and the BATS report records its basename as
+          # the director's CPI provenance.
+          echo "PVE_CPI_RELEASE_PATH=${GITHUB_WORKSPACE}/.deps/cpi-releases/bosh-pve-cpi-${VERSION}.tgz" >> "${GITHUB_ENV}"
+
+      - name: Upgrade certification (scripts/certify)
+        if: ${{ !inputs.skip_certify }}
+        timeout-minutes: 150
+        # --force: unattended slot handling — a director left standing by a
+        # previous run is torn down instead of failing preflight. --keep OFF:
+        # the run must end with a free slot for the bootstrap below.
+        run: |
+          set -euo pipefail
+          ./scripts/certify upgrade --env cpitest --force \
+            --headline-pass-fail-only --no-color
+
+      - name: Commit upgrade run report
+        if: ${{ always() && !inputs.skip_certify }}
+        run: |
+          set -euo pipefail
+          git add docs/certification
+          if git diff --cached --quiet; then
+            echo "no certification doc changes to commit"
+            exit 0
+          fi
+          git commit -m "docs(certification): scheduled upgrade run report $(date -u +%F)"
+          # Scheduled runs ride the default branch; rebase in case another
+          # push landed while the certification ran.
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Bootstrap director on the latest release
+        timeout-minutes: 90
+        # Minimal director bring-up (the emptyvm smoke and CF are out of
+        # scope here: BATS itself is the acceptance check). net-up first —
+        # certify's teardown removed the cpitest SDN objects along with the
+        # director.
+        run: |
+          set -euo pipefail
+          echo "bootstrapping director from ${PVE_CPI_RELEASE_PATH}"
+          ./scripts/bosh net-up
+          ./scripts/bosh create-env
+          ./scripts/bosh alias-env
+          ./scripts/bosh login
+          ./scripts/bosh ucc
+          ./scripts/bosh runtime-config
+          ./scripts/bosh upload-stemcell
+
+      - name: BATS (scripts/bats)
+        if: ${{ !inputs.skip_bats }}
+        run: |
+          set -uo pipefail
+          set +e
+          ./scripts/bats run --env cpitest --headline-pass-fail-only --no-color
+          rc=$?
+          set -e
+          if [[ "${rc}" -eq 2 ]]; then
+            # Locally exit 2 is the soft "ruby/bundler not installed" skip.
+            # The CI image bakes ruby and bundler, so here it can only mean
+            # the image regressed — that is a failure, not a skip.
+            echo "ERROR: scripts/bats exited 2 (ruby/bundler missing). The CI image bakes ruby, so the image has regressed." >&2
+            exit 1
+          fi
+          exit "${rc}"
+
+      - name: Commit BATS run report
+        if: ${{ always() && !inputs.skip_bats }}
+        run: |
+          set -euo pipefail
+          git add docs/certification
+          if git diff --cached --quiet; then
+            echo "no certification doc changes to commit"
+            exit 0
+          fi
+          git commit -m "docs(certification): scheduled bats run report $(date -u +%F)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Persist director state to the runner host
+        if: always()
+        # The state dir holds lab credentials; it lives on the runner host
+        # only (see the volumes comment above).
+        run: |
+          set -euo pipefail
+          umask 077
+          for f in creds.yml state.json; do
+            if [[ -f "manifests/bosh/${f}" ]]; then
+              install -m 0600 "manifests/bosh/${f}" "${LAB_STATE_DIR}/${f}"
+              echo "persisted manifests/bosh/${f}"
+            fi
+          done
+
+      - name: Remove materialized secrets and state
+        if: always()
+        # The workspace persists between jobs on a self-hosted runner; the
+        # state just persisted above is restored from the state dir next run.
+        run: |
+          rm -f manifests/bosh/vars.yml manifests/bosh/creds.yml \
+            manifests/bosh/state.json ci/integration.yml

@@ -1,0 +1,91 @@
+name: CI Image
+
+# Builds ci/Dockerfile and pushes it to ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
+# with tags `latest` and the git sha. The acceptance workflow pulls this
+# image; docs/ci-image.md documents the tool matrix it must provide.
+#
+# Runs directly on the runner host (no job container): the build needs the
+# host's docker daemon, which is present because the runner launches every
+# other job's container through it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/Dockerfile
+      - .github/workflows/ci-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
+
+jobs:
+  build:
+    name: Build and Push
+    runs-on: self-hosted
+    timeout-minutes: 45
+    # Not PR-triggered, but keep the head-repo guard shape used by every
+    # workflow in this repo: only this repository may use our runner.
+    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker build \
+            -f ci/Dockerfile \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${GITHUB_SHA}" \
+            .
+
+      - name: Verify baked tools
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMAGE}:${GITHUB_SHA}" sh -c '
+            set -e
+            bosh --version
+            gh --version
+            cf --version
+            credhub --version
+            uv --version
+            go version
+            ruby --version
+            bundle --version
+            python3 --version
+            python3 -c "import yaml; print(\"python3-yaml ok\")"
+            git --version
+            ssh -V
+            command -v ssh-keygen
+            jq --version
+            make --version | head -1
+            curl --version | head -1
+          '
+
+      - name: Push image
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
+          # Print the pushed digest so the acceptance workflow's image
+          # reference can be pinned to it (see acceptance.yml).
+          docker inspect --format '{{join .RepoDigests "\n"}}' "${IMAGE}:latest"
+
+      - name: Log out of ghcr.io
+        if: always()
+        run: docker logout ghcr.io

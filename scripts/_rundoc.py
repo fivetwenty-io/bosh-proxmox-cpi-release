@@ -254,11 +254,23 @@ def write_summary_doc(
     latest_table: "list[tuple[str, str]]",
     history_header: list[str],
     history_row: "Callable[[dict], str]",
+    headline_pass_fail_only: bool = False,
 ) -> Path:
-    """Regenerate docs_dir/README.md from the run history and return its path."""
+    """Regenerate docs_dir/README.md from the run history and return its path.
+
+    headline_pass_fail_only makes the "Latest run" section track the most
+    recent run with a definite PASS/FAIL verdict, skipping UNKNOWN runs
+    (which stay in the history table and keep their committed run document).
+    Scheduled runs pass it so a run that asserted nothing never replaces the
+    headline; the default keeps local behavior unchanged.
+    """
     docs_dir.mkdir(parents=True, exist_ok=True)
     history = collect_run_history(runs_dir, meta_mark)
     latest = history[0] if history else None
+    if headline_pass_fail_only:
+        latest = next(
+            (m for m in history if m.get("verdict") != "UNKNOWN"), None,
+        )
 
     lines: list[str] = []
     lines.append(f"# {title}")

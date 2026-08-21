@@ -1,186 +1,83 @@
-# CI Image Requirements
+# CI Image
 
-The integration task defined in `ci/tasks/integration.yml` requires a Docker image that includes several CLIs not present in the stock `bosh/bosh-cli` image. This document describes what the image must contain, provides an example Dockerfile, and shows how to wire it into the pipeline.
+Our acceptance and integration jobs run inside a purpose-built container image. The canonical Dockerfile lives at `ci/Dockerfile`; the `CI Image` workflow (`.github/workflows/ci-image.yml`) builds it on every change to that file and pushes it to `ghcr.io/fivetwenty-io/bosh-pve-cpi-ci` with the tags `latest` and the git sha.
+
+Two consumers use the image:
+
+- the scheduled acceptance workflow (`.github/workflows/acceptance.yml`), which runs `scripts/certify`, `scripts/bosh`, and `scripts/bats`
+
+- the Concourse integration task (`ci/tasks/integration.yml`), which runs `./scripts/test integration all`
 
 ---
 
 ## Why a custom image is required
 
-The `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependencies. The integration task runs `./scripts/test integration all`, which calls `scripts/bosh`, `scripts/cf`, `scripts/lifecycle`, and several Python helper scripts, which require:
+The stock `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependencies. Our scripts also need:
 
-- **cf** — not present in `bosh/bosh-cli`
-- **credhub** — not present in `bosh/bosh-cli`
-- **uv** — not present in any standard BOSH image; required to execute PEP 723 inline-dependency scripts (`#!/usr/bin/env -S uv run --script`)
-- **go** and **make** — to compile `bin/cpi` before the lifecycle tier runs
+- **cf** and **credhub**
+  Not present in `bosh/bosh-cli`; the CF tier and credential lookups shell out to them.
 
-A custom image that bundles all of these tools is required for the integration job to succeed.
+- **uv**
+  Executes the PEP 723 inline-dependency scripts (`#!/usr/bin/env -S uv run --script`) under `scripts/`.
 
----
+- **go** and **make**
+  Compile `bin/cpi` before the lifecycle tier runs. The Go version must match `src/pve_cpi/go.mod`.
 
-## Required CLIs
+- **ruby** and **bundler**
+  `scripts/bats` runs the BOSH Acceptance Tests, a Ruby rspec suite whose `bundle install` compiles native gems (hence `build-essential`).
 
-| Tool | Minimum version | Install reference |
-|------|----------------|-------------------|
-| `bosh` | 7.0.0 | https://github.com/cloudfoundry/bosh-cli/releases |
-| `cf` | 8.0.0 | https://github.com/cloudfoundry/cli/releases |
-| `credhub` | 2.9.0 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
-| `uv` | 0.4.0 | https://github.com/astral-sh/uv/releases (or `curl -LsSf https://astral.sh/uv/install.sh`) |
-| `go` | 1.26.6 | https://go.dev/dl/ (must match `src/pve_cpi/go.mod`) |
-| `make` | 4.3 | System package (`apt-get install make`) |
-| `jq` | 1.6 | System package (`apt-get install jq`) |
-| `curl` | 7.88 | System package (`apt-get install curl`) |
-| `base64` | (coreutils) | System package (`apt-get install coreutils`) |
-| `ssh` | (openssh-client) | System package (`apt-get install openssh-client`) |
-| `git` | 2.39 | System package (`apt-get install git`) |
-| `python3` | 3.11 | Required by `uv` runtime; `uv` downloads and pins a matching interpreter automatically |
-
-The Python scripts use only the standard library. `uv` manages the Python runtime; no extra packages need to be pre-installed.
+- **gh**
+  The acceptance workflow resolves and downloads the latest published release with it.
 
 ---
 
-## Example Dockerfile
+## Tool matrix
 
-This multi-stage Dockerfile pins every binary version so CI runs are reproducible. Adjust version numbers on upgrade.
+`ci/Dockerfile` pins every version; this table records the floor each consumer needs. The `bosh` and `gh` downloads are sha256-verified with the same published checksums `.github/workflows/release.yml` verifies.
 
-```dockerfile
-# syntax=docker/dockerfile:1
+| Tool | Minimum version | Source |
+|------|----------------|--------|
+| `bosh` | 7.10.9 | https://github.com/cloudfoundry/bosh-cli/releases (sha256-pinned) |
+| `gh` | 2.97.0 | https://github.com/cli/cli/releases (sha256-pinned) |
+| `cf` | 8.9.0 | https://github.com/cloudfoundry/cli/releases |
+| `credhub` | 2.9.45 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
+| `uv` | 0.4.30 | https://github.com/astral-sh/uv/releases |
+| `go` | 1.26.6 | golang official image (must match `src/pve_cpi/go.mod`) |
+| `ruby` + `bundler` | 3.3 | ruby official slim image |
+| `python3` + PyYAML | 3.11 | Debian packages (`python3`, `python3-yaml`) |
+| `git`, `jq`, `make`, `curl`, `openssh-client`, `coreutils`, `build-essential` | Debian bookworm | System packages |
 
-ARG GO_VERSION=1.26.6
-ARG BOSH_CLI_VERSION=7.9.6
-ARG CF_CLI_VERSION=8.9.0
-ARG CREDHUB_CLI_VERSION=2.9.45
-ARG UV_VERSION=0.4.30
-
-# ── Stage 1: download binaries ─────────────────────────────────────────────
-FROM debian:bookworm-slim AS downloader
-
-ARG BOSH_CLI_VERSION
-ARG CF_CLI_VERSION
-ARG CREDHUB_CLI_VERSION
-ARG UV_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /downloads
-
-# bosh CLI
-RUN curl -fsSL \
-    "https://github.com/cloudfoundry/bosh-cli/releases/download/v${BOSH_CLI_VERSION}/bosh-cli-${BOSH_CLI_VERSION}-linux-amd64" \
-    -o bosh && chmod +x bosh
-
-# cf CLI (v8 tarball ships a single binary named cf8 → rename to cf)
-RUN curl -fsSL \
-    "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=${CF_CLI_VERSION}&source=github" \
-    -o cf-cli.tgz && tar xzf cf-cli.tgz cf8 && mv cf8 cf && chmod +x cf
-
-# credhub CLI
-RUN curl -fsSL \
-    "https://github.com/cloudfoundry-incubator/credhub-cli/releases/download/${CREDHUB_CLI_VERSION}/credhub-linux-amd64-${CREDHUB_CLI_VERSION}.tgz" \
-    -o credhub.tgz && tar xzf credhub.tgz && chmod +x credhub
-
-# uv
-RUN curl -fsSL \
-    "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
-    -o uv.tgz && tar xzf uv.tgz --strip-components=1 "uv-x86_64-unknown-linux-musl/uv" && chmod +x uv
-
-# ── Stage 2: Go toolchain ──────────────────────────────────────────────────
-FROM golang:${GO_VERSION}-bookworm AS gobase
-
-# ── Stage 3: final image ───────────────────────────────────────────────────
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        coreutils \
-        git \
-        jq \
-        make \
-        openssh-client \
-    && rm -rf /var/lib/apt/lists/*
-
-# Go toolchain from official image
-COPY --from=gobase /usr/local/go /usr/local/go
-ENV PATH="/usr/local/go/bin:${PATH}"
-
-# Downloaded CLIs
-COPY --from=downloader /downloads/bosh     /usr/local/bin/bosh
-COPY --from=downloader /downloads/cf       /usr/local/bin/cf
-COPY --from=downloader /downloads/credhub  /usr/local/bin/credhub
-COPY --from=downloader /downloads/uv       /usr/local/bin/uv
-
-# uv manages its own Python runtimes in a cache directory; point it somewhere writable.
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-
-RUN useradd -m -u 1000 ci
-USER ci
-WORKDIR /home/ci
-```
-
-Build and push the image:
-
-```
-docker build \
-  --build-arg GO_VERSION=1.26.6 \
-  --build-arg BOSH_CLI_VERSION=7.9.6 \
-  --build-arg CF_CLI_VERSION=8.9.0 \
-  --build-arg CREDHUB_CLI_VERSION=2.9.45 \
-  --build-arg UV_VERSION=0.4.30 \
-  -t registry.example.com/bosh-pve-cpi-ci:latest \
-  -f ci/Dockerfile .
-
-docker push registry.example.com/bosh-pve-cpi-ci:latest
-```
-
-Store the Dockerfile at `ci/Dockerfile` in the repository so version bumps are tracked in git.
-
+The Python helper scripts use only the standard library plus PyYAML; `uv` can also download and pin its own interpreter (`UV_PYTHON_INSTALL_DIR=/opt/uv/python`).
 
 ---
 
-## Pipeline integration
+## Building and publishing
 
-Replace the `image_resource` stanza in `ci/tasks/integration.yml` after the custom image is built and pushed:
+The `CI Image` workflow builds and pushes automatically when `ci/Dockerfile` or the workflow itself changes on `main`, and can be dispatched by hand. Its verify step runs every baked tool's version command before the push, and the push step prints the image digest so `acceptance.yml` can pin its `container.image` reference to `ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:...`.
+
+To build locally:
+
+```
+docker build -f ci/Dockerfile -t bosh-pve-cpi-ci:dev .
+docker run --rm bosh-pve-cpi-ci:dev sh -c 'bosh --version && gh --version && cf --version && credhub --version && uv --version && go version && ruby --version && bundle --version'
+```
+
+If a tool check fails, confirm the corresponding `COPY --from=downloader` line in `ci/Dockerfile` completed. Rebuild with `--no-cache` if a download was silently skipped because of a layer cache hit on a changed URL.
+
+---
+
+## Concourse pipeline integration
+
+Point the `image_resource` stanza in `ci/tasks/integration.yml` at the published image:
 
 ```yaml
 image_resource:
   type: registry-image
   source:
-    repository: registry.example.com/bosh-pve-cpi-ci
+    repository: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
     tag: latest
-    # If the registry requires authentication:
-    # username: ((registry_username))
-    # password: ((registry_password))
 ```
 
-The `registry-image` resource type is preferred over `docker-image` for new pipelines — it pulls OCI manifests directly and does not require a Docker daemon on the worker.
+The `registry-image` resource type is preferred over `docker-image` for new pipelines. It pulls OCI manifests directly and does not require a Docker daemon on the worker. If the package is made private, add registry credentials to the Concourse secrets store and reference them with `((double-paren))` interpolation.
 
-If the registry is private, add the credentials to your Concourse secrets store and reference them with `((double-paren))` interpolation as shown above.
-
-
----
-
-## Verification
-
-After building the image, run the following one-liner to confirm every required tool is present and meets the minimum version.
-
-
-```
-docker run --rm registry.example.com/bosh-pve-cpi-ci:latest \
-  sh -c 'bosh --version && cf --version && credhub --version && uv --version && go version && make --version'
-```
-
-Expected output (versions will vary based on build args):
-
-```
-BOSH CLI version 7.9.6-...
-cf version 8.9.0+...
-credhub 2.9.45
-uv 0.4.30 (...)
-go version go1.26.6 linux/amd64
-GNU Make 4.3
-```
-
-If any command fails, check that the corresponding `COPY --from=downloader` line in the Dockerfile completed successfully. Rebuild with `--no-cache` if a download was silently skipped because of a layer cache hit on a changed URL.
+The image's default user is root because GitHub Actions job containers rely on it for workspace ownership; Concourse tasks can run it under their own user configuration.
