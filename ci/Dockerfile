@@ -84,7 +84,8 @@ FROM golang:${GO_VERSION}-bookworm AS gobase
 # -- Stage 3: final image ---------------------------------------------------
 # ruby:<ver>-slim is Debian bookworm with ruby + bundler in /usr/local; BATS
 # (bosh-acceptance-tests) needs ruby 3.3+ with bundler, and its bundle
-# install compiles native gems, hence build-essential.
+# install compiles native gems, hence build-essential. certify derives the
+# light-stemcell qcow2 with qemu-img, hence qemu-utils.
 FROM ruby:${RUBY_VERSION}-slim-bookworm
 
 # Links the ghcr package to this repository so the workflows' GITHUB_TOKEN
@@ -105,6 +106,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         python3 \
         python3-yaml \
+        qemu-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Go toolchain from the official image
