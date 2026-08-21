@@ -152,6 +152,11 @@ certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would 
 
 ##@ Code Quality
 
+.PHONY: hooks
+hooks: ## Point git at the repo-managed hooks (pre-commit gofmt gate, pre-push make check)
+	@git config core.hooksPath .githooks
+	@echo "$(GREEN)✓ git hooks installed (core.hooksPath=.githooks)$(RESET)"
+
 .PHONY: fmt
 fmt: ## Format Go source files with gofmt
 	@echo "$(GREEN)Formatting code...$(RESET)"
