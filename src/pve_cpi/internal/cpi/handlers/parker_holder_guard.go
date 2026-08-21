@@ -89,6 +89,13 @@ func isTypedCPIError(err error) bool {
 	return errors.As(err, &typed)
 }
 
+// okToRetryCPIError reports whether err carries a *cpierrors.Error anywhere
+// in its chain whose type the BOSH Director may retry (ok_to_retry).
+func okToRetryCPIError(err error) bool {
+	var typed *cpierrors.Error
+	return errors.As(err, &typed) && typed.OkToRetry()
+}
+
 // anchorMissingRefusal returns the strict-mode refusal for a disk whose CID
 // envelope promises a parker anchor while the holder scan found no holder at
 // all. Under the parked strategy a promised disk is on a parker whenever it is

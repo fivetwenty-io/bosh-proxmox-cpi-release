@@ -42,6 +42,19 @@ func TestServerSideFetchEligibleRequiresSHA256(t *testing.T) {
 	}
 }
 
+// TestServerSideFetchEligibleRejectsNodePin: the server-side path resolves
+// its own node from config and storage ownership, so an operator's
+// cloud_properties.node pin must route to the CPI-side fetch that honors it.
+func TestServerSideFetchEligibleRejectsNodePin(t *testing.T) {
+	t.Parallel()
+	deps := Deps{Config: &config.CPIConfig{}}
+	cp := ssfCloudProps()
+	cp.Node = "pve2"
+	if serverSideFetchEligible(deps, cp) {
+		t.Fatal("expected ineligible when cloud_properties.node pins a node")
+	}
+}
+
 // TestServerSideFetchEligibleRequiresHTTPS: PVE's download-url endpoint
 // cannot speak the CPI's other fetch schemes.
 func TestServerSideFetchEligibleRequiresHTTPS(t *testing.T) {

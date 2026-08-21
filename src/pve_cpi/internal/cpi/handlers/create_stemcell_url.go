@@ -51,11 +51,28 @@ func handleStemcellDownloadURL(
 	cp stemcellCloudProps,
 	directorUUID string,
 ) (any, error) {
+	out, _, err := handleStemcellDownloadURLTracked(ctx, deps, cp, directorUUID)
+	return out, err
+}
+
+// handleStemcellDownloadURLTracked is handleStemcellDownloadURL plus a
+// taskStarted result: true once CreateStorageDownloadUrl has been accepted by
+// PVE, meaning a server-side download task may exist (running, finished, or
+// failed). The image_url dispatch uses it to bound its CPI-side fallback —
+// falling back after the task started would race a still-running download for
+// the same import/<file> path (the two writers can interleave, and the
+// fallback's prefix dedup could then adopt a half-written volume).
+func handleStemcellDownloadURLTracked(
+	ctx context.Context,
+	deps Deps,
+	cp stemcellCloudProps,
+	directorUUID string,
+) (any, bool, error) {
 	// 1. Resolve storage and node. Reuse the shared helper that also enforces
 	//    the shared-storage constraint for multi-node clusters.
 	node, storage, resolveErr := resolveStemcellStorageAndNode(ctx, deps)
 	if resolveErr != nil {
-		return nil, resolveErr
+		return nil, false, resolveErr
 	}
 
 	templateNode := deps.Config.StemcellTemplateNode
@@ -78,7 +95,7 @@ func handleStemcellDownloadURL(
 	// gap at the root instead of emitting an identity the rest of the system
 	// cannot safely dedup or look up by.
 	if !isValidSHA256Hex(cp.ExpectedSHA256) {
-		return nil, cpierrors.Cloud(
+		return nil, false, cpierrors.Cloud(
 			"create_stemcell: server-download (cloud_properties.source_url) requires cloud_properties.sha256 "+
 				"so content identity and dedup work (must be a 64-character hex string, got %q)", cp.ExpectedSHA256)
 	}
@@ -98,7 +115,7 @@ func handleStemcellDownloadURL(
 	// 3. Pre-dedup: if the volume already exists, skip the download entirely.
 	existingVol, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
 	if findErr != nil {
-		return nil, cpierrors.Wrap(findErr, "create_stemcell: server-download dedup lookup")
+		return nil, false, cpierrors.Wrap(findErr, "create_stemcell: server-download dedup lookup")
 	}
 	if existingVol != "" {
 		deps.Log(ctx).Info("create_stemcell: server-download — volume already present, skipping download",
@@ -108,7 +125,7 @@ func handleStemcellDownloadURL(
 			templateNode, storage, qcow2Filename, cp.ExpectedSHA256, "",
 			pve.StemcellKindHeavy, stemcellCID, directorUUID, cp, cp.SourceURL)
 		if tmplErr != nil {
-			return nil, fmt.Errorf("create_stemcell: server-download dedup: ensure template: %w", tmplErr)
+			return nil, false, fmt.Errorf("create_stemcell: server-download dedup: ensure template: %w", tmplErr)
 		}
 		deps.Log(ctx).Info("create_stemcell: server-download (dedup) template ready",
 			log.Int64(metadataKeyVMID, vmid),
@@ -117,7 +134,7 @@ func handleStemcellDownloadURL(
 		)
 		maybeReplicateServerDownload(ctx, deps, templateNode, storage, qcow2Filename,
 			cp.ExpectedSHA256, cp.SourceURL, stemcellCID, directorUUID, cp)
-		return stemcellCID, nil
+		return stemcellCID, false, nil
 	}
 
 	// 4. Build CreateStorageDownloadUrl params.
@@ -134,12 +151,12 @@ func handleStemcellDownloadURL(
 	}
 
 	if deps.PVE == nil || deps.PVE.Nodes() == nil {
-		return nil, cpierrors.Cloud("create_stemcell: server-download: nodes service unavailable")
+		return nil, false, cpierrors.Cloud("create_stemcell: server-download: nodes service unavailable")
 	}
 
 	resp, dlErr := deps.PVE.Nodes().CreateStorageDownloadUrl(ctx, node, storage, params)
 	if dlErr != nil {
-		return nil, cpierrors.Cloud(
+		return nil, false, cpierrors.Cloud(
 			"create_stemcell: server-download CreateStorageDownloadUrl failed: %s", dlErr.Error())
 	}
 
@@ -149,13 +166,23 @@ func handleStemcellDownloadURL(
 	if resp != nil && len(*resp) > 0 {
 		upid, upidErr := pve.UPIDFromRaw(*resp)
 		if upidErr != nil {
-			return nil, cpierrors.Cloud(
+			return nil, true, cpierrors.Cloud(
 				"create_stemcell: server-download: cannot parse task UPID from response: %s", upidErr.Error())
 		}
 		if upid != "" {
 			awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
 				pve.WithMaxWait(pve.StemcellMaxWait))
 			if awaitErr != nil {
+				// A retriable await error means the wait budget ran out (or a
+				// transient poll fault) while the task may still be running
+				// server-side. The partial file must NOT be deleted out from
+				// under a live download; propagate the retriable class so the
+				// Director's retried create_stemcell re-enters and dedups on
+				// the completed file.
+				if okToRetryCPIError(awaitErr) {
+					return nil, true, cpierrors.WrapAs(awaitErr, cpierrors.TypeRetriableCloud,
+						fmt.Sprintf("create_stemcell: server-download task on node %q may still be running — retry once it completes", node))
+				}
 				// Task failure includes checksum mismatch reported by PVE.
 				// Non-retriable: the URL or checksum is wrong; retrying the same
 				// call will not fix the root cause.
@@ -172,7 +199,7 @@ func handleStemcellDownloadURL(
 						log.Err(delErr),
 					)
 				}
-				return nil, cpierrors.Cloud(
+				return nil, true, cpierrors.Cloud(
 					"create_stemcell: server-download task failed (check source_url reachability from PVE node %q "+
 						"and sha256 correctness): %s", node, awaitErr.Error())
 			}
@@ -191,17 +218,17 @@ func handleStemcellDownloadURL(
 	//    "00000000.qcow2" which is a valid but non-unique suffix).
 	downloadedVol, volFindErr := pve.FindStemcellByFilename(ctx, deps.PVE, node, storage, qcow2Filename)
 	if volFindErr != nil {
-		return nil, cpierrors.Wrap(volFindErr, "create_stemcell: server-download: post-download volume lookup")
+		return nil, true, cpierrors.Wrap(volFindErr, "create_stemcell: server-download: post-download volume lookup")
 	}
 	if downloadedVol == "" {
 		// Fallback: prefix scan to handle PVE filename normalization.
 		prefix := stemcellDownloadURLPrefix(cp.Name, cp.Version)
 		downloadedVol, volFindErr = fetchFindByPrefix(ctx, deps, node, storage, prefix)
 		if volFindErr != nil {
-			return nil, cpierrors.Wrap(volFindErr, "create_stemcell: server-download: prefix scan after download")
+			return nil, true, cpierrors.Wrap(volFindErr, "create_stemcell: server-download: prefix scan after download")
 		}
 		if downloadedVol == "" {
-			return nil, cpierrors.Cloud(
+			return nil, true, cpierrors.Cloud(
 				"create_stemcell: server-download: volume not found after successful task "+
 					"(storage=%q node=%q filename=%q)", storage, node, qcow2Filename)
 		}
@@ -211,7 +238,7 @@ func handleStemcellDownloadURL(
 	// qcow2Filename after normalization).
 	actualFilename := fetchExtractFilename(downloadedVol)
 	if actualFilename == "" {
-		return nil, cpierrors.Cloud(
+		return nil, true, cpierrors.Cloud(
 			"create_stemcell: server-download: cannot extract filename from volid %q", downloadedVol)
 	}
 
@@ -233,7 +260,7 @@ func handleStemcellDownloadURL(
 		templateNode, storage, actualFilename, cp.ExpectedSHA256, "",
 		pve.StemcellKindHeavy, actualCID, directorUUID, cp, cp.SourceURL)
 	if tmplErr != nil {
-		return nil, fmt.Errorf("create_stemcell: server-download: ensure template: %w", tmplErr)
+		return nil, true, fmt.Errorf("create_stemcell: server-download: ensure template: %w", tmplErr)
 	}
 
 	deps.Log(ctx).Info("create_stemcell: server-download stemcell ready",
@@ -244,7 +271,7 @@ func handleStemcellDownloadURL(
 	)
 	maybeReplicateServerDownload(ctx, deps, templateNode, storage, actualFilename,
 		cp.ExpectedSHA256, cp.SourceURL, actualCID, directorUUID, cp)
-	return actualCID, nil
+	return actualCID, true, nil
 }
 
 // maybeReplicateServerDownload applies the same replication gate

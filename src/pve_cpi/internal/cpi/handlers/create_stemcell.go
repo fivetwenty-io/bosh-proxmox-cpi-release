@@ -494,21 +494,29 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 			return handleLightStemcellPreUploaded(ctx, deps, cp, reqCtx.DirectorUUID)
 		case "fetch":
 			// Prefer the PVE server-side download-url path when the image_url
-			// qualifies (https, no credentials, sha256 present): PVE streams
-			// the bytes itself and the CPI never transfers them, which
-			// sidesteps the cluster-proxy upload problem class entirely. Both
-			// paths derive the same digest-based filename and ":heavy:" CID,
-			// so a failed server-side attempt falls back to the CPI-side
-			// fetch below without changing the stemcell's identity.
+			// qualifies (https, no credentials, sha256 present, no node pin):
+			// PVE streams the bytes itself and the CPI never transfers them,
+			// which sidesteps the cluster-proxy upload problem class entirely.
+			// Both paths derive the same digest-based filename and ":heavy:"
+			// CID, so a failed server-side attempt falls back to the CPI-side
+			// fetch below without changing the stemcell's identity — but ONLY
+			// while no download task was started: once PVE accepted the task,
+			// a fallback would race a possibly-still-running server-side
+			// download for the same import/<file> path, so the server-side
+			// error (retriable when the task may still be running) is returned
+			// instead and the Director's retry re-enters through the dedup.
 			if serverSideFetchEligible(deps, cp) {
 				sd := cp
 				sd.SourceURL = cp.ImageURL
 				sd.ImageURL = ""
-				out, sdErr := handleStemcellDownloadURL(ctx, deps, sd, reqCtx.DirectorUUID)
+				out, taskStarted, sdErr := handleStemcellDownloadURLTracked(ctx, deps, sd, reqCtx.DirectorUUID)
 				if sdErr == nil {
 					return out, nil
 				}
-				deps.Log(ctx).Warn("create_stemcell: server-side download for image_url failed; falling back to the CPI-side fetch",
+				if taskStarted {
+					return nil, sdErr
+				}
+				deps.Log(ctx).Warn("create_stemcell: server-side download for image_url could not start; falling back to the CPI-side fetch",
 					log.URL("image_url", cp.ImageURL),
 					log.Err(sdErr),
 				)
@@ -1577,6 +1585,50 @@ func stemcellStorageOwningNode(ctx context.Context, deps Deps, configuredNode, s
 	return owners[0]
 }
 
+// stemcellStorageOwnerSet returns the set of nodes allowed to host storage
+// per its storage.cfg nodes restriction, or nil when the storage is
+// unrestricted or its definition could not be read (fail-open, matching
+// stemcellStorageOwningNode). The replication fan-outs use it to skip nodes
+// that cannot see the storage at all — every upload or download addressed to
+// one would fail and only add noise to the aggregate warning.
+func stemcellStorageOwnerSet(ctx context.Context, deps Deps, storage string) map[string]bool {
+	info, ok := liveStorageInfo(ctx, deps, storage)
+	if !ok || len(info.Nodes) == 0 {
+		return nil
+	}
+	owners := make(map[string]bool, len(info.Nodes))
+	for _, n := range info.Nodes {
+		owners[n] = true
+	}
+	return owners
+}
+
+// filterReplicaNodesToOwners drops replica candidates a node restriction on
+// storage excludes, logging the skipped set once. Returns nodes unchanged
+// when the storage is unrestricted.
+func filterReplicaNodesToOwners(ctx context.Context, deps Deps, label, storage string, nodes []string) []string {
+	owners := stemcellStorageOwnerSet(ctx, deps, storage)
+	if owners == nil {
+		return nodes
+	}
+	kept := nodes[:0:0]
+	var skipped []string
+	for _, n := range nodes {
+		if owners[n] {
+			kept = append(kept, n)
+		} else {
+			skipped = append(skipped, n)
+		}
+	}
+	if len(skipped) > 0 {
+		deps.Log(ctx).Info(label+": storage is node-restricted; skipping replication to nodes that cannot host it",
+			log.String("storage", storage),
+			log.String("skipped_nodes", strings.Join(skipped, ",")),
+		)
+	}
+	return kept
+}
+
 // stemcellDedupResult bundles the outputs of buildAndDeduplicateStemcellCID
 // into a single struct, keeping the return list under the 5-result linter limit.
 type stemcellDedupResult struct {
@@ -1867,6 +1919,14 @@ func handleLightStemcellPreUploaded(
 	if node == "" {
 		return nil, cpierrors.Cloud("create_stemcell: config.node must not be empty")
 	}
+	// When the storage carries a nodes restriction excluding the resolved
+	// node, address the existence check to an owning node — otherwise the
+	// lookup below reports "not found" for a qcow2 the operator DID upload,
+	// just on a storage the resolved node cannot see. Same retarget the
+	// heavy path applies via resolveStemcellStorageAndNode.
+	if chosenNode == "" {
+		node = stemcellStorageOwningNode(ctx, deps, node, storage)
+	}
 
 	// 4. Existence check — qcow2 filename is the trailing segment after "import/".
 	// volumePath has the form "import/<file>" per the CID grammar's contract.
@@ -1958,12 +2018,19 @@ func resolveFetchSource(deps Deps, rawURL string) (stemcellfetch.Source, stemcel
 //   - credential resolution (per-stemcell image_url_auth, then the config's
 //     FetchCredentialDefaults longest-prefix match) must come up empty, or
 //     the server-side fetch would silently drop the credentials the CPI-side
-//     fetch would have sent.
+//     fetch would have sent;
+//   - the operator must not have pinned a node (cloud_properties.node): the
+//     server-side path resolves its own node from config and storage
+//     ownership and would silently ignore the pin the CPI-side fetch honors
+//     through ValidateLightStemcellStorage.
 //
 // A malformed auth payload also returns false: the CPI-side fetch surfaces
 // that error with its full context instead.
 func serverSideFetchEligible(deps Deps, cp stemcellCloudProps) bool {
 	if !isValidSHA256Hex(cp.ExpectedSHA256) {
+		return false
+	}
+	if cp.Node != "" {
 		return false
 	}
 	if !strings.HasPrefix(strings.ToLower(cp.ImageURL), "https://") {
@@ -3174,13 +3241,15 @@ func replicateStemcellToNodes(
 		workerLimit = deps.Config.StemcellReplicationConcurrencyValue()
 	}
 
-	// Collect non-primary nodes to replicate.
+	// Collect non-primary nodes to replicate, dropping nodes a storage
+	// nodes-restriction excludes (an upload addressed to one can only fail).
 	var replicaNodes []string
 	for _, node := range targetNodes {
 		if node != primaryNode {
 			replicaNodes = append(replicaNodes, node)
 		}
 	}
+	replicaNodes = filterReplicaNodesToOwners(ctx, deps, "create_stemcell: replication", storage, replicaNodes)
 	if len(replicaNodes) == 0 {
 		return
 	}
@@ -3554,6 +3623,7 @@ func replicateServerDownloadToNodes(
 			replicaNodes = append(replicaNodes, node)
 		}
 	}
+	replicaNodes = filterReplicaNodesToOwners(ctx, deps, "create_stemcell: server-download replication", storage, replicaNodes)
 	if len(replicaNodes) == 0 {
 		return
 	}
