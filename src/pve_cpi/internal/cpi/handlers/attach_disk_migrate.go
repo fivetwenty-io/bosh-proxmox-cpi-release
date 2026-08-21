@@ -32,6 +32,77 @@ func diskBackendIsLocal(ctx context.Context, deps Deps, op, volid string) (bool,
 	return backend.Kind() == pve.BackendLocal, nil
 }
 
+// parkFreeFloatingCrossNodeDisk parks a free-floating stable-ID disk on its
+// own node when its node-local volume sits on a different node than the
+// target VM, returning the resulting parker holder and true. It returns
+// (zero, false, nil) when the disk's backend is shared, the volume already
+// sits on the VM's node, or the backend cannot name a node — the caller then
+// proceeds with the ordinary config-edit attach. See the call-site comment in
+// guardAndUnparkBeforeAttach for why the park happens at all.
+func parkFreeFloatingCrossNodeDisk(
+	ctx context.Context,
+	deps Deps,
+	op string,
+	rd *resolvedDisk,
+	vmNode string,
+	parkerCfg pve.ParkerConfig,
+) (pve.DiskHolder, bool, error) {
+	localBacked, backErr := diskBackendIsLocal(ctx, deps, op, rd.volid)
+	if backErr != nil {
+		return pve.DiskHolder{}, false, backErr
+	}
+	if !localBacked {
+		return pve.DiskHolder{}, false, nil
+	}
+	diskNode, nodeErr := localDiskNode(ctx, deps, op, rd.volid)
+	if nodeErr != nil {
+		return pve.DiskHolder{}, false, nodeErr
+	}
+	if diskNode == "" || diskNode == vmNode {
+		return pve.DiskHolder{}, false, nil
+	}
+	deps.Log(ctx).Info(op+": free-floating local-backend disk is on a different node than the VM; parking it on its own node so the mover flow can migrate it",
+		log.String("disk_cid", rd.diskCID),
+		log.String("disk_node", diskNode),
+		log.String("vm_node", vmNode),
+	)
+	pctx := pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID}
+	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), diskNode, rd.volid, parkerWriteConfigFor(deps), pctx); parkErr != nil {
+		return pve.DiskHolder{}, false, retriableUnlessPermanent(parkErr,
+			fmt.Sprintf("%s: park free-floating disk %s on node %s before cross-node migration", op, rd.diskCID, diskNode))
+	}
+	newHolder, reErr := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerCfg)
+	if reErr != nil {
+		return pve.DiskHolder{}, false, wrapHolderScanError(reErr,
+			fmt.Sprintf("%s: resolve holder of disk %s after its pre-migration park", op, rd.diskCID))
+	}
+	return newHolder, true, nil
+}
+
+// localDiskNode returns the node that actually holds the volume named by
+// volid, via the backend's own existence scan. Used by the free-floating
+// pre-migration park in guardAndUnparkBeforeAttach, where the node
+// attachDiskResolveNode originally derived has already been retargeted to the
+// VM's node.
+func localDiskNode(ctx context.Context, deps Deps, op, volid string) (string, error) {
+	storage, _, parseErr := pve.ParseDiskCID(volid)
+	if parseErr != nil {
+		return "", cpierrors.DiskNotFound(volid)
+	}
+	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if err != nil {
+		return "", cpierrors.Wrap(err, fmt.Sprintf("%s: backend resolution failed for storage %q", op, storage))
+	}
+	node, err := backend.NodeForExisting(ctx, volid)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			return "", cpierrors.DiskNotFound(volid)
+		}
+		return "", cpierrors.Wrap(err, fmt.Sprintf("%s: node lookup for disk %s", op, volid))
+	}
+	return node, nil
+}
+
 // attachViaMigration moves a cross-node parked disk to the target VM's node
 // through the mover flow, then hands back the ordinary same-node reassignment
 // plan: the disk ends the call parked on a single-purpose mover ON the target

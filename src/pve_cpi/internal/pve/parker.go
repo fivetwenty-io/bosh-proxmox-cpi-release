@@ -670,6 +670,13 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 			}
 			tags, _ = vmCfg["tags"].(string)
 		}
+		// A mover carries the parker tag too (every parker guard must fire
+		// for it), but it is a single-purpose migration vehicle: parking an
+		// unrelated disk onto one would carry that disk along with the next
+		// mover migration. Movers are never park targets.
+		if TagsMarkDiskMover(tags) {
+			continue
+		}
 		if tagContainsParker(tags) && parkerBelongsToDirector(tags, cfg.DirectorID) {
 			result = append(result, vmid)
 		}

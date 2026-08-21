@@ -392,7 +392,20 @@ func attachDiskViaTransfer(
 			if unErr := pve.UnparkDiskAt(ctx, deps.PVE, deps.Log(ctx), preVolid, plan.parker, parkerCfg); unErr != nil {
 				return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (snapshot fallback)", op, diskCID))
 			}
-			return attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts)
+			slot, devicePath, putErr := attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts)
+			// The unpark above emptied a single-purpose mover on this path;
+			// destroy it like the mainline transfer does (best-effort, same
+			// guard, never failing the attach that just landed).
+			if putErr == nil && plan.destroyMover {
+				if dErr := pve.DestroyEmptyMover(ctx, deps.PVE, deps.Log(ctx), plan.parker); dErr != nil {
+					deps.Log(ctx).Warn(op+": could not destroy the migration mover after the snapshot-fallback attach; it holds no disks and an operator cleanup removes it",
+						log.Int("mover_vmid", plan.parker.VMID),
+						log.String("node", plan.parker.Node),
+						log.Err(dErr),
+					)
+				}
+			}
+			return slot, devicePath, putErr
 		}
 		return "", "", retriableUnlessPermanent(terr, fmt.Sprintf("%s: reassign disk %s from parker to VM %s", op, diskCID, vmCID))
 	}
@@ -939,6 +952,27 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	overlay, ovErr := attachOverlayForHolder(ctx, deps, op, rd, holder, node, targetVMID)
 	if ovErr != nil {
 		return attachPlan{}, ovErr
+	}
+
+	// A stable-ID disk nobody references (detached_disk_strategy: free is the
+	// common source) has no holder to migrate, but on a node-local backend its
+	// data still sits wherever create_disk or the last detach left it. When
+	// that node differs from the target VM's, the config-edit attach below
+	// would write a volid the VM's node cannot see — or, worse, reference a
+	// same-named volume that node happens to hold. Park the disk on its own
+	// node first: that produces exactly the cross-node parker shape the block
+	// below routes through the mover migration. Only reachable with migration
+	// enabled — attachDiskResolveNode refuses every cross-node local shape
+	// when pve.disk_migration resolves to "off".
+	if !holder.Found && rd.stableID != "" && deps.Config.DiskMigrationOnAttachEnabled() {
+		parkedHolder, parked, parkErr := parkFreeFloatingCrossNodeDisk(ctx, deps, op, rd, node, parkerCfg)
+		if parkErr != nil {
+			return attachPlan{}, parkErr
+		}
+		if parked {
+			holder = parkedHolder
+			rd.holder = &parkedHolder
+		}
 	}
 
 	if holder.Found && holder.IsParker && rd.stableID != "" {

@@ -330,7 +330,13 @@ func migrateMoverToNode(
 		var upidErr error
 		upid, upidErr = UPIDFromRaw(*raw)
 		if upidErr != nil {
-			return "", "", cpierrors.Wrap(upidErr, "disk migrate: parse migrate task UPID")
+			// The migrate POST succeeded but the response UPID is unreadable,
+			// so the task's state is unknown — treat it like the still-running
+			// case below: protection stays down, and the retried attach
+			// re-enters the flow and adopts the mover wherever the task left
+			// it.
+			return "", "", cpierrors.WrapAs(upidErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("disk migrate: parse migrate task UPID for mover vmid %d; the migration may be running server-side — retry the attach", mover.VMID))
 		}
 	}
 	if upid != "" {
@@ -494,7 +500,8 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 func destroyMoverBestEffort(ctx context.Context, c Client, logger *log.Logger, moverVMID int, node string, cfg ParkerConfig) {
 	mover := DiskHolder{Found: true, VMID: moverVMID, Node: node, IsParker: true, Tags: buildMoverTags(cfg)}
 	if err := DestroyEmptyMover(context.WithoutCancel(ctx), c, logger, mover); err != nil && logger != nil {
-		logger.Warn("disk migrate: could not clean up the mover after a failed isolation; the next attach adopts it",
+		logger.Warn("disk migrate: could not clean up the mover after a failed isolation; "+
+			"if it holds the disk the next attach adopts it, an empty one must be destroyed by hand (qm destroy)",
 			log.Int("mover_vmid", moverVMID),
 			log.String("node", node),
 			log.Err(err),

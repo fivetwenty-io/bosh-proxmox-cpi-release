@@ -2628,6 +2628,31 @@ func TestListParkersForNode_SkipsContainers(t *testing.T) {
 	}
 }
 
+// TestListParkersForNode_SkipsMovers: a migration mover carries the parker
+// tag too (every parker guard must fire for it), but selecting one as a park
+// target would carry the parked disk along with the mover's next migration.
+// Movers must never appear in the park-target listing.
+func TestListParkersForNode_SkipsMovers(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+
+	qemuSvc := &parkerQEMU{}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(90000), "node": node, "type": "qemu", "tags": "bosh-cpi;bosh-parker;bosh-disk-mover"},
+			map[string]any{"vmid": int64(90001), "node": node, "type": "qemu", "tags": "bosh-cpi;bosh-parker"},
+		), nil
+	})
+
+	parkers, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("ListParkersForNode: %v", err)
+	}
+	if len(parkers) != 1 || parkers[0] != 90001 {
+		t.Fatalf("parkers = %v, want [90001] (the mover must be excluded)", parkers)
+	}
+}
+
 // TestUnparkDiskAt_DemotedOnly_SweepReadFails_DoesNotReportSuccess covers a
 // sweep that cannot confirm its own work. This path has already SEEN the
 // unusedN entry naming the volume; if the sweep's config read fails and the
