@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-push gate: run the same `make check` the CI workflow runs, so a push
+# never lands a commit that CI will reject.
+# Install with `make hooks`. Bypass once with SKIP_CHECKS=1 git push
+# (or git push --no-verify).
+
+if [ -n "$SKIP_CHECKS" ]; then
+    echo "pre-push: SKIP_CHECKS set, skipping make check" >&2
+    exit 0
+fi
+
+echo "pre-push: running make check (SKIP_CHECKS=1 git push to bypass)" >&2
+exec make check
