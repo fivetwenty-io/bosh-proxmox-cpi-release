@@ -12,7 +12,47 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-21
+
 ### Added
+
+- Cross-node persistent-disk migration on attach, on by default. PVE's `move_disk` refuses to reassign a volume between VMs on different nodes, so a stable-ID disk stranded on node-local storage away from its VM used to fail `attach_disk` outright. Under `pve.disk_migration: on_attach` (the default; `""` means the same) the CPI isolates the disk onto a fresh single-purpose mover parker on the disk's node, offline-migrates the never-started mover to the VM's node, attaches from it with the usual same-node reassignment, and destroys the mover. Setting `pve.disk_migration: off` restores the hard refusal, which names the knob and the manual `qm migrate` escape; the setting is overridable per cpi-config entry as `pve_disk_migration`. Disks created before stable disk identities existed are still refused: the migration renames the volume, and a legacy CID is the volume name. See [Known Limitations](docs/limitations.md).
+
+- Stemcell calls follow the storage's owning nodes. When the stemcell storage carries a `storage.cfg` nodes restriction that excludes the configured node, the upload, server-side download, and content-listing calls are addressed to the restriction set's first owning node instead of failing with "storage not available on node". Replication fan-outs now end with one aggregate summary line, and a stemcell `download-url` is fetched server-side by the PVE node when possible, with a bounded local-fetch fallback.
+
+- Scheduled acceptance workflow. `.github/workflows/acceptance.yml` runs the director-upgrade certification and the BOSH Acceptance Tests unattended every Saturday against a live PVE lab, resolving the published releases to test, and lands the run reports on `main` through an auto-merged pull request. The lifecycle and e2e test tiers now write committed run reports under `docs/certification/` the same way the BATS and upgrade tiers do. See [Scheduled Acceptance Workflow](docs/certification/scheduled.md).
+
+### Changed
+
+- The vendored Proxmox API client SDK is v3.9.0.
+
+### Fixed
+
+- `pve.api_token` accepts the full Authorization-header form (`PVEAPIToken=user@realm!name=uuid`) as well as the bare `user@realm!name=uuid` form.
+
+- Stemcell template VMs are created directly into their resource pool and tagged after creation, so reduced-ACL tokens whose `VM.Config` rights are scoped per option no longer fail `create_stemcell`.
+
+- `attach_disk` returns a retriable error when a just-parked disk's parker VM is not yet visible in the cluster listing, instead of a terminal one.
+
+- An explicit stemcell node pin outranks the owning-node retarget in the light-stemcell fetch path.
+
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- Stable disk identity. `create_disk` mints a `bpd-` plus 16-hex identity token that rides the drive's `serial=` attribute for the life of the disk, and attach resolves a disk by serial scan first, provenance sentinel second, and birth volid last, so a disk keeps its CID across the volume renames that parking and reassignment cause. Ownership moves by `move_disk` reassignment between the holder and the parker slot rather than by config-line surgery. CIDs minted before this release carry no token and resolve by volid forever. See [Stable disk identity and ownership transfer](docs/persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
+
+- `create_disk` parks fresh disks under the parked strategy, fail-closed: a disk that cannot be parked at creation is not left floating.
+
+- The disk CID records its create-time format, and block-native storage records `raw`, so later attaches rebuild the drive string from what was actually created rather than from current config.
+
+- Operations on a parked disk whose parker anchor has vanished are refused with the repair path named, instead of proceeding against storage the parker no longer references.
+
+- IPv6 dual-stack networks. Networks that share a `nic_group` plan onto one NIC with both `ip=` and `ip6=` addresses, and the BATS runner grows an opt-in dual-stack pass (`--only ipv6`).
+
+- Offline wire-protocol conformance suite. `make test` now drives the compiled CPI binary against a refused endpoint and asserts exactly one well-formed response envelope per request, exit 0, retriable error typing with `ok_to_retry`, an `api_version` handshake matrix pinned to 2, and a stdout that carries nothing but envelopes, with no lab required.
+
+- Consolidated [Known Limitations](docs/limitations.md) page stating every scope limit in one place.
 
 - `update_disk` option updates are now durable. Every option change is recorded as a per-disk override map, and each attach builds the drive string by merging global `disk_performance` config, then the options recorded in the disk CID at `create_disk` time, then the recorded overrides — rightmost wins, and an empty-string value deletes the key. Previously a detach/attach cycle rebuilt the drive string from config and CID options alone, silently reverting every operator update. The record lives on the holder VM's description (`bosh_disk_opt_overlays` sentinel key) while attached and rides the parker's `bosh_parked_disks` provenance entry (new optional `opts` field) while parked; `update_disk` writes it fail-closed before touching the drive, and the invariant guard (`pve.disk_perf_invariant_mode`) treats recorded updates as part of the expected baseline rather than as divergence. A parked disk can now be updated too: the change is recorded (and `size` applied to the volume directly) and takes effect at the next attach, where the old behavior wrote options onto the parker's drive string and lost them at unpark. Two paths still drop the record, with a logged warning: a detach under `detached_disk_strategy: free` (no carrier exists for it), and `delete_vm`'s plain detach of a still-attached legacy foreign disk. See [Durable disk option updates](docs/persistent-disk-strategy.md#durable-disk-option-updates).
 
@@ -25,6 +65,16 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 - `pve.pool_reap_empty` now defaults to `true`: a per-deployment pool is deleted when the synchronous `delete_vm` path destroys its last VM. Only pools carrying the CPI's `managed by bosh-pve-cpi` provenance comment are ever reaped, the static `pve.vm_pool` and `pve.stemcell_template_pool` are refused by name, and the fast-path delete still skips the reaper. Set the property to `false` explicitly to keep empty pools; the key is now always rendered into the CPI config, so an explicit `false` takes effect (previously the template could not express it).
 
 - The parker VMID band now resolves under every `detached_disk_strategy`, at the job level and in every cpi-config entry alike: unset bounds fill with the built-in `90000`–`90999` whether the strategy is `parked`, `free`, or stood down by a band collision. Under `free` the band is read-only: nothing allocates a parker VMID in it, a band overlap is accepted rather than rejected at load, and disks parked while `parked` was in effect are recognized and unparked on their next `attach_disk` or `delete_disk` instead of being refused until an operator restores the band by hand. Switching to `free` no longer needs the band carried forward, and the load-time warning for `free` without a band is gone with the state it warned about. The stranded-parker refusal remains for a band moved away from VMIDs where parker VMs still live.
+
+- The vendored Proxmox API client SDK is v3.8.6.
+
+### Fixed
+
+- A snapshot that blocks the detach reassignment defers the park instead of failing `detach_disk`; the disk parks on its next detach once the snapshot is gone.
+
+- `create_vm` with `disk_cids` runs the full attach guard path, so a foreign holder or a stale parker is caught at VM creation the same way `attach_disk` catches it.
+
+- Task-await log lines follow the UPID's effective node, so logs name the node that actually ran the task.
 
 ## [0.2.0] - 2026-08-19
 
@@ -202,7 +252,9 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/b7ead4a1d2763f88a34baad9746f798cda8e68ef...v0.1.2
 [0.1.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.0...b7ead4a1d2763f88a34baad9746f798cda8e68ef
