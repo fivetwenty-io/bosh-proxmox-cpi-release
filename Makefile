@@ -50,11 +50,11 @@ GO_SOURCES := $(shell find $(SRC_ROOT) -type f -name '*.go' -not -path '*/vendor
 
 # BOSH release blob config
 BLOBS_DIR    := blobs
-GO_BLOB_VER  := 1.26.6
+GO_BLOB_VER  := 1.27.0
 GO_BLOB_NAME := go$(GO_BLOB_VER).linux-amd64.tar.gz
-GO_BLOB_KEY  := golang-1.26/$(GO_BLOB_NAME)
+GO_BLOB_KEY  := golang-1.27/$(GO_BLOB_NAME)
 GO_BLOB_URL  := https://dl.google.com/go/$(GO_BLOB_NAME)
-GO_BLOB_SHA  := 708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
+GO_BLOB_SHA  := 675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685
 
 ##@ General
 
@@ -182,7 +182,7 @@ vet: ## Run go vet
 
 # Pinned golangci-lint version — update here when upgrading.
 # go run is used as a fallback when the binary is not present, ensuring CI
-# (golang:1.26 image) runs lint without baking golangci-lint into the image.
+# (golang:1.27 image) runs lint without baking golangci-lint into the image.
 GOLANGCI_LINT_VERSION := v2.12.2
 
 .PHONY: lint
@@ -214,7 +214,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	if [ "$${required}" != "$(GO_BLOB_VER)" ] && [ "$${oldest}" = "$(GO_BLOB_VER)" ]; then \
 		echo "$(RED)✗ go.mod requires go $${required} but the packaged blob is $(GO_BLOB_VER)$(RESET)"; \
 		echo "$(RED)  BOSH compilation pins GOTOOLCHAIN=local, so the package build fails on a compile VM.$(RESET)"; \
-		echo "$(RED)  Bump GO_BLOB_VER (and packages/golang-1.26/*) to $${required}, then run 'make download-blobs upload-blobs'.$(RESET)"; \
+		echo "$(RED)  Bump GO_BLOB_VER (and packages/golang-1.27/*) to $${required}, then run 'make download-blobs upload-blobs'.$(RESET)"; \
 		exit 1; \
 	fi; \
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
@@ -254,7 +254,8 @@ TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
 	--skip-files "manifests/bosh/creds.yml.*" \
 	--skip-files manifests/envs/cpitest/artifacts_ssh \
 	--skip-files config/private.yml \
-	--skip-dirs .e2e-results
+	--skip-dirs .e2e-results \
+	--skip-dirs .claude/worktrees
 
 .PHONY: trivy
 trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if trivy is not installed)
@@ -275,7 +276,7 @@ security: govulncheck gosec trivy ## Run all security scans (govulncheck, gosec,
 
 .PHONY: download-blobs
 download-blobs: ## Download upstream Go blob into blobs/ and register with BOSH
-	@mkdir -p $(BLOBS_DIR)/golang-1.26
+	@mkdir -p $(BLOBS_DIR)/golang-1.27
 	@echo "$(GREEN)==> Go $(GO_BLOB_VER)$(RESET)"
 	@if [ -f $(BLOBS_DIR)/$(GO_BLOB_KEY) ]; then \
 		echo "   already present: $(BLOBS_DIR)/$(GO_BLOB_KEY)"; \

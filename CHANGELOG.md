@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- The packaged Go toolchain moves from 1.26.6 to 1.27.0: the `golang-1.26` BOSH package is now `golang-1.27` with the `go1.27.0.linux-amd64.tar.gz` blob, `src/pve_cpi/go.mod` requires `go 1.27.0`, and CI builds in the digest-pinned `golang:1.27` image.
+
 ## [0.4.0] - 2026-08-21
 
 ### Added

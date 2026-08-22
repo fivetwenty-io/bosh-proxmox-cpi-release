@@ -24,7 +24,7 @@ For small fixes, a pull request is enough. For anything larger, such as a new CP
 
 ### Prerequisites
 
-- Go 1.26 or higher. The BOSH packaging compiles against the `golang-1.26` blob, so local builds should match.
+- Go 1.27 or higher. The BOSH packaging compiles against the `golang-1.27` blob, so local builds should match.
 
 - `golangci-lint`. When it is not installed, `make lint` falls back to `go run` at a pinned version.
 

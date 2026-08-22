@@ -66,7 +66,7 @@ run:
       # remove this block and update image_resource accordingly.
       #
       # Pinned versions:
-      #   bosh-cli   7.8.5   (matches packages/golang-1.26 build target)
+      #   bosh-cli   7.8.5   (matches packages/golang-1.27 build target)
       #   cf-cli     8.x     (CF Foundry maintained apt repo)
       #   credhub    2.9.37  (matches director credhub version in vars)
       #   uv         0.4.x   (astral-sh installer; latest stable)

@@ -7,10 +7,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 1. Locate Go toolchain
 # ---------------------------------------------------------------------------
-GOROOT=/var/vcap/packages/golang-1.26
+GOROOT=/var/vcap/packages/golang-1.27
 if [ ! -d "${GOROOT}" ]; then
   # Relative path used by `bosh create-env` local compilation.
-  GOROOT="$(dirname "${BOSH_INSTALL_TARGET}")/golang-1.26"
+  GOROOT="$(dirname "${BOSH_INSTALL_TARGET}")/golang-1.27"
 fi
 
 # Packaged Go is a Linux ELF; on a macOS operator host running `bosh

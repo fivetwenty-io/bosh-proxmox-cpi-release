@@ -61,7 +61,7 @@ jobs:
 
     container:
       # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
-      # digest the way the other workflows pin golang:1.26; update the pin
+      # digest the way the other workflows pin golang:1.27; update the pin
       # from the digest a ci-image.yml run prints after a Dockerfile change.
       image: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:1bed77dbc5af4e9a26aac03c37f0888071b7f72933fc83a16c9ada05f6943ad4
       # Host-path caches follow the gha-container-cache pattern from ci.yml.

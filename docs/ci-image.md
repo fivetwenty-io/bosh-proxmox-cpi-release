@@ -42,7 +42,7 @@ The stock `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependen
 | `cf` | 8.9.0 | https://github.com/cloudfoundry/cli/releases |
 | `credhub` | 2.9.45 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
 | `uv` | 0.4.30 | https://github.com/astral-sh/uv/releases |
-| `go` | 1.26.6 | golang official image (must match `src/pve_cpi/go.mod`) |
+| `go` | 1.27.0 | golang official image (must match `src/pve_cpi/go.mod`) |
 | `ruby` + `bundler` | 3.3 | ruby official slim image |
 | `python3` + PyYAML | 3.11 | Debian packages (`python3`, `python3-yaml`) |
 | `git`, `jq`, `make`, `curl`, `openssh-client`, `coreutils`, `build-essential` | Debian bookworm | System packages |

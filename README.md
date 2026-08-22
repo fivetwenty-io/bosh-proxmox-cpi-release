@@ -149,7 +149,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 
 ### Requirements
 
-- Go 1.26 or higher (BOSH packaging compiles against the `golang-1.26` blob).
+- Go 1.27 or higher (BOSH packaging compiles against the `golang-1.27` blob).
 
 - `golangci-lint` (`make lint` falls back to `go run` at a pinned version when not installed).
 
@@ -176,7 +176,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | `make release VERSION=X.Y.Z` | Build a versioned BOSH release tarball; prints `RELEASE_TGZ=<path>` |
 | `make release-hygiene` | Assert no loose `bosh-pve-cpi-*.tgz` exists at the repo root |
 | `make release-clean` | Remove `bin/`, coverage artifacts, and release tarballs |
-| `make download-blobs` | Download and register the Go toolchain blob (`golang-1.26`) |
+| `make download-blobs` | Download and register the Go toolchain blob (`golang-1.27`) |
 
 `make release-build` and `make release` are intentionally distinct. `release-build` is the Go-binary-only path for local iteration. `make release` (and `make dev-release`) call `scripts/create-release` to assemble the BOSH release tarball under `dev_releases/` or `releases/` and never produce a loose tarball at the repo root.
 

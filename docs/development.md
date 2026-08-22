@@ -4,7 +4,7 @@ This guide covers building, testing, and contributing to the BOSH PVE CPI Go cod
 
 ## Prerequisites
 
-- Go 1.26 or later (BOSH packaging compiles against the `golang-1.26` blob; see `packages/golang-1.26/`)
+- Go 1.27 or later (BOSH packaging compiles against the `golang-1.27` blob; see `packages/golang-1.27/`)
 - BOSH CLI v2 (optional, for creating BOSH releases): https://bosh.io/docs/cli-v2.html
 - PVE 9.x (optional, for end-to-end integration testing; unit tests do not require a live instance)
 
@@ -51,7 +51,7 @@ cd src/pve_cpi && go test -race -count=1 ./internal/pve
 
 ## Building a BOSH Release
 
-The repository ships BOSH job and package definitions under `jobs/pve_cpi/`, `packages/pve_cpi/`, and `packages/golang-1.26/`. The Go toolchain ships as a blob — register it before the first release:
+The repository ships BOSH job and package definitions under `jobs/pve_cpi/`, `packages/pve_cpi/`, and `packages/golang-1.27/`. The Go toolchain ships as a blob — register it before the first release:
 
 ```bash
 make download-blobs   # downloads + sha256-verifies + bosh add-blob

@@ -1,5 +1,5 @@
 # golangci-lint v2 configuration (schema version "2", requires golangci-lint >= v2.0)
-# Installed: v2.12.2  |  Go module: go 1.26.4
+# Installed: v2.13.1  |  Go module: go 1.27.0
 #
 # Complexity thresholds (gocyclo/gocognit) are tightened to 40 following the
 # handler phase-helper extraction wave (HandleCreateVM, HandleCreateNetwork,

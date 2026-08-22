@@ -2,7 +2,7 @@
 name: pve_cpi
 
 dependencies:
-  - golang-1.26
+  - golang-1.27
 
 files:
   - pve_cpi/cmd/**/*.go

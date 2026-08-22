@@ -57,7 +57,7 @@ flowchart LR
 
 ### Build tools
 
-- `go` (1.26+) and `make` — required to build `bin/cpi` before Tier 1 runs
+- `go` (1.27+) and `make` — required to build `bin/cpi` before Tier 1 runs
 
 ### Manifest files (gitignored)
 

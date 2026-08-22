@@ -23,7 +23,7 @@ The workflow:
 
 - A Linux bridge on the PVE node (default `vmbr0`) with reachable network to the desired Director IP.
 
-- Local tooling: `bosh` CLI v7+, Go 1.26+, `git`, `make`.
+- Local tooling: `bosh` CLI v7+, Go 1.27+, `git`, `make`.
 
 - A workstation that can reach both the PVE API (`https://<pve>:8006`) and the Director IP.
 
