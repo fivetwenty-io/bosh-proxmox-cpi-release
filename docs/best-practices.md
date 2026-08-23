@@ -208,7 +208,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **CPI behavior.** `pve.stemcell_replicate_local` (default `false`) gates replication, and when it is on, `create_stemcell` builds per-node template replicas whenever `vm_storage` classifies as node-local — regardless of the qcow2 pool's shared-ness, and for every stemcell kind including a pre-uploaded `:light:`. A shared qcow2 pool only suppresses the per-node *file* copy; the per-node template is still built. Classification reads PVE's live storage index rather than the raw `shared` flag, so an NFS pool without an explicit `shared: 1` entry is not misclassified. Replication failures are warn-only, and `delete_stemcell` sweeps replicas by sha8 tag.
 
-**Status.** Configurable — leave `stemcell_replicate_local: false` when `vm_storage` is shared; enable it when `vm_storage` is node-local on a multi-node cluster, which otherwise fails at `create_stemcell` time.
+**Status.** Configurable — leave `stemcell_replicate_local: false` when `vm_storage` is shared (a node-local qcow2 staging pool is fine there under the default `template` strategy: one template serves every node via cross-node clone); enable it when `vm_storage` is node-local on a multi-node cluster, which otherwise fails at `create_stemcell` time.
 
 **Cross-node clone pre-flight.**
 

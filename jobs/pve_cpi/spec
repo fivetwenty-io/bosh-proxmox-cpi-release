@@ -45,10 +45,13 @@ properties:
       Storage pool for stemcell qcow2 images. PVE only allows uploads to
       file-based storages (dir, nfs, cifs, glusterfs, cephfs); block-based
       storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads and
-      are rejected at create_stemcell time. Must also be shared across all
-      cluster nodes when the cluster has more than one node. Defaults to
-      vm_storage if unset; in that case vm_storage must satisfy the same
-      constraints.
+      are rejected at create_stemcell time. On a multi-node cluster this
+      pool must be shared, unless vm_storage is shared (e.g. Ceph RBD)
+      and stemcell_strategy is "template": then a node-local file pool is
+      accepted for staging, because the single cache template's disk lives
+      on vm_storage and clones to every node (the import-strategy fallback
+      remains available only on the staging node). Defaults to vm_storage
+      if unset; in that case vm_storage must satisfy the same constraints.
     default: ""
   pve.iso_storage:
     description: |
@@ -1303,7 +1306,10 @@ properties:
 
       Default false: a node-local vm_storage on a multi-node cluster is then
       rejected at create_stemcell time with a clear error directing the
-      operator to use shared storage or enable this flag.
+      operator to use shared storage or enable this flag. Not needed when
+      vm_storage is shared (e.g. Ceph RBD): a single cache template then
+      serves every node via cross-node clone, even when the qcow2 staging
+      pool (stemcell_storage) is node-local.
     default: false
   pve.replica_adopt_timeout_sec:
     description: |

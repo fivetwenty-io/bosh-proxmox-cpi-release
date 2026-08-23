@@ -1911,12 +1911,72 @@ func verifyStemcellQcow2Exists(
 		return nil
 	}
 	if volid == "" {
-		return cpierrors.Cloud(
-			"create_vm: stemcell qcow2 %s:%s not found — re-upload the stemcell (bosh upload-stemcell --fix)",
-			parsed.stemcellStorage, parsed.stemcellVolPath,
-		)
+		return stemcellQcow2MissingError(ctx, deps, logger, node, parsed)
 	}
 	return nil
+}
+
+// stemcellQcow2MissingError builds the confirmed-absence error for
+// verifyStemcellQcow2Exists, distinguishing two very different situations
+// that look identical from the placement node:
+//
+//   - The qcow2 is genuinely gone (deleted, or never uploaded): the generic
+//     "re-upload" guidance is correct.
+//   - The qcow2 exists, but only on another node's copy of a node-local
+//     staging pool (the single-shared-template topology: node-local
+//     stemcell_storage + shared vm_storage). Direct import can never run
+//     from this node; the cache template is the supported route, and this
+//     code path is only reachable because that template was not found
+//     (deleted out of band, or PVE's cluster index is lagging). The generic
+//     "re-upload" guidance would be misleading: upload-stemcell --fix does
+//     repair it, but by rebuilding the template, not by placing a qcow2
+//     here.
+//
+// The cross-node probe is best-effort: enumeration or lookup failures fall
+// back to the generic message. The topology error is retriable because the
+// most common cause (index lag hiding a live template) heals on its own; a
+// genuinely deleted template surfaces the same message, with the rebuild
+// remedy, once the director's bounded retries are exhausted.
+func stemcellQcow2MissingError(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	parsed *createVMParsedArgs,
+) error {
+	generic := cpierrors.Cloud(
+		"create_vm: stemcell qcow2 %s:%s not found — re-upload the stemcell (bosh upload-stemcell --fix)",
+		parsed.stemcellStorage, parsed.stemcellVolPath,
+	)
+	if shared, known := stemcellStorageIsShared(ctx, deps, parsed.stemcellStorage); !known || shared {
+		return generic
+	}
+	nodes, listErr := listClusterNodes(ctx, deps)
+	if listErr != nil {
+		logger.Warn("create_vm: cannot enumerate cluster nodes for cross-node stemcell probe (using generic error)",
+			log.Err(listErr),
+		)
+		return generic
+	}
+	for _, n := range nodes {
+		if n == node {
+			continue
+		}
+		otherVolid, findErr := pve.FindStemcellByFilename(ctx, deps.PVE, n, parsed.stemcellStorage, parsed.stemcellFilename)
+		if findErr != nil {
+			continue
+		}
+		if otherVolid != "" {
+			return cpierrors.Retriable(
+				"create_vm: stemcell qcow2 %s:%s exists only on node %q's node-local storage and cannot be"+
+					" imported from node %q; the stemcell cache template that normally serves this node via"+
+					" cross-node clone was not found (deleted out of band, or PVE's cluster index is lagging);"+
+					" retry the deploy, or run bosh upload-stemcell --fix to rebuild the cache template",
+				parsed.stemcellStorage, parsed.stemcellVolPath, n, node,
+			)
+		}
+	}
+	return generic
 }
 
 // validateStemcellStrategyCloudProp validates the optional per-VM

@@ -680,6 +680,23 @@ func stemcellStorageIsShared(ctx context.Context, deps Deps, storage string) (sh
 	return info.IsShared(), true
 }
 
+// lightStemcellPolicyOpts builds the option set for
+// pve.ValidateLightStemcellStorage: the unpinned-local relaxation applies
+// exactly when the single-shared-template topology holds (strategy is not
+// import, and vm_storage positively classifies as shared), mirroring
+// validateStemcellStorageShared's relaxation on the heavy path so every
+// create_stemcell mode accepts the same configurations. Fail-closed: unknown
+// vm_storage classification keeps rule 5's pin requirement.
+func lightStemcellPolicyOpts(ctx context.Context, deps Deps) []pve.LightStemcellPolicyOption {
+	if deps.Config == nil || deps.Config.StemcellStrategy == config.StemcellStrategyImport {
+		return nil
+	}
+	if vmShared, known := stemcellStorageIsShared(ctx, deps, deps.Config.VMStorage); known && vmShared {
+		return []pve.LightStemcellPolicyOption{pve.WithUnpinnedLocalAccepted()}
+	}
+	return nil
+}
+
 // templateReplicasNeeded reports whether per-node cache-template replicas
 // serve any purpose in this configuration: replication is opt-in
 // (stemcell_replicate_local) and only meaningful when the TEMPLATE-DISK pool
@@ -1577,11 +1594,62 @@ func resolveStemcellStorageAndNode(ctx context.Context, deps Deps) (node, storag
 		return "", "", cpierrors.Cloud("create_stemcell: no stemcell storage configured (stemcell_storage and vm_storage both empty)")
 	}
 
+	// Block-only pools (rbd, lvm, lvmthin, zfspool, ...) hold VM disk images
+	// and can never receive a qcow2 file upload: PVE limits their content to
+	// "Disk image"/"Container". Reaching one here (directly, or through the
+	// vm_storage fallback above) fails fast with guidance instead of an
+	// opaque PVE upload error. Best-effort: an unlisted/unclassifiable pool
+	// falls through and lets the upload itself report the failure.
+	if info, ok := liveStorageInfo(ctx, deps, storage); ok && pve.IsBlockStorage(info.Type) {
+		hint := ""
+		// The node-local-staging hint only holds under strategy=template,
+		// where the single cache template clones cross-node; import reads the
+		// qcow2 from each VM's own node and gets no such relief.
+		if deps.Config.StemcellStrategy != config.StemcellStrategyImport {
+			hint = " (a node-local pool works when vm_storage is shared: the single cache template clones to every node)"
+		}
+		tail := ""
+		if deps.Config.VMStorage != "" {
+			tail = fmt.Sprintf(" and keep vm_storage on %q for the template and VM disks", deps.Config.VMStorage)
+		}
+		return "", "", cpierrors.Cloud(
+			"create_stemcell: stemcell storage %q (type=%q) is block-only and cannot hold stemcell qcow2 files; "+
+				"point stemcell_storage at a file-capable pool (dir/NFS/CIFS/CephFS)%s%s",
+			storage, info.Type, hint, tail,
+		)
+	}
+
 	if validateErr := validateStemcellStorageShared(ctx, deps, storage); validateErr != nil {
 		return "", "", validateErr
 	}
 	node = stemcellStorageOwningNode(ctx, deps, node, storage)
+	if tnErr := validateTemplateNodeReachesStaging(ctx, deps, storage, node); tnErr != nil {
+		return "", "", tnErr
+	}
 	return node, storage, nil
+}
+
+// validateTemplateNodeReachesStaging rejects a stemcell_template_node that
+// cannot see the staged qcow2: with a node-local staging pool the file lands
+// on stagingNode only, and attemptCreateTemplateVM's import-from on any other
+// node fails opaquely at QEMU create time. Only enforced when replication is
+// off (stemcell_replicate_local copies the qcow2 to every node, preserving
+// that configuration's pre-existing behavior) and only on a positively
+// node-local classification; an unknown or shared pool passes.
+func validateTemplateNodeReachesStaging(ctx context.Context, deps Deps, storage, stagingNode string) error {
+	tn := deps.Config.StemcellTemplateNode
+	if tn == "" || tn == stagingNode || deps.Config.StemcellReplicateLocal {
+		return nil
+	}
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && !shared {
+		return cpierrors.Cloud(
+			"create_stemcell: stemcell_template_node %q cannot build the cache template: the stemcell qcow2"+
+				" stages on node %q's node-local storage %q, which node %q cannot read; unset"+
+				" stemcell_template_node, set it to %q, or use a shared stemcell staging pool",
+			tn, stagingNode, storage, tn, stagingNode,
+		)
+	}
+	return nil
 }
 
 // stemcellStorageOwningNode returns the node that storage-scoped API calls
@@ -1945,7 +2013,7 @@ func handleLightStemcellPreUploaded(
 
 	// 2. Apply storage policy via ValidateLightStemcellStorage.
 	policyDeps := newHandlerPolicyDeps(deps)
-	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node)
+	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node, lightStemcellPolicyOpts(ctx, deps)...)
 	if policyErr != nil {
 		return nil, policyErr
 	}
@@ -1993,6 +2061,9 @@ func handleLightStemcellPreUploaded(
 	// never uploaded, reclaimed, or deleted by the CPI (D10).
 	templateNode := node
 	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
+		if tnErr := validateTemplateNodeReachesStaging(ctx, deps, storage, node); tnErr != nil {
+			return nil, tnErr
+		}
 		templateNode = deps.Config.StemcellTemplateNode
 	}
 	stemcellCID := pve.BuildLightStemcellCID(storage, qcow2Filename)
@@ -2144,7 +2215,7 @@ func handleLightStemcellFetch(
 
 	// Apply storage policy (block-type check, multi-node local-pin enforcement).
 	policyDeps := newHandlerPolicyDeps(deps)
-	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node)
+	chosenNode, policyErr := pve.ValidateLightStemcellStorage(ctx, policyDeps, storage, cp.Node, lightStemcellPolicyOpts(ctx, deps)...)
 	if policyErr != nil {
 		return nil, policyErr
 	}
@@ -2167,6 +2238,9 @@ func handleLightStemcellFetch(
 
 	fetchTemplateNode := node
 	if deps.Config != nil && deps.Config.StemcellTemplateNode != "" {
+		if tnErr := validateTemplateNodeReachesStaging(ctx, deps, storage, node); tnErr != nil {
+			return nil, tnErr
+		}
 		fetchTemplateNode = deps.Config.StemcellTemplateNode
 	}
 
@@ -2552,10 +2626,31 @@ func validateStemcellStorageShared(ctx context.Context, deps Deps, storage strin
 		if deps.Config != nil && deps.Config.StemcellReplicateLocal {
 			return nil
 		}
+		// Single-shared-template topology: the qcow2 staging pool only needs
+		// to be reachable from the node that builds the cache template. When
+		// the template-DISK pool (vm_storage) classifies as shared, the one
+		// template's disk clones to any node via cloneFromTemplate's
+		// cross-node Target= redirect, so a node-local staging pool is fine.
+		// The import strategy is excluded: it reads the qcow2 from each VM's
+		// own node at create_vm time, which a local staging pool cannot
+		// serve. Fail-closed on unknown vm_storage classification: the
+		// operator keeps the actionable rejection below.
+		if deps.Config != nil && deps.Config.StemcellStrategy != config.StemcellStrategyImport {
+			if vmShared, known := stemcellStorageIsShared(ctx, deps, deps.Config.VMStorage); known && vmShared {
+				deps.Log(ctx).Info("create_stemcell: stemcell staging storage is node-local but vm_storage is shared; "+
+					"a single cache template will serve all nodes via cross-node clone "+
+					"(import-strategy fallback is only available on the staging node)",
+					log.String("stemcell_storage", storage),
+					log.String("vm_storage", deps.Config.VMStorage),
+				)
+				return nil
+			}
+		}
 		return cpierrors.Cloud(
 			"create_stemcell: stemcell storage %q is local-only but the cluster has %d nodes; "+
 				"set stemcell_replicate_local=true to replicate the template to each node, "+
-				"or use a shared storage pool (NFS, Ceph, CIFS, etc.) accessible from all cluster nodes",
+				"use a shared storage pool (NFS, Ceph, CIFS, etc.) accessible from all cluster nodes, "+
+				"or keep vm_storage on a shared pool (e.g. Ceph RBD) so a single template serves every node via cross-node clone",
 			storage, clusterSize,
 		)
 	}

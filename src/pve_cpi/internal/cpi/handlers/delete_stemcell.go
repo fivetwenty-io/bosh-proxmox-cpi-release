@@ -314,9 +314,21 @@ func handleDeleteStemcellWithTemplate(
 		if delErr := deleteHeavyQcow2Primary(ctx, deps, logger, anchor.Node, storage, volumePath); delErr != nil {
 			return nil, delErr
 		}
+		swept := map[string]bool{anchor.Node: true}
 		for _, r := range replicas {
 			deleteHeavyQcow2ReplicaBestEffort(ctx, deps, logger, r.Node, storage, volumePath)
+			swept[r.Node] = true
 		}
+		// The replica list is empty whenever stemcell_replicate_local is off,
+		// yet stray per-node copies can still exist on a node-local staging
+		// pool: a second CPI entry pinned to another node uploaded its own
+		// copy before cluster-scoped sha-tag dedup converged on one template,
+		// or the template VM migrated off its staging node, dragging
+		// anchor.Node away from where the qcow2 actually lives. Sweep every
+		// node not already covered above when the storage is not positively
+		// shared, the same last-resort convergence the no-template branch
+		// applies.
+		sweepHeavyQcow2OtherNodesBestEffort(ctx, deps, logger, storage, volumePath, swept)
 	}
 
 	// ----------------------------------------------------------------
@@ -387,22 +399,8 @@ func handleDeleteStemcellNoTemplate(
 	// positively known to be shared, best-effort delete the same volume on
 	// every OTHER cluster node too. On genuinely shared storage the primary
 	// delete already removed the cluster's only copy, and on a single-node
-	// cluster the loop below is a same-node no-op.
-	if shared, known := stemcellStorageIsShared(ctx, deps, storage); !known || !shared {
-		otherNodes, listErr := listClusterNodes(ctx, deps)
-		if listErr != nil {
-			logger.Warn("delete_stemcell: cannot enumerate cluster nodes for replica qcow2 cleanup (best-effort, continuing)",
-				log.Err(listErr),
-			)
-		} else {
-			for _, n := range otherNodes {
-				if n == node {
-					continue
-				}
-				deleteHeavyQcow2ReplicaBestEffort(ctx, deps, logger, n, storage, volumePath)
-			}
-		}
-	}
+	// cluster the sweep is a same-node no-op.
+	sweepHeavyQcow2OtherNodesBestEffort(ctx, deps, logger, storage, volumePath, map[string]bool{node: true})
 
 	if deps.Config.StemcellOrphanPruneEnabled() {
 		// No template was destroyed on this branch — nothing to exclude.
@@ -441,6 +439,39 @@ func deleteHeavyQcow2Primary(ctx context.Context, deps Deps, logger *log.Logger,
 		log.String("node", node),
 	)
 	return nil
+}
+
+// sweepHeavyQcow2OtherNodesBestEffort best-effort deletes storage:volumePath
+// on every cluster node not already in skip, but only when storage is NOT
+// positively classified as shared: on genuinely shared storage the primary
+// delete already removed the cluster's only copy, and per-node sweeping would
+// re-delete (harmlessly) or waste API calls. Unknown classification sweeps:
+// convergence over economy, matching the fail-open stance of the no-template
+// branch this helper was factored from. Node-enumeration failure warns and
+// returns, since every delete here is best-effort by contract.
+func sweepHeavyQcow2OtherNodesBestEffort(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	storage, volumePath string,
+	skip map[string]bool,
+) {
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && shared {
+		return
+	}
+	otherNodes, listErr := listClusterNodes(ctx, deps)
+	if listErr != nil {
+		logger.Warn("delete_stemcell: cannot enumerate cluster nodes for replica qcow2 cleanup (best-effort, continuing)",
+			log.Err(listErr),
+		)
+		return
+	}
+	for _, n := range otherNodes {
+		if skip[n] {
+			continue
+		}
+		deleteHeavyQcow2ReplicaBestEffort(ctx, deps, logger, n, storage, volumePath)
+	}
 }
 
 // deleteHeavyQcow2ReplicaBestEffort deletes the same storage:volumePath on a

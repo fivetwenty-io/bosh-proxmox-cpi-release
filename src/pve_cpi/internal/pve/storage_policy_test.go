@@ -257,6 +257,38 @@ func TestValidateLightStemcellStorage_MultiNode_LocalNoPin_Reject(t *testing.T) 
 	}
 }
 
+// Test 10b: multi-node + local dir + NO node, but the caller vouches that
+// placement no longer depends on the upload node (single-shared-template
+// topology) → accepted, empty chosenNode so the caller falls back to its
+// configured node.
+func TestValidateLightStemcellStorage_MultiNode_LocalNoPin_UnpinnedOptionAccepts(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("local", "dir", 3)
+	node, err := ValidateLightStemcellStorage(context.Background(), deps, "local", "",
+		WithUnpinnedLocalAccepted())
+	if err != nil {
+		t.Fatalf("unexpected error with WithUnpinnedLocalAccepted: %v", err)
+	}
+	if node != "" {
+		t.Errorf("chosenNode = %q, want empty (caller resolves)", node)
+	}
+}
+
+// Test 10c: the option relaxes ONLY rule 5 — block-only storage is still
+// rejected with it set (rule 1 evaluates first).
+func TestValidateLightStemcellStorage_UnpinnedOption_BlockStillRejected(t *testing.T) {
+	t.Parallel()
+	deps := singleStorageStub("vg0", "lvm", 3)
+	_, err := ValidateLightStemcellStorage(context.Background(), deps, "vg0", "",
+		WithUnpinnedLocalAccepted())
+	if err == nil {
+		t.Fatal("expected block-only rejection to survive WithUnpinnedLocalAccepted")
+	}
+	if !strings.Contains(err.Error(), "block-only") {
+		t.Errorf("error %q should mention block-only", err.Error())
+	}
+}
+
 // Test 11: multi-node + zfspool (block) + node pinned → still rejected (rule 1 first).
 func TestValidateLightStemcellStorage_BlockReject_ZFSPool(t *testing.T) {
 	t.Parallel()

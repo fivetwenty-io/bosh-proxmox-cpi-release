@@ -37,7 +37,12 @@ type CPIConfig struct {
 	// StemcellStorage receives qcow2 uploads and is referenced via
 	// "<storage>:import/<filename>" in scsi0's `import-from=`. PVE only
 	// allows uploads to file-based storages (dir/nfs/cifs/glusterfs/cephfs);
-	// block storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads.
+	// block storages (lvm, lvmthin, zfspool, rbd) cannot accept qcow2 uploads
+	// (create_stemcell rejects them with guidance). On a multi-node cluster
+	// this pool must be shared, unless VMStorage is shared and the strategy
+	// is "template": then a node-local file pool is accepted for staging,
+	// since the single cache template's disk lives on VMStorage and clones
+	// cross-node (validateStemcellStorageShared).
 	StemcellStorage string `json:"stemcell_storage"`
 
 	// StemcellStagingDir is an optional absolute path that scopes all stemcell
@@ -506,8 +511,11 @@ type CPIConfig struct {
 	//
 	// Default false. When false, the existing behavior applies: local storage on a
 	// multi-node cluster is rejected at create_stemcell time with a clear error
-	// directing the operator to use shared storage. Setting this to true opts the
-	// operator into the replication strategy as an alternative to shared storage.
+	// directing the operator to use shared storage, except when VMStorage is
+	// shared and the strategy is "template", where a single cache template
+	// serves every node via cross-node clone and no replication is needed.
+	// Setting this to true opts the operator into the replication strategy as
+	// an alternative to shared storage.
 	// validate-only-when-set; omit from ERB when false.
 	StemcellReplicateLocal bool `json:"stemcell_replicate_local,omitempty"`
 

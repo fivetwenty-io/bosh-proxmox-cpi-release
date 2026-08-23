@@ -66,7 +66,7 @@ The returned `stemcell_cid` is a path-identity CID identifying the qcow2 file it
 - **`:light:<storage>:import/<file>`** — an operator-managed qcow2 (the `image_id` mode below). The CPI never deletes this file, no matter how many directors stop referencing it.
 - **`:heavy:<storage>:import/<file>`** — a CPI-uploaded or CPI-downloaded qcow2 (the default tarball path, `image_url`, and `source_url` modes). The CPI deletes this file when the last director reference within this cluster is dropped, in `delete_stemcell`.
 
-`cloud_properties` must include `name` and `version`; both are required to build the deterministic filename and cache-template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes (or local storage on a single-node cluster, or with `pve.stemcell_replicate_local` enabled for per-node replicas).
+`cloud_properties` must include `name` and `version`; both are required to build the deterministic filename and cache-template name. `stemcell_storage` must be a shared storage pool accessible from all cluster nodes (or local storage on a single-node cluster, or with `pve.stemcell_replicate_local` enabled for per-node replicas, or a node-local staging pool when `vm_storage` is shared and `stemcell_strategy` is `template`: the single cache template then clones to every node).
 
 **Light stemcell cloud_properties:**
 

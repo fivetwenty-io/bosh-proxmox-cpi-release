@@ -156,6 +156,26 @@ func ValidateTemplateCloneStorage(
 	return cloudPropsNode, nil
 }
 
+// LightStemcellPolicyOption adjusts ValidateLightStemcellStorage's rule
+// evaluation. Options are handler-supplied context the policy cannot derive
+// from the storage alone.
+type LightStemcellPolicyOption func(*lightStemcellPolicyOptions)
+
+type lightStemcellPolicyOptions struct {
+	unpinnedLocalAccepted bool
+}
+
+// WithUnpinnedLocalAccepted relaxes rule 5: multi-node local storage without
+// a cloud_properties.node pin is accepted instead of rejected. Callers pass
+// it only after establishing that VM placement does not depend on the upload
+// node — the single-shared-template topology (strategy=template, shared
+// vm_storage).
+func WithUnpinnedLocalAccepted() LightStemcellPolicyOption {
+	return func(o *lightStemcellPolicyOptions) {
+		o.unpinnedLocalAccepted = true
+	}
+}
+
 // ValidateLightStemcellStorage applies the light-stemcell storage policy.
 // It returns the node the caller should target for the stemcell operation,
 // or a non-nil *cpierrors.Error when the storage configuration is incompatible.
@@ -177,9 +197,15 @@ func ValidateTemplateCloneStorage(
 //  4. Multi-node cluster + local storage + cloudPropsNode provided — ACCEPT.
 //     The upload must land on the pinned node. Returns cloudPropsNode.
 //
-//  5. Multi-node cluster + local storage + no cloudPropsNode — REJECT.
-//     Without a node pin, the CPI cannot guarantee upload and VM placement
-//     land on the same node. Returns a human-readable operator message.
+//  5. Multi-node cluster + local storage + no cloudPropsNode — REJECT,
+//     unless WithUnpinnedLocalAccepted was passed. Without a node pin, the
+//     CPI cannot guarantee upload and VM placement land on the same node —
+//     unless the caller has established that placement no longer depends on
+//     the upload node (single-shared-template topology: strategy=template
+//     with a shared vm_storage pool, where the one cache template serves
+//     every node via cross-node clone). With the option, ACCEPT and return
+//     "" so the caller falls back to its configured node. Returns a
+//     human-readable operator message otherwise.
 //
 // Inputs:
 //   - ctx: standard context; passed to deps methods unchanged.
@@ -199,7 +225,12 @@ func ValidateLightStemcellStorage(
 	deps PolicyDeps,
 	storage string,
 	cloudPropsNode string,
+	opts ...LightStemcellPolicyOption,
 ) (chosenNode string, err error) {
+	var policyOpts lightStemcellPolicyOptions
+	for _, opt := range opts {
+		opt(&policyOpts)
+	}
 	if storage == "" {
 		return "", cpierrors.Cloud("validate_light_stemcell_storage: storage name required")
 	}
@@ -233,8 +264,12 @@ func ValidateLightStemcellStorage(
 		return cloudPropsNode, nil
 	}
 
-	// Rules 4/5: multi-node + local storage — node pin required.
+	// Rules 4/5: multi-node + local storage — node pin required, unless the
+	// caller established that placement no longer depends on the upload node.
 	if cloudPropsNode == "" {
+		if policyOpts.unpinnedLocalAccepted {
+			return "", nil
+		}
 		return "", cpierrors.Cloud(
 			"validate_light_stemcell_storage: storage %q is local on a multi-node cluster (%d nodes);"+
 				" set cloud_properties.node to pin the stemcell upload to a specific node",
