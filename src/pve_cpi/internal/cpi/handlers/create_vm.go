@@ -950,7 +950,7 @@ func createVMWithFallback(
 		if attemptErr != nil {
 			// Clean up this attempt's partial VM (if any was created).
 			if vmid != 0 {
-				cleanupVMDetached(ctx, deps, candidateNode, vmid, logger)
+				cleanupVMDetached(ctx, deps, candidateNode, vmid, parsed.env, logger)
 			}
 
 			if !shouldFallback || isLast {
@@ -1604,7 +1604,7 @@ func attemptStemcellTemplateClone(
 				log.String("sha8", sha8),
 				log.ErrScrubbed(cloneErr),
 			)
-			cleanupVMDetached(ctx, deps, shape.node, candidate, logger)
+			cleanupVMDetached(ctx, deps, shape.node, candidate, nil, logger)
 			return false, nil
 		}
 		// Classify for retry: VMID conflicts and transient transport faults are

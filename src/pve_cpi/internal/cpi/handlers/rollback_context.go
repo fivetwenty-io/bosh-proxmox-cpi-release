@@ -10,11 +10,14 @@ import (
 // correct — cleanup must survive the caller's cancellation or deadline — but
 // without re-imposing a deadline the SDK's 30-minute HTTP timeout multiplied
 // by retry budgets lets a single rollback hold in-flight semaphore slots and
-// Director workers for hours against an unresponsive node. Two minutes
-// mirrors the dispatcher middleware's rollback bound (internal/cpi
-// middleware.go) and comfortably covers the realistic cleanup shapes: a
-// destroy call plus a task await, or a volume delete plus await.
-const rollbackCleanupTimeout = 2 * time.Minute
+// Director workers for hours against an unresponsive node. Five minutes
+// covers the realistic cleanup shapes: the common case is a destroy call
+// plus a task await, but cleanupVM's foreign-disk protection can add config
+// reads, per-disk detaches, and — for stable-ID disks — a full parker
+// transfer with its own move_disk task await per disk. Exhausting the bound
+// fails closed (the purge is refused and the VM preserved), so the cost of a
+// too-small budget is unnecessary orphans, not data loss.
+const rollbackCleanupTimeout = 5 * time.Minute
 
 // sdnCleanupTimeout bounds delete_network's SDN teardown, which detaches from
 // the request ctx so a cancelled caller cannot leave half-applied SDN state.

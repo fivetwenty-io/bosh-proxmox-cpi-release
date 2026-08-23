@@ -258,7 +258,7 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 	case pve.IsTransientTransport(cerr):
 		// Clone POST may or may not have committed — sweep the candidate VMID
 		// before retrying so the cluster list is clean.
@@ -266,12 +266,12 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 	default:
 		// Non-retryable error (e.g. local-storage cross-node violation,
 		// template not found, or other PVE fatal). Clean up any partial VM
 		// state and propagate — AllocateWithRetry will not retry.
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 	}
 	return cerr
 }

@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- The `create_vm` rollback no longer destroys an attached persistent disk. When a create failed after the persistent disk was already attached (agent configure, VM start, or a post-start check, including the node-fallback retry), the rollback purged the VM with disk destruction enabled and PVE destroyed every referenced volume, including the persistent disk a `bosh recreate` was re-attaching. The rollback now detaches foreign persistent disks to safety first, exactly as `delete_vm` does, and when that protection cannot complete it preserves and tags the VM instead of purging it — an orphaned VM is recoverable, a purged persistent volume is not. The fast-path delete's straggler sweep gained the same protection: a `bosh-deleting` VM whose foreign-disk detach failed on the original delete is now deferred to the `delete_vm` retry instead of being destroyed with the disk still attached. Both paths also treat pmxcfs's "Configuration file ... does not exist" answer as the vanished-VM condition it is, rather than refusing to proceed.
+
 ### Changed
 
 - The packaged Go toolchain moves from 1.26.6 to 1.27.0: the `golang-1.26` BOSH package is now `golang-1.27` with the `go1.27.0.linux-amd64.tar.gz` blob, `src/pve_cpi/go.mod` requires `go 1.27.0`, and CI builds in the digest-pinned `golang:1.27` image.

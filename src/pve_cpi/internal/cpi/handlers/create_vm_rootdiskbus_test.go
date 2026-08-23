@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -132,9 +133,13 @@ func rootDiskBusCloneArgs(agentID string) []json.RawMessage {
 // (resolveTemplateDiskStorage) and the post-clone cloned-config read used to
 // patch root-disk perf options.
 func configFnWithDisk(diskKey string) func(context.Context, string, int) (map[string]any, error) {
-	return func(_ context.Context, _ string, _ int) (map[string]any, error) {
+	return func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+		// PVE names a VM's disks after their owner, so the config read for the
+		// template and for the cloned VM each see their own vmid embedded in
+		// the volume name (a mismatched vmid would read as a foreign
+		// persistent disk to the rollback guard).
 		return map[string]any{
-			diskKey: storageName + ":vm-6042-disk-0,size=5G",
+			diskKey: fmt.Sprintf("%s:vm-%d-disk-0,size=5G", storageName, vmid),
 			"net0":  "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0",
 		}, nil
 	}
@@ -201,7 +206,10 @@ func TestCreateVM_ClonePath_RootDiskBus_SCSI_MatchingTemplate_Succeeds(t *testin
 func TestCreateVM_ClonePath_RootDiskBus_SCSI_MismatchedVirtioTemplate_FailsFast(t *testing.T) {
 	t.Parallel()
 	// createQemuCloneFn intentionally left nil: CreateQemuClone panics if
-	// called, proving the fail-fast guard rejects before any PVE mutation.
+	// called, proving the bus-mismatch guard rejects before the clone API
+	// call. (The rejection still triggers the clone-error rollback, which
+	// reads the candidate VM's config, finds no foreign disks to protect,
+	// and cleans up the never-cloned candidate idempotently.)
 	n := &vmMockNodes{}
 	q := &vmMockQEMU{configFn: configFnWithDisk("virtio0")}
 	a := &vmMockAgent{}

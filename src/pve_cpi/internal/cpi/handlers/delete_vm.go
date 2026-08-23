@@ -159,6 +159,37 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			}
 			destroyDisks = destroyDisks && !retained
 		}
+		// A straggler can still hold a foreign persistent disk on an active
+		// slot: fastPathDeleteVM stamps bosh-deleting BEFORE its
+		// detachForeignActiveDisks call, so a failed detach leaves a tagged
+		// VM whose purge here would destroy the volume. Defer such a
+		// straggler instead of destroying it -- the Director's delete_vm
+		// retry re-runs the real detach (including parker transfers), and
+		// once the disks are off, a later sweep or the retry itself reaps
+		// the VM. A config-read failure defers too (fail-closed), except
+		// the two "VM already gone" shapes, where the destroy below is
+		// idempotent.
+		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID))
+		if strCfgErr != nil && !pve.IsNotFound(strCfgErr) && !pve.IsPmxcfsConfigMissing(strCfgErr) {
+			sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
+				log.Err(strCfgErr))
+			continue
+		}
+		if strCfgErr == nil {
+			if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID)); len(foreign) > 0 {
+				sweepLogger.Warn("delete_vm: straggler sweep: foreign persistent disks still attached; deferring to the delete_vm retry to detach them",
+					log.Any("slots", foreign))
+				continue
+			}
+		}
+		// Same unusedN protection the sync and fast paths run: a persistent
+		// volume demoted to unusedN (snapshot-pinned, sweep-resistant) would
+		// be destroyed with the VM.
+		if guardErr := guardUnusedVolumes(ctx, deps, item.Node, vmIDStr, int(item.VMID), deps.Config.DiskStorage); guardErr != nil {
+			sweepLogger.Warn("delete_vm: straggler sweep: unused-volume guard refused destroy; deferring straggler to next sweep (non-fatal)",
+				log.Err(guardErr))
+			continue
+		}
 		// Fire-and-forget: discard the UPID, no await. Purge's pool-membership
 		// interplay: see the synchronous-path DeleteQemu comment in
 		// HandleDeleteVM.
@@ -255,9 +286,11 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	}
 
 	// Protect attached persistent disks before the skiplock destroy. Synchronous
-	// config PUTs only — does not introduce an unbounded await. A bosh-deleting
-	// straggler reaped by sweepFastDeleteStragglers already had its foreign disks
-	// detached on this initial fast-path call, so the sweep needs no guard.
+	// config PUTs only — does not introduce an unbounded await. When this detach
+	// fails, the VM stays tagged bosh-deleting with the disk still attached;
+	// sweepFastDeleteStragglers defers exactly that shape (it re-checks for
+	// foreign active disks before destroying), so the disk survives until a
+	// delete_vm retry detaches it.
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
 		return protErr
 	}
@@ -802,12 +835,14 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid int, diskStorage string) error {
 	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if cfgErr != nil {
-		if !pve.IsNotFound(cfgErr) {
+		if !pve.IsNotFound(cfgErr) && !pve.IsPmxcfsConfigMissing(cfgErr) {
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("delete_vm: read config for VM %s before destroy", vmCID))
 		}
-		// 404 here means the VM is gone -- fall through to the destroy
-		// call below, which handles the NotFound case idempotently.
+		// A 404 -- or pmxcfs's "Configuration file ... does not exist" 500,
+		// which is the same condition wearing a different status code --
+		// means the VM is gone; fall through to the destroy call below,
+		// which handles the NotFound case idempotently.
 		return nil
 	}
 
@@ -899,8 +934,10 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
 	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
 	if cfgErr != nil {
-		if pve.IsNotFound(cfgErr) {
-			return nil // VM gone — destroy path handles idempotently
+		if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
+			// VM gone (404, or pmxcfs's config-missing 500) — the destroy
+			// path handles the absence idempotently.
+			return nil
 		}
 		return cpierrors.Wrap(pve.WrapError(cfgErr),
 			fmt.Sprintf("delete_vm: read config for VM %s before foreign-disk detach", vmCID))

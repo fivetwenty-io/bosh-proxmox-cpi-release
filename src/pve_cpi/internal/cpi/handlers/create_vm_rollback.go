@@ -48,7 +48,7 @@ func handleCreateError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 	}
 	return cerr
 }
@@ -77,7 +77,7 @@ func handleAwaitError(
 		// PVE rolled back its own qmcreate task — but the
 		// VMID may still be registered with the partial
 		// state. Clean up before the next attempt.
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 		return werr
 	}
 	if pve.IsTransientTransport(werr) {
@@ -88,14 +88,14 @@ func handleAwaitError(
 		// The qmcreate task itself may still be running on
 		// PVE — we only lost the await connection. Clean
 		// up the VMID so a fresh attempt has a clean slate.
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 		return werr
 	}
 	// Non-conflict failure after Create succeeded: the VM may
 	// have been partially registered. Roll back this attempt
 	// before propagating so the next retry (which won't run)
 	// or the caller sees a clean slate.
-	cleanupVMDetached(ctx, deps, node, candidate, logger)
+	cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 	return werr
 }
 
@@ -130,7 +130,7 @@ func rollbackOnExit(
 			*retErr = preserveFailedVMError(*retErr, vmid, node)
 			return
 		}
-		cleanupVMDetached(ctx, deps, node, vmid, logger)
+		cleanupVMDetached(ctx, deps, node, vmid, env, logger)
 	}
 }
 
@@ -221,6 +221,49 @@ func preserveFailedVMError(orig error, vmid int, node string) error {
 	)
 }
 
+// protectForeignDisksOnRollback keeps a rollback purge from destroying
+// persistent volumes the failed create already attached. With config in hand
+// it runs the same two guards delete_vm runs before its destroy:
+// detachForeignActiveDisks (stable-ID disks transfer to a parker so the
+// anchor promise survives; legacy disks plain-detach and stay free-floating)
+// and guardUnusedVolumes (a persistent volume demoted to unusedN must not
+// ride the purge either). Without config (the shared helper is reachable
+// with deps.Config unset) the transfer guard cannot run, so a foreign disk
+// on an active slot refuses the purge outright instead.
+//
+// Two deliberate asymmetries with delete_vm's use of the same guards. First,
+// delete_vm confirms the VM stopped before detaching; here the Stop above is
+// best-effort and unawaited-on-error, so a detach can race a still-running
+// guest. The transfer path tolerates a running source (detach-to-unusedN,
+// then reassign), and any detach failure fails closed into the preserve
+// branch -- the cost of the race is an unnecessary orphan, never a lost
+// volume. Second, the reused helpers log and wrap errors with their native
+// "delete_vm:" prefix; during a create_vm rollback those lines appear inside
+// the create_vm request's log stream. Accepted for now to keep the guards
+// byte-identical with the delete path they mirror.
+func protectForeignDisksOnRollback(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
+	if deps.Config == nil {
+		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+		if cfgErr != nil {
+			if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
+				return nil // VM gone -- the purge below is idempotent about that
+			}
+			return cpierrors.Wrap(pve.WrapError(cfgErr),
+				fmt.Sprintf("create_vm: rollback: read config for VM %s before purge", vmCID))
+		}
+		if foreign := pve.FindForeignActiveDisks(cfg, vmid); len(foreign) > 0 {
+			return cpierrors.Cloud(
+				"create_vm: rollback: refusing to purge VM %s -- persistent disks still attached on active slots and no CPI config is available to park them: %v",
+				vmCID, foreign)
+		}
+		return nil
+	}
+	if err := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); err != nil {
+		return err
+	}
+	return guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage)
+}
+
 // --------------------------------------------------------------------------
 // cleanupVM attempts to stop and purge a created VM on error. All errors are
 // logged but suppressed so the original error propagates unmodified.
@@ -239,10 +282,16 @@ func preserveFailedVMError(orig error, vmid int, node string) error {
 // survives caller cancellation without inheriting the SDK's 30-minute
 // transport timeout times a retry budget as its only bound (see
 // detachedContext).
-func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
+// env carries the deploy identity for failure tagging: callers rolling back
+// the final VM of a create (rollbackOnExit, the node-fallback loop) pass the
+// parsed env so a VM preserved by the foreign-disk guard is tagged and
+// findable; callers cleaning up an intermediate allocation candidate (which
+// cannot have persistent disks attached and has no deploy identity worth
+// stamping) pass nil.
+func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	rbCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 	defer rbCancel()
-	cleanupVM(rbCtx, deps, node, vmid, nil, logger)
+	cleanupVM(rbCtx, deps, node, vmid, env, logger)
 }
 
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
@@ -274,6 +323,32 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
 			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 		}
+	}
+
+	// Protect persistent disks before the purge. The purge below destroys
+	// every disk the VM config references -- including a persistent disk
+	// attachPersistentDisks already attached when a later create stage (agent
+	// configure, start, post-start checks) failed and armed this rollback.
+	// delete_vm runs detachForeignActiveDisks for exactly this reason; the
+	// rollback path must too, or a routine start timeout turns into the loss
+	// of the very volume the recreate was trying to re-attach. Fail-closed:
+	// when the disks cannot be moved to safety, the VM is tagged and LEFT --
+	// an orphaned VM is recoverable, a purged persistent volume is not.
+	if protErr := protectForeignDisksOnRollback(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
+		logger.Error("create_vm: rollback: persistent disks could not be detached to safety; preserving the VM instead of purging it (detach the disks, then remove the VM with delete_vm or qm destroy)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(protErr))
+		if env != nil {
+			tagFailedVM(ctx, deps, node, vmid, env, logger)
+		}
+		// The preserved VM is outside BOSH's view (no CID was ever returned),
+		// so nothing will ever GC its cluster-level HA rule; drop the pin now.
+		// The ConfigDrive ISO is deliberately kept -- the preserved VM still
+		// references it, and the operator's eventual delete removes it.
+		if pinErr := removeNodeAffinityPin(ctx, deps, vmid, logger); pinErr != nil {
+			logger.Warn("create_vm: rollback node-affinity pin cleanup incomplete on preserved VM (non-fatal)",
+				log.Int(metadataKeyVMID, vmid), log.Err(pinErr))
+		}
+		return
 	}
 
 	// Purge the VM. DestroyUnreferencedDisks follows pve.destroy_unreferenced_disks

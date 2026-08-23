@@ -154,7 +154,7 @@ func applyPVEConfigWithCleanup(
 	logger *log.Logger,
 ) error {
 	if err := applyPVEConfigPassthrough(ctx, deps, node, candidate, cfg, logger); err != nil {
-		cleanupVMDetached(ctx, deps, node, candidate, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
 		return err
 	}
 	return nil
