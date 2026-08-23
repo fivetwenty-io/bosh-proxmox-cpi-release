@@ -22,6 +22,7 @@ func attachDepsPerfWithStorageType(qemuSvc qemu.Service, cfg *config.CPIConfig, 
 		Config: cfg,
 		PVE: &mockPVEClient{
 			qemuSvc:           qemuSvc,
+			clusterSvc:        attachClusterWithVM100(),
 			clusterStorageSvc: &mockClusterStorage{storageName: storageName, storageType: storageType},
 		},
 		Logger: log.NewNopLogger(),

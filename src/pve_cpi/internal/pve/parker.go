@@ -40,7 +40,6 @@ import (
 	"strings"
 	"time"
 
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
@@ -562,11 +561,12 @@ func FindParkerForNode(ctx context.Context, c Client, node string, cfg ParkerCon
 
 // ListParkersForNode returns all parker VMIDs on node in ascending VMID order.
 //
-// One /cluster/resources?type=vm request carries the vmid, the node, and the
-// tag string of every guest, which is everything the band check and the
-// parker-tag check need. A row in the band on this node whose tags are empty
-// gets one config read to settle the question, since an empty field means
-// either an untagged VM or a PVE that does not populate it there.
+// One GET /nodes/<node>/qemu request carries the vmid and the tag string of
+// every guest on the node, which is everything the band check and the
+// parker-tag check need, and it is served from the node's own pmxcfs view
+// with none of the /cluster/resources index lag. A row in the band whose
+// tags are empty gets one config read to settle the question, since an empty
+// field means either an untagged VM or a PVE that does not populate it there.
 //
 // An earlier shape walked the band VMID by VMID and issued a fresh cluster
 // listing plus a config read for each occupied one — 1+2K requests where K is
@@ -594,63 +594,41 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 			cfg.VMIDRangeStart, cfg.VMIDRangeEnd)
 	}
 
-	typeStr := "vm"
-	var resp *sdkcluster.ListResourcesResponse
+	// The node's own qemu listing, not the /cluster/resources index: the
+	// listing is served from the node's pmxcfs view with no index lag (a
+	// parker created moments ago by a concurrent park is visible), it
+	// answers with QEMU guests only (no LXC rows to filter), and every row
+	// belongs to this node by construction (no empty-node fallback needed).
+	var raws []json.RawMessage
 	listErr := RetryOnTransient(ctx, nil, "list_parkers_for_node", 0, func() error {
-		var inner error
-		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-		return inner
+		resp, inner := c.Nodes().ListQemu(ctx, node, nil)
+		if inner != nil {
+			return inner
+		}
+		raws = nil
+		if resp != nil {
+			raws = *resp
+		}
+		return nil
 	})
 	if listErr != nil {
-		return nil, cpierrors.Wrap(WrapConfigReadError(listErr), "ListParkersForNode: list cluster resources")
-	}
-	if resp == nil {
-		// Retriable, matching the same condition in FindVMByDiskVolid and
-		// listClusterVMIDs: a pvedaemon coming back up answers with an empty
-		// body, and this listing runs on every park -- a permanent class here
-		// fails the detach_disk that triggered it for good.
-		return nil, cpierrors.Retriable("ListParkersForNode: nil response from cluster resources")
+		return nil, cpierrors.Wrap(WrapConfigReadError(listErr), "ListParkersForNode: list node guests")
 	}
 
 	var result []int
-	for _, raw := range *resp {
-		var entry struct {
-			VMID int64  `json:"vmid"`
-			Node string `json:"node"`
-			Tags string `json:"tags"`
-			Type string `json:"type"`
-		}
+	for _, raw := range raws {
+		var entry qemuListItem
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
-		// The cluster resource type "vm" covers both QEMU guests and LXC
-		// containers, and every read below this point goes through the QEMU
-		// config endpoint. An LXC container that happens to sit in the parker
-		// band would fail that read, and because an untagged row's read is
-		// fail-loud, one container in the band would break every park and
-		// unpark on the node. A container is never a parker; skip it. A row
-		// that elides "type" is kept: dropping it would be the same
-		// band-exhausting mistake as dropping a row with no node.
-		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
-			continue
-		}
-		vmid := int(entry.VMID)
+		vmid := int(entry.Vmid)
 		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
 			continue
 		}
-		// A row that elides "node" is rare but real on some PVE versions, and
-		// FindVMByDiskVolid already carries a fallback for exactly that. Treat
-		// an empty node as the node being asked about: dropping such rows makes
-		// this function always return empty, so every park creates a fresh
-		// parker and exhausts the band it exists to conserve.
-		rowNode := entry.Node
-		if rowNode == "" {
-			rowNode = node
+		tags := ""
+		if entry.Tags != nil {
+			tags = *entry.Tags
 		}
-		if rowNode != node {
-			continue
-		}
-		tags := entry.Tags
 		if tags == "" {
 			// The row carries no tags. That is either a genuinely untagged VM
 			// sharing the band, or a PVE that does not populate the field, and
@@ -726,7 +704,7 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		c,
 		func(vmid int) error {
 			params := map[string]any{
-				"vmid":          vmid,
+				cfgKeyVMID:      vmid,
 				cfgKeyName:      parkerVMName(vmid),
 				cfgKeyTags:      tags,
 				paramProtection: protection,
@@ -851,8 +829,7 @@ type diskHolder struct {
 // of the same answer, so ParkDisk resolves the holder once and reads both from
 // it rather than paying for the sweep twice on every detach.
 func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (diskHolder, error) {
-	holderVMID, holderNode, holderTags, found, err := FindVMByDiskVolidOrNoneTagged(
-		ctx, c, cfg.FallbackNode, bareVolid)
+	holderVMID, holderNode, holderTags, found, err := FindVMByDiskVolidOrNoneTagged(ctx, c, bareVolid)
 	if err != nil {
 		return diskHolder{}, err
 	}
@@ -2184,6 +2161,9 @@ const cfgKeyTags = "tags"
 
 // cfgKeyName is the QEMU create/update config key for the VM name.
 const cfgKeyName = "name"
+
+// cfgKeyVMID is the QEMU create param key for the VM ID.
+const cfgKeyVMID = "vmid"
 
 // paramProtection is the QEMU create/update config key for the PVE
 // protection flag.

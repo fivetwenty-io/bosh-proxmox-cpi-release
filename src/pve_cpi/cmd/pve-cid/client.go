@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
@@ -24,8 +23,8 @@ const envConfigPath = "PVE_CPI_CONFIG"
 // location, used when neither --config nor $PVE_CPI_CONFIG is set.
 const defaultConfigPath = "/var/vcap/jobs/pve_cpi/config/cpi.json"
 
-// ClusterVM is the subset of a GET /cluster/resources "qemu" row pve-cid's
-// online subcommands need.
+// ClusterVM is the subset of an authoritative per-node qemu listing row
+// pve-cid's online subcommands need.
 type ClusterVM struct {
 	VMID int
 	Node string
@@ -53,8 +52,9 @@ type StorageContentItem struct {
 // service slices rather than the full SDK client. pve-cid never calls a
 // mutating PVE endpoint, so Reader exposes only List/Get-shaped methods.
 type Reader interface {
-	// ListClusterVMs returns every QEMU guest (VM or template) visible via
-	// GET /cluster/resources?type=vm, decoded into ClusterVM.
+	// ListClusterVMs returns every QEMU guest (VM or template) in the
+	// cluster, decoded into ClusterVM. Backed by authoritative per-node
+	// listings, so it does not carry the /cluster/resources index lag.
 	ListClusterVMs(ctx context.Context) ([]ClusterVM, error)
 	// VMConfig returns the raw GET /nodes/{node}/qemu/{vmid}/config response
 	// for vmid on node.
@@ -92,46 +92,28 @@ func newPVEReader(client pve.Client) Reader {
 func strPtr(s string) *string { return &s }
 
 func (r *pveReader) ListClusterVMs(ctx context.Context) ([]ClusterVM, error) {
-	if r.client == nil || r.client.Cluster() == nil {
-		return nil, fmt.Errorf("pve-cid: no cluster service available")
+	if r.client == nil {
+		return nil, fmt.Errorf("pve-cid: no client available")
 	}
-	typ := "vm"
-	resp, err := r.client.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+	// Authoritative per-node listings, not the /cluster/resources index: the
+	// index lags node-local state by minutes, so an inventory read from it
+	// would misreport a fresh template or VM as absent (and a fresh entry as
+	// an orphan). The enumeration fails loudly when any node cannot be
+	// listed, which an inventory tool must surface rather than silently
+	// under-report.
+	guests, err := pve.ListGuestsAuthoritative(ctx, r.client, nil)
 	if err != nil {
-		return nil, fmt.Errorf("pve-cid: list cluster resources: %w", err)
-	}
-	if resp == nil {
-		return nil, nil
+		return nil, fmt.Errorf("pve-cid: list cluster guests: %w", err)
 	}
 
 	var out []ClusterVM
-	for _, raw := range *resp {
-		var entry struct {
-			Type string `json:"type"`
-			VMID int64  `json:"vmid"`
-			Node string `json:"node"`
-			Name string `json:"name"`
-			Tags string `json:"tags"`
-			// Decoded through pveIntBool because PVE serialises this as 1/0,
-			// not true/false — a plain bool field silently fails to decode
-			// the whole row.
-			Template pveIntBool `json:"template,omitempty"`
-		}
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			// Malformed element — skip; do not fail the whole scan (matches
-			// internal/pve's own tolerance of individual malformed rows).
-			continue
-		}
-		if entry.Type != "qemu" || entry.VMID <= 0 {
-			// Excludes lxc containers and any other non-VM resource row.
-			continue
-		}
+	for _, g := range guests {
 		out = append(out, ClusterVM{
-			VMID:     int(entry.VMID),
-			Node:     entry.Node,
-			Name:     entry.Name,
-			Tags:     entry.Tags,
-			Template: bool(entry.Template),
+			VMID:     g.VMID,
+			Node:     g.Node,
+			Name:     g.Name,
+			Tags:     g.Tags,
+			Template: g.Template,
 		})
 	}
 	return out, nil

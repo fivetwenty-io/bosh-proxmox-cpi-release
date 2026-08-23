@@ -14,12 +14,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // cleanupAdvertisedRoutes removes the SDN subnets recorded in the deleted
@@ -39,7 +37,7 @@ func cleanupAdvertisedRoutes(ctx context.Context, deps Deps, vmid int, tagsRaw s
 	defer opCancel()
 	clusterSvc := deps.PVE.Cluster()
 
-	shared := advrtTagsHeldByOthers(opCtx, clusterSvc, vmid, logger)
+	shared := advrtTagsHeldByOthers(opCtx, deps, vmid, logger)
 	if shared == nil {
 		// Refcount scan failed — cannot prove sole ownership of any route.
 		// Fail open: leave every subnet in place.
@@ -67,32 +65,25 @@ func cleanupAdvertisedRoutes(ctx context.Context, deps Deps, vmid int, tagsRaw s
 }
 
 // advrtTagsHeldByOthers returns the set of advrt tags carried by any OTHER
-// VM in the cluster (one ListResources scan). nil signals the scan failed
-// and callers must not delete anything.
-func advrtTagsHeldByOthers(ctx context.Context, clusterSvc sdkcluster.Service, vmid int, logger *log.Logger) map[string]bool {
-	typ := "vm"
-	resp, err := clusterSvc.ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+// VM in the cluster. The scan reads authoritative per-node listings
+// (ListGuestsAuthoritative), not the /cluster/resources index: the index
+// lags by minutes, and a young VM sharing the route tag would be invisible
+// to it, turning "sole holder" into a wrong answer that deletes a subnet
+// still in use. nil signals the scan failed and callers must not delete
+// anything (fail open, leave subnets in place).
+func advrtTagsHeldByOthers(ctx context.Context, deps Deps, vmid int, logger *log.Logger) map[string]bool {
+	guests, err := pve.ListGuestsAuthoritative(ctx, deps.PVE, logger)
 	if err != nil {
 		logger.Warn("delete_vm: advertised-route cleanup skipped — could not list cluster VMs for refcount",
 			log.Err(err))
 		return nil
 	}
 	shared := make(map[string]bool)
-	if resp == nil {
-		return shared
-	}
-	for _, raw := range *resp {
-		var entry struct {
-			VMID int64  `json:"vmid"`
-			Tags string `json:"tags"`
-		}
-		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
+	for _, g := range guests {
+		if g.VMID == vmid {
 			continue
 		}
-		if int(entry.VMID) == vmid {
-			continue
-		}
-		for _, ref := range parseAdvertisedRouteTags(entry.Tags) {
+		for _, ref := range parseAdvertisedRouteTags(g.Tags) {
 			shared[ref.tag] = true
 		}
 	}

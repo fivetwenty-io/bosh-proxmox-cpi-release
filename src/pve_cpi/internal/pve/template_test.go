@@ -629,25 +629,101 @@ func makeClusterResourcesResponse(items []clusterResourceItem) *sdkcluster.ListR
 	return &resp
 }
 
-// templateClusterService satisfies cluster.Service via embedding (nil embed —
-// panics on unimplemented methods) with only ListResources overridden.
-type templateClusterService struct {
-	sdkcluster.Service
-	listResourcesFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+// authFixtureAdapter translates the ListResources-shaped fixture fn into the
+// authoritative per-node listing surface the cluster-scoped template lookups
+// now read (ListClusterConfigNodes + per-node ListQemu). Cluster membership
+// is the distinct node names of the fixture rows ("pve1" when the fixture
+// yields none, so an empty fixture reads as an empty cluster rather than a
+// failed enumeration); each node's qemu listing carries the fixture's qemu
+// rows for that node. An fn error surfaces from the membership listing.
+type authFixtureAdapter struct {
+	fn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
 }
 
-func (s *templateClusterService) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-	if s.listResourcesFn != nil {
-		return s.listResourcesFn(ctx, params)
+func (a *authFixtureAdapter) rows(ctx context.Context) ([]clusterResourceItem, error) {
+	if a.fn == nil {
+		return nil, nil
 	}
-	resp := sdkcluster.ListResourcesResponse{}
+	resp, err := a.fn(ctx, &sdkcluster.ListResourcesParams{})
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	var out []clusterResourceItem
+	for _, raw := range *resp {
+		var item clusterResourceItem
+		if json.Unmarshal(raw, &item) != nil {
+			continue
+		}
+		if item.Node == "" {
+			item.Node = "pve1"
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+type authFixtureCluster struct {
+	sdkcluster.Service
+	ad *authFixtureAdapter
+}
+
+func (s *authFixtureCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	rows, err := s.ad.rows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var nodes []string
+	for _, r := range rows {
+		if !seen[r.Node] {
+			seen[r.Node] = true
+			nodes = append(nodes, r.Node)
+		}
+	}
+	if len(nodes) == 0 {
+		nodes = []string{"pve1"}
+	}
+	resp := make(sdkcluster.ListConfigNodesResponse, 0, len(nodes))
+	for _, n := range nodes {
+		resp = append(resp, json.RawMessage(`{"name": "`+n+`"}`))
+	}
 	return &resp, nil
 }
 
-// newClusterTemplateClient builds a mockClient whose Cluster().ListResources
-// is served by fn.
+type authFixtureNodes struct {
+	sdknodes.Service
+	ad *authFixtureAdapter
+}
+
+func (s *authFixtureNodes) ListQemu(ctx context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	rows, err := s.ad.rows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp := make(sdknodes.ListQemuResponse, 0)
+	for _, r := range rows {
+		// A per-node qemu listing carries QEMU guests only; lxc containers
+		// and non-VM resource rows never appear in it by construction.
+		if r.Type != "qemu" || r.Node != node {
+			continue
+		}
+		raw, mErr := json.Marshal(r)
+		if mErr != nil {
+			continue
+		}
+		resp = append(resp, raw)
+	}
+	return &resp, nil
+}
+
+// newClusterTemplateClient builds a mockClient serving the fixture fn through
+// the authoritative per-node listing surface (see authFixtureAdapter).
 func newClusterTemplateClient(fn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)) *mockClient {
-	return &mockClient{clusterSvc: &templateClusterService{listResourcesFn: fn}}
+	ad := &authFixtureAdapter{fn: fn}
+	return &mockClient{clusterSvc: &authFixtureCluster{ad: ad}, nodesSvc: &authFixtureNodes{ad: ad}}
 }
 
 func TestFindTemplatesBySHATagCluster_MatchesAcrossNodes(t *testing.T) {
@@ -1073,4 +1149,10 @@ func TestFindTemplatesBySHATagNode_EmptyInputs(t *testing.T) {
 	if _, err := pve.FindTemplatesBySHATagNode(context.Background(), c, "", "abc12345"); err == nil {
 		t.Error("empty node must error")
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (s *authFixtureCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

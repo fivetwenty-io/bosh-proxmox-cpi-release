@@ -283,6 +283,22 @@ func (n *migFakeNodes) CreateQemuMigrate(_ context.Context, node string, vmidStr
 	return &resp, nil
 }
 
+// ListQemu derives the node's listing from the fake's placed VMs, mirroring
+// ListResources, so the allocator's authoritative leg sees the same state.
+func (n *migFakeNodes) ListQemu(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	resp := sdknodes.ListQemuResponse{}
+	for vmid, vmNode := range n.c.nodes {
+		if vmNode != node {
+			continue
+		}
+		b, _ := json.Marshal(map[string]any{"vmid": vmid})
+		resp = append(resp, b)
+	}
+	return &resp, nil
+}
+
 func (n *migFakeNodes) DeleteQemu(_ context.Context, node string, vmidStr string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
@@ -317,6 +333,34 @@ func (cl *migFakeCluster) ListResources(context.Context, *sdkcluster.ListResourc
 		resp = append(resp, b)
 	}
 	return &resp, nil
+}
+
+// ListConfigNodes derives the membership from the fake's vmid-to-node map
+// (fallback "pve1" when no VM is placed yet), the surface the allocator's
+// authoritative enumeration fans out over.
+func (cl *migFakeCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	cl.c.mu.Lock()
+	defer cl.c.mu.Unlock()
+	seen := map[string]bool{}
+	resp := sdkcluster.ListConfigNodesResponse{}
+	for _, node := range cl.c.nodes {
+		if node == "" || seen[node] {
+			continue
+		}
+		seen[node] = true
+		b, _ := json.Marshal(map[string]any{"name": node})
+		resp = append(resp, b)
+	}
+	if len(resp) == 0 {
+		resp = append(resp, json.RawMessage(`{"name": "pve1"}`))
+	}
+	return &resp, nil
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (cl *migFakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }
 
 // migFakeBackendResolver classifies every storage with a fixed kind and

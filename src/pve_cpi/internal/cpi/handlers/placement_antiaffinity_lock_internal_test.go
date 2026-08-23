@@ -11,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 // aaLockPools is a fake PoolService backing the cluster lock, sharing an ordered
@@ -84,7 +85,13 @@ func aaLockConfig(mode string, verify bool, timeoutSec int) *config.CPIConfig {
 func aaDepsLock(cfg *config.CPIConfig, stub *aaClusterStub, pools *aaLockPools) Deps {
 	return Deps{
 		Config: cfg,
-		PVE:    &icPVEClient{clusterSvc: stub, poolsSvc: pools},
+		PVE: &icPVEClient{
+			clusterSvc: stub,
+			poolsSvc:   pools,
+			nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return stub.ListResources(ctx, p)
+			}},
+		},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),
 	}

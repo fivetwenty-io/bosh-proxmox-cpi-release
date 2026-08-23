@@ -311,6 +311,59 @@ func TestDeleteStemcell_Light_LastRef_TemplateDestroyed_FileNeverDeleted(t *test
 	}
 }
 
+// TestDeleteStemcell_CoMatchForeignRef_SurvivesAnchorSweep pins the
+// per-co-match ref gate: the anchor's ref set going empty proves nothing
+// about a same-sha8 twin frozen by another director. The twin's OWN
+// provenance names dir-b, so the last-ref sweep destroys the anchor and
+// preserves the twin (a deliberate leak in the safe direction, reclaimable
+// by the orphan prune once the twin's own refs empty).
+func TestDeleteStemcell_CoMatchForeignRef_SurvivesAnchorSweep(t *testing.T) {
+	t.Parallel()
+
+	const anchorVMID = int64(8101)
+	const twinVMID = int64(8102)
+	var destroyedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyedVMIDs = append(destroyedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == int(twinVMID) {
+				// The twin's own provenance still references dir-b.
+				return directorRefsDescMap("dir-b"), nil
+			}
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(anchorVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
+				clusterTemplateItem(twinVMID, "pve2", "stemcell-cache-twin", cacheTemplateTags(testStemcellSHA8)),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(destroyedVMIDs) != 1 || destroyedVMIDs[0] != fmt.Sprintf("%d", anchorVMID) {
+		t.Errorf("want only the anchor %d destroyed (twin %d carries dir-b's live ref); destroys=%v",
+			anchorVMID, twinVMID, destroyedVMIDs)
+	}
+}
+
 func TestDeleteStemcell_Light_NoTemplates_NoOp(t *testing.T) {
 	t.Parallel()
 
@@ -1096,6 +1149,14 @@ func TestDeleteStemcell_SHA8Unextractable_WarnsAndSkipsClusterLookup(t *testing.
 			listResourcesCalled = true
 			return &sdkcluster.ListResourcesResponse{}, nil
 		},
+		// Static membership keeps listResourcesCalled a pure template-lookup
+		// observable: the default ListConfigNodes derives membership from
+		// ListResources, which would trip the flag on the qcow2 sweep.
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			nodeEntry, _ := json.Marshal(map[string]string{"name": vmNode})
+			resp := sdkcluster.ListConfigNodesResponse{nodeEntry}
+			return &resp, nil
+		},
 	}
 	storageSvc := &deleteStemcellMockStorage{}
 	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{clusterSvc: clusterSvc, storageSvc: storageSvc, logger: logger})
@@ -1158,8 +1219,13 @@ func TestDeleteStemcell_OrphanPrune_Disabled_NoSecondListResourcesCall(t *testin
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if listResourcesCalls != 1 {
-		t.Errorf("expected exactly 1 ListResources call (template lookup only, no orphan scan), got %d", listResourcesCalls)
+	// Five fixture reads, all template lookups and the best-effort qcow2
+	// sweep: the cluster-wide sha-tag lookup derives membership and the
+	// per-node listing (two), the per-node sha-tag lookup derives membership
+	// and its listing (two more), and the cross-node qcow2 sweep lists
+	// membership once. An orphan scan would add more.
+	if listResourcesCalls != 5 {
+		t.Errorf("expected exactly 5 fixture reads (template lookups + qcow2 sweep, no orphan scan), got %d", listResourcesCalls)
 	}
 }
 
@@ -1206,8 +1272,10 @@ func TestDeleteStemcell_OrphanPrune_EmptyDirectorUUID_Skipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if listResourcesCalls != 1 {
-		t.Errorf("expected exactly 1 ListResources call (prune must be skipped before any orphan scan), got %d", listResourcesCalls)
+	// Five fixture reads (see the no-orphan-scan test above for the
+	// breakdown); the skipped prune must add none.
+	if listResourcesCalls != 5 {
+		t.Errorf("expected exactly 5 fixture reads (prune must be skipped before any orphan scan), got %d", listResourcesCalls)
 	}
 	if !strings.Contains(buf.String(), "carried no director UUID") {
 		t.Errorf("expected a Warn log about orphan prune skipping due to missing director UUID, got: %s", buf.String())
@@ -1334,6 +1402,72 @@ func TestDeleteStemcell_OrphanPrune_CandidateWithForeignRef_NotPruned(t *testing
 	for _, id := range deletedVMIDs {
 		if id == fmt.Sprintf("%d", foreignRefVMID) {
 			t.Errorf("candidate carrying a live foreign director ref must NOT be pruned, destroys=%v", deletedVMIDs)
+		}
+	}
+}
+
+// TestDeleteStemcell_OrphanPrune_SoleRefDifferentSHA8_NotPruned pins the
+// sha8 half of the prune gate: a candidate whose sole director ref is this
+// caller's own UUID is still a healthy cache when its provenance sha8 names
+// a DIFFERENT stemcell than the one being deleted: this director still has
+// that stemcell registered, and pruning would force a re-upload on its next
+// create_vm.
+func TestDeleteStemcell_OrphanPrune_SoleRefDifferentSHA8_NotPruned(t *testing.T) {
+	t.Parallel()
+
+	const primaryVMID = int64(7911)
+	const otherStemcellVMID = int64(7912)
+	const dirUUID = "dir-scope"
+
+	var deletedVMIDs []string
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			deletedVMIDs = append(deletedVMIDs, vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == int(otherStemcellVMID) {
+				// Sole own ref, but the provenance sha8 names a different
+				// stemcell than this delete call's CID.
+				return map[string]any{"description": directorRefsDescJSON("ffff0000", dirUUID)}, nil
+			}
+			return directorRefsDescMap(dirUUID), nil
+		},
+	}
+	dirTag := "director--" + dirUUID
+	var listCall int
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			listCall++
+			if listCall == 1 {
+				items := sdkcluster.ListResourcesResponse{clusterTemplateItem(primaryVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8))}
+				return &items, nil
+			}
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(otherStemcellVMID, "pve2", "other-stemcell-cache", "bosh-stemcell;"+dirTag),
+			}
+			return &items, nil
+		},
+	}
+	tr := true
+	cfg := &config.CPIConfig{
+		Node: vmNode, StemcellStorage: "local", VMStorage: "local", DiskStorage: "local",
+		Stemcell: &config.StemcellProvenanceConfig{PruneOrphans: &tr},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{cfg: cfg, qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: dirUUID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, id := range deletedVMIDs {
+		if id == fmt.Sprintf("%d", otherStemcellVMID) {
+			t.Errorf("sole-own-ref candidate for a different stemcell must NOT be pruned, destroys=%v", deletedVMIDs)
 		}
 	}
 }

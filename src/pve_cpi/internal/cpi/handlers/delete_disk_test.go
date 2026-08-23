@@ -742,10 +742,12 @@ func TestHandleDeleteDisk_NoClusterCallExpected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Exactly one cluster call: the unconditional holder scan. Allocating a disk
+	// Exactly two fixture reads, both from the unconditional holder scan's
+	// authoritative enumeration: cluster membership and the per-node listing
+	// each derive from the same ListResources fixture. Allocating a disk
 	// VMID, which delete_disk must never do, would add another.
-	if clusterCalls != 1 {
-		t.Errorf("delete_disk should make exactly one cluster call (the holder scan); got %d", clusterCalls)
+	if clusterCalls != 2 {
+		t.Errorf("delete_disk should read the cluster fixture exactly twice (holder-scan membership + node listing); got %d", clusterCalls)
 	}
 }
 
@@ -946,13 +948,15 @@ func TestHandleDeleteDisk_Guard_Off_NoOwnerLookup(t *testing.T) {
 		t.Error("guard off: delete must proceed")
 	}
 	// The delete-state guard is off, so the only lookups left belong to the
-	// unconditional holder scan: one cluster listing and one config read to find
-	// the volume in that VM. The stranded-parker decision reads the tags that
-	// same read returned, so it adds nothing -- which is also what keeps it from
-	// having to decide what an unreadable config means on a path whose fallback
-	// is destroying the volume. The guard would add its own owner lookup on top.
-	if *listCalls != 1 || *configReads != 1 {
-		t.Errorf("guard off: only the holder scan should look (config=%d, list=%d)", *configReads, *listCalls)
+	// unconditional holder scan: two fixture reads (the authoritative
+	// enumeration derives cluster membership and the per-node listing from
+	// the same fixture) and one config read to find the volume in that VM.
+	// The stranded-parker decision reads the tags that same read returned, so
+	// it adds nothing, which is also what keeps it from having to decide
+	// what an unreadable config means on a path whose fallback is destroying
+	// the volume. The guard would add its own owner lookup on top.
+	if *listCalls != 2 || *configReads != 1 {
+		t.Errorf("guard off: only the holder scan should look (config=%d want 1, list=%d want 2)", *configReads, *listCalls)
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -123,8 +122,11 @@ import (
 //     prune with a Warn rather than falling back to any shared sentinel (an
 //     unscoped prune could destroy another caller's abandoned template). Each
 //     candidate's own provenance director_refs is read before it is
-//     destroyed — a candidate is pruned only when that set is empty or
-//     contains exactly this director's UUID, and never when its VMID is one
+//     destroyed: a candidate is pruned only when that set is empty, or when
+//     it contains exactly this director's UUID AND the candidate's
+//     provenance sha8 matches the stemcell being deleted (a sole-ref
+//     template for a different stemcell is healthy cache), and never when
+//     its VMID is one
 //     this call already handled above (excludeVMIDs); the marker tag alone
 //     is not sufficient (nothing ever removes it on deregistration) and an
 //     unfiltered destroy can hit a template this director still actively
@@ -179,18 +181,22 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 			}
 		}
 
-		// The cluster listing above is /cluster/resources-fed and can be
-		// minutes stale on a loaded cluster: a template create_stemcell froze
-		// moments ago is invisible there, and a replica or twin can be missing
-		// from a non-empty listing just as easily as an anchor from an empty
-		// one. Both destructive conclusions this handler draws — "no template,
-		// delete the qcow2" and "these are ALL the templates, sweep them" —
-		// therefore always get the authoritative per-node sweep unioned in,
-		// not only on an empty cluster answer. Sweeping all nodes rather than
-		// guessing the template's home matters: create_stemcell can build on
-		// a node other than the configured one (owning-node retarget of a
-		// node-restricted staging pool, a cloud_properties node pin, or
-		// adoption of an existing template found elsewhere).
+		// Both lookup legs now read the authoritative per-node listings with
+		// identical filtering (FindTemplatesBySHATagCluster runs on
+		// ListGuestsAuthoritative and FindTemplatesBySHATagNode mirrors its
+		// template/sha/generation gates), so unlike the /cluster/resources
+		// era the second sweep is not covering an index-lag blind spot. It is
+		// retained deliberately for two reasons: it is a second read of a
+		// surface that can change between the two calls (a template frozen
+		// mid-handler joins the union instead of being missed), and its
+		// partial-failure semantics below are the load-bearing part: the
+		// qcow2 delete must only run when ABSENCE was proven against every
+		// node, while a found ref-anchor may proceed on a partial sweep.
+		// Sweeping all nodes rather than guessing the template's home
+		// matters: create_stemcell can build on a node other than the
+		// configured one (owning-node retarget of a node-restricted staging
+		// pool, a cloud_properties node pin, or adoption of an existing
+		// template found elsewhere).
 		//
 		// An incomplete sweep (enumeration failure, or any node's probe
 		// failing) is fatal exactly when it would feed the no-template or
@@ -318,18 +324,38 @@ func handleDeleteStemcellWithTemplate(
 	// ----------------------------------------------------------------
 	// Step 4: anchor + sweep destroy, gated by the director-UUID ref set.
 	// ----------------------------------------------------------------
+	// destroyedVMIDs feeds step 7's excludeVMIDs: only templates this call
+	// actually destroyed are excluded from the orphan prune, so a co-match
+	// the gate skipped (or whose destroy failed) stays visible to the prune,
+	// keeping the "reclaimable by the orphan prune" promise inside this same
+	// call instead of deferring it to an unrelated later one.
+	destroyedVMIDs := make(map[int64]bool, len(replicas)+1)
 	destroyFn := func(ctx context.Context) error {
 		if delErr := destroyTemplateVM(ctx, deps, anchor.Node, anchor.VMID, cidStr); delErr != nil {
 			return delErr
 		}
+		destroyedVMIDs[anchor.VMID] = true
 		for _, r := range replicas {
+			// The anchor's ref set going empty proves nothing about a
+			// co-match's own references: a twin frozen by another director
+			// carries that director's live ref in its own provenance, and
+			// destroying it here would take a cache another caller depends
+			// on. Skip any co-match whose own refs name anyone but this
+			// director; a skipped one is a deliberate leak in the safe
+			// direction, reclaimable by the orphan prune once its own refs
+			// empty.
+			if !coMatchSafeToSweep(ctx, deps, r, directorUUID, logger) {
+				continue
+			}
 			if delErr := destroyTemplateVM(ctx, deps, r.Node, r.VMID, cidStr); delErr != nil {
 				logger.Warn("delete_stemcell: replica template destroy failed (best-effort, continuing)",
 					log.String("node", r.Node),
 					log.Int64("vmid", r.VMID),
 					log.Err(delErr),
 				)
+				continue
 			}
+			destroyedVMIDs[r.VMID] = true
 		}
 		return nil
 	}
@@ -390,12 +416,8 @@ func handleDeleteStemcellWithTemplate(
 	// template(s) this call just destroyed above.
 	// ----------------------------------------------------------------
 	if deps.Config.StemcellOrphanPruneEnabled() {
-		excludeVMIDs := make(map[int64]bool, len(replicas)+1)
-		excludeVMIDs[anchor.VMID] = true
-		for _, r := range replicas {
-			excludeVMIDs[r.VMID] = true
-		}
-		pruneOrphanStemcellTemplates(ctx, deps, cidStr, directorUUID, excludeVMIDs)
+		deleteSHA8, _ := extractSHA8FromPathCIDVolume(volumePath)
+		pruneOrphanStemcellTemplates(ctx, deps, cidStr, deleteSHA8, directorUUID, destroyedVMIDs)
 	}
 
 	return nil, nil
@@ -458,7 +480,8 @@ func handleDeleteStemcellNoTemplate(
 
 	if deps.Config.StemcellOrphanPruneEnabled() {
 		// No template was destroyed on this branch — nothing to exclude.
-		pruneOrphanStemcellTemplates(ctx, deps, cidStr, directorUUID, nil)
+		deleteSHA8, _ := extractSHA8FromPathCIDVolume(volumePath)
+		pruneOrphanStemcellTemplates(ctx, deps, cidStr, deleteSHA8, directorUUID, nil)
 	}
 
 	return nil, nil
@@ -663,7 +686,8 @@ func extractSHA8FromPathCIDVolume(volumePath string) (sha8 string, ok bool) {
 // stemcell still carries it. Before destroying a candidate, its OWN
 // provenance director_refs is read and checked
 // (directorRefsAllowPrune): only a candidate whose live ref set is empty, or
-// contains exactly this director's UUID and no one else's, is pruned. A
+// whose sole ref is this director's UUID while its provenance sha8 matches
+// the stemcell being deleted, is pruned. A
 // candidate whose provenance cannot be read or parsed is skipped
 // (conservative — matches deregisterStemcellDirectorRef's own
 // unparseable-description rule). excludeVMIDs additionally skips every
@@ -681,7 +705,7 @@ func extractSHA8FromPathCIDVolume(volumePath string) (sha8 string, ok bool) {
 // sentinel could destroy another caller's abandoned template that happens to
 // share the same "no identity" bucket. An empty directorUUID skips the prune
 // entirely (Warn only).
-func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, directorUUID string, excludeVMIDs map[int64]bool) {
+func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, deleteSHA8, directorUUID string, excludeVMIDs map[int64]bool) {
 	dryRun := deps.Config.StemcellOrphanPruneDryRun()
 	logger := deps.Log(ctx).With(
 		log.String("operation", "delete_stemcell.orphan_prune"),
@@ -701,55 +725,40 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, direct
 		return
 	}
 
-	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	// Candidates come from the authoritative per-node listings, not the
+	// /cluster/resources index: a template frozen inside the index lag window
+	// would be invisible to an index-fed scan, and the prune would report
+	// success while the orphan survives. The prune is best-effort, so an
+	// enumeration failure skips it with a Warn rather than failing the
+	// delete_stemcell call. Tolerant form: the prune destroys only what it
+	// FINDS (each candidate re-gated on its own config read), so excluding an
+	// offline member merely leaves that node's orphans for a later call.
+	guests, _, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, logger)
 	if err != nil {
-		logger.Warn("delete_stemcell: ListResources failed; orphan prune skipped", log.Err(err))
-		return
-	}
-	if resp == nil {
+		logger.Warn("delete_stemcell: guest enumeration failed; orphan prune skipped", log.Err(err))
 		return
 	}
 
-	type clusterItem struct {
-		Type string `json:"type"`
-		VMID int64  `json:"vmid"`
-		Node string `json:"node"`
-		Name string `json:"name"`
-		Tags string `json:"tags"`
-		// Template is decoded through clusterPruneBool, not *bool/*int — see
-		// clusterPruneBool's doc comment for why a fixed numeric encoding
-		// assumption silently drops or wrongly matches rows.
-		Template *clusterPruneBool `json:"template"`
-	}
-
-	for _, raw := range *resp {
-		var item clusterItem
-		if json.Unmarshal(raw, &item) != nil {
+	for _, g := range guests {
+		if !g.Template || g.VMID == 0 {
 			continue
 		}
-		if item.Type != resourceTypeQemu || item.VMID == 0 {
+		if excludeVMIDs[int64(g.VMID)] {
 			continue
 		}
-		if item.Template == nil || !bool(*item.Template) {
+		if !tagsContain(g.Tags, stemcellMarkerTag) {
 			continue
 		}
-		if excludeVMIDs[item.VMID] {
-			continue
-		}
-		if !tagsContain(item.Tags, stemcellMarkerTag) {
-			continue
-		}
-		if !tagsContain(item.Tags, dirTag) {
+		if !tagsContain(g.Tags, dirTag) {
 			continue
 		}
 		nodeLogger := logger.With(
-			log.String("node", item.Node),
-			log.Int("vmid", int(item.VMID)),
-			log.String("name", item.Name),
+			log.String("node", g.Node),
+			log.Int("vmid", g.VMID),
+			log.String("name", g.Name),
 		)
 
-		vmidInt := int(item.VMID) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
-		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, item.Node, vmidInt)
+		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, g.Node, g.VMID)
 		if cfgErr != nil {
 			if pve.IsNotFound(cfgErr) {
 				nodeLogger.Info("delete_stemcell: orphan prune: candidate already gone (skipping)")
@@ -765,9 +774,10 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, direct
 			nodeLogger.Warn("delete_stemcell: orphan prune: candidate description not parseable JSON; conservative — not pruning")
 			continue
 		}
-		if !directorRefsAllowPrune(prov.DirectorRefs, directorUUID) {
-			nodeLogger.Info("delete_stemcell: orphan prune: candidate carries live director refs beyond this director; skipping",
+		if !directorRefsAllowPrune(prov, directorUUID, deleteSHA8) {
+			nodeLogger.Info("delete_stemcell: orphan prune: candidate not prunable under this director and stemcell; skipping",
 				log.Int("director_ref_count", len(prov.DirectorRefs)),
+				log.String("candidate_sha8", prov.SHA8),
 			)
 			continue
 		}
@@ -776,7 +786,7 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, direct
 			nodeLogger.Info("delete_stemcell: orphan prune: would prune (dry-run)")
 			continue
 		}
-		if delErr := destroyTemplateVM(ctx, deps, item.Node, item.VMID, cidStr); delErr != nil {
+		if delErr := destroyTemplateVM(ctx, deps, g.Node, int64(g.VMID), cidStr); delErr != nil {
 			if pve.IsBaseVolumeInUse(delErr) {
 				nodeLogger.Warn("delete_stemcell: orphan prune: skip — referenced by linked clone")
 			} else {
@@ -788,45 +798,73 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, direct
 	}
 }
 
+// coMatchSafeToSweep reports whether a co-matching template (replica or
+// twin) may be destroyed as part of directorUUID's last-ref sweep. The
+// anchor's ref set is authoritative only for the anchor; a twin frozen by
+// another director carries that director's live ref in its OWN provenance,
+// so each co-match is judged on its own refs: empty, or naming only this
+// director, allows the sweep. Already-gone co-matches report false (nothing
+// to destroy); unreadable or unparseable provenance reports false
+// (conservative, matching the orphan prune's rule).
+//
+// The comparison resolves directorUUID through directorRefOrSentinel because
+// every WRITER of DirectorRefs does the same: a create-env request carries no
+// director UUID, so its refs read ["unknown-director"], and comparing them
+// against the raw empty string would brand this call's own replicas as
+// foreign and leak them permanently.
+func coMatchSafeToSweep(ctx context.Context, deps Deps, r pve.TemplateRef, directorUUID string, logger *log.Logger) bool {
+	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, r.Node, int(r.VMID))
+	if cfgErr != nil {
+		if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
+			return false
+		}
+		logger.Warn("delete_stemcell: cannot read co-match provenance; conservative, not destroying",
+			log.String("node", r.Node),
+			log.Int64("vmid", r.VMID),
+			log.Err(cfgErr),
+		)
+		return false
+	}
+	prov, ok := parseStemcellProvenanceFromDescription(stringConfigField(cfg, pveConfigKeyDescription))
+	if !ok {
+		logger.Warn("delete_stemcell: co-match description not parseable; conservative, not destroying",
+			log.String("node", r.Node),
+			log.Int64("vmid", r.VMID),
+		)
+		return false
+	}
+	want := directorRefOrSentinel(directorUUID)
+	for _, ref := range prov.DirectorRefs {
+		if ref != want {
+			logger.Info("delete_stemcell: co-match carries a foreign director ref; preserving",
+				log.String("node", r.Node),
+				log.Int64("vmid", r.VMID),
+			)
+			return false
+		}
+	}
+	return true
+}
+
 // directorRefsAllowPrune reports whether a candidate template's own
-// provenance director_refs permits pruning it under directorUUID's scope: an
-// empty set (no live reference at all) or a set containing EXACTLY
-// directorUUID and no one else. Any other non-empty set means some director
-// (this one alongside another, or a different one entirely) still actively
-// references the template — pruning it would destroy a live cache another
-// caller depends on.
-func directorRefsAllowPrune(refs []string, directorUUID string) bool {
+// provenance permits pruning it under directorUUID's scope. An empty ref set
+// (no live reference at all) always allows. A sole ref equal to
+// directorUUID allows only when the candidate's provenance sha8 matches the
+// stemcell this delete_stemcell call is deleting: a sole-ref template for a
+// DIFFERENT stemcell is a healthy cache this director still has registered,
+// and pruning it would force a re-upload on that stemcell's next create_vm.
+// Any other non-empty set means some director (this one alongside another,
+// or a different one entirely) still actively references the template;
+// pruning it would destroy a live cache another caller depends on.
+func directorRefsAllowPrune(prov stemcellProvenance, directorUUID, deleteSHA8 string) bool {
+	refs := prov.DirectorRefs
 	if len(refs) == 0 {
 		return true
 	}
-	return len(refs) == 1 && refs[0] == directorUUID
-}
-
-// clusterPruneBool decodes the "template" field of a GET /cluster/resources
-// row for the orphan-prune scan. Mirrors internal/pve's pveBool decode
-// (internal/pve/template.go) locally — that type is unexported in package
-// pve and unreachable from here. PVE (Perl-backed) usually renders this
-// boolean as the JSON numbers 1/0, but some endpoints and most fixtures use
-// the JSON literals true/false, and a handful return "1"/"0" as strings. A
-// *bool decode fails on the integer form and would silently drop every
-// candidate from the scan (defeating the prune entirely); a *int decode
-// fails on the boolean/string forms and does the same. All of 1/0,
-// true/false, "1"/"0"/"true"/"false", and null are accepted here so the scan
-// degrades gracefully across PVE API versions instead of going silently
-// blind to one encoding.
-type clusterPruneBool bool
-
-// UnmarshalJSON accepts 1/0, true/false, "1"/"0"/"true"/"false", and null.
-func (b *clusterPruneBool) UnmarshalJSON(data []byte) error {
-	switch s := strings.Trim(strings.TrimSpace(string(data)), `"`); s {
-	case "1", "true":
-		*b = true
-	case "0", "false", "", "null":
-		*b = false
-	default:
-		return fmt.Errorf("clusterPruneBool: cannot decode %q as a PVE boolean", s)
+	if len(refs) != 1 || refs[0] != directorUUID {
+		return false
 	}
-	return nil
+	return deleteSHA8 != "" && prov.SHA8 == deleteSHA8
 }
 
 // destroyTemplateVM deletes the template VM identified by vmid on node with

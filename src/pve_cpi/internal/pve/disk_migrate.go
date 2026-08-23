@@ -481,7 +481,7 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 		c,
 		func(vmid int) error {
 			params := map[string]any{
-				"vmid":          vmid,
+				cfgKeyVMID:      vmid,
 				cfgKeyName:      parkerVMName(vmid),
 				cfgKeyTags:      tags,
 				paramProtection: protection,

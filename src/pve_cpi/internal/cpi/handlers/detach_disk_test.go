@@ -1436,11 +1436,14 @@ func TestHandleDetachDisk_RealVMHolder_OneClusterSweep(t *testing.T) {
 	if _, err := h.Handle(context.Background(), detachArgs(t, "100", parkedVolid), jsonrpc.Context{}); err != nil {
 		t.Fatalf("expected idempotent success; got: %v", err)
 	}
-	// Two sweeps total: one locates the source VM's node, one resolves the
-	// disk's holder. The holder sweep used to run twice -- once for the parked
-	// check, once for the real-VM check -- against the same unchanged answer.
-	if sweeps != 2 {
-		t.Errorf("already-detached path must resolve the holder with a single sweep (2 total); got %d", sweeps)
+	// Three fixture reads total: one locates the source VM's node, and the
+	// single holder sweep's authoritative enumeration derives cluster
+	// membership and the per-node listing from the same fixture (one read
+	// each). The holder sweep used to run twice (once for the parked check,
+	// once for the real-VM check) against the same unchanged answer; a
+	// second sweep would now show up as five reads.
+	if sweeps != 3 {
+		t.Errorf("already-detached path must resolve the holder with a single sweep (3 fixture reads); got %d", sweeps)
 	}
 }
 

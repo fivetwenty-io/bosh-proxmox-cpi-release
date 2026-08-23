@@ -88,7 +88,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		//    config stores disk values in canonical "<storage>:<volname>"
 		//    form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, holderTags, err := pve.FindVMByDiskVolidTagged(ctx, deps.PVE, deps.Config.Node, bareDiskCID)
+		vmid, node, holderTags, err := pve.FindVMByDiskVolidTagged(ctx, deps.PVE, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}

@@ -13,7 +13,6 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
@@ -186,8 +185,9 @@ func coerceTagMap(v any) map[string]string {
 	}
 }
 
-// findVMsHostingDisk scans cluster VM resources via ListResources and returns
-// every (node, vmid) pair whose QEMU config contains diskCID. Uses exact
+// findVMsHostingDisk scans every cluster guest via authoritative per-node
+// listings and returns every (node, vmid) pair whose QEMU config contains
+// diskCID. Uses exact
 // volid equality (with option-string tolerance via pve.DiskOptStrContainsVolid)
 // to prevent false matches on diskCIDs that are substrings of other volids.
 //
@@ -196,8 +196,8 @@ func coerceTagMap(v any) map[string]string {
 // ("disk not attached; metadata not persisted"). This is correct: metadata
 // for a parked disk is irrelevant until the disk is attached to a real VM.
 //
-// The tag is tested twice and costs no extra API call either time. First on the
-// cluster-resources item, which the scan already has. Then on the VM config,
+// The tag is tested twice and costs no extra API call either time. First on
+// the listing row, which the scan already has. Then on the VM config,
 // which the scan reads for every VM anyway: an empty tags field on the item
 // cannot tell an untagged VM from a PVE that does not populate the field, and
 // deciding on it alone would treat a parker as an ordinary holder.
@@ -209,7 +209,8 @@ func coerceTagMap(v any) map[string]string {
 // description, which is where the provenance record for every disk it holds
 // lives.
 //
-// Transport errors from ListResources propagate as wrapped retriable errors.
+// Transport errors from the enumeration propagate as wrapped retriable
+// errors.
 // Per-VM Config errors are skipped only when they are not-found (the VM was
 // deleted concurrently or its config is gone); any other Config error is
 // classified by pve.WrapConfigReadError, so a transient fault mid-scan is
@@ -218,49 +219,26 @@ func coerceTagMap(v any) map[string]string {
 // permanent and names itself. The scan never short-circuits on the first match:
 // visiting every VM is what makes ambiguity detection possible.
 func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attachedVM, error) {
-	typeStr := "vm"
-	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "set_disk_metadata_list_resources", 0, func() error {
-		var inner error
-		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-		return inner
-	})
+	// The candidate list comes from authoritative per-node listings
+	// (ListGuestsAuthoritative), not the /cluster/resources index: the index
+	// lags by minutes, so a young holder would be invisible to it, producing
+	// the silent 0-match (metadata loss) or masked multi-attach the contract
+	// above forbids. The enumeration classifies its own failures (retriable
+	// for a partial fleet), preserving the retriable-propagation contract.
+	guests, listErr := pve.ListGuestsAuthoritative(ctx, deps.PVE, deps.Log(ctx))
 	if listErr != nil {
-		// WrapError keeps transport errors retriable, matching the contract
-		// documented above (transient list failures propagate as retriable).
-		return nil, cpierrors.Wrap(pve.WrapError(listErr), "set_disk_metadata: list cluster resources")
-	}
-	if resources == nil {
-		return nil, cpierrors.Cloud("set_disk_metadata: nil response from cluster resources")
-	}
-
-	type resourceEntry struct {
-		VMID int64  `json:"vmid"`
-		Node string `json:"node"`
-		Tags string `json:"tags"`
+		return nil, cpierrors.Wrap(listErr, "set_disk_metadata: enumerate cluster guests")
 	}
 
 	var matches []attachedVM
 
-	for _, raw := range *resources {
-		var entry resourceEntry
-		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil || entry.VMID <= 0 {
-			continue
-		}
-
-		vmNode := entry.Node
-		if vmNode == "" {
-			vmNode = deps.Config.Node
-		}
-		if vmNode == "" {
-			continue
-		}
-
-		vmid := int(entry.VMID)
+	for _, g := range guests {
+		vmNode := g.Node
+		vmid := g.VMID
 
 		// Skip parker VMs: a parked disk on a parker VM should not be treated
-		// as "attached to a real VM". Uses only data from the cluster-resources
-		// item — no extra API calls.
+		// as "attached to a real VM". Uses only data from the listing row, no
+		// extra API calls.
 		//
 		// The tag alone decides. IsParkerVM is the tag test AND a band test, so
 		// it can only ever be a subset of this one, and the band half goes quiet
@@ -268,7 +246,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		// parkers still stood would otherwise have this merge deployment
 		// metadata into a parker's description — the field carrying the
 		// provenance sentinel for every disk it holds.
-		if pve.TagsMarkParker(entry.Tags) {
+		if pve.TagsMarkParker(g.Tags) {
 			continue
 		}
 

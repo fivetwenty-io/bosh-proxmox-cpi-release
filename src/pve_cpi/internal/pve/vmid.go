@@ -217,15 +217,29 @@ type vmidEntry struct {
 	Vmid *int64 `json:"vmid"`
 }
 
-// listClusterVMIDs calls GET /cluster/resources?type=vm and returns the set of
-// all VMID integers currently registered in the cluster (across all nodes).
-// Returns a non-nil error wrapped as *cpierrors.Error on any failure.
+// listClusterVMIDs returns the set of all VMID integers currently registered
+// in the cluster (across all nodes), as the UNION of two sources:
+//
+//   - GET /cluster/resources?type=vm: covers QEMU and LXC guests alike, but
+//     the index trails node-local state by minutes, so a guest registered
+//     seconds ago can be missing.
+//   - ListGuestsAuthoritative: the per-node QEMU listings, which have no lag,
+//     so a VMID a concurrent create just won is already in the used-set. The
+//     CPI only ever creates QEMU guests, which means every peer-created VMID
+//     the index can lag on is covered by this leg; LXC guests (always
+//     operator-created, so never inside the lag window of a CPI peer) stay
+//     covered by the index leg.
+//
+// Over-approximation is safe for allocation: the worst a stale index row
+// costs is skipping a free ID. Both legs are required; either failing fails
+// the allocation with a classified *cpierrors.Error.
 //
 // The cluster-resources call is wrapped in RetryOnTransient to absorb the
 // pvedaemon-worker-recycle window: under burst load the worker holding our
 // TCP connection may exit (request-quota or memory limit), surfacing as
 // HTTP 596 or an auth-EOF on the next call. A fresh worker spawns within
-// roughly a second, so a short retry usually wins.
+// roughly a second, so a short retry usually wins. The authoritative leg
+// carries its own per-node retries.
 func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 	typeStr := "vm"
 	var resp *sdkcluster.ListResourcesResponse
@@ -253,6 +267,18 @@ func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 		if entry.Vmid != nil {
 			used[int(*entry.Vmid)] = struct{}{}
 		}
+	}
+
+	// Tolerant form: an offline member must not block every allocation
+	// cluster-wide. Its guests stay covered by the index leg above (an
+	// offline node creates no new guests, so the index has long since
+	// caught up on them), keeping the used-set an over-approximation.
+	guests, _, err := ListGuestsAuthoritativeTolerant(ctx, c, nil)
+	if err != nil {
+		return nil, cpierrors.Wrap(err, "vmid: authoritative guest enumeration")
+	}
+	for _, g := range guests {
+		used[g.VMID] = struct{}{}
 	}
 	return used, nil
 }

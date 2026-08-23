@@ -81,6 +81,27 @@ type ldmNodes struct {
 	events   *[]string
 	updateFn func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error
 	deleteFn func(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+	// guests, when set, backs the authoritative per-node listing surface
+	// (pve.ListGuestsAuthoritative) with the same rows the cluster fixture
+	// serves through the index.
+	guests *sdkclusterapi.ListResourcesResponse
+}
+
+// ListQemu serves the node's guests from the guests fixture (empty when unset).
+func (n *ldmNodes) ListQemu(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	out := sdknodes.ListQemuResponse{}
+	if n.guests != nil {
+		for _, raw := range *n.guests {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node != node {
+				continue
+			}
+			out = append(out, raw)
+		}
+	}
+	return &out, nil
 }
 
 func (n *ldmNodes) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
@@ -111,6 +132,16 @@ func (c *ldmCluster) ListResources(_ context.Context, _ *sdkclusterapi.ListResou
 		return &sdkclusterapi.ListResourcesResponse{}, nil
 	}
 	return c.resp, nil
+}
+
+// ListConfigNodes derives corosync membership from the fixture rows,
+// defaulting to lockTestNode, for pve.ListGuestsAuthoritative.
+func (c *ldmCluster) ListConfigNodes(ctx context.Context) (*sdkclusterapi.ListConfigNodesResponse, error) {
+	rows, err := c.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return authConfigNodesFromResources(rows, lockTestNode), nil
 }
 
 // ldmClusterResources builds a one-VM ListResourcesResponse.
@@ -150,7 +181,7 @@ func TestHandleSetDiskMetadata_LockAcquiredBeforeRead(t *testing.T) {
 		Agent:  &mockAgentService{},
 		PVE: &lockTestPVEClient{
 			qemuSvc:    &ldmQEMU{diskCID: diskCID, events: &events},
-			nodesSvc:   &ldmNodes{events: &events},
+			nodesSvc:   &ldmNodes{events: &events, guests: ldmClusterResources(vmid, lockTestNode)},
 			clusterSvc: &ldmCluster{resp: ldmClusterResources(vmid, lockTestNode)},
 			poolsSvc:   pools,
 		},
@@ -237,6 +268,7 @@ func TestHandleSetDiskMetadata_LockAcquireFailureRetriable(t *testing.T) {
 					updateCalled = true
 					return nil
 				},
+				guests: ldmClusterResources(vmid, lockTestNode),
 			},
 			clusterSvc: &ldmCluster{resp: ldmClusterResources(vmid, lockTestNode)},
 			poolsSvc:   pools,
@@ -391,4 +423,10 @@ func TestDeleteVM_StampDeletingTag_NilPoolsFallback(t *testing.T) {
 	if !strings.Contains(gotTags, "bosh-deleting") {
 		t.Errorf("bosh-deleting must be written even when lock unavailable; got tags=%q", gotTags)
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (c *ldmCluster) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	empty := sdkclusterapi.ListStatusResponse{}
+	return &empty, nil
 }

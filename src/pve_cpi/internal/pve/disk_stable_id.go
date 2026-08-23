@@ -128,7 +128,7 @@ func ResolveDiskIdentity(
 		return DiskIdentity{}, cpierrors.Cloud("ResolveDiskIdentity: client must not be nil")
 	}
 
-	hit, err := findVMByDiskIdentityScan(ctx, c, cfg.FallbackNode, birthVolid, stableID)
+	hit, err := findVMByDiskIdentityScan(ctx, c, birthVolid, stableID)
 	if err == nil {
 		return DiskIdentity{Volid: hit.Volid, Holder: holderFromScanHit(logger, hit, birthVolid, cfg)}, nil
 	}

@@ -667,3 +667,9 @@ func TestDLBMembership_SharedRootDiskAndISO_Registers(t *testing.T) {
 		t.Fatalf("shared root+disk+iso: expected 1 CreateHaResources call, got %d", len(clusterSvc.createHACalls))
 	}
 }
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (s *dlbClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+	empty := cluster.ListStatusResponse{}
+	return &empty, nil
+}

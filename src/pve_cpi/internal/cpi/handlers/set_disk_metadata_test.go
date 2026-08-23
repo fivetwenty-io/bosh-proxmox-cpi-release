@@ -103,6 +103,38 @@ type diskMetaNodesMock struct {
 	capturedTags *string
 	// updateErr if set, UpdateQemuConfig returns this error.
 	updateErr error
+	// listQemuSrc, when set, backs the authoritative per-node listing
+	// (pve.ListGuestsAuthoritative) with the suite's cluster fixture rows.
+	// buildDiskMetaPVE wires it to the cluster service's ListResources.
+	listQemuSrc func(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error)
+}
+
+// ListQemu serves the node's guests from the cluster fixture (empty when unwired).
+func (m *diskMetaNodesMock) ListQemu(ctx context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	out := sdknodes.ListQemuResponse{}
+	if m.listQemuSrc == nil {
+		return &out, nil
+	}
+	rows, err := m.listQemuSrc(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node != node {
+				continue
+			}
+			if item.Type != "" && item.Type != "qemu" {
+				continue
+			}
+			out = append(out, raw)
+		}
+	}
+	return &out, nil
 }
 
 func diskKey(node string, vmid int) string {
@@ -137,11 +169,21 @@ type diskMetaClientMock struct {
 	clusterSvc sdkclusterapi.Service
 }
 
-func (c *diskMetaClientMock) QEMU() qemu.Service                     { return c.qemuSvc }
-func (c *diskMetaClientMock) Storage() storage.Service               { return nil }
-func (c *diskMetaClientMock) CloudInit() cloudinit.Service           { return nil }
-func (c *diskMetaClientMock) Tasks() tasks.Service                   { return nil }
-func (c *diskMetaClientMock) Nodes() sdknodes.Service                { return c.nodesSvc }
+func (c *diskMetaClientMock) QEMU() qemu.Service           { return c.qemuSvc }
+func (c *diskMetaClientMock) Storage() storage.Service     { return nil }
+func (c *diskMetaClientMock) CloudInit() cloudinit.Service { return nil }
+func (c *diskMetaClientMock) Tasks() tasks.Service         { return nil }
+
+// Nodes wires the nodes mock's authoritative listing source to the cluster
+// fixture on first use (unless a test already set one), so every
+// construction site of diskMetaClientMock gets pve.ListGuestsAuthoritative
+// coverage without repeating the wiring.
+func (c *diskMetaClientMock) Nodes() sdknodes.Service {
+	if c.nodesSvc != nil && c.nodesSvc.listQemuSrc == nil && c.clusterSvc != nil {
+		c.nodesSvc.listQemuSrc = c.clusterSvc.ListResources
+	}
+	return c.nodesSvc
+}
 func (c *diskMetaClientMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaClientMock) ClusterStorage() clusterstorage.Service { return nil }
 func (c *diskMetaClientMock) Pools() pve.PoolService                 { return &noopPoolService{} }
@@ -204,6 +246,16 @@ func (m *diskMetaClusterSvc) ListResources(ctx context.Context, params *sdkclust
 	}
 	empty := sdkclusterapi.ListResourcesResponse{}
 	return &empty, nil
+}
+
+// ListConfigNodes derives corosync membership from the same fixture rows
+// (falling back to testNode), for pve.ListGuestsAuthoritative.
+func (m *diskMetaClusterSvc) ListConfigNodes(ctx context.Context) (*sdkclusterapi.ListConfigNodesResponse, error) {
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return authConfigNodesFromResources(rows, testNode), nil
 }
 
 var _ sdkclusterapi.Service = (*diskMetaClusterSvc)(nil)
@@ -1032,6 +1084,14 @@ type updateCaptureMock struct {
 	updateFn func(context.Context, string, string, *sdknodes.UpdateQemuConfigParams) error
 }
 
+// ListQemu returns an empty node: the authoritative enumeration reaches every
+// wired nodes service, and this mock's suite scripts guests through the
+// cluster fixture instead.
+func (m *updateCaptureMock) ListQemu(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	empty := sdknodes.ListQemuResponse{}
+	return &empty, nil
+}
+
 func (m *updateCaptureMock) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
 	if m.updateFn != nil {
 		return m.updateFn(ctx, node, vmid, params)
@@ -1049,11 +1109,20 @@ type diskMetaFullMock struct {
 	clusterSvc sdkclusterapi.Service
 }
 
-func (c *diskMetaFullMock) QEMU() qemu.Service                     { return c.qemuSvc }
-func (c *diskMetaFullMock) Storage() storage.Service               { return nil }
-func (c *diskMetaFullMock) CloudInit() cloudinit.Service           { return nil }
-func (c *diskMetaFullMock) Tasks() tasks.Service                   { return nil }
-func (c *diskMetaFullMock) Nodes() sdknodes.Service                { return c.nodesSvc }
+func (c *diskMetaFullMock) QEMU() qemu.Service           { return c.qemuSvc }
+func (c *diskMetaFullMock) Storage() storage.Service     { return nil }
+func (c *diskMetaFullMock) CloudInit() cloudinit.Service { return nil }
+func (c *diskMetaFullMock) Tasks() tasks.Service         { return nil }
+
+// Nodes wraps the wired nodes service so pve.ListGuestsAuthoritative sees
+// the guests scripted through the cluster fixture; every other method
+// delegates to the suite's mock.
+func (c *diskMetaFullMock) Nodes() sdknodes.Service {
+	if c.clusterSvc == nil {
+		return c.nodesSvc
+	}
+	return &authNodesService{Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: testNode}
+}
 func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service { return nil }
 func (c *diskMetaFullMock) Pools() pve.PoolService                 { return &noopPoolService{} }
@@ -1496,4 +1565,10 @@ func TestHandleSetDiskMetadata_TagsPathPreservesForeignSentinelKeys(t *testing.T
 	if !strings.Contains(desc, `"bosh_disk_tags"`) {
 		t.Errorf("description missing bosh_disk_tags after write; got: %s", desc)
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (m *diskMetaClusterSvc) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	empty := sdkclusterapi.ListStatusResponse{}
+	return &empty, nil
 }

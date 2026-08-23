@@ -14,7 +14,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"sort"
 	"strconv"
@@ -24,7 +23,6 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -84,7 +82,8 @@ func IPConflictCloudError(conflict *IPConflict, bridge string, vlan int) *cpierr
 //     Pass 0 (or any value <= 0) to disable exclusion and scan all VMs.
 //
 // Algorithm:
-//  1. cluster.ListResources(type=vm) → all (vmid, node) pairs.
+//  1. Authoritative per-node listings (pve.ListGuestsAuthoritative) → all
+//     (vmid, node) pairs, without the /cluster/resources index lag.
 //  2. Per-VM: QEMU().Config(node, vmid) → parse ipconfig{N} for static IPs.
 //     Concurrency is bounded to maxIPConflictWorkers goroutines.
 //  3. When bridge != "", also parse net{N} keys to restrict to NICs on that
@@ -92,7 +91,7 @@ func IPConflictCloudError(conflict *IPConflict, bridge string, vlan int) *cpierr
 //  4. First conflict found cancels remaining goroutines and is returned.
 //
 // Error handling:
-//   - Transport faults from ListResources → pve.WrapError → retriable where applicable.
+//   - Transport faults from the enumeration → retriable where applicable.
 //   - Per-VM Config fetch errors → logged at debug, VM skipped (same policy as
 //     findVMsHostingDisk; templates and ephemeral VMs often return errors here).
 //   - First non-skip error from a worker goroutine propagates to the caller.
@@ -123,47 +122,39 @@ func detectIPConflict(
 		return nil, nil
 	}
 
-	// Phase 1: list all VM resources from the cluster.
-	typeStr := "vm"
-	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "detect_ip_conflict_list_resources", 0, func() error {
-		var inner error
-		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-		return inner
-	})
+	// Phase 1: enumerate every cluster guest from authoritative per-node
+	// listings, not the /cluster/resources index: the index lags by minutes,
+	// and a young VM already holding the target IP is exactly the conflict
+	// this guard exists to catch. The enumeration classifies its own failures
+	// (retriable for a partial fleet). Tolerant form: an offline member must
+	// not block every create_vm, and its guests could not be scanned anyway,
+	// because phase 2's config read is served by the guest's own node. The
+	// index-fed baseline had the same blind spot (the candidate row survived,
+	// its config read failed and was skipped); what must not happen is
+	// passing that blind spot off as a clean proof, so a non-empty exclusion
+	// is surfaced as a Warn naming the unverified members.
+	guests, excludedMembers, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if listErr != nil {
-		return nil, cpierrors.Wrap(
-			pve.WrapError(listErr),
-			"detect_ip_conflict: list cluster VM resources",
-		)
+		return nil, cpierrors.Wrap(listErr, "detect_ip_conflict: enumerate cluster guests")
 	}
-	if resources == nil || len(*resources) == 0 {
+	if len(excludedMembers) > 0 {
+		deps.Log(ctx).Warn("detect_ip_conflict: cluster members reported offline were not scanned;"+
+			" static IPs owned by their guests are unverified",
+			log.String("nodes", strings.Join(excludedMembers, ",")))
+	}
+	if len(guests) == 0 {
 		return nil, nil
 	}
 
 	type vmEntry struct {
-		VMID int64  `json:"vmid"`
-		Node string `json:"node"`
-		Name string `json:"name"`
+		VMID int64
+		Node string
+		Name string
 	}
 
-	// Parse resource list into typed entries; skip malformed rows.
-	entries := make([]vmEntry, 0, len(*resources))
-	for _, raw := range *resources {
-		var e vmEntry
-		if err := json.Unmarshal(raw, &e); err != nil || e.VMID <= 0 {
-			continue
-		}
-		if e.Node == "" {
-			e.Node = deps.Config.Node
-		}
-		if e.Node == "" {
-			continue
-		}
-		entries = append(entries, e)
-	}
-	if len(entries) == 0 {
-		return nil, nil
+	entries := make([]vmEntry, 0, len(guests))
+	for _, g := range guests {
+		entries = append(entries, vmEntry{VMID: int64(g.VMID), Node: g.Node, Name: g.Name})
 	}
 
 	// Phase 2: parallel per-VM config fetch + ipconfig parse.

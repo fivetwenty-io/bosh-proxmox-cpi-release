@@ -178,9 +178,26 @@ func attachDeps(qemuSvc qemu.Service, ag agent.Agent) handlers.Deps {
 func attachDepsWithConfig(qemuSvc qemu.Service, ag agent.Agent, cfg *config.CPIConfig) handlers.Deps {
 	return handlers.Deps{
 		Config: cfg,
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc, clusterSvc: attachClusterWithVM100()},
 		Agent:  ag,
 		Logger: log.NewNopLogger(),
+	}
+}
+
+// attachClusterWithVM100 places VM 100 on testNode, for the same reason as
+// the fixture inside attachDeps: the authoritative lookup must hit on the
+// scan so no per-node config probe consumes a scripted Config response.
+func attachClusterWithVM100() *mockClusterSvc {
+	targetRaw, _ := json.Marshal(map[string]any{
+		"vmid": 100,
+		"node": testNode,
+		"type": "qemu",
+	})
+	return &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{targetRaw}
+			return &resp, nil
+		},
 	}
 }
 
@@ -523,17 +540,17 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
-			// Calls 1-2 — holder scan: VM 100 is listed in the cluster, so
-			// the disk-holder resolution reads its config to match the disk,
-			// then re-reads it for tags + slot (finds the disk on a
-			// non-parker VM, a no-op for the unpark path).
+			// Call 1, holder scan: VM 100 is listed by its node, and the
+			// disk-holder identity scan reads its config to match the disk.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
+			// Call 2, overlay read: the holder's recorded per-disk option
+			// overrides (none here) are read from the same config.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
-			// Call 3 — slot selection: legacy scsi0 attachment present.
+			// Call 3, slot selection: legacy scsi0 attachment present.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
-			// Call 4 — re-read after Detach: scsi0 gone.
+			// Call 4, re-read after Detach: scsi0 gone.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 5 — Resolve after AttachDisk: scsi1 present with volid.
+			// Call 5 and later, Resolve after AttachDisk: scsi1 present with volid.
 			{"virtio0": "data:vm-100-disk-0", "scsi1": diskCID},
 		},
 	}
@@ -1206,7 +1223,7 @@ func perfDiskCID(t *testing.T, bare string, opts map[string]string) string {
 func attachDepsPerf(qemuSvc qemu.Service, ag agent.Agent, cfg *config.CPIConfig) handlers.Deps {
 	return handlers.Deps{
 		Config: cfg,
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc, clusterSvc: attachClusterWithVM100()},
 		Agent:  ag,
 		Logger: log.NewNopLogger(),
 	}
@@ -1595,16 +1612,19 @@ func parkedCfg() *config.CPIConfig {
 //
 // Config call sequence driven by configCfgs:
 //
-//	Call 1: FindVMByDiskVolid — config read for parker VMID (disk present → match)
-//	Call 2: holder resolution — second config read for parker VMID (tags + slot)
-//	Call 3: option-override read — the parker's provenance entry is where a
+//	Call 1: FindVMByDiskVolid, the identity-scan config read for the parker VMID
+//	        (disk present → match)
+//	Call 2: resolveDiskHolder, the in-band holder read for tags + slot
+//	Call 3: option-override read; the parker's provenance entry is where a
 //	        parked disk's recorded overrides live, read before the unpark can
 //	        remove it
-//	Call 4: unpark — re-resolves the slot under the protection lock, because a
+//	Call 4: unpark, which re-resolves the slot under the protection lock; a
 //	        slot name resolved before the lock is a blind write by the time the
 //	        detach runs
-//	Call 5: chooseSCSISlotSkippingZero — target VM config (empty → pick scsi1)
-//	Call 6: ResolveDiskID — target VM config after attach (scsi1 present)
+//	Call 5: removeParkerProvenance, which re-reads the parker description under the
+//	        same lock
+//	Call 6: chooseSCSISlotSkippingZero, the target VM config (empty, so pick scsi1)
+//	Call 7+: ResolveDiskID and the CID stamp on the target VM after attach
 func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	t.Parallel()
 
@@ -1627,11 +1647,12 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
 			parkerVMCfg,         // call 1: FindVMByDiskVolid config scan on parker VMID
-			parkerVMCfg,         // call 2: holder resolution reads tags + slot
+			parkerVMCfg,         // call 2: resolveDiskHolder in-band tags + slot read
 			parkerVMCfg,         // call 3: option-override read on the parker
 			parkerVMCfg,         // call 4: unpark re-resolves the slot under the lock
-			targetVMCfgEmpty,    // call 5: chooseSCSISlotSkippingZero on target VM
-			targetVMCfgAttached, // call 6: ResolveDiskID on target VM after attach
+			parkerVMCfg,         // call 5: removeParkerProvenance description read
+			targetVMCfgEmpty,    // call 6: chooseSCSISlotSkippingZero on target VM
+			targetVMCfgAttached, // call 7+: ResolveDiskID / CID stamp after attach
 		},
 	}
 	ag := &captureAgent{}
@@ -1816,8 +1837,12 @@ func TestHandleAttachDisk_StrategyFree_NoParkerCalls(t *testing.T) {
 	if len(qemuSvc.detachCalls) != 0 {
 		t.Errorf("strategy=free: expected no DetachDisk calls; got %v", qemuSvc.detachCalls)
 	}
-	if listCalls != 2 {
-		t.Errorf("strategy=free: expected 2 ListResources calls (VM-node lookup + holder guard); got %d", listCalls)
+	// Three fixture reads: the VM-node lookup reads the index once, and the
+	// holder guard's authoritative enumeration derives cluster membership and
+	// the per-node listing from the same fixture (one read each). The point
+	// of the assertion is unchanged: no parker scan beyond the guard.
+	if listCalls != 3 {
+		t.Errorf("strategy=free: expected 3 fixture reads (VM-node lookup + holder-guard membership + node listing); got %d", listCalls)
 	}
 }
 

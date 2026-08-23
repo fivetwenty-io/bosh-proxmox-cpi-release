@@ -19,6 +19,10 @@ import (
 // used as the `type=` filter for ListResources calls.
 const resourceTypeNode = "node"
 
+// statusRowTypeCluster is the type discriminator of the /cluster/status row
+// that carries cluster-wide fields such as quorate.
+const statusRowTypeCluster = "cluster"
+
 type localBackend struct {
 	client      Client
 	info        StorageInfo

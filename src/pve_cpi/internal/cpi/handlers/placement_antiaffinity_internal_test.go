@@ -31,6 +31,11 @@ type aaClusterStub struct {
 	// next CreateHaRules the named sid is removed from the persisted CSV, so a
 	// read-after-write verify observes the lost member.
 	dropMemberOnRecreate string
+	// memberNodes overrides the corosync membership reported by
+	// ListConfigNodes; nil means the single default node "pve1".
+	memberNodes []string
+	// statusFn scripts the /cluster/status response; nil means fully online.
+	statusFn func() (*cluster.ListStatusResponse, error)
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -52,6 +57,22 @@ func (s *aaClusterStub) ListResources(_ context.Context, _ *cluster.ListResource
 	}
 	empty := cluster.ListResourcesResponse{}
 	return &empty, nil
+}
+
+// ListConfigNodes reports memberNodes, defaulting to the single test node
+// "pve1": every aa fixture row is node-less, and ListGuestsAuthoritative
+// needs a non-empty membership.
+func (s *aaClusterStub) ListConfigNodes(_ context.Context) (*cluster.ListConfigNodesResponse, error) {
+	names := s.memberNodes
+	if len(names) == 0 {
+		names = []string{"pve1"}
+	}
+	out := make(cluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		raw, _ := json.Marshal(map[string]any{"name": n})
+		out = append(out, raw)
+	}
+	return &out, nil
 }
 
 func (s *aaClusterStub) CreateHaResources(_ context.Context, p *cluster.CreateHaResourcesParams) error {
@@ -132,7 +153,12 @@ func aaResourcesFn(entries ...json.RawMessage) func() *cluster.ListResourcesResp
 func aaDeps(stub *aaClusterStub) Deps {
 	return Deps{
 		Config: icMinConfig(),
-		PVE:    &icPVEClient{clusterSvc: stub},
+		PVE: &icPVEClient{
+			clusterSvc: stub,
+			nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return stub.ListResources(ctx, p)
+			}},
+		},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),
 	}
@@ -204,6 +230,74 @@ func TestEnsureAntiAffinity_AppendRecreatesRule(t *testing.T) {
 	if stub.createRuleCalls != 1 || stub.deleteRuleCalls != 1 {
 		t.Errorf("expected one delete+create recreate; create=%d delete=%d",
 			stub.createRuleCalls, stub.deleteRuleCalls)
+	}
+}
+
+// TestEnsureAntiAffinity_StaleScanNeverShrinksRule pins the never-shrink
+// contract: the persisted HA rule carries a member (vm:200) whose guest
+// exists but does not carry the group tag yet (a same-group twin mid-create;
+// tags land after the create commits). Ensuring a newcomer must union the
+// existing rule's members into the scanned set; the removal path is the sole
+// shrink authority, so the rewritten rule keeps vm:200.
+func TestEnsureAntiAffinity_StaleScanNeverShrinksRule(t *testing.T) {
+	stub := newAAStub()
+	stub.rules["bosh-aa-web"] = "vm:100,vm:200"
+	// The scan sees vm:100 tagged; vm:200 is a live guest with no tag yet.
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"), aaQEMU(200, ""))
+
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:200" {
+		t.Errorf("rule resources = %q; want %q (vm:200 must survive the tag-stale scan)", got, "vm:100,vm:101,vm:200")
+	}
+}
+
+// TestEnsureAntiAffinity_DeadRuleMemberDropped is the counterpart bound: a
+// rule member whose guest exists nowhere in the fleet (destroyed outside the
+// CPI, or a failed delete_vm HA cleanup) must not be resurrected into the
+// recreated rule, because PVE no longer has that resource and a rule naming
+// it would wedge every later create in the group.
+func TestEnsureAntiAffinity_DeadRuleMemberDropped(t *testing.T) {
+	stub := newAAStub()
+	stub.rules["bosh-aa-web"] = "vm:100,vm:999"
+	// vm:999 appears in no node's listing: its guest is gone.
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101" {
+		t.Errorf("rule resources = %q; want %q (dead vm:999 must be dropped)", got, "vm:100,vm:101")
+	}
+}
+
+// TestEnsureAntiAffinity_OfflineExcludedMemberKept: when the enumeration
+// tolerated an offline cluster member, a rule sid absent from the live set is
+// unenumerated, not provably gone, so the union must keep it. Dropping it
+// would recreate the rule without the guest that node hosts and silently
+// void the spread guarantee for the reboot window.
+func TestEnsureAntiAffinity_OfflineExcludedMemberKept(t *testing.T) {
+	stub := newAAStub()
+	stub.rules["bosh-aa-web"] = "vm:100,vm:1042"
+	stub.memberNodes = []string{"pve1", "pve2"}
+	stub.statusFn = func() (*cluster.ListStatusResponse, error) {
+		resp := cluster.ListStatusResponse{
+			json.RawMessage(`{"type": "cluster", "name": "lab", "quorate": 1}`),
+			json.RawMessage(`{"type": "node", "name": "pve1", "online": 1}`),
+			json.RawMessage(`{"type": "node", "name": "pve2", "online": 0}`),
+		}
+		return &resp, nil
+	}
+	// vm:1042 lives on the offline pve2, so the tolerant scan cannot see it.
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:1042" {
+		t.Errorf("rule resources = %q; want %q (vm:1042 is unenumerated, not gone, and must survive)",
+			got, "vm:100,vm:101,vm:1042")
 	}
 }
 
@@ -351,4 +445,14 @@ func TestAntiAffinityGroupTag(t *testing.T) {
 	if got := antiAffinityGroupTag(cfg, env); got != "job--web" {
 		t.Errorf("antiAffinityGroupTag = %q; want %q", got, "job--web")
 	}
+}
+
+// ListStatus delegates to statusFn when scripted; otherwise it reports no
+// offline members (the fixture cluster is fully online).
+func (s *aaClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+	if s.statusFn != nil {
+		return s.statusFn()
+	}
+	empty := cluster.ListStatusResponse{}
+	return &empty, nil
 }

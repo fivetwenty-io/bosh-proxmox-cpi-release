@@ -85,7 +85,7 @@ func TestGuardDiskDeleteState_NotAttached_Proceeds(t *testing.T) {
 	t.Parallel()
 	// The disk is attached to no VM (the normal pre-delete state): nothing to
 	// guard, even though some unrelated VM is mid-migrate.
-	if err := pve.GuardDiskDeleteState(context.Background(), guardUnattachedClient(), "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), guardUnattachedClient(), guardVolid); err != nil {
 		t.Errorf("not attached: want proceed (nil), got %v", err)
 	}
 }
@@ -93,7 +93,7 @@ func TestGuardDiskDeleteState_NotAttached_Proceeds(t *testing.T) {
 func TestGuardDiskDeleteState_AttachedUnlocked_Proceeds(t *testing.T) {
 	t.Parallel()
 	c := guardAttachedClient(guardVolid, "", "pve-01")
-	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid); err != nil {
 		t.Errorf("attached unlocked: want proceed (nil), got %v", err)
 	}
 }
@@ -102,7 +102,7 @@ func TestGuardDiskDeleteState_AttachedDestructiveLock_Retriable(t *testing.T) {
 	t.Parallel()
 	for _, lock := range []string{"backup", "clone", "migrate", "snapshot", "rollback", "create"} {
 		c := guardAttachedClient(guardVolid, lock, "pve-02")
-		err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid)
+		err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid)
 		if err == nil {
 			t.Fatalf("lock=%q: want error, got nil", lock)
 		}
@@ -117,7 +117,7 @@ func TestGuardDiskDeleteState_AttachedNonDestructiveLock_Proceeds(t *testing.T) 
 	// A lock outside the destructive set (e.g. "suspended") must not block the
 	// delete — the guard only fires on known data-mutating locks.
 	c := guardAttachedClient(guardVolid, "suspended", "pve-01")
-	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid); err != nil {
 		t.Errorf("non-destructive lock: want proceed (nil), got %v", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestGuardDiskDeleteState_AttachedDirStyleVolid_Retriable(t *testing.T) {
 	// still match it against the attached VM's disk slot and apply the lock check.
 	const dirVolid = "local:9001/vm-9001-disk-0.raw"
 	c := guardAttachedClient(dirVolid, "snapshot", "pve-01")
-	err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", dirVolid)
+	err := pve.GuardDiskDeleteState(context.Background(), c, dirVolid)
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("dir-style volid: want retriable-cloud, got %v", err)
 	}
@@ -146,7 +146,7 @@ func TestGuardDiskDeleteState_AttachedVMConfig404_Proceeds(t *testing.T) {
 			},
 		},
 	}
-	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid); err != nil {
 		t.Errorf("config 404 during resolution: want proceed (nil), got %v", err)
 	}
 }
@@ -157,7 +157,7 @@ func TestGuardDiskDeleteState_PermanentResolutionError_FailsOpen(t *testing.T) {
 	// best-effort and must fail open rather than turn a permanent guard fault
 	// into a permanent delete failure.
 	c := guardClientListErr(errors.New("permission denied"))
-	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid); err != nil {
 		t.Errorf("permanent resolution error: want fail-open (nil), got %v", err)
 	}
 }
@@ -175,7 +175,7 @@ func TestGuardDiskDeleteState_TransientConfigErrorDuringScan_Retriable(t *testin
 			},
 		},
 	}
-	err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid)
+	err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid)
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("transient config error during scan: want retriable-cloud, got %v", err)
 	}
@@ -217,7 +217,7 @@ func TestGuardDiskDeleteState_TransientLockReadError_Retriable(t *testing.T) {
 	// The holder resolved but its lock state could not be read due to a
 	// transient fault: the guard must defer the delete as retriable.
 	c := guardLockReadFailClient(&sdkerrors.TimeoutError{Operation: "qemu config", Duration: "5s"})
-	err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid)
+	err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid)
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("transient lock-read error: want retriable-cloud, got %v", err)
 	}
@@ -228,21 +228,21 @@ func TestGuardDiskDeleteState_PermanentLockReadError_FailsOpen(t *testing.T) {
 	// A permanent lock-read failure (e.g. 403) keeps the guard best-effort:
 	// retrying cannot clear it, so fail open and allow the delete.
 	c := guardLockReadFailClient(&sdkerrors.APIError{HTTPCode: 403, Message: "permission denied"})
-	if err := pve.GuardDiskDeleteState(context.Background(), c, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), c, guardVolid); err != nil {
 		t.Errorf("permanent lock-read error: want fail-open (nil), got %v", err)
 	}
 }
 
 func TestGuardDiskDeleteState_EmptyVolid_Proceeds(t *testing.T) {
 	t.Parallel()
-	if err := pve.GuardDiskDeleteState(context.Background(), guardAttachedClient(guardVolid, "migrate", "pve-01"), "pve-01", ""); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), guardAttachedClient(guardVolid, "migrate", "pve-01"), ""); err != nil {
 		t.Errorf("empty volid: want proceed (nil), got %v", err)
 	}
 }
 
 func TestGuardDiskDeleteState_NilClient_FailsOpen(t *testing.T) {
 	t.Parallel()
-	if err := pve.GuardDiskDeleteState(context.Background(), nil, "pve-01", guardVolid); err != nil {
+	if err := pve.GuardDiskDeleteState(context.Background(), nil, guardVolid); err != nil {
 		t.Errorf("nil client: want fail-open (nil), got %v", err)
 	}
 }

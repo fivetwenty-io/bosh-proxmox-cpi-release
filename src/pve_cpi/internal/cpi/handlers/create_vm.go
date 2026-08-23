@@ -1604,12 +1604,12 @@ func attemptStemcellTemplateClone(
 				log.String("sha8", sha8),
 				log.ErrScrubbed(cloneErr),
 			)
-			cleanupVMDetached(ctx, deps, shape.node, candidate, nil, logger)
+			sweepCandidateVMID(ctx, deps, shape.node, candidate, candidateName, nil, logger)
 			return false, nil
 		}
 		// Classify for retry: VMID conflicts and transient transport faults are
 		// retryable — they use the same retry classification as the import path.
-		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, parsed.env, cloneErr)
+		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, candidateName, parsed.env, cloneErr)
 	}
 
 	logger.Info("create_vm: vm cloned from stemcell cache template",
@@ -1899,12 +1899,12 @@ func attemptStemcellImport(
 
 	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
 	if cerr != nil {
-		return handleCreateError(ctx, deps, logger, shape.node, candidate, cerr)
+		return handleCreateError(ctx, deps, logger, shape.node, candidate, candidateName, cerr)
 	}
 
 	if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger,
 		pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
-		return handleAwaitError(ctx, deps, logger, shape.node, candidate, werr)
+		return handleAwaitError(ctx, deps, logger, shape.node, candidate, candidateName, werr)
 	}
 
 	logger.Info("create_vm: vm disk imported",

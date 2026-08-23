@@ -140,6 +140,14 @@ func (s *advrtClusterStub) ListResources(_ context.Context, _ *sdkcluster.ListRe
 	return &resp, nil
 }
 
+// ListConfigNodes reports the single test node "pve1" (every fixture row
+// lives there) so pve.ListGuestsAuthoritative has a non-empty membership.
+func (s *advrtClusterStub) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	raw, _ := json.Marshal(map[string]any{"name": "pve1"})
+	resp := sdkcluster.ListConfigNodesResponse{raw}
+	return &resp, nil
+}
+
 func (s *advrtClusterStub) ListSdnVnetsSubnets(_ context.Context, vnet string, _ *sdkcluster.ListSdnVnetsSubnetsParams) (*sdkcluster.ListSdnVnetsSubnetsResponse, error) {
 	if s.subnetsErr != nil {
 		return nil, s.subnetsErr
@@ -165,7 +173,12 @@ func advrtDeps(cl *advrtClusterStub) Deps {
 	cfg := icMinConfig()
 	return Deps{
 		Config: cfg,
-		PVE:    &icPVEClient{clusterSvc: cl},
+		PVE: &icPVEClient{
+			clusterSvc: cl,
+			nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+				return cl.ListResources(ctx, p)
+			}},
+		},
 		Logger: log.NewNopLogger(),
 	}
 }
@@ -328,4 +341,10 @@ func TestCleanupAdvertisedRoutes_IPv6RoundTrip(t *testing.T) {
 	if cl.applyCalls != 1 {
 		t.Errorf("apply calls = %d, want 1", cl.applyCalls)
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (s *advrtClusterStub) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

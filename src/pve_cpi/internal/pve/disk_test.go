@@ -385,17 +385,28 @@ type diskClusterClient struct {
 	clusterSvc cluster.Service
 }
 
-func (c *diskClusterClient) QEMU() qemu.Service                     { return c.qemuSvc }
-func (c *diskClusterClient) Storage() storage.Service               { return nil }
-func (c *diskClusterClient) CloudInit() cloudinit.Service           { return nil }
-func (c *diskClusterClient) Tasks() tasks.Service                   { return nil }
-func (c *diskClusterClient) Nodes() nodes.Service                   { return nil }
+func (c *diskClusterClient) QEMU() qemu.Service       { return c.qemuSvc }
+func (c *diskClusterClient) Storage() storage.Service { return nil }
+func (c *diskClusterClient) CloudInit() cloudinit.Service {
+	return nil
+}
+func (c *diskClusterClient) Tasks() tasks.Service { return nil }
+
+// Nodes synthesizes the authoritative per-node listing surface from the same
+// ListResources-shaped fixture rows, so every test client built around
+// diskFakeCluster serves the enumeration the production scans now read.
+func (c *diskClusterClient) Nodes() nodes.Service {
+	if f, ok := c.clusterSvc.(*diskFakeCluster); ok {
+		return &diskFakeNodesFromCluster{f: f}
+	}
+	return nil
+}
 func (c *diskClusterClient) Cluster() cluster.Service               { return c.clusterSvc }
 func (c *diskClusterClient) ClusterStorage() clusterstorage.Service { return nil }
 func (c *diskClusterClient) Pools() pve.PoolService                 { return nil }
 
 // diskFakeCluster is a minimal cluster.Service that delegates ListResources
-// to an injected function.
+// to an injected function and derives cluster membership from the same rows.
 type diskFakeCluster struct {
 	cluster.Service
 	listFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
@@ -403,6 +414,123 @@ type diskFakeCluster struct {
 
 func (f *diskFakeCluster) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	return f.listFn(ctx, params)
+}
+
+// diskFakeRow is the decoded subset of a fixture row the authoritative
+// adapter re-serves through per-node listings.
+type diskFakeRow struct {
+	Vmid     int64  `json:"vmid,omitempty"`
+	Node     string `json:"node,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Tags     string `json:"tags,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Template any    `json:"template,omitempty"`
+}
+
+// fixtureRows decodes the fixture's ListResources rows, defaulting an elided
+// node to "pve1" so single-node fixtures need no node field.
+func (f *diskFakeCluster) fixtureRows(ctx context.Context) ([]diskFakeRow, error) {
+	resp, err := f.listFn(ctx, &cluster.ListResourcesParams{})
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	var out []diskFakeRow
+	for _, raw := range *resp {
+		var r diskFakeRow
+		if json.Unmarshal(raw, &r) != nil {
+			continue
+		}
+		if r.Node == "" {
+			r.Node = "pve1"
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// ListConfigNodes reports the distinct node names of the fixture rows
+// ("pve1" for an empty fixture, so an empty fixture reads as an empty
+// cluster rather than a failed enumeration).
+func (f *diskFakeCluster) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {
+	rows, err := f.fixtureRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	names := []string{}
+	for _, r := range rows {
+		if !seen[r.Node] {
+			seen[r.Node] = true
+			names = append(names, r.Node)
+		}
+	}
+	if len(names) == 0 {
+		names = []string{"pve1"}
+	}
+	resp := make(cluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		resp = append(resp, json.RawMessage(`{"name": "`+n+`"}`))
+	}
+	return &resp, nil
+}
+
+// diskFakeNodesFromCluster serves per-node qemu listings from the cluster
+// fixture rows. Rows typed lxc (or any non-qemu type) never appear: a
+// node's qemu listing carries QEMU guests only by construction.
+type diskFakeNodesFromCluster struct {
+	nodes.Service
+	f *diskFakeCluster
+}
+
+// UpdateQemuConfig and ListStorageContent are no-ops, mirroring the nil
+// nodes-service tolerance production code extended to these fixtures before
+// they grew a real Nodes surface.
+func (s *diskFakeNodesFromCluster) UpdateQemuConfig(
+	_ context.Context, _, _ string, _ *nodes.UpdateQemuConfigParams,
+) error {
+	return nil
+}
+
+func (s *diskFakeNodesFromCluster) ListStorageContent(
+	_ context.Context, _, _ string, _ *nodes.ListStorageContentParams,
+) (*nodes.ListStorageContentResponse, error) {
+	return &nodes.ListStorageContentResponse{}, nil
+}
+
+func (s *diskFakeNodesFromCluster) ListQemu(ctx context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	rows, err := s.f.fixtureRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp := make(nodes.ListQemuResponse, 0)
+	for _, r := range rows {
+		if r.Node != node || (r.Type != "" && r.Type != "qemu") || r.Vmid <= 0 {
+			continue
+		}
+		item := map[string]any{"vmid": r.Vmid}
+		if r.Name != "" {
+			item["name"] = r.Name
+		}
+		if r.Tags != "" {
+			item["tags"] = r.Tags
+		}
+		if r.Status != "" {
+			item["status"] = r.Status
+		}
+		if r.Template != nil {
+			item["template"] = r.Template
+		}
+		raw, mErr := json.Marshal(item)
+		if mErr != nil {
+			continue
+		}
+		resp = append(resp, raw)
+	}
+	return &resp, nil
 }
 
 // diskFakeQEMU is a minimal qemu.Service that returns a canned config for any VM.
@@ -467,7 +595,7 @@ func TestFindVMByDiskVolid_TransientThenSuccess(t *testing.T) {
 		},
 	}
 
-	vmid, node, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	vmid, node, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err != nil {
 		t.Fatalf("expected success after transient retry, got: %v", err)
 	}
@@ -510,7 +638,7 @@ func TestFindVMByDiskVolid_TransientConfigError_ReturnsRetriable(t *testing.T) {
 		},
 	}
 
-	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err == nil {
 		t.Fatal("expected retriable error for transient Config failure; got nil")
 	}
@@ -546,7 +674,7 @@ func TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues(t *testing.T
 		},
 	}
 
-	gotVMID, gotNode, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	gotVMID, gotNode, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err != nil {
 		t.Fatalf("not-found Config error must be skipped; scan must find the disk; got: %v", err)
 	}
@@ -559,12 +687,13 @@ func TestFindVMByDiskVolid_NotFoundConfigError_SkippedScanContinues(t *testing.T
 }
 
 // TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues pins the container
-// skip. /cluster/resources?type=vm answers with LXC rows alongside QEMU ones,
-// and PVE answers a QEMU config read for a container with a pmxcfs
-// "Configuration file ... does not exist" error rather than a 404. Without the
-// skip, one container anywhere in the cluster aborts every holder scan, which
-// with parking as the default means every detach_disk and every attach_disk of
-// a persistent disk fails for as long as that container exists.
+// invisibility contract. The scan now reads authoritative per-node qemu
+// listings, which never carry LXC rows, so a container anywhere in the
+// cluster cannot inject a guest whose config read fails with the pmxcfs
+// "Configuration file ... does not exist" shape and abort every holder scan.
+// The fixture includes an explicit lxc row to prove the listing filters it;
+// its config function still answers the container shape so a leak through
+// the filter would fail the test loudly rather than pass by accident.
 func TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues(t *testing.T) {
 	t.Parallel()
 	volid := "local-lvm:vm-402-disk-0"
@@ -573,9 +702,7 @@ func TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues(t *testing.T) {
 		clusterSvc: &diskFakeCluster{
 			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 				return diskClusterResp(
-					// No "type": an older PVE that elides it, which is the only
-					// row shape that can still turn out to be a container.
-					map[string]any{"vmid": int64(200), "node": "pve-01"},
+					map[string]any{"vmid": int64(200), "node": "pve-01", "type": "lxc"},
 					map[string]any{"vmid": int64(402), "node": "pve-01", "type": "qemu"},
 				), nil
 			},
@@ -591,7 +718,7 @@ func TestFindVMByDiskVolid_ContainerRow_SkippedScanContinues(t *testing.T) {
 		},
 	}
 
-	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err != nil {
 		t.Fatalf("a container row must not abort the scan; got: %v", err)
 	}
@@ -627,7 +754,7 @@ func TestFindVMByDiskVolid_QemuRowConfigMissing_NotSkipped(t *testing.T) {
 		},
 	}
 
-	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err == nil {
 		t.Fatal("a qemu guest whose config moved must not read as 'not attached to any VM'")
 	}
@@ -665,7 +792,7 @@ func TestFindVMByDiskVolid_ContainerRow_NotReadAtAll(t *testing.T) {
 		},
 	}
 
-	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, "pve-default", volid)
+	gotVMID, _, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
 	if err != nil {
 		t.Fatalf("a container row must never be read; got: %v", err)
 	}
@@ -1727,4 +1854,10 @@ func TestFindVMPoolViaCluster_TransportError(t *testing.T) {
 	if found {
 		t.Error("expected found=false on error")
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (f *diskFakeCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+	empty := cluster.ListStatusResponse{}
+	return &empty, nil
 }

@@ -175,7 +175,7 @@ func ensureAntiAffinityMembershipLocked(
 	}
 
 	// 2. Compute the full member set: existing same-group guests + this VM.
-	members, scanErr := collectGroupMemberSids(ctx, deps, groupTag)
+	members, live, liveComplete, scanErr := collectGroupMemberSids(ctx, deps, groupTag)
 	if scanErr != nil {
 		// Without the member set we cannot safely recreate the rule. Warn and stop.
 		return fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
@@ -186,6 +186,32 @@ func ensureAntiAffinityMembershipLocked(
 	existing, listErr := findHaRule(ctx, svc, ruleName)
 	if listErr != nil {
 		return fmt.Errorf("anti-affinity: list HA rules: %w", listErr)
+	}
+
+	// This ensure path only ever grows a rule: union the existing rule's
+	// members into the freshly scanned set instead of replacing them. However
+	// authoritative the scan, its TAG view can still trail reality (a
+	// same-group twin mid-create has no tag yet), and the delete path
+	// (removeAntiAffinityMembership) is the sole authority for shrinking, so
+	// a smaller scan here must never drop members another create registered.
+	// The one exception is a sid whose GUEST no longer exists anywhere in the
+	// fleet (destroyed outside the CPI, or a failed delete_vm HA cleanup):
+	// the enumeration in hand is authoritative for existence, and recreating
+	// the rule around a dangling sid would name a resource PVE no longer
+	// has, wedging every later create in the group. That drop is gated on
+	// liveComplete: when the enumeration excluded offline members, a sid
+	// missing from live may simply sit on an unenumerated node, and dropping
+	// it would silently void the spread guarantee for the reboot window, so
+	// every inherited sid is kept instead.
+	if existing != nil {
+		for s := range parseHaResources(existing.Resources) {
+			if _, ok := live[s]; !ok && liveComplete {
+				logger.Info("anti-affinity: dropping rule member with no live guest",
+					log.String("rule", ruleName), log.String("sid", s))
+				continue
+			}
+			members[s] = struct{}{}
+		}
 	}
 
 	// Fewer than two members: a negative-affinity rule is meaningless. Remove a
@@ -341,34 +367,36 @@ func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv,
 }
 
 // collectGroupMemberSids scans the cluster for QEMU guests tagged with groupTag
-// and returns their HA sids ("vm:<vmid>") as a set. The VM being created is not
-// yet tagged, so the caller adds its own sid afterwards.
-func collectGroupMemberSids(ctx context.Context, deps Deps, groupTag string) (map[string]struct{}, error) {
-	resp, err := deps.PVE.Cluster().ListResources(ctx, &cluster.ListResourcesParams{})
+// and returns their HA sids ("vm:<vmid>") as a set, plus the sids of EVERY
+// live guest regardless of tag (the union step uses the latter to drop an
+// inherited rule member whose guest is provably gone), plus liveComplete,
+// which is true only when the enumeration covered every cluster member.
+// When it is false the live set proves nothing about absence: a guest on an
+// offline-excluded member is unenumerated, not gone, so the union step must
+// keep every inherited sid. The VM being created is not yet tagged, so the
+// caller adds its own sid afterwards.
+//
+// The scan reads authoritative per-node listings, not the /cluster/resources
+// index: the index lags by minutes, and a same-group VM created moments ago
+// would be invisible to it, so a rule recomputed from the index could drop a
+// live member. Tolerant form so an offline member does not block every
+// create in the group; an enumeration failure is still returned (retriable)
+// rather than answered from a partial fleet.
+func collectGroupMemberSids(ctx context.Context, deps Deps, groupTag string) (members, live map[string]struct{}, liveComplete bool, err error) {
+	guests, excluded, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
-	out := make(map[string]struct{})
-	if resp == nil {
-		return out, nil
-	}
-	for _, raw := range *resp {
-		var ri struct {
-			Type string `json:"type"`
-			Vmid int64  `json:"vmid"`
-			Tags string `json:"tags"`
-		}
-		if json.Unmarshal(raw, &ri) != nil {
-			continue
-		}
-		if ri.Type != resourceTypeQemu || ri.Vmid == 0 {
-			continue
-		}
-		if tagsContain(ri.Tags, groupTag) {
-			out["vm:"+strconv.FormatInt(ri.Vmid, 10)] = struct{}{}
+	members = make(map[string]struct{})
+	live = make(map[string]struct{}, len(guests))
+	for _, g := range guests {
+		sid := "vm:" + strconv.Itoa(g.VMID)
+		live[sid] = struct{}{}
+		if tagsContain(g.Tags, groupTag) {
+			members[sid] = struct{}{}
 		}
 	}
-	return out, nil
+	return members, live, len(excluded) == 0, nil
 }
 
 // findHaRule returns the rule named ruleName, or nil when it does not exist.

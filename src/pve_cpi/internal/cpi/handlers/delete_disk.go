@@ -180,7 +180,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		//     straight through. Off → no extra calls.
 		// ----------------------------------------------------------------
 		if deps.Config.DiskDeleteStateGuardEnabled() {
-			if guardErr := pve.GuardDiskDeleteState(ctx, deps.PVE, node, bareDiskCID); guardErr != nil {
+			if guardErr := pve.GuardDiskDeleteState(ctx, deps.PVE, bareDiskCID); guardErr != nil {
 				deps.Log(ctx).Info("delete_disk: deferring delete, attached VM busy or holder state unresolved",
 					log.String("disk_cid", diskCID),
 				)

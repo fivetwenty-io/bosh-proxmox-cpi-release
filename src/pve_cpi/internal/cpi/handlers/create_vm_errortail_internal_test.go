@@ -119,7 +119,7 @@ func TestHandleAwaitError_VMIDConflict(t *testing.T) {
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
 
 	werr := errors.New("vm 100 already exists")
-	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 100, werr)
+	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 100, "", werr)
 
 	if !errors.Is(got, werr) {
 		t.Errorf("returned error = %v, want original werr", got)
@@ -137,7 +137,7 @@ func TestHandleAwaitError_StorageLockTimeout(t *testing.T) {
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
 
 	werr := errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
-	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 101, werr)
+	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 101, "", werr)
 
 	if !errors.Is(got, werr) {
 		t.Errorf("returned error = %v, want original werr", got)
@@ -155,7 +155,7 @@ func TestHandleAwaitError_TransientTransport(t *testing.T) {
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
 
 	werr := errors.New("auto-login failed: connection reset")
-	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 102, werr)
+	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 102, "", werr)
 
 	if !errors.Is(got, werr) {
 		t.Errorf("returned error = %v, want original werr", got)
@@ -173,7 +173,7 @@ func TestHandleAwaitError_GenericFailure(t *testing.T) {
 	deps := Deps{Config: etConfig(), PVE: client, Logger: log.NewNopLogger()}
 
 	werr := errors.New("qmcreate failed: unexpected backend error")
-	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 103, werr)
+	got := handleAwaitError(context.Background(), deps, log.NewNopLogger(), "node1", 103, "", werr)
 
 	if !errors.Is(got, werr) {
 		t.Errorf("returned error = %v, want original werr", got)

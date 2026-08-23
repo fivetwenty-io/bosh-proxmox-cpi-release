@@ -1290,9 +1290,26 @@ type templateGapClusterSvc struct {
 	resourceRows []map[string]any
 }
 
+// ListConfigNodes derives corosync membership from the resourceRows fixture
+// (the template's own node), so the authoritative template lookup lists the
+// node that actually holds the template. "name" is what
+// pve.ListClusterConfigNodes parses.
 func (c *templateGapClusterSvc) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-	raw, _ := json.Marshal(map[string]any{"node": "pve-vm"})
-	resp := sdkcluster.ListConfigNodesResponse{raw}
+	seen := map[string]bool{}
+	resp := sdkcluster.ListConfigNodesResponse{}
+	for _, row := range c.resourceRows {
+		node, _ := row["node"].(string)
+		if node == "" || seen[node] {
+			continue
+		}
+		seen[node] = true
+		raw, _ := json.Marshal(map[string]any{"name": node, "node": node})
+		resp = append(resp, raw)
+	}
+	if len(resp) == 0 {
+		raw, _ := json.Marshal(map[string]any{"name": "pve-vm", "node": "pve-vm"})
+		resp = append(resp, raw)
+	}
 	return &resp, nil
 }
 func (c *templateGapClusterSvc) ListStatus(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
@@ -1400,6 +1417,32 @@ func (n *templateGapNodesSvc) CreateQemuClone(_ context.Context, node, vmidStr s
 // qemu, when set, overrides the default benign etQEMU stub — used by tests whose
 // path reaches QEMU calls beyond Config (e.g. the rollback Stop in
 // cleanupVMDetached).
+// templateGapAuthNodes serves the template's own node from the cluster
+// fixture and delegates every other node (and method) to the test's nodes
+// service, keeping listQemuFn a pure replica-guard observable.
+type templateGapAuthNodes struct {
+	*templateGapNodesSvc
+	cluster *templateGapClusterSvc
+}
+
+func (n *templateGapAuthNodes) ListQemu(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if node == templateGapTemplateNode {
+		out := sdknodes.ListQemuResponse{}
+		for _, row := range n.cluster.resourceRows {
+			if rn, _ := row["node"].(string); rn != node {
+				continue
+			}
+			raw, err := json.Marshal(row)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, raw)
+		}
+		return &out, nil
+	}
+	return n.templateGapNodesSvc.ListQemu(ctx, node, p)
+}
+
 type templateGapPVE struct {
 	nodes   *templateGapNodesSvc
 	cluster *templateGapClusterSvc
@@ -1422,7 +1465,13 @@ func (p *templateGapPVE) QEMU() sdkqemu.Service {
 	}
 	return &etQEMU{}
 }
-func (p *templateGapPVE) Nodes() sdknodes.Service         { return p.nodes }
+
+// Nodes wraps the test's nodes service so the authoritative template lookup
+// (which lists the template's own node) sees the resourceRows fixture, while
+// listQemuFn stays the replica guard's observable on every other node.
+func (p *templateGapPVE) Nodes() sdknodes.Service {
+	return &templateGapAuthNodes{templateGapNodesSvc: p.nodes, cluster: p.cluster}
+}
 func (p *templateGapPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *templateGapPVE) Storage() sdkstorage.Service     { panic("not needed") }
 func (p *templateGapPVE) CloudInit() sdkcloudinit.Service { panic("not needed") }

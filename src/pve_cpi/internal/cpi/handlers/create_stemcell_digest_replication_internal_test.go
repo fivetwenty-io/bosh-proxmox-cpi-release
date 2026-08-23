@@ -447,13 +447,16 @@ func (c *countingNodesService) CreateQemuTemplate(ctx context.Context, node, vmi
 // countingClusterService counts ListConfigNodes calls.
 type countingClusterService struct {
 	sdkcluster.Service
-	listConfigNodesCalls int
+	// listConfigNodesCalls is atomic: the replication pool's per-node
+	// goroutines each allocate a VMID, and the allocator's authoritative
+	// enumeration reads membership concurrently.
+	listConfigNodesCalls atomic.Int32
 	listConfigNodesFn    func(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error)
 	listResourcesFn      func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
 }
 
 func (c *countingClusterService) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-	c.listConfigNodesCalls++
+	c.listConfigNodesCalls.Add(1)
 	if c.listConfigNodesFn != nil {
 		return c.listConfigNodesFn(ctx)
 	}
@@ -897,7 +900,19 @@ func buildReplicationDeps(
 	}
 	logger, _ := log.NewLogger("debug", io.Discard)
 	mc := &digestReplicationMockClient{
-		clusterSvc: &countingClusterService{},
+		// Membership covers every node these suites replicate to; the VMID
+		// allocator's authoritative enumeration needs a non-empty membership,
+		// and listing a node with no scripted guests just returns empty.
+		clusterSvc: &countingClusterService{
+			listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+				resp := make(sdkcluster.ListConfigNodesResponse, 0, 4)
+				for _, n := range []string{"pve1", "pve2", "pve3", "pve4"} {
+					raw, _ := json.Marshal(map[string]any{"name": n})
+					resp = append(resp, raw)
+				}
+				return &resp, nil
+			},
+		},
 		nodesSvc:   nodesSvc,
 		qemuSvc:    qemuSvc,
 		storageSvc: storageSvc,
@@ -1657,4 +1672,10 @@ func TestReplicateStemcellToNodes_PanicRecovered(t *testing.T) {
 	if !strings.Contains(logOutput, panicNode) {
 		t.Errorf("log output should name the panicking replica node %q; got: %s", panicNode, logOutput)
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (c *countingClusterService) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

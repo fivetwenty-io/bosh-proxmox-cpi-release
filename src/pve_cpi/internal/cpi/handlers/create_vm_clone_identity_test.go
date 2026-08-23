@@ -43,16 +43,33 @@ func nodeListWithTemplate(vmid int64, sha8 string) func(context.Context, string,
 
 // TestCreateVM_TemplateCacheMiss_RecheckFindsTemplate_Clones is the
 // template-visibility race: create_stemcell freezes a template, the director
-// issues create_vm immediately, and PVE's /cluster/resources index has not
-// caught up yet. The first lookup misses; the bounded re-check must find the
-// template and clone rather than silently degrading to a full-copy import.
+// issues create_vm immediately, and the template is not yet visible in the
+// listing (frozen mid-flight). The first lookup misses; the bounded re-check
+// must find the template and clone rather than silently degrading to a
+// full-copy import. The race is staged on the per-node listing every lookup
+// reads: call 1 is the VMID allocator's enumeration, calls 2 and 3 are
+// attempt 1 (cluster-scoped lookup, then the authoritative per-node probe),
+// both missing, and call 4 is attempt 2's lookup, after the re-check wait,
+// which sees the template. The wait counter is the load-bearing assertion:
+// it proves the delayed re-check loop actually cycled, where a raw
+// listing-call count could be satisfied by attempt 1 alone if the
+// surrounding call pattern ever shifts.
 func TestCreateVM_TemplateCacheMiss_RecheckFindsTemplate_Clones(t *testing.T) {
 	defer handlers.SetTemplateCacheRecheckDelay(0)()
+	waitsBefore := handlers.TemplateCacheRecheckWaits()
 
-	var cacheLookups atomic.Int32
+	var nodeLists atomic.Int32
 	cloneCalled := false
 
+	templateList := nodeListWithTemplate(6042, oldCIDSHA8)
 	n := &vmMockNodes{
+		listQemuFn: func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			if nodeLists.Add(1) <= 3 {
+				empty := sdknodes.ListQemuResponse{}
+				return &empty, nil
+			}
+			return templateList(ctx, node, params)
+		},
 		createQemuCloneFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuCloneParams) (*sdknodes.CreateQemuCloneResponse, error) {
 			cloneCalled = true
 			return cloneUPIDResponse(), nil
@@ -60,20 +77,7 @@ func TestCreateVM_TemplateCacheMiss_RecheckFindsTemplate_Clones(t *testing.T) {
 	}
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
-	// The cluster index lags: empty on the first cache lookup, populated after.
-	c := &vmMockCluster{
-		listResourcesFn: func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			if params != nil && params.Type != nil {
-				empty := sdkcluster.ListResourcesResponse{}
-				return &empty, nil
-			}
-			if cacheLookups.Add(1) == 1 {
-				empty := sdkcluster.ListResourcesResponse{}
-				return &empty, nil
-			}
-			return clusterCacheListResourcesFn(6042, "pve", oldCIDSHA8)(ctx, params)
-		},
-	}
+	c := &vmMockCluster{}
 
 	deps := buildVMDepsForOldCIDLookup(q, n, c, a)
 	h := handlers.HandleCreateVM(deps)
@@ -92,8 +96,15 @@ func TestCreateVM_TemplateCacheMiss_RecheckFindsTemplate_Clones(t *testing.T) {
 	if len(q.createCalls) != 0 {
 		t.Errorf("QEMU.Create (import path) must not be called, got %d calls", len(q.createCalls))
 	}
-	if got := cacheLookups.Load(); got < 2 {
-		t.Errorf("cluster cache lookup ran %d time(s); the re-check must retry after a miss", got)
+	if got := nodeLists.Load(); got < 4 {
+		t.Errorf("per-node listing ran %d time(s); attempt 2 must retry after attempt 1 misses", got)
+	}
+	// The wait counter pins the re-check directly: if the surrounding call
+	// pattern ever shifts so an attempt-1 lookup already sees the template,
+	// the listing-count assertion above could still pass without the delayed
+	// re-check having run, but no wait would have been taken.
+	if handlers.TemplateCacheRecheckWaits() == waitsBefore {
+		t.Error("no re-check wait was taken; the staged miss never exercised the re-check loop")
 	}
 }
 

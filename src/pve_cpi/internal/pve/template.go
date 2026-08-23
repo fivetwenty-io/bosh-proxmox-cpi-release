@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
@@ -28,6 +27,9 @@ type qemuListItem struct {
 	Name *string `json:"name,omitempty"`
 	// Tags is the semicolon-delimited PVE tag string; absent when no tags set.
 	Tags *string `json:"tags,omitempty"`
+	// Status is the guest power state ("running", "stopped"); absent on some
+	// PVE versions for templates.
+	Status *string `json:"status,omitempty"`
 	// Template is true when the VM has been frozen as a PVE template.
 	// PVE omits the field entirely for normal VMs (not false, just absent).
 	//
@@ -528,11 +530,13 @@ func FindTemplatesBySHATagNode(ctx context.Context, c Client, node, sha8 string)
 
 // ---- Cluster-scoped template cache lookup ----
 //
-// A node-scoped ListQemu lookup would mean create-side dedup on node A and a
+// A single-node ListQemu lookup would mean create-side dedup on node A and a
 // destroy-side sweep initiated from node B see different worlds. The
-// functions below scan Cluster().ListResources instead, so create-side lookup
-// and destroy-side sweep always agree on which cache templates exist,
-// clusterwide, regardless of which node the caller is talking to.
+// functions below union authoritative per-node listings over the whole
+// cluster (ListGuestsAuthoritative), so create-side lookup and destroy-side
+// sweep always agree on which cache templates exist, clusterwide, regardless
+// of which node the caller is talking to, and without the minutes-scale lag
+// of the /cluster/resources index.
 
 // clusterResourceTypeQemu is the "type" discriminator for QEMU guest rows in
 // a GET /cluster/resources response (as opposed to "lxc", "node", "storage",
@@ -601,59 +605,45 @@ type clusterQemuResourceItem struct {
 // so no sha8- or name-keyed path can adopt, sweep, or destroy a template a
 // previous CPI generation left on the cluster. See stemcell_generation.go.
 func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
-	// RetryOnTransient + WrapErrorKeepingClass: this and
-	// FindTemplatesBySHATagNode were the only ListResources/ListQemu call
-	// sites with neither, so a transient 503 here surfaced permanent (and
-	// some callers papered over it with their own re-wraps).
-	var resp *sdkcluster.ListResourcesResponse
-	err := RetryOnTransient(ctx, nil, label, 0, func() error {
-		var inner error
-		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
-		return inner
-	})
+	// The scan reads authoritative per-node listings
+	// (ListGuestsAuthoritative), not the /cluster/resources index: the index
+	// lags by minutes, and a twin template frozen inside the lag window is
+	// exactly what the create-side dedup and the race reconcile exist to
+	// find. The enumeration classifies its own failures (retriable for a
+	// partial fleet), so its error is wrapped with context only.
+	guests, err := ListGuestsAuthoritative(ctx, c, nil)
 	if err != nil {
-		return nil, cpierrors.Wrap(WrapErrorKeepingClass(err), label)
-	}
-	if resp == nil || len(*resp) == 0 {
-		return nil, nil
+		return nil, cpierrors.Wrap(err, label)
 	}
 
-	out := make([]clusterQemuResourceItem, 0, len(*resp))
-	for i, raw := range *resp {
-		var item clusterQemuResourceItem
-		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
-			// Malformed element — skip; do not fail the whole scan. Logged at
-			// Debug so schema drift leaves a diagnostic trail instead of
-			// silently reporting "template not found" a layer up.
-			log.FromContext(ctx).Debug("template: skipping malformed cluster resource entry",
-				log.Int("index", i),
-				log.Err(jsonErr),
-			)
-			continue
-		}
-		if item.Type != clusterResourceTypeQemu || item.Vmid == 0 {
-			// Excludes lxc containers, nodes, storages, pools, and any other
-			// non-VM resource row.
-			continue
-		}
-		if item.Template == nil || !*item.Template {
+	out := make([]clusterQemuResourceItem, 0, len(guests))
+	for _, g := range guests {
+		if !g.Template {
 			// Excludes running VMs (not yet — or never — frozen as templates).
 			continue
 		}
-		if !HasStemcellGenerationMarker(splitPVETags(item.Tags)) {
+		if !HasStemcellGenerationMarker(g.SplitTags()) {
 			// Excludes templates left by a previous CPI generation: they carry
 			// the same content sha tag but none of this generation's refs, so
 			// adopting one would destroy a live template on the first
 			// last-ref delete_stemcell. Logged at Debug so an operator seeing
 			// an unexpected duplicate cache can tell why.
 			log.FromContext(ctx).Debug("template: skipping stemcell template with no current-generation marker",
-				log.Int64("vmid", item.Vmid),
-				log.String("node", item.Node),
-				log.String("name", item.Name),
+				log.Int64("vmid", int64(g.VMID)),
+				log.String("node", g.Node),
+				log.String("name", g.Name),
 			)
 			continue
 		}
-		out = append(out, item)
+		isTemplate := pveBool(true)
+		out = append(out, clusterQemuResourceItem{
+			Type:     clusterResourceTypeQemu,
+			Vmid:     int64(g.VMID),
+			Node:     g.Node,
+			Name:     g.Name,
+			Tags:     g.Tags,
+			Template: &isTemplate,
+		})
 	}
 	return out, nil
 }

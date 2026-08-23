@@ -14,6 +14,42 @@ import (
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
+// sweepCandidateVMID destroys the partial VM a failed create attempt may
+// have left at candidate, but only after checking the guest there is ours.
+// The sweeping paths are commit-indeterminate (a dropped POST or lost await
+// may not have registered the VMID at all), so between the failure and this
+// sweep a concurrent create can win the same VMID; destroying the winner
+// would take a live VM this process never owned. The name our own create
+// params carried is the discriminator: a guest whose name differs is the
+// peer's and is left alone. A missing guest returns without any destroy; an
+// unnamed guest, an unreadable config, or an empty expectedName falls
+// through to the normal cleanup, whose destroy tolerates already-gone
+// verdicts (best-effort: the guard narrows the exposure, it cannot close it
+// for two attempts that chose the same name; that residual window is itself
+// narrowed by the allocator's used-set now including the authoritative
+// per-node listings, so a peer's just-registered VMID is normally never
+// handed out twice in the first place).
+func sweepCandidateVMID(ctx context.Context, deps Deps, node string, candidate int, expectedName string, env map[string]any, logger *log.Logger) {
+	if expectedName != "" {
+		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, candidate)
+		if cfgErr != nil {
+			if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
+				return
+			}
+			// Unreadable: proceed; cleanupVM's own destroy handling
+			// re-classifies and tolerates already-gone.
+		} else if name, _ := cfg[metadataKeyName].(string); name != "" && name != expectedName {
+			logger.Warn("create_vm: candidate VMID now holds a different VM (a concurrent create won the ID); leaving it alone",
+				log.Int("vmid_attempted", candidate),
+				log.String("expected_name", expectedName),
+				log.String("actual_name", name),
+			)
+			return
+		}
+	}
+	cleanupVMDetached(ctx, deps, node, candidate, env, logger)
+}
+
 // handleCreateError classifies a QEMU.Create error and logs the appropriate
 // message. It cleans up transient-transport failures (where the POST may have
 // committed) and returns the original error so AllocateWithRetry can retry.
@@ -23,6 +59,7 @@ func handleCreateError(
 	logger *log.Logger,
 	node string,
 	candidate int,
+	candidateName string,
 	cerr error,
 ) error {
 	// Classify mutually exclusively so VMID conflicts don't
@@ -48,7 +85,7 @@ func handleCreateError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		sweepCandidateVMID(ctx, deps, node, candidate, candidateName, nil, logger)
 	}
 	return cerr
 }
@@ -62,6 +99,7 @@ func handleAwaitError(
 	logger *log.Logger,
 	node string,
 	candidate int,
+	candidateName string,
 	werr error,
 ) error {
 	if pve.IsVMIDConflict(werr) {
@@ -77,7 +115,7 @@ func handleAwaitError(
 		// PVE rolled back its own qmcreate task — but the
 		// VMID may still be registered with the partial
 		// state. Clean up before the next attempt.
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		sweepCandidateVMID(ctx, deps, node, candidate, candidateName, nil, logger)
 		return werr
 	}
 	if pve.IsTransientTransport(werr) {
@@ -88,14 +126,14 @@ func handleAwaitError(
 		// The qmcreate task itself may still be running on
 		// PVE — we only lost the await connection. Clean
 		// up the VMID so a fresh attempt has a clean slate.
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		sweepCandidateVMID(ctx, deps, node, candidate, candidateName, nil, logger)
 		return werr
 	}
 	// Non-conflict failure after Create succeeded: the VM may
 	// have been partially registered. Roll back this attempt
 	// before propagating so the next retry (which won't run)
 	// or the caller sees a clean slate.
-	cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+	sweepCandidateVMID(ctx, deps, node, candidate, candidateName, nil, logger)
 	return werr
 }
 

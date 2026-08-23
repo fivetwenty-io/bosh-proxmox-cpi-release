@@ -107,6 +107,17 @@ func (m *snapClusterService) ListResources(ctx context.Context, params *sdkclust
 	return &resp, nil
 }
 
+// ListConfigNodes derives corosync membership from the same ListResources
+// fixture (falling back to testNode), so pve.ListGuestsAuthoritative sees
+// the cluster the suite scripts through the index fixture.
+func (m *snapClusterService) ListConfigNodes(ctx context.Context) (*sdkclusterapi.ListConfigNodesResponse, error) {
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return authConfigNodesFromResources(rows, testNode), nil
+}
+
 // ---------------------------------------------------------------------------
 // helper: build a cluster response with one VM entry.
 // ---------------------------------------------------------------------------
@@ -848,3 +859,9 @@ func TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds(t *testing.T) {
 // integration-test harness provides a cifs pool via env.
 //
 // func TestHandleSnapshotDisk_CIFS_CID(t *testing.T) { ... }
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (m *snapClusterService) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+	empty := sdkclusterapi.ListStatusResponse{}
+	return &empty, nil
+}

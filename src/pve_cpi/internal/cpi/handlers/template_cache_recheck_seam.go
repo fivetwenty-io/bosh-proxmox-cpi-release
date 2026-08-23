@@ -17,9 +17,24 @@ func init() {
 	templateCacheRecheckDelayNs.Store(int64(750 * time.Millisecond))
 }
 
+// templateCacheRecheckWaits counts the re-check waits taken since process
+// start. The delay is consulted exactly once per bounded re-check attempt,
+// so a test staging an index-lag race can assert the re-check actually ran
+// instead of inferring it from listing-call ordinals, which degrade silently
+// when the surrounding call pattern shifts.
+var templateCacheRecheckWaits atomic.Int64
+
 // templateCacheRecheckDelay returns the current inter-attempt wait.
 func templateCacheRecheckDelay() time.Duration {
+	templateCacheRecheckWaits.Add(1)
 	return time.Duration(templateCacheRecheckDelayNs.Load())
+}
+
+// TemplateCacheRecheckWaits returns the number of re-check waits taken since
+// process start; tests capture it before and after a staged race and assert
+// on the delta.
+func TemplateCacheRecheckWaits() int64 {
+	return templateCacheRecheckWaits.Load()
 }
 
 // SetTemplateCacheRecheckDelay replaces the inter-attempt wait for the

@@ -64,11 +64,28 @@ func reconcileVMPoolMembership(ctx context.Context, deps Deps, node string, vmid
 		return
 	}
 	if !found {
-		return
+		// The membership lookup reads the /cluster/resources index, which
+		// lags node-local state by minutes, and set_vm_metadata runs seconds
+		// after create_vm: a young VM is the common case here, not an
+		// anomaly. The VM itself is proven present (its config was just read
+		// above), so a silent return would leave exactly the newest VMs
+		// unreconciled. Proceed with an unknown current pool for the
+		// template-layer converge only: it moves to the desired pool
+		// regardless (MoveVMToPool tolerates the VM already being there).
+		// Legacy adoption gets the found flag and skips, because it requires
+		// an actual reading proving the VM sits in the static pool; an
+		// unknown pool must not satisfy that gate (with vm_pool unset the
+		// gate would otherwise compare empty to empty and adopt blind).
+		logger.Debug("set_vm_metadata: pool reconcile: VM not in cluster index yet; treating current pool as unknown")
+		currentPool = ""
 	}
 
 	if hasSentinel {
 		reconcileTemplateLayerVM(ctx, deps, node, vmid, pm, currentPool, logger)
+		return
+	}
+	if !found {
+		logger.Debug("set_vm_metadata: pool adopt: current pool unknown (index lag); adoption needs a proven static-pool reading, skipping")
 		return
 	}
 	adoptLegacyVM(ctx, deps, node, vmid, metadata, currentPool, logger)

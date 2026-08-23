@@ -54,8 +54,15 @@ func (f *fakeClusterService) ListResources(ctx context.Context, params *cluster.
 	return f.listResourcesFn(ctx, params)
 }
 
+// ListStatus delegates to listStatusFn when scripted; otherwise it reports no
+// offline members (fully online fixture cluster), because the authoritative
+// enumeration consults it best-effort on many paths whose tests never wire it.
 func (f *fakeClusterService) ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error) {
-	return f.listStatusFn(ctx)
+	if f.listStatusFn != nil {
+		return f.listStatusFn(ctx)
+	}
+	empty := cluster.ListStatusResponse{}
+	return &empty, nil
 }
 
 func (f *fakeClusterService) ListFirewallGroups(ctx context.Context) (*cluster.ListFirewallGroupsResponse, error) {

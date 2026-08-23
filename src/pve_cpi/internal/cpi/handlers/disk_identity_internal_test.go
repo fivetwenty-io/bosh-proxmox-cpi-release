@@ -130,6 +130,29 @@ type idFakeNodes struct {
 	c *idFakeClient
 }
 
+// ListQemu serves the node's guests from the shared config store, so
+// pve.ListGuestsAuthoritative and ListParkersForNode see every scripted VM.
+func (n *idFakeNodes) ListQemu(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	out := sdknodes.ListQemuResponse{}
+	for vmid, cfg := range n.c.configs {
+		row := map[string]any{"vmid": vmid}
+		if tags, ok := cfg["tags"].(string); ok {
+			row["tags"] = tags
+		}
+		if name, ok := cfg["name"].(string); ok {
+			row["name"] = name
+		}
+		raw, err := json.Marshal(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, raw)
+	}
+	return &out, nil
+}
+
 func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr string, params *sdknodes.UpdateQemuConfigParams) error {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
@@ -203,6 +226,14 @@ func (n *idFakeNodes) CreateQemuMoveDisk(_ context.Context, _ string, vmidStr st
 type idFakeCluster struct {
 	sdkcluster.Service
 	c *idFakeClient
+}
+
+// ListConfigNodes reports the single test node "pve1" so
+// pve.ListGuestsAuthoritative has a non-empty membership.
+func (cl *idFakeCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	raw, _ := json.Marshal(map[string]any{"name": "pve1"})
+	resp := sdkcluster.ListConfigNodesResponse{raw}
+	return &resp, nil
 }
 
 func (cl *idFakeCluster) ListResources(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -397,4 +428,10 @@ func TestDiskHandlersRouteThroughIdentityResolver(t *testing.T) {
 			t.Errorf("%s decodes a disk CID but never resolves it through resolveDiskForOp; a renamed stable-ID volume would be unfindable there", name)
 		}
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (cl *idFakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

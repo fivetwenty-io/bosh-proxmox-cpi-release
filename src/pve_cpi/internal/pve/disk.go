@@ -538,8 +538,8 @@ func ResolveDiskID(ctx context.Context, c Client, node string, vmid int, volid s
 // Returns (0, "", cpierrors.Error) when:
 //   - cluster resource listing fails (wrapped error).
 //   - no VM holds the disk: cpierrors.Cloud("...disk not attached to any VM...").
-func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string) (int, string, error) {
-	vmid, node, _, err := FindVMByDiskVolidTagged(ctx, c, fallbackNode, volid)
+func FindVMByDiskVolid(ctx context.Context, c Client, volid string) (int, string, error) {
+	vmid, node, _, err := FindVMByDiskVolidTagged(ctx, c, volid)
 	return vmid, node, err
 }
 
@@ -550,8 +550,8 @@ func FindVMByDiskVolid(ctx context.Context, c Client, fallbackNode, volid string
 // are already in hand; a caller that needs to know what kind of VM it found --
 // snapshot_disk asking whether the holder is a parker -- would otherwise pay a
 // second read of a config this function just discarded.
-func FindVMByDiskVolidTagged(ctx context.Context, c Client, fallbackNode, volid string) (int, string, string, error) {
-	hit, err := findVMByDiskIdentityScan(ctx, c, fallbackNode, volid, "")
+func FindVMByDiskVolidTagged(ctx context.Context, c Client, volid string) (int, string, string, error) {
+	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "")
 	return hit.VMID, hit.Node, hit.Tags, err
 }
 
@@ -574,7 +574,7 @@ type DiskScanHit struct {
 // non-empty — by a serial=<stableID> drive option. The serial match is what
 // finds a volume move_disk renamed, at zero extra API cost over the volid
 // scan every caller already paid.
-func findVMByDiskIdentityScan(ctx context.Context, c Client, fallbackNode, volid, stableID string) (DiskScanHit, error) {
+func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID string) (DiskScanHit, error) {
 	if c == nil {
 		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: client must not be nil")
 	}
@@ -582,85 +582,41 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, fallbackNode, volid
 		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: volid must not be empty")
 	}
 
-	typeStr := "vm"
-	var resources *sdkcluster.ListResourcesResponse
-	listErr := RetryOnTransient(ctx, nil, "find_vm_by_disk_volid_list", 0, func() error {
-		var inner error
-		resources, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-		return inner
-	})
+	// The candidate list comes from authoritative per-node listings, not the
+	// /cluster/resources index: the index lags by minutes, and a young VM it
+	// has not caught up with is exactly the holder whose absence turns into
+	// "not attached to any VM", the answer behind delete-while-attached and
+	// double-attach. The enumeration already classifies its failures
+	// (retriable for a partial fleet or a pvedaemon restart), so its error is
+	// wrapped with context only. Per-node listings also answer with QEMU
+	// guests only, so the LXC-container filtering the index scan needed is
+	// gone by construction, and every row carries its real node, so no
+	// fallback node hint is needed.
+	guests, listErr := ListGuestsAuthoritative(ctx, c, nil)
 	if listErr != nil {
-		// WrapError first, as ListParkersForNode does: the SDK error arriving
-		// here is not a *cpierrors.Error, so wrapping it directly would fall
-		// through to TypeCloud and label a corosync blip, a quorum loss, or a
-		// pvedaemon restart as permanent. The Director would give up on
-		// delete_disk and detach_disk instead of re-driving them. WrapError
-		// makes the retriable/permanent split on what the error actually is.
-		return DiskScanHit{}, cpierrors.Wrap(WrapError(listErr), "FindVMByDiskVolid: list cluster resources")
-	}
-	if resources == nil {
-		// Retriable: a pvedaemon coming back up answers with an empty body, and
-		// the scan now runs on delete_disk, attach_disk, and detach_disk alike,
-		// so a permanent failure here fails all three during a restart that
-		// resolves itself in seconds.
-		return DiskScanHit{}, cpierrors.Retriable("FindVMByDiskVolid: nil response from cluster resources")
+		return DiskScanHit{}, cpierrors.Wrap(listErr, "FindVMByDiskVolid: enumerate cluster guests")
 	}
 
-	type resourceEntry struct {
-		VMID int64  `json:"vmid"`
-		Node string `json:"node"`
-		Type string `json:"type"`
-	}
-
-	for _, raw := range *resources {
-		var entry resourceEntry
-		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil || entry.VMID <= 0 {
-			continue
-		}
-
-		// /cluster/resources?type=vm answers with LXC containers alongside QEMU
-		// guests, and a container's config lives at a path the QEMU endpoint
-		// cannot read: PVE returns a pmxcfs "Configuration file ... does not
-		// exist" error, which is not a 404 and would abort the whole scan
-		// retriably. One container anywhere in the cluster would then fail every
-		// park, unpark, and holder probe until somebody deleted it. A row that
-		// elides the field is kept, matching ListParkersForNode.
-		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
-			continue
-		}
-
-		vmNode := entry.Node
-		if vmNode == "" {
-			vmNode = fallbackNode
-		}
-		if vmNode == "" {
-			// No node hint; cannot fetch config. Skip.
-			continue
-		}
-
-		vmid := int(entry.VMID)
+	for _, g := range guests {
+		vmid := g.VMID
+		vmNode := g.Node
 		cfg, cfgErr := c.QEMU().Config(ctx, vmNode, vmid)
 		if cfgErr != nil {
-			// Skip config-gone errors: the VM was deleted, or is a template whose
-			// config was concurrently removed, or the row named a guest this
-			// endpoint cannot read. Either way it holds no QEMU disk. Any other
-			// error is potentially a fault on the VM that holds the disk, and
-			// concluding "not attached to any VM" from it is how a volume ends
-			// up attached twice, so it is returned rather than skipped.
+			// Skip a clean 404: the VM was deleted between the listing and
+			// this read, so it holds no QEMU disk. Any other error is
+			// potentially a fault on the VM that holds the disk, and
+			// concluding "not attached to any VM" from it is how a volume
+			// ends up attached twice, so it is returned rather than skipped.
+			// That includes the pmxcfs "Configuration file ... does not
+			// exist" shape: on an authoritative row it is most likely a
+			// guest mid-migration whose .conf has moved nodes, and the
+			// wrapped error classifies retriable so the Director re-drives
+			// the scan once the migration settles.
 			//
 			// WrapError makes the retriable/permanent split on what the error
-			// actually is: a 403 on one VM's config is a grant only a human can
-			// add, and re-driving it forever helps nobody.
-			// The pmxcfs skip is deliberately narrower than the not-found one:
-			// it applies only to a row that elided "type". A row that named
-			// itself qemu and then answers "Configuration file ... does not
-			// exist" is most likely a guest mid-migration, whose .conf has moved
-			// to another node while the row still names the old one -- and
-			// concluding "not attached to any VM" from that is how a running
-			// VM's volume gets attached to a second VM. Containers, the case the
-			// skip exists for, are already filtered by type above; a row that
-			// elides type is the only one that can still be one.
-			if IsNotFound(cfgErr) || (entry.Type == "" && IsPmxcfsConfigMissing(cfgErr)) {
+			// actually is: a 403 on one VM's config is a grant only a human
+			// can add, and re-driving it forever helps nobody.
+			if IsNotFound(cfgErr) {
 				continue
 			}
 			return DiskScanHit{}, cpierrors.Wrap(
@@ -712,8 +668,8 @@ func matchDiskIdentity(disks map[string]string, volid, stableID string) (slot, c
 // Existing callers of FindVMByDiskVolid are unaffected: they still receive the
 // wrapped ErrDiskNotAttachedToAnyVM error (detectable via errors.Is) and the
 // human-readable format is preserved.
-func FindVMByDiskVolidOrNone(ctx context.Context, c Client, fallbackNode, volid string) (vmid int, node string, found bool, err error) {
-	v, n, _, found, findErr := FindVMByDiskVolidOrNoneTagged(ctx, c, fallbackNode, volid)
+func FindVMByDiskVolidOrNone(ctx context.Context, c Client, volid string) (vmid int, node string, found bool, err error) {
+	v, n, _, found, findErr := FindVMByDiskVolidOrNoneTagged(ctx, c, volid)
 	return v, n, found, findErr
 }
 
@@ -724,9 +680,9 @@ func FindVMByDiskVolidOrNone(ctx context.Context, c Client, fallbackNode, volid 
 // failure would otherwise have to be handled, on a path where the safe answer
 // and the available answer are not the same.
 func FindVMByDiskVolidOrNoneTagged(
-	ctx context.Context, c Client, fallbackNode, volid string,
+	ctx context.Context, c Client, volid string,
 ) (vmid int, node, tags string, found bool, err error) {
-	v, n, t, findErr := FindVMByDiskVolidTagged(ctx, c, fallbackNode, volid)
+	v, n, t, findErr := FindVMByDiskVolidTagged(ctx, c, volid)
 	if findErr != nil {
 		if errors.Is(findErr, ErrDiskNotAttachedToAnyVM) {
 			return 0, "", "", false, nil

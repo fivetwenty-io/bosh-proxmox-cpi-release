@@ -45,8 +45,24 @@ type mockPVEClient struct {
 	poolsSvc          pve.PoolService
 }
 
-func (m *mockPVEClient) QEMU() qemu.Service           { return m.qemuSvc }
-func (m *mockPVEClient) Nodes() nodes.Service         { return m.nodesSvc }
+func (m *mockPVEClient) QEMU() qemu.Service { return m.qemuSvc }
+
+// Nodes serves the authoritative per-node listing surface
+// (pve.ListGuestsAuthoritative) by deriving ListQemu rows from the wired
+// cluster fixture, so suites scripted against the /cluster/resources index
+// keep working after the production migration to per-node listings. A wired
+// nodes service keeps handling every other method through delegation; with
+// neither service wired, Nodes stays nil so production nil-guards behave as
+// before.
+func (m *mockPVEClient) Nodes() nodes.Service {
+	if m.nodesSvc != nil {
+		return &authNodesService{Service: m.nodesSvc, listFn: m.Cluster().ListResources, fallbackNode: testNode}
+	}
+	if m.clusterSvc != nil {
+		return &authNodesService{listFn: m.clusterSvc.ListResources, fallbackNode: testNode}
+	}
+	return nil
+}
 func (m *mockPVEClient) Tasks() tasks.Service         { return m.tasksSvc }
 func (m *mockPVEClient) Storage() storage.Service     { return m.storageSvc }
 func (m *mockPVEClient) CloudInit() cloudinit.Service { return m.cloudInitSvc }
@@ -181,6 +197,23 @@ type mockNodesService struct {
 	createQemuStatusRebootFn func(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error)
 	listStorageFn            func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 	listHardwarePciFn        func(ctx context.Context, node string, params *nodes.ListHardwarePciParams) (*nodes.ListHardwarePciResponse, error)
+	listQemuFn               func(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error)
+}
+
+// ListQemu backs the authoritative per-node listing
+// (pve.ListGuestsAuthoritative); nil listQemuFn means an empty node, which is
+// what suites that only script the VM under test expect the rest of the
+// cluster to look like. A scripted listQemuFn MUST honor its node argument
+// (return each guest for exactly one node): the enumeration calls it once per
+// derived cluster member, and a fn that ignores node duplicates the same
+// guest under every node, so multi-node assertions pass or fail for reasons
+// unrelated to production behavior.
+func (m *mockNodesService) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	if m.listQemuFn != nil {
+		return m.listQemuFn(ctx, node, params)
+	}
+	empty := nodes.ListQemuResponse{}
+	return &empty, nil
 }
 
 func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
@@ -759,21 +792,160 @@ func (m *mockClusterSvc) ListStatus(ctx context.Context) (*cluster.ListStatusRes
 	if m.listStatusFn != nil {
 		return m.listStatusFn(ctx)
 	}
-	panic("mockClusterSvc.ListStatus: not configured")
+	// Default: no offline members (fully online fixture cluster). The
+	// authoritative enumeration consults this best-effort on many paths whose
+	// tests never script it.
+	empty := cluster.ListStatusResponse{}
+	return &empty, nil
 }
 
 func (m *mockClusterSvc) ListConfigNodes(ctx context.Context) (*cluster.ListConfigNodesResponse, error) {
 	if m.listConfigNodesFn != nil {
 		return m.listConfigNodesFn(ctx)
 	}
-	// Default: single-node cluster (one entry). Tests exercising multi-node
-	// topology must set listConfigNodesFn explicitly. The real
-	// /cluster/config/nodes payload carries the node name under "name"
-	// (which pve.ListClusterConfigNodes parses); "node" is included for
-	// callers that key on the resource-index field name.
-	raw, _ := json.Marshal(map[string]any{"name": "pve-node1", "node": "pve-node1"})
-	resp := cluster.ListConfigNodesResponse{raw}
-	return &resp, nil
+	// Default: derive membership from the ListResources fixture (the distinct
+	// node names in the scripted rows), falling back to a single-node cluster.
+	// A fixed default node here would make guests scripted on other nodes
+	// invisible to pve.ListGuestsAuthoritative. Tests exercising a specific
+	// topology set listConfigNodesFn explicitly.
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return authConfigNodesFromResources(rows, "pve-node1"), nil
+}
+
+// authConfigNodesFromResources derives a /cluster/config/nodes response from
+// a ListResources-shaped fixture: the distinct node names in the rows, or the
+// fallback node when the fixture is empty or node-less, so an empty fixture
+// reads as an empty cluster rather than a failed enumeration.
+func authConfigNodesFromResources(rows *cluster.ListResourcesResponse, fallback string) *cluster.ListConfigNodesResponse {
+	seen := map[string]bool{}
+	names := make([]string, 0, 2)
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node == "" || seen[item.Node] {
+				continue
+			}
+			seen[item.Node] = true
+			names = append(names, item.Node)
+		}
+	}
+	if len(names) == 0 {
+		names = append(names, fallback)
+	}
+	out := make(cluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		// "name" is what pve.ListClusterConfigNodes parses; "node" is kept
+		// for callers keyed on the resource-index field name.
+		b, _ := json.Marshal(map[string]any{"name": n, "node": n})
+		out = append(out, b)
+	}
+	return &out
+}
+
+// authNodesService serves the authoritative per-node listing surface for
+// pve.ListGuestsAuthoritative by deriving each node's qemu rows from the
+// same ListResources fixture a suite scripts, so tests written against the
+// /cluster/resources index keep working after the production migration to
+// per-node listings. Rows with an explicit non-qemu type are filtered; rows
+// without a node land on fallbackNode. Every other method delegates to the
+// embedded Service (panicking when it is nil, same as the suites' own stubs).
+type authNodesService struct {
+	nodes.Service
+	listFn       func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+	fallbackNode string
+}
+
+// ListStorageContent and UpdateQemuConfig delegate to the embedded Service
+// when one is wired; without a delegate they fall back to what paths that
+// previously saw a nil nodes service tolerated: an empty content listing and
+// an accepted config write.
+func (s *authNodesService) ListStorageContent(ctx context.Context, node, storageName string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
+	if s.Service != nil {
+		return s.Service.ListStorageContent(ctx, node, storageName, params)
+	}
+	empty := nodes.ListStorageContentResponse{}
+	return &empty, nil
+}
+
+func (s *authNodesService) UpdateQemuConfig(ctx context.Context, node, vmid string, params *nodes.UpdateQemuConfigParams) error {
+	if s.Service != nil {
+		return s.Service.UpdateQemuConfig(ctx, node, vmid, params)
+	}
+	return nil
+}
+
+// ListQemu unions the delegate's own listing (suites that script per-node
+// rows directly) with rows derived from the cluster fixture, deduplicated by
+// vmid with the delegate winning, so neither scripting style is shadowed.
+func (s *authNodesService) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	out := make(nodes.ListQemuResponse, 0, 4)
+	seen := map[int64]bool{}
+	vmidOf := func(raw json.RawMessage) int64 {
+		var item struct {
+			Vmid int64 `json:"vmid"`
+		}
+		if json.Unmarshal(raw, &item) != nil {
+			return 0
+		}
+		return item.Vmid
+	}
+	if s.Service != nil {
+		resp, err := s.Service.ListQemu(ctx, node, params)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil {
+			for _, raw := range *resp {
+				out = append(out, raw)
+				if id := vmidOf(raw); id > 0 {
+					seen[id] = true
+				}
+			}
+		}
+	}
+	var rows *cluster.ListResourcesResponse
+	if s.listFn != nil {
+		// Type="vm" matches the VMID allocator's own query shape; suites use
+		// Type-unset ListResources as the signature of the legacy cache
+		// lookup, so the derive must not masquerade as one.
+		vmType := "vm"
+		var err error
+		rows, err = s.listFn(ctx, &cluster.ListResourcesParams{Type: &vmType})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(raw, &item) != nil {
+				continue
+			}
+			if item.Type != "" && item.Type != "qemu" {
+				continue
+			}
+			rowNode := item.Node
+			if rowNode == "" {
+				rowNode = s.fallbackNode
+			}
+			if rowNode != node {
+				continue
+			}
+			if id := vmidOf(raw); id > 0 && seen[id] {
+				continue
+			}
+			out = append(out, raw)
+		}
+	}
+	return &out, nil
 }
 
 // mockClusterStorage is a minimal clusterstorage.Service stub for create_vm

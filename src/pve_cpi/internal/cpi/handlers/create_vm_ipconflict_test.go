@@ -451,6 +451,139 @@ func (m *icClusterService) ListResources(ctx context.Context, params *sdkcluster
 	return &empty, nil
 }
 
+// ListConfigNodes derives corosync membership from the same ListResources
+// fixture: the distinct node names in the scripted rows, or the single test
+// node "pve1" when the fixture is empty, so an empty fixture reads as an
+// empty cluster rather than a failed enumeration.
+func (m *icClusterService) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	rows, err := m.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	names := make([]string, 0, 2)
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node == "" || seen[item.Node] {
+				continue
+			}
+			seen[item.Node] = true
+			names = append(names, item.Node)
+		}
+	}
+	if len(names) == 0 {
+		names = append(names, "pve1")
+	}
+	out := make(sdkcluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		b, _ := json.Marshal(map[string]any{"name": n})
+		out = append(out, b)
+	}
+	return &out, nil
+}
+
+// icNodesService serves the authoritative per-node listing surface for
+// ListGuestsAuthoritative by deriving each node's qemu rows from the same
+// ListResources fixture the test scripts; the guest-agent network query
+// delegates to agentFn (empty result when unset). When an inner Service is
+// wired, ListQemu unions the delegate's own rows (suites that script
+// per-node listings directly) with the derived rows, deduplicated by vmid
+// with the delegate winning; every other method delegates through the embed.
+type icNodesService struct {
+	nodes.Service
+	listFn  func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	agentFn func(ctx context.Context, node string, vmid string) (*nodes.ListQemuAgentNetworkGetInterfacesResponse, error)
+	// fallbackNode is where a fixture row without a "node" key lands;
+	// defaults to "pve1".
+	fallbackNode string
+}
+
+func (s *icNodesService) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	out := make(nodes.ListQemuResponse, 0, 4)
+	seen := map[int64]bool{}
+	if s.Service != nil {
+		resp, err := s.Service.ListQemu(ctx, node, params)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil {
+			for _, raw := range *resp {
+				out = append(out, raw)
+				if id := icRowVMID(raw); id > 0 {
+					seen[id] = true
+				}
+			}
+		}
+	}
+	if s.listFn != nil {
+		rows, err := s.listFn(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		fallback := s.fallbackNode
+		if fallback == "" {
+			fallback = "pve1"
+		}
+		out = icAppendDerivedQemuRows(out, rows, node, fallback, seen)
+	}
+	return &out, nil
+}
+
+// icRowVMID decodes the vmid from a fixture row; 0 when absent or malformed.
+func icRowVMID(raw json.RawMessage) int64 {
+	var item struct {
+		Vmid int64 `json:"vmid"`
+	}
+	if json.Unmarshal(raw, &item) != nil {
+		return 0
+	}
+	return item.Vmid
+}
+
+// icAppendDerivedQemuRows filters a ListResources fixture down to the qemu
+// rows living on node (rows without a "node" key land on fallbackNode) and
+// appends them to out, skipping vmids already served by a delegate listing.
+func icAppendDerivedQemuRows(out nodes.ListQemuResponse, rows *sdkcluster.ListResourcesResponse, node, fallbackNode string, seen map[int64]bool) nodes.ListQemuResponse {
+	if rows == nil {
+		return out
+	}
+	for _, raw := range *rows {
+		var item struct {
+			Node string `json:"node"`
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(raw, &item) != nil {
+			continue
+		}
+		if item.Type != "" && item.Type != "qemu" {
+			continue
+		}
+		rowNode := item.Node
+		if rowNode == "" {
+			rowNode = fallbackNode
+		}
+		if rowNode != node {
+			continue
+		}
+		if id := icRowVMID(raw); id > 0 && seen[id] {
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out
+}
+
+func (s *icNodesService) ListQemuAgentNetworkGetInterfaces(ctx context.Context, node string, vmid string) (*nodes.ListQemuAgentNetworkGetInterfacesResponse, error) {
+	if s.agentFn != nil {
+		return s.agentFn(ctx, node, vmid)
+	}
+	empty := nodes.ListQemuAgentNetworkGetInterfacesResponse([]byte(`{"result":[]}`))
+	return &empty, nil
+}
+
 // icAgentStub satisfies agent.Agent with no-ops.
 type icAgentStub struct{}
 
@@ -495,6 +628,7 @@ func icDeps(
 		PVE: &icPVEClient{
 			qemuSvc:    &icQEMUService{configFn: cfgFn},
 			clusterSvc: &icClusterService{listFn: listFn},
+			nodesSvc:   &icNodesService{listFn: listFn},
 		},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),
@@ -866,4 +1000,10 @@ func TestDetectIPConflict_SelfExclusion_ExternalConflictStillDetected(t *testing
 	if conflict.IP != targetIP {
 		t.Errorf("expected conflict IP %q, got %q", targetIP, conflict.IP)
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (m *icClusterService) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

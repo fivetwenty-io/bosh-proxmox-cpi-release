@@ -99,7 +99,7 @@ func HandleResizeDisk(deps Deps) Handler {
 		//    the VM's node. PVE VM config stores disk values in canonical
 		//    "<storage>:<volname>" form — the disk_cid is that form.
 		// ----------------------------------------------------------------
-		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, deps.Config.Node, bareDiskCID)
+		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}

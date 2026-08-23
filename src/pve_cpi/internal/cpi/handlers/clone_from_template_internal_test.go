@@ -648,3 +648,9 @@ func TestCloneFromTemplate_SingleNode_NoTarget(t *testing.T) {
 		t.Errorf("single-node: Target must be nil, got %q", *p.Target)
 	}
 }
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (s *cloneClusterSvc) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
+}

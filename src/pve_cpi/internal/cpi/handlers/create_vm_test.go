@@ -376,6 +376,46 @@ func (m *vmMockCluster) ListResources(ctx context.Context, params *sdkcluster.Li
 	return &resp, nil
 }
 
+// ListConfigNodes derives corosync membership from the ListResources fixture:
+// the distinct node names in the scripted rows, defaulting to the single test
+// node "pve" (matching buildVMDeps' config.Node) when the fixture is empty or
+// its rows carry no node, so ListGuestsAuthoritative sees an empty cluster
+// rather than a failed enumeration. The probe passes Type="vm" (the VMID
+// allocator's own params shape) because suites discriminate the cache
+// lookup's Type-unset reads from everything else; a probe error falls back to
+// the static single-node membership rather than propagating, mirroring
+// production where corosync membership does not fail with the index.
+func (m *vmMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	vmType := "vm"
+	rows, err := m.ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &vmType})
+	if err != nil {
+		rows = nil
+	}
+	seen := map[string]bool{}
+	names := make([]string, 0, 2)
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node == "" || seen[item.Node] {
+				continue
+			}
+			seen[item.Node] = true
+			names = append(names, item.Node)
+		}
+	}
+	if len(names) == 0 {
+		names = append(names, "pve")
+	}
+	out := make(sdkcluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		b, _ := json.Marshal(map[string]any{"name": n})
+		out = append(out, b)
+	}
+	return &out, nil
+}
+
 // ListFirewallOptions defaults to reporting the datacenter firewall master
 // switch as enabled, so the §1.4 probe (create_vm_firewall_masterswitch.go)
 // never logs a Warn for tests that don't specifically exercise it. Tests that
@@ -1787,11 +1827,40 @@ func withConfigNodes(c *vmMockCluster, nodeCount int) *mockClusterSvc {
 				return &resp, nil
 			},
 		},
-		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
-			resp := make(sdkcluster.ListConfigNodesResponse, nodeCount)
-			for i := 0; i < nodeCount; i++ {
-				raw, _ := json.Marshal(map[string]any{"node": fmt.Sprintf("pve%02d", i+1)})
-				resp[i] = raw
+		listConfigNodesFn: func(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			// Membership carries the config node "pve" plus every node the
+			// fixture places a guest on (so pve.ListGuestsAuthoritative lists
+			// the node holding the cache template), padded with synthetic
+			// names up to nodeCount for the storage-locality node count.
+			// "name" is what pve.ListClusterConfigNodes parses.
+			rows, err := c.ListResources(ctx, nil)
+			if err != nil {
+				return nil, err
+			}
+			seen := map[string]bool{"pve": true}
+			names := []string{"pve"}
+			if rows != nil {
+				for _, raw := range *rows {
+					var item struct {
+						Node string `json:"node"`
+					}
+					if json.Unmarshal(raw, &item) == nil && item.Node != "" && !seen[item.Node] {
+						seen[item.Node] = true
+						names = append(names, item.Node)
+					}
+				}
+			}
+			for i := 1; len(names) < nodeCount; i++ {
+				n := fmt.Sprintf("pve%02d", i)
+				if !seen[n] {
+					seen[n] = true
+					names = append(names, n)
+				}
+			}
+			resp := make(sdkcluster.ListConfigNodesResponse, 0, len(names))
+			for _, n := range names {
+				raw, _ := json.Marshal(map[string]any{"name": n, "node": n})
+				resp = append(resp, raw)
 			}
 			return &resp, nil
 		},
@@ -2104,15 +2173,12 @@ func buildVMDepsForOldCIDLookup(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster,
 
 // clusterCacheListResourcesFn returns a vmMockCluster.listResourcesFn that
 // reports a single frozen stemcell-cache template (vmid, node, sha8 tag) for
-// a cache-lookup query (Type unset) and an empty list for a VMID-collision
-// scan query (Type="vm"), so wiring the fixture never perturbs VMID
-// allocation.
+// every query shape: the cache lookup and the VMID allocator both read the
+// same authoritative per-node listings derived from this fixture, and the
+// allocator seeing the template's VMID in its used-set is exactly what a real
+// cluster reports (it merely excludes that one ID from allocation).
 func clusterCacheListResourcesFn(vmid int64, node, sha8 string) func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-	return func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-		if params != nil && params.Type != nil {
-			empty := sdkcluster.ListResourcesResponse{}
-			return &empty, nil
-		}
+	return func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		raw, _ := json.Marshal(map[string]any{
 			"type": "qemu",
 			"vmid": vmid,
@@ -2235,21 +2301,24 @@ func TestCreateVM_OldCID_NoTemplate_FallsBackToImport(t *testing.T) {
 func TestCreateVM_OldCID_LookupError_FallsBackToImport(t *testing.T) {
 	t.Parallel()
 
+	// The cache lookup and the VMID allocator now read the same authoritative
+	// per-node listings, so the failure is staged by call order: the
+	// allocator's enumeration (first ListQemu) succeeds, the cache lookup's
+	// (second) fails. That isolates the cache-lookup fallback from allocation,
+	// which must keep working for the import path to run at all.
 	lookupErr := fmt.Errorf("PVE API: connection refused")
-	n := &vmMockNodes{}
-	c := &vmMockCluster{
-		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-			// Only the strategy=template cache lookup (Type unset) should
-			// fail here; the VMID-collision scan (Type="vm", used by
-			// AllocateWithRetry regardless of stemcell strategy) must keep
-			// working so this test isolates the cache-lookup fallback.
-			if params != nil && params.Type != nil {
-				empty := sdkcluster.ListResourcesResponse{}
-				return &empty, nil
+	listQemuCalls := 0
+	n := &vmMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			listQemuCalls++
+			if listQemuCalls == 2 {
+				return nil, lookupErr
 			}
-			return nil, lookupErr
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
 		},
 	}
+	c := &vmMockCluster{}
 	q := &vmMockQEMU{}
 	a := &vmMockAgent{}
 
@@ -2322,20 +2391,22 @@ func TestCreateVM_OldCID_TemplateFound_ConflictRetries(t *testing.T) {
 }
 
 // TestCreateVM_TemplateCID_Regression_StillClones verifies that a same-node
-// strategy=template cache hit clones directly without ever calling the
-// node-scoped ListQemu (used only by the per-node replica guard on a
-// cross-node, local-storage miss) — CreateQemuClone fires straight from the
-// cluster-scoped cache lookup.
+// strategy=template cache hit clones straight from the cache lookup without
+// the per-node replica guard firing. The VMID allocator's authoritative
+// enumeration lists the single member node once and the cache lookup's lists
+// it once more; a third ListQemu call would be the replica guard (used only
+// on a cross-node, local-storage miss), the regression this test pins.
 func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
 	t.Parallel()
 
 	cloneCalled := false
+	listQemuCalls := 0
 	n := &vmMockNodes{
-		// listQemuFn: if ListQemu is called on a same-node cache hit, that is
-		// the regression this test guards against — the replica guard must
-		// never fire when the cache lookup already matched shape.node.
 		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
-			t.Error("same-node cache hit must not call ListQemu")
+			listQemuCalls++
+			if listQemuCalls > 2 {
+				t.Error("same-node cache hit must not call ListQemu beyond the allocator's and cache lookup's own enumerations (replica guard fired)")
+			}
 			empty := sdknodes.ListQemuResponse{}
 			return &empty, nil
 		},
@@ -2379,7 +2450,20 @@ func TestCreateVM_TemplateCID_Regression_StillClones(t *testing.T) {
 func TestCreateVM_StrategyImport_ExistenceCheck_Positive(t *testing.T) {
 	t.Parallel()
 	q := &vmMockQEMU{}
-	n := &vmMockNodes{}
+	// The cache lookup enumerates per-node listings; with strategy=import the
+	// only enumeration is the VMID allocator's single-node pass, so a second
+	// ListQemu call would be the cache lookup running despite the strategy.
+	listQemuCalls := 0
+	n := &vmMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			listQemuCalls++
+			if listQemuCalls > 1 {
+				t.Error("strategy=import must not call the cluster cache lookup (extra per-node enumeration)")
+			}
+			empty := sdknodes.ListQemuResponse{}
+			return &empty, nil
+		},
+	}
 	c := &vmMockCluster{
 		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			if params == nil || params.Type == nil {
@@ -2507,6 +2591,17 @@ func TestCreateVM_TemplateStrategy_SHA8Unextractable_FallsBackToImport(t *testin
 			return &empty, nil
 		},
 	}
+	// A second per-node enumeration beyond the VMID allocator's would be the
+	// cache lookup running despite the unextractable sha8.
+	listQemuCalls := 0
+	n.listQemuFn = func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		listQemuCalls++
+		if listQemuCalls > 1 {
+			t.Error("sha8-unextractable stemcell must never reach the cluster cache lookup (extra per-node enumeration)")
+		}
+		empty := sdknodes.ListQemuResponse{}
+		return &empty, nil
+	}
 	c := &vmMockCluster{
 		listResourcesFn: func(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			if params == nil || params.Type == nil {
@@ -2625,7 +2720,10 @@ func emptyListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*
 
 // TestCreateVM_PlacementEnabled_TargetNodeOverride verifies that when
 // cloud_properties.target_node is set, placement scoring is bypassed entirely.
-// The test would fail if GatherNodeFacts were called because ListStatus panics.
+// ListStatus is scripted so the scorer would pick pve1 (most free memory); the
+// VM landing on pve2 proves the scorer never ran. (ListStatus itself is no
+// longer a placement-only observable: the authoritative guest enumeration
+// consults it best-effort for offline-member tolerance.)
 func TestCreateVM_PlacementEnabled_TargetNodeOverride(t *testing.T) {
 	t.Parallel()
 
@@ -2639,11 +2737,7 @@ func TestCreateVM_PlacementEnabled_TargetNodeOverride(t *testing.T) {
 	n := &vmMockNodes{}
 	a := &vmMockAgent{}
 
-	// Use a cluster that panics on ListStatus — proves GatherNodeFacts is never called.
-	panicStatus := func(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
-		panic("ListStatus must not be called when target_node is set")
-	}
-	deps := buildVMDepsPlacement(q, n, panicStatus, emptyListResources, a, nil)
+	deps := buildVMDepsPlacement(q, n, listStatusTwoNodes(), emptyListResources, a, nil)
 	deps.Config.EnsureNoIPConflicts = placementDisabled // no static IPs in this test
 	h := handlers.HandleCreateVM(deps)
 

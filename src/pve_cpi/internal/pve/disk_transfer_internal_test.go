@@ -153,6 +153,32 @@ func (c *scanFakeClient) Nodes() sdknodes.Service {
 	return &fakeNodesService{
 		updateQemuConfigFn:   c.updateQemuConfig,
 		createQemuMoveDiskFn: c.createQemuMoveDisk,
+		// The authoritative per-node listing the parker and holder scans now
+		// read, derived from the same configs the ListResources fake serves.
+		listQemuFn: func(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			var resp sdknodes.ListQemuResponse
+			if c.rows != nil {
+				for _, row := range c.rows {
+					b, err := json.Marshal(row)
+					if err != nil {
+						return nil, err
+					}
+					resp = append(resp, b)
+				}
+				return &resp, nil
+			}
+			for vmid, cfg := range c.configs {
+				tags, _ := cfg["tags"].(string)
+				b, err := json.Marshal(map[string]any{"vmid": vmid, cfgKeyTags: tags})
+				if err != nil {
+					return nil, err
+				}
+				resp = append(resp, b)
+			}
+			return &resp, nil
+		},
 	}
 }
 
@@ -253,6 +279,10 @@ func clusterRow(vmid int, tags string) map[string]any {
 
 func (c *scanFakeClient) Cluster() sdkcluster.Service {
 	return &fakeClusterService{
+		listConfigNodesFn: func(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			resp := sdkcluster.ListConfigNodesResponse{json.RawMessage(`{"name": "pve1"}`)}
+			return &resp, nil
+		},
 		listResourcesFn: func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()

@@ -120,6 +120,24 @@ func (n *rpNodes) ListStorageContent(
 	return &empty, nil
 }
 
+// ListQemu derives the node's listing from the committed configs, mirroring
+// ListResources, so the allocator's authoritative leg sees the same state.
+func (n *rpNodes) ListQemu(
+	_ context.Context, node string, _ *sdknodes.ListQemuParams,
+) (*sdknodes.ListQemuResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	entries := make([]json.RawMessage, 0, len(n.c.configs))
+	if node == n.c.node {
+		for vmid := range n.c.configs {
+			raw, _ := json.Marshal(map[string]any{rpVMIDKey: vmid})
+			entries = append(entries, raw)
+		}
+	}
+	resp := sdknodes.ListQemuResponse(entries)
+	return &resp, nil
+}
+
 func (n *rpNodes) CreateQemuMoveDisk(
 	_ context.Context, _ string, vmidStr string, params *sdknodes.CreateQemuMoveDiskParams,
 ) (*sdknodes.CreateQemuMoveDiskResponse, error) {
@@ -178,6 +196,19 @@ func (cl *rpCluster) ListResources(
 	}
 	resp := sdkcluster.ListResourcesResponse(entries)
 	return &resp, nil
+}
+
+// ListConfigNodes reports the fake's single node as the cluster membership.
+func (cl *rpCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	raw, _ := json.Marshal(map[string]any{"name": cl.c.node})
+	resp := sdkcluster.ListConfigNodesResponse{raw}
+	return &resp, nil
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (cl *rpCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }
 
 // rpCommitVM registers vmid in the fake's state the way PVE's side of a

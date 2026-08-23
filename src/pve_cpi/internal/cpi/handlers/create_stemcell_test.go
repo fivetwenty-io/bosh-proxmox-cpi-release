@@ -63,8 +63,17 @@ func (m *stemcellMockClient) QEMU() sdkqemu.Service           { return m.qemuSvc
 func (m *stemcellMockClient) Storage() sdkstorage.Service     { return m.storageSvc }
 func (m *stemcellMockClient) CloudInit() sdkcloudinit.Service { return nil }
 func (m *stemcellMockClient) Tasks() sdktasks.Service         { return m.tasksSvc }
-func (m *stemcellMockClient) Nodes() sdknodes.Service         { return m.nodesSvc }
-func (m *stemcellMockClient) Cluster() sdkcluster.Service     { return m.clusterSvc }
+
+// Nodes wraps the wired nodes service so pve.ListGuestsAuthoritative sees
+// the guests the suite scripts through the cluster ListResources fixture
+// (delegate rows win on vmid collisions; every other method delegates).
+func (m *stemcellMockClient) Nodes() sdknodes.Service {
+	if m.clusterSvc == nil {
+		return m.nodesSvc
+	}
+	return &authNodesService{Service: m.nodesSvc, listFn: m.clusterSvc.ListResources, fallbackNode: vmNode}
+}
+func (m *stemcellMockClient) Cluster() sdkcluster.Service { return m.clusterSvc }
 func (m *stemcellMockClient) ClusterStorage() sdkclusterstorage.Service {
 	return m.clusterStorageSvc
 }
@@ -239,11 +248,30 @@ func (m *stemcellMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.
 	if m.listConfigNodesFn != nil {
 		return m.listConfigNodesFn(ctx)
 	}
-	// Default: single-node cluster — local storage is acceptable. The real
-	// /cluster/config/nodes payload carries the node name under "name";
-	// "node" is kept for callers keyed on the resource-index field name.
-	nodeEntry, _ := json.Marshal(map[string]string{"name": vmNode, "node": vmNode})
-	resp := sdkcluster.ListConfigNodesResponse{nodeEntry}
+	// Default: vmNode plus every node the ListResources fixture places a
+	// guest on, so pve.ListGuestsAuthoritative lists the nodes that actually
+	// hold scripted templates and replicas. The real /cluster/config/nodes
+	// payload carries the node name under "name"; "node" is kept for callers
+	// keyed on the resource-index field name.
+	seen := map[string]bool{vmNode: true}
+	names := []string{vmNode}
+	rows, err := m.ListResources(ctx, nil)
+	if err == nil && rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) == nil && item.Node != "" && !seen[item.Node] {
+				seen[item.Node] = true
+				names = append(names, item.Node)
+			}
+		}
+	}
+	resp := make(sdkcluster.ListConfigNodesResponse, 0, len(names))
+	for _, n := range names {
+		nodeEntry, _ := json.Marshal(map[string]string{"name": n, "node": n})
+		resp = append(resp, nodeEntry)
+	}
 	return &resp, nil
 }
 
@@ -1463,7 +1491,10 @@ func lightStemcellDeps(
 	t.Helper()
 	var clusterNodes sdkcluster.ListConfigNodesResponse
 	for i := 0; i < configNodeCount; i++ {
-		raw, _ := json.Marshal(map[string]string{"node": "pve-node1"})
+		// The real /cluster/config/nodes payload carries the node name under
+		// "name" (which pve.ListClusterConfigNodes parses); "node" is kept
+		// for callers keyed on the resource-index field name.
+		raw, _ := json.Marshal(map[string]string{"name": "pve-node1", "node": "pve-node1"})
 		clusterNodes = append(clusterNodes, raw)
 	}
 	cluster := &stemcellMockCluster{
@@ -2014,3 +2045,9 @@ var _ pve.Backend = (*localBackend)(nil)
 
 // Verify that pve.BackendResolver is fully implemented by localBackendResolver.
 var _ pve.BackendResolver = (*localBackendResolver)(nil)
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (m *stemcellMockCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
+}

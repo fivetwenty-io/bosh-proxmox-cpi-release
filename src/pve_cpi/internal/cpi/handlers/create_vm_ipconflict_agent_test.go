@@ -67,27 +67,6 @@ func agentListResp(entries ...json.RawMessage) *sdkcluster.ListResourcesResponse
 }
 
 // --------------------------------------------------------------------------
-// agentNodesService: minimal nodes.Service stub for agent probe tests.
-// Only ListQemuAgentNetworkGetInterfaces is wired; all others panic on call
-// via the embedded nil interface.
-// --------------------------------------------------------------------------
-
-type agentNodesService struct {
-	nodes.Service // embed: unimplemented methods panic on call
-	fn            func(ctx context.Context, node string, vmid string) (*nodes.ListQemuAgentNetworkGetInterfacesResponse, error)
-}
-
-// ListQemuAgentNetworkGetInterfaces is the one method used by the probe.
-func (s *agentNodesService) ListQemuAgentNetworkGetInterfaces(ctx context.Context, node string, vmid string) (*nodes.ListQemuAgentNetworkGetInterfacesResponse, error) {
-	if s.fn != nil {
-		return s.fn(ctx, node, vmid)
-	}
-	// Default: empty result — no IP addresses visible.
-	empty := nodes.ListQemuAgentNetworkGetInterfacesResponse([]byte(`{"result":[]}`))
-	return &empty, nil
-}
-
-// --------------------------------------------------------------------------
 // agentDeps builds a Deps for probeGuestAgentIPConflict tests.
 // --------------------------------------------------------------------------
 
@@ -99,7 +78,7 @@ func agentDeps(
 		Config: icMinConfig(),
 		PVE: &icPVEClient{
 			clusterSvc: &icClusterService{listFn: listFn},
-			nodesSvc:   &agentNodesService{fn: agentFn},
+			nodesSvc:   &icNodesService{listFn: listFn, agentFn: agentFn},
 		},
 		Agent:  &icAgentStub{},
 		Logger: log.NewNopLogger(),

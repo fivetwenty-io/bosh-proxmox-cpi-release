@@ -188,6 +188,20 @@ type parkerNodesService struct {
 	// storageContentFn intercepts ListStorageContent, the storage scan parker
 	// VMID allocation runs when ParkerConfig.DiskStorage is set.
 	storageContentFn func(node, storage string) (*sdknodes.ListStorageContentResponse, error)
+	// listQemuDelegate serves ListQemu (the authoritative per-node listing
+	// the cluster scans now read); buildParkerClientWithNodes wires it to
+	// the base client's fixture-derived nodes surface.
+	listQemuDelegate sdknodes.Service
+}
+
+func (n *parkerNodesService) ListQemu(
+	ctx context.Context, node string, params *sdknodes.ListQemuParams,
+) (*sdknodes.ListQemuResponse, error) {
+	if n.listQemuDelegate != nil {
+		return n.listQemuDelegate.ListQemu(ctx, node, params)
+	}
+	resp := sdknodes.ListQemuResponse{}
+	return &resp, nil
 }
 
 func (n *parkerNodesService) ListStorageContent(
@@ -224,6 +238,9 @@ func buildParkerClientWithNodes(
 	nodesSvc sdknodes.Service,
 ) pve.Client {
 	base := buildParkerClient(qemuSvc, listFn)
+	if pn, ok := nodesSvc.(*parkerNodesService); ok && pn.listQemuDelegate == nil {
+		pn.listQemuDelegate = base.Nodes()
+	}
 	return &parkerClientWithNodes{Client: base, nodesSvc: nodesSvc}
 }
 
@@ -1859,7 +1876,7 @@ func TestFindVMByDiskVolidOrNone_Found(t *testing.T) {
 		},
 	)
 
-	vmid, gotNode, found, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, node, volid)
+	vmid, gotNode, found, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, volid)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1884,7 +1901,7 @@ func TestFindVMByDiskVolidOrNone_NotFound(t *testing.T) {
 		},
 	)
 
-	vmid, node, found, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, "", "local-lvm:vm-9001-disk-0")
+	vmid, node, found, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, "local-lvm:vm-9001-disk-0")
 	if err != nil {
 		t.Fatalf("expected nil error for not-found case; got: %v", err)
 	}
@@ -1910,7 +1927,7 @@ func TestFindVMByDiskVolidOrNone_TransientErrorPassthrough(t *testing.T) {
 	)
 
 	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
-	_, _, _, err := pve.FindVMByDiskVolidOrNone(ctx, c, "", "local-lvm:vm-9001-disk-0")
+	_, _, _, err := pve.FindVMByDiskVolidOrNone(ctx, c, "local-lvm:vm-9001-disk-0")
 	if err == nil {
 		t.Fatal("expected error to propagate for transient scan failure; got nil")
 	}
@@ -1934,7 +1951,7 @@ func TestFindVMByDiskVolidOrNone_RetriableConfigError_Passthrough(t *testing.T) 
 		},
 	)
 
-	_, _, _, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, node, volid)
+	_, _, _, err := pve.FindVMByDiskVolidOrNone(context.Background(), c, volid)
 	if err == nil {
 		t.Fatal("expected retriable error to propagate; got nil")
 	}

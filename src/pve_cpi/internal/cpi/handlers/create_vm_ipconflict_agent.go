@@ -28,7 +28,6 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -170,51 +169,35 @@ func probeGuestAgentIPConflict(
 		return nil
 	}
 
-	// Phase 1: list all running VM resources from the cluster.
-	typeStr := "vm"
-	var resources *sdkcluster.ListResourcesResponse
-	listErr := pve.RetryOnTransient(ctx, logger, "probe_agent_ip_list_resources", 0, func() error {
-		var inner error
-		resources, inner = deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typeStr})
-		return inner
-	})
+	// Phase 1: enumerate every running guest from authoritative per-node
+	// listings, not the /cluster/resources index: the index lags by minutes,
+	// and a young VM already answering on the target IP is exactly what this
+	// probe exists to find. Tolerant form: the probe targets RUNNING guests,
+	// and an offline member runs none, so excluding it loses nothing.
+	guests, _, listErr := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, logger)
 	if listErr != nil {
-		// Infra error enumerating cluster resources — fail open so create_vm
+		// Infra error enumerating cluster guests: fail open so create_vm
 		// is never blocked by a probe/cluster-API error.
 		logger.Debug(
-			"probe_agent_ip: skipping probe, ListResources failed",
+			"probe_agent_ip: skipping probe, guest enumeration failed",
 			log.Err(listErr),
 		)
 		return nil
 	}
-	if resources == nil || len(*resources) == 0 {
-		return nil
-	}
 
 	type vmEntry struct {
-		VMID   int64  `json:"vmid"`
-		Node   string `json:"node"`
-		Status string `json:"status"`
-		Name   string `json:"name"`
+		VMID int64
+		Node string
+		Name string
 	}
 
-	// Parse resource list; keep only running VMs.
-	entries := make([]vmEntry, 0, len(*resources))
-	for _, raw := range *resources {
-		var e vmEntry
-		if err := json.Unmarshal(raw, &e); err != nil || e.VMID <= 0 {
+	// Keep only running VMs: a stopped guest cannot answer a guest-agent probe.
+	entries := make([]vmEntry, 0, len(guests))
+	for _, g := range guests {
+		if !strings.EqualFold(g.Status, vmPowerStateRunning) {
 			continue
 		}
-		if !strings.EqualFold(e.Status, vmPowerStateRunning) {
-			continue
-		}
-		if e.Node == "" {
-			e.Node = deps.Config.Node
-		}
-		if e.Node == "" {
-			continue
-		}
-		entries = append(entries, e)
+		entries = append(entries, vmEntry{VMID: int64(g.VMID), Node: g.Node, Name: g.Name})
 	}
 	if len(entries) == 0 {
 		return nil

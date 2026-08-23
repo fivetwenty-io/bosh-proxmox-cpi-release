@@ -276,11 +276,20 @@ type wbMockClient struct {
 	poolsSvc pve.PoolService
 }
 
-func (c *wbMockClient) QEMU() sdkqemu.Service                     { return nil }
-func (c *wbMockClient) Storage() sdkstorage.Service               { return c.storageSvc }
-func (c *wbMockClient) CloudInit() sdkcloudinit.Service           { return nil }
-func (c *wbMockClient) Tasks() sdktasks.Service                   { return nil }
-func (c *wbMockClient) Nodes() sdknodes.Service                   { return c.nodesSvc }
+func (c *wbMockClient) QEMU() sdkqemu.Service           { return nil }
+func (c *wbMockClient) Storage() sdkstorage.Service     { return c.storageSvc }
+func (c *wbMockClient) CloudInit() sdkcloudinit.Service { return nil }
+func (c *wbMockClient) Tasks() sdktasks.Service         { return nil }
+
+// Nodes wraps the wired nodes service so pve.ListGuestsAuthoritative sees
+// the guests scripted through the cluster ListResources fixture (delegate
+// rows win on vmid collisions; every other method delegates through).
+func (c *wbMockClient) Nodes() sdknodes.Service {
+	if c.clusterSvc == nil {
+		return c.nodesSvc
+	}
+	return &icNodesService{Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: "pve-node1"}
+}
 func (c *wbMockClient) Cluster() sdkcluster.Service               { return c.clusterSvc }
 func (c *wbMockClient) ClusterStorage() sdkclusterstorage.Service { return c.clusterStorageSvc }
 func (c *wbMockClient) Pools() pve.PoolService {
@@ -337,7 +346,10 @@ func (c *wbMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.ListCo
 	}
 	var resp sdkcluster.ListConfigNodesResponse
 	for i := 0; i < c.nodeCount; i++ {
-		raw, _ := json.Marshal(map[string]string{"node": "pve-node1"})
+		// "name" is the key production decoders read (PVE's real
+		// /cluster/config/nodes rows carry it); the old "node" key made the
+		// default rows invisible to every name-decoding consumer.
+		raw, _ := json.Marshal(map[string]string{"name": "pve-node1"})
 		resp = append(resp, raw)
 	}
 	return &resp, nil
@@ -978,6 +990,36 @@ func (c *wbClusterForAlloc) ListResources(ctx context.Context, params *sdkcluste
 	}
 	empty := sdkcluster.ListResourcesResponse{}
 	return &empty, nil
+}
+
+// ListConfigNodes derives corosync membership from the listResourcesFn
+// fixture (the distinct node names in the scripted rows), falling back to
+// "pve-node1", so pve.ListGuestsAuthoritative lists the nodes that actually
+// hold the scripted templates.
+func (c *wbClusterForAlloc) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	rows, err := c.ListResources(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	resp := sdkcluster.ListConfigNodesResponse{}
+	if rows != nil {
+		for _, raw := range *rows {
+			var item struct {
+				Node string `json:"node"`
+			}
+			if json.Unmarshal(raw, &item) != nil || item.Node == "" || seen[item.Node] {
+				continue
+			}
+			seen[item.Node] = true
+			b, _ := json.Marshal(map[string]any{"name": item.Node})
+			resp = append(resp, b)
+		}
+	}
+	if len(resp) == 0 {
+		resp = append(resp, json.RawMessage(`{"name": "pve-node1"}`))
+	}
+	return &resp, nil
 }
 
 // TestEnsureTemplateVM_CreatePath_NoSourceDeletion verifies the create path
@@ -3867,4 +3909,16 @@ func TestEnsureTemplateVM_PreGenerationTemplate_NotAdopted(t *testing.T) {
 	if !createCalled {
 		t.Error("QEMU.Create was not called: the CPI must build its own cache template alongside the older one")
 	}
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (c *wbMockCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (c *wbClusterForAlloc) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
 }

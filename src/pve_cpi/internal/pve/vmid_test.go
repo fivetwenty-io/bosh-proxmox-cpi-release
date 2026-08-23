@@ -17,10 +17,12 @@ import (
 )
 
 // stubNodesService satisfies sdknodes.Service via embedding; only
-// ListStorageContent is implemented. All other methods panic if called.
+// ListStorageContent and ListQemu are implemented. All other methods panic
+// if called.
 type stubNodesService struct {
 	sdknodes.Service
 	listStorageContentFn func(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error)
+	listQemuFn           func(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error)
 }
 
 func (s *stubNodesService) ListStorageContent(ctx context.Context, node, storage string, params *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
@@ -28,6 +30,17 @@ func (s *stubNodesService) ListStorageContent(ctx context.Context, node, storage
 		return s.listStorageContentFn(ctx, node, storage, params)
 	}
 	resp := sdknodes.ListStorageContentResponse{}
+	return &resp, nil
+}
+
+// ListQemu delegates to listQemuFn when scripted; the default empty listing
+// makes the allocator's authoritative leg contribute nothing, so suites that
+// script only the index fixture keep their exact used-sets.
+func (s *stubNodesService) ListQemu(ctx context.Context, node string, params *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+	if s.listQemuFn != nil {
+		return s.listQemuFn(ctx, node, params)
+	}
+	resp := sdknodes.ListQemuResponse{}
 	return &resp, nil
 }
 
@@ -61,11 +74,26 @@ func (s *stubClusterService) ListResources(ctx context.Context, params *sdkclust
 	return &resp, nil
 }
 
-// newVMIDClient builds a mockClient with a cluster stub wired to listFn.
+// ListConfigNodes reports a single-node cluster ("pve1"), the membership the
+// allocator's authoritative enumeration fans out over.
+func (s *stubClusterService) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	resp := sdkcluster.ListConfigNodesResponse{json.RawMessage(`{"name": "pve1"}`)}
+	return &resp, nil
+}
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (s *stubClusterService) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
+}
+
+// newVMIDClient builds a mockClient with a cluster stub wired to listFn and a
+// nodes stub whose per-node listings default to empty.
 func newVMIDClient(listFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)) *mockClient {
 	return &mockClient{
 		tasksSvc:   &mockTasksService{},
 		clusterSvc: &stubClusterService{listResourcesFn: listFn},
+		nodesSvc:   &stubNodesService{},
 	}
 }
 
@@ -102,6 +130,37 @@ func TestNextVMID_FreeInRange(t *testing.T) {
 	}
 	if id == 100 || id == 101 || id == 103 {
 		t.Errorf("returned a used VMID: %d", id)
+	}
+}
+
+// TestNextVMID_AuthoritativeListingAugmentsLaggingIndex pins the allocator's
+// second leg: a VMID a concurrent create registered seconds ago is missing
+// from the /cluster/resources index but present in the node's own qemu
+// listing, and the allocator must treat it as used.
+func TestNextVMID_AuthoritativeListingAugmentsLaggingIndex(t *testing.T) {
+	t.Parallel()
+	// The index lags: it reports only 100. The per-node listing also sees 101
+	// (just created by a peer). With a range of exactly [100, 102], the only
+	// allocatable ID is 102.
+	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+		return buildResources(100), nil
+	})
+	c.nodesSvc = &stubNodesService{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			entry, _ := json.Marshal(struct {
+				Vmid int64 `json:"vmid"`
+			}{Vmid: 101})
+			resp := sdknodes.ListQemuResponse{entry}
+			return &resp, nil
+		},
+	}
+
+	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(100, 102))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != 102 {
+		t.Errorf("allocator must skip the index-lagged VMID 101; got %d", id)
 	}
 }
 

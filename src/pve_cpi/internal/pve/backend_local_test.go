@@ -461,3 +461,9 @@ func TestAsInt(t *testing.T) {
 		})
 	}
 }
+
+// ListStatus reports no offline members; the fixture cluster is fully online.
+func (f *fakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	empty := sdkcluster.ListStatusResponse{}
+	return &empty, nil
+}

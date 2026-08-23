@@ -97,10 +97,7 @@ func readGuestLock(ctx context.Context, c Client, node string, vmid int) (string
 // director could never clear by retrying (the guard stays best-effort there
 // rather than converting a permanent guard fault into a permanent delete
 // failure).
-//
-// fallbackNode is the configured default node, used by FindVMByDiskVolid only
-// for cluster rows that omit the node field (rare in modern PVE).
-func GuardDiskDeleteState(ctx context.Context, c Client, fallbackNode, volid string) error {
+func GuardDiskDeleteState(ctx context.Context, c Client, volid string) error {
 	if c == nil || volid == "" {
 		return nil
 	}
@@ -112,7 +109,7 @@ func GuardDiskDeleteState(ctx context.Context, c Client, fallbackNode, volid str
 	// error means the disk is attached to no VM (the normal pre-delete state)
 	// or resolution failed permanently: no in-flight guest to guard against,
 	// so allow the delete.
-	vmid, node, err := FindVMByDiskVolid(ctx, c, fallbackNode, volid)
+	vmid, node, err := FindVMByDiskVolid(ctx, c, volid)
 	if err != nil {
 		if isRetriableCPIError(err) {
 			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,

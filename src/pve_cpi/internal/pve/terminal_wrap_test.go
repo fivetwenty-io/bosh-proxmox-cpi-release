@@ -137,8 +137,10 @@ func TestFindTemplatesBySHATagCluster_TransientRetriesInPlace(t *testing.T) {
 	if len(refs) != 1 {
 		t.Fatalf("got %d refs, want 1", len(refs))
 	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("ListResources calls = %d, want 2 (one failure, one retry)", got)
+	// Three fixture reads: the membership listing fails once and retries in
+	// place (two), then the per-node qemu listing succeeds (three).
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("fixture reads = %d, want 3 (failed membership, retried membership, node listing)", got)
 	}
 }
 
