@@ -56,7 +56,8 @@ func WithMaxWait(d time.Duration) AwaitOption {
 // reaches terminal state or the deadline is exceeded. It wraps the SDK
 // tasks.Service.Wait with CPI-standard defaults and error normalization.
 //
-// Returns nil when the task exits with status "OK".
+// Returns nil when the task exits with status "OK" or a "WARNINGS: N"
+// status (completed with warnings).
 // Returns a *cpierrors.Error with the following retriable classification:
 //   - upid is empty — non-retriable CloudError (programming error).
 //   - node is empty — non-retriable CloudError (programming error).
@@ -67,7 +68,8 @@ func WithMaxWait(d time.Duration) AwaitOption {
 //     RetriableCloudError via WrapError classification.
 //   - nil status — non-retriable CloudError (SDK contract violation).
 //   - empty exit status — non-retriable CloudError (PVE never wrote outcome).
-//   - non-OK exit status — non-retriable CloudError (permanent task failure).
+//   - non-OK, non-WARNINGS exit status — non-retriable CloudError (permanent
+//     task failure).
 func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOption) error {
 	if ctx == nil {
 		return cpierrors.Cloud("AwaitTask: ctx must not be nil")
@@ -159,6 +161,16 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 			cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("task %s: empty exit status (poll timeout — task still running)", upid),
 		)
+	}
+	if status.Warned {
+		// "WARNINGS: N" exit: the task completed its work but logged WARN
+		// lines -- e.g. qmdestroy removed the VM yet could not remove one
+		// disk under storage-lock contention ("Could not remove disk ...,
+		// check manually"). Failing here would fail an operation that
+		// actually succeeded; any leftover volume is an audit concern
+		// (scripts/disk-audit), not a task failure. Mirrors the adaptive
+		// path's classifyTaskExit.
+		return nil
 	}
 	if exit != "OK" && exit != "ok" {
 		return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)

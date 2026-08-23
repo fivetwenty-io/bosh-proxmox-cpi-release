@@ -548,6 +548,25 @@ func TestIsStorageLockTimeout_RealPVEMessage(t *testing.T) {
 	}
 }
 
+// source: live 3-node PVE cluster with shared RBD under concurrent clones —
+// PVE's cfs cluster lock on the storage, not the file lock: mass VM creation
+// from one template makes qmclone tasks fail with exactly this prose.
+func TestIsStorageLockTimeout_CfsLockRequestTimeout(t *testing.T) {
+	t.Parallel()
+	err := errors.New("task failed: clone failed: cfs-lock 'storage-rbd' error: got lock request timeout")
+	if !pve.IsStorageLockTimeout(err) {
+		t.Error("cfs-lock request timeout message should match")
+	}
+}
+
+func TestIsStorageLockTimeout_CfsLockOtherError(t *testing.T) {
+	t.Parallel()
+	err := errors.New("cfs-lock 'storage-rbd' error: no quorum")
+	if pve.IsStorageLockTimeout(err) {
+		t.Error("a non-timeout cfs-lock error must not classify as lock timeout")
+	}
+}
+
 func TestIsStorageLockTimeout_MixedCase(t *testing.T) {
 	t.Parallel()
 	err := errors.New("Can't Lock File '/var/lock/pve-manager/pve-storage-data' - Got Timeout")

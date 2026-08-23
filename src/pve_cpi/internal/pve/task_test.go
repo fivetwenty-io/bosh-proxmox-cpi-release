@@ -125,6 +125,40 @@ func TestAwaitTask_Adaptive_TerminalFailure(t *testing.T) {
 	}
 }
 
+// TestAwaitTask_WarningsExitIsSuccess: a task that stops with exit status
+// "WARNINGS: N" (Warned=true) completed its work -- e.g. qmdestroy removed
+// the VM but could not remove one disk under storage-lock contention. The
+// plain Wait path must accept it as success, exactly as the adaptive path's
+// classifyTaskExit already does.
+func TestAwaitTask_WarningsExitIsSuccess(t *testing.T) {
+	t.Parallel()
+
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "WARNINGS: 1", UpID: upid, Warned: true}, nil
+		},
+	}
+	if err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:destroy"); err != nil {
+		t.Fatalf("expected WARNINGS exit treated as success, got: %v", err)
+	}
+}
+
+// TestAwaitTask_Adaptive_WarningsExitIsSuccess: same tolerance on the
+// adaptive-poll path (already provided by classifyTaskExit; regression guard).
+func TestAwaitTask_Adaptive_WarningsExitIsSuccess(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "WARNINGS: 2", UpID: upid, Warned: true}, nil
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:destroy"); err != nil {
+		t.Fatalf("expected WARNINGS exit treated as success on the adaptive path, got: %v", err)
+	}
+}
+
 // TestAwaitTask_Adaptive_DisabledUsesWait confirms the default (disabled) path
 // uses the SDK Wait and never calls GetStatus — byte-identical routing.
 func TestAwaitTask_Adaptive_DisabledUsesWait(t *testing.T) {

@@ -467,6 +467,15 @@ func IsStorageLockTimeout(err error) bool {
 	if strings.Contains(msg, "can't lock file") && strings.Contains(msg, "got timeout") {
 		return true
 	}
+	// The cluster-wide cfs lock on a shared storage (pmxcfs, not the local
+	// file lock above): concurrent qmclone/qmcreate/qmdestroy tasks against
+	// one shared pool (e.g. RBD during a mass VM creation) contend on it and
+	// PVE fails the task with "cfs-lock 'storage-<pool>' error: got lock
+	// request timeout". Pure contention -- retriable. Other cfs-lock errors
+	// (e.g. "no quorum!") deliberately do not match.
+	if strings.Contains(msg, "cfs-lock") && strings.Contains(msg, "got lock request timeout") {
+		return true
+	}
 	return IsLVMCommandTimeout(err)
 }
 
