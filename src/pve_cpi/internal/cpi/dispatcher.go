@@ -78,6 +78,16 @@ type Dispatcher struct {
 	// an unconfigured dispatcher pays zero overhead. Populated via
 	// WithDurationRecorder.
 	durationRecorder func(ctx context.Context, method, outcome string, durationMs float64)
+
+	// transientClassifier, when non-nil, is consulted by dispatchError's
+	// plain-error fallback: an error it reports as transient surfaces as a
+	// retriable CloudError instead of the permanent generic wrap. Populated
+	// via WithTransientClassifier (production wires pve.IsTransientTransport;
+	// the dispatcher cannot import internal/pve itself, since internal/pve
+	// depends on internal/config, which depends on internal/cpi/hooks, which
+	// depends on this package). nil (the default) keeps the fallback
+	// permanent for every plain error.
+	transientClassifier func(error) bool
 }
 
 // NewDispatcher returns a Dispatcher with all 22 CPI methods pre-registered as
@@ -177,6 +187,18 @@ func WithRequestTrace(enabled bool) func(*Dispatcher) {
 func WithDurationRecorder(recorder func(ctx context.Context, method, outcome string, durationMs float64)) func(*Dispatcher) {
 	return func(d *Dispatcher) {
 		d.durationRecorder = recorder
+	}
+}
+
+// WithTransientClassifier returns an option that installs the predicate the
+// plain-error fallback in dispatchError consults before minting a permanent
+// CloudError. It exists as an injected seam purely for layering: the
+// production wiring passes pve.IsTransientTransport, which this package
+// cannot import directly (see the transientClassifier field comment). A nil
+// classifier (the default) keeps every unclassified plain error permanent.
+func WithTransientClassifier(classifier func(error) bool) func(*Dispatcher) {
+	return func(d *Dispatcher) {
+		d.transientClassifier = classifier
 	}
 }
 
@@ -324,7 +346,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		// metric's outcome vocabulary is success/error/marshal_error only;
 		// the "timeout" string is a dispatch-log-only distinction.
 		d.recordDuration(ctx, req.Method, "error", durationMS)
-		return dispatchError(cpierrors.Retriable(
+		return d.dispatchError(cpierrors.Retriable(
 			"operation %s exceeded its %s deadline [request_id=%s]; aborted and may be retried",
 			req.Method, budget, requestID))
 	}
@@ -338,7 +360,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			log.ErrScrubbed(err),
 		)...)
 		d.recordDuration(ctx, req.Method, outcome, durationMS)
-		return dispatchError(err)
+		return d.dispatchError(err)
 	}
 
 	// Marshal result before returning so a non-serialisable value becomes
@@ -536,7 +558,7 @@ func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string,
 // task/event records: an error embedding a presigned or userinfo-bearing URL
 // (a failed stemcell fetch, for example) must not reach that sink verbatim.
 // This mirrors what endRootSpanErr already does for the trace exporter.
-func dispatchError(err error) *jsonrpc.Response {
+func (d *Dispatcher) dispatchError(err error) *jsonrpc.Response {
 	var cpiErr *cpierrors.Error
 	if errors.As(err, &cpiErr) {
 		return &jsonrpc.Response{
@@ -548,6 +570,14 @@ func dispatchError(err error) *jsonrpc.Response {
 			},
 			Log: "",
 		}
+	}
+	// Last-resort transport classification: no live handler path lets a raw
+	// transport error reach this fallback today, but a future handler
+	// regression must not convert a transient fault (a dropped connection, a
+	// cycling pveproxy) into a permanent failure the Director will not retry.
+	if d.transientClassifier != nil && d.transientClassifier(err) {
+		return errorResponse(cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			"transient transport fault: "+err.Error()))
 	}
 	// Plain error — wrap as generic CloudError, not retriable.
 	return errorResponse(cpierrors.Cloud("%s", err.Error()))

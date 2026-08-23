@@ -191,23 +191,30 @@ func WrapError(err error) error {
 				"server fault: %s", err.Error())
 	}
 
-	// SDK APIError: check HTTP code for 404 vs 5xx vs 429 vs other 4xx.
-	var apiErr *sdkerrors.APIError
-	if errors.As(err, &apiErr) {
-		if apiErr.IsNotFound() {
-			return cpierrors.Cloud("resource not found: %s", apiErr.Error())
+	// SDK API status classification: 404 vs 5xx vs 429 vs other 4xx. Resolved
+	// through apiHTTPCode, not a bare errors.As against *APIError, because the
+	// SDK returns 400 as *ParameterError, 401 as *AuthenticationError, and 403
+	// as *PermissionError, each embedding APIError by VALUE; the bare check
+	// missed exactly those codes, letting their bodies fall through to the
+	// text classifiers below, where a pushback phrase in a 4xx body silently
+	// flipped a request verdict to retriable. Every resolved status gets its
+	// verdict here, ahead of any text matching.
+	if code, ok := apiHTTPCode(err); ok {
+		if IsNotFound(err) {
+			return cpierrors.Cloud("resource not found: %s", err.Error())
 		}
-		// 5xx server error → retriable.
-		if errors.Is(err, sdkerrors.ErrServer) {
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+apiErr.Error())
+		// 5xx server error → retriable. The sentinel check keeps parity with
+		// shapes that carry Code but not HTTPCode.
+		if errors.Is(err, sdkerrors.ErrServer) || code >= 500 {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+err.Error())
 		}
-		// 429 Too Many Requests → retriable pushback. Checked inside the APIError
-		// branch so the HTTPCode field is available without a second errors.As.
-		if apiErr.HTTPCode == 429 {
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback (429): "+apiErr.Error())
+		// 429 Too Many Requests → retriable pushback.
+		if code == 429 {
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback (429): "+err.Error())
 		}
-		// 4xx non-404 non-429 → non-retriable.
-		return cpierrors.Cloud("PVE API error: %s", apiErr.Error())
+		// Any other 4xx (or an unresolved code on a typed API error) is a
+		// verdict about the request → non-retriable, whatever the body says.
+		return cpierrors.Cloud("PVE API error: %s", err.Error())
 	}
 
 	// Task-level transient signals carried as plain errors (no APIError /
@@ -380,11 +387,19 @@ func IsCloneToNonSharedStorage(err error) bool {
 // connection the server closed between requests produces the same shape,
 // because Go cannot auto-retry a streamed POST body.
 //
-// These never reach the SDK's typed ConnectionError (that type models a
-// connection that could not be established at all), so without this predicate
-// a mid-request drop falls through every transient classifier and surfaces as
-// a permanent CloudError. Typed errors.Is checks only: the SDK preserves the
+// Most of these never reach the SDK's typed ConnectionError (that type
+// historically modeled a connection that could not be established at all;
+// SDK v3.9.1 additionally maps the drop shapes below to it, and the typed
+// branch in WrapError handles that form), so without this predicate a
+// mid-request drop falls through every transient classifier and surfaces as
+// a permanent CloudError. Typed errors.Is checks first: the SDK preserves the
 // chain with %w end to end, and textual matching on "eof" is far too loose.
+// The single exception is net/http's unexported errServerClosedIdle sentinel
+// ("http: server closed idle connection", the other arm of the keep-alive
+// race whose io.EOF arm is covered above): it is a bare errors.New with no
+// chain, so it is matched per unwrap link by full-string equality, never by
+// substring. The exception list is named and bounded: this one sentinel, and
+// nothing else, is matched textually here.
 //
 // Retrying a dropped mutation can replay a request the server already
 // processed; that trade is identical to the timeout case (already classified
@@ -401,8 +416,28 @@ func IsTransportConnectionDrop(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	// The client-side arm of the same race: the transport pool handed out a
+	// connection that was already closed.
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// The server-side keep-alive arm, whose stdlib sentinel carries no chain:
+	// exact match per unwrap link (see the doc comment above).
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if e.Error() == serverClosedIdleMessage {
+			return true
+		}
+	}
+	return false
 }
+
+// serverClosedIdleMessage is the message of net/http's unexported
+// errServerClosedIdle sentinel. See IsTransportConnectionDrop for the
+// matching discipline.
+const serverClosedIdleMessage = "http: server closed idle connection"
 
 // IsTransientTransport reports whether err signals a transient transport-layer
 // fault between the CPI and the PVE API surface, distinct from a deliberate
@@ -456,11 +491,31 @@ func IsTransientTransport(err error) bool {
 	if IsTransportConnectionDrop(err) {
 		return true
 	}
+	// A failure that carries a resolved non-429 4xx status is a verdict about
+	// the request (a rejected credential, a denied grant), not a transport
+	// fault: the textual rescues below must not resurrect it. SDK v3.9.1 and
+	// later preserve the status chain through login failures, so a 401 login
+	// resolves here and classifies permanent even though its message contains
+	// the no-ticket sentinel text.
+	if code, ok := apiHTTPCode(err); ok && code >= 400 && code < 500 && code != 429 {
+		return false
+	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "failed to parse login response") {
 		return true
 	}
 	if strings.Contains(msg, "auto-login failed") {
+		return true
+	}
+	// Safety net for SDK versions predating v3.9.1, whose ticket-login failure
+	// surfaced as this bare sentinel with the real cause (typically a 5xx from
+	// a cycling pveproxy) discarded. Retriable because a ticket login that a
+	// live cluster refuses to answer is overwhelmingly a transient server
+	// fault: a genuinely rejected credential answers 401 and carries a
+	// different message. v3.9.1 and later preserve the status chain, so the
+	// typed branches above classify first. API-token deployments never hit
+	// this path.
+	if strings.Contains(msg, "authentication failed: no ticket received") {
 		return true
 	}
 	if strings.Contains(msg, "(code: 596)") || strings.Contains(msg, "http 596") {

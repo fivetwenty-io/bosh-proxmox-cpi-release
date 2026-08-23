@@ -577,7 +577,13 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// (DefaultTransientMaxAttempts) stays in force.
 	pve.ConfigureTransientRetry(cfg.RetryTransientMaxAttempts())
 
-	dispatcherOpts := []func(*cpi.Dispatcher){cpi.WithHooks(hookChain...)}
+	// The transient classifier backs dispatchError's last-resort fallback:
+	// a raw transport error a handler failed to classify still surfaces as
+	// retriable. Wired here because internal/cpi cannot import internal/pve.
+	dispatcherOpts := []func(*cpi.Dispatcher){
+		cpi.WithHooks(hookChain...),
+		cpi.WithTransientClassifier(pve.IsTransientTransport),
+	}
 	if otelDurationRecorder != nil {
 		dispatcherOpts = append(dispatcherOpts, cpi.WithDurationRecorder(otelDurationRecorder))
 	}

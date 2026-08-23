@@ -213,14 +213,16 @@ func adaptiveTaskInterval(elapsed time.Duration, progress float64, fallback time
 }
 
 // awaitTaskAdaptive is the §7.28 progress-aware poll loop. It mirrors AwaitTask's
-// terminal/error classification, with ONE deliberate divergence: AwaitTask can
-// observe ExitStatus == "" only while the task is still running (it returns a
-// retriable poll-timeout for it), whereas this loop reaches classification
-// only after Status == "stopped", where an empty ExitStatus is treated as
-// success (see classifyTaskExit). The two paths never classify the same
-// observable state differently — they observe different states.
+// terminal/error classification. Both paths observe the same failed-exit
+// state and must classify it identically: classifyTaskExit routes the exit
+// text through WrapError, exactly as the default path's wrapPollError does
+// for the SDK's "task failed: <exitstatus>" error. The one state only this
+// loop can see is ExitStatus == "" on a stopped task (AwaitTask observes an
+// empty ExitStatus only while the task is still running, and returns a
+// retriable poll-timeout for it); classifyTaskExit treats it as success.
 //   - terminal "stopped" with exit OK/ok/"" or a WARNINGS status → nil
-//   - terminal "stopped" with any other exit → non-retriable CloudError
+//   - terminal "stopped" with any other exit → classified by exit text:
+//     lock/quorum/pushback contention retriable, everything else permanent
 //   - poll deadline exceeded while still running → retriable (task still running)
 //   - ctx cancelled → retriable
 //   - not-found task → non-retriable (preserves IsNotFound)
@@ -315,7 +317,13 @@ const taskStatusStopped = "stopped"
 
 // classifyTaskExit maps a terminal (Status == "stopped") task's exit status
 // to the CPI result: OK/ok or a WARNINGS status (warned) is success; anything
-// else is a non-retriable failure.
+// else routes through WrapError so the exit text gets the same retriability
+// classification the default SDK-poller path applies (Wait surfaces a failed
+// exit as "task failed: <exitstatus>", which wrapPollError feeds to
+// WrapError). Storage-lock timeouts, quorum loss, and pushback phrases inside
+// the exit text stay retriable; every other exit stays a permanent
+// CloudError. Before this, the adaptive path hard-coded every failed exit to
+// permanent, so one poll knob silently changed classification.
 //
 // An empty exit status on a STOPPED task is also accepted as success — an
 // explicit choice, not an oversight: some PVE task types report stopped with
@@ -330,7 +338,7 @@ func classifyTaskExit(upid, exit string, warned bool) error {
 	if warned || exit == "OK" || exit == "ok" {
 		return nil
 	}
-	return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)
+	return WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
 }
 
 // wrapPollError maps a task poll SDK error to the appropriate CPI error type.

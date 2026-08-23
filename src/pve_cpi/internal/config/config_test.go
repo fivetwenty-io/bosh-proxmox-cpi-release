@@ -5732,6 +5732,11 @@ func TestLoad_PVEAPITransportTuning_RoundTrip(t *testing.T) {
 
 // TestLoad_PVEAPITransportTuning_ZeroByteIdentical verifies that absent fields
 // produce zero values — byte-identical behavior to prior releases (SDK no-op).
+// The one deliberate exception is PVEIdleConnTimeoutSec, whose unset value now
+// defaults to 15: the SDK's 90s idle window outlives pveproxy's keep-alive and
+// sets up the reused-dead-connection race, so the shipped default changed (an
+// explicit, user-approved exception to the byte-identical policy; see
+// ApplyDefaults and the changelog Changed entry).
 func TestLoad_PVEAPITransportTuning_ZeroByteIdentical(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
@@ -5750,8 +5755,8 @@ func TestLoad_PVEAPITransportTuning_ZeroByteIdentical(t *testing.T) {
 	if cfg.PVEMaxIdleConnsPerHost != 0 {
 		t.Errorf("PVEMaxIdleConnsPerHost: got %d, want 0 (byte-identical)", cfg.PVEMaxIdleConnsPerHost)
 	}
-	if cfg.PVEIdleConnTimeoutSec != 0 {
-		t.Errorf("PVEIdleConnTimeoutSec: got %d, want 0 (byte-identical)", cfg.PVEIdleConnTimeoutSec)
+	if cfg.PVEIdleConnTimeoutSec != 15 {
+		t.Errorf("PVEIdleConnTimeoutSec: got %d, want 15 (deliberate shipped default)", cfg.PVEIdleConnTimeoutSec)
 	}
 	if cfg.PVETCPKeepAliveSec != 0 {
 		t.Errorf("PVETCPKeepAliveSec: got %d, want 0 (byte-identical)", cfg.PVETCPKeepAliveSec)

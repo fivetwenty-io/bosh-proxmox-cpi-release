@@ -1157,9 +1157,17 @@ func (c *Client) handleTFAAuthentication(authErr error) error {
 		return fmt.Errorf("tfa handling failed: %w", err)
 	}
 
-	_, err = ticketAuth.CompleteTFA(challenge, response)
+	result, err := ticketAuth.CompleteTFA(challenge, response)
 	if err != nil {
 		return fmt.Errorf("tfa completion failed: %w", err)
+	}
+
+	// CompleteTFA reports in-band failures (a rejected code, a 5xx from the
+	// TFA endpoint) through AuthResult.Error with a nil Go error. Surface
+	// them so the cause chain reaches the caller instead of degrading into a
+	// generic authentication failure.
+	if result != nil && result.Error != nil {
+		return fmt.Errorf("tfa completion failed: %w", result.Error)
 	}
 
 	return nil
@@ -1451,6 +1459,14 @@ func (c *Client) performAutoLogin() error {
 
 	err := c.ensureAuthentication()
 	if err != nil {
+		// A failed login must not permanently disable auto-login for this
+		// client: clear the marker so the next request attempts a fresh
+		// login and surfaces the same error shape as this one, instead of
+		// proceeding unauthenticated into the 401-retry path.
+		c.loginMutex.Lock()
+		c.loginAttempted = false
+		c.loginMutex.Unlock()
+
 		return fmt.Errorf("auto-login failed: %w", err)
 	}
 
@@ -1578,10 +1594,65 @@ func classifyTransportError(req *http.Request, doErr error, attempt, retries int
 	}
 
 	if attempt >= retries || !retryAllowed {
+		// A connection-lifecycle race (the server closed an idle keep-alive
+		// connection, or the pool handed out an already-closed connection)
+		// surfaces as a typed ConnectionError so callers can classify it,
+		// instead of as an anonymous wrap around a chainless stdlib sentinel.
+		// This only changes what surfaces; whether the loop retries is
+		// decided above, unchanged.
+		if isConnectionDropError(doErr) {
+			return newDroppedConnectionError(req, doErr, attempt+1)
+		}
+
 		return fmt.Errorf("request failed after %d attempt(s): %w", attempt+1, doErr)
 	}
 
 	return nil
+}
+
+// serverClosedIdleMessage is the message of net/http's unexported
+// errServerClosedIdle sentinel, which carries no error chain, so string
+// equality on an unwrap link is the only available handle. It is compared per
+// unwrap link by full-string equality, never by substring, so a larger message
+// that merely mentions the phrase does not match. Any future chainless stdlib
+// sentinel gets its own named constant here under the same discipline.
+const serverClosedIdleMessage = "http: server closed idle connection"
+
+// isConnectionDropError reports whether err is a connection-lifecycle race on
+// an established connection: the keep-alive peer closed the connection between
+// pickup and write, or the client pool handed out a connection that was
+// already closed. Both mean the request may not have reached the server and a
+// fresh connection is expected to succeed.
+func isConnectionDropError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if e.Error() == serverClosedIdleMessage {
+			return true
+		}
+	}
+
+	return false
+}
+
+// newDroppedConnectionError wraps a connection-drop failure in the typed
+// ConnectionError, mirroring newConnectionError but naming the drop rather
+// than a failed dial.
+func newDroppedConnectionError(req *http.Request, cause error, attempts int) error {
+	port, _ := strconv.Atoi(req.URL.Port())
+
+	return &apierrors.ConnectionError{
+		Host:    req.URL.Hostname(),
+		Port:    port,
+		Message: fmt.Sprintf("connection dropped after %d attempt(s)", attempts),
+		Cause:   cause,
+	}
 }
 
 // waitBackoff sleeps for d but returns early if ctx is canceled first, so a

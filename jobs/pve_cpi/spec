@@ -672,10 +672,13 @@ properties:
   pve.api_idle_conn_timeout_sec:
     description: |
       Optional. How long an idle keep-alive PVE API connection remains in the
-      transport pool before being closed, in seconds. 0 (default) leaves the
-      transport at the SDK default. Shorter values free sockets sooner on
-      clusters with infrequent CPI activity; longer values retain warmed
-      connections across calls. Must be >= 0.
+      transport pool before being closed, in seconds. 0 (default) selects the
+      CPI default of 15, which retires idle connections before pveproxy's
+      shorter keep-alive window closes them server-side (reusing a
+      server-closed connection races the close and surfaces as a dropped
+      request). Set 90 for the previous SDK behavior. Shorter values free
+      sockets sooner on clusters with infrequent CPI activity; longer values
+      retain warmed connections across calls. Must be >= 0.
     default: 0
   pve.api_tcp_keepalive_sec:
     description: |

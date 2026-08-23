@@ -261,11 +261,14 @@ func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 		// Long timeout: stemcell uploads (multi-GB) and import tasks
 		// can run for several minutes.
 		Timeout: 30 * time.Minute,
-		// PVE API transport tuning — all fields are 0 by default. Zero is the
-		// SDK no-op sentinel: it leaves the transport field at the SDK internal
-		// default, so an unset config is byte-identical to prior releases.
-		// Direct assignment is safe: the SDK treats 0 as "use default" for each
-		// field (see vendor/pkg/client/options.go). Validated >= 0 in config.Validate.
+		// PVE API transport tuning — zero is the SDK no-op sentinel: it leaves
+		// the transport field at the SDK internal default. Direct assignment is
+		// safe: the SDK treats 0 as "use default" for each field (see
+		// vendor/pkg/client/options.go). Validated >= 0 in config.Validate.
+		// IdleConnTimeoutSec arrives as 15 for an unset config (see
+		// config.ApplyDefaults): pveproxy's keep-alive window is shorter than
+		// the SDK's 90s default, so retiring idle connections first avoids the
+		// reused-dead-connection race.
 		DialTimeoutSec:         cfg.PVEDialTimeoutSec,
 		TLSHandshakeTimeoutSec: cfg.PVETLSHandshakeTimeoutSec,
 		MaxIdleConnsPerHost:    cfg.PVEMaxIdleConnsPerHost,

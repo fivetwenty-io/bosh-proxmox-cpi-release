@@ -984,10 +984,11 @@ type CPIConfig struct {
 	PVEMaxIdleConnsPerHost int `json:"pve_api_max_idle_conns_per_host,omitempty"`
 
 	// PVEIdleConnTimeoutSec bounds how long an idle keep-alive connection stays
-	// in the transport pool before being closed. 0 (default) leaves the transport
-	// at the SDK default. Shorter values free sockets sooner on clusters with
-	// infrequent CPI activity; longer values retain warmed connections across
-	// calls. validate-only-when-set; omit from ERB when zero.
+	// in the transport pool before being closed. 0 (unset) is defaulted by
+	// ApplyDefaults to 15, which retires idle connections before pveproxy's
+	// shorter keep-alive window can close them server-side and set up the
+	// reused-dead-connection race (see ApplyDefaults). Explicit values pass
+	// through; operators who want the SDK's 90s behavior set 90.
 	PVEIdleConnTimeoutSec int `json:"pve_api_idle_conn_timeout_sec,omitempty"`
 
 	// PVETCPKeepAliveSec sets the TCP keep-alive probe interval for PVE API
@@ -2179,6 +2180,16 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.VerifySSL == nil {
 		t := true
 		c.VerifySSL = &t
+	}
+	// Idle keep-alive window for PVE API connections. The SDK default (90s)
+	// sits far past pveproxy's keep-alive window, so an unset value makes the
+	// client routinely pick up connections the server has already closed and
+	// race the close (the io.EOF and server-closed-idle drop shapes). 15s
+	// keeps warmed connections across a CPI action's bursts while retiring
+	// them long before pveproxy does. Operators who want the SDK behavior set
+	// the property to 90 explicitly.
+	if c.PVEIdleConnTimeoutSec == 0 {
+		c.PVEIdleConnTimeoutSec = 15
 	}
 	if c.AgentMode == "" {
 		c.AgentMode = AgentModeCloudInit

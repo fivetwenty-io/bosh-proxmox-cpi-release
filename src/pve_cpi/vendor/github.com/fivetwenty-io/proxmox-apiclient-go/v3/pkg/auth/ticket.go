@@ -159,6 +159,13 @@ func (ta *TicketAuthenticator) Authenticate() error {
 		return nil
 	}
 
+	// The result may carry the real failure (for example the HTTP status
+	// chain from a 5xx login response). Wrap it so the historical sentinel
+	// stays matchable while the cause chain survives for classification.
+	if result.Error != nil {
+		return fmt.Errorf("%w: %w", ErrAuthenticationFailedNoTicket, result.Error)
+	}
+
 	return ErrAuthenticationFailedNoTicket
 }
 
@@ -227,6 +234,12 @@ func (ta *TicketAuthenticator) RefreshForce() error {
 		ta.mu.Unlock()
 
 		return nil
+	}
+
+	// Same contract as Authenticate: surface the real failure chain when the
+	// result carries one, behind the historical sentinel.
+	if result.Error != nil {
+		return fmt.Errorf("%w: %w", ErrAuthenticationFailedNoTicket, result.Error)
 	}
 
 	return ErrAuthenticationFailedNoTicket
