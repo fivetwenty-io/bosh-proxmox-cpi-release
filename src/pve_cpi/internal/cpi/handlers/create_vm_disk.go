@@ -1124,11 +1124,31 @@ func attachEphemeralDisk(
 	}
 
 	volName := fmt.Sprintf("vm-%d-ephemeral-0", vmid)
-	createdVolid, err := deps.PVE.Storage().CreateVolume(
-		ctx, shape.node, shape.ephemeralStorage,
-		shape.ephemeralDiskGiB, shape.vmDiskFormat, vmid, volName,
-	)
+	// In-place retry on storage contention, the same backoff create_disk's
+	// attemptCreateVolume uses (that path additionally honors the operator's
+	// storage-lock attempt budget; this one takes the default): a CF deploy
+	// allocates many volumes on the same shared pool at once, and the losers
+	// of the cfs-lock race die with "cfs-lock 'storage-<pool>' error: got
+	// lock request timeout". Failing straight back to the Director re-runs
+	// the whole create_vm (clone, boot, configure) only to re-enter the same
+	// contention window; backing off here (2s→30s) lets the in-flight
+	// holders drain first.
+	var createdVolid string
+	err := pve.RetryOnTransientOrLock(ctx, logger, "create_vm_ephemeral_volume", 0, func() error {
+		var innerErr error
+		createdVolid, innerErr = deps.PVE.Storage().CreateVolume(
+			ctx, shape.node, shape.ephemeralStorage,
+			shape.ephemeralDiskGiB, shape.vmDiskFormat, vmid, volName,
+		)
+		return innerErr
+	})
 	if err != nil {
+		// The failed CreateVolume may still have committed the volume (a
+		// dropped connection after the server acted, a lock timeout after
+		// the allocation ran): sweep it best-effort, mirroring
+		// attemptCreateVolume in create_disk, so the Director's redo with a
+		// fresh VMID does not leave an orphan behind.
+		sweepEphemeralVolumeAfterCreateFailure(ctx, deps, logger, shape, vmid, volName)
 		return "", cpierrors.Wrap(pve.WrapError(err),
 			fmt.Sprintf("create_vm: create ephemeral volume vmid=%d size=%dG storage=%s",
 				vmid, shape.ephemeralDiskGiB, shape.ephemeralStorage))
@@ -1214,6 +1234,59 @@ func attachEphemeralDisk(
 		log.String("dev_path", devPath),
 	)
 	return devPath, nil
+}
+
+// sweepEphemeralVolumeAfterCreateFailure best-effort-removes an ephemeral
+// volume that a failed CreateVolume may have committed anyway (connection
+// drop after the server acted, lock timeout after the allocation ran).
+// Mirrors the non-conflict failure sweep in create_disk's
+// attemptCreateVolume: existence-check first, then DeleteVolumeAsync with
+// the imgdel task awaited; every failure is logged, never propagated.
+//
+// The canonical volid guess covers block-backed pools
+// ("<storage>:<volname>"). Dir-style plugins nest the volume under a
+// per-VMID directory the guess misses; there the Exists probe answers false,
+// the sweep is a no-op, and a committed orphan is left for
+// scripts/disk-audit (the pre-sweep status quo).
+func sweepEphemeralVolumeAfterCreateFailure(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	shape *createVMShape,
+	vmid int,
+	volName string,
+) {
+	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
+	defer rbCancel()
+	canonical := fmt.Sprintf("%s:%s", shape.ephemeralStorage, volName)
+	exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
+	if exErr != nil || !exists {
+		return
+	}
+	upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
+	if delErr != nil {
+		logger.Warn("create_vm: ephemeral volume cleanup after CreateVolume error failed",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("volid", canonical),
+			log.Err(delErr),
+		)
+		return
+	}
+	if upid != "" {
+		if werr := pve.AwaitTaskWithLogger(rollbackCtx, deps.PVE, shape.node, upid, logger); werr != nil {
+			logger.Warn("create_vm: ephemeral volume cleanup await failed",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("volid", canonical),
+				log.String("upid", upid),
+				log.Err(werr),
+			)
+			return
+		}
+	}
+	logger.Info("create_vm: removed partially committed ephemeral volume after CreateVolume error",
+		log.Int(metadataKeyVMID, vmid),
+		log.String("volid", canonical),
+	)
 }
 
 // attachPersistentDisks attaches each disk CID in parsed.diskCIDs to the VM

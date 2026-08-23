@@ -295,6 +295,16 @@ func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Du
 	}
 }
 
+// IsRetryableOrLockFault reports whether err belongs to any fault class that
+// RetryOnTransientOrLock retries: PVE pushback, per-storage lock timeout,
+// cluster quorum loss, or a transient transport fault. Ops composed of several
+// PVE calls use it to route an inner step's failure (e.g. a pre-retry cleanup
+// sweep) back onto the loop's backoff curve instead of pressing on into a
+// call that is now guaranteed to fail.
+func IsRetryableOrLockFault(err error) bool {
+	return IsPVEPushback(err) || IsStorageLockTimeout(err) || IsClusterNotQuorate(err) || IsTransientTransport(err)
+}
+
 // RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
 // returned error is a per-storage lockfile timeout (IsStorageLockTimeout), a
 // cluster quorum-loss condition (IsClusterNotQuorate), a transient transport-

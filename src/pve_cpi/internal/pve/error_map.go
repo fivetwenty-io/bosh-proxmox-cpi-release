@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"regexp"
 	"strings"
+	"syscall"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
@@ -126,6 +128,8 @@ func apiHTTPCode(err error) (int, bool) {
 //   - SDK 4xx non-404 non-429 → non-retriable CloudError
 //   - net.Error Timeout() → retriable RetriableCloudError
 //   - SDK ConnectionError or TimeoutError → retriable RetriableCloudError
+//   - mid-request connection drop (IsTransportConnectionDrop) → retriable
+//     RetriableCloudError
 //   - everything else → non-retriable CloudError wrapping original message
 func WrapError(err error) error {
 	if err == nil {
@@ -148,6 +152,15 @@ func WrapError(err error) error {
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "network timeout: "+err.Error())
+	}
+
+	// Mid-request connection drop (EOF, reset, broken pipe after the
+	// connection was established) → retriable. The SDK's typed ConnectionError
+	// covers only connections that never came up, so these would otherwise
+	// fall through to the permanent fallback.
+	if IsTransportConnectionDrop(err) {
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			"PVE connection dropped mid-request: "+err.Error())
 	}
 
 	// Cluster quorum loss: /etc/pve becomes read-only cluster-wide and every
@@ -358,6 +371,39 @@ func IsCloneToNonSharedStorage(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "can't clone to non-shared storage")
 }
 
+// IsTransportConnectionDrop reports whether err signals a connection that the
+// server closed after it was established, mid-request or mid-response: the Go
+// transport surfaces these as io.EOF or io.ErrUnexpectedEOF inside the
+// *url.Error, or as write-side ECONNRESET / EPIPE syscall errors. The live
+// trigger is pveproxy under burst load (a CF deploy uploading many configdrive
+// ISOs in parallel) recycling or shedding connections; a stale keep-alive
+// connection the server closed between requests produces the same shape,
+// because Go cannot auto-retry a streamed POST body.
+//
+// These never reach the SDK's typed ConnectionError (that type models a
+// connection that could not be established at all), so without this predicate
+// a mid-request drop falls through every transient classifier and surfaces as
+// a permanent CloudError. Typed errors.Is checks only: the SDK preserves the
+// chain with %w end to end, and textual matching on "eof" is far too loose.
+//
+// Retrying a dropped mutation can replay a request the server already
+// processed; that trade is identical to the timeout case (already classified
+// transient), and the mutation call sites absorb it the same way they absorb
+// a replayed timeout: clone retries VMID conflicts with per-candidate
+// cleanup, the configdrive upload clears the target name before re-uploading,
+// and volume creates sweep a partially committed volume after failure.
+//
+// nil → false.
+func IsTransportConnectionDrop(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
 // IsTransientTransport reports whether err signals a transient transport-layer
 // fault between the CPI and the PVE API surface, distinct from a deliberate
 // HTTP 4xx response. The canonical trigger is a pvedaemon worker cycling
@@ -370,6 +416,8 @@ func IsCloneToNonSharedStorage(err error) bool {
 //     localhost ("backend gone"); it is included in the 5xx class.
 //   - SDK *ConnectionError — bare TCP refusal, RST, or DNS failure.
 //   - SDK *TimeoutError — request deadline exceeded.
+//   - Mid-request connection drops (IsTransportConnectionDrop): EOF, reset,
+//     or broken pipe after the connection was established.
 //   - "failed to parse login response" — POST /access/ticket returned an
 //     empty body because the worker exited mid-response.
 //   - "auto-login failed" — generic SDK wrapper covering ticket-fetch
@@ -403,6 +451,9 @@ func IsTransientTransport(err error) bool {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if IsTransportConnectionDrop(err) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())

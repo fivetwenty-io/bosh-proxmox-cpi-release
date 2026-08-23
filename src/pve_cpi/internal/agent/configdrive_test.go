@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	diskfs "github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
@@ -670,5 +673,110 @@ func TestConfigure_NonLocalISOStorageNoWarning(t *testing.T) {
 		if e.Level == log.LevelWarn && strings.Contains(e.Message, "iso_storage=local") {
 			t.Errorf("unexpected iso_storage=local warning for storage=ceph: %q", e.Message)
 		}
+	}
+}
+
+// TestConfigDrive_Configure_RetriesUploadOnConnectionDrop reproduces the live
+// CF-deploy failure: pveproxy dropped the multipart POST mid-request and the
+// SDK surfaced url.Error(io.EOF), which the retry loop treated as permanent:
+// one attempt, then a non-retriable CloudError. The drop must be retried with
+// a fresh body stream, and the retry attempt must clear the target filename
+// first (PVE rejects a duplicate iso upload with HTTP 409 if the dropped POST
+// actually committed).
+func TestConfigDrive_Configure_RetriesUploadOnConnectionDrop(t *testing.T) {
+	t.Parallel()
+
+	dropErr := fmt.Errorf("failed to upload file %q to path %q: %w",
+		"vm-200-config.iso", "/nodes/pve1/storage/local/upload",
+		fmt.Errorf("HTTP upload to %q failed for file %q: %w",
+			"/nodes/pve1/storage/local/upload", "vm-200-config.iso",
+			fmt.Errorf("request failed after 1 attempt(s): %w", &url.Error{
+				Op:  "Post",
+				URL: "https://pve1.example.io:8006/api2/json/nodes/pve1/storage/local/upload",
+				Err: io.EOF,
+			})))
+
+	attempts := 0
+	storageSvc := &fakeStorageSvc{
+		uploadFn: func(_ context.Context, _, _, _, _ string, body io.Reader) (string, error) {
+			attempts++
+			if attempts == 1 {
+				return "", dropErr
+			}
+			// The retry must present a fresh, readable body stream.
+			data, err := io.ReadAll(body)
+			if err != nil {
+				return "", err
+			}
+			if len(data) == 0 {
+				return "", errors.New("retry attempt sent an empty body")
+			}
+			return "", nil
+		},
+	}
+	a := newISOAgent(storageSvc, nil)
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := a.Configure(ctx, "pve1", 200, baseISOConfig()); err != nil {
+		t.Fatalf("Configure must succeed once the retried upload lands: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("upload attempts = %d, want 2 (one drop, one retry)", attempts)
+	}
+	// Two name-clearing deletes: Configure's pre-upload sweep plus the
+	// pre-retry sweep guarding against a committed-but-unacked first POST.
+	if got := len(storageSvc.deleteVolumeIfExistsCalls); got != 2 {
+		t.Errorf("DeleteVolumeIfExists calls = %d, want 2 (pre-upload and pre-retry)", got)
+	}
+}
+
+// TestConfigDrive_Configure_SweepLockTimeoutRetriedNotSkipped covers the
+// pre-retry sweep failing on the same contention that killed the upload: the
+// imgdel behind removeISOIfExists queues under the per-storage lock, so under
+// a burst it can time out exactly like the upload did. Skipping the sweep and
+// uploading anyway risks a permanent HTTP 409 (duplicate iso name) when the
+// dropped POST committed; instead the sweep failure must ride the retry
+// loop's backoff curve and be attempted again before any re-upload happens.
+func TestConfigDrive_Configure_SweepLockTimeoutRetriedNotSkipped(t *testing.T) {
+	t.Parallel()
+
+	dropErr := fmt.Errorf("request failed after 1 attempt(s): %w", &url.Error{
+		Op:  "Post",
+		URL: "https://pve1.example.io:8006/api2/json/nodes/pve1/storage/local/upload",
+		Err: io.EOF,
+	})
+
+	uploads := 0
+	sweeps := 0
+	storageSvc := &fakeStorageSvc{}
+	storageSvc.uploadFn = func(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
+		uploads++
+		if uploads == 1 {
+			return "", dropErr
+		}
+		return "", nil
+	}
+	storageSvc.deleteVolumeIfExistsFn = func(_ context.Context, _, _, _ string) (bool, error) {
+		sweeps++
+		// Call 1 is Configure's pre-upload sweep; call 2 is the first
+		// pre-retry sweep, which loses the same lock race the upload lost.
+		if sweeps == 2 {
+			return false, errors.New("cfs-lock 'storage-local' error: got lock request timeout")
+		}
+		return true, nil
+	}
+	a := newISOAgent(storageSvc, nil)
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := a.Configure(ctx, "pve1", 200, baseISOConfig()); err != nil {
+		t.Fatalf("Configure must succeed once the sweep retry clears the name: %v", err)
+	}
+	// Attempt 1: upload drops. Attempt 2: sweep times out, no upload runs.
+	// Attempt 3: sweep succeeds, upload lands.
+	if uploads != 2 {
+		t.Errorf("upload attempts = %d, want 2 (the lock-timeout attempt must not reach the upload)", uploads)
+	}
+	if sweeps != 3 {
+		t.Errorf("DeleteVolumeIfExists calls = %d, want 3 (pre-upload, failed pre-retry, successful pre-retry)", sweeps)
 	}
 }

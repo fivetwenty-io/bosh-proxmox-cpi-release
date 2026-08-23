@@ -223,9 +223,10 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// visible to subsequent calls (e.g. attaching as a CD-ROM) until the
 	// task completes. Both the multipart POST and the task run under the
 	// per-storage lockfile, so on bursty deploys this can surface
-	// "can't lock file ... got timeout" on either side. Retry the whole
-	// open+upload+await tuple on that signal; the body stream is reopened
-	// each attempt so PVE always sees a fresh reader.
+	// "can't lock file ... got timeout" on either side, and an overloaded
+	// pveproxy can drop the connection mid-POST (surfacing as EOF). Retry
+	// the whole open+upload+await tuple on those signals; the body stream
+	// is reopened each attempt so PVE always sees a fresh reader.
 	//
 	// Disable the SDK's inner HTTP retry for this request: it tries to
 	// replay a multipart upload by re-reading req.Body, but the body has
@@ -235,7 +236,32 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// Our outer RetryOnTransientOrLock reopens the file each iteration,
 	// so transient failures are still retried with a fresh stream.
 	uploadCtx := sdkclient.WithRetries(ctx, 0)
+	firstAttempt := true
 	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", 0, func() error {
+		// A retry means the previous POST died mid-flight (connection drop,
+		// lock timeout). PVE may still have committed the file after the drop,
+		// and a duplicate `content=iso` upload is rejected with HTTP 409, so
+		// clear the target name before re-uploading. 404 is "not committed"
+		// (the common case). A sweep that fails on the same retryable fault
+		// class the loop handles (lock contention, pushback, another drop) is
+		// returned to the loop so the sweep itself rides the backoff curve:
+		// pressing on would upload into a possibly-taken name and turn the
+		// retryable fault into a permanent 409. Only a permanently-failing
+		// sweep proceeds best-effort, leaving the upload to surface the truth.
+		if !firstAttempt {
+			if _, rmErr := a.removeISOIfExists(ctx, node, filename); rmErr != nil {
+				if pve.IsRetryableOrLockFault(rmErr) {
+					return rmErr
+				}
+				a.logger.Warn("configdrive: pre-retry iso cleanup failed; retrying the upload anyway",
+					log.String("node", node),
+					log.String("filename", filename),
+					log.Err(rmErr),
+				)
+			}
+		}
+		firstAttempt = false
+
 		f, openErr := os.Open(localPath) // #nosec G304 -- localPath is CPI-owned MkdirTemp output
 		if openErr != nil {
 			return fmt.Errorf("open local iso: %w", openErr)

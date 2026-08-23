@@ -92,10 +92,12 @@ func (q *diskSizingQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ 
 
 var _ sdkqemu.Service = (*diskSizingQEMU)(nil)
 
-// diskSizingStorage implements sdkstorage.Service with configurable CreateVolume + DeleteVolumeAsync.
+// diskSizingStorage implements sdkstorage.Service with configurable
+// CreateVolume + DeleteVolumeAsync + Exists.
 type diskSizingStorage struct {
 	createVolumeFn      func(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error)
 	deleteVolumeAsyncFn func(ctx context.Context, node, storage, volume string) (string, error)
+	existsFn            func(volume string) (bool, error)
 }
 
 func (s *diskSizingStorage) CreateVolume(ctx context.Context, node, storage string, sizeGiB int, format string, vmid int, name string) (string, error) {
@@ -123,8 +125,15 @@ func (s *diskSizingStorage) DeleteVolumeIfExists(_ context.Context, _, _, _ stri
 func (s *diskSizingStorage) DeleteVolumeIfExistsAsync(_ context.Context, _, _, _ string) (bool, string, error) {
 	panic("diskSizingStorage.DeleteVolumeIfExistsAsync: not expected")
 }
-func (s *diskSizingStorage) Exists(_ context.Context, _, _, _ string) (bool, error) {
-	panic("diskSizingStorage.Exists: not expected")
+
+// Exists backs the CreateVolume-failure sweep's committed-volume probe;
+// absent an existsFn it answers false (nothing committed), so tests that do
+// not exercise the sweep see no DeleteVolumeAsync call from it.
+func (s *diskSizingStorage) Exists(_ context.Context, _, _, volume string) (bool, error) {
+	if s.existsFn != nil {
+		return s.existsFn(volume)
+	}
+	return false, nil
 }
 func (s *diskSizingStorage) Upload(_ context.Context, _, _, _, _ string, _ io.Reader) (string, error) {
 	panic("diskSizingStorage.Upload: not expected")
@@ -738,7 +747,8 @@ func TestAttachEphemeralDisk_NextFreeSlot(t *testing.T) {
 }
 
 // TestAttachEphemeralDisk_CreateFail_NoOrphan verifies that when CreateVolume
-// fails, no DeleteVolumeAsync call is made (nothing was created to clean up).
+// fails and the committed-volume probe answers false, no DeleteVolumeAsync
+// call is made (nothing was created to clean up).
 func TestAttachEphemeralDisk_CreateFail_NoOrphan(t *testing.T) {
 	t.Parallel()
 

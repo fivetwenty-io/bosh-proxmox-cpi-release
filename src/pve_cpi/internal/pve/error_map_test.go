@@ -3,9 +3,14 @@ package pve_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
@@ -1443,5 +1448,77 @@ func TestWrapMutationError(t *testing.T) {
 				t.Errorf("retriable = %v, want %v (err: %v)", !tc.retriable, tc.retriable, got)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsTransportConnectionDrop
+// ---------------------------------------------------------------------------
+
+// sdkUploadEOFError reproduces the exact chain the SDK surfaces when pveproxy
+// drops a connection mid-request: url.Error(io.EOF) wrapped by the transport
+// retry loop's "request failed after N attempt(s)" and the upload path's two
+// prose layers, every layer with %w.
+func sdkUploadEOFError(inner error) error {
+	uerr := &url.Error{
+		Op:  "Post",
+		URL: "https://pve01.example.io:8006/api2/json/nodes/pve01/storage/local/upload",
+		Err: inner,
+	}
+	wrapped := fmt.Errorf("request failed after 1 attempt(s): %w", uerr)
+	wrapped = fmt.Errorf("HTTP upload to %q failed for file %q: %w",
+		"/nodes/pve01/storage/local/upload", "vm-2706-config.iso", wrapped)
+	return fmt.Errorf("failed to upload file %q to path %q: %w",
+		"vm-2706-config.iso", "/nodes/pve01/storage/local/upload", wrapped)
+}
+
+func TestIsTransportConnectionDrop(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"eof mid-request", sdkUploadEOFError(io.EOF), true},
+		{"unexpected eof", sdkUploadEOFError(io.ErrUnexpectedEOF), true},
+		{"connection reset", sdkUploadEOFError(&net.OpError{
+			Op: "write", Net: "tcp",
+			Err: &os.SyscallError{Syscall: "write", Err: syscall.ECONNRESET},
+		}), true},
+		{"broken pipe", sdkUploadEOFError(&net.OpError{
+			Op: "write", Net: "tcp",
+			Err: &os.SyscallError{Syscall: "write", Err: syscall.EPIPE},
+		}), true},
+		{"api 500 is not a drop", makeAPIErr(500, "internal error"), false},
+		{"api 404 is not a drop", makeAPIErr(404, "not found"), false},
+		{"plain prose is not a drop", errors.New("volume does not exist"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pve.IsTransportConnectionDrop(tc.err); got != tc.want {
+				t.Errorf("IsTransportConnectionDrop = %v, want %v (err: %v)", got, tc.want, tc.err)
+			}
+		})
+	}
+}
+
+// TestIsTransientTransport_ConnectionDrop pins the classification behind the
+// live failure: a CF deploy's configdrive upload died with a mid-request EOF
+// and surfaced as a non-retriable CloudError because the transient classifier
+// only modeled dial failures and timeouts, not drops after the connection was
+// established.
+func TestIsTransientTransport_ConnectionDrop(t *testing.T) {
+	t.Parallel()
+	if !pve.IsTransientTransport(sdkUploadEOFError(io.EOF)) {
+		t.Error("mid-request EOF must be transient")
+	}
+}
+
+func TestWrapError_ConnectionDropRetriable(t *testing.T) {
+	t.Parallel()
+	got := pve.WrapError(sdkUploadEOFError(io.EOF))
+	if !cpiErrIsRetriable(t, got) {
+		t.Errorf("mid-request EOF must map to a retriable error, got: %v", got)
 	}
 }
