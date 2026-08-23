@@ -206,7 +206,7 @@ Every PVE call that returns a UPID is awaited via `AwaitTask` before the handler
 
 ## Error Mapping
 
-Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as a non-retriable `CloudError` and HTTP 5xx and network timeouts as `RetriableCloudError`. A 404 returns a non-retriable `CloudError` that callers upgrade: `WrapNotFoundVM` and `WrapNotFoundDisk` convert it to `VMNotFound` or `DiskNotFound` at the call site, where the resource type is known. The dispatcher serializes the resulting error's `Type()`, `Error()`, and `OkToRetry()` into the JSON-RPC error envelope; the director uses `OkToRetry` to decide whether to re-drive the call.
+Every SDK error flows through `internal/pve.WrapError`, which classifies HTTP 4xx as a non-retriable `CloudError` and HTTP 5xx and network timeouts as `RetriableCloudError`. A 404 returns a non-retriable `CloudError` that callers upgrade: `WrapNotFoundVM` and `WrapNotFoundDisk` convert it to `VMNotFound` or `DiskNotFound` at the call site, where the resource type is known. The dispatcher serializes the resulting error into the JSON-RPC error envelope, translating the internal taxonomy to the classes the director's allow-list recognizes: a retriable error escaping `create_vm` crosses the wire as `VMCreationFailed` with `ok_to_retry: true`, which the director's create step retries up to `max_vm_create_tries`, while retriable errors from every other method cross as `CloudError` with the flag preserved, since no other method has a director-side retry loop. `RetriableCloudError` itself never crosses the wire: the director knows it only as an abstract base class and rejects it as an unknown CPI error.
 
 ## Stemcell Model
 

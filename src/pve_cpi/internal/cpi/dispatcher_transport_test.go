@@ -20,7 +20,10 @@ import (
 // reach dispatchError today; this is defense in depth for the path that a
 // future handler regression would take. A raw *url.Error carrying io.EOF (a
 // mid-request connection drop) must surface with ok_to_retry=true, not as the
-// permanent generic CloudError the fallback used to mint.
+// permanent generic CloudError the fallback used to mint. The wire type is
+// CloudError, not RetriableCloudError: the Director's known-error list has no
+// RetriableCloudError entry, and for a method without a Director-side retry
+// loop CloudError plus the flag is the closest legal encoding.
 func TestDispatchError_RawTransientTransportIsRetriable(t *testing.T) {
 	t.Parallel()
 
@@ -40,8 +43,35 @@ func TestDispatchError_RawTransientTransportIsRetriable(t *testing.T) {
 		t.Errorf("raw transient transport error surfaced with ok_to_retry=false: %+v", resp.Error)
 	}
 
-	if resp.Error.Type != string(cpierrors.TypeRetriableCloud) {
-		t.Errorf("error type = %q, want %q", resp.Error.Type, string(cpierrors.TypeRetriableCloud))
+	if resp.Error.Type != string(cpierrors.TypeCloud) {
+		t.Errorf("error type = %q, want %q", resp.Error.Type, string(cpierrors.TypeCloud))
+	}
+}
+
+// TestDispatchError_RawTransientTransportOnCreateVM pins the create_vm arm of
+// the same fallback: the one method the Director retries needs the
+// VMCreationFailed wire type for ok_to_retry to reach its create step.
+func TestDispatchError_RawTransientTransportOnCreateVM(t *testing.T) {
+	t.Parallel()
+
+	d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithTransientClassifier(pve.IsTransientTransport))
+	rawDrop := &url.Error{Op: "Post", URL: "https://pve:8006/api2/json/nodes", Err: io.EOF}
+	mustRegister(t, d, "create_vm", cpi.HandlerFunc(
+		func(_ context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+			return nil, rawDrop
+		}))
+
+	resp := d.Handle(context.Background(), makeReq("create_vm"))
+	if resp == nil || resp.Error == nil {
+		t.Fatal("expected an error response")
+	}
+
+	if !resp.Error.OkToRetry {
+		t.Errorf("raw transient transport error surfaced with ok_to_retry=false: %+v", resp.Error)
+	}
+
+	if resp.Error.Type != string(cpierrors.TypeVMCreationFailed) {
+		t.Errorf("error type = %q, want %q", resp.Error.Type, string(cpierrors.TypeVMCreationFailed))
 	}
 }
 

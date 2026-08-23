@@ -54,6 +54,22 @@ const (
 	// TypeStemcellInvalidTar signals that the stemcell tarball contained a
 	// malformed tar header (e.g., negative declared size); not retriable.
 	TypeStemcellInvalidTar Type = "Bosh::Clouds::StemcellInvalidTar"
+
+	// TypeVMCreationFailed is the Director's retriable create_vm failure class.
+	// Wire-only: the dispatch boundary mints it when a retriable error escapes
+	// create_vm, because the Director's create step retries on this class (up
+	// to max_vm_create_tries) but treats TypeRetriableCloud, an abstract base
+	// class on the Director side, as an unknown CPI error. Handlers keep
+	// returning Retriable(); no constructor exists for this type.
+	TypeVMCreationFailed Type = "Bosh::Clouds::VMCreationFailed"
+
+	// TypeDiskNotAttached is the Director's name for a disk operation on a
+	// disk that is not attached to the VM. Wire-only: the dispatch boundary
+	// translates TypeDetachedDisk to it, because TypeDetachedDisk is not in
+	// the Director's known-error list and would surface as an unknown CPI
+	// error. Handlers keep returning DetachedDisk(); no constructor exists
+	// for this type.
+	TypeDiskNotAttached Type = "Bosh::Clouds::DiskNotAttached"
 )
 
 // Error is the unified BOSH CPI error value. All constructors return *Error.

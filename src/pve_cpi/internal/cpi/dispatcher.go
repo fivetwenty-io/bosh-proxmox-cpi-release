@@ -346,7 +346,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 		// metric's outcome vocabulary is success/error/marshal_error only;
 		// the "timeout" string is a dispatch-log-only distinction.
 		d.recordDuration(ctx, req.Method, "error", durationMS)
-		return d.dispatchError(cpierrors.Retriable(
+		return d.dispatchError(req.Method, cpierrors.Retriable(
 			"operation %s exceeded its %s deadline [request_id=%s]; aborted and may be retried",
 			req.Method, budget, requestID))
 	}
@@ -360,7 +360,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 			log.ErrScrubbed(err),
 		)...)
 		d.recordDuration(ctx, req.Method, outcome, durationMS)
-		return d.dispatchError(err)
+		return d.dispatchError(req.Method, err)
 	}
 
 	// Marshal result before returning so a non-serialisable value becomes
@@ -551,24 +551,22 @@ func (d *Dispatcher) recordDuration(ctx context.Context, method, outcome string,
 }
 
 // dispatchError converts any error returned by a handler to a *jsonrpc.Response.
-// *cpierrors.Error values are mapped faithfully; plain errors become CloudError.
+// *cpierrors.Error values keep their type through wireErrorBody's translation;
+// plain errors become CloudError. method is the JSON-RPC method the error came
+// from, which wireErrorBody needs to pick the Director's retriable class.
 //
 // The message is scrubbed at this choke point — the single funnel every
 // handler error passes through — because the Director persists it in its
 // task/event records: an error embedding a presigned or userinfo-bearing URL
 // (a failed stemcell fetch, for example) must not reach that sink verbatim.
 // This mirrors what endRootSpanErr already does for the trace exporter.
-func (d *Dispatcher) dispatchError(err error) *jsonrpc.Response {
+func (d *Dispatcher) dispatchError(method string, err error) *jsonrpc.Response {
 	var cpiErr *cpierrors.Error
 	if errors.As(err, &cpiErr) {
 		return &jsonrpc.Response{
 			Result: nil,
-			Error: &jsonrpc.ErrorBody{
-				Type:      string(cpiErr.Type()),
-				Message:   log.ScrubMessage(cpiErr.Error()),
-				OkToRetry: cpiErr.OkToRetry(),
-			},
-			Log: "",
+			Error:  wireErrorBody(method, cpiErr),
+			Log:    "",
 		}
 	}
 	// Last-resort transport classification: no live handler path lets a raw
@@ -576,24 +574,73 @@ func (d *Dispatcher) dispatchError(err error) *jsonrpc.Response {
 	// regression must not convert a transient fault (a dropped connection, a
 	// cycling pveproxy) into a permanent failure the Director will not retry.
 	if d.transientClassifier != nil && d.transientClassifier(err) {
-		return errorResponse(cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"transient transport fault: "+err.Error()))
+		return &jsonrpc.Response{
+			Result: nil,
+			Error: wireErrorBody(method, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				"transient transport fault: "+err.Error())),
+			Log: "",
+		}
 	}
 	// Plain error — wrap as generic CloudError, not retriable.
 	return errorResponse(cpierrors.Cloud("%s", err.Error()))
 }
 
-// errorResponse builds a *jsonrpc.Response from a *cpierrors.Error. The
-// message is scrubbed for the same reason dispatchError scrubs — see there.
+// wireErrorBody builds the JSON-RPC error body for e, translating the CPI's
+// internal error taxonomy into the class names the Director recognizes. The
+// Director resolves the wire type against a fixed allow-list (KNOWN_ERRORS in
+// bosh-director's clouds/external_cpi.rb) and raises "Unknown CPI error" for
+// any other string, discarding ok_to_retry with it, so an internal type that
+// crossed the wire unmapped would turn a retriable fault into a hard
+// deployment failure.
+//
+//   - TypeRetriableCloud is the internal retry marker. The Director knows
+//     RetriableCloudError only as an abstract base class, never as a wire
+//     type. For create_vm the subclass its create step acts on is
+//     VMCreationFailed: with ok_to_retry set, the Director re-invokes
+//     create_vm with identical arguments up to max_vm_create_tries. No other
+//     method has a Director-side retry loop, so every other method maps to
+//     CloudError with the ok_to_retry flag carried through unchanged.
+//   - TypeDetachedDisk names the condition the Director calls
+//     DiskNotAttached.
+//   - The stemcell validation types and SnapshotBlocked are internal
+//     diagnostics; on the wire they are ordinary non-retriable CloudErrors.
+//
+// The message is scrubbed here for the reason given on dispatchError.
+func wireErrorBody(method string, e *cpierrors.Error) *jsonrpc.ErrorBody {
+	typ := e.Type()
+	switch typ {
+	case cpierrors.TypeRetriableCloud:
+		if method == "create_vm" {
+			typ = cpierrors.TypeVMCreationFailed
+		} else {
+			typ = cpierrors.TypeCloud
+		}
+	case cpierrors.TypeDetachedDisk:
+		typ = cpierrors.TypeDiskNotAttached
+	case cpierrors.TypeSnapshotBlocked,
+		cpierrors.TypeStemcellExtractCap,
+		cpierrors.TypeStemcellMagicMismatch,
+		cpierrors.TypeStemcellNoCandidate,
+		cpierrors.TypeStemcellEscapedRoot,
+		cpierrors.TypeStemcellInvalidTar:
+		typ = cpierrors.TypeCloud
+	}
+	return &jsonrpc.ErrorBody{
+		Type:      string(typ),
+		Message:   log.ScrubMessage(e.Error()),
+		OkToRetry: e.OkToRetry(),
+	}
+}
+
+// errorResponse builds a *jsonrpc.Response from a *cpierrors.Error for the
+// dispatcher's own pre-handler failures (nil request, unknown method, result
+// marshal, panic recovery). Those are all minted as CloudError, which
+// wireErrorBody passes through untouched, so no method context is needed.
 func errorResponse(e *cpierrors.Error) *jsonrpc.Response {
 	return &jsonrpc.Response{
 		Result: nil,
-		Error: &jsonrpc.ErrorBody{
-			Type:      string(e.Type()),
-			Message:   log.ScrubMessage(e.Error()),
-			OkToRetry: e.OkToRetry(),
-		},
-		Log: "",
+		Error:  wireErrorBody("", e),
+		Log:    "",
 	}
 }
 

@@ -4,11 +4,13 @@ This is a symptom-first triage runbook. Start from the failure you see, follow t
 
 ## Reading CPI errors
 
-The CPI surfaces two error types in BOSH task output:
+The CPI surfaces three error shapes in BOSH task output:
 
 - **`Bosh::Clouds::CloudError`** (`ok_to_retry: false`) — terminal failure; the Director will not retry. Operator action required.
 
-- **`Bosh::Clouds::RetriableCloudError`** (`ok_to_retry: true`) — transient fault. The director auto-retries the CPI call. If it exhausts retries, the error escalates to the task log as a permanent failure.
+- **`Bosh::Clouds::VMCreationFailed`** (`ok_to_retry: true`): transient `create_vm` failure. The Director retries the create with identical arguments, up to its `max_vm_create_tries` budget (default 5). If those retries also exhaust, the error escalates to the task log as a permanent failure.
+
+- **`Bosh::Clouds::CloudError`** (`ok_to_retry: true`): transient fault from a method the Director has no retry loop for. The CPI already exhausted its internal retry budget before surfacing it; retrying the deploy usually succeeds once the underlying fault clears.
 
 Errors appear in the BOSH task debug log. To view them:
 
@@ -917,7 +919,7 @@ command '/sbin/lvs ...' failed: got timeout
 
 **Behavior**
 
-The CPI retries up to 10 times with exponential backoff starting at 2 seconds, capped at 30 seconds, with ±30% jitter. If all 10 attempts fail, the operation surfaces as a `RetriableCloudError` and the director re-queues it.
+The CPI retries up to 10 times with exponential backoff starting at 2 seconds, capped at 30 seconds, with ±30% jitter. If all 10 attempts fail, the operation surfaces as a retriable error: from `create_vm` it arrives as `Bosh::Clouds::VMCreationFailed` and the director retries the create itself; from other methods it arrives as `Bosh::Clouds::CloudError` with `ok_to_retry: true`, marking the fault transient for the operator.
 
 **Operator action needed only if**
 
@@ -985,7 +987,7 @@ Look at the `Quorate` line (`Yes`/`No`) and the `Votequorum information` block: 
 
 **Behavior**
 
-The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Because quorum loss is a minutes-scale condition — waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup — the CPI retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a `RetriableCloudError` and the BOSH Director's own re-drive logic takes over on the next deploy or task retry.
+The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Because quorum loss is a minutes-scale condition — waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup — the CPI retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a retriable failure (`Bosh::Clouds::VMCreationFailed` from `create_vm`, `Bosh::Clouds::CloudError` with `ok_to_retry: true` elsewhere) and recovery happens on the next deploy or task retry.
 
 **Fix**
 
@@ -1046,5 +1048,6 @@ Use these patterns to distinguish normal retry noise from actionable failures.
 |---|---|---|
 | `pve: storage lock timeout, retrying op=<op> attempt=N max_attempts=10` | Storage lock contention, CPI is retrying | Watch trend; if `attempt` > 5 routinely, split storages or throttle deploys |
 | `pve: transient transport fault, retrying` | `pvedaemon` worker recycled mid-request | If frequent, raise `MAX_WORKERS`; see [PVE Host Tuning](pve-host-tuning.md) |
-| `"type":"Bosh::Clouds::RetriableCloudError"` | Transient fault, director will auto-retry | No action unless retries routinely exhaust |
+| `"type":"Bosh::Clouds::VMCreationFailed","ok_to_retry":true` | Transient `create_vm` failure, director retries the create | No action unless retries routinely exhaust |
+| `"type":"Bosh::Clouds::CloudError","ok_to_retry":true` | Transient fault from a method the director does not retry | Retry the deploy; investigate if frequent |
 | `"type":"Bosh::Clouds::CloudError","ok_to_retry":false` | Terminal failure, operator action required | Read the `message` field and consult the relevant section above |

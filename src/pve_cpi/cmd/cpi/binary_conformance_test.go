@@ -81,8 +81,12 @@ func parseSingleEnvelope(t *testing.T, stdout string) jsonrpc.Response {
 // TestBinary_DeadEndpoint_MethodClasses drives one method from each CPI
 // method class against a refused endpoint and asserts the wire contract:
 // exit 0, a single envelope, a null result, and a retriable transport error
-// (connection refusal is transient by classification — WrapError maps SDK
-// ConnectionError to Bosh::Clouds::RetriableCloudError with ok_to_retry).
+// with ok_to_retry set. The wire type is method-dependent: create_vm carries
+// Bosh::Clouds::VMCreationFailed, the class the Director's create step
+// retries on, while methods without a Director-side retry loop carry
+// Bosh::Clouds::CloudError. Both are on the Director's known-error list;
+// the internal RetriableCloudError type never crosses the wire because the
+// Director would reject it as an unknown CPI error and drop ok_to_retry.
 func TestBinary_DeadEndpoint_MethodClasses(t *testing.T) {
 	port := closedPort(t)
 	cfgFile := deadEndpointConfig(t, port)
@@ -93,13 +97,15 @@ func TestBinary_DeadEndpoint_MethodClasses(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		req  string
+		name     string
+		req      string
+		wantType string
 	}{
-		{"query_has_vm", `{"method":"has_vm","arguments":["100"],"context":{"request_id":"cf-1"},"api_version":2}`},
-		{"delete_delete_vm", `{"method":"delete_vm","arguments":["100"],"context":{"request_id":"cf-2"},"api_version":2}`},
-		{"create_create_disk", `{"method":"create_disk","arguments":[1024,{}],"context":{"request_id":"cf-3"},"api_version":2}`},
-		{"attach_attach_disk", fmt.Sprintf(`{"method":"attach_disk","arguments":["100",%q],"context":{"request_id":"cf-4"},"api_version":2}`, encodedDiskCID)},
+		{"query_has_vm", `{"method":"has_vm","arguments":["100"],"context":{"request_id":"cf-1"},"api_version":2}`, "Bosh::Clouds::CloudError"},
+		{"delete_delete_vm", `{"method":"delete_vm","arguments":["100"],"context":{"request_id":"cf-2"},"api_version":2}`, "Bosh::Clouds::CloudError"},
+		{"create_create_disk", `{"method":"create_disk","arguments":[1024,{}],"context":{"request_id":"cf-3"},"api_version":2}`, "Bosh::Clouds::CloudError"},
+		{"attach_attach_disk", fmt.Sprintf(`{"method":"attach_disk","arguments":["100",%q],"context":{"request_id":"cf-4"},"api_version":2}`, encodedDiskCID), "Bosh::Clouds::CloudError"},
+		{"create_create_vm", `{"method":"create_vm","arguments":["agent-1",":heavy:local:import/bosh-stemcell.qcow2",{},{"net":{"type":"dynamic"}},[],{}],"context":{"request_id":"cf-5"},"api_version":2}`, "Bosh::Clouds::VMCreationFailed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,8 +123,8 @@ func TestBinary_DeadEndpoint_MethodClasses(t *testing.T) {
 			if resp.Result != nil {
 				t.Errorf("result must be null alongside an error, got %v", resp.Result)
 			}
-			if resp.Error.Type != "Bosh::Clouds::RetriableCloudError" {
-				t.Errorf("error type = %q; want Bosh::Clouds::RetriableCloudError (refused dial is transient)", resp.Error.Type)
+			if resp.Error.Type != tc.wantType {
+				t.Errorf("error type = %q; want %q (refused dial is transient)", resp.Error.Type, tc.wantType)
 			}
 			if !resp.Error.OkToRetry {
 				t.Error("ok_to_retry = false; want true for a transport-layer fault")

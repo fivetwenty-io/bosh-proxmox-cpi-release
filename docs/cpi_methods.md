@@ -128,7 +128,7 @@ From the Director's perspective a running VM has no lifecycle dependency on the 
 
 **Errors:**
 
-- `Bosh::Clouds::CloudError` (or `Bosh::Clouds::RetriableCloudError` for transient PVE faults) if VM creation fails; the CPI rolls back partial resources before returning
+- `Bosh::Clouds::CloudError` (or `Bosh::Clouds::VMCreationFailed` with `ok_to_retry: true` for transient PVE faults, which the Director's create step retries) if VM creation fails; the CPI rolls back partial resources before returning
 - `Bosh::Clouds::CloudError` on PVE API failure
 
 **Notes:** Creates a VM from a stemcell CID. `pve.stemcell_strategy` (default `template`; per-VM override `cloud_properties.stemcell_strategy`) selects how the root disk is materialized:

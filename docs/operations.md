@@ -78,7 +78,7 @@ Error response:
 {"result":null,"error":{"type":"Bosh::Clouds::CloudError","message":"...","ok_to_retry":false},"log":""}
 ```
 
-The `ok_to_retry` field tells the Director whether to re-queue the entire CPI call. `RetriableCloudError` sets it `true`; `CloudError` sets it `false`. Storage-lock timeouts and transient transport faults surface as retriable errors. Permission failures (HTTP 403), snapshot guard rejections, and VMID exhaustion are terminal.
+The `ok_to_retry` field tells the Director whether the call may be re-driven with identical arguments. Storage-lock timeouts and transient transport faults surface with it set; permission failures (HTTP 403), snapshot guard rejections, and VMID exhaustion are terminal. The Director acts on the flag for `create_vm` only, where a transient failure arrives as `Bosh::Clouds::VMCreationFailed` and the create step retries up to its `max_vm_create_tries` budget (default 5). Transient failures from every other method arrive as `Bosh::Clouds::CloudError` with the flag attached for operator visibility, because the Director has no retry loop for those methods.
 
 ### Log level
 
@@ -456,7 +456,8 @@ Watch these patterns in `/var/vcap/sys/log/bosh/cpi/pve.log`:
 |---|---|---|
 | `pve: storage lock timeout, retrying ... attempt=N` | Normal if N < 5 | If N > 5 routinely, split storages or throttle the director |
 | `pve: transient transport fault, retrying` | Normal pvedaemon worker cycle | If frequent, raise MAX_WORKERS |
-| `"type":"Bosh::Clouds::RetriableCloudError"` | Director will auto-retry | Monitor frequency |
+| `"type":"Bosh::Clouds::VMCreationFailed","ok_to_retry":true` | Transient `create_vm` failure; the Director retries the create | Monitor frequency |
+| `"type":"Bosh::Clouds::CloudError","ok_to_retry":true` | Transient fault from a method the Director does not retry | Retry the deploy; investigate if frequent |
 | `"type":"Bosh::Clouds::CloudError","ok_to_retry":false` | Terminal — operator action needed | See [Troubleshooting](troubleshooting.md) |
 
 Storage-lock retries use exponential backoff: 2 s × 1.5^n with ±30% jitter, capped at 30 s, for up to 10 attempts. Transient transport retries use 1 s × 1.5^n capped at 15 s for up to 8 attempts. See [PVE Storage Locking](pve-storage-locking.md) and [PVE Host Tuning](pve-host-tuning.md) for structural remediation.
