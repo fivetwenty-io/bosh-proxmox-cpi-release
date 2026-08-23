@@ -1967,6 +1967,20 @@ func stemcellQcow2MissingError(
 			continue
 		}
 		if otherVolid != "" {
+			// Under an explicit import strategy the cache template is
+			// irrelevant and no retry can help: import always reads from the
+			// VM's own node, and the qcow2 permanently lives elsewhere. Only
+			// the template strategy's fallback has a self-healing cause
+			// (cluster-index lag hiding a live template) worth retrying.
+			if resolveStemcellStrategy(deps.Config, parsed) == config.StemcellStrategyImport {
+				return cpierrors.Cloud(
+					"create_vm: stemcell qcow2 %s:%s exists only on node %q's node-local storage and cannot be"+
+						" imported from node %q; stemcell_strategy=import always reads from the VM's own node, so"+
+						" drop the import override (letting the cache template serve this node via cross-node"+
+						" clone) or pin the VM to node %q",
+					parsed.stemcellStorage, parsed.stemcellVolPath, n, node, n,
+				)
+			}
 			return cpierrors.Retriable(
 				"create_vm: stemcell qcow2 %s:%s exists only on node %q's node-local storage and cannot be"+
 					" imported from node %q; the stemcell cache template that normally serves this node via"+

@@ -2052,7 +2052,9 @@ func handleLightStemcellPreUploaded(
 	if existing == "" {
 		return nil, cpierrors.Cloud(
 			"create_stemcell: light stemcell image_id %q not found on storage %q node %q — "+
-				"operator must upload via pvesm or PVE Upload API before referencing",
+				"operator must upload via pvesm or PVE Upload API before referencing"+
+				" (if the file lives on another node's copy of a node-local pool,"+
+				" set cloud_properties.node to point the lookup at that node)",
 			imageID, storage, node)
 	}
 

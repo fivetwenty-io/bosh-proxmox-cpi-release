@@ -393,6 +393,38 @@ func TestStemcellQcow2MissingError_NodeLocalStaging_FoundElsewhere(t *testing.T)
 	}
 }
 
+// TestStemcellQcow2MissingError_ImportOverride_NonRetriable: under an
+// explicit stemcell_strategy=import override the cache template cannot help
+// and no retry heals anything; the error must be non-retriable and name the
+// real remedies (drop the override, or pin the VM to the staging node).
+func TestStemcellQcow2MissingError_ImportOverride_NonRetriable(t *testing.T) {
+	t.Parallel()
+	deps := sstDeps(sstConfig(), sstEntries("rbd", true))
+	client := deps.PVE.(*wbMockClient)
+	client.clusterSvc.(*wbMockCluster).listConfigNodesFn = sstNamedClusterFn("pve01", "pve02", "pve03")
+	client.nodesSvc = &countingNodesService{
+		listStorageContentFn: sstContentFn("pve02", "local:import/sc-abcd1234.qcow2"),
+	}
+	parsed := &createVMParsedArgs{
+		stemcellStorage:  "local",
+		stemcellVolPath:  "import/sc-abcd1234.qcow2",
+		stemcellFilename: "sc-abcd1234.qcow2",
+		cloudProps:       createVMCloudProps{StemcellStrategy: config.StemcellStrategyImport},
+	}
+
+	err := stemcellQcow2MissingError(context.Background(), deps, log.NewNopLogger(), "pve01", parsed)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "drop the import override") {
+		t.Errorf("expected the import-override remedy, got: %v", err)
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) || cpiErr.OkToRetry() {
+		t.Errorf("expected a non-retriable error under the import override, got: %#v", err)
+	}
+}
+
 // TestStemcellQcow2MissingError_NotFoundAnywhere_Generic: when the qcow2 is
 // genuinely gone from every node, the generic re-upload guidance stands.
 func TestStemcellQcow2MissingError_NotFoundAnywhere_Generic(t *testing.T) {
