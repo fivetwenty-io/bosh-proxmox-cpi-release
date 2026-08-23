@@ -12,11 +12,15 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-22
+
 ### Added
 
 - Single-shared-template stemcell topology. On a multi-node cluster whose `vm_storage` is shared (for example Ceph RBD), `create_stemcell` now accepts a node-local file pool for the qcow2 staging (`stemcell_storage`) under the default `template` strategy: one cache template is built, its disk lands on the shared `vm_storage`, and `create_vm` clones it to any node cross-node, so neither `stemcell_replicate_local` nor a shared file storage is required. The multi-node rejection still applies when `vm_storage` is node-local, when its shared-ness cannot be determined, or under `stemcell_strategy: import` (which reads the qcow2 from every VM's own node). A `stemcell_storage` that resolves to a block-only pool (rbd, lvm, lvmthin, zfspool) is now rejected up front with guidance to stage on a file-capable pool, instead of failing later with an opaque PVE upload error. The relaxation covers every `create_stemcell` mode the same way (tarball upload, `source_url` server-side fetch, `image_url` CPI-side fetch, and pre-uploaded `image_id`), a `stemcell_template_node` that cannot read the node-local staging pool is rejected with guidance instead of failing opaquely at template build, `delete_stemcell` sweeps stray per-node qcow2 copies that the replica list cannot name, and a `create_vm` import fallback on a node the staging pool cannot serve now returns a retriable error explaining the topology and the rebuild remedy instead of misleading re-upload guidance.
 
 ### Fixed
+
+- A lagging `/cluster/resources` index no longer hides a freshly built cache template. On a loaded cluster the index can trail a just-frozen template by minutes, and both consumers of the cluster-scoped sha-tag lookup mistook that lag for absence: `create_vm` fell through to the import fallback (which fails outright when the staging qcow2 lives on another node's local storage), and `delete_stemcell` took the no-template branch, deleting the staging qcow2 while orphaning the live template. Both now follow a cluster-index miss with authoritative `GET /nodes/<node>/qemu` probes, which read node-local guest configs and do not lag: `create_vm` probes the template's home node (`stemcell_template_node`, or the configured `node`) and clones the template it finds, and `delete_stemcell` sweeps every cluster node (create_stemcell can legitimately build on a non-default node) so the template and all its per-node replicas are found and destroyed.
 
 - The `create_vm` rollback no longer destroys an attached persistent disk. When a create failed after the persistent disk was already attached (agent configure, VM start, or a post-start check, including the node-fallback retry), the rollback purged the VM with disk destruction enabled and PVE destroyed every referenced volume, including the persistent disk a `bosh recreate` was re-attaching. The rollback now detaches foreign persistent disks to safety first, exactly as `delete_vm` does, and when that protection cannot complete it preserves and tags the VM instead of purging it — an orphaned VM is recoverable, a purged persistent volume is not. The fast-path delete's straggler sweep gained the same protection: a `bosh-deleting` VM whose foreign-disk detach failed on the original delete is now deferred to the `delete_vm` retry instead of being destroyed with the disk still attached. Both paths also treat pmxcfs's "Configuration file ... does not exist" answer as the vanished-VM condition it is, rather than refusing to proceed.
 
@@ -268,7 +272,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...v0.2.0
