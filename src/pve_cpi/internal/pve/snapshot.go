@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -93,7 +94,10 @@ func WaitForSnapshotAbsent(
 			return inner
 		})
 		if retryErr != nil {
-			return cpierrors.Wrap(retryErr,
+			// WrapConfigReadError: this is a config-scan read, and its
+			// transient shapes (a cycling pveproxy, a bare 5xx) must stay
+			// retriable through the terminal wrap.
+			return cpierrors.Wrap(WrapConfigReadError(retryErr),
 				fmt.Sprintf("WaitForSnapshotAbsent: vm %d on node %s", vmid, node))
 		}
 		present := false
@@ -107,9 +111,14 @@ func WaitForSnapshotAbsent(
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return cpierrors.Cloud(
-				"WaitForSnapshotAbsent: snapshot %q on vm %d still present after %ds",
+			// Still present after the wait budget means the asynchronous
+			// removal is still in progress server-side, not that it failed:
+			// retriable, so the Director re-enters and finds it gone rather
+			// than treating a slow storage backend as a permanent failure.
+			msg := fmt.Sprintf(
+				"WaitForSnapshotAbsent: snapshot %q on vm %d still present after %ds (removal still in progress)",
 				snapName, vmid, ao.maxWaitSeconds)
+			return cpierrors.WrapAs(errors.New(msg), cpierrors.TypeRetriableCloud, msg)
 		}
 		select {
 		case <-ctx.Done():

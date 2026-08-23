@@ -543,6 +543,7 @@ func AllocateWithRetry(
 	}
 
 	var lastVMID int
+	var lastConflictErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		vmid, err := NextVMID(ctx, c, opts...)
 		if err != nil {
@@ -551,6 +552,7 @@ func AllocateWithRetry(
 		lastVMID = vmid
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
+				lastConflictErr = createErr
 				if attempt < maxAttempts-1 {
 					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
 						return 0, cpierrors.Wrap(sleepErr, "AllocateWithRetry: context cancelled during backoff")
@@ -562,11 +564,21 @@ func AllocateWithRetry(
 			// non-retriable CloudError, turning a transient pvedaemon recycle
 			// after the retry budget into a permanent create_vm/create_disk
 			// failure the Director will not re-drive.
-			return 0, cpierrors.Wrap(WrapError(createErr), fmt.Sprintf("create VMID %d", vmid))
+			return 0, cpierrors.Wrap(WrapErrorKeepingClass(createErr), fmt.Sprintf("create VMID %d", vmid))
 		}
 		return vmid, nil
 	}
 
+	// Exhaustion keeps the last conflict as the cause so both the reason and
+	// its retriability class survive: an every-attempt conflict is contention
+	// (another allocator racing this band), which a Director re-drive with
+	// fresh VMIDs resolves, so discarding it here minted a permanent failure
+	// out of a transient condition.
+	if lastConflictErr != nil {
+		return 0, cpierrors.Wrap(WrapErrorKeepingClass(lastConflictErr), fmt.Sprintf(
+			"AllocateWithRetry: exhausted VMID allocation after %d attempts (last attempted VMID %d)",
+			maxAttempts, lastVMID))
+	}
 	return 0, cpierrors.Cloud(
 		"AllocateWithRetry: exhausted VMID allocation after %d attempts (last attempted VMID %d)",
 		maxAttempts, lastVMID,
@@ -607,6 +619,7 @@ func AllocateDiskWithRetry(
 	}
 
 	var lastVMID int
+	var lastConflictErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		vmid, err := NextDiskVMID(ctx, c, node, storage, opts...)
 		if err != nil {
@@ -615,6 +628,7 @@ func AllocateDiskWithRetry(
 		lastVMID = vmid
 		if createErr := create(vmid); createErr != nil {
 			if isConflict != nil && isConflict(createErr) {
+				lastConflictErr = createErr
 				if attempt < maxAttempts-1 {
 					if sleepErr := retryBackoff(ctx, ao, createErr, attempt); sleepErr != nil {
 						return 0, cpierrors.Wrap(sleepErr, "AllocateDiskWithRetry: context cancelled during backoff")
@@ -622,11 +636,21 @@ func AllocateDiskWithRetry(
 				}
 				continue
 			}
-			return 0, cpierrors.Wrap(createErr, fmt.Sprintf("create disk VMID %d", vmid))
+			// WrapErrorKeepingClass first, exactly like the VM twin above: a
+			// raw SDK 5xx through a bare cpierrors.Wrap became a non-retriable
+			// CloudError, turning a transient pvedaemon recycle into a
+			// permanent create_disk failure the Director will not re-drive.
+			return 0, cpierrors.Wrap(WrapErrorKeepingClass(createErr), fmt.Sprintf("create disk VMID %d", vmid))
 		}
 		return vmid, nil
 	}
 
+	// Keep the last conflict as the cause on exhaustion (see AllocateWithRetry).
+	if lastConflictErr != nil {
+		return 0, cpierrors.Wrap(WrapErrorKeepingClass(lastConflictErr), fmt.Sprintf(
+			"AllocateDiskWithRetry: exhausted disk VMID allocation after %d attempts (last attempted VMID %d)",
+			maxAttempts, lastVMID))
+	}
 	return 0, cpierrors.Cloud(
 		"AllocateDiskWithRetry: exhausted disk VMID allocation after %d attempts (last attempted VMID %d)",
 		maxAttempts, lastVMID,

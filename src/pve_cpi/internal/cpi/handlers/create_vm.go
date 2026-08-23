@@ -2079,11 +2079,15 @@ func startVMAndReadConfig(
 		startUPID, innerErr = deps.PVE.QEMU().Start(ctx, shape.node, vmid)
 		return innerErr
 	}); err != nil {
-		return nil, cpierrors.Cloud("create_vm: start vmid=%d: %s", vmid, err.Error())
+		// WrapErrorKeepingClass: the exhausted retry error is the raw last
+		// SDK error, and flattening it to a permanent Cloud made a transient
+		// start failure non-retriable for the Director.
+		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+			fmt.Sprintf("create_vm: start vmid=%d", vmid))
 	}
 
 	if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
-		return nil, cpierrors.Wrap(pve.WrapError(err),
+		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
 			fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 	}
 

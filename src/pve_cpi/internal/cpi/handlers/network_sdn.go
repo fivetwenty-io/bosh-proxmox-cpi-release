@@ -127,13 +127,16 @@ func applySDN(ctx context.Context, deps Deps, clusterSvc sdkcluster.Service, opC
 	// non-retriable CloudError — permanently failing a deploy on a condition
 	// that clears in about a second. Mirrors internal/pve/sdn.go's own
 	// UpdateSdn treatment.
-	err := pve.RetryOnTransient(ctx, deps.Log(ctx), opCtx+"_apply_sdn", 0, func() error {
+	// RetryOnTransientOrLock, not RetryOnTransient: the SDN apply serializes
+	// on cfs_lock_file('sdn') cluster-wide, so a concurrent apply surfaces as
+	// a cfs-lock timeout that belongs on the lock backoff curve.
+	err := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), opCtx+"_apply_sdn", 0, func() error {
 		var inner error
 		resp, inner = clusterSvc.UpdateSdn(ctx, nil)
 		return inner
 	})
 	if err != nil {
-		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("%s: apply SDN", opCtx))
+		return cpierrors.Wrap(pve.WrapErrorKeepingClass(err), fmt.Sprintf("%s: apply SDN", opCtx))
 	}
 	if resp == nil || len(*resp) == 0 {
 		// Nil / empty body — simple zone synchronous apply; no task to await.
@@ -169,5 +172,9 @@ func applySDN(ctx context.Context, deps Deps, clusterSvc sdkcluster.Service, opC
 		return nil
 	}
 
-	return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
+	if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx)); awaitErr != nil {
+		return cpierrors.Wrap(pve.WrapErrorKeepingClass(awaitErr),
+			fmt.Sprintf("%s: await SDN apply task", opCtx))
+	}
+	return nil
 }

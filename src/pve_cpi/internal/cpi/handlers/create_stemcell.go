@@ -918,12 +918,10 @@ func ensureTemplateVM(
 	if sha8 != "" {
 		refs, findErr := pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
 		if findErr != nil {
-			// pve.WrapError re-derives retriability from the underlying SDK
-			// error (5xx/429/connection/timeout) even though
-			// FindTemplatesBySHATagCluster's own wrap does not — without this,
-			// a transient 503 from Cluster().ListResources would surface as a
-			// non-retriable create_stemcell failure.
-			return 0, "", fmt.Errorf("ensureTemplateVM: cluster sha-tag lookup %q: %w", sha8, pve.WrapError(findErr))
+			// The lookup classifies its own failures (retry + WrapError inside
+			// listClusterQemuTemplates); re-running WrapError here would
+			// flatten that classification, so pass the chain through.
+			return 0, "", fmt.Errorf("ensureTemplateVM: cluster sha-tag lookup %q: %w", sha8, findErr)
 		}
 		for _, ref := range refs {
 			if ref.IsReplica() {
@@ -1081,19 +1079,33 @@ func ensureTemplateVM(
 		log.Int64(metadataKeyVMID, allocatedVMID),
 	)
 
-	// Step 5: Freeze the VM into a PVE template.
-	freezeUPID, freezeErr := pve.MakeTemplate(ctx, deps.PVE, templateNode, allocatedVMID)
+	// Step 5: Freeze the VM into a PVE template. qm template renames the base
+	// volumes under the storage lock, so both the submit and its task ride
+	// the lock-aware retry curve. A retry after a committed-but-dropped
+	// attempt would see PVE reject the second freeze, so the closure treats
+	// an already-frozen config as success (the goal state is reached).
+	freezeErr := pve.RetryOnTransientOrLock(ctx, logger, "create_stemcell.freeze", 0, func() error {
+		freezeUPID, mkErr := pve.MakeTemplate(ctx, deps.PVE, templateNode, allocatedVMID)
+		if mkErr != nil {
+			if templateFrozen(ctx, deps, templateNode, allocatedVMID) {
+				return nil
+			}
+			return mkErr
+		}
+		if freezeUPID == "" {
+			return nil
+		}
+		awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, freezeUPID, logger,
+			pve.WithMaxWait(pve.StemcellMaxWait))
+		if awaitErr != nil && templateFrozen(ctx, deps, templateNode, allocatedVMID) {
+			return nil
+		}
+		return awaitErr
+	})
 	if freezeErr != nil {
 		cleanupLeakedTemplateVM(ctx, deps, templateNode, allocatedVMID, logger, "freeze")
-		return 0, "", fmt.Errorf("ensureTemplateVM: freeze template vmid=%d: %w", allocatedVMID, freezeErr)
-	}
-	if freezeUPID != "" {
-		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, freezeUPID, logger,
-			pve.WithMaxWait(pve.StemcellMaxWait)); awaitErr != nil {
-			cleanupLeakedTemplateVM(ctx, deps, templateNode, allocatedVMID, logger, "await freeze")
-			return 0, "", fmt.Errorf("ensureTemplateVM: await freeze task vmid=%d upid=%s: %w",
-				allocatedVMID, freezeUPID, awaitErr)
-		}
+		return 0, "", fmt.Errorf("ensureTemplateVM: freeze template vmid=%d: %w",
+			allocatedVMID, pve.WrapErrorKeepingClass(freezeErr))
 	}
 
 	logger.Info("ensureTemplateVM: template frozen",
@@ -1313,6 +1325,32 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 // template band and a disk on vm_storage with no automated reclaim path.
 // stage names the failing step for the warn log; the original freeze error is
 // always what the caller returns, regardless of whether this cleanup succeeds.
+// templateFrozen reports whether the guest's authoritative config already
+// carries the PVE template flag. Used only to convert a replayed freeze into
+// success (the goal state is reached, whoever reached it); any read failure
+// reports false so the original freeze error surfaces instead. PVE renders
+// the flag as the JSON number 1, but tolerate the literal and string forms
+// like pveBool does.
+func templateFrozen(ctx context.Context, deps Deps, node string, vmid int64) bool {
+	if deps.PVE == nil || deps.PVE.QEMU() == nil {
+		return false
+	}
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, int(vmid))
+	if err != nil || cfg == nil {
+		return false
+	}
+	switch v := cfg["template"].(type) {
+	case bool:
+		return v
+	case float64:
+		return v == 1
+	case string:
+		return v == "1" || v == "true"
+	default:
+		return false
+	}
+}
+
 func cleanupLeakedTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, logger *log.Logger, stage string) {
 	if delErr := deleteTemplateVM(ctx, deps, node, vmid, logger); delErr != nil {
 		logger.Warn("ensureTemplateVM: failed to clean up template VM left unfrozen after "+stage+" failure (non-fatal; VM leaked)",
@@ -2297,7 +2335,12 @@ func handleLightStemcellFetch(
 	// 4. Fetch source body → local temp file + SHA-256 in flight.
 	body, contentLength, fetchErr := src.Fetch(ctx, ref, creds)
 	if fetchErr != nil {
-		return nil, cpierrors.Cloud("create_stemcell: fetch %q: %s", cp.ImageURL, fetchErr.Error())
+		// WrapErrorKeepingClass: a transient fault against the image host (a
+		// dropped connection, a timeout, a 5xx) stays retriable; a permanent
+		// verdict (404, bad URL) stays permanent. A truncation twelve lines
+		// below was already classified retriable while this was not.
+		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(fetchErr),
+			fmt.Sprintf("create_stemcell: fetch %q", cp.ImageURL))
 	}
 	defer func() { _ = body.Close() }()
 
@@ -2314,7 +2357,11 @@ func handleLightStemcellFetch(
 	h := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(tmpFile, h), body)
 	if copyErr != nil {
-		return nil, cpierrors.Cloud("create_stemcell: stream fetched body to temp file: %s", copyErr.Error())
+		// WrapErrorKeepingClass: a mid-stream drop (EOF, reset, timeout) is
+		// the same transient class as the truncation check below and must not
+		// surface permanent.
+		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(copyErr),
+			"create_stemcell: stream fetched body to temp file")
 	}
 	sha256hex := hex.EncodeToString(h.Sum(nil))
 
@@ -3120,7 +3167,12 @@ func uploadStemcellImage(
 			pve.WithMaxWait(pve.StemcellMaxWait))
 	})
 	if rerr != nil {
-		return cpierrors.Cloud("uploadStemcellImage: upload to %s/%s: %s", node, storageName, rerr.Error())
+		// WrapErrorKeepingClass: rerr is the raw last error out of the retry
+		// wrapper (or an already-classified await error); flattening it to a
+		// permanent Cloud turned an exhausted-but-transient storage fault
+		// into a failure the Director will not re-drive.
+		return cpierrors.Wrap(pve.WrapErrorKeepingClass(rerr),
+			fmt.Sprintf("uploadStemcellImage: upload to %s/%s", node, storageName))
 	}
 	return nil
 }

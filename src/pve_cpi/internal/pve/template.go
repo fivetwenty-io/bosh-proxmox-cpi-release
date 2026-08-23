@@ -145,7 +145,9 @@ func CloneQemuVM(ctx context.Context, c Client, node string, templateVMID int64,
 	vmidStr := strconv.FormatInt(templateVMID, 10)
 	raw, err := c.Nodes().CreateQemuClone(ctx, node, vmidStr, params)
 	if err != nil {
-		return "", cpierrors.Wrap(err, fmt.Sprintf("CloneQemuVM: node %s vmid %d", node, templateVMID))
+		// WrapErrorKeepingClass first: a bare cpierrors.Wrap flattened a raw
+		// SDK 5xx (a cycling pvedaemon mid-clone) to a permanent CloudError.
+		return "", cpierrors.Wrap(WrapErrorKeepingClass(err), fmt.Sprintf("CloneQemuVM: node %s vmid %d", node, templateVMID))
 	}
 
 	if raw == nil {
@@ -193,7 +195,10 @@ func MakeTemplate(ctx context.Context, c Client, node string, vmid int64) (upid 
 	// Disk=nil → convert all disks; this is the correct default for stemcell templates.
 	raw, err := c.Nodes().CreateQemuTemplate(ctx, node, vmidStr, &sdknodes.CreateQemuTemplateParams{})
 	if err != nil {
-		return "", cpierrors.Wrap(err, fmt.Sprintf("MakeTemplate: node %s vmid %d", node, vmid))
+		// WrapErrorKeepingClass first: qm template runs under the storage
+		// lock (it renames base volumes), so lock contention and transient
+		// 5xx shapes must stay retriable through this wrap.
+		return "", cpierrors.Wrap(WrapErrorKeepingClass(err), fmt.Sprintf("MakeTemplate: node %s vmid %d", node, vmid))
 	}
 
 	if raw == nil {
@@ -418,9 +423,14 @@ func FindTemplatesBySHATagNode(ctx context.Context, c Client, node, sha8 string)
 
 	shaTag := "bosh-stemcell-sha-" + sha8
 
-	resp, listErr := c.Nodes().ListQemu(ctx, node, nil)
+	var resp *sdknodes.ListQemuResponse
+	listErr := RetryOnTransient(ctx, nil, "find_templates_sha_node", 0, func() error {
+		var inner error
+		resp, inner = c.Nodes().ListQemu(ctx, node, nil)
+		return inner
+	})
 	if listErr != nil {
-		return nil, cpierrors.Wrap(listErr,
+		return nil, cpierrors.Wrap(WrapErrorKeepingClass(listErr),
 			fmt.Sprintf("FindTemplatesBySHATagNode: node %s sha8 %q", node, sha8))
 	}
 	if resp == nil || len(*resp) == 0 {
@@ -553,9 +563,18 @@ type clusterQemuResourceItem struct {
 // so no sha8- or name-keyed path can adopt, sweep, or destroy a template a
 // previous CPI generation left on the cluster. See stemcell_generation.go.
 func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
-	resp, err := c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+	// RetryOnTransient + WrapErrorKeepingClass: this and
+	// FindTemplatesBySHATagNode were the only ListResources/ListQemu call
+	// sites with neither, so a transient 503 here surfaced permanent (and
+	// some callers papered over it with their own re-wraps).
+	var resp *sdkcluster.ListResourcesResponse
+	err := RetryOnTransient(ctx, nil, label, 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
+		return inner
+	})
 	if err != nil {
-		return nil, cpierrors.Wrap(err, label)
+		return nil, cpierrors.Wrap(WrapErrorKeepingClass(err), label)
 	}
 	if resp == nil || len(*resp) == 0 {
 		return nil, nil

@@ -170,7 +170,9 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		if sha8OK {
 			refs, err = pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
 			if err != nil {
-				return nil, cpierrors.Wrap(pve.WrapError(err), "delete_stemcell: cluster template lookup")
+				// The lookup classifies its own failures now; cpierrors.Wrap
+				// preserves that class, and re-running WrapError would not.
+				return nil, cpierrors.Wrap(err, "delete_stemcell: cluster template lookup")
 			}
 		}
 

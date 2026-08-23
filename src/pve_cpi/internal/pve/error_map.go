@@ -93,6 +93,25 @@ func WrapMutationError(err error) error {
 	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE call failed: "+err.Error())
 }
 
+// WrapErrorKeepingClass classifies err like WrapError, except that an error
+// already carrying a CPI classification anywhere in its chain passes through
+// unchanged. Terminal wraps use it on errors that may come back from a retry
+// wrapper or an AwaitTask call: those are sometimes raw SDK errors (which
+// need classification) and sometimes already-classified *cpierrors.Error
+// values whose class WrapError cannot always re-derive (a retriable
+// poll-timeout, for example, carries no SDK shape and no classifier phrase,
+// so re-running WrapError on it would flatten it to permanent).
+func WrapErrorKeepingClass(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *cpierrors.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	return WrapError(err)
+}
+
 // apiHTTPCode extracts the HTTP status code from an SDK error, whichever
 // concrete type carries it. The SDK's ParseAPIError does not always return
 // *APIError: 403 dispatches to *PermissionError, 400 to *ParameterError, and

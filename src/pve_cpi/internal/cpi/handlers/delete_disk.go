@@ -238,7 +238,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 				)
 				return nil, nil
 			}
-			return nil, cpierrors.Wrap(err, "delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
+			// WrapErrorKeepingClass like every sibling delete path: a transient
+			// storage fault must not surface as a permanent delete_disk failure.
+			return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+				"delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
 		}
 
 		deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))

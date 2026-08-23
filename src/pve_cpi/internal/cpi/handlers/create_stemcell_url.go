@@ -154,10 +154,18 @@ func handleStemcellDownloadURLTracked(
 		return nil, false, cpierrors.Cloud("create_stemcell: server-download: nodes service unavailable")
 	}
 
-	resp, dlErr := deps.PVE.Nodes().CreateStorageDownloadUrl(ctx, node, storage, params)
+	// RetryOnTransientOrLock + WrapErrorKeepingClass: the download-url POST
+	// allocates in the target storage (it can collide on the storage lock),
+	// and its exhausted error was previously flattened to a permanent Cloud.
+	var resp *sdknodes.CreateStorageDownloadUrlResponse
+	dlErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell.download_url", 0, func() error {
+		var inner error
+		resp, inner = deps.PVE.Nodes().CreateStorageDownloadUrl(ctx, node, storage, params)
+		return inner
+	})
 	if dlErr != nil {
-		return nil, false, cpierrors.Cloud(
-			"create_stemcell: server-download CreateStorageDownloadUrl failed: %s", dlErr.Error())
+		return nil, false, cpierrors.Wrap(pve.WrapErrorKeepingClass(dlErr),
+			"create_stemcell: server-download CreateStorageDownloadUrl failed")
 	}
 
 	// 5. Extract UPID from response and await task.
