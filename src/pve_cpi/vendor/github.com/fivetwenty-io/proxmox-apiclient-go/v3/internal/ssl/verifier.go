@@ -21,10 +21,8 @@ var (
 // CreateTLSConfig creates a TLS configuration for a given host.
 func CreateTLSConfig(host string, options *TLSOptions) (*tls.Config, error) {
 	config := &tls.Config{
-		Rand:                                nil,
 		Time:                                nil,
 		Certificates:                        nil,
-		NameToCertificate:                   nil,
 		GetCertificate:                      nil,
 		GetClientCertificate:                nil,
 		GetConfigForClient:                  nil,
@@ -37,9 +35,7 @@ func CreateTLSConfig(host string, options *TLSOptions) (*tls.Config, error) {
 		ClientCAs:                           nil,
 		InsecureSkipVerify:                  false,
 		CipherSuites:                        nil,
-		PreferServerCipherSuites:            true,
 		SessionTicketsDisabled:              false,
-		SessionTicketKey:                    [32]byte{},
 		ClientSessionCache:                  nil,
 		UnwrapSession:                       nil,
 		WrapSession:                         nil,

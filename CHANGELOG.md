@@ -46,7 +46,9 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
-- The bundled Proxmox SDK moves to proxmox-apiclient-go v3.9.1, which preserves the HTTP status chain through login failures, retries auto-login after a failed attempt, and surfaces server-closed-idle connection races as its typed connection error.
+- The bundled Proxmox SDK moves to proxmox-apiclient-go v3.9.2, which preserves the HTTP status chain through login failures, retries auto-login after a failed attempt, surfaces server-closed-idle connection races as its typed connection error, and requires Go 1.27.
+
+- Third-party dependencies are refreshed to their latest patch releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher.
 
 - `pve.api_idle_conn_timeout_sec` now defaults to 15 seconds when unset, instead of inheriting the SDK's 90-second idle window, which outlives pveproxy's server-side keep-alive and sets up a reused-dead-connection race; explicit values pass through, and `90` restores the previous behavior.
 
