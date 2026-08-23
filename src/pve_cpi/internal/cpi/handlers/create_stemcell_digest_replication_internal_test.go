@@ -1679,3 +1679,16 @@ func (c *countingClusterService) ListStatus(context.Context) (*sdkcluster.ListSt
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (n *noopReplicationPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (c *countingNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

@@ -228,8 +228,13 @@ func MakeTemplate(ctx context.Context, c Client, node string, vmid int64) (upid 
 //
 // Pool membership writes serialize on PVE's cluster-wide cfs_lock_file
 // ('user_cfg'), so the AddVM rides RetryOnTransientOrLock: a lock timeout
-// under concurrent deploys is contention, not a verdict. logger may be nil
-// (retry attempts then go unlogged).
+// under concurrent deploys is contention, not a verdict. The full
+// storage-lock attempt budget (not the smaller cleanup-sweep budget) is
+// deliberate: a burst deploy makes every create contend on this one lock by
+// design, and giving up early would fail creates that one more backoff
+// window would have completed; the opt-in operation_timeout envelope
+// remains the operator's ceiling. logger may be nil (retry attempts then go
+// unlogged).
 //
 // Pool verdicts arrive as HTTP 500 + text, which the blanket 5xx rule in
 // IsTransientTransport would otherwise retry to exhaustion, so two verdicts
@@ -265,10 +270,30 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64, lo
 			// it arises: a replayed AddVM whose committed response was
 			// dropped (the VM is in poolID; success), and a VM another actor
 			// enrolled elsewhere (this caller's pool preference was not
-			// applied; fail loudly naming both pools). A lookup failure, an
-			// absent listing entry, or an entry without a pool keeps the
-			// replay reading: the cluster resources index can lag the
-			// user_cfg write this call just made.
+			// applied; fail loudly naming both pools). The target pool's own
+			// membership (GET /pools/{poolid}, pmxcfs-backed) is consulted
+			// first: it does not lag, so a VM another path just moved INTO
+			// poolID resolves as the success it is instead of a false
+			// permanent error read from the stale index. Only when that probe
+			// answers a definitive "not a member" does the index name the
+			// other pool; a probe or lookup failure, an absent listing entry,
+			// or an entry without a pool keeps the replay reading, because
+			// the index can lag the user_cfg write this call just made.
+			member, probeErr := c.Pools().PoolHasVM(ctx, poolID, vmid)
+			if probeErr == nil && member {
+				return nil
+			}
+			if probeErr != nil {
+				// Without the probe's answer the index verdict below would
+				// rest on stale evidence alone, so the failure reads as the
+				// replay it statistically is; the Warn keeps a systematic
+				// probe failure (a token missing Pool.Audit) visible.
+				if logger != nil {
+					logger.Warn("AssignVMToPool: pool membership probe failed; reading the verdict as a replayed AddVM without consulting the lagging index",
+						log.String("pool", poolID), log.Int64("vmid", vmid), log.Err(probeErr))
+				}
+				return nil
+			}
 			current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
 			if lookupErr == nil && found && current != "" && current != poolID {
 				return cpierrors.Cloud(
@@ -615,7 +640,26 @@ func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]cl
 	if err != nil {
 		return nil, cpierrors.Wrap(err, label)
 	}
+	return filterClusterQemuTemplates(ctx, guests), nil
+}
 
+// listClusterQemuTemplatesTolerant is listClusterQemuTemplates on the
+// offline-tolerant enumeration: members the quorate cluster reports offline
+// are excluded instead of failing the scan. Only for callers whose miss path
+// is safe by construction (the create_vm cache lookup falls open to import;
+// a missed template there costs a slower copy, never a wrong destroy).
+// Destructive consumers keep the strict form.
+func listClusterQemuTemplatesTolerant(ctx context.Context, c Client, label string) ([]clusterQemuResourceItem, error) {
+	guests, _, err := ListGuestsAuthoritativeTolerant(ctx, c, log.FromContext(ctx))
+	if err != nil {
+		return nil, cpierrors.Wrap(err, label)
+	}
+	return filterClusterQemuTemplates(ctx, guests), nil
+}
+
+// filterClusterQemuTemplates applies the shared template/generation gates to
+// an enumerated guest list; see listClusterQemuTemplates.
+func filterClusterQemuTemplates(ctx context.Context, guests []GuestRef) []clusterQemuResourceItem {
 	out := make([]clusterQemuResourceItem, 0, len(guests))
 	for _, g := range guests {
 		if !g.Template {
@@ -645,7 +689,7 @@ func listClusterQemuTemplates(ctx context.Context, c Client, label string) ([]cl
 			Template: &isTemplate,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // FindTemplatesBySHATagCluster scans the whole cluster (not a single node)
@@ -687,6 +731,37 @@ func FindTemplatesBySHATagCluster(ctx context.Context, c Client, sha8 string) ([
 		return nil, err
 	}
 
+	return matchTemplatesByTag(items, wantedTag), nil
+}
+
+// FindTemplatesBySHATagClusterTolerant is FindTemplatesBySHATagCluster on
+// the offline-tolerant enumeration (see listClusterQemuTemplatesTolerant).
+// For the create-side cache lookup only: its miss path falls open to import,
+// so a member the quorate cluster reports offline must not fail every
+// create_vm, and a template that lives only on that member could not be
+// cloned from anyway. Destructive consumers (delete_stemcell) keep the
+// strict form.
+func FindTemplatesBySHATagClusterTolerant(ctx context.Context, c Client, sha8 string) ([]TemplateRef, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagClusterTolerant: ctx must not be nil")
+	}
+	if c == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagClusterTolerant: client must not be nil")
+	}
+	if sha8 == "" {
+		return nil, nil
+	}
+	items, err := listClusterQemuTemplatesTolerant(ctx, c,
+		fmt.Sprintf("FindTemplatesBySHATagClusterTolerant: sha8 %q", sha8))
+	if err != nil {
+		return nil, err
+	}
+	return matchTemplatesByTag(items, "bosh-stemcell-sha-"+sha8), nil
+}
+
+// matchTemplatesByTag filters template rows to those carrying wantedTag as an
+// exact tag token, sorted by VMID ascending for deterministic output.
+func matchTemplatesByTag(items []clusterQemuResourceItem, wantedTag string) []TemplateRef {
 	var out []TemplateRef
 	for _, item := range items {
 		matched := false
@@ -703,7 +778,7 @@ func FindTemplatesBySHATagCluster(ctx context.Context, c Client, sha8 string) ([
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
-	return out, nil
+	return out
 }
 
 // FindTemplateByNameCluster scans the whole cluster for template VMs whose

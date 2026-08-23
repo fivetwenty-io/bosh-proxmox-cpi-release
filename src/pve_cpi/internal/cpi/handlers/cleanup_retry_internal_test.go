@@ -175,6 +175,65 @@ func TestCleanupVM_DestroyLockTimeout_RetriesAndSucceeds(t *testing.T) {
 	}
 }
 
+// TestCleanupVM_SkiplockDestroy_LockTimeout_RetriesAndSucceeds pins the
+// skiplock destroy's own retry: the primary destroy is refused by a guest
+// config lock (not retried; config locks are not in the retry union), the
+// root@pam skiplock retry then fires into the same contended storage state
+// and hits a cfs-lock timeout, and one more attempt completes the destroy.
+// Single-shot skiplock code would orphan the VM here (nothing re-drives a
+// rollback).
+func TestCleanupVM_SkiplockDestroy_LockTimeout_RetriesAndSucceeds(t *testing.T) {
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg), crhLockErr(), nil},
+	}
+	q := &lrQEMUStub{}
+	deps := Deps{Config: lrRootPamConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(crhCtx(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	if len(nodes.deleteCalls) != 3 {
+		t.Fatalf("expected 3 DeleteQemu calls (config-locked + skiplock lock-timeout + skiplock retry), got %d",
+			len(nodes.deleteCalls))
+	}
+	for i := 1; i <= 2; i++ {
+		if call := nodes.deleteCalls[i]; call.Skiplock == nil || !*call.Skiplock {
+			t.Errorf("DeleteQemu call %d must carry skiplock=true", i)
+		}
+	}
+	if nodes.updateCalls != 0 {
+		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	}
+}
+
+// TestCleanupVM_LockClearDestroy_LockTimeout_RetriesAndSucceeds is the token
+// identity analogue: no skiplock is available, so the rollback waits for the
+// config lock to clear (the stub's Config reports no lock, so the wait
+// returns immediately) and the post-lock-clear destroy must also retry
+// through a cfs-lock timeout instead of giving up on its last-chance
+// reclaim.
+func TestCleanupVM_LockClearDestroy_LockTimeout_RetriesAndSucceeds(t *testing.T) {
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg), crhLockErr(), nil},
+	}
+	q := &lrQEMUStub{}
+	deps := Deps{Config: lrTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(crhCtx(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	if len(nodes.deleteCalls) != 3 {
+		t.Fatalf("expected 3 DeleteQemu calls (config-locked + post-lock-clear lock-timeout + retry), got %d",
+			len(nodes.deleteCalls))
+	}
+	for i, call := range nodes.deleteCalls {
+		if call.Skiplock != nil && *call.Skiplock {
+			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a token identity", i)
+		}
+	}
+	if nodes.updateCalls != 0 {
+		t.Errorf("destroy succeeded after retry; the VM must not be tagged as failed (got %d tag writes)", nodes.updateCalls)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // L-F-05: deleteTemplateVM
 // ---------------------------------------------------------------------------
@@ -542,4 +601,10 @@ func TestSweepUnusedDiskSlot_PersistentLockTimeout_TransientBudget(t *testing.T)
 		t.Fatalf("sweep must run on the explicit transient budget: expected %d DetachDisk calls, got %d",
 			pve.TransientMaxAttempts(), q.detachCalls)
 	}
+}
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *crhPools) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
 }

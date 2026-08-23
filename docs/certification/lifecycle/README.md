@@ -4,11 +4,11 @@ The CPI lifecycle harness (`scripts/lifecycle`) exercises every CPI method a BOS
 
 ## Latest run
 
-**PASSED** on 2026-08-21: 4 passes run, 0 failed, in 18m14s. Full report: [runs/2026-08-21.md](runs/2026-08-21.md).
+**PASSED** on 2026-08-23: 4 passes run, 0 failed, in 15m07s. Full report: [runs/2026-08-23-162046.md](runs/2026-08-23-162046.md).
 
 | Item | Value |
 |---|---|
-| CPI release | v0.3.0-12-g17d5492-dirty |
+| CPI release | v0.4.0-16-gb195a9b-dirty |
 | Proxmox VE | 9.2.4 |
 | Stemcell | bosh-stemcell-1.364-openstack-kvm-ubuntu-noble.tgz |
 | Config | ci/integration.yml |
@@ -17,4 +17,5 @@ The CPI lifecycle harness (`scripts/lifecycle`) exercises every CPI method a BOS
 
 | Date | Result | Passes | Failed | Wall clock | Report |
 |---|---|---|---|---|---|
+| 2026-08-23 | PASSED | 4 | 0 | 15m07s | [runs/2026-08-23-162046.md](runs/2026-08-23-162046.md) |
 | 2026-08-21 | PASSED | 4 | 0 | 18m14s | [runs/2026-08-21.md](runs/2026-08-21.md) |

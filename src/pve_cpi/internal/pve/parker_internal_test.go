@@ -540,3 +540,9 @@ func TestParkerWindowBudget(t *testing.T) {
 		t.Errorf("budget(1ms) = %v, want 1s floor", got)
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (r *recordingPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

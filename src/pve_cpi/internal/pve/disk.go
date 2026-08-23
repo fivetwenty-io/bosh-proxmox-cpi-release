@@ -523,16 +523,13 @@ func ResolveDiskID(ctx context.Context, c Client, node string, vmid int, volid s
 	return diskID, nil
 }
 
-// FindVMByDiskVolid scans cluster VM resources to find the VMID + node whose
+// FindVMByDiskVolid scans every cluster guest (authoritative per-node
+// listings via ListGuestsAuthoritative, so a young holder inside the
+// /cluster/resources lag window is still found) for the VMID + node whose
 // QEMU config contains a disk entry matching volid. The volid may appear as
 // the bare value or as the prefix before comma-separated options in a disk
 // option string (e.g., "local-lvm:vm-100-disk-1" matches
 // "local-lvm:vm-100-disk-1,cache=wb").
-//
-// fallbackNode is consulted only when a cluster resource entry omits the
-// "node" field (rare in modern PVE); pass the configured default node so
-// scans still work in single-node deployments where /cluster/resources may
-// elide that field.
 //
 // Returns (vmid, node, nil) on success.
 // Returns (0, "", cpierrors.Error) when:

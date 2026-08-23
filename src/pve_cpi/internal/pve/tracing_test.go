@@ -597,3 +597,9 @@ func TestTracedPoolService_AllMethods_Traced(t *testing.T) {
 		})
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (f *fakePoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

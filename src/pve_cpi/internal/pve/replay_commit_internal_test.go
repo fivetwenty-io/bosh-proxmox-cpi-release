@@ -266,6 +266,39 @@ func TestCreateMoverVM_AdoptsOwnCommittedCreateAfterDrop(t *testing.T) {
 	}
 }
 
+// TestCreateMoverVM_FinalAttemptDropAdoptsCommittedMover covers the drop
+// landing on the FINAL retry attempt: the create commits server-side but
+// every response is dropped, so the retry budget exhausts with the drop
+// itself as the error (never a VMID conflict). The commit question is the
+// same, and the probe must adopt the committed mover instead of leaving it
+// behind as a protection=1 orphan with no reclaim path.
+func TestCreateMoverVM_FinalAttemptDropAdoptsCommittedMover(t *testing.T) {
+	t.Parallel()
+	c := newRPClient()
+	var committedVMID int
+	c.createFn = func(vmid int, params map[string]any) (string, error) {
+		if c.createCalls == 1 {
+			committedVMID = vmid
+			rpCommitVM(c, vmid, params)
+		}
+		return "", fmt.Errorf("Post \"/nodes/pve1/qemu\": %w", io.EOF)
+	}
+
+	vmid, err := createMoverVM(rpCtx(), c, log.NewNopLogger(), "pve1", dmBand())
+	if err != nil {
+		t.Fatalf("expected the exhausted-drops create to adopt the committed mover, got: %v", err)
+	}
+	if vmid != committedVMID {
+		t.Errorf("adopted VMID: want the committed mover %d, got %d", committedVMID, vmid)
+	}
+	if len(c.configs) != 1 {
+		t.Errorf("exactly one mover must exist after adoption, got %d", len(c.configs))
+	}
+	if len(c.deletedVMs) != 0 {
+		t.Errorf("adoption must never destroy anything, got destroys of %v", c.deletedVMs)
+	}
+}
+
 // TestCreateMoverVM_FirstAttemptConflictRegenerates covers the guard on the
 // adoption: a conflict with NO dropped attempt observed means another CPI won
 // the VMID race. Even when the winner's config looks exactly like an empty

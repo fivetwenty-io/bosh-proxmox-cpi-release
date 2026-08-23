@@ -209,7 +209,12 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		}
 		// Fire-and-forget: discard the UPID, no await. Purge's pool-membership
 		// interplay: see the synchronous-path DeleteQemu comment in
-		// HandleDeleteVM.
+		// HandleDeleteVM. Deliberately single-shot, unlike the other cleanup
+		// mutations: the sweep is a self-draining queue (a straggler whose
+		// destroy loses a lock race stays tagged bosh-deleting and the next
+		// fast-path delete re-issues it), so an in-place retry would only
+		// serialize the request path behind contention the queue absorbs for
+		// free.
 		_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, item.Node, vmIDStr, &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyDisks,

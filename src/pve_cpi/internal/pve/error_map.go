@@ -218,9 +218,14 @@ func WrapError(err error) error {
 	// text classifiers below, where a pushback phrase in a 4xx body silently
 	// flipped a request verdict to retriable. Every resolved status gets its
 	// verdict here, ahead of any text matching.
+	// The verdict branches below wrap with the cause chained (WrapAs, whose
+	// Error() appends the cause after a colon) rather than flattening into a
+	// fresh Cloud error: apiHTTPCode must still resolve the status on the
+	// wrapped error, because membership fallbacks branch on "resolved API
+	// verdict vs transport fault" after the wrap (ListClusterMemberNames).
 	if code, ok := apiHTTPCode(err); ok {
 		if IsNotFound(err) {
-			return cpierrors.Cloud("resource not found: %s", err.Error())
+			return cpierrors.WrapAs(err, cpierrors.TypeCloud, "resource not found")
 		}
 		// 5xx server error → retriable. The sentinel check keeps parity with
 		// shapes that carry Code but not HTTPCode.
@@ -233,7 +238,7 @@ func WrapError(err error) error {
 		}
 		// Any other 4xx (or an unresolved code on a typed API error) is a
 		// verdict about the request → non-retriable, whatever the body says.
-		return cpierrors.Cloud("PVE API error: %s", err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud, "PVE API error")
 	}
 
 	// Task-level transient signals carried as plain errors (no APIError /
@@ -564,24 +569,34 @@ func IsHotUnplugBusy(err error) bool {
 	return strings.Contains(msg, "hotplug problem") && strings.Contains(msg, "busy in guest")
 }
 
-// IsStorageLockTimeout reports whether err signals a transient PVE storage-
-// backend stall. Two shapes are covered, both surfaced inside qmtask output:
+// IsStorageLockTimeout reports whether err signals a transient PVE lock
+// stall. Despite the name, the predicate's reach is wider than per-storage
+// locks; three shapes are covered, all surfaced inside qmtask output:
 //
 //  1. per-storage lockfile timeout — many concurrent qmcreate / qm resize
 //     tasks serialise behind /var/lock/pve-manager/pve-storage-<name>; the
 //     loser dies with
 //     "can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout".
 //
-//  2. LVM tooling command timeout — `qm resize` shells out to /sbin/lvs to
+//  2. pmxcfs cfs-lock request timeout, in EVERY lock domain, not only
+//     "storage-<pool>": the same "cfs-lock '<domain>' error: got lock
+//     request timeout" phrase is emitted for user_cfg (token/ACL writes),
+//     firewall, sdn, ha, and replication config commits. All are pure
+//     serialisation contention on the cluster config filesystem and clear
+//     when the holder commits, so they deliberately share this predicate
+//     and its retry curve.
+//
+//  3. LVM tooling command timeout — `qm resize` shells out to /sbin/lvs to
 //     read the LV's current size before extending. Under heavy concurrent
 //     activity on the same VG, lvs blocks on the LVM metadata daemon and
 //     the wrapper kills it after its internal deadline, surfacing as
 //     "command '/sbin/lvs --separator ... /dev/data/vm-N-disk-0' failed:
 //     got timeout".
 //
-// Both are transient storage-backend contention and clear once the in-flight
-// holder releases — the same seconds-scale backoff is appropriate for both,
-// so they share the predicate and the retry curve.
+// All three are transient contention and clear once the in-flight holder
+// releases; the same seconds-scale backoff is appropriate for each, so they
+// share the predicate and the retry curve. Retry logs label all of them
+// reason=storage_lock; read that label as "lock contention", storage or not.
 //
 // nil → false.
 func IsStorageLockTimeout(err error) bool {
@@ -592,12 +607,14 @@ func IsStorageLockTimeout(err error) bool {
 	if strings.Contains(msg, "can't lock file") && strings.Contains(msg, "got timeout") {
 		return true
 	}
-	// The cluster-wide cfs lock on a shared storage (pmxcfs, not the local
-	// file lock above): concurrent qmclone/qmcreate/qmdestroy tasks against
-	// one shared pool (e.g. RBD during a mass VM creation) contend on it and
-	// PVE fails the task with "cfs-lock 'storage-<pool>' error: got lock
-	// request timeout". Pure contention -- retriable. Other cfs-lock errors
-	// (e.g. "no quorum!") deliberately do not match.
+	// The cluster-wide pmxcfs cfs lock (not the local file lock above). The
+	// match is domain-agnostic on purpose: "cfs-lock 'storage-<pool>' error:
+	// got lock request timeout" from concurrent qmclone/qmcreate/qmdestroy
+	// against one shared pool is the common case, but user_cfg, firewall,
+	// sdn, ha, and replication commits emit the identical phrase under the
+	// same serialisation contention. Pure contention, retriable in every
+	// domain. Other cfs-lock errors (e.g. "no quorum!") deliberately do not
+	// match.
 	if strings.Contains(msg, "cfs-lock") && strings.Contains(msg, "got lock request timeout") {
 		return true
 	}
@@ -946,6 +963,13 @@ func IsPVEPushback(err error) bool {
 	var apiErr *sdkerrors.APIError
 	if errors.As(err, &apiErr) && apiErr.HTTPCode == 429 {
 		return true
+	}
+	// A resolved non-429 4xx is a verdict about the request, not server
+	// pressure; the phrase list below includes "got timeout", which also
+	// appears in 4xx bodies, and matching it here would spend a full pushback
+	// backoff on a settled answer. Same guard as IsTransientTransport.
+	if code, ok := apiHTTPCode(err); ok && code >= 400 && code < 500 && code != 429 {
+		return false
 	}
 	// Plain-text phrase matching (task-body errors, non-APIError surfaces).
 	msg := strings.ToLower(err.Error())

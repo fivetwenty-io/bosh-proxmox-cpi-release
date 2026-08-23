@@ -462,3 +462,17 @@ func TestAdoptReplicaTemplate_DisabledTimeout_InFlight_NotAdopted(t *testing.T) 
 		t.Errorf("timeout=0 must poll exactly once (no wait loop); got %d", n.callCount())
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (f *adoptFakeNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	empty := nodes.ListNodesResponse{}
+	return &empty, nil
+}
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (f *adoptCtxFakeNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	empty := nodes.ListNodesResponse{}
+	return &empty, nil
+}

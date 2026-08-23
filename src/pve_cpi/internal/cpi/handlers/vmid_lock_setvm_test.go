@@ -283,3 +283,9 @@ func TestHandleSetVMMetadata_ExistingTagsPreservedUnderLock(t *testing.T) {
 		}
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *recordingPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

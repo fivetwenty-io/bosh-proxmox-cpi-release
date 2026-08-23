@@ -94,10 +94,11 @@ func HandleResizeDisk(deps Deps) Handler {
 
 		// ----------------------------------------------------------------
 		// 3. Locate attached VM + its current node, then resolve diskID.
-		//    FindVMByDiskVolid scans /cluster/resources so resize works in
-		//    multi-node deployments without depending on Config.Node matching
-		//    the VM's node. PVE VM config stores disk values in canonical
-		//    "<storage>:<volname>" form — the disk_cid is that form.
+		//    FindVMByDiskVolid scans authoritative per-node listings so
+		//    resize works in multi-node deployments without depending on
+		//    Config.Node matching the VM's node. PVE VM config stores disk
+		//    values in canonical "<storage>:<volname>" form — the disk_cid
+		//    is that form.
 		// ----------------------------------------------------------------
 		vmid, node, err := pve.FindVMByDiskVolid(ctx, deps.PVE, bareDiskCID)
 		if err != nil {

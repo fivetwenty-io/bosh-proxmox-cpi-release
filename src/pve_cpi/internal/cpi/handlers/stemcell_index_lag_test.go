@@ -16,6 +16,7 @@ import (
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // lagRawTemplateItem builds one raw per-node ListQemu entry in PVE's wire
@@ -157,8 +158,11 @@ func TestDeleteStemcell_ClusterIndexLag_NodeSweepProbeErrors_NoTemplateBranch(t 
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("incomplete-sweep error = %v; want retriable (the Director re-drives once PVE recovers)", err)
 	}
-	if len(probed) != 2 {
-		t.Errorf("sweep probed %v; want both enumerated nodes attempted despite errors", probed)
+	// The sha-tag lookup in step 3 reads the same authoritative per-node
+	// listings, so each node is probed once by the lookup and once again by
+	// the sweep that step 3's retriable failure falls back to.
+	if len(probed) != 4 {
+		t.Errorf("sweep probed %v; want both enumerated nodes attempted by the lookup and again by the sweep", probed)
 	}
 	if len(destroyed) != 0 {
 		t.Errorf("nothing may be destroyed on an incomplete sweep, got %v", destroyed)
@@ -166,6 +170,54 @@ func TestDeleteStemcell_ClusterIndexLag_NodeSweepProbeErrors_NoTemplateBranch(t 
 	if storageSvc.deleteVolumeIfExistsCalls != 0 {
 		t.Errorf("qcow2 delete ran %d time(s) on an incomplete sweep; the volume must be left in place",
 			storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
+// TestDeleteStemcell_ClusterLookupPermanentError_StaysFatal pins the other
+// half of the lookup's error split: only a RETRIABLE lookup failure may fall
+// back to the per-node sweep (the sweep is the same authoritative evidence,
+// re-gathered). A permanent verdict (here a 403 on every listing) is not
+// going to answer differently on a re-list, so the handler must surface it
+// unchanged: no sweep conclusion, nothing destroyed, and the qcow2 left in
+// place.
+func TestDeleteStemcell_ClusterLookupPermanentError_StaysFatal(t *testing.T) {
+	t.Parallel()
+
+	var destroyed []string
+	nodesSvc := &stemcellMockNodes{
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			return nil, sdkerrors.ParseAPIError(403, []byte(`{"message":"permission denied - missing VM.Audit"}`))
+		},
+		deleteQemuFn: func(_ context.Context, node, vmid string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			destroyed = append(destroyed, node+":"+vmid)
+			resp := sdknodes.DeleteQemuResponse(`""`)
+			return &resp, nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn:   emptyClusterResources,
+		listConfigNodesFn: lagConfigNodes(vmNode, "pve-node2"),
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{
+		nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc,
+	})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err == nil {
+		t.Fatal("a permanent lookup failure must surface, not fall through to the sweep")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("permanent-lookup error = %v; must not be reclassified retriable", err)
+	}
+	if len(destroyed) != 0 {
+		t.Errorf("nothing may be destroyed on a permanent lookup failure, got %v", destroyed)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("qcow2 delete ran %d time(s); the volume must be left in place", storageSvc.deleteVolumeIfExistsCalls)
 	}
 }
 

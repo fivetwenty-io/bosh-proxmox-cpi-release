@@ -1007,3 +1007,10 @@ func (m *icClusterService) ListStatus(context.Context) (*sdkcluster.ListStatusRe
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (s *icNodesService) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	empty := nodes.ListNodesResponse{}
+	return &empty, nil
+}

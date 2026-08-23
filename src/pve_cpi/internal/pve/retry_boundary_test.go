@@ -373,3 +373,9 @@ func TestValidateTemplateCloneStorage_ClusterNodeCount_400_IsNotRetriable(t *tes
 	_, err := pve.ValidateTemplateCloneStorage(context.Background(), deps, "local", "")
 	assertRetriable(t, err, false)
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (s *retryPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

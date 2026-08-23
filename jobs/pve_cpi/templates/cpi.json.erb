@@ -107,8 +107,10 @@
 
   # Emit PVE API transport tuning knobs only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config
-  # zero-value (0) reaches NewClient unchanged and the SDK transport default
-  # applies (byte-identical to prior releases). Mirrors the stemcell-fetch
+  # zero-value (0) reaches ApplyDefaults unchanged; for four of the five keys
+  # that means the SDK transport default applies (byte-identical to prior
+  # releases), while pve_api_idle_conn_timeout_sec is defaulted to 15 by
+  # ApplyDefaults (see the spec description). Mirrors the stemcell-fetch
   # timeout omit-when-zero pattern.
   {
     "pve_api_dial_timeout_sec"         => "pve.api_dial_timeout_sec",

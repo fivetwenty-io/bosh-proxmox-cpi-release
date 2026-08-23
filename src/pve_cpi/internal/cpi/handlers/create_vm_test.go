@@ -5049,3 +5049,10 @@ func TestCreateVM_DiskCIDs_ParkedUnparksBeforeAttach(t *testing.T) {
 		t.Error("persistent disk must never land on scsi0")
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (m *vmMockNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

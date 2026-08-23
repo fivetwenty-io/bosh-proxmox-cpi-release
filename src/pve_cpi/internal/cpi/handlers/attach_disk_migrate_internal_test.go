@@ -728,3 +728,10 @@ func TestAttachCrossNode_SharedBirthNamed_KeepsCheapPath(t *testing.T) {
 		t.Error("parker still holds the volume after the unpark")
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (n *migFakeNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

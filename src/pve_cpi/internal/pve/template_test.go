@@ -1156,3 +1156,17 @@ func (s *authFixtureCluster) ListStatus(context.Context) (*sdkcluster.ListStatus
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (s *templateNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (s *authFixtureNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

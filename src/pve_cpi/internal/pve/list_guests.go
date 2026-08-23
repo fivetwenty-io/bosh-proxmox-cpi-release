@@ -83,10 +83,11 @@ func ListGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger) 
 // fail-loud rule applies unreduced.
 //
 // Only advisory or presence-driven callers belong here: the VMID allocator's
-// union leg, the IP-conflict probes, the pve-cid inventory, the anti-affinity
-// live set (which must gate its drops on an empty excluded list), and the
-// orphan-template prune (under-enumeration only skips candidates). Absence
-// proofs use the strict ListGuestsAuthoritative.
+// union leg, the IP-conflict probes, the anti-affinity live set (which must
+// gate its drops on an empty excluded list), and the orphan-template prune
+// (under-enumeration only skips candidates). Absence proofs, and the pve-cid
+// inventory (which must surface a partial fleet rather than silently
+// under-report), use the strict ListGuestsAuthoritative.
 func ListGuestsAuthoritativeTolerant(ctx context.Context, c Client, logger *log.Logger) ([]GuestRef, []string, error) {
 	// Guard before the status consult: offlineClusterNodes dereferences the
 	// client, and both entry points must classify a nil client identically
@@ -108,13 +109,17 @@ func listGuestsAuthoritative(ctx context.Context, c Client, logger *log.Logger, 
 		return nil, nil, cpierrors.Cloud("ListGuestsAuthoritative: nodes service unavailable")
 	}
 
-	nodeNames, err := ListClusterConfigNodes(ctx, c)
+	// ListClusterMemberNames covers the never-clustered host: corosync
+	// membership answers empty (or with a resolved API error) there, and the
+	// helper falls back to GET /nodes, which names exactly the standalone
+	// host itself.
+	nodeNames, err := ListClusterMemberNames(ctx, c)
 	if err != nil {
 		return nil, nil, cpierrors.Wrap(err, "ListGuestsAuthoritative: enumerate cluster membership")
 	}
 	if len(nodeNames) == 0 {
-		// Corosync membership can never be legitimately empty on a live
-		// cluster; treat it as the enumeration failing, not as "no guests".
+		// Membership can never be legitimately empty on a live host; treat
+		// it as the enumeration failing, not as "no guests".
 		return nil, nil, cpierrors.Retriable("ListGuestsAuthoritative: cluster membership listing returned no nodes; cannot enumerate guests")
 	}
 

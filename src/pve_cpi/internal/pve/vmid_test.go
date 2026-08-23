@@ -1497,3 +1497,10 @@ func TestRetryBackoff_RespectsContextCancel(t *testing.T) {
 		t.Error("expected ctx.Err() to be non-nil after cancel")
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (s *stubNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

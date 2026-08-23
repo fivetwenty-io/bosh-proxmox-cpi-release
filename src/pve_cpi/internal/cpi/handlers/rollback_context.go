@@ -10,14 +10,24 @@ import (
 // correct — cleanup must survive the caller's cancellation or deadline — but
 // without re-imposing a deadline the SDK's 30-minute HTTP timeout multiplied
 // by retry budgets lets a single rollback hold in-flight semaphore slots and
-// Director workers for hours against an unresponsive node. Five minutes
-// covers the realistic cleanup shapes: the common case is a destroy call
-// plus a task await, but cleanupVM's foreign-disk protection can add config
-// reads, per-disk detaches, and — for stable-ID disks — a full parker
-// transfer with its own move_disk task await per disk. Exhausting the bound
-// fails closed (the purge is refused and the VM preserved), so the cost of a
-// too-small budget is unnecessary orphans, not data loss.
-const rollbackCleanupTimeout = 5 * time.Minute
+// Director workers for hours against an unresponsive node.
+//
+// Everything cleanupVM does draws on this one context, and the worst case
+// stacks: the stop call and its task await (up to the 300s AwaitTask
+// default), foreign-disk protection with config reads, per-disk detaches,
+// and — for stable-ID disks — a full parker transfer with its own move_disk
+// task await per disk, the primary destroy's retry budget
+// (rollbackDestroyMaxAttempts, ~16s of backoff), the skiplock or
+// lock-clear recovery (awaitVMConfigLockClear waits up to
+// vmLockClearMaxWait = 120s, and the follow-up skiplock or lock-clear
+// destroy carries its own rollbackDestroyMaxAttempts budget, another ~16s
+// each), the destroy's task await, then ISO removal and HA-pin removal. Ten minutes gives that
+// stack headroom in the common shapes while still bounding a dead node to
+// minutes, not hours; the pathological worst case (multiple full task
+// awaits back to back) can still exhaust it, and exhausting the bound fails
+// closed (the purge is refused, the VM preserved and tagged), so the cost
+// of a too-small budget is unnecessary orphans, not data loss.
+const rollbackCleanupTimeout = 10 * time.Minute
 
 // sdnCleanupTimeout bounds delete_network's SDN teardown, which detaches from
 // the request ctx so a cancelled caller cannot leave half-applied SDN state.

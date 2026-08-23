@@ -217,3 +217,9 @@ func TestWithVMIDLock_NilPools(t *testing.T) {
 		t.Error("fn must not run with nil pool service")
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *vmidLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

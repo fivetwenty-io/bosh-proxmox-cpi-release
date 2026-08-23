@@ -381,3 +381,9 @@ func TestDeleteVM_ReaperRefusesStemcellTemplatePool(t *testing.T) {
 		t.Errorf("DeletePool: want 0 calls for the stemcell template pool, got %v", fx.pools.deletePoolCalls)
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *reaperPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

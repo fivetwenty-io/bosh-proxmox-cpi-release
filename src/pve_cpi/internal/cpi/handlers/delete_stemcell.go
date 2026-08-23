@@ -175,9 +175,25 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		if sha8OK {
 			refs, err = pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
 			if err != nil {
-				// The lookup classifies its own failures now; cpierrors.Wrap
-				// preserves that class, and re-running WrapError would not.
-				return nil, cpierrors.Wrap(err, "delete_stemcell: cluster template lookup")
+				// A retriable failure here is a partial fleet (an unlistable
+				// member), and this leg only feeds the union that the
+				// per-node sweep below re-derives with its own tolerant
+				// anchor logic: failing hard here would make that logic
+				// unreachable whenever one node is down, wedging
+				// delete_stemcell even when the template is provably present
+				// on a reachable node. Proceed with an empty leg; the
+				// sweep's own gates still block the qcow2 delete unless
+				// absence was proven against every node.
+				if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+					// A permanent verdict (bad request, missing grant) is a
+					// settled answer, not a partial fleet; cpierrors.Wrap
+					// preserves that class, and re-running WrapError would
+					// not.
+					return nil, cpierrors.Wrap(err, "delete_stemcell: cluster template lookup")
+				}
+				logger.Warn("delete_stemcell: cluster template lookup incomplete; relying on the per-node sweep",
+					log.Err(err))
+				refs = nil
 			}
 		}
 

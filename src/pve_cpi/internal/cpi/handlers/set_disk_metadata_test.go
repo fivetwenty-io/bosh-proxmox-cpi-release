@@ -1572,3 +1572,17 @@ func (m *diskMetaClusterSvc) ListStatus(context.Context) (*sdkclusterapi.ListSta
 	empty := sdkclusterapi.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (m *diskMetaNodesMock) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (m *updateCaptureMock) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

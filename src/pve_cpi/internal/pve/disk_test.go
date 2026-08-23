@@ -1861,3 +1861,10 @@ func (f *diskFakeCluster) ListStatus(context.Context) (*cluster.ListStatusRespon
 	empty := cluster.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (s *diskFakeNodesFromCluster) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	empty := nodes.ListNodesResponse{}
+	return &empty, nil
+}

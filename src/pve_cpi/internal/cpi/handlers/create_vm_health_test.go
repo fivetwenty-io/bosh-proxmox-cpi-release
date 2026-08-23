@@ -842,3 +842,10 @@ func TestCreateVM_AgentChecksum_EmptyExpected_NoExec(t *testing.T) {
 		t.Errorf("no expected checksum: want 0 exec calls, got %d", n.execCalls)
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (h *healthNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

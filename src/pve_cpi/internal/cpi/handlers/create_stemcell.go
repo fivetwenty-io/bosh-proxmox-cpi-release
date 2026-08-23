@@ -990,9 +990,11 @@ func ensureTemplateVM(
 	if sha8 == "" {
 		refs, findErr := pve.FindTemplateByNameCluster(ctx, deps.PVE, templateName)
 		if findErr != nil {
-			// See the sha-tag lookup branch above: pve.WrapError restores
-			// retriability the inner cluster lookup's own wrap drops.
-			return 0, "", fmt.Errorf("ensureTemplateVM: cluster name lookup %q: %w", templateName, pve.WrapError(findErr))
+			// The lookup classifies its own failures (retry + WrapError inside
+			// listClusterQemuTemplates); re-running WrapError here would
+			// flatten that classification, so pass the chain through, matching
+			// the sha-tag lookup branch above.
+			return 0, "", fmt.Errorf("ensureTemplateVM: cluster name lookup %q: %w", templateName, findErr)
 		}
 		for _, primary := range refs {
 			if primary.IsReplica() {

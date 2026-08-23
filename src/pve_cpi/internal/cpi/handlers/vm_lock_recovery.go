@@ -6,8 +6,13 @@
 // identity regardless of granted privileges — including an API token owned
 // by root@pam; see pve.IsRootPamIdentity's doc comment for why). Used by
 // cleanupVM (create_vm.go rollback) and the delete_vm.go synchronous destroy
-// path — both call into these helpers so the retry behavior, logging, and
-// operator-facing recovery message stay identical across both call sites.
+// path: both call the skiplock helpers so that retry's behavior, logging,
+// and operator-facing recovery message stay identical across both call
+// sites. The bounded lock-clear wait (retryDestroyAfterLockClear) is
+// rollback-only, deliberately: a delete_vm still locked after skiplock
+// surfaces a RETRIABLE error, so the Director's own re-drive converges once
+// the lock holder finishes, while nothing ever re-drives a create_vm
+// rollback, so it must wait out the lock in-call or leak the orphan.
 package handlers
 
 import (
@@ -40,11 +45,25 @@ func retryDestroyWithSkiplock(
 	logger.Warn("destroy rejected -- VM config is locked; retrying with skiplock (root@pam)",
 		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("lock_type", lockType))
 	skiplock := true
-	return deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-		Purge:                    &purge,
-		DestroyUnreferencedDisks: &destroyUnref,
-		Skiplock:                 &skiplock,
+	// The skiplock destroy fires into the same contended storage state that
+	// just failed the primary destroy, so it must not be single-shot: one
+	// cfs-lock timeout here would permanently orphan the VM the rollback is
+	// reclaiming (nothing re-drives a rollback). Same budget and already-gone
+	// short-circuit as the primary destroy in cleanupVM.
+	var resp *sdknodes.DeleteQemuResponse
+	var delErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "vm_lock_recovery.skiplock_destroy", rollbackDestroyMaxAttempts, func() error {
+		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyUnref,
+			Skiplock:                 &skiplock,
+		})
+		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+			return nil
+		}
+		return delErr
 	})
+	return resp, delErr
 }
 
 // retryStopWithSkiplock is the Stop analogue of retryDestroyWithSkiplock. The
@@ -143,10 +162,23 @@ func retryDestroyAfterLockClear(
 	if !awaitVMConfigLockClear(ctx, deps, node, vmid, logger) {
 		return nil, origErr
 	}
-	return deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-		Purge:                    &purge,
-		DestroyUnreferencedDisks: &destroyUnref,
+	// Not single-shot: the post-lock-clear destroy is the last chance to
+	// reclaim this VM (nothing re-drives a rollback), and storage contention
+	// that outlived the lock would otherwise orphan it on one timeout. Same
+	// budget and already-gone short-circuit as the primary destroy.
+	var resp *sdknodes.DeleteQemuResponse
+	var delErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "vm_lock_recovery.lockclear_destroy", rollbackDestroyMaxAttempts, func() error {
+		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyUnref,
+		})
+		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+			return nil
+		}
+		return delErr
 	})
+	return resp, delErr
 }
 
 // awaitVMConfigLockClear polls the guest config until its lock field clears,

@@ -511,7 +511,13 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 				// was actually observed (a first-attempt conflict means
 				// another CPI won the VMID) and the probe proves the VM is an
 				// empty mover: both tags present, zero volumes referenced.
-				if IsVMIDConflict(retryErr) && sawDroppedAttempt &&
+				// The drop can also land on the FINAL attempt, in which case
+				// retryErr is the drop itself rather than a conflict; the
+				// commit question is identical, so the same probe runs and a
+				// committed mover carrying this call's nonce is adopted
+				// instead of surviving as a protected orphan.
+				if sawDroppedAttempt &&
+					(IsVMIDConflict(retryErr) || IsTransportConnectionDrop(retryErr)) &&
 					moverAdoptableAfterReplay(ctx, c, logger, node, vmid, attemptNonce) {
 					if logger != nil {
 						logger.Info("disk migrate: adopted the mover a dropped create response left behind",

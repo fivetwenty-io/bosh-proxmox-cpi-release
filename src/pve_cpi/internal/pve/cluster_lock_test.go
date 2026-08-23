@@ -520,3 +520,9 @@ func TestRelease_CommentNamesAnotherOwner_LeavesSentinel(t *testing.T) {
 		t.Error("handle should latch released")
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (f *fakeLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

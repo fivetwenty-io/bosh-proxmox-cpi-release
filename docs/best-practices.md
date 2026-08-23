@@ -450,6 +450,14 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Status.** Meets.
 
+**Idle keep-alive connections retired before pveproxy closes them.**
+
+**Best practice.** pveproxy closes idle keep-alive connections after a short server-side idle window. A client transport pool that holds idle connections much longer (the SDK default is 90 s) routinely picks one up that the server has already closed and races the close, surfacing as opaque `io.EOF` or connection-reset failures on the first call of a burst.
+
+**CPI behavior.** `pve.api_idle_conn_timeout_sec` bounds how long an idle keep-alive connection stays in the transport pool. Unset, it defaults to 15 s, which keeps connections warm across a CPI action's bursts while retiring them long before pveproxy does. Explicit values pass through unchanged; operators who want the SDK's prior behavior set `90`.
+
+**Status.** Meets.
+
 **Cross-process cluster lock.**
 
 **Best practice.** Two CPI processes (or two Directors sharing a cluster) racing the same VMID-allocation or template-build window can collide in ways a single process's own retry logic cannot see.

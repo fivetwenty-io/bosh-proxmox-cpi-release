@@ -1631,15 +1631,20 @@ func attemptStemcellTemplateClone(
 const templateCacheRecheckAttempts = 3
 
 // resolveTemplateCacheTargetSettled is resolveTemplateCacheTarget plus a
-// bounded re-check that defeats PVE's cluster-index lag.
+// bounded re-check that defeats template-visibility races.
 //
-// resolveTemplateCacheTarget reads through GET /cluster/resources, whose index
-// trails a freshly frozen template by around a second. A BOSH director issues
-// create_vm immediately after create_stemcell, so the first VM of every
-// fresh-stemcell deploy hit that window: the lookup missed a template that had
-// existed for well under a second, and the VM silently took the full-copy
-// import path instead of the CoW clone. The template was never missing —
-// re-issuing the identical create_vm moments later cloned correctly.
+// resolveTemplateCacheTarget originally read GET /cluster/resources, whose
+// index trails a freshly frozen template by around a second. A BOSH director
+// issues create_vm immediately after create_stemcell, so the first VM of
+// every fresh-stemcell deploy hit that window: the lookup missed a template
+// that had existed for well under a second, and the VM silently took the
+// full-copy import path instead of the CoW clone. The cluster-scoped lookup
+// has since moved to authoritative per-node listings (listClusterQemuTemplates
+// via ListGuestsAuthoritative), which removes the index lag itself; the
+// re-check below is retained because a template frozen mid-flight (the qm
+// template task still running when the first lookup lands) is still invisible
+// to any listing until the freeze commits, and the same settle loop covers
+// that window.
 //
 // Two independent mechanisms close it, in this order per attempt:
 //
@@ -1767,7 +1772,11 @@ func resolveTemplateCacheTarget(
 	shape *createVMShape,
 	sha8 string,
 ) (templateVMID int64, templateNode string, found bool, err error) {
-	refs, listErr := pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
+	// Tolerant enumeration: this lookup's miss path falls open to import, so
+	// a cluster member the quorate cluster reports offline must not fail (or
+	// slow) every create_vm; a template living only on that member could not
+	// be cloned from anyway.
+	refs, listErr := pve.FindTemplatesBySHATagClusterTolerant(ctx, deps.PVE, sha8)
 	if listErr != nil {
 		// Lookup failure is non-fatal: log and fall through to import-from.
 		// Do NOT fail create_vm on a read-only lookup error — the safe path

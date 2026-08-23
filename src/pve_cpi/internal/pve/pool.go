@@ -64,6 +64,13 @@ func PoolProvenance(director string) string {
 //     transient transport fault after the retry budget, ...): wrapped via
 //     WrapError and returned so callers see the correct retriable/
 //     non-retriable classification.
+//
+// The retry rides the full storage-lock attempt budget even on the
+// create_vm request path, deliberately: every pool mutation cluster-wide
+// serializes on the single pmxcfs user_cfg lock, so a burst deploy contends
+// here by design, and giving up after the smaller cleanup-sweep budget
+// would fail creates that one more backoff window would have completed. The
+// opt-in operation_timeout envelope remains the operator's ceiling.
 func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string, logger *log.Logger) error {
 	if ctx == nil {
 		return cpierrors.Cloud("EnsurePoolExists: ctx must not be nil")

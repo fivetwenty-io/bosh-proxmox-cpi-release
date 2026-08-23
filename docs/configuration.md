@@ -596,7 +596,7 @@ Fine-grained HTTP transport timeouts for the stemcell-fetch client and the PVE A
 | `pve.api_dial_timeout_sec` | Integer | `0` (SDK default) | TCP dial timeout for PVE API HTTP requests. `0` leaves the transport at the SDK default (no explicit dial timeout). |
 | `pve.api_tls_handshake_timeout_sec` | Integer | `0` (SDK default) | TLS handshake timeout for PVE API HTTPS requests. `0` leaves the transport at the SDK default. |
 | `pve.api_max_idle_conns_per_host` | Integer | `0` (SDK default) | Maximum idle (keep-alive) connections retained in the transport pool per PVE host. Higher values reduce connection-setup latency under burst load; lower values conserve file descriptors. |
-| `pve.api_idle_conn_timeout_sec` | Integer | `0` (SDK default) | How long an idle keep-alive PVE API connection remains in the pool before being closed. |
+| `pve.api_idle_conn_timeout_sec` | Integer | `0` (→ 15 s) | How long an idle keep-alive PVE API connection remains in the pool before being closed. The 15 s default retires idle connections before pveproxy closes them server-side; set `90` for the previous SDK behavior. |
 | `pve.api_tcp_keepalive_sec` | Integer | `0` (Go default) | TCP keep-alive probe interval for PVE API connections, in seconds. A positive value enables periodic TCP keep-alive probes, which helps detect silently-dropped connections on stateful firewalls. |
 
 ## IP Conflict Detection

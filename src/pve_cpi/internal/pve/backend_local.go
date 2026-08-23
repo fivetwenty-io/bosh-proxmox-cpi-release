@@ -167,10 +167,11 @@ func (l *localBackend) candidateNodes(ctx context.Context) ([]string, error) {
 	// the /cluster/resources index: the index lags cluster state, so a
 	// recently joined or briefly unindexed node would be silently skipped by
 	// the probe sweep — and an unswept node is a node whose volume this scan
-	// would wrongly conclude absent. ListClusterConfigNodes wraps the listing
-	// in RetryOnTransient and classifies its errors, so retriable transport
-	// faults propagate up as RetriableCloud once retries are exhausted.
-	nodes, listErr := ListClusterConfigNodes(ctx, l.client)
+	// would wrongly conclude absent. ListClusterMemberNames wraps the listing
+	// in RetryOnTransient, classifies its errors (retriable transport faults
+	// propagate up as RetriableCloud once retries are exhausted), and falls
+	// back to GET /nodes on a never-clustered standalone host.
+	nodes, listErr := ListClusterMemberNames(ctx, l.client)
 	if listErr != nil {
 		return nil, cpierrors.Wrap(listErr, "backend(local): list cluster nodes")
 	}

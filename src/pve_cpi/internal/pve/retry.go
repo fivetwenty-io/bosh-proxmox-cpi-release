@@ -282,6 +282,11 @@ func RetryOnTransient(
 // isQuorum before isLock only gives the log line an accurate reason label.
 // Genuine pushback (worker-pool saturation, rate limiting) still gets the
 // most conservative PushbackBackoff curve when no lock/quorum signal matched.
+//
+// The "storage_lock" reason label covers everything IsStorageLockTimeout
+// matches, which includes pmxcfs cfs-lock timeouts in every lock domain
+// (user_cfg, firewall, sdn, ha, replication), not only per-storage locks;
+// read the label as "lock contention", storage or not.
 func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Duration, reason string) {
 	switch {
 	case isQuorum:

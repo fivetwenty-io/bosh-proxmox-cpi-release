@@ -458,3 +458,9 @@ func TestCreateVM_InvalidPoolName_FailsPreCreate(t *testing.T) {
 		t.Errorf("expected no CreatePool attempt (pre-create validation failure); got %d calls", len(pools.createPoolCalls))
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *poolCallRecorder) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

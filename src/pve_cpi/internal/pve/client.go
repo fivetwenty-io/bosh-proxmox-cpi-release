@@ -3,6 +3,7 @@ package pve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -61,6 +62,13 @@ type PoolService interface {
 	// membership. Returns an error when the pool does not exist or the PVE
 	// API rejects the call.
 	MoveVMToPool(ctx context.Context, poolID string, vmid int64) error
+
+	// PoolHasVM reports whether vmid is currently a member of poolID, read
+	// from GET /pools/{poolid}: the pmxcfs-backed pool object itself, not
+	// the lagging /cluster/resources index. A pool that does not exist
+	// reports (false, nil). Used to disambiguate PVE's "already a pool
+	// member" verdict, which does not name the pool.
+	PoolHasVM(ctx context.Context, poolID string, vmid int64) (bool, error)
 }
 
 // Client wraps SDK services for mockability.
@@ -193,6 +201,36 @@ func (s *sdkPoolService) GetPoolComment(ctx context.Context, poolID string) (str
 	return *resp.Comment, true, nil
 }
 
+// PoolHasVM implements PoolService.PoolHasVM via GET /pools/{poolid},
+// decoding the members list and matching on vmid. See the interface doc.
+func (s *sdkPoolService) PoolHasVM(ctx context.Context, poolID string, vmid int64) (bool, error) {
+	if poolID == "" || vmid <= 0 {
+		return false, cpierrors.Cloud("PoolService.PoolHasVM: poolID must not be empty and vmid must be positive")
+	}
+	resp, err := s.svc.GetPools(ctx, poolID, nil)
+	if err != nil {
+		if isPoolNotFound(err) {
+			return false, nil
+		}
+		return false, cpierrors.Wrap(err, fmt.Sprintf("PoolService.PoolHasVM: read pool %q", poolID))
+	}
+	if resp == nil {
+		return false, nil
+	}
+	for _, raw := range resp.Members {
+		var item struct {
+			Vmid *int64 `json:"vmid"`
+		}
+		if json.Unmarshal(raw, &item) != nil || item.Vmid == nil {
+			continue
+		}
+		if *item.Vmid == vmid {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // isPoolNotFound reports whether err indicates the queried pool does not exist.
 // Fail-closed: only returns true when we POSITIVELY identify the pool as
 // absent. Unknown errors propagate as failures rather than being treated as
@@ -246,9 +284,10 @@ func buildUserAgent(cfg *config.CPIConfig) string {
 //
 // All five PVE API transport fields (DialTimeoutSec, TLSHandshakeTimeoutSec,
 // MaxIdleConnsPerHost, IdleConnTimeoutSec, TCPKeepAliveSec) are assigned
-// directly from cfg: 0 is the SDK's "use default" sentinel, so an unset cfg
-// produces Options identical to those built before §7.30 was introduced
-// (byte-identical guarantee).
+// directly from cfg: 0 is the SDK's "use default" sentinel. Four of the five
+// therefore produce Options identical to those built before §7.30 when
+// unset; IdleConnTimeoutSec is the exception, because ApplyDefaults rewrites
+// its 0 to 15 before this function runs (see the paragraph below).
 func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 	port := cfg.Port
 	if port == 0 {

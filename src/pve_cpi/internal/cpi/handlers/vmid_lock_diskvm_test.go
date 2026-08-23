@@ -430,3 +430,10 @@ func (c *ldmCluster) ListStatus(context.Context) (*sdkclusterapi.ListStatusRespo
 	empty := sdkclusterapi.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (n *ldmNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

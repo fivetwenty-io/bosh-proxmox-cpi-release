@@ -149,3 +149,10 @@ func (f *fakeNodesService) CreateQemuFirewallRules(ctx context.Context, node str
 func (f *fakeNodesService) UpdateQemuFirewallOptions(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuFirewallOptionsParams) error {
 	return f.updateQemuFirewallOptionsFn(ctx, node, vmid, params)
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (f *fakeNodesService) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+	empty := nodes.ListNodesResponse{}
+	return &empty, nil
+}

@@ -206,3 +206,9 @@ func TestIsPoolPermissionDenied(t *testing.T) {
 		})
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (f *fakePoolServiceForEnsure) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

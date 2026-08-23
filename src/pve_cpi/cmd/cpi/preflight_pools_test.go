@@ -212,3 +212,9 @@ func TestPreflightPoolAccess_StemcellTemplatePoolOnly_Probed(t *testing.T) {
 		t.Errorf("expected a single probe for stemcell_template_pool, got %v", fake.calls)
 	}
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (f *fakePreflightPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

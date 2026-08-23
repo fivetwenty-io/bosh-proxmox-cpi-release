@@ -15,6 +15,7 @@ import (
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
@@ -22,16 +23,28 @@ import (
 type lgCluster struct {
 	sdkcluster.Service
 	nodes []string
+	// configNodesFn overrides ListConfigNodes; nil serves nodes as names.
+	configNodesFn func() (*sdkcluster.ListConfigNodesResponse, error)
 	// statusFn overrides ListStatus; nil means "no offline members".
 	statusFn func() (*sdkcluster.ListStatusResponse, error)
 }
 
 func (s *lgCluster) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	if s.configNodesFn != nil {
+		return s.configNodesFn()
+	}
 	resp := make(sdkcluster.ListConfigNodesResponse, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		resp = append(resp, json.RawMessage(`{"name": "`+n+`"}`))
 	}
 	return &resp, nil
+}
+
+// ListResources reports an empty cluster index (the lag window); tests that
+// need index rows script their own cluster fake.
+func (s *lgCluster) ListResources(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	empty := sdkcluster.ListResourcesResponse{}
+	return &empty, nil
 }
 
 type lgNodes struct {
@@ -41,6 +54,10 @@ type lgNodes struct {
 	listings  map[string][]string
 	failNodes map[string]error
 	calls     map[string]int
+	// listNodesFn overrides ListNodes; nil serves an empty list so the
+	// standalone-membership fallback surfaces the original corosync answer.
+	listNodesFn    func() (*sdknodes.ListNodesResponse, error)
+	listNodesCalls int
 }
 
 func (s *lgNodes) ListQemu(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -62,10 +79,14 @@ type lgClient struct {
 	Client
 	cluster *lgCluster
 	nodes   *lgNodes
+	// qemu backs FindVMAuthoritative's config probes; nil panics loudly on
+	// an unexpected probe.
+	qemu sdkqemu.Service
 }
 
 func (c *lgClient) Cluster() sdkcluster.Service { return c.cluster }
 func (c *lgClient) Nodes() sdknodes.Service     { return c.nodes }
+func (c *lgClient) QEMU() sdkqemu.Service       { return c.qemu }
 
 func lgCtx() context.Context {
 	return WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
@@ -333,4 +354,16 @@ func TestListGuestsAuthoritativeTolerant_StatusUnavailableKeepsFailLoud(t *testi
 	if !strings.Contains(err.Error(), "pve2") {
 		t.Fatalf("the error must name the unlistable node, got: %v", err)
 	}
+}
+
+// ListNodes reports an empty node list unless listNodesFn scripts otherwise;
+// the standalone-membership fallback then surfaces the original corosync
+// answer unchanged.
+func (s *lgNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	s.listNodesCalls++
+	if s.listNodesFn != nil {
+		return s.listNodesFn()
+	}
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
 }

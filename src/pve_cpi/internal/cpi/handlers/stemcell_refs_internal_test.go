@@ -81,3 +81,9 @@ func (c *refsClient) CloudInit() sdkcloudinit.Service           { return nil }
 func (c *refsClient) Tasks() sdktasks.Service                   { return nil }
 func (c *refsClient) Cluster() sdkcluster.Service               { return nil }
 func (c *refsClient) ClusterStorage() sdkclusterstorage.Service { return nil }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *refsPoolSvc) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

@@ -574,3 +574,9 @@ func TestCreateStemcell_ListConfigNodes_400_IsNotRetriable(t *testing.T) {
 
 	assertHandlerRetriable(t, err, false)
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (s *retryBoundaryPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

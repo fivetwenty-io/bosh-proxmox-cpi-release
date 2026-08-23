@@ -76,6 +76,27 @@ func TestIsPVEPushback_GotTimeoutPhrase(t *testing.T) {
 	}
 }
 
+// TestIsPVEPushback_Resolved4xxWithPushbackPhrase_NotPushback pins the
+// resolved-verdict guard: a non-429 4xx whose body happens to contain a
+// pushback phrase ("got timeout") is a settled answer about the request, and
+// must not spend a pushback backoff. A 429 carrying the same body stays
+// pushback.
+func TestIsPVEPushback_Resolved4xxWithPushbackPhrase_NotPushback(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(403, "permission check: got timeout")
+	if pve.IsPVEPushback(err) {
+		t.Errorf("a resolved 403 must NOT be pushback even with a matching phrase in the body; err=%v", err)
+	}
+	err = makeAPIErr(400, "parameter verification: got timeout")
+	if pve.IsPVEPushback(err) {
+		t.Errorf("a resolved 400 must NOT be pushback even with a matching phrase in the body; err=%v", err)
+	}
+	err = makeAPIErr(429, "too many requests: got timeout")
+	if !pve.IsPVEPushback(err) {
+		t.Errorf("HTTP 429 stays pushback regardless of body; err=%v", err)
+	}
+}
+
 func TestIsPVEPushback_Unrelated_400(t *testing.T) {
 	t.Parallel()
 	err := makeAPIErr(400, "bad request")

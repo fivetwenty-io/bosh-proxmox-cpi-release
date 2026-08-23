@@ -32,10 +32,12 @@ func crCtx() context.Context {
 
 // crPoolSvc is a PoolService fake with per-method call scripting.
 type crPoolSvc struct {
-	createFn    func(call int) error
-	addVMFn     func(call int) error
-	createCalls int
-	addVMCalls  int
+	createFn       func(call int) error
+	addVMFn        func(call int) error
+	poolHasVMFn    func(poolID string, vmid int64) (bool, error)
+	createCalls    int
+	addVMCalls     int
+	poolHasVMCalls int
 }
 
 func (s *crPoolSvc) CreatePool(_ context.Context, _, _ string) error {
@@ -281,5 +283,74 @@ func TestAssignVMToPool_AlreadyMemberOfOtherPool_FailsLoudly(t *testing.T) {
 	}
 	if svc.addVMCalls != 1 {
 		t.Fatalf("resolved verdict must not spend the retry budget: expected 1 AddVM call, got %d", svc.addVMCalls)
+	}
+}
+
+// PoolHasVM reports no membership unless poolHasVMFn scripts otherwise.
+func (s *crPoolSvc) PoolHasVM(_ context.Context, poolID string, vmid int64) (bool, error) {
+	s.poolHasVMCalls++
+	if s.poolHasVMFn != nil {
+		return s.poolHasVMFn(poolID, vmid)
+	}
+	return false, nil
+}
+
+// TestAssignVMToPool_AlreadyMemberOfRequestedPool_PoolProbeBeatsStaleIndex
+// pins the disambiguation order: the target pool's own pmxcfs-backed
+// membership (PoolHasVM) answers first, so a VM another path just moved into
+// the requested pool resolves as success even while the lagging
+// /cluster/resources index still names the pool it came FROM. Before the
+// probe, the stale index row turned this replay into a false permanent error.
+func TestAssignVMToPool_AlreadyMemberOfRequestedPool_PoolProbeBeatsStaleIndex(t *testing.T) {
+	t.Parallel()
+	svc := &crPoolSvc{
+		addVMFn: func(int) error {
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		poolHasVMFn: func(poolID string, vmid int64) (bool, error) {
+			if poolID != "stem-pool" || vmid != 30500 {
+				t.Errorf("PoolHasVM(%q, %d); want the requested pool and VMID", poolID, vmid)
+			}
+			return true, nil
+		},
+	}
+	// The stale index still shows the pool the VM was just moved out of.
+	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
+		json.RawMessage(`{"vmid": 30500, "pool": "other-pool"}`),
+	}}}
+	err := AssignVMToPool(crCtx(), cl, "stem-pool", 30500, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("membership confirmed by the pool object itself must resolve as success, got: %v", err)
+	}
+	if svc.poolHasVMCalls != 1 {
+		t.Fatalf("expected exactly 1 PoolHasVM probe, got %d", svc.poolHasVMCalls)
+	}
+}
+
+// TestAssignVMToPool_AlreadyMember_ProbeFailureSkipsStaleIndexVerdict pins
+// the probe-failure posture: when PoolHasVM itself errors, the replay reading
+// stands and the lagging index is never allowed to mint the fatal
+// already-in-another-pool error on stale evidence alone.
+func TestAssignVMToPool_AlreadyMember_ProbeFailureSkipsStaleIndexVerdict(t *testing.T) {
+	t.Parallel()
+	svc := &crPoolSvc{
+		addVMFn: func(int) error {
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		poolHasVMFn: func(string, int64) (bool, error) {
+			return false, cr500("pvedaemon worker cycling")
+		},
+	}
+	// The stale index still shows the pool the VM was just moved out of; with
+	// the probe answer missing, that row alone must not fail the call.
+	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
+		json.RawMessage(`{"vmid": 30500, "pool": "other-pool"}`),
+	}}}
+	err := AssignVMToPool(crCtx(), cl, "stem-pool", 30500, log.NewNopLogger())
+	if err != nil {
+		t.Fatalf("a failed membership probe must keep the replay reading, got: %v", err)
+	}
+	if svc.poolHasVMCalls != 1 {
+		t.Fatalf("expected exactly 1 PoolHasVM probe, got %d", svc.poolHasVMCalls)
 	}
 }

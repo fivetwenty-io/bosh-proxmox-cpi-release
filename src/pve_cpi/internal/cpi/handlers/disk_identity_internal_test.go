@@ -435,3 +435,10 @@ func (cl *idFakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResp
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (n *idFakeNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}

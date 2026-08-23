@@ -278,3 +278,9 @@ func TestEnsureAntiAffinity_VerifyOn_MemberAbsentRetriable(t *testing.T) {
 func encodeAALockComment(owner string, expUnix int64) string {
 	return fmt.Sprintf("owner=%s exp=%d", owner, expUnix)
 }
+
+// PoolHasVM reports no membership; tests that exercise the
+// disambiguation supply their own fake.
+func (p *aaLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
+	return false, nil
+}

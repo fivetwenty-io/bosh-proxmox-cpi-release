@@ -2857,3 +2857,10 @@ func TestUnparkDiskAt_AnchorPermissive_ParkerVanished_NoError(t *testing.T) {
 		t.Fatalf("permissive config must not error, got: %v", err)
 	}
 }
+
+// ListNodes reports an empty node list; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged.
+func (n *parkerNodesService) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+	empty := sdknodes.ListNodesResponse{}
+	return &empty, nil
+}
