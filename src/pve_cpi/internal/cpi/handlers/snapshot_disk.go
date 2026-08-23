@@ -141,16 +141,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// operations on zfs/lvm/btrfs storages take the per-storage lock,
 		// so retry the submit+await pair on IsStorageLockTimeout.
 		// ----------------------------------------------------------------
-		serr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
-			upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
-			if e != nil {
-				return e
-			}
-			if upid == "" {
-				return nil
-			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
-		})
+		serr := takeVMSnapshotConverging(ctx, deps, node, vmid, snapName, snapOpts)
 		if serr != nil {
 			deps.Log(ctx).Error("snapshot_disk: Snapshot failed",
 				log.String("disk_cid", diskCID),
@@ -175,6 +166,69 @@ func HandleSnapshotDisk(deps Deps) Handler {
 
 		return snapshotCID, nil
 	})
+}
+
+// takeVMSnapshotConverging submits the snapshot and awaits its task under the
+// storage-lock retry loop, converging replays: the name is generated once per
+// handler call, so a replay of a committed-then-dropped attempt hits
+// "snapshot name ... already exists" and would burn the whole lock budget
+// before failing; the Director's redo then generates a fresh name and orphans
+// the first snapshot, which later hard-blocks resize_disk and parker
+// transfers. On a replayed attempt's failure, the loop checks whether
+// snapName already exists: if it does, a prior attempt committed and the goal
+// is reached. A first-attempt failure cannot mean that (the name is fresh),
+// so it skips the probe entirely.
+func takeVMSnapshotConverging(ctx context.Context, deps Deps, node string, vmid int, snapName string, snapOpts map[string]any) error {
+	firstAttempt := true
+	return pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
+		replay := !firstAttempt
+		firstAttempt = false
+		upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
+		if e == nil {
+			if upid == "" {
+				return nil
+			}
+			e = pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
+			if e == nil {
+				return nil
+			}
+		}
+		if replay && snapshotAlreadyCommitted(ctx, deps, node, vmid, snapName) {
+			deps.Log(ctx).Info("snapshot_disk: replay found the snapshot already committed",
+				log.Int("vmid", vmid),
+				log.String("snap_name", snapName),
+			)
+			return nil
+		}
+		return e
+	})
+}
+
+// snapshotAlreadyCommitted reports whether snapName exists on the VM as a
+// COMPLETED snapshot. It backs the replay tolerance in HandleSnapshotDisk:
+// only a prior attempt of the same handler call can have created that exact
+// name, so its completed presence after a failed replay means the goal is
+// reached. Presence alone is not enough: PVE writes the snapshot's config
+// section as soon as the worker starts and stamps it with a snapstate field
+// (prepare, delete) while in progress or after a failure it could not roll
+// back, and the "already exists" rejection fires on that section too. An
+// entry still carrying snapstate is a half-created snapshot, not the goal
+// state, so it reports false and the replay's own error stands. A listing
+// error also reports false for the same reason.
+func snapshotAlreadyCommitted(ctx context.Context, deps Deps, node string, vmid int, snapName string) bool {
+	entries, listErr := deps.PVE.QEMU().ListSnapshots(ctx, node, vmid)
+	if listErr != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name, _ := entry["name"].(string)
+		if name != snapName {
+			continue
+		}
+		state, _ := entry["snapstate"].(string)
+		return state == ""
+	}
+	return false
 }
 
 // guardSnapshotParked rejects a snapshot operation when the disk's holder VM is

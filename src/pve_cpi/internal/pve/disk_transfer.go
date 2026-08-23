@@ -58,14 +58,57 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 	}
 	tv := int64(targetVMID)
 	ts := targetSlot
-	var raw *sdknodes.CreateQemuMoveDiskResponse
+	// The await runs INSIDE the retry closure: the per-storage lock most
+	// often lands on the move task rather than the POST, and the parker's
+	// protection window stays open for the whole transfer, so a task-level
+	// lock timeout must re-drive the move in-process instead of surfacing.
+	attempts := 0
+	errFromAwait := false
 	moveErr := RetryOnTransientOrLock(ctx, logger, "disk_transfer_move", parkerWindowMaxAttempts, func() error {
-		var inner error
-		raw, inner = nodesSvc.CreateQemuMoveDisk(ctx, node, strconv.Itoa(srcVMID), &sdknodes.CreateQemuMoveDiskParams{
+		attempts++
+		errFromAwait = false
+		raw, inner := nodesSvc.CreateQemuMoveDisk(ctx, node, strconv.Itoa(srcVMID), &sdknodes.CreateQemuMoveDiskParams{
 			Disk:       disk,
 			TargetVmid: &tv,
 			TargetDisk: &ts,
 		})
+		if inner == nil {
+			var upid string
+			if raw != nil {
+				var upidErr error
+				upid, upidErr = UPIDFromRaw(*raw)
+				if upidErr != nil {
+					return cpierrors.Wrap(upidErr, "move_disk: parse task UPID")
+				}
+			}
+			if upid == "" {
+				// No task to await: treat the POST's 200 as completion, like
+				// every other endpoint that answers without a UPID.
+				return nil
+			}
+			inner = AwaitTaskWithLogger(ctx, c, node, upid, logger)
+			if inner == nil {
+				return nil
+			}
+			errFromAwait = true
+		}
+		// Replay tolerance: a prior attempt whose response was dropped may
+		// have committed the reassignment, and the re-submit then fails on
+		// "no such disk" (the source slot is empty). Probe both sides: the
+		// move landed exactly when the target slot holds a volume and the
+		// source slot no longer does. Only a repeat attempt can be a replay;
+		// a first-attempt failure surfaces as-is.
+		if attempts > 1 && moveDiskLanded(ctx, c, node, srcVMID, disk, targetVMID, targetSlot) {
+			if logger != nil {
+				logger.Info("disk transfer: move replay found the reassignment already committed",
+					log.Int("src_vmid", srcVMID),
+					log.String("disk", disk),
+					log.Int("target_vmid", targetVMID),
+					log.String("target_slot", targetSlot),
+				)
+			}
+			return nil
+		}
 		return inner
 	})
 	if moveErr != nil {
@@ -73,31 +116,42 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			return fmt.Errorf("move %s of vm %d to vm %d slot %s: %w: %s",
 				disk, srcVMID, targetVMID, targetSlot, ErrMoveDiskSnapshotRefused, moveErr.Error())
 		}
+		// Preserve the pre-loop classification split: a task-body failure
+		// carries a verdict about the move itself (unsupported target
+		// storage, ...) and stays on WrapError's non-retriable fallback,
+		// while a POST failure keeps the mutation wrapper's retriable
+		// default. Folding both into WrapMutationError flipped permanent
+		// task verdicts to ok_to_retry=true.
+		if errFromAwait {
+			return cpierrors.Wrap(WrapError(moveErr),
+				fmt.Sprintf("move_disk task for %s of vm %d to vm %d slot %s", disk, srcVMID, targetVMID, targetSlot))
+		}
 		return cpierrors.Wrap(WrapMutationError(moveErr),
 			fmt.Sprintf("move_disk %s of vm %d to vm %d slot %s on node %s", disk, srcVMID, targetVMID, targetSlot, node))
 	}
-	var upid string
-	if raw != nil {
-		var upidErr error
-		upid, upidErr = UPIDFromRaw(*raw)
-		if upidErr != nil {
-			return cpierrors.Wrap(upidErr, "move_disk: parse task UPID")
-		}
-	}
-	if upid == "" {
-		// No task to await: treat the POST's 200 as completion, like every
-		// other endpoint that answers without a UPID.
-		return nil
-	}
-	if awaitErr := AwaitTaskWithLogger(ctx, c, node, upid, logger); awaitErr != nil {
-		if IsMoveDiskSnapshotRefusal(awaitErr) {
-			return fmt.Errorf("move %s of vm %d to vm %d slot %s: %w: %s",
-				disk, srcVMID, targetVMID, targetSlot, ErrMoveDiskSnapshotRefused, awaitErr.Error())
-		}
-		return cpierrors.Wrap(WrapError(awaitErr),
-			fmt.Sprintf("move_disk task for %s of vm %d to vm %d slot %s", disk, srcVMID, targetVMID, targetSlot))
-	}
 	return nil
+}
+
+// moveDiskLanded reports whether a move_disk reassignment of disk from
+// srcVMID actually committed: the target slot holds a volume and the source
+// slot no longer does. Both conditions are required: an occupied target slot
+// alone could predate the move, and an empty source alone proves nothing
+// landed. Probe errors report false so the caller surfaces the move's own
+// error rather than masking it.
+func moveDiskLanded(ctx context.Context, c Client, node string, srcVMID int, disk string, targetVMID int, targetSlot string) bool {
+	targetCfg, tErr := c.QEMU().Config(ctx, node, targetVMID)
+	if tErr != nil {
+		return false
+	}
+	if _, occupied := slotBareVolid(targetCfg, targetSlot); !occupied {
+		return false
+	}
+	srcCfg, sErr := c.QEMU().Config(ctx, node, srcVMID)
+	if sErr != nil {
+		return false
+	}
+	_, stillHeld := slotBareVolid(srcCfg, disk)
+	return !stillHeld
 }
 
 // slotBareVolid returns the bare volid a config key currently holds, or

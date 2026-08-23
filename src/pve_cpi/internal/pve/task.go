@@ -139,6 +139,17 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
 		}
+		// The SDK reports a RESOLVED task's failing exit status as an error
+		// of its own ("task failed: <exit text>", parseTaskStatus in
+		// pkg/api/tasks) rather than through the returned status, so it
+		// arrives here alongside genuine poll faults. Render and classify it
+		// exactly as the adaptive path's classifyTaskExit does: WrapError
+		// keeps a contention exit (cfs-lock timeout) retriable and a genuine
+		// verdict permanent, and IsTaskExitVerdict has one "failed: exit
+		// status" shape to match across both polling modes.
+		if exit, resolved := sdkTaskFailureExit(err); resolved {
+			return WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
+		}
 		// Route through WrapError: 5xx, ConnectionError, TimeoutError, net.Error
 		// Timeout all surface as retriable; permanent SDK errors stay non-retriable.
 		return wrapPollError(err, upid)
@@ -339,6 +350,41 @@ func classifyTaskExit(upid, exit string, warned bool) error {
 		return nil
 	}
 	return WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
+}
+
+// sdkTaskFailureExit extracts the exit-status text from the SDK poller's
+// resolved-task failure error ("task failed: <exit status>", produced by
+// parseTaskStatus in pkg/api/tasks). The SDK's sentinel is unexported, so
+// the match is textual and anchored to the message prefix: a poll transport
+// fault is a raw read error and a poll timeout says "task still running",
+// neither of which begins with this prefix.
+func sdkTaskFailureExit(err error) (string, bool) {
+	const prefix = "task failed: "
+	if err == nil {
+		return "", false
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, prefix) {
+		return "", false
+	}
+	return msg[len(prefix):], true
+}
+
+// IsTaskExitVerdict reports whether err carries a PVE task's OWN terminal
+// exit status: the awaited task RESOLVED and reported failure. Both await
+// paths render that verdict as "task <upid> failed: exit status <text>":
+// the fixed-interval path normalizes the SDK's failure error into this
+// shape in AwaitTask (see sdkTaskFailureExit) and the adaptive path emits
+// it from classifyTaskExit. No other await error carries the shape: a poll
+// timeout says "task still running" and a poll transport fault is the raw
+// read error under an "AwaitTask ... poll failed" label. Replay arms that
+// re-await a prior attempt's task use this as the positive "the task
+// settled" discriminator; retriability is the wrong test there, because a
+// lock-timeout VERDICT is retryable (the operation should be re-submitted)
+// while an UNRESOLVED poll timeout is not (the task may still be executing
+// and re-submitting would double-apply).
+func IsTaskExitVerdict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed: exit status")
 }
 
 // wrapPollError maps a task poll SDK error to the appropriate CPI error type.

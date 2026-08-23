@@ -63,6 +63,11 @@ type vmMockQEMU struct {
 	// before attaching it; tests exercising that path set this field. All
 	// others leave it nil so the default panic reveals unexpected detaches.
 	detachDiskFn func(ctx context.Context, node string, vmid int, slot string) error
+	// statusFn, when non-nil, is called by Status. create_vm probes Status
+	// after a failed start to detect a start that a replayed request already
+	// committed; the nil default reports "stopped" so start-failure tests
+	// keep surfacing the original error.
+	statusFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 
 	mu          sync.Mutex
 	createCalls []vmCreateCall
@@ -131,10 +136,14 @@ func (m *vmMockQEMU) Clone(ctx context.Context, node string, vmid int, params ma
 	panic("vmMockQEMU.Clone: create_vm must not call Clone (direct-import mode)")
 }
 
-// Unimplemented stubs — panic on unexpected calls.
-func (m *vmMockQEMU) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
-	panic("vmMockQEMU.Status: not expected")
+func (m *vmMockQEMU) Status(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if m.statusFn != nil {
+		return m.statusFn(ctx, node, vmid)
+	}
+	return map[string]any{"status": "stopped"}, nil
 }
+
+// Unimplemented stubs — panic on unexpected calls.
 func (m *vmMockQEMU) Reset(_ context.Context, _ string, _ int) (string, error) {
 	panic("vmMockQEMU.Reset: not expected")
 }

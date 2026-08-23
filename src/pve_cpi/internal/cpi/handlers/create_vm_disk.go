@@ -232,12 +232,18 @@ func extractSHA8FromParsed(parsed *createVMParsedArgs) (sha8 string, ok bool) {
 //
 // Clone-source-missing never reaches this function: attemptStemcellTemplateClone
 // intercepts it before classification and falls back to strategy=import.
+//
+// env carries the deploy identity through to cleanupVM so a candidate whose
+// destroy stays blocked behind a config lock (a clone dropped mid-task under
+// an identity that cannot skiplock) is tagged bosh-create-failed and stays
+// findable instead of becoming an anonymous locked orphan.
 func handleCloneError(
 	ctx context.Context,
 	deps Deps,
 	logger *log.Logger,
 	node string,
 	candidate int,
+	env map[string]any,
 	cerr error,
 ) error {
 	switch {
@@ -258,7 +264,7 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, env, logger)
 	case pve.IsTransientTransport(cerr):
 		// Clone POST may or may not have committed — sweep the candidate VMID
 		// before retrying so the cluster list is clean.
@@ -266,12 +272,12 @@ func handleCloneError(
 			log.Int("vmid_attempted", candidate),
 			log.ErrScrubbed(cerr),
 		)
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, env, logger)
 	default:
 		// Non-retryable error (e.g. local-storage cross-node violation,
 		// template not found, or other PVE fatal). Clean up any partial VM
 		// state and propagate — AllocateWithRetry will not retry.
-		cleanupVMDetached(ctx, deps, node, candidate, nil, logger)
+		cleanupVMDetached(ctx, deps, node, candidate, env, logger)
 	}
 	return cerr
 }
@@ -867,17 +873,11 @@ func resizeRootDisk(
 	// concurrent CF deploy this contends with parallel stemcell imports
 	// and other resizes and surfaces as "can't lock file ... got timeout"
 	// in the task log. Retry the whole submit+await with seconds-scale
-	// backoff against the lock holder finishing.
-	rerr := pve.RetryOnTransientOrLock(ctx, logger, "resize_root_disk", shape.maxAttempts, func() error {
-		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, shape.node, vmid, shape.rootDiskKey, growGiB)
-		if e != nil {
-			return e
-		}
-		if upid == "" {
-			return nil
-		}
-		return pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger)
-	})
+	// backoff against the lock holder finishing; the retry recomputes the
+	// remaining delta from the live config so a committed-then-dropped
+	// attempt is not replayed on top of itself.
+	rerr := resizeDiskConverging(ctx, deps, logger, "resize_root_disk",
+		shape.node, vmid, shape.rootDiskKey, actualTemplateGiB, shape.rootDiskGiB, shape.maxAttempts)
 	if rerr != nil {
 		// Route through WrapError so task-level transients (LVM command
 		// timeouts under VG contention, pmxcfs sync races where the just-

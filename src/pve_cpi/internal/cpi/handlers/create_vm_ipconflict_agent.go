@@ -205,7 +205,7 @@ func probeGuestAgentIPConflict(
 		if err := json.Unmarshal(raw, &e); err != nil || e.VMID <= 0 {
 			continue
 		}
-		if !strings.EqualFold(e.Status, "running") {
+		if !strings.EqualFold(e.Status, vmPowerStateRunning) {
 			continue
 		}
 		if e.Node == "" {

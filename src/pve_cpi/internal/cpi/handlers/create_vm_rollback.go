@@ -294,28 +294,23 @@ func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, en
 	cleanupVM(rbCtx, deps, node, vmid, env, logger)
 }
 
-func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
-	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
-	vmCID := strconv.Itoa(vmid)
-
-	// Stop (best-effort; VM may not have started yet). Wrap in RetryOnTransient
-	// so a pvedaemon worker-recycle during rollback doesn't bubble out — this
-	// path is best-effort already and absorbing the transient keeps the
-	// rollback graceful.
+// stopVMForRollback stops the VM best-effort ahead of the rollback purge (the
+// VM may not have started yet). The stop rides RetryOnTransient so a
+// pvedaemon worker-recycle during rollback doesn't bubble out. A killed
+// worker or node reboot mid-clone/mid-create can leave the guest config
+// carrying an in-flight lock (lock: clone|create|...), which PVE rejects even
+// a Stop against; retry once with skiplock=true when the CPI is authenticated
+// as root@pam via password (the only identity PVE honors skiplock for — not
+// even an API token owned by root@pam qualifies, see pve.IsRootPamIdentity).
+// Otherwise the lock rejection stands, which is fine: Stop is best-effort
+// and the purge is where the orphan actually matters.
+func stopVMForRollback(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) {
 	var stopUPID string
 	stopErr := pve.RetryOnTransient(ctx, logger, "create_vm.cleanup.stop", 0, func() error {
 		var innerErr error
 		stopUPID, innerErr = deps.PVE.QEMU().Stop(ctx, node, vmid)
 		return innerErr
 	})
-	// A killed worker or node reboot mid-clone/mid-create can leave the guest
-	// config carrying an in-flight lock (lock: clone|create|...), which PVE
-	// rejects even a Stop against. Retry once with skiplock=true when the CPI
-	// is authenticated as root@pam via password (the only identity PVE
-	// honors skiplock for — not even an API token owned by root@pam
-	// qualifies, see pve.IsRootPamIdentity); otherwise this is a no-op and
-	// stopErr is left as the lock rejection, which is fine — Stop is
-	// best-effort and the purge below is where the orphan actually matters.
 	if stopErr != nil && pve.IsVMConfigLocked(stopErr) {
 		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmCID, vmid, stopErr, logger)
 	}
@@ -324,6 +319,13 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 			logger.Warn("create_vm: rollback stop task failed", log.Int(metadataKeyVMID, vmid), log.Err(awaitErr))
 		}
 	}
+}
+
+func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
+	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
+	vmCID := strconv.Itoa(vmid)
+
+	stopVMForRollback(ctx, deps, node, vmCID, vmid, logger)
 
 	// Protect persistent disks before the purge. The purge below destroys
 	// every disk the VM config references -- including a persistent disk
@@ -369,6 +371,9 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	})
 	if delErr != nil && pve.IsVMConfigLocked(delErr) {
 		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
+	}
+	if delErr != nil && pve.IsVMConfigLocked(delErr) {
+		delResp, delErr = retryDestroyAfterLockClear(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
 	}
 	if delErr != nil {
 		switch {

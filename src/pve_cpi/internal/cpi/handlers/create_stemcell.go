@@ -3114,6 +3114,73 @@ func sha256FilePath(path, stagingDir string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// awaitPriorUploadTask re-awaits the upload task a prior attempt left
+// unresolved (its await's own poll failed while the task ran). The task's
+// outcome is the authority on what the retry may do next: a completed task
+// means the upload already committed, so (true, nil) reports the goal
+// reached; a task that RESOLVED with a failure verdict
+// (pve.IsTaskExitVerdict) returns (false, nil), telling the caller the
+// partial file is provably ours to sweep before re-uploading. Any other
+// await failure means the task is still UNRESOLVED and possibly executing,
+// so its error is returned instead: a retryable fault rides the loop's
+// backoff into another re-await, and a poll timeout exits to the Director
+// as retriable, matching a first attempt's await semantics. Retriability is
+// deliberately NOT the discriminator here: a lock-timeout verdict is
+// retryable yet fully resolved, and treating it as "still running" would
+// wedge the loop re-polling a dead task instead of re-driving the upload.
+func awaitPriorUploadTask(ctx context.Context, deps Deps, node, filename, upid string) (bool, error) {
+	awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
+		pve.WithMaxWait(pve.StemcellMaxWait))
+	if awaitErr == nil {
+		deps.Log(ctx).Info("create_stemcell: the prior attempt's upload task completed; upload already committed",
+			log.String("node", node),
+			log.String("filename", filename),
+		)
+		return true, nil
+	}
+	if pve.IsTaskExitVerdict(awaitErr) {
+		return false, nil
+	}
+	return false, awaitErr
+}
+
+// sweepUploadTarget clears the upload target name ahead of a re-upload. The
+// caller invokes it only on evidence its own attempt may have written the
+// file: a dropped POST response (PVE may have committed the file after the
+// drop; the name is content-addressed, so re-uploading restores identical
+// bytes) or an upload task that failed with a verdict (its partial file is
+// ours). A POST rejected before writing (lock timeout) leaves nothing of
+// ours behind, and sweeping there could delete a concurrent same-stemcell
+// upload's file on no evidence at all. A duplicate import upload is rejected
+// with HTTP 409, so the sweep must run before the re-upload; a sweep failing
+// on the loop's own retryable fault class is returned to ride the backoff
+// (pressing on would turn it into a permanent 409), and only a permanently
+// failing sweep proceeds best-effort (nil), leaving the upload to surface
+// the truth.
+func sweepUploadTarget(ctx context.Context, deps Deps, node, storageName, filename string) error {
+	volume := fmt.Sprintf("%s:%s/%s", storageName, pveStorageContentImport, filename)
+	existed, delUPID, rmErr := deps.PVE.Storage().DeleteVolumeIfExistsAsync(ctx, node, storageName, volume)
+	if rmErr == nil && delUPID != "" {
+		rmErr = pve.AwaitTaskWithLogger(ctx, deps.PVE, node, delUPID, deps.Log(ctx))
+	}
+	if rmErr != nil {
+		if pve.IsRetryableOrLockFault(rmErr) {
+			return rmErr
+		}
+		deps.Log(ctx).Warn("create_stemcell: pre-retry upload cleanup failed; retrying the upload anyway",
+			log.String("node", node),
+			log.String("volume", volume),
+			log.Err(rmErr),
+		)
+	} else if existed {
+		deps.Log(ctx).Info("create_stemcell: cleared a committed partial upload before retrying",
+			log.String("node", node),
+			log.String("volume", volume),
+		)
+	}
+	return nil
+}
+
 // uploadStemcellImage streams imagePath to the PVE storage upload endpoint,
 // then waits for the resulting task to finish. content is fixed to "import";
 // the file lands as a referenceable storage volume "<storage>:import/<filename>".
@@ -3149,7 +3216,31 @@ func uploadStemcellImage(
 	// 0"). Our outer RetryOnTransientOrLock reopens the file each iteration
 	// so transient failures retry with a fresh stream.
 	uploadCtx := sdkclient.WithRetries(ctx, 0)
+	firstAttempt := true
+	pendingUPID := ""    // prior attempt's upload task whose completion is unresolved
+	sweepNeeded := false // evidence exists that OUR prior attempt wrote (part of) the file
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", 0, func() error {
+		if !firstAttempt {
+			if pendingUPID != "" {
+				committed, awaitErr := awaitPriorUploadTask(ctx, deps, node, filename, pendingUPID)
+				if committed {
+					return nil
+				}
+				if awaitErr != nil {
+					return awaitErr
+				}
+				pendingUPID = ""
+				sweepNeeded = true
+			}
+			if sweepNeeded {
+				if sweepErr := sweepUploadTarget(ctx, deps, node, storageName, filename); sweepErr != nil {
+					return sweepErr
+				}
+				sweepNeeded = false
+			}
+		}
+		firstAttempt = false
+
 		f, openErr := openStagedFile(stagingDir, imagePath)
 		if openErr != nil {
 			return cpierrors.Cloud("uploadStemcellImage: open %s: %s", imagePath, openErr.Error())
@@ -3158,13 +3249,26 @@ func uploadStemcellImage(
 
 		upid, uerr := deps.PVE.Storage().Upload(uploadCtx, node, storageName, pveStorageContentImport, filename, f)
 		if uerr != nil {
+			if pve.IsTransportConnectionDrop(uerr) {
+				sweepNeeded = true
+			}
 			return uerr
 		}
 		if upid == "" {
 			return nil
 		}
-		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
+		pendingUPID = upid
+		aerr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
 			pve.WithMaxWait(pve.StemcellMaxWait))
+		if aerr == nil {
+			pendingUPID = ""
+		} else if pve.IsTaskExitVerdict(aerr) {
+			// Resolved with a failure verdict: a retry must not re-poll the
+			// dead task; its partial file is ours to sweep before re-uploading.
+			pendingUPID = ""
+			sweepNeeded = true
+		}
+		return aerr
 	})
 	if rerr != nil {
 		// WrapErrorKeepingClass: rerr is the raw last error out of the retry

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -102,6 +103,11 @@ type lrQEMUStub struct {
 	stopUPID     string
 	stopErr      error
 	stopCalls    int
+	// configFn, when non-nil, is called by Config with the running call
+	// count (1-based); awaitVMConfigLockClear polls Config to watch the
+	// guest lock, so tests script when the lock clears through it.
+	configFn    func(call int) (map[string]any, error)
+	configCalls int
 }
 
 func (q *lrQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) {
@@ -110,6 +116,10 @@ func (q *lrQEMUStub) Stop(_ context.Context, _ string, _ int) (string, error) {
 }
 
 func (q *lrQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]interface{}, error) {
+	q.configCalls++
+	if q.configFn != nil {
+		return q.configFn(q.configCalls)
+	}
 	return map[string]interface{}{}, nil
 }
 
@@ -205,11 +215,17 @@ func TestCleanupVM_DeleteLocked_NonRootPam_NoSkiplockRetry_TagsFailedVM(t *testi
 
 	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
 
-	if len(nodes.deleteCalls) != 1 {
-		t.Fatalf("non-root@pam identity: expected exactly 1 DeleteQemu call (no skiplock retry), got %d", len(nodes.deleteCalls))
+	// A non-root@pam identity gets no skiplock retry; instead the rollback
+	// waits for the config lock to clear (the stub's Config reports no lock,
+	// so the wait returns immediately) and re-issues the destroy once. Both
+	// calls fail locked here, so the VM is tagged.
+	if len(nodes.deleteCalls) != 2 {
+		t.Fatalf("non-root@pam identity: expected 2 DeleteQemu calls (initial + post-lock-clear retry), got %d", len(nodes.deleteCalls))
 	}
-	if nodes.deleteCalls[0].Skiplock != nil && *nodes.deleteCalls[0].Skiplock {
-		t.Error("the single DeleteQemu call must not carry skiplock=true for a non-root@pam identity")
+	for i, call := range nodes.deleteCalls {
+		if call.Skiplock != nil && *call.Skiplock {
+			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a non-root@pam identity", i)
+		}
 	}
 	if nodes.updateCalls != 1 {
 		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
@@ -233,11 +249,16 @@ func TestCleanupVM_DeleteLocked_RootPamOwnedToken_NoSkiplockRetry_TagsFailedVM(t
 
 	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
 
-	if len(nodes.deleteCalls) != 1 {
-		t.Fatalf("root@pam-owned token: expected exactly 1 DeleteQemu call (no skiplock retry), got %d", len(nodes.deleteCalls))
+	// Same contract as the non-root@pam case: no skiplock retry, but the
+	// lock-clear wait (immediately satisfied by the stub) re-issues the
+	// destroy once before giving up and tagging.
+	if len(nodes.deleteCalls) != 2 {
+		t.Fatalf("root@pam-owned token: expected 2 DeleteQemu calls (initial + post-lock-clear retry), got %d", len(nodes.deleteCalls))
 	}
-	if nodes.deleteCalls[0].Skiplock != nil && *nodes.deleteCalls[0].Skiplock {
-		t.Error("the single DeleteQemu call must not carry skiplock=true for a root@pam-owned token identity")
+	for i, call := range nodes.deleteCalls {
+		if call.Skiplock != nil && *call.Skiplock {
+			t.Errorf("DeleteQemu call %d must not carry skiplock=true for a root@pam-owned token identity", i)
+		}
 	}
 	if nodes.updateCalls != 1 {
 		t.Fatalf("VM remains locked and orphaned: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
@@ -316,5 +337,62 @@ func TestCleanupVM_StopLocked_RootPamOwnedToken_NoSkiplockRetry(t *testing.T) {
 
 	if len(nodes.stopCalls) != 0 {
 		t.Errorf("root@pam-owned token: CreateQemuStatusStop must never be called, got %d calls", len(nodes.stopCalls))
+	}
+}
+
+// --------------------------------------------------------------------------
+// Lock-clear wait recovery (token identities)
+// --------------------------------------------------------------------------
+
+// TestCleanupVM_DeleteLocked_WaitsForLockClearThenDestroys scripts the failed
+// clone whose in-flight task still holds `lock: clone` when the rollback's
+// destroy fires: the wait must poll the guest config until the lock clears,
+// then re-issue the destroy, which succeeds, so the VM is never tagged.
+func TestCleanupVM_DeleteLocked_WaitsForLockClearThenDestroys(t *testing.T) {
+	defer SetVMLockClearBounds(0, time.Second)()
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg), nil},
+	}
+	q := &lrQEMUStub{configFn: func(call int) (map[string]any, error) {
+		if call <= 2 {
+			return map[string]any{"lock": "clone"}, nil
+		}
+		return map[string]any{}, nil // the clone task finished; lock released
+	}}
+	deps := Deps{Config: lrTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	if len(nodes.deleteCalls) != 2 {
+		t.Fatalf("expected 2 DeleteQemu calls (locked initial + post-lock-clear retry), got %d", len(nodes.deleteCalls))
+	}
+	if q.configCalls < 3 {
+		t.Errorf("the retry destroy must fire only after the lock cleared (>=3 config polls), got %d", q.configCalls)
+	}
+	if nodes.updateCalls != 0 {
+		t.Errorf("the post-lock-clear destroy succeeded: no bosh-create-failed tag may be written, got %d", nodes.updateCalls)
+	}
+}
+
+// TestCleanupVM_DeleteLocked_LockNeverClears_TagsWithoutRetry is the control:
+// when the lock outlives the wait budget, no second destroy may be issued
+// (it would fail identically) and the orphan must be tagged for visibility.
+func TestCleanupVM_DeleteLocked_LockNeverClears_TagsWithoutRetry(t *testing.T) {
+	defer SetVMLockClearBounds(0, 20*time.Millisecond)()
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg)},
+	}
+	q := &lrQEMUStub{configFn: func(_ int) (map[string]any, error) {
+		return map[string]any{"lock": "clone"}, nil // wedged: never clears
+	}}
+	deps := Deps{Config: lrTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	if len(nodes.deleteCalls) != 1 {
+		t.Fatalf("lock never cleared: expected exactly 1 DeleteQemu call, got %d", len(nodes.deleteCalls))
+	}
+	if nodes.updateCalls != 1 {
+		t.Fatalf("wedged locked orphan: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
 	}
 }

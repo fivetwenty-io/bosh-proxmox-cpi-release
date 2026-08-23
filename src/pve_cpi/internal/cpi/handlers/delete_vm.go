@@ -816,7 +816,7 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 				fmt.Sprintf("delete_vm: status VM %s while waiting for stop", vmCID))
 		}
 		state, _ := st["status"].(string)
-		if state == "stopped" {
+		if state == vmPowerStateStopped {
 			return nil
 		}
 		if time.Now().After(deadline) {

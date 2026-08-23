@@ -24,6 +24,10 @@ import (
 type snapQEMUService struct {
 	configFn   func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	snapshotFn func(ctx context.Context, node string, vmid int, name string, opts map[string]any) (string, error)
+	// listSnapshotsFn, when non-nil, is called by ListSnapshots. The handler
+	// lists snapshots only when a replayed attempt fails (checking whether a
+	// prior attempt committed), so the nil default keeps the panic guard.
+	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
 func (m *snapQEMUService) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
@@ -74,7 +78,10 @@ func (m *snapQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ strin
 func (m *snapQEMUService) DeleteSnapshot(_ context.Context, _ string, _ int, _ string) error {
 	panic("snapQEMUService.DeleteSnapshot: not expected")
 }
-func (m *snapQEMUService) ListSnapshots(_ context.Context, _ string, _ int) ([]map[string]any, error) {
+func (m *snapQEMUService) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]any, error) {
+	if m.listSnapshotsFn != nil {
+		return m.listSnapshotsFn(ctx, node, vmid)
+	}
 	panic("snapQEMUService.ListSnapshots: not expected")
 }
 func (m *snapQEMUService) RollbackSnapshot(_ context.Context, _ string, _ int, _ string) (string, error) {

@@ -329,17 +329,10 @@ func resizeDiskInternal(
 
 	// Wrap submit+await in RetryOnTransientOrLock: PVE holds a per-storage
 	// lockfile during resize; concurrent resizes fail with "can't lock file
-	// ... got timeout". Retry the full submit+await pair on that signal.
-	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "update_disk_resize", 0, func() error {
-		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
-		if e != nil {
-			return e
-		}
-		if upid == "" {
-			return nil
-		}
-		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
-	})
+	// ... got timeout". Retry the full submit+await pair on that signal. The
+	// retry recomputes the remaining delta from the live config so a
+	// committed-then-dropped attempt is not replayed on top of itself.
+	rerr := resizeDiskConverging(ctx, deps, deps.Log(ctx), "update_disk_resize", node, vmid, diskID, currentGiB, newGiB, 0)
 	if rerr != nil {
 		return cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("update_disk: ResizeDisk failed for %s (+%dG)", diskCID, deltaGiB))
 	}

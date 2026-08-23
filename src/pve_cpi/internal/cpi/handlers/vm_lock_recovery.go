@@ -13,6 +13,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -84,15 +85,100 @@ func retryStopWithSkiplock(
 // logUnresolvedVMLock logs the actionable error surfaced when a stop/destroy
 // call is rejected by PVE's guest-config lock and no further in-process
 // recovery is possible — either the CPI is not root@pam (skiplock could not
-// be attempted) or a skiplock retry was attempted and still failed. It names
-// the lock type and the `qm unlock <vmid>` recovery command PVE's HTTP API
-// has no endpoint equivalent for.
+// be attempted) or a skiplock retry was attempted and still failed. The lock
+// usually belongs to an in-flight task (clone, create, migrate), so the
+// recovery hint leads with waiting for that task to finish; `qm unlock` is
+// right only when the task is gone and the lock is stale, and the HTTP API
+// has no endpoint equivalent for it either way.
 func logUnresolvedVMLock(logger *log.Logger, action string, vmid int, node string, err error) {
 	logger.Error(action+": VM config is locked; manual recovery required",
 		log.Int(metadataKeyVMID, vmid),
 		log.String("node", node),
 		log.String("lock_type", pve.VMConfigLockType(err)),
-		log.String("recovery", fmt.Sprintf("qm unlock %d", vmid)),
+		log.String("recovery", fmt.Sprintf(
+			"wait for the in-flight task holding the lock to finish, then retry the delete; run `qm unlock %d` only if no task is running and the lock is stale", vmid)),
 		log.Err(err),
 	)
+}
+
+// Lock-clear poll bounds for awaitVMConfigLockClear. Package vars, replaced
+// by SetVMLockClearBounds in tests.
+var (
+	vmLockClearPollInterval = 2 * time.Second
+	vmLockClearMaxWait      = 120 * time.Second
+)
+
+// SetVMLockClearBounds replaces the lock-clear poll interval and bound and
+// returns a restore func. Test seam:
+//
+//	defer handlers.SetVMLockClearBounds(0, 50*time.Millisecond)()
+func SetVMLockClearBounds(interval, maxWait time.Duration) func() {
+	prevInterval, prevMax := vmLockClearPollInterval, vmLockClearMaxWait
+	vmLockClearPollInterval = interval
+	vmLockClearMaxWait = maxWait
+	return func() {
+		vmLockClearPollInterval = prevInterval
+		vmLockClearMaxWait = prevMax
+	}
+}
+
+// retryDestroyAfterLockClear handles a destroy refused by a guest-config lock
+// when skiplock was unavailable (any API token) or refused. The lock is
+// usually held by the failed create's own in-flight task (a clone dropped
+// mid-task keeps `lock: clone` until the worker finishes or dies), so wait
+// bounded for it to clear (awaitVMConfigLockClear), then destroy once more.
+// Without this, every token-authenticated deploy that loses a clone mid-task
+// leaks a locked orphan that only `qm unlock` can free. When the lock never
+// clears, origErr is returned unchanged so the caller's lock classification
+// still fires.
+func retryDestroyAfterLockClear(
+	ctx context.Context, deps Deps, node, vmCID string, vmid int,
+	purge, destroyUnref bool, origErr error, logger *log.Logger,
+) (*sdknodes.DeleteQemuResponse, error) {
+	logger.Info("create_vm: rollback delete blocked by a config lock; waiting for the in-flight task to release it",
+		log.Int(metadataKeyVMID, vmid),
+		log.String("node", node),
+		log.String("lock_type", pve.VMConfigLockType(origErr)),
+	)
+	if !awaitVMConfigLockClear(ctx, deps, node, vmid, logger) {
+		return nil, origErr
+	}
+	return deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+		Purge:                    &purge,
+		DestroyUnreferencedDisks: &destroyUnref,
+	})
+}
+
+// awaitVMConfigLockClear polls the guest config until its lock field clears,
+// reporting whether it did. It backs the rollback path for identities that
+// cannot skiplock (every API token): a destroy refused with `lock: clone` is
+// usually blocked by the failed clone's own in-flight task, which finishes or
+// dies on its own, so a bounded wait converts a guaranteed orphan into a
+// completed cleanup. Config-read errors and a VM that disappears mid-poll
+// both report true: the follow-up destroy is the authority on what remains
+// (a gone VM makes it an idempotent 404), and a read blip must not strand
+// the orphan without even attempting the retry.
+func awaitVMConfigLockClear(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) bool {
+	deadline := time.Now().Add(vmLockClearMaxWait)
+	for {
+		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+		if cfgErr != nil {
+			return true
+		}
+		if lock, _ := cfg["lock"].(string); lock == "" {
+			return true
+		}
+		if time.Now().After(deadline) {
+			logger.Warn("VM config lock did not clear within the wait budget",
+				log.Int(metadataKeyVMID, vmid),
+				log.String("node", node),
+			)
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(vmLockClearPollInterval):
+		}
+	}
 }

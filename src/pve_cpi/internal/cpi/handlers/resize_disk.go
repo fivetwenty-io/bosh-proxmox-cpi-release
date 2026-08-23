@@ -225,17 +225,10 @@ func HandleResizeDisk(deps Deps) Handler {
 		// runs under the per-storage lockfile, so on bursty deploys the
 		// task can fail with "can't lock file ... got timeout". Retry the
 		// submit+await pair on that signal; non-lock errors propagate.
+		// The retry recomputes the remaining delta from the live config so
+		// a committed-then-dropped attempt is not replayed on top of itself.
 		// ----------------------------------------------------------------
-		rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "resize_disk", 0, func() error {
-			upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, deltaGiB)
-			if e != nil {
-				return e
-			}
-			if upid == "" {
-				return nil
-			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
-		})
+		rerr := resizeDiskConverging(ctx, deps, deps.Log(ctx), "resize_disk", node, vmid, diskID, currentGiB, newGiB, 0)
 		if rerr != nil {
 			return nil, cpierrors.Wrap(pve.WrapError(rerr), fmt.Sprintf("resize_disk: ResizeDisk failed for VM %d disk %s (+%dG)", vmid, diskCID, deltaGiB))
 		}
@@ -260,6 +253,184 @@ func HandleResizeDisk(deps Deps) Handler {
 		)
 
 		return nil, nil
+	})
+}
+
+// Settle bounds for resizeDiskConverging's dropped-POST window. Package
+// vars, replaced by SetResizeSettleBounds in tests.
+var (
+	resizeSettlePollInterval = 2 * time.Second
+	resizeSettleMaxWait      = 30 * time.Second
+)
+
+// SetResizeSettleBounds replaces the dropped-POST settle poll interval and
+// bound and returns a restore func. Test seam:
+//
+//	defer handlers.SetResizeSettleBounds(0, 50*time.Millisecond)()
+func SetResizeSettleBounds(interval, maxWait time.Duration) func() {
+	prevInterval, prevMax := resizeSettlePollInterval, resizeSettleMaxWait
+	resizeSettlePollInterval = interval
+	resizeSettleMaxWait = maxWait
+	return func() {
+		resizeSettlePollInterval = prevInterval
+		resizeSettleMaxWait = prevMax
+	}
+}
+
+// readDiskSizeGiB reads the live size of diskID from the guest config.
+func readDiskSizeGiB(ctx context.Context, deps Deps, op, node string, vmid int, diskID string) (int, error) {
+	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		return 0, cfgErr
+	}
+	diskOptStr, ok := cfg[diskID].(string)
+	if !ok || diskOptStr == "" {
+		return 0, cpierrors.Cloud("%s: disk %s missing from VM %d config while re-reading size for retry", op, diskID, vmid)
+	}
+	gib, parseErr := parseDiskSizeGiB(diskOptStr)
+	if parseErr != nil {
+		return 0, cpierrors.Wrap(parseErr, fmt.Sprintf("%s: re-read size of disk %s on VM %d", op, diskID, vmid))
+	}
+	return gib, nil
+}
+
+// settleDroppedResizeGiB gives an unnamed in-flight resize task a bounded
+// window to land before the delta is recomputed. It backs the dropped-POST
+// arm of resizeDiskConverging: when the resize POST's response drops, PVE may
+// have already created a task we never learned the UPID of, and that task
+// only writes the new size into the config when it finishes; recomputing the
+// delta from a config read taken while it still runs re-submits the full
+// growth. The poll returns as soon as the size reaches targetGiB or stops at
+// the window's edge with the latest observed size; read errors end the poll
+// with the last known size (the caller's re-read already succeeded once).
+func settleDroppedResizeGiB(
+	ctx context.Context, deps Deps, logger *log.Logger,
+	op, node string, vmid int, diskID string, observedGiB, targetGiB int,
+) int {
+	deadline := time.Now().Add(resizeSettleMaxWait)
+	latest := observedGiB
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return latest
+		case <-time.After(resizeSettlePollInterval):
+		}
+		gib, err := readDiskSizeGiB(ctx, deps, op, node, vmid, diskID)
+		if err != nil {
+			return latest
+		}
+		latest = gib
+		if latest >= targetGiB {
+			return latest
+		}
+	}
+	logger.Info("resize settle window closed without reaching the target; resubmitting the remaining delta",
+		log.String("op", op),
+		log.Int(metadataKeyVMID, vmid),
+		log.String("disk_id", diskID),
+		log.Int("observed_gib", latest),
+		log.Int("target_gib", targetGiB),
+	)
+	return latest
+}
+
+// resizeDiskConverging grows the disk at diskID to targetGiB through PVE's
+// relative resize API (the SDK sends "+NG"), recomputing the remaining delta
+// on every retry. Computing the delta once outside the loop is a replay
+// hazard: an attempt whose resize committed but whose response was dropped
+// (connection blip, lock timeout on the await) would re-issue the same
+// relative delta and land the disk at current plus twice the growth,
+// silently, because convergence checks are >=. Re-reading the live size
+// inside the closure makes the replay idempotent; a zero or negative
+// remaining delta means a prior attempt already committed, which is success.
+//
+// The re-read is only authoritative once the prior attempt's task has
+// settled: PVE writes the new size into the config when the resize task
+// FINISHES, not when the POST returns. Two arms guard that ordering. When
+// the prior attempt holds a task UPID that has not RESOLVED (its await
+// failed without carrying the task's own exit verdict, pve.IsTaskExitVerdict),
+// the retry re-awaits that same task before re-reading; a resolved task,
+// success or failure verdict alike, settles the config and falls through to
+// the re-read plus resubmit. When the POST's own response dropped, no UPID
+// exists to await, so the re-read gets a bounded settle window
+// (settleDroppedResizeGiB) for the possible unnamed task to land; a task
+// slower than the window resubmits into PVE's config lock, which rejects the
+// overlap with a retryable lock fault rather than double-applying.
+//
+// currentGiB is the size the caller already read for its first-attempt delta,
+// so the steady-state path issues no extra config reads.
+func resizeDiskConverging(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	op, node string,
+	vmid int,
+	diskID string,
+	currentGiB, targetGiB, maxAttempts int,
+) error {
+	knownGiB := currentGiB
+	firstAttempt := true
+	pendingUPID := ""      // prior attempt's task whose completion is unresolved
+	submitDropped := false // prior POST's response dropped: an unnamed task may exist
+	return pve.RetryOnTransientOrLock(ctx, logger, op, maxAttempts, func() error {
+		if !firstAttempt {
+			if pendingUPID != "" {
+				awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, pendingUPID, logger)
+				switch {
+				case awaitErr == nil, pve.IsTaskExitVerdict(awaitErr):
+					// The task RESOLVED (success, or a failure verdict):
+					// the config now reflects its outcome, and the re-read
+					// plus resubmit below is the recovery for a failed one.
+					pendingUPID = ""
+				default:
+					// UNRESOLVED: a poll transport fault or a poll timeout;
+					// the task may still be executing, so re-reading now
+					// would recompute the delta from a moving config. A
+					// retryable fault rides the loop's backoff into another
+					// re-await; a poll timeout exits to the Director as
+					// retriable, matching a first attempt's await semantics.
+					return awaitErr
+				}
+			}
+			gib, readErr := readDiskSizeGiB(ctx, deps, op, node, vmid, diskID)
+			if readErr != nil {
+				return readErr
+			}
+			if submitDropped && gib < targetGiB {
+				gib = settleDroppedResizeGiB(ctx, deps, logger, op, node, vmid, diskID, gib, targetGiB)
+			}
+			submitDropped = false
+			knownGiB = gib
+		}
+		firstAttempt = false
+
+		remaining := targetGiB - knownGiB
+		if remaining <= 0 {
+			logger.Info("resize replay converged: a prior attempt committed the growth",
+				log.String("op", op),
+				log.Int(metadataKeyVMID, vmid),
+				log.String("disk_id", diskID),
+				log.Int("current_gib", knownGiB),
+				log.Int("target_gib", targetGiB),
+			)
+			return nil
+		}
+		upid, e := deps.PVE.QEMU().ResizeDisk(ctx, node, vmid, diskID, remaining)
+		if e != nil {
+			submitDropped = pve.IsTransportConnectionDrop(e)
+			return e
+		}
+		if upid == "" {
+			return nil
+		}
+		pendingUPID = upid
+		e = pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, logger)
+		if e == nil || pve.IsTaskExitVerdict(e) {
+			// Resolved either way: a retry must not re-poll a dead task,
+			// it must re-read and resubmit the remaining delta.
+			pendingUPID = ""
+		}
+		return e
 	})
 }
 

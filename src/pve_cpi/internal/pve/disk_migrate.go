@@ -432,10 +432,16 @@ func buildMoverTags(cfg ParkerConfig) string {
 // never-started mover there: parker shape (protection=1, onboot=0, minimal
 // resources), parker tags plus the mover tag.
 //
-// Unlike createParkerVM it never adopts a conflicting VM: a VMID conflict
-// means an ordinary parker (or a concurrent mover) won that VMID, and
-// adopting a shared parker as a mover would migrate a node's durable parker
-// away with every disk it holds. Conflicts regenerate a fresh VMID instead.
+// Unlike createParkerVM it never adopts a VM another CPI created: a VMID
+// conflict on a fresh first attempt means an ordinary parker (or a concurrent
+// mover) won that VMID, and adopting a shared parker as a mover would migrate
+// a node's durable parker away with every disk it holds. Those conflicts
+// regenerate a fresh VMID. The one adoption is the replay of our own create:
+// when an attempt's response was dropped in transit (the create may have
+// committed server-side) and the retry then conflicts, the VMID is probed,
+// and an empty VM carrying this call's attempt marker (see
+// moverAttemptDescPrefix) plus both the parker and mover tags is adopted
+// instead of being leaked as a protected orphan forever.
 func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node string, cfg ParkerConfig) (int, error) {
 	if node == "" {
 		return 0, cpierrors.Cloud("createMoverVM: node must not be empty")
@@ -452,6 +458,20 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 	cores := 1
 	scsihw := "virtio-scsi-pci"
 
+	// Per-call attempt marker. Config shape alone (tags, emptiness) is
+	// satisfied identically by a concurrent CPI's freshly created mover, so
+	// the replay adoption below additionally requires this nonce in the
+	// probed VM's description: only the create THIS call submitted can have
+	// written it. Generation failure leaves the nonce empty, which the probe
+	// treats as never-adoptable (fail closed to regeneration).
+	attemptNonce := ""
+	if id, nonceErr := GenerateDiskStableID(); nonceErr == nil {
+		attemptNonce = moverAttemptDescPrefix + id
+	} else if logger != nil {
+		logger.Warn("disk migrate: could not generate a mover attempt marker; a dropped create will regenerate instead of adopting",
+			log.Err(nonceErr))
+	}
+
 	return AllocateWithRetry(
 		ctx,
 		c,
@@ -466,13 +486,37 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 				"cores":         cores,
 				"scsihw":        scsihw,
 			}
+			if attemptNonce != "" {
+				params["description"] = attemptNonce
+			}
 			var upid string
 			var innerErr error
+			sawDroppedAttempt := false
 			retryErr := RetryOnTransientOrLock(ctx, logger, "disk_migrate_create_mover", 0, func() error {
 				upid, innerErr = c.QEMU().Create(ctx, node, params)
+				if innerErr != nil && IsTransportConnectionDrop(innerErr) {
+					sawDroppedAttempt = true
+				}
 				return innerErr
 			})
 			if retryErr != nil {
+				// A create whose response was dropped may have committed
+				// server-side; the retry then conflicts against our own mover,
+				// and regenerating would leak it as a protection=1 orphan with
+				// no reclaim path. Adopt it, but only when a dropped attempt
+				// was actually observed (a first-attempt conflict means
+				// another CPI won the VMID) and the probe proves the VM is an
+				// empty mover: both tags present, zero volumes referenced.
+				if IsVMIDConflict(retryErr) && sawDroppedAttempt &&
+					moverAdoptableAfterReplay(ctx, c, logger, node, vmid, attemptNonce) {
+					if logger != nil {
+						logger.Info("disk migrate: adopted the mover a dropped create response left behind",
+							log.Int("mover_vmid", vmid),
+							log.String("node", node),
+						)
+					}
+					return nil
+				}
 				return retryErr
 			}
 			if upid != "" {
@@ -490,6 +534,55 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 		WithRange(cfg.VMIDRangeStart, cfg.VMIDRangeEnd),
 		WithStorageScan(node, cfg.DiskStorage),
 	)
+}
+
+// moverAttemptDescPrefix labels the per-call attempt marker createMoverVM
+// writes into the mover's description so a replay adoption can prove the
+// conflicting VM is its own committed create and not a concurrent CPI's
+// identically shaped fresh mover.
+const moverAttemptDescPrefix = "bosh-cpi-mover-attempt:"
+
+// moverAdoptableAfterReplay reports whether the VM at vmid on node is the
+// empty mover our own committed-then-dropped create left behind: the
+// authoritative config carries the exact attempt marker this call generated
+// (a concurrent CPI's mover carries its own), both the parker and mover
+// tags, and references no volume on any active slot or unusedN entry. An
+// empty attemptNonce (marker generation failed) or a probe error reports
+// false so the conflict falls back to regenerating a fresh VMID; nothing
+// here is ever destroyed.
+func moverAdoptableAfterReplay(ctx context.Context, c Client, logger *log.Logger, node string, vmid int, attemptNonce string) bool {
+	if attemptNonce == "" {
+		return false
+	}
+	vmCfg, cfgErr := c.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if logger != nil {
+			logger.Debug("disk migrate: could not probe the conflicting VMID after a dropped create; regenerating",
+				log.Int("vmid", vmid),
+				log.String("node", node),
+				log.Err(cfgErr),
+			)
+		}
+		return false
+	}
+	desc, _ := vmCfg["description"].(string)
+	if desc != attemptNonce {
+		if logger != nil {
+			logger.Info("disk migrate: conflicting VM does not carry this call's attempt marker; regenerating",
+				log.Int("vmid", vmid),
+				log.String("node", node),
+			)
+		}
+		return false
+	}
+	cfgTags, _ := vmCfg["tags"].(string)
+	if !tagContainsParker(cfgTags) || !TagsMarkDiskMover(cfgTags) {
+		return false
+	}
+	if len(qemu.ParseDisks(vmCfg)) > 0 || len(FindUnusedDiskEntries(vmCfg)) > 0 {
+		return false
+	}
+	return true
 }
 
 // destroyMoverBestEffort cleans up a mover a failed isolation leaves behind.

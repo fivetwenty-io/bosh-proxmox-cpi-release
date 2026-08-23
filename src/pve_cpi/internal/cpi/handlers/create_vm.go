@@ -1609,7 +1609,7 @@ func attemptStemcellTemplateClone(
 		}
 		// Classify for retry: VMID conflicts and transient transport faults are
 		// retryable — they use the same retry classification as the import path.
-		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, cloneErr)
+		return true, handleCloneError(ctx, deps, logger, shape.node, candidate, parsed.env, cloneErr)
 	}
 
 	logger.Info("create_vm: vm cloned from stemcell cache template",
@@ -2073,22 +2073,36 @@ func startVMAndReadConfig(
 	// Wrap in RetryOnTransient so a pvedaemon worker-recycle (HTTP 5xx /
 	// "got no worker upid - start worker failed") under burst load is absorbed
 	// in-process rather than surfacing as RetriableCloudError to the director.
+	// A start whose first attempt committed but whose response was dropped
+	// replays into an "already running" rejection; the goal state (a running
+	// VM) is reached whoever reached it, so tolerate that outcome on both the
+	// submit and the task await, falling back to a live status probe when the
+	// rejection text does not match.
 	var startUPID string
-	if err := pve.RetryOnTransient(ctx, logger, "create_vm.start", 0, func() error {
+	startErr := pve.RetryOnTransient(ctx, logger, "create_vm.start", 0, func() error {
 		var innerErr error
 		startUPID, innerErr = deps.PVE.QEMU().Start(ctx, shape.node, vmid)
 		return innerErr
-	}); err != nil {
+	})
+	switch {
+	case startErr == nil:
+		if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
+			if !vmAlreadyRunning(err) && !vmRunningNow(ctx, deps, logger, shape.node, vmid) {
+				return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+					fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
+			}
+			logger.Info("create_vm: start task raced a prior committed start; VM already running",
+				log.Int(metadataKeyVMID, vmid))
+		}
+	case vmAlreadyRunning(startErr) || vmRunningNow(ctx, deps, logger, shape.node, vmid):
+		logger.Info("create_vm: start replay found the VM already running; goal state reached",
+			log.Int(metadataKeyVMID, vmid))
+	default:
 		// WrapErrorKeepingClass: the exhausted retry error is the raw last
 		// SDK error, and flattening it to a permanent Cloud made a transient
 		// start failure non-retriable for the Director.
-		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(startErr),
 			fmt.Sprintf("create_vm: start vmid=%d", vmid))
-	}
-
-	if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
-		return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
-			fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
 	}
 
 	logger.Info("create_vm: VM started", log.Int(metadataKeyVMID, vmid))

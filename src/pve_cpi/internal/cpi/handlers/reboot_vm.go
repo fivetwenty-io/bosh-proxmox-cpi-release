@@ -111,7 +111,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		state, _ := st["status"].(string)
 
 		// --- stopped VM: start instead of reboot ---
-		if state == "stopped" {
+		if state == vmPowerStateStopped {
 			return rebootVMHandleStopped(ctx, deps, logger, node, vmid, vmCID)
 		}
 
@@ -157,6 +157,12 @@ func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node 
 	return nil, nil
 }
 
+// VM power states as reported by the qemu status endpoints.
+const (
+	vmPowerStateRunning = "running"
+	vmPowerStateStopped = "stopped"
+)
+
 // vmAlreadyRunning reports whether a start rejection says the VM is already
 // running — PVE's qmstart (call and task result alike) fails with
 // "VM <vmid> already running". On the reboot start-a-stopped-VM path this is
@@ -166,6 +172,28 @@ func rebootVMHardReset(ctx context.Context, deps Deps, logger *log.Logger, node 
 // then issues loses the race to the reboot's own start.
 func vmAlreadyRunning(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already running")
+}
+
+// vmRunningNow probes the VM's live status and reports whether it is running.
+// It backs the replay tolerance on start paths: a start whose first attempt
+// committed but whose response was dropped replays into a rejection, and the
+// goal state (a running VM) is already reached no matter who reached it. A
+// probe error reports false so the caller surfaces its original start error
+// rather than masking it with a probe failure.
+func vmRunningNow(ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int) bool {
+	if deps.PVE == nil || deps.PVE.QEMU() == nil {
+		return false
+	}
+	st, err := deps.PVE.QEMU().Status(ctx, node, vmid)
+	if err != nil {
+		logger.Debug("status probe after failed start could not read the VM",
+			log.Int(metadataKeyVMID, vmid),
+			log.Err(err),
+		)
+		return false
+	}
+	state, _ := st["status"].(string)
+	return state == vmPowerStateRunning
 }
 
 // rebootVMHandleStopped starts a stopped VM instead of rebooting it.
@@ -190,7 +218,7 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 		if pve.IsNotFound(startErr) {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
-		if vmAlreadyRunning(startErr) {
+		if vmAlreadyRunning(startErr) || vmRunningNow(ctx, deps, logger, node, vmid) {
 			logger.Info("reboot_vm: start raced a concurrent boot; VM already running — success")
 			return nil, nil
 		}
@@ -198,7 +226,7 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 	}
 	if startUPID != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, startUPID, logger); awaitErr != nil {
-			if vmAlreadyRunning(awaitErr) {
+			if vmAlreadyRunning(awaitErr) || vmRunningNow(ctx, deps, logger, node, vmid) {
 				logger.Info("reboot_vm: start task raced a concurrent boot; VM already running — success")
 				return nil, nil
 			}
