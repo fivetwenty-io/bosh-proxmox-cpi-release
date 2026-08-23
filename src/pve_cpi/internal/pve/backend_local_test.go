@@ -43,11 +43,46 @@ func (b *backendTestClient) Pools() PoolService                     { return nil
 
 type fakeCluster struct {
 	sdkcluster.Service
-	listFn func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	listFn        func(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error)
+	configNodesFn func(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error)
 }
 
 func (f *fakeCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 	return f.listFn(ctx, params)
+}
+
+// ListConfigNodes defaults to deriving cluster membership from the same rows
+// listFn serves, so tests that encode the node set as /cluster/resources rows
+// keep working after candidateNodes moved to /cluster/config/nodes. Rows that
+// fail to parse pass through unchanged (the production parser then skips
+// them), preserving the unparseable-snapshot tests' semantics.
+func (f *fakeCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	if f.configNodesFn != nil {
+		return f.configNodesFn(ctx)
+	}
+	typ := "node"
+	resp, err := f.listFn(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
+	if err != nil || resp == nil {
+		return nil, err
+	}
+	out := make(sdkcluster.ListConfigNodesResponse, 0, len(*resp))
+	for _, raw := range *resp {
+		var row struct {
+			Node string `json:"node"`
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &row) != nil {
+			out = append(out, raw)
+			continue
+		}
+		name := row.Name
+		if name == "" {
+			name = row.Node
+		}
+		b, _ := json.Marshal(map[string]any{"name": name})
+		out = append(out, b)
+	}
+	return &out, nil
 }
 
 // clusterResp builds a /cluster/resources response from typed rows.

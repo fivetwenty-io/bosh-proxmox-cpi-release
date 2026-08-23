@@ -136,6 +136,32 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			log.String("node", item.Node),
 			log.String("vmid", vmIDStr),
 		)
+		// Authoritative config read comes FIRST — before any mutation this
+		// straggler triggers. The index row that selected this VMID can be
+		// minutes stale: the tagged VM may already be destroyed and the VMID
+		// reused by a live, untagged VM, in which case the skiplock+purge
+		// below would destroy a healthy guest and every disk it references.
+		// The config read is node-local truth. A "VM already gone" shape
+		// (404, or pmxcfs's config-missing 500) means there is nothing left
+		// to reap; any other read failure defers the straggler (fail-closed).
+		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID))
+		if strCfgErr != nil {
+			if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
+				sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
+				continue
+			}
+			sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
+				log.Err(strCfgErr))
+			continue
+		}
+		// Re-test the deleting tag from the authoritative config, not the
+		// index row. Tag absent means the row is stale — this VMID's current
+		// occupant was never marked for deletion, so it must not be destroyed.
+		authTags, _ := strCfg[jsonKeyTags].(string)
+		if !tagsContain(authTags, tagDeletingVM) {
+			sweepLogger.Warn("delete_vm: straggler sweep: index row is stale — the VM's authoritative config does not carry the deleting tag; skipping (VMID likely reused by a live VM)")
+			continue
+		}
 		// Base value is pve.destroy_unreferenced_disks (default false; see the
 		// config field doc for the cross-cluster shared-storage data-loss
 		// hazard enabling it introduces).
@@ -148,9 +174,10 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// pending unlink, and force the destroy flag false for retain-tagged
 		// stragglers regardless of the config knob. On detach failure, skip this
 		// straggler (left for the next sweep) rather than destroy with the
-		// volume in an unknown state.
+		// volume in an unknown state. The tag is read from the authoritative
+		// config for the same staleness reason as the deleting tag above.
 		destroyDisks := deps.Config.DestroyUnreferencedDisks
-		if tagsContain(item.Tags, tagRetainEphemeral) {
+		if tagsContain(authTags, tagRetainEphemeral) {
 			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID), sweepLogger)
 			if retainErr != nil {
 				sweepLogger.Warn("delete_vm: straggler sweep: retain-ephemeral detach failed; deferring straggler to next sweep (non-fatal)",
@@ -166,21 +193,11 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// straggler instead of destroying it -- the Director's delete_vm
 		// retry re-runs the real detach (including parker transfers), and
 		// once the disks are off, a later sweep or the retry itself reaps
-		// the VM. A config-read failure defers too (fail-closed), except
-		// the two "VM already gone" shapes, where the destroy below is
-		// idempotent.
-		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID))
-		if strCfgErr != nil && !pve.IsNotFound(strCfgErr) && !pve.IsPmxcfsConfigMissing(strCfgErr) {
-			sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
-				log.Err(strCfgErr))
+		// the VM.
+		if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID)); len(foreign) > 0 {
+			sweepLogger.Warn("delete_vm: straggler sweep: foreign persistent disks still attached; deferring to the delete_vm retry to detach them",
+				log.Any("slots", foreign))
 			continue
-		}
-		if strCfgErr == nil {
-			if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID)); len(foreign) > 0 {
-				sweepLogger.Warn("delete_vm: straggler sweep: foreign persistent disks still attached; deferring to the delete_vm retry to detach them",
-					log.Any("slots", foreign))
-				continue
-			}
 		}
 		// Same unusedN protection the sync and fast paths run: a persistent
 		// volume demoted to unusedN (snapshot-pinned, sweep-resistant) would
@@ -378,18 +395,23 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 
 		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
-		// --- locate VM via cluster scan ---
-		// Queries /cluster/resources for the authoritative node, correct even
-		// after an HA failover. Not-found is idempotent for delete: the VM is
-		// already gone, so clean up agent state and return success.
-		// Transport error -> propagate.
-		logger.Debug("delete_vm: locating VM via cluster scan")
-		node, vmTags, found, lookupErr := pve.FindVMViaCluster(ctx, deps.PVE, vmid)
+		// --- locate VM authoritatively ---
+		// The cluster scan's hit is authoritative (correct even after an HA
+		// failover), but its miss is not: /cluster/resources lags node-local
+		// state by minutes on loaded clusters, and treating a stale miss as
+		// "already deleted" makes the Director drop its record while the live
+		// VM keeps running with its IP. FindVMAuthoritative therefore proves
+		// absence on a miss with per-node config probes before this handler
+		// may take the idempotent-success branch; any probe failure surfaces
+		// retriable instead. Transport error -> propagate.
+		logger.Debug("delete_vm: locating VM (cluster scan, per-node probes on miss)")
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("delete_vm: locate VM %s", vmCID))
+			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
 		}
-		if !found || node == "" {
-			logger.Info("delete_vm: VM not found in cluster — already deleted, returning success")
+		node, vmTags := loc.Node, loc.Tags
+		if !loc.Found || node == "" {
+			logger.Info("delete_vm: VM absent from cluster index and every node's config probe — already deleted, returning success")
 			// Best-effort agent cleanup: registry/cloud-init state may still exist.
 			if agentErr := deps.Agent.Remove(ctx, deps.Config.Node, vmid); agentErr != nil {
 				logger.Warn("delete_vm: agent.Remove failed after cluster-not-found", log.Err(agentErr))

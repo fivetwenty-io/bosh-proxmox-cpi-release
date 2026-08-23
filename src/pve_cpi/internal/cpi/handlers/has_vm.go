@@ -58,21 +58,24 @@ func HandleHasVM(deps Deps) cpi.Handler {
 
 		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
-		// --- locate VM via cluster scan ---
-		// Queries /cluster/resources so the node returned is authoritative even
-		// after an HA failover. Scan-not-found → VM absent → return false.
-		// Transport error → propagate; caller may retry.
-		logger.Debug("has_vm: locating VM via cluster scan")
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		// --- locate VM authoritatively ---
+		// A cluster-scan hit is authoritative even after an HA failover, but a
+		// miss is not: the /cluster/resources index lags by minutes on loaded
+		// clusters, and a false "no" here makes the Director treat a live VM
+		// as gone. FindVMAuthoritative proves absence on a miss with per-node
+		// config probes; a probe failure surfaces retriable instead of a
+		// false no. Transport error → propagate; caller may retry.
+		logger.Debug("has_vm: locating VM (cluster scan, per-node probes on miss)")
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), "has_vm: locate VM")
+			return nil, cpierrors.Wrap(lookupErr, "has_vm: locate VM")
 		}
-		if !found || node == "" {
-			logger.Debug("has_vm: VM not found in cluster — returning false")
+		if !loc.Found || loc.Node == "" {
+			logger.Debug("has_vm: VM absent from cluster index and every node's config probe — returning false")
 			return false, nil
 		}
 
-		logger.Debug("has_vm: VM found via cluster scan — returning true", log.String("node", node))
+		logger.Debug("has_vm: VM found — returning true", log.String("node", loc.Node))
 		return true, nil
 	})
 }

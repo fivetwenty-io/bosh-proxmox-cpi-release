@@ -93,17 +93,22 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			log.Int("vmid", vmid),
 		)
 
-		// --- locate VM via cluster scan ---
-		// Queries /cluster/resources for the authoritative node, correct even
-		// after an HA failover. Not-found → VMNotFound. Transport error → propagate.
-		logger.Debug("set_vm_metadata: locating VM via cluster scan")
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		// --- locate VM authoritatively ---
+		// set_vm_metadata runs immediately after create_vm — the narrowest
+		// index-lag window in the CPI protocol — so a /cluster/resources miss
+		// here is routinely a VM the index has not caught up with yet.
+		// FindVMAuthoritative's per-node config probes on the miss path find
+		// it anyway; VMNotFound is only returned on proven absence, and a
+		// probe failure surfaces retriable. Transport error → propagate.
+		logger.Debug("set_vm_metadata: locating VM (cluster scan, per-node probes on miss)")
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("set_vm_metadata: locate VM %s", vmCID))
+			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("set_vm_metadata: locate VM %s", vmCID))
 		}
-		if !found || node == "" {
+		if !loc.Found || loc.Node == "" {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		node := loc.Node
 		logger.Debug("set_vm_metadata: VM located", log.String("node", node))
 
 		// --- build description ---

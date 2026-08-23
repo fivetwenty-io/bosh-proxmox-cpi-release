@@ -69,17 +69,21 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			log.Int("vmid", vmid),
 		)
 
-		// --- locate VM via cluster scan ---
-		// Queries /cluster/resources for the authoritative node, correct even
-		// after an HA failover. Not-found → VMNotFound. Transport error → propagate.
-		logger.Debug("reboot_vm: locating VM via cluster scan")
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		// --- locate VM authoritatively ---
+		// A cluster-scan hit is correct even after an HA failover; a miss is
+		// proven by per-node config probes before VMNotFound may be returned,
+		// since the /cluster/resources index lags and a young VM can be
+		// invisible there. Probe failure → retriable. Transport error →
+		// propagate.
+		logger.Debug("reboot_vm: locating VM (cluster scan, per-node probes on miss)")
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), fmt.Sprintf("reboot_vm: locate VM %s", vmCID))
+			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("reboot_vm: locate VM %s", vmCID))
 		}
-		if !found || node == "" {
+		if !loc.Found || loc.Node == "" {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		node := loc.Node
 		logger.Debug("reboot_vm: VM located", log.String("node", node))
 
 		mode := deps.Config.RebootModeValue()

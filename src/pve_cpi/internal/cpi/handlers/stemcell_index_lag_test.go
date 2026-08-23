@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -113,10 +114,14 @@ func TestDeleteStemcell_ClusterIndexLag_NodeSweepFindsTemplate(t *testing.T) {
 }
 
 // TestDeleteStemcell_ClusterIndexLag_NodeSweepProbeErrors_NoTemplateBranch
-// verifies probe failures degrade to the pre-sweep behavior (no-template
-// branch, nothing destroyed) instead of failing the call, and that the sweep
-// genuinely attempted every enumerated node first (a sweep that never probes
-// would pass the destruction assertions trivially).
+// verifies the sweep fails closed: when every node's probe errors and no
+// ref-anchor was found, delete_stemcell returns a retriable error rather
+// than entering the no-template branch — that branch deletes the qcow2, and
+// concluding "no template" from a sweep that could not actually see the
+// nodes is the original production bug reachable through its own fix's
+// error path. Nothing may be destroyed and the qcow2 delete must not run.
+// The sweep must still have attempted every enumerated node (a sweep that
+// never probes would pass the destruction assertions trivially).
 func TestDeleteStemcell_ClusterIndexLag_NodeSweepProbeErrors_NoTemplateBranch(t *testing.T) {
 	t.Parallel()
 
@@ -145,14 +150,22 @@ func TestDeleteStemcell_ClusterIndexLag_NodeSweepProbeErrors_NoTemplateBranch(t 
 	h := handlers.HandleDeleteStemcell(deps)
 
 	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
-	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err == nil {
+		t.Fatal("expected a retriable error when every probe fails and no anchor was found; got success")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("incomplete-sweep error = %v; want retriable (the Director re-drives once PVE recovers)", err)
 	}
 	if len(probed) != 2 {
 		t.Errorf("sweep probed %v; want both enumerated nodes attempted despite errors", probed)
 	}
 	if len(destroyed) != 0 {
-		t.Errorf("nothing may be destroyed on the no-template branch, got %v", destroyed)
+		t.Errorf("nothing may be destroyed on an incomplete sweep, got %v", destroyed)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("qcow2 delete ran %d time(s) on an incomplete sweep; the volume must be left in place",
+			storageSvc.deleteVolumeIfExistsCalls)
 	}
 }
 

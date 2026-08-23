@@ -239,8 +239,10 @@ func (m *stemcellMockCluster) ListConfigNodes(ctx context.Context) (*sdkcluster.
 	if m.listConfigNodesFn != nil {
 		return m.listConfigNodesFn(ctx)
 	}
-	// Default: single-node cluster — local storage is acceptable.
-	nodeEntry, _ := json.Marshal(map[string]string{"node": vmNode})
+	// Default: single-node cluster — local storage is acceptable. The real
+	// /cluster/config/nodes payload carries the node name under "name";
+	// "node" is kept for callers keyed on the resource-index field name.
+	nodeEntry, _ := json.Marshal(map[string]string{"name": vmNode, "node": vmNode})
 	resp := sdkcluster.ListConfigNodesResponse{nodeEntry}
 	return &resp, nil
 }

@@ -147,12 +147,27 @@ var _ agent.Agent = (*captureAgent)(nil)
 
 // attachDeps builds a Deps suitable for attach_disk tests.
 func attachDeps(qemuSvc qemu.Service, ag agent.Agent) handlers.Deps {
+	// The cluster listing places VM 100 on testNode so the handler's
+	// authoritative VM lookup hits on the scan; an index miss would
+	// otherwise trigger per-node config probes, consuming a scripted
+	// Config response and shifting the call sequences these tests assert.
+	targetRaw, _ := json.Marshal(map[string]any{
+		"vmid": 100,
+		"node": testNode,
+		"type": "qemu",
+	})
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			resp := sdkcluster.ListResourcesResponse{targetRaw}
+			return &resp, nil
+		},
+	}
 	return handlers.Deps{
 		Config: &config.CPIConfig{
 			Node:         testNode,
 			VMDiskFormat: "qcow2",
 		},
-		PVE:    &mockPVEClient{qemuSvc: qemuSvc},
+		PVE:    &mockPVEClient{qemuSvc: qemuSvc, clusterSvc: clusterSvc},
 		Agent:  ag,
 		Logger: log.NewNopLogger(),
 	}
@@ -364,15 +379,16 @@ func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 // the diskID returned by AttachDisk and still returns valid disk_hints
 // (logs a warning).
 //
-// The first Config call (slot selection) must succeed; the second (resolve)
-// must fail. configErrAfter=1 implements that two-phase behavior.
+// The first two Config calls (holder scan on the listed VM, then slot
+// selection) must succeed; the third (resolve) must fail. configErrAfter=2
+// implements that behavior.
 func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 	t.Parallel()
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
 		configCfg:          map[string]any{},
 		configErr:          errors.New("transient config error"),
-		configErrAfter:     1,
+		configErrAfter:     2,
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -507,11 +523,17 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
-			// Call 1 — slot selection: legacy scsi0 attachment present.
+			// Calls 1-2 — holder scan: VM 100 is listed in the cluster, so
+			// the disk-holder resolution reads its config to match the disk,
+			// then re-reads it for tags + slot (finds the disk on a
+			// non-parker VM, a no-op for the unpark path).
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
-			// Call 2 — re-read after Detach: scsi0 gone.
+			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
+			// Call 3 — slot selection: legacy scsi0 attachment present.
+			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
+			// Call 4 — re-read after Detach: scsi0 gone.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 3 — Resolve after AttachDisk: scsi1 present with volid.
+			// Call 5 — Resolve after AttachDisk: scsi1 present with volid.
 			{"virtio0": "data:vm-100-disk-0", "scsi1": diskCID},
 		},
 	}
@@ -1522,7 +1544,16 @@ func parkerClusterSvc() *mockClusterSvc {
 		"node": parkerNode,
 		"type": "qemu",
 	})
-	resp := sdkcluster.ListResourcesResponse{raw}
+	// The target VM (100) is listed too: the handler's authoritative VM
+	// lookup would otherwise treat the index miss as unproven and probe
+	// per-node configs, consuming a scripted Config response and shifting
+	// the call sequences these tests assert.
+	targetRaw, _ := json.Marshal(map[string]any{
+		"vmid": 100,
+		"node": testNode,
+		"type": "qemu",
+	})
+	resp := sdkcluster.ListResourcesResponse{raw, targetRaw}
 	return &mockClusterSvc{
 		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 			return &resp, nil

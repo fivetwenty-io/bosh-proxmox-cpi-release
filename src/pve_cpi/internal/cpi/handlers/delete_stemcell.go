@@ -61,11 +61,14 @@ import (
 //     ("-<8hex>.qcow2"). Unextractable → Warn and treat as "no cache
 //     template found" (falls through to step 6).
 //  3. Cluster-scoped lookup of every cache template carrying
-//     "bosh-stemcell-sha-<sha8>" (pve.FindTemplatesBySHATagCluster). Zero
-//     matches → an authoritative per-node sweep of every cluster node
-//     (findStemcellTemplatesAllNodesBestEffort), since a cluster-index miss
-//     can be lag rather than absence. Zero matches from both → step 6
-//     (idempotent retry / already-destroyed convergence).
+//     "bosh-stemcell-sha-<sha8>" (pve.FindTemplatesBySHATagCluster),
+//     unioned unconditionally with an authoritative per-node sweep of every
+//     cluster node (findStemcellTemplatesAllNodes), since the cluster index
+//     lags and can miss templates a per-node listing sees. An incomplete
+//     sweep with no ref-anchor found is retriable — absence must be proven
+//     by every node before the destructive no-template branch may run.
+//     Zero matches from a complete sweep → step 6 (idempotent retry /
+//     already-destroyed convergence).
 //  4. One or more matches (from either the cluster lookup or the per-node
 //     sweep): the lowest-VMID entry that is NOT a per-node
 //     replica (pve.TemplateRef.IsReplica) is the ref-anchor; every other
@@ -176,27 +179,46 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 			}
 		}
 
-		// A cluster-scoped miss can be /cluster/resources index lag rather
-		// than a true absence: a template create_stemcell froze moments ago is
-		// invisible there for the lag window (observed at minutes on loaded
-		// clusters), and taking the no-template branch then deletes the qcow2
-		// while orphaning the live template. Before concluding no-template,
-		// read every node's guest listing authoritatively (per-node listings,
-		// no index involved). Sweeping all nodes rather than guessing the
-		// template's home matters: create_stemcell can build on a node other
-		// than the configured one (owning-node retarget of a node-restricted
-		// staging pool, a cloud_properties node pin, or adoption of an
-		// existing template found elsewhere), and delete_stemcell's
-		// destructive branches must see replicas on every node so this
-		// with-template path stays equivalent to the cluster-listing one.
-		if sha8OK && len(refs) == 0 {
-			if nodeRefs := findStemcellTemplatesAllNodesBestEffort(ctx, deps, logger, sha8); len(nodeRefs) > 0 {
+		// The cluster listing above is /cluster/resources-fed and can be
+		// minutes stale on a loaded cluster: a template create_stemcell froze
+		// moments ago is invisible there, and a replica or twin can be missing
+		// from a non-empty listing just as easily as an anchor from an empty
+		// one. Both destructive conclusions this handler draws — "no template,
+		// delete the qcow2" and "these are ALL the templates, sweep them" —
+		// therefore always get the authoritative per-node sweep unioned in,
+		// not only on an empty cluster answer. Sweeping all nodes rather than
+		// guessing the template's home matters: create_stemcell can build on
+		// a node other than the configured one (owning-node retarget of a
+		// node-restricted staging pool, a cloud_properties node pin, or
+		// adoption of an existing template found elsewhere).
+		//
+		// An incomplete sweep (enumeration failure, or any node's probe
+		// failing) is fatal exactly when it would feed the no-template or
+		// no-anchor fall-through: those branches delete the qcow2, and
+		// absence must be proven by every node, never inferred from partial
+		// data. When a ref-anchor was found despite the incomplete sweep, the
+		// with-template path proceeds — at worst the sweep set misses a
+		// replica on the failed node, which the orphan prune or a later call
+		// cleans up, while deferring would block the delete on a node that
+		// may stay down.
+		if sha8OK {
+			nodeRefs, sweepErr := findStemcellTemplatesAllNodes(ctx, deps, logger, sha8)
+			if len(nodeRefs) > 0 && len(refs) == 0 {
 				logger.Info("delete_stemcell: cache template found by authoritative per-node "+
 					"listings after a cluster-index miss",
 					log.String("sha8", sha8),
 					log.Int("match_count", len(nodeRefs)),
 				)
-				refs = nodeRefs
+			}
+			refs = unionTemplateRefs(refs, nodeRefs)
+			if sweepErr != nil {
+				if _, _, anchorOK := selectStemcellAnchor(refs); !anchorOK {
+					return nil, cpierrors.Wrap(sweepErr,
+						"delete_stemcell: cannot prove the cache template absent (the qcow2 delete must not run on partial data)")
+				}
+				logger.Warn("delete_stemcell: per-node template sweep incomplete; proceeding on the found ref-anchor "+
+					"(replicas on the failed node(s), if any, are left for the orphan prune)",
+					log.Err(sweepErr))
 			}
 		}
 
@@ -473,32 +495,41 @@ func deleteHeavyQcow2Primary(ctx context.Context, deps Deps, logger *log.Logger,
 	return nil
 }
 
-// findStemcellTemplatesAllNodesBestEffort probes every cluster node's
-// authoritative guest listing for generation-gated cache templates carrying
-// the sha tag, merged in ascending-VMID order (the anchor-selection contract).
-// It backstops a cluster-scoped lookup that returned nothing: per-node
-// listings read node-local guest configs and do not lag the way
-// /cluster/resources does. Best effort throughout: node-enumeration failure
-// degrades to probing the template's presumed home node, and a single node's
-// probe failure warns and continues with the remaining nodes, since the
-// caller treats an empty answer as the (idempotent) no-template branch.
-func findStemcellTemplatesAllNodesBestEffort(
+// findStemcellTemplatesAllNodes probes every cluster node's authoritative
+// guest listing for generation-gated cache templates carrying the sha tag,
+// merged in ascending-VMID order (the anchor-selection contract). It backs
+// the cluster-scoped lookup: per-node listings read node-local guest configs
+// and do not lag the way /cluster/resources does.
+//
+// The sweep is strict about completeness, not about partial yield: refs from
+// every node that answered are always returned, and the error is non-nil
+// exactly when some node's answer is missing — node enumeration failed,
+// returned zero nodes, or a per-node probe failed after its retries. The
+// caller decides whether the incomplete merge is still usable: it is when a
+// ref-anchor was found anyway, and it is not when the merge would feed a
+// "no template" conclusion, because that branch deletes the qcow2 — the
+// original production bug — and absence needs every node's clean answer.
+// (The old shape guessed the template's home node on enumeration failure and
+// swallowed probe failures entirely, which made the backstop's own error
+// path a route back into exactly the bug it exists to prevent.)
+func findStemcellTemplatesAllNodes(
 	ctx context.Context,
 	deps Deps,
 	logger *log.Logger,
 	sha8 string,
-) []pve.TemplateRef {
+) ([]pve.TemplateRef, error) {
 	nodes, listErr := listClusterNodes(ctx, deps)
-	if listErr != nil || len(nodes) == 0 {
-		logger.Warn("delete_stemcell: cluster node enumeration returned no nodes; "+
-			"probing the template's presumed home node only",
-			log.Err(listErr),
-		)
-		if home := templateHomeNode(deps); home != "" {
-			nodes = []string{home}
-		}
+	if listErr != nil {
+		return nil, cpierrors.WrapAs(listErr, cpierrors.TypeRetriableCloud,
+			"delete_stemcell: cluster node enumeration for the template sweep failed")
+	}
+	if len(nodes) == 0 {
+		return nil, cpierrors.Retriable(
+			"delete_stemcell: cluster node enumeration returned zero nodes; cannot prove template absence")
 	}
 	var all []pve.TemplateRef
+	var failedNodes []string
+	var lastProbeErr error
 	for _, node := range nodes {
 		nodeRefs, probeErr := pve.FindTemplatesBySHATagNode(ctx, deps.PVE, node, sha8)
 		if probeErr != nil {
@@ -508,12 +539,37 @@ func findStemcellTemplatesAllNodesBestEffort(
 				log.String("sha8", sha8),
 				log.Err(probeErr),
 			)
+			failedNodes = append(failedNodes, node)
+			lastProbeErr = probeErr
 			continue
 		}
 		all = append(all, nodeRefs...)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].VMID < all[j].VMID })
-	return all
+	if len(failedNodes) > 0 {
+		return all, cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("delete_stemcell: template probe failed on node(s) %s; the sweep is incomplete",
+				strings.Join(failedNodes, ",")))
+	}
+	return all, nil
+}
+
+// unionTemplateRefs merges two TemplateRef sets, deduplicated by (node, vmid)
+// with first occurrence winning, re-sorted ascending by VMID (the
+// anchor-selection contract).
+func unionTemplateRefs(a, b []pve.TemplateRef) []pve.TemplateRef {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]pve.TemplateRef, 0, len(a)+len(b))
+	for _, r := range append(append([]pve.TemplateRef{}, a...), b...) {
+		key := fmt.Sprintf("%s/%d", r.Node, r.VMID)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
+	return out
 }
 
 // sweepHeavyQcow2OtherNodesBestEffort best-effort deletes storage:volumePath

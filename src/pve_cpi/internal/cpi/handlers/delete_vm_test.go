@@ -203,14 +203,21 @@ func TestHandleDeleteVM_MultiNode_ResolvesCorrectNode(t *testing.T) {
 	}
 }
 
-// TestHandleDeleteVM_NotFound_InCluster verifies that when the cluster scan does
-// not find the VM, delete_vm returns nil (idempotent: already gone).
+// TestHandleDeleteVM_NotFound_InCluster verifies that when the cluster scan
+// does not find the VM and the per-node config probe proves the absence
+// (404 on every node), delete_vm returns nil (idempotent: already gone).
 func TestHandleDeleteVM_NotFound_InCluster(t *testing.T) {
 	t.Parallel()
 
-	// testDeps wires empty cluster: VM not found.
+	// testDeps wires empty cluster; the authoritative probe must answer
+	// not-found for the idempotent-success branch to run.
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return nil, notFoundAPIErr()
+		},
+	}
 	agentSvc := &mockAgentService{}
-	h := handlers.HandleDeleteVM(testDeps(nil, nil, nil, agentSvc))
+	h := handlers.HandleDeleteVM(testDeps(qemuSvc, nil, nil, agentSvc))
 	result, err := h.Handle(context.Background(), marshalArgs("202"), jsonrpc.Context{})
 
 	if err != nil {
@@ -218,6 +225,86 @@ func TestHandleDeleteVM_NotFound_InCluster(t *testing.T) {
 	}
 	if result != nil {
 		t.Errorf("expected nil result, got %v", result)
+	}
+}
+
+// TestHandleDeleteVM_IndexMiss_ProbeFindsVM_DestroysOnProbedNode pins the
+// positive half of the authoritative lookup: the cluster index misses a VM
+// that a per-node config probe then finds (the index lags node-local state by
+// minutes on loaded clusters, so a just-created VM is exactly this shape).
+// Before the probe existed, delete_vm reported false success here, leaking a
+// live VM and its IP; the destroy must run, and against the node the probe
+// found the VM on, not the configured default.
+func TestHandleDeleteVM_IndexMiss_ProbeFindsVM_DestroysOnProbedNode(t *testing.T) {
+	t.Parallel()
+
+	const holderNode = "pve-node2" // not testConfig's default node
+
+	var probedNodes []string
+	var stopNodes []string
+	type deleteCall struct{ node, vmid string }
+	var deleteCalls []deleteCall
+
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, node string, _ int) (map[string]any, error) {
+			probedNodes = append(probedNodes, node)
+			if node != holderNode {
+				return nil, notFoundAPIErr()
+			}
+			return map[string]any{"tags": "bosh-cpi"}, nil
+		},
+		stopFn: func(_ context.Context, node string, _ int) (string, error) {
+			stopNodes = append(stopNodes, node)
+			return "UPID:pve-node2:stop-probe-hit", nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, node string, vmid string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalls = append(deleteCalls, deleteCall{node, vmid})
+			return &nodes.DeleteQemuResponse{}, nil
+		},
+	}
+	clusterSvc := &mockClusterSvc{
+		// listResourcesFn left nil: the default empty listing is the index miss.
+		listConfigNodesFn: func(_ context.Context) (*cluster.ListConfigNodesResponse, error) {
+			members := []string{"pve-node1", holderNode}
+			resp := make(cluster.ListConfigNodesResponse, 0, len(members))
+			for _, name := range members {
+				raw, _ := json.Marshal(map[string]any{"name": name})
+				resp = append(resp, raw)
+			}
+			return &resp, nil
+		},
+	}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, &mockStorageService{}, clusterSvc)
+	h := handlers.HandleDeleteVM(deps)
+	result, err := h.Handle(context.Background(), marshalArgs("303"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if len(deleteCalls) != 1 {
+		t.Fatalf("DeleteQemu: want exactly 1 destroy for the probe-found VM, got %d (%v)", len(deleteCalls), deleteCalls)
+	}
+	if deleteCalls[0].node != holderNode || deleteCalls[0].vmid != "303" {
+		t.Errorf("DeleteQemu: want node=%q vmid=%q, got node=%q vmid=%q",
+			holderNode, "303", deleteCalls[0].node, deleteCalls[0].vmid)
+	}
+	if len(stopNodes) == 0 || stopNodes[0] != holderNode {
+		t.Errorf("Stop: want the probe-resolved node %q, got %v", holderNode, stopNodes)
+	}
+	sawCleanMiss := false
+	for _, n := range probedNodes {
+		if n == "pve-node1" {
+			sawCleanMiss = true
+		}
+	}
+	if !sawCleanMiss {
+		t.Errorf("probe visited %v; want pve-node1 probed (clean 404) before the hit on %q", probedNodes, holderNode)
 	}
 }
 
@@ -1189,7 +1276,13 @@ func TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			// The sweep re-tests the deleting tag from the authoritative
+			// config; the straggler must carry it there or it is (correctly)
+			// skipped as a stale index row.
+			if vmid == stragglerVMID {
+				return map[string]any{"tags": "bosh-deleting"}, nil
+			}
 			return map[string]any{}, nil
 		},
 	}
@@ -1261,14 +1354,22 @@ func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			// The sweep re-tests the deleting tag from the authoritative
+			// config; the straggler must carry it there to reach the destroy
+			// whose 404 this test pins.
+			if vmid == stragglerVMID {
+				return map[string]any{"tags": "bosh-deleting"}, nil
+			}
 			return map[string]any{}, nil
 		},
 	}
+	stragglerDestroyAttempted := false
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 			if vmidStr == "721" {
 				// Straggler already gone — 404.
+				stragglerDestroyAttempted = true
 				return nil, notFoundAPIErr()
 			}
 			// Current VM succeeds.
@@ -1300,6 +1401,9 @@ func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
 	}
 	if sweepErrPropagated {
 		t.Error("straggler 404 propagated as error")
+	}
+	if !stragglerDestroyAttempted {
+		t.Error("straggler destroy never attempted; the 404-tolerance path this test pins was not exercised")
 	}
 }
 
@@ -1490,11 +1594,17 @@ func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
 	}
 
 	currentDestroyCalled := false
+	stragglerDestroyAttempted := false
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			// The straggler must carry the deleting tag in its authoritative
+			// config to reach the destroy whose failure this test pins.
+			if vmid == stragglerVMID {
+				return map[string]any{"tags": "bosh-deleting"}, nil
+			}
 			return map[string]any{}, nil
 		},
 	}
@@ -1502,6 +1612,7 @@ func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
 		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 			if vmidStr == "733" {
 				// Straggler destroy fails with a non-404 error.
+				stragglerDestroyAttempted = true
 				return nil, errors.New("pve: task queue full")
 			}
 			// Current VM destroy succeeds.
@@ -1528,6 +1639,86 @@ func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
 	}
 	if !currentDestroyCalled {
 		t.Error("sweep-destroy-error: current VM destroy must proceed after straggler destroy failure")
+	}
+	if !stragglerDestroyAttempted {
+		t.Error("straggler destroy never attempted; the destroy-error path this test pins was not exercised")
+	}
+}
+
+// TestHandleDeleteVM_FastPath_SweepSkipsStaleIndexTag pins the sweep's
+// authoritative re-test of the deleting tag. The cluster index lags node
+// state by minutes and PVE reuses VMIDs, so a row still tagged bosh-deleting
+// can describe a VMID that has since been destroyed and reassigned to a brand
+// new, innocent VM. The sweep's destroy runs with skiplock and purge; issuing
+// it from the stale row alone would destroy that new VM. When the
+// authoritative config carries no deleting tag, the sweep must skip the VMID
+// entirely while the current delete proceeds.
+func TestHandleDeleteVM_FastPath_SweepSkipsStaleIndexTag(t *testing.T) {
+	t.Parallel()
+
+	const currentVMID = 741
+	const reusedVMID = 742 // index row stale-tagged; config says innocent VM
+
+	stragglerRaw, _ := json.Marshal(map[string]any{
+		"vmid": reusedVMID,
+		"node": vmNode,
+		"type": "qemu",
+		"tags": "bosh-deleting",
+	})
+	currentRaw, _ := json.Marshal(map[string]any{
+		"vmid": currentVMID,
+		"node": vmNode,
+		"type": "qemu",
+	})
+	clusterSvc := &mockClusterSvc{
+		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			resp := cluster.ListResourcesResponse{currentRaw, stragglerRaw}
+			return &resp, nil
+		},
+	}
+
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if vmid == reusedVMID {
+				// The authoritative config: a live VM with no deleting tag.
+				return map[string]any{"tags": "bosh-vm;bosh-agent-fresh"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	type deleteCall struct{ vmid string }
+	var deleteCalls []deleteCall
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			deleteCalls = append(deleteCalls, deleteCall{vmidStr})
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		updateQemuConfigFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	deps := testDepsWithCluster(qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, &mockStorageService{}, clusterSvc)
+	enabled := true
+	deps.Config.FastPathDelete = &enabled
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("741"), jsonrpc.Context{})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, dc := range deleteCalls {
+		if dc.vmid == "742" {
+			t.Fatalf("destroy issued for VMID 742 from a stale index row; the authoritative config shows an innocent VM (calls: %v)", deleteCalls)
+		}
+	}
+	if len(deleteCalls) != 1 || deleteCalls[0].vmid != "741" {
+		t.Errorf("deleteCalls = %v; want exactly the current VM 741", deleteCalls)
 	}
 }
 
@@ -1702,7 +1893,13 @@ func TestHandleDeleteVM_FastPath_SweepCapsAtMax(t *testing.T) {
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			// The sweep re-tests the deleting tag from the authoritative
+			// config; straggler VMIDs must carry it there or they are
+			// (correctly) skipped as stale index rows.
+			if vmid >= 900 {
+				return map[string]any{"tags": "bosh-deleting"}, nil
+			}
 			return map[string]any{}, nil
 		},
 	}

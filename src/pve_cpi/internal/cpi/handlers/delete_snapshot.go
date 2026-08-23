@@ -63,23 +63,27 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 3. Locate VM via cluster scan to get authoritative node.
+		// 3. Locate VM authoritatively. The idempotent-success branch below
+		//    concludes "snapshot necessarily absent" from the VM's absence,
+		//    so absence must be proven (per-node config probes on an index
+		//    miss), never inferred from the lagging /cluster/resources index.
 		// ----------------------------------------------------------------
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr),
+			return nil, cpierrors.Wrap(lookupErr,
 				fmt.Sprintf("delete_snapshot: locate VM %s", vmCID))
 		}
-		if !found || node == "" {
+		if !loc.Found || loc.Node == "" {
 			// VM absent -> snapshot is necessarily absent. Idempotent success.
-			deps.Log(ctx).Info("delete_snapshot: VM not found in cluster -- snapshot already absent",
+			deps.Log(ctx).Info("delete_snapshot: VM absent from cluster index and every node's config probe -- snapshot already absent",
 				log.String("snapshot_cid", snapshotCID),
 				log.Int("vmid", vmid),
 			)
 			return nil, nil
 		}
+		node := loc.Node
 
-		deps.Log(ctx).Debug("delete_snapshot: VM located via cluster scan",
+		deps.Log(ctx).Debug("delete_snapshot: VM located",
 			log.String("snapshot_cid", snapshotCID),
 			log.Int("vmid", vmid),
 			log.String("node", node),

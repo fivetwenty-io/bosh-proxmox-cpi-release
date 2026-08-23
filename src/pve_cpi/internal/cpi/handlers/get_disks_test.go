@@ -227,7 +227,13 @@ func TestHandleGetDisks_MissingNode(t *testing.T) {
 	h := handlers.HandleGetDisks(handlers.Deps{
 		Config: &config.CPIConfig{Node: ""},
 		PVE: &mockPVEClient{
-			qemuSvc:    &getDisksQEMUService{},
+			// Empty cluster listing plus a 404 config probe: the VM is
+			// authoritatively absent, so VMNotFound is the proven answer.
+			qemuSvc: &getDisksQEMUService{
+				configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+					return nil, notFoundAPIErr()
+				},
+			},
 			clusterSvc: &mockClusterSvc{}, // empty: VM 100 not found
 		},
 		Logger: log.NewNopLogger(),

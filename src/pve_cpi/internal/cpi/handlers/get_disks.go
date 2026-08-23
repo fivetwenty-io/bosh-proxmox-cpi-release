@@ -86,17 +86,20 @@ func HandleGetDisks(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 2. Locate VM via cluster scan to get authoritative node.
+		// 2. Locate VM authoritatively (cluster scan; per-node config
+		//    probes on an index miss, so a just-created VM the lagging
+		//    index has not caught up with is not misreported as gone).
 		// ----------------------------------------------------------------
-		node, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 		if lookupErr != nil {
-			return nil, cpierrors.Wrap(pve.WrapError(lookupErr), "get_disks: locate VM "+vmCID)
+			return nil, cpierrors.Wrap(lookupErr, "get_disks: locate VM "+vmCID)
 		}
-		if !found || node == "" {
+		if !loc.Found || loc.Node == "" {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		node := loc.Node
 
-		deps.Log(ctx).Debug("get_disks: VM located via cluster scan",
+		deps.Log(ctx).Debug("get_disks: VM located",
 			log.String("vm_cid", vmCID),
 			log.String("node", node),
 		)

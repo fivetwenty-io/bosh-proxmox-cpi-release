@@ -655,10 +655,17 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stabl
 	// node that cannot see the volume, producing a confusing storage
 	// error. Verify co-location explicitly and surface a clear message
 	// when violated.
-	vmNode, found, lookupErr := pve.FindVMNodeViaCluster(ctx, deps.PVE, vmid)
+	// FindVMAuthoritative rather than the bare cluster scan: attach_disk can
+	// run inside the index's lag window (create_vm then attach_disk is a
+	// standard Director sequence), and a stale-index miss would leave the
+	// backend-derived storage node in place — a wrong-node config read that
+	// surfaces as a confusing pmxcfs error. The per-node probes on the miss
+	// path resolve the real node; a probe failure surfaces retriable.
+	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
 	if lookupErr != nil {
 		return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
 	}
+	vmNode, found := loc.Node, loc.Found
 	if backend.Kind() == pve.BackendLocal {
 		if found && vmNode != "" && vmNode != node {
 			switch {

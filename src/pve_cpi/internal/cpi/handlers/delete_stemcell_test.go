@@ -846,8 +846,12 @@ func TestDeleteStemcell_Heavy_NoTemplates_UsesStemcellTemplateNode(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(storageSvc.calls) != 1 || storageSvc.calls[0].node != "pve-template-node" {
-		t.Errorf("expected qcow2 delete on StemcellTemplateNode, got %+v", storageSvc.calls)
+	// The primary delete targets StemcellTemplateNode; the best-effort
+	// replica sweep may then visit the other enumerated cluster nodes
+	// (the default mock lists vmNode), so only the primary call's node is
+	// pinned here.
+	if len(storageSvc.calls) == 0 || storageSvc.calls[0].node != "pve-template-node" {
+		t.Errorf("expected the primary qcow2 delete on StemcellTemplateNode, got %+v", storageSvc.calls)
 	}
 }
 

@@ -44,13 +44,18 @@ func NewVMAnnotator(deps Deps) *VMAnnotator {
 // not correctness, and the annotation itself is already best-effort. Returns
 // an error when the node cannot be located or the PVE update fails.
 func (a *VMAnnotator) AnnotateNotes(ctx context.Context, vmid int, notes string) error {
-	node, ok, err := pve.FindVMNodeViaCluster(ctx, a.pveClient, vmid)
+	// Authoritative lookup: the annotator often runs right after create_vm,
+	// inside the cluster index's lag window, and a stale-index miss here
+	// silently skips the annotation for a VM that exists. The per-node probes
+	// on the miss path find it; a proven absence stays a silent no-op.
+	loc, err := pve.FindVMAuthoritative(ctx, a.pveClient, vmid)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if !loc.Found || loc.Node == "" {
 		return nil
 	}
+	node := loc.Node
 
 	desc := notes
 	if vmCfg, cfgErr := a.pveClient.QEMU().Config(ctx, node, vmid); cfgErr == nil {

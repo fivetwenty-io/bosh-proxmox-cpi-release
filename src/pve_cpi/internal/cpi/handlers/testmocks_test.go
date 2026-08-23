@@ -767,8 +767,11 @@ func (m *mockClusterSvc) ListConfigNodes(ctx context.Context) (*cluster.ListConf
 		return m.listConfigNodesFn(ctx)
 	}
 	// Default: single-node cluster (one entry). Tests exercising multi-node
-	// topology must set listConfigNodesFn explicitly.
-	raw, _ := json.Marshal(map[string]any{"node": "pve-node1"})
+	// topology must set listConfigNodesFn explicitly. The real
+	// /cluster/config/nodes payload carries the node name under "name"
+	// (which pve.ListClusterConfigNodes parses); "node" is included for
+	// callers that key on the resource-index field name.
+	raw, _ := json.Marshal(map[string]any{"name": "pve-node1", "node": "pve-node1"})
 	resp := cluster.ListConfigNodesResponse{raw}
 	return &resp, nil
 }

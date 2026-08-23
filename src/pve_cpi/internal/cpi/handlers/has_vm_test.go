@@ -35,12 +35,19 @@ func TestHandleHasVM_Exists(t *testing.T) {
 }
 
 // TestHandleHasVM_NotExists verifies false is returned when the cluster scan
-// returns no match for the VM.
+// returns no match for the VM and the per-node config probe proves the
+// absence (404 on every node).
 func TestHandleHasVM_NotExists(t *testing.T) {
 	t.Parallel()
 
-	// testDeps wires empty cluster list: vmid 999 will not be found.
-	h := handlers.HandleHasVM(testDeps(nil, nil, nil, &mockAgentService{}))
+	// testDeps wires an empty cluster list; the authoritative per-node probe
+	// then runs and must answer not-found for false to be returned.
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return nil, notFoundAPIErr()
+		},
+	}
+	h := handlers.HandleHasVM(testDeps(qemuSvc, nil, nil, &mockAgentService{}))
 	result, err := h.Handle(context.Background(), marshalArgs("999"), jsonrpc.Context{})
 
 	if err != nil {

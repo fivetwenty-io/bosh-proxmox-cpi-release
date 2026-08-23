@@ -11,9 +11,6 @@ package pve
 
 import (
 	"context"
-	"encoding/json"
-
-	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 )
@@ -88,7 +85,6 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 	}
 
 	var lastProbeErr error
-	anyProbeSucceeded := false
 
 	for _, node := range candidates {
 		// ExistsTolerant folds the lvmthin/zfspool "Failed to find logical
@@ -104,19 +100,23 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 			lastProbeErr = err
 			continue
 		}
-		anyProbeSucceeded = true
 		if exists {
 			return node, nil
 		}
 	}
 
-	// If every candidate errored (none returned a clean false), we cannot
-	// distinguish "disk genuinely absent" from "all nodes unreachable". Treat
-	// the latter as retriable so the director re-drives the action once PVE
-	// recovers, rather than permanently losing track of the disk.
-	if !anyProbeSucceeded && lastProbeErr != nil {
+	// DiskNotFound may only be concluded from a COMPLETE sweep: every
+	// candidate answered a clean false. A single erroring node with the rest
+	// clean-absent is exactly the case where the volume lives on the node we
+	// could not ask — the erroring node is the likeliest holder, since a
+	// local volume's node going unhealthy takes its probe down with it.
+	// Concluding absence there turns delete_disk into false success,
+	// has_disk into a false no, and detach_disk into a phantom
+	// already-detached. Any probe error with no hit is therefore retriable so
+	// the director re-drives the action once PVE recovers.
+	if lastProbeErr != nil {
 		return "", cpierrors.WrapAs(lastProbeErr, cpierrors.TypeRetriableCloud,
-			"NodeForExisting: all-node probe failed")
+			"NodeForExisting: node probe(s) failed with no hit on the reachable nodes; cannot prove the volume absent")
 	}
 
 	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
@@ -159,48 +159,28 @@ func (l *localBackend) candidateNodes(ctx context.Context) ([]string, error) {
 		return out, nil
 	}
 
-	typ := resourceTypeNode
-	// Wrap the cluster-resources listing in RetryOnTransient so a transient
-	// pvedaemon worker recycling during candidate-node discovery does not
-	// abort the entire backend resolve and cascade into a DiskNotFound. The
-	// SDK error is classified through pve.WrapError so retriable transport
+	// Enumerate from /cluster/config/nodes (corosync membership) rather than
+	// the /cluster/resources index: the index lags cluster state, so a
+	// recently joined or briefly unindexed node would be silently skipped by
+	// the probe sweep — and an unswept node is a node whose volume this scan
+	// would wrongly conclude absent. ListClusterConfigNodes wraps the listing
+	// in RetryOnTransient and classifies its errors, so retriable transport
 	// faults propagate up as RetriableCloud once retries are exhausted.
-	var resp *sdkcluster.ListResourcesResponse
-	if rerr := RetryOnTransient(ctx, nil, "backend(local).candidateNodes", 0, func() error {
-		var listErr error
-		resp, listErr = l.client.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{Type: &typ})
-		return listErr
-	}); rerr != nil {
-		return nil, cpierrors.Wrap(WrapError(rerr), "backend(local): list cluster nodes")
+	nodes, listErr := ListClusterConfigNodes(ctx, l.client)
+	if listErr != nil {
+		return nil, cpierrors.Wrap(listErr, "backend(local): list cluster nodes")
 	}
-	if resp == nil {
-		return out, nil
-	}
-	for _, raw := range *resp {
-		var entry struct {
-			Node string `json:"node"`
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			continue
-		}
-		// /cluster/resources?type=node populates "node" with the node name;
-		// fall back to "name" if "node" is absent in older PVE responses.
-		if entry.Node != "" {
-			add(entry.Node)
-		} else if entry.Name != "" {
-			add(entry.Name)
-		}
+	for _, n := range nodes {
+		add(n)
 	}
 
 	if len(out) == 0 {
-		// Every /cluster/resources row failed to parse into {node,name} (or the
-		// index was empty) — an invisible-cluster condition, not a permanent
+		// The membership listing came back empty (or every row failed to
+		// parse) — an invisible-cluster condition, not a permanent
 		// misconfiguration. Retriable, matching the classification convention
-		// every other error return in this file follows (see the sibling
-		// candidateNodes error two lines above), so the Director re-drives the
-		// action once cluster visibility recovers instead of treating an
-		// unparseable snapshot as a hard failure.
+		// every other error return in this file follows, so the Director
+		// re-drives the action once cluster visibility recovers instead of
+		// treating an unparseable snapshot as a hard failure.
 		return nil, cpierrors.Retriable("backend(local): cluster scan returned zero candidate nodes")
 	}
 	return out, nil
