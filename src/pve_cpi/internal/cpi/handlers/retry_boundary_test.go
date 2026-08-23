@@ -15,6 +15,7 @@ import (
 	"errors"
 	"strconv"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -141,7 +142,7 @@ func TestCreateStemcell_PoolAssign_503_IsRetriable(t *testing.T) {
 	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
 
 	h := handlers.HandleCreateStemcell(deps)
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-pool-503"})
+	_, err := h.Handle(pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 }), args, jsonrpc.Context{RequestID: "req-pool-503"})
 
 	assertHandlerRetriable(t, err, true)
 
@@ -189,7 +190,7 @@ func TestCreateStemcell_PoolAssign_ConnectionError_IsRetriable(t *testing.T) {
 	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
 
 	h := handlers.HandleCreateStemcell(deps)
-	_, err := h.Handle(context.Background(), args, jsonrpc.Context{RequestID: "req-pool-conn"})
+	_, err := h.Handle(pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 }), args, jsonrpc.Context{RequestID: "req-pool-conn"})
 
 	assertHandlerRetriable(t, err, true)
 }

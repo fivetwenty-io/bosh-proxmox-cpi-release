@@ -223,7 +223,20 @@ func MakeTemplate(ctx context.Context, c Client, node string, vmid int64) (upid 
 //   - vmid ≤ 0 → error
 //
 // All API errors are wrapped with context naming the poolID and VMID.
-func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64) error {
+//
+// Pool membership writes serialize on PVE's cluster-wide cfs_lock_file
+// ('user_cfg'), so the AddVM rides RetryOnTransientOrLock: a lock timeout
+// under concurrent deploys is contention, not a verdict. logger may be nil
+// (retry attempts then go unlogged).
+//
+// Pool verdicts arrive as HTTP 500 + text, which the blanket 5xx rule in
+// IsTransientTransport would otherwise retry to exhaustion, so two verdicts
+// are short-circuited out of the budget inside the closure: "already a pool
+// member" resolves as success (a replayed AddVM whose committed response was
+// dropped, or a create whose pool parameter already enrolled the VM; see
+// IsVMAlreadyPoolMember), and "pool does not exist" surfaces immediately
+// with its normal classification instead of after ten dead attempts.
+func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64, logger *log.Logger) error {
 	if poolID == "" {
 		return nil
 	}
@@ -236,8 +249,33 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64) er
 	if vmid <= 0 {
 		return cpierrors.Cloud("AssignVMToPool: vmid must be a positive integer, got %d", vmid)
 	}
-	if err := c.Pools().AddVM(ctx, poolID, vmid); err != nil {
-		return cpierrors.Wrap(WrapError(err), fmt.Sprintf("AssignVMToPool: pool %q vmid %d", poolID, vmid))
+	var addErr error
+	_ = RetryOnTransientOrLock(ctx, logger, "pool.assign_vm", 0, func() error {
+		addErr = c.Pools().AddVM(ctx, poolID, vmid)
+		if addErr != nil && (IsVMAlreadyPoolMember(addErr) || IsPoolNotFound(addErr)) {
+			return nil
+		}
+		return addErr
+	})
+	if addErr != nil {
+		if IsVMAlreadyPoolMember(addErr) {
+			// The verdict does not name the pool, so distinguish the two ways
+			// it arises: a replayed AddVM whose committed response was
+			// dropped (the VM is in poolID; success), and a VM another actor
+			// enrolled elsewhere (this caller's pool preference was not
+			// applied; fail loudly naming both pools). A lookup failure, an
+			// absent listing entry, or an entry without a pool keeps the
+			// replay reading: the cluster resources index can lag the
+			// user_cfg write this call just made.
+			current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
+			if lookupErr == nil && found && current != "" && current != poolID {
+				return cpierrors.Cloud(
+					"AssignVMToPool: vmid %d is already a member of pool %q and cannot also be added to pool %q; remove it from %q first",
+					vmid, current, poolID, current)
+			}
+			return nil
+		}
+		return cpierrors.Wrap(WrapError(addErr), fmt.Sprintf("AssignVMToPool: pool %q vmid %d", poolID, vmid))
 	}
 	return nil
 }

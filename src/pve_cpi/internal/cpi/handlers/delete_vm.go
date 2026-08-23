@@ -1349,7 +1349,24 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 		return
 	}
 
-	deleteErr := deps.PVE.Pools().DeletePool(ctx, poolID)
+	// Pool deletes serialize on PVE's cluster-wide user_cfg lock, so a lock
+	// timeout under concurrent deploys is contention, not a verdict; ride
+	// RetryOnTransientOrLock instead of leaking the empty pool on the first
+	// timeout. The two resolved verdicts (not empty, already gone) are
+	// short-circuited to nil inside the closure so the retry budget is never
+	// spent on them; the switch below still sees them via deleteErr. The
+	// budget is the small sweep budget, not the full lock curve: this runs on
+	// the request path after the destroy already succeeded, every branch
+	// below is swallowed, and a leaked empty pool is cosmetic, so minutes of
+	// backoff here would only slow delete_vm down.
+	var deleteErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.pool_reap", cleanupSweepMaxAttempts, func() error {
+		deleteErr = deps.PVE.Pools().DeletePool(ctx, poolID)
+		if deleteErr != nil && (pve.IsPoolNotEmpty(deleteErr) || pve.IsPoolNotFound(deleteErr)) {
+			return nil
+		}
+		return deleteErr
+	})
 	switch {
 	case deleteErr == nil:
 		logger.Info("delete_vm: reaper: reaped empty pool", log.String("pool", poolID))

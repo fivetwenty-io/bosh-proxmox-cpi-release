@@ -700,8 +700,23 @@ func attemptCreateVolume(
 				// re-runs see a clean slate.
 				rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 				defer rbCancel()
-				if exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical); exErr == nil && exists {
-					upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
+				exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical)
+				if exErr != nil {
+					// A failed probe means the sweep is silently skipped;
+					// name the volid so operators can distinguish
+					// "nothing to clean" from "could not look".
+					deps.Log(rollbackCtx).Warn("create_disk: orphan volume existence probe failed; sweep skipped",
+						log.String("volid", candidateCanonical),
+						log.Err(exErr),
+					)
+				}
+				if exErr == nil && exists {
+					var upid string
+					delErr := pve.RetryOnTransientOrLock(rollbackCtx, deps.Log(rollbackCtx), "create_disk.orphan_sweep", cleanupSweepMaxAttempts, func() error {
+						var innerErr error
+						upid, innerErr = deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, candidateCanonical)
+						return innerErr
+					})
 					switch {
 					case delErr != nil:
 						deps.Log(rollbackCtx).Warn("create_disk: orphan volume cleanup after CreateVolume error failed",
@@ -766,7 +781,12 @@ func rollbackCreatedVolume(
 ) {
 	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 	defer rbCancel()
-	upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
+	var upid string
+	delErr := pve.RetryOnTransientOrLock(rollbackCtx, logger, "create_disk.rollback_volume", cleanupSweepMaxAttempts, func() error {
+		var innerErr error
+		upid, innerErr = deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, node, storage, canonicalVolID)
+		return innerErr
+	})
 	if delErr != nil {
 		logger.Warn("create_disk: rollback DeleteVolume failed",
 			log.String("volid", canonicalVolID),

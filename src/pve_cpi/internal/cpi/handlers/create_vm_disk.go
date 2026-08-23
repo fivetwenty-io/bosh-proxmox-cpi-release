@@ -1167,7 +1167,12 @@ func attachEphemeralDisk(
 		if stor == "" {
 			stor = shape.ephemeralStorage
 		}
-		upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, stor, createdVolid)
+		var upid string
+		delErr := pve.RetryOnTransientOrLock(rollbackCtx, logger, "create_vm.ephemeral_cleanup", cleanupSweepMaxAttempts, func() error {
+			var innerErr error
+			upid, innerErr = deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, stor, createdVolid)
+			return innerErr
+		})
 		if delErr != nil {
 			logger.Warn("create_vm: ephemeral volume orphan cleanup failed",
 				log.Int(metadataKeyVMID, vmid),
@@ -1260,10 +1265,26 @@ func sweepEphemeralVolumeAfterCreateFailure(
 	defer rbCancel()
 	canonical := fmt.Sprintf("%s:%s", shape.ephemeralStorage, volName)
 	exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
-	if exErr != nil || !exists {
+	if exErr != nil {
+		// A failed probe means the sweep is silently skipped; name the volid
+		// so operators can distinguish "nothing to clean" from "could not
+		// look".
+		logger.Warn("create_vm: ephemeral volume existence probe failed; sweep skipped",
+			log.Int(metadataKeyVMID, vmid),
+			log.String("volid", canonical),
+			log.Err(exErr),
+		)
 		return
 	}
-	upid, delErr := deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
+	if !exists {
+		return
+	}
+	var upid string
+	delErr := pve.RetryOnTransientOrLock(rollbackCtx, logger, "create_vm.ephemeral_sweep", cleanupSweepMaxAttempts, func() error {
+		var innerErr error
+		upid, innerErr = deps.PVE.Storage().DeleteVolumeAsync(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
+		return innerErr
+	})
 	if delErr != nil {
 		logger.Warn("create_vm: ephemeral volume cleanup after CreateVolume error failed",
 			log.Int(metadataKeyVMID, vmid),

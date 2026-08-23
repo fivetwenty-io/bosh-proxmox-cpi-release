@@ -37,6 +37,17 @@ func transientMaxAttemptsDefault() int {
 	return DefaultTransientMaxAttempts
 }
 
+// TransientMaxAttempts returns the effective process-wide transient retry
+// attempt budget: the operator override installed by ConfigureTransientRetry
+// when one is set, DefaultTransientMaxAttempts otherwise. Exported for call
+// sites outside this package that pass an explicit budget to a retry helper
+// whose own zero-value fallback resolves to a different curve's budget
+// (RetryOnTransientOrLock falls back to the storage-lock budget, which
+// ignores the operator's transient tuning).
+func TransientMaxAttempts() int {
+	return transientMaxAttemptsDefault()
+}
+
 // SetTransientRetryForTest overrides the transient attempt budget for a test
 // and returns a restore function. Mirrors SetTaskPollingForTest.
 //

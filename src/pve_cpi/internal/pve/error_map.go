@@ -865,6 +865,30 @@ func IsPoolNotFound(err error) bool {
 	return strings.Contains(msg, "pool") && strings.Contains(msg, "does not exist")
 }
 
+// IsVMAlreadyPoolMember reports whether err signals that PVE refused an AddVM
+// because the VMID is already recorded as a pool member. Shape (PVE
+// access-control API2/Pool.pm, HTTP 500 + text like every pool verdict):
+//
+//	update pools failed: VM 30500 is already a pool member
+//
+// The message does not name the pool, so a positive match means "member of
+// some pool", not "member of the requested pool". The verdict has two
+// sources: a replayed AddVM whose first, committed response was dropped by
+// the transport (membership in the requested pool is already written), and a
+// VM another actor enrolled in a different pool (the template-race survivor
+// arm assigns a VM this process did not create, and its creator may have
+// used a different pool). AssignVMToPool disambiguates by reading the VM's
+// current pool from the cluster resources index: requested pool (or no
+// answer) resolves as success, a different pool fails loudly naming both.
+//
+// nil → false.
+func IsVMAlreadyPoolMember(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already a pool member")
+}
+
 // IsVolumeFormatUnknown reports whether err is PVE's refusal to inspect a
 // volume whose volid it cannot parse into a known disk format. Live shape
 // (PVE 9.2, HTTP 500 + text, never 4xx):

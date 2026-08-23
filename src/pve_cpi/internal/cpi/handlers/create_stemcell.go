@@ -1045,7 +1045,7 @@ func ensureTemplateVM(
 	// existing (idempotent).
 	if deps.Config.StemcellTemplatePool != "" {
 		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
-			pve.PoolProvenance("")); ensureErr != nil {
+			pve.PoolProvenance(""), logger); ensureErr != nil {
 			return 0, "", fmt.Errorf("ensureTemplateVM: ensure pool %q exists: %w",
 				deps.Config.StemcellTemplatePool, ensureErr)
 		}
@@ -1165,7 +1165,7 @@ func ensureTemplateVM(
 	// immediately rather than leaving a template silently outside the
 	// expected pool.
 	if deps.Config.StemcellTemplatePool != "" && winnerVMID != allocatedVMID {
-		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, winnerVMID); poolErr != nil {
+		if poolErr := pve.AssignVMToPool(ctx, deps.PVE, deps.Config.StemcellTemplatePool, winnerVMID, logger); poolErr != nil {
 			return 0, "", fmt.Errorf("ensureTemplateVM: assign template vmid=%d to pool %q: %w",
 				winnerVMID, deps.Config.StemcellTemplatePool, poolErr)
 		}
@@ -1294,15 +1294,31 @@ func deleteTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, l
 	destroyDisks := deps.Config.DestroyUnreferencedDisks
 	vmidStr := strconv.FormatInt(vmid, 10)
 
-	resp, err := deps.PVE.Nodes().DeleteQemu(ctx, node, vmidStr, &sdknodes.DeleteQemuParams{
-		Purge:                    &purge,
-		DestroyUnreferencedDisks: &destroyDisks,
-	})
-	if err != nil {
-		if pve.IsNotFound(err) {
+	// A leak here is permanent (nothing reclaims a failed template VM), and
+	// this cleanup typically fires right after a storage fault, into the same
+	// contended lock. RetryOnTransientOrLock keeps it from giving up on the
+	// first cfs-lock timeout. Already-gone verdicts (404, and the pmxcfs
+	// "configuration file does not exist" shape a replayed destroy gets as a
+	// 500) are short-circuited to success inside the closure so the blanket
+	// 5xx transient rule cannot spend the budget on a VM that is already
+	// destroyed.
+	var resp *sdknodes.DeleteQemuResponse
+	var delErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "create_stemcell.delete_template_vm", 0, func() error {
+		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmidStr, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyDisks,
+		})
+		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
 			return nil
 		}
-		return fmt.Errorf("deleteTemplateVM: delete vmid=%d: %w", vmid, err)
+		return delErr
+	})
+	if delErr != nil {
+		if pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr) {
+			return nil
+		}
+		return fmt.Errorf("deleteTemplateVM: delete vmid=%d: %w", vmid, delErr)
 	}
 
 	if resp != nil {
@@ -3752,7 +3768,10 @@ func replicateOneNode(
 			// caller was told succeeded.
 			if shared, known := stemcellStorageIsShared(ctx, deps, storage); known && !shared {
 				volumePath := "import/" + qcow2Filename
-				if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+				if delErr := pve.RetryOnTransientOrLock(ctx, nodeLogger, "create_stemcell.replica_upload_sweep", cleanupSweepMaxAttempts, func() error {
+					_, innerErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+					return innerErr
+				}); delErr != nil {
 					nodeLogger.Warn("create_stemcell: replication: cleanup of failed upload also failed (non-fatal)",
 						log.Err(delErr),
 					)
@@ -3845,7 +3864,7 @@ func ensureReplicaTemplateVM(
 	// ensureTemplateVM's own pool ensure. Idempotent when already ensured.
 	if deps.Config.StemcellTemplatePool != "" {
 		if ensureErr := pve.EnsurePoolExists(ctx, deps.PVE, deps.Config.StemcellTemplatePool,
-			pve.PoolProvenance("")); ensureErr != nil {
+			pve.PoolProvenance(""), logger); ensureErr != nil {
 			return 0, fmt.Errorf("ensureReplicaTemplateVM: ensure pool %q exists: %w",
 				deps.Config.StemcellTemplatePool, ensureErr)
 		}
@@ -4121,7 +4140,10 @@ func replicateOneNodeServerDownload(
 			return
 		}
 		volumePath := "import/" + filename
-		if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+		if delErr := pve.RetryOnTransientOrLock(ctx, nodeLogger, "create_stemcell.replica_download_sweep", cleanupSweepMaxAttempts, func() error {
+			_, innerErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+			return innerErr
+		}); delErr != nil {
 			nodeLogger.Warn("create_stemcell: server-download replication: cleanup of failed download also failed (non-fatal)",
 				log.Err(delErr),
 			)
@@ -4149,7 +4171,18 @@ func replicateOneNodeServerDownload(
 				nodeLogger.Warn("create_stemcell: server-download replication: download task failed (non-fatal; replica not created)",
 					log.Err(awaitErr),
 				)
-				cleanupOnFailure(qcow2Filename)
+				// Sweep the partial file only on a resolved task failure. A
+				// retriable await error means the wait budget ran out (or a
+				// transient poll fault) while the download task may still be
+				// writing import/<file> server-side; deleting under a live
+				// task races the very file a later dedup pass would adopt.
+				// Mirrors handleStemcellDownloadURLTracked's guard.
+				if okToRetryCPIError(awaitErr) {
+					nodeLogger.Warn("create_stemcell: server-download replication: skipping download cleanup, " +
+						"task may still be running")
+				} else {
+					cleanupOnFailure(qcow2Filename)
+				}
 				return replicaOutcome{Node: node, Stage: "download", Err: awaitErr}
 			}
 		}

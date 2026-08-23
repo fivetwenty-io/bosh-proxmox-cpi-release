@@ -34,16 +34,18 @@ import (
 type rpClient struct {
 	parkerLockClient
 
-	mu          sync.Mutex
-	node        string
-	configs     map[int]map[string]any
-	deletedVMs  []int
-	createFn    func(vmid int, params map[string]any) (string, error)
-	moveDiskFn  func(srcVMID int, params *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error)
-	waitFn      func(call int, upid string) (*sdktasks.Status, error)
-	createCalls int
-	moveCalls   int
-	waitCalls   int
+	mu           sync.Mutex
+	node         string
+	configs      map[int]map[string]any
+	deletedVMs   []int
+	createFn     func(vmid int, params map[string]any) (string, error)
+	moveDiskFn   func(srcVMID int, params *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error)
+	waitFn       func(call int, upid string) (*sdktasks.Status, error)
+	migrateFn    func(call int) (*sdknodes.CreateQemuMigrateResponse, error)
+	createCalls  int
+	moveCalls    int
+	waitCalls    int
+	migrateCalls int
 }
 
 // rpVMIDKey is the "vmid" request/response field name.
@@ -126,6 +128,25 @@ func (n *rpNodes) CreateQemuMoveDisk(
 	n.c.moveCalls++
 	srcVMID, _ := strconv.Atoi(vmidStr)
 	return n.c.moveDiskFn(srcVMID, params)
+}
+
+func (n *rpNodes) CreateQemuMigrate(
+	_ context.Context, _ string, _ string, _ *sdknodes.CreateQemuMigrateParams,
+) (*sdknodes.CreateQemuMigrateResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	n.c.migrateCalls++
+	if n.c.migrateFn != nil {
+		return n.c.migrateFn(n.c.migrateCalls)
+	}
+	resp := sdknodes.CreateQemuMigrateResponse(`""`)
+	return &resp, nil
+}
+
+func (n *rpNodes) UpdateQemuConfig(
+	_ context.Context, _ string, _ string, _ *sdknodes.UpdateQemuConfigParams,
+) error {
+	return nil
 }
 
 func (n *rpNodes) DeleteQemu(

@@ -89,7 +89,7 @@ func TestEnsurePoolExists_CreatesWhenAbsent(t *testing.T) {
 	}
 	client := &fakeEnsureClient{pools: fp}
 
-	err := pve.EnsurePoolExists(context.Background(), client, "bosh", pve.PoolProvenanceComment)
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", pve.PoolProvenanceComment, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestEnsurePoolExists_ToleratesDuplicate500(t *testing.T) {
 	}
 	client := &fakeEnsureClient{pools: fp}
 
-	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "", nil)
 	if err != nil {
 		t.Fatalf("duplicate-pool creation should be tolerated as success; got %v", err)
 	}
@@ -132,7 +132,7 @@ func TestEnsurePoolExists_PropagatesOtherError(t *testing.T) {
 	}
 	client := &fakeEnsureClient{pools: fp}
 
-	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "", nil)
 	if err == nil {
 		t.Fatal("expected error to propagate; got nil")
 	}
@@ -143,7 +143,7 @@ func TestEnsurePoolExists_NilPoolService(t *testing.T) {
 
 	client := &fakeEnsureClient{pools: nil}
 
-	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "")
+	err := pve.EnsurePoolExists(context.Background(), client, "bosh", "", nil)
 	if err == nil {
 		t.Fatal("expected error for a client with no pool service; got nil (and no panic, which is the point)")
 	}

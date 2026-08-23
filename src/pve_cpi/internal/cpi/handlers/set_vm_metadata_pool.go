@@ -149,12 +149,23 @@ func adoptLegacyVM(ctx context.Context, deps Deps, node string, vmid int, metada
 // logged at Warn); the caller then skips the sentinel write so the recorded
 // name never claims a membership the move did not achieve.
 func movePoolMember(ctx context.Context, deps Deps, vmid int, desired, currentPool, director string, logger *log.Logger) bool {
-	if err := pve.EnsurePoolExists(ctx, deps.PVE, desired, pve.PoolProvenance(director)); err != nil {
+	if err := pve.EnsurePoolExists(ctx, deps.PVE, desired, pve.PoolProvenance(director), logger); err != nil {
 		logger.Warn("set_vm_metadata: pool reconcile: could not ensure target pool; skipping",
 			log.String("pool", desired), log.Err(err))
 		return false
 	}
-	if err := deps.PVE.Pools().MoveVMToPool(ctx, desired, int64(vmid)); err != nil {
+	// The move serializes on PVE's cluster-wide user_cfg lock; ride
+	// RetryOnTransientOrLock so concurrent deploys contending on that lock do
+	// not make this reconcile give up (and skip the sentinel write) on the
+	// first timeout. A success on any attempt returns nil here, so the caller
+	// still writes the sentinel after a success-after-retry. The budget is
+	// the small sweep budget: this reconcile is best-effort on the request
+	// path, and its failure only skips the sentinel write, so the full lock
+	// curve would trade minutes of set_vm_metadata latency for a retry the
+	// next reconcile gets anyway.
+	if err := pve.RetryOnTransientOrLock(ctx, logger, "set_vm_metadata.pool_move", cleanupSweepMaxAttempts, func() error {
+		return deps.PVE.Pools().MoveVMToPool(ctx, desired, int64(vmid))
+	}); err != nil {
 		logger.Warn("set_vm_metadata: pool reconcile: move failed; skipping",
 			log.String("pool", desired), log.Err(err))
 		return false

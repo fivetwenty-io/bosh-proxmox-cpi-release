@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
@@ -67,6 +68,14 @@ func assertRetriable(t *testing.T, err error, want bool) {
 }
 
 // ---------------------------------------------------------------------------
+// zeroBackoffCtx returns a context whose retry backoff is zero, so boundary
+// tests that feed AssignVMToPool a persistently failing service exhaust its
+// internal RetryOnTransientOrLock budget instantly instead of sleeping
+// through the real lock curve.
+func zeroBackoffCtx() context.Context {
+	return pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+}
+
 // AssignVMToPool — boundary tests
 // ---------------------------------------------------------------------------
 
@@ -81,7 +90,7 @@ func TestAssignVMToPool_Retriable_503(t *testing.T) {
 			},
 		},
 	}
-	err := pve.AssignVMToPool(context.Background(), client, "my-pool", 100)
+	err := pve.AssignVMToPool(zeroBackoffCtx(), client, "my-pool", 100, nil)
 	assertRetriable(t, err, true)
 }
 
@@ -99,7 +108,7 @@ func TestAssignVMToPool_Retriable_ConnectionError(t *testing.T) {
 			},
 		},
 	}
-	err := pve.AssignVMToPool(context.Background(), client, "my-pool", 100)
+	err := pve.AssignVMToPool(zeroBackoffCtx(), client, "my-pool", 100, nil)
 	assertRetriable(t, err, true)
 }
 
@@ -116,7 +125,7 @@ func TestAssignVMToPool_Retriable_TimeoutError(t *testing.T) {
 			},
 		},
 	}
-	err := pve.AssignVMToPool(context.Background(), client, "my-pool", 100)
+	err := pve.AssignVMToPool(zeroBackoffCtx(), client, "my-pool", 100, nil)
 	assertRetriable(t, err, true)
 }
 
@@ -131,7 +140,7 @@ func TestAssignVMToPool_NotRetriable_400(t *testing.T) {
 			},
 		},
 	}
-	err := pve.AssignVMToPool(context.Background(), client, "bad-pool", 100)
+	err := pve.AssignVMToPool(zeroBackoffCtx(), client, "bad-pool", 100, nil)
 	assertRetriable(t, err, false)
 }
 
@@ -145,7 +154,7 @@ func TestAssignVMToPool_NotRetriable_404(t *testing.T) {
 			},
 		},
 	}
-	err := pve.AssignVMToPool(context.Background(), client, "missing-pool", 100)
+	err := pve.AssignVMToPool(zeroBackoffCtx(), client, "missing-pool", 100, nil)
 	assertRetriable(t, err, false)
 }
 
@@ -160,7 +169,7 @@ func TestAssignVMToPool_NilPoolID_ReturnsNil(t *testing.T) {
 			},
 		},
 	}
-	if err := pve.AssignVMToPool(context.Background(), client, "", 100); err != nil {
+	if err := pve.AssignVMToPool(context.Background(), client, "", 100, nil); err != nil {
 		t.Fatalf("empty pool ID should return nil; got: %v", err)
 	}
 }
@@ -170,7 +179,7 @@ func TestAssignVMToPool_Success_ReturnsNil(t *testing.T) {
 	client := &poolMockClient{
 		poolsSvc: &retryPoolService{},
 	}
-	if err := pve.AssignVMToPool(context.Background(), client, "my-pool", 100); err != nil {
+	if err := pve.AssignVMToPool(zeroBackoffCtx(), client, "my-pool", 100, nil); err != nil {
 		t.Fatalf("expected nil on success; got: %v", err)
 	}
 }

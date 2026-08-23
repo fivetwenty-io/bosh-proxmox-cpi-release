@@ -563,7 +563,7 @@ func ensureResolvedPool(ctx context.Context, deps Deps, shape *createVMShape, lo
 	if shape.vmPool == "" {
 		return nil
 	}
-	if err := pve.EnsurePoolExists(ctx, deps.PVE, shape.vmPool, shape.vmPoolComment); err != nil {
+	if err := pve.EnsurePoolExists(ctx, deps.PVE, shape.vmPool, shape.vmPoolComment, logger); err != nil {
 		// A permission-denied here is a reduced-ACL cluster whose token
 		// cannot create pools (no Pool.Allocate at /pool). That is a
 		// permanent configuration condition with a config-side fix, so name

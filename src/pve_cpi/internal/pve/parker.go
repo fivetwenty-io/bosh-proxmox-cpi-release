@@ -727,7 +727,7 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		func(vmid int) error {
 			params := map[string]any{
 				"vmid":          vmid,
-				"name":          parkerVMName(vmid),
+				cfgKeyName:      parkerVMName(vmid),
 				cfgKeyTags:      tags,
 				paramProtection: protection,
 				"onboot":        onboot,
@@ -2181,6 +2181,9 @@ func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger,
 // injection) is a no-op.
 // cfgKeyTags is the QEMU create/update config key for the tag string.
 const cfgKeyTags = "tags"
+
+// cfgKeyName is the QEMU create/update config key for the VM name.
+const cfgKeyName = "name"
 
 // paramProtection is the QEMU create/update config key for the PVE
 // protection flag.

@@ -608,12 +608,19 @@ func sweepHeavyQcow2OtherNodesBestEffort(
 // deleteHeavyQcow2ReplicaBestEffort deletes the same storage:volumePath on a
 // replica node. Replica qcow2 copies live on per-node LOCAL storage under the
 // same storage ID + filename as the primary (the replication feature in
-// create_stemcell.go). Failures are logged at Warn and never propagate — a
-// stray replica-node copy is cleaned up by a subsequent
-// pve.WithStorageScan-covered sweep or manual operator action; it must not
-// block the overall delete_stemcell call from succeeding.
+// create_stemcell.go). Failures are logged at Warn and never propagate; they
+// must not block the overall delete_stemcell call from succeeding. There is
+// no automatic sweep behind this call (WithStorageScan is a VMID-allocation
+// option, not a reaper), so a failure here leaves the replica copy for
+// manual operator cleanup; the delete therefore rides RetryOnTransientOrLock
+// instead of giving up on the first cfs-lock timeout.
 func deleteHeavyQcow2ReplicaBestEffort(ctx context.Context, deps Deps, logger *log.Logger, node, storage, volumePath string) {
-	existed, err := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+	var existed bool
+	err := pve.RetryOnTransientOrLock(ctx, logger, "delete_stemcell.replica_sweep", cleanupSweepMaxAttempts, func() error {
+		var innerErr error
+		existed, innerErr = deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+		return innerErr
+	})
 	if err != nil {
 		logger.Warn("delete_stemcell: replica qcow2 delete failed (best-effort, continuing)",
 			log.String("node", node),
@@ -844,17 +851,24 @@ func destroyTemplateVM(ctx context.Context, deps Deps, node string, vmid int64, 
 
 	purge := true
 	destroyDisks := deps.Config.DestroyUnreferencedDisks
+	// Already-gone verdicts (404, and the pmxcfs "configuration file does not
+	// exist" shape a replayed destroy gets as a 500) are short-circuited to
+	// success inside the closure so the blanket 5xx transient rule cannot
+	// spend the retry budget on a VM that is already destroyed.
 	var deleteResp *sdknodes.DeleteQemuResponse
-	deleteErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_stemcell.destroy_template", 0, func() error {
-		var innerErr error
-		deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, fmt.Sprintf("%d", vmid), &sdknodes.DeleteQemuParams{
+	var deleteErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "delete_stemcell.destroy_template", 0, func() error {
+		deleteResp, deleteErr = deps.PVE.Nodes().DeleteQemu(ctx, node, fmt.Sprintf("%d", vmid), &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyDisks,
 		})
-		return innerErr
+		if deleteErr != nil && (pve.IsNotFound(deleteErr) || pve.IsPmxcfsConfigMissing(deleteErr)) {
+			return nil
+		}
+		return deleteErr
 	})
 	if deleteErr != nil {
-		if pve.IsNotFound(deleteErr) {
+		if pve.IsNotFound(deleteErr) || pve.IsPmxcfsConfigMissing(deleteErr) {
 			logger.Warn("delete_stemcell: template VM not found during destroy — already deleted, returning success",
 				log.String("stemcell_cid", cidStr),
 			)

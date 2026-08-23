@@ -9,6 +9,7 @@ import (
 	"errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -38,7 +39,15 @@ func PoolProvenance(director string) string {
 // Inputs: ctx must be non-nil; c must be non-nil and its Pools() must return
 // a non-nil PoolService (several call/test paths construct a Client without
 // a pool service — see the nil-Pools guard below); poolID must be non-empty.
-// comment may be empty (sent to PVE as-is by PoolService.CreatePool).
+// comment may be empty (sent to PVE as-is by PoolService.CreatePool). logger
+// may be nil (retry attempts then go unlogged).
+//
+// Every pool mutation cluster-wide serializes on PVE's cfs_lock_file
+// ('user_cfg'), so concurrent creates (parallel deploys, a stemcell upload
+// racing a VM create) can time out on pure lock contention. The create rides
+// RetryOnTransientOrLock rather than surfacing the first lock timeout;
+// "already exists" answers, from this call or a concurrent winner, stop the
+// retry immediately because the pool existing is the desired end state.
 //
 // Failure modes:
 //   - ctx == nil, c == nil, or poolID == "": non-retriable CloudError, no PVE
@@ -52,9 +61,10 @@ func PoolProvenance(director string) string {
 //     existing is the desired end state, whether this call or a concurrent
 //     one created it.
 //   - Any other CreatePool error (auth failure, malformed poolID, quota,
-//     transient transport fault, ...): wrapped via WrapError and returned so
-//     callers see the correct retriable/non-retriable classification.
-func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string) error {
+//     transient transport fault after the retry budget, ...): wrapped via
+//     WrapError and returned so callers see the correct retriable/
+//     non-retriable classification.
+func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string, logger *log.Logger) error {
 	if ctx == nil {
 		return cpierrors.Cloud("EnsurePoolExists: ctx must not be nil")
 	}
@@ -69,11 +79,19 @@ func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string) err
 		return cpierrors.Cloud("EnsurePoolExists: PVE client has no pool service")
 	}
 
-	err := pools.CreatePool(ctx, poolID, comment)
-	if err == nil || isPoolAlreadyExists(err) {
-		return nil
+	err := RetryOnTransientOrLock(ctx, logger, "pool.ensure_exists", 0, func() error {
+		createErr := pools.CreatePool(ctx, poolID, comment)
+		if createErr != nil && isPoolAlreadyExists(createErr) {
+			// Goal state reached (concurrent winner or earlier attempt whose
+			// response was dropped); do not spend retry budget on it.
+			return nil
+		}
+		return createErr
+	})
+	if err != nil {
+		return cpierrors.Wrap(WrapError(err), "EnsurePoolExists: create pool "+poolID)
 	}
-	return cpierrors.Wrap(WrapError(err), "EnsurePoolExists: create pool "+poolID)
+	return nil
 }
 
 // IsPoolPermissionDenied reports whether err signals that PVE denied read

@@ -201,7 +201,10 @@ func handleStemcellDownloadURLTracked(
 				// os.Remove of the temp file. PVE may have already removed it; ignore
 				// the delete result so the cleanup never masks the original error.
 				volumePath := "import/" + qcow2Filename
-				if _, delErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath); delErr != nil {
+				if delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell.download_partial_sweep", cleanupSweepMaxAttempts, func() error {
+					_, innerErr := deps.PVE.Storage().DeleteVolumeIfExists(ctx, node, storage, volumePath)
+					return innerErr
+				}); delErr != nil {
 					deps.Log(ctx).Warn("create_stemcell: server-download: best-effort cleanup of partial volume failed (non-fatal)",
 						log.String("volume", volumePath),
 						log.Err(delErr),

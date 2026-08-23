@@ -33,6 +33,32 @@ const sdnCleanupTimeout = 5 * time.Minute
 // slowness without letting a dead cluster hold the deferred release open.
 const lockReleaseTimeout = 30 * time.Second
 
+// cleanupSweepMaxAttempts bounds the RetryOnTransientOrLock budget on
+// best-effort cleanup sweeps (orphan-volume deletes, rollback volume
+// removal) and on the best-effort pool operations that run on the
+// Director-facing request path (delete_vm's empty-pool reaper,
+// set_vm_metadata's pool-move reconcile). These operations typically fire
+// right after a storage fault, into the same contended lock, so a
+// single-shot call almost always loses the race it was born into; three
+// attempts ride the lock backoff curve long enough to outlast a worker
+// recycle or a lock hand-off without letting a dead storage backend consume
+// the whole detached-context budget that the primary rollback work
+// (destroys, task awaits) also draws from, and without absorbing minutes of
+// backoff on a request path for an outcome that is cosmetic by contract.
+const cleanupSweepMaxAttempts = 3
+
+// rollbackDestroyMaxAttempts bounds the DeleteQemu retry inside cleanupVM.
+// The destroy is the most load-bearing cleanup (an unreaped VM is a
+// permanent leak), so it gets more attempts than a cosmetic sweep, but not
+// the full ten-attempt storage-lock budget: the whole rollback (stop,
+// foreign-disk protection, destroy, task await, ISO removal, HA pin
+// removal) shares one detached context bounded by rollbackCleanupTimeout,
+// and a full lock curve on the destroy alone (~124s of backoff plus ten
+// slow lock-wait round trips) could exhaust it and cascade failures into
+// the tail steps. Five attempts (~16s of backoff) retain the retry value
+// against a lock hand-off while leaving the tail its share of the budget.
+const rollbackDestroyMaxAttempts = 5
+
 // detachedContext returns a context that survives parent cancellation but is
 // bounded by d, plus the cancel the caller must defer. It replaces bare
 // context.WithoutCancel for cleanup paths: detachment without a bound turns

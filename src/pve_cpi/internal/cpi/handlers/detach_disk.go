@@ -668,7 +668,15 @@ func sweepUnusedDiskSlot(
 		if volid != diskCID {
 			continue
 		}
-		if sweepErr := pve.RetryOnTransient(ctx, deps.Log(ctx), "detach_disk.sweep", 0, func() error {
+		// RetryOnTransientOrLock, matching the parker twin of this sweep:
+		// removing the unusedN reference contends on the same VM config and
+		// storage locks the detach itself just released. The budget is passed
+		// explicitly rather than left at 0: the OrLock helper's zero-value
+		// fallback is the ten-attempt storage-lock budget, while this sweep
+		// runs on the transient budget, including the operator's
+		// retry.transient override, exactly as it did before lock timeouts
+		// joined its retry union.
+		if sweepErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "detach_disk.sweep", pve.TransientMaxAttempts(), func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
 		}); sweepErr != nil {
 			if pve.IsNotFound(sweepErr) {

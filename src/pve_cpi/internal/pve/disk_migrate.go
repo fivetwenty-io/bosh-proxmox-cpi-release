@@ -313,8 +313,12 @@ func migrateMoverToNode(
 	if nodesSvc == nil {
 		return "", "", cpierrors.Cloud("disk migrate: nodes service not available")
 	}
+	// RetryOnTransientOrLock, not RetryOnTransient: with Targetstorage set
+	// the migrate allocates the destination volume under the storage lock,
+	// so a cfs-lock timeout here is the same contention every other storage
+	// mutation retries through.
 	var raw *sdknodes.CreateQemuMigrateResponse
-	migErr := RetryOnTransient(ctx, logger, "disk_migrate", maxAttempts, func() error {
+	migErr := RetryOnTransientOrLock(ctx, logger, "disk_migrate", maxAttempts, func() error {
 		var inner error
 		raw, inner = nodesSvc.CreateQemuMigrate(ctx, mover.Node, strconv.Itoa(mover.VMID), params)
 		return inner
@@ -478,7 +482,7 @@ func createMoverVM(ctx context.Context, c Client, logger *log.Logger, node strin
 		func(vmid int) error {
 			params := map[string]any{
 				"vmid":          vmid,
-				"name":          parkerVMName(vmid),
+				cfgKeyName:      parkerVMName(vmid),
 				cfgKeyTags:      tags,
 				paramProtection: protection,
 				"onboot":        onboot,

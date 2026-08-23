@@ -365,9 +365,30 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	// shared rollback helper reachable with deps.Config unset.
 	purge := true
 	destroyUnref := deps.Config != nil && deps.Config.DestroyUnreferencedDisks
-	delResp, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
-		Purge:                    &purge,
-		DestroyUnreferencedDisks: &destroyUnref,
+	// The destroy rides RetryOnTransientOrLock: this rollback usually fires
+	// because a storage fault just failed the create, so the very next
+	// mutation into the same contended storage lock must not be single-shot
+	// (one cfs-lock timeout would otherwise orphan the VM permanently, since
+	// no caller ever retries a rollback). The budget is bounded
+	// (rollbackDestroyMaxAttempts) because this retry shares the detached
+	// rollback context with the task await, ISO removal, and HA pin removal
+	// that follow. Config-lock rejections ("lock: clone" and friends) are not
+	// in the retry union and fall through unchanged to the skiplock and
+	// lock-clear branches below; already-gone verdicts (404, pmxcfs
+	// config-missing 500) are short-circuited inside the closure so the
+	// blanket 5xx transient rule cannot spend the budget on a VM that no
+	// longer exists, and the switch below still sees them via delErr.
+	var delResp *sdknodes.DeleteQemuResponse
+	var delErr error
+	_ = pve.RetryOnTransientOrLock(ctx, logger, "create_vm.cleanup.destroy", rollbackDestroyMaxAttempts, func() error {
+		delResp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+			Purge:                    &purge,
+			DestroyUnreferencedDisks: &destroyUnref,
+		})
+		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+			return nil
+		}
+		return delErr
 	})
 	if delErr != nil && pve.IsVMConfigLocked(delErr) {
 		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
