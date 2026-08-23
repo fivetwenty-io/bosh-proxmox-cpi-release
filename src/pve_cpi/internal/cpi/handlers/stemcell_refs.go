@@ -567,3 +567,21 @@ func mergeProvenanceIntoDescription(desc string, prov stemcellProvenance) (strin
 	}
 	return string(merged), nil
 }
+
+// templateHomeNode names the node create_stemcell most likely built the cache
+// template on: stemcell_template_node when configured, the CPI's configured
+// node otherwise. Best effort (an owning-node retarget of the stemcell
+// storage, a cloud_properties node pin, or adoption of an existing template
+// can all place it elsewhere), so callers use it only as a probe target,
+// never as an exclusive answer: create_vm's settled re-check skips one
+// authoritative probe on a wrong guess, and delete_stemcell falls back to it
+// only when cluster node enumeration itself fails.
+func templateHomeNode(deps Deps) string {
+	if deps.Config == nil {
+		return ""
+	}
+	if deps.Config.StemcellTemplateNode != "" {
+		return deps.Config.StemcellTemplateNode
+	}
+	return deps.Config.Node
+}

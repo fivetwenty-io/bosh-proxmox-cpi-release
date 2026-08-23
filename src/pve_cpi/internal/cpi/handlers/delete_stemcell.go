@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
@@ -61,8 +62,12 @@ import (
 //     template found" (falls through to step 6).
 //  3. Cluster-scoped lookup of every cache template carrying
 //     "bosh-stemcell-sha-<sha8>" (pve.FindTemplatesBySHATagCluster). Zero
-//     matches → step 6 (idempotent retry / already-destroyed convergence).
-//  4. One or more matches: the lowest-VMID entry that is NOT a per-node
+//     matches → an authoritative per-node sweep of every cluster node
+//     (findStemcellTemplatesAllNodesBestEffort), since a cluster-index miss
+//     can be lag rather than absence. Zero matches from both → step 6
+//     (idempotent retry / already-destroyed convergence).
+//  4. One or more matches (from either the cluster lookup or the per-node
+//     sweep): the lowest-VMID entry that is NOT a per-node
 //     replica (pve.TemplateRef.IsReplica) is the ref-anchor; every other
 //     match (replica or not) is swept alongside it. Anchoring must skip
 //     replicas — a replica's provenance ref set is a fossil of its own
@@ -166,6 +171,30 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 			refs, err = pve.FindTemplatesBySHATagCluster(ctx, deps.PVE, sha8)
 			if err != nil {
 				return nil, cpierrors.Wrap(pve.WrapError(err), "delete_stemcell: cluster template lookup")
+			}
+		}
+
+		// A cluster-scoped miss can be /cluster/resources index lag rather
+		// than a true absence: a template create_stemcell froze moments ago is
+		// invisible there for the lag window (observed at minutes on loaded
+		// clusters), and taking the no-template branch then deletes the qcow2
+		// while orphaning the live template. Before concluding no-template,
+		// read every node's guest listing authoritatively (per-node listings,
+		// no index involved). Sweeping all nodes rather than guessing the
+		// template's home matters: create_stemcell can build on a node other
+		// than the configured one (owning-node retarget of a node-restricted
+		// staging pool, a cloud_properties node pin, or adoption of an
+		// existing template found elsewhere), and delete_stemcell's
+		// destructive branches must see replicas on every node so this
+		// with-template path stays equivalent to the cluster-listing one.
+		if sha8OK && len(refs) == 0 {
+			if nodeRefs := findStemcellTemplatesAllNodesBestEffort(ctx, deps, logger, sha8); len(nodeRefs) > 0 {
+				logger.Info("delete_stemcell: cache template found by authoritative per-node "+
+					"listings after a cluster-index miss",
+					log.String("sha8", sha8),
+					log.Int("match_count", len(nodeRefs)),
+				)
+				refs = nodeRefs
 			}
 		}
 
@@ -349,9 +378,10 @@ func handleDeleteStemcellWithTemplate(
 }
 
 // handleDeleteStemcellNoTemplate implements step 6's no-cache-template
-// branch: either the sha8 could not be extracted from the CID (step 2), the
-// cluster-scoped lookup found zero matches (already destroyed, or a retry
-// after a previous call died between template destroy and qcow2 delete), or
+// branch: either the sha8 could not be extracted from the CID (step 2), both
+// the cluster-scoped lookup and the authoritative per-node sweep found zero
+// matches (already destroyed, or a retry after a previous call died between
+// template destroy and qcow2 delete), or
 // every match was a per-node replica with no anchor to deregister against
 // (selectStemcellAnchor). All cases converge to the same kind-specific qcow2
 // handling, followed by the same opt-in orphan prune step 6/7 the
@@ -439,6 +469,49 @@ func deleteHeavyQcow2Primary(ctx context.Context, deps Deps, logger *log.Logger,
 		log.String("node", node),
 	)
 	return nil
+}
+
+// findStemcellTemplatesAllNodesBestEffort probes every cluster node's
+// authoritative guest listing for generation-gated cache templates carrying
+// the sha tag, merged in ascending-VMID order (the anchor-selection contract).
+// It backstops a cluster-scoped lookup that returned nothing: per-node
+// listings read node-local guest configs and do not lag the way
+// /cluster/resources does. Best effort throughout: node-enumeration failure
+// degrades to probing the template's presumed home node, and a single node's
+// probe failure warns and continues with the remaining nodes, since the
+// caller treats an empty answer as the (idempotent) no-template branch.
+func findStemcellTemplatesAllNodesBestEffort(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	sha8 string,
+) []pve.TemplateRef {
+	nodes, listErr := listClusterNodes(ctx, deps)
+	if listErr != nil || len(nodes) == 0 {
+		logger.Warn("delete_stemcell: cluster node enumeration returned no nodes; "+
+			"probing the template's presumed home node only",
+			log.Err(listErr),
+		)
+		if home := templateHomeNode(deps); home != "" {
+			nodes = []string{home}
+		}
+	}
+	var all []pve.TemplateRef
+	for _, node := range nodes {
+		nodeRefs, probeErr := pve.FindTemplatesBySHATagNode(ctx, deps.PVE, node, sha8)
+		if probeErr != nil {
+			logger.Warn("delete_stemcell: authoritative per-node template probe failed; "+
+				"continuing with the remaining nodes",
+				log.String("node", node),
+				log.String("sha8", sha8),
+				log.Err(probeErr),
+			)
+			continue
+		}
+		all = append(all, nodeRefs...)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].VMID < all[j].VMID })
+	return all
 }
 
 // sweepHeavyQcow2OtherNodesBestEffort best-effort deletes storage:volumePath

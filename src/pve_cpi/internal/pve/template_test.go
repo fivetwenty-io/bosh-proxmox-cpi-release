@@ -1009,3 +1009,68 @@ func TestBuildTemplateNameWithSHA_InvalidCharsSanitized(t *testing.T) {
 		t.Errorf("BuildTemplateNameWithSHA: result contains DNS-unsafe characters: %q", got)
 	}
 }
+
+// ============================================================
+// FindTemplatesBySHATagNode tests
+// ============================================================
+
+// TestFindTemplatesBySHATagNode_MatchesPrimariesAndReplicas verifies the
+// node-scoped scan returns every generation-gated sha match on the node,
+// primary and replica alike, in ascending-VMID order with Node stamped.
+func TestFindTemplatesBySHATagNode_MatchesPrimariesAndReplicas(t *testing.T) {
+	t.Parallel()
+	sha8 := "abc12345"
+	nodeTag := pve.ReplicaNodeTagForNode("pve1")
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return makeListQemuResponseRaw(
+			// Replica listed first: ordering must come from VMID sorting.
+			`{"vmid":30020,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-`+sha8+`;`+nodeTag+`"}`,
+			`{"vmid":30010,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-`+sha8+`"}`,
+			// Different sha: excluded.
+			`{"vmid":30030,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-ffffffff"}`,
+			// Not a template: excluded.
+			`{"vmid":30040,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-`+sha8+`"}`,
+			// No generation marker: a previous CPI generation's template, excluded.
+			`{"vmid":30050,"template":1,"tags":"bosh-stemcell-sha-`+sha8+`"}`,
+		), nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagNode(context.Background(), c, "pve1", sha8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("len(refs) = %d; want 2 (primary + replica), got %+v", len(refs), refs)
+	}
+	if refs[0].VMID != 30010 || refs[1].VMID != 30020 {
+		t.Errorf("refs not in ascending-VMID order: %+v", refs)
+	}
+	for _, r := range refs {
+		if r.Node != "pve1" {
+			t.Errorf("ref %d Node = %q; want %q (stamped from the probed node)", r.VMID, r.Node, "pve1")
+		}
+	}
+	if refs[0].IsReplica() {
+		t.Error("vmid 30010 carries no node tag and must not classify as a replica")
+	}
+	if !refs[1].IsReplica() {
+		t.Error("vmid 30020 carries a node tag and must classify as a replica")
+	}
+}
+
+// TestFindTemplatesBySHATagNode_EmptyInputs verifies the guard clauses.
+func TestFindTemplatesBySHATagNode_EmptyInputs(t *testing.T) {
+	t.Parallel()
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		t.Fatal("ListQemu must not be called for an empty sha8")
+		return nil, nil
+	})
+
+	refs, err := pve.FindTemplatesBySHATagNode(context.Background(), c, "pve1", "")
+	if err != nil || refs != nil {
+		t.Errorf("empty sha8: got (%v, %v); want (nil, nil)", refs, err)
+	}
+	if _, err := pve.FindTemplatesBySHATagNode(context.Background(), c, "", "abc12345"); err == nil {
+		t.Error("empty node must error")
+	}
+}

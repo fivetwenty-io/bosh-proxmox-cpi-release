@@ -1651,8 +1651,16 @@ const templateCacheRecheckAttempts = 3
 //     index, so it sees a just-frozen local template with no lag at all —
 //     which resolves the single-node and same-node cases on the first attempt,
 //     with no wait.
+//  3. The same authoritative listing of the template's home node
+//     (stemcell_template_node when set, the configured node otherwise) when
+//     it differs from the placement node. Under the single-shared-template
+//     topology the cache template create_stemcell just froze lives on the
+//     staging node, not on the placement node, and clusters under load have
+//     been observed lagging their /cluster/resources index by minutes: far
+//     beyond the re-check budget. Probing the home node directly makes the
+//     cross-node fresh-template case as lag-proof as the same-node case.
 //
-// Only when both miss does the attempt sleep and retry. A genuine absence
+// Only when all miss does the attempt sleep and retry. A genuine absence
 // (operator deleted the cache template) still falls through to found=false
 // after the full budget, and the caller falls back to import as before.
 // A ctx cancellation during the wait ends the re-check immediately and reports
@@ -1694,6 +1702,29 @@ func resolveTemplateCacheTargetSettled(
 				log.Int("attempt", attempt),
 			)
 			return int64(vmid), shape.node, true, nil
+		}
+
+		// Same authoritative read against the template's home node: a fresh
+		// template built by create_stemcell lives there, and when the VM
+		// places on a different node the probe above cannot see it while the
+		// cluster index lags.
+		if home := templateHomeNode(deps); home != "" && home != shape.node {
+			if vmid, ok, probeErr := pve.ResolveTemplateVMIDForNode(ctx, deps.PVE, home, sha8); probeErr != nil {
+				logger.Warn("create_vm: authoritative template-home-node cache-template probe failed (continuing re-check)",
+					log.String("node", home),
+					log.String("sha8", sha8),
+					log.Err(probeErr),
+				)
+			} else if ok {
+				logger.Info("create_vm: stemcell cache template found on its home node by authoritative"+
+					" per-node listing after a cluster-index miss; cloning instead of importing",
+					log.String("node", home),
+					log.Int("template_vmid", vmid),
+					log.String("sha8", sha8),
+					log.Int("attempt", attempt),
+				)
+				return int64(vmid), home, true, nil
+			}
 		}
 
 		if attempt == templateCacheRecheckAttempts {

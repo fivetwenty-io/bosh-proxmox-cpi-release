@@ -385,6 +385,99 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 	return int(bestVMID), true, nil
 }
 
+// FindTemplatesBySHATagNode is the node-scoped, authoritative counterpart of
+// FindTemplatesBySHATagCluster: it lists one node's guests directly
+// (GET /nodes/<node>/qemu), which reads the node's own guest configs rather
+// than the /cluster/resources index and therefore sees a just-frozen template
+// with no lag. Callers that must not mistake index lag for absence reach it
+// after a cluster-scoped miss: create_vm's settled re-check probes the
+// template's home node, and the delete_stemcell no-template decision sweeps
+// every cluster node through it.
+//
+// Matching mirrors the cluster scan: template guests only, the stemcell
+// generation gate applies, and every match carrying the sha tag is returned:
+// primaries and per-node replicas alike (anchor selection downstream decides
+// what to do with replicas). Results are in ascending-VMID order, the same
+// contract FindTemplatesBySHATagCluster documents. Node is stamped from the
+// probed node: a per-node listing only ever returns that node's guests.
+// A nil slice with a nil error means zero matches (or an empty sha8), the
+// same convention FindTemplatesBySHATagCluster documents.
+func FindTemplatesBySHATagNode(ctx context.Context, c Client, node, sha8 string) ([]TemplateRef, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagNode: ctx must not be nil")
+	}
+	if c == nil {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagNode: client must not be nil")
+	}
+	if node == "" {
+		return nil, cpierrors.Cloud("FindTemplatesBySHATagNode: node must not be empty")
+	}
+	if sha8 == "" {
+		return nil, nil
+	}
+
+	shaTag := "bosh-stemcell-sha-" + sha8
+
+	resp, listErr := c.Nodes().ListQemu(ctx, node, nil)
+	if listErr != nil {
+		return nil, cpierrors.Wrap(listErr,
+			fmt.Sprintf("FindTemplatesBySHATagNode: node %s sha8 %q", node, sha8))
+	}
+	if resp == nil || len(*resp) == 0 {
+		return nil, nil
+	}
+
+	var refs []TemplateRef
+	for i, raw := range *resp {
+		var item qemuListItem
+		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
+			log.FromContext(ctx).Debug("template: skipping malformed qemu list entry",
+				log.String("node", node),
+				log.Int("index", i),
+				log.Err(jsonErr),
+			)
+			continue
+		}
+		if item.Vmid == 0 {
+			// Defensive, matching the cluster scan's filter: a zero VMID
+			// would sort first and poison downstream anchor selection.
+			continue
+		}
+		if item.Template == nil || !*item.Template {
+			continue
+		}
+		if item.Tags == nil {
+			continue
+		}
+		tokens := splitPVETags(*item.Tags)
+		if !HasStemcellGenerationMarker(tokens) {
+			continue
+		}
+		hasSHA := false
+		for _, tok := range tokens {
+			if tok == shaTag {
+				hasSHA = true
+				break
+			}
+		}
+		if !hasSHA {
+			continue
+		}
+		name := ""
+		if item.Name != nil {
+			name = *item.Name
+		}
+		refs = append(refs, TemplateRef{
+			VMID: item.Vmid,
+			Node: node,
+			Name: name,
+			Tags: *item.Tags,
+		})
+	}
+	sort.Slice(refs, func(a, b int) bool { return refs[a].VMID < refs[b].VMID })
+	return refs, nil
+}
+
 // ---- Cluster-scoped template cache lookup ----
 //
 // A node-scoped ListQemu lookup would mean create-side dedup on node A and a
