@@ -117,6 +117,17 @@ A tag with a prerelease suffix, such as `v1.2.3-rc.1`, is published as a GitHub 
 
 The build syncs blobs from the private S3 blobstore, so the repository needs two Actions secrets: `BLOBSTORE_ACCESS_KEY_ID` and `BLOBSTORE_SECRET_ACCESS_KEY`, holding a key with read access to the bucket named in `config/final.yml`. Set them with `gh secret set`. The workflow fails with instructions when they are missing.
 
+After the GitHub Release is published, finalize the release so [bosh.io](https://bosh.io/releases) can index it. bosh.io ignores GitHub Releases; it reads the final release metadata tracked in `releases/` and `.final_builds/` on `main`. Download the published tarball, then run (this needs `config/private.yml` with blobstore write credentials):
+
+```bash
+bosh finalize-release --version X.Y.Z bosh-proxmox-cpi-X.Y.Z.tgz
+git add releases/bosh-proxmox-cpi .final_builds
+git commit -m "chore(release): track final release metadata for X.Y.Z"
+git push origin main
+```
+
+Skipping this step means the new version never appears on bosh.io.
+
 ## License
 
 This project is licensed under the [Apache License, Version 2.0](LICENSE). By submitting a contribution, you agree that it will be licensed under the same terms.
