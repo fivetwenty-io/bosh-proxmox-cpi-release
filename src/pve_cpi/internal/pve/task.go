@@ -3,6 +3,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -150,6 +151,22 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 		if exit, resolved := sdkTaskFailureExit(err); resolved {
 			return WrapError(fmt.Errorf("task %s failed: exit status %q", upid, exit))
 		}
+		// The vendored poller's own TimeoutSeconds window (derived from ao.
+		// maxWaitSeconds via context.WithTimeout, independent of the caller's
+		// ctx already excluded above) can elapse while a poll interval sleep
+		// or an in-flight status read is outstanding; both arms return
+		// "task polling canceled...: %w" wrapping that derived context's
+		// DeadlineExceeded (vendor tasks.go waitForInterval / poll "before
+		// start"). Reaching here with ctx.Err() == nil proves the outer ctx
+		// is fine and it was the poller's own budget that ran out — the PVE
+		// task named by upid may still be executing. Classify it exactly
+		// like the empty-exit-status case below (poll gave up, task
+		// unresolved), NOT as a transient transport fault: a caller
+		// wrapping AwaitTask in RetryOnTransientOrLock must not treat this
+		// as license to re-submit the mutation the task belongs to.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return pollTimeoutUnresolved(upid)
+		}
 		// Route through WrapError: 5xx, ConnectionError, TimeoutError, net.Error
 		// Timeout all surface as retriable; permanent SDK errors stay non-retriable.
 		return wrapPollError(err, upid)
@@ -167,27 +184,25 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 		// task failure. Return a retriable error so the BOSH director
 		// re-issues the CPI action (with a fresh VMID if applicable) rather
 		// than holding a queue slot or treating a live task as failed.
-		return cpierrors.WrapAs(
-			fmt.Errorf("task %s: empty exit status (poll timeout — task still running)", upid),
-			cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("task %s: empty exit status (poll timeout — task still running)", upid),
-		)
+		// The message keeps its distinct "empty exit status" wording (tested
+		// verbatim) but shares pollTimeoutUnresolvedText's suffix, so
+		// IsTaskPollUnresolved recognizes this shape too.
+		msg := fmt.Sprintf("task %s: empty exit status (%s)", upid, pollTimeoutUnresolvedText)
+		return cpierrors.WrapAs(errors.New(msg), cpierrors.TypeRetriableCloud, msg)
 	}
-	if status.Warned {
-		// "WARNINGS: N" exit: the task completed its work but logged WARN
-		// lines -- e.g. qmdestroy removed the VM yet could not remove one
-		// disk under storage-lock contention ("Could not remove disk ...,
-		// check manually"). Failing here would fail an operation that
-		// actually succeeded; any leftover volume is an audit concern
-		// (scripts/disk-audit), not a task failure. Mirrors the adaptive
-		// path's classifyTaskExit.
-		return nil
-	}
-	if exit != "OK" && exit != "ok" {
-		return cpierrors.Cloud("task %s failed: exit status %q", upid, exit)
-	}
-
-	return nil
+	// classifyTaskExit subsumes both the WARNINGS check ("WARNINGS: N" is a
+	// success carrying WARN lines -- e.g. qmdestroy removed the VM yet could
+	// not remove one disk under storage-lock contention; failing here would
+	// fail an operation that actually succeeded) and the OK/ok check, AND
+	// routes any other exit text through WrapError so a contention exit
+	// (cfs-lock timeout, quorum loss, pushback phrase) stays retriable
+	// instead of hard-coding every non-OK exit to permanent. Both await
+	// paths must classify a resolved failing exit identically (see
+	// awaitTaskAdaptive's doc comment); calling the adaptive path's own
+	// classifier here, instead of re-deriving the same rule, makes that
+	// true by construction rather than by two independently maintained
+	// copies drifting apart.
+	return classifyTaskExit(upid, exit, status.Warned)
 }
 
 // adaptiveTaskPollBounds are the clamp on the progress-derived poll interval.
@@ -263,10 +278,7 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 					fmt.Sprintf("AwaitTask %s: context cancelled", upid))
 			}
 			if actx.Err() != nil {
-				return cpierrors.WrapAs(
-					fmt.Errorf("task %s: poll timeout — task still running", upid),
-					cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("task %s: poll timeout — task still running", upid))
+				return pollTimeoutUnresolved(upid)
 			}
 			if IsNotFound(err) {
 				return wrapPollError(err, upid)
@@ -303,10 +315,7 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 			return cpierrors.WrapAs(ctx.Err(), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AwaitTask %s: context cancelled", upid))
 		case <-actx.Done():
-			return cpierrors.WrapAs(
-				fmt.Errorf("task %s: poll timeout — task still running", upid),
-				cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("task %s: poll timeout — task still running", upid))
+			return pollTimeoutUnresolved(upid)
 		case <-time.After(d):
 		}
 	}
@@ -385,6 +394,45 @@ func sdkTaskFailureExit(err error) (string, bool) {
 // and re-submitting would double-apply).
 func IsTaskExitVerdict(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "failed: exit status")
+}
+
+// pollTimeoutUnresolvedText is the canonical message both await paths use
+// when polling gave up before upid's task reached a terminal state. Both
+// pollTimeoutUnresolved and IsTaskPollUnresolved anchor on it, so the two
+// stay in sync by construction rather than by convention.
+const pollTimeoutUnresolvedText = "poll timeout — task still running"
+
+// pollTimeoutUnresolved returns the standard "polling gave up before the
+// task resolved" error for upid: the underlying PVE task may still be
+// executing (or its outcome is genuinely unknown — see task.go's SDK
+// Wait() DeadlineExceeded arm). It is retriable to the Director (BOSH
+// re-issues the CPI action, with a fresh VMID where applicable) but is
+// deliberately built from a bare message with no SDK/network error shape
+// in its chain: IsTransientTransport, IsStorageLockTimeout,
+// IsClusterNotQuorate, IsPVEPushback, and therefore IsRetryableOrLockFault,
+// all report false for it. That is load-bearing. A caller that wraps
+// AwaitTask inside RetryOnTransientOrLock (moveDiskToVM, uploadISO,
+// takeVMSnapshotConverging, the create_stemcell freeze closure) must not
+// treat this shape as license to resubmit the mutation the task belongs
+// to — the task may still be running, and a second submit would
+// double-apply it. Those callers must track the pending UPID and re-await
+// it on the next attempt instead (see IsTaskExitVerdict's doc for the
+// resolved/unresolved discriminator those replay arms use).
+func pollTimeoutUnresolved(upid string) error {
+	msg := fmt.Sprintf("task %s: %s", upid, pollTimeoutUnresolvedText)
+	return cpierrors.WrapAs(errors.New(msg), cpierrors.TypeRetriableCloud, msg)
+}
+
+// IsTaskPollUnresolved reports whether err is the pollTimeoutUnresolved
+// shape: an await gave up on upid without learning whether its task
+// succeeded, failed, or is still running. It is the negative counterpart to
+// IsTaskExitVerdict (which reports a RESOLVED task's own failure verdict) —
+// exactly one of the two, or neither (a genuine transport fault, which
+// carries its own SDK/network shape and remains subject to
+// IsTransientTransport / IsRetryableOrLockFault), can be true for a given
+// AwaitTask error.
+func IsTaskPollUnresolved(err error) bool {
+	return err != nil && strings.Contains(err.Error(), pollTimeoutUnresolvedText)
 }
 
 // wrapPollError maps a task poll SDK error to the appropriate CPI error type.

@@ -73,7 +73,9 @@ const (
 )
 
 // Error is the unified BOSH CPI error value. All constructors return *Error.
-// Use Type(), OkToRetry(), and RPCPayload() at the JSON-RPC layer.
+// Use Type() and OkToRetry() directly; the JSON-RPC layer builds the wire
+// error body via dispatcher.wireErrorBody(method, e), not RPCPayload() (see
+// that method's doc for why).
 type Error struct {
 	typ       Type
 	msg       string

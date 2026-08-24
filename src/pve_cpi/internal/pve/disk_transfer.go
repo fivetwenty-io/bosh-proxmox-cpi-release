@@ -51,6 +51,8 @@ func IsMoveDiskSnapshotRefusal(err error) bool {
 // moveDiskToVM issues one move_disk reassignment and awaits its task. disk is
 // the source config key ("scsi3" or "unused0"), targetSlot the config key the
 // volume lands on. Same-node only — PVE refuses cross-node reassignment.
+//
+//nolint:gocognit // Move retry-state machine: pendingUPID re-await, replay probe, and the POST+await path are one ordered decision tree; splitting it would scatter the ordering the double-apply protection depends on.
 func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string, srcVMID int, disk string, targetVMID int, targetSlot string) error {
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {
@@ -62,11 +64,44 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 	// often lands on the move task rather than the POST, and the parker's
 	// protection window stays open for the whole transfer, so a task-level
 	// lock timeout must re-drive the move in-process instead of surfacing.
+	//
+	// pendingUPID tracks a submitted move whose await did not RESOLVE
+	// (IsTaskExitVerdict false — a poll transport fault or an unresolved
+	// poll timeout, IsTaskPollUnresolved). On the NEXT attempt the closure
+	// re-awaits that same task instead of re-POSTing CreateQemuMoveDisk:
+	// the earlier move may still be executing on PVE, and a second POST
+	// would double-apply it. Mirrors resizeDiskConverging.
 	attempts := 0
 	errFromAwait := false
+	pendingUPID := ""
 	moveErr := RetryOnTransientOrLock(ctx, logger, "disk_transfer_move", parkerWindowMaxAttempts, func() error {
 		attempts++
 		errFromAwait = false
+
+		if pendingUPID != "" {
+			upid := pendingUPID
+			inner := AwaitTaskWithLogger(ctx, c, node, upid, logger)
+			errFromAwait = true
+			if inner == nil {
+				pendingUPID = ""
+				return nil
+			}
+			if IsTaskExitVerdict(inner) {
+				// Resolved with a failure verdict: the task settled, so a
+				// fresh POST (next attempt) is the recovery, not another
+				// re-await.
+				pendingUPID = ""
+			}
+			// Unresolved (pendingUPID stays set) rides the loop's backoff
+			// into another re-await; a resolved verdict falls through to
+			// the replay probe below before surfacing.
+			if moveDiskLanded(ctx, c, node, srcVMID, disk, targetVMID, targetSlot) {
+				pendingUPID = ""
+				return nil
+			}
+			return inner
+		}
+
 		raw, inner := nodesSvc.CreateQemuMoveDisk(ctx, node, strconv.Itoa(srcVMID), &sdknodes.CreateQemuMoveDiskParams{
 			Disk:       disk,
 			TargetVmid: &tv,
@@ -86,9 +121,14 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 				// every other endpoint that answers without a UPID.
 				return nil
 			}
+			pendingUPID = upid
 			inner = AwaitTaskWithLogger(ctx, c, node, upid, logger)
 			if inner == nil {
+				pendingUPID = ""
 				return nil
+			}
+			if IsTaskExitVerdict(inner) {
+				pendingUPID = ""
 			}
 			errFromAwait = true
 		}
@@ -107,6 +147,7 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 					log.String("target_slot", targetSlot),
 				)
 			}
+			pendingUPID = ""
 			return nil
 		}
 		return inner

@@ -1469,6 +1469,50 @@ func TestWrapMutationError(t *testing.T) {
 	}
 }
 
+// TestWrapMutationError_PmxcfsConfigMissing_ChainsCause is the F7 regression:
+// WrapMutationError's pmxcfs-config-gone branch used to build its result with
+// cpierrors.Cloud("...: %s", err.Error()), which embeds the cause as flat
+// text rather than chaining it -- Cloud sets no cause, so Unwrap returns nil
+// and downstream errors.Is / errors.As stop working on the result. This pins
+// that the SDK sentinel is still reachable through the chain (errors.Is)
+// after the wrap, and that the message text is unchanged (Error() appends
+// the chained cause exactly once, producing the same string the embedded
+// format used to).
+func TestWrapMutationError_PmxcfsConfigMissing_ChainsCause(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("boom")
+	cause := fmt.Errorf("Configuration file 'nodes/pve1/qemu-server/90000.conf' does not exist: %w", sentinel)
+	got := pve.WrapMutationError(cause)
+	if !errors.Is(got, sentinel) {
+		t.Errorf("WrapMutationError must chain the cause (errors.Is must reach the sentinel); err=%v", got)
+	}
+	if strings.Count(got.Error(), "boom") != 1 {
+		t.Errorf("cause text should appear exactly once, got %d in %q", strings.Count(got.Error(), "boom"), got.Error())
+	}
+	if cpiErrIsRetriable(t, got) {
+		t.Errorf("pmxcfs-config-gone must stay non-retriable through WrapMutationError; err=%v", got)
+	}
+}
+
+// TestWrapError_VolumeFormatUnknown_ChainsCause is the F7 regression for
+// WrapError's IsVolumeFormatUnknown branch: same embedded-cause defect as
+// WrapMutationError's pmxcfs branch, on the sibling classifier.
+func TestWrapError_VolumeFormatUnknown_ChainsCause(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("boom")
+	cause := fmt.Errorf("volume_size_info on 'nfs-images:9999/vm-9999-disk-0.qcow2' failed - no format: %w", sentinel)
+	got := pve.WrapError(cause)
+	if !errors.Is(got, sentinel) {
+		t.Errorf("WrapError must chain the cause (errors.Is must reach the sentinel); err=%v", got)
+	}
+	if strings.Count(got.Error(), "boom") != 1 {
+		t.Errorf("cause text should appear exactly once, got %d in %q", strings.Count(got.Error(), "boom"), got.Error())
+	}
+	if cpiErrIsRetriable(t, got) {
+		t.Errorf("volume-format-unknown must stay non-retriable; err=%v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // IsTransportConnectionDrop
 // ---------------------------------------------------------------------------

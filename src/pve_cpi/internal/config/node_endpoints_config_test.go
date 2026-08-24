@@ -53,6 +53,9 @@ func TestValidateNodeEndpoints_RejectsBadValues(t *testing.T) {
 		{"empty port", map[string]string{"pve2": "pve2.example.com:"}, "port must be 1-65535"},
 		{"missing host", map[string]string{"pve2": ":8006"}, "must carry a host before the port"},
 		{"padded key", map[string]string{" pve2": "pve2.example.com"}, "must not carry surrounding whitespace"},
+		{"padded value leading", map[string]string{"pve2": " pve2.example.com"}, "value must not carry surrounding whitespace"},
+		{"padded value trailing", map[string]string{"pve2": "pve2.example.com "}, "value must not carry surrounding whitespace"},
+		{"padded value both", map[string]string{"pve2": "  pve2.example.com  "}, "value must not carry surrounding whitespace"},
 		{"bracketed without port", map[string]string{"pve2": "[fd00::1]"}, "bracketed address must be [host]:port"},
 		{"double port typo", map[string]string{"pve2": "pve2:8006:8006"}, "bare IPv6 literal"},
 	}
@@ -84,6 +87,47 @@ func TestValidateNodeEndpoints_AcceptsGoodValues(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("valid entries rejected: %v", err)
+	}
+}
+
+// TestNodeEndpointsDiscoveryAllowed is the F-03 regression: before the fix
+// there was no way to disable /cluster/status discovery for a verify_ssl:
+// false deployment (it was force-enabled with no off switch). The nil case
+// asserts the legacy computed default is preserved byte-for-byte.
+func TestNodeEndpointsDiscoveryAllowed(t *testing.T) {
+	t.Parallel()
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name      string
+		verifySSL *bool // nil -> VerifySSLValue() default true
+		discovery *bool // nil -> unset (legacy computed default)
+		wantAllow bool
+	}{
+		{"unset discovery, verify_ssl unset (default true)", nil, nil, false},
+		{"unset discovery, verify_ssl explicit true", &trueVal, nil, false},
+		{"unset discovery, verify_ssl false", &falseVal, nil, true},
+		{"explicit false overrides verify_ssl false", &falseVal, &falseVal, false},
+		{"explicit true overrides verify_ssl true", &trueVal, &trueVal, true},
+		{"explicit true with verify_ssl unset", nil, &trueVal, true},
+		{"explicit false with verify_ssl unset", nil, &falseVal, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := baseValidCfg()
+			c.VerifySSL = tc.verifySSL
+			c.NodeEndpointsDiscovery = tc.discovery
+			if got := c.NodeEndpointsDiscoveryAllowed(); got != tc.wantAllow {
+				t.Errorf("NodeEndpointsDiscoveryAllowed() = %v, want %v", got, tc.wantAllow)
+			}
+		})
+	}
+}
+
+func TestNodeEndpointsDiscoveryAllowed_NilReceiver(t *testing.T) {
+	t.Parallel()
+	if got := (*config.CPIConfig)(nil).NodeEndpointsDiscoveryAllowed(); got != false {
+		t.Errorf("nil receiver = %v, want false", got)
 	}
 }
 

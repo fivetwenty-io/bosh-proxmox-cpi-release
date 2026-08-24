@@ -18,6 +18,7 @@ import (
 	sdktasks "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
@@ -208,7 +209,14 @@ func TestAssignVMToPool_AlreadyMemberVerdict_SingleCallSuccess(t *testing.T) {
 	if !IsTransientTransport(verdict) {
 		t.Fatalf("fixture error must look transient to the blanket 5xx rule: %v", verdict)
 	}
-	svc := &crPoolSvc{addVMFn: func(int) error { return verdict }}
+	svc := &crPoolSvc{
+		addVMFn: func(int) error { return verdict },
+		// PoolHasVM is now authoritative for the requested pool (see the
+		// F5 fix); confirm membership so this test still isolates the
+		// AddVM-verdict classification it targets rather than exercising
+		// the probe's own disambiguation.
+		poolHasVMFn: func(string, int64) (bool, error) { return true, nil },
+	}
 	err := AssignVMToPool(crCtx(), &crPoolClient{pools: svc}, "stem-pool", 30500, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("already-a-pool-member must resolve as success (replayed committed AddVM), got: %v", err)
@@ -220,12 +228,18 @@ func TestAssignVMToPool_AlreadyMemberVerdict_SingleCallSuccess(t *testing.T) {
 
 func TestAssignVMToPool_AlreadyMemberAfterLockTimeout_Success(t *testing.T) {
 	t.Parallel()
-	svc := &crPoolSvc{addVMFn: func(call int) error {
-		if call == 1 {
-			return crLockErr()
-		}
-		return cr500("update pools failed: VM 30500 is already a pool member")
-	}}
+	svc := &crPoolSvc{
+		addVMFn: func(call int) error {
+			if call == 1 {
+				return crLockErr()
+			}
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		// PoolHasVM is now authoritative for the requested pool (see the
+		// F5 fix); confirm membership so this test still isolates the
+		// lock-retry-then-already-member sequence it targets.
+		poolHasVMFn: func(string, int64) (bool, error) { return true, nil },
+	}
 	err := AssignVMToPool(crCtx(), &crPoolClient{pools: svc}, "stem-pool", 30500, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("lock timeout then already-member must resolve as success, got: %v", err)
@@ -251,9 +265,16 @@ func TestAssignVMToPool_PoolNotFoundVerdict_SingleCallError(t *testing.T) {
 
 func TestAssignVMToPool_AlreadyMemberOfRequestedPool_VerifiedSuccess(t *testing.T) {
 	t.Parallel()
-	svc := &crPoolSvc{addVMFn: func(int) error {
-		return cr500("update pools failed: VM 30500 is already a pool member")
-	}}
+	svc := &crPoolSvc{
+		addVMFn: func(int) error {
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		// PoolHasVM is now authoritative for the requested pool (see the
+		// F5 fix): a definitive "not a member" must never be overturned by
+		// the index, so a genuine success case must confirm membership
+		// through the probe, not rely on the index alone.
+		poolHasVMFn: func(string, int64) (bool, error) { return true, nil },
+	}
 	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{"vmid": 30500, "pool": "stem-pool"}`),
 	}}}
@@ -327,11 +348,15 @@ func TestAssignVMToPool_AlreadyMemberOfRequestedPool_PoolProbeBeatsStaleIndex(t 
 	}
 }
 
-// TestAssignVMToPool_AlreadyMember_ProbeFailureSkipsStaleIndexVerdict pins
-// the probe-failure posture: when PoolHasVM itself errors, the replay reading
-// stands and the lagging index is never allowed to mint the fatal
-// already-in-another-pool error on stale evidence alone.
-func TestAssignVMToPool_AlreadyMember_ProbeFailureSkipsStaleIndexVerdict(t *testing.T) {
+// TestAssignVMToPool_AlreadyMember_TransientProbeFailure_ReturnsRetriable
+// pins the transient-probe posture: when PoolHasVM itself fails with an
+// unclassifiable/transient fault, AssignVMToPool must not report success on
+// a probe it never actually completed — that would be the exact silent
+// misattachment (this call's pool preference silently dropped) the probe
+// exists to prevent. It must also never fall through to the lagging index on
+// a merely transient fault, since a genuinely transient blip usually clears
+// on the caller's own retry.
+func TestAssignVMToPool_AlreadyMember_TransientProbeFailure_ReturnsRetriable(t *testing.T) {
 	t.Parallel()
 	svc := &crPoolSvc{
 		addVMFn: func(int) error {
@@ -341,14 +366,79 @@ func TestAssignVMToPool_AlreadyMember_ProbeFailureSkipsStaleIndexVerdict(t *test
 			return false, cr500("pvedaemon worker cycling")
 		},
 	}
-	// The stale index still shows the pool the VM was just moved out of; with
-	// the probe answer missing, that row alone must not fail the call.
 	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
 		json.RawMessage(`{"vmid": 30500, "pool": "other-pool"}`),
 	}}}
 	err := AssignVMToPool(crCtx(), cl, "stem-pool", 30500, log.NewNopLogger())
-	if err != nil {
-		t.Fatalf("a failed membership probe must keep the replay reading, got: %v", err)
+	if err == nil {
+		t.Fatal("a transient probe failure must not be read as success")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("expected TypeRetriableCloud so the caller redrives; got: %v", err)
+	}
+	if svc.poolHasVMCalls != 1 {
+		t.Fatalf("expected exactly 1 PoolHasVM probe, got %d", svc.poolHasVMCalls)
+	}
+}
+
+// TestAssignVMToPool_AlreadyMember_PermanentProbeDenial_NamesIndexConflict
+// pins the permanent-verdict posture: a 403 (token missing Pool.Audit) can
+// never succeed on retry, so it must fall through to the lagging index
+// rather than reading as success, and when that index names a genuine
+// conflicting pool the call fails loudly instead of silently dropping this
+// caller's pool preference.
+func TestAssignVMToPool_AlreadyMember_PermanentProbeDenial_NamesIndexConflict(t *testing.T) {
+	t.Parallel()
+	svc := &crPoolSvc{
+		addVMFn: func(int) error {
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		poolHasVMFn: func(string, int64) (bool, error) {
+			return false, sdkerrors.ParseAPIError(403, []byte(`{"message":"Permission check failed"}`))
+		},
+	}
+	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
+		json.RawMessage(`{"vmid": 30500, "pool": "other-pool"}`),
+	}}}
+	err := AssignVMToPool(crCtx(), cl, "stem-pool", 30500, log.NewNopLogger())
+	if err == nil {
+		t.Fatal("a permanently denied probe must not be read as success when the index names a conflicting pool")
+	}
+	if !strings.Contains(err.Error(), "other-pool") {
+		t.Errorf("expected the conflicting pool named in the error, got: %v", err)
+	}
+	if svc.poolHasVMCalls != 1 {
+		t.Fatalf("expected exactly 1 PoolHasVM probe, got %d", svc.poolHasVMCalls)
+	}
+}
+
+// TestAssignVMToPool_AlreadyMember_DefiniteNonMember_StaleIndexNeverOverturnsIt
+// pins the F5 invariant: once PoolHasVM answers a definitive "not a member"
+// for the requested pool, that verdict is authoritative (pmxcfs does not
+// lag). A stale /cluster/resources row that still names the REQUESTED pool
+// (the exact shape left behind immediately after a pool move, before the
+// index catches up) must never overturn it back to success.
+func TestAssignVMToPool_AlreadyMember_DefiniteNonMember_StaleIndexNeverOverturnsIt(t *testing.T) {
+	t.Parallel()
+	svc := &crPoolSvc{
+		addVMFn: func(int) error {
+			return cr500("update pools failed: VM 30500 is already a pool member")
+		},
+		poolHasVMFn: func(poolID string, vmid int64) (bool, error) {
+			if poolID != "stem-pool" || vmid != 30500 {
+				t.Errorf("PoolHasVM(%q, %d); want the requested pool and VMID", poolID, vmid)
+			}
+			return false, nil
+		},
+	}
+	// The lagging index still shows the REQUESTED pool, even though the
+	// pmxcfs-backed probe just proved the VM is NOT a member of it.
+	cl := &crPoolClient{pools: svc, cluster: &crCluster{resp: sdkcluster.ListResourcesResponse{
+		json.RawMessage(`{"vmid": 30500, "pool": "stem-pool"}`),
+	}}}
+	err := AssignVMToPool(crCtx(), cl, "stem-pool", 30500, log.NewNopLogger())
+	if err == nil {
+		t.Fatal("a definitive non-member probe verdict must never resolve to success, even when the stale index still shows the requested pool")
 	}
 	if svc.poolHasVMCalls != 1 {
 		t.Fatalf("expected exactly 1 PoolHasVM probe, got %d", svc.poolHasVMCalls)

@@ -81,8 +81,24 @@ func WrapMutationError(err error) error {
 	// so neither test above catches it -- and it is a verdict, not a wobble: the
 	// guest this call names is not there. Without this, every write against a
 	// parker somebody deleted mid-window is retried until the Director gives up.
+	//
+	// Opposing WrapError:251-253's classification of the SAME predicate on
+	// purpose, not by oversight: WrapError backs config-read/await callers
+	// that see this mid-flight on an ordinary read (a concurrent rollback or
+	// orphan sweep racing the read) and must stay retriable so the Director
+	// re-issues with a fresh VMID; this function backs MUTATING parker calls
+	// (attach/detach/protection-write) where the same text means the specific
+	// guest this write targets is provably gone, and retrying a write against
+	// nothing is fruitless. Each caller class needs the opposite answer for
+	// the identical text; neither is wrong.
+	//
+	// WrapAs (not Cloud(fmt-embedded-cause)) chains err as the cause: Cloud's
+	// message-only constructor leaves Unwrap returning nil, so a downstream
+	// errors.Is/errors.As (IsNotFound's SDK-sentinel arm, apiHTTPCode) would
+	// go blind on the result. Error() appends the cause once, so the message
+	// text is unchanged from before.
 	if IsPmxcfsConfigMissing(err) {
-		return cpierrors.Cloud("PVE reports the guest config is gone: %s", err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud, "PVE reports the guest config is gone")
 	}
 	if code, ok := apiHTTPCode(err); ok && code >= 400 && code < 500 && code != 429 {
 		return WrapError(err)
@@ -204,10 +220,15 @@ func WrapError(err error) error {
 	// and an operator-actionable message naming the volid. See
 	// IsVolumeFormatUnknown.
 	if IsVolumeFormatUnknown(err) {
-		return cpierrors.Cloud(
+		// WrapAs (not Cloud(fmt-embedded-cause)) chains err as the cause, so
+		// IsNotFound's SDK-sentinel arm and apiHTTPCode still resolve on the
+		// wrapped result -- Cloud's message-only constructor leaves Unwrap
+		// returning nil. Error() appends the cause once, so the message text
+		// is unchanged from before.
+		return cpierrors.WrapAs(err, cpierrors.TypeCloud,
 			"PVE cannot determine a disk format for this volume ID — the volume ID is malformed "+
 				"or names a path its storage plugin cannot resolve; this is permanent, not a transient "+
-				"server fault: %s", err.Error())
+				"server fault")
 	}
 
 	// SDK API status classification: 404 vs 5xx vs 429 vs other 4xx. Resolved
@@ -249,6 +270,16 @@ func WrapError(err error) error {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE storage backend transient")
 	}
 	if IsPmxcfsConfigMissing(err) {
+		// Opposing WrapMutationError:84's classification of the SAME
+		// predicate on purpose, not by oversight: this function backs
+		// config-read/await callers that see this mid-flight on an ordinary
+		// read (a concurrent rollback or orphan sweep racing the read) and
+		// must stay retriable so the Director re-issues with a fresh VMID;
+		// WrapMutationError backs MUTATING parker calls (attach/detach/
+		// protection-write) where the same text means the specific guest
+		// that write targets is provably gone, and retrying a write against
+		// nothing is fruitless. Each caller class needs the opposite answer
+		// for the identical text; neither is wrong.
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pmxcfs race (config gone mid-flight)")
 	}
 	// Plain-text pushback phrases (task-body or non-APIError surfaces).

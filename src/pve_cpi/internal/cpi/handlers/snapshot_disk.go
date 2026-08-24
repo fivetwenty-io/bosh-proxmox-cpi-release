@@ -178,19 +178,52 @@ func HandleSnapshotDisk(deps Deps) Handler {
 // snapName already exists: if it does, a prior attempt committed and the goal
 // is reached. A first-attempt failure cannot mean that (the name is fresh),
 // so it skips the probe entirely.
+//
+// pendingUPID tracks a submitted snapshot whose await did not RESOLVE
+// (pve.IsTaskExitVerdict false — a poll transport fault or an unresolved
+// poll timeout, pve.IsTaskPollUnresolved): the next attempt re-awaits that
+// same task instead of re-submitting Snapshot, because the earlier snapshot
+// may still be executing on PVE and a second submit would double-apply it.
+// Mirrors resizeDiskConverging / uploadStemcellImage.
 func takeVMSnapshotConverging(ctx context.Context, deps Deps, node string, vmid int, snapName string, snapOpts map[string]any) error {
 	firstAttempt := true
+	pendingUPID := ""
 	return pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "snapshot_disk", 0, func() error {
 		replay := !firstAttempt
 		firstAttempt = false
+
+		if pendingUPID != "" {
+			upid := pendingUPID
+			awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
+			switch {
+			case awaitErr == nil:
+				pendingUPID = ""
+				return nil
+			case pve.IsTaskExitVerdict(awaitErr):
+				// Resolved with a failure verdict: the task settled, so a
+				// fresh submit (falling through below) is the recovery.
+				pendingUPID = ""
+			default:
+				// Unresolved: the snapshot may still be executing, so a
+				// resubmit would double-apply it. Ride the loop's backoff
+				// into another re-await instead.
+				return awaitErr
+			}
+		}
+
 		upid, e := deps.PVE.QEMU().Snapshot(ctx, node, vmid, snapName, snapOpts)
 		if e == nil {
 			if upid == "" {
 				return nil
 			}
+			pendingUPID = upid
 			e = pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
 			if e == nil {
+				pendingUPID = ""
 				return nil
+			}
+			if pve.IsTaskExitVerdict(e) {
+				pendingUPID = ""
 			}
 		}
 		if replay && snapshotAlreadyCommitted(ctx, deps, node, vmid, snapName) {
@@ -198,6 +231,7 @@ func takeVMSnapshotConverging(ctx context.Context, deps Deps, node string, vmid 
 				log.Int("vmid", vmid),
 				log.String("snap_name", snapName),
 			)
+			pendingUPID = ""
 			return nil
 		}
 		return e

@@ -173,6 +173,12 @@ func TestValidateRetry_RejectsBadValues(t *testing.T) {
 		{"negative base", &config.RetryConfig{StorageImport: &config.RetryPolicy{BaseMs: -5}}, "base_ms must be >= 0"},
 		{"jitter over 100", &config.RetryConfig{TaskPoll: &config.RetryPolicy{JitterPct: 150}}, "jitter_pct must be 0-100"},
 		{"cap below base", &config.RetryConfig{StorageImport: &config.RetryPolicy{BaseMs: 5000, CapMs: 1000}}, "effective cap_ms (1000) must be >= effective base_ms (5000)"},
+		// F2 regression: no upper bound on max_attempts previously meant an
+		// operator could push a curve's attempt counter into the range where
+		// the (now-fixed) backoff overflow lived; validation must reject the
+		// value outright rather than rely on the runtime clamp alone.
+		{"attempts above ceiling", &config.RetryConfig{StorageUpload: &config.RetryPolicy{MaxAttempts: 101}}, "retry.storage_upload.max_attempts must be <= 100"},
+		{"attempts far above ceiling", &config.RetryConfig{Transient: &config.RetryPolicy{MaxAttempts: 1000}}, "retry.transient.max_attempts must be <= 100"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,6 +218,24 @@ func TestValidateRetry_AcceptsZeroAndValid(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("expected valid config, got %v", err)
+	}
+}
+
+// TestValidateRetry_MaxAttemptsCeilingBoundary pins the exact boundary for
+// the F2 upper bound: 100 is accepted (the documented ceiling), 101 is
+// rejected.
+func TestValidateRetry_MaxAttemptsCeilingBoundary(t *testing.T) {
+	c := baseValidCfg()
+	c.Retry = &config.RetryConfig{StorageLock: &config.RetryPolicy{MaxAttempts: 100}}
+	if err := c.Validate(); err != nil {
+		t.Errorf("max_attempts=100 (the ceiling) must be accepted, got %v", err)
+	}
+
+	c2 := baseValidCfg()
+	c2.Retry = &config.RetryConfig{StorageLock: &config.RetryPolicy{MaxAttempts: 101}}
+	err := c2.Validate()
+	if err == nil || !strings.Contains(err.Error(), "retry.storage_lock.max_attempts must be <= 100") {
+		t.Errorf("max_attempts=101 must be rejected with a ceiling error, got %v", err)
 	}
 }
 

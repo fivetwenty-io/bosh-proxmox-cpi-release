@@ -226,19 +226,83 @@ func TestAttachEphemeralDisk_StorageLockContention_RetriesInPlace(t *testing.T) 
 	}
 }
 
-// TestAttachEphemeralDisk_ExhaustedLockRetries_SweepsCommittedVolume covers
-// the drop-after-commit residue: when every CreateVolume attempt fails on
-// lock contention but PVE committed the volume anyway (the storage task ran
-// after the API answer was lost), the failure path must probe for the
-// canonical volid and remove it, so the Director's redo with a fresh VMID
-// does not orphan the committed volume.
-func TestAttachEphemeralDisk_ExhaustedLockRetries_SweepsCommittedVolume(t *testing.T) {
+// TestAttachEphemeralDisk_ReplayFindsVolumeCommitted_ConvergesWithoutSweeping
+// is the F3 regression: volName is deterministic per VMID, so a replay of a
+// committed-then-dropped first attempt hits PVE's "already exists" rejection
+// (an LVM/ZFS text shape IsVMIDConflict does not recognize) on every
+// remaining attempt. Before the fix the loop burned its entire lock-retry
+// budget (up to ~2-4 minutes) discovering that the verdict never changes, and
+// on exhaustion swept (DELETED) the volume it had itself just committed. The
+// fix probes existence on any REPLAY failure (attempt > 1) and, since this
+// VMID was freshly allocated for this create_vm call, treats a hit as the
+// goal state reached: the loop converges after the second attempt, and the
+// committed volume is adopted (attached), never swept.
+func TestAttachEphemeralDisk_ReplayFindsVolumeCommitted_ConvergesWithoutSweeping(t *testing.T) {
 	t.Parallel()
 
 	lockErr := errors.New("API request failed: cfs-lock 'storage-rbd' error: got lock request timeout\n (code: 0)")
 	stor := &ephemeralStorageSvc{
+		// Every CreateVolume attempt keeps failing (PVE rejects the replay
+		// against the already-committed name), but the volume is there from
+		// attempt 1's own commit.
 		createVolumeFn: func(int) (string, error) { return "", lockErr },
 		existsFn:       func(string) (bool, error) { return true, nil },
+	}
+	q := &ephemeralQEMU{
+		configFn: func() (map[string]any, error) {
+			return map[string]any{"virtio0": "zfs-1:vm-9101-disk-0"}, nil
+		},
+		attachDiskFn: func(_, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+			return "UPID:pve1:1:2:qmattach:9101:root@pam:", nil
+		},
+	}
+	deps := Deps{PVE: &ephemeralClient{qemu: q, storage: stor}, Logger: log.NewNopLogger()}
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	devPath, err := attachEphemeralDisk(ctx, deps, log.NewNopLogger(), newEphemeralShape(), ephemeralTestVMID)
+	if err != nil {
+		t.Fatalf("a replay that finds its own committed volume must converge to success, got: %v", err)
+	}
+	if devPath == "" {
+		t.Error("expected a non-empty device path on success")
+	}
+	if stor.createVolumeCalls != 2 {
+		t.Errorf("CreateVolume calls = %d, want 2 (dropped first attempt + replay whose probe converges)",
+			stor.createVolumeCalls)
+	}
+	const canonical = ephemeralTestStorage + ":vm-9101-ephemeral-0"
+	if len(stor.existsCalls) != 1 || stor.existsCalls[0] != canonical {
+		t.Fatalf("Exists probes = %v, want exactly one (the in-loop replay probe) for %q", stor.existsCalls, canonical)
+	}
+	if len(stor.deleteAsyncCalls) != 0 {
+		t.Errorf("DeleteVolumeAsync must NOT run: the committed volume is the goal state (adopted, not orphaned), "+
+			"got %d calls", len(stor.deleteAsyncCalls))
+	}
+}
+
+// TestAttachEphemeralDisk_ExhaustedLockRetries_SweepsCommittedVolume covers
+// the case the in-loop replay probe cannot resolve: every attempt's own
+// existence probe finds nothing (the volume genuinely is not there yet on
+// any replay), but PVE's storage task quietly finishes committing it right
+// as the LAST attempt's response is lost -- there is no further replay
+// attempt to catch that in-loop. Exhaustion still falls through to the
+// existing post-loop sweep, which must find and remove the residue so the
+// Director's redo with a fresh VMID does not orphan it.
+func TestAttachEphemeralDisk_ExhaustedLockRetries_SweepsCommittedVolume(t *testing.T) {
+	t.Parallel()
+
+	lockErr := errors.New("API request failed: cfs-lock 'storage-rbd' error: got lock request timeout\n (code: 0)")
+	existsCalls := 0
+	stor := &ephemeralStorageSvc{
+		createVolumeFn: func(int) (string, error) { return "", lockErr },
+		existsFn: func(string) (bool, error) {
+			existsCalls++
+			// Every in-loop replay probe (attempts 2..DefaultStorageLockMaxAttempts)
+			// sees no evidence yet; only the post-exhaustion sweep's own
+			// probe -- the final Exists call overall -- finds the volume
+			// the last attempt committed.
+			return existsCalls == pve.DefaultStorageLockMaxAttempts, nil
+		},
 	}
 	deps := Deps{PVE: &ephemeralClient{qemu: &ephemeralQEMU{}, storage: stor}, Logger: log.NewNopLogger()}
 
@@ -251,8 +315,9 @@ func TestAttachEphemeralDisk_ExhaustedLockRetries_SweepsCommittedVolume(t *testi
 			stor.createVolumeCalls, pve.DefaultStorageLockMaxAttempts)
 	}
 	const canonical = ephemeralTestStorage + ":vm-9101-ephemeral-0"
-	if len(stor.existsCalls) != 1 || stor.existsCalls[0] != canonical {
-		t.Fatalf("Exists probes = %v, want exactly one for %q", stor.existsCalls, canonical)
+	if len(stor.existsCalls) != pve.DefaultStorageLockMaxAttempts {
+		t.Fatalf("Exists probes = %d, want %d (one per replay attempt, plus the post-loop sweep probe)",
+			len(stor.existsCalls), pve.DefaultStorageLockMaxAttempts)
 	}
 	if len(stor.deleteAsyncCalls) != 1 {
 		t.Fatalf("DeleteVolumeAsync: want 1 sweep call, got %d", len(stor.deleteAsyncCalls))

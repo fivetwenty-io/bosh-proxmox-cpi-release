@@ -302,6 +302,91 @@ func TestBackoff_ZeroJitterNoPanic(t *testing.T) {
 	}
 }
 
+// TestBackoff_HighAttemptCountNeverOverflowsNegative is the F2 regression:
+// computing base × 1.5^attempt as a single unclamped float64 factor, THEN
+// converting to time.Duration, meant that past attempt ~57 (TransientBackoff's
+// 1s base) the float64→int64 conversion is implementation-defined and yields
+// a large NEGATIVE duration on amd64 (CVTTSD2SI). A negative duration passes
+// neither the pre-jitter nor the post-jitter "> maxBackoff" clamp (a negative
+// number is never greater than a positive cap), so time.After(negative) fires
+// immediately — a zero-delay hot loop against an already-overloaded PVE
+// cluster. This exercises attempt counts through 500 (well past the
+// documented attempt=57 cliff and past expBackoffMaxIterations) for all three
+// curves and asserts every result is clamped in [0, cap], never negative.
+func TestBackoff_HighAttemptCountNeverOverflowsNegative(t *testing.T) {
+	t.Parallel()
+	const (
+		transientCap    = 15 * time.Second
+		storageLockCap  = 30 * time.Second
+		pushbackCapWant = 60 * time.Second
+	)
+	for _, attempt := range []int{56, 57, 58, 100, 200, 500} {
+		if d := TransientBackoff(attempt); d < 0 || d > transientCap {
+			t.Errorf("TransientBackoff(%d) = %v, want in [0, %v]", attempt, d, transientCap)
+		}
+		if d := StorageLockBackoff(attempt); d < 0 || d > storageLockCap {
+			t.Errorf("StorageLockBackoff(%d) = %v, want in [0, %v]", attempt, d, storageLockCap)
+		}
+		if d := PushbackBackoff(attempt); d < 0 || d > pushbackCapWant {
+			t.Errorf("PushbackBackoff(%d) = %v, want in [0, %v]", attempt, d, pushbackCapWant)
+		}
+	}
+}
+
+// TestExpBackoffDuration_FactorNeverReachesOverflowRegime is a
+// platform-independent proof that expBackoffDuration's early exit works:
+// the float64→int64 duration conversion the F2 finding exploited is only
+// implementation-defined once float64(base)*factor exceeds math.MaxInt64
+// (~9.22e18 ns, ~292 years) — on amd64 that specific input converts to a
+// large NEGATIVE int64 (CVTTSD2SI), which is what turns the retry loop into
+// a hot loop; on arm64 the same conversion instead saturates to MaxInt64,
+// so a test that only checks the OUTPUT stays non-negative
+// (TestBackoff_HighAttemptCountNeverOverflowsNegative) cannot distinguish
+// old from new code on an Apple Silicon dev box, exactly as the review
+// notes. This test instead checks the INPUT never reaches that regime in
+// the first place, which holds on every architecture: for a base/cap pair
+// representative of each shipped curve, expBackoffDuration must return
+// EXACTLY the cap once attempt is high enough to have crossed it — proving
+// the internal factor stopped growing at the early exit rather than
+// continuing toward the danger zone.
+func TestExpBackoffDuration_FactorNeverReachesOverflowRegime(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		base time.Duration
+		cap  time.Duration
+	}{
+		{"transient", 1 * time.Second, 15 * time.Second},
+		{"storage_lock", 2 * time.Second, 30 * time.Second},
+		{"pushback", 5 * time.Second, 60 * time.Second},
+	}
+	for _, c := range cases {
+		for _, attempt := range []int{57, 100, 200, expBackoffMaxIterations, expBackoffMaxIterations + 100} {
+			if d := expBackoffDuration(c.base, attempt, c.cap); d != c.cap {
+				t.Errorf("%s: expBackoffDuration(base=%v, attempt=%d, cap=%v) = %v, want exactly the cap "+
+					"(a value below the cap means the early exit did not fire and factor kept growing)",
+					c.name, c.base, attempt, c.cap, d)
+			}
+		}
+	}
+}
+
+// TestExpBackoffDuration_ZeroBaseNeverPanicsOrNaNs covers the degenerate
+// input a misconfigured base_ms=0 override produces: base × factor is always
+// 0, so the early-exit in expBackoffDuration (which fires once base×factor
+// reaches maxBackoff) never trips, leaving expBackoffMaxIterations as the
+// only thing stopping factor from growing toward float64 +Inf across enough
+// iterations — and 0 × +Inf is NaN, which converts to an unspecified
+// time.Duration. A high attempt count must still return a valid, small,
+// non-negative duration.
+func TestExpBackoffDuration_ZeroBaseNeverPanicsOrNaNs(t *testing.T) {
+	t.Parallel()
+	d := expBackoffDuration(0, 100000, 15*time.Second)
+	if d < 0 {
+		t.Errorf("expBackoffDuration(0, 100000, 15s) = %v, want >= 0", d)
+	}
+}
+
 // TestJitterSource_Seam confirms that swapping jitterSource under jitterMu
 // changes the output of TransientBackoff and StorageLockBackoff, proving the
 // seam is wired end-to-end. A seeded PCG source produces reproducible output,

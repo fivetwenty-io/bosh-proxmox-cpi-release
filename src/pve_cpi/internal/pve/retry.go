@@ -60,6 +60,55 @@ const DefaultStorageUploadMaxAttempts = 30
 // is down, so a long retry curve widens the unprotected window.
 const DefaultDiskMigrateMaxAttempts = 4
 
+// expBackoffMaxIterations hard-bounds the exponent loop every backoff curve
+// in this file runs, independent of the early-exit in expBackoffDuration: a
+// misconfigured base of 0 (operator override) never trips that early exit
+// (0 × anything never reaches a positive cap), so without a ceiling here
+// factor could still grow across enough iterations to overflow float64 to
+// +Inf, and 0 × +Inf is NaN. Far above any max_attempts a curve is ever
+// driven with (validateRetry rejects > retryMaxAttemptsCeiling in config.go).
+const expBackoffMaxIterations = 200
+
+// expBackoffDuration computes base × 1.5^attempt, clamped at maxBackoff,
+// without the float64→time.Duration overflow every backoff curve here used
+// to compute independently: growing factor unboundedly and converting
+// float64(base)*factor to time.Duration only AFTER the loop meant that once
+// factor grew large enough (attempt >= 57 for TransientBackoff's 1s base),
+// the float64→int64 conversion is implementation-defined and yields a large
+// NEGATIVE duration on amd64 (CVTTSD2SI) — negative, so neither the
+// pre-jitter nor the post-jitter maxBackoff clamp catches it, and
+// time.After(negative) fires immediately, turning the retry loop into a
+// zero-delay hot loop against an already-overloaded PVE cluster.
+//
+// This computes the SAME clamped result while never reaching that regime:
+// the loop stops the INSTANT base×factor first reaches maxBackoff, because
+// every later iteration would clamp to the identical maxBackoff anyway (the
+// unclamped value is monotonically increasing in factor) — so the multiplier
+// is never allowed to grow into the range where the final conversion could
+// misbehave. expBackoffMaxIterations is an independent, unconditional
+// ceiling for the degenerate case where maxBackoff itself is <= 0 (the early
+// exit could never fire).
+func expBackoffDuration(base time.Duration, attempt int, maxBackoff time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > expBackoffMaxIterations {
+		attempt = expBackoffMaxIterations
+	}
+	factor := 1.0
+	for i := 0; i < attempt; i++ {
+		factor *= 1.5
+		if time.Duration(float64(base)*factor) >= maxBackoff {
+			break
+		}
+	}
+	d := time.Duration(float64(base) * factor)
+	if d > maxBackoff || d < 0 {
+		d = maxBackoff
+	}
+	return d
+}
+
 // TransientBackoff returns the sleep duration after the attempt-th (0-indexed)
 // failed transport call: exponential 1s × 1.5^attempt with ±30% jitter, capped
 // at 15s. Tuned for pvedaemon worker recycling, which completes in roughly a
@@ -70,14 +119,7 @@ func TransientBackoff(attempt int) time.Duration {
 	// jitter math below.
 	const maxBackoff = 15 * time.Second
 	base := 1 * time.Second
-	factor := 1.0
-	for i := 0; i < attempt; i++ {
-		factor *= 1.5
-	}
-	d := time.Duration(float64(base) * factor)
-	if d > maxBackoff {
-		d = maxBackoff
-	}
+	d := expBackoffDuration(base, attempt, maxBackoff)
 	// Guard against Int64N(0) which panics. With a zero/negative jitter
 	// window fall back to the deterministic base delay.
 	jitterWindow := int64(d) * 6 / 10
@@ -129,14 +171,7 @@ func StorageLockBackoff(attempt int) time.Duration {
 	baseMs, capMs, jPct := storageLockDefaults()
 	base := time.Duration(baseMs) * time.Millisecond
 	maxBackoff := time.Duration(capMs) * time.Millisecond
-	factor := 1.0
-	for i := 0; i < attempt; i++ {
-		factor *= 1.5
-	}
-	d := time.Duration(float64(base) * factor)
-	if d > maxBackoff {
-		d = maxBackoff
-	}
+	d := expBackoffDuration(base, attempt, maxBackoff)
 	// jitterPct is in [0,100]. jitterWindow = d * 2*jPct/100 (±jPct% of d).
 	// Guard against Int64N(0) which panics.
 	if jPct < 0 {
@@ -188,14 +223,7 @@ func PushbackBackoff(attempt int) time.Duration {
 	baseMs, capMs := pushbackDefaults()
 	base := time.Duration(baseMs) * time.Millisecond
 	maxBackoff := time.Duration(capMs) * time.Millisecond
-	factor := 1.0
-	for i := 0; i < attempt; i++ {
-		factor *= 1.5
-	}
-	d := time.Duration(float64(base) * factor)
-	if d > maxBackoff {
-		d = maxBackoff
-	}
+	d := expBackoffDuration(base, attempt, maxBackoff)
 	// Guard against Int64N(0) which panics. With a zero/negative jitter
 	// window fall back to the deterministic base delay.
 	jitterWindow := int64(d) * 6 / 10

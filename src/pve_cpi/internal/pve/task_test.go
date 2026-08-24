@@ -394,6 +394,61 @@ func TestAwaitTask_EmptyExitStatusReturnsRetriableError(t *testing.T) {
 	}
 }
 
+// TestAwaitTask_SDKPollTimeout_NotTransientTransport reproduces the F1
+// finding: the vendored SDK's Wait() imposes its OWN internal timeout
+// (WaitOptions.TimeoutSeconds, independent of the caller's ctx), and when
+// that window elapses while the PVE task is still running, it returns
+// "task polling canceled: %w" wrapping context.DeadlineExceeded from ITS
+// derived context — not the caller's. The caller's ctx (here,
+// context.Background(), which never expires) is fine, so this must NOT be
+// classified as a transient transport fault: a mutation retry loop
+// wrapping AwaitTask (RetryOnTransientOrLock) uses IsTransientTransport /
+// IsRetryableOrLockFault to decide whether to re-submit, and a task that
+// may still be executing on PVE must not be re-submitted.
+//
+// Before the fix this error routed through wrapPollError -> WrapError's
+// net.Error-with-Timeout()==true branch (context.DeadlineExceeded
+// satisfies net.Error), so IsTransientTransport / IsRetryableOrLockFault
+// both reported true. After the fix it is retriable to the Director (a
+// poll timeout is not a permanent verdict) but reports false for both,
+// and true for the dedicated IsTaskPollUnresolved discriminator.
+func TestAwaitTask_SDKPollTimeout_NotTransientTransport(t *testing.T) {
+	t.Parallel()
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, _ string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			// Mirrors vendor/.../pkg/api/tasks/tasks.go's waitForInterval:
+			// the poller's own derived-context deadline fired mid-poll.
+			return nil, fmt.Errorf("task polling canceled: %w", context.DeadlineExceeded)
+		},
+	}
+
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error for SDK-internal poll timeout, got nil")
+	}
+
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("SDK poll timeout must be retriable to the Director, got OkToRetry=false; err=%v", err)
+	}
+	if pve.IsTransientTransport(err) {
+		t.Errorf("SDK poll timeout must NOT be IsTransientTransport (a mutation retry loop would re-submit "+
+			"a possibly still-running task): err=%v", err)
+	}
+	if pve.IsRetryableOrLockFault(err) {
+		t.Errorf("SDK poll timeout must NOT be IsRetryableOrLockFault: err=%v", err)
+	}
+	if !pve.IsTaskPollUnresolved(err) {
+		t.Errorf("SDK poll timeout must satisfy IsTaskPollUnresolved: err=%v", err)
+	}
+	if pve.IsTaskExitVerdict(err) {
+		t.Errorf("SDK poll timeout must NOT satisfy IsTaskExitVerdict (the task never resolved): err=%v", err)
+	}
+}
+
 func TestAwaitTask_Failure(t *testing.T) {
 	t.Parallel()
 	svc := &mockTasksService{
@@ -420,6 +475,41 @@ func TestAwaitTask_NonOKExitStatusNoSDKError(t *testing.T) {
 	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
 	if err == nil {
 		t.Fatal("expected error for FAILED exit status, got nil")
+	}
+}
+
+// TestAwaitTask_StatusShapedContentionExitStaysRetriable is the F4
+// regression: the status-shaped branch (a non-nil Status with a nil error --
+// the shape every test/fake Client seam produces, and the shape any future
+// Tasks() implementation could produce for a failed exit) used to hard-code
+// EVERY non-OK/non-WARNINGS exit to a permanent CloudError, contradicting
+// the parity rule the SDK-error-shaped branch three lines above it already
+// follows (both must classify a resolved failing exit identically). A
+// contention exit -- cfs-lock timeout, quorum loss, pushback -- is
+// RETRIABLE by that rule regardless of which shape carried it; this pins
+// that the status-shaped path now agrees.
+func TestAwaitTask_StatusShapedContentionExitStaysRetriable(t *testing.T) {
+	t.Parallel()
+	const exitText = "can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout"
+	svc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			return &sdktasks.Status{Status: "stopped", ExitStatus: exitText, UpID: upid}, nil
+		},
+	}
+	err := pve.AwaitTask(context.Background(), newMockClient(svc), "node1", "UPID:node1:abc")
+	if err == nil {
+		t.Fatal("expected error for a lock-contention exit status, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("a status-shaped lock-contention exit must be retriable, got OkToRetry=false; err=%v", err)
+	}
+	if !pve.IsTaskExitVerdict(err) {
+		t.Errorf("must still carry the resolved-verdict shape (\"failed: exit status\") so replay arms treat "+
+			"it as resolved, not unresolved: err=%v", err)
 	}
 }
 

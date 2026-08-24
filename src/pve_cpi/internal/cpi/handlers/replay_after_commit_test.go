@@ -207,6 +207,46 @@ func TestCreateVM_StartReplayFindsVMRunning(t *testing.T) {
 	}
 }
 
+// TestCreateVM_StartEmptyUPIDSkipsAwait is the F5 regression: an empty
+// startUPID means PVE completed the start synchronously with no task to
+// await (the same shape rebootVMHandleStopped already guards). Before the
+// fix, AwaitTaskWithLogger was always called, and AwaitTask's own
+// upid-must-not-be-empty input validation returned a permanent CloudError
+// naming a programming error -- rescued only by vmRunningNow's status probe
+// happening to report "running". This pins the probe is never reached at
+// all: statusFn panics if called, so a pass here proves the empty-UPID path
+// short-circuits before AwaitTask, exactly like reboot_vm's.
+func TestCreateVM_StartEmptyUPIDSkipsAwait(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{
+		startFn: func(_ context.Context, _ string, _ int) (string, error) {
+			return "", nil // synchronous success: no task to await
+		},
+		statusFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			panic("vmMockQEMU.Status: must not be called when startUPID is empty (no await ran)")
+		},
+	}
+	n := &vmMockNodes{}
+	a := &vmMockAgent{}
+	h := handlers.HandleCreateVM(buildVMDeps(q, n, &vmMockCluster{}, a))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	result, err := h.Handle(context.Background(), args, mkCtx("start-empty-upid"))
+	if err != nil {
+		t.Fatalf("a synchronous (empty-UPID) start must complete create_vm without an await, got: %v", err)
+	}
+	pair, ok := result.([]any)
+	if !ok || len(pair) == 0 || pair[0] == nil || fmt.Sprintf("%v", pair[0]) == "" {
+		t.Fatalf("result: want [vm_cid, networks] with a non-empty CID, got %T %v", result, result)
+	}
+	if len(a.removeCalls) != 0 {
+		t.Errorf("no rollback may run: agent.Remove called %d times", len(a.removeCalls))
+	}
+}
+
 // TestHandleResizeDisk_DroppedPostSettlesBeforeResubmit covers the unnamed-
 // task arm: the resize POST's response drops, but PVE created the task and it
 // commits only AFTER the retry's first re-read. The bounded settle window
@@ -506,6 +546,114 @@ func TestHandleResizeDisk_PollTimeoutOnReAwaitDoesNotResubmit(t *testing.T) {
 	defer mu.Unlock()
 	if resizeCalls != 1 {
 		t.Errorf("resize submits: want 1 (no stale resubmit over a running task), got %d", resizeCalls)
+	}
+	if waitCalls != 2 {
+		t.Errorf("task awaits: want 2 (blipped await + re-await), got %d", waitCalls)
+	}
+}
+
+// TestHandleSnapshotDisk_ReAwaitsPendingTaskInsteadOfResubmitting is the F1
+// regression for takeVMSnapshotConverging: the submit commits and returns a
+// UPID, but the first await hits a genuinely transient fault reading the
+// task's own status (a mid-request connection drop), not a resolved verdict
+// (pve.IsTaskExitVerdict false). The retry must re-await that SAME UPID
+// instead of re-submitting Snapshot — a second submit while the first
+// snapshot task may still be running would either collide on the (already
+// taken) name or, worse, silently create a second snapshot under a fresh
+// name were the collision not detected.
+func TestHandleSnapshotDisk_ReAwaitsPendingTaskInsteadOfResubmitting(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	snapCalls := 0
+	waitCalls := 0
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{diskSlot: diskCID}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			snapCalls++
+			return "UPID:pve1:0000FEED:00112233:66aabbcc:qmsnapshot:100:root@pam:", nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			waitCalls++
+			if waitCalls == 1 {
+				return nil, fmt.Errorf("Get \"/nodes/pve1/tasks/%s/status\": %w", upid, io.EOF)
+			}
+			return &tasks.Status{Status: "stopped", ExitStatus: "OK"}, nil
+		},
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
+	_, err := h.Handle(fastRetryCtx(context.Background()),
+		marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("re-await of the pending task must converge to success, got: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if snapCalls != 1 {
+		t.Errorf("snapshot submits: want 1 (no resubmit while the task is pending), got %d", snapCalls)
+	}
+	if waitCalls != 2 {
+		t.Errorf("task awaits: want 2 (blipped await + re-await), got %d", waitCalls)
+	}
+}
+
+// TestHandleSnapshotDisk_PollTimeoutOnReAwaitDoesNotResubmit pins the
+// unresolved-task arm for the F1 fix: the re-await of the prior attempt's
+// task outruns its poll budget while the task still runs. The handler must
+// surface that as retriable (for the Director) and never fall through to a
+// resubmit that would double-apply the still-executing snapshot.
+func TestHandleSnapshotDisk_PollTimeoutOnReAwaitDoesNotResubmit(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	snapCalls := 0
+	waitCalls := 0
+
+	qemuSvc := &snapQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{diskSlot: diskCID}, nil
+		},
+		snapshotFn: func(_ context.Context, _ string, _ int, _ string, _ map[string]any) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			snapCalls++
+			return "UPID:pve1:0000FACE:00112233:66aabbcc:qmsnapshot:100:root@pam:", nil
+		},
+	}
+	tasksSvc := &mockTasksService{
+		waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			waitCalls++
+			if waitCalls == 1 {
+				return nil, fmt.Errorf("Get \"/nodes/pve1/tasks/%s/status\": %w", upid, io.EOF)
+			}
+			// The SDK wait window elapsed with no terminal exit status: the
+			// task is still running.
+			return &tasks.Status{ExitStatus: ""}, nil
+		},
+	}
+
+	h := handlers.HandleSnapshotDisk(snapDeps(qemuSvc, resizeClusterWith(100), tasksSvc))
+	_, err := h.Handle(fastRetryCtx(context.Background()),
+		marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("an unresolved task must surface, not silently converge")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if snapCalls != 1 {
+		t.Errorf("snapshot submits: want 1 (no stale resubmit over a running task), got %d", snapCalls)
 	}
 	if waitCalls != 2 {
 		t.Errorf("task awaits: want 2 (blipped await + re-await), got %d", waitCalls)

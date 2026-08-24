@@ -1125,6 +1125,7 @@ func attachEphemeralDisk(
 	}
 
 	volName := fmt.Sprintf("vm-%d-ephemeral-0", vmid)
+	canonical := fmt.Sprintf("%s:%s", shape.ephemeralStorage, volName)
 	// In-place retry on storage contention, the same backoff create_disk's
 	// attemptCreateVolume uses (that path additionally honors the operator's
 	// storage-lock attempt budget; this one takes the default): a CF deploy
@@ -1134,13 +1135,48 @@ func attachEphemeralDisk(
 	// the whole create_vm (clone, boot, configure) only to re-enter the same
 	// contention window; backing off here (2s→30s) lets the in-flight
 	// holders drain first.
+	//
+	// volName is deterministic per VMID -- unlike attemptCreateVolume, which
+	// sits inside AllocateDiskWithRetry and moves to a fresh candidate VMID
+	// on a conflict, this call has no naming freedom: vmid is already fixed
+	// (the VM this ephemeral disk belongs to). A replay of a
+	// committed-then-dropped first attempt therefore cannot resolve by
+	// choosing a new name; it hits PVE's "already exists" rejection for the
+	// SAME name on every remaining attempt, and that LVM text --
+	// `Volume "vm-100-ephemeral-0" already exists` -- contains "vm-" but not
+	// the "vm "/"vmid " token IsVMIDConflict requires, so it does not match
+	// there either. Without recovery the loop burns its entire lock-retry
+	// budget (up to ~2-4 minutes) on a verdict that cannot change. Since
+	// vmid was freshly allocated for this create_vm call, an existing
+	// volume under its deterministic name on a REPLAYED attempt can only be
+	// this same call's own earlier commit -- so probe existence on any
+	// replay failure and treat presence as the goal state reached, instead
+	// of a verdict to keep retrying against.
 	var createdVolid string
+	attempted := false
 	err := pve.RetryOnTransientOrLock(ctx, logger, "create_vm_ephemeral_volume", 0, func() error {
+		isReplay := attempted
+		attempted = true
 		var innerErr error
 		createdVolid, innerErr = deps.PVE.Storage().CreateVolume(
 			ctx, shape.node, shape.ephemeralStorage,
 			shape.ephemeralDiskGiB, shape.vmDiskFormat, vmid, volName,
 		)
+		if innerErr == nil {
+			return nil
+		}
+		if isReplay {
+			if exists, exErr := deps.PVE.Storage().Exists(ctx, shape.node, shape.ephemeralStorage, canonical); exErr == nil && exists {
+				if logger != nil {
+					logger.Info("create_vm: ephemeral volume replay found the volume already committed",
+						log.Int(metadataKeyVMID, vmid),
+						log.String("volid", canonical),
+					)
+				}
+				createdVolid = canonical
+				return nil
+			}
+		}
 		return innerErr
 	})
 	if err != nil {

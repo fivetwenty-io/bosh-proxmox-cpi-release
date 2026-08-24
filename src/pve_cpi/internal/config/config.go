@@ -36,9 +36,24 @@ type CPIConfig struct {
 	// targeting that node dial it directly instead of letting the configured
 	// endpoint's pveproxy proxy the multipart POST cross-node, a hop that
 	// sheds connections under burst load. Nodes absent from the map fall back
-	// to /cluster/status discovery when verify_ssl is disabled, else to the
-	// proxied path. See pve.NodeEndpointResolver.
+	// to /cluster/status discovery when NodeEndpointsDiscoveryAllowed() is
+	// true, else to the proxied path. See pve.NodeEndpointResolver.
 	NodeEndpoints map[string]string `json:"node_endpoints,omitempty"`
+
+	// NodeEndpointsDiscovery gates whether the resolver falls back to
+	// /cluster/status name-to-IP discovery for a node absent from the
+	// explicit NodeEndpoints map. Pointer so JSON omission (nil) is
+	// distinguishable from an explicit true/false; use
+	// NodeEndpointsDiscoveryAllowed() for the effective bool. nil preserves
+	// the pre-existing behavior byte-for-byte: discovery runs exactly when
+	// VerifySSLValue() is false. Set explicit false to opt a verify_ssl:false
+	// deployment out of discovery entirely (e.g. a cluster running corosync
+	// on a dedicated ring, where the discovered address is not where
+	// pveproxy listens) without giving up TLS verification-skip elsewhere.
+	// Set explicit true to force discovery on even when VerifySSLValue() is
+	// true. Explicit NodeEndpoints entries are unaffected either way: they
+	// stay opt-in by construction and need no gate.
+	NodeEndpointsDiscovery *bool `json:"node_endpoints_discovery,omitempty"`
 
 	// Storage
 	VMStorage   string `json:"vm_storage"`
@@ -2163,6 +2178,22 @@ func (c *CPIConfig) VerifySSLValue() bool {
 		return true
 	}
 	return *c.VerifySSL
+}
+
+// NodeEndpointsDiscoveryAllowed returns the effective /cluster/status
+// node-endpoint discovery gate. nil (NodeEndpointsDiscovery absent from
+// JSON) preserves the legacy computed default: discovery runs exactly when
+// VerifySSLValue() is false. An explicit true or false overrides that
+// default in either direction, independent of verify_ssl. A nil receiver
+// returns false (no discovery without a config).
+func (c *CPIConfig) NodeEndpointsDiscoveryAllowed() bool {
+	if c == nil {
+		return false
+	}
+	if c.NodeEndpointsDiscovery == nil {
+		return !c.VerifySSLValue()
+	}
+	return *c.NodeEndpointsDiscovery
 }
 
 // SDNAutoManageZoneEnabled returns the effective zone auto-management bool.
@@ -4531,6 +4562,15 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must not be empty", node))
 			continue
 		}
+		if addr != strings.TrimSpace(addr) {
+			// applyHostOverride joins the raw value into the request host
+			// verbatim; a padded value would validate no further checks below
+			// (SplitHostPort rejects the leading/trailing space and every
+			// later case in this switch also falls through) and only fail at
+			// runtime as an unresolvable DNS name.
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] value must not carry surrounding whitespace, got %q", node, addr))
+			continue
+		}
 		if strings.Contains(addr, "://") {
 			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a scheme, got %q", node, addr))
 			continue
@@ -4861,6 +4901,18 @@ func isHex64(s string) bool {
 // (raw base 0 fails the >0 guard) and let an effective cap smaller than the
 // effective base through, producing a degenerate near-zero backoff. eff returns
 // the resolved (base, cap) the runtime curve actually uses.
+// retryMaxAttemptsCeiling bounds retry.*.max_attempts. The pve package's
+// backoff curves (TransientBackoff, StorageLockBackoff, PushbackBackoff) are
+// themselves overflow-safe at any attempt count (see pve.expBackoffDuration),
+// so this is a sane OPERATIONAL ceiling rather than a safety-critical one: a
+// curve is fully saturated at its cap within a couple dozen attempts at most
+// (the smallest shipped base, TransientBackoff's 1s, reaches its 15s cap by
+// attempt ~7), so every attempt beyond this ceiling sleeps for the cap and
+// contributes nothing but wall-clock time against a cluster that is by
+// definition already struggling. DefaultStorageUploadMaxAttempts (30, the
+// largest shipped default) leaves generous headroom below it.
+const retryMaxAttemptsCeiling = 100
+
 func (c *CPIConfig) validateRetry(errs *[]string) {
 	if c == nil || c.Retry == nil {
 		return
@@ -4871,6 +4923,11 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 		}
 		if p.MaxAttempts < 0 {
 			*errs = append(*errs, fmt.Sprintf("retry.%s.max_attempts must be >= 0, got %d", name, p.MaxAttempts))
+		} else if p.MaxAttempts > retryMaxAttemptsCeiling {
+			*errs = append(*errs, fmt.Sprintf(
+				"retry.%s.max_attempts must be <= %d (each additional attempt beyond a curve's cap sleeps for the "+
+					"cap and adds nothing but wall-clock time), got %d",
+				name, retryMaxAttemptsCeiling, p.MaxAttempts))
 		}
 		if p.BaseMs < 0 {
 			*errs = append(*errs, fmt.Sprintf("retry.%s.base_ms must be >= 0, got %d", name, p.BaseMs))

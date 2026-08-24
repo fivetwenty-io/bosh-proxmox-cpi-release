@@ -18,6 +18,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -120,24 +121,54 @@ func logUnresolvedVMLock(logger *log.Logger, action string, vmid int, node strin
 	)
 }
 
-// Lock-clear poll bounds for awaitVMConfigLockClear. Package vars, replaced
-// by SetVMLockClearBounds in tests.
+// Lock-clear poll bounds for awaitVMConfigLockClear, stored in atomics
+// (nanoseconds) rather than plain package vars so SetVMLockClearBounds is
+// race-safe against a parallel test reading them through
+// awaitVMConfigLockClear -- mirroring the pve package's seam discipline
+// (jitterSource under jitterMu, adaptivePollEnabled as an atomic.Bool,
+// storage_lock_seam.go's storageLockBaseNs/storageLockCapNs), which this
+// pair used to be the one exception to.
 var (
-	vmLockClearPollInterval = 2 * time.Second
-	vmLockClearMaxWait      = 120 * time.Second
+	vmLockClearPollIntervalNs atomic.Int64
+	vmLockClearMaxWaitNs      atomic.Int64
 )
+
+const (
+	defaultVMLockClearPollInterval = 2 * time.Second
+	defaultVMLockClearMaxWait      = 120 * time.Second
+
+	// vmLockClearMinPollInterval floors SetVMLockClearBounds' interval
+	// argument: a literal zero interval makes awaitVMConfigLockClear's
+	// select fire time.After(0) on every iteration, spinning the poll loop
+	// at an unbounded rate against deps.PVE.QEMU().Config for the whole
+	// maxWait budget. Existing tests pass 0 to mean "poll as fast as the
+	// test allows"; this floor keeps that intent (still far faster than any
+	// maxWait these tests use) while guaranteeing an actual, if tiny, pause
+	// between polls.
+	vmLockClearMinPollInterval = 1 * time.Millisecond
+)
+
+func init() {
+	vmLockClearPollIntervalNs.Store(int64(defaultVMLockClearPollInterval))
+	vmLockClearMaxWaitNs.Store(int64(defaultVMLockClearMaxWait))
+}
 
 // SetVMLockClearBounds replaces the lock-clear poll interval and bound and
 // returns a restore func. Test seam:
 //
 //	defer handlers.SetVMLockClearBounds(0, 50*time.Millisecond)()
+//
+// interval <= 0 is floored to vmLockClearMinPollInterval rather than applied
+// verbatim -- see that constant's doc for why.
 func SetVMLockClearBounds(interval, maxWait time.Duration) func() {
-	prevInterval, prevMax := vmLockClearPollInterval, vmLockClearMaxWait
-	vmLockClearPollInterval = interval
-	vmLockClearMaxWait = maxWait
+	if interval <= 0 {
+		interval = vmLockClearMinPollInterval
+	}
+	prevInterval := vmLockClearPollIntervalNs.Swap(int64(interval))
+	prevMax := vmLockClearMaxWaitNs.Swap(int64(maxWait))
 	return func() {
-		vmLockClearPollInterval = prevInterval
-		vmLockClearMaxWait = prevMax
+		vmLockClearPollIntervalNs.Store(prevInterval)
+		vmLockClearMaxWaitNs.Store(prevMax)
 	}
 }
 
@@ -191,7 +222,7 @@ func retryDestroyAfterLockClear(
 // (a gone VM makes it an idempotent 404), and a read blip must not strand
 // the orphan without even attempting the retry.
 func awaitVMConfigLockClear(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) bool {
-	deadline := time.Now().Add(vmLockClearMaxWait)
+	deadline := time.Now().Add(time.Duration(vmLockClearMaxWaitNs.Load()))
 	for {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
 		if cfgErr != nil {
@@ -210,7 +241,7 @@ func awaitVMConfigLockClear(ctx context.Context, deps Deps, node string, vmid in
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(vmLockClearPollInterval):
+		case <-time.After(time.Duration(vmLockClearPollIntervalNs.Load())):
 		}
 	}
 }

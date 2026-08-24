@@ -479,3 +479,90 @@ func TestMoveDiskToVM_ReplayNotLandedSurfacesError(t *testing.T) {
 func containsErrText(err error, substr string) bool {
 	return err != nil && substr != "" && strings.Contains(err.Error(), substr)
 }
+
+// TestMoveDiskToVM_UnresolvedPollTimeoutDoesNotResubmit is the F1 regression:
+// the POST commits and returns a UPID, but the await gives up with an
+// UNRESOLVED poll timeout (IsTaskExitVerdict false — the SDK's own internal
+// poll window elapsed, task.go's pollTimeoutUnresolved shape) rather than a
+// genuinely retriable transport fault. Before the fix this shape satisfied
+// IsTransientTransport (a context.DeadlineExceeded routed through
+// wrapPollError's net.Error branch), so RetryOnTransientOrLock retried and
+// moveDiskToVM re-POSTed CreateQemuMoveDisk for a move that might still be
+// running on PVE. After the fix the shape fails IsRetryableOrLockFault, so
+// the loop must stop after the single attempt: no second POST, and the
+// caller sees a Director-retriable error (not a resubmitted mutation).
+func TestMoveDiskToVM_UnresolvedPollTimeoutDoesNotResubmit(t *testing.T) {
+	t.Parallel()
+	const volid = "data:vm-153-disk-0"
+	c := newRPClient()
+	c.configs[153] = map[string]any{"scsi1": volid}
+	c.configs[90004] = map[string]any{cfgKeyTags: CpiOwnershipTag + ";" + ParkerTag}
+	c.moveDiskFn = func(_ int, _ *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {
+		resp := json.RawMessage(`"UPID:pve1:0000C0DE:00112233:66aabbcc:qmmove:153:root@pam:"`)
+		return &resp, nil
+	}
+	c.waitFn = func(_ int, _ string) (*sdktasks.Status, error) {
+		// Mirrors vendor/.../pkg/api/tasks/tasks.go's waitForInterval: the
+		// SDK poller's own derived-context deadline fired mid-poll while the
+		// task itself may still be running.
+		return nil, fmt.Errorf("task polling canceled: %w", context.DeadlineExceeded)
+	}
+
+	err := moveDiskToVM(rpCtx(), c, log.NewNopLogger(), "pve1", 153, "scsi1", 90004, "scsi2")
+	if err == nil {
+		t.Fatal("an unresolved poll timeout must surface an error, got success")
+	}
+	if c.moveCalls != 1 {
+		t.Errorf("move_disk must not be re-submitted while the first attempt's task is unresolved: "+
+			"want 1 POST, got %d", c.moveCalls)
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) {
+		t.Fatalf("expected *cpierrors.Error, got %T: %v", err, err)
+	}
+	if !cpiErr.OkToRetry() {
+		t.Errorf("an unresolved poll timeout must stay Director-retriable, got ok_to_retry=false: %v", err)
+	}
+	if _, held := slotBareVolid(c.configs[153], "scsi1"); !held {
+		t.Error("source slot must still hold the volume: no resubmission may have run")
+	}
+}
+
+// TestMoveDiskToVM_ReAwaitsPendingTaskInsteadOfResubmitting scripts a
+// genuinely retriable poll fault (a storage-lock timeout reading task
+// status, not an unresolved poll timeout) on the first await, then a
+// successful resolution on the re-await. The retry loop must re-await the
+// SAME pending UPID rather than re-POST CreateQemuMoveDisk: moveCalls stays
+// at 1 while waitCalls reaches 2.
+func TestMoveDiskToVM_ReAwaitsPendingTaskInsteadOfResubmitting(t *testing.T) {
+	t.Parallel()
+	const volid = "data:vm-154-disk-0"
+	c := newRPClient()
+	c.configs[154] = map[string]any{"scsi1": volid}
+	c.configs[90005] = map[string]any{cfgKeyTags: CpiOwnershipTag + ";" + ParkerTag}
+	c.moveDiskFn = func(_ int, _ *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {
+		resp := json.RawMessage(`"UPID:pve1:0000C0DE:00112233:66aabbcc:qmmove:154:root@pam:"`)
+		return &resp, nil
+	}
+	c.waitFn = func(call int, _ string) (*sdktasks.Status, error) {
+		if call == 1 {
+			// A storage-lock timeout reading the task's own status: a
+			// transport-layer wobble, not a verdict about the task -- retries
+			// must re-poll, not re-submit.
+			return nil, errors.New("can't lock file '/var/lock/pve-manager/pve-storage-data' - got timeout")
+		}
+		return &sdktasks.Status{Status: "stopped", ExitStatus: "OK"}, nil
+	}
+
+	err := moveDiskToVM(rpCtx(), c, log.NewNopLogger(), "pve1", 154, "scsi1", 90005, "scsi2")
+	if err != nil {
+		t.Fatalf("re-await of the pending task must converge to success, got: %v", err)
+	}
+	if c.moveCalls != 1 {
+		t.Errorf("move_disk must not be re-submitted while the first attempt's task is pending: "+
+			"want 1 POST, got %d", c.moveCalls)
+	}
+	if c.waitCalls != 2 {
+		t.Errorf("the retry must re-await the same UPID: want 2 Wait() calls, got %d", c.waitCalls)
+	}
+}

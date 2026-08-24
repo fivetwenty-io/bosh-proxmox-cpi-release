@@ -6,6 +6,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -395,4 +396,65 @@ func TestCleanupVM_DeleteLocked_LockNeverClears_TagsWithoutRetry(t *testing.T) {
 	if nodes.updateCalls != 1 {
 		t.Fatalf("wedged locked orphan: expected 1 bosh-create-failed tag write, got %d", nodes.updateCalls)
 	}
+}
+
+// TestSetVMLockClearBounds_ZeroIntervalFlooredNotSpun is the F9 regression:
+// SetVMLockClearBounds(0, ...) used to install a literal zero poll interval,
+// so awaitVMConfigLockClear's select fired time.After(0) on every iteration
+// -- an unbounded-rate spin against deps.PVE.QEMU().Config for the whole
+// maxWait budget. The fix floors interval <= 0 to vmLockClearMinPollInterval
+// (1ms); this pins that a wedged lock over a maxWait several times that
+// floor produces a config-poll count in the low tens/hundreds, not the
+// unbounded count a true zero-delay spin would rack up in the same wall-clock
+// budget.
+func TestSetVMLockClearBounds_ZeroIntervalFlooredNotSpun(t *testing.T) {
+	defer SetVMLockClearBounds(0, 50*time.Millisecond)()
+	nodes := &lrNodesStub{
+		deleteErrs: []error{errors.New(lockedCloneMsg)},
+	}
+	q := &lrQEMUStub{configFn: func(_ int) (map[string]any, error) {
+		return map[string]any{"lock": "clone"}, nil // wedged: never clears
+	}}
+	deps := Deps{Config: lrTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+
+	cleanupVM(context.Background(), deps, "pve01", 100, lrEnv(), log.NewNopLogger())
+
+	// A true zero-delay spin over 50ms would issue many thousands of poll
+	// calls (bounded only by scheduler overhead); a 1ms-floored poll caps it
+	// near 50. Generous headroom (1000) still catches a regression back to
+	// an unfloored zero interval while tolerating scheduling jitter.
+	if q.configCalls > 1000 {
+		t.Errorf("config polls = %d, want a bounded count consistent with a floored (non-zero) poll interval, "+
+			"not an unbounded zero-delay spin", q.configCalls)
+	}
+	if q.configCalls < 2 {
+		t.Errorf("config polls = %d, want at least a couple of polls over the 50ms budget", q.configCalls)
+	}
+}
+
+// TestSetVMLockClearBounds_ConcurrentSwapsRaceClean is the F9 regression for
+// the missing synchronization: SetVMLockClearBounds used to write two plain
+// package vars with no lock, while awaitVMConfigLockClear (run concurrently
+// by parallel tests exercising cleanupVM/HandleDeleteVM's lock-clear path)
+// read them unsynchronized -- a data race under `go test -race`. This
+// exercises concurrent Set/restore cycles alongside concurrent reads through
+// the real poll loop; a regression to unsynchronized package vars fails
+// under -race, not via an assertion here.
+func TestSetVMLockClearBounds_ConcurrentSwapsRaceClean(t *testing.T) {
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			restore := SetVMLockClearBounds(time.Duration(n+1)*time.Millisecond, 20*time.Millisecond)
+			nodes := &lrNodesStub{deleteErrs: []error{errors.New(lockedCloneMsg)}}
+			q := &lrQEMUStub{configFn: func(_ int) (map[string]any, error) {
+				return map[string]any{"lock": "clone"}, nil
+			}}
+			deps := Deps{Config: lrTokenConfig(), PVE: &lrClient{nodes: nodes, qemu: q}, Logger: log.NewNopLogger()}
+			cleanupVM(context.Background(), deps, "pve01", 100+n, lrEnv(), log.NewNopLogger())
+			restore()
+		}(i)
+	}
+	wg.Wait()
 }
