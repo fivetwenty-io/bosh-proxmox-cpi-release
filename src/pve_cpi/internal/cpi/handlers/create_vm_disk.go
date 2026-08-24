@@ -794,7 +794,7 @@ func cloneFromTemplate(
 	}
 	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, shape.node, strconv.Itoa(candidate), resourceParams); cfgErr != nil {
 		return cpierrors.Wrap(pve.WrapError(cfgErr), fmt.Sprintf(
-			"create_vm: apply cpu/memory to cloned vmid=%d: %s", candidate, cfgErr.Error()))
+			"create_vm: apply cpu/memory to cloned vmid=%d", candidate))
 	}
 	logger.Info("create_vm: applied cpu/memory to cloned vm",
 		log.Int("new_vmid", candidate),

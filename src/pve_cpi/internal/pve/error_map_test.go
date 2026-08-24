@@ -905,11 +905,29 @@ func TestIsBaseVolumeInUse_Timeout(t *testing.T) {
 	}
 }
 
+func TestWrapError_CauseTextAppearsExactlyOnce(t *testing.T) {
+	t.Parallel()
+	// Wrap messages must not embed the cause text: Error() appends the chained
+	// cause after a colon, so an embedded copy prints it twice (the
+	// "failed to upload ... EOF: failed to upload ... EOF" shape).
+	cause := fmt.Errorf("failed to upload configdrive iso: %w", io.EOF)
+	wrapped := pve.WrapError(cause)
+	if got := strings.Count(wrapped.Error(), "EOF"); got != 1 {
+		t.Errorf("cause text should appear exactly once, got %d in %q", got, wrapped.Error())
+	}
+	if got := strings.Count(wrapped.Error(), "failed to upload configdrive iso"); got != 1 {
+		t.Errorf("cause prefix should appear exactly once, got %d in %q", got, wrapped.Error())
+	}
+	if !pve.IsTransientTransport(wrapped) {
+		t.Errorf("de-doubled wrap must stay transient-transport classifiable; err=%v", wrapped)
+	}
+}
+
 func TestIsBaseVolumeInUse_WrappedCPIError(t *testing.T) {
 	t.Parallel()
 	// A CPI CloudError wrapping the PVE message must also classify correctly.
 	inner := errors.New("volume 'data:vm-200-disk-0' is still in use by linked clone")
-	wrapped := cpierrors.Wrap(inner, "PVE error: "+inner.Error())
+	wrapped := cpierrors.Wrap(inner, "PVE error")
 	if !pve.IsBaseVolumeInUse(wrapped) {
 		t.Errorf("CPI-wrapped base-volume-in-use message should classify correctly; err=%v", wrapped)
 	}

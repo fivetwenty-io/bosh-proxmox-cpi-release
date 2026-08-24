@@ -183,7 +183,7 @@ func applyPCIPassthrough(
 	}
 	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, params); err != nil {
 		return cpierrors.Wrap(err,
-			fmt.Sprintf("create_vm: apply PCI passthrough to vmid=%d: %s", vmid, err.Error()))
+			fmt.Sprintf("create_vm: apply PCI passthrough to vmid=%d", vmid))
 	}
 
 	logger.Info("create_vm: applied PCI passthrough",

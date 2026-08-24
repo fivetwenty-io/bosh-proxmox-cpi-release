@@ -227,7 +227,7 @@ func applyPVEConfigPassthrough(
 	vmidStr := strconv.Itoa(vmid)
 	if cfgErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, params); cfgErr != nil {
 		return cpierrors.Wrap(pve.WrapError(cfgErr),
-			fmt.Sprintf("create_vm: apply pve_config to vmid=%d: %s", vmid, cfgErr.Error()))
+			fmt.Sprintf("create_vm: apply pve_config to vmid=%d", vmid))
 	}
 
 	logger.Info("create_vm: applied pve_config passthrough",

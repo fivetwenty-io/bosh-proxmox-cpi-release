@@ -46,7 +46,7 @@ func WrapConfigReadError(err error) error {
 		return nil
 	}
 	if IsTransientTransport(err) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE transient transport fault: "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE transient transport fault")
 	}
 	// Any 5xx on a config read is the server failing, not a verdict about the
 	// request: a cycling pvedaemon worker answers this way and comes back within
@@ -54,7 +54,7 @@ func WrapConfigReadError(err error) error {
 	// bare APIError carrying only the code. The permanent 500-with-text shapes
 	// are excluded for the same reason IsTransientTransport excludes them.
 	if code, ok := apiHTTPCode(err); ok && code >= 500 && !IsVolumeFormatUnknown(err) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error")
 	}
 	return WrapError(err)
 }
@@ -90,7 +90,7 @@ func WrapMutationError(err error) error {
 	if IsVolumeFormatUnknown(err) {
 		return WrapError(err)
 	}
-	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE call failed: "+err.Error())
+	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE call failed")
 }
 
 // WrapErrorKeepingClass classifies err like WrapError, except that an error
@@ -158,19 +158,19 @@ func WrapError(err error) error {
 	// SDK ConnectionError → retriable (transient network fault).
 	var connErr *sdkerrors.ConnectionError
 	if errors.As(err, &connErr) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE connection error: "+connErr.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE connection error")
 	}
 
 	// SDK TimeoutError → retriable.
 	var timeoutErr *sdkerrors.TimeoutError
 	if errors.As(err, &timeoutErr) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE timeout: "+timeoutErr.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE timeout")
 	}
 
 	// net.Error with Timeout() → retriable.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "network timeout: "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "network timeout")
 	}
 
 	// Mid-request connection drop (EOF, reset, broken pipe after the
@@ -179,7 +179,7 @@ func WrapError(err error) error {
 	// fall through to the permanent fallback.
 	if IsTransportConnectionDrop(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"PVE connection dropped mid-request: "+err.Error())
+			"PVE connection dropped mid-request")
 	}
 
 	// Cluster quorum loss: /etc/pve becomes read-only cluster-wide and every
@@ -195,7 +195,7 @@ func WrapError(err error) error {
 	// use in RetryOnTransientOrLock (retry.go).
 	if IsClusterNotQuorate(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-			"cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status`: "+err.Error())
+			"cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status`")
 	}
 
 	// Permanent 500-with-text: PVE returns a request-shaped rejection as a 500
@@ -230,11 +230,11 @@ func WrapError(err error) error {
 		// 5xx server error → retriable. The sentinel check keeps parity with
 		// shapes that carry Code but not HTTPCode.
 		if errors.Is(err, sdkerrors.ErrServer) || code >= 500 {
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error: "+err.Error())
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error")
 		}
 		// 429 Too Many Requests → retriable pushback.
 		if code == 429 {
-			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback (429): "+err.Error())
+			return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback (429)")
 		}
 		// Any other 4xx (or an unresolved code on a typed API error) is a
 		// verdict about the request → non-retriable, whatever the body says.
@@ -246,18 +246,18 @@ func WrapError(err error) error {
 	// surfaced by AwaitTask). Mark these retriable so the director re-runs
 	// the action with a fresh VMID / on a recovered storage layer.
 	if IsStorageLockTimeout(err) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE storage backend transient: "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE storage backend transient")
 	}
 	if IsPmxcfsConfigMissing(err) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pmxcfs race (config gone mid-flight): "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pmxcfs race (config gone mid-flight)")
 	}
 	// Plain-text pushback phrases (task-body or non-APIError surfaces).
 	if IsPVEPushback(err) {
-		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback: "+err.Error())
+		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE pushback")
 	}
 
 	// Fallback: generic wrap as non-retriable CloudError.
-	return cpierrors.Wrap(err, "PVE error: "+err.Error())
+	return cpierrors.Wrap(err, "PVE error")
 }
 
 // IsNotFound returns true when err (or any error in its chain) signals HTTP 404
@@ -829,8 +829,8 @@ func WrapVMConfigLocked(err error, vmid int, node string) error {
 	}
 	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 		fmt.Sprintf(
-			"PVE VM %d on node %q is locked (%s); recover with `qm unlock %d` on node %q, then retry: %s",
-			vmid, node, lockType, vmid, node, err.Error()))
+			"PVE VM %d on node %q is locked (%s); recover with `qm unlock %d` on node %q, then retry",
+			vmid, node, lockType, vmid, node))
 }
 
 // IsPoolNotEmpty reports whether err signals that PVE refused to delete a

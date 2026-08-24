@@ -577,7 +577,7 @@ func (d *Dispatcher) dispatchError(method string, err error) *jsonrpc.Response {
 		return &jsonrpc.Response{
 			Result: nil,
 			Error: wireErrorBody(method, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				"transient transport fault: "+err.Error())),
+				"transient transport fault")),
 			Log: "",
 		}
 	}

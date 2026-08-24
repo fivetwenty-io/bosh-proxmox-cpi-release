@@ -110,6 +110,12 @@ func (e *Error) OkToRetry() bool {
 // CPI JSON-RPC response envelope:
 //
 //	{"type": "Bosh::Clouds::...", "message": "...", "ok_to_retry": <bool>}
+//
+// Note: this serializes e.msg ALONE, dropping the chained cause. Wrap
+// messages deliberately do not embed the cause text (Error() appends it
+// exactly once), so anyone reviving this currently-unused method on the wire
+// path must switch it to e.Error() or cause detail vanishes from operator
+// output. The live wire body is built by wireErrorBody from e.Error().
 func (e *Error) RPCPayload() map[string]any {
 	return map[string]any{
 		"type":        string(e.typ),
