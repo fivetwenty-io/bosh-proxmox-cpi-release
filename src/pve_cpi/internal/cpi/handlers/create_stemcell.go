@@ -3311,18 +3311,23 @@ func uploadStemcellImage(
 	}
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", pve.StorageUploadMaxAttempts(), func() error {
 		err := run()
-		if err != nil && directHost != "" && pve.IsTLSCertVerificationFailure(err) {
-			// The node certificate does not cover the routed address. Nothing
-			// was sent when the handshake failed (a TLS verification failure
-			// never sets sweepNeeded), so re-running un-pinned through the
-			// configured endpoint (the pre-existing path) is safe, and the
-			// remaining attempts stay un-pinned.
-			deps.Log(ctx).Warn("create_stemcell: direct-to-node dial failed TLS certificate verification; falling back to the configured endpoint",
+		if err != nil && directHost != "" && (pve.IsTLSCertVerificationFailure(err) || pve.IsDirectDialFailure(err)) {
+			// The direct address is unusable: the node certificate does not
+			// cover it, or the dial itself failed (wrong entry, unreachable
+			// address). Nothing was sent when the handshake or dial failed
+			// (neither sets sweepNeeded), and a failure past the POST leaves
+			// pendingUPID set, which the re-run resolves un-pinned before any
+			// re-upload, so re-running through the configured endpoint (the
+			// pre-existing path) is safe. The dead route is memoized on the
+			// resolver so the replication fan-out's remaining uploads to this
+			// node skip it, and the remaining attempts here stay un-pinned.
+			deps.Log(ctx).Warn("create_stemcell: direct-to-node dial failed; falling back to the configured endpoint",
 				log.String("node", node),
 				log.String("direct_host", directHost),
-				log.String("hint", "map this node in pve.node_endpoints to an address its certificate SANs cover"),
+				log.String("hint", "verify the pve.node_endpoints entry for this node is a reachable address its certificate SANs cover"),
 				log.Err(err),
 			)
+			deps.NodeEndpoints.MarkDirectRouteFailed(node)
 			directHost = ""
 			pinnedCtx = ctx
 			uploadCtx = sdkclient.WithRetries(ctx, 0)

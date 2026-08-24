@@ -26,7 +26,9 @@ import (
 // Discovery is memoized once per process (the CPI runs one process per
 // request; the stemcell replication fan-out within one request is the
 // multi-lookup case) and a discovery failure resolves to "no override"; it
-// must never fail the upload.
+// must never fail the upload. A resolved address whose dial then fails is
+// reported back via MarkDirectRouteFailed, after which the node resolves to
+// "no override" for the rest of the process.
 //
 // A nil resolver is valid everywhere and never overrides.
 type NodeEndpointResolver struct {
@@ -39,6 +41,8 @@ type NodeEndpointResolver struct {
 	mu            sync.Mutex
 	discovered    map[string]string
 	discoveryDone bool
+	discoveryGate chan struct{} // non-nil while a fetch is in flight
+	failedDirect  map[string]bool
 }
 
 // NewNodeEndpointResolver builds a resolver over c. explicit is the operator's
@@ -69,6 +73,12 @@ func (r *NodeEndpointResolver) HostFor(ctx context.Context, node string) (string
 	if r == nil || node == "" {
 		return "", false
 	}
+	r.mu.Lock()
+	failed := r.failedDirect[node]
+	r.mu.Unlock()
+	if failed {
+		return "", false
+	}
 	if h, ok := r.explicit[node]; ok && h != "" {
 		if hostPartEquals(h, r.configuredHost) {
 			return "", false
@@ -85,24 +95,73 @@ func (r *NodeEndpointResolver) HostFor(ctx context.Context, node string) (string
 	return h, true
 }
 
-// discoveredMap returns the memoized /cluster/status name-to-IP map, fetching
-// it on first use. The outcome (including a failed fetch, memoized as nil) is
-// kept for the process lifetime.
-func (r *NodeEndpointResolver) discoveredMap(ctx context.Context) map[string]string {
+// MarkDirectRouteFailed records that dialing node's resolved direct address
+// failed (TLS certificate verification or a dial-phase connection failure).
+// Subsequent HostFor calls for that node yield no override for the rest of
+// the process, so every later upload in the same request takes the proxied
+// path at once instead of re-failing the same dial. Nil-safe.
+func (r *NodeEndpointResolver) MarkDirectRouteFailed(node string) {
+	if r == nil || node == "" {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.discoveryDone {
-		return r.discovered
+	if r.failedDirect == nil {
+		r.failedDirect = make(map[string]bool)
 	}
-	r.discoveryDone = true
-	m, err := ClusterNodeAddressMap(ctx, r.c)
-	if err != nil {
-		r.logger.Debug("node endpoints: cluster status discovery failed; uploads take the proxied path",
-			log.Err(err))
-		return nil
+	r.failedDirect[node] = true
+}
+
+// discoveredMap returns the memoized /cluster/status name-to-IP map, fetching
+// it on first use. The fetch runs outside the resolver lock so the stemcell
+// replication fan-out's first concurrent lookups do not serialize behind it;
+// late arrivals wait on the in-flight fetch and share its outcome. A genuine
+// fetch failure is memoized as nil for the process lifetime, but a fetch that
+// died with its caller's context (cancellation, deadline) leaves the outcome
+// open so the next caller retries with a live context.
+func (r *NodeEndpointResolver) discoveredMap(ctx context.Context) map[string]string {
+	for {
+		r.mu.Lock()
+		if r.discoveryDone {
+			m := r.discovered
+			r.mu.Unlock()
+			return m
+		}
+		if gate := r.discoveryGate; gate != nil {
+			r.mu.Unlock()
+			select {
+			case <-gate:
+				continue
+			case <-ctx.Done():
+				return nil
+			}
+		}
+		gate := make(chan struct{})
+		r.discoveryGate = gate
+		r.mu.Unlock()
+
+		m, err := ClusterNodeAddressMap(ctx, r.c)
+
+		r.mu.Lock()
+		r.discoveryGate = nil
+		switch {
+		case err == nil:
+			r.discovered = m
+			r.discoveryDone = true
+		case ctx.Err() != nil:
+			// Not the cluster's fault; leave the outcome open.
+		default:
+			r.discoveryDone = true
+			r.logger.Warn("node endpoints: cluster status discovery failed; uploads take the proxied path",
+				log.Err(err))
+		}
+		close(gate)
+		r.mu.Unlock()
+		if err != nil {
+			return nil
+		}
+		return m
 	}
-	r.discovered = m
-	return m
 }
 
 // hostPartEquals reports whether the host part of addr (which may carry a
@@ -183,4 +242,27 @@ func IsTLSCertVerificationFailure(err error) bool {
 	return strings.Contains(msg, "certificate is valid for") ||
 		strings.Contains(msg, "certificate signed by unknown authority") ||
 		strings.Contains(msg, "failed to verify certificate")
+}
+
+// IsDirectDialFailure reports whether err (or its chain) died before a
+// connection to the target existed: a DNS resolution failure or a dial-phase
+// error (connection refused, unreachable host or network, dial timeout).
+// Upload paths use it alongside IsTLSCertVerificationFailure to fall back
+// from an unusable direct node address to the configured endpoint; nothing
+// was sent when the dial failed, so the un-pinned re-attempt is safe. A drop
+// on an established connection (EOF mid-request) deliberately stays out:
+// that is the transient fault the pinned retry budget exists to ride.
+func IsDirectDialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial"
+	}
+	return false
 }

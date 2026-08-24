@@ -4521,6 +4521,12 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 			*errs = append(*errs, "node_endpoints keys must be non-empty node names")
 			continue
 		}
+		if node != strings.TrimSpace(node) {
+			// Runtime lookup is by exact node name; a padded key would
+			// validate and then silently never match anything.
+			*errs = append(*errs, fmt.Sprintf("node_endpoints key %q must not carry surrounding whitespace", node))
+			continue
+		}
 		if strings.TrimSpace(addr) == "" {
 			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must not be empty", node))
 			continue
@@ -4533,7 +4539,9 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a path, got %q", node, addr))
 			continue
 		}
-		if host, port, err := net.SplitHostPort(addr); err == nil {
+		host, port, splitErr := net.SplitHostPort(addr)
+		switch {
+		case splitErr == nil:
 			if strings.TrimSpace(host) == "" {
 				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must carry a host before the port, got %q", node, addr))
 				continue
@@ -4542,11 +4550,20 @@ func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
 			if convErr != nil || n < 1 || n > 65535 {
 				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] port must be 1-65535, got %q", node, port))
 			}
-		} else if strings.Count(addr, ":") == 1 {
+		case strings.HasPrefix(addr, "["):
+			// Brackets that SplitHostPort rejected: "[fd00::1]" without a
+			// port. The dialer would re-bracket the value into an
+			// unresolvable host, so demand the port or the bare literal.
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] bracketed address must be [host]:port, got %q", node, addr))
+		case strings.Count(addr, ":") == 1:
 			// One colon but SplitHostPort rejected it: a malformed host:port
-			// (empty port, stray colon). More colons without brackets is a bare
-			// IPv6 literal, accepted as a host; the SDK brackets it when dialing.
+			// (empty port, stray colon).
 			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port, got %q", node, addr))
+		case strings.Contains(addr, ":") && net.ParseIP(addr) == nil:
+			// More colons without brackets is acceptable only as a bare IPv6
+			// literal (the SDK brackets it when dialing); anything else here
+			// is a typo like "host:8006:8006".
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host, host:port, or a bare IPv6 literal, got %q", node, addr))
 		}
 	}
 }

@@ -564,7 +564,7 @@ Exponential-backoff parameters for storage imports, VMID allocation, task pollin
 | `pve.retry.pushback.base_ms` | Integer | `0` (→ 5000 ms) | Initial backoff in milliseconds for HTTP 429 pushback responses from PVE. Longer than the storage-lock curve by design. |
 | `pve.retry.pushback.cap_ms` | Integer | `0` (→ 60000 ms) | Maximum pushback backoff in milliseconds. Clamped up to `base_ms` if smaller. |
 | `pve.retry.transient.max_attempts` | Integer | `0` (→ 8) | Maximum attempts for transport-layer transient retries (pvedaemon worker recycling, connection refusals, request timeouts). The backoff curve for this class is fixed (1 s growing to 15 s, plus or minus 30 percent jitter) and is not configurable. |
-| `pve.retry.storage_upload.max_attempts` | Integer | `0` (→ 30) | Maximum attempts for the storage upload retry loops (stemcell image and per-VM ConfigDrive ISO uploads), roughly six minutes on the transient curve. Each attempt reopens the file and re-sends the upload; the backoff curve is selected per fault from the shared transient and storage-lock curves. |
+| `pve.retry.storage_upload.max_attempts` | Integer | `0` (→ 30) | Maximum attempts for the storage upload retry loops (stemcell image and per-VM ConfigDrive ISO uploads): roughly six minutes on the transient curve, roughly twelve when storage-lock contention dominates. Each attempt reopens the file and re-sends the upload; the backoff curve is selected per fault from the shared transient and storage-lock curves. |
 | `pve.retry.storage_lock.max_attempts` | Integer | `0` (→ 10) | Maximum attempts for the inner PVE storage-lock retry loop (`"got timeout waiting for worker"` / `"storage locked"` signal) in `create_disk` and `create_vm`. Primary knob; `storage_import.max_attempts` is honored as a legacy fallback when this is unset. |
 | `pve.retry.storage_lock.base_ms` | Integer | `0` (→ 2000 ms) | Base delay in milliseconds for the storage-lock exponential backoff (`base × 1.5^attempt`). |
 | `pve.retry.storage_lock.cap_ms` | Integer | `0` (→ 30000 ms) | Maximum delay in milliseconds for the storage-lock backoff. Must be ≥ `base_ms` when both are set. |
@@ -612,7 +612,7 @@ The address for a node resolves in order:
 
 3. Neither applies: the upload takes the proxied path through `pve.host`, the pre-existing behavior.
 
-With `verify_ssl: true`, prefer hostnames or FQDNs the node certificate covers in `pve.node_endpoints`. When a direct dial fails TLS certificate verification, the upload logs a warning naming the node and address and falls back to the configured endpoint for the remainder of that operation, so a wrong entry degrades to the proxied path instead of failing the deploy.
+With `verify_ssl: true`, prefer hostnames or FQDNs the node certificate covers in `pve.node_endpoints`. When a direct dial fails TLS certificate verification or the connection itself (an unresolvable name, a refused or unreachable address), the upload logs a warning naming the node and address, falls back to the configured endpoint, and skips that node's direct route for the rest of the process, so a wrong entry (or a discovered corosync address that pveproxy does not listen on) degrades to the proxied path instead of failing the deploy.
 
 ## IP Conflict Detection
 

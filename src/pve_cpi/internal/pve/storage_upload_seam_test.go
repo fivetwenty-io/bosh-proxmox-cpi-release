@@ -30,12 +30,17 @@ func TestConfigureStorageUploadRetry_Override(t *testing.T) {
 }
 
 func TestSetStorageUploadRetryForTest_Restores(t *testing.T) {
-	restore := pve.SetStorageUploadRetryForTest(3)
-	if got := pve.StorageUploadMaxAttempts(); got != 3 {
-		t.Errorf("override: %d, want 3", got)
+	// Pin a known prior value so the restore assertion does not depend on
+	// what earlier tests left in the process-global seam.
+	defer pve.SetStorageUploadRetryForTest(0)()
+
+	before := pve.StorageUploadMaxAttempts()
+	restore := pve.SetStorageUploadRetryForTest(before + 1)
+	if got := pve.StorageUploadMaxAttempts(); got != before+1 {
+		t.Errorf("override: %d, want %d", got, before+1)
 	}
 	restore()
-	if got := pve.StorageUploadMaxAttempts(); got == 3 {
-		t.Error("restore did not clear the test override")
+	if got := pve.StorageUploadMaxAttempts(); got != before {
+		t.Errorf("after restore: %d, want the prior value %d", got, before)
 	}
 }

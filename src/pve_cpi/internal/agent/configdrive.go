@@ -163,6 +163,14 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	// botched earlier create_vm (or a VMID recycled out-of-band) would wedge
 	// every subsequent attempt at the same vmid. 404 is tolerated; any other
 	// failure short-circuits before the upload.
+	//
+	// This sweep deliberately stays on the plain ctx while uploadISO's
+	// in-loop pre-retry sweep is pinned: a failure here short-circuits
+	// Configure with no fallback of its own, and no pinned dial has been
+	// proven reachable yet. The in-loop sweep pins because by the time it
+	// runs the pinned route has already carried the POST that made the
+	// retry necessary, and reading that node's own task list gives
+	// read-your-write consistency for the imgdel it queues.
 	if existed, rmErr := a.removeISOIfExists(ctx, node, filename); rmErr != nil {
 		return cpierrors.Wrap(rmErr, fmt.Sprintf("agent configure vm %d: pre-delete stale configdrive iso", vmid))
 	} else if existed {
@@ -289,7 +297,9 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 		}
 		firstAttempt = false
 
+		awaitPhase := false
 		attempt := func(upCtx context.Context) error {
+			awaitPhase = false
 			f, openErr := os.Open(localPath) // #nosec G304 -- localPath is CPI-owned MkdirTemp output
 			if openErr != nil {
 				return fmt.Errorf("open local iso: %w", openErr)
@@ -303,25 +313,36 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 			if upid == "" {
 				return nil
 			}
+			awaitPhase = true
 			return pve.AwaitTaskWithLogger(pinnedCtx, a.pveSvc, node, upid, a.logger)
 		}
 
 		err := attempt(uploadCtx)
-		if err != nil && directHost != "" && pve.IsTLSCertVerificationFailure(err) {
-			// The node certificate does not cover the routed address. Nothing
-			// was sent when the handshake failed, so re-attempting un-pinned
-			// through the configured endpoint (the pre-existing path) needs no
-			// pre-sweep, and the remaining attempts stay un-pinned.
-			a.logger.Warn("configdrive: direct-to-node dial failed TLS certificate verification; falling back to the configured endpoint",
+		if err != nil && directHost != "" && (pve.IsTLSCertVerificationFailure(err) || pve.IsDirectDialFailure(err)) {
+			// The direct address is unusable: the node certificate does not
+			// cover it, or the dial itself failed (wrong entry, unreachable
+			// address). Nothing was sent in either case, so re-attempting
+			// un-pinned through the configured endpoint (the pre-existing
+			// path) needs no pre-sweep. The dead route is memoized on the
+			// resolver so later uploads this process skip it, and the
+			// remaining attempts here stay un-pinned. When the failure
+			// surfaced in the await phase the POST already went through, so
+			// the inline re-attempt is skipped: the retry loop re-enters with
+			// the (now un-pinned) pre-retry sweep clearing the possibly
+			// committed name before the next upload.
+			a.logger.Warn("configdrive: direct-to-node dial failed; falling back to the configured endpoint",
 				log.String("node", node),
 				log.String("direct_host", directHost),
-				log.String("hint", "map this node in pve.node_endpoints to an address its certificate SANs cover"),
+				log.String("hint", "verify the pve.node_endpoints entry for this node is a reachable address its certificate SANs cover"),
 				log.Err(err),
 			)
+			a.nodeEndpoints.MarkDirectRouteFailed(node)
 			directHost = ""
 			pinnedCtx = ctx
 			uploadCtx = sdkclient.WithRetries(ctx, 0)
-			err = attempt(uploadCtx)
+			if !awaitPhase {
+				err = attempt(uploadCtx)
+			}
 		}
 		return err
 	})

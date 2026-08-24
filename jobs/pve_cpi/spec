@@ -48,8 +48,10 @@ properties:
       route nodes listed here, because the discovered address is the corosync
       link0 IP and stock PVE node certificates usually do not carry it as a
       SAN. Prefer hostnames or FQDNs the node certificate covers. When a
-      direct dial fails TLS certificate verification, the upload falls back
-      to the pve.host endpoint and logs a warning.
+      direct dial fails TLS certificate verification or the connection
+      itself (unresolvable, refused, unreachable), the upload falls back to
+      the pve.host endpoint, logs a warning, and skips that node's direct
+      route for the rest of the process.
       Example: {pve02: pve02.example.com, pve03: 10.0.0.13:8006}
     default: {}
   pve.vm_storage:
@@ -1672,10 +1674,11 @@ properties:
     description: |
       Maximum attempts for the storage upload retry loops (stemcell image
       and per-VM ConfigDrive ISO uploads). Zero (default) applies the
-      built-in budget of 30, roughly six minutes on the transient backoff
-      curve. Each attempt reopens the file and re-sends the upload; the
-      backoff curve is selected per fault from the shared transient and
-      storage-lock curves and is not configurable per upload.
+      built-in budget of 30: roughly six minutes on the transient backoff
+      curve, roughly twelve when storage-lock contention dominates. Each
+      attempt reopens the file and re-sends the upload; the backoff curve is
+      selected per fault from the shared transient and storage-lock curves
+      and is not configurable per upload.
     default: 0
 
   pve.retry.storage_lock.max_attempts:

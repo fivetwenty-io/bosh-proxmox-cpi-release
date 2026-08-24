@@ -986,3 +986,54 @@ func TestWithRequestOverrides_EntryPlacementInvalid_FailsThatRequest(t *testing.
 		t.Errorf("no PVE client should be built for a rejected override, got %d call(s)", len(tracker.calls))
 	}
 }
+
+// -----------------------------------------------------------------------
+// node_endpoints scoping: the job-level explicit map names nodes of the
+// job-level cluster, so an override bundle inherits it only when the
+// override still targets the job-level host.
+// -----------------------------------------------------------------------
+
+func TestWithRequestOverrides_NodeEndpointsFollowBaseHost(t *testing.T) {
+	t.Parallel()
+	jobClient := &mockPVEClient{}
+	base := overrideTestBaseConfig()
+	base.NodeEndpoints = map[string]string{"pve2": "pve2-direct.example"}
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    jobClient,
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+			BaseHost:      base.Host,
+		},
+	}
+	ctx := context.Background()
+
+	// An override that keeps the job-level host inherits the explicit map.
+	sameHost, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{
+		RequestID: "req-same-host",
+		Extra:     map[string]any{"pve_node": "pve9"},
+	})
+	if err != nil {
+		t.Fatalf("same-host override: unexpected error: %v", err)
+	}
+	if h, ok := sameHost.NodeEndpoints.HostFor(ctx, "pve2"); !ok || h != "pve2-direct.example" {
+		t.Errorf("same-host override HostFor(pve2) = %q, %v; want the job-level entry pve2-direct.example", h, ok)
+	}
+
+	// An override targeting a different cluster must drop the map: its node
+	// names belong to the job-level cluster and would misroute uploads.
+	// Discovery stays gated off here (verify_ssl is true in the base config).
+	otherHost, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{
+		RequestID: "req-other-host",
+		Extra:     map[string]any{"pve_host": "az2.example"},
+	})
+	if err != nil {
+		t.Fatalf("other-host override: unexpected error: %v", err)
+	}
+	if h, ok := otherHost.NodeEndpoints.HostFor(ctx, "pve2"); ok {
+		t.Errorf("other-host override HostFor(pve2) = %q; want no override (job-level map must not leak across clusters)", h)
+	}
+}

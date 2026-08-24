@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
@@ -168,6 +170,78 @@ func TestUploadContext_RoundTrip(t *testing.T) {
 	}
 	if got := pve.UploadHostFromContext(context.Background()); got != "" {
 		t.Errorf("UploadHostFromContext(plain ctx) = %q, want empty", got)
+	}
+}
+
+func TestNodeEndpointResolver_MarkDirectRouteFailed(t *testing.T) {
+	t.Parallel()
+	r := pve.NewNodeEndpointResolver(newPeersClient(),
+		map[string]string{"pve2": "pve2.example.com"}, "pve1.example.com", false, log.NewNopLogger())
+
+	if _, ok := r.HostFor(context.Background(), "pve2"); !ok {
+		t.Fatal("HostFor(pve2): expected an override before the route is marked failed")
+	}
+	r.MarkDirectRouteFailed("pve2")
+	if _, ok := r.HostFor(context.Background(), "pve2"); ok {
+		t.Error("HostFor(pve2): expected no override after MarkDirectRouteFailed")
+	}
+
+	var nilResolver *pve.NodeEndpointResolver
+	nilResolver.MarkDirectRouteFailed("pve2") // must not panic
+}
+
+func TestNodeEndpointResolver_CancelledDiscoveryNotMemoized(t *testing.T) {
+	t.Parallel()
+	resp := sdkcluster.ListStatusResponse([]json.RawMessage{
+		statusRow("node", "pve2", "10.0.0.2", 1),
+	})
+	c := &mockClient{
+		clusterSvc: &statusStubCluster{
+			listStatusFn: func(ctx context.Context) (*sdkcluster.ListStatusResponse, error) {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return &resp, nil
+			},
+		},
+	}
+	r := pve.NewNodeEndpointResolver(c, nil, "pve1.example.com", true, log.NewNopLogger())
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := r.HostFor(cancelled, "pve2"); ok {
+		t.Error("HostFor with a cancelled ctx: expected no override")
+	}
+	// The cancellation must not poison the process; a live ctx retries.
+	if h, ok := r.HostFor(context.Background(), "pve2"); !ok || h != "10.0.0.2" {
+		t.Errorf("HostFor after cancelled first fetch = %q, %v; want discovered 10.0.0.2, true", h, ok)
+	}
+}
+
+func TestIsDirectDialFailure(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"dial op error", fmt.Errorf("Post: %w",
+			&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}), true},
+		{"read op error", fmt.Errorf("Post: %w",
+			&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")}), false},
+		{"dns error", fmt.Errorf("Post: %w",
+			&net.DNSError{Err: "no such host", Name: "pve2.invalid"}), true},
+		{"sdk connection error over dial", &sdkerrors.ConnectionError{
+			Host: "10.0.0.2", Port: 8006, Message: "failed to establish a connection",
+			Cause: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("no route to host")}}, true},
+		{"mid-request drop", fmt.Errorf("upload: %w", io.EOF), false},
+		{"unrelated", errors.New("boom"), false},
+	}
+	for _, tc := range cases {
+		if got := pve.IsDirectDialFailure(tc.err); got != tc.want {
+			t.Errorf("%s: IsDirectDialFailure = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -182,7 +183,7 @@ func applyPCIPassthrough(
 		Hostpci: hostpci,
 	}
 	if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, params); err != nil {
-		return cpierrors.Wrap(err,
+		return cpierrors.Wrap(pve.WrapError(err),
 			fmt.Sprintf("create_vm: apply PCI passthrough to vmid=%d", vmid))
 	}
 

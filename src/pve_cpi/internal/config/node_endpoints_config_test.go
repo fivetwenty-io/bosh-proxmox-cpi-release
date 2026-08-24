@@ -52,6 +52,9 @@ func TestValidateNodeEndpoints_RejectsBadValues(t *testing.T) {
 		{"non-numeric port", map[string]string{"pve2": "pve2.example.com:abc"}, "port must be 1-65535"},
 		{"empty port", map[string]string{"pve2": "pve2.example.com:"}, "port must be 1-65535"},
 		{"missing host", map[string]string{"pve2": ":8006"}, "must carry a host before the port"},
+		{"padded key", map[string]string{" pve2": "pve2.example.com"}, "must not carry surrounding whitespace"},
+		{"bracketed without port", map[string]string{"pve2": "[fd00::1]"}, "bracketed address must be [host]:port"},
+		{"double port typo", map[string]string{"pve2": "pve2:8006:8006"}, "bare IPv6 literal"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,6 +80,7 @@ func TestValidateNodeEndpoints_AcceptsGoodValues(t *testing.T) {
 		"pve3": "10.0.0.13:8006",
 		"pve4": "10.0.0.14",
 		"pve6": "2001:db8::6",
+		"pve7": "[2001:db8::7]:8006",
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("valid entries rejected: %v", err)
