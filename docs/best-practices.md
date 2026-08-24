@@ -458,6 +458,14 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Status.** Meets.
 
+**Storage uploads dial the node that owns the storage.**
+
+**Best practice.** A multipart upload to another node's storage, sent through one configured endpoint, is proxied pveproxy to pveproxy, and under a many-VM deploy burst that cross-node hop sheds connections mid-request while uploads to the endpoint node itself keep working. Dialing the target node's own pveproxy removes the hop entirely.
+
+**CPI behavior.** Stemcell image and ConfigDrive ISO uploads resolve the target node's address from the `pve.node_endpoints` map first, then from `/cluster/status` discovery when `verify_ssl` is `false`, and dial it directly for the upload, its task await, and the pre-retry sweeps. A direct dial that fails TLS certificate verification falls back to the configured endpoint with a warning. The uploads also carry their own retry budget (`pve.retry.storage_upload.max_attempts`, built-in 30 attempts, roughly six minutes on the transient curve) so a single create attempt outlasts a burst window the previous one-minute budget did not.
+
+**Status.** Meets; map nodes explicitly in `pve.node_endpoints` on verifying deployments and on clusters with a dedicated corosync ring.
+
 **Cross-process cluster lock.**
 
 **Best practice.** Two CPI processes (or two Directors sharing a cluster) racing the same VMID-allocation or template-build window can collide in ways a single process's own retry logic cannot see.

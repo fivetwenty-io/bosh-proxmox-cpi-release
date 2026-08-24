@@ -564,6 +564,7 @@ Exponential-backoff parameters for storage imports, VMID allocation, task pollin
 | `pve.retry.pushback.base_ms` | Integer | `0` (→ 5000 ms) | Initial backoff in milliseconds for HTTP 429 pushback responses from PVE. Longer than the storage-lock curve by design. |
 | `pve.retry.pushback.cap_ms` | Integer | `0` (→ 60000 ms) | Maximum pushback backoff in milliseconds. Clamped up to `base_ms` if smaller. |
 | `pve.retry.transient.max_attempts` | Integer | `0` (→ 8) | Maximum attempts for transport-layer transient retries (pvedaemon worker recycling, connection refusals, request timeouts). The backoff curve for this class is fixed (1 s growing to 15 s, plus or minus 30 percent jitter) and is not configurable. |
+| `pve.retry.storage_upload.max_attempts` | Integer | `0` (→ 30) | Maximum attempts for the storage upload retry loops (stemcell image and per-VM ConfigDrive ISO uploads), roughly six minutes on the transient curve. Each attempt reopens the file and re-sends the upload; the backoff curve is selected per fault from the shared transient and storage-lock curves. |
 | `pve.retry.storage_lock.max_attempts` | Integer | `0` (→ 10) | Maximum attempts for the inner PVE storage-lock retry loop (`"got timeout waiting for worker"` / `"storage locked"` signal) in `create_disk` and `create_vm`. Primary knob; `storage_import.max_attempts` is honored as a legacy fallback when this is unset. |
 | `pve.retry.storage_lock.base_ms` | Integer | `0` (→ 2000 ms) | Base delay in milliseconds for the storage-lock exponential backoff (`base × 1.5^attempt`). |
 | `pve.retry.storage_lock.cap_ms` | Integer | `0` (→ 30000 ms) | Maximum delay in milliseconds for the storage-lock backoff. Must be ≥ `base_ms` when both are set. |
@@ -598,6 +599,20 @@ Fine-grained HTTP transport timeouts for the stemcell-fetch client and the PVE A
 | `pve.api_max_idle_conns_per_host` | Integer | `0` (SDK default) | Maximum idle (keep-alive) connections retained in the transport pool per PVE host. Higher values reduce connection-setup latency under burst load; lower values conserve file descriptors. |
 | `pve.api_idle_conn_timeout_sec` | Integer | `0` (→ 15 s) | How long an idle keep-alive PVE API connection remains in the pool before being closed. The 15 s default retires idle connections before pveproxy closes them server-side; set `90` for the previous SDK behavior. |
 | `pve.api_tcp_keepalive_sec` | Integer | `0` (Go default) | TCP keep-alive probe interval for PVE API connections, in seconds. A positive value enables periodic TCP keep-alive probes, which helps detect silently-dropped connections on stateful firewalls. |
+
+## Direct-to-Node Uploads
+
+A storage upload targeting a node other than the configured `pve.host` is normally proxied: the endpoint node's pveproxy forwards the multipart POST to the target node's pveproxy, and under deploy-burst load that cross-node hop can shed connections mid-request. The CPI removes the hop by dialing the target node's own pveproxy for the upload POST, its task await, and the pre-retry sweeps. VM configuration writes are unaffected; they go through pmxcfs and gain nothing from direct dialing.
+
+The address for a node resolves in order:
+
+1. An explicit `pve.node_endpoints` entry. The property is a map of PVE node name to `host` or `host:port` (no scheme, no path), for example `{pve02: pve02.example.com, pve03: 10.0.0.13:8006}`. An explicit entry always wins.
+
+2. Discovery from `GET /cluster/status`, only when `pve.verify_ssl` is `false`. The discovered address is the corosync link0 IP, which stock PVE node certificates usually do not carry as a subject alternative name, so we never dial it when certificate verification is on. On clusters running corosync on a dedicated ring, that IP is not where pveproxy listens; map those nodes explicitly.
+
+3. Neither applies: the upload takes the proxied path through `pve.host`, the pre-existing behavior.
+
+With `verify_ssl: true`, prefer hostnames or FQDNs the node certificate covers in `pve.node_endpoints`. When a direct dial fails TLS certificate verification, the upload logs a warning naming the node and address and falls back to the configured endpoint for the remainder of that operation, so a wrong entry degrades to the proxied path instead of failing the deploy.
 
 ## IP Conflict Detection
 
