@@ -346,9 +346,10 @@ release-hygiene: ## Assert no CPI release tarball (either name) exists at the re
 	@echo "$(GREEN)✓ release hygiene clean — no loose tarballs at repo root$(RESET)"
 
 .PHONY: bosh-clean
-bosh-clean: ## Remove local BOSH release artifacts (.dev_builds, .final_builds, dev_releases)
-	@rm -rf .dev_builds .final_builds dev_releases
+bosh-clean: ## Remove local BOSH release artifacts (.dev_builds, dev_releases)
+	@rm -rf .dev_builds dev_releases
 	@echo "$(YELLOW)note: blobs/ cache left in place; remove manually if desired$(RESET)"
+	@echo "$(YELLOW)note: .final_builds/ and releases/ are tracked (bosh.io reads them); never delete them$(RESET)"
 
 ##@ Presentations
 
