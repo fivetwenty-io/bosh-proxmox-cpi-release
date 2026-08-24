@@ -1,6 +1,6 @@
 name: CI Image
 
-# Builds ci/Dockerfile and pushes it to ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
+# Builds ci/Dockerfile and pushes it to ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci
 # with tags `latest` and the git sha. The acceptance workflow pulls this
 # image; docs/ci-image.md documents the tool matrix it must provide.
 #
@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
+  IMAGE: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci
 
 jobs:
   build:

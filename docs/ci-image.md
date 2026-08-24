@@ -1,6 +1,6 @@
 # CI Image
 
-Our acceptance and integration jobs run inside a purpose-built container image. The canonical Dockerfile lives at `ci/Dockerfile`; the `CI Image` workflow (`.github/workflows/ci-image.yml`) builds it on every change to that file and pushes it to `ghcr.io/fivetwenty-io/bosh-pve-cpi-ci` with the tags `latest` and the git sha.
+Our acceptance and integration jobs run inside a purpose-built container image. The canonical Dockerfile lives at `ci/Dockerfile`; the `CI Image` workflow (`.github/workflows/ci-image.yml`) builds it on every change to that file and pushes it to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci` with the tags `latest` and the git sha.
 
 Two consumers use the image:
 
@@ -53,13 +53,13 @@ The Python helper scripts use only the standard library plus PyYAML; `uv` can al
 
 ## Building and publishing
 
-The `CI Image` workflow builds and pushes automatically when `ci/Dockerfile` or the workflow itself changes on `main`, and can be dispatched by hand. Its verify step runs every baked tool's version command before the push, and the push step prints the image digest so `acceptance.yml` can pin its `container.image` reference to `ghcr.io/fivetwenty-io/bosh-pve-cpi-ci@sha256:...`.
+The `CI Image` workflow builds and pushes automatically when `ci/Dockerfile` or the workflow itself changes on `main`, and can be dispatched by hand. Its verify step runs every baked tool's version command before the push, and the push step prints the image digest so `acceptance.yml` can pin its `container.image` reference to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:...`.
 
 To build locally:
 
 ```
-docker build -f ci/Dockerfile -t bosh-pve-cpi-ci:dev .
-docker run --rm bosh-pve-cpi-ci:dev sh -c 'bosh --version && gh --version && cf --version && credhub --version && uv --version && go version && ruby --version && bundle --version'
+docker build -f ci/Dockerfile -t bosh-proxmox-cpi-ci:dev .
+docker run --rm bosh-proxmox-cpi-ci:dev sh -c 'bosh --version && gh --version && cf --version && credhub --version && uv --version && go version && ruby --version && bundle --version'
 ```
 
 If a tool check fails, confirm the corresponding `COPY --from=downloader` line in `ci/Dockerfile` completed. Rebuild with `--no-cache` if a download was silently skipped because of a layer cache hit on a changed URL.
@@ -74,7 +74,7 @@ Point the `image_resource` stanza in `ci/tasks/integration.yml` at the published
 image_resource:
   type: registry-image
   source:
-    repository: ghcr.io/fivetwenty-io/bosh-pve-cpi-ci
+    repository: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci
     tag: latest
 ```
 
