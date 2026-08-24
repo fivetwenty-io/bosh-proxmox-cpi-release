@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -241,6 +242,107 @@ func TestIsDirectDialFailure(t *testing.T) {
 	for _, tc := range cases {
 		if got := pve.IsDirectDialFailure(tc.err); got != tc.want {
 			t.Errorf("%s: IsDirectDialFailure = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIsRoutedHandshakeFailure_F01NonVerificationTLSHandshake is the F-01
+// regression: a TLS handshake failure that is not certificate verification
+// (a non-TLS listener on the routed port, or a protocol-level handshake
+// abort) must be fallback-eligible so the routed upload degrades to the
+// proxied path instead of failing permanently. Before the fix neither
+// IsTLSCertVerificationFailure nor IsDirectDialFailure matched this shape.
+func TestIsRoutedHandshakeFailure_F01NonVerificationTLSHandshake(t *testing.T) {
+	t.Parallel()
+	// The exact wrap shape the SDK produces: fmt.Errorf("request failed
+	// after %d attempt(s): %w", ...) around *url.Error{Err:
+	// tls.RecordHeaderError{...}}.
+	err := fmt.Errorf("request failed after 1 attempt(s): %w", &url.Error{
+		Op:  "Post",
+		URL: "https://10.0.0.13:22/api2/json/x",
+		Err: tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
+	})
+	if pve.IsTLSCertVerificationFailure(err) {
+		t.Error("IsTLSCertVerificationFailure must not match a non-verification TLS handshake failure")
+	}
+	if pve.IsDirectDialFailure(err) {
+		t.Error("IsDirectDialFailure must not match a non-verification TLS handshake failure")
+	}
+	if !pve.IsRoutedHandshakeFailure(err) {
+		t.Error("IsRoutedHandshakeFailure = false, want true for tls.RecordHeaderError")
+	}
+}
+
+// TestIsRoutedHandshakeFailure_F02HandshakePhaseReadTimeout is the F-02
+// regression: a read-phase net.OpError that occurs before any response is
+// received (the shape a stalled or reset TLS handshake produces once the
+// TCP connect has already succeeded) must be fallback-eligible, not merely
+// retryable, so the retry loop does not stay pinned to a dead route for the
+// entire budget. Before the fix this shape was retryable
+// (IsTransientTransport true via net.Error.Timeout()) but not
+// fallback-eligible.
+func TestIsRoutedHandshakeFailure_F02HandshakePhaseReadTimeout(t *testing.T) {
+	t.Parallel()
+	err := fmt.Errorf("Post: %w", &url.Error{
+		Op:  "Post",
+		URL: "https://10.0.0.13:8006/api2/json/x",
+		Err: &net.OpError{Op: "read", Net: "tcp", Err: errTimeoutOp{}},
+	})
+	if !pve.IsTransientTransport(err) {
+		t.Fatal("test setup: expected the fixture to satisfy IsTransientTransport (Timeout()==true)")
+	}
+	if pve.IsDirectDialFailure(err) {
+		t.Error("IsDirectDialFailure must not match a read-phase net.OpError (see its doc comment)")
+	}
+	if !pve.IsRoutedHandshakeFailure(err) {
+		t.Error("IsRoutedHandshakeFailure = false, want true for a read-phase net.OpError")
+	}
+}
+
+// errTimeoutOp implements net.Error with Timeout()==true, the shape
+// net.OpError.Timeout() delegates to, without needing a real syscall error.
+type errTimeoutOp struct{}
+
+func (errTimeoutOp) Error() string   { return "i/o timeout" }
+func (errTimeoutOp) Timeout() bool   { return true }
+func (errTimeoutOp) Temporary() bool { return true }
+
+func TestIsRoutedHandshakeFailure_EstablishedConnectionDropStillExcludedFromDirectDial(t *testing.T) {
+	t.Parallel()
+	// Mirrors the existing "read op error" case in TestIsDirectDialFailure:
+	// a plain read-phase net.OpError with no Timeout() signal, the shape a
+	// mid-response drop on an established connection produces.
+	err := fmt.Errorf("Post: %w",
+		&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")})
+	if pve.IsDirectDialFailure(err) {
+		t.Error("IsDirectDialFailure must still exclude a read-phase net.OpError; " +
+			"the fallback distinction lives in IsRoutedHandshakeFailure, not here")
+	}
+	// IsRoutedHandshakeFailure deliberately does NOT preserve this exclusion:
+	// the wire signal cannot distinguish a handshake-phase read failure from
+	// an established-connection drop for this exact shape, and upload
+	// fallback sites accept that ambiguity resolves toward fallback (see the
+	// predicate's doc comment).
+	if !pve.IsRoutedHandshakeFailure(err) {
+		t.Error("IsRoutedHandshakeFailure = false, want true (ambiguous read-phase shape resolves to fallback)")
+	}
+}
+
+func TestIsRoutedHandshakeFailure_NoFalsePositiveOnUnrelatedErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"nil", nil},
+		{"unrelated", errors.New("boom")},
+		{"mid-request EOF", fmt.Errorf("upload: %w", io.EOF)},
+		{"dial op error", fmt.Errorf("Post: %w",
+			&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")})},
+	}
+	for _, tc := range cases {
+		if got := pve.IsRoutedHandshakeFailure(tc.err); got {
+			t.Errorf("%s: IsRoutedHandshakeFailure = true, want false", tc.name)
 		}
 	}
 }

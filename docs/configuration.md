@@ -606,13 +606,13 @@ A storage upload targeting a node other than the configured `pve.host` is normal
 
 The address for a node resolves in order:
 
-1. An explicit `pve.node_endpoints` entry. The property is a map of PVE node name to `host` or `host:port` (no scheme, no path), for example `{pve02: pve02.example.com, pve03: 10.0.0.13:8006}`. An explicit entry always wins.
+1. An explicit `pve.node_endpoints` entry. The property is a map of PVE node name to `host` or `host:port` (no scheme, no path), for example `{pve02: pve02.example.com, pve03: 10.0.0.13:8006}`. An explicit entry always wins. Neither the key nor the value may carry surrounding whitespace; both are rejected at config validation.
 
-2. Discovery from `GET /cluster/status`, only when `pve.verify_ssl` is `false`. The discovered address is the corosync link0 IP, which stock PVE node certificates usually do not carry as a subject alternative name, so we never dial it when certificate verification is on. On clusters running corosync on a dedicated ring, that IP is not where pveproxy listens; map those nodes explicitly.
+2. Discovery from `GET /cluster/status`, gated by `pve.node_endpoints_discovery`. Unset (the default) preserves the original behavior: discovery runs exactly when `pve.verify_ssl` is `false`. Set it explicitly to override that default in either direction: `false` opts a `verify_ssl: false` deployment out of discovery entirely, and `true` forces discovery on even with `verify_ssl: true`. The discovered address is the corosync link0 IP, which stock PVE node certificates usually do not carry as a subject alternative name, so a verifying deployment gains little from turning discovery on. On clusters running corosync on a dedicated ring, that IP is not where pveproxy listens either; set `pve.node_endpoints_discovery: false` and map those nodes explicitly instead.
 
 3. Neither applies: the upload takes the proxied path through `pve.host`, the pre-existing behavior.
 
-With `verify_ssl: true`, prefer hostnames or FQDNs the node certificate covers in `pve.node_endpoints`. When a direct dial fails TLS certificate verification or the connection itself (an unresolvable name, a refused or unreachable address), the upload logs a warning naming the node and address, falls back to the configured endpoint, and skips that node's direct route for the rest of the process, so a wrong entry (or a discovered corosync address that pveproxy does not listen on) degrades to the proxied path instead of failing the deploy.
+With `verify_ssl: true`, prefer hostnames or FQDNs the node certificate covers in `pve.node_endpoints`. When a direct dial fails TLS certificate verification, a TLS handshake failure for any other reason (a non-TLS listener answering the port, a firewall that accepts the connection and drops the handshake, a stalled or reset handshake), or the connection itself (an unresolvable name, a refused or unreachable address), the upload logs a warning naming the node and address, falls back to the configured endpoint, and skips that node's direct route for the rest of the process. A wrong entry or a discovered corosync address that pveproxy does not listen on degrades to the proxied path instead of failing the deploy.
 
 ## IP Conflict Detection
 

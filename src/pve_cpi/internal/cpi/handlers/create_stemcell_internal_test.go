@@ -1350,6 +1350,145 @@ func TestEnsureTemplateVM_MakeTemplateFails_ErrorReturned(t *testing.T) {
 	}
 }
 
+// TestEnsureTemplateVM_FreezeReAwaitsPendingTaskInsteadOfResubmitting is the
+// F1 regression for ensureTemplateVM's freeze closure: MakeTemplate commits
+// and returns a UPID, but the first await hits a genuinely transient fault
+// reading the task's own status (not a resolved verdict,
+// pve.IsTaskExitVerdict false). The retry must re-await that SAME UPID
+// instead of re-POSTing CreateQemuTemplate — a second freeze submit while
+// the first may still be running risks PVE rejecting it on an in-flight
+// storage lock, or worse, racing the same base-volume rename.
+func TestEnsureTemplateVM_FreezeReAwaitsPendingTaskInsteadOfResubmitting(t *testing.T) {
+	t.Parallel()
+
+	const freezeUPID = "UPID:pve-node1:0000FEED:00112233:66aabbcc:qmtemplate:30000:root@pam:"
+	freezeCalls := 0
+	waitCalls := 0
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "", nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			freezeCalls++
+			raw := sdknodes.CreateQemuTemplateResponse(`"` + freezeUPID + `"`)
+			return &raw, nil
+		},
+	}
+	tasks := &wbMockTasks{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			waitCalls++
+			if waitCalls == 1 {
+				return nil, fmt.Errorf("Get \"/nodes/pve-node1/tasks/%s/status\": %w", upid, io.EOF)
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	stor := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, tasks, stor)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+	var capturedTags string
+	captureTemplateTagsUpdate(t, deps, &capturedTags)
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "2.0"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "focal.qcow2")
+	_, _, err := ensureTemplateVM(crhCtx(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err != nil {
+		t.Fatalf("re-await of the pending freeze task must converge to success, got: %v", err)
+	}
+	if freezeCalls != 1 {
+		t.Errorf("freeze submits: want 1 (no resubmit while the task is pending), got %d", freezeCalls)
+	}
+	if waitCalls != 2 {
+		t.Errorf("task awaits: want 2 (blipped await + re-await), got %d", waitCalls)
+	}
+}
+
+// TestEnsureTemplateVM_FreezeUnresolvedPollTimeoutDoesNotResubmit pins the
+// unresolved-task arm for the F1 fix: the re-await of the prior freeze
+// attempt's task outruns its poll budget while the task still runs. The
+// handler must surface that as retriable (for the Director) and never fall
+// through to a resubmit that would double-apply the still-executing freeze.
+func TestEnsureTemplateVM_FreezeUnresolvedPollTimeoutDoesNotResubmit(t *testing.T) {
+	t.Parallel()
+
+	const freezeUPID = "UPID:pve-node1:0000FACE:00112233:66aabbcc:qmtemplate:30000:root@pam:"
+	freezeCalls := 0
+	waitCalls := 0
+
+	qemu := &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, _ map[string]any) (string, error) {
+			return "", nil
+		},
+		// templateFrozen's Config read after the unresolved-timeout branch is
+		// never reached (the closure returns before probing), but the create
+		// path may still consult it for provenance; keep it a harmless default.
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{}, nil
+		},
+	}
+	nodes := &wbTemplateNodes{
+		listQemuFn: listQemuEmpty(),
+		createQemuTemplateFn: func(_ context.Context, _, _ string, _ *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error) {
+			freezeCalls++
+			raw := sdknodes.CreateQemuTemplateResponse(`"` + freezeUPID + `"`)
+			return &raw, nil
+		},
+		deleteQemuFn: func(_ context.Context, _, _ string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			raw := sdknodes.DeleteQemuResponse(`""`)
+			return &raw, nil
+		},
+	}
+	tasks := &wbMockTasks{
+		waitFn: func(_ context.Context, _, upid string, _ *sdktasks.WaitOptions) (*sdktasks.Status, error) {
+			waitCalls++
+			if waitCalls == 1 {
+				return nil, fmt.Errorf("Get \"/nodes/pve-node1/tasks/%s/status\": %w", upid, io.EOF)
+			}
+			// The SDK wait window elapsed with no terminal exit status: the
+			// task is still running.
+			return &sdktasks.Status{ExitStatus: ""}, nil
+		},
+	}
+	stor := &wbTemplateStorage{
+		deleteVolumeIfExistsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return true, nil
+		},
+	}
+	deps := buildEnsureTemplateDeps(qemu, nodes, tasks, stor)
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
+		listResourcesFn: listClusterResourcesEmpty(),
+	}
+	var capturedTags string
+	captureTemplateTagsUpdate(t, deps, &capturedTags)
+
+	cp := stemcellCloudProps{Name: "ubuntu-focal", Version: "2.0"}
+	stemcellCID := pve.BuildHeavyStemcellCID("nfs", "focal.qcow2")
+	_, _, err := ensureTemplateVM(crhCtx(), deps, "pve-node1", "nfs", "focal.qcow2",
+		"aabbccddee112233aabbccddee112233aabbccddee112233aabbccddee112233",
+		"", pve.StemcellKindHeavy, stemcellCID, "test-director", cp, "")
+	if err == nil {
+		t.Fatal("an unresolved freeze task must surface, not silently converge")
+	}
+	if freezeCalls != 1 {
+		t.Errorf("freeze submits: want 1 (no stale resubmit over a running task), got %d", freezeCalls)
+	}
+	if waitCalls != 2 {
+		t.Errorf("task awaits: want 2 (blipped await + re-await), got %d", waitCalls)
+	}
+}
+
 // TestEnsureTemplateVM_LightKind_SourceNeverDeleted verifies that a
 // :light: cache template build never touches the source qcow2 — same D10
 // no-reclaim policy as :heavy:, but exercised with StemcellKindLight to

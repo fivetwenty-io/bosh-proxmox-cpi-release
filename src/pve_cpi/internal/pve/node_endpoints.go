@@ -166,8 +166,16 @@ func (r *NodeEndpointResolver) discoveredMap(ctx context.Context) map[string]str
 
 // hostPartEquals reports whether the host part of addr (which may carry a
 // :port suffix) equals host. Comparison is textual only; a hostname never
-// equals an IP here, which at worst pins an upload to the endpoint node's own
-// address, a harmless no-hop dial.
+// equals an IP here, so a pve.node_endpoints entry that names the endpoint
+// node by an address textually different from pve.host (a hostname mapped to
+// its own IP, or vice versa) still resolves to a direct, pinned dial rather
+// than "no override". Under verify_ssl: true that pinned dial verifies
+// against the mapped address, not pve.host, and stock PVE node certificates
+// carry DNS SANs for the node's hostname and FQDN, not its bare IP — so this
+// is not the harmless no-hop case it looks like: the handshake fails,
+// MarkDirectRouteFailed disables the route for the rest of the process
+// (self-healing, but only after a failed attempt and a Warn log naming a
+// "failed" dial to the operator's own endpoint).
 func hostPartEquals(addr, host string) bool {
 	if addr == host {
 		return true
@@ -247,11 +255,14 @@ func IsTLSCertVerificationFailure(err error) bool {
 // IsDirectDialFailure reports whether err (or its chain) died before a
 // connection to the target existed: a DNS resolution failure or a dial-phase
 // error (connection refused, unreachable host or network, dial timeout).
-// Upload paths use it alongside IsTLSCertVerificationFailure to fall back
-// from an unusable direct node address to the configured endpoint; nothing
-// was sent when the dial failed, so the un-pinned re-attempt is safe. A drop
-// on an established connection (EOF mid-request) deliberately stays out:
-// that is the transient fault the pinned retry budget exists to ride.
+// Upload paths use it alongside IsTLSCertVerificationFailure and
+// IsRoutedHandshakeFailure to fall back from an unusable direct node address
+// to the configured endpoint; nothing was sent when the dial failed, so the
+// un-pinned re-attempt is safe. A drop on an established connection (EOF
+// mid-request) deliberately stays out: that is the transient fault the
+// pinned retry budget exists to ride. See IsRoutedHandshakeFailure for the
+// narrower, more aggressive predicate that upload fallback sites also apply,
+// which does treat some read-phase failures as fallback-eligible.
 func IsDirectDialFailure(err error) bool {
 	if err == nil {
 		return false
@@ -265,4 +276,78 @@ func IsDirectDialFailure(err error) bool {
 		return opErr.Op == "dial"
 	}
 	return false
+}
+
+// IsRoutedHandshakeFailure reports whether err (or its chain) is a TLS
+// handshake-phase failure that IsTLSCertVerificationFailure does not already
+// cover, or a read-phase network error observed while establishing a
+// connection. Two shapes:
+//
+//   - A non-verification TLS handshake failure: the peer answered the dial
+//     but does not speak the expected protocol at all (a plain-TCP listener
+//     on the port, an L4 load balancer, a plaintext pveproxy on 8007), or
+//     speaks TLS but aborts the handshake (a protocol alert). These surface
+//     as tls.RecordHeaderError or tls.AlertError, or — once the SDK's error
+//     wrapping is accounted for — as a "tls: ..." prefixed message that
+//     neither typed check catches.
+//
+//   - A read-phase net.OpError. Once the TCP connect succeeds, both "the
+//     handshake stalled or was reset before completing" and "an established
+//     connection dropped mid-response" surface as the identical
+//     net.OpError{Op: "read"} shape; nothing on the wire distinguishes them.
+//     IsDirectDialFailure deliberately excludes this shape everywhere (see
+//     its doc comment): an established-connection drop is the transient
+//     fault the pinned retry budget exists to ride, and that exclusion must
+//     hold for the general-purpose predicate.
+//
+// This predicate exists for a narrower use: upload call sites invoke it only
+// once a request already carries a direct-to-node host override
+// (UploadHostFromContext(ctx) != ""), at the same fallback-classification
+// point that already checks IsTLSCertVerificationFailure and
+// IsDirectDialFailure. On that boundary the two outcomes of guessing wrong
+// are not symmetric: routing a genuinely-established-connection drop to the
+// un-pinned fallback still succeeds (the proxied path was always going to
+// work), while leaving a genuine handshake stall pinned burns the whole
+// retry budget against a route that will never complete (see the PVE API
+// transport's lack of a default handshake deadline, documented at
+// client.go's buildTransportOpts). Ambiguity therefore resolves toward
+// fallback here, deliberately more aggressively than IsDirectDialFailure.
+//
+// nil → false.
+func IsRoutedHandshakeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var recErr tls.RecordHeaderError
+	if errors.As(err, &recErr) {
+		return true
+	}
+	var alertErr tls.AlertError
+	if errors.As(err, &alertErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "read" {
+		return true
+	}
+	// Textual safety net for TLS handshake failures the SDK's transport
+	// re-wraps into a shape errors.As cannot see through (e.g. a
+	// non-standard-library HTTP transport, or a future crypto/tls error
+	// type). Every crypto/tls error message is "tls: ..."-prefixed; a false
+	// positive here still only widens the fallback-eligible set at the same
+	// bounded call sites described above.
+	return strings.Contains(strings.ToLower(err.Error()), "tls:")
+}
+
+// IsRoutedUploadFallbackEligible reports whether err, observed on a
+// direct-to-node upload dial, should fall back to the configured (proxied)
+// endpoint: the OR of IsTLSCertVerificationFailure, IsDirectDialFailure, and
+// IsRoutedHandshakeFailure. Upload call sites already gate on
+// directHost != "" (equivalently, UploadHostFromContext(ctx) != "") before
+// calling this, so it is deliberately not context-aware itself. Extracted
+// as one call so each fallback site's own control flow — reopening the
+// upload un-pinned, memoizing the route as failed — stays the readable part
+// of the function.
+func IsRoutedUploadFallbackEligible(err error) bool {
+	return IsTLSCertVerificationFailure(err) || IsDirectDialFailure(err) || IsRoutedHandshakeFailure(err)
 }

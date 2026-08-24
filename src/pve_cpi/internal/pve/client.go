@@ -316,6 +316,45 @@ func buildTransportOpts(cfg *config.CPIConfig) sdkclient.Options {
 	}
 }
 
+// assertNoFingerprintPinningWithRouting fails fast when opts enables SDK TLS
+// fingerprint pinning (any of CachedFingerprints, ManualVerification,
+// VerifyFingerprintCallback, ManualVerifyCallback, FingerprintCachePath)
+// while routingPossible is true. The SDK's hostOverrideFromContext rejects
+// any per-request host-overridden request outright with
+// ErrHostOverrideFingerprint once fingerprint verification is enabled
+// (buildUploadRequest and buildRequestWithContext both fail before sending),
+// so combining pinning with direct-to-node routing (pve.node_endpoints or
+// pve.node_endpoints_discovery) would turn every routed upload into a
+// permanent create_vm / create_stemcell failure instead of the intended
+// degrade-to-proxied-path behavior.
+//
+// No current CPIConfig property sets any of these Options fields — this
+// guards the invariant documented at node_endpoints.go's UploadContext
+// against a future property that wires one in without also gating node
+// routing off, catching the incompatible combination at client construction
+// (a config-shaped, startup-time failure) rather than letting it surface
+// only as an opaque per-upload runtime error.
+//
+// nil-safe on opts's map/callback fields; always returns nil when
+// routingPossible is false.
+func assertNoFingerprintPinningWithRouting(opts sdkclient.Options, routingPossible bool) error {
+	if !routingPossible {
+		return nil
+	}
+	pinned := len(opts.CachedFingerprints) > 0 ||
+		opts.ManualVerification ||
+		opts.VerifyFingerprintCallback != nil ||
+		opts.ManualVerifyCallback != nil ||
+		opts.FingerprintCachePath != ""
+	if !pinned {
+		return nil
+	}
+	return cpierrors.Cloud("pve client init: TLS fingerprint pinning is incompatible with direct-to-node upload " +
+		"routing (pve.node_endpoints or pve.node_endpoints_discovery): the SDK rejects any per-request host " +
+		"override outright while pinning is enabled, which would turn every routed upload into a permanent " +
+		"failure instead of falling back to the proxied path; disable node routing or fingerprint pinning")
+}
+
 // NewClientWithTracer constructs a Client from CPIConfig.
 // Selects auth: APIToken if non-empty else User+Password+Realm.
 // Honors VerifySSL (false = skip TLS verify).
@@ -403,6 +442,11 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 			CACert:         tmpPath,
 		}
 		logger.Debug("pve client: custom CA cert pool in use")
+	}
+
+	routingPossible := len(cfg.NodeEndpoints) > 0 || cfg.NodeEndpointsDiscoveryAllowed()
+	if assertErr := assertNoFingerprintPinningWithRouting(opts, routingPossible); assertErr != nil {
+		return nil, assertErr
 	}
 
 	raw, err := sdkclient.NewClient(opts)

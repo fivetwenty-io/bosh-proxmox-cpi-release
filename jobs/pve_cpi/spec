@@ -44,16 +44,35 @@ properties:
       ISOs) dial it directly instead of letting the pve.host endpoint proxy
       the multipart POST cross-node, a hop that sheds connections under
       burst load. Nodes absent from the map are discovered from
-      /cluster/status when verify_ssl is false; with verify_ssl true we only
-      route nodes listed here, because the discovered address is the corosync
+      /cluster/status when pve.node_endpoints_discovery allows it (default:
+      only when verify_ssl is false); with verify_ssl true we only route
+      nodes listed here, because the discovered address is the corosync
       link0 IP and stock PVE node certificates usually do not carry it as a
       SAN. Prefer hostnames or FQDNs the node certificate covers. When a
-      direct dial fails TLS certificate verification or the connection
-      itself (unresolvable, refused, unreachable), the upload falls back to
-      the pve.host endpoint, logs a warning, and skips that node's direct
-      route for the rest of the process.
+      direct dial fails TLS certificate verification, a TLS handshake
+      failure for any other reason, or the connection itself (unresolvable,
+      refused, unreachable, reset or stalled during the handshake), the
+      upload falls back to the pve.host endpoint, logs a warning, and skips
+      that node's direct route for the rest of the process.
       Example: {pve02: pve02.example.com, pve03: 10.0.0.13:8006}
     default: {}
+  pve.node_endpoints_discovery:
+    description: |
+      Explicit override for whether uploadISO to a node absent from
+      pve.node_endpoints falls back to /cluster/status name-to-IP discovery.
+      Unset (the default) preserves the pre-existing behavior byte-for-byte:
+      discovery runs exactly when verify_ssl is false. Set false to opt a
+      verify_ssl:false deployment out of discovery entirely, for example a
+      cluster running corosync on a dedicated ring, where the discovered
+      address is not where pveproxy listens, so every discovered dial fails
+      and falls back to the proxied path with a warning until the operator
+      maps the affected nodes explicitly; false skips straight to the
+      proxied path instead. Set true to force discovery on even with
+      verify_ssl true (the operator accepts that the discovered corosync IP
+      is unlikely to be covered by the node certificate; a mismatched dial
+      still falls back to the proxied path rather than failing the deploy).
+      Explicit pve.node_endpoints entries are unaffected either way; they
+      stay opt-in by construction and need no gate.
   pve.vm_storage:
     description: "Storage pool for VMs"
   pve.disk_storage:

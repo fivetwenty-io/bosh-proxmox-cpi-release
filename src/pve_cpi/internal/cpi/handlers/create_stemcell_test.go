@@ -161,6 +161,11 @@ type stemcellMockNodes struct {
 	// createQemuTemplateFn is called by MakeTemplate inside ensureTemplateVM.
 	// Default (nil): returns synchronous success with no UPID.
 	createQemuTemplateFn func(ctx context.Context, node, vmid string, params *sdknodes.CreateQemuTemplateParams) (*sdknodes.CreateQemuTemplateResponse, error)
+	// listNodesFn backs GET /nodes, the standalone-membership fallback
+	// ListClusterMemberNames uses when ListConfigNodes answers empty. Default
+	// (nil): empty list, matching the pre-fallback behavior every existing
+	// suite scripts around.
+	listNodesFn func(ctx context.Context) (*sdknodes.ListNodesResponse, error)
 }
 
 func (m *stemcellMockNodes) UpdateQemuConfig(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
@@ -2058,9 +2063,14 @@ func (n *noopPoolService) PoolHasVM(context.Context, string, int64) (bool, error
 	return false, nil
 }
 
-// ListNodes reports an empty node list; the standalone-membership
-// fallback then surfaces the original corosync answer unchanged.
-func (m *stemcellMockNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
+// ListNodes reports an empty node list by default; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged. Set
+// listNodesFn to script a non-empty GET /nodes answer (e.g. a standalone
+// host's self-membership).
+func (m *stemcellMockNodes) ListNodes(ctx context.Context) (*sdknodes.ListNodesResponse, error) {
+	if m.listNodesFn != nil {
+		return m.listNodesFn(ctx)
+	}
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
 }

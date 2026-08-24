@@ -1086,7 +1086,40 @@ func ensureTemplateVM(
 	// the lock-aware retry curve. A retry after a committed-but-dropped
 	// attempt would see PVE reject the second freeze, so the closure treats
 	// an already-frozen config as success (the goal state is reached).
+	//
+	// freezeUPIDPending tracks a submitted freeze whose await did not
+	// RESOLVE (pve.IsTaskExitVerdict false — a poll transport fault or an
+	// unresolved poll timeout, pve.IsTaskPollUnresolved): the next attempt
+	// re-awaits that same task instead of re-POSTing MakeTemplate, because
+	// the earlier freeze may still be executing on PVE and a second submit
+	// would double-apply it (PVE's own rejection of a concurrent freeze is
+	// not guaranteed to be distinguishable from an unrelated failure).
+	// Mirrors resizeDiskConverging / uploadStemcellImage.
+	freezeUPIDPending := ""
 	freezeErr := pve.RetryOnTransientOrLock(ctx, logger, "create_stemcell.freeze", 0, func() error {
+		if freezeUPIDPending != "" {
+			upid := freezeUPIDPending
+			awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, upid, logger,
+				pve.WithMaxWait(pve.StemcellMaxWait))
+			switch {
+			case awaitErr == nil:
+				freezeUPIDPending = ""
+				return nil
+			case pve.IsTaskExitVerdict(awaitErr):
+				// Resolved with a failure verdict: the freeze settled, so a
+				// fresh submit (falling through below) is the recovery.
+				freezeUPIDPending = ""
+				if templateFrozen(ctx, deps, templateNode, allocatedVMID) {
+					return nil
+				}
+			default:
+				// Unresolved: the freeze may still be executing, so a
+				// resubmit would double-apply it. Ride the loop's backoff
+				// into another re-await instead.
+				return awaitErr
+			}
+		}
+
 		freezeUPID, mkErr := pve.MakeTemplate(ctx, deps.PVE, templateNode, allocatedVMID)
 		if mkErr != nil {
 			if templateFrozen(ctx, deps, templateNode, allocatedVMID) {
@@ -1097,10 +1130,18 @@ func ensureTemplateVM(
 		if freezeUPID == "" {
 			return nil
 		}
+		freezeUPIDPending = freezeUPID
 		awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, templateNode, freezeUPID, logger,
 			pve.WithMaxWait(pve.StemcellMaxWait))
-		if awaitErr != nil && templateFrozen(ctx, deps, templateNode, allocatedVMID) {
+		if awaitErr == nil {
+			freezeUPIDPending = ""
 			return nil
+		}
+		if pve.IsTaskExitVerdict(awaitErr) {
+			freezeUPIDPending = ""
+			if templateFrozen(ctx, deps, templateNode, allocatedVMID) {
+				return nil
+			}
 		}
 		return awaitErr
 	})
@@ -3311,10 +3352,12 @@ func uploadStemcellImage(
 	}
 	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", pve.StorageUploadMaxAttempts(), func() error {
 		err := run()
-		if err != nil && directHost != "" && (pve.IsTLSCertVerificationFailure(err) || pve.IsDirectDialFailure(err)) {
+		if err != nil && directHost != "" && pve.IsRoutedUploadFallbackEligible(err) {
 			// The direct address is unusable: the node certificate does not
-			// cover it, or the dial itself failed (wrong entry, unreachable
-			// address). Nothing was sent when the handshake or dial failed
+			// cover it, the dial itself failed (wrong entry, unreachable
+			// address), or the TLS handshake failed for some other reason (a
+			// non-TLS listener on the port, a handshake reset or stall).
+			// Nothing was sent when the handshake or dial failed
 			// (neither sets sweepNeeded), and a failure past the POST leaves
 			// pendingUPID set, which the re-run resolves un-pinned before any
 			// re-upload, so re-running through the configured endpoint (the

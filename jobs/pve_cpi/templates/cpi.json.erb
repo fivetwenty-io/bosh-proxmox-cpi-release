@@ -619,6 +619,12 @@
   node_endpoints = p("pve.node_endpoints", {})
   config["node_endpoints"] = node_endpoints unless node_endpoints.nil? || node_endpoints.empty?
 
+  # node_endpoints_discovery has no spec default (see jobs/pve_cpi/spec), so
+  # if_p fires only when the operator sets it explicitly; the Go *bool field
+  # then distinguishes "unset" (preserve the legacy verify_ssl-derived
+  # default) from an explicit true/false override.
+  if_p("pve.node_endpoints_discovery") { |v| config["node_endpoints_discovery"] = v }
+
   # Emit the retry block only when the operator overrides at least one curve.
   # Each sub-policy and field is omit-when-zero so an untouched curve keeps the
   # Go accessor's shipped default (byte-identical to prior releases).

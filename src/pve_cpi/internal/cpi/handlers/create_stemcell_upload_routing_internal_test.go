@@ -7,6 +7,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -219,3 +220,70 @@ func TestUploadStemcellImage_TLSFailureFallsBackToEndpoint(t *testing.T) {
 		t.Errorf("upload ctx hosts = %v, want [10.0.0.2 \"\"]", storage.hosts)
 	}
 }
+
+// TestUploadStemcellImage_NonVerificationTLSHandshakeFallsBackToEndpoint is
+// the F-01 regression: a TLS handshake failure that is NOT certificate
+// verification (a non-TLS listener answering the routed port) must still
+// degrade to the proxied path instead of failing create_stemcell
+// permanently. Before the fix neither IsTLSCertVerificationFailure nor
+// IsDirectDialFailure matched tls.RecordHeaderError.
+func TestUploadStemcellImage_NonVerificationTLSHandshakeFallsBackToEndpoint(t *testing.T) {
+	t.Parallel()
+
+	storage := &routeStorage{}
+	storage.uploadFn = func(call int) (string, error) {
+		if call == 1 {
+			return "", fmt.Errorf("Post %q: %w",
+				"https://10.0.0.13:22/api2/json/nodes/pve2/storage/stemcells/upload",
+				tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"})
+		}
+		return "", nil
+	}
+	deps := urDeps(storage)
+	deps.NodeEndpoints = routeResolver("10.0.0.13:22")
+
+	err := uploadStemcellImage(urCtx(), deps, "pve2", "stemcells", "img.qcow2", urImageFile(t), "")
+	if err != nil {
+		t.Fatalf("uploadStemcellImage must succeed via the endpoint fallback: %v", err)
+	}
+	if len(storage.hosts) != 2 || storage.hosts[0] != "10.0.0.13:22" || storage.hosts[1] != "" {
+		t.Errorf("upload ctx hosts = %v, want [10.0.0.13:22 \"\"]", storage.hosts)
+	}
+}
+
+// TestUploadStemcellImage_HandshakePhaseReadTimeoutFallsBackToEndpoint is the
+// F-02 regression: a read-phase net.OpError (the shape a stalled or reset
+// TLS handshake produces once the TCP connect already succeeded) must be
+// fallback-eligible on the FIRST attempt rather than retried pinned to the
+// same dead route for the whole upload budget.
+func TestUploadStemcellImage_HandshakePhaseReadTimeoutFallsBackToEndpoint(t *testing.T) {
+	t.Parallel()
+
+	storage := &routeStorage{}
+	storage.uploadFn = func(call int) (string, error) {
+		if call == 1 {
+			return "", &net.OpError{Op: "read", Net: "tcp", Err: stemcellRoutingTimeoutErr{}}
+		}
+		return "", nil
+	}
+	deps := urDeps(storage)
+	deps.NodeEndpoints = routeResolver("10.0.0.2")
+
+	err := uploadStemcellImage(urCtx(), deps, "pve2", "stemcells", "img.qcow2", urImageFile(t), "")
+	if err != nil {
+		t.Fatalf("uploadStemcellImage must succeed via the endpoint fallback: %v", err)
+	}
+	// Exactly 2 attempts: fall back on the FIRST pinned failure.
+	if len(storage.hosts) != 2 || storage.hosts[0] != "10.0.0.2" || storage.hosts[1] != "" {
+		t.Errorf("upload ctx hosts = %v, want [10.0.0.2 \"\"]", storage.hosts)
+	}
+}
+
+// stemcellRoutingTimeoutErr implements net.Error with Timeout()==true, the
+// shape net.OpError.Timeout() delegates to, without needing a real syscall
+// error.
+type stemcellRoutingTimeoutErr struct{}
+
+func (stemcellRoutingTimeoutErr) Error() string   { return "i/o timeout" }
+func (stemcellRoutingTimeoutErr) Timeout() bool   { return true }
+func (stemcellRoutingTimeoutErr) Temporary() bool { return true }

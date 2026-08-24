@@ -232,6 +232,7 @@ func (a *ConfigDrive) Remove(ctx context.Context, node string, vmid int) error {
 	return nil
 }
 
+//nolint:gocognit // Sequential upload retry-state machine: pendingUPID re-await, evidence-gated sweep, pinned attempt, and the routed-fallback re-attempt are one ordered decision tree; splitting it would scatter the ordering the retry semantics depend on.
 func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename string) error {
 	// Upload returns a UPID (async storage task). The file is not yet
 	// visible to subsequent calls (e.g. attaching as a CD-ROM) until the
@@ -272,27 +273,65 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	}
 	uploadCtx := sdkclient.WithRetries(pinnedCtx, 0)
 	firstAttempt := true
-	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", pve.StorageUploadMaxAttempts(), func() error {
-		// A retry means the previous POST died mid-flight (connection drop,
-		// lock timeout). PVE may still have committed the file after the drop,
-		// and a duplicate `content=iso` upload is rejected with HTTP 409, so
-		// clear the target name before re-uploading. 404 is "not committed"
-		// (the common case). A sweep that fails on the same retryable fault
-		// class the loop handles (lock contention, pushback, another drop) is
-		// returned to the loop so the sweep itself rides the backoff curve:
-		// pressing on would upload into a possibly-taken name and turn the
-		// retryable fault into a permanent 409. Only a permanently-failing
-		// sweep proceeds best-effort, leaving the upload to surface the truth.
+	// pendingUPID tracks a submitted upload whose await did not RESOLVE
+	// (pve.IsTaskExitVerdict false — a poll transport fault or an
+	// unresolved poll timeout, pve.IsTaskPollUnresolved): the next attempt
+	// re-awaits that same task instead of sweeping the target name and
+	// re-uploading, because the earlier upload task may still be running
+	// and clearing the name it is writing would corrupt it. sweepNeeded is
+	// evidence-gated (F6): only a dropped POST or a task that RESOLVED with
+	// a failure verdict proves our own prior attempt wrote (part of) the
+	// file, mirroring uploadStemcellImage's sweepUploadTarget/sweepNeeded
+	// pattern -- a POST rejected before writing (lock timeout) leaves
+	// nothing of ours behind, and sweeping unconditionally could delete a
+	// concurrent same-name writer's file on no evidence at all.
+	pendingUPID := ""
+	sweepNeeded := false
+	run := func() error {
 		if !firstAttempt {
-			if _, rmErr := a.removeISOIfExists(pinnedCtx, node, filename); rmErr != nil {
-				if pve.IsRetryableOrLockFault(rmErr) {
-					return rmErr
+			if pendingUPID != "" {
+				upid := pendingUPID
+				awaitErr := pve.AwaitTaskWithLogger(pinnedCtx, a.pveSvc, node, upid, a.logger)
+				switch {
+				case awaitErr == nil:
+					pendingUPID = ""
+					return nil
+				case pve.IsTaskExitVerdict(awaitErr):
+					// Resolved with a failure verdict: the task settled, so
+					// its partial file is ours to sweep before re-uploading.
+					pendingUPID = ""
+					sweepNeeded = true
+				default:
+					// Unresolved: the upload may still be executing, so
+					// sweeping now (and the resubmit that would follow)
+					// risks deleting the file a live task is writing. Ride
+					// the loop's backoff into another re-await instead.
+					return awaitErr
 				}
-				a.logger.Warn("configdrive: pre-retry iso cleanup failed; retrying the upload anyway",
-					log.String("node", node),
-					log.String("filename", filename),
-					log.Err(rmErr),
-				)
+			}
+			// A retry means the previous POST died mid-flight (connection drop,
+			// lock timeout) or its task resolved with a failure verdict. PVE
+			// may still have committed the file, and a duplicate `content=iso`
+			// upload is rejected with HTTP 409, so clear the target name
+			// before re-uploading -- but only on the evidence above, never
+			// unconditionally. A sweep that fails on the same retryable fault
+			// class the loop handles (lock contention, pushback, another drop) is
+			// returned to the loop so the sweep itself rides the backoff curve:
+			// pressing on would upload into a possibly-taken name and turn the
+			// retryable fault into a permanent 409. Only a permanently-failing
+			// sweep proceeds best-effort, leaving the upload to surface the truth.
+			if sweepNeeded {
+				if _, rmErr := a.removeISOIfExists(pinnedCtx, node, filename); rmErr != nil {
+					if pve.IsRetryableOrLockFault(rmErr) {
+						return rmErr
+					}
+					a.logger.Warn("configdrive: pre-retry iso cleanup failed; retrying the upload anyway",
+						log.String("node", node),
+						log.String("filename", filename),
+						log.Err(rmErr),
+					)
+				}
+				sweepNeeded = false
 			}
 		}
 		firstAttempt = false
@@ -308,28 +347,41 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 
 			upid, err := a.pveSvc.Storage().Upload(upCtx, node, a.storage, "iso", filename, f)
 			if err != nil {
+				if pve.IsTransportConnectionDrop(err) {
+					sweepNeeded = true
+				}
 				return pve.WrapError(err)
 			}
 			if upid == "" {
 				return nil
 			}
+			pendingUPID = upid
 			awaitPhase = true
-			return pve.AwaitTaskWithLogger(pinnedCtx, a.pveSvc, node, upid, a.logger)
+			awaitErr := pve.AwaitTaskWithLogger(pinnedCtx, a.pveSvc, node, upid, a.logger)
+			if awaitErr == nil {
+				pendingUPID = ""
+			} else if pve.IsTaskExitVerdict(awaitErr) {
+				pendingUPID = ""
+				sweepNeeded = true
+			}
+			return awaitErr
 		}
 
 		err := attempt(uploadCtx)
-		if err != nil && directHost != "" && (pve.IsTLSCertVerificationFailure(err) || pve.IsDirectDialFailure(err)) {
+		if err != nil && directHost != "" && pve.IsRoutedUploadFallbackEligible(err) {
 			// The direct address is unusable: the node certificate does not
-			// cover it, or the dial itself failed (wrong entry, unreachable
-			// address). Nothing was sent in either case, so re-attempting
+			// cover it, the dial itself failed (wrong entry, unreachable
+			// address), or the TLS handshake failed for some other reason
+			// (a non-TLS listener on the port, a handshake reset or stall).
+			// Nothing was sent in any of these cases, so re-attempting
 			// un-pinned through the configured endpoint (the pre-existing
 			// path) needs no pre-sweep. The dead route is memoized on the
 			// resolver so later uploads this process skip it, and the
 			// remaining attempts here stay un-pinned. When the failure
 			// surfaced in the await phase the POST already went through, so
 			// the inline re-attempt is skipped: the retry loop re-enters with
-			// the (now un-pinned) pre-retry sweep clearing the possibly
-			// committed name before the next upload.
+			// the (now un-pinned) pending-UPID re-await / evidence-gated sweep
+			// before any next upload.
 			a.logger.Warn("configdrive: direct-to-node dial failed; falling back to the configured endpoint",
 				log.String("node", node),
 				log.String("direct_host", directHost),
@@ -345,7 +397,8 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 			}
 		}
 		return err
-	})
+	}
+	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", pve.StorageUploadMaxAttempts(), run)
 }
 
 func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, filename string) error {

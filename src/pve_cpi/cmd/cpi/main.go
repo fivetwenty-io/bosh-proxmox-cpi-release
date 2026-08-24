@@ -484,11 +484,13 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	cfgForBoot := *cfg
 	cfgForBoot.AgentMode = cfg.BootAgentMode()
 	// Direct-to-node upload routing: explicit pve.node_endpoints entries win,
-	// /cluster/status discovery fills the rest when TLS verification is off
-	// (the discovered corosync IP is usually absent from stock node cert
-	// SANs). Shared by the boot agent (ConfigDrive ISO uploads) and Deps
-	// (stemcell image uploads).
-	nodeEndpoints := pve.NewNodeEndpointResolver(client, cfg.NodeEndpoints, cfg.Host, !cfg.VerifySSLValue(), logger)
+	// /cluster/status discovery fills the rest when
+	// pve.node_endpoints_discovery allows it (default: on exactly when TLS
+	// verification is off, since the discovered corosync IP is usually
+	// absent from stock node cert SANs; an explicit true/false overrides
+	// that default either way). Shared by the boot agent (ConfigDrive ISO
+	// uploads) and Deps (stemcell image uploads).
+	nodeEndpoints := pve.NewNodeEndpointResolver(client, cfg.NodeEndpoints, cfg.Host, cfg.NodeEndpointsDiscoveryAllowed(), logger)
 	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))

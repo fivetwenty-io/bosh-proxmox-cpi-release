@@ -349,7 +349,7 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	if cfg.Host != r.BaseHost {
 		explicitEndpoints = nil
 	}
-	nodeEndpoints := pve.NewNodeEndpointResolver(client, explicitEndpoints, cfg.Host, !cfg.VerifySSLValue(), logger)
+	nodeEndpoints := pve.NewNodeEndpointResolver(client, explicitEndpoints, cfg.Host, cfg.NodeEndpointsDiscoveryAllowed(), logger)
 
 	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
 	if err != nil {
