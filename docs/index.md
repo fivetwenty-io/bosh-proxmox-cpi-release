@@ -1,6 +1,6 @@
-# BOSH PVE CPI Documentation
+# BOSH Proxmox CPI Documentation
 
-Documentation for the BOSH PVE CPI — a Cloud Provider Interface (CPI) for managing virtual machines on PVE infrastructure within the BOSH ecosystem.
+Documentation for the BOSH Proxmox CPI — a Cloud Provider Interface (CPI) for managing virtual machines on PVE infrastructure within the BOSH ecosystem.
 
 ## Overview
 

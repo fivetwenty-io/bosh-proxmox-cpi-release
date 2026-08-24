@@ -1,5 +1,5 @@
 {
-  "name": "bosh-pve-cpi-intro-overview-docs",
+  "name": "bosh-proxmox-cpi-intro-overview-docs",
   "private": true,
   "description": "Build tooling for compiling docs/intro-overview/*.md into a single index.html",
   "scripts": {

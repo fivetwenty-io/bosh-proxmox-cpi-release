@@ -45,7 +45,7 @@ The second `create-env` reuses the first run's `state.json` and `creds.yml`. Tha
 
 5. Capture-pre
 
-   Records the Director's VM CID and persistent disk CIDs from `state.json`, the deployment's VM and disk CIDs from the Director, the `bosh-pve-cpi` release version the Director runs, and the orphaned-disk count.
+   Records the Director's VM CID and persistent disk CIDs from `state.json`, the deployment's VM and disk CIDs from the Director, the `bosh-proxmox-cpi` release version the Director runs, and the orphaned-disk count.
 
 6. Upgrade
 

@@ -28,7 +28,7 @@ Alongside these, `./scripts/e2e` runs the full-stack end-to-end flow: it bootstr
 
 ### Configure
 
-Create a CPI config file (e.g. `~/.bosh-pve-cpi/cpi.json`):
+Create a CPI config file (e.g. `~/.bosh-proxmox-cpi/cpi.json`):
 
 ```json
 {
@@ -58,7 +58,7 @@ Notes:
 ### Run
 
 ```bash
-export CPI_CONFIG=~/.bosh-pve-cpi/cpi.json
+export CPI_CONFIG=~/.bosh-proxmox-cpi/cpi.json
 export STEMCELL_PATH=/path/to/bosh-stemcell-*-pve-ubuntu-jammy-go_agent.tgz
 ./scripts/lifecycle
 ```
@@ -161,7 +161,7 @@ pve/
 │   ├── terraform/
 │   │   └── pve.tf                 # Test network + DNS provisioning (or stub for static cluster)
 │   └── ops/
-│       └── custom-cpi-release.yml # Pin the bosh-pve-cpi release version under test
+│       └── custom-cpi-release.yml # Pin the bosh-proxmox-cpi release version under test
 ├── configure                      # Bash entrypoint: bosh int + fly set-pipeline
 └── pipeline.yml                   # Concourse pipeline definition
 ```
@@ -175,7 +175,7 @@ Reference: copy the `aws/` layout as a starting template and substitute:
 
 ### Prerequisites Before Submitting
 
-1. The `bosh-pve-cpi` release published to bosh.io or an S3/HTTP-accessible URL
+1. The `bosh-proxmox-cpi` release published to bosh.io or an S3/HTTP-accessible URL
 2. A PVE cluster reserved for certification runs with the storage pools, networks, and capacity required by BATs
 3. A Concourse instance with the credentials and resource workers to run the pipeline
 4. PR template additions to BATs ([cloudfoundry/bosh-acceptance-tests](https://github.com/cloudfoundry/bosh-acceptance-tests/tree/master/templates)) so the BAT manifest template lives upstream

@@ -1,4 +1,4 @@
-// Package main is the entrypoint for the BOSH PVE CPI binary.
+// Package main is the entrypoint for the BOSH Proxmox CPI binary.
 //
 // The binary reads JSON-RPC requests from stdin, dispatches each to the
 // registered CPI method handler, and writes JSON-RPC responses to stdout.

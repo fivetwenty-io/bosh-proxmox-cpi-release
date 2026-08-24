@@ -1,4 +1,4 @@
-# The BOSH PVE CPI — An Architecture, From First Principles
+# The BOSH Proxmox CPI — An Architecture, From First Principles
 
 ## What this is
 

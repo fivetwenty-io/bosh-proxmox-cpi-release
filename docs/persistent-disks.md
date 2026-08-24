@@ -1,6 +1,6 @@
 # Persistent disks
 
-The BOSH PVE CPI maps BOSH persistent disks to PVE storage volumes. Each
+The BOSH Proxmox CPI maps BOSH persistent disks to PVE storage volumes. Each
 disk lives on a single PVE storage and attaches to one VM at a time. This
 page covers how the CPI selects the target node for each disk operation,
 which PVE storage types are supported, the cloud-properties an operator

@@ -1,8 +1,8 @@
 ---
 theme: default
-title: The BOSH PVE CPI — An Operator's Introduction
+title: The BOSH Proxmox CPI — An Operator's Introduction
 info: |
-  A one-hour operator introduction to the BOSH PVE CPI.
+  A one-hour operator introduction to the BOSH Proxmox CPI.
   Presented by Wayne E. Seguin, FiveTwenty Inc.
 author: Wayne E. Seguin
 class: text-center
@@ -19,7 +19,7 @@ transition: slide-left
 layout: cover
 ---
 
-# The BOSH PVE CPI
+# The BOSH Proxmox CPI
 
 ## An Operator's Introduction
 

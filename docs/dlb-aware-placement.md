@@ -1,6 +1,6 @@
 # DLB-Aware Placement
 
-This document covers opt-in integration between the BOSH PVE CPI and the PVE 9.2 Dynamic Load Balancer (DLB).
+This document covers opt-in integration between the BOSH Proxmox CPI and the PVE 9.2 Dynamic Load Balancer (DLB).
 
 ---
 

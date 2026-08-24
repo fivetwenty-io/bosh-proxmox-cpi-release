@@ -1,8 +1,10 @@
-# BOSH PVE CPI
+# BOSH Proxmox CPI
 
 Go implementation of the BOSH Cloud Provider Interface (CPI) v2 for Proxmox VE 9.x.
 
 The CPI provisions VMs, persistent disks, networks, snapshots, and stemcells on a PVE cluster on behalf of a BOSH Director. It speaks the BOSH JSON-RPC envelope over stdin/stdout, supports three agent bootstrap modes (`cloudinit`, `noagent`, and `auto`), and ships as a single static Go binary packaged into a BOSH release.
+
+Naming note: this release was named `bosh-pve-cpi` through v0.4.0 and continues as `bosh-proxmox-cpi` from v0.5.0 onward.
 
 - BOSH CPI v2 compliant (`api_version: 2`)
 
@@ -34,15 +36,15 @@ The steps below take a fresh checkout through to a deployed Director on a PVE cl
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/fivetwenty-io/bosh-pve-cpi-release.git
-cd bosh-pve-cpi-release
+git clone https://github.com/fivetwenty-io/bosh-proxmox-cpi-release.git
+cd bosh-proxmox-cpi-release
 ```
 
 ### 2. Build the BOSH release tarball
 
 ```bash
 make download-blobs   # one-time: fetch the Go toolchain blob
-make dev-release      # builds dev_releases/bosh-pve-cpi/bosh-pve-cpi-<version>.tgz
+make dev-release      # builds dev_releases/bosh-proxmox-cpi/bosh-proxmox-cpi-<version>.tgz
 RELEASE_TGZ=$(scripts/create-release dev | grep '^RELEASE_TGZ=' | cut -d= -f2)
 ```
 
@@ -172,9 +174,9 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | `make lint` | Run `golangci-lint` (pinned version via `go run` fallback) |
 | `make security` | Run `govulncheck` and `gosec` |
 | `make release-build` | Build the Go CPI binary only (`bin/cpi`); does not produce a BOSH tarball |
-| `make dev-release` | Build a dev BOSH release tarball under `dev_releases/bosh-pve-cpi/` |
+| `make dev-release` | Build a dev BOSH release tarball under `dev_releases/bosh-proxmox-cpi/` |
 | `make release VERSION=X.Y.Z` | Build a versioned BOSH release tarball; prints `RELEASE_TGZ=<path>` |
-| `make release-hygiene` | Assert no loose `bosh-pve-cpi-*.tgz` exists at the repo root |
+| `make release-hygiene` | Assert no loose `bosh-proxmox-cpi-*.tgz` exists at the repo root |
 | `make release-clean` | Remove `bin/`, coverage artifacts, and release tarballs |
 | `make download-blobs` | Download and register the Go toolchain blob (`golang-1.27`) |
 
@@ -193,7 +195,7 @@ See [Development guide](docs/development.md) for the source layout, testing stra
 A local harness exercises the 14 canonical CPI methods end-to-end against a live PVE cluster:
 
 ```bash
-export CPI_CONFIG=~/.bosh-pve-cpi/cpi.json
+export CPI_CONFIG=~/.bosh-proxmox-cpi/cpi.json
 export STEMCELL_PATH=/path/to/bosh-stemcell-*.tgz
 ./scripts/lifecycle
 ```

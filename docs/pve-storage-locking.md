@@ -60,7 +60,7 @@ task failed: command '/sbin/lvs --separator ... /dev/data/vm-N-disk-0' failed: g
 
 ## When the CPI hits it
 
-A BOSH director driving a Cloud Foundry deploy can launch a dozen or more concurrent `create_vm` calls within a second of each other. Each runs as a separate OS process (one `bosh-pve-cpi` invocation per VM), so in-process serialisation does nothing. The director's worker pool is the only knob, and it defaults wide.
+A BOSH director driving a Cloud Foundry deploy can launch a dozen or more concurrent `create_vm` calls within a second of each other. Each runs as a separate OS process (one `bosh-proxmox-cpi` invocation per VM), so in-process serialisation does nothing. The director's worker pool is the only knob, and it defaults wide.
 
 Observed contention points, in deploy-time order:
 

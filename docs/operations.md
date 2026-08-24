@@ -1,6 +1,6 @@
 # Operations Runbook
 
-This runbook covers day-2 operations and diagnostics for an already-deployed BOSH PVE CPI. For symptom-first failure triage, see [Troubleshooting](troubleshooting.md).
+This runbook covers day-2 operations and diagnostics for an already-deployed BOSH Proxmox CPI. For symptom-first failure triage, see [Troubleshooting](troubleshooting.md).
 
 ---
 
@@ -674,7 +674,7 @@ Collect the following before opening an issue.
 # Output format: "bosh-proxmox-cpi <version> (<commit>, built <date>)"
 
 # proxmox-apiclient-go version — in the release source
-grep proxmox-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod
+grep proxmox-apiclient-go /path/to/bosh-proxmox-cpi-release/src/pve_cpi/go.mod
 # Current release: v3.8.6
 
 # PVE version — on the PVE host
@@ -695,7 +695,7 @@ This section describes how to build a CPI release tarball and pass its path to B
 ### Build a dev tarball
 
 ```bash
-# Build a timestamped dev tarball under dev_releases/bosh-pve-cpi/
+# Build a timestamped dev tarball under dev_releases/bosh-proxmox-cpi/
 make dev-release
 
 # Capture the path from the RELEASE_TGZ= line printed at the end
@@ -707,17 +707,17 @@ Or equivalently:
 ```bash
 scripts/create-release dev
 # Output ends with:
-#   Set BOSH var: --var release_artifact_path=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
-#   RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
-RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-dev-YYYYMMDDHHMMSS.tgz
+#   Set BOSH var: --var release_artifact_path=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
+#   RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
+RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
 ```
 
 ### Build a versioned (final) tarball
 
 ```bash
 make release VERSION=1.2.3
-# Tarball written to releases/bosh-pve-cpi/bosh-pve-cpi-1.2.3.tgz
-RELEASE_TGZ="$(pwd)/releases/bosh-pve-cpi/bosh-pve-cpi-1.2.3.tgz"
+# Tarball written to releases/bosh-proxmox-cpi/bosh-proxmox-cpi-1.2.3.tgz
+RELEASE_TGZ="$(pwd)/releases/bosh-proxmox-cpi/bosh-proxmox-cpi-1.2.3.tgz"
 ```
 
 ### Pass the path to BOSH
@@ -750,7 +750,7 @@ Copy `vars.yml.example` to `vars.yml` and leave `pve_cpi_release_path` as the `(
 
 ### Hygiene check
 
-`make release-hygiene` asserts that no `bosh-pve-cpi-*.tgz` file exists at the repository root. This gate catches accidental tarball dumps in the working tree before they enter a commit.
+`make release-hygiene` asserts that no `bosh-proxmox-cpi-*.tgz` file exists at the repository root. This gate catches accidental tarball dumps in the working tree before they enter a commit.
 
 ```bash
 make release-hygiene

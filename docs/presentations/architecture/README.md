@@ -1,6 +1,6 @@
 # Architecture Presentation
 
-A [Slidev](https://sli.dev) deck of the BOSH PVE CPI architecture, built entirely
+A [Slidev](https://sli.dev) deck of the BOSH Proxmox CPI architecture, built entirely
 from the prose in [`../../architecture/`](../../architecture/). One slide per section,
 a transition slide per chapter, an agenda up front. Presented by Wayne E. Seguin,
 FiveTwenty Inc.

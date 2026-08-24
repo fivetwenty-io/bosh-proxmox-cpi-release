@@ -33,7 +33,7 @@ Everything the CPI knows arrives from exactly two places: the request the Direct
 
 ## How it is packaged
 
-The project ships as a standard BOSH release named `bosh-pve-cpi`, and its contents are small enough to describe completely.
+The project ships as a standard BOSH release named `bosh-proxmox-cpi`, and its contents are small enough to describe completely.
 
 - **One job, `pve_cpi`**
 Colocated on the Director VM. It renders two files: `bin/cpi`, the entry point the Director invokes, and `config/cpi.json`, the configuration document built from our `pve.*` manifest properties.
@@ -46,7 +46,7 @@ The same package ships a small read-only command-line tool alongside the CPI. It
 
 ```mermaid
 flowchart TD
-    R["release: bosh-pve-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
+    R["release: bosh-proxmox-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
     R --> P1["package: pve_cpi<br/>the CPI binary + pve-cid"]
     R --> P2["package: golang<br/>build toolchain"]
     J --> DVM["lives on the Director VM"]

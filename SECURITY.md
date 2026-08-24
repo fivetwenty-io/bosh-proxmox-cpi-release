@@ -4,7 +4,7 @@ The CPI holds Proxmox VE API credentials and participates in the BOSH control pl
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/fivetwenty-io/bosh-pve-cpi-release/security/advisories/new). Open the Security tab of this repository and choose "Report a vulnerability".
+Please report vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/security/advisories/new). Open the Security tab of this repository and choose "Report a vulnerability".
 
 Do not report vulnerabilities through public GitHub issues, pull requests, or discussions. A public report exposes every deployment before a fix exists.
 

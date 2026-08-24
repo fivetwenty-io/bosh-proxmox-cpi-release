@@ -1,6 +1,6 @@
 # Intro-Overview Presentation
 
-A [Slidev](https://sli.dev) deck introducing the BOSH PVE CPI to operators, built
+A [Slidev](https://sli.dev) deck introducing the BOSH Proxmox CPI to operators, built
 entirely from the prose in [`../../intro-overview/`](../../intro-overview/). Ten
 chapters sized for a one-hour meeting: roughly fifty-five minutes of talk plus
 question time. Presented by Wayne E. Seguin, FiveTwenty Inc.

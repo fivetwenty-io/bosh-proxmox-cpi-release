@@ -1,5 +1,5 @@
 {
-  "name": "bosh-pve-cpi-architecture-docs",
+  "name": "bosh-proxmox-cpi-architecture-docs",
   "private": true,
   "description": "Build tooling for compiling docs/architecture/*.md into a single index.html",
   "scripts": {

@@ -47,7 +47,7 @@ layout: section
 
 ```mermaid {scale: 0.75}
 flowchart TD
-    R["release: bosh-pve-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
+    R["release: bosh-proxmox-cpi"] --> J["job: pve_cpi<br/>bin/cpi + config/cpi.json"]
     R --> P1["package: pve_cpi<br/>the CPI binary + pve-cid"]
     R --> P2["package: golang<br/>build toolchain"]
     J --> DVM["lives on the Director VM"]

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml", "requests"]
 # ///
-"""End-to-end bootstrap + feature test runner for bosh-pve-cpi-release.
+"""End-to-end bootstrap + feature test runner for bosh-proxmox-cpi-release.
 
 Aggregates the existing per-tool wrappers (scripts/bosh, scripts/cf,
 scripts/test) and the cf CLI into a single high-signal orchestrator that

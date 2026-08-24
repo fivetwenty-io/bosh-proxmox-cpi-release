@@ -7,7 +7,7 @@ ops library.
 
 The workflow:
 
-1. Build a local tarball of `bosh-pve-cpi`.
+1. Build a local tarball of `bosh-proxmox-cpi`.
 
 2. Clone `bosh-deployment`.
 
@@ -35,11 +35,11 @@ From the repository root:
 make release VERSION=0.1.0
 ```
 
-This produces `./bosh-pve-cpi-0.1.0.tgz` at the repo root. Capture the absolute path; it goes into `vars.yml` as `pve_cpi_release_path`.
+This produces `./bosh-proxmox-cpi-0.1.0.tgz` at the repo root. Capture the absolute path; it goes into `vars.yml` as `pve_cpi_release_path`.
 
-For an untagged build, use `make dev-release` — output is `./bosh-pve-cpi-dev-<UTC-timestamp>.tgz`.
+For an untagged build, use `make dev-release` — output is `./bosh-proxmox-cpi-dev-<UTC-timestamp>.tgz`.
 
-The release is named `bosh-pve-cpi`. If you build a final release later, the name and version are recorded under `releases/bosh-pve-cpi/`.
+The release is named `bosh-proxmox-cpi`. If you build a final release later, the name and version are recorded under `releases/bosh-proxmox-cpi/`.
 
 ## 3. Clone `bosh-deployment`
 
@@ -272,9 +272,9 @@ rm -f /var/lib/vz/template/iso/vm-105-config.iso
 | `manifests/vars.yml` | Real variables, includes secrets | **no** |
 | `manifests/state.json` | VM/disk identity tracked across runs | **no** |
 | `manifests/creds.yml` | Generated Director credentials | **no** |
-| `./bosh-pve-cpi-*.tgz` | Built release tarball | **no** |
+| `./bosh-proxmox-cpi-*.tgz` | Built release tarball | **no** |
 
-Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bosh-pve-cpi-*.tgz` to `.gitignore`.
+Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bosh-proxmox-cpi-*.tgz` to `.gitignore`.
 
 ## 11. Troubleshooting
 

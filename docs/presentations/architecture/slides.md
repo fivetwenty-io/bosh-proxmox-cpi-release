@@ -1,8 +1,8 @@
 ---
 theme: default
-title: The BOSH PVE CPI — An Architecture, From First Principles
+title: The BOSH Proxmox CPI — An Architecture, From First Principles
 info: |
-  An architecture of the BOSH PVE CPI, told from first principles.
+  An architecture of the BOSH Proxmox CPI, told from first principles.
   Presented by Wayne E. Seguin, FiveTwenty Inc.
 author: Wayne E. Seguin
 class: text-center
@@ -19,7 +19,7 @@ transition: slide-left
 layout: cover
 ---
 
-# The BOSH PVE CPI
+# The BOSH Proxmox CPI
 
 ## An Architecture, From First Principles
 

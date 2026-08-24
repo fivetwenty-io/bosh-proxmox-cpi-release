@@ -1,6 +1,6 @@
 # Persistent disk lifecycle strategy
 
-This document explains how the BOSH PVE CPI manages persistent disks in the
+This document explains how the BOSH Proxmox CPI manages persistent disks in the
 detached state — the period between `detach_disk` and the next `attach_disk`
 or `delete_disk`. It covers the root cause that makes the choice necessary,
 both available strategies, their trade-offs, configuration, and the operator

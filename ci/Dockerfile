@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Canonical CI image for bosh-pve-cpi-release.
+# Canonical CI image for bosh-proxmox-cpi-release.
 #
 # Built by .github/workflows/ci-image.yml and pushed to
 # ghcr.io/fivetwenty-io/bosh-pve-cpi-ci. Used by:
@@ -90,8 +90,8 @@ FROM ruby:${RUBY_VERSION}-slim-bookworm
 
 # Links the ghcr package to this repository so the workflows' GITHUB_TOKEN
 # can push it and repo collaborators inherit access.
-LABEL org.opencontainers.image.source="https://github.com/fivetwenty-io/bosh-pve-cpi-release"
-LABEL org.opencontainers.image.description="CI image for bosh-pve-cpi-release acceptance and integration jobs"
+LABEL org.opencontainers.image.source="https://github.com/fivetwenty-io/bosh-proxmox-cpi-release"
+LABEL org.opencontainers.image.description="CI image for bosh-proxmox-cpi-release acceptance and integration jobs"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \

@@ -50,6 +50,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The release is renamed from `bosh-pve-cpi` to `bosh-proxmox-cpi`; this is the first release published under the new name, and the GitHub repository moves to `fivetwenty-io/bosh-proxmox-cpi-release` (old URLs redirect). To a Director the renamed release is a new release: upgrading an existing environment means changing the release name in the create-env manifest or ops files to `bosh-proxmox-cpi` (our `manifests/bosh/cpi.yml` already does), deploying, then optionally running `bosh delete-release bosh-pve-cpi` once nothing references the old name. The job name `pve_cpi`, every `pve.*` property, the `PVE_CPI_RELEASE_PATH`/`PVE_CPI_CONFIG` environment variables, cpi_ids, and all CIDs are unchanged, so no other manifest edits are needed. Release assets for v0.4.0 and earlier keep their `bosh-pve-cpi-<version>.tgz` filenames, and `scripts/certify` and the acceptance workflow accept both names when fetching old versions.
+
+- The CPI's live identity strings carry the new name: new resource pools are tagged `managed by bosh-proxmox-cpi` (the `delete_vm` pool reaper recognizes the old comment forever, so pools created by earlier releases are still reaped), the HTTP User-Agent on PVE API calls is now `BOSH-Proxmox-CPI/<version>` (update any HTTP-level filters or audit rules that match the old string), the default OTel `service.name` is now `bosh-proxmox-cpi` (pin `pve.otel.service_name: bosh-pve-cpi` for dashboard continuity), `--version` reports `bosh-proxmox-cpi`, and the Go module path is `github.com/fivetwenty-io/bosh-proxmox-cpi`.
+
 - The bundled Proxmox SDK moves to proxmox-apiclient-go v3.9.2, which preserves the HTTP status chain through login failures, retries auto-login after a failed attempt, surfaces server-closed-idle connection races as its typed connection error, and requires Go 1.27.
 
 - Third-party dependencies are refreshed to their latest patch releases, including the AWS SDK for Go v2 modules behind the S3 stemcell fetcher.
@@ -300,12 +304,12 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.2...v0.2.0
-[0.1.2]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/b7ead4a1d2763f88a34baad9746f798cda8e68ef...v0.1.2
-[0.1.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.1.0...b7ead4a1d2763f88a34baad9746f798cda8e68ef
-[0.1.0]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/compare/v0.0.1...v0.1.0
-[0.0.1]: https://github.com/fivetwenty-io/bosh-pve-cpi-release/releases/tag/v0.0.1
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/b7ead4a1d2763f88a34baad9746f798cda8e68ef...v0.1.2
+[0.1.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.1.0...b7ead4a1d2763f88a34baad9746f798cda8e68ef
+[0.1.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.0.1...v0.1.0
+[0.0.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/releases/tag/v0.0.1

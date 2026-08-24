@@ -2,13 +2,13 @@
 
 ## Minimal `bosh create-env` CPI block
 
-The `cloud_provider` block in your `bosh.yml` (or its ops-file overlay) wires up the PVE CPI for Director bootstrapping. The CPI job name is `pve_cpi` from release `bosh-pve-cpi`.
+The `cloud_provider` block in your `bosh.yml` (or its ops-file overlay) wires up the PVE CPI for Director bootstrapping. The CPI job name is `pve_cpi` from release `bosh-proxmox-cpi`.
 
 ```yaml
 cloud_provider:
   template:
     name: pve_cpi
-    release: bosh-pve-cpi
+    release: bosh-proxmox-cpi
 
   properties:
     pve:

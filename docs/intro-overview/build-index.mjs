@@ -82,7 +82,7 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The BOSH PVE CPI — An Operator's Introduction</title>
+<title>The BOSH Proxmox CPI — An Operator's Introduction</title>
 <style>
   :root {
     --ink: #1c2330;

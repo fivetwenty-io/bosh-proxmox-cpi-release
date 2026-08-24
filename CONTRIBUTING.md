@@ -1,6 +1,6 @@
-# Contributing to bosh-pve-cpi-release
+# Contributing to bosh-proxmox-cpi-release
 
-Thank you for helping improve the BOSH PVE CPI. We welcome bug reports, documentation fixes, and code contributions. This guide explains how to report a problem, set up a development environment, and submit a change.
+Thank you for helping improve the BOSH Proxmox CPI. We welcome bug reports, documentation fixes, and code contributions. This guide explains how to report a problem, set up a development environment, and submit a change.
 
 ## Reporting issues
 
@@ -77,7 +77,7 @@ This runs `govulncheck`, `gosec`, and `trivy`. We run these scans before every r
 This step is optional. Green unit tests are enough for a pull request. If you want to validate a change against a real cluster, a local harness exercises the canonical CPI methods end to end:
 
 ```bash
-export CPI_CONFIG=~/.bosh-pve-cpi/cpi.json
+export CPI_CONFIG=~/.bosh-proxmox-cpi/cpi.json
 export STEMCELL_PATH=/path/to/bosh-stemcell-*.tgz
 ./scripts/lifecycle
 ```

@@ -1,6 +1,6 @@
 # Integration Testing
 
-This guide covers the tiered integration test harness for the BOSH PVE CPI release. All tests beyond Tier 0 require a live Proxmox VE cluster and lab network access.
+This guide covers the tiered integration test harness for the BOSH Proxmox CPI release. All tests beyond Tier 0 require a live Proxmox VE cluster and lab network access.
 
 ---
 
@@ -323,7 +323,7 @@ When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is 
 ### Setting the pipeline
 
 ```
-fly -t <target> sp -p bosh-pve-cpi -c ci/pipeline.yml -l ci/params.yml
+fly -t <target> sp -p bosh-proxmox-cpi -c ci/pipeline.yml -l ci/params.yml
 ```
 
 `ci/params.yml` is gitignored. Populate it from `ci/params.yml.example`.

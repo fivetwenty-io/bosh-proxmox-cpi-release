@@ -1,4 +1,4 @@
-# Proxmox VE Settings Required by `bosh-pve-cpi`
+# Proxmox VE Settings Required by `bosh-proxmox-cpi`
 
 Prerequisites on the PVE host that must be in place before `bosh create-env` succeeds. One-time per cluster. Each section gives both the UI path and an equivalent API call.
 

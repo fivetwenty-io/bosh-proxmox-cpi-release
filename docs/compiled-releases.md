@@ -11,7 +11,7 @@ once against the active stemcell, stores the compiled tarball, and pins it so
 every later create-env skips that compilation. On this lab it cut a cached
 create-env from **21m55s to 4m54s** (~78%).
 
-The `bosh-pve-cpi` release is deliberately **not** compiled by default: create-env
+The `bosh-proxmox-cpi` release is deliberately **not** compiled by default: create-env
 runs the CPI binary on the **local host** (the `cloud_provider` driver), not on the
 director VM, so a Linux-compiled CPI cannot execute on a non-Linux workstation
 (`cannot execute binary file`). The CPI compiles locally for the create-env host's
@@ -35,7 +35,7 @@ flowchart TD
 ```
 
 1. Ensures the stemcell pinned in `manifests/bosh/vars.yml` is on the director.
-2. Uploads the source `bosh` release (plus `bosh-pve-cpi` when
+2. Uploads the source `bosh` release (plus `bosh-proxmox-cpi` when
    `COMPILE_RELEASES_WITH_CPI=1`).
 3. Deploys a placeholder deployment with **empty `instance_groups`** (no VMs) that
    merely references the release(s) + stemcell.
@@ -147,7 +147,7 @@ compiles from source rather than using a cache that cannot match.
 ## Scope
 
 Only `bosh` is compiled by default — it is the create-env compilation sink that
-runs on the director VM. `bosh-pve-cpi` runs locally and compiles per create-env
+runs on the director VM. `bosh-proxmox-cpi` runs locally and compiles per create-env
 host (opt in with `COMPILE_RELEASES_WITH_CPI=1` on same-OS/arch hosts). `bpm`,
 `os-conf`, `uaa`, and `credhub` already arrive as compiled blobs from upstream and
 are left untouched. CloudFoundry uses `cf-deployment`'s own

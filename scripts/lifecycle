@@ -4,7 +4,7 @@
 # ///
 """BOSH CPI lifecycle harness.
 
-Exercises the bosh-pve-cpi binary end-to-end against a live PVE cluster by
+Exercises the bosh-proxmox-cpi binary end-to-end against a live PVE cluster by
 feeding JSON-RPC requests to ./bin/cpi on stdin (one process per call) and
 threading IDs between steps.
 

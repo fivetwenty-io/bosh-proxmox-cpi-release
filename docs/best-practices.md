@@ -1,6 +1,6 @@
 # Best Practices
 
-How the BOSH PVE CPI aligns with Proxmox VE best practices, section by section. Every entry states the practice, what the CPI actually does about it, and a status: **Meets** (the CPI implements the practice as the sensible default or as its only behavior), **Exceeds** (the CPI goes beyond PVE's own default or beyond what a CPI is typically expected to do), or **Configurable** (the practice is available but requires an operator to set a property — the recommended setting is given).
+How the BOSH Proxmox CPI aligns with Proxmox VE best practices, section by section. Every entry states the practice, what the CPI actually does about it, and a status: **Meets** (the CPI implements the practice as the sensible default or as its only behavior), **Exceeds** (the CPI goes beyond PVE's own default or beyond what a CPI is typically expected to do), or **Configurable** (the practice is available but requires an operator to set a property — the recommended setting is given).
 
 Property names and defaults are cross-referenced to [Configuration reference](configuration.md); day-2 operational detail lives in [Operations runbook](operations.md), [Network configuration](networks.md), [PVE API permissions](pve-api-permissions.md), and [Troubleshooting](troubleshooting.md).
 

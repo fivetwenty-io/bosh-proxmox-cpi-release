@@ -1,6 +1,6 @@
 # Architecture
 
-The BOSH PVE CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary once per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally, the code splits into layered packages. Each layer has a single responsibility and a narrow interface, so unit tests replace dependencies with mocks.
+The BOSH Proxmox CPI is a Go binary that implements the BOSH CPI v2 specification for PVE 9.x. The director invokes the binary once per request, exchanging JSON-RPC envelopes over stdin and stdout. Internally, the code splits into layered packages. Each layer has a single responsibility and a narrow interface, so unit tests replace dependencies with mocks.
 
 This document describes the structure: where code lives, how the packages depend on one another, what happens during a single request, the cross-cutting mechanisms that span packages, and how errors flow back to the director. For method signatures and per-method behavior, see [CPI Methods](cpi_methods.md).
 

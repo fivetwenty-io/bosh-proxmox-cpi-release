@@ -1,8 +1,8 @@
-# The BOSH PVE CPI — An Operator's Introduction
+# The BOSH Proxmox CPI — An Operator's Introduction
 
 # What this is
 
-This is the talking script for a one-hour introduction to the BOSH PVE CPI, written for operators. It explains how the system is put together, how it works, and how it is configured — in prose, without requiring anyone to read the implementation. Someone who follows the hour should be able to reason about a deployment, read the cluster, configure the CPI, and know exactly where to dig when a topic needs more depth. The code stays available for those who want it afterward; it is never required.
+This is the talking script for a one-hour introduction to the BOSH Proxmox CPI, written for operators. It explains how the system is put together, how it works, and how it is configured — in prose, without requiring anyone to read the implementation. Someone who follows the hour should be able to reason about a deployment, read the cluster, configure the CPI, and know exactly where to dig when a topic needs more depth. The code stays available for those who want it afterward; it is never required.
 
 The script is the companion to the Slidev deck in [`docs/presentations/intro-overview/`](../presentations/intro-overview/). The slides carry minimal cues and diagrams; the narrative below is what gets said. Each chapter opens with the idea it rests on, in italics, and closes with a hand-off to the next — the same shape as the [architecture narrative](../architecture/index.md), at introductory altitude.
 

@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide covers building, testing, and contributing to the BOSH PVE CPI Go codebase.
+This guide covers building, testing, and contributing to the BOSH Proxmox CPI Go codebase.
 
 ## Prerequisites
 
@@ -11,8 +11,8 @@ This guide covers building, testing, and contributing to the BOSH PVE CPI Go cod
 ## Setup
 
 ```bash
-git clone https://github.com/fivetwenty-io/bosh-pve-cpi
-cd bosh-pve-cpi
+git clone https://github.com/fivetwenty-io/bosh-proxmox-cpi-release
+cd bosh-proxmox-cpi-release
 cd src/pve_cpi && go mod download
 ```
 

@@ -1,4 +1,4 @@
-# Code owners for bosh-pve-cpi-release
+# Code owners for bosh-proxmox-cpi-release
 #
 # GitHub reads this file to decide who reviews a pull request. When a pull
 # request touches a path listed here, GitHub asks the listed owners for a

@@ -1,5 +1,5 @@
 // Package main implements pve-cid, a read-only operator CLI for inspecting
-// BOSH PVE CPI CIDs (cloud IDs) and correlating them against live PVE
+// BOSH Proxmox CPI CIDs (cloud IDs) and correlating them against live PVE
 // cluster state.
 //
 // pve-cid never mutates PVE: every subcommand either decodes/encodes a CID
@@ -122,7 +122,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	_, _ = fmt.Fprint(w, `pve-cid — read-only operator CLI for BOSH PVE CPI CIDs
+	_, _ = fmt.Fprint(w, `pve-cid — read-only operator CLI for BOSH Proxmox CPI CIDs
 
 Usage:
   pve-cid decode <cid> [--json]

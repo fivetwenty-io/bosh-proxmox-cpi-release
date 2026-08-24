@@ -5,8 +5,8 @@
 We can also dispatch it by hand:
 
 ```sh
-gh workflow run acceptance.yml --repo fivetwenty-io/bosh-pve-cpi-release
-gh workflow run acceptance.yml --repo fivetwenty-io/bosh-pve-cpi-release -f skip_bats=true
+gh workflow run acceptance.yml --repo fivetwenty-io/bosh-proxmox-cpi-release
+gh workflow run acceptance.yml --repo fivetwenty-io/bosh-proxmox-cpi-release -f skip_bats=true
 ```
 
 `skip_bats=true` runs certify alone, which is the cheaper first probe after any change to the workflow, the CI image, or the lab. The workflow's `concurrency: group: lab` serializes it with every other lab-touching workflow, so a manual dispatch queues behind a running one rather than colliding with it.
