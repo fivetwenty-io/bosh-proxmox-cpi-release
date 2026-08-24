@@ -99,7 +99,7 @@ func TestPreflightPoolAccess_NilCfgLoggerClientPoolsAreNoOps(t *testing.T) {
 func TestPreflightPoolAccess_VisiblePool_NoError(t *testing.T) {
 	t.Parallel()
 	fake := &fakePreflightPoolService{
-		getPoolCommentFn: func(string) (string, bool, error) { return "managed by bosh-pve-cpi", true, nil },
+		getPoolCommentFn: func(string) (string, bool, error) { return "managed by bosh-proxmox-cpi", true, nil },
 	}
 	cfg := &config.CPIConfig{VMPool: "bosh", StemcellTemplatePool: "bosh-templates"}
 	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {

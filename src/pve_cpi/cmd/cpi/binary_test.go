@@ -68,7 +68,7 @@ func TestBinary_UnexpectedPositionalArgs(t *testing.T) {
 // TestBinary_MissingConfigFile verifies that --config pointing at a
 // nonexistent file exits non-zero with a diagnostic on stderr.
 func TestBinary_MissingConfigFile(t *testing.T) {
-	stdout, code, err := runBinary(t, "", "--config", "/nonexistent/bosh-pve-cpi-test.json")
+	stdout, code, err := runBinary(t, "", "--config", "/nonexistent/bosh-proxmox-cpi-test.json")
 	if err != nil {
 		t.Fatalf("runBinary: %v", err)
 	}

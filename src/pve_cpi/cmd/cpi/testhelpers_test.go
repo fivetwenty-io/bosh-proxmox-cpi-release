@@ -79,7 +79,7 @@ func attemptBuild() (string, error) {
 	}
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
 
-	dir, err := os.MkdirTemp("", "bosh-pve-cpi-bin-*")
+	dir, err := os.MkdirTemp("", "bosh-proxmox-cpi-bin-*")
 	if err != nil {
 		return "", fmt.Errorf("MkdirTemp: %w", err)
 	}
@@ -119,7 +119,7 @@ func makeExecCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 }
 
 // TestMain removes the buildOnce binary's parent temp directory after the test
-// process exits. The binary is built into os.MkdirTemp("", "bosh-pve-cpi-bin-*")
+// process exits. The binary is built into os.MkdirTemp("", "bosh-proxmox-cpi-bin-*")
 // and reused across every test in this package (see buildOnce); t.TempDir is
 // not usable because its lifetime is bound to a single *testing.T.
 func TestMain(m *testing.M) {

@@ -7,6 +7,7 @@ package pve
 import (
 	"context"
 	"errors"
+	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -16,9 +17,24 @@ import (
 // PoolProvenanceComment is the comment the CPI writes on every resource pool
 // it creates. delete_vm's opt-in empty-pool reaper (see
 // reapEmptyPoolIfManaged in internal/cpi/handlers/delete_vm.go) checks a
-// pool's comment for this prefix before ever deleting it, so an operator's
-// pre-existing pool is never touched.
-const PoolProvenanceComment = "managed by bosh-pve-cpi"
+// pool's comment via IsCPIManagedPoolComment before ever deleting it, so an
+// operator's pre-existing pool is never touched.
+const PoolProvenanceComment = "managed by bosh-proxmox-cpi"
+
+// PoolProvenanceCommentLegacy is the provenance comment written by every
+// release before the bosh-proxmox-cpi rename. Pools created by those releases
+// still carry it on live clusters, so every provenance check accepts both
+// prefixes, permanently — dropping this would silently strand pre-rename
+// pools from the reaper.
+const PoolProvenanceCommentLegacy = "managed by bosh-pve-cpi"
+
+// IsCPIManagedPoolComment reports whether comment marks a pool as created by
+// this CPI, accepting both the current provenance prefix and the legacy
+// pre-rename one.
+func IsCPIManagedPoolComment(comment string) bool {
+	return strings.HasPrefix(comment, PoolProvenanceComment) ||
+		strings.HasPrefix(comment, PoolProvenanceCommentLegacy)
+}
 
 // PoolProvenance builds the comment recorded on a CPI-created pool. When
 // director is non-empty, it is appended in a parenthetical so multiple BOSH

@@ -1286,7 +1286,8 @@ func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Lo
 }
 
 // reapEmptyPoolIfManaged deletes poolID when it is empty AND was created by
-// this CPI (provenance comment prefix pve.PoolProvenanceComment), tolerating
+// this CPI (provenance comment per pve.IsCPIManagedPoolComment, which accepts
+// the current prefix and the legacy pre-rename one), tolerating
 // the two live PVE races this can hit. It is the delete_vm reaper for
 // pve.pool_reap_empty (release default true; per-deployment pools go away
 // with their deployments) and is called ONLY from the synchronous (non-fast-path)
@@ -1305,9 +1306,10 @@ func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Lo
 // Otherwise:
 //  1. GetPoolComment(poolID): a lookup error or a not-found pool both return
 //     immediately (logged at debug) -- nothing to reap.
-//  2. Comment prefix check: a pool whose comment does not start with
-//     pve.PoolProvenanceComment is an operator's own pool and is NEVER
-//     deleted by the CPI, regardless of emptiness.
+//  2. Comment prefix check: a pool whose comment fails
+//     pve.IsCPIManagedPoolComment (neither the current nor the legacy
+//     provenance prefix) is an operator's own pool and is NEVER deleted by
+//     the CPI, regardless of emptiness.
 //  3. DeletePool(poolID):
 //     - nil error: the pool was empty and CPI-managed -- reaped, logged Info.
 //     - pve.IsPoolNotEmpty / pve.IsPoolNotFound: PVE returns HTTP 500 + text
@@ -1348,7 +1350,7 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 			log.String("pool", poolID))
 		return
 	}
-	if !strings.HasPrefix(comment, pve.PoolProvenanceComment) {
+	if !pve.IsCPIManagedPoolComment(comment) {
 		logger.Debug("delete_vm: reaper: pool not CPI-managed, not reaping",
 			log.String("pool", poolID), log.String("comment", comment))
 		return

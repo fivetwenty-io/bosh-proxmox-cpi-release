@@ -118,7 +118,7 @@ func TestOTel_Enabled_AllFieldsValid_NoError(t *testing.T) {
 		Enabled:          true,
 		ExporterEndpoint: "otel-collector.example.internal:4318",
 		Insecure:         true,
-		ServiceName:      "bosh-pve-cpi",
+		ServiceName:      "bosh-proxmox-cpi",
 		SampleRatio:      0.5,
 		ExportTimeoutMs:  3000,
 	}
@@ -147,8 +147,8 @@ func TestOTel_ApplyDefaults_FillsZeroFieldsWhenEnabled(t *testing.T) {
 	}
 	c.ApplyDefaults()
 
-	if c.OTel.ServiceName != "bosh-pve-cpi" {
-		t.Errorf("ServiceName = %q, want default %q", c.OTel.ServiceName, "bosh-pve-cpi")
+	if c.OTel.ServiceName != "bosh-proxmox-cpi" {
+		t.Errorf("ServiceName = %q, want default %q", c.OTel.ServiceName, "bosh-proxmox-cpi")
 	}
 	if c.OTel.SampleRatio != 1.0 {
 		t.Errorf("SampleRatio = %v, want default 1.0", c.OTel.SampleRatio)

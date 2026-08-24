@@ -2549,14 +2549,14 @@ User-Agent (`BOSH-AZURE-CPI/<version> pid-<guid>`). PVE API calls from this CPI 
 distinguishing User-Agent, so operators cannot attribute API load or throttling to BOSH in
 PVE access logs.
 
-**Build:** set a `BOSH-PVE-CPI/<version>` User-Agent header on the proxmox-apiclient-go HTTP
+**Build:** set a `BOSH-Proxmox-CPI/<version>` User-Agent header on the proxmox-apiclient-go HTTP
 client through its transport wrapper, and add an optional `operator_id` config key appended to
 the header for per-operator attribution.
 
 **Limits.** PVE does not bill on API usage as the public clouds do, so the value is confined
 to audit, throttle attribution, and log filtering rather than cost accounting.
 
-**Shipped:** `BOSH-PVE-CPI/<version>` User-Agent is set on all PVE API calls via
+**Shipped:** `BOSH-Proxmox-CPI/<version>` User-Agent is set on all PVE API calls via
 `raw.SetHeader` at client construction in `internal/pve/client.go`. The version token uses
 `version.Short()` (ldflags-settable; defaults to `dev`). The optional `pve.operator_id`
 config key appends `pid-<value>` to the header for log attribution when multiple BOSH

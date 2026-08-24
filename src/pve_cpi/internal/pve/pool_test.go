@@ -175,6 +175,36 @@ func TestPoolProvenance_WithAndWithoutDirector(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// IsCPIManagedPoolComment
+// ---------------------------------------------------------------------------
+
+func TestIsCPIManagedPoolComment_AcceptsCurrentAndLegacyPrefixes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		comment string
+		want    bool
+	}{
+		{"current bare", "managed by bosh-proxmox-cpi", true},
+		{"current with director", "managed by bosh-proxmox-cpi (director d1)", true},
+		{"legacy bare", "managed by bosh-pve-cpi", true},
+		{"legacy with director", "managed by bosh-pve-cpi (director d1)", true},
+		{"operator pool", "my ops pool", false},
+		{"empty", "", false},
+		{"prefix not at start", "pool managed by bosh-proxmox-cpi", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.IsCPIManagedPoolComment(tc.comment); got != tc.want {
+				t.Errorf("IsCPIManagedPoolComment(%q) = %v; want %v", tc.comment, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // IsPoolPermissionDenied
 // ---------------------------------------------------------------------------
 

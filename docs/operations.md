@@ -671,7 +671,7 @@ Collect the following before opening an issue.
 ```bash
 # CPI version — on the Director VM
 /var/vcap/jobs/pve_cpi/bin/cpi --version
-# Output format: "bosh-pve-cpi <version> (<commit>, built <date>)"
+# Output format: "bosh-proxmox-cpi <version> (<commit>, built <date>)"
 
 # proxmox-apiclient-go version — in the release source
 grep proxmox-apiclient-go /path/to/bosh-pve-cpi-release/src/pve_cpi/go.mod

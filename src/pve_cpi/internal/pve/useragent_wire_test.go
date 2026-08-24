@@ -104,14 +104,14 @@ func issueProbeRequest(t *testing.T, cfg *config.CPIConfig) {
 }
 
 // TestUserAgent_WireNoOperatorID asserts that a config with no operator_id
-// sends "BOSH-PVE-CPI/<version>" on the wire (overrides SDK default).
+// sends "BOSH-Proxmox-CPI/<version>" on the wire (overrides SDK default).
 func TestUserAgent_WireNoOperatorID(t *testing.T) {
 	t.Parallel()
 	stub := newPVEStub(t)
 	cfg := stubCfg(t, stub, "")
 	issueProbeRequest(t, cfg)
 
-	want := "BOSH-PVE-CPI/" + version.Short()
+	want := "BOSH-Proxmox-CPI/" + version.Short()
 	got, _ := stub.recorded.Load().(string)
 	if got != want {
 		t.Errorf("User-Agent on wire: got %q, want %q", got, want)
@@ -119,14 +119,14 @@ func TestUserAgent_WireNoOperatorID(t *testing.T) {
 }
 
 // TestUserAgent_WireWithOperatorID asserts that operator_id="acme" produces
-// "BOSH-PVE-CPI/<version> pid-acme" on the wire.
+// "BOSH-Proxmox-CPI/<version> pid-acme" on the wire.
 func TestUserAgent_WireWithOperatorID(t *testing.T) {
 	t.Parallel()
 	stub := newPVEStub(t)
 	cfg := stubCfg(t, stub, "acme")
 	issueProbeRequest(t, cfg)
 
-	want := fmt.Sprintf("BOSH-PVE-CPI/%s pid-acme", version.Short())
+	want := fmt.Sprintf("BOSH-Proxmox-CPI/%s pid-acme", version.Short())
 	got, _ := stub.recorded.Load().(string)
 	if got != want {
 		t.Errorf("User-Agent on wire: got %q, want %q", got, want)

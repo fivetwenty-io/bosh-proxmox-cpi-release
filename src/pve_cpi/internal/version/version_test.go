@@ -7,7 +7,7 @@ import (
 
 func TestStringDefault(t *testing.T) {
 	s := String()
-	if !strings.HasPrefix(s, "bosh-pve-cpi ") {
+	if !strings.HasPrefix(s, "bosh-proxmox-cpi ") {
 		t.Errorf("String() prefix wrong: %q", s)
 	}
 	if !strings.Contains(s, "dev") {
@@ -44,7 +44,7 @@ func TestStringWithOverride(t *testing.T) {
 	BuildDate = "2026-05-18T00:00:00Z"
 
 	s := String()
-	want := "bosh-pve-cpi v1.2.3 (abc1234, built 2026-05-18T00:00:00Z)"
+	want := "bosh-proxmox-cpi v1.2.3 (abc1234, built 2026-05-18T00:00:00Z)"
 	if s != want {
 		t.Errorf("String() = %q, want %q", s, want)
 	}

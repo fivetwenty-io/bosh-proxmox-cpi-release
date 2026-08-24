@@ -60,7 +60,7 @@ const tracerName = "github.com/fivetwenty-io/bosh-proxmox-cpi"
 // when Enabled is true; this is a defensive fallback for callers (tests,
 // future callers) that construct an OTelConfig without going through
 // ApplyDefaults first.
-const defaultServiceName = "bosh-pve-cpi"
+const defaultServiceName = "bosh-proxmox-cpi"
 
 // noopShutdown is the shutdown func returned when tracing is disabled. It
 // performs no work, opens no network connection, and never returns an error.

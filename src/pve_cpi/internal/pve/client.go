@@ -261,7 +261,7 @@ func isPoolNotFound(err error) bool {
 }
 
 // buildUserAgent returns the User-Agent string for all PVE API requests.
-// Format: "BOSH-PVE-CPI/<version>" with an optional " pid-<operator_id>"
+// Format: "BOSH-Proxmox-CPI/<version>" with an optional " pid-<operator_id>"
 // suffix when cfg.OperatorID is non-empty.
 //
 // version.Short() is used (not version.String()) to avoid embedding commit SHA
@@ -269,7 +269,7 @@ func isPoolNotFound(err error) bool {
 // contains no trailing space — byte-identical to any prior release that did not
 // set a User-Agent.
 func buildUserAgent(cfg *config.CPIConfig) string {
-	ua := "BOSH-PVE-CPI/" + version.Short()
+	ua := "BOSH-Proxmox-CPI/" + version.Short()
 	if cfg.OperatorID != "" {
 		ua += " pid-" + cfg.OperatorID
 	}

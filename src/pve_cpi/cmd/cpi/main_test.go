@@ -321,8 +321,8 @@ func TestMain_VersionFlag(t *testing.T) {
 		t.Fatalf("--version exited non-zero: %v\noutput: %s", execErr, out)
 	}
 	output := strings.TrimSpace(string(out))
-	if !strings.Contains(output, "bosh-pve-cpi") {
-		t.Errorf("--version output does not contain 'bosh-pve-cpi': %q", output)
+	if !strings.Contains(output, "bosh-proxmox-cpi") {
+		t.Errorf("--version output does not contain 'bosh-proxmox-cpi': %q", output)
 	}
 }
 

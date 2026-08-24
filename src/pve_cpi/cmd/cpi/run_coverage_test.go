@@ -297,8 +297,8 @@ func TestRunWithArgs_VersionFlag(t *testing.T) {
 		t.Errorf("expected exit code 0 for --version, got %d; stderr=%q", code, stderr.String())
 	}
 	out := strings.TrimSpace(stdout.String())
-	if !strings.Contains(out, "bosh-pve-cpi") {
-		t.Errorf("--version output %q does not contain 'bosh-pve-cpi'", out)
+	if !strings.Contains(out, "bosh-proxmox-cpi") {
+		t.Errorf("--version output %q does not contain 'bosh-proxmox-cpi'", out)
 	}
 }
 
@@ -328,7 +328,7 @@ func TestRunWithArgs_MissingConfigFile(t *testing.T) {
 	t.Parallel()
 	var stdout, stderr bytes.Buffer
 	code := runWithArgs(
-		[]string{"--config", "/nonexistent/bosh-pve-cpi-test-config.json"},
+		[]string{"--config", "/nonexistent/bosh-proxmox-cpi-test-config.json"},
 		strings.NewReader(""),
 		&stdout, &stderr,
 		runOptions{},

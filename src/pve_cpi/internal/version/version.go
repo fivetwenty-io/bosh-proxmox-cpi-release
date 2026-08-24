@@ -13,7 +13,7 @@ var BuildDate = "unknown"
 
 // String returns the full version string including version, commit, and build date.
 func String() string {
-	return fmt.Sprintf("bosh-pve-cpi %s (%s, built %s)", Version, Commit, BuildDate)
+	return fmt.Sprintf("bosh-proxmox-cpi %s (%s, built %s)", Version, Commit, BuildDate)
 }
 
 // Short returns the Version string only.

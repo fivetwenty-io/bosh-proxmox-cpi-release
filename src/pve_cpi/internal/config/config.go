@@ -195,7 +195,7 @@ type CPIConfig struct {
 	// OperatorID is an optional label appended to the User-Agent header on all
 	// PVE API requests as "pid-<value>". Use it to attribute CPI traffic in PVE
 	// access logs when multiple BOSH directors share a single PVE cluster.
-	// When empty (the default), the User-Agent is "BOSH-PVE-CPI/<version>"
+	// When empty (the default), the User-Agent is "BOSH-Proxmox-CPI/<version>"
 	// with no suffix — byte-identical to prior releases.
 	OperatorID string `json:"operator_id,omitempty"`
 
@@ -400,7 +400,7 @@ type CPIConfig struct {
 	// StemcellTemplatePool is an optional PVE resource pool name assigned to
 	// newly created template VMs. Empty (default) means no pool assignment.
 	// Create-if-missing: the CPI creates the pool before the first template
-	// VM is assigned to it, tagging it with a "managed by bosh-pve-cpi"
+	// VM is assigned to it, tagging it with a "managed by bosh-proxmox-cpi"
 	// provenance comment (see VMPool doc for the shared rationale and the
 	// distinct-from-VMPool ACL boundary this preserves).
 	// validate-only-when-set: must not equal VMPool (see validateVMPool),
@@ -422,7 +422,7 @@ type CPIConfig struct {
 	//
 	// Both VMPool and StemcellTemplatePool are now create-if-missing: the CPI
 	// creates the resolved pool before the first VM or template lands in it,
-	// tagging it with a "managed by bosh-pve-cpi" provenance comment. Their
+	// tagging it with a "managed by bosh-proxmox-cpi" provenance comment. Their
 	// spec/ERB defaults are distinct ("bosh" and "bosh-templates"
 	// respectively) so the ACL boundary between workload VMs and shared
 	// stemcell templates holds even for an operator who sets nothing;
@@ -489,7 +489,7 @@ type CPIConfig struct {
 
 	// PoolReapEmpty enables an empty-pool reaper at delete_vm: when the
 	// destroyed VM's pool membership (captured before destroy) is a
-	// CPI-managed pool (provenance comment "managed by bosh-pve-cpi") that
+	// CPI-managed pool (provenance comment "managed by bosh-proxmox-cpi") that
 	// PVE reports empty after the destroy, the CPI deletes it. An
 	// operator-created pool without the provenance comment is never reaped,
 	// and the static VMPool and StemcellTemplatePool are refused by name
@@ -1291,7 +1291,7 @@ type OTelConfig struct {
 	Insecure bool `json:"insecure,omitempty"`
 
 	// ServiceName is the OTel resource service.name attribute. Empty means
-	// "use default"; ApplyDefaults fills "bosh-pve-cpi" when Enabled is true
+	// "use default"; ApplyDefaults fills "bosh-proxmox-cpi" when Enabled is true
 	// and this field is empty. An explicit non-empty override is preserved.
 	ServiceName string `json:"service_name,omitempty"`
 
@@ -2386,7 +2386,7 @@ func (c *CPIConfig) applyOTelDefaults() {
 	}
 	if c.OTel.Enabled {
 		if c.OTel.ServiceName == "" {
-			c.OTel.ServiceName = "bosh-pve-cpi"
+			c.OTel.ServiceName = "bosh-proxmox-cpi"
 		}
 		if c.OTel.SampleRatio == 0 {
 			c.OTel.SampleRatio = 1.0

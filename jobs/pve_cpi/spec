@@ -384,7 +384,7 @@ properties:
     description: |
       PVE resource pool name assigned to newly created template VMs. The CPI
       creates this pool if it does not already exist, tagging it with a
-      "managed by bosh-pve-cpi" provenance comment, before the first
+      "managed by bosh-proxmox-cpi" provenance comment, before the first
       template VM is assigned to it. Default "bosh-templates"
       (create-if-missing); set explicitly to "" to opt out entirely — no
       pool assignment and no pool creation.
@@ -402,7 +402,7 @@ properties:
       both the import path and the clone path (both PVE's create and clone
       endpoints accept "pool" directly). The CPI creates the resolved pool
       if it does not already exist, tagging it with a "managed by
-      bosh-pve-cpi" provenance comment, before the first VM lands in it.
+      bosh-proxmox-cpi" provenance comment, before the first VM lands in it.
       Default "bosh" (create-if-missing); set explicitly to "" to opt this
       global layer out entirely — a higher-precedence layer still
       applies if set, and when every layer resolves empty no pool is
@@ -463,7 +463,7 @@ properties:
   pve.pool_reap_empty:
     description: |
       When true, delete_vm deletes a CPI-managed pool (tagged with the
-      "managed by bosh-pve-cpi" provenance comment) once the destroyed VM's
+      "managed by bosh-proxmox-cpi" provenance comment) once the destroyed VM's
       pool membership, captured before destroy, is reported empty by PVE.
       An operator-created pool without that provenance comment is never
       reaped, the static pve.vm_pool and pve.stemcell_template_pool are
@@ -1027,7 +1027,7 @@ properties:
       Value of the service.name resource attribute attached to every emitted
       span, log record, and metric, identifying this CPI instance to the
       observability backend.
-    default: "bosh-pve-cpi"
+    default: "bosh-proxmox-cpi"
   pve.otel.sample_ratio:
     description: |
       Fraction of traces sampled: greater than 0.0, up to 1.0 (all).
@@ -2007,7 +2007,7 @@ properties:
       Optional operator identifier appended to the User-Agent header on all PVE
       API requests as "pid-<value>". Use this to attribute CPI traffic in PVE
       access logs when multiple BOSH directors share a single PVE cluster.
-      When unset (the default), the User-Agent is "BOSH-PVE-CPI/<version>"
+      When unset (the default), the User-Agent is "BOSH-Proxmox-CPI/<version>"
       with no suffix. The value passes through unmodified; avoid whitespace and
       control characters, which may be interpreted differently by PVE log parsers.
     default: ~

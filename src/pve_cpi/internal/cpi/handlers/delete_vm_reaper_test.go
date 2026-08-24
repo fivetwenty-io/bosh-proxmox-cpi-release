@@ -164,7 +164,7 @@ func TestDeleteVM_ReaperDeletesEmptyManagedPool(t *testing.T) {
 	const vmid = 9002
 	fx := newReaperTestFixture(t, vmid, true, "bosh")
 	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
-		return "managed by bosh-pve-cpi (director d)", true, nil
+		return "managed by bosh-proxmox-cpi (director d)", true, nil
 	}
 
 	if err := fx.run(t, vmid); err != nil {
@@ -178,6 +178,26 @@ func TestDeleteVM_ReaperDeletesEmptyManagedPool(t *testing.T) {
 	}
 	if !strings.Contains(fx.logBuf.String(), "reaped empty pool") {
 		t.Errorf("expected an Info log confirming the reap; log=%s", fx.logBuf.String())
+	}
+}
+
+// A pool created by a release before the bosh-proxmox-cpi rename still
+// carries the legacy provenance comment; the reaper must keep treating it as
+// CPI-owned forever.
+func TestDeleteVM_ReaperDeletesLegacyProvenancePool(t *testing.T) {
+	t.Parallel()
+
+	const vmid = 9012
+	fx := newReaperTestFixture(t, vmid, true, "bosh")
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "managed by bosh-pve-cpi (director d)", true, nil
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.deletePoolCalls) != 1 || fx.pools.deletePoolCalls[0] != "bosh" {
+		t.Fatalf("DeletePool: want 1 call for legacy-commented pool %q, got %v", "bosh", fx.pools.deletePoolCalls)
 	}
 }
 
@@ -207,7 +227,7 @@ func TestDeleteVM_ReaperToleratesNotEmptyRace(t *testing.T) {
 	const vmid = 9004
 	fx := newReaperTestFixture(t, vmid, true, "bosh")
 	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
-		return "managed by bosh-pve-cpi", true, nil
+		return "managed by bosh-proxmox-cpi", true, nil
 	}
 	fx.pools.deletePoolFn = func(_ context.Context, _ string) error {
 		return errors.New("pool 'x' is not empty (contains VM 99098)")
@@ -234,7 +254,7 @@ func TestDeleteVM_ReaperToleratesPoolGone(t *testing.T) {
 	const vmid = 9005
 	fx := newReaperTestFixture(t, vmid, true, "bosh")
 	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
-		return "managed by bosh-pve-cpi", true, nil
+		return "managed by bosh-proxmox-cpi", true, nil
 	}
 	fx.pools.deletePoolFn = func(_ context.Context, _ string) error {
 		return errors.New("delete pool failed: pool 'x' does not exist")

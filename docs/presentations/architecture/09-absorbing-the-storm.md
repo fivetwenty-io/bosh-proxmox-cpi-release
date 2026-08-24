@@ -27,7 +27,7 @@ flowchart LR
 - Reconciliation must live on the seam — in the CPI
 
 <!--
-- Tension: reconciliation has to live in the CPI because there is nowhere else — each call is a separate `bosh-pve-cpi` process, no shared memory, so in-process serialization does nothing.
+- Tension: reconciliation has to live in the CPI because there is nowhere else — each call is a separate `bosh-proxmox-cpi` process, no shared memory, so in-process serialization does nothing.
 - The ratios are the whole story: a dozen+ concurrent create_vm in one second, 3 pvedaemon workers, one lockfile per storage pool — roughly 10:1 in-flight-to-worker.
 - The Director defaults its worker pool wide; the only real knobs sit at the two ends (throttle the Director, grow the host), so the middle has to absorb.
 - Gotcha that forces the seam: a worker recycle during the burst window is statistically guaranteed — once every few hundred requests in the field.

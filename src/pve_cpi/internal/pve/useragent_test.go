@@ -11,11 +11,11 @@ import (
 )
 
 // TestBuildUserAgent_NoOperatorID verifies that a config with no operator_id
-// produces exactly "BOSH-PVE-CPI/<version>" with no trailing space or suffix.
+// produces exactly "BOSH-Proxmox-CPI/<version>" with no trailing space or suffix.
 func TestBuildUserAgent_NoOperatorID(t *testing.T) {
 	t.Parallel()
 	cfg := &config.CPIConfig{}
-	want := "BOSH-PVE-CPI/" + version.Short()
+	want := "BOSH-Proxmox-CPI/" + version.Short()
 	got := buildUserAgent(cfg)
 	if got != want {
 		t.Errorf("buildUserAgent (no operator_id): got %q, want %q", got, want)
@@ -27,7 +27,7 @@ func TestBuildUserAgent_NoOperatorID(t *testing.T) {
 func TestBuildUserAgent_WithOperatorID(t *testing.T) {
 	t.Parallel()
 	cfg := &config.CPIConfig{OperatorID: "acme"}
-	want := "BOSH-PVE-CPI/" + version.Short() + " pid-acme"
+	want := "BOSH-Proxmox-CPI/" + version.Short() + " pid-acme"
 	got := buildUserAgent(cfg)
 	if got != want {
 		t.Errorf("buildUserAgent (operator_id=acme): got %q, want %q", got, want)
@@ -52,7 +52,7 @@ func TestBuildUserAgent_VersionShort(t *testing.T) {
 	cfg := &config.CPIConfig{}
 	got := buildUserAgent(cfg)
 	// Must start with the prefix and embed Short(), not the full String().
-	prefix := "BOSH-PVE-CPI/"
+	prefix := "BOSH-Proxmox-CPI/"
 	if !strings.HasPrefix(got, prefix) {
 		t.Errorf("buildUserAgent: got %q, want prefix %q", got, prefix)
 	}
@@ -78,9 +78,9 @@ func TestBuildUserAgent_SpecialCharsPassThrough(t *testing.T) {
 		id   string
 		want string
 	}{
-		{"my-org_1", "BOSH-PVE-CPI/" + version.Short() + " pid-my-org_1"},
-		{"123", "BOSH-PVE-CPI/" + version.Short() + " pid-123"},
-		{"prod.east", "BOSH-PVE-CPI/" + version.Short() + " pid-prod.east"},
+		{"my-org_1", "BOSH-Proxmox-CPI/" + version.Short() + " pid-my-org_1"},
+		{"123", "BOSH-Proxmox-CPI/" + version.Short() + " pid-123"},
+		{"prod.east", "BOSH-Proxmox-CPI/" + version.Short() + " pid-prod.east"},
 	}
 	for _, tc := range cases {
 		tc := tc

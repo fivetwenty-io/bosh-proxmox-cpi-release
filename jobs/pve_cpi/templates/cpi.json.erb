@@ -692,8 +692,8 @@
     otel["exporter_endpoint"] = p("pve.otel.exporter_endpoint", "")
     otel_insecure = p("pve.otel.insecure", false)
     otel["insecure"] = true if otel_insecure
-    otel_service_name = p("pve.otel.service_name", "bosh-pve-cpi")
-    otel["service_name"] = otel_service_name unless otel_service_name == "bosh-pve-cpi"
+    otel_service_name = p("pve.otel.service_name", "bosh-proxmox-cpi")
+    otel["service_name"] = otel_service_name unless otel_service_name == "bosh-proxmox-cpi"
     otel_sample_ratio = p("pve.otel.sample_ratio", 1.0).to_f
     if otel_sample_ratio <= 0.0 || otel_sample_ratio > 1.0
       raise "pve.otel.sample_ratio must be greater than 0.0 and at most 1.0 " \
@@ -815,7 +815,7 @@
   if_p("pve.fast_path_delete") { |v| config["fast_path_delete"] = v }
 
   # Emit operator_id only when the operator sets a non-empty value. When absent
-  # the User-Agent defaults to "BOSH-PVE-CPI/<version>" with no suffix —
+  # the User-Agent defaults to "BOSH-Proxmox-CPI/<version>" with no suffix —
   # byte-identical to any prior release that did not configure operator_id.
   if_p("pve.operator_id") { |v| config["operator_id"] = v unless v.to_s.empty? }
 

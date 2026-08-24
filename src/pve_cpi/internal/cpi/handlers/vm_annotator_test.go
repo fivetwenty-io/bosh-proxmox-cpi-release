@@ -44,11 +44,11 @@ func TestVMAnnotator_PreservesExistingSentinel(t *testing.T) {
 	deps := testDepsFoundVM(vmid, qemuSvc, nodesSvc, nil, &mockAgentService{})
 
 	a := handlers.NewVMAnnotator(deps)
-	if annErr := a.AnnotateNotes(context.Background(), vmid, "created by bosh-pve-cpi"); annErr != nil {
+	if annErr := a.AnnotateNotes(context.Background(), vmid, "created by bosh-proxmox-cpi"); annErr != nil {
 		t.Fatalf("AnnotateNotes: unexpected error: %v", annErr)
 	}
 
-	if !strings.Contains(written, "created by bosh-pve-cpi") {
+	if !strings.Contains(written, "created by bosh-proxmox-cpi") {
 		t.Errorf("notes text missing from written description: %q", written)
 	}
 	pm, ok := pve.GetPoolMembership(written)

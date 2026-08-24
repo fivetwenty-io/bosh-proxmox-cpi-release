@@ -1040,7 +1040,7 @@ func ensureTemplateVM(
 	// The configured template pool must exist before the create loop below:
 	// attemptCreateTemplateVM passes it as the qemu-create "pool" param, and
 	// PVE rejects a create referencing a non-existent pool.
-	// pve.EnsurePoolExists creates it with a "managed by bosh-pve-cpi"
+	// pve.EnsurePoolExists creates it with a "managed by bosh-proxmox-cpi"
 	// provenance comment (create_stemcell has no env.bosh, so the director is
 	// not derivable — the comment carries no director suffix here, unlike
 	// create_vm's per-director comment) and tolerates the pool already
