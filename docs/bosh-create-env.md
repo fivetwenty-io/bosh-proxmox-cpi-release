@@ -11,7 +11,7 @@ The workflow:
 
 2. Clone `bosh-deployment`.
 
-3. Fill in `manifests/vars.yml`.
+3. Fill in `manifests/bosh/vars.yml`.
 
 4. Run `bosh create-env` with the supplied ops file.
 
@@ -35,9 +35,9 @@ From the repository root:
 make release VERSION=0.1.0
 ```
 
-This produces `./bosh-proxmox-cpi-0.1.0.tgz` at the repo root. Capture the absolute path; it goes into `vars.yml` as `pve_cpi_release_path`.
+This produces `releases/bosh-proxmox-cpi/bosh-proxmox-cpi-0.1.0.tgz`, never at the repo root. Capture the absolute path; it goes into `vars.yml` as `pve_cpi_release_path`.
 
-For an untagged build, use `make dev-release` — output is `./bosh-proxmox-cpi-dev-<UTC-timestamp>.tgz`.
+For an untagged build, use `make dev-release`: output is `dev_releases/bosh-proxmox-cpi/bosh-proxmox-cpi-dev-<UTC-timestamp>.tgz`.
 
 The release is named `bosh-proxmox-cpi`. If you build a final release later, the name and version are recorded under `releases/bosh-proxmox-cpi/`.
 
@@ -53,8 +53,8 @@ Pass `~/w/cloudfoundry/bosh-deployment/bosh.yml` as the base manifest.
 ## 4. Prepare `vars.yml`
 
 ```bash
-cp manifests/vars.yml.example manifests/vars.yml
-$EDITOR manifests/vars.yml
+cp manifests/bosh/vars.yml.example manifests/bosh/vars.yml
+$EDITOR manifests/bosh/vars.yml
 ```
 
 Required fields:
@@ -75,7 +75,7 @@ Required fields:
 
 - `pve_cpi_release_path` (absolute path to the tarball from step 2)
 
-- `pve_cpi_release_name` (the release name embedded in that tarball: `bosh-proxmox-cpi` for releases built from this repo, `bosh-pve-cpi` for published tarballs through v0.4.0). `scripts/bosh` reads it from the tarball automatically; set it only for the raw invocation below.
+- `pve_cpi_release_name` (defaults to `bosh-proxmox-cpi` in `vars.yml.example`). Leave it unless you deploy a published tarball through v0.4.0, which embeds the pre-rename name `bosh-pve-cpi`; set it to `bosh-pve-cpi` in that case. `scripts/bosh create-env`/`teardown` read the name from the tarball automatically and pass it via `-v`, which overrides this file's value, so `scripts/bosh` always uses the name embedded in the tarball regardless of what `vars.yml` sets. This default only matters for the raw invocation below.
 
 - `stemcell_url`, `stemcell_sha1` (Ubuntu noble openstack-kvm). Known-good values:
 
@@ -107,7 +107,7 @@ The Mac workstation may reach PVE over Tailscale fine — but `bosh create-env` 
 
 See [pve-api-permissions.md](pve-api-permissions.md) for token creation and the minimum-privilege `bosh@pve` user setup.
 
-The ops file in `manifests/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them, but only one should hold a real value — leave the other as an empty string. The CPI validates this XOR at startup (`one of password or api_token is required`; `password and api_token are mutually exclusive`).
+The ops file in `manifests/bosh/cpi.yml` wires both `pve_password` and `pve_api_token` into the CPI job. Both vars must exist in `vars.yml` so the BOSH var interpolator can resolve them, but only one should hold a real value; leave the other as an empty string. The CPI validates this XOR at startup (`one of password or api_token is required`; `password and api_token are mutually exclusive`).
 
 Password auth (default):
 
@@ -131,12 +131,12 @@ Use an API token for non-interactive automation — it can be scoped and revoked
 
 ```bash
 bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
-  --state=manifests/state.json \
-  --vars-store=manifests/creds.yml \
+  --state=manifests/bosh/state.json \
+  --vars-store=manifests/bosh/creds.yml \
   -o manifests/bosh/bosh-release.yml \
-  -o manifests/cpi.yml \
+  -o manifests/bosh/cpi.yml \
   -o ~/w/cloudfoundry/bosh-deployment/jumpbox-user.yml \
-  -l manifests/vars.yml
+  -l manifests/bosh/vars.yml
 ```
 
 `scripts/bosh create-env` wraps this exact invocation with full ops layering — prefer it over the raw command above.
@@ -147,11 +147,11 @@ The `jumpbox-user.yml` ops file (optional but recommended) adds a `jumpbox` user
 
 What each flag does:
 
-- `--state=manifests/state.json`
+- `--state=manifests/bosh/state.json`
 
   Persists the Director VM identity (VMID, disk CIDs) so reruns update rather than recreate.
 
-- `--vars-store=manifests/creds.yml`
+- `--vars-store=manifests/bosh/creds.yml`
 
   Persists generated credentials (NATS, mbus, blobstore, jumpbox) across runs. Required for idempotent updates.
 
@@ -159,11 +159,11 @@ What each flag does:
 
   Pins the `cloudfoundry/bosh` release to a reproducible version (282.1.13) instead of the local `bosh-deployment` default.
 
-- `-o manifests/cpi.yml`
+- `-o manifests/bosh/cpi.yml`
 
   Layers the PVE CPI onto `bosh.yml`: stemcell URL, network bridge, instance-group job, and `cloud_provider` block.
 
-- `-l manifests/vars.yml`
+- `-l manifests/bosh/vars.yml`
 
   Supplies the variables consumed by the ops file.
 
@@ -172,15 +172,15 @@ The first run takes several minutes: it uploads the stemcell template, clones it
 ## 6. Point the CLI at the new Director
 
 ```bash
-DIRECTOR_IP=$(bosh int manifests/vars.yml --path /internal_ip)
+DIRECTOR_IP=$(bosh int manifests/bosh/vars.yml --path /internal_ip)
 
 bosh alias-env pve \
   -e "${DIRECTOR_IP}" \
-  --ca-cert <(bosh int manifests/creds.yml --path /director_ssl/ca)
+  --ca-cert <(bosh int manifests/bosh/creds.yml --path /director_ssl/ca)
 
 export BOSH_ENVIRONMENT=pve
 export BOSH_CLIENT=admin
-export BOSH_CLIENT_SECRET=$(bosh int manifests/creds.yml --path /admin_password)
+export BOSH_CLIENT_SECRET=$(bosh int manifests/bosh/creds.yml --path /admin_password)
 
 bosh env
 ```
@@ -191,7 +191,7 @@ Stash the environment block in a sourceable file for repeated use:
 cat > ~/.bosh-pve.env <<EOF
 export BOSH_ENVIRONMENT=pve
 export BOSH_CLIENT=admin
-export BOSH_CLIENT_SECRET=$(bosh int $(pwd)/manifests/creds.yml --path /admin_password)
+export BOSH_CLIENT_SECRET=$(bosh int $(pwd)/manifests/bosh/creds.yml --path /admin_password)
 EOF
 # source ~/.bosh-pve.env
 ```
@@ -201,9 +201,9 @@ EOF
 If you deployed with `jumpbox-user.yml` (step 5), pull the private key from `creds.yml` and connect:
 
 ```bash
-bosh int manifests/creds.yml --path /jumpbox_ssh/private_key > /tmp/jumpbox.key
+bosh int manifests/bosh/creds.yml --path /jumpbox_ssh/private_key > /tmp/jumpbox.key
 chmod 600 /tmp/jumpbox.key
-ssh -i /tmp/jumpbox.key jumpbox@$(bosh int manifests/vars.yml --path /internal_ip)
+ssh -i /tmp/jumpbox.key jumpbox@$(bosh int manifests/bosh/vars.yml --path /internal_ip)
 # inside the VM: sudo -i  (root shell)
 ```
 
@@ -229,10 +229,10 @@ To redeploy after changing the release, ops file, or vars, run:
 ```bash
 make release VERSION=0.1.0            # rebuild if release code changed
 bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
-  --state=manifests/state.json \
-  --vars-store=manifests/creds.yml \
-  -o manifests/cpi.yml \
-  -l manifests/vars.yml
+  --state=manifests/bosh/state.json \
+  --vars-store=manifests/bosh/creds.yml \
+  -o manifests/bosh/cpi.yml \
+  -l manifests/bosh/vars.yml
 ```
 
 `bosh create-env` is idempotent: it reads `state.json`, diffs the manifest, and applies the delta. Keep `state.json` and `creds.yml` together — losing either forces a full redeploy.
@@ -242,11 +242,11 @@ When the only change is the rendered CPI config — for example, after editing `
 ## 9. Tearing down
 
 ```bash
-bosh delete-env ~/w/bosh-deployment/bosh.yml \
-  --state=manifests/state.json \
-  --vars-store=manifests/creds.yml \
-  -o manifests/cpi.yml \
-  -l manifests/vars.yml
+bosh delete-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
+  --state=manifests/bosh/state.json \
+  --vars-store=manifests/bosh/creds.yml \
+  -o manifests/bosh/cpi.yml \
+  -l manifests/bosh/vars.yml
 ```
 
 This destroys the Director VM, its persistent disk, and the stemcell template.
@@ -269,14 +269,14 @@ rm -f /var/lib/vz/template/iso/vm-105-config.iso
 | Path | Role | Commit? |
 |---|---|---|
 | `manifests/bosh/bosh-release.yml` | Ops file pinning the `bosh` release version | yes |
-| `manifests/cpi.yml` | Ops file applied to `bosh.yml` | yes |
-| `manifests/vars.yml.example` | Template for variables | yes |
-| `manifests/vars.yml` | Real variables, includes secrets | **no** |
-| `manifests/state.json` | VM/disk identity tracked across runs | **no** |
-| `manifests/creds.yml` | Generated Director credentials | **no** |
+| `manifests/bosh/cpi.yml` | Ops file applied to `bosh.yml` | yes |
+| `manifests/bosh/vars.yml.example` | Template for variables | yes |
+| `manifests/bosh/vars.yml` | Real variables, includes secrets | **no** |
+| `manifests/bosh/state.json` | VM/disk identity tracked across runs | **no** |
+| `manifests/bosh/creds.yml` | Generated Director credentials | **no** |
 | `./bosh-proxmox-cpi-*.tgz` | Built release tarball | **no** |
 
-Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bosh-proxmox-cpi-*.tgz` to `.gitignore`.
+Add `manifests/bosh/vars.yml`, `manifests/bosh/state.json`, `manifests/bosh/creds.yml`, and `bosh-proxmox-cpi-*.tgz` to `.gitignore`.
 
 ## 11. Troubleshooting
 
@@ -302,7 +302,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **Need a fresh state**
 
-  Delete `manifests/state.json` and `manifests/creds.yml`, then rerun `create-env`. If the previous Director VM still exists, remove it from PVE manually first (see [Tearing down](#9-tearing-down) for the cleanup commands, including the synthetic-vmid persistent disk).
+  Delete `manifests/bosh/state.json` and `manifests/bosh/creds.yml`, then rerun `create-env`. If the previous Director VM still exists, remove it from PVE manually first (see [Tearing down](#9-tearing-down) for the cleanup commands, including the synthetic-vmid persistent disk).
 
 - **`Image is not in qcow2 format` during create_stemcell**
 
@@ -334,7 +334,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
 - **`Can't find property 'director.cpi_job'` during template render**
 
-  `manifests/cpi.yml` must set `/instance_groups/name=bosh/properties/director/cpi_job` to `pve_cpi`. Without this property the Director's `director.yml.erb` template aborts. The ops file in this repo sets it by default.
+  `manifests/bosh/cpi.yml` must set `/instance_groups/name=bosh/properties/director/cpi_job` to `pve_cpi`. Without this property the Director's `director.yml.erb` template aborts. The ops file in this repo sets it by default.
 
 - **`lvm name 'data:vm-...' contains illegal characters` during attach**
 
@@ -350,7 +350,7 @@ Add `manifests/vars.yml`, `manifests/state.json`, `manifests/creds.yml`, and `bo
 
   - **CPI `delete_vm` guard**: before issuing the destroy, the CPI reads the VM config and refuses to proceed if any `unusedN` entry references a volume on `pve_disk_storage`. This catches future SDK regressions or any bypass path.
 
-  Rebuild the release and re-vendor the SDK if seen on an old build. If the LV is already gone, recover by deleting `manifests/state.json` and `manifests/creds.yml` and rerunning `create-env` (a fresh Director with a fresh persistent disk), or by manually re-creating the LV with `pvesm alloc <storage> <vmid> <name> <size>M --format raw` if the Director identity must be preserved.
+  Rebuild the release and re-vendor the SDK if seen on an old build. If the LV is already gone, recover by deleting `manifests/bosh/state.json` and `manifests/bosh/creds.yml` and rerunning `create-env` (a fresh Director with a fresh persistent disk), or by manually re-creating the LV with `pvesm alloc <storage> <vmid> <name> <size>M --format raw` if the Director identity must be preserved.
 
 ## 12. Reference
 

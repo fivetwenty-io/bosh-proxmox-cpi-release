@@ -1070,7 +1070,7 @@ def _cpi_release_version(path: str) -> str:
 
     try:
         with tarfile.open(path, "r:gz") as tf:
-            mf = next((n for n in tf.getnames() if n.endswith("release.MF")), None)
+            mf = next((n for n in tf.getnames() if n in ("release.MF", "./release.MF")), None)
             if mf:
                 member = tf.extractfile(mf)
                 if member is not None:
@@ -1103,7 +1103,7 @@ def _cpi_release_name(path: str) -> str:
 
     try:
         with tarfile.open(path, "r:gz") as tf:
-            mf = next((n for n in tf.getnames() if n.endswith("release.MF")), None)
+            mf = next((n for n in tf.getnames() if n in ("release.MF", "./release.MF")), None)
             if mf:
                 member = tf.extractfile(mf)
                 if member is not None:
@@ -1297,16 +1297,17 @@ def cmd_compile_releases(args: list[str]) -> int:
         sys.exit(f"compile-releases: bosh/{bosh_ver} not on director after upload; check `bosh releases`")
     if include_cpi:
         cpi_path = cpi_release_path()
+        cpi_name = _cpi_release_name(cpi_path)
         cpi_ver = _cpi_release_version(cpi_path)
-        print(f"    uploading source release bosh-proxmox-cpi/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
+        print(f"    uploading source release {cpi_name}/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
         if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
-            sys.exit("compile-releases: upload bosh-proxmox-cpi release failed")
-        if not _release_present(denv, "bosh-proxmox-cpi", cpi_ver):
+            sys.exit(f"compile-releases: upload {cpi_name} release failed")
+        if not _release_present(denv, cpi_name, cpi_ver):
             sys.exit(
-                f"compile-releases: bosh-proxmox-cpi/{cpi_ver} not on director after upload "
+                f"compile-releases: {cpi_name}/{cpi_ver} not on director after upload "
                 f"(release.MF version may differ); check `bosh releases`"
             )
-        targets.append(("bosh-proxmox-cpi", cpi_ver))
+        targets.append((cpi_name, cpi_ver))
 
     # 3. Deploy the no-VM compilation deployment (empty instance_groups).
     rel_lines = "".join(f"- name: {n}\n  version: \"{v}\"\n" for n, v in targets)

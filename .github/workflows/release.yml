@@ -54,7 +54,6 @@ jobs:
       # default GOCACHE would land there -- inside _work/_temp, wiped between
       # jobs and outside the mount above. Point it at the mounted path.
       GOCACHE: /root/.cache/go-build
-      RELEASE_NAME: bosh-proxmox-cpi
       BOSH_CLI_VERSION: "7.10.9"
       # sha256 of bosh-cli-7.10.9-linux-amd64 from cloudfoundry/bosh-cli releases
       BOSH_CLI_SHA256: "b06db2e0ad45c1c24d90726c2e83011b025d5fe5c3dabb9d8af8f87db1f2a89c"
@@ -111,6 +110,20 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
           "${RUNNER_TEMP}/bin/bosh" --version
           "${RUNNER_TEMP}/bin/gh" --version
+
+      - name: Derive release name
+        # config/final.yml's final_name is what `bosh create-release --final`
+        # embeds in release.MF; read it here instead of hardcoding a copy so
+        # the tarball filename and published manifest snippet can't drift
+        # from the name actually embedded in the release.
+        run: |
+          set -euo pipefail
+          RELEASE_NAME="$(bosh int config/final.yml --path /final_name)"
+          if [[ -z "${RELEASE_NAME}" ]]; then
+            echo "ERROR: could not read /final_name from config/final.yml" >&2
+            exit 1
+          fi
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> "${GITHUB_ENV}"
 
       - name: Write blobstore credentials (config/private.yml)
         env:

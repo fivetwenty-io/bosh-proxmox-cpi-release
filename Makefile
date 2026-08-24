@@ -303,12 +303,23 @@ sync-blobs: ## Sync blobs/ from the configured blobstore
 release-build: bin/cpi ## Build Go CPI binary only (no BOSH tarball). Use 'make release' to build the full BOSH tarball.
 	@echo "$(GREEN)✓ CPI binary built: bin/cpi $(VERSION) ($(COMMIT))$(RESET)"
 
+.PHONY: release-name-check
+release-name-check: ## Assert Makefile's RELEASE_NAME matches config/final.yml's final_name (the value embedded in release.MF).
+	@final="$$(bosh int config/final.yml --path /final_name)"; \
+	if [ "$$final" != "$(RELEASE_NAME)" ]; then \
+		echo "$(RED)✗ Makefile RELEASE_NAME ($(RELEASE_NAME)) does not match config/final.yml final_name ($$final)$(RESET)" >&2; \
+		echo "  Update Makefile's RELEASE_NAME to match; a divergence here means the tarball" >&2; \
+		echo "  filename and dev_releases/releases directory name disagree with what" >&2; \
+		echo "  bosh create-release actually embeds in release.MF." >&2; \
+		exit 1; \
+	fi
+
 .PHONY: dev-release
-dev-release: ## Build a dev BOSH release tarball under dev_releases/$(RELEASE_NAME)/ and print RELEASE_TGZ=...
+dev-release: release-name-check ## Build a dev BOSH release tarball under dev_releases/$(RELEASE_NAME)/ and print RELEASE_TGZ=...
 	@./scripts/create-release dev
 
 .PHONY: release
-release: ## Build a versioned BOSH release under dev_releases/ or releases/ (requires VERSION=X.Y.Z). Prints RELEASE_TGZ=<path>.
+release: release-name-check ## Build a versioned BOSH release under dev_releases/ or releases/ (requires VERSION=X.Y.Z). Prints RELEASE_TGZ=<path>.
 	@if [ -z "$(VERSION)" ] || [ "$(VERSION)" = "dev" ]; then \
 		echo "$(YELLOW)ERROR: VERSION= required for a final release (e.g., make release VERSION=1.0.0)$(RESET)" >&2; \
 		echo "$(YELLOW)For a dev tarball use: make dev-release$(RESET)" >&2; \

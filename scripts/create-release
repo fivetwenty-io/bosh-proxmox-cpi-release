@@ -14,7 +14,7 @@
 #       RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-X.tgz
 #   - No writes to manifests/bosh/vars.yml occur. The operator must pass the path
 #     explicitly via bosh int/deploy, e.g.:
-#       bosh int bosh.yml --var release_artifact_path=$RELEASE_TGZ [...]
+#       bosh int bosh.yml --var pve_cpi_release_path=$RELEASE_TGZ [...]
 #   - For a final release: git add + commit + tag v<X.Y.Z>
 #
 # Side effects:
@@ -25,7 +25,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-RELEASE_NAME="bosh-proxmox-cpi"
+# Single source of truth for the release name: config/final.yml's final_name is
+# what `bosh create-release --final` embeds in release.MF. Deriving from it here
+# keeps the tarball filename and this name in lockstep; a hardcoded copy could
+# silently diverge from what release.MF actually carries.
+RELEASE_NAME="$(bosh int config/final.yml --path /final_name)"
+if [[ -z "${RELEASE_NAME}" ]]; then
+  echo "create-release: could not read /final_name from config/final.yml" >&2
+  exit 1
+fi
 VERSION="${1:-dev}"
 
 GREEN='\033[1;32m'
@@ -52,7 +60,7 @@ fi
 
 echo -e "${GREEN}✓ ${TARBALL}${RESET}"
 echo ""
-echo -e "${YELLOW}Set BOSH var: --var release_artifact_path=${TARBALL}${RESET}"
+echo -e "${YELLOW}Set BOSH var: --var pve_cpi_release_path=${TARBALL}${RESET}"
 echo "RELEASE_TGZ=${TARBALL}"
 
 if [[ "${VERSION}" != "dev" ]]; then

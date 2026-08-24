@@ -6,7 +6,7 @@ The `emptyvm` deployment is the minimum smoke test. It boots a single stemcell V
 
 This document covers:
 
-1. The two manifests in `manifests/`: `cloud-config.yml` and `emptyvm.yml`.
+1. The two manifests in `manifests/bosh/`: `cloud-config.yml` and `emptyvm.yml`.
 
 2. Targeting the Director with the BOSH CLI.
 
@@ -18,9 +18,9 @@ This document covers:
 
 ## 1. Manifests
 
-Two files in `manifests/`, both driven by `vars.yml`:
+Two files in `manifests/bosh/`, both driven by `vars.yml`:
 
-### `manifests/cloud-config.yml`
+### `manifests/bosh/cloud-config.yml`
 
 Minimal cloud-config: one AZ, two `vm_types` (`default` for compilation workers, `small` for instances), one `disk_type`, one manual network on the same subnet as the Director, and a compilation pool.
 
@@ -36,7 +36,7 @@ Key fields:
 
 - **`compilation`** — minimal one-AZ pool. Cloud-config validation requires it even when no release will compile.
 
-### `manifests/emptyvm.yml`
+### `manifests/bosh/emptyvm.yml`
 
 One-instance deployment with no jobs and no releases:
 
@@ -73,15 +73,15 @@ The `stemcells[*].os` value must match the stemcell uploaded in step 3 below. Th
 ## 2. Target the Director
 
 ```bash
-DIRECTOR_IP=$(bosh int manifests/vars.yml --path /internal_ip)
+DIRECTOR_IP=$(bosh int manifests/bosh/vars.yml --path /internal_ip)
 
 bosh alias-env pve \
   -e "${DIRECTOR_IP}" \
-  --ca-cert <(bosh int manifests/creds.yml --path /director_ssl/ca)
+  --ca-cert <(bosh int manifests/bosh/creds.yml --path /director_ssl/ca)
 
 export BOSH_ENVIRONMENT=pve
 export BOSH_CLIENT=admin
-export BOSH_CLIENT_SECRET=$(bosh int manifests/creds.yml --path /admin_password)
+export BOSH_CLIENT_SECRET=$(bosh int manifests/bosh/creds.yml --path /admin_password)
 
 bosh env
 ```
@@ -93,14 +93,14 @@ bosh env
 ```bash
 # 3a. Stemcell — same URL/SHA the Director itself was built on
 bosh upload-stemcell \
-  --sha1 $(bosh int manifests/vars.yml --path /stemcell_sha1) \
-  $(bosh int manifests/vars.yml --path /stemcell_url)
+  --sha1 $(bosh int manifests/bosh/vars.yml --path /stemcell_sha1) \
+  $(bosh int manifests/bosh/vars.yml --path /stemcell_url)
 
 # 3b. Cloud config — defines vm_types, networks, az, compilation
-bosh update-cloud-config manifests/cloud-config.yml -l manifests/vars.yml
+bosh update-cloud-config manifests/bosh/cloud-config.yml -l manifests/bosh/vars.yml
 
 # 3c. Deploy
-bosh -d emptyvm deploy manifests/emptyvm.yml -l manifests/vars.yml
+bosh -d emptyvm deploy manifests/bosh/emptyvm.yml -l manifests/bosh/vars.yml
 ```
 
 Watch the task output. A clean run takes roughly one to two minutes and proceeds through:
@@ -191,7 +191,7 @@ The bosh-agent will sit forever in two specific bad states, both producing the s
 Can't find property 'director.cpi_job'
 ```
 
-Set by `manifests/cpi.yml` against `/instance_groups/name=bosh/properties/director/cpi_job: pve_cpi`. Without it, `director.yml.erb` aborts during template rendering. The ops file in this repo includes this op; if you fork it, preserve it.
+Set by `manifests/bosh/cpi.yml` against `/instance_groups/name=bosh/properties/director/cpi_job: pve_cpi`. Without it, `director.yml.erb` aborts during template rendering. The ops file in this repo includes this op; if you fork it, preserve it.
 
 ## 7. Reference
 

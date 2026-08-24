@@ -45,10 +45,17 @@ internal_gw:   192.168.1.1
 internal_ip:   192.168.1.10
 
 # --- Release + stemcell ---------------------------------------------------
-# pve_cpi_release_path and pve_cpi_release_name are supplied by scripts/bosh
-# at deploy time via -v (the name is read from the tarball's release.MF:
-# bosh-proxmox-cpi for current builds, bosh-pve-cpi for published tarballs
-# through v0.4.0).
+# pve_cpi_release_name: default for raw create-env/delete-env invocations that
+# load this file directly. Leave as bosh-proxmox-cpi unless you deploy a
+# published tarball through v0.4.0, which embeds the pre-rename name
+# bosh-pve-cpi: set this to bosh-pve-cpi in that case.
+# scripts/bosh reads the name from the tarball's release.MF and passes it via
+# -v pve_cpi_release_name=..., which overrides this file's value (a CLI -v
+# wins over a -l vars-file entry in bosh), so scripts/bosh create-env/teardown
+# always uses the name embedded in the tarball regardless of this default.
+pve_cpi_release_name: bosh-proxmox-cpi
+
+# pve_cpi_release_path is supplied by scripts/bosh at deploy time via -v.
 # Discovery order:
 #   1. PVE_CPI_RELEASE_PATH env var (set by Concourse to the artifact input
 #      path; set locally to point at a custom build);

@@ -74,7 +74,7 @@ bosh create-env $BOSH_DEPLOYMENT_DIR/bosh.yml \
   --state manifests/bosh/state.json \
   --vars-store manifests/bosh/creds.yml \
   --vars-file manifests/bosh/vars.yml \
-  --var release_artifact_path="$RELEASE_TGZ" \
+  --var pve_cpi_release_path="$RELEASE_TGZ" \
   -o manifests/bosh/cpi.yml
 ```
 
@@ -139,7 +139,7 @@ Specific topics:
   The free-floating and parked detachment strategies, `scripts/disk-audit`, parker VM teardown, and provenance sentinel details.
 
 - [Release workflow](docs/operations.md)
-  Operator workflow for capturing `RELEASE_TGZ` from `scripts/create-release` and passing it via `--var release_artifact_path=...`.
+  Operator workflow for capturing `RELEASE_TGZ` from `scripts/create-release` and passing it via `--var pve_cpi_release_path=...`.
 
 ## Network configuration
 

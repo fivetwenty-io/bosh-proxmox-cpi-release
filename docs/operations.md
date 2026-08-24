@@ -707,7 +707,7 @@ Or equivalently:
 ```bash
 scripts/create-release dev
 # Output ends with:
-#   Set BOSH var: --var release_artifact_path=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
+#   Set BOSH var: --var pve_cpi_release_path=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
 #   RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
 RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-dev-YYYYMMDDHHMMSS.tgz
 ```
@@ -728,7 +728,7 @@ For `bosh create-env`:
 bosh create-env manifests/bosh/bosh.yml \
   --state manifests/bosh/state.json \
   --vars-file manifests/bosh/vars.yml \
-  --var release_artifact_path="$RELEASE_TGZ" \
+  --var pve_cpi_release_path="$RELEASE_TGZ" \
   ...
 ```
 
@@ -737,16 +737,12 @@ For `bosh int` (manifest interpolation only):
 ```bash
 bosh int manifests/bosh/bosh.yml \
   --vars-file manifests/bosh/vars.yml \
-  --var release_artifact_path="$RELEASE_TGZ"
+  --var pve_cpi_release_path="$RELEASE_TGZ"
 ```
 
-`manifests/bosh/vars.yml.example` shows the corresponding variable declaration:
+`manifests/bosh/vars.yml.example` does not declare a `pve_cpi_release_path` key: only a comment notes that `scripts/bosh` supplies it via `-v` at deploy time. Supply it directly with `--var pve_cpi_release_path=...` as shown above; do not route it through an intermediate var. A `pve_cpi_release_path: ((some_other_var))` line in a vars file is not re-interpolated by `bosh` (vars-file values are used as literal substitution sources, not rendered themselves), so that pattern silently fails to resolve.
 
-```yaml
-pve_cpi_release_path: ((release_artifact_path))
-```
-
-Copy `vars.yml.example` to `vars.yml` and leave `pve_cpi_release_path` as the `((release_artifact_path))` placeholder. Supply the actual path via `--var release_artifact_path=...` at runtime. Never commit `vars.yml` — it is listed in `.gitignore`.
+Copy `vars.yml.example` to `vars.yml` and leave `pve_cpi_release_path` unset there; supply it at runtime with `--var pve_cpi_release_path=...` as above. Never commit `vars.yml`; it is listed in `.gitignore`.
 
 ### Hygiene check
 
