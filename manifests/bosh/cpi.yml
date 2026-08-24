@@ -15,9 +15,9 @@
 # (path is read from var pve_cpi_release_path).
 
 - type: replace
-  path: /releases/name=bosh-pve-cpi?
+  path: /releases/name=bosh-proxmox-cpi?
   value:
-    name: bosh-pve-cpi
+    name: bosh-proxmox-cpi
     url: file://((pve_cpi_release_path))
 
 # Stemcell: openstack-kvm jammy works on PVE (qemu/KVM).
@@ -83,7 +83,7 @@
   path: /instance_groups/name=bosh/jobs/-
   value:
     name: pve_cpi
-    release: bosh-pve-cpi
+    release: bosh-proxmox-cpi
     properties:
       agent:
         mbus: nats://((internal_ip)):4222
@@ -127,7 +127,7 @@
   path: /cloud_provider/template?
   value:
     name: pve_cpi
-    release: bosh-pve-cpi
+    release: bosh-proxmox-cpi
 
 - type: replace
   path: /cloud_provider/properties/pve?

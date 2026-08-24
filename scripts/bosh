@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml"]
 # ///
-"""Wrapper around the bosh CLI for the bosh-pve-cpi-release repo.
+"""Wrapper around the bosh CLI for the bosh-proxmox-cpi-release repo.
 
 Subcommands:
     create-env | deploy    bosh create-env for the pve director
@@ -35,7 +35,7 @@ Subcommands:
                            show the SDN zone/vnet/subnet + node bridge state.
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
-    compile-releases       compile bosh + bosh-pve-cpi once against the active
+    compile-releases       compile bosh + bosh-proxmox-cpi once against the active
                            stemcell (no-VM compilation deployment + export-
                            release), store the tarballs (file:// default or S3),
                            and pin them so later create-envs skip compilation.
@@ -115,7 +115,7 @@ CPI_CONFIG = MANIFESTS / "cpi-config.yml"
 EMPTYVM = BOSH_DIR / "emptyvm.yml"
 PVE_GUEST_AGENT_RC = MANIFESTS / "runtime-configs" / "pve-guest-agent.yml"
 ENVS_DIR = MANIFESTS / "envs"
-DEV_RELEASES_DIR = REPO_ROOT / "dev_releases" / "bosh-pve-cpi"
+DEV_RELEASES_DIR = REPO_ROOT / "dev_releases" / "bosh-proxmox-cpi"
 # Compiled-release pipeline (scripts/bosh compile-releases): generated ops file
 # pinning compiled tarballs, and the default local store directory. Both are
 # gitignored — the ops file is environment-specific and the tarballs are large.
@@ -127,7 +127,7 @@ def cpi_release_path() -> str:
     """Resolve the CPI release tarball path for create-env/delete-env.
 
     PVE_CPI_RELEASE_PATH wins when set (Concourse points it at an artifact
-    input). Otherwise pick the newest *.tgz under dev_releases/bosh-pve-cpi/
+    input). Otherwise pick the newest *.tgz under dev_releases/bosh-proxmox-cpi/
     by mtime — the location scripts/create-release writes to.
     """
     override = os.environ.get("PVE_CPI_RELEASE_PATH", "").strip()
@@ -1019,7 +1019,7 @@ def cmd_passthrough(args: list[str]) -> int:
 # ---------------------------------------------------------------------------
 # Compiled-release pipeline (compile-releases)
 #
-# create-env compiles the bosh + bosh-pve-cpi packages on the director VM every
+# create-env compiles the bosh + bosh-proxmox-cpi packages on the director VM every
 # run (~18 min: director-ruby, postgres, the cloud CLIs, the CPI go build).
 # Upstream publishes no compiled bosh release for noble, and the bosh release is
 # not a deployable deployment, so it cannot be export-released directly. This
@@ -1054,11 +1054,11 @@ def _sha256_file(path: str) -> str:
 
 
 def _cpi_release_version(path: str) -> str:
-    """Version of the local bosh-pve-cpi dev release.
+    """Version of the local bosh-proxmox-cpi dev release.
 
     Read from release.MF inside the tarball (the source of truth export-release
     must match); fall back to the create-release filename convention
-    (bosh-pve-cpi-<version>.tgz) if the tarball cannot be read.
+    (bosh-proxmox-cpi-<version>.tgz) if the tarball cannot be read.
     """
     import tarfile
 
@@ -1076,8 +1076,12 @@ def _cpi_release_version(path: str) -> str:
         pass
     stem = Path(path).name
     stem = stem[:-4] if stem.endswith(".tgz") else stem
-    prefix = "bosh-pve-cpi-"
-    return stem[len(prefix):] if stem.startswith(prefix) else stem
+    # Tarballs built before the bosh-proxmox-cpi rename keep the old filename
+    # prefix (on disk and in run records); accept both, current name first.
+    for prefix in ("bosh-proxmox-cpi-", "bosh-pve-cpi-"):
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+    return stem
 
 
 def _store_put(cfg: "_compiled.StoreConfig", local_path: str, basename: str) -> str:
@@ -1203,7 +1207,7 @@ def _bosh_release_pin() -> "tuple[str, str, str]":
 def cmd_compile_releases(args: list[str]) -> int:
     """Compile the heavy create-env releases once and pin the compiled tarballs.
 
-    Compiles bosh + bosh-pve-cpi against the active stemcell via a no-VM
+    Compiles bosh + bosh-proxmox-cpi against the active stemcell via a no-VM
     compilation deployment on the running director, exports the compiled
     tarballs to the configured store (file:// default, or S3-compatible), and
     writes manifests/bosh/compiled-releases.yml so later create-envs skip
@@ -1239,7 +1243,7 @@ def cmd_compile_releases(args: list[str]) -> int:
     # 2. Upload the source release(s) to compile.
     #
     # Only the bosh release is pinned compiled: it runs solely on the Linux
-    # director VM. The bosh-pve-cpi release is NOT compiled by default — create-env
+    # director VM. The bosh-proxmox-cpi release is NOT compiled by default — create-env
     # runs the CPI binary on the LOCAL host (cloud_provider driver), so a
     # Linux-compiled CPI cannot execute on a non-Linux workstation ("cannot execute
     # binary file"). It is left to compile locally for the create-env host's OS.
@@ -1258,15 +1262,15 @@ def cmd_compile_releases(args: list[str]) -> int:
     if include_cpi:
         cpi_path = cpi_release_path()
         cpi_ver = _cpi_release_version(cpi_path)
-        print(f"    uploading source release bosh-pve-cpi/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
+        print(f"    uploading source release bosh-proxmox-cpi/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
         if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
-            sys.exit("compile-releases: upload bosh-pve-cpi release failed")
-        if not _release_present(denv, "bosh-pve-cpi", cpi_ver):
+            sys.exit("compile-releases: upload bosh-proxmox-cpi release failed")
+        if not _release_present(denv, "bosh-proxmox-cpi", cpi_ver):
             sys.exit(
-                f"compile-releases: bosh-pve-cpi/{cpi_ver} not on director after upload "
+                f"compile-releases: bosh-proxmox-cpi/{cpi_ver} not on director after upload "
                 f"(release.MF version may differ); check `bosh releases`"
             )
-        targets.append(("bosh-pve-cpi", cpi_ver))
+        targets.append(("bosh-proxmox-cpi", cpi_ver))
 
     # 3. Deploy the no-VM compilation deployment (empty instance_groups).
     rel_lines = "".join(f"- name: {n}\n  version: \"{v}\"\n" for n, v in targets)

@@ -143,7 +143,10 @@ CC_OPS = CERT_MANIFESTS / "cloud-config-ops.yml"
 CC_CPI_OPS = CERT_MANIFESTS / "cloud-config-cpi-ops.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
-RELEASES_DIR = REPO_ROOT / "releases" / "bosh-pve-cpi"
+RELEASES_DIR = REPO_ROOT / "releases" / "bosh-proxmox-cpi"
+# Tarballs built before the bosh-proxmox-cpi rename live under the old
+# directory name; the committed-release lookup checks both.
+LEGACY_RELEASES_DIR = REPO_ROOT / "releases" / "bosh-pve-cpi"
 DEPS_CPI_RELEASES = _checkouts.DEPS_DIR / "cpi-releases"
 DEPS_BOSH_RELEASES = _checkouts.DEPS_DIR / "bosh-releases"
 
@@ -330,29 +333,50 @@ def resolve_cpi_release(spec: str, side: str, dry_run: bool) -> "tuple[Path, str
             ".tgz, nor an X.Y.Z version"
         )
     version = spec.lstrip("v")
-    committed = RELEASES_DIR / f"bosh-pve-cpi-{version}.tgz"
-    if committed.exists():
-        return committed, version
+    # Releases v0.4.0 and earlier were published under the pre-rename name and
+    # keep their bosh-pve-cpi-<version>.tgz asset filenames forever. Try the
+    # current name first, then fall back to the legacy one, in both the local
+    # releases/ trees and the GitHub release assets, so upgrade certification
+    # against an old tag keeps working.
+    names = [f"bosh-proxmox-cpi-{version}.tgz", f"bosh-pve-cpi-{version}.tgz"]
+    for releases_dir in (RELEASES_DIR, LEGACY_RELEASES_DIR):
+        for name in names:
+            committed = releases_dir / name
+            if committed.exists():
+                return committed, version
 
     DEPS_CPI_RELEASES.mkdir(parents=True, exist_ok=True)
-    tarball = DEPS_CPI_RELEASES / f"bosh-pve-cpi-{version}.tgz"
-    checksum = DEPS_CPI_RELEASES / f"bosh-pve-cpi-{version}.tgz.sha256"
-    if not tarball.exists() or not checksum.exists():
+    tarball = None
+    for name in names:
+        cand = DEPS_CPI_RELEASES / name
+        if cand.exists() and (DEPS_CPI_RELEASES / f"{name}.sha256").exists():
+            tarball = cand
+            break
+    if tarball is None:
         if shutil.which("gh") is None:
             raise RuntimeError(
                 f"CPI release {version} is not committed under releases/ and "
                 "gh is not on PATH to download it from the GitHub release"
             )
-        proc = subprocess.run(
-            ["gh", "release", "download", f"v{version}",
-             "--pattern", f"bosh-pve-cpi-{version}.tgz*",
-             "--dir", str(DEPS_CPI_RELEASES), "--clobber"],
-            cwd=str(REPO_ROOT), capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"gh release download v{version} failed:\n{proc.stderr.strip()}"
+        errors = []
+        for name in names:
+            proc = subprocess.run(
+                ["gh", "release", "download", f"v{version}",
+                 "--pattern", f"{name}*",
+                 "--dir", str(DEPS_CPI_RELEASES), "--clobber"],
+                cwd=str(REPO_ROOT), capture_output=True, text=True,
             )
+            cand = DEPS_CPI_RELEASES / name
+            if proc.returncode == 0 and cand.exists():
+                tarball = cand
+                break
+            errors.append(f"{name}: {proc.stderr.strip()}")
+        if tarball is None:
+            detail = "\n".join(errors)
+            raise RuntimeError(
+                f"gh release download v{version} matched neither asset name:\n{detail}"
+            )
+    checksum = Path(f"{tarball}.sha256")
     if not tarball.exists():
         raise RuntimeError(f"download produced no {tarball}")
     if checksum.exists():

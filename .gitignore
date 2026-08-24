@@ -35,6 +35,7 @@ blobs/
 dev_releases/
 .dev_builds/
 .final_builds/
+bosh-proxmox-cpi-*.tgz
 bosh-pve-cpi-*.tgz
 tmp/
 creds.yml

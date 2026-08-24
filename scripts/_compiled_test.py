@@ -24,8 +24,8 @@ class TestBasename(unittest.TestCase):
     def test_slugs_unsafe_chars(self):
         # '+' in a dev version must not break the filename.
         self.assertEqual(
-            c.compiled_basename("bosh-pve-cpi", "0.1.0+dev.1", "ubuntu-noble", "1.383"),
-            "bosh-pve-cpi-0.1.0-dev.1-ubuntu-noble-1.383.tgz",
+            c.compiled_basename("bosh-proxmox-cpi", "0.1.0+dev.1", "ubuntu-noble", "1.383"),
+            "bosh-proxmox-cpi-0.1.0-dev.1-ubuntu-noble-1.383.tgz",
         )
 
     def test_stemcell_encoded(self):
@@ -127,14 +127,14 @@ class TestOpsGeneration(unittest.TestCase):
         return c.compiled_releases_ops(
             [
                 c.CompiledRelease("bosh", "282.1.13", "file:///cr/bosh.tgz", "sha256:aaa"),
-                c.CompiledRelease("bosh-pve-cpi", "0.1.0", "https://s3/cr/cpi.tgz", "sha256:bbb"),
+                c.CompiledRelease("bosh-proxmox-cpi", "0.1.0", "https://s3/cr/cpi.tgz", "sha256:bbb"),
             ]
         )
 
     def test_replaces_each_release(self):
         ops = self._ops()
         self.assertIn("path: /releases/name=bosh?", ops)
-        self.assertIn("path: /releases/name=bosh-pve-cpi?", ops)
+        self.assertIn("path: /releases/name=bosh-proxmox-cpi?", ops)
 
     def test_carries_url_and_sha(self):
         ops = self._ops()

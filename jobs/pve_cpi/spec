@@ -1,7 +1,7 @@
 ---
 name: pve_cpi
 
-description: "PVE BOSH Cloud Provider Interface"
+description: "BOSH Cloud Provider Interface for Proxmox VE"
 
 templates:
   cpi.erb: bin/cpi

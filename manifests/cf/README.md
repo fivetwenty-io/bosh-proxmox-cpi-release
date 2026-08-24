@@ -62,7 +62,7 @@ cf ssh <app> -c 'hostname'
 ## Deploy
 
 ```bash
-cd ~/w/proxmox/bosh-pve-cpi-release
+cd ~/w/proxmox/bosh-proxmox-cpi-release
 bosh -e pve env                  # confirm login
 ./manifests/cf/deploy.sh         # full pipeline
 ```

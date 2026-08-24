@@ -35,14 +35,15 @@ define require_tool
 endef
 
 # BOSH release packaging
-RELEASE_NAME := bosh-pve-cpi
+RELEASE_NAME := bosh-proxmox-cpi
 # Tarballs are written under dev_releases/ (dev) or releases/ (final), never at the repo root.
 RELEASE_DEV_DIR  := dev_releases/$(RELEASE_NAME)
 RELEASE_ARTIFACT_FIND := find . -type f \( -name 'coverage.*' -o -name '*.prof' -o -name '*.test' \) -not -path './.git/*' -not -path './blobs/*' -not -path './.blobs/*' -not -path './$(SRC_ROOT)/vendor/*' -not -path './dev_releases/*' -not -path './releases/*'
 # Separate find for release tarballs in their canonical output dirs.
 RELEASE_TGZ_FIND := find dev_releases releases -type f -name '*.tgz' 2>/dev/null || true
 # Loose tarballs at the repo root are always erroneous; release-hygiene asserts none exist.
-RELEASE_ROOT_TGZ_FIND := find . -maxdepth 1 -name 'bosh-pve-cpi-*.tgz'
+# Both names checked: pre-rename tarballs can still be lying around locally.
+RELEASE_ROOT_TGZ_FIND := find . -maxdepth 1 \( -name 'bosh-proxmox-cpi-*.tgz' -o -name 'bosh-pve-cpi-*.tgz' \)
 
 # Go sources — prerequisites for bin/cpi so the binary rebuilds whenever any
 # source, go.mod, or go.sum changes (the bare target never rebuilt once built).
@@ -323,12 +324,12 @@ release-clean: ## Remove bin/, coverage artifacts, and release tarballs under de
 	@echo "$(GREEN)✓ release artifacts cleaned$(RESET)"
 
 .PHONY: release-hygiene
-release-hygiene: ## Assert no bosh-pve-cpi-*.tgz exists at the repo root. Exits 1 if any are found.
+release-hygiene: ## Assert no CPI release tarball (either name) exists at the repo root. Exits 1 if any are found.
 	@found="$$($(RELEASE_ROOT_TGZ_FIND))"; \
 	if [ -n "$$found" ]; then \
 		echo "$(YELLOW)ERROR: loose release tarballs found at repo root — must not exist:$(RESET)" >&2; \
 		echo "$$found" >&2; \
-		echo "Run 'make release-clean' or 'rm bosh-pve-cpi-*.tgz' to remove them." >&2; \
+		echo "Run 'make release-clean' or remove the listed tarballs." >&2; \
 		exit 1; \
 	fi
 	@echo "$(GREEN)✓ release hygiene clean — no loose tarballs at repo root$(RESET)"

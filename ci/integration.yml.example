@@ -35,7 +35,7 @@ cf_vars:    manifests/cf/vars.yml     # CF-specific vars including system_domain
 env_name: ""                          # e.g. "lab" to layer manifests/envs/lab
 
 # CPI release tarball path. When unset, scripts/bosh picks the newest tarball
-# under dev_releases/bosh-pve-cpi/*.tgz; set when pointing at a release built
+# under dev_releases/bosh-proxmox-cpi/*.tgz; set when pointing at a release built
 # outside the repo (Concourse artifact path). Honored as PVE_CPI_RELEASE_PATH.
 cpi_release_path: ""
 

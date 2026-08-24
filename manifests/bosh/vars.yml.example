@@ -49,10 +49,10 @@ internal_ip:   192.168.1.10
 # Discovery order:
 #   1. PVE_CPI_RELEASE_PATH env var (set by Concourse to the artifact input
 #      path; set locally to point at a custom build);
-#   2. else the newest tarball under dev_releases/bosh-pve-cpi/*.tgz by mtime
+#   2. else the newest tarball under dev_releases/bosh-proxmox-cpi/*.tgz by mtime
 #      (what `scripts/create-release dev` produces).
 # Override at deploy time when you want a specific build:
-#   PVE_CPI_RELEASE_PATH=/abs/path/to/bosh-pve-cpi-VERSION.tgz \
+#   PVE_CPI_RELEASE_PATH=/abs/path/to/bosh-proxmox-cpi-VERSION.tgz \
 #     ./scripts/bosh create-env
 
 # Ubuntu jammy openstack-kvm stemcell (works on PVE qemu/kvm).

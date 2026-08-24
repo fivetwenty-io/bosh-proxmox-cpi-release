@@ -3,7 +3,7 @@
 # Template for the fly -l params file used when setting the pipeline locally.
 # Copy to ci/params.yml (gitignored), fill in real values, then run:
 #
-#   fly -t lab sp -p bosh-pve-cpi -c ci/pipeline.yml -l ci/params.yml
+#   fly -t lab sp -p bosh-proxmox-cpi -c ci/pipeline.yml -l ci/params.yml
 #
 # In a shared CI environment, store these values in Vault/CredHub instead and
 # reference them as ((var_name)) — Concourse resolves them at runtime without
@@ -12,7 +12,7 @@
 # NEVER commit ci/params.yml to version control.
 
 # Git repository URI for the repo resource.
-repo_uri: https://github.com/your-org/bosh-pve-cpi-release
+repo_uri: https://github.com/your-org/bosh-proxmox-cpi-release
 
 # Proxmox VE API endpoint (with port if non-standard).
 pve_endpoint: https://192.168.1.10:8006

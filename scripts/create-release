@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a BOSH release tarball for bosh-pve-cpi.
+# Build a BOSH release tarball for bosh-proxmox-cpi.
 #
 # Usage:
 #   scripts/create-release            # dev release (timestamped)
@@ -8,10 +8,10 @@
 #   scripts/create-release X.Y.Z      # final release
 #
 # Output contract:
-#   - Tarball is written to dev_releases/bosh-pve-cpi/<name>.tgz (dev) or
-#     releases/bosh-pve-cpi/<name>.tgz (final), matching BOSH directory conventions.
+#   - Tarball is written to dev_releases/bosh-proxmox-cpi/<name>.tgz (dev) or
+#     releases/bosh-proxmox-cpi/<name>.tgz (final), matching BOSH directory conventions.
 #   - The absolute path to the tarball is printed to stdout as the last line:
-#       RELEASE_TGZ=/abs/path/to/bosh-pve-cpi-X.tgz
+#       RELEASE_TGZ=/abs/path/to/bosh-proxmox-cpi-X.tgz
 #   - No writes to manifests/bosh/vars.yml occur. The operator must pass the path
 #     explicitly via bosh int/deploy, e.g.:
 #       bosh int bosh.yml --var release_artifact_path=$RELEASE_TGZ [...]
@@ -25,7 +25,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-RELEASE_NAME="bosh-pve-cpi"
+RELEASE_NAME="bosh-proxmox-cpi"
 VERSION="${1:-dev}"
 
 GREEN='\033[1;32m'

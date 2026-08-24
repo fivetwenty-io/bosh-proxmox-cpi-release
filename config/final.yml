@@ -1,5 +1,5 @@
 ---
-final_name: bosh-pve-cpi
+final_name: bosh-proxmox-cpi
 
 blobstore:
   provider: s3

@@ -54,7 +54,7 @@ jobs:
       # default GOCACHE would land there -- inside _work/_temp, wiped between
       # jobs and outside the mount above. Point it at the mounted path.
       GOCACHE: /root/.cache/go-build
-      RELEASE_NAME: bosh-pve-cpi
+      RELEASE_NAME: bosh-proxmox-cpi
       BOSH_CLI_VERSION: "7.10.9"
       # sha256 of bosh-cli-7.10.9-linux-amd64 from cloudfoundry/bosh-cli releases
       BOSH_CLI_SHA256: "b06db2e0ad45c1c24d90726c2e83011b025d5fe5c3dabb9d8af8f87db1f2a89c"

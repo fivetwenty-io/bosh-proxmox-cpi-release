@@ -187,15 +187,24 @@ jobs:
           TAG="$(gh release view --json tagName --jq .tagName)"
           VERSION="${TAG#v}"
           mkdir -p .deps/cpi-releases
-          gh release download "${TAG}" \
-            --pattern "bosh-pve-cpi-${VERSION}.tgz*" \
-            --dir .deps/cpi-releases --clobber
-          (cd .deps/cpi-releases && sha256sum -c "bosh-pve-cpi-${VERSION}.tgz.sha256")
+          # Tags v0.4.0 and earlier publish their assets under the pre-rename
+          # bosh-pve-cpi-<version>.tgz filenames forever; try the current
+          # asset name first, then fall back to the legacy one.
+          CPI_TARBALL="bosh-proxmox-cpi-${VERSION}.tgz"
+          if ! gh release download "${TAG}" \
+            --pattern "${CPI_TARBALL}*" \
+            --dir .deps/cpi-releases --clobber; then
+            CPI_TARBALL="bosh-pve-cpi-${VERSION}.tgz"
+            gh release download "${TAG}" \
+              --pattern "${CPI_TARBALL}*" \
+              --dir .deps/cpi-releases --clobber
+          fi
+          (cd .deps/cpi-releases && sha256sum -c "${CPI_TARBALL}.sha256")
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           # The director bootstrap and BATS both read this: create-env bakes
           # the CPI it points at, and the BATS report records its basename as
           # the director's CPI provenance.
-          echo "PVE_CPI_RELEASE_PATH=${GITHUB_WORKSPACE}/.deps/cpi-releases/bosh-pve-cpi-${VERSION}.tgz" >> "${GITHUB_ENV}"
+          echo "PVE_CPI_RELEASE_PATH=${GITHUB_WORKSPACE}/.deps/cpi-releases/${CPI_TARBALL}" >> "${GITHUB_ENV}"
 
       - name: Upgrade certification (scripts/certify)
         if: ${{ !inputs.skip_certify }}
