@@ -75,6 +75,8 @@ Required fields:
 
 - `pve_cpi_release_path` (absolute path to the tarball from step 2)
 
+- `pve_cpi_release_name` (the release name embedded in that tarball: `bosh-proxmox-cpi` for releases built from this repo, `bosh-pve-cpi` for published tarballs through v0.4.0). `scripts/bosh` reads it from the tarball automatically; set it only for the raw invocation below.
+
 - `stemcell_url`, `stemcell_sha1` (Ubuntu noble openstack-kvm). Known-good values:
 
   - `stemcell_url: https://bosh.io/d/stemcells/bosh-openstack-kvm-ubuntu-noble?v=1.364`

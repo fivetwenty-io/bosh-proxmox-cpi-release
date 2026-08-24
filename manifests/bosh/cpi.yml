@@ -9,15 +9,23 @@
 #     -o  ~/w/cloudfoundry/bosh-deployment/uaa.yml \
 #     -o  ~/w/cloudfoundry/bosh-deployment/credhub.yml \
 #     -l  manifests/bosh/vars.yml \
-#     -v  director_name=ocfp-mgmt
+#     -v  director_name=ocfp-mgmt \
+#     -v  pve_cpi_release_name=bosh-proxmox-cpi
 #
 # Requires a local release tarball produced by ./scripts/create-release dev
-# (path is read from var pve_cpi_release_path).
+# (path is read from var pve_cpi_release_path; pve_cpi_release_name must match
+# the name embedded in the tarball's release.MF).
 
+# The release name must match the name embedded in the tarball's release.MF:
+# create-env/delete-env refuses a mismatch outright. Published tarballs through
+# v0.4.0 embed the pre-rename name bosh-pve-cpi, so scripts/bosh reads the name
+# from the tarball and supplies it as pve_cpi_release_name (bosh-proxmox-cpi
+# for current releases). The path anchor below never matches an entry in
+# bosh-deployment's bosh.yml, so the trailing ? makes it an append either way.
 - type: replace
   path: /releases/name=bosh-proxmox-cpi?
   value:
-    name: bosh-proxmox-cpi
+    name: ((pve_cpi_release_name))
     url: file://((pve_cpi_release_path))
 
 # Stemcell: openstack-kvm jammy works on PVE (qemu/KVM).
@@ -83,7 +91,7 @@
   path: /instance_groups/name=bosh/jobs/-
   value:
     name: pve_cpi
-    release: bosh-proxmox-cpi
+    release: ((pve_cpi_release_name))
     properties:
       agent:
         mbus: nats://((internal_ip)):4222
@@ -127,7 +135,7 @@
   path: /cloud_provider/template?
   value:
     name: pve_cpi
-    release: bosh-proxmox-cpi
+    release: ((pve_cpi_release_name))
 
 - type: replace
   path: /cloud_provider/properties/pve?

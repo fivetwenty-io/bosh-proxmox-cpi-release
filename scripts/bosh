@@ -360,6 +360,9 @@ def cmd_create_env(args: list[str]) -> int:
         *env_vars_layer(),
         "-v", "director_name=ocfp-mgmt",
         "-v", f"pve_cpi_release_path={release}",
+        # The manifest's release name must match the name embedded in the
+        # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).
+        "-v", f"pve_cpi_release_name={_cpi_release_name(release)}",
         # Light-stemcell overrides win over vars.yml stemcell_url/sha1 so the
         # Director boots from the light tarball (see _ensure_director_light_stemcell).
         *light_vars,
@@ -475,6 +478,9 @@ def cmd_teardown(args: list[str]) -> int:
         *env_vars_layer(),
         "-v", "director_name=ocfp-mgmt",
         "-v", f"pve_cpi_release_path={release}",
+        # The manifest's release name must match the name embedded in the
+        # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).
+        "-v", f"pve_cpi_release_name={_cpi_release_name(release)}",
         f"--state={STATE}",
         f"--vars-store={CREDS}",
         *args,
@@ -1082,6 +1088,36 @@ def _cpi_release_version(path: str) -> str:
         if stem.startswith(prefix):
             return stem[len(prefix):]
     return stem
+
+
+def _cpi_release_name(path: str) -> str:
+    """Release name embedded in the CPI tarball at `path`.
+
+    Published tarballs through v0.4.0 embed the pre-rename name bosh-pve-cpi,
+    and the manifest's release name must match the tarball exactly or
+    create-env/delete-env refuses with "Release name ... does not match the
+    name in release tarball". Read release.MF (authoritative); fall back to
+    the filename prefix, then to the current name.
+    """
+    import tarfile
+
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            mf = next((n for n in tf.getnames() if n.endswith("release.MF")), None)
+            if mf:
+                member = tf.extractfile(mf)
+                if member is not None:
+                    data = member.read().decode("utf-8", "replace")
+                    m = re.search(r"^name:\s*['\"]?([^'\"\n]+)", data, re.M)
+                    if m:
+                        return m.group(1).strip()
+    except (tarfile.TarError, OSError):
+        pass
+    stem = Path(path).name
+    for prefix in ("bosh-proxmox-cpi-", "bosh-pve-cpi-"):
+        if stem.startswith(prefix):
+            return prefix[:-1]
+    return "bosh-proxmox-cpi"
 
 
 def _store_put(cfg: "_compiled.StoreConfig", local_path: str, basename: str) -> str:

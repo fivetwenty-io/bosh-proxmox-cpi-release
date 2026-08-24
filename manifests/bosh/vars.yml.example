@@ -45,7 +45,10 @@ internal_gw:   192.168.1.1
 internal_ip:   192.168.1.10
 
 # --- Release + stemcell ---------------------------------------------------
-# pve_cpi_release_path is supplied by scripts/bosh at deploy time via -v.
+# pve_cpi_release_path and pve_cpi_release_name are supplied by scripts/bosh
+# at deploy time via -v (the name is read from the tarball's release.MF:
+# bosh-proxmox-cpi for current builds, bosh-pve-cpi for published tarballs
+# through v0.4.0).
 # Discovery order:
 #   1. PVE_CPI_RELEASE_PATH env var (set by Concourse to the artifact input
 #      path; set locally to point at a custom build);
