@@ -3,7 +3,7 @@
 # Canonical CI image for bosh-proxmox-cpi-release.
 #
 # Built by .github/workflows/ci-image.yml and pushed to
-# ghcr.io/fivetwenty-io/bosh-pve-cpi-ci. Used by:
+# ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci. Used by:
 #   - the scheduled acceptance workflow (.github/workflows/acceptance.yml),
 #     which runs scripts/certify, scripts/bosh, and scripts/bats
 #   - the Concourse integration task (ci/tasks/integration.yml), which runs

@@ -1,6 +1,6 @@
 # ci/integration.yml.example
 #
-# Non-secret integration test configuration for the BOSH PVE CPI release.
+# Non-secret integration test configuration for the BOSH Proxmox CPI release.
 #
 # Usage:
 #   cp ci/integration.yml.example ci/integration.yml
