@@ -39,6 +39,13 @@ type Deps struct {
 	// "shared on Config.Node" default via the backendResolverOrDefault helper.
 	Resolver      pve.BackendResolver
 	FetchResolver func(rawURL string) (stemcellfetch.Source, stemcellfetch.Reference, error)
+	// NodeEndpoints resolves the direct pveproxy address for node-scoped
+	// storage uploads (stemcell images). Production wiring (main.go)
+	// constructs it from pve.node_endpoints plus /cluster/status discovery;
+	// nil (every test Deps literal that leaves it unset) means uploads take
+	// the proxied path through the configured endpoint, the pre-existing
+	// behavior.
+	NodeEndpoints *pve.NodeEndpointResolver
 	// Inflight holds the per-node in-flight semaphores that gate mutating
 	// handlers when max_inflight_per_node is set. main.go constructs one via
 	// NewInflightRegistry so all handlers share it. Nil (e.g. in test Deps

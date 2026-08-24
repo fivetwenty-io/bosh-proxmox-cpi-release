@@ -44,6 +44,15 @@ const DefaultStorageLockMaxAttempts = 10
 // sub-second so a higher attempt count is cheap and rarely consumed in full.
 const DefaultTransientMaxAttempts = 8
 
+// DefaultStorageUploadMaxAttempts bounds the storage upload retry loops
+// (configdrive ISO, stemcell image). Uploads ride the shared curves through
+// RetryOnTransientOrLock; 30 attempts is roughly 6 minutes on the transient
+// curve (1s x 1.5^n, cap 15s) and roughly 12 minutes lock-dominant (2s x
+// 1.5^n, cap 30s), sized so one create attempt outlasts a deploy-burst
+// overload window that the previous 10-attempt (about 1 minute) budget did
+// not. retry.storage_upload.max_attempts overrides it when > 0.
+const DefaultStorageUploadMaxAttempts = 30
+
 // DefaultDiskMigrateMaxAttempts bounds transient retries of the cross-node
 // migrate request MigrateDiskViaMover issues (retry.disk_migrate.max_attempts
 // overrides it when > 0). Deliberately the same small bound as

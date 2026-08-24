@@ -11,10 +11,12 @@ import (
 )
 
 // clusterStatusPeer is the minimal shape needed from GET /cluster/status rows
-// for VXLAN peer derivation. The "online" field is an integer in the PVE API
-// (1 = online, 0 = offline); "ip" is present only on type=node rows.
+// for VXLAN peer derivation and node-address discovery. The "online" field is
+// an integer in the PVE API (1 = online, 0 = offline); "ip" and "name" are
+// present only on type=node rows.
 type clusterStatusPeer struct {
 	Type   string `json:"type"`
+	Name   string `json:"name"`
 	IP     string `json:"ip"`
 	Online int64  `json:"online"`
 }
@@ -70,4 +72,54 @@ func ClusterNodePeerIPs(ctx context.Context, c Client) ([]string, error) {
 	}
 	sort.Strings(peers)
 	return peers, nil
+}
+
+// ClusterNodeAddressMap returns node name to management IP for all online
+// cluster nodes from GET /cluster/status. It backs direct-to-node upload
+// routing (see NodeEndpointResolver) when the operator has not mapped a node
+// in pve.node_endpoints explicitly.
+//
+// The "ip" field is the corosync link0 address; on clusters running corosync
+// on a dedicated ring separate from management, that address is not where
+// pveproxy listens, which is exactly what the explicit pve.node_endpoints
+// override exists for. Offline nodes are excluded (an upload targeting an
+// offline node fails identically either way), and malformed or nameless rows
+// are skipped. An empty map is not an error.
+func ClusterNodeAddressMap(ctx context.Context, c Client) (map[string]string, error) {
+	if ctx == nil {
+		return nil, cpierrors.Cloud("ClusterNodeAddressMap: ctx must not be nil")
+	}
+	if c == nil {
+		return nil, cpierrors.Cloud("ClusterNodeAddressMap: client must not be nil")
+	}
+	svc := c.Cluster()
+	if svc == nil {
+		return nil, cpierrors.Cloud("ClusterNodeAddressMap: cluster service unavailable")
+	}
+
+	var resp *sdkcluster.ListStatusResponse
+	err := RetryOnTransient(ctx, nil, "node_endpoints_cluster_status", 0, func() error {
+		var inner error
+		resp, inner = svc.ListStatus(ctx)
+		return inner
+	})
+	if err != nil {
+		return nil, cpierrors.Wrap(WrapError(err), "node endpoints: list cluster status")
+	}
+	if resp == nil {
+		return nil, cpierrors.Cloud("node endpoints: nil response from cluster status")
+	}
+
+	addrs := make(map[string]string, len(*resp))
+	for _, raw := range *resp {
+		var item clusterStatusPeer
+		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
+			continue
+		}
+		if item.Type != resourceTypeNode || item.Online != 1 || item.Name == "" || item.IP == "" {
+			continue
+		}
+		addrs[item.Name] = item.IP
+	}
+	return addrs, nil
 }

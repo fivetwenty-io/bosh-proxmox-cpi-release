@@ -3233,14 +3233,35 @@ func uploadStemcellImage(
 	// which Go's transport rejects ("http: ContentLength=N with Body length
 	// 0"). Our outer RetryOnTransientOrLock reopens the file each iteration
 	// so transient failures retry with a fresh stream.
-	uploadCtx := sdkclient.WithRetries(ctx, 0)
+	//
+	// Direct-to-node routing: when deps.NodeEndpoints maps the target node,
+	// the upload POST, its UPID await, and the pre-retry await/sweep all dial
+	// that node's own pveproxy instead of letting the configured endpoint
+	// proxy the multipart POST cross-node (the hop sheds connections under
+	// burst load; the replication fan-out pushes the same image to every
+	// node, so it benefits most). Reading the target node's own task list
+	// also gives read-your-write consistency for the task the upload just
+	// created there. The override presumes TLS fingerprint pinning stays
+	// unset in buildTransportOpts; enabling any pinning option makes the SDK
+	// reject overridden requests.
+	pinnedCtx := ctx
+	directHost := ""
+	if h, ok := deps.NodeEndpoints.HostFor(ctx, node); ok {
+		pinnedCtx = pve.UploadContext(ctx, h)
+		directHost = h
+		deps.Log(ctx).Debug("create_stemcell: uploading directly to the target node",
+			log.String("node", node),
+			log.String("direct_host", h),
+		)
+	}
+	uploadCtx := sdkclient.WithRetries(pinnedCtx, 0)
 	firstAttempt := true
 	pendingUPID := ""    // prior attempt's upload task whose completion is unresolved
 	sweepNeeded := false // evidence exists that OUR prior attempt wrote (part of) the file
-	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", 0, func() error {
+	run := func() error {
 		if !firstAttempt {
 			if pendingUPID != "" {
-				committed, awaitErr := awaitPriorUploadTask(ctx, deps, node, filename, pendingUPID)
+				committed, awaitErr := awaitPriorUploadTask(pinnedCtx, deps, node, filename, pendingUPID)
 				if committed {
 					return nil
 				}
@@ -3251,7 +3272,7 @@ func uploadStemcellImage(
 				sweepNeeded = true
 			}
 			if sweepNeeded {
-				if sweepErr := sweepUploadTarget(ctx, deps, node, storageName, filename); sweepErr != nil {
+				if sweepErr := sweepUploadTarget(pinnedCtx, deps, node, storageName, filename); sweepErr != nil {
 					return sweepErr
 				}
 				sweepNeeded = false
@@ -3276,7 +3297,7 @@ func uploadStemcellImage(
 			return nil
 		}
 		pendingUPID = upid
-		aerr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx),
+		aerr := pve.AwaitTaskWithLogger(pinnedCtx, deps.PVE, node, upid, deps.Log(ctx),
 			pve.WithMaxWait(pve.StemcellMaxWait))
 		if aerr == nil {
 			pendingUPID = ""
@@ -3287,6 +3308,27 @@ func uploadStemcellImage(
 			sweepNeeded = true
 		}
 		return aerr
+	}
+	rerr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "create_stemcell_upload", pve.StorageUploadMaxAttempts(), func() error {
+		err := run()
+		if err != nil && directHost != "" && pve.IsTLSCertVerificationFailure(err) {
+			// The node certificate does not cover the routed address. Nothing
+			// was sent when the handshake failed (a TLS verification failure
+			// never sets sweepNeeded), so re-running un-pinned through the
+			// configured endpoint (the pre-existing path) is safe, and the
+			// remaining attempts stay un-pinned.
+			deps.Log(ctx).Warn("create_stemcell: direct-to-node dial failed TLS certificate verification; falling back to the configured endpoint",
+				log.String("node", node),
+				log.String("direct_host", directHost),
+				log.String("hint", "map this node in pve.node_endpoints to an address its certificate SANs cover"),
+				log.Err(err),
+			)
+			directHost = ""
+			pinnedCtx = ctx
+			uploadCtx = sdkclient.WithRetries(ctx, 0)
+			err = run()
+		}
+		return err
 	})
 	if rerr != nil {
 		// WrapErrorKeepingClass: rerr is the raw last error out of the retry

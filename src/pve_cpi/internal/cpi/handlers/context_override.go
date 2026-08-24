@@ -73,6 +73,15 @@ type RequestOverrideRuntime struct {
 	// (deps.Log(ctx)) so it carries request_id/method/trace correlation.
 	Logger *log.Logger
 
+	// BaseHost is the job-level pve.host. An override bundle inherits the
+	// job-level node_endpoints map only when its effective host equals this
+	// value: the map's node names belong to the job-level cluster, and an
+	// override routed at a different cluster must not dial the job-level
+	// cluster's addresses for same-named nodes. Discovery (gated on the
+	// effective config's verify_ssl) still applies either way, since it asks
+	// the override's own cluster.
+	BaseHost string
+
 	// MaxCachedBundles caps the number of distinct override identities (see
 	// requestOverrideCacheKey) whose PVE client/agent/resolver bundle stays
 	// cached at once. Each bundle holds a live pve.Client with its own
@@ -110,9 +119,10 @@ type buildCall struct {
 // identity reuses it, unless it was evicted (see MaxCachedBundles) in the
 // meantime, in which case it is rebuilt.
 type overrideBundle struct {
-	client   pve.Client
-	agent    agent.Agent
-	resolver pve.BackendResolver
+	client        pve.Client
+	agent         agent.Agent
+	resolver      pve.BackendResolver
+	nodeEndpoints *pve.NodeEndpointResolver
 }
 
 // overrideCacheEntry is the value stored in each lru list element, carrying
@@ -332,7 +342,16 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	cfgForBoot.AgentMode = cfg.BootAgentMode()
 	cfgForBoot.ISOStorage = agent.ResolveISOStorage(ctx, &cfgForBoot, client, logger)
 
-	bootAgent, err := agent.NewAgent(&cfgForBoot, client, logger)
+	// See RequestOverrideRuntime.BaseHost: the explicit node_endpoints map
+	// names nodes of the job-level cluster, so it applies only when this
+	// bundle targets that same host.
+	explicitEndpoints := cfg.NodeEndpoints
+	if cfg.Host != r.BaseHost {
+		explicitEndpoints = nil
+	}
+	nodeEndpoints := pve.NewNodeEndpointResolver(client, explicitEndpoints, cfg.Host, !cfg.VerifySSLValue(), logger)
+
+	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
 	if err != nil {
 		return nil, fmt.Errorf("build boot agent: %w", err)
 	}
@@ -344,7 +363,7 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), ttl)
 	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node)
 
-	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver}, nil
+	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver, nodeEndpoints: nodeEndpoints}, nil
 }
 
 // requestOverrideCacheKey derives a stable identity string from exactly the
@@ -586,5 +605,6 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	d.PVE = bundle.client
 	d.Agent = bundle.agent
 	d.Resolver = bundle.resolver
+	d.NodeEndpoints = bundle.nodeEndpoints
 	return d, nil
 }

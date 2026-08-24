@@ -66,11 +66,16 @@ type ConfigDrive struct {
 	storage string
 	pveSvc  pve.Client
 	logger  *log.Logger
+	// nodeEndpoints resolves the direct pveproxy address for the upload's
+	// target node; nil (every test that does not care) means the upload takes
+	// the proxied path through the configured endpoint.
+	nodeEndpoints *pve.NodeEndpointResolver
 }
 
 // NewConfigDrive constructs a ConfigDrive bound to the given PVE client.
-// pveClient, logger must not be nil; storage must not be empty.
-func NewConfigDrive(pveClient pve.Client, storage string, logger *log.Logger) *ConfigDrive {
+// pveClient, logger must not be nil; storage must not be empty; nodeEndpoints
+// may be nil (no direct-to-node upload routing).
+func NewConfigDrive(pveClient pve.Client, storage string, nodeEndpoints *pve.NodeEndpointResolver, logger *log.Logger) *ConfigDrive {
 	// invariant violation: nil pve.Client at construction; cannot occur at runtime
 	if pveClient == nil {
 		panic("agent: NewConfigDrive: pveClient must not be nil")
@@ -84,9 +89,10 @@ func NewConfigDrive(pveClient pve.Client, storage string, logger *log.Logger) *C
 		panic("agent: NewConfigDrive: storage must not be empty")
 	}
 	return &ConfigDrive{
-		storage: storage,
-		pveSvc:  pveClient,
-		logger:  logger,
+		storage:       storage,
+		pveSvc:        pveClient,
+		logger:        logger,
+		nodeEndpoints: nodeEndpoints,
 	}
 }
 
@@ -235,9 +241,30 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 	// transport rejects with "http: ContentLength=N with Body length 0".
 	// Our outer RetryOnTransientOrLock reopens the file each iteration,
 	// so transient failures are still retried with a fresh stream.
-	uploadCtx := sdkclient.WithRetries(ctx, 0)
+	//
+	// Direct-to-node routing: when the resolver maps the target node, the
+	// upload POST, its UPID await, and the pre-retry sweep all dial that
+	// node's own pveproxy instead of letting the configured endpoint proxy
+	// the multipart POST cross-node (the hop sheds connections under burst
+	// load, and reading the target node's own task list gives read-your-write
+	// consistency for the task the upload just created there). The attach and
+	// everything else stay on the plain ctx: VM config writes go through
+	// pmxcfs and gain nothing from pinning. The override presumes TLS
+	// fingerprint pinning stays unset in buildTransportOpts; enabling any
+	// pinning option makes the SDK reject overridden requests.
+	pinnedCtx := ctx
+	directHost := ""
+	if h, ok := a.nodeEndpoints.HostFor(ctx, node); ok {
+		pinnedCtx = pve.UploadContext(ctx, h)
+		directHost = h
+		a.logger.Debug("configdrive: uploading directly to the target node",
+			log.String("node", node),
+			log.String("direct_host", h),
+		)
+	}
+	uploadCtx := sdkclient.WithRetries(pinnedCtx, 0)
 	firstAttempt := true
-	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", 0, func() error {
+	return pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_upload", pve.StorageUploadMaxAttempts(), func() error {
 		// A retry means the previous POST died mid-flight (connection drop,
 		// lock timeout). PVE may still have committed the file after the drop,
 		// and a duplicate `content=iso` upload is rejected with HTTP 409, so
@@ -249,7 +276,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 		// retryable fault into a permanent 409. Only a permanently-failing
 		// sweep proceeds best-effort, leaving the upload to surface the truth.
 		if !firstAttempt {
-			if _, rmErr := a.removeISOIfExists(ctx, node, filename); rmErr != nil {
+			if _, rmErr := a.removeISOIfExists(pinnedCtx, node, filename); rmErr != nil {
 				if pve.IsRetryableOrLockFault(rmErr) {
 					return rmErr
 				}
@@ -262,20 +289,41 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 		}
 		firstAttempt = false
 
-		f, openErr := os.Open(localPath) // #nosec G304 -- localPath is CPI-owned MkdirTemp output
-		if openErr != nil {
-			return fmt.Errorf("open local iso: %w", openErr)
-		}
-		defer func() { _ = f.Close() }()
+		attempt := func(upCtx context.Context) error {
+			f, openErr := os.Open(localPath) // #nosec G304 -- localPath is CPI-owned MkdirTemp output
+			if openErr != nil {
+				return fmt.Errorf("open local iso: %w", openErr)
+			}
+			defer func() { _ = f.Close() }()
 
-		upid, err := a.pveSvc.Storage().Upload(uploadCtx, node, a.storage, "iso", filename, f)
-		if err != nil {
-			return pve.WrapError(err)
+			upid, err := a.pveSvc.Storage().Upload(upCtx, node, a.storage, "iso", filename, f)
+			if err != nil {
+				return pve.WrapError(err)
+			}
+			if upid == "" {
+				return nil
+			}
+			return pve.AwaitTaskWithLogger(pinnedCtx, a.pveSvc, node, upid, a.logger)
 		}
-		if upid == "" {
-			return nil
+
+		err := attempt(uploadCtx)
+		if err != nil && directHost != "" && pve.IsTLSCertVerificationFailure(err) {
+			// The node certificate does not cover the routed address. Nothing
+			// was sent when the handshake failed, so re-attempting un-pinned
+			// through the configured endpoint (the pre-existing path) needs no
+			// pre-sweep, and the remaining attempts stay un-pinned.
+			a.logger.Warn("configdrive: direct-to-node dial failed TLS certificate verification; falling back to the configured endpoint",
+				log.String("node", node),
+				log.String("direct_host", directHost),
+				log.String("hint", "map this node in pve.node_endpoints to an address its certificate SANs cover"),
+				log.Err(err),
+			)
+			directHost = ""
+			pinnedCtx = ctx
+			uploadCtx = sdkclient.WithRetries(ctx, 0)
+			err = attempt(uploadCtx)
 		}
-		return pve.AwaitTaskWithLogger(ctx, a.pveSvc, node, upid, a.logger)
+		return err
 	})
 }
 

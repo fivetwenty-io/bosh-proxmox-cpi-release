@@ -483,7 +483,13 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// normally. All other modes pass cfg unchanged.
 	cfgForBoot := *cfg
 	cfgForBoot.AgentMode = cfg.BootAgentMode()
-	bootAgent, err := agent.NewAgent(&cfgForBoot, client, logger)
+	// Direct-to-node upload routing: explicit pve.node_endpoints entries win,
+	// /cluster/status discovery fills the rest when TLS verification is off
+	// (the discovered corosync IP is usually absent from stock node cert
+	// SANs). Shared by the boot agent (ConfigDrive ISO uploads) and Deps
+	// (stemcell image uploads).
+	nodeEndpoints := pve.NewNodeEndpointResolver(client, cfg.NodeEndpoints, cfg.Host, !cfg.VerifySSLValue(), logger)
+	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))
 		return 1
@@ -577,6 +583,11 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// (DefaultTransientMaxAttempts) stays in force.
 	pve.ConfigureTransientRetry(cfg.RetryTransientMaxAttempts())
 
+	// Apply the operator's storage upload attempt budget process-wide. With
+	// an unset retry.storage_upload block this is 0 and the shipped default
+	// (DefaultStorageUploadMaxAttempts) stays in force.
+	pve.ConfigureStorageUploadRetry(cfg.RetryStorageUploadMaxAttempts())
+
 	// The transient classifier backs dispatchError's last-resort fallback:
 	// a raw transport error a handler failed to classify still surfaces as
 	// retriable. Wired here because internal/cpi cannot import internal/pve.
@@ -626,17 +637,19 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		ClientFactory: func(effCfg *config.CPIConfig, effLogger *log.Logger) (pve.Client, error) {
 			return clientFactory(effCfg, effLogger, clientTracer)
 		},
-		Logger: logger,
+		Logger:   logger,
+		BaseHost: cfg.Host,
 	}
 
 	handlers.RegisterAll(d, handlers.Deps{
-		Config:    cfg,
-		PVE:       client,
-		Agent:     bootAgent,
-		Logger:    logger,
-		Resolver:  backendResolver,
-		Inflight:  handlers.NewInflightRegistry(),
-		Overrides: overrideRuntime,
+		Config:        cfg,
+		PVE:           client,
+		Agent:         bootAgent,
+		Logger:        logger,
+		Resolver:      backendResolver,
+		NodeEndpoints: nodeEndpoints,
+		Inflight:      handlers.NewInflightRegistry(),
+		Overrides:     overrideRuntime,
 	})
 
 	maxLine := opts.MaxLineBytes

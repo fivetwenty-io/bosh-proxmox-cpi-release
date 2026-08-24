@@ -36,6 +36,22 @@ properties:
     default: "pam"
   pve.node:
     description: "Default PVE node"
+  pve.node_endpoints:
+    description: |
+      Optional map of PVE node name to the address (host or host:port, no
+      scheme, no path) that node's own pveproxy is reachable at. Storage
+      uploads targeting a mapped node (stemcell images, per-VM ConfigDrive
+      ISOs) dial it directly instead of letting the pve.host endpoint proxy
+      the multipart POST cross-node, a hop that sheds connections under
+      burst load. Nodes absent from the map are discovered from
+      /cluster/status when verify_ssl is false; with verify_ssl true we only
+      route nodes listed here, because the discovered address is the corosync
+      link0 IP and stock PVE node certificates usually do not carry it as a
+      SAN. Prefer hostnames or FQDNs the node certificate covers. When a
+      direct dial fails TLS certificate verification, the upload falls back
+      to the pve.host endpoint and logs a warning.
+      Example: {pve02: pve02.example.com, pve03: 10.0.0.13:8006}
+    default: {}
   pve.vm_storage:
     description: "Storage pool for VMs"
   pve.disk_storage:
@@ -1650,6 +1666,16 @@ properties:
       (default) applies the built-in budget of 8. The backoff curve for this
       class is fixed (1s growing to 15s, plus/minus 30 percent jitter) and
       is not configurable.
+    default: 0
+
+  pve.retry.storage_upload.max_attempts:
+    description: |
+      Maximum attempts for the storage upload retry loops (stemcell image
+      and per-VM ConfigDrive ISO uploads). Zero (default) applies the
+      built-in budget of 30, roughly six minutes on the transient backoff
+      curve. Each attempt reopens the file and re-sends the upload; the
+      backoff curve is selected per fault from the shared transient and
+      storage-lock curves and is not configurable per upload.
     default: 0
 
   pve.retry.storage_lock.max_attempts:

@@ -50,7 +50,7 @@ func TestNewAgent_Cloudinit_ReturnsConfigDrive(t *testing.T) {
 	cfg := minimalCfg("cloudinit")
 	cfg.VMStorage = "local"
 
-	a, err := NewAgent(cfg, newFakePVE(), log.NewNopLogger())
+	a, err := NewAgent(cfg, newFakePVE(), nil, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("NewAgent(cloudinit): unexpected error: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestNewAgent_NoAgent(t *testing.T) {
 	t.Parallel()
 	cfg := minimalCfg("noagent")
 
-	a, err := NewAgent(cfg, nil, log.NewNopLogger())
+	a, err := NewAgent(cfg, nil, nil, log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("NewAgent(noagent): unexpected error: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestNewAgent_UnknownMode(t *testing.T) {
 	t.Parallel()
 	cfg := minimalCfg("bogus")
 
-	_, err := NewAgent(cfg, nil, log.NewNopLogger())
+	_, err := NewAgent(cfg, nil, nil, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("NewAgent(bogus): expected error, got nil")
 	}
@@ -94,7 +94,7 @@ func TestNewAgent_CloudinitStorageFallback(t *testing.T) {
 		cfg.VMStorage = "local"
 		cfg.StemcellStorage = "stemcell-store"
 
-		a, err := NewAgent(cfg, newFakePVE(), log.NewNopLogger())
+		a, err := NewAgent(cfg, newFakePVE(), nil, log.NewNopLogger())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -113,7 +113,7 @@ func TestNewAgent_CloudinitStorageFallback(t *testing.T) {
 		cfg.VMStorage = "vm-store"
 		cfg.StemcellStorage = ""
 
-		a, err := NewAgent(cfg, newFakePVE(), log.NewNopLogger())
+		a, err := NewAgent(cfg, newFakePVE(), nil, log.NewNopLogger())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -129,7 +129,7 @@ func TestNewAgent_CloudinitStorageFallback(t *testing.T) {
 
 func TestNewAgent_NilCfg(t *testing.T) {
 	t.Parallel()
-	_, err := NewAgent(nil, nil, log.NewNopLogger())
+	_, err := NewAgent(nil, nil, nil, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected error for nil cfg")
 	}
@@ -137,7 +137,7 @@ func TestNewAgent_NilCfg(t *testing.T) {
 
 func TestNewAgent_NilLogger(t *testing.T) {
 	t.Parallel()
-	_, err := NewAgent(minimalCfg("noagent"), nil, nil)
+	_, err := NewAgent(minimalCfg("noagent"), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil logger")
 	}

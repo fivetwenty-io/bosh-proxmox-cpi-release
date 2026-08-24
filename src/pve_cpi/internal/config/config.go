@@ -31,6 +31,15 @@ type CPIConfig struct {
 	Realm    string `json:"realm,omitempty"`
 	Node     string `json:"node,omitempty"`
 
+	// NodeEndpoints maps a PVE node name to the address (host or host:port,
+	// no scheme, no path) its own pveproxy is reachable at. Storage uploads
+	// targeting that node dial it directly instead of letting the configured
+	// endpoint's pveproxy proxy the multipart POST cross-node, a hop that
+	// sheds connections under burst load. Nodes absent from the map fall back
+	// to /cluster/status discovery when verify_ssl is disabled, else to the
+	// proxied path. See pve.NodeEndpointResolver.
+	NodeEndpoints map[string]string `json:"node_endpoints,omitempty"`
+
 	// Storage
 	VMStorage   string `json:"vm_storage"`
 	DiskStorage string `json:"disk_storage"`
@@ -1186,6 +1195,14 @@ type RetryConfig struct {
 	// Defaults: max_attempts 0 (→ DefaultStorageLockMaxAttempts), base_ms 2000,
 	// cap_ms 30000, jitter_pct 30.
 	StorageLock *RetryPolicy `json:"storage_lock,omitempty"`
+
+	// StorageUpload governs the attempt budget for the storage upload loops
+	// (configdrive ISO, stemcell image). Only max_attempts is consulted; the
+	// backoff curve is selected per fault by RetryOnTransientOrLock from the
+	// shared TransientBackoff / StorageLockBackoff curves, and
+	// base_ms/cap_ms/jitter_pct are ignored. Default: max_attempts 0 →
+	// pve.DefaultStorageUploadMaxAttempts (30).
+	StorageUpload *RetryPolicy `json:"storage_upload,omitempty"`
 
 	// DiskMigrate governs the cross-node offline migration attach_disk runs
 	// when pve.disk_migration resolves to "on_attach" and a persistent disk
@@ -3639,6 +3656,18 @@ func (c *CPIConfig) RetryTransientMaxAttempts() int {
 	return p.MaxAttempts
 }
 
+// RetryStorageUploadMaxAttempts returns the operator's override for the
+// storage upload attempt budget, or 0 when unset so callers keep
+// pve.DefaultStorageUploadMaxAttempts. Only max_attempts is meaningful for
+// this class (see the RetryConfig.StorageUpload doc comment).
+func (c *CPIConfig) RetryStorageUploadMaxAttempts() int {
+	p := c.retryPolicyOf(func(r *RetryConfig) *RetryPolicy { return r.StorageUpload })
+	if p == nil {
+		return 0
+	}
+	return p.MaxAttempts
+}
+
 // OperationTimeoutEnabled reports whether the per-method deadline envelope is
 // active. Returns false when the block is nil, Enabled is nil, or Enabled is
 // *false. Only an explicit *true returns true.
@@ -3803,6 +3832,7 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateEnumFields(&errs)
 	c.validateSDNFields(&errs)
 	c.validateRanges(&errs)
+	c.validateNodeEndpoints(&errs)
 	c.validatePlacement(&errs)
 	c.validateStorage(&errs)
 	c.validateHooks(&errs)
@@ -4479,6 +4509,48 @@ func (c *CPIConfig) appendStemcellFetchTimeoutErrors(errs *[]string) {
 	check("stemcell_fetch_idle_conn_timeout_sec", c.StemcellFetchIdleConnTimeoutSec)
 }
 
+// validateNodeEndpoints validates the optional node_endpoints map. Skipped
+// entirely when the map is empty (validate-only-when-set). Keys must be
+// non-empty node names; values must be a bare host or host:port with no
+// scheme and no path, and any port must parse in 1-65535. Node names are not
+// checked for cluster membership; an entry naming a node that never appears
+// at runtime is simply unused.
+func (c *CPIConfig) validateNodeEndpoints(errs *[]string) {
+	for node, addr := range c.NodeEndpoints {
+		if strings.TrimSpace(node) == "" {
+			*errs = append(*errs, "node_endpoints keys must be non-empty node names")
+			continue
+		}
+		if strings.TrimSpace(addr) == "" {
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must not be empty", node))
+			continue
+		}
+		if strings.Contains(addr, "://") {
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a scheme, got %q", node, addr))
+			continue
+		}
+		if strings.Contains(addr, "/") {
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port without a path, got %q", node, addr))
+			continue
+		}
+		if host, port, err := net.SplitHostPort(addr); err == nil {
+			if strings.TrimSpace(host) == "" {
+				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must carry a host before the port, got %q", node, addr))
+				continue
+			}
+			n, convErr := strconv.Atoi(port)
+			if convErr != nil || n < 1 || n > 65535 {
+				*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] port must be 1-65535, got %q", node, port))
+			}
+		} else if strings.Count(addr, ":") == 1 {
+			// One colon but SplitHostPort rejected it: a malformed host:port
+			// (empty port, stray colon). More colons without brackets is a bare
+			// IPv6 literal, accepted as a host; the SDK brackets it when dialing.
+			*errs = append(*errs, fmt.Sprintf("node_endpoints[%q] must be host or host:port, got %q", node, addr))
+		}
+	}
+}
+
 // validatePlacement validates the optional Placement block. Skipped entirely
 // when Placement is nil (validate-only-when-set). Checks:
 //   - AZMap: every AZ name is non-empty (always true by map key semantics),
@@ -4798,6 +4870,7 @@ func (c *CPIConfig) validateRetry(errs *[]string) {
 	checkRaw("task_poll", c.Retry.TaskPoll)
 	checkRaw("pushback", c.Retry.Pushback)
 	checkRaw("transient", c.Retry.Transient)
+	checkRaw("storage_upload", c.Retry.StorageUpload)
 	checkRaw("storage_lock", c.Retry.StorageLock)
 	// disk_migrate consults only max_attempts and cap_ms (a wall-clock await
 	// budget, not a backoff ceiling), so like transient it gets the raw-bounds

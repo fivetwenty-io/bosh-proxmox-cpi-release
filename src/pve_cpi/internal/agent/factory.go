@@ -23,8 +23,12 @@ import (
 //   - any other   → *errors.Error of type NotSupported.
 //
 // cfg and logger must not be nil. pveClient may be nil only when
-// cfg.AgentMode == "noagent".
-func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (Agent, error) {
+// cfg.AgentMode == "noagent". nodeEndpoints routes ConfigDrive ISO uploads
+// directly to the target node's pveproxy; nil disables routing (uploads take
+// the proxied path through the configured endpoint). Callers construct it
+// alongside the pve.Client so a per-request override bundle's agent routes
+// within its own cluster (see handlers.RequestOverrideRuntime.BaseHost).
+func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, nodeEndpoints *pve.NodeEndpointResolver, logger *log.Logger) (Agent, error) {
 	if cfg == nil {
 		return nil, cpierrors.Cloud("agent.NewAgent: cfg must not be nil")
 	}
@@ -50,7 +54,7 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (
 		if isoStorage == "" {
 			return nil, cpierrors.Cloud("agent.NewAgent: cloudinit mode requires ISOStorage, StemcellStorage, or VMStorage to be set")
 		}
-		return NewConfigDrive(pveClient, isoStorage, logger), nil
+		return NewConfigDrive(pveClient, isoStorage, nodeEndpoints, logger), nil
 
 	case config.AgentModeNoAgent:
 		if cfg.ISOStorage != "" {

@@ -614,6 +614,11 @@
   end
   config["debug"] = debug unless debug.empty?
 
+  # Direct-to-node upload routing map (node name => host or host:port).
+  # Omitted when empty so uploads keep the discovery-or-proxied behavior.
+  node_endpoints = p("pve.node_endpoints", {})
+  config["node_endpoints"] = node_endpoints unless node_endpoints.nil? || node_endpoints.empty?
+
   # Emit the retry block only when the operator overrides at least one curve.
   # Each sub-policy and field is omit-when-zero so an untouched curve keeps the
   # Go accessor's shipped default (byte-identical to prior releases).
@@ -624,6 +629,7 @@
     "task_poll"      => ["base_ms", "cap_ms", "jitter_pct"],
     "pushback"       => ["base_ms", "cap_ms"],
     "transient"      => ["max_attempts"],
+    "storage_upload" => ["max_attempts"],
     "storage_lock"   => ["max_attempts", "base_ms", "cap_ms", "jitter_pct"],
     "disk_migrate"   => ["max_attempts", "cap_ms"],
   }.each do |klass, fields|
