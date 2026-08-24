@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 10
     # Not PR-triggered, but keep the head-repo guard shape used by every
     # workflow in this repo: a fork's dispatch must never reach our runner.
-    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+    if: github.repository == 'fivetwenty-io/bosh-proxmox-cpi-release'
 
     steps:
       - name: Probe PVE API endpoint

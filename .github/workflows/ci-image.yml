@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 45
     # Not PR-triggered, but keep the head-repo guard shape used by every
     # workflow in this repo: only this repository may use our runner.
-    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+    if: github.repository == 'fivetwenty-io/bosh-proxmox-cpi-release'
 
     steps:
       - name: Checkout

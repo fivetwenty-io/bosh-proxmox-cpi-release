@@ -57,7 +57,7 @@ jobs:
     timeout-minutes: 360
     # Not PR-triggered, but keep the head-repo guard shape used by every
     # workflow in this repo: only this repository may use our runner.
-    if: github.repository == 'fivetwenty-io/bosh-pve-cpi-release'
+    if: github.repository == 'fivetwenty-io/bosh-proxmox-cpi-release'
 
     container:
       # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
@@ -136,7 +136,7 @@ jobs:
           if [[ -z "${LAB_BOSH_VARS_YML}" ]]; then
             echo "ERROR: the LAB_BOSH_VARS_YML secret is not configured for this repository." >&2
             echo "Add it from a checkout that has the lab vars file:" >&2
-            echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-pve-cpi-release --body-file manifests/bosh/vars.yml" >&2
+            echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-proxmox-cpi-release --body-file manifests/bosh/vars.yml" >&2
             exit 1
           fi
           umask 077
@@ -153,7 +153,7 @@ jobs:
           if [[ -z "${LAB_PVE_SSH_KEY}" ]]; then
             echo "ERROR: the LAB_PVE_SSH_KEY secret is not configured for this repository." >&2
             echo "Generate a dedicated key, authorize it for root on the lab PVE node, then:" >&2
-            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-pve-cpi-release < <keyfile>" >&2
+            echo "  gh secret set LAB_PVE_SSH_KEY --repo fivetwenty-io/bosh-proxmox-cpi-release < <keyfile>" >&2
             exit 1
           fi
           umask 077
