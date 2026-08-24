@@ -30,11 +30,11 @@ manifests/creds.yml
 manifests/bosh/vars.yml
 manifests/bosh/creds.yml
 
-# BOSH release artifacts
+# BOSH release artifacts. .final_builds/ and releases/*.yml are NOT ignored:
+# bosh.io indexes final releases from those tracked files on the default branch.
 blobs/
 dev_releases/
 .dev_builds/
-.final_builds/
 bosh-proxmox-cpi-*.tgz
 bosh-pve-cpi-*.tgz
 tmp/

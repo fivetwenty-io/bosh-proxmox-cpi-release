@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- Final release metadata is now tracked on the default branch (`releases/bosh-proxmox-cpi/` and `.final_builds/`, starting with 0.5.0), so release aggregators such as bosh.io can index our releases and rebuild them from the public blobstore with `bosh create-release`.
+
 ## [0.5.0] - 2026-08-24
 
 ### Added
