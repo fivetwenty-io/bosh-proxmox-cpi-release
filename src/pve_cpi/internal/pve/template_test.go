@@ -6,10 +6,13 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -543,6 +546,63 @@ func TestResolveTemplateVMIDForNode_APIError(t *testing.T) {
 	_, _, err := pve.ResolveTemplateVMIDForNode(context.Background(), c, "pve1", "sha8test")
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+// TestResolveTemplateVMIDForNode_TransientThenSuccess_Retries pins the F6
+// fix: a single transient ListQemu fault (a pvedaemon worker recycle mid-scan)
+// must not fail the placement scorer outright — it is exactly the kind of
+// blip a single in-process retry absorbs, the same tolerance every sibling
+// per-node listing in this package already has (listNodeGuests,
+// FindTemplatesBySHATagNode).
+func TestResolveTemplateVMIDForNode_TransientThenSuccess_Retries(t *testing.T) {
+	t.Parallel()
+	sha8 := "abc12345"
+	var calls int
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		calls++
+		if calls == 1 {
+			// Transient shape: "(code: 596)" is detected by IsTransientTransport.
+			return nil, errors.New("pveproxy backend gone (code: 596)")
+		}
+		return makeListQemuResponseRaw(
+			`{"vmid":30001,"template":1,"tags":"bosh-stemcell-cache;bosh-stemcell-sha-` + sha8 + `"}`,
+		), nil
+	})
+
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	vmid, found, err := pve.ResolveTemplateVMIDForNode(ctx, c, "pve1", sha8)
+	if err != nil {
+		t.Fatalf("expected success after transient retry, got: %v", err)
+	}
+	if !found || vmid != 30001 {
+		t.Errorf("vmid/found = %d/%v; want 30001/true", vmid, found)
+	}
+	if calls < 2 {
+		t.Errorf("expected at least 2 ListQemu calls (1 transient + 1 success), got %d", calls)
+	}
+}
+
+// TestResolveTemplateVMIDForNode_Exhausted5xx_ClassifiesRetriable pins the
+// classification half of the F6 fix. A persistent 5xx (a pvedaemon that
+// never recovers within the retry budget) exhausts RetryOnTransient and
+// returns the raw SDK error; cpierrors.Wrap(listErr, ...) alone would flatten
+// that to a permanent CloudError (Wrap defaults anything that is not already
+// a *cpierrors.Error to non-retriable), stranding the Director on a fault a
+// later re-drive would have cleared. WrapErrorKeepingClass must run first so
+// the SDK's own 5xx classification (retriable) survives the wrap.
+func TestResolveTemplateVMIDForNode_Exhausted5xx_ClassifiesRetriable(t *testing.T) {
+	t.Parallel()
+	c := resolveTemplateClient(func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		return nil, sdkerrors.ParseAPIError(500, []byte(`{"message":"pveproxy backend gone"}`))
+	})
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	_, _, err := pve.ResolveTemplateVMIDForNode(ctx, c, "pve1", "sha8test")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("an exhausted 5xx must still classify TypeRetriableCloud; got: %v", err)
 	}
 }
 

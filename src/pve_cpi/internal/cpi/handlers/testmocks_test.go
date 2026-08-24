@@ -198,6 +198,7 @@ type mockNodesService struct {
 	listStorageFn            func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 	listHardwarePciFn        func(ctx context.Context, node string, params *nodes.ListHardwarePciParams) (*nodes.ListHardwarePciResponse, error)
 	listQemuFn               func(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error)
+	listNodesFn              func(ctx context.Context) (*nodes.ListNodesResponse, error)
 }
 
 // ListQemu backs the authoritative per-node listing
@@ -1075,16 +1076,27 @@ func testDepsWithCluster(
 	}
 }
 
-// ListNodes reports an empty node list; the standalone-membership
-// fallback then surfaces the original corosync answer unchanged.
-func (m *mockNodesService) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+// ListNodes reports an empty node list by default; the standalone-membership
+// fallback then surfaces the original corosync answer unchanged. Set
+// listNodesFn to script a non-empty GET /nodes answer (e.g. a standalone
+// host's self-membership).
+func (m *mockNodesService) ListNodes(ctx context.Context) (*nodes.ListNodesResponse, error) {
+	if m.listNodesFn != nil {
+		return m.listNodesFn(ctx)
+	}
 	empty := nodes.ListNodesResponse{}
 	return &empty, nil
 }
 
-// ListNodes reports an empty node list; the standalone-membership
+// ListNodes delegates to the embedded delegate when one is wired, so a suite
+// that scripts a standalone host's GET /nodes answer on its own nodes mock
+// (e.g. stemcellMockNodes.listNodesFn) sees it through this wrapper too.
+// Without a delegate it reports an empty node list; the standalone-membership
 // fallback then surfaces the original corosync answer unchanged.
-func (s *authNodesService) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
+func (s *authNodesService) ListNodes(ctx context.Context) (*nodes.ListNodesResponse, error) {
+	if s.Service != nil {
+		return s.Service.ListNodes(ctx)
+	}
 	empty := nodes.ListNodesResponse{}
 	return &empty, nil
 }

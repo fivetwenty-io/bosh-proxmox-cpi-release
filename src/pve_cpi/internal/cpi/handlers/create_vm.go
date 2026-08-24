@@ -604,10 +604,7 @@ func createVM(
 		return nil, cpierrors.Wrap(err, "create_vm: allocate+create VM")
 	}
 
-	vmName := shape.initialName
-	if vmName == "" {
-		vmName = fmt.Sprintf("vm-%d", vmid)
-	}
+	vmName := candidateVMName(shape.initialName, parsed.agentID, vmid)
 
 	// Arm rollback for stages 4b–8: any failure after this point destroys the
 	// winning VM. See rollbackOnExit for the error-path and panic-path handling.
@@ -1354,10 +1351,7 @@ func buildAndStartVMAttempt(
 	// allocate attempt). Best-effort — see persistPoolMembership.
 	persistPoolMembership(ctx, deps, logger, &nodeShape, vmid)
 
-	vmName := nodeShape.initialName
-	if vmName == "" {
-		vmName = fmt.Sprintf("vm-%d", vmid)
-	}
+	vmName := candidateVMName(nodeShape.initialName, parsed.agentID, vmid)
 
 	if err := resizeRootDisk(ctx, deps, logger, &nodeShape, vmid); err != nil {
 		return vmid, nil, nil, nil, err
@@ -1504,10 +1498,7 @@ func attemptCreateVM(
 	shape *createVMShape,
 	candidate int,
 ) error {
-	candidateName := shape.initialName
-	if candidateName == "" {
-		candidateName = fmt.Sprintf("vm-%d", candidate)
-	}
+	candidateName := candidateVMName(shape.initialName, parsed.agentID, candidate)
 
 	// PCI guard: every node-resolution outcome funnels through here, including
 	// the static paths that never run the placement filter (operator
@@ -2095,13 +2086,24 @@ func startVMAndReadConfig(
 	})
 	switch {
 	case startErr == nil:
-		if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
-			if !vmAlreadyRunning(err) && !vmRunningNow(ctx, deps, logger, shape.node, vmid) {
-				return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
-					fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
+		// Empty startUPID means PVE completed the start synchronously with
+		// no task to await -- rebootVMHandleStopped guards the same call
+		// shape identically. Without the guard, AwaitTask's empty-upid input
+		// validation ("AwaitTask: upid must not be empty") returns a
+		// permanent CloudError naming a programming error, and create_vm is
+		// rescued only if vmRunningNow's status probe happens to succeed; a
+		// probe that fails transiently (the same burst that caused the odd
+		// start response) would surface that nonsense error to the Director
+		// as a permanent create_vm failure.
+		if startUPID != "" {
+			if err := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, startUPID, logger); err != nil {
+				if !vmAlreadyRunning(err) && !vmRunningNow(ctx, deps, logger, shape.node, vmid) {
+					return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
+						fmt.Sprintf("create_vm: await start task vmid=%d", vmid))
+				}
+				logger.Info("create_vm: start task raced a prior committed start; VM already running",
+					log.Int(metadataKeyVMID, vmid))
 			}
-			logger.Info("create_vm: start task raced a prior committed start; VM already running",
-				log.Int(metadataKeyVMID, vmid))
 		}
 	case vmAlreadyRunning(startErr) || vmRunningNow(ctx, deps, logger, shape.node, vmid):
 		logger.Info("create_vm: start replay found the VM already running; goal state reached",

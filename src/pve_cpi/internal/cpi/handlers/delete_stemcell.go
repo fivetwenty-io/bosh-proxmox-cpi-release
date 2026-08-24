@@ -557,7 +557,13 @@ func findStemcellTemplatesAllNodes(
 	logger *log.Logger,
 	sha8 string,
 ) ([]pve.TemplateRef, error) {
-	nodes, listErr := listClusterNodes(ctx, deps)
+	// Uses ListClusterMemberNames, not listClusterNodes: this sweep must
+	// enumerate the host itself on a standalone (never pvecm create'd) PVE
+	// node, and listClusterNodes only reads /cluster/config/nodes, which is
+	// empty with no corosync configuration. ListClusterMemberNames falls back
+	// to GET /nodes, which names the standalone host itself, so absence can
+	// still be proven and the no-template branch stays reachable.
+	nodes, listErr := pve.ListClusterMemberNames(ctx, deps.PVE)
 	if listErr != nil {
 		return nil, cpierrors.WrapAs(listErr, cpierrors.TypeRetriableCloud,
 			"delete_stemcell: cluster node enumeration for the template sweep failed")

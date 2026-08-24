@@ -274,25 +274,62 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64, lo
 			// membership (GET /pools/{poolid}, pmxcfs-backed) is consulted
 			// first: it does not lag, so a VM another path just moved INTO
 			// poolID resolves as the success it is instead of a false
-			// permanent error read from the stale index. Only when that probe
-			// answers a definitive "not a member" does the index name the
-			// other pool; a probe or lookup failure, an absent listing entry,
-			// or an entry without a pool keeps the replay reading, because
-			// the index can lag the user_cfg write this call just made.
+			// permanent error read from the stale index.
 			member, probeErr := c.Pools().PoolHasVM(ctx, poolID, vmid)
-			if probeErr == nil && member {
+			switch {
+			case probeErr == nil && member:
 				return nil
+			case probeErr == nil && !member:
+				// Invariant: once PoolHasVM answers definitively, it is
+				// authoritative — pmxcfs does not lag. "Not a member of
+				// poolID" therefore means the VM is in SOME other pool (the
+				// "already a pool member" verdict said so), full stop. The
+				// index below is consulted only to NAME that other pool; a
+				// lookup failure, or an index that (because it lags) still
+				// shows poolID, must never overturn this verdict back to
+				// success — that reopens the exact silent-misattachment bug
+				// this probe exists to close (e.g. set_vm_metadata having
+				// just moved the VM out of poolID while the index row has
+				// not caught up).
+				current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
+				if lookupErr == nil && found && current != "" {
+					return cpierrors.Cloud(
+						"AssignVMToPool: vmid %d already belongs to pool %q (PVE's own pool-membership check confirms it is NOT in %q) and cannot also be added to %q; remove it from %q first",
+						vmid, current, poolID, poolID, current)
+				}
+				return cpierrors.Cloud(
+					"AssignVMToPool: vmid %d already belongs to a pool other than %q (confirmed by PVE's own pool-membership check) and cannot also be added to it; find its current pool and remove it first",
+					vmid, poolID)
 			}
-			if probeErr != nil {
-				// Without the probe's answer the index verdict below would
-				// rest on stale evidence alone, so the failure reads as the
-				// replay it statistically is; the Warn keeps a systematic
-				// probe failure (a token missing Pool.Audit) visible.
+			// probeErr != nil: the probe itself failed. A permanent verdict
+			// (401/403 — most often a token missing Pool.Audit on poolID, see
+			// the package doc) is systematic, never a blip, so treating it as
+			// "statistically a replay" is never true; a transient/
+			// unclassifiable fault could resolve on retry. Neither case may
+			// resolve to nil here — that would report success on a probe
+			// this call never actually completed, which is the exact
+			// swallow this probe exists to prevent.
+			code, isAPIVerdict := apiHTTPCode(probeErr)
+			permanent := isAPIVerdict && (code == 400 || code == 401 || code == 403)
+			if !permanent {
 				if logger != nil {
-					logger.Warn("AssignVMToPool: pool membership probe failed; reading the verdict as a replayed AddVM without consulting the lagging index",
+					logger.Warn("AssignVMToPool: pool membership probe failed transiently after an ambiguous "+
+						"'already a pool member' verdict; failing retriable rather than assuming a replay",
 						log.String("pool", poolID), log.Int64("vmid", vmid), log.Err(probeErr))
 				}
-				return nil
+				return cpierrors.WrapAs(WrapError(probeErr), cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("AssignVMToPool: pool %q vmid %d: membership probe failed; cannot confirm the ambiguous 'already a pool member' verdict", poolID, vmid))
+			}
+			// Permanent verdict: the probe can never succeed on retry, so
+			// fall through to the lagging-index leg instead of swallowing a
+			// systematic denial as success. The index cannot prove
+			// membership in poolID (only PoolHasVM can), so this leg either
+			// names a genuine conflict or — same as the pre-probe code path
+			// — proceeds best-effort when it finds none.
+			if logger != nil {
+				logger.Warn("AssignVMToPool: pool membership probe permanently denied (e.g. missing Pool.Audit); "+
+					"consulting the lagging index instead of assuming a replay",
+					log.String("pool", poolID), log.Int64("vmid", vmid), log.Err(probeErr))
 			}
 			current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
 			if lookupErr == nil && found && current != "" && current != poolID {
@@ -384,9 +421,14 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 	shaTag := "bosh-stemcell-sha-" + sha8
 	nodeTag := replicaNodeTag(node)
 
-	resp, listErr := c.Nodes().ListQemu(ctx, node, nil)
+	var resp *sdknodes.ListQemuResponse
+	listErr := RetryOnTransient(ctx, nil, "resolve_template_vmid_for_node", 0, func() error {
+		var inner error
+		resp, inner = c.Nodes().ListQemu(ctx, node, nil)
+		return inner
+	})
 	if listErr != nil {
-		return 0, false, cpierrors.Wrap(listErr,
+		return 0, false, cpierrors.Wrap(WrapErrorKeepingClass(listErr),
 			fmt.Sprintf("ResolveTemplateVMIDForNode: node %s sha8 %q", node, sha8))
 	}
 	if resp == nil || len(*resp) == 0 {

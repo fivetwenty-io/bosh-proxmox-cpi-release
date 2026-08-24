@@ -6,6 +6,9 @@ package handlers
 
 import (
 	"context"
+	cryptosha1 "crypto/sha1" // #nosec G505 -- name-collision avoidance, not security
+	"encoding/hex"
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -629,4 +632,55 @@ func composeVMName(prefix, deployment, job, index string) string {
 		return ""
 	}
 	return sanitizeVMName(strings.Join(parts, "-"))
+}
+
+// attemptDiscriminatorLen is the byte length of the hex suffix
+// candidateVMName appends. Reserved off maxPVEVMNameLength's budget before
+// the human-readable base is truncated, so the discriminator itself is
+// never the part that gets cut.
+const attemptDiscriminatorLen = 8
+
+// attemptNameDiscriminator returns a short, name-safe hex token unique to
+// the BOSH instance behind agentID — the create_vm handler's own agent_id
+// argument, which the Director guarantees is unique per VM instance
+// (including two instances of the very same instance group and deployment
+// created concurrently). Hashing rather than slicing agentID directly
+// decorrelates the discriminator from whatever ID scheme the Director
+// happens to use, so a shared prefix across unrelated instances can never
+// leak through as a shared discriminator.
+func attemptNameDiscriminator(agentID string) string {
+	sum := cryptosha1.Sum([]byte(agentID)) // #nosec G401 -- name-collision avoidance, not security
+	return hex.EncodeToString(sum[:])[:attemptDiscriminatorLen]
+}
+
+// candidateVMName is the name written to PVE (and to the guest agent's own
+// VM.Name) for one create attempt: the resolved initial name, or the
+// "vm-<n>" placeholder when nothing is derivable from env.bosh, with a
+// per-instance discriminator suffix appended.
+//
+// The suffix exists for sweepCandidateVMID: parallel instances of the SAME
+// instance group in the SAME deployment compose the byte-identical
+// human-readable base (composeVMName has no index to work with yet — that
+// arrives later via set_vm_metadata), and an empty initialName collapses
+// every attempt racing for the same candidate VMID to the identical
+// "vm-<candidate>" placeholder too. Without the suffix, a losing attempt's
+// own name check can never distinguish "the peer's winning create" from
+// "the guest I lost the race for is my own" and would destroy a live VM it
+// never owned. The suffix survives the maxPVEVMNameLength cap unconditionally
+// (attemptDiscriminatorLen is reserved off the base's budget first), so it is
+// never the part truncation removes.
+func candidateVMName(initialName, agentID string, candidate int) string {
+	base := initialName
+	if base == "" {
+		base = fmt.Sprintf("vm-%d", candidate)
+	}
+	suffix := "-" + attemptNameDiscriminator(agentID)
+	maxBase := maxPVEVMNameLength - len(suffix)
+	if maxBase < 0 {
+		maxBase = 0
+	}
+	if len(base) > maxBase {
+		base = strings.TrimRight(base[:maxBase], "-")
+	}
+	return base + suffix
 }

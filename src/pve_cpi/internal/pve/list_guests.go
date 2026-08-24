@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
@@ -182,7 +184,21 @@ func offlineClusterNodes(ctx context.Context, c Client, logger *log.Logger) map[
 	if c.Cluster() == nil {
 		return nil
 	}
-	resp, err := c.Cluster().ListStatus(ctx)
+	// RetryOnTransient absorbs a single blip (pvedaemon worker recycle) before
+	// conceding: without it, one transient failure during a legitimate node
+	// outage silently withholds the tolerance and turns what should be a
+	// tolerated enumeration into a hard fail-loud, exactly when the tolerance
+	// was supposed to keep FindVMAuthoritative / the tolerant enumeration
+	// working. The direction stays fail-safe either way (withheld tolerance
+	// only means fail-loud, never a wrong destroy), so an exhausted retry
+	// still degrades to "treat every member as online" rather than
+	// propagating an error.
+	var resp *cluster.ListStatusResponse
+	err := RetryOnTransient(ctx, logger, "offline_cluster_nodes", 0, func() error {
+		var inner error
+		resp, inner = c.Cluster().ListStatus(ctx)
+		return inner
+	})
 	if err != nil || resp == nil {
 		if err != nil && logger != nil {
 			logger.Debug("ListGuestsAuthoritative: cluster status unavailable; treating every member as online",

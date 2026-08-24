@@ -383,6 +383,10 @@ func TestResolveDiskID_EmptyConfig(t *testing.T) {
 type diskClusterClient struct {
 	qemuSvc    qemu.Service
 	clusterSvc cluster.Service
+	// nodesOverride, when set, is returned by Nodes() instead of the default
+	// diskFakeNodesFromCluster adapter — used by tests that need to script a
+	// per-node ListQemu failure (an unlistable/offline member).
+	nodesOverride nodes.Service
 }
 
 func (c *diskClusterClient) QEMU() qemu.Service       { return c.qemuSvc }
@@ -396,6 +400,9 @@ func (c *diskClusterClient) Tasks() tasks.Service { return nil }
 // ListResources-shaped fixture rows, so every test client built around
 // diskFakeCluster serves the enumeration the production scans now read.
 func (c *diskClusterClient) Nodes() nodes.Service {
+	if c.nodesOverride != nil {
+		return c.nodesOverride
+	}
 	if f, ok := c.clusterSvc.(*diskFakeCluster); ok {
 		return &diskFakeNodesFromCluster{f: f}
 	}
@@ -410,6 +417,9 @@ func (c *diskClusterClient) Pools() pve.PoolService                 { return nil
 type diskFakeCluster struct {
 	cluster.Service
 	listFn func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
+	// listStatusFn overrides ListStatus (offline-member reporting) when set;
+	// nil keeps the default fully-online fixture cluster.
+	listStatusFn func(ctx context.Context) (*cluster.ListStatusResponse, error)
 }
 
 func (f *diskFakeCluster) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
@@ -484,6 +494,11 @@ func (f *diskFakeCluster) ListConfigNodes(ctx context.Context) (*cluster.ListCon
 type diskFakeNodesFromCluster struct {
 	nodes.Service
 	f *diskFakeCluster
+	// failNode, when non-empty, makes ListQemu return failErr for exactly
+	// that node instead of serving its fixture rows, simulating an unlistable
+	// (e.g. powered-off) member.
+	failNode string
+	failErr  error
 }
 
 // UpdateQemuConfig and ListStorageContent are no-ops, mirroring the nil
@@ -502,6 +517,9 @@ func (s *diskFakeNodesFromCluster) ListStorageContent(
 }
 
 func (s *diskFakeNodesFromCluster) ListQemu(ctx context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	if s.failNode != "" && node == s.failNode {
+		return nil, s.failErr
+	}
 	rows, err := s.f.fixtureRows(ctx)
 	if err != nil {
 		return nil, err
@@ -801,6 +819,101 @@ func TestFindVMByDiskVolid_ContainerRow_NotReadAtAll(t *testing.T) {
 	}
 	if read[200] {
 		t.Error("the LXC row was read through the QEMU config endpoint")
+	}
+}
+
+// TestFindVMByDiskVolid_OfflineMemberExcluded_FoundOnOnlineNode_Succeeds
+// verifies the offline-member tolerance the disk-holder scan needs to match
+// has_vm/delete_vm's resurrection behavior: a member the quorate cluster
+// reports offline must not block a disk operation whose holder is provably
+// on a reachable node. pve-02 is scripted to error on ListQemu (proving it
+// really would fail if probed); the scan must never reach it because pve-02
+// is excluded as offline, and the disk is found on pve-01.
+func TestFindVMByDiskVolid_OfflineMemberExcluded_FoundOnOnlineNode_Succeeds(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-501-disk-0"
+
+	fc := &diskFakeCluster{
+		listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return diskClusterResp(
+				map[string]any{"vmid": int64(501), "node": "pve-01"},
+				map[string]any{"vmid": int64(602), "node": "pve-02"},
+			), nil
+		},
+		listStatusFn: func(context.Context) (*cluster.ListStatusResponse, error) {
+			return diskQuorateStatusWithOffline("pve-02"), nil
+		},
+	}
+	c := &diskClusterClient{
+		clusterSvc: fc,
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				return map[string]any{"scsi0": volid}, nil
+			},
+		},
+		nodesOverride: &diskFakeNodesFromCluster{
+			f:        fc,
+			failNode: "pve-02",
+			failErr:  errors.New("pve-02: connection refused (member is powered off)"),
+		},
+	}
+
+	vmid, node, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
+	if err != nil {
+		t.Fatalf("an offline member must not block a holder scan that finds its answer on an online node; got: %v", err)
+	}
+	if vmid != 501 || node != "pve-01" {
+		t.Errorf("vmid/node: want 501/pve-01, got %d/%s", vmid, node)
+	}
+}
+
+// TestFindVMByDiskVolid_OfflineMemberExcluded_NotFound_ReturnsRetriable
+// verifies the other half of the F2 invariant: when the disk is NOT found
+// among the reachable guests AND a member was excluded as offline, the scan
+// must refuse to conclude "not attached to any VM" — that conclusion would
+// be unproven, since the excluded member's guests were never probed.
+func TestFindVMByDiskVolid_OfflineMemberExcluded_NotFound_ReturnsRetriable(t *testing.T) {
+	t.Parallel()
+	volid := "local-lvm:vm-999-disk-0"
+
+	fc := &diskFakeCluster{
+		listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+			return diskClusterResp(
+				map[string]any{"vmid": int64(501), "node": "pve-01"},
+				// A zero-vmid row registers pve-02 as a corosync member with
+				// no guest of its own in the fixture; ListConfigNodes derives
+				// membership from distinct node names regardless of vmid.
+				map[string]any{"node": "pve-02"},
+			), nil
+		},
+		listStatusFn: func(context.Context) (*cluster.ListStatusResponse, error) {
+			return diskQuorateStatusWithOffline("pve-02"), nil
+		},
+	}
+	c := &diskClusterClient{
+		clusterSvc: fc,
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, vmid int) (map[string]any, error) {
+				// pve-01's only guest holds an unrelated disk.
+				return map[string]any{"scsi0": "local-lvm:vm-501-disk-0"}, nil
+			},
+		},
+		nodesOverride: &diskFakeNodesFromCluster{
+			f:        fc,
+			failNode: "pve-02",
+			failErr:  errors.New("pve-02: connection refused (member is powered off)"),
+		},
+	}
+
+	_, _, err := pve.FindVMByDiskVolid(context.Background(), c, volid)
+	if err == nil {
+		t.Fatal("expected a retriable error; a not-found verdict with an excluded member proves nothing")
+	}
+	if errors.Is(err, pve.ErrDiskNotAttachedToAnyVM) {
+		t.Errorf("must not report ErrDiskNotAttachedToAnyVM while a member was excluded as offline; got: %v", err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("expected TypeRetriableCloud; got: %v", err)
 	}
 }
 
@@ -1856,10 +1969,30 @@ func TestFindVMPoolViaCluster_TransportError(t *testing.T) {
 	}
 }
 
-// ListStatus reports no offline members; the fixture cluster is fully online.
-func (f *diskFakeCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
+// ListStatus reports no offline members by default; the fixture cluster is
+// fully online. Set listStatusFn to script a quorate cluster with specific
+// members reported offline.
+func (f *diskFakeCluster) ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error) {
+	if f.listStatusFn != nil {
+		return f.listStatusFn(ctx)
+	}
 	empty := cluster.ListStatusResponse{}
 	return &empty, nil
+}
+
+// diskQuorateStatusWithOffline builds a ListStatus response reporting a
+// quorate cluster with the named node(s) offline, matching the shape
+// offlineClusterNodes parses (a "cluster" type row for quorum plus a "node"
+// type row per member).
+func diskQuorateStatusWithOffline(offlineNodes ...string) *cluster.ListStatusResponse {
+	resp := make(cluster.ListStatusResponse, 0, 1+len(offlineNodes))
+	clusterRow, _ := json.Marshal(map[string]any{"type": "cluster", "quorate": 1})
+	resp = append(resp, clusterRow)
+	for _, n := range offlineNodes {
+		row, _ := json.Marshal(map[string]any{"type": "node", "name": n, "online": 0})
+		resp = append(resp, row)
+	}
+	return &resp
 }
 
 // ListNodes reports an empty node list; the standalone-membership

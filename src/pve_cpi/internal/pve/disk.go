@@ -583,13 +583,23 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	// /cluster/resources index: the index lags by minutes, and a young VM it
 	// has not caught up with is exactly the holder whose absence turns into
 	// "not attached to any VM", the answer behind delete-while-attached and
-	// double-attach. The enumeration already classifies its failures
-	// (retriable for a partial fleet or a pvedaemon restart), so its error is
-	// wrapped with context only. Per-node listings also answer with QEMU
-	// guests only, so the LXC-container filtering the index scan needed is
-	// gone by construction, and every row carries its real node, so no
-	// fallback node hint is needed.
-	guests, listErr := ListGuestsAuthoritative(ctx, c, nil)
+	// double-attach. Per-node listings also answer with QEMU guests only, so
+	// the LXC-container filtering the index scan needed is gone by
+	// construction, and every row carries its real node, so no fallback node
+	// hint is needed.
+	//
+	// The tolerant form is used, not the strict ListGuestsAuthoritative: a
+	// single dead member must not block every disk operation cluster-wide
+	// (the same wedge 3022084's offline-member tolerance closed for
+	// has_vm/delete_vm). A match found on any listed node is proof regardless
+	// of what was excluded, since the disk can only be attached to one guest;
+	// finding it settles the holder. The invariant that keeps this sound: a
+	// NOT-found verdict is authoritative ("not attached to any VM", which
+	// callers may act on destructively) only when nothing was excluded. When
+	// excludedNodes is non-empty, "not found among the online nodes" cannot
+	// rule out the disk being attached to a guest that lives on an excluded
+	// node, so the scan fails retriable instead of asserting absence.
+	guests, excludedNodes, listErr := ListGuestsAuthoritativeTolerant(ctx, c, nil)
 	if listErr != nil {
 		return DiskScanHit{}, cpierrors.Wrap(listErr, "FindVMByDiskVolid: enumerate cluster guests")
 	}
@@ -628,6 +638,11 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		}
 	}
 
+	if len(excludedNodes) > 0 {
+		return DiskScanHit{}, cpierrors.Retriable(
+			"disk %q: not found among the reachable guests, but node(s) %s were excluded as offline; cannot prove the disk is unattached",
+			volid, strings.Join(excludedNodes, ","))
+	}
 	return DiskScanHit{}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
 }
 

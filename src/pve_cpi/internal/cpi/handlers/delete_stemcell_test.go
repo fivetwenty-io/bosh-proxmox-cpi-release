@@ -401,6 +401,50 @@ func TestDeleteStemcell_Light_NoTemplates_NoNodeConfigured_StillSucceeds(t *test
 	}
 }
 
+// TestDeleteStemcell_Light_NoTemplates_StandaloneHost_StillSucceeds verifies
+// that a never-clustered (no pvecm create) single-node PVE host can still
+// reach the no-template branch: GET /cluster/config/nodes answers empty (no
+// corosync configuration), and the per-node sweep must fall back to naming
+// the standalone host itself via GET /nodes instead of concluding zero
+// enumerable nodes and refusing to prove absence forever.
+func TestDeleteStemcell_Light_NoTemplates_StandaloneHost_StillSucceeds(t *testing.T) {
+	t.Parallel()
+
+	storageSvc := &deleteStemcellMockStorage{}
+	clusterSvc := &stemcellMockCluster{
+		listConfigNodesFn: func(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+			// Never-clustered host: corosync has no membership at all.
+			resp := sdkcluster.ListConfigNodesResponse{}
+			return &resp, nil
+		},
+	}
+	nodesSvc := &stemcellMockNodes{
+		listNodesFn: func(_ context.Context) (*sdknodes.ListNodesResponse, error) {
+			n, _ := json.Marshal(map[string]string{"node": vmNode})
+			resp := sdknodes.ListNodesResponse{n}
+			return &resp, nil
+		},
+	}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{
+		storageSvc: storageSvc,
+		clusterSvc: clusterSvc,
+		nodesSvc:   nodesSvc,
+	})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testLightCID())}
+	result, err := h.Handle(context.Background(), args, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("standalone host must reach the no-template branch and succeed, got error: %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result, got %v", result)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("light stemcell no-template path must never touch storage, got %d calls", storageSvc.deleteVolumeIfExistsCalls)
+	}
+}
+
 // ============================================================
 // Tests: heavy stemcells — destroy-then-delete ordering, replicas
 // ============================================================

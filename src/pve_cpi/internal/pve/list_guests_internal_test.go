@@ -356,6 +356,47 @@ func TestListGuestsAuthoritativeTolerant_StatusUnavailableKeepsFailLoud(t *testi
 	}
 }
 
+// TestListGuestsAuthoritativeTolerant_StatusTransientBlip_RetriesAndTolerates
+// pins the F7 fix: a single transient /cluster/status fault (a pvedaemon
+// worker recycling mid-request) must not silently withhold the offline-
+// member tolerance — offlineClusterNodes must retry it like every other read
+// in this package, so a legitimate node outage keeps working instead of
+// intermittently hard-failing on an unrelated blip.
+func TestListGuestsAuthoritativeTolerant_StatusTransientBlip_RetriesAndTolerates(t *testing.T) {
+	t.Parallel()
+	var statusCalls int
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes: []string{"pve1", "pve2"},
+			statusFn: func() (*sdkcluster.ListStatusResponse, error) {
+				statusCalls++
+				if statusCalls == 1 {
+					// Transient shape: "(code: 596)" is detected by IsTransientTransport.
+					return nil, errors.New("pveproxy backend gone (code: 596)")
+				}
+				return lgStatus(map[string]bool{"pve1": true, "pve2": false})()
+			},
+		},
+		nodes: &lgNodes{
+			listings:  map[string][]string{"pve1": {`{"vmid": 596}`}},
+			failNodes: map[string]error{"pve2": errors.New("connection refused")},
+		},
+	}
+	guests, excluded, err := ListGuestsAuthoritativeTolerant(lgCtx(), c, nil)
+	if err != nil {
+		t.Fatalf("a transient status blip must be retried, not read as tolerance-withheld; got: %v", err)
+	}
+	if len(guests) != 1 || guests[0].VMID != 596 {
+		t.Fatalf("expected the online node's guests only, got %+v", guests)
+	}
+	if len(excluded) != 1 || excluded[0] != "pve2" {
+		t.Fatalf("the excluded member must be reported once the retry succeeds, got %v", excluded)
+	}
+	if statusCalls < 2 {
+		t.Errorf("expected at least 2 ListStatus calls (1 transient + 1 success), got %d", statusCalls)
+	}
+}
+
 // ListNodes reports an empty node list unless listNodesFn scripts otherwise;
 // the standalone-membership fallback then surfaces the original corosync
 // answer unchanged.
