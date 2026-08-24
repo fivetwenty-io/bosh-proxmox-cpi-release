@@ -1,4 +1,4 @@
-module github.com/fivetwenty-io/bosh-pve-cpi
+module github.com/fivetwenty-io/bosh-proxmox-cpi
 
 go 1.27.0
 

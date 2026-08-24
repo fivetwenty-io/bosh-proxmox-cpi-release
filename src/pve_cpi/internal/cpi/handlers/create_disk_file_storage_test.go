@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // File-based storages (dir/nfs/cifs/glusterfs/btrfs) require the volume name

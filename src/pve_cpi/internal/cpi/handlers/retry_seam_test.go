@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // fastRetryCtx returns a derived context with the pve retry backoff curves

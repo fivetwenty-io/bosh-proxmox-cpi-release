@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version"
 )
 
 // TestBuildUserAgent_NoOperatorID verifies that a config with no operator_id

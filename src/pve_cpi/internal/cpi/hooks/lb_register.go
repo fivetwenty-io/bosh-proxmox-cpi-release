@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/lb"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/lb"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // defaultLBTimeout bounds a Data Plane API call when TimeoutMS is unset.

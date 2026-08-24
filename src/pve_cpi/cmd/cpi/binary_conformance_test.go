@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // ---------------------------------------------------------------------------

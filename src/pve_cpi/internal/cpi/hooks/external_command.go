@@ -6,10 +6,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	safeexec "github.com/fivetwenty-io/bosh-pve-cpi/internal/exec"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	safeexec "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/exec"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // defaultExternalCommandTimeout bounds an invocation when TimeoutMS is unset.

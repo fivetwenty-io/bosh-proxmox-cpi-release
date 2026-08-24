@@ -6,8 +6,8 @@ import (
 	mrand "math/rand/v2"
 	"sync"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // globalVNIMu is the process-level mutex that serialises VNI allocation,

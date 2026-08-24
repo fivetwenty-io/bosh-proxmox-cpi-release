@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // migrationSafetyWarnText is the leading fragment of the one Warn these tests

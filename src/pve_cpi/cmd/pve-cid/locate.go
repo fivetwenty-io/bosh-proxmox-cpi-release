@@ -10,7 +10,7 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // DiskHolder identifies the active bus slot on a live VM currently holding a

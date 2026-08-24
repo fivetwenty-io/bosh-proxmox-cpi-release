@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 )
 
 const cvsuGiB = int64(1024 * 1024 * 1024)

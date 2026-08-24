@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // layeredBaseCfg returns a minimal CPIConfig that passes Validate, used as the

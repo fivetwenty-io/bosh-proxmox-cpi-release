@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // parkedDiskEntry is a minimal, read-only mirror of internal/pve's private

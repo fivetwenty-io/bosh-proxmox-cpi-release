@@ -4,8 +4,8 @@ import (
 	"context"
 	"strings"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // haRegistrationFeature names a specific create_vm feature that registers the

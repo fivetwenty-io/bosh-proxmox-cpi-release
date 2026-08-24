@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // FuzzParseEncodedDiskCID feeds arbitrary byte slices (as strings) to

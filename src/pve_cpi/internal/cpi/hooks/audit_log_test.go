@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 func TestAuditLogHook_OkPath(t *testing.T) {

@@ -32,7 +32,7 @@ import (
 	"errors"
 	"strings"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // destructiveDiskLocks is the set of PVE guest-config lock values during which

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 )
 
 // runBinary executes the CPI binary with the given args and stdin, returning

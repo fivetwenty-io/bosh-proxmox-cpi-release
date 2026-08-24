@@ -24,11 +24,11 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 //nolint:modernize // helper supports non-zero bool values; new(bool) only gives false

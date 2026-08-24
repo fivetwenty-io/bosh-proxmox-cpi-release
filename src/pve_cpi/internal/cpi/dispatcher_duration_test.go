@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 )
 
 // recordedDuration captures one WithDurationRecorder invocation for assertion.

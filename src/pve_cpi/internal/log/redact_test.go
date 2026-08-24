@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // secretTree builds a representative CPI argument tree carrying the kinds of

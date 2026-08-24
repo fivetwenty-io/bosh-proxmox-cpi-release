@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 )
 
 // TestMain zeroes the template-cache recheck delay for the whole test binary.

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"testing"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkcloudinit "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"

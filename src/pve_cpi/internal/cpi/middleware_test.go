@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 )
 
 // ptrHandler is a pointer-typed Handler so tests can assert WrapHandler returns

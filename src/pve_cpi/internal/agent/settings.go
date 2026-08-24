@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 func vmNameDefault(vmid int) string { return fmt.Sprintf("vm-%d", vmid) }

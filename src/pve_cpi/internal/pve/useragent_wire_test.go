@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version"
 )
 
 // pveStub is a minimal httptest.TLS server that records the User-Agent header

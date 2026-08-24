@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // jitterMu guards jitterSource so tests can swap it without a data race.

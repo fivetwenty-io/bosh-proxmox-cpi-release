@@ -16,7 +16,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-PKG     := github.com/fivetwenty-io/bosh-pve-cpi/internal/version
+PKG     := github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version
 LDFLAGS := -X '$(PKG).Version=$(VERSION)' \
            -X '$(PKG).Commit=$(COMMIT)' \
            -X '$(PKG).BuildDate=$(DATE)'

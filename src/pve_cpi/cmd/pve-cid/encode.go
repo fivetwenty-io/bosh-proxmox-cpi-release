@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // optFlag implements flag.Value to accept repeatable "--opt key=value" flags

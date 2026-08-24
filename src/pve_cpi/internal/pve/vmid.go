@@ -12,7 +12,7 @@ import (
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // Default VMID ranges. The three classes occupy disjoint, contiguous bands:

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // Credentials applies authentication to a Source's outbound request. Each

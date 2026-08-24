@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	safeexec "github.com/fivetwenty-io/bosh-pve-cpi/internal/exec"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	safeexec "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/exec"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 func nopLogger() *log.Logger { return log.NewNopLogger() }

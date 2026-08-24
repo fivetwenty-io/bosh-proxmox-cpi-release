@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // HasSnapshots returns the names of real (non-synthetic) snapshots for the given VM.

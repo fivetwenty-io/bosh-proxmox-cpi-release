@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // NoAgent is the no-op agent strategy. Use when BOSH agent bootstrap is not required

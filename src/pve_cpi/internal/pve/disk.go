@@ -18,7 +18,7 @@ import (
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // ErrDiskNotAttached is returned (wrapped via fmt.Errorf with %w) by

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/lb"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/lb"
 )
 
 // --------------------------------------------------------------------------

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // fakeLockPools is an in-memory PoolService recording the call sequence and

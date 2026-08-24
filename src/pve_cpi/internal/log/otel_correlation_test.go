@@ -6,7 +6,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // validTestSpanContext returns a manufactured, valid, sampled SpanContext with

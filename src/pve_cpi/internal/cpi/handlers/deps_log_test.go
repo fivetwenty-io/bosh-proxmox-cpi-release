@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // TestDeps_Log_CtxLoggerTakesPrecedence verifies Deps.Log(ctx) returns the

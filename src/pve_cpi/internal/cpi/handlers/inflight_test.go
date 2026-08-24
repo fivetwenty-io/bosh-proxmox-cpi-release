@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // TestInflightUnlimited: limit<=0 → acquire never blocks; all goroutines proceed.

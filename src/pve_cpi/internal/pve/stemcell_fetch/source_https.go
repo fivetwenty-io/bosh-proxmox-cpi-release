@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // httpsSource implements Source for https:// references. It streams the

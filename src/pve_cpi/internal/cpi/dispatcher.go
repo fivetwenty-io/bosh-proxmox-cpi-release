@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // Handler is implemented by per-method handlers in internal/cpi/handlers/.

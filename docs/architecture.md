@@ -16,7 +16,7 @@ Go sources live under `src/pve_cpi/` so the directory shape matches the BOSH pac
 
 - `src/pve_cpi/go.mod`, `src/pve_cpi/go.sum`, `src/pve_cpi/vendor/` — module metadata and vendored dependencies.
 
-The Go module path is `github.com/fivetwenty-io/bosh-pve-cpi`, and the internal import paths (for example `internal/cpi/handlers`) are unchanged. References to `cmd/cpi` and `internal/...` below name Go packages, not repo-root directories.
+The Go module path is `github.com/fivetwenty-io/bosh-proxmox-cpi`, and the internal import paths (for example `internal/cpi/handlers`) are unchanged. References to `cmd/cpi` and `internal/...` below name Go packages, not repo-root directories.
 
 ## Package Layers
 

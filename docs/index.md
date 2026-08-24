@@ -74,4 +74,4 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Changelog](../CHANGELOG.md): Operator-visible change by release, plus the work already merged for the next one.
 
-- [API Reference](https://pkg.go.dev/github.com/fivetwenty-io/bosh-pve-cpi): Package-level Go documentation on pkg.go.dev.
+- [Source](https://github.com/fivetwenty-io/bosh-proxmox-cpi-release): CPI source code, including package-level Go documentation in `src/pve_cpi`.

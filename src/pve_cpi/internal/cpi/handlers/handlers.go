@@ -3,12 +3,12 @@ package handlers
 import (
 	"context"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	stemcellfetch "github.com/fivetwenty-io/bosh-pve-cpi/internal/pve/stemcell_fetch"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	stemcellfetch "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/stemcell_fetch"
 )
 
 // Handler is a package-level alias for cpi.Handler so individual handler files

@@ -12,7 +12,7 @@ package pve
 import (
 	"context"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // resourceTypeNode is the PVE cluster-resource type tag for compute nodes,

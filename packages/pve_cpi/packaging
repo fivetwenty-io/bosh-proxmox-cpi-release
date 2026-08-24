@@ -126,8 +126,8 @@ pushd "${BOSH_COMPILE_TARGET}/pve_cpi" >/dev/null
   go build \
     -trimpath \
     -ldflags "-s -w \
-      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.Version=${BOSH_PACKAGE_VERSION_SANITIZED} \
-      -X github.com/fivetwenty-io/bosh-pve-cpi/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      -X github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version.Version=${BOSH_PACKAGE_VERSION_SANITIZED} \
+      -X github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o "${BOSH_INSTALL_TARGET}/bin/cpi" \
     ./cmd/cpi
 

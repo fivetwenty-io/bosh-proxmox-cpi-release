@@ -3,7 +3,7 @@ package handlers
 import (
 	"testing"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // TestParseDiskSizeGiB_Units exercises the unit-handling branches of

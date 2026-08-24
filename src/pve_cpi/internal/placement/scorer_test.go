@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/placement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 )
 
 // GiB convenience constant.

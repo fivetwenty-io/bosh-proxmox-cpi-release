@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -24,8 +24,8 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // PoolService manages PVE resource pool membership.

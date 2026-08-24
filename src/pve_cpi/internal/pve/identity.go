@@ -6,7 +6,7 @@ package pve
 import (
 	"strings"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // rootPamIdentity is the exact user@realm string PVE requires for the

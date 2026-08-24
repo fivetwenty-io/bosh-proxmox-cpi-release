@@ -3,7 +3,7 @@ package handlers_test
 import (
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 )
 
 // setHealthPollMinInterval overrides the production poll-floor for the duration

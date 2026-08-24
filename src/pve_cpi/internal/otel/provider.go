@@ -46,14 +46,14 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // tracerName identifies this instrumentation library to the tracing backend.
 // It is the CPI's Go module path, matching the OTel convention of using the
 // instrumenting package's import path as the tracer name.
-const tracerName = "github.com/fivetwenty-io/bosh-pve-cpi"
+const tracerName = "github.com/fivetwenty-io/bosh-proxmox-cpi"
 
 // defaultServiceName is used when cfg.ServiceName is empty. Normal callers
 // reach Setup only after config.ApplyDefaults, which already fills this in

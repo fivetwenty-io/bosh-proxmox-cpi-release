@@ -33,17 +33,17 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/agent"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/hooks"
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/otel"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/version"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/otel"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/version"
 )
 
 // exitSignaled is the exit code returned when the process catches SIGINT or SIGTERM.
@@ -72,14 +72,14 @@ const defaultOTelShutdownTimeoutMs = 5000
 // non-nil tracer returned by otel.Setup (real or its own no-op), so this path
 // is only reached by test call sites that pass nil to exercise runCPI/
 // dispatchOne without constructing a tracer.
-const fallbackTracerName = "github.com/fivetwenty-io/bosh-pve-cpi/cmd/cpi"
+const fallbackTracerName = "github.com/fivetwenty-io/bosh-proxmox-cpi/cmd/cpi"
 
 // fallbackMeterName identifies the no-op Meter runWithArgs falls back to when
 // the metrics-setup factory (production: otel.SetupMetrics) returns an
 // error. It mirrors fallbackTracerName's convention and role: a Meter is
 // still handed to the rest of startup so nothing downstream has to nil-check
 // it, but every instrument it creates is a cheap no-op (fail-open).
-const fallbackMeterName = "github.com/fivetwenty-io/bosh-pve-cpi/cmd/cpi"
+const fallbackMeterName = "github.com/fivetwenty-io/bosh-proxmox-cpi/cmd/cpi"
 
 // noopSignalShutdown is used in place of a logs/metrics shutdown func when
 // the corresponding setup factory returned a nil shutdown (defensive) or

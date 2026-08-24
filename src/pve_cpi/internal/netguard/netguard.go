@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"net"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // IsPrivateOrSpecial returns true when ip is a non-globally-routable address.

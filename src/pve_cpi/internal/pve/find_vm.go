@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // VMLocation is FindVMAuthoritative's answer: where the guest lives, its raw

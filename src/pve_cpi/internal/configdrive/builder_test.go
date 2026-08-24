@@ -9,7 +9,7 @@ import (
 
 	diskfs "github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/configdrive"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/configdrive"
 )
 
 func TestBuild_RoundTrip(t *testing.T) {

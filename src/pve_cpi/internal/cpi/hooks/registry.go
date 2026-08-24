@@ -3,7 +3,7 @@ package hooks
 import (
 	"sort"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 )
 
 // Registry maps each built-in hook name to its constructor. Config validation

@@ -12,9 +12,9 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 )
 
 const lockedCloneDestroyMsg = "500 unable to destroy VM 100: VM is locked (clone)\n"

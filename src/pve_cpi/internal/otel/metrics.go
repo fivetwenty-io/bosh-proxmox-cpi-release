@@ -44,8 +44,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // errorHandlerOnce is the single, package-wide guard for
@@ -76,7 +76,7 @@ func setErrorHandlerOnce(logger *log.Logger) {
 // meterName identifies this instrumentation library to the metrics backend,
 // matching tracerName's convention of using the instrumenting package's
 // import path.
-const meterName = "github.com/fivetwenty-io/bosh-pve-cpi"
+const meterName = "github.com/fivetwenty-io/bosh-proxmox-cpi"
 
 // deltaTemporalitySelector returns metricdata.DeltaTemporality for every
 // InstrumentKind, overriding the SDK default of CumulativeTemporality.

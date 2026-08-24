@@ -16,8 +16,8 @@ import (
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // StorageInfo is the CPI-facing view of a PVE storage entry.

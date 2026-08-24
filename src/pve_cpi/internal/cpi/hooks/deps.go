@@ -3,7 +3,7 @@ package hooks
 import (
 	"context"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // Deps carries everything a built-in hook constructor needs. It is assembled in

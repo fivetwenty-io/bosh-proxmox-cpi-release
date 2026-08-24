@@ -11,7 +11,7 @@ import (
 
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // NodeEndpointResolver resolves the pveproxy address to dial for a node-scoped

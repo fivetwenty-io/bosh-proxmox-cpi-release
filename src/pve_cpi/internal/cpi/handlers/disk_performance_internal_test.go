@@ -3,7 +3,7 @@ package handlers
 import (
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // boolPtr returns a pointer to b. Helper for building DiskPerformanceDefaults literals.

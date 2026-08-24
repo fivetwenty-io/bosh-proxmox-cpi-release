@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 )
 
 // ---------------------------------------------------------------------------

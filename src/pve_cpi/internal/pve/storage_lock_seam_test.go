@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // NOTE: these tests mutate process-wide storage-lock defaults and must NOT run

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/netguard"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/netguard"
 )
 
 // TransportConfig bounds the network steps of every stemcell-fetch HTTP request

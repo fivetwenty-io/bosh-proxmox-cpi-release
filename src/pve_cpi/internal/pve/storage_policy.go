@@ -18,7 +18,7 @@ import (
 	"context"
 	"strings"
 
-	cpierrors "github.com/fivetwenty-io/bosh-pve-cpi/internal/errors"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // PolicyDeps is the narrow dependency interface ValidateLightStemcellStorage

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/fivetwenty-io/bosh-pve-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // newObservedLogger returns a log.Logger backed by an observer so tests can
