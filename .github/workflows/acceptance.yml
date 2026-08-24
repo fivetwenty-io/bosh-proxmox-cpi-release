@@ -51,7 +51,14 @@ concurrency:
 jobs:
   acceptance:
     name: Certify and BATS
-    runs-on: self-hosted
+    # Pinned to the bosh-lab label, which only the runners on the first
+    # worker VM carry. The lab fleet grew to two VMs on 2026-08-24, and
+    # gha-lab-state below is a host directory that exists on that first VM
+    # alone: a run scheduled onto the second VM would find an empty mount,
+    # treat the deployment as new, and build a second director in the lab
+    # while orphaning the live one. Keep this pin as long as the director's
+    # state lives on a single runner host.
+    runs-on: [self-hosted, bosh-lab]
     # BATS alone has taken 2h22m and certify 56m on this lab; six hours gives
     # both room plus the bootstrap without masking a wedged run forever.
     timeout-minutes: 360
