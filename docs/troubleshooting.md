@@ -574,8 +574,8 @@ gone returns success instead: whatever removed it, nothing is left to delete.
 transfer in: write intent record on parker vmid <N> (fail-closed: the record is the crash-window identity carrier): ... description: value may only be 8192 characters long
 ```
 
-The same ceiling has a quieter shape on an ordinary detach, where the record is
-advisory and the parker still has a free slot:
+The same ceiling had a quieter shape on an ordinary detach, where the parker
+still had a free slot and the record was advisory:
 
 ```text
 WARN parker provenance: provenance not updated  parker_vmid=<N> volid=<volid> error=... parker provenance store is full

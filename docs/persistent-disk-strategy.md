@@ -153,16 +153,20 @@ Fields:
 | `slot` | Stable-ID entries only. The parker bus slot the disk occupies, or the slot a detach-side transfer targets. |
 | `opts` | Either keying generation, optional. The disk's recorded drive-option overrides (operator updates made through `update_disk`) while it is parked — see [Durable disk option updates](#durable-disk-option-updates). Absent means no overrides are recorded. |
 
-Provenance writes are best-effort: a failure logs a warning but does not block
-the park. Because PVE has no atomic read-modify-write on VM descriptions,
+Provenance writes are best-effort in one direction only. Room for the record is
+confirmed before an ordinary park moves the disk, so a parker whose store is
+full routes the disk elsewhere instead of taking it and dropping the entry; see
+[Store capacity and collection](#store-capacity-and-collection). Past that
+check, a write that fails for some other reason logs a warning and does not
+block the park. Because PVE has no atomic read-modify-write on VM descriptions,
 two concurrent park operations targeting the same parker VM may overwrite each
 other's provenance entry. The disk remains correctly attached in its `scsiN`
 slot; only the advisory provenance record may be incomplete.
 
-The detach-side transfer is the one exception. Between the source slot's
-deletion and the serial landing on the parker, its intent record carries the
-disk's only identity, so that write is strict: the transfer refuses to proceed
-until the record reaches the parker.
+The detach-side transfer goes further still. Between the source slot's deletion
+and the serial landing on the parker, its intent record carries the disk's only
+identity, so that write is strict at every stage: the transfer refuses to
+proceed until the record reaches the parker.
 
 #### Store capacity and collection
 
