@@ -159,6 +159,31 @@ two concurrent park operations targeting the same parker VM may overwrite each
 other's provenance entry. The disk remains correctly attached in its `scsiN`
 slot; only the advisory provenance record may be incomplete.
 
+The detach-side transfer is the one exception. Between the source slot's
+deletion and the serial landing on the parker, its intent record carries the
+disk's only identity, so that write is strict: the transfer refuses to proceed
+until the record reaches the parker.
+
+#### Store capacity and collection
+
+PVE caps a guest description at 8192 characters, which bounds how many records
+one parker can hold. Two behaviors keep the store inside that bound.
+
+Every write first collects the records that are no longer live: a record whose
+volume neither a `scsiN` slot nor an `unusedN` key on that parker names, and
+whose `parked_at` is more than an hour old. The age test protects an in-flight
+transfer, whose intent record predates the disk it names and is therefore
+unreferenced by design. Collection keeps a long-lived parker from filling with
+records for disks that left by a route nothing recorded: an out-of-band delete,
+a remove whose config write failed, or a director torn down while its disks
+were reaped by hand.
+
+A parker whose live records still fill the store presents a capacity condition,
+handled exactly like a parker with no free slot: the disk goes to the next
+parker on the node, or to a freshly allocated one. That decision lands before
+anything destructive runs, so a full store never puts a disk at risk. Ordinary
+parks, whose provenance writes are advisory, log a warning and carry on.
+
 The `disk-audit` script reads these sentinel entries to build its inventory.
 Free-floating disks have no provenance entry because PVE provides no field to
 write one. That gap is why `disk-audit` classifies free-floating volumes

@@ -562,6 +562,45 @@ pvesm list <disk_storage> | grep <volid>
 
 Verify the volume exists and its data is intact. Then set `pve.parked_anchor_strict: false` in the CPI manifest (or cpi-config entry) and retry: the CPI treats the disk as free-floating, and the next detach re-parks it onto a fresh parker, restoring the anchor. Re-enable strict afterwards (remove the property). Labs that intentionally delete parkers can leave the property false. See [Persistent Disk Strategy](persistent-disk-strategy.md).
 
+`delete_disk` reaches this refusal only when the volume is still on storage, or
+when its absence cannot be established. A `delete_disk` whose volume is already
+gone returns success instead: whatever removed it, nothing is left to delete.
+
+### Parked-disk records fill a parker's description
+
+**Symptom**
+
+```text
+transfer in: write intent record on parker vmid <N> (fail-closed: the record is the crash-window identity carrier): ... description: value may only be 8192 characters long
+```
+
+**Diagnosis**
+
+Releases before this fix never collected parked-disk records, so a long-lived
+parker accumulated entries for disks that had left by a route nothing recorded,
+until the next write crossed PVE's description cap. `detach_disk` and
+`delete_vm` then failed closed rather than park a disk whose identity they could
+not record. Failing closed is the right answer to that state; reaching the state
+at all is the defect.
+
+Read the store to confirm what is in it:
+
+```bash
+qm config <parker-vmid> | grep -o '<!--BOSH:.*-->'
+./scripts/disk-audit --config cpi.json
+```
+
+**Fix**
+
+Upgrade. Every provenance write now collects records whose volume nothing on
+that parker references and whose `parked_at` is over an hour old, and a parker
+whose live records genuinely fill the store hands the disk to another parker
+instead of failing. To clear an affected parker before upgrading, confirm from
+`disk-audit` which records name volumes the parker no longer holds and edit the
+sentinel out of its description with `qm set <parker-vmid> --description`,
+preserving the rest of the JSON. See
+[Persistent Disk Strategy](persistent-disk-strategy.md).
+
 ### delete_vm refuses to destroy VM with attached unused disks
 
 **Symptom**

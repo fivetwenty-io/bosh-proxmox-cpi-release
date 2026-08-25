@@ -833,6 +833,37 @@ func TestIsVolumeMissing_ZfspoolDatasetMissing(t *testing.T) {
 	}
 }
 
+func TestIsVolumeMissing_RbdImageAbsent(t *testing.T) {
+	t.Parallel()
+	// Exact imgdel task-body shape observed on lab-ceph when delete_disk ran
+	// against an image the parked-owned deallocation had already removed.
+	err := errors.New(`rbd: error opening image vm-90842-disk-0: (2) No such file or directory`)
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected rbd 'error opening image' to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_RbdLibrbdRemove(t *testing.T) {
+	t.Parallel()
+	// librbd's own wording for the same condition, which PVE surfaces
+	// unchanged from the imgdel task body.
+	err := errors.New(
+		`librbd::api::Image: remove: error opening image: (2) No such file or directory`)
+	if !pve.IsVolumeMissing(err) {
+		t.Errorf("expected librbd remove-on-absent-image to classify as missing; err=%v", err)
+	}
+}
+
+func TestIsVolumeMissing_UnrelatedRbdFault(t *testing.T) {
+	t.Parallel()
+	// A real Ceph fault must stay a fault: treating it as "already gone"
+	// would report a delete that never happened as successful.
+	err := errors.New(`rbd: error opening image vm-90842-disk-0: (110) Connection timed out`)
+	if pve.IsVolumeMissing(err) {
+		t.Errorf("an rbd error that is not an absent image must not classify as missing; err=%v", err)
+	}
+}
+
 func TestIsVolumeMissing_HTTP404(t *testing.T) {
 	t.Parallel()
 	// SDK 404 path must still classify (existing IsNotFound semantics retained).

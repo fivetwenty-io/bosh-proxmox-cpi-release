@@ -240,7 +240,7 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 // is advisory metadata for disk-audit.
 func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) {
 	entry := buildParkerProvEntry(node, bareVolid, slot, cfg, pctx)
-	if err := writeParkerProvenance(ctx, c, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry); err != nil {
+	if err := writeParkerProvenance(ctx, c, logger, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg); err != nil {
 		if logger != nil {
 			logger.Warn("parker provenance: provenance not updated",
 				log.Int("parker_vmid", parkerVMID),
@@ -290,12 +290,126 @@ func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx P
 	return entry
 }
 
+// ErrProvenanceFull reports that a parker's description cannot hold another
+// parked-disk record. It is a capacity condition, exactly like ErrNoSlots:
+// the parker is unusable for this park, another one is not. Every park loop
+// treats the two identically (see isParkerCapacityError), so a full store
+// moves the disk to the next parker instead of failing the detach.
+var ErrProvenanceFull = errors.New("parker provenance store is full")
+
+// parkerDescriptionLimit is PVE's hard cap on a guest description. Exceeding
+// it fails the config PUT with "description: value may only be 8192
+// characters long" — observed on lab-pmx parker 90472, where it turned
+// detach_disk and delete_vm into fail-closed refusals. The cap is stated in
+// characters and measured here in bytes, which for any description longer in
+// bytes than in characters errs toward refusing early.
+const parkerDescriptionLimit = 8192
+
+// parkerDescriptionBudget is the largest description this package will write,
+// leaving parkerDescriptionReserve below the cap. The reserve covers growth
+// this read-modify-write cannot see: the other sentinel keys
+// (bosh_attached_disks, bosh_disk_opt_overlays) belong to other writers who
+// may add to the same description between our read and PVE's write. Losing
+// that race at the PUT would surface as an opaque PVE rejection on a parker
+// the caller has already committed to; losing it at the budget check surfaces
+// as ErrProvenanceFull, which the park loops know how to route around.
+const parkerDescriptionBudget = parkerDescriptionLimit - parkerDescriptionReserve
+
+// parkerDescriptionReserve is the headroom left below the PVE cap.
+const parkerDescriptionReserve = 512
+
+// parkerProvenanceGraceWindow is how long an unreferenced record is protected
+// from collection. A detach-side transfer writes its intent record BEFORE the
+// disk lands on the parker (the write ordering D13 requires), so "no slot on
+// this parker names the volume" is the normal state of a young record, not
+// evidence that it is stale. A transfer that has not converged in an hour has
+// long since been re-driven or abandoned by the Director.
+const parkerProvenanceGraceWindow = time.Hour
+
+// parkerReferencedVolids returns every volid a parker's config currently
+// names, from an active bus slot or an unusedN key. Values are bare: option
+// suffixes are stripped so they compare directly against recorded volids.
+func parkerReferencedVolids(vmCfg map[string]any) map[string]bool {
+	out := make(map[string]bool)
+	for _, val := range qemu.ParseDisks(vmCfg) {
+		bare := val
+		if comma := strings.IndexByte(bare, ','); comma >= 0 {
+			bare = bare[:comma]
+		}
+		if bare != "" {
+			out[bare] = true
+		}
+	}
+	for _, volid := range FindUnusedDiskEntries(vmCfg) {
+		if volid != "" {
+			out[volid] = true
+		}
+	}
+	return out
+}
+
+// provEntryVolid is the volume a record names: the volid field for stable-ID
+// records, and the key itself for legacy records, which are keyed by the bare
+// volid and omit the field.
+func provEntryVolid(key string, entry parkerProvEntry) string {
+	if entry.Volid != "" {
+		return entry.Volid
+	}
+	return key
+}
+
+// collectStaleParkerProvenance deletes from disks every record whose volume
+// nothing on the parker references and whose parked_at is older than the
+// grace window. It returns the keys it removed, for the caller's log line.
+//
+// keepKey is the record being written and is never collected — it is the
+// youngest record in the store by definition, and for a transfer intent it is
+// the disk's only identity carrier.
+//
+// An unparseable or absent parked_at counts as older than the window. Every
+// writer in this package stamps RFC3339, so a value that will not parse is
+// corruption rather than a young record, and corruption that also names a
+// volume nothing holds is exactly what this is here to clear.
+func collectStaleParkerProvenance(
+	disks map[string]parkerProvEntry, vmCfg map[string]any, keepKey string, now time.Time,
+) []string {
+	referenced := parkerReferencedVolids(vmCfg)
+	var pruned []string
+	for key, entry := range disks {
+		if key == keepKey {
+			continue
+		}
+		if referenced[provEntryVolid(key, entry)] {
+			continue
+		}
+		if parsed, parseErr := time.Parse(time.RFC3339, entry.ParkedAt); parseErr == nil {
+			if now.Sub(parsed) < parkerProvenanceGraceWindow {
+				continue
+			}
+		}
+		delete(disks, key)
+		pruned = append(pruned, key)
+	}
+	sort.Strings(pruned)
+	return pruned
+}
+
 // writeParkerProvenance is the strict read-modify-write behind every
 // provenance update. Ordinary parks treat a failure as advisory (the
 // best-effort wrapper above); the detach-side transfer does not — its intent
 // record is the crash-window identity carrier, so the transfer refuses to
 // delete the source slot until this write has landed.
-func writeParkerProvenance(ctx context.Context, c Client, node string, parkerVMID int, key string, entry parkerProvEntry) error {
+//
+// Every write collects stale records first. Nothing else does: the only other
+// deletion, removeParkerProvenance, removes the single volid it was handed, so
+// a disk that leaves a parker by any other route (an out-of-band delete, a
+// remove whose config write failed and logged, a director torn down while its
+// disks were reaped by hand) leaves its record behind forever. That is how the
+// store reaches PVE's description cap by accumulation rather than by load.
+func writeParkerProvenance(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
+) error {
 	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
 	if err != nil {
 		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
@@ -304,9 +418,28 @@ func writeParkerProvenance(ctx context.Context, c Client, node string, parkerVMI
 	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
 	disks[key] = entry
 
+	// The config read above is the same one the reference test needs, so
+	// collection costs no extra API call.
+	if pruned := collectStaleParkerProvenance(disks, vmCfg, key, parkerNow(cfg)); len(pruned) > 0 && logger != nil {
+		logger.Info("parker provenance: collected stale parked-disk records",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.Int("collected", len(pruned)),
+			log.String("keys", strings.Join(pruned, ",")),
+		)
+	}
+
 	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
 		return cpierrors.Wrap(marshalErr, "parker provenance: marshal")
+	}
+	if len(newDesc) > parkerDescriptionBudget {
+		// Refuse here rather than at the PUT. The caller can still choose
+		// another parker; PVE's rejection arrives too late to be useful and
+		// says only that a string was too long.
+		return fmt.Errorf(
+			"parker provenance: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
+			parkerVMID, node, len(disks), len(newDesc), parkerDescriptionBudget, ErrProvenanceFull)
 	}
 
 	nodesSvc := c.Nodes()
@@ -1143,7 +1276,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if attachErr == nil {
 			return nil
 		}
-		if errors.Is(attachErr, ErrNoSlots) {
+		if isParkerCapacityError(attachErr) {
 			continue
 		}
 		return cpierrors.Wrap(attachErr, "ParkDisk: attach to parker")
@@ -1167,11 +1300,11 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		if attachErr == nil {
 			return nil
 		}
-		if !errors.Is(attachErr, ErrNoSlots) {
+		if !isParkerCapacityError(attachErr) {
 			return cpierrors.Wrap(attachErr, "ParkDisk: attach to fresh parker")
 		}
 		if logger != nil {
-			logger.Warn("parker: freshly ensured parker had no free slot; allocating another",
+			logger.Warn("parker: freshly ensured parker had no capacity for the disk; allocating another",
 				log.Int("parker_vmid", freshVMID),
 				log.String("node", node),
 				log.Int("attempt", attempt+1),
@@ -1179,7 +1312,8 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 		}
 	}
 	return cpierrors.Retriable(
-		"ParkDisk: could not find a parker with a free slot on node %s after %d fresh-parker attempts",
+		"ParkDisk: could not find a parker on node %s with both a free slot and room in its provenance store, "+
+			"after %d fresh-parker attempts",
 		node, freshParkerAttempts)
 }
 
@@ -1204,6 +1338,16 @@ const parkerWindowMaxAttempts = 4
 // single attempt is not enough; an unbounded loop would spin against a genuinely
 // exhausted band.
 const freshParkerAttempts = 3
+
+// isParkerCapacityError reports whether err says "this parker cannot take the
+// disk, another one can". Two conditions qualify and the park loops treat
+// them identically: every bus slot is taken (ErrNoSlots), and the provenance
+// store has no room for the record (ErrProvenanceFull). Both are reached
+// before anything destructive has run, so moving to the next parker is always
+// safe; neither is a reason to fail the detach that asked for the park.
+func isParkerCapacityError(err error) bool {
+	return errors.Is(err, ErrNoSlots) || errors.Is(err, ErrProvenanceFull)
+}
 
 // attachAndSecure performs one park onto a known parker with that parker's
 // protection window held: attach, put protection back, record provenance.

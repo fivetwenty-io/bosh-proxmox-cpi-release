@@ -154,7 +154,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 			Opts:     map[string]string{"cache": "writeback", "serial": "bpd-evil"},
 		}
 		entry := buildParkerProvEntry("pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, pctx)
-		if err := writeParkerProvenance(context.Background(), c, "pve1", 90000, overlayTestStableID, entry); err != nil {
+		if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, overlayTestStableID, entry, parkerTestCfgInternal()); err != nil {
 			t.Fatalf("writeParkerProvenance: %v", err)
 		}
 		got, err := ReadParkerDiskOverlay(context.Background(), c, "pve1", 90000, "data:vm-90000-disk-0", overlayTestStableID)
@@ -177,7 +177,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 		entry := buildParkerProvEntry("pve1", "data:vm-90000-disk-3", "scsi3", transferTestCfg, ParkContext{
 			DiskCID: "pvd-x", StableID: overlayTestStableID, Opts: map[string]string{"iothread": "0"},
 		})
-		if err := writeParkerProvenance(context.Background(), c, "pve1", 90000, overlayTestStableID, entry); err != nil {
+		if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, overlayTestStableID, entry, parkerTestCfgInternal()); err != nil {
 			t.Fatalf("writeParkerProvenance: %v", err)
 		}
 		// Look up with no stable ID and the current volid alone.
@@ -199,7 +199,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 			DiskCID: "pvd-x", SourceVMCID: "700", StableID: overlayTestStableID,
 			Opts: map[string]string{"cache": "none"},
 		})
-		if err := writeParkerProvenance(context.Background(), c, "pve1", 90000, overlayTestStableID, entry); err != nil {
+		if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, overlayTestStableID, entry, parkerTestCfgInternal()); err != nil {
 			t.Fatalf("writeParkerProvenance: %v", err)
 		}
 		merged, err := ApplyParkerDiskOverlay(context.Background(), c, "pve1", 90000,
@@ -262,7 +262,7 @@ func TestResumeDiskTransferKeepsOverlay(t *testing.T) {
 		DiskCID: "pvd-x", SourceVMCID: "700", StableID: transferStableID,
 		Opts: map[string]string{"cache": "writeback"},
 	})
-	if err := writeParkerProvenance(context.Background(), c, "pve1", 90000, transferStableID, intentEntry); err != nil {
+	if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, transferStableID, intentEntry, parkerTestCfgInternal()); err != nil {
 		t.Fatalf("writeParkerProvenance: %v", err)
 	}
 

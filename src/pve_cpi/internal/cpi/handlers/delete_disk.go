@@ -28,11 +28,19 @@ import (
 // take the ordinary unpark: PVE deallocates an unused volume its holder owns,
 // so the unpark's sweep semantics ARE the deletion, and its safety guard
 // rightly refuses. DeleteParkedOwnedDisk makes that intent explicit — the
-// detach deallocates the volume, and the storage delete that follows finds
-// it already gone (idempotent success).
-func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk) error {
+// detach deallocates the volume.
+//
+// The bool reports that the volume is already off storage and the caller must
+// not issue a storage delete. Two paths set it. The parked-owned deallocation
+// above IS the delete, and an imgdel behind it can only fail: on Ceph it does,
+// with "rbd: error opening image <name>: (2) No such file or directory" from
+// a task PVE accepted, which is a task failure rather than the 404 the
+// idempotent path reads. The second is a promised anchor whose volume is not
+// on storage at all: nothing to unpark and nothing to delete, so the delete
+// the Director asked for has already happened.
+func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node string) (bool, error) {
 	if deps.Config == nil {
-		return nil
+		return false, nil
 	}
 	parkerCfg := parkerReadConfigFor(deps)
 	var holder pve.DiskHolder
@@ -44,7 +52,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk) error {
 		var resolveErr error
 		holder, resolveErr = pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerCfg)
 		if resolveErr != nil {
-			return wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
+			return false, wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
 		}
 	}
 	// A disk whose CID promises a parker anchor must have a holder while
@@ -52,18 +60,33 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk) error {
 	// deleting the volume would destroy the one copy of the data before
 	// anyone has looked at why its protected home disappeared.
 	if anchorErr := anchorMissingRefusal(ctx, deps, "delete_disk", rd.diskCID, rd.meta, holder); anchorErr != nil {
-		return anchorErr
+		// The refusal reads "no holder" as a parker deleted out-of-band, which
+		// is right only while the volume is still there. When it is not, the
+		// state is a completed delete, and answering it with advice to relax
+		// pve.parked_anchor_strict points the operator at a fault that is not
+		// the one in front of them. Absence has to be established, not assumed:
+		// a probe that fails proves nothing, so the refusal stands.
+		gone, checkErr := volumeAbsentFromStorage(ctx, deps, node, rd.volid)
+		if checkErr != nil || !gone {
+			return false, anchorErr
+		}
+		deps.Log(ctx).Info("delete_disk: promised anchor has no holder and the volume is not on storage, treating as already-deleted",
+			log.String("disk_cid", rd.diskCID),
+		)
+		return true, nil
 	}
 	if strandedErr := strandedParkerRefusal(deps, "delete_disk", rd.diskCID, holder); strandedErr != nil {
-		return strandedErr
+		return false, strandedErr
 	}
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {
 			if delErr := pve.DeleteParkedOwnedDisk(ctx, deps.PVE, deps.Log(ctx), holder.Node, holder.VMID, rd.volid, parkerCfg); delErr != nil {
-				return retriableUnlessPermanent(delErr,
+				return false, retriableUnlessPermanent(delErr,
 					fmt.Sprintf("delete_disk: deallocate parked disk %s on its parker", rd.diskCID))
 			}
-			return nil
+			// The detach deallocated the volume. There is nothing left for a
+			// storage delete to remove.
+			return true, nil
 		}
 	}
 	// UnparkDiskAt reuses the holder just resolved and is a no-op when the disk
@@ -76,9 +99,79 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk) error {
 		deps.Log(ctx).Info("delete_disk: unpark failed",
 			log.String("disk_cid", rd.diskCID),
 		)
-		return cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
+		return false, cpierrors.Wrap(unparkErr, "delete_disk: unpark before delete")
 	}
-	return nil
+	return false, nil
+}
+
+// volumeAbsentFromStorage reports whether the volume is provably not on
+// storage. The error return distinguishes "present" from "could not tell":
+// callers use this to turn a refusal into idempotent success, and only a
+// probe that answered may do that.
+func volumeAbsentFromStorage(ctx context.Context, deps Deps, node, bareVolid string) (bool, error) {
+	if node == "" {
+		return false, cpierrors.Cloud("delete_disk: no node to probe storage from")
+	}
+	storage, _, err := pve.ParseDiskCID(bareVolid)
+	if err != nil {
+		return false, err
+	}
+	exists, existsErr := pve.ExistsTolerant(ctx, deps.PVE, node, storage, bareVolid)
+	if existsErr != nil {
+		return false, existsErr
+	}
+	return !exists, nil
+}
+
+// deleteDiskVolume issues the storage delete for a volume nothing references
+// any more.
+//
+// Fast-path mode (fast_path_delete=true): issue DeleteVolumeAsync and return
+// immediately without awaiting the imgdel task. Eventual consistency: has_disk
+// may briefly still see the volume. Disk volumes cannot carry PVE tags, so no
+// "bosh-deleting" marker is applied here; the operator must rely on the volume
+// eventually disappearing from storage. The §7.13 orphan-GC sweep (for VM
+// templates) does not cover raw volumes; PVE's own storage GC handles stale
+// imgdel residue.
+//
+// Slow-path mode (default): issue DeleteVolumeAsync and await the returned
+// imgdel UPID so a queued imgdel under storage-lock contention cannot fire
+// after delete_disk has already returned success.
+func deleteDiskVolume(ctx context.Context, deps Deps, diskCID, bareDiskCID, storage, node string) error {
+	delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_disk", 0, func() error {
+		upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, bareDiskCID)
+		if err != nil {
+			return err
+		}
+		// Fast-path: return without awaiting the task UPID.
+		if deps.Config.FastPathDeleteEnabled() {
+			return nil
+		}
+		if upid == "" {
+			return nil
+		}
+		return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
+	})
+	if delErr == nil {
+		return nil
+	}
+	// Check whether the error says the volume is already gone. The SDK
+	// DeleteVolume swallows 404 internally, but block-backed storages report an
+	// absent volume through a failed task rather than a 404: lvmthin and
+	// zfspool with their CLI text, rbd with "error opening image ...: (2) No
+	// such file or directory". IsVolumeMissing reads all of those; IsNotFound
+	// alone reads only the 404, which is how a completed delete came back to
+	// the Director as a failure.
+	if pve.IsVolumeMissing(delErr) {
+		deps.Log(ctx).Info("delete_disk: disk already absent, skipping",
+			log.String("disk_cid", diskCID),
+		)
+		return nil
+	}
+	// WrapErrorKeepingClass like every sibling delete path: a transient storage
+	// fault must not surface as a permanent delete_disk failure.
+	return cpierrors.Wrap(pve.WrapErrorKeepingClass(delErr),
+		"delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
 }
 
 // resolveDeleteDiskCID is delete_disk's identity seam: decode the CID, map it
@@ -195,53 +288,20 @@ func HandleDeleteDisk(deps Deps) Handler {
 		//     Unpark failure → retriable; the disk is still safe on the
 		//     parker VM and the caller can retry.
 		// ----------------------------------------------------------------
-		if err := unparkBeforeDelete(ctx, deps, rd); err != nil {
+		alreadyDeleted, err := unparkBeforeDelete(ctx, deps, rd, node)
+		if err != nil {
 			return nil, err
+		}
+		if alreadyDeleted {
+			deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))
+			return nil, nil
 		}
 
 		// ----------------------------------------------------------------
 		// 4. Delete the volume.
-		//
-		// Fast-path mode (fast_path_delete=true): issue DeleteVolumeAsync and
-		// return immediately without awaiting the imgdel task. Eventual
-		// consistency: has_disk may briefly still see the volume. Disk volumes
-		// cannot carry PVE tags, so no "bosh-deleting" marker is applied here;
-		// the operator must rely on the volume eventually disappearing from
-		// storage. The §7.13 orphan-GC sweep (for VM templates) does not cover
-		// raw volumes; PVE's own storage GC handles stale imgdel residue.
-		//
-		// Slow-path mode (default): issue DeleteVolumeAsync and await the
-		// returned imgdel UPID so a queued imgdel under storage-lock contention
-		// cannot fire after delete_disk has already returned success.
 		// ----------------------------------------------------------------
-		delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_disk", 0, func() error {
-			upid, err := deps.PVE.Storage().DeleteVolumeAsync(ctx, node, storage, bareDiskCID)
-			if err != nil {
-				return err
-			}
-			// Fast-path: return without awaiting the task UPID.
-			if deps.Config.FastPathDeleteEnabled() {
-				return nil
-			}
-			if upid == "" {
-				return nil
-			}
-			return pve.AwaitTaskWithLogger(ctx, deps.PVE, node, upid, deps.Log(ctx))
-		})
-		if err := delErr; err != nil {
-			// Check whether the error is a not-found variant. The SDK
-			// DeleteVolume already swallows 404 internally, but if a
-			// non-SDK not-found surfaces we still treat it as success.
-			if pve.IsNotFound(err) {
-				deps.Log(ctx).Info("delete_disk: disk already absent, skipping",
-					log.String("disk_cid", diskCID),
-				)
-				return nil, nil
-			}
-			// WrapErrorKeepingClass like every sibling delete path: a transient
-			// storage fault must not surface as a permanent delete_disk failure.
-			return nil, cpierrors.Wrap(pve.WrapErrorKeepingClass(err),
-				"delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
+		if delErr := deleteDiskVolume(ctx, deps, diskCID, bareDiskCID, storage, node); delErr != nil {
+			return nil, delErr
 		}
 
 		deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))

@@ -200,7 +200,7 @@ func isolateDiskOntoMover(
 	// record (plus the serial riding the drive entry) is what the identity
 	// scan finds after a crash.
 	intent := buildParkerProvEntry(spec.Holder.Node, spec.Volid, moverIsolationSlot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, spec.Holder.Node, moverVMID, spec.StableID, intent); provErr != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, intent, cfg); provErr != nil {
 		destroyMoverBestEffort(ctx, c, logger, moverVMID, spec.Holder.Node, cfg)
 		return DiskHolder{}, "", cpierrors.Wrap(provErr,
 			fmt.Sprintf("disk migrate: write intent record on mover vmid %d (fail-closed: the record is the crash-window identity carrier)", moverVMID))
@@ -221,7 +221,7 @@ func isolateDiskOntoMover(
 	// best-effort now that the serial rides the mover's drive entry.
 	final := intent
 	final.Volid = landed
-	if provErr := writeParkerProvenance(ctx, c, spec.Holder.Node, moverVMID, spec.StableID, final); provErr != nil && logger != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, final, cfg); provErr != nil && logger != nil {
 		logger.Warn("disk migrate: could not finalize the mover's provenance record (non-fatal; the drive serial is authoritative)",
 			log.Int("mover_vmid", moverVMID),
 			log.String("volid", landed),
@@ -414,7 +414,7 @@ func convergeMigratedMover(
 	reassertParkerProtection(ctx, c, logger, spec.TargetNode, moverVMID)
 
 	entry := buildParkerProvEntry(spec.TargetNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, spec.TargetNode, moverVMID, spec.StableID, entry); provErr != nil && logger != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil && logger != nil {
 		logger.Warn("disk migrate: could not rewrite the mover's provenance record for its new node (non-fatal; the drive serial is authoritative)",
 			log.Int("mover_vmid", moverVMID),
 			log.String("node", spec.TargetNode),

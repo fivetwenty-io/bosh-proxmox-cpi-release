@@ -380,7 +380,7 @@ func TransferDiskToParker(
 		if err == nil {
 			return landed, nil
 		}
-		if errors.Is(err, ErrNoSlots) {
+		if isParkerCapacityError(err) {
 			continue
 		}
 		return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to parker")
@@ -394,12 +394,13 @@ func TransferDiskToParker(
 		if err == nil {
 			return landed, nil
 		}
-		if !errors.Is(err, ErrNoSlots) {
+		if !isParkerCapacityError(err) {
 			return "", cpierrors.Wrap(err, "TransferDiskToParker: transfer to fresh parker")
 		}
 	}
 	return "", cpierrors.Retriable(
-		"TransferDiskToParker: could not find a parker with a free slot on node %s after %d fresh-parker attempts",
+		"TransferDiskToParker: could not find a parker on node %s with both a free slot and room in its "+
+			"provenance store, after %d fresh-parker attempts",
 		node, freshParkerAttempts)
 }
 
@@ -440,7 +441,7 @@ func transferIntoParkerLocked(
 	// until the serial lands on the parker, this record is the disk's only
 	// identity carrier, so the transfer must not proceed without it.
 	intent := buildParkerProvEntry(node, bareVolid, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, node, parkerVMID, pctx.StableID, intent); provErr != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, intent, cfg); provErr != nil {
 		return "", cpierrors.Wrap(provErr,
 			fmt.Sprintf("transfer in: write intent record on parker vmid %d (fail-closed: the record is the crash-window identity carrier)", parkerVMID))
 	}
@@ -525,7 +526,7 @@ func transferIntoParkerLocked(
 	// a stale record only costs recovery a slot read.
 	final := intent
 	final.Volid = landed
-	if provErr := writeParkerProvenance(ctx, c, node, parkerVMID, pctx.StableID, final); provErr != nil && logger != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil && logger != nil {
 		logger.Warn("transfer in: could not finalize the provenance record (non-fatal; the drive serial is authoritative)",
 			log.Int("parker_vmid", parkerVMID),
 			log.String("volid", landed),
@@ -757,7 +758,7 @@ func finalizeResumedTransfer(
 	cfg ParkerConfig, pctx ParkContext,
 ) {
 	entry := buildParkerProvEntry(intent.ParkerNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, intent.ParkerNode, intent.ParkerVMID, stableID, entry); provErr != nil && logger != nil {
+	if provErr := writeParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil && logger != nil {
 		logger.Warn("transfer resume: could not finalize the provenance record (non-fatal; the drive serial is authoritative)",
 			log.Int("parker_vmid", intent.ParkerVMID),
 			log.String("volid", landed),

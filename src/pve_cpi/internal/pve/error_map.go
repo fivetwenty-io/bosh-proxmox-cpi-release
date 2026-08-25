@@ -321,6 +321,13 @@ func IsNotFound(err error) bool {
 //     logical volume \"<vg>/<lv>\"". Either substring is sufficient.
 //   - zfspool: similar pattern with "dataset does not exist" or
 //     "no such pool or dataset".
+//   - rbd: the imgdel task body carries the librbd wording, "error opening
+//     image <name>: (2) No such file or directory". The errno is what makes
+//     it an absence: rbd reports connectivity and permission faults through
+//     the same "error opening image" prefix with a different errno, and
+//     folding those into "already gone" would report a delete that never
+//     happened as successful. Observed on lab-ceph when delete_disk issued
+//     imgdel for an image the parked-owned deallocation had already removed.
 //
 // Callers that want existence semantics — has_disk, delete_disk idempotency,
 // the NodeForExisting cluster scan — should fold this into a clean "not
@@ -345,6 +352,8 @@ func IsVolumeMissing(err error) bool {
 	case strings.Contains(msg, "dataset does not exist"):
 		return true
 	case strings.Contains(msg, "no such pool or dataset"):
+		return true
+	case strings.Contains(msg, "error opening image") && strings.Contains(msg, "no such file or directory"):
 		return true
 	}
 	return false
