@@ -15,6 +15,14 @@ permissions:
 concurrency:
   group: release-${{ github.ref }}
 
+# Self-hosted lab runners host four jobs per VM on eight cores. Go sizes
+# its build parallelism from the host core count, so each job fans out as
+# if it owned the machine and four of them together exhaust the VM's
+# memory. Runner-level env does not cross into container jobs; workflow
+# env is part of the job context, which the runner does carry in.
+env:
+  GOMAXPROCS: 2
+
 jobs:
   check:
     name: Check
