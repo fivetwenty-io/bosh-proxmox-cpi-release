@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-25
+
 ### Added
 
 - Final release metadata is now tracked on the default branch (`releases/bosh-proxmox-cpi/` and `.final_builds/`, starting with 0.5.0), so release aggregators such as bosh.io can index our releases and rebuild them from the public blobstore with `bosh create-release`.
@@ -330,7 +332,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.2.0...v0.3.0
