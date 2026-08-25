@@ -64,7 +64,7 @@ flowchart LR
 - The contract is 21 canonical methods plus the `update_disk` extension we will add; "many drivers" is literal — same method set, AWS/Azure/vSphere/PVE each translate it differently.
 - v2 reshaped the contract: `create_vm` now returns `[vm_cid, networks_with_mac]`, `attach_disk` returns disk hints, `configure_networks` is gone (networks set only at create_vm), and there is no registry.
 - "Swap driver, Director never notices" is real but bounded — we and vSphere will be the only two CPIs that even implement network lifecycle; surface coverage is the easy part, depth within methods is the actual work ahead.
-- The certification boundary will back the claim: our local lifecycle harness will run 14 canonical methods end-to-end against live PVE in minutes; the upstream Concourse BAT suite is the release gate we target, though no `pve/` directory exists upstream yet.
+- The certification boundary will back the claim: our local lifecycle harness will run 19 of the 22 methods end-to-end against live PVE in minutes, 21 with network testing on; the upstream Concourse BAT suite is the release gate we target, though no `pve/` directory exists upstream yet.
 -->
 
 ---

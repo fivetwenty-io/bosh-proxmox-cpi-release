@@ -2,7 +2,7 @@
 
 Four paths exist for certifying this CPI release against the BOSH CPI v2 contract. Each covers a surface the one before it does not.
 
-1. **Local lifecycle harness**: `scripts/lifecycle` in this repo. Exercises the 14 canonical lifecycle methods end-to-end against a live PVE cluster in a few minutes. No Concourse, no terraform, and no full BOSH director required. Driven through `./scripts/test integration lifecycle`, it records a committed run report under `docs/certification/lifecycle/` (see [Lifecycle results](lifecycle/README.md)). **Recommended for day-to-day development and pre-merge validation.**
+1. **Local lifecycle harness**: `scripts/lifecycle` in this repo. Exercises 19 of the 22 methods this CPI implements end-to-end against a live PVE cluster in a few minutes, and 21 with `NETWORK_TEST_MODE` enabled; only `calculate_vm_cloud_properties` is left out. No Concourse, no terraform, and no full BOSH director required. Driven through `./scripts/test integration lifecycle`, it records a committed run report under `docs/certification/lifecycle/` (see [Lifecycle results](lifecycle/README.md)). **Recommended for day-to-day development and pre-merge validation.**
 
 2. **Local BOSH Acceptance Tests**: `scripts/bats` in this repo. Runs the upstream [BOSH Acceptance Test](https://github.com/cloudfoundry/bosh-acceptance-tests) rspec suite against the live director the e2e harness stands up, with the PVE tag-exclusion set, and records a committed run report under `docs/certification/bats/`. See [Running BATS](bats.md). **Recommended before cutting a release.**
 

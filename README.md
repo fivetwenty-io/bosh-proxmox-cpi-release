@@ -192,7 +192,7 @@ See [Development guide](docs/development.md) for the source layout, testing stra
 
 ## BOSH CPI Lifecycle Tests
 
-A local harness exercises the 14 canonical CPI methods end-to-end against a live PVE cluster:
+A local harness exercises 19 of the 22 methods this CPI implements end-to-end against a live PVE cluster, and 21 with `NETWORK_TEST_MODE` enabled (only `calculate_vm_cloud_properties` is left out):
 
 ```bash
 export CPI_CONFIG=~/.bosh-proxmox-cpi/cpi.json
