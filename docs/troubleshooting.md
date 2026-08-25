@@ -574,6 +574,13 @@ gone returns success instead: whatever removed it, nothing is left to delete.
 transfer in: write intent record on parker vmid <N> (fail-closed: the record is the crash-window identity carrier): ... description: value may only be 8192 characters long
 ```
 
+The same ceiling has a quieter shape on an ordinary detach, where the record is
+advisory and the parker still has a free slot:
+
+```text
+WARN parker provenance: provenance not updated  parker_vmid=<N> volid=<volid> error=... parker provenance store is full
+```
+
 **Diagnosis**
 
 Releases before this fix never collected parked-disk records, so a long-lived
@@ -581,7 +588,9 @@ parker accumulated entries for disks that had left by a route nothing recorded,
 until the next write crossed PVE's description cap. `detach_disk` and
 `delete_vm` then failed closed rather than park a disk whose identity they could
 not record. Failing closed is the right answer to that state; reaching the state
-at all is the defect.
+at all is the defect. An ordinary detach failed differently: the parker still had
+free slots, so it took the disk and lost only the record, which is how a parker
+ends up holding a volume it carries no entry for.
 
 Read the store to confirm what is in it:
 
@@ -595,10 +604,11 @@ qm config <parker-vmid> | grep -o '<!--BOSH:.*-->'
 Upgrade. Every provenance write now collects records whose volume nothing on
 that parker references and whose `parked_at` is over an hour old, and a parker
 whose live records genuinely fill the store hands the disk to another parker
-instead of failing. To clear an affected parker before upgrading, confirm from
-`disk-audit` which records name volumes the parker no longer holds and edit the
-sentinel out of its description with `qm set <parker-vmid> --description`,
-preserving the rest of the JSON. See
+instead of failing. An ordinary park confirms room for the record before it
+moves the disk, so a full store no longer costs a record silently. To clear an
+affected parker before upgrading, confirm from `disk-audit` which records name
+volumes the parker no longer holds and edit the sentinel out of its description
+with `qm set <parker-vmid> --description`, preserving the rest of the JSON. See
 [Persistent Disk Strategy](persistent-disk-strategy.md).
 
 ### delete_vm refuses to destroy VM with attached unused disks

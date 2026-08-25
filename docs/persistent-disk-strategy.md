@@ -181,8 +181,11 @@ were reaped by hand.
 A parker whose live records still fill the store presents a capacity condition,
 handled exactly like a parker with no free slot: the disk goes to the next
 parker on the node, or to a freshly allocated one. That decision lands before
-anything destructive runs, so a full store never puts a disk at risk. Ordinary
-parks, whose provenance writes are advisory, log a warning and carry on.
+anything destructive runs, so a full store never puts a disk at risk. Capacity
+means both halves: a free slot and room for the record. An ordinary park
+confirms both before the disk moves, because a parker with free slots and a full
+store would otherwise take the disk and fail only the advisory write, leaving the
+volume where its CID, its source VM, and its option overlay cannot follow it.
 
 The `disk-audit` script reads these sentinel entries to build its inventory.
 Free-floating disks have no provenance entry because PVE provides no field to

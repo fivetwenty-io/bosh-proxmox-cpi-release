@@ -455,3 +455,88 @@ func TestIsParkerCapacityError_CoversBothExhaustionShapes(t *testing.T) {
 		t.Error("nil must not read as a capacity condition")
 	}
 }
+
+// fullStoreFreeSlotsDescription fills a parker's provenance store past the
+// budget while leaving bus slots free. This is the shape the lab found: parker
+// 90472 held 24 of its 31 slots in 7964 bytes of description, so it could
+// still take a disk it could no longer record.
+func fullStoreFreeSlotsDescription(t *testing.T, parkerVMID int, cfg map[string]any, now time.Time) string {
+	t.Helper()
+	const records = 24
+	disks := make(map[string]parkerProvEntry, records)
+	for i := range records {
+		volid := fmt.Sprintf("data:vm-%d-disk-%d", parkerVMID, i)
+		cfg[fmt.Sprintf("scsi%d", i)] = volid + ",size=1G"
+		disks[fmt.Sprintf("bpd-%016x", i)] = parkerProvEntry{
+			DiskCID:     "pvd-" + strings.Repeat("A", 180),
+			SourceVMCID: fmt.Sprintf("vm-49e0b1c2-3f4a-4b5c-8d9e-%012d", i),
+			ParkedAt:    now.Format(time.RFC3339),
+			Node:        "pve1",
+			Volid:       volid,
+			Slot:        fmt.Sprintf("scsi%d", i),
+		}
+	}
+	desc := provSentinel(t, disks)
+	if len(desc) <= parkerDescriptionBudget {
+		t.Fatalf("fixture description is %d bytes, needs to exceed the %d budget", len(desc), parkerDescriptionBudget)
+	}
+	if records >= parkerMaxSlots {
+		t.Fatalf("fixture must leave free slots, filled %d of %d", records, parkerMaxSlots)
+	}
+	return desc
+}
+
+// TestParkDisk_FullProvenanceStoreMovesToNextParker is the ordinary detach
+// park, the half the transfer path does not cover. A parker with free slots
+// and a full store can still take the disk, so nothing refuses it -- and the
+// record that carries the disk's CID, its option overlay, and its source VM
+// is dropped on the floor with a warning. Capacity is capacity: the park has
+// to move to a parker that can hold both halves.
+func TestParkDisk_FullProvenanceStoreMovesToNextParker(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	full := map[string]any{cfgKeyTags: "bosh-cpi;bosh-parker", paramProtection: true}
+	full["description"] = fullStoreFreeSlotsDescription(t, 90000, full, now)
+
+	c := newScanFakeClient(map[int]map[string]any{
+		90000: full,
+		90001: {cfgKeyTags: "bosh-cpi;bosh-parker", paramProtection: true},
+	})
+
+	cfg := transferTestCfg
+	cfg.NowFunc = func() time.Time { return now }
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+
+	if err := ParkDisk(context.Background(), c, nil, "pve1", "data:vm-700-disk-1", cfg, pctx); err != nil {
+		t.Fatalf("a full provenance store on one parker must not fail the park: %v", err)
+	}
+
+	if _, ok := parseSentinelDisks(t, c, 90000)[transferStableID]; ok {
+		t.Error("the full parker must carry no record for a disk it never received")
+	}
+	if _, ok := parseSentinelDisks(t, c, 90001)[transferStableID]; !ok {
+		t.Error("the receiving parker must carry the parked-disk record")
+	}
+	if slot := parkerSlotHolding(t, c, 90000, "data:vm-700-disk-1"); slot != "" {
+		t.Errorf("the disk parked on the full parker at %s; a park it cannot record is a park it cannot take", slot)
+	}
+	if slot := parkerSlotHolding(t, c, 90001, "data:vm-700-disk-1"); slot == "" {
+		t.Error("the disk must land on the parker that can hold both the volume and its record")
+	}
+}
+
+// parkerSlotHolding reports the bus slot on vmid holding bareVolid, or "".
+func parkerSlotHolding(t *testing.T, c *scanFakeClient, vmid int, bareVolid string) string {
+	t.Helper()
+	cfg, ok := c.configCopy(vmid)
+	if !ok {
+		return ""
+	}
+	for slot, entry := range qemu.ParseDisks(cfg) {
+		if strings.SplitN(entry, ",", 2)[0] == bareVolid {
+			return slot
+		}
+	}
+	return ""
+}

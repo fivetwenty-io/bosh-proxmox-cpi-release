@@ -394,6 +394,69 @@ func collectStaleParkerProvenance(
 	return pruned
 }
 
+// projectParkerProvenance renders the description a provenance write would
+// push for vmCfg with entry added under key, applying collection first, and
+// reports the keys it collected. It returns ErrProvenanceFull when the result
+// would exceed the budget: the refusal belongs here rather than at the PUT,
+// because a caller that learns the store is full can still choose another
+// parker, while PVE's rejection arrives too late to be useful and says only
+// that a string was too long.
+func projectParkerProvenance(
+	vmCfg map[string]any, node string, parkerVMID int,
+	key string, entry parkerProvEntry, cfg ParkerConfig,
+) (desc string, pruned []string, err error) {
+	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	disks[key] = entry
+
+	// The caller's config read is the same one the reference test needs, so
+	// collection costs no extra API call.
+	pruned = collectStaleParkerProvenance(disks, vmCfg, key, parkerNow(cfg))
+
+	desc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
+	if marshalErr != nil {
+		return "", pruned, cpierrors.Wrap(marshalErr, "parker provenance: marshal")
+	}
+	if len(desc) > parkerDescriptionBudget {
+		return "", pruned, fmt.Errorf(
+			"parker provenance: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
+			parkerVMID, node, len(disks), len(desc), parkerDescriptionBudget, ErrProvenanceFull)
+	}
+	return desc, pruned, nil
+}
+
+// parkerProvenanceRoom reports whether parkerVMID can still record a park of
+// bareVolid, returning ErrProvenanceFull when it cannot.
+//
+// The park path needs this ahead of the attach, not after it. A parker with a
+// free slot and a full store takes the disk perfectly well, so nothing on the
+// attach path refuses it, and the write that follows is best-effort: it logs a
+// warning and drops the record. That record is not decoration. It carries the
+// disk's CID, its source VM, and its per-disk option overlay, and it is what
+// findParkedDiskIntentByStableID reads to resolve a disk whose volume was
+// renamed under it. Losing it silently costs more than parking one slot later
+// on the next parker, so capacity is checked before the disk moves.
+//
+// The probe is one config read outside the protection window. A park that wins
+// the race between this read and the write still lands on a full store and
+// still drops its record; that is the same concurrent-park lost update the
+// ParkContext doc already declares acceptable, narrowed to the moments two
+// parks target one nearly-full parker.
+func parkerProvenanceRoom(
+	ctx context.Context, c Client, node string, parkerVMID int, bareVolid string,
+	cfg ParkerConfig, pctx ParkContext,
+) error {
+	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+	if err != nil {
+		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: capacity probe")
+	}
+	// The landed slot is unknown before the attach. Probe with the widest slot
+	// name a parker can hand out so the estimate is never optimistic.
+	widestSlot := fmt.Sprintf("scsi%d", parkerMaxSlots-1)
+	entry := buildParkerProvEntry(node, bareVolid, widestSlot, cfg, pctx)
+	_, _, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg)
+	return projectErr
+}
+
 // writeParkerProvenance is the strict read-modify-write behind every
 // provenance update. Ordinary parks treat a failure as advisory (the
 // best-effort wrapper above); the detach-side transfer does not — its intent
@@ -415,12 +478,8 @@ func writeParkerProvenance(
 		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
 	}
 
-	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
-	disks[key] = entry
-
-	// The config read above is the same one the reference test needs, so
-	// collection costs no extra API call.
-	if pruned := collectStaleParkerProvenance(disks, vmCfg, key, parkerNow(cfg)); len(pruned) > 0 && logger != nil {
+	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, cfg)
+	if len(pruned) > 0 && logger != nil {
 		logger.Info("parker provenance: collected stale parked-disk records",
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
@@ -428,18 +487,8 @@ func writeParkerProvenance(
 			log.String("keys", strings.Join(pruned, ",")),
 		)
 	}
-
-	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
-	if marshalErr != nil {
-		return cpierrors.Wrap(marshalErr, "parker provenance: marshal")
-	}
-	if len(newDesc) > parkerDescriptionBudget {
-		// Refuse here rather than at the PUT. The caller can still choose
-		// another parker; PVE's rejection arrives too late to be useful and
-		// says only that a string was too long.
-		return fmt.Errorf(
-			"parker provenance: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
-			parkerVMID, node, len(disks), len(newDesc), parkerDescriptionBudget, ErrProvenanceFull)
+	if projectErr != nil {
+		return projectErr
 	}
 
 	nodesSvc := c.Nodes()
@@ -1360,6 +1409,13 @@ func isParkerCapacityError(err error) bool {
 // the park's protection write against the unpark's window closes that, and it
 // also stops a park claiming a slot an unpark is about to detach by name.
 func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
+	// Capacity is both halves: a slot for the volume and room for its record.
+	// Checked before the attach so a parker that fails either one is simply
+	// the wrong parker, not a disk parked where its provenance cannot follow.
+	if roomErr := parkerProvenanceRoom(ctx, c, node, parkerVMID, bareVolid, cfg, pctx); roomErr != nil {
+		return roomErr
+	}
+
 	var landedSlot string
 	if lockErr := withParkerProtectionLock(ctx, c, logger, parkerVMID, "park", func(wctx context.Context) error {
 		slot, attachErr := attachToParkerLocked(wctx, c, logger, node, parkerVMID, bareVolid, pctx.StableID)
