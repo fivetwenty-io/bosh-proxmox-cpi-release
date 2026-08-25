@@ -83,8 +83,13 @@ jobs:
       # gha-lab-state is DIFFERENT in kind: it persists the director's
       # create-env products (creds.yml, state.json) between runs, because
       # losing them means every run rebuilds the director and orphans the old
-      # one. It holds lab credentials — it must stay on the runner host
-      # (mode 0700, owner runner) and never be copied off it.
+      # one. It holds lab credentials: keep it mode 0700, owner runner, and
+      # inside the lab. Only one runner VM carries it, which is why this job
+      # pins its label; the lab's scripts/80-gha-runner copies it daily to
+      # that VM's Proxmox node (/var/lib/gha-lab-state, root-only) so a
+      # rebuilt VM can be restored. The other VMs carry a tripwire file at
+      # this path, so a run scheduled onto one fails on its first write
+      # instead of building a second director.
       volumes:
         - /home/runner/gha-container-cache/go:/go
         - /home/runner/gha-container-cache/go-build:/root/.cache/go-build
