@@ -4,12 +4,12 @@ The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-test
 
 ## Latest run
 
-**PASSED** on 2026-08-24: 47 examples, 0 failures, 11 skipped, in 2h21m43s. Full report: [runs/2026-08-24-155302.md](runs/2026-08-24-155302.md).
+**PASSED** on 2026-08-29: 47 examples, 0 failures, 11 skipped, in 2h21m36s. Full report: [runs/2026-08-29-040219.md](runs/2026-08-29-040219.md).
 
 | Item | Value |
 |---|---|
-| CPI release | v0.4.0-32-g962739b-dirty |
-| BATS revision | 31057b3 |
+| CPI release | v0.5.1-1-g4455d0b1-dirty |
+| BATS revision | 252eb20 |
 | BOSH director | 282.1.13 |
 | Stemcell | bosh-proxmox-kvm-ubuntu-noble-go_agent-light/1.383 |
 | Proxmox VE | 9.2.4 |
@@ -18,6 +18,7 @@ The [BOSH Acceptance Tests](https://github.com/cloudfoundry/bosh-acceptance-test
 
 | Date | Result | Examples | Failures | Wall clock | Report |
 |---|---|---|---|---|---|
+| 2026-08-29 | PASSED | 47 | 0 | 2h21m36s | [runs/2026-08-29-040219.md](runs/2026-08-29-040219.md) |
 | 2026-08-24 | PASSED | 47 | 0 | 2h21m43s | [runs/2026-08-24-155302.md](runs/2026-08-24-155302.md) |
 | 2026-08-22 | PASSED | 47 | 0 | 2h21m39s | [runs/2026-08-22-041333.md](runs/2026-08-22-041333.md) |
 | 2026-08-21 | PASSED | 47 | 0 | 2h21m51s | [runs/2026-08-21-171022.md](runs/2026-08-21-171022.md) |
