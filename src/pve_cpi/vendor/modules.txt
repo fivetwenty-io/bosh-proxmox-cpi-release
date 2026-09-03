@@ -180,7 +180,7 @@ github.com/docker/docker-credential-helpers/credentials
 # github.com/elliotwutingfeng/asciiset v0.0.0-20260801111138-45c5fff54b41
 ## explicit; go 1.11
 github.com/elliotwutingfeng/asciiset
-# github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.2
+# github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.3
 ## explicit; go 1.27.0
 github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/constants
 github.com/fivetwenty-io/proxmox-apiclient-go/v3/internal/http
