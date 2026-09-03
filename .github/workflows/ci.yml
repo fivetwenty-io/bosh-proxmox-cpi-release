@@ -6,6 +6,23 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      purge_go_build_cache:
+        description: >-
+          Run go clean -cache before the checks. The self-hosted runners on
+          one host share a single go-build cache, and a concurrent job can
+          leave a corrupt object in it that every later build on that host
+          then links against (the tell is a linker panic naming an inlined
+          function with "missing func info"). This evicts it at the cost of
+          one cold build.
+        type: boolean
+        default: false
+      runner:
+        description: >-
+          Runner label to pin the job to. Each host keeps its own cache, so a
+          purge has to land on the host that holds the bad object.
+        type: string
+        default: self-hosted
   workflow_call:
 
 permissions:
@@ -28,7 +45,9 @@ env:
 jobs:
   check:
     name: Check
-    runs-on: self-hosted
+    # Push, pull-request, and workflow_call runs carry no inputs, so they fall
+    # through to the shared label.
+    runs-on: ${{ inputs.runner || 'self-hosted' }}
     timeout-minutes: 30
     # Fork pull requests must not run untrusted code on a self-hosted runner.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -68,6 +87,10 @@ jobs:
           # The mounted /go volume is the module cache; the action's own
           # cache would restore a second copy over it and fail on tar.
           cache: false
+
+      - name: Purge the shared Go build cache
+        if: ${{ inputs.purge_go_build_cache == true }}
+        run: go clean -cache
 
       - name: Install staticcheck
         run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
