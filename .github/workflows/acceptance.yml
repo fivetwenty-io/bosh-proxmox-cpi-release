@@ -78,7 +78,7 @@ jobs:
       # Built from ci/Dockerfile by .github/workflows/ci-image.yml. Pinned by
       # digest the way the other workflows pin golang:1.27; update the pin
       # from the digest a ci-image.yml run prints after a Dockerfile change.
-      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:21ef0e6cc490a10004a8d056e58e7449d02050ca9e8aa14bb41d2b70498a5a71
+      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:0861097ffeede7570271c78110c4a09d8e4affabecfd0db3eb7c85f99cdf1beb
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
       # gha-lab-state is DIFFERENT in kind: it persists the director's
       # create-env products (creds.yml, state.json) between runs, because
