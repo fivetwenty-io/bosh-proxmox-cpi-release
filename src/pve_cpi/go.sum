@@ -50,8 +50,8 @@ github.com/docker/docker-credential-helpers v0.9.9 h1:BkydjIgZ46JnDbqyM2p2fc63KM
 github.com/docker/docker-credential-helpers v0.9.9/go.mod h1:v1S+hepowrQXITkEfw6o4+BMbGot02wiKpzWhGUZK6c=
 github.com/elliotwutingfeng/asciiset v0.0.0-20260801111138-45c5fff54b41 h1:k6IHOr6orJ0s8nQ0b8QmuO8RVj0K3WYruDcQfcdqm8g=
 github.com/elliotwutingfeng/asciiset v0.0.0-20260801111138-45c5fff54b41/go.mod h1:GLo/8fDswSAniFG+BFIaiSPcK610jyzgEhWYPQwuQdw=
-github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.3 h1:r72ybAW+4gcioxOfpqj/TDbGm0wbicXYUqz3zFcz3IA=
-github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.3/go.mod h1:A2RrxcT51znsXp6429Qd7eZ1vna4BYweBkAolRUaoas=
+github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.10.0 h1:ugeG6hq+/xQqFQOaFwEWyfQ0cGpwUlmKN5DXHaSm6fQ=
+github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.10.0/go.mod h1:A2RrxcT51znsXp6429Qd7eZ1vna4BYweBkAolRUaoas=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
 github.com/go-logr/logr v1.4.4 h1:tG4xh9yMsRCAiodLVTxyrkzSZ9+o0L1Kg/+cPVcbP/8=
 github.com/go-logr/logr v1.4.4/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=

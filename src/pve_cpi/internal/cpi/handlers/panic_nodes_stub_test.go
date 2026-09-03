@@ -247,6 +247,14 @@ func (s *panicNodesStub) CreateCephStop(ctx context.Context, node string, params
 	panic("panicNodesStub.CreateCephStop: not expected")
 }
 
+func (s *panicNodesStub) ListCephReleases(ctx context.Context, node string) (*nodes.ListCephReleasesResponse, error) {
+	panic("panicNodesStub.ListCephReleases: not expected")
+}
+
+func (s *panicNodesStub) CreateCephRestartBulk(ctx context.Context, node string, params *nodes.CreateCephRestartBulkParams) (*nodes.CreateCephRestartBulkResponse, error) {
+	panic("panicNodesStub.CreateCephRestartBulk: not expected")
+}
+
 func (s *panicNodesStub) ListCertificates(ctx context.Context, node string) (*nodes.ListCertificatesResponse, error) {
 	panic("panicNodesStub.ListCertificates: not expected")
 }

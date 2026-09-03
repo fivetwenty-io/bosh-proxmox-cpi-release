@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.110.0
 	github.com/diskfs/go-diskfs v1.9.4
-	github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.9.3
+	github.com/fivetwenty-io/proxmox-apiclient-go/v3 v3.10.0
 	github.com/google/go-containerregistry v0.22.0
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1
 	go.opentelemetry.io/otel v1.46.0

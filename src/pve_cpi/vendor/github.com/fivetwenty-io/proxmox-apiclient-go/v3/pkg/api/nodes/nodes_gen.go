@@ -185,9 +185,15 @@ type Service interface {
 	// ListCephPoolStatus GET /nodes/{node}/ceph/pool/{name}/status
 	// Show the current pool status.
 	ListCephPoolStatus(ctx context.Context, node string, name string, params *ListCephPoolStatusParams) (*ListCephPoolStatusResponse, error)
+	// ListCephReleases GET /nodes/{node}/ceph/releases
+	// List all known Ceph releases, marking which ones can be installed on this node.
+	ListCephReleases(ctx context.Context, node string) (*ListCephReleasesResponse, error)
 	// CreateCephRestart POST /nodes/{node}/ceph/restart
 	// Restart ceph services.
 	CreateCephRestart(ctx context.Context, node string, params *CreateCephRestartParams) (*CreateCephRestartResponse, error)
+	// CreateCephRestartBulk POST /nodes/{node}/ceph/restart-bulk
+	// Rolling restart of all Ceph OSDs on this node. Each OSD is restarted only after Ceph reports the previous one is back up and the next one is safe to stop. For non-OSD Ceph daemons, use the cluster-wide endpoint at /cluster/ceph/restart-bulk. The 'noout' flag is applied only to the OSDs targeted by this run, so unrelated OSDs on other nodes that fail during the restart window still get out-marked normally. Aborting the resulting task (for example via 'pvesh task stop') triggers a SIGTERM handler that unsets the per-OSD 'noout' if this endpoint set it. Per-daemon progress is checkpointed in Ceph's config-key store ('pve/ceph-bulk-restart/node/<node>'), so an aborted run can be resumed by re-issuing this endpoint with 'resume=1'.
+	CreateCephRestartBulk(ctx context.Context, node string, params *CreateCephRestartBulkParams) (*CreateCephRestartBulkResponse, error)
 	// ListCephRules GET /nodes/{node}/ceph/rules
 	// List ceph rules.
 	ListCephRules(ctx context.Context, node string) (*ListCephRulesResponse, error)
@@ -1347,6 +1353,7 @@ func (s *service) ListAptChangelog(ctx context.Context, node string, params *Lis
 }
 
 // ListAptRepositoriesResponse mirrors the shape returned by GET /nodes/{node}/apt/repositories.
+// Result from parsing the APT repository files in /etc/apt/.
 type ListAptRepositoriesResponse struct {
 	// Digest Common digest of all files.
 	Digest string `json:"digest"`
@@ -1983,6 +1990,7 @@ type ListCephCfgValueParams struct {
 }
 
 // ListCephCfgValueResponse is the raw JSON returned by GET /nodes/{node}/ceph/cfg/value.
+// Two-level map of {section} -> {key} -> value. Underscores in section and key names are normalised to hyphens.
 type ListCephCfgValueResponse = json.RawMessage
 
 // ListCephCfgValue implements Service.ListCephCfgValue. GET /nodes/{node}/ceph/cfg/value.
@@ -3408,6 +3416,39 @@ func (s *service) ListCephPoolStatus(ctx context.Context, node string, name stri
 	return out, nil
 }
 
+// ListCephReleasesResponse mirrors the shape returned by GET /nodes/{node}/ceph/releases.
+type ListCephReleasesResponse []json.RawMessage
+
+// ListCephReleases implements Service.ListCephReleases. GET /nodes/{node}/ceph/releases.
+func (s *service) ListCephReleases(ctx context.Context, node string) (*ListCephReleasesResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.ListCephReleases: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/ceph/releases", url.PathEscape(node))
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListCephReleases: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.ListCephReleases: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListCephReleasesResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListCephReleases: re-marshal data: %w", err)
+	}
+	out := &ListCephReleasesResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.ListCephReleases: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
 // CreateCephRestartParams is the request payload for CreateCephRestart.
 type CreateCephRestartParams struct {
 	// Service Ceph service name.
@@ -3455,6 +3496,69 @@ func (s *service) CreateCephRestart(ctx context.Context, node string, params *Cr
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("nodes.CreateCephRestart: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// CreateCephRestartBulkParams is the request payload for CreateCephRestartBulk.
+type CreateCephRestartBulkParams struct {
+	// DryRun Log the plan (which OSDs would be restarted, in what order) without actually doing anything.
+	DryRun *bool `json:"dry-run,omitempty"`
+	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. HEALTH_ERR is always fatal regardless. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
+	Force *bool `json:"force,omitempty"`
+	// OnlyOutdated Restart only OSDs whose running version differs from the locally-installed ceph-osd binary. Useful for post-upgrade rolling restarts that should touch only daemons that need it. Refuses if the local binary version cannot be determined. Ignored on resume (the saved plan is used as-is).
+	OnlyOutdated *bool `json:"only-outdated,omitempty"`
+	// Resume Resume an aborted bulk-restart from the checkpoint stored in Ceph's config-key store. The plan and noout decision from the prior run are honored; 'set-noout' is ignored. When false (default), the endpoint refuses to start if a checkpoint exists for this node, to avoid silently overwriting in-progress work.
+	Resume *bool `json:"resume,omitempty"`
+	// ServiceType Ceph daemon type to restart. Only OSDs can be rolling-restarted on a per-node basis.
+	ServiceType string `json:"service-type"`
+	// SetNoout Set the 'noout' flag on each OSD targeted by this run for the duration of the rolling restart, and unset it on completion. Per-OSD rather than cluster-wide so that unrelated OSDs failing on other nodes still trigger backfill normally.
+	SetNoout *bool `json:"set-noout,omitempty"`
+	// Timeout Per-OSD timeout (in seconds). Bounds both the wait for a restarted OSD to come back up and the wait for recovery to quiesce enough that Ceph reports the next OSD safe to stop. Default sized for busy clusters where multi-TB OSDs with many PGs can need several minutes to clear peering after a restart; bump higher for very large or heavily-loaded OSDs.
+	Timeout *int64 `json:"timeout,omitempty"`
+}
+
+// CreateCephRestartBulkResponse is the raw JSON returned by POST /nodes/{node}/ceph/restart-bulk.
+type CreateCephRestartBulkResponse = json.RawMessage
+
+// CreateCephRestartBulk implements Service.CreateCephRestartBulk. POST /nodes/{node}/ceph/restart-bulk.
+func (s *service) CreateCephRestartBulk(ctx context.Context, node string, params *CreateCephRestartBulkParams) (*CreateCephRestartBulkResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("nodes.CreateCephRestartBulk: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/nodes/%s/ceph/restart-bulk", url.PathEscape(node))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.CreateCephRestartBulk: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("nodes.CreateCephRestartBulk: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PostRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.CreateCephRestartBulk: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("nodes.CreateCephRestartBulk: nil response from client")
+	}
+	if resp.Data == nil {
+		out := CreateCephRestartBulkResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.CreateCephRestartBulk: re-marshal data: %w", err)
+	}
+	out := &CreateCephRestartBulkResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("nodes.CreateCephRestartBulk: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -5898,17 +6002,32 @@ func (s *service) CreateHosts(ctx context.Context, node string, params *CreateHo
 type ListJournalParams struct {
 	// Endcursor End before the given Cursor. Conflicts with 'until'
 	Endcursor *string `json:"endcursor,omitempty"`
+	// Identifiers Also return a record listing the distinct syslog identifiers present, for filter completion. Only honored together with 'structured'.
+	Identifiers *bool `json:"identifiers,omitempty"`
+	// Kernel Only print kernel messages.
+	Kernel *bool `json:"kernel,omitempty"`
 	// Lastentries Limit to the last X lines. Conflicts with a range.
 	Lastentries *int64 `json:"lastentries,omitempty"`
+	// Priority Only print messages of this syslog priority: a single level from 0 (emerg) to 7 (debug), selecting that level and everything more severe, or a 'LOW..HIGH' range. Empty means no priority filter.
+	Priority *string `json:"priority,omitempty"`
+	// Service Only print messages whose syslog identifier matches this glob, for example 'pve*' or 'postfix/*'.
+	Service *string `json:"service,omitempty"`
 	// Since Display all log since this UNIX epoch. Conflicts with 'startcursor'.
 	Since *int64 `json:"since,omitempty"`
 	// Startcursor Start after the given Cursor. Conflicts with 'since'
 	Startcursor *string `json:"startcursor,omitempty"`
+	// Structured Return one JSON object per entry with separate fields (timestamp, identifier, message, priority, ...) instead of pre-rendered text lines.
+	Structured *bool `json:"structured,omitempty"`
+	// Unit Only print messages of this systemd unit (the .service suffix is implied).
+	Unit *string `json:"unit,omitempty"`
+	// Units Also return a record listing the distinct systemd units present, for filter completion. Only honored together with 'structured'.
+	Units *bool `json:"units,omitempty"`
 	// Until Display all log until this UNIX epoch. Conflicts with 'endcursor'.
 	Until *int64 `json:"until,omitempty"`
 }
 
 // ListJournalResponse mirrors the shape returned by GET /nodes/{node}/journal.
+// One pre-rendered log line per entry. With Structured set the server returns one object per entry instead, which this type cannot decode; fetch the same path through GetRawCtx and decode the data array yourself.
 type ListJournalResponse []string
 
 // ListJournal implements Service.ListJournal. GET /nodes/{node}/journal.
@@ -7828,6 +7947,7 @@ type CreateLxcMigrateParams struct {
 }
 
 // CreateLxcMigrateResponse is the raw JSON returned by POST /nodes/{node}/lxc/{vmid}/migrate.
+// the task ID.
 type CreateLxcMigrateResponse = json.RawMessage
 
 // CreateLxcMigrate implements Service.CreateLxcMigrate. POST /nodes/{node}/lxc/{vmid}/migrate.
@@ -8101,6 +8221,7 @@ type CreateLxcRemoteMigrateParams struct {
 }
 
 // CreateLxcRemoteMigrateResponse is the raw JSON returned by POST /nodes/{node}/lxc/{vmid}/remote_migrate.
+// the task ID.
 type CreateLxcRemoteMigrateResponse = json.RawMessage
 
 // CreateLxcRemoteMigrate implements Service.CreateLxcRemoteMigrate. POST /nodes/{node}/lxc/{vmid}/remote_migrate.
@@ -8156,6 +8277,7 @@ type UpdateLxcResizeParams struct {
 }
 
 // UpdateLxcResizeResponse is the raw JSON returned by PUT /nodes/{node}/lxc/{vmid}/resize.
+// the task ID.
 type UpdateLxcResizeResponse = json.RawMessage
 
 // UpdateLxcResize implements Service.UpdateLxcResize. PUT /nodes/{node}/lxc/{vmid}/resize.
@@ -8351,6 +8473,7 @@ type CreateLxcSnapshotParams struct {
 }
 
 // CreateLxcSnapshotResponse is the raw JSON returned by POST /nodes/{node}/lxc/{vmid}/snapshot.
+// the task ID.
 type CreateLxcSnapshotResponse = json.RawMessage
 
 // CreateLxcSnapshot implements Service.CreateLxcSnapshot. POST /nodes/{node}/lxc/{vmid}/snapshot.
@@ -8402,6 +8525,7 @@ type DeleteLxcSnapshotParams struct {
 }
 
 // DeleteLxcSnapshotResponse is the raw JSON returned by DELETE /nodes/{node}/lxc/{vmid}/snapshot/{snapname}.
+// the task ID.
 type DeleteLxcSnapshotResponse = json.RawMessage
 
 // DeleteLxcSnapshot implements Service.DeleteLxcSnapshot. DELETE /nodes/{node}/lxc/{vmid}/snapshot/{snapname}.
@@ -8555,6 +8679,7 @@ type CreateLxcSnapshotRollbackParams struct {
 }
 
 // CreateLxcSnapshotRollbackResponse is the raw JSON returned by POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback.
+// the task ID.
 type CreateLxcSnapshotRollbackResponse = json.RawMessage
 
 // CreateLxcSnapshotRollback implements Service.CreateLxcSnapshotRollback. POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback.
@@ -8606,6 +8731,7 @@ type CreateLxcSpiceproxyParams struct {
 }
 
 // CreateLxcSpiceproxyResponse is the raw JSON returned by POST /nodes/{node}/lxc/{vmid}/spiceproxy.
+// Returned values can be directly passed to the 'remote-viewer' application.
 type CreateLxcSpiceproxyResponse = json.RawMessage
 
 // CreateLxcSpiceproxy implements Service.CreateLxcSpiceproxy. POST /nodes/{node}/lxc/{vmid}/spiceproxy.
@@ -10260,6 +10386,7 @@ func (s *service) GetQemu(ctx context.Context, node string, vmid string) (*GetQe
 }
 
 // ListQemuAgentResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/agent.
+// Returns the list of QEMU Guest Agent commands
 type ListQemuAgentResponse []json.RawMessage
 
 // ListQemuAgent implements Service.ListQemuAgent. GET /nodes/{node}/qemu/{vmid}/agent.
@@ -10299,6 +10426,7 @@ type CreateQemuAgentParams struct {
 }
 
 // CreateQemuAgentResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent.
+// Returns an object with a single `result` property.
 type CreateQemuAgentResponse = json.RawMessage
 
 // CreateQemuAgent implements Service.CreateQemuAgent. POST /nodes/{node}/qemu/{vmid}/agent.
@@ -10476,6 +10604,7 @@ type ListQemuAgentFileReadParams struct {
 }
 
 // ListQemuAgentFileReadResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/agent/file-read.
+// Returns an object with a `content` property.
 type ListQemuAgentFileReadResponse struct {
 	// Content The content of the file, maximum 16777216
 	Content string `json:"content"`
@@ -10565,6 +10694,7 @@ func (s *service) CreateQemuAgentFileWrite(ctx context.Context, node string, vmi
 }
 
 // CreateQemuAgentFsfreezeFreezeResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-freeze.
+// Returns an object with a single `result` property.
 type CreateQemuAgentFsfreezeFreezeResponse = json.RawMessage
 
 // CreateQemuAgentFsfreezeFreeze implements Service.CreateQemuAgentFsfreezeFreeze. POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-freeze.
@@ -10598,6 +10728,7 @@ func (s *service) CreateQemuAgentFsfreezeFreeze(ctx context.Context, node string
 }
 
 // CreateQemuAgentFsfreezeStatusResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-status.
+// Returns an object with a single `result` property.
 type CreateQemuAgentFsfreezeStatusResponse = json.RawMessage
 
 // CreateQemuAgentFsfreezeStatus implements Service.CreateQemuAgentFsfreezeStatus. POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-status.
@@ -10631,6 +10762,7 @@ func (s *service) CreateQemuAgentFsfreezeStatus(ctx context.Context, node string
 }
 
 // CreateQemuAgentFsfreezeThawResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-thaw.
+// Returns an object with a single `result` property.
 type CreateQemuAgentFsfreezeThawResponse = json.RawMessage
 
 // CreateQemuAgentFsfreezeThaw implements Service.CreateQemuAgentFsfreezeThaw. POST /nodes/{node}/qemu/{vmid}/agent/fsfreeze-thaw.
@@ -10664,6 +10796,7 @@ func (s *service) CreateQemuAgentFsfreezeThaw(ctx context.Context, node string, 
 }
 
 // CreateQemuAgentFstrimResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/fstrim.
+// Returns an object with a single `result` property.
 type CreateQemuAgentFstrimResponse = json.RawMessage
 
 // CreateQemuAgentFstrim implements Service.CreateQemuAgentFstrim. POST /nodes/{node}/qemu/{vmid}/agent/fstrim.
@@ -10697,6 +10830,7 @@ func (s *service) CreateQemuAgentFstrim(ctx context.Context, node string, vmid s
 }
 
 // ListQemuAgentGetFsinfoResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-fsinfo.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetFsinfoResponse = json.RawMessage
 
 // ListQemuAgentGetFsinfo implements Service.ListQemuAgentGetFsinfo. GET /nodes/{node}/qemu/{vmid}/agent/get-fsinfo.
@@ -10730,6 +10864,7 @@ func (s *service) ListQemuAgentGetFsinfo(ctx context.Context, node string, vmid 
 }
 
 // ListQemuAgentGetHostNameResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-host-name.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetHostNameResponse = json.RawMessage
 
 // ListQemuAgentGetHostName implements Service.ListQemuAgentGetHostName. GET /nodes/{node}/qemu/{vmid}/agent/get-host-name.
@@ -10763,6 +10898,7 @@ func (s *service) ListQemuAgentGetHostName(ctx context.Context, node string, vmi
 }
 
 // ListQemuAgentGetMemoryBlockInfoResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-memory-block-info.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetMemoryBlockInfoResponse = json.RawMessage
 
 // ListQemuAgentGetMemoryBlockInfo implements Service.ListQemuAgentGetMemoryBlockInfo. GET /nodes/{node}/qemu/{vmid}/agent/get-memory-block-info.
@@ -10796,6 +10932,7 @@ func (s *service) ListQemuAgentGetMemoryBlockInfo(ctx context.Context, node stri
 }
 
 // ListQemuAgentGetMemoryBlocksResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-memory-blocks.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetMemoryBlocksResponse = json.RawMessage
 
 // ListQemuAgentGetMemoryBlocks implements Service.ListQemuAgentGetMemoryBlocks. GET /nodes/{node}/qemu/{vmid}/agent/get-memory-blocks.
@@ -10829,6 +10966,7 @@ func (s *service) ListQemuAgentGetMemoryBlocks(ctx context.Context, node string,
 }
 
 // ListQemuAgentGetOsinfoResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-osinfo.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetOsinfoResponse = json.RawMessage
 
 // ListQemuAgentGetOsinfo implements Service.ListQemuAgentGetOsinfo. GET /nodes/{node}/qemu/{vmid}/agent/get-osinfo.
@@ -10862,6 +11000,7 @@ func (s *service) ListQemuAgentGetOsinfo(ctx context.Context, node string, vmid 
 }
 
 // ListQemuAgentGetTimeResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-time.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetTimeResponse = json.RawMessage
 
 // ListQemuAgentGetTime implements Service.ListQemuAgentGetTime. GET /nodes/{node}/qemu/{vmid}/agent/get-time.
@@ -10895,6 +11034,7 @@ func (s *service) ListQemuAgentGetTime(ctx context.Context, node string, vmid st
 }
 
 // ListQemuAgentGetTimezoneResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-timezone.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetTimezoneResponse = json.RawMessage
 
 // ListQemuAgentGetTimezone implements Service.ListQemuAgentGetTimezone. GET /nodes/{node}/qemu/{vmid}/agent/get-timezone.
@@ -10928,6 +11068,7 @@ func (s *service) ListQemuAgentGetTimezone(ctx context.Context, node string, vmi
 }
 
 // ListQemuAgentGetUsersResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-users.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetUsersResponse = json.RawMessage
 
 // ListQemuAgentGetUsers implements Service.ListQemuAgentGetUsers. GET /nodes/{node}/qemu/{vmid}/agent/get-users.
@@ -10961,6 +11102,7 @@ func (s *service) ListQemuAgentGetUsers(ctx context.Context, node string, vmid s
 }
 
 // ListQemuAgentGetVcpusResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/get-vcpus.
+// Returns an object with a single `result` property.
 type ListQemuAgentGetVcpusResponse = json.RawMessage
 
 // ListQemuAgentGetVcpus implements Service.ListQemuAgentGetVcpus. GET /nodes/{node}/qemu/{vmid}/agent/get-vcpus.
@@ -10994,6 +11136,7 @@ func (s *service) ListQemuAgentGetVcpus(ctx context.Context, node string, vmid s
 }
 
 // ListQemuAgentInfoResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/info.
+// Returns an object with a single `result` property.
 type ListQemuAgentInfoResponse = json.RawMessage
 
 // ListQemuAgentInfo implements Service.ListQemuAgentInfo. GET /nodes/{node}/qemu/{vmid}/agent/info.
@@ -11027,6 +11170,7 @@ func (s *service) ListQemuAgentInfo(ctx context.Context, node string, vmid strin
 }
 
 // ListQemuAgentNetworkGetInterfacesResponse is the raw JSON returned by GET /nodes/{node}/qemu/{vmid}/agent/network-get-interfaces.
+// Returns an object with a single `result` property.
 type ListQemuAgentNetworkGetInterfacesResponse = json.RawMessage
 
 // ListQemuAgentNetworkGetInterfaces implements Service.ListQemuAgentNetworkGetInterfaces. GET /nodes/{node}/qemu/{vmid}/agent/network-get-interfaces.
@@ -11060,6 +11204,7 @@ func (s *service) ListQemuAgentNetworkGetInterfaces(ctx context.Context, node st
 }
 
 // CreateQemuAgentPingResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/ping.
+// Returns an object with a single `result` property.
 type CreateQemuAgentPingResponse = json.RawMessage
 
 // CreateQemuAgentPing implements Service.CreateQemuAgentPing. POST /nodes/{node}/qemu/{vmid}/agent/ping.
@@ -11103,6 +11248,7 @@ type CreateQemuAgentSetUserPasswordParams struct {
 }
 
 // CreateQemuAgentSetUserPasswordResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/set-user-password.
+// Returns an object with a single `result` property.
 type CreateQemuAgentSetUserPasswordResponse = json.RawMessage
 
 // CreateQemuAgentSetUserPassword implements Service.CreateQemuAgentSetUserPassword. POST /nodes/{node}/qemu/{vmid}/agent/set-user-password.
@@ -11148,6 +11294,7 @@ func (s *service) CreateQemuAgentSetUserPassword(ctx context.Context, node strin
 }
 
 // CreateQemuAgentShutdownResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/shutdown.
+// Returns an object with a single `result` property.
 type CreateQemuAgentShutdownResponse = json.RawMessage
 
 // CreateQemuAgentShutdown implements Service.CreateQemuAgentShutdown. POST /nodes/{node}/qemu/{vmid}/agent/shutdown.
@@ -11181,6 +11328,7 @@ func (s *service) CreateQemuAgentShutdown(ctx context.Context, node string, vmid
 }
 
 // CreateQemuAgentSuspendDiskResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/suspend-disk.
+// Returns an object with a single `result` property.
 type CreateQemuAgentSuspendDiskResponse = json.RawMessage
 
 // CreateQemuAgentSuspendDisk implements Service.CreateQemuAgentSuspendDisk. POST /nodes/{node}/qemu/{vmid}/agent/suspend-disk.
@@ -11214,6 +11362,7 @@ func (s *service) CreateQemuAgentSuspendDisk(ctx context.Context, node string, v
 }
 
 // CreateQemuAgentSuspendHybridResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/suspend-hybrid.
+// Returns an object with a single `result` property.
 type CreateQemuAgentSuspendHybridResponse = json.RawMessage
 
 // CreateQemuAgentSuspendHybrid implements Service.CreateQemuAgentSuspendHybrid. POST /nodes/{node}/qemu/{vmid}/agent/suspend-hybrid.
@@ -11247,6 +11396,7 @@ func (s *service) CreateQemuAgentSuspendHybrid(ctx context.Context, node string,
 }
 
 // CreateQemuAgentSuspendRamResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/agent/suspend-ram.
+// Returns an object with a single `result` property.
 type CreateQemuAgentSuspendRamResponse = json.RawMessage
 
 // CreateQemuAgentSuspendRam implements Service.CreateQemuAgentSuspendRam. POST /nodes/{node}/qemu/{vmid}/agent/suspend-ram.
@@ -11285,7 +11435,7 @@ type CreateQemuCloneParams struct {
 	Bwlimit *int64 `json:"bwlimit,omitempty"`
 	// Description Description for the new VM.
 	Description *string `json:"description,omitempty"`
-	// Format Target format for file storage. Only valid for full clone.
+	// Format Target disk format. Only valid for full clone. If the target storage does not support the format, the storage's default format is used instead.
 	Format *string `json:"format,omitempty"`
 	// Full Create a full copy of all disks. This is always done when you clone a normal VM. For VM templates, we try to create a linked clone by default.
 	Full *bool `json:"full,omitempty"`
@@ -11459,6 +11609,7 @@ type ListQemuConfigParams struct {
 }
 
 // ListQemuConfigResponse mirrors the shape returned by GET /nodes/{node}/qemu/{vmid}/config.
+// The VM configuration.
 type ListQemuConfigResponse struct {
 	// Acpi Enable/disable ACPI.
 	Acpi *client.PVEBool `json:"acpi,omitempty"`
@@ -13761,6 +13912,7 @@ type CreateQemuMigrateParams struct {
 }
 
 // CreateQemuMigrateResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/migrate.
+// the task ID.
 type CreateQemuMigrateResponse = json.RawMessage
 
 // CreateQemuMigrate implements Service.CreateQemuMigrate. POST /nodes/{node}/qemu/{vmid}/migrate.
@@ -13866,7 +14018,7 @@ type CreateQemuMoveDiskParams struct {
 	Digest *string `json:"digest,omitempty"`
 	// Disk The disk you want to move.
 	Disk string `json:"disk"`
-	// Format Target Format.
+	// Format Target disk format. Only used when moving to a different storage. If the target storage does not support the format, the storage's default format is used instead.
 	Format *string `json:"format,omitempty"`
 	// Storage Target storage.
 	Storage *string `json:"storage,omitempty"`
@@ -13879,6 +14031,7 @@ type CreateQemuMoveDiskParams struct {
 }
 
 // CreateQemuMoveDiskResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/move_disk.
+// the task ID.
 type CreateQemuMoveDiskResponse = json.RawMessage
 
 // CreateQemuMoveDisk implements Service.CreateQemuMoveDisk. POST /nodes/{node}/qemu/{vmid}/move_disk.
@@ -14083,6 +14236,7 @@ type CreateQemuRemoteMigrateParams struct {
 }
 
 // CreateQemuRemoteMigrateResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/remote_migrate.
+// the task ID.
 type CreateQemuRemoteMigrateResponse = json.RawMessage
 
 // CreateQemuRemoteMigrate implements Service.CreateQemuRemoteMigrate. POST /nodes/{node}/qemu/{vmid}/remote_migrate.
@@ -14140,6 +14294,7 @@ type UpdateQemuResizeParams struct {
 }
 
 // UpdateQemuResizeResponse is the raw JSON returned by PUT /nodes/{node}/qemu/{vmid}/resize.
+// the task ID.
 type UpdateQemuResizeResponse = json.RawMessage
 
 // UpdateQemuResize implements Service.UpdateQemuResize. PUT /nodes/{node}/qemu/{vmid}/resize.
@@ -14375,6 +14530,7 @@ type CreateQemuSnapshotParams struct {
 }
 
 // CreateQemuSnapshotResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/snapshot.
+// the task ID.
 type CreateQemuSnapshotResponse = json.RawMessage
 
 // CreateQemuSnapshot implements Service.CreateQemuSnapshot. POST /nodes/{node}/qemu/{vmid}/snapshot.
@@ -14426,6 +14582,7 @@ type DeleteQemuSnapshotParams struct {
 }
 
 // DeleteQemuSnapshotResponse is the raw JSON returned by DELETE /nodes/{node}/qemu/{vmid}/snapshot/{snapname}.
+// the task ID.
 type DeleteQemuSnapshotResponse = json.RawMessage
 
 // DeleteQemuSnapshot implements Service.DeleteQemuSnapshot. DELETE /nodes/{node}/qemu/{vmid}/snapshot/{snapname}.
@@ -14579,6 +14736,7 @@ type CreateQemuSnapshotRollbackParams struct {
 }
 
 // CreateQemuSnapshotRollbackResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback.
+// the task ID.
 type CreateQemuSnapshotRollbackResponse = json.RawMessage
 
 // CreateQemuSnapshotRollback implements Service.CreateQemuSnapshotRollback. POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback.
@@ -14630,6 +14788,7 @@ type CreateQemuSpiceproxyParams struct {
 }
 
 // CreateQemuSpiceproxyResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/spiceproxy.
+// Returned values can be directly passed to the 'remote-viewer' application.
 type CreateQemuSpiceproxyResponse = json.RawMessage
 
 // CreateQemuSpiceproxy implements Service.CreateQemuSpiceproxy. POST /nodes/{node}/qemu/{vmid}/spiceproxy.
@@ -14908,6 +15067,7 @@ func (s *service) CreateQemuStatusReset(ctx context.Context, node string, vmid s
 
 // CreateQemuStatusResumeParams is the request payload for CreateQemuStatusResume.
 type CreateQemuStatusResumeParams struct {
+	// Nocheck Do not check whether the VM is running, used internally during migration. Only root may use this option.
 	Nocheck *bool `json:"nocheck,omitempty"`
 	// Skiplock Ignore locks - only root is allowed to use this option.
 	Skiplock *bool `json:"skiplock,omitempty"`
@@ -15207,6 +15367,7 @@ type CreateQemuTemplateParams struct {
 }
 
 // CreateQemuTemplateResponse is the raw JSON returned by POST /nodes/{node}/qemu/{vmid}/template.
+// the task ID.
 type CreateQemuTemplateResponse = json.RawMessage
 
 // CreateQemuTemplate implements Service.CreateQemuTemplate. POST /nodes/{node}/qemu/{vmid}/template.
@@ -16463,6 +16624,7 @@ func (s *service) GetSdnVnets(ctx context.Context, node string, vnet string) (*G
 }
 
 // ListSdnVnetsMacVrfResponse mirrors the shape returned by GET /nodes/{node}/sdn/vnets/{vnet}/mac-vrf.
+// All routes from the MAC VRF that this node self-originates or has learned via BGP.
 type ListSdnVnetsMacVrfResponse []json.RawMessage
 
 // ListSdnVnetsMacVrf implements Service.ListSdnVnetsMacVrf. GET /nodes/{node}/sdn/vnets/{vnet}/mac-vrf.
@@ -16628,6 +16790,7 @@ func (s *service) ListSdnZonesContent(ctx context.Context, node string, zone str
 }
 
 // ListSdnZonesIpVrfResponse mirrors the shape returned by GET /nodes/{node}/sdn/zones/{zone}/ip-vrf.
+// All entries in the VRF table of zone {zone} of the node.This does not include /32 routes for guests on this host,since they are handled via the respective vnet bridge directly.
 type ListSdnZonesIpVrfResponse []json.RawMessage
 
 // ListSdnZonesIpVrf implements Service.ListSdnZonesIpVrf. GET /nodes/{node}/sdn/zones/{zone}/ip-vrf.
@@ -16914,6 +17077,7 @@ type CreateSpiceshellParams struct {
 }
 
 // CreateSpiceshellResponse is the raw JSON returned by POST /nodes/{node}/spiceshell.
+// Returned values can be directly passed to the 'remote-viewer' application.
 type CreateSpiceshellResponse = json.RawMessage
 
 // CreateSpiceshell implements Service.CreateSpiceshell. POST /nodes/{node}/spiceshell.
@@ -17310,6 +17474,7 @@ type CreateStorageContentParams struct {
 }
 
 // CreateStorageContentResponse is the raw JSON returned by POST /nodes/{node}/storage/{storage}/content.
+// Volume identifier
 type CreateStorageContentResponse = json.RawMessage
 
 // CreateStorageContent implements Service.CreateStorageContent. POST /nodes/{node}/storage/{storage}/content.
@@ -17756,6 +17921,7 @@ type ListStorageImportMetadataParams struct {
 }
 
 // ListStorageImportMetadataResponse mirrors the shape returned by GET /nodes/{node}/storage/{storage}/import-metadata.
+// Information about how to import a guest.
 type ListStorageImportMetadataResponse struct {
 	// CreateArgs Parameters which can be used in a call to create a VM or container.
 	CreateArgs json.RawMessage `json:"create-args"`
@@ -19225,6 +19391,7 @@ func (s *service) ListVzdumpExtractconfig(ctx context.Context, node string, para
 }
 
 // CreateWakeonlanResponse is the raw JSON returned by POST /nodes/{node}/wakeonlan.
+// MAC address used to assemble the WoL magic packet.
 type CreateWakeonlanResponse = json.RawMessage
 
 // CreateWakeonlan implements Service.CreateWakeonlan. POST /nodes/{node}/wakeonlan.

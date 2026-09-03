@@ -156,6 +156,10 @@ func (s *panicClusterStub) UpdateCephFlags2(_ context.Context, _ string, _ *clus
 	panic("panicClusterStub.UpdateCephFlags2: not configured for SDN test; opt in by setting UpdateCephFlags2Fn")
 }
 
+func (s *panicClusterStub) CreateCephRestartBulk(_ context.Context, _ *cluster.CreateCephRestartBulkParams) (*cluster.CreateCephRestartBulkResponse, error) {
+	panic("panicClusterStub.CreateCephRestartBulk: not configured for SDN test; opt in by setting CreateCephRestartBulkFn")
+}
+
 func (s *panicClusterStub) ListCephMetadata(_ context.Context, _ *cluster.ListCephMetadataParams) (*cluster.ListCephMetadataResponse, error) {
 	panic("panicClusterStub.ListCephMetadata: not configured for SDN test; opt in by setting ListCephMetadataFn")
 }

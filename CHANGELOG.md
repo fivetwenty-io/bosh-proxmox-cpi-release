@@ -16,6 +16,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The packaged Go toolchain moves from 1.27.0 to 1.27.1. The `golang-1.27` BOSH package now carries the `go1.27.1.linux-amd64.tar.gz` blob, its packaging script verifies that blob's own SHA256 before extracting, `src/pve_cpi/go.mod` requires `go 1.27.1`, and every CI container builds in the `golang:1.27` image digest that resolves to the same release. The compile VM pins `GOTOOLCHAIN=local`, so the blob is the toolchain a release is actually built with, and `make go-blob-check` keeps it from drifting back below what the module requires.
 
+### Fixed
+
+- The Dynamic Load Balancer's cluster CRS check now reads the setting PVE actually returns. `GET /cluster/options` hands back the parsed `datacenter.cfg`, so `crs` arrives as an object keyed by sub-option with its flags as unquoted integers, not as the single property string the check decoded. That decode failed on every real cluster and was discarded silently, leaving the CPI to believe no CRS setting was configured at all. With `pve.placement.dlb.manage_cluster_crs` false, the CPI warned that CRS was not dynamic, and printed an empty current setting, on clusters where it was already correct. With the knob true, the CPI never recognized the required setting as already present, so it rewrote the cluster-wide CRS option on every `create_vm` that registered a DLB member, and because the merge started from an empty setting, any other CRS sub-option the operator had configured was dropped on the first such write. Both shapes now decode, the warning reports the setting it found, and a cluster already in the required state is left untouched.
+
 ## [0.5.1] - 2026-08-25
 
 ### Added

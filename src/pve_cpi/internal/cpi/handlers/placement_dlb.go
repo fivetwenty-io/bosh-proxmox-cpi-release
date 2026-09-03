@@ -150,23 +150,16 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 // crs setting (when DLBManageClusterCRS is true) or emits a WARN when not
 // dynamic and management is off.
 func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, logger *log.Logger) error {
-	raw, listErr := svc.ListOptions(ctx)
+	opts, listErr := svc.ListOptions(ctx)
 	if listErr != nil {
 		return fmt.Errorf("read cluster options: %w", listErr)
 	}
 
-	// ListOptionsResponse is json.RawMessage; extract "crs" string field.
-	crsStr := ""
-	if raw != nil {
-		var opts struct {
-			Crs string `json:"crs"`
-		}
-		if jerr := json.Unmarshal(*raw, &opts); jerr == nil {
-			crsStr = opts.Crs
-		}
+	crsMap := make(map[string]string)
+	if opts != nil {
+		crsMap = parseCRSRaw(opts.Crs)
 	}
-
-	crsMap := parseCRS(crsStr)
+	crsStr := formatCRS(crsMap)
 	isDynamic := crsHasDynamic(crsMap)
 
 	if deps.Config != nil && deps.Config.DLBManageClusterCRS() {
@@ -317,6 +310,54 @@ func pveVersionAtLeast(version string, major, minor int) bool {
 		return true
 	}
 	return false
+}
+
+// parseCRSRaw parses the crs field of GET /cluster/options into the same
+// key→value map parseCRS produces. PVE returns the parsed datacenter.cfg, so
+// crs normally arrives as an object keyed by sub-option, with the boolean
+// flags as unquoted integers; a bare property string is still accepted for
+// the shape a hand-written configuration can produce. Anything else yields an
+// empty map, which reads as "not dynamic".
+func parseCRSRaw(raw json.RawMessage) map[string]string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return make(map[string]string)
+	}
+
+	var asString string
+	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
+		return parseCRS(asString)
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &fields); err != nil {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(fields))
+	for key, val := range fields {
+		out[key] = crsScalar(val)
+	}
+	return out
+}
+
+// crsScalar renders one crs sub-option as the string the map holds. PVE sends
+// the boolean flags as unquoted 1/0, so a JSON number or bool becomes the
+// digit crsHasDynamic, the flag comparisons, and formatCRS expect.
+func crsScalar(val json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(val))
+	switch trimmed {
+	case "", "null":
+		return ""
+	case "true":
+		return "1"
+	case "false":
+		return "0"
+	}
+	var asString string
+	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
+		return asString
+	}
+	return trimmed
 }
 
 // parseCRS parses a PVE crs option string into a key→value map.

@@ -131,6 +131,9 @@ type Service interface {
 	// ListCephMetadata GET /cluster/ceph/metadata
 	// Get ceph metadata.
 	ListCephMetadata(ctx context.Context, params *ListCephMetadataParams) (*ListCephMetadataResponse, error)
+	// CreateCephRestartBulk POST /cluster/ceph/restart-bulk
+	// Cluster-wide rolling restart of all Ceph daemons of the given type. For MON/MGR/MDS each daemon is restarted only after Ceph reports the previous one is back up and the next one is safe to stop. For OSDs the cluster path orchestrates the per-node endpoint at /nodes/{node}/ceph/restart-bulk on each node in turn, inheriting that endpoint's per-OSD 'noout' handling and resume support. The 'noout' flag itself is not exposed by this endpoint as it is OSD-specific (and for OSDs handled by the per-node sub-tasks).
+	CreateCephRestartBulk(ctx context.Context, params *CreateCephRestartBulkParams) (*CreateCephRestartBulkResponse, error)
 	// ListCephStatus GET /cluster/ceph/status
 	// Get ceph status.
 	ListCephStatus(ctx context.Context) (*ListCephStatusResponse, error)
@@ -1444,6 +1447,7 @@ type ListAcmeTosParams struct {
 }
 
 // ListAcmeTosResponse is the raw JSON returned by GET /cluster/acme/tos.
+// ACME TermsOfService URL.
 type ListAcmeTosResponse = json.RawMessage
 
 // ListAcmeTos implements Service.ListAcmeTos. GET /cluster/acme/tos.
@@ -1632,6 +1636,7 @@ func (s *service) CreateBackup(ctx context.Context, params *CreateBackupParams) 
 }
 
 // ListBackupInfoResponse mirrors the shape returned by GET /cluster/backup-info.
+// Directory index.
 type ListBackupInfoResponse []json.RawMessage
 
 // ListBackupInfo implements Service.ListBackupInfo. GET /cluster/backup-info.
@@ -1665,6 +1670,7 @@ func (s *service) ListBackupInfo(ctx context.Context) (*ListBackupInfoResponse, 
 }
 
 // ListBackupInfoNotBackedUpResponse mirrors the shape returned by GET /cluster/backup-info/not-backed-up.
+// Contains the guest objects.
 type ListBackupInfoNotBackedUpResponse []json.RawMessage
 
 // ListBackupInfoNotBackedUp implements Service.ListBackupInfoNotBackedUp. GET /cluster/backup-info/not-backed-up.
@@ -1933,6 +1939,7 @@ func (s *service) UpdateBackup(ctx context.Context, id string, params *UpdateBac
 }
 
 // ListBackupIncludedVolumesResponse mirrors the shape returned by GET /cluster/backup/{id}/included_volumes.
+// Root node of the tree object. Children represent guests, grandchildren represent volumes of that guest.
 type ListBackupIncludedVolumesResponse struct {
 	Children []json.RawMessage `json:"children"`
 }
@@ -2049,6 +2056,7 @@ type CreateBulkActionGuestMigrateParams struct {
 }
 
 // CreateBulkActionGuestMigrateResponse is the raw JSON returned by POST /cluster/bulk-action/guest/migrate.
+// UPID of the worker
 type CreateBulkActionGuestMigrateResponse = json.RawMessage
 
 // CreateBulkActionGuestMigrate implements Service.CreateBulkActionGuestMigrate. POST /cluster/bulk-action/guest/migrate.
@@ -2108,6 +2116,7 @@ type CreateBulkActionGuestShutdownParams struct {
 }
 
 // CreateBulkActionGuestShutdownResponse is the raw JSON returned by POST /cluster/bulk-action/guest/shutdown.
+// UPID of the worker
 type CreateBulkActionGuestShutdownResponse = json.RawMessage
 
 // CreateBulkActionGuestShutdown implements Service.CreateBulkActionGuestShutdown. POST /cluster/bulk-action/guest/shutdown.
@@ -2165,6 +2174,7 @@ type CreateBulkActionGuestStartParams struct {
 }
 
 // CreateBulkActionGuestStartResponse is the raw JSON returned by POST /cluster/bulk-action/guest/start.
+// UPID of the worker
 type CreateBulkActionGuestStartResponse = json.RawMessage
 
 // CreateBulkActionGuestStart implements Service.CreateBulkActionGuestStart. POST /cluster/bulk-action/guest/start.
@@ -2224,6 +2234,7 @@ type CreateBulkActionGuestSuspendParams struct {
 }
 
 // CreateBulkActionGuestSuspendResponse is the raw JSON returned by POST /cluster/bulk-action/guest/suspend.
+// UPID of the worker
 type CreateBulkActionGuestSuspendResponse = json.RawMessage
 
 // CreateBulkActionGuestSuspend implements Service.CreateBulkActionGuestSuspend. POST /cluster/bulk-action/guest/suspend.
@@ -2481,6 +2492,7 @@ type ListCephMetadataParams struct {
 }
 
 // ListCephMetadataResponse mirrors the shape returned by GET /cluster/ceph/metadata.
+// Items for each type of service containing objects for each instance.
 type ListCephMetadataResponse struct {
 	// Mds Metadata servers configured in the cluster and their properties, keyed by '<name>@<host>'.
 	Mds json.RawMessage `json:"mds"`
@@ -2531,6 +2543,65 @@ func (s *service) ListCephMetadata(ctx context.Context, params *ListCephMetadata
 	err = json.Unmarshal(raw, out)
 	if err != nil {
 		return nil, fmt.Errorf("cluster.ListCephMetadata: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// CreateCephRestartBulkParams is the request payload for CreateCephRestartBulk.
+type CreateCephRestartBulkParams struct {
+	// DryRun Log the plan (which daemons would be restarted, in what order) without actually doing anything.
+	DryRun *bool `json:"dry-run,omitempty"`
+	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. HEALTH_ERR is always fatal regardless. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
+	Force *bool `json:"force,omitempty"`
+	// OnlyOutdated OSDs only: restart only OSDs whose running version differs from the locally-installed ceph-osd binary on their host. Forwarded to each per-node sub-task so the per-host installed version is used (a partial upgrade where one host is on a newer build is handled correctly).
+	OnlyOutdated *bool `json:"only-outdated,omitempty"`
+	// ServiceType Ceph daemon type to restart cluster-wide.
+	ServiceType string `json:"service-type"`
+	// Timeout Per-daemon timeout (in seconds) for the up-wait phase. Note: for daemons on remote nodes the same timeout also bounds the remote restart task, so the per-daemon budget can be up to 2x this value. Default sized for slow MDS journal replay or MON paxos settle on busy clusters; bump higher if the cluster routinely takes longer to stabilize after a daemon restart.
+	Timeout *int64 `json:"timeout,omitempty"`
+}
+
+// CreateCephRestartBulkResponse is the raw JSON returned by POST /cluster/ceph/restart-bulk.
+type CreateCephRestartBulkResponse = json.RawMessage
+
+// CreateCephRestartBulk implements Service.CreateCephRestartBulk. POST /cluster/ceph/restart-bulk.
+func (s *service) CreateCephRestartBulk(ctx context.Context, params *CreateCephRestartBulkParams) (*CreateCephRestartBulkResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.CreateCephRestartBulk: ctx must not be nil")
+	}
+	path := "/cluster/ceph/restart-bulk"
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.CreateCephRestartBulk: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return nil, fmt.Errorf("cluster.CreateCephRestartBulk: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PostRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.CreateCephRestartBulk: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.CreateCephRestartBulk: nil response from client")
+	}
+	if resp.Data == nil {
+		out := CreateCephRestartBulkResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.CreateCephRestartBulk: re-marshal data: %w", err)
+	}
+	out := &CreateCephRestartBulkResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.CreateCephRestartBulk: unmarshal data: %w", err)
 	}
 	return out, nil
 }
@@ -2699,6 +2770,7 @@ func (s *service) CreateConfig(ctx context.Context, params *CreateConfigParams) 
 }
 
 // ListConfigApiversionResponse is the raw JSON returned by GET /cluster/config/apiversion.
+// Cluster Join API version, currently 1
 type ListConfigApiversionResponse = json.RawMessage
 
 // ListConfigApiversion implements Service.ListConfigApiversion. GET /cluster/config/apiversion.
@@ -5031,7 +5103,7 @@ func (s *service) ListHaRules(ctx context.Context, params *ListHaRulesParams) (*
 
 // CreateHaRulesParams is the request payload for CreateHaRules.
 type CreateHaRulesParams struct {
-	// Affinity Describes whether the HA resources are supposed to be kept on the same node ('positive'), or are supposed to be kept on separate nodes ('negative').
+	// Affinity With type=node-affinity: Describes whether the HA resources are supposed to be placed on the given nodes ('positive'), or are supposed to be placed on any but the given nodes ('negative'). With type=resource-affinity: Describes whether the HA resources are supposed to be kept on the same node ('positive'), or are supposed to be kept on separate nodes ('negative').
 	Affinity *string `json:"affinity,omitempty"`
 	// Comment HA rule description.
 	Comment *string `json:"comment,omitempty"`
@@ -5136,7 +5208,7 @@ func (s *service) GetHaRules(ctx context.Context, rule string) (*GetHaRulesRespo
 
 // UpdateHaRulesParams is the request payload for UpdateHaRules.
 type UpdateHaRulesParams struct {
-	// Affinity Describes whether the HA resources are supposed to be kept on the same node ('positive'), or are supposed to be kept on separate nodes ('negative').
+	// Affinity With type=node-affinity: Describes whether the HA resources are supposed to be placed on the given nodes ('positive'), or are supposed to be placed on any but the given nodes ('negative'). With type=resource-affinity: Describes whether the HA resources are supposed to be kept on the same node ('positive'), or are supposed to be kept on separate nodes ('negative').
 	Affinity *string `json:"affinity,omitempty"`
 	// Comment HA rule description.
 	Comment *string `json:"comment,omitempty"`
@@ -5340,6 +5412,7 @@ func (s *service) ListHaStatusManagerStatus(ctx context.Context) (*ListHaStatusM
 }
 
 // ListJobsResponse mirrors the shape returned by GET /cluster/jobs.
+// Directory index.
 type ListJobsResponse []json.RawMessage
 
 // ListJobs implements Service.ListJobs. GET /cluster/jobs.
@@ -5563,6 +5636,7 @@ type ListJobsScheduleAnalyzeParams struct {
 }
 
 // ListJobsScheduleAnalyzeResponse mirrors the shape returned by GET /cluster/jobs/schedule-analyze.
+// An array of the next <iterations> events since <starttime>.
 type ListJobsScheduleAnalyzeResponse []json.RawMessage
 
 // ListJobsScheduleAnalyze implements Service.ListJobsScheduleAnalyze. GET /cluster/jobs/schedule-analyze.
@@ -6594,6 +6668,7 @@ type ListNextidParams struct {
 }
 
 // ListNextidResponse is the raw JSON returned by GET /cluster/nextid.
+// The next free VMID.
 type ListNextidResponse = json.RawMessage
 
 // ListNextid implements Service.ListNextid. GET /cluster/nextid.
@@ -7843,8 +7918,59 @@ func (s *service) CreateNotificationsTargetsTest(ctx context.Context, name strin
 	return nil
 }
 
-// ListOptionsResponse is the raw JSON returned by GET /cluster/options.
-type ListOptionsResponse = json.RawMessage
+// ListOptionsResponse mirrors the shape returned by GET /cluster/options.
+type ListOptionsResponse struct {
+	// AllowedTags The tags the current user is allowed to set and see.
+	AllowedTags []string `json:"allowed-tags"`
+	// Bwlimit Set I/O bandwidth limit for various operations (in KiB/s).
+	Bwlimit *string `json:"bwlimit,omitempty"`
+	// ConsentText Consent text that is displayed before logging in.
+	ConsentText *string `json:"consent-text,omitempty"`
+	// Console Select the default Console viewer. You can either use the builtin java applet (VNC; deprecated and maps to html5), an external virt-viewer comtatible application (SPICE), an HTML5 based vnc viewer (noVNC), or an HTML5 based console client (xtermjs). If the selected viewer is not available (e.g. SPICE not activated for the VM), the fallback is noVNC.
+	Console *string `json:"console,omitempty"`
+	// Crs Cluster resource scheduling settings.
+	Crs json.RawMessage `json:"crs,omitempty"`
+	// Description Datacenter description. Shown in the web-interface datacenter notes panel. This is saved as comment inside the configuration file.
+	Description *string `json:"description,omitempty"`
+	// EmailFrom Specify email address to send notification from (default is root@$hostname)
+	EmailFrom *string `json:"email_from,omitempty"`
+	// Fencing Set the fencing mode of the HA cluster. Hardware mode needs a valid configuration of fence devices in /etc/pve/ha/fence.cfg. With both all two modes are used.  WARNING: 'hardware' and 'both' are EXPERIMENTAL & WIP
+	Fencing *string `json:"fencing,omitempty"`
+	// Ha Cluster wide HA settings.
+	Ha json.RawMessage `json:"ha,omitempty"`
+	// HttpProxy Specify external http proxy which is used for downloads (example: 'http://username:password@host:port/')
+	HttpProxy *string `json:"http_proxy,omitempty"`
+	// Keyboard Default keybord layout for vnc server.
+	Keyboard *string `json:"keyboard,omitempty"`
+	// Language Default GUI language.
+	Language *string `json:"language,omitempty"`
+	// Location The location of the cluster.
+	Location *string `json:"location,omitempty"`
+	// MacPrefix Prefix for the auto-generated MAC addresses of virtual guests. The default 'BC:24:11' is the OUI assigned by the IEEE to Proxmox Server Solutions GmbH for a 24-bit large MAC block. You're allowed to use this in local networks, i.e., those not directly reachable by the public (e.g., in a LAN or behind NAT).
+	MacPrefix *string `json:"mac_prefix,omitempty"`
+	// MaxWorkers Defines how many workers (per node) are maximal started  on actions like 'stopall VMs' or task from the ha-manager.
+	MaxWorkers *client.PVEInt `json:"max_workers,omitempty"`
+	// Migration For cluster wide migration settings.
+	Migration json.RawMessage `json:"migration,omitempty"`
+	// MigrationUnsecure Migration is secure using SSH tunnel by default. For secure private networks you can disable it to speed up migration. Deprecated, use the 'migration' property instead!
+	MigrationUnsecure *client.PVEBool `json:"migration_unsecure,omitempty"`
+	// NextId Control the range for the free VMID auto-selection pool.
+	NextId json.RawMessage `json:"next-id,omitempty"`
+	// Notify Cluster-wide notification settings.
+	Notify json.RawMessage `json:"notify,omitempty"`
+	// RegisteredTags A list of tags that require a `Sys.Modify` on '/' to set and delete. Tags set here that are also in 'user-tag-access' also require `Sys.Modify`.
+	RegisteredTags []string `json:"registered-tags,omitempty"`
+	// Replication For cluster wide replication settings.
+	Replication json.RawMessage `json:"replication,omitempty"`
+	// TagStyle Tag style options.
+	TagStyle json.RawMessage `json:"tag-style,omitempty"`
+	// U2f u2f
+	U2f json.RawMessage `json:"u2f,omitempty"`
+	// UserTagAccess Privilege options for user-settable tags
+	UserTagAccess json.RawMessage `json:"user-tag-access,omitempty"`
+	// Webauthn webauthn configuration
+	Webauthn json.RawMessage `json:"webauthn,omitempty"`
+}
 
 // ListOptions implements Service.ListOptions. GET /cluster/options.
 func (s *service) ListOptions(ctx context.Context) (*ListOptionsResponse, error) {
@@ -7861,8 +7987,7 @@ func (s *service) ListOptions(ctx context.Context) (*ListOptionsResponse, error)
 		return nil, fmt.Errorf("cluster.ListOptions: nil response from client")
 	}
 	if resp.Data == nil {
-		out := ListOptionsResponse{}
-		return &out, nil
+		return nil, fmt.Errorf("cluster.ListOptions: empty data in response (code=%d)", resp.Code)
 	}
 	raw, err := json.Marshal(resp.Data)
 	if err != nil {

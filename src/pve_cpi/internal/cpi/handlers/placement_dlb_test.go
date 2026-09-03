@@ -71,12 +71,17 @@ func (s *dlbClusterStub) ListOptions(_ context.Context) (*cluster.ListOptionsRes
 	if s.listOptionsRaw != nil {
 		return s.listOptionsRaw, nil
 	}
-	// Default: crs=ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1.
-	raw, _ := json.Marshal(map[string]any{
-		"crs": "ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1",
-	})
-	resp := cluster.ListOptionsResponse(raw)
-	return &resp, nil
+	// Default: crs=ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1, in
+	// the parsed-datacenter.cfg shape PVE returns it.
+	return dlbListOptions(`{"ha":"dynamic","ha-auto-rebalance":1,"ha-rebalance-on-start":1}`), nil
+}
+
+// dlbListOptions builds a /cluster/options response carrying the given crs
+// JSON, so a test can pick either shape the field has been seen to take: the
+// object of sub-options PVE parses out of datacenter.cfg, or a bare property
+// string.
+func dlbListOptions(crsJSON string) *cluster.ListOptionsResponse {
+	return &cluster.ListOptionsResponse{Crs: json.RawMessage(crsJSON)}
 }
 
 func (s *dlbClusterStub) UpdateOptions(_ context.Context, p *cluster.UpdateOptionsParams) error {
@@ -334,9 +339,7 @@ func (s *dlbClusterStubAlreadyExists) CreateHaResources(_ context.Context, _ *cl
 
 func TestDLBMembership_ManageCRS_NotDynamic_CallsUpdateOptions(t *testing.T) {
 	// crs is not dynamic; manage_cluster_crs=true → UpdateOptions must be called.
-	raw, _ := json.Marshal(map[string]any{"crs": "ha=static"})
-	resp := cluster.ListOptionsResponse(raw)
-	clusterSvc := &dlbClusterStub{listOptionsRaw: &resp}
+	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
 	cfg := dlbConfigWithDLB(true, false) // manage_cluster_crs=true
@@ -362,9 +365,7 @@ func TestDLBMembership_ManageCRS_NotDynamic_CallsUpdateOptions(t *testing.T) {
 }
 
 func TestDLBMembership_ManageCRSFalse_NotDynamic_NoUpdateOptions(t *testing.T) {
-	raw, _ := json.Marshal(map[string]any{"crs": "ha=static"})
-	resp := cluster.ListOptionsResponse(raw)
-	svc := &dlbClusterStub{listOptionsRaw: &resp}
+	svc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
 	cfg := dlbConfigWithDLB(false, false) // manage_cluster_crs=false
@@ -385,6 +386,85 @@ func TestDLBMembership_ManageCRSFalse_NotDynamic_NoUpdateOptions(t *testing.T) {
 // --------------------------------------------------------------------------
 // parseCRS / formatCRS / crsHasDynamic unit tests
 // --------------------------------------------------------------------------
+
+func TestDLBMembership_ManageCRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
+	// PVE returns crs as an object of sub-options with the flags as unquoted
+	// integers. That is already the required setting, so nothing may be written.
+	clusterSvc := &dlbClusterStub{
+		listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-rebalance-on-start":1,"ha-auto-rebalance":1}`),
+	}
+	nodesSvc := &dlbNodesStub{}
+	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
+	cfg := dlbConfigWithDLB(true, false) // manage_cluster_crs=true
+
+	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
+	if err := ensureDLBMembership(context.Background(), deps, 107, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(clusterSvc.updateOptsCRS) != 0 {
+		t.Errorf("crs already dynamic: UpdateOptions must NOT be called, got %v", clusterSvc.updateOptsCRS)
+	}
+}
+
+func TestParseCRSRaw(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want map[string]string
+	}{
+		{
+			name: "object with integer flags",
+			raw:  `{"ha":"dynamic","ha-rebalance-on-start":1,"ha-auto-rebalance":0}`,
+			want: map[string]string{"ha": "dynamic", "ha-rebalance-on-start": "1", "ha-auto-rebalance": "0"},
+		},
+		{
+			name: "object with string flags",
+			raw:  `{"ha":"dynamic","ha-rebalance-on-start":"1"}`,
+			want: map[string]string{"ha": "dynamic", "ha-rebalance-on-start": "1"},
+		},
+		{
+			name: "object with boolean flags",
+			raw:  `{"ha":"dynamic","ha-rebalance-on-start":true,"ha-auto-rebalance":false}`,
+			want: map[string]string{"ha": "dynamic", "ha-rebalance-on-start": "1", "ha-auto-rebalance": "0"},
+		},
+		{
+			name: "bare property string",
+			raw:  `"ha=dynamic,ha-auto-rebalance=1"`,
+			want: map[string]string{"ha": "dynamic", "ha-auto-rebalance": "1"},
+		},
+		{name: "empty string value", raw: `""`, want: map[string]string{}},
+		{name: "absent", raw: ``, want: map[string]string{}},
+		{name: "null", raw: `null`, want: map[string]string{}},
+		{name: "unexpected array", raw: `["ha=dynamic"]`, want: map[string]string{}},
+		{name: "malformed", raw: `{`, want: map[string]string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseCRSRaw(json.RawMessage(tc.raw))
+			if got == nil {
+				t.Fatal("parseCRSRaw must never return a nil map")
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Errorf("key %q: got %q, want %q", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestParseCRSRaw_ObjectRoundTripsThroughFormatCRS(t *testing.T) {
+	// The WARN log renders the map back to a property string; the object shape
+	// must survive that as the equivalent crs setting.
+	got := formatCRS(parseCRSRaw(json.RawMessage(`{"ha":"dynamic","ha-auto-rebalance":1}`)))
+	const want = "ha=dynamic,ha-auto-rebalance=1"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
 
 func TestParseCRS_Empty(t *testing.T) {
 	m := parseCRS("")
