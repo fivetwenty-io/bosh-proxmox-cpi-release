@@ -37,7 +37,7 @@ const crsModeDynamic = "dynamic"
 //  5. CRS: when DLBManageClusterCRS() == true, ensure the cluster crs option is
 //     set to ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1 via
 //     UpdateOptions. When manage is false and crs is not dynamic, log a
-//     one-time WARN with the corrective pvesh command.
+//     WARN with the corrective pvesh command.
 func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, logger *log.Logger) error {
 	logger.Debug("DLB: evaluating membership", log.Int("vmid", vmid), log.String("az", az))
 
@@ -148,7 +148,9 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 
 // ensureDLBClusterCRS reads /cluster/options and either writes the required
 // crs setting (when DLBManageClusterCRS is true) or emits a WARN when not
-// dynamic and management is off.
+// dynamic and management is off. A crs value the CPI cannot decode is an error
+// in both modes: merging from an empty base would drop every sub-option the
+// operator configured, which is the loss the decode exists to prevent.
 func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, logger *log.Logger) error {
 	opts, listErr := svc.ListOptions(ctx)
 	if listErr != nil {
@@ -157,23 +159,20 @@ func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, lo
 
 	crsMap := make(map[string]string)
 	if opts != nil {
-		crsMap = parseCRSRaw(opts.Crs)
+		parsed, parseErr := parseCRSRaw(opts.Crs)
+		if parseErr != nil {
+			return fmt.Errorf("decode cluster crs %s: %w", strings.TrimSpace(string(opts.Crs)), parseErr)
+		}
+		crsMap = parsed
 	}
-	crsStr := formatCRS(crsMap)
 	isDynamic := crsHasDynamic(crsMap)
 
 	if deps.Config != nil && deps.Config.DLBManageClusterCRS() {
-		if isDynamic &&
-			crsMap["ha-rebalance-on-start"] == "1" &&
-			crsMap["ha-auto-rebalance"] == "1" {
-			// Already correct — nothing to write.
+		if crsHasRequired(crsMap) {
+			// Already correct: nothing to write.
 			return nil
 		}
-		// Merge the required keys into whatever is currently configured.
-		crsMap["ha"] = crsModeDynamic
-		crsMap["ha-rebalance-on-start"] = "1"
-		crsMap["ha-auto-rebalance"] = "1"
-		newCRS := formatCRS(crsMap)
+		newCRS := formatCRS(withRequiredCRS(crsMap))
 		if updErr := svc.UpdateOptions(ctx, &cluster.UpdateOptionsParams{
 			Crs: &newCRS,
 		}); updErr != nil {
@@ -182,13 +181,36 @@ func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, lo
 		return nil
 	}
 
-	// manage_cluster_crs is false: read-only. Warn once if not dynamic.
+	// manage_cluster_crs is false: read-only. Warn if not dynamic, and hand the
+	// operator the merged setting so the corrective command keeps whatever else
+	// they configured; pvesh set --crs replaces the whole property string.
 	if !isDynamic {
 		logger.Warn("DLB: cluster crs is not dynamic; DLB rebalancing is inactive",
-			log.String("current_crs", crsStr),
-			log.String("fix", "pvesh set /cluster/options --crs ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1"))
+			log.String("current_crs", formatCRS(crsMap)),
+			log.String("fix", "pvesh set /cluster/options --crs "+formatCRS(withRequiredCRS(crsMap))))
 	}
 	return nil
+}
+
+// crsHasRequired reports whether the parsed crs map already carries the three
+// sub-options DLB needs: ha=dynamic with both rebalance flags on.
+func crsHasRequired(m map[string]string) bool {
+	return crsHasDynamic(m) &&
+		m["ha-rebalance-on-start"] == "1" &&
+		m["ha-auto-rebalance"] == "1"
+}
+
+// withRequiredCRS returns a copy of m with the three sub-options DLB needs set,
+// leaving every other sub-option the operator configured in place.
+func withRequiredCRS(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m)+3)
+	for k, v := range m {
+		out[k] = v
+	}
+	out["ha"] = crsModeDynamic
+	out["ha-rebalance-on-start"] = "1"
+	out["ha-auto-rebalance"] = "1"
+	return out
 }
 
 // firstClusterNode returns the name of the first node from ListConfigNodes,
@@ -316,55 +338,72 @@ func pveVersionAtLeast(version string, major, minor int) bool {
 // key→value map parseCRS produces. PVE returns the parsed datacenter.cfg, so
 // crs normally arrives as an object keyed by sub-option, with the boolean
 // flags as unquoted integers; a bare property string is still accepted for
-// the shape a hand-written configuration can produce. Anything else yields an
-// empty map, which reads as "not dynamic".
-func parseCRSRaw(raw json.RawMessage) map[string]string {
+// the shape a hand-written configuration can produce. An absent or null field
+// is an empty map. Any other shape, or a sub-option whose value is not a JSON
+// scalar, is an error rather than an empty map, so a caller never merges into
+// an empty base and writes the operator's other sub-options away.
+func parseCRSRaw(raw json.RawMessage) (map[string]string, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
-		return make(map[string]string)
+		return make(map[string]string), nil
 	}
 
 	var asString string
 	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
-		return parseCRS(asString)
+		return parseCRS(asString), nil
 	}
 
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &fields); err != nil {
-		return make(map[string]string)
+		return nil, fmt.Errorf("crs is neither a property string nor an object of sub-options: %w", err)
 	}
 	out := make(map[string]string, len(fields))
 	for key, val := range fields {
-		out[key] = crsScalar(val)
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		scalar, err := crsScalar(val)
+		if err != nil {
+			return nil, fmt.Errorf("crs sub-option %q: %w", key, err)
+		}
+		out[key] = scalar
 	}
-	return out
+	return out, nil
 }
 
 // crsScalar renders one crs sub-option as the string the map holds. PVE sends
 // the boolean flags as unquoted 1/0, so a JSON number or bool becomes the
-// digit crsHasDynamic, the flag comparisons, and formatCRS expect.
-func crsScalar(val json.RawMessage) string {
+// digit crsHasDynamic, the flag comparisons, and formatCRS expect. Strings are
+// trimmed the way parseCRS trims property-string values. Anything that is not
+// a JSON scalar is an error rather than its raw JSON text, so an object or
+// array can never be spliced into the property string the CPI writes back.
+func crsScalar(val json.RawMessage) (string, error) {
 	trimmed := strings.TrimSpace(string(val))
 	switch trimmed {
 	case "", "null":
-		return ""
+		return "", nil
 	case "true":
-		return "1"
+		return "1", nil
 	case "false":
-		return "0"
+		return "0", nil
 	}
 	var asString string
 	if err := json.Unmarshal([]byte(trimmed), &asString); err == nil {
-		return asString
+		return strings.TrimSpace(asString), nil
 	}
-	return trimmed
+	var asNumber json.Number
+	if err := json.Unmarshal([]byte(trimmed), &asNumber); err == nil {
+		return asNumber.String(), nil
+	}
+	return "", fmt.Errorf("value %s is not a JSON scalar", trimmed)
 }
 
 // parseCRS parses a PVE crs option string into a key→value map.
 // PVE format: "ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1"
-// Each token is "key=value"; tokens without "=" are stored with an empty
-// string value so they are preserved through a round-trip via formatCRS.
-// An empty input string returns an empty (non-nil) map.
+// Each token is "key=value"; a token without "=" is stored with an empty
+// string value so the read side keeps it, and formatCRS drops it again on the
+// way out. An empty input string returns an empty (non-nil) map.
 func parseCRS(s string) map[string]string {
 	out := make(map[string]string)
 	if s == "" {
@@ -394,26 +433,22 @@ func crsHasDynamic(m map[string]string) bool {
 	return m["ha"] == crsModeDynamic
 }
 
-// formatCRS serializes a CRS map back to the PVE "key=value,..." string format
-// with keys in deterministic (sorted) order so the output is stable across
-// round-trips.
+// formatCRS serializes a CRS map back to the PVE "key=value,..." property
+// string with keys in deterministic (sorted) order so the output is stable
+// across round-trips. A key with an empty value is dropped: the crs format
+// declares no default key, so PVE rejects a bare token in a write, and a
+// value-less key is only ever a read-side artifact of parseCRS.
 func formatCRS(m map[string]string) string {
-	if len(m) == 0 {
-		return ""
-	}
 	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	for k, v := range m {
+		if v != "" {
+			keys = append(keys, k)
+		}
 	}
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		v := m[k]
-		if v == "" {
-			parts = append(parts, k)
-		} else {
-			parts = append(parts, k+"="+v)
-		}
+		parts = append(parts, k+"="+m[k])
 	}
 	return strings.Join(parts, ",")
 }

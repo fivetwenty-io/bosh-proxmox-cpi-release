@@ -101,9 +101,9 @@ pvesh set /cluster/options \
 
 ### `manage_cluster_crs` Knob
 
-**Default behavior (`manage_cluster_crs: false`):** The CPI reads `/cluster/options` each time a DLB-eligible VM is created. If the cluster is not in dynamic mode, the CPI logs a warning with the corrective `pvesh` command and continues. DLB rebalancing will be inactive until the operator applies the setting.
+**Default behavior (`manage_cluster_crs: false`):** The CPI reads `/cluster/options` each time a DLB-eligible VM is created. If the cluster is not in dynamic mode, the CPI logs a warning with the corrective `pvesh` command and continues. That command is built from the current setting with the three DLB keys merged in, so running it keeps any other CRS sub-option we already have. DLB rebalancing will be inactive until the operator applies the setting.
 
-**Opt-in automation (`manage_cluster_crs: true`):** The CPI calls `UpdateOptions` to set `crs=ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1` automatically. It merges those three keys into whatever the cluster already has, so any other CRS sub-option the operator set is preserved, and it writes nothing when all three already hold the required values. Use this with caution: writing the cluster CRS option is a **cluster-wide change** that affects every HA-managed guest, not only BOSH VMs.
+**Opt-in automation (`manage_cluster_crs: true`):** The CPI calls `UpdateOptions` to set `crs=ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1` automatically. It merges those three keys into whatever the cluster already has, so any other CRS sub-option the operator set is preserved, and it writes nothing when all three already hold the required values. If the CPI cannot decode the current setting it writes nothing and logs the error, so a merge never starts from an empty base. Use this with caution: writing the cluster CRS option is a **cluster-wide change** that affects every HA-managed guest, not only BOSH VMs.
 
 ---
 

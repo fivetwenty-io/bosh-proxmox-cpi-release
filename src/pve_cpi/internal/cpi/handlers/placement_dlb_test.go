@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -406,11 +408,145 @@ func TestDLBMembership_ManageCRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
 	}
 }
 
+func dlbSharedDeps(clusterSvc *dlbClusterStub, manageCRS bool) Deps {
+	return dlbDeps(clusterSvc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB(manageCRS, false))
+}
+
+func TestDLBMembership_ManageCRS_PreservesOperatorSubOptions(t *testing.T) {
+	// The merge must keep every sub-option the operator configured and only
+	// set the three DLB needs; the flags come back as unquoted integers.
+	clusterSvc := &dlbClusterStub{
+		listOptionsRaw: dlbListOptions(`{"ha":"static","ha-auto-rebalance-margin":50,"ha-auto-rebalance-method":"topsis"}`),
+	}
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 108, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-auto-rebalance-margin=50,ha-auto-rebalance-method=topsis,ha-rebalance-on-start=1"}
+	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
+		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
+	}
+}
+
+func TestDLBMembership_ManageCRS_PartiallyCorrect_StillWrites(t *testing.T) {
+	// ha=dynamic alone is not enough: a flag that is off must still trigger the
+	// write, so the short-circuit cannot be widened to the mode alone.
+	clusterSvc := &dlbClusterStub{
+		listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-rebalance-on-start":1,"ha-auto-rebalance":0}`),
+	}
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 109, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1"}
+	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
+		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
+	}
+}
+
+func TestDLBMembership_ManageCRS_PropertyStringShape_Writes(t *testing.T) {
+	// A bare property string is the other shape the field has been seen to
+	// take; it must drive the same merge end to end.
+	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`"ha=static,ha-auto-rebalance-margin=20"`)}
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 110, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-auto-rebalance-margin=20,ha-rebalance-on-start=1"}
+	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
+		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
+	}
+}
+
+func TestDLBMembership_ManageCRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.T) {
+	// A crs value the CPI cannot decode must never merge from an empty base:
+	// that write would drop every sub-option the operator configured.
+	for _, raw := range []string{`["ha=dynamic"]`, `{"ha":{"mode":"dynamic"}}`, `{`} {
+		clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(raw)}
+		err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 111, "dlb", log.NewNopLogger())
+		if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
+			t.Errorf("crs %s: want a decode error, got %v", raw, err)
+		}
+		if len(clusterSvc.updateOptsCRS) != 0 {
+			t.Errorf("crs %s: UpdateOptions must NOT be called, got %v", raw, clusterSvc.updateOptsCRS)
+		}
+	}
+}
+
+func TestDLBMembership_ManageCRSFalse_UndecodableCRS_Errors(t *testing.T) {
+	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`["ha=dynamic"]`)}
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 112, "dlb", log.NewNopLogger())
+	if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
+		t.Errorf("want a decode error, got %v", err)
+	}
+}
+
+func TestDLBMembership_ManageCRS_ListOptionsError_Wrapped(t *testing.T) {
+	clusterSvc := &dlbClusterStub{listOptionsErr: fmt.Errorf("boom")}
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 113, "dlb", log.NewNopLogger())
+	if err == nil || !strings.Contains(err.Error(), "read cluster options: boom") {
+		t.Errorf("want the wrapped ListOptions error, got %v", err)
+	}
+	if len(clusterSvc.updateOptsCRS) != 0 {
+		t.Errorf("UpdateOptions must NOT be called after a failed read, got %v", clusterSvc.updateOptsCRS)
+	}
+}
+
+func TestDLBMembership_ManageCRS_UpdateOptionsError_Wrapped(t *testing.T) {
+	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`), updateOptsErr: fmt.Errorf("denied")}
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 114, "dlb", log.NewNopLogger())
+	if err == nil || !strings.Contains(err.Error(), `set cluster crs="ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1": denied`) {
+		t.Errorf("want the wrapped UpdateOptions error, got %v", err)
+	}
+}
+
+func TestDLBMembership_ManageCRSFalse_WarnHintPreservesOperatorSubOptions(t *testing.T) {
+	// pvesh set --crs replaces the whole property string, so the corrective
+	// command in the WARN must carry the operator's other sub-options too.
+	clusterSvc := &dlbClusterStub{
+		listOptionsRaw: dlbListOptions(`{"ha":"static","ha-auto-rebalance-margin":50}`),
+	}
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 115, "dlb", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var warn *log.Entry
+	for _, e := range obs.All() {
+		if e.Level == slog.LevelWarn && strings.Contains(e.Message, "cluster crs is not dynamic") {
+			entry := e
+			warn = &entry
+		}
+	}
+	if warn == nil {
+		t.Fatalf("no crs WARN logged; entries: %v", obs.All())
+	}
+	if got, want := warn.Attrs["current_crs"], "ha=static,ha-auto-rebalance-margin=50"; got != want {
+		t.Errorf("current_crs: want %q, got %v", want, got)
+	}
+	wantFix := "pvesh set /cluster/options --crs ha=dynamic,ha-auto-rebalance=1,ha-auto-rebalance-margin=50,ha-rebalance-on-start=1"
+	if got := warn.Attrs["fix"]; got != wantFix {
+		t.Errorf("fix: want %q, got %v", wantFix, got)
+	}
+}
+
+func TestDLBMembership_ManageCRSFalse_Dynamic_NoWarn(t *testing.T) {
+	// A cluster already running ha=dynamic must not be warned about, whatever
+	// the rebalance flags say; that is the noise the object decode removes.
+	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-auto-rebalance":0}`)}
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 116, "dlb", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, e := range obs.All() {
+		if e.Level == slog.LevelWarn && strings.Contains(e.Message, "cluster crs") {
+			t.Errorf("unexpected crs WARN: %v", e)
+		}
+	}
+}
+
 func TestParseCRSRaw(t *testing.T) {
 	cases := []struct {
-		name string
-		raw  string
-		want map[string]string
+		name    string
+		raw     string
+		want    map[string]string
+		wantErr bool
 	}{
 		{
 			name: "object with integer flags",
@@ -432,17 +568,44 @@ func TestParseCRSRaw(t *testing.T) {
 			raw:  `"ha=dynamic,ha-auto-rebalance=1"`,
 			want: map[string]string{"ha": "dynamic", "ha-auto-rebalance": "1"},
 		},
+		{
+			name: "object with numeric sub-option",
+			raw:  `{"ha":"dynamic","ha-auto-rebalance-margin":50}`,
+			want: map[string]string{"ha": "dynamic", "ha-auto-rebalance-margin": "50"},
+		},
+		{
+			name: "object values and keys are trimmed like property-string tokens",
+			raw:  `{" ha ":" dynamic "}`,
+			want: map[string]string{"ha": "dynamic"},
+		},
+		{
+			name: "object with null sub-option",
+			raw:  `{"ha":"dynamic","ha-auto-rebalance":null}`,
+			want: map[string]string{"ha": "dynamic", "ha-auto-rebalance": ""},
+		},
 		{name: "empty string value", raw: `""`, want: map[string]string{}},
 		{name: "absent", raw: ``, want: map[string]string{}},
 		{name: "null", raw: `null`, want: map[string]string{}},
-		{name: "unexpected array", raw: `["ha=dynamic"]`, want: map[string]string{}},
-		{name: "malformed", raw: `{`, want: map[string]string{}},
+		{name: "unexpected array", raw: `["ha=dynamic"]`, wantErr: true},
+		{name: "unexpected number", raw: `1`, wantErr: true},
+		{name: "malformed", raw: `{`, wantErr: true},
+		{name: "object sub-option value", raw: `{"ha":{"mode":"dynamic"}}`, wantErr: true},
+		{name: "array sub-option value", raw: `{"ha":["dynamic"]}`, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseCRSRaw(json.RawMessage(tc.raw))
+			got, err := parseCRSRaw(json.RawMessage(tc.raw))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got map %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if got == nil {
-				t.Fatal("parseCRSRaw must never return a nil map")
+				t.Fatal("parseCRSRaw must never return a nil map on success")
 			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
@@ -459,7 +622,11 @@ func TestParseCRSRaw(t *testing.T) {
 func TestParseCRSRaw_ObjectRoundTripsThroughFormatCRS(t *testing.T) {
 	// The WARN log renders the map back to a property string; the object shape
 	// must survive that as the equivalent crs setting.
-	got := formatCRS(parseCRSRaw(json.RawMessage(`{"ha":"dynamic","ha-auto-rebalance":1}`)))
+	parsed, err := parseCRSRaw(json.RawMessage(`{"ha":"dynamic","ha-auto-rebalance":1}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := formatCRS(parsed)
 	const want = "ha=dynamic,ha-auto-rebalance=1"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -554,15 +721,21 @@ func TestFormatCRS_Sorted(t *testing.T) {
 }
 
 func TestFormatCRS_KeyWithoutValue(t *testing.T) {
+	// The crs format declares no default key, so a bare token is rejected by
+	// PVE; the write side must drop it rather than emit it.
 	m := map[string]string{"ha": "dynamic", "bare": ""}
-	got := formatCRS(m)
-	// "bare" has no "=" emitted; "ha=dynamic" is included.
-	parsed := parseCRS(got)
-	if parsed["ha"] != "dynamic" {
-		t.Errorf("ha: want dynamic, got %q", parsed["ha"])
+	if got, want := formatCRS(m), "ha=dynamic"; got != want {
+		t.Errorf("formatCRS: want %q, got %q", want, got)
 	}
-	if _, ok := parsed["bare"]; !ok {
-		t.Error("bare key must be preserved in round-trip")
+	if got := formatCRS(map[string]string{"bare": ""}); got != "" {
+		t.Errorf("formatCRS of only value-less keys: want empty, got %q", got)
+	}
+}
+
+func TestParseCRS_BareTokenIsKeptOnRead(t *testing.T) {
+	parsed := parseCRS("ha=dynamic,bare")
+	if v, ok := parsed["bare"]; !ok || v != "" {
+		t.Errorf("bare token must be kept on read with an empty value, got %v", parsed)
 	}
 }
 
