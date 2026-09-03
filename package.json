@@ -1,8 +1,8 @@
 {
   "dependencies": {},
   "devDependencies": {
-    "@slidev/cli": "^52.19.0",
+    "@slidev/cli": "^52.19.1",
     "@slidev/theme-default": "^0.25.0",
-    "playwright-chromium": "^1.61.1"
+    "playwright-chromium": "^1.62.1"
   }
 }
