@@ -38,6 +38,9 @@ permissions:
   contents: write
   packages: read
   pull-requests: write
+  # The report step mirrors each dispatched check run's conclusion onto the
+  # report branch head as a commit status, which is what unblocks its PR.
+  statuses: write
 
 # Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
 # touches the lab (its PVE API, the director slot, or the cpitest network)
@@ -309,9 +312,66 @@ jobs:
           # and the auto-merge above would wait forever. workflow_dispatch is
           # exempt from that suppression: dispatch the check workflows on the
           # report branch so their check runs land on its head sha.
+          #
+          # A dispatched run's check runs are attached to the commit but not
+          # to the pull request, and branch protection reads the pull
+          # request's own rollup, so dispatching alone still leaves the PR
+          # blocked with its required contexts never reported. Wait for each
+          # dispatched run and mirror its conclusion onto the head sha as a
+          # commit status carrying the required context's exact name. A
+          # status and a check run satisfy the same required context, and
+          # GITHUB_TOKEN posts it as the same GitHub Actions app the rule
+          # pins, so auto-merge lands the PR once all three report success.
+          REPORT_SHA="$(git rev-parse HEAD)"
+          mirror_check() {
+            local wf="$1" ctx="$2" run_id="" state="" conclusion="" url=""
+            # The dispatch is asynchronous: wait for the run to be queued
+            # against this branch before polling it.
+            for _ in $(seq 1 30); do
+              run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow "${wf}" \
+                --branch "${REPORT_BRANCH}" --event workflow_dispatch --limit 1 \
+                --json databaseId --jq '.[0].databaseId // empty' || true)"
+              [[ -n "${run_id}" ]] && break
+              sleep 10
+            done
+            if [[ -z "${run_id}" ]]; then
+              echo "WARN: ${wf} never queued on ${REPORT_BRANCH}; leaving ${ctx} unreported" >&2
+              return 0
+            fi
+            # 40 minutes covers the slowest of the three (CI) with headroom.
+            for _ in $(seq 1 120); do
+              local line=""
+              line="$(gh run view "${run_id}" \
+                --repo "${GITHUB_REPOSITORY}" --json status,conclusion,url \
+                --jq '[.status, (.conclusion // "-"), .url] | @tsv' || true)"
+              read -r state conclusion url <<<"${line}" || true
+              [[ "${state}" == "completed" ]] && break
+              sleep 20
+            done
+            if [[ "${state}" != "completed" ]]; then
+              echo "WARN: ${wf} run ${run_id} still ${state}; leaving ${ctx} unreported" >&2
+              return 0
+            fi
+            local status_state="failure"
+            [[ "${conclusion}" == "success" ]] && status_state="success"
+            if ! gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${REPORT_SHA}" \
+              -f state="${status_state}" \
+              -f context="${ctx}" \
+              -f target_url="${url}" \
+              -f description="${conclusion} in the dispatched ${wf} run"; then
+              echo "WARN: could not post the ${ctx} status; the report PR stays blocked" >&2
+              return 0
+            fi
+            echo "${ctx}: ${conclusion}"
+          }
           for wf in ci.yml security.yml codeql.yml; do
             gh workflow run "${wf}" --repo "${GITHUB_REPOSITORY}" --ref "${REPORT_BRANCH}"
           done
+          # Context names must match branch protection exactly: they are the
+          # job names GitHub reports, with CodeQL's matrix language suffix.
+          mirror_check ci.yml       "Check"
+          mirror_check security.yml "Security Scans"
+          mirror_check codeql.yml   "Analyze (go)"
 
       - name: Persist director state to the runner host
         if: always()
