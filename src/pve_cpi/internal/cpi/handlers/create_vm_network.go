@@ -1109,7 +1109,7 @@ func extractMACsFromConfig(cfg map[string]any) map[int]string {
 		if err != nil {
 			continue
 		}
-		valStr, ok := val.(string)
+		valStr, ok := pve.ConfigStringValue(val)
 		if !ok {
 			continue
 		}

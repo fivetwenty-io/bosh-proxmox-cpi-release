@@ -228,7 +228,7 @@ func awaitVMConfigLockClear(ctx context.Context, deps Deps, node string, vmid in
 		if cfgErr != nil {
 			return true
 		}
-		if lock, _ := cfg["lock"].(string); lock == "" {
+		if lock, _ := pve.ConfigString(cfg, "lock"); lock == "" {
 			return true
 		}
 		if time.Now().After(deadline) {

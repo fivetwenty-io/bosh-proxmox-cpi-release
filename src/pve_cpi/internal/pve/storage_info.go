@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -544,7 +545,8 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 }
 
 // parseStorageEntry decodes the relevant fields from a /storage response item.
-// PVE returns shared as a 0/1 integer; nodes is comma-joined when present.
+// PVE returns shared as 0/1, true/false, or "0"/"1" depending on version, so
+// it decodes through PVEBool; nodes is comma-joined when present.
 //
 // Backing-identity fields per PVE storage plugin (pveStorage(5)): dir-style
 // plugins report "path"; nfs reports "server"+"export"; cifs reports
@@ -557,15 +559,15 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 // BackingKey falls back to the storage ID for those types regardless.
 func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 	var v struct {
-		Storage string `json:"storage"`
-		Type    string `json:"type"`
-		Shared  *int   `json:"shared,omitempty"`
-		Nodes   string `json:"nodes,omitempty"`
-		Path    string `json:"path,omitempty"`
-		Server  string `json:"server,omitempty"`
-		Export  string `json:"export,omitempty"`
-		Share   string `json:"share,omitempty"`
-		Content string `json:"content,omitempty"`
+		Storage string             `json:"storage"`
+		Type    string             `json:"type"`
+		Shared  *sdkclient.PVEBool `json:"shared,omitempty"`
+		Nodes   string             `json:"nodes,omitempty"`
+		Path    string             `json:"path,omitempty"`
+		Server  string             `json:"server,omitempty"`
+		Export  string             `json:"export,omitempty"`
+		Share   string             `json:"share,omitempty"`
+		Content string             `json:"content,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return StorageInfo{}, err
@@ -581,7 +583,7 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 		Server:  v.Server,
 		Content: v.Content,
 	}
-	if v.Shared != nil && *v.Shared != 0 {
+	if v.Shared != nil && v.Shared.Bool() {
 		info.Shared = true
 	}
 	// cifs names its remote resource "share", not "export"; both feed the

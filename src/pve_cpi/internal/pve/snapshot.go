@@ -41,7 +41,7 @@ func HasSnapshots(ctx context.Context, client Client, node string, vmid int) ([]
 
 	var names []string
 	for _, m := range entries {
-		name, ok := m["name"].(string)
+		name, ok := ConfigString(m, "name")
 		if !ok || name == "" || name == "current" {
 			continue
 		}

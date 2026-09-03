@@ -3,11 +3,13 @@ package placement
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // ClusterClient is the subset of the PVE cluster API used by GatherNodeFacts.
@@ -25,15 +27,18 @@ type NodesClient interface {
 }
 
 // clusterStatusItem is the typed shape of each entry in GET /cluster/status.
-// The "online" field is an integer in the PVE API (1 = online, 0 = offline).
+// The scalar fields use the SDK's tolerant types because PVE renders "online"
+// as the integer 1/0 and has returned the counters as strings on some
+// versions; a plain int64 or float64 would reject the row and silently drop
+// the node from placement.
 type clusterStatusItem struct {
-	Type   string  `json:"type"`
-	Name   string  `json:"name"`
-	Online int64   `json:"online"`
-	Maxcpu int64   `json:"maxcpu"`
-	Maxmem int64   `json:"maxmem"`
-	Mem    int64   `json:"mem"`
-	CPU    float64 `json:"cpu"` // current utilisation fraction [0,1]
+	Type   string             `json:"type"`
+	Name   string             `json:"name"`
+	Online sdkclient.PVEBool  `json:"online"`
+	Maxcpu sdkclient.PVEInt   `json:"maxcpu"`
+	Maxmem sdkclient.PVEInt   `json:"maxmem"`
+	Mem    sdkclient.PVEInt   `json:"mem"`
+	CPU    sdkclient.PVEFloat `json:"cpu"` // current utilisation fraction [0,1]
 }
 
 // NodeResource is the typed shape for each entry in GET /cluster/resources
@@ -41,11 +46,11 @@ type clusterStatusItem struct {
 // Exported so callers with an existing []json.RawMessage can decode without
 // re-issuing the API call.
 type NodeResource struct {
-	Type   string `json:"type"`
-	Node   string `json:"node"`
-	Name   string `json:"name"`   // VM name; used for group tag matching
-	Tags   string `json:"tags"`   // space-separated PVE tags
-	Maxmem int64  `json:"maxmem"` // configured (reserved) memory in bytes; 0 when absent
+	Type   string           `json:"type"`
+	Node   string           `json:"node"`
+	Name   string           `json:"name"`   // VM name; used for group tag matching
+	Tags   string           `json:"tags"`   // space-separated PVE tags
+	Maxmem sdkclient.PVEInt `json:"maxmem"` // configured (reserved) memory in bytes; 0 when absent
 }
 
 // clusterResourceItem is an internal alias kept for backward compatibility
@@ -64,12 +69,12 @@ type haStatusEntry struct {
 
 // storageEntry is the typed shape of each entry in GET /nodes/{node}/storage.
 type storageEntry struct {
-	Storage string `json:"storage"`
-	Active  int    `json:"active"`  // 1 = active
-	Enabled int    `json:"enabled"` // 1 = enabled
-	Content string `json:"content"` // comma-separated content types
-	Avail   int64  `json:"avail"`   // available bytes
-	Total   int64  `json:"total"`   // total bytes
+	Storage string            `json:"storage"`
+	Active  sdkclient.PVEBool `json:"active"`  // PVE renders this as 1/0
+	Enabled sdkclient.PVEBool `json:"enabled"` // PVE renders this as 1/0
+	Content string            `json:"content"` // comma-separated content types
+	Avail   sdkclient.PVEInt  `json:"avail"`   // available bytes
+	Total   sdkclient.PVEInt  `json:"total"`   // total bytes
 }
 
 // GatherOptions holds optional parameters for GatherNodeFacts.
@@ -193,17 +198,26 @@ func GatherNodeFacts(
 			}
 		}
 
+		// PVEFloat parses whatever string PVE sends, so a "nan" or "inf" cpu
+		// value would reach the scorer as a non-finite number, poison the
+		// score, and make the sort comparator non-transitive. Treat it as
+		// unknown load, which is what a missing field already reads as.
+		cpuUsed := item.CPU.Float()
+		if math.IsNaN(cpuUsed) || math.IsInf(cpuUsed, 0) {
+			cpuUsed = 0
+		}
+
 		facts = append(facts, NodeFacts{
 			Node:              nodeName,
-			Online:            item.Online == 1,
+			Online:            item.Online.Bool(),
 			InMaintenance:     inMaintenance,
-			FreeMemBytes:      item.Maxmem - item.Mem,
-			TotalMemBytes:     item.Maxmem,
+			FreeMemBytes:      item.Maxmem.Int() - item.Mem.Int(),
+			TotalMemBytes:     item.Maxmem.Int(),
 			CommittedMemBytes: committedMem[nodeName],
 			FreeStorageBytes:  storageAvail[nodeName],
 			TotalStorageBytes: storageTotal[nodeName],
-			CPUUsed:           item.CPU,
-			MaxCPU:            item.Maxcpu,
+			CPUUsed:           cpuUsed,
+			MaxCPU:            item.Maxcpu.Int(),
 			GuestCount:        guestCounts[nodeName],
 			SameGroupCount:    sameGroupCounts[nodeName],
 		})
@@ -298,7 +312,7 @@ func gatherGuestCounts(
 		if groupTag != "" && hasTag(ri.Tags, groupTag) {
 			sameGroupCounts[ri.Node]++
 		}
-		committedMem[ri.Node] += ri.Maxmem
+		committedMem[ri.Node] += ri.Maxmem.Int()
 	}
 	return guestCounts, sameGroupCounts, committedMem
 }
@@ -338,14 +352,14 @@ func gatherStorageFacts(
 			if se.Storage != storageName {
 				continue
 			}
-			if se.Active != 1 {
+			if !se.Active.Bool() {
 				continue
 			}
 			if !hasImagesContent(se.Content) {
 				continue
 			}
-			storageAvail[nodeName] = se.Avail
-			storageTotal[nodeName] = se.Total
+			storageAvail[nodeName] = se.Avail.Int()
+			storageTotal[nodeName] = se.Total.Int()
 			break
 		}
 	}

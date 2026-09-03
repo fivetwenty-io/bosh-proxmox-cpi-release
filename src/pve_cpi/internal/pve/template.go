@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -22,7 +23,7 @@ import (
 // Template are optional.
 type qemuListItem struct {
 	// Vmid is the unique VM ID; always present in list responses.
-	Vmid int64 `json:"vmid"`
+	Vmid sdkclient.PVEInt `json:"vmid"`
 	// Name is the VM (host)name; absent for unnamed VMs.
 	Name *string `json:"name,omitempty"`
 	// Tags is the semicolon-delimited PVE tag string; absent when no tags set.
@@ -43,22 +44,10 @@ type qemuListItem struct {
 // pveBool decodes a PVE API boolean. PVE renders booleans as the JSON numbers
 // 1 and 0 (its API is Perl-backed), but some endpoints — and most fixtures —
 // use the JSON literals true/false, and a handful return the strings "1"/"0".
-// All three encodings, plus null, are accepted; anything else is an error so a
-// genuinely malformed field still surfaces.
-type pveBool bool
-
-// UnmarshalJSON accepts 1/0, true/false, "1"/"0"/"true"/"false", and null.
-func (b *pveBool) UnmarshalJSON(data []byte) error {
-	switch s := strings.Trim(strings.TrimSpace(string(data)), `"`); s {
-	case "1", "true":
-		*b = true
-	case "0", "false", "", "null":
-		*b = false
-	default:
-		return fmt.Errorf("pveBool: cannot decode %q as a PVE boolean", s)
-	}
-	return nil
-}
+// It is the SDK's tolerant PVEBool, which accepts every encoding PVE has been
+// observed to emit, so a hand-decoded row never drops out of a scan because
+// one flag arrived in an unexpected shape.
+type pveBool = sdkclient.PVEBool
 
 // BuildTemplateName returns the canonical PVE VM name for a stemcell template.
 //
@@ -486,8 +475,8 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 		if !hasNodeTag && hasAnyNodeTag {
 			continue
 		}
-		if bestVMID == 0 || item.Vmid < bestVMID {
-			bestVMID = item.Vmid
+		if bestVMID == 0 || item.Vmid.Int() < bestVMID {
+			bestVMID = item.Vmid.Int()
 		}
 	}
 
@@ -555,7 +544,7 @@ func FindTemplatesBySHATagNode(ctx context.Context, c Client, node, sha8 string)
 			)
 			continue
 		}
-		if item.Vmid == 0 {
+		if item.Vmid.Int() == 0 {
 			// Defensive, matching the cluster scan's filter: a zero VMID
 			// would sort first and poison downstream anchor selection.
 			continue
@@ -585,7 +574,7 @@ func FindTemplatesBySHATagNode(ctx context.Context, c Client, node, sha8 string)
 			name = *item.Name
 		}
 		refs = append(refs, TemplateRef{
-			VMID: item.Vmid,
+			VMID: item.Vmid.Int(),
 			Node: node,
 			Name: name,
 			Tags: *item.Tags,
@@ -648,7 +637,7 @@ type clusterQemuResourceItem struct {
 	// rows are VM guests — "lxc", "node", "storage" etc. are skipped.
 	Type string `json:"type"`
 	// Vmid is the unique VM ID; 0 for non-VM resource rows.
-	Vmid int64 `json:"vmid"`
+	Vmid sdkclient.PVEInt `json:"vmid"`
 	// Node is the hosting PVE node.
 	Node string `json:"node"`
 	// Name is the VM (host)name; absent for unnamed VMs.
@@ -724,7 +713,7 @@ func filterClusterQemuTemplates(ctx context.Context, guests []GuestRef) []cluste
 		isTemplate := pveBool(true)
 		out = append(out, clusterQemuResourceItem{
 			Type:     clusterResourceTypeQemu,
-			Vmid:     int64(g.VMID),
+			Vmid:     sdkclient.PVEInt(g.VMID),
 			Node:     g.Node,
 			Name:     g.Name,
 			Tags:     g.Tags,
@@ -816,7 +805,7 @@ func matchTemplatesByTag(items []clusterQemuResourceItem, wantedTag string) []Te
 		if !matched {
 			continue
 		}
-		out = append(out, TemplateRef{VMID: item.Vmid, Node: item.Node, Name: item.Name, Tags: item.Tags})
+		out = append(out, TemplateRef{VMID: item.Vmid.Int(), Node: item.Node, Name: item.Name, Tags: item.Tags})
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
@@ -857,7 +846,7 @@ func FindTemplateByNameCluster(ctx context.Context, c Client, name string) ([]Te
 		if item.Name != name {
 			continue
 		}
-		out = append(out, TemplateRef{VMID: item.Vmid, Node: item.Node, Name: item.Name, Tags: item.Tags})
+		out = append(out, TemplateRef{VMID: item.Vmid.Int(), Node: item.Node, Name: item.Name, Tags: item.Tags})
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })

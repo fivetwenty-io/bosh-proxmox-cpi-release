@@ -107,7 +107,7 @@ func FindVMAuthoritative(ctx context.Context, c Client, vmid int) (VMLocation, e
 			lastProbeErr = probeErr
 			continue
 		}
-		cfgTags, _ := cfg["tags"].(string)
+		cfgTags, _ := ConfigString(cfg, "tags")
 		return VMLocation{Node: n, Tags: cfgTags, Found: true}, nil
 	}
 	if len(failedNodes) > 0 {

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -218,7 +219,7 @@ func findParkedDiskIntentByStableID(
 			return DiskTransferIntent{}, false, cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("provenance scan: config fetch for parker vmid %d on node %s", p.vmid, p.node))
 		}
-		if tags, _ := vmCfg["tags"].(string); !tagContainsParker(tags) {
+		if tags, _ := ConfigString(vmCfg, "tags"); !tagContainsParker(tags) {
 			continue
 		}
 		_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
@@ -265,11 +266,11 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 	var out []parkerCandidate
 	for _, raw := range *resp {
 		var entry struct {
-			VMID int64  `json:"vmid"`
-			Node string `json:"node"`
-			Type string `json:"type"`
+			VMID sdkclient.PVEInt `json:"vmid"`
+			Node string           `json:"node"`
+			Type string           `json:"type"`
 		}
-		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil || entry.VMID <= 0 {
+		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil || entry.VMID.Int() <= 0 {
 			continue
 		}
 		// LXC containers cannot be parkers and their configs are unreadable
@@ -277,7 +278,7 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
 			continue
 		}
-		if entry.VMID < int64(cfg.VMIDRangeStart) || entry.VMID > int64(cfg.VMIDRangeEnd) {
+		if entry.VMID.Int() < int64(cfg.VMIDRangeStart) || entry.VMID.Int() > int64(cfg.VMIDRangeEnd) {
 			continue
 		}
 		node := entry.Node
@@ -287,7 +288,7 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 		if node == "" {
 			continue
 		}
-		out = append(out, parkerCandidate{vmid: int(entry.VMID), node: node})
+		out = append(out, parkerCandidate{vmid: int(entry.VMID.Int()), node: node})
 	}
 	return out, nil
 }

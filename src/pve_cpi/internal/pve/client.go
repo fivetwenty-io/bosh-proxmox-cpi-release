@@ -219,12 +219,12 @@ func (s *sdkPoolService) PoolHasVM(ctx context.Context, poolID string, vmid int6
 	}
 	for _, raw := range resp.Members {
 		var item struct {
-			Vmid *int64 `json:"vmid"`
+			Vmid *sdkclient.PVEInt `json:"vmid"`
 		}
 		if json.Unmarshal(raw, &item) != nil || item.Vmid == nil {
 			continue
 		}
-		if *item.Vmid == vmid {
+		if item.Vmid.Int() == vmid {
 			return true, nil
 		}
 	}

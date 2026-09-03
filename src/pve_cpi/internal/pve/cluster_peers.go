@@ -6,19 +6,20 @@ import (
 	"sort"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // clusterStatusPeer is the minimal shape needed from GET /cluster/status rows
 // for VXLAN peer derivation and node-address discovery. The "online" field is
-// an integer in the PVE API (1 = online, 0 = offline); "ip" and "name" are
-// present only on type=node rows.
+// a PVE boolean (usually the integer 1/0, decoded tolerantly); "ip" and "name"
+// are present only on type=node rows.
 type clusterStatusPeer struct {
-	Type   string `json:"type"`
-	Name   string `json:"name"`
-	IP     string `json:"ip"`
-	Online int64  `json:"online"`
+	Type   string            `json:"type"`
+	Name   string            `json:"name"`
+	IP     string            `json:"ip"`
+	Online sdkclient.PVEBool `json:"online"`
 }
 
 // ClusterNodePeerIPs returns the sorted management IPs of all online cluster
@@ -65,7 +66,7 @@ func ClusterNodePeerIPs(ctx context.Context, c Client) ([]string, error) {
 			// Skip malformed entries; a single bad item should not abort derivation.
 			continue
 		}
-		if item.Type != resourceTypeNode || item.Online != 1 || item.IP == "" {
+		if item.Type != resourceTypeNode || !item.Online.Bool() || item.IP == "" {
 			continue
 		}
 		peers = append(peers, item.IP)
@@ -116,7 +117,7 @@ func ClusterNodeAddressMap(ctx context.Context, c Client) (map[string]string, er
 		if jsonErr := json.Unmarshal(raw, &item); jsonErr != nil {
 			continue
 		}
-		if item.Type != resourceTypeNode || item.Online != 1 || item.Name == "" || item.IP == "" {
+		if item.Type != resourceTypeNode || !item.Online.Bool() || item.Name == "" || item.IP == "" {
 			continue
 		}
 		addrs[item.Name] = item.IP

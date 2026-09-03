@@ -174,7 +174,7 @@ func HandleResizeDisk(deps Deps) Handler {
 			return nil, cpierrors.Wrap(err, fmt.Sprintf("resize_disk: read VM %d config", vmid))
 		}
 
-		diskOptStr, ok := cfg[diskID].(string)
+		diskOptStr, ok := pve.ConfigString(cfg, diskID)
 		if !ok || diskOptStr == "" {
 			return nil, cpierrors.Cloud("resize_disk: disk %q not found in VM %d config", diskID, vmid)
 		}
@@ -284,7 +284,7 @@ func readDiskSizeGiB(ctx context.Context, deps Deps, op, node string, vmid int, 
 	if cfgErr != nil {
 		return 0, cfgErr
 	}
-	diskOptStr, ok := cfg[diskID].(string)
+	diskOptStr, ok := pve.ConfigString(cfg, diskID)
 	if !ok || diskOptStr == "" {
 		return 0, cpierrors.Cloud("%s: disk %s missing from VM %d config while re-reading size for retry", op, diskID, vmid)
 	}
@@ -466,7 +466,7 @@ func waitForResizeConvergence(
 				log.String("disk_id", diskID),
 				log.Err(err),
 			)
-		} else if optStr, ok := cfg[diskID].(string); ok && optStr != "" {
+		} else if optStr, ok := pve.ConfigString(cfg, diskID); ok && optStr != "" {
 			gib, perr := parseDiskSizeGiB(optStr)
 			switch {
 			case perr != nil:

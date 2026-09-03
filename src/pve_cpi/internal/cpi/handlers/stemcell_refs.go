@@ -431,18 +431,15 @@ func stampDestroyPendingTagLocked(ctx context.Context, deps Deps, node string, v
 const pveTagJoinSep = ";"
 
 // stringConfigField reads key from a QEMU config map (as returned by
-// QEMU().Config) as a string, returning "" when the key is absent or holds a
-// non-string value.
+// QEMU().Config) as a string via pve.ConfigString (tolerant of PVE
+// rendering a spec-string field as a JSON number or bool), returning ""
+// when the key is absent or holds a non-scalar value.
 func stringConfigField(cfg map[string]any, key string) string {
 	if cfg == nil {
 		return ""
 	}
-	if v, ok := cfg[key]; ok {
-		if s, ok2 := v.(string); ok2 {
-			return s
-		}
-	}
-	return ""
+	s, _ := pve.ConfigString(cfg, key)
+	return s
 }
 
 // stringSliceContains reports whether want is present in s (exact match).

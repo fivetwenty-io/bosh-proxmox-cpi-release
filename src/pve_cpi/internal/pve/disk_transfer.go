@@ -198,7 +198,7 @@ func moveDiskLanded(ctx context.Context, c Client, node string, srcVMID int, dis
 // slotBareVolid returns the bare volid a config key currently holds, or
 // ("", false) when the key is absent or empty.
 func slotBareVolid(cfg map[string]any, slot string) (string, bool) {
-	v, _ := cfg[slot].(string)
+	v, _ := ConfigString(cfg, slot)
 	if v == "" {
 		return "", false
 	}

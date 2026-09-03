@@ -271,10 +271,10 @@ func listNodeGuests(ctx context.Context, c Client, logger *log.Logger, node stri
 			}
 			continue
 		}
-		if item.Vmid <= 0 {
+		if item.Vmid.Int() <= 0 {
 			continue
 		}
-		g := GuestRef{VMID: int(item.Vmid), Node: node}
+		g := GuestRef{VMID: int(item.Vmid.Int()), Node: node}
 		if item.Name != nil {
 			g.Name = *item.Name
 		}

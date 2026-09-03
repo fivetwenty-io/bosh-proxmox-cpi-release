@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // resourceTypeNode is the /cluster/resources item type identifying a PVE node.
@@ -47,28 +48,29 @@ type vmCloudProperties struct {
 
 // clusterStatusNode is the decoded shape of each node entry returned by
 // GET /cluster/status. Only fields used for node selection are captured;
-// additional PVE fields are silently ignored. The "online" field is an
-// integer in the PVE API (1 = online, 0 = offline).
+// additional PVE fields are silently ignored. The scalar fields use the SDK's
+// tolerant types because PVE renders "online" as the integer 1/0 and has
+// returned the byte counters as strings on some versions.
 type clusterStatusNode struct {
-	Type   string `json:"type"`
-	Name   string `json:"name"`
-	Online int64  `json:"online"` // 1 = online, 0 = offline
-	Maxcpu int64  `json:"maxcpu"`
-	Maxmem int64  `json:"maxmem"`
-	Mem    int64  `json:"mem"` // current used memory in bytes
+	Type   string            `json:"type"`
+	Name   string            `json:"name"`
+	Online sdkclient.PVEBool `json:"online"`
+	Maxcpu sdkclient.PVEInt  `json:"maxcpu"`
+	Maxmem sdkclient.PVEInt  `json:"maxmem"`
+	Mem    sdkclient.PVEInt  `json:"mem"` // current used memory in bytes
 }
 
 // storageStatusEntry is the decoded shape of each entry returned by
 // GET /nodes/{node}/storage. Only fields needed for storage-first filtering
 // are captured; the rest are silently ignored.
 type storageStatusEntry struct {
-	Storage string `json:"storage"`
-	Type    string `json:"type"`
-	Active  int    `json:"active"`  // 1 = active, 0 = inactive
-	Enabled int    `json:"enabled"` // 1 = enabled, 0 = disabled
-	Content string `json:"content"` // comma-separated content types, e.g. "images,rootdir"
-	Avail   int64  `json:"avail"`   // available bytes reported by PVE
-	Total   int64  `json:"total"`   // total bytes reported by PVE
+	Storage string            `json:"storage"`
+	Type    string            `json:"type"`
+	Active  sdkclient.PVEBool `json:"active"`  // PVE renders this as 1/0
+	Enabled sdkclient.PVEBool `json:"enabled"` // PVE renders this as 1/0
+	Content string            `json:"content"` // comma-separated content types, e.g. "images,rootdir"
+	Avail   sdkclient.PVEInt  `json:"avail"`   // available bytes reported by PVE
+	Total   sdkclient.PVEInt  `json:"total"`   // total bytes reported by PVE
 }
 
 // nodeHasStorage returns true when the per-node storage list returned by
@@ -89,7 +91,7 @@ func nodeHasStorage(resp *nodes.ListStorageResponse, storageName string) bool {
 		if entry.Storage != storageName {
 			continue
 		}
-		if entry.Active != 1 {
+		if !entry.Active.Bool() {
 			return false
 		}
 		for _, ct := range strings.Split(entry.Content, ",") {
@@ -151,7 +153,7 @@ func candidateNodesForCloudProps(
 		if item.Type != resourceTypeNode {
 			continue
 		}
-		if item.Online == 0 {
+		if !item.Online.Bool() {
 			continue // node offline
 		}
 
@@ -168,8 +170,8 @@ func candidateNodesForCloudProps(
 			)
 			// Track for the NotSupported message if it would have fit CPU+RAM,
 			// so an unreachable-storage node is reported like an inactive one.
-			freeBytes := item.Maxmem - item.Mem
-			if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
+			freeBytes := item.Maxmem.Int() - item.Mem.Int()
+			if item.Maxcpu.Int() >= int64(res.CPU) && freeBytes >= ramBytes {
 				cpuRAMFailedStorage = append(cpuRAMFailedStorage, item.Name)
 			}
 			continue // fail-safe: never pick node with unknown storage status
@@ -182,16 +184,16 @@ func candidateNodesForCloudProps(
 				),
 			)
 			// Still track it for the error message if it would have fit CPU+RAM.
-			freeBytes := item.Maxmem - item.Mem
-			if item.Maxcpu >= int64(res.CPU) && freeBytes >= ramBytes {
+			freeBytes := item.Maxmem.Int() - item.Mem.Int()
+			if item.Maxcpu.Int() >= int64(res.CPU) && freeBytes >= ramBytes {
 				cpuRAMFailedStorage = append(cpuRAMFailedStorage, item.Name)
 			}
 			continue
 		}
 
 		// Phase 3: CPU + RAM fit among storage-OK nodes.
-		freeBytes := item.Maxmem - item.Mem
-		if item.Maxcpu < int64(res.CPU) {
+		freeBytes := item.Maxmem.Int() - item.Mem.Int()
+		if item.Maxcpu.Int() < int64(res.CPU) {
 			continue
 		}
 		if freeBytes < ramBytes {

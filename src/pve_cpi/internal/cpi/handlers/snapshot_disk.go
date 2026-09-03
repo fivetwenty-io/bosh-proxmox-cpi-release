@@ -255,11 +255,11 @@ func snapshotAlreadyCommitted(ctx context.Context, deps Deps, node string, vmid 
 		return false
 	}
 	for _, entry := range entries {
-		name, _ := entry["name"].(string)
+		name, _ := pve.ConfigString(entry, "name")
 		if name != snapName {
 			continue
 		}
-		state, _ := entry["snapstate"].(string)
+		state, _ := pve.ConfigString(entry, "snapstate")
 		return state == ""
 	}
 	return false

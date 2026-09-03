@@ -62,13 +62,12 @@ func RenderSentinel(nonBOSH string, raw map[string]json.RawMessage) (string, err
 
 // DescriptionFromConfig extracts the "description" field from a VM config map
 // as returned by QEMU().Config, defaulting to "" when the field is absent or
-// not a string (PVE always returns a string when present; the type guard only
-// protects against a malformed or mocked response).
+// holds a non-scalar value (map, slice). PVE's Perl encoder can render a
+// numeric-looking description ("7", "123") as a JSON number rather than a
+// JSON string, so a plain type assertion would silently drop the field
+// (and, with it, the BOSH sentinel block it may carry); ConfigString
+// tolerates that and every other PVE scalar shape.
 func DescriptionFromConfig(cfg map[string]any) string {
-	if v, ok := cfg["description"]; ok {
-		if s, ok2 := v.(string); ok2 {
-			return s
-		}
-	}
-	return ""
+	s, _ := ConfigString(cfg, "description")
+	return s
 }

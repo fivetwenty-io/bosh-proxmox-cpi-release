@@ -23,6 +23,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // replicaAdoptPollInterval is the base delay between adopt polls while a winner
@@ -35,10 +36,10 @@ const replicaAdoptPollInterval = 2 * time.Second
 // "create" on a guest while a clone or fresh-import build is in flight, which is
 // the signal that a discovered replica is not yet safe to adopt.
 type replicaListItem struct {
-	Vmid     int64    `json:"vmid"`
-	Tags     *string  `json:"tags,omitempty"`
-	Template *pveBool `json:"template,omitempty"`
-	Lock     *string  `json:"lock,omitempty"`
+	Vmid     sdkclient.PVEInt `json:"vmid"`
+	Tags     *string          `json:"tags,omitempty"`
+	Template *pveBool         `json:"template,omitempty"`
+	Lock     *string          `json:"lock,omitempty"`
 }
 
 // isCloneInProgressLock reports whether a guest-config lock value indicates a
@@ -145,7 +146,7 @@ func findReplicaCandidate(ctx context.Context, c Client, node, sha8 string) (rep
 		if !hasSHA || !hasNode {
 			continue
 		}
-		cand := replicaCandidate{VMID: int(item.Vmid)}
+		cand := replicaCandidate{VMID: int(item.Vmid.Int())}
 		if item.Template != nil {
 			cand.Template = bool(*item.Template)
 		}

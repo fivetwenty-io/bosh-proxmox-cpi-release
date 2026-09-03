@@ -42,17 +42,17 @@ func storageUtilizationStatus(ctx context.Context, deps Deps, node, storageName,
 		if entry.Storage != storageName {
 			continue
 		}
-		if entry.Active != 1 {
+		if !entry.Active.Bool() {
 			deps.Log(ctx).Warn(opName+": storage pool inactive; storage-utilization gate fails open",
 				log.String("node", node), log.String("storage", storageName))
 			return 0, 0, false
 		}
-		if entry.Total <= 0 {
+		if entry.Total.Int() <= 0 {
 			deps.Log(ctx).Warn(opName+": storage pool reports zero total capacity; storage-utilization gate fails open",
 				log.String("node", node), log.String("storage", storageName))
 			return 0, 0, false
 		}
-		return entry.Avail, entry.Total, true
+		return entry.Avail.Int(), entry.Total.Int(), true
 	}
 	deps.Log(ctx).Warn(opName+": storage pool not reported by node; storage-utilization gate fails open",
 		log.String("node", node), log.String("storage", storageName))

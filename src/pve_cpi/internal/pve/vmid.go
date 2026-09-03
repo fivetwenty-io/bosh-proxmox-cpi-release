@@ -11,6 +11,7 @@ import (
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
@@ -214,7 +215,7 @@ var globalVMIDMu sync.Mutex
 // vmidEntry is a minimal struct used to extract the vmid field from
 // cluster/resources or nodes/qemu JSON items.
 type vmidEntry struct {
-	Vmid *int64 `json:"vmid"`
+	Vmid *sdkclient.PVEInt `json:"vmid"`
 }
 
 // listClusterVMIDs returns the set of all VMID integers currently registered
@@ -265,7 +266,7 @@ func listClusterVMIDs(ctx context.Context, c Client) (map[int]struct{}, error) {
 			continue
 		}
 		if entry.Vmid != nil {
-			used[int(*entry.Vmid)] = struct{}{}
+			used[int(entry.Vmid.Int())] = struct{}{}
 		}
 	}
 

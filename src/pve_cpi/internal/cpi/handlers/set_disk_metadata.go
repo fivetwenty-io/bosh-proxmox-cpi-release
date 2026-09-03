@@ -267,7 +267,7 @@ func findVMsHostingDisk(ctx context.Context, deps Deps, diskCID string) ([]attac
 		// description that carries its provenance sentinel. delete_vm makes the
 		// same fallback for the same reason; here the config is already in hand,
 		// so it costs nothing.
-		if cfgTags, _ := cfg["tags"].(string); pve.TagsMarkParker(cfgTags) {
+		if cfgTags, _ := pve.ConfigString(cfg, "tags"); pve.TagsMarkParker(cfgTags) {
 			continue
 		}
 
@@ -292,10 +292,8 @@ func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID stri
 
 	// Extract current description.
 	currentDesc := ""
-	if v, ok := cfg["description"]; ok {
-		if s, ok := v.(string); ok {
-			currentDesc = s
-		}
+	if s, ok := pve.ConfigString(cfg, "description"); ok {
+		currentDesc = s
 	}
 
 	// Parse the shared sentinel block, touching only this handler's key.
@@ -369,19 +367,17 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 	}
 
 	var existing []string
-	if v, ok := cfg[jsonKeyTags]; ok {
-		if s, ok := v.(string); ok {
-			for _, e := range parseTagsField(s) {
-				skip := false
-				for prefix := range replacedPrefixes {
-					if strings.HasPrefix(e, prefix) {
-						skip = true
-						break
-					}
+	if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
+		for _, e := range parseTagsField(s) {
+			skip := false
+			for prefix := range replacedPrefixes {
+				if strings.HasPrefix(e, prefix) {
+					skip = true
+					break
 				}
-				if !skip {
-					existing = append(existing, e)
-				}
+			}
+			if !skip {
+				existing = append(existing, e)
 			}
 		}
 	}
@@ -389,10 +385,8 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 	mergedTags := mergeTagList(existing, newEntries, maxTagLength)
 
 	currentDesc := ""
-	if v, ok := cfg["description"]; ok {
-		if s, ok := v.(string); ok {
-			currentDesc = s
-		}
+	if s, ok := pve.ConfigString(cfg, "description"); ok {
+		currentDesc = s
 	}
 
 	// Same shared-sentinel discipline as persistMetadata: touch only the

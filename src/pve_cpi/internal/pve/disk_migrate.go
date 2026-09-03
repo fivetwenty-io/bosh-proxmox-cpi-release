@@ -273,7 +273,7 @@ func migrateMoverToNode(
 			fmt.Sprintf("disk migrate: config read for mover vmid %d on node %s", mover.VMID, mover.Node))
 	}
 
-	if lock, _ := srcCfg["lock"].(string); lock == "migrate" {
+	if lock, _ := ConfigString(srcCfg, "lock"); lock == "migrate" {
 		return "", "", cpierrors.Retriable(
 			"disk migrate: mover vmid %d is mid-migration on the PVE side (config lock %q); the copy continues server-side — retry the attach and it completes once the migration lands",
 			mover.VMID, lock)
@@ -575,7 +575,7 @@ func moverAdoptableAfterReplay(ctx context.Context, c Client, logger *log.Logger
 		}
 		return false
 	}
-	desc, _ := vmCfg["description"].(string)
+	desc, _ := ConfigString(vmCfg, "description")
 	if desc != attemptNonce {
 		if logger != nil {
 			logger.Info("disk migrate: conflicting VM does not carry this call's attempt marker; regenerating",
@@ -585,7 +585,7 @@ func moverAdoptableAfterReplay(ctx context.Context, c Client, logger *log.Logger
 		}
 		return false
 	}
-	cfgTags, _ := vmCfg["tags"].(string)
+	cfgTags, _ := ConfigString(vmCfg, "tags")
 	if !tagContainsParker(cfgTags) || !TagsMarkDiskMover(cfgTags) {
 		return false
 	}
@@ -651,13 +651,13 @@ func DestroyEmptyMover(ctx context.Context, c Client, logger *log.Logger, mover 
 	// The caller's tags came from a scan; the config is authoritative. Both
 	// tags must be present, or this is not a mover no matter what the caller
 	// believed.
-	cfgTags, _ := vmCfg["tags"].(string)
+	cfgTags, _ := ConfigString(vmCfg, "tags")
 	if !tagContainsParker(cfgTags) || !TagsMarkDiskMover(cfgTags) {
 		return cpierrors.Cloud(
 			"DestroyEmptyMover: vmid %d (node %s) config tags %q do not mark a migration mover; refusing to destroy it",
 			mover.VMID, mover.Node, cfgTags)
 	}
-	if lock, _ := vmCfg["lock"].(string); isDestructiveDiskLock(lock) {
+	if lock, _ := ConfigString(vmCfg, "lock"); isDestructiveDiskLock(lock) {
 		return cpierrors.Retriable(
 			"DestroyEmptyMover: mover vmid %d holds config lock %q (an in-flight operation); deferring the destroy",
 			mover.VMID, lock)

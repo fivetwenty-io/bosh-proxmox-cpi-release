@@ -270,7 +270,7 @@ func applyIPForwarding(
 		// Setting net{N}="firewall=0" (partial) REPLACES the entire NIC definition
 		// in PVE, destroying model/bridge/MAC — so we must write the full string.
 		netKey := fmt.Sprintf("net%d", i)
-		currentStr, ok := vmCfg[netKey].(string)
+		currentStr, ok := pve.ConfigString(vmCfg, netKey)
 		if !ok || currentStr == "" {
 			// PVE Config() did not return a string for this NIC index. This is
 			// unexpected (configureNICs wrote net{i} before start), but guard

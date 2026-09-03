@@ -8,6 +8,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // globalVNIMu is the process-level mutex that serialises VNI allocation,
@@ -33,6 +34,10 @@ var globalVNIMu sync.Mutex
 // repeat-safe under -count=N.
 var vniZoneListWarnOnce sync.Once
 
+// vniZoneRowWarned records the zone names whose row failed to decode in
+// listUsedVNIs, so the per-row Warn fires once per zone per CPI process.
+var vniZoneRowWarned sync.Map
+
 // zoneReservedVNIFields decodes the numeric VNI-shaped fields a PVE SDN zone
 // row may carry:
 //
@@ -48,36 +53,43 @@ var vniZoneListWarnOnce sync.Once
 //
 // Both fields are optional and zone-type-dependent; PVE's zone row schema is
 // sparse and varies by plugin type (see SDNZone's own doc comment), so
-// decoding tolerates either or both being absent. Uses the same plain int64
-// JSON typing as SDNVnet.Tag elsewhere in this file — PVE encodes these as
-// JSON numbers, not the 0/1 integer-boolean convention pveBool exists for.
+// decoding tolerates either or both being absent. They use the SDK's tolerant
+// PVEInt, matching SDNVnet.Tag, because PVE returns these as JSON numbers on
+// applied rows and has been seen returning them as strings on pending rows.
 type zoneReservedVNIFields struct {
-	VrfVxlan *int64 `json:"vrf-vxlan,omitempty"`
-	Tag      *int64 `json:"tag,omitempty"`
+	VrfVxlan *sdkclient.PVEInt `json:"vrf-vxlan,omitempty"`
+	Tag      *sdkclient.PVEInt `json:"tag,omitempty"`
 }
 
 // zoneReservedVNIs extracts the zone-level VNI(s) that must never be handed
 // out to a new vnet from a single zone row's raw JSON. Returns nil for a zone
 // that carries neither field (the common case — most zone types, including
-// the CPI's own turnkey vxlan zone, reserve nothing at the zone level) or
-// whose raw JSON fails to decode (malformed rows are skipped, not treated as
-// fatal — one bad row must not abort exclusion for every other zone).
-func zoneReservedVNIs(raw json.RawMessage) []int {
+// the CPI's own turnkey vxlan zone, reserve nothing at the zone level). The
+// fields are PVEInt, so a bare or quoted integer both decode; a quoted value
+// that is not an integer decodes to 0 and is treated as absent, which is safe
+// because PVE validates both fields as integers on write and cannot have
+// stored one. A row whose raw JSON fails to decode (a composite value where a
+// scalar is expected, or a row that is not an object) returns the decode
+// error so the caller can log it; the caller keeps going, because one bad row
+// must not abort exclusion for every other zone, but it must not go
+// unreported either since a silently skipped EVPN zone means its vrf-vxlan
+// can be re-allocated.
+func zoneReservedVNIs(raw json.RawMessage) ([]int, error) {
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 	var fields zoneReservedVNIFields
 	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil
+		return nil, err
 	}
 	var out []int
-	if fields.VrfVxlan != nil && *fields.VrfVxlan != 0 {
-		out = append(out, int(*fields.VrfVxlan))
+	if fields.VrfVxlan != nil && fields.VrfVxlan.Int() != 0 {
+		out = append(out, int(fields.VrfVxlan.Int()))
 	}
-	if fields.Tag != nil && *fields.Tag != 0 {
-		out = append(out, int(*fields.Tag))
+	if fields.Tag != nil && fields.Tag.Int() != 0 {
+		out = append(out, int(fields.Tag.Int()))
 	}
-	return out
+	return out, nil
 }
 
 // listUsedVNIs returns the set of VNIs that must not be handed out to a new
@@ -90,7 +102,10 @@ func zoneReservedVNIs(raw json.RawMessage) []int {
 // The zone listing is fail-open: a failure there logs a single Warn (once per
 // CPI process — see vniZoneListWarnOnce) and allocation proceeds using only
 // the vnet-tag exclusion set, i.e. the behavior before zone-level exclusion
-// existed. A zone-listing hiccup must never block VM/network creation.
+// existed. A zone-listing hiccup must never block VM/network creation. A
+// single zone row that cannot be decoded is skipped the same way and warned
+// about once per zone name per process (see vniZoneRowWarned), since NextVNI
+// runs on every network creation and the row does not change between calls.
 // logger may be nil (no Warn is attempted in that case, but the fail-open
 // behavior still applies).
 func listUsedVNIs(ctx context.Context, c Client, logger *log.Logger) (map[int]struct{}, error) {
@@ -100,8 +115,8 @@ func listUsedVNIs(ctx context.Context, c Client, logger *log.Logger) (map[int]st
 	}
 	used := make(map[int]struct{}, len(vnets))
 	for _, v := range vnets {
-		if v.Tag != 0 {
-			used[int(v.Tag)] = struct{}{}
+		if v.Tag.Int() != 0 {
+			used[int(v.Tag.Int())] = struct{}{}
 		}
 	}
 
@@ -119,7 +134,16 @@ func listUsedVNIs(ctx context.Context, c Client, logger *log.Logger) (map[int]st
 		return used, nil
 	}
 	for _, z := range zones {
-		for _, vni := range zoneReservedVNIs(z.Raw) {
+		reserved, rerr := zoneReservedVNIs(z.Raw)
+		if rerr != nil {
+			if _, seen := vniZoneRowWarned.LoadOrStore(z.Zone, struct{}{}); !seen && logger != nil {
+				logger.Warn("vni: could not decode an SDN zone row to exclude its zone-level "+
+					"control VNIs from allocation; that zone's reservations are not excluded",
+					log.String("zone", z.Zone), log.String("zone_type", z.Type), log.Err(rerr))
+			}
+			continue
+		}
+		for _, vni := range reserved {
 			used[vni] = struct{}{}
 		}
 	}

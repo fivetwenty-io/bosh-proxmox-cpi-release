@@ -124,13 +124,18 @@ func TestHasSnapshots(t *testing.T) {
 			wantNames: []string{"real-snap"},
 		},
 		{
-			name: "entry with non-string name is skipped safely",
+			// PVE's Perl encoder can render a numeric-looking snapshot name as
+			// a JSON number rather than a JSON string. ConfigString tolerates
+			// that (rendering the float64 back to its decimal string form)
+			// instead of silently dropping the snapshot, so a real snapshot
+			// literally named "42" is not lost to a wire-encoding quirk.
+			name: "entry with numeric-shaped name is tolerated",
 			entries: []map[string]any{
 				{"name": "current"},
 				{"name": 42},
 				{"name": "real-snap"},
 			},
-			wantNames: []string{"real-snap"},
+			wantNames: []string{"42", "real-snap"},
 		},
 		{
 			name: "entry with empty string name is skipped",

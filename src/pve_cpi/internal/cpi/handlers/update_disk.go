@@ -225,7 +225,7 @@ func updateAttachedDisk(ctx context.Context, deps Deps, diskCID string, rd resol
 	if err != nil {
 		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config", vmid))
 	}
-	diskOptStr, ok := cfg[diskID].(string)
+	diskOptStr, ok := pve.ConfigString(cfg, diskID)
 	if !ok || diskOptStr == "" {
 		return cpierrors.Cloud("update_disk: disk %q not found in VM %d config after locate", diskID, vmid)
 	}
@@ -303,7 +303,7 @@ func resizeDiskInternal(
 		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("update_disk: read VM %d config for resize", vmid))
 	}
 
-	diskOptStr, ok := cfg[diskID].(string)
+	diskOptStr, ok := pve.ConfigString(cfg, diskID)
 	if !ok || diskOptStr == "" {
 		return cpierrors.Cloud("update_disk: disk %q not in VM %d config during resize", diskID, vmid)
 	}

@@ -189,15 +189,11 @@ func setVMMetadataRMW(
 	var existingTags []string
 	var existingDesc string
 	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-		if v, ok := cfg[jsonKeyTags]; ok {
-			if s, ok := v.(string); ok {
-				existingTags = parseTagsField(s)
-			}
+		if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
+			existingTags = parseTagsField(s)
 		}
-		if v, ok := cfg["description"]; ok {
-			if s, ok := v.(string); ok {
-				existingDesc = s
-			}
+		if s, ok := pve.ConfigString(cfg, "description"); ok {
+			existingDesc = s
 		}
 	} else if pve.IsNotFound(cfgErr) {
 		return cpierrors.VMNotFound(vmCID)

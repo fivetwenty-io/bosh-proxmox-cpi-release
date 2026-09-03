@@ -263,7 +263,7 @@ func nicIndicesOnBridge(cfg map[string]any, bridge string, vlan int) map[int]str
 		if err != nil {
 			continue
 		}
-		netStr, ok := val.(string)
+		netStr, ok := pve.ConfigStringValue(val)
 		if !ok {
 			continue
 		}
@@ -367,7 +367,7 @@ func parseIPConflict(
 			}
 		}
 
-		ipStr, ok := val.(string)
+		ipStr, ok := pve.ConfigStringValue(val)
 		if !ok {
 			continue
 		}

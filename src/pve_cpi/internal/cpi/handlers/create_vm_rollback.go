@@ -38,7 +38,7 @@ func sweepCandidateVMID(ctx context.Context, deps Deps, node string, candidate i
 			}
 			// Unreadable: proceed; cleanupVM's own destroy handling
 			// re-classifies and tolerates already-gone.
-		} else if name, _ := cfg[metadataKeyName].(string); name != "" && name != expectedName {
+		} else if name, _ := pve.ConfigString(cfg, metadataKeyName); name != "" && name != expectedName {
 			logger.Warn("create_vm: candidate VMID now holds a different VM (a concurrent create won the ID); leaving it alone",
 				log.Int("vmid_attempted", candidate),
 				log.String("expected_name", expectedName),
@@ -215,10 +215,8 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 		// at QEMU.Create). Best-effort read: on failure we still apply the failure tag.
 		var existing []string
 		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if v, ok := cfg[jsonKeyTags]; ok {
-				if s, ok := v.(string); ok {
-					existing = parseTagsField(s)
-				}
+			if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
+				existing = parseTagsField(s)
 			}
 		}
 

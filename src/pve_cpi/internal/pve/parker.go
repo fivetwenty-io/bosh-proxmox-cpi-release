@@ -803,7 +803,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
-		vmid := int(entry.Vmid)
+		vmid := int(entry.Vmid.Int())
 		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
 			continue
 		}
@@ -828,7 +828,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 				return nil, cpierrors.Wrap(WrapConfigReadError(cfgErr),
 					fmt.Sprintf("ListParkersForNode: config fetch for vmid %d", vmid))
 			}
-			tags, _ = vmCfg["tags"].(string)
+			tags, _ = ConfigString(vmCfg, "tags")
 		}
 		// A mover carries the parker tag too (every parker guard must fire
 		// for it), but it is a single-purpose migration vehicle: parking an
@@ -1054,7 +1054,7 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 			fmt.Sprintf("config fetch for vmid %d on node %s", holderVMID, holderNode))
 	}
 
-	tagsRaw, _ := vmCfg["tags"].(string)
+	tagsRaw, _ := ConfigString(vmCfg, "tags")
 	if !tagContainsParker(tagsRaw) {
 		if logger != nil {
 			// Under "parked" a workload VM inside the parker band is surprising

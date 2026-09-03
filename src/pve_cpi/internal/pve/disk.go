@@ -17,6 +17,7 @@ import (
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
@@ -58,7 +59,7 @@ func FindUnusedDiskEntries(cfg map[string]any) map[string]string {
 		if !unusedDiskKeyPattern.MatchString(key) {
 			continue
 		}
-		val, ok := raw.(string)
+		val, ok := ConfigStringValue(raw)
 		if !ok || val == "" {
 			continue
 		}
@@ -633,7 +634,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		}
 
 		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(cfg), volid, stableID); ok {
-			tags, _ := cfg["tags"].(string)
+			tags, _ := ConfigString(cfg, "tags")
 			return DiskScanHit{VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current}, nil
 		}
 	}
@@ -774,14 +775,14 @@ func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags strin
 	}
 	for _, raw := range *resp {
 		var entry struct {
-			VMID int64  `json:"vmid"`
-			Node string `json:"node"`
-			Tags string `json:"tags"`
+			VMID sdkclient.PVEInt `json:"vmid"`
+			Node string           `json:"node"`
+			Tags string           `json:"tags"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
-		if int(entry.VMID) == vmid && entry.Node != "" {
+		if int(entry.VMID.Int()) == vmid && entry.Node != "" {
 			return entry.Node, entry.Tags, true, nil
 		}
 	}
@@ -827,13 +828,13 @@ func FindVMPoolViaCluster(ctx context.Context, c Client, vmid int) (pool string,
 	}
 	for _, raw := range *resp {
 		var entry struct {
-			VMID int64  `json:"vmid"`
-			Pool string `json:"pool"`
+			VMID sdkclient.PVEInt `json:"vmid"`
+			Pool string           `json:"pool"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
-		if int(entry.VMID) == vmid {
+		if int(entry.VMID.Int()) == vmid {
 			return entry.Pool, true, nil
 		}
 	}

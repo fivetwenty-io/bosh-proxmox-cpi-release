@@ -108,7 +108,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			}
 			return nil, cpierrors.Wrap(pve.WrapError(statusErr), fmt.Sprintf("reboot_vm: status VM %s", vmCID))
 		}
-		state, _ := st["status"].(string)
+		state, _ := pve.ConfigString(st, "status")
 
 		// --- stopped VM: start instead of reboot ---
 		if state == vmPowerStateStopped {
@@ -192,7 +192,7 @@ func vmRunningNow(ctx context.Context, deps Deps, logger *log.Logger, node strin
 		)
 		return false
 	}
-	state, _ := st["status"].(string)
+	state, _ := pve.ConfigString(st, "status")
 	return state == vmPowerStateRunning
 }
 

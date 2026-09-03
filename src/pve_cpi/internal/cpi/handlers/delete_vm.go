@@ -18,6 +18,7 @@ import (
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // tagDeletingVM is the PVE tag stamped on a VM before an async fast-path destroy.
@@ -45,10 +46,8 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 		// mergeTagList still adds tagDeletingVM as the sole entry.
 		var existing []string
 		if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
-			if v, ok := cfg[jsonKeyTags]; ok {
-				if s, ok := v.(string); ok {
-					existing = parseTagsField(s)
-				}
+			if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
+				existing = parseTagsField(s)
 			}
 		}
 		tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
@@ -105,10 +104,10 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 	}
 
 	type clusterItem struct {
-		Type string `json:"type"`
-		VMID int64  `json:"vmid"`
-		Node string `json:"node"`
-		Tags string `json:"tags"`
+		Type string           `json:"type"`
+		VMID sdkclient.PVEInt `json:"vmid"`
+		Node string           `json:"node"`
+		Tags string           `json:"tags"`
 	}
 
 	purge := true
@@ -120,7 +119,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		if item.Type != resourceTypeQemu || item.VMID == 0 || item.Node == "" {
+		if item.Type != resourceTypeQemu || item.VMID.Int() == 0 || item.Node == "" {
 			continue
 		}
 		if !tagsContain(item.Tags, tagDeletingVM) {
@@ -131,7 +130,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 			continue
 		}
 		processed++
-		vmIDStr := strconv.FormatInt(item.VMID, 10)
+		vmIDStr := strconv.FormatInt(item.VMID.Int(), 10)
 		sweepLogger := logger.With(
 			log.String("node", item.Node),
 			log.String("vmid", vmIDStr),
@@ -144,7 +143,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// The config read is node-local truth. A "VM already gone" shape
 		// (404, or pmxcfs's config-missing 500) means there is nothing left
 		// to reap; any other read failure defers the straggler (fail-closed).
-		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID))
+		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID.Int()))
 		if strCfgErr != nil {
 			if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
 				sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
@@ -157,7 +156,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// Re-test the deleting tag from the authoritative config, not the
 		// index row. Tag absent means the row is stale — this VMID's current
 		// occupant was never marked for deletion, so it must not be destroyed.
-		authTags, _ := strCfg[jsonKeyTags].(string)
+		authTags, _ := pve.ConfigString(strCfg, jsonKeyTags)
 		if !tagsContain(authTags, tagDeletingVM) {
 			sweepLogger.Warn("delete_vm: straggler sweep: index row is stale — the VM's authoritative config does not carry the deleting tag; skipping (VMID likely reused by a live VM)")
 			continue
@@ -178,7 +177,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// config for the same staleness reason as the deleting tag above.
 		destroyDisks := deps.Config.DestroyUnreferencedDisks
 		if tagsContain(authTags, tagRetainEphemeral) {
-			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID), sweepLogger)
+			retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, item.Node, vmIDStr, int(item.VMID.Int()), sweepLogger)
 			if retainErr != nil {
 				sweepLogger.Warn("delete_vm: straggler sweep: retain-ephemeral detach failed; deferring straggler to next sweep (non-fatal)",
 					log.Err(retainErr))
@@ -194,7 +193,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// retry re-runs the real detach (including parker transfers), and
 		// once the disks are off, a later sweep or the retry itself reaps
 		// the VM.
-		if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID)); len(foreign) > 0 {
+		if foreign := pve.FindForeignActiveDisks(strCfg, int(item.VMID.Int())); len(foreign) > 0 {
 			sweepLogger.Warn("delete_vm: straggler sweep: foreign persistent disks still attached; deferring to the delete_vm retry to detach them",
 				log.Any("slots", foreign))
 			continue
@@ -202,7 +201,7 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// Same unusedN protection the sync and fast paths run: a persistent
 		// volume demoted to unusedN (snapshot-pinned, sweep-resistant) would
 		// be destroyed with the VM.
-		if guardErr := guardUnusedVolumes(ctx, deps, item.Node, vmIDStr, int(item.VMID), deps.Config.DiskStorage); guardErr != nil {
+		if guardErr := guardUnusedVolumes(ctx, deps, item.Node, vmIDStr, int(item.VMID.Int()), deps.Config.DiskStorage); guardErr != nil {
 			sweepLogger.Warn("delete_vm: straggler sweep: unused-volume guard refused destroy; deferring straggler to next sweep (non-fatal)",
 				log.Err(guardErr))
 			continue
@@ -625,7 +624,7 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int, vmT
 			"delete_vm: could not read config for VMID %d to verify parker status: %s (retry when PVE recovers)",
 			vmid, cfgErr.Error())
 	}
-	tagsRaw, _ := vmCfg[jsonKeyTags].(string)
+	tagsRaw, _ := pve.ConfigString(vmCfg, jsonKeyTags)
 	if pve.TagsMarkParker(tagsRaw) {
 		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 	}
@@ -820,7 +819,7 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 			return cpierrors.Wrap(pve.WrapError(statusErr),
 				fmt.Sprintf("delete_vm: status VM %s while waiting for stop", vmCID))
 		}
-		state, _ := st["status"].(string)
+		state, _ := pve.ConfigString(st, "status")
 		if state == vmPowerStateStopped {
 			return nil
 		}
@@ -1102,7 +1101,7 @@ func detachRetainedEphemeralDisk(
 			fmt.Sprintf("delete_vm: read config for VM %s to check retain-ephemeral tag", vmCID))
 	}
 
-	tagsRaw, _ := vmCfg[jsonKeyTags].(string)
+	tagsRaw, _ := pve.ConfigString(vmCfg, jsonKeyTags)
 	if !tagsContain(tagsRaw, tagRetainEphemeral) {
 		return false, nil // flag not set — byte-identical path; no API calls
 	}

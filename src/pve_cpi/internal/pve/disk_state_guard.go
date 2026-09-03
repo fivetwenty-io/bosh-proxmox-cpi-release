@@ -80,7 +80,7 @@ func readGuestLock(ctx context.Context, c Client, node string, vmid int) (string
 	if cfg == nil {
 		return "", false, nil
 	}
-	lock, _ := cfg["lock"].(string)
+	lock, _ := ConfigString(cfg, "lock")
 	return lock, false, nil
 }
 

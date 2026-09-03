@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
@@ -67,12 +68,12 @@ func isSDNNotFoundShape(err error) bool {
 // on the zone plugin type. Raw preserves the unparsed JSON for callers that
 // need fields not promoted here.
 type SDNZone struct {
-	Zone   string          `json:"zone"`
-	Type   string          `json:"type"`
-	Bridge string          `json:"bridge,omitempty"`
-	MTU    int64           `json:"mtu,omitempty"`
-	Nodes  string          `json:"nodes,omitempty"`
-	Raw    json.RawMessage `json:"-"`
+	Zone   string           `json:"zone"`
+	Type   string           `json:"type"`
+	Bridge string           `json:"bridge,omitempty"`
+	MTU    sdkclient.PVEInt `json:"mtu,omitempty"`
+	Nodes  string           `json:"nodes,omitempty"`
+	Raw    json.RawMessage  `json:"-"`
 }
 
 // DeleteSDNZone issues DELETE /cluster/sdn/zones/{zone}.
@@ -192,15 +193,17 @@ func GetSDNZone(ctx context.Context, c Client, zone string) (*SDNZone, error) {
 // ---------------------------------------------------------------------------
 
 // SDNVnet is the decoded shape of a vnet row. Zone is promoted because
-// callers commonly derive the parent zone from a vnet name lookup.
+// callers commonly derive the parent zone from a vnet name lookup. Tag and
+// Vlanaware use the SDK's tolerant scalars because PVE has returned both as
+// numbers and as strings depending on whether the row is pending.
 type SDNVnet struct {
-	Vnet      string          `json:"vnet"`
-	Zone      string          `json:"zone"`
-	Alias     string          `json:"alias,omitempty"`
-	Tag       int64           `json:"tag,omitempty"`
-	Vlanaware int64           `json:"vlanaware,omitempty"`
-	Type      string          `json:"type,omitempty"`
-	Raw       json.RawMessage `json:"-"`
+	Vnet      string            `json:"vnet"`
+	Zone      string            `json:"zone"`
+	Alias     string            `json:"alias,omitempty"`
+	Tag       sdkclient.PVEInt  `json:"tag,omitempty"`
+	Vlanaware sdkclient.PVEBool `json:"vlanaware,omitempty"`
+	Type      string            `json:"type,omitempty"`
+	Raw       json.RawMessage   `json:"-"`
 }
 
 // DeleteSDNVnet issues DELETE /cluster/sdn/vnets/{vnet}. NotFound surfaces

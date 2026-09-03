@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // zfsThickProvisioningWarnedPools deduplicates the once-per-pool-per-process
@@ -89,10 +90,11 @@ func warnIfZFSThickProvisioned(ctx context.Context, deps Deps, storageName, know
 		var entry struct {
 			Storage string `json:"storage"`
 			Type    string `json:"type"`
-			// Sparse is PVE's integer-boolean convention (1/0), not a JSON
-			// bool — absent or 0 means thick provisioning, the zfspool
-			// plugin's own default when the config carries no "sparse" line.
-			Sparse *int `json:"sparse,omitempty"`
+			// Sparse is a PVE boolean (usually the integer 1/0, decoded
+			// tolerantly). Absent or false means thick provisioning, the
+			// zfspool plugin's own default when the config carries no
+			// "sparse" line.
+			Sparse *sdkclient.PVEBool `json:"sparse,omitempty"`
 		}
 		if jerr := json.Unmarshal(raw, &entry); jerr != nil {
 			continue
@@ -103,7 +105,7 @@ func warnIfZFSThickProvisioned(ctx context.Context, deps Deps, storageName, know
 		if entry.Type != pve.StorageTypeZFSPool {
 			return
 		}
-		if entry.Sparse != nil && *entry.Sparse != 0 {
+		if entry.Sparse != nil && entry.Sparse.Bool() {
 			return // sparse=1: silent, this is the well-provisioned case.
 		}
 		if _, loaded := zfsThickProvisioningWarnedPools.LoadOrStore(warnKey, struct{}{}); loaded {

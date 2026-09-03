@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -178,9 +179,9 @@ func storageTierMatches(info pve.StorageInfo, criteria config.StorageTierCriteri
 // Uses the same subset as StorageInfoCache.refresh and handlerPolicyDeps.StorageInfo.
 func parseTierStorageEntry(raw json.RawMessage) (pve.StorageInfo, error) {
 	var v struct {
-		Storage string `json:"storage"`
-		Type    string `json:"type"`
-		Shared  *int   `json:"shared,omitempty"`
+		Storage string             `json:"storage"`
+		Type    string             `json:"type"`
+		Shared  *sdkclient.PVEBool `json:"shared,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return pve.StorageInfo{}, err
@@ -192,7 +193,7 @@ func parseTierStorageEntry(raw json.RawMessage) (pve.StorageInfo, error) {
 		Name: v.Storage,
 		Type: v.Type,
 	}
-	if v.Shared != nil && *v.Shared != 0 {
+	if v.Shared != nil && v.Shared.Bool() {
 		info.Shared = true
 	}
 	return info, nil

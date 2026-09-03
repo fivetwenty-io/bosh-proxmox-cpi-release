@@ -108,10 +108,10 @@ func resolveTemplateDiskStorage(ctx context.Context, deps Deps, templateNode str
 		return "", "", fmt.Errorf("read template %d config on node %q: %w", templateVMID, templateNode, cfgErr)
 	}
 	rootKey = diskKeyVirtio0
-	v0, ok := cfg[rootKey].(string)
+	v0, ok := pve.ConfigString(cfg, rootKey)
 	if !ok || v0 == "" {
 		rootKey = diskKeyScsi0
-		v0, ok = cfg[rootKey].(string)
+		v0, ok = pve.ConfigString(cfg, rootKey)
 	}
 	if !ok || v0 == "" {
 		return "", "", fmt.Errorf("template %d config on node %q has neither a %s nor a %s entry",
@@ -767,7 +767,7 @@ func cloneFromTemplate(
 				log.ErrScrubbed(cfgGetErr),
 			)
 		} else {
-			currentRootDiskVal, _ := clonedCfg[shape.rootDiskKey].(string)
+			currentRootDiskVal, _ := pve.ConfigString(clonedCfg, shape.rootDiskKey)
 			if currentRootDiskVal == "" {
 				// Fallback: use storage:index bare form that PVE recognises. The
 				// "vm-<id>-disk-0" naming convention is bus-agnostic (PVE names the
@@ -823,7 +823,7 @@ func readRootDiskSizeGiB(ctx context.Context, deps Deps, node string, vmid int, 
 	if err != nil {
 		return 0, err
 	}
-	v0, ok := cfg[rootKey].(string)
+	v0, ok := pve.ConfigString(cfg, rootKey)
 	if !ok || v0 == "" {
 		return defaultStemcellDiskGiB, nil
 	}
