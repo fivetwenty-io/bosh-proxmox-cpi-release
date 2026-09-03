@@ -2,11 +2,11 @@
 name: golang-1.27
 
 description: |
-  Go 1.27.0 toolchain blob used to compile pve_cpi during BOSH packaging.
+  Go 1.27.1 toolchain blob used to compile pve_cpi during BOSH packaging.
   Register the blob before creating a release:
-    bosh add-blob /path/to/go1.27.0.linux-amd64.tar.gz golang-1.27/go1.27.0.linux-amd64.tar.gz
+    bosh add-blob /path/to/go1.27.1.linux-amd64.tar.gz golang-1.27/go1.27.1.linux-amd64.tar.gz
 
 dependencies: []
 
 files:
-  - golang-1.27/go1.27.0.linux-amd64.tar.gz
+  - golang-1.27/go1.27.1.linux-amd64.tar.gz

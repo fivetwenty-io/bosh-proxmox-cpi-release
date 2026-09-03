@@ -1,4 +1,4 @@
-golang-1.27/go1.27.0.linux-amd64.tar.gz:
-  size: 70523269
-  object_id: 85c480a4-d6bb-43f0-4dc7-f672ee55a462
-  sha: sha256:675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685
+golang-1.27/go1.27.1.linux-amd64.tar.gz:
+  size: 70553950
+  object_id: 8206a61a-d5d1-4319-79f8-69806b2aad6b
+  sha: sha256:63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445

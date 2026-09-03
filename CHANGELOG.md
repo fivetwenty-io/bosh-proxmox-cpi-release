@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- The packaged Go toolchain moves from 1.27.0 to 1.27.1. The `golang-1.27` BOSH package now carries the `go1.27.1.linux-amd64.tar.gz` blob, its packaging script verifies that blob's own SHA256 before extracting, `src/pve_cpi/go.mod` requires `go 1.27.1`, and every CI container builds in the `golang:1.27` image digest that resolves to the same release. The compile VM pins `GOTOOLCHAIN=local`, so the blob is the toolchain a release is actually built with, and `make go-blob-check` keeps it from drifting back below what the module requires.
+
 ## [0.5.1] - 2026-08-25
 
 ### Added
