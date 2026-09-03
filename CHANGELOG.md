@@ -12,9 +12,12 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-03
+
 ### Changed
 
 - The packaged Go toolchain moves from 1.27.0 to 1.27.1. The `golang-1.27` BOSH package now carries the `go1.27.1.linux-amd64.tar.gz` blob, its packaging script verifies that blob's own SHA256 before extracting, `src/pve_cpi/go.mod` requires `go 1.27.1`, and every CI container builds in the `golang:1.27` image digest that resolves to the same release. The compile VM pins `GOTOOLCHAIN=local`, so the blob is the toolchain a release is actually built with, and `make go-blob-check` keeps it from drifting back below what the module requires.
+- The bundled Proxmox SDK moves to proxmox-apiclient-go v3.10.0, which refreshes its bindings to the Proxmox VE 9.2.4, Proxmox Backup Server 4.2.5, and Proxmox Datacenter Manager 1.1.7 specifications, returns a typed struct from `GET /cluster/options` with the eleven parsed `datacenter.cfg` fields corrected to the object shapes PVE actually sends, and documents the tolerant `PVEBool`, `PVEInt`, and `PVEFloat` scalars that the fixes below rely on.
 
 ### Fixed
 
@@ -342,7 +345,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.3.0...v0.4.0
