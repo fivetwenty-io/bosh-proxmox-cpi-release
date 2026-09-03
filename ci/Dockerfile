@@ -14,17 +14,17 @@
 # .github/workflows/release.yml verifies; the cf, credhub, and uv downloads
 # are version-pinned over TLS from their vendors' release channels.
 
-ARG GO_VERSION=1.27.0
+ARG GO_VERSION=1.27.1
 ARG RUBY_VERSION=3.3
-ARG BOSH_CLI_VERSION=7.10.9
-# sha256 of bosh-cli-7.10.9-linux-amd64 from cloudfoundry/bosh-cli releases
-ARG BOSH_CLI_SHA256=b06db2e0ad45c1c24d90726c2e83011b025d5fe5c3dabb9d8af8f87db1f2a89c
-ARG GH_CLI_VERSION=2.97.0
-# sha256 of gh_2.97.0_linux_amd64.tar.gz from cli/cli releases
-ARG GH_CLI_SHA256=a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112
-ARG CF_CLI_VERSION=8.9.0
-ARG CREDHUB_CLI_VERSION=2.9.45
-ARG UV_VERSION=0.4.30
+ARG BOSH_CLI_VERSION=7.10.10
+# sha256 of bosh-cli-7.10.10-linux-amd64 from cloudfoundry/bosh-cli releases
+ARG BOSH_CLI_SHA256=ff092e567f6b6b41cbcaf8b4065eb2bae29a7463f537bd99ae6424c0d93291c9
+ARG GH_CLI_VERSION=2.99.0
+# sha256 of gh_2.99.0_linux_amd64.tar.gz from cli/cli releases
+ARG GH_CLI_SHA256=ed4960225d2833e04a61590d9fa2b5773d147f3aa375459e5466a40c102f3832
+ARG CF_CLI_VERSION=8.19.0
+ARG CREDHUB_CLI_VERSION=2.9.60
+ARG UV_VERSION=0.12.9
 
 # -- Stage 1: download CLI binaries -----------------------------------------
 FROM debian:bookworm-slim AS downloader

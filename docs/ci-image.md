@@ -37,12 +37,12 @@ The stock `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependen
 
 | Tool | Minimum version | Source |
 |------|----------------|--------|
-| `bosh` | 7.10.9 | https://github.com/cloudfoundry/bosh-cli/releases (sha256-pinned) |
-| `gh` | 2.97.0 | https://github.com/cli/cli/releases (sha256-pinned) |
-| `cf` | 8.9.0 | https://github.com/cloudfoundry/cli/releases |
-| `credhub` | 2.9.45 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
-| `uv` | 0.4.30 | https://github.com/astral-sh/uv/releases |
-| `go` | 1.27.0 | golang official image (must match `src/pve_cpi/go.mod`) |
+| `bosh` | 7.10.10 | https://github.com/cloudfoundry/bosh-cli/releases (sha256-pinned) |
+| `gh` | 2.99.0 | https://github.com/cli/cli/releases (sha256-pinned) |
+| `cf` | 8.19.0 | https://github.com/cloudfoundry/cli/releases |
+| `credhub` | 2.9.60 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
+| `uv` | 0.12.9 | https://github.com/astral-sh/uv/releases |
+| `go` | 1.27.1 | golang official image (must satisfy `src/pve_cpi/go.mod`) |
 | `ruby` + `bundler` | 3.3 | ruby official slim image |
 | `python3` + PyYAML | 3.11 | Debian packages (`python3`, `python3-yaml`) |
 | `git`, `jq`, `make`, `curl`, `openssh-client`, `coreutils`, `build-essential` | Debian bookworm | System packages |

@@ -33,7 +33,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
-      image: golang:1.27@sha256:65b6f280bf050ec5af12716857e8ea8439d694dbba8f31ceeb7630670071f2bb
+      image: golang:1.27@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a
