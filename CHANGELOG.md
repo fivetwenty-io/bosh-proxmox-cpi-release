@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- The `pve.vm_disk_format` job property now reaches the VM root disk and the ephemeral disk. `create_vm` resolved its format from the call's `cloud_properties`, then from a `vm_type` or `disk_type` profile, and then fell straight through to the built-in `qcow2`, skipping the job property entirely. `create_disk` and `attach_disk` had always read the same field, so the two VM-owned disks were the only ones ignoring it. An operator whose `vm_storage` is block-native (`lvm`, `lvmthin`, `zfspool`, `rbd`) sets the property to `raw` because those pools reject qcow2, and unless a cloud-config `vm_type` repeated the value, the CPI asked PVE for a format the pool cannot hold. A `cpi-config` entry overriding `vm_disk_format` for its own cluster was stranded the same way. The property now sits between the cloud-property layers and the `qcow2` default, so an explicit cloud property still wins and an unset property still lands on `qcow2`.
+
+### Documentation
+
+- [Operations](docs/operations.md) gains a section on where a disk format comes from, covering the four-rung resolution order, the rule that block-native pools always record `raw` while file-backed pools get the resolved format verbatim (and carry it in the volume filename), and the fact that the CPI never downgrades a requested `qcow2` to `raw`. Proxmox supports qcow2 on NFS and the CPI classifies NFS as file-backed in every format decision, so a raw volume on an NFS pool means raw was requested; the section explains how to find the layer that asked for it, starting with the `disk_type` the deployment actually uses rather than the CPI job properties.
+
 ## [0.5.2] - 2026-09-03
 
 ### Changed
