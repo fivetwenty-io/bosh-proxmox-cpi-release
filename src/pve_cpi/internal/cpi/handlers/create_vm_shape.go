@@ -253,15 +253,31 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 	}
 
 	// Disk format: resolver wins (handles both "vm_disk_format" key in call
-	// layer and profile layers) → struct field from JSON unmarshal → qcow2.
-	// The struct field cp.VMDiskFormat is already populated from args[2] by
-	// the standard unmarshal in parseCreateVMArgs, so we only consult it when
-	// the resolver finds nothing in any layer.
-	if df, ok := r.String("vm_disk_format", "disk_format"); ok {
+	// layer and profile layers) → struct field from JSON unmarshal → the
+	// job/cpi-config value → qcow2. The struct field cp.VMDiskFormat is
+	// already populated from args[2] by the standard unmarshal in
+	// parseCreateVMArgs, so we only consult it when the resolver finds
+	// nothing in any layer.
+	//
+	// cfg.VMDiskFormat is the pve.vm_disk_format job property, which a
+	// cpi-config entry may also override per cluster (see the context
+	// override registry in internal/config/context_overrides.go). Skipping it
+	// here used to strand that setting: an operator whose vm_storage is
+	// block-native (lvm, lvmthin, zfspool, rbd) sets pve.vm_disk_format to
+	// raw because those pools reject qcow2, and with no vm_type
+	// cloud_property carrying the format, create_vm fell straight through to
+	// the qcow2 literal and asked PVE for a format the pool cannot hold.
+	// create_disk (create_disk.go) and attach_disk (attach_disk.go) have
+	// always read the same config field, so the root and ephemeral disks were
+	// the only two that ignored it.
+	switch df, ok := r.String("vm_disk_format", "disk_format"); {
+	case ok:
 		vmDiskFormat = df
-	} else if cp.VMDiskFormat != "" {
+	case cp.VMDiskFormat != "":
 		vmDiskFormat = cp.VMDiskFormat
-	} else {
+	case cfg.VMDiskFormat != "":
+		vmDiskFormat = cfg.VMDiskFormat
+	default:
 		vmDiskFormat = diskFormatQCOW2
 	}
 

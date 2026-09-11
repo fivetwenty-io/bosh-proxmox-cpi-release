@@ -4182,3 +4182,107 @@ func (n *templateGapAuthNodes) ListNodes(context.Context) (*sdknodes.ListNodesRe
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
 }
+
+// TestResolveVMShapeStorage_DiskFormat_FromConfig verifies that the
+// pve.vm_disk_format job property reaches the VM root disk when no
+// cloud_property at any layer expresses a format. Operators on block-native
+// pools (lvm, lvmthin, zfspool, rbd) set it to raw because those pools reject
+// qcow2, and before this was wired the resolver fell through to the qcow2
+// literal and asked PVE for a format the pool cannot hold.
+func TestResolveVMShapeStorage_DiskFormat_FromConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:    "local-lvm",
+		VMDiskFormat: "raw",
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+	parsed.cloudProps.VMDiskFormat = ""
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != "raw" {
+		t.Errorf("vmDiskFormat = %q; want raw (from pve.vm_disk_format)", vmDiskFormat)
+	}
+}
+
+// TestResolveVMShapeStorage_DiskFormat_CallBeatsConfig verifies that a
+// cloud_property format still wins over the job property, so a per-VM
+// override on a file-backed pool is not clobbered by a cluster-wide default.
+func TestResolveVMShapeStorage_DiskFormat_CallBeatsConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:    "nfs-pool",
+		VMDiskFormat: "raw",
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_disk_format": "qcow2",
+	})
+	parsed.cloudProps.VMDiskFormat = "qcow2"
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != "qcow2" {
+		t.Errorf("vmDiskFormat = %q; want qcow2 (call layer beats pve.vm_disk_format)", vmDiskFormat)
+	}
+}
+
+// TestResolveVMShapeStorage_DiskFormat_ProfileBeatsConfig verifies the middle
+// rung of the precedence ladder: a vm_type profile still outranks the job
+// property.
+func TestResolveVMShapeStorage_DiskFormat_ProfileBeatsConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{
+		VMStorage:    "nfs-pool",
+		VMDiskFormat: "raw",
+		VMTypes: map[string]config.TypeProfile{
+			"sparse": {
+				CloudProperties: map[string]any{
+					"vm_disk_format": "qcow2",
+				},
+			},
+		},
+	}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{
+		"vm_type": "sparse",
+	})
+	parsed.cloudProps.VMDiskFormat = ""
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != "qcow2" {
+		t.Errorf("vmDiskFormat = %q; want qcow2 (vm_type profile beats pve.vm_disk_format)", vmDiskFormat)
+	}
+}
+
+// TestResolveVMShapeStorage_DiskFormat_EmptyConfigKeepsQCOW2 pins the tail of
+// the ladder: an unset job property still lands on the qcow2 built-in, which
+// is the correct default for the file-backed pools (dir, nfs, cifs) the CPI
+// is most often pointed at.
+func TestResolveVMShapeStorage_DiskFormat_EmptyConfigKeepsQCOW2(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{VMStorage: "nfs-pool"}
+	parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+	parsed.cloudProps.VMDiskFormat = ""
+
+	_, vmDiskFormat, _, err := resolveVMShapeStorage(cfg, parsed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmDiskFormat != diskFormatQCOW2 {
+		t.Errorf("vmDiskFormat = %q; want %q (built-in default)", vmDiskFormat, diskFormatQCOW2)
+	}
+}
