@@ -125,6 +125,11 @@ coverage-check: coverage ## Fail if total line coverage < $(COVERAGE_THRESHOLD)%
 	fi
 	@echo "$(GREEN)✓ Coverage threshold met$(RESET)"
 
+.PHONY: erb-check
+erb-check: ## Render the BOSH job template and validate its JSON
+	@bash -n packages/pve_cpi/packaging jobs/pve_cpi/templates/pre-start.erb scripts/_test_erb_render.sh
+	@bash scripts/_test_erb_render.sh
+
 .PHONY: py-test
 py-test: ## Run every scripts/*_test.py unit suite with python3 (offline; mocks all PVE traffic)
 	@echo "$(GREEN)Running Python script tests...$(RESET)"
@@ -221,7 +226,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
 .PHONY: check
-check: fmt-check vet go-blob-check py-test staticcheck lint coverage-check test ## Run fmt-check, vet, go-blob-check, py-test, staticcheck, lint, coverage-check, and test (cheap-fast checks first)
+check: fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run formatting, vet, blob, template, Python, analysis, coverage, and race checks
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

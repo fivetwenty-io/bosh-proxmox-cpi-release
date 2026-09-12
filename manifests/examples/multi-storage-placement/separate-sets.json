@@ -1,0 +1,40 @@
+{
+  "host": "pve.example.com",
+  "user": "bosh@pve",
+  "api_token": "bosh@pve!cpi=REPLACE_WITH_API_TOKEN",
+  "node": "pve1",
+  "network_bridge": "vmbr0",
+  "vm_storage": "nfs-ephemeral-01",
+  "disk_storage": "nfs-persistent-01",
+  "stemcell_storage": "nfs-images",
+  "iso_storage": "nfs-iso",
+  "iso_storage_follow_vm_storage": false,
+  "storage_placement_namespace": "production-director-pve",
+  "storage_allocation_journal_dir": "/var/vcap/store/pve_cpi/allocations",
+  "storage_sets": {
+    "ephemeral": {
+      "names": [
+        "nfs-ephemeral-01",
+        "nfs-ephemeral-02",
+        "nfs-ephemeral-03"
+      ],
+      "strategy": {
+        "name": "spread",
+        "version": 1
+      }
+    },
+    "persistent": {
+      "names": [
+        "nfs-persistent-01",
+        "nfs-persistent-02"
+      ],
+      "strategy": {
+        "name": "weighted_free_space",
+        "version": 1
+      }
+    }
+  },
+  "ephemeral_storage_set": "ephemeral",
+  "persistent_storage_set": "persistent",
+  "require_disjoint_storage_sets": true
+}

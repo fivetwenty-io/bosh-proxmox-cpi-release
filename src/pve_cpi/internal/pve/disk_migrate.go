@@ -62,6 +62,7 @@ func TagsMarkDiskMover(tags string) bool {
 
 // DiskMigrationSpec is everything MigrateDiskViaMover needs to move one disk.
 type DiskMigrationSpec struct {
+	AllocationID, AllocationNamespace, AllocationBacking string
 	// Holder is the parker currently referencing the volume, on a node other
 	// than TargetNode. A holder already carrying the mover tag is adopted (a
 	// previous run crashed between isolation and destroy); any other parker
@@ -133,7 +134,10 @@ func MigrateDiskViaMover(
 		spec.AwaitBudget = defaultDiskMigrateAwaitBudget
 	}
 
-	pctx := ParkContext{DiskCID: spec.DiskCID, StableID: spec.StableID, Opts: spec.Opts}
+	pctx := ParkContext{DiskCID: spec.DiskCID, StableID: spec.StableID, Opts: spec.Opts, AllocationID: spec.AllocationID, AllocationNamespace: spec.AllocationNamespace, AllocationBacking: spec.AllocationBacking}
+	if storage, _, err := ParseDiskCID(spec.Volid); err == nil {
+		cfg.DiskStorage = storage
+	}
 
 	mover := spec.Holder
 	volid := spec.Volid
@@ -217,16 +221,22 @@ func isolateDiskOntoMover(
 	}
 
 	// Finalize the mover's record with the landed (mover-named) volid, then
-	// drop the shared parker's entry — receiving side first, both
-	// best-effort now that the serial rides the mover's drive entry.
+	// drop the shared parker's entry. Managed allocation identity must be
+	// verified at the receiver before the source record can be removed.
 	final := intent
 	final.Volid = landed
-	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, final, cfg); provErr != nil && logger != nil {
-		logger.Warn("disk migrate: could not finalize the mover's provenance record (non-fatal; the drive serial is authoritative)",
-			log.Int("mover_vmid", moverVMID),
-			log.String("volid", landed),
-			log.Err(provErr),
-		)
+	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, final, cfg); provErr != nil {
+		if spec.AllocationID != "" || spec.AllocationNamespace != "" {
+			return DiskHolder{}, "", cpierrors.Cloud("managed migration isolation provenance requires reconciliation")
+		}
+		if logger != nil {
+			logger.Warn("disk migrate: could not finalize legacy mover provenance", log.Err(provErr))
+		}
+	}
+	if spec.AllocationID != "" || spec.AllocationNamespace != "" {
+		if err := VerifyAllocationParked(ctx, c, logger, landed, spec.StableID, spec.AllocationNamespace, spec.AllocationID, cfg); err != nil {
+			return DiskHolder{}, "", cpierrors.Cloud("managed migration receiver provenance is not verified")
+		}
 	}
 	RemoveParkerProvenanceEntry(ctx, c, logger, spec.Holder.Node, spec.Holder.VMID, spec.Volid, cfg)
 
@@ -414,13 +424,18 @@ func convergeMigratedMover(
 	reassertParkerProtection(ctx, c, logger, spec.TargetNode, moverVMID)
 
 	entry := buildParkerProvEntry(spec.TargetNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil && logger != nil {
-		logger.Warn("disk migrate: could not rewrite the mover's provenance record for its new node (non-fatal; the drive serial is authoritative)",
-			log.Int("mover_vmid", moverVMID),
-			log.String("node", spec.TargetNode),
-			log.String("volid", landed),
-			log.Err(provErr),
-		)
+	if provErr := writeParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil {
+		if spec.AllocationID != "" || spec.AllocationNamespace != "" {
+			return "", "", cpierrors.Cloud("managed migration destination provenance requires reconciliation")
+		}
+		if logger != nil {
+			logger.Warn("disk migrate: could not finalize legacy destination provenance", log.Err(provErr))
+		}
+	}
+	if spec.AllocationID != "" || spec.AllocationNamespace != "" {
+		if err := VerifyAllocationParked(ctx, c, logger, landed, spec.StableID, spec.AllocationNamespace, spec.AllocationID, cfg); err != nil {
+			return "", "", cpierrors.Cloud("managed migration destination provenance is not verified")
+		}
 	}
 	return slot, landed, nil
 }

@@ -156,6 +156,11 @@ func attachViaMigration(
 		MaxAttempts: pol.MaxAttempts,
 		AwaitBudget: time.Duration(pol.CapMs) * time.Millisecond,
 	}
+	if rd.allocation != nil {
+		spec.AllocationID = rd.allocation.record.ID
+		spec.AllocationNamespace = rd.allocation.record.Namespace
+		spec.AllocationBacking = rd.allocation.provenance.Backing
+	}
 	// The write config: mover allocation scans disk_storage volume content
 	// like every other parker-band allocation (see parkerReadConfigFor's doc
 	// comment for why the read config must not be used here).

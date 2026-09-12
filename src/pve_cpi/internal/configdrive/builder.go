@@ -20,6 +20,10 @@ const volumeLabel = "config-2"
 // 10 MiB matches the upstream example and leaves headroom for filesystem overhead.
 const isoSize int64 = 10 * 1024 * 1024
 
+// AllocationBytes is the fixed backing allocation used by Build. Managed callers
+// verify the finalized artifact does not exceed this charge before uploading.
+func AllocationBytes() uint64 { return uint64(isoSize) }
+
 // diskCreate is the function used to create a new disk image. It defaults to
 // diskfs.Create. Tests replace it to exercise the diskfs.Create error branch
 // in Build without requiring a real disk operation to fail.

@@ -188,7 +188,7 @@ func resolveDeleteDiskCID(ctx context.Context, deps Deps, diskCID string) (resol
 	if resolveErr != nil {
 		return resolvedDisk{}, resolveErr
 	}
-	return resumeTransferIfNeeded(ctx, deps, "delete_disk", rd)
+	return rd, nil
 }
 
 // HandleDeleteDisk returns a Handler for the BOSH CPI delete_disk method.
@@ -208,7 +208,7 @@ func resolveDeleteDiskCID(ctx context.Context, deps Deps, diskCID string) (resol
 // from the node that hosts them. Operators using local storage must ensure the
 // configured node matches the volume's location.
 func HandleDeleteDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (result any, operationErr error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
@@ -216,20 +216,31 @@ func HandleDeleteDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// ----------------------------------------------------------------
-		if len(args) < 1 {
-			return nil, cpierrors.Cloud("delete_disk: expected 1 argument (disk_cid), got 0")
-		}
-
-		var diskCID string
-		if err := json.Unmarshal(args[0], &diskCID); err != nil {
-			return nil, cpierrors.Wrap(err, "delete_disk: args[0] disk_cid must be a string")
-		}
-		if diskCID == "" {
-			return nil, cpierrors.Cloud("delete_disk: disk_cid must not be empty")
+		diskCID, parseErr := deleteDiskArguments(args)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		rd, decErr := resolveDeleteDiskCID(ctx, deps, diskCID)
 		if decErr != nil {
 			return nil, decErr
+		}
+		if rd.allocation != nil && rd.allocation.terminalAbsent {
+			return nil, nil
+		}
+		if rd.allocation != nil && rd.allocation.absent {
+			return nil, finalizeAbsentManagedDisk(ctx, deps, rd)
+		}
+		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "delete_disk")
+		if lifecycleErr != nil {
+			return nil, lifecycleErr
+		}
+		if lifecycle != nil {
+			rd = lifecycle.disk
+			defer func() { operationErr = lifecycle.finish(ctx, operationErr, true) }()
+		}
+		rd, err = resumeTransferIfNeeded(ctx, deps, "delete_disk", rd)
+		if err != nil {
+			return nil, err
 		}
 		bareDiskCID := rd.volid
 
@@ -307,4 +318,19 @@ func HandleDeleteDisk(deps Deps) Handler {
 		deps.Log(ctx).Info("delete_disk", log.String("disk_cid", diskCID), log.String("node", node))
 		return nil, nil
 	})
+}
+
+func deleteDiskArguments(args []json.RawMessage) (string, error) {
+	if len(args) < 1 {
+		return "", cpierrors.Cloud("delete_disk: expected 1 argument (disk_cid), got 0")
+	}
+
+	var diskCID string
+	if err := json.Unmarshal(args[0], &diskCID); err != nil {
+		return "", cpierrors.Wrap(err, "delete_disk: args[0] disk_cid must be a string")
+	}
+	if diskCID == "" {
+		return "", cpierrors.Cloud("delete_disk: disk_cid must not be empty")
+	}
+	return diskCID, nil
 }

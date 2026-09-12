@@ -14,6 +14,22 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
 
+- [Multiple NFS Shares Design](designs/multi-storage-placement-design.md) explains the vSphere research, independent role sets, versioned strategies, and recovery contract. Implementation is under review.
+
+- [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the feature. Follow the [implementation progress record](plans/multi-storage-placement-progress.md) for current validation results.
+
+- [Parker Prefix, Pool, and Tags Implementation Plan](plans/parker-prefix-pool-and-tags-plan.md) gives parker and mover VMs an operator-visible identity through a configurable name prefix, a resource pool, and a `prefix--` tag, and records the configuration, permission, and release consequences of each.
+
+- [Configure Multiple NFS Shares](multi-storage-placement.md) explains storage sets, strategy selection, role boundaries, and capacity domains for the implementation under development.
+
+- [Provision the Storage Journal](storage-journal-provisioning.md) explains durable paths, ownership, and Director mounts.
+
+- [Audit and Recover Storage Allocations](storage-journal-operations.md) covers enrollment, authority restoration, index repair, adoption, and explicit cleanup.
+
+- [Certify Candidate Artifacts](certification/candidate-artifacts.md) explains how to test the exact candidate release and retain its checksum in certification reports.
+
+- [Verify Multi-storage Placement](certification/multi-storage-placement.md) explains the live lifecycle assertions and the evidence they produce.
+
 - [Known Limitations](limitations.md): The consolidated list of what the CPI does not do, covering disk, storage, networking, topology, and permissions constraints, one sentence per item with a link to the page that owns the detail.
 
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.

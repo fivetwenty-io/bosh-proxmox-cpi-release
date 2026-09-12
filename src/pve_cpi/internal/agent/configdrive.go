@@ -63,9 +63,12 @@ var _ Agent = (*ConfigDrive)(nil)
 //
 // This is the only cloud-init bootstrap path for the CPI.
 type ConfigDrive struct {
-	storage string
-	pveSvc  pve.Client
-	logger  *log.Logger
+	managedAllocationBytes uint64
+	managedExistingISO     string
+	managedPayloadCheck    func([]byte) error
+	storage                string
+	pveSvc                 pve.Client
+	logger                 *log.Logger
 	// nodeEndpoints resolves the direct pveproxy address for the upload's
 	// target node; nil (every test that does not care) means the upload takes
 	// the proxied path through the configured endpoint.
@@ -150,6 +153,22 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: marshal settings.json", vmid))
 	}
 
+	if a.managedPayloadCheck != nil {
+		if err := a.managedPayloadCheck(payload); err != nil {
+			return err
+		}
+	}
+	if a.managedExistingISO != "" {
+		filename := configDriveISOFilename(vmid)
+		if a.managedExistingISO != fmt.Sprintf("%s:iso/%s", a.storage, filename) {
+			return cpierrors.Cloud("managed ISO identity differs from proven artifact")
+		}
+		found, err := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, a.managedExistingISO)
+		if err != nil || !found {
+			return cpierrors.Cloud("managed ISO is no longer observable")
+		}
+		return a.attachISO(ctx, node, vmid, filename)
+	}
 	isoPath, cleanup, err := configdrive.Build(payload)
 	if err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("agent configure vm %d: build configdrive iso", vmid))
@@ -157,6 +176,20 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	defer cleanup()
 
 	filename := configDriveISOFilename(vmid)
+	if a.managedAllocationBytes > 0 {
+		info, statErr := os.Stat(isoPath)
+		if statErr != nil {
+			return fmt.Errorf("inspect managed config drive allocation: %w", statErr)
+		}
+		size := info.Size()
+		if size < 0 {
+			return fmt.Errorf("invalid managed config drive allocation size")
+		}
+		if uint64(size) != a.managedAllocationBytes {
+			return cpierrors.Cloud("managed configdrive artifact exceeds frozen allocation or cannot be measured")
+		}
+
+	}
 
 	// Pre-delete any orphan ISO sitting under the same filename. PVE rejects
 	// `content=iso` uploads with HTTP 409 when the target name is taken, so a
@@ -186,6 +219,9 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	}
 
 	if attachErr := a.attachISO(ctx, node, vmid, filename); attachErr != nil {
+		if a.managedAllocationBytes > 0 {
+			return cpierrors.Wrap(attachErr, "managed configdrive attachment requires reconciliation")
+		}
 		// Best-effort cleanup: remove the uploaded ISO so it does not linger as
 		// an orphan in the storage pool. When cleanup also fails the combined
 		// error supersedes the attach-only error so operators see both failure
@@ -427,6 +463,16 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 // uploaded ISO — causing qmstart to fail with "volume … does not exist".
 func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string) (bool, error) {
 	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
+	if a.managedAllocationBytes > 0 {
+		exists, err := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, volume)
+		if err != nil {
+			return false, cpierrors.Cloud("managed configdrive collision observation failed")
+		}
+		if exists {
+			return true, cpierrors.Cloud("managed configdrive target already exists; reconciliation required")
+		}
+		return false, nil
+	}
 	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storage, volume)
 	if err != nil {
 		return false, pve.WrapError(err)

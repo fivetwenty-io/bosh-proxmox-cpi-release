@@ -209,6 +209,11 @@ func AwaitTask(ctx context.Context, c Client, node, upid string, opts ...AwaitOp
 const (
 	adaptivePollMinInterval = 1 * time.Second
 	adaptivePollMaxInterval = 10 * time.Second
+	// A freshly returned UPID can briefly be absent from the task-status
+	// endpoint while pveproxy registers the task on the node encoded in the
+	// UPID. Three initial retries cover that registration window without
+	// changing the terminal classification of a genuinely unknown task.
+	adaptiveTaskInitialNotFoundRetries = 3
 )
 
 // adaptiveTaskInterval derives the next poll interval from how long the task has
@@ -251,7 +256,8 @@ func adaptiveTaskInterval(elapsed time.Duration, progress float64, fallback time
 //     lock/quorum/pushback contention retriable, everything else permanent
 //   - poll deadline exceeded while still running → retriable (task still running)
 //   - ctx cancelled → retriable
-//   - not-found task → non-retriable (preserves IsNotFound)
+//   - initial not-found reads → retried three times for PVE task registration
+//   - persistent not-found, or disappearance after observation → non-retriable
 //   - other transient read errors → retried until the deadline
 //
 // The per-iteration sleep is the progress-derived interval (adaptiveTaskInterval)
@@ -269,6 +275,8 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 	defer cancel()
 
 	start := time.Now()
+	initialNotFound := 0
+	taskObserved := false
 	for attempt := 0; ; attempt++ {
 		status, err := c.Tasks().GetStatus(actx, node, upid)
 		switch {
@@ -281,7 +289,11 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 				return pollTimeoutUnresolved(upid)
 			}
 			if IsNotFound(err) {
-				return wrapPollError(err, upid)
+				if taskObserved || initialNotFound >= adaptiveTaskInitialNotFoundRetries {
+					return wrapPollError(err, upid)
+				}
+				initialNotFound++
+				break
 			}
 			// Mirror the non-adaptive path: route through wrapPollError to classify.
 			// Transient faults (5xx, ConnectionError, TimeoutError, net.Timeout,
@@ -297,7 +309,10 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 		case status == nil:
 			return cpierrors.Cloud("AwaitTask %s: nil status returned from task service", upid)
 		case status.Status == taskStatusStopped:
+			taskObserved = true
 			return classifyTaskExit(upid, status.ExitStatus, status.Warned)
+		default:
+			taskObserved = true
 		}
 
 		var d time.Duration

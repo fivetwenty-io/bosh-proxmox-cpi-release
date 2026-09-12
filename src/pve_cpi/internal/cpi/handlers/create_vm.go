@@ -351,7 +351,10 @@ func (v *jsonScalarString) UnmarshalJSON(data []byte) error {
 
 // createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
 type createVMParsedArgs struct {
-	agentID string
+	storageRuntime   *managedVMAllocation
+	storagePlan      *StorageAllocationPlan
+	storageSelection *StoragePlacementSelection
+	agentID          string
 	// stemcellCID is the original path-identity CID as received
 	// (":light:<storage>:import/<file>" or ":heavy:<storage>:import/<file>").
 	stemcellCID string
@@ -548,6 +551,28 @@ func createVM(
 		return nil, err
 	}
 
+	if existing, found, resumeErr := resumeExistingManagedVM(ctx, deps, args, parsed); found || resumeErr != nil {
+		return existing, resumeErr
+	}
+
+	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
+	if err != nil {
+		return nil, cpierrors.Cloud("create_vm: %s", err.Error())
+	}
+	if selection.SetManaged {
+		return createManagedVM(ctx, deps, args, parsed, selection)
+	}
+	if selection.UsesAtomicSelectors {
+		parsed.storageSelection = selection
+	}
+	if selection.FuturePersistentSet != "" {
+		prepared, planErr := prepareManagedVMPlan(ctx, deps, parsed, selection)
+		if planErr != nil {
+			return nil, managedVMPlanCPIError(planErr)
+		}
+		parsed.storagePlan = prepared.plan
+	}
+
 	// -----------------------------------------------------------------------
 	// 2–3. Resolve node and VM-shape parameters.
 	// -----------------------------------------------------------------------
@@ -562,7 +587,7 @@ func createVM(
 		fallbackMax = deps.Config.PlacementFallbackMaxValue()
 	}
 
-	if fallbackMax > 0 {
+	if fallbackMax > 0 && parsed.storagePlan == nil {
 		return createVMWithFallback(ctx, deps, logger, parsed, fallbackMax, &retErr)
 	}
 
@@ -630,6 +655,12 @@ func createVM(
 		disposeFailedVM(c, deps, shape.node, vmid, parsed.env, logger)
 	})
 
+	return finishCreatedVM(ctx, deps, logger, parsed, shape, vmid, vmName)
+}
+
+// finishCreatedVM applies the common post-create phases. The caller owns rollback
+// and allocation authority, so managed callers can preserve uncertain resources.
+func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed *createVMParsedArgs, shape *createVMShape, vmid int, vmName string) (any, error) {
 	logger.Info("create_vm: vm created and disk imported",
 		log.Int(metadataKeyVMID, vmid),
 		log.String("stemcell_cid", parsed.stemcellCID),
@@ -653,7 +684,7 @@ func createVM(
 	// (CreatePartitionIfNoEphemeralDisk=true in the stemcell's agent.json
 	// requires free space at the end of the root disk).
 	// -----------------------------------------------------------------------
-	if err := resizeRootDisk(ctx, deps, logger, shape, vmid); err != nil {
+	if err := resizeCreatedVMRoot(ctx, deps, logger, parsed, shape, vmid); err != nil {
 		return nil, err
 	}
 
@@ -685,7 +716,7 @@ func createVM(
 	//      byte-identical to pre-feature behavior (agent carves ephemeral
 	//      from root disk via CreatePartitionIfNoEphemeralDisk).
 	// -----------------------------------------------------------------------
-	ephemeralDevPath, err := attachEphemeralDisk(ctx, deps, logger, shape, vmid)
+	ephemeralDevPath, err := attachCreatedVMEphemeral(ctx, deps, logger, parsed, shape, vmid)
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +731,7 @@ func createVM(
 	// -----------------------------------------------------------------------
 	// 8. Start VM + read back VM config to extract assigned MAC addresses
 	// -----------------------------------------------------------------------
-	responseNetworks, err := startVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
+	responseNetworks, err := startCreatedVMAndReadConfig(ctx, deps, logger, parsed, shape, vmid, nicPlan)
 	if err != nil {
 		return nil, err
 	}
@@ -788,7 +819,7 @@ func createVM(
 	// route. Empty list → no API calls (byte-identical). Errors propagate and
 	// trigger rollback; subnets injected before a failure are removed best-effort.
 	// -----------------------------------------------------------------------
-	if routeErr := applyAdvertisedRoutes(ctx, deps, shape.node, vmid, parsed.cloudProps.AdvertisedRoutes, logger); routeErr != nil {
+	if routeErr := applyCreatedVMRoutes(ctx, deps, parsed, shape, vmid, logger); routeErr != nil {
 		return nil, routeErr
 	}
 
@@ -1853,6 +1884,35 @@ func attemptStemcellImport(
 		return existErr
 	}
 
+	createParams := buildVMImportParams(parsed, shape, candidate, candidateName)
+	// The resolved pool (if any) must exist before it is handed to QEMU.Create
+	// as the "pool" param below (applyOptionalCreateParams) — PVE rejects a
+	// create referencing a non-existent pool. No-op when shape.vmPool == "".
+	if err := ensureResolvedPool(ctx, deps, shape, logger); err != nil {
+		return err
+	}
+	applyOptionalCreateParams(createParams, shape)
+
+	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
+	if cerr != nil {
+		return handleCreateError(ctx, deps, logger, shape.node, candidate, candidateName, cerr)
+	}
+
+	if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger,
+		pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
+		return handleAwaitError(ctx, deps, logger, shape.node, candidate, candidateName, werr)
+	}
+
+	logger.Info("create_vm: vm disk imported",
+		log.Int("vmid_attempted", candidate),
+		log.String("upid", upid),
+	)
+	// Apply post-clone config (pve_config passthrough + PCI hostpciN).
+	return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+}
+
+// buildVMImportParams is shared by the legacy and frozen managed import paths.
+func buildVMImportParams(parsed *createVMParsedArgs, shape *createVMShape, candidate int, candidateName string) map[string]any {
 	rootDiskVal := fmt.Sprintf("%s:0,import-from=%s,format=%s,size=%dG",
 		shape.vmStorage, parsed.rawVolid, shape.vmDiskFormat, shape.rootDiskGiB)
 	// Append resolved per-disk performance options (iothread, cache, etc.) when
@@ -1889,30 +1949,7 @@ func attemptStemcellImport(
 		// e.g. to redirect to a host device instead.
 		pveConfigKeySerial0: "socket",
 	}
-	// The resolved pool (if any) must exist before it is handed to QEMU.Create
-	// as the "pool" param below (applyOptionalCreateParams) — PVE rejects a
-	// create referencing a non-existent pool. No-op when shape.vmPool == "".
-	if err := ensureResolvedPool(ctx, deps, shape, logger); err != nil {
-		return err
-	}
-	applyOptionalCreateParams(createParams, shape)
-
-	upid, cerr := deps.PVE.QEMU().Create(ctx, shape.node, createParams)
-	if cerr != nil {
-		return handleCreateError(ctx, deps, logger, shape.node, candidate, candidateName, cerr)
-	}
-
-	if werr := pve.AwaitTaskWithLogger(ctx, deps.PVE, shape.node, upid, logger,
-		pve.WithMaxWait(pve.StemcellMaxWait)); werr != nil {
-		return handleAwaitError(ctx, deps, logger, shape.node, candidate, candidateName, werr)
-	}
-
-	logger.Info("create_vm: vm disk imported",
-		log.Int("vmid_attempted", candidate),
-		log.String("upid", upid),
-	)
-	// Apply post-clone config (pve_config passthrough + PCI hostpciN).
-	return applyPostCloneConfig(ctx, deps, shape.node, candidate, parsed, logger)
+	return createParams
 }
 
 // verifyStemcellQcow2Exists confirms the stemcell's qcow2 file is present on

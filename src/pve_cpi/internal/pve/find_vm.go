@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
@@ -94,15 +96,22 @@ func FindVMAuthoritative(ctx context.Context, c Client, vmid int) (VMLocation, e
 		}
 		probedAny = true
 		var cfg map[string]any
+		missing := false
 		probeErr := RetryOnTransient(ctx, nil, "find_vm_authoritative_probe", 0, func() error {
 			var inner error
-			cfg, inner = c.QEMU().Config(ctx, n, vmid)
+			// The CPI owns retries for this read so it can distinguish a settled
+			// missing-config 500 from transient failures before any backoff.
+			cfg, inner = c.QEMU().Config(sdkclient.WithRetries(ctx, 0), n, vmid)
+			missing = IsNotFound(inner) || IsPmxcfsConfigMissing(inner)
+			if missing {
+				return nil
+			}
 			return inner
 		})
+		if missing {
+			continue
+		}
 		if probeErr != nil {
-			if IsNotFound(probeErr) || IsPmxcfsConfigMissing(probeErr) {
-				continue // proven absent on this node
-			}
 			failedNodes = append(failedNodes, n)
 			lastProbeErr = probeErr
 			continue

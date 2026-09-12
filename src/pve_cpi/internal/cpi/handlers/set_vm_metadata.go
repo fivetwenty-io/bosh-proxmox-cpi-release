@@ -194,24 +194,36 @@ func setVMMetadataRMW(
 		}
 		if s, ok := pve.ConfigString(cfg, "description"); ok {
 			existingDesc = s
+		} else if _, present := cfg["description"]; present {
+			return cpierrors.Cloud("set_vm_metadata: existing description is unreadable")
 		}
 	} else if pve.IsNotFound(cfgErr) {
 		return cpierrors.VMNotFound(vmCID)
 	} else {
+		if deps.Config != nil && (deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
+			return cpierrors.Cloud("set_vm_metadata: cannot verify existing allocation provenance")
+		}
 		logger.Warn("set_vm_metadata: could not read current VM config; existing tags and description sentinel will not be preserved",
 			log.Err(cfgErr),
 		)
 	}
 
+	if strings.Contains(description, "<!--BOSH:") {
+		return cpierrors.Cloud("set_vm_metadata: metadata contains reserved description sentinel")
+	}
 	if _, raw := pve.ParseSentinel(existingDesc); len(raw) > 0 {
 		merged, renderErr := pve.RenderSentinel(strings.TrimSpace(description), raw)
 		if renderErr != nil {
-			logger.Warn("set_vm_metadata: could not re-render description sentinel; sentinel not preserved",
-				log.Err(renderErr),
-			)
+			return cpierrors.Cloud("set_vm_metadata: cannot preserve existing description sentinel")
 		} else {
 			description = merged
 		}
+	}
+
+	var markerErr error
+	description, markerErr = preserveVMAllocationMarker(existingDesc, description)
+	if markerErr != nil {
+		return markerErr
 	}
 
 	preserved := stripReservedBoshTags(existingTags)
@@ -344,4 +356,32 @@ func buildBoshManagedTags(metadata map[string]any) []string {
 		}
 	}
 	return parts
+}
+
+// preserveVMAllocationMarker keeps allocation provenance ahead of the shared
+// BOSH sentinel while metadata replaces the human-readable description.
+func preserveVMAllocationMarker(existing, description string) (string, error) {
+	if _, found, err := pve.ParseStorageAllocationMarker(description); err != nil || found {
+		return "", cpierrors.Cloud("set_vm_metadata: metadata contains reserved allocation provenance")
+	}
+	marker, found, err := pve.ParseStorageAllocationMarker(existing)
+	if err != nil {
+		return "", cpierrors.Cloud("set_vm_metadata: existing allocation provenance is malformed")
+	}
+	if !found {
+		return description, nil
+	}
+	if strings.Count(existing, "<!--BOSH:") > 1 {
+		return "", cpierrors.Cloud("set_vm_metadata: existing description sentinel is ambiguous")
+	}
+	if strings.Contains(existing, "<!--BOSH:") {
+		if _, raw := pve.ParseSentinel(existing); len(raw) == 0 {
+			return "", cpierrors.Cloud("set_vm_metadata: existing description sentinel is malformed")
+		}
+	}
+	encoded, err := pve.FormatStorageAllocationMarker(marker)
+	if err != nil {
+		return "", cpierrors.Cloud("set_vm_metadata: cannot preserve allocation provenance")
+	}
+	return encoded + description, nil
 }

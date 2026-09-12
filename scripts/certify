@@ -110,6 +110,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import _checkouts  # noqa: E402
+import _release_artifact
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
 import _rundoc  # noqa: E402
@@ -535,6 +536,8 @@ def write_run_doc(
     pre_timings.append("|---|---|---|")
     pre_timings.append(
         f"| CPI release | {_md_escape(meta['old_cpi'])} | {_md_escape(meta['new_cpi'])} |"
+        f"\n| CPI artifact version | {_md_escape(str(meta.get('old_cpi_artifact_version', 'unresolved')))} | {_md_escape(str(meta.get('new_cpi_artifact_version', 'unresolved')))} |"
+        f"\n| CPI SHA256 | {_md_escape(str(meta.get('old_cpi_sha256', 'unresolved')))} | {_md_escape(str(meta.get('new_cpi_sha256', 'unresolved')))} |"
     )
     pre_timings.append(
         f"| bosh release | {_md_escape(meta['old_bosh'])} | {_md_escape(meta['new_bosh'])} |"
@@ -1400,6 +1403,8 @@ class Certify:
         return True
 
     def _run_meta(self, run_ok: bool) -> dict:
+        old_artifact = _release_artifact.report_identity(self.old_cpi_path)
+        new_artifact = _release_artifact.report_identity(self.new_cpi_path)
         totals = {PASS: 0, FAIL: 0, "SKIP": 0}
         for r in self.rep.results:
             totals[r.status] = totals.get(r.status, 0) + 1
@@ -1418,6 +1423,11 @@ class Certify:
             "steps_skipped": totals.get("SKIP", 0),
             "old_cpi": self.old_cpi_label or self.args.old_cpi,
             "new_cpi": self.new_cpi_label or self.args.new_cpi,
+            "old_cpi_artifact_version": old_artifact["version"],
+            "new_cpi_artifact_version": new_artifact["version"],
+            "old_cpi_sha256": old_artifact["sha256"],
+            "new_cpi_sha256": new_artifact["sha256"],
+            "candidate_source_commit": os.environ.get("PVE_CPI_RELEASE_COMMIT", "unknown"),
             "matrix_source": (
                 "N-1 to N of the published releases"
                 if getattr(self.args, "auto_matrix", False) else "pinned"

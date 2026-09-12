@@ -148,6 +148,19 @@ build_props() {
       ' "$pw" "$tok"
 }
 
+# Storage-placement round-trip fixture consumed by Go integration tests.
+# The normal smoke-test invocation still exercises the original three cases.
+if [ "${1:-}" = "--storage-placement-fixture" ]; then
+  fixture_base="$(build_props 'fixture-password' '')"
+  fixture_props="$(printf '%s' "$fixture_base" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    h["pve"].merge!(JSON.parse(ARGV[0]))
+    print h.inspect
+  ' "$2")"
+  render "$fixture_props"
+  exit 0
+fi
+
 FAILED=0
 
 # --- Case 1: password-only ---------------------------------------------------
@@ -173,6 +186,14 @@ JSON_3="$(render "$PROPS_3")"
 assert_json_valid   "case3" "$JSON_3"             || FAILED=$((FAILED+1))
 assert_json_has_key "case3" "$JSON_3" password    || FAILED=$((FAILED+1))
 assert_json_has_key "case3" "$JSON_3" api_token   || FAILED=$((FAILED+1))
+
+# Omitted new placement properties must not alter legacy JSON.
+for key in storage_sets storage_capacity_domains ephemeral_storage_set \
+  persistent_storage_set root_storage_set storage_placement_namespace \
+  storage_allocation_journal_dir require_disjoint_storage_sets \
+  storage_status_max_age_seconds; do
+  assert_json_lacks_key "legacy-placement" "$JSON_1" "$key" || FAILED=$((FAILED+1))
+done
 
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2

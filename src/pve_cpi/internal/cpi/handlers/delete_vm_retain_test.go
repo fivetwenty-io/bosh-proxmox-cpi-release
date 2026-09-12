@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -172,119 +174,59 @@ func TestDetachRetainedEphemeralDisk_NoFlag(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestDetachRetainedEphemeralDisk_Happy: tag present, ephemeral slot found,
-// unlink demotes to unusedN, sweep removes the unusedN config entry, returned
-// retained=true signals the caller to set DestroyUnreferencedDisks=false.
-//
-// Two-read sequence models PVE's demotion behaviour:
-//   Read 1: scsi1 = ephemeral volid + bosh-retain-ephemeral tag.
-//   Unlink: recorded; scsi1 becomes unused0.
-//   Read 2: config has unused0 = ephemeral volid; scsi1 is gone.
-//   Config Delete: "unused0" removed from config; storage untouched.
-// ---------------------------------------------------------------------------
-
+// Retention must reassign the physical volume and verify its receiving parker.
 func TestDetachRetainedEphemeralDisk_Happy(t *testing.T) {
-	t.Parallel()
-
-	const vmid = 101
-	const ephemeralVolid = "zfs-1:vm-101-ephemeral-0"
-	const ephemeralOptStr = "zfs-1:vm-101-ephemeral-0,size=10G"
-
-	initCfg := map[string]any{
-		"virtio0":   "zfs-1:vm-101-disk-0",
-		"scsi1":     ephemeralOptStr,
-		jsonKeyTags: "bosh-cpi;bosh-retain-ephemeral",
+	deps, client, volume := legacyRetainFlowFixture(t)
+	retained, err := detachRetainedEphemeralDisk(context.Background(), deps, "n1", "777", 777, log.NewNopLogger())
+	if err != nil || !retained {
+		t.Fatalf("retention failed: %v", err)
 	}
-	postUnlinkCfg := map[string]any{
-		"virtio0": "zfs-1:vm-101-disk-0",
-		"unused0": ephemeralVolid,
+	if client.moves != 1 || len(client.state.volumes) != 1 || client.state.volumes[volume] != nil {
+		t.Fatal("ephemeral was not physically preserved by reassignment")
 	}
-
-	q := &retainQEMU{configs: []map[string]any{initCfg, postUnlinkCfg}}
-	n := &retainNodes{}
-
-	retained, err := detachRetainedEphemeralDisk(context.Background(), retainDeps(q, n), "pve-node1", "101", vmid, log.NewNopLogger())
-	if err != nil {
-		t.Fatalf("expected nil error, got: %v", err)
+	for _, info := range client.state.volumes {
+		if info.Size != 5<<30 {
+			t.Fatal("retention lost volume contents/size")
+		}
 	}
-	if !retained {
-		t.Error("retained must be true when ephemeral disk was unlinked and swept")
+	if _, err := detachRetainedEphemeralDisk(context.Background(), deps, "n1", "777", 777, log.NewNopLogger()); err != nil {
+		t.Fatal(err)
 	}
-
-	if len(n.unlinkCalls) != 1 {
-		t.Fatalf("want 1 Unlink call, got %d", len(n.unlinkCalls))
-	}
-	if n.unlinkCalls[0].Idlist != "scsi1" {
-		t.Errorf("Unlink: want Idlist=%q, got %q", "scsi1", n.unlinkCalls[0].Idlist)
-	}
-	if n.unlinkCalls[0].Force != nil && *n.unlinkCalls[0].Force {
-		t.Error("Unlink: Force must be nil/false; true would destroy the volume")
-	}
-
-	if len(n.configCalls) != 1 {
-		t.Fatalf("want 1 UpdateQemuConfig Delete call, got %d", len(n.configCalls))
-	}
-	if n.configCalls[0] != "unused0" {
-		t.Errorf("UpdateQemuConfig Delete: want %q, got %q", "unused0", n.configCalls[0])
+	if client.moves != 1 {
+		t.Fatal("retry duplicated retention transfer")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestDetachRetainedEphemeralDisk_UnlinkFails: Unlink returns error → retriable.
-// ---------------------------------------------------------------------------
-
+// Missing source evidence prevents retention mutations.
 func TestDetachRetainedEphemeralDisk_UnlinkFails(t *testing.T) {
-	t.Parallel()
-
-	const vmid = 101
-	initCfg := map[string]any{
-		"scsi1":     "zfs-1:vm-101-ephemeral-0,size=10G",
-		jsonKeyTags: "bosh-retain-ephemeral",
+	deps, client, volume := legacyRetainFlowFixture(t)
+	delete(client.state.volumes, volume)
+	if _, err := detachRetainedEphemeralDisk(context.Background(), deps, "n1", "777", 777, log.NewNopLogger()); err == nil {
+		t.Fatal("missing physical source was accepted")
 	}
-
-	q := &retainQEMU{configs: []map[string]any{initCfg}}
-	n := &retainNodes{unlinkErr: errRetainTest("pve: lock timeout")}
-
-	_, err := detachRetainedEphemeralDisk(context.Background(), retainDeps(q, n), "pve-node1", "101", vmid, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("expected error when Unlink fails, got nil")
-	}
-	type retriableChecker interface{ OkToRetry() bool }
-	if rc, ok := err.(retriableChecker); !ok || !rc.OkToRetry() {
-		t.Errorf("error must be retriable; got: %v (type %T)", err, err)
-	}
-	// No sweep call must have been made.
-	if len(n.configCalls) != 0 {
-		t.Errorf("expected no sweep calls after Unlink failure, got %d", len(n.configCalls))
+	if client.moves != 0 {
+		t.Fatal("missing volume triggered mutation")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestDetachRetainedEphemeralDisk_SweepFails: Unlink ok, sweep returns error → retriable.
-// ---------------------------------------------------------------------------
-
+// Interrupted retention keeps the original volume and resumes its durable intent.
 func TestDetachRetainedEphemeralDisk_SweepFails(t *testing.T) {
-	t.Parallel()
-
-	const vmid = 101
-	initCfg := map[string]any{
-		"scsi1":     "zfs-1:vm-101-ephemeral-0,size=10G",
-		jsonKeyTags: "bosh-retain-ephemeral",
+	deps, client, volume := legacyRetainFlowFixture(t)
+	client.moveErr = errors.New("transfer refused")
+	if _, err := detachRetainedEphemeralDisk(context.Background(), deps, "n1", "777", 777, log.NewNopLogger()); err == nil {
+		t.Fatal("failed retention transfer reported success")
 	}
-	postUnlinkCfg := map[string]any{
-		"unused0": "zfs-1:vm-101-ephemeral-0",
+	if client.state.volumes[volume] == nil {
+		t.Fatal("failed transfer swept the VM-owned volume")
 	}
-
-	q := &retainQEMU{configs: []map[string]any{initCfg, postUnlinkCfg}}
-	n := &retainNodes{configDelErr: errRetainTest("pve: storage lock")}
-
-	_, err := detachRetainedEphemeralDisk(context.Background(), retainDeps(q, n), "pve-node1", "101", vmid, log.NewNopLogger())
-	if err == nil {
-		t.Fatal("expected error when sweep fails, got nil")
+	client.moveErr = nil
+	if _, err := detachRetainedEphemeralDisk(context.Background(), deps, "n1", "777", 777, log.NewNopLogger()); err != nil {
+		t.Fatal(err)
 	}
-	type retriableChecker interface{ OkToRetry() bool }
-	if rc, ok := err.(retriableChecker); !ok || !rc.OkToRetry() {
-		t.Errorf("error must be retriable; got: %v (type %T)", err, err)
+	if client.moves != 1 || len(client.state.volumes) != 1 {
+		t.Fatal("interrupted retention did not resume exactly once")
 	}
 }
 
@@ -424,6 +366,17 @@ func TestForeignDiskAlreadyPreserved_ForeignGuardFires(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // errRetainTest is a plain error for retain-path test cases.
-type errRetainTest string
 
-func (e errRetainTest) Error() string { return string(e) }
+func legacyRetainFlowFixture(t *testing.T) (Deps, *lifecycleFlowPVE, string) {
+	t.Helper()
+	deps, client, _, _, _ := lifecycleFlowFixture(t)
+	original := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
+	volume := "a:vm-777-ephemeral-0"
+	client.state.volumes[volume] = client.state.volumes[original]
+	delete(client.state.volumes, original)
+	client.state.configs[777]["scsi1"] = volume + ",size=5G"
+	client.state.configs[777]["tags"] = tagRetainEphemeral
+	deps.Config.StoragePlacementNamespace = ""
+	deps.Config.StorageAllocationJournalDir = ""
+	return deps, client, volume
+}

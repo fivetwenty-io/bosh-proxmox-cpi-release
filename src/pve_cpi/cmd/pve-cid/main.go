@@ -110,6 +110,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runDecode(args[1:], stdout, stderr)
 	case "encode":
 		return runEncode(args[1:], stdout, stderr)
+	case "storage-plan":
+		return runStoragePlan(args[1:], stdout, stderr)
 	case "locate":
 		return runLocate(args[1:], stdout, stderr)
 	case "stemcells":
@@ -128,6 +130,7 @@ Usage:
   pve-cid decode <cid> [--json]
   pve-cid encode --volid <storage:path> [--pool P] [--node N] [--az Z] [--opt k=v ...] [--compress] [--json]
   pve-cid locate <cid|volid> [--config PATH] [--json]
+  pve-cid storage-plan --request PATH [--config PATH] [--json]
   pve-cid stemcells [--storage ID] [--node N] [--orphans] [--config PATH] [--json]
   pve-cid version
   pve-cid help

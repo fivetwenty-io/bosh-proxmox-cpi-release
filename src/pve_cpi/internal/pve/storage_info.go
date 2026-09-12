@@ -28,14 +28,15 @@ import (
 // for nfs, Server+Export (populated from the "share" field) for cifs. They
 // are used only by BackingKey — nothing else in this struct depends on them.
 type StorageInfo struct {
-	Name    string
-	Type    string
-	Shared  bool
-	Nodes   []string
-	Path    string
-	Server  string
-	Export  string
-	Content string
+	Name     string
+	Type     string
+	Shared   bool
+	Disabled bool
+	Nodes    []string
+	Path     string
+	Server   string
+	Export   string
+	Content  string
 }
 
 // IsShared classifies the storage as "shared" (cluster-visible) or "local"
@@ -561,6 +562,7 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 	var v struct {
 		Storage string             `json:"storage"`
 		Type    string             `json:"type"`
+		Disable json.RawMessage    `json:"disable,omitempty"`
 		Shared  *sdkclient.PVEBool `json:"shared,omitempty"`
 		Nodes   string             `json:"nodes,omitempty"`
 		Path    string             `json:"path,omitempty"`
@@ -582,6 +584,16 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 		Path:    v.Path,
 		Server:  v.Server,
 		Content: v.Content,
+	}
+	if len(v.Disable) > 0 {
+		switch strings.TrimSpace(string(v.Disable)) {
+		case "true", "1", "\"1\"":
+			info.Disabled = true
+		case "false", "0", "\"0\"":
+			info.Disabled = false
+		default:
+			return StorageInfo{}, fmt.Errorf("storage_info: disable must be boolean or exact 0/1")
+		}
 	}
 	if v.Shared != nil && v.Shared.Bool() {
 		info.Shared = true

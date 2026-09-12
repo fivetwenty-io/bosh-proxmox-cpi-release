@@ -47,3 +47,9 @@ PVE exposes `scsi0` through `scsi30` (31 slots). The CPI reserves slots as follo
 - [Architecture overview](architecture.md)
 - [DLB-Aware Placement](dlb-aware-placement.md)
 - [Operations — ConfigDrive ISO storage](operations.md#configdrive-iso-storage)
+
+## ConfigDrive with storage sets
+
+Set-managed VM planning includes the fixed 10 MiB ConfigDrive allocation and verifies that its target supports ISO content. An explicit `iso_storage` remains an infrastructure choice. When the original ISO policy permits following VM storage, the selected root target must satisfy the ISO requirements. Every permitted HA node must reach the planned ISO store.
+
+The CPI records upload and attachment evidence with the VM allocation. An uncertain upload retains that evidence for reconciliation. See [multi-storage placement](multi-storage-placement.md) for the role bindings and [journal provisioning](storage-journal-provisioning.md) for durable storage requirements.

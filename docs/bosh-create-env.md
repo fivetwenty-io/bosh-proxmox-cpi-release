@@ -359,3 +359,9 @@ Add `manifests/bosh/vars.yml`, `manifests/bosh/state.json`, `manifests/bosh/cred
 - Upstream ops library: <https://github.com/cloudfoundry/bosh-deployment>
 - Release source: this repository, see `README.md` for configuration properties.
 - Persistent disks (shared vs local PVE storages, cloud_properties): [`persistent-disks.md`](./persistent-disks.md).
+
+## Storage sets during create-env
+
+A set-managed create-env invocation needs an enrolled journal on the machine running the CPI. Choose a durable absolute path outside the temporary CPI installation and retain it with the create-env state. The Director's CPI has a separate execution environment, so configure its durable mount and authority as described in [journal provisioning](storage-journal-provisioning.md).
+
+Use [multi-storage placement](multi-storage-placement.md) for the storage-set properties. Preserve each namespace and its journal across upgrades, retries, and teardown reconciliation.

@@ -4,6 +4,7 @@ name: pve_cpi
 description: "BOSH Cloud Provider Interface for Proxmox VE"
 
 templates:
+  pre-start.erb: bin/pre-start
   cpi.erb: bin/cpi
   cpi.json.erb: config/cpi.json
 
@@ -1857,6 +1858,61 @@ properties:
       no tier matching runs and storage is chosen by the existing vm_storage /
       disk_storage config fields.
     default: {}
+
+  pve.storage_sets:
+    description: |
+      Optional named shared-NFS storage sets. Each value requires exactly one
+      nonempty names list or Go RE2 name_pattern, and strategy {name, version}.
+      Supported strategies are spread, weighted_free_space, and least_utilized,
+      version 1. Optional types must be [nfs] and shared must be true. encrypted
+      is an operator assertion. min_free_mb is a nonnegative integer in MiB;
+      max_utilization_pct is an integer from 1 through 100. Unknown keys and
+      null values are rejected. Defining an unused set does not enable placement.
+
+  pve.storage_capacity_domains:
+    description: |
+      Optional map of shared capacity budgets. Each value has a nonempty
+      members list of literal PVE storage IDs. A backing may belong to only
+      one domain. Inventory resolution validates existence and backing aliases.
+
+  pve.ephemeral_storage_set:
+    description: |
+      Optional named set defining the default and boundary for new VM root and
+      dedicated ephemeral disks, co-located unless a role selector splits them.
+
+  pve.persistent_storage_set:
+    description: |
+      Optional named set defining the default and boundary for every new
+      persistent disk, including creation without a VM hint.
+
+  pve.root_storage_set:
+    description: |
+      Optional separate root default and boundary. When absent, root inherits
+      ephemeral_storage_set. Defining this separates root and ephemeral selection.
+
+  pve.storage_placement_namespace:
+    description: |
+      Stable nonblank allocation authority required for set-enabled allocation.
+      Keep it unchanged across process restarts and API endpoint alias changes.
+
+  pve.storage_allocation_journal_dir:
+    description: |
+      Absolute durable directory required for set-enabled allocation. Use
+      /var/vcap/store/pve_cpi/allocations on a Director persistent disk; create-env
+      must supply a durable local path. This process-level setting cannot be
+      redirected by request context. Runtime validation checks access and locking.
+
+  pve.require_disjoint_storage_sets:
+    description: |
+      Optional boolean requiring persistent and VM-lifetime boundaries to use
+      different backings. Defaults to true when both global persistent and
+      ephemeral bindings exist. Explicit false permits deliberate overlap with
+      combined capacity accounting.
+
+  pve.storage_status_max_age_seconds:
+    description: |
+      Maximum age of storage admission observations, as an integer from 1
+      through 60 seconds. Defaults to 5 when omitted. Explicit zero is invalid.
 
   pve.security_groups:
     description: |

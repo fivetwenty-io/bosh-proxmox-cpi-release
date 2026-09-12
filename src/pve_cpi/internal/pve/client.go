@@ -89,6 +89,7 @@ type Client interface {
 
 // sdkClient is the concrete implementation returned by NewClient.
 type sdkClient struct {
+	auditReader       auditPermissionGetter
 	qemuSvc           qemu.Service
 	storageSvc        storage.Service
 	cloudInitSvc      cloudinit.Service
@@ -464,8 +465,8 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	qemuSvc := qemu.New(raw)
 	storageSvc := storage.New(raw)
 	tasksSvc := tasks.New(raw)
-	nodesSvc := nodes.New(raw)
-	clusterSvc := cluster.New(raw)
+	var nodesSvc nodes.Service = &strictStorageContentNodes{Service: nodes.New(raw), reader: raw}
+	var clusterSvc cluster.Service = &strictHAResourcesCluster{Service: cluster.New(raw), reader: raw}
 	clusterStorageSvc := clusterstorage.New(raw)
 	var poolsSvc PoolService = &sdkPoolService{svc: pools.New(raw)}
 	// cloudInitSvc is never decorated: the call-surface audit (see tracing.go)
@@ -484,7 +485,7 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	}
 
 	return &sdkClient{
-		qemuSvc:           qemuSvc,
+		auditReader: raw, qemuSvc: qemuSvc,
 		storageSvc:        storageSvc,
 		cloudInitSvc:      cloudInitSvc,
 		tasksSvc:          tasksSvc,

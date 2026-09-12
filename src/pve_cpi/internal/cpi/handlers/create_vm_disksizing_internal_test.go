@@ -690,8 +690,10 @@ func TestAttachEphemeralDisk_Success(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	devPath, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
@@ -732,8 +734,10 @@ func TestAttachEphemeralDisk_NextFreeSlot(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	devPath, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 102)
@@ -766,6 +770,8 @@ func TestAttachEphemeralDisk_CreateFail_NoOrphan(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
 	}
 
@@ -808,8 +814,10 @@ func TestAttachEphemeralDisk_AttachFail_OrphanCleanup(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
@@ -868,8 +876,10 @@ func TestAttachEphemeralDisk_OrphanCleanup_AwaitsDeleteUPID(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
@@ -923,8 +933,10 @@ func TestAttachEphemeralDisk_OrphanCleanup_AwaitFailureLoggedNotFatal(t *testing
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
@@ -962,8 +974,10 @@ func TestAttachEphemeralDisk_ConfigReadFail_OrphanCleanup(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)
@@ -1008,8 +1022,10 @@ func TestAttachEphemeralDisk_ScsiSlotExhausted(t *testing.T) {
 	shape := &createVMShape{
 		node:             "pve",
 		ephemeralDiskGiB: 4,
+		vmStorage:        "local-lvm",
+		vmStorageType:    "lvmthin",
 		ephemeralStorage: "local-lvm",
-		vmDiskFormat:     "qcow2",
+		vmDiskFormat:     "raw",
 	}
 
 	_, err := attachEphemeralDisk(context.Background(), deps, log.NewNopLogger(), shape, 101)

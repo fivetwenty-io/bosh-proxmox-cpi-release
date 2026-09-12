@@ -74,6 +74,7 @@ func StableIDFromDriveOptStr(optStr string) (string, bool) {
 // anywhere in the transfer window always leaves at least one carrier of the
 // disk's identity (the write ordering D13 specifies).
 type DiskTransferIntent struct {
+	AllocationID, AllocationNamespace, AllocationBacking string
 	// ParkerVMID and ParkerNode identify the parker carrying the record.
 	ParkerVMID int
 	ParkerNode string
@@ -228,6 +229,7 @@ func findParkedDiskIntentByStableID(
 			continue
 		}
 		return DiskTransferIntent{
+			AllocationID: entry.AllocationID, AllocationNamespace: entry.AllocationNamespace, AllocationBacking: entry.AllocationBacking,
 			ParkerVMID:  p.vmid,
 			ParkerNode:  p.node,
 			Slot:        entry.Slot,

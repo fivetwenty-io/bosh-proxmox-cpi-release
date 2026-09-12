@@ -758,6 +758,16 @@
   storage_tiers = p("pve.storage_tiers", {})
   config["storage_tiers"] = storage_tiers unless storage_tiers.nil? || storage_tiers.empty?
 
+  # Storage placement preserves presence, false, zero, and invalid null values
+  # for the strict Go decoder. Properties have no BOSH defaults, so absent
+  # values leave legacy JSON unchanged. Do not coerce malformed values here.
+  %w[storage_sets storage_capacity_domains ephemeral_storage_set
+     persistent_storage_set root_storage_set storage_placement_namespace
+     storage_allocation_journal_dir require_disjoint_storage_sets
+     storage_status_max_age_seconds].each do |key|
+    if_p("pve.#{key}") { |value| config[key] = value }
+  end
+
   # Emit security_groups only when the operator supplies a non-empty list. When
   # absent or empty (the default []), the key is omitted so the Go config
   # zero-value (nil slice) is preserved and no global firewall groups are applied.

@@ -199,3 +199,9 @@ A multi-CPI CF deployment spreading instance groups across AZs bound to differen
 - [Design Decisions](design-decisions.md) — the full rationale behind D9 (cross-cluster delete safety) and D10 (qcow2 deletion policy) referenced throughout this document.
 - [Operations Runbook](operations.md) — stemcell lifecycle across directors and safe teardown ordering for multi-director environments.
 - [Configuration](configuration.md) — the complete `pve.*` property reference.
+
+## Storage-set authorities across clusters
+
+Give each cluster context its own stable `pve_storage_placement_namespace`. Context storage-set and capacity-domain maps replace the corresponding maps as a whole. The journal directory belongs to process configuration and cannot be redirected through a request context.
+
+The CPI checks cluster continuity using the PVE root CA identity observed on the relevant nodes. Alternate API hostnames for the same cluster retain that identity. A different cluster or changed CA requires authority reconciliation. Follow [multi-storage placement](multi-storage-placement.md) and [journal provisioning](storage-journal-provisioning.md) when defining each context.

@@ -363,3 +363,9 @@ and configuration details.
 - **Shrink not supported.** PVE's resize endpoint is additive only; requesting a smaller size returns `NotSupported`. Enable `pve.resize_wait_for_convergence` to poll until the guest filesystem reports the new size after an additive resize.
 
 Refer to [configuration.md](configuration.md) for the full property reference.
+
+## Persistent storage sets
+
+The `storage_set` disk cloud property selects a named shared NFS set. A global `persistent_storage_set` supplies both the default and the allowed boundary. Use a subset with one member to pin a disk type, or a subset with several members to distribute new disks. See [multi-storage placement](multi-storage-placement.md) for both configurations.
+
+Set placement preserves the existing free and parked CID modes. Removing a store from a set does not relocate its disks. Lifecycle operations use actual volume identity and retained provenance; keep the journal and historical backing available for reconciliation.

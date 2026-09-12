@@ -26,7 +26,9 @@ type NodesClient interface {
 	ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
 }
 
-// clusterStatusItem is the typed shape of each entry in GET /cluster/status.
+// clusterStatusItem carries membership from GET /cluster/status. Resource
+// counters come from GET /cluster/resources; optional status counters remain
+// compatible with older API fixtures and are overridden by resource observations.
 // The scalar fields use the SDK's tolerant types because PVE renders "online"
 // as the integer 1/0 and has returned the counters as strings on some
 // versions; a plain int64 or float64 would reject the row and silently drop
@@ -46,11 +48,14 @@ type clusterStatusItem struct {
 // Exported so callers with an existing []json.RawMessage can decode without
 // re-issuing the API call.
 type NodeResource struct {
-	Type   string           `json:"type"`
-	Node   string           `json:"node"`
-	Name   string           `json:"name"`   // VM name; used for group tag matching
-	Tags   string           `json:"tags"`   // space-separated PVE tags
-	Maxmem sdkclient.PVEInt `json:"maxmem"` // configured (reserved) memory in bytes; 0 when absent
+	Type   string             `json:"type"`
+	Node   string             `json:"node"`
+	Name   string             `json:"name"`   // VM name; used for group tag matching
+	Tags   string             `json:"tags"`   // space-separated PVE tags
+	Maxmem sdkclient.PVEInt   `json:"maxmem"` // configured guest memory or total node memory
+	Maxcpu sdkclient.PVEInt   `json:"maxcpu"`
+	Mem    sdkclient.PVEInt   `json:"mem"`
+	CPU    sdkclient.PVEFloat `json:"cpu"`
 }
 
 // clusterResourceItem is an internal alias kept for backward compatibility
@@ -107,13 +112,13 @@ type GatherOptions struct {
 }
 
 // GatherNodeFacts assembles NodeFacts for every node reported by the PVE cluster.
-// It makes three API calls (plus an optional fourth):
-//  1. ListStatus — node online/offline, CPU, memory, tags.
-//  2. ListResources — guest count, BOSH group tag, and committed (reserved)
-//     memory per node (non-fatal on error).
-//  3. Per-node ListStorage — available storage bytes (non-fatal on error per node).
-//  4. ListHaStatusCurrent — HA maintenance state per node (non-fatal, only when
-//     opts.ExcludeMaintenanceNodes is true).
+// It observes the following APIs:
+//  1. ListStatus provides node membership, online state, and tags.
+//  2. ListResources provides node CPU and memory counters, guest counts, BOSH
+//     group tags, and committed guest memory (non-fatal on error).
+//  3. Per-node ListStorage provides available storage bytes (non-fatal on error).
+//  4. ListHaStatusCurrent provides HA maintenance state when
+//     opts.ExcludeMaintenanceNodes is true (non-fatal on error).
 //
 // A ListResources error is non-fatal: GatherNodeFacts logs a warning and continues
 // with GuestCount=0, SameGroupCount=0, and CommittedMemBytes=0 for all nodes.
@@ -134,7 +139,7 @@ func GatherNodeFacts(
 	logger *log.Logger,
 	opts GatherOptions,
 ) ([]NodeFacts, error) {
-	// Phase 1: cluster status (node online/CPU/mem/tags).
+	// Phase 1: cluster membership (node online state and tags).
 	statusResp, err := clusterClient.ListStatus(ctx)
 	if err != nil {
 		return nil, err
@@ -169,9 +174,9 @@ func GatherNodeFacts(
 		maintenanceNodes = gatherHAMaintenanceNodes(ctx, clusterClient, logger)
 	}
 
-	// Phase 2: ListResources for guest count, group tags, and committed memory
-	// (non-fatal).
-	guestCounts, sameGroupCounts, committedMem := gatherGuestCounts(ctx, clusterClient, logger, opts.GroupTag)
+	// Phase 2: node compute counters, guest count, group tags, and committed
+	// memory from ListResources (non-fatal).
+	guestCounts, sameGroupCounts, committedMem, nodeResources := gatherResourceFacts(ctx, clusterClient, logger, opts.GroupTag)
 
 	// Phase 3: per-node storage query (non-fatal per node).
 	storageAvail, storageTotal := gatherStorageFacts(ctx, nodesClient, logger, nodeItems, opts.StorageName)
@@ -180,6 +185,9 @@ func GatherNodeFacts(
 	facts := make([]NodeFacts, 0, len(nodeItems))
 	for _, item := range nodeItems {
 		nodeName := item.Name
+		if resource, ok := nodeResources[nodeName]; ok {
+			item.Maxcpu, item.Maxmem, item.Mem, item.CPU = resource.Maxcpu, resource.Maxmem, resource.Mem, resource.CPU
+		}
 
 		// Determine maintenance status: HA state OR operator node tag (union).
 		inMaintenance := false
@@ -269,10 +277,10 @@ func gatherHAMaintenanceNodes(
 	return result
 }
 
-// gatherGuestCounts calls ListResources and tallies, per node: QEMU guest
-// count, same-group count, and total committed (reserved) memory in bytes.
-// Errors are non-fatal: on failure all three maps are returned empty (all
-// nodes get GuestCount=0 / SameGroupCount=0 / CommittedMemBytes=0).
+// gatherResourceFacts reads node compute counters and tallies QEMU guest
+// count, same-group count, and committed memory from one resource observation.
+// Errors are non-fatal. On failure all maps are empty; nodes retain any
+// available status counters and have no observed guest reservations.
 //
 // Committed memory sums each qemu resource's Maxmem regardless of the guest's
 // run state — cluster/resources reports Maxmem from the guest's configuration,
@@ -281,25 +289,33 @@ func gatherHAMaintenanceNodes(
 // from the API response decodes to the Go zero value (0) and is added as-is
 // (fail-open: the guest still counts toward GuestCount/SameGroupCount above,
 // it just contributes nothing to CommittedMemBytes).
-func gatherGuestCounts(
+func gatherResourceFacts(
 	ctx context.Context,
 	clusterClient ClusterClient,
 	logger *log.Logger,
 	groupTag string,
-) (guestCounts map[string]int, sameGroupCounts map[string]int, committedMem map[string]int64) {
+) (guestCounts map[string]int, sameGroupCounts map[string]int, committedMem map[string]int64, nodeResources map[string]NodeResource) {
 	guestCounts = make(map[string]int)
 	sameGroupCounts = make(map[string]int)
 	committedMem = make(map[string]int64)
+	nodeResources = make(map[string]NodeResource)
 
 	resResp, resErr := clusterClient.ListResources(ctx, &cluster.ListResourcesParams{})
 	if resErr != nil {
 		logger.Warn("placement: ListResources failed — GuestCount=0 for all nodes",
 			log.Err(resErr))
-		return guestCounts, sameGroupCounts, committedMem
+		return guestCounts, sameGroupCounts, committedMem, nodeResources
+	}
+	if resResp == nil {
+		return guestCounts, sameGroupCounts, committedMem, nodeResources
 	}
 	for _, raw := range *resResp {
 		var ri clusterResourceItem
 		if parseErr := json.Unmarshal(raw, &ri); parseErr != nil {
+			continue
+		}
+		if ri.Type == "node" && ri.Node != "" {
+			nodeResources[ri.Node] = ri
 			continue
 		}
 		if ri.Type != "qemu" {
@@ -314,7 +330,7 @@ func gatherGuestCounts(
 		}
 		committedMem[ri.Node] += ri.Maxmem.Int()
 	}
-	return guestCounts, sameGroupCounts, committedMem
+	return guestCounts, sameGroupCounts, committedMem, nodeResources
 }
 
 // gatherStorageFacts queries per-node storage availability for storageName.

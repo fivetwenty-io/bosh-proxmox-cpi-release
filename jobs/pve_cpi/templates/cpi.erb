@@ -3,9 +3,13 @@ set -euo pipefail
 
 # Resolve paths relative to this script so the wrapper works for both
 # director VM installs (/var/vcap/...) and `bosh create-env` host installs
-# (~/.bosh/installations/<id>/...).
+# (~/.bosh/installations/<id>/...). BOSH create-env supplies its package
+# location explicitly, including when --package-dir relocates the cache.
 JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACKAGES_DIR="$(cd "${JOB_DIR}/../../packages" && pwd)"
+# Compute the installation parent lexically. Appending /../.. to a job
+# symlink would make the kernel resolve those parents inside data/jobs.
+INSTALL_DIR="$(dirname "$(dirname "${JOB_DIR}")")"
+PACKAGES_DIR="${BOSH_PACKAGES_DIR:-${INSTALL_DIR}/packages}"
 
 BIN="${PACKAGES_DIR}/pve_cpi/bin/cpi"
 

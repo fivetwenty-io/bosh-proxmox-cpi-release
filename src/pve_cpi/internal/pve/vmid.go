@@ -6,6 +6,7 @@ import (
 	"fmt"
 	mrand "math/rand/v2"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -504,6 +505,14 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 			continue
 		}
 		matches := volumeVMIDRegexp.FindStringSubmatch(target)
+		if len(matches) < 2 {
+			// Managed file volumes retain the allocation UUID in their name.
+			// Their VMID must remain reserved even before any VM references it.
+			filename := target[strings.LastIndexAny(target, "/:")+1:]
+			if managed := allocationVolume.FindStringSubmatch(filename); len(managed) >= 4 && allocationUUID.MatchString(managed[3]) {
+				matches = []string{target, managed[1]}
+			}
+		}
 		if len(matches) < 2 {
 			continue
 		}

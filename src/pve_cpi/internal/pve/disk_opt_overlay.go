@@ -316,7 +316,8 @@ func matchParkerOverlayEntry(disks map[string]parkerProvEntry, bareVolid, stable
 	if _, ok := disks[bareVolid]; ok {
 		return bareVolid, true
 	}
-	for key, entry := range disks {
+	for key := range disks {
+		entry := disks[key]
 		if entry.Volid == bareVolid {
 			return key, true
 		}

@@ -17,6 +17,18 @@ on:
     - cron: "30 2 * * 6"
   workflow_dispatch:
     inputs:
+      candidate_run_id:
+        description: "Completed build run containing a candidate CPI artifact (empty uses published releases)"
+        required: false
+        type: string
+      candidate_artifact:
+        description: "Artifact name containing exactly one CPI .tgz; required with candidate_run_id"
+        required: false
+        type: string
+      candidate_sha256:
+        description: "Expected candidate tarball SHA256; required for a candidate run"
+        required: false
+        type: string
       skip_certify:
         description: "Skip the upgrade certification (supervised first runs)"
         required: false
@@ -203,7 +215,48 @@ jobs:
             fi
           done
 
+      - name: Validate candidate selection
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${CANDIDATE_RUN_ID}${CANDIDATE_ARTIFACT}${CANDIDATE_SHA256}" ]]; then
+            [[ "${CANDIDATE_RUN_ID}" =~ ^[0-9]+$ ]]
+            [[ -n "${CANDIDATE_ARTIFACT}" ]]
+            [[ "${CANDIDATE_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]
+          fi
+
+      - name: Resolve candidate CPI artifact
+        if: ${{ inputs.candidate_run_id != '' }}
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+          CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          run_metadata="$(gh run view "${CANDIDATE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --json conclusion,status,workflowName,headSha)"
+          printf '%s' "${run_metadata}" | jq -e \
+            '.conclusion == "success" and .status == "completed" and .workflowName == "Candidate Release"' >/dev/null
+          candidate_dir="$(mktemp -d "${RUNNER_TEMP}/cpi-candidate.XXXXXX")"
+          gh run download "${CANDIDATE_RUN_ID}" --repo "${GITHUB_REPOSITORY}" \
+            --name "${CANDIDATE_ARTIFACT}" --dir "${candidate_dir}"
+          shopt -s globstar nullglob
+          candidates=("${candidate_dir}"/**/*.tgz)
+          [[ "${#candidates[@]}" -eq 1 ]]
+          python3 scripts/_release_artifact.py "${candidates[0]}" \
+            --sha256 "${CANDIDATE_SHA256}" --github-env "${GITHUB_ENV}"
+          source_commit="$(printf '%s' "${run_metadata}" | jq -r .headSha)"
+          [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          echo "PVE_CPI_RELEASE_COMMIT=${source_commit}" >> "${GITHUB_ENV}"
+          echo "PVE_CPI_CANDIDATE_RUN_ID=${CANDIDATE_RUN_ID}" >> "${GITHUB_ENV}"
+          old_spec="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+          echo "PVE_CPI_OLD_RELEASE_SPEC=${old_spec}" >> "${GITHUB_ENV}"
+
       - name: Resolve the latest published release
+        if: ${{ inputs.candidate_run_id == '' }}
         id: release
         run: |
           set -euo pipefail
@@ -227,7 +280,7 @@ jobs:
           # The director bootstrap and BATS both read this: create-env bakes
           # the CPI it points at, and the BATS report records its basename as
           # the director's CPI provenance.
-          echo "PVE_CPI_RELEASE_PATH=${GITHUB_WORKSPACE}/.deps/cpi-releases/${CPI_TARBALL}" >> "${GITHUB_ENV}"
+          python3 scripts/_release_artifact.py ".deps/cpi-releases/${CPI_TARBALL}" --github-env "${GITHUB_ENV}"
 
       - name: Upgrade certification (scripts/certify)
         if: ${{ !inputs.skip_certify }}
@@ -237,10 +290,14 @@ jobs:
         # the run must end with a free slot for the bootstrap below.
         run: |
           set -euo pipefail
+          cpi_args=()
+          if [[ -n "${PVE_CPI_CANDIDATE_RUN_ID:-}" ]]; then
+            cpi_args=(--old-cpi "${PVE_CPI_OLD_RELEASE_SPEC}" --new-cpi "${PVE_CPI_RELEASE_PATH}")
+          fi
           ./scripts/certify upgrade --env cpitest --force \
-            --headline-pass-fail-only --no-color
+            --headline-pass-fail-only --no-color "${cpi_args[@]}"
 
-      - name: Bootstrap director on the latest release
+      - name: Bootstrap director on the selected release
         timeout-minutes: 90
         # Minimal director bring-up (the emptyvm smoke and CF are out of
         # scope here: BATS itself is the acceptance check). net-up first —

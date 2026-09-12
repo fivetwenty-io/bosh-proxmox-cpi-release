@@ -1,0 +1,54 @@
+{
+  "vm_types": [
+    {
+      "name": "worker-spread",
+      "cloud_properties": {
+        "cpu": 4,
+        "ram": 8192,
+        "ephemeral_disk_size_mb": 51200,
+        "ephemeral_storage_set": "ephemeral-spread"
+      }
+    },
+    {
+      "name": "worker-weighted_free_space",
+      "cloud_properties": {
+        "cpu": 4,
+        "ram": 8192,
+        "ephemeral_disk_size_mb": 51200,
+        "ephemeral_storage_set": "ephemeral-weighted_free_space"
+      }
+    },
+    {
+      "name": "worker-least_utilized",
+      "cloud_properties": {
+        "cpu": 4,
+        "ram": 8192,
+        "ephemeral_disk_size_mb": 51200,
+        "ephemeral_storage_set": "ephemeral-least_utilized"
+      }
+    }
+  ],
+  "disk_types": [
+    {
+      "name": "database-spread",
+      "disk_size": 102400,
+      "cloud_properties": {
+        "storage_set": "persistent-spread"
+      }
+    },
+    {
+      "name": "database-weighted_free_space",
+      "disk_size": 102400,
+      "cloud_properties": {
+        "storage_set": "persistent-weighted_free_space"
+      }
+    },
+    {
+      "name": "database-least_utilized",
+      "disk_size": 102400,
+      "cloud_properties": {
+        "storage_set": "persistent-least_utilized"
+      }
+    }
+  ]
+}

@@ -1100,3 +1100,11 @@ Use these patterns to distinguish normal retry noise from actionable failures.
 | `"type":"Bosh::Clouds::VMCreationFailed","ok_to_retry":true` | Transient `create_vm` failure, director retries the create | No action unless retries routinely exhaust |
 | `"type":"Bosh::Clouds::CloudError","ok_to_retry":true` | Transient fault from a method the director does not retry | Retry the deploy; investigate if frequent |
 | `"type":"Bosh::Clouds::CloudError","ok_to_retry":false` | Terminal failure, operator action required | Read the `message` field and consult the relevant section above |
+
+## Multi-storage allocation requires reconciliation
+
+Use the allocation UUID in the error to inspect the retained journal and actual PVE resources. A missing task response does not establish that the mutation failed. Preserve its record, VM marker, disk provenance, and historical backing while reconciling the outcome.
+
+A changed caller request conflicts with an active VM generation. A changed global strategy alone does not create a replacement generation, while a restrictive boundary can block remaining mutations. Operating on an existing disk CID should not require restoring an unrelated set that is unavailable.
+
+If an audit reports incomplete visibility, check propagated `VM.Audit` and `Datastore.Audit` privileges, the image-access grants, and the ACL inventory access described in [PVE API permissions](pve-api-permissions.md#multi-storage-audit-visibility). A successful filtered listing cannot prove that historical resources are absent.

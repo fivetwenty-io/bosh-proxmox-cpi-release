@@ -144,7 +144,7 @@ func detachDiskResolveSlot(
 //
 // The disk volume is NOT deleted from storage; that is handled by delete_disk.
 func HandleDetachDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (result any, operationErr error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
@@ -152,24 +152,9 @@ func HandleDetachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 1. Unmarshal and validate arguments.
 		// --------------------------------------------------------------------
-		if len(args) < 2 {
-			return nil, cpierrors.Cloud("detach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
-		}
-
-		var vmCID string
-		if err := json.Unmarshal(args[0], &vmCID); err != nil {
-			return nil, cpierrors.Wrap(err, "detach_disk: args[0] vm_cid must be a string")
-		}
-		if vmCID == "" {
-			return nil, cpierrors.Cloud("detach_disk: args[0] vm_cid must not be empty")
-		}
-
-		var diskCID string
-		if err := json.Unmarshal(args[1], &diskCID); err != nil {
-			return nil, cpierrors.Wrap(err, "detach_disk: args[1] disk_cid must be a string")
-		}
-		if diskCID == "" {
-			return nil, cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
+		vmCID, diskCID, parseErr := detachDiskArguments(args)
+		if parseErr != nil {
+			return nil, parseErr
 		}
 		// Strip optional metadata suffix; PVE API and volid comparisons need
 		// the bare "<storage>:<volid>" form.
@@ -194,6 +179,14 @@ func HandleDetachDisk(deps Deps) Handler {
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "detach_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
+		}
+		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "detach_disk")
+		if lifecycleErr != nil {
+			return nil, lifecycleErr
+		}
+		if lifecycle != nil {
+			rd = lifecycle.disk
+			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 		if rd.stableID != "" {
 			return nil, handleDetachStableID(ctx, deps, vmCID, vmid, rd)
@@ -368,7 +361,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return retriableUnlessPermanent(ovErr,
 			fmt.Sprintf("detach_disk: read recorded option overrides for disk %s before transfer", rd.diskCID))
 	}
-	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay}
+	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay})
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerWriteConfigFor(deps), pctx)
 	if transferErr != nil {
 		if pve.IsMoveDiskSnapshotRefusal(transferErr) {
@@ -393,6 +386,14 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		}
 		return retriableUnlessPermanent(transferErr,
 			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
+	}
+	if err := verifyManagedDiskParked(ctx, deps, rd, landed); err != nil {
+		return err
+	}
+	if rd.allocation != nil {
+		if err := pve.RemoveDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), rd.allocation.provenance); err != nil {
+			return err
+		}
 	}
 	// Giving side's record last: the parker's provenance entry (the receiving
 	// side) was written before the source slot was touched, so the holder
@@ -420,12 +421,12 @@ func parkFreeFloatingStableID(ctx context.Context, deps Deps, rd resolvedDisk) e
 		}
 		return resolveErr
 	}
-	pctx := pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID}
+	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID})
 	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, rd.volid, parkerWriteConfigFor(deps), pctx); parkErr != nil {
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", rd.diskCID))
 	}
-	return nil
+	return verifyManagedDiskParked(ctx, deps, rd, rd.volid)
 }
 
 // handleAlreadyDetachedParked handles the alreadyDetached=true branch of
@@ -692,4 +693,27 @@ func sweepUnusedDiskSlot(
 		return true, nil
 	}
 	return false, nil
+}
+
+func detachDiskArguments(args []json.RawMessage) (string, string, error) {
+	if len(args) < 2 {
+		return "", "", cpierrors.Cloud("detach_disk: expected 2 arguments (vm_cid, disk_cid), got %d", len(args))
+	}
+
+	var vmCID string
+	if err := json.Unmarshal(args[0], &vmCID); err != nil {
+		return "", "", cpierrors.Wrap(err, "detach_disk: args[0] vm_cid must be a string")
+	}
+	if vmCID == "" {
+		return "", "", cpierrors.Cloud("detach_disk: args[0] vm_cid must not be empty")
+	}
+
+	var diskCID string
+	if err := json.Unmarshal(args[1], &diskCID); err != nil {
+		return "", "", cpierrors.Wrap(err, "detach_disk: args[1] disk_cid must be a string")
+	}
+	if diskCID == "" {
+		return "", "", cpierrors.Cloud("detach_disk: args[1] disk_cid must not be empty")
+	}
+	return vmCID, diskCID, nil
 }

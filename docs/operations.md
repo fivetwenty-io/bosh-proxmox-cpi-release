@@ -1106,3 +1106,9 @@ tail -100 /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
 grep '"method":"create_vm"' /var/vcap/sys/log/bosh/cpi/pve-metrics.jsonl \
   | jq -r '.duration_ms' | sort -n | awk 'END{print NR"th percentile:", $0}'
 ```
+
+## Storage allocation recovery
+
+Use the [storage journal runbook](storage-journal-operations.md) to enroll a namespace, inspect retained CIDs, restore authority, repair its index, and record adoption or completed cleanup. These commands require the durable journal and fresh PVE observations. An absent resource does not establish that an earlier task has finished.
+
+The existing opt-in metrics exporter includes `cpi.storage.allocations`, `cpi.storage.fallbacks`, `cpi.storage.rejections`, `cpi.storage.candidate_rejections`, and `cpi.storage.reconciliations`. Request rejection and candidate rejection are separate counters. Labels identify configured sets, roles, strategy versions, or fixed reconciliation outcomes; allocation IDs and backend error text are excluded.

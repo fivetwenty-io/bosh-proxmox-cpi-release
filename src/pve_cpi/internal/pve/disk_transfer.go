@@ -355,6 +355,9 @@ func TransferDiskToParker(
 	if node == "" || srcVMID <= 0 || bareVolid == "" {
 		return "", cpierrors.Cloud("TransferDiskToParker: node, source VMID, and volid are all required")
 	}
+	if actual, _, err := ParseDiskCID(bareVolid); err == nil {
+		cfg.DiskStorage = actual
+	}
 	if pctx.StableID == "" {
 		return "", cpierrors.Cloud("TransferDiskToParker: a stable ID is required; legacy disks park by config edit")
 	}
@@ -521,17 +524,23 @@ func transferIntoParkerLocked(
 			fmt.Sprintf("transfer in: re-apply serial on parker vmid %d slot %s", parkerVMID, slot))
 	}
 
-	// 7. Finalize the record with the landed volid. Best-effort: the serial
-	// is on the slot now, so the identity scan resolves the disk without it;
-	// a stale record only costs recovery a slot read.
+	// 7. Finalize the landed volume identity. Managed disks require durable
+	// full provenance and receiving-side readback before source cleanup.
+	// Legacy disks retain their serial-based best-effort behavior.
 	final := intent
 	final.Volid = landed
-	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil && logger != nil {
-		logger.Warn("transfer in: could not finalize the provenance record (non-fatal; the drive serial is authoritative)",
-			log.Int("parker_vmid", parkerVMID),
-			log.String("volid", landed),
-			log.Err(provErr),
-		)
+	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil {
+		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
+			return "", cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
+		}
+		if logger != nil {
+			logger.Warn("transfer in: could not finalize legacy provenance", log.Err(provErr))
+		}
+	}
+	if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
+		if err := VerifyAllocationParked(ctx, c, logger, landed, pctx.StableID, pctx.AllocationNamespace, pctx.AllocationID, cfg); err != nil {
+			return "", cpierrors.Cloud("managed transfer provenance readback requires reconciliation")
+		}
 	}
 	reassertParkerProtection(ctx, c, logger, node, parkerVMID)
 	if logger != nil {
@@ -575,11 +584,10 @@ func ResumeDiskTransferToParker(
 	if stableID == "" || intent.ParkerVMID <= 0 || intent.ParkerNode == "" {
 		return "", cpierrors.Cloud("ResumeDiskTransferToParker: stable ID and parker identity are required")
 	}
-	pctx.StableID = stableID
-	// The finalize rewrites the whole provenance entry from pctx, so a resume
-	// that omitted the recorded option overrides would silently drop them.
-	if len(pctx.Opts) == 0 {
-		pctx.Opts = intent.Opts
+	var contextErr error
+	pctx, cfg, contextErr = resumeDiskTransferContext(intent, stableID, cfg, pctx)
+	if contextErr != nil {
+		return "", contextErr
 	}
 
 	var landed string
@@ -602,8 +610,7 @@ func ResumeDiskTransferToParker(
 				bare = bare[:comma]
 			}
 			landed = bare
-			finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
-			return nil
+			return finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
 		}
 
 		// Window: the move never ran — the source VM still holds the volume
@@ -651,8 +658,7 @@ func ResumeDiskTransferToParker(
 						return serialErr
 					}
 					landed = bare
-					finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
-					return nil
+					return finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
 				}
 			}
 		}
@@ -668,8 +674,7 @@ func ResumeDiskTransferToParker(
 						return serialErr
 					}
 					landed = bare
-					finalizeResumedTransfer(wctx, c, logger, intent, stableID, intent.Slot, bare, cfg, pctx)
-					return nil
+					return finalizeResumedTransfer(wctx, c, logger, intent, stableID, intent.Slot, bare, cfg, pctx)
 				}
 			}
 		}
@@ -706,8 +711,7 @@ func ResumeDiskTransferToParker(
 					return attachErr
 				}
 				landed = intent.Volid
-				finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, intent.Volid, cfg, pctx)
-				return nil
+				return finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, intent.Volid, cfg, pctx)
 			}
 		}
 
@@ -756,16 +760,21 @@ func finalizeResumedTransfer(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, stableID, slot, landed string,
 	cfg ParkerConfig, pctx ParkContext,
-) {
+) error {
 	entry := buildParkerProvEntry(intent.ParkerNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil && logger != nil {
-		logger.Warn("transfer resume: could not finalize the provenance record (non-fatal; the drive serial is authoritative)",
-			log.Int("parker_vmid", intent.ParkerVMID),
-			log.String("volid", landed),
-			log.Err(provErr),
-		)
+	if provErr := writeParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil {
+		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
+			return cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
+		}
+		if logger != nil {
+			logger.Warn("transfer resume: could not finalize legacy provenance", log.Err(provErr))
+		}
 	}
 	reassertParkerProtection(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID)
+	if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
+		return VerifyAllocationParked(ctx, c, logger, landed, stableID, pctx.AllocationNamespace, pctx.AllocationID, cfg)
+	}
+	return nil
 }
 
 // DeleteParkedOwnedDisk deletes a parked stable-ID disk whose volume is named
@@ -890,4 +899,26 @@ func sweepOwnedUnusedEntries(ctx context.Context, c Client, logger *log.Logger, 
 			"delete parked: unused entry referencing %q survived removal on parker vmid %d", bareVolid, parkerVMID)
 	}
 	return nil
+}
+
+func resumeDiskTransferContext(intent DiskTransferIntent, stableID string, cfg ParkerConfig, pctx ParkContext) (ParkContext, ParkerConfig, error) {
+	pctx.StableID = stableID
+	if pctx.AllocationID == "" {
+		pctx.AllocationID = intent.AllocationID
+		pctx.AllocationNamespace = intent.AllocationNamespace
+		pctx.AllocationBacking = intent.AllocationBacking
+	}
+	if pctx.AllocationID != intent.AllocationID || pctx.AllocationNamespace != intent.AllocationNamespace {
+		return pctx, cfg, cpierrors.Cloud("transfer resume: allocation provenance conflict")
+	}
+	if actual, _, err := ParseDiskCID(intent.Volid); err == nil {
+		cfg.DiskStorage = actual
+	}
+	// The finalize rewrites the whole provenance entry from pctx, so a resume
+	// that omitted the recorded option overrides would silently drop them.
+	if len(pctx.Opts) == 0 {
+		pctx.Opts = intent.Opts
+	}
+
+	return pctx, cfg, nil
 }

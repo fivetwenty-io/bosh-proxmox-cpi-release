@@ -149,6 +149,7 @@ from typing import Any
 # Import the sibling out-of-band PVE verifier (scripts/_pve_verify.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _pve_verify  # noqa: E402
+from _storage_placement_verify import PlacementVerification  # noqa: E402
 
 
 def env(name: str, default: str | None = None, *, required: bool = False) -> str:
@@ -193,6 +194,10 @@ except (json.JSONDecodeError, ValueError) as _dns_exc:
 NETWORK_BRIDGE = env("NETWORK_BRIDGE", "")
 VM_CORES = int(env("VM_CORES", "1"))
 VM_MEMORY_MIB = int(env("VM_MEMORY_MIB", "1024"))
+VM_EPHEMERAL_MIB = int(env("VM_EPHEMERAL_MIB", "0"))
+MULTI_STORAGE_PLACEMENT_TEST = env("MULTI_STORAGE_PLACEMENT_TEST", "off")
+if MULTI_STORAGE_PLACEMENT_TEST not in {"off", "on"} or VM_EPHEMERAL_MIB < 0:
+    sys.exit("invalid multi-storage test mode or ephemeral size")
 DISK_SIZE_MIB = int(env("DISK_SIZE_MIB", "1024"))
 STEMCELL_NAME = env("STEMCELL_NAME", "")
 STEMCELL_VERSION = env("STEMCELL_VERSION", "")
@@ -1270,6 +1275,9 @@ def main() -> int:
         # Out-of-band PVE verifier (same host+auth as the CPI binary). A run
         # that cannot reach PVE to verify must not be able to report success.
         verifier = _pve_verify.PVEVerifier.from_config_file(CPI_CONFIG)
+        placement = None
+        if MULTI_STORAGE_PLACEMENT_TEST == "on":
+            placement = PlacementVerification(CPI_CONFIG, CPI_BIN, env("STORAGE_PLACEMENT_REPORT", "tmp/storage-placement-lifecycle.json"))
 
         step("1. info")
         info = call("info", [])
@@ -1337,6 +1345,8 @@ def main() -> int:
 
         step(f"3. create_vm (agent_id={AGENT_ID}, stemcell_cid={state['stemcell_cid']})")
         cloud_props = {"cores": VM_CORES, "memory": VM_MEMORY_MIB}
+        if VM_EPHEMERAL_MIB:
+            cloud_props["ephemeral_disk_size_mb"] = VM_EPHEMERAL_MIB
         if NETWORK_TEST_MODE == "bridge":
             # A plain Linux bridge exists on ONE node -- create_network built it
             # on the CPI config's node -- while create_vm places by headroom
@@ -1358,6 +1368,8 @@ def main() -> int:
                 "cloud_properties": {"bridge": eff_bridge},
             }
         }
+        if placement:
+            placement.preflight([AGENT_ID, state["stemcell_cid"], cloud_props, networks, [], {}])
         create_vm_res = call(
             "create_vm",
             [AGENT_ID, state["stemcell_cid"], cloud_props, networks, [], {}],
@@ -1368,6 +1380,9 @@ def main() -> int:
             f"vm {state['vm_cid']!r} exists on pve",
             verifier.vm_exists(state["vm_cid"]),
         )
+
+        if placement:
+            placement.verify_vm(verifier.qemu_config(state["vm_cid"]), VM_EPHEMERAL_MIB > 0, verifier.volume_entry)
 
         step("4. has_vm")
         has_vm = call("has_vm", [state["vm_cid"]])
@@ -1389,6 +1404,10 @@ def main() -> int:
             f"disk volume {state['disk_cid']!r} exists on pve",
             verifier.volume_exists(state["disk_cid"]),
         )
+
+        if placement:
+            placement.verify_disk(verifier.volume_entry(state["disk_cid"]), verifier.current_disk_volid(state["disk_cid"]))
+            placement.rejected_selector_cases(_call_once, state["vm_cid"], DISK_SIZE_MIB, lambda: placement.volume_inventory(verifier))
 
         # The CID envelope records the format the disk was created under and
         # attach_disk trusts it, so it must match what PVE actually created:

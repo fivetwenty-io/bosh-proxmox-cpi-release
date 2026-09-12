@@ -143,6 +143,10 @@ func parkerNow(cfg ParkerConfig) time.Time {
 // DiskCID should be the encoded CID as the Director knows it (may include a
 // metadata suffix). SourceVMCID is the VM the disk was detached from.
 type ParkContext struct {
+	// Allocation identity is mandatory for set-managed disks and survives provenance updates.
+	AllocationID        string
+	AllocationNamespace string
+	AllocationBacking   string
 	// DiskCID is the full disk CID passed by the Director (may include encoded
 	// metadata suffix). Stored as disk_cid in the provenance entry so disk-audit
 	// can cross-reference back to the Director's view of the disk.
@@ -175,13 +179,16 @@ type ParkContext struct {
 // requires: written before the source VM's slot is deleted, finalized with
 // the landed volid after the serial is re-applied.
 type parkerProvEntry struct {
-	DiskCID     string `json:"disk_cid"`
-	SourceVMCID string `json:"source_vm_cid,omitempty"`
-	ParkedAt    string `json:"parked_at"`
-	Node        string `json:"node"`
-	DirectorID  string `json:"director_id,omitempty"`
-	Volid       string `json:"volid,omitempty"`
-	Slot        string `json:"slot,omitempty"`
+	AllocationID        string `json:"allocation_id,omitempty"`
+	AllocationNamespace string `json:"allocation_namespace,omitempty"`
+	AllocationBacking   string `json:"allocation_backing,omitempty"`
+	DiskCID             string `json:"disk_cid"`
+	SourceVMCID         string `json:"source_vm_cid,omitempty"`
+	ParkedAt            string `json:"parked_at"`
+	Node                string `json:"node"`
+	DirectorID          string `json:"director_id,omitempty"`
+	Volid               string `json:"volid,omitempty"`
+	Slot                string `json:"slot,omitempty"`
 	// Opts holds the disk's drive-option overrides while it is parked (see
 	// disk_opt_overlay.go). Either keying generation may carry it; absent
 	// means no overrides are recorded.
@@ -274,11 +281,14 @@ func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx P
 		diskCIDField = pctx.DiskCID
 	}
 	entry := parkerProvEntry{
-		DiskCID:     diskCIDField,
-		SourceVMCID: pctx.SourceVMCID,
-		ParkedAt:    parkerNow(cfg).Format(time.RFC3339),
-		Node:        node,
-		DirectorID:  cfg.DirectorID,
+		AllocationID:        pctx.AllocationID,
+		AllocationNamespace: pctx.AllocationNamespace,
+		AllocationBacking:   pctx.AllocationBacking,
+		DiskCID:             diskCIDField,
+		SourceVMCID:         pctx.SourceVMCID,
+		ParkedAt:            parkerNow(cfg).Format(time.RFC3339),
+		Node:                node,
+		DirectorID:          cfg.DirectorID,
 	}
 	if pctx.StableID != "" {
 		entry.Volid = bareVolid
@@ -375,7 +385,8 @@ func collectStaleParkerProvenance(
 ) []string {
 	referenced := parkerReferencedVolids(vmCfg)
 	var pruned []string
-	for key, entry := range disks {
+	for key := range disks {
+		entry := disks[key]
 		if key == keepKey {
 			continue
 		}
@@ -406,6 +417,16 @@ func projectParkerProvenance(
 	key string, entry parkerProvEntry, cfg ParkerConfig,
 ) (desc string, pruned []string, err error) {
 	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	if previous, ok := disks[key]; ok && previous.AllocationID != "" {
+		if entry.AllocationID != "" && (entry.AllocationID != previous.AllocationID || entry.AllocationNamespace != previous.AllocationNamespace) {
+			return "", nil, fmt.Errorf("parker allocation provenance conflicts with existing identity")
+		}
+		entry.AllocationID = previous.AllocationID
+		entry.AllocationNamespace = previous.AllocationNamespace
+		if entry.AllocationBacking == "" {
+			entry.AllocationBacking = previous.AllocationBacking
+		}
+	}
 	disks[key] = entry
 
 	// The caller's config read is the same one the reference test needs, so
@@ -541,7 +562,8 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 	// field. The caller only ever knows the volid it just moved off the parker,
 	// and that matches exactly one entry under either scheme.
 	removed := false
-	for key, entry := range disks {
+	for key := range disks {
+		entry := disks[key]
 		if key == bareVolid || entry.Volid == bareVolid {
 			delete(disks, key)
 			removed = true
@@ -1237,6 +1259,9 @@ func ParkedFromHolder(h DiskHolder, bareVolid string) (vmid int, node, slot stri
 //
 // All PVE mutations are wrapped with RetryOnTransientOrLock.
 func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
+	if actual, _, err := ParseDiskCID(bareVolid); err == nil {
+		cfg.DiskStorage = actual
+	}
 	if c == nil {
 		return cpierrors.Cloud("ParkDisk: client must not be nil")
 	}

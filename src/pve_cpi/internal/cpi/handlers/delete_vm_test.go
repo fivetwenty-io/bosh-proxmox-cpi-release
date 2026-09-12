@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -514,12 +515,10 @@ func TestHandleDeleteVM_DetachesForeignDiskThenDestroys(t *testing.T) {
 
 	var detachedSlots []string
 	deleteCalled := false
-	var configCalls int
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			configCalls++
-			if configCalls == 1 {
+			if len(detachedSlots) == 0 {
 				// Director DB disk (vmid 15689) attached to VM 6031 as scsi1.
 				return map[string]any{
 					"virtio0": "local-lvm:vm-6031-disk-0",
@@ -2215,8 +2214,8 @@ func TestHandleDeleteVM_TaggedRow_NoParkerConfigFallback(t *testing.T) {
 	//   3. guardUnusedVolumes — unusedN guard
 	// Totalling 3 when no detach occurs. The parker check must add zero additional
 	// config calls when ParkedStrategyActive=false (range unset). Assert count ≤ 3.
-	if configCalls > 3 {
-		t.Errorf("range-unset: Config called %d times; expected ≤3 (no parker check overhead)", configCalls)
+	if configCalls > 4 {
+		t.Errorf("range-unset: Config called %d times; expected ≤4 (including allocation provenance verification)", configCalls)
 	}
 }
 
@@ -2327,442 +2326,38 @@ func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives is an end-to-end
-// test that proves the fix for F1: DestroyUnreferencedDisks=true would destroy
-// the ephemeral volume after unlink+sweep (it is then unreferenced + own-VMID),
-// and DestroyUnreferencedDisks=false (set by the retain path, or by
-// default when pve.destroy_unreferenced_disks is left unset) preserves it.
-//
-// The DeleteQemu double models PVE's actual behavior:
-//   - When DestroyUnreferencedDisks=true: it "frees" every volume whose VMID
-//     matches the VM being destroyed AND that is NOT referenced in the storage
-//     inventory. After the unlink+sweep the ephemeral volume falls into this
-//     class (config ref gone, matching VMID) → it would be destroyed.
-//   - When DestroyUnreferencedDisks=false: unreferenced volumes are left alone.
-//
-// Sub-cases:
-//   (a) retain flag present: DestroyUnreferencedDisks=false → ephemeral survives,
-//       root disk is freed (it remains config-referenced at destroy time).
-//   (b) retain flag absent, pve.destroy_unreferenced_disks unset (the default):
-//       DestroyUnreferencedDisks=false → nothing in this class is freed.
-//   (c) retain flag absent, pve.destroy_unreferenced_disks=true (explicit
-//       opt-in): DestroyUnreferencedDisks=true → the now-unreferenced
-//       ephemeral volume is freed.
-// ---------------------------------------------------------------------------
-
-//nolint:gocognit // Models the PVE config/storage state machine across unlink, sweep, and destroy; splitting obscures the sequence under test.
-func TestHandleDeleteVM_RetainEphemeral_VolumeActuallySurvives(t *testing.T) {
-	t.Parallel()
-
-	const vmid = 500
-
-	// simStorage models a PVE storage containing the VM's volumes.
-	// Keys are bare volids; value true = volume still present.
-	type simStorage map[string]bool
-
-	// pveDestroyUnref models PVE's DestroyUnreferencedDisks pass: every volume
-	// in stor whose VMID component matches vmidStr AND that is not present in
-	// configRefs (a set of volids still referenced by config) is freed.
-	pveDestroyUnref := func(stor simStorage, vmidStr string, configRefs map[string]bool) {
-		prefix := "vm-" + vmidStr + "-"
-		for volid := range stor {
-			// Strip storage prefix for VMID check.
-			v := volid
-			if i := strings.Index(volid, ":"); i >= 0 {
-				v = volid[i+1:]
-			}
-			if !strings.HasPrefix(v, prefix) {
-				continue
-			}
-			if configRefs[volid] {
-				continue // still referenced — not freed
-			}
-			delete(stor, volid)
-		}
-	}
-
-	runCase := func(t *testing.T, retainTag, destroyUnreferencedDisks bool) (ephemeralSurvives, rootDestroyed bool) {
-		t.Helper()
-
-		const rootVolid = "zfs-1:vm-500-disk-0"
-		const ephemeralVolid = "zfs-1:vm-500-ephemeral-0"
-
-		// The simulated storage inventory: both volumes start present.
-		stor := simStorage{rootVolid: true, ephemeralVolid: true}
-
-		tagsVal := "bosh-cpi"
-		if retainTag {
-			tagsVal = "bosh-cpi;bosh-retain-ephemeral"
-		}
-
-		// Config reads are state-driven, not count-driven: multiple helpers on the
-		// delete path read the VM config (detachForeignActiveDisks, the retain
-		// check, guardUnusedVolumes), so the returned config models the actual VM
-		// state machine — initial (scsi1 active) → post-unlink (unused0, tags kept
-		// by PVE) → post-sweep (reference gone).
-		var unlinked, swept bool
-		qemuSvc := &mockQEMUService{
-			stopFn: func(_ context.Context, _ string, _ int) (string, error) {
-				return "", nil
-			},
-			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-				switch {
-				case !retainTag:
-					// Non-retain: all reads return initial config (no ephemeral slot).
-					return map[string]any{
-						"virtio0": rootVolid + ",size=5G",
-						"tags":    tagsVal,
-					}, nil
-				case !unlinked:
-					return map[string]any{
-						"virtio0": rootVolid + ",size=5G",
-						"scsi1":   ephemeralVolid + ",size=10G",
-						"tags":    tagsVal,
-					}, nil
-				case !swept:
-					// Post-unlink: PVE demoted scsi1 to unused0; tags survive.
-					return map[string]any{
-						"virtio0": rootVolid + ",size=5G",
-						"unused0": ephemeralVolid,
-						"tags":    tagsVal,
-					}, nil
-				default:
-					// Post-sweep: reference removed; volume exists only in storage.
-					return map[string]any{
-						"virtio0": rootVolid + ",size=5G",
-						"tags":    tagsVal,
-					}, nil
+// Storage content failures must prevent destruction for every retention mode.
+// Successful transfer and retained-generation closure are exercised with the
+// stateful storage fixture in managed_vm_ephemeral_retention_test.go.
+func TestHandleDeleteVM_RetainEphemeral_UnverifiedVolumeRefusesDestruction(t *testing.T) {
+	for _, fast := range []bool{false, true} {
+		for _, sweep := range []bool{false, true} {
+			t.Run(fmt.Sprintf("fast=%t/sweep=%t", fast, sweep), func(t *testing.T) {
+				destroyed := false
+				qemuSvc := &mockQEMUService{stopFn: func(context.Context, string, int) (string, error) { return "", nil }, configFn: func(context.Context, string, int) (map[string]any, error) {
+					return map[string]any{"tags": "bosh-cpi;bosh-retain-ephemeral", "virtio0": "local:730/vm-730-disk-0.qcow2", "scsi1": "local:vm-730-ephemeral-0"}, nil
+				}}
+				base := &mockNodesService{updateQemuConfigFn: func(context.Context, string, string, *nodes.UpdateQemuConfigParams) error { return nil }, deleteQemuFn: func(context.Context, string, string, *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+					destroyed = true
+					return nil, nil
+				}}
+				service := &retentionProofUnavailableNodes{Service: base}
+				deps := testDepsFoundVMWithStorage(730, qemuSvc, service, &mockTasksService{}, &mockAgentService{}, &mockStorageService{})
+				deps.Config.FastPathDelete = &fast
+				deps.Config.DestroyUnreferencedDisks = sweep
+				_, err := handlers.HandleDeleteVM(deps).Handle(t.Context(), marshalArgs("730"), jsonrpc.Context{})
+				if err == nil || destroyed {
+					t.Fatalf("unverified retained volume admitted destruction: error=%v destroyed=%t", err, destroyed)
 				}
-			},
+			})
 		}
-
-		var capturedDestroyUnref *bool
-		nodesSvc := &mockNodesService{
-			updateQemuUnlinkFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuUnlinkParams) error {
-				unlinked = true // PVE demotes the slot to unusedN
-				return nil
-			},
-			updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
-				if params != nil && params.Delete != nil && strings.Contains(*params.Delete, "unused0") {
-					swept = true // sweep removed the unused0 reference
-				}
-				return nil // other calls stamp tags etc.
-			},
-			deleteQemuFn: func(_ context.Context, _ string, vmidStr string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-				if params != nil && params.DestroyUnreferencedDisks != nil {
-					v := *params.DestroyUnreferencedDisks
-					capturedDestroyUnref = &v
-				}
-				// Model PVE: when DestroyUnreferencedDisks=true, free unreferenced own-VMID volumes.
-				destroyUnref := params != nil && params.DestroyUnreferencedDisks != nil && *params.DestroyUnreferencedDisks
-				if destroyUnref {
-					// At destroy time, virtio0 is the only config-referenced volume.
-					// (On retain path: scsi1 and unused0 are already gone via unlink+sweep.)
-					configRefs := map[string]bool{rootVolid: true}
-					pveDestroyUnref(stor, vmidStr, configRefs)
-				}
-				return &nodes.DeleteQemuResponse{}, nil
-			},
-		}
-
-		deps := testDepsFoundVM(vmid, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{})
-		deps.Config.DestroyUnreferencedDisks = destroyUnreferencedDisks
-		h := handlers.HandleDeleteVM(deps)
-		_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
-		if err != nil {
-			t.Fatalf("HandleDeleteVM: unexpected error: %v", err)
-		}
-
-		switch {
-		case retainTag:
-			if capturedDestroyUnref == nil || *capturedDestroyUnref {
-				t.Error("retain path: DeleteQemu must receive DestroyUnreferencedDisks=false regardless of the config knob")
-			}
-		case destroyUnreferencedDisks:
-			if capturedDestroyUnref == nil || !*capturedDestroyUnref {
-				t.Error("non-retain path with pve.destroy_unreferenced_disks=true: DeleteQemu must receive DestroyUnreferencedDisks=true")
-			}
-		default:
-			if capturedDestroyUnref == nil || *capturedDestroyUnref {
-				t.Error("non-retain path with pve.destroy_unreferenced_disks unset (default): DeleteQemu must receive DestroyUnreferencedDisks=false")
-			}
-		}
-
-		return stor[ephemeralVolid], !stor[rootVolid]
-	}
-
-	t.Run("retain_flag_present_ephemeral_survives", func(t *testing.T) {
-		t.Parallel()
-		ephemeralSurvives, rootDestroyed := runCase(t, true, false)
-		// With fix: DestroyUnreferencedDisks=false → ephemeral untouched.
-		if !ephemeralSurvives {
-			t.Error("retain path: ephemeral volume must survive delete_vm; it was destroyed (DestroyUnreferencedDisks=true was wrongly used)")
-		}
-		// Root disk is still config-referenced at destroy time — it is NOT freed by
-		// DestroyUnreferencedDisks (which only frees unreferenced volumes). Purge
-		// removes config+HA references; actual storage free is via DeleteQemu's
-		// standard disk deletion for referenced disks. We verify the mock did NOT
-		// delete the root (our model only applies pveDestroyUnref for unreferenced).
-		_ = rootDestroyed // root disk fate depends on PVE internals beyond our model
-	})
-
-	t.Run("retain_flag_present_destroy_unreferenced_disks_opt_in_still_survives", func(t *testing.T) {
-		t.Parallel()
-		// Retain semantics must win even when the operator opted in to
-		// pve.destroy_unreferenced_disks -- see the destroyDisks := cfg &&
-		// !retained expression at every delete_vm call site.
-		ephemeralSurvives, _ := runCase(t, true, true)
-		if !ephemeralSurvives {
-			t.Error("retain path: ephemeral volume must survive delete_vm even with destroy_unreferenced_disks=true")
-		}
-	})
-
-	t.Run("no_retain_flag_destroyDisks_defaults_false", func(t *testing.T) {
-		t.Parallel()
-		// Default: pve.destroy_unreferenced_disks unset -> DeleteQemu
-		// receives DestroyUnreferencedDisks=false even on the non-retain
-		// path. runCase's inner assertion checks this directly; no orphan
-		// volume is freed here because the flag is off.
-		runCase(t, false, false)
-	})
-
-	t.Run("no_retain_flag_destroyDisks_true_when_opted_in", func(t *testing.T) {
-		t.Parallel()
-		// Explicit pve.destroy_unreferenced_disks=true opts
-		// in: DeleteQemu receives
-		// DestroyUnreferencedDisks=true on the non-retain path.
-		runCase(t, false, true)
-	})
-}
-
-// TestHandleDeleteVM_RetainEphemeral_NoUnusedEntryAfterUnlink_ConservativeFalse
-// covers detachRetainedEphemeralDisk's conservative fallback: the SDK (or PVE
-// itself) can auto-sweep the unusedN config reference in the same operation
-// that demotes the ephemeral slot, so the post-unlink config re-read never
-// shows an unusedN entry for the volid at all. The handler cannot confirm the
-// reference is gone via a distinct sweep step, so it must still report
-// retained=true and DeleteQemu must still receive DestroyUnreferencedDisks=
-// false — the opposite (false→true) is the exact regression that would
-// destroy the volume the operator asked to retain.
-func TestHandleDeleteVM_RetainEphemeral_NoUnusedEntryAfterUnlink_ConservativeFalse(t *testing.T) {
-	t.Parallel()
-
-	const vmid = 502
-	const rootVolid = "zfs-1:vm-502-disk-0"
-	const ephemeralVolid = "zfs-1:vm-502-ephemeral-0"
-
-	var unlinked bool
-	qemuSvc := &mockQEMUService{
-		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
-			return "", nil
-		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			if !unlinked {
-				return map[string]any{
-					"virtio0": rootVolid + ",size=5G",
-					"scsi1":   ephemeralVolid + ",size=10G",
-					"tags":    "bosh-cpi;bosh-retain-ephemeral",
-				}, nil
-			}
-			// Post-unlink: the SDK/PVE already swept the unusedN reference in the
-			// same operation, so no unusedN key appears for ephemeralVolid at all.
-			return map[string]any{
-				"virtio0": rootVolid + ",size=5G",
-				"tags":    "bosh-cpi;bosh-retain-ephemeral",
-			}, nil
-		},
-	}
-
-	var sweepCalled bool
-	var capturedDestroyUnref *bool
-	nodesSvc := &mockNodesService{
-		updateQemuUnlinkFn: func(_ context.Context, _ string, _ string, _ *nodes.UpdateQemuUnlinkParams) error {
-			unlinked = true
-			return nil
-		},
-		updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
-			if params != nil && params.Delete != nil && strings.Contains(*params.Delete, "unused") {
-				sweepCalled = true
-			}
-			return nil
-		},
-		deleteQemuFn: func(_ context.Context, _ string, _ string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-			if params != nil && params.DestroyUnreferencedDisks != nil {
-				v := *params.DestroyUnreferencedDisks
-				capturedDestroyUnref = &v
-			}
-			return &nodes.DeleteQemuResponse{}, nil
-		},
-	}
-
-	h := handlers.HandleDeleteVM(testDepsFoundVM(vmid, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}))
-	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
-	if err != nil {
-		t.Fatalf("HandleDeleteVM: unexpected error: %v", err)
-	}
-
-	if sweepCalled {
-		t.Error("no unusedN entry was found after unlink; UpdateQemuConfig sweep must not be called")
-	}
-	if capturedDestroyUnref == nil || *capturedDestroyUnref {
-		t.Fatal("conservative fallback: DeleteQemu must receive DestroyUnreferencedDisks=false when no unusedN entry is found after unlink")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestHandleDeleteVM_RetainEphemeral_StragglerSweepPreservesVolume covers the
-// straggler window: a retain-tagged VM whose fast-path destroy fails AFTER the
-// ephemeral disk was unlinked+swept survives carrying both bosh-deleting and
-// bosh-retain-ephemeral, with its ephemeral volume unreferenced and matching
-// VMID — exactly the class DestroyUnreferencedDisks=true frees. The next
-// delete_vm's straggler sweep must re-issue the destroy with
-// DestroyUnreferencedDisks=false, or it destroys the volume the first call
-// preserved.
-//
-// Two real handler invocations against shared simulated state:
-//
-//	call 1: delete_vm(730) — retain-tagged; unlink+sweep succeed; the destroy
-//	        returns a transient 500 → handler errors, VM survives as straggler.
-//	call 2: delete_vm(731) — untagged; its sweep finds straggler 730 and must
-//	        destroy it with DestroyUnreferencedDisks=false; the ephemeral
-//	        volume must still exist afterwards.
-//
-//nolint:gocognit // Models config/tag/storage state across two handler calls; splitting obscures the window under test.
-func TestHandleDeleteVM_RetainEphemeral_StragglerSweepPreservesVolume(t *testing.T) {
-	t.Parallel()
+type retentionProofUnavailableNodes struct{ nodes.Service }
 
-	const stragglerVMID = 730
-	const otherVMID = 731
-	const rootVolid = "zfs-1:vm-730-disk-0"
-	const ephemeralVolid = "zfs-1:vm-730-ephemeral-0"
-
-	// Simulated storage inventory (bare volid -> present).
-	stor := map[string]bool{rootVolid: true, ephemeralVolid: true}
-
-	// VM 730 state machine, shared across both handler calls.
-	tags730 := "bosh-cpi;bosh-retain-ephemeral"
-	var unlinked730, swept730 bool
-	firstDestroy730 := true
-	var stragglerSweepDestroyUnref *bool
-
-	clusterSvc := &mockClusterSvc{
-		listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
-			// Built from live state so call 2 sees the tags call 1 actually wrote.
-			raw730, _ := json.Marshal(map[string]any{
-				"vmid": stragglerVMID, "node": vmNode, "type": "qemu", "tags": tags730,
-			})
-			raw731, _ := json.Marshal(map[string]any{
-				"vmid": otherVMID, "node": vmNode, "type": "qemu",
-			})
-			resp := cluster.ListResourcesResponse{raw730, raw731}
-			return &resp, nil
-		},
-	}
-
-	qemuSvc := &mockQEMUService{
-		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
-		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
-			if vmid != stragglerVMID {
-				return map[string]any{}, nil
-			}
-			switch {
-			case !unlinked730:
-				return map[string]any{
-					"virtio0": rootVolid + ",size=5G",
-					"scsi1":   ephemeralVolid + ",size=10G",
-					"tags":    tags730,
-				}, nil
-			case !swept730:
-				return map[string]any{
-					"virtio0": rootVolid + ",size=5G",
-					"unused0": ephemeralVolid,
-					"tags":    tags730,
-				}, nil
-			default:
-				return map[string]any{
-					"virtio0": rootVolid + ",size=5G",
-					"tags":    tags730,
-				}, nil
-			}
-		},
-	}
-	nodesSvc := &mockNodesService{
-		updateQemuUnlinkFn: func(_ context.Context, _ string, vmidStr string, _ *nodes.UpdateQemuUnlinkParams) error {
-			if vmidStr == "730" {
-				unlinked730 = true
-			}
-			return nil
-		},
-		updateQemuConfigFn: func(_ context.Context, _ string, vmidStr string, params *nodes.UpdateQemuConfigParams) error {
-			if vmidStr != "730" || params == nil {
-				return nil
-			}
-			if params.Delete != nil && strings.Contains(*params.Delete, "unused0") {
-				swept730 = true
-			}
-			if params.Tags != nil {
-				tags730 = *params.Tags // stampDeletingTag merges bosh-deleting in
-			}
-			return nil
-		},
-		deleteQemuFn: func(_ context.Context, _ string, vmidStr string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
-			if vmidStr == "730" && firstDestroy730 {
-				firstDestroy730 = false
-				// Transient failure AFTER unlink+sweep: the window under test.
-				return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "cluster not ready - no quorum?"}
-			}
-			destroyUnref := params != nil && params.DestroyUnreferencedDisks != nil && *params.DestroyUnreferencedDisks
-			if vmidStr == "730" {
-				v := destroyUnref
-				stragglerSweepDestroyUnref = &v
-				if destroyUnref {
-					// Model PVE: free unreferenced own-VMID volumes. At this point
-					// only virtio0 (root) is config-referenced.
-					if !swept730 {
-						t.Error("test invariant: straggler destroy reached before sweep completed")
-					}
-					delete(stor, ephemeralVolid)
-				}
-			}
-			raw := nodes.DeleteQemuResponse{}
-			return &raw, nil
-		},
-	}
-	tasksSvc := &mockTasksService{}
-	agentSvc := &mockAgentService{removeFn: func(_ context.Context, _ string, _ int) error { return nil }}
-
-	deps := testDepsWithCluster(qemuSvc, nodesSvc, tasksSvc, agentSvc, &mockStorageService{}, clusterSvc)
-	enabled := true
-	deps.Config.FastPathDelete = &enabled
-	h := handlers.HandleDeleteVM(deps)
-
-	// Call 1: retain-tagged delete whose destroy fails transiently post-sweep.
-	if _, err := h.Handle(context.Background(), marshalArgs("730"), jsonrpc.Context{}); err == nil {
-		t.Fatal("call 1: expected transient destroy failure to propagate")
-	}
-	if !unlinked730 || !swept730 {
-		t.Fatalf("call 1: expected unlink+sweep to complete before the failing destroy (unlinked=%v swept=%v)", unlinked730, swept730)
-	}
-	if !strings.Contains(tags730, "bosh-deleting") {
-		t.Fatalf("call 1: expected bosh-deleting stamped on straggler, tags=%q", tags730)
-	}
-	if !stor[ephemeralVolid] {
-		t.Fatal("call 1: ephemeral volume must still exist after the failed destroy")
-	}
-
-	// Call 2: deleting another VM; its sweep reaps straggler 730.
-	if _, err := h.Handle(context.Background(), marshalArgs("731"), jsonrpc.Context{}); err != nil {
-		t.Fatalf("call 2: unexpected error: %v", err)
-	}
-	if stragglerSweepDestroyUnref == nil {
-		t.Fatal("call 2: straggler sweep must re-issue destroy for VM 730")
-	}
-	if *stragglerSweepDestroyUnref {
-		t.Error("call 2: straggler sweep must destroy retain-tagged VM 730 with DestroyUnreferencedDisks=false")
-	}
-	if !stor[ephemeralVolid] {
-		t.Error("call 2: retained ephemeral volume was destroyed by the straggler sweep")
-	}
+func (n *retentionProofUnavailableNodes) GetStorageContent(context.Context, string, string, string) (*nodes.GetStorageContentResponse, error) {
+	return nil, errors.New("storage observation unavailable")
 }
 
 // TestHandleDeleteVM_AuthFailure verifies that a 401 Unauthorized from QEMU.Stop

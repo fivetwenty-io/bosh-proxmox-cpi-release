@@ -29,10 +29,11 @@ type HandlerFunc = cpi.HandlerFunc
 // stemcellfetch.ResolveSourceWith call inside HandleCreateStemcell's
 // resolveFetchSource path. Set by tests only; production code leaves it nil.
 type Deps struct {
-	Config *config.CPIConfig
-	PVE    pve.Client
-	Agent  agent.Agent
-	Logger *log.Logger
+	StorageMetrics *StoragePlacementMetrics
+	Config         *config.CPIConfig
+	PVE            pve.Client
+	Agent          agent.Agent
+	Logger         *log.Logger
 	// Resolver maps a storage name to a persistent-disk Backend (shared or
 	// local). Production wiring (main.go) constructs it from a
 	// StorageInfoCache; tests may leave it nil to get the static

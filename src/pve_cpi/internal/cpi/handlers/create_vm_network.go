@@ -208,6 +208,9 @@ func configureNICs(
 	// Assign networks to NIC slots. Without nic_group this is one NIC per
 	// network in sortedNetworkNames order; with it, a group shares one NIC.
 	plan := planNICs(parsed.networks)
+	if parsed.storageRuntime != nil && len(plan) == 0 {
+		return plan, nil
+	}
 	netNames := planNetworkNames(plan)
 
 	// VM-level bridge and model defaults via layered resolver.
@@ -250,6 +253,9 @@ func configureNICs(
 		}
 
 		netMap[i] = buildNICNetValue(logger, entry.primary(), attrs, vnetNames)
+		if parsed.storageRuntime != nil {
+			netMap[i] = managedVMNICValue(parsed.storageRuntime.handle.Record().ID, i, netMap[i])
+		}
 		if attrs.bridge != "" {
 			bridgeSet[attrs.bridge] = struct{}{}
 		}

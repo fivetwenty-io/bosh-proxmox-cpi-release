@@ -906,3 +906,6 @@ Every default listed below applies with the [Minimal Configuration](#minimal-con
 
 Everything not listed here — hooks, OTel, metrics, DLB, anti-affinity, encrypted storage, disk-performance overrides, retry tuning, transport timeouts, and the rest — defaults to off/unset and adds no PVE grant and no behavior beyond the [Minimal Configuration](#minimal-configuration) manifest.
 
+## Multiple NFS storage sets
+
+Use [multi-storage placement](multi-storage-placement.md) to configure independent persistent and ephemeral sets, choose a versioned strategy, and constrain deployment overrides. Existing storage scalars remain available for legacy and infrastructure consumers. Set-managed allocation also requires a stable namespace and an enrolled durable journal.

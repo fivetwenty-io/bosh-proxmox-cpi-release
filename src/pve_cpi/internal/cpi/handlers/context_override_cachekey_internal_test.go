@@ -43,6 +43,9 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 	}
 	// ApplyContextOverrides re-validates the effective config, so the base
 	// must be a fully-defaulted, valid config first.
+	base.StorageSets = map[string]config.StorageSet{
+		"set-a": {Names: []string{"nfs-a"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
+	}
 	base.ApplyDefaults()
 	baseKey := requestOverrideCacheKey(base)
 
@@ -50,6 +53,16 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 	// base and coerce cleanly; enum validity is enforced later by Validate(),
 	// not by ApplyContextOverrides.
 	overrideValues := map[string]any{
+		"pve_storage_sets": map[string]any{"set-a": map[string]any{
+			"names": []string{"nfs-b"}, "strategy": map[string]any{"name": "spread", "version": 1},
+		}},
+		"pve_storage_capacity_domains":           map[string]any{"nas": map[string]any{"members": []string{"nfs-a"}}},
+		"pve_ephemeral_storage_set":              "set-a",
+		"pve_persistent_storage_set":             "set-a",
+		"pve_root_storage_set":                   "set-a",
+		"pve_storage_placement_namespace":        "other-authority",
+		"pve_require_disjoint_storage_sets":      false,
+		"pve_storage_status_max_age_seconds":     12,
 		"pve_host":                               "pve-b.example",
 		"pve_port":                               float64(9999), // JSON numbers decode as float64
 		"pve_user":                               "other",

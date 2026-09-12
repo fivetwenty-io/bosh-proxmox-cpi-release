@@ -106,6 +106,8 @@ const ephemeralTestVMID = 9101
 func newEphemeralShape() *createVMShape {
 	return &createVMShape{
 		node:             ephemeralTestNode,
+		vmStorage:        ephemeralTestStorage,
+		vmStorageType:    "zfspool",
 		ephemeralStorage: ephemeralTestStorage,
 		ephemeralDiskGiB: 10,
 		vmDiskFormat:     "raw",

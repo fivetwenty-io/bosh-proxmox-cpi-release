@@ -21,6 +21,9 @@ import (
 // resolveVMShape derives the createVMShape from deps.Config + parsed args.
 // Returns cpierrors.CloudError if the target node cannot be determined.
 func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (*createVMShape, error) {
+	if parsed.storagePlan != nil {
+		return buildVMShapeForNode(ctx, deps, parsed, parsed.storagePlan.Node)
+	}
 	cp := parsed.cloudProps
 
 	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed

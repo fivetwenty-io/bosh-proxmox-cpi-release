@@ -18,6 +18,7 @@ import (
 // resolvedDisk is one disk's decoded and resolved identity, carried through a
 // handler in place of the raw (bareDiskCID, meta) pair.
 type resolvedDisk struct {
+	allocation *managedDiskIdentity
 	// diskCID is the Director's verbatim encoded CID.
 	diskCID string
 	// birth is the envelope volid — the volume's name at create_disk time.
@@ -63,7 +64,7 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 		rd.stableID = meta.ID
 	}
 	if rd.stableID == "" || deps.Config == nil {
-		return rd, nil
+		return resolveManagedDiskIdentity(ctx, deps, rd)
 	}
 	ident, err := pve.ResolveDiskIdentity(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, rd.stableID, parkerReadConfigFor(deps))
 	if err != nil {
@@ -75,7 +76,7 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 		rd.holder = &h
 	}
 	rd.intent = ident.Intent
-	return rd, nil
+	return resolveManagedDiskIdentity(ctx, deps, rd)
 }
 
 // resumeTransferIfNeeded converges a mid-transfer disk to its parked state
@@ -89,7 +90,7 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 		log.String("disk_cid", rd.diskCID),
 		log.Int("parker_vmid", rd.intent.ParkerVMID),
 	)
-	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts}
+	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts})
 	if _, err := pve.ResumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerWriteConfigFor(deps), pctx); err != nil {
 		return resolvedDisk{}, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: resume interrupted transfer for disk %s", op, rd.diskCID))

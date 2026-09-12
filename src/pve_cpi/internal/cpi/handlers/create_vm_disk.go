@@ -644,7 +644,7 @@ func cloneFromTemplate(
 		log.String("template_node", templateNode),
 		log.Int("new_vmid", candidate),
 		log.String("clone_mode", mode),
-		log.Bool("full_clone", full != nil && *full),
+		log.Bool(storageMechanismFullClone, full != nil && *full),
 	)
 
 	upid, cloneErr := pve.CloneQemuVM(ctx, deps.PVE, templateNode, templateVMID, params)
@@ -1124,8 +1124,23 @@ func attachEphemeralDisk(
 		return "", nil
 	}
 
-	volName := fmt.Sprintf("vm-%d-ephemeral-0", vmid)
-	canonical := fmt.Sprintf("%s:%s", shape.ephemeralStorage, volName)
+	storageType := shape.vmStorageType
+	if shape.ephemeralStorage != shape.vmStorage || storageType == "" {
+		info, ok := liveStorageInfo(ctx, deps, shape.ephemeralStorage)
+		if !ok {
+			return "", fmt.Errorf("ephemeral storage definition is unavailable")
+		}
+		storageType = info.Type
+	}
+	format, err := pve.EphemeralVolumeFormat(storageType, shape.vmDiskFormat)
+	if err != nil {
+		return "", err
+	}
+	volName, suffix, err := pve.EphemeralVolumeName(storageType, format, vmid)
+	if err != nil {
+		return "", err
+	}
+	canonical := shape.ephemeralStorage + ":" + suffix
 	// In-place retry on storage contention, the same backoff create_disk's
 	// attemptCreateVolume uses (that path additionally honors the operator's
 	// storage-lock attempt budget; this one takes the default): a CF deploy
@@ -1154,13 +1169,13 @@ func attachEphemeralDisk(
 	// of a verdict to keep retrying against.
 	var createdVolid string
 	attempted := false
-	err := pve.RetryOnTransientOrLock(ctx, logger, "create_vm_ephemeral_volume", 0, func() error {
+	err = pve.RetryOnTransientOrLock(ctx, logger, "create_vm_ephemeral_volume", 0, func() error {
 		isReplay := attempted
 		attempted = true
 		var innerErr error
 		createdVolid, innerErr = deps.PVE.Storage().CreateVolume(
 			ctx, shape.node, shape.ephemeralStorage,
-			shape.ephemeralDiskGiB, shape.vmDiskFormat, vmid, volName,
+			shape.ephemeralDiskGiB, format, vmid, volName,
 		)
 		if innerErr == nil {
 			return nil
@@ -1185,7 +1200,7 @@ func attachEphemeralDisk(
 		// the allocation ran): sweep it best-effort, mirroring
 		// attemptCreateVolume in create_disk, so the Director's redo with a
 		// fresh VMID does not leave an orphan behind.
-		sweepEphemeralVolumeAfterCreateFailure(ctx, deps, logger, shape, vmid, volName)
+		sweepEphemeralVolumeAfterCreateFailure(ctx, deps, logger, shape, vmid, suffix)
 		return "", cpierrors.Wrap(pve.WrapError(err),
 			fmt.Sprintf("create_vm: create ephemeral volume vmid=%d size=%dG storage=%s",
 				vmid, shape.ephemeralDiskGiB, shape.ephemeralStorage))
@@ -1285,11 +1300,8 @@ func attachEphemeralDisk(
 // attemptCreateVolume: existence-check first, then DeleteVolumeAsync with
 // the imgdel task awaited; every failure is logged, never propagated.
 //
-// The canonical volid guess covers block-backed pools
-// ("<storage>:<volname>"). Dir-style plugins nest the volume under a
-// per-VMID directory the guess misses; there the Exists probe answers false,
-// the sweep is a no-op, and a committed orphan is left for
-// scripts/disk-audit (the pre-sweep status quo).
+// The caller supplies the storage-specific canonical suffix: a bare volume
+// name for block storage or a VMID directory plus filename for file storage.
 func sweepEphemeralVolumeAfterCreateFailure(
 	ctx context.Context,
 	deps Deps,
@@ -1391,6 +1403,18 @@ func attachPersistentDisks(
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "create_vm", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return resolveErr
+		}
+		if rd.allocation != nil || parsed.storageRuntime != nil {
+			var attachErr error
+			if parsed.storageRuntime != nil {
+				attachErr = parsed.storageRuntime.attachPersistent(ctx, rd)
+			} else {
+				_, attachErr = attachManagedPersistentDisk(ctx, deps, vmCID, shape.node, vmid, rd)
+			}
+			if attachErr != nil {
+				return attachErr
+			}
+			continue
 		}
 		plan, guardErr := guardAndUnparkBeforeAttach(ctx, deps, "create_vm", &rd, shape.node, vmid)
 		if guardErr != nil {

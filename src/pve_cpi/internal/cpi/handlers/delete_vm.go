@@ -94,6 +94,11 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 	if deps.PVE == nil || deps.PVE.Cluster() == nil {
 		return
 	}
+	protected, err := legacySweepJournalVMIDs(ctx, deps)
+	if err != nil {
+		logger.Warn("delete_vm: journal history unavailable; deferring legacy sweep")
+		return
+	}
 	resp, err := deps.PVE.Cluster().ListResources(ctx, &sdkcluster.ListResourcesParams{})
 	if err != nil {
 		logger.Warn("delete_vm: straggler sweep: ListResources failed (non-fatal)", log.Err(err))
@@ -122,6 +127,9 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		if item.Type != resourceTypeQemu || item.VMID.Int() == 0 || item.Node == "" {
 			continue
 		}
+		if protected[int(item.VMID.Int())] {
+			continue
+		}
 		if !tagsContain(item.Tags, tagDeletingVM) {
 			continue
 		}
@@ -143,22 +151,8 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// The config read is node-local truth. A "VM already gone" shape
 		// (404, or pmxcfs's config-missing 500) means there is nothing left
 		// to reap; any other read failure defers the straggler (fail-closed).
-		strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, item.Node, int(item.VMID.Int()))
-		if strCfgErr != nil {
-			if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
-				sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
-				continue
-			}
-			sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
-				log.Err(strCfgErr))
-			continue
-		}
-		// Re-test the deleting tag from the authoritative config, not the
-		// index row. Tag absent means the row is stale — this VMID's current
-		// occupant was never marked for deletion, so it must not be destroyed.
-		authTags, _ := pve.ConfigString(strCfg, jsonKeyTags)
-		if !tagsContain(authTags, tagDeletingVM) {
-			sweepLogger.Warn("delete_vm: straggler sweep: index row is stale — the VM's authoritative config does not carry the deleting tag; skipping (VMID likely reused by a live VM)")
+		strCfg, authTags, allowed := legacySweepConfig(ctx, deps, item.Node, int(item.VMID.Int()), sweepLogger)
+		if !allowed {
 			continue
 		}
 		// Base value is pve.destroy_unreferenced_disks (default false; see the
@@ -396,156 +390,177 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		if err != nil {
 			return nil, err
 		}
-
-		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
-
-		// --- locate VM authoritatively ---
-		// The cluster scan's hit is authoritative (correct even after an HA
-		// failover), but its miss is not: /cluster/resources lags node-local
-		// state by minutes on loaded clusters, and treating a stale miss as
-		// "already deleted" makes the Director drop its record while the live
-		// VM keeps running with its IP. FindVMAuthoritative therefore proves
-		// absence on a miss with per-node config probes before this handler
-		// may take the idempotent-success branch; any probe failure surfaces
-		// retriable instead. Transport error -> propagate.
-		logger.Debug("delete_vm: locating VM (cluster scan, per-node probes on miss)")
-		loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
-		if lookupErr != nil {
-			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
-		}
-		node, vmTags := loc.Node, loc.Tags
-		if !loc.Found || node == "" {
-			logger.Info("delete_vm: VM absent from cluster index and every node's config probe — already deleted, returning success")
-			// Best-effort agent cleanup: registry/cloud-init state may still exist.
-			if agentErr := deps.Agent.Remove(ctx, deps.Config.Node, vmid); agentErr != nil {
-				logger.Warn("delete_vm: agent.Remove failed after cluster-not-found", log.Err(agentErr))
-			}
-			return nil, nil
-		}
-		logger.Debug("delete_vm: VM located", log.String("node", node))
-
-		// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
-		if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid, vmTags); parkerErr != nil {
-			return nil, parkerErr
-		} else if alreadyGone {
-			return nil, nil
+		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmCID, vmid); handled || managedErr != nil {
+			return nil, storageDecisionSourceError(managedErr)
 		}
 
-		// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
-		if deps.Config != nil {
-			inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
-			if inflightErr != nil {
-				return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
-			}
-			defer inflightRelease()
-		}
-
-		// --- fast-path branch: tag-and-return without terminal-state poll ---
-		// When fast_path_delete is enabled the handler must return in bounded time
-		// regardless of PVE task behaviour. This requires bypassing ALL unbounded
-		// AwaitTaskWithLogger calls — including the stop-task await that
-		// stopVMBeforeDelete performs. The fast path therefore takes its own stop
-		// approach: issue Stop fire-and-forget (UPID discarded, no await), then
-		// issue DeleteQemu with skiplock=true so PVE destroys the VM even if it is
-		// still running or holds a config lock. The destroy call itself is NOT
-		// awaited — the UPID is discarded and the handler returns immediately.
-		//
-		// skiplock=true is restricted to the root@pam superuser authenticated via
-		// password — PVE rejects it for any other identity regardless of role or
-		// privilege, including an API token owned by root@pam, so no ACL grant on
-		// a least-privilege token (or any token at all) can enable it; run the
-		// CPI as root@pam with a password to use it.
-		//
-		// Eventual consistency: a subsequent has_vm call may briefly still see the
-		// VM while PVE's async destroy runs. The bosh-deleting tag marks VMs whose
-		// fast-path destroy was issued but may not have completed; sweepFastDeleteStragglers
-		// reaps them on the next fast-path delete (a self-draining work queue), so a
-		// stalled async destroy is retried automatically rather than left for manual
-		// `qm destroy <vmid>` cleanup.
-		//
-		// The fast path bypasses the §7.15 operation-timeout envelope naturally:
-		// no poll loop runs; the handler returns as soon as the destroy API call
-		// returns (which itself is bounded by the HTTP transport timeout).
-		if deps.Config.FastPathDeleteEnabled() {
-			if fpErr := fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger); fpErr != nil {
-				return nil, fpErr
-			}
-			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-			return nil, nil
-		}
-
-		// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
-		cleanupHAMembership(ctx, deps, vmid, logger)
-
-		// --- stop VM (synchronous path) ---
-		if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
-			return nil, stopErr
-		} else if stopDone {
-			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-			return nil, nil
-		}
-
-		// --- protect attached persistent disks: detach foreign-VMID volumes so
-		//     the destroy below cannot take them; refuse if a detach is not
-		//     guaranteed (fail-closed, retriable) ---
-		if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
-			return nil, protErr
-		}
-
-		// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
-		// retained=true whenever the retain tag is present (even if a prior attempt
-		// already unlinked the disk); DestroyUnreferencedDisks must be false on that
-		// path. See function doc.
-		retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
-		if retainErr != nil {
-			return nil, retainErr
-		}
-
-		// --- guard: refuse to destroy if a persistent volume is still attached ---
-		if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
-			return nil, guardErr
-		}
-
-		// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
-		// The /cluster/resources row for this vmid (and therefore its pool
-		// membership) disappears once the VM is destroyed, and delete_vm has
-		// no env.bosh to re-derive a pool name from -- so the lookup must run
-		// here, before the destroy call below.
-		reapPool := capturePoolForReap(ctx, deps, vmid, logger)
-
-		// --- delete VM (synchronous path; see destroyVMWithRecovery for the
-		//     purge/DestroyUnreferencedDisks semantics and recovery ladder) ---
-		deleteResp, alreadyGone, deleteErr := destroyVMWithRecovery(ctx, deps, node, vmCID, vmid, retained, logger)
-		if deleteErr != nil {
-			return nil, deleteErr
-		}
-		if alreadyGone {
-			cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-			return nil, nil
-		}
-
-		// Await the destroy task so the VM is fully purged from PVE before we
-		// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
-		// null response means PVE completed synchronously and no await is needed.
-		if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, deleteResp, logger); awaitErr != nil {
-			return nil, awaitErr
-		}
-
-		// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
-		//     PVE has already dropped this VM's pool membership. Never fails
-		//     delete_vm -- every branch is logged and swallowed.
-		reapEmptyPoolIfManaged(ctx, deps, reapPool, logger)
-
-		// --- agent cleanup ---
-		cleanupAgentForVM(ctx, deps, node, vmid, logger)
-
-		// --- advertised-route SDN subnet cleanup (provenance-tagged, refcounted,
-		//     entirely fail-open — see delete_vm_routes.go) ---
-		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
-
-		logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
-		return nil, nil
+		return deleteLegacyVM(ctx, deps, vmCID, vmid)
 	})
+}
+
+func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any, error) {
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+
+	// --- locate VM authoritatively ---
+	// The cluster scan's hit is authoritative (correct even after an HA
+	// failover), but its miss is not: /cluster/resources lags node-local
+	// state by minutes on loaded clusters, and treating a stale miss as
+	// "already deleted" makes the Director drop its record while the live
+	// VM keeps running with its IP. FindVMAuthoritative therefore proves
+	// absence on a miss with per-node config probes before this handler
+	// may take the idempotent-success branch; any probe failure surfaces
+	// retriable instead. Transport error -> propagate.
+	logger.Debug("delete_vm: locating VM (cluster scan, per-node probes on miss)")
+	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	if lookupErr != nil {
+		return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
+	}
+	node, vmTags := loc.Node, loc.Tags
+	if !loc.Found || node == "" {
+		logger.Info("delete_vm: VM absent from cluster index and every node's config probe — already deleted, returning success")
+		// Best-effort agent cleanup: registry/cloud-init state may still exist.
+		if agentErr := deps.Agent.Remove(ctx, deps.Config.Node, vmid); agentErr != nil {
+			logger.Warn("delete_vm: agent.Remove failed after cluster-not-found", log.Err(agentErr))
+		}
+		return nil, nil
+	}
+	logger.Debug("delete_vm: VM located", log.String("node", node))
+
+	// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
+	if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid, vmTags); parkerErr != nil {
+		return nil, parkerErr
+	} else if alreadyGone {
+		return nil, nil
+	}
+
+	// A removed placement configuration cannot turn an allocated VM into a
+	// legacy guest and bypass its durable cleanup authority.
+	liveConfig, configErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if configErr != nil {
+		return nil, cpierrors.Retriable("delete_vm: cannot verify allocation provenance for VM %s", vmCID)
+	}
+	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(liveConfig)); markerErr != nil || managed {
+		return nil, cpierrors.Cloud("delete_vm: allocation provenance requires its original storage journal authority")
+	}
+
+	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
+	if deps.Config != nil {
+		inflightRelease, inflightErr := deps.Inflight.acquire(ctx, node, deps.Config.MaxInflightPerNodeLimit())
+		if inflightErr != nil {
+			return nil, cpierrors.Retriable("delete_vm: in-flight limit exceeded or context cancelled on node %s: %s", node, inflightErr.Error())
+		}
+		defer inflightRelease()
+	}
+
+	// --- fast-path branch: tag-and-return without terminal-state poll ---
+	// When fast_path_delete is enabled the handler must return in bounded time
+	// regardless of PVE task behaviour. This requires bypassing ALL unbounded
+	// AwaitTaskWithLogger calls — including the stop-task await that
+	// stopVMBeforeDelete performs. The fast path therefore takes its own stop
+	// approach: issue Stop fire-and-forget (UPID discarded, no await), then
+	// issue DeleteQemu with skiplock=true so PVE destroys the VM even if it is
+	// still running or holds a config lock. The destroy call itself is NOT
+	// awaited — the UPID is discarded and the handler returns immediately.
+	//
+	// skiplock=true is restricted to the root@pam superuser authenticated via
+	// password — PVE rejects it for any other identity regardless of role or
+	// privilege, including an API token owned by root@pam, so no ACL grant on
+	// a least-privilege token (or any token at all) can enable it; run the
+	// CPI as root@pam with a password to use it.
+	//
+	// Eventual consistency: a subsequent has_vm call may briefly still see the
+	// VM while PVE's async destroy runs. The bosh-deleting tag marks VMs whose
+	// fast-path destroy was issued but may not have completed; sweepFastDeleteStragglers
+	// reaps them on the next fast-path delete (a self-draining work queue), so a
+	// stalled async destroy is retried automatically rather than left for manual
+	// `qm destroy <vmid>` cleanup.
+	//
+	// The fast path bypasses the §7.15 operation-timeout envelope naturally:
+	// no poll loop runs; the handler returns as soon as the destroy API call
+	// returns (which itself is bounded by the HTTP transport timeout).
+	if deps.Config.FastPathDeleteEnabled() {
+		if fpErr := fastPathDeleteVM(ctx, deps, node, vmCID, vmid, logger); fpErr != nil {
+			return nil, fpErr
+		}
+		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+		return nil, nil
+	}
+
+	return deleteLegacyVMAndArtifacts(ctx, deps, node, vmCID, vmid, vmTags, logger)
+}
+
+func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID string, vmid int, vmTags string, logger *log.Logger) (any, error) {
+	// --- HA anti-affinity / DLB / node-affinity pin cleanup (best-effort) ---
+	cleanupHAMembership(ctx, deps, vmid, logger)
+
+	// --- stop VM (synchronous path) ---
+	if stopDone, stopErr := stopVMBeforeDelete(ctx, deps, node, vmid, vmCID, logger); stopErr != nil {
+		return nil, stopErr
+	} else if stopDone {
+		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+		return nil, nil
+	}
+
+	// --- protect attached persistent disks: detach foreign-VMID volumes so
+	//     the destroy below cannot take them; refuse if a detach is not
+	//     guaranteed (fail-closed, retriable) ---
+	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
+		return nil, protErr
+	}
+
+	// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
+	// retained=true whenever the retain tag is present (even if a prior attempt
+	// already unlinked the disk); DestroyUnreferencedDisks must be false on that
+	// path. See function doc.
+	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
+	if retainErr != nil {
+		return nil, retainErr
+	}
+
+	// --- guard: refuse to destroy if a persistent volume is still attached ---
+	if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
+		return nil, guardErr
+	}
+
+	// --- opt-in empty-pool reaper: capture membership BEFORE destroy ---
+	// The /cluster/resources row for this vmid (and therefore its pool
+	// membership) disappears once the VM is destroyed, and delete_vm has
+	// no env.bosh to re-derive a pool name from -- so the lookup must run
+	// here, before the destroy call below.
+	reapPool := capturePoolForReap(ctx, deps, vmid, logger)
+
+	// --- delete VM (synchronous path; see destroyVMWithRecovery for the
+	//     purge/DestroyUnreferencedDisks semantics and recovery ladder) ---
+	deleteResp, alreadyGone, deleteErr := destroyVMWithRecovery(ctx, deps, node, vmCID, vmid, retained, logger)
+	if deleteErr != nil {
+		return nil, deleteErr
+	}
+	if alreadyGone {
+		cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+		return nil, nil
+	}
+
+	// Await the destroy task so the VM is fully purged from PVE before we
+	// return. DeleteQemu returns a UPID as a json.RawMessage; an empty or
+	// null response means PVE completed synchronously and no await is needed.
+	if awaitErr := awaitDeleteTask(ctx, deps, node, vmCID, deleteResp, logger); awaitErr != nil {
+		return nil, awaitErr
+	}
+
+	// --- opt-in empty-pool reaper: run AFTER the destroy has completed so
+	//     PVE has already dropped this VM's pool membership. Never fails
+	//     delete_vm -- every branch is logged and swallowed.
+	reapEmptyPoolIfManaged(ctx, deps, reapPool, logger)
+
+	// --- agent cleanup ---
+	cleanupAgentForVM(ctx, deps, node, vmid, logger)
+
+	// --- advertised-route SDN subnet cleanup (provenance-tagged, refcounted,
+	//     entirely fail-open — see delete_vm_routes.go) ---
+	cleanupAdvertisedRoutes(ctx, deps, vmid, vmTags, logger)
+
+	logger.Info("delete_vm: VM deleted successfully", log.String("node", node))
+	return nil, nil
 }
 
 // parseDeleteVMArgs extracts and validates the vm_cid argument, returning the
@@ -1050,152 +1065,11 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 // on unrelated volume names.
 const ephemeralVolidInfix = "-ephemeral-"
 
-// detachRetainedEphemeralDisk checks whether the VM carries the tagRetainEphemeral
-// tag and, when it does, finds every ephemeral disk slot (volid containing
-// "vm-<vmid>-ephemeral-"), unlinks each with force=false (which demotes the disk to
-// unusedN), then sweeps each unusedN config entry to remove the config reference
-// without freeing storage.
-//
-// Returns (true, nil) whenever the tag is present — including when no active
-// ephemeral slot remains (a prior attempt may already have unlinked+swept it, leaving
-// the volume unreferenced with a matching VMID). Tag presence, not unlink success,
-// gates the destroy flag so retried deletes and the straggler sweep stay safe. The
-// caller MUST pass DestroyUnreferencedDisks=false to the subsequent DeleteQemu when
-// retained==true:
-//
-//	DestroyUnreferencedDisks=true instructs PVE to free every volume that (a) is not
-//	referenced in the config AND (b) has a VMID matching the VM being destroyed. After
-//	the unlink+sweep sequence the ephemeral volume is unreferenced (config entry gone)
-//	and has a matching VMID — so DestroyUnreferencedDisks=true would destroy it. Setting
-//	the flag to false on the retain path is the only mechanism that keeps the volume.
-//
-//	Residual: on a retain-flagged VM, ANY other unreferenced own-VMID volumes (e.g. an
-//	old orphan from a prior failed create) also survive. This is conservative by design;
-//	scripts/disk-audit can inventory them.
-//
-// Returns (false, nil) when the tag is absent (byte-identical path: no extra config read,
-// no API calls, DestroyUnreferencedDisks unchanged).
-//
-// Unlink mechanics:
-//  1. UpdateQemuUnlink(force=false) → PVE moves the slot to unusedN; storage untouched.
-//  2. Re-read VM config to find the resulting unusedN slot for this volid.
-//  3. UpdateQemuConfig(Delete: "unusedN") → removes the config reference only; storage intact.
-//  4. Caller sets DestroyUnreferencedDisks=false → DeleteQemu leaves the now-unreferenced
-//     volume alone.
-//
-//nolint:gocognit // Multi-step unlink+sweep per ephemeral slot; each step individually simple.
-func detachRetainedEphemeralDisk(
-	ctx context.Context,
-	deps Deps,
-	node, vmCID string,
-	vmid int,
-	logger *log.Logger,
-) (retained bool, err error) {
-	// --- read VM config to check for tagRetainEphemeral ---
-	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
-	if cfgErr != nil {
-		if pve.IsNotFound(cfgErr) {
-			return false, nil
-		}
-		return false, cpierrors.Wrap(pve.WrapError(cfgErr),
-			fmt.Sprintf("delete_vm: read config for VM %s to check retain-ephemeral tag", vmCID))
-	}
-
-	tagsRaw, _ := pve.ConfigString(vmCfg, jsonKeyTags)
-	if !tagsContain(tagsRaw, tagRetainEphemeral) {
-		return false, nil // flag not set — byte-identical path; no API calls
-	}
-
-	// Find ephemeral disk slots: active bus slots whose bare volid contains
-	// "-ephemeral-" and whose embedded VMID matches the VM's own VMID.
-	// EmbeddedDiskVMID matches "vm-<n>-disk-<n>" only; ephemeral uses a different
-	// naming convention so a string-infix check is required.
-	ephemeralSlots := findEphemeralActiveDisks(vmCfg, vmid)
-	if len(ephemeralSlots) == 0 {
-		// Tag present but no active ephemeral slot. Either a prior delete attempt
-		// already unlinked+swept the disk (the volume now sits unreferenced with a
-		// matching VMID — exactly what DestroyUnreferencedDisks=true would free),
-		// or the VM never had an ephemeral disk. Return retained=true in both
-		// cases: tag presence, not unlink success, must gate the destroy flag, or
-		// a retried delete would destroy the volume the first attempt preserved.
-		logger.Info("delete_vm: retain_ephemeral_on_delete set, no active ephemeral slot (already detached or none); forcing DestroyUnreferencedDisks=false",
-			log.String("vmid", vmCID))
-		return true, nil
-	}
-
-	slots := make([]string, 0, len(ephemeralSlots))
-	for slot := range ephemeralSlots {
-		slots = append(slots, slot)
-	}
-	sort.Strings(slots)
-
-	for _, slot := range slots {
-		volid := ephemeralSlots[slot]
-
-		// Step 1: unlink with force=false → PVE demotes slot to unusedN, storage intact.
-		unlinkErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.retain_ephemeral_unlink", 0, func() error {
-			return deps.PVE.Nodes().UpdateQemuUnlink(ctx, node, vmCID, &sdknodes.UpdateQemuUnlinkParams{
-				Idlist: slot,
-			})
-		})
-		if unlinkErr != nil {
-			return false, cpierrors.Retriable(
-				"delete_vm: retain_ephemeral_on_delete: could not unlink ephemeral slot %s (volid=%s) on VM %s: %s (retry re-attempts)",
-				slot, volid, vmCID, unlinkErr.Error())
-		}
-
-		// Step 2: re-read config to find the unusedN slot the unlink created.
-		postUnlinkCfg, postErr := deps.PVE.QEMU().Config(ctx, node, vmid)
-		if postErr != nil {
-			if pve.IsNotFound(postErr) {
-				return false, nil
-			}
-			return false, cpierrors.Wrap(pve.WrapError(postErr),
-				fmt.Sprintf("delete_vm: retain_ephemeral_on_delete: re-read config after unlink for VM %s slot %s", vmCID, slot))
-		}
-
-		// Step 3: find the unusedN slot that now holds our volid and delete that
-		// config entry (UpdateQemuConfig Delete removes only the config reference;
-		// storage is left intact). After this sweep the volume is unreferenced.
-		// The caller MUST then pass DestroyUnreferencedDisks=false — see function doc.
-		unusedSlot := ""
-		for unusedKey, unusedVolid := range pve.FindUnusedDiskEntries(postUnlinkCfg) {
-			if unusedVolid == volid || strings.HasPrefix(unusedVolid, volid+",") {
-				unusedSlot = unusedKey
-				break
-			}
-		}
-
-		if unusedSlot != "" {
-			deleteKey := unusedSlot
-			sweepErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.retain_ephemeral_sweep", 0, func() error {
-				return deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
-					&sdknodes.UpdateQemuConfigParams{Delete: &deleteKey})
-			})
-			if sweepErr != nil {
-				return false, cpierrors.Retriable(
-					"delete_vm: retain_ephemeral_on_delete: could not sweep unusedN entry %s (volid=%s) on VM %s: %s (retry re-attempts; volume is safe)",
-					unusedSlot, volid, vmCID, sweepErr.Error())
-			}
-			logger.Warn("delete_vm: retain_ephemeral_on_delete: ephemeral disk unlinked and config ref swept; caller will set DestroyUnreferencedDisks=false to preserve volume",
-				log.String("vmid", vmCID),
-				log.String("slot", slot),
-				log.String("volid", volid),
-			)
-			retained = true
-		} else {
-			// The unusedN entry may have already been swept (SDK auto-sweep).
-			// Treat as retained: we cannot confirm the config ref is gone, so
-			// use DestroyUnreferencedDisks=false as the conservative choice.
-			logger.Warn("delete_vm: retain_ephemeral_on_delete: ephemeral disk unlinked; no unusedN entry found after unlink (may have been auto-swept); setting retained=true conservatively",
-				log.String("vmid", vmCID),
-				log.String("slot", slot),
-				log.String("volid", volid),
-			)
-			retained = true
-		}
-	}
-	return retained, nil
+// detachRetainedEphemeralDisk transfers retained ephemeral volumes to parkers
+// before destroying their original VM. Removing unused entries would physically
+// delete VM-owned volumes, so retention never uses the old unused-slot sweep.
+func detachRetainedEphemeralDisk(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) (bool, error) {
+	return retainLegacyEphemeralDisks(ctx, deps, node, vmCID, vmid, logger)
 }
 
 // findEphemeralActiveDisks returns every (slot -> bare volid) on an active bus slot
@@ -1383,4 +1257,31 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 		logger.Warn("delete_vm: reaper: empty-pool reap failed (non-fatal)",
 			log.String("pool", poolID), log.Err(deleteErr))
 	}
+}
+
+func legacySweepConfig(ctx context.Context, deps Deps, node string, vmid int, sweepLogger *log.Logger) (map[string]any, string, bool) {
+	strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if strCfgErr != nil {
+		if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
+			sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
+			return nil, "", false
+		}
+		sweepLogger.Warn("delete_vm: straggler sweep: config read failed; deferring straggler to next sweep (non-fatal)",
+			log.Err(strCfgErr))
+		return nil, "", false
+	}
+	// Re-test the deleting tag from the authoritative config, not the
+	// index row. Tag absent means the row is stale — this VMID's current
+	// occupant was never marked for deletion, so it must not be destroyed.
+	authTags, _ := pve.ConfigString(strCfg, jsonKeyTags)
+	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(strCfg)); markerErr != nil || managed {
+		sweepLogger.Warn("delete_vm: allocation provenance requires journal reconciliation; skipping legacy sweep")
+		return nil, "", false
+	}
+	if !tagsContain(authTags, tagDeletingVM) {
+		sweepLogger.Warn("delete_vm: straggler sweep: index row is stale — the VM's authoritative config does not carry the deleting tag; skipping (VMID likely reused by a live VM)")
+		return nil, "", false
+	}
+
+	return strCfg, authTags, true
 }

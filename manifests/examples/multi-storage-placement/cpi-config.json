@@ -1,0 +1,104 @@
+{
+  "cpis": [
+    {
+      "name": "pve-1",
+      "type": "pve",
+      "properties": {
+        "pve": {
+          "host": "pve-1.example.com",
+          "user": "bosh@pve",
+          "api_token": "bosh@pve!cpi=REPLACE_WITH_API_TOKEN",
+          "node": "pve1-node1",
+          "network_bridge": "vmbr0",
+          "vm_storage": "nfs-ephemeral-01",
+          "disk_storage": "nfs-persistent-01",
+          "stemcell_storage": "nfs-images",
+          "iso_storage": "nfs-iso",
+          "storage_placement_namespace": "production-director-pve1",
+          "storage_sets": {
+            "ephemeral": {
+              "names": [
+                "nfs-ephemeral-01",
+                "nfs-ephemeral-02",
+                "nfs-ephemeral-03"
+              ],
+              "strategy": {
+                "name": "spread",
+                "version": 1
+              }
+            },
+            "persistent": {
+              "names": [
+                "nfs-persistent-01",
+                "nfs-persistent-02"
+              ],
+              "strategy": {
+                "name": "weighted_free_space",
+                "version": 1
+              }
+            }
+          },
+          "ephemeral_storage_set": "ephemeral",
+          "persistent_storage_set": "persistent",
+          "require_disjoint_storage_sets": true,
+          "vmid_range_start": 100,
+          "vmid_range_end": 999,
+          "disk_vmid_range_start": 9000,
+          "disk_vmid_range_end": 9999,
+          "stemcell_template_vmid_range_start": 30000,
+          "stemcell_template_vmid_range_end": 30499
+        }
+      }
+    },
+    {
+      "name": "pve-2",
+      "type": "pve",
+      "properties": {
+        "pve": {
+          "host": "pve-2.example.com",
+          "user": "bosh@pve",
+          "api_token": "bosh@pve!cpi=REPLACE_WITH_API_TOKEN",
+          "node": "pve2-node1",
+          "network_bridge": "vmbr0",
+          "vm_storage": "nfs-ephemeral-01",
+          "disk_storage": "nfs-persistent-01",
+          "stemcell_storage": "nfs-images",
+          "iso_storage": "nfs-iso",
+          "storage_placement_namespace": "production-director-pve2",
+          "storage_sets": {
+            "ephemeral": {
+              "names": [
+                "nfs-ephemeral-01",
+                "nfs-ephemeral-02",
+                "nfs-ephemeral-03"
+              ],
+              "strategy": {
+                "name": "spread",
+                "version": 1
+              }
+            },
+            "persistent": {
+              "names": [
+                "nfs-persistent-01",
+                "nfs-persistent-02"
+              ],
+              "strategy": {
+                "name": "weighted_free_space",
+                "version": 1
+              }
+            }
+          },
+          "ephemeral_storage_set": "ephemeral",
+          "persistent_storage_set": "persistent",
+          "require_disjoint_storage_sets": true,
+          "vmid_range_start": 1100,
+          "vmid_range_end": 1999,
+          "disk_vmid_range_start": 19000,
+          "disk_vmid_range_end": 19999,
+          "stemcell_template_vmid_range_start": 30500,
+          "stemcell_template_vmid_range_end": 30999
+        }
+      }
+    }
+  ]
+}

@@ -70,6 +70,14 @@ var contextOverrideFieldOrder = []string{
 	"pve_vm_disk_format",
 	"pve_agent_mbus",
 	"pve_placement",
+	"pve_storage_sets",
+	"pve_storage_capacity_domains",
+	"pve_ephemeral_storage_set",
+	"pve_persistent_storage_set",
+	"pve_root_storage_set",
+	"pve_storage_placement_namespace",
+	"pve_require_disjoint_storage_sets",
+	"pve_storage_status_max_age_seconds",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -78,6 +86,22 @@ var contextOverrideFieldOrder = []string{
 // must have a matching entry here (asserted by TestContextOverrideFieldOrder
 // in context_overrides_test.go) or ApplyContextOverrides would silently skip it.
 var contextOverrideFields = map[string]func(*CPIConfig, any) error{
+	"pve_storage_sets": func(c *CPIConfig, v any) error { return applyStoragePlacementOverride(c, "storage_sets", v) },
+	"pve_storage_capacity_domains": func(c *CPIConfig, v any) error {
+		return applyStoragePlacementOverride(c, "storage_capacity_domains", v)
+	},
+	"pve_ephemeral_storage_set":  func(c *CPIConfig, v any) error { return applyStoragePlacementOverride(c, "ephemeral_storage_set", v) },
+	"pve_persistent_storage_set": func(c *CPIConfig, v any) error { return applyStoragePlacementOverride(c, "persistent_storage_set", v) },
+	"pve_root_storage_set":       func(c *CPIConfig, v any) error { return applyStoragePlacementOverride(c, "root_storage_set", v) },
+	"pve_storage_placement_namespace": func(c *CPIConfig, v any) error {
+		return applyStoragePlacementOverride(c, "storage_placement_namespace", v)
+	},
+	"pve_require_disjoint_storage_sets": func(c *CPIConfig, v any) error {
+		return applyStoragePlacementOverride(c, "require_disjoint_storage_sets", v)
+	},
+	"pve_storage_status_max_age_seconds": func(c *CPIConfig, v any) error {
+		return applyStoragePlacementOverride(c, "storage_status_max_age_seconds", v)
+	},
 	"pve_host": func(c *CPIConfig, v any) error {
 		s, err := coerceOverrideString(v)
 		if err != nil {
@@ -170,7 +194,7 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		if err != nil {
 			return err
 		}
-		c.ISOStorage = s
+		c.SetISOStoragePolicy(s)
 		return nil
 	},
 	"pve_network_bridge": func(c *CPIConfig, v any) error {
@@ -549,7 +573,7 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 //   - effective: base when no override key is present; otherwise a shallow
 //     copy of base with only the matched fields replaced. Every field NOT
 //     named in contextOverrideFieldOrder — including every pointer, slice,
-//     and map field other than VerifySSL — is shared with base by the
+//     and map field other than storage-placement policy — is shared with base by the
 //     shallow copy: an overridden request inherits ALL other job-level
 //     policy (hooks, otel, retry curves, ...) unconditionally. VerifySSL and
 //     Placement are the pointer fields this function may itself write, and
@@ -609,8 +633,11 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 		return base, nil, nil, nil
 	}
 	extra = flattenNestedContextOverrides(extra)
+	if err := validateStoragePlacementContext(base, base, extra); err != nil {
+		return nil, nil, nil, err
+	}
 
-	eff := *base // shallow copy — see doc comment above.
+	eff := base.CloneStoragePlacement() // isolate mutable storage policy for this request.
 	// Start from the pre-defaulting shape of the parker band, so an entry that
 	// sets one bound does not silently inherit the other from ApplyDefaults and
 	// an entry that sets none can be told apart from one that named the built-in
@@ -669,6 +696,10 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	// of parking entirely, would otherwise fail validation below for every
 	// request routed to it. See reevaluateParkedDefaultAfterOverrides.
 	eff.reevaluateParkedDefaultAfterOverrides()
+
+	if err := validateStoragePlacementContext(base, &eff, extra); err != nil {
+		return nil, nil, nil, err
+	}
 
 	if validateErr := eff.Validate(); validateErr != nil {
 		return nil, nil, nil, fmt.Errorf("config: effective override config failed validation: %w", validateErr)

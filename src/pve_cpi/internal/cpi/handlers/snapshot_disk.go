@@ -32,7 +32,7 @@ import (
 //
 // If the disk is not attached to any VM, the handler returns a CloudError.
 func HandleSnapshotDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (result any, operationErr error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
@@ -62,6 +62,14 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "snapshot_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
+		}
+		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "snapshot_disk")
+		if lifecycleErr != nil {
+			return nil, lifecycleErr
+		}
+		if lifecycle != nil {
+			rd = lifecycle.disk
+			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 		bareDiskCID = rd.volid
 

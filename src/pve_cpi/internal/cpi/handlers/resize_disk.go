@@ -43,7 +43,7 @@ import (
 //
 //nolint:gocognit // Multi-phase orchestration not yet decomposed; flagged for follow-up extraction (see .golangci.yml comment). Behaviour-preserving refactor scope-deferred.
 func HandleResizeDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (result any, operationErr error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
@@ -73,6 +73,14 @@ func HandleResizeDisk(deps Deps) Handler {
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "resize_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
+		}
+		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "resize_disk")
+		if lifecycleErr != nil {
+			return nil, lifecycleErr
+		}
+		if lifecycle != nil {
+			rd = lifecycle.disk
+			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 		bareDiskCID = rd.volid
 

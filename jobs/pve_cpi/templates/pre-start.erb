@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PACKAGES_DIR="$(cd "${JOB_DIR}/../../packages" && pwd)"
+exec "${PACKAGES_DIR}/pve_cpi/bin/cpi" provision-journal --config "${JOB_DIR}/config/cpi.json" --owner vcap

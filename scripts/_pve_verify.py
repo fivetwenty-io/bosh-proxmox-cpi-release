@@ -6,10 +6,15 @@
 
 The lifecycle harness drives bin/cpi and trusts the CPI's JSON-RPC return
 values. This module verifies the *actual* cluster state out-of-band by querying
-the PVE REST API directly, reusing the host and auth from the same CPI config
+the PVE REST API, reusing the host and auth from the same CPI config
 the CPI binary was given. It lets the harness assert that the CPI and the
 cluster agree (e.g. after create_network the vnet really exists; after
 delete_vm the VM is really gone).
+
+Set PVE_VERIFY_TRANSPORT=pmx to run inspections through pmx. Set
+PVE_VERIFY_PMX_BIN to select a candidate pmx executable. This mode requires
+a pmx build that honors tls.ca-cert when the CPI config declares a custom CA.
+Without the transport setting, the verifier uses Python's urllib client.
 
 Stdlib only — scripts/lifecycle declares no pip dependencies and imports this
 module, so it must not pull anything in.
@@ -36,9 +41,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import ssl
+import subprocess
 import sys
+import tempfile
 import zlib
 import urllib.error
 import urllib.parse
@@ -327,19 +335,31 @@ class PVEVerifier:
     """Minimal read-only PVE REST API client built from a CPI config dict."""
 
     def __init__(self, config: dict[str, Any]) -> None:
+        self._transport = os.environ.get("PVE_VERIFY_TRANSPORT", "urllib")
+        if self._transport not in {"urllib", "pmx"}:
+            raise PVEVerifyError("PVE_VERIFY_TRANSPORT must be urllib or pmx")
+        self._ca = config.get("pve_ca_cert") or ""
         host = str(config.get("host", "")).strip()
         if not host:
             raise PVEVerifyError("cpi config missing 'host'")
         self.host = host
         self.port = int(config.get("port", 8006) or 8006)
         self.node = str(config.get("node", "")).strip()
-        # The harness always synthesizes verify_ssl=false; default to false so a
-        # self-signed lab cert never blocks verification.
-        self.verify_ssl = bool(config.get("verify_ssl", False))
+        # Match the CPI default while preserving an explicit lab-only opt-out.
+        verify_ssl = config.get("verify_ssl")
+        if verify_ssl is not None and type(verify_ssl) is not bool:
+            raise PVEVerifyError("verify_ssl must be a boolean")
+        self.verify_ssl = verify_ssl is not False
         self.base = f"https://{self.host}:{self.port}/api2/json"
 
         if self.verify_ssl:
-            self._ssl = ssl.create_default_context()
+            ca = config.get("pve_ca_cert") or None
+            if ca is not None and not isinstance(ca, str):
+                raise PVEVerifyError("pve_ca_cert must be PEM text")
+            try:
+                self._ssl = ssl.create_default_context(cadata=ca)
+            except (ssl.SSLError, ValueError) as error:
+                raise PVEVerifyError("pve_ca_cert is not a usable CA certificate") from error
         else:
             self._ssl = ssl.create_default_context()
             self._ssl.check_hostname = False
@@ -387,6 +407,7 @@ class PVEVerifier:
             with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise PVEVerifyError(
                 f"PVE ticket auth failed: HTTP {exc.code} {exc.reason}"
             ) from exc
@@ -401,6 +422,8 @@ class PVEVerifier:
 
     def _get(self, path: str) -> Any:
         """GET <base><path>; return the parsed 'data' field. Raise on any error."""
+        if self._transport == "pmx":
+            return self._pmx_get(path)
         self._ensure_ticket()
         req = urllib.request.Request(f"{self.base}{path}", method="GET")
         if self._token:
@@ -411,12 +434,72 @@ class PVEVerifier:
             with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise PVEVerifyError(
                 f"GET {path} failed: HTTP {exc.code} {exc.reason}"
             ) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise PVEVerifyError(f"GET {path} failed: {exc}") from exc
         return payload.get("data")
+
+    def _pmx_get(self, path: str) -> Any:
+        """Inspect through pmx using this verifier's exact endpoint and trust.
+
+        Set PVE_VERIFY_TRANSPORT=pmx to enable this transport. The generated
+        context also preserves fault-proxy endpoints and per-cluster routing.
+        PVE_VERIFY_PMX_BIN may select an isolated candidate executable.
+        """
+        parsed = urllib.parse.urlsplit(path)
+        if not path.startswith("/") or parsed.scheme or parsed.netloc or parsed.fragment:
+            raise PVEVerifyError("pmx inspection requires a relative API path")
+        auth = {"type": "password", "username": self._username_with_realm(),
+                "secret": "${PVE_VERIFY_PMX_SECRET}"}
+        secret = self._password
+        if self._token:
+            identity, separator, secret = self._token.partition("=")
+            username, bang, token_id = identity.partition("!")
+            if not separator or not bang or not username or not token_id or not secret:
+                raise PVEVerifyError("pmx inspection requires a complete API token")
+            auth.update(type="token", username=username)
+            auth["token-id"] = token_id
+        # Each request owns its files and environment; concurrent clusters and
+        # proxies cannot overwrite one another's credentials or CA bundle.
+        with tempfile.TemporaryDirectory(prefix="pve-verify-pmx-") as directory:
+            root = Path(directory)
+            tls = {"insecure": not self.verify_ssl}
+            if self.verify_ssl and self._ca:
+                ca_file = root / "ca.pem"
+                ca_file.write_text(self._ca, encoding="utf-8")
+                ca_file.chmod(0o600)
+                tls["ca-cert"] = str(ca_file)
+            context = {"host": self.host, "port": self.port, "protocol": "https",
+                       "realm": self._realm, "auth": auth, "tls": tls}
+            config_file = root / "config.json"
+            config_file.write_text(json.dumps({"current-context": "cpi-verifier",
+                                               "contexts": {"cpi-verifier": context}}), encoding="utf-8")
+            config_file.chmod(0o600)
+            command = [os.environ.get("PVE_VERIFY_PMX_BIN", "pmx"),
+                       "--config", str(config_file), "--context", "cpi-verifier",
+                       "--output", "json", "--no-log", "api", "get", parsed.path]
+            for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+                command.extend(["--data", f"{key}={value}"])
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("PMX_")}
+            environment["PVE_VERIFY_PMX_SECRET"] = secret
+            try:
+                result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        timeout=45, check=False)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise PVEVerifyError("pmx inspection could not complete") from error
+            if result.returncode:
+                # CLI errors can include server-controlled content; do not
+                # forward them into reports that may be published.
+                raise PVEVerifyError(f"pmx inspection failed (exit {result.returncode})")
+            try:
+                return json.loads(result.stdout)
+            except (ValueError, UnicodeDecodeError) as error:
+                raise PVEVerifyError("pmx inspection returned invalid JSON") from error
 
     def _require_node(self) -> str:
         if not self.node:

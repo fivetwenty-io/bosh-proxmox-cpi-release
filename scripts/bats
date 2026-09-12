@@ -91,6 +91,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import _checkouts  # noqa: E402
+import _release_artifact
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
 import _rundoc  # noqa: E402
@@ -660,6 +661,9 @@ def write_run_doc(
         env_table=[
             ("CPI release", "cpi_version"),
             ("Director CPI release", "director_cpi_release"),
+            ("Director CPI artifact version", "director_cpi_version"),
+            ("Director CPI SHA256", "director_cpi_sha256"),
+            ("Director CPI source commit", "director_cpi_source_commit"),
             ("BATS revision", "bats_ref"),
             ("BOSH director", "director_version"),
             ("Stemcell", "stemcell"),
@@ -827,9 +831,9 @@ class BATS:
         )
         ok = ok and present
 
-        vars_present = BOSH_VARS.exists() or self.dry_run
+        vars_present = Path(self.cfg["bosh_vars"]).exists() or self.dry_run
         self.rep.record(
-            "file:manifests/bosh/vars.yml", PASS if vars_present else FAIL, 0.0,
+            "file:" + self.cfg["bosh_vars"], PASS if vars_present else FAIL, 0.0,
             "present" if vars_present else "MISSING (copy from vars.yml.example)",
         )
         ok = ok and vars_present
@@ -1131,23 +1135,23 @@ class BATS:
         )
 
     def _ensure_light_stemcell(self) -> "_lightstemcell.LightStemcell":
-        """Mirror scripts/bosh: derive the light stemcell from vars.yml with
-        env-bundle layering, ensure the qcow2 is on PVE, build the tarball."""
-        source_url = _bosh_int_opt(BOSH_VARS, "/stemcell_url")
-        source_sha1 = _bosh_int_opt(BOSH_VARS, "/stemcell_sha1")
-        if not source_url or not source_sha1:
-            raise RuntimeError(
-                "stemcell_url/stemcell_sha1 missing from manifests/bosh/vars.yml"
-            )
-        os_name, version = _lightstemcell.parse_os_version(source_url)
-        mode = (layered_var(self.env_name, "/light_stemcell_mode") or "preuploaded").strip()
-        fetch_url = (layered_var(self.env_name, "/stemcell_fetch_url") or "").strip()
-        token = (layered_var(self.env_name, "/stemcell_fetch_token") or "").strip()
+        """Use explicit integration variables; retain env layering for the default file."""
+        vars_path = Path(self.cfg["bosh_vars"])
 
         def _reader(path: str) -> "str | None":
-            return layered_var(self.env_name, path)
+            if vars_path.resolve() == BOSH_VARS.resolve():
+                return layered_var(self.env_name, path)
+            return _bosh_int_opt(vars_path, path)
 
-        cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_reader)
+        source_url = _reader("/stemcell_url")
+        source_sha1 = _reader("/stemcell_sha1")
+        if not source_url or not source_sha1:
+            raise RuntimeError("stemcell_url/stemcell_sha1 missing from " + str(vars_path))
+        os_name, version = _lightstemcell.parse_os_version(source_url)
+        mode = (_reader("/light_stemcell_mode") or "preuploaded").strip()
+        fetch_url = (_reader("/stemcell_fetch_url") or "").strip()
+        token = (_reader("/stemcell_fetch_token") or "").strip()
+        cpi_cfg = _lightstemcell.pve_cfg_from_bosh_vars(vars_path, reader=_reader)
         print(
             f"    light stemcell ({mode}): ensuring {os_name} {version} "
             f"is available on PVE (host {cpi_cfg['host']})"
@@ -1355,12 +1359,22 @@ class BATS:
         self.rep.section("finalize")
         ok = True
 
-        # BATS replaced the director's cloud config with its own generated
-        # one; put the env's cloud config back so the lab is usable again.
-        restore_ok, _ = self.runner.step(
-            "director:restore-cloud-config", [BOSH_SCRIPT, "ucc"], timeout=300,
-        )
-        ok = ok and restore_ok
+        if self.dry_run:
+            self.rep.skip("director:restore-cloud-config", "dry-run")
+        else:
+            restore_ok, _ = self.runner.step(
+                "director:restore-cloud-config", ["bosh", "-n", "update-cloud-config", str(self.baseline_cloud_path)],
+                env=self._director_env(), timeout=300,
+            )
+            ok = ok and restore_ok
+            if restore_ok:
+                read_ok, raw = self.runner.capture("director:verify-cloud-config", ["bosh", "cloud-config"], env=self._director_env(), timeout=60)
+                try:
+                    matches = read_ok and yaml.safe_load(raw) == self.baseline_cloud
+                except yaml.YAMLError:
+                    matches = False
+                self.rep.record("director:baseline-restored", PASS if matches else FAIL, 0.0, "observed cloud configuration comparison")
+                ok = ok and matches
 
         if self.args.skip_doc or self.dry_run:
             self.rep.skip("docs:report", "--skip-doc" if self.args.skip_doc else "dry-run")
@@ -1421,6 +1435,8 @@ class BATS:
             else "unknown (PVE_CPI_RELEASE_PATH not set)"
         )
 
+        cpi_artifact = _release_artifact.report_identity(Path(release_path) if release_path else None)
+
         pve_version = "unknown"
         try:
             cpi_cfg = _integration.build_cpi_config(self.cfg, dry_run=False)
@@ -1475,6 +1491,9 @@ class BATS:
             "skipped": rspec["skipped"] if rspec else None,
             "cpi_version": cpi_version,
             "director_cpi_release": director_cpi_release,
+            "director_cpi_version": cpi_artifact["version"],
+            "director_cpi_sha256": cpi_artifact["sha256"],
+            "director_cpi_source_commit": os.environ.get("PVE_CPI_RELEASE_COMMIT", "unknown"),
             "bats_ref": bats_ref,
             "director_version": self.director_version or "unknown",
             "stemcell": f"{self.stemcell_name}/{self.stemcell_version}",
@@ -1505,10 +1524,30 @@ class BATS:
 
     # -- orchestration ------------------------------------------------------- #
 
+    def capture_baseline_cloud(self) -> bool:
+        if self.dry_run:
+            return True
+        ok, raw = self.runner.capture("director:baseline-cloud-config", ["bosh", "cloud-config"], env=self._director_env(), timeout=60)
+        try:
+            cloud = yaml.safe_load(raw) if ok else None
+        except yaml.YAMLError:
+            cloud = None
+        if not isinstance(cloud, dict):
+            self.rep.record("director:baseline-cloud-config", FAIL, 0.0, "an existing cloud configuration is required before BATS")
+            return False
+        self.baseline_cloud = cloud
+        self.baseline_cloud_path = self.run_dir / "baseline-cloud-config.yml"
+        with self.baseline_cloud_path.open("x") as stream:
+            stream.write(raw)
+        self.baseline_cloud_path.chmod(0o600)
+        return True
+
     def dispatch(self) -> bool:
         if not self.preflight():
             return False
         if not self.prepare():
+            return False
+        if not self.capture_baseline_cloud():
             return False
         rspec_ok = self.run_rspec()
         finalize_ok = self.finalize(rspec_ok)

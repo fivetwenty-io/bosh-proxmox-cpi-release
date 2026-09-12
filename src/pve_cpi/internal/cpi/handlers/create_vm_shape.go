@@ -83,7 +83,12 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// Best-effort: populate vmStorageType for the clone-mode decision in
 	// cloneFromTemplate. A lookup error leaves the field "" which
 	// IsLinkedCloneSupported treats as linked-capable (permissive).
-	vmStorageType := lookupVMStorageType(ctx, deps, vmStorage)
+	vmStorageType := ""
+	if parsed.storagePlan != nil {
+		vmStorageType = parsed.storagePlan.Definitions[vmStorage].Type
+	} else {
+		vmStorageType = lookupVMStorageType(ctx, deps, vmStorage)
+	}
 
 	// rootDiskKeyVal is the PVE VM config key the root disk lands on: virtio0
 	// (default) or scsi0 (pve.root_disk_bus=scsi).
@@ -138,7 +143,19 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		balloonMiB = &n
 	}
 
-	ephemeralDiskGiB, ephemeralStorage, err := resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
+	var ephemeralDiskGiB int
+	var ephemeralStorage string
+	switch {
+	case parsed.storagePlan != nil:
+		if target, ok := managedVMRoleTarget(parsed.storagePlan, storageRoleEphemeral); ok {
+			ephemeralDiskGiB, err = managedVMGiB(target.VirtualBytes)
+			ephemeralStorage = target.StorageID
+		}
+	case parsed.storageSelection != nil && parsed.storageSelection.Ephemeral != nil && parsed.storageSelection.Ephemeral.Atomic:
+		ephemeralDiskGiB, ephemeralStorage, err = resolveAtomicVMEphemeral(ctx, deps, cp, parsed.storageSelection.Ephemeral)
+	default:
+		ephemeralDiskGiB, ephemeralStorage, err = resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +254,29 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 	}
 
 	// Storage pool resolution: explicit pool → storage_tier (if tierFn wired) → config → stemcell fallback.
-	if pool, ok := r.String("storage_pool"); ok {
+	if parsed.storagePlan != nil {
+		target, ok := managedVMRoleTarget(parsed.storagePlan, "root")
+		if !ok {
+			return "", "", 0, cpierrors.Cloud("managed VM plan has no root target")
+		}
+		vmStorage = target.StorageID
+	} else if parsed.storageSelection != nil && parsed.storageSelection.Root != nil && parsed.storageSelection.Root.Atomic {
+		role := parsed.storageSelection.Root
+		switch role.Kind {
+		case "pool":
+			vmStorage = role.Value
+		case "tier":
+			if resolveTier == nil {
+				return "", "", 0, cpierrors.Cloud("atomic root tier resolution unavailable")
+			}
+			vmStorage, err = resolveTier(role.Value)
+			if err != nil {
+				return "", "", 0, err
+			}
+		default:
+			return "", "", 0, cpierrors.Cloud("set selector requires frozen plan")
+		}
+	} else if pool, ok := r.String("storage_pool"); ok {
 		vmStorage = pool
 	} else if tier, hasTier := r.String("storage_tier"); hasTier && resolveTier != nil {
 		resolved, tierErr := resolveTier(tier)
@@ -296,6 +335,13 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 		requestedGiB := (requestedMiB + 1023) / 1024
 		if requestedGiB > rootDiskGiB {
 			rootDiskGiB = requestedGiB
+		}
+	}
+	if parsed.storagePlan != nil {
+		target, _ := managedVMRoleTarget(parsed.storagePlan, "root")
+		rootDiskGiB, err = managedVMGiB(target.VirtualBytes)
+		if err != nil {
+			return "", "", 0, err
 		}
 	}
 	return vmStorage, vmDiskFormat, rootDiskGiB, nil

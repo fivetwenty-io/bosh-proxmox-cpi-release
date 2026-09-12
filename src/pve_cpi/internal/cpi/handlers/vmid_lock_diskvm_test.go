@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -326,7 +327,10 @@ func TestDeleteVM_StampDeletingTag_LockAcquiredBeforeRead(t *testing.T) {
 		&mockQEMUService{
 			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 				events = append(events, "qemu-config")
-				return map[string]any{"tags": "existing-tag"}, nil
+				if slices.Contains(events, "create:"+expectedPool) {
+					return map[string]any{"tags": "fresh-under-lock"}, nil
+				}
+				return map[string]any{"tags": "preflight-tag"}, nil
 			},
 			stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 				return "upid-stop", nil
@@ -359,24 +363,20 @@ func TestDeleteVM_StampDeletingTag_LockAcquiredBeforeRead(t *testing.T) {
 		t.Errorf("bosh-deleting tag must be written; got tags=%q", gotTags)
 	}
 
-	// Lock acquire must precede the Config read for the stamp.
-	acquireIdx, readIdx := -1, -1
-	for i, ev := range events {
-		if ev == "create:"+expectedPool && acquireIdx == -1 {
-			acquireIdx = i
-		}
-		if ev == "qemu-config" && readIdx == -1 {
-			readIdx = i
-		}
+	if !strings.Contains(gotTags, "fresh-under-lock") || strings.Contains(gotTags, "preflight-tag") {
+		t.Fatalf("stamp must merge the configuration reread under the lock, got tags=%q", gotTags)
 	}
-	if acquireIdx == -1 {
-		t.Fatalf("lock never acquired; events=%v", events)
+
+	// The ownership preflight may read configuration before locking. The tag
+	// mutation must use a fresh read after acquisition and write before release.
+	acquireIdx := slices.Index(events, "create:"+expectedPool)
+	writeIdx := slices.Index(events, "update-config")
+	releaseIdx := slices.Index(events, "delete:"+expectedPool)
+	if acquireIdx < 0 || writeIdx <= acquireIdx || releaseIdx <= writeIdx {
+		t.Fatalf("tag write must occur while the lock is held; events=%v", events)
 	}
-	if readIdx == -1 {
-		t.Fatalf("qemu-config never read; events=%v", events)
-	}
-	if acquireIdx >= readIdx {
-		t.Errorf("lock acquire(%d) must precede qemu-config read(%d); events=%v", acquireIdx, readIdx, events)
+	if !slices.Contains(events[acquireIdx+1:writeIdx], "qemu-config") {
+		t.Fatalf("stamp must reread configuration after acquiring the lock; events=%v", events)
 	}
 }
 

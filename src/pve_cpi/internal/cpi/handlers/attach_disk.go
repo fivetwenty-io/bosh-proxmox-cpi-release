@@ -78,7 +78,7 @@ type diskHints struct {
 // order (see the System field comment in create_vm.go's agentCfg
 // construction) finds it correctly either way with no agent-config change.
 func HandleAttachDisk(deps Deps) Handler {
-	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
+	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (result any, operationErr error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
 		if err != nil {
 			return nil, err
@@ -107,6 +107,14 @@ func HandleAttachDisk(deps Deps) Handler {
 		rd, err := resolveDiskForOp(ctx, deps, "attach_disk", diskCID, bareDiskCID, meta)
 		if err != nil {
 			return nil, err
+		}
+		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "attach_disk")
+		if lifecycleErr != nil {
+			return nil, lifecycleErr
+		}
+		if lifecycle != nil {
+			rd = lifecycle.disk
+			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 
 		// --------------------------------------------------------------------
@@ -341,6 +349,9 @@ func attachDiskConfigPut(
 	// instead of the bare volid: cloudcheck membership fidelity (see
 	// pve.UpdateAttachedDiskCID doc comment). Best-effort: never fails the
 	// attach.
+	if err := writeManagedDiskHolder(ctx, deps, rd, node, vmid, rd.volid); err != nil {
+		return "", "", err
+	}
 	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
 
 	return diskID, devicePath, nil
@@ -420,6 +431,9 @@ func attachDiskViaTransfer(
 	// the parker's provenance entry (matched by the pre-move volid it
 	// recorded). Both best-effort — the drive serial is the authoritative
 	// carrier by this point.
+	if err := writeManagedDiskHolder(ctx, deps, rd, node, vmid, rd.volid); err != nil {
+		return "", "", err
+	}
 	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
 	pve.RemoveParkerProvenanceEntry(ctx, deps.PVE, deps.Log(ctx), plan.parker.Node, plan.parker.VMID, preVolid, parkerCfg)
 

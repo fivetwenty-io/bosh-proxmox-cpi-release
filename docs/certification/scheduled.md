@@ -11,6 +11,8 @@ gh workflow run acceptance.yml --repo fivetwenty-io/bosh-proxmox-cpi-release -f 
 
 `skip_bats=true` runs certify alone, which is the cheaper first probe after any change to the workflow, the CI image, or the lab. The workflow's `concurrency: group: lab` serializes it with every other lab-touching workflow, so a manual dispatch queues behind a running one rather than colliding with it.
 
+For an unpublished CPI build, follow [candidate artifact certification](candidate-artifacts.md).
+
 ## One-time setup
 
 The workflow reads its lab access from repository configuration, all of which exists as of 2026-08-21:

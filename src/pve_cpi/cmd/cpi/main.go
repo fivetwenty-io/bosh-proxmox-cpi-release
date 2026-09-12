@@ -342,6 +342,12 @@ func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.
 // deferred calls (including signal.NotifyContext's cancel) fire before the
 // process exits.
 func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts runOptions) int {
+	if len(args) > 0 && args[0] == "storage-journal" {
+		return runStorageJournal(args[1:], stdout, stderr, opts)
+	}
+	if len(args) > 0 && args[0] == "provision-journal" {
+		return runProvisionJournal(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("cpi", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (required)")
@@ -414,29 +420,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// spans/logs/metrics. A flush/export failure is logged at Warn and never
 	// changes the process's exit code: every deadline is bounded, and an
 	// export failure must never fail a CPI action.
-	defer func() {
-		timeoutMs := cfg.OTel.ExportTimeoutMs
-		if timeoutMs <= 0 {
-			timeoutMs = defaultOTelShutdownTimeoutMs
-		}
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-		defer shutdownCancel()
-		if shutdownErr := otelShutdown(shutdownCtx); shutdownErr != nil {
-			logger.Warn("otel shutdown/flush failed", log.ErrScrubbed(shutdownErr))
-		}
-
-		logsShutdownCtx, logsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-		defer logsShutdownCancel()
-		if shutdownErr := logsShutdown(logsShutdownCtx); shutdownErr != nil {
-			logger.Warn("otel logs shutdown/flush failed", log.ErrScrubbed(shutdownErr))
-		}
-
-		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-		defer metricsShutdownCancel()
-		if shutdownErr := metricsShutdown(metricsShutdownCtx); shutdownErr != nil {
-			logger.Warn("otel metrics shutdown/flush failed", log.ErrScrubbed(shutdownErr))
-		}
-	}()
+	defer shutdownOTelSignals(cfg, logger, otelShutdown, logsShutdown, metricsShutdown)
 
 	clientFactory := opts.ClientFactory
 	if clientFactory == nil {
@@ -475,6 +459,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// effective iso_storage value. A no-op (zero PVE calls) when the operator
 	// explicitly disabled the flag, or when iso_storage was pinned to
 	// anything other than the spec default "local".
+	// Retain the operator pin/sentinel for later set-managed request planning.
+	cfg.CaptureISOStoragePolicy()
 	cfg.ISOStorage = agent.ResolveISOStorage(rootCtx, cfg, client, logger)
 
 	// When agent_mode="auto", the primary boot agent is always configdrive.
@@ -643,15 +629,20 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		BaseHost: cfg.Host,
 	}
 
+	storageMetrics, storageMetricsErr := handlers.NewStoragePlacementMetrics(meter)
+	if storageMetricsErr != nil {
+		logger.Warn("storage metrics unavailable", log.ErrScrubbed(storageMetricsErr))
+	}
 	handlers.RegisterAll(d, handlers.Deps{
-		Config:        cfg,
-		PVE:           client,
-		Agent:         bootAgent,
-		Logger:        logger,
-		Resolver:      backendResolver,
-		NodeEndpoints: nodeEndpoints,
-		Inflight:      handlers.NewInflightRegistry(),
-		Overrides:     overrideRuntime,
+		StorageMetrics: storageMetrics,
+		Config:         cfg,
+		PVE:            client,
+		Agent:          bootAgent,
+		Logger:         logger,
+		Resolver:       backendResolver,
+		NodeEndpoints:  nodeEndpoints,
+		Inflight:       handlers.NewInflightRegistry(),
+		Overrides:      overrideRuntime,
 	})
 
 	maxLine := opts.MaxLineBytes
@@ -1001,4 +992,28 @@ func recordResponseWriteFailureSpan(
 	failSpan.RecordError(errors.New(msg))
 	failSpan.SetStatus(codes.Error, msg)
 	failSpan.End()
+}
+
+func shutdownOTelSignals(cfg *config.CPIConfig, logger *log.Logger, otelShutdown, logsShutdown, metricsShutdown func(context.Context) error) {
+	timeoutMs := cfg.OTel.ExportTimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = defaultOTelShutdownTimeoutMs
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer shutdownCancel()
+	if shutdownErr := otelShutdown(shutdownCtx); shutdownErr != nil {
+		logger.Warn("otel shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+	}
+
+	logsShutdownCtx, logsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer logsShutdownCancel()
+	if shutdownErr := logsShutdown(logsShutdownCtx); shutdownErr != nil {
+		logger.Warn("otel logs shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+	}
+
+	metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer metricsShutdownCancel()
+	if shutdownErr := metricsShutdown(metricsShutdownCtx); shutdownErr != nil {
+		logger.Warn("otel metrics shutdown/flush failed", log.ErrScrubbed(shutdownErr))
+	}
 }

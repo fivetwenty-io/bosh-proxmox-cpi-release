@@ -23,7 +23,9 @@ import gzip
 import http.client
 import io
 import json
+import os
 import ssl
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -139,6 +141,36 @@ class TestPVEVerifierConstruction(unittest.TestCase):
             path = f.name
         with self.assertRaises(PVEVerifyError):
             PVEVerifier.from_config_file(path)
+
+    def test_omitted_or_null_tls_setting_keeps_verification_enabled(self) -> None:
+        for mode in ("omitted", "null"):
+            with self.subTest(mode=mode):
+                cfg = _token_config()
+                if mode == "omitted":
+                    del cfg["verify_ssl"]
+                else:
+                    cfg["verify_ssl"] = None
+                verifier = PVEVerifier(cfg)
+                self.assertTrue(verifier.verify_ssl)
+                self.assertTrue(verifier._ssl.check_hostname)
+                self.assertEqual(verifier._ssl.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_custom_ca_is_loaded_into_verifier_context(self) -> None:
+        with unittest.mock.patch("_pve_verify.ssl.create_default_context") as create:
+            verifier = PVEVerifier(_token_config(verify_ssl=True, pve_ca_cert="declared CA PEM"))
+            create.assert_called_once_with(cadata="declared CA PEM")
+            self.assertIs(verifier._ssl, create.return_value)
+
+    def test_invalid_tls_settings_fail_before_network_use(self) -> None:
+        for value in ("false", 0, 1, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(PVEVerifyError):
+                    PVEVerifier(_token_config(verify_ssl=value))
+        with self.assertRaises(PVEVerifyError):
+            PVEVerifier(_token_config(verify_ssl=True, pve_ca_cert="invalid PEM"))
+        verifier = PVEVerifier(_token_config(verify_ssl=False, pve_ca_cert="unused PEM"))
+        self.assertFalse(verifier._ssl.check_hostname)
+        self.assertEqual(verifier._ssl.verify_mode, ssl.CERT_NONE)
 
     def test_verify_ssl_true_creates_default_context(self) -> None:
         cfg = _token_config(verify_ssl=True)
@@ -767,6 +799,17 @@ class TestPasswordAuth(unittest.TestCase):
             with self.assertRaises(PVEVerifyError) as ctx:
                 v.vnet_exists("cpitest0")
             self.assertIn("401", str(ctx.exception))
+
+    def test_http_error_responses_are_closed(self) -> None:
+        for cfg in (_password_config(), _token_config()):
+            with self.subTest(password_auth="password" in cfg):
+                error = _make_http_error(401, "Unauthorized")
+                with unittest.mock.patch.object(error, "close", wraps=error.close) as close:
+                    with unittest.mock.patch("urllib.request.urlopen", side_effect=error):
+                        with self.assertRaises(PVEVerifyError):
+                            PVEVerifier(cfg).vnet_exists("cpitest0")
+                    close.assert_called_once()
+                self.assertTrue(error.closed)
 
     def test_ticket_fetch_malformed_json_raises(self) -> None:
         v = PVEVerifier(_password_config())
@@ -1677,6 +1720,85 @@ class TestStableDiskIdentity(unittest.TestCase):
                 v, "current_disk_volid", return_value="data:vm-700-disk-1"
             ):
                 self.assertTrue(v.parked_disk_recorded(90000, id_cid))
+
+
+class TestPMXTransport(unittest.TestCase):
+    def test_exact_proxy_identity_private_files_and_query(self):
+        paths = []
+        def invoke(command, **kwargs):
+            config_path = Path(command[command.index("--config") + 1])
+            paths.append(config_path)
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(config_path.parent.stat().st_mode & 0o777, 0o700)
+            config = json.loads(config_path.read_text())
+            context = config["contexts"]["cpi-verifier"]
+            self.assertEqual(context["host"], "127.0.0.1")
+            self.assertEqual(context["port"], 42443)
+            self.assertEqual(context["auth"]["username"], "proxy@pam")
+            self.assertEqual(context["auth"]["token-id"], "capability")
+            self.assertTrue(context["tls"]["insecure"])
+            self.assertEqual(kwargs["env"]["PVE_VERIFY_PMX_SECRET"], "$literal=secret")
+            self.assertNotIn("PMX_CONTEXT", kwargs["env"])
+            self.assertNotIn("$literal=secret", config_path.read_text())
+            self.assertNotIn("$literal=secret", " ".join(command))
+            self.assertEqual(command[-5:], ["api", "get", "/cluster/resources", "--data", "type=vm"])
+            return subprocess.CompletedProcess(command, 0, b'[{"vmid":901}]', b'')
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT":"pmx", "PMX_CONTEXT":"wrong"}), \
+                unittest.mock.patch("_pve_verify.subprocess.run", side_effect=invoke), \
+                unittest.mock.patch("_pve_verify.urllib.request.urlopen") as direct:
+            verifier = PVEVerifier(_token_config(host="127.0.0.1", port=42443,
+                                               api_token="proxy@pam!capability=$literal=secret"))
+            self.assertEqual(verifier._get("/cluster/resources?type=vm"), [{"vmid":901}])
+            direct.assert_not_called()
+        self.assertFalse(paths[0].exists())
+
+    def test_password_and_declared_ca(self):
+        def invoke(command, **kwargs):
+            config = json.loads(Path(command[command.index("--config") + 1]).read_text())
+            context = config["contexts"]["cpi-verifier"]
+            self.assertEqual(context["auth"]["type"], "password")
+            self.assertEqual(context["auth"]["username"], "owner@pve")
+            self.assertEqual(kwargs["env"]["PVE_VERIFY_PMX_SECRET"], "password")
+            self.assertFalse(context["tls"]["insecure"])
+            ca = Path(context["tls"]["ca-cert"])
+            self.assertEqual(ca.read_text(), "test PEM")
+            self.assertEqual(ca.stat().st_mode & 0o777, 0o600)
+            return subprocess.CompletedProcess(command, 0, b'{"running":true}', b'')
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT":"pmx"}), \
+                unittest.mock.patch("_pve_verify.ssl.create_default_context"), \
+                unittest.mock.patch("_pve_verify.subprocess.run", side_effect=invoke):
+            verifier = PVEVerifier(_password_config(user="owner@pve", password="password",
+                                                  verify_ssl=True, pve_ca_cert="test PEM"))
+            self.assertEqual(verifier._get("/status"), {"running":True})
+
+    def test_failures_never_fall_back_or_expose_stderr(self):
+        for result in (subprocess.CompletedProcess([], 1, b'', b'secret credential'),
+                       subprocess.CompletedProcess([], 0, b'bad JSON', b''),
+                       FileNotFoundError("secret credential"),
+                       subprocess.TimeoutExpired("secret credential", 45)):
+            with self.subTest(result=type(result).__name__), \
+                    unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT":"pmx"}), \
+                    unittest.mock.patch("_pve_verify.subprocess.run") as run, \
+                    unittest.mock.patch("_pve_verify.urllib.request.urlopen") as direct:
+                if isinstance(result, Exception):
+                    run.side_effect = result
+                else:
+                    run.return_value = result
+                with self.assertRaises(PVEVerifyError) as caught:
+                    PVEVerifier(_token_config())._get("/nodes")
+                self.assertNotIn("secret credential", str(caught.exception))
+                direct.assert_not_called()
+
+    def test_invalid_transport_and_absolute_paths_rejected(self):
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT":"typo"}):
+            with self.assertRaises(PVEVerifyError):
+                PVEVerifier(_token_config())
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT":"pmx"}), \
+                unittest.mock.patch("_pve_verify.subprocess.run") as run:
+            for path in ("https://other/nodes", "//other/nodes", "/nodes#fragment", "--help"):
+                with self.assertRaises(PVEVerifyError):
+                    PVEVerifier(_token_config())._get(path)
+            run.assert_not_called()
 
 
 if __name__ == "__main__":

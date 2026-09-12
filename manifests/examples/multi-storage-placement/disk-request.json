@@ -1,0 +1,10 @@
+{
+  "method": "create_disk",
+  "arguments": [
+    102400,
+    {
+      "storage_set": "persistent"
+    },
+    ""
+  ]
+}

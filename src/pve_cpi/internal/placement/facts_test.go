@@ -726,3 +726,42 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 		t.Error("pve3: expected InMaintenance=false")
 	}
 }
+
+// Real PVE /cluster/status reports membership only; compute counters are
+// supplied separately by /cluster/resources. Both static and managed placement
+// use these facts for CPU and free-memory admission.
+func TestGatherNodeFacts_RealMembershipAndNodeResources(t *testing.T) {
+	statuses := cluster.ListStatusResponse{
+		json.RawMessage(`{"type":"node","name":"pve1","online":1}`),
+		json.RawMessage(`{"type":"node","name":"pve2","online":0}`),
+		json.RawMessage(`{"type":"node","name":"pve3","online":1}`),
+	}
+	resources := cluster.ListResourcesResponse{
+		json.RawMessage(`{"type":"node","node":"pve1","maxcpu":"8","maxmem":"8589934592","mem":"2147483648","cpu":"0.125"}`),
+		json.RawMessage(`{"type":"node","node":"pve2","maxcpu":8,"maxmem":8589934592,"mem":0,"status":"online"}`),
+		json.RawMessage(`{"type":"node","node":"not-a-member","maxcpu":64,"maxmem":8589934592,"mem":0}`),
+		resourceQEMUWithMem("pve1", "stopped", 1*gib, "stopped"),
+	}
+	cl := &stubCluster{statusResp: &statuses, resResp: &resources}
+	facts, err := placement.GatherNodeFacts(t.Context(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("membership changed: %+v", facts)
+	}
+	first := facts[0]
+	if first.MaxCPU != 8 || first.TotalMemBytes != 8*gib || first.FreeMemBytes != 6*gib || first.CPUUsed != 0.125 || first.CommittedMemBytes != gib || first.GuestCount != 1 {
+		t.Fatalf("actual node and guest facts not merged: %+v", first)
+	}
+	pass, rejected := placement.Filter(facts, placement.Request{RequiredCPU: 1, RequiredMemBytes: 2 * gib})
+	if len(pass) != 1 || pass[0].Node != "pve1" || rejected["pve2"] != "node offline" || rejected["pve3"] != "insufficient CPU" {
+		t.Fatalf("admission did not preserve membership and missing-facts constraints: pass=%+v rejected=%v", pass, rejected)
+	}
+	// An old status counter cannot override a current resource observation.
+	statuses[0] = statusNode("pve1", 1, 1*gib, 1*gib, 1, 0.9)
+	facts, err = placement.GatherNodeFacts(t.Context(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{})
+	if err != nil || facts[0].MaxCPU != 8 || facts[0].FreeMemBytes != 6*gib {
+		t.Fatalf("resource observation was not authoritative: %+v %v", facts, err)
+	}
+}

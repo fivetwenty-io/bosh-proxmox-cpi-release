@@ -210,13 +210,40 @@ func TestAwaitTask_Adaptive_TransientErrorThenSucceeds(t *testing.T) {
 	}
 }
 
-// TestAwaitTask_Adaptive_NotFoundIsNonRetriable verifies a not-found task UPID is
-// classified non-retriable (preserves IsNotFound) in the adaptive loop.
+// TestAwaitTask_Adaptive_InitialNotFoundThenSucceeds covers PVE's task
+// registration race: the mutation returned a UPID, but its first status read
+// has not reached the task index yet.
+func TestAwaitTask_Adaptive_InitialNotFoundThenSucceeds(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			calls++
+			if calls == 1 {
+				return nil, sdkerrors.ErrNotFound
+			}
+			return &sdktasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:new"); err != nil {
+		t.Fatalf("initial task-index miss must be retried, got: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one registration miss and one terminal read, got %d calls", calls)
+	}
+}
+
+// TestAwaitTask_Adaptive_NotFoundIsNonRetriable verifies a UPID that remains
+// absent after the bounded registration window is classified non-retriable.
 func TestAwaitTask_Adaptive_NotFoundIsNonRetriable(t *testing.T) {
 	defer pve.SetAdaptiveTaskPollForTest(true)()
 
+	calls := 0
 	svc := &mockTasksService{
 		getStatusFn: func(_ context.Context, _, _ string) (*sdktasks.Status, error) {
+			calls++
 			return nil, sdkerrors.ErrNotFound
 		},
 	}
@@ -230,6 +257,34 @@ func TestAwaitTask_Adaptive_NotFoundIsNonRetriable(t *testing.T) {
 	}
 	if !pve.IsNotFound(err) {
 		t.Errorf("not-found classification must be preserved, got: %v", err)
+	}
+	if calls != 4 {
+		t.Errorf("expected initial read plus three registration retries, got %d calls", calls)
+	}
+}
+
+// TestAwaitTask_Adaptive_DisappearanceIsImmediatelyNonRetriable ensures the
+// registration allowance applies only before the task has ever been observed.
+func TestAwaitTask_Adaptive_DisappearanceIsImmediatelyNonRetriable(t *testing.T) {
+	defer pve.SetAdaptiveTaskPollForTest(true)()
+
+	calls := 0
+	svc := &mockTasksService{
+		getStatusFn: func(_ context.Context, _, upid string) (*sdktasks.Status, error) {
+			calls++
+			if calls == 1 {
+				return &sdktasks.Status{Status: "running", UpID: upid}, nil
+			}
+			return nil, sdkerrors.ErrNotFound
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	err := pve.AwaitTask(ctx, newMockClient(svc), "node1", "UPID:node1:vanished")
+	if err == nil || !pve.IsNotFound(err) || cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("observed task disappearance must be an immediate permanent failure, got: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("observed disappearance must not consume registration retries; got %d calls", calls)
 	}
 }
 

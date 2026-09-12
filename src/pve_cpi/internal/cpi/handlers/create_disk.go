@@ -282,6 +282,15 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, err
 		}
 
+		selection, selectorErr := ResolveStoragePlacementSelectors(deps.Config, "create_disk", callCP, false)
+		if selectorErr != nil {
+			return nil, cpierrors.Cloud("create_disk: %s", selectorErr)
+		}
+		if selection.SetManaged {
+			return createManagedDisk(ctx, deps, args, selection, sizeMB, cloudProps, vmCID, r)
+		}
+		r = managedDiskLegacyResolver(r, selection)
+
 		// Resolve encrypted flag: per-call > global > false.
 		// layeredResolver.Bool reads call/disk_type/vm_type layers; global is the
 		// CPIConfig.Encrypted field. When neither is set, encrypted=false → no filter.

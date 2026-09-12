@@ -55,6 +55,17 @@ type CPIConfig struct {
 	// stay opt-in by construction and need no gate.
 	NodeEndpointsDiscovery *bool `json:"node_endpoints_discovery,omitempty"`
 
+	// Named storage placement is opt-in; unused definitions do not activate it.
+	StorageSets                 map[string]StorageSet            `json:"storage_sets,omitempty"`
+	StorageCapacityDomains      map[string]StorageCapacityDomain `json:"storage_capacity_domains,omitempty"`
+	EphemeralStorageSet         string                           `json:"ephemeral_storage_set,omitempty"`
+	PersistentStorageSet        string                           `json:"persistent_storage_set,omitempty"`
+	RootStorageSet              string                           `json:"root_storage_set,omitempty"`
+	StoragePlacementNamespace   string                           `json:"storage_placement_namespace,omitempty"`
+	StorageAllocationJournalDir string                           `json:"storage_allocation_journal_dir,omitempty"`
+	RequireDisjointStorageSets  *bool                            `json:"require_disjoint_storage_sets,omitempty"`
+	StorageStatusMaxAgeSeconds  *int                             `json:"storage_status_max_age_seconds,omitempty"`
+
 	// Storage
 	VMStorage   string `json:"vm_storage"`
 	DiskStorage string `json:"disk_storage"`
@@ -90,6 +101,11 @@ type CPIConfig struct {
 	// cephfs) whenever any of those HA-driven features is active. See
 	// RequireSharedISOForHA and ISOStorageFollowVMStorage.
 	ISOStorage string `json:"iso_storage,omitempty"`
+
+	// Private original pin/sentinel survives defaults and runtime ISO resolution.
+	// These values are intentionally absent from serialized config snapshots.
+	isoStorageOriginal       string
+	isoStoragePolicyCaptured bool
 
 	// RequireSharedISOForHA escalates the config-drive ISO migration-safety
 	// Warn (emitted by create_vm whenever the VM is HA-registered under DLB,
@@ -272,9 +288,9 @@ type CPIConfig struct {
 	VMIDRangeStart int `json:"vmid_range_start,omitempty"`
 	// VMIDRangeEnd is the inclusive upper bound of the VMID range for VM
 	// allocation. VMs are allocated in [VMIDRangeStart, VMIDRangeEnd].
-	// Defaults to 8999. Must be > VMIDRangeStart and <= 8999 (the disk range
-	// begins at 9000). Persistent disks use synthetic VMIDs 9000-29999
-	// (unaffected by this field).
+	// Defaults to 8999. Must be greater than VMIDRangeStart and at most
+	// 999999999, the PVE maximum. The VM, persistent-disk, template, and active
+	// parker allocation bands must not overlap; each has separate bounds.
 	VMIDRangeEnd int `json:"vmid_range_end,omitempty"`
 	// VMIDAllocAttempts is the maximum number of retries for VMID-conflict
 	// recovery in create_vm / create_disk. ≤0 → use the handler default (5).
@@ -2269,6 +2285,8 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.ISOStorage == "" {
 		c.ISOStorage = "local"
 	}
+	// Preserve the unresolved operator/default choice before runtime resolution.
+	c.CaptureISOStoragePolicy()
 	if c.Hotplug == nil {
 		s := "network,disk,cpu,memory"
 		c.Hotplug = &s
@@ -3873,6 +3891,9 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateOperationTimeout(&errs)
 	c.validateOTel(&errs)
 	c.validateStorageTiers(&errs)
+	if err := c.ValidateStoragePlacement(); err != nil {
+		errs = append(errs, err.Error())
+	}
 	c.validateDiskPerformance(&errs)
 	c.validateVMPool(&errs)
 	c.validateStemcellTemplatePool(&errs)

@@ -3748,6 +3748,10 @@ func TestCreateVM_NoGroupsNoFirewall_ZeroFirewallAPICalls(t *testing.T) {
 func buildVMDepsWithStorage(q *vmMockQEMU, n *vmMockNodes, c *vmMockCluster, a *vmMockAgent, stor *mockStorageService) handlers.Deps {
 	d := buildVMDeps(q, n, c, a)
 	d.PVE.(*mockPVEClient).storageSvc = stor
+	d.PVE.(*mockPVEClient).clusterStorageSvc = &multiClusterStorage{entries: []map[string]any{
+		{"storage": storageName, "type": "lvmthin"},
+		{"storage": "fast-ssd", "type": "zfspool"},
+	}}
 	return d
 }
 
@@ -3891,8 +3895,10 @@ func TestHandleCreateVM_Ephemeral_ExplicitPool(t *testing.T) {
 func TestHandleCreateVM_Ephemeral_CreateFail_VMRolledBack(t *testing.T) {
 	t.Parallel()
 
+	createVolumeCalled := false
 	stor := &mockStorageService{
 		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			createVolumeCalled = true
 			return "", errors.New("storage pool full")
 		},
 	}
@@ -3909,6 +3915,9 @@ func TestHandleCreateVM_Ephemeral_CreateFail_VMRolledBack(t *testing.T) {
 		defaultNetMap(), []string{}, map[string]any{})
 
 	_, err := h.Handle(context.Background(), args, mkCtx("eph-fail"))
+	if !createVolumeCalled {
+		t.Fatal("expected the storage allocation failure to be exercised")
+	}
 	if err == nil {
 		t.Fatal("expected error from CreateVolume failure, got nil")
 	}

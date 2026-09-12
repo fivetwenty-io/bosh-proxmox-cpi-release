@@ -62,6 +62,11 @@ func HandleHasDisk(deps Deps) Handler {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
+		if rd.allocation != nil {
+			// Managed resolution already verified physical membership and
+			// visibility. Do not replace that proof with a legacy image probe.
+			return !rd.allocation.terminalAbsent && !rd.allocation.absent, nil
+		}
 		if rd.holder != nil || rd.intent != nil {
 			deps.Log(ctx).Debug("has_disk: resolved by identity scan",
 				log.String("disk_cid", diskCID),

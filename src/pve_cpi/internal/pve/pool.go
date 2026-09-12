@@ -47,6 +47,13 @@ func PoolProvenance(director string) string {
 	return PoolProvenanceComment + " (director " + director + ")"
 }
 
+// PoolEnsurer lets a mutation decorator classify create-if-missing outcomes
+// inside its durable mutation boundary. Direct CreatePool retains its exclusive
+// creation semantics, including for pool-based locks.
+type PoolEnsurer interface {
+	EnsurePoolExists(context.Context, string, string) error
+}
+
 // EnsurePoolExists creates the PVE resource pool poolID with comment if it
 // does not already exist, tolerating a concurrent/prior creation of the same
 // pool. It is the single create-if-missing entry point used by both the
@@ -100,6 +107,10 @@ func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string, log
 	pools := c.Pools()
 	if pools == nil {
 		return cpierrors.Cloud("EnsurePoolExists: PVE client has no pool service")
+	}
+
+	if managed, ok := pools.(PoolEnsurer); ok {
+		return managed.EnsurePoolExists(ctx, poolID, comment)
 	}
 
 	err := RetryOnTransientOrLock(ctx, logger, "pool.ensure_exists", 0, func() error {

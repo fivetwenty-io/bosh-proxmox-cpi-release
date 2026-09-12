@@ -340,6 +340,8 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	// paths take the normalized mode from config.BootAgentMode.
 	cfgForBoot := *cfg
 	cfgForBoot.AgentMode = cfg.BootAgentMode()
+	// This copy preserves inherited operator policy without mutating shared cfg.
+	cfgForBoot.CaptureISOStoragePolicy()
 	cfgForBoot.ISOStorage = agent.ResolveISOStorage(ctx, &cfgForBoot, client, logger)
 
 	// See RequestOverrideRuntime.BaseHost: the explicit node_endpoints map
@@ -406,6 +408,23 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		_, _ = fmt.Fprintf(h, "placement=%s\x00", placementJSON)
 	} else {
 		_, _ = fmt.Fprintf(h, "placement_marshal_error=%s\x00", perr.Error())
+	}
+	// Storage policy belongs to the cached request bundle. Canonical JSON keeps
+	// map iteration order from changing its identity and preserves explicit false.
+	storagePolicy := struct {
+		Sets                                               map[string]config.StorageSet
+		Domains                                            map[string]config.StorageCapacityDomain
+		Ephemeral, Persistent, Root, Namespace, JournalDir string
+		Disjoint                                           *bool
+		MaxAge                                             *int
+	}{cfg.StorageSets, cfg.StorageCapacityDomains, cfg.EphemeralStorageSet,
+		cfg.PersistentStorageSet, cfg.RootStorageSet, cfg.StoragePlacementNamespace,
+		cfg.StorageAllocationJournalDir, cfg.RequireDisjointStorageSets,
+		cfg.StorageStatusMaxAgeSeconds}
+	if policyJSON, err := json.Marshal(storagePolicy); err == nil {
+		_, _ = fmt.Fprintf(h, "storage_policy=%s\x00", policyJSON)
+	} else {
+		_, _ = fmt.Fprintf(h, "storage_policy_marshal_error=%s\x00", err.Error())
 	}
 	pwHash := sha256.Sum256([]byte(cfg.Password))
 	tokHash := sha256.Sum256([]byte(cfg.APIToken))

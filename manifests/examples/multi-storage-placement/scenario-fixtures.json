@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "policy": {
+    "expected_root_mechanism": "full_clone",
+    "stemcell_cid": "REPLACE_WITH_EXISTING_STEMCELL_CID",
+    "vm_cloud_properties": {
+      "cores": 1,
+      "memory": 1024,
+      "root_disk_size": 4096
+    },
+    "networks": {
+      "default": {
+        "type": "dynamic",
+        "cloud_properties": {
+          "bridge": "vmbr0"
+        }
+      }
+    },
+    "environment": {},
+    "ephemeral_size_mib": 1024,
+    "disk_size_mib": 1024,
+    "ephemeral_storage_ids": [
+      "nfs-ephemeral-01",
+      "nfs-ephemeral-02",
+      "nfs-ephemeral-03"
+    ],
+    "persistent_storage_ids": [
+      "nfs-persistent-01",
+      "nfs-persistent-02"
+    ],
+    "root_storage_ids": [
+      "nfs-root-01"
+    ],
+    "fixed_iso_storage_id": "nfs-iso",
+    "encrypted_persistent_storage_ids": [
+      "nfs-persistent-01"
+    ],
+    "escaping_tier_criteria": {
+      "types": [
+        "lvmthin"
+      ],
+      "shared": false
+    }
+  },
+  "faults": {
+    "namespace": "production-director-pve",
+    "disk_size_mib": 64,
+    "backends": []
+  },
+  "recovery": {
+    "workspace": "/absolute/durable/certification-recovery",
+    "cases": [
+      "journal_corrupt",
+      "journal_missing",
+      "journal_stale",
+      "unreturned_cid",
+      "context_isolation",
+      "mixed_legacy_managed"
+    ],
+    "disk_size_mb": 16,
+    "legacy_storage": "legacy-disk-store",
+    "contexts": [
+      "/absolute/path/cluster-a-cpi.json",
+      "/absolute/path/cluster-b-cpi.json"
+    ]
+  },
+  "constraints": {
+    "missing_storage_id": "cert-storage-deliberately-absent",
+    "alias_storage_ids": [
+      "cert-p-alias-a",
+      "cert-p-alias-b"
+    ],
+    "domain_storage_ids": [
+      "cert-domain-export-a",
+      "cert-domain-export-b"
+    ],
+    "restricted_storage": {
+      "storage_id": "cert-node-restricted",
+      "allowed_node": "pve-a",
+      "excluded_node": "pve-b"
+    },
+    "unequal_storage_ids": [
+      "cert-small",
+      "cert-large"
+    ],
+    "stale_delay_seconds": 2
+  },
+  "director": {
+    "dedicated_director": true,
+    "environment": "storage-cert-director",
+    "namespace": "storage-cert-director-owned",
+    "ssh": {
+      "host": "director.example.test",
+      "user": "vcap"
+    },
+    "candidate_archive": "/absolute/artifacts/candidate.tgz",
+    "candidate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "linux_cpi_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "compilation_release": "/absolute/artifacts/storage-workload.tgz",
+    "deployment_manifest": "/absolute/fixtures/workload.json",
+    "cloud_config": "/absolute/fixtures/cloud.json",
+    "baseline_cloud_config": "/absolute/fixtures/original-cloud.json",
+    "compilation_vm_type": "storage-compilation",
+    "expected_root_mechanism": "full_clone",
+    "workload_vm_type": "storage-service",
+    "errand_vm_type": "storage-errand",
+    "errand_name": "storage-check",
+    "resurrection_timeout_seconds": 1200,
+    "rollout": {
+      "candidate_manifest": "/srv/storage-cert/director-candidate.json",
+      "scalar_manifest": "/srv/storage-cert/director-scalar.json",
+      "baseline_manifest": "/srv/storage-cert/director-baseline.json",
+      "state_file": "/srv/storage-cert/bootstrap/state.json",
+      "vars_store": "/srv/storage-cert/bootstrap/vars.json",
+      "baseline_archive": "/srv/storage-cert/artifacts/baseline.tgz",
+      "baseline_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "baseline_linux_cpi_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "observer_policy": {
+      "vm_cloud_properties": {
+        "cores": 1,
+        "memory": 1024,
+        "root_disk_size": 4096
+      },
+      "ephemeral_storage_ids": [
+        "nfs-ephemeral-01",
+        "nfs-ephemeral-02",
+        "nfs-ephemeral-03"
+      ],
+      "root_storage_ids": [
+        "nfs-root-01"
+      ],
+      "persistent_storage_ids": [
+        "nfs-persistent-01",
+        "nfs-persistent-02"
+      ],
+      "fixed_iso_storage_id": "nfs-iso",
+      "ephemeral_size_mib": 1024,
+      "disk_size_mib": 1024,
+      "expected_root_mechanism": "full_clone",
+      "encrypted_persistent_storage_ids": [],
+      "escaping_tier_criteria": {}
+    }
+  }
+}

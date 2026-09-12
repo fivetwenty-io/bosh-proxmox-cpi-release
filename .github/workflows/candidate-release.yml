@@ -1,0 +1,87 @@
+name: Candidate Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOMAXPROCS: 2
+
+jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  candidate:
+    name: Build candidate artifact
+    needs: check
+    if: github.repository == 'fivetwenty-io/bosh-proxmox-cpi-release'
+    runs-on: self-hosted
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:0861097ffeede7570271c78110c4a09d8e4affabecfd0db3eb7c85f99cdf1beb
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Verify and register the public Go blob
+        run: make download-blobs
+
+      - name: Build and verify package binaries
+        run: |
+          set -euo pipefail
+          export BOSH_COMPILE_TARGET="${GITHUB_WORKSPACE}/src"
+          export BOSH_INSTALL_TARGET="${RUNNER_TEMP}/candidate-package/pve_cpi"
+          export BOSH_PACKAGE_VERSION="0.0.0-candidate.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${RUNNER_TEMP}/candidate-package/golang-1.27"
+          tar -xzf blobs/golang-1.27/go1.27.1.linux-amd64.tar.gz \
+            --strip-components=1 -C "${RUNNER_TEMP}/candidate-package/golang-1.27"
+          bash packages/pve_cpi/packaging
+          "${BOSH_INSTALL_TARGET}/bin/cpi" --version
+          "${BOSH_INSTALL_TARGET}/bin/pve-cid" storage-plan --help
+          "${BOSH_INSTALL_TARGET}/bin/cpi" storage-journal initialize --help
+
+      - name: Build candidate archive
+        id: archive
+        run: |
+          set -euo pipefail
+          version="0.0.0-candidate.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          tarball="${RUNNER_TEMP}/candidate.tgz"
+          bosh create-release --force --version="${version}" --tarball="${tarball}"
+          python3 scripts/_release_artifact.py "${tarball}"
+          checksum="$(sha256sum "${tarball}" | cut -d' ' -f1)"
+          echo "tarball=${tarball}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "Candidate run: ${GITHUB_RUN_ID}"
+            echo "Artifact: cpi-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "Source commit: ${GITHUB_SHA}"
+            echo "Release version: ${version}"
+            echo "Tarball SHA256: ${checksum}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Retain candidate archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpi-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.archive.outputs.tarball }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
