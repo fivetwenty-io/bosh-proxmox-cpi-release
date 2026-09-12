@@ -4,7 +4,7 @@ The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certificat
 
 ## Latest run
 
-**PASSED** on 2026-09-05: 0.5.1 to 0.5.2, 37 steps passed, 0 failed, in 58m35s. Full report: [runs/2026-09-05-023803.md](runs/2026-09-05-023803.md).
+**PASSED** on 2026-09-12: 0.5.1 to 0.5.2, 37 steps passed, 0 failed, in 59m18s. Full report: [runs/2026-09-12-023853.md](runs/2026-09-12-023853.md).
 
 | Item | Value |
 |---|---|
@@ -20,6 +20,7 @@ The [BOSH CPI certification](https://github.com/cloudfoundry/bosh-cpi-certificat
 
 | Date | Result | CPI upgrade | Steps failed | Wall clock | Report |
 |---|---|---|---|---|---|
+| 2026-09-12 | PASSED | 0.5.1 to 0.5.2 | 0 | 59m18s | [runs/2026-09-12-023853.md](runs/2026-09-12-023853.md) |
 | 2026-09-05 | PASSED | 0.5.1 to 0.5.2 | 0 | 58m35s | [runs/2026-09-05-023803.md](runs/2026-09-05-023803.md) |
 | 2026-08-29 | PASSED | 0.5.0 to 0.5.1 | 0 | 1h01m15s | [runs/2026-08-29-023417.md](runs/2026-08-29-023417.md) |
 | 2026-08-24 | PASSED | 0.3.0 to 0.4.0 | 0 | 1h00m11s | [runs/2026-08-24-142623.md](runs/2026-08-24-142623.md) |
