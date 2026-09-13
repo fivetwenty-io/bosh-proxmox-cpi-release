@@ -448,7 +448,7 @@ class ParkerRecord:
     """Inventory record for one parker VM."""
 
     __slots__ = (
-        "vmid", "node", "name", "disk_count", "unused_count",
+        "vmid", "node", "name", "pool", "disk_count", "unused_count",
         "config_read", "slot_capacity", "empty",
     )
 
@@ -458,12 +458,19 @@ class ParkerRecord:
         node: str,
         name: str,
         disk_count: int,
+        pool: str = "",
         unused_count: int = 0,
         config_read: bool = True,
     ) -> None:
         self.vmid = vmid
         self.node = node
         self.name = name
+        # The resource pool the cluster index reports for this VM, or the
+        # empty string when the parker sits in no pool. We read it from the
+        # cluster-resources row rather than a per-pool lookup, because this
+        # report describes the cluster as it stands rather than confirming
+        # work that finished moments ago.
+        self.pool = pool
         self.disk_count = disk_count
         # unusedN keys are references too: `qm destroy --purge` walks them and
         # frees the volume behind each one.  A parker holding only unusedN
@@ -481,6 +488,7 @@ class ParkerRecord:
             "vmid": self.vmid,
             "node": self.node,
             "name": self.name,
+            "pool": self.pool,
             "disk_count": self.disk_count,
             "unused_count": self.unused_count,
             "config_read": self.config_read,
@@ -573,7 +581,7 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
     """Collect the full disk and parker inventory from PVE.
 
     Algorithm:
-      1. List all cluster VM resources to build vmid -> {node, name, tags}.
+      1. List all cluster VM resources to build vmid -> {node, name, tags, pool}.
       2. Determine which nodes to scan (all online, or cfg.node if set).
       3. For each node, list storages; enumerate image content. Collect
          all volids whose embedded disk-band VMID falls in [disk_vmid_start,
@@ -617,6 +625,7 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
             "node": str(entry.get("node", "") or ""),
             "name": str(entry.get("name", "") or ""),
             "tags": str(entry.get("tags", "") or ""),
+            "pool": str(entry.get("pool", "") or ""),
         }
 
     # ---- Step 2: node list ----
@@ -785,6 +794,7 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
             vmid=vmid_int,
             node=vm_node,
             name=info["name"],
+            pool=info["pool"],
             disk_count=disk_count,
             unused_count=unused_count,
             config_read=pconfig is not None,
@@ -901,14 +911,15 @@ def print_human_report(
     if parker_records:
         print("PARKER VMs")
         print(
-            f"  {'VMID':>7}  {'NODE':<15}  {'NAME':<30}  {'DISKS':>5}/{31}  "
+            f"  {'VMID':>7}  {'NODE':<15}  {'NAME':<30}  {'POOL':<20}  {'DISKS':>5}/{31}  "
             f"{'UNUSED':>6}  {'EMPTY':>5}"
         )
-        print(f"  {'-'*7}  {'-'*15}  {'-'*30}  {'-'*8}  {'-'*6}  {'-'*5}")
+        print(f"  {'-'*7}  {'-'*15}  {'-'*30}  {'-'*20}  {'-'*8}  {'-'*6}  {'-'*5}")
         for pr in parker_records:
             empty_flag = "YES" if pr.empty else ("?" if not pr.config_read else "")
             print(
                 f"  {pr.vmid:>7}  {pr.node:<15}  {_trunc(pr.name, 30):<30}  "
+                f"{_trunc(pr.pool, 20):<20}  "
                 f"{pr.disk_count:>5}/{31}  {pr.unused_count:>6}  {empty_flag:>5}"
             )
         print()
@@ -972,7 +983,7 @@ def emit_warnings(
     empty_parkers = [pr for pr in parker_records if pr.empty]
     for pr in empty_parkers:
         _warn(
-            f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} is empty "
+            f"parker VM {pr.vmid} ({pr.name}, pool {pr.pool or 'none'}) on node {pr.node} is empty "
             "(0 disks) — teardown candidate: "
             f"qm set {pr.vmid} --protection 0 && qm destroy {pr.vmid} --purge"
         )
@@ -982,7 +993,7 @@ def emit_warnings(
     for pr in parker_records:
         if pr.unused_count > 0:
             _warn(
-                f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} carries "
+                f"parker VM {pr.vmid} ({pr.name}, pool {pr.pool or 'none'}) on node {pr.node} carries "
                 f"{pr.unused_count} unusedN reference(s) to a live volume; "
                 "do NOT destroy it. Clear each with: "
                 f"qm set {pr.vmid} --protection 0 && "
@@ -997,7 +1008,7 @@ def emit_warnings(
     for pr in parker_records:
         if not pr.config_read:
             _warn(
-                f"parker VM {pr.vmid} ({pr.name}) on node {pr.node} config was "
+                f"parker VM {pr.vmid} ({pr.name}, pool {pr.pool or 'none'}) on node {pr.node} config was "
                 "not returned (vanished during the scan, HTTP 404/501); its "
                 "contents are unknown and it is not reported as empty"
             )
