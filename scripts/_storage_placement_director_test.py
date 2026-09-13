@@ -230,9 +230,10 @@ class DirectorTests(unittest.TestCase):
                         return [{"stage":"Applying problem resolutions","state":"finished","task":"VM for '"+task_instance+" (0)' missing"}]
                     return {}
                 value.bosh=bosh
-                value.operation=lambda *args,**kwargs:{}
+                value.operation=unittest.mock.Mock(return_value={})
                 if task_instance==old["instance"]:
                     result=value.resurrection()
+                    value.operation.assert_called_once_with(["delete-vm", "100"])
                     self.assertTrue(result["resurrection_setting_restored"])
                     self.assertIn(["update-resurrection","off"],commands)
                     self.assertTrue(value.runner.report["director_recovery"]["restored"])

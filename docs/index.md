@@ -1,6 +1,6 @@
 # BOSH Proxmox CPI Documentation
 
-Documentation for the BOSH Proxmox CPI — a Cloud Provider Interface (CPI) for managing virtual machines on PVE infrastructure within the BOSH ecosystem.
+This site documents the BOSH Proxmox CPI, a Cloud Provider Interface (CPI) that manages virtual machines on PVE infrastructure within the BOSH ecosystem.
 
 ## Overview
 
@@ -8,15 +8,17 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 ## Table of Contents
 
-- [An Operator's Introduction](intro-overview/index.md): The one-hour operator walkthrough — how the CPI is put together, how it works, and how it is configured, in ten prose chapters with a matching [Slidev deck](presentations/intro-overview/README.md).
+- [An Operator's Introduction](intro-overview/index.md): This one-hour operator walkthrough explains how the CPI is put together, how it works, and how it is configured. It includes ten prose chapters and a matching [Slidev deck](presentations/intro-overview/README.md).
 
-- [An Architecture, From First Principles](architecture/index.md): The thirteen-chapter narrative that derives the design from fundamentals — problem first, principle next, feature last — for architects, engineering managers, and new team members, with a matching [Slidev deck](presentations/architecture/README.md). `make docs-architecture-html` compiles the whole narrative into a single-page HTML edition.
+- [An Architecture, From First Principles](architecture/index.md): This thirteen-chapter narrative derives the design from fundamentals by presenting the problem, then the principle, and then the feature. It serves architects, engineering managers, and new team members, and it has a matching [Slidev deck](presentations/architecture/README.md). `make docs-architecture-html` compiles the whole narrative into a single-page HTML edition.
 
-- [Design Decisions](design-decisions.md): The operator-facing record of the stemcell CID, storage, network, and multi-cluster design decisions — context, options considered, chosen behavior, and migration notes for each.
+- [Design Decisions](design-decisions.md): This operator-facing record explains the context, options, chosen behavior, and migration notes for each stemcell CID, storage, network, and multi-cluster design decision.
 
-- [Multiple NFS Shares Design](designs/multi-storage-placement-design.md) explains the vSphere research, independent role sets, versioned strategies, and recovery contract. Implementation is under review.
+- [Multiple NFS Shares Design](designs/multi-storage-placement-design.md) explains the vSphere research, independent role sets, versioned strategies, and recovery contract.
 
 - [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the feature. Follow the [implementation progress record](plans/multi-storage-placement-progress.md) for current validation results.
+
+- [Multi-storage Placement Implementation and Validation Report](multi-storage-placement-implementation-and-validation-report.md) explains the implemented behavior, lab campaigns, Director results, remediations, cleanup evidence, and remaining release gates.
 
 - [Parker Prefix, Pool, and Tags Implementation Plan](plans/parker-prefix-pool-and-tags-plan.md) gives parker and mover VMs an operator-visible identity through a configurable name prefix, a resource pool, and a `prefix--` tag, and records the configuration, permission, and release consequences of each.
 
@@ -29,6 +31,10 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 - [Certify Candidate Artifacts](certification/candidate-artifacts.md) explains how to test the exact candidate release and retain its checksum in certification reports.
 
 - [Verify Multi-storage Placement](certification/multi-storage-placement.md) explains the live lifecycle assertions and the evidence they produce.
+
+- [Multiple NFS Shares: Proposed Design](designs/multi-storage-placement-design.md): vSphere datastore research, independent disk-role storage sets, placement strategy options, and a staged implementation and certification plan. Proposed functionality, not current configuration.
+
+- [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the proposed feature.
 
 - [Known Limitations](limitations.md): The consolidated list of what the CPI does not do, covering disk, storage, networking, topology, and permissions constraints, one sentence per item with a link to the page that owns the detail.
 
@@ -54,7 +60,7 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Smoke-testing with `emptyvm`](emptyvm.md): Minimal post-deploy deployment that exercises the full CPI surface (create_stemcell, create_vm, create_disk, attach_disk, agent handshake).
 
-- [CPI Certification](certification/index.md): The hub for every path we certify this CPI against the BOSH CPI v2 contract — the local lifecycle harness, the BOSH Acceptance Tests, the BOSH Director Upgrade Test, and the upstream Concourse pipeline.
+- [CPI Certification](certification/index.md): This hub covers every path we use to certify the CPI against the BOSH CPI v2 contract, including the local lifecycle harness, the BOSH Acceptance Tests, the BOSH Director Upgrade Test, and the upstream Concourse pipeline.
 
 - [Lifecycle results](certification/lifecycle/README.md): The committed record of CPI lifecycle harness runs, with the latest verdict, per-pass timings, and per-run reports.
 
@@ -72,7 +78,7 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [PVE Per-Storage Lockfile Behaviour](pve-storage-locking.md): How PVE's per-storage lockfile serialises every storage mutation, why bursty BOSH deploys hit it, and how the CPI retries to absorb the contention.
 
-- [DLB-Aware Placement](dlb-aware-placement.md): Opt-in integration with the PVE 9.2 Dynamic Load Balancer — node scoring, availability-zone pinning, and HA node-affinity rules.
+- [DLB-Aware Placement](dlb-aware-placement.md): This guide covers opt-in integration with the PVE 9.2 Dynamic Load Balancer, including node scoring, availability-zone pinning, and HA node-affinity rules.
 
 - [HA and Resurrection](ha-and-resurrection.md): Ownership matrix for BOSH-resurrector-owned versus PVE-HA-owned recovery, the double-healing race, and the CPI's warning guard rail.
 
@@ -82,9 +88,9 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [PVE Host Tuning](pve-host-tuning.md): Operator-side knobs (`pvedaemon` / `pveproxy` worker counts, storage layout) for sustained concurrent CPI workloads.
 
-- [Troubleshooting](troubleshooting.md): Symptom-first runbook for authentication, storage, networking, and agent failures; cross-references the deep-detail docs for each failure class.
+- [Troubleshooting](troubleshooting.md): This symptom-first runbook covers authentication, storage, networking, and agent failures. It links to the detailed documentation for each failure class.
 
-- [Operations Runbook](operations.md): Day-2 operations and diagnostics — log access, PVE-side inspection commands, pre- and post-deploy health checks, orphan and lock recovery, and how to file a bug report.
+- [Operations Runbook](operations.md): This runbook covers day-2 operations and diagnostics, including log access, PVE-side inspection commands, pre- and post-deploy health checks, orphan and lock recovery, and bug reports.
 
 - [Examples](examples.md): Sample BOSH deployment manifests and usage scenarios.
 

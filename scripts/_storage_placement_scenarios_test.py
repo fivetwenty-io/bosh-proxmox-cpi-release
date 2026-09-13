@@ -337,6 +337,23 @@ class ScenarioTests(unittest.TestCase):
                     "audit": {"complete": True, "vm_scan_complete": True}, "records": None}
         runner.verification = SimpleNamespace(_json_command=Mock(return_value=envelope))
         self.assertEqual(runner.audit()["records"], [])
+        removed = copy.deepcopy(envelope)
+        removed["audit"].update(complete=False, issues=sorted(runner.REMOVED_BACKEND_ISSUES), evidence=[])
+        runner.verification._json_command.return_value = removed
+        self.assertEqual(runner.audit()["records"], [])
+        self.assertEqual(runner.verification._json_command.call_args.kwargs["allowed_returncodes"], (0, 1))
+        for mutation in ("extra", "complete", "conflict"):
+            changed = copy.deepcopy(removed)
+            if mutation == "extra":
+                changed["audit"]["issues"].append("unrelated")
+            elif mutation == "complete":
+                changed["audit"]["complete"] = True
+            else:
+                changed["audit"]["conflicts"] = [{"allocation_id": "conflict"}]
+            runner.verification._json_command.return_value = changed
+            with self.assertRaises(scenarios.ScenarioFailure):
+                runner.audit()
+        runner.verification._json_command.return_value = envelope
         envelope.pop("records")
         with self.assertRaises(scenarios.ScenarioFailure):
             runner.audit()
@@ -453,10 +470,18 @@ class ScenarioTests(unittest.TestCase):
         values["scsi1"] = "e2:ephemeral"
         with self.assertRaises(scenarios.ScenarioFailure):
             runner.observed_vm("100", generated, True)
-        values["scsi1"] = "e1:ephemeral"
+        values.clear()
+        values.update({"virtio0": "e1:root", "scsi1": "p1:persistent", "scsi2": "e1:ephemeral", "ide2": "e1:iso,media=cdrom"})
+        root = {"external_volumes": ["p1:persistent"], "auxiliary_devices": [], "root_owned_volumes": ["e1:root"]}
+        observed = runner.observed_vm("100", generated, True, root, {"/": ["/dev/vda"], "/var/vcap/data": ["/dev/sdc"]})
+        self.assertEqual(observed["devices"]["scsi2"], "e1:ephemeral")
+        values["scsi3"] = "p1:persistent"
+        with self.assertRaises(scenarios.ScenarioFailure):
+            runner.observed_vm("100", generated, True, root)
+        values.pop("scsi3")
         values["unused0"] = "e1:unplanned"
         with self.assertRaises(scenarios.ScenarioFailure):
-            runner.observed_vm("100", generated, True)
+            runner.observed_vm("100", generated, True, root)
 
     def test_disk_uuid_token_backing_and_renamed_volume_are_observed(self):
         runner = bare_runner()

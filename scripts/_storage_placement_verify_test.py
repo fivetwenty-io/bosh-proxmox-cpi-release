@@ -50,6 +50,16 @@ class PlacementVerificationTests(unittest.TestCase):
     def content(volume):
         return {"volid": volume, "size": 8 * 1024 * 1024, "format": "raw"}
 
+    def test_json_command_accepts_only_declared_warning_exit(self):
+        completed = SimpleNamespace(returncode=1, stdout='{"audit": {}}')
+        with patch("_storage_placement_verify.subprocess.run", return_value=completed):
+            self.assertEqual(
+                self.verification._json_command(["audit"], allowed_returncodes=(0, 1)),
+                {"audit": {}},
+            )
+            with self.assertRaisesRegex(RuntimeError, "verification command failed"):
+                self.verification._json_command(["audit"])
+
     def test_feasible_topology_keeps_all_ten_observations(self):
         self.assertEqual(len(self.verification.inventory_pairs), 10)
         self.assertEqual(self.verification.members["persistent"], {"p1", "p2"})

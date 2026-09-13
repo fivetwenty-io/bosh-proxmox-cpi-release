@@ -75,4 +75,3 @@ class OrphanCleanupTests(unittest.TestCase):
    obj,_=self.fixture();del obj.require_detached_or_parked_disk;v=Mock();obj.runner=types.SimpleNamespace(verifier=v);v._get.return_value=[row];v.qemu_config.return_value=config
    with self.assertRaises(RuntimeError):obj.require_detached_or_parked_disk(obj.service['disks'][0])
 if __name__=='__main__':unittest.main()
-

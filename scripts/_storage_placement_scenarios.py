@@ -346,12 +346,33 @@ class ScenarioRunner:
         require(isinstance(value, dict) and value.get("observation_only") is True and value.get("targets"), "production diagnostic did not produce a feasible plan")
         return value
 
-    def audit(self, config_path: str = "") -> dict[str, Any]:
-        output = self.verification._json_command([self.cpi_bin, "storage-journal", "audit", "--config", config_path or self.config_path])
+    REMOVED_BACKEND_ISSUES = {
+        'historical mutation backing for "nfs-cert-fault" changed or disappeared',
+        'historical storage "nfs-cert-fault" changed or disappeared; original backing needs audit',
+        'historical storage "nfs-cert-fault" is absent from definitions',
+    }
+
+    @classmethod
+    def accepted_audit(cls, output: dict[str, Any]) -> dict[str, Any]:
         audit = output.get("audit", {})
         require(output.get("generation_index_healthy") is True and output.get("cluster_continuity") is True,
                 "journal generation index or cluster continuity is not healthy")
-        require(audit.get("complete") is True and audit.get("vm_scan_complete") is True and not audit.get("issues") and not audit.get("conflicts"), "journal audit is incomplete or inconsistent")
+        require(audit.get("vm_scan_complete") is True and not audit.get("conflicts"),
+                "journal audit has incomplete scan or conflicts")
+        issues = audit.get("issues") or []
+        clean = audit.get("complete") is True and issues == []
+        removed = (audit.get("complete") is False and isinstance(issues, list)
+                   and len(issues) == len(cls.REMOVED_BACKEND_ISSUES)
+                   and set(issues) == cls.REMOVED_BACKEND_ISSUES)
+        require(clean or removed, "journal audit contains unexpected issues")
+        return output
+
+    def audit(self, config_path: str = "") -> dict[str, Any]:
+        output = self.verification._json_command(
+            [self.cpi_bin, "storage-journal", "audit", "--config", config_path or self.config_path],
+            allowed_returncodes=(0, 1),
+        )
+        self.accepted_audit(output)
         require("records" in output, "journal audit omitted record summaries")
         if output["records"] is None:
             output["records"] = []
@@ -376,10 +397,7 @@ class ScenarioRunner:
         return rows[0]
 
     def current_vm_record(self, audit: dict[str, Any], cid: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        require(audit.get("generation_index_healthy") is True and audit.get("cluster_continuity") is True,
-                "VM generation requires healthy audited authority")
-        proof = audit.get("audit", {})
-        require(proof.get("complete") is True and proof.get("vm_scan_complete") is True and not proof.get("issues") and not proof.get("conflicts"), "VM generation audit is incomplete or inconsistent")
+        self.accepted_audit(audit)
         live = [row for row in rows if row.get("State") not in {"deleted", "cleaned", "vm_deleted_retained"}]
         require(len(live) == 1 and live[0].get("State") in {"ready_to_return", "adopted"}, "VM CID has ambiguous or unready live generations")
         summary = live[0]
@@ -443,21 +461,30 @@ class ScenarioRunner:
         disks = {slot: str(value).split(",", 1)[0] for slot, value in actual.items()
                  if re.fullmatch(r"(?:scsi|virtio|sata|ide|unused)\d+", slot) and ":" in str(value) and "media=cdrom" not in str(value)}
         external = set((root_evidence or {}).get("external_volumes", []))
-        require(external <= set(disks.values()), "verified persistent disk is missing from the guest")
+        all_volumes = list(disks.values())
+        require(len(set(all_volumes)) == len(all_volumes), "VM has missing, duplicate, or extra disk devices")
+        require(all(all_volumes.count(volume) == 1 for volume in external), "verified persistent disk is missing from the guest")
         disks = {slot: volume for slot, volume in disks.items() if volume not in external}
-        wanted = {root_slot, "scsi1"} if dedicated else {root_slot}
+        required = {root_slot}
         if root_evidence:
             auxiliary = set(root_evidence["auxiliary_devices"])
-            require(not auxiliary & wanted, "source auxiliary disk collides with a guest role device")
-            wanted |= auxiliary
+            require(not auxiliary & required, "source auxiliary disk collides with a guest role device")
+            required |= auxiliary
             require(set(root_evidence["root_owned_volumes"]) <= set(disks.values()), "observed root mutation volumes are missing from actual guest devices")
-        require(set(disks) == wanted and len(set(disks.values())) == len(disks), "VM has missing, duplicate, or extra disk devices")
+        require(required <= set(disks), "VM has missing, duplicate, or extra disk devices")
+        role_slots = set(disks) - required
+        if dedicated:
+            require(len(role_slots) == 1, "VM has missing, duplicate, or extra disk devices")
+            ephemeral_slot = next(iter(role_slots))
+            require(re.fullmatch(r"scsi\d+", ephemeral_slot) is not None, "ephemeral volume does not use a SCSI device")
+        else:
+            require(not role_slots, "VM has missing, duplicate, or extra disk devices")
         root_set = config.get("root_storage_set", config["ephemeral_storage_set"])
         require(disks[root_slot].split(":", 1)[0] in config["storage_sets"][root_set]["names"], "VM root escaped its effective role set")
         if dedicated:
-            require(disks["scsi1"].split(":", 1)[0] in config["storage_sets"][config["ephemeral_storage_set"]]["names"], "ephemeral volume escaped its role set")
+            require(disks[ephemeral_slot].split(":", 1)[0] in config["storage_sets"][config["ephemeral_storage_set"]]["names"], "ephemeral volume escaped its role set")
             if "root_storage_set" not in config:
-                require(disks["scsi1"].split(":", 1)[0] == disks[root_slot].split(":", 1)[0], "default root/ephemeral bundle split unexpectedly")
+                require(disks[ephemeral_slot].split(":", 1)[0] == disks[root_slot].split(":", 1)[0], "default root/ephemeral bundle split unexpectedly")
         for volume in disks.values():
             PlacementVerification._verified_volume(self.observed_volume(volume), volume)
         isos = {slot: str(value).split(",", 1)[0] for slot, value in actual.items() if "media=cdrom" in str(value) and ":" in str(value)}

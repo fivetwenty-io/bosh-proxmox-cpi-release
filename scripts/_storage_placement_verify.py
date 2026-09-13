@@ -31,9 +31,9 @@ class PlacementVerification:
         self.members: dict[str, set[str]] = {}
         self.inventory_pairs: set[tuple[str, str]] = set()
 
-    def _json_command(self, command: list[str]) -> Any:
+    def _json_command(self, command: list[str], allowed_returncodes: tuple[int, ...] = (0,)) -> Any:
         result = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
-        if result.returncode:
+        if result.returncode not in allowed_returncodes:
             raise RuntimeError("storage verification command failed; inspect CPI diagnostics")
         return json.loads(result.stdout)
 

@@ -752,7 +752,7 @@ class DirectorScenarios:
         # The documented delete-vm command removes the VM through the Director's
         # own CPI. The instance remains desired, so automatic resurrection must
         # create the replacement. No direct PVE mutation bypasses its journal.
-        self.operation(["delete-vm", old["vm_cid"]], scoped=False)
+        self.operation(["delete-vm", old["vm_cid"]])
         deadline = time.monotonic()+self.fixture.get("resurrection_timeout_seconds", 1200)
         current = None
         while time.monotonic() < deadline:
