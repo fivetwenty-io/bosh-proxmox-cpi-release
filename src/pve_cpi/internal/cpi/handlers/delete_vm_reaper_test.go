@@ -457,7 +457,7 @@ func TestDeleteVM_ReaperRefusesRenderedParkerPool(t *testing.T) {
 func TestDeleteVM_ReaperStillReapsAManagedPoolThatIsNotTheParkerPool(t *testing.T) {
 	t.Parallel()
 
-	// The other half of the refusal: configuring a parker pool must not stop
+	// The other half of the refusal. Configuring a parker pool must not stop
 	// the reaper from doing its job on an ordinary per-deployment pool.
 	const vmid = 9014
 	fx := newReaperTestFixture(t, vmid, true, "bosh-cf-diego")

@@ -455,10 +455,10 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	// node. This path does not have one yet, because the holder scan below runs
 	// first and resolveNodeForDetachedDisk runs only if that scan finds the
 	// disk free.
-	// See parkerReadConfigFor: a cluster-resources row without a node is dropped
-	// by the holder scan unless there is a fallback to attribute it to, and a
-	// dropped row reads as "nobody holds this volume". Setting the field before
-	// the builder call would only have the builder wipe it again.
+	// See parkerReadConfigFor, where a cluster-resources row without a node is
+	// dropped by the holder scan unless there is a fallback to attribute it to,
+	// and a dropped row reads as "nobody holds this volume". Setting the field
+	// before the builder call would only have the builder wipe it again.
 	parkerCfg.FallbackNode = deps.Config.Node
 	// "Is it already parked?" and "is a real VM holding it?" are two readings of
 	// one fact, and the cluster-wide sweep that establishes that fact is the

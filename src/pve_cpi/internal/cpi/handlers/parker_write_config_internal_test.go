@@ -22,15 +22,15 @@ import (
 // The parker config builders and the three park funnels that were folded onto
 // them. Two things are under test here. The first is that the configured
 // parker prefix and pool reach every funnel that can create a parker, which is
-// the whole point of the fold: a funnel that kept its own literal would
+// the whole point of the fold, because a funnel that kept its own literal would
 // compile, pass, and name a live cluster's parkers "bosh-parker-..." whatever
 // the operator asked for. The second is that the write builder leaves
 // FallbackNode empty, because pve.ParkDisk and pve.TransferDiskToParker fill
 // that field with the disk's own node only while it is empty, and the
 // job-level node is the wrong answer on a multi-node cluster.
 //
-// The funnel tests swap the parkDisk seam (park_disk_seam.go) and must not run
-// in parallel.
+// The funnel tests swap the park seam (park_disk_seam.go) through
+// setParkDiskForTest, so they must not run in parallel.
 // ---------------------------------------------------------------------------
 
 const (
@@ -134,26 +134,25 @@ func (r parkerCfgResolver) Resolve(_ context.Context, _ string) (pve.Backend, er
 	return r.backend, nil
 }
 
-// captureParkDisk swaps the parkDisk seam for one that records the
-// ParkerConfig it was handed and returns parkErr, restoring the seam when the
-// test ends. The caller must not run in parallel: the seam is process-wide.
+// captureParkDisk swaps the park seam for one that records the ParkerConfig it
+// was handed and returns parkErr, restoring the seam when the test ends. The
+// caller must not run in parallel, because the seam is process-wide.
 func captureParkDisk(t *testing.T, parkErr error) *pve.ParkerConfig {
 	t.Helper()
 	got := &pve.ParkerConfig{}
 	called := false
-	previous := parkDisk
-	parkDisk = func(
+	restore := setParkDiskForTest(func(
 		_ context.Context, _ pve.Client, _ *log.Logger,
 		_, _ string, cfg pve.ParkerConfig, _ pve.ParkContext,
 	) error {
 		called = true
 		*got = cfg
 		return parkErr
-	}
+	})
 	t.Cleanup(func() {
-		parkDisk = previous
+		restore()
 		if !called {
-			t.Errorf("the park funnel never reached parkDisk; nothing was asserted")
+			t.Errorf("the park funnel never reached the park seam; nothing was asserted")
 		}
 	})
 	return got
@@ -181,8 +180,8 @@ func TestParkerReadConfigFor_CarriesPrefixAndPool(t *testing.T) {
 	got := parkerReadConfigFor(deps)
 
 	assertParkerCfgPrefixAndPool(t, got, "parkerReadConfigFor")
-	// The read builder keeps the job-level node: its callers scan for a holder
-	// without having resolved a node of their own.
+	// The read builder keeps the job-level node, because its callers scan for a
+	// holder without having resolved a node of their own.
 	if got.FallbackNode != parkerCfgJobNode {
 		t.Errorf("parkerReadConfigFor: FallbackNode = %q; want the job-level node %q",
 			got.FallbackNode, parkerCfgJobNode)
@@ -193,8 +192,8 @@ func TestParkerReadConfigFor_DefaultsToTheHistoricalPrefixAndNoPool(t *testing.T
 	t.Parallel()
 
 	// An operator who sets neither field gets what every prior release
-	// produced: parkers named "bosh-parker-<vmid>" and no pool assignment at
-	// all, since an empty pool is the documented opt-out.
+	// produced, which is parkers named "bosh-parker-<vmid>" and no pool
+	// assignment at all, since an empty pool is the documented opt-out.
 	deps := Deps{Config: &config.CPIConfig{DetachedDiskStrategy: "parked"}, Logger: log.NewNopLogger()}
 	got := parkerReadConfigFor(deps)
 
@@ -251,15 +250,13 @@ func TestParkFreshDisk_HandsDownPrefixPoolAndEmptyFallbackNode(t *testing.T) {
 }
 
 func TestParkFreshDisk_SkipsTheParkEntirelyUnderTheFreeStrategy(t *testing.T) {
-	previous := parkDisk
-	parkDisk = func(
+	t.Cleanup(setParkDiskForTest(func(
 		_ context.Context, _ pve.Client, _ *log.Logger,
 		_, _ string, _ pve.ParkerConfig, _ pve.ParkContext,
 	) error {
-		t.Error("parkFreshDisk called ParkDisk under detached_disk_strategy=free")
+		t.Error("parkFreshDisk parked a disk under detached_disk_strategy=free")
 		return nil
-	}
-	t.Cleanup(func() { parkDisk = previous })
+	}))
 
 	cfg := parkerCfgTestConfig()
 	cfg.DetachedDiskStrategy = "free"
@@ -294,7 +291,7 @@ func TestParkAfterDetach_HandsDownPrefixPoolAndEmptyFallbackNode(t *testing.T) {
 }
 
 func TestParkAfterDetach_KeepsThePermanentClassTheParkChose(t *testing.T) {
-	// The fold must not change how a failed park is reported: a park that
+	// The fold must not change how a failed park is reported. A park that
 	// refuses permanently stays permanent, so the Director stops instead of
 	// retrying a grant it cannot make on its own.
 	permanent := errors.New("simulated park failure")
@@ -338,7 +335,7 @@ func TestHandleAlreadyDetachedParked_HandsDownPrefixPoolAndTheJobLevelFallbackNo
 			got.DiskStorage, parkerCfgStorage)
 	}
 	// This funnel is the one exception to the empty-FallbackNode rule, and the
-	// order it writes the field in is what makes the exception work: the write
+	// order it writes the field in is what makes the exception work. The write
 	// builder clears the field, and the funnel sets the job-level node back on
 	// the result afterwards. Its holder scan runs before any node is resolved,
 	// and a cluster-resources row without a node is dropped unless the scan has
