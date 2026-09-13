@@ -46,7 +46,7 @@ This runs all Go tests with race detection. Every code change should come with t
 make check
 ```
 
-This runs `fmt-check`, `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+This runs `artifacts-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
 
 ### Installing the git hooks
 
@@ -58,11 +58,15 @@ This points `core.hooksPath` at the repo's `.githooks/` directory. Two hooks run
 
 - `pre-commit`
 
-  Checks the staged Go files with `gofmt` and refuses the commit if any need formatting. It takes well under a second. Bypass one commit with `git commit --no-verify`.
+  Refuses the commit if the index holds AI-agent working state, a path that `.gitignore` matches, or a blob over 5 MB. It then checks the staged Go files with `gofmt` and refuses the commit if any of them need formatting. It takes well under a second. Bypass one commit with `git commit --no-verify`, or set `ALLOW_LARGE_FILES=1` when a large file belongs in the commit.
 
 - `pre-push`
 
   Runs the same `make check` suite CI runs, so a push never lands a commit CI will reject. Bypass one push with `SKIP_CHECKS=1 git push` when you know CI already covered the commit.
+
+### Keeping agent working state out of the tree
+
+AI coding agents are welcome to work in this checkout, and they may leave scratch directories, plans, session journals, and work-preservation bundles behind. None of that is part of the product, so none of it is ever committed. The `.gitignore` block headed "AI coding-agent working state" keeps the known directory names out of `git add`, and `scripts/_tracked_artifacts_check.sh` backs that block up in three places. The pre-commit hook audits the index, `make check` audits every tracked path, and CI runs `make check` on every push. When we adopt a new tool, we add its directory to both the `.gitignore` block and the pattern list in the script.
 
 ### Running security scans
 
@@ -82,7 +86,7 @@ export STEMCELL_PATH=/path/to/bosh-stemcell-*.tgz
 ./scripts/lifecycle
 ```
 
-The harness needs a live Proxmox VE cluster and will create and destroy real VMs and disks on it. See [CPI certification](docs/bosh-cpi-certification.md) for the prerequisites and the config schema.
+The harness needs a live Proxmox VE cluster and will create and destroy real VMs and disks on it. See [CPI certification](docs/certification/index.md) for the prerequisites and the config schema.
 
 ## Submitting a pull request
 

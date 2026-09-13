@@ -169,6 +169,12 @@ fmt: ## Format Go source files with gofmt
 	@gofmt -w $$(find $(SRC_ROOT) -name '*.go' -not -path '$(SRC_ROOT)/vendor/*')
 	@echo "$(GREEN)✓ Code formatted$(RESET)"
 
+.PHONY: artifacts-check
+artifacts-check: ## Fail if the tracked tree holds AI-agent working state or forced-in ignored paths
+	@echo "$(GREEN)Checking the tracked tree for agent artifacts...$(RESET)"
+	@sh scripts/_tracked_artifacts_check.sh
+	@echo "$(GREEN)✓ tracked tree clean$(RESET)"
+
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source file is not gofmt-formatted
 	@echo "$(GREEN)Checking gofmt...$(RESET)"
@@ -226,7 +232,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
 .PHONY: check
-check: fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run formatting, vet, blob, template, Python, analysis, coverage, and race checks
+check: artifacts-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run artifact, formatting, vet, blob, template, Python, analysis, coverage, and race checks
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

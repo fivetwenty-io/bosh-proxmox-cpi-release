@@ -88,3 +88,31 @@ src/pve_cpi/pve-cid
 
 # BOSH blobstore credentials (bosh upload-blobs) — never commit
 config/private.yml
+
+# AI coding-agent working state. Agents may keep scratch directories, plans,
+# session journals, and work-preservation bundles inside the checkout, but
+# none of it is part of the product and none of it is ever committed.
+# scripts/_tracked_artifacts_check.sh backs this up in the pre-commit hook,
+# make check, and CI. Generic names are root-anchored so that vendored
+# upstream modules shipping their own CLAUDE.md or AGENTS.md stay untouched.
+*work-preservation/
+.codex/
+.claude/
+.cursor/
+.aider*
+.gemini/
+.copilot/
+.windsurf/
+.cline/
+.roo/
+.opencode/
+.crush/
+.agents/
+.agent/
+superpowers/
+.superpowers/
+graphify-out/
+/CLAUDE.md
+/AGENTS.md
+/GEMINI.md
+/.mcp.json
