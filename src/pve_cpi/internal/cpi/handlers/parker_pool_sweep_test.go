@@ -61,7 +61,7 @@ func assertSweptOnce(t *testing.T, calls []sweepCall, where, node string, deps D
 	if got.cfg.Pool != parkerCfgPool {
 		t.Errorf("%s: swept pool %q, want %q", where, got.cfg.Pool, parkerCfgPool)
 	}
-	if deps.PVE != nil && got.client != deps.PVE {
+	if got.client != deps.PVE {
 		t.Errorf("%s: the sweep must run on the unguarded client from deps", where)
 	}
 }
@@ -74,6 +74,18 @@ func assertNotSwept(t *testing.T, calls []sweepCall, where string) {
 	}
 }
 
+// parkedDeps is the parked-strategy deps for the two funnels that reach the
+// park without touching PVE first. The client is wired even though neither
+// funnel calls it, so that assertSweptOnce can compare what the sweep was
+// handed against what deps holds.
+func parkedDeps() Deps {
+	return Deps{
+		Config: parkerCfgTestConfig(),
+		PVE:    &parkerCfgClient{cluster: &parkerCfgCluster{}, nodes: &parkerCfgNodes{}},
+		Logger: log.NewNopLogger(),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // parkFreshDisk (create_disk)
 // ---------------------------------------------------------------------------
@@ -82,7 +94,7 @@ func TestParkFreshDisk_SweepsThePoolAfterThePark(t *testing.T) {
 	_ = captureParkDisk(t, nil)
 	calls := captureParkerPoolSweep(t)
 
-	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
+	deps := parkedDeps()
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
 		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
 		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
@@ -95,7 +107,7 @@ func TestParkFreshDisk_SkipsTheSweepWhenTheParkFails(t *testing.T) {
 	_ = captureParkDisk(t, errors.New("simulated park failure"))
 	calls := captureParkerPoolSweep(t)
 
-	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
+	deps := parkedDeps()
 	if err := parkFreshDisk(context.Background(), deps, parkerCfgJobNode,
 		"pvd-abc", parkerCfgVolid, "stable-id"); err == nil {
 		t.Fatal("parkFreshDisk: want the park's failure, got nil")
@@ -112,7 +124,7 @@ func TestParkAfterDetach_SweepsThePoolAfterThePark(t *testing.T) {
 	_ = captureParkDisk(t, nil)
 	calls := captureParkerPoolSweep(t)
 
-	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
+	deps := parkedDeps()
 	if err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil); err != nil {
 		t.Fatalf("parkAfterDetach: unexpected error: %v", err)
@@ -125,7 +137,7 @@ func TestParkAfterDetach_SkipsTheSweepWhenTheParkFails(t *testing.T) {
 	_ = captureParkDisk(t, errors.New("simulated park failure"))
 	calls := captureParkerPoolSweep(t)
 
-	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
+	deps := parkedDeps()
 	if err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil); err == nil {
 		t.Fatal("parkAfterDetach: want the park's failure, got nil")
@@ -387,6 +399,49 @@ func TestDetachForeignActiveDisks_SkipsTheSweepWhenTheTransferFails(t *testing.T
 	if err := detachForeignActiveDisks(context.Background(), deps, "pve1", "700", 700,
 		deps.Log(context.Background())); err == nil {
 		t.Fatal("detachForeignActiveDisks: want the transfer's failure, got nil")
+	}
+
+	assertNotSwept(t, *calls, "detachForeignActiveDisks")
+}
+
+func TestDetachForeignActiveDisks_SweepsOncePerCallNotOncePerDisk(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+
+	// Both disks transfer to a parker on the same node, so one sweep covers
+	// them. A sweep per disk would repeat a pool ensure and a node listing for
+	// an outcome the first one already reached.
+	const secondToken = "bpd-aabbccdd00112244"
+	c := newIDFakeClient(map[int]map[string]any{
+		700: {
+			"scsi1": "data:vm-777-disk-1,serial=" + idTestToken + ",size=10G",
+			"scsi2": "data:vm-778-disk-1,serial=" + secondToken + ",size=10G",
+		},
+		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true},
+	})
+	deps := transferFunnelDeps(c)
+
+	if err := detachForeignActiveDisks(context.Background(), deps, "pve1", "700", 700,
+		deps.Log(context.Background())); err != nil {
+		t.Fatalf("detachForeignActiveDisks: unexpected error: %v", err)
+	}
+
+	assertSweptOnce(t, *calls, "detachForeignActiveDisks", "pve1", deps)
+}
+
+func TestDetachForeignActiveDisks_SkipsTheSweepWhenNothingTransferred(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+
+	// A legacy foreign disk carries no serial, so it is plain-detached and no
+	// parker is involved. Nothing changed about pool membership, so nothing
+	// sweeps.
+	c := newIDFakeClient(map[int]map[string]any{
+		700: {"scsi1": "data:vm-777-disk-1,size=10G"},
+	})
+	deps := transferFunnelDeps(c)
+
+	if err := detachForeignActiveDisks(context.Background(), deps, "pve1", "700", 700,
+		deps.Log(context.Background())); err != nil {
+		t.Fatalf("detachForeignActiveDisks: unexpected error: %v", err)
 	}
 
 	assertNotSwept(t, *calls, "detachForeignActiveDisks")

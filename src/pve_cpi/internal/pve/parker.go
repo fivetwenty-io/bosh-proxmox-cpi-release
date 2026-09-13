@@ -23,8 +23,9 @@
 // prefix>", always follows. It carries "bosh" when Prefix is empty, the same
 // default parkerVMName renders into the VM's name, so the tag can never name
 // a different prefix than the VM actually carries. Pool adds no tag. The
-// pool sweep in PlaceParkersInPool (Section 3.8) is the only code that reads
-// Pool, so nothing here wires it into VM creation.
+// pool sweep in PlaceParkersInPool is the only code that reads Pool, and it
+// runs from a handler on the unguarded client once a park has succeeded, so
+// nothing here wires Pool into VM creation.
 //
 // # Slot capacity
 //
@@ -94,9 +95,12 @@ type ParkerConfig struct {
 	// to "bosh" inside parkerVMName, so a caller that never sets Prefix gets
 	// byte-identical names to prior releases.
 	Prefix string
-	// Pool names the PVE resource pool the sweep in PlaceParkersInPool
-	// (Section 3.8) places parker VMs into. Park, transfer, and mover code
-	// never read this field; only that sweep does. An empty Pool keeps the
+	// Pool names the PVE resource pool the sweep in PlaceParkersInPool places
+	// parker VMs into, once a park has succeeded and the managed allocation
+	// guard's window has closed, on a client no guard has wrapped. Park,
+	// transfer, and mover code never read this field; only that sweep does,
+	// because a pool call inside that window is refused and the refusal
+	// poisons the allocation. An empty Pool keeps the
 	// documented pve.parker_pool: "" opt-out of "do not touch any pool", so
 	// nothing here wires it into createParkerVM.
 	Pool string

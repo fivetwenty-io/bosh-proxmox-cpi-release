@@ -995,6 +995,11 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		slots = append(slots, slot)
 	}
 	sort.Strings(slots)
+	// Every transfer below targets this one node, so the parker pool sweep
+	// runs once after the loop rather than once per disk, and transferred
+	// records whether there is anything for it to do.
+	parkerCfg := parkerWriteConfigFor(deps)
+	transferred := false
 	for _, slot := range slots {
 		entry := foreign[slot]
 		// A stable-ID disk moves to a parker by reassignment instead of a
@@ -1011,13 +1016,12 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 				StableID:    entry.StableID,
 				Opts:        pve.DiskOptOverlayFromDesc(desc, entry.StableID, entry.Volid),
 			}
-			parkerCfg := parkerWriteConfigFor(deps)
 			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerCfg, pctx); transferErr != nil {
 				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
 					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it (the volume would otherwise be destroyed; retry resumes the transfer)",
 					vmCID, slot, entry.Volid))
 			}
-			sweepParkerPool(ctx, deps, node, parkerCfg)
+			transferred = true
 			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, entry.StableID, entry.Volid)
 			continue
 		}
@@ -1038,6 +1042,13 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 				"delete_vm: refusing to destroy VM %s -- could not detach persistent disk %s=%s to preserve it: %s (the volume would otherwise be destroyed; retry re-attempts detach)",
 				vmCID, slot, entry.Volid, detachErr.Error())
 		}
+	}
+	if transferred {
+		// Once, for the whole loop, because every transfer above landed on the
+		// same node. A transfer that failed returned already, so a delete_vm
+		// that stops halfway leaves its parkers unpooled until the Director
+		// retries, which is the right trade for a membership that is cosmetic.
+		sweepParkerPool(ctx, deps, node, parkerCfg)
 	}
 	// Re-read config: a detach that silently no-ops (SDK regression / race) must
 	// not let the destroy take the volume while it is still on an active slot. A

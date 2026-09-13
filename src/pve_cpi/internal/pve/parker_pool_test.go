@@ -12,6 +12,7 @@
 package pve
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	sdkcloudinit "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -290,6 +292,54 @@ func TestPlaceParkersInPool_LeavesAParkerAnotherPoolHolds(t *testing.T) {
 	}
 }
 
+func TestPlaceParkersInPool_OtherPoolSkipReadsTheSentinelNotTheMessage(t *testing.T) {
+	t.Parallel()
+
+	// The skip above turns on ErrVMInAnotherPool, which AssignVMToPool chains
+	// onto that one verdict. An unrelated failure whose text happens to read
+	// like the verdict is still a failure, and this case is here so that a
+	// later rewording of either message cannot quietly turn real failures into
+	// silent skips.
+	pools := newSweepPools()
+	pools.addErr = errors.New("500 vmid 90000 already belongs to something the storage layer is unhappy about")
+	c := sweepFixture(t, pools, map[int]string{90000: "bosh-parker;director--d1"})
+
+	err := PlaceParkersInPool(context.Background(), c, nil, sweepNode, sweepCfg())
+	if err == nil {
+		t.Fatal("an error that merely reads like the other-pool verdict must still be a failure")
+	}
+	if errors.Is(err, ErrVMInAnotherPool) {
+		t.Error("nothing chained the sentinel, so nothing may report it")
+	}
+}
+
+func TestAssignVMToPool_AnotherPoolVerdictCarriesTheSentinel(t *testing.T) {
+	t.Parallel()
+
+	// The other half of the contract the sweep depends on. PVE answers with
+	// "already a pool member", the membership probe says the target pool does
+	// not hold the guest, and the error that comes back names both pools and
+	// chains the sentinel.
+	pools := newSweepPools()
+	pools.addErr = errors.New("500 VM 90000 is already a pool member")
+	other, err := json.Marshal(map[string]any{"vmid": 90000, "pool": "an-operators-pool"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &sweepTestClient{
+		pools:   pools,
+		cluster: &sweepClusterSvc{t: t, rows: []json.RawMessage{other}},
+	}
+
+	assignErr := AssignVMToPool(context.Background(), c, sweepPool, 90000, nil)
+	if !errors.Is(assignErr, ErrVMInAnotherPool) {
+		t.Fatalf("want the other-pool sentinel chained, got %v", assignErr)
+	}
+	if !strings.Contains(assignErr.Error(), "an-operators-pool") {
+		t.Errorf("the message must still name the pool that holds the guest, got %q", assignErr)
+	}
+}
+
 func TestPlaceParkersInPool_EmptyPoolMakesNoCall(t *testing.T) {
 	t.Parallel()
 
@@ -343,6 +393,44 @@ func TestPlaceParkersInPool_FailedEnsureStillProcessesEveryParker(t *testing.T) 
 	}
 	if !pools.members[sweepPool][90000] || !pools.members[sweepPool][90001] {
 		t.Errorf("both parkers must still land in %q, got %v", sweepPool, pools.members[sweepPool])
+	}
+}
+
+func TestPlaceParkersInPool_FailedEnsureWarnsOnceForTheWholeSweep(t *testing.T) {
+	t.Parallel()
+
+	// A missing Pool.Allocate grant fails the ensure and then fails every
+	// assignment after it for that one reason. One warning says that; a
+	// warning per parker turns a single grant an operator has to add into a
+	// wall of lines that scales with how many parkers the node happens to
+	// hold. So the assignment failures drop to debug once the ensure has
+	// warned.
+	sink := &bytes.Buffer{}
+	logger, err := log.NewLogger("debug", sink)
+	if err != nil {
+		t.Fatalf("build a logger: %v", err)
+	}
+
+	pools := newSweepPools()
+	pools.createErr = errors.New("403 Pool.Allocate missing")
+	pools.addErr = errors.New("403 Pool.Allocate missing")
+	c := sweepFixture(t, pools, map[int]string{
+		90000: "bosh-parker;director--d1",
+		90001: "bosh-parker;director--d1",
+		90002: "bosh-parker;director--d1",
+	})
+
+	_ = PlaceParkersInPool(context.Background(), c, logger, sweepNode, sweepCfg())
+
+	logged := sink.String()
+	if got := strings.Count(logged, "could not ensure the parker pool exists"); got != 1 {
+		t.Errorf("the failed ensure logged %d times, want exactly 1", got)
+	}
+	if got := strings.Count(logged, "it stays where it is and the park itself is unaffected"); got != 0 {
+		t.Errorf("the per-parker failures warned %d times after the ensure had already warned, want 0", got)
+	}
+	if got := strings.Count(logged, "for the reason the pool ensure above already reported"); got != 3 {
+		t.Errorf("the per-parker failures logged at debug %d times, want one per parker, which is 3", got)
 	}
 }
 

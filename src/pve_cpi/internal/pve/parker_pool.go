@@ -8,7 +8,6 @@ package pve
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -23,12 +22,15 @@ import (
 // user_cfg lock and a burst deploy contends there by design. That budget is
 // right for create_vm, where the pool is part of the outcome. It is wrong
 // here, where the pool is cosmetic and a detach is waiting, so the sweep
-// spends this instead. The number sits beside the poolsPreflightTimeout
-// convention in cmd/cpi so it stays visible rather than buried.
+// spends this instead. The name and the shape match the poolsPreflightTimeout
+// convention in cmd/cpi, so the number stays visible rather than buried.
 const parkerPoolSweepTimeout = 10 * time.Second
 
-// PlaceParkersInPool puts every parker VM on node into cfg.Pool, creating that
-// pool if it does not exist yet. Handlers call it once a park or a transfer has
+// PlaceParkersInPool puts cfg.Pool's missing parkers on node into it, creating
+// that pool if it does not exist yet. Its candidates come from
+// ListParkersForNode, so they are the parkers in cfg's band that this
+// director may adopt, and a parker another director's tag attributes
+// elsewhere is not one of them. Handlers call it once a park or a transfer has
 // returned success, and they discard its error after logging; it returns one
 // only so tests can read the failures.
 //
@@ -90,10 +92,12 @@ func PlaceParkersInPool(ctx context.Context, c Client, logger *log.Logger, node 
 	defer cancel()
 
 	var failures []error
+	ensureFailed := false
 	if ensureErr := EnsurePoolExists(sweepCtx, c, cfg.Pool, PoolProvenance(cfg.DirectorID), logger); ensureErr != nil {
 		// A pool we could not create may already exist, so the assignments
 		// below are still worth attempting.
 		failures = append(failures, ensureErr)
+		ensureFailed = true
 		if logger != nil {
 			logger.Warn("could not ensure the parker pool exists; the parkers on this node stay unpooled unless the pool is already there",
 				log.String("pool", cfg.Pool),
@@ -136,7 +140,7 @@ func PlaceParkersInPool(ctx context.Context, c Client, logger *log.Logger, node 
 		if assignErr == nil {
 			continue
 		}
-		if assignReportsAnotherPool(assignErr) {
+		if errors.Is(assignErr, ErrVMInAnotherPool) {
 			if logger != nil {
 				logger.Debug("this parker belongs to another pool and stays there, because moving it is not this sweep's decision to make",
 					log.String("pool", cfg.Pool),
@@ -149,27 +153,22 @@ func PlaceParkersInPool(ctx context.Context, c Client, logger *log.Logger, node 
 		}
 		failures = append(failures, assignErr)
 		if logger != nil {
-			logger.Warn("could not place this parker in the parker pool; it stays where it is and the park itself is unaffected",
+			fields := []log.Field{
 				log.String("pool", cfg.Pool),
 				log.String("node", node),
 				log.Int("parker_vmid", vmid),
 				log.Err(assignErr),
-			)
+			}
+			if ensureFailed {
+				// The pool ensure above already warned once for this sweep,
+				// and a missing Pool.Allocate grant fails every assignment
+				// after it for that same reason, so these lines stay at debug
+				// rather than repeating one warning per parker.
+				logger.Debug("could not place this parker in the parker pool, for the reason the pool ensure above already reported", fields...)
+			} else {
+				logger.Warn("could not place this parker in the parker pool; it stays where it is and the park itself is unaffected", fields...)
+			}
 		}
 	}
 	return errors.Join(failures...)
-}
-
-// assignReportsAnotherPool reports whether err is AssignVMToPool's permanent
-// verdict that the guest already belongs to a pool other than the one we
-// asked for.
-//
-// The verdict is matched on its text because AssignVMToPool builds a fresh
-// Cloud error out of two messages rather than wrapping PVE's, so there is no
-// sentinel to compare against. Both of its messages say "already belongs to",
-// once naming the other pool and once saying only that one exists, and the
-// phrase is the stable half of each. A rewording there has to keep this
-// phrase or move this check with it.
-func assignReportsAnotherPool(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "already belongs to")
 }

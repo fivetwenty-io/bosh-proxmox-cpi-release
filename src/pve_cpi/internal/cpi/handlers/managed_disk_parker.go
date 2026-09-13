@@ -89,7 +89,7 @@ func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, v
 	// mutation only for a bosh-lock- sentinel and refuses everything else, and
 	// a refusal poisons the whole allocation, so a placement moved inside
 	// ParkDisk to save a listing would turn every managed park into an
-	// uncertain allocation (Section 3.8).
+	// uncertain allocation that needs reconciliation.
 	sweepParkerPool(ctx, m.deps, m.plan.Node, cfg)
 	return nil
 }

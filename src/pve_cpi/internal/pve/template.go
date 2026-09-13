@@ -4,6 +4,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -204,6 +205,16 @@ func MakeTemplate(ctx context.Context, c Client, node string, vmid int64) (upid 
 	return upid, nil
 }
 
+// ErrVMInAnotherPool is the cause AssignVMToPool chains onto its permanent
+// verdict that the guest already belongs to a pool other than the one asked
+// for. A caller that treats that verdict as a skip rather than a failure, and
+// the parker pool sweep in PlaceParkersInPool is the one that does, tests for
+// it with errors.Is instead of reading the message.
+//
+// The text is terse because cpierrors.Error appends a cause after its own
+// message, so the full error already names both pools and the VMID.
+var ErrVMInAnotherPool = errors.New("vm already belongs to another pool")
+
 // AssignVMToPool adds vmid to the named PVE resource pool by delegating to
 // c.Pools().AddVM. Returns nil when poolID is empty (caller skips the call).
 //
@@ -282,13 +293,13 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64, lo
 				// not caught up).
 				current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
 				if lookupErr == nil && found && current != "" {
-					return cpierrors.Cloud(
+					return cpierrors.WrapAs(ErrVMInAnotherPool, cpierrors.TypeCloud, fmt.Sprintf(
 						"AssignVMToPool: vmid %d already belongs to pool %q (PVE's own pool-membership check confirms it is NOT in %q) and cannot also be added to %q; remove it from %q first",
-						vmid, current, poolID, poolID, current)
+						vmid, current, poolID, poolID, current))
 				}
-				return cpierrors.Cloud(
+				return cpierrors.WrapAs(ErrVMInAnotherPool, cpierrors.TypeCloud, fmt.Sprintf(
 					"AssignVMToPool: vmid %d already belongs to a pool other than %q (confirmed by PVE's own pool-membership check) and cannot also be added to it; find its current pool and remove it first",
-					vmid, poolID)
+					vmid, poolID))
 			}
 			// probeErr != nil: the probe itself failed. A permanent verdict
 			// (401/403 — most often a token missing Pool.Audit on poolID, see
@@ -322,9 +333,9 @@ func AssignVMToPool(ctx context.Context, c Client, poolID string, vmid int64, lo
 			}
 			current, found, lookupErr := FindVMPoolViaCluster(ctx, c, int(vmid))
 			if lookupErr == nil && found && current != "" && current != poolID {
-				return cpierrors.Cloud(
+				return cpierrors.WrapAs(ErrVMInAnotherPool, cpierrors.TypeCloud, fmt.Sprintf(
 					"AssignVMToPool: vmid %d is already a member of pool %q and cannot also be added to pool %q; remove it from %q first",
-					vmid, current, poolID, current)
+					vmid, current, poolID, current))
 			}
 			return nil
 		}
