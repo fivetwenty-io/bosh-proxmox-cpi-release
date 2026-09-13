@@ -227,7 +227,7 @@ func setVMMetadataRMW(
 	}
 
 	preserved := stripReservedBoshTags(existingTags)
-	boshEntries := buildBoshManagedTags(metadata)
+	boshEntries := buildBoshManagedTags(metadata, deps.Config.ParkerPrefixValue())
 	tags := mergeTagList(preserved, boshEntries, maxTagLength)
 
 	logger.Debug("set_vm_metadata: updating VM config",
@@ -336,7 +336,18 @@ func buildDescription(metadata map[string]any) string {
 // rather than accumulating.
 //
 // Keys whose metadata value is missing, nil, or sanitizes to empty are skipped.
-func buildBoshManagedTags(metadata map[string]any) []string {
+//
+// vmPrefix is the resolved prefix from cfg.ParkerPrefixValue(), and it becomes
+// the "vm-prefix--<value>" identity tag. An empty vmPrefix omits the tag, which
+// the accessor never produces and a direct call from a test can.
+//
+// The prefix tag is appended last, after every other BOSH-managed entry, and
+// whoever adds the next tag should insert it before this one and leave the
+// prefix tag in last place. mergeTagList truncates the joined string at a tag
+// boundary against maxTagLength, so the last entry is the first one a long
+// deployment and job set costs us, and we would rather lose the identity tag
+// than lose an entry BOSH itself supplied.
+func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 	var parts []string
 	for _, key := range []string{"director", "deployment", "instance_group", "job", "index"} {
 		v, ok := metadata[key]
@@ -354,6 +365,9 @@ func buildBoshManagedTags(metadata map[string]any) []string {
 		if s := sanitizeTagValue(raw); s != "" {
 			parts = append(parts, s)
 		}
+	}
+	if s := sanitizeTagValue(vmPrefix); s != "" {
+		parts = append(parts, vmPrefixTagPrefix+s)
 	}
 	return parts
 }

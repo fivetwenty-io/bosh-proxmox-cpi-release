@@ -58,8 +58,9 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// It lets operators filter PVE UI / scripts to CPI-managed guests only and
 	// is preserved across set_vm_metadata because it is not in
 	// reservedBoshTagPrefixes. Operator-supplied tags are appended after.
-	// The BOSH-managed director/deployment/job triple is added later by
-	// set_vm_metadata.
+	// Every tag in reservedBoshTagPrefixes, which covers the BOSH metadata keys
+	// and the vm-prefix-- identity tag, is added later by set_vm_metadata, and
+	// none of them is stamped here.
 	baseRetainTags := buildCustomTags(cp.Tags)
 	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
 		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)

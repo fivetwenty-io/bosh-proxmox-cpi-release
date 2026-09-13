@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -342,9 +343,18 @@ func persistMetadata(ctx context.Context, deps Deps, vm attachedVM, diskCID stri
 //
 // Merge semantics: for each key in `tags`, any existing entry on the VM with
 // the same key prefix ("<key>--") is replaced. Entries with unrelated keys
-// are preserved. The BOSH-reserved director/deployment/job prefixes are also
-// preserved here — set_vm_metadata owns those and rebuilds them on each sync.
+// are preserved. The keys in reservedBoshTagPrefixes are also preserved here,
+// because set_vm_metadata owns those and rebuilds them on each sync.
+//
+// Preserving them takes a filter rather than a guarantee from the merge. A
+// disk tag whose key is one of the reserved ones would replace the VM's own
+// entry directly, outside the strip-and-reapply cycle set_vm_metadata runs,
+// and the overwrite would stand until the next metadata call. So we drop such
+// a tag and warn, naming the key and the disk. We skip rather than refuse, so
+// that a deployment already shipping one of these keys keeps working instead
+// of failing its next set_disk_metadata.
 func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, tags map[string]string, diskCID string) error {
+	tags = dropReservedDiskTags(ctx, deps, tags, diskCID)
 	if len(tags) == 0 {
 		return nil
 	}
@@ -425,4 +435,39 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		)
 	}
 	return nil
+}
+
+// dropReservedDiskTags returns tags without any entry whose key would render a
+// CPI-owned tag, warning once per dropped key. The comparison runs on the
+// sanitized key, the same way buildCustomTags builds the entry, so a key of
+// "vm_prefix" is caught alongside "vm-prefix" and a key of "instance_group"
+// alongside "instance-group".
+//
+// tags comes back unchanged when it holds no reserved key, so the ordinary call
+// allocates nothing. The filtered map is what applyCustomTagsToVM records in the
+// description sentinel as well, so a dropped tag does not come back on the next
+// detach and attach cycle.
+func dropReservedDiskTags(ctx context.Context, deps Deps, tags map[string]string, diskCID string) map[string]string {
+	var reserved []string
+	for k := range tags {
+		if hasReservedBoshPrefix(sanitizeTagValue(k) + "--") {
+			reserved = append(reserved, k)
+		}
+	}
+	if len(reserved) == 0 {
+		return tags
+	}
+	kept := make(map[string]string, len(tags))
+	for k, v := range tags {
+		kept[k] = v
+	}
+	sort.Strings(reserved)
+	for _, k := range reserved {
+		delete(kept, k)
+		deps.Log(ctx).Warn("set_disk_metadata: disk tag key is reserved by the CPI and was not applied",
+			log.String("tag_key", k),
+			log.String("disk_cid", diskCID),
+		)
+	}
+	return kept
 }

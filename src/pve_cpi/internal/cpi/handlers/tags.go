@@ -12,11 +12,31 @@ import (
 // preserves it across every metadata update.
 const ownershipTag = "bosh-cpi"
 
+// vmPrefixTagPrefix is the key of the identity tag that names the prefix a
+// guest belongs to. The tag reads "vm-prefix--<prefix>", and buildBoshManagedTags
+// stamps it on every workload VM from that VM's first set_vm_metadata call.
+//
+// The internal/pve package declares the same literal for parker and mover VMs,
+// as parkerPrefixTagPrefix, because this package cannot import that one without
+// an import cycle. The two literals have to stay identical, so that an operator
+// filtering the PVE UI on "vm-prefix--blue" sees the workload VMs of that bloc
+// and the parkers holding their detached disks in one listing.
+const vmPrefixTagPrefix = "vm-prefix--"
+
 // reservedBoshTagPrefixes are the tag key prefixes the CPI owns and rewrites
 // on every set_vm_metadata call. Entries with these prefixes are stripped
 // from a stored PVE tag list before BOSH-managed values are re-applied, so a
-// stale director/deployment/job triple cannot accumulate.
-var reservedBoshTagPrefixes = []string{"director--", "deployment--", "instance-group--", "job--", "index--"}
+// stale value cannot accumulate beside the current one. The set is open, and a
+// key joins it whenever the CPI starts rebuilding that key on every sync, so
+// please read the slice rather than any prose that enumerates it.
+var reservedBoshTagPrefixes = []string{
+	"director--",
+	"deployment--",
+	"instance-group--",
+	"job--",
+	"index--",
+	vmPrefixTagPrefix,
+}
 
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and
 // cluster-resource rows, named once so the literal stays under the goconst
@@ -140,9 +160,11 @@ func parseTagsField(s string) []string {
 }
 
 // stripReservedBoshTags drops entries whose prefix matches any of
-// reservedBoshTagPrefixes. Used so set_vm_metadata can rebuild the
-// director/deployment/job triple from fresh metadata without leaving stale
-// values from a prior sync.
+// reservedBoshTagPrefixes. Used so set_vm_metadata can rebuild every
+// CPI-owned key from fresh inputs without leaving a stale value from a prior
+// sync beside the new one. The keys are the BOSH metadata keys plus the
+// vm-prefix-- identity tag, and reservedBoshTagPrefixes is the list that
+// decides.
 func stripReservedBoshTags(entries []string) []string {
 	if len(entries) == 0 {
 		return nil

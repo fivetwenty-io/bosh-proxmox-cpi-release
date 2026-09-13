@@ -75,7 +75,10 @@ func TestHandleSetVMMetadata_Happy(t *testing.T) {
 	}
 }
 
-// TestHandleSetVMMetadata_EmptyMetadata verifies empty metadata writes empty description/tags.
+// TestHandleSetVMMetadata_EmptyMetadata verifies empty metadata writes an empty
+// description and no tag other than the vm-prefix-- identity tag, which the CPI
+// derives from its own configuration rather than from the metadata map and so
+// stamps on every call.
 func TestHandleSetVMMetadata_EmptyMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -106,8 +109,8 @@ func TestHandleSetVMMetadata_EmptyMetadata(t *testing.T) {
 	if gotDescription != "" {
 		t.Errorf("expected empty description for empty metadata, got: %q", gotDescription)
 	}
-	if gotTags != "" {
-		t.Errorf("expected empty tags for empty metadata, got: %q", gotTags)
+	if gotTags != "vm-prefix--bosh" {
+		t.Errorf("expected only the identity tag for empty metadata, got: %q", gotTags)
 	}
 }
 
@@ -318,6 +321,67 @@ func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
 		if !strings.Contains(gotTags, want) {
 			t.Errorf("tags missing %q; got: %q", want, gotTags)
 		}
+	}
+}
+
+// TestHandleSetVMMetadata_PrefixTagReplacedNotAccumulated is the redeploy test
+// for the vm-prefix-- identity tag. The VM comes back from the first call
+// carrying "vm-prefix--old", the operator then changes pve.parker_prefix, and
+// the second call must leave exactly one identity tag naming the new value.
+//
+// The changed prefix is what makes the test able to fail. Two calls with an
+// unchanged prefix leave one tag whether or not the key is registered in
+// reservedBoshTagPrefixes, because mergeTagList drops exact-string duplicates,
+// so a test that does not change the prefix passes against the very defect it
+// targets.
+func TestHandleSetVMMetadata_PrefixTagReplacedNotAccumulated(t *testing.T) {
+	t.Parallel()
+
+	// storedTags is the VM's PVE tag field, read by every call and rewritten
+	// by every update, so the second call sees what the first one wrote.
+	storedTags := ""
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"tags": storedTags}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, params *nodes.UpdateQemuConfigParams) error {
+			if params.Tags != nil {
+				storedTags = *params.Tags
+			}
+			return nil
+		},
+	}
+
+	deps := testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{})
+	deps.Config.ParkerPrefix = "old"
+	h := handlers.HandleSetVMMetadata(deps)
+	metadata := map[string]any{"director": "d1", "deployment": "cf", "job": "web"}
+
+	if _, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{}); err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	if !strings.Contains(storedTags, "vm-prefix--old") {
+		t.Fatalf("first call did not stamp the identity tag; got: %q", storedTags)
+	}
+
+	deps.Config.ParkerPrefix = "new"
+	if _, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{}); err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+
+	var identity []string
+	for _, e := range strings.Split(storedTags, ";") {
+		if strings.HasPrefix(e, "vm-prefix--") {
+			identity = append(identity, e)
+		}
+	}
+	if len(identity) != 1 || identity[0] != "vm-prefix--new" {
+		t.Errorf("expected exactly one identity tag naming the new prefix; got %v in %q", identity, storedTags)
+	}
+	if !strings.Contains(storedTags, "director--d1") {
+		t.Errorf("BOSH-managed tags lost on the second call; got: %q", storedTags)
 	}
 }
 

@@ -881,7 +881,9 @@ Notes:
 
 - The combined tag string is capped at 255 bytes; entries past the cap are dropped at a `;` boundary, so partial entries are never emitted.
 
-- The CPI reserves five tag-key prefixes: `director--`, `deployment--`, `instance-group--`, `job--`, and `index--`. These are rebuilt from BOSH-supplied metadata on every `set_vm_metadata` call. Custom tags survive those re-syncs.
+- The CPI reserves six tag-key prefixes, which are `director--`, `deployment--`, `instance-group--`, `job--`, `index--`, and `vm-prefix--`. The CPI rebuilds all six on every `set_vm_metadata` call, the first five from the metadata the Director supplies and the sixth from the prefix `pve.parker_prefix` resolves to. Custom tags under any other key survive those re-syncs untouched.
+
+- A reserved key on a `disk_type` is dropped rather than applied, and the CPI logs a warning naming the key and the disk. A reserved key on a `vm_type` is not dropped at `create_vm` time, and the next `set_vm_metadata` call rebuilds the entry from the CPI's own inputs and discards the operator's value. Either way the operator's value does not survive, so a tag of one's own wants a key the CPI does not reserve.
 
 - PVE has no native disk-volume tag field. Tags on a `disk_type` are written to the tag field of the VM the disk is attached to and recorded in the VM description sentinel under `bosh_disk_tags`. Disk tags become visible only once the disk is attached to a VM; if `create_disk` is called without a `vm_cid` hint, the tags are deferred and applied on the next `set_disk_metadata` call.
 

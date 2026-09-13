@@ -517,6 +517,53 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 	}
 }
 
+// TestHandleSetDiskMetadata_SkipsReservedTagKeys verifies a disk tag whose key
+// the CPI owns is dropped with a warning while the rest of the map is applied.
+// Without the filter such a tag would replace the VM's own entry outright,
+// because the merge replaces every entry sharing the new tag's "<key>--"
+// prefix, and the overwrite would stand until the next set_vm_metadata call.
+func TestHandleSetDiskMetadata_SkipsReservedTagKeys(t *testing.T) {
+	t.Parallel()
+
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pve := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): {
+			"scsi0": testDiskCID,
+			"tags":  "vm-prefix--bosh;director--abc",
+		},
+	}, nodesSvc)
+
+	h := handlers.HandleSetDiskMetadata(makeDiskMetaDeps(pve))
+	meta := map[string]any{
+		"tags": map[string]any{
+			"tier":           "bronze",
+			"vm-prefix":      "blue",
+			"vm_prefix":      "green",
+			"instance_group": "hijacked",
+		},
+	}
+	_, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if nodesSvc.capturedTags == nil {
+		t.Fatal("UpdateQemuConfig did not write VM tags field")
+	}
+	gotTags := *nodesSvc.capturedTags
+	for _, want := range []string{"tier--bronze", "vm-prefix--bosh", "director--abc"} {
+		if !strings.Contains(gotTags, want) {
+			t.Errorf("VM tags missing %q; got: %q", want, gotTags)
+		}
+	}
+	for _, unwanted := range []string{"vm-prefix--blue", "vm-prefix--green", "instance-group--hijacked"} {
+		if strings.Contains(gotTags, unwanted) {
+			t.Errorf("reserved disk tag %q was applied; got: %q", unwanted, gotTags)
+		}
+	}
+}
+
 func TestHandleSetDiskMetadata_InvalidDiskCID(t *testing.T) {
 	t.Parallel()
 

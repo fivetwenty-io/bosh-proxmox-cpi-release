@@ -195,6 +195,77 @@ func TestStripReservedBoshTags_PreservesBoshCPI(t *testing.T) {
 	}
 }
 
+// TestStripReservedBoshTags_StripsVMPrefix verifies the vm-prefix-- identity
+// tag is stripped like every other CPI-owned key. It has to be, because
+// set_vm_metadata re-applies it from the current configuration, and a tag left
+// standing here would sit beside the new one after an operator changes the
+// prefix.
+func TestStripReservedBoshTags_StripsVMPrefix(t *testing.T) {
+	t.Parallel()
+	in := []string{
+		"bosh-cpi",
+		"vm-prefix--old",
+		"env--prod",
+		"advrt-abc12345",
+	}
+	got := stripReservedBoshTags(in)
+	want := []string{"bosh-cpi", "env--prod", "advrt-abc12345"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestBuildBoshManagedTags_PrefixTagAppendedLast pins the ordering promise in
+// buildBoshManagedTags's doc comment. mergeTagList truncates at a tag boundary,
+// so the identity tag has to be the last entry and therefore the first one a
+// long deployment and job set costs us.
+func TestBuildBoshManagedTags_PrefixTagAppendedLast(t *testing.T) {
+	t.Parallel()
+	got := buildBoshManagedTags(map[string]any{
+		"director":       "d1",
+		"deployment":     "cf",
+		"instance_group": "web",
+		"job":            "web",
+		"index":          "0",
+		"name":           "web/abc",
+	}, "blue")
+	want := []string{
+		"director--d1",
+		"deployment--cf",
+		"instance-group--web",
+		"job--web",
+		"index--0",
+		"web--abc",
+		"vm-prefix--blue",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestBuildBoshManagedTags_EmptyPrefixOmitsTag covers the direct-call case the
+// accessor cannot produce. An empty prefix emits no tag at all rather than a
+// bare "vm-prefix--".
+func TestBuildBoshManagedTags_EmptyPrefixOmitsTag(t *testing.T) {
+	t.Parallel()
+	got := buildBoshManagedTags(map[string]any{"deployment": "cf"}, "")
+	want := []string{"deployment--cf"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestBuildBoshManagedTags_PrefixSanitized verifies the prefix runs through the
+// same sanitizer every other tag value does.
+func TestBuildBoshManagedTags_PrefixSanitized(t *testing.T) {
+	t.Parallel()
+	got := buildBoshManagedTags(map[string]any{}, "my_prefix")
+	want := []string{"vm-prefix--my-prefix"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 // TestMergeTagList_BoshCPIDedup verifies that mergeTagList deduplicates
 // "bosh-cpi" when passed in both existing and additions slices.
 func TestMergeTagList_BoshCPIDedup(t *testing.T) {
