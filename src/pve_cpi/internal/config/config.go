@@ -4060,7 +4060,7 @@ func (c *CPIConfig) Validate() error {
 
 // ValidateWithLogger is identical to Validate, but accepts a logger parameter
 // for any warning entries. A nil logger uses the default stderr fallback.
-// warnVMPrefixSanitized is the one warning it emits today: a pve.vm_prefix that
+// warnVMPrefixSanitized is the one warning it emits today. A pve.vm_prefix that
 // the parker prefix chain had to rewrite is a fact an operator wants to see,
 // and it is not an error, because that property predates this validation.
 func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
@@ -5570,8 +5570,10 @@ func (c *CPIConfig) validateParkerPrefix(errs *[]string) {
 // The token scan comes next, and it returns as soon as it finds an unknown
 // variable. An unsubstituted "{director}" survives into the rendered name and
 // then fails the poolid charset rule, which would point the operator at a
-// charset they did not knowingly violate. Once we know the render is
-// meaningless, judging its charset or its collisions only adds noise.
+// charset they did not knowingly violate. After an unknown token the value
+// cannot render at all, so we report the token error and let the operator fix
+// that first. Every later check, the collision checks included, then runs
+// against a name that means something.
 //
 // The rest follows validateVMPool's own order, which is equality first and then
 // the shape checks, so a config that is both malformed and colliding reports
@@ -5583,6 +5585,20 @@ func (c *CPIConfig) validateParkerPrefix(errs *[]string) {
 // them. The comparisons earn their keep beyond tidiness, because a parker pool
 // colliding with either one would defeat the by-name refusals that keep the
 // empty-pool reaper away from them.
+//
+// One more skip sits between the collision checks and the shape checks. When
+// the template carries "{prefix}" and validateParkerPrefix has already refused
+// the prefix, the rendered name inherits whatever made the prefix illegal, and
+// running validateFlatPoolName over it would report the same bad string a
+// second time under a different property name. The ERB emits parker_pool with
+// its "{prefix}-parker" default on every deployment, so this is the common case
+// rather than a corner. A parker_prefix of "bosh parked" would otherwise draw a
+// DNS-label error naming parker_prefix and a poolid charset error naming
+// "bosh parked-parker". We skip the shape checks in that case, which are
+// validateFlatPoolName and the bosh-lock- refusal, and keep the token scan and
+// both collision checks, since neither of those depends on the prefix being
+// well formed. The skipped checks come back on the next load once the prefix is
+// legal.
 func (c *CPIConfig) validateParkerPool(errs *[]string) {
 	rendered := c.ParkerPoolValue()
 	if rendered == "" {
@@ -5615,6 +5631,9 @@ func (c *CPIConfig) validateParkerPool(errs *[]string) {
 			rendered,
 		))
 	}
+	if strings.Contains(c.ParkerPool, parkerPoolPrefixToken) && !c.parkerPrefixWellFormed() {
+		return
+	}
 	validateFlatPoolName("parker_pool", rendered, errs)
 	if strings.HasPrefix(rendered, clusterLockPoolPrefix) {
 		*errs = append(*errs, fmt.Sprintf(
@@ -5622,6 +5641,17 @@ func (c *CPIConfig) validateParkerPool(errs *[]string) {
 			clusterLockPoolPrefix, rendered,
 		))
 	}
+}
+
+// parkerPrefixWellFormed reports whether ParkerPrefix satisfies every rule
+// validateParkerPrefix enforces. It runs that validator against a throwaway
+// slice rather than restating the rules, so the two can never drift apart. An
+// empty ParkerPrefix is well formed, because the resolution chain then falls
+// through to a value that is legal by construction.
+func (c *CPIConfig) parkerPrefixWellFormed() bool {
+	var probe []string
+	c.validateParkerPrefix(&probe)
+	return len(probe) == 0
 }
 
 // warnVMPrefixSanitized logs a warning when the parker prefix chain fell

@@ -7741,3 +7741,44 @@ func TestValidateParkerFields_StrictConfigValidationAcceptsBoth(t *testing.T) {
 		t.Errorf("ParkerPoolValue() = %q, want %q", got, "parked-parker")
 	}
 }
+
+// TestValidateParkerPool_InvalidPrefixReportedOnce covers the pairing the ERB
+// makes common. It emits parker_pool with its "{prefix}-parker" default on
+// every deployment, so a parker_prefix the validator refuses would render into
+// the pool name and draw a second error naming a property the operator never
+// touched. One bad string earns one error, so validateParkerPool skips the
+// rendered value's shape checks whenever the template carries "{prefix}" and
+// the prefix itself is already refused.
+func TestValidateParkerPool_InvalidPrefixReportedOnce(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "bosh parked",
+		"parker_pool": "{prefix}-parker"
+	}`)
+	if err == nil {
+		t.Fatal("expected an error for a parker_prefix outside the DNS label charset")
+	}
+	msg := err.Error()
+	if count := strings.Count(msg, "parker_prefix"); count != 1 {
+		t.Errorf("expected exactly one error naming parker_prefix, got %d in: %v", count, err)
+	}
+	if strings.Contains(msg, "parker_pool") {
+		t.Errorf("the rendered pool must draw no error of its own while the prefix is refused, got: %v", err)
+	}
+}
+
+// TestValidateParkerPool_ShapeChecksSurviveAValidPrefix is the other half of
+// that skip. A well-formed prefix leaves every shape check in force, so a
+// template that renders a slash is still refused.
+func TestValidateParkerPool_ShapeChecksSurviveAValidPrefix(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "parked",
+		"parker_pool": "{prefix}/parker"
+	}`)
+	assertCloudError(t, err, "parker_pool must not contain '/'")
+}
