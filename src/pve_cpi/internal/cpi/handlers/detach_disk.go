@@ -388,10 +388,13 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return retriableUnlessPermanent(transferErr,
 			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
 	}
-	sweepParkerPool(ctx, deps, node, parkerCfg)
+	// The sweep runs after the verification rather than before it, so that
+	// every funnel places parkers only once the park it just made has been
+	// verified. The managed create_disk park already works that way.
 	if err := verifyManagedDiskParked(ctx, deps, rd, landed); err != nil {
 		return err
 	}
+	sweepParkerPool(ctx, deps, node, parkerCfg)
 	if rd.allocation != nil {
 		if err := pve.RemoveDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), rd.allocation.provenance); err != nil {
 			return err
@@ -429,8 +432,13 @@ func parkFreeFloatingStableID(ctx context.Context, deps Deps, rd resolvedDisk) e
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", rd.diskCID))
 	}
+	// A verified park first, and the pool sweep after it, which is the order
+	// every other funnel follows.
+	if err := verifyManagedDiskParked(ctx, deps, rd, rd.volid); err != nil {
+		return err
+	}
 	sweepParkerPool(ctx, deps, node, parkerCfg)
-	return verifyManagedDiskParked(ctx, deps, rd, rd.volid)
+	return nil
 }
 
 // handleAlreadyDetachedParked handles the alreadyDetached=true branch of

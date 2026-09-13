@@ -704,9 +704,16 @@ func parkerDirectorTag(directorID string) string {
 	return parkerDirectorTagPrefix + sd
 }
 
-// parkerPrefixTagPrefix marks the tag that carries a parker or mover VM's
-// resolved name prefix.
-const parkerPrefixTagPrefix = "vm-prefix--"
+// ParkerPrefixTagPrefix marks the tag that carries a guest's resolved name
+// prefix. The tag reads "vm-prefix--<prefix>".
+//
+// It is exported because the handlers package stamps the same tag on every
+// workload VM through buildBoshManagedTags, and the two have to stay identical
+// byte for byte. An operator filtering the PVE UI on "vm-prefix--blue" expects
+// the workload VMs of that bloc and the parkers holding their detached disks in
+// one listing, and two separate literals could drift apart without a single
+// test noticing.
+const ParkerPrefixTagPrefix = "vm-prefix--"
 
 // parkerPrefixTag returns the "vm-prefix--<prefix>" tag for prefix, or "" when
 // prefix is empty or nothing survives sanitizing. Mirrors parkerDirectorTag's
@@ -722,7 +729,7 @@ func parkerPrefixTag(prefix string) string {
 	if sp == "" {
 		return ""
 	}
-	return parkerPrefixTagPrefix + sp
+	return ParkerPrefixTagPrefix + sp
 }
 
 // parkerBelongsToDirector reports whether a parker carrying tagStr may be

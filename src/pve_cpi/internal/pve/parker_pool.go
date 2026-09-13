@@ -93,17 +93,41 @@ func PlaceParkersInPool(ctx context.Context, c Client, logger *log.Logger, node 
 
 	var failures []error
 	ensureFailed := false
-	if ensureErr := EnsurePoolExists(sweepCtx, c, cfg.Pool, PoolProvenance(cfg.DirectorID), logger); ensureErr != nil {
-		// A pool we could not create may already exist, so the assignments
-		// below are still worth attempting.
-		failures = append(failures, ensureErr)
-		ensureFailed = true
+	// Read before writing. EnsurePoolExists on an undecorated client goes
+	// straight to POST /pools and leans on the already-exists answer, and every
+	// pool mutation cluster-wide serializes on the single pmxcfs user_cfg lock,
+	// so an unconditional ensure would put one lock-serialized write on every
+	// park for a pool the first park already created. GetPoolComment is the
+	// same read the boot preflight makes, it needs only Pool.Audit, and it
+	// turns the steady state into one read per park.
+	//
+	// A read we could not make falls through to the ensure rather than
+	// stopping, because the ensure treats an already-existing pool as success
+	// and a genuinely missing pool still has to be created.
+	_, poolExists, poolReadErr := c.Pools().GetPoolComment(sweepCtx, cfg.Pool)
+	if poolReadErr != nil {
+		poolExists = false
 		if logger != nil {
-			logger.Warn("could not ensure the parker pool exists; the parkers on this node stay unpooled unless the pool is already there",
+			logger.Debug("could not read whether the parker pool already exists, so the sweep falls back to creating it if missing",
 				log.String("pool", cfg.Pool),
 				log.String("node", node),
-				log.Err(ensureErr),
+				log.Err(poolReadErr),
 			)
+		}
+	}
+	if !poolExists {
+		if ensureErr := EnsurePoolExists(sweepCtx, c, cfg.Pool, PoolProvenance(cfg.DirectorID), logger); ensureErr != nil {
+			// A pool we could not create may already exist, so the assignments
+			// below are still worth attempting.
+			failures = append(failures, ensureErr)
+			ensureFailed = true
+			if logger != nil {
+				logger.Warn("could not ensure the parker pool exists; the parkers on this node stay unpooled unless the pool is already there",
+					log.String("pool", cfg.Pool),
+					log.String("node", node),
+					log.Err(ensureErr),
+				)
+			}
 		}
 	}
 

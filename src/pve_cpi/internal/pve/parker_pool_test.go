@@ -48,6 +48,13 @@ type sweepPools struct {
 	createErr error
 	addErr    error
 	probeErr  error
+	// poolExists is what GetPoolComment answers for any pool, which is the
+	// read the sweep makes before it decides whether the pool needs creating
+	// at all.
+	poolExists bool
+	// commentErr fails that read, which is the case where the sweep cannot
+	// tell whether the pool is there and falls back to the ensure.
+	commentErr error
 	// block, when non-nil, is waited on by CreatePool until it closes or the
 	// context ends, which is how the bound test holds the sweep still.
 	block <-chan struct{}
@@ -86,6 +93,12 @@ func (p *sweepPools) DeletePool(ctx context.Context, poolID string) error {
 
 func (p *sweepPools) GetPoolComment(ctx context.Context, poolID string) (string, bool, error) {
 	p.record(ctx, "comment:"+poolID)
+	if p.commentErr != nil {
+		return "", false, p.commentErr
+	}
+	if p.poolExists {
+		return PoolProvenance("d1"), true, nil
+	}
 	return "", false, nil
 }
 
@@ -210,7 +223,12 @@ func countCalls(calls []string, prefix string) int {
 func TestPlaceParkersInPool_AssignsEveryUnpooledParker(t *testing.T) {
 	t.Parallel()
 
+	// The pool is already there, which is the steady state after the first
+	// park on the cluster. The sweep reads it and creates nothing, because
+	// every pool mutation cluster-wide serializes on one pmxcfs lock and a
+	// create per park would contend there for a pool that already exists.
 	pools := newSweepPools()
+	pools.poolExists = true
 	c := sweepFixture(t, pools, map[int]string{
 		90000: "bosh-cpi;bosh-parker;director--d1",
 		90001: "bosh-cpi;bosh-parker;director--d1",
@@ -231,10 +249,56 @@ func TestPlaceParkersInPool_AssignsEveryUnpooledParker(t *testing.T) {
 	if got := countCalls(pools.calls, "move:"); got != 0 {
 		t.Errorf("MoveVMToPool must never be called; calls = %v", pools.calls)
 	}
+	if got := countCalls(pools.calls, "comment:"); got != 1 {
+		t.Errorf("the sweep must read the pool exactly once; calls = %v", pools.calls)
+	}
+	if got := countCalls(pools.calls, "create:"); got != 0 {
+		t.Errorf("a pool that already exists must not be created again; calls = %v", pools.calls)
+	}
+	if len(pools.calls) == 0 || pools.calls[0] != "comment:"+sweepPool {
+		t.Errorf("the read must come first, got %v", pools.calls)
+	}
+}
+
+func TestPlaceParkersInPool_CreatesTheParkerPoolWhenItIsMissing(t *testing.T) {
+	t.Parallel()
+
+	// The first park on a fresh cluster. The read finds nothing, so the sweep
+	// creates the pool, and it carries the provenance comment the empty-pool
+	// reaper reads.
+	pools := newSweepPools()
+	c := sweepFixture(t, pools, map[int]string{90000: "bosh-cpi;bosh-parker;director--d1"})
+
+	if err := PlaceParkersInPool(context.Background(), c, nil, sweepNode, sweepCfg()); err != nil {
+		t.Fatalf("PlaceParkersInPool: unexpected error: %v", err)
+	}
+
 	wantComment := PoolProvenance("d1")
-	if len(pools.calls) == 0 || pools.calls[0] != "create:"+sweepPool+":"+wantComment {
-		t.Errorf("the sweep must ensure the pool first with the provenance comment %q, got %v",
+	want := []string{"comment:" + sweepPool, "create:" + sweepPool + ":" + wantComment}
+	if len(pools.calls) < 2 || pools.calls[0] != want[0] || pools.calls[1] != want[1] {
+		t.Errorf("the sweep must read the pool and then create it with %q, got %v",
 			wantComment, pools.calls)
+	}
+	if !pools.members[sweepPool][90000] {
+		t.Errorf("the parker must still land in %q, got %v", sweepPool, pools.members[sweepPool])
+	}
+}
+
+func TestPlaceParkersInPool_FailedPoolReadStillCreatesThePool(t *testing.T) {
+	t.Parallel()
+
+	// A read we could not make tells us nothing, so the sweep falls back to
+	// the ensure, which treats an already-existing pool as success anyway.
+	pools := newSweepPools()
+	pools.commentErr = errors.New("500 connection reset")
+	c := sweepFixture(t, pools, map[int]string{90000: "bosh-cpi;bosh-parker;director--d1"})
+
+	if err := PlaceParkersInPool(context.Background(), c, nil, sweepNode, sweepCfg()); err != nil {
+		t.Fatalf("a failed pool read must not fail the sweep: %v", err)
+	}
+	if got := countCalls(pools.calls, "create:"); got != 1 {
+		t.Errorf("a pool whose existence we could not read must still be ensured; calls = %v",
+			pools.calls)
 	}
 }
 

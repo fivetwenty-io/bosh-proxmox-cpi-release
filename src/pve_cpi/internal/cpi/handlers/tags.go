@@ -3,6 +3,8 @@ package handlers
 import (
 	"sort"
 	"strings"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // ownershipTag is the fixed CPI ownership marker stamped on every VM and
@@ -11,17 +13,6 @@ import (
 // ones. The tag is NOT in reservedBoshTagPrefixes, so set_vm_metadata
 // preserves it across every metadata update.
 const ownershipTag = "bosh-cpi"
-
-// vmPrefixTagPrefix is the key of the identity tag that names the prefix a
-// guest belongs to. The tag reads "vm-prefix--<prefix>", and buildBoshManagedTags
-// stamps it on every workload VM from that VM's first set_vm_metadata call.
-//
-// The internal/pve package declares the same literal for parker and mover VMs,
-// as parkerPrefixTagPrefix, because this package cannot import that one without
-// an import cycle. The two literals have to stay identical, so that an operator
-// filtering the PVE UI on "vm-prefix--blue" sees the workload VMs of that bloc
-// and the parkers holding their detached disks in one listing.
-const vmPrefixTagPrefix = "vm-prefix--"
 
 // reservedBoshTagPrefixes are the tag key prefixes the CPI owns and rewrites
 // on every set_vm_metadata call. Entries with these prefixes are stripped
@@ -35,7 +26,12 @@ var reservedBoshTagPrefixes = []string{
 	"instance-group--",
 	"job--",
 	"index--",
-	vmPrefixTagPrefix,
+	// The identity tag that names the prefix a guest belongs to. The pve
+	// package owns the literal, because it stamps the same tag on parker and
+	// mover VMs, and an operator filtering the PVE UI on "vm-prefix--blue"
+	// expects the workload VMs of that bloc and the parkers holding their
+	// detached disks in one listing.
+	pve.ParkerPrefixTagPrefix,
 }
 
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and

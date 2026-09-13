@@ -367,7 +367,7 @@ func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 		}
 	}
 	if s := sanitizeTagValue(vmPrefix); s != "" {
-		parts = append(parts, vmPrefixTagPrefix+s)
+		parts = append(parts, pve.ParkerPrefixTagPrefix+s)
 	}
 	return parts
 }
