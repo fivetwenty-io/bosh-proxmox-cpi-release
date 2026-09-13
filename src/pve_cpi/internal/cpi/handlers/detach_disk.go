@@ -361,8 +361,9 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return retriableUnlessPermanent(ovErr,
 			fmt.Sprintf("detach_disk: read recorded option overrides for disk %s before transfer", rd.diskCID))
 	}
+	parkerCfg := parkerWriteConfigFor(deps)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay})
-	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerWriteConfigFor(deps), pctx)
+	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerCfg, pctx)
 	if transferErr != nil {
 		if pve.IsMoveDiskSnapshotRefusal(transferErr) {
 			// PVE refuses to reassign a snapshot-referenced volume, and the
@@ -387,6 +388,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return retriableUnlessPermanent(transferErr,
 			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
 	}
+	sweepParkerPool(ctx, deps, node, parkerCfg)
 	if err := verifyManagedDiskParked(ctx, deps, rd, landed); err != nil {
 		return err
 	}
@@ -421,11 +423,13 @@ func parkFreeFloatingStableID(ctx context.Context, deps Deps, rd resolvedDisk) e
 		}
 		return resolveErr
 	}
+	parkerCfg := parkerWriteConfigFor(deps)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID})
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, rd.volid, parkerWriteConfigFor(deps), pctx); parkErr != nil {
+	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), node, rd.volid, parkerCfg, pctx); parkErr != nil {
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", rd.diskCID))
 	}
+	sweepParkerPool(ctx, deps, node, parkerCfg)
 	return verifyManagedDiskParked(ctx, deps, rd, rd.volid)
 }
 
@@ -522,6 +526,7 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park free-floating disk %s (fail-closed)", diskCID))
 	}
+	sweepParkerPool(ctx, deps, alreadyDetachedNode, parkerCfg)
 	return nil
 }
 
@@ -599,6 +604,7 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("detach_disk: park disk %s after detach (fail-closed: retry will re-park)", diskCID))
 	}
+	sweepParkerPool(ctx, deps, node, parkerCfg)
 	return nil
 }
 

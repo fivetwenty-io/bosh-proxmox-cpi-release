@@ -31,17 +31,20 @@ type managedDiskTestPVE struct {
 	state *managedDiskTestState
 }
 type managedDiskTestState struct {
-	volumes       map[string]*nodes.GetStorageContentResponse
-	created       []string
-	createErr     error
-	readErr       error
-	before        func(string)
-	beforeList    func(string)
-	badReturn     bool
-	partial       bool
-	failFirst     bool
-	configs       map[int]map[string]any
-	pools         map[string]string
+	volumes    map[string]*nodes.GetStorageContentResponse
+	created    []string
+	createErr  error
+	readErr    error
+	before     func(string)
+	beforeList func(string)
+	badReturn  bool
+	partial    bool
+	failFirst  bool
+	configs    map[int]map[string]any
+	pools      map[string]string
+	// poolMembers records which guests each pool holds, which is what the
+	// parker pool sweep reads and writes once the guarded window has closed.
+	poolMembers   map[string]map[int64]bool
 	parkMutations int
 	parkErr       error
 	existsErr     error
@@ -109,6 +112,19 @@ func (p managedDiskTestPools) DeletePool(_ context.Context, id string) error {
 func (p managedDiskTestPools) GetPoolComment(_ context.Context, id string) (string, bool, error) {
 	v, ok := p.state.pools[id]
 	return v, ok, nil
+}
+func (p managedDiskTestPools) AddVM(_ context.Context, id string, vmid int64) error {
+	if p.state.poolMembers == nil {
+		p.state.poolMembers = map[string]map[int64]bool{}
+	}
+	if p.state.poolMembers[id] == nil {
+		p.state.poolMembers[id] = map[int64]bool{}
+	}
+	p.state.poolMembers[id][vmid] = true
+	return nil
+}
+func (p managedDiskTestPools) PoolHasVM(_ context.Context, id string, vmid int64) (bool, error) {
+	return p.state.poolMembers[id][vmid], nil
 }
 func (q managedDiskTestQEMU) AttachDisk(_ context.Context, _ string, vmid int, volume, bus string, opts *qemu.AttachOpts) (string, error) {
 	q.state.parkMutations++

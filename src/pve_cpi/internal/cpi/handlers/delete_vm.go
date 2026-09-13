@@ -1011,11 +1011,13 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 				StableID:    entry.StableID,
 				Opts:        pve.DiskOptOverlayFromDesc(desc, entry.StableID, entry.Volid),
 			}
-			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerWriteConfigFor(deps), pctx); transferErr != nil {
+			parkerCfg := parkerWriteConfigFor(deps)
+			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerCfg, pctx); transferErr != nil {
 				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
 					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it (the volume would otherwise be destroyed; retry resumes the transfer)",
 					vmCID, slot, entry.Volid))
 			}
+			sweepParkerPool(ctx, deps, node, parkerCfg)
 			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, entry.StableID, entry.Volid)
 			continue
 		}

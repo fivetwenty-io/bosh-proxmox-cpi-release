@@ -81,7 +81,17 @@ func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, v
 	if err := guard.Err(); err != nil {
 		return err
 	}
-	return pve.VerifyAllocationParked(ctx, m.deps.PVE, m.deps.Log(ctx), volume, m.token, m.plan.Namespace, m.id, cfg)
+	if err := pve.VerifyAllocationParked(ctx, m.deps.PVE, m.deps.Log(ctx), volume, m.token, m.plan.Namespace, m.id, cfg); err != nil {
+		return err
+	}
+	// The sweep runs here, outside the guard, on the same unguarded client the
+	// verification above uses. The guard's admission hook admits a pool
+	// mutation only for a bosh-lock- sentinel and refuses everything else, and
+	// a refusal poisons the whole allocation, so a placement moved inside
+	// ParkDisk to save a listing would turn every managed park into an
+	// uncertain allocation (Section 3.8).
+	sweepParkerPool(ctx, m.deps, m.plan.Node, cfg)
+	return nil
 }
 
 func managedDiskParkIdentity(call ManagedAllocationMutation, defaultNode string) (string, int, error) {

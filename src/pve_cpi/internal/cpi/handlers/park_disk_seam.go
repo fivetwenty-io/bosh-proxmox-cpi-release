@@ -20,14 +20,16 @@ type parkDiskFunc func(
 	pctx pve.ParkContext,
 ) error
 
-// parkDiskImpl holds the park the three folded funnels call, which is
+// parkDiskImpl holds the park every direct park funnel calls, which is
 // pve.ParkDisk in every process that is not running a test. It is a test seam
 // rather than an abstraction over parking, and production never swaps it.
 //
-// It exists because the three funnels that build a park config out of
+// It exists because the funnels that build a park config out of
 // parkerWriteConfigFor, which are parkFreshDisk, handleAlreadyDetachedParked,
-// and parkAfterDetach, have to be tested on the config they hand down rather
-// than on the PVE calls that config eventually makes. Most of ParkerConfig does
+// parkAfterDetach, parkFreeFloatingStableID, and parkFreeFloatingCrossNodeDisk,
+// have to be tested on the config they hand down and on the parker pool sweep
+// they run afterwards, rather than on the PVE calls that config eventually
+// makes. Most of ParkerConfig does
 // show up in those calls. The band bounds pick the VMID, DiskStorage turns the
 // storage scan on, and Prefix lands in the created parker's name. Pool does
 // not. The sweep that reads Pool runs outside the park, so a funnel that
@@ -38,10 +40,9 @@ type parkDiskFunc func(
 // It is held in an atomic.Pointer for the reason haResurrectorWarnOnce is,
 // which is that a plain package var swapped by a test is an unsynchronized
 // write the race detector is entitled to flag. The seam is deliberately
-// narrow. The other parkers in this package, which are
-// parkFreeFloatingStableID, the cross-node migrate park, and the managed park
-// that runs against the allocation guard's own client, still call pve.ParkDisk
-// directly, because nothing tests them through here.
+// narrow. The managed park still calls pve.ParkDisk directly, because it runs
+// against the allocation guard's own client and its tests drive the guard
+// itself rather than the park.
 var parkDiskImpl atomic.Pointer[parkDiskFunc]
 
 func init() {

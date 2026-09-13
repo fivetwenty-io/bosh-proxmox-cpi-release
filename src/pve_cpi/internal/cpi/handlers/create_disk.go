@@ -848,6 +848,7 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID, s
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("create_disk: park fresh disk %s (fail-closed: rollback deletes the volume)", diskCID))
 	}
+	sweepParkerPool(ctx, deps, node, parkerCfg)
 	return nil
 }
 

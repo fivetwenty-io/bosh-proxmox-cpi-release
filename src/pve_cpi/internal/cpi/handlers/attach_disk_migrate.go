@@ -66,11 +66,16 @@ func parkFreeFloatingCrossNodeDisk(
 		log.String("disk_node", diskNode),
 		log.String("vm_node", vmNode),
 	)
+	parkWriteCfg := parkerWriteConfigFor(deps)
 	pctx := pve.ParkContext{DiskCID: rd.diskCID, StableID: rd.stableID}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), diskNode, rd.volid, parkerWriteConfigFor(deps), pctx); parkErr != nil {
+	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), diskNode, rd.volid, parkWriteCfg, pctx); parkErr != nil {
 		return pve.DiskHolder{}, false, retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("%s: park free-floating disk %s on node %s before cross-node migration", op, rd.diskCID, diskNode))
 	}
+	// This park runs on deps.PVE rather than on a guarded client, and the sweep
+	// has to match it. An attach may hold a lifecycle guard open elsewhere in
+	// the call chain, and that guard refuses every pool outside bosh-lock-.
+	sweepParkerPool(ctx, deps, diskNode, parkWriteCfg)
 	newHolder, reErr := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), rd.volid, parkerCfg)
 	if reErr != nil {
 		return pve.DiskHolder{}, false, wrapHolderScanError(reErr,

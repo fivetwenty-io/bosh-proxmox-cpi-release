@@ -117,9 +117,11 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 			return err
 		}
 	case identity.holder != nil && identity.holder.Node == node && identity.holder.VMID == vmid:
-		if _, err := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, identity.volid, parkerWriteConfigFor(deps), parkContext); err != nil {
+		parkerCfg := parkerWriteConfigFor(deps)
+		if _, err := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, identity.volid, parkerCfg, parkContext); err != nil {
 			return err
 		}
+		sweepParkerPool(ctx, deps, node, parkerCfg)
 	case identity.holder == nil || !identity.holder.IsParker:
 		return fmt.Errorf("retained ephemeral ownership is ambiguous")
 	}
