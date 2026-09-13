@@ -11,7 +11,7 @@ Run the [Candidate Release workflow](../../.github/workflows/candidate-release.y
 ```sh
 gh workflow run candidate-release.yml \
   --repo fivetwenty-io/bosh-proxmox-cpi-release \
-  --ref multi-storage-placement
+  --ref main
 ```
 
 The workflow runs the CI gate, compiles both package binaries with the verified Go blob, and builds a source release archive. Its run summary supplies the artifact name, source commit, release version, and tarball checksum. It retains the artifact for 30 days through [GitHub artifact storage](https://github.com/actions/upload-artifact#retention-period), without publishing a release or contacting PVE.

@@ -2,7 +2,7 @@
 
 The lifecycle harness can verify the base configuration against a disposable PVE lab. It checks actual VM and disk locations through the PVE API and obtains set membership from the production `pve-cid storage-plan` command. It does not reproduce the selection algorithm in Python.
 
-Prepare at least two PVE nodes that can reach three independent ephemeral NFS members and two independent persistent members. Bind the global ephemeral and persistent sets separately, and provide the infrastructure storage required by the selected stemcell and agent mode. The CPI and `pve-cid` binaries must be built from the same candidate and installed together. Initialize the durable journal through the [journal operations procedure](../storage-journal-operations.md) before running the harness.
+Prepare at least two PVE nodes that can reach three independent ephemeral NFS members and two independent persistent members. Bind the global ephemeral and persistent sets separately, and provide the infrastructure storage required by the selected stemcell and agent mode. The CPI and `pve-cid` binaries must be built from the same candidate and installed together. Initialize the durable journal through the [journal operations procedure](../storage-journal-operations.md) before running the harness. The [lab topology page](multi-storage-lab.md) records the storage targets, capacity basis, and guest-agent fixture our reference lab uses.
 
 Use the existing lifecycle environment variables for credentials, the stemcell, and a disposable test IP. Enable the placement checks with the following command. Replace the paths with the intended lab files.
 

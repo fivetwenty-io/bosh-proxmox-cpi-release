@@ -261,7 +261,7 @@ TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
 	--skip-files manifests/envs/cpitest/artifacts_ssh \
 	--skip-files config/private.yml \
 	--skip-dirs .e2e-results \
-	--skip-dirs .claude/worktrees
+	--skip-dirs '**/worktrees'
 
 .PHONY: trivy
 trivy: ## Run trivy filesystem scan for HIGH/CRITICAL CVEs (skips gracefully if trivy is not installed)

@@ -1,6 +1,6 @@
 # Multiple NFS shares: research, updated design, and implementation plan
 
-Implementation is underway on the `multi-storage-placement` branch. The [progress record](../plans/multi-storage-placement-progress.md) tracks validation; live certification has not run. The research and adversarial revision dated 2026-09-08 establish complete ephemeral coverage and replaceable operator-selected algorithms as first-release requirements.
+The implementation follows this design, and the [implementation plan](../plans/multi-storage-placement-plan.md) records the work packages and gates. The research and adversarial revision dated 2026-09-08 establish complete ephemeral coverage and replaceable operator-selected algorithms as first-release requirements.
 
 We recommend adding **named storage sets**. Each set names existing PVE storage IDs through an explicit list or a regex. The operator chooses a versioned placement strategy for that set. The base configuration binds one set to persistent disks and a separate set to VM-lifetime storage: root disks and any dedicated ephemeral disks. Root placement and cloning are required in the first release; otherwise VMs that obtain guest ephemeral space from their root disk would escape the policy. Operators may explicitly bind root disks to another set when they want that separation.
 

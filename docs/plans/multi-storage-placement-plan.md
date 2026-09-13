@@ -2,7 +2,7 @@
 
 This plan implements the [multiple-storage placement design](../designs/multi-storage-placement-design.md). It gives operators independent persistent and ephemeral storage sets, with a selectable, versioned strategy for each set. The ephemeral set covers root disks and dedicated ephemeral disks. Persistent sets support either one share or several shares through the same configuration and allocation path.
 
-Implementation and the local standalone campaign are complete. Candidate 13 passed all sixty standalone cases, the separate four-VM batch, the Director update, and the Director compilation, errand, and recreation workloads. On September 12, 2026, the operator assigned further Director upgrade certification and BATS to weekly acceptance and closed local execution. The remaining Director core and placement rollout results are not claimed as passed. The [final report](../multi-storage-placement-implementation-and-validation-report.md) records this disposition, including the unresolved R10 preflight failure and the release-selection conditions for weekly evidence. The design remains the source for placement semantics; the [progress record](multi-storage-placement-progress.md) preserves the campaign history.
+The implementation is complete, and the standalone lifecycle, fault, constraint, and recovery cases passed against the lab. We do not claim the Director core and placement rollout gates as passed. They run through the [weekly acceptance pipeline](../certification/scheduled.md). The design remains the source for placement semantics.
 
 ## 1. Delivery contract
 
@@ -240,7 +240,7 @@ Provide validated operator examples for the two-set base case, singleton persist
 
 Update configuration, persistent-disk, ConfigDrive, create-env, multi-cluster, operations, troubleshooting, and permissions documentation. Document journal initialization, backup, restoration, adoption, and cleanup using the completed tooling. Explain the required PVE inventory and storage permissions through the existing permissions inventory, without claiming a new NAS-level encryption or availability guarantee.
 
-Acceptance requires executable configuration fixtures, CLI parsing and no-mutation tests, redaction assertions, bounded metric labels, and documented error remedies. Run writing-expert review and remediation on completed prose, then validate local links and command examples.
+Acceptance requires executable configuration fixtures, CLI parsing and no-mutation tests, redaction assertions, bounded metric labels, and documented error remedies. Review the completed prose, then validate local links and command examples.
 
 ## 12. P10: Certify the complete feature
 
@@ -324,7 +324,7 @@ The feature is complete when P1–P11 pass, every release-matrix row has evidenc
 
 ## 14. P11: Publish the implementation and validation report
 
-After every implementation, lab, lifecycle, recovery, rollout, and rollback gate has reached a terminal result, publish a detailed prose report at `docs/multi-storage-placement-implementation-and-validation-report.md`. Write it for operators, maintainers, and release reviewers who did not participate in the implementation. The report must explain what shipped, how placement behaves, what was tested, what evidence supports each conclusion, and any limits demonstrated by the tests. Do not replace explanations with raw command output or a list of artifact paths.
+After every implementation, lab, lifecycle, recovery, rollout, and rollback gate has reached a terminal result, publish a detailed prose report under `docs/certification/`. Write it for operators, maintainers, and release reviewers who did not participate in the implementation. The report must explain what shipped, how placement behaves, what was tested, what evidence supports each conclusion, and any limits demonstrated by the tests. Do not replace explanations with raw command output or a list of artifact paths.
 
 Include the final configuration schema and effective precedence rules; persistent, root, and dedicated ephemeral placement behavior; strategy selection and versioning; capacity-domain accounting; retry and fallback behavior; durable journal and recovery semantics; lifecycle behavior after policy or membership changes; compatibility; rollout; and rollback. Describe the certified lab topology, including the two PVE nodes, NFS exports, roles, capacity domains, quotas, and relevant failure injection. Record the exact source commit, candidate release version and checksum, packaged binary checksums, PVE versions, policy fingerprints, and sanitized infrastructure identifiers needed to reproduce or audit the result.
 
@@ -332,4 +332,4 @@ Support the prose with tables that map requirements to implementation locations 
 
 Report every failed attempt that changed the implementation or test procedure, the diagnosed cause, the remediation, and the successful rerun evidence. Distinguish product defects from harness or environment defects. Preserve failed-run artifacts and link them from the report; never rewrite a failed result as a pass. Redact credentials, tokens, private keys, and secrets while retaining stable non-secret correlation identifiers.
 
-Before completion, verify every table row and graph against the retained receipts, logs, inventories, and source. Check local links and Mermaid syntax, run writing-expert review and remediation over the complete report, and confirm that the report contains no placeholders, TODOs, deferred sections, unsupported claims, or unresolved findings. The feature is not complete until this report is committed with the implementation and all cited evidence is retained at the documented locations.
+Before completion, verify every table row and graph against the retained receipts, logs, inventories, and source. Check local links and Mermaid syntax, review the complete report's prose, and confirm that the report contains no placeholders, TODOs, deferred sections, unsupported claims, or unresolved findings. The feature is not complete until we commit a certification run report in the established format with the implementation. All cited evidence must remain at the documented locations.

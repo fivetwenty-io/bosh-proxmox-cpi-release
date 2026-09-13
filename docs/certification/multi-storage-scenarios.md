@@ -120,13 +120,13 @@ To control a PVE-hosted backend through pmx, add this optional object to that ba
 {
   "transport": {
     "kind": "pmx",
-    "binary": "/home/ubuntu/storage-cert-20260909/bin/pmx",
-    "config": "/home/ubuntu/storage-cert-20260909/config/physical-pmx.yml",
+    "binary": "/absolute/path/pmx",
+    "config": "/absolute/path/physical-pmx.yml",
     "context": "lab",
     "node": "sm-0",
-    "identity_file": "/home/ubuntu/storage-cert-20260909/config/physical-fault-ssh",
-    "known_hosts_file": "/home/ubuntu/storage-cert-20260909/config/physical-fault-known-hosts",
-    "host_key_alias": "cpi-storage-fault-20260909-sm-0"
+    "identity_file": "/absolute/path/physical-fault-ssh",
+    "known_hosts_file": "/absolute/path/physical-fault-known-hosts",
+    "host_key_alias": "cpi-storage-fault-sm-0"
   }
 }
 ```

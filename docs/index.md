@@ -16,13 +16,11 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Multiple NFS Shares Design](designs/multi-storage-placement-design.md) explains the vSphere research, independent role sets, versioned strategies, and recovery contract.
 
-- [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the feature. Follow the [implementation progress record](plans/multi-storage-placement-progress.md) for current validation results.
+- [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the feature.
 
-- [Multi-storage Placement Implementation and Validation Report](multi-storage-placement-implementation-and-validation-report.md) explains the implemented behavior, lab campaigns, Director results, remediations, cleanup evidence, and remaining release gates.
+- [Configure Multiple NFS Shares](multi-storage-placement.md) explains storage sets, strategy selection, role boundaries, and capacity domains for the implementation.
 
-- [Parker Prefix, Pool, and Tags Implementation Plan](plans/parker-prefix-pool-and-tags-plan.md) gives parker and mover VMs an operator-visible identity through a configurable name prefix, a resource pool, and a `prefix--` tag, and records the configuration, permission, and release consequences of each.
-
-- [Configure Multiple NFS Shares](multi-storage-placement.md) explains storage sets, strategy selection, role boundaries, and capacity domains for the implementation under development.
+- [Multi-storage Lab Topology](certification/multi-storage-lab.md) records the storage targets, capacity basis, readiness checks, and guest-agent fixture of the reference lab that certifies placement.
 
 - [Provision the Storage Journal](storage-journal-provisioning.md) explains durable paths, ownership, and Director mounts.
 
