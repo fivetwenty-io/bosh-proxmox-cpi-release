@@ -104,6 +104,17 @@ assert_json_lacks_key() {
   fi
 }
 
+assert_json_key_equals() {
+  local label="$1"; local json="$2"; local key="$3"; local want="$4"
+  local got
+  got="$(printf '%s' "$json" | ruby -rjson -e 'd=JSON.parse(STDIN.read); print d.fetch(ARGV[0], "<absent>")' "$key")"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL [${label}]: key \"${key}\" is ${got@Q}, expected ${want@Q}" >&2
+    echo "       JSON was: ${json}" >&2
+    return 1
+  fi
+}
+
 assert_json_valid() {
   local label="$1"; local json="$2"
   if ! printf '%s' "$json" | ruby -rjson -e 'JSON.parse(STDIN.read)' >/dev/null 2>&1; then
@@ -217,6 +228,27 @@ PROPS_4C="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
 JSON_4C="$(render "$PROPS_4C")"
 assert_json_valid   "case4c" "$JSON_4C"             || FAILED=$((FAILED+1))
 assert_json_has_key "case4c" "$JSON_4C" parker_pool || FAILED=$((FAILED+1))
+
+# 4d: with pve.parker_pool never set, the rendered config carries the release
+# default, and that default is the same string the job spec declares. The ERB
+# spells its own inline default so a stub property map still renders, so the two
+# can drift apart without anything else noticing; this case is what notices.
+SPEC_PARKER_POOL="$(ruby -ryaml -e '
+  spec = YAML.load_file(ARGV[0])
+  print spec.fetch("properties").fetch("pve.parker_pool").fetch("default")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ "$SPEC_PARKER_POOL" != "{prefix}-parker" ]; then
+  echo "FAIL [case4d]: the spec default for pve.parker_pool is ${SPEC_PARKER_POOL@Q}, expected '{prefix}-parker'" >&2
+  FAILED=$((FAILED+1))
+fi
+PROPS_4D="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"].delete("parker_pool")
+  print h.inspect
+')"
+JSON_4D="$(render "$PROPS_4D")"
+assert_json_valid       "case4d" "$JSON_4D"                                  || FAILED=$((FAILED+1))
+assert_json_key_equals  "case4d" "$JSON_4D" parker_pool "$SPEC_PARKER_POOL"  || FAILED=$((FAILED+1))
 
 # Omitted new placement properties must not alter legacy JSON.
 for key in storage_sets storage_capacity_domains ephemeral_storage_set \

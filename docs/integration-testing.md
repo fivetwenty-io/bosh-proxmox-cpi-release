@@ -232,7 +232,7 @@ None of this is visible in the CPI's return values — every one of those calls 
 | `parked_disk.range_start` | Optional. May only restate the band the CPI config uses | *(from the CPI config)* |
 | `parked_disk.range_end` | Optional, under the same restriction | *(from the CPI config)* |
 | `parked_disk.prefix` | Optional. Names parker VMs and, through `{prefix}`, their pool. A parker is named `<prefix>-parker-<vmid>` | *(CPI default `bosh`)* |
-| `parked_disk.pool` | Optional. The pool parker VMs join. `""` turns pool placement off | *(CPI default `{prefix}-parker`)* |
+| `parked_disk.pool` | Optional. The pool parker VMs join. `""` turns pool placement off | *(default `{prefix}-parker`, which the harness applies itself because it writes the CPI config without the job template)* |
 
 The pass leaves its parker VM in place. That is the design working as intended — a parker is durable infrastructure that outlives any single disk, the CPI has no call that removes one, and later runs reuse it. Removing one by hand needs the protection flag cleared first, or PVE refuses:
 

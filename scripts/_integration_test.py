@@ -711,5 +711,34 @@ class TestRunWithRetries(unittest.TestCase):
         self.assertIn("my-label", buf.getvalue())
 
 
+
+class TestBuildCpiConfigParkerPool(unittest.TestCase):
+    """Tests for the parker pool default _integration.build_cpi_config applies.
+
+    This harness writes the CPI config JSON itself and never renders the job
+    spec or the ERB, so nothing carries the release default in for it. An
+    absent key would reach Go as the documented "" opt-out and quietly turn
+    off the pool membership assertion the lifecycle pass makes.
+    """
+
+    def _build(self, parked: "dict | None") -> dict:
+        tier1: dict = {"vmid_range_start": 100}
+        if parked is not None:
+            tier1["parked_disk"] = parked
+        cfg = {"bosh_vars": "/dev/null", "tier1": tier1}
+        return _integration.build_cpi_config(cfg, dry_run=True)
+
+    def test_absent_pool_gets_the_release_default(self):
+        self.assertEqual(self._build(None)["parker_pool"], "{prefix}-parker")
+
+    def test_absent_pool_key_inside_a_present_block_gets_the_default(self):
+        self.assertEqual(self._build({"prefix": "acme"})["parker_pool"], "{prefix}-parker")
+
+    def test_explicit_empty_pool_stays_the_opt_out(self):
+        self.assertEqual(self._build({"pool": ""})["parker_pool"], "")
+
+    def test_explicit_pool_wins(self):
+        self.assertEqual(self._build({"pool": "lab-parker"})["parker_pool"], "lab-parker")
+
 if __name__ == "__main__":
     unittest.main()

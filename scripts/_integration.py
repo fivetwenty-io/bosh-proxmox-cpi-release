@@ -301,6 +301,16 @@ def build_cpi_config(
                 )
             cpi_cfg[_cfg_key] = _val
 
+    # An absent pool key still gets the release default. This harness writes the
+    # CPI config JSON itself and never renders the job spec or the ERB, so no
+    # spec default reaches it, and an absent parker_pool would arrive in Go as
+    # the documented "" opt-out rather than as the default a real deployment
+    # runs. That would turn the lifecycle pass's pool membership assertion into
+    # a no-op on exactly the configuration everybody uses. The literal restates
+    # the ERB's always-emit default in jobs/pve_cpi/templates/cpi.json.erb.
+    # An explicit "" set above survives, because it is already in the dict.
+    cpi_cfg.setdefault("parker_pool", "{prefix}-parker")
+
     # Attach auth — api_token wins if non-empty (and not a dry-run placeholder).
     is_placeholder = api_token.startswith("<dry-run:")
     if api_token and not is_placeholder:
