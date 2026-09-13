@@ -32,10 +32,6 @@ This CPI enables BOSH to provision and manage resources on PVE 9.x. It implement
 
 - [Verify Multi-storage Placement](certification/multi-storage-placement.md) explains the live lifecycle assertions and the evidence they produce.
 
-- [Multiple NFS Shares: Proposed Design](designs/multi-storage-placement-design.md): vSphere datastore research, independent disk-role storage sets, placement strategy options, and a staged implementation and certification plan. Proposed functionality, not current configuration.
-
-- [Multiple NFS Shares Implementation Plan](plans/multi-storage-placement-plan.md) describes the required code changes, dependencies, acceptance tests, recovery behavior, and release gates for the proposed feature.
-
 - [Known Limitations](limitations.md): The consolidated list of what the CPI does not do, covering disk, storage, networking, topology, and permissions constraints, one sentence per item with a link to the page that owns the detail.
 
 - [Development Guide](development.md): Instructions for setting up a development environment, running tests, and building releases.
