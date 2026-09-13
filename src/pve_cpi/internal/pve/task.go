@@ -309,7 +309,6 @@ func awaitTaskAdaptive(ctx context.Context, c Client, node, upid string, opts ..
 		case status == nil:
 			return cpierrors.Cloud("AwaitTask %s: nil status returned from task service", upid)
 		case status.Status == taskStatusStopped:
-			taskObserved = true
 			return classifyTaskExit(upid, status.ExitStatus, status.Warned)
 		default:
 			taskObserved = true
