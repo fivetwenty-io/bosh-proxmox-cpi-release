@@ -109,7 +109,7 @@ assert_json_key_equals() {
   local got
   got="$(printf '%s' "$json" | ruby -rjson -e 'd=JSON.parse(STDIN.read); print d.fetch(ARGV[0], "<absent>")' "$key")"
   if [ "$got" != "$want" ]; then
-    echo "FAIL [${label}]: key \"${key}\" is ${got@Q}, expected ${want@Q}" >&2
+    echo "FAIL [${label}]: key \"${key}\" is $(printf %q "$got"), expected $(printf %q "$want")" >&2
     echo "       JSON was: ${json}" >&2
     return 1
   fi
@@ -238,7 +238,7 @@ SPEC_PARKER_POOL="$(ruby -ryaml -e '
   print spec.fetch("properties").fetch("pve.parker_pool").fetch("default")
 ' "${REPO_ROOT}/jobs/pve_cpi/spec")"
 if [ "$SPEC_PARKER_POOL" != "{prefix}-parker" ]; then
-  echo "FAIL [case4d]: the spec default for pve.parker_pool is ${SPEC_PARKER_POOL@Q}, expected '{prefix}-parker'" >&2
+  echo "FAIL [case4d]: the spec default for pve.parker_pool is $(printf %q "$SPEC_PARKER_POOL"), expected '{prefix}-parker'" >&2
   FAILED=$((FAILED+1))
 fi
 PROPS_4D="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
