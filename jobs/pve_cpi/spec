@@ -1527,10 +1527,11 @@ properties:
       any change to this property, so parkers created after upgrading to a
       release with this property are named differently from the parkers
       that same deployment created before the upgrade. The existing ones
-      keep their bosh-parker-<vmid> names and bosh-parker pool membership,
-      and only new parkers pick up the prefix. The mix is harmless, because
-      every parker classifier keys on the bosh-parker tag and never on the
-      name, but an operator who already sets vm_prefix should expect it.
+      keep their bosh-parker-<vmid> names, and the pool sweep places them
+      in the parker pool beside the new ones the next time a disk parks on
+      their node. The mix is harmless, because every parker classifier
+      keys on the bosh-parker tag and the VMID band and never on the name,
+      but an operator who already sets vm_prefix should expect it.
 
       When set explicitly, the value must match
       "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", be no more than 46 bytes
