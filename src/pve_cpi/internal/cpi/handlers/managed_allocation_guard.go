@@ -121,6 +121,44 @@ type managedAllocationClient struct {
 	guard *ManagedAllocationGuard
 }
 
+// guardWrappedClient is implemented by every client decorator that a managed
+// allocation guard installs. Each one reports the client it wraps, which is how
+// unguardedPVE walks back out to the client the CPI built.
+type guardWrappedClient interface {
+	unguardedClient() pve.Client
+}
+
+func (c *managedAllocationClient) unguardedClient() pve.Client { return c.Client }
+
+// unguardedPVE returns the client underneath every managed allocation guard
+// decorator wrapping c, and returns c itself when no guard wraps it.
+//
+// The parker pool sweep is the caller. A guard's admission hook refuses every
+// pool outside bosh-lock-, and one refusal poisons the whole allocation, so a
+// cosmetic pool call made on a guarded client would fail the detach or the
+// attach whose park has already landed. The park funnels cannot tell which
+// client they hold, because the managed lifecycle paths shadow their own deps
+// with a guarded copy before they call one, so the unwrapping happens here
+// rather than at each funnel.
+//
+// The walk is bounded so that a decorator which ever returned a client wrapping
+// itself cannot spin. Two decorators exist today and the bound leaves room for
+// more.
+func unguardedPVE(c pve.Client) pve.Client {
+	for range 8 {
+		wrapper, ok := c.(guardWrappedClient)
+		if !ok {
+			return c
+		}
+		inner := wrapper.unguardedClient()
+		if inner == nil || inner == c {
+			return c
+		}
+		c = inner
+	}
+	return c
+}
+
 func (g *ManagedAllocationGuard) end(ctx context.Context, m ManagedAllocationMutation, token string) {
 	defer g.mu.Unlock()
 	if recovered := recover(); recovered != nil {

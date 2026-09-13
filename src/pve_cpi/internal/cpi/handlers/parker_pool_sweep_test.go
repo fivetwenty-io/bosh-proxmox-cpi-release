@@ -632,3 +632,237 @@ func TestManagedDiskPark_PoolPlacementRunsOutsideTheAllocationGuard(t *testing.T
 			comment)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The guard scope, which is the rule the funnels above cannot enforce for
+// themselves
+// ---------------------------------------------------------------------------
+
+// guardScopePools is a pool service that records every call and holds
+// membership, so a test can read what the real sweep did once the funnel has
+// returned.
+type guardScopePools struct {
+	pools   map[string]string
+	members map[string]map[int64]bool
+	calls   []string
+}
+
+func newGuardScopePools() *guardScopePools {
+	return &guardScopePools{pools: map[string]string{}, members: map[string]map[int64]bool{}}
+}
+
+func (p *guardScopePools) CreatePool(_ context.Context, poolID, comment string) error {
+	p.calls = append(p.calls, "create:"+poolID)
+	p.pools[poolID] = comment
+	return nil
+}
+
+func (p *guardScopePools) DeletePool(_ context.Context, poolID string) error {
+	p.calls = append(p.calls, "delete:"+poolID)
+	delete(p.pools, poolID)
+	return nil
+}
+
+func (p *guardScopePools) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	p.calls = append(p.calls, "comment:"+poolID)
+	comment, found := p.pools[poolID]
+	return comment, found, nil
+}
+
+func (p *guardScopePools) AddVM(_ context.Context, poolID string, vmid int64) error {
+	p.calls = append(p.calls, "add:"+poolID)
+	if p.members[poolID] == nil {
+		p.members[poolID] = map[int64]bool{}
+	}
+	p.members[poolID][vmid] = true
+	return nil
+}
+
+func (p *guardScopePools) MoveVMToPool(_ context.Context, poolID string, _ int64) error {
+	p.calls = append(p.calls, "move:"+poolID)
+	return nil
+}
+
+func (p *guardScopePools) PoolHasVM(_ context.Context, poolID string, vmid int64) (bool, error) {
+	return p.members[poolID][vmid], nil
+}
+
+// guardScopeClient adds a pool service to a fake client that has none, so the
+// real sweep has somewhere to put a parker. Everything else falls through to
+// the client it wraps.
+type guardScopeClient struct {
+	pve.Client
+	pools *guardScopePools
+}
+
+func (c *guardScopeClient) Pools() pve.PoolService { return c.pools }
+
+// guardScopeNodes reports one parker on one node, which is the listing the
+// sweep reads to find its candidates. Every other node answers empty, so the
+// holder scans that run elsewhere in the funnel see what they saw before.
+type guardScopeNodes struct {
+	sdknodes.Service
+	node string
+	vmid int
+}
+
+func (n *guardScopeNodes) ListQemu(
+	_ context.Context, node string, _ *sdknodes.ListQemuParams,
+) (*sdknodes.ListQemuResponse, error) {
+	if node != n.node {
+		empty := sdknodes.ListQemuResponse{}
+		return &empty, nil
+	}
+	raw, err := json.Marshal(map[string]any{"vmid": n.vmid, "tags": "bosh-cpi;bosh-parker"})
+	if err != nil {
+		return nil, err
+	}
+	resp := sdknodes.ListQemuResponse{raw}
+	return &resp, nil
+}
+
+// guardScopeAdmission records every mutation a guard admits and applies the one
+// rule the real hooks apply to pools, which is that a pool outside bosh-lock-
+// is refused and the refusal poisons the allocation. It stands in for
+// managedDiskLifecycleGuard.before, whose other arms need a whole allocation
+// journal that has nothing to do with what these two cases are about.
+type guardScopeAdmission struct {
+	// seen records every mutation as "Service.Method" with the pool ID
+	// appended for a pool mutation, which is what the pool assertions read.
+	seen []string
+	// unrelatedPools counts the pool mutations outside bosh-lock-, which are
+	// the ones the real hook refuses.
+	unrelatedPools int
+}
+
+func (a *guardScopeAdmission) hooks() ManagedAllocationHooks {
+	return ManagedAllocationHooks{
+		Before: func(_ context.Context, call ManagedAllocationMutation) (string, error) {
+			key := call.Service + "." + call.Method
+			if call.Service != managedDiskServicePool {
+				a.seen = append(a.seen, key)
+				return key, nil
+			}
+			pool, _ := call.Args[managedArgumentPoolID].(string)
+			a.seen = append(a.seen, key+":"+pool)
+			if !strings.HasPrefix(pool, "bosh-lock-") ||
+				(call.Method != "CreatePool" && call.Method != "DeletePool") {
+				a.unrelatedPools++
+				return "", errors.New("unrelated pool mutation in disk lifecycle")
+			}
+			return key, nil
+		},
+		After:  func(context.Context, ManagedAllocationMutation, string, any) error { return nil },
+		Failed: func(_ context.Context, _ ManagedAllocationMutation, _ string, err error) error { return err },
+	}
+}
+
+// guardedDepsFor wraps deps the way the managed detach and attach paths wrap
+// their own, which is a lifecycle client over the allocation guard's client,
+// and returns the guard alongside so a test can read whether it was poisoned.
+func guardedDepsFor(t *testing.T, deps Deps, admission *guardScopeAdmission) (Deps, *ManagedAllocationGuard) {
+	t.Helper()
+	guard, err := NewManagedAllocationGuard(deps.PVE, admission.hooks())
+	if err != nil {
+		t.Fatalf("build the allocation guard: %v", err)
+	}
+	guarded := deps
+	guarded.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: &managedDiskLifecycle{}}
+	return guarded, guard
+}
+
+func TestUnguardedPVE_WalksOutOfEveryAllocationGuardDecorator(t *testing.T) {
+	base := &guardScopeClient{
+		Client: &parkerCfgClient{cluster: &parkerCfgCluster{}, nodes: &parkerCfgNodes{}},
+		pools:  newGuardScopePools(),
+	}
+	admission := &guardScopeAdmission{}
+	guard, err := NewManagedAllocationGuard(base, admission.hooks())
+	if err != nil {
+		t.Fatalf("build the allocation guard: %v", err)
+	}
+
+	if got := unguardedPVE(base); got != pve.Client(base) {
+		t.Errorf("a client no guard wraps must come back unchanged, got %T", got)
+	}
+	if got := unguardedPVE(guard.Client()); got != pve.Client(base) {
+		t.Errorf("the guard's own decorator must unwrap to the client it guards, got %T", got)
+	}
+	lifecycle := &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: &managedDiskLifecycle{}}
+	if got := unguardedPVE(lifecycle); got != pve.Client(base) {
+		t.Errorf("the lifecycle decorator must unwrap through the guard as well, got %T", got)
+	}
+}
+
+// TestHandleDetachStableID_PlacesThePoolOutsideTheLifecycleGuard drives the
+// detach funnel with the deps shape managedDiskOperation hands it, which is a
+// guarded client the funnel cannot tell from an unguarded one. The real sweep
+// runs. A sweep that went through the guard would be refused as an unrelated
+// pool mutation, the refusal would poison the allocation, and the detach would
+// fail after the disk had already moved onto the parker.
+func TestHandleDetachStableID_PlacesThePoolOutsideTheLifecycleGuard(t *testing.T) {
+	const volid = "data:vm-700-disk-1"
+	c := transferFunnelClient(volid)
+	deps := transferFunnelDeps(c)
+	pools := newGuardScopePools()
+	deps.PVE = &guardScopeClient{Client: c, pools: pools}
+	diskCID := overlayCID(t, volid, &pve.DiskCIDMeta{ID: idTestToken, Anchor: true})
+	rd := resolveTransferDisk(t, deps, diskCID)
+
+	admission := &guardScopeAdmission{}
+	guarded, guard := guardedDepsFor(t, deps, admission)
+
+	if err := handleDetachStableID(context.Background(), guarded, "700", 700, rd); err != nil {
+		t.Fatalf("the detach must succeed; a pool call inside the guard is what fails it: %v", err)
+	}
+	if err := guard.Err(); err != nil {
+		t.Fatalf("the allocation guard is poisoned: %v", err)
+	}
+	if admission.unrelatedPools != 0 {
+		t.Errorf("the guard saw %d pool mutations outside bosh-lock-, want 0; it saw %v",
+			admission.unrelatedPools, admission.seen)
+	}
+	if !pools.members[parkerCfgPool][90000] {
+		t.Errorf("the parker must be in %q once the detach returns, got %v",
+			parkerCfgPool, pools.members)
+	}
+}
+
+// TestParkFreeFloatingCrossNodeDisk_PlacesThePoolOutsideTheLifecycleGuard is
+// the attach-side half of the case above. attach_disk shadows its own deps with
+// the guarded copy before guardAndUnparkBeforeAttach reaches this funnel, so
+// the funnel parks and then sweeps holding a client it did not choose.
+//
+// The funnel's own return is not the assertion here. Its holder re-resolve
+// reports the just-created parker as not yet visible against this fixture,
+// which the sweep case above already documents. What this case reads is the
+// guard, which must be clean, and the pool, which must hold the parker.
+func TestParkFreeFloatingCrossNodeDisk_PlacesThePoolOutsideTheLifecycleGuard(t *testing.T) {
+	_ = captureParkDisk(t, nil)
+
+	deps := crossNodeDeps()
+	pools := newGuardScopePools()
+	deps.PVE = &guardScopeClient{
+		Client: &parkerCfgClient{cluster: &parkerCfgCluster{}, nodes: &guardScopeNodes{node: "pve2", vmid: 90000}},
+		pools:  pools,
+	}
+
+	admission := &guardScopeAdmission{}
+	guarded, guard := guardedDepsFor(t, deps, admission)
+
+	rd := resolvedDisk{diskCID: "pvd-abc", birth: parkerCfgVolid, volid: parkerCfgVolid, stableID: "bpd-aabbccdd00112233"}
+	_, _, _ = parkFreeFloatingCrossNodeDisk(context.Background(), guarded, "attach_disk",
+		&rd, parkerCfgJobNode, parkerReadConfigFor(guarded))
+
+	if err := guard.Err(); err != nil {
+		t.Fatalf("the allocation guard is poisoned: %v", err)
+	}
+	if admission.unrelatedPools != 0 {
+		t.Errorf("the guard saw %d pool mutations outside bosh-lock-, want 0; it saw %v",
+			admission.unrelatedPools, admission.seen)
+	}
+	if !pools.members[parkerCfgPool][90000] {
+		t.Errorf("the parker must be in %q once the funnel returns, got %v",
+			parkerCfgPool, pools.members)
+	}
+}

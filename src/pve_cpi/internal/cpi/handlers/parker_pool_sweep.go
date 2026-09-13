@@ -45,14 +45,17 @@ func init() {
 // never taken back for it, so the sweep's own warnings are the operator's
 // record and this line is only a marker for the request log.
 //
-// It always passes deps.PVE, which no guard has wrapped. No call for our pool
-// may run inside a managed allocation guard, because the guard's admission hook
+// It always passes the unguarded client, which unguardedPVE finds by walking
+// deps.PVE out of whatever allocation guard wraps it. No call for our pool may
+// run through a managed allocation guard, because the guard's admission hook
 // refuses every pool outside bosh-lock- and a refusal poisons the whole
-// allocation. Taking the client from deps rather than from a parameter is what
-// keeps a later reader from wiring a guarded one in.
+// allocation. The funnels cannot do that unwrapping themselves, because the
+// managed detach and attach paths shadow their own deps with a guarded copy and
+// a funnel cannot tell which of the two it was handed, so it happens here once
+// for all nine of them.
 func sweepParkerPool(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
 	logger := deps.Log(ctx)
-	if err := (*placeParkersInPoolImpl.Load())(ctx, deps.PVE, logger, node, cfg); err != nil {
+	if err := (*placeParkersInPoolImpl.Load())(ctx, unguardedPVE(deps.PVE), logger, node, cfg); err != nil {
 		logger.Debug("the parker pool sweep reported failures; the parkers it could not place stay where they are",
 			log.String("pool", cfg.Pool),
 			log.String("node", node),

@@ -16,6 +16,11 @@ type managedDiskLifecycleClient struct {
 	lifecycle *managedDiskLifecycle
 }
 
+// unguardedClient reports the client this decorator wraps, which is the
+// allocation guard's own decorator, so unguardedPVE can keep walking out to the
+// client the CPI built.
+func (c *managedDiskLifecycleClient) unguardedClient() pve.Client { return c.Client }
+
 func (c *managedDiskLifecycleClient) QEMU() qemu.Service {
 	return &managedDiskLifecycleQEMU{Service: c.Client.QEMU(), client: c.Client, lifecycle: c.lifecycle}
 }
