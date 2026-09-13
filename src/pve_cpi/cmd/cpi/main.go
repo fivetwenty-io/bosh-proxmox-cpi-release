@@ -252,6 +252,26 @@ func run() int {
 // a named, non-retriable create_vm error (see ensureResolvedPool in
 // internal/cpi/handlers) rather than at boot.
 //
+// When the "parked" detached-disk strategy is active (DetachedDiskParkedEnabled)
+// and pve.parker_pool resolves to a non-empty name, that pool is probed too,
+// deduped against the other two so a parker pool that happens to equal
+// pve.vm_pool is only read once. Unlike the two pools above, a denial on the
+// parker pool only warns; it never fails boot. Parker-pool assignment is a
+// best-effort, cosmetic sweep (see internal/pve's parker pool sweep), so a
+// missing Pool.Audit grant there should not stop the CPI from serving
+// requests the way a denied pve.vm_pool -- which every create_vm needs --
+// correctly does. This also keeps the probe honest for an operator who has
+// deliberately opted out of pools by emptying pve.vm_pool,
+// pve.vm_pool_template, and pve.stemcell_template_pool: pve.parker_pool
+// carries a non-empty default of its own, and the only thing that should be
+// able to newly fail their boot is enabling the parked strategy, not merely
+// having a pool preflight in the binary.
+//
+// A per-entry pve_parker_pool or pve_parker_prefix override (see
+// internal/config's context-override registry) is invisible here: this
+// preflight only ever sees the process-wide job config, the same as every
+// other per-entry override.
+//
 // Design: the cheapest side-effect-free signal that proves the CPI's
 // identity can read a pool path is GET /pools/{poolid}
 // (pve.PoolService.GetPoolComment) issued against each configured pool
@@ -287,34 +307,59 @@ func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.
 	if cfg == nil || logger == nil || client == nil || client.Pools() == nil {
 		return nil
 	}
-	if cfg.VMPool == "" && cfg.StemcellTemplatePool == "" {
+
+	parkerPool := ""
+	if cfg.DetachedDiskParkedEnabled() {
+		parkerPool = cfg.ParkerPoolValue()
+	}
+	if cfg.VMPool == "" && cfg.StemcellTemplatePool == "" && parkerPool == "" {
 		return nil
 	}
 
-	pools := make([]string, 0, 2)
-	seen := make(map[string]bool, 2)
-	for _, p := range []string{cfg.VMPool, cfg.StemcellTemplatePool} {
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		pools = append(pools, p)
+	// failFast marks pve.vm_pool and pve.stemcell_template_pool: every
+	// create_vm/create_stemcell needs them, so a permission denial on either
+	// one fails boot. The parker pool is best-effort (see the doc comment
+	// above), so it carries failFast=false and only ever warns.
+	type poolProbe struct {
+		poolID   string
+		failFast bool
+	}
+	candidates := []poolProbe{
+		{cfg.VMPool, true},
+		{cfg.StemcellTemplatePool, true},
+		{parkerPool, false},
 	}
 
-	for _, poolID := range pools {
+	pools := make([]poolProbe, 0, 3)
+	seen := make(map[string]bool, 3)
+	for _, c := range candidates {
+		if c.poolID == "" || seen[c.poolID] {
+			continue
+		}
+		seen[c.poolID] = true
+		pools = append(pools, c)
+	}
+
+	for _, p := range pools {
 		probeCtx, cancel := context.WithTimeout(ctx, poolsPreflightTimeout)
-		_, found, err := client.Pools().GetPoolComment(probeCtx, poolID)
+		_, found, err := client.Pools().GetPoolComment(probeCtx, p.poolID)
 		cancel()
 		if err == nil {
 			if !found {
 				logger.Debug("pools preflight: pool does not exist yet; it will be created on first use",
-					log.String("pool", poolID))
+					log.String("pool", p.poolID))
 				continue
 			}
-			logger.Debug("pools preflight: pool visible", log.String("pool", poolID))
+			logger.Debug("pools preflight: pool visible", log.String("pool", p.poolID))
 			continue
 		}
 		if pve.IsPoolPermissionDenied(err) {
+			if !p.failFast {
+				logger.Warn("pools preflight: PVE denied read access to the parker pool "+
+					"(non-fatal; parker-pool assignment is best effort, boot continuing)",
+					log.String("pool", p.poolID), log.Err(err))
+				continue
+			}
 			return cpierrors.Cloud(
 				"pools preflight: PVE denied read access to pool %q: %s -- grant the CPI's "+
 					"identity Pool.Audit AND Pool.Allocate on /pool/%s (Pool.Allocate cannot be "+
@@ -322,10 +367,10 @@ func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.
 					"create_stemcell the first time either assigns a VM to this pool); "+
 					"alternatively, set pve.vm_pool: \"\" and pve.stemcell_template_pool: \"\" "+
 					"to disable pool assignment entirely",
-				poolID, err.Error(), poolID)
+				p.poolID, err.Error(), p.poolID)
 		}
 		logger.Warn("pools preflight: could not confirm pool access (non-fatal; treating as transient, boot continuing)",
-			log.String("pool", poolID), log.Err(err))
+			log.String("pool", p.poolID), log.Err(err))
 	}
 	return nil
 }
