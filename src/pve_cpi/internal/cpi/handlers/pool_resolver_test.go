@@ -377,6 +377,65 @@ func TestValidateResolvedPoolName_StemcellPoolCollisionRejected(t *testing.T) {
 	}
 }
 
+// TestValidateResolvedPoolName_ParkerPoolCollisionRejected covers the refusal
+// on the rendered parker pool. The config carries the spec default template,
+// so the comparison value is the rendered "bosh-parker" rather than the raw
+// "{prefix}-parker" field.
+func TestValidateResolvedPoolName_ParkerPoolCollisionRejected(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{ParkerPool: "{prefix}-parker"}
+	_, err := validateResolvedPoolName(cfg, "bosh-parker")
+	if err == nil {
+		t.Fatal("expected error for a resolved name equal to the rendered parker pool")
+	}
+	msg := err.Error()
+	for _, want := range []string{"bosh-parker", "parker_pool", "vm_pool_template", "{director}", "{deployment}", "vm_pool"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q missing %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "{prefix}-parker") {
+		t.Errorf("error %q names the raw template rather than the rendered pool", msg)
+	}
+}
+
+// TestValidateResolvedPoolName_ParkerPoolOptOutSkipsCheck covers the opt-out.
+// An empty pve.parker_pool renders empty, no parker pool is assigned at all,
+// and the clause must then refuse nothing.
+func TestValidateResolvedPoolName_ParkerPoolOptOutSkipsCheck(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{ParkerPool: ""}
+	name, err := validateResolvedPoolName(cfg, "bosh-parker")
+	if err != nil {
+		t.Fatalf("unexpected error with the parker pool opted out: %v", err)
+	}
+	if name != "bosh-parker" {
+		t.Errorf("name = %q; want bosh-parker", name)
+	}
+}
+
+// TestValidateResolvedPoolName_ParkerPoolFollowsPrefixOverride proves the
+// comparison follows the request-scoped prefix. With pve.parker_prefix set to
+// "blue" the refused name is "blue-parker", and the name the default prefix
+// would have refused now passes.
+func TestValidateResolvedPoolName_ParkerPoolFollowsPrefixOverride(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.CPIConfig{ParkerPool: "{prefix}-parker", ParkerPrefix: "blue"}
+	if _, err := validateResolvedPoolName(cfg, "blue-parker"); err == nil {
+		t.Error("expected error for the pool the overridden prefix renders")
+	}
+	name, err := validateResolvedPoolName(cfg, "bosh-parker")
+	if err != nil {
+		t.Fatalf("unexpected error for a name the overridden prefix does not render: %v", err)
+	}
+	if name != "bosh-parker" {
+		t.Errorf("name = %q; want bosh-parker", name)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Release-default template matrix ("bosh-{director}-{deployment}")
 // ---------------------------------------------------------------------------

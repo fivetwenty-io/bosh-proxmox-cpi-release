@@ -185,15 +185,29 @@ func extractDirectorFromEnv(env map[string]any, deployment, job string) string {
 }
 
 // validateResolvedPoolName enforces the flat-name + PVE poolid-charset +
-// reserved-namespace rules on a resolved (non-empty) pool name, plus the
-// stemcell-pool collision rule: a workload VM must never land in
+// reserved-namespace rules on a resolved (non-empty) pool name, plus two
+// collision rules.
+//
+// The first is the stemcell pool. A workload VM must never land in
 // cfg.StemcellTemplatePool, whose whole purpose is an ACL boundary between
 // workload VMs and shared templates. The collision is reachable by naming
 // alone now that vm_pool_template defaults on — e.g. a director or
 // deployment literally named so that "bosh-{director}-{deployment}" renders
-// the stemcell pool's name. name must already be non-empty; callers only
-// invoke this on a winning candidate. Returns (name, nil) when valid, or a
-// non-retriable CloudError describing exactly which rule failed.
+// the stemcell pool's name.
+//
+// The second is the parker pool. A workload VM must never land in the pool
+// cfg.ParkerPoolValue() renders, which is reserved for the parker VMs that
+// hold detached persistent disks. That collision is reachable by naming too,
+// and a vm_pool_template of "{prefix}-parker" walks straight into it. We
+// compare against the rendered value rather than the raw pve.parker_pool
+// field, and we take it from the request-scoped cfg, so that a per-entry
+// pve_parker_prefix or pve_parker_pool override is honored on the entry that
+// set it. An empty render is the documented parker-pool opt-out, and it skips
+// the comparison rather than refusing every name.
+//
+// name must already be non-empty; callers only invoke this on a winning
+// candidate. Returns (name, nil) when valid, or a non-retriable CloudError
+// describing exactly which rule failed.
 func validateResolvedPoolName(cfg *config.CPIConfig, name string) (string, error) {
 	if strings.Contains(name, "/") {
 		return "", cpierrors.Cloud(
@@ -217,6 +231,15 @@ func validateResolvedPoolName(cfg *config.CPIConfig, name string) (string, error
 		return "", cpierrors.Cloud(
 			"resolved pool name %q collides with pve.stemcell_template_pool: workload VMs must not share the "+
 				"stemcell template pool (it is the ACL boundary between VMs and templates); check "+
+				"cloud_properties.pool, the pve.vm_pool_template tokens ({prefix}/{director}/{deployment}/"+
+				"{instance_group}) whose rendered value produced this name, and pve.vm_pool",
+			name,
+		)
+	}
+	if parkerPool := cfg.ParkerPoolValue(); parkerPool != "" && name == parkerPool {
+		return "", cpierrors.Cloud(
+			"resolved pool name %q collides with the pool pve.parker_pool renders: workload VMs must not share "+
+				"the parker pool (it is reserved for the parker VMs that hold detached persistent disks); check "+
 				"cloud_properties.pool, the pve.vm_pool_template tokens ({prefix}/{director}/{deployment}/"+
 				"{instance_group}) whose rendered value produced this name, and pve.vm_pool",
 			name,

@@ -271,3 +271,45 @@ func TestSetVMMetadata_PoolReconcile_RenderHittingStemcellPoolSkipped(t *testing
 		t.Errorf("a stemcell-pool-colliding render must never move, got %v", moves)
 	}
 }
+
+// TestSetVMMetadata_PoolReconcile_RenderHittingParkerPoolSkipped covers the
+// reconciler half of the parker-pool refusal. The template re-renders this
+// VM's persisted tokens onto the rendered parker pool, and the shared
+// validator refuses it, so the VM stays where it is instead of being
+// reconciled in among the parkers.
+func TestSetVMMetadata_PoolReconcile_RenderHittingParkerPoolSkipped(t *testing.T) {
+	t.Parallel()
+
+	desc := sentinelDesc(t, &pve.PoolMembership{
+		Name: "bosh", Layer: pve.PoolLayerTemplate,
+		Director: "", Deployment: "parker", InstanceGroup: "web",
+	})
+	fx := newReconcileFixture(t, desc, "bosh")
+	fx.deps.Config.VMPoolTemplate = "bosh-{director}-{deployment}"
+	fx.deps.Config.ParkerPool = "{prefix}-parker"
+	fx.run(t, standardMetadata())
+
+	if moves := fx.moveEvents(); len(moves) != 0 {
+		t.Errorf("a parker-pool-colliding render must never move, got %v", moves)
+	}
+}
+
+// TestSetVMMetadata_PoolReconcile_ParkerPoolOptOutStillMoves is the control for
+// the test above. The same render with pve.parker_pool empty has no parker pool
+// to collide with, so the move goes ahead.
+func TestSetVMMetadata_PoolReconcile_ParkerPoolOptOutStillMoves(t *testing.T) {
+	t.Parallel()
+
+	desc := sentinelDesc(t, &pve.PoolMembership{
+		Name: "bosh", Layer: pve.PoolLayerTemplate,
+		Director: "", Deployment: "parker", InstanceGroup: "web",
+	})
+	fx := newReconcileFixture(t, desc, "bosh")
+	fx.deps.Config.VMPoolTemplate = "bosh-{director}-{deployment}"
+	fx.deps.Config.ParkerPool = ""
+	fx.run(t, standardMetadata())
+
+	if moves := fx.moveEvents(); len(moves) != 1 || !strings.Contains(moves[0], "bosh-parker") {
+		t.Errorf("expected one move into bosh-parker with the parker pool opted out, got %v", moves)
+	}
+}

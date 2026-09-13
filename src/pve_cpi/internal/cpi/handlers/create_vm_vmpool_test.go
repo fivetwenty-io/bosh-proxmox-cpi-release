@@ -459,6 +459,76 @@ func TestCreateVM_InvalidPoolName_FailsPreCreate(t *testing.T) {
 	}
 }
 
+// TestCreateVM_TemplateRendersParkerPool_FailsPreCreate covers the create_vm
+// half of the parker-pool refusal. A vm_pool_template of "{prefix}-parker"
+// renders the very pool pve.parker_pool renders, and create_vm must refuse
+// before it creates the VM or the pool, rather than quietly filing a workload
+// VM among the parkers.
+func TestCreateVM_TemplateRendersParkerPool_FailsPreCreate(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	deps := buildVMDeps(q, n, c, a)
+	deps.Config.VMPrefix = "bosh"
+	deps.Config.VMPoolTemplate = "{prefix}-parker"
+	deps.Config.ParkerPool = "{prefix}-parker"
+	pools := &poolCallRecorder{}
+	withPoolsSvc(t, deps, pools)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-parker-pool", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	_, err := h.Handle(context.Background(), args, mkCtx("parker-pool"))
+	if err == nil {
+		t.Fatal("expected an error for a workload pool that renders the parker pool")
+	}
+	if !isCloudError(err) {
+		t.Errorf("expected a CloudError, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "parker_pool") {
+		t.Errorf("error %q does not name pve.parker_pool", err.Error())
+	}
+	if len(q.createCalls) != 0 {
+		t.Errorf("expected no QEMU.Create attempt (pre-create validation failure); got %d calls", len(q.createCalls))
+	}
+	if len(pools.createPoolCalls) != 0 {
+		t.Errorf("expected no CreatePool attempt (pre-create validation failure); got %d calls", len(pools.createPoolCalls))
+	}
+}
+
+// TestCreateVM_ParkerPoolOptOut_TemplateStillRenders proves the refusal is not
+// a blanket ban on the name. With pve.parker_pool empty no parker pool exists,
+// and a workload pool named "bosh-parker" is just a pool.
+func TestCreateVM_ParkerPoolOptOut_TemplateStillRenders(t *testing.T) {
+	t.Parallel()
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	a := &vmMockAgent{}
+	deps := buildVMDeps(q, n, c, a)
+	deps.Config.VMPrefix = "bosh"
+	deps.Config.VMPoolTemplate = "{prefix}-parker"
+	deps.Config.ParkerPool = ""
+	pools := &poolCallRecorder{}
+	withPoolsSvc(t, deps, pools)
+	h := handlers.HandleCreateVM(deps)
+
+	args := mkArgs("agent-parker-pool-optout", testStemcellCID,
+		map[string]any{"cores": 1, "memory": 512},
+		defaultNetMap(), []string{}, map[string]any{})
+
+	if _, err := h.Handle(context.Background(), args, mkCtx("parker-pool-optout")); err != nil {
+		t.Fatalf("unexpected error with the parker pool opted out: %v", err)
+	}
+	if got, _ := q.createCalls[0].params["pool"].(string); got != "bosh-parker" {
+		t.Errorf("createParams[\"pool\"] = %q; want %q", got, "bosh-parker")
+	}
+}
+
 // PoolHasVM reports no membership; tests that exercise the
 // disambiguation supply their own fake.
 func (p *poolCallRecorder) PoolHasVM(context.Context, string, int64) (bool, error) {
