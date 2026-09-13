@@ -669,8 +669,10 @@ type CPIConfig struct {
 	//
 	//   ""       — same as "parked" (the default)
 	//   "parked" — detached disks are attached to a dedicated parker VM
-	//              (bosh-parker-<n>) in an active scsi slot (scsi0..30) with
-	//              protection=1 and onboot=0. The parker VM is never started.
+	//              (<prefix>-parker-<vmid>, which is bosh-parker-<vmid> until
+	//              ParkerPrefix or VMPrefix says otherwise) in an active scsi
+	//              slot (scsi0..30) with protection=1 and onboot=0. The parker
+	//              VM is never started.
 	//              Provides PVE-side ownership visibility and accident protection
 	//              at the cost of slightly higher op counts per detach/attach.
 	//              Default.
@@ -739,8 +741,10 @@ type CPIConfig struct {
 	DiskCIDCompression bool `json:"disk_cid_compression,omitempty"`
 
 	// ParkedDiskVMIDRangeStart is the inclusive lower bound of the VMID range
-	// reserved for parker VMs (bosh-parker-<n>). Parker VMs occupy this band;
-	// each parker VM holds up to 31 parked disk volumes in scsi0..30 slots.
+	// reserved for parker VMs, which are named "<prefix>-parker-<vmid>" and stay
+	// "bosh-parker-<vmid>" until ParkerPrefix or VMPrefix says otherwise. Parker
+	// VMs occupy this band; each parker VM holds up to 31 parked disk volumes in
+	// scsi0..30 slots.
 	// ApplyDefaults sets to 90000 when zero, under both strategies: under
 	// "parked" the band is where parker VMs are allocated, and under "free" it
 	// is read-only, letting the holder scans recognize and unpark disks parked
