@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -184,7 +185,7 @@ func (m *managedDiskRequest) observeParkMutation(ctx context.Context, handle *aj
 		if !ok && (key == "onboot" && managedDiskScalar(want) == "0") {
 			continue
 		}
-		if !ok || managedDiskScalar(got) != managedDiskScalar(want) {
+		if !ok || !managedDiskFieldMatches(key, got, want) {
 			return fmt.Errorf("parker %s readback mismatch", key)
 		}
 	}
@@ -199,6 +200,31 @@ func managedDiskScalar(v any) string {
 		return "0"
 	}
 	return fmt.Sprint(v)
+}
+
+// managedDiskFieldMatches reports whether a readback value for key matches
+// the value the CPI sent. Every key compares as an exact scalar string
+// except jsonKeyTags ("tags"), which is order-insensitive: PVE stores tags
+// alphabetically under its default tag style, and nothing in this repository
+// records that as guaranteed behavior, so the tags side of the comparison
+// splits both strings on ";", sorts the tokens, and rejoins before
+// comparing. A tag string that genuinely differs, not merely reorders, still
+// mismatches.
+func managedDiskFieldMatches(key string, got, want any) bool {
+	gotStr, wantStr := managedDiskScalar(got), managedDiskScalar(want)
+	if key == jsonKeyTags {
+		return sortedTagString(gotStr) == sortedTagString(wantStr)
+	}
+	return gotStr == wantStr
+}
+
+// sortedTagString splits a PVE tags string on ";", sorts the tokens, and
+// rejoins them with ";", giving a form that compares equal across any
+// PVE-imposed reordering.
+func sortedTagString(s string) string {
+	parts := strings.Split(s, ";")
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
 }
 
 func (m *managedDiskRequest) observeParkPool(ctx context.Context, call ManagedAllocationMutation) error {
