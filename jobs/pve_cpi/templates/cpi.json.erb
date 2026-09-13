@@ -508,6 +508,23 @@
   v = p("pve.parked_disk_vmid_range_end", 0).to_i
   config["parked_disk_vmid_range_end"] = v unless v == 0
 
+  # Emit parker_prefix only when the operator supplies a non-empty value.
+  # Default "" (fall back to pve.vm_prefix, then the literal "bosh"); an
+  # explicit "" still omits the key here so the Go accessor sees an absent
+  # field and runs the same fallback chain -- absent and empty mean the
+  # same thing for the prefix.
+  parker_prefix = p("pve.parker_prefix", "")
+  config["parker_prefix"] = parker_prefix unless parker_prefix.to_s.empty?
+
+  # Always emit parker_pool: the release default is the literal template
+  # string "{prefix}-parker" (not ""), so that an explicit "" reaching Go as
+  # an empty string stays distinguishable from the operator never touching
+  # the property. That distinction is the whole pool-assignment opt-out; the
+  # omit-when-empty idiom used above for parker_prefix would destroy it here.
+  # The inline default is byte-identical to the spec default so a stub that
+  # has not been updated yet renders rather than raising.
+  config["parker_pool"] = p("pve.parker_pool", "{prefix}-parker")
+
   # Emit network_resolve_retries only when the operator explicitly sets it
   # (including an explicit 0). pve.network_resolve_retries intentionally
   # carries NO spec default (see jobs/pve_cpi/spec), so if_p fires only when

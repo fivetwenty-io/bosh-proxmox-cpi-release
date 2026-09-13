@@ -131,7 +131,8 @@ BASE_PROPS='{
     "require_snapshot_check_pass" => false,
     "hotplug" => "network,disk,cpu,memory", "numa" => true,
     "reboot_mode" => "soft", "reboot_timeout" => 60,
-    "vm_prefix" => "", "create_env_deployment" => "create-env"
+    "vm_prefix" => "", "create_env_deployment" => "create-env",
+    "parker_prefix" => "", "parker_pool" => "{prefix}-parker"
   }
 }'
 
@@ -186,6 +187,36 @@ JSON_3="$(render "$PROPS_3")"
 assert_json_valid   "case3" "$JSON_3"             || FAILED=$((FAILED+1))
 assert_json_has_key "case3" "$JSON_3" password    || FAILED=$((FAILED+1))
 assert_json_has_key "case3" "$JSON_3" api_token   || FAILED=$((FAILED+1))
+
+# --- Case 4: parker_prefix / parker_pool idioms ------------------------------
+echo "Case 4: parker prefix/pool"
+
+# 4a: a set parker_prefix reaches the rendered config (the omit-when-empty
+# idiom passes a non-empty value through unchanged).
+PROPS_4A="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"]["parker_prefix"] = "cpi"
+  print h.inspect
+')"
+JSON_4A="$(render "$PROPS_4A")"
+assert_json_valid    "case4a" "$JSON_4A"               || FAILED=$((FAILED+1))
+assert_json_has_key  "case4a" "$JSON_4A" parker_prefix || FAILED=$((FAILED+1))
+
+# 4b: an empty parker_prefix (the BASE_PROPS default) does not reach the
+# rendered config; absent and empty mean the same thing for the prefix.
+assert_json_lacks_key "case4b" "$JSON_1" parker_prefix || FAILED=$((FAILED+1))
+
+# 4c: an empty parker_pool still reaches the rendered config as an explicit
+# empty string, because that is the whole "" opt-out for pool assignment
+# and the always-emit idiom must not collapse it away.
+PROPS_4C="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"]["parker_pool"] = ""
+  print h.inspect
+')"
+JSON_4C="$(render "$PROPS_4C")"
+assert_json_valid   "case4c" "$JSON_4C"             || FAILED=$((FAILED+1))
+assert_json_has_key "case4c" "$JSON_4C" parker_pool || FAILED=$((FAILED+1))
 
 # Omitted new placement properties must not alter legacy JSON.
 for key in storage_sets storage_capacity_domains ephemeral_storage_set \

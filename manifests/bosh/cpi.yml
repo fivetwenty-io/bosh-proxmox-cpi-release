@@ -121,6 +121,8 @@
         log_level: info
         vm_prefix: ((pve_vm_prefix))
         create_env_deployment: ((pve_create_env_deployment))
+        parker_prefix: ((pve_parker_prefix))
+        parker_pool: ((pve_parker_pool))
         vmid_range_start: ((pve_vmid_range_start))
         vmid_range_end: ((pve_vmid_range_end))
         allow_disk_ops_with_snapshots: ((pve_allow_disk_ops_with_snapshots))

@@ -1507,6 +1507,63 @@ properties:
       under the parked strategy; under "free" the overlap is accepted, since
       nothing allocates a parker VMID there.
     default: 0
+  pve.parker_prefix:
+    description: |
+      Optional prefix for parker VM names ("<prefix>-parker-<vmid>") and,
+      through pve.parker_pool's "{prefix}" token, for the default parker
+      pool name. Resolves in order: this property when set, else
+      pve.vm_prefix when that is set, else the literal "bosh". The default
+      "" is that sentinel, not "no prefix", which means "fall through the
+      chain", so a deployment that leaves both properties unset still gets
+      bosh-parker-<vmid> parkers in a bosh-parker pool, byte-identical to
+      every release before this property existed.
+
+      A deployment that already sets pve.vm_prefix inherits it here without
+      any change to this property, so parkers created after upgrading to a
+      release with this property are named differently from the parkers
+      that same deployment created before the upgrade. The existing ones
+      keep their bosh-parker-<vmid> names and bosh-parker pool membership,
+      and only new parkers pick up the prefix. The mix is harmless, because
+      every parker classifier keys on the bosh-parker tag and never on the
+      name, but an operator who already sets vm_prefix should expect it.
+
+      When set explicitly, the value must match
+      "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", be no more than 46 bytes
+      long, and must not start with "bosh-lock-" (reserved for the
+      cluster-lock sentinel pool namespace, see pve.cluster_lock_mode); a
+      value that reaches this property only through inheritance from
+      pve.vm_prefix is not re-validated against those rules. Overridable
+      per cpi-config entry as pve_parker_prefix.
+    default: ""
+  pve.parker_pool:
+    description: |
+      PVE resource pool name for parker VMs (see pve.detached_disk_strategy's
+      "parked" strategy). Supports exactly one variable, "{prefix}",
+      substituted with the resolved pve.parker_prefix. This "{prefix}" is
+      the parker prefix, not the "{prefix}" of pve.vm_pool_template, which
+      substitutes pve.vm_prefix instead, so the same token spells two
+      different values depending on which property it appears in. Any
+      other flat pool name may be given literally in place of the
+      template, subject to the same PVE poolid charset rules as pve.vm_pool.
+
+      The default "{prefix}-parker" renders to "bosh-parker" when the
+      parker prefix chain resolves to its own default, matching the
+      pre-existing bosh-parker-<vmid> naming. The CPI creates the resolved
+      pool if it does not already exist and tags it with a "managed by
+      bosh-proxmox-cpi" provenance comment, the same as pve.vm_pool. Set
+      explicitly to "" to disable pool assignment for parkers entirely;
+      because the property is always rendered rather than omitted when
+      empty, an explicit "" reaches the CPI as a genuine empty string
+      distinct from the default template.
+
+      The rendered value must not equal pve.vm_pool, pve.stemcell_template_pool,
+      or a workload pool resolved from call-level cloud_properties.pool,
+      the vm_type profile's cloud_properties.pool, or pve.vm_pool_template.
+      create_vm refuses that collision by name, because a workload VM
+      sharing the parker pool would keep the pool alive forever instead of
+      letting it get reaped with the deployment that created it.
+      Overridable per cpi-config entry as pve_parker_pool.
+    default: "{prefix}-parker"
   pve.network_resolve_retries:
     description: |
       Eventual-consistency poll budget for freshly created SDN networks. SDN

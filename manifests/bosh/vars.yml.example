@@ -33,6 +33,19 @@ pve_vm_prefix:       cpi
 # Synthetic deployment name used in VM names for `bosh create-env` directors
 # (bosh-init does not pass a deployment in env). Defaults to "create-env".
 pve_create_env_deployment: create-env
+# Prefix for parker VM names and, through the "{prefix}" token in
+# pve_parker_pool below, for the default parker pool name. Left empty here
+# so it inherits pve_vm_prefix above. With pve_vm_prefix "cpi", the parkers
+# this reference manifest creates are named "cpi-parker-<vmid>" in a
+# "cpi-parker" pool, not the release default "bosh-parker-<vmid>" in
+# "bosh-parker".
+pve_parker_prefix:   ""
+# Parker pool name template. "{prefix}" substitutes the resolved parker
+# prefix above, not pve_vm_prefix directly. Leave as the default template to
+# get one pool per resolved parker prefix, set a literal flat pool name to
+# use a fixed pool instead, or set "" to disable parker pool assignment
+# entirely.
+pve_parker_pool:     "{prefix}-parker"
 
 # --- Director VM sizing ---------------------------------------------------
 director_cpu:    2

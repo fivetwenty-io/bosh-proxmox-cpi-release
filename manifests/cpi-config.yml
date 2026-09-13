@@ -67,6 +67,8 @@ cpis:
       disk_vmid_range_end: 19999
       stemcell_template_vmid_range_start: 30000
       stemcell_template_vmid_range_end: 30499
+      parker_prefix: ((pve_parker_prefix))
+      parker_pool: ((pve_parker_pool))
       parked_disk_vmid_range_start: 90000
       parked_disk_vmid_range_end: 90499
 
@@ -101,5 +103,7 @@ cpis:
       disk_vmid_range_end: 29999
       stemcell_template_vmid_range_start: 30500
       stemcell_template_vmid_range_end: 30999
+      parker_prefix: ((pve_parker_prefix))
+      parker_pool: ((pve_parker_pool))
       parked_disk_vmid_range_start: 90500
       parked_disk_vmid_range_end: 90999
