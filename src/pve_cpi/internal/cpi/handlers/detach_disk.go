@@ -443,26 +443,23 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
-		// DiskStorage feeds WithStorageScan on parker VMID allocation, same as
-		// parkAfterDetach below -- this already-detached (retry) path reaches
-		// the same createParkerVM/NextVMID allocation and must close the same
-		// cross-cluster parker-VMID collision gap.
-		DiskStorage: deps.Config.DiskStorage,
-		// See parkerReadConfigFor: a cluster-resources row without a node is
-		// dropped by the holder scan unless there is a fallback to attribute it
-		// to, and a dropped row reads as "nobody holds this volume".
-		FallbackNode: deps.Config.Node,
-		// Always true here (the gate above), recorded for the holder scan's
-		// log-level choice.
-		// Same strict anchor invariant the read paths apply; see
-		// ParkerConfig.AnchorStrict.
-		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
-		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
-	}
+	// parkerWriteConfigFor carries the band, the director scope, the parker
+	// prefix and pool, the strict anchor invariant, and the DiskStorage that
+	// feeds WithStorageScan on parker VMID allocation, so this already-detached
+	// retry closes the same cross-cluster parker-VMID collision gap that
+	// parkAfterDetach below closes.
+	parkerCfg := parkerWriteConfigFor(deps)
+	// The job-level node goes back on afterwards, and the order matters. The
+	// write builder clears FallbackNode so ParkDisk can fill it with the disk's
+	// own node, which is the better answer on the paths that hand ParkDisk a
+	// node. This path does not have one yet, because the holder scan below runs
+	// first and resolveNodeForDetachedDisk runs only if that scan finds the
+	// disk free.
+	// See parkerReadConfigFor: a cluster-resources row without a node is dropped
+	// by the holder scan unless there is a fallback to attribute it to, and a
+	// dropped row reads as "nobody holds this volume". Setting the field before
+	// the builder call would only have the builder wipe it again.
+	parkerCfg.FallbackNode = deps.Config.Node
 	// "Is it already parked?" and "is a real VM holding it?" are two readings of
 	// one fact, and the cluster-wide sweep that establishes that fact is the
 	// expensive call in this whole path — it reads the config of every VM and
@@ -517,8 +514,8 @@ func handleAlreadyDetachedParked(ctx context.Context, deps Deps, diskCID, bareDi
 		}
 		return resolveErr
 	}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
-		// Keep the class the park chose. A 403 on creating bosh-parker-*, an
+	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), alreadyDetachedNode, bareDiskCID, parkerCfg, pve.ParkContext{DiskCID: diskCID}); parkErr != nil {
+		// Keep the class the park chose. A 403 on creating a parker VM, an
 		// exhausted VMID band, and an unswept reference are all permanent and
 		// each names what to do; relabelling them retriable hides the message
 		// behind a Director retry loop that cannot end.
@@ -589,23 +586,14 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
-		// DiskStorage feeds WithStorageScan on parker VMID allocation so a
-		// VMID whose number is already claimed by orphaned volumes on the
-		// disk storage is skipped (same guard create_vm applies).
-		DiskStorage: deps.Config.DiskStorage,
-		// Always true here (the gate above), recorded for the holder scan's
-		// log-level choice.
-		// Same strict anchor invariant the read paths apply; see
-		// ParkerConfig.AnchorStrict.
-		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
-		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
-	}
+	// parkerWriteConfigFor carries the band, the director scope, the parker
+	// prefix and pool, the strict anchor invariant, and the DiskStorage that
+	// feeds WithStorageScan on parker VMID allocation, so a VMID already
+	// claimed by orphaned volumes on the disk storage is skipped. It leaves
+	// FallbackNode empty, and ParkDisk fills it with the disk's own node.
+	parkerCfg := parkerWriteConfigFor(deps)
 	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID, Opts: overlay}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
+	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		// Same reasoning as the free-floating park above: the class the park
 		// chose is the one the Director should see.
 		return retriableUnlessPermanent(parkErr,

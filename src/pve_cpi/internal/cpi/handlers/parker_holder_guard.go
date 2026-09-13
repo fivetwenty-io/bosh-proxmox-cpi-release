@@ -25,11 +25,23 @@ import (
 // error, so nothing catches that misuse at runtime; the name is the guard. Do
 // not populate the field to make this helper park-safe -- that would only make
 // it LOOK park-safe while still missing whatever park-only field comes next.
+//
+// Prefix and Pool are resolved here rather than at each park site, because this
+// is the one builder every parker path shares and because both accessors resolve
+// against the effective per-request config. A per-entry pve_vm_prefix or
+// pve_parker_prefix override therefore moves the parker names and the parker
+// pool together, on the request it was routed to.
 func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 	return pve.ParkerConfig{
 		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
 		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
 		DirectorID:     deps.RequestDirectorUUID,
+		// The prefix names a parker VM, and the pool is rendered from it. Both
+		// fall back to values that reproduce prior releases byte for byte when
+		// an operator sets neither, so a read path that never creates a parker
+		// carries them harmlessly.
+		Prefix: deps.Config.ParkerPrefixValue(),
+		Pool:   deps.Config.ParkerPoolValue(),
 		// The holder scan drops any /cluster/resources row that elides "node"
 		// unless it has a fallback, and on a PVE that elides it for every row
 		// that means the scan finds no holder at all -- so attach_disk's

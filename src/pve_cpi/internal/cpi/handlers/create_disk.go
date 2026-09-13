@@ -834,25 +834,17 @@ func parkFreshDisk(ctx context.Context, deps Deps, node, diskCID, bareDiskCID, s
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
-	parkerCfg := pve.ParkerConfig{
-		VMIDRangeStart: deps.Config.ParkedDiskVMIDRangeStartValue(),
-		VMIDRangeEnd:   deps.Config.ParkedDiskVMIDRangeEndValue(),
-		DirectorID:     deps.RequestDirectorUUID,
-		// DiskStorage feeds WithStorageScan on parker VMID allocation so a
-		// VMID whose number is already claimed by orphaned volumes on the
-		// disk storage is skipped (same guard detach_disk's park applies).
-		DiskStorage: deps.Config.DiskStorage,
-		// Always true here (the gate above), recorded for the holder scan's
-		// log-level choice.
-		// Same strict anchor invariant the read paths apply; see
-		// ParkerConfig.AnchorStrict.
-		ParkedEnabled: deps.Config.DetachedDiskParkedEnabled(),
-		AnchorStrict:  deps.Config.ParkedAnchorStrictValue(),
-	}
+	// parkerWriteConfigFor is the park-safe composition, and it carries the
+	// band, the director scope, the parker prefix and pool, the strict anchor
+	// invariant, and the DiskStorage that feeds WithStorageScan on parker VMID
+	// allocation, so a VMID already claimed by orphaned volumes on the disk
+	// storage is skipped. It leaves FallbackNode empty on purpose, and ParkDisk
+	// fills it with the disk's own node.
+	parkerCfg := parkerWriteConfigFor(deps)
 	// StableID makes the park attach bake the serial= identity onto the
 	// parker slot, and keys the provenance record by the token.
 	pctx := pve.ParkContext{DiskCID: diskCID, StableID: stableID}
-	if parkErr := pve.ParkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
+	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		return retriableUnlessPermanent(parkErr,
 			fmt.Sprintf("create_disk: park fresh disk %s (fail-closed: rollback deletes the volume)", diskCID))
 	}

@@ -102,8 +102,23 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 // path that ATTACHES disks to parkers (park, transfer, resume) must set —
 // see parkerReadConfigFor's doc comment for why the read helper leaves
 // DiskStorage empty on purpose.
+//
+// It also clears FallbackNode, which the read builder fills with the job-level
+// deps.Config.Node. A park path has a better answer than that node and already
+// uses it, because pve.ParkDisk and pve.TransferDiskToParker each default the
+// field to the node the disk itself lives on, and they do that only while the
+// field is empty. On a single-node PVE every /cluster/resources row elides
+// "node", so a scan without a fallback reports a held volume as free, which is
+// why the fallback exists at all. On a multi-node cluster the disk's own node
+// is the one that answers correctly, and the job-level node is simply the
+// wrong one.
+// Carrying the read builder's value across would quietly take that choice away
+// from both functions. A caller that genuinely wants the job-level node sets
+// the field back on the result, and handleAlreadyDetachedParked is the one that
+// does.
 func parkerWriteConfigFor(deps Deps) pve.ParkerConfig {
 	cfg := parkerReadConfigFor(deps)
 	cfg.DiskStorage = deps.Config.DiskStorage
+	cfg.FallbackNode = ""
 	return cfg
 }
