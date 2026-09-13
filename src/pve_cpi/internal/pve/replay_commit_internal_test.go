@@ -215,7 +215,7 @@ func (cl *rpCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse
 // committed create would: config carries the tags and description (the
 // per-attempt marker) the create sent.
 func rpCommitVM(c *rpClient, vmid int, params map[string]any) {
-	cfg := map[string]any{"name": parkerVMName(vmid)}
+	cfg := map[string]any{"name": parkerVMName("", vmid)}
 	if tags, ok := params[cfgKeyTags].(string); ok {
 		cfg[cfgKeyTags] = tags
 	}

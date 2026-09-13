@@ -10,14 +10,19 @@
 //	cfg := pve.ParkerConfig{
 //	    VMIDRangeStart: cpiCfg.ParkedDiskVMIDRangeStartValue(),
 //	    VMIDRangeEnd:   cpiCfg.ParkedDiskVMIDRangeEndValue(),
-//	    DirectorID:     deps.RequestDirectorUUID, // empty = omit director scope tag
+//	    DirectorID:     deps.RequestDirectorUUID,   // empty = omit director scope tag
+//	    Prefix:         cpiCfg.ParkerPrefixValue(),  // empty = "bosh"
+//	    Pool:           cpiCfg.ParkerPoolValue(),    // empty = leave pool membership alone
 //	}
 //
 // # Tag constants
 //
 // ParkerTag ("bosh-parker") marks every parker VM. When DirectorID is set a
 // second tag "director--<sanitized-id>" is appended (mirrors stemcell provenance
-// convention from create_stemcell.go).
+// convention from create_stemcell.go). Prefix changes only the parker VM's
+// name, not its tags, and Pool adds no tag either: the pool sweep in
+// PlaceParkersInPool (Section 3.8) is the only code that reads Pool, so
+// nothing here wires it into VM creation.
 //
 // # Slot capacity
 //
@@ -80,6 +85,19 @@ type ParkerConfig struct {
 	// "director--<sanitized-id>" tag is added to newly created parker VMs so
 	// operators can distinguish parkers per director in multi-director clusters.
 	DirectorID string
+	// Prefix replaces the leading "bosh" segment of a parker or mover VM's
+	// name, so a parker VM is named "<prefix>-parker-<vmid>" instead of
+	// "bosh-parker-<vmid>". createMoverVM shares the same rendering, so a
+	// mover's name carries the same prefix. Empty (the zero value) resolves
+	// to "bosh" inside parkerVMName, so a caller that never sets Prefix gets
+	// byte-identical names to prior releases.
+	Prefix string
+	// Pool names the PVE resource pool the sweep in PlaceParkersInPool
+	// (Section 3.8) places parker VMs into. Park, transfer, and mover code
+	// never read this field; only that sweep does. An empty Pool keeps the
+	// documented pve.parker_pool: "" opt-out of "do not touch any pool", so
+	// nothing here wires it into createParkerVM.
+	Pool string
 	// DiskStorage is the CPI's configured pve.disk_storage pool. When set,
 	// createParkerVM passes it to pve.WithStorageScan so parker VMID
 	// allocation also scans that storage's volume content, closing the same
@@ -617,9 +635,17 @@ func sanitizeParkerTagValue(v string) string {
 	return parkerTagSanitizeRe.ReplaceAllString(v, "")
 }
 
-// parkerVMName returns the canonical name for a parker VM with the given VMID.
-func parkerVMName(vmid int) string {
-	return fmt.Sprintf("bosh-parker-%d", vmid)
+// parkerVMName returns the canonical name for a parker VM with the given
+// prefix and VMID, rendering "<prefix>-parker-<vmid>". An empty prefix
+// resolves to "bosh" here, so every caller gets the byte-identical default
+// name without resolving the fallback itself. createMoverVM shares this
+// helper rather than forking the format string, so a mover's name carries
+// the same prefix as an ordinary parker.
+func parkerVMName(prefix string, vmid int) string {
+	if prefix == "" {
+		prefix = "bosh"
+	}
+	return fmt.Sprintf("%s-parker-%d", prefix, vmid)
 }
 
 // buildParkerTags returns the semicolon-joined tag string for a new parker VM.
@@ -875,7 +901,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 // short-circuit on an existing one).
 //
 // The parker VM is created with:
-//   - name: "bosh-parker-<vmid>"
+//   - name: "<prefix>-parker-<vmid>" (prefix defaults to "bosh")
 //   - onboot: 0 (never auto-started)
 //   - protection: 1 (prevent accidental deletion)
 //   - tags: "bosh-parker[;director--<id>]"
@@ -909,7 +935,7 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		func(vmid int) error {
 			params := map[string]any{
 				cfgKeyVMID:      vmid,
-				cfgKeyName:      parkerVMName(vmid),
+				cfgKeyName:      parkerVMName(cfg.Prefix, vmid),
 				cfgKeyTags:      tags,
 				paramProtection: protection,
 				"onboot":        onboot,

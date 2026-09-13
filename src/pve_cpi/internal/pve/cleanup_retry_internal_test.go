@@ -157,7 +157,7 @@ func TestMigrateMoverToNode_LockTimeoutOnMigrate_Retries(t *testing.T) {
 
 	c := newRPClient()
 	c.configs[moverVMID] = map[string]any{
-		"name":  parkerVMName(moverVMID),
+		"name":  parkerVMName("", moverVMID),
 		"scsi1": volid + ",size=1G",
 	}
 	c.migrateFn = func(call int) (*sdknodes.CreateQemuMigrateResponse, error) {

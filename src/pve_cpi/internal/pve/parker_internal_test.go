@@ -181,9 +181,39 @@ func TestSanitizeParkerTagValue_EmptyInput(t *testing.T) {
 
 func TestParkerVMName(t *testing.T) {
 	t.Parallel()
-	got := parkerVMName(90000)
-	if got != "bosh-parker-90000" {
-		t.Errorf("want %q, got %q", "bosh-parker-90000", got)
+	cases := []struct {
+		name   string
+		prefix string
+		vmid   int
+		want   string
+	}{
+		{
+			name:   "empty prefix resolves to bosh",
+			prefix: "",
+			vmid:   90000,
+			want:   "bosh-parker-90000",
+		},
+		{
+			name:   "set prefix renders verbatim",
+			prefix: "acme",
+			vmid:   90000,
+			want:   "acme-parker-90000",
+		},
+		{
+			name:   "mover path renders the same shape",
+			prefix: "acme",
+			vmid:   90001,
+			want:   "acme-parker-90001",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parkerVMName(tc.prefix, tc.vmid)
+			if got != tc.want {
+				t.Errorf("want %q, got %q", tc.want, got)
+			}
+		})
 	}
 }
 

@@ -722,6 +722,54 @@ func TestEnsureParker_CreatesWhenNoneExist(t *testing.T) {
 	}
 }
 
+// TestEnsureParker_CreatesWhenNoneExist_CustomPrefix proves a non-default
+// cfg.Prefix flows through EnsureParker into the create call's name param,
+// rendering "<prefix>-parker-<vmid>" instead of the "bosh-parker-<vmid>"
+// default.
+func TestEnsureParker_CreatesWhenNoneExist_CustomPrefix(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	var createdParams map[string]any
+	var createdVMID int
+
+	createdAlready := false
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if createdAlready && vmid == createdVMID {
+				return map[string]any{"tags": "bosh-parker"}, nil
+			}
+			return map[string]any{}, nil
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			createdParams = params
+			vmidVal, _ := params["vmid"].(int)
+			createdVMID = vmidVal
+			createdAlready = true
+			return "", nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(), nil // always empty for allocation purposes
+	})
+
+	cfg := parkerTestCfg()
+	cfg.Prefix = "acme"
+
+	vmid, err := pve.EnsureParker(context.Background(), c, nopLogger(), node, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if createdParams == nil {
+		t.Fatal("Create was not called")
+	}
+	nameVal, _ := createdParams["name"].(string)
+	expectedName := fmt.Sprintf("acme-parker-%d", vmid)
+	if nameVal != expectedName {
+		t.Errorf("name: want %q, got %q", expectedName, nameVal)
+	}
+}
+
 func TestEnsureParker_CreateConflictAdoptsWinner(t *testing.T) {
 	t.Parallel()
 	node := "pve1"
