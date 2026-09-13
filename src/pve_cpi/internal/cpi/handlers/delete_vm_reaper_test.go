@@ -402,6 +402,78 @@ func TestDeleteVM_ReaperRefusesStemcellTemplatePool(t *testing.T) {
 	}
 }
 
+func TestDeleteVM_ReaperRefusesParkerPool(t *testing.T) {
+	t.Parallel()
+
+	// The parker pool is the third long-lived shared pool, and the reaper
+	// refuses it by name the way it already refuses the other two. Nothing
+	// deletes a parker, so the reaper cannot reach this pool in normal
+	// operation; the refusal is here to keep a future change from reaching it.
+	const vmid = 9012
+	fx := newReaperTestFixture(t, vmid, true, "bosh-parker")
+	// The spec default renders "bosh-parker" out of the default prefix, and
+	// that is the pool this fixture's workload VM belongs to.
+	fx.deps.Config.ParkerPool = "{prefix}-parker"
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "managed by bosh-proxmox-cpi (director d)", true, nil
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.getCommentCalls) != 0 {
+		t.Errorf("GetPoolComment: want 0 calls for the parker pool, got %v", fx.pools.getCommentCalls)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls for the parker pool, got %v", fx.pools.deletePoolCalls)
+	}
+	if !strings.Contains(fx.logBuf.String(), "never reaped") {
+		t.Errorf("expected the by-name refusal debug log; log=%s", fx.logBuf.String())
+	}
+}
+
+func TestDeleteVM_ReaperRefusesRenderedParkerPool(t *testing.T) {
+	t.Parallel()
+
+	// The refusal compares the rendered pool name rather than the raw
+	// template, so a non-default prefix moves the refusal along with the pool
+	// it names.
+	const vmid = 9013
+	fx := newReaperTestFixture(t, vmid, true, "acme-parker")
+	fx.deps.Config.ParkerPrefix = "acme"
+	fx.deps.Config.ParkerPool = "{prefix}-parker"
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "managed by bosh-proxmox-cpi (director d)", true, nil
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.deletePoolCalls) != 0 {
+		t.Errorf("DeletePool: want 0 calls for the rendered parker pool, got %v", fx.pools.deletePoolCalls)
+	}
+}
+
+func TestDeleteVM_ReaperStillReapsAManagedPoolThatIsNotTheParkerPool(t *testing.T) {
+	t.Parallel()
+
+	// The other half of the refusal: configuring a parker pool must not stop
+	// the reaper from doing its job on an ordinary per-deployment pool.
+	const vmid = 9014
+	fx := newReaperTestFixture(t, vmid, true, "bosh-cf-diego")
+	fx.deps.Config.ParkerPool = "{prefix}-parker"
+	fx.pools.getCommentFn = func(_ context.Context, _ string) (string, bool, error) {
+		return "managed by bosh-proxmox-cpi (director d)", true, nil
+	}
+
+	if err := fx.run(t, vmid); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fx.pools.deletePoolCalls) != 1 || fx.pools.deletePoolCalls[0] != "bosh-cf-diego" {
+		t.Fatalf("DeletePool: want 1 call for pool %q, got %v", "bosh-cf-diego", fx.pools.deletePoolCalls)
+	}
+}
+
 // PoolHasVM reports no membership; tests that exercise the
 // disambiguation supply their own fake.
 func (p *reaperPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {

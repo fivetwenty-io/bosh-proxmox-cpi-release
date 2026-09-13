@@ -1173,8 +1173,9 @@ func capturePoolForReap(ctx context.Context, deps Deps, vmid int, logger *log.Lo
 //     failed and the caller already reset reapPool to ""), or
 //   - deps.PVE.Pools() is nil (test fixtures / wiring gaps that never
 //     configured a pool service), or
-//   - poolID names the static vm_pool or the stemcell_template_pool (shared
-//     long-lived pools, never reaped regardless of emptiness or comment).
+//   - poolID names the static vm_pool, the stemcell_template_pool, or the
+//     resolved parker pool (shared long-lived pools, never reaped regardless
+//     of emptiness or comment).
 //
 // Otherwise:
 //  1. GetPoolComment(poolID): a lookup error or a not-found pool both return
@@ -1201,13 +1202,26 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 	if deps.PVE == nil || deps.PVE.Pools() == nil {
 		return
 	}
-	// The static vm_pool and the stemcell template pool are long-lived shared
-	// pools (create-if-missing at boot/first use), not per-deployment ones:
-	// reaping either would churn create/delete on every last-VM delete and,
-	// for the stemcell pool, momentarily drop the ACL boundary templates live
-	// behind. Refuse both by name before any API call.
-	if poolID == deps.Config.VMPool || poolID == deps.Config.StemcellTemplatePool {
-		logger.Debug("delete_vm: reaper: pool is the static vm_pool or stemcell_template_pool; never reaped",
+	// The static vm_pool, the stemcell template pool, and the parker pool are
+	// long-lived shared pools (create-if-missing at boot/first use) rather than
+	// per-deployment ones. Reaping any of them would churn create/delete on
+	// every last-VM delete and, for the stemcell pool, momentarily drop the ACL
+	// boundary templates live behind. Refuse all three by name before any API
+	// call.
+	//
+	// The parker pool cannot be reached here in normal operation, because the
+	// reaper fires on a workload VM delete against that VM's own captured
+	// membership and nothing ever deletes a parker. We refuse it anyway. It
+	// costs one comparison and it closes a whole class of future accident, in
+	// the same spirit as the two names that were already here. The comparison
+	// is request-scoped, so a per-entry pve_parker_pool override is honored on
+	// a delete routed to that entry. What it cannot see is a sibling entry's
+	// parker pool, and that exposure is theoretical for the reason above.
+	parkerPool := deps.Config.ParkerPoolValue()
+	if poolID == deps.Config.VMPool || poolID == deps.Config.StemcellTemplatePool ||
+		(parkerPool != "" && poolID == parkerPool) {
+		logger.Debug("delete_vm: reaper: pool is the static vm_pool, the stemcell_template_pool, "+
+			"or the parker pool; never reaped",
 			log.String("pool", poolID))
 		return
 	}
