@@ -216,9 +216,9 @@ func TestStripReservedBoshTags_StripsVMPrefix(t *testing.T) {
 }
 
 // TestBuildBoshManagedTags_PrefixTagAppendedLast pins the ordering promise in
-// buildBoshManagedTags's doc comment. mergeTagList truncates at a tag boundary,
-// so the identity tag has to be the last entry and therefore the first one a
-// long deployment and job set costs us.
+// buildBoshManagedTags's doc comment. mergeTagList truncates at a tag boundary
+// and drops the last entry first, so the identity tag has to sit last and go
+// first when a long deployment and job set overflows the cap.
 func TestBuildBoshManagedTags_PrefixTagAppendedLast(t *testing.T) {
 	t.Parallel()
 	got := buildBoshManagedTags(map[string]any{

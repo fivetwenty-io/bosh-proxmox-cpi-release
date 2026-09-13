@@ -524,6 +524,9 @@ func TestCreateVM_ParkerPoolOptOut_TemplateStillRenders(t *testing.T) {
 	if _, err := h.Handle(context.Background(), args, mkCtx("parker-pool-optout")); err != nil {
 		t.Fatalf("unexpected error with the parker pool opted out: %v", err)
 	}
+	if len(q.createCalls) != 1 {
+		t.Fatalf("expected exactly 1 QEMU.Create call, got %d", len(q.createCalls))
+	}
 	if got, _ := q.createCalls[0].params["pool"].(string); got != "bosh-parker" {
 		t.Errorf("createParams[\"pool\"] = %q; want %q", got, "bosh-parker")
 	}

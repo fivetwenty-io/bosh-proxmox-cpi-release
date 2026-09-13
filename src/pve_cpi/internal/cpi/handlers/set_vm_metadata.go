@@ -344,9 +344,9 @@ func buildDescription(metadata map[string]any) string {
 // The prefix tag is appended last, after every other BOSH-managed entry, and
 // whoever adds the next tag should insert it before this one and leave the
 // prefix tag in last place. mergeTagList truncates the joined string at a tag
-// boundary against maxTagLength, so the last entry is the first one a long
-// deployment and job set costs us, and we would rather lose the identity tag
-// than lose an entry BOSH itself supplied.
+// boundary against maxTagLength, and it drops the last entry first, so a
+// deployment and job set long enough to overflow the cap loses the identity tag
+// and keeps every entry BOSH itself supplied.
 func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 	var parts []string
 	for _, key := range []string{"director", "deployment", "instance_group", "job", "index"} {

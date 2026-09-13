@@ -236,14 +236,17 @@ func validateResolvedPoolName(cfg *config.CPIConfig, name string) (string, error
 			name,
 		)
 	}
-	if parkerPool := cfg.ParkerPoolValue(); parkerPool != "" && name == parkerPool {
-		return "", cpierrors.Cloud(
-			"resolved pool name %q collides with the pool pve.parker_pool renders: workload VMs must not share "+
-				"the parker pool (it is reserved for the parker VMs that hold detached persistent disks); check "+
-				"cloud_properties.pool, the pve.vm_pool_template tokens ({prefix}/{director}/{deployment}/"+
-				"{instance_group}) whose rendered value produced this name, and pve.vm_pool",
-			name,
-		)
+	if cfg != nil {
+		if parkerPool := cfg.ParkerPoolValue(); parkerPool != "" && name == parkerPool {
+			return "", cpierrors.Cloud(
+				"resolved pool name %q collides with the pool pve.parker_pool and pve.parker_prefix render "+
+					"between them: workload VMs must not share the parker pool (it is reserved for the parker VMs "+
+					"that hold detached persistent disks); check cloud_properties.pool, the pve.vm_pool_template "+
+					"tokens ({prefix}/{director}/{deployment}/{instance_group}) whose rendered value produced this "+
+					"name, and pve.vm_pool",
+				name,
+			)
+		}
 	}
 	return name, nil
 }

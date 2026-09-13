@@ -390,7 +390,11 @@ func TestValidateResolvedPoolName_ParkerPoolCollisionRejected(t *testing.T) {
 		t.Fatal("expected error for a resolved name equal to the rendered parker pool")
 	}
 	msg := err.Error()
-	for _, want := range []string{"bosh-parker", "parker_pool", "vm_pool_template", "{director}", "{deployment}", "vm_pool"} {
+	wantIn := []string{
+		"bosh-parker", "parker_pool", "parker_prefix",
+		"vm_pool_template", "{director}", "{deployment}", "vm_pool",
+	}
+	for _, want := range wantIn {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error %q missing %q", msg, want)
 		}
