@@ -78,6 +78,8 @@ var contextOverrideFieldOrder = []string{
 	"pve_storage_placement_namespace",
 	"pve_require_disjoint_storage_sets",
 	"pve_storage_status_max_age_seconds",
+	"pve_parker_prefix",
+	"pve_parker_pool",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -354,6 +356,31 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.VMPrefix = s
+		return nil
+	},
+	// Parker VM names are cluster-facing identity rather than process
+	// policy, the same justification pve_vm_prefix carries above and the
+	// reason the parker VMID band is already overridable too. pve.vm_pool
+	// and pve.vm_pool_template stay job-level on purpose, so this is not an
+	// inconsistency.
+	"pve_parker_prefix": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.ParkerPrefix = s
+		return nil
+	},
+	// The parker pool name is cluster-facing identity for the same reason
+	// the parker prefix above is, since it also names something on the
+	// target cluster. pve.vm_pool and pve.vm_pool_template still stay
+	// job-level on purpose.
+	"pve_parker_pool": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.ParkerPool = s
 		return nil
 	},
 	"pve_agent_mode": func(c *CPIConfig, v any) error {

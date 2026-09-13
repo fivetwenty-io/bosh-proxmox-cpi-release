@@ -580,6 +580,81 @@ func TestApplyContextOverrides_UnknownKeysAlongsideKnown_NoError(t *testing.T) {
 	}
 }
 
+// TestApplyContextOverrides_ParkerPrefix_Applies proves pve_parker_prefix is
+// a registered override: the context value lands on the effective config's
+// ParkerPrefix, and the job-level base is left untouched.
+func TestApplyContextOverrides_ParkerPrefix_Applies(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.ParkerPrefix = "bosh"
+
+	eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parker_prefix": "az1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(applied) != 1 || applied[0] != "pve_parker_prefix" {
+		t.Errorf("applied = %#v, want [pve_parker_prefix]", applied)
+	}
+	if eff.ParkerPrefix != "az1" {
+		t.Errorf("eff.ParkerPrefix = %q, want az1", eff.ParkerPrefix)
+	}
+	if base.ParkerPrefix != "bosh" {
+		t.Errorf("base.ParkerPrefix mutated to %q, want unchanged \"bosh\"", base.ParkerPrefix)
+	}
+}
+
+// TestApplyContextOverrides_ParkerPool_Applies proves pve_parker_pool is a
+// registered override: the context value lands on the effective config's
+// ParkerPool, and the job-level base is left untouched.
+func TestApplyContextOverrides_ParkerPool_Applies(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.ParkerPool = "bosh-parker"
+
+	eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parker_pool": "az1-parker",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(applied) != 1 || applied[0] != "pve_parker_pool" {
+		t.Errorf("applied = %#v, want [pve_parker_pool]", applied)
+	}
+	if eff.ParkerPool != "az1-parker" {
+		t.Errorf("eff.ParkerPool = %q, want az1-parker", eff.ParkerPool)
+	}
+	if base.ParkerPool != "bosh-parker" {
+		t.Errorf("base.ParkerPool mutated to %q, want unchanged \"bosh-parker\"", base.ParkerPool)
+	}
+}
+
+// TestApplyContextOverrides_ParkerPrefix_MovesParkerPoolValue is the point of
+// the accessor design ParkerPoolValue documents: because the pool renders
+// per request from the effective config rather than being frozen at
+// ApplyDefaults time, a per-entry pve_parker_prefix override moves the
+// rendered parker pool name along with it, not just the raw ParkerPrefix
+// field.
+func TestApplyContextOverrides_ParkerPrefix_MovesParkerPoolValue(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.ParkerPool = "{prefix}-parker"
+	if want := "bosh-parker"; base.ParkerPoolValue() != want {
+		t.Fatalf("base.ParkerPoolValue() = %q, want %q", base.ParkerPoolValue(), want)
+	}
+
+	eff, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_parker_prefix": "az1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if eff.ParkerPoolValue() != "az1-parker" {
+		t.Errorf("eff.ParkerPoolValue() = %q, want az1-parker", eff.ParkerPoolValue())
+	}
+}
+
 // -----------------------------------------------------------------------
 // helpers
 // -----------------------------------------------------------------------

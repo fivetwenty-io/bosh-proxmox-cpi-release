@@ -88,6 +88,8 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_disk_migration":                     "off",
 		"pve_stemcell_replicate_local":           true,
 		"pve_vm_prefix":                          "az2",
+		"pve_parker_prefix":                      "az2",
+		"pve_parker_pool":                        "az2-parker",
 		"pve_agent_mode":                         config.AgentModeNoAgent,
 		"pve_vm_disk_format":                     "vmdk",
 		"pve_agent_mbus":                         "nats://mbus-b",
