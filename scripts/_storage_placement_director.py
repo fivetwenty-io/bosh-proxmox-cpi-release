@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from _pve_verify import resolved_parker_prefix
 from _release_artifact import release_identity
 
 DIRECTOR_IDS = (
@@ -861,6 +862,10 @@ class DirectorScenarios:
 
     def require_detached_or_parked_disk(self, disk: dict[str, Any]) -> None:
         verifier = self.runner.verifier
+        # resolved_parker_prefix mirrors CPIConfig.ParkerPrefixValue, so this
+        # keeps its value under a non-default pve.parker_prefix or pve.vm_prefix
+        # instead of only recognizing a parker named with the default "bosh".
+        expected_parker_prefix = resolved_parker_prefix(self.runner.base_config)
         rows = verifier._get("/cluster/resources?type=vm")
         require(isinstance(rows, list) and len(rows) <= 10000, "orphan attachment inventory is incomplete")
         seen, holders = set(), []
@@ -877,7 +882,7 @@ class DirectorScenarios:
                     require(isinstance(raw, str) and raw, "orphan attachment disk slot is malformed")
                 if re.fullmatch(r"(?:scsi|virtio|sata|ide|unused)[0-9]+", slot) and isinstance(raw, str) and (raw.split(",", 1)[0] == disk["volume_id"] or "serial="+disk["stable_token"] in raw.split(",")):
                     tags = config.get("tags")
-                    require(isinstance(tags, str) and {"bosh-cpi", "bosh-parker"}.issubset(set(re.split(r"[;, ]+", tags))) and config.get("name") == "bosh-parker-" + vmid and type(config.get("onboot")) is int and config["onboot"] == 0 and config.get("scsihw") == "virtio-scsi-pci" and re.fullmatch(r"scsi(?:[0-9]|[12][0-9]|30)", slot), "owned orphan remains attached to a workload or unproven holder")
+                    require(isinstance(tags, str) and {"bosh-cpi", "bosh-parker"}.issubset(set(re.split(r"[;, ]+", tags))) and config.get("name") == expected_parker_prefix + "-parker-" + vmid and type(config.get("onboot")) is int and config["onboot"] == 0 and config.get("scsihw") == "virtio-scsi-pci" and re.fullmatch(r"scsi(?:[0-9]|[12][0-9]|30)", slot), "owned orphan remains attached to a workload or unproven holder")
                     require(raw.split(",", 1)[0] == disk["volume_id"] and raw.split(",").count("serial=" + disk["stable_token"]) == 1, "parked disk slot identity differs")
                     status = verifier._get(f"/nodes/{node}/qemu/{vmid}/status/current")
                     require(isinstance(status, dict) and status.get("status") == "stopped" and status.get("qmpstatus") == "stopped", "owned disk parker is not stopped")

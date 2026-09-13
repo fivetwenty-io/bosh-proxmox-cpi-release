@@ -281,6 +281,26 @@ def build_cpi_config(
         if _val is not None:
             cpi_cfg[_cfg_key] = int(_val)
 
+    # The parker name prefix and pool, from the same block. Both reach the
+    # generated CPI config as plain strings, the shape pve.parker_prefix and
+    # pve.parker_pool expect, so a value of any other JSON type surfaces here
+    # as a clear error rather than as a confusing failure deep in config load.
+    # pool may be deliberately "", the documented opt-out that turns pool
+    # placement off, so it is threaded through the same "is not None" test as
+    # every other optional key here rather than a truthiness test that would
+    # treat the opt-out as absent.
+    for _cfg_key, _src_key in (
+        ("parker_prefix", "prefix"),
+        ("parker_pool", "pool"),
+    ):
+        _val = _parked.get(_src_key)
+        if _val is not None:
+            if not isinstance(_val, str):
+                raise ValueError(
+                    f"tier1.parked_disk.{_src_key} must be a string, got {type(_val).__name__}"
+                )
+            cpi_cfg[_cfg_key] = _val
+
     # Attach auth — api_token wins if non-empty (and not a dry-run placeholder).
     is_placeholder = api_token.startswith("<dry-run:")
     if api_token and not is_placeholder:
@@ -843,6 +863,14 @@ def tier1_env(cfg: dict, cpi_config_path: "str | Path", dry_run: bool = False) -
             env_out["PARKER_RANGE_START"] = str(int(parked["range_start"]))
         if parked.get("range_end") is not None:
             env_out["PARKER_RANGE_END"] = str(int(parked["range_end"]))
+        # prefix and pool feed the generated CPI config (see build_cpi_config)
+        # and PARKER_PREFIX/PARKER_POOL, which derive_config in scripts/lifecycle
+        # applies to every temp config the parked-disk pass runs against, so a
+        # non-default prefix set only here would never reach a parker.
+        if parked.get("prefix") is not None:
+            env_out["PARKER_PREFIX"] = str(parked["prefix"])
+        if parked.get("pool") is not None:
+            env_out["PARKER_POOL"] = str(parked["pool"])
 
     return env_out
 
@@ -939,7 +967,13 @@ def _print_summary(cfg: dict, dry_run: bool) -> None:
         band = "(CPI default 90000-90999)"
         if parked.get("range_start") or parked.get("range_end"):
             band = f"{parked.get('range_start', '(default)')}-{parked.get('range_end', '(default)')}"
-        print(f"  parked_disk:      enabled band={band}")
+        prefix = parked.get("prefix") or "(CPI default bosh)"
+        # "pool" in parked (rather than truthiness) keeps a deliberate "" opt-out
+        # distinct from the key being absent altogether.
+        pool = "(CPI default {prefix}-parker)"
+        if "pool" in parked:
+            pool = parked["pool"] or "(disabled)"
+        print(f"  parked_disk:      enabled band={band} prefix={prefix} pool={pool}")
     else:
         print("  parked_disk:      (disabled)")
     print()

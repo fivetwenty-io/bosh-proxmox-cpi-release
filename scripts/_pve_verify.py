@@ -108,6 +108,61 @@ def _tags_contain(tag_str: str, want: str) -> bool:
     )
 
 
+# The last rung of the parker prefix chain, and the byte cap a prefix derived
+# from vm_prefix is cut to. Both mirror defaultParkerPrefix and
+# maxParkerPrefixLength in internal/config/config.go, so a harness computing
+# the expected prefix from a CPI config agrees with the CPI byte for byte.
+DEFAULT_PARKER_PREFIX = "bosh"
+_MAX_PARKER_PREFIX_LENGTH = 46
+_NON_ALNUM_RUN_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def sanitize_vm_name(raw: str) -> str:
+    """Rewrite raw into the name PVE would accept for it.
+
+    This mirrors config.SanitizeVMName in internal/config/config.go. Every run
+    of bytes outside [A-Za-z0-9] collapses to a single '-', and the result is
+    trimmed of leading and trailing '-'. Returns "" when raw collapses to
+    nothing. The Go function also cuts the result to 63 bytes, which we leave
+    out here because resolved_parker_prefix applies its tighter 46-byte cut
+    afterward; reuse this function elsewhere only with that in mind.
+    """
+    return _NON_ALNUM_RUN_RE.sub("-", raw).strip("-")
+
+
+def resolved_parker_prefix(cfg: dict) -> str:
+    """Return the parker name prefix cfg resolves to.
+
+    This mirrors CPIConfig.ParkerPrefixValue in internal/config/config.go. We
+    prefer an explicit parker_prefix, fall back to a sanitized vm_prefix, and
+    fall back again to the literal "bosh". A harness that hard-codes
+    "bosh-parker-" instead of calling this keeps its value only under the
+    default prefix, and every non-default one then makes the harness fail for
+    a reason that has nothing to do with the CPI under test.
+    """
+    explicit = str(cfg.get("parker_prefix") or "")
+    if explicit:
+        return explicit
+    sanitized = sanitize_vm_name(str(cfg.get("vm_prefix") or ""))
+    if sanitized:
+        return sanitized[:_MAX_PARKER_PREFIX_LENGTH].rstrip("-")
+    return DEFAULT_PARKER_PREFIX
+
+
+def resolved_parker_pool(cfg: dict) -> str:
+    """Return the pool cfg resolves parker placement to, or "" when pool
+    placement is off.
+
+    This mirrors CPIConfig.ParkerPoolValue. The "{prefix}" token in the
+    parker_pool template substitutes for resolved_parker_prefix(cfg), and an
+    empty template is the documented opt-out rather than a name to derive.
+    """
+    template = str(cfg.get("parker_pool", "") or "")
+    if not template:
+        return ""
+    return template.replace("{prefix}", resolved_parker_prefix(cfg))
+
+
 def _decode_cid_payload(disk_cid: str) -> dict:
     """Decode a pvd-/pvz- envelope CID to its JSON payload dict.
 
@@ -801,6 +856,42 @@ class PVEVerifier:
             if _tags_contain(str(config.get("tags", "")), "bosh-parker"):
                 parkers.append(vmid)
         return sorted(parkers)
+
+    def pool_member_vmids(self, poolid: str) -> list[int]:
+        """Return the VMIDs that belong to poolid, ascending.
+
+        Reads GET /pools/{poolid} rather than the pool field on
+        /cluster/resources on purpose. That index lags the live cluster by
+        minutes, and the harness asserts on pool membership seconds after a
+        park creates the parker, so a reader built on the index would fail
+        intermittently for a reason that has nothing to do with the code under
+        test.
+
+        A pool's members array mixes guest and storage entries, and only a
+        guest entry carries a vmid, the way splitTagString in
+        internal/pve/parker.go tokenizes a tag string and drops anything that
+        is not a whole tag. We keep the same discipline here. A member missing
+        vmid, or carrying one PVE did not send as a number, is skipped rather
+        than raised over, since a storage member is neither a parker nor an
+        error.
+
+        Raises PVEVerifyError when the pool does not exist or PVE's response is
+        not an object, the same way qemu_config raises when a VM does not
+        exist.
+        """
+        data = self._get(f"/pools/{urllib.parse.quote(poolid)}")
+        if not isinstance(data, dict):
+            raise PVEVerifyError(f"pool {poolid!r} response is not an object")
+        vmids: list[int] = []
+        for member in self._as_list(data.get("members")):
+            raw = member.get("vmid")
+            if raw is None:
+                continue
+            try:
+                vmids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return sorted(vmids)
 
     def disk_holders(self, disk_cid: str) -> list[tuple[int, str]]:
         """Return every (vmid, slot) in the CLUSTER whose config references disk_cid.

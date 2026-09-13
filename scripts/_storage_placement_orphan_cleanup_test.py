@@ -19,13 +19,13 @@ class OrphanCleanupTests(unittest.TestCase):
   with self.assertRaises(RuntimeError):obj.delete_owned_orphan_disks()
   obj.operation.assert_not_called()
  def test_strict_holder_scan_refuses_workload_and_unreadable_vm(self):
-  obj,_=self.fixture();del obj.require_detached_or_parked_disk;v=Mock();obj.runner=types.SimpleNamespace(verifier=v);v._get.return_value=[{'type':'qemu','vmid':100,'node':'n'}];disk=obj.service['disks'][0]
+  obj,_=self.fixture();del obj.require_detached_or_parked_disk;v=Mock();obj.runner=types.SimpleNamespace(verifier=v,base_config={});v._get.return_value=[{'type':'qemu','vmid':100,'node':'n'}];disk=obj.service['disks'][0]
   v.qemu_config.return_value={'scsi1':disk['volume_id']+',serial='+disk['stable_token']}
   with self.assertRaises(RuntimeError):obj.require_detached_or_parked_disk(disk)
   v.qemu_config.side_effect=RuntimeError('read failed')
   with self.assertRaisesRegex(RuntimeError,'read failed'):obj.require_detached_or_parked_disk(disk)
  def production_parker(self):
-  obj,_=self.fixture();del obj.require_detached_or_parked_disk;obj.fixture={'namespace':'storage-cert-director-20260909'};v=Mock();obj.runner=types.SimpleNamespace(verifier=v)
+  obj,_=self.fixture();del obj.require_detached_or_parked_disk;obj.fixture={'namespace':'storage-cert-director-20260909'};v=Mock();obj.runner=types.SimpleNamespace(verifier=v,base_config={})
   disk=obj.service['disks'][0];disk.update(volume_id='nfs-persistent-cert-2:104166/vm-104166-disk-0.qcow2',backing={'type':'nfs','server':'10.254.0.1','export':'/tank/nfs/labs/pve-cpi/multi-storage/persistent-cert-2'})
   entry={'disk_cid':disk['cid'],'allocation_id':disk['allocation_uuid'],'allocation_namespace':obj.fixture['namespace'],'allocation_backing':'nfs://'+disk['backing']['server']+disk['backing']['export'],'volid':disk['volume_id'],'slot':'scsi0','node':'lab-pve-cpi-0'}
   config={'name':'bosh-parker-104166','tags':'bosh-cpi;bosh-parker;director--uuid','onboot':0,'scsihw':'virtio-scsi-pci','scsi0':disk['volume_id']+',serial='+disk['stable_token']+',size=2G','description':'<!--BOSH:'+json.dumps({'bosh_parked_disks':{disk['stable_token']:entry}})+'-->'}
@@ -36,7 +36,13 @@ class OrphanCleanupTests(unittest.TestCase):
  def test_actual_production_parker_capture(self):
   from _pve_verify import PVEVerifier
   capture={'disk': {'cid': 'pvz-H4sIAAAAAAAC_zTMTW7DIBQE4LvMmtfy4yTAbXgPLFtKjAs0XUS-e2VFWc030mheeCJimzvtpfW1j7INktIG2Wi01eHy_XzQW8S1LyTFFW2SDc5rm26e0v1ehcyUtc_BUL4K0xTmC4XMiawY5yftLbv560fqn4XCA_GFuo9-Zl67pJYRUTcorHUsraSzGyj0_tahkDZZakMc7bcozIj4_K3nhvdMQfyNWSeXp8CsrziO_wEAa9plP-IAAAA', 'allocation_uuid': '14d08d91-d6cb-49f5-9dba-2c1384082b3f', 'stable_token': 'bpd-9c87bb0a3d49bb06', 'volume_id': 'nfs-persistent-cert-2:104166/vm-104166-disk-0.qcow2', 'size_bytes': 2147483648, 'backing': {'type': 'nfs', 'server': '10.254.0.1', 'export': '/tank/nfs/labs/pve-cpi/multi-storage/persistent-cert-2'}}, 'holder': {'vmid': 104166, 'node': 'lab-pve-cpi-0', 'slot': 'scsi0', 'config': {'boot': ' ', 'cores': 1, 'description': '<!--BOSH:{"bosh_parked_disks":{"bpd-9c87bb0a3d49bb06":{"allocation_id":"14d08d91-d6cb-49f5-9dba-2c1384082b3f","allocation_namespace":"storage-cert-director-20260909","allocation_backing":"nfs://10.254.0.1/tank/nfs/labs/pve-cpi/multi-storage/persistent-cert-2","disk_cid":"pvz-H4sIAAAAAAAC_zTMTW7DIBQE4LvMmtfy4yTAbXgPLFtKjAs0XUS-e2VFWc030mheeCJimzvtpfW1j7INktIG2Wi01eHy_XzQW8S1LyTFFW2SDc5rm26e0v1ehcyUtc_BUL4K0xTmC4XMiawY5yftLbv560fqn4XCA_GFuo9-Zl67pJYRUTcorHUsraSzGyj0_tahkDZZakMc7bcozIj4_K3nhvdMQfyNWSeXp8CsrziO_wEAa9plP-IAAAA","source_vm_cid":"100137","parked_at":"2026-09-10T17:48:12Z","node":"lab-pve-cpi-0","director_id":"9c88e707-478d-4895-a708-001403623838","volid":"nfs-persistent-cert-2:104166/vm-104166-disk-0.qcow2","slot":"scsi0","opts":{"discard":"on","iothread":"1","ssd":"1"}}}}-->', 'digest': '64636652b5c004df706b7a8275fd5f04c180b718', 'memory': '16', 'meta': 'creation-qemu=11.0.2,ctime=1789041704', 'name': 'bosh-parker-104166', 'onboot': 0, 'protection': 1, 'scsi0': 'nfs-persistent-cert-2:104166/vm-104166-disk-0.qcow2,serial=bpd-9c87bb0a3d49bb06,size=2G', 'scsihw': 'virtio-scsi-pci', 'smbios1': 'uuid=d88da3bc-6d8d-4c05-98ab-1cc90a2642a0', 'tags': 'bosh-cpi;bosh-parker;director--9c88e707-478d-4895-a708-001403623838', 'vmgenid': '09281bf7-3bc1-4b86-9a35-d8abbd3edd82'}, 'status': {'cpu': 0, 'cpus': 1, 'disk': 0, 'ha': {'managed': 0}, 'maxdisk': 0, 'maxmem': 16777216, 'mem': 0, 'memhost': 0, 'name': 'bosh-parker-104166', 'netin': 0, 'netout': 0, 'qmpstatus': 'stopped', 'status': 'stopped', 'tags': 'bosh-cpi;bosh-parker;director--9c88e707-478d-4895-a708-001403623838', 'uptime': 0, 'vmid': 104166}, 'parked_recorded': True}}
-  obj=DirectorScenarios.__new__(DirectorScenarios);obj.fixture={'namespace':'storage-cert-director-20260909'};v=PVEVerifier.__new__(PVEVerifier);obj.runner=types.SimpleNamespace(verifier=v);holder=capture['holder'];v.qemu_config=Mock(return_value=holder['config']);v._get=Mock(side_effect=lambda path:[{'type':'qemu','vmid':holder['vmid'],'node':holder['node']}] if path.startswith('/cluster/') else holder['status']);obj.require_detached_or_parked_disk(capture['disk'])
+  obj=DirectorScenarios.__new__(DirectorScenarios);obj.fixture={'namespace':'storage-cert-director-20260909'};v=PVEVerifier.__new__(PVEVerifier);obj.runner=types.SimpleNamespace(verifier=v,base_config={});holder=capture['holder'];v.qemu_config=Mock(return_value=holder['config']);v._get=Mock(side_effect=lambda path:[{'type':'qemu','vmid':holder['vmid'],'node':holder['node']}] if path.startswith('/cluster/') else holder['status']);obj.require_detached_or_parked_disk(capture['disk'])
+ def test_production_parker_accepts_a_custom_prefix(self):
+  obj,v,disk,config,entry=self.production_parker();obj.runner.base_config={'parker_prefix':'acme'};config['name']='acme-parker-104166'
+  obj.require_detached_or_parked_disk(disk)
+ def test_production_parker_named_with_the_default_prefix_is_refused_under_a_custom_one(self):
+  obj,v,disk,config,entry=self.production_parker();obj.runner.base_config={'parker_prefix':'acme'}
+  with self.assertRaises(RuntimeError):obj.require_detached_or_parked_disk(disk)
  def test_running_wrong_slot_serial_and_provenance_refuse(self):
   for change in ['running','unused','serial','volume','onboot','name','allocation','cid','slot','namespace','backing']:
    obj,v,disk,config,entry=self.production_parker()
@@ -72,6 +78,6 @@ class OrphanCleanupTests(unittest.TestCase):
   cid=events[0]['task'].removeprefix('Deleting orphaned disk ');obj=DirectorScenarios.__new__(DirectorScenarios);obj.name='owned';obj.task_evidence=[];obj.runner=types.SimpleNamespace(active_resources={'director_workflow':{}},checkpoint=Mock());obj.tasks=Mock(side_effect=[{}, {'11':task}]);obj.bosh=Mock(side_effect=[{'task_ids':['11']},events]);self.assertEqual(obj.operation(['delete-disk',cid],scoped=False)['tasks'][0]['disk_cid'],cid)
  def test_lxc_and_malformed_qemu_slots_refuse(self):
   for row,config in [({'type':'lxc','vmid':100,'node':'n'},{}),({'type':'qemu','vmid':100,'node':'n'},{'scsi1':123})]:
-   obj,_=self.fixture();del obj.require_detached_or_parked_disk;v=Mock();obj.runner=types.SimpleNamespace(verifier=v);v._get.return_value=[row];v.qemu_config.return_value=config
+   obj,_=self.fixture();del obj.require_detached_or_parked_disk;v=Mock();obj.runner=types.SimpleNamespace(verifier=v,base_config={});v._get.return_value=[row];v.qemu_config.return_value=config
    with self.assertRaises(RuntimeError):obj.require_detached_or_parked_disk(obj.service['disks'][0])
 if __name__=='__main__':unittest.main()

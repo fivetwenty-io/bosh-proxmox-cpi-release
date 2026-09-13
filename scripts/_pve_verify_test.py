@@ -37,7 +37,15 @@ from pathlib import Path
 # Make scripts/ importable regardless of working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _pve_verify
-from _pve_verify import PVEVerifier, PVEVerifyError, parse_stemcell_cid, parse_stemcell_path_cid
+from _pve_verify import (
+    PVEVerifier,
+    PVEVerifyError,
+    parse_stemcell_cid,
+    parse_stemcell_path_cid,
+    resolved_parker_pool,
+    resolved_parker_prefix,
+    sanitize_vm_name,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +997,64 @@ class TestParseStemcellPathCID(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Parker name prefix and pool resolution
+# ---------------------------------------------------------------------------
+
+class TestSanitizeVMName(unittest.TestCase):
+    def test_collapses_runs_of_non_alnum_to_one_dash(self) -> None:
+        self.assertEqual(sanitize_vm_name("my_prefix"), "my-prefix")
+        self.assertEqual(sanitize_vm_name("a...b"), "a-b")
+
+    def test_trims_leading_and_trailing_dashes(self) -> None:
+        self.assertEqual(sanitize_vm_name("--acme--"), "acme")
+
+    def test_empty_input_collapses_to_empty(self) -> None:
+        self.assertEqual(sanitize_vm_name(""), "")
+        self.assertEqual(sanitize_vm_name("___"), "")
+
+
+class TestResolvedParkerPrefix(unittest.TestCase):
+    def test_explicit_parker_prefix_wins(self) -> None:
+        self.assertEqual(
+            resolved_parker_prefix({"parker_prefix": "acme", "vm_prefix": "other"}), "acme"
+        )
+
+    def test_falls_back_to_a_sanitized_vm_prefix(self) -> None:
+        self.assertEqual(resolved_parker_prefix({"vm_prefix": "my_prefix"}), "my-prefix")
+
+    def test_falls_back_to_bosh_when_both_are_absent(self) -> None:
+        self.assertEqual(resolved_parker_prefix({}), "bosh")
+
+    def test_falls_back_to_bosh_when_vm_prefix_sanitizes_to_nothing(self) -> None:
+        self.assertEqual(resolved_parker_prefix({"vm_prefix": "___"}), "bosh")
+
+    def test_a_long_vm_prefix_is_cut_to_the_parker_prefix_bound(self) -> None:
+        """internal/config/config.go caps a vm_prefix-derived parker prefix at
+        46 bytes, the longest prefix that still renders a legal parker VM name
+        under the widest possible VMID. This mirrors that bound."""
+        long_prefix = "a" * 60
+        resolved = resolved_parker_prefix({"vm_prefix": long_prefix})
+        self.assertEqual(resolved, "a" * 46)
+
+
+class TestResolvedParkerPool(unittest.TestCase):
+    def test_default_template_substitutes_the_resolved_prefix(self) -> None:
+        self.assertEqual(
+            resolved_parker_pool({"parker_prefix": "acme", "parker_pool": "{prefix}-parker"}),
+            "acme-parker",
+        )
+
+    def test_empty_template_is_the_documented_opt_out(self) -> None:
+        self.assertEqual(resolved_parker_pool({"parker_pool": ""}), "")
+
+    def test_absent_template_is_also_the_opt_out(self) -> None:
+        self.assertEqual(resolved_parker_pool({}), "")
+
+    def test_a_template_without_the_token_is_returned_unchanged(self) -> None:
+        self.assertEqual(resolved_parker_pool({"parker_pool": "fixed-pool"}), "fixed-pool")
+
+
+# ---------------------------------------------------------------------------
 # Parked-disk (parker VM) inspection
 # ---------------------------------------------------------------------------
 
@@ -1167,6 +1233,69 @@ class TestParkerInspection(unittest.TestCase):
             "/nodes/pve1/qemu/90002/config": {"tags": "bosh-parker"},
         })
         self.assertEqual(v.parker_vmids(90000, 90999), [90002])
+
+    # -- pool_member_vmids ----------------------------------------------------
+
+    def test_pool_member_vmids_reads_qemu_members(self) -> None:
+        v = self._verifier({
+            "/pools/bosh-parker": {
+                "members": [
+                    {"id": "qemu/90000", "node": "pve1", "type": "qemu", "vmid": 90000},
+                ],
+            },
+        })
+        self.assertEqual(v.pool_member_vmids("bosh-parker"), [90000])
+
+    def test_pool_member_vmids_sorts_ascending(self) -> None:
+        v = self._verifier({
+            "/pools/bosh-parker": {
+                "members": [
+                    {"id": "qemu/90002", "node": "pve1", "type": "qemu", "vmid": 90002},
+                    {"id": "qemu/90000", "node": "pve1", "type": "qemu", "vmid": 90000},
+                    {"id": "qemu/90001", "node": "pve2", "type": "qemu", "vmid": 90001},
+                ],
+            },
+        })
+        self.assertEqual(v.pool_member_vmids("bosh-parker"), [90000, 90001, 90002])
+
+    def test_pool_member_vmids_skips_storage_members_without_vmid(self) -> None:
+        """A pool's members array mixes guest and storage entries, and only a
+        guest entry carries a vmid. A reader that assumed every member had one
+        would raise over a pool that legitimately also holds a storage ID."""
+        v = self._verifier({
+            "/pools/bosh-parker": {
+                "members": [
+                    {"id": "storage/local", "node": "pve1", "type": "storage", "storage": "local"},
+                    {"id": "qemu/90000", "node": "pve1", "type": "qemu", "vmid": 90000},
+                ],
+            },
+        })
+        self.assertEqual(v.pool_member_vmids("bosh-parker"), [90000])
+
+    def test_pool_member_vmids_ignores_a_non_numeric_vmid(self) -> None:
+        v = self._verifier({
+            "/pools/bosh-parker": {
+                "members": [{"id": "qemu/x", "node": "pve1", "type": "qemu", "vmid": "x"}],
+            },
+        })
+        self.assertEqual(v.pool_member_vmids("bosh-parker"), [])
+
+    def test_pool_member_vmids_empty_pool_returns_empty_list(self) -> None:
+        v = self._verifier({"/pools/bosh-parker": {"members": []}})
+        self.assertEqual(v.pool_member_vmids("bosh-parker"), [])
+
+    def test_pool_member_vmids_raises_when_the_pool_does_not_exist(self) -> None:
+        """GET /pools/{poolid} errors when the pool is absent, the same way
+        qemu_config errors when the VM is absent, so a caller that asserts
+        membership gets a failure it can read rather than a silent []."""
+        v = PVEVerifier(_token_config())
+
+        def fake_get(path: str):
+            raise PVEVerifyError(f"GET {path} failed: HTTP 500 pool does not exist")
+
+        v._get = fake_get  # type: ignore[method-assign]
+        with self.assertRaises(PVEVerifyError):
+            v.pool_member_vmids("bosh-parker")
 
     # -- disk_holders --------------------------------------------------------
 

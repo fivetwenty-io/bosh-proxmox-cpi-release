@@ -231,6 +231,8 @@ None of this is visible in the CPI's return values — every one of those calls 
 | `parked_disk.enabled` | `false` skips steps 11c–11l | `true` |
 | `parked_disk.range_start` | Optional. May only restate the band the CPI config uses | *(from the CPI config)* |
 | `parked_disk.range_end` | Optional, under the same restriction | *(from the CPI config)* |
+| `parked_disk.prefix` | Optional. Names parker VMs and, through `{prefix}`, their pool. A parker is named `<prefix>-parker-<vmid>` | *(CPI default `bosh`)* |
+| `parked_disk.pool` | Optional. The pool parker VMs join. `""` turns pool placement off | *(CPI default `{prefix}-parker`)* |
 
 The pass leaves its parker VM in place. That is the design working as intended — a parker is durable infrastructure that outlives any single disk, the CPI has no call that removes one, and later runs reuse it. Removing one by hand needs the protection flag cleared first, or PVE refuses:
 
@@ -313,6 +315,8 @@ Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `creat
 | `PARKED_DISK_TEST` | `on` | `on` \| `off` — run the parked detached-disk pass (steps 11c–11l) |
 | `PARKER_RANGE_START` | from `CPI_CONFIG` | First parker VMID. May only restate the band `CPI_CONFIG` uses; a different value aborts the run |
 | `PARKER_RANGE_END` | from `CPI_CONFIG` | Last parker VMID, under the same restriction |
+| `PARKER_PREFIX` | from `CPI_CONFIG` | Names parker VMs and, through `{prefix}`, their pool. Applied to every derived config, so a non-default value reaches every step of the pass, not just the ones reading `CPI_CONFIG` directly |
+| `PARKER_POOL` | from `CPI_CONFIG` | The pool parker VMs join, under the same restriction as `PARKER_PREFIX` |
 
 When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is set per pass from `tier1.network_test.modes`; the `SDN_*`/`BRIDGE_TEST_IFACE` values come from `tier1.network_test`, and the `PARKED_*`/`PARKER_*` values from `tier1.parked_disk`. The parker band belongs in the CPI config rather than here: the pass reads it from there and refuses a `PARKER_RANGE_*` that disagrees, because looking for parkers outside the band the CPI parks into would read a real parker as an ordinary VM.
 

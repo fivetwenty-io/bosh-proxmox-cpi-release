@@ -269,6 +269,48 @@ if PARKER_RANGE_START < 100 or PARKER_RANGE_END <= PARKER_RANGE_START:
         "(start must be >=100 and below end)"
     )
 
+# PARKER_PREFIX/PARKER_POOL let a run exercise a non-default pve.parker_prefix
+# or pve.parker_pool without hand-editing CPI_CONFIG on disk. Empty (the
+# default) means "trust whatever CPI_CONFIG already resolves to"; derive_config
+# applies a non-empty value to every generated config, the same way
+# write_strategy_config pins the parker band, so the value reaches the config
+# step 11d onward actually parks against rather than sitting unread in
+# CPI_CONFIG. tier1.parked_disk.prefix/.pool feed both CPI_CONFIG and these two
+# env vars, so the two sides agree the same way PARKER_RANGE_START/END do.
+PARKER_PREFIX = env("PARKER_PREFIX", "")
+PARKER_POOL = env("PARKER_POOL", "")
+
+
+def resolved_parker_prefix(cfg: dict) -> str:
+    """Return the parker name prefix a config resolves to.
+
+    Delegates the chain itself (explicit parker_prefix, then a sanitized
+    vm_prefix, then "bosh") to _pve_verify.resolved_parker_prefix, which
+    mirrors CPIConfig.ParkerPrefixValue in internal/config/config.go.
+    PARKER_PREFIX stands in for the parker_prefix override derive_config
+    applies to every generated config, so this checks the value the
+    parked-disk pass actually parked against rather than the unoverridden
+    base config.
+    """
+    if PARKER_PREFIX:
+        return PARKER_PREFIX
+    return _pve_verify.resolved_parker_prefix(cfg)
+
+
+def resolved_parker_pool(cfg: dict) -> str:
+    """Return the pool a config resolves parker placement to, or "" when pool
+    placement is off.
+
+    This mirrors CPIConfig.ParkerPoolValue. The "{prefix}" token in the
+    template substitutes for resolved_parker_prefix(cfg), and an empty
+    template is the documented opt-out. PARKER_POOL stands in for the same
+    override derive_config applies, matching resolved_parker_prefix.
+    """
+    template = PARKER_POOL or str(cfg.get("parker_pool", "") or "")
+    if not template:
+        return ""
+    return template.replace("{prefix}", resolved_parker_prefix(cfg))
+
 # PVE rejects VMIDs above this ceiling, and the CPI's config validation
 # enforces it on the parker band, so a derived band crossing it would fail
 # config load mid-pass with an error naming a temp file instead of the cause.
@@ -522,7 +564,18 @@ def derive_config(prefix: str, **overrides: Any) -> str:
     Lets the harness exercise config-selected code paths without mutating the
     primary config, and without depending on what the primary config happens to
     say. Removal is handled centrally by purge_derived_configs().
+
+    PARKER_PREFIX and PARKER_POOL, when set, fold into every call's overrides
+    as parker_prefix and parker_pool, unless the caller already named one of
+    those keys itself. This is the one funnel every generated config passes
+    through, so setting them here is what makes every wrapper below pick up a
+    non-default prefix or pool together, rather than needing an edit at each
+    call site.
     """
+    if PARKER_PREFIX and "parker_prefix" not in overrides:
+        overrides["parker_prefix"] = PARKER_PREFIX
+    if PARKER_POOL and "parker_pool" not in overrides:
+        overrides["parker_pool"] = PARKER_POOL
     with open(CPI_CONFIG) as f:
         cfg = json.load(f)
     for key, value in overrides.items():
@@ -777,9 +830,10 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         )
 
     parker_cfg = verifier.qemu_config(parker_vmid)
+    expected_parker_prefix = resolved_parker_prefix(_base_cfg)
     verifier.assert_true(
-        f"parker {parker_vmid} is named bosh-parker-{parker_vmid}",
-        str(parker_cfg.get("name", "")) == f"bosh-parker-{parker_vmid}",
+        f"parker {parker_vmid} is named {expected_parker_prefix}-parker-{parker_vmid}",
+        str(parker_cfg.get("name", "")) == f"{expected_parker_prefix}-parker-{parker_vmid}",
     )
     verifier.assert_true(
         f"parker {parker_vmid} is protected against disk and VM removal",
@@ -809,6 +863,22 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         f"parker {parker_vmid} carries the CPI ownership tag",
         any(t.strip().lower() == "bosh-cpi" for t in parker_tags.split(";")),
     )
+    expected_prefix_tag = f"vm-prefix--{expected_parker_prefix}"
+    verifier.assert_true(
+        f"parker {parker_vmid} carries the {expected_prefix_tag} identity tag",
+        any(t.strip().lower() == expected_prefix_tag.lower() for t in parker_tags.split(";")),
+    )
+    # PlaceParkersInPool is the only code that reads pve.parker_pool, and it
+    # runs outside the park itself, so this checks the pool's own member list
+    # rather than trusting a field on the parker's VM config. /cluster/resources
+    # lags the live cluster by minutes; a check built on it would fail here for
+    # a reason that has nothing to do with pool placement.
+    expected_parker_pool = resolved_parker_pool(_base_cfg)
+    if expected_parker_pool:
+        verifier.assert_true(
+            f"parker {parker_vmid} is a member of the pool {expected_parker_pool!r}",
+            parker_vmid in verifier.pool_member_vmids(expected_parker_pool),
+        )
 
     step("11d-bis. detach_disk again (parked: the already-parked path is idempotent)")
     call("detach_disk", [vm_cid, disk_cid], config_path=parked_cfg)

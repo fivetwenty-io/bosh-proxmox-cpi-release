@@ -187,6 +187,17 @@ tier1:
     # reads a real parker as an ordinary VM.
     # range_start: 91000
     # range_end:   91999
+    # Uncomment to name parker VMs and their pool from a prefix other than the
+    # CPI default "bosh". A parker is named "<prefix>-parker-<vmid>", and this
+    # feeds both the generated CPI config's pve.parker_prefix and the
+    # PARKER_PREFIX env var scripts/lifecycle applies to every config it
+    # derives, so the two cannot disagree either.
+    # prefix: acme
+    # Uncomment to move the pool parker VMs join. "{prefix}" substitutes for
+    # the prefix above (or the CPI default "bosh" when prefix is unset), so the
+    # default template "{prefix}-parker" needs no override to work with a
+    # custom prefix. Set to "" to turn pool placement off.
+    # pool: acme-parker
 
 # Tier 2: BOSH director smoke test.
 tier2:
