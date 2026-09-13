@@ -19,6 +19,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // --------------------------------------------------------------------------
@@ -1037,6 +1038,21 @@ func TestApplyDefaults_AllFields(t *testing.T) {
 	}
 	if cfg.VMPrefix != "" {
 		t.Errorf("VMPrefix = %q, want empty (no default prefix)", cfg.VMPrefix)
+	}
+	// ApplyDefaults deliberately leaves both parker naming fields alone. The
+	// prefix resolves per request in ParkerPrefixValue and the pool renders per
+	// request in ParkerPoolValue, because pve.vm_prefix is overridable per
+	// cpi-config entry and a value frozen here would leave an entry's parker
+	// names behind its workload VM names. These two checks are the guard
+	// against a later refactor that moves the resolution in here. Note that
+	// this test is not a canary for new fields in general. It is a list of
+	// plain checks over named fields, with no reflection and no exhaustiveness
+	// mechanism, so a field nobody names here cannot fail it.
+	if cfg.ParkerPrefix != "" {
+		t.Errorf("ParkerPrefix = %q, want empty; the prefix resolves in ParkerPrefixValue", cfg.ParkerPrefix)
+	}
+	if cfg.ParkerPool != "" {
+		t.Errorf("ParkerPool = %q, want empty; the pool renders in ParkerPoolValue", cfg.ParkerPool)
 	}
 }
 
@@ -7270,5 +7286,458 @@ func TestOTelMetricsEnabled_Accessor(t *testing.T) {
 	var nilC *config.CPIConfig
 	if nilC.OTelMetricsEnabled() {
 		t.Errorf("OTelMetricsEnabled() on nil receiver = true, want false")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Parker prefix and parker pool
+// --------------------------------------------------------------------------
+
+// TestParkerPrefixValue_ResolutionChain walks every rung of the fallback chain
+// the parker prefix resolves through. ParkerPrefix wins when it is set,
+// VMPrefix comes next, and the literal "bosh" is the floor, which is the name
+// every prior release used.
+func TestParkerPrefixValue_ResolutionChain(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		parkerPrefix string
+		vmPrefix     string
+		want         string
+	}{
+		{"both_unset_yields_bosh", "", "", "bosh"},
+		{"vm_prefix_alone", "", "cpi", "cpi"},
+		{"parker_prefix_alone", "parked", "", "parked"},
+		{"both_set_parker_prefix_wins", "parked", "cpi", "parked"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseCfg()
+			cfg.ParkerPrefix = tc.parkerPrefix
+			cfg.VMPrefix = tc.vmPrefix
+			if got := cfg.ParkerPrefixValue(); got != tc.want {
+				t.Errorf("ParkerPrefixValue() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParkerPrefixValue_ExplicitNotOverwritten is the companion this codebase
+// pairs with every fallback, modeled on TestApplyDefaults_StemcellFallback and
+// TestApplyDefaults_StemcellNotOverwritten. An operator who names a parker
+// prefix keeps it, and ApplyDefaults leaves both of the new fields alone.
+func TestParkerPrefixValue_ExplicitNotOverwritten(t *testing.T) {
+	t.Parallel()
+	var cfg config.CPIConfig
+	cfg.VMStorage = "vm-store"
+	cfg.VMPrefix = "cpi"
+	cfg.ParkerPrefix = "parked"
+	cfg.ApplyDefaults()
+
+	if cfg.ParkerPrefix != "parked" {
+		t.Errorf("ParkerPrefix = %q, want %q", cfg.ParkerPrefix, "parked")
+	}
+	if got := cfg.ParkerPrefixValue(); got != "parked" {
+		t.Errorf("ParkerPrefixValue() = %q, want %q", got, "parked")
+	}
+}
+
+// TestParkerAccessors_NilReceiver covers the nilable config the set_vm_metadata
+// path reaches these accessors with. Neither accessor may panic, and the prefix
+// still falls back to the historical name.
+func TestParkerAccessors_NilReceiver(t *testing.T) {
+	t.Parallel()
+	var cfg *config.CPIConfig
+	if got := cfg.ParkerPrefixValue(); got != "bosh" {
+		t.Errorf("ParkerPrefixValue() on a nil receiver = %q, want %q", got, "bosh")
+	}
+	if got := cfg.ParkerPoolValue(); got != "" {
+		t.Errorf("ParkerPoolValue() on a nil receiver = %q, want empty", got)
+	}
+}
+
+// TestParkerPoolValue_Table covers the render, including the empty-string
+// opt-out. That opt-out is the reason the property defaults to a template
+// string rather than to "", so a change that brought back derive-on-empty has
+// to fail here.
+func TestParkerPoolValue_Table(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		parkerPool   string
+		parkerPrefix string
+		want         string
+	}{
+		{"spec_default_renders_bosh_parker", "{prefix}-parker", "", "bosh-parker"},
+		{"spec_default_under_a_set_prefix", "{prefix}-parker", "parked", "parked-parker"},
+		{"literal_name_passes_through", "attic", "parked", "attic"},
+		{"empty_is_the_opt_out", "", "parked", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validBaseCfg()
+			cfg.ParkerPool = tc.parkerPool
+			cfg.ParkerPrefix = tc.parkerPrefix
+			if got := cfg.ParkerPoolValue(); got != tc.want {
+				t.Errorf("ParkerPoolValue() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateParkerPrefix_SlashRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "bosh/parked"
+	}`)
+	assertCloudError(t, err, "parker_prefix must not contain '/'")
+}
+
+func TestValidateParkerPrefix_CharsetRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "bosh parked!"
+	}`)
+	assertCloudError(t, err, "parker_prefix must be a DNS label")
+}
+
+func TestValidateParkerPrefix_LeadingOrTrailingHyphenRejected(t *testing.T) {
+	t.Parallel()
+	for _, prefix := range []string{"-parked", "parked-"} {
+		t.Run(prefix, func(t *testing.T) {
+			t.Parallel()
+			_, err := mustLoad(t, `{
+				"host": "h", "user": "u", "password": "p",
+				"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+				"parker_prefix": "`+prefix+`"
+			}`)
+			assertCloudError(t, err, "parker_prefix must be a DNS label")
+		})
+	}
+}
+
+// TestValidateParkerPrefix_SingleCharacterAccepted guards the optional-group
+// form of the regex. A one-character prefix is perfectly good, and the
+// two-character spelling of the same pattern would reject it.
+func TestValidateParkerPrefix_SingleCharacterAccepted(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "p"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for a one-character parker_prefix: %v", err)
+	}
+	if got := cfg.ParkerPrefixValue(); got != "p" {
+		t.Errorf("ParkerPrefixValue() = %q, want %q", got, "p")
+	}
+}
+
+func TestValidateParkerPrefix_BoshLockPrefixRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "bosh-lock-parked"
+	}`)
+	assertCloudError(t, err, `parker_prefix must not start with "bosh-lock-"`)
+}
+
+// TestValidateParkerPrefix_TooLongRejected covers the derived 46-byte bound.
+// The rendered parker name is the prefix, then "-parker-", then up to nine VMID
+// digits, and PVE caps a VM name at 63 bytes.
+func TestValidateParkerPrefix_TooLongRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "`+strings.Repeat("a", 47)+`"
+	}`)
+	assertCloudError(t, err, "parker_prefix must be at most 46 bytes")
+}
+
+// TestValidateParkerPrefix_AtBoundAccepted pins the bound itself, so a change
+// to the derivation shows up as a failing test rather than as a quietly
+// narrower field.
+func TestValidateParkerPrefix_AtBoundAccepted(t *testing.T) {
+	t.Parallel()
+	want := strings.Repeat("a", 46)
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_prefix": "`+want+`"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error for a 46-byte parker_prefix: %v", err)
+	}
+	if cfg.ParkerPrefix != want {
+		t.Errorf("ParkerPrefix = %q, want %q", cfg.ParkerPrefix, want)
+	}
+}
+
+func TestValidateParkerPrefix_UnsetNoError(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ParkerPrefix != "" {
+		t.Errorf("ParkerPrefix = %q; want empty", cfg.ParkerPrefix)
+	}
+	if got := cfg.ParkerPrefixValue(); got != "bosh" {
+		t.Errorf("ParkerPrefixValue() = %q, want %q", got, "bosh")
+	}
+}
+
+func TestValidateParkerPool_UnknownToken(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_pool": "{director}-parker"
+	}`)
+	assertCloudError(t, err, `parker_pool contains unknown variable "{director}"`)
+}
+
+func TestValidateParkerPool_SlashRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_pool": "{prefix}/parker"
+	}`)
+	assertCloudError(t, err, "parker_pool must not contain '/'")
+}
+
+func TestValidateParkerPool_CharsetRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_pool": "{prefix} parker!"
+	}`)
+	assertCloudError(t, err, "parker_pool contains characters invalid for a PVE poolid")
+}
+
+func TestValidateParkerPool_BoshLockPrefixRejected(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"parker_pool": "bosh-lock-parker"
+	}`)
+	assertCloudError(t, err, `parker_pool must not start with "bosh-lock-"`)
+}
+
+// TestValidateParkerPool_EqualsVMPool covers the collision that matters most.
+// The validator renders the template before it compares, so the spec default
+// collides with a vm_pool an operator happened to name "bosh-parker". Checking
+// the raw field would return early on that default, which is the case every
+// deployment actually runs.
+func TestValidateParkerPool_EqualsVMPool(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "bosh-parker",
+		"parker_pool": "{prefix}-parker"
+	}`)
+	assertCloudError(t, err, "parker_pool must not equal vm_pool")
+}
+
+func TestValidateParkerPool_EqualsStemcellTemplatePool(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"stemcell_template_pool": "bosh-parker",
+		"parker_pool": "{prefix}-parker"
+	}`)
+	assertCloudError(t, err, "parker_pool must not equal stemcell_template_pool")
+}
+
+// TestValidateParkerPool_CollisionReportedOnce holds the single-owner
+// convention this codebase states on validateStemcellTemplatePool. The parker
+// pool owns both of its equality comparisons, and no other validator repeats
+// them, so a collision is reported once however the config sets the fields.
+func TestValidateParkerPool_CollisionReportedOnce(t *testing.T) {
+	t.Parallel()
+	_, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "shared-parker",
+		"parker_pool": "shared-parker"
+	}`)
+	if err == nil {
+		t.Fatal("expected a parker_pool and vm_pool collision error")
+	}
+	count := strings.Count(err.Error(), "parker_pool must not equal vm_pool")
+	if count != 1 {
+		t.Errorf("expected exactly one equality-collision error, got %d in: %v", count, err)
+	}
+}
+
+// TestValidateParkerPool_BothPoolsEmptyNoCollision pins the ordering inside the
+// validator. An operator who opts out of pools altogether leaves both
+// properties empty, and an equality check that ran before the empty
+// early-return would report those two empty strings as colliding with each
+// other.
+func TestValidateParkerPool_BothPoolsEmptyNoCollision(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"vm_pool": "",
+		"parker_pool": ""
+	}`)
+	if err != nil {
+		t.Fatalf("two empty pools must not collide: %v", err)
+	}
+	if got := cfg.ParkerPoolValue(); got != "" {
+		t.Errorf("ParkerPoolValue() = %q, want empty, which is the opt-out", got)
+	}
+}
+
+func TestValidateParkerPool_UnsetNoError(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br"
+	}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ParkerPool != "" {
+		t.Errorf("ParkerPool = %q; want empty", cfg.ParkerPool)
+	}
+}
+
+// TestParkerPrefixValue_VMPrefixSanitized covers the middle rung of the chain.
+// A vm_prefix that no validator ever checked still has to boot, so we rewrite
+// it inside the accessor rather than reject it, and we warn so the operator can
+// see what the parker names will say.
+func TestParkerPrefixValue_VMPrefixSanitized(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.VMPrefix = "my_prefix"
+
+	var buf bytes.Buffer
+	logger, err := log.NewLogger("warn", &buf)
+	if err != nil {
+		t.Fatalf("log.NewLogger: %v", err)
+	}
+	if err := cfg.ValidateWithLogger(logger); err != nil {
+		t.Fatalf("an unsanitized vm_prefix must still validate: %v", err)
+	}
+	if got := cfg.ParkerPrefixValue(); got != "my-prefix" {
+		t.Errorf("ParkerPrefixValue() = %q, want %q", got, "my-prefix")
+	}
+	out := buf.String()
+	for _, want := range []string{"pve.vm_prefix", "my_prefix", "my-prefix"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warning %q must mention %q", out, want)
+		}
+	}
+}
+
+// TestParkerPrefixValue_VMPrefixTruncated covers the other half of the middle
+// rung. A vm_prefix longer than the bound still validates, and the accessor
+// cuts it down and trims the hyphen the cut leaves behind, so the parker name
+// stays inside PVE's own 63-byte cap.
+func TestParkerPrefixValue_VMPrefixTruncated(t *testing.T) {
+	t.Parallel()
+	cfg := validBaseCfg()
+	cfg.VMPrefix = strings.Repeat("a", 45) + "-" + strings.Repeat("b", 10)
+
+	var buf bytes.Buffer
+	logger, err := log.NewLogger("warn", &buf)
+	if err != nil {
+		t.Fatalf("log.NewLogger: %v", err)
+	}
+	if err := cfg.ValidateWithLogger(logger); err != nil {
+		t.Fatalf("an over-long vm_prefix must still validate: %v", err)
+	}
+	got := cfg.ParkerPrefixValue()
+	if want := strings.Repeat("a", 45); got != want {
+		t.Errorf("ParkerPrefixValue() = %q, want %q", got, want)
+	}
+	if len(got) > 46 {
+		t.Errorf("ParkerPrefixValue() is %d bytes, want at most 46", len(got))
+	}
+	if strings.HasSuffix(got, "-") {
+		t.Errorf("ParkerPrefixValue() = %q, want no trailing hyphen", got)
+	}
+	if !strings.Contains(buf.String(), "pve.vm_prefix") {
+		t.Errorf("warning %q must mention %q", buf.String(), "pve.vm_prefix")
+	}
+}
+
+// TestValidateParkerPrefix_UnderscoreRejectedUnlikeVMPrefix draws the line
+// between the two properties. The strict rule belongs to the property this work
+// adds, and not to the one that predates it, because tightening pve.vm_prefix
+// would stop a deployment that boots today.
+func TestValidateParkerPrefix_UnderscoreRejectedUnlikeVMPrefix(t *testing.T) {
+	t.Parallel()
+	t.Run("parker_prefix_rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"parker_prefix": "my_prefix"
+		}`)
+		assertCloudError(t, err, "parker_prefix must be a DNS label")
+	})
+	t.Run("vm_prefix_accepted", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := mustLoad(t, `{
+			"host": "h", "user": "u", "password": "p",
+			"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+			"vm_prefix": "my_prefix"
+		}`)
+		if err != nil {
+			t.Fatalf("vm_prefix must stay unvalidated: %v", err)
+		}
+		if cfg.VMPrefix != "my_prefix" {
+			t.Errorf("VMPrefix = %q, want %q, left as the operator wrote it", cfg.VMPrefix, "my_prefix")
+		}
+		if got := cfg.ParkerPrefixValue(); got != "my-prefix" {
+			t.Errorf("ParkerPrefixValue() = %q, want %q", got, "my-prefix")
+		}
+	})
+}
+
+// TestValidateParkerFields_StrictConfigValidationAcceptsBoth guards the JSON
+// tags on the two new fields. knownConfigFields is built by reflection and
+// skips any field whose tag name is empty once the options are cut off, so a
+// bare `json:",omitempty"` would compile, would read as correct, and would
+// leave the key out of the known set. A config that carried it would then hard
+// fail under strict_config_validation, which is exactly what this test catches.
+func TestValidateParkerFields_StrictConfigValidationAcceptsBoth(t *testing.T) {
+	t.Parallel()
+	cfg, err := mustLoad(t, `{
+		"host": "h", "user": "u", "password": "p",
+		"vm_storage": "s", "disk_storage": "s", "network_bridge": "br",
+		"strict_config_validation": true,
+		"parker_prefix": "parked",
+		"parker_pool": "{prefix}-parker"
+	}`)
+	if err != nil {
+		t.Fatalf("both parker keys must be known to strict validation: %v", err)
+	}
+	if cfg.ParkerPrefix != "parked" {
+		t.Errorf("ParkerPrefix = %q, want %q", cfg.ParkerPrefix, "parked")
+	}
+	if got := cfg.ParkerPoolValue(); got != "parked-parker" {
+		t.Errorf("ParkerPoolValue() = %q, want %q", got, "parked-parker")
 	}
 }

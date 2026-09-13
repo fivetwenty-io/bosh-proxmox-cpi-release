@@ -756,6 +756,43 @@ type CPIConfig struct {
 	// zero.
 	ParkedDiskVMIDRangeEnd int `json:"parked_disk_vmid_range_end,omitempty"`
 
+	// ParkerPrefix names parker VMs and the pool they join. A parker is named
+	// "<prefix>-parker-<vmid>", so this value is the "<prefix>" of that name
+	// and, through the "{prefix}" token, of ParkerPool as well.
+	//
+	// ApplyDefaults does not fill this field, and no accessor writes it back.
+	// ParkerPrefixValue resolves the value per request instead, preferring this
+	// field, then VMPrefix, then the literal "bosh". Empty therefore means
+	// "fall down that chain", and an empty value is byte-identical to every
+	// prior release only when VMPrefix is also empty. A config that sets
+	// pve.vm_prefix picks the prefix up from there, so its new parkers are
+	// named "<vm_prefix>-parker-<vmid>" while parkers created earlier keep the
+	// name they were born with. That mix is harmless, because every classifier
+	// keys on the bosh-parker tag rather than on the name.
+	//
+	// Validated only when set, against the intersection of the PVE VM-name and
+	// poolid charsets, since the value lands in both namespaces. See
+	// validateParkerPrefix. Omit from ERB when empty.
+	ParkerPrefix string `json:"parker_prefix,omitempty"`
+
+	// ParkerPool is the template for the pool parker VMs join, and the only
+	// variable it accepts is "{prefix}", which ParkerPoolValue substitutes with
+	// the resolved parker prefix. The spec defaults it to the literal template
+	// "{prefix}-parker", so an untouched deployment lands its parkers in
+	// "bosh-parker".
+	//
+	// The default is a template string rather than "" on purpose, because that
+	// is what keeps the opt-out reachable. An empty value renders empty and
+	// turns pool assignment off altogether, which an operator who grants
+	// Pool.Allocate per pool may well want. A design that derived the pool name
+	// from an empty value could never express that, and the omit-when-empty ERB
+	// idiom would drop an explicit "" before it ever reached this field.
+	//
+	// Validated after rendering rather than raw, so the default is checked for
+	// collisions like any other value. See validateParkerPool. Omit from ERB
+	// when empty.
+	ParkerPool string `json:"parker_pool,omitempty"`
+
 	// parkedDefaultBandCollision records why the DEFAULTED parked strategy is
 	// not in force for this config: it names the configured VMID band the
 	// built-in parker band 90000-90999 would have overlapped. Unexported and
@@ -2452,6 +2489,157 @@ func (c *CPIConfig) applyOTelDefaults() {
 	}
 }
 
+// maxPVEVMNameLength is the maximum byte length PVE accepts for a VM's "name"
+// config field. The PVE schema documents that field as a DNS name (RFC 1035
+// single label), which caps it at 63 octets. It carries the same value and the
+// same name in internal/cpi/handlers/tags.go, duplicated because that package
+// imports this one and the reverse edge would be an import cycle.
+const maxPVEVMNameLength = 63
+
+// maxParkerPrefixLength is the longest parker prefix that can still render a
+// legal parker VM name. We derive the number rather than pick it. A parker name
+// is the prefix, then the literal "-parker-", which is eight bytes, then the
+// VMID. The VMID is not five digits in the general case, because the parker
+// band is operator-set, both of its bounds are overridable per cpi-config entry
+// (see context_overrides.go), and the only ceiling on either is maxVMID, which
+// is 999999999. Nine digits is therefore the worst case, and 63 minus 8 minus 9
+// leaves 46. A bound derived from the band an operator actually configured
+// would be tighter and would also be correct; this fixed one is simpler and is
+// never wrong.
+//
+// The 63-byte cap is PVE's own rather than ours. sanitizeVMName in
+// internal/cpi/handlers enforces it for workload VM names, and parker names
+// never pass through that helper, so checking the prefix against this bound is
+// what turns a PVE-side rejection into a config error an operator can read.
+const maxParkerPrefixLength = 46
+
+// defaultParkerPrefix is the last rung of the parker prefix chain, and it is
+// the name every release before this one used unconditionally.
+const defaultParkerPrefix = "bosh"
+
+// parkerPoolPrefixToken is the only "{...}" variable ParkerPoolValue
+// substitutes, and validateParkerPool rejects every other one by name.
+const parkerPoolPrefixToken = "{prefix}"
+
+// SanitizeVMName rewrites s into a name PVE accepts for a VM. Every byte
+// outside [A-Za-z0-9] becomes "-", runs of dashes collapse to a single dash,
+// dashes are trimmed from both ends, and a result longer than
+// maxPVEVMNameLength is cut to that bound and trimmed again. It returns "" when
+// s collapses to nothing.
+//
+// This is the twin of sanitizeVMName in internal/cpi/handlers/tags.go, and the
+// two have to agree byte for byte, because a workload VM and the parker that
+// holds its detached disks derive their names from the same prefix. We cannot
+// share one copy, since handlers imports this package and the reverse import
+// would be a cycle, so we duplicate the mapping here.
+// TestSanitizeVMName_MatchesConfigTwin in the handlers package feeds both
+// functions the same table and fails when they disagree. That test is the only
+// reason this helper is exported.
+func SanitizeVMName(s string) string {
+	if s == "" {
+		return ""
+	}
+	b := make([]byte, 0, len(s))
+	prevDash := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		isAlnum := (ch >= 'a' && ch <= 'z') ||
+			(ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9')
+		if isAlnum {
+			b = append(b, ch)
+			prevDash = false
+			continue
+		}
+		// Every other byte, the '-' included, becomes a single '-', so runs of
+		// them collapse rather than repeat.
+		if !prevDash {
+			b = append(b, '-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(string(b), "-")
+	if len(out) > maxPVEVMNameLength {
+		out = strings.TrimRight(out[:maxPVEVMNameLength], "-")
+	}
+	return out
+}
+
+// parkerPrefixFromVMPrefix rewrites a raw VMPrefix into a prefix a parker name
+// can legally carry. It sanitizes the value the way every workload VM name is
+// sanitized, and it then cuts anything still over maxParkerPrefixLength down to
+// that bound, trimming the hyphen the cut may leave behind. A long vm_prefix
+// therefore yields a short parker prefix rather than an illegal parker name.
+// Returns "" when the value collapses to nothing, which lets the caller fall
+// through to defaultParkerPrefix.
+func parkerPrefixFromVMPrefix(raw string) string {
+	out := SanitizeVMName(raw)
+	if len(out) > maxParkerPrefixLength {
+		out = strings.TrimRight(out[:maxParkerPrefixLength], "-")
+	}
+	return out
+}
+
+// ParkerPrefixValue returns the prefix parker VM names and the parker pool are
+// built from. It prefers ParkerPrefix, falls back to VMPrefix, and falls back
+// again to "bosh", which is the name every prior release used.
+//
+// Only the middle rung is sanitized. ParkerPrefix is checked strictly by
+// validateParkerPrefix, so it arrives already legal, and the "bosh" literal is
+// legal by construction. VMPrefix has never had a validator, so a value such as
+// "my_prefix" names a workload VM perfectly well, since composeVMName runs
+// every workload name through sanitizeVMName on the way out, while the same
+// value would hand PVE an illegal parker name. parkerVMName formats straight
+// into the create params, so such a name fails every park as a retriable error
+// that the Director then retries forever. Rewriting the value here rather than
+// rejecting it keeps a deployment that boots today booting, and
+// ValidateWithLogger warns whenever the rewrite changed anything.
+//
+// The resolution deliberately does not live in ApplyDefaults, and someone who
+// does not know why will try to move it there. pve.vm_prefix is overridable per
+// cpi-config entry, so copying it into ParkerPrefix at startup would freeze the
+// job-level value, and an entry that overrode pve_vm_prefix would then move
+// its workload VM names and leave its parker names behind. We resolve against
+// the effective config on each request instead.
+func (c *CPIConfig) ParkerPrefixValue() string {
+	if c == nil {
+		return defaultParkerPrefix
+	}
+	if c.ParkerPrefix != "" {
+		return c.ParkerPrefix
+	}
+	if sanitized := parkerPrefixFromVMPrefix(c.VMPrefix); sanitized != "" {
+		return sanitized
+	}
+	return defaultParkerPrefix
+}
+
+// ParkerPoolValue renders ParkerPool by substituting "{prefix}" with
+// ParkerPrefixValue(). An empty ParkerPool renders empty, and that is the
+// documented opt-out, because it turns parker pool assignment off rather than
+// deriving a name. A template that carries no token comes back unchanged, and
+// the spec default of "{prefix}-parker" renders "bosh-parker" out of the box.
+//
+// We render with one strings.ReplaceAll and nothing after it, and the asymmetry
+// with the workload renderer looks like an omission, so here is why it is not.
+// renderPoolTemplateTokens in internal/cpi/handlers finishes by collapsing
+// separator runs and trimming hyphens from both ends. Its inputs are director,
+// deployment, and instance-group names that nothing validates, so it has to
+// clean up after them. Our input is a single prefix that validateParkerPrefix
+// has already checked when the operator set it, and that ParkerPrefixValue has
+// already sanitized when the chain fell through to vm_prefix. Nothing is left
+// to clean, and a second pass would only make the two renderers disagree.
+//
+// Like ParkerPrefixValue, this resolves per request rather than in
+// ApplyDefaults, so a per-entry pve_vm_prefix or pve_parker_prefix override
+// moves the pool along with the name.
+func (c *CPIConfig) ParkerPoolValue() string {
+	if c == nil || c.ParkerPool == "" {
+		return ""
+	}
+	return strings.ReplaceAll(c.ParkerPool, parkerPoolPrefixToken, c.ParkerPrefixValue())
+}
+
 // RebootModeValue returns the effective reboot mode, defaulting to "soft" when
 // the field is empty (e.g. config constructed manually without ApplyDefaults).
 func (c *CPIConfig) RebootModeValue() string {
@@ -3872,9 +4060,10 @@ func (c *CPIConfig) Validate() error {
 
 // ValidateWithLogger is identical to Validate, but accepts a logger parameter
 // for any warning entries. A nil logger uses the default stderr fallback.
-// The logger parameter is retained for API compatibility; no registry warnings
-// are emitted since the registry was removed.
-func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
+// warnVMPrefixSanitized is the one warning it emits today: a pve.vm_prefix that
+// the parker prefix chain had to rewrite is a fact an operator wants to see,
+// and it is not an error, because that property predates this validation.
+func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 	var errs []string
 	c.validateRequiredFields(&errs)
 	c.validateAuth(&errs)
@@ -3898,6 +4087,9 @@ func (c *CPIConfig) ValidateWithLogger(_ *log.Logger) error {
 	c.validateVMPool(&errs)
 	c.validateStemcellTemplatePool(&errs)
 	c.validateVMPoolTemplate(&errs)
+	c.validateParkerPrefix(&errs)
+	c.validateParkerPool(&errs)
+	c.warnVMPrefixSanitized(logger)
 	// Cross-field strict checks. No raw bytes needed; struct fields are read
 	// directly. Appended after all other validators so existing error order is
 	// preserved and strict errors group at the end.
@@ -5292,6 +5484,177 @@ func (c *CPIConfig) validateVMPoolTemplate(errs *[]string) {
 			))
 		}
 	}
+}
+
+// parkerPrefixRe matches the intersection of the two charsets a parker prefix
+// has to satisfy, because the value lands in two namespaces at once. It becomes
+// part of a PVE VM name, which is a DNS label of [A-Za-z0-9-] with alphanumeric
+// ends (see sanitizeVMName in internal/cpi/handlers/tags.go), and it becomes
+// part of a PVE poolid, whose charset also allows '.' and '_' (see
+// poolIDCharsetRe). The narrower of the two wins.
+//
+// The optional-group spelling is deliberate. Written as
+// `^[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9]$` the pattern would demand two
+// characters and reject a perfectly good one-character prefix.
+var parkerPrefixRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
+
+// validateParkerPrefix rejects a ParkerPrefix that cannot render a legal parker
+// VM name or a legal parker pool id:
+//   - a '/', which can only ever produce a nested pool id the CPI refuses to
+//     create. Checked first, since a '/' fails the charset rule too and we
+//     would rather not report the same string twice.
+//   - a byte outside the DNS label charset, or a hyphen on either end.
+//   - the cluster-lock sentinel namespace ("bosh-lock-" prefix, see
+//     internal/pve/cluster_lock.go), which a dynamically-named sentinel pool
+//     could then collide with, corrupting the mutex.
+//   - more than maxParkerPrefixLength bytes, which would overflow PVE's own
+//     63-byte VM name cap once the "-parker-<vmid>" suffix is appended.
+//
+// Skipped entirely when ParkerPrefix is empty (validate-only-when-set). The
+// strict rule belongs to this property alone. VMPrefix, which the resolution
+// chain falls back to, has never had a validator anywhere in this file, and
+// tightening it now would be a breaking change. ApplyContextOverrides re-runs
+// Validate on the effective config, so a deployment carrying pve.vm_prefix
+// "my_prefix" would refuse to boot after the upgrade, and a per-entry
+// pve_vm_prefix of the same shape would fail every request routed to that
+// entry, create_vm included. ParkerPrefixValue sanitizes that rung instead, and
+// ValidateWithLogger warns about the rewrite.
+func (c *CPIConfig) validateParkerPrefix(errs *[]string) {
+	if c.ParkerPrefix == "" {
+		return
+	}
+	switch {
+	case strings.Contains(c.ParkerPrefix, "/"):
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_prefix must not contain '/' (got %q); the prefix names both parker VMs and their pool, "+
+				"and neither accepts a nested id",
+			c.ParkerPrefix,
+		))
+	case !parkerPrefixRe.MatchString(c.ParkerPrefix):
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_prefix must be a DNS label (letters, digits, and '-', beginning and ending with a letter "+
+				"or a digit), got %q; the prefix has to satisfy both the PVE VM name charset and the PVE "+
+				"poolid charset, so it takes the narrower of the two",
+			c.ParkerPrefix,
+		))
+	}
+	if strings.HasPrefix(c.ParkerPrefix, clusterLockPoolPrefix) {
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_prefix must not start with %q (reserved for cluster-lock sentinel pools), got %q",
+			clusterLockPoolPrefix, c.ParkerPrefix,
+		))
+	}
+	if len(c.ParkerPrefix) > maxParkerPrefixLength {
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_prefix must be at most %d bytes (got %d in %q); PVE caps a VM name at %d bytes and a "+
+				"parker name adds \"-parker-\" plus up to nine VMID digits on top of the prefix",
+			maxParkerPrefixLength, len(c.ParkerPrefix), c.ParkerPrefix, maxPVEVMNameLength,
+		))
+	}
+}
+
+// validateParkerPool rejects a ParkerPool that names an unknown variable, or
+// whose rendering collides with a pool the CPI already owns, or cannot be a
+// valid flat PVE poolid.
+//
+// It validates ParkerPoolValue(), the rendered pool, rather than the raw field.
+// Validating the raw field would return early on the spec default, which is the
+// case every deployment actually runs, so a vm_pool named "bosh-parker" would
+// collide with the derived parker pool and nothing would say so.
+//
+// The empty early-return comes first, before anything else. An operator who
+// opts out of pools entirely leaves parker_pool and vm_pool both empty, and an
+// equality check that ran first would report those two empty strings as a
+// collision with each other.
+//
+// The token scan comes next, and it returns as soon as it finds an unknown
+// variable. An unsubstituted "{director}" survives into the rendered name and
+// then fails the poolid charset rule, which would point the operator at a
+// charset they did not knowingly violate. Once we know the render is
+// meaningless, judging its charset or its collisions only adds noise.
+//
+// The rest follows validateVMPool's own order, which is equality first and then
+// the shape checks, so a config that is both malformed and colliding reports
+// both. Both equality checks live here and nowhere else, per the single-owner
+// convention validateStemcellTemplatePool states, which is that the rule lives
+// in exactly one validator, so a collision is reported once regardless of which
+// field a config sets first. The parker pool is the newest of the three, so it
+// owns both of its comparisons and neither of the other two validators repeats
+// them. The comparisons earn their keep beyond tidiness, because a parker pool
+// colliding with either one would defeat the by-name refusals that keep the
+// empty-pool reaper away from them.
+func (c *CPIConfig) validateParkerPool(errs *[]string) {
+	rendered := c.ParkerPoolValue()
+	if rendered == "" {
+		return
+	}
+	unknownToken := false
+	for _, tok := range poolTemplateTokenRe.FindAllString(c.ParkerPool, -1) {
+		if tok != parkerPoolPrefixToken {
+			unknownToken = true
+			*errs = append(*errs, fmt.Sprintf(
+				"parker_pool contains unknown variable %q in %q; the only allowed variable is %q",
+				tok, c.ParkerPool, parkerPoolPrefixToken,
+			))
+		}
+	}
+	if unknownToken {
+		return
+	}
+	if rendered == c.VMPool {
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_pool must not equal vm_pool (both resolve to %q); parker VMs need a pool of their own so "+
+				"the empty-pool reaper can tell the two apart by name",
+			rendered,
+		))
+	}
+	if rendered == c.StemcellTemplatePool {
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_pool must not equal stemcell_template_pool (both resolve to %q); parker VMs need a pool of "+
+				"their own so the empty-pool reaper can tell the two apart by name",
+			rendered,
+		))
+	}
+	validateFlatPoolName("parker_pool", rendered, errs)
+	if strings.HasPrefix(rendered, clusterLockPoolPrefix) {
+		*errs = append(*errs, fmt.Sprintf(
+			"parker_pool must not start with %q (reserved for cluster-lock sentinel pools), got %q",
+			clusterLockPoolPrefix, rendered,
+		))
+	}
+}
+
+// warnVMPrefixSanitized logs a warning when the parker prefix chain fell
+// through to pve.vm_prefix and ParkerPrefixValue had to rewrite that value to
+// make it a legal parker name. The warning names the property and shows both
+// forms, so an operator can see what their parker VMs and their parker pool
+// will actually be called and can set pve.parker_prefix if they want something
+// else. It stays a warning rather than an error because pve.vm_prefix predates
+// this validation and a deployment that boots today has to keep booting.
+//
+// A nil logger falls back to a stderr logger, matching ValidateWithLogger's
+// documented contract and warnUnknownFields' own treatment of the same problem.
+func (c *CPIConfig) warnVMPrefixSanitized(logger *log.Logger) {
+	if c == nil || c.ParkerPrefix != "" || c.VMPrefix == "" {
+		return
+	}
+	resolved := c.ParkerPrefixValue()
+	if resolved == c.VMPrefix {
+		return
+	}
+	if logger == nil {
+		fallback, err := log.NewLogger("warn", os.Stderr)
+		if err != nil {
+			return
+		}
+		logger = fallback
+	}
+	logger.Warn("config: pve.vm_prefix is not a legal parker name prefix, so the CPI rewrote it for parker VM "+
+		"names and for the parker pool; set pve.parker_prefix to name parkers directly and leave "+
+		"pve.vm_prefix alone",
+		log.String("vm_prefix", c.VMPrefix),
+		log.String("parker_prefix", resolved),
+	)
 }
 
 // validateStrictCrossFields checks cross-field consistency rules that are
