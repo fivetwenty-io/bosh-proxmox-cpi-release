@@ -20,9 +20,9 @@
 // ParkerTag ("bosh-parker") marks every parker VM. When DirectorID is set a
 // second tag "director--<sanitized-id>" is appended (mirrors stemcell provenance
 // convention from create_stemcell.go). A third tag, "vm-prefix--<resolved
-// prefix>", always follows: it carries "bosh" when Prefix is empty, the same
+// prefix>", always follows. It carries "bosh" when Prefix is empty, the same
 // default parkerVMName renders into the VM's name, so the tag can never name
-// a different prefix than the VM actually carries. Pool adds no tag: the
+// a different prefix than the VM actually carries. Pool adds no tag. The
 // pool sweep in PlaceParkersInPool (Section 3.8) is the only code that reads
 // Pool, so nothing here wires it into VM creation.
 //
@@ -665,7 +665,7 @@ func parkerVMName(prefix string, vmid int) string {
 // stemcell provenance pattern), and "vm-prefix--<resolved prefix>" is
 // appended last, carrying "bosh" when Prefix is empty.
 //
-// That order is load-bearing for a second reason beyond readability: the
+// That order is load-bearing for a second reason beyond readability. The
 // managed guard in handlers reads a parker's tags back and compares them
 // against what we sent, and PVE stores tags alphabetically under its default
 // tag style, so the order we send has to be the order PVE keeps. It is,
@@ -737,7 +737,7 @@ func parkerPrefixTag(prefix string) string {
 // carry none, and refusing them would strand their disks.
 //
 // This scans "director--" tokens only. A "vm-prefix--" tag is deliberately
-// inert here: a prefix is a display convenience for VM names, not an
+// inert here. A prefix is a display convenience for VM names, not an
 // ownership boundary, and making adoption prefix-sensitive would be a
 // behavior change nobody agreed to.
 func parkerBelongsToDirector(tagStr, directorID string) bool {

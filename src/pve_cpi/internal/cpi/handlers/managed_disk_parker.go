@@ -204,7 +204,7 @@ func managedDiskScalar(v any) string {
 
 // managedDiskFieldMatches reports whether a readback value for key matches
 // the value the CPI sent. Every key compares as an exact scalar string
-// except jsonKeyTags ("tags"), which is order-insensitive: PVE stores tags
+// except jsonKeyTags ("tags"), which is order-insensitive. PVE stores tags
 // alphabetically under its default tag style, and nothing in this repository
 // records that as guaranteed behavior, so the tags side of the comparison
 // splits both strings on ";", sorts the tokens, and rejoins before

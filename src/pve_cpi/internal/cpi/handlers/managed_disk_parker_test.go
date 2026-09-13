@@ -3,7 +3,7 @@ package handlers
 import "testing"
 
 // TestManagedDiskFieldMatches_TagsOrderInsensitive covers the readback
-// comparison's tags special case: PVE is free to reorder a tag string it
+// comparison's tags special case. PVE is free to reorder a tag string it
 // stores, so a reordered readback must still match, while a readback that
 // drops or adds a tag must still mismatch.
 func TestManagedDiskFieldMatches_TagsOrderInsensitive(t *testing.T) {
@@ -52,7 +52,7 @@ func TestManagedDiskFieldMatches_TagsOrderInsensitive(t *testing.T) {
 }
 
 // TestManagedDiskFieldMatches_NonTagsKeyIsExact covers that every key other
-// than tags keeps the prior exact-scalar comparison: reordering is not
+// than tags keeps the prior exact-scalar comparison. Reordering is not
 // tolerated there, because a reordered non-tag value is a real difference.
 func TestManagedDiskFieldMatches_NonTagsKeyIsExact(t *testing.T) {
 	for _, tc := range []struct {
