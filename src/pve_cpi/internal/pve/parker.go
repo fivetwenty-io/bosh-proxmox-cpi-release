@@ -19,10 +19,12 @@
 //
 // ParkerTag ("bosh-parker") marks every parker VM. When DirectorID is set a
 // second tag "director--<sanitized-id>" is appended (mirrors stemcell provenance
-// convention from create_stemcell.go). Prefix changes only the parker VM's
-// name, not its tags, and Pool adds no tag either: the pool sweep in
-// PlaceParkersInPool (Section 3.8) is the only code that reads Pool, so
-// nothing here wires it into VM creation.
+// convention from create_stemcell.go). A third tag, "vm-prefix--<resolved
+// prefix>", always follows: it carries "bosh" when Prefix is empty, the same
+// default parkerVMName renders into the VM's name, so the tag can never name
+// a different prefix than the VM actually carries. Pool adds no tag: the
+// pool sweep in PlaceParkersInPool (Section 3.8) is the only code that reads
+// Pool, so nothing here wires it into VM creation.
 //
 // # Slot capacity
 //
@@ -635,6 +637,17 @@ func sanitizeParkerTagValue(v string) string {
 	return parkerTagSanitizeRe.ReplaceAllString(v, "")
 }
 
+// resolveParkerPrefix applies the "bosh" default a caller gets when Prefix is
+// empty. parkerVMName and buildParkerTags both call this rather than each
+// resolving the fallback on its own, so a parker's name and its
+// "vm-prefix--" tag can never disagree about what the resolved prefix is.
+func resolveParkerPrefix(prefix string) string {
+	if prefix == "" {
+		return "bosh"
+	}
+	return prefix
+}
+
 // parkerVMName returns the canonical name for a parker VM with the given
 // prefix and VMID, rendering "<prefix>-parker-<vmid>". An empty prefix
 // resolves to "bosh" here, so every caller gets the byte-identical default
@@ -642,21 +655,30 @@ func sanitizeParkerTagValue(v string) string {
 // helper rather than forking the format string, so a mover's name carries
 // the same prefix as an ordinary parker.
 func parkerVMName(prefix string, vmid int) string {
-	if prefix == "" {
-		prefix = "bosh"
-	}
-	return fmt.Sprintf("%s-parker-%d", prefix, vmid)
+	return fmt.Sprintf("%s-parker-%d", resolveParkerPrefix(prefix), vmid)
 }
 
 // buildParkerTags returns the semicolon-joined tag string for a new parker VM.
 // CpiOwnershipTag ("bosh-cpi") is always first so operators can filter all
 // CPI-managed guests by a single tag. ParkerTag follows; "director--<id>" is
 // appended when DirectorID is set and sanitizes to a non-empty value (mirrors
-// stemcell provenance pattern).
+// stemcell provenance pattern), and "vm-prefix--<resolved prefix>" is
+// appended last, carrying "bosh" when Prefix is empty.
+//
+// That order is load-bearing for a second reason beyond readability: the
+// managed guard in handlers reads a parker's tags back and compares them
+// against what we sent, and PVE stores tags alphabetically under its default
+// tag style, so the order we send has to be the order PVE keeps. It is,
+// because "vm-prefix--" sorts after "director--". The readback comparison
+// also sorts both sides before comparing, so this ordering is insurance, not
+// the only thing standing between a create and a false readback mismatch.
 func buildParkerTags(cfg ParkerConfig) string {
 	tags := []string{CpiOwnershipTag, ParkerTag}
 	if dt := parkerDirectorTag(cfg.DirectorID); dt != "" {
 		tags = append(tags, dt)
+	}
+	if pt := parkerPrefixTag(resolveParkerPrefix(cfg.Prefix)); pt != "" {
+		tags = append(tags, pt)
 	}
 	return strings.Join(tags, ";")
 }
@@ -678,6 +700,27 @@ func parkerDirectorTag(directorID string) string {
 	return parkerDirectorTagPrefix + sd
 }
 
+// parkerPrefixTagPrefix marks the tag that carries a parker or mover VM's
+// resolved name prefix.
+const parkerPrefixTagPrefix = "vm-prefix--"
+
+// parkerPrefixTag returns the "vm-prefix--<prefix>" tag for prefix, or "" when
+// prefix is empty or nothing survives sanitizing. Mirrors parkerDirectorTag's
+// shape. Callers pass the already-resolved prefix (resolveParkerPrefix), not
+// the raw, possibly empty, ParkerConfig field, so an empty Prefix still
+// produces "vm-prefix--bosh" through the caller's resolution rather than
+// being silently omitted here.
+func parkerPrefixTag(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	sp := sanitizeParkerTagValue(prefix)
+	if sp == "" {
+		return ""
+	}
+	return parkerPrefixTagPrefix + sp
+}
+
 // parkerBelongsToDirector reports whether a parker carrying tagStr may be
 // adopted by the director identified by directorID.
 //
@@ -692,6 +735,11 @@ func parkerDirectorTag(directorID string) string {
 // A parker with no attribution tag is adoptable by anyone. Parkers created
 // before the tag existed, or by a configuration with no director UUID to hand,
 // carry none, and refusing them would strand their disks.
+//
+// This scans "director--" tokens only. A "vm-prefix--" tag is deliberately
+// inert here: a prefix is a display convenience for VM names, not an
+// ownership boundary, and making adoption prefix-sensitive would be a
+// behavior change nobody agreed to.
 func parkerBelongsToDirector(tagStr, directorID string) bool {
 	want := parkerDirectorTag(directorID)
 	if want == "" {
@@ -904,7 +952,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 //   - name: "<prefix>-parker-<vmid>" (prefix defaults to "bosh")
 //   - onboot: 0 (never auto-started)
 //   - protection: 1 (prevent accidental deletion)
-//   - tags: "bosh-parker[;director--<id>]"
+//   - tags: "bosh-parker[;director--<id>];vm-prefix--<resolved prefix>"
 //   - scsihw: "virtio-scsi-pci"
 //   - memory: 16 MiB
 //   - cores: 1

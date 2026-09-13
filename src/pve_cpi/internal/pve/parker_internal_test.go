@@ -225,8 +225,9 @@ func TestBuildParkerTags_NoDirectorID(t *testing.T) {
 	t.Parallel()
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999}
 	got := buildParkerTags(cfg)
-	// CpiOwnershipTag is always first; ParkerTag follows.
-	want := CpiOwnershipTag + ";bosh-parker"
+	// CpiOwnershipTag is always first; ParkerTag follows. No director id, but
+	// the prefix tag still lands last, carrying the "bosh" default.
+	want := CpiOwnershipTag + ";bosh-parker;vm-prefix--bosh"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -236,7 +237,7 @@ func TestBuildParkerTags_WithDirectorID(t *testing.T) {
 	t.Parallel()
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my-director"}
 	got := buildParkerTags(cfg)
-	want := CpiOwnershipTag + ";bosh-parker;director--my-director"
+	want := CpiOwnershipTag + ";bosh-parker;director--my-director;vm-prefix--bosh"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -247,7 +248,7 @@ func TestBuildParkerTags_DirectorIDWithSpecialChars(t *testing.T) {
 	// Special chars stripped by sanitizeParkerTagValue.
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my director!"}
 	got := buildParkerTags(cfg)
-	want := CpiOwnershipTag + ";bosh-parker;director--mydirector"
+	want := CpiOwnershipTag + ";bosh-parker;director--mydirector;vm-prefix--bosh"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -258,10 +259,54 @@ func TestBuildParkerTags_DirectorIDBecomesEmpty(t *testing.T) {
 	// DirectorID of only special chars sanitizes to ""; director tag omitted.
 	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "!!!"}
 	got := buildParkerTags(cfg)
-	// CpiOwnershipTag still present; director tag omitted.
-	want := CpiOwnershipTag + ";bosh-parker"
+	// CpiOwnershipTag still present; director tag omitted, prefix tag still last.
+	want := CpiOwnershipTag + ";bosh-parker;vm-prefix--bosh"
 	if got != want {
 		t.Errorf("want %q (director tag omitted), got %q", want, got)
+	}
+}
+
+func TestBuildParkerTags_CustomPrefix(t *testing.T) {
+	t.Parallel()
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my-director", Prefix: "cpi"}
+	got := buildParkerTags(cfg)
+	want := CpiOwnershipTag + ";bosh-parker;director--my-director;vm-prefix--cpi"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestBuildParkerTags_PrefixNeedsSanitizing(t *testing.T) {
+	t.Parallel()
+	// Special chars stripped by sanitizeParkerTagValue, same as DirectorID.
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, Prefix: "my prefix!"}
+	got := buildParkerTags(cfg)
+	want := CpiOwnershipTag + ";bosh-parker;vm-prefix--myprefix"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestBuildParkerTags_PrefixBecomesEmpty(t *testing.T) {
+	t.Parallel()
+	// A Prefix of only special chars sanitizes to ""; unlike an unset Prefix
+	// (which resolves to "bosh"), a non-empty Prefix that sanitizes away
+	// omits the vm-prefix-- tag entirely rather than falling back to "bosh".
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, Prefix: "!!!"}
+	got := buildParkerTags(cfg)
+	want := CpiOwnershipTag + ";bosh-parker"
+	if got != want {
+		t.Errorf("want %q (prefix tag omitted), got %q", want, got)
+	}
+}
+
+func TestBuildMoverTags_KeepsDiskMoverTagLastAfterPrefixTag(t *testing.T) {
+	t.Parallel()
+	cfg := ParkerConfig{VMIDRangeStart: 90000, VMIDRangeEnd: 90999, DirectorID: "my-director", Prefix: "acme"}
+	got := buildMoverTags(cfg)
+	want := CpiOwnershipTag + ";bosh-parker;director--my-director;vm-prefix--acme;" + DiskMoverTag
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
