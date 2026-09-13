@@ -1482,10 +1482,10 @@ properties:
       pve.parker_prefix or pve.vm_prefix says otherwise. Each parker VM holds
       up to 31 parked disk volumes in scsi0-30 slots. The band resolves under
       every detached_disk_strategy, at the job level and in every cpi-config
-      entry alike: under "parked" (the
-      default) it is where parker VMs are allocated, and under "free" it is
-      read-only — it lets the CPI recognize disks parked earlier and unpark
-      them on their next attach_disk or delete_disk instead of refusing them.
+      entry alike. Under "parked" (the default) it is where parker VMs are
+      allocated, and under "free" it is read-only, which lets the CPI
+      recognize disks parked earlier and unpark them on their next
+      attach_disk or delete_disk instead of refusing them.
       An unset (0) bound resolves independently of the other, so a cpi-config
       entry may move one bound and leave the other at 0. The resolved partner
       is the built-in bound when that leaves a window no wider than
@@ -1515,10 +1515,11 @@ properties:
     description: |
       Optional prefix for parker VM names ("<prefix>-parker-<vmid>") and,
       through pve.parker_pool's "{prefix}" token, for the default parker
-      pool name. Resolves in order: this property when set, else
-      pve.vm_prefix when that is set, else the literal "bosh". The default
-      "" is that sentinel, not "no prefix", which means "fall through the
-      chain", so a deployment that leaves both properties unset still gets
+      pool name. The prefix resolves from this property when it is set, from
+      pve.vm_prefix when this property is unset, and from the literal "bosh"
+      when neither is set. The default "" is the sentinel that starts that
+      fall-through rather than a request for no prefix at all, so a
+      deployment that leaves both properties unset still gets
       bosh-parker-<vmid> parkers in a bosh-parker pool, byte-identical to
       every release before this property existed.
 
@@ -1542,13 +1543,14 @@ properties:
   pve.parker_pool:
     description: |
       PVE resource pool name for parker VMs (see pve.detached_disk_strategy's
-      "parked" strategy). Supports exactly one variable, "{prefix}",
-      substituted with the resolved pve.parker_prefix. This "{prefix}" is
-      the parker prefix, not the "{prefix}" of pve.vm_pool_template, which
-      substitutes pve.vm_prefix instead, so the same token spells two
-      different values depending on which property it appears in. Any
-      other flat pool name may be given literally in place of the
-      template, subject to the same PVE poolid charset rules as pve.vm_pool.
+      "parked" strategy). The template supports exactly one variable,
+      "{prefix}", which is substituted with the resolved pve.parker_prefix.
+      This "{prefix}" is the parker prefix, not the "{prefix}" of
+      pve.vm_pool_template, which substitutes pve.vm_prefix instead, so the
+      same token spells two different values depending on which property it
+      appears in. Any other flat pool name may be given literally in place
+      of the template, subject to the same PVE poolid charset rules as
+      pve.vm_pool.
 
       The default "{prefix}-parker" renders to "bosh-parker" when the
       parker prefix chain resolves to its own default, matching the
@@ -1560,9 +1562,10 @@ properties:
       empty, an explicit "" reaches the CPI as a genuine empty string
       distinct from the default template.
 
-      The rendered value must not equal pve.vm_pool, pve.stemcell_template_pool,
-      or a workload pool resolved from call-level cloud_properties.pool,
-      the vm_type profile's cloud_properties.pool, or pve.vm_pool_template.
+      The rendered value must not equal pve.vm_pool or
+      pve.stemcell_template_pool, and it must not equal a workload pool
+      resolved from call-level cloud_properties.pool, from the vm_type
+      profile's cloud_properties.pool, or from pve.vm_pool_template.
       create_vm refuses that collision by name, because a workload VM
       sharing the parker pool would keep the pool alive forever instead of
       letting it get reaped with the deployment that created it.
