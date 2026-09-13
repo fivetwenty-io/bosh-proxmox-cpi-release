@@ -581,7 +581,7 @@ func TestApplyContextOverrides_UnknownKeysAlongsideKnown_NoError(t *testing.T) {
 }
 
 // TestApplyContextOverrides_ParkerPrefix_Applies proves pve_parker_prefix is
-// a registered override: the context value lands on the effective config's
+// a registered override. The context value lands on the effective config's
 // ParkerPrefix, and the job-level base is left untouched.
 func TestApplyContextOverrides_ParkerPrefix_Applies(t *testing.T) {
 	t.Parallel()
@@ -606,7 +606,7 @@ func TestApplyContextOverrides_ParkerPrefix_Applies(t *testing.T) {
 }
 
 // TestApplyContextOverrides_ParkerPool_Applies proves pve_parker_pool is a
-// registered override: the context value lands on the effective config's
+// registered override. The context value lands on the effective config's
 // ParkerPool, and the job-level base is left untouched.
 func TestApplyContextOverrides_ParkerPool_Applies(t *testing.T) {
 	t.Parallel()
@@ -631,9 +631,9 @@ func TestApplyContextOverrides_ParkerPool_Applies(t *testing.T) {
 }
 
 // TestApplyContextOverrides_ParkerPrefix_MovesParkerPoolValue is the point of
-// the accessor design ParkerPoolValue documents: because the pool renders
-// per request from the effective config rather than being frozen at
-// ApplyDefaults time, a per-entry pve_parker_prefix override moves the
+// the accessor design ParkerPoolValue documents. The pool renders per
+// request from the effective config rather than being frozen at
+// ApplyDefaults time, so a per-entry pve_parker_prefix override moves the
 // rendered parker pool name along with it, not just the raw ParkerPrefix
 // field.
 func TestApplyContextOverrides_ParkerPrefix_MovesParkerPoolValue(t *testing.T) {

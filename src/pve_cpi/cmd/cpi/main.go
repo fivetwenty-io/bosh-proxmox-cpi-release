@@ -262,13 +262,13 @@ func run() int {
 // requests the way a denied pve.vm_pool -- which every create_vm needs --
 // correctly does. This also keeps the probe honest for an operator who has
 // deliberately opted out of pools by emptying pve.vm_pool,
-// pve.vm_pool_template, and pve.stemcell_template_pool: pve.parker_pool
+// pve.vm_pool_template, and pve.stemcell_template_pool. pve.parker_pool
 // carries a non-empty default of its own, and the only thing that should be
 // able to newly fail their boot is enabling the parked strategy, not merely
 // having a pool preflight in the binary.
 //
 // A per-entry pve_parker_pool or pve_parker_prefix override (see
-// internal/config's context-override registry) is invisible here: this
+// internal/config's context-override registry) is invisible here. This
 // preflight only ever sees the process-wide job config, the same as every
 // other per-entry override.
 //
@@ -316,7 +316,7 @@ func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.
 		return nil
 	}
 
-	// failFast marks pve.vm_pool and pve.stemcell_template_pool: every
+	// failFast marks pve.vm_pool and pve.stemcell_template_pool. Every
 	// create_vm/create_stemcell needs them, so a permission denial on either
 	// one fails boot. The parker pool is best-effort (see the doc comment
 	// above), so it carries failFast=false and only ever warns.

@@ -74,7 +74,7 @@ func TestPreflightPoolAccess_SkipsWhenBothPoolsEmpty(t *testing.T) {
 }
 
 // TestPreflightPoolAccess_OnlyParkerPoolSet_NotSkipped is the all-empty
-// guard's other half: pve.vm_pool and pve.stemcell_template_pool are both
+// guard's other half. pve.vm_pool and pve.stemcell_template_pool are both
 // empty, so the two-pool guard alone would skip the probe entirely, but the
 // parked strategy is active and pve.parker_pool resolves to a name, so the
 // preflight must still run one probe rather than returning early.
@@ -134,7 +134,7 @@ func TestPreflightPoolAccess_VisiblePool_NoError(t *testing.T) {
 
 // TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes is
 // TestPreflightPoolAccess_VisiblePool_NoError's sibling with the parked
-// strategy active and a distinct pve.parker_pool set: all three pools are
+// strategy active and a distinct pve.parker_pool set. All three pools are
 // visible, so the preflight probes all three and returns no error.
 func TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes(t *testing.T) {
 	t.Parallel()
@@ -190,7 +190,7 @@ func TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// One entry per probed pool, including the missing parker pool: it gets
+	// One entry per probed pool, including the missing parker pool. It gets
 	// its own quiet Debug line rather than being silently skipped or logged
 	// at a level that reads as a fault.
 	entries := obs.All()
@@ -222,7 +222,7 @@ func TestPreflightPoolAccess_DuplicatePoolNames_ProbedOnce(t *testing.T) {
 }
 
 // TestPreflightPoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce extends the
-// dedup coverage to the parker pool: an operator who sets pve.parker_pool to
+// dedup coverage to the parker pool. An operator who sets pve.parker_pool to
 // the same name as pve.vm_pool gets one probe, not two, and that probe keeps
 // the fail-fast classification pve.vm_pool carries (the name is already
 // represented in the deduped list by the time the parker candidate is
@@ -264,8 +264,8 @@ func TestPreflightPoolAccess_PermissionDenied_FailsFastNamingGrant(t *testing.T)
 	}
 }
 
-// TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails is Task 3.4's
-// deliberate exception to the fail-fast rule above: a permission denial on
+// TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails covers the
+// deliberate exception to the fail-fast rule above. A permission denial on
 // the parker pool alone must not fail boot. Parker-pool assignment is a
 // best-effort, cosmetic sweep, unlike pve.vm_pool, so treating this the same
 // as a workload-pool denial would stop the CPI from booting over something
@@ -291,7 +291,7 @@ func TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails(t *testing.T) {
 // TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn pins the log level and
 // content for a denied parker pool, the same way
 // TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug pins Debug for a
-// not-yet-existing pool: an operator must be able to tell this apart from
+// not-yet-existing pool. An operator must be able to tell this apart from
 // the fatal pve.vm_pool/pve.stemcell_template_pool denial, which returns an
 // error instead of logging.
 func TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
@@ -320,11 +320,12 @@ func TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed is
-// the gate Task 3.4 adds: when pve.detached_disk_strategy is "free", no
-// parker VM is ever created, so pve.parker_pool -- even though it resolves
-// to a non-empty name -- must not be probed. A boot-time failure for a pool
-// the CPI will never touch would contradict the whole "free" opt-out.
+// TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed
+// covers the strategy gate on the parker-pool probe. When
+// pve.detached_disk_strategy is "free", no parker VM is ever created, so
+// pve.parker_pool, even though it resolves to a non-empty name, must not be
+// probed. A boot-time failure for a pool the CPI will never touch would
+// contradict the whole "free" opt-out.
 func TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed(t *testing.T) {
 	t.Parallel()
 	fake := &fakePreflightPoolService{}
@@ -345,7 +346,7 @@ func TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed(t *tes
 // pool out (pve.parker_pool: ""), the documented ParkerPoolValue() opt-out.
 // vm_pool and stemcell_template_pool are also empty here, so this doubles as
 // the "an operator who emptied every pool property gets no new probe"
-// regression the Task 3.4 gate exists to protect.
+// regression the parked-strategy gate exists to protect.
 func TestPreflightPoolAccess_ParkerPoolOptedOut_NotProbed(t *testing.T) {
 	t.Parallel()
 	fake := &fakePreflightPoolService{}
