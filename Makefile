@@ -159,7 +159,7 @@ certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would 
 ##@ Code Quality
 
 .PHONY: hooks
-hooks: ## Point git at the repo-managed hooks (pre-commit gofmt gate, pre-push make check)
+hooks: ## Point git at the repo-managed hooks (pre-commit and pre-merge-commit gates, pre-push make check)
 	@git config core.hooksPath .githooks
 	@echo "$(GREEN)✓ git hooks installed (core.hooksPath=.githooks)$(RESET)"
 
@@ -174,6 +174,12 @@ artifacts-check: ## Fail if the tracked tree holds AI-agent working state or for
 	@echo "$(GREEN)Checking the tracked tree for agent artifacts...$(RESET)"
 	@sh scripts/_tracked_artifacts_check.sh
 	@echo "$(GREEN)✓ tracked tree clean$(RESET)"
+
+.PHONY: linear-check
+linear-check: ## Fail if a merge commit is reachable from HEAD (main stays linear)
+	@echo "$(GREEN)Checking the history for merge commits...$(RESET)"
+	@sh scripts/_linear_history_check.sh
+	@echo "$(GREEN)✓ history is linear$(RESET)"
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source file is not gofmt-formatted
@@ -232,7 +238,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
 .PHONY: check
-check: artifacts-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run artifact, formatting, vet, blob, template, Python, analysis, coverage, and race checks
+check: artifacts-check linear-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run artifact, formatting, vet, blob, template, Python, analysis, coverage, and race checks
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

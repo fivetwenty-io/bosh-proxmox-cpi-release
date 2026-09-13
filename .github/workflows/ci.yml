@@ -113,3 +113,33 @@ jobs:
 
       - name: Run checks
         run: make check REQUIRE_TOOLS=1
+
+  linear-history:
+    name: Linear history
+    runs-on: ${{ inputs.runner || 'self-hosted' }}
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    container:
+      # Same digest-pinned image as the check job; the runner host has no git.
+      image: golang:1.27@sha256:512690a5660563b57d37ecc31129e7f136e831db2aed24a1dbeb8ad7380dc0fa
+
+    steps:
+      - name: Checkout the commit graph
+        uses: actions/checkout@v7
+        with:
+          # A pull_request run checks out a synthetic merge of the branch
+          # into main, which is itself a merge commit. Audit the branch head.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The check walks every reachable commit, so it needs the whole
+          # graph; the tree:0 filter leaves out trees and blobs, and the
+          # sparse checkout materializes only the script itself.
+          fetch-depth: 0
+          filter: tree:0
+          sparse-checkout: scripts/_linear_history_check.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Refuse merge commits
+        run: sh scripts/_linear_history_check.sh

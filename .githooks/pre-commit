@@ -1,8 +1,16 @@
 #!/bin/sh
-# Fast pre-commit gate: refuse AI-agent working state and unformatted Go files.
+# Fast pre-commit gate: refuse merge commits, AI-agent working state, and unformatted Go files.
 # Install with `make hooks`. Bypass a single commit with `git commit --no-verify`.
 
 set -e
+
+# A merge that stopped on conflicts is finished with a plain commit, which
+# skips the pre-merge-commit hook; refuse it here so main stays linear.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    echo "pre-commit: this commit would be a merge commit; the repository keeps a linear history" >&2
+    echo "pre-commit: run 'git merge --abort' and use 'git rebase main' instead" >&2
+    exit 1
+fi
 
 # Agent scratch, work-preservation bundles, forced-in ignored paths, and
 # oversized blobs never belong in a commit (scripts/_tracked_artifacts_check.sh).

@@ -102,6 +102,12 @@ The harness needs a live Proxmox VE cluster and will create and destroy real VMs
 
 Keep each pull request focused on one change. A small, focused pull request is easier to review and lands faster than a large one that mixes concerns.
 
+### Keeping the history linear
+
+The history of `main` is a straight line, and we keep it that way on purpose. Every change lands as a rebase or a squash, never as a merge commit, so `git log`, `git bisect`, and `git blame` all read cleanly. GitHub refuses a merge commit on `main` no matter who pushes it. On a pull request, the merge button offers only "Rebase and merge" and "Squash and merge".
+
+When a branch falls behind `main`, we bring it up to date with `git rebase main` rather than merging `main` into it. A branch that carries a merge commit fails the "Linear history" CI check, and the same check runs locally as part of `make check`. The repo-managed hooks from `make hooks` also refuse a merge commit when we run `git merge`.
+
 ### Commit messages
 
 Write commit messages that describe the code change, not the process that produced it. This repository follows the Conventional Commits style: a type prefix such as `fix:`, `feat:`, `docs:`, or `ci:`, followed by a short summary in the imperative mood. Look at `git log` for examples.

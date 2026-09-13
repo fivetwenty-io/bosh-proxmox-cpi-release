@@ -1,0 +1,9 @@
+#!/bin/sh
+# Refuse merge commits. This repository keeps a linear history: bring a
+# branch up to date with `git rebase main` and land it on GitHub with a
+# rebase or squash merge. Fast-forward merges create no commit and are
+# unaffected. Install with `make hooks`. Bypass once with git merge --no-verify.
+
+echo "pre-merge-commit: merge commits are not allowed in this repository; use 'git rebase main' instead" >&2
+echo "pre-merge-commit: abort this merge with 'git merge --abort'" >&2
+exit 1
