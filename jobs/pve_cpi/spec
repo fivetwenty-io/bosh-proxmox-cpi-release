@@ -1397,8 +1397,10 @@ properties:
       detach_disk and the next attach_disk or delete_disk). One of:
         ""       — same as "parked" (the default).
         "parked" — detached disks are attached to a dedicated parker VM
-                   (bosh-parker-<n>) in an active scsi slot (scsi0-30) with
-                   protection=1 and onboot=0. The parker VM is never started.
+                   (<prefix>-parker-<vmid>, which is bosh-parker-<vmid> until
+                   pve.parker_prefix or pve.vm_prefix says otherwise) in an
+                   active scsi slot (scsi0-30) with protection=1 and
+                   onboot=0. The parker VM is never started.
                    Provides PVE-side ownership visibility and accident protection.
                    The CPI defaults pve.parked_disk_vmid_range_start and
                    pve.parked_disk_vmid_range_end to 90000/90999 if unset, each
@@ -1475,10 +1477,12 @@ properties:
     default: false
   pve.parked_disk_vmid_range_start:
     description: |
-      Inclusive lower bound of the VMID range reserved for parker VMs
-      (bosh-parker-<n>). Each parker VM holds up to 31 parked disk volumes in
-      scsi0-30 slots. The band resolves under every detached_disk_strategy, at
-      the job level and in every cpi-config entry alike: under "parked" (the
+      Inclusive lower bound of the VMID range reserved for parker VMs, which
+      are named <prefix>-parker-<vmid> and stay bosh-parker-<vmid> until
+      pve.parker_prefix or pve.vm_prefix says otherwise. Each parker VM holds
+      up to 31 parked disk volumes in scsi0-30 slots. The band resolves under
+      every detached_disk_strategy, at the job level and in every cpi-config
+      entry alike: under "parked" (the
       default) it is where parker VMs are allocated, and under "free" it is
       read-only — it lets the CPI recognize disks parked earlier and unpark
       them on their next attach_disk or delete_disk instead of refusing them.

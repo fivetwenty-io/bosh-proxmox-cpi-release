@@ -1020,6 +1020,8 @@ python3 scripts/disk-audit --config /path/to/audit-config.json --json
 | `free-floating` | Volume in storage but no VM holds it — potential orphan; triggers exit 1 |
 | `unknown` | Volume found in storage but VMID cannot be determined from the volid pattern |
 
+The report also lists the parker VMs themselves, and that listing carries a `POOL` column naming the resource pool each parker belongs to, left blank for a parker that belongs to no pool. The parker warnings below name the same pool, and write `none` where the column is blank, so a finding says where the parker lives without a second lookup. The column is read from the cluster index, which lags a membership change by minutes, so a parker that was swept into its pool moments ago can still read as unpooled.
+
 The script prints warnings to stderr when:
 
 - Parked disks exist but `detached_disk_strategy` in the config file is set to `"free"`. These disks still drain — the parker band resolves under every strategy, so each unparks on its next `attach_disk` or `delete_disk` — but no new detaches will park.
@@ -1029,6 +1031,22 @@ The script prints warnings to stderr when:
 - A parker carries an `unusedN` reference to a live volume, left by a sweep that did not complete. The warning names the `qm unlink` sequence that clears it. That parker is not a teardown candidate: `qm destroy --purge` frees the volume behind an `unusedN` entry as readily as one in a `scsiN` slot.
 
 - A parker's config did not come back, so its contents are unknown and it is not reported as empty.
+
+### Moving parkers after a parker pool rename
+
+Under the parked strategy the CPI puts parkers into the pool `pve.parker_pool` names, and it does that after every successful park rather than only when it creates a parker. The sweep claims only the parkers that belong to no pool, and it never moves a parker out of a pool something else put it in. Renaming `pve.parker_pool` therefore leaves every existing parker where it is, and only the parkers created after the rename land in the new pool.
+
+Moving the old ones is a manual step, through the Proxmox UI or `pvesh`. Take it once we are satisfied that the old pool holds nothing but parkers we mean to move, since the same command would move anything else we named:
+
+```bash
+# Confirm what the old pool still holds
+pvesh get /pools/<old-pool>
+# Move one parker across; allow-move is what lets PVE take a guest
+# that already belongs to another pool
+pvesh set /pools/<new-pool> --vms <parker-vmid> --allow-move 1
+```
+
+Run `python3 scripts/disk-audit --config /path/to/audit-config.json` afterwards and read the parker table's `POOL` column, allowing the cluster index its few minutes to catch up. Nothing is broken while the parkers are split across two pools. Every parker classifier keys on the `bosh-parker` tag and the VMID band rather than on pool membership, so a split pool costs us tidiness in the PVE UI and nothing else.
 
 ### Recovering empty parker VMs
 
