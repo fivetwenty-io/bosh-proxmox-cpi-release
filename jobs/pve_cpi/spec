@@ -1352,6 +1352,25 @@ properties:
       serves every node via cross-node clone, even when the qcow2 staging
       pool (stemcell_storage) is node-local.
     default: false
+  pve.stemcell_replicate_storage_set:
+    description: |
+      When true, create_stemcell builds one cache template per member of the
+      effective root storage set (pve.root_storage_set, else
+      pve.ephemeral_storage_set), each tagged
+      "bosh-stemcell-storage-<storage-id>", so a set-managed create_vm clones
+      linked on whichever member placement chose instead of copying the
+      stemcell in full onto every member other than pve.vm_storage.
+
+      Replicas build after the primary template, best-effort: a member that
+      fails is logged and skipped, and `bosh upload-stemcell --fix` builds
+      the missing ones. Replicas hold no director reference of their own.
+      delete_stemcell sweeps them with the primary on its last reference.
+
+      Requires pve.stemcell_strategy "template" and a bound root or
+      ephemeral set whose explicit member names sanitize to distinct tags.
+      Overridable per cpi-config entry as
+      pve_stemcell_replicate_storage_set.
+    default: false
   pve.replica_adopt_timeout_sec:
     description: |
       Adopt-and-wait bound (seconds) for a racing concurrent template-replica clone.
@@ -1639,15 +1658,20 @@ properties:
   pve.stemcell_replication_concurrency:
     description: |
       Maximum number of cluster nodes that receive a stemcell replica upload
-      concurrently during create_stemcell. Only meaningful when
-      stemcell_replicate_local is true. Zero (default) resolves to 1, which
-      replicates one node at a time (serial, byte-identical to prior releases). Set
+      concurrently during create_stemcell. Meaningful when
+      stemcell_replicate_local or stemcell_replicate_storage_set is true. Zero
+      (default) resolves to 1, which replicates one node at a time (serial,
+      byte-identical to prior releases). Set
       a positive value up to 64 to replicate multiple nodes in parallel and reduce
       total replication time on large clusters. Per-node semantics are preserved in
       all modes: a per-node failure is best-effort (logged, does not abort other
       nodes), idempotent skip applies when a replica already exists, and the
-      per-node in-flight gate is honored. Negative values and values > 64 are
-      rejected at config validation.
+      per-node fan-out honors the per-node in-flight gate. The storage-set
+      fan-out builds every replica on the template node, so it is bounded by
+      this concurrency value alone and does not take that gate, which would
+      otherwise serialize a whole set to one worker. The two fan-outs run one
+      after the other, never nested, so this value is never exceeded. Negative
+      values and values > 64 are rejected at config validation.
     default: 0
   pve.health_check.enabled:
     description: |

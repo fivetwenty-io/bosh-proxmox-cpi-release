@@ -214,6 +214,37 @@ func (c *CPIConfig) HasGlobalStorageSetBindings() bool {
 	return c.EphemeralStorageSet != "" || c.PersistentStorageSet != "" || c.RootStorageSet != ""
 }
 
+// EffectiveRootStorageSet names the set that governs new root disks:
+// root_storage_set when bound, otherwise ephemeral_storage_set, matching the
+// fallback resolveStorageRole applies for the root role.
+func (c *CPIConfig) EffectiveRootStorageSet() string {
+	if c.RootStorageSet != "" {
+		return c.RootStorageSet
+	}
+	return c.EphemeralStorageSet
+}
+
+// ReplicaTagPart mirrors pve.dnsSafeStemcellPart so validation and the
+// replica builder agree on which member names collide under the
+// "bosh-stemcell-storage-<part>" tag. It is exported so a test in
+// internal/pve can pin the agreement; internal/config cannot import
+// internal/pve because internal/pve already imports internal/config.
+func ReplicaTagPart(s string) string {
+	s = strings.ToLower(s)
+	var buf []byte
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			buf = append(buf, byte(r)) // #nosec G115 -- range-checked above
+			prevDash = false
+		} else if !prevDash {
+			buf = append(buf, '-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(string(buf), "-")
+}
+
 // ValidateStoragePlacementAllocation checks static prerequisites only when a
 // caller has classified an operation as set-managed. Filesystem readiness and
 // cluster enrollment belong to the allocation journal, never CID lifecycle reads.
@@ -280,6 +311,31 @@ func (c *CPIConfig) ValidateStoragePlacement() error {
 				errs = append(errs, fmt.Sprintf("storage %q belongs to capacity domains %q and %q", member, owner, name))
 			}
 			owners[member] = name
+		}
+	}
+	if c.StemcellReplicateStorageSet {
+		set := c.EffectiveRootStorageSet()
+		if set == "" {
+			errs = append(errs, "stemcell_replicate_storage_set requires root_storage_set or ephemeral_storage_set")
+		}
+		if c.StemcellStrategy == StemcellStrategyImport {
+			errs = append(errs, "stemcell_replicate_storage_set requires stemcell_strategy template")
+		}
+		// An explicit member list is checked here so a collision is a
+		// config error rather than a runtime skip. A name_pattern set
+		// resolves against the live cluster, so the builder repeats the
+		// check at build time (filterStorageReplicaMembers) and skips the
+		// later member with a warning.
+		if def, ok := c.StorageSets[set]; ok {
+			seen := make(map[string]string, len(def.Names))
+			for _, member := range def.Names {
+				tag := ReplicaTagPart(member)
+				if prior, dup := seen[tag]; dup {
+					errs = append(errs, fmt.Sprintf("storage set %q members %q and %q sanitize to the same replica tag", set, prior, member))
+					continue
+				}
+				seen[tag] = member
+			}
 		}
 	}
 	if len(errs) > 0 {

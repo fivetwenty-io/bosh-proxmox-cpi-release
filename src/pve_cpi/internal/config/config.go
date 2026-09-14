@@ -559,6 +559,17 @@ type CPIConfig struct {
 	// validate-only-when-set; omit from ERB when false.
 	StemcellReplicateLocal bool `json:"stemcell_replicate_local,omitempty"`
 
+	// StemcellReplicateStorageSet builds one cache template per member of the
+	// effective root storage set (root_storage_set, else
+	// ephemeral_storage_set) so a set-managed create_vm can clone linked on
+	// whichever member placement chose. Each replica carries the tag
+	// "bosh-stemcell-storage-<sanitized-storage-id>" beside the shared
+	// content tag. Replicas hold no director reference; delete_stemcell
+	// sweeps them with the primary on its last reference. Requires
+	// stemcell_strategy "template" and a bound root or ephemeral set.
+	// Default false. Validated only when set; omitted from ERB when false.
+	StemcellReplicateStorageSet bool `json:"stemcell_replicate_storage_set,omitempty"`
+
 	// StemcellStrategy selects how create_vm materializes a VM root disk from
 	// a stemcell CID.
 	// "template" — clone the per-cluster cache template (CoW-fast; the cache

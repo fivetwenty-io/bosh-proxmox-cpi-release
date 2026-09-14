@@ -450,6 +450,12 @@
     config["stemcell_replicate_local"] = true
   end
 
+  # Emit stemcell_replicate_storage_set only when true. The Go zero-value
+  # (false) means no per-member templates; omitting the key preserves that.
+  if p("pve.stemcell_replicate_storage_set", false)
+    config["stemcell_replicate_storage_set"] = true
+  end
+
   # Emit stemcell_replication_concurrency only when non-zero. Zero (default)
   # resolves to 1 (serial) in Go; omitting the key preserves that default —
   # byte-identical to prior releases. The Go accessor clamps nil/0 to 1 so

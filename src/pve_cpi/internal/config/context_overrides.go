@@ -65,6 +65,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_detached_disk_strategy",
 	"pve_disk_migration",
 	"pve_stemcell_replicate_local",
+	"pve_stemcell_replicate_storage_set",
 	"pve_vm_prefix",
 	"pve_agent_mode",
 	"pve_vm_disk_format",
@@ -346,6 +347,17 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.StemcellReplicateLocal = b
+		return nil
+	},
+	// Whether a cluster's storage set members each carry a cache template is
+	// a property of that cluster's set topology, so a cpi-config entry must
+	// be able to set it for its own cluster.
+	"pve_stemcell_replicate_storage_set": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellReplicateStorageSet = b
 		return nil
 	},
 	// VM-name prefix is cluster-facing identity (operators distinguish each
