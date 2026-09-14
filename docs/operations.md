@@ -1034,7 +1034,7 @@ The script prints warnings to stderr when:
 
 ### Moving parkers after a parker pool rename
 
-Under the parked strategy the CPI puts parkers into the pool `pve.parker_pool` names, and it does that after every successful park rather than only when it creates a parker. The sweep claims only the parkers that belong to no pool, and it never moves a parker out of a pool something else put it in. Renaming `pve.parker_pool` therefore leaves every existing parker where it is, and only the parkers created after the rename land in the new pool.
+Under the parked strategy the CPI puts parkers into the pool `pve.parker_pool` names, and it does that after every successful park rather than only when it creates a parker. The sweep claims only the parkers that belong to no pool and carry this deployment's own prefix, and it never moves a parker out of a pool something else put it in. Renaming `pve.parker_pool` therefore leaves every existing parker where it is, and only the parkers created after the rename land in the new pool.
 
 Moving the old ones is a manual step, through the Proxmox UI or `pvesh`. Take it once we are satisfied that the old pool holds nothing but parkers we mean to move, since the same command would move anything else we named:
 
@@ -1047,6 +1047,14 @@ pvesh set /pools/<new-pool> --vms <parker-vmid> --allow-move 1
 ```
 
 Run `python3 scripts/disk-audit --config /path/to/audit-config.json` afterwards and read the parker table's `POOL` column, allowing the cluster index its few minutes to catch up. Nothing is broken while the parkers are split across two pools. Every parker classifier keys on the `bosh-parker` tag and the VMID band rather than on pool membership, so a split pool costs us tidiness in the PVE UI and nothing else.
+
+### Retiring parkers after a parker prefix change
+
+Changing `pve.parker_prefix`, or changing `pve.vm_prefix` when the parker prefix inherits from it, takes the parkers we already have out of future reuse and pooling. A park reuses only a parker whose prefix matches the deployment's resolved prefix, and the pool sweep pools only those same parkers, so nothing chooses the old parkers again. The deployment creates fresh parkers beside them and fills those from the change onward, even when an old parker on the same node still has free slots.
+
+Nothing renames a parker, and the CPI never deletes one, so the old parkers stay standing and keep holding the disks they already hold. Those disks stay reachable. Each one attaches, unparks, and deletes exactly as it did before the change, because every path that finds a disk where it already sits is prefix-agnostic. The old parkers therefore drain one disk at a time as the Director attaches or deletes what they hold, and each becomes a teardown candidate once it is empty. Run `python3 scripts/disk-audit --config /path/to/audit-config.json` to see which of them still hold anything, and follow [Recovering empty parker VMs](#recovering-empty-parker-vms) for the ones that come back empty.
+
+An operator who wants the old parkers to keep filling sets `pve.parker_prefix` back to the old value explicitly. For a deployment that inherited the prefix from `pve.vm_prefix`, that value is `bosh`, because a parker created before the identity tag existed carries no `vm-prefix--` tag, and its `bosh-parker-<vmid>` name reads as the `bosh` prefix.
 
 ### A workload VM found in the parker pool
 
