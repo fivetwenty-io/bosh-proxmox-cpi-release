@@ -4,7 +4,7 @@
 #
 # Built by .github/workflows/ci-image.yml and pushed to
 # ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci. Used by:
-#   - the scheduled acceptance workflow (.github/workflows/acceptance.yml),
+#   - the scheduled certification workflow (.github/workflows/certification.yml),
 #     which runs scripts/certify, scripts/bosh, and scripts/bats
 #   - the Concourse integration task (ci/tasks/integration.yml), which runs
 #     ./scripts/test integration all
@@ -91,7 +91,7 @@ FROM ruby:${RUBY_VERSION}-slim-bookworm
 # Links the ghcr package to this repository so the workflows' GITHUB_TOKEN
 # can push it and repo collaborators inherit access.
 LABEL org.opencontainers.image.source="https://github.com/fivetwenty-io/bosh-proxmox-cpi-release"
-LABEL org.opencontainers.image.description="CI image for bosh-proxmox-cpi-release acceptance and integration jobs"
+LABEL org.opencontainers.image.description="CI image for bosh-proxmox-cpi-release certification and integration jobs"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \

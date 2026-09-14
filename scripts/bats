@@ -1426,7 +1426,7 @@ class BATS:
         # The CPI release the director actually runs is frozen at create-env
         # time and never appears in `bosh releases`, so the only honest source
         # is the tarball create-env was pointed at. When the caller (the
-        # scheduled acceptance workflow, or a local shell that just ran
+        # scheduled certification workflow, or a local shell that just ran
         # create-env) still has PVE_CPI_RELEASE_PATH exported, record its
         # basename; otherwise say so rather than guess from the working tree.
         release_path = os.environ.get("PVE_CPI_RELEASE_PATH", "").strip()

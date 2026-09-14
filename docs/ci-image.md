@@ -1,10 +1,10 @@
 # CI Image
 
-Our acceptance and integration jobs run inside a purpose-built container image. The canonical Dockerfile lives at `ci/Dockerfile`; the `CI Image` workflow (`.github/workflows/ci-image.yml`) builds it on every change to that file and pushes it to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci` with the tags `latest` and the git sha.
+Our certification and integration jobs run inside a purpose-built container image. The canonical Dockerfile lives at `ci/Dockerfile`; the `CI Image` workflow (`.github/workflows/ci-image.yml`) builds it on every change to that file and pushes it to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci` with the tags `latest` and the git sha.
 
 Two consumers use the image:
 
-- the scheduled acceptance workflow (`.github/workflows/acceptance.yml`), which runs `scripts/certify`, `scripts/bosh`, and `scripts/bats`
+- the scheduled certification workflow (`.github/workflows/certification.yml`), which runs `scripts/certify`, `scripts/bosh`, and `scripts/bats`
 
 - the Concourse integration task (`ci/tasks/integration.yml`), which runs `./scripts/test integration all`
 
@@ -27,7 +27,7 @@ The stock `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependen
   `scripts/bats` runs the BOSH Acceptance Tests, a Ruby rspec suite whose `bundle install` compiles native gems (hence `build-essential`).
 
 - **gh**
-  The acceptance workflow resolves and downloads the latest published release with it.
+  The certification workflow resolves and downloads the latest published release with it.
 
 ---
 
@@ -53,7 +53,7 @@ The Python helper scripts use only the standard library plus PyYAML; `uv` can al
 
 ## Building and publishing
 
-The `CI Image` workflow builds and pushes automatically when `ci/Dockerfile` or the workflow itself changes on `main`, and can be dispatched by hand. Its verify step runs every baked tool's version command before the push, and the push step prints the image digest so `acceptance.yml` can pin its `container.image` reference to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:...`.
+The `CI Image` workflow builds and pushes automatically when `ci/Dockerfile` or the workflow itself changes on `main`, and can be dispatched by hand. Its verify step runs every baked tool's version command before the push, and the push step prints the image digest so `certification.yml` can pin its `container.image` reference to `ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:...`.
 
 To build locally:
 

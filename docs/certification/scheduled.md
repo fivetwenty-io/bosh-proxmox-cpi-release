@@ -1,12 +1,12 @@
-# Scheduled Acceptance Workflow
+# Scheduled Certification Workflow
 
-`.github/workflows/acceptance.yml` runs the director-upgrade certification (`scripts/certify`) and the BOSH Acceptance Tests (`scripts/bats`) unattended every Saturday at 02:30 UTC, on our self-hosted runner fleet, against the `cpitest` environment (an SDN slice of the `pmx` nested lab). It is the automated counterpart to the local certification paths in [the certification index](index.md): the same scripts, the same lab, no operator at the keyboard.
+`.github/workflows/certification.yml` runs the director-upgrade certification (`scripts/certify`) and the BOSH Acceptance Tests (`scripts/bats`) unattended every Saturday at 02:30 UTC, on our self-hosted runner fleet, against the `cpitest` environment (an SDN slice of the `pmx` nested lab). It is the automated counterpart to the local certification paths in [the certification index](index.md): the same scripts, the same lab, no operator at the keyboard.
 
 We can also dispatch it by hand:
 
 ```sh
-gh workflow run acceptance.yml --repo fivetwenty-io/bosh-proxmox-cpi-release
-gh workflow run acceptance.yml --repo fivetwenty-io/bosh-proxmox-cpi-release -f skip_bats=true
+gh workflow run certification.yml --repo fivetwenty-io/bosh-proxmox-cpi-release
+gh workflow run certification.yml --repo fivetwenty-io/bosh-proxmox-cpi-release -f skip_bats=true
 ```
 
 `skip_bats=true` runs certify alone, which is the cheaper first probe after any change to the workflow, the CI image, or the lab. The workflow's `concurrency: group: lab` serializes it with every other lab-touching workflow, so a manual dispatch queues behind a running one rather than colliding with it.
@@ -49,7 +49,7 @@ Dispatch `lab-probe.yml` first. It re-proves both halves of the network path (PV
 
 Failures we have already seen, with their signatures:
 
-- The job cannot pull the CI image: the `packages: read` permission or the ghcr digest pin in `acceptance.yml` is stale. `ci-image.yml` prints the new digest after a Dockerfile change; pin it.
+- The job cannot pull the CI image: the `packages: read` permission or the ghcr digest pin in `certification.yml` is stale. `ci-image.yml` prints the new digest after a Dockerfile change; pin it.
 
 - `qemu-img: command not found` during certify: the CI image lost `qemu-utils`, which the light-stemcell qcow2 derivation needs.
 
