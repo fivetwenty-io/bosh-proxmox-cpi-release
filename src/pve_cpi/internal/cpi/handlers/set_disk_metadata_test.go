@@ -517,6 +517,89 @@ func TestHandleSetDiskMetadata_AppliesDiskTags(t *testing.T) {
 	}
 }
 
+// TestHandleSetDiskMetadata_WarnsOnDroppedTags verifies that a disk tag the
+// byte cap pushes off the hosting VM's tag list is named in a warning rather
+// than lost in silence.
+func TestHandleSetDiskMetadata_WarnsOnDroppedTags(t *testing.T) {
+	t.Parallel()
+
+	// The stored tag list already sits just under the cap, so the one entry
+	// this call adds cannot fit beside it.
+	crowded := "env--" + strings.Repeat("a", 336)
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pveClient := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): {
+			"scsi0": testDiskCID,
+			"tags":  crowded,
+		},
+	}, nodesSvc)
+
+	logger, logs := log.NewObservedLogger(log.LevelWarn)
+	deps := makeDiskMetaDeps(pveClient)
+	deps.Logger = logger
+
+	h := handlers.HandleSetDiskMetadata(deps)
+	meta := map[string]any{
+		"tags": map[string]any{
+			"tier": "bronze",
+		},
+	}
+	if _, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entry, dropped := findDroppedTagWarning(t, logs.All())
+	if dropped == "" {
+		t.Fatalf("expected a warning naming the dropped tags, got entries %+v", logs.All())
+	}
+	if !strings.Contains(entry.Message, "set_disk_metadata") {
+		t.Errorf("warning message should name the operation; got %q", entry.Message)
+	}
+	if got, ok := entry.Attrs["vmid"]; !ok || got != testVMID {
+		t.Errorf("warning should carry vmid %d; got %v", testVMID, entry.Attrs["vmid"])
+	}
+	if got, ok := entry.Attrs["max_tag_bytes"]; !ok || got != int64(350) {
+		t.Errorf("warning should carry the 350 byte cap; got %v", entry.Attrs["max_tag_bytes"])
+	}
+	if !strings.Contains(dropped, "tier--bronze") {
+		t.Errorf("dropped tags should name the entry that did not fit; got %q", dropped)
+	}
+}
+
+// TestHandleSetDiskMetadata_NoWarnAtNormalTagSizes verifies an ordinary disk
+// tag merge stays well under the cap and so logs no warning.
+func TestHandleSetDiskMetadata_NoWarnAtNormalTagSizes(t *testing.T) {
+	t.Parallel()
+
+	nodesSvc := &diskMetaNodesMock{}
+	clusterSvc := &diskMetaClusterSvc{resp: clusterResourcesWithVM(testVMID, testNode)}
+	pveClient := buildDiskMetaPVE(clusterSvc, map[string]map[string]any{
+		diskKey(testNode, int(testVMID)): {
+			"scsi0": testDiskCID,
+			"tags":  "env--prod;director--abc",
+		},
+	}, nodesSvc)
+
+	logger, logs := log.NewObservedLogger(log.LevelWarn)
+	deps := makeDiskMetaDeps(pveClient)
+	deps.Logger = logger
+
+	h := handlers.HandleSetDiskMetadata(deps)
+	meta := map[string]any{
+		"tags": map[string]any{
+			"tier": "bronze",
+		},
+	}
+	if _, err := h.Handle(context.Background(), makeMetaArgs(t, testDiskCID, meta), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, dropped := findDroppedTagWarning(t, logs.All()); dropped != "" {
+		t.Errorf("expected no dropped-tag warning at normal sizes; got %q", dropped)
+	}
+}
+
 // TestHandleSetDiskMetadata_SkipsReservedTagKeys verifies a disk tag whose key
 // the CPI owns is dropped with a warning while the rest of the map is applied.
 // Without the filter such a tag would replace the VM's own entry outright,

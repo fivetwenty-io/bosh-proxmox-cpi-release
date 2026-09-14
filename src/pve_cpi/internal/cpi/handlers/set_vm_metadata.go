@@ -26,6 +26,22 @@ import (
 // name) plus a few operator tags.
 const maxTagLength = 350
 
+// warnDroppedTags says out loud which tag entries the byte cap left off a
+// guest, so an operator can see the loss in the logs instead of having to
+// diff a QEMU config by hand. The guest field is whichever handle the caller
+// already holds, the VM CID for set_vm_metadata and the VMID for
+// set_disk_metadata. We stay quiet when every entry fit.
+func warnDroppedTags(logger *log.Logger, operation string, guest log.Field, maxBytes int, dropped []string) {
+	if logger == nil || len(dropped) == 0 {
+		return
+	}
+	logger.Warn(operation+": tag list exceeded the byte cap, so these entries were dropped",
+		guest,
+		log.Int("max_tag_bytes", maxBytes),
+		log.String("dropped_tags", strings.Join(dropped, ";")),
+	)
+}
+
 // HandleSetVMMetadata returns a handler for the set_vm_metadata CPI method.
 //
 // Arguments:
@@ -228,7 +244,8 @@ func setVMMetadataRMW(
 
 	preserved := stripReservedBoshTags(existingTags)
 	boshEntries := buildBoshManagedTags(metadata, deps.Config.ParkerPrefixValue())
-	tags := mergeTagList(preserved, boshEntries, maxTagLength)
+	tags, droppedTags := mergeTagListReporting(preserved, boshEntries, maxTagLength)
+	warnDroppedTags(logger, "set_vm_metadata", log.String("vm_cid", vmCID), maxTagLength, droppedTags)
 
 	logger.Debug("set_vm_metadata: updating VM config",
 		log.String("description_len", fmt.Sprintf("%d", len(description))),

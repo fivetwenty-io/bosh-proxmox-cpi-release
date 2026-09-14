@@ -392,7 +392,8 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		}
 	}
 
-	mergedTags := mergeTagList(existing, newEntries, maxTagLength)
+	mergedTags, droppedTags := mergeTagListReporting(existing, newEntries, maxTagLength)
+	warnDroppedTags(deps.Log(ctx), "set_disk_metadata", log.Int("vmid", vmid), maxTagLength, droppedTags)
 
 	currentDesc := ""
 	if s, ok := pve.ConfigString(cfg, "description"); ok {

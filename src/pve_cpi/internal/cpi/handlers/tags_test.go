@@ -126,6 +126,84 @@ func TestMergeTagList_Empty(t *testing.T) {
 	}
 }
 
+// TestMergeTagListReporting_NothingDropped checks that a list which fits under
+// the cap reports no dropped entry at all, so the caller stays silent.
+func TestMergeTagListReporting_NothingDropped(t *testing.T) {
+	t.Parallel()
+	merged, dropped := mergeTagListReporting([]string{"env--prod"}, []string{"tier--gold"}, 255)
+	if merged != "env--prod;tier--gold" {
+		t.Errorf("merged = %q, want %q", merged, "env--prod;tier--gold")
+	}
+	if dropped != nil {
+		t.Errorf("dropped = %v, want nil", dropped)
+	}
+}
+
+// TestMergeTagListReporting_OneDropped checks that the single entry the cap
+// pushes off the end comes back by name.
+func TestMergeTagListReporting_OneDropped(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("a", 80)
+	additions := []string{"k1--" + long, "k2--" + long, "vm-prefix--blue"}
+	// Two 84-byte entries and one separator fill 169 bytes, so a cap of 180
+	// leaves no room for the identity tag.
+	merged, dropped := mergeTagListReporting(nil, additions, 180)
+	if strings.Contains(merged, "vm-prefix--blue") {
+		t.Errorf("merged should not hold the identity tag; got %q", merged)
+	}
+	want := []string{"vm-prefix--blue"}
+	if !slices.Equal(dropped, want) {
+		t.Errorf("dropped = %v, want %v", dropped, want)
+	}
+}
+
+// TestMergeTagListReporting_SeveralDropped checks that every entry from the
+// first one that does not fit onwards is reported, in the order we dropped it.
+func TestMergeTagListReporting_SeveralDropped(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("a", 80)
+	additions := []string{"k1--" + long, "k2--" + long, "k3--" + long, "k4--" + long}
+	merged, dropped := mergeTagListReporting(nil, additions, 180)
+	if merged != additions[0]+";"+additions[1] {
+		t.Errorf("merged = %q, want the first two entries", merged)
+	}
+	want := []string{additions[2], additions[3]}
+	if !slices.Equal(dropped, want) {
+		t.Errorf("dropped = %v, want %v", dropped, want)
+	}
+}
+
+// TestMergeTagListReporting_DuplicatesNotDropped checks that an entry the merge
+// deduplicates is never reported as a casualty of the cap, because it is still
+// in the merged string.
+func TestMergeTagListReporting_DuplicatesNotDropped(t *testing.T) {
+	t.Parallel()
+	existing := []string{"env--prod", "owner--alice"}
+	additions := []string{"env--prod", "owner--alice", "tier--gold"}
+	merged, dropped := mergeTagListReporting(existing, additions, 0)
+	if merged != "env--prod;owner--alice;tier--gold" {
+		t.Errorf("merged = %q, want the three distinct entries", merged)
+	}
+	if dropped != nil {
+		t.Errorf("dropped = %v, want nil", dropped)
+	}
+}
+
+// TestMergeTagListReporting_FirstEntryTooLong checks the corner where even one
+// entry overflows the cap. The merged string comes back empty and every entry
+// is reported.
+func TestMergeTagListReporting_FirstEntryTooLong(t *testing.T) {
+	t.Parallel()
+	additions := []string{"k1--" + strings.Repeat("a", 80), "k2--short"}
+	merged, dropped := mergeTagListReporting(nil, additions, 10)
+	if merged != "" {
+		t.Errorf("merged = %q, want empty", merged)
+	}
+	if !slices.Equal(dropped, additions) {
+		t.Errorf("dropped = %v, want %v", dropped, additions)
+	}
+}
+
 func TestParseTagsField(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

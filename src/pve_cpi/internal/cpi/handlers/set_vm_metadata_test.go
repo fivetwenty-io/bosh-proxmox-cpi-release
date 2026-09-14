@@ -10,8 +10,27 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
+
+// findDroppedTagWarning returns the first warning an observed logger recorded
+// that carries a dropped_tags attribute, along with that attribute's value.
+// Handler tests use it to check that a guest losing a tag at the byte cap says
+// so in the logs.
+func findDroppedTagWarning(t *testing.T, entries []log.Entry) (log.Entry, string) {
+	t.Helper()
+	for _, e := range entries {
+		if v, ok := e.Attrs["dropped_tags"]; ok {
+			s, isStr := v.(string)
+			if !isStr {
+				t.Fatalf("dropped_tags attribute is %T, want string", v)
+			}
+			return e, s
+		}
+	}
+	return log.Entry{}, ""
+}
 
 // TestHandleSetVMMetadata_Happy verifies description and tags are written correctly.
 func TestHandleSetVMMetadata_Happy(t *testing.T) {
@@ -237,6 +256,86 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 		if part == "" || !strings.Contains(part, "--") {
 			t.Errorf("malformed tag %q in %q", part, gotTags)
 		}
+	}
+}
+
+// TestHandleSetVMMetadata_WarnsOnDroppedTags verifies that a metadata payload
+// long enough to overflow the byte cap leaves a warning naming the entries the
+// VM lost, the identity tag among them.
+func TestHandleSetVMMetadata_WarnsOnDroppedTags(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("a", 100)
+	metadata := map[string]any{
+		"director":       "d-" + long,
+		"deployment":     "d-" + long,
+		"instance_group": "g-" + long,
+		"job":            "j-" + long,
+	}
+
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	logger, logs := log.NewObservedLogger(log.LevelWarn)
+	deps := testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{})
+	deps.Logger = logger
+
+	h := handlers.HandleSetVMMetadata(deps)
+	if _, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entry, dropped := findDroppedTagWarning(t, logs.All())
+	if dropped == "" {
+		t.Fatalf("expected a warning naming the dropped tags, got entries %+v", logs.All())
+	}
+	if !strings.Contains(entry.Message, "set_vm_metadata") {
+		t.Errorf("warning message should name the operation; got %q", entry.Message)
+	}
+	if got, ok := entry.Attrs["vm_cid"]; !ok || got != "101" {
+		t.Errorf("warning should carry vm_cid 101; got %v", entry.Attrs["vm_cid"])
+	}
+	if got, ok := entry.Attrs["max_tag_bytes"]; !ok || got != int64(350) {
+		t.Errorf("warning should carry the 350 byte cap; got %v", entry.Attrs["max_tag_bytes"])
+	}
+	if !strings.Contains(dropped, "vm-prefix--bosh") {
+		t.Errorf("dropped tags should name the identity tag; got %q", dropped)
+	}
+}
+
+// TestHandleSetVMMetadata_NoWarnAtNormalTagSizes verifies an ordinary metadata
+// payload fits under the cap and so logs no warning at all.
+func TestHandleSetVMMetadata_NoWarnAtNormalTagSizes(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{
+		"director":       "bosh-director",
+		"deployment":     "cf",
+		"instance_group": "diego",
+		"job":            "diego_cell",
+		"index":          "0",
+	}
+
+	nodesSvc := &mockNodesService{
+		updateQemuConfigFn: func(_ context.Context, _, _ string, _ *nodes.UpdateQemuConfigParams) error {
+			return nil
+		},
+	}
+
+	logger, logs := log.NewObservedLogger(log.LevelWarn)
+	deps := testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{})
+	deps.Logger = logger
+
+	h := handlers.HandleSetVMMetadata(deps)
+	if _, err := h.Handle(context.Background(), marshalArgs("101", metadata), jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, dropped := findDroppedTagWarning(t, logs.All()); dropped != "" {
+		t.Errorf("expected no dropped-tag warning at normal sizes; got %q", dropped)
 	}
 }
 

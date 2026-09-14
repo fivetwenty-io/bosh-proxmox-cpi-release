@@ -92,8 +92,21 @@ func buildCustomTags(custom map[string]string) []string {
 // string joined by ";". Duplicate entries (exact string match) are dropped,
 // preserving the first occurrence. The result is truncated at a tag boundary
 // so the total byte length never exceeds maxBytes; partial entries are never
-// emitted. maxBytes <= 0 disables truncation.
+// emitted. maxBytes <= 0 disables truncation. A caller that wants to know
+// which entries the cap left out should call mergeTagListReporting instead.
 func mergeTagList(existing []string, additions []string, maxBytes int) string {
+	merged, _ := mergeTagListReporting(existing, additions, maxBytes)
+	return merged
+}
+
+// mergeTagListReporting merges the two lists exactly the way mergeTagList
+// does, and it also hands back the entries the byte cap left out. The second
+// return value holds those entries in the order we dropped them, already
+// deduplicated, and it is nil when everything fits. We report them because we
+// write the identity tag last, so it is the first entry to fall off a full
+// list, and a guest that quietly loses that tag no longer names the parkers
+// holding its detached disks.
+func mergeTagListReporting(existing []string, additions []string, maxBytes int) (string, []string) {
 	seen := make(map[string]struct{}, len(existing)+len(additions))
 	parts := make([]string, 0, len(existing)+len(additions))
 	add := func(p string) {
@@ -113,11 +126,11 @@ func mergeTagList(existing []string, additions []string, maxBytes int) string {
 		add(p)
 	}
 	if len(parts) == 0 {
-		return ""
+		return "", nil
 	}
 	joined := strings.Join(parts, ";")
 	if maxBytes <= 0 || len(joined) <= maxBytes {
-		return joined
+		return joined, nil
 	}
 	var truncated string
 	for i, p := range parts {
@@ -126,11 +139,15 @@ func mergeTagList(existing []string, additions []string, maxBytes int) string {
 			candidate = truncated + ";" + p
 		}
 		if len(candidate) > maxBytes {
-			break
+			// The first entry that does not fit ends the list, so every
+			// entry from here on goes with it and we name them all.
+			dropped := make([]string, len(parts)-i)
+			copy(dropped, parts[i:])
+			return truncated, dropped
 		}
 		truncated = candidate
 	}
-	return truncated
+	return truncated, nil
 }
 
 // parseTagsField splits a stored PVE tags string back into entries. PVE
