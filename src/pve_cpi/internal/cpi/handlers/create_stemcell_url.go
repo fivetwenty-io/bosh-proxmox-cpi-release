@@ -134,6 +134,8 @@ func handleStemcellDownloadURLTracked(
 		)
 		maybeReplicateServerDownload(ctx, deps, templateNode, storage, qcow2Filename,
 			cp.ExpectedSHA256, cp.SourceURL, stemcellCID, directorUUID, cp)
+		maybeReplicateTemplateToStorageSet(ctx, deps, templateNode, storage, qcow2Filename, cp.ExpectedSHA256,
+			stemcellCID, directorUUID, pve.StemcellKindHeavy, cp, cp.SourceURL)
 		return stemcellCID, false, nil
 	}
 
@@ -282,6 +284,8 @@ func handleStemcellDownloadURLTracked(
 	)
 	maybeReplicateServerDownload(ctx, deps, templateNode, storage, actualFilename,
 		cp.ExpectedSHA256, cp.SourceURL, actualCID, directorUUID, cp)
+	maybeReplicateTemplateToStorageSet(ctx, deps, templateNode, storage, actualFilename, cp.ExpectedSHA256,
+		actualCID, directorUUID, pve.StemcellKindHeavy, cp, cp.SourceURL)
 	return actualCID, true, nil
 }
 

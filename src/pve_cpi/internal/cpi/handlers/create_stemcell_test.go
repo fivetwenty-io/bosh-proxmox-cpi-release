@@ -2074,3 +2074,135 @@ func (m *stemcellMockNodes) ListNodes(ctx context.Context) (*sdknodes.ListNodesR
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
 }
+
+// ============================================================
+// Storage-set cache template replicas (pve.stemcell_replicate_storage_set).
+// ============================================================
+
+// replicaInvSource is a fixture inv.Source for storage-set replica tests.
+type replicaInvSource struct {
+	defs     []json.RawMessage
+	statuses map[string][]json.RawMessage
+}
+
+func (s replicaInvSource) Definitions(context.Context) ([]json.RawMessage, error) { return s.defs, nil }
+func (s replicaInvSource) Statuses(_ context.Context, node string) ([]json.RawMessage, error) {
+	return s.statuses[node], nil
+}
+
+func replicaInvFixture(t *testing.T, node string, ids ...string) replicaInvSource {
+	t.Helper()
+	src := replicaInvSource{statuses: map[string][]json.RawMessage{}}
+	for _, id := range ids {
+		src.defs = append(src.defs, marshalArg(t, map[string]any{"storage": id, "type": "nfs", "shared": 1, "server": "nas", "export": "/" + id, "content": "images,import"}))
+		src.statuses[node] = append(src.statuses[node], marshalArg(t, map[string]any{"storage": id, "active": 1, "enabled": 1, "total": uint64(100) << 30, "avail": uint64(80) << 30}))
+	}
+	return src
+}
+
+// storageSetReplicaDeps builds a create_stemcell fixture whose qcow2 and
+// cache template already exist, so the only QEMU().Create calls the handler
+// can make are storage-set replica builds.
+func storageSetReplicaDeps(t *testing.T, on bool, roots *[]string, tags *[]string) (handlers.Deps, string) {
+	t.Helper()
+	imgPath := tempImageFile(t)
+	wantSHA := computeFileSHA(t, imgPath)
+	sha8 := wantSHA[:8]
+	wantFilename := "bosh-stemcell-ubuntu-jammy-1.234-" + sha8 + ".qcow2"
+	const existingVMID = int64(30010)
+	templateName := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.234", sha8)
+
+	var mu sync.Mutex
+	qemuSvc := &stemcellMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			root, _ := params["virtio0"].(string)
+			*roots = append(*roots, root)
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if int64(vmid) == existingVMID {
+				return map[string]any{"virtio0": "ns_1:base-30010-disk-0.qcow2,size=5G"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	nodesSvc := &stemcellMockNodes{
+		listStorageFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+			entry, _ := json.Marshal(map[string]string{"volid": "local:import/" + wantFilename})
+			resp := sdknodes.ListStorageContentResponse{entry}
+			return &resp, nil
+		},
+		// The tolerant cluster scan the replica fan-out runs reads the
+		// authoritative per-node listing, not /cluster/resources.
+		listQemuFn: func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+			row, _ := json.Marshal(map[string]any{
+				"vmid": existingVMID, "name": templateName, "tags": cacheTemplateTags(sha8), "template": 1, "status": "stopped",
+			})
+			resp := sdknodes.ListQemuResponse{row}
+			return &resp, nil
+		},
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if params != nil && params.Tags != nil {
+				*tags = append(*tags, *params.Tags)
+			}
+			return nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(existingVMID, vmNode, templateName, cacheTemplateTags(sha8)),
+			}
+			return &items, nil
+		},
+	}
+	client := buildStemcellClient(qemuSvc, nodesSvc, &stemcellMockTasks{}, clusterSvc)
+	deps := makeDeps(client)
+	deps.Config.VMStorage = "ns_1"
+	deps.Config.EphemeralStorageSet = "eph"
+	deps.Config.StemcellReplicateStorageSet = on
+	deps.Config.StemcellTemplateVMIDRangeStart = 30000
+	deps.Config.StemcellTemplateVMIDRangeEnd = 30999
+	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2"},
+		Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
+	deps.ReplicaInventory = replicaInvFixture(t, vmNode, "ns_1", "ns_2")
+	return deps, imgPath
+}
+
+func TestCreateStemcell_BuildsStorageSetReplicas(t *testing.T) {
+	t.Parallel()
+	var roots, tags []string
+	deps, imgPath := storageSetReplicaDeps(t, true, &roots, &tags)
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.234", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
+	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(roots) != 1 || !strings.HasPrefix(roots[0], "ns_2:0,import-from=local:import/") {
+		t.Fatalf("want exactly one replica create on ns_2, got %v", roots)
+	}
+	joined := strings.Join(tags, "\n")
+	if !strings.Contains(joined, "bosh-stemcell-storage-ns-2") {
+		t.Fatalf("replica tag missing from tag writes:\n%s", joined)
+	}
+}
+
+func TestCreateStemcell_PropertyOff_NoStorageSetReplicas(t *testing.T) {
+	t.Parallel()
+	var roots, tags []string
+	deps, imgPath := storageSetReplicaDeps(t, false, &roots, &tags)
+	h := handlers.HandleCreateStemcell(deps)
+	cp := map[string]any{"name": "ubuntu-jammy", "version": "1.234", "disk_format": "qcow2"}
+	args := []json.RawMessage{marshalArg(t, imgPath), marshalArg(t, cp)}
+	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(roots) != 0 {
+		t.Fatalf("want no creates with the property off, got %v", roots)
+	}
+}

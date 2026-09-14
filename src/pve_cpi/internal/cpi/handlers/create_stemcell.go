@@ -602,6 +602,8 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		maybeReplicateTemplate(ctx, deps, templateNode, storage, qcow2Filename, sha256hex,
 			uploadSourcePath, uploadStagingDir, stemcellCID, reqCtx.DirectorUUID,
 			pve.StemcellKindHeavy, cp, imagePath)
+		maybeReplicateTemplateToStorageSet(ctx, deps, templateNode, storage, qcow2Filename, sha256hex,
+			stemcellCID, reqCtx.DirectorUUID, pve.StemcellKindHeavy, cp, imagePath)
 
 		return stemcellCID, nil
 	})
@@ -2192,6 +2194,8 @@ func handleLightStemcellPreUploaded(
 	// that pool classifies as shared.
 	maybeReplicateTemplate(ctx, deps, winnerNode, storage, qcow2Filename, sha256hex,
 		"", "", stemcellCID, directorUUID, pve.StemcellKindLight, cp, cp.ImageID)
+	maybeReplicateTemplateToStorageSet(ctx, deps, winnerNode, storage, qcow2Filename, sha256hex,
+		stemcellCID, directorUUID, pve.StemcellKindLight, cp, cp.ImageID)
 
 	return stemcellCID, nil
 }
@@ -2522,6 +2526,8 @@ func handleLightStemcellFetch(
 	maybeReplicateTemplate(ctx, deps, fetchTemplateNode, storage, qcow2Filename,
 		sha256hex, tmpPath, "", stemcellCID, directorUUID,
 		pve.StemcellKindHeavy, cp, cp.ImageURL)
+	maybeReplicateTemplateToStorageSet(ctx, deps, fetchTemplateNode, storage, qcow2Filename, sha256hex,
+		stemcellCID, directorUUID, pve.StemcellKindHeavy, cp, cp.ImageURL)
 
 	return stemcellCID, nil
 }
