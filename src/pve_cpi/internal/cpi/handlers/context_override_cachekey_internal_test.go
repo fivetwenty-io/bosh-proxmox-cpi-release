@@ -87,6 +87,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_detached_disk_strategy":             "free",
 		"pve_disk_migration":                     "off",
 		"pve_stemcell_replicate_local":           true,
+		"pve_stemcell_replicate_storage_set":     true,
 		"pve_vm_prefix":                          "az2",
 		"pve_parker_prefix":                      "az2",
 		"pve_parker_pool":                        "az2-parker",
@@ -102,13 +103,26 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		},
 	}
 
+	// stemcell_replicate_storage_set validates against the effective root set,
+	// so it cannot be applied to a base with no binding. The base itself must
+	// stay unbound, because an inherited binding makes ApplyContextOverrides
+	// refuse the pve_host and pve_port rows unless the entry also restates
+	// pve_storage_sets. This field therefore gets a bound base of its own.
+	boundBase := *base
+	boundBase.EphemeralStorageSet = "set-a"
+	boundBaseKey := requestOverrideCacheKey(&boundBase)
+
 	for _, field := range config.ContextOverrideFieldOrderForTest() {
 		val, ok := overrideValues[field]
 		if !ok {
 			t.Errorf("field %q is overridable but this test has no distinct value for it — add one so the cache key stays covered", field)
 			continue
 		}
-		eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{field: val})
+		fieldBase, fieldBaseKey := base, baseKey
+		if field == "pve_stemcell_replicate_storage_set" {
+			fieldBase, fieldBaseKey = &boundBase, boundBaseKey
+		}
+		eff, applied, unknown, err := config.ApplyContextOverrides(fieldBase, map[string]any{field: val})
 		if err != nil {
 			t.Errorf("ApplyContextOverrides(%q): %v", field, err)
 			continue
@@ -117,7 +131,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 			t.Errorf("ApplyContextOverrides(%q): applied=%v unknown=%v; want exactly one applied", field, applied, unknown)
 			continue
 		}
-		if key := requestOverrideCacheKey(eff); key == baseKey {
+		if key := requestOverrideCacheKey(eff); key == fieldBaseKey {
 			t.Errorf("overriding %q did not change requestOverrideCacheKey — two requests with different effective configs would share one cached bundle", field)
 		}
 	}

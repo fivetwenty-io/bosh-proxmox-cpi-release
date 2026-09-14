@@ -42,13 +42,13 @@ func TestStorageSetReplicasNeeded(t *testing.T) {
 	}
 }
 
-func replicaStorageDef(t *testing.T, id, server, export string, shared bool, content string) pve.StorageInfo {
+func replicaStorageDef(t *testing.T, id, export string, shared bool, content string) pve.StorageInfo {
 	t.Helper()
 	// An NFS storage is shared by protocol whatever its "shared" flag says
 	// (pve.StorageInfo.IsShared), so a node-local member has to be a
 	// plugin that is not inherently shared. "dir" is the one the fan-out
 	// most plausibly meets on a set an operator wrote by hand.
-	row := map[string]any{"storage": id, "type": "nfs", "shared": 1, "server": server, "export": export, "content": content}
+	row := map[string]any{"storage": id, "type": "nfs", "shared": 1, "server": "nas", "export": export, "content": content}
 	if !shared {
 		row = map[string]any{"storage": id, "type": "dir", "shared": 0, "path": export, "content": content}
 	}
@@ -62,12 +62,12 @@ func replicaStorageDef(t *testing.T, id, server, export string, shared bool, con
 func TestFilterStorageReplicaMembers(t *testing.T) {
 	t.Parallel()
 	defs := map[string]pve.StorageInfo{
-		"ns_1":       replicaStorageDef(t, "ns_1", "nas", "/ns1", true, "images,import"),
-		"ns_2":       replicaStorageDef(t, "ns_2", "nas", "/ns2", true, "images"),
-		"ns_1_alias": replicaStorageDef(t, "ns_1_alias", "nas", "/ns1", true, "images"),
-		"ns_3":       replicaStorageDef(t, "ns_3", "nas", "/ns3", false, "images"),
-		"ns_4":       replicaStorageDef(t, "ns_4", "nas", "/ns4", true, "iso"),
-		"ns-2":       replicaStorageDef(t, "ns-2", "nas", "/ns2b", true, "images"),
+		"ns_1":       replicaStorageDef(t, "ns_1", "/ns1", true, "images,import"),
+		"ns_2":       replicaStorageDef(t, "ns_2", "/ns2", true, "images"),
+		"ns_1_alias": replicaStorageDef(t, "ns_1_alias", "/ns1", true, "images"),
+		"ns_3":       replicaStorageDef(t, "ns_3", "/ns3", false, "images"),
+		"ns_4":       replicaStorageDef(t, "ns_4", "/ns4", true, "iso"),
+		"ns-2":       replicaStorageDef(t, "ns-2", "/ns2b", true, "images"),
 	}
 	definition := func(id string) (pve.StorageInfo, bool) { d, ok := defs[id]; return d, ok }
 	members := []string{"ns_1", "ns_2", "ns_1_alias", "ns_3", "ns_4", "ns-2", "ghost"}

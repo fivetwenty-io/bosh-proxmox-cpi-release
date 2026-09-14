@@ -385,6 +385,38 @@ func ReplicaNodeTagForNode(node string) string {
 	return replicaNodeTag(node)
 }
 
+// nodeTemplateAccepted applies ResolveTemplateVMIDForNode's match rules to
+// one template's tag tokens. The template has to carry shaTag. It is then a
+// candidate when it carries this node's replica tag, or when it carries no
+// node tag at all and is therefore the cluster primary. A template carrying a
+// per-storage replica tag is never a candidate, whichever node it sits on:
+// its root disk lives on a storage set member rather than on vm_storage, so
+// the scalar clone path must not take it for this node's primary.
+func nodeTemplateAccepted(tokens []string, shaTag, nodeTag string) bool {
+	hasSHA := false
+	hasNodeTag := false
+	hasAnyNodeTag := false
+	hasStorageTag := false
+	for _, tok := range tokens {
+		switch tok {
+		case shaTag:
+			hasSHA = true
+		case nodeTag:
+			hasNodeTag = true
+		}
+		if strings.HasPrefix(tok, "bosh-stemcell-node-") {
+			hasAnyNodeTag = true
+		}
+		if strings.HasPrefix(tok, ReplicaStorageTagPrefix) {
+			hasStorageTag = true
+		}
+	}
+	if !hasSHA || hasStorageTag {
+		return false
+	}
+	return hasNodeTag || !hasAnyNodeTag
+}
+
 // ResolveTemplateVMIDForNode returns the VMID of a stemcell template residing
 // on node that matches sha8. It accepts both the primary template (on the
 // canonical template node) and per-node replicas tagged with
@@ -468,30 +500,7 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 			continue
 		}
 
-		hasSHA := false
-		hasNodeTag := false
-		hasAnyNodeTag := false
-		hasStorageTag := false
-		for _, tok := range tokens {
-			if tok == shaTag {
-				hasSHA = true
-			}
-			if tok == nodeTag {
-				hasNodeTag = true
-			}
-			if strings.HasPrefix(tok, "bosh-stemcell-node-") {
-				hasAnyNodeTag = true
-			}
-			if strings.HasPrefix(tok, ReplicaStorageTagPrefix) {
-				hasStorageTag = true
-			}
-		}
-		if !hasSHA {
-			continue
-		}
-		// Accept: replica with this node's tag, OR primary with no node tag.
-		// A storage replica is never a node primary, whichever node it sits on.
-		if hasStorageTag || (!hasNodeTag && hasAnyNodeTag) {
+		if !nodeTemplateAccepted(tokens, shaTag, nodeTag) {
 			continue
 		}
 		if bestVMID == 0 || item.Vmid.Int() < bestVMID {
