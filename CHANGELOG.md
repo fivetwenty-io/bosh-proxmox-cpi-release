@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-14
+
 ### Added
 
 - `pve.stemcell_replicate_storage_set` (unset, which means on wherever it applies). When a root or ephemeral storage set is bound, `create_stemcell` builds one cache template per member of the effective root set, each tagged `bosh-stemcell-storage-<storage-id>`, after the primary and best-effort, and the set-managed planner ranks the template on the placed member ahead of every other candidate so `clone_mode: auto` yields a linked clone on every member that holds a replica. A member with no replica clones in full with a warning naming the member and `bosh upload-stemcell --fix`, which rebuilds it. Overridable per cpi-config entry as `pve_stemcell_replicate_storage_set`. See `docs/multi-storage-placement.md#cache-templates-per-member`.
@@ -375,7 +377,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.0...v0.5.1
