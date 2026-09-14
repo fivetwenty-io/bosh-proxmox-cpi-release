@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- `pve.stemcell_replicate_storage_set` (default `false`). When a root or ephemeral storage set is bound, `create_stemcell` builds one cache template per member of the effective root set, each tagged `bosh-stemcell-storage-<storage-id>`, after the primary and best-effort, and the set-managed planner ranks the template on the placed member ahead of every other candidate so `clone_mode: auto` yields a linked clone on every member that holds a replica. A member with no replica clones in full with a warning naming the member and `bosh upload-stemcell --fix`, which rebuilds it. Overridable per cpi-config entry as `pve_stemcell_replicate_storage_set`. See `docs/multi-storage-placement.md#cache-templates-per-member`.
+
+### Fixed
+
+- `delete_stemcell` now sweeps every replica of a stemcell, whether tagged `bosh-stemcell-node-<node>` or `bosh-stemcell-storage-<storage-id>`, when the anchor's last director reference drops. `coMatchSafeToSweep` previously preserved a replica whose fossil provenance named another director, which leaked replicas in multi-director clusters. A replica that still backs a linked clone now fails the delete with its VMID and node before the qcow2 is removed, instead of a warning followed by a successful qcow2 delete.
+
 ## [0.6.0] - 2026-09-14
 
 ### Added
