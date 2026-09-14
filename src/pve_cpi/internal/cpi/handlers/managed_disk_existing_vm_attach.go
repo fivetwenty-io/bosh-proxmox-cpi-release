@@ -55,7 +55,7 @@ func attachExistingDiskToManagedVM(ctx context.Context, deps Deps, handle *aj.Ha
 	}
 	lifecycle.guard = guard
 	local := deps
-	local.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: lifecycle}
+	local.PVE = wrapManagedDiskClient(guard, lifecycle)
 	defer func() {
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {

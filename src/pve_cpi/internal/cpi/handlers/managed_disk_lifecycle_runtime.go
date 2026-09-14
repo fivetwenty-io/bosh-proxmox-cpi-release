@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"sort"
 	"time"
 )
@@ -159,6 +160,19 @@ func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verificati
 	return aj.Verification{EvidenceID: id, EvidenceJSON: body, Complete: true, AbsenceVerified: true, ArtifactDispositionVerified: true}, nil
 }
 
+// wrapManagedDiskClient builds the client every managed disk operation runs
+// on, which is the lifecycle decorator over the allocation guard's own
+// decorator. Every path that needs that chain builds it here, so the chain has
+// one definition and the tests that read it exercise the one production uses.
+//
+// unguardedPVE has to be able to walk back out of every decorator this
+// function adds, because the parker pool sweep runs on the client underneath
+// them all. A decorator added here therefore needs an unguardedClient method of
+// its own and a case in TestUnguardedPVE_WalksOutOfEveryAllocationGuardDecorator.
+func wrapManagedDiskClient(guard *ManagedAllocationGuard, m *managedDiskLifecycle) pve.Client {
+	return &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: m}
+}
+
 // managedDiskOperation returns request-local mutation services. Read-only
 // handlers must continue using resolveDiskForOp without this acquisition path.
 func managedDiskOperation(ctx context.Context, deps Deps, rd resolvedDisk, operation string) (Deps, *managedDiskLifecycle, error) {
@@ -172,7 +186,7 @@ func managedDiskOperation(ctx context.Context, deps Deps, rd resolvedDisk, opera
 	}
 	m.guard = guard
 	local := deps
-	local.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: m}
+	local.PVE = wrapManagedDiskClient(guard, m)
 	if deps.Config != nil {
 		copied := *deps.Config
 		disabled := false

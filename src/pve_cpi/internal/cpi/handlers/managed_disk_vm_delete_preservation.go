@@ -160,7 +160,7 @@ func preserveLegacyDiskForVMDelete(ctx context.Context, deps Deps, node string, 
 	}
 	lifecycle.guard = guard
 	local := deps
-	local.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: lifecycle}
+	local.PVE = wrapManagedDiskClient(guard, lifecycle)
 	current, err := resolveDiskForOp(ctx, deps, "delete_vm.preserve_legacy", disk.diskCID, disk.birth, disk.meta)
 	if err == nil && disk.stableID == "" {
 		current = disk

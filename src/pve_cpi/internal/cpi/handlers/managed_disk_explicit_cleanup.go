@@ -88,7 +88,7 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	disabled := false
 	copied.FastPathDelete = &disabled
 	local.Config = &copied
-	local.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: lifecycle}
+	local.PVE = wrapManagedDiskClient(guard, lifecycle)
 	defer func() {
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {
