@@ -1048,6 +1048,20 @@ pvesh set /pools/<new-pool> --vms <parker-vmid> --allow-move 1
 
 Run `python3 scripts/disk-audit --config /path/to/audit-config.json` afterwards and read the parker table's `POOL` column, allowing the cluster index its few minutes to catch up. Nothing is broken while the parkers are split across two pools. Every parker classifier keys on the `bosh-parker` tag and the VMID band rather than on pool membership, so a split pool costs us tidiness in the PVE UI and nothing else.
 
+### A workload VM found in the parker pool
+
+A workload VM lands in the parker pool when `pve.vm_pool_template` or a `vm_type` profile renders the same name the parker pool claims. The CPI refuses that. `create_vm` fails the request instead of creating a VM there, and the `set_vm_metadata` pool reconciler warns and skips rather than moving one in. A VM that an older release put there before those guards existed stays where it is.
+
+The CPI does not move it back out either. The reconciler re-renders the pool name from the VM's persisted tokens, gets the parker pool back, refuses it, and returns without moving anything, so the warning comes back on every deploy and the VM stays put. Nothing else is broken while it sits there, because every parker classifier keys on the `bosh-parker` tag and the VMID band rather than on pool membership.
+
+Moving it is a manual step. Put the VM in the workload pool it belongs in, and then change the template or the profile so the name it renders no longer collides, since the same tokens would otherwise send the next VM to the same place:
+
+```bash
+pvesh set /pools/<workload-pool> --vms <vmid> --allow-move 1
+```
+
+The audit reports these VMs. Run `python3 scripts/disk-audit --config /path/to/audit-config.json` and read the warnings on stderr. It counts every pool that holds a parker as a parker pool, and `--parker-pool <name>` names one that holds no parker yet.
+
 ### Recovering empty parker VMs
 
 The script prints the removal commands for each empty parker VM. Verify before running. The digit anchor matters: every parker carries a `scsihw:` line, so a bare `^scsi` matches on an empty parker too and the check never clears.
