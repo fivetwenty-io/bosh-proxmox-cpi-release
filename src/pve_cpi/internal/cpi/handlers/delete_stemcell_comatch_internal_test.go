@@ -45,9 +45,16 @@ func coMatchProvDesc(refs ...string) map[string]any {
 // unknown-director sentinel for an empty director UUID, and the gate must
 // resolve its own side the same way or this call's replicas read as foreign
 // and leak permanently.
+// coMatchProvDescSHA renders a provenance description for sha8 whose
+// DirectorRefs are exactly refs.
+func coMatchProvDescSHA(sha8 string, refs ...string) map[string]any {
+	prov := stemcellProvenance{Name: "ubuntu-jammy", Version: "1.0", SHA8: sha8, DirectorRefs: refs}
+	b, _ := json.Marshal(prov)
+	return map[string]any{pveConfigKeyDescription: string(b)}
+}
+
 func TestCoMatchSafeToSweep(t *testing.T) {
 	t.Parallel()
-	ref := pve.TemplateRef{VMID: 8102, Node: "pve2"}
 	notFound := sdkerrors.ParseAPIError(404, []byte(`{"message":"Configuration file 'nodes/pve2/qemu-server/8102.conf' does not exist"}`))
 
 	cases := []struct {
@@ -55,25 +62,32 @@ func TestCoMatchSafeToSweep(t *testing.T) {
 		cfg    map[string]any
 		cfgErr error
 		uuid   string
+		tags   string
 		want   bool
 	}{
-		{"empty refs allow", coMatchProvDesc(), nil, "dir-a", true},
-		{"sole own ref allows", coMatchProvDesc("dir-a"), nil, "dir-a", true},
-		{"foreign ref preserves", coMatchProvDesc("dir-b"), nil, "dir-a", false},
-		{"own plus foreign preserves", coMatchProvDesc("dir-a", "dir-b"), nil, "dir-a", false},
-		{"empty uuid matches sentinel refs", coMatchProvDesc("unknown-director"), nil, "", true},
-		{"empty uuid against real ref preserves", coMatchProvDesc("dir-a"), nil, "", false},
-		{"already gone reports false", nil, notFound, "dir-a", false},
-		{"unreadable config preserves", nil, stderrors.New("pmxcfs timeout"), "dir-a", false},
-		{"unparseable description preserves", map[string]any{pveConfigKeyDescription: "not json"}, nil, "dir-a", false},
+		{"empty refs allow", coMatchProvDesc(), nil, "dir-a", "", true},
+		{"sole own ref allows", coMatchProvDesc("dir-a"), nil, "dir-a", "", true},
+		{"foreign ref preserves", coMatchProvDesc("dir-b"), nil, "dir-a", "", false},
+		{"own plus foreign preserves", coMatchProvDesc("dir-a", "dir-b"), nil, "dir-a", "", false},
+		{"empty uuid matches sentinel refs", coMatchProvDesc("unknown-director"), nil, "", "", true},
+		{"empty uuid against real ref preserves", coMatchProvDesc("dir-a"), nil, "", "", false},
+		{"already gone reports false", nil, notFound, "dir-a", "", false},
+		{"unreadable config preserves", nil, stderrors.New("pmxcfs timeout"), "dir-a", "", false},
+		{"unparseable description preserves", map[string]any{pveConfigKeyDescription: "not json"}, nil, "dir-a", "", false},
+		{"storage replica with foreign ref is swept on last-ref", coMatchProvDesc("dir-b"), nil, "dir-a", "bosh-stemcell-sha-abcd1234;bosh-stemcell-storage-ns-2", true},
+		{"node replica with foreign ref is swept on last-ref", coMatchProvDesc("dir-b"), nil, "dir-a", "bosh-stemcell-sha-abcd1234;bosh-stemcell-node-pve2", true},
+		{"replica for a different sha8 is preserved", coMatchProvDescSHA("ffff0000", "dir-b"), nil, "dir-a", "bosh-stemcell-sha-ffff0000;bosh-stemcell-storage-ns-2", false},
+		{"replica already gone reports false", nil, notFound, "dir-a", "bosh-stemcell-sha-abcd1234;bosh-stemcell-storage-ns-2", false},
+		{"non-replica with foreign ref is preserved", coMatchProvDesc("dir-b"), nil, "dir-a", "bosh-stemcell-sha-abcd1234", false},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := coMatchSafeToSweep(context.Background(), coMatchDeps(tc.cfg, tc.cfgErr), ref, tc.uuid, log.NewNopLogger())
+			ref := pve.TemplateRef{VMID: 8102, Node: "pve2", Tags: tc.tags}
+			got := coMatchSafeToSweep(context.Background(), coMatchDeps(tc.cfg, tc.cfgErr), ref, tc.uuid, "abcd1234", log.NewNopLogger())
 			if got != tc.want {
-				t.Errorf("coMatchSafeToSweep(uuid=%q) = %v; want %v", tc.uuid, got, tc.want)
+				t.Errorf("coMatchSafeToSweep(uuid=%q tags=%q) = %v; want %v", tc.uuid, tc.tags, got, tc.want)
 			}
 		})
 	}
