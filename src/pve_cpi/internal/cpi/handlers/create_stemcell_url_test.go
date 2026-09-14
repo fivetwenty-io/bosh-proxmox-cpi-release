@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -791,4 +792,90 @@ func mustMarshalMap(t *testing.T, m map[string]any) json.RawMessage {
 		t.Fatalf("mustMarshalMap: %v", err)
 	}
 	return b
+}
+
+// ============================================================
+// TestCreateStemcell_SourceURL_BuildsStorageSetReplicas
+// Verifies that the server-download path also builds a cache template on
+// every member of the effective root set: the dedup hit at the top of
+// handleStemcellDownloadURL returns before any download, and the storage
+// fan-out still runs from there.
+// ============================================================
+
+func TestCreateStemcell_SourceURL_BuildsStorageSetReplicas(t *testing.T) {
+	t.Parallel()
+
+	const sha256hex = "cafebabe12345678cafebabe12345678cafebabe12345678cafebabe12345678"
+	const sha8 = "cafebabe"
+	const primaryVMID = int64(30010)
+	wantFilename := pve.BuildStemcellFilename("ubuntu-jammy", "1.504", sha256hex)
+	templateName := pve.BuildTemplateNameWithSHA("ubuntu-jammy", "1.504", sha8)
+
+	listFn := func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+		raw, _ := json.Marshal(map[string]string{"volid": "nfs:import/" + wantFilename})
+		resp := sdknodes.ListStorageContentResponse{raw}
+		return &resp, nil
+	}
+	dlFn := func(_ context.Context, _, _ string, _ *sdknodes.CreateStorageDownloadUrlParams) (*sdknodes.CreateStorageDownloadUrlResponse, error) {
+		return nil, errors.New("download must not be called on dedup hit")
+	}
+
+	deps := buildDownloadDeps(t, listFn, dlFn)
+
+	var mu sync.Mutex
+	var roots []string
+	nodes := deps.PVE.(*wbTemplateMockClient).nodesSvc.(*wbDownloadNodes)
+	nodes.listQemuFn = func(_ context.Context, _ string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+		row, _ := json.Marshal(map[string]any{
+			"vmid": primaryVMID, "name": templateName, "template": 1, "status": "stopped",
+			"tags": stemcellCacheTag + ";bosh-stemcell-sha-" + sha8,
+		})
+		resp := sdknodes.ListQemuResponse{row}
+		return &resp, nil
+	}
+	deps.PVE.(*wbTemplateMockClient).qemuSvc = &wbMockQEMU{
+		createFn: func(_ context.Context, _ string, params map[string]any) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			root, _ := params["virtio0"].(string)
+			roots = append(roots, root)
+			return "", nil
+		},
+		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+			if int64(vmid) == primaryVMID {
+				return map[string]any{"virtio0": "ns_1:base-30010-disk-0.qcow2,size=5G"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{listResourcesFn: listClusterResourcesEmpty()}
+	deps.Config.VMStorage = "ns_1"
+	deps.Config.EphemeralStorageSet = "eph"
+	deps.Config.StemcellReplicateStorageSet = true
+	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2"},
+		Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
+	src := &planFixtureSource{statuses: map[string][]json.RawMessage{}}
+	for _, id := range []string{"ns_1", "ns_2"} {
+		src.defs = append(src.defs, planJSON(t, map[string]any{"storage": id, "type": "nfs", "shared": 1, "server": "nas", "export": "/" + id, "content": "images,import"}))
+		src.statuses["pve-node1"] = append(src.statuses["pve-node1"], planJSON(t, map[string]any{"storage": id, "active": 1, "enabled": 1, "total": uint64(100) << 30, "avail": uint64(80) << 30}))
+	}
+	deps.ReplicaInventory = src
+
+	h := HandleCreateStemcell(deps)
+	cp := map[string]any{
+		"name":       "ubuntu-jammy",
+		"version":    "1.504",
+		"source_url": "https://example.com/stemcell.qcow2",
+		"sha256":     sha256hex,
+	}
+	args := []json.RawMessage{mustMarshalStr(t, "/dev/null"), mustMarshalMap(t, cp)}
+
+	if _, err := h.Handle(context.Background(), args, jsonrpc.Context{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(roots) != 1 || !strings.HasPrefix(roots[0], "ns_2:0,import-from=nfs:import/") {
+		t.Fatalf("want exactly one replica create on ns_2, got %v", roots)
+	}
 }
