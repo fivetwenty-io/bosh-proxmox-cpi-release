@@ -108,7 +108,7 @@ Each parker VM is created with the following fixed properties:
 | --- | --- |
 | Name | `<prefix>-parker-<vmid>`, where the prefix comes from `pve.parker_prefix` when we set it, from `pve.vm_prefix` when we do not (sanitized to the VM name character set and truncated to 46 bytes, with a warning when we truncate it), or from the literal `bosh` when we set neither. At the defaults the name comes out the same as before, `bosh-parker-<vmid>`. |
 | Tags | `bosh-cpi` and `bosh-parker`, always in that order; `director--<id>` next, when the calling director's identity is present in the request context (automatic, no configuration needed); `vm-prefix--<prefix>` last, always, naming the resolved parker prefix |
-| Pool | Parkers join the PVE resource pool that `pve.parker_pool` names. That property is a template whose only token is `{prefix}`, which stands for the resolved parker prefix. Its default is `{prefix}-parker`, so the default pool is `bosh-parker`. Setting it to the empty string opts us out of pooling. We create the pool on first use and write CPI provenance into its comment. Placement runs as a best-effort sweep after each park, so a placement failure only logs a warning and never fails the park. We check membership per pool rather than through the cluster-wide index, which lags. Renaming the pool afterward does not move parkers already in it; we move them by hand. A workload VM that a template rendered onto the parker pool needs the same manual move, and [A workload VM found in the parker pool](operations.md#a-workload-vm-found-in-the-parker-pool) walks through it. |
+| Pool | Parkers join the PVE resource pool that `pve.parker_pool` names. That property is a template whose only token is `{prefix}`, which stands for the resolved parker prefix. Its default is `{prefix}-parker`, so the default pool is `bosh-parker`. Setting it to the empty string opts us out of pooling. We create the pool on first use and write CPI provenance into its comment. Placement runs as a best-effort sweep after each park, so a placement failure only logs a warning and never fails the park. The sweep places only the parkers whose prefix matches this deployment's resolved prefix, so a parker that another prefix created stays where it is. We check membership per pool rather than through the cluster-wide index, which lags. Renaming the pool afterward does not move parkers already in it; we move them by hand. A workload VM that a template rendered onto the parker pool needs the same manual move, and [A workload VM found in the parker pool](operations.md#a-workload-vm-found-in-the-parker-pool) walks through it. |
 | `onboot` | `0` — never auto-started |
 | `protection` | `1` — PVE blocks deletion while protection is set |
 | `memory` | 16 MiB |
@@ -118,10 +118,16 @@ Each parker VM is created with the following fixed properties:
 
 When a parker VM fills all 31 slots, the CPI creates a second parker VM in the
 same VMID band and attaches subsequent disks there. Each new park reuses the
-lowest existing parker that still has a free slot before creating another,
-so the VMID band fills densely rather than one parker per disk. Each
-parker VM is node-scoped: one parker (or chain of parkers) per PVE cluster
-node.
+lowest existing parker of the same prefix that still has a free slot before
+creating another, so the VMID band fills densely rather than one parker per
+disk. The prefix here is the one the deployment resolves for itself, and a
+parker that another prefix created is never reused, even when it has room to
+spare. We read a parker's prefix from its `vm-prefix--<prefix>` tag, and we
+fall back to its `<prefix>-parker-<vmid>` name when it carries no such tag. A
+parker with neither counts as a `bosh` parker, so only a park that resolved
+the `bosh` prefix reuses an untagged parker from an earlier release. Parkers
+are node-scoped as well, so each prefix keeps one parker, or one chain of
+parkers, on each PVE cluster node.
 
 ### Provenance sentinel
 
@@ -184,13 +190,14 @@ a remove whose config write failed, or a director torn down while its disks
 were reaped by hand.
 
 A parker whose live records still fill the store presents a capacity condition,
-handled exactly like a parker with no free slot: the disk goes to the next
-parker on the node, or to a freshly allocated one. That decision lands before
-anything destructive runs, so a full store never puts a disk at risk. Capacity
-means both halves: a free slot and room for the record. An ordinary park
-confirms both before the disk moves, because a parker with free slots and a full
-store would otherwise take the disk and fail only the advisory write, leaving the
-volume where its CID, its source VM, and its option overlay cannot follow it.
+handled exactly like a parker with no free slot, so the disk goes to the next
+parker of the same prefix on the node, or to a freshly allocated one. That
+decision lands before anything destructive runs, so a full store never puts a
+disk at risk. Capacity means both halves: a free slot and room for the record.
+An ordinary park confirms both before the disk moves, because a parker with free
+slots and a full store would otherwise take the disk and fail only the advisory
+write, leaving the volume where its CID, its source VM, and its option overlay
+cannot follow it.
 
 The `disk-audit` script reads these sentinel entries to build its inventory.
 Free-floating disks have no provenance entry because PVE provides no field to
@@ -235,9 +242,10 @@ promise and are always handled permissively. See
 1. BOSH calls `detach_disk`.
 2. The CPI detaches the disk from its VM via the PVE config PUT (synchronous).
 3. The CPI calls `ParkDisk`: checks whether the disk is already parked
-   (idempotent); if not, calls `EnsureParker` to find or create a parker VM
-   on the disk's node; reads the parker's config to find a free `scsiN` slot;
-   attaches the disk with an explicit `DiskID`; writes the provenance sentinel.
+   (idempotent); if not, calls `EnsureParker` to find or create a parker VM of
+   this deployment's resolved prefix on the disk's node; reads the parker's
+   config to find a free `scsiN` slot; attaches the disk with an explicit
+   `DiskID`; writes the provenance sentinel.
 4. Park failure is fail-closed and keeps the class the park chose: most
    failures are retriable, and the Director's retry finds the disk
    free-floating, so `ParkDisk`'s idempotency check re-parks it without

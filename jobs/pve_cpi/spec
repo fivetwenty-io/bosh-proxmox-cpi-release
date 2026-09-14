@@ -1525,13 +1525,19 @@ properties:
 
       A deployment that already sets pve.vm_prefix inherits it here without
       any change to this property, so parkers created after upgrading to a
-      release with this property are named differently from the parkers
-      that same deployment created before the upgrade. The existing ones
-      keep their bosh-parker-<vmid> names, and the pool sweep places them
-      in the parker pool beside the new ones the next time a disk parks on
-      their node. The mix is harmless, because every parker classifier
-      keys on the bosh-parker tag and the VMID band and never on the name,
-      but an operator who already sets vm_prefix should expect it.
+      release with this property are named differently from the parkers that
+      same deployment created before the upgrade. The existing ones keep
+      their bosh-parker-<vmid> names, and they now sit under a different
+      prefix from the new ones. A park reuses only a parker whose prefix
+      matches the deployment's resolved prefix, and the pool sweep pools only
+      those same parkers, so this deployment creates fresh parkers and fills
+      them from the upgrade on. We read a parker's prefix from its
+      vm-prefix-- tag, or from its name when it carries no such tag, and a
+      parker that has neither counts as a bosh parker. The older parkers
+      therefore belong to the bosh prefix. They keep holding the disks they
+      already hold, and those disks attach, unpark, and delete exactly as
+      they did. An operator who wants the old parkers to keep filling sets
+      this property to bosh explicitly.
 
       When set explicitly, the value must match
       "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", be no more than 46 bytes
