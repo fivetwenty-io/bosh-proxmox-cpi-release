@@ -52,6 +52,21 @@ jobs:
       GOCACHE: /root/.cache/go-build
 
     steps:
+      - name: Drop a workspace clone an earlier job left partial
+        # The linear-history job used to check out a tree:0 promisor clone into
+        # this shared workspace, and a runner that ran it once kept that clone.
+        # The next full checkout on that runner then came up with a commit and
+        # no files, which setup-go reported as a missing go.mod. Remove the
+        # clone when it carries either mark, so checkout starts from nothing.
+        # On a healthy workspace this step does nothing.
+        shell: sh
+        run: |
+          ws="${GITHUB_WORKSPACE}"
+          if [ -f "$ws/.git/config" ] && grep -qE 'partialclonefilter|sparseCheckout' "$ws/.git/config" "$ws/.git/config.worktree" 2>/dev/null; then
+            echo "removing the partial clone in $ws"
+            rm -rf "$ws/.git"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v7
 
