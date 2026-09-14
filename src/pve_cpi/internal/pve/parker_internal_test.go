@@ -340,6 +340,76 @@ func TestParkerBelongsToDirector(t *testing.T) {
 	}
 }
 
+// TestParkerBelongsToPrefix walks the whole evidence ladder a parker's prefix
+// identity is read from. The tag is the first answer, the canonical name is
+// the fallback for a parker created before the tag existed, and a parker with
+// neither belongs to the "bosh" default, which is also what a deployment that
+// never set a prefix resolves to. The comparison folds case at every rung,
+// because PVE lowercases a tag it stores unless the datacenter tag-style
+// option has been set to keep tags case-sensitive.
+func TestParkerBelongsToPrefix(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		tags   string
+		vmName string
+		prefix string
+		want   bool
+	}{
+		{"the tag names our prefix", "bosh-cpi;bosh-parker;vm-prefix--blue", "blue-parker-90000", "blue", true},
+		{"the tag names another prefix", "bosh-cpi;bosh-parker;vm-prefix--green", "green-parker-90000", "blue", false},
+		{"no tag and the name names our prefix", "bosh-cpi;bosh-parker", "blue-parker-90000", "blue", true},
+		{"no tag and the name names another prefix", "bosh-cpi;bosh-parker", "green-parker-90000", "blue", false},
+		{"a legacy parker with neither belongs to bosh", "bosh-cpi;bosh-parker", "", "bosh", true},
+		{"a legacy parker with neither is not ours", "bosh-cpi;bosh-parker", "", "blue", false},
+		{"an empty prefix resolves to bosh", "bosh-cpi;bosh-parker", "bosh-parker-90472", "", true},
+		{"the tag wins over a disagreeing name", "bosh-parker;vm-prefix--green", "blue-parker-90000", "blue", false},
+		{"the tag wins over a legacy-shaped name", "bosh-parker;vm-prefix--blue", "bosh-parker-90000", "blue", true},
+		{"our prefix among two tags still counts as ours", "bosh-parker;vm-prefix--green;vm-prefix--blue", "", "blue", true},
+		{"neither of two tags is ours", "bosh-parker;vm-prefix--green;vm-prefix--red", "", "blue", false},
+		{"a comma-separated tag is honored", "bosh-cpi,bosh-parker,vm-prefix--blue", "", "blue", true},
+		{"a name that is not the parker shape falls back to bosh", "bosh-parker", "some-operators-vm", "bosh", true},
+		{"a prefix holding the parker infix reads back whole", "bosh-parker", "a-parker-b-parker-9", "a-parker-b", true},
+		{"an uppercase configured prefix matches a lowercased tag", "bosh-parker;vm-prefix--blue", "", "Blue", true},
+		{"an uppercase tag matches a lowercase configured prefix", "bosh-parker;vm-prefix--BLUE", "", "blue", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parkerBelongsToPrefix(tc.tags, tc.vmName, tc.prefix); got != tc.want {
+				t.Errorf("parkerBelongsToPrefix(%q, %q, %q) = %v, want %v",
+					tc.tags, tc.vmName, tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParkerPrefixIdentity reads the identity itself rather than the verdict,
+// so the default the legacy branch falls back to is pinned to whatever
+// resolveParkerPrefix says rather than to a second copy of the literal.
+func TestParkerPrefixIdentity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		tags   string
+		vmName string
+		want   string
+	}{
+		{"the tag", "bosh-parker;vm-prefix--blue", "green-parker-90000", "blue"},
+		{"the name when no tag is there", "bosh-parker", "green-parker-90000", "green"},
+		{"the default when neither is there", "bosh-parker", "", resolveParkerPrefix("")},
+		{"the first of two tags", "bosh-parker;vm-prefix--green;vm-prefix--blue", "", "green"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parkerPrefixIdentity(tc.tags, tc.vmName); got != tc.want {
+				t.Errorf("parkerPrefixIdentity(%q, %q) = %q, want %q", tc.tags, tc.vmName, got, tc.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // parker protection-window lock
 // ---------------------------------------------------------------------------
