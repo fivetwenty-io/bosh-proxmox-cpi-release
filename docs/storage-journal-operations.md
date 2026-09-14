@@ -24,6 +24,8 @@ cpi storage-journal initialize \
 
 The flags record operator attestations. Supply them only after establishing the stated conditions. Initialization refuses existing enrollment or conflicting provenance. Restore retained history when resources already belong to the namespace.
 
+The audit lists the content of every image-capable storage on every node. If it cannot finish one of those listings, `complete` stays false, since an unread storage could hold volumes the namespace already owns. A storage whose definition is disabled is the one exception. PVE refuses to list a disabled storage and refuses to allocate on it, so the audit skips it, reports it under `skipped_disabled_storages`, and stays complete. The audit never inspected the content of a storage it skipped, so run it again after re-enabling one and before relying on absence there. A disabled storage that a retained record does name is still audited, and its listing failure still keeps the audit incomplete.
+
 ## Inspect retained allocations
 
 ```sh

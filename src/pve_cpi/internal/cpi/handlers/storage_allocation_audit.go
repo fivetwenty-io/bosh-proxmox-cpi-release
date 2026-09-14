@@ -41,6 +41,13 @@ type StorageAllocationAudit struct {
 	Issues         []string                    `json:"issues"`
 	Conflicts      []string                    `json:"conflicts"`
 	Records        []aj.Record                 `json:"records"`
+	// SkippedDisabledStorages lists image-capable storages that PVE reports
+	// as disabled and that no retained record ever named. PVE refuses to
+	// list a disabled storage's content, and neither PVE nor this CPI can
+	// allocate on one, so leaving it uninspected does not weaken the absence
+	// proof. The list is disclosed so an operator who re-enables one of them
+	// knows it was never audited.
+	SkippedDisabledStorages []string `json:"skipped_disabled_storages"`
 }
 
 // AuditStorageAllocations reads current definitions and retained historical
@@ -112,6 +119,8 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 	result.Issues = slices.Compact(result.Issues)
 	sort.Strings(result.Conflicts)
 	result.Conflicts = slices.Compact(result.Conflicts)
+	sort.Strings(result.SkippedDisabledStorages)
+	result.SkippedDisabledStorages = slices.Compact(result.SkippedDisabledStorages)
 	if len(result.Conflicts) > 0 {
 		result.Complete = false
 	}
@@ -434,6 +443,14 @@ func storageAuditTargets(ctx context.Context, deps Deps, nodes []string, histori
 	for id := range stores {
 		def := stores[id]
 		if !strings.Contains(","+def.Content+",", ",images,") && !strings.Contains(","+def.Content+",", ",iso,") && historical[id] == nil {
+			continue
+		}
+		// A disabled storage cannot be listed or allocated on, so it is
+		// skipped and disclosed rather than counted as an inspection failure.
+		// A disabled storage that a retained record names is still audited,
+		// and the listing failure that follows keeps the audit incomplete.
+		if def.Disabled && historical[id] == nil {
+			result.SkippedDisabledStorages = append(result.SkippedDisabledStorages, id)
 			continue
 		}
 		for _, node := range allNodes {

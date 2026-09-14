@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,10 +42,23 @@ type allocationAuditNodes struct {
 	ns.Service
 	content ns.ListStorageContentResponse
 	failure error
+	mu      sync.Mutex
+	listed  []string
 }
 
-func (n *allocationAuditNodes) ListStorageContent(context.Context, string, string, *ns.ListStorageContentParams) (*ns.ListStorageContentResponse, error) {
+// ListStorageContent records every listing it serves; the audit fans out
+// across worker goroutines, so the record is guarded.
+func (n *allocationAuditNodes) ListStorageContent(_ context.Context, node, storage string, _ *ns.ListStorageContentParams) (*ns.ListStorageContentResponse, error) {
+	n.mu.Lock()
+	n.listed = append(n.listed, node+"/"+storage)
+	n.mu.Unlock()
 	return &n.content, n.failure
+}
+
+func (n *allocationAuditNodes) listedStorages() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.listed)
 }
 func auditFixture(t *testing.T) (Deps, *aj.Journal, *allocationAuditClient) {
 	t.Helper()
@@ -343,5 +358,46 @@ func TestAllocationAuditPreservationTargetsDoNotRequireVMMarker(t *testing.T) {
 		if len(report.Conflicts) > 0 || !report.Complete {
 			t.Fatalf("preservation target became owned VM: %+v", report)
 		}
+	}
+}
+
+func TestAllocationAuditSkipsAndDisclosesDisabledStorage(t *testing.T) {
+	deps, j, c := auditFixture(t)
+	c.storageRead.definitions = append(c.storageRead.definitions,
+		json.RawMessage(`{"storage":"local-lvm","type":"lvmthin","vgname":"pve","thinpool":"data","content":"images,rootdir","disable":1}`),
+		json.RawMessage(`{"storage":"local","type":"dir","path":"/var/lib/vz","content":"iso,vztmpl,backup","disable":1}`))
+	report, err := AuditStorageAllocations(context.Background(), deps, j, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete || !report.VMScanComplete || len(report.Issues) != 0 {
+		t.Fatalf("disabled storage counted as an inspection failure: %+v", report)
+	}
+	if strings.Join(report.SkippedDisabledStorages, ",") != "local,local-lvm" {
+		t.Fatalf("disabled storages not disclosed: %+v", report.SkippedDisabledStorages)
+	}
+	listed := c.nodesRead.listedStorages()
+	for _, entry := range listed {
+		if strings.HasSuffix(entry, "/local") || strings.HasSuffix(entry, "/local-lvm") {
+			t.Fatalf("disabled storage was listed: %v", listed)
+		}
+	}
+	if !slices.Contains(listed, "pve1/a") {
+		t.Fatalf("enabled storage was not listed: %v", listed)
+	}
+}
+
+func TestAllocationAuditDisabledHistoricalStorageStaysAudited(t *testing.T) {
+	deps, _, c := auditFixture(t)
+	c.storageRead.definitions = append(c.storageRead.definitions,
+		json.RawMessage(`{"storage":"local-lvm","type":"lvmthin","vgname":"pve","thinpool":"data","content":"images","disable":1}`))
+	c.nodesRead.failure = errors.New("storage 'local-lvm' is disabled")
+	records := []aj.Record{{ID: "old-disk", Namespace: "director", Kind: "disk", State: aj.Observed, Steps: []aj.Step{{ID: "owned", State: aj.Observed, Target: aj.Target{Node: "pve1", Storage: "local-lvm"}, VolIDs: []string{"local-lvm:vm-100-disk-0"}}}}}
+	report, err := auditStorageAllocationRecords(context.Background(), deps, records, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Complete || len(report.SkippedDisabledStorages) != 0 {
+		t.Fatalf("historical disabled storage was skipped: %+v", report)
 	}
 }
