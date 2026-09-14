@@ -21,6 +21,8 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D11 | HA versus the BOSH resurrector | An active, once-per-process warning plus a dedicated ownership doc; no change to `has_vm` behavior |
 | D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
 | D13 | Stable disk identity and ownership transfer | A drive `serial=` token becomes the disk's stable identity; ownership transfers by `move_disk` reassignment; the envelope volid becomes a birth record with legacy fallback forever |
+| D14 | Upload node targeting | Address the node, no direct dial |
+| D15 | Per-member stemcell cache | Opt-in replica template on every root set member, swept with the primary |
 
 ---
 
@@ -299,6 +301,18 @@ Two guardrails matter operationally. First, a key inside the registry carrying a
 **Chosen: keep addressing the owning node through the shared connection.** The failure mode the knob would guard against does not exist on the PVE versions we support, so the knob is not built. Addressing is still load-bearing: the owning-node retarget in `create_stemcell` picks a node that owns the storage, and the audit confirms PVE then places the volume there. This also avoids the TLS cost a direct dial would carry (node IPs would need to appear in certificate SANs).
 
 **One quirk worth knowing.** The upload task's UPID names the connection node, not the addressed node, even though the volume lands on the addressed node. Task polling must follow the node embedded in the UPID rather than the node the request addressed; `AwaitTask` already does this (it re-targets to `nodeFromUPID` whenever the two disagree), so no CPI change was needed.
+
+## D15 — Per-member stemcell cache: replicas on every root set member
+
+**Context.** A linked clone lands on its template's storage, and the CPI builds one cache template per cluster on `vm_storage`. The 0.6.0 storage-set design served every other member through full clones and declined to build a replica cache, so with a four-member root set three roots in four copied the whole stemcell across NFS on every create.
+
+**Options considered.** Keep full clones and accept the create time. Force `clone_mode: full` for uniform behavior. Build one template per member eagerly at upload time and let the planner prefer the same-member template. Build the member template lazily inside `create_vm`, which the CPI has always refused to do because a cache rebuild inside a create is unbounded work on the deploy path.
+
+**Chosen: eager per-member replicas, opt-in.** `pve.stemcell_replicate_storage_set` makes `create_stemcell` build one replica per member of the effective root set, tagged `bosh-stemcell-storage-<storage-id>`, after the primary and best-effort. `sourceFor` ranks a same-storage template first, so the existing linked-versus-full rule yields a linked clone wherever a replica exists. Replicas never hold a director reference. `delete_stemcell` sweeps every replica of the stemcell on the anchor's last reference, no longer preserves a replica because its fossil provenance names another director, which also closes a leak for per-node replicas in multi-director clusters, and refuses to delete the qcow2 while any replica still backs a linked clone.
+
+**Operator-visible consequences.** One extra template per member per stemcell in the 30000 band. Creates on every member run at linked-clone speed. A missing replica is a warning on the create and a full clone, never a failure. Two explicit member names that sanitize to the same tag are a config error. `pve-cid stemcells` shows replicas under their sha8 as before.
+
+**Migration.** None. Turn the property on, run `bosh upload-stemcell --fix` once per stemcell, or wait for the next upload.
 
 ## Out of scope
 

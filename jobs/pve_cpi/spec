@@ -1361,9 +1361,9 @@ properties:
       linked on whichever member placement chose instead of copying the
       stemcell in full onto every member other than pve.vm_storage.
 
-      Replicas build after the primary template, best-effort: a member that
-      fails is logged and skipped, and `bosh upload-stemcell --fix` builds
-      the missing ones. Replicas hold no director reference of their own.
+      Replicas build after the primary template and never fail the upload.
+      A member that fails is logged and skipped, and `bosh upload-stemcell
+      --fix` builds the missing ones. Replicas hold no director reference of their own.
       delete_stemcell sweeps them with the primary on its last reference.
 
       Requires pve.stemcell_strategy "template" and a bound root or

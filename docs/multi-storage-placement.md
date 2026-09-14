@@ -76,6 +76,16 @@ Every set requires an explicit name and version.
 
 Two named sets can reference the same exports with different strategies. This lets deployments select different policies through VM and disk types. Duplicate physical backings within one set are rejected.
 
+## Cache templates per member
+
+A linked clone lands on the storage its template lives on, and the CPI builds one cache template per cluster on `vm_storage`. So with a multi-member root set, a root placed on any other member is a full copy of the stemcell across the network. Set `pve.stemcell_replicate_storage_set: true` and `create_stemcell` builds a template on every member of the effective root set as well, tagged `bosh-stemcell-storage-<storage-id>`, and the planner ranks the template on the placed member ahead of every other candidate. Under `clone_mode: auto` every root then comes up as a linked clone.
+
+The replicas build after the primary and never fail the upload. A member that is unreachable, full, or node-local is skipped with a warning naming it, and a `create_vm` placed there clones in full with a warning that names the member and suggests `bosh upload-stemcell --fix`, which rebuilds the missing replica through the ordinary dedup path. A member added to the set later gets its replica on the next upload or `--fix`; a member removed keeps its replica until the stemcell is deleted.
+
+Each replica is one more image on its member. The cost is the member count times the stemcell count times the image size, the planner does not charge it against capacity, and `least_utilized` sees it as used bytes after each upload. The template VMID band, 30000 to 30999 by default, is shared by every template, so replicas multiply the templates per stemcell by the member count plus one.
+
+Replicas hold no director reference. The primary's reference set decides the stemcell's lifetime, and `delete_stemcell` sweeps every replica of that stemcell when the last reference drops, whichever director built them. A replica that still backs a running linked clone refuses to die, and `delete_stemcell` then returns an error naming it before touching the qcow2, so the base images under those VMs are never orphaned. Nothing here relaxes the `linked-only root requires singleton set` rule. `clone_mode: linked` still needs a one-member set, because a missing replica under a hard linked requirement would fail the create outright.
+
 ## Resolve membership and shared capacity
 
 Use exactly one of `names` or `name_pattern`. Patterns follow Go RE2 search semantics, so anchor them when the whole ID must match.
