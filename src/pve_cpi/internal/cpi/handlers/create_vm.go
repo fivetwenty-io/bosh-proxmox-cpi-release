@@ -1813,6 +1813,20 @@ func resolveTemplateCacheTarget(
 		return 0, "", false, nil
 	}
 
+	// Storage-set replicas live on set members, not on vm_storage. The
+	// legacy path clones onto vm_storage, so a replica here would only
+	// downgrade to a full clone. Prefer non-replica templates; fall back to
+	// the full list only when nothing else exists.
+	primaries := refs[:0:0]
+	for _, ref := range refs {
+		if !ref.IsStorageReplica() {
+			primaries = append(primaries, ref)
+		}
+	}
+	if len(primaries) > 0 {
+		refs = primaries
+	}
+
 	// Prefer a template already on shape.node.
 	for _, ref := range refs {
 		if ref.Node == shape.node {
