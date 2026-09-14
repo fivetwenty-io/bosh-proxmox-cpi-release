@@ -1,7 +1,7 @@
 # ci/integration.scheduled.yml
 #
-# Scheduled-run integration config for the acceptance workflow
-# (.github/workflows/acceptance.yml). The workflow materializes this file to
+# Scheduled-run integration config for the certification workflow
+# (.github/workflows/certification.yml). The workflow materializes this file to
 # the gitignored ci/integration.yml after substituting the ${...} placeholders
 # from repository variables, then runs scripts/certify and scripts/bats
 # against the cpitest env bundle.

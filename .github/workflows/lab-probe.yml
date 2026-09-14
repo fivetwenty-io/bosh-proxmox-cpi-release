@@ -1,7 +1,7 @@
 name: Lab Probe
 
 # Manual reachability probe: settles whether the self-hosted runner can reach
-# the PVE lab before the scheduled acceptance workflow is trusted with a
+# the PVE lab before the scheduled certification workflow is trusted with a
 # 6-hour slot. Runs on the runner HOST (no container) so it measures the same
 # network position a container with host networking would get, without any
 # image dependency. The targets arrive as dispatch inputs, so this workflow

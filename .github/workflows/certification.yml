@@ -1,6 +1,6 @@
-name: Acceptance
+name: Certification
 
-# Scheduled acceptance runs against the latest published release: the
+# Scheduled certification runs against the latest published release: the
 # Director Upgrade certification (scripts/certify, N-1 -> N of the published
 # releases) followed by a fresh director bootstrap on the latest tag and the
 # BOSH Acceptance Tests (scripts/bats). Run reports are committed under
@@ -72,7 +72,7 @@ env:
   GOMAXPROCS: 2
 
 jobs:
-  acceptance:
+  certification:
     name: Certify and BATS
     # Pinned to the bosh-lab label, which only the runners on the first
     # worker VM carry. The lab fleet grew to two VMs on 2026-08-24, and
@@ -361,7 +361,7 @@ jobs:
           gh pr create --repo "${GITHUB_REPOSITORY}" \
             --head "${REPORT_BRANCH}" --base main \
             --title "docs(certification): scheduled run reports $(date -u +%F)" \
-            --body "Automated certification reports from acceptance run ${GITHUB_RUN_ID}."
+            --body "Automated certification reports from certification run ${GITHUB_RUN_ID}."
           gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
           # A branch pushed with the job's GITHUB_TOKEN raises no push or
           # pull_request events (GitHub suppresses workflow triggers from
