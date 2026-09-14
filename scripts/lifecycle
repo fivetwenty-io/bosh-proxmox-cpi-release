@@ -831,10 +831,23 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
 
     parker_cfg = verifier.qemu_config(parker_vmid)
     expected_parker_prefix = resolved_parker_prefix(_base_cfg)
-    verifier.assert_true(
-        f"parker {parker_vmid} is named {expected_parker_prefix}-parker-{parker_vmid}",
-        str(parker_cfg.get("name", "")) == f"{expected_parker_prefix}-parker-{parker_vmid}",
-    )
+    # The CPI fills any parker on the node that has a free slot before it
+    # creates a new one, and it never renames or retags a parker it finds, so
+    # a parker that was on the node before this run keeps whatever name and
+    # tags its own creator gave it. Only a parker this park created can prove
+    # the prefix and the identity tag. Pool placement is different, because
+    # the sweep after a park puts every parker on the node into the pool.
+    parker_is_new = parker_vmid not in parkers_before
+    if parker_is_new:
+        verifier.assert_true(
+            f"parker {parker_vmid} is named {expected_parker_prefix}-parker-{parker_vmid}",
+            str(parker_cfg.get("name", "")) == f"{expected_parker_prefix}-parker-{parker_vmid}",
+        )
+    else:
+        print(
+            f"    note: parker {parker_vmid} predates this run as {parker_cfg.get('name', '')!r}; "
+            "the CPI never renames a parker, so its name is not checked"
+        )
     verifier.assert_true(
         f"parker {parker_vmid} is protected against disk and VM removal",
         str(parker_cfg.get("protection", "0")) == "1",
@@ -864,10 +877,16 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         any(t.strip().lower() == "bosh-cpi" for t in parker_tags.split(";")),
     )
     expected_prefix_tag = f"vm-prefix--{expected_parker_prefix}"
-    verifier.assert_true(
-        f"parker {parker_vmid} carries the {expected_prefix_tag} identity tag",
-        any(t.strip().lower() == expected_prefix_tag.lower() for t in parker_tags.split(";")),
-    )
+    if parker_is_new:
+        verifier.assert_true(
+            f"parker {parker_vmid} carries the {expected_prefix_tag} identity tag",
+            any(t.strip().lower() == expected_prefix_tag.lower() for t in parker_tags.split(";")),
+        )
+    else:
+        print(
+            f"    note: parker {parker_vmid} predates this run with tags {parker_tags!r}; "
+            "the CPI never retags a parker, so the identity tag is not checked"
+        )
     # PlaceParkersInPool is the only code that reads pve.parker_pool, and it
     # runs outside the park itself, so this checks the pool's own member list
     # rather than trusting a field on the parker's VM config. /cluster/resources
