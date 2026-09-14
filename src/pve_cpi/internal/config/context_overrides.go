@@ -357,7 +357,10 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		if err != nil {
 			return err
 		}
-		c.StemcellReplicateStorageSet = b
+		// An entry that names the key is stating an explicit choice, so the
+		// pointer is always set here and the tri-state default never applies
+		// to that cluster.
+		c.StemcellReplicateStorageSet = &b
 		return nil
 	},
 	// VM-name prefix is cluster-facing identity (operators distinguish each

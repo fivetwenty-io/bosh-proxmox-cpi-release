@@ -565,10 +565,16 @@ type CPIConfig struct {
 	// whichever member placement chose. Each replica carries the tag
 	// "bosh-stemcell-storage-<sanitized-storage-id>" beside the shared
 	// content tag. Replicas hold no director reference; delete_stemcell
-	// sweeps them with the primary on its last reference. Requires
-	// stemcell_strategy "template" and a bound root or ephemeral set.
-	// Default false. Validated only when set; omitted from ERB when false.
-	StemcellReplicateStorageSet bool `json:"stemcell_replicate_storage_set,omitempty"`
+	// sweeps them with the primary on its last reference.
+	// Tri-state. nil (field absent) means replicate whenever the
+	// preconditions hold, because a set-managed root that lands off
+	// vm_storage copies the whole stemcell across the network otherwise, and
+	// a set whose only member is vm_storage builds nothing. *false opts out.
+	// *true additionally makes the preconditions mandatory, so a missing set
+	// or stemcell_strategy "import" is a config error rather than a quiet
+	// no-op. Read StemcellReplicateStorageSetEnabled() for the effective
+	// bool; emitted to ERB only when the operator sets it explicitly.
+	StemcellReplicateStorageSet *bool `json:"stemcell_replicate_storage_set,omitempty"`
 
 	// StemcellStrategy selects how create_vm materializes a VM root disk from
 	// a stemcell CID.
@@ -3635,6 +3641,23 @@ func (c *CPIConfig) ISOStorageFollowVMStorageEnabled() bool {
 		return true
 	}
 	return *c.ISOStorageFollowVMStorage
+}
+
+// StemcellReplicateStorageSetEnabled returns the effective
+// stemcell_replicate_storage_set setting. *false → false (opt-out). Otherwise
+// replication is on whenever it can do anything at all, which means a bound
+// effective root storage set and a stemcell strategy that builds templates.
+// nil (field absent from JSON) and *true agree on that answer; they differ
+// only in ValidateStoragePlacement, where *true turns the missing
+// preconditions into config errors.
+func (c *CPIConfig) StemcellReplicateStorageSetEnabled() bool {
+	if c == nil {
+		return false
+	}
+	if c.StemcellReplicateStorageSet != nil && !*c.StemcellReplicateStorageSet {
+		return false
+	}
+	return c.EffectiveRootStorageSet() != "" && c.StemcellStrategy != StemcellStrategyImport
 }
 
 // HooksValue returns the configured hook names in order, or nil when none are

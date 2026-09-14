@@ -33,7 +33,7 @@ func replicaInventorySource(deps Deps) inv.Source {
 // never reach the builder, which would otherwise mint a template with no
 // sha tag that nothing can dedup against.
 func storageSetReplicasNeeded(deps Deps, sha256hex string) (string, bool) {
-	if deps.Config == nil || !deps.Config.StemcellReplicateStorageSet || sha8Of(sha256hex) == "" {
+	if !deps.Config.StemcellReplicateStorageSetEnabled() || sha8Of(sha256hex) == "" {
 		return "", false
 	}
 	set := deps.Config.EffectiveRootStorageSet()

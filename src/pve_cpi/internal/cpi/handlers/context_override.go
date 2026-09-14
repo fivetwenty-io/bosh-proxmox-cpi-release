@@ -394,8 +394,15 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd,
 		cfg.DetachedDiskStrategyValue())
 	_, _ = fmt.Fprintf(h, "disk_migration=%s\x00", cfg.DiskMigrationValue())
-	_, _ = fmt.Fprintf(h, "replicate_local=%t\x00replicate_storage_set=%t\x00vm_prefix=%s\x00",
-		cfg.StemcellReplicateLocal, cfg.StemcellReplicateStorageSet, cfg.VMPrefix)
+	// The tri-state is hashed raw rather than resolved, because the resolved
+	// value also depends on the storage-set bindings and the stemcell
+	// strategy, and both of those already reach this hash on their own.
+	replicateStorageSet := "unset"
+	if cfg.StemcellReplicateStorageSet != nil {
+		replicateStorageSet = fmt.Sprintf("%t", *cfg.StemcellReplicateStorageSet)
+	}
+	_, _ = fmt.Fprintf(h, "replicate_local=%t\x00replicate_storage_set=%s\x00vm_prefix=%s\x00",
+		cfg.StemcellReplicateLocal, replicateStorageSet, cfg.VMPrefix)
 	_, _ = fmt.Fprintf(h, "parker_prefix=%s\x00parker_pool=%s\x00",
 		cfg.ParkerPrefix, cfg.ParkerPool)
 	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",

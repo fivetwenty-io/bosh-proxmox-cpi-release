@@ -276,7 +276,7 @@ STEMCELL_PATH=/path/to/stemcell.tgz \
   ./scripts/lifecycle
 ```
 
-The config it runs against has to bind a root or ephemeral storage set with at least two explicit members and set `stemcell_replicate_storage_set` to true, and the pass aborts rather than reporting success when either is missing. Step 2b asserts that the stemcell's sha8 carries one cache template per member and that each replica holds its own `bosh-stemcell-storage-<id>` tag. Step 3b asserts that the VM's root disk landed on a member that holds a template, which is the condition under which `clone_mode: auto` produces a linked clone. Step 16b asserts that the last-reference sweep took every replica along with the primary. The pass is not part of `make check` and it runs on the lab only.
+The config it runs against has to bind a root or ephemeral storage set with at least two explicit members, and the pass aborts rather than reporting success when it does not. It need not name `stemcell_replicate_storage_set`, because replication is the default for a config that binds a set; a config that sets it to false is refused, since that config builds no replicas by design. Step 2b asserts that the stemcell's sha8 carries one cache template per member and that each replica holds its own `bosh-stemcell-storage-<id>` tag. Step 3b asserts that the VM's root disk landed on a member that holds a template, which is the condition under which `clone_mode: auto` produces a linked clone. Step 16b asserts that the last-reference sweep took every replica along with the primary. The pass is not part of `make check` and it runs on the lab only.
 
 ## Keep the remaining release evidence separate
 

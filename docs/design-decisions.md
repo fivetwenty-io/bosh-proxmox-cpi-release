@@ -22,7 +22,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
 | D13 | Stable disk identity and ownership transfer | A drive `serial=` token becomes the disk's stable identity; ownership transfers by `move_disk` reassignment; the envelope volid becomes a birth record with legacy fallback forever |
 | D14 | Upload node targeting | Address the node, no direct dial |
-| D15 | Per-member stemcell cache | Opt-in replica template on every root set member, swept with the primary |
+| D15 | Per-member stemcell cache | Replica template on every root set member by default, swept with the primary |
 
 ---
 
@@ -308,11 +308,13 @@ Two guardrails matter operationally. First, a key inside the registry carrying a
 
 **Options considered.** Keep full clones and accept the create time. Force `clone_mode: full` for uniform behavior. Build one template per member eagerly at upload time and let the planner prefer the same-member template. Build the member template lazily inside `create_vm`, which the CPI has always refused to do because a cache rebuild inside a create is unbounded work on the deploy path.
 
-**Chosen: eager per-member replicas, opt-in.** `pve.stemcell_replicate_storage_set` makes `create_stemcell` build one replica per member of the effective root set, tagged `bosh-stemcell-storage-<storage-id>`, after the primary and best-effort. `sourceFor` ranks a same-storage template first, so the existing linked-versus-full rule yields a linked clone wherever a replica exists. Replicas never hold a director reference. `delete_stemcell` sweeps every replica of the stemcell on the anchor's last reference, no longer preserves a replica because its fossil provenance names another director, which also closes a leak for per-node replicas in multi-director clusters, and refuses to delete the qcow2 while any replica still backs a linked clone.
+**Chosen: eager per-member replicas, on by default.** `create_stemcell` builds one replica per member of the effective root set, tagged `bosh-stemcell-storage-<storage-id>`, after the primary and best-effort. `sourceFor` ranks a same-storage template first, so the existing linked-versus-full rule yields a linked clone wherever a replica exists. Replicas never hold a director reference. `delete_stemcell` sweeps every replica of the stemcell on the anchor's last reference, no longer preserves a replica because its fossil provenance names another director, which also closes a leak for per-node replicas in multi-director clusters, and refuses to delete the qcow2 while any replica still backs a linked clone.
 
-**Operator-visible consequences.** One extra template per member per stemcell in the 30000 band. Creates on every member run at linked-clone speed. A missing replica is a warning on the create and a full clone, never a failure. Two explicit member names that sanitize to the same tag are a config error. `pve-cid stemcells` shows replicas under their sha8 as before.
+**Why the default is on rather than opt-in.** An operator who binds a storage set has already told us where roots may land, and the slow full clone is the surprise, not the replica. The flag is therefore tri-state. Left unset it replicates wherever replication can change the outcome, which means wherever an effective root set is bound and the strategy builds templates. An explicit `false` opts out. An explicit `true` additionally makes those preconditions mandatory, so an operator who means to depend on replicas hears about a missing set or the `import` strategy as a config error instead of getting silence.
 
-**Migration.** None. Turn the property on, run `bosh upload-stemcell --fix` once per stemcell, or wait for the next upload.
+**Operator-visible consequences.** One extra template per member per stemcell in the 30000 band. Creates on every member run at linked-clone speed. A missing replica is a warning on the create and a full clone, never a failure. The PVE token needs `Datastore.AllocateSpace`, `Datastore.Audit`, and `Datastore.Allocate` on every member of a bound set. That requirement now arrives with the binding rather than with an opt-in. Two explicit member names that sanitize to the same tag are a config error when the flag is explicitly true, and a skip with a warning otherwise. `pve-cid stemcells` shows replicas under their sha8 as before.
+
+**Migration.** None for anyone with no storage set bound. A deployment that does bind one starts building replicas on its next stemcell upload, and `bosh upload-stemcell --fix` builds them for stemcells already uploaded. Set the property to `false` to keep the old behavior.
 
 ## Out of scope
 
