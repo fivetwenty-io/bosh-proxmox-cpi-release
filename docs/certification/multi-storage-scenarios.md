@@ -265,6 +265,19 @@ Before downgrade, the runner retains a checksum-verified candidate executable an
 
 The rollout performs no live action during `--validate-only`. A missing rollout fixture produces missing rows, while still cleaning a successfully completed core workload. Offline tests verify the command and assertion boundaries; release certification requires a real disposable-lab run.
 
+## Exercise per-member cache templates
+
+The scenario runner does not cover `pve.stemcell_replicate_storage_set`. The lifecycle harness does, through an opt-in pass that runs only when `STORAGE_SET_REPLICAS_TEST=on`:
+
+```bash
+STORAGE_SET_REPLICAS_TEST=on \
+CPI_CONFIG=/path/to/cpi.json \
+STEMCELL_PATH=/path/to/stemcell.tgz \
+  ./scripts/lifecycle
+```
+
+The config it runs against has to bind a root or ephemeral storage set with at least two explicit members and set `stemcell_replicate_storage_set` to true, and the pass aborts rather than reporting success when either is missing. Step 2b asserts that the stemcell's sha8 carries one cache template per member and that each replica holds its own `bosh-stemcell-storage-<id>` tag. Step 3b asserts that the VM's root disk landed on a member that holds a template, which is the condition under which `clone_mode: auto` produces a linked clone. Step 16b asserts that the last-reference sweep took every replica along with the primary. The pass is not part of `make check` and it runs on the lab only.
+
 ## Keep the remaining release evidence separate
 
 These scenario reports supplement the [minimum release matrix](../plans/multi-storage-placement-plan.md). They do not turn an offline regression into a passing live test. Preserve the candidate checksum with every report and use the [candidate artifact workflow](candidate-artifacts.md) for BATS and upgrade certification.
