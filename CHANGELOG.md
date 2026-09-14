@@ -12,9 +12,11 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-14
+
 ### Fixed
 
-- `storage-journal audit-enrollment` and `storage-journal audit` no longer count a disabled storage as an inspection failure. PVE refuses to list the content of a storage whose definition carries `disable: 1`. A cluster that ships `local` and `local-lvm` disabled on every node therefore never produced a complete audit, and `storage-journal initialize` then refused to enroll a namespace with no allocations at all. The audit now skips a disabled storage that no retained record names, and reports it under `skipped_disabled_storages`, so the operator who later re-enables it knows it was never inspected. A disabled storage that a retained record does name is still audited, and its listing failure still keeps the audit incomplete.
+- `storage-journal audit-enrollment` and `storage-journal audit` no longer count a disabled storage as an inspection failure. PVE refuses to list the content of a storage whose definition carries `disable: 1`. A cluster that ships `local` and `local-lvm` disabled on every node therefore never produced a complete audit, and `storage-journal initialize` then refused to enroll a namespace with no allocations at all. The audit now skips a disabled storage that no retained record names, and reports it under `skipped_disabled_storages`, so the operator who later re-enables it knows it was never inspected. A disabled storage that a retained record does name is still audited, and its listing failure still keeps the audit incomplete. When `storage-journal initialize` succeeds with skipped storages, it now names them on stderr and in its JSON summary, so an operator who enrolls without reading the audit report still learns what went uninspected.
 
 ## [0.7.0] - 2026-09-14
 
@@ -381,7 +383,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.1...v0.5.2
