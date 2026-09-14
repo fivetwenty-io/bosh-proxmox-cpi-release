@@ -454,6 +454,43 @@ func (i *StoragePlanIterator) accessConstraints(node, id string) error {
 	}
 	return nil
 }
+
+// rankRootSources orders the compatible clone sources for target storage id.
+// Templates come before import candidates, so a target that is also the
+// stemcell pool still clones from a template elsewhere rather than importing
+// the qcow2 in full. Among templates, one whose disk already lives on the
+// target ranks first, because only that one can clone linked. The remaining
+// keys, VMID descending then storage then node, keep the order deterministic
+// and preserve the tiebreak earlier plans relied on.
+func (i *StoragePlanIterator) rankRootSources(candidates []StorageRootSource, id string, target pve.StorageInfo) {
+	onTarget := func(s StorageRootSource) bool {
+		if s.TemplateVMID == 0 {
+			return false
+		}
+		if s.StorageID == id {
+			return true
+		}
+		def, ok := i.req.Inventory.Definition(s.StorageID)
+		return ok && pve.SameBacking(def, target)
+	}
+	sort.SliceStable(candidates, func(a, b int) bool {
+		x, y := candidates[a], candidates[b]
+		if xt, yt := x.TemplateVMID > 0, y.TemplateVMID > 0; xt != yt {
+			return xt
+		}
+		if sx, sy := onTarget(x), onTarget(y); sx != sy {
+			return sx
+		}
+		if x.TemplateVMID != y.TemplateVMID {
+			return x.TemplateVMID > y.TemplateVMID
+		}
+		if x.StorageID != y.StorageID {
+			return x.StorageID < y.StorageID
+		}
+		return x.Node < y.Node
+	})
+}
+
 func (i *StoragePlanIterator) sourceFor(node, id string) (*StorageRootSource, string, error) {
 	target, _ := i.req.Inventory.Definition(id)
 	var candidates []StorageRootSource
@@ -474,37 +511,7 @@ func (i *StoragePlanIterator) sourceFor(node, id string) (*StorageRootSource, st
 			candidates = append(candidates, s)
 		}
 	}
-	sameTarget := func(s StorageRootSource) bool {
-		if s.TemplateVMID == 0 {
-			return false
-		}
-		if s.StorageID == id {
-			return true
-		}
-		def, ok := i.req.Inventory.Definition(s.StorageID)
-		return ok && pve.SameBacking(def, target)
-	}
-	sort.SliceStable(candidates, func(a, b int) bool {
-		x, y := candidates[a], candidates[b]
-		// Every template outranks every import candidate, so a target that
-		// is also the stemcell pool still clones from a template elsewhere
-		// instead of importing the qcow2 in full.
-		if xt, yt := x.TemplateVMID > 0, y.TemplateVMID > 0; xt != yt {
-			return xt
-		}
-		// A template already on the target storage clones linked; rank it
-		// ahead of every other template regardless of VMID.
-		if sx, sy := sameTarget(x), sameTarget(y); sx != sy {
-			return sx
-		}
-		if x.TemplateVMID != y.TemplateVMID {
-			return x.TemplateVMID > y.TemplateVMID
-		}
-		if x.StorageID != y.StorageID {
-			return x.StorageID < y.StorageID
-		}
-		return x.Node < y.Node
-	})
+	i.rankRootSources(candidates, id, target)
 	for _, s := range candidates {
 		if s.TemplateVMID == 0 {
 			if i.req.CloneMode != "linked" {

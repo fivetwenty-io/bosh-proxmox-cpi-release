@@ -394,8 +394,8 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		cfg.ParkedDiskVMIDRangeStart, cfg.ParkedDiskVMIDRangeEnd,
 		cfg.DetachedDiskStrategyValue())
 	_, _ = fmt.Fprintf(h, "disk_migration=%s\x00", cfg.DiskMigrationValue())
-	_, _ = fmt.Fprintf(h, "replicate_local=%t\x00vm_prefix=%s\x00",
-		cfg.StemcellReplicateLocal, cfg.VMPrefix)
+	_, _ = fmt.Fprintf(h, "replicate_local=%t\x00replicate_storage_set=%t\x00vm_prefix=%s\x00",
+		cfg.StemcellReplicateLocal, cfg.StemcellReplicateStorageSet, cfg.VMPrefix)
 	_, _ = fmt.Fprintf(h, "parker_prefix=%s\x00parker_pool=%s\x00",
 		cfg.ParkerPrefix, cfg.ParkerPool)
 	_, _ = fmt.Fprintf(h, "agent_mode=%s\x00vm_disk_format=%s\x00agent_mbus=%s\x00",
