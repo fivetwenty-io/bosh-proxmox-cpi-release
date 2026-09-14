@@ -1,0 +1,28 @@
+name: bosh-proxmox-cpi
+version: 0.6.0
+commit_hash: 5c4e591f
+uncommitted_changes: false
+jobs:
+- name: pve_cpi
+  version: 7c517c4633bc9e980f547198b6348e94466da9b404db912f1ca0829b75805d32
+  fingerprint: 7c517c4633bc9e980f547198b6348e94466da9b404db912f1ca0829b75805d32
+  sha1: sha256:6b2dc312a3f33493f6493fff073b8ac78e7e8c7fc2ecd14ef40c2f360fe4e7c8
+  packages:
+  - pve_cpi
+packages:
+- name: golang-1.27
+  version: 72994980046dec3afe1a23fc503ffe75d04156a11d3cd066b9579aa8fa6c09e1
+  fingerprint: 72994980046dec3afe1a23fc503ffe75d04156a11d3cd066b9579aa8fa6c09e1
+  sha1: sha256:f0be3e21171d0b380fa48cef9966fa3ee0e43c0e2f5a857e96a568276edc5009
+  dependencies: []
+- name: pve_cpi
+  version: e324611bbc1469843938d821ba606099bbff382e735974e65382a51e45a5f53d
+  fingerprint: e324611bbc1469843938d821ba606099bbff382e735974e65382a51e45a5f53d
+  sha1: sha256:1c24ca561fbd023e5d8b65ebd7e8fba7b1cfbf5e0da15e2a2f903aa9e41d2106
+  dependencies:
+  - golang-1.27
+license:
+  version: 0170c5a6520eeae2adbb57b56632b5227821515f5d4db57626da22d5d6120e5b
+  fingerprint: 0170c5a6520eeae2adbb57b56632b5227821515f5d4db57626da22d5d6120e5b
+  sha1: sha256:a3b06e9729af0529b03d45360a219ee68ab5a709e4aadfe0ace632d90f037a58
+no_compression: false
