@@ -91,10 +91,15 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 		log.Int("parker_vmid", rd.intent.ParkerVMID),
 	)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts})
-	if _, err := pve.ResumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerWriteConfigFor(deps), pctx); err != nil {
+	parkerCfg := parkerWriteConfigFor(deps)
+	if _, err := resumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerCfg, pctx); err != nil {
 		return resolvedDisk{}, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: resume interrupted transfer for disk %s", op, rd.diskCID))
 	}
+	// The parker the interrupted transfer created stays outside the pool until
+	// somebody sweeps, so we sweep it the way every park funnel does, on the
+	// parker's own node rather than the one this request is aimed at.
+	sweepParkerPool(ctx, deps, rd.intent.ParkerNode, parkerCfg)
 	return resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
 }
 

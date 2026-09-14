@@ -45,9 +45,38 @@ type parkDiskFunc func(
 // itself rather than the park.
 var parkDiskImpl atomic.Pointer[parkDiskFunc]
 
+// resumeDiskTransferToParkerFunc is the shape of
+// pve.ResumeDiskTransferToParker, named so the seam below can hold it in an
+// atomic pointer and so a test can declare a replacement without restating the
+// parameter list.
+type resumeDiskTransferToParkerFunc func(
+	ctx context.Context,
+	c pve.Client,
+	logger *log.Logger,
+	intent pve.DiskTransferIntent,
+	stableID string,
+	cfg pve.ParkerConfig,
+	pctx pve.ParkContext,
+) (string, error)
+
+// resumeDiskTransferToParkerImpl holds the resume both funnels that converge an
+// interrupted transfer call, which is pve.ResumeDiskTransferToParker in every
+// process that is not running a test. Production never swaps it.
+//
+// It exists for the reason parkDiskImpl does. A resume lands the disk on its
+// parker, and the parker pool sweep that follows is best-effort, so a funnel
+// that dropped the sweep would still converge the disk and still return
+// success. Watching the seam is how a test drives a resume that succeeds and a
+// resume that fails without standing up the whole crash window the real
+// function reads.
+var resumeDiskTransferToParkerImpl atomic.Pointer[resumeDiskTransferToParkerFunc]
+
 func init() {
 	production := parkDiskFunc(pve.ParkDisk)
 	parkDiskImpl.Store(&production)
+
+	resumeProduction := resumeDiskTransferToParkerFunc(pve.ResumeDiskTransferToParker)
+	resumeDiskTransferToParkerImpl.Store(&resumeProduction)
 }
 
 // parkDisk calls whatever the seam currently holds. Read it as pve.ParkDisk.
@@ -74,4 +103,32 @@ func parkDisk(
 func setParkDiskForTest(fn parkDiskFunc) func() {
 	prev := parkDiskImpl.Swap(&fn)
 	return func() { parkDiskImpl.Store(prev) }
+}
+
+// resumeDiskTransferToParker calls whatever the seam currently holds. Read it
+// as pve.ResumeDiskTransferToParker.
+func resumeDiskTransferToParker(
+	ctx context.Context,
+	c pve.Client,
+	logger *log.Logger,
+	intent pve.DiskTransferIntent,
+	stableID string,
+	cfg pve.ParkerConfig,
+	pctx pve.ParkContext,
+) (string, error) {
+	return (*resumeDiskTransferToParkerImpl.Load())(ctx, c, logger, intent, stableID, cfg, pctx)
+}
+
+// setResumeDiskTransferToParkerForTest replaces the resume for the duration of
+// a test and returns a restore function.
+//
+// The swap itself is race-safe, but the seam is still process-wide, so two
+// tests that swap it at the same time would take each other's replacement.
+// Tests using it must not call t.Parallel, exactly as the tests using
+// setParkDiskForTest must not.
+//
+//	defer setResumeDiskTransferToParkerForTest(fn)()
+func setResumeDiskTransferToParkerForTest(fn resumeDiskTransferToParkerFunc) func() {
+	prev := resumeDiskTransferToParkerImpl.Swap(&fn)
+	return func() { resumeDiskTransferToParkerImpl.Store(prev) }
 }

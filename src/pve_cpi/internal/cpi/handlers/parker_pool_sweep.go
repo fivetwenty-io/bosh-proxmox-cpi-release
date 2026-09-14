@@ -52,7 +52,7 @@ func init() {
 // allocation. The funnels cannot do that unwrapping themselves, because the
 // managed detach and attach paths shadow their own deps with a guarded copy and
 // a funnel cannot tell which of the two it was handed, so it happens here once
-// for all nine of them.
+// on behalf of every one of them.
 func sweepParkerPool(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
 	logger := deps.Log(ctx)
 	if err := (*placeParkersInPoolImpl.Load())(ctx, unguardedPVE(deps.PVE), logger, node, cfg); err != nil {

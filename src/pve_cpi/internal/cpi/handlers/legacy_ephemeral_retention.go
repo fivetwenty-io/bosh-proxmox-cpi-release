@@ -113,9 +113,16 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 	parkContext := pve.ParkContext{DiskCID: cid, SourceVMCID: vmCID, StableID: meta.ID}
 	switch {
 	case identity.intent != nil:
-		if _, err := pve.ResumeDiskTransferToParker(ctx, deps.PVE, logger, *identity.intent, meta.ID, parkerWriteConfigFor(deps), parkContext); err != nil {
+		parkerCfg := parkerWriteConfigFor(deps)
+		if _, err := resumeDiskTransferToParker(ctx, deps.PVE, logger, *identity.intent, meta.ID, parkerCfg, parkContext); err != nil {
 			return err
 		}
+		// The resume lands the disk on a parker the interrupted transfer had
+		// already created, and that parker is outside the pool until somebody
+		// sweeps, so we sweep here as every other park funnel does. The node is
+		// the parker's own, which on a cluster is not always the node this
+		// delete is running against.
+		sweepParkerPool(ctx, deps, identity.intent.ParkerNode, parkerCfg)
 	case identity.holder != nil && identity.holder.Node == node && identity.holder.VMID == vmid:
 		parkerCfg := parkerWriteConfigFor(deps)
 		if _, err := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, identity.volid, parkerCfg, parkContext); err != nil {
