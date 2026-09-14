@@ -8,6 +8,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/configdrive"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 )
@@ -124,6 +125,20 @@ func prepareManagedVMPlan(ctx context.Context, deps Deps, parsed *createVMParsed
 	plan, err := iterator.Next(ctx)
 	if err != nil {
 		return observed, err
+	}
+	// A root that falls back to a full clone under storage-set replicas
+	// means the placed member has no cache template of its own. Say so on
+	// the create rather than leaving the operator to read clone timings.
+	// Gated on the property so a deployment without replicas is never told
+	// to build them. Fires once per plan attempt.
+	if root, ok := managedVMRoleTarget(plan, storageRoleRoot); ok &&
+		root.Mechanism == storageMechanismFullClone && root.Source != nil &&
+		root.Source.TemplateVMID > 0 && deps.Config != nil && deps.Config.StemcellReplicateStorageSet {
+		sha8, _ := extractSHA8FromParsed(parsed)
+		deps.Log(ctx).Warn("create_vm: no cache template on placed storage; cloning in full",
+			log.String("storage", root.StorageID),
+			log.String("sha8", sha8),
+			log.String("hint", "run bosh upload-stemcell --fix to build the replica"))
 	}
 	ledger := inv.NewLedger()
 	for i := range plan.Charges {

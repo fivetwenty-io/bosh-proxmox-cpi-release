@@ -474,8 +474,29 @@ func (i *StoragePlanIterator) sourceFor(node, id string) (*StorageRootSource, st
 			candidates = append(candidates, s)
 		}
 	}
-	sort.Slice(candidates, func(a, b int) bool {
+	sameTarget := func(s StorageRootSource) bool {
+		if s.TemplateVMID == 0 {
+			return false
+		}
+		if s.StorageID == id {
+			return true
+		}
+		def, ok := i.req.Inventory.Definition(s.StorageID)
+		return ok && pve.SameBacking(def, target)
+	}
+	sort.SliceStable(candidates, func(a, b int) bool {
 		x, y := candidates[a], candidates[b]
+		// Every template outranks every import candidate, so a target that
+		// is also the stemcell pool still clones from a template elsewhere
+		// instead of importing the qcow2 in full.
+		if xt, yt := x.TemplateVMID > 0, y.TemplateVMID > 0; xt != yt {
+			return xt
+		}
+		// A template already on the target storage clones linked; rank it
+		// ahead of every other template regardless of VMID.
+		if sx, sy := sameTarget(x), sameTarget(y); sx != sy {
+			return sx
+		}
 		if x.TemplateVMID != y.TemplateVMID {
 			return x.TemplateVMID > y.TemplateVMID
 		}
