@@ -31,7 +31,7 @@ The Makefile re-roots every `go` invocation into `src/pve_cpi/` — prefer the `
 | `make fmt`      | Run `gofmt -w` on all Go files                           |
 | `make vet`      | Run `go vet ./...`                                       |
 | `make staticcheck` | Run `staticcheck ./...` when installed                |
-| `make check`    | Every gate CI runs, in the Makefile's order; see [Running the full check suite](../CONTRIBUTING.md#running-the-full-check-suite) |
+| `make check`    | Every gate CI runs, in the Makefile's order. See [Running the full check suite](../CONTRIBUTING.md#running-the-full-check-suite) |
 | `make security` | `govulncheck` + `gosec`                                  |
 | `make tidy`     | Run `go mod tidy`                                        |
 | `make clean`    | Remove build artifacts                                   |

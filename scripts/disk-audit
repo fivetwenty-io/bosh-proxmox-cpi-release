@@ -26,7 +26,7 @@ Warnings are printed to stderr when:
     not complete; the parker must NOT be destroyed until it is cleared)
   - a parker's config did not come back, so its contents are unknown
   - a VM sits in a parker pool and carries no bosh-parker tag, so it is a
-    workload VM the CPI never moves out on its own and an operator has to
+    workload VM the CPI never moves out on its own, and an operator has to
     move it by hand. A pool counts as a parker pool when a parker VM belongs
     to it, and --parker-pool names one that holds no parker yet.
 
@@ -505,10 +505,10 @@ class PoolIntruderRecord:
     """Inventory record for a workload VM that sits in a parker pool.
 
     The CPI refuses to create a VM in the parker pool, and the pool reconciler
-    warns and skips when a persisted template renders that name, so nothing in
-    the CPI ever puts a VM here and nothing in the CPI takes it back out. A VM
-    we record here was put in the pool by a release older than those guards,
-    and an operator has to move it out by hand.
+    warns and skips when a persisted template renders that name. Nothing in the
+    CPI puts a VM here, and nothing in the CPI takes it back out. A VM we
+    record here was put in the pool by a release older than those guards, and
+    an operator has to move it out by hand.
     """
 
     __slots__ = ("vmid", "node", "name", "pool")
@@ -604,8 +604,8 @@ def parse_parker_pool_args(values: "list[str] | None") -> list[str]:
     """Turn the raw --parker-pool values into a clean, ordered list of names.
 
     The flag may be repeated and each value may itself be a comma-separated
-    list, so we accept both spellings and fold them into one list. Blanks are
-    dropped and a name given twice is kept once.
+    list, so we accept both spellings and fold them into one list. We drop the
+    blanks, and we keep a name given twice only once.
 
     Inputs:
       values - the argparse accumulator, or None when the flag was never given
@@ -623,10 +623,9 @@ def parker_pool_names(parker_records: list[ParkerRecord], extra_pools: "list[str
     """Decide which resource pools we treat as parker pools.
 
     By default a pool counts as a parker pool when at least one parker VM
-    belongs to it, which is what the cluster index tells us without asking the
-    operator for anything. That derivation says nothing about a parker pool
-    standing empty, so every name the operator passed on --parker-pool is
-    added to the set as well.
+    belongs to it, which the cluster index tells us without asking the operator
+    for anything. That derivation says nothing about a parker pool standing
+    empty, so we add every name the operator passed on --parker-pool as well.
 
     Inputs:
       parker_records - the parker inventory, whose pool field comes from the
@@ -646,8 +645,8 @@ def find_pool_intruders(
 ) -> list[PoolIntruderRecord]:
     """Find every VM that sits in a parker pool without carrying the parker tag.
 
-    A parker is recognized by its bosh-parker tag, so a VM in one of these
-    pools that carries no such tag is a workload VM which landed there by a
+    We recognize a parker by its bosh-parker tag, so a VM in one of these
+    pools that carries no such tag is a workload VM that landed there by a
     name collision. We key on the tag alone rather than on the parker VMID
     band, because an untagged VM inside the band would still be something for
     an operator to look at.
@@ -1130,8 +1129,8 @@ def emit_warnings(
 
     # Warn about workload VMs sitting in a parker pool. The CPI refuses to
     # create one there and its pool reconciler warns and skips rather than
-    # moving it, so this stays until an operator moves the VM by hand and
-    # points the template or profile that rendered the name somewhere else.
+    # moving it, so the warning stays until an operator moves the VM by hand
+    # and points the template or profile that rendered the name somewhere else.
     for ir in pool_intruders:
         _warn(
             f"VM {ir.vmid} ({ir.name or 'unnamed'}, pool {ir.pool}) on node {ir.node} sits in a parker "
@@ -1183,8 +1182,8 @@ def main(argv: "list[str] | None" = None) -> int:
         metavar="NAME",
         help=(
             "Treat NAME as a parker pool when looking for workload VMs that do not belong in one. "
-            "Repeat the flag or give a comma-separated list. Any pool that already holds a parker "
-            "is found without this."
+            "Repeat the flag or give a comma-separated list. A pool that already holds a parker "
+            "needs no flag."
         ),
     )
     args = parser.parse_args(argv)
