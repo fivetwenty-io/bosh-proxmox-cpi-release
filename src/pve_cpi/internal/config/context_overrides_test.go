@@ -813,3 +813,39 @@ func TestApplyContextOverrides_NestedFlatPrecedence(t *testing.T) {
 		t.Errorf("host = %q, want the explicit flat key to win", eff.Host)
 	}
 }
+
+// TestApplyContextOverrides_StemcellReplicateStorageSet verifies that a
+// cpi-config entry can turn per-member stemcell replicas on for its own
+// cluster. It does not ride the nested-shape test, because that entry moves
+// the cluster endpoint, and an endpoint change with inherited storage
+// bindings is refused unless the entry restates pve_storage_sets.
+func TestApplyContextOverrides_StemcellReplicateStorageSet(t *testing.T) {
+	t.Parallel()
+	base := validBaseCfg()
+	base.EphemeralStorageSet = "eph"
+	base.StorageSets = map[string]config.StorageSet{
+		"eph": {Names: []string{"ns1", "ns2"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
+	}
+
+	eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_stemcell_replicate_storage_set": true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !eff.StemcellReplicateStorageSet {
+		t.Error("pve_stemcell_replicate_storage_set must apply to the effective config")
+	}
+	if base.StemcellReplicateStorageSet {
+		t.Error("base config was mutated")
+	}
+	found := false
+	for _, k := range applied {
+		if k == "pve_stemcell_replicate_storage_set" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("applied = %v, want it to carry pve_stemcell_replicate_storage_set", applied)
+	}
+}

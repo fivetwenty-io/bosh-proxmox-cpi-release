@@ -250,6 +250,18 @@ JSON_4D="$(render "$PROPS_4D")"
 assert_json_valid       "case4d" "$JSON_4D"                                  || FAILED=$((FAILED+1))
 assert_json_key_equals  "case4d" "$JSON_4D" parker_pool "$SPEC_PARKER_POOL"  || FAILED=$((FAILED+1))
 
+# --- Case 5: stemcell_replicate_storage_set emit-when-true --------------------
+echo "Case 5: stemcell_replicate_storage_set"
+PROPS_5="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"]["stemcell_replicate_storage_set"] = true
+  print h.inspect
+')"
+JSON_5="$(render "$PROPS_5")"
+assert_json_valid   "case5" "$JSON_5"                                    || FAILED=$((FAILED+1))
+assert_json_has_key "case5" "$JSON_5" stemcell_replicate_storage_set     || FAILED=$((FAILED+1))
+assert_json_lacks_key "case5-default" "$JSON_1" stemcell_replicate_storage_set || FAILED=$((FAILED+1))
+
 # Omitted new placement properties must not alter legacy JSON.
 for key in storage_sets storage_capacity_domains ephemeral_storage_set \
   persistent_storage_set root_storage_set storage_placement_namespace \
