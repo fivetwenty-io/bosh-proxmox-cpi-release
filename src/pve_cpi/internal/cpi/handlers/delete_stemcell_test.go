@@ -1766,3 +1766,65 @@ func TestDeleteStemcell_PreGenerationTemplate_NotSwept(t *testing.T) {
 		t.Errorf("a previous-generation template must never be selected as a ref anchor, got config reads of %v", configReads)
 	}
 }
+
+// TestDeleteStemcell_ReplicaStillBackingClones_ErrorBeforeQcow2Delete pins
+// the rule that with per-storage replicas it is a replica, not the anchor on
+// vm_storage, that backs live linked clones. The anchor destroys cleanly, the
+// replica refuses with the base-volume-in-use error, and the handler must
+// fail with that replica named BEFORE the heavy qcow2 is deleted: deleting it
+// past a live replica would strand the VMs' base images unanchored and
+// invisible to the orphan prune.
+func TestDeleteStemcell_ReplicaStillBackingClones_ErrorBeforeQcow2Delete(t *testing.T) {
+	t.Parallel()
+
+	const anchorVMID = int64(7601)
+	const replicaVMID = int64(7602)
+	const replicaNode = "pve-node2"
+
+	nodesSvc := &stemcellMockNodes{
+		deleteQemuFn: func(_ context.Context, _, vmidStr string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
+			if vmidStr == fmt.Sprintf("%d", replicaVMID) {
+				return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "volume 'ns_2:base-7602-disk-0' is still in use by 'linked-clone-9999'"}
+			}
+			raw := sdknodes.DeleteQemuResponse(`""`)
+			return &raw, nil
+		},
+	}
+	qemuSvc := &stemcellMockQEMU{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return directorRefsDescMap("dir-a"), nil
+		},
+	}
+	clusterSvc := &stemcellMockCluster{
+		listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+			items := sdkcluster.ListResourcesResponse{
+				clusterTemplateItem(anchorVMID, vmNode, "stemcell-cache", cacheTemplateTags(testStemcellSHA8)),
+				clusterTemplateItem(replicaVMID, replicaNode, "stemcell-cache",
+					cacheTemplateTags(testStemcellSHA8)+";"+pve.ReplicaStorageTagForStorage("ns_2")),
+			}
+			return &items, nil
+		},
+	}
+	storageSvc := &deleteStemcellMockStorage{}
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{
+		qemuSvc: qemuSvc, nodesSvc: nodesSvc, clusterSvc: clusterSvc, storageSvc: storageSvc,
+	})
+	h := handlers.HandleDeleteStemcell(deps)
+
+	args := []json.RawMessage{marshalArg(t, testHeavyCID())}
+	_, err := h.Handle(context.Background(), args, jsonrpc.Context{DirectorUUID: "dir-a"})
+	if err == nil {
+		t.Fatal("expected an error while a replica still backs linked clones")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "still backs one or more linked-clone VMs") {
+		t.Errorf("error must be the actionable in-use message: %s", msg)
+	}
+	if !strings.Contains(msg, fmt.Sprintf("%d", replicaVMID)) || !strings.Contains(msg, replicaNode) {
+		t.Errorf("error must name the replica's VMID and node: %s", msg)
+	}
+	if storageSvc.deleteVolumeIfExistsCalls != 0 {
+		t.Errorf("the heavy qcow2 must survive: %d delete calls %v",
+			storageSvc.deleteVolumeIfExistsCalls, storageSvc.calls)
+	}
+}

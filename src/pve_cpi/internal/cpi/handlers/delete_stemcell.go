@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -268,7 +269,7 @@ func HandleDeleteStemcell(deps Deps) cpi.Handler {
 		// run the kind-specific qcow2 cleanup, and finish with the opt-in
 		// orphan prune.
 		return handleDeleteStemcellWithTemplate(
-			ctx, deps, logger, kind, storage, volumePath, cidStr, anchor, sweep, reqCtx.DirectorUUID)
+			ctx, deps, logger, kind, storage, volumePath, cidStr, anchor, sweep, reqCtx.DirectorUUID, sha8)
 	})
 }
 
@@ -327,6 +328,11 @@ func selectStemcellAnchor(refs []pve.TemplateRef) (anchor pve.TemplateRef, sweep
 // is kept from the pre-anchor-selection shape even though a member can, in principle, be a
 // second non-replica match from an anomalous cluster state — it is still
 // swept the same best-effort way a true replica is).
+// errReplicaBaseVolumeInUse marks the sweep loop's own base-volume-in-use
+// refusal, so the caller can return that error untouched instead of
+// re-wrapping it under the anchor's VMID and node.
+var errReplicaBaseVolumeInUse = errors.New("delete_stemcell: replica template still backs a linked clone")
+
 func handleDeleteStemcellWithTemplate(
 	ctx context.Context,
 	deps Deps,
@@ -336,6 +342,7 @@ func handleDeleteStemcellWithTemplate(
 	anchor pve.TemplateRef,
 	replicas []pve.TemplateRef,
 	directorUUID string,
+	sha8 string,
 ) (any, error) {
 	// ----------------------------------------------------------------
 	// Step 4: anchor + sweep destroy, gated by the director-UUID ref set.
@@ -360,10 +367,23 @@ func handleDeleteStemcellWithTemplate(
 			// director; a skipped one is a deliberate leak in the safe
 			// direction, reclaimable by the orphan prune once its own refs
 			// empty.
-			if !coMatchSafeToSweep(ctx, deps, r, directorUUID, logger) {
+			if !coMatchSafeToSweep(ctx, deps, r, directorUUID, sha8, logger) {
 				continue
 			}
 			if delErr := destroyTemplateVM(ctx, deps, r.Node, r.VMID, cidStr); delErr != nil {
+				// With storage replicas it is the replicas that back live
+				// linked clones, not the anchor on vm_storage. Deleting the
+				// qcow2 past a replica that refuses would leave the VMs'
+				// base images unanchored and invisible to the orphan prune,
+				// so this refusal is as fatal as the anchor's.
+				if pve.IsBaseVolumeInUse(delErr) {
+					return cpierrors.WrapAs(
+						fmt.Errorf("%w: %w", errReplicaBaseVolumeInUse, delErr),
+						cpierrors.TypeCloud,
+						fmt.Sprintf("delete_stemcell: replica template VM %d (node %q) still backs one or more linked-clone VMs; "+
+							"delete or migrate those VMs, then retry delete_stemcell (the destroy is marked pending and will resume): %s",
+							r.VMID, r.Node, delErr.Error()))
+				}
 				logger.Warn("delete_stemcell: replica template destroy failed (best-effort, continuing)",
 					log.String("node", r.Node),
 					log.Int64("vmid", r.VMID),
@@ -383,6 +403,12 @@ func handleDeleteStemcellWithTemplate(
 		// error. A bosh-destroy-pending marker was already stamped by
 		// deregisterStemcellDirectorRef, so a retry resumes the destroy
 		// directly instead of re-deriving "last ref".
+		// The sweep loop raises its own already-actionable error naming the
+		// replica that refused; re-wrapping it here would report the anchor's
+		// VMID for a refusal the anchor never made.
+		if errors.Is(refErr, errReplicaBaseVolumeInUse) {
+			return nil, refErr
+		}
 		if pve.IsBaseVolumeInUse(refErr) {
 			return nil, cpierrors.Cloud(
 				"delete_stemcell: template VM %d (node %q) still backs one or more linked-clone VMs; "+
@@ -821,7 +847,12 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, delete
 }
 
 // coMatchSafeToSweep reports whether a co-matching template (replica or
-// twin) may be destroyed as part of directorUUID's last-ref sweep. The
+// twin) may be destroyed as part of directorUUID's last-ref sweep. A
+// co-match tagged as a replica, per-node or per-storage, is swept whenever
+// its provenance sha8 is the stemcell being deleted: replicas hold no live
+// reference of their own, so their recorded refs are a fossil of whichever
+// director happened to build them, and honoring that fossil leaked every
+// replica whenever the OTHER director dropped the last anchor ref. The
 // anchor's ref set is authoritative only for the anchor; a twin frozen by
 // another director carries that director's live ref in its OWN provenance,
 // so each co-match is judged on its own refs: empty, or naming only this
@@ -834,7 +865,7 @@ func pruneOrphanStemcellTemplates(ctx context.Context, deps Deps, cidStr, delete
 // director UUID, so its refs read ["unknown-director"], and comparing them
 // against the raw empty string would brand this call's own replicas as
 // foreign and leak them permanently.
-func coMatchSafeToSweep(ctx context.Context, deps Deps, r pve.TemplateRef, directorUUID string, logger *log.Logger) bool {
+func coMatchSafeToSweep(ctx context.Context, deps Deps, r pve.TemplateRef, directorUUID, sha8 string, logger *log.Logger) bool {
 	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, r.Node, int(r.VMID))
 	if cfgErr != nil {
 		if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
@@ -854,6 +885,22 @@ func coMatchSafeToSweep(ctx context.Context, deps Deps, r pve.TemplateRef, direc
 			log.Int64("vmid", r.VMID),
 		)
 		return false
+	}
+	// A replica's DirectorRefs is a fossil of its own creation: by contract
+	// replicas never hold a live reference, and the anchor's empty ref set is
+	// the sole authority over their lifetime. Sweep a replica of this sha8
+	// unconditionally; the foreign-ref guard below protects only anchors.
+	// The precondition this relies on is that every director on a cluster
+	// converges on one anchor through ensureTemplateVM's cluster-scoped
+	// dedup, so an empty anchor ref set means no director claims the
+	// stemcell. Do not extend this rule to non-replica co-matches.
+	if r.IsReplica() {
+		if prov.SHA8 != "" && prov.SHA8 != sha8 {
+			logger.Info("delete_stemcell: co-match replica belongs to a different stemcell; preserving",
+				log.String("node", r.Node), log.Int64("vmid", r.VMID), log.String("sha8", prov.SHA8))
+			return false
+		}
+		return true
 	}
 	want := directorRefOrSentinel(directorUUID)
 	for _, ref := range prov.DirectorRefs {
