@@ -22,18 +22,22 @@
 // convention from create_stemcell.go). A third tag, "vm-prefix--<resolved
 // prefix>", always follows. It carries "bosh" when Prefix is empty, the same
 // default parkerVMName renders into the VM's name, so the tag can never name
-// a different prefix than the VM actually carries. Pool adds no tag. The
-// pool sweep in PlaceParkersInPool is the only code that reads Pool, and it
-// runs from a handler on the unguarded client once a park has succeeded, so
-// nothing here wires Pool into VM creation.
+// a different prefix than the VM actually carries. That tag is also what
+// decides which parkers a deployment may reuse and pool, because a park reads
+// it back through parkerBelongsToPrefix. Pool adds no tag. The pool sweep in
+// PlaceParkersInPool is the only code that reads Pool, and it runs from a
+// handler on the unguarded client once a park has succeeded, so nothing here
+// wires Pool into VM creation.
 //
 // # Slot capacity
 //
 // Each parker VM holds up to 31 disks (scsi0..scsi30). When every existing
 // parker on a node is full, a fresh parker VMID is allocated in the same range.
-// New parks always reuse the lowest existing parker that still has a free slot
-// before creating another parker, so the VMID band is not exhausted one disk
-// at a time.
+// New parks always reuse the lowest existing parker of the same prefix that
+// still has a free slot before creating another parker, so the VMID band is not
+// exhausted one disk at a time. A parker of another prefix is never reused, so
+// two deployments whose prefixes differ each build their own parkers on a
+// shared node. See parkerBelongsToPrefix for how we read a parker's prefix.
 package pve
 
 import (
@@ -94,6 +98,13 @@ type ParkerConfig struct {
 	// mover's name carries the same prefix. Empty (the zero value) resolves
 	// to "bosh" inside parkerVMName, so a caller that never sets Prefix gets
 	// byte-identical names to prior releases.
+	//
+	// It is also the reuse and pooling boundary. ListParkersForNode hands back
+	// only the parkers whose own prefix identity equals this one, so a park
+	// fills a same-prefix parker or creates a fresh one, and the pool sweep
+	// places only same-prefix parkers. It is not an ownership boundary, so a
+	// disk parked under one prefix still attaches, unparks, and deletes after
+	// the prefix changes.
 	Prefix string
 	// Pool names the PVE resource pool the sweep in PlaceParkersInPool places
 	// parker VMs into, once a park has succeeded and the managed allocation
@@ -747,10 +758,13 @@ func parkerPrefixTag(prefix string) string {
 // before the tag existed, or by a configuration with no director UUID to hand,
 // carry none, and refusing them would strand their disks.
 //
-// This scans "director--" tokens only. A "vm-prefix--" tag is deliberately
-// inert here. A prefix is a display convenience for VM names, not an
-// ownership boundary, and making adoption prefix-sensitive would be a
-// behavior change nobody agreed to.
+// This scans "director--" tokens only. The prefix question is asked next
+// door, in parkerBelongsToPrefix, and the two answer different things. A
+// director is who owns the parker, and a prefix is which deployments may
+// share it. So a prefix is a reuse and pooling boundary, and it is never an
+// ownership boundary. Every path that finds a disk where it already sits,
+// refuses to destroy a parker, unparks a disk, or deletes a parked one stays
+// prefix-agnostic, exactly as it stays director-agnostic.
 func parkerBelongsToDirector(tagStr, directorID string) bool {
 	want := parkerDirectorTag(directorID)
 	if want == "" {
@@ -771,6 +785,85 @@ func parkerBelongsToDirector(tagStr, directorID string) bool {
 		}
 	}
 	return !sawAttribution
+}
+
+// parkerNameRe matches the canonical parker name parkerVMName renders,
+// "<prefix>-parker-<vmid>", and captures the prefix. The capture is greedy on
+// purpose, so a prefix that itself contains "-parker-" reads back whole rather
+// than being cut at its first occurrence.
+var parkerNameRe = regexp.MustCompile(`^(.+)-parker-\d+$`)
+
+// parkerPrefixIdentity reports which prefix a parker belongs to, reading the
+// evidence in the order it became available.
+//
+// A "vm-prefix--" tag is the first and best answer, because we write it on
+// every parker we create and it says outright what prefix made the parker.
+// When there is no such tag we fall back to the name, since a parker we
+// created before the tag existed still carries "<prefix>-parker-<vmid>". When
+// there is neither a tag nor a name in that shape, the parker predates both
+// conventions and belongs to the default prefix, which we take from
+// resolveParkerPrefix so the "bosh" literal lives in exactly one place.
+func parkerPrefixIdentity(tagStr, name string) string {
+	for _, t := range splitTagString(tagStr) {
+		if !strings.HasPrefix(strings.ToLower(t), ParkerPrefixTagPrefix) {
+			continue
+		}
+		return t[len(ParkerPrefixTagPrefix):]
+	}
+	if m := parkerNameRe.FindStringSubmatch(strings.TrimSpace(name)); m != nil {
+		return m[1]
+	}
+	return resolveParkerPrefix("")
+}
+
+// parkerBelongsToPrefix reports whether a parker carrying tagStr and named
+// name may be reused and pooled by a deployment whose configured prefix is
+// prefix. An empty prefix resolves to the same default the parker's own
+// identity falls back to, so a legacy untagged "bosh-parker-90472" and a
+// deployment that never set a prefix still find each other.
+//
+// Comparison folds case, the way the sibling tag checks
+// parkerBelongsToDirector and tagContainsParker do, because PVE lowercases a
+// tag it stores unless the datacenter tag-style option has been set to keep
+// tags case-sensitive. Two prefixes that differ only in case therefore share
+// parkers.
+//
+// Every prefix tag is considered, not just the first. A parker an operator
+// edited into carrying two of them would otherwise be adopted or refused on
+// tag order, which is not a property anything should depend on, so a parker
+// carrying our prefix among several counts as ours. The name is consulted
+// only when no prefix tag is there at all, so a tag that disagrees with the
+// name wins.
+func parkerBelongsToPrefix(tagStr, name, prefix string) bool {
+	want := resolveParkerPrefix(prefix)
+	sawPrefixTag := false
+	for _, t := range splitTagString(tagStr) {
+		if !strings.HasPrefix(strings.ToLower(t), ParkerPrefixTagPrefix) {
+			continue
+		}
+		sawPrefixTag = true
+		if strings.EqualFold(t[len(ParkerPrefixTagPrefix):], want) {
+			return true
+		}
+	}
+	if sawPrefixTag {
+		return false
+	}
+	return strings.EqualFold(parkerPrefixIdentity(tagStr, name), want)
+}
+
+// tagsCarryParkerPrefix reports whether a PVE tag string carries a
+// "vm-prefix--" token at all, without saying which prefix that token names.
+// The listing filter reads it to decide whether a parker's name is still
+// evidence, since parkerBelongsToPrefix consults the name only when no prefix
+// tag is present.
+func tagsCarryParkerPrefix(tagStr string) bool {
+	for _, t := range splitTagString(tagStr) {
+		if strings.HasPrefix(strings.ToLower(t), ParkerPrefixTagPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // tagContainsParker reports whether a PVE tag string contains ParkerTag as a
@@ -848,6 +941,70 @@ func FindParkerForNode(ctx context.Context, c Client, node string, cfg ParkerCon
 	return parkers[0], true, nil
 }
 
+// parkerRowEvidence returns the tags and the name the filter must judge a
+// listing row on, reading the VM's own config whenever the listing left out
+// something the verdict turns on. It reports true in its third result when the
+// VM went away between the listing and the read, which is a row the caller
+// skips rather than an error.
+//
+// A row with no tags at all is either a genuinely untagged VM sharing the band,
+// or a PVE that does not populate the field, and the two are indistinguishable
+// from the listing. We confirm with a config read rather than assume, because
+// assuming "not a parker" would create a fresh parker on every park and exhaust
+// the band.
+//
+// A row that is tagged as a parker, carries no prefix tag, and arrived with no
+// name has no evidence of its prefix left except the name PVE did not put in
+// the listing. Without the read its identity falls back to the default and the
+// filter flips in both directions at once, so a "bosh" deployment would adopt a
+// parker that belongs to another prefix while that prefix stopped seeing its
+// own. Parkers in that shape are rare enough that the extra read costs the
+// detach path nothing in the ordinary case. Rows the mover and director tests
+// already reject are left alone, because a name cannot make a mover or another
+// director's parker ours.
+func parkerRowEvidence(
+	ctx context.Context,
+	c Client,
+	node string,
+	vmid int,
+	rowTags, rowName string,
+	cfg ParkerConfig,
+) (string, string, bool, error) {
+	tags, name := rowTags, rowName
+	needTags := tags == ""
+	needName := !needTags && name == "" &&
+		tagContainsParker(tags) &&
+		!TagsMarkDiskMover(tags) &&
+		parkerBelongsToDirector(tags, cfg.DirectorID) &&
+		!tagsCarryParkerPrefix(tags)
+	if !needTags && !needName {
+		return tags, name, false, nil
+	}
+
+	vmCfg, cfgErr := c.QEMU().Config(ctx, node, vmid)
+	if cfgErr != nil {
+		if parkerConfigGone(cfgErr) {
+			return "", "", true, nil
+		}
+		// WrapError, not a blanket retriable, because a 403 on this read is a
+		// grant only a human can add, and re-driving every detach on the node
+		// forever does not add it.
+		return "", "", false, cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			fmt.Sprintf("ListParkersForNode: config fetch for vmid %d", vmid))
+	}
+	if needTags {
+		tags, _ = ConfigString(vmCfg, "tags")
+	}
+	if name == "" {
+		// The same config read already carries the name, and the prefix
+		// fallback needs it whenever the tag turns out to be missing too.
+		// Reading it here keeps both branches deciding the prefix question on
+		// the same evidence.
+		name, _ = ConfigString(vmCfg, "name")
+	}
+	return tags, name, false, nil
+}
+
 // ListParkersForNode returns all parker VMIDs on node in ascending VMID order.
 //
 // One GET /nodes/<node>/qemu request carries the vmid and the tag string of
@@ -869,6 +1026,13 @@ func FindParkerForNode(ctx context.Context, c Client, node string, cfg ParkerCon
 // remain adoptable — see parkerBelongsToDirector. Lookups that have to find a
 // disk wherever it sits (IsDiskParked, UnparkDisk) deliberately do not filter,
 // so a disk parked under one attribution is still reachable under another.
+//
+// A parker whose prefix identity differs from cfg.Prefix is skipped for the
+// same reason, and parkerBelongsToPrefix is what decides. Two deployments
+// share parkers only when their resolved prefixes are equal, and that includes
+// the "bosh" a deployment gets when it never set one. When no same-prefix
+// parker on the node has a free slot the park creates a fresh parker, even
+// though a parker of another prefix beside it has room.
 //
 // Returns an empty slice (not an error) when no parkers exist.
 func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerConfig) ([]int, error) {
@@ -914,28 +1078,20 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
 			continue
 		}
-		tags := ""
+		rowTags := ""
 		if entry.Tags != nil {
-			tags = *entry.Tags
+			rowTags = *entry.Tags
 		}
-		if tags == "" {
-			// The row carries no tags. That is either a genuinely untagged VM
-			// sharing the band, or a PVE that does not populate the field, and
-			// the two are indistinguishable from here. Confirm with a config
-			// read rather than assume: assuming "not a parker" would create a
-			// fresh parker on every park and exhaust the band.
-			vmCfg, cfgErr := c.QEMU().Config(ctx, node, vmid)
-			if cfgErr != nil {
-				if parkerConfigGone(cfgErr) {
-					continue
-				}
-				// WrapError, not a blanket retriable: a 403 on this read is a
-				// grant only a human can add, and re-driving every detach on the
-				// node forever does not add it.
-				return nil, cpierrors.Wrap(WrapConfigReadError(cfgErr),
-					fmt.Sprintf("ListParkersForNode: config fetch for vmid %d", vmid))
-			}
-			tags, _ = ConfigString(vmCfg, "tags")
+		rowName := ""
+		if entry.Name != nil {
+			rowName = *entry.Name
+		}
+		tags, name, gone, evidenceErr := parkerRowEvidence(ctx, c, node, vmid, rowTags, rowName, cfg)
+		if evidenceErr != nil {
+			return nil, evidenceErr
+		}
+		if gone {
+			continue
 		}
 		// A mover carries the parker tag too (every parker guard must fire
 		// for it), but it is a single-purpose migration vehicle: parking an
@@ -944,7 +1100,9 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		if TagsMarkDiskMover(tags) {
 			continue
 		}
-		if tagContainsParker(tags) && parkerBelongsToDirector(tags, cfg.DirectorID) {
+		if tagContainsParker(tags) &&
+			parkerBelongsToDirector(tags, cfg.DirectorID) &&
+			parkerBelongsToPrefix(tags, name, cfg.Prefix) {
 			result = append(result, vmid)
 		}
 	}
@@ -953,11 +1111,16 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 }
 
 // createParkerVM allocates a VMID in cfg's parker range and creates a fresh
-// parker VM there, retrying past VMID conflicts by re-scanning and adopting
-// whichever parker won the race. It is shared by EnsureParker (called after
-// its existing-parker short-circuit) and EnsureFreshParker (called directly,
-// since its whole contract is "always allocate a NEW parker" — it must never
-// short-circuit on an existing one).
+// parker VM there. A VMID conflict means somebody else created a guest at that
+// VMID first, so we re-scan and adopt the lowest parker of our own prefix on
+// the node. When the scan turns up none of those, because the winner carries
+// another prefix, the conflict comes back as a retriable failure and the
+// allocation runs again on a VMID nobody has taken.
+//
+// It is shared by EnsureParker (called after its existing-parker
+// short-circuit) and EnsureFreshParker (called directly, since its whole
+// contract is "always allocate a NEW parker", so it must never short-circuit
+// on an existing one).
 //
 // The parker VM is created with:
 //   - name: "<prefix>-parker-<vmid>" (prefix defaults to "bosh")
@@ -1026,7 +1189,9 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 		// CPI created a parker at this VMID. We do NOT want AllocateWithRetry to
 		// regenerate a fresh VMID (that would create a duplicate parker); instead
 		// we surface the conflict so the branch below re-scans and ADOPTS the
-		// winner (PC-4). Transient/lock errors are still retried inside the create
+		// winner when the winner shares our prefix (PC-4), and reports a
+		// retriable failure when it does not, so the next attempt allocates
+		// elsewhere. Transient/lock errors are still retried inside the create
 		// closure via RetryOnTransientOrLock.
 		nil,
 		1,
@@ -1044,7 +1209,10 @@ func createParkerVM(ctx context.Context, c Client, logger *log.Logger, node stri
 			if found {
 				return winner, nil
 			}
-			return 0, cpierrors.Retriable("%s: VMID conflict but no parker found after re-scan on node %q", opLabel, node)
+			return 0, cpierrors.Retriable(
+				"%s: VMID conflict, and the re-scan on node %q found no parker of our own prefix to adopt, "+
+					"so the allocation retries on a fresh VMID",
+				opLabel, node)
 		}
 		return 0, cpierrors.Wrap(createErr, fmt.Sprintf("%s: create parker VM", opLabel))
 	}
@@ -1336,8 +1504,9 @@ func ParkedFromHolder(h DiskHolder, bareVolid string) (vmid int, node, slot stri
 // The algorithm:
 //  1. One cluster-wide holder scan, read two ways: already parked -> nil, held
 //     by a real VM -> refuse (parking would double-reference a live volume).
-//  2. List the parkers on node and attach to the lowest one with a free slot,
-//     creating a parker only when none exists or all are full.
+//  2. List the same-prefix parkers on node and attach to the lowest one with a
+//     free slot, creating a parker only when none exists or all are full. A
+//     parker of another prefix is never a candidate, even with slots to spare.
 //  3. AttachDisk with an explicit DiskID (scsiN), then re-read to confirm the
 //     slot holds this volume -- a concurrent park can win the same slot.
 //  4. Re-assert protection=1 and write the provenance record.
@@ -1404,11 +1573,14 @@ func ParkDisk(ctx context.Context, c Client, logger *log.Logger, node, bareVolid
 // from ParkDisk so the EnsureFreshParker overflow path stays out of the
 // idempotency pre-check.
 //
-// Capacity reuse: it lists every parker on node in ascending VMID order
-// and attaches to the FIRST parker with a free slot. A fresh parker is created
-// only when all existing parkers are full (or none exist). This prevents the
+// It reuses capacity before it makes any. It lists the parkers on node that
+// carry cfg's own prefix, in ascending VMID order, and attaches to the FIRST
+// of them with a free slot. A fresh parker is created only when all of those
+// are full, or when the node has none of them yet. This prevents the
 // parker-per-disk leak where each overflow disk would otherwise spawn a new
-// parker VM, exhausting the VMID band.
+// parker VM, exhausting the VMID band. A parker of another prefix with room
+// in it is not reuse we will take, because sharing one is what couples two
+// deployments together.
 func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string, cfg ParkerConfig, pctx ParkContext) error {
 	parkers, listErr := ListParkersForNode(ctx, c, node, cfg)
 	if listErr != nil {

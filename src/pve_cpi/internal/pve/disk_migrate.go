@@ -578,9 +578,12 @@ const moverAttemptDescPrefix = "bosh-cpi-mover-attempt:"
 //
 // The tag check below matches by token containment (tagContainsParker,
 // TagsMarkDiskMover) and never looks at a "vm-prefix--" tag. That is
-// deliberate, mirroring parkerBelongsToDirector. A prefix is a display
-// convenience for VM names, not an identity the replay check needs to
-// verify, so replay adoption stays prefix-insensitive on purpose.
+// deliberate, and it does not contradict the prefix filter a park applies
+// through parkerBelongsToPrefix. A park is choosing which parker to fill, and
+// the prefix is what keeps two deployments out of each other's parkers. This
+// check is doing something else entirely, because it recognizes our own mover
+// by the attempt nonce we generated a moment ago, which no other prefix can be
+// carrying, so the prefix adds nothing to the verdict here.
 func moverAdoptableAfterReplay(ctx context.Context, c Client, logger *log.Logger, node string, vmid int, attemptNonce string) bool {
 	if attemptNonce == "" {
 		return false

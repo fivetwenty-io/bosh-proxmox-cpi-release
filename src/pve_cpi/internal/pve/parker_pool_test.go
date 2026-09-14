@@ -129,9 +129,15 @@ func (p *sweepPools) PoolHasVM(ctx context.Context, poolID string, vmid int64) (
 
 // sweepNodesSvc answers the node's own qemu listing with one row per scripted
 // guest, which is the listing ListParkersForNode reads.
+//
+// guests maps a VMID to its tag string, and names optionally gives that same
+// VMID a name. A guest the names map says nothing about is served without one,
+// which is what a parker created before the prefix tag existed and read
+// through an older PVE looks like.
 type sweepNodesSvc struct {
 	sdknodes.Service
 	guests map[int]string
+	names  map[int]string
 	err    error
 }
 
@@ -143,7 +149,11 @@ func (n *sweepNodesSvc) ListQemu(
 	}
 	resp := sdknodes.ListQemuResponse{}
 	for vmid, tags := range n.guests {
-		raw, err := json.Marshal(map[string]any{"vmid": vmid, "tags": tags})
+		row := map[string]any{"vmid": vmid, "tags": tags}
+		if name := n.names[vmid]; name != "" {
+			row["name"] = name
+		}
+		raw, err := json.Marshal(row)
 		if err != nil {
 			return nil, err
 		}
@@ -178,9 +188,18 @@ type sweepTestClient struct {
 	pools   PoolService
 	nodes   sdknodes.Service
 	cluster sdkcluster.Service
+	qemu    sdkqemu.Service
 }
 
-func (c *sweepTestClient) QEMU() sdkqemu.Service                     { return nil }
+// QEMU answers with an empty-config service when the fixture set none, so the
+// config read ListParkersForNode falls back to for a row that carries no name
+// resolves the way a nameless parker does in the field.
+func (c *sweepTestClient) QEMU() sdkqemu.Service {
+	if c.qemu == nil {
+		return &sweepQEMU{}
+	}
+	return c.qemu
+}
 func (c *sweepTestClient) Storage() sdkstorage.Service               { return nil }
 func (c *sweepTestClient) CloudInit() sdkcloudinit.Service           { return nil }
 func (c *sweepTestClient) Tasks() sdktasks.Service                   { return nil }
@@ -198,6 +217,23 @@ func sweepCfg() ParkerConfig {
 	}
 }
 
+// sweepQEMU is the config read ListParkersForNode falls back to when a listing
+// row carries no name. It answers with the fixture's name for that VMID, and
+// with a config that has no name at all when the fixture set none, which is
+// what a parker created before the naming convention looks like.
+type sweepQEMU struct {
+	sdkqemu.Service
+	names map[int]string
+}
+
+func (q *sweepQEMU) Config(_ context.Context, _ string, vmid int) (map[string]any, error) {
+	cfg := map[string]any{}
+	if name := q.names[vmid]; name != "" {
+		cfg["name"] = name
+	}
+	return cfg, nil
+}
+
 // sweepFixture builds a client holding the given guests, with a cluster
 // service that fails the test if the sweep reads the index.
 func sweepFixture(t *testing.T, pools *sweepPools, guests map[int]string) *sweepTestClient {
@@ -206,6 +242,20 @@ func sweepFixture(t *testing.T, pools *sweepPools, guests map[int]string) *sweep
 		pools:   pools,
 		nodes:   &sweepNodesSvc{guests: guests},
 		cluster: &sweepClusterSvc{t: t, banned: true},
+		qemu:    &sweepQEMU{},
+	}
+}
+
+// sweepFixtureNamed is sweepFixture for the cases that need the guests to
+// carry names, which is how a parker created before the prefix tag existed
+// says which prefix it belongs to.
+func sweepFixtureNamed(t *testing.T, pools *sweepPools, guests, names map[int]string) *sweepTestClient {
+	t.Helper()
+	return &sweepTestClient{
+		pools:   pools,
+		nodes:   &sweepNodesSvc{guests: guests, names: names},
+		cluster: &sweepClusterSvc{t: t, banned: true},
+		qemu:    &sweepQEMU{names: names},
 	}
 }
 
@@ -220,7 +270,7 @@ func countCalls(calls []string, prefix string) int {
 	return n
 }
 
-func TestPlaceParkersInPool_AssignsEveryUnpooledParker(t *testing.T) {
+func TestPlaceParkersInPool_AssignsEveryUnpooledSamePrefixParker(t *testing.T) {
 	t.Parallel()
 
 	// The pool is already there, which is the steady state after the first
@@ -434,7 +484,7 @@ func TestPlaceParkersInPool_NilPoolServiceMakesNoCallAndDoesNotPanic(t *testing.
 	}
 }
 
-func TestPlaceParkersInPool_FailedEnsureStillProcessesEveryParker(t *testing.T) {
+func TestPlaceParkersInPool_FailedEnsureStillProcessesEverySamePrefixParker(t *testing.T) {
 	t.Parallel()
 
 	// A pool the CPI cannot create may still exist, and a pool it cannot
@@ -591,6 +641,45 @@ func TestPlaceParkersInPool_NeverReadsTheClusterIndex(t *testing.T) {
 	}
 	if got := countCalls(pools.calls, "has:"); got != 2 {
 		t.Errorf("membership must be read once per parker through PoolHasVM; calls = %v", pools.calls)
+	}
+}
+
+func TestPlaceParkersInPool_LeavesAnotherPrefixesParkerOutOfThePool(t *testing.T) {
+	t.Parallel()
+
+	// The prefix is a pooling boundary as well as a reuse one. A parker the
+	// "green" deployment created belongs in whatever pool green's own sweep
+	// names, and a legacy parker belongs to the default prefix, so neither
+	// may be pulled into blue's pool by a sweep that happens to run on the
+	// same node.
+	pools := newSweepPools()
+	pools.poolExists = true
+	cfg := sweepCfg()
+	cfg.Prefix = "blue"
+	c := sweepFixtureNamed(t, pools,
+		map[int]string{
+			90000: "bosh-cpi;bosh-parker;director--d1;" + ParkerPrefixTagPrefix + "green",
+			90001: "bosh-cpi;bosh-parker;director--d1;" + ParkerPrefixTagPrefix + "blue",
+			90002: "bosh-cpi;bosh-parker;director--d1",
+		},
+		map[int]string{
+			90000: "green-parker-90000",
+			90001: "blue-parker-90001",
+			90002: "bosh-parker-90002",
+		})
+
+	if err := PlaceParkersInPool(context.Background(), c, nil, sweepNode, cfg); err != nil {
+		t.Fatalf("PlaceParkersInPool: unexpected error: %v", err)
+	}
+
+	if !pools.members[sweepPool][90001] {
+		t.Errorf("our own prefix's parker must land in %q, got %v", sweepPool, pools.members[sweepPool])
+	}
+	if pools.members[sweepPool][90000] || pools.members[sweepPool][90002] {
+		t.Errorf("only our own prefix's parker may be pooled, got %v", pools.members[sweepPool])
+	}
+	if got := countCalls(pools.calls, "add:"); got != 1 {
+		t.Errorf("AddVM calls = %d, want 1; calls = %v", got, pools.calls)
 	}
 }
 

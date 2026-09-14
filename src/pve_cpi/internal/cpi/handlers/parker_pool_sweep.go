@@ -39,10 +39,11 @@ func init() {
 	placeParkersInPoolImpl.Store(&production)
 }
 
-// sweepParkerPool places every parker on node into the configured parker pool,
-// after a park or a transfer has already succeeded. Callers discard the
-// outcome, because pool membership is cosmetic and a park that has landed is
-// never taken back for it, so the sweep's own warnings are the operator's
+// sweepParkerPool places every parker on node that carries cfg's own prefix
+// into the configured parker pool, after a park or a transfer has already
+// succeeded. A parker of another prefix is left where it is. Callers discard
+// the outcome, because pool membership is cosmetic and a park that has landed
+// is never taken back for it, so the sweep's own warnings are the operator's
 // record and this line is only a marker for the request log.
 //
 // It always passes the unguarded client, which unguardedPVE finds by walking

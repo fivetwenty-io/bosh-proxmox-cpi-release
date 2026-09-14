@@ -31,6 +31,22 @@ func parkerTestCfg() pve.ParkerConfig {
 	}
 }
 
+// parkerTestCfgWithPrefix returns a ParkerConfig for a deployment whose
+// resolved parker prefix is prefix.
+func parkerTestCfgWithPrefix(prefix string) pve.ParkerConfig {
+	return pve.ParkerConfig{
+		VMIDRangeStart: 90000,
+		VMIDRangeEnd:   90999,
+		Prefix:         prefix,
+	}
+}
+
+// parkerPrefixTagFor renders the tag a parker of this prefix carries, so the
+// fixtures below never spell the tag out twice.
+func parkerPrefixTagFor(prefix string) string {
+	return pve.ParkerPrefixTagPrefix + prefix
+}
+
 // parkerTestCfgWithDirector returns a ParkerConfig that includes a director ID.
 func parkerTestCfgWithDirector(directorID string) pve.ParkerConfig {
 	return pve.ParkerConfig{
@@ -466,6 +482,238 @@ func TestParkDisk_AllParkersFullCreatesFreshParker(t *testing.T) {
 	}
 	if attachVMID == 90000 || attachVMID == 90001 || attachVMID == 90002 || attachVMID == 0 {
 		t.Errorf("disk must attach to the freshly created parker, not an existing full one; got %d", attachVMID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prefix-scoped reuse
+// ---------------------------------------------------------------------------
+
+// TestParkDisk_DoesNotReuseAnotherPrefixesParker is the whole point of the
+// prefix boundary. A parker another deployment's prefix created has 30 free
+// slots here, and we still build our own beside it, because filling it would
+// couple two deployments that only ever meant to share a node.
+func TestParkDisk_DoesNotReuseAnotherPrefixesParker(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	cfg := parkerTestCfgWithPrefix("blue")
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var createdVMIDs []int
+	var attachVMID int
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == 90000 {
+				return map[string]any{
+					"tags":  "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("green"),
+					"name":  "green-parker-90000",
+					"scsi0": "local-lvm:vm-9999-disk-0",
+				}, nil
+			}
+			return map[string]any{"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("blue")}, nil
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			vmidVal, _ := params["vmid"].(int)
+			createdVMIDs = append(createdVMIDs, vmidVal)
+			return "", nil
+		},
+		attachFn: func(_ string, vmid int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachVMID = vmid
+			return "", nil
+		},
+	}
+
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{
+			"vmid": int64(90000), "node": node, "type": "qemu",
+			"name": "green-parker-90000",
+			"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("green"),
+		}), nil
+	})
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if len(createdVMIDs) != 1 {
+		t.Fatalf("a parker of another prefix with room in it must not be filled; created %v", createdVMIDs)
+	}
+	if attachVMID == 90000 || attachVMID != createdVMIDs[0] {
+		t.Errorf("the disk must land on the parker we created, %d; it landed on %d",
+			createdVMIDs[0], attachVMID)
+	}
+}
+
+// TestParkDisk_ReusesItsOwnPrefixesParker is the other half. The boundary is
+// only worth having if a deployment still fills the parkers it created, so a
+// same-prefix parker with a free slot takes the disk and nothing is created.
+func TestParkDisk_ReusesItsOwnPrefixesParker(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	cfg := parkerTestCfgWithPrefix("blue")
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var createdVMIDs []int
+	var attachVMID int
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == 90000 {
+				return map[string]any{
+					"tags":  "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("blue"),
+					"name":  "blue-parker-90000",
+					"scsi0": "local-lvm:vm-9999-disk-0",
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			vmidVal, _ := params["vmid"].(int)
+			createdVMIDs = append(createdVMIDs, vmidVal)
+			return "", nil
+		},
+		attachFn: func(_ string, vmid int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachVMID = vmid
+			return "", nil
+		},
+	}
+
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{
+			"vmid": int64(90000), "node": node, "type": "qemu",
+			"name": "blue-parker-90000",
+			"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("blue"),
+		}), nil
+	})
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if len(createdVMIDs) != 0 {
+		t.Errorf("our own prefix's parker had a free slot, so nothing may be created; created %v", createdVMIDs)
+	}
+	if attachVMID != 90000 {
+		t.Errorf("the disk must land on our own parker 90000; it landed on %d", attachVMID)
+	}
+}
+
+// TestParkDisk_DefaultPrefixReusesALegacyParker covers the parkers that
+// predate the prefix tag. They carry no prefix tag and are named
+// "bosh-parker-<vmid>", and a deployment that never set a prefix resolves to
+// the same "bosh" and fills them exactly as it always did. The assertion does
+// not isolate which evidence answered, because the name and the default
+// fallback both say "bosh" here. TestParkerPrefixIdentity is the test that
+// reads the name path on its own.
+func TestParkDisk_DefaultPrefixReusesALegacyParker(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	cfg := parkerTestCfg()
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var createdVMIDs []int
+	var attachVMID int
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == 90472 {
+				return map[string]any{
+					"tags":  "bosh-cpi;bosh-parker",
+					"name":  "bosh-parker-90472",
+					"scsi0": "local-lvm:vm-9999-disk-0",
+				}, nil
+			}
+			return map[string]any{}, nil
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			vmidVal, _ := params["vmid"].(int)
+			createdVMIDs = append(createdVMIDs, vmidVal)
+			return "", nil
+		},
+		attachFn: func(_ string, vmid int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachVMID = vmid
+			return "", nil
+		},
+	}
+
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{
+			"vmid": int64(90472), "node": node, "type": "qemu",
+			"name": "bosh-parker-90472",
+			"tags": "bosh-cpi;bosh-parker",
+		}), nil
+	})
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if len(createdVMIDs) != 0 {
+		t.Errorf("a legacy bosh parker must still be adoptable by the default prefix; created %v", createdVMIDs)
+	}
+	if attachVMID != 90472 {
+		t.Errorf("the disk must land on the legacy parker 90472; it landed on %d", attachVMID)
+	}
+}
+
+// TestParkDisk_NonDefaultPrefixLeavesALegacyParkerAlone is the same fixture
+// read from the other side. A legacy parker belongs to "bosh", so a deployment
+// whose prefix is anything else builds its own beside it rather than adopting
+// somebody's history.
+func TestParkDisk_NonDefaultPrefixLeavesALegacyParkerAlone(t *testing.T) {
+	t.Parallel()
+	ctx := pve.WithTestBackoff(context.Background(), func(_ int) time.Duration { return 0 })
+	cfg := parkerTestCfgWithPrefix("cpitest")
+	node := "pve1"
+	bareVolid := "local-lvm:vm-9001-disk-0"
+
+	var createdVMIDs []int
+	var attachVMID int
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == 90472 {
+				return map[string]any{
+					"tags":  "bosh-cpi;bosh-parker",
+					"name":  "bosh-parker-90472",
+					"scsi0": "local-lvm:vm-9999-disk-0",
+				}, nil
+			}
+			return map[string]any{"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("cpitest")}, nil
+		},
+		createFn: func(_ string, params map[string]any) (string, error) {
+			vmidVal, _ := params["vmid"].(int)
+			createdVMIDs = append(createdVMIDs, vmidVal)
+			return "", nil
+		},
+		attachFn: func(_ string, vmid int, _, _ string, _ *qemu.AttachOpts) (string, error) {
+			attachVMID = vmid
+			return "", nil
+		},
+	}
+
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{
+			"vmid": int64(90472), "node": node, "type": "qemu",
+			"name": "bosh-parker-90472",
+			"tags": "bosh-cpi;bosh-parker",
+		}), nil
+	})
+
+	if err := pve.ParkDisk(ctx, c, nopLogger(), node, bareVolid, cfg, pve.ParkContext{}); err != nil {
+		t.Fatalf("ParkDisk: unexpected error: %v", err)
+	}
+
+	if len(createdVMIDs) != 1 {
+		t.Fatalf("a legacy bosh parker is not ours to fill, so one must be created; created %v", createdVMIDs)
+	}
+	if attachVMID == 90472 || attachVMID != createdVMIDs[0] {
+		t.Errorf("the disk must land on the parker we created, %d; it landed on %d",
+			createdVMIDs[0], attachVMID)
 	}
 }
 
@@ -2715,6 +2963,136 @@ func TestListParkersForNode_SkipsMovers(t *testing.T) {
 	}
 	if len(parkers) != 1 || parkers[0] != 90001 {
 		t.Fatalf("parkers = %v, want [90001] (the mover must be excluded)", parkers)
+	}
+}
+
+// TestListParkersForNode_ReturnsOnlyItsOwnPrefix puts three prefixes on one
+// node, which is what a cluster looks like once two deployments and a legacy
+// parker share it, and reads the listing as the "blue" deployment. Only blue's
+// own parker may come back, because this listing is what a park chooses from
+// and what the pool sweep places.
+func TestListParkersForNode_ReturnsOnlyItsOwnPrefix(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+
+	qemuSvc := &parkerQEMU{}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{
+				"vmid": int64(90000), "node": node, "type": "qemu",
+				"name": "green-parker-90000",
+				"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("green"),
+			},
+			map[string]any{
+				"vmid": int64(90001), "node": node, "type": "qemu",
+				"name": "blue-parker-90001",
+				"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("blue"),
+			},
+			map[string]any{
+				"vmid": int64(90002), "node": node, "type": "qemu",
+				"name": "bosh-parker-90002",
+				"tags": "bosh-cpi;bosh-parker",
+			},
+		), nil
+	})
+
+	parkers, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfgWithPrefix("blue"))
+	if err != nil {
+		t.Fatalf("ListParkersForNode: %v", err)
+	}
+	if len(parkers) != 1 || parkers[0] != 90001 {
+		t.Fatalf("parkers = %v, want [90001]; another prefix's parker and a legacy one are not ours", parkers)
+	}
+
+	legacy, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("ListParkersForNode for the default prefix: %v", err)
+	}
+	if len(legacy) != 1 || legacy[0] != 90002 {
+		t.Fatalf("parkers = %v, want [90002]; the default prefix sees the legacy parker and nothing else", legacy)
+	}
+}
+
+// TestListParkersForNode_ReadsTheNameFromTheConfigWhenTheRowHasNeither covers
+// the branch where the row arrives with no tags at all. The config read that
+// settles the tag question carries the name too, and the prefix fallback needs
+// it, so both branches decide the prefix on the same evidence.
+func TestListParkersForNode_ReadsTheNameFromTheConfigWhenTheRowHasNeither(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			switch vmid {
+			case 90000:
+				return map[string]any{"tags": "bosh-cpi;bosh-parker", "name": "green-parker-90000"}, nil
+			case 90001:
+				return map[string]any{"tags": "bosh-cpi;bosh-parker", "name": "blue-parker-90001"}, nil
+			default:
+				return map[string]any{}, nil
+			}
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(
+			map[string]any{"vmid": int64(90000), "node": node, "type": "qemu"},
+			map[string]any{"vmid": int64(90001), "node": node, "type": "qemu"},
+		), nil
+	})
+
+	parkers, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfgWithPrefix("blue"))
+	if err != nil {
+		t.Fatalf("ListParkersForNode: %v", err)
+	}
+	if len(parkers) != 1 || parkers[0] != 90001 {
+		t.Fatalf("parkers = %v, want [90001]; the name the config read carried is what tells the two apart", parkers)
+	}
+}
+
+// TestListParkersForNode_ReadsTheNameFromTheConfigWhenTheTagsCarryNoPrefix
+// covers the row that arrives tagged as a parker, with no prefix tag on it and
+// with no name either. The name in the config is the only evidence of the
+// parker's prefix left, so without that read the identity would fall back to
+// the default and the parker would answer to "bosh" instead of to the prefix
+// that built it.
+func TestListParkersForNode_ReadsTheNameFromTheConfigWhenTheTagsCarryNoPrefix(t *testing.T) {
+	t.Parallel()
+	node := "pve1"
+	configReads := 0
+
+	qemuSvc := &parkerQEMU{
+		configFn: func(_ string, vmid int) (map[string]any, error) {
+			if vmid == 90000 {
+				configReads++
+				return map[string]any{"tags": "bosh-cpi;bosh-parker", "name": "blue-parker-90000"}, nil
+			}
+			return map[string]any{}, nil
+		},
+	}
+	c := buildParkerClient(qemuSvc, func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+		return parkerClusterResp(map[string]any{
+			"vmid": int64(90000), "node": node, "type": "qemu",
+			"tags": "bosh-cpi;bosh-parker",
+		}), nil
+	})
+
+	mine, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfgWithPrefix("blue"))
+	if err != nil {
+		t.Fatalf("ListParkersForNode for the blue prefix: %v", err)
+	}
+	if len(mine) != 1 || mine[0] != 90000 {
+		t.Fatalf("parkers = %v, want [90000]; the config name is what names the parker's prefix", mine)
+	}
+	if configReads == 0 {
+		t.Error("the untagged-prefix row must send the filter to the VM's config for its name")
+	}
+
+	theirs, err := pve.ListParkersForNode(context.Background(), c, node, parkerTestCfg())
+	if err != nil {
+		t.Fatalf("ListParkersForNode for the default prefix: %v", err)
+	}
+	if len(theirs) != 0 {
+		t.Fatalf("parkers = %v, want none; a parker named for another prefix is not the default prefix's", theirs)
 	}
 }
 

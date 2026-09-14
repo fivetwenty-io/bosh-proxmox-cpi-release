@@ -29,8 +29,10 @@ const parkerPoolSweepTimeout = 10 * time.Second
 // PlaceParkersInPool puts cfg.Pool's missing parkers on node into it, creating
 // that pool if it does not exist yet. Its candidates come from
 // ListParkersForNode, so they are the parkers in cfg's band that this
-// director may adopt, and a parker another director's tag attributes
-// elsewhere is not one of them. Handlers call it once a park or a transfer has
+// director may adopt and whose prefix identity equals cfg.Prefix. A parker
+// another director's tag attributes elsewhere is not one of them, and neither
+// is a parker another prefix created, which stays in whatever pool its own
+// deployment's sweep put it in. Handlers call it once a park or a transfer has
 // returned success, and they discard its error after logging; it returns one
 // only so tests can read the failures.
 //

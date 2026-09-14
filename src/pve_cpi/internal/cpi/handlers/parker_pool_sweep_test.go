@@ -309,10 +309,18 @@ func transferFunnelDeps(c *idFakeClient) Deps {
 
 // transferFunnelClient is the fake both detach funnels below run against: one
 // workload VM holding a stable-ID disk, and one parker ready to receive it.
+//
+// The parker carries the prefix tag transferFunnelDeps configures, because a
+// park reuses only the parkers of its own prefix. Without it this parker reads
+// as a legacy "bosh" one, the transfer builds a second parker beside it, and
+// the sweep these tests watch would be watching the wrong guest.
 func transferFunnelClient(volid string) *idFakeClient {
 	return newIDFakeClient(map[int]map[string]any{
-		700:   {"scsi1": volid + ",serial=" + idTestToken + ",size=10G"},
-		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true},
+		700: {"scsi1": volid + ",serial=" + idTestToken + ",size=10G"},
+		90000: {
+			"tags":       "bosh-cpi;bosh-parker;" + pve.ParkerPrefixTagPrefix + parkerCfgPrefix,
+			"protection": true,
+		},
 	})
 }
 
@@ -417,7 +425,12 @@ func TestDetachForeignActiveDisks_SweepsOncePerCallNotOncePerDisk(t *testing.T) 
 			"scsi1": "data:vm-777-disk-1,serial=" + idTestToken + ",size=10G",
 			"scsi2": "data:vm-778-disk-1,serial=" + secondToken + ",size=10G",
 		},
-		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true},
+		// The prefix tag is here for the reason transferFunnelClient carries
+		// one, which is that a park reuses only the parkers of its own prefix.
+		90000: {
+			"tags":       "bosh-cpi;bosh-parker;" + pve.ParkerPrefixTagPrefix + parkerCfgPrefix,
+			"protection": true,
+		},
 	})
 	deps := transferFunnelDeps(c)
 
@@ -855,7 +868,13 @@ func (n *guardScopeNodes) ListQemu(
 		empty := sdknodes.ListQemuResponse{}
 		return &empty, nil
 	}
-	raw, err := json.Marshal(map[string]any{"vmid": n.vmid, "tags": "bosh-cpi;bosh-parker"})
+	// The prefix tag is what makes this parker one the configured prefix may
+	// adopt and pool. A parker without it reads as a legacy "bosh" parker and
+	// the sweep under test would pass it over.
+	raw, err := json.Marshal(map[string]any{
+		"vmid": n.vmid,
+		"tags": "bosh-cpi;bosh-parker;" + pve.ParkerPrefixTagPrefix + parkerCfgPrefix,
+	})
 	if err != nil {
 		return nil, err
 	}
