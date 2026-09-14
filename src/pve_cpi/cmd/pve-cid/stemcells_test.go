@@ -205,6 +205,48 @@ func TestBuildStemcellInventory_LocalStorageReplicaNotFalseOrphan(t *testing.T) 
 	}
 }
 
+// TestBuildStemcellInventory_StorageReplicaGroupsWithPrimary pins that a
+// per-storage cache replica is reported under its stemcell's sha8 alongside
+// the primary rather than as a stemcell of its own: the tool groups on name,
+// version and sha8 and never keys on a replica tag prefix.
+func TestBuildStemcellInventory_StorageReplicaGroupsWithPrimary(t *testing.T) {
+	r := &fakeReader{
+		vms: []ClusterVM{
+			{VMID: 6042, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.719-cafebabe",
+				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe", Template: true},
+			{VMID: 6043, Node: "pve1", Name: "bosh-stemcell-ubuntu-jammy-1.719-cafebabe",
+				Tags: "bosh-stemcell;bosh-stemcell-name-ubuntu-jammy;bosh-stemcell-version-1.719;bosh-stemcell-sha-cafebabe;bosh-stemcell-storage-ns-2", Template: true},
+		},
+		configs: map[string]map[string]any{
+			"pve1/6042": templateCfg(t, templateProvenance{
+				Name: "ubuntu-jammy", Version: "1.719", SHA8: "cafebabe", Kind: "heavy",
+				Created: "2026-08-01T00:00:00Z", DirectorRefs: []string{"dir-1"},
+			}),
+			"pve1/6043": templateCfg(t, templateProvenance{
+				Name: "ubuntu-jammy", Version: "1.719", SHA8: "cafebabe", Kind: "heavy",
+				Created: "2026-08-01T00:00:00Z", DirectorRefs: []string{"dir-1"},
+			}),
+		},
+		content: map[string][]StorageContentItem{
+			"pve1|nfs": {{VolID: "nfs:import/bosh-stemcell-ubuntu-jammy-1.719-cafebabe.qcow2", Size: 123}},
+		},
+		nodes:              []string{"pve1"},
+		storageSharedKnown: map[string]bool{"nfs": true},
+		storageShared:      map[string]bool{"nfs": true},
+	}
+
+	entries, err := buildStemcellInventory(context.Background(), r, "pve1", "nfs")
+	if err != nil {
+		t.Fatalf("buildStemcellInventory error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected the primary and its storage replica in 1 entry, got %d", len(entries))
+	}
+	if entries[0].Orphan {
+		t.Errorf("expected non-orphan, reasons=%v", entries[0].OrphanReasons)
+	}
+}
+
 // TestBuildStemcellInventory_LocalStorageTrulyMissingBackingIsOrphan covers
 // the other side of node-local scanning: a template on node-local storage
 // whose own node genuinely lacks the backing file is still reported as an
