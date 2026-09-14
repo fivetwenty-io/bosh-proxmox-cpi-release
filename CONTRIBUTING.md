@@ -46,7 +46,7 @@ This runs all Go tests with race detection. Every code change should come with t
 make check
 ```
 
-This runs `artifacts-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+This runs `artifacts-check`, `linear-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
 
 ### Installing the git hooks
 
