@@ -103,8 +103,9 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		},
 	}
 
-	// stemcell_replicate_storage_set validates against the effective root set,
-	// so it cannot be applied to a base with no binding. The base itself must
+	// An explicit stemcell_replicate_storage_set validates against the
+	// effective root set, so a true cannot be applied to a base with no
+	// binding. The base itself must
 	// stay unbound, because an inherited binding makes ApplyContextOverrides
 	// refuse the pve_host and pve_port rows unless the entry also restates
 	// pve_storage_sets. This field therefore gets a bound base of its own.

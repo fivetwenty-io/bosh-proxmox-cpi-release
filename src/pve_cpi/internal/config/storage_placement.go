@@ -258,6 +258,42 @@ func (c *CPIConfig) ValidateStoragePlacementAllocation() error {
 	return nil
 }
 
+// validateStemcellReplicaSet checks the preconditions of per-member stemcell
+// cache replicas, but only when the operator set the property explicitly to
+// true. Left unset the property is a request to replicate where replication
+// helps, so a deployment with no storage set bound, or one on the import
+// strategy, simply never builds a replica and hears nothing about it.
+func (c *CPIConfig) validateStemcellReplicaSet(errs *[]string) {
+	if c.StemcellReplicateStorageSet == nil || !*c.StemcellReplicateStorageSet {
+		return
+	}
+	set := c.EffectiveRootStorageSet()
+	if set == "" {
+		*errs = append(*errs, "stemcell_replicate_storage_set requires root_storage_set or ephemeral_storage_set")
+	}
+	if c.StemcellStrategy == StemcellStrategyImport {
+		*errs = append(*errs, "stemcell_replicate_storage_set requires stemcell_strategy template")
+	}
+	// An explicit member list is checked here so a collision is a config
+	// error rather than a runtime skip. A name_pattern set resolves against
+	// the live cluster, so the builder repeats the check at build time
+	// (filterStorageReplicaMembers) and skips the later member with a
+	// warning.
+	def, ok := c.StorageSets[set]
+	if !ok {
+		return
+	}
+	seen := make(map[string]string, len(def.Names))
+	for _, member := range def.Names {
+		tag := ReplicaTagPart(member)
+		if prior, dup := seen[tag]; dup {
+			*errs = append(*errs, fmt.Sprintf("storage set %q members %q and %q sanitize to the same replica tag", set, prior, member))
+			continue
+		}
+		seen[tag] = member
+	}
+}
+
 // ValidateStoragePlacement checks schema and references without contacting PVE,
 // inspecting live membership, or requiring access to the journal directory.
 func (c *CPIConfig) ValidateStoragePlacement() error {
@@ -313,31 +349,7 @@ func (c *CPIConfig) ValidateStoragePlacement() error {
 			owners[member] = name
 		}
 	}
-	if c.StemcellReplicateStorageSet {
-		set := c.EffectiveRootStorageSet()
-		if set == "" {
-			errs = append(errs, "stemcell_replicate_storage_set requires root_storage_set or ephemeral_storage_set")
-		}
-		if c.StemcellStrategy == StemcellStrategyImport {
-			errs = append(errs, "stemcell_replicate_storage_set requires stemcell_strategy template")
-		}
-		// An explicit member list is checked here so a collision is a
-		// config error rather than a runtime skip. A name_pattern set
-		// resolves against the live cluster, so the builder repeats the
-		// check at build time (filterStorageReplicaMembers) and skips the
-		// later member with a warning.
-		if def, ok := c.StorageSets[set]; ok {
-			seen := make(map[string]string, len(def.Names))
-			for _, member := range def.Names {
-				tag := ReplicaTagPart(member)
-				if prior, dup := seen[tag]; dup {
-					errs = append(errs, fmt.Sprintf("storage set %q members %q and %q sanitize to the same replica tag", set, prior, member))
-					continue
-				}
-				seen[tag] = member
-			}
-		}
-	}
+	c.validateStemcellReplicaSet(&errs)
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}

@@ -2164,7 +2164,7 @@ func storageSetReplicaDeps(t *testing.T, on bool, roots *[]string, tags *[]strin
 	deps := makeDeps(client)
 	deps.Config.VMStorage = "ns_1"
 	deps.Config.EphemeralStorageSet = "eph"
-	deps.Config.StemcellReplicateStorageSet = on
+	deps.Config.StemcellReplicateStorageSet = boolPtr(on)
 	deps.Config.StemcellTemplateVMIDRangeStart = 30000
 	deps.Config.StemcellTemplateVMIDRangeEnd = 30999
 	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2"},

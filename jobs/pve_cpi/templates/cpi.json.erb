@@ -450,11 +450,14 @@
     config["stemcell_replicate_local"] = true
   end
 
-  # Emit stemcell_replicate_storage_set only when true. The Go zero-value
-  # (false) means no per-member templates; omitting the key preserves that.
-  if p("pve.stemcell_replicate_storage_set", false)
-    config["stemcell_replicate_storage_set"] = true
-  end
+  # Emit stemcell_replicate_storage_set only when the operator explicitly sets
+  # it (true or false). The spec has no default (default: ~), so if_p only
+  # fires on an explicit manifest value -- this preserves the Go accessor's
+  # tri-state: key absent -> nil -> per-member templates whenever a root or
+  # ephemeral set is bound and the strategy builds templates; explicit false
+  # -> never replicate; explicit true -> replicate, and the preconditions
+  # become mandatory instead of a quiet no-op.
+  if_p("pve.stemcell_replicate_storage_set") { |v| config["stemcell_replicate_storage_set"] = v }
 
   # Emit stemcell_replication_concurrency only when non-zero. Zero (default)
   # resolves to 1 (serial) in Go; omitting the key preserves that default —

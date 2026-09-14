@@ -19,7 +19,7 @@ import (
 
 func TestStorageSetReplicasNeeded(t *testing.T) {
 	t.Parallel()
-	on := Deps{Config: &config.CPIConfig{StemcellReplicateStorageSet: true, EphemeralStorageSet: "eph"}}
+	on := Deps{Config: &config.CPIConfig{StemcellReplicateStorageSet: boolPtr(true), EphemeralStorageSet: "eph"}}
 	if set, ok := storageSetReplicasNeeded(on, "abcd1234ef"); !ok || set != "eph" {
 		t.Fatalf("want eph/true, got %q/%v", set, ok)
 	}
@@ -29,11 +29,21 @@ func TestStorageSetReplicasNeeded(t *testing.T) {
 	if _, ok := storageSetReplicasNeeded(on, "abc"); ok {
 		t.Fatal("a digest shorter than eight characters must disable replicas")
 	}
-	off := Deps{Config: &config.CPIConfig{EphemeralStorageSet: "eph"}}
-	if _, ok := storageSetReplicasNeeded(off, "abcd1234ef"); ok {
-		t.Fatal("property off must disable replicas")
+	// Unset is the shipping default, and a bound set is the whole reason the
+	// default is on, so this is the case most deployments actually take.
+	dflt := Deps{Config: &config.CPIConfig{EphemeralStorageSet: "eph"}}
+	if set, ok := storageSetReplicasNeeded(dflt, "abcd1234ef"); !ok || set != "eph" {
+		t.Fatalf("an unset property with a bound set must replicate, got %q/%v", set, ok)
 	}
-	unbound := Deps{Config: &config.CPIConfig{StemcellReplicateStorageSet: true}}
+	off := Deps{Config: &config.CPIConfig{StemcellReplicateStorageSet: boolPtr(false), EphemeralStorageSet: "eph"}}
+	if _, ok := storageSetReplicasNeeded(off, "abcd1234ef"); ok {
+		t.Fatal("an explicit false must disable replicas")
+	}
+	imported := Deps{Config: &config.CPIConfig{EphemeralStorageSet: "eph", StemcellStrategy: config.StemcellStrategyImport}}
+	if _, ok := storageSetReplicasNeeded(imported, "abcd1234ef"); ok {
+		t.Fatal("the import strategy builds no templates, so it must disable replicas")
+	}
+	unbound := Deps{Config: &config.CPIConfig{StemcellReplicateStorageSet: boolPtr(true)}}
 	if _, ok := storageSetReplicasNeeded(unbound, "abcd1234ef"); ok {
 		t.Fatal("no bound set must disable replicas")
 	}
@@ -96,7 +106,7 @@ func TestStorageSetReplicaTargets(t *testing.T) {
 	add("ns_1", "nas", "/ns1", 1, "images,import")
 	add("ns_2", "nas", "/ns2", 1, "images")
 	add("ns_5", "nas", "/ns5", 1, "images")
-	cfg := &config.CPIConfig{VMStorage: "ns_1", EphemeralStorageSet: "eph", StemcellReplicateStorageSet: true,
+	cfg := &config.CPIConfig{VMStorage: "ns_1", EphemeralStorageSet: "eph", StemcellReplicateStorageSet: boolPtr(true),
 		StorageSets: map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2", "ns_5"},
 			Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
 	deps := Deps{Config: cfg, Logger: log.NewNopLogger(), ReplicaInventory: src}
@@ -118,7 +128,7 @@ func TestStorageSetReplicaTargets_DiscoverErrorIsReturned(t *testing.T) {
 	src := &planFixtureSource{statuses: map[string][]json.RawMessage{}}
 	src.defs = append(src.defs, planJSON(t, map[string]any{"storage": "ns_1", "type": "nfs", "shared": 1, "server": "nas", "export": "/ns1", "content": "images,import"}))
 	src.statuses["n1"] = append(src.statuses["n1"], planJSON(t, map[string]any{"storage": "ns_1", "active": 1, "enabled": 1, "total": uint64(100) << 30, "avail": uint64(80) << 30}))
-	cfg := &config.CPIConfig{VMStorage: "ns_1", EphemeralStorageSet: "eph", StemcellReplicateStorageSet: true,
+	cfg := &config.CPIConfig{VMStorage: "ns_1", EphemeralStorageSet: "eph", StemcellReplicateStorageSet: boolPtr(true),
 		StorageSets: map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_missing"},
 			Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
 	deps := Deps{Config: cfg, Logger: log.NewNopLogger(), ReplicaInventory: src}
@@ -261,7 +271,7 @@ func TestMaybeReplicateTemplateToStorageSet_BuildsOnEachMember(t *testing.T) {
 	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
 	deps.Config.VMStorage = "ns_1"
 	deps.Config.EphemeralStorageSet = "eph"
-	deps.Config.StemcellReplicateStorageSet = true
+	deps.Config.StemcellReplicateStorageSet = boolPtr(true)
 	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2", "ns_5"},
 		Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{
@@ -318,7 +328,7 @@ func TestMaybeReplicateTemplateToStorageSet_SkipsOnRootBusMismatch(t *testing.T)
 	deps := buildEnsureTemplateDeps(qemu, nodes, &wbMockTasks{}, &wbTemplateStorage{})
 	deps.Config.VMStorage = "ns_1"
 	deps.Config.EphemeralStorageSet = "eph"
-	deps.Config.StemcellReplicateStorageSet = true
+	deps.Config.StemcellReplicateStorageSet = boolPtr(true)
 	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2"},
 		Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{

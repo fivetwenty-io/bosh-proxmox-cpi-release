@@ -133,7 +133,7 @@ func prepareManagedVMPlan(ctx context.Context, deps Deps, parsed *createVMParsed
 	// to build them. Fires once per plan attempt.
 	if root, ok := managedVMRoleTarget(plan, storageRoleRoot); ok &&
 		root.Mechanism == storageMechanismFullClone && root.Source != nil &&
-		root.Source.TemplateVMID > 0 && deps.Config != nil && deps.Config.StemcellReplicateStorageSet {
+		root.Source.TemplateVMID > 0 && deps.Config.StemcellReplicateStorageSetEnabled() {
 		sha8, _ := extractSHA8FromParsed(parsed)
 		deps.Log(ctx).Warn("create_vm: no cache template on placed storage; cloning in full",
 			log.String("storage", root.StorageID),

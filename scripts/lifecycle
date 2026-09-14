@@ -115,8 +115,10 @@ Parked-disk strategy (exercises pve.detached_disk_strategy end to end):
 Storage-set cache replicas (exercises pve.stemcell_replicate_storage_set):
     STORAGE_SET_REPLICAS_TEST  on | off            (default: off)
                        Runs steps 2b, 3b, and 16b against a CPI_CONFIG that
-                       binds a multi-member root or ephemeral storage set and
-                       sets stemcell_replicate_storage_set. Step 2b asserts one
+                       binds a multi-member root or ephemeral storage set.
+                       Replication is on by default for such a config, so the
+                       config need not name stemcell_replicate_storage_set;
+                       one set to false is refused. Step 2b asserts one
                        cache template per member, each replica carrying its own
                        bosh-stemcell-storage-<id> tag. Step 3b asserts the VM's
                        root disk landed on a member that holds a template, which
@@ -248,10 +250,12 @@ DISK_MIGRATION_TEST = env("DISK_MIGRATION_TEST", "on").strip().lower()
 if DISK_MIGRATION_TEST not in ("on", "off"):
     sys.exit(f"DISK_MIGRATION_TEST must be on|off, got {DISK_MIGRATION_TEST!r}")
 
-# Storage-set cache replicas (pve.stemcell_replicate_storage_set). Opt-in and
-# off by default: it asserts one cache template per member of the effective
-# root set, so it only means anything against a CPI_CONFIG that binds a
-# multi-member root or ephemeral set and turns the property on.
+# Storage-set cache replicas (pve.stemcell_replicate_storage_set). The pass is
+# opt-in and off by default, because it asserts one cache template per member
+# of the effective root set and so only means anything against a CPI_CONFIG
+# that binds a multi-member root or ephemeral set. The property itself needs no
+# setting there, since replication is the default for a config that binds a
+# set; a config that sets it to false is refused below rather than failed.
 STORAGE_SET_REPLICAS_TEST = env("STORAGE_SET_REPLICAS_TEST", "off").strip().lower()
 if STORAGE_SET_REPLICAS_TEST not in ("on", "off"):
     sys.exit(f"STORAGE_SET_REPLICAS_TEST must be on|off, got {STORAGE_SET_REPLICAS_TEST!r}")
@@ -1502,6 +1506,12 @@ def main() -> int:
             _members = list((_base_cfg.get("storage_sets") or {}).get(_set_name, {}).get("names") or [])
             if len(_members) < 2:
                 sys.exit(f"STORAGE_SET_REPLICAS_TEST=on needs set {_set_name!r} to list at least two explicit members")
+            if _base_cfg.get("stemcell_replicate_storage_set") is False:
+                sys.exit(
+                    "STORAGE_SET_REPLICAS_TEST=on cannot run against a CPI_CONFIG that sets "
+                    "stemcell_replicate_storage_set to false, which builds no replicas by design; "
+                    "drop the key to take the default or set it to true"
+                )
             print(f"root set {_set_name!r} members: {_members}")
             verify_storage_set_replicas(verifier, state["stemcell_cid"], len(_members))
 

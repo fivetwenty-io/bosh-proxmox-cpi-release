@@ -851,7 +851,7 @@ func TestCreateStemcell_SourceURL_BuildsStorageSetReplicas(t *testing.T) {
 	deps.PVE.(*wbTemplateMockClient).clusterSvc = &wbClusterForAlloc{listResourcesFn: listClusterResourcesEmpty()}
 	deps.Config.VMStorage = "ns_1"
 	deps.Config.EphemeralStorageSet = "eph"
-	deps.Config.StemcellReplicateStorageSet = true
+	deps.Config.StemcellReplicateStorageSet = boolPtr(true)
 	deps.Config.StorageSets = map[string]config.StorageSet{"eph": {Names: []string{"ns_1", "ns_2"},
 		Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
 	src := &planFixtureSource{statuses: map[string][]json.RawMessage{}}

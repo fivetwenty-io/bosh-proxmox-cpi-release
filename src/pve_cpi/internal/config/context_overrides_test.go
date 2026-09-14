@@ -815,10 +815,13 @@ func TestApplyContextOverrides_NestedFlatPrecedence(t *testing.T) {
 }
 
 // TestApplyContextOverrides_StemcellReplicateStorageSet verifies that a
-// cpi-config entry can turn per-member stemcell replicas on for its own
-// cluster. It does not ride the nested-shape test, because that entry moves
-// the cluster endpoint, and an endpoint change with inherited storage
-// bindings is refused unless the entry restates pve_storage_sets.
+// cpi-config entry decides per-member stemcell replicas for its own cluster
+// in both directions. The false case is the one that matters, because the
+// base already has a set bound and so replicates by default; an entry that
+// says false must be able to turn that off. It does not ride the
+// nested-shape test, because that entry moves the cluster endpoint, and an
+// endpoint change with inherited storage bindings is refused unless the
+// entry restates pve_storage_sets.
 func TestApplyContextOverrides_StemcellReplicateStorageSet(t *testing.T) {
 	t.Parallel()
 	base := validBaseCfg()
@@ -826,26 +829,37 @@ func TestApplyContextOverrides_StemcellReplicateStorageSet(t *testing.T) {
 	base.StorageSets = map[string]config.StorageSet{
 		"eph": {Names: []string{"ns1", "ns2"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
 	}
+	if !base.StemcellReplicateStorageSetEnabled() {
+		t.Fatal("a bound ephemeral set must replicate by default, or this test proves nothing")
+	}
 
-	eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{
-		"pve_stemcell_replicate_storage_set": true,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !eff.StemcellReplicateStorageSet {
-		t.Error("pve_stemcell_replicate_storage_set must apply to the effective config")
-	}
-	if base.StemcellReplicateStorageSet {
-		t.Error("base config was mutated")
-	}
-	found := false
-	for _, k := range applied {
-		if k == "pve_stemcell_replicate_storage_set" {
-			found = true
+	for _, tc := range []struct {
+		name string
+		want bool
+	}{{"on", true}, {"off", false}} {
+		eff, applied, _, err := config.ApplyContextOverrides(base, map[string]any{
+			"pve_stemcell_replicate_storage_set": tc.want,
+		})
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
 		}
-	}
-	if !found {
-		t.Errorf("applied = %v, want it to carry pve_stemcell_replicate_storage_set", applied)
+		if eff.StemcellReplicateStorageSet == nil || *eff.StemcellReplicateStorageSet != tc.want {
+			t.Errorf("%s: effective pointer = %v, want an explicit %t", tc.name, eff.StemcellReplicateStorageSet, tc.want)
+		}
+		if got := eff.StemcellReplicateStorageSetEnabled(); got != tc.want {
+			t.Errorf("%s: resolved = %t, want %t", tc.name, got, tc.want)
+		}
+		if base.StemcellReplicateStorageSet != nil {
+			t.Errorf("%s: base config was mutated", tc.name)
+		}
+		found := false
+		for _, k := range applied {
+			if k == "pve_stemcell_replicate_storage_set" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: applied = %v, want it to carry pve_stemcell_replicate_storage_set", tc.name, applied)
+		}
 	}
 }
