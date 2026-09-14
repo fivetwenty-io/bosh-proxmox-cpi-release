@@ -149,6 +149,34 @@ def resolved_parker_prefix(cfg: dict) -> str:
     return DEFAULT_PARKER_PREFIX
 
 
+# The tag prefix a parker's resolved name prefix rides on, and the name shape
+# a parker without that tag falls back to. Both mirror ParkerPrefixTagPrefix
+# and parkerVMName in internal/pve/parker.go, so a harness reading a parker's
+# prefix identity off its tags or its name agrees with the CPI byte for byte.
+PARKER_PREFIX_TAG_PREFIX = "vm-prefix--"
+_PARKER_NAME_RE = re.compile(r"^(.+)-parker-\d+$")
+
+
+def parker_prefix_identity(tags: str, name: str) -> str:
+    """Return the prefix identity a parker carries.
+
+    Mirrors parkerPrefixIdentity in internal/pve/parker.go, which the CPI reads
+    to decide which parkers a deployment may reuse and pool. We read the
+    "vm-prefix--<value>" tag first, when tags carries one. When it does not,
+    we parse the prefix out of a name shaped "<prefix>-parker-<vmid>". A
+    parker with neither a tag nor a name in that shape predates both
+    conventions, and its identity is the default prefix, "bosh".
+    """
+    for raw in _TAG_SEP_RE.split(tags):
+        t = raw.strip()
+        if t.lower().startswith(PARKER_PREFIX_TAG_PREFIX.lower()):
+            return t[len(PARKER_PREFIX_TAG_PREFIX):]
+    m = _PARKER_NAME_RE.match(name.strip())
+    if m:
+        return m.group(1)
+    return DEFAULT_PARKER_PREFIX
+
+
 def resolved_parker_pool(cfg: dict) -> str:
     """Return the pool cfg resolves parker placement to, or "" when pool
     placement is off.

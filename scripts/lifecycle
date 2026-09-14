@@ -887,6 +887,19 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
             f"    note: parker {parker_vmid} predates this run with tags {parker_tags!r}; "
             "the CPI never retags a parker, so the identity tag is not checked"
         )
+    # The CPI reuses and pools a parker only when its prefix identity equals
+    # the run's resolved prefix, whether that parker is new to this run or
+    # predates it, so this assertion runs unconditionally, unlike the name and
+    # tag checks above it. The comparison folds case because
+    # parkerBelongsToPrefix folds case.
+    found_parker_prefix = _pve_verify.parker_prefix_identity(
+        parker_tags, str(parker_cfg.get("name", ""))
+    )
+    verifier.assert_true(
+        f"parker {parker_vmid} prefix identity is {expected_parker_prefix!r}, "
+        f"found {found_parker_prefix!r}",
+        found_parker_prefix.lower() == expected_parker_prefix.lower(),
+    )
     # PlaceParkersInPool is the only code that reads pve.parker_pool, and it
     # runs outside the park itself, so this checks the pool's own member list
     # rather than trusting a field on the parker's VM config. /cluster/resources
