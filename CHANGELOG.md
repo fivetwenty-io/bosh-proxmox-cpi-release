@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- `storage-journal audit-enrollment` and `storage-journal audit` no longer count a disabled storage as an inspection failure. PVE refuses to list the content of a storage whose definition carries `disable: 1`. A cluster that ships `local` and `local-lvm` disabled on every node therefore never produced a complete audit, and `storage-journal initialize` then refused to enroll a namespace with no allocations at all. The audit now skips a disabled storage that no retained record names, and reports it under `skipped_disabled_storages`, so the operator who later re-enables it knows it was never inspected. A disabled storage that a retained record does name is still audited, and its listing failure still keeps the audit incomplete.
+
 ## [0.7.0] - 2026-09-14
 
 ### Added
