@@ -43,8 +43,9 @@ on:
 # contents: write is required to push the report branch; pull-requests: write
 # opens and auto-merges the report PR (main is protected, so reports land
 # through a PR gated on the required checks); actions: write dispatches the
-# check workflows on the report branch; packages: read lets the job's
-# GITHUB_TOKEN pull the private CI image from ghcr.
+# check workflows on the report branch and approves the held pull_request
+# runs the report PR raises; packages: read lets the job's GITHUB_TOKEN pull
+# the private CI image from ghcr.
 permissions:
   actions: write
   contents: write
@@ -363,12 +364,19 @@ jobs:
             --title "docs(certification): scheduled run reports $(date -u +%F)" \
             --body "Automated certification reports from certification run ${GITHUB_RUN_ID}."
           gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
-          # A branch pushed with the job's GITHUB_TOKEN raises no push or
-          # pull_request events (GitHub suppresses workflow triggers from
-          # GITHUB_TOKEN actions), so the required checks would never report
-          # and the auto-merge above would wait forever. workflow_dispatch is
-          # exempt from that suppression: dispatch the check workflows on the
-          # report branch so their check runs land on its head sha.
+          # Opening the PR does raise pull_request runs of the three check
+          # workflows, but GitHub holds them for approval: their actor is
+          # github-actions[bot], which is not a collaborator, and the repo
+          # requires approval for every external contributor's runs (the
+          # fork-PR guard for the shared self-hosted runner). Nobody is at
+          # the keyboard at 02:30 UTC on a Saturday, so the held runs expire
+          # as failures. approve_held_runs below approves them with this
+          # job's token (actions: write covers the approve endpoint).
+          #
+          # That approval is best-effort, and the held runs are not what
+          # lands the PR. workflow_dispatch runs are never held: dispatch the
+          # check workflows on the report branch so their check runs land on
+          # its head sha regardless of what happens to the held runs.
           #
           # A dispatched run's check runs are attached to the commit but not
           # to the pull request, and branch protection reads the pull
@@ -421,6 +429,31 @@ jobs:
             fi
             echo "${ctx}: ${conclusion}"
           }
+          approve_held_runs() {
+            local ids="" id="" approved=0
+            # The held runs are created when the PR opens; give them two
+            # minutes to appear, and expect one per check workflow.
+            for _ in $(seq 1 12); do
+              ids="$(gh run list --repo "${GITHUB_REPOSITORY}" --branch "${REPORT_BRANCH}" \
+                --event pull_request --limit 20 --json databaseId,status,conclusion \
+                --jq '.[] | select(.status == "action_required" or .conclusion == "action_required") | .databaseId' || true)"
+              [[ "$(printf '%s\n' "${ids}" | grep -c .)" -ge 3 ]] && break
+              sleep 10
+            done
+            if [[ -z "${ids}" ]]; then
+              echo "no pull_request runs on ${REPORT_BRANCH} are waiting for approval"
+              return 0
+            fi
+            for id in ${ids}; do
+              if gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/approve"; then
+                approved=$((approved + 1))
+              else
+                echo "WARN: could not approve held run ${id}; it will expire as a failure" >&2
+              fi
+            done
+            echo "approved ${approved} held pull_request run(s) on ${REPORT_BRANCH}"
+          }
+          approve_held_runs
           for wf in ci.yml security.yml codeql.yml; do
             gh workflow run "${wf}" --repo "${GITHUB_REPOSITORY}" --ref "${REPORT_BRANCH}"
           done

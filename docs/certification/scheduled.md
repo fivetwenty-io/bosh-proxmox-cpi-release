@@ -31,13 +31,17 @@ The lab side of this setup (the `host.fw` rules on `lab-pmx-0`, the runner fleet
 
 Required status checks protect `main`, and the job's `GITHUB_TOKEN` cannot bypass them, so the workflow commits its run reports (under `docs/certification/`) to a per-run branch named `certification-reports-<run id>`, opens a PR, and arms auto-merge.
 
-One wrinkle makes the last mile work: GitHub suppresses workflow triggers from events a job's `GITHUB_TOKEN` creates, so the branch push and the PR raise no `push` or `pull_request` events, and the required checks would never start. `workflow_dispatch` events are exempt from that suppression, so after arming auto-merge the job dispatches `ci.yml`, `security.yml`, and `codeql.yml` on the report branch itself. Their check runs land on the branch head, the required checks report, and auto-merge fires.
+Two wrinkles make the last mile work. The first is that the PR does raise `pull_request` runs of `ci.yml`, `security.yml`, and `codeql.yml`, but GitHub holds them for approval, because their actor is `github-actions[bot]`, which is not a collaborator, and the repository requires approval for every external contributor's runs as a guard against fork PRs on the shared self-hosted runner. Nobody is at the keyboard on a Saturday morning, so before we added the approval step those held runs expired as failures. The job now approves them itself through the workflow-run approve endpoint, which its `actions: write` permission covers.
 
-Two consequences worth knowing:
+The second wrinkle is that we do not rely on those approved runs to land the PR. After arming auto-merge the job also dispatches the same three workflows on the report branch, because `workflow_dispatch` runs are never held. A dispatched run's check runs attach to the commit but not to the pull request, and branch protection reads the pull request's own rollup, so the job waits for each dispatched run and mirrors its conclusion onto the branch head as a commit status that carries the required context's exact name (`Check`, `Security Scans`, and `Analyze (go)`). Those statuses satisfy the required checks, and auto-merge fires.
+
+Three consequences worth knowing:
 
 - The repository does not delete branches on merge, so `certification-reports-*` branches accumulate and need occasional pruning.
 
-- If a report PR sits open with no checks, the dispatch step failed or was skipped; dispatching those three workflows on the report branch by hand (`gh workflow run <wf> --ref <branch>`) unblocks it.
+- If a report PR sits open with no checks, the dispatch or mirror step failed or was skipped. Dispatching those three workflows on the report branch by hand (`gh workflow run <wf> --ref <branch>`) puts check runs on the head, and `gh pr merge <n> --squash --admin` lands the PR once their verdicts are green.
+
+- If the held `pull_request` runs still show "required approval but was not approved before it expired", the approve call was refused. The job logs a warning naming each run it could not approve. The PR still lands through the mirrored statuses, so this is noise rather than a blocker, but it means the approve endpoint did not accept the job's token.
 
 ## Director state on the runner host
 
