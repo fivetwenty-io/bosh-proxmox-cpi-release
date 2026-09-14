@@ -25,6 +25,10 @@ Warnings are printed to stderr when:
   - a parker carries an unusedN reference to a live volume (a sweep that did
     not complete; the parker must NOT be destroyed until it is cleared)
   - a parker's config did not come back, so its contents are unknown
+  - a VM sits in a parker pool and carries no bosh-parker tag, so it is a
+    workload VM the CPI never moves out on its own and an operator has to
+    move it by hand. A pool counts as a parker pool when a parker VM belongs
+    to it, and --parker-pool names one that holds no parker yet.
 
 Config file format (JSON, subset of the CPI config):
 
@@ -497,6 +501,25 @@ class ParkerRecord:
         }
 
 
+class PoolIntruderRecord:
+    """Inventory record for a workload VM that sits in a parker pool.
+
+    The CPI refuses to create a VM in the parker pool, and the pool reconciler
+    warns and skips when a persisted template renders that name, so nothing in
+    the CPI ever puts a VM here and nothing in the CPI takes it back out. A VM
+    we record here was put in the pool by a release older than those guards,
+    and an operator has to move it out by hand.
+    """
+
+    __slots__ = ("vmid", "node", "name", "pool")
+
+    def __init__(self, vmid: int, node: str, name: str, pool: str) -> None:
+        self.vmid = vmid
+        self.node = node
+        self.name = name
+        self.pool = pool
+
+
 # ---------------------------------------------------------------------------
 # Inventory collection
 # ---------------------------------------------------------------------------
@@ -577,7 +600,89 @@ def _count_unused_refs(config: dict[str, Any]) -> int:
     )
 
 
-def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRecord], list[ParkerRecord]]":
+def parse_parker_pool_args(values: "list[str] | None") -> list[str]:
+    """Turn the raw --parker-pool values into a clean, ordered list of names.
+
+    The flag may be repeated and each value may itself be a comma-separated
+    list, so we accept both spellings and fold them into one list. Blanks are
+    dropped and a name given twice is kept once.
+
+    Inputs:
+      values - the argparse accumulator, or None when the flag was never given
+    """
+    names: list[str] = []
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part not in names:
+                names.append(part)
+    return names
+
+
+def parker_pool_names(parker_records: list[ParkerRecord], extra_pools: "list[str] | None" = None) -> set[str]:
+    """Decide which resource pools we treat as parker pools.
+
+    By default a pool counts as a parker pool when at least one parker VM
+    belongs to it, which is what the cluster index tells us without asking the
+    operator for anything. That derivation says nothing about a parker pool
+    standing empty, so every name the operator passed on --parker-pool is
+    added to the set as well.
+
+    Inputs:
+      parker_records - the parker inventory, whose pool field comes from the
+                       cluster index
+      extra_pools    - pool names the operator named explicitly, or None
+    """
+    names = {pr.pool for pr in parker_records if pr.pool}
+    for pool in extra_pools or []:
+        if pool:
+            names.add(pool)
+    return names
+
+
+def find_pool_intruders(
+    vm_map: dict[int, dict[str, str]],
+    parker_pools: set[str],
+) -> list[PoolIntruderRecord]:
+    """Find every VM that sits in a parker pool without carrying the parker tag.
+
+    A parker is recognized by its bosh-parker tag, so a VM in one of these
+    pools that carries no such tag is a workload VM which landed there by a
+    name collision. We key on the tag alone rather than on the parker VMID
+    band, because an untagged VM inside the band would still be something for
+    an operator to look at.
+
+    Inputs:
+      vm_map       - vmid -> {node, name, tags, pool} from the cluster index
+      parker_pools - the pools parker_pool_names resolved
+
+    Returns:
+      the intruders, ordered by VMID
+    """
+    intruders: list[PoolIntruderRecord] = []
+    if not parker_pools:
+        return intruders
+    for vmid_int in sorted(vm_map):
+        info = vm_map[vmid_int]
+        pool = str(info.get("pool", "") or "")
+        if pool not in parker_pools:
+            continue
+        if _tags_contain_parker(str(info.get("tags", "") or "")):
+            continue
+        intruders.append(PoolIntruderRecord(
+            vmid=vmid_int,
+            node=str(info.get("node", "") or ""),
+            name=str(info.get("name", "") or ""),
+            pool=pool,
+        ))
+    return intruders
+
+
+def collect_inventory(
+    client: PVEClient,
+    cfg: AuditConfig,
+    extra_parker_pools: "list[str] | None" = None,
+) -> "tuple[list[DiskRecord], list[ParkerRecord], list[PoolIntruderRecord]]":
     """Collect the full disk and parker inventory from PVE.
 
     Algorithm:
@@ -603,13 +708,18 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
          disk_count is 0 and therefore never appear as disk holders).
          Count unusedN references alongside bus slots: a parker holding one
          still references a live volume, so it is not a teardown candidate.
+      7. Work out which pools hold parkers, add any the operator named, and
+         report every VM in one of them that carries no bosh-parker tag.
 
     Inputs:
-      client — authenticated PVE API client
-      cfg    — resolved audit config
+      client             - authenticated PVE API client
+      cfg                - resolved audit config
+      extra_parker_pools - pool names the operator passed on --parker-pool,
+                           which count as parker pools even when no parker
+                           currently belongs to them
 
     Returns:
-      (disk_records, parker_records)
+      (disk_records, parker_records, pool_intruders)
     """
     # ---- Step 1: cluster VM map ----
     vm_map: dict[int, dict[str, str]] = {}
@@ -801,7 +911,11 @@ def collect_inventory(client: PVEClient, cfg: AuditConfig) -> "tuple[list[DiskRe
         ))
 
     parker_records.sort(key=lambda r: r.vmid)
-    return disk_records, parker_records
+
+    # ---- Step 7: workload VMs sitting in a parker pool ----
+    pool_intruders = find_pool_intruders(vm_map, parker_pool_names(parker_records, extra_parker_pools))
+
+    return disk_records, parker_records, pool_intruders
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1073,7 @@ def print_json_report(
 def emit_warnings(
     disk_records: list[DiskRecord],
     parker_records: list[ParkerRecord],
+    pool_intruders: list[PoolIntruderRecord],
     cfg: AuditConfig,
 ) -> None:
     """Emit advisory warnings to stderr."""
@@ -1013,6 +1128,18 @@ def emit_warnings(
                 "contents are unknown and it is not reported as empty"
             )
 
+    # Warn about workload VMs sitting in a parker pool. The CPI refuses to
+    # create one there and its pool reconciler warns and skips rather than
+    # moving it, so this stays until an operator moves the VM by hand and
+    # points the template or profile that rendered the name somewhere else.
+    for ir in pool_intruders:
+        _warn(
+            f"VM {ir.vmid} ({ir.name or 'unnamed'}, pool {ir.pool}) on node {ir.node} sits in a parker "
+            "pool and carries no bosh-parker tag. The CPI never moves it out, so move it into the "
+            "workload pool it belongs in with: "
+            f"pvesh set /pools/<workload-pool> --vms {ir.vmid} --allow-move 1"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -1049,19 +1176,31 @@ def main(argv: "list[str] | None" = None) -> int:
         default=False,
         help="Emit machine-readable JSON to stdout instead of a human table.",
     )
+    parser.add_argument(
+        "--parker-pool",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Treat NAME as a parker pool when looking for workload VMs that do not belong in one. "
+            "Repeat the flag or give a comma-separated list. Any pool that already holds a parker "
+            "is found without this."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
+    extra_parker_pools = parse_parker_pool_args(args.parker_pool)
 
     try:
         client = PVEClient(cfg)
-        disk_records, parker_records = collect_inventory(client, cfg)
+        disk_records, parker_records, pool_intruders = collect_inventory(client, cfg, extra_parker_pools)
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
         _die(f"inventory collection failed: {exc}")
 
-    emit_warnings(disk_records, parker_records, cfg)
+    emit_warnings(disk_records, parker_records, pool_intruders, cfg)
 
     if args.json:
         print_json_report(disk_records, parker_records, cfg)

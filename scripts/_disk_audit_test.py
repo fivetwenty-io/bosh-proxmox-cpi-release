@@ -22,7 +22,7 @@ import importlib.util as _ilu
 import io
 import json
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -185,6 +185,136 @@ class TestPrintHumanReportPoolColumn(unittest.TestCase):
         # The "/31" disk-capacity marker is a fixed anchor; it must land at
         # the same column in both rows.
         self.assertEqual(row_a.index("/31"), row_b.index("/31"))
+
+
+def _parker(vmid: int, pool: str = "") -> "object":
+    return disk_audit.ParkerRecord(
+        vmid=vmid, node="pve1", name=f"parker-{vmid}", disk_count=0, pool=pool,
+    )
+
+
+class TestParseParkerPoolArgs(unittest.TestCase):
+    """Tests for the --parker-pool accumulator."""
+
+    def test_none_gives_an_empty_list(self) -> None:
+        self.assertEqual(disk_audit.parse_parker_pool_args(None), [])
+
+    def test_repeated_flag_keeps_every_name_in_order(self) -> None:
+        self.assertEqual(
+            disk_audit.parse_parker_pool_args(["bosh-parker", "blue-parker"]),
+            ["bosh-parker", "blue-parker"],
+        )
+
+    def test_comma_separated_value_is_split(self) -> None:
+        self.assertEqual(
+            disk_audit.parse_parker_pool_args(["bosh-parker, blue-parker"]),
+            ["bosh-parker", "blue-parker"],
+        )
+
+    def test_blanks_are_dropped_and_duplicates_collapse(self) -> None:
+        self.assertEqual(
+            disk_audit.parse_parker_pool_args(["bosh-parker,,  ", " bosh-parker "]),
+            ["bosh-parker"],
+        )
+
+
+class TestParkerPoolNames(unittest.TestCase):
+    """Tests for the set of pools the audit treats as parker pools."""
+
+    def test_derived_from_the_pools_parkers_belong_to(self) -> None:
+        parkers = [_parker(90000, "bosh-parker"), _parker(90001, "blue-parker")]
+        self.assertEqual(
+            disk_audit.parker_pool_names(parkers),
+            {"bosh-parker", "blue-parker"},
+        )
+
+    def test_parker_in_no_pool_contributes_nothing(self) -> None:
+        self.assertEqual(disk_audit.parker_pool_names([_parker(90000)]), set())
+
+    def test_explicit_argument_adds_a_pool_that_holds_no_parker(self) -> None:
+        self.assertEqual(
+            disk_audit.parker_pool_names([], ["bosh-parker"]),
+            {"bosh-parker"},
+        )
+
+    def test_explicit_argument_and_derivation_are_unioned(self) -> None:
+        self.assertEqual(
+            disk_audit.parker_pool_names([_parker(90000, "bosh-parker")], ["blue-parker"]),
+            {"bosh-parker", "blue-parker"},
+        )
+
+
+class TestFindPoolIntruders(unittest.TestCase):
+    """Tests for the workload VM found sitting in a parker pool."""
+
+    def test_parker_in_its_own_pool_is_not_a_finding(self) -> None:
+        vm_map = {
+            90000: {"node": "pve1", "name": "bosh-parker-90000", "tags": "bosh-cpi;bosh-parker", "pool": "bosh-parker"},
+        }
+        self.assertEqual(disk_audit.find_pool_intruders(vm_map, {"bosh-parker"}), [])
+
+    def test_workload_vm_in_the_parker_pool_is_a_finding(self) -> None:
+        vm_map = {
+            140: {"node": "pve2", "name": "bosh-web-0", "tags": "bosh-cpi", "pool": "bosh-parker"},
+        }
+        found = disk_audit.find_pool_intruders(vm_map, {"bosh-parker"})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].vmid, 140)
+        self.assertEqual(found[0].name, "bosh-web-0")
+        self.assertEqual(found[0].node, "pve2")
+        self.assertEqual(found[0].pool, "bosh-parker")
+
+    def test_workload_vm_in_another_pool_is_not_a_finding(self) -> None:
+        vm_map = {
+            140: {"node": "pve2", "name": "bosh-web-0", "tags": "bosh-cpi", "pool": "bosh-prod"},
+        }
+        self.assertEqual(disk_audit.find_pool_intruders(vm_map, {"bosh-parker"}), [])
+
+    def test_vm_in_no_pool_is_not_a_finding(self) -> None:
+        vm_map = {
+            140: {"node": "pve2", "name": "bosh-web-0", "tags": "bosh-cpi", "pool": ""},
+        }
+        self.assertEqual(disk_audit.find_pool_intruders(vm_map, {"bosh-parker"}), [])
+
+    def test_no_parker_pools_means_no_findings(self) -> None:
+        vm_map = {
+            140: {"node": "pve2", "name": "bosh-web-0", "tags": "bosh-cpi", "pool": "bosh-parker"},
+        }
+        self.assertEqual(disk_audit.find_pool_intruders(vm_map, set()), [])
+
+    def test_findings_come_back_ordered_by_vmid(self) -> None:
+        vm_map = {
+            141: {"node": "pve2", "name": "bosh-web-1", "tags": "", "pool": "bosh-parker"},
+            140: {"node": "pve2", "name": "bosh-web-0", "tags": "", "pool": "bosh-parker"},
+        }
+        found = disk_audit.find_pool_intruders(vm_map, {"bosh-parker"})
+        self.assertEqual([r.vmid for r in found], [140, 141])
+
+
+class TestPoolIntruderWarning(unittest.TestCase):
+    """Tests for the stderr finding an intruding workload VM produces."""
+
+    def _warnings(self, intruders: list) -> str:
+        cfg = _make_cfg()
+        cfg.detached_disk_strategy = "parked"
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            disk_audit.emit_warnings([], [], intruders, cfg)
+        return buf.getvalue()
+
+    def test_warning_names_the_vm_the_pool_and_the_move_command(self) -> None:
+        intruder = disk_audit.PoolIntruderRecord(
+            vmid=140, node="pve2", name="bosh-web-0", pool="bosh-parker",
+        )
+        out = self._warnings([intruder])
+        self.assertIn("VM 140", out)
+        self.assertIn("bosh-web-0", out)
+        self.assertIn("pve2", out)
+        self.assertIn("pool bosh-parker", out)
+        self.assertIn("pvesh set /pools/<workload-pool> --vms 140 --allow-move 1", out)
+
+    def test_no_intruders_means_no_warning(self) -> None:
+        self.assertEqual(self._warnings([]), "")
 
 
 if __name__ == "__main__":
