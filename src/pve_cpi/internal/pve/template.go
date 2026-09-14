@@ -396,6 +396,9 @@ func ReplicaNodeTagForNode(node string) string {
 // by a previous CPI generation is never returned (see stemcell_generation.go):
 //  1. Template carries "bosh-stemcell-sha-<sha8>" AND "bosh-stemcell-node-<node>". → replica.
 //  2. Template carries "bosh-stemcell-sha-<sha8>" AND no "bosh-stemcell-node-" tag. → primary.
+//  3. A template carrying "bosh-stemcell-storage-<id>" is never a candidate: a
+//     storage-set replica's root disk lives on a set member, not on vm_storage,
+//     so the scalar clone path must never treat it as this node's primary.
 //
 // Return values:
 //   - (vmid, true, nil)  — match found on node.
@@ -468,6 +471,7 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 		hasSHA := false
 		hasNodeTag := false
 		hasAnyNodeTag := false
+		hasStorageTag := false
 		for _, tok := range tokens {
 			if tok == shaTag {
 				hasSHA = true
@@ -478,12 +482,16 @@ func ResolveTemplateVMIDForNode(ctx context.Context, c Client, node, sha8 string
 			if strings.HasPrefix(tok, "bosh-stemcell-node-") {
 				hasAnyNodeTag = true
 			}
+			if strings.HasPrefix(tok, ReplicaStorageTagPrefix) {
+				hasStorageTag = true
+			}
 		}
 		if !hasSHA {
 			continue
 		}
 		// Accept: replica with this node's tag, OR primary with no node tag.
-		if !hasNodeTag && hasAnyNodeTag {
+		// A storage replica is never a node primary, whichever node it sits on.
+		if hasStorageTag || (!hasNodeTag && hasAnyNodeTag) {
 			continue
 		}
 		if bestVMID == 0 || item.Vmid.Int() < bestVMID {
@@ -634,7 +642,7 @@ type TemplateRef struct {
 // other directors still reference or turn delete_stemcell into a no-op.
 func (r TemplateRef) IsReplica() bool {
 	for _, tok := range splitPVETags(r.Tags) {
-		if strings.HasPrefix(tok, "bosh-stemcell-node-") {
+		if strings.HasPrefix(tok, "bosh-stemcell-node-") || strings.HasPrefix(tok, ReplicaStorageTagPrefix) {
 			return true
 		}
 	}
