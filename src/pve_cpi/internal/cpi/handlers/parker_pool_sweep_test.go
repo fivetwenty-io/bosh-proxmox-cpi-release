@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -545,6 +546,147 @@ func TestRetainLegacyEphemeralVolume_SkipsTheSweepWhenTheTransferFails(t *testin
 }
 
 // ---------------------------------------------------------------------------
+// The two resume sites, which converge a transfer an interruption left in
+// flight. The parker the interrupted transfer created is already on the node
+// and already outside the pool, so a resume that lands the disk has to sweep
+// for the same reason a transfer does.
+// ---------------------------------------------------------------------------
+
+// captureResumeDiskTransfer swaps the resume seam for one that records the
+// config it was handed, fails with resumeErr when that is set, and otherwise
+// runs converge, which is how a case moves the fake into the state a real
+// resume would have left. A nil converge leaves the fake alone.
+func captureResumeDiskTransfer(t *testing.T, resumeErr error, converge func()) *[]pve.ParkerConfig {
+	t.Helper()
+	calls := &[]pve.ParkerConfig{}
+	t.Cleanup(setResumeDiskTransferToParkerForTest(func(
+		_ context.Context, _ pve.Client, _ *log.Logger, intent pve.DiskTransferIntent,
+		_ string, cfg pve.ParkerConfig, _ pve.ParkContext,
+	) (string, error) {
+		*calls = append(*calls, cfg)
+		if resumeErr != nil {
+			return "", resumeErr
+		}
+		if converge != nil {
+			converge()
+		}
+		return intent.Volid, nil
+	}))
+	return calls
+}
+
+// midTransferDisk is the disk resumeTransferIfNeeded converges, carrying an
+// intent whose parker sits on a node other than the one the request is aimed
+// at, so the case can tell the two apart.
+func midTransferDisk(volid string) resolvedDisk {
+	return resolvedDisk{
+		diskCID:  "pvd-abc",
+		birth:    volid,
+		volid:    volid,
+		meta:     &pve.DiskCIDMeta{ID: idTestToken},
+		stableID: idTestToken,
+		intent: &pve.DiskTransferIntent{
+			ParkerVMID: 90000, ParkerNode: "pve2", Slot: "scsi0", Volid: volid, SourceVMCID: "700",
+		},
+	}
+}
+
+func TestResumeTransferIfNeeded_SweepsTheParkersOwnNodeAfterTheResume(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+	resumes := captureResumeDiskTransfer(t, nil, nil)
+
+	const volid = "data:vm-700-disk-1"
+	deps := transferFunnelDeps(transferFunnelClient(volid))
+
+	if _, err := resumeTransferIfNeeded(context.Background(), deps, "detach_disk", midTransferDisk(volid)); err != nil {
+		t.Fatalf("resumeTransferIfNeeded: unexpected error: %v", err)
+	}
+
+	if len(*resumes) != 1 {
+		t.Fatalf("resumes = %d, want exactly 1", len(*resumes))
+	}
+	// The node here is the parker's, from the intent record. The job-level node
+	// this deps carries is pve1, so a sweep that read deps.Config.Node instead
+	// would sweep a node the parker is not on.
+	assertSweptOnce(t, *calls, "resumeTransferIfNeeded", "pve2", deps)
+}
+
+func TestResumeTransferIfNeeded_SkipsTheSweepWhenTheResumeFails(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+	_ = captureResumeDiskTransfer(t, errors.New("simulated resume failure"), nil)
+
+	const volid = "data:vm-700-disk-1"
+	deps := transferFunnelDeps(transferFunnelClient(volid))
+
+	if _, err := resumeTransferIfNeeded(context.Background(), deps, "detach_disk", midTransferDisk(volid)); err == nil {
+		t.Fatal("resumeTransferIfNeeded: want the resume's failure, got nil")
+	}
+
+	assertNotSwept(t, *calls, "resumeTransferIfNeeded")
+}
+
+// retentionResumeFixture puts the retention fake into the state an interrupted
+// transfer leaves behind. The volume is off the source VM, the source VM's
+// description still carries its CID, and the parker holds the record the
+// resolver reads as a transfer intent. It returns the converge that stands in
+// for the real resume, which attaches the volume to the parker slot the record
+// names and writes the disk's serial onto it.
+func retentionResumeFixture(t *testing.T, volid string) (Deps, func()) {
+	t.Helper()
+	c, deps := retentionFixture(t, volid)
+	cid := overlayCID(t, volid, &pve.DiskCIDMeta{ID: idTestToken})
+	c.mu.Lock()
+	delete(c.configs[700], "scsi1")
+	c.configs[90000]["description"] = fmt.Sprintf(
+		`<!--BOSH:{"bosh_parked_disks":{%q:{"disk_cid":%q,"parked_at":"2026-08-20T00:00:00Z",`+
+			`"node":"pve1","volid":%q,"slot":"scsi0","source_vm_cid":"700"}}}-->`,
+		idTestToken, cid, volid)
+	c.mu.Unlock()
+	converge := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.configs[90000]["scsi0"] = volid + ",serial=" + idTestToken + ",size=10G"
+	}
+	return deps, converge
+}
+
+func TestRetainLegacyEphemeralVolume_SweepsThePoolAfterTheResume(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+
+	const volid = "data:vm-700-disk-1"
+	deps, converge := retentionResumeFixture(t, volid)
+	resumes := captureResumeDiskTransfer(t, nil, converge)
+
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+		deps.Log(context.Background())); err != nil {
+		t.Fatalf("retainLegacyEphemeralVolume: unexpected error: %v", err)
+	}
+
+	if len(*resumes) != 1 {
+		t.Fatalf("resumes = %d, want exactly 1", len(*resumes))
+	}
+	assertSweptOnce(t, *calls, "retainLegacyEphemeralVolume resume", "pve1", deps)
+}
+
+func TestRetainLegacyEphemeralVolume_SkipsTheSweepWhenTheResumeFails(t *testing.T) {
+	calls := captureParkerPoolSweep(t)
+
+	const volid = "data:vm-700-disk-1"
+	deps, _ := retentionResumeFixture(t, volid)
+	resumes := captureResumeDiskTransfer(t, errors.New("simulated resume failure"), nil)
+
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+		deps.Log(context.Background())); err == nil {
+		t.Fatal("retainLegacyEphemeralVolume: want the resume's failure, got nil")
+	}
+
+	if len(*resumes) != 1 {
+		t.Fatalf("resumes = %d, want exactly 1 so the failure came from the resume itself", len(*resumes))
+	}
+	assertNotSwept(t, *calls, "retainLegacyEphemeralVolume resume")
+}
+
+// ---------------------------------------------------------------------------
 // The managed create_disk park, which is the funnel the allocation guard wraps
 // ---------------------------------------------------------------------------
 
@@ -758,8 +900,10 @@ func (a *guardScopeAdmission) hooks() ManagedAllocationHooks {
 }
 
 // guardedDepsFor wraps deps the way the managed detach and attach paths wrap
-// their own, which is a lifecycle client over the allocation guard's client,
-// and returns the guard alongside so a test can read whether it was poisoned.
+// their own, and returns the guard alongside so a test can read whether it was
+// poisoned. It calls wrapManagedDiskClient rather than building the decorator
+// chain of its own, so that a decorator added to the production chain reaches
+// these cases too.
 func guardedDepsFor(t *testing.T, deps Deps, admission *guardScopeAdmission) (Deps, *ManagedAllocationGuard) {
 	t.Helper()
 	guard, err := NewManagedAllocationGuard(deps.PVE, admission.hooks())
@@ -767,7 +911,7 @@ func guardedDepsFor(t *testing.T, deps Deps, admission *guardScopeAdmission) (De
 		t.Fatalf("build the allocation guard: %v", err)
 	}
 	guarded := deps
-	guarded.PVE = &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: &managedDiskLifecycle{}}
+	guarded.PVE = wrapManagedDiskClient(guard, &managedDiskLifecycle{})
 	return guarded, guard
 }
 
@@ -788,7 +932,9 @@ func TestUnguardedPVE_WalksOutOfEveryAllocationGuardDecorator(t *testing.T) {
 	if got := unguardedPVE(guard.Client()); got != pve.Client(base) {
 		t.Errorf("the guard's own decorator must unwrap to the client it guards, got %T", got)
 	}
-	lifecycle := &managedDiskLifecycleClient{Client: guard.Client(), lifecycle: &managedDiskLifecycle{}}
+	// The chain comes from wrapManagedDiskClient, which is the one production
+	// builds, so a decorator added there is unwrapped here or this case fails.
+	lifecycle := wrapManagedDiskClient(guard, &managedDiskLifecycle{})
 	if got := unguardedPVE(lifecycle); got != pve.Client(base) {
 		t.Errorf("the lifecycle decorator must unwrap through the guard as well, got %T", got)
 	}
