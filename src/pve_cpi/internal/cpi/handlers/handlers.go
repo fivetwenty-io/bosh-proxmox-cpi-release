@@ -9,6 +9,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	stemcellfetch "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/stemcell_fetch"
+	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 )
 
 // Handler is a package-level alias for cpi.Handler so individual handler files
@@ -67,6 +68,12 @@ type Deps struct {
 	// through every signature. Empty when the caller sent no context
 	// (hand-rolled CPI calls, some tests).
 	RequestDirectorUUID string
+	// ReplicaInventory feeds the storage-set replica fan-out's discovery.
+	// Nil (production and every existing test literal) means
+	// inv.PVESource{Client: PVE}; tests that drive the fan-out set a
+	// fixture source here rather than through a package variable, so
+	// parallel tests cannot race on it.
+	ReplicaInventory inv.Source
 }
 
 // Log returns the per-request, span-correlated logger stored in ctx (attached
