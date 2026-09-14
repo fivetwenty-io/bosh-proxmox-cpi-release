@@ -138,7 +138,18 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, "journal initialized but close failed; inspect enrollment before retrying")
 		return 1
 	}
-	if err = json.NewEncoder(stdout).Encode(map[string]string{"namespace": cfg.StoragePlacementNamespace, "cluster_id": identity.ID(), "audit_id": auditID, "state": "initialized"}); err != nil {
+	// The retained audit already records the storages the absence proof did
+	// not inspect. Surface them here as well, because an operator who runs
+	// initialize without reading the audit-enrollment report would otherwise
+	// enroll without learning that anything was skipped.
+	if len(report.SkippedDisabledStorages) > 0 {
+		fmt.Fprintf(stderr, "enrolled without inspecting %d disabled storage(s): %s; audit again after re-enabling any of them\n", len(report.SkippedDisabledStorages), strings.Join(report.SkippedDisabledStorages, ", "))
+	}
+	summary := map[string]any{"namespace": cfg.StoragePlacementNamespace, "cluster_id": identity.ID(), "audit_id": auditID, "state": "initialized"}
+	if len(report.SkippedDisabledStorages) > 0 {
+		summary["skipped_disabled_storages"] = report.SkippedDisabledStorages
+	}
+	if err = json.NewEncoder(stdout).Encode(summary); err != nil {
 		return 1
 	}
 	return 0
