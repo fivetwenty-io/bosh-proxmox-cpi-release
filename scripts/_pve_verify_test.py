@@ -40,6 +40,7 @@ import _pve_verify
 from _pve_verify import (
     PVEVerifier,
     PVEVerifyError,
+    parker_prefix_identity,
     parse_stemcell_cid,
     parse_stemcell_path_cid,
     resolved_parker_pool,
@@ -1035,6 +1036,28 @@ class TestResolvedParkerPrefix(unittest.TestCase):
         long_prefix = "a" * 60
         resolved = resolved_parker_prefix({"vm_prefix": long_prefix})
         self.assertEqual(resolved, "a" * 46)
+
+
+class TestParkerPrefixIdentity(unittest.TestCase):
+    def test_reads_the_vm_prefix_tag(self) -> None:
+        self.assertEqual(
+            parker_prefix_identity("bosh-cpi;vm-prefix--acme", "acme-parker-90000"), "acme"
+        )
+
+    def test_falls_back_to_the_name_when_there_is_no_tag(self) -> None:
+        self.assertEqual(parker_prefix_identity("bosh-cpi", "cpitest-parker-90001"), "cpitest")
+
+    def test_the_bosh_prefixed_name_shape_also_resolves_through_the_name_fallback(self) -> None:
+        self.assertEqual(parker_prefix_identity("bosh-cpi", "bosh-parker-90472"), "bosh")
+
+    def test_legacy_parker_with_neither_a_tag_nor_a_matching_name_is_bosh(self) -> None:
+        self.assertEqual(parker_prefix_identity("bosh-cpi", "some-other-name"), "bosh")
+        self.assertEqual(parker_prefix_identity("", ""), "bosh")
+
+    def test_tag_wins_over_a_disagreeing_name(self) -> None:
+        self.assertEqual(
+            parker_prefix_identity("bosh-cpi;vm-prefix--acme", "other-parker-90002"), "acme"
+        )
 
 
 class TestResolvedParkerPool(unittest.TestCase):
