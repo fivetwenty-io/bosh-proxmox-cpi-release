@@ -42,18 +42,14 @@ on:
 
 # contents: write is required to push the report branch; pull-requests: write
 # opens and auto-merges the report PR (main is protected, so reports land
-# through a PR gated on the required checks); actions: write dispatches the
-# check workflows on the report branch and approves the held pull_request
-# runs the report PR raises; packages: read lets the job's GITHUB_TOKEN pull
-# the private CI image from ghcr.
+# through a PR gated on the required checks); actions: write approves the
+# held pull_request runs the report PR raises; packages: read lets the job's
+# GITHUB_TOKEN pull the private CI image from ghcr.
 permissions:
   actions: write
   contents: write
   packages: read
   pull-requests: write
-  # The report step mirrors each dispatched check run's conclusion onto the
-  # report branch head as a commit status, which is what unblocks its PR.
-  statuses: write
 
 # Exactly one workflow may touch the lab at a time. Any FUTURE workflow that
 # touches the lab (its PVE API, the director slot, or the cpitest network)
@@ -364,104 +360,55 @@ jobs:
             --title "docs(certification): scheduled run reports $(date -u +%F)" \
             --body "Automated certification reports from certification run ${GITHUB_RUN_ID}."
           gh pr merge "${REPORT_BRANCH}" --repo "${GITHUB_REPOSITORY}" --auto --rebase
-          # Opening the PR does raise pull_request runs of the three check
+          # Opening the PR raises pull_request runs of the three check
           # workflows, but GitHub holds them for approval: their actor is
           # github-actions[bot], which is not a collaborator, and the repo
           # requires approval for every external contributor's runs (the
           # fork-PR guard for the shared self-hosted runner). Nobody is at
-          # the keyboard at 02:30 UTC on a Saturday, so the held runs expire
-          # as failures. approve_held_runs below approves them with this
-          # job's token (actions: write covers the approve endpoint).
+          # the keyboard at 02:30 UTC on a Saturday, so unapproved runs would
+          # expire as failures and the PR would never see its required
+          # checks. Approve them here with the job's token (actions: write
+          # covers the approve endpoint); once approved they run like any
+          # PR's checks, report on the PR's own rollup, and auto-merge fires.
           #
-          # That approval is best-effort, and the held runs are not what
-          # lands the PR. workflow_dispatch runs are never held: dispatch the
-          # check workflows on the report branch so their check runs land on
-          # its head sha regardless of what happens to the held runs.
-          #
-          # A dispatched run's check runs are attached to the commit but not
-          # to the pull request, and branch protection reads the pull
-          # request's own rollup, so dispatching alone still leaves the PR
-          # blocked with its required contexts never reported. Wait for each
-          # dispatched run and mirror its conclusion onto the head sha as a
-          # commit status carrying the required context's exact name. A
-          # status and a check run satisfy the same required context, and
-          # GITHUB_TOKEN posts it as the same GitHub Actions app the rule
-          # pins, so auto-merge lands the PR once all three report success.
-          REPORT_SHA="$(git rev-parse HEAD)"
-          mirror_check() {
-            local wf="$1" ctx="$2" run_id="" state="" conclusion="" url=""
-            # The dispatch is asynchronous: wait for the run to be queued
-            # against this branch before polling it.
-            for _ in $(seq 1 30); do
-              run_id="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow "${wf}" \
-                --branch "${REPORT_BRANCH}" --event workflow_dispatch --limit 1 \
-                --json databaseId --jq '.[0].databaseId // empty' || true)"
-              [[ -n "${run_id}" ]] && break
-              sleep 10
-            done
-            if [[ -z "${run_id}" ]]; then
-              echo "WARN: ${wf} never queued on ${REPORT_BRANCH}; leaving ${ctx} unreported" >&2
-              return 0
-            fi
-            # 40 minutes covers the slowest of the three (CI) with headroom.
-            for _ in $(seq 1 120); do
-              local line=""
-              line="$(gh run view "${run_id}" \
-                --repo "${GITHUB_REPOSITORY}" --json status,conclusion,url \
-                --jq '[.status, (.conclusion // "-"), .url] | @tsv' || true)"
-              read -r state conclusion url <<<"${line}" || true
-              [[ "${state}" == "completed" ]] && break
-              sleep 20
-            done
-            if [[ "${state}" != "completed" ]]; then
-              echo "WARN: ${wf} run ${run_id} still ${state}; leaving ${ctx} unreported" >&2
-              return 0
-            fi
-            local status_state="failure"
-            [[ "${conclusion}" == "success" ]] && status_state="success"
-            if ! gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/statuses/${REPORT_SHA}" \
-              -f state="${status_state}" \
-              -f context="${ctx}" \
-              -f target_url="${url}" \
-              -f description="${conclusion} in the dispatched ${wf} run"; then
-              echo "WARN: could not post the ${ctx} status; the report PR stays blocked" >&2
-              return 0
-            fi
-            echo "${ctx}: ${conclusion}"
-          }
+          # Fail the step if the runs never appear or an approval is refused:
+          # the reports are already on the branch and the PR is open, so a
+          # red run is the signal to dispatch the check workflows on the
+          # report branch by hand and admin-merge it (see
+          # docs/certification/scheduled.md).
           approve_held_runs() {
-            local ids="" id="" approved=0
+            local rows="" id="" state="" total=0 approved=0 failed=0
             # The held runs are created when the PR opens; give them two
             # minutes to appear, and expect one per check workflow.
             for _ in $(seq 1 12); do
-              ids="$(gh run list --repo "${GITHUB_REPOSITORY}" --branch "${REPORT_BRANCH}" \
+              rows="$(gh run list --repo "${GITHUB_REPOSITORY}" --branch "${REPORT_BRANCH}" \
                 --event pull_request --limit 20 --json databaseId,status,conclusion \
-                --jq '.[] | select(.status == "action_required" or .conclusion == "action_required") | .databaseId' || true)"
-              [[ "$(printf '%s\n' "${ids}" | grep -c .)" -ge 3 ]] && break
+                --jq '.[] | [.databaseId, (if .conclusion == "action_required" then "action_required" else .status end)] | @tsv' || true)"
+              total="$(printf '%s\n' "${rows}" | grep -c . || true)"
+              [[ "${total}" -ge 3 ]] && break
               sleep 10
             done
-            if [[ -z "${ids}" ]]; then
-              echo "no pull_request runs on ${REPORT_BRANCH} are waiting for approval"
-              return 0
+            if [[ "${total}" -lt 3 ]]; then
+              echo "ERROR: only ${total} pull_request run(s) appeared on ${REPORT_BRANCH}; the report PR needs manual checks" >&2
+              return 1
             fi
-            for id in ${ids}; do
+            while IFS=$'\t' read -r id state; do
+              [[ -n "${id}" ]] || continue
+              if [[ "${state}" != "action_required" ]]; then
+                echo "run ${id} is ${state}; no approval needed"
+                continue
+              fi
               if gh api --silent -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/approve"; then
                 approved=$((approved + 1))
               else
-                echo "WARN: could not approve held run ${id}; it will expire as a failure" >&2
+                echo "ERROR: could not approve held run ${id}" >&2
+                failed=$((failed + 1))
               fi
-            done
+            done <<<"${rows}"
             echo "approved ${approved} held pull_request run(s) on ${REPORT_BRANCH}"
+            [[ "${failed}" -eq 0 ]]
           }
           approve_held_runs
-          for wf in ci.yml security.yml codeql.yml; do
-            gh workflow run "${wf}" --repo "${GITHUB_REPOSITORY}" --ref "${REPORT_BRANCH}"
-          done
-          # Context names must match branch protection exactly: they are the
-          # job names GitHub reports, with CodeQL's matrix language suffix.
-          mirror_check ci.yml       "Check"
-          mirror_check security.yml "Security Scans"
-          mirror_check codeql.yml   "Analyze (go)"
 
       - name: Persist director state to the runner host
         if: always()
