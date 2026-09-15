@@ -235,7 +235,7 @@ func journalNotEnrolled(directory, namespace string, err error) bool {
 // step that failed mid-flight carries. Volumes are deduplicated because one
 // allocation's attempts record the same volid on more than one step.
 //
-// Three rules are this source's own, and each exists to stop a contradiction
+// Two rules are this source's own, and each exists to stop a contradiction
 // that would be wrong.
 //
 // The allocation that owns the volume under proof is dropped whole, not just
@@ -247,20 +247,24 @@ func journalNotEnrolled(directory, namespace string, err error) bool {
 // every retained cleanup the journal ever recorded.
 //
 // A step on another node is dropped unless the storage is shared. A node-local
-// storage is a different tree on every node, and PVE gives every node a dir
-// storage called "local", so a volume the journal recorded on one node's
-// "local" says nothing about the listing another node's "local" just served.
-// A step that recorded no node at all matches any node, because dropping it
-// would silently discard evidence rather than scope it.
+// storage is a different tree on every node, and PVE gives every node an
+// lvmthin storage called "local-lvm", so a volume the journal recorded on one
+// node's "local-lvm" says nothing about the listing another node's "local-lvm"
+// just served. A step that recorded no node at all would match any node,
+// because dropping it would silently discard evidence rather than scope it; the
+// journal's record validation refuses a step with a blank node, so that arm is
+// a guard rather than a path.
 //
-// A step that never got past Planned is dropped. The journal persists a step's
-// intent before it submits the API call that would create the volume, and the
-// record format enforces that: a new step must first appear as Planned with no
-// UPID and no volids, carrying only the volume it means to create. Counting
-// that intended name would contradict an empty listing with a volume nothing
-// ever created. Submitted and the states past it are counted, because from
-// Submitted onward the create call has gone to PVE and a volume may exist
-// whatever the outcome was.
+// A step still in Planned counts, the way it counts for the audit. The journal
+// persists a step's intent before it submits the create call, so a Planned step
+// with no UPID is either an allocation that is about to submit, one that failed
+// before submitting, or one whose process died between the call going out and
+// the Submitted state landing. Only the middle one names a volume PVE never
+// made, and the journal's own attempt rules refuse to assume that without an
+// operator's attestation, so this source does not assume it either. A Planned
+// record that lingers is settled by the allocation cleanup, which is where a
+// volume that never existed gets argued away; here it is one more reason an
+// empty listing is not yet proof.
 func journalVolumesOnStorage(records []aj.Record, probe pve.EmptyListingProbe) int {
 	if strings.TrimSpace(probe.Storage) == "" {
 		return 0
@@ -318,23 +322,20 @@ func journalStepVolumes(step aj.Step) []string {
 
 // journalStepCountsForProbe reports whether a step's volumes are evidence about
 // the listing the probe read: the right storage, ownership rather than
-// preservation, a node the probe can see, and a state in which the create call
-// had already been made.
+// preservation, and a node the probe can see. The step's state is not a
+// criterion, for the reason journalVolumesOnStorage gives.
 func journalStepCountsForProbe(step aj.Step, probe pve.EmptyListingProbe) bool {
 	if step.Target.External || step.Target.Storage != probe.Storage {
 		return false
 	}
-	if !journalStepNodeInScope(step, probe) {
-		return false
-	}
-	return step.State != aj.Planned
+	return journalStepNodeInScope(step, probe)
 }
 
 // journalStepNodeInScope reports whether a step's node is one the probe's
 // listing would have covered. A shared storage shows the same tree everywhere,
 // so every node is in scope. A node-local or unclassified storage is in scope
-// only for the node that was probed, and a step that recorded no node is in
-// scope for all of them.
+// only for the node that was probed, and a step that recorded no node would be
+// in scope for all of them, though the journal never persists one.
 func journalStepNodeInScope(step aj.Step, probe pve.EmptyListingProbe) bool {
 	if probe.Classified && probe.Info.IsShared() {
 		return true

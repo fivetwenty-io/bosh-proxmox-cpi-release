@@ -580,11 +580,11 @@ type DiskScanHit struct {
 // tree, not a storage whose last volume was deleted.
 //
 // The node breakdown is what keeps that answer honest on local storage. PVE
-// gives every node a dir storage called "local", and the storage named in a
-// volid is the same string on all of them, so a disk deleted on one node would
-// otherwise be contradicted by the ten disks another node keeps on its own
-// "local". Read the counts through OnNode for a storage only one node can see,
-// and through Anywhere for a storage the whole cluster shares.
+// gives every node an lvmthin storage called "local-lvm", and the storage named
+// in a volid is the same string on all of them, so a disk deleted on one node
+// would otherwise be contradicted by the ten disks another node keeps on its
+// own "local-lvm". Read the counts through OnNode for a storage only one node
+// can see, and through Anywhere for a storage the whole cluster shares.
 //
 // The counts are a lower bound rather than a census. The scan stops at the
 // first config that matches the disk it was looking for, so a hit leaves the
@@ -640,7 +640,18 @@ func (c StorageReferenceCounts) add(storage, node string) {
 //
 // The parsed disk map carries only the bus slots, so the unusedN entries are
 // read from the raw config the parse came from.
-func addStorageReferences(counts StorageReferenceCounts, node string, cfg map[string]any, disks map[string]string) {
+//
+// The volume the scan is looking for never counts. A bus slot naming it makes
+// the scan return a holder, and no absence proof runs, so skipping it there
+// changes nothing. An unusedN slot naming it is the case that matters: the
+// holder scan does not read unusedN slots as holders, so a stale entry left
+// behind by an interrupted detach names a volume the caller is about to prove
+// absent, and counting it would let the config source contradict the proof
+// with the very volume under proof. The counts are evidence about other
+// volumes on the storage, never about that one.
+func addStorageReferences(
+	counts StorageReferenceCounts, node, target string, cfg map[string]any, disks map[string]string,
+) {
 	if counts == nil {
 		return
 	}
@@ -648,13 +659,13 @@ func addStorageReferences(counts StorageReferenceCounts, node string, cfg map[st
 		if driveOptStrIsCDROM(optstr) {
 			continue
 		}
-		countStorageReference(counts, node, bareDriveVolid(optstr))
+		countStorageReference(counts, node, target, bareDriveVolid(optstr))
 	}
 	// FindUnusedDiskEntries has already stripped any option suffix, and PVE
 	// never parks cdrom media in an unusedN slot, so what comes back is a bare
 	// volid or nothing.
 	for _, volid := range FindUnusedDiskEntries(cfg) {
-		countStorageReference(counts, node, volid)
+		countStorageReference(counts, node, target, volid)
 	}
 }
 
@@ -671,12 +682,17 @@ func bareDriveVolid(optstr string) string {
 // storage. The values that name no such volume are the empty slot, PVE's
 // "none" placeholder, a cloud-init drive, and anything that is not a
 // storage-qualified volid at all.
-func countStorageReference(counts StorageReferenceCounts, node, bare string) {
-	if bare == "" || bare == "none" || strings.Contains(bare, "-cloudinit") {
+func countStorageReference(counts StorageReferenceCounts, node, target, bare string) {
+	if bare == "" || bare == "none" || bare == target {
 		return
 	}
 	storage, volume, ok := strings.Cut(bare, ":")
 	if !ok || storage == "" || volume == "" {
+		return
+	}
+	// A cloud-init drive is screened by its volume name, not the whole volid,
+	// so a storage whose own name carries the word keeps its references.
+	if strings.Contains(volume, "-cloudinit") {
 		return
 	}
 	counts.add(storage, node)
@@ -772,7 +788,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		}
 
 		disks := qemu.ParseDisks(cfg)
-		addStorageReferences(counts, vmNode, cfg, disks)
+		addStorageReferences(counts, vmNode, volid, cfg, disks)
 
 		if slot, current, ok := matchDiskIdentity(disks, volid, stableID); ok {
 			tags, _ := ConfigString(cfg, "tags")

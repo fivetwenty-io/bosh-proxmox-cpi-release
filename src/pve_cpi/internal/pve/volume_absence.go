@@ -223,9 +223,11 @@ type EmptyListingCorroborator interface {
 // Info and Classified are what keep a source from reading evidence off the
 // wrong node. A shared storage shows one tree to the whole cluster, so a
 // reference or a journal record anywhere in it contradicts an empty listing. A
-// node-local storage shows a different tree on every node, and a dir storage
-// named "local" exists on all of them, so only what the probed node itself
-// holds says anything about the listing that node served.
+// node-local storage shows a different tree on every node, and the lvmthin
+// storage PVE names "local-lvm" exists on all of them, so only what the probed
+// node itself holds says anything about the listing that node served. (The dir
+// storage "local" is the same shape, but a plain dir never reaches this point:
+// listingProvesAbsence refuses its empty listing first.)
 type EmptyListingProbe struct {
 	// Node is the node the listing was read from.
 	Node string
@@ -286,6 +288,15 @@ const (
 // images storage and a backup storage crosses the floor while both storages are
 // telling the truth.
 const EmptyListingUsedBytesFloor = 1 << 30
+
+// emptyListingStatusAttempts bounds the retry ladder under the storage status
+// read. The package default of eight attempts, each up to
+// emptyListingStatusTimeout with backoff between them, would let one probe sit
+// for minutes on a storage whose status endpoint keeps answering 5xx, and the
+// local backend's node sweep pays that once per candidate node. Three attempts
+// still clear a pvedaemon worker recycling mid-call, which is the fault the
+// ladder is for, and keep the worst case under two minutes per node.
+const emptyListingStatusAttempts = 3
 
 // emptyListingStatusTimeout bounds one attempt at the storage status read. It
 // matches the other single-read probes in this package, and it exists because
@@ -389,11 +400,13 @@ func (c corroboratorFunc) CorroborateEmptyListing(
 // Which references count depends on the storage. A shared storage is one tree
 // the whole cluster sees, so a config on any node naming a volume on it
 // contradicts a listing that showed nothing. A node-local storage is a
-// different tree on every node, and the dir storage PVE calls "local" exists on
-// all of them, so only the configs of guests on the probed node say anything
-// about the listing that node served. An unclassified storage takes the
-// node-local reading, which is the one that cannot manufacture a contradiction
-// out of another node's disks.
+// different tree on every node, and the lvmthin storage PVE names "local-lvm"
+// exists on all of them, so only the configs of guests on the probed node say
+// anything about the listing that node served. An unclassified storage takes
+// the node-local reading, which is the one that cannot manufacture a
+// contradiction out of another node's disks; in practice listingProvesAbsence
+// has already refused an unclassified storage before any corroborator runs,
+// so that branch is a guard rather than a path.
 //
 // The volume under proof needs no excluding here. The scan counts what VM
 // configs reference, and a volume any config still references has a holder, so
@@ -483,18 +496,22 @@ func readStorageStatusCorroboration(ctx context.Context, client Client, node, st
 	// is exactly the fault that clears on the next attempt. A permanent answer
 	// still comes straight back, because RetryOnTransient only re-drives
 	// transport faults and pushback. Each attempt carries its own timeout, so a
-	// hung read cannot spend the whole budget.
+	// hung read cannot spend the whole budget, and the ladder is short, because
+	// a 5xx counts as transient and a storage that keeps answering one would
+	// otherwise hold a delete path for the full default ladder on every node
+	// the local backend sweeps.
 	var status *nodes.ListStorageStatusResponse
-	err := RetryOnTransient(ctx, nil, "empty_listing_storage_status", 0, func() error {
-		statusCtx, cancel := context.WithTimeout(ctx, emptyListingStatusTimeout)
-		defer cancel()
-		read, readErr := client.Nodes().ListStorageStatus(statusCtx, node, storage)
-		if readErr != nil {
-			return readErr
-		}
-		status = read
-		return nil
-	})
+	err := RetryOnTransient(ctx, log.FromContext(ctx), "empty_listing_storage_status", emptyListingStatusAttempts,
+		func() error {
+			statusCtx, cancel := context.WithTimeout(ctx, emptyListingStatusTimeout)
+			defer cancel()
+			read, readErr := client.Nodes().ListStorageStatus(statusCtx, node, storage)
+			if readErr != nil {
+				return readErr
+			}
+			status = read
+			return nil
+		})
 	if err != nil {
 		return Corroboration{}, fmt.Errorf("read status of storage %s on node %s: %w", storage, node, err)
 	}
