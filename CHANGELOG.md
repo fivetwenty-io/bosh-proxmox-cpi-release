@@ -25,7 +25,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 ### Changed
 
 - `create_vm` writes the pool-membership and stemcell records in a single description update rather than one per record, so provenance costs one config read and one write per VM on a deploy of any size. That write now goes to the unguarded PVE client. On the managed storage-placement path it previously rode the allocation guard, where a transient failure on a purely advisory description update could poison the allocation, fail a `create_vm` that had otherwise succeeded, and leave a record in `ReconciliationRequired` for an operator to clear.
-- The stemcell tag is appended after the advertised-route provenance tags rather than ahead of them. The 350-byte tag budget truncates from the tail, and an evicted `advrt-` tag is an SDN subnet `delete_vm` can no longer withdraw, so cleanup-critical tags keep their place and the stemcell label is the first thing to go. `set_vm_metadata` still names every dropped entry in a warning.
+- The stemcell tag is appended after the advertised-route provenance tags rather than ahead of them. The 350-byte tag budget truncates from the tail, and an evicted `advrt-` tag is an SDN subnet `delete_vm` can no longer withdraw, so cleanup-critical tags keep their place and the stemcell label is the first thing to go. `create_vm` warns when the cap drops the stemcell tag, naming the tag, and that VM still answers a `bosh_stemcell` Notes query even though a tag query misses it. `set_vm_metadata` still names every dropped entry in a warning.
 
 ## [0.7.1] - 2026-09-14
 
