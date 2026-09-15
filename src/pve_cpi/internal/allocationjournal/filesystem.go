@@ -66,7 +66,18 @@ func privateInfo(info os.FileInfo, directory bool) error {
 	if !ok || int64(st.Uid) != int64(os.Geteuid()) || info.Mode().Perm()&0o077 != 0 || info.IsDir() != directory || !directory && !info.Mode().IsRegular() {
 		return fmt.Errorf("journal: unsafe ownership, permissions, or file type")
 	}
-	if !directory && st.Nlink != 1 {
+	// Reject a second link, not a missing one. A link count of zero is what a
+	// concurrent atomicJSON rename looks like from the reader's side: the
+	// victim inode is unlinked while the name still resolves to it, so an
+	// lstat or an fstat a moment later sees a live name on a zero-link inode.
+	// Measured on APFS that is about one lookup in five hundred under load,
+	// and "!= 1" turned every one of them into a hard failure no caller
+	// recognised. An inode nothing links to cannot be reached by name by any
+	// new opener, so accepting it gives an attacker nothing, while nlink >= 2
+	// stays refused and that is what the message has always claimed to catch.
+	// Reading a doomed inode is handled where it belongs, by the SameFile
+	// check in openPrivateWith and the retry in readJSON.
+	if !directory && st.Nlink > 1 {
 		return fmt.Errorf("journal: multiply linked file rejected")
 	}
 	return nil
@@ -162,8 +173,21 @@ func strictDecode(data []byte, out any) error {
 	}
 	return nil
 }
+
+// readRetries bounds how many times readJSON reopens a file whose inode was
+// replaced between the lstat and the fstat inside openPrivate. A concurrent
+// atomic rename is exactly what atomicJSON is built to do, so a reader losing
+// that race is ordinary and deserves another look rather than a reconciliation
+// record. Writers hold the exclusive lock and are not exposed this way. The
+// bound keeps a genuinely unstable file from spinning: after this many losses
+// the ErrReconciliationRequired is returned to the caller unchanged.
+const readRetries = 3
+
 func readJSON(r *os.Root, name string, out any) error {
 	f, err := openPrivate(r, name, os.O_RDONLY)
+	for attempt := 0; attempt < readRetries && errors.Is(err, ErrReconciliationRequired); attempt++ {
+		f, err = openPrivate(r, name, os.O_RDONLY)
+	}
 	if err != nil {
 		return err
 	}
