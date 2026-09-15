@@ -22,10 +22,11 @@ const corroborationNode = "pve-01"
 // silentCorroborator has nothing to say and records that it was asked, which is
 // how the order cases tell "consulted and passed" from "never reached".
 func silentCorroborator(calls *int) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc("a quiet source", func(context.Context, string, string, string) (pve.Corroboration, error) {
-		*calls++
-		return pve.Corroboration{}, nil
-	})
+	return pve.CorroboratorFunc("a quiet source",
+		func(context.Context, string, string, string) (pve.Corroboration, error) {
+			*calls++
+			return pve.Corroboration{}, nil
+		})
 }
 
 // contradictingCorroborator contradicts the listing with a fixed detail.
@@ -38,10 +39,11 @@ func contradictingCorroborator(calls *int, source, detail string) pve.EmptyListi
 
 // failingCorroborator is a check that did not land.
 func failingCorroborator(calls *int, err error) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc("a source that broke", func(context.Context, string, string, string) (pve.Corroboration, error) {
-		*calls++
-		return pve.Corroboration{}, err
-	})
+	return pve.CorroboratorFunc("a source that broke",
+		func(context.Context, string, string, string) (pve.Corroboration, error) {
+			*calls++
+			return pve.Corroboration{}, err
+		})
 }
 
 // forbiddenCorroborator fails the test if it is ever consulted.
@@ -509,7 +511,8 @@ func TestStorageStatusCorroborator_MissingArguments_AreErrors(t *testing.T) {
 	if _, err := corroborator.CorroborateEmptyListing(context.Background(), "", absenceStorage, absenceVolid); err == nil {
 		t.Error("an empty node name must not reach the API")
 	}
-	if _, err := corroborator.CorroborateEmptyListing(context.Background(), corroborationNode, "", absenceVolid); err == nil {
+	_, err := corroborator.CorroborateEmptyListing(context.Background(), corroborationNode, "", absenceVolid)
+	if err == nil {
 		t.Error("an empty storage name must not reach the API")
 	}
 	if _, err := pve.StorageStatusCorroborator(nil).

@@ -19,7 +19,7 @@ import (
 )
 
 // liveStorageInfo issues a live /storage listing and decodes it through
-// pve.LiveStorageInfo — the SAME decoder StorageInfoCache.refresh uses — so
+// pve.LiveStorageInfo, the same decoder StorageInfoCache.refresh uses, so
 // this file's storage-classification call sites cannot silently diverge from
 // the canonical parsing (in particular: this is what gives lookupVMStorageType
 // and needsReplicaCheck access to the backing-identity fields (Path/Server/

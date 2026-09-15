@@ -781,7 +781,7 @@ func FindVMByDiskVolidOrNoneTagged(
 
 // findVMByDiskVolidHit is FindVMByDiskVolidOrNoneTagged with the whole scan hit
 // preserved, so a caller that needs what the scan saw on its way past the other
-// guests -- the per-storage reference counts -- gets it without a second sweep.
+// guests, namely the per-storage reference counts, gets it without a second sweep.
 // The not-found answer carries the counts too: the scan read every config in
 // the cluster to reach it, and that answer is where the counts matter most.
 func findVMByDiskVolidHit(ctx context.Context, c Client, volid string) (DiskScanHit, bool, error) {
