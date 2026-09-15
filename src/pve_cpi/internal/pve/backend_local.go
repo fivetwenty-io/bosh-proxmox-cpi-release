@@ -32,6 +32,12 @@ type localBackend struct {
 	info        StorageInfo
 	defaultNode string
 
+	// corroborate supplies the second opinions the sweep hands to an empty
+	// content listing. The resolver sets it (see WithEmptyListingCorroborators);
+	// nil is a backend built without one, which sweeps exactly as it did before
+	// corroboration existed.
+	corroborate func() []EmptyListingCorroborator
+
 	// liveOnce guards the single live classification this backend is willing
 	// to pay for. The read happens on the first classifier call, which the
 	// absence proof only makes after a point probe has already failed, so a
@@ -42,8 +48,10 @@ type localBackend struct {
 	liveOK   bool
 }
 
-func newLocalBackend(c Client, info StorageInfo, defaultNode string) Backend {
-	return &localBackend{client: c, info: info, defaultNode: defaultNode}
+func newLocalBackend(
+	c Client, info StorageInfo, defaultNode string, corroborate func() []EmptyListingCorroborator,
+) Backend {
+	return &localBackend{client: c, info: info, defaultNode: defaultNode, corroborate: corroborate}
 }
 
 // Kind reports BackendLocal — node-pinned storage where the volume's host node determines VM placement.
@@ -88,6 +96,25 @@ func (l *localBackend) NodeForCreate(ctx context.Context, vmHint, cloudPropNode 
 //
 // Returns cpierrors.DiskNotFound when no node holds the volume.
 func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (string, error) {
+	return l.nodeForExisting(ctx, volume)
+}
+
+// NodeForExistingCorroborated is NodeForExisting with extra corroborators for
+// this one sweep (the CorroboratedNodeSweeper capability). The caller's extras
+// go first, ahead of whatever the resolver supplied, because the evidence a
+// caller carries is evidence it already paid for: the cluster's VM configs,
+// read by a holder scan that ran before the sweep. The resolver's own sources
+// follow in their configured order, which ends with the one that spends an API
+// call.
+func (l *localBackend) NodeForExistingCorroborated(
+	ctx context.Context, volume string, extra ...EmptyListingCorroborator,
+) (string, error) {
+	return l.nodeForExisting(ctx, volume, extra...)
+}
+
+func (l *localBackend) nodeForExisting(
+	ctx context.Context, volume string, extra ...EmptyListingCorroborator,
+) (string, error) {
 	if volume == "" {
 		return "", cpierrors.Cloud("backend(local): volume must not be empty")
 	}
@@ -113,7 +140,8 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 		// the volume GET with a 500 naming volume_size_info, which says
 		// nothing either way. The proof settles that question from a storage
 		// content listing, so the scan gets its clean miss there too.
-		absent, err := ProveVolumeAbsent(ctx, l.client, node, storage, volume, l.classifyStorage)
+		absent, err := ProveVolumeAbsent(
+			ctx, l.client, node, storage, volume, l.classifyStorage, l.emptyListingCorroborators(extra)...)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
 			// the volume may live on a different healthy node. Record the
@@ -141,6 +169,25 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 	}
 
 	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
+}
+
+// emptyListingCorroborators orders the second opinions one probe hands to an
+// empty content listing: the caller's own first, then the resolver's. The
+// resolver's supplier is called once per probe rather than once per backend,
+// because a source such as the allocation journal is a record on disk that a
+// concurrent CPI process can change between two nodes of the same sweep, and
+// because a sweep whose point probes all answer must never call it at all.
+func (l *localBackend) emptyListingCorroborators(extra []EmptyListingCorroborator) []EmptyListingCorroborator {
+	var supplied []EmptyListingCorroborator
+	if l.corroborate != nil {
+		supplied = l.corroborate()
+	}
+	if len(extra) == 0 {
+		return supplied
+	}
+	out := make([]EmptyListingCorroborator, 0, len(extra)+len(supplied))
+	out = append(out, extra...)
+	return append(out, supplied...)
 }
 
 // classifyStorage answers the absence proof's classifier question for this

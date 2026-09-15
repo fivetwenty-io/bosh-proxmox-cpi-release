@@ -944,6 +944,12 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 
 	parkerCfg := parkerReadConfigFor(deps)
 	var holder pve.DiskHolder
+	// The same scan that answers "who holds this volume?" counts, per storage,
+	// how many volumes the cluster's configs reference. That count is what
+	// contradicts an empty content listing in the absence proof below, and a
+	// disk nothing references keeps it on the resolved identity rather than on
+	// a holder that was never found.
+	refs := rd.storageRefs
 	if rd.stableID != "" {
 		if rd.holder != nil {
 			holder = *rd.holder
@@ -954,6 +960,7 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 		if err != nil {
 			return attachPlan{}, wrapHolderScanError(err, fmt.Sprintf("%s: resolve current holder of disk %s", op, rd.diskCID))
 		}
+		refs = holder.StorageReferences
 	}
 
 	// A disk whose CID promises a parker anchor must have a holder while
@@ -967,7 +974,7 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	// location rather than using node, which by this point names the VM the
 	// disk is being attached to.
 	if anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder); anchorErr != nil {
-		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid) {
+		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid, refs) {
 			return attachPlan{}, anchorVolumeGoneRefusal(op, rd.diskCID, rd.volid)
 		}
 		return attachPlan{}, anchorErr

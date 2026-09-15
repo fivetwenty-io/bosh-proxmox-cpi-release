@@ -718,7 +718,7 @@ func attemptCreateVolume(
 				// it. An absence we still cannot prove skips the sweep, which
 				// is what a probe error did before.
 				absent, exErr := pve.ProveVolumeAbsent(rollbackCtx, deps.PVE, node, storage, candidateCanonical,
-					handlerStorageClassifier(deps, storage))
+					handlerStorageClassifier(deps, storage), emptyListingCorroborators(deps, nil)...)
 				if exErr != nil {
 					// A failed probe means the sweep is silently skipped, so
 					// the warning carries what the anchor proof's warning

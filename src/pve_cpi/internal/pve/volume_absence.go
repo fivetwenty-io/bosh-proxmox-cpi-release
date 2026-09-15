@@ -89,7 +89,7 @@ func ProveVolumeAbsent(
 	// means nothing at all, so what is left here is the allow-listed or
 	// is_mountpoint storage whose empty answer we are about to believe.
 	if listed == 0 {
-		if corrErr := corroborateEmptyListing(ctx, node, storage, corroborators); corrErr != nil {
+		if corrErr := corroborateEmptyListing(ctx, node, storage, volume, corroborators); corrErr != nil {
 			return false, corrErr
 		}
 	}
@@ -171,9 +171,17 @@ func listingFailsWhenBackingIsGone(storageType string) bool {
 // the proof fails closed naming what contradicted it. It errors, and the proof
 // fails closed too, because a check that did not land cannot clear an empty
 // answer. Or it has nothing to say, and the next corroborator gets its turn.
+//
+// The volume under proof is passed along because a source that still knows of
+// that one volume knows nothing the proof does not already suspect: its absence
+// is the question, so its own record must never count as evidence against the
+// listing. A source that tracks volumes by name has to exclude it; the ones
+// that count references or read a capacity figure have nothing to exclude and
+// ignore the argument.
 type EmptyListingCorroborator interface {
-	// CorroborateEmptyListing is asked about one storage as seen from one node.
-	CorroborateEmptyListing(ctx context.Context, node, storage string) (Corroboration, error)
+	// CorroborateEmptyListing is asked about one storage as seen from one
+	// node, while proving the named volume absent from it.
+	CorroborateEmptyListing(ctx context.Context, node, storage, volume string) (Corroboration, error)
 }
 
 // Corroboration is one corroborator's answer. The zero value is "nothing to
@@ -231,13 +239,13 @@ type corroborationSourceNamer interface {
 // that spends an API call, so a contradiction the cheap sources can see is
 // found without touching the cluster.
 func corroborateEmptyListing(
-	ctx context.Context, node, storage string, corroborators []EmptyListingCorroborator,
+	ctx context.Context, node, storage, volume string, corroborators []EmptyListingCorroborator,
 ) error {
 	for _, corroborator := range corroborators {
 		if corroborator == nil {
 			continue
 		}
-		verdict, err := corroborator.CorroborateEmptyListing(ctx, node, storage)
+		verdict, err := corroborator.CorroborateEmptyListing(ctx, node, storage, volume)
 		if err != nil {
 			return fmt.Errorf(
 				"storage %s listed no content and the %s check that would corroborate it did not land, "+
@@ -283,23 +291,25 @@ func corroborationDetail(detail string) string {
 // as the built-in ones. A nil fn is a wiring fault rather than a corroborator
 // with nothing to say, so it reports an error and the proof fails closed.
 func CorroboratorFunc(
-	source string, fn func(ctx context.Context, node, storage string) (Corroboration, error),
+	source string, fn func(ctx context.Context, node, storage, volume string) (Corroboration, error),
 ) EmptyListingCorroborator {
 	return corroboratorFunc{source: source, fn: fn}
 }
 
 type corroboratorFunc struct {
 	source string
-	fn     func(ctx context.Context, node, storage string) (Corroboration, error)
+	fn     func(ctx context.Context, node, storage, volume string) (Corroboration, error)
 }
 
 func (c corroboratorFunc) CorroborationSource() string { return c.source }
 
-func (c corroboratorFunc) CorroborateEmptyListing(ctx context.Context, node, storage string) (Corroboration, error) {
+func (c corroboratorFunc) CorroborateEmptyListing(
+	ctx context.Context, node, storage, volume string,
+) (Corroboration, error) {
 	if c.fn == nil {
 		return Corroboration{Source: c.source}, fmt.Errorf("empty-listing corroborator %q has no implementation", c.source)
 	}
-	return c.fn(ctx, node, storage)
+	return c.fn(ctx, node, storage, volume)
 }
 
 // ConfigReferenceCorroborator contradicts an empty listing when the cluster's
@@ -308,9 +318,14 @@ func (c corroboratorFunc) CorroborateEmptyListing(ctx context.Context, node, sto
 // costs no API call where it is available, and it is available nowhere else:
 // refs is nil on every caller that never scanned, and a nil map has nothing to
 // say rather than something to deny.
+//
+// The volume under proof needs no excluding here. The scan counts what VM
+// configs reference, and a volume any config still references has a holder, so
+// a caller that reached an absence proof for it is not the caller these counts
+// come back to.
 func ConfigReferenceCorroborator(refs StorageReferenceCounts) EmptyListingCorroborator {
 	return CorroboratorFunc(CorroborationSourceConfigs,
-		func(_ context.Context, _, storage string) (Corroboration, error) {
+		func(_ context.Context, _, storage, _ string) (Corroboration, error) {
 			referenced := refs[storage]
 			if referenced <= 0 {
 				return Corroboration{}, nil
@@ -347,9 +362,12 @@ func isAre(n int) string {
 // references, whose filer is now exporting the wrong tree. An NFS mount of a
 // parent dataset still reports the children's bytes, so a used figure with an
 // empty listing is the contradiction.
+// It has no volume to exclude: PVE reports one figure for the whole storage,
+// and a used figure above the floor is bytes no single missing volume accounts
+// for.
 func StorageStatusCorroborator(client Client) EmptyListingCorroborator {
 	return CorroboratorFunc(CorroborationSourceStorageStatus,
-		func(ctx context.Context, node, storage string) (Corroboration, error) {
+		func(ctx context.Context, node, storage, _ string) (Corroboration, error) {
 			return readStorageStatusCorroboration(ctx, client, node, storage)
 		})
 }

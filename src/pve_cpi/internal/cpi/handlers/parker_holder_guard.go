@@ -165,8 +165,13 @@ func anchorMissingRefusal(ctx context.Context, deps Deps, method, diskCID string
 // volume" and "dataset does not exist" replies fold into one, so an operator
 // would be told the data is gone about a disk sitting healthy on its own node.
 // The disk's location is resolved from its own volid instead.
-func proveAnchorVolumeGone(ctx context.Context, deps Deps, method, diskCID, volid string) bool {
-	gone, err := anchorVolumeAbsentAnywhere(ctx, deps, volid)
+// refs carries the per-storage counts the holder scan behind this call already
+// produced, which is the cheapest contradiction of an empty content listing and
+// the only one the caller can supply.
+func proveAnchorVolumeGone(
+	ctx context.Context, deps Deps, method, diskCID, volid string, refs pve.StorageReferenceCounts,
+) bool {
+	gone, err := anchorVolumeAbsentAnywhere(ctx, deps, volid, refs)
 	return anchorAbsenceProven(ctx, deps, method, diskCID, "every node that could hold the volume", gone, err)
 }
 
@@ -174,8 +179,10 @@ func proveAnchorVolumeGone(ctx context.Context, deps Deps, method, diskCID, voli
 // that already resolved the disk's own node through its backend. delete_disk
 // is the only one: its node comes from NodeForExisting on the volume's
 // storage, which is the node the volume is actually on.
-func proveAnchorVolumeGoneAt(ctx context.Context, deps Deps, method, diskCID, volid, node string) bool {
-	gone, err := volumeAbsentFromStorage(ctx, deps, node, volid)
+func proveAnchorVolumeGoneAt(
+	ctx context.Context, deps Deps, method, diskCID, volid, node string, refs pve.StorageReferenceCounts,
+) bool {
+	gone, err := volumeAbsentFromStorage(ctx, deps, node, volid, refs)
 	return anchorAbsenceProven(ctx, deps, method, diskCID, "node "+node, gone, err)
 }
 
@@ -210,7 +217,9 @@ func anchorAbsenceProven(ctx context.Context, deps Deps, method, diskCID, scope 
 // finds, answers DiskNotFound only when every node proved the volume absent,
 // and turns any node it could not ask into a retriable error rather than a
 // miss. Reusing it keeps one sweep in the codebase instead of two.
-func anchorVolumeAbsentAnywhere(ctx context.Context, deps Deps, volid string) (bool, error) {
+func anchorVolumeAbsentAnywhere(
+	ctx context.Context, deps Deps, volid string, refs pve.StorageReferenceCounts,
+) (bool, error) {
 	storage, _, err := pve.ParseDiskCID(volid)
 	if err != nil {
 		return false, err
@@ -219,7 +228,13 @@ func anchorVolumeAbsentAnywhere(ctx context.Context, deps Deps, volid string) (b
 	if resolveErr != nil {
 		return false, resolveErr
 	}
-	node, nodeErr := backend.NodeForExisting(ctx, volid)
+	// The sweep runs inside package pve, which has the journal and status
+	// corroborators the production resolver handed it but no way to reach the
+	// cluster's configs. The counts this caller already holds are passed per
+	// call, so the local branch weighs the same three sources the shared branch
+	// does. A backend that cannot take them (the static test fallback) answers
+	// the plain question instead.
+	node, nodeErr := pve.NodeForExistingCorroborated(ctx, backend, volid, anchorSweepCorroborators(refs)...)
 	if nodeErr != nil {
 		if backend.Kind() == pve.BackendLocal && pve.IsNotFound(nodeErr) {
 			// Every candidate node answered a clean absence, which is the
@@ -232,7 +247,19 @@ func anchorVolumeAbsentAnywhere(ctx context.Context, deps Deps, volid string) (b
 		// A node came back, so a node holds the volume.
 		return false, nil
 	}
-	return volumeAbsentFromStorage(ctx, deps, node, volid)
+	return volumeAbsentFromStorage(ctx, deps, node, volid, refs)
+}
+
+// anchorSweepCorroborators is the extra evidence the cluster sweep takes from
+// its caller: the config-reference counts, and nothing else. The journal and
+// the storage status reach the sweep through the resolver the production wiring
+// built, so passing them here as well would read the journal twice on a storage
+// the configs no longer reference.
+func anchorSweepCorroborators(refs pve.StorageReferenceCounts) []pve.EmptyListingCorroborator {
+	if refs == nil {
+		return nil
+	}
+	return []pve.EmptyListingCorroborator{pve.ConfigReferenceCorroborator(refs)}
 }
 
 // anchorVolumeGoneRefusal returns the refusal for a promised anchor whose

@@ -79,19 +79,82 @@ func BackendStorageInfo(b Backend) (StorageInfo, bool) {
 	return StorageInfo{}, false
 }
 
+// CorroboratedNodeSweeper is an optional capability of a Backend: a sweep that
+// takes extra empty-listing corroborators for one call. The local backend
+// implements it, because its cluster sweep is the one Backend method that
+// proves a volume absent, and a caller that already read the cluster's configs
+// holds evidence the backend itself has no way to obtain.
+//
+// It is kept out of the Backend interface so the fakes and the static fallback
+// need not implement it; NodeForExistingCorroborated is the free function that
+// uses it when a backend has it and falls back to NodeForExisting when it does
+// not.
+type CorroboratedNodeSweeper interface {
+	NodeForExistingCorroborated(ctx context.Context, volume string, extra ...EmptyListingCorroborator) (string, error)
+}
+
+// NodeForExistingCorroborated locates the node holding volume, adding extra
+// corroborators to any empty content listing the sweep has to weigh. A backend
+// that cannot take them (the shared backend, which never proves an absence, and
+// every test fake) answers the ordinary NodeForExisting question, so the extra
+// evidence is an improvement where it applies rather than a new requirement.
+func NodeForExistingCorroborated(
+	ctx context.Context, b Backend, volume string, extra ...EmptyListingCorroborator,
+) (string, error) {
+	if b == nil {
+		return "", cpierrors.Cloud("backend: NodeForExistingCorroborated needs a backend")
+	}
+	if sweeper, ok := b.(CorroboratedNodeSweeper); ok && len(extra) > 0 {
+		return sweeper.NodeForExistingCorroborated(ctx, volume, extra...)
+	}
+	return b.NodeForExisting(ctx, volume)
+}
+
 // resolver is the production BackendResolver. It consults StorageInfoCache to
 // classify the storage, then constructs either a SharedBackend or LocalBackend.
 type resolver struct {
 	client      Client
 	cache       *StorageInfoCache
 	defaultNode string
+	// corroborate supplies the empty-listing corroborators the backends this
+	// resolver builds hand to their absence proofs. It is a function rather
+	// than a slice because the sources it names (the CPI's allocation journal,
+	// PVE's storage status) are read at proof time, and because the handlers
+	// package owns the journal while this package owns the proof. Nil means no
+	// corroboration, which is what every caller had before the option existed.
+	corroborate func() []EmptyListingCorroborator
+}
+
+// BackendResolverOption configures the production resolver at construction.
+type BackendResolverOption func(*resolver)
+
+// WithEmptyListingCorroborators gives the resolver's backends a source of
+// second opinions on an empty storage content listing. The local backend's
+// cluster sweep reads a listing on every node it probes, and an nfs or cifs
+// export that mounts but serves the wrong tree lists nothing on all of them,
+// so without corroboration that sweep reports a volume absent from every node
+// in the cluster.
+//
+// supply is called once per proof that reaches an empty listing, so a caller
+// whose point probes answer pays nothing. A nil supply, or one that returns no
+// corroborators, leaves the pre-corroboration behavior in place.
+func WithEmptyListingCorroborators(supply func() []EmptyListingCorroborator) BackendResolverOption {
+	return func(r *resolver) { r.corroborate = supply }
 }
 
 // NewBackendResolver builds the production resolver. The cache may be nil — in
 // which case every Resolve falls back to BackendLocal on defaultNode (matching
 // the "treat unknown as local, require explicit node" safety default).
-func NewBackendResolver(client Client, cache *StorageInfoCache, defaultNode string) BackendResolver {
-	return &resolver{client: client, cache: cache, defaultNode: defaultNode}
+func NewBackendResolver(
+	client Client, cache *StorageInfoCache, defaultNode string, opts ...BackendResolverOption,
+) BackendResolver {
+	r := &resolver{client: client, cache: cache, defaultNode: defaultNode}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
+	return r
 }
 
 // Resolve classifies storage and returns the appropriate Backend.
@@ -111,9 +174,12 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 		info, err := r.cache.Get(ctx, storage)
 		if err == nil {
 			if info.IsShared() {
+				// The shared backend never proves an absence: it routes to a
+				// node rather than sweeping for one, so it has no empty
+				// listing to weigh and takes no corroborators.
 				return newSharedBackend(r.client, info, r.defaultNode), nil
 			}
-			return newLocalBackend(r.client, info, r.defaultNode), nil
+			return newLocalBackend(r.client, info, r.defaultNode, r.corroborate), nil
 		}
 		// StorageInfoCache.Get returns a non-nil error for two very different
 		// conditions: the storage genuinely absent from the PVE index (a plain
@@ -138,7 +204,7 @@ func (r *resolver) Resolve(ctx context.Context, storage string) (Backend, error)
 	// No cache configured or storage not found: treat as local. Tests that
 	// don't wire a resolver use NewStaticBackendResolver instead; this branch
 	// is for production lookups that miss.
-	return newLocalBackend(r.client, StorageInfo{Name: storage}, r.defaultNode), nil
+	return newLocalBackend(r.client, StorageInfo{Name: storage}, r.defaultNode, r.corroborate), nil
 }
 
 // staticResolver is a deterministic resolver used by tests that don't exercise

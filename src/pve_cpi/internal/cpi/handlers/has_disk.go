@@ -142,8 +142,13 @@ func HandleHasDisk(deps Deps) Handler {
 			// a missing file from a backing that went away. The probe error
 			// travels on rather than the proof's, so a cycling pvedaemon
 			// worker still reaches the Director as the retriable fault it is.
+			// No holder scan ran on this path, so the corroborators are the
+			// two that need none: the allocation journal, and PVE's own
+			// status for the storage. An empty listing either of them
+			// contradicts leaves has_disk reporting the probe error rather
+			// than the false a wrong export would otherwise produce.
 			absent, proofErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, bareDiskCID,
-				handlerStorageClassifier(deps, storage))
+				handlerStorageClassifier(deps, storage), emptyListingCorroborators(deps, nil)...)
 			if proofErr != nil {
 				deps.Log(ctx).Warn("has_disk: the volume's presence could not be proven from a content listing",
 					log.String("disk_cid", diskCID),
