@@ -22,6 +22,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `set_disk_metadata` now refuses an operator disk tag whose key would render the `stemcell--` prefix, the same way it already refuses one that would render `director--` or `deployment--`, so a tag keyed `stemcell` cannot overwrite the record of what a guest booted from. The refusal is logged and applies whatever the key's case.
 
+### Fixed
+
+- The allocation journal no longer refuses a record file because another process was saving it at that moment. The safety check that rejects a journal file something else also hard-links tested the link count against exactly one, and a file being replaced by an atomic rename is briefly reachable by name while its link count reads zero, so a reader that looked at the wrong instant was rejected as multiply linked when nothing had linked it at all. On a shared journal that surfaced as a `create_vm` failing outright, because the managed storage path inspects the journal before it does anything else. The check now rejects a link count above one, which is the hard-link case it always claimed to catch and the only one an attacker can create; a reader that loses the rename race reopens the file instead. Measured on APFS, the rejection fired on roughly one lookup in five hundred under concurrent load and now does not fire at all. A hard-linked record is still refused, and a test now pins that.
+
 ### Changed
 
 - `create_vm` writes the pool-membership and stemcell records in a single description update rather than one per record, so provenance costs one config read and one write per VM on a deploy of any size. That write now goes to the unguarded PVE client. On the managed storage-placement path it previously rode the allocation guard, where a transient failure on a purely advisory description update could poison the allocation, fail a `create_vm` that had otherwise succeeded, and leave a record in `ReconciliationRequired` for an operator to clear.
