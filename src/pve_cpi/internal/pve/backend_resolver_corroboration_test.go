@@ -73,7 +73,7 @@ func sweepLocalBackend(t *testing.T, resolver BackendResolver) Backend {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if backend.Kind() != BackendLocal {
-		t.Fatalf("Kind()=%s, want local — the sweep only runs on a local backend", backend.Kind())
+		t.Fatalf("Kind()=%s, want local, because the sweep only runs on a local backend", backend.Kind())
 	}
 	return backend
 }
@@ -163,10 +163,11 @@ func TestNodeForExistingCorroborated_CallerExtrasComeFirst(t *testing.T) {
 	})
 	resolver, _ := corroboratedResolverFixture(t, WithEmptyListingCorroborators(
 		func() []EmptyListingCorroborator { return []EmptyListingCorroborator{supplied} }))
-	extra := CorroboratorFunc(sweepCorroborationSource, func(context.Context, string, string, string) (Corroboration, error) {
-		order = append(order, "caller")
-		return Corroboration{}, nil
-	})
+	extra := CorroboratorFunc(sweepCorroborationSource,
+		func(context.Context, string, string, string) (Corroboration, error) {
+			order = append(order, "caller")
+			return Corroboration{}, nil
+		})
 	_, err := NodeForExistingCorroborated(
 		context.Background(), sweepLocalBackend(t, resolver), classifyVolid, extra)
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeDiskNotFound) {
@@ -183,9 +184,10 @@ func TestNodeForExistingCorroborated_CallerExtrasComeFirst(t *testing.T) {
 func TestNodeForExistingCorroborated_FallsBackOnAPlainBackend(t *testing.T) {
 	t.Parallel()
 
-	extra := CorroboratorFunc(sweepCorroborationSource, func(context.Context, string, string, string) (Corroboration, error) {
-		return Corroboration{Contradicted: true}, nil
-	})
+	extra := CorroboratorFunc(sweepCorroborationSource,
+		func(context.Context, string, string, string) (Corroboration, error) {
+			return Corroboration{Contradicted: true}, nil
+		})
 	node, err := NodeForExistingCorroborated(
 		context.Background(), &staticBackend{defaultNode: "pve-07"}, classifyVolid, extra)
 	if err != nil {
