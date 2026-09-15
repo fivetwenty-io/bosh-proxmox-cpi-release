@@ -609,7 +609,7 @@ A template tagged `bosh-stemcell-node-<node>` or `bosh-stemcell-storage-<storage
 
 ### Which stemcell is a VM running?
 
-Every VM the CPI creates carries a `stemcell--<name>-<version>` tag naming the stemcell it booted from, and the same identity in its Notes under the `bosh_stemcell` key. A Director never sends the stemcell in its `set_vm_metadata` payload, so before this the answer lived only inside the guest. Now PVE can answer it, and so can a create-env Director, which receives no `set_vm_metadata` call at all.
+A VM the CPI creates carries a `stemcell--<name>-<version>` tag naming the stemcell it booted from, and the same identity in its Notes under the `bosh_stemcell` key. That covers every VM built from a stemcell the CPI uploaded, and the exceptions are listed at the end of this section. A Director never sends the stemcell in its `set_vm_metadata` payload, so before this the answer lived only inside the guest. Now PVE can answer it, and so can a create-env Director, which receives no `set_vm_metadata` call at all.
 
 The tag uses the CPI's usual tag alphabet, so the version's dot becomes a dash, and the stemcell `bosh-openstack-kvm-ubuntu-noble-1.585` is tagged `stemcell--bosh-openstack-kvm-ubuntu-noble-1-585`. The Notes record keeps the exact version, along with the full stemcell CID, its kind, and its content sha8.
 
