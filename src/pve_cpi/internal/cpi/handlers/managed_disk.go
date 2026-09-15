@@ -13,6 +13,7 @@ import (
 	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
@@ -62,25 +63,37 @@ func createManagedDisk(ctx context.Context, deps Deps, args []json.RawMessage, s
 	if err := deps.Config.ValidateStoragePlacementAllocation(); err != nil {
 		return nil, err
 	}
-	m, err := prepareManagedDisk(ctx, deps, selection, sizeMB, cp, hint, resolver)
+	// The journal opens and admission runs above planning so the plan can see
+	// what in-flight siblings have already claimed. Both are scoped to every
+	// node in the cluster rather than to the nodes planning discovers, which
+	// costs one cluster-wide scan per disk create and widens the absence proof.
+	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return nil, err
 	}
-	journal, err := openStorageAllocationJournal(ctx, deps, m.inventory.Nodes())
+	journal, err := openStorageAllocationJournal(ctx, deps, clusterNodes)
 	if err != nil {
 		return nil, err
 	}
+	allocation := ""
 	defer func() {
 		if err := journal.Close(); err != nil {
 			result = nil
-			retErr = cpierrors.Cloud("allocation %s journal close failed; inspect retained evidence before retrying", m.id)
+			retErr = managedDiskJournalCloseError(allocation)
 		}
 	}()
 	// Admission validates retained remote provenance before a new allocation is
 	// introduced. CreateDisk also checks all historical shortened-token values.
-	if err := admitStorageAllocation(ctx, deps, journal, m.inventory.Nodes()); err != nil {
+	// Its records are the one scan sibling accounting reads.
+	audit, err := admitStorageAllocation(ctx, deps, journal, clusterNodes)
+	if err != nil {
 		return nil, err
 	}
+	m, err := prepareManagedDisk(ctx, deps, selection, sizeMB, cp, hint, resolver, audit.Records)
+	if err != nil {
+		return nil, err
+	}
+	allocation = m.id
 	intent, err := storageJournalIntent("create_disk", args, selection, m.inventory, m.plan)
 	if err != nil {
 		return nil, err
@@ -99,7 +112,23 @@ func createManagedDisk(ctx context.Context, deps Deps, args []json.RawMessage, s
 	return m.execute(ctx, handle)
 }
 
-func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacementSelection, sizeMB int, cp createDiskCloudProperties, hint string, resolver *layeredResolver) (*managedDiskRequest, error) {
+// managedDiskJournalCloseError names the allocation the operator has to inspect
+// after a failed journal close. The journal now opens above planning, so a
+// close failure can happen before an allocation identifier exists, and the
+// message says so rather than naming an empty allocation.
+func managedDiskJournalCloseError(allocation string) error {
+	if allocation == "" {
+		return cpierrors.Cloud("create_disk: allocation journal close failed; inspect retained evidence before retrying")
+	}
+	return cpierrors.Cloud("allocation %s journal close failed; inspect retained evidence before retrying", allocation)
+}
+
+// prepareManagedDisk ranks a persistent allocation. siblings is the record
+// slice the admission audit already read, and its in-flight claims are charged
+// against every candidate before the ranking runs. A caller with no journal
+// open, such as the plan diagnostic, passes nil and ranks against the snapshot
+// alone.
+func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacementSelection, sizeMB int, cp createDiskCloudProperties, hint string, resolver *layeredResolver, siblings []aj.Record) (*managedDiskRequest, error) {
 	bytes, gib, err := managedDiskSize(sizeMB)
 	if err != nil {
 		return nil, err
@@ -130,7 +159,15 @@ func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacem
 		return nil, err
 	}
 	discovery := managedDiskDiscovery(selection.Persistent, nodes)
+	// The collector stamps the snapshot from this process's wall clock here,
+	// because no clock is injected, so reading the clock immediately before
+	// discovery gives sibling accounting the moment the observation began.
+	snapshotStart := time.Now().UTC()
 	snapshot, err := collector.Discover(ctx, selection.Policy, discovery)
+	if err != nil {
+		return nil, err
+	}
+	siblingMember, siblingDomain, err := managedDiskSiblingBytes(siblings, id, snapshotStart)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +182,10 @@ func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacem
 			return nil, e
 		}
 		observed.inventory = snapshot
-		iterator, e := NewStoragePlanIterator(StoragePlanRequest{OnCandidateRejected: deps.storageCandidateRejectionObserver(ctx, selection), Selection: selection, Inventory: snapshot, Groups: []StoragePlanNodeGroup{{AZ: cp.AvailabilityZone, Nodes: planningNodes}}, Namespace: deps.Config.StoragePlacementNamespace, AllocationKey: id, Seed: seed, SeedSet: true, PersistentBytes: bytes, SearchBudget: 10000})
+		request := StoragePlanRequest{OnCandidateRejected: deps.storageCandidateRejectionObserver(ctx, selection), Selection: selection, Inventory: snapshot, Groups: []StoragePlanNodeGroup{{AZ: cp.AvailabilityZone, Nodes: planningNodes}}, Namespace: deps.Config.StoragePlacementNamespace, AllocationKey: id, Seed: seed, SeedSet: true, PersistentBytes: bytes, SearchBudget: 10000}
+		request.SiblingMemberBytes = siblingMember
+		request.SiblingDomainBytes = siblingDomain
+		iterator, e := NewStoragePlanIterator(request)
 		if e != nil {
 			return observed, e
 		}
@@ -182,6 +222,21 @@ func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacem
 		return &managedDiskRequest{deps: deps, selection: selection, collector: collector, inventory: snapshot, plan: plan, ledger: ledger, id: id, token: token, format: format, hint: hint, az: cp.AvailabilityZone, sizeGiB: gib, opts: opts, tags: cp.Tags, iterator: iterator, budget: budget}, nil
 	}
 	return nil, cpierrors.Cloud("create_disk: hinted VM kept migrating; no allocation submitted")
+}
+
+// managedDiskSiblingBytes turns the journal records a caller already holds into
+// the two byte maps that seed a persistent ranking. A persistent allocation
+// carries no instance group, so the group is empty and the scope is none. Both
+// of those cut the sibling group key to empty, the counts come back nil, and
+// the ranking on this path is never partitioned by sibling count. self is this
+// allocation's own identifier, which is always skipped so a retry stays on the
+// share it already holds.
+func managedDiskSiblingBytes(records []aj.Record, self string, start time.Time) (member, domain map[string]uint64, err error) {
+	member, domain, _, err = siblingCharges(records, self, "", config.StorageAntiAffinityScopeNone, start)
+	if err != nil {
+		return nil, nil, err
+	}
+	return member, domain, nil
 }
 
 func managedDiskSize(sizeMB int) (uint64, int, error) {

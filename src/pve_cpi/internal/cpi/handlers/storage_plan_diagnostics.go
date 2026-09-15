@@ -160,7 +160,9 @@ func observeDiskPlan(ctx context.Context, deps Deps, args []json.RawMessage) (*S
 	if err != nil {
 		return selection, nil, nil, nil, err
 	}
-	m, err := prepareManagedDisk(ctx, deps, selection, size, cp, hint, resolver)
+	// The diagnostic holds no journal, so it ranks against the snapshot alone
+	// and charges no in-flight sibling.
+	m, err := prepareManagedDisk(ctx, deps, selection, size, cp, hint, resolver, nil)
 	if m == nil {
 		return selection, nil, nil, nil, err
 	}
@@ -182,7 +184,8 @@ func observeVMPlan(ctx context.Context, deps Deps, args []json.RawMessage) (*Sto
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	m, err := prepareManagedVMPlan(ctx, deps, parsed, selection)
+	// A diagnostic plan opens no journal, so it charges no sibling bytes.
+	m, err := prepareManagedVMPlan(ctx, deps, parsed, selection, nil, "")
 	if m == nil {
 		return selection, nil, nil, nil, err
 	}

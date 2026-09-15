@@ -56,7 +56,7 @@ func cleanupPendingVMDeletion(step aj.Step, record aj.Record) bool {
 }
 
 func observeCleanupVMDeletion(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record, step aj.Step) error {
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return err
 	}

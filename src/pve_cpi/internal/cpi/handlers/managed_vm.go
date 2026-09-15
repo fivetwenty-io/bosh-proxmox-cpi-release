@@ -24,7 +24,7 @@ func createManagedVM(ctx context.Context, deps Deps, args []json.RawMessage, par
 			deps.recordStoragePlacement(ctx, selection, "rejection")
 		}
 	}()
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return nil, err
 	}
@@ -40,30 +40,30 @@ func createManagedVM(ctx context.Context, deps Deps, args []json.RawMessage, par
 	if found {
 		return resumeManagedVM(ctx, deps, parsed, selection, journal, record, args, continueManagedVM)
 	}
+	// The admission scan carries the journal's records, but the first
+	// placement does not read them here. The planning callback below receives
+	// a listing taken under the index lock, which is strictly fresher and is
+	// the only read that closes the window against a concurrent create.
 	if err := admitStorageVMAllocation(ctx, deps, journal, nodes, parsed.agentID); err != nil {
 		return nil, err
 	}
-	prepared, err := prepareManagedVMPlan(ctx, deps, parsed, selection)
+	prepared, err := observeManagedVMPlan(ctx, deps, parsed, selection)
 	if err != nil {
 		return nil, managedVMPlanCPIError(err)
 	}
-	parsed.storagePlan = prepared.plan
-	parsed.storageSelection = selection
-	shape, err := buildVMShapeForNode(ctx, deps, parsed, prepared.plan.Node)
+	// Resolve the storage tier out here. The callback runs under a cluster
+	// visible lock and must not reach PVE for one.
+	tier, err := managedVMTierResolver(ctx, deps, parsed, selection)
 	if err != nil {
 		return nil, err
 	}
-	prepared.plan.VMExecution, err = freezeManagedVMExecution(deps.Config, shape)
+	placement := &managedVMFirstPlacement{deps: deps, parsed: parsed, selection: selection,
+		prepared: prepared, tier: tier, args: args}
+	handle, err := journal.AcquireVMPlanned(ctx, parsed.agentID, func(id string, siblings []aj.Record) (aj.Intent, error) {
+		return placement.plan(ctx, id, siblings)
+	})
 	if err != nil {
-		return nil, err
-	}
-	intent, err := storageJournalIntent("create_vm", args, selection, prepared.inventory, prepared.plan)
-	if err != nil {
-		return nil, err
-	}
-	handle, err := journal.AcquireVM(ctx, parsed.agentID, intent)
-	if err != nil {
-		return nil, err
+		return resumeConflictingManagedVM(ctx, deps, parsed, selection, journal, args, err)
 	}
 	if handle.Resumed {
 		existing := handle.Record()
@@ -73,11 +73,81 @@ func createManagedVM(ctx context.Context, deps Deps, args []json.RawMessage, par
 		return resumeManagedVM(ctx, deps, parsed, selection, journal, existing, args, continueManagedVM)
 	}
 	defer func() { retErr = errors.Join(retErr, handle.Close()) }()
-	m, err := newManagedVMAllocation(deps, parsed, shape, prepared, handle)
+	// A new generation is written only when the planning callback returns an
+	// intent, so the shape is always here. Say so rather than dereference it.
+	if placement.shape == nil {
+		return nil, cpierrors.Cloud("allocation %s was acquired without a frozen VM shape", handle.Record().ID)
+	}
+	m, err := newManagedVMAllocation(deps, parsed, placement.shape, prepared, handle)
 	if err != nil {
 		return nil, err
 	}
 	return runManagedVMWithRetries(ctx, deps, journal, parsed, selection, m, nil)
+}
+
+// managedVMFirstPlacement carries what one first placement needs across the
+// journal's planning callback. Everything on it was observed before the index
+// lock was taken, and shape is the one result the callback leaves behind for
+// the caller.
+type managedVMFirstPlacement struct {
+	deps      Deps
+	parsed    *createVMParsedArgs
+	selection *StoragePlacementSelection
+	prepared  *managedVMPlan
+	tier      vmStorageTierFn
+	args      []json.RawMessage
+	shape     *createVMShape
+}
+
+// plan ranks, shapes, and freezes one placement while the journal holds its
+// index lock, and returns the intent the new record carries. It observes
+// nothing: the siblings come from the journal's own read under that lock, the
+// inventory snapshot was frozen before it, and so was the storage tier. See
+// aj.VMPlanFunc for the contract the callback runs under.
+func (p *managedVMFirstPlacement) plan(ctx context.Context, id string, siblings []aj.Record) (aj.Intent, error) {
+	if err := applyManagedVMSiblings(p.prepared, siblings, id); err != nil {
+		return aj.Intent{}, err
+	}
+	if err := rankManagedVMPlan(ctx, p.deps, p.parsed, p.prepared); err != nil {
+		return aj.Intent{}, managedVMPlanCPIError(err)
+	}
+	p.parsed.storagePlan = p.prepared.plan
+	p.parsed.storageSelection = p.selection
+	// The frozen plan names the root storage and its type, so the shape build
+	// needs no cluster storage listing of its own.
+	shape, err := buildVMShapeForNode(ctx, p.deps, p.parsed, p.prepared.plan.Node, p.tier)
+	if err != nil {
+		return aj.Intent{}, err
+	}
+	p.prepared.plan.VMExecution, err = freezeManagedVMExecution(p.deps.Config, shape)
+	if err != nil {
+		return aj.Intent{}, err
+	}
+	intent, err := storageJournalIntent("create_vm", p.args, p.selection, p.prepared.inventory, p.prepared.plan)
+	if err != nil {
+		return aj.Intent{}, err
+	}
+	p.shape = shape
+	return intent, nil
+}
+
+// resumeConflictingManagedVM converges on a generation that appeared after this
+// call looked the agent up and before it acquired. The planning entry point has
+// no caller intent to compare, so the journal reports that generation as a
+// conflict rather than resuming it, and the resume path owns the comparison
+// instead: it re-acquires with this call's caller fingerprint and refuses a
+// generation whose caller intent differs. Any other acquisition error, and a
+// conflict with no generation behind it, is returned unchanged.
+func resumeConflictingManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArgs,
+	selection *StoragePlacementSelection, journal *aj.Journal, args []json.RawMessage, cause error) (any, error) {
+	if !errors.Is(cause, aj.ErrConflict) {
+		return nil, cause
+	}
+	record, found, err := journal.InspectVMContext(ctx, parsed.agentID)
+	if err != nil || !found {
+		return nil, errors.Join(cause, err)
+	}
+	return resumeManagedVM(ctx, deps, parsed, selection, journal, record, args, continueManagedVM)
 }
 
 func managedVMPlanCPIError(err error) error {
@@ -98,7 +168,15 @@ func newManagedVMAllocation(deps Deps, parsed *createVMParsedArgs, shape *create
 }
 func continueManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArgs, selection *StoragePlacementSelection, journal *aj.Journal, handle *aj.Handle, plan *StorageAllocationPlan, observed *managedVMObservation) (any, error) {
 	if managedVMAttemptClosed(handle.Record()) {
-		next, err := prepareManagedVMPlan(ctx, deps, parsed, selection)
+		// Read the siblings before the re-plan. The absence proof keeps its
+		// place after it, because that proof is what authorizes the retry, and
+		// our own record is excluded so the retry stays free to return to the
+		// share its retained artifacts already sit on.
+		siblings, err := journal.List()
+		if err != nil {
+			return nil, err
+		}
+		next, err := prepareManagedVMPlan(ctx, deps, parsed, selection, siblings, handle.Record().ID)
 		if err != nil {
 			return nil, managedVMPlanCPIError(err)
 		}

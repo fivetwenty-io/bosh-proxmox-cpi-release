@@ -26,7 +26,13 @@ import (
 // vmStorageType is populated via a best-effort cluster storage list lookup;
 // on failure (PVE unavailable, ClusterStorage not wired) the field is left ""
 // so IsLinkedCloneSupported treats it as linked-capable (permissive default).
-func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedArgs, node string) (*createVMShape, error) {
+//
+// The optional tierFn replaces the storage-tier resolver this function builds
+// for itself. A caller that must not issue a PVE query from here, because it
+// holds a cluster-visible lock, supplies one already primed with every tier
+// this build can name. A nil or omitted argument keeps the default resolver.
+func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedArgs, node string,
+	tierFn ...vmStorageTierFn) (*createVMShape, error) {
 	cp := parsed.cloudProps
 
 	rangeStart, maxAttempts := resolveVMIDAllocParams(deps.Config)
@@ -35,7 +41,10 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// The closure is only invoked when cloud_properties.storage_tier is set
 	// in the resolver layers; nil ClusterStorage falls through to config fallback.
 	var tierFnForVM vmStorageTierFn
-	if deps.PVE != nil && deps.PVE.ClusterStorage() != nil {
+	switch {
+	case len(tierFn) > 0 && tierFn[0] != nil:
+		tierFnForVM = tierFn[0]
+	case deps.PVE != nil && deps.PVE.ClusterStorage() != nil:
 		lister := deps.PVE.ClusterStorage()
 		cfg := deps.Config
 		tierFnForVM = func(tier string) (string, error) {

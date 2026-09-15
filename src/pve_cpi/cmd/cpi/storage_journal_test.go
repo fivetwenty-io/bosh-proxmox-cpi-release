@@ -582,3 +582,161 @@ func TestStorageJournalPendingCleanupRequiresFencingBeforeIO(t *testing.T) {
 		}
 	}
 }
+
+// storageJournalAuditOutput mirrors the audit command's JSON shape from the
+// consumer's side, decoding loosely the way a real consumer would.
+type storageJournalAuditOutput struct {
+	Records []struct {
+		ID, Kind, State, CID, SHA256 string
+		CreatedAt, UpdatedAt         time.Time
+		Charging                     bool `json:"charging"`
+	} `json:"records"`
+	ChargingSummary struct {
+		Count     int    `json:"count"`
+		OldestID  string `json:"oldest_id"`
+		OldestAge string `json:"oldest_age"`
+	} `json:"charging_summary"`
+	IndexHealthy      bool `json:"generation_index_healthy"`
+	ClusterContinuity bool `json:"cluster_continuity"`
+}
+
+// storageJournalAuditTestRecord builds a minimal record with no journal and no
+// encoded plan, which is enough for writeStorageJournalAudit: it never decodes
+// the plan, it only reads state and the two timestamps.
+func storageJournalAuditTestRecord(id string, state aj.State, created, updated time.Time) aj.Record {
+	return aj.Record{
+		Version: aj.Version, ID: id, Namespace: "director", Kind: "vm",
+		State: state, CreatedAt: created, UpdatedAt: updated,
+	}
+}
+
+func decodeStorageJournalAuditOutput(t *testing.T, raw []byte) storageJournalAuditOutput {
+	t.Helper()
+	var output storageJournalAuditOutput
+	if err := json.Unmarshal(raw, &output); err != nil {
+		t.Fatalf("decode audit output: %v %s", err, raw)
+	}
+	return output
+}
+
+func TestStorageJournalAuditRecordSummaryChargingMatchesPredicateForEveryState(t *testing.T) {
+	// One table drives both the command's per-record field and the exported
+	// predicate the sibling reader also calls, so the two views cannot drift.
+	states := []aj.State{
+		aj.Planned, aj.Submitted, aj.Observed, aj.ReconciliationRequired,
+		aj.ReadyToReturn, aj.Adopted, aj.VMDeletedRetained, aj.Deleted, aj.Cleaned,
+	}
+	created := time.Now().UTC().Add(-time.Hour)
+	for _, state := range states {
+		t.Run(string(state), func(t *testing.T) {
+			report := handlers.StorageAllocationAudit{
+				Complete: true, VMScanComplete: true,
+				Records: []aj.Record{storageJournalAuditTestRecord("record-"+string(state), state, created, created)},
+			}
+			var out, stderr bytes.Buffer
+			writeStorageJournalAudit(&out, &stderr, report, nil, true)
+			output := decodeStorageJournalAuditOutput(t, out.Bytes())
+			if len(output.Records) != 1 {
+				t.Fatalf("expected one record summary, got %d", len(output.Records))
+			}
+			want := handlers.StorageAllocationCharging(state)
+			if output.Records[0].Charging != want {
+				t.Fatalf("state %s: summary charging %v, predicate %v", state, output.Records[0].Charging, want)
+			}
+		})
+	}
+}
+
+func TestStorageJournalAuditPlannedRecordChargesWithTimestamps(t *testing.T) {
+	created := time.Now().UTC().Add(-3 * time.Minute)
+	updated := time.Now().UTC().Add(-time.Minute)
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{storageJournalAuditTestRecord("planned-1", aj.Planned, created, updated)},
+	}
+	var out, stderr bytes.Buffer
+	writeStorageJournalAudit(&out, &stderr, report, nil, true)
+	output := decodeStorageJournalAuditOutput(t, out.Bytes())
+	if len(output.Records) != 1 {
+		t.Fatalf("expected one record summary, got %d", len(output.Records))
+	}
+	record := output.Records[0]
+	if !record.Charging {
+		t.Fatal("planned record must report charging true")
+	}
+	if record.CreatedAt.IsZero() || record.UpdatedAt.IsZero() {
+		t.Fatalf("planned record missing timestamps: %+v", record)
+	}
+	if !record.CreatedAt.Equal(created) || !record.UpdatedAt.Equal(updated) {
+		t.Fatalf("timestamps not carried through: got created=%v updated=%v, want created=%v updated=%v",
+			record.CreatedAt, record.UpdatedAt, created, updated)
+	}
+}
+
+func TestStorageJournalAuditReadyToReturnRecordDoesNotCharge(t *testing.T) {
+	created := time.Now().UTC().Add(-24 * time.Hour)
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{storageJournalAuditTestRecord("returned-1", aj.ReadyToReturn, created, created)},
+	}
+	var out, stderr bytes.Buffer
+	writeStorageJournalAudit(&out, &stderr, report, nil, true)
+	output := decodeStorageJournalAuditOutput(t, out.Bytes())
+	if len(output.Records) != 1 || output.Records[0].Charging {
+		t.Fatalf("ready_to_return record must not charge: %+v", output.Records)
+	}
+	if output.ChargingSummary.Count != 0 {
+		t.Fatalf("charging summary must be empty when nothing charges: %+v", output.ChargingSummary)
+	}
+}
+
+func TestStorageJournalAuditTerminalRecordsDoNotCharge(t *testing.T) {
+	created := time.Now().UTC().Add(-24 * time.Hour)
+	for _, state := range []aj.State{aj.Deleted, aj.Cleaned} {
+		t.Run(string(state), func(t *testing.T) {
+			report := handlers.StorageAllocationAudit{
+				Complete: true, VMScanComplete: true,
+				Records: []aj.Record{storageJournalAuditTestRecord("terminal-"+string(state), state, created, created)},
+			}
+			var out, stderr bytes.Buffer
+			writeStorageJournalAudit(&out, &stderr, report, nil, true)
+			output := decodeStorageJournalAuditOutput(t, out.Bytes())
+			if len(output.Records) != 1 || output.Records[0].Charging {
+				t.Fatalf("%s record must not charge: %+v", state, output.Records)
+			}
+		})
+	}
+}
+
+func TestStorageJournalAuditChargingSummaryCountsAndNamesOldest(t *testing.T) {
+	now := time.Now().UTC()
+	oldest := now.Add(-3 * time.Hour)
+	newer := now.Add(-time.Minute)
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{
+			storageJournalAuditTestRecord("newer-planned", aj.Planned, newer, newer),
+			storageJournalAuditTestRecord("oldest-submitted", aj.Submitted, oldest, oldest),
+			storageJournalAuditTestRecord("resting", aj.ReadyToReturn, oldest, oldest),
+		},
+	}
+	var out, stderr bytes.Buffer
+	writeStorageJournalAudit(&out, &stderr, report, nil, true)
+	output := decodeStorageJournalAuditOutput(t, out.Bytes())
+	if output.ChargingSummary.Count != 2 {
+		t.Fatalf("expected 2 charging records, got %d: %+v", output.ChargingSummary.Count, output.ChargingSummary)
+	}
+	if output.ChargingSummary.OldestID != "oldest-submitted" {
+		t.Fatalf("expected oldest-submitted to be named oldest, got %q", output.ChargingSummary.OldestID)
+	}
+	age, err := time.ParseDuration(output.ChargingSummary.OldestAge)
+	if err != nil {
+		t.Fatalf("oldest age %q did not parse as a duration: %v", output.ChargingSummary.OldestAge, err)
+	}
+	// The command computes age against its own call to time.Now(), a few
+	// milliseconds after "now" above, so allow a little slack on both sides
+	// rather than asserting exact equality against a wall clock we do not control.
+	if age < 3*time.Hour-time.Second || age > 3*time.Hour+5*time.Second {
+		t.Fatalf("oldest age %s not within tolerance of 3h", age)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -126,7 +127,7 @@ func TestAllocationAuditPartialStorageNeverCertifiesAbsence(t *testing.T) {
 		t.Fatal("transport response leaked")
 	}
 	// An unrelated independent disk UUID needs no historical absence proof.
-	if err := admitStorageAllocation(context.Background(), deps, j, []string{"pve1"}); err != nil {
+	if _, err := admitStorageAllocation(context.Background(), deps, j, []string{"pve1"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -145,7 +146,7 @@ func TestAllocationAuditDetectsUnindexedFreeVolume(t *testing.T) {
 	if len(report.Conflicts) != 1 || report.Complete {
 		t.Fatal("lost disk journal not exposed")
 	}
-	if err := admitStorageAllocation(context.Background(), deps, j, []string{"pve1"}); err == nil {
+	if _, err := admitStorageAllocation(context.Background(), deps, j, []string{"pve1"}); err == nil {
 		t.Fatal("detected stale history admitted")
 	}
 }
@@ -185,6 +186,49 @@ func TestAllocationAuditPreservesLegacyAttachedCIDMap(t *testing.T) {
 	}
 	if !report.Complete || len(report.Issues) != 0 || len(report.Conflicts) != 0 {
 		t.Fatalf("legacy CID map misinterpreted: %+v", report)
+	}
+}
+
+func TestAdmitStorageAllocationReturnsScanRecordsOrZeroAudit(t *testing.T) {
+	deps, j, _ := auditFixture(t)
+	id, err := aj.NewAllocationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentSum := sha256.Sum256([]byte("intent"))
+	policySum := sha256.Sum256([]byte("policy"))
+	h, err := j.CreateDisk(context.Background(), id, aj.Intent{IntentFingerprint: hex.EncodeToString(intentSum[:]), PolicyFingerprint: hex.EncodeToString(policySum[:]), PlanVersion: 1, Plan: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := j.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, err := admitStorageAllocation(context.Background(), deps, j, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(audit.Records, held) {
+		t.Fatalf("admitted audit records diverged from journal-held records: got %+v, want %+v", audit.Records, held)
+	}
+
+	failDeps, failJournal, failClient := auditFixture(t)
+	orphanID := "12345678-1234-4234-8234-123456789abc"
+	orphanName, err := pve.AllocationVolumeName(9001, "director", orphanID, "qcow2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failClient.nodesRead.content = ns.ListStorageContentResponse{planJSON(t, map[string]any{"volid": "a:9001/" + orphanName})}
+	failedAudit, err := admitStorageAllocation(context.Background(), failDeps, failJournal, []string{"pve1"})
+	if err == nil {
+		t.Fatal("stale unindexed volume was admitted")
+	}
+	if !reflect.DeepEqual(failedAudit, StorageAllocationAudit{}) {
+		t.Fatalf("failed admission returned nonzero audit: %+v", failedAudit)
 	}
 }
 

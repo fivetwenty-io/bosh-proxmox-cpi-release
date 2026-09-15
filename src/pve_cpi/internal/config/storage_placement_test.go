@@ -46,6 +46,9 @@ func TestStoragePlacementStrictDecode(t *testing.T) {
 		"null reserve":               `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"min_free_mb":null}}}`,
 		"fractional reserve":         `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"min_free_mb":0.5}}}`,
 		"null ceiling":               `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"max_utilization_pct":null}}}`,
+		"null anti_affinity":         `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"anti_affinity":null}}}`,
+		"unknown anti_affinity key":  `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"anti_affinity":{"scope":"instance_group","priority":1}}}}`,
+		"null anti_affinity band":    `{"storage_sets":{"e":{"names":["e"],"strategy":{"name":"spread","version":1},"anti_affinity":{"utilization_band_pct":null}}}}`,
 		"wrong bool":                 `{"require_disjoint_storage_sets":"false"}`,
 		"null bool":                  `{"require_disjoint_storage_sets":null}`,
 		"null age":                   `{"storage_status_max_age_seconds":null}`,
@@ -105,6 +108,28 @@ func TestStoragePlacementStaticValidation(t *testing.T) {
 			s := c.StorageSets["e"]
 			n := 101
 			s.MaxUtilizationPct = &n
+			c.StorageSets["e"] = s
+		},
+		"unknown anti_affinity scope": func(c *config.CPIConfig) {
+			s := c.StorageSets["e"]
+			s.AntiAffinity = &config.StorageAntiAffinity{Scope: "rack"}
+			c.StorageSets["e"] = s
+		},
+		"blank anti_affinity scope": func(c *config.CPIConfig) {
+			s := c.StorageSets["e"]
+			s.AntiAffinity = &config.StorageAntiAffinity{Scope: ""}
+			c.StorageSets["e"] = s
+		},
+		"negative anti_affinity band": func(c *config.CPIConfig) {
+			s := c.StorageSets["e"]
+			n := -1
+			s.AntiAffinity = &config.StorageAntiAffinity{Scope: config.StorageAntiAffinityScopeInstanceGroup, UtilizationBandPct: &n}
+			c.StorageSets["e"] = s
+		},
+		"large anti_affinity band": func(c *config.CPIConfig) {
+			s := c.StorageSets["e"]
+			n := 101
+			s.AntiAffinity = &config.StorageAntiAffinity{Scope: config.StorageAntiAffinityScopeInstanceGroup, UtilizationBandPct: &n}
 			c.StorageSets["e"] = s
 		},
 		"unknown strategy": func(c *config.CPIConfig) {
@@ -299,5 +324,75 @@ func TestStoragePlacementERBRoundTrip(t *testing.T) {
 				t.Fatal("ERB dropped explicit zero")
 			}
 		})
+	}
+}
+
+func TestStorageAntiAffinityValidScopesAndBandsDecodeAndValidateCleanly(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		raw   string
+		scope string
+		band  int
+	}{
+		{"instance_group scope", `{"scope":"instance_group"}`, config.StorageAntiAffinityScopeInstanceGroup, config.DefaultStorageAntiAffinityBandPct},
+		{"deployment scope", `{"scope":"deployment"}`, config.StorageAntiAffinityScopeDeployment, config.DefaultStorageAntiAffinityBandPct},
+		{"none scope", `{"scope":"none"}`, config.StorageAntiAffinityScopeNone, config.DefaultStorageAntiAffinityBandPct},
+		{"band zero", `{"scope":"instance_group","utilization_band_pct":0}`, config.StorageAntiAffinityScopeInstanceGroup, 0},
+		{"band one hundred", `{"scope":"instance_group","utilization_band_pct":100}`, config.StorageAntiAffinityScopeInstanceGroup, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := decodeStoragePlacement(t, `{"storage_sets":{"e":{"names":["nfs-e"],"strategy":{"name":"spread","version":1},"anti_affinity":`+tc.raw+`}}}`)
+			if err := c.ValidateStoragePlacement(); err != nil {
+				t.Fatalf("valid anti_affinity rejected: %v", err)
+			}
+			s := c.StorageSets["e"]
+			if got := s.EffectiveAntiAffinityScope(); got != tc.scope {
+				t.Fatalf("scope = %q, want %q", got, tc.scope)
+			}
+			if got := s.EffectiveAntiAffinityBandPct(); got != tc.band {
+				t.Fatalf("band = %d, want %d", got, tc.band)
+			}
+		})
+	}
+}
+
+func TestStoragePlacementCloneAntiAffinityDoesNotAlias(t *testing.T) {
+	t.Parallel()
+	c := decodeStoragePlacement(t, `{"storage_sets":{"e":`+placementSetJSON+`}}`)
+	s := c.StorageSets["e"]
+	s.AntiAffinity = &config.StorageAntiAffinity{Scope: config.StorageAntiAffinityScopeDeployment, UtilizationBandPct: intPtr(15)}
+	c.StorageSets["e"] = s
+
+	cloned := c.CloneStoragePlacement()
+	clonedSet := cloned.StorageSets["e"]
+	if clonedSet.AntiAffinity == c.StorageSets["e"].AntiAffinity {
+		t.Fatal("cloned anti_affinity aliases the original pointer")
+	}
+	if clonedSet.AntiAffinity.UtilizationBandPct == c.StorageSets["e"].AntiAffinity.UtilizationBandPct {
+		t.Fatal("cloned band aliases the original pointer")
+	}
+	*clonedSet.AntiAffinity.UtilizationBandPct = 90
+	clonedSet.AntiAffinity.Scope = config.StorageAntiAffinityScopeNone
+	if *c.StorageSets["e"].AntiAffinity.UtilizationBandPct != 15 || c.StorageSets["e"].AntiAffinity.Scope != config.StorageAntiAffinityScopeDeployment {
+		t.Fatal("mutating the clone leaked into the original set")
+	}
+}
+
+func TestStorageSetEffectiveAntiAffinityDefaultsNeverMaterializePointer(t *testing.T) {
+	t.Parallel()
+	c := decodeStoragePlacement(t, `{"storage_sets":{"e":`+placementSetJSON+`}}`)
+	s := c.StorageSets["e"]
+	if s.AntiAffinity != nil {
+		t.Fatal("a set that never declared anti_affinity must decode with a nil pointer")
+	}
+	if got := s.EffectiveAntiAffinityScope(); got != config.DefaultStorageAntiAffinityScope {
+		t.Fatalf("scope = %q, want default %q", got, config.DefaultStorageAntiAffinityScope)
+	}
+	if got := s.EffectiveAntiAffinityBandPct(); got != config.DefaultStorageAntiAffinityBandPct {
+		t.Fatalf("band = %d, want default %d", got, config.DefaultStorageAntiAffinityBandPct)
+	}
+	if s.AntiAffinity != nil {
+		t.Fatal("reading the effective defaults must never materialize the pointer")
 	}
 }

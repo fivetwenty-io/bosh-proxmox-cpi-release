@@ -323,22 +323,69 @@ func (j *Journal) newRecord(id, kind, agentID string, intent Intent) (Record, er
 	return r, validateRecord(r)
 }
 
+// VMPlanFunc plans an allocation while the journal holds the index lock. It
+// receives the identifier the new record will carry and every record the
+// journal holds, read under that lock, so an allocation a sibling create
+// started moments earlier is already visible. It returns the Intent the new
+// record freezes, and that Intent is validated exactly like a caller-supplied
+// one, so a fingerprint-only Intent fails rather than writing a bad record.
+//
+// The contract is strict, because index.lock is cluster visible and every
+// create in the namespace queues behind the callback.
+//
+//   - It runs under index.lock.
+//   - It may call List and Inspect, neither of which takes a lock.
+//   - It must not call anything that takes the index lock in either mode,
+//     which includes AcquireVM, AcquireVMPlanned, Acquire, and CreateDisk.
+//     The journal's locks are not reentrant, so such a call deadlocks the
+//     caller against itself.
+//   - It must not perform network work. Discovery, node facts, and template
+//     lookups belong before the acquisition.
+//
+// An error returned by the callback aborts the acquisition, and neither an
+// index entry nor a record file is written.
+type VMPlanFunc func(id string, siblings []Record) (Intent, error)
+
 // AcquireVM converges matching concurrent callers. Existing returns Resumed=true:
 // caller must reconcile actual ownership/existence before any mutation/CID return.
 // Policy changes alone never replace an existing allocation or its frozen plan.
 func (j *Journal) AcquireVM(ctx context.Context, agentID string, intent Intent) (*Handle, error) {
-	if !nonblank(agentID) {
-		return nil, fmt.Errorf("journal: agent ID is required")
-	}
 	if !validFingerprint(intent.IntentFingerprint) {
 		return nil, fmt.Errorf("journal: invalid caller intent fingerprint")
+	}
+	return j.acquireVM(ctx, agentID, intent, nil)
+}
+
+// AcquireVMPlanned acquires a generation whose Intent the callback produces
+// under the index lock, so ranking sees the claims of in-flight siblings. It
+// converges concurrent callers exactly as AcquireVM does, and an existing
+// non-closed generation returns Resumed=true without the callback running at
+// all, so a retry pass never re-plans.
+//
+// Unlike AcquireVM it cannot validate a caller intent fingerprint up front,
+// because there is no Intent until the callback returns one. The Intent is
+// validated when the record is built. See VMPlanFunc for what the callback may
+// and may not do while the lock is held.
+func (j *Journal) AcquireVMPlanned(ctx context.Context, agentID string, plan VMPlanFunc) (*Handle, error) {
+	if plan == nil {
+		return nil, fmt.Errorf("journal: planning callback is required")
+	}
+	return j.acquireVM(ctx, agentID, Intent{}, plan)
+}
+
+// acquireVM owns the retry loop both entry points share: it takes the index
+// lock, runs one attempt, and pauses before retrying a generation another
+// process holds. A nil plan keeps the caller-supplied intent.
+func (j *Journal) acquireVM(ctx context.Context, agentID string, intent Intent, plan VMPlanFunc) (*Handle, error) {
+	if !nonblank(agentID) {
+		return nil, fmt.Errorf("journal: agent ID is required")
 	}
 	for {
 		idxLock, err := waitLock(ctx, j.root, "index.lock")
 		if err != nil {
 			return nil, err
 		}
-		h, busy, err := j.acquireVMUnderIndex(agentID, intent)
+		h, busy, err := j.acquireVMUnderIndex(agentID, intent, plan)
 		releaseErr := idxLock.close()
 		if err = errors.Join(err, releaseErr); err != nil {
 			if h != nil {
@@ -354,7 +401,7 @@ func (j *Journal) AcquireVM(ctx context.Context, agentID string, intent Intent) 
 		}
 	}
 }
-func (j *Journal) acquireVMUnderIndex(agentID string, intent Intent) (h *Handle, busy bool, retErr error) {
+func (j *Journal) acquireVMUnderIndex(agentID string, intent Intent, plan VMPlanFunc) (h *Handle, busy bool, retErr error) {
 	if err := j.checkAuthority(); err != nil {
 		return nil, false, err
 	}
@@ -400,6 +447,20 @@ func (j *Journal) acquireVMUnderIndex(agentID string, intent Intent) (h *Handle,
 		return nil, false, ErrConflict
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, false, err
+	}
+	// Plan here and nowhere earlier. newRecord consumes the Intent, the
+	// existing-generation branch above has already returned every resume, and
+	// a callback placed before the retry loop would re-plan on every pass.
+	if plan != nil {
+		siblings, listErr := j.List()
+		if listErr != nil {
+			return nil, false, listErr
+		}
+		planned, planErr := plan(id, siblings)
+		if planErr != nil {
+			return nil, false, planErr
+		}
+		intent = planned
 	}
 	r, err := j.newRecord(id, "vm", agentID, intent)
 	if err != nil {

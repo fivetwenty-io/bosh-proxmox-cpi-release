@@ -36,7 +36,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err := storageCleanupSettled(ctx, record); err != nil {
 		return proof, err
 	}
-	clusterNodes, err := managedVMClusterNodes(ctx, deps)
+	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return proof, err
 	}
@@ -208,7 +208,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	if deps.Config == nil || deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
 		return false, nil
 	}
-	clusterNodes, err := managedVMClusterNodes(ctx, deps)
+	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return true, err
 	}
@@ -352,7 +352,7 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	if retention.VMID <= 0 || len(retention.RetainedArtifacts) == 0 {
 		return proof, fmt.Errorf("retained VM disposition evidence missing")
 	}
-	clusterNodes, err := managedVMClusterNodes(ctx, deps)
+	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return proof, err
 	}
@@ -788,7 +788,7 @@ func legacySweepJournalVMIDs(ctx context.Context, deps Deps) (protected map[int]
 	if deps.Config == nil || deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
 		return protected, nil
 	}
-	clusterNodes, err := managedVMClusterNodes(ctx, deps)
+	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return nil, err
 	}
