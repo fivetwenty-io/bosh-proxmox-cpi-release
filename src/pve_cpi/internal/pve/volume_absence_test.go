@@ -303,6 +303,11 @@ func TestProveVolumeAbsent_StorageClassification(t *testing.T) {
 		{"plain btrfs with an empty listing", classifierFor(pve.StorageTypeBTRFS, false), nil, false, true},
 		{"plain btrfs with other volumes", classifierFor(pve.StorageTypeBTRFS, false), other, true, false},
 		{"an unrecognized type with an empty listing", classifierFor("some-future-plugin", false), nil, false, true},
+		// The local backend's cache-miss fallback answers ok with a
+		// StorageInfo carrying only the name, so an empty type is a shape the
+		// production classifier really produces.
+		{"an empty type with an empty listing", classifierFor("", false), nil, false, true},
+		{"an empty type with other volumes", classifierFor("", false), other, true, false},
 		{
 			"a classifier that cannot identify the storage",
 			func(context.Context) (pve.StorageInfo, bool) { return pve.StorageInfo{}, false },
@@ -348,6 +353,26 @@ func TestProveVolumeAbsent_PlainDirEmptyListing_NamesTheFix(t *testing.T) {
 	}
 }
 
+// TestProveVolumeAbsent_EmptyStorageTypeReadsAsProse pins how the unproven
+// message names a storage the index never classified. The local backend builds
+// one of those on a cache miss, and reading "is a  storage" tells an operator
+// nothing about what to do next.
+func TestProveVolumeAbsent_EmptyStorageTypeReadsAsProse(t *testing.T) {
+	t.Parallel()
+	probe := noFormatProbe(listingOf(t))
+	_, err := pve.ProveVolumeAbsent(context.Background(), probe.client(), "pve-01",
+		absenceStorage, absenceVolid, classifierFor("", false))
+	if err == nil {
+		t.Fatal("an empty listing on an unclassified storage proves nothing")
+	}
+	if !strings.Contains(err.Error(), "an unclassified storage") {
+		t.Errorf("error %q must name the storage as unclassified", err.Error())
+	}
+	if strings.Contains(err.Error(), "is a  storage") {
+		t.Errorf("error %q still renders the empty type verbatim", err.Error())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Input guards
 // ---------------------------------------------------------------------------
@@ -379,5 +404,113 @@ func TestProveVolumeAbsent_RejectsMissingInputs(t *testing.T) {
 				t.Fatal("a rejected call must never read as absent")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Missing services, and what the unproven error has to say
+// ---------------------------------------------------------------------------
+
+// TestProveVolumeAbsent_NilNodesService_IsUnproven pins the fail-closed answer
+// for a client that can run the point probe but has no nodes service to read a
+// listing with. Before the guard this reached ListStorageContent on a nil
+// interface and panicked partway through a delete path.
+func TestProveVolumeAbsent_NilNodesService_IsUnproven(t *testing.T) {
+	t.Parallel()
+	client := &absenceVisibleClient{
+		absenceClient: &absenceClient{
+			storageSvc: &absenceStorageService{
+				existsFn: func(context.Context, string, string, string) (bool, error) {
+					return false, makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+				},
+			},
+		},
+	}
+	absent, err := pve.ProveVolumeAbsent(
+		context.Background(), client, "pve-01", absenceStorage, absenceVolid, nfsClassifier())
+	if err == nil {
+		t.Fatal("a client that cannot read a listing cannot prove an absence")
+	}
+	if absent {
+		t.Fatal("an unproven outcome must never read as absent")
+	}
+	if !strings.Contains(err.Error(), "nodes service") {
+		t.Errorf("the error must name the surface that is missing, got %q", err.Error())
+	}
+}
+
+// TestProveVolumeAbsent_NilNodesService_PointProbeStillAnswers keeps the guard
+// from costing anything the listing was never needed for. A 404 settles the
+// question on its own, so a client with no nodes service still gets an answer.
+func TestProveVolumeAbsent_NilNodesService_PointProbeStillAnswers(t *testing.T) {
+	t.Parallel()
+	client := &absenceClient{
+		storageSvc: &absenceStorageService{
+			existsFn: func(context.Context, string, string, string) (bool, error) {
+				return false, makeAPIErr(404, "not found")
+			},
+		},
+	}
+	absent, err := pve.ProveVolumeAbsent(
+		context.Background(), client, "pve-01", absenceStorage, absenceVolid, nfsClassifier())
+	if err != nil {
+		t.Fatalf("a 404 settles the question without a listing, got %v", err)
+	}
+	if !absent {
+		t.Fatal("a 404 from the point probe is an absence")
+	}
+}
+
+// TestProveVolumeAbsent_NilStorageService_IsUnproven pins the other surface.
+// Nothing can be probed at all, so the call fails closed before it touches the
+// nil interface.
+func TestProveVolumeAbsent_NilStorageService_IsUnproven(t *testing.T) {
+	t.Parallel()
+	client := &absenceClient{nodesSvc: &absenceNodesService{
+		listFn: func(context.Context, string, string, *nodes.ListStorageContentParams) (
+			*nodes.ListStorageContentResponse, error) {
+			return listingOf(t), nil
+		},
+	}}
+	absent, err := pve.ProveVolumeAbsent(
+		context.Background(), client, "pve-01", absenceStorage, absenceVolid, nfsClassifier())
+	if err == nil {
+		t.Fatal("a client with no storage service cannot probe anything")
+	}
+	if absent {
+		t.Fatal("an unproven outcome must never read as absent")
+	}
+	if !strings.Contains(err.Error(), "storage service") {
+		t.Errorf("the error must name the surface that is missing, got %q", err.Error())
+	}
+}
+
+// TestProveVolumeAbsent_UnprovenErrorCarriesBothReasons pins what an operator
+// reads when neither observation landed. The observation error stays the
+// wrapped one, so the managed paths that match on its category still match,
+// and the point probe's own reason rides along, because otherwise the warning
+// says a listing failed and never says what the probe saw.
+func TestProveVolumeAbsent_UnprovenErrorCarriesBothReasons(t *testing.T) {
+	t.Parallel()
+	probe := absenceProbe{
+		existsFn: func(context.Context, string, string, string) (bool, error) {
+			return false, makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+		},
+		listFn: func(context.Context, string, string, *nodes.ListStorageContentParams) (
+			*nodes.ListStorageContentResponse, error) {
+			return nil, makeAPIErr(596, "connection refused")
+		},
+		visible: true,
+	}
+	_, err := pve.ProveVolumeAbsent(
+		context.Background(), probe.client(), "pve-01", absenceStorage, absenceVolid, nfsClassifier())
+	if err == nil {
+		t.Fatal("expected an unproven outcome")
+	}
+	if !strings.Contains(err.Error(), "point probe") {
+		t.Errorf("the error must name the point probe's reason, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "no format") {
+		t.Errorf("the point probe's reason is the reply PVE actually sent, got %q", err.Error())
 	}
 }

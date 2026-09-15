@@ -33,6 +33,14 @@ func ProveVolumeAbsent(
 	if storage == "" || volume == "" {
 		return false, fmt.Errorf("volume absence proof requires a storage name and a volume")
 	}
+	// The point probe reads the storage service, so a client without one
+	// cannot start. That is a wiring fault rather than a cluster condition,
+	// and on a delete path it has to fail closed rather than panic on the nil
+	// interface. The nodes service is checked where the listing needs it, so a
+	// caller whose point probe answers is not held to a surface it never uses.
+	if client.Storage() == nil {
+		return false, fmt.Errorf("volume absence proof requires the storage service")
+	}
 	exists, err := ExistsTolerant(ctx, client, node, storage, volume)
 	if err == nil {
 		return !exists, nil
@@ -43,13 +51,20 @@ func ProveVolumeAbsent(
 	// work, whatever stopped it, so the reply cannot be read either way. The
 	// info handler behind it never activates the storage, so it cannot tell a
 	// missing file from an export that went away. Only a content listing can.
+	if client.Nodes() == nil {
+		return false, fmt.Errorf(
+			"volume absence proof needs the nodes service to read a content listing (point probe: %s)", err.Error())
+	}
 	found, listed, observeErr := ObserveStorageVolumeContent(ctx, client, node, volume)
 	if observeErr != nil {
-		// The observation error travels on its own rather than joined to the
-		// probe error. Observation failures are scrubbed to a bounded
-		// diagnostic category on purpose, and joining the raw API body would
-		// put PVE response text back into whatever log the caller writes.
-		return false, observeErr
+		// Both observations failed, so the caller's warning is the only place
+		// an operator will learn why. The observation error stays the wrapped
+		// one, so errors.Is still matches the bounded diagnostic category the
+		// managed paths test for, and the point probe's own reason rides
+		// along as text rather than as a second wrapped error, so nothing
+		// downstream starts classifying this outcome from the probe's HTTP
+		// code. Callers log it through log.Err, which scrubs URL credentials.
+		return false, fmt.Errorf("%w (point probe: %s)", observeErr, err.Error())
 	}
 	if found {
 		return false, nil
@@ -86,11 +101,26 @@ func listingProvesAbsence(ctx context.Context, storage string, listed int, class
 		return nil
 	}
 	return fmt.Errorf(
-		"storage %s is a %s storage with no is_mountpoint and its content listing came back empty, "+
+		"storage %s is %s with no is_mountpoint and its content listing came back empty, "+
 			"which a dropped mount produces as readily as a genuinely empty storage; set is_mountpoint "+
 			"on that storage so PVE reports it offline instead of listing nothing",
-		storage, info.Type,
+		storage, describeStorageType(info.Type),
 	)
+}
+
+// describeStorageType names the storage in the unproven message. A classifier
+// can answer with a storage whose type is empty: the local backend's cache-miss
+// fallback fabricates a StorageInfo carrying only the name, and it reports that
+// as a successful classification. Rendering the type verbatim there produced
+// "is a  storage", so an empty type is named for what it is. The conservative
+// rule is unchanged either way, because an unclassified storage takes the same
+// path as an unrecognized one: only other volumes in the listing prove the tree
+// is really there.
+func describeStorageType(storageType string) string {
+	if strings.TrimSpace(storageType) == "" {
+		return "an unclassified storage"
+	}
+	return "a " + storageType + " storage"
 }
 
 // listingFailsWhenBackingIsGone names the storage types whose own listing path
