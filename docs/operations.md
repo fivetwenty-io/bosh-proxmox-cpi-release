@@ -607,6 +607,29 @@ When two or more BOSH directors share one PVE cluster — a management director 
 
 A template tagged `bosh-stemcell-node-<node>` or `bosh-stemcell-storage-<storage-id>` is a replica. Replicas hold no reference of their own. From this release, `delete_stemcell` sweeps every replica of the stemcell whose last reference just dropped, whichever director built it. Earlier releases preserved a replica whose provenance named another director, and left it behind. A replica that still backs a linked clone makes `delete_stemcell` fail with the replica's VMID and node, and the retry resumes once those VMs are gone.
 
+### Which stemcell is a VM running?
+
+Every VM the CPI creates carries a `stemcell--<name>-<version>` tag naming the stemcell it booted from, and the same identity in its Notes under the `bosh_stemcell` key. A Director never sends the stemcell in its `set_vm_metadata` payload, so before this the answer lived only inside the guest; now PVE can answer it, and so can a create-env Director, which receives no `set_vm_metadata` call at all.
+
+The tag uses the CPI's usual tag alphabet, so the version's dot becomes a dash, and the stemcell `bosh-openstack-kvm-ubuntu-noble-1.585` is tagged `stemcell--bosh-openstack-kvm-ubuntu-noble-1-585`. The Notes record keeps the exact version, along with the full stemcell CID, its kind, and its content sha8.
+
+```bash
+# Every VM still on a given stemcell
+pvesh get /cluster/resources --type vm \
+  | jq -r '.[] | select(.tags != null and (.tags | contains("stemcell--bosh-openstack-kvm-ubuntu-noble-1-585"))) | "\(.vmid) \(.name)"'
+
+# Group the whole cluster by stemcell, to see what a bump has left behind
+pvesh get /cluster/resources --type vm \
+  | jq -r '.[] | select(.tags != null) | .tags | gsub(","; ";") | split(";")[] | select(startswith("stemcell--"))' \
+  | sort | uniq -c
+
+# The exact version, CID, kind, and sha8 for one VM
+pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json \
+  | jq -r '.description' | grep -o '<!--BOSH:.*-->' | sed 's/<!--BOSH://; s/-->//' | jq '.bosh_stemcell'
+```
+
+Both are written once, when the VM is created, and neither is rebuilt afterwards. A VM whose tag names an old stemcell has genuinely not been recreated since that stemcell was current, which is exactly the question a stemcell bump raises. VMs created before this release carry no tag and no record; recreate them and they pick both up.
+
 ### `bosh clean-up` is safe across directors
 
 Each cache template records the set of director UUIDs currently depending on it. Running `bosh clean-up` (or `bosh clean-up --all`) on one director only removes *that* director's own reference — it never touches another director's reference to the same template, even though both directors may be looking at the same PVE cluster. The cache template, and for a CPI-uploaded (`:heavy:`) stemcell its qcow2 file, survive until the last director referencing them releases its reference. An operator-managed (`:light:`) qcow2 is never removed by the CPI regardless of reference count.

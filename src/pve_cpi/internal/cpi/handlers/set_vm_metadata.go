@@ -227,6 +227,14 @@ func setVMMetadataRMW(
 	if strings.Contains(description, "<!--BOSH:") {
 		return cpierrors.Cloud("set_vm_metadata: metadata contains reserved description sentinel")
 	}
+
+	// This handler regenerates the human-readable text wholesale from the
+	// Director's metadata map, and that map never names the stemcell. Carry
+	// the create-time record forward from the sentinel so the readable notes
+	// keep answering "which stemcell is this guest on" after the first
+	// metadata sync overwrites them.
+	description = withStemcellNote(description, existingDesc)
+
 	if _, raw := pve.ParseSentinel(existingDesc); len(raw) > 0 {
 		merged, renderErr := pve.RenderSentinel(strings.TrimSpace(description), raw)
 		if renderErr != nil {
