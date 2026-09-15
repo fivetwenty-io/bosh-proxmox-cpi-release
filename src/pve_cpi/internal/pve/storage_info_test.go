@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -561,5 +562,83 @@ func TestClusterStorageAsLister_PropagatesError(t *testing.T) {
 	}
 	if resp != nil {
 		t.Errorf("ListStorage response = %v, want nil on error", resp)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// is_mountpoint decoding
+// ---------------------------------------------------------------------------
+
+// TestParseStorageEntry_IsMountpointWireShapes walks every value shape a live
+// cluster sends for is_mountpoint. PVE declares the field as a bool-or-path, so
+// the flag arrives as 1, "1", "yes", or the mount path itself, and only whether
+// it is set survives the decode. The proof in ProveVolumeAbsent reads this flag
+// to decide whether an empty content listing means anything, so a value read
+// the wrong way would let a dropped mount pass as an absent volume.
+func TestParseStorageEntry_IsMountpointWireShapes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		value string
+		set   bool
+	}{
+		{"0", false},
+		{`"0"`, false},
+		{`"no"`, false},
+		{`"false"`, false},
+		{"false", false},
+		{`""`, false},
+		{"null", false},
+		{"1", true},
+		{`"1"`, true},
+		{`"yes"`, true},
+		{"true", true},
+		{`"/mnt/pve/backing"`, true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Parallel()
+			raw := json.RawMessage(fmt.Sprintf(`{"storage":"dir-a","type":"dir","is_mountpoint":%s}`, tc.value))
+			info, err := ParseStorageEntry(raw)
+			if err != nil {
+				t.Fatalf("ParseStorageEntry(%s): %v", tc.value, err)
+			}
+			if info.IsMountpoint != tc.set {
+				t.Fatalf("IsMountpoint = %v for %s, want %v", info.IsMountpoint, tc.value, tc.set)
+			}
+		})
+	}
+}
+
+// TestParseStorageEntry_IsMountpointOmitted pins the default for the storages
+// that do not carry the flag at all, which is most of them.
+func TestParseStorageEntry_IsMountpointOmitted(t *testing.T) {
+	t.Parallel()
+	info, err := ParseStorageEntry(json.RawMessage(`{"storage":"dir-a","type":"dir"}`))
+	if err != nil {
+		t.Fatalf("ParseStorageEntry: %v", err)
+	}
+	if info.IsMountpoint {
+		t.Fatal("a storage that does not carry is_mountpoint must not read as carrying it")
+	}
+}
+
+// TestParseStorageEntry_IsMountpointUnexpectedValue pins where this field parts
+// company with disable. An unexpected value does not fail the entry, because
+// the flag only decides how much a content listing proves, and failing the
+// parse would take the whole storage classification down with it. An
+// unrecognized value counts as set, which is the conservative reading.
+func TestParseStorageEntry_IsMountpointUnexpectedValue(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"2", "-1", `"maybe"`, `" 1"`} {
+		t.Run(value, func(t *testing.T) {
+			t.Parallel()
+			raw := json.RawMessage(fmt.Sprintf(`{"storage":"dir-a","type":"dir","is_mountpoint":%s}`, value))
+			info, err := ParseStorageEntry(raw)
+			if err != nil {
+				t.Fatalf("an unexpected is_mountpoint value must not fail the parse; got %v", err)
+			}
+			if !info.IsMountpoint {
+				t.Fatalf("an unrecognized value %s should count as set", value)
+			}
+		})
 	}
 }

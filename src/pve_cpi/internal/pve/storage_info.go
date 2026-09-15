@@ -37,6 +37,15 @@ type StorageInfo struct {
 	Server   string
 	Export   string
 	Content  string
+	// IsMountpoint reports whether the storage carries PVE's is_mountpoint
+	// flag, which tells PVE to refuse to activate the storage when its path is
+	// not a mount point. Only the absence proof in ProveVolumeAbsent reads it,
+	// because a dir-style storage that carries the flag fails its content
+	// listing once the mount goes away, while one without it lists an empty
+	// array that a caller cannot tell from a genuinely empty storage. The
+	// flag's value may be a mount path rather than a boolean, and nothing here
+	// needs the path, so only whether it is set survives the decode.
+	IsMountpoint bool
 }
 
 // IsShared classifies the storage as "shared" (cluster-visible) or "local"
@@ -570,6 +579,9 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 		Export  string             `json:"export,omitempty"`
 		Share   string             `json:"share,omitempty"`
 		Content string             `json:"content,omitempty"`
+		// PVE declares is_mountpoint as a bool-or-path, so it is decoded raw
+		// and normalized by parseIsMountpoint rather than through PVEBool.
+		IsMountpoint json.RawMessage `json:"is_mountpoint,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return StorageInfo{}, err
@@ -579,11 +591,12 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 	}
 
 	info := StorageInfo{
-		Name:    v.Storage,
-		Type:    v.Type,
-		Path:    v.Path,
-		Server:  v.Server,
-		Content: v.Content,
+		Name:         v.Storage,
+		Type:         v.Type,
+		Path:         v.Path,
+		Server:       v.Server,
+		Content:      v.Content,
+		IsMountpoint: parseIsMountpoint(v.IsMountpoint),
 	}
 	if len(v.Disable) > 0 {
 		switch strings.TrimSpace(string(v.Disable)) {
@@ -616,6 +629,27 @@ func parseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// parseIsMountpoint normalizes PVE's is_mountpoint value into a bool. The field
+// is declared as a bool-or-path, so a live cluster sends 1, "1", "yes", or the
+// mount path itself, and the SDK types it as a string pointer. An absent value
+// and the negative spellings 0, no, and false mean the flag is not set, and
+// every other value means it is, because naming a mount path is how an operator
+// turns the flag on.
+//
+// Unlike disable, an unexpected value is not a parse error here. The flag only
+// decides how much a content listing proves, so a value we do not recognize
+// counts as set rather than failing the whole storage entry and taking the
+// backend classification down with it.
+func parseIsMountpoint(raw json.RawMessage) bool {
+	value := strings.TrimSpace(string(raw))
+	value = strings.TrimSpace(strings.Trim(value, `"`))
+	switch strings.ToLower(value) {
+	case "", "null", "0", "no", "false":
+		return false
+	}
+	return true
 }
 
 // ParseStorageEntry decodes a single /storage response item into a
