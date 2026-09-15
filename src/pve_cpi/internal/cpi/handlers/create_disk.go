@@ -709,17 +709,32 @@ func attemptCreateVolume(
 				// re-runs see a clean slate.
 				rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 				defer rbCancel()
-				exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, node, storage, candidateCanonical)
+				// ProveVolumeAbsent rather than the bare Exists this used to
+				// call. On dir, NFS, and CIFS storage PVE answers the volume
+				// GET for a file it cannot stat with an HTTP 500 naming
+				// volume_size_info, so a probe that only reads that reply
+				// skipped the sweep on every one of those storages and left
+				// the partially committed volume behind. The listing settles
+				// it. An absence we still cannot prove skips the sweep, which
+				// is what a probe error did before.
+				absent, exErr := pve.ProveVolumeAbsent(rollbackCtx, deps.PVE, node, storage, candidateCanonical,
+					handlerStorageClassifier(deps, storage))
 				if exErr != nil {
-					// A failed probe means the sweep is silently skipped;
-					// name the volid so operators can distinguish
-					// "nothing to clean" from "could not look".
+					// A failed probe means the sweep is silently skipped, so
+					// the warning carries what the anchor proof's warning
+					// carries: the volume, where it was looked for, and the
+					// scrubbed reason. It names the volid rather than a disk
+					// CID because no CID exists yet; the create that would
+					// have minted one is the call that just failed. That
+					// keeps operators able to tell "nothing to clean" from
+					// "could not look".
 					deps.Log(rollbackCtx).Warn("create_disk: orphan volume existence probe failed; sweep skipped",
 						log.String("volid", candidateCanonical),
+						log.String("probe_scope", "node "+node),
 						log.Err(exErr),
 					)
 				}
-				if exErr == nil && exists {
+				if exErr == nil && !absent {
 					var upid string
 					delErr := pve.RetryOnTransientOrLock(rollbackCtx, deps.Log(rollbackCtx), "create_disk.orphan_sweep", cleanupSweepMaxAttempts, func() error {
 						var innerErr error

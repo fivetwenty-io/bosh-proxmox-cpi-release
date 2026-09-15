@@ -150,27 +150,89 @@ func anchorMissingRefusal(ctx context.Context, deps Deps, method, diskCID string
 }
 
 // proveAnchorVolumeGone reports whether the volume behind a promised anchor is
-// provably not on storage. The anchor refusal reads "no holder" as a parker
-// deleted out of band, which is only the right reading while the volume is
-// still there. An absence we cannot prove is not an absence, so the caller
-// keeps its refusal, and the warning says so: the operator is looking at a
-// refusal standing on an unproven absence, not at an established fact.
+// provably not on storage, anywhere the volume could be. The anchor refusal
+// reads "no holder" as a parker deleted out of band, which is only the right
+// reading while the volume is still there. An absence we cannot prove is not
+// an absence, so the caller keeps its refusal, and the warning says so: the
+// operator is looking at a refusal standing on an unproven absence, not at an
+// established fact.
+//
+// The attach paths must not pass their own node in. By the time
+// guardAndUnparkBeforeAttach runs, the node has been retargeted to the VM the
+// disk is being attached to, and create_vm passes the node its placement
+// chose. Probing a node-local storage from a node the disk was never on reads
+// as a clean absence on lvmthin and zfspool, whose "Failed to find logical
+// volume" and "dataset does not exist" replies fold into one, so an operator
+// would be told the data is gone about a disk sitting healthy on its own node.
+// The disk's location is resolved from its own volid instead.
+func proveAnchorVolumeGone(ctx context.Context, deps Deps, method, diskCID, volid string) bool {
+	gone, err := anchorVolumeAbsentAnywhere(ctx, deps, volid)
+	return anchorAbsenceProven(ctx, deps, method, diskCID, "every node that could hold the volume", gone, err)
+}
+
+// proveAnchorVolumeGoneAt is the same question asked of one node, for a caller
+// that already resolved the disk's own node through its backend. delete_disk
+// is the only one: its node comes from NodeForExisting on the volume's
+// storage, which is the node the volume is actually on.
+func proveAnchorVolumeGoneAt(ctx context.Context, deps Deps, method, diskCID, volid, node string) bool {
+	gone, err := volumeAbsentFromStorage(ctx, deps, node, volid)
+	return anchorAbsenceProven(ctx, deps, method, diskCID, "node "+node, gone, err)
+}
+
+// anchorAbsenceProven reports the probe's verdict and, when the probe did not
+// reach one, writes the warning that says the refusal about to be returned is
+// standing on an unproven absence.
 //
 // log.Err delegates to ErrScrubbed, so the probe error reaches the sink with
 // URL credentials masked, which is the house rule for logging an error this
 // package did not construct.
-func proveAnchorVolumeGone(ctx context.Context, deps Deps, method, diskCID, volid, node string) bool {
-	gone, err := volumeAbsentFromStorage(ctx, deps, node, volid)
+func anchorAbsenceProven(ctx context.Context, deps Deps, method, diskCID, scope string, gone bool, err error) bool {
 	if err != nil {
 		deps.Log(ctx).Warn("parked anchor missing and the volume's absence could not be proven; the refusal stands",
 			log.String("method", method),
 			log.String("disk_cid", diskCID),
-			log.String("node", node),
+			log.String("probe_scope", scope),
 			log.Err(err),
 		)
 		return false
 	}
 	return gone
+}
+
+// anchorVolumeAbsentAnywhere reports whether the volume is provably not on
+// storage, asking the question of wherever the volume's own storage can put
+// it rather than of a node the caller happens to hold.
+//
+// A shared storage is visible from any node, so one probe against the
+// backend's node settles it. A node-local storage needs the cluster sweep, and
+// NodeForExisting already is that sweep: it runs the same absence proof
+// against every candidate node, returns the node on the first volume it
+// finds, answers DiskNotFound only when every node proved the volume absent,
+// and turns any node it could not ask into a retriable error rather than a
+// miss. Reusing it keeps one sweep in the codebase instead of two.
+func anchorVolumeAbsentAnywhere(ctx context.Context, deps Deps, volid string) (bool, error) {
+	storage, _, err := pve.ParseDiskCID(volid)
+	if err != nil {
+		return false, err
+	}
+	backend, resolveErr := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if resolveErr != nil {
+		return false, resolveErr
+	}
+	node, nodeErr := backend.NodeForExisting(ctx, volid)
+	if nodeErr != nil {
+		if backend.Kind() == pve.BackendLocal && pve.IsNotFound(nodeErr) {
+			// Every candidate node answered a clean absence, which is the
+			// complete sweep this conclusion requires.
+			return false, nil
+		}
+		return false, nodeErr
+	}
+	if backend.Kind() == pve.BackendLocal {
+		// A node came back, so a node holds the volume.
+		return false, nil
+	}
+	return volumeAbsentFromStorage(ctx, deps, node, volid)
 }
 
 // anchorVolumeGoneRefusal returns the refusal for a promised anchor whose

@@ -1313,19 +1313,31 @@ func sweepEphemeralVolumeAfterCreateFailure(
 	rollbackCtx, rbCancel := detachedContext(ctx, rollbackCleanupTimeout)
 	defer rbCancel()
 	canonical := fmt.Sprintf("%s:%s", shape.ephemeralStorage, volName)
-	exists, exErr := deps.PVE.Storage().Exists(rollbackCtx, shape.node, shape.ephemeralStorage, canonical)
+	// ProveVolumeAbsent rather than the bare Exists this used to call. On
+	// dir, NFS, and CIFS storage PVE answers the volume GET for a file it
+	// cannot stat with an HTTP 500 naming volume_size_info, so a probe that
+	// only reads that reply skipped the sweep on every one of those storages
+	// and left the partially committed volume behind. The listing settles it.
+	// An absence we still cannot prove skips the sweep, which is what a probe
+	// error did before.
+	absent, exErr := pve.ProveVolumeAbsent(rollbackCtx, deps.PVE, shape.node, shape.ephemeralStorage, canonical,
+		handlerStorageClassifier(deps, shape.ephemeralStorage))
 	if exErr != nil {
-		// A failed probe means the sweep is silently skipped; name the volid
-		// so operators can distinguish "nothing to clean" from "could not
-		// look".
+		// A failed probe means the sweep is silently skipped, so the warning
+		// carries what the anchor proof's warning carries: the volume, where
+		// it was looked for, and the scrubbed reason. An ephemeral volume has
+		// no disk CID at all, so the VM it belongs to and the volid are what
+		// identify it. That keeps operators able to tell "nothing to clean"
+		// from "could not look".
 		logger.Warn("create_vm: ephemeral volume existence probe failed; sweep skipped",
 			log.Int(metadataKeyVMID, vmid),
 			log.String("volid", canonical),
+			log.String("probe_scope", "node "+shape.node),
 			log.Err(exErr),
 		)
 		return
 	}
-	if !exists {
+	if absent {
 		return
 	}
 	var upid string

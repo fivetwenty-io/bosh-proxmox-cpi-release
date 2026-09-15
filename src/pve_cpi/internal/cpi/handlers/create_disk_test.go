@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -1852,5 +1853,135 @@ func TestHandleCreateDisk_FreeStrategy_NeverTouchesParker(t *testing.T) {
 	}
 	if cid, ok := result.(string); !ok || cid == "" {
 		t.Fatalf("expected non-empty string disk_cid, got %#v", result)
+	}
+}
+
+// TestHandleCreateDisk_OrphanCleanupOnFileStorage_NoFormatStillSweeps is the
+// file-storage half of the orphan sweep. PVE answers the volume GET for a file
+// it cannot stat with an HTTP 500 naming volume_size_info, so the bare
+// existence probe this used to run failed on dir, NFS, and CIFS every time and
+// left the partially committed volume behind. The content listing carries the
+// volume, which settles that it is there and the sweep has work to do.
+func TestHandleCreateDisk_OrphanCleanupOnFileStorage_NoFormatStillSweeps(t *testing.T) {
+	t.Parallel()
+
+	var probed, deletedVolID string
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return "", errors.New("network drop after the allocation ran")
+		},
+		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			// The sweep probes exactly one volume, and the listing below has
+			// to name that same volid, so the fixture records it here rather
+			// than guessing which VMID the allocator picked.
+			probed = volume
+			return false, nfsNoFormat(volume)
+		},
+		deleteVolumeFn: func(_ context.Context, _, _, volume string) error {
+			deletedVolID = volume
+			return nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		listStorageContentFn: func(
+			_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams,
+		) (*sdknodes.ListStorageContentResponse, error) {
+			return storageContentListing(probed), nil
+		},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 testNode,
+			DiskStorage:          storageName,
+			VMDiskFormat:         "qcow2",
+			DetachedDiskStrategy: "free",
+		},
+		PVE: &mockPVEClient{
+			storageSvc: storageSvc,
+			nodesSvc:   nodesSvc,
+			clusterSvc: &mockClusterSvc{},
+		},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected the CreateVolume failure to propagate")
+	}
+	if deletedVolID == "" {
+		t.Fatal("a volume the listing shows on storage must be swept, even when the point probe cannot say so")
+	}
+	if deletedVolID != probed {
+		t.Errorf("the sweep must delete the volume it probed, probed %q and deleted %q", probed, deletedVolID)
+	}
+}
+
+// TestHandleCreateDisk_OrphanCleanupOnFileStorage_ProvenAbsentSkipsSweep is
+// the other direction. The listing an NFS storage would refuse to serve at all
+// if its export were down came back without the volume, so the failed create
+// committed nothing and there is nothing to delete.
+func TestHandleCreateDisk_OrphanCleanupOnFileStorage_ProvenAbsentSkipsSweep(t *testing.T) {
+	t.Parallel()
+
+	deleteCalls := 0
+	storageSvc := &mockStorageService{
+		createVolumeFn: func(_ context.Context, _, _ string, _ int, _ string, _ int, _ string) (string, error) {
+			return "", errors.New("network drop before the allocation ran")
+		},
+		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			return false, nfsNoFormat(volume)
+		},
+		deleteVolumeFn: func(_ context.Context, _, _, _ string) error {
+			deleteCalls++
+			return nil
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
+			deleteCalls++
+			return "", nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		listStorageContentFn: func(
+			_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams,
+		) (*sdknodes.ListStorageContentResponse, error) {
+			return storageContentListing(), nil
+		},
+	}
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                 testNode,
+			DiskStorage:          "nfs-images",
+			VMDiskFormat:         "qcow2",
+			DetachedDiskStrategy: "free",
+		},
+		PVE: &visiblePVEClient{mockPVEClient: &mockPVEClient{
+			storageSvc: storageSvc,
+			nodesSvc:   nodesSvc,
+			clusterSvc: &mockClusterSvc{},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: "nfs-images",
+				storageType: "nfs",
+				shared:      true,
+			},
+		}},
+		Logger: log.NewNopLogger(),
+	}
+
+	h := handlers.HandleCreateDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(1024),
+		marshal(map[string]string{}),
+	}, jsonrpc.Context{})
+
+	if err == nil {
+		t.Fatal("expected the CreateVolume failure to propagate")
+	}
+	if deleteCalls != 0 {
+		t.Errorf("nothing was committed, so nothing may be deleted, got %d delete calls", deleteCalls)
 	}
 }

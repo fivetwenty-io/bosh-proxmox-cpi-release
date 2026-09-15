@@ -5174,3 +5174,71 @@ func TestCreateVM_DiskCIDs_AnchorPromise_VolumeProvenGone_SaysDataIsGone(t *test
 		t.Errorf("strict mode cannot recover a volume that is not there, so it must not be advised: %v", err)
 	}
 }
+
+// createVMCrossNode names a node-local persistent disk that lives on a
+// different node from the VM create_vm is building. The disk storage is
+// deliberately not the VM storage, so the create flow itself is untouched and
+// only the disk_cids attach path classifies anything.
+const (
+	createVMCrossNodeStorage = "pdisk-lvm"
+	createVMCrossNodeVolid   = "pdisk-lvm:vm-9001-disk-0"
+	createVMCrossNodeDisk    = "pve-a"
+	createVMCrossNodeVM      = "pve-b"
+)
+
+// TestCreateVM_DiskCIDs_AnchorPromise_DiskOnAnotherNode_KeepsRefusal is the
+// create_vm half of the cross-node regression. create_vm hands the guard the
+// node its placement chose, which on node-local storage is not where the disk
+// is. Probing lvmthin there answers "Failed to find logical volume", so an
+// absence read from that node would report lost data about a live disk.
+func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	deps := buildVMDeps(q, n, c, &vmMockAgent{})
+	deps.Config.Node = createVMCrossNodeVM
+	deps.Config.DetachedDiskStrategy = "parked"
+	base, ok := deps.PVE.(*mockPVEClient)
+	if !ok {
+		t.Fatalf("expected the create_vm suite's mock client, got %T", deps.PVE)
+	}
+	// Present on the disk's own node, and lvmthin's missing-volume text
+	// anywhere else, which is what PVE answers for a volume that is not on
+	// the node asked.
+	base.storageSvc = &mockStorageService{
+		existsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+			if node == createVMCrossNodeDisk {
+				return true, nil
+			}
+			return false, errors.New("Failed to find logical volume \"pve/vm-9001-disk-0\"")
+		},
+	}
+	base.clusterStorageSvc = &mockClusterStorage{
+		storageName: createVMCrossNodeStorage,
+		storageType: "lvmthin",
+		nodes:       createVMCrossNodeVM + "," + createVMCrossNodeDisk,
+	}
+	client := &visiblePVEClient{mockPVEClient: base}
+	deps.PVE = client
+	deps.Resolver = liveBackendResolver(client, createVMCrossNodeVM)
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{mustEncodeDiskCID(t, createVMCrossNodeVolid, &pve.DiskCIDMeta{Anchor: true})},
+		map[string]any{})
+
+	h := handlers.HandleCreateVM(deps)
+	_, err := h.Handle(context.Background(), args, mkCtx("anchor-cross-node"))
+	if err == nil {
+		t.Fatal("expected the anchor-missing refusal, got nil")
+	}
+	if strings.Contains(err.Error(), "the data is gone") {
+		t.Errorf("the disk is alive on node %s; reporting lost data would send an operator to delete it: %v",
+			createVMCrossNodeDisk, err)
+	}
+	if !strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("an unproven absence keeps the original refusal and its escape hatch, got: %v", err)
+	}
+}

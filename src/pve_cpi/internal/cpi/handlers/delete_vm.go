@@ -898,21 +898,15 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	// present) so a transient error never green-lights destroying a live
 	// volume. Probe on the VM's node: any volume still referenced by this
 	// VM's config is reachable from there.
-	unusedSlots := pve.FindUnusedDiskEntries(vmCfg)
-	if len(unusedSlots) == 0 {
-		return nil
-	}
 	// The absence proof classifies the storage before it will read a content
-	// listing that omits the volume as an absence. Every slot below is probed
-	// against the one configured disk storage, so resolve that classification
-	// once here rather than re-reading the storage index for each slot.
-	slotStorageInfo, slotStorageKnown := liveStorageInfo(ctx, deps, diskStorage)
-	classifySlotStorage := func(context.Context) (pve.StorageInfo, bool) {
-		return slotStorageInfo, slotStorageKnown
-	}
+	// listing that omits a volume as an absence. Every slot below is probed
+	// against the one configured disk storage, so they share one classifier,
+	// which reads the storage index lazily and at most once. A loop whose
+	// point probes all answer never reads it.
+	classifySlotStorage := handlerStorageClassifier(deps, diskStorage)
 
 	var protected []string
-	for slot, volid := range unusedSlots {
+	for slot, volid := range pve.FindUnusedDiskEntries(vmCfg) {
 		storage, _, parseErr := pve.ParseDiskCID(volid)
 		if parseErr != nil {
 			// Unparseable volid -- skip; can't determine storage.

@@ -2,14 +2,17 @@ package handlers_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -244,6 +247,109 @@ func TestHandleAttachDisk_AnchorPromise_AbsenceUnproven_KeepsRefusal(t *testing.
 	}
 	if strings.Contains(err.Error(), "the data is gone") {
 		t.Errorf("an unproven absence must not be reported as lost data, got: %v", err)
+	}
+	if qemuSvc.attachLastVolid != "" {
+		t.Errorf("AttachDisk must not run after the refusal; attached %q", qemuSvc.attachLastVolid)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The anchor proof on node-local storage, where the node the caller holds is
+// not the node the disk is on. attach_disk has already retargeted its node to
+// the VM's by the time the guard runs, and probing lvmthin from a node the
+// disk was never on answers "Failed to find logical volume", which folds into
+// a clean absence. Read as proof, that tells an operator the data is gone
+// about a disk sitting healthy on its own node.
+// ---------------------------------------------------------------------------
+
+const (
+	crossNodeStorage  = "local-lvm"
+	crossNodeVolid    = "local-lvm:vm-9001-disk-0"
+	crossNodeDiskNode = "pve-a"
+	crossNodeVMNode   = "pve-b"
+	crossNodeStableID = "bpd-aabbccdd00112233"
+)
+
+// crossNodeAnchorClient scripts a cluster where the disk is alive on one node
+// and the VM that wants it runs on another. The point probe answers present on
+// the disk's node and answers lvmthin's missing-volume text everywhere else,
+// which is exactly what PVE does for a volume that is not on the node asked.
+func crossNodeAnchorClient(qemuSvc *attachQEMUService, vmid int) *visiblePVEClient {
+	return &visiblePVEClient{
+		mockPVEClient: &mockPVEClient{
+			qemuSvc: qemuSvc,
+			clusterSvc: &mockClusterSvc{
+				listResourcesFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (
+					*sdkcluster.ListResourcesResponse, error) {
+					raw, _ := json.Marshal(map[string]any{
+						"vmid": vmid, "node": crossNodeVMNode, "type": "qemu", "tags": "bosh-cpi",
+					})
+					resp := sdkcluster.ListResourcesResponse{raw}
+					return &resp, nil
+				},
+			},
+			storageSvc: &mockStorageService{
+				existsFn: func(_ context.Context, node, _, _ string) (bool, error) {
+					if node == crossNodeDiskNode {
+						return true, nil
+					}
+					return false, errors.New("Failed to find logical volume \"pve/vm-9001-disk-0\"")
+				},
+			},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: crossNodeStorage,
+				storageType: "lvmthin",
+				nodes:       crossNodeDiskNode + "," + crossNodeVMNode,
+			},
+		},
+	}
+}
+
+// crossNodeAnchorConfig pins the CPI to the disk's node and lets attach_disk
+// retarget to the VM's node, which is the shape that exposed the defect.
+func crossNodeAnchorConfig() *config.CPIConfig {
+	return &config.CPIConfig{
+		Node:                     crossNodeDiskNode,
+		DiskStorage:              crossNodeStorage,
+		VMDiskFormat:             "raw",
+		DetachedDiskStrategy:     "parked",
+		DiskMigration:            "on_attach",
+		ParkedDiskVMIDRangeStart: 90000,
+		ParkedDiskVMIDRangeEnd:   90999,
+		DiskPerformance:          &config.DiskPerformanceDefaults{Iothread: boolPtr(false)},
+	}
+}
+
+// TestHandleAttachDisk_AnchorPromise_DiskOnAnotherNode_KeepsRefusal is the
+// regression. The disk is alive on its own node, so the absence is not proven
+// and the original refusal stands. Reporting lost data here would send an
+// operator to delete a disk that is intact.
+func TestHandleAttachDisk_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testing.T) {
+	t.Parallel()
+	diskCID := mustEncodeDiskCID(t, crossNodeVolid,
+		&pve.DiskCIDMeta{ID: crossNodeStableID, Anchor: true})
+
+	qemuSvc := &attachQEMUService{}
+	client := crossNodeAnchorClient(qemuSvc, 100)
+	deps := handlers.Deps{
+		Config:   crossNodeAnchorConfig(),
+		PVE:      client,
+		Resolver: liveBackendResolver(client, crossNodeDiskNode),
+		Agent:    &captureAgent{},
+		Logger:   log.NewNopLogger(),
+	}
+
+	h := handlers.HandleAttachDisk(deps)
+	_, err := h.Handle(context.Background(), attachArgs(t, "100", diskCID), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("expected the anchor-missing refusal, got nil")
+	}
+	if strings.Contains(err.Error(), "the data is gone") {
+		t.Errorf("the disk is alive on node %s; reporting lost data would send an operator to delete it: %v",
+			crossNodeDiskNode, err)
+	}
+	if !strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("an unproven absence keeps the original refusal and its escape hatch, got: %v", err)
 	}
 	if qemuSvc.attachLastVolid != "" {
 		t.Errorf("AttachDisk must not run after the refusal; attached %q", qemuSvc.attachLastVolid)

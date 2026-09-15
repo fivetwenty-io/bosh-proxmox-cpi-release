@@ -2412,11 +2412,24 @@ const (
 func deleteVMUnusedNFSDeps(
 	deleteCalled *bool,
 	listing func() (*nodes.ListStorageContentResponse, error),
-) handlers.Deps {
+) (handlers.Deps, *countingClusterStorage) {
+	return deleteVMUnusedNFSDepsWithSlots(deleteCalled, listing, nil,
+		map[string]any{"unused0": deleteVMNFSVolid})
+}
+
+// deleteVMUnusedNFSDepsWithSlots is the same fixture with the VM config and
+// the point probe spelled out, for the cases that need several slots or a
+// probe that answers.
+func deleteVMUnusedNFSDepsWithSlots(
+	deleteCalled *bool,
+	listing func() (*nodes.ListStorageContentResponse, error),
+	existsFn func(ctx context.Context, node, storage, volume string) (bool, error),
+	vmCfg map[string]any,
+) (handlers.Deps, *countingClusterStorage) {
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"unused0": deleteVMNFSVolid}, nil
+			return vmCfg, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
@@ -2431,24 +2444,26 @@ func deleteVMUnusedNFSDeps(
 			return listing()
 		},
 	}
-	storageSvc := &mockStorageService{
-		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+	if existsFn == nil {
+		existsFn = func(_ context.Context, _, _, volume string) (bool, error) {
 			return false, nfsNoFormat(volume)
-		},
+		}
 	}
+	storageSvc := &mockStorageService{existsFn: existsFn}
 	deps := testDepsFoundVMWithStorage(101, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, storageSvc)
 	deps.Config.DiskStorage = deleteVMNFSStorage
-	base, ok := deps.PVE.(*mockPVEClient)
-	if !ok {
-		return deps
-	}
-	base.clusterStorageSvc = &mockClusterStorage{
+	index := &countingClusterStorage{mockClusterStorage: &mockClusterStorage{
 		storageName: deleteVMNFSStorage,
 		storageType: "nfs",
 		shared:      true,
+	}}
+	base, ok := deps.PVE.(*mockPVEClient)
+	if !ok {
+		return deps, index
 	}
+	base.clusterStorageSvc = index
 	deps.PVE = &visiblePVEClient{mockPVEClient: base}
-	return deps
+	return deps, index
 }
 
 // TestHandleDeleteVM_AllowsWhenUnusedNFSVolumeProvenAbsent pins the outcome
@@ -2458,7 +2473,7 @@ func TestHandleDeleteVM_AllowsWhenUnusedNFSVolumeProvenAbsent(t *testing.T) {
 	t.Parallel()
 
 	deleteCalled := false
-	deps := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
+	deps, _ := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
 		return storageContentListing(), nil
 	})
 
@@ -2478,7 +2493,7 @@ func TestHandleDeleteVM_RefusesWhenUnusedNFSVolumeUnproven(t *testing.T) {
 	t.Parallel()
 
 	deleteCalled := false
-	deps := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
+	deps, _ := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
 		return nil, errors.New("storage 'nfs-images' is not online")
 	})
 
@@ -2490,4 +2505,54 @@ func TestHandleDeleteVM_RefusesWhenUnusedNFSVolumeUnproven(t *testing.T) {
 	if deleteCalled {
 		t.Error("DeleteQemu must not run while the slot's volume could still be there")
 	}
+}
+
+// TestHandleDeleteVM_UnusedSlots_ReadTheStorageIndexAtMostOnce pins the cost
+// of the guard. The storage classification is only needed to weigh a content
+// listing, so several slots on one storage share a single index read, and a
+// loop whose point probes all answer never reads the index at all.
+func TestHandleDeleteVM_UnusedSlots_ReadTheStorageIndexAtMostOnce(t *testing.T) {
+	t.Parallel()
+
+	t.Run("several unproven slots share one read", func(t *testing.T) {
+		t.Parallel()
+		deleteCalled := false
+		deps, index := deleteVMUnusedNFSDepsWithSlots(&deleteCalled,
+			func() (*nodes.ListStorageContentResponse, error) {
+				return storageContentListing(), nil
+			}, nil,
+			map[string]any{
+				"unused0": deleteVMNFSVolid,
+				"unused1": "nfs-images:9001/vm-9001-disk-0.qcow2",
+				"unused2": "nfs-images:9002/vm-9002-disk-0.qcow2",
+			})
+
+		h := handlers.HandleDeleteVM(deps)
+		if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
+			t.Fatalf("every slot's volume is proven gone, so the destroy must proceed, got %v", err)
+		}
+		if index.calls > 1 {
+			t.Errorf("three slots on one storage must share one index read, got %d", index.calls)
+		}
+	})
+
+	t.Run("a probe that answers never reads the index", func(t *testing.T) {
+		t.Parallel()
+		deleteCalled := false
+		deps, index := deleteVMUnusedNFSDepsWithSlots(&deleteCalled,
+			func() (*nodes.ListStorageContentResponse, error) {
+				t.Error("a point probe that answered must not be followed by a listing")
+				return storageContentListing(), nil
+			},
+			func(context.Context, string, string, string) (bool, error) { return false, nil },
+			map[string]any{"unused0": deleteVMNFSVolid})
+
+		h := handlers.HandleDeleteVM(deps)
+		if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
+			t.Fatalf("a slot whose volume the point probe reports gone must not block destroy, got %v", err)
+		}
+		if index.calls != 0 {
+			t.Errorf("a call that never weighed a listing must not read the storage index, got %d", index.calls)
+		}
+	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
@@ -67,7 +68,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		// the one in front of them. Absence has to be established, not assumed:
 		// a probe that fails proves nothing, so the refusal stands, and
 		// proveAnchorVolumeGone writes the warning that says why it stands.
-		if !proveAnchorVolumeGone(ctx, deps, "delete_disk", rd.diskCID, rd.volid, node) {
+		if !proveAnchorVolumeGoneAt(ctx, deps, "delete_disk", rd.diskCID, rd.volid, node) {
 			return false, anchorErr
 		}
 		deps.Log(ctx).Info("delete_disk: promised anchor has no holder and the volume is not on storage, treating as already-deleted",
@@ -118,12 +119,6 @@ func volumeAbsentFromStorage(ctx context.Context, deps Deps, node, bareVolid str
 	if node == "" {
 		return false, cpierrors.Cloud("delete_disk: no node to probe storage from")
 	}
-	// A client with no storage service cannot probe anything. That is a
-	// wiring fault rather than a cluster condition, and on a delete path it
-	// has to fail closed rather than panic on the nil service.
-	if deps.PVE == nil || deps.PVE.Storage() == nil {
-		return false, cpierrors.Cloud("delete_disk: no storage service to probe the volume with")
-	}
 	storage, _, err := pve.ParseDiskCID(bareVolid)
 	if err != nil {
 		return false, err
@@ -139,11 +134,20 @@ func volumeAbsentFromStorage(ctx context.Context, deps Deps, node, bareVolid str
 // cannot classify is one whose listing cannot carry a proof, so the false
 // travels through and pve.ProveVolumeAbsent fails closed on it.
 //
-// The classifier runs at most once per probe, and only after the point probe
-// has already failed, so the fast paths pay nothing for the extra listing.
+// The lookup is lazy and happens at most once per classifier. Nothing calls it
+// until a point probe has failed and a listing proof is being weighed, so a
+// call whose probes all answer never reads the storage index at all, and a
+// caller that weighs several volumes against one storage (delete_vm's
+// unused-slot loop) reads it once and shares the answer.
 func handlerStorageClassifier(deps Deps, storage string) pve.StorageClassifier {
+	var (
+		once  sync.Once
+		info  pve.StorageInfo
+		known bool
+	)
 	return func(ctx context.Context) (pve.StorageInfo, bool) {
-		return liveStorageInfo(ctx, deps, storage)
+		once.Do(func() { info, known = liveStorageInfo(ctx, deps, storage) })
+		return info, known
 	}
 }
 
