@@ -1274,6 +1274,11 @@ type diskHolder struct {
 	// finds a holder outside the parker band can still tell a stranded parker
 	// from an ordinary VM without a second config read.
 	tags string
+	// storageReferences counts what the same scan saw on every other guest:
+	// how many volids each storage is referenced by. It is set even when no
+	// holder was found, because that is the case a caller is about to prove an
+	// absence for.
+	storageReferences StorageReferenceCounts
 }
 
 // resolveDiskHolder answers "who holds this volid, and is it a parker?" in a
@@ -1286,19 +1291,23 @@ type diskHolder struct {
 // of the same answer, so ParkDisk resolves the holder once and reads both from
 // it rather than paying for the sweep twice on every detach.
 func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVolid string, cfg ParkerConfig) (diskHolder, error) {
-	holderVMID, holderNode, holderTags, found, err := FindVMByDiskVolidOrNoneTagged(ctx, c, bareVolid)
+	hit, found, err := findVMByDiskVolidHit(ctx, c, bareVolid)
 	if err != nil {
 		return diskHolder{}, err
 	}
+	refs := hit.StorageReferences
 	if !found {
-		return diskHolder{}, nil
+		return diskHolder{storageReferences: refs}, nil
 	}
+	holderVMID, holderNode, holderTags := hit.VMID, hit.Node, hit.Tags
 
 	// Out of the parker band → a real VM, no config read needed. The tags come
 	// from the scan, so a caller that needs to tell a stranded parker from an
 	// ordinary VM can do it without a second read.
 	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
-		return diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: holderTags}, nil
+		return diskHolder{
+			found: true, vmid: holderVMID, node: holderNode, tags: holderTags, storageReferences: refs,
+		}, nil
 	}
 
 	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
@@ -1321,7 +1330,7 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 			}
 			// Permissive: the disk is free-floating as far as this call is
 			// concerned.
-			return diskHolder{}, nil
+			return diskHolder{storageReferences: refs}, nil
 		}
 		// WrapError keeps a 403 permanent: it names a grant to add, and no
 		// number of retries adds it.
@@ -1347,11 +1356,16 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 				log.String("tags", tagsRaw),
 			)
 		}
-		return diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw}, nil
+		return diskHolder{
+			found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw, storageReferences: refs,
+		}, nil
 	}
 
 	slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
-	return diskHolder{found: true, vmid: holderVMID, node: holderNode, isParker: true, slot: slot, tags: tagsRaw}, nil
+	return diskHolder{
+		found: true, vmid: holderVMID, node: holderNode, isParker: true, slot: slot, tags: tagsRaw,
+		storageReferences: refs,
+	}, nil
 }
 
 // IsDiskParked reports whether bareVolid is currently held on a parker VM.
@@ -1453,6 +1467,11 @@ type DiskHolder struct {
 	// not IsParker but whose tags mark a parker is one the configured band no
 	// longer covers -- the state every stranded-parker refusal keys on.
 	Tags string
+	// StorageReferences counts, per storage, the volumes the cluster's configs
+	// reference, as the same scan saw them. It is set whether or not a holder
+	// was found, and it is nil only when no scan ran. pve.ConfigReferenceCorroborator
+	// turns it into the second opinion an empty content listing needs.
+	StorageReferences StorageReferenceCounts
 }
 
 // ResolveDiskHolder answers "who holds this volid, and is it a parker?" with one
@@ -1477,6 +1496,7 @@ func ResolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	}
 	return DiskHolder{
 		Found: h.found, VMID: h.vmid, Node: h.node, IsParker: h.isParker, Slot: h.slot, Tags: h.tags,
+		StorageReferences: h.storageReferences,
 	}, nil
 }
 
@@ -1486,12 +1506,13 @@ func ResolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 // and the empty-slot race handling match IsDiskParked exactly.
 func ParkedFromHolder(h DiskHolder, bareVolid string) (vmid int, node, slot string, parked bool, err error) {
 	return parkedFromHolder(diskHolder{
-		found:    h.Found,
-		vmid:     h.VMID,
-		node:     h.Node,
-		isParker: h.IsParker,
-		slot:     h.Slot,
-		tags:     h.Tags,
+		found:             h.Found,
+		vmid:              h.VMID,
+		node:              h.Node,
+		isParker:          h.IsParker,
+		slot:              h.Slot,
+		tags:              h.Tags,
+		storageReferences: h.StorageReferences,
 	}, bareVolid)
 }
 

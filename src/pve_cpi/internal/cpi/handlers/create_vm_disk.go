@@ -14,15 +14,14 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
-	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
 // liveStorageInfo issues a live /storage listing and decodes it through
-// pve.ParseStorageEntry — the SAME decoder StorageInfoCache.refresh uses —
-// so this file's storage-classification call sites cannot silently diverge
-// from the canonical parsing (in particular: this is what gives lookupVMStorageType
+// pve.LiveStorageInfo — the SAME decoder StorageInfoCache.refresh uses — so
+// this file's storage-classification call sites cannot silently diverge from
+// the canonical parsing (in particular: this is what gives lookupVMStorageType
 // and needsReplicaCheck access to the backing-identity fields (Path/Server/
 // Export) needed by the clone-mode storageMismatch check below, without each
 // duplicating its own ad-hoc JSON decode).
@@ -39,25 +38,18 @@ import (
 // Returns (info, false) on any failure: nil PVE/ClusterStorage, empty name,
 // transport error, or the name absent from the index. Callers treat false as
 // "unknown" and fail open, exactly as the pre-consolidation ad-hoc decoders
-// did on any failure.
+// did on any failure. The helper reports each of those as a distinct error;
+// nothing here needs to tell them apart, so the reason is dropped rather than
+// logged, which keeps this off the hot path's log budget.
 func liveStorageInfo(ctx context.Context, deps Deps, storageName string) (pve.StorageInfo, bool) {
-	if deps.PVE == nil || deps.PVE.ClusterStorage() == nil || storageName == "" {
+	if deps.PVE == nil {
 		return pve.StorageInfo{}, false
 	}
-	resp, err := deps.PVE.ClusterStorage().ListStorage(ctx, &sdkclusterstorage.ListStorageParams{})
-	if err != nil || resp == nil {
+	info, err := pve.LiveStorageInfo(ctx, deps.PVE, storageName)
+	if err != nil {
 		return pve.StorageInfo{}, false
 	}
-	for _, raw := range *resp {
-		info, perr := pve.ParseStorageEntry(raw)
-		if perr != nil {
-			continue
-		}
-		if info.Name == storageName {
-			return info, true
-		}
-	}
-	return pve.StorageInfo{}, false
+	return info, true
 }
 
 // lookupVMStorageType fetches the PVE storage type for storageName. Returns
