@@ -38,6 +38,21 @@ type ManagedAllocationHooks struct {
 }
 
 // ManagedAllocationGuard serializes writes and blocks further mutations after uncertainty.
+//
+// One invariant holds this together and nothing enforces it mechanically, so it
+// is written down here. A guarded UpdateQemuConfig that carries a Description is
+// checked byte-for-byte against the frozen allocation marker, in
+// managedVMTarget.validate and again in the evidence comparison. That check is
+// only survivable while the description still reads exactly as the allocation
+// wrote it. Once createManagedVMRoot returns, create_vm annotates the
+// description with pool membership and stemcell provenance, so from that point
+// on no write under the guard may carry a Description. The annotating write
+// goes through unguardedPVE for precisely this reason, pveConfigKeyDescription
+// is blocklisted in pve_config so an operator cannot reintroduce one, and the
+// remaining description writers all sit on attach_disk, detach_disk,
+// set_*_metadata, or delete_vm paths that run outside an allocation. A new
+// description-bearing write added under the guard after root creation would
+// fail create_vm and poison the allocation, and it would do it silently.
 type ManagedAllocationGuard struct {
 	mu       sync.Mutex
 	original pve.Client
