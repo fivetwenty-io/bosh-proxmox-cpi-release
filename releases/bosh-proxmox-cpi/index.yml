@@ -1,6 +1,8 @@
 builds:
   03f91731-5b54-46ff-70f0-9ff25ab6913b:
     version: 0.7.0
+  0c77be0f-542c-4b99-6cca-ab4717f29acb:
+    version: 0.7.3
   27002a58-5560-47fa-7263-da35a05784aa:
     version: 0.5.0
   479734fe-782f-4a46-6eef-08f59e657391:
