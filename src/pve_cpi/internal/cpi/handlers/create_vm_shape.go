@@ -89,6 +89,11 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 				log.String("tag", tag))
 		}
 	}
+	if tag := stemcellIdentityTag(parsed); tag != "" && !strings.Contains(initialTags, tag) {
+		deps.Log(ctx).Warn("create_vm: stemcell provenance tag dropped by tag-length cap — "+
+			"this VM answers a bosh_stemcell Notes query but not a stemcell-- tag query",
+			log.String("tag", tag))
+	}
 	initialName := resolveVMShapeInitialName(deps.Config, parsed)
 
 	// Best-effort: populate vmStorageType for the clone-mode decision in

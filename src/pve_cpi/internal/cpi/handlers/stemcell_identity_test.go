@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -192,5 +193,48 @@ func TestWithStemcellNote(t *testing.T) {
 	directorSaid := buildDescription(map[string]any{"stemcell": "something-else-1.0"})
 	if got := withStemcellNote(directorSaid, seeded); got != directorSaid {
 		t.Errorf("a Director-supplied stemcell key must not be duplicated, got %q", got)
+	}
+}
+
+// The stemcell tag is written last so that a full tag list sheds it before it
+// sheds an advertised-route tag, because an evicted advrt- tag is an SDN subnet
+// delete_vm can no longer withdraw. create_vm warns when this happens, and the
+// docs name it as a limit, so the ordering it rests on is pinned here.
+func TestStemcellTagIsEvictedBeforeAdvertisedRouteTags(t *testing.T) {
+	t.Parallel()
+
+	stemcell := "stemcell--bosh-openstack-kvm-ubuntu-noble-1-585"
+	// Fill the budget with advertised-route tags right to the brim, so the
+	// stemcell tag appended behind them is the only entry the cap can shed.
+	var advrt []string
+	fits := func(entries []string) int {
+		return len(strings.Join(append([]string{ownershipTag}, entries...), ";"))
+	}
+	for {
+		next := fmt.Sprintf("advrt-%02d--10-244-%d-0-24", len(advrt), len(advrt))
+		grown := append(append([]string{}, advrt...), next)
+		if fits(grown) > maxTagLength {
+			break
+		}
+		advrt = grown
+	}
+	if len(advrt) == 0 {
+		t.Fatal("fixture built no advertised-route tags")
+	}
+
+	merged, dropped := mergeTagListReporting(
+		[]string{ownershipTag},
+		append(append([]string{}, advrt...), stemcell),
+		maxTagLength,
+	)
+	if len(dropped) != 1 || dropped[0] != stemcell {
+		t.Fatalf("the stemcell tag must be the only entry evicted, dropped %v", dropped)
+	}
+	if strings.Contains(merged, stemcell) {
+		t.Errorf("evicted tag must not appear in the merged list: %q", merged)
+	}
+	// The earliest advertised routes keep their place; cleanup outranks provenance.
+	if !strings.Contains(merged, advrt[0]) {
+		t.Errorf("advertised-route tag %q must outrank the stemcell tag, got %q", advrt[0], merged)
 	}
 }
