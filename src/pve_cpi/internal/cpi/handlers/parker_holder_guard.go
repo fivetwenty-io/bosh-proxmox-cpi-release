@@ -224,7 +224,7 @@ func anchorVolumeAbsentAnywhere(ctx context.Context, deps Deps, volid string) (b
 		if backend.Kind() == pve.BackendLocal && pve.IsNotFound(nodeErr) {
 			// Every candidate node answered a clean absence, which is the
 			// complete sweep this conclusion requires.
-			return false, nil
+			return true, nil
 		}
 		return false, nodeErr
 	}

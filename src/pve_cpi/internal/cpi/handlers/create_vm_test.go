@@ -5242,3 +5242,54 @@ func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testi
 		t.Errorf("an unproven absence keeps the original refusal and its escape hatch, got: %v", err)
 	}
 }
+
+// TestCreateVM_DiskCIDs_AnchorPromise_DiskOnNoNode_ReportsGone is the other
+// half of the node-local proof. Every node answers lvmthin's missing-volume
+// text, so the cluster sweep proves the volume gone everywhere and the refusal
+// says so, rather than pointing at strict mode for a volume nothing can bring
+// back. attach_disk never reaches this branch on local storage, because its
+// own node resolution answers DiskNotFound first; create_vm does.
+func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnNoNode_ReportsGone(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	c := &vmMockCluster{}
+	deps := buildVMDeps(q, n, c, &vmMockAgent{})
+	deps.Config.Node = createVMCrossNodeVM
+	deps.Config.DetachedDiskStrategy = "parked"
+	base, ok := deps.PVE.(*mockPVEClient)
+	if !ok {
+		t.Fatalf("expected the create_vm suite's mock client, got %T", deps.PVE)
+	}
+	base.storageSvc = &mockStorageService{
+		existsFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, errors.New("Failed to find logical volume \"pve/vm-9001-disk-0\"")
+		},
+	}
+	base.clusterStorageSvc = &mockClusterStorage{
+		storageName: createVMCrossNodeStorage,
+		storageType: "lvmthin",
+		nodes:       createVMCrossNodeVM + "," + createVMCrossNodeDisk,
+	}
+	client := &visiblePVEClient{mockPVEClient: base}
+	deps.PVE = client
+	deps.Resolver = liveBackendResolver(client, createVMCrossNodeVM)
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{mustEncodeDiskCID(t, createVMCrossNodeVolid, &pve.DiskCIDMeta{Anchor: true})},
+		map[string]any{})
+
+	h := handlers.HandleCreateVM(deps)
+	_, err := h.Handle(context.Background(), args, mkCtx("anchor-gone-everywhere"))
+	if err == nil {
+		t.Fatal("expected the data-is-gone refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "the data is gone") {
+		t.Errorf("every node proved the volume absent; the refusal must report lost data, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("a proven absence must not offer the strict-mode escape hatch, got: %v", err)
+	}
+}
