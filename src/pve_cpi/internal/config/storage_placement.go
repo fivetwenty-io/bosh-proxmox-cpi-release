@@ -32,6 +32,56 @@ type StorageSet struct {
 	Strategy          StoragePlacementStrategy `json:"strategy"`
 	MinFreeMB         int64                    `json:"min_free_mb,omitempty"`
 	MaxUtilizationPct *int                     `json:"max_utilization_pct,omitempty"`
+	// AntiAffinity stays nil for a set the operator never declared it on. No
+	// code path may ever materialize DefaultStorageAntiAffinityScope or
+	// DefaultStorageAntiAffinityBandPct into this pointer: the set marshals
+	// into the policy fingerprint and the context-override cache key, so
+	// writing a default in here would change both for every existing
+	// deployment on upgrade. Read defaults at the point of use through
+	// EffectiveAntiAffinityScope and EffectiveAntiAffinityBandPct instead.
+	AntiAffinity *StorageAntiAffinity `json:"anti_affinity,omitempty"`
+}
+
+// StorageAntiAffinity configures the same-instance-group spreading preference
+// options applies inside the capacity band, alongside sibling byte charging.
+type StorageAntiAffinity struct {
+	Scope              string `json:"scope,omitempty"`
+	UtilizationBandPct *int   `json:"utilization_band_pct,omitempty"`
+}
+
+// Storage anti-affinity scopes and defaults live together in one place so
+// flipping the feature between on-by-default and off-by-default is a single
+// edit: setting DefaultStorageAntiAffinityScope to
+// StorageAntiAffinityScopeNone turns the preference off for every storage set
+// that does not declare anti_affinity explicitly, and nothing else has to
+// change.
+const (
+	StorageAntiAffinityScopeInstanceGroup = "instance_group"
+	StorageAntiAffinityScopeDeployment    = "deployment"
+	StorageAntiAffinityScopeNone          = "none"
+
+	DefaultStorageAntiAffinityScope   = StorageAntiAffinityScopeInstanceGroup
+	DefaultStorageAntiAffinityBandPct = 20
+)
+
+// EffectiveAntiAffinityScope reads the configured scope, or the package
+// default when the set left anti_affinity unset or declared a blank scope. It
+// never writes the default back onto the set.
+func (s StorageSet) EffectiveAntiAffinityScope() string {
+	if s.AntiAffinity == nil || strings.TrimSpace(s.AntiAffinity.Scope) == "" {
+		return DefaultStorageAntiAffinityScope
+	}
+	return s.AntiAffinity.Scope
+}
+
+// EffectiveAntiAffinityBandPct reads the configured utilization band, or the
+// package default when the set left anti_affinity or the band unset. It never
+// writes the default back onto the set.
+func (s StorageSet) EffectiveAntiAffinityBandPct() int {
+	if s.AntiAffinity == nil || s.AntiAffinity.UtilizationBandPct == nil {
+		return DefaultStorageAntiAffinityBandPct
+	}
+	return *s.AntiAffinity.UtilizationBandPct
 }
 
 // StorageCapacityDomain declares exports consuming one shared capacity budget.
@@ -144,6 +194,20 @@ func (s *StoragePlacementStrategy) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("strategy.version is required")
 	}
 	*s = StoragePlacementStrategy(value)
+	return nil
+}
+
+// UnmarshalJSON decodes the anti-affinity block without accepting unknown
+// fields or an explicit null on scope or the band. A blank scope decodes
+// cleanly here; validateStorageSet rejects it, because strict decoding alone
+// cannot tell a blank scope from one the operator omitted.
+func (a *StorageAntiAffinity) UnmarshalJSON(data []byte) error {
+	type plain StorageAntiAffinity
+	var value plain
+	if _, err := decodePlacementObject(data, &value); err != nil {
+		return fmt.Errorf("anti_affinity: %w", err)
+	}
+	*a = StorageAntiAffinity(value)
 	return nil
 }
 
@@ -375,12 +439,14 @@ func (c *CPIConfig) CloneStoragePlacement() CPIConfig {
 	cloned := *c
 	if c.StorageSets != nil {
 		cloned.StorageSets = make(map[string]StorageSet, len(c.StorageSets))
-		for name, s := range c.StorageSets {
+		for name := range c.StorageSets {
+			s := c.StorageSets[name]
 			s.Names = slices.Clone(s.Names)
 			s.Types = slices.Clone(s.Types)
 			s.Shared = clonePlacementPointer(s.Shared)
 			s.Encrypted = clonePlacementPointer(s.Encrypted)
 			s.MaxUtilizationPct = clonePlacementPointer(s.MaxUtilizationPct)
+			s.AntiAffinity = cloneStorageAntiAffinity(s.AntiAffinity)
 			cloned.StorageSets[name] = s
 		}
 	}
@@ -401,6 +467,17 @@ func clonePlacementPointer[T any](value *T) *T {
 		return nil
 	}
 	cloned := *value
+	return &cloned
+}
+
+// cloneStorageAntiAffinity deep-copies the anti-affinity block, including the
+// inner band pointer, so a clone never aliases the original set's pointers.
+func cloneStorageAntiAffinity(value *StorageAntiAffinity) *StorageAntiAffinity {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.UtilizationBandPct = clonePlacementPointer(value.UtilizationBandPct)
 	return &cloned
 }
 
@@ -504,6 +581,18 @@ func validateStorageSet(name string, s StorageSet, assertions map[string]bool) [
 	}
 	if s.MaxUtilizationPct != nil && (*s.MaxUtilizationPct < 1 || *s.MaxUtilizationPct > 100) {
 		errs = append(errs, prefix+".max_utilization_pct must be 1-100")
+	}
+	if s.AntiAffinity != nil {
+		switch s.AntiAffinity.Scope {
+		case StorageAntiAffinityScopeInstanceGroup, StorageAntiAffinityScopeDeployment, StorageAntiAffinityScopeNone:
+		case "":
+			errs = append(errs, prefix+".anti_affinity.scope must not be blank")
+		default:
+			errs = append(errs, prefix+".anti_affinity.scope must be instance_group, deployment, or none")
+		}
+		if band := s.AntiAffinity.UtilizationBandPct; band != nil && (*band < 0 || *band > 100) {
+			errs = append(errs, prefix+".anti_affinity.utilization_band_pct must be 0-100")
+		}
 	}
 	return errs
 }

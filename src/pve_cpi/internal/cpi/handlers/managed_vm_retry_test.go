@@ -113,3 +113,36 @@ func testManagedVMRetryMode(t *testing.T, mode string) {
 		t.Fatal("new seed/frozen budget/cleanup proof lost")
 	}
 }
+
+// TestManagedVMRetryExcludesItsOwnAllocation pins what the retry branch passes
+// as self. A retry re-plans while its own record is still in flight, and
+// charging that record against the re-plan would steer the attempt away from
+// the artifacts it has already retained.
+func TestManagedVMRetryExcludesItsOwnAllocation(t *testing.T) {
+	request := siblingPlacementFixture(t, map[string]siblingMemberCapacity{
+		"a": {total: 100 * siblingPlacementGiB, available: 83 * siblingPlacementGiB},
+		"b": {total: 100 * siblingPlacementGiB, available: 80 * siblingPlacementGiB},
+	}, nil)
+	journal := siblingPlacementJournal(t, request.Namespace)
+	handle := siblingPlacementPeer(t, journal, request, "agent")
+	records, err := journal.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	charge := func(self string) map[string]uint64 {
+		t.Helper()
+		observed := &managedVMPlan{selection: request.Selection, inventory: request.Inventory,
+			request: request, snapshotStart: request.Clock()}
+		if err := applyManagedVMSiblings(observed, records, self); err != nil {
+			t.Fatal(err)
+		}
+		return observed.request.SiblingMemberBytes
+	}
+	if own := charge(handle.Record().ID); len(own) != 0 {
+		t.Fatalf("a retry charged its own allocation %v", own)
+	}
+	key := siblingCapacityKey(t, request, siblingPlacementRootStorage(t, handle.Record()))
+	if other := charge("alloc-other"); other[key] == 0 {
+		t.Fatalf("the same record charges %v under another identifier, want its claim on %q", other, key)
+	}
+}

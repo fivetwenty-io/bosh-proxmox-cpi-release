@@ -143,7 +143,7 @@ func resumeManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArgs,
 	}
 	var observed *managedVMObservation
 	if len(record.Steps) == 0 {
-		nodes, err := managedVMClusterNodes(ctx, deps)
+		nodes, err := clusterNodeNames(ctx, deps)
 		if err != nil {
 			return nil, err
 		}
@@ -193,7 +193,7 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 	if parsed == nil {
 		return nil, false, fmt.Errorf("existing allocation lookup requires parsed VM arguments")
 	}
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return nil, false, err
 	}

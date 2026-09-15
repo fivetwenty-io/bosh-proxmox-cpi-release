@@ -140,7 +140,7 @@ func TestStoragePlanDiagnosticVMImportUsesProductionPlanner(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		_, e = prepareManagedVMPlan(t.Context(), deps, parsed, sel)
+		_, e = prepareManagedVMPlan(t.Context(), deps, parsed, sel, nil, "")
 		t.Fatalf("VM plan missing: %v %+v", e, report)
 	}
 	cfg.AgentMode = ""

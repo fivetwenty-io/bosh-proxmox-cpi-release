@@ -123,6 +123,36 @@ func activeStorageAllocationPlan(record allocationjournal.Record) (*StorageAlloc
 	return &plan, nil
 }
 
+// siblingStorageAllocationPlan decodes another allocation's active plan for
+// sibling accounting. It deliberately differs from activeStorageAllocationPlan
+// in two ways, because it reads a record we do not own.
+//
+// It decodes without DisallowUnknownFields. Every create now decodes every
+// in-flight sibling, so a strict decode here would mean that any field a later
+// release adds to the plan breaks every create an older binary attempts while a
+// newer sibling record is still non-terminal. It still requires a trailing
+// io.EOF, so malformed trailing bytes fail rather than pass unnoticed.
+//
+// It also skips the namespace and policy fingerprint comparisons. Those checks
+// audit the identity of a plan against the record that owns it, and a sibling
+// is not ours to audit. The owner's own decode through
+// activeStorageAllocationPlan stays strict and is not affected by this one.
+func siblingStorageAllocationPlan(record allocationjournal.Record) (*StorageAllocationPlan, error) {
+	active := record.ActivePlan()
+	if active.PlanVersion != 1 {
+		return nil, cpierrors.Cloud("allocation %s uses an unsupported plan version; audit required", record.ID)
+	}
+	d := json.NewDecoder(bytes.NewReader(active.Plan))
+	var plan StorageAllocationPlan
+	if err := d.Decode(&plan); err != nil {
+		return nil, cpierrors.Cloud("allocation %s has invalid plan evidence; audit required", record.ID)
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return nil, cpierrors.Cloud("allocation %s has invalid plan evidence; audit required", record.ID)
+	}
+	return &plan, nil
+}
+
 // storageMutationIntent must succeed before the corresponding API call. A
 // planned record after restart remains uncertain even when no UPID was saved.
 func storageMutationIntent(handle *allocationjournal.Handle, kind string, target allocationjournal.Target, charges []storageinventory.ChargeRecord, parameters ...json.RawMessage) (string, error) {

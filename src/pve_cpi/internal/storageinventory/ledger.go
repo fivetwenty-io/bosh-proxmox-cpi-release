@@ -94,12 +94,54 @@ type ledgerEntry struct {
 
 // Ledger is immutable and request-local. Copying it is cheap; state-changing
 // methods clone its private entries before modification.
-type Ledger struct{ entries map[string]ledgerEntry }
+type Ledger struct {
+	entries map[string]ledgerEntry
+	// siblingMember and siblingDomain carry bytes that concurrent allocations
+	// outside this request have already claimed, keyed by capacity key and by
+	// capacity domain key. Candidate folds them into the projected outstanding
+	// bytes so a peer that started moments earlier is visible to this ranking.
+	// They must never become ledger entries. Records() is the plan's charge
+	// list and its caller takes the last element of that sorted slice as the
+	// charge it just added, so a sibling entry would corrupt both the option
+	// mapping and the persisted plan. Both maps are owned by the ledger and are
+	// never mutated after construction.
+	siblingMember map[string]uint64
+	siblingDomain map[string]uint64
+}
 
 // NewLedger creates an empty immutable capacity ledger.
 func NewLedger() Ledger { return Ledger{entries: map[string]ledgerEntry{}} }
+
+// NewLedgerWithSiblings creates an empty capacity ledger that charges every
+// candidate with bytes already claimed by allocations outside this request. The
+// member map is keyed by capacity key and the domain map by capacity domain
+// key. Both maps are copied, so a later mutation by the caller cannot change a
+// ledger that is already in use. A nil or empty map behaves exactly like
+// NewLedger.
+func NewLedgerWithSiblings(member, domain map[string]uint64) Ledger {
+	next := NewLedger()
+	next.siblingMember = copyByteMap(member)
+	next.siblingDomain = copyByteMap(domain)
+	return next
+}
+
+func copyByteMap(source map[string]uint64) map[string]uint64 {
+	if len(source) == 0 {
+		return nil
+	}
+	copied := make(map[string]uint64, len(source))
+	for key, value := range source {
+		copied[key] = value
+	}
+	return copied
+}
+
 func (l Ledger) clone() Ledger {
 	next := NewLedger()
+	// clone starts from a fresh ledger, so the sibling maps have to be carried
+	// across explicitly or the first WithPlanned would drop them.
+	next.siblingMember = l.siblingMember
+	next.siblingDomain = l.siblingDomain
 	for id := range l.entries {
 		next.entries[id] = l.entries[id]
 	}
@@ -192,6 +234,18 @@ func (l Ledger) Candidate(s *Snapshot, node, id string, allocationBytes uint64, 
 			if err != nil {
 				return storageplacement.EligibleCandidate{}, err
 			}
+		}
+	}
+	// Sibling bytes are folded in after the entry loop and before the candidate
+	// is built, so both projections below see them.
+	memberOutstanding, err = add(memberOutstanding, l.siblingMember[pair.CapacityKey])
+	if err != nil {
+		return storageplacement.EligibleCandidate{}, fmt.Errorf("member %s sibling bytes: %w", id, err)
+	}
+	if domainKey != "" {
+		domainOutstanding, err = add(domainOutstanding, l.siblingDomain[domainKey])
+		if err != nil {
+			return storageplacement.EligibleCandidate{}, fmt.Errorf("domain %s sibling bytes: %w", domainKey, err)
 		}
 	}
 	candidate := storageplacement.EligibleCandidate{StorageID: id, BackingKey: pair.CapacityKey, DomainKey: domainKey, Member: storageplacement.CapacityBudget{TotalBytes: b.TotalBytes, AvailableBytes: b.AvailableBytes, ReserveBytes: memberLimits.ReserveBytes, MaxUtilizationPct: memberLimits.MaxUtilizationPct, OutstandingBytes: memberOutstanding, AllocationBytes: allocationBytes}}

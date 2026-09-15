@@ -112,7 +112,7 @@ func observeCleanupUploadedISOState(ctx context.Context, deps Deps, journal *aj.
 	if !cleanupPriorISOUploadOwnership(record, target) {
 		return false, fmt.Errorf("absent VM has no retained exact ISO ownership")
 	}
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return false, err
 	}

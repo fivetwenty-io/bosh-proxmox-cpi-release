@@ -290,7 +290,7 @@ func managedDiskFixture(t *testing.T, strategy string, plural bool) (*managedDis
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := prepareManagedDisk(t.Context(), deps, selection, 1025, createDiskCloudProperties{}, "", r)
+	m, err := prepareManagedDisk(t.Context(), deps, selection, 1025, createDiskCloudProperties{}, "", r, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +524,7 @@ func TestManagedDiskIndependentSameSizeCallsRemainDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := prepareManagedDisk(t.Context(), m.deps, m.selection, 1025, createDiskCloudProperties{}, "", resolver)
+	next, err := prepareManagedDisk(t.Context(), m.deps, m.selection, 1025, createDiskCloudProperties{}, "", resolver, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +582,7 @@ func TestManagedDiskSubsetAliasBoundaryAndCapacity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			m, err := prepareManagedDisk(t.Context(), base.deps, selection, tc.size, createDiskCloudProperties{}, "", r)
+			m, err := prepareManagedDisk(t.Context(), base.deps, selection, tc.size, createDiskCloudProperties{}, "", r, nil)
 			if tc.fail {
 				if err == nil {
 					t.Fatal("invalid placement admitted")

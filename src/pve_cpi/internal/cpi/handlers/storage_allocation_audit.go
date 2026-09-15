@@ -128,19 +128,28 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 	return result, nil
 }
 
-func admitStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journal, nodes []string) error {
+// admitStorageAllocation runs AuditStorageAllocations and admits the result.
+// The returned audit carries the same scan (including Records) that sibling
+// accounting reads, so a caller never needs a second List. On any error the
+// zero audit is returned alongside it, so a failed scan can never be used.
+func admitStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journal, nodes []string) (StorageAllocationAudit, error) {
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {
-		return err
+		return StorageAllocationAudit{}, err
 	}
 	if len(report.Conflicts) > 0 {
-		return cpierrors.Cloud("storage allocation admission: %s", strings.Join(report.Conflicts, "; "))
+		return StorageAllocationAudit{}, cpierrors.Cloud("storage allocation admission: %s", strings.Join(report.Conflicts, "; "))
 	}
 	if !report.Complete {
 		deps.Log(ctx).Warn("storage provenance inspection incomplete; no historical absence is certified", log.Int("unavailable_observations", len(report.Issues)))
 	}
-	return nil
+	return report, nil
 }
+
+// admitStorageVMAllocation runs AuditStorageAllocations and admits the result
+// for a VM allocation. It returns no audit on purpose: the VM path reads its
+// siblings under the journal index lock, which is fresher than this scan, so
+// nothing downstream may rank from the audit's records.
 func admitStorageVMAllocation(ctx context.Context, deps Deps, journal *aj.Journal, nodes []string, agentID string) error {
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {

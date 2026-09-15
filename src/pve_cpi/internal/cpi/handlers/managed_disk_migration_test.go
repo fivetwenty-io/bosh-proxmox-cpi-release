@@ -67,7 +67,7 @@ func TestManagedDiskHintUsesActualNodeAndReplansMigration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			m, err := prepareManagedDisk(t.Context(), deps, base.selection, 1025, createDiskCloudProperties{}, "321", r)
+			m, err := prepareManagedDisk(t.Context(), deps, base.selection, 1025, createDiskCloudProperties{}, "321", r, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -91,7 +91,7 @@ func TestManagedDiskMissingHintAndNodePolicyFailBeforeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, hint := range []string{"invalid", "-1", "321"} {
-		if _, err := prepareManagedDisk(t.Context(), base.deps, base.selection, 1025, createDiskCloudProperties{}, hint, r); err == nil {
+		if _, err := prepareManagedDisk(t.Context(), base.deps, base.selection, 1025, createDiskCloudProperties{}, hint, r, nil); err == nil {
 			t.Errorf("accepted missing hint %q", hint)
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -881,5 +883,135 @@ func TestExplicitFencedIndexRecovery(t *testing.T) {
 	}()
 	if h.Record().ID != id {
 		t.Fatal("index recovery changed active generation")
+	}
+}
+
+func TestAcquireVMPlannedRunsOnePlannerAtATime(t *testing.T) {
+	j, _ := fixture(t)
+	type attempt struct {
+		id       string
+		siblings []string
+		calls    atomic.Int32
+		handle   *Handle
+		err      error
+	}
+	attempts := make([]attempt, 2)
+	agents := []string{"agent-one", "agent-two"}
+	var wg sync.WaitGroup
+	for i, agent := range agents {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a := &attempts[i]
+			a.handle, a.err = j.AcquireVMPlanned(context.Background(), agent, func(id string, siblings []Record) (Intent, error) {
+				a.calls.Add(1)
+				a.id = id
+				for _, r := range siblings {
+					a.siblings = append(a.siblings, r.ID)
+				}
+				return intent(), nil
+			})
+		}()
+	}
+	wg.Wait()
+	t.Cleanup(func() {
+		for i := range attempts {
+			if attempts[i].handle != nil {
+				closeHandle(t, attempts[i].handle)
+			}
+		}
+	})
+	for i := range attempts {
+		if attempts[i].err != nil {
+			t.Fatalf("%s: %v", agents[i], attempts[i].err)
+		}
+		if calls := attempts[i].calls.Load(); calls != 1 {
+			t.Fatalf("%s planned %d times, want exactly one", agents[i], calls)
+		}
+		if got := attempts[i].handle.Record().ID; got != attempts[i].id {
+			t.Fatalf("%s recorded %s, planned %s", agents[i], got, attempts[i].id)
+		}
+	}
+	first, second := &attempts[0], &attempts[1]
+	if len(first.siblings) > len(second.siblings) {
+		first, second = second, first
+	}
+	if len(first.siblings) != 0 {
+		t.Fatalf("first planner saw siblings %v in an empty journal", first.siblings)
+	}
+	if len(second.siblings) != 1 || second.siblings[0] != first.id {
+		t.Fatalf("second planner saw %v, want only the first record %s", second.siblings, first.id)
+	}
+}
+func TestAcquireVMPlannedRejectedPlanWritesNothing(t *testing.T) {
+	j, dir := fixture(t)
+	refused := errors.New("no member can take the charge")
+	_, err := j.AcquireVMPlanned(context.Background(), "agent", func(string, []Record) (Intent, error) {
+		return Intent{}, refused
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("rejected plan returned %v", err)
+	}
+	records, err := j.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("rejected plan left %d records", len(records))
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, pathKey("namespace")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "allocation-") {
+			t.Fatalf("rejected plan left %s behind", entry.Name())
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, pathKey("namespace"), "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var idx index
+	if err = json.Unmarshal(data, &idx); err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.ActiveVMs) != 0 {
+		t.Fatalf("rejected plan indexed %v", idx.ActiveVMs)
+	}
+}
+func TestAcquireVMPlannedNeverPlansAgainstABusyGeneration(t *testing.T) {
+	j, _ := fixture(t)
+	h := acquireVM(t, j)
+	defer closeHandle(t, h)
+	var calls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := j.AcquireVMPlanned(ctx, "agent", func(string, []Record) (Intent, error) {
+		calls.Add(1)
+		return intent(), nil
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("busy generation returned %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("planner ran %d times against a held generation", calls.Load())
+	}
+}
+func TestAcquireVMResumesGenerationFromFingerprintOnlyIntent(t *testing.T) {
+	j, _ := fixture(t)
+	h := acquireVM(t, j)
+	original := h.Record()
+	closeHandle(t, h)
+	resumed, err := j.AcquireVM(context.Background(), "agent", Intent{IntentFingerprint: original.Intent.IntentFingerprint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeHandle(t, resumed)
+	record := resumed.Record()
+	if !resumed.Resumed || record.ID != original.ID {
+		t.Fatalf("resumed=%v id=%s, want the original generation %s", resumed.Resumed, record.ID, original.ID)
+	}
+	if record.Intent.PolicyFingerprint != original.Intent.PolicyFingerprint || string(record.Intent.Plan) != string(original.Intent.Plan) {
+		t.Fatalf("resume replaced the frozen intent: %+v", record.Intent)
 	}
 }

@@ -95,7 +95,7 @@ func cleanupPendingVMAllocation(step aj.Step, record aj.Record) bool {
 // storage/device readback establish ownership separately. A filename or task ID
 // alone never grants cleanup authority.
 func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record, step aj.Step) (aj.Verification, []string, error) {
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return aj.Verification{}, nil, err
 	}

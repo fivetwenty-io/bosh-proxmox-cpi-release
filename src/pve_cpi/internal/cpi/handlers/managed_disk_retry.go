@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -106,12 +107,25 @@ func (m *managedDiskRequest) retryRejected(ctx context.Context, handle *aj.Handl
 		m.failedTargets = map[string]bool{}
 	}
 	m.failedTargets[target.Node+"\x00"+target.StorageID] = true
+	refreshStart := time.Now().UTC()
 	snapshot, err := m.collector.Refresh(ctx, m.inventory)
 	if err != nil {
 		return err
 	}
 	request := m.iterator.req
 	request.Inventory = snapshot
+	// The re-plan sees whatever siblings claimed while this attempt ran, so the
+	// maps refresh alongside the inventory. Our own record is skipped, which
+	// keeps the retry free to stay on the share it already holds.
+	records, err := m.journal.List()
+	if err != nil {
+		return err
+	}
+	member, domain, err := managedDiskSiblingBytes(records, handle.Record().ID, refreshStart)
+	if err != nil {
+		return err
+	}
+	request.SiblingMemberBytes, request.SiblingDomainBytes = member, domain
 	if m.hint != "" {
 		node, e := managedDiskHintNode(ctx, m.deps, m.hint)
 		if e != nil {

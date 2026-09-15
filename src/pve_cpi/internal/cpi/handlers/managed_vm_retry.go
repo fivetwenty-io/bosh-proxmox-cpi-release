@@ -54,7 +54,7 @@ func managedVMAttemptClosed(record aj.Record) bool {
 	return len(record.Attempts) > 0 && record.Attempts[len(record.Attempts)-1].Completion != nil
 }
 func proveManagedVMAttemptAbsent(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record) (aj.Verification, error) {
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return aj.Verification{}, err
 	}
@@ -99,7 +99,15 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 		}
 		parsed.storagePlan = nil
 		parsed.storageRuntime = nil
-		next, replanErr := prepareManagedVMPlan(ctx, deps, parsed, selection)
+		// The re-plan charges the same in-flight siblings a first placement
+		// charges, so a fallback attempt does not pile onto a share a peer
+		// claimed while this attempt was running. Our own record is excluded,
+		// which leaves the retry free to return to the share it already holds.
+		siblings, replanErr := journal.List()
+		if replanErr != nil {
+			return nil, replanErr
+		}
+		next, replanErr := prepareManagedVMPlan(ctx, deps, parsed, selection, siblings, m.handle.Record().ID)
 		if replanErr != nil {
 			return nil, managedVMPlanCPIError(replanErr)
 		}

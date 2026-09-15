@@ -93,7 +93,7 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 	if !decision.PreviousWriterFenced || !decision.RemoteTasksSettled || strings.TrimSpace(decision.AuthorityID) == "" {
 		return ctx, nil, fmt.Errorf("pending mutation cleanup requires explicit writer fencing and independently settled remote tasks")
 	}
-	nodes, err := managedVMClusterNodes(ctx, deps)
+	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
 		return ctx, nil, err
 	}

@@ -357,7 +357,53 @@ func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, 
 	return 0
 }
 
-type storageJournalRecordSummary struct{ ID, Kind, State, CID, SHA256 string }
+// storageJournalRecordSummary is the operator-facing view of one journal
+// record. CreatedAt and UpdatedAt let an operator see how old a record is,
+// and Charging says whether the record's state currently charges its bytes
+// against every later create. Charging always comes from
+// handlers.StorageAllocationCharging, never from a second copy of the state
+// list here, so this view cannot drift from the planner's arithmetic.
+type storageJournalRecordSummary struct {
+	ID, Kind, State, CID, SHA256 string
+	CreatedAt, UpdatedAt         time.Time
+	Charging                     bool `json:"charging"`
+}
+
+// storageJournalChargingSummary lets an operator reading a long audit see, at
+// a glance, whether anything is charging bytes and how long the oldest such
+// record has been open, without scanning every row. It names nothing to age
+// a record out of its state; that decision stays with the operator.
+type storageJournalChargingSummary struct {
+	Count     int    `json:"count"`
+	OldestID  string `json:"oldest_id,omitempty"`
+	OldestAge string `json:"oldest_age,omitempty"`
+}
+
+// storageJournalChargingRecords finds the charging records among summaries and
+// reports how many there are and how old the oldest one is relative to now.
+// now is a parameter, not a call to time.Now(), so the computation stays
+// testable without a clock seam on the record itself.
+func storageJournalChargingRecords(
+	summaries []storageJournalRecordSummary, now time.Time,
+) storageJournalChargingSummary {
+	var result storageJournalChargingSummary
+	var oldest *storageJournalRecordSummary
+	for i := range summaries {
+		summary := summaries[i]
+		if !summary.Charging {
+			continue
+		}
+		result.Count++
+		if oldest == nil || summary.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = &summaries[i]
+		}
+	}
+	if oldest != nil {
+		result.OldestID = oldest.ID
+		result.OldestAge = now.Sub(oldest.CreatedAt).Round(time.Second).String()
+	}
+	return result
+}
 
 func validStorageJournalFlags(action string, fs *flag.FlagSet, configPath, authority string, fenced bool, request storageJournalMissingGeneration) bool {
 	if request.RecoveredTaskStep != "" || request.RecoveredTaskUPID != "" || request.RecoveredTaskEvidencePath != "" {
@@ -403,15 +449,25 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 	var summaries []storageJournalRecordSummary
 	for rIndex := range report.Records {
 		r := report.Records[rIndex]
-		summaries = append(summaries, storageJournalRecordSummary{r.ID, r.Kind, string(r.State), r.CID, concise.RecordSHA256[r.ID]})
+		summaries = append(summaries, storageJournalRecordSummary{
+			ID:        r.ID,
+			Kind:      r.Kind,
+			State:     string(r.State),
+			CID:       r.CID,
+			SHA256:    concise.RecordSHA256[r.ID],
+			CreatedAt: r.CreatedAt,
+			UpdatedAt: r.UpdatedAt,
+			Charging:  handlers.StorageAllocationCharging(r.State),
+		})
 	}
 	output := struct {
 		Records           []storageJournalRecordSummary   `json:"records"`
+		ChargingSummary   storageJournalChargingSummary   `json:"charging_summary"`
 		IndexHealthy      bool                            `json:"generation_index_healthy"`
 		IndexFinding      string                          `json:"generation_index_finding,omitempty"`
 		ClusterContinuity bool                            `json:"cluster_continuity"`
 		Audit             handlers.StorageAllocationAudit `json:"audit"`
-	}{summaries, indexErr == nil, "", continuity, outputReport}
+	}{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport}
 	if indexErr != nil {
 		output.IndexFinding = "generation index invalid or unavailable; record listing does not establish healthy authority"
 	}

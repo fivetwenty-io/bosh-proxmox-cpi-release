@@ -566,7 +566,9 @@ func createVM(
 		parsed.storageSelection = selection
 	}
 	if selection.FuturePersistentSet != "" {
-		prepared, planErr := prepareManagedVMPlan(ctx, deps, parsed, selection)
+		// No journal is open on this preflight, so there are no sibling
+		// allocations to charge against the ranking.
+		prepared, planErr := prepareManagedVMPlan(ctx, deps, parsed, selection, nil, "")
 		if planErr != nil {
 			return nil, managedVMPlanCPIError(planErr)
 		}

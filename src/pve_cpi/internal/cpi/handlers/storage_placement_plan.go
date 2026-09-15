@@ -9,9 +9,11 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
@@ -93,8 +95,23 @@ type StoragePlanRequest struct {
 	HANodes                                              []string
 	ExtraLimits                                          inv.Limits
 	RoleLimits                                           map[string]inv.Limits
-	SearchBudget                                         int
-	Clock                                                func() time.Time
+	// SiblingMemberBytes and SiblingDomainBytes are bytes already claimed by
+	// in-flight allocations outside this request, keyed by capacity key and by
+	// capacity domain key. They seed the root ranking ledger so a peer that
+	// started moments earlier is charged against this placement.
+	SiblingMemberBytes map[string]uint64
+	SiblingDomainBytes map[string]uint64
+	// SiblingGroupCounts is the number of records of our own instance group
+	// already placed on each capacity key, keyed by capacity key. It is empty
+	// on every path that does not compute a group, and an empty map means the
+	// ranking is not partitioned by sibling count.
+	SiblingGroupCounts map[string]int
+	// Group identifies the instance group this allocation belongs to, already
+	// sanitized for use as a tag value. It is empty when the request carries no
+	// instance group, which is the common create-env shape.
+	Group        string
+	SearchBudget int
+	Clock        func() time.Time
 }
 
 // StoragePlanTarget freezes one role's physical destination and virtual size.
@@ -120,6 +137,11 @@ type StorageAllocationPlan struct {
 	Definitions                                           map[string]pve.StorageInfo
 	CapacityDomains                                       map[string][]string
 	Rejections                                            []string
+	// Group is the sanitized instance group of this allocation. The omitempty
+	// tag is load-bearing: without it every plan the CPI writes would carry an
+	// empty Group, and an older release decoding a plan strictly would fail on
+	// every record rather than only on grouped ones.
+	Group string `json:",omitempty"`
 }
 type storagePlanOption struct {
 	target    StoragePlanTarget
@@ -336,7 +358,8 @@ func (i *StoragePlanIterator) Next(ctx context.Context) (*StorageAllocationPlan,
 			if role == nil {
 				return nil, planError(StoragePlanConfiguration, "operation creates no storage roles")
 			}
-			options, err := i.options(ctx, *role, bytes, inv.NewLedger(), i.req.Groups[i.group].Nodes, true)
+			seeded := inv.NewLedgerWithSiblings(i.req.SiblingMemberBytes, i.req.SiblingDomainBytes)
+			options, err := i.options(ctx, *role, bytes, seeded, i.req.Groups[i.group].Nodes, true)
 			if err != nil {
 				return nil, err
 			}
@@ -587,31 +610,25 @@ func (i *StoragePlanIterator) options(ctx context.Context, r StorageRoleSelectio
 		}
 	}
 	var candidates []rank.EligibleCandidate
+	// utilization holds each representative's projected member utilization as a
+	// percentage of its total capacity, keyed by capacity key. The anti-affinity
+	// partition reads it rather than projecting a second time.
+	utilization := make(map[string]float64, len(byBacking))
 	keys := make([]string, 0, len(byBacking))
 	for key := range byBacking {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		options := byBacking[key]
-		representative := options[0].candidate
-		// Conservative residual across alternatives freezes one node-independent weight.
-		for optionIndex := 1; optionIndex < len(options); optionIndex++ {
-			o := &options[optionIndex]
-			representative.Member.OutstandingBytes = max(representative.Member.OutstandingBytes, o.candidate.Member.OutstandingBytes)
-			representative.Member.AllocationBytes = max(representative.Member.AllocationBytes, o.candidate.Member.AllocationBytes)
-			representative.Domain.OutstandingBytes = max(representative.Domain.OutstandingBytes, o.candidate.Domain.OutstandingBytes)
-			representative.Domain.AllocationBytes = max(representative.Domain.AllocationBytes, o.candidate.Domain.AllocationBytes)
-		}
-		if _, err := rank.ProjectBudget(representative.Member); err != nil {
+		// A representative that no longer fits leaves a rejection behind, so an
+		// operator reading the plan can tell a member the ceiling excluded from
+		// one the ranking never saw.
+		representative, projected, err := collapseRepresentative(key, byBacking[key])
+		if err != nil {
+			i.rejectCandidate(r.Role, err)
 			continue
 		}
-		if representative.DomainKey != "" {
-			if _, err := rank.ProjectBudget(representative.Domain); err != nil {
-				continue
-			}
-		}
-		representative.BackingKey = key
+		utilization[key] = projectedBudgetUtilizationPct(projected)
 		candidates = append(candidates, representative)
 	}
 	policy := rank.Policy{Name: "spread", Version: 1}
@@ -621,9 +638,10 @@ func (i *StoragePlanIterator) options(ctx context.Context, r StorageRoleSelectio
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	ranked, err := rank.Rank(rank.RequestSnapshot{Policy: policy, Namespace: i.req.Namespace, AllocationKey: i.req.AllocationKey, AllocationGroup: r.Role, RequestedBytes: bytes, Seed: i.req.Seed, SeedSet: true}, candidates)
+	request := rank.RequestSnapshot{Policy: policy, Namespace: i.req.Namespace, AllocationKey: i.req.AllocationKey, AllocationGroup: r.Role, RequestedBytes: bytes, Seed: i.req.Seed, SeedSet: true}
+	ranked, err := i.rankCandidates(request, r, candidates, utilization, primary)
 	if err != nil {
-		return nil, planError(StoragePlanConfiguration, "rank: %v", err)
+		return nil, err
 	}
 	var out []storagePlanOption
 	for rangeIndex637 := range ranked {
@@ -641,6 +659,221 @@ func (i *StoragePlanIterator) options(ctx context.Context, r StorageRoleSelectio
 	}
 	return out, nil
 }
+
+// collapseRepresentative merges one capacity key's per-node options into the
+// single candidate the ranking sees. It takes the larger of each charge, so a
+// residual that depends on which node runs the plan is never understated, and
+// it returns the member projection the anti-affinity band reuses rather than
+// projecting the same budget twice.
+//
+// An error means the merged charge no longer fits. Every option was admitted on
+// its own when it was built, so only a merge of options that differ in opposite
+// directions can produce an infeasible representative, and discovery keeps two
+// members of one set off a shared backing. The check is therefore a guard
+// rather than a routine exclusion, and it now names the key it dropped.
+func collapseRepresentative(key string, options []storagePlanOption) (rank.EligibleCandidate, rank.BudgetProjection, error) {
+	if len(options) == 0 {
+		return rank.EligibleCandidate{}, rank.BudgetProjection{}, fmt.Errorf("capacity key %s has no options", key)
+	}
+	representative := options[0].candidate
+	// Conservative residual across alternatives freezes one node-independent weight.
+	for optionIndex := 1; optionIndex < len(options); optionIndex++ {
+		o := &options[optionIndex]
+		representative.Member.OutstandingBytes = max(representative.Member.OutstandingBytes, o.candidate.Member.OutstandingBytes)
+		representative.Member.AllocationBytes = max(representative.Member.AllocationBytes, o.candidate.Member.AllocationBytes)
+		representative.Domain.OutstandingBytes = max(representative.Domain.OutstandingBytes, o.candidate.Domain.OutstandingBytes)
+		representative.Domain.AllocationBytes = max(representative.Domain.AllocationBytes, o.candidate.Domain.AllocationBytes)
+	}
+	projected, err := rank.ProjectBudget(representative.Member)
+	if err != nil {
+		return rank.EligibleCandidate{}, rank.BudgetProjection{},
+			fmt.Errorf("capacity key %s cannot hold the combined charge: %w", key, err)
+	}
+	if representative.DomainKey != "" {
+		if _, err := rank.ProjectBudget(representative.Domain); err != nil {
+			return rank.EligibleCandidate{}, rank.BudgetProjection{},
+				fmt.Errorf("capacity domain %s cannot hold the combined charge for %s: %w", representative.DomainKey, key, err)
+		}
+	}
+	representative.BackingKey = key
+	return representative, projected, nil
+}
+
+// storageUtilizationEpsilon absorbs the last bits of a ratio of two integers,
+// so a member exactly on the edge of the band is treated as inside it.
+const storageUtilizationEpsilon = 1e-9
+
+// projectedBudgetUtilizationPct expresses a member's projected usage as a
+// percentage of its total capacity. ProjectBudget refuses a zero total, so the divisor is
+// positive for every projection this planner admits; the guard keeps a future
+// caller from dividing by zero rather than describing a reachable state.
+func projectedBudgetUtilizationPct(p rank.BudgetProjection) float64 {
+	if p.TotalBytes == 0 {
+		return 100
+	}
+	return 100 * float64(p.ProjectedUsedBytes) / float64(p.TotalBytes)
+}
+
+// StorageAntiAffinityGroupKey cuts a plan's group string down to the key two
+// allocations must share to count as siblings under one scope. The group is the
+// full deployment--<name>/instance-group--<name> pair that every plan persists.
+// The instance_group scope compares the whole pair, and the deployment scope
+// compares the deployment half alone. An empty group, the none scope, and any
+// scope this release does not know all return the empty string, which means no
+// allocation is ever a sibling and the ranking is left to the strategy.
+//
+// The layer that counts the journal's in-flight records owns the comparison: it
+// applies this to our own group and to each sibling's decoded group before it
+// compares the two. The persisted plan always keeps the full pair, because a
+// later create may read that record under a different scope.
+func StorageAntiAffinityGroupKey(group, scope string) string {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return ""
+	}
+	switch scope {
+	case config.StorageAntiAffinityScopeInstanceGroup:
+		return group
+	case config.StorageAntiAffinityScopeDeployment:
+		// A group with no instance group half is already a deployment key.
+		if deployment, _, found := strings.Cut(group, "/"); found {
+			return deployment
+		}
+		return group
+	default:
+		return ""
+	}
+}
+
+// antiAffinityScope reads the effective anti-affinity scope for one role. A
+// role that carries no set takes the package default, which is the same value
+// a declared set with no anti_affinity block reports.
+func antiAffinityScope(r StorageRoleSelection) string {
+	if r.Set == nil {
+		return config.DefaultStorageAntiAffinityScope
+	}
+	return r.Set.EffectiveAntiAffinityScope()
+}
+
+// antiAffinityBandPct reads the effective utilization band for one role, in
+// percentage points, with the same fallback as antiAffinityScope.
+func antiAffinityBandPct(r StorageRoleSelection) int {
+	if r.Set == nil {
+		return config.DefaultStorageAntiAffinityBandPct
+	}
+	return r.Set.EffectiveAntiAffinityBandPct()
+}
+
+// partitionsBySiblingCount reports whether the anti-affinity preference orders
+// this role's candidates. It runs for the primary root ranking only. The
+// dedicated ephemeral call passes primary false, create_disk ranks a persistent
+// role, and neither path ever carries sibling counts, so each of the three
+// conditions fails on its own. A scope of none or a request with no group also
+// leaves the ranking to the strategy alone.
+//
+// SiblingGroupCounts arrives keyed by capacity key and already cut to this
+// scope, because the layer that reads the journal compares our group against
+// each sibling's persisted group through StorageAntiAffinityGroupKey. The
+// planner gates on the scope here and takes the counts as given.
+func (i *StoragePlanIterator) partitionsBySiblingCount(r StorageRoleSelection, primary bool) bool {
+	if !primary || r.Role != storageRoleRoot || len(i.req.SiblingGroupCounts) == 0 {
+		return false
+	}
+	return StorageAntiAffinityGroupKey(i.req.Group, antiAffinityScope(r)) != ""
+}
+
+// rankCandidates orders one role's candidates with the configured strategy.
+//
+// When the anti-affinity preference does not apply this is a single ranking and
+// the order is exactly the strategy's. When it does apply, the candidates whose
+// projected utilization sits within the band of the least-utilized one are
+// bucketed by how many siblings of our own group already hold them, each
+// non-empty bucket is ranked on its own, and the buckets are concatenated in
+// ascending sibling order. Candidates outside the band are ranked once and
+// appended, so a member far fuller than the least-utilized one never wins on a
+// sibling count alone. Bucketing changes what each strategy sees, so a bucket's
+// order is not in general a subsequence of the strategy's order over the whole
+// set.
+func (i *StoragePlanIterator) rankCandidates(request rank.RequestSnapshot, r StorageRoleSelection,
+	candidates []rank.EligibleCandidate, utilization map[string]float64, primary bool) ([]rank.RankedCandidate, error) {
+	if !i.partitionsBySiblingCount(r, primary) {
+		return rankOnce(request, candidates)
+	}
+	band := antiAffinityBandPct(r)
+	minimum := math.Inf(1)
+	for index := range candidates {
+		if used, ok := utilization[candidates[index].BackingKey]; ok && used < minimum {
+			minimum = used
+		}
+	}
+	buckets := map[int][]rank.EligibleCandidate{}
+	var counts []int
+	var outside []rank.EligibleCandidate
+	for index := range candidates {
+		used, measured := utilization[candidates[index].BackingKey]
+		// An unmeasured candidate sits outside the band rather than ahead of a
+		// member we did measure.
+		if !measured || used-minimum > float64(band)+storageUtilizationEpsilon {
+			outside = append(outside, candidates[index])
+			continue
+		}
+		count := i.req.SiblingGroupCounts[candidates[index].BackingKey]
+		if _, seen := buckets[count]; !seen {
+			counts = append(counts, count)
+		}
+		buckets[count] = append(buckets[count], candidates[index])
+	}
+	sort.Ints(counts)
+	ranked := make([]rank.RankedCandidate, 0, len(candidates))
+	// An empty bucket is skipped rather than ranked, because Rank validates its
+	// own result and rejects a call with nothing to order.
+	for _, count := range counts {
+		bucket, err := rankOnce(request, buckets[count])
+		if err != nil {
+			return nil, err
+		}
+		ranked = append(ranked, i.annotateSiblingBand(bucket, band, true)...)
+	}
+	if len(outside) > 0 {
+		bucket, err := rankOnce(request, outside)
+		if err != nil {
+			return nil, err
+		}
+		ranked = append(ranked, i.annotateSiblingBand(bucket, band, false)...)
+	}
+	return ranked, nil
+}
+
+func rankOnce(request rank.RequestSnapshot, candidates []rank.EligibleCandidate) ([]rank.RankedCandidate, error) {
+	ranked, err := rank.Rank(request, candidates)
+	if err != nil {
+		return nil, planError(StoragePlanConfiguration, "rank: %v", err)
+	}
+	return ranked, nil
+}
+
+// annotateSiblingBand appends the partition's evidence to each candidate's
+// reason, which is where an operator reads why a member won. Rank validates
+// that a strategy left the candidate facts alone, so the reason is only ever
+// touched after Rank has returned, and every built-in strategy fills it with an
+// explanation of its own ordering first.
+func (i *StoragePlanIterator) annotateSiblingBand(ranked []rank.RankedCandidate, band int, inBand bool) []rank.RankedCandidate {
+	for index := range ranked {
+		count := i.req.SiblingGroupCounts[ranked[index].Candidate.BackingKey]
+		placement, bucket := "outside band", "none"
+		if inBand {
+			placement, bucket = "in band", strconv.Itoa(count)
+		}
+		note := fmt.Sprintf("anti-affinity %s %d%%, bucket %s, siblings %d", placement, band, bucket, count)
+		if ranked[index].Reason == "" {
+			ranked[index].Reason = note
+			continue
+		}
+		ranked[index].Reason += "; " + note
+	}
+	return ranked
+}
+
 func (i *StoragePlanIterator) isoTarget(node, root string) (string, error) {
 	id := i.req.OriginalISOStorage
 	if i.req.ISOFollowRoot && (id == "" || id == "local") {
@@ -728,7 +961,7 @@ func (i *StoragePlanIterator) makePlan(root storagePlanOption, ep *storagePlanOp
 			}
 		}
 	}
-	return &StorageAllocationPlan{Version: 1, Namespace: i.req.Namespace, AllocationKey: i.req.AllocationKey, PolicyFingerprint: i.fingerprint, AZ: i.req.Groups[i.group].AZ, Node: root.target.Node, Seed: i.req.Seed, HANodes: i.haNodes(), Targets: targets, Charges: storagePlanExecutionCharges(l.Records(), targets), Rankings: rankings, Strategies: strategies, Definitions: definitions, CapacityDomains: domains, Rejections: slices.Clone(i.rejections)}
+	return &StorageAllocationPlan{Version: 1, Group: i.req.Group, Namespace: i.req.Namespace, AllocationKey: i.req.AllocationKey, PolicyFingerprint: i.fingerprint, AZ: i.req.Groups[i.group].AZ, Node: root.target.Node, Seed: i.req.Seed, HANodes: i.haNodes(), Targets: targets, Charges: storagePlanExecutionCharges(l.Records(), targets), Rankings: rankings, Strategies: strategies, Definitions: definitions, CapacityDomains: domains, Rejections: slices.Clone(i.rejections)}
 }
 
 func (i *StoragePlanIterator) haNodes() []string {
