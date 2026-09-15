@@ -933,6 +933,12 @@ func TestResolveDiskHolder_CountsUnusedSlotReferences(t *testing.T) {
 					// A cloud-init drive parked in an unused slot is still not
 					// a volume anyone proves an absence for.
 					"unused2": "nfs-images:400/vm-400-cloudinit.qcow2",
+					// A stale unused slot naming the volume the scan is looking
+					// for is the one entry that may never count: the scan does
+					// not read it as a holder, so the caller goes on to prove
+					// that volume absent, and its own stale entry cannot be
+					// evidence against that.
+					"unused3": "nfs-images:999/vm-999-disk-0.qcow2",
 				}, nil
 			},
 		},
@@ -944,7 +950,8 @@ func TestResolveDiskHolder_CountsUnusedSlotReferences(t *testing.T) {
 		t.Fatalf("ResolveDiskHolder: %v", err)
 	}
 	if got := holder.StorageReferences.OnNode("nfs-images", "pve-03"); got != 2 {
-		t.Errorf("nfs-images on pve-03: want both unused disks counted and the cloud-init drive left out, got %d", got)
+		t.Errorf("nfs-images on pve-03: want both unused disks counted and the cloud-init drive and the "+
+			"scan's own target left out, got %d", got)
 	}
 }
 
@@ -975,7 +982,9 @@ func TestResolveDiskHolder_CountsRideOutOnTheHolder(t *testing.T) {
 	if !holder.Found || holder.VMID != 300 {
 		t.Fatalf("holder: want vmid 300, got %+v", holder)
 	}
-	if got := holder.StorageReferences.OnNode("local-lvm", "pve-01"); got != 2 {
-		t.Errorf("local-lvm: want 2 disk references on the holder's own config, got %d", got)
+	// The disk the scan was looking for is left out of its own counts, so the
+	// holder's config contributes only its other disk.
+	if got := holder.StorageReferences.OnNode("local-lvm", "pve-01"); got != 1 {
+		t.Errorf("local-lvm: want the holder's other disk counted and the scan target left out, got %d", got)
 	}
 }

@@ -123,10 +123,12 @@ func TestJournalVolumesOnStorage_UnclassifiedStorage_ReadsOnlyTheProbedNode(t *t
 	}
 }
 
-// TestJournalVolumesOnStorage_PlannedStepIsNotCounted is the state rule. The
-// journal persists a step's intent before it submits the create call, so an
-// intended volume on a planned step names something that was never created.
-func TestJournalVolumesOnStorage_PlannedStepIsNotCounted(t *testing.T) {
+// TestJournalVolumesOnStorage_PlannedStepIsCounted is the state rule. The
+// journal persists a step's intent before it submits the create call, and a
+// planned step with no UPID may be an allocation whose process died after the
+// call went out, so the audit counts it as a known volume and this source
+// agrees rather than assuming nothing was submitted.
+func TestJournalVolumesOnStorage_PlannedStepIsCounted(t *testing.T) {
 	t.Parallel()
 
 	planned := aj.Step{
@@ -136,8 +138,8 @@ func TestJournalVolumesOnStorage_PlannedStepIsNotCounted(t *testing.T) {
 		Target: aj.Target{Node: journalCountNode, Storage: journalCountStorage, IntendedVolume: journalCountOther},
 	}
 	records := []aj.Record{liveRecord("other", planned)}
-	if got := journalVolumesOnStorage(records, sharedJournalProbe()); got != 0 {
-		t.Errorf("a volume no create call was ever made for contradicts nothing, want 0, got %d", got)
+	if got := journalVolumesOnStorage(records, sharedJournalProbe()); got != 1 {
+		t.Errorf("a planned volume may have been created before the process died, want 1, got %d", got)
 	}
 }
 

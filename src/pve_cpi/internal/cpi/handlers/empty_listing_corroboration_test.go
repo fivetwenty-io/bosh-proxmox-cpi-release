@@ -481,22 +481,27 @@ func TestDeleteDisk_EmptyListing_NothingContradicts(t *testing.T) {
 	}
 }
 
-// TestDeleteDisk_EmptyListing_PlannedAllocationDoesNotContradict is the state
-// rule on the handler path. Another allocation that recorded its intent and
-// then failed before the create call names a volume PVE never made, so it is no
-// evidence that the storage holds anything, and delete_disk stays idempotent.
-func TestDeleteDisk_EmptyListing_PlannedAllocationDoesNotContradict(t *testing.T) {
+// TestDeleteDisk_EmptyListing_PlannedAllocationContradicts is the state rule
+// on the handler path. Another allocation that recorded its intent and never
+// recorded submitting may have made the volume before its process died, which
+// is how the audit reads the same record, so it still contradicts an empty
+// listing, and settling it is the allocation cleanup's job rather than the
+// proof's.
+func TestDeleteDisk_EmptyListing_PlannedAllocationContradicts(t *testing.T) {
 	t.Parallel()
 
 	fixture := newCorroborationFixture(t, corroborationSetup{
 		plannedVolid: corroborationJournalVolid,
 		statusActive: true,
 	})
-	if err := deleteCorroborationDisk(t, fixture); err != nil {
-		t.Fatalf("a volume no create call was ever made for must not refuse the delete, got %v", err)
+	if err := deleteCorroborationDisk(t, fixture); err == nil {
+		t.Fatal("a planned allocation the journal never saw settle must not be read as a completed delete")
+	}
+	if reason := unprovenAbsenceReason(fixture.observer); !strings.Contains(reason, pve.CorroborationSourceJournal) {
+		t.Errorf("the operator must be told the journal contradicted the listing, got %q", reason)
 	}
 	if *fixture.deleteCalls != 0 {
-		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
 	}
 }
 
