@@ -149,6 +149,52 @@ func anchorMissingRefusal(ctx context.Context, deps Deps, method, diskCID string
 	)
 }
 
+// proveAnchorVolumeGone reports whether the volume behind a promised anchor is
+// provably not on storage. The anchor refusal reads "no holder" as a parker
+// deleted out of band, which is only the right reading while the volume is
+// still there. An absence we cannot prove is not an absence, so the caller
+// keeps its refusal, and the warning says so: the operator is looking at a
+// refusal standing on an unproven absence, not at an established fact.
+//
+// log.Err delegates to ErrScrubbed, so the probe error reaches the sink with
+// URL credentials masked, which is the house rule for logging an error this
+// package did not construct.
+func proveAnchorVolumeGone(ctx context.Context, deps Deps, method, diskCID, volid, node string) bool {
+	gone, err := volumeAbsentFromStorage(ctx, deps, node, volid)
+	if err != nil {
+		deps.Log(ctx).Warn("parked anchor missing and the volume's absence could not be proven; the refusal stands",
+			log.String("method", method),
+			log.String("disk_cid", diskCID),
+			log.String("node", node),
+			log.Err(err),
+		)
+		return false
+	}
+	return gone
+}
+
+// anchorVolumeGoneRefusal returns the refusal for a promised anchor whose
+// parker and whose volume are both gone. It is deliberately a different
+// message from anchorMissingRefusal, and deliberately carries no strict-mode
+// advice: relaxing pve.parked_anchor_strict lets a caller proceed against a
+// free-floating volume, and there is no volume left to proceed against. The
+// only way forward is to take the disk out of the Director's records.
+//
+// The class is cpierrors.Cloud rather than DiskNotFound. DiskNotFound is
+// semantically closer, but it is a class the Director acts on, and an attach
+// step acting on it for a disk the deployment manifest still asks for is not a
+// behavior we want to discover in the field.
+func anchorVolumeGoneRefusal(method, diskCID, volid string) error {
+	return cpierrors.Cloud(
+		"%s: disk %s was created under the parked strategy and its CID promises a parker anchor, but no VM "+
+			"in the cluster references the volume and the volume %s is not on storage; the parker VM and the "+
+			"disk it held were both removed out-of-band, so the data is gone. Remove the disk from the "+
+			"Director's records with `bosh -d <deployment> cck` (or drop it from the create-env state file) "+
+			"and redeploy to have a fresh disk created",
+		method, diskCID, volid,
+	)
+}
+
 // strandedParkerRefusal returns a refusal when a volume's holder carries the
 // bosh-parker tag but sits outside the configured band, and nil otherwise.
 //

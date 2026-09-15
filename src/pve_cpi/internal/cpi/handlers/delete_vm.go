@@ -898,8 +898,21 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	// present) so a transient error never green-lights destroying a live
 	// volume. Probe on the VM's node: any volume still referenced by this
 	// VM's config is reachable from there.
+	unusedSlots := pve.FindUnusedDiskEntries(vmCfg)
+	if len(unusedSlots) == 0 {
+		return nil
+	}
+	// The absence proof classifies the storage before it will read a content
+	// listing that omits the volume as an absence. Every slot below is probed
+	// against the one configured disk storage, so resolve that classification
+	// once here rather than re-reading the storage index for each slot.
+	slotStorageInfo, slotStorageKnown := liveStorageInfo(ctx, deps, diskStorage)
+	classifySlotStorage := func(context.Context) (pve.StorageInfo, bool) {
+		return slotStorageInfo, slotStorageKnown
+	}
+
 	var protected []string
-	for slot, volid := range pve.FindUnusedDiskEntries(vmCfg) {
+	for slot, volid := range unusedSlots {
 		storage, _, parseErr := pve.ParseDiskCID(volid)
 		if parseErr != nil {
 			// Unparseable volid -- skip; can't determine storage.
@@ -924,15 +937,18 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
 			continue
 		}
-		// ExistsTolerant: block-backed storages return 500 with
-		// "Failed to find logical volume" for missing LVs rather
-		// than 404. Treat those as "volume gone" so a stale unused
-		// slot pointing at a deleted volume does not wedge delete_vm.
-		exists, existErr := pve.ExistsTolerant(ctx, deps.PVE, node, diskStorage, volid)
-		if existErr != nil {
+		// ProveVolumeAbsent: block-backed storages return 500 with
+		// "Failed to find logical volume" for missing LVs rather than 404,
+		// and file storages return 500 naming volume_size_info for a stat
+		// that did not work. The first folds through the tolerant point
+		// probe and the second is settled by a storage content listing, so
+		// a stale unused slot pointing at a deleted volume no longer wedges
+		// delete_vm on either kind of storage.
+		absent, probeErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, diskStorage, volid, classifySlotStorage)
+		if probeErr != nil {
 			deps.Log(ctx).Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
-				log.String("slot", slot), log.String("volid", volid), log.Err(existErr))
-		} else if !exists {
+				log.String("slot", slot), log.String("volid", volid), log.Err(probeErr))
+		} else if absent {
 			deps.Log(ctx).Info("delete_vm: ignoring stale unused slot -- volume already deleted",
 				log.String("slot", slot), log.String("volid", volid))
 			continue

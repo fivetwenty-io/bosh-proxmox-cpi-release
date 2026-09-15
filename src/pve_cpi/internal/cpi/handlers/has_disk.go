@@ -107,12 +107,16 @@ func HandleHasDisk(deps Deps) Handler {
 		}
 
 		// ----------------------------------------------------------------
-		// 4. Call storage.Exists via ExistsTolerant so block-backed
-		//    storages (lvmthin/zfspool) that return 500 wrapping
-		//    "Failed to find logical volume" / "dataset does not exist"
-		//    for a missing volume report a clean (false, nil) — has_disk
-		//    must answer false for a just-deleted disk regardless of
-		//    backend, not raise a retriable cloud error.
+		// 4. Settle existence through pve.ProveVolumeAbsent. It starts from
+		//    the same tolerant point probe, so block-backed storages
+		//    (lvmthin/zfspool) that return 500 wrapping "Failed to find
+		//    logical volume" / "dataset does not exist" for a missing volume
+		//    still report a clean false. When the point probe cannot answer
+		//    at all, which is what dir, NFS, and CIFS storage do for a
+		//    missing file, with an HTTP 500 naming volume_size_info rather
+		//    than a 404 — a storage content listing settles it instead, and
+		//    bosh cck gets the false it needs. An absence the listing cannot
+		//    prove stays an error rather than becoming a guess.
 		// ----------------------------------------------------------------
 		// RetryOnTransient + WrapError below: without them a single pvedaemon
 		// worker recycle (HTTP 596/5xx) during the Exists call turned
@@ -133,7 +137,27 @@ func HandleHasDisk(deps Deps) Handler {
 				)
 				return false, nil
 			}
-			return nil, cpierrors.Wrap(pve.WrapError(err), "has_disk: Exists check failed for "+diskCID+" on node "+node)
+			// The point probe never answered. Settle the question from a
+			// storage content listing, which is the observation that can tell
+			// a missing file from a backing that went away. The probe error
+			// travels on rather than the proof's, so a cycling pvedaemon
+			// worker still reaches the Director as the retriable fault it is.
+			absent, proofErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, bareDiskCID,
+				handlerStorageClassifier(deps, storage))
+			if proofErr != nil {
+				deps.Log(ctx).Warn("has_disk: the volume's presence could not be proven from a content listing",
+					log.String("disk_cid", diskCID),
+					log.String("node", node),
+					log.Err(proofErr),
+				)
+				return nil, cpierrors.Wrap(pve.WrapError(err),
+					"has_disk: Exists check failed for "+diskCID+" on node "+node)
+			}
+			deps.Log(ctx).Debug("has_disk: settled from a storage content listing",
+				log.String("disk_cid", diskCID),
+				log.Bool("exists", !absent),
+			)
+			return !absent, nil
 		}
 
 		deps.Log(ctx).Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))

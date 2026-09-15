@@ -957,8 +957,17 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	}
 
 	// A disk whose CID promises a parker anchor must have a holder while
-	// detached; no holder at all means the parker vanished out-of-band.
+	// detached; no holder at all means the parker vanished out-of-band. When
+	// the volume is also provably off storage, the parker and the disk it held
+	// went together, so the strict-mode escape hatch has nothing to offer and
+	// the refusal says the data is gone instead. An absence we cannot prove
+	// keeps the original refusal. create_vm reaches this same code through
+	// create_vm_disk.go when the manifest carries disk_cids, so both paths
+	// pick the new outcome up from here.
 	if anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder); anchorErr != nil {
+		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid, node) {
+			return attachPlan{}, anchorVolumeGoneRefusal(op, rd.diskCID, rd.volid)
+		}
 		return attachPlan{}, anchorErr
 	}
 
