@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 
@@ -107,6 +108,17 @@ func nfsNoFormat(volid string) error {
 func makeAPIErr(httpCode int, msg string) error {
 	body, _ := json.Marshal(map[string]any{"message": msg, "code": httpCode})
 	return sdkerrors.ParseAPIError(httpCode, body)
+}
+
+// liveBackendResolver builds the production backend resolver over a mock
+// client, so a test can exercise the real shared-versus-local classification
+// instead of the static fallback that calls every storage shared. A local
+// storage is what dir, btrfs, lvm, lvmthin, and zfspool actually are, and the
+// node sweep a local backend runs is a different code path from the single
+// probe a shared one takes.
+func liveBackendResolver(client pve.Client, defaultNode string) pve.BackendResolver {
+	cache := pve.NewStorageInfoCache(pve.ClusterStorageAsLister(client.ClusterStorage()), time.Minute)
+	return pve.NewBackendResolver(client, cache, defaultNode)
 }
 
 // storageContentListing renders a ListStorageContent reply carrying exactly
@@ -1001,6 +1013,11 @@ type mockClusterStorage struct {
 	// whether an empty content listing means anything. Empty leaves the key
 	// out of the entry, which is the shape of a storage that never set it.
 	isMountpoint string
+	// nodes is PVE's comma-separated node restriction. A local backend that
+	// has one probes exactly those nodes and skips the cluster membership
+	// listing, which is what lets a test drive the node sweep without wiring
+	// a corosync answer.
+	nodes string
 }
 
 func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
@@ -1015,6 +1032,9 @@ func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.Li
 	}
 	if s.isMountpoint != "" {
 		entry["is_mountpoint"] = s.isMountpoint
+	}
+	if s.nodes != "" {
+		entry["nodes"] = s.nodes
 	}
 	raw, _ := json.Marshal(entry)
 	resp := clusterstorage.ListStorageResponse{json.RawMessage(raw)}
@@ -1035,6 +1055,22 @@ func (s *mockClusterStorage) UpdateStorage(_ context.Context, _ string, _ *clust
 }
 
 var _ clusterstorage.Service = (*mockClusterStorage)(nil)
+
+// countingClusterStorage counts the storage-index reads a handler makes. The
+// absence proof reads the index only when it has to weigh a content listing,
+// so a call whose point probes all answer should never touch it, and a call
+// that weighs several volumes against one storage should touch it once.
+type countingClusterStorage struct {
+	*mockClusterStorage
+	calls int
+}
+
+func (s *countingClusterStorage) ListStorage(
+	ctx context.Context, params *clusterstorage.ListStorageParams,
+) (*clusterstorage.ListStorageResponse, error) {
+	s.calls++
+	return s.mockClusterStorage.ListStorage(ctx, params)
+}
 
 // clusterVMOnNode builds a ListResourcesResponse placing vmid on node.
 // Used to feed FindVMNodeViaCluster in tests that need the cluster scan to

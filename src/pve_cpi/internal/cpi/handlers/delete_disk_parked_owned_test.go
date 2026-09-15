@@ -18,6 +18,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -269,6 +270,11 @@ func newFileAnchorProof(
 	listing func() (*sdknodes.ListStorageContentResponse, error),
 	visibilityErr error,
 ) fileAnchorProof {
+	// The storage type alone decides shared versus local, exactly as it does
+	// in PVE: nfs is cluster-visible and dir is node-local. Nothing here sets
+	// a shared flag by hand, because a dir storage flagged shared is a shape
+	// production never produces, and testing against it would hide the node
+	// sweep a local backend really runs before delete_disk sees the disk.
 	deleteCalls := 0
 	storageSvc := &mockStorageService{
 		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
@@ -302,8 +308,11 @@ func newFileAnchorProof(
 			clusterStorageSvc: &mockClusterStorage{
 				storageName:  storageName,
 				storageType:  storageType,
-				shared:       true,
 				isMountpoint: isMountpoint,
+				// A local storage restricted to the one node the fixture
+				// runs on keeps the node sweep off the cluster membership
+				// listing, which this suite does not script.
+				nodes: fileAnchorNode,
 			},
 		},
 		visibilityErr: visibilityErr,
@@ -318,8 +327,9 @@ func newFileAnchorProof(
 			ParkedDiskVMIDRangeStart: 90000,
 			ParkedDiskVMIDRangeEnd:   90999,
 		},
-		PVE:    client,
-		Logger: logger,
+		PVE:      client,
+		Resolver: liveBackendResolver(client, fileAnchorNode),
+		Logger:   logger,
 	}
 	return fileAnchorProof{deps: deps, observer: observer, deleteCalls: &deleteCalls}
 }
@@ -432,24 +442,47 @@ func TestHandleDeleteDisk_AnchorMissing_NFSVisibilityUnproven_Refuses(t *testing
 // dropped-mount case. PVE lists a dir storage with no is_mountpoint as an
 // empty array once its mount goes away, exactly as it lists a storage that is
 // genuinely empty, so an empty listing settles nothing there.
+//
+// A dir storage is node-local, so the refusal an operator actually meets
+// comes from the node sweep rather than from the anchor guard: delete_disk
+// asks the backend which node holds the volume, every candidate answers
+// unproven, and a sweep that could not prove the volume absent anywhere is
+// retriable by design. What matters is that the delete does not proceed and
+// that the message carries the fix.
 func TestHandleDeleteDisk_AnchorMissing_PlainDirEmptyListing_Refuses(t *testing.T) {
 	t.Parallel()
 
 	fixture := newFileAnchorProof(fileAnchorDirStorage, "dir", "", emptyStorageListing, nil)
-	if err := deleteFileAnchorDisk(t, fixture, fileAnchorDirVolid); err == nil {
+	err := deleteFileAnchorDisk(t, fixture, fileAnchorDirVolid)
+	if err == nil {
 		t.Fatal("an empty listing on a plain dir storage must not prove absence")
 	}
-	if !warnsAbsenceUnproven(fixture.observer) {
-		t.Error("a refusal standing on an unproven absence must say so in the log")
+	if !strings.Contains(err.Error(), "is_mountpoint") {
+		t.Errorf("the message must name the fix that turns a dropped mount into an honest failure, got %v", err)
+	}
+	if !strings.Contains(err.Error(), fileAnchorDirStorage) {
+		t.Errorf("the message must name the storage to set it on, got %v", err)
+	}
+	if !okToRetry(err) {
+		t.Errorf("a sweep that could not prove the volume absent anywhere is retriable, got %v", err)
 	}
 	if *fixture.deleteCalls != 0 {
 		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
 	}
 }
 
+// okToRetry reports whether the Director may re-drive the call that produced
+// err.
+func okToRetry(err error) bool {
+	var typed *cpierrors.Error
+	return errors.As(err, &typed) && typed.OkToRetry()
+}
+
 // TestHandleDeleteDisk_AnchorMissing_PlainDirPopulatedListing_Idempotent is
 // the other half of that rule. Other volumes in the listing prove the tree is
-// really mounted, which is the evidence an empty array cannot give.
+// really mounted, which is the evidence an empty array cannot give. On a
+// node-local dir storage the sweep reaches that conclusion for every node, so
+// delete_disk settles the call as already done before the anchor guard runs.
 func TestHandleDeleteDisk_AnchorMissing_PlainDirPopulatedListing_Idempotent(t *testing.T) {
 	t.Parallel()
 
@@ -471,7 +504,8 @@ func TestHandleDeleteDisk_AnchorMissing_PlainDirPopulatedListing_Idempotent(t *t
 // TestHandleDeleteDisk_AnchorMissing_DirWithIsMountpoint_Idempotent pins the
 // fix the unproven message advises. With is_mountpoint set, PVE refuses to
 // activate the storage when the mount is gone, so an empty listing from a
-// storage that answered at all is proof.
+// storage that answered at all is proof, and the same delete that hung on the
+// message above now completes.
 func TestHandleDeleteDisk_AnchorMissing_DirWithIsMountpoint_Idempotent(t *testing.T) {
 	t.Parallel()
 

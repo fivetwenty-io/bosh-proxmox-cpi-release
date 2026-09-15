@@ -963,9 +963,11 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	// the refusal says the data is gone instead. An absence we cannot prove
 	// keeps the original refusal. create_vm reaches this same code through
 	// create_vm_disk.go when the manifest carries disk_cids, so both paths
-	// pick the new outcome up from here.
+	// pick the new outcome up from here. The proof resolves the disk's own
+	// location rather than using node, which by this point names the VM the
+	// disk is being attached to.
 	if anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder); anchorErr != nil {
-		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid, node) {
+		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid) {
 			return attachPlan{}, anchorVolumeGoneRefusal(op, rd.diskCID, rd.volid)
 		}
 		return attachPlan{}, anchorErr

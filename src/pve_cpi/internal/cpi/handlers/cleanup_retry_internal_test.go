@@ -11,7 +11,9 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -347,6 +349,9 @@ func TestSweepEphemeralVolume_ProbeError_WarnsWithVolid(t *testing.T) {
 			if got, _ := e.Attrs["volid"].(string); got != "local:vm-596-disk-1" {
 				t.Errorf("probe warn must name the volid, got %v", e.Attrs["volid"])
 			}
+			if got, _ := e.Attrs["probe_scope"].(string); got != "node pve1" {
+				t.Errorf("probe warn must name where the volume was looked for, got %v", e.Attrs["probe_scope"])
+			}
 		}
 	}
 	if !warned {
@@ -608,3 +613,94 @@ func TestSweepUnusedDiskSlot_PersistentLockTimeout_TransientBudget(t *testing.T)
 func (p *crhPools) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
 }
+
+// crhNodes serves the content listing the absence proof reads. crhClient
+// returns a nil nodes service, which is what a suite that never needed a
+// listing wants; a case that does need one wraps its client.
+type crhNodes struct {
+	sdknodes.Service
+	listing *sdknodes.ListStorageContentResponse
+}
+
+func (n *crhNodes) ListStorageContent(
+	_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams,
+) (*sdknodes.ListStorageContentResponse, error) {
+	return n.listing, nil
+}
+
+// crhListingClient is crhClient with a nodes service attached.
+type crhListingClient struct {
+	*crhClient
+	nodes sdknodes.Service
+}
+
+func (c *crhListingClient) Nodes() sdknodes.Service { return c.nodes }
+
+// crhListingOf builds a content listing carrying exactly the given volids.
+func crhListingOf(volids ...string) *sdknodes.ListStorageContentResponse {
+	out := make(sdknodes.ListStorageContentResponse, 0, len(volids))
+	for _, volid := range volids {
+		raw, _ := json.Marshal(map[string]string{"volid": volid})
+		out = append(out, raw)
+	}
+	return &out
+}
+
+// TestSweepEphemeralVolume_FileStorageNoFormat_StillSweeps is the file-storage
+// half of the ephemeral sweep. PVE answers the volume GET for a file it cannot
+// stat with an HTTP 500 naming volume_size_info, so the bare existence probe
+// this used to run skipped the sweep on dir, NFS, and CIFS every time and left
+// the volume a failed create had already committed. The listing carries the
+// volume, which settles that the sweep has work to do.
+func TestSweepEphemeralVolume_FileStorageNoFormat_StillSweeps(t *testing.T) {
+	t.Parallel()
+
+	const canonical = "nfs-images:596/vm-596-disk-1.qcow2"
+	s := &crhStorage{existsFn: func() (bool, error) {
+		return false, fmt.Errorf("volume_size_info on '%s' failed - no format", canonical)
+	}}
+	client := &crhListingClient{
+		crhClient: &crhClient{storage: s},
+		nodes:     &crhNodes{listing: crhListingOf(canonical)},
+	}
+	deps := Deps{PVE: client, Logger: log.NewNopLogger()}
+	shape := &createVMShape{node: "pve1", ephemeralStorage: "nfs-images"}
+
+	sweepEphemeralVolumeAfterCreateFailure(crhCtx(), deps, log.NewNopLogger(), shape, 596, "596/vm-596-disk-1.qcow2")
+
+	if s.deleteAsyncCalls != 1 {
+		t.Fatalf("a volume the listing shows on storage must be swept, got %d delete calls", s.deleteAsyncCalls)
+	}
+}
+
+// TestSweepEphemeralVolume_FileStorageProvenAbsent_SkipsSweep is the other
+// direction. Nothing was committed, so there is nothing to delete, and the
+// sweep must not issue an imgdel for a volume that is not there.
+func TestSweepEphemeralVolume_FileStorageProvenAbsent_SkipsSweep(t *testing.T) {
+	t.Parallel()
+
+	const canonical = "nfs-images:596/vm-596-disk-1.qcow2"
+	s := &crhStorage{existsFn: func() (bool, error) {
+		return false, fmt.Errorf("volume_size_info on '%s' failed - no format", canonical)
+	}}
+	client := &crhVisibleClient{crhListingClient: &crhListingClient{
+		crhClient: &crhClient{storage: s},
+		nodes:     &crhNodes{listing: crhListingOf()},
+	}}
+	deps := Deps{PVE: client, Logger: log.NewNopLogger()}
+	shape := &createVMShape{node: "pve1", ephemeralStorage: "nfs-images"}
+
+	sweepEphemeralVolumeAfterCreateFailure(crhCtx(), deps, log.NewNopLogger(), shape, 596, "596/vm-596-disk-1.qcow2")
+
+	if s.deleteAsyncCalls != 0 {
+		t.Fatalf("nothing was committed, so nothing may be deleted, got %d delete calls", s.deleteAsyncCalls)
+	}
+}
+
+// crhVisibleClient answers the audit-visibility proof the listing demands
+// before it will call a volume absent.
+type crhVisibleClient struct {
+	*crhListingClient
+}
+
+func (c *crhVisibleClient) StorageAuditVisibility(context.Context) error { return nil }
