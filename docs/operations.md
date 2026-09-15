@@ -609,14 +609,15 @@ A template tagged `bosh-stemcell-node-<node>` or `bosh-stemcell-storage-<storage
 
 ### Which stemcell is a VM running?
 
-Every VM the CPI creates carries a `stemcell--<name>-<version>` tag naming the stemcell it booted from, and the same identity in its Notes under the `bosh_stemcell` key. A Director never sends the stemcell in its `set_vm_metadata` payload, so before this the answer lived only inside the guest; now PVE can answer it, and so can a create-env Director, which receives no `set_vm_metadata` call at all.
+Every VM the CPI creates carries a `stemcell--<name>-<version>` tag naming the stemcell it booted from, and the same identity in its Notes under the `bosh_stemcell` key. A Director never sends the stemcell in its `set_vm_metadata` payload, so before this the answer lived only inside the guest. Now PVE can answer it, and so can a create-env Director, which receives no `set_vm_metadata` call at all.
 
 The tag uses the CPI's usual tag alphabet, so the version's dot becomes a dash, and the stemcell `bosh-openstack-kvm-ubuntu-noble-1.585` is tagged `stemcell--bosh-openstack-kvm-ubuntu-noble-1-585`. The Notes record keeps the exact version, along with the full stemcell CID, its kind, and its content sha8.
 
 ```bash
 # Every VM still on a given stemcell
 pvesh get /cluster/resources --type vm \
-  | jq -r '.[] | select(.tags != null and (.tags | contains("stemcell--bosh-openstack-kvm-ubuntu-noble-1-585"))) | "\(.vmid) \(.name)"'
+  | jq -r --arg want stemcell--bosh-openstack-kvm-ubuntu-noble-1-585 \
+      '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.name)"'
 
 # Group the whole cluster by stemcell, to see what a bump has left behind
 pvesh get /cluster/resources --type vm \
@@ -628,7 +629,11 @@ pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json \
   | jq -r '.description' | grep -o '<!--BOSH:.*-->' | sed 's/<!--BOSH://; s/-->//' | jq '.bosh_stemcell'
 ```
 
-Both are written once, when the VM is created, and neither is rebuilt afterwards. A VM whose tag names an old stemcell has genuinely not been recreated since that stemcell was current, which is exactly the question a stemcell bump raises. VMs created before this release carry no tag and no record; recreate them and they pick both up.
+Match on a whole tag rather than on a substring. A `contains` test for `stemcell--...-1-585` also matches `stemcell--...-1-5850`, which is why both queries above split the field first.
+
+Both records are written once, when the VM is created, and neither is rebuilt afterwards. A VM whose tag names an old stemcell has genuinely not been recreated since that stemcell was current, which is exactly the question a stemcell bump raises. VMs created before this release carry no tag and no record; recreate them and they pick both up.
+
+Three limits are worth knowing. The identity is derived from the stemcell's qcow2 filename, so it is always present for a `:heavy:` stemcell the CPI uploaded, and it is present for a `:light:` one only when the operator named the file the way the CPI does, as `bosh-stemcell-<name>-<version>-<sha8>.qcow2`. A file named anything else gets no tag and no record rather than a guess. A derived label longer than 96 characters, or carrying anything outside `A-Za-z0-9._-`, is refused for the same reason. And the readable `stemcell:` line in the Notes is written by `set_vm_metadata`, so it appears after the Director's first metadata sync; on a create-env Director, which never makes that call, read the `bosh_stemcell` key or the tag instead.
 
 ### `bosh clean-up` is safe across directors
 

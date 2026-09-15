@@ -5074,3 +5074,44 @@ func (m *vmMockNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, e
 func isNICConfigCall(params *sdknodes.UpdateQemuConfigParams) bool {
 	return params != nil && (len(params.Net) > 0 || len(params.Ipconfig) > 0)
 }
+
+// isProvenanceWriteCall reports whether an UpdateQemuConfig call is the
+// create-time provenance write: description only, no NIC or resource fields.
+func isProvenanceWriteCall(params *sdknodes.UpdateQemuConfigParams) bool {
+	return params != nil && params.Description != nil && !isNICConfigCall(params) && params.Memory == nil
+}
+
+// TestHandleCreateVM_ProvenanceWriteFailureIsSwallowed pins the best-effort
+// contract on the create-time provenance write. The record says which pool a VM
+// resolved into and which stemcell it booted from, and neither is worth failing
+// a VM the Director asked for: a pmxcfs lock timeout or an HTTP 500 on that one
+// description PUT has to leave the create succeeding without the record.
+func TestHandleCreateVM_ProvenanceWriteFailureIsSwallowed(t *testing.T) {
+	t.Parallel()
+	provenanceAttempts := 0
+	n := &vmMockNodes{
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
+			if isProvenanceWriteCall(params) {
+				provenanceAttempts++
+				return fmt.Errorf("storage is locked (500)")
+			}
+			return nil
+		},
+	}
+	h := handlers.HandleCreateVM(buildVMDeps(&vmMockQEMU{}, n, &vmMockCluster{}, &vmMockAgent{}))
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{}, map[string]any{})
+
+	res, err := h.Handle(context.Background(), args, mkCtx("provenance-fail"))
+	if err != nil {
+		t.Fatalf("a failed provenance write must not fail create_vm, got: %v", err)
+	}
+	if res == nil {
+		t.Fatal("create_vm returned no result")
+	}
+	if provenanceAttempts == 0 {
+		t.Fatal("the provenance write was never attempted; this test would pass vacuously")
+	}
+}

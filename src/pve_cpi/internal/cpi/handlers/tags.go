@@ -34,6 +34,40 @@ var reservedBoshTagPrefixes = []string{
 	pve.ParkerPrefixTagPrefix,
 }
 
+// createTimeTagPrefixes are the CPI-owned tag prefixes written once at create
+// time and preserved from then on, as opposed to the reservedBoshTagPrefixes
+// that set_vm_metadata rebuilds from the Director's metadata on every sync.
+//
+// The two lists answer different questions. reservedBoshTagPrefixes decides what
+// set_vm_metadata strips before re-applying that metadata, so a key written once
+// at create time has to stay out of it or the first sync would delete it and put
+// nothing back. This list covers the other half of ownership: what an
+// operator-supplied tag may not claim. A disk tag keyed "stemcell" would
+// otherwise render "stemcell--<value>" and overwrite the record of which
+// stemcell the guest actually booted from.
+//
+// Every entry is lowercase, because hasCPIOwnedPrefix lowercases before it
+// compares.
+var createTimeTagPrefixes = []string{stemcellTagPrefix}
+
+// hasCPIOwnedPrefix reports whether entry claims a prefix the CPI owns. The
+// inherited reservedBoshTagPrefixes are matched exactly, which is the comparison
+// they have always had. The create-time prefixes are matched without regard to
+// case, because an operator key of "Stemcell" is plainly an attempt at the same
+// namespace and there is no reason to let a shift key through a guard.
+func hasCPIOwnedPrefix(entry string) bool {
+	if hasReservedBoshPrefix(entry) {
+		return true
+	}
+	lowered := strings.ToLower(entry)
+	for _, p := range createTimeTagPrefixes {
+		if strings.HasPrefix(lowered, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and
 // cluster-resource rows, named once so the literal stays under the goconst
 // occurrence cap.

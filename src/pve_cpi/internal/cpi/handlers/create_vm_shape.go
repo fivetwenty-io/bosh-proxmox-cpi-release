@@ -71,11 +71,17 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// with the VM on create rollback.
 	advrtTags := advertisedRouteTags(cp.AdvertisedRoutes)
 	baseRetainTags = append(baseRetainTags, advrtTags...)
-	// The stemcell tag rides beside the ownership marker rather than in
-	// baseRetainTags, so it sits near the front of the list and survives the
-	// byte cap. It is written once here and never rebuilt, because the
+	// The stemcell tag goes last, behind the advertised-route provenance in
+	// baseRetainTags. mergeTagList truncates from the tail, and an evicted
+	// advrt- tag is an SDN subnet delete_vm can no longer withdraw, while an
+	// evicted stemcell tag costs an operator query. Provenance yields to
+	// cleanup. It is written once here and never rebuilt, because the
 	// Director's set_vm_metadata payload does not name the stemcell.
-	initialTags := mergeTagList([]string{ownershipTag, stemcellIdentityTag(parsed)}, baseRetainTags, maxTagLength)
+	stemcellTags := baseRetainTags
+	if tag := stemcellIdentityTag(parsed); tag != "" {
+		stemcellTags = append(append([]string{}, baseRetainTags...), tag)
+	}
+	initialTags := mergeTagList([]string{ownershipTag}, stemcellTags, maxTagLength)
 	for _, tag := range advrtTags {
 		if !strings.Contains(initialTags, tag) {
 			deps.Log(ctx).Warn("create_vm: advertised-route provenance tag dropped by tag-length cap — "+
@@ -679,7 +685,14 @@ func persistCreateProvenance(ctx context.Context, deps Deps, logger *log.Logger,
 			InstanceGroup: shape.vmPoolInstanceGrp,
 		}
 	}
-	pve.UpdateVMCreateProvenance(ctx, deps.PVE, logger, shape.node, vmid, pm, vmStemcellRecord(parsed))
+	// unguardedPVE, for the same reason the parker pool sweep uses it: on the
+	// managed storage-placement path deps.PVE is the allocation guard's client,
+	// which treats every UpdateQemuConfig as a gated mutation. A transient
+	// failure on this one cosmetic description PUT would poison the guard, fail
+	// the create_vm that otherwise succeeded, and leave the allocation in
+	// ReconciliationRequired for an operator to clear. Provenance is not part of
+	// the allocation's mutation set and must not be able to fail it.
+	pve.UpdateVMCreateProvenance(ctx, unguardedPVE(deps.PVE), logger, shape.node, vmid, pm, vmStemcellRecord(parsed))
 }
 
 // composeVMName builds the PVE VM name from prefix + deployment + job +
