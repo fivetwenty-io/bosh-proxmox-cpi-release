@@ -12,6 +12,12 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- `delete_disk` no longer refuses a parked-anchor disk whose volume is already gone from `dir`, NFS, or CIFS storage. PVE does not answer a missing file on those backends with a 404. It answers with an HTTP 500 that names `volume_size_info` and reports no format. That same wording also covers a denied read, a stale NFS handle, an unmounted export, and an I/O error, so the CPI could not read the reply either way, and it failed closed. The CPI now settles the question with a storage content listing rather than with the error text. A volid that is absent from a listing the CPI was allowed to read counts as proof that the volume is gone. The same proof unblocks `has_disk`, which `bosh cck` relies on to learn that a disk no longer exists. It also unblocks the stale-unused-slot check in `delete_vm` and the local-backend cluster scan that used to turn a deleted volume into a retriable error. An absence the CPI cannot prove still leaves the refusal in place, and the CPI now logs a warning that names why the proof did not land. Proving an absence needs `Sys.Audit` at `/access` on the CPI's token, because the listing has to be one PVE did not filter by permission. On a plain `dir` storage with no `is_mountpoint`, an empty listing counts as unproven. When the mount under such a storage drops, PVE lists the storage as empty rather than failing the call, so operators who run `dir` storage should set `is_mountpoint` on it.
+
+- `create_vm` and `attach_disk` now report that the data is gone when a disk's CID promises a parker anchor, no VM in the cluster references the volume, and the volume is provably not on storage. Both calls used to point at `pve.parked_anchor_strict: false`, which cannot bring back a volume that is not there. The new message asks the operator to remove the disk from the Director's records with `bosh -d <deployment> cck`, or to drop it from the create-env state file, and then to redeploy so that a fresh disk is created. The refusal stays permanent and non-retriable, and an attach whose volume is not provably gone keeps the original message and its strict-mode advice.
+
 ## [0.7.2] - 2026-09-15
 
 ### Added

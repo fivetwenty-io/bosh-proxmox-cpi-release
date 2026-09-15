@@ -549,6 +549,14 @@ or, when a parker vanishes between the cluster listing and its config read:
 disk holder vmid <N> (node X) sits inside the parker band [90000,90999] but its config vanished mid-scan; a parker VM holding <volid> was likely deleted out-of-band. ...
 ```
 
+or, when the volume the parker held is provably gone from storage as well:
+
+```text
+attach_disk: disk <cid> was created under the parked strategy and its CID promises a parker anchor, but no VM in the cluster references the volume and the volume <volid> is not on storage; the parker VM and the disk it held were both removed out-of-band, so the data is gone. Remove the disk from the Director's records with `bosh -d <deployment> cck` (or drop it from the create-env state file) and redeploy to have a fresh disk created
+```
+
+`create_vm` with `disk_cids` reaches the attach path, so it returns the same message under its own method name.
+
 **Diagnosis**
 
 A disk created under the parked strategy is held by a parker VM whenever it is detached; the CPI never deletes parkers, so a promised disk with no holder means someone removed the parker out-of-band (`qm destroy` after clearing protection, a cluster restore, a cleanup script). The volume itself may still be intact on storage. Check:
@@ -562,9 +570,33 @@ pvesm list <disk_storage> | grep <volid>
 
 Verify the volume exists and its data is intact. Then set `pve.parked_anchor_strict: false` in the CPI manifest (or cpi-config entry) and retry: the CPI treats the disk as free-floating, and the next detach re-parks it onto a fresh parker, restoring the anchor. Re-enable strict afterwards (remove the property). Labs that intentionally delete parkers can leave the property false. See [Persistent Disk Strategy](persistent-disk-strategy.md).
 
-`delete_disk` reaches this refusal only when the volume is still on storage, or
-when its absence cannot be established. A `delete_disk` whose volume is already
-gone returns success instead: whatever removed it, nothing is left to delete.
+That recovery applies to a volume that is still intact, because it hands the CPI a disk it can go on using. The third message above is a different case, and no setting recovers it. The volume itself is gone, so the disk has to leave the Director's records before the deployment can move again. Run `bosh -d <deployment> cck` and choose to delete the disk reference, or drop the disk from the create-env state file, and then redeploy so that a fresh disk is created.
+
+`delete_disk` reaches this refusal only when the volume is still on storage, or when the CPI cannot prove that the volume is gone. The CPI proves an absence by reading the storage's content listing and finding no entry for the volid. It cannot settle the question from the error instead, because on `dir`, NFS, and CIFS storage a missing file comes back as an HTTP 500 naming `volume_size_info` rather than as a 404, and that one error also covers a denied read and an export that went away. A `delete_disk` whose volume is provably gone returns success instead, because nothing is left to delete. A token without `Sys.Audit` at `/access` cannot read a listing that PVE left unfiltered, so it cannot prove an absence at all. The refusal then stands, and the CPI writes a warning to its log naming why the proof did not land.
+
+### Absence unproven on a dir storage with no is_mountpoint
+
+**Symptom**
+
+A parker-anchor refusal stands even though the volume is gone, and the CPI log carries a warning whose error reads:
+
+```text
+storage <name> is a dir storage with no is_mountpoint and its content listing came back empty, which a dropped mount produces as readily as a genuinely empty storage; set is_mountpoint on that storage so PVE reports it offline instead of listing nothing
+```
+
+**Diagnosis**
+
+The CPI proves a volume absent by reading the storage's content listing. On a `dir` or `btrfs` storage that carries no `is_mountpoint` flag, an empty listing proves nothing. PVE still lists the bare mount point when the backing filesystem has gone away, and it even recreates `images/` underneath it, so a dropped mount and a genuinely empty storage look identical. The CPI therefore accepts an empty listing as proof only from a storage PVE refuses to activate when its backing is unreachable. That means NFS, CIFS, the block and Ceph plugins, and any `dir` or `btrfs` storage carrying `is_mountpoint`. On a plain `dir` storage, other volumes in the listing are what prove the tree is really mounted, so the refusal stands only when the listing is empty.
+
+**Fix**
+
+Tell PVE that the storage is a mount point, which makes it fail loudly instead of listing nothing:
+
+```bash
+pvesm set <storage> --is_mountpoint yes
+```
+
+The flag takes effect on the next call, because the CPI reads it live rather than from its storage cache. A storage whose only volume was the one just deleted still lists empty for an honest reason, and that case reads as unproven until another volume lands there.
 
 ### Parked-disk records fill a parker's description
 
