@@ -883,6 +883,33 @@ func TestIsVolumeMissing_Unrelated(t *testing.T) {
 	}
 }
 
+// TestIsVolumeMissing_VolumeFormatUnknownIsNotMissing pins that PVE's
+// file-storage "no format" reply is NOT a missing-volume signal. The same
+// wording comes back for a missing file, a denied read, a stale NFS handle, an
+// unmounted export, and an I/O error, so folding it in here would report a
+// filer that went away as a volume that no longer exists, and every caller that
+// folds a missing volume into a clean absence would inherit that. The listing
+// proof in pve.ProveVolumeAbsent is what tells those apart.
+func TestIsVolumeMissing_VolumeFormatUnknownIsNotMissing(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+	if pve.IsVolumeMissing(err) {
+		t.Errorf("the no-format reply does not prove absence and must not classify as missing; err=%v", err)
+	}
+	// The same text as a bare error, without the SDK wrapper, must also miss.
+	if pve.IsVolumeMissing(errors.New(liveVolumeSizeInfoNoFormat)) {
+		t.Error("the bare no-format text must not classify as missing either")
+	}
+	// ExistsTolerant folds IsVolumeMissing, so the shape has to surface as an
+	// error there rather than as a clean (false, nil).
+	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
+		return false, makeAPIErr(500, liveVolumeSizeInfoNoFormat)
+	})
+	if _, err := pve.ExistsTolerant(context.Background(), c, "pve-01", "nfs-images", absenceVolid); err == nil {
+		t.Error("ExistsTolerant must not fold the no-format reply into a clean absence")
+	}
+}
+
 func TestIsVolumeMissing_Nil(t *testing.T) {
 	t.Parallel()
 	if pve.IsVolumeMissing(nil) {

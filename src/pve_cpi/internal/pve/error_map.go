@@ -965,8 +965,19 @@ func IsVMAlreadyPoolMember(err error) bool {
 // Matched with a "volume_size_info" adjacency guard (both substrings must be
 // present) so an unrelated 500 mentioning a format — a genuinely transient
 // server fault whose text happens to include the word — is not misclassified
-// as permanent. Reachable only with a malformed disk CID; a CPI-issued disk
-// CID always names a well-formed volid.
+// as permanent.
+//
+// PVE raises this from volume_size_info whenever file_size_info cannot stat the
+// volume's backing file, which makes it the ordinary reply for a volume that is
+// not there on dir, nfs, cifs, and lvm-with-qcow2 storage. A missing file, a
+// denied read, a stale NFS handle, an unmounted export, and an I/O error all
+// arrive with the identical wording, and the info handler behind the GET never
+// activates the storage, so it cannot tell them apart either. The text is
+// therefore never on its own a statement that the volume is gone, and
+// IsVolumeMissing deliberately does not match it: folding it in would report a
+// filer that went away as a volume that no longer exists. ProveVolumeAbsent is
+// the observation that separates the two, because it reads a storage content
+// listing rather than the error text.
 //
 // nil → false.
 func IsVolumeFormatUnknown(err error) bool {

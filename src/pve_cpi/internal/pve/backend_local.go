@@ -5,8 +5,9 @@
 // Node selection:
 //   - new disks co-locate with their owner VM (vmHint), then fall back to
 //     cloud_properties.node, then config.node.
-//   - existing volumes are located via a cluster-wide scan: every node is
-//     probed via Storage().Exists(); the first hit wins.
+//   - existing volumes are located via a cluster-wide scan. Every node is
+//     probed through ProveVolumeAbsent, and the first node that does not prove
+//     the volume absent wins.
 package pve
 
 import (
@@ -90,13 +91,21 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 
 	var lastProbeErr error
 
+	// The backend already holds this storage's classification, so its
+	// classifier costs nothing and never fails.
+	classify := func(context.Context) (StorageInfo, bool) { return l.info, true }
+
 	for _, node := range candidates {
-		// ExistsTolerant folds the lvmthin/zfspool "Failed to find logical
-		// volume" / "dataset does not exist" 500 errors into (false, nil)
-		// so the cluster scan reports a clean miss instead of a retriable
-		// error when the volume is genuinely gone (e.g. just-deleted disks
-		// being re-probed by has_disk / delete_disk idempotency paths).
-		exists, err := ExistsTolerant(ctx, l.client, node, storage, volume)
+		// ProveVolumeAbsent folds the lvmthin/zfspool "Failed to find logical
+		// volume" / "dataset does not exist" 500 errors into a clean absence
+		// so the cluster scan reports a miss instead of a retriable error when
+		// the volume is genuinely gone (e.g. just-deleted disks being
+		// re-probed by has_disk / delete_disk idempotency paths). A miss on
+		// file storage never reaches us as a 404 at all, because PVE answers
+		// the volume GET with a 500 naming volume_size_info, which says
+		// nothing either way. The proof settles that question from a storage
+		// content listing, so the scan gets its clean miss there too.
+		absent, err := ProveVolumeAbsent(ctx, l.client, node, storage, volume, classify)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
 			// the volume may live on a different healthy node. Record the
@@ -104,7 +113,7 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 			lastProbeErr = err
 			continue
 		}
-		if exists {
+		if !absent {
 			return node, nil
 		}
 	}
