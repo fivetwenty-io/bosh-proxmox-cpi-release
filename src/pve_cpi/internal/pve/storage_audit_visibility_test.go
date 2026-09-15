@@ -90,3 +90,52 @@ func TestStorageAuditVisibilityAcceptsCompleteStorageAllocateBypass(t *testing.T
 		}
 	}
 }
+
+// TestStorageAuditVisibilityMemoizesSuccess pins that a proven visibility is
+// read once per client. The proof costs an ACL inventory read plus one
+// effective-permission call per ACL path, and it now runs inside the delete_vm
+// unused-slot loop and the local backend's node sweep, so re-proving it for
+// every volume would multiply those calls by the number of volumes one CPI
+// call looks at.
+func TestStorageAuditVisibilityMemoizesSuccess(t *testing.T) {
+	g := visibilityFixture()
+	c := &sdkClient{auditReader: g}
+
+	if err := c.StorageAuditVisibility(context.Background()); err != nil {
+		t.Fatalf("first proof: %v", err)
+	}
+	first := len(g.calls)
+	if first == 0 {
+		t.Fatal("the first proof must actually read PVE")
+	}
+	for range 3 {
+		if err := c.StorageAuditVisibility(context.Background()); err != nil {
+			t.Fatalf("repeat proof: %v", err)
+		}
+	}
+	if len(g.calls) != first {
+		t.Errorf("a proven visibility must not be re-read, got %d calls after %d", len(g.calls), first)
+	}
+}
+
+// TestStorageAuditVisibilityDoesNotCacheFailure keeps a transport fault from
+// becoming permanent. A failure says as much about PVE's mood as about the
+// token's grants, so the next call has to ask again.
+func TestStorageAuditVisibilityDoesNotCacheFailure(t *testing.T) {
+	g := visibilityFixture()
+	g.failure = errors.New("pvedaemon restarting")
+	c := &sdkClient{auditReader: g}
+
+	if err := c.StorageAuditVisibility(context.Background()); err == nil {
+		t.Fatal("expected the transport fault to surface")
+	}
+	failed := len(g.calls)
+
+	g.failure = nil
+	if err := c.StorageAuditVisibility(context.Background()); err != nil {
+		t.Fatalf("a retry after the fault cleared must succeed, got %v", err)
+	}
+	if len(g.calls) == failed {
+		t.Error("a failed proof must be re-attempted rather than replayed from the cache")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,8 +18,31 @@ type auditPermissionGetter interface {
 	GetCtx(context.Context, string, map[string]interface{}) (interface{}, error)
 }
 
+// auditVisibilityMemo caches a proven audit visibility for the life of the
+// client. Only a success is cached: a failure can come from a transport fault
+// as readily as from a missing grant, and re-proving on the next call is what
+// lets a retry succeed once PVE answers again. A cached success cannot go
+// stale within a CPI call, because revoking a grant mid-call would only ever
+// make the proof stricter than the listings it guards.
+type auditVisibilityMemo struct {
+	mu     sync.Mutex
+	proven bool
+}
+
 func (c *sdkClient) StorageAuditVisibility(ctx context.Context) error {
-	return observeStorageAuditVisibility(ctx, c.auditReader)
+	c.auditVisibility.mu.Lock()
+	proven := c.auditVisibility.proven
+	c.auditVisibility.mu.Unlock()
+	if proven {
+		return nil
+	}
+	if err := observeStorageAuditVisibility(ctx, c.auditReader); err != nil {
+		return err
+	}
+	c.auditVisibility.mu.Lock()
+	c.auditVisibility.proven = true
+	c.auditVisibility.mu.Unlock()
+	return nil
 }
 
 // PVE omits denied paths from the all-permissions response. Read the unfiltered

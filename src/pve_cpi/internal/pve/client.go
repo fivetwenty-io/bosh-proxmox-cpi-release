@@ -89,7 +89,15 @@ type Client interface {
 
 // sdkClient is the concrete implementation returned by NewClient.
 type sdkClient struct {
-	auditReader       auditPermissionGetter
+	auditReader auditPermissionGetter
+	// auditVisibility memoizes the storage audit-visibility proof. The proof
+	// reads the unfiltered ACL inventory and then one effective-permission
+	// call per ACL path, and its answer is a property of the token rather
+	// than of any volume, so it cannot change within a call. The CPI is an
+	// external CPI with one process per call, so caching it for the process
+	// lifetime is caching it for exactly one CPI method. See
+	// storage_audit_visibility.go for why only a success is cached.
+	auditVisibility   auditVisibilityMemo
 	qemuSvc           qemu.Service
 	storageSvc        storage.Service
 	cloudInitSvc      cloudinit.Service
