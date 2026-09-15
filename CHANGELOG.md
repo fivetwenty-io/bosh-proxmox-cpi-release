@@ -18,6 +18,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `create_vm` and `attach_disk` now report that the data is gone when a disk's CID promises a parker anchor, no VM in the cluster references the volume, and the volume is provably not on storage. Both calls used to point at `pve.parked_anchor_strict: false`, which cannot bring back a volume that is not there. The new message asks the operator to remove the disk from the Director's records with `bosh -d <deployment> cck`, or to drop it from the create-env state file, and then to redeploy so that a fresh disk is created. The refusal stays permanent and non-retriable, and an attach whose volume is not provably gone keeps the original message and its strict-mode advice.
 
+- The orphan sweeps that run after a failed `create_disk` or a failed ephemeral disk create now use the same content-listing proof to decide whether a partial volume was left behind. Both used to ask the bare existence probe. On `dir`, NFS, and CIFS storage the `volume_size_info` reply made them skip a sweep they should have run, and on `lvmthin` and `zfspool` the missing-volume text did the same, so the partially committed volume stayed on storage. A volume the listing shows is swept as before, a proven absence skips the sweep, and an absence the CPI cannot prove skips it with the same warning as before, which now names where the CPI looked.
+
 ## [0.7.2] - 2026-09-15
 
 ### Added
