@@ -114,7 +114,7 @@ func HandleHasDisk(deps Deps) Handler {
 		//    still report a clean false. When the point probe cannot answer
 		//    at all, which is what dir, NFS, and CIFS storage do for a
 		//    missing file, with an HTTP 500 naming volume_size_info rather
-		//    than a 404 — a storage content listing settles it instead, and
+		//    than a 404, so a storage content listing settles it instead, and
 		//    bosh cck gets the false it needs. An absence the listing cannot
 		//    prove stays an error rather than becoming a guess.
 		// ----------------------------------------------------------------
