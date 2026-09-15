@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-15
+
 ### Added
 
 - Every set-managed create now charges what its in-flight siblings have already claimed. Placement ranks members against the capacity PVE reports, and PVE reports a volume only once that volume exists, so two creates that started seconds apart used to see the same free space and choose the same share, which is how several VMs of one instance group landed together. Each create now reads the allocation journal before it ranks and seeds the ranking with the bytes the other open allocations have claimed on each member and each capacity domain. See [Charge in-flight siblings against a placement](docs/multi-storage-placement.md#charge-in-flight-siblings-against-a-placement).
@@ -446,7 +448,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.0...v0.7.1
