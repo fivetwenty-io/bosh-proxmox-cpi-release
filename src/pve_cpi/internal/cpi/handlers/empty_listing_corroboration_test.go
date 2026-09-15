@@ -56,8 +56,12 @@ type corroborationSetup struct {
 	// storage.
 	otherVMVolid string
 	// journalVolid, when set, enrolls a journal in a temp directory carrying
-	// one live allocation of that volume on the storage.
+	// one live allocation of that volume on the storage, observed on storage.
 	journalVolid string
+	// plannedVolid, when set, enrolls the same journal with the allocation
+	// stopped at planned: the intent is recorded and no create call was ever
+	// made, so the intended volume names nothing that exists.
+	plannedVolid string
 	// statusUsed and statusActive script PVE's own status for the storage.
 	// The zero value is an active storage reporting nothing in use, which
 	// contradicts nothing.
@@ -137,6 +141,12 @@ func newCorroborationFixture(t *testing.T, setup corroborationSetup) corroborati
 		cfg.StorageAllocationJournalDir = enrolledJournalWithAllocation(t, setup.journalVolid)
 		cfg.StoragePlacementNamespace = corroborationJournalNS
 	}
+	if setup.plannedVolid != "" {
+		directory := enrollCorroborationJournal(t)
+		recordPlannedCorroborationAllocation(t, directory, setup.plannedVolid)
+		cfg.StorageAllocationJournalDir = directory
+		cfg.StoragePlacementNamespace = corroborationJournalNS
+	}
 	deps := handlers.Deps{
 		Config:   cfg,
 		PVE:      client,
@@ -213,8 +223,27 @@ func enrollCorroborationJournal(t *testing.T) string {
 }
 
 // recordCorroborationAllocation adds one live disk allocation naming volume on
-// the storage under test.
+// the storage under test, with its step carried to observed: the create call
+// went to PVE and the volume was seen on storage. That is the state the
+// corroborator counts, because it is the only one in which a volume the listing
+// should have carried exists.
 func recordCorroborationAllocation(t *testing.T, directory, volume string) {
+	t.Helper()
+	recordCorroborationStep(t, directory, volume, aj.Observed)
+}
+
+// recordPlannedCorroborationAllocation stops one step earlier: the intent is
+// persisted and no create call has been made, so the intended volume names
+// nothing that exists.
+func recordPlannedCorroborationAllocation(t *testing.T, directory, volume string) {
+	t.Helper()
+	recordCorroborationStep(t, directory, volume, aj.Planned)
+}
+
+// recordCorroborationStep writes one disk allocation whose single step targets
+// the storage under test and reached state. The journal insists a step first
+// appear as planned, so anything past that is a second save.
+func recordCorroborationStep(t *testing.T, directory, volume string, state aj.State) {
 	t.Helper()
 	journal, err := aj.Open(directory, corroborationJournalNS, corroborationJournalClusterID)
 	if err != nil {
@@ -257,15 +286,29 @@ func recordCorroborationAllocation(t *testing.T, directory, volume string) {
 	if err := handle.Save(record); err != nil {
 		t.Fatalf("record allocation step: %v", err)
 	}
+	if state == aj.Planned {
+		return
+	}
+	record = handle.Record()
+	record.Steps[len(record.Steps)-1].State = state
+	record.Steps[len(record.Steps)-1].VolIDs = []string{volume}
+	if err := handle.Save(record); err != nil {
+		t.Fatalf("carry allocation step to %s: %v", state, err)
+	}
 }
 
 // deleteCorroborationDisk runs delete_disk against the promised-anchor CID for
 // the volume under test.
+//
+// The fixture's logger goes into the context the call carries, the way cmd/cpi
+// wires it per request, so a warning the proof writes through the context
+// reaches the observer rather than the nop logger.
 func deleteCorroborationDisk(t *testing.T, fixture corroborationFixture) error {
 	t.Helper()
 	cid := mustEncodeDiskCID(t, corroborationVolid, &pve.DiskCIDMeta{ID: corroborationStableID, Anchor: true})
 	h := handlers.HandleDeleteDisk(fixture.deps)
-	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	ctx := log.IntoContext(context.Background(), fixture.deps.Logger)
+	_, err := h.Handle(ctx, []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
 	return err
 }
 
@@ -360,33 +403,65 @@ func TestDeleteDisk_EmptyListing_JournalStopsTheStatusRead(t *testing.T) {
 	}
 }
 
-// TestDeleteDisk_EmptyListing_ContradictedByStorageStatus is the disk born
-// before the journal on a storage nothing references: only PVE's own figure for
-// the storage is left, and an NFS mount of a populated parent dataset reports
-// the children's bytes against a listing that shows nothing.
-func TestDeleteDisk_EmptyListing_ContradictedByStorageStatus(t *testing.T) {
+// TestDeleteDisk_EmptyListing_UsedBytesAreAdvisory pins the one source that
+// may not contradict. PVE answers the used figure from a statfs of the whole
+// filesystem behind the storage, while the listing covers only the storage's
+// configured content types, so an export shared with a backup storage reports
+// its dumps against an images storage that is honestly empty. The delete stays
+// idempotent and the operator gets a warning to go look at the export.
+func TestDeleteDisk_EmptyListing_UsedBytesAreAdvisory(t *testing.T) {
 	t.Parallel()
 
 	fixture := newCorroborationFixture(t, corroborationSetup{
 		statusActive: true,
 		statusUsed:   corroborationStatusUsedGiB,
 	})
+	if err := deleteCorroborationDisk(t, fixture); err != nil {
+		t.Fatalf("a used figure is not a listing and must not refuse the delete, got %v", err)
+	}
+	warned := false
+	for _, entry := range fixture.observer.All() {
+		if entry.Level == log.LevelWarn && strings.Contains(entry.Message, "reports bytes in use") {
+			warned = true
+			if got := entry.Attrs["storage"]; got != corroborationStorage {
+				t.Errorf("the warning must name the storage, got %v", got)
+			}
+			if got := entry.Attrs["used_bytes"]; got != int64(corroborationStatusUsedGiB) {
+				t.Errorf("the warning must carry the figure PVE reported, got %v", got)
+			}
+		}
+	}
+	if !warned {
+		t.Error("the operator must still be told the storage reports bytes against an empty listing")
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+	if calls := fixture.statusCalls(); calls != 1 {
+		t.Errorf("the status is read once per probe, got %d", calls)
+	}
+}
+
+// TestDeleteDisk_EmptyListing_InactiveStorage_IsUnproven keeps the half of the
+// status read that is still evidence: a storage PVE reports inactive on the
+// node cannot have proved anything absent, so the anchor refusal stands.
+func TestDeleteDisk_EmptyListing_InactiveStorage_IsUnproven(t *testing.T) {
+	t.Parallel()
+
+	fixture := newCorroborationFixture(t, corroborationSetup{statusActive: false})
 	err := deleteCorroborationDisk(t, fixture)
 	if err == nil {
-		t.Fatal("an empty listing on a storage reporting bytes in use must not be read as a completed delete")
+		t.Fatal("an empty listing from an inactive storage must not be read as a completed delete")
 	}
 	reason := unprovenAbsenceReason(fixture.observer)
 	if !strings.Contains(reason, pve.CorroborationSourceStorageStatus) {
 		t.Errorf("the operator must be told which source contradicted the listing, got %q", reason)
 	}
-	if !strings.Contains(reason, "bytes in use") {
+	if !strings.Contains(reason, "not active") {
 		t.Errorf("the refusal must name what it saw, got %q", reason)
 	}
 	if *fixture.deleteCalls != 0 {
 		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
-	}
-	if calls := fixture.statusCalls(); calls != 1 {
-		t.Errorf("the status is read once per probe, got %d", calls)
 	}
 }
 
@@ -403,6 +478,77 @@ func TestDeleteDisk_EmptyListing_NothingContradicts(t *testing.T) {
 	}
 	if *fixture.deleteCalls != 0 {
 		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+}
+
+// TestDeleteDisk_EmptyListing_PlannedAllocationDoesNotContradict is the state
+// rule on the handler path. Another allocation that recorded its intent and
+// then failed before the create call names a volume PVE never made, so it is no
+// evidence that the storage holds anything, and delete_disk stays idempotent.
+func TestDeleteDisk_EmptyListing_PlannedAllocationDoesNotContradict(t *testing.T) {
+	t.Parallel()
+
+	fixture := newCorroborationFixture(t, corroborationSetup{
+		plannedVolid: corroborationJournalVolid,
+		statusActive: true,
+	})
+	if err := deleteCorroborationDisk(t, fixture); err != nil {
+		t.Fatalf("a volume no create call was ever made for must not refuse the delete, got %v", err)
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+}
+
+// TestDeleteDisk_EmptyListing_UnenrolledJournalDirectory_SaysNothing is the
+// operator who set the journal directory and stopped there. The directory
+// exists with the umask default of 0755, which the journal refuses to open
+// because another user could reach it, and that refusal used to travel out as a
+// check that did not land. A directory holding no enrollment holds no records,
+// so it has nothing to say and delete_disk stays idempotent.
+func TestDeleteDisk_EmptyListing_UnenrolledJournalDirectory_SaysNothing(t *testing.T) {
+	t.Parallel()
+
+	fixture := newCorroborationFixture(t, corroborationSetup{statusActive: true})
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o755); err != nil {
+		t.Fatalf("relax the journal directory: %v", err)
+	}
+	fixture.deps.Config.StorageAllocationJournalDir = directory
+	fixture.deps.Config.StoragePlacementNamespace = corroborationJournalNS
+
+	if err := deleteCorroborationDisk(t, fixture); err != nil {
+		t.Fatalf("a directory with no enrollment holds no records to fail on, got %v", err)
+	}
+	if reason := unprovenAbsenceReason(fixture.observer); reason != "" {
+		t.Errorf("an unenrolled directory must not read as a check that did not land, got %q", reason)
+	}
+}
+
+// TestDeleteDisk_EmptyListing_EnrolledUnreadableJournal_FailsClosed is the
+// other side of that rule. Once the enrollment is there, a directory the
+// journal will not open is a journal whose records we failed to read, and a
+// delete path may not read that as the journal saying nothing.
+func TestDeleteDisk_EmptyListing_EnrolledUnreadableJournal_FailsClosed(t *testing.T) {
+	t.Parallel()
+
+	fixture := newCorroborationFixture(t, corroborationSetup{
+		journalVolid: corroborationJournalVolid,
+		statusActive: true,
+	})
+	if err := os.Chmod(fixture.deps.Config.StorageAllocationJournalDir, 0o755); err != nil {
+		t.Fatalf("relax the journal directory: %v", err)
+	}
+
+	if err := deleteCorroborationDisk(t, fixture); err == nil {
+		t.Fatal("an enrolled journal that will not open leaves the absence unproven")
+	}
+	reason := unprovenAbsenceReason(fixture.observer)
+	if !strings.Contains(reason, pve.CorroborationSourceJournal) {
+		t.Errorf("the operator must be told which check did not land, got %q", reason)
+	}
+	if !strings.Contains(reason, "did not land") {
+		t.Errorf("a failed read is not a source with nothing to say, got %q", reason)
 	}
 }
 

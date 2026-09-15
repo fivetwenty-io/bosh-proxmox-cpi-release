@@ -904,6 +904,11 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	// which reads the storage index lazily and at most once. A loop whose
 	// point probes all answer never reads it.
 	classifySlotStorage := handlerStorageClassifier(deps, diskStorage)
+	// The second opinions on an empty listing are built once for the whole
+	// loop, for the same reason: every slot asks the same sources about the
+	// same storage, and the allocation journal among them reads a file on
+	// local disk to answer.
+	slotCorroborators := emptyListingCorroborators(deps, nil)
 
 	var protected []string
 	for slot, volid := range pve.FindUnusedDiskEntries(vmCfg) {
@@ -939,7 +944,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		// a stale unused slot pointing at a deleted volume no longer wedges
 		// delete_vm on either kind of storage.
 		absent, probeErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, diskStorage, volid, classifySlotStorage,
-			emptyListingCorroborators(deps, nil)...)
+			slotCorroborators...)
 		if probeErr != nil {
 			deps.Log(ctx).Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
 				log.String("slot", slot), log.String("volid", volid), log.Err(probeErr))

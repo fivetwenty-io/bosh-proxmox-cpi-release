@@ -161,6 +161,34 @@ func TestResolveDiskIdentity_Matrix(t *testing.T) {
 		}
 	})
 
+	t.Run("mid-transfer identity carries the scan's reference counts", func(t *testing.T) {
+		t.Parallel()
+		// A detach-side transfer that crashed leaves the volume findable only
+		// through the parker's provenance. The scan that failed to find it read
+		// every config on the way, and the counts it gathered are the cheapest
+		// second opinion the handlers resuming the transfer have on an empty
+		// content listing, so they must ride out on this branch too.
+		desc := `<!--BOSH:{"bosh_parked_disks":{"` + stableID + `":{"disk_cid":"pvd-x","source_vm_cid":"700",` +
+			`"parked_at":"2026-08-20T00:00:00Z","node":"pve1","volid":"data:vm-700-disk-1","slot":"scsi4"}}}-->`
+		c := newClient(map[int]map[string]any{
+			90000: {cfgKeyTags: "bosh-cpi;bosh-parker", "description": desc},
+			700:   {"scsi0": "data:vm-700-disk-5,size=10G"},
+		}, []map[string]any{clusterRow(90000, ""), clusterRow(700, "")})
+		ident, err := ResolveDiskIdentity(context.Background(), c, nil, birth, stableID, cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if ident.Intent == nil {
+			t.Fatalf("intent = nil, want the recorded transfer intent")
+		}
+		if ident.Holder.StorageReferences == nil {
+			t.Fatal("a scan that ran must carry its counts out of the provenance branch as well")
+		}
+		if got := ident.Holder.StorageReferences.OnNode("data", "pve1"); got != 1 {
+			t.Errorf("data on pve1 = %d, want the one disk VM 700 still references", got)
+		}
+	})
+
 	t.Run("birth fallback when nothing matches anywhere", func(t *testing.T) {
 		t.Parallel()
 		c := newClient(map[int]map[string]any{

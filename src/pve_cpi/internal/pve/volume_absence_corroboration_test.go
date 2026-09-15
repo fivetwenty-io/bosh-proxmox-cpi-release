@@ -9,21 +9,58 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // corroborationNode is the node every case below observes from.
 const corroborationNode = "pve-01"
 
+// corroborationPeerNode is the other node in the cluster: the one whose disks
+// say nothing about a local storage on corroborationNode.
+const corroborationPeerNode = "pve-02"
+
+// sharedProbe is the question a corroborator is asked about the nfs storage the
+// proof cases run against, as seen from corroborationNode. nfs is shared, so a
+// source may weigh evidence from anywhere in the cluster.
+func sharedProbe() pve.EmptyListingProbe {
+	return pve.EmptyListingProbe{
+		Node:       corroborationNode,
+		Storage:    absenceStorage,
+		Volume:     absenceVolid,
+		Info:       pve.StorageInfo{Name: absenceStorage, Type: pve.StorageTypeNFS},
+		Classified: true,
+	}
+}
+
+// localProbe is the same question about a node-local dir storage, where only
+// what the probed node holds is evidence about the listing that node served.
+func localProbe(node string) pve.EmptyListingProbe {
+	return pve.EmptyListingProbe{
+		Node:       node,
+		Storage:    absenceStorage,
+		Volume:     absenceVolid,
+		Info:       pve.StorageInfo{Name: absenceStorage, Type: pve.StorageTypeDir, IsMountpoint: true},
+		Classified: true,
+	}
+}
+
+// unclassifiedProbe is the storage the proof could not identify. Nothing in
+// Info was observed, so a source may not read it.
+func unclassifiedProbe(node string) pve.EmptyListingProbe {
+	return pve.EmptyListingProbe{Node: node, Storage: absenceStorage, Volume: absenceVolid}
+}
+
 // silentCorroborator has nothing to say and records that it was asked, which is
 // how the order cases tell "consulted and passed" from "never reached".
 func silentCorroborator(calls *int) pve.EmptyListingCorroborator {
 	return pve.CorroboratorFunc("a quiet source",
-		func(context.Context, string, string, string) (pve.Corroboration, error) {
+		func(context.Context, pve.EmptyListingProbe) (pve.Corroboration, error) {
 			*calls++
 			return pve.Corroboration{}, nil
 		})
@@ -31,7 +68,7 @@ func silentCorroborator(calls *int) pve.EmptyListingCorroborator {
 
 // contradictingCorroborator contradicts the listing with a fixed detail.
 func contradictingCorroborator(calls *int, source, detail string) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc(source, func(context.Context, string, string, string) (pve.Corroboration, error) {
+	return pve.CorroboratorFunc(source, func(context.Context, pve.EmptyListingProbe) (pve.Corroboration, error) {
 		*calls++
 		return pve.Corroboration{Contradicted: true, Source: source, Detail: detail}, nil
 	})
@@ -40,7 +77,7 @@ func contradictingCorroborator(calls *int, source, detail string) pve.EmptyListi
 // failingCorroborator is a check that did not land.
 func failingCorroborator(calls *int, err error) pve.EmptyListingCorroborator {
 	return pve.CorroboratorFunc("a source that broke",
-		func(context.Context, string, string, string) (pve.Corroboration, error) {
+		func(context.Context, pve.EmptyListingProbe) (pve.Corroboration, error) {
 			*calls++
 			return pve.Corroboration{}, err
 		})
@@ -50,7 +87,7 @@ func failingCorroborator(calls *int, err error) pve.EmptyListingCorroborator {
 func forbiddenCorroborator(t *testing.T, why string) pve.EmptyListingCorroborator {
 	t.Helper()
 	return pve.CorroboratorFunc("a source that must not be asked",
-		func(context.Context, string, string, string) (pve.Corroboration, error) {
+		func(context.Context, pve.EmptyListingProbe) (pve.Corroboration, error) {
 			t.Error(why)
 			return pve.Corroboration{}, errors.New("unexpected corroboration call")
 		})
@@ -83,20 +120,26 @@ func TestProveVolumeAbsent_EmptyListing_NoCorroborators_KeepsTodaysAnswer(t *tes
 // listing.
 func TestProveVolumeAbsent_EmptyListing_PassesTheVolumeUnderProof(t *testing.T) {
 	t.Parallel()
-	var sawNode, sawStorage, sawVolume string
+	var seen pve.EmptyListingProbe
 	recorder := pve.CorroboratorFunc("a source that reads its arguments",
-		func(_ context.Context, node, storage, volume string) (pve.Corroboration, error) {
-			sawNode, sawStorage, sawVolume = node, storage, volume
+		func(_ context.Context, probe pve.EmptyListingProbe) (pve.Corroboration, error) {
+			seen = probe
 			return pve.Corroboration{}, nil
 		})
 	if _, err := proveWithCorroborators(t, recorder); err != nil {
 		t.Fatalf("a silent corroborator leaves the answer alone: %v", err)
 	}
-	if sawNode != corroborationNode || sawStorage != absenceStorage {
-		t.Errorf("the corroborator must be told where it is looking, got node %q storage %q", sawNode, sawStorage)
+	if seen.Node != corroborationNode || seen.Storage != absenceStorage {
+		t.Errorf("the corroborator must be told where it is looking, got node %q storage %q", seen.Node, seen.Storage)
 	}
-	if sawVolume != absenceVolid {
-		t.Errorf("the corroborator must be told which volume is under proof, got %q", sawVolume)
+	if seen.Volume != absenceVolid {
+		t.Errorf("the corroborator must be told which volume is under proof, got %q", seen.Volume)
+	}
+	if !seen.Classified {
+		t.Error("the proof classified the storage, so the probe must say so")
+	}
+	if seen.Info.Type != pve.StorageTypeNFS || !seen.Info.IsShared() {
+		t.Errorf("the probe must carry the classification the proof made, got %+v", seen.Info)
 	}
 }
 
@@ -211,7 +254,7 @@ func TestProveVolumeAbsent_EmptyListing_AllSilent_ProvesAbsence(t *testing.T) {
 
 func TestProveVolumeAbsent_ContradictionWithoutSourceOrDetail_StillReads(t *testing.T) {
 	t.Parallel()
-	bare := pve.CorroboratorFunc("", func(context.Context, string, string, string) (pve.Corroboration, error) {
+	bare := pve.CorroboratorFunc("", func(context.Context, pve.EmptyListingProbe) (pve.Corroboration, error) {
 		return pve.Corroboration{Contradicted: true}, nil
 	})
 	_, err := proveWithCorroborators(t, bare)
@@ -220,6 +263,46 @@ func TestProveVolumeAbsent_ContradictionWithoutSourceOrDetail_StillReads(t *test
 	}
 	if !strings.Contains(err.Error(), "unnamed") || !strings.Contains(err.Error(), "no detail") {
 		t.Errorf("the refusal must stay readable without a source or detail, got: %v", err)
+	}
+}
+
+// TestProveVolumeAbsent_EmptyListing_LocalStorage_IgnoresOtherNodes is the
+// whole finding end to end. The proof classifies the storage once and hands
+// that classification to the sources, so a dir storage on the probed node is
+// judged by what the probed node holds, and the disks another node keeps on its
+// own storage of the same name cannot contradict an honest empty listing.
+func TestProveVolumeAbsent_EmptyListing_LocalStorage_IgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+	probe := noFormatProbe(listingOf(t))
+	refs := pve.StorageReferenceCounts{absenceStorage: {corroborationPeerNode: 3}}
+	absent, err := pve.ProveVolumeAbsent(context.Background(), probe.client(), corroborationNode,
+		absenceStorage, absenceVolid, classifierFor(pve.StorageTypeDir, true),
+		pve.ConfigReferenceCorroborator(refs))
+	if err != nil {
+		t.Fatalf("another node's local storage is another tree and proves nothing here: %v", err)
+	}
+	if !absent {
+		t.Fatal("an empty listing on the probed node's own storage still proves the volume gone")
+	}
+}
+
+// TestProveVolumeAbsent_EmptyListing_SharedStorage_CountsOtherNodes is the same
+// counts against a shared storage, where every node sees one tree and a
+// reference from any of them is a volume the listing should have carried.
+func TestProveVolumeAbsent_EmptyListing_SharedStorage_CountsOtherNodes(t *testing.T) {
+	t.Parallel()
+	probe := noFormatProbe(listingOf(t))
+	refs := pve.StorageReferenceCounts{absenceStorage: {corroborationPeerNode: 3}}
+	absent, err := pve.ProveVolumeAbsent(context.Background(), probe.client(), corroborationNode,
+		absenceStorage, absenceVolid, nfsClassifier(), pve.ConfigReferenceCorroborator(refs))
+	if err == nil {
+		t.Fatal("on one shared export a reference from any node contradicts an empty listing")
+	}
+	if absent {
+		t.Fatal("an unproven absence must not read as absent")
+	}
+	if !strings.Contains(err.Error(), pve.CorroborationSourceConfigs) {
+		t.Errorf("the refusal must name the source, got: %v", err)
 	}
 }
 
@@ -261,7 +344,7 @@ func TestProveVolumeAbsent_PlainDirRuleWinsBeforeCorroboration(t *testing.T) {
 func TestConfigReferenceCorroborator_NilCounts_SaysNothing(t *testing.T) {
 	t.Parallel()
 	verdict, err := pve.ConfigReferenceCorroborator(nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("a caller that never scanned is not an error: %v", err)
 	}
@@ -270,11 +353,17 @@ func TestConfigReferenceCorroborator_NilCounts_SaysNothing(t *testing.T) {
 	}
 }
 
+// referenceCounts builds the nested shape the scan produces: per storage, then
+// per node of the guest whose config carried the reference.
+func referenceCounts(storage, node string, count int) pve.StorageReferenceCounts {
+	return pve.StorageReferenceCounts{storage: {node: count}}
+}
+
 func TestConfigReferenceCorroborator_ZeroCount_SaysNothing(t *testing.T) {
 	t.Parallel()
-	refs := pve.StorageReferenceCounts{"other-storage": 4}
+	refs := referenceCounts("other-storage", corroborationNode, 4)
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
@@ -285,9 +374,9 @@ func TestConfigReferenceCorroborator_ZeroCount_SaysNothing(t *testing.T) {
 
 func TestConfigReferenceCorroborator_ReferencedStorage_Contradicts(t *testing.T) {
 	t.Parallel()
-	refs := pve.StorageReferenceCounts{absenceStorage: 3}
+	refs := referenceCounts(absenceStorage, corroborationNode, 3)
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
@@ -304,14 +393,119 @@ func TestConfigReferenceCorroborator_ReferencedStorage_Contradicts(t *testing.T)
 
 func TestConfigReferenceCorroborator_SingleReference_ReadsAsOneVolume(t *testing.T) {
 	t.Parallel()
-	refs := pve.StorageReferenceCounts{absenceStorage: 1}
+	refs := referenceCounts(absenceStorage, corroborationNode, 1)
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
 	if verdict.Detail != "1 volume on the storage is referenced by VM configs" {
 		t.Errorf("a single reference must read as a sentence, got %q", verdict.Detail)
+	}
+}
+
+// TestConfigReferenceCorroborator_SharedStorage_CountsEveryNode is the whole
+// point of the shared reading: one nfs export is one tree, so a disk any node
+// still references is a disk the listing should have carried.
+func TestConfigReferenceCorroborator_SharedStorage_CountsEveryNode(t *testing.T) {
+	t.Parallel()
+	refs := pve.StorageReferenceCounts{absenceStorage: {corroborationPeerNode: 2}}
+	verdict, err := pve.ConfigReferenceCorroborator(refs).
+		CorroborateEmptyListing(context.Background(), sharedProbe())
+	if err != nil {
+		t.Fatalf("ConfigReferenceCorroborator: %v", err)
+	}
+	if !verdict.Contradicted {
+		t.Fatal("on a shared storage a reference from another node is a reference to the same tree")
+	}
+	if verdict.Detail != "2 volumes on the storage are referenced by VM configs" {
+		t.Errorf("a shared storage names no node, got %q", verdict.Detail)
+	}
+}
+
+// TestConfigReferenceCorroborator_LocalStorage_IgnoresOtherNodes is the defect
+// this split closed. PVE gives every node a dir storage called "local", so ten
+// disks on one node's "local" would otherwise contradict an honest empty
+// listing another node served for its own.
+func TestConfigReferenceCorroborator_LocalStorage_IgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+	refs := pve.StorageReferenceCounts{absenceStorage: {corroborationPeerNode: 10}}
+	verdict, err := pve.ConfigReferenceCorroborator(refs).
+		CorroborateEmptyListing(context.Background(), localProbe(corroborationNode))
+	if err != nil {
+		t.Fatalf("ConfigReferenceCorroborator: %v", err)
+	}
+	if verdict.Contradicted {
+		t.Fatalf("another node's local storage is another tree, got %+v", verdict)
+	}
+}
+
+// TestConfigReferenceCorroborator_LocalStorage_CountsTheProbedNode is the other
+// half: a reference on the node we probed is a volume that node's own listing
+// should have carried.
+func TestConfigReferenceCorroborator_LocalStorage_CountsTheProbedNode(t *testing.T) {
+	t.Parallel()
+	refs := pve.StorageReferenceCounts{absenceStorage: {
+		corroborationNode:     1,
+		corroborationPeerNode: 10,
+	}}
+	verdict, err := pve.ConfigReferenceCorroborator(refs).
+		CorroborateEmptyListing(context.Background(), localProbe(corroborationNode))
+	if err != nil {
+		t.Fatalf("ConfigReferenceCorroborator: %v", err)
+	}
+	if !verdict.Contradicted {
+		t.Fatal("a reference on the probed node contradicts that node's empty listing")
+	}
+	if verdict.Detail != "1 volume on the storage is referenced by VM configs on node "+corroborationNode {
+		t.Errorf("the detail must say which node the reference lives on, got %q", verdict.Detail)
+	}
+}
+
+// TestConfigReferenceCorroborator_Unclassified_ReadsOnlyTheProbedNode pins the
+// conservative reading. An unclassified storage may be local, so counting
+// another node's references could manufacture a contradiction out of a storage
+// the probed node never shared.
+func TestConfigReferenceCorroborator_Unclassified_ReadsOnlyTheProbedNode(t *testing.T) {
+	t.Parallel()
+	refs := pve.StorageReferenceCounts{absenceStorage: {corroborationPeerNode: 4}}
+	verdict, err := pve.ConfigReferenceCorroborator(refs).
+		CorroborateEmptyListing(context.Background(), unclassifiedProbe(corroborationNode))
+	if err != nil {
+		t.Fatalf("ConfigReferenceCorroborator: %v", err)
+	}
+	if verdict.Contradicted {
+		t.Fatalf("a storage nobody classified cannot be assumed shared, got %+v", verdict)
+	}
+}
+
+// TestStorageReferenceCounts_ReadingsOfOneScan pins the two readings against
+// one another on the same counts, including the nil map every caller that never
+// scanned passes.
+func TestStorageReferenceCounts_ReadingsOfOneScan(t *testing.T) {
+	t.Parallel()
+	refs := pve.StorageReferenceCounts{absenceStorage: {
+		corroborationNode:     2,
+		corroborationPeerNode: 3,
+	}}
+	if got := refs.OnNode(absenceStorage, corroborationNode); got != 2 {
+		t.Errorf("OnNode: want 2, got %d", got)
+	}
+	if got := refs.Anywhere(absenceStorage); got != 5 {
+		t.Errorf("Anywhere: want 5, got %d", got)
+	}
+	if got := refs.OnNode(absenceStorage, "pve-99"); got != 0 {
+		t.Errorf("a node nothing was counted on reads zero, got %d", got)
+	}
+	if got := refs.Anywhere("other-storage"); got != 0 {
+		t.Errorf("a storage nothing was counted on reads zero, got %d", got)
+	}
+	var unscanned pve.StorageReferenceCounts
+	if got := unscanned.OnNode(absenceStorage, corroborationNode); got != 0 {
+		t.Errorf("a scan that never ran counts nothing, got %d", got)
+	}
+	if got := unscanned.Anywhere(absenceStorage); got != 0 {
+		t.Errorf("a scan that never ran counts nothing, got %d", got)
 	}
 }
 
@@ -367,7 +561,7 @@ func TestStorageStatusCorroborator_ActiveAndEmpty_SaysNothing(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":1,"enabled":1,"used":131072,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -380,7 +574,7 @@ func TestStorageStatusCorroborator_Inactive_Contradicts(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":0,"enabled":1,"used":0,"total":0,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -399,7 +593,7 @@ func TestStorageStatusCorroborator_MissingActive_Contradicts(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"enabled":1,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -408,22 +602,120 @@ func TestStorageStatusCorroborator_MissingActive_Contradicts(t *testing.T) {
 	}
 }
 
-func TestStorageStatusCorroborator_UsedAtFloor_Contradicts(t *testing.T) {
+// TestStorageStatusCorroborator_UsedAtFloor_WarnsAndSaysNothing pins the
+// figure's demotion to advice. PVE answers used from a statfs of the whole
+// filesystem, so one NFS export carrying a backup storage's dumps beside an
+// images storage crosses the floor while both storages are telling the truth,
+// and has_disk and the orphan sweeps have no way to override a refusal.
+func TestStorageStatusCorroborator_UsedAtFloor_WarnsAndSaysNothing(t *testing.T) {
 	t.Parallel()
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	ctx := log.IntoContext(context.Background(), logger)
 	status := statusFromJSON(t, `{"active":1,"used":1073741824,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(ctx, sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
-	if !verdict.Contradicted {
-		t.Fatalf("used at the floor contradicts a listing that showed nothing, got %+v", verdict)
+	if verdict.Contradicted {
+		t.Fatalf("a used figure is not a listing, so it may not contradict one, got %+v", verdict)
 	}
-	if !strings.Contains(verdict.Detail, "1073741824") {
-		t.Errorf("the detail must name the used bytes, got %q", verdict.Detail)
+	entry, found := warnedAboutUsedBytes(observer)
+	if !found {
+		t.Fatalf("the operator must still be told what PVE reported, got %+v", observer.All())
 	}
-	if !strings.Contains(verdict.Detail, "10737418240") {
-		t.Errorf("the detail must name the capacity the used figure sits against, got %q", verdict.Detail)
+	if got := entry.Attrs["used_bytes"]; got != int64(1073741824) {
+		t.Errorf("used_bytes: want 1073741824, got %v", got)
+	}
+	if got := entry.Attrs["total_bytes"]; got != int64(10737418240) {
+		t.Errorf("total_bytes: want 10737418240, got %v", got)
+	}
+	if got := entry.Attrs["storage"]; got != absenceStorage {
+		t.Errorf("storage: want %q, got %v", absenceStorage, got)
+	}
+	if got := entry.Attrs["node"]; got != corroborationNode {
+		t.Errorf("node: want %q, got %v", corroborationNode, got)
+	}
+}
+
+// warnedAboutUsedBytes finds the warning the used figure is now reported
+// through, which is the only trace it leaves.
+func warnedAboutUsedBytes(observer *log.Observer) (log.Entry, bool) {
+	for _, entry := range observer.All() {
+		if entry.Level == log.LevelWarn && strings.Contains(entry.Message, "reports bytes in use") {
+			return entry, true
+		}
+	}
+	return log.Entry{}, false
+}
+
+// TestStorageStatusCorroborator_UsedAboveFloor_StillSaysNothing covers the
+// figure an operator would call obviously wrong: a storage reporting gigabytes
+// against an empty listing. It is the same statfs reading, so it is the same
+// advice.
+func TestStorageStatusCorroborator_UsedAboveFloor_StillSaysNothing(t *testing.T) {
+	t.Parallel()
+	status := statusFromJSON(t, `{"active":1,"used":21474836480,"total":10737418240,"type":"nfs"}`)
+	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
+		CorroborateEmptyListing(context.Background(), sharedProbe())
+	if err != nil {
+		t.Fatalf("StorageStatusCorroborator: %v", err)
+	}
+	if verdict.Contradicted {
+		t.Fatalf("the used figure is advisory whatever it reads, got %+v", verdict)
+	}
+}
+
+// TestStorageStatusCorroborator_TransientError_IsRetried pins the retry the one
+// read now rides. A pvedaemon worker recycling during it would otherwise turn
+// into a permanent refusal on a delete path.
+func TestStorageStatusCorroborator_TransientError_IsRetried(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	client := &corroborationStatusClient{
+		nodesSvc: &corroborationNodesService{
+			statusFn: func(context.Context, string, string) (*nodes.ListStorageStatusResponse, error) {
+				attempts++
+				if attempts == 1 {
+					return nil, makeAPIErr(596, "pvedaemon worker recycled")
+				}
+				return statusFromJSON(t, `{"active":1,"used":0,"total":10737418240,"type":"nfs"}`), nil
+			},
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	verdict, err := pve.StorageStatusCorroborator(client).CorroborateEmptyListing(ctx, sharedProbe())
+	if err != nil {
+		t.Fatalf("a worker recycle must not become a permanent refusal: %v", err)
+	}
+	if verdict.Contradicted {
+		t.Fatalf("the second attempt answered, and it agreed with the listing, got %+v", verdict)
+	}
+	if attempts != 2 {
+		t.Errorf("want one retry after the transient failure, got %d attempts", attempts)
+	}
+}
+
+// TestStorageStatusCorroborator_PermanentError_IsNotRetried keeps the retry
+// narrow: a verdict that will never change is returned on the first read, so a
+// misconfigured grant does not spend the whole ladder.
+func TestStorageStatusCorroborator_PermanentError_IsNotRetried(t *testing.T) {
+	t.Parallel()
+	attempts := 0
+	client := &corroborationStatusClient{
+		nodesSvc: &corroborationNodesService{
+			statusFn: func(context.Context, string, string) (*nodes.ListStorageStatusResponse, error) {
+				attempts++
+				return nil, makeAPIErr(403, "Permission check failed")
+			},
+		},
+	}
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	if _, err := pve.StorageStatusCorroborator(client).CorroborateEmptyListing(ctx, sharedProbe()); err == nil {
+		t.Fatal("a denied read did not land, so it cannot clear an empty listing")
+	}
+	if attempts != 1 {
+		t.Errorf("a permanent answer owes no retry, got %d attempts", attempts)
 	}
 }
 
@@ -431,7 +723,7 @@ func TestStorageStatusCorroborator_UsedBelowFloor_SaysNothing(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":1,"used":1073741823,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -444,17 +736,23 @@ func TestStorageStatusCorroborator_StringTypedFields_Decode(t *testing.T) {
 	t.Parallel()
 	// PVE answers these as strings on some versions and endpoints, which is why
 	// nothing here decodes into a plain int.
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	ctx := log.IntoContext(context.Background(), logger)
 	status := statusFromJSON(t, `{"active":"1","used":"2147483648","total":"10737418240","type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(ctx, sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
-	if !verdict.Contradicted {
-		t.Fatal("a string-typed used figure above the floor contradicts the listing just as an integer one does")
+	if verdict.Contradicted {
+		t.Fatalf("the used figure is advisory whichever way PVE typed it, got %+v", verdict)
 	}
-	if !strings.Contains(verdict.Detail, "2147483648") {
-		t.Errorf("the string-typed used figure must decode, got %q", verdict.Detail)
+	entry, found := warnedAboutUsedBytes(observer)
+	if !found {
+		t.Fatal("a string-typed used figure above the floor must still reach the operator")
+	}
+	if got := entry.Attrs["used_bytes"]; got != int64(2147483648) {
+		t.Errorf("the string-typed used figure must decode, got %v", got)
 	}
 }
 
@@ -462,7 +760,7 @@ func TestStorageStatusCorroborator_StringTypedInactive_Decodes(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":"0","used":"0","total":"0","type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -475,7 +773,7 @@ func TestStorageStatusCorroborator_TransportError_IsReturned(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("pveproxy backend gone (code: 596)")
 	_, err := pve.StorageStatusCorroborator(statusClient(nil, sentinel)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err == nil {
 		t.Fatal("a status read that did not land is not a status read that agreed")
 	}
@@ -490,7 +788,7 @@ func TestStorageStatusCorroborator_TransportError_IsReturned(t *testing.T) {
 func TestStorageStatusCorroborator_EmptyResponse_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.StorageStatusCorroborator(statusClient(nil, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err == nil {
 		t.Fatal("a status with no payload establishes nothing and must fail closed")
 	}
@@ -499,7 +797,7 @@ func TestStorageStatusCorroborator_EmptyResponse_IsAnError(t *testing.T) {
 func TestStorageStatusCorroborator_MissingNodesService_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.StorageStatusCorroborator(&corroborationStatusClient{}).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err == nil {
 		t.Fatal("a client with no nodes service cannot corroborate anything")
 	}
@@ -508,15 +806,18 @@ func TestStorageStatusCorroborator_MissingNodesService_IsAnError(t *testing.T) {
 func TestStorageStatusCorroborator_MissingArguments_AreErrors(t *testing.T) {
 	t.Parallel()
 	corroborator := pve.StorageStatusCorroborator(statusClient(nil, nil))
-	if _, err := corroborator.CorroborateEmptyListing(context.Background(), "", absenceStorage, absenceVolid); err == nil {
+	nodeless := sharedProbe()
+	nodeless.Node = ""
+	if _, err := corroborator.CorroborateEmptyListing(context.Background(), nodeless); err == nil {
 		t.Error("an empty node name must not reach the API")
 	}
-	_, err := corroborator.CorroborateEmptyListing(context.Background(), corroborationNode, "", absenceVolid)
-	if err == nil {
+	storageless := sharedProbe()
+	storageless.Storage = ""
+	if _, err := corroborator.CorroborateEmptyListing(context.Background(), storageless); err == nil {
 		t.Error("an empty storage name must not reach the API")
 	}
 	if _, err := pve.StorageStatusCorroborator(nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid); err == nil {
+		CorroborateEmptyListing(context.Background(), sharedProbe()); err == nil {
 		t.Error("a nil client must not reach the API")
 	}
 }
@@ -524,7 +825,7 @@ func TestStorageStatusCorroborator_MissingArguments_AreErrors(t *testing.T) {
 func TestCorroboratorFunc_NilFunction_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.CorroboratorFunc("a source with no implementation", nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
+		CorroborateEmptyListing(context.Background(), sharedProbe())
 	if err == nil {
 		t.Fatal("a corroborator with no implementation is a wiring fault, not a source with nothing to say")
 	}
@@ -554,6 +855,9 @@ func TestResolveDiskHolder_CountsStorageReferencesAcrossGuests(t *testing.T) {
 			"scsi0":  "nfs-images:200/vm-200-disk-0.qcow2,size=64G",
 			"virtio": "not-a-disk-key",
 			"ide2":   "none,media=cdrom",
+			// A detached volume PVE demoted to an unused slot is still a
+			// reference: destroying the VM would take it with it.
+			"unused0": "local-lvm:vm-200-disk-3",
 		},
 	}
 
@@ -588,14 +892,59 @@ func TestResolveDiskHolder_CountsStorageReferencesAcrossGuests(t *testing.T) {
 	if holder.StorageReferences == nil {
 		t.Fatal("a scan that ran must carry its counts out, even when it found no holder")
 	}
-	if got := holder.StorageReferences["nfs-images"]; got != 2 {
+	if got := holder.StorageReferences.Anywhere("nfs-images"); got != 2 {
 		t.Errorf("nfs-images: want 2 disk references (cloud-init and ISO excluded), got %d", got)
 	}
-	if got := holder.StorageReferences["local-lvm"]; got != 1 {
-		t.Errorf("local-lvm: want 1 disk reference, got %d", got)
+	if got := holder.StorageReferences.OnNode("nfs-images", "pve-01"); got != 1 {
+		t.Errorf("nfs-images on pve-01: want the one reference VM 100 carries, got %d", got)
+	}
+	if got := holder.StorageReferences.OnNode("nfs-images", "pve-02"); got != 1 {
+		t.Errorf("nfs-images on pve-02: want the one reference VM 200 carries, got %d", got)
+	}
+	if got := holder.StorageReferences.OnNode("local-lvm", "pve-01"); got != 1 {
+		t.Errorf("local-lvm on pve-01: want 1 disk reference, got %d", got)
+	}
+	if got := holder.StorageReferences.OnNode("local-lvm", "pve-02"); got != 1 {
+		t.Errorf("local-lvm on pve-02: want the unused-slot reference to count, got %d", got)
 	}
 	if got := len(holder.StorageReferences); got != 2 {
 		t.Errorf("only the two real storages must be counted, got %d entries: %v", got, holder.StorageReferences)
+	}
+}
+
+// TestResolveDiskHolder_CountsUnusedSlotReferences is the unused slot on its
+// own. A disk PVE demoted out of its bus slot is exactly the reference an empty
+// listing would otherwise let delete_disk remove out from under the VM that
+// still holds it.
+func TestResolveDiskHolder_CountsUnusedSlotReferences(t *testing.T) {
+	t.Parallel()
+
+	c := &diskClusterClient{
+		clusterSvc: &diskFakeCluster{
+			listFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				return diskClusterResp(map[string]any{"vmid": int64(400), "node": "pve-03"}), nil
+			},
+		},
+		qemuSvc: &diskFakeQEMUFn{
+			fn: func(_ string, _ int) (map[string]any, error) {
+				return map[string]any{
+					"unused0": "nfs-images:400/vm-400-disk-0.qcow2",
+					"unused1": "nfs-images:400/vm-400-disk-1.qcow2,replicate=0",
+					// A cloud-init drive parked in an unused slot is still not
+					// a volume anyone proves an absence for.
+					"unused2": "nfs-images:400/vm-400-cloudinit.qcow2",
+				}, nil
+			},
+		},
+	}
+
+	holder, err := pve.ResolveDiskHolder(
+		context.Background(), c, nopLogger(), "nfs-images:999/vm-999-disk-0.qcow2", parkerTestCfg())
+	if err != nil {
+		t.Fatalf("ResolveDiskHolder: %v", err)
+	}
+	if got := holder.StorageReferences.OnNode("nfs-images", "pve-03"); got != 2 {
+		t.Errorf("nfs-images on pve-03: want both unused disks counted and the cloud-init drive left out, got %d", got)
 	}
 }
 
@@ -626,7 +975,7 @@ func TestResolveDiskHolder_CountsRideOutOnTheHolder(t *testing.T) {
 	if !holder.Found || holder.VMID != 300 {
 		t.Fatalf("holder: want vmid 300, got %+v", holder)
 	}
-	if got := holder.StorageReferences["local-lvm"]; got != 2 {
+	if got := holder.StorageReferences.OnNode("local-lvm", "pve-01"); got != 2 {
 		t.Errorf("local-lvm: want 2 disk references on the holder's own config, got %d", got)
 	}
 }

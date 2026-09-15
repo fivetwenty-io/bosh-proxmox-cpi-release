@@ -563,51 +563,123 @@ type DiskScanHit struct {
 	Tags  string
 	Slot  string
 	Volid string
-	// StorageReferences counts, per storage, the volids the configs the scan
-	// read reference. It is nil when no scan ran, and empty when one ran and
-	// found nothing. See StorageReferenceCounts for what the count is good for
-	// and where it is only a lower bound.
+	// StorageReferences counts the volids the configs the scan read
+	// reference, per storage and then per the node each referencing guest
+	// runs on. It is nil when no scan ran, and empty when one ran and found
+	// nothing. See StorageReferenceCounts for which reading a caller wants
+	// and where the count is only a lower bound.
 	StorageReferences StorageReferenceCounts
 }
 
 // StorageReferenceCounts maps a storage name to the number of volumes the
-// cluster's VM configs reference on it. The cluster-wide disk scan reads every
-// QEMU config already, so the count is free wherever that scan ran, and it
-// answers the one question an empty content listing cannot: a storage that
-// lists nothing while configs still name volumes on it is an export serving
-// the wrong tree, not a storage whose last volume was deleted.
+// cluster's VM configs reference on it, counted separately for each node whose
+// guests hold those references. The cluster-wide disk scan reads every QEMU
+// config already, so the counts are free wherever that scan ran, and they
+// answer the one question an empty content listing cannot: a storage that lists
+// nothing while configs still name volumes on it is an export serving the wrong
+// tree, not a storage whose last volume was deleted.
 //
-// The count is a lower bound rather than a census. The scan stops at the first
-// config that matches the disk it was looking for, so a hit leaves the configs
-// behind it unread. That only ever under-counts, so a non-zero count is still
-// evidence, which is all the corroborator asks of it.
-type StorageReferenceCounts map[string]int
+// The node breakdown is what keeps that answer honest on local storage. PVE
+// gives every node a dir storage called "local", and the storage named in a
+// volid is the same string on all of them, so a disk deleted on one node would
+// otherwise be contradicted by the ten disks another node keeps on its own
+// "local". Read the counts through OnNode for a storage only one node can see,
+// and through Anywhere for a storage the whole cluster shares.
+//
+// The counts are a lower bound rather than a census. The scan stops at the
+// first config that matches the disk it was looking for, so a hit leaves the
+// configs behind it unread. That only ever under-counts, so a non-zero count is
+// still evidence, which is all the corroborator asks of it.
+//
+// A nil map means no scan ran, which is an absence of evidence rather than
+// evidence of absence. Both methods read nil as zero, so a caller that never
+// scanned gets a source with nothing to say instead of one that denies.
+type StorageReferenceCounts map[string]map[string]int
 
-// addStorageReferences counts one guest's parsed disk map into counts.
+// OnNode reports how many volumes on storage are referenced by the configs of
+// guests running on node. It is the reading a node-local storage takes, and the
+// reading an unclassified storage takes, because references from elsewhere in
+// the cluster cannot contradict what one node's own tree holds.
+func (c StorageReferenceCounts) OnNode(storage, node string) int {
+	return c[storage][node]
+}
+
+// Anywhere reports how many volumes on storage the cluster's configs reference
+// on any node. It is the reading a shared storage takes, where every node sees
+// the same tree and a reference from any of them is a volume the listing should
+// have carried.
+func (c StorageReferenceCounts) Anywhere(storage string) int {
+	total := 0
+	for _, count := range c[storage] {
+		total += count
+	}
+	return total
+}
+
+// add records one reference to storage from a guest on node.
+func (c StorageReferenceCounts) add(storage, node string) {
+	if c == nil {
+		return
+	}
+	if c[storage] == nil {
+		c[storage] = make(map[string]int)
+	}
+	c[storage][node]++
+}
+
+// addStorageReferences counts one guest's references into counts, attributing
+// them to the node that guest runs on.
 //
 // Every active bus slot counts, parkers included: a parker holding a detached
 // volume is exactly the reference an empty listing would otherwise let us
-// delete out from under. Cdrom media and cloud-init drives do not, because
-// neither is a volume whose absence anyone is proving, and an ISO mounted from
-// a storage says nothing about the disk images on it.
-func addStorageReferences(counts StorageReferenceCounts, disks map[string]string) {
+// delete out from under. So does every unusedN entry, which is the slot PVE
+// demotes a disk to when it leaves its bus slot, and which is the same detached
+// volume wearing a different key. Cdrom media and cloud-init drives do not,
+// because neither is a volume whose absence anyone is proving, and an ISO
+// mounted from a storage says nothing about the disk images on it.
+//
+// The parsed disk map carries only the bus slots, so the unusedN entries are
+// read from the raw config the parse came from.
+func addStorageReferences(counts StorageReferenceCounts, node string, cfg map[string]any, disks map[string]string) {
 	if counts == nil {
 		return
 	}
 	for _, optstr := range disks {
-		bare := optstr
-		if comma := strings.Index(optstr, ","); comma >= 0 {
-			bare = optstr[:comma]
-		}
-		if bare == "" || bare == "none" || driveOptStrIsCDROM(optstr) || strings.Contains(bare, "-cloudinit") {
+		if driveOptStrIsCDROM(optstr) {
 			continue
 		}
-		storage, volume, ok := strings.Cut(bare, ":")
-		if !ok || storage == "" || volume == "" {
-			continue
-		}
-		counts[storage]++
+		countStorageReference(counts, node, bareDriveVolid(optstr))
 	}
+	// FindUnusedDiskEntries has already stripped any option suffix, and PVE
+	// never parks cdrom media in an unusedN slot, so what comes back is a bare
+	// volid or nothing.
+	for _, volid := range FindUnusedDiskEntries(cfg) {
+		countStorageReference(counts, node, volid)
+	}
+}
+
+// bareDriveVolid strips the option suffix PVE writes after a volid in a drive
+// entry, leaving the volid itself.
+func bareDriveVolid(optstr string) string {
+	if comma := strings.Index(optstr, ","); comma >= 0 {
+		return optstr[:comma]
+	}
+	return optstr
+}
+
+// countStorageReference counts one drive value if it names a volume on a
+// storage. The values that name no such volume are the empty slot, PVE's
+// "none" placeholder, a cloud-init drive, and anything that is not a
+// storage-qualified volid at all.
+func countStorageReference(counts StorageReferenceCounts, node, bare string) {
+	if bare == "" || bare == "none" || strings.Contains(bare, "-cloudinit") {
+		return
+	}
+	storage, volume, ok := strings.Cut(bare, ":")
+	if !ok || storage == "" || volume == "" {
+		return
+	}
+	counts.add(storage, node)
 }
 
 // driveOptStrIsCDROM reports whether a drive entry is cdrom media. PVE writes
@@ -700,7 +772,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		}
 
 		disks := qemu.ParseDisks(cfg)
-		addStorageReferences(counts, disks)
+		addStorageReferences(counts, vmNode, cfg, disks)
 
 		if slot, current, ok := matchDiskIdentity(disks, volid, stableID); ok {
 			tags, _ := ConfigString(cfg, "tags")

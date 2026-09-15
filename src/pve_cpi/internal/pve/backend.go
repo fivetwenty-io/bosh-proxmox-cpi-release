@@ -135,9 +135,12 @@ type BackendResolverOption func(*resolver)
 // so without corroboration that sweep reports a volume absent from every node
 // in the cluster.
 //
-// supply is called once per proof that reaches an empty listing, so a caller
-// whose point probes answer pays nothing. A nil supply, or one that returns no
-// corroborators, leaves the pre-corroboration behavior in place.
+// supply is called once per sweep, before the first node is probed, and the
+// sources it returns are shared by every probe in that sweep. It must therefore
+// be cheap to call and must not read anything itself; a source that needs a
+// file or an API call reads it lazily, when a probe actually asks. A nil
+// supply, or one that returns no corroborators, leaves the pre-corroboration
+// behavior in place.
 func WithEmptyListingCorroborators(supply func() []EmptyListingCorroborator) BackendResolverOption {
 	return func(r *resolver) { r.corroborate = supply }
 }

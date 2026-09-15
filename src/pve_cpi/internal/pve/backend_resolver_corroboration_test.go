@@ -6,6 +6,7 @@ package pve
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,8 +29,22 @@ func corroboratedResolverFixture(
 	t *testing.T, opts ...BackendResolverOption,
 ) (BackendResolver, *fakeContentNodes) {
 	t.Helper()
+	return corroboratedResolverFixtureOn(t, []string{"pve-01"}, opts...)
+}
+
+// corroboratedResolverFixtureOn is the same fixture over a named node set, for
+// the cases that care how often a sweep of several nodes reaches its sources.
+// The first node is the resolver's default node.
+func corroboratedResolverFixtureOn(
+	t *testing.T, clusterNodes []string, opts ...BackendResolverOption,
+) (BackendResolver, *fakeContentNodes) {
+	t.Helper()
 	content := &fakeContentNodes{}
 	index := newCountingStorageIndex(nil, `{"storage":"dir-images","type":"dir","is_mountpoint":"1"}`)
+	rows := make([]map[string]any, 0, len(clusterNodes))
+	for _, node := range clusterNodes {
+		rows = append(rows, map[string]any{"node": node})
+	}
 	base := &backendTestClient{
 		storageSvc: &fakeStorage{
 			existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
@@ -38,7 +53,7 @@ func corroboratedResolverFixture(
 		},
 		clusterSvc: &fakeCluster{
 			listFn: func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-				return clusterResp(map[string]any{"node": "pve-01"}), nil
+				return clusterResp(rows...), nil
 			},
 		},
 		nodesSvc:          content,
@@ -46,14 +61,14 @@ func corroboratedResolverFixture(
 	}
 	client := &visibleBackendClient{backendTestClient: base}
 	cache := NewStorageInfoCache(ClusterStorageAsLister(index.svc), time.Minute)
-	return NewBackendResolver(client, cache, "pve-01", opts...), content
+	return NewBackendResolver(client, cache, clusterNodes[0], opts...), content
 }
 
 // contradictingCorroborator answers every question with a contradiction and
 // records that it was asked.
 func contradictingCorroborator(asked *int) EmptyListingCorroborator {
 	return CorroboratorFunc(sweepCorroborationSource,
-		func(context.Context, string, string, string) (Corroboration, error) {
+		func(context.Context, EmptyListingProbe) (Corroboration, error) {
 			*asked++
 			return Corroboration{
 				Contradicted: true,
@@ -121,7 +136,7 @@ func TestBackendResolver_WithEmptyListingCorroborators_SweepFailsClosed(t *testi
 		t.Errorf("the one candidate node owes one corroboration, got %d", asked)
 	}
 	if supplied != 1 {
-		t.Errorf("the supplier is called per probe that reaches a listing, got %d", supplied)
+		t.Errorf("the supplier is called once for the sweep, got %d", supplied)
 	}
 }
 
@@ -149,6 +164,40 @@ func TestBackendResolver_Corroborators_UnusedWhenTheListingCarriesTheVolume(t *t
 	}
 }
 
+// TestBackendResolver_Corroborators_BuiltOncePerSweep pins the cost of a
+// multi-node sweep. Every candidate asks the same sources the same question,
+// and a source such as the allocation journal reads a file on local disk to
+// answer, so building them per node would read that file once per node in the
+// cluster while the sources themselves are still asked per node.
+func TestBackendResolver_Corroborators_BuiltOncePerSweep(t *testing.T) {
+	t.Parallel()
+
+	supplied := 0
+	var askedOn []string
+	resolver, _ := corroboratedResolverFixtureOn(t, []string{"pve-01", "pve-02", "pve-03"},
+		WithEmptyListingCorroborators(func() []EmptyListingCorroborator {
+			supplied++
+			return []EmptyListingCorroborator{
+				CorroboratorFunc(sweepCorroborationSource,
+					func(_ context.Context, probe EmptyListingProbe) (Corroboration, error) {
+						askedOn = append(askedOn, probe.Node)
+						return Corroboration{}, nil
+					}),
+			}
+		}))
+	_, err := sweepLocalBackend(t, resolver).NodeForExisting(context.Background(), classifyVolid)
+	if err == nil || !cpierrors.IsType(err, cpierrors.TypeDiskNotFound) {
+		t.Fatalf("three silent corroborations leave the sweep a complete clean miss, got %v", err)
+	}
+	if supplied != 1 {
+		t.Errorf("the sources are built once for the whole sweep, got %d builds", supplied)
+	}
+	want := []string{"pve-01", "pve-02", "pve-03"}
+	if !slices.Equal(askedOn, want) {
+		t.Errorf("every candidate node owes its own corroboration, want %v, got %v", want, askedOn)
+	}
+}
+
 // TestNodeForExistingCorroborated_CallerExtrasComeFirst covers the per-call
 // half: the handler paths hold config-reference counts the resolver cannot
 // supply, and those go ahead of the resolver's own sources so the cheapest
@@ -157,14 +206,14 @@ func TestNodeForExistingCorroborated_CallerExtrasComeFirst(t *testing.T) {
 	t.Parallel()
 
 	var order []string
-	supplied := CorroboratorFunc("resolver source", func(context.Context, string, string, string) (Corroboration, error) {
+	supplied := CorroboratorFunc("resolver source", func(context.Context, EmptyListingProbe) (Corroboration, error) {
 		order = append(order, "resolver")
 		return Corroboration{}, nil
 	})
 	resolver, _ := corroboratedResolverFixture(t, WithEmptyListingCorroborators(
 		func() []EmptyListingCorroborator { return []EmptyListingCorroborator{supplied} }))
 	extra := CorroboratorFunc(sweepCorroborationSource,
-		func(context.Context, string, string, string) (Corroboration, error) {
+		func(context.Context, EmptyListingProbe) (Corroboration, error) {
 			order = append(order, "caller")
 			return Corroboration{}, nil
 		})
@@ -185,7 +234,7 @@ func TestNodeForExistingCorroborated_FallsBackOnAPlainBackend(t *testing.T) {
 	t.Parallel()
 
 	extra := CorroboratorFunc(sweepCorroborationSource,
-		func(context.Context, string, string, string) (Corroboration, error) {
+		func(context.Context, EmptyListingProbe) (Corroboration, error) {
 			return Corroboration{Contradicted: true}, nil
 		})
 	node, err := NodeForExistingCorroborated(

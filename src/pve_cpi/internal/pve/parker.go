@@ -1275,9 +1275,9 @@ type diskHolder struct {
 	// from an ordinary VM without a second config read.
 	tags string
 	// storageReferences counts what the same scan saw on every other guest:
-	// how many volids each storage is referenced by. It is set even when no
-	// holder was found, because that is the case a caller is about to prove an
-	// absence for.
+	// how many volids each storage is referenced by, broken down by the node
+	// the referencing guest runs on. It is set even when no holder was found,
+	// because that is the case a caller is about to prove an absence for.
 	storageReferences StorageReferenceCounts
 }
 
@@ -1467,10 +1467,11 @@ type DiskHolder struct {
 	// not IsParker but whose tags mark a parker is one the configured band no
 	// longer covers -- the state every stranded-parker refusal keys on.
 	Tags string
-	// StorageReferences counts, per storage, the volumes the cluster's configs
-	// reference, as the same scan saw them. It is set whether or not a holder
-	// was found, and it is nil only when no scan ran. pve.ConfigReferenceCorroborator
-	// turns it into the second opinion an empty content listing needs.
+	// StorageReferences counts the volumes the cluster's configs reference, per
+	// storage and then per the node each referencing guest runs on, as the same
+	// scan saw them. It is set whether or not a holder was found, and it is nil
+	// only when no scan ran. pve.ConfigReferenceCorroborator turns it into the
+	// second opinion an empty content listing needs.
 	StorageReferences StorageReferenceCounts
 }
 
