@@ -20,6 +20,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // Package-level sentinel constants shared across handler test files.
@@ -78,7 +79,47 @@ func (m *mockPVEClient) Cluster() cluster.Service {
 	return m.clusterSvc
 }
 func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return m.clusterStorageSvc }
-func (m *mockPVEClient) Pools() pve.PoolService                 { return m.poolsSvc }
+
+// visiblePVEClient answers the audit-visibility proof
+// pve.ObserveStorageVolumePresence demands before it will call a volume absent.
+// mockPVEClient deliberately does not implement it, because giving every
+// existing test's client that method would change the diagnostic reason those
+// tests see from visibility_unavailable to visibility_unproven, and
+// managed_vm_delete_observation_test.go pins that mapping. Only a test that
+// needs a provable absence wraps its client.
+type visiblePVEClient struct {
+	*mockPVEClient
+	visibilityErr error
+}
+
+func (c *visiblePVEClient) StorageAuditVisibility(context.Context) error { return c.visibilityErr }
+
+// nfsNoFormat is PVE 9.2's reply for a stat that did not work on file storage.
+// A missing file produces it, and so does an unmounted export, a denied read,
+// and a stale handle, which is why the text on its own settles nothing.
+func nfsNoFormat(volid string) error {
+	return makeAPIErr(500, "volume_size_info on '"+volid+"' failed - no format")
+}
+
+// makeAPIErr builds an SDK error through ParseAPIError, so it carries the
+// sentinel and the HTTP code a live reply would and the pve classifiers read
+// it exactly as they read the wire.
+func makeAPIErr(httpCode int, msg string) error {
+	body, _ := json.Marshal(map[string]any{"message": msg, "code": httpCode})
+	return sdkerrors.ParseAPIError(httpCode, body)
+}
+
+// storageContentListing renders a ListStorageContent reply carrying exactly
+// the given volids, which is the observation the absence proof reads.
+func storageContentListing(volids ...string) *nodes.ListStorageContentResponse {
+	resp := make(nodes.ListStorageContentResponse, 0, len(volids))
+	for _, volid := range volids {
+		raw, _ := json.Marshal(map[string]any{"volid": volid})
+		resp = append(resp, json.RawMessage(raw))
+	}
+	return &resp
+}
+func (m *mockPVEClient) Pools() pve.PoolService { return m.poolsSvc }
 
 // --------------------------------------------------------------------------
 // mockQEMUService
@@ -955,6 +996,11 @@ type mockClusterStorage struct {
 	storageName string
 	storageType string
 	shared      bool
+	// isMountpoint carries PVE's is_mountpoint value verbatim, because the
+	// field arrives as a bool-or-path and the absence proof reads it to decide
+	// whether an empty content listing means anything. Empty leaves the key
+	// out of the entry, which is the shape of a storage that never set it.
+	isMountpoint string
 }
 
 func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
@@ -962,11 +1008,15 @@ func (s *mockClusterStorage) ListStorage(_ context.Context, _ *clusterstorage.Li
 	if s.shared {
 		sharedInt = 1
 	}
-	raw, _ := json.Marshal(map[string]any{
+	entry := map[string]any{
 		"storage": s.storageName,
 		"type":    s.storageType,
 		"shared":  sharedInt,
-	})
+	}
+	if s.isMountpoint != "" {
+		entry["is_mountpoint"] = s.isMountpoint
+	}
+	raw, _ := json.Marshal(entry)
 	resp := clusterstorage.ListStorageResponse{json.RawMessage(raw)}
 	return &resp, nil
 }

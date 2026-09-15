@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	sdkclusterapi "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -230,5 +231,274 @@ func TestHandleDeleteDisk_AnchorMissing_ExistenceUnprovable_Refuses(t *testing.T
 	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(reparkDiskCID(t))}, jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("an unprovable absence must not be treated as a completed delete")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The file-storage twins of the three cases above. On dir, NFS, and CIFS
+// storage PVE answers a single-volume GET for a file it cannot stat with an
+// HTTP 500 naming volume_size_info rather than a 404, so the point probe
+// settles nothing and the storage content listing is what proves absence.
+// ---------------------------------------------------------------------------
+
+const (
+	// fileAnchorNFSStorage is an NFS storage, whose listing PVE refuses to
+	// serve at all when the export is down, so a listing that omits the
+	// volume proves the volume is gone.
+	fileAnchorNFSStorage = "nfs-images"
+	fileAnchorNFSVolid   = "nfs-images:604/vm-604-disk-0.qcow2"
+	// fileAnchorDirStorage is a plain dir storage with no is_mountpoint,
+	// which lists an empty array when its mount drops instead of failing.
+	fileAnchorDirStorage = "dir-images"
+	fileAnchorDirVolid   = "dir-images:604/vm-604-disk-0.qcow2"
+	fileAnchorNode       = "lab-file-0"
+)
+
+// fileAnchorProof wires one delete_disk call against file storage: the parker
+// survives holding nothing, the point probe answers PVE's "no format" 500, and
+// the content listing and the audit-visibility proof are whatever the case
+// under test needs them to be.
+type fileAnchorProof struct {
+	deps        handlers.Deps
+	observer    *log.Observer
+	deleteCalls *int
+}
+
+func newFileAnchorProof(
+	storageName, storageType, isMountpoint string,
+	listing func() (*sdknodes.ListStorageContentResponse, error),
+	visibilityErr error,
+) fileAnchorProof {
+	deleteCalls := 0
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			return false, nfsNoFormat(volume)
+		},
+		deleteVolumeAsyncFn: func(_ context.Context, _, _, _ string) (string, error) {
+			deleteCalls++
+			return "", nil
+		},
+	}
+	// The parker is still there and holds nothing, so the holder scan finds
+	// no VM referencing the volume.
+	qemuSvc := &mockQEMUService{
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"tags": "bosh-cpi;bosh-parker", "protection": true}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		listStorageContentFn: func(
+			_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams,
+		) (*sdknodes.ListStorageContentResponse, error) {
+			return listing()
+		},
+	}
+	client := &visiblePVEClient{
+		mockPVEClient: &mockPVEClient{
+			storageSvc: storageSvc,
+			qemuSvc:    qemuSvc,
+			nodesSvc:   nodesSvc,
+			clusterSvc: reparkClusterSvc(),
+			clusterStorageSvc: &mockClusterStorage{
+				storageName:  storageName,
+				storageType:  storageType,
+				shared:       true,
+				isMountpoint: isMountpoint,
+			},
+		},
+		visibilityErr: visibilityErr,
+	}
+	logger, observer := log.NewObservedLogger(log.LevelWarn)
+	deps := handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:                     fileAnchorNode,
+			DiskStorage:              storageName,
+			DetachedDiskStrategy:     "parked",
+			DiskDeleteStateGuard:     "off",
+			ParkedDiskVMIDRangeStart: 90000,
+			ParkedDiskVMIDRangeEnd:   90999,
+		},
+		PVE:    client,
+		Logger: logger,
+	}
+	return fileAnchorProof{deps: deps, observer: observer, deleteCalls: &deleteCalls}
+}
+
+// deleteFileAnchorDisk runs delete_disk against a promised-anchor CID naming
+// the given volume.
+func deleteFileAnchorDisk(t *testing.T, fixture fileAnchorProof, volid string) error {
+	t.Helper()
+	cid := mustEncodeDiskCID(t, volid, &pve.DiskCIDMeta{ID: reparkStableID, Anchor: true})
+	h := handlers.HandleDeleteDisk(fixture.deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{marshal(cid)}, jsonrpc.Context{})
+	return err
+}
+
+// emptyStorageListing is the reply PVE gives for a storage holding nothing,
+// and also the reply a dir storage gives once its mount has dropped.
+func emptyStorageListing() (*sdknodes.ListStorageContentResponse, error) {
+	return storageContentListing(), nil
+}
+
+// warnsAbsenceUnproven reports whether the run logged the warning that says
+// the refusal is standing on an absence nobody could establish.
+func warnsAbsenceUnproven(observer *log.Observer) bool {
+	for _, entry := range observer.All() {
+		if entry.Level == log.LevelWarn && strings.Contains(entry.Message, "absence could not be proven") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestHandleDeleteDisk_AnchorMissing_NFSVolumeGone_Idempotent is the live
+// defect. The point probe cannot answer on NFS, and reading its failure as
+// "unproven" left delete_disk refusing a disk that was already gone.
+func TestHandleDeleteDisk_AnchorMissing_NFSVolumeGone_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFileAnchorProof(fileAnchorNFSStorage, "nfs", "", emptyStorageListing, nil)
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorNFSVolid); err != nil {
+		t.Fatalf("a volume an NFS listing proves gone must be idempotent success, got %v", err)
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_NFSVolumePresent_StillRefuses keeps the
+// guard the idempotency shortcut must not weaken: the listing carries the
+// volume, so it is there, and the anchor refusal stands with its recovery.
+func TestHandleDeleteDisk_AnchorMissing_NFSVolumePresent_StillRefuses(t *testing.T) {
+	t.Parallel()
+
+	listing := func() (*sdknodes.ListStorageContentResponse, error) {
+		return storageContentListing(fileAnchorNFSVolid), nil
+	}
+	fixture := newFileAnchorProof(fileAnchorNFSStorage, "nfs", "", listing, nil)
+	err := deleteFileAnchorDisk(t, fixture, fileAnchorNFSVolid)
+	if err == nil {
+		t.Fatal("a promised-anchor volume the listing still carries must be refused")
+	}
+	if !strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("the refusal must keep its recovery advice, got %v", err)
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_NFSListingFails_Refuses is the fail-safe
+// direction: the one observation that could have settled the question did not
+// land, so the refusal stands and the log says why.
+func TestHandleDeleteDisk_AnchorMissing_NFSListingFails_Refuses(t *testing.T) {
+	t.Parallel()
+
+	listing := func() (*sdknodes.ListStorageContentResponse, error) {
+		return nil, errors.New("storage 'nfs-images' is not online")
+	}
+	fixture := newFileAnchorProof(fileAnchorNFSStorage, "nfs", "", listing, nil)
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorNFSVolid); err == nil {
+		t.Fatal("an unprovable absence must not be treated as a completed delete")
+	}
+	if !warnsAbsenceUnproven(fixture.observer) {
+		t.Error("a refusal standing on an unproven absence must say so in the log")
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_NFSVisibilityUnproven_Refuses covers the
+// reduced-ACL token. Without Sys.Audit at /access the listing may be
+// permission filtered, so a volume missing from it proves nothing.
+func TestHandleDeleteDisk_AnchorMissing_NFSVisibilityUnproven_Refuses(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFileAnchorProof(fileAnchorNFSStorage, "nfs", "", emptyStorageListing,
+		errors.New("permission check failed (/access, Sys.Audit)"))
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorNFSVolid); err == nil {
+		t.Fatal("a listing that may be permission filtered must not prove absence")
+	}
+	if !warnsAbsenceUnproven(fixture.observer) {
+		t.Error("a refusal standing on an unproven absence must say so in the log")
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_PlainDirEmptyListing_Refuses is the
+// dropped-mount case. PVE lists a dir storage with no is_mountpoint as an
+// empty array once its mount goes away, exactly as it lists a storage that is
+// genuinely empty, so an empty listing settles nothing there.
+func TestHandleDeleteDisk_AnchorMissing_PlainDirEmptyListing_Refuses(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFileAnchorProof(fileAnchorDirStorage, "dir", "", emptyStorageListing, nil)
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorDirVolid); err == nil {
+		t.Fatal("an empty listing on a plain dir storage must not prove absence")
+	}
+	if !warnsAbsenceUnproven(fixture.observer) {
+		t.Error("a refusal standing on an unproven absence must say so in the log")
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("a refused delete must not reach storage, got %d imgdel calls", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_PlainDirPopulatedListing_Idempotent is
+// the other half of that rule. Other volumes in the listing prove the tree is
+// really mounted, which is the evidence an empty array cannot give.
+func TestHandleDeleteDisk_AnchorMissing_PlainDirPopulatedListing_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	listing := func() (*sdknodes.ListStorageContentResponse, error) {
+		return storageContentListing(
+			"dir-images:701/vm-701-disk-0.qcow2",
+			"dir-images:702/vm-702-disk-0.qcow2",
+		), nil
+	}
+	fixture := newFileAnchorProof(fileAnchorDirStorage, "dir", "", listing, nil)
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorDirVolid); err != nil {
+		t.Fatalf("a populated dir listing that omits the volume proves it gone, got %v", err)
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_DirWithIsMountpoint_Idempotent pins the
+// fix the unproven message advises. With is_mountpoint set, PVE refuses to
+// activate the storage when the mount is gone, so an empty listing from a
+// storage that answered at all is proof.
+func TestHandleDeleteDisk_AnchorMissing_DirWithIsMountpoint_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFileAnchorProof(fileAnchorDirStorage, "dir", "1", emptyStorageListing, nil)
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorDirVolid); err != nil {
+		t.Fatalf("is_mountpoint makes an empty dir listing proof of absence, got %v", err)
+	}
+	if *fixture.deleteCalls != 0 {
+		t.Errorf("nothing to delete, want 0 imgdel calls, got %d", *fixture.deleteCalls)
+	}
+}
+
+// TestHandleDeleteDisk_AnchorMissing_UnclassifiableStorage_Refuses pins what a
+// storage the CPI cannot look up means. A storage it cannot classify is one
+// whose listing cannot carry a proof, so the absence stays unproven rather
+// than falling open.
+func TestHandleDeleteDisk_AnchorMissing_UnclassifiableStorage_Refuses(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFileAnchorProof(fileAnchorNFSStorage, "nfs", "", emptyStorageListing, nil)
+	// A client with no cluster-storage service is what a token that cannot
+	// read the storage index sees, and it is what an unwired caller sees too.
+	fixture.deps.PVE.(*visiblePVEClient).clusterStorageSvc = nil
+	if err := deleteFileAnchorDisk(t, fixture, fileAnchorNFSVolid); err == nil {
+		t.Fatal("a storage the CPI cannot classify must not yield a proven absence")
+	}
+	if !warnsAbsenceUnproven(fixture.observer) {
+		t.Error("a refusal standing on an unproven absence must say so in the log")
 	}
 }

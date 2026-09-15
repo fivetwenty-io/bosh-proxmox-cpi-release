@@ -2394,3 +2394,100 @@ func TestHandleDeleteVM_AuthFailure(t *testing.T) {
 		t.Errorf("auth failure classified as RetriableCloud; want non-retriable TypeCloud; type=%s", cpiErr.Type())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The unused-slot guard on file storage. A stale slot pointing at a deleted
+// volume must not wedge delete_vm, and on dir, NFS, and CIFS storage the
+// single-volume probe cannot establish that the volume is deleted, because
+// PVE answers a file it cannot stat with an HTTP 500 naming volume_size_info.
+// ---------------------------------------------------------------------------
+
+const (
+	deleteVMNFSStorage = "nfs-images"
+	deleteVMNFSVolid   = "nfs-images:9000/vm-9000-disk-0.qcow2"
+)
+
+// deleteVMUnusedNFSDeps builds delete_vm Deps for a VM carrying one unused
+// slot on NFS storage whose point probe cannot answer.
+func deleteVMUnusedNFSDeps(
+	deleteCalled *bool,
+	listing func() (*nodes.ListStorageContentResponse, error),
+) handlers.Deps {
+	qemuSvc := &mockQEMUService{
+		stopFn: func(_ context.Context, _ string, _ int) (string, error) { return "", nil },
+		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+			return map[string]any{"unused0": deleteVMNFSVolid}, nil
+		},
+	}
+	nodesSvc := &mockNodesService{
+		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			*deleteCalled = true
+			raw := nodes.DeleteQemuResponse{}
+			return &raw, nil
+		},
+		listStorageContentFn: func(
+			_ context.Context, _, _ string, _ *nodes.ListStorageContentParams,
+		) (*nodes.ListStorageContentResponse, error) {
+			return listing()
+		},
+	}
+	storageSvc := &mockStorageService{
+		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			return false, nfsNoFormat(volume)
+		},
+	}
+	deps := testDepsFoundVMWithStorage(101, qemuSvc, nodesSvc, &mockTasksService{}, &mockAgentService{}, storageSvc)
+	deps.Config.DiskStorage = deleteVMNFSStorage
+	base, ok := deps.PVE.(*mockPVEClient)
+	if !ok {
+		return deps
+	}
+	base.clusterStorageSvc = &mockClusterStorage{
+		storageName: deleteVMNFSStorage,
+		storageType: "nfs",
+		shared:      true,
+	}
+	deps.PVE = &visiblePVEClient{mockPVEClient: base}
+	return deps
+}
+
+// TestHandleDeleteVM_AllowsWhenUnusedNFSVolumeProvenAbsent pins the outcome
+// the listing makes reachable. The volume behind the stale slot is gone, so
+// destroying the VM cannot lose data and the guard must let it through.
+func TestHandleDeleteVM_AllowsWhenUnusedNFSVolumeProvenAbsent(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	deps := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
+		return storageContentListing(), nil
+	})
+
+	h := handlers.HandleDeleteVM(deps)
+	if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
+		t.Fatalf("a stale slot whose volume the listing proves gone must not block destroy, got %v", err)
+	}
+	if !deleteCalled {
+		t.Error("DeleteQemu must be called once the unused-slot volume is proven absent")
+	}
+}
+
+// TestHandleDeleteVM_RefusesWhenUnusedNFSVolumeUnproven keeps the fail-closed
+// default. Neither observation landed, so the slot counts as live and the
+// destroy that would take the volume with it does not run.
+func TestHandleDeleteVM_RefusesWhenUnusedNFSVolumeUnproven(t *testing.T) {
+	t.Parallel()
+
+	deleteCalled := false
+	deps := deleteVMUnusedNFSDeps(&deleteCalled, func() (*nodes.ListStorageContentResponse, error) {
+		return nil, errors.New("storage 'nfs-images' is not online")
+	})
+
+	h := handlers.HandleDeleteVM(deps)
+	_, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("an unprovable absence must leave the unused-slot guard refusing")
+	}
+	if deleteCalled {
+		t.Error("DeleteQemu must not run while the slot's volume could still be there")
+	}
+}

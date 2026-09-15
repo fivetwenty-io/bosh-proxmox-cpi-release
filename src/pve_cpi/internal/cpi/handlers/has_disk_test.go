@@ -10,6 +10,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -595,3 +596,121 @@ func TestHandleHasDisk_LVMThin_CID(t *testing.T) {
 // Re-enable when integration-test harness provides a cifs pool via env.
 //
 // func TestHandleHasDisk_CIFS_CID(t *testing.T) { ... }
+
+// ---------------------------------------------------------------------------
+// has_disk on file storage. PVE answers a single-volume GET for a file it
+// cannot stat with an HTTP 500 naming volume_size_info rather than a 404, so
+// the point probe never resolves and bosh cck used to get an error where it
+// needs a false.
+// ---------------------------------------------------------------------------
+
+const (
+	hasDiskNFSStorage = "nfs-images"
+	hasDiskNFSVolid   = "nfs-images:9001/vm-9001-disk-0.qcow2"
+)
+
+// depsForHasOnNFS builds has_disk Deps whose point probe answers PVE's "no
+// format" 500 and whose content listing is whatever the case under test needs.
+func depsForHasOnNFS(listing func() (*sdknodes.ListStorageContentResponse, error)) handlers.Deps {
+	client := &visiblePVEClient{
+		mockPVEClient: &mockPVEClient{
+			storageSvc: &mockStorageService{
+				existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+					return false, nfsNoFormat(volume)
+				},
+			},
+			clusterSvc: emptyClusterSvc(),
+			nodesSvc: &mockNodesService{
+				listStorageContentFn: func(
+					_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams,
+				) (*sdknodes.ListStorageContentResponse, error) {
+					return listing()
+				},
+			},
+			clusterStorageSvc: &mockClusterStorage{
+				storageName: hasDiskNFSStorage,
+				storageType: "nfs",
+				shared:      true,
+			},
+		},
+	}
+	return handlers.Deps{
+		Config: &config.CPIConfig{
+			Node:        testNode,
+			DiskStorage: hasDiskNFSStorage,
+		},
+		PVE:    client,
+		Logger: log.NewNopLogger(),
+	}
+}
+
+// TestHandleHasDisk_NFSVolumeGone_ReturnsFalse is the answer bosh cck needs.
+// The listing an NFS storage would refuse to serve at all if its export were
+// down came back without the volume, which settles it.
+func TestHandleHasDisk_NFSVolumeGone_ReturnsFalse(t *testing.T) {
+	t.Parallel()
+	deps := depsForHasOnNFS(func() (*sdknodes.ListStorageContentResponse, error) {
+		return storageContentListing(), nil
+	})
+
+	h := handlers.HandleHasDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(mustEncodeDiskCID(t, hasDiskNFSVolid, nil)),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("a volume an NFS listing proves gone must answer false, got %v", err)
+	}
+	exists, ok := result.(bool)
+	if !ok {
+		t.Fatalf("expected bool result, got %T", result)
+	}
+	if exists {
+		t.Error("expected exists=false")
+	}
+}
+
+// TestHandleHasDisk_NFSVolumePresent_ReturnsTrue keeps the other direction
+// honest: the volume is in the listing, so it is there.
+func TestHandleHasDisk_NFSVolumePresent_ReturnsTrue(t *testing.T) {
+	t.Parallel()
+	deps := depsForHasOnNFS(func() (*sdknodes.ListStorageContentResponse, error) {
+		return storageContentListing(hasDiskNFSVolid), nil
+	})
+
+	h := handlers.HandleHasDisk(deps)
+	result, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(mustEncodeDiskCID(t, hasDiskNFSVolid, nil)),
+	}, jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("a volume the listing carries must answer true, got %v", err)
+	}
+	exists, ok := result.(bool)
+	if !ok {
+		t.Fatalf("expected bool result, got %T", result)
+	}
+	if !exists {
+		t.Error("expected exists=true")
+	}
+}
+
+// TestHandleHasDisk_NFSListingFails_Errors pins the fail-closed direction and
+// its classification. Neither observation landed, so has_disk answers with the
+// probe's own error, and PVE's "no format" reply is a verdict about the
+// request rather than a wobble, so the Director must not re-drive it.
+func TestHandleHasDisk_NFSListingFails_Errors(t *testing.T) {
+	t.Parallel()
+	deps := depsForHasOnNFS(func() (*sdknodes.ListStorageContentResponse, error) {
+		return nil, errors.New("storage 'nfs-images' is not online")
+	})
+
+	h := handlers.HandleHasDisk(deps)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		marshal(mustEncodeDiskCID(t, hasDiskNFSVolid, nil)),
+	}, jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("an unprovable presence must not be answered with a guess")
+	}
+	if cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Errorf("the no-format reply is permanent, so the error must not be retriable, got %v", err)
+	}
+}

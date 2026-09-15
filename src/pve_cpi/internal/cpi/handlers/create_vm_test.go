@@ -5115,3 +5115,62 @@ func TestHandleCreateVM_ProvenanceWriteFailureIsSwallowed(t *testing.T) {
 		t.Fatal("the provenance write was never attempted; this test would pass vacuously")
 	}
 }
+
+// createVMAnchorVolid is a promised-anchor disk on NFS storage, handed to
+// create_vm through disk_cids after its parker and its volume were both
+// removed out of band.
+const (
+	createVMAnchorStorage = "nfs-images"
+	createVMAnchorVolid   = "nfs-images:9001/vm-9001-disk-0.qcow2"
+)
+
+// TestCreateVM_DiskCIDs_AnchorPromise_VolumeProvenGone_SaysDataIsGone pins
+// that create_vm reaches the same outcome attach_disk does, because both go
+// through one guard. The disk the manifest still asks for no longer exists, so
+// the refusal names the recovery rather than the strict-mode escape hatch,
+// which cannot bring a deleted volume back.
+func TestCreateVM_DiskCIDs_AnchorPromise_VolumeProvenGone_SaysDataIsGone(t *testing.T) {
+	t.Parallel()
+
+	q := &vmMockQEMU{}
+	n := &vmMockNodes{}
+	// No VM in the cluster references the volume, so the holder scan finds
+	// nothing and the anchor promise is unmet.
+	c := &vmMockCluster{}
+	deps := buildVMDeps(q, n, c, &vmMockAgent{})
+	deps.Config.DetachedDiskStrategy = "parked"
+	base, ok := deps.PVE.(*mockPVEClient)
+	if !ok {
+		t.Fatalf("expected the create_vm suite's mock client, got %T", deps.PVE)
+	}
+	// The point probe answers PVE's "no format" 500, which is what a missing
+	// file looks like on file storage, and the empty content listing from a
+	// storage PVE would refuse to activate is the proof it really is gone.
+	base.storageSvc = &mockStorageService{
+		existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+			return false, nfsNoFormat(volume)
+		},
+	}
+	base.clusterStorageSvc = &mockClusterStorage{
+		storageName: createVMAnchorStorage,
+		storageType: "nfs",
+		shared:      true,
+	}
+	deps.PVE = &visiblePVEClient{mockPVEClient: base}
+
+	args := mkArgs("agent-1", testStemcellCID, map[string]any{},
+		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
+		[]string{mustEncodeDiskCID(t, createVMAnchorVolid, &pve.DiskCIDMeta{Anchor: true})}, map[string]any{})
+
+	h := handlers.HandleCreateVM(deps)
+	_, err := h.Handle(context.Background(), args, mkCtx("anchor-volume-gone"))
+	if err == nil {
+		t.Fatal("expected the data-is-gone refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "the data is gone") {
+		t.Errorf("the refusal must say the data is gone, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "parked_anchor_strict") {
+		t.Errorf("strict mode cannot recover a volume that is not there, so it must not be advised: %v", err)
+	}
+}
