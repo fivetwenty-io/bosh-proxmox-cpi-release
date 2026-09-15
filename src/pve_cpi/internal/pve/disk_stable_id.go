@@ -151,7 +151,16 @@ func ResolveDiskIdentity(
 			volid = birthVolid
 		}
 		i := intent
-		return DiskIdentity{Volid: volid, Intent: &i}, nil
+		// The counts the scan gathered ride out here too. A mid-transfer disk
+		// is one an interrupted detach left on a parker, and the handlers that
+		// resume it reach the same absence proof the other two branches do, so
+		// dropping the counts here would send that proof to the journal and
+		// the storage status for evidence the caller was already holding.
+		return DiskIdentity{
+			Volid:  volid,
+			Intent: &i,
+			Holder: DiskHolder{StorageReferences: hit.StorageReferences},
+		}, nil
 	}
 
 	// Never transferred (or free-floating): the volume keeps its birth name.

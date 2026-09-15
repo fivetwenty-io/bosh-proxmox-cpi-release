@@ -128,6 +128,12 @@ func (l *localBackend) nodeForExisting(
 		return "", err
 	}
 
+	// The second opinions are built once for the whole sweep. Every candidate
+	// node asks the same sources the same question, and a source such as the
+	// allocation journal reads a file on local disk to answer it, so building
+	// them per node would read that file once per node in the cluster.
+	corroborators := l.emptyListingCorroborators(extra)
+
 	var lastProbeErr error
 
 	for _, node := range candidates {
@@ -141,7 +147,7 @@ func (l *localBackend) nodeForExisting(
 		// nothing either way. The proof settles that question from a storage
 		// content listing, so the scan gets its clean miss there too.
 		absent, err := ProveVolumeAbsent(
-			ctx, l.client, node, storage, volume, l.classifyStorage, l.emptyListingCorroborators(extra)...)
+			ctx, l.client, node, storage, volume, l.classifyStorage, corroborators...)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
 			// the volume may live on a different healthy node. Record the
@@ -171,12 +177,12 @@ func (l *localBackend) nodeForExisting(
 	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
 }
 
-// emptyListingCorroborators orders the second opinions one probe hands to an
+// emptyListingCorroborators orders the second opinions one sweep hands to an
 // empty content listing: the caller's own first, then the resolver's. The
-// resolver's supplier is called once per probe rather than once per backend,
-// because a source such as the allocation journal is a record on disk that a
-// concurrent CPI process can change between two nodes of the same sweep, and
-// because a sweep whose point probes all answer must never call it at all.
+// resolver's supplier is called once per sweep rather than once per backend, so
+// a source such as the allocation journal is read against the cluster as it
+// stands when the sweep starts rather than as a concurrent CPI process leaves
+// it partway through.
 func (l *localBackend) emptyListingCorroborators(extra []EmptyListingCorroborator) []EmptyListingCorroborator {
 	var supplied []EmptyListingCorroborator
 	if l.corroborate != nil {

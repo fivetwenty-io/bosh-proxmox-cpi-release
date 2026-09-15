@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// authorityFile is the enrollment record inside a namespace directory. Its
+// presence is what separates an enrolled namespace from a directory somebody
+// created and never enrolled.
+const authorityFile = "authority.json"
+
 // Journal is a namespace-scoped authority. Close only after all Handles close.
 // Opening/inspection does not initialize state or claim remote writer ownership.
 type Journal struct {
@@ -49,7 +54,7 @@ func openNamespace(directory, namespace string) (*os.Root, error) {
 }
 func readAuthority(r *os.Root, namespace string) (authority, error) {
 	var a authority
-	if err := readJSON(r, "authority.json", &a); err != nil {
+	if err := readJSON(r, authorityFile, &a); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return a, ErrNotInitialized
 		}
@@ -142,11 +147,42 @@ func Initialize(ctx context.Context, directory, namespace string, e Enrollment) 
 	if err := errors.Join(checkErr, l.close()); err != nil {
 		return nil, err
 	}
-	if err := atomicJSON(root, "authority.json", a, ops); err != nil {
+	if err := atomicJSON(root, authorityFile, a, ops); err != nil {
 		return nil, err
 	}
 	success = true
 	return &Journal{root: root, auth: a, ops: ops}, nil
+}
+
+// EnrollmentRecorded reports whether an enrollment authority file exists for
+// namespace under directory. It answers the question a reader has when
+// InspectEnrollment fails for a reason that is not "nothing is there": a
+// directory whose ownership or permissions this package refuses to open may
+// hold an enrollment, or may be an empty directory an operator created with the
+// umask default and never enrolled, and those two deserve different treatment.
+//
+// It is deliberately weaker than opening the journal. It follows no symlink
+// checks and validates no content, because presence is all it claims. A reader
+// that gets false may treat the journal as having nothing to say; anything it
+// would act on still has to come from InspectEnrollment or Open.
+//
+// The error return is "could not tell", which is neither presence nor absence,
+// and a caller about to conclude something from absence has to fail closed on
+// it.
+func EnrollmentRecorded(directory, namespace string) (bool, error) {
+	if err := validateNamespace(namespace); err != nil {
+		return false, err
+	}
+	if !filepath.IsAbs(directory) {
+		return false, fmt.Errorf("journal: directory must be absolute")
+	}
+	if _, err := os.Lstat(filepath.Join(directory, pathKey(namespace), authorityFile)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // InspectEnrollment reads existing enrollment without initialization or locks.
@@ -619,7 +655,7 @@ func (j *Journal) RecoverAuthority(ctx context.Context, e Enrollment) (retErr er
 	if err != nil {
 		return err
 	}
-	return atomicJSON(j.root, "authority.json", authority{Version: Version, Namespace: j.auth.Namespace, Epoch: epoch, Enrollment: e}, j.ops)
+	return atomicJSON(j.root, authorityFile, authority{Version: Version, Namespace: j.auth.Namespace, Epoch: epoch, Enrollment: e}, j.ops)
 }
 
 // validateTokenUnique is also used by recovery adapters against remote collision
@@ -797,5 +833,5 @@ func (j *Journal) RecoverIndex(ctx context.Context, e Enrollment) (retErr error)
 	if err != nil {
 		return err
 	}
-	return atomicJSON(j.root, "authority.json", authority{Version: Version, Namespace: j.auth.Namespace, Epoch: epoch, Enrollment: e}, j.ops)
+	return atomicJSON(j.root, authorityFile, authority{Version: Version, Namespace: j.auth.Namespace, Epoch: epoch, Enrollment: e}, j.ops)
 }
