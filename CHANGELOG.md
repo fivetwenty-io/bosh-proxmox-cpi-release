@@ -12,6 +12,17 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-14
+
+### Added
+
+- Every VM the CPI creates now records the stemcell it booted from, as a `stemcell--<name>-<version>` tag and as a `bosh_stemcell` key in the VM's Notes. Nothing on the PVE side named the stemcell before, because a Director's `set_vm_metadata` payload carries the deployment, instance group, job, index, and name, and never the stemcell, so the only way to tell which guests still ran an old stemcell after a bump was to log into each one. `create_vm` is the one call that knows, so it writes both. A create-env Director gets the same treatment, and that is the case where no `set_vm_metadata` call arrives at all. The tag uses the CPI's usual tag alphabet, so `bosh-openstack-kvm-ubuntu-noble-1.585` is tagged `stemcell--bosh-openstack-kvm-ubuntu-noble-1-585`; the Notes record keeps the exact version alongside the full stemcell CID, its kind, and its content sha8. `set_vm_metadata` carries the identity into the readable Notes as a `stemcell:` line, and never strips the tag, so both survive every later metadata sync. Both are written once at create time, so a VM whose tag names an old stemcell genuinely has not been recreated since. VMs created by an earlier release carry neither until they are recreated. See [Which stemcell is a VM running?](docs/operations.md#which-stemcell-is-a-vm-running).
+
+### Changed
+
+- `create_vm` writes the pool-membership and stemcell records in a single description update rather than one per record, so provenance costs one config read and one write per VM on a deploy of any size.
+- The stemcell tag takes about 45 bytes of a VM's 350-byte PVE tag budget, ahead of the Director-supplied tags. A deployment whose names already crowded that budget can now lose a trailing tag it used to keep, and `set_vm_metadata` names every dropped entry in a warning when that happens.
+
 ## [0.7.1] - 2026-09-14
 
 ### Fixed
@@ -383,7 +394,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.5.2...v0.6.0

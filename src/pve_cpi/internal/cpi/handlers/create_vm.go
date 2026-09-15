@@ -668,10 +668,13 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 		log.Int("root_disk_gib", shape.rootDiskGiB),
 	)
 
-	// Record the pool-resolution provenance now that the VM exists (the
-	// clone path's post-clone description clear already ran inside the
-	// allocate attempt). Best-effort — see persistPoolMembership.
-	persistPoolMembership(ctx, deps, logger, shape, vmid)
+	// Record the create-time provenance now that the VM exists: the pool
+	// resolution, and the stemcell this guest booted from (nothing else ever
+	// writes that one — the Director's set_vm_metadata payload does not name
+	// the stemcell, and a create-env Director receives no set_vm_metadata call
+	// at all). The clone path's post-clone description clear already ran
+	// inside the allocate attempt. Best-effort — see persistCreateProvenance.
+	persistCreateProvenance(ctx, deps, logger, parsed, shape, vmid)
 
 	// -----------------------------------------------------------------------
 	// 4b. Grow virtio0 to the requested root disk size.
@@ -1377,10 +1380,10 @@ func buildAndStartVMAttempt(
 		return 0, nil, cpierrors.Wrap(err, "create_vm: allocate+create VM"), nil, nil
 	}
 
-	// Record the pool-resolution provenance now that the VM exists (the
-	// clone path's post-clone description clear already ran inside the
-	// allocate attempt). Best-effort — see persistPoolMembership.
-	persistPoolMembership(ctx, deps, logger, &nodeShape, vmid)
+	// Record the create-time provenance now that the VM exists (the clone
+	// path's post-clone description clear already ran inside the allocate
+	// attempt). Best-effort — see persistCreateProvenance.
+	persistCreateProvenance(ctx, deps, logger, parsed, &nodeShape, vmid)
 
 	vmName := candidateVMName(nodeShape.initialName, parsed.agentID, vmid)
 

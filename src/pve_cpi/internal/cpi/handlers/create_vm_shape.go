@@ -71,7 +71,11 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// with the VM on create rollback.
 	advrtTags := advertisedRouteTags(cp.AdvertisedRoutes)
 	baseRetainTags = append(baseRetainTags, advrtTags...)
-	initialTags := mergeTagList([]string{ownershipTag}, baseRetainTags, maxTagLength)
+	// The stemcell tag rides beside the ownership marker rather than in
+	// baseRetainTags, so it sits near the front of the list and survives the
+	// byte cap. It is written once here and never rebuilt, because the
+	// Director's set_vm_metadata payload does not name the stemcell.
+	initialTags := mergeTagList([]string{ownershipTag, stemcellIdentityTag(parsed)}, baseRetainTags, maxTagLength)
 	for _, tag := range advrtTags {
 		if !strings.Contains(initialTags, tag) {
 			deps.Log(ctx).Warn("create_vm: advertised-route provenance tag dropped by tag-length cap — "+
@@ -651,25 +655,31 @@ func ensureResolvedPool(ctx context.Context, deps Deps, shape *createVMShape, lo
 	return nil
 }
 
-// persistPoolMembership records the VM's create-time pool resolution (name,
-// winning layer, and template tokens) in the bosh_pool description sentinel.
+// persistCreateProvenance records everything create_vm knows about a new VM in
+// its description sentinel: the pool resolution (name, winning layer, and
+// template tokens) under bosh_pool, and the stemcell the guest booted from
+// under bosh_stemcell. Both go in one read-modify-write, because this runs for
+// every VM a deploy creates.
+//
 // Called after the VM exists on both create paths — on the clone path this
 // must run after the post-clone description clear (the clone strips the
 // inherited template identity wholesale), which happens inside the allocate
 // attempt, so any post-allocation call site is safe. Best-effort: a failed
-// write is logged inside pve.UpdatePoolMembership and degrades that VM to
-// the legacy-adoption reconciliation rules, never failing create_vm.
-func persistPoolMembership(ctx context.Context, deps Deps, logger *log.Logger, shape *createVMShape, vmid int) {
-	if shape.vmPool == "" {
-		return
+// write is logged inside pve.UpdateVMCreateProvenance and costs that VM the
+// legacy-adoption reconciliation rules and its stemcell label, never
+// failing create_vm.
+func persistCreateProvenance(ctx context.Context, deps Deps, logger *log.Logger, parsed *createVMParsedArgs, shape *createVMShape, vmid int) {
+	var pm *pve.PoolMembership
+	if shape.vmPool != "" {
+		pm = &pve.PoolMembership{
+			Name:          shape.vmPool,
+			Layer:         shape.vmPoolLayer,
+			Director:      shape.vmPoolDirector,
+			Deployment:    shape.vmPoolDeployment,
+			InstanceGroup: shape.vmPoolInstanceGrp,
+		}
 	}
-	pve.UpdatePoolMembership(ctx, deps.PVE, logger, shape.node, vmid, &pve.PoolMembership{
-		Name:          shape.vmPool,
-		Layer:         shape.vmPoolLayer,
-		Director:      shape.vmPoolDirector,
-		Deployment:    shape.vmPoolDeployment,
-		InstanceGroup: shape.vmPoolInstanceGrp,
-	})
+	pve.UpdateVMCreateProvenance(ctx, deps.PVE, logger, shape.node, vmid, pm, vmStemcellRecord(parsed))
 }
 
 // composeVMName builds the PVE VM name from prefix + deployment + job +

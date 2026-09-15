@@ -880,9 +880,9 @@ func TestHandleCreateVM_ConfigUpdateFail(t *testing.T) {
 	t.Parallel()
 	callCount := 0
 	n := &vmMockNodes{
-		updateConfigFn: func(_ context.Context, _, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
+		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) {
 				return fmt.Errorf("permission denied")
 			}
 			return nil
@@ -983,7 +983,7 @@ func TestHandleCreateVM_MultipleNICs(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -1126,7 +1126,7 @@ func TestHandleCreateVM_DynamicNetwork(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -4734,7 +4734,7 @@ func TestHandleCreateVM_GatewayAudit_WarnOnMissing(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -4775,7 +4775,7 @@ func TestHandleCreateVM_Searchdomain_Set(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -4825,7 +4825,7 @@ func TestHandleCreateVM_Searchdomain_DnsSearchAlias(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -4870,7 +4870,7 @@ func TestHandleCreateVM_Searchdomain_Absent(t *testing.T) {
 	n := &vmMockNodes{
 		updateConfigFn: func(_ context.Context, _, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			callCount++
-			if callCount == 1 {
+			if isNICConfigCall(params) && capturedNICParams == nil {
 				capturedNICParams = params
 			}
 			return nil
@@ -5064,4 +5064,13 @@ func TestCreateVM_DiskCIDs_ParkedUnparksBeforeAttach(t *testing.T) {
 func (m *vmMockNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, error) {
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
+}
+
+// isNICConfigCall reports whether an UpdateQemuConfig call is the NIC
+// configuration step. Tests match on what the call carries rather than on its
+// position, because create_vm writes the create-time provenance sentinel
+// (bosh_pool plus bosh_stemcell) to the description before it configures NICs,
+// so the NIC call is not the first config update a create makes.
+func isNICConfigCall(params *sdknodes.UpdateQemuConfigParams) bool {
+	return params != nil && (len(params.Net) > 0 || len(params.Ipconfig) > 0)
 }

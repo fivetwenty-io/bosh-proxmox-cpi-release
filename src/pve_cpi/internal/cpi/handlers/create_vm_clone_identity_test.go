@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -240,8 +241,13 @@ func TestCreateVM_ClonePath_ReplacesInheritedStemcellIdentity(t *testing.T) {
 	if params.Tags == nil {
 		t.Fatal("post-clone params.Tags is nil; the clone keeps the template's inherited stemcell tags")
 	}
-	if *params.Tags != "bosh-cpi" {
-		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q", *params.Tags, "bosh-cpi")
+	// The workload tag set is the ownership marker plus the stemcell the guest
+	// booted from, which is derived from testTemplateCID's filename
+	// ("bosh-stemcell-ubuntu-jammy-1.0-<sha8>.qcow2") with the tag alphabet's
+	// dash in place of the version's dot.
+	wantTags := "bosh-cpi;stemcell--ubuntu-jammy-1-0"
+	if *params.Tags != wantTags {
+		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q", *params.Tags, wantTags)
 	}
 	if params.Description == nil {
 		t.Fatal("post-clone params.Description is nil; the clone keeps the template's provenance JSON")
@@ -290,12 +296,22 @@ func TestCreateVM_CloneAndImportPaths_AgreeOnVMIdentity(t *testing.T) {
 
 	importTags, _ := importQEMU.createCalls[0].params["tags"].(string)
 	cloneParams := resourceShapeParams(t, cloneNodes)
-	if cloneParams.Tags == nil || *cloneParams.Tags != importTags {
-		got := "nil"
-		if cloneParams.Tags != nil {
-			got = *cloneParams.Tags
-		}
-		t.Errorf("clone-path tags = %q; want the import path's %q — both paths must produce one VM identity", got, importTags)
+	if cloneParams.Tags == nil {
+		t.Fatal("clone-path tags are nil; both paths must produce one VM identity")
+	}
+	// The stemcell tag names each fixture's own stemcell, and the two fixtures
+	// deliberately use different ones (jammy 1.0 for the template, jammy 1.438
+	// for the import), so it is compared separately from the rest of the set.
+	cloneRest, cloneStemcell := splitStemcellTag(*cloneParams.Tags)
+	importRest, importStemcell := splitStemcellTag(importTags)
+	if cloneRest != importRest {
+		t.Errorf("clone-path tags = %q; want the import path's %q — both paths must produce one VM identity", cloneRest, importRest)
+	}
+	if cloneStemcell != "stemcell--ubuntu-jammy-1-0" {
+		t.Errorf("clone-path stemcell tag = %q; want the tag for the template fixture's stemcell", cloneStemcell)
+	}
+	if importStemcell != "stemcell--ubuntu-jammy-1-438" {
+		t.Errorf("import-path stemcell tag = %q; want the tag for the import fixture's stemcell", importStemcell)
 	}
 	// The import path never writes a description, so the clone path must clear
 	// the one it inherited rather than leaving the template's provenance JSON.
@@ -305,4 +321,19 @@ func TestCreateVM_CloneAndImportPaths_AgreeOnVMIdentity(t *testing.T) {
 	if cloneParams.Description == nil || *cloneParams.Description != "" {
 		t.Error("clone path must clear the inherited description to match the import path's empty one")
 	}
+}
+
+// splitStemcellTag separates a PVE tag string into the entries that are not the
+// stemcell tag and the stemcell tag itself, so a comparison across two
+// fixtures with different stemcells can check each half on its own terms.
+func splitStemcellTag(tags string) (rest string, stemcell string) {
+	kept := make([]string, 0, 4)
+	for _, entry := range strings.Split(tags, ";") {
+		if strings.HasPrefix(entry, "stemcell--") {
+			stemcell = entry
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	return strings.Join(kept, ";"), stemcell
 }
