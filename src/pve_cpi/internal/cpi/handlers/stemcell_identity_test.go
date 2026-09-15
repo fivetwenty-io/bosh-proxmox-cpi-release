@@ -45,6 +45,10 @@ func TestStemcellLabelFromFilename(t *testing.T) {
 		{"label carries a newline", "bosh-stemcell-name\n1.0-deadbeef.qcow2", ""},
 		{"label carries a tag separator", "bosh-stemcell-name;job--web-1.0-deadbeef.qcow2", ""},
 		{"label carries a space", "bosh-stemcell-name 1.0-deadbeef.qcow2", ""},
+		// An over-long label would take more than half the 350-byte tag budget
+		// away from the advertised-route and identity tags.
+		{"label past the length cap", "bosh-stemcell-" + strings.Repeat("n", 97) + "-deadbeef.qcow2", ""},
+		{"label at the length cap", "bosh-stemcell-" + strings.Repeat("n", 96) + "-deadbeef.qcow2", strings.Repeat("n", 96)},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,6 +77,22 @@ func TestStemcellIdentityTag(t *testing.T) {
 	}
 	if got := stemcellIdentityTag(&createVMParsedArgs{stemcellFilename: "not-a-stemcell.img"}); got != "" {
 		t.Errorf("an unrecognised filename must yield no tag, got %q", got)
+	}
+}
+
+// An operator-supplied disk tag must not be able to claim the stemcell
+// namespace and overwrite the record of what the guest actually booted from.
+func TestStemcellTagIsCPIOwned(t *testing.T) {
+	t.Parallel()
+
+	if !hasCPIOwnedPrefix(stemcellTagPrefix) {
+		t.Fatalf("%q must be a CPI-owned tag prefix so set_disk_metadata refuses it", stemcellTagPrefix)
+	}
+	// Both spellings of the key render the same prefix, so both must be caught.
+	for _, key := range []string{"stemcell", "STEMCELL"} {
+		if !hasCPIOwnedPrefix(sanitizeTagValue(key) + "--") {
+			t.Errorf("a disk tag keyed %q would overwrite the VM's stemcell tag", key)
+		}
 	}
 }
 

@@ -71,12 +71,21 @@ func stemcellLabelFromFilename(filename string) string {
 	return label
 }
 
+// maxStemcellLabelLen caps the derived label. pve.BuildStemcellFilename allows a
+// 200-byte base, so a label can otherwise run to about 186 characters, and the
+// tag built from it would take more than half a guest's 350-byte tag budget away
+// from the advertised-route and identity tags that delete_vm and the parker
+// lookup depend on. A real stemcell label is around 37 characters, so a label
+// past this bound did not come from a stemcell we would recognise anyway.
+const maxStemcellLabelLen = 96
+
 // isStemcellLabelSafe reports whether every byte of label is one
 // pve.BuildStemcellFilename's sanitizer can emit, plus the uppercase letters an
-// operator-placed qcow2 may legitimately carry. Nothing in this set can open a
-// description sentinel, an allocation marker, or a new line.
+// operator-placed qcow2 may legitimately carry, and whether the whole label fits
+// maxStemcellLabelLen. Nothing in this set can open a description sentinel, an
+// allocation marker, or a new line.
 func isStemcellLabelSafe(label string) bool {
-	if label == "" {
+	if label == "" || len(label) > maxStemcellLabelLen {
 		return false
 	}
 	for i := 0; i < len(label); i++ {

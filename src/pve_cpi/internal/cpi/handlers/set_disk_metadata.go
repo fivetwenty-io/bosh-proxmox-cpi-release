@@ -451,7 +451,7 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 func dropReservedDiskTags(ctx context.Context, deps Deps, tags map[string]string, diskCID string) map[string]string {
 	var reserved []string
 	for k := range tags {
-		if hasReservedBoshPrefix(sanitizeTagValue(k) + "--") {
+		if hasCPIOwnedPrefix(sanitizeTagValue(k) + "--") {
 			reserved = append(reserved, k)
 		}
 	}
