@@ -363,7 +363,12 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 		ttl = defaultOverrideStorageInfoTTL
 	}
 	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), ttl)
-	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node)
+	// The local backend's cluster sweep proves a volume absent from a content
+	// listing, so it gets the same second opinions the handlers apply: the
+	// allocation journal of this bundle's own configuration, and PVE's status
+	// for the storage read through this bundle's own client.
+	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node,
+		pve.WithEmptyListingCorroborators(BackendCorroborators(cfg, client)))
 
 	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver, nodeEndpoints: nodeEndpoints}, nil
 }

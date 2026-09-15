@@ -22,7 +22,7 @@ const corroborationNode = "pve-01"
 // silentCorroborator has nothing to say and records that it was asked, which is
 // how the order cases tell "consulted and passed" from "never reached".
 func silentCorroborator(calls *int) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc("a quiet source", func(context.Context, string, string) (pve.Corroboration, error) {
+	return pve.CorroboratorFunc("a quiet source", func(context.Context, string, string, string) (pve.Corroboration, error) {
 		*calls++
 		return pve.Corroboration{}, nil
 	})
@@ -30,7 +30,7 @@ func silentCorroborator(calls *int) pve.EmptyListingCorroborator {
 
 // contradictingCorroborator contradicts the listing with a fixed detail.
 func contradictingCorroborator(calls *int, source, detail string) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc(source, func(context.Context, string, string) (pve.Corroboration, error) {
+	return pve.CorroboratorFunc(source, func(context.Context, string, string, string) (pve.Corroboration, error) {
 		*calls++
 		return pve.Corroboration{Contradicted: true, Source: source, Detail: detail}, nil
 	})
@@ -38,7 +38,7 @@ func contradictingCorroborator(calls *int, source, detail string) pve.EmptyListi
 
 // failingCorroborator is a check that did not land.
 func failingCorroborator(calls *int, err error) pve.EmptyListingCorroborator {
-	return pve.CorroboratorFunc("a source that broke", func(context.Context, string, string) (pve.Corroboration, error) {
+	return pve.CorroboratorFunc("a source that broke", func(context.Context, string, string, string) (pve.Corroboration, error) {
 		*calls++
 		return pve.Corroboration{}, err
 	})
@@ -48,7 +48,7 @@ func failingCorroborator(calls *int, err error) pve.EmptyListingCorroborator {
 func forbiddenCorroborator(t *testing.T, why string) pve.EmptyListingCorroborator {
 	t.Helper()
 	return pve.CorroboratorFunc("a source that must not be asked",
-		func(context.Context, string, string) (pve.Corroboration, error) {
+		func(context.Context, string, string, string) (pve.Corroboration, error) {
 			t.Error(why)
 			return pve.Corroboration{}, errors.New("unexpected corroboration call")
 		})
@@ -71,6 +71,30 @@ func TestProveVolumeAbsent_EmptyListing_NoCorroborators_KeepsTodaysAnswer(t *tes
 	}
 	if !absent {
 		t.Fatal("an empty listing on nfs still proves absence when nothing corroborates it")
+	}
+}
+
+// TestProveVolumeAbsent_EmptyListing_PassesTheVolumeUnderProof pins the
+// argument the journal source depends on. A source that tracks volumes by name
+// has to know which one is being proven absent, because that volume's own
+// record is the thing in question and can never be evidence against the
+// listing.
+func TestProveVolumeAbsent_EmptyListing_PassesTheVolumeUnderProof(t *testing.T) {
+	t.Parallel()
+	var sawNode, sawStorage, sawVolume string
+	recorder := pve.CorroboratorFunc("a source that reads its arguments",
+		func(_ context.Context, node, storage, volume string) (pve.Corroboration, error) {
+			sawNode, sawStorage, sawVolume = node, storage, volume
+			return pve.Corroboration{}, nil
+		})
+	if _, err := proveWithCorroborators(t, recorder); err != nil {
+		t.Fatalf("a silent corroborator leaves the answer alone: %v", err)
+	}
+	if sawNode != corroborationNode || sawStorage != absenceStorage {
+		t.Errorf("the corroborator must be told where it is looking, got node %q storage %q", sawNode, sawStorage)
+	}
+	if sawVolume != absenceVolid {
+		t.Errorf("the corroborator must be told which volume is under proof, got %q", sawVolume)
 	}
 }
 
@@ -185,7 +209,7 @@ func TestProveVolumeAbsent_EmptyListing_AllSilent_ProvesAbsence(t *testing.T) {
 
 func TestProveVolumeAbsent_ContradictionWithoutSourceOrDetail_StillReads(t *testing.T) {
 	t.Parallel()
-	bare := pve.CorroboratorFunc("", func(context.Context, string, string) (pve.Corroboration, error) {
+	bare := pve.CorroboratorFunc("", func(context.Context, string, string, string) (pve.Corroboration, error) {
 		return pve.Corroboration{Contradicted: true}, nil
 	})
 	_, err := proveWithCorroborators(t, bare)
@@ -235,7 +259,7 @@ func TestProveVolumeAbsent_PlainDirRuleWinsBeforeCorroboration(t *testing.T) {
 func TestConfigReferenceCorroborator_NilCounts_SaysNothing(t *testing.T) {
 	t.Parallel()
 	verdict, err := pve.ConfigReferenceCorroborator(nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("a caller that never scanned is not an error: %v", err)
 	}
@@ -248,7 +272,7 @@ func TestConfigReferenceCorroborator_ZeroCount_SaysNothing(t *testing.T) {
 	t.Parallel()
 	refs := pve.StorageReferenceCounts{"other-storage": 4}
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
@@ -261,7 +285,7 @@ func TestConfigReferenceCorroborator_ReferencedStorage_Contradicts(t *testing.T)
 	t.Parallel()
 	refs := pve.StorageReferenceCounts{absenceStorage: 3}
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
@@ -280,7 +304,7 @@ func TestConfigReferenceCorroborator_SingleReference_ReadsAsOneVolume(t *testing
 	t.Parallel()
 	refs := pve.StorageReferenceCounts{absenceStorage: 1}
 	verdict, err := pve.ConfigReferenceCorroborator(refs).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("ConfigReferenceCorroborator: %v", err)
 	}
@@ -341,7 +365,7 @@ func TestStorageStatusCorroborator_ActiveAndEmpty_SaysNothing(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":1,"enabled":1,"used":131072,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -354,7 +378,7 @@ func TestStorageStatusCorroborator_Inactive_Contradicts(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":0,"enabled":1,"used":0,"total":0,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -373,7 +397,7 @@ func TestStorageStatusCorroborator_MissingActive_Contradicts(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"enabled":1,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -386,7 +410,7 @@ func TestStorageStatusCorroborator_UsedAtFloor_Contradicts(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":1,"used":1073741824,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -405,7 +429,7 @@ func TestStorageStatusCorroborator_UsedBelowFloor_SaysNothing(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":1,"used":1073741823,"total":10737418240,"type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -420,7 +444,7 @@ func TestStorageStatusCorroborator_StringTypedFields_Decode(t *testing.T) {
 	// nothing here decodes into a plain int.
 	status := statusFromJSON(t, `{"active":"1","used":"2147483648","total":"10737418240","type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -436,7 +460,7 @@ func TestStorageStatusCorroborator_StringTypedInactive_Decodes(t *testing.T) {
 	t.Parallel()
 	status := statusFromJSON(t, `{"active":"0","used":"0","total":"0","type":"nfs"}`)
 	verdict, err := pve.StorageStatusCorroborator(statusClient(status, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err != nil {
 		t.Fatalf("StorageStatusCorroborator: %v", err)
 	}
@@ -449,7 +473,7 @@ func TestStorageStatusCorroborator_TransportError_IsReturned(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("pveproxy backend gone (code: 596)")
 	_, err := pve.StorageStatusCorroborator(statusClient(nil, sentinel)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err == nil {
 		t.Fatal("a status read that did not land is not a status read that agreed")
 	}
@@ -464,7 +488,7 @@ func TestStorageStatusCorroborator_TransportError_IsReturned(t *testing.T) {
 func TestStorageStatusCorroborator_EmptyResponse_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.StorageStatusCorroborator(statusClient(nil, nil)).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err == nil {
 		t.Fatal("a status with no payload establishes nothing and must fail closed")
 	}
@@ -473,7 +497,7 @@ func TestStorageStatusCorroborator_EmptyResponse_IsAnError(t *testing.T) {
 func TestStorageStatusCorroborator_MissingNodesService_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.StorageStatusCorroborator(&corroborationStatusClient{}).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err == nil {
 		t.Fatal("a client with no nodes service cannot corroborate anything")
 	}
@@ -482,14 +506,14 @@ func TestStorageStatusCorroborator_MissingNodesService_IsAnError(t *testing.T) {
 func TestStorageStatusCorroborator_MissingArguments_AreErrors(t *testing.T) {
 	t.Parallel()
 	corroborator := pve.StorageStatusCorroborator(statusClient(nil, nil))
-	if _, err := corroborator.CorroborateEmptyListing(context.Background(), "", absenceStorage); err == nil {
+	if _, err := corroborator.CorroborateEmptyListing(context.Background(), "", absenceStorage, absenceVolid); err == nil {
 		t.Error("an empty node name must not reach the API")
 	}
-	if _, err := corroborator.CorroborateEmptyListing(context.Background(), corroborationNode, ""); err == nil {
+	if _, err := corroborator.CorroborateEmptyListing(context.Background(), corroborationNode, "", absenceVolid); err == nil {
 		t.Error("an empty storage name must not reach the API")
 	}
 	if _, err := pve.StorageStatusCorroborator(nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage); err == nil {
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid); err == nil {
 		t.Error("a nil client must not reach the API")
 	}
 }
@@ -497,7 +521,7 @@ func TestStorageStatusCorroborator_MissingArguments_AreErrors(t *testing.T) {
 func TestCorroboratorFunc_NilFunction_IsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := pve.CorroboratorFunc("a source with no implementation", nil).
-		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage)
+		CorroborateEmptyListing(context.Background(), corroborationNode, absenceStorage, absenceVolid)
 	if err == nil {
 		t.Fatal("a corroborator with no implementation is a wiring fault, not a source with nothing to say")
 	}

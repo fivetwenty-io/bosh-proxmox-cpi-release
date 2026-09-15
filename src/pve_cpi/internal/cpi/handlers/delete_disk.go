@@ -45,6 +45,11 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	}
 	parkerCfg := parkerReadConfigFor(deps)
 	var holder pve.DiskHolder
+	// The scan's per-storage reference counts ride alongside the holder, and
+	// they are what contradicts an empty content listing below. A stable-ID
+	// disk nothing references has no holder to read them off, so the identity
+	// resolution kept them on the resolved disk.
+	refs := rd.storageRefs
 	if rd.stableID != "" {
 		if rd.holder != nil {
 			holder = *rd.holder
@@ -55,6 +60,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		if resolveErr != nil {
 			return false, wrapHolderScanError(resolveErr, "delete_disk: resolve current holder before delete")
 		}
+		refs = holder.StorageReferences
 	}
 	// A disk whose CID promises a parker anchor must have a holder while
 	// detached; no holder at all means the parker vanished out-of-band, and
@@ -68,7 +74,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		// the one in front of them. Absence has to be established, not assumed:
 		// a probe that fails proves nothing, so the refusal stands, and
 		// proveAnchorVolumeGone writes the warning that says why it stands.
-		if !proveAnchorVolumeGoneAt(ctx, deps, "delete_disk", rd.diskCID, rd.volid, node) {
+		if !proveAnchorVolumeGoneAt(ctx, deps, "delete_disk", rd.diskCID, rd.volid, node, refs) {
 			return false, anchorErr
 		}
 		deps.Log(ctx).Info("delete_disk: promised anchor has no holder and the volume is not on storage, treating as already-deleted",
@@ -115,7 +121,15 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 // an HTTP 500 naming volume_size_info for any stat that did not work, and a
 // missing file, a denied read, and an export that went away all arrive with
 // the identical wording.
-func volumeAbsentFromStorage(ctx context.Context, deps Deps, node, bareVolid string) (bool, error) {
+//
+// refs carries the per-storage volume counts a holder scan saw, when the caller
+// ran one, so an empty listing on a storage the cluster's configs still
+// reference is contradicted before anything else is read. A caller that never
+// scanned passes nil and the proof falls back to the journal and the storage
+// status.
+func volumeAbsentFromStorage(
+	ctx context.Context, deps Deps, node, bareVolid string, refs pve.StorageReferenceCounts,
+) (bool, error) {
 	if node == "" {
 		return false, cpierrors.Cloud("delete_disk: no node to probe storage from")
 	}
@@ -123,7 +137,8 @@ func volumeAbsentFromStorage(ctx context.Context, deps Deps, node, bareVolid str
 	if err != nil {
 		return false, err
 	}
-	return pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, bareVolid, handlerStorageClassifier(deps, storage))
+	return pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, bareVolid,
+		handlerStorageClassifier(deps, storage), emptyListingCorroborators(deps, refs)...)
 }
 
 // handlerStorageClassifier reads the storage's type and is_mountpoint flag live

@@ -532,7 +532,12 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// storage.cfg edits between deploys while shielding a busy create_disk
 	// burst from per-call lookups.
 	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), 60*time.Second)
-	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node)
+	// The local backend's cluster sweep reads a storage content listing to
+	// decide a volume is absent, and an export serving the wrong tree lists
+	// nothing on every node. The corroborators give that sweep the same
+	// contradiction sources the handlers use.
+	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node,
+		pve.WithEmptyListingCorroborators(handlers.BackendCorroborators(cfg, client)))
 
 	// Resolve configured middleware hooks via the registry. config.Validate has
 	// already rejected unknown names, so a miss here is defensive only.

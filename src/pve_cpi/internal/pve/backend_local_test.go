@@ -129,7 +129,7 @@ func TestLocalBackend_NodeForCreate_CoLocatesWithVMHint(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default", nil)
 	got, err := b.NodeForCreate(context.Background(), "100", "ignored-by-vmHint-priority")
 	if err != nil {
 		t.Fatalf("NodeForCreate: %v", err)
@@ -148,7 +148,7 @@ func TestLocalBackend_NodeForCreate_VMHintMiss_FallsBackToCloudProp(t *testing.T
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default", nil)
 	got, err := b.NodeForCreate(context.Background(), "100", "pve-cloud")
 	if err != nil {
 		t.Fatalf("NodeForCreate: %v", err)
@@ -160,7 +160,7 @@ func TestLocalBackend_NodeForCreate_VMHintMiss_FallsBackToCloudProp(t *testing.T
 
 func TestLocalBackend_NodeForCreate_EmptyVMHintAndNoCloudProp_UsesDefault(t *testing.T) {
 	t.Parallel()
-	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
+	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default", nil)
 	got, err := b.NodeForCreate(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("NodeForCreate: %v", err)
@@ -172,7 +172,7 @@ func TestLocalBackend_NodeForCreate_EmptyVMHintAndNoCloudProp_UsesDefault(t *tes
 
 func TestLocalBackend_NodeForCreate_NoResolution_Errors(t *testing.T) {
 	t.Parallel()
-	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(nil, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	_, err := b.NodeForCreate(context.Background(), "", "")
 	if err == nil {
 		t.Fatalf("expected error when no node resolvable")
@@ -201,7 +201,7 @@ func TestLocalBackend_NodeForExisting_FindsOwnerViaExistsProbe(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	got, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err != nil {
 		t.Fatalf("NodeForExisting: %v", err)
@@ -230,7 +230,7 @@ func TestLocalBackend_NodeForExisting_PrefersDefaultNodeFirst(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default", nil)
 	got, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err != nil {
 		t.Fatalf("NodeForExisting: %v", err)
@@ -257,7 +257,7 @@ func TestLocalBackend_NodeForExisting_NoOwner_DiskNotFound(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "pve-default", nil)
 	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err == nil {
 		t.Fatalf("expected DiskNotFound error")
@@ -278,7 +278,7 @@ func TestLocalBackend_NodeForExisting_ClusterListErrorPropagates(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err == nil {
 		t.Fatalf("expected error when cluster list fails")
@@ -304,7 +304,7 @@ func TestNodeForExisting_AllNodesError_ReturnsRetriable(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err == nil {
 		t.Fatalf("expected error when all probes fail")
@@ -362,7 +362,7 @@ func TestCandidateNodes_RetriesOnTransient(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	got, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err != nil {
 		t.Fatalf("NodeForExisting after transient retry: %v", err)
@@ -385,7 +385,7 @@ func TestLocalBackend_NodeForExisting_RestrictedNodes_SkipsClusterScan(t *testin
 		},
 		// clusterSvc deliberately nil — restricted-nodes path must not call it.
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "shared-lvm", Type: "lvm", Nodes: []string{"pve-03", "pve-04"}}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "shared-lvm", Type: "lvm", Nodes: []string{"pve-03", "pve-04"}}, "", nil)
 	got, err := b.NodeForExisting(context.Background(), "anything")
 	if err != nil {
 		t.Fatalf("NodeForExisting: %v", err)
@@ -413,7 +413,7 @@ func TestCandidateNodes_AllRowsFailToParse_ReturnsRetriable(t *testing.T) {
 			},
 		},
 	}
-	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "")
+	b := newLocalBackend(c, StorageInfo{Name: "local-zfs", Type: "zfspool"}, "", nil)
 	_, err := b.NodeForExisting(context.Background(), "vm-100-disk-0")
 	if err == nil {
 		t.Fatalf("expected error when every candidate row fails to parse")

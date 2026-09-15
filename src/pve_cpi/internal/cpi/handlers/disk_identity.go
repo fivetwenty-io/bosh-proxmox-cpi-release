@@ -40,6 +40,12 @@ type resolvedDisk struct {
 	// provenance intent record names it. Mutating handlers resume the
 	// transfer before acting; read handlers treat the disk as existing.
 	intent *pve.DiskTransferIntent
+	// storageRefs counts, per storage, the volumes the cluster's configs
+	// referenced when the identity scan read them. It is set whether or not
+	// the scan found a holder, because the caller that needs it most is the
+	// one holding a disk nothing references and about to prove its volume
+	// gone. Nil for legacy disks, whose resolution runs no scan.
+	storageRefs pve.StorageReferenceCounts
 }
 
 // sentinelKey is the key this disk's records live under in the description
@@ -71,6 +77,10 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 		return resolvedDisk{}, wrapHolderScanError(err, fmt.Sprintf("%s: resolve disk identity for %s", op, diskCID))
 	}
 	rd.volid = ident.Volid
+	// Read off the identity before the branch below: the holder is copied only
+	// when the scan found one, and a free-floating disk is exactly the case
+	// these counts have to survive into.
+	rd.storageRefs = ident.Holder.StorageReferences
 	if ident.Holder.Found {
 		h := ident.Holder
 		rd.holder = &h

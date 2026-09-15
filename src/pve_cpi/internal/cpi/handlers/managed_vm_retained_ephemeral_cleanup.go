@@ -136,7 +136,7 @@ func cleanupManagedRetainedEphemeral(ctx context.Context, deps Deps, handle *aj.
 	if err := pve.DeleteParkedOwnedDisk(ctx, local.PVE, local.Log(ctx), target.Node, target.VMID, target.IntendedVolume, parkerWriteConfigFor(local)); err != nil {
 		return err
 	}
-	absent, err := volumeAbsentFromStorage(ctx, deps, target.Node, target.IntendedVolume)
+	absent, err := volumeAbsentFromStorage(ctx, deps, target.Node, target.IntendedVolume, nil)
 	if err != nil || !absent {
 		return fmt.Errorf("retained volume deletion is not observed")
 	}

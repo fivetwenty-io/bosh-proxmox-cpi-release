@@ -130,7 +130,7 @@ func classifySweep(
 	if index != nil {
 		base.clusterStorageSvc = index.svc
 	}
-	return newLocalBackend(&visibleBackendClient{backendTestClient: base}, captured, ""), content
+	return newLocalBackend(&visibleBackendClient{backendTestClient: base}, captured, "", nil), content
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,16 @@ type mockPVEClient struct {
 	clusterSvc        cluster.Service
 	clusterStorageSvc clusterstorage.Service
 	poolsSvc          pve.PoolService
+	// storageStatusFn scripts GET /nodes/{node}/storage/{storage}/status, the
+	// read the empty-listing corroboration makes when a content listing came
+	// back empty and the cheaper sources had nothing to say. Nil answers an
+	// active storage with nothing used, which is the shape that leaves the
+	// pre-corroboration verdict in place; a suite proving a contradiction sets
+	// it.
+	storageStatusFn func(ctx context.Context, node, storage string) (*nodes.ListStorageStatusResponse, error)
+	// storageStatusCalls counts those reads, so a test can pin that the
+	// corroboration stopped at a cheaper source.
+	storageStatusCalls int
 }
 
 func (m *mockPVEClient) QEMU() qemu.Service { return m.qemuSvc }
@@ -58,12 +68,45 @@ func (m *mockPVEClient) QEMU() qemu.Service { return m.qemuSvc }
 // before.
 func (m *mockPVEClient) Nodes() nodes.Service {
 	if m.nodesSvc != nil {
-		return &authNodesService{Service: m.nodesSvc, listFn: m.Cluster().ListResources, fallbackNode: testNode}
+		return &authNodesService{
+			Service: m.nodesSvc, listFn: m.Cluster().ListResources, fallbackNode: testNode, client: m,
+		}
 	}
 	if m.clusterSvc != nil {
-		return &authNodesService{listFn: m.clusterSvc.ListResources, fallbackNode: testNode}
+		return &authNodesService{listFn: m.clusterSvc.ListResources, fallbackNode: testNode, client: m}
 	}
 	return nil
+}
+
+// listStorageStatus answers the corroboration's status read and records that it
+// happened. It lives on the client rather than on the nodes wrapper because
+// Nodes() builds a fresh wrapper per call, and a count kept on the wrapper
+// would be thrown away with it.
+func (m *mockPVEClient) listStorageStatus(
+	ctx context.Context, node, storageID string,
+) (*nodes.ListStorageStatusResponse, error) {
+	m.storageStatusCalls++
+	if m.storageStatusFn != nil {
+		return m.storageStatusFn(ctx, node, storageID)
+	}
+	return storageStatusResponse(true, 0, 0), nil
+}
+
+// storageStatusResponse renders a status payload the way the wire delivers it,
+// so the wire scalars are decoded rather than hand-built.
+func storageStatusResponse(active bool, used, total int64) *nodes.ListStorageStatusResponse {
+	activeInt := 0
+	if active {
+		activeInt = 1
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"active": activeInt, "enabled": 1, "used": used, "total": total, "type": "nfs",
+	})
+	out := &nodes.ListStorageStatusResponse{}
+	if err := json.Unmarshal(raw, out); err != nil {
+		panic("storageStatusResponse: " + err.Error())
+	}
+	return out
 }
 func (m *mockPVEClient) Tasks() tasks.Service         { return m.tasksSvc }
 func (m *mockPVEClient) Storage() storage.Service     { return m.storageSvc }
@@ -912,6 +955,24 @@ type authNodesService struct {
 	nodes.Service
 	listFn       func(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
 	fallbackNode string
+	// client is the mock the wrapper was built from, when there is one. It
+	// owns the scripted storage-status answer and its call count; a wrapper a
+	// suite builds by hand leaves it nil and gets the default answer.
+	client *mockPVEClient
+}
+
+// ListStorageStatus answers the empty-listing corroboration's status read
+// without reaching the embedded delegate, whose stubs panic on every method a
+// suite did not script. The default answer is an active storage reporting
+// nothing in use, which says nothing either way and leaves the verdict where it
+// was before corroboration existed.
+func (s *authNodesService) ListStorageStatus(
+	ctx context.Context, node, storageID string,
+) (*nodes.ListStorageStatusResponse, error) {
+	if s.client != nil {
+		return s.client.listStorageStatus(ctx, node, storageID)
+	}
+	return storageStatusResponse(true, 0, 0), nil
 }
 
 // ListStorageContent and UpdateQemuConfig delegate to the embedded Service

@@ -938,7 +938,8 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		// probe and the second is settled by a storage content listing, so
 		// a stale unused slot pointing at a deleted volume no longer wedges
 		// delete_vm on either kind of storage.
-		absent, probeErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, diskStorage, volid, classifySlotStorage)
+		absent, probeErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, diskStorage, volid, classifySlotStorage,
+			emptyListingCorroborators(deps, nil)...)
 		if probeErr != nil {
 			deps.Log(ctx).Warn("delete_vm: unused-slot volume existence probe failed -- treating slot as present (fail-closed)",
 				log.String("slot", slot), log.String("volid", volid), log.Err(probeErr))
