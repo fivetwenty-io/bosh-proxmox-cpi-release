@@ -598,6 +598,57 @@ pvesm set <storage> --is_mountpoint yes
 
 The flag takes effect on the next call, because the CPI reads it live rather than from its storage cache. A storage whose only volume was the one just deleted still lists empty for an honest reason, and that case reads as unproven until another volume lands there.
 
+The local-backend cluster scan, which walks the nodes looking for a node-pinned volume, classifies the storage the same way. It reads the storage index live the first time it needs a classification, so the flag we set a moment ago is the flag the scan uses, and no cache has to expire first. When that read cannot be made, the scan falls back to the classification the backend was built with, and a fallback that carries no storage type counts as no classification at all, which leaves the absence unproven instead of letting the scan guess.
+
+### Absence unproven because an empty listing was contradicted
+
+**Symptom**
+
+A parker-anchor refusal stands, or an orphan sweep is skipped, and the CPI log carries a warning whose error reads:
+
+```text
+storage <name> listed no content but its absence is contradicted by <source>: <detail>; the export may be mounted from the wrong tree, so the volume is not proven gone
+```
+
+or, when the check that would have corroborated the empty listing failed instead of answering:
+
+```text
+storage <name> listed no content and the <source> check that would corroborate it did not land, so the volume is not proven gone: <error>
+```
+
+`<source>` names where the evidence came from, and it is one of `cluster configs`, `allocation journal`, or `storage status`.
+
+**Diagnosis**
+
+An NFS or CIFS export that mounts but serves the wrong tree lists nothing at all. The mount itself succeeded, so PVE activates the storage without complaint, and both types sit on the CPI's allow-list of storages whose listing fails outright when the backing is gone. Left alone, the proof would read that empty listing as evidence that every volume on the storage is gone, and `delete_disk` would report success over a disk whose data is intact. The realistic shape is a filer that lost its dataset and now exports the empty parent directory, or an export that somebody repointed.
+
+So when a listing comes back empty on a storage we would otherwise trust, the CPI asks three sources whether anything contradicts it. It stops at the first source that answers, and the order is the cost order:
+
+- **The cluster's VM configs** come first. A config that still references a volume on the storage contradicts an empty listing, and the check costs no extra call on `delete_disk`, `attach_disk`, and a `create_vm` that carries `disk_cids`, because those calls already read every VM config in the cluster to find the disk's holder. No other caller has that reading in hand. `has_disk`, `delete_vm`, the orphan sweeps that run after a failed create, and the local-backend cluster scan go straight to the next source.
+
+- **The allocation journal** comes next. It contradicts an empty listing when the CPI recorded allocating some other volume on the storage and never recorded deleting it, and it answers on every caller without touching the cluster. The disk we are asking about never counts against itself. The journal still holds an open allocation record for that disk at the moment we ask, and it holds exactly that record whether the volume is gone or not. The journal also misses a disk that was born before the journal existed, and it misses everything once the journal directory has been wiped.
+
+- **The storage's own status on the node** comes last, because it is the only source that spends an API call. It contradicts an empty listing when the storage is not active on that node, and when the storage reports at least 1 GiB in use with nothing listed. An NFS mount of a parent dataset still reports the children's bytes, which is how a filer exporting the empty parent of a populated pool gives itself away. It misses a storage that holds only the one disk we are asking about, when that disk is smaller than the 1 GiB floor.
+
+A source that fails rather than answers also leaves the absence unproven, which is the second message above. A check that did not land is not a check that agreed.
+
+One state stays indistinguishable. A storage that holds only the disk in question, and reports under a gigabyte in use, still proves absent from an empty listing. The journal cannot rescue that case, because the only disk it could name on such a storage is the one we are asking about, and that disk never counts against itself. At the PVE API level such a storage looks exactly like one whose last volume was genuinely deleted.
+
+**Fix**
+
+Go to the node and look at what the storage is actually serving:
+
+```bash
+pvesm status --storage <storage>
+pvesm list <storage>
+findmnt /mnt/pve/<storage>
+ls -la /mnt/pve/<storage>/images
+```
+
+Then compare the storage's backing against the filer. The definition in `/etc/pve/storage.cfg` carries a `path` for a dir-style storage, a `server` and an `export` for NFS, and a `server` and a `share` for CIFS. Confirm on the filer that the export our storage names still points at the dataset that holds our disks. An export somebody repointed, or a dataset a filer rebuild left empty, is the fault this refusal exists to catch, and remounting the right tree resolves it with the data intact.
+
+If the storage turns out to be genuinely empty, `pve.parked_anchor_strict: false` is the lever that lets the deployment move again. With it set, the anchor guard logs and proceeds without running the proof at all, and `delete_disk` folds a missing volume into success. That setting disables the protection described in this section, so set it only after inspecting the export on the node and confirming that the data is not there. Remove the property again once the deployment is moving, so that the next call gets the proof back.
+
 ### Parked-disk records fill a parker's description
 
 **Symptom**
