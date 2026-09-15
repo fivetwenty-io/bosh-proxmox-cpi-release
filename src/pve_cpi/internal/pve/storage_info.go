@@ -671,3 +671,58 @@ func ParseStorageEntry(raw json.RawMessage) (StorageInfo, error) {
 func ClusterStorageAsLister(svc clusterstorage.Service) StorageLister {
 	return svc
 }
+
+// LiveStorageInfo reads the PVE storage index once and returns the entry for
+// name, decoded through the same parser StorageInfoCache.refresh uses, so a
+// caller that needs a fresh classification gets exactly the fields the cache
+// would have held. Its reason for existing is that the cache is in memory and
+// one CPI process can outlive an operator's storage.cfg edit: the multi-request
+// stdin loop keeps a process alive across calls, and a backend built on a cache
+// miss carries a fabricated StorageInfo with nothing but the name in it. A
+// caller about to decide something on Type or IsMountpoint wants the live
+// answer for both shapes.
+//
+// It costs one uncached /storage request per call and deliberately does not go
+// through StorageInfoCache, so it works on a client whose resolver was never
+// wired. Callers that make the call on a hot path should memoize it themselves.
+//
+// Every failure is an error rather than a zero StorageInfo: a missing cluster
+// storage service, a transport fault, an index that came back nil, and a name
+// the index does not carry. The transport fault keeps its retriable
+// classification through WrapError so a caller that propagates it lets the
+// Director re-drive the action.
+func LiveStorageInfo(ctx context.Context, client Client, name string) (StorageInfo, error) {
+	if ctx == nil || client == nil {
+		return StorageInfo{}, fmt.Errorf("storage_info: live lookup needs a context and a client")
+	}
+	if strings.TrimSpace(name) == "" {
+		return StorageInfo{}, fmt.Errorf("storage_info: live lookup needs a storage name")
+	}
+	svc := client.ClusterStorage()
+	if svc == nil {
+		return StorageInfo{}, fmt.Errorf("storage_info: live lookup of %s needs the cluster storage service", name)
+	}
+	resp, err := svc.ListStorage(ctx, &clusterstorage.ListStorageParams{})
+	if err != nil {
+		return StorageInfo{}, cpierrors.Wrap(WrapError(err), "storage_info: live lookup of "+name)
+	}
+	if resp == nil {
+		return StorageInfo{}, cpierrors.Cloud("storage_info: live lookup of %s returned a nil storage index", name)
+	}
+	for i, raw := range *resp {
+		info, perr := parseStorageEntry(raw)
+		if perr != nil {
+			// One malformed entry must not fail the whole lookup, matching
+			// refresh's rule. Logged at Debug so schema drift leaves a trail.
+			log.FromContext(ctx).Debug("storage_info: skipping malformed /storage entry",
+				log.Int("index", i),
+				log.Err(perr),
+			)
+			continue
+		}
+		if info.Name == name {
+			return info, nil
+		}
+	}
+	return StorageInfo{}, fmt.Errorf("storage_info: storage %s is not in the PVE storage index", name)
+}

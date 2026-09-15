@@ -155,14 +155,20 @@ func ResolveDiskIdentity(
 	}
 
 	// Never transferred (or free-floating): the volume keeps its birth name.
-	return DiskIdentity{Volid: birthVolid}, nil
+	// The holder is empty, but the reference counts the scan gathered on its
+	// way to that answer ride out on it: a free-floating disk is exactly what
+	// delete_disk is about to prove absent, and the counts are the cheapest
+	// second opinion it has.
+	return DiskIdentity{Volid: birthVolid, Holder: DiskHolder{StorageReferences: hit.StorageReferences}}, nil
 }
 
 // holderFromScanHit classifies an identity-scan hit into the DiskHolder shape
 // resolveDiskHolder produces, without a second config read: the scan already
 // carried the tags and slot out of the config it matched.
 func holderFromScanHit(logger *log.Logger, hit DiskScanHit, birthVolid string, cfg ParkerConfig) DiskHolder {
-	holder := DiskHolder{Found: true, VMID: hit.VMID, Node: hit.Node, Tags: hit.Tags}
+	holder := DiskHolder{
+		Found: true, VMID: hit.VMID, Node: hit.Node, Tags: hit.Tags, StorageReferences: hit.StorageReferences,
+	}
 	inBand := hit.VMID >= cfg.VMIDRangeStart && hit.VMID <= cfg.VMIDRangeEnd
 	if !inBand {
 		return holder

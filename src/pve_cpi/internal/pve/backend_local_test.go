@@ -26,15 +26,20 @@ import (
 type backendTestClient struct {
 	storageSvc storage.Service
 	clusterSvc sdkcluster.Service
+	// nodesSvc and clusterStorageSvc stay nil unless a test wires them, which
+	// keeps every case written before the absence proof gained a content
+	// listing and a live classification on exactly the surface it had.
+	nodesSvc          nodes.Service
+	clusterStorageSvc clusterstorage.Service
 }
 
 func (b *backendTestClient) QEMU() qemu.Service                     { return nil }
 func (b *backendTestClient) Storage() storage.Service               { return b.storageSvc }
 func (b *backendTestClient) CloudInit() cloudinit.Service           { return nil }
 func (b *backendTestClient) Tasks() tasks.Service                   { return nil }
-func (b *backendTestClient) Nodes() nodes.Service                   { return nil }
+func (b *backendTestClient) Nodes() nodes.Service                   { return b.nodesSvc }
 func (b *backendTestClient) Cluster() sdkcluster.Service            { return b.clusterSvc }
-func (b *backendTestClient) ClusterStorage() clusterstorage.Service { return nil }
+func (b *backendTestClient) ClusterStorage() clusterstorage.Service { return b.clusterStorageSvc }
 func (b *backendTestClient) Pools() PoolService                     { return nil }
 
 // ---------------------------------------------------------------------------

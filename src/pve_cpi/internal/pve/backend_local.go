@@ -12,8 +12,11 @@ package pve
 
 import (
 	"context"
+	"strings"
+	"sync"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // resourceTypeNode is the PVE cluster-resource type tag for compute nodes,
@@ -28,6 +31,15 @@ type localBackend struct {
 	client      Client
 	info        StorageInfo
 	defaultNode string
+
+	// liveOnce guards the single live classification this backend is willing
+	// to pay for. The read happens on the first classifier call, which the
+	// absence proof only makes after a point probe has already failed, so a
+	// sweep that never reaches a content listing never issues it, and a sweep
+	// that reaches several issues it once.
+	liveOnce sync.Once
+	liveInfo StorageInfo
+	liveOK   bool
 }
 
 func newLocalBackend(c Client, info StorageInfo, defaultNode string) Backend {
@@ -91,10 +103,6 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 
 	var lastProbeErr error
 
-	// The backend already holds this storage's classification, so its
-	// classifier costs nothing and never fails.
-	classify := func(context.Context) (StorageInfo, bool) { return l.info, true }
-
 	for _, node := range candidates {
 		// ProveVolumeAbsent folds the lvmthin/zfspool "Failed to find logical
 		// volume" / "dataset does not exist" 500 errors into a clean absence
@@ -105,7 +113,7 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 		// the volume GET with a 500 naming volume_size_info, which says
 		// nothing either way. The proof settles that question from a storage
 		// content listing, so the scan gets its clean miss there too.
-		absent, err := ProveVolumeAbsent(ctx, l.client, node, storage, volume, classify)
+		absent, err := ProveVolumeAbsent(ctx, l.client, node, storage, volume, l.classifyStorage)
 		if err != nil {
 			// Probe failure on one node should not abort the cluster scan —
 			// the volume may live on a different healthy node. Record the
@@ -133,6 +141,55 @@ func (l *localBackend) NodeForExisting(ctx context.Context, volume string) (stri
 	}
 
 	return "", cpierrors.DiskNotFound(FormatDiskCID(storage, volume))
+}
+
+// classifyStorage answers the absence proof's classifier question for this
+// backend's storage, preferring a live read of the PVE storage index over the
+// StorageInfo this backend was constructed from.
+//
+// The captured info is right often enough, but two shapes make it the wrong
+// thing to answer with. A cache miss that is not retriable leaves the resolver
+// fabricating a StorageInfo carrying only the name, so its Type is empty and
+// its is_mountpoint is false on a storage that may well carry the flag. And one
+// CPI process can outlive an operator's storage.cfg edit, because the
+// multi-request stdin loop keeps the process alive across calls while the
+// classification cache holds its entries for a TTL.
+//
+// The live read is made at most once per backend and only from here, which the
+// proof reaches only after a point probe failed, so the cost lands on the paths
+// that are about to read a content listing anyway.
+//
+// When the live read cannot be made, the answer falls back to the captured
+// info, and how much that proves depends on what it carries. A captured info
+// with a Type is a real classification, so it stays a successful one, which is
+// what keeps this working on a client that wires no cluster storage service. A
+// captured info with no Type is the fabricated one, and reporting that as a
+// successful classification told the proof it was looking at an unclassified
+// storage when the truth is that we never classified it at all. It now answers
+// false, which the proof reads as unproven.
+func (l *localBackend) classifyStorage(ctx context.Context) (StorageInfo, bool) {
+	l.liveOnce.Do(func() {
+		info, err := LiveStorageInfo(ctx, l.client, l.info.Name)
+		if err != nil {
+			// Not fatal on its own: the fallback below still answers, and the
+			// caller's own failure message is the one that matters if it does
+			// not. Logged at Debug so an operator chasing an unproven absence
+			// can see that the live classification is what went missing.
+			log.FromContext(ctx).Debug("backend(local): live storage classification unavailable, using captured info",
+				log.String("storage", l.info.Name),
+				log.Err(err),
+			)
+			return
+		}
+		l.liveInfo, l.liveOK = info, true
+	})
+	if l.liveOK {
+		return l.liveInfo, true
+	}
+	if strings.TrimSpace(l.info.Type) == "" {
+		return l.info, false
+	}
+	return l.info, true
 }
 
 // candidateNodes builds the ordered list of node names to probe. Preference:

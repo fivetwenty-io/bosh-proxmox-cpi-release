@@ -563,6 +563,64 @@ type DiskScanHit struct {
 	Tags  string
 	Slot  string
 	Volid string
+	// StorageReferences counts, per storage, the volids the configs the scan
+	// read reference. It is nil when no scan ran, and empty when one ran and
+	// found nothing. See StorageReferenceCounts for what the count is good for
+	// and where it is only a lower bound.
+	StorageReferences StorageReferenceCounts
+}
+
+// StorageReferenceCounts maps a storage name to the number of volumes the
+// cluster's VM configs reference on it. The cluster-wide disk scan reads every
+// QEMU config already, so the count is free wherever that scan ran, and it
+// answers the one question an empty content listing cannot: a storage that
+// lists nothing while configs still name volumes on it is an export serving
+// the wrong tree, not a storage whose last volume was deleted.
+//
+// The count is a lower bound rather than a census. The scan stops at the first
+// config that matches the disk it was looking for, so a hit leaves the configs
+// behind it unread. That only ever under-counts, so a non-zero count is still
+// evidence, which is all the corroborator asks of it.
+type StorageReferenceCounts map[string]int
+
+// addStorageReferences counts one guest's parsed disk map into counts.
+//
+// Every active bus slot counts, parkers included: a parker holding a detached
+// volume is exactly the reference an empty listing would otherwise let us
+// delete out from under. Cdrom media and cloud-init drives do not, because
+// neither is a volume whose absence anyone is proving, and an ISO mounted from
+// a storage says nothing about the disk images on it.
+func addStorageReferences(counts StorageReferenceCounts, disks map[string]string) {
+	if counts == nil {
+		return
+	}
+	for _, optstr := range disks {
+		bare := optstr
+		if comma := strings.Index(optstr, ","); comma >= 0 {
+			bare = optstr[:comma]
+		}
+		if bare == "" || bare == "none" || driveOptStrIsCDROM(optstr) || strings.Contains(bare, "-cloudinit") {
+			continue
+		}
+		storage, volume, ok := strings.Cut(bare, ":")
+		if !ok || storage == "" || volume == "" {
+			continue
+		}
+		counts[storage]++
+	}
+}
+
+// driveOptStrIsCDROM reports whether a drive entry is cdrom media. PVE writes
+// the flag as a media=cdrom option after the volid, which is how an ISO mount
+// and a disk image are told apart in a config that spells both the same way.
+func driveOptStrIsCDROM(optstr string) bool {
+	parts := strings.Split(optstr, ",")
+	for _, opt := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(opt), "media=cdrom") {
+			return true
+		}
+	}
+	return false
 }
 
 // findVMByDiskIdentityScan is the single cluster-wide disk scan behind
@@ -605,6 +663,14 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		return DiskScanHit{}, cpierrors.Wrap(listErr, "FindVMByDiskVolid: enumerate cluster guests")
 	}
 
+	// The counts are allocated once the listing has landed, so a nil map means
+	// no scan ran and an empty one means a scan ran and found no references.
+	// The empty-listing corroborator reads that difference: it has nothing to
+	// say about a storage nobody counted, and nothing to say about a storage
+	// counted at zero either, but only the first of those is an absence of
+	// evidence.
+	counts := make(StorageReferenceCounts)
+
 	for _, g := range guests {
 		vmid := g.VMID
 		vmNode := g.Node
@@ -633,18 +699,26 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 			)
 		}
 
-		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(cfg), volid, stableID); ok {
+		disks := qemu.ParseDisks(cfg)
+		addStorageReferences(counts, disks)
+
+		if slot, current, ok := matchDiskIdentity(disks, volid, stableID); ok {
 			tags, _ := ConfigString(cfg, "tags")
-			return DiskScanHit{VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current}, nil
+			return DiskScanHit{
+				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
+			}, nil
 		}
 	}
 
 	if len(excludedNodes) > 0 {
-		return DiskScanHit{}, cpierrors.Retriable(
+		return DiskScanHit{StorageReferences: counts}, cpierrors.Retriable(
 			"disk %q: not found among the reachable guests, but node(s) %s were excluded as offline; cannot prove the disk is unattached",
 			volid, strings.Join(excludedNodes, ","))
 	}
-	return DiskScanHit{}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+	// The counts ride out on the not-found answer too, and that is the case
+	// they exist for: a disk nothing references is the one delete_disk is about
+	// to prove absent from an empty listing.
+	return DiskScanHit{StorageReferences: counts}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
 }
 
 // matchDiskIdentity matches one parsed disk map against a disk identity: the
@@ -695,14 +769,30 @@ func FindVMByDiskVolidOrNone(ctx context.Context, c Client, volid string) (vmid 
 func FindVMByDiskVolidOrNoneTagged(
 	ctx context.Context, c Client, volid string,
 ) (vmid int, node, tags string, found bool, err error) {
-	v, n, t, findErr := FindVMByDiskVolidTagged(ctx, c, volid)
+	hit, hitFound, findErr := findVMByDiskVolidHit(ctx, c, volid)
 	if findErr != nil {
-		if errors.Is(findErr, ErrDiskNotAttachedToAnyVM) {
-			return 0, "", "", false, nil
-		}
 		return 0, "", "", false, findErr
 	}
-	return v, n, t, true, nil
+	if !hitFound {
+		return 0, "", "", false, nil
+	}
+	return hit.VMID, hit.Node, hit.Tags, true, nil
+}
+
+// findVMByDiskVolidHit is FindVMByDiskVolidOrNoneTagged with the whole scan hit
+// preserved, so a caller that needs what the scan saw on its way past the other
+// guests -- the per-storage reference counts -- gets it without a second sweep.
+// The not-found answer carries the counts too: the scan read every config in
+// the cluster to reach it, and that answer is where the counts matter most.
+func findVMByDiskVolidHit(ctx context.Context, c Client, volid string) (DiskScanHit, bool, error) {
+	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "")
+	if err != nil {
+		if errors.Is(err, ErrDiskNotAttachedToAnyVM) {
+			return DiskScanHit{StorageReferences: hit.StorageReferences}, false, nil
+		}
+		return DiskScanHit{}, false, err
+	}
+	return hit, true, nil
 }
 
 // DiskOptStrContainsVolid reports whether any entry in disks has a value that

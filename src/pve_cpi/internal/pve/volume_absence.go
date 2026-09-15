@@ -8,6 +8,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
+
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // StorageClassifier answers what kind of storage we are proving against. It is
@@ -24,8 +27,16 @@ type StorageClassifier func(context.Context) (StorageInfo, bool)
 //
 // The volume argument is a full volid such as "nfs-images:9000/vm-9000-disk-0.qcow2",
 // and storage names the storage it lives on.
+//
+// The corroborators are optional and are consulted in the one case where an
+// empty listing is about to be read as an absence: an nfs or cifs export that
+// mounts but serves the wrong tree lists nothing while its real content sits
+// elsewhere, and the allow-list cannot tell that apart from a storage whose
+// last volume was deleted. A caller that passes none keeps the behavior it had
+// before corroboration existed.
 func ProveVolumeAbsent(
 	ctx context.Context, client Client, node, storage, volume string, classify StorageClassifier,
+	corroborators ...EmptyListingCorroborator,
 ) (bool, error) {
 	if ctx == nil || client == nil || node == "" {
 		return false, fmt.Errorf("volume absence proof requires context, client, and node")
@@ -72,6 +83,16 @@ func ProveVolumeAbsent(
 	if proofErr := listingProvesAbsence(ctx, storage, listed, classify); proofErr != nil {
 		return false, proofErr
 	}
+	// Only an empty listing reaches corroboration. A listing that carried other
+	// volumes proved the tree is really there, and the plain-dir rule above has
+	// already refused the empty case on the storages where an empty answer
+	// means nothing at all, so what is left here is the allow-listed or
+	// is_mountpoint storage whose empty answer we are about to believe.
+	if listed == 0 {
+		if corrErr := corroborateEmptyListing(ctx, node, storage, corroborators); corrErr != nil {
+			return false, corrErr
+		}
+	}
 	return true, nil
 }
 
@@ -109,13 +130,12 @@ func listingProvesAbsence(ctx context.Context, storage string, listed int, class
 }
 
 // describeStorageType names the storage in the unproven message. A classifier
-// can answer with a storage whose type is empty: the local backend's cache-miss
-// fallback fabricates a StorageInfo carrying only the name, and it reports that
-// as a successful classification. Rendering the type verbatim there produced
-// "is a  storage", so an empty type is named for what it is. The conservative
-// rule is unchanged either way, because an unclassified storage takes the same
-// path as an unrecognized one: only other volumes in the listing prove the tree
-// is really there.
+// can still answer with a storage whose type is empty, for instance a live
+// index entry that carries no type, and rendering the type verbatim there
+// produced "is a  storage", so an empty type is named for what it is. The
+// conservative rule is unchanged either way, because an unclassified storage
+// takes the same path as an unrecognized one: only other volumes in the listing
+// prove the tree is really there.
 func describeStorageType(storageType string) string {
 	if strings.TrimSpace(storageType) == "" {
 		return "an unclassified storage"
@@ -140,4 +160,257 @@ func listingFailsWhenBackingIsGone(storageType string) bool {
 		return true
 	}
 	return false
+}
+
+// EmptyListingCorroborator is a second opinion on an empty content listing. The
+// proof consults it only when the listing came back empty on a storage the
+// allow-list or is_mountpoint would otherwise trust, so a corroborator costs
+// nothing on every other path and never has to guess at what the listing meant.
+//
+// A corroborator answers in one of three ways. It contradicts the listing, and
+// the proof fails closed naming what contradicted it. It errors, and the proof
+// fails closed too, because a check that did not land cannot clear an empty
+// answer. Or it has nothing to say, and the next corroborator gets its turn.
+type EmptyListingCorroborator interface {
+	// CorroborateEmptyListing is asked about one storage as seen from one node.
+	CorroborateEmptyListing(ctx context.Context, node, storage string) (Corroboration, error)
+}
+
+// Corroboration is one corroborator's answer. The zero value is "nothing to
+// say", which is what a corroborator returns when it has no evidence either
+// way rather than when it found the storage genuinely empty: no source here
+// can prove emptiness, only contradict it.
+type Corroboration struct {
+	// Contradicted is true when this source knows of volumes the listing
+	// should have carried.
+	Contradicted bool
+	// Source names where the evidence came from, for the operator-facing
+	// refusal. Empty falls back to the name the corroborator carries.
+	Source string
+	// Detail is the one clause that follows the source in the refusal, such as
+	// "3 volumes on the storage are referenced by VM configs".
+	Detail string
+}
+
+// The source names the refusal prints. They are the operator's whole answer to
+// "how do you know?", so they name the record rather than the code that read it.
+const (
+	// CorroborationSourceConfigs is the cluster's own VM configs, read by the
+	// holder scan the caller already paid for.
+	CorroborationSourceConfigs = "cluster configs"
+	// CorroborationSourceJournal is the CPI's allocation journal, which
+	// records what we allocated on a storage and what we recorded deleting.
+	CorroborationSourceJournal = "allocation journal"
+	// CorroborationSourceStorageStatus is PVE's own status for the storage on
+	// the node, which reports activity and used bytes.
+	CorroborationSourceStorageStatus = "storage status"
+)
+
+// EmptyListingUsedBytesFloor is the used figure above which a storage that
+// listed nothing is contradicting itself. It sits well above what an empty
+// dir-style storage reports for its own images/ and dump/ subdirectories, and
+// well below any disk BOSH would have put there, so neither side of the
+// comparison is a close call.
+const EmptyListingUsedBytesFloor = 1 << 30
+
+// emptyListingStatusTimeout bounds the one storage status read. It matches the
+// other single-read probes in this package, and it exists because the read
+// happens on a delete path that has already spent a point probe and a listing.
+const emptyListingStatusTimeout = 30 * time.Second
+
+// corroborationSourceNamer is implemented by the corroborators in this package
+// so a refusal can name the source even when the answer carried no verdict, as
+// an error does.
+type corroborationSourceNamer interface {
+	CorroborationSource() string
+}
+
+// corroborateEmptyListing consults the corroborators in order and stops at the
+// first one that has something to say. Order is the caller's, and it is the
+// cost order: the sources that read records already in hand come before the one
+// that spends an API call, so a contradiction the cheap sources can see is
+// found without touching the cluster.
+func corroborateEmptyListing(
+	ctx context.Context, node, storage string, corroborators []EmptyListingCorroborator,
+) error {
+	for _, corroborator := range corroborators {
+		if corroborator == nil {
+			continue
+		}
+		verdict, err := corroborator.CorroborateEmptyListing(ctx, node, storage)
+		if err != nil {
+			return fmt.Errorf(
+				"storage %s listed no content and the %s check that would corroborate it did not land, "+
+					"so the volume is not proven gone: %w",
+				storage, corroborationSource(corroborator, verdict.Source), err)
+		}
+		if verdict.Contradicted {
+			return fmt.Errorf(
+				"storage %s listed no content but its absence is contradicted by %s: %s; the export may be "+
+					"mounted from the wrong tree, so the volume is not proven gone",
+				storage, corroborationSource(corroborator, verdict.Source), corroborationDetail(verdict.Detail))
+		}
+	}
+	return nil
+}
+
+// corroborationSource picks the name the refusal prints: the one the answer
+// carried, then the one the corroborator carries, and failing both a phrase
+// that at least says what kind of check it was.
+func corroborationSource(corroborator EmptyListingCorroborator, source string) string {
+	if trimmed := strings.TrimSpace(source); trimmed != "" {
+		return trimmed
+	}
+	if namer, ok := corroborator.(corroborationSourceNamer); ok {
+		if trimmed := strings.TrimSpace(namer.CorroborationSource()); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "an unnamed empty-listing check"
+}
+
+// corroborationDetail keeps the refusal readable when a corroborator
+// contradicted the listing without saying what it saw.
+func corroborationDetail(detail string) string {
+	if trimmed := strings.TrimSpace(detail); trimmed != "" {
+		return trimmed
+	}
+	return "it reported no detail"
+}
+
+// CorroboratorFunc adapts a function to EmptyListingCorroborator, carrying the
+// source name so a caller composing its own check gets the same refusal wording
+// as the built-in ones. A nil fn is a wiring fault rather than a corroborator
+// with nothing to say, so it reports an error and the proof fails closed.
+func CorroboratorFunc(
+	source string, fn func(ctx context.Context, node, storage string) (Corroboration, error),
+) EmptyListingCorroborator {
+	return corroboratorFunc{source: source, fn: fn}
+}
+
+type corroboratorFunc struct {
+	source string
+	fn     func(ctx context.Context, node, storage string) (Corroboration, error)
+}
+
+func (c corroboratorFunc) CorroborationSource() string { return c.source }
+
+func (c corroboratorFunc) CorroborateEmptyListing(ctx context.Context, node, storage string) (Corroboration, error) {
+	if c.fn == nil {
+		return Corroboration{Source: c.source}, fmt.Errorf("empty-listing corroborator %q has no implementation", c.source)
+	}
+	return c.fn(ctx, node, storage)
+}
+
+// ConfigReferenceCorroborator contradicts an empty listing when the cluster's
+// VM configs still reference volumes on the storage. The counts come from the
+// holder scan delete_disk and the attach paths already run, so this source
+// costs no API call where it is available, and it is available nowhere else:
+// refs is nil on every caller that never scanned, and a nil map has nothing to
+// say rather than something to deny.
+func ConfigReferenceCorroborator(refs StorageReferenceCounts) EmptyListingCorroborator {
+	return CorroboratorFunc(CorroborationSourceConfigs,
+		func(_ context.Context, _, storage string) (Corroboration, error) {
+			referenced := refs[storage]
+			if referenced <= 0 {
+				return Corroboration{}, nil
+			}
+			return Corroboration{
+				Contradicted: true,
+				Source:       CorroborationSourceConfigs,
+				Detail: fmt.Sprintf("%s on the storage %s referenced by VM configs",
+					pluralVolumes(referenced), isAre(referenced)),
+			}, nil
+		})
+}
+
+// pluralVolumes renders a reference count as the noun phrase the refusal reads.
+func pluralVolumes(n int) string {
+	if n == 1 {
+		return "1 volume"
+	}
+	return fmt.Sprintf("%d volumes", n)
+}
+
+// isAre agrees the verb with the count, so the refusal reads as a sentence.
+func isAre(n int) string {
+	if n == 1 {
+		return "is"
+	}
+	return "are"
+}
+
+// StorageStatusCorroborator contradicts an empty listing from PVE's own status
+// for the storage on the node. It is the last resort because it is the only
+// corroborator that spends an API call, and it catches the case the record-based
+// sources cannot: a disk born before the journal, on a storage no config
+// references, whose filer is now exporting the wrong tree. An NFS mount of a
+// parent dataset still reports the children's bytes, so a used figure with an
+// empty listing is the contradiction.
+func StorageStatusCorroborator(client Client) EmptyListingCorroborator {
+	return CorroboratorFunc(CorroborationSourceStorageStatus,
+		func(ctx context.Context, node, storage string) (Corroboration, error) {
+			return readStorageStatusCorroboration(ctx, client, node, storage)
+		})
+}
+
+// readStorageStatusCorroboration performs the one status read behind
+// StorageStatusCorroborator. Every failure is returned rather than swallowed:
+// the caller is about to conclude that a volume is gone, and a status read that
+// did not land is not a status read that agreed.
+func readStorageStatusCorroboration(ctx context.Context, client Client, node, storage string) (Corroboration, error) {
+	if ctx == nil || client == nil {
+		return Corroboration{}, fmt.Errorf("storage status corroboration requires context and client")
+	}
+	if node == "" || storage == "" {
+		return Corroboration{}, fmt.Errorf("storage status corroboration requires a node and a storage name")
+	}
+	if client.Nodes() == nil {
+		return Corroboration{}, fmt.Errorf("storage status corroboration requires the nodes service")
+	}
+	// One read, no retry ladder. The Director re-drives the whole CPI call, and
+	// a retry here would only widen the window in which a flapping storage
+	// answers on the attempt that agrees with an empty listing.
+	statusCtx, cancel := context.WithTimeout(ctx, emptyListingStatusTimeout)
+	defer cancel()
+	status, err := client.Nodes().ListStorageStatus(statusCtx, node, storage)
+	if err != nil {
+		return Corroboration{}, fmt.Errorf("read status of storage %s on node %s: %w", storage, node, err)
+	}
+	if status == nil {
+		return Corroboration{}, fmt.Errorf("status of storage %s on node %s came back empty", storage, node)
+	}
+	// PVE answers these as integers or as strings depending on the endpoint and
+	// the version, which is why the SDK decodes them through its wire scalars
+	// and why nothing here reads a plain int.
+	if status.Active == nil || !status.Active.Bool() {
+		return Corroboration{
+			Contradicted: true,
+			Source:       CorroborationSourceStorageStatus,
+			Detail:       fmt.Sprintf("storage is not active on node %s", node),
+		}, nil
+	}
+	if status.Used == nil {
+		return Corroboration{}, nil
+	}
+	used := status.Used.Int()
+	if used < EmptyListingUsedBytesFloor {
+		return Corroboration{}, nil
+	}
+	return Corroboration{
+		Contradicted: true,
+		Source:       CorroborationSourceStorageStatus,
+		Detail: fmt.Sprintf("the storage reports %d bytes in use%s with nothing listed",
+			used, describeStorageTotal(status.Total)),
+	}, nil
+}
+
+// describeStorageTotal adds the capacity the used figure sits against, when PVE
+// reported one, so an operator reading the refusal can tell a full storage from
+// a nearly empty one without going to look.
+func describeStorageTotal(total *sdkclient.PVEInt) string {
+	if total == nil || total.Int() <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" of %d", total.Int())
 }
