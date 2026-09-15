@@ -1188,8 +1188,26 @@ Use these patterns to distinguish normal retry noise from actionable failures.
 
 ## Multi-storage allocation requires reconciliation
 
-Use the allocation UUID in the error to inspect the retained journal and actual PVE resources. A missing task response does not establish that the mutation failed. Preserve its record, VM marker, disk provenance, and historical backing while reconciling the outcome.
+Use the allocation UUID in the error to inspect the retained journal and the actual PVE resources. A missing task response does not establish that the mutation failed, so preserve the record, the VM marker, the disk provenance, and the historical backing while we reconcile the outcome.
 
-A changed caller request conflicts with an active VM generation. A changed global strategy alone does not create a replacement generation, while a restrictive boundary can block remaining mutations. Operating on an existing disk CID should not require restoring an unrelated set that is unavailable.
+A changed caller request conflicts with the active VM generation. A changed global strategy on its own does not create a replacement generation, though a more restrictive boundary can block the mutations that remain. Operating on an existing disk CID should never require restoring an unrelated set that is unavailable.
 
-If an audit reports incomplete visibility, check propagated `VM.Audit` and `Datastore.Audit` privileges, the image-access grants, and the ACL inventory access described in [PVE API permissions](pve-api-permissions.md#multi-storage-audit-visibility). A successful filtered listing cannot prove that historical resources are absent.
+If an audit reports incomplete visibility, check the propagated `VM.Audit` and `Datastore.Audit` privileges, the image-access grants, and the ACL inventory access described in [PVE API permissions](pve-api-permissions.md#multi-storage-audit-visibility). When PVE has filtered a listing by permission, that listing cannot prove that historical resources are absent.
+
+### A crash-abandoned allocation keeps charging capacity
+
+Every set-managed create charges the bytes that its in-flight siblings have already claimed, so an allocation left behind in an in-flight state goes on charging its bytes against every later create in the namespace. Nothing ages a record out of those states on its own. A CPI killed between writing its record and running its first step leaves a `planned` record, and that record keeps its claim until an operator resolves it.
+
+The bound is the number of abandoned allocations rather than the number of VMs, so the usual symptom is a share that looks fuller to the planner than PVE says it is. In the worst case, a create cannot find a feasible member at all.
+
+The journal audit names such a record.
+
+```sh
+cpi storage-journal audit --config /path/to/cpi.json
+```
+
+Each record summary carries `charging`, which is true for exactly the states that charge bytes, and it carries `CreatedAt` and `UpdatedAt` in RFC 3339. The `charging_summary` object beside the record listing holds the number of charging records, the identifier of the oldest one, and its age, so we do not have to read a long audit row by row. When nothing is charging, that summary reports a count of zero and names no record. When a record's age runs to hours or days and its `UpdatedAt` has not moved since it was created, we are looking at the shape a crashed CPI leaves behind.
+
+Nothing clears such a record automatically, and that is deliberate, because deciding that an in-flight allocation is abandoned rather than merely slow is a human's call. The `reconciliation_required` state exists for exactly that wait. Reconcile the record the way this section describes, by reading it, settling what the allocation left behind on PVE, and then moving or cleaning it with the commands in [Audit and recover storage allocations](storage-journal-operations.md).
+
+[Charge in-flight siblings against a placement](multi-storage-placement.md#charge-in-flight-siblings-against-a-placement) lists which record states charge and which do not.

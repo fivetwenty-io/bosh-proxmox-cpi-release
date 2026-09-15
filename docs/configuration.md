@@ -928,3 +928,24 @@ Everything not listed here — hooks, OTel, metrics, DLB, anti-affinity, encrypt
 ## Multiple NFS storage sets
 
 Use [multi-storage placement](multi-storage-placement.md) to configure independent persistent and ephemeral sets, choose a versioned strategy, and constrain deployment overrides. Existing storage scalars remain available for legacy and infrastructure consumers. Set-managed allocation also requires a stable namespace and an enrolled durable journal.
+
+Each set may also declare `anti_affinity`, which asks the planner to prefer a member that does not already hold another allocation of the same instance group.
+
+```yaml
+storage_sets:
+  ephemeral:
+    names: [nfs-ephemeral-01, nfs-ephemeral-02, nfs-ephemeral-03]
+    strategy: {name: least_utilized, version: 1}
+    anti_affinity:
+      scope: instance_group
+      utilization_band_pct: 20
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `anti_affinity.scope` | `instance_group` | Which allocations count as siblings. `instance_group` matches the deployment and the instance group, `deployment` matches the deployment alone, and `none` turns the preference off for this set. |
+| `anti_affinity.utilization_band_pct` | `20` | How far a member may sit above the least utilized candidate and still be ordered by sibling count, measured in percentage points of projected utilization. A fuller member ranks after every in-band one. |
+
+The whole block is optional, and a set that declares no `anti_affinity` block behaves exactly as if it had declared the two defaults. The defaults are read where they are used, and they are never written onto the set. That is why the policy fingerprint of a deployment that leaves the block out does not change on upgrade. Once a set does declare the block, it has to name a scope, because a blank scope fails validation with `anti_affinity.scope must not be blank`. The band stays optional inside a declared block. Write `anti_affinity: {scope: none}` on a set to turn the preference off there.
+
+Every set-managed create also charges what its in-flight siblings have already claimed, and that behavior needs no configuration. [Charge in-flight siblings against a placement](multi-storage-placement.md#charge-in-flight-siblings-against-a-placement) explains which record states charge and why the resting ones do not. [Spread an instance group across members](multi-storage-placement.md#spread-an-instance-group-across-members) covers the group string, the band, and the order the buckets rank in.
