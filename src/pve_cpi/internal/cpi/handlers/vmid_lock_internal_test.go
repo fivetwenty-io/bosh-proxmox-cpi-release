@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -222,4 +223,24 @@ func TestWithVMIDLock_NilPools(t *testing.T) {
 // disambiguation supply their own fake.
 func (p *vmidLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
+}
+
+// TestWithVMIDLock_OwnerNamesTheProcess checks that the VMID lock stamps a
+// claim that names this process and this acquisition, so two CPI processes
+// locking one VMID in the same second never write the same claim.
+func TestWithVMIDLock_OwnerNamesTheProcess(t *testing.T) {
+	pools := newVMIDLockPools(nil)
+	var claims []string
+	for range 2 {
+		if err := withVMIDLock(t.Context(), pools, 4242, "set_vm_metadata/4242", nil, func() error {
+			claims = append(claims, pools.pools["bosh-lock-vm-4242"])
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := fmt.Sprintf("owner=set_vm_metadata/4242@%d-", os.Getpid())
+	if !strings.HasPrefix(claims[0], marker) || !strings.HasPrefix(claims[1], marker) || claims[0] == claims[1] {
+		t.Fatalf("claims %q do not name this process and acquisition", claims)
+	}
 }

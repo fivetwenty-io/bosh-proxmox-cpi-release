@@ -37,6 +37,11 @@ func (m *managedVMAllocation) revalidate(ctx context.Context) error {
 	m.prepared.ledger = ledger
 	return nil
 }
+
+// managedVMAntiAffinitySentinelPrefix is the sentinel namespace of the
+// anti-affinity lock, the only lock a VM allocation takes under its guard.
+var managedVMAntiAffinitySentinelPrefix = pve.ClusterLockPoolName(antiAffinityLockPrefix)
+
 func (m *managedVMAllocation) newGuard() error {
 	if m.guard != nil {
 		return m.guard.Err()
@@ -70,8 +75,9 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 	case "QEMU.ResizeDisk", managedVMCallResize, managedVMCallAttach, managedVMCallDetach, managedVMCallStart, managedVMCallUpdateConfig, "Nodes.CreateQemuAgentExec", "Nodes.CreateQemuFirewallIpset", "Nodes.CreateQemuFirewallIpset2", "Nodes.CreateQemuFirewallRules", "Nodes.UpdateQemuFirewallOptions", "Cluster.CreateHaResources", "Cluster.UpdateHaResources", "Cluster.CreateHaRules", "Cluster.DeleteHaRules", "Cluster.CreateSdnVnetsSubnets", "Cluster.UpdateSdn", "Pool.AddVM", "Pool.MoveVMToPool", "Pool.CreatePool":
 	case "Pool.DeletePool":
 		// The anti-affinity lock releases its sentinel through this guard. No
-		// other pool may be deleted during a VM allocation.
-		if pool, _ := call.Args[managedArgumentPoolID].(string); !isManagedLockPool(pool) {
+		// other pool may be deleted during a VM allocation, and that includes
+		// every other sentinel, such as a parker's or a VMID's.
+		if pool, _ := call.Args[managedArgumentPoolID].(string); !strings.HasPrefix(pool, managedVMAntiAffinitySentinelPrefix) {
 			return "", fmt.Errorf("unplanned VM allocation pool deletion")
 		}
 	default:

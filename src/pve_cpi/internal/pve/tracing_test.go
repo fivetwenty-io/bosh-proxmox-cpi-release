@@ -603,3 +603,26 @@ func TestTracedPoolService_AllMethods_Traced(t *testing.T) {
 func (f *fakePoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
 }
+
+type rawReadingPoolService struct {
+	fakePoolService
+	comment string
+}
+
+func (p *rawReadingPoolService) ReadPoolComment(context.Context, string) (string, error) {
+	return p.comment, nil
+}
+
+// TestTracedPoolService_ReadPoolComment forwards the raw read when the wrapped
+// service offers one and fails the read when it does not.
+func TestTracedPoolService_ReadPoolComment(t *testing.T) {
+	tracer, _ := newTestTracer(t)
+	traced := &tracedPoolService{PoolService: &rawReadingPoolService{comment: "owner=a exp=1"}, tracer: tracer}
+	if comment, err := traced.ReadPoolComment(context.Background(), "p"); err != nil || comment != "owner=a exp=1" {
+		t.Fatalf("raw read was not forwarded: %q, %v", comment, err)
+	}
+	plain := &tracedPoolService{PoolService: &fakePoolService{}, tracer: tracer}
+	if _, err := plain.ReadPoolComment(context.Background(), "p"); err == nil {
+		t.Fatal("a wrapped service without a raw read answered one")
+	}
+}

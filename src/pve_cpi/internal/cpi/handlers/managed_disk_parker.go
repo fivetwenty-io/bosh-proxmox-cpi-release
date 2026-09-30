@@ -13,6 +13,7 @@ import (
 )
 
 func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, volume string) error {
+	ctx = managedLockWaitContext(ctx)
 	cfg := parkerWriteConfigFor(m.deps)
 	cfg.DiskStorage = m.plan.Targets[0].StorageID
 	pctx := pve.ParkContext{DiskCID: cid, StableID: m.token, Opts: m.opts, AllocationID: m.id, AllocationNamespace: m.plan.Namespace, AllocationBacking: m.plan.Targets[0].BackingKey}

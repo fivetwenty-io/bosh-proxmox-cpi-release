@@ -45,7 +45,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -2025,20 +2024,26 @@ func UnparkDiskAt(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 // live holder was inside the window throughout.
 const parkerProtectionLockTTL = 180 * time.Second
 
+// ParkerProtectionLockTTL exports the protection-window lock's TTL, which is
+// the longest a live holder's claim can stand before a waiter may steal it.
+const ParkerProtectionLockTTL = parkerProtectionLockTTL
+
 // parkerProtectionLockTimeout bounds the wait for the lock. On timeout the
-// window runs unserialized rather than failing, which is what every release
-// before the lock existed did; see withParkerProtectionLock.
+// acquire fails retriably with ErrClusterLockTimeout, because a live holder was
+// inside the window throughout; see withParkerProtectionLock. A caller that
+// would rather wait out a whole holder sets a longer wait with
+// WithParkerLockWait.
 const parkerProtectionLockTimeout = 15 * time.Second
 
 // parkerLockReleaseTimeout bounds the deferred sentinel-pool delete.
 const parkerLockReleaseTimeout = 10 * time.Second
 
-// parkerLockTimeoutsKey carries a test override for the protection-window
-// lock's TTL and acquire timeout. The production values are tuned for a real
-// cluster -- a 15s wait and a 180s TTL -- and a test that exercises the
-// contended paths would otherwise have to spend them in wall-clock time.
-// Test-only, like WithTestBackoff: production code must leave the constants in
-// place.
+// parkerLockTimeoutsKey carries an override for the protection-window lock's
+// TTL and acquire timeout. The production values are tuned for a real cluster
+// -- a 15s wait and a 180s TTL. Production code overrides only the wait, and
+// only through WithParkerLockWait. Tests shorten both through
+// withTestParkerLockTimeouts, since a test that exercises the contended paths
+// would otherwise have to spend them in wall-clock time.
 type parkerLockTimeoutsKey struct{}
 
 type parkerLockTimeouts struct {
@@ -2050,6 +2055,18 @@ type parkerLockTimeouts struct {
 // protection-window lock's TTL and acquire timeout.
 func withTestParkerLockTimeouts(ctx context.Context, ttl, timeout time.Duration) context.Context {
 	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: timeout})
+}
+
+// WithParkerLockWait returns a context whose protection-window lock acquires
+// wait up to d for a live holder instead of parkerProtectionLockTimeout. The
+// TTL is unchanged, so a holder's claim lasts exactly as long as before. A
+// non-positive d leaves ctx as it is.
+func WithParkerLockWait(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	ttl, _ := parkerLockTimeoutsFrom(ctx)
+	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: d})
 }
 
 // parkerLockTimeoutsFrom returns the override installed by
@@ -2107,7 +2124,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 		}
 		return fn(ctx)
 	}
-	owner := fmt.Sprintf("%s/%d/%d", purpose, os.Getpid(), parkerVMID)
+	owner := ProcessLockOwner(fmt.Sprintf("%s/%d", purpose, parkerVMID))
 	ttl, timeout := parkerLockTimeoutsFrom(ctx)
 	handle, lockErr := AcquireClusterLock(ctx, pools,
 		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout)

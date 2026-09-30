@@ -30,6 +30,9 @@ func clusterLockOwner(key string, vmid int) string {
 	return fmt.Sprintf("%d-%d-%s-%d", os.Getpid(), aaOwnerSeq.Add(1), key, vmid)
 }
 
+// antiAffinityLockPrefix prefixes an instance group's anti-affinity lock name.
+const antiAffinityLockPrefix = "aa-"
+
 // haRuleNamePrefix namespaces every CPI-managed HA anti-affinity rule so a
 // cluster-wide scan can find and clean them by vmid without knowing the group.
 const haRuleNamePrefix = "bosh-aa-"
@@ -152,7 +155,7 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 	timeout := time.Duration(deps.Config.ClusterLockTimeoutSecValue()) * time.Second
 	ttl := 2 * timeout
 	owner := clusterLockOwner(groupKey, vmid)
-	return pve.AcquireClusterLock(ctx, poolSvc, "aa-"+groupKey, owner, ttl, timeout)
+	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+groupKey, owner, ttl, timeout)
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under

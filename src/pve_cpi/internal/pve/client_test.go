@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 //nolint:modernize // helper supports non-zero bool values; new(bool) only gives false
@@ -444,5 +446,35 @@ func TestPoolService_GetPoolComment_OtherErrorPropagates(t *testing.T) {
 	}
 	if found {
 		t.Fatal("found=true, want false when an error propagated")
+	}
+}
+
+// TestPoolService_ReadPoolComment_ReturnsTheRawVerdict confirms the raw read
+// hands back PVE's missing-pool answer untouched, so a caller that must prove
+// absence can classify the exact verdict instead of a folded found=false.
+func TestPoolService_ReadPoolComment_ReturnsTheRawVerdict(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api2/json/pools/missing-pool", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"data":null,"message":"pool 'missing-pool' does not exist\n"}`))
+	})
+	mux.HandleFunc("/api2/json/pools/held-pool", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"comment":"owner=a exp=1","members":[]}}`))
+	})
+	reader, ok := newPoolStubClient(t, mux).Pools().(pve.RawPoolCommentReader)
+	if !ok {
+		t.Fatal("the SDK pool service does not offer a raw read")
+	}
+	_, err := reader.ReadPoolComment(context.Background(), "missing-pool")
+	var apiErr *sdkerrors.APIError
+	if !errors.As(err, &apiErr) || apiErr.HTTPCode != http.StatusInternalServerError || apiErr.Message != "pool 'missing-pool' does not exist\n" {
+		t.Fatalf("raw read folded or rewrote the verdict: %v", err)
+	}
+	comment, err := reader.ReadPoolComment(context.Background(), "held-pool")
+	if err != nil || comment != "owner=a exp=1" {
+		t.Fatalf("raw read of a present pool = %q, %v", comment, err)
 	}
 }
