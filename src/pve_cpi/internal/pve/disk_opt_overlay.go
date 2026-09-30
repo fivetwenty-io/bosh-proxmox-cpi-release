@@ -31,9 +31,9 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
-// diskOptOverlaysSentinelKey is the top-level sentinel JSON key holding the
+// DiskOptOverlaysSentinelKey is the top-level sentinel JSON key holding the
 // per-disk drive-option override maps on a workload VM's description.
-const diskOptOverlaysSentinelKey = "bosh_disk_opt_overlays"
+const DiskOptOverlaysSentinelKey = "bosh_disk_opt_overlays"
 
 // parseDiskOptOverlaysSentinel extracts the nonBOSH prefix and the current
 // bosh_disk_opt_overlays map from a VM description. Corrupted JSON for our
@@ -43,9 +43,9 @@ func parseDiskOptOverlaysSentinel(desc string) (nonBOSH string, overlays map[str
 	nonBOSH, raw = ParseSentinel(desc)
 	overlays = make(map[string]map[string]string)
 
-	if rawOverlays, ok := raw[diskOptOverlaysSentinelKey]; ok {
+	if rawOverlays, ok := raw[DiskOptOverlaysSentinelKey]; ok {
 		_ = json.Unmarshal(rawOverlays, &overlays) // best-effort; corruption → empty map
-		delete(raw, diskOptOverlaysSentinelKey)
+		delete(raw, DiskOptOverlaysSentinelKey)
 	}
 	return
 }
@@ -67,7 +67,7 @@ func renderDiskOptOverlaysSentinel(nonBOSH string, overlays map[string]map[strin
 		if err != nil {
 			return "", err
 		}
-		merged[diskOptOverlaysSentinelKey] = json.RawMessage(b)
+		merged[DiskOptOverlaysSentinelKey] = json.RawMessage(b)
 	}
 
 	return RenderSentinel(nonBOSH, merged)
