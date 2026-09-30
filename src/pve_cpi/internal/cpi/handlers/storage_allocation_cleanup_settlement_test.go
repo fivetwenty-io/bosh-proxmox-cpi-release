@@ -242,10 +242,98 @@ func TestPersistedCleanupEvidenceDoesNotAuthorizeOrdinaryLifecycle(t *testing.T)
 		t.Fatal(err)
 	}
 	ownership := aj.Verification{EvidenceID: proofID, EvidenceJSON: proofBody, Complete: true, OwnershipVerified: true}
-	if _, err := beginStorageLifecycleMode(h, "resize_disk", ownership, false); err == nil {
+	_, err = beginStorageLifecycleMode(h, "resize_disk", ownership, false)
+	if err == nil {
 		t.Fatal("persisted cleanup proof authorized ordinary lifecycle")
+	}
+	if want := "resize_disk has unresolved mutation evidence; step pending-config (vm.Nodes.UpdateQemuConfig) is planned"; err.Error() != want {
+		t.Fatalf("refusal = %q, want %q", err, want)
 	}
 	if !reflect.DeepEqual(before, h.Record()) {
 		t.Fatal("rejected lifecycle changed journal")
+	}
+}
+
+// TestStorageLifecycleRefusalNamesItsOperation pins that an ordinary disk
+// operation refused for an unsettled step names itself rather than cleanup,
+// while explicit cleanup, which drives delete_disk underneath, keeps naming
+// cleanup, the command the operator ran.
+func TestStorageLifecycleRefusalNamesItsOperation(t *testing.T) {
+	proofID, proofBody, err := aj.VerificationEvidence(map[string]string{"ownership": "fresh independent test proof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership := aj.Verification{EvidenceID: proofID, EvidenceJSON: proofBody, Complete: true, OwnershipVerified: true}
+	const step = "step pending-config (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned"
+	cases := []struct {
+		name  string
+		begin func(*aj.Handle) (*storageLifecycle, error)
+		want  string
+	}{
+		{"attach_disk", func(h *aj.Handle) (*storageLifecycle, error) {
+			return beginStorageLifecycle(h, "attach_disk", ownership)
+		},
+			"attach_disk has unresolved mutation evidence; " + step},
+		{"detach_disk", func(h *aj.Handle) (*storageLifecycle, error) {
+			return beginStorageLifecycle(h, "detach_disk", ownership)
+		},
+			"detach_disk has unresolved mutation evidence; " + step},
+		{"delete_disk", func(h *aj.Handle) (*storageLifecycle, error) {
+			return beginStorageLifecycle(h, "delete_disk", ownership)
+		},
+			"delete_disk has unresolved mutation evidence; " + step},
+		{"cleanup", func(h *aj.Handle) (*storageLifecycle, error) {
+			return beginStorageLifecycleCleanup(t.Context(), h, "delete_disk", ownership)
+		}, "cleanup has unresolved mutation evidence; " + step},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, j, _, record := deleteManagedFixture(t)
+			appendCleanupPending(t, j, record.ID, "lifecycle_attach_disk_Nodes_UpdateQemuConfig")
+			h, err := j.Acquire(t.Context(), record.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := h.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			before := h.Record()
+			_, err = tc.begin(h)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("refusal = %v, want %q", err, tc.want)
+			}
+			if !reflect.DeepEqual(before, h.Record()) {
+				t.Fatal("refused lifecycle changed journal")
+			}
+		})
+	}
+}
+
+// TestStorageOperationSettledRejectsEmptyCaller pins that admission refuses
+// before it could print a refusal with no operation in front of it.
+func TestStorageOperationSettledRejectsEmptyCaller(t *testing.T) {
+	_, j, _, record := deleteManagedFixture(t)
+	h, err := j.Acquire(t.Context(), record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := h.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	proofID, proofBody, err := aj.VerificationEvidence(map[string]string{"ownership": "fresh independent test proof"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership := aj.Verification{EvidenceID: proofID, EvidenceJSON: proofBody, Complete: true, OwnershipVerified: true}
+	before := h.Record()
+	if _, err := beginStorageLifecycleContext(t.Context(), h, "delete_disk", " ", ownership, false); err == nil {
+		t.Fatal("empty caller admitted")
+	}
+	if !reflect.DeepEqual(before, h.Record()) {
+		t.Fatal("refused lifecycle changed journal")
 	}
 }

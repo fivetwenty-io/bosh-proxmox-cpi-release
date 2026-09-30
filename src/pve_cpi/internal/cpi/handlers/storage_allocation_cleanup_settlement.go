@@ -149,11 +149,19 @@ func cleanupConfigStep(step aj.Step, record aj.Record) bool {
 	}
 }
 
-// storageCleanupSettled permits only the exact pending configuration, ISO upload,
-// recorded deletion, or sole shared-pool intent
-// independently admitted by this explicit cleanup invocation. New failed cleanup
-// steps, ordinary lifecycle calls and allocation replay retain strict refusal.
+// storageCleanupSettled is storageOperationSettled for explicit cleanup and
+// delete_vm, whose refusals name cleanup.
 func storageCleanupSettled(ctx context.Context, record aj.Record) error {
+	return storageOperationSettled(ctx, "cleanup", record)
+}
+
+// storageOperationSettled permits only the exact pending configuration, ISO
+// upload, recorded deletion, or sole shared-pool intent independently admitted
+// by this explicit cleanup invocation. New failed cleanup steps, ordinary
+// lifecycle calls and allocation replay retain strict refusal. operation names
+// the call in the refusal, such as attach_disk for an ordinary lifecycle call,
+// so the Director's error says which call found the unsettled step.
+func storageOperationSettled(ctx context.Context, operation string, record aj.Record) error {
 	proof, _ := ctx.Value(cleanupSettlementKey{}).(*cleanupSettlement)
 	for i := range record.Steps {
 		step := &record.Steps[i]
@@ -161,11 +169,11 @@ func storageCleanupSettled(ctx context.Context, record aj.Record) error {
 			continue
 		}
 		if proof == nil || proof.AllocationID != record.ID || proof.Attempt != record.ActiveAttempt() {
-			return storageRefusal("cleanup has unresolved mutation evidence; " + unsettledStepName(*step))
+			return storageRefusal(operation + " has unresolved mutation evidence; " + unsettledStepName(*step))
 		}
 		hash, err := aj.Fingerprint(*step)
 		if err != nil || proof.Steps[step.ID] != hash {
-			return storageRefusal("cleanup has new or changed unresolved mutation evidence")
+			return storageRefusal(operation + " has new or changed unresolved mutation evidence")
 		}
 	}
 	return nil

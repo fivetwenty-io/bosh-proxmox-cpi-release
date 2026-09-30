@@ -22,13 +22,20 @@ func beginStorageLifecycle(handle *aj.Handle, operation string, ownership aj.Ver
 }
 
 func beginStorageLifecycleMode(handle *aj.Handle, operation string, ownership aj.Verification, requireReturned bool) (*storageLifecycle, error) {
-	return beginStorageLifecycleContext(context.Background(), handle, operation, ownership, requireReturned)
+	return beginStorageLifecycleContext(context.Background(), handle, operation, operation, ownership, requireReturned)
 }
+
+// beginStorageLifecycleCleanup admits the lifecycle operation that explicit
+// cleanup drives. Its refusals name cleanup, the command the operator ran,
+// rather than the operation cleanup runs underneath.
 func beginStorageLifecycleCleanup(ctx context.Context, handle *aj.Handle, operation string, ownership aj.Verification) (*storageLifecycle, error) {
-	return beginStorageLifecycleContext(ctx, handle, operation, ownership, false)
+	return beginStorageLifecycleContext(ctx, handle, operation, "cleanup", ownership, false)
 }
-func beginStorageLifecycleContext(ctx context.Context, handle *aj.Handle, operation string, ownership aj.Verification, requireReturned bool) (*storageLifecycle, error) {
-	if handle == nil || strings.TrimSpace(operation) == "" {
+
+// beginStorageLifecycleContext admits operation against the record. caller
+// names the call in a refusal for unsettled steps.
+func beginStorageLifecycleContext(ctx context.Context, handle *aj.Handle, operation, caller string, ownership aj.Verification, requireReturned bool) (*storageLifecycle, error) {
+	if handle == nil || strings.TrimSpace(operation) == "" || strings.TrimSpace(caller) == "" {
 		return nil, fmt.Errorf("lifecycle requires allocation ownership and operation")
 	}
 	record := handle.Record()
@@ -38,7 +45,7 @@ func beginStorageLifecycleContext(ctx context.Context, handle *aj.Handle, operat
 	if err := storageLifecycleEvidence(record, ownership, false); err != nil {
 		return nil, err
 	}
-	if err := storageCleanupSettled(ctx, record); err != nil {
+	if err := storageOperationSettled(ctx, caller, record); err != nil {
 		return nil, err
 	}
 	session := &storageLifecycle{handle: handle, operation: operation, adopted: record.State == aj.Adopted}

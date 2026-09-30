@@ -107,7 +107,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 		// where its record says, with no transfer in flight.
 		returned := record.State == aj.ReadyToReturn || record.Kind == allocationKindDisk && record.State == aj.ReconciliationRequired
 		if !returned || record.CID == "" || record.CID != decision.ExpectedCID {
-			return result, storageRefusal("adoption requires the exact ready-to-return CID")
+			return result, storageRefusal("adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID")
 		}
 		ownership, err = observeAllocationDecisionOwnership(ctx, deps, journal, record)
 		if err != nil {

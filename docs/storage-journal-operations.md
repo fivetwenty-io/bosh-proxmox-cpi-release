@@ -87,7 +87,7 @@ The command retains the reconstruction evidence and a cleaned tombstone for that
 
 ## Record adoption or completed cleanup
 
-Use the exact CID from the audit when a completed allocation needs explicit adoption. The command checks current ownership and settled mutation evidence before recording the decision. It does not insert the CID into the Director database. It accepts a VM in `ready_to_return`, and a disk in `ready_to_return` or in `reconciliation_required` with its CID, which is the shape a disk operation leaves when it fails after the Director already holds the disk. For that disk, the command also observes that the volume sits where its record says and that no transfer is in flight.
+Use the exact CID from the audit when a completed allocation needs explicit adoption. The command checks current ownership and settled mutation evidence before recording the decision. It does not insert the CID into the Director database. It accepts a VM in `ready_to_return`, and a disk in `ready_to_return` or in `reconciliation_required` with its CID, which is the shape a disk operation leaves when it fails after the Director already holds the disk. Any other state, or a CID that differs from the record's, refuses with `adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID`. For every disk it adopts, in either state, the command also observes that the volume sits where its record says and that no transfer is in flight.
 
 ```sh
 cpi storage-journal adopt \
@@ -112,13 +112,13 @@ A step is settled when it is `observed`, or when it belongs to an earlier attemp
 
 A planned lock step is the one exception, and the command settles it first. A lock step is one whose kind is `lifecycle_<operation>_Pool_CreatePool`, `lifecycle_<operation>_Pool_DeletePool`, `park_Pool_CreatePool`, or `park_Pool_DeletePool`. It records the create or delete of a `bosh-lock-` pool, which is an empty lock marker and never holds anything the allocation owns. The command reads the lock pool of every VM that the record's steps name, `bosh-lock-vm-<vmid>`. When each read answers exactly, either with the pool and whatever claim it holds or with PVE's own `pool '<id>' does not exist`, the command marks the planned lock steps observed. That writes only the journal. A claim that the failed request left behind stays in place, and the next request that wants the lock takes it over once the claim's TTL passes. When a read fails, or answers with anything else, the step stays planned and the refusal says which lock pool could not be read. A VM record's `vm.Pool.CreatePool` steps are not settled this way, because the same kind also creates deployment pools and the step does not record which pool it meant.
 
-The next `attach_disk`, `detach_disk`, or `delete_disk` call for the disk settles planned lock steps the same way before it readmits the record, and so does `cleanup`. The Director does not retry those calls by itself, so that next call is usually the one a rerun deploy makes.
+The next `attach_disk`, `detach_disk`, or `delete_disk` call for the disk settles planned lock steps the same way before it readmits the record, and so does `cleanup`. The Director retries only `create_vm` within a task, so the next `attach_disk` or `detach_disk` is the one a rerun deploy makes. A deploy never deletes a persistent disk, because it orphans the disk instead, so `delete_disk` comes only from orphan cleanup. The Director's scheduled orphan cleanup retries a failed `delete_disk` every 30 minutes on its own once the orphan is older than `director.disks.max_orphaned_age_in_days`, so an orphan that the old lock bug stranded is settled and deleted without any action from us.
 
 Cleanup finalization does not delete resources. It requires settled mutations and a complete audit proving that the allocation's resources and provenance are absent. A remaining root volume, ISO, renamed disk, or uncertain task prevents finalization. Keep tombstones and verification history; age does not authorize purging them.
 
 ## Delete an allocation through its retained authority
 
-Use `cleanup` when you intend to remove an allocation's resources. This command performs physical deletion, so select the full allocation UUID from the audit and record the reason in a nonsecret decision reference.
+We use `cleanup` when we intend to remove an allocation's resources. This command performs physical deletion, so we select the full allocation UUID from the audit and record the reason in a nonsecret decision reference.
 
 ```sh
 cpi storage-journal cleanup \

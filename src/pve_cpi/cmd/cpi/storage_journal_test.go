@@ -524,7 +524,7 @@ func TestStorageJournalDecisionRefusalNamesItsReason(t *testing.T) {
 	f := newStorageJournalFixture(t)
 	_, id := journalFixtureVM(t, f)
 	code, out := f.run("adopt", "--allocation-id", id, "--decision-id", "audit-ticket", "--expected-cid", "999")
-	if code != 1 || !strings.Contains(out, "allocation decision refused (identity_or_audit_evidence: adoption requires the exact ready-to-return CID); inspect settled outcome, identity and audit evidence\n") {
+	if code != 1 || !strings.Contains(out, "allocation decision refused (identity_or_audit_evidence: adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID); inspect settled outcome, identity and audit evidence\n") {
 		t.Fatalf("adopt refusal = %d %q, want the refusal's reason", code, out)
 	}
 }
