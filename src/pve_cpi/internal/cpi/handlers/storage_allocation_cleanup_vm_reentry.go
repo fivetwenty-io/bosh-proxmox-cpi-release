@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -59,11 +58,13 @@ func cleanupPendingVMDeletion(step aj.Step, record aj.Record) bool {
 }
 
 // cleanupVMDeletionAdmittedMove reports whether the latest delete admission
-// of record accepted a move of VM vmid to node. The admission audit ran while
-// the record was still returned, the only state in which the audit accepts a
-// VM move, and it retained the moves it accepted in its evidence. A crashed
-// delete leaves the record in reconciliation, where a fresh audit can no
-// longer accept that move, so re-entry reads the admission's verdict instead.
+// of record that verified ownership accepted a move of VM vmid to node. An
+// admission that found the VM absent is skipped, and it plans no stop or
+// destroy that an older move could link. The first admission audit ran while
+// the record was still returned, and it retained the moves it accepted in its
+// evidence. A delete in flight, or one that failed or crashed, leaves the
+// record in planned, observed, or reconciliation, so crash re-entry and the
+// audit's VM move rule both read the admission's verdict instead.
 func cleanupVMDeletionAdmittedMove(record aj.Record, vmid int, node string) bool {
 	var moves []StorageAllocationMove
 	for _, verification := range record.Verifications {
@@ -104,11 +105,11 @@ func observeCleanupVMDeletion(ctx context.Context, deps Deps, journal *aj.Journa
 		return err
 	}
 	if observed.Node != step.Target.Node || observed.VMID != step.Target.VMID {
-		return fmt.Errorf("pending stop lacks exact VM ownership")
+		return storageRefusal("pending stop lacks exact VM ownership")
 	}
 	status, err := deps.PVE.QEMU().Status(ctx, observed.Node, observed.VMID)
 	if err != nil || status["status"] != "stopped" {
-		return fmt.Errorf("pending stop completion is not independently observed")
+		return storageRefusal("pending stop completion is not independently observed")
 	}
 	return nil
 }

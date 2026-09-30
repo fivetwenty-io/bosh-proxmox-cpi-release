@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -52,13 +51,13 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 		}
 		if cleanupPendingDiskDelete(*step, record) || cleanupSubmittedVMISODelete(*step, record) || cleanupPendingVMEphemeralDelete(*step, record) {
 			if proof.CompletedDeletion != nil {
-				return ctx, nil, fmt.Errorf("cleanup requires a unique completed deletion")
+				return ctx, nil, storageRefusal("cleanup requires a unique completed deletion")
 			}
 			target := step.Target
 			proof.CompletedDeletion = &target
 		} else if target, ok := cleanupSubmittedISOUpload(*step, record); ok {
 			if proof.CompletedUpload != nil {
-				return ctx, nil, fmt.Errorf("cleanup requires a unique completed ISO upload")
+				return ctx, nil, storageRefusal("cleanup requires a unique completed ISO upload")
 			}
 			proof.CompletedUpload = &target
 		} else if pool, ok := cleanupOnlySharedPool(record); ok {
@@ -71,14 +70,14 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 				proof.CompletedVMDeletions = append(proof.CompletedVMDeletions, *step)
 			case cleanupPendingVMAllocation(*step, record):
 				if proof.PendingVMAllocation != nil {
-					return ctx, nil, fmt.Errorf("cleanup requires a unique pending VM allocation")
+					return ctx, nil, storageRefusal("cleanup requires a unique pending VM allocation")
 				}
 				pending := *step
 				proof.PendingVMAllocation = &pending
 			case cleanupUnknownDiskAllocation(*step, record):
 				proof.UnknownDiskAllocation = true
 			case !cleanupConfigStep(*step, record):
-				return ctx, nil, fmt.Errorf("cleanup refuses unresolved allocation or asynchronous mutation")
+				return ctx, nil, storageRefusal("cleanup refuses unresolved allocation or asynchronous mutation")
 			}
 		}
 		hash, err := aj.Fingerprint(*original)
@@ -91,7 +90,7 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 		return ctx, nil, nil
 	}
 	if !decision.PreviousWriterFenced || !decision.RemoteTasksSettled || strings.TrimSpace(decision.AuthorityID) == "" {
-		return ctx, nil, fmt.Errorf("pending mutation cleanup requires explicit writer fencing and independently settled remote tasks")
+		return ctx, nil, storageRefusal("pending mutation cleanup requires explicit writer fencing and independently settled remote tasks")
 	}
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
@@ -162,11 +161,11 @@ func storageCleanupSettled(ctx context.Context, record aj.Record) error {
 			continue
 		}
 		if proof == nil || proof.AllocationID != record.ID || proof.Attempt != record.ActiveAttempt() {
-			return fmt.Errorf("cleanup has unresolved mutation evidence")
+			return storageRefusal("cleanup has unresolved mutation evidence")
 		}
 		hash, err := aj.Fingerprint(*step)
 		if err != nil || proof.Steps[step.ID] != hash {
-			return fmt.Errorf("cleanup has new or changed unresolved mutation evidence")
+			return storageRefusal("cleanup has new or changed unresolved mutation evidence")
 		}
 	}
 	return nil
@@ -224,7 +223,7 @@ func storageCleanupPendingOwnership(ctx context.Context, deps Deps, journal *aj.
 		return ownership, nil
 	}
 	if !ownership.Complete || !ownership.OwnershipVerified {
-		return aj.Verification{}, fmt.Errorf("pending configuration cleanup requires independently observed owned artifacts")
+		return aj.Verification{}, storageRefusal("pending configuration cleanup requires independently observed owned artifacts")
 	}
 	return ownership, nil
 }
@@ -276,11 +275,11 @@ func cleanupPendingDiskDelete(step aj.Step, record aj.Record) bool {
 func observeCleanupDeletedTarget(ctx context.Context, deps Deps, target aj.Target) error {
 	definition, err := managedDiskActualDefinition(ctx, deps, target.Storage)
 	if err != nil || definition.BackingKey() != target.Backing {
-		return fmt.Errorf("completed deletion target backing cannot be verified")
+		return storageRefusal("completed deletion target backing cannot be verified")
 	}
 	present, err := managedVolumePresent(ctx, deps, target.Node, target.IntendedVolume)
 	if err != nil || present {
-		return fmt.Errorf("completed deletion target absence cannot be verified")
+		return storageRefusal("completed deletion target absence cannot be verified")
 	}
 	return nil
 }
@@ -365,7 +364,7 @@ func cleanupUnknownDiskAllocation(step aj.Step, record aj.Record) bool {
 
 func observeCompletedCleanupDeletion(ctx context.Context, deps Deps, record aj.Record, settlement *cleanupSettlement, ownership aj.Verification) (aj.Verification, error) {
 	if !ownership.Complete || !ownership.AbsenceVerified || !ownership.ArtifactDispositionVerified {
-		return aj.Verification{}, fmt.Errorf("completed deletion requires complete historical artifact absence")
+		return aj.Verification{}, storageRefusal("completed deletion requires complete historical artifact absence")
 	}
 	if record.Kind == "vm" {
 		plan, err := activeStorageAllocationPlan(record)
@@ -374,7 +373,7 @@ func observeCompletedCleanupDeletion(ctx context.Context, deps Deps, record aj.R
 		}
 		definition, ok := plan.Definitions[settlement.CompletedDeletion.Storage]
 		if !ok {
-			return aj.Verification{}, fmt.Errorf("completed VM deletion lacks frozen definition")
+			return aj.Verification{}, storageRefusal("completed VM deletion lacks frozen definition")
 		}
 		if err := verifyManagedVMCleanupDefinition(ctx, deps, *settlement.CompletedDeletion, definition); err != nil {
 			return aj.Verification{}, err

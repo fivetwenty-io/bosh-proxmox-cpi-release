@@ -518,6 +518,17 @@ func TestStorageJournalDecisionsRequireReferencesAndClusterContinuity(t *testing
 	}
 }
 
+// TestStorageJournalDecisionRefusalNamesItsReason pins that a refused decision
+// prints the CPI's own reason beside the class, not the bare class.
+func TestStorageJournalDecisionRefusalNamesItsReason(t *testing.T) {
+	f := newStorageJournalFixture(t)
+	_, id := journalFixtureVM(t, f)
+	code, out := f.run("adopt", "--allocation-id", id, "--decision-id", "audit-ticket", "--expected-cid", "999")
+	if code != 1 || !strings.Contains(out, "allocation decision refused (identity_or_audit_evidence: adoption requires the exact ready-to-return CID); inspect settled outcome, identity and audit evidence\n") {
+		t.Fatalf("adopt refusal = %d %q, want the refusal's reason", code, out)
+	}
+}
+
 func TestStorageJournalRequiresSettledRemoteTasksBeforeInitializationOrIndexRepair(t *testing.T) {
 	for _, action := range []string{"initialize", "recover-index"} {
 		var out, stderr bytes.Buffer

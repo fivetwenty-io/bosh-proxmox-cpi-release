@@ -36,9 +36,11 @@ func TestAllocationCleanupDiskUsesLifecycleAuthorityWithoutLockReentry(t *testin
 }
 
 func TestAllocationCleanupRefusalsPreserveJournalAndResources(t *testing.T) {
-	for _, mode := range []string{"wrong namespace", "unknown task", "duplicate holder", "secret read error", "attached disk"} {
+	for _, mode := range []string{"wrong namespace", "unknown task", "duplicate holder", "malformed provenance", "secret read error", "attached disk"} {
 		t.Run(mode, func(t *testing.T) {
 			deps, client, journal, id, _ := lifecycleFlowFixture(t)
+			// lead is the admission audit's refusal, for the modes that reach it.
+			lead := ""
 			switch mode {
 			case "wrong namespace":
 				deps.Config.StoragePlacementNamespace = "foreign"
@@ -63,6 +65,10 @@ func TestAllocationCleanupRefusalsPreserveJournalAndResources(t *testing.T) {
 				}
 			case "duplicate holder":
 				client.state.configs[778] = map[string]any{"scsi1": client.state.configs[777]["scsi1"]}
+				lead = "allocation cleanup refused: 1 audit conflict; disk allocation " + id + " has 2 holders"
+			case "malformed provenance":
+				client.state.configs[456] = map[string]any{"description": "<!--BOSH:{broken-provenance-->"}
+				lead = "allocation cleanup refused: 1 audit issue; VM 456 has malformed disk provenance on n1"
 			case "secret read error":
 				client.state.readErr = errors.New("backend password=cleanup-secret")
 			}
@@ -70,6 +76,9 @@ func TestAllocationCleanupRefusalsPreserveJournalAndResources(t *testing.T) {
 			_, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "cleanup", AllocationID: id, DecisionID: "refused"})
 			if err == nil {
 				t.Fatal("unsafe cleanup accepted")
+			}
+			if message := directorMessage(err); !strings.HasPrefix(message, lead) {
+				t.Fatalf("refusal = %q, want prefix %q", message, lead)
 			}
 			if strings.Contains(err.Error(), "cleanup-secret") {
 				t.Fatal("raw source error leaked")

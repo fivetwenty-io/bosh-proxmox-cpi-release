@@ -202,8 +202,11 @@ func healMovedDiskProvenance(ctx context.Context, deps Deps, node string, vmid i
 		return nil
 	}
 	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
-	if err != nil || cfg == nil {
-		return cpierrors.Cloud("managed disk holder provenance cannot be read before transfer; audit required")
+	if err != nil {
+		return cpierrors.Cloud("managed disk holder provenance cannot be read before transfer: VM %d on %s: %s; audit required", vmid, node, pve.DescribeAuditError(err))
+	}
+	if cfg == nil {
+		return cpierrors.Cloud("managed disk holder provenance cannot be read before transfer: VM %d on %s returned no configuration; audit required", vmid, node)
 	}
 	entries, err := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(cfg))
 	if err != nil {
@@ -231,8 +234,8 @@ func healMovedDiskProvenance(ctx context.Context, deps Deps, node string, vmid i
 	if err != nil {
 		return err
 	}
-	if !audit.observedMove(current.AllocationID, node) {
-		return cpierrors.Cloud("detach refused before transfer: disk allocation %s (volume %s) held by VM %d on %s, provenance names %s, and the allocation audit accepted no move on shared storage; the disk stays attached", current.AllocationID, current.Volid, vmid, node, storageAuditField(stored.Node))
+	if !audit.observedMove(allocationKindDisk, current.AllocationID, vmid, node) {
+		return cpierrors.Cloud("detach refused before transfer: disk allocation %s (volume %s) held by VM %d on %s, provenance names %s, and the allocation audit accepted no move on shared storage (%s); the disk stays attached", current.AllocationID, current.Volid, vmid, node, storageAuditField(stored.Node), storageAuditMoveRefusal(audit, current.AllocationID))
 	}
 	if err := pve.WriteDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), current); err != nil {
 		return cpierrors.Cloud("managed disk holder provenance could not be moved to %s before transfer; audit required", node)

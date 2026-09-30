@@ -23,8 +23,11 @@ func TestRenderStorageAuditCommand(t *testing.T) {
 		name, executable, configPath, owner, euid, want string
 	}{
 		{"journal owned by another user", executable, configPath, "1000", "0", "sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json"},
-		{"journal owned by this user", executable, configPath, "1000", "1000", "/var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json"},
+		{"BOSH job running as the journal owner", executable, configPath, "1000", "1000", "sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json"},
+		{"create-env CPI running as the journal owner", "/home/op/.bosh/installations/abc/packages/pve_cpi/bin/cpi", "/home/op/.bosh/installations/abc/jobs/pve_cpi/config/cpi.json", "1000", "1000", "/home/op/.bosh/installations/abc/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /home/op/.bosh/installations/abc/jobs/pve_cpi/config/cpi.json"},
+		{"create-env CPI with a journal owned by another user", "/home/op/cpi", "/home/op/cpi.json", "1000", "0", "sudo -u vcap /home/op/cpi storage-journal audit --summary --config /home/op/cpi.json"},
 		{"owner without an account", executable, configPath, "4242", "0", ""},
+		{"BOSH job whose owner has no account", executable, configPath, "4242", "4242", ""},
 		{"paths that need quoting", "/home/op/bosh cpi/bin/cpi", "/home/op/it's/cpi.json", "1000", "1000", `'/home/op/bosh cpi/bin/cpi' storage-journal audit --summary --config '/home/op/it'\''s/cpi.json'`},
 		{"no executable", "", configPath, "1000", "1000", ""},
 		{"no config", executable, "", "1000", "1000", ""},

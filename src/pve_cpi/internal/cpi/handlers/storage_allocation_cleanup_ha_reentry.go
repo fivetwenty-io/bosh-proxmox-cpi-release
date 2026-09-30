@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"strings"
 )
@@ -47,7 +46,7 @@ func cleanupPendingHAPurge(step aj.Step, record aj.Record) bool {
 func observeCleanupHAPurge(ctx context.Context, deps Deps, record aj.Record, step aj.Step) error {
 	present, err := managedVMHAResourcePresent(ctx, deps, haResourceSid(step.Target.VMID))
 	if err != nil || present {
-		return fmt.Errorf("unknown HA purge has not been independently observed")
+		return storageRefusal("unknown HA purge has not been independently observed")
 	}
 	before := map[string]map[string]any{}
 	for index := range record.Steps {
@@ -60,15 +59,15 @@ func observeCleanupHAPurge(ctx context.Context, deps Deps, record aj.Record, ste
 			candidate.State = aj.Planned
 		}
 		if !cleanupPendingHAPurge(candidate, record) {
-			return fmt.Errorf("HA purge rule evidence malformed")
+			return storageRefusal("HA purge rule evidence malformed")
 		}
 		var fields map[string]any
 		if json.Unmarshal(old.Parameters, &fields) != nil {
-			return fmt.Errorf("HA purge rule evidence unreadable")
+			return storageRefusal("HA purge rule evidence unreadable")
 		}
 		name, ok := fields["rule"].(string)
 		if !ok || name == "" || before[name] != nil {
-			return fmt.Errorf("HA purge rule evidence ambiguous")
+			return storageRefusal("HA purge rule evidence ambiguous")
 		}
 		fields["resources"] = fields["original_resources"]
 		before[name] = fields

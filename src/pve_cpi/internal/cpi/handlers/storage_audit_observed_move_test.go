@@ -330,10 +330,10 @@ func TestAllocationAuditAcceptsSharedStorageMoves(t *testing.T) {
 	if len(report.ObservedMoves) != len(want) {
 		t.Fatalf("unexpected moves: %+v", report.ObservedMoves)
 	}
-	if !report.observedMove(vm4626.ID, "pvupvecf102") || !report.observedMove(disk.ID, "pvupvecf102") || !report.observedMove(vm7014.ID, "pvupvecf103") {
+	if !report.observedMove("vm", vm4626.ID, 4626, "pvupvecf102") || !report.observedMove(allocationKindDisk, disk.ID, 4626, "pvupvecf102") || !report.observedMove("vm", vm7014.ID, 7014, "pvupvecf103") {
 		t.Fatal("observedMove missed an accepted move")
 	}
-	if report.observedMove(vm4626.ID, "pvupvecf101") || report.observedMove(vm7014.ID, "pvupvecf102") {
+	if report.observedMove("vm", vm4626.ID, 4626, "pvupvecf101") || report.observedMove("vm", vm7014.ID, 7014, "pvupvecf102") {
 		t.Fatal("observedMove accepted a node the VM is not on")
 	}
 	if err := storageAuditGateError(context.Background(), deps, "create_vm", report, storageAuditGateVMScan|storageAuditGateConflicts); err != nil {
@@ -431,20 +431,20 @@ func TestAllocationAuditMoveRulesRefuseUnsafeMoves(t *testing.T) {
 				if !findingWith(report.Conflicts, vmPrefix, "; not accepted as a move because "+tc.vmReason) {
 					t.Fatalf("VM move not refused with %q:\n%s", tc.vmReason, strings.Join(report.Conflicts, "\n"))
 				}
-				if report.observedMove(f.vm.ID, "pve2") {
+				if report.observedMove("vm", f.vm.ID, 123, "pve2") {
 					t.Fatal("refused VM move still reported as observed")
 				}
-			} else if !report.observedMove(f.vm.ID, "pve2") {
+			} else if !report.observedMove("vm", f.vm.ID, 123, "pve2") {
 				t.Fatalf("VM move refused:\n%s", strings.Join(report.Conflicts, "\n"))
 			}
 			if tc.diskReason != "" {
 				if !findingWith(report.Conflicts, diskConflict, "; not accepted as a move because "+tc.diskReason) {
 					t.Fatalf("disk move not refused with %q:\n%s", tc.diskReason, strings.Join(report.Conflicts, "\n"))
 				}
-				if report.observedMove(f.disk.ID, "pve2") {
+				if report.observedMove(allocationKindDisk, f.disk.ID, 123, "pve2") {
 					t.Fatal("refused disk move still reported as observed")
 				}
-			} else if !tc.noDiskMove && !report.observedMove(f.disk.ID, "pve2") {
+			} else if !tc.noDiskMove && !report.observedMove(allocationKindDisk, f.disk.ID, 123, "pve2") {
 				t.Fatalf("disk move refused:\n%s", strings.Join(report.Conflicts, "\n"))
 			}
 			gate := storageAuditGateError(context.Background(), f.deps, "create_vm", report, storageAuditGateVMScan|storageAuditGateConflicts)
@@ -599,7 +599,7 @@ func TestAllocationAuditMoveRulesNeverWriteTheJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !accepted.observedMove(record.ID, "pve2") || len(accepted.Conflicts) != 0 {
+	if !accepted.observedMove("vm", record.ID, 123, "pve2") || len(accepted.Conflicts) != 0 {
 		t.Fatalf("journal-backed move refused: %v", accepted.Conflicts)
 	}
 	c.nodesRead.volumesByNode["pve2"] = nil
@@ -607,7 +607,7 @@ func TestAllocationAuditMoveRulesNeverWriteTheJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if refused.observedMove(record.ID, "pve2") || len(refused.Conflicts) == 0 {
+	if refused.observedMove("vm", record.ID, 123, "pve2") || len(refused.Conflicts) == 0 {
 		t.Fatal("unlisted move accepted")
 	}
 	after, err := j.List()
@@ -684,3 +684,46 @@ func TestAllocationAuditKeepsVMInventory(t *testing.T) {
 
 // Compile-time guard that the listing fake still satisfies the SDK service.
 var _ ns.Service = (*allocationAuditNodes)(nil)
+
+// TestObservedMoveMatchesKindAndVMID pins that a parker's move of an
+// allocation never stands in for its holder's move, and that a move answers
+// only for the VMID it was accepted for.
+func TestObservedMoveMatchesKindAndVMID(t *testing.T) {
+	report := StorageAllocationAudit{ObservedMoves: []StorageAllocationMove{{AllocationID: "disk-1", Kind: storageMoveKindParker, VMID: 90881, RecordedNodes: []string{"n1"}, ObservedNode: "n2"}}}
+	if !report.observedMove(storageMoveKindParker, "disk-1", 90881, "n2") {
+		t.Fatal("accepted parker move not found")
+	}
+	for _, miss := range []struct {
+		kind, id string
+		vmid     int
+		node     string
+	}{
+		{allocationKindDisk, "disk-1", 90881, "n2"},
+		{allocationKindDisk, "disk-1", 777, "n2"},
+		{storageMoveKindParker, "disk-1", 777, "n2"},
+		{storageMoveKindParker, "disk-1", 90881, "n1"},
+		{storageMoveKindParker, "disk-2", 90881, "n2"},
+	} {
+		if report.observedMove(miss.kind, miss.id, miss.vmid, miss.node) {
+			t.Fatalf("move answered for %+v", miss)
+		}
+	}
+}
+
+// TestStorageAuditMoveRefusalNamesTheReason pins the reason a refused move
+// carries into refusals that consult the audit's verdict.
+func TestStorageAuditMoveRefusalNamesTheReason(t *testing.T) {
+	var report StorageAllocationAudit
+	report.VMScanComplete = true
+	report.addConflict("disk ownership provenance disagrees with actual holder node: disk allocation disk-1 (volume a:1/vm-1-disk-0.raw) held by VM 1 on n2, provenance names n1; not accepted as a move because volume a:1/vm-1-disk-0.raw is node-local", "disk allocation disk-1 on n2, recorded n1; not a move: volume a:1/vm-1-disk-0.raw is node-local")
+	if got := storageAuditMoveRefusal(report, "disk-1"); got != "disk allocation disk-1 on n2, recorded n1; not a move: volume a:1/vm-1-disk-0.raw is node-local" {
+		t.Fatalf("refusal = %q, want the conflict's brief", got)
+	}
+	if got := storageAuditMoveRefusal(report, "disk-2"); got != "no audit finding names the allocation" {
+		t.Fatalf("refusal = %q for an allocation no finding names", got)
+	}
+	report.VMScanComplete = false
+	if got := storageAuditMoveRefusal(report, "disk-2"); got != "the VM scan is incomplete" {
+		t.Fatalf("refusal = %q, want the incomplete VM scan", got)
+	}
+}

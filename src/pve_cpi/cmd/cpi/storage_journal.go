@@ -86,8 +86,10 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, "configuration invalid; check it with the CPI's startup validation")
 		return 1
 	}
+	// This validation's errors are fixed text that names the one missing
+	// requirement, unlike LoadFile's, so the CLI prints it.
 	if err = cfg.ValidateStoragePlacementAllocation(); err != nil {
-		fmt.Fprintln(stderr, "storage journal configuration incomplete: storage-journal commands require storage_placement_namespace and an absolute storage_allocation_journal_dir")
+		fmt.Fprintln(stderr, "storage journal configuration incomplete: "+err.Error())
 		return 1
 	}
 	logger := log.NewNopLogger()

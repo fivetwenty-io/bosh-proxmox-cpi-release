@@ -29,14 +29,14 @@ func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal
 
 func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool) (proof aj.Verification, retErr error) {
 	if handle == nil || journal == nil {
-		return proof, fmt.Errorf("VM cleanup requires held journal authority")
+		return proof, storageRefusal("VM cleanup requires held journal authority")
 	}
 	record := handle.Record()
 	if record.State == aj.VMDeletedRetained {
 		return disposeManagedRetainedVM(ctx, deps, journal, handle)
 	}
 	if record.Kind != "vm" {
-		return proof, fmt.Errorf("VM cleanup requires a VM allocation")
+		return proof, storageRefusal("VM cleanup requires a VM allocation")
 	}
 	if err := storageCleanupSettled(ctx, record); err != nil {
 		return proof, err
@@ -66,7 +66,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 			return proof, e
 		}
 		if location.Found && location.Node != node {
-			return proof, fmt.Errorf("VM cleanup identity lacks exact live provenance")
+			return proof, storageRefusal("VM cleanup identity lacks exact live provenance")
 		}
 	}
 	admission, err := storageAllocationVerification(audit, map[string]any{allocationEvidenceOperationField: managedVMCleanupAdmissionOperation, allocationEvidenceIDField: record.ID})
@@ -108,7 +108,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	}
 	// A VM the audit accepted as moved on shared storage keeps its recorded
 	// steps on the old node; ephemeral retention accepts them on this one.
-	moved := node != "" && audit.observedMove(record.ID, node)
+	moved := node != "" && audit.observedMove("vm", record.ID, vmid, node)
 	retainedTargets, err := deleteManagedVMGuest(ctx, deps, handle, record, node, vmid, owned, retain, moved)
 	if err != nil {
 		return proof, err
@@ -165,7 +165,7 @@ func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node s
 	}
 	if !present {
 		if len(before) != 0 {
-			return fmt.Errorf("HA resource absent while its rule membership remains")
+			return storageRefusal("HA resource absent while its rule membership remains")
 		}
 		return nil
 	}
@@ -177,7 +177,7 @@ func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node s
 		return err
 	}
 	if resource == nil || resource.Sid != sid {
-		return fmt.Errorf("HA resource identity is unreadable or differs from the recorded VM")
+		return storageRefusal("HA resource identity is unreadable or differs from the recorded VM")
 	}
 	parameters, err := aj.MutationParameters(map[string]any{"version": 1, "kind": "ha_resource_purge", "resources": sid})
 	if err != nil {
@@ -197,7 +197,7 @@ func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node s
 	}
 	present, err = managedVMHAResourcePresent(ctx, deps, sid)
 	if err != nil || present {
-		return fmt.Errorf("HA deregistration not observed")
+		return storageRefusal("HA deregistration not observed")
 	}
 	if err := observeManagedVMHAPurge(ctx, deps, vmid, before); err != nil {
 		return err
@@ -245,7 +245,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 			}
 			_, found, e := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
 			if e != nil || found {
-				return true, fmt.Errorf("VM allocation provenance has no returned journal CID; explicit cleanup required")
+				return true, storageRefusal("VM allocation provenance has no returned journal CID; explicit cleanup required")
 			}
 		}
 		return false, nil
@@ -262,7 +262,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 			return true, e
 		}
 		if location.Found {
-			return true, fmt.Errorf("retired VM identity is present; audit required")
+			return true, storageRefusal("retired VM identity is present; audit required")
 		}
 		return true, nil
 	}
@@ -308,7 +308,7 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 	}
 	storage, bare, err := pve.ParseDiskCID(target.IntendedVolume)
 	if err != nil || storage != target.Storage {
-		return false, fmt.Errorf("cleanup target identity is invalid")
+		return false, storageRefusal("cleanup target identity is invalid")
 	}
 	present, err := managedVolumePresent(ctx, deps, target.Node, target.IntendedVolume)
 	if err != nil || !present {
@@ -319,12 +319,12 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 		return false, nil
 	}
 	if err != nil || content == nil || content.Size <= 0 {
-		return false, fmt.Errorf("cleanup volume content is not proven")
+		return false, storageRefusal("cleanup volume content is not proven")
 	}
 	if unattached {
 		guests, skipped, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 		if err != nil || len(skipped) > 0 {
-			return false, fmt.Errorf("cleanup volume reference scan incomplete")
+			return false, storageRefusal("cleanup volume reference scan incomplete")
 		}
 		for _, guest := range guests {
 			cfg, e := deps.PVE.QEMU().Config(ctx, guest.Node, guest.VMID)
@@ -337,7 +337,7 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 			}
 			for _, volume := range volumes {
 				if volume == target.IntendedVolume && (expected.IsShared() || guest.Node == target.Node) {
-					return false, fmt.Errorf("cleanup volume remains referenced by a guest")
+					return false, storageRefusal("cleanup volume remains referenced by a guest")
 				}
 			}
 		}
@@ -358,7 +358,7 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 		}
 	}
 	if retention.VMID <= 0 || len(retention.RetainedArtifacts) == 0 {
-		return proof, fmt.Errorf("retained VM disposition evidence missing")
+		return proof, storageRefusal("retained VM disposition evidence missing")
 	}
 	clusterNodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
@@ -376,7 +376,7 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 		return proof, err
 	}
 	if location.Found {
-		return proof, fmt.Errorf("retired VM identity is present")
+		return proof, storageRefusal("retired VM identity is present")
 	}
 	admission, err := retainedCleanupDecisionAdmission(ctx, deps, record, audit, StorageAllocationDecision{Action: "cleanup", AllocationID: record.ID, DecisionID: "retained artifact cleanup admission"})
 	if err != nil {
@@ -416,7 +416,7 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	}
 	for _, evidence := range audit.Evidence {
 		if evidence.AllocationID == record.ID {
-			return proof, fmt.Errorf("retained cleanup artifacts remain")
+			return proof, storageRefusal("retained cleanup artifacts remain")
 		}
 	}
 	if err := storageAuditGateError(ctx, deps, "retained VM cleanup completion", audit, storageAuditGateAll); err != nil {
@@ -454,7 +454,7 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 					return e
 				}
 				if status["status"] != "stopped" {
-					return fmt.Errorf("VM stop not observed")
+					return storageRefusal("VM stop not observed")
 				}
 				return nil
 			})
@@ -483,7 +483,7 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 				return e
 			}
 			if location.Found {
-				return fmt.Errorf("VM destruction not observed")
+				return storageRefusal("VM destruction not observed")
 			}
 			return nil
 		})
@@ -512,7 +512,7 @@ func deleteManagedVMOrphanVolumes(ctx context.Context, deps Deps, journal *aj.Jo
 			continue
 		}
 		if evidence.VolumeID == "" {
-			return fmt.Errorf("remaining cleanup artifact is not an exact owned volume")
+			return storageRefusal("remaining cleanup artifact is not an exact owned volume")
 		}
 		kept := false
 		for _, target := range retainedTargets {
@@ -524,7 +524,7 @@ func deleteManagedVMOrphanVolumes(ctx context.Context, deps Deps, journal *aj.Jo
 			continue
 		}
 		if !owned[evidence.VolumeID] {
-			return fmt.Errorf("remaining cleanup volume lacks allocation ownership")
+			return storageRefusal("remaining cleanup volume lacks allocation ownership")
 		}
 		storage, _, e := pve.ParseDiskCID(evidence.VolumeID)
 		if e != nil {
@@ -537,7 +537,7 @@ func deleteManagedVMOrphanVolumes(ctx context.Context, deps Deps, journal *aj.Jo
 		}
 		definition, ok := plan.Definitions[storage]
 		if !ok {
-			return fmt.Errorf("cleanup volume lacks frozen backing")
+			return storageRefusal("cleanup volume lacks frozen backing")
 		}
 		target.Backing = definition.BackingKey()
 		key := evidence.Node + "/" + evidence.VolumeID
@@ -576,7 +576,7 @@ func managedVMDisposalIdentity(record aj.Record, audit StorageAllocationAudit) (
 		}
 		if record.Steps[rangeIndex50].Target.VMID > 0 && !storageStepNamesRetentionParker(record, record.Steps[rangeIndex50]) {
 			if vmid != 0 && vmid != record.Steps[rangeIndex50].Target.VMID {
-				return "", 0, nil, fmt.Errorf("VM cleanup targets disagree")
+				return "", 0, nil, storageRefusal("VM cleanup targets disagree")
 			}
 			vmid = record.Steps[rangeIndex50].Target.VMID
 		}
@@ -587,7 +587,7 @@ func managedVMDisposalIdentity(record aj.Record, audit StorageAllocationAudit) (
 	for _, evidence := range audit.Evidence {
 		if evidence.AllocationID == record.ID && evidence.Kind == "vm" && evidence.VolumeID == "" {
 			if node != "" || evidence.VMID != vmid {
-				return "", 0, nil, fmt.Errorf("VM cleanup provenance is ambiguous")
+				return "", 0, nil, storageRefusal("VM cleanup provenance is ambiguous")
 			}
 			node = evidence.Node
 		}
@@ -616,7 +616,7 @@ func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle
 		for rangeIndex159 := range record.Steps {
 			if record.Steps[rangeIndex159].Attempt == record.ActiveAttempt() && strings.HasPrefix(record.Steps[rangeIndex159].Kind, "vm.ephemeral.") && len(record.Steps[rangeIndex159].VolIDs) == 1 {
 				if original != "" {
-					return nil, fmt.Errorf("multiple ephemeral retention bindings")
+					return nil, storageRefusal("multiple ephemeral retention bindings")
 				}
 				original = record.Steps[rangeIndex159].VolIDs[0]
 			}
@@ -631,7 +631,7 @@ func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle
 				return nil, e
 			}
 			if retainedTarget.VMID <= 0 || retainedTarget.Storage == "" || retainedTarget.Backing == "" {
-				return nil, fmt.Errorf("retained ephemeral physical target is not proven")
+				return nil, storageRefusal("retained ephemeral physical target is not proven")
 			}
 			retainedTargets = append(retainedTargets, retainedTarget)
 		}
@@ -651,7 +651,7 @@ func managedVMDispositionProof(ctx context.Context, deps Deps, audit StorageAllo
 			}
 		}
 		if !kept {
-			return proof, fmt.Errorf("VM allocation artifacts remain")
+			return proof, storageRefusal("VM allocation artifacts remain")
 		}
 	}
 	if err := storageAuditGateError(ctx, deps, "VM cleanup completion", audit, storageAuditGateAll); err != nil {
@@ -690,16 +690,16 @@ func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Rec
 		}
 		drive, ok := pve.ConfigStringValue(value)
 		if !ok {
-			return fmt.Errorf("VM destruction device is malformed")
+			return storageRefusal("VM destruction device is malformed")
 		}
 		volume := strings.Split(drive, ",")[0]
 		if strings.Contains(volume, ":") && !owned[volume] {
-			return fmt.Errorf("VM destruction would include an unowned volume")
+			return storageRefusal("VM destruction would include an unowned volume")
 		}
 	}
 	marker, found, err := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
 	if err != nil || !found || marker.Kind != "vm" || marker.Namespace != record.Namespace || marker.AllocationID != record.ID || marker.AgentSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(record.AgentID))) {
-		return fmt.Errorf("VM destruction provenance changed")
+		return storageRefusal("VM destruction provenance changed")
 	}
 	plan, err := activeStorageAllocationPlan(record)
 	if err != nil {
@@ -716,14 +716,14 @@ func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Rec
 		}
 		def, ok := plan.Definitions[storage]
 		if !ok {
-			return fmt.Errorf("VM destruction backing lacks frozen definition")
+			return storageRefusal("VM destruction backing lacks frozen definition")
 		}
 		present, err := managedVMVerifyCleanupVolume(ctx, deps, aj.Target{Node: node, Storage: storage, Backing: def.BackingKey(), IntendedVolume: volume}, def, false)
 		if err != nil {
 			return err
 		}
 		if !present {
-			return fmt.Errorf("VM destruction volume disappeared before submission")
+			return storageRefusal("VM destruction volume disappeared before submission")
 		}
 	}
 	return nil
@@ -741,7 +741,7 @@ func managedVMRecordForCID(records []aj.Record, cid string) (*aj.Record, error) 
 			continue
 		}
 		if selected != nil {
-			return nil, fmt.Errorf("VM CID has multiple live allocation records")
+			return nil, storageRefusal("VM CID has multiple live allocation records")
 		}
 		cloned := records[rangeIndex393]
 		selected = &cloned
@@ -770,27 +770,27 @@ func managedVMRetentionEvidenceMatches(record aj.Record, target aj.Target, evide
 func verifyManagedVMCleanupDefinition(ctx context.Context, deps Deps, target aj.Target, expected pve.StorageInfo) error {
 	response, err := deps.PVE.ClusterStorage().ListStorage(ctx, nil)
 	if err != nil || response == nil || *response == nil {
-		return fmt.Errorf("cleanup storage definition unavailable")
+		return storageRefusal("cleanup storage definition unavailable")
 	}
 	found := false
 	for _, raw := range *response {
 		definition, e := pve.ParseStorageEntry(raw)
 		if e != nil {
-			return fmt.Errorf("cleanup storage definition malformed")
+			return storageRefusal("cleanup storage definition malformed")
 		}
 		if definition.Name != target.Storage {
 			continue
 		}
 		if found {
-			return fmt.Errorf("cleanup storage definition ambiguous")
+			return storageRefusal("cleanup storage definition ambiguous")
 		}
 		found = true
 		if definition.BackingKey() != target.Backing || definition.BackingKey() != expected.BackingKey() || definition.IsShared() != expected.IsShared() || len(definition.Nodes) > 0 && !slices.Contains(definition.Nodes, target.Node) {
-			return fmt.Errorf("cleanup physical backing or shared scope changed")
+			return storageRefusal("cleanup physical backing or shared scope changed")
 		}
 	}
 	if !found {
-		return fmt.Errorf("cleanup storage definition disappeared")
+		return storageRefusal("cleanup storage definition disappeared")
 	}
 	return nil
 }

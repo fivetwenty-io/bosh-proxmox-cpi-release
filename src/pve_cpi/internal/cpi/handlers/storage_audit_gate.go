@@ -82,7 +82,7 @@ func storageAuditGateError(ctx context.Context, deps Deps, operation string, rep
 	}
 	hint := storageAuditGateFallbackHint
 	if deps.StorageAuditCommand != "" {
-		hint = "run '" + deps.StorageAuditCommand + "' for the full report"
+		hint = "run " + storageAuditQuotedCommand(deps.StorageAuditCommand) + " for the full report"
 	}
 	deps.Log(ctx).Error("allocation audit gate refused",
 		log.String("operation", operation),
@@ -96,6 +96,16 @@ func storageAuditGateError(ctx context.Context, deps Deps, operation string, rep
 		log.String("issues", log.ScrubMessage(strings.Join(report.Issues, " | "))),
 		log.String("observed_moves", log.ScrubMessage(strings.Join(storageAuditMoveLines(report.ObservedMoves), " | "))))
 	return cpierrors.WrapAs(&storageAuditGateFailure{summary: log.ScrubMessage(summary), hint: hint}, cpierrors.TypeCloud, operation+" refused")
+}
+
+// storageAuditQuotedCommand sets the rendered command off from the refusal in
+// single quotes, or in double quotes when the command quotes one of its own
+// arguments, so what sits between the quotes can always be pasted as is.
+func storageAuditQuotedCommand(command string) string {
+	if strings.Contains(command, "'") {
+		return `"` + command + `"`
+	}
+	return "'" + command + "'"
 }
 
 // storageAuditMoveLines renders each accepted move as one line.

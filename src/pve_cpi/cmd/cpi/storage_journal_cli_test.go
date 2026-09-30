@@ -90,8 +90,19 @@ func TestStorageJournalConfigFailuresPrintNoValues(t *testing.T) {
 	out.Reset()
 	stderr.Reset()
 	code = runStorageJournal([]string{"audit", "--config", path}, &out, &stderr, runOptions{})
-	if code != 1 || !strings.Contains(stderr.String(), "storage_placement_namespace and an absolute storage_allocation_journal_dir") {
-		t.Fatalf("config without a journal reported as %d %q", code, stderr.String())
+	if code != 1 || stderr.String() != "storage journal configuration incomplete: storage_placement_namespace is required for set-enabled allocation\n" {
+		t.Fatalf("config without a namespace reported as %d %q", code, stderr.String())
+	}
+
+	noJournal := minimalCfg()
+	noJournal.StoragePlacementNamespace = "director"
+	noJournal.StorageAllocationJournalDir = ""
+	path = writeStorageJournalConfig(t, noJournal)
+	out.Reset()
+	stderr.Reset()
+	code = runStorageJournal([]string{"audit", "--config", path}, &out, &stderr, runOptions{})
+	if code != 1 || stderr.String() != "storage journal configuration incomplete: storage_allocation_journal_dir must be an absolute durable directory for set-enabled allocation\n" {
+		t.Fatalf("config without a journal directory reported as %d %q", code, stderr.String())
 	}
 }
 

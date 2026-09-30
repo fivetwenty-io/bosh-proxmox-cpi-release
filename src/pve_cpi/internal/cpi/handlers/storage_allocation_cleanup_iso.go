@@ -41,7 +41,7 @@ func cleanupSubmittedISOUpload(step aj.Step, record aj.Record) (aj.Target, bool)
 
 func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record, target aj.Target, observed *managedVMObservation) error {
 	if observed == nil || observed.Node != target.Node || observed.VMID != target.VMID || !observed.Verification.OwnershipVerified {
-		return fmt.Errorf("uploaded ISO cleanup lacks exact live VM ownership")
+		return storageRefusal("uploaded ISO cleanup lacks exact live VM ownership")
 	}
 	var pending *aj.Step
 	for i := range record.Steps {
@@ -51,12 +51,12 @@ func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record,
 			continue
 		}
 		if candidate != target || pending != nil {
-			return fmt.Errorf("uploaded ISO cleanup target is ambiguous")
+			return storageRefusal("uploaded ISO cleanup target is ambiguous")
 		}
 		pending = &effective
 	}
 	if pending == nil {
-		return fmt.Errorf("uploaded ISO cleanup lacks original submitted intent")
+		return storageRefusal("uploaded ISO cleanup lacks original submitted intent")
 	}
 	plan, err := activeStorageAllocationPlan(record)
 	if err != nil {
@@ -64,7 +64,7 @@ func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record,
 	}
 	definition, ok := plan.Definitions[target.Storage]
 	if !ok {
-		return fmt.Errorf("uploaded ISO cleanup lacks frozen definition")
+		return storageRefusal("uploaded ISO cleanup lacks frozen definition")
 	}
 	if err := verifyManagedVMCleanupDefinition(ctx, deps, target, definition); err != nil {
 		return err
@@ -78,7 +78,7 @@ func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record,
 	// proof. A remote copy can finish after the second in which its worker began.
 	proof, _ := ctx.Value(cleanupSettlementKey{}).(*cleanupSettlement)
 	if proof == nil || !proof.TaskObservation.CorroboratesUploadTimestamp(pending.UPID, content.CTime) {
-		return fmt.Errorf("uploaded ISO timestamp does not corroborate recorded task")
+		return storageRefusal("uploaded ISO timestamp does not corroborate recorded task")
 	}
 	_, bare, err := pve.ParseDiskCID(target.IntendedVolume)
 	if err != nil {
@@ -86,7 +86,7 @@ func observeCleanupUploadedISO(ctx context.Context, deps Deps, record aj.Record,
 	}
 	detail, err := deps.PVE.Nodes().GetStorageContent(ctx, target.Node, target.Storage, bare)
 	if err != nil || detail == nil || detail.Size <= 0 || uint64(detail.Size) != iso.VirtualBytes || detail.Format != "raw" && detail.Format != "iso" {
-		return fmt.Errorf("uploaded ISO exact content readback differs")
+		return storageRefusal("uploaded ISO exact content readback differs")
 	}
 	return nil
 }
@@ -110,7 +110,7 @@ func observeCleanupUploadedISOState(ctx context.Context, deps Deps, journal *aj.
 		return true, nil
 	}
 	if !cleanupPriorISOUploadOwnership(record, target) {
-		return false, fmt.Errorf("absent VM has no retained exact ISO ownership")
+		return false, storageRefusal("absent VM has no retained exact ISO ownership")
 	}
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
@@ -125,7 +125,7 @@ func observeCleanupUploadedISOState(ctx context.Context, deps Deps, journal *aj.
 	}
 	definition, ok := plan.Definitions[target.Storage]
 	if !ok {
-		return false, fmt.Errorf("ISO backing unavailable")
+		return false, storageRefusal("ISO backing unavailable")
 	}
 	present, err := managedVMVerifyCleanupVolume(ctx, deps, target, definition, true)
 	if err != nil || !present {

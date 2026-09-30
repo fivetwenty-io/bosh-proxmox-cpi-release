@@ -76,7 +76,7 @@ var knownProvenanceErrors = map[string]bool{
 
 // DescribeAuditError renders err as text that is safe to retain in an audit
 // finding, a Director error, or CLI output. It renders only fields whose
-// content it knows: a PVE API status and PVE-authored message, a connection
+// content it knows: an API error's status and message, a connection
 // endpoint, a timeout or cancellation class, a missing audit grant, the nodes
 // of a failed guest enumeration, and the parsers' fixed provenance texts.
 // Anything else renders as "unclassified error"; it never falls back to
@@ -126,8 +126,10 @@ func describeAuditErrorClass(err error) string {
 	return "unclassified error"
 }
 
-// auditAPIErrorFields reads the status and PVE-authored message from every
-// SDK API error shape. The subtypes embed APIError by value, so a bare
+// auditAPIErrorFields reads the status and message from every SDK API error
+// shape. The message is usually PVE's, but for a non-JSON body the SDK keeps
+// the raw body there, such as an intermediary's error page, which is why the
+// caller scrubs and caps it. The subtypes embed APIError by value, so a bare
 // errors.As against *APIError would miss them (see apiHTTPCode).
 func auditAPIErrorFields(err error) (int, string, bool) {
 	var apiErr *sdkerrors.APIError

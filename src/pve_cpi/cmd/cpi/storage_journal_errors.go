@@ -223,7 +223,7 @@ func newStorageJournalHost(args []string) storageJournalHost {
 // belongs to the journal's owner.
 func storageJournalPathOwner(path string) (int, bool) {
 	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
-		if info, err := os.Stat(current); err == nil {
+		if info, err := os.Stat(current); err == nil { // #nosec G703 -- operator-supplied CLI path; only its owner is read
 			stat, ok := info.Sys().(*syscall.Stat_t)
 			if !ok {
 				return -1, false
@@ -240,7 +240,7 @@ func storageJournalPathOwner(path string) (int, bool) {
 // the group of path, when that group may read path. It reports false when the
 // group cannot read path or no account carries the group's name.
 func storageJournalGroupReader(path string) (int, bool) {
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) // #nosec G703 -- operator-supplied CLI config path; only its group and mode are read
 	if err != nil || info.Mode().Perm()&0o040 == 0 {
 		return -1, false
 	}
@@ -264,7 +264,7 @@ func storageJournalGroupReader(path string) (int, bool) {
 }
 
 func storageJournalReadable(path string) error {
-	f, err := os.Open(path) // #nosec G304 -- operator-supplied CLI config path; opened only to test access
+	f, err := os.Open(path) // #nosec G304 G703 -- operator-supplied CLI config path; opened only to test access
 	if err != nil {
 		return err
 	}
@@ -326,7 +326,7 @@ func storageJournalAccessMessage(dir, namespace string, err error, host storageJ
 		return fmt.Sprintf("journal %s is not accessible to %s", dir, storageJournalUserName(host.euid, host.lookup)), true
 	}
 	if errors.Is(err, fs.ErrNotExist) {
-		if _, statErr := os.Lstat(dir); errors.Is(statErr, fs.ErrNotExist) {
+		if _, statErr := os.Lstat(dir); errors.Is(statErr, fs.ErrNotExist) { // #nosec G703 -- operator-configured journal directory; only its existence is read
 			return fmt.Sprintf("journal directory %s is missing; run provision-journal", dir), true
 		}
 		return storageJournalNotEnrolled(dir, namespace), true
@@ -357,7 +357,7 @@ func storageJournalOpenFailure(stderr io.Writer, message, dir, namespace string,
 // rendered job config is not world-readable, so an operator who is neither
 // root nor the CPI's user fails here first, and the owner hint fires here too.
 func storageJournalConfigProblem(path string, host storageJournalHost) string {
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) // #nosec G703 -- operator-supplied CLI config path; only its metadata is read
 	if err == nil && !info.Mode().IsRegular() {
 		return fmt.Sprintf("config %s is not a regular file", path)
 	}

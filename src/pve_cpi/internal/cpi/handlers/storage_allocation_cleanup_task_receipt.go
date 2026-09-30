@@ -28,7 +28,7 @@ type StorageRecoveredTaskEvidence struct {
 func validateRecoveredTaskReceipt(record aj.Record, step aj.Step, decision StorageAllocationDecision) error {
 	receipt := decision.RecoveredTaskEvidence
 	if receipt == nil {
-		return fmt.Errorf("recovered task receipt is required")
+		return storageRefusal("recovered task receipt is required")
 	}
 	expectedHash, err := aj.Fingerprint(step)
 	if err != nil {
@@ -39,7 +39,7 @@ func validateRecoveredTaskReceipt(record aj.Record, step aj.Step, decision Stora
 		return err
 	}
 	if receipt.Version != 1 || receipt.Namespace != record.Namespace || receipt.AllocationID != record.ID || actualHash != expectedHash || receipt.UPID != decision.RecoveredTaskUPID || receipt.Method != "POST" || receipt.ResponseStatus < 200 || receipt.ResponseStatus >= 300 {
-		return fmt.Errorf("recovered task lacks exact retained request/response evidence")
+		return storageRefusal("recovered task lacks exact retained request/response evidence")
 	}
 	if err := validateRecoveredRequestScalars(step.Kind, receipt.RequestIdentity); err != nil {
 		return err
@@ -51,12 +51,12 @@ func validateRecoveredTaskReceipt(record aj.Record, step aj.Step, decision Stora
 	case "vm." + managedVMCallUpload:
 		expected = "/nodes/" + target.Node + "/storage/" + target.Storage + "/upload"
 		if request["content"] != "iso" || request["filename"] != fmt.Sprintf("vm-%d-config.iso", target.VMID) {
-			return fmt.Errorf("recovered upload request differs from intended ISO")
+			return storageRefusal("recovered upload request differs from intended ISO")
 		}
 	case "vm." + managedVMCallCreate, "vm." + managedVMCallClone:
 		marker, err := pve.FormatStorageAllocationMarker(pve.StorageAllocationMarker{Version: 1, Kind: "vm", Namespace: record.Namespace, AllocationID: record.ID, AgentSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(record.AgentID)))})
 		if err != nil || request[pveConfigKeyDescription] != marker {
-			return fmt.Errorf("recovered allocation request lacks full allocation marker")
+			return storageRefusal("recovered allocation request lacks full allocation marker")
 		}
 		expected = "/nodes/" + target.Node + "/qemu"
 		identityKey := "vmid"
@@ -69,13 +69,13 @@ func validateRecoveredTaskReceipt(record aj.Record, step aj.Step, decision Stora
 			identityKey = "newid"
 		}
 		if fmt.Sprint(request[identityKey]) != strconv.Itoa(target.VMID) {
-			return fmt.Errorf("recovered allocation destination differs")
+			return storageRefusal("recovered allocation destination differs")
 		}
 	default:
-		return fmt.Errorf("recovered task request kind unsupported")
+		return storageRefusal("recovered task request kind unsupported")
 	}
 	if receipt.Path != expected {
-		return fmt.Errorf("recovered task request endpoint differs")
+		return storageRefusal("recovered task request endpoint differs")
 	}
 	return nil
 }
@@ -93,13 +93,13 @@ func validateRecoveredRequestScalars(kind string, request map[string]any) error 
 		case string, int, float64:
 		case bool:
 			if key != "full" {
-				return fmt.Errorf("boolean request identity only valid for clone mode")
+				return storageRefusal("boolean request identity only valid for clone mode")
 			}
 		default:
-			return fmt.Errorf("recovered request identity must contain bounded scalars")
+			return storageRefusal("recovered request identity must contain bounded scalars")
 		}
 		if !allowed[key] || len(fmt.Sprint(value)) > 8192 {
-			return fmt.Errorf("recovered task request identity is unsupported")
+			return storageRefusal("recovered task request identity is unsupported")
 		}
 	}
 	return nil
@@ -112,27 +112,27 @@ func validateRecoveredCloneRequest(record aj.Record, target aj.Target, request m
 	}
 	root, ok := managedVMRoleTarget(plan, storageRoleRoot)
 	if !ok || root.Source == nil {
-		return "", fmt.Errorf("recovered clone source unavailable")
+		return "", storageRefusal("recovered clone source unavailable")
 	}
 	expected := "/nodes/" + root.Source.Node + "/qemu/" + strconv.Itoa(root.Source.TemplateVMID) + "/clone"
 	full := fmt.Sprint(request["full"])
 	if root.Mechanism == storageMechanismFullClone && full != "true" && full != "1" || root.Mechanism == "linked_clone" && full != "false" && full != "0" {
-		return "", fmt.Errorf("recovered clone mode differs")
+		return "", storageRefusal("recovered clone mode differs")
 	}
 	if root.Mechanism == storageMechanismFullClone && (plan.VMExecution == nil || request["format"] != plan.VMExecution.DiskFormat) {
-		return "", fmt.Errorf("recovered clone format differs")
+		return "", storageRefusal("recovered clone format differs")
 	}
 	if root.Mechanism == "linked_clone" {
 		if _, exists := request["format"]; exists {
-			return "", fmt.Errorf("linked clone receipt contains format override")
+			return "", storageRefusal("linked clone receipt contains format override")
 		}
 	}
 	if root.Mechanism == storageMechanismFullClone && request["storage"] != target.Storage {
-		return "", fmt.Errorf("recovered clone storage differs")
+		return "", storageRefusal("recovered clone storage differs")
 	}
 	if root.Mechanism == "linked_clone" {
 		if _, exists := request["storage"]; exists {
-			return "", fmt.Errorf("linked clone receipt contains storage override")
+			return "", storageRefusal("linked clone receipt contains storage override")
 		}
 	}
 	node := root.Source.Node
@@ -140,7 +140,7 @@ func validateRecoveredCloneRequest(record aj.Record, target aj.Target, request m
 		node = fmt.Sprint(actual)
 	}
 	if node != target.Node {
-		return "", fmt.Errorf("recovered clone destination node differs")
+		return "", storageRefusal("recovered clone destination node differs")
 	}
 	return expected, nil
 }

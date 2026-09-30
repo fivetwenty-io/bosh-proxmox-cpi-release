@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -51,7 +50,7 @@ func cleanupOnlySharedPool(record aj.Record) (string, bool) {
 func observeCleanupPoolOnlyAbsence(ctx context.Context, deps Deps, record aj.Record, settlement *cleanupSettlement) (aj.Verification, error) {
 	pool, ok := cleanupOnlySharedPool(record)
 	if !ok || pool != settlement.SharedPoolOnly {
-		return aj.Verification{}, fmt.Errorf("shared pool cleanup scope changed")
+		return aj.Verification{}, storageRefusal("shared pool cleanup scope changed")
 	}
 	return observePlannedVMAbsence(ctx, deps, record, settlement.TaskObservation.Nodes, record.Steps[0].Target.VMID)
 }
@@ -69,7 +68,7 @@ func observePlannedVMAbsence(ctx context.Context, deps Deps, record aj.Record, n
 func observePlannedVMStorageAbsence(ctx context.Context, deps Deps, record aj.Record, nodes []string, vmid int, allowed ...string) error {
 	// Scan all applicable current and historical storage locations, including
 	// unmarked plain VM files, before releasing this numeric VM reservation.
-	report := StorageAllocationAudit{Complete: true}
+	report := StorageAllocationAudit{Complete: true, Records: []aj.Record{record}}
 	stores := auditStorageDefinitions(ctx, deps, []aj.Record{record}, &report)
 	_, historical, _ := storageAuditRecordIndex([]aj.Record{record})
 	targets := storageAuditTargets(ctx, deps, nodes, historical, stores, &report)
@@ -87,7 +86,7 @@ func observePlannedVMStorageAbsence(ctx context.Context, deps Deps, record aj.Re
 func observePoolOnlyStorageAbsent(ctx context.Context, deps Deps, target storageAuditTarget, vmid int, allowed ...string) error {
 	listing, err := deps.PVE.Nodes().ListStorageContent(ctx, target.node, target.storage, nil)
 	if err != nil || listing == nil || *listing == nil {
-		return fmt.Errorf("pool-only cleanup content unavailable")
+		return storageRefusal("pool-only cleanup content unavailable")
 	}
 	seen := map[string]bool{}
 	for _, raw := range *listing {
@@ -96,11 +95,11 @@ func observePoolOnlyStorageAbsent(ctx context.Context, deps Deps, target storage
 			VMID  int    `json:"vmid"`
 		}
 		if json.Unmarshal(raw, &item) != nil || item.VolID == "" || seen[item.VolID] {
-			return fmt.Errorf("pool-only cleanup content malformed")
+			return storageRefusal("pool-only cleanup content malformed")
 		}
 		storage, bare, err := pve.ParseDiskCID(item.VolID)
 		if err != nil || storage != target.storage {
-			return fmt.Errorf("pool-only cleanup content target differs")
+			return storageRefusal("pool-only cleanup content target differs")
 		}
 		seen[item.VolID] = true
 		if len(allowed) == 1 && item.VolID == allowed[0] {
@@ -109,7 +108,7 @@ func observePoolOnlyStorageAbsent(ctx context.Context, deps Deps, target storage
 		owner, _ := pve.EmbeddedDiskVMID(item.VolID)
 		name := bare[strings.LastIndex(bare, "/")+1:]
 		if item.VMID == vmid || owner == vmid || strings.HasPrefix(bare, strconv.Itoa(vmid)+"/") || strings.HasPrefix(name, "vm-"+strconv.Itoa(vmid)+"-") {
-			return fmt.Errorf("pool-only cleanup found artifact for planned VM identity")
+			return storageRefusal("pool-only cleanup found artifact for planned VM identity")
 		}
 	}
 	return nil
@@ -120,14 +119,14 @@ func observePoolOnlyGuestsAbsent(ctx context.Context, deps Deps, nodes []string,
 	for _, node := range nodes {
 		qemu, err := deps.PVE.Nodes().ListQemu(ctx, node, nil)
 		if err != nil || qemu == nil || *qemu == nil {
-			return fmt.Errorf("pool-only cleanup QEMU inventory unavailable")
+			return storageRefusal("pool-only cleanup QEMU inventory unavailable")
 		}
 		if err := validatePoolOnlyGuestRows(*qemu, vmid, seen); err != nil {
 			return err
 		}
 		lxc, err := deps.PVE.Nodes().ListLxc(ctx, node)
 		if err != nil || lxc == nil || *lxc == nil {
-			return fmt.Errorf("pool-only cleanup LXC inventory unavailable")
+			return storageRefusal("pool-only cleanup LXC inventory unavailable")
 		}
 		if err := validatePoolOnlyGuestRows(*lxc, vmid, seen); err != nil {
 			return err
@@ -141,14 +140,14 @@ func validatePoolOnlyGuestRows(rows []json.RawMessage, vmid int, seen map[int]bo
 			VMID json.Number `json:"vmid"`
 		}
 		if json.Unmarshal(raw, &item) != nil {
-			return fmt.Errorf("pool-only cleanup guest identity malformed")
+			return storageRefusal("pool-only cleanup guest identity malformed")
 		}
 		id, err := strconv.Atoi(string(item.VMID))
 		if err != nil || id <= 0 || strconv.Itoa(id) != string(item.VMID) || seen[id] {
-			return fmt.Errorf("pool-only cleanup guest identity missing or duplicated")
+			return storageRefusal("pool-only cleanup guest identity missing or duplicated")
 		}
 		if id == vmid {
-			return fmt.Errorf("pool-only cleanup found planned guest identity")
+			return storageRefusal("pool-only cleanup found planned guest identity")
 		}
 		seen[id] = true
 	}

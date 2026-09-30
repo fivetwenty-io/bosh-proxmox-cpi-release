@@ -11,6 +11,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	pveerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -72,7 +73,7 @@ func (m *managedDiskRequest) execute(ctx context.Context, handle *aj.Handle) (an
 			return nil, storageAllocationUncertain(handle, "validated rejection retry budget exhausted")
 		}
 		if err = m.retryRejected(ctx, handle, rejected); err != nil {
-			return nil, storageAllocationUncertain(handle, "validated rejection absence audit or replanning")
+			return nil, errors.Join(err, storageAllocationUncertain(handle, "validated rejection absence audit or replanning"))
 		}
 	}
 	return nil, cpierrors.Cloud("create_disk: managed attempt budget exhausted")
@@ -84,12 +85,15 @@ func (m *managedDiskRequest) retryRejected(ctx context.Context, handle *aj.Handl
 	}
 	target := m.plan.Targets[0]
 	exists, err := managedVolumePresent(ctx, m.deps, target.Node, rejected.volume)
-	if err != nil || exists {
-		return fmt.Errorf("failed allocation absence unproven")
+	if err != nil {
+		return cpierrors.Cloud("create_disk retry refused: rejected volume %s on %s could not be read: %s", rejected.volume, target.Node, pve.DescribeAuditError(err))
+	}
+	if exists {
+		return cpierrors.Cloud("create_disk retry refused: rejected volume %s is still present on %s", rejected.volume, target.Node)
 	}
 	report, err := AuditStorageAllocations(ctx, m.deps, m.journal, m.inventory.Nodes())
 	if err != nil {
-		return fmt.Errorf("failed allocation historical audit incomplete")
+		return cpierrors.Cloud("create_disk retry refused: the allocation audit could not run: %s", pve.DescribeAuditError(err))
 	}
 	if err := storageAuditGateError(ctx, m.deps, "create_disk retry", report, storageAuditGateComplete|storageAuditGateConflicts); err != nil {
 		return err

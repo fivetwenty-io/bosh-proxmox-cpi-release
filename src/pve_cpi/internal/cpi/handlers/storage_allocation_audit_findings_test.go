@@ -193,7 +193,33 @@ func TestAllocationAuditFindingsNameWhatTheySaw(t *testing.T) {
 				record.Steps[0].Target.Storage = "gone"
 				return []aj.Record{record}
 			},
-			want: `historical storage "gone" is absent from definitions: recorded on pve1`},
+			want: `historical storage "gone" is absent from definitions: recorded on pve1 by allocation ` + findingAllocationID},
+		{name: "historical storage definition changed", list: "issues", records: true,
+			setup: func(t *testing.T, _ *Deps, _ *allocationAuditClient) []aj.Record {
+				record := findingDisk(sharedBacking, volume)
+				other := moveDefinition(t, `{"storage":"a","type":"nfs","server":"other","export":"/a","content":"images","shared":1}`)
+				record.Intent = movePlan(t, "disk", "pve1", map[string]pve.StorageInfo{"a": other}, volume)
+				return []aj.Record{record}
+			},
+			want: `historical storage "a" changed or disappeared; original backing needs audit: allocation ` + findingAllocationID + " recorded nfs://other/a shared=true, current " + sharedBacking + " shared=true"},
+		{name: "storage index missing", list: "issues",
+			setup: func(_ *testing.T, _ *Deps, c *allocationAuditClient) []aj.Record {
+				c.storageRead.noIndex = true
+				return nil
+			},
+			want: "storage definitions could not be inspected: PVE returned no storage index"},
+		{name: "node list missing", list: "issues",
+			setup: func(_ *testing.T, _ *Deps, c *allocationAuditClient) []aj.Record {
+				c.nodesRead.noNodeList = true
+				return nil
+			},
+			want: "storage audit node enumeration failed: PVE returned no node list"},
+		{name: "content listing missing", list: "issues",
+			setup: func(_ *testing.T, _ *Deps, c *allocationAuditClient) []aj.Record {
+				c.nodesRead.noContent = true
+				return nil
+			},
+			want: `storage "a" on node "pve1" could not be inspected: PVE returned no content listing`},
 		{name: "content listing failed on one node", list: "issues",
 			setup: func(_ *testing.T, _ *Deps, c *allocationAuditClient) []aj.Record {
 				c.nodesRead.nodeNames = []string{"pve1", "pve2"}

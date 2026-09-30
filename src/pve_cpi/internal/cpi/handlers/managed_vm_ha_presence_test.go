@@ -68,10 +68,10 @@ func TestManagedHAMembershipRequiresCompleteValidList(t *testing.T) {
 }
 func TestCleanupDiagnosticDoesNotExposeSource(t *testing.T) {
 	err := storageCleanupFailure("vm_ha", errors.New("password=private-backend-response"))
-	if got := StorageAllocationDecisionFailure(storageDecisionSourceError(err)); got != "cleanup_vm_ha" {
+	if got := StorageAllocationDecisionFailure(storageDecisionSourceError(err)); got != "cleanup_vm_ha: unclassified error" {
 		t.Fatalf("classification %s", got)
 	}
-	if got := StorageAllocationDecisionFailure(errors.New("password=private")); got != "identity_or_audit_evidence" {
+	if got := StorageAllocationDecisionFailure(errors.New("password=private")); got != "identity_or_audit_evidence: unclassified error" {
 		t.Fatalf("unclassified %s", got)
 	}
 }

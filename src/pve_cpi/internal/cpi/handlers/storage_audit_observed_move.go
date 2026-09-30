@@ -35,12 +35,30 @@ func (m StorageAllocationMove) String() string {
 	return fmt.Sprintf("%s allocation %s (VM %d) moved from %s to %s", m.Kind, m.AllocationID, m.VMID, strings.Join(m.RecordedNodes, ","), m.ObservedNode)
 }
 
-// observedMove reports whether the audit accepted a move of allocationID to
-// node. Lifecycle paths consult it instead of re-deciding the move.
-func (r StorageAllocationAudit) observedMove(allocationID, node string) bool {
+// observedMove reports whether the audit accepted a move of allocationID, of
+// the given kind and held by VM vmid, to node. Lifecycle paths consult it
+// instead of re-deciding the move, and the kind and VMID keep a parker's
+// move of an allocation from standing in for its holder's.
+func (r StorageAllocationAudit) observedMove(kind, allocationID string, vmid int, node string) bool {
 	return slices.ContainsFunc(r.ObservedMoves, func(move StorageAllocationMove) bool {
-		return move.AllocationID == allocationID && move.ObservedNode == node
+		return move.Kind == kind && move.AllocationID == allocationID && move.VMID == vmid && move.ObservedNode == node
 	})
+}
+
+// storageAuditMoveRefusal names why the audit accepted no move of
+// allocationID. It returns the short form of the first conflict that names
+// the allocation, which carries the move rule's reason, or says that the VM
+// scan was incomplete or that no finding named the allocation.
+func storageAuditMoveRefusal(audit StorageAllocationAudit, allocationID string) string {
+	for _, conflict := range audit.Conflicts {
+		if strings.Contains(conflict, allocationID) {
+			return audit.brief(conflict)
+		}
+	}
+	if !audit.VMScanComplete {
+		return "the VM scan is incomplete"
+	}
+	return "no audit finding names the allocation"
 }
 
 // storageAuditMoveIndex is the journal and storage state the move rules read.
@@ -104,7 +122,7 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 	if !found || record.Kind != "vm" || record.Namespace != index.namespace {
 		return StorageAllocationMove{}, "no VM record of this namespace owns the allocation"
 	}
-	if record.State != aj.ReadyToReturn && record.State != aj.Adopted {
+	if record.State != aj.ReadyToReturn && record.State != aj.Adopted && !storageAuditDeletionKeepsMove(record, evidence) {
 		return StorageAllocationMove{}, fmt.Sprintf("the record is in state %s, not ready_to_return or adopted", record.State)
 	}
 	recorded := storageAuditActiveVMNodes(record, evidence.VMID)
@@ -165,6 +183,21 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 		}
 	}
 	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, ""
+}
+
+// storageAuditDeletionKeepsMove reports whether a record that delete took out
+// of ready_to_return or adopted may still be read as moved to the sighted
+// node. Delete admission audited the record while it was returned, and its
+// retained evidence names this VMID and node. Every other condition of the
+// rule still applies to the live state, so a VM that moved again since the
+// admission stays a conflict. A record whose CID was never returned cannot
+// reach this, because no admission of it ever accepted a move.
+func storageAuditDeletionKeepsMove(record aj.Record, evidence StorageAllocationEvidence) bool {
+	switch record.State {
+	case aj.Observed, aj.Planned, aj.ReconciliationRequired:
+		return cleanupVMDeletionAdmittedMove(record, evidence.VMID, evidence.Node)
+	}
+	return false
 }
 
 // storageAuditObservedSharedDiskMove decides whether a disk whose provenance

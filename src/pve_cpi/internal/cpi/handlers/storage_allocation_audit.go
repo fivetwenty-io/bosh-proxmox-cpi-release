@@ -695,6 +695,28 @@ func auditHistoricalDefinitions(records []aj.Record, stores map[string]pve.Stora
 	}
 }
 
+// storageAuditRecordedBy names the allocations whose steps target storage, as
+// " by allocation <id>" or " by allocations <id>, <id>", or "" when the
+// records in scope name none.
+func storageAuditRecordedBy(records []aj.Record, storage string) string {
+	var ids []string
+	for recordIndex := range records {
+		record := records[recordIndex]
+		if slices.ContainsFunc(record.Steps, func(step aj.Step) bool { return step.Target.Storage == storage }) {
+			ids = append(ids, record.ID)
+		}
+	}
+	sort.Strings(ids)
+	ids = slices.Compact(ids)
+	switch len(ids) {
+	case 0:
+		return ""
+	case 1:
+		return " by allocation " + ids[0]
+	}
+	return " by allocations " + strings.Join(ids, ", ")
+}
+
 // storageAuditDefinitionName names a storage definition that failed to parse,
 // by its storage name when that much decodes and by its position otherwise.
 func storageAuditDefinitionName(raw json.RawMessage, index int) string {
@@ -773,7 +795,7 @@ func storageAuditTargets(ctx context.Context, deps Deps, nodes []string, histori
 			on = strings.Join(recorded, ", ")
 		}
 		result.Complete = false
-		result.Issues = append(result.Issues, fmt.Sprintf("historical storage %q is absent from definitions: recorded on %s", id, on))
+		result.Issues = append(result.Issues, fmt.Sprintf("historical storage %q is absent from definitions: recorded on %s%s", id, on, storageAuditRecordedBy(result.Records, id)))
 	}
 	sort.Slice(targets, func(i, j int) bool {
 		if targets[i].node != targets[j].node {
