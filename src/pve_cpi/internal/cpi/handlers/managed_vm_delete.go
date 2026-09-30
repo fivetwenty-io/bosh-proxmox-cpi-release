@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -488,7 +489,27 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if isDiskReturnedAfterLockTimeout(err) && storageLifecycleSettled(handle.Record()) == nil {
 		return err
 	}
-	return errors.Join(err, storageAllocationUncertain(handle, "VM cleanup"))
+	return joinReconciliation(err, storageAllocationUncertain(handle, "VM cleanup"))
+}
+
+// joinReconciliation joins the reconciliation error onto a failure that left
+// the allocation requiring it. The Director reads only the first CPI error in
+// the chain. A retriable failure goes behind the reconciliation error, which
+// is not retriable, so the Director does not retry into a record that then
+// refuses. Any other failure keeps its place, so its own message, such as an
+// audit gate's findings, is still the one the Director shows. An untyped
+// failure is wrapped as a non-retriable CloudError first, because otherwise
+// the reconciliation error would be the first typed error and its text would
+// replace the failure's own.
+func joinReconciliation(err, reconciliation error) error {
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) {
+		return errors.Join(cpierrors.WrapAs(err, cpierrors.TypeCloud, "VM disposal failed"), reconciliation)
+	}
+	if typed.OkToRetry() || typed.Type() == cpierrors.TypeRetriableCloud {
+		return errors.Join(reconciliation, err)
+	}
+	return errors.Join(err, reconciliation)
 }
 
 // managedVMRollbackFailure settles a failure while create_vm rolls back one of
@@ -496,14 +517,13 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 // may have stopped the guest or removed its HA resource, so the generation is
 // half disposed. A create_vm retry would resume it as a create, which is never
 // safe, so every failure requires reconciliation. That includes a persistent
-// disk preservation that waited out a parker lock and changed nothing. The
-// reconciliation error leads the joined error, so the Director reads it ahead
-// of the timeout's retriable type.
+// disk preservation that waited out a parker lock and changed nothing, whose
+// retriable type goes behind the reconciliation error.
 func managedVMRollbackFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
 	}
-	return errors.Join(storageAllocationUncertain(handle, "VM create rollback"), err)
+	return joinReconciliation(err, storageAllocationUncertain(handle, "VM create rollback"))
 }
 
 func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {
