@@ -39,7 +39,11 @@ import (
 // So the readback settles the step whenever it answers exactly, whether the
 // sentinel is gone or holds any claim, ours or not. It leaves the step planned
 // when a read fails or answers loosely, and when the record names no sentinel
-// the step could have meant.
+// the step could have meant. The readback proves that PVE answered exactly for
+// the sentinel, not what the step did. The ownerless reasoning above it is what
+// makes that enough. A read that fails leaves nothing behind, so the call that
+// hit it refuses, and the next call on the record reads again. By then, the
+// transport's own retries have already been spent.
 
 // lockStepKinds are the step kinds a guard writes for a sentinel mutation. The
 // lifecycle and parker guards admit a Pool mutation only for a bosh-lock-
