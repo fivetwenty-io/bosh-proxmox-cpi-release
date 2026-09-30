@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 )
 
 // buildState guards the cached binary path across the test process.
@@ -123,7 +125,11 @@ func makeExecCmd(ctx context.Context, bin string, args ...string) *exec.Cmd {
 // and reused across every test in this package (see buildOnce); t.TempDir is
 // not usable because its lifetime is bound to a single *testing.T.
 func TestMain(m *testing.M) {
+	// The allocation journal's fsyncs dominate the journal-backed CLI tests;
+	// the journal's own tests keep them on.
+	restoreSync := aj.SetFileSyncForTest(false)
 	code := m.Run()
+	restoreSync()
 	buildState.mu.Lock()
 	bin := buildState.bin
 	buildState.mu.Unlock()

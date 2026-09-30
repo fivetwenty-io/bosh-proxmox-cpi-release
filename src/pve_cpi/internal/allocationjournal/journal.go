@@ -112,7 +112,8 @@ func Initialize(ctx context.Context, directory, namespace string, e Enrollment) 
 	if err = base.Mkdir(key, 0o700); err != nil {
 		return nil, fmt.Errorf("%w: namespace already exists or cannot be created: %w", ErrNotInitialized, err)
 	}
-	if err = syncDirectory(base); err != nil {
+	ops := defaultFileOps()
+	if err = ops.syncDir(base); err != nil {
 		return nil, &DurabilityError{Err: err}
 	}
 	root, err := openPrivateRoot(filepath.Join(directory, key))
@@ -130,7 +131,6 @@ func Initialize(ctx context.Context, directory, namespace string, e Enrollment) 
 		return nil, err
 	}
 	a := authority{Version: Version, Namespace: namespace, Epoch: epoch, Enrollment: e}
-	ops := defaultFileOps()
 	if err := atomicJSON(root, "index.json", index{Version: Version, ActiveVMs: map[string]string{}}, ops); err != nil {
 		return nil, err
 	}
