@@ -72,6 +72,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - Log and error scrubbing now also masks a `PVEAPIToken` or `PVEAuthCookie` value when the name follows a percent escape such as `%20` or an underscore, when a blank sits before the `=`, or when the value sits on the line after it. Before this, those forms reached Director messages, CLI output, and the CPI's logs with the value intact. The argument trees that the allocation journal fingerprints, and that the opt-in request trace logs, keep their current rule, so this change leaves the fingerprints as they were.
 
+- A `delete_vm` retry that refuses a journal-managed VM now tells the Director why. When an earlier delete stopped partway and left a step unsettled, the retry refuses and names that step, as in `cleanup has unresolved mutation evidence; step attempt-0-step-7 (lifecycle_delete_vm_retain_ephemeral_Nodes_CreateQemuMoveDisk) is planned`. The Director used to show only `allocation decision could not verify or persist evidence` for that refusal and for every other refusal the CPI raises before it starts deleting, such as `retired VM identity is present; audit required`, and so did the Director's orphaned-VM cleanup, which retries the delete on its own schedule. Those refusals now reach the Director with their own text, and so does the CPI's log line for the failed call, which `bosh task <id> --cpi` shows. A journal write that fails and a PVE answer the CPI does not recognize still show the generic line, so no backend text reaches the Director, and every error keeps the type and retry behavior it had before.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added
