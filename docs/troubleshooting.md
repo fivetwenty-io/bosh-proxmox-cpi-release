@@ -1235,7 +1235,7 @@ What a rerun deploy does with our disk depends on whether the Director already h
 
 With `director.enable_cpi_resize_disk` on, the Director resizes the disk in place instead, so the disk was already active on the instance, and the rerun resizes and attaches that same disk again.
 
-A `create_disk` that failed the same way reports `requires reconciliation at persistent parker completion` and never returned a CID, so its record takes `cleanup`, which settles the lock step before it judges the evidence. For a `create_disk` record, the record names no parker VMID for its lock step, so that read goes to `bosh-lock-vm-<vmid>`, where `<vmid>` is the number in the new volume's name, `vm-<vmid>-...`. That number comes from the persistent-disk VMID band, which never overlaps the parker band, so it is never the parker's lock pool, and any exact answer settles the step.
+A `create_disk` that failed the same way reports `requires reconciliation at persistent parker completion` and never returned a CID, so its record takes `cleanup`, which settles the lock step before it judges the evidence. Until that `cleanup` runs, the record keeps charging its planned size against capacity, and `storage-journal audit --summary` prints it with `charging=true` on its `record:` line, so when a create is refused for capacity we did not expect, this record is the first place we look. For a `create_disk` record, the record names no parker VMID for its lock step, so that read goes to `bosh-lock-vm-<vmid>`, where `<vmid>` is the number in the new volume's name, `vm-<vmid>-...`. That number comes from the persistent-disk VMID band, which never overlaps the parker band, so it is never the parker's lock pool, and any exact answer settles the step.
 
 ### A parker lock wait runs out
 
