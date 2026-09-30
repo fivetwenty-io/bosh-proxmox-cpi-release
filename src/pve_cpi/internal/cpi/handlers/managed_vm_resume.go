@@ -26,6 +26,10 @@ type managedVMObservation struct {
 // observeManagedVMRecord proves ownership from the journal, full marker and
 // actual storage. It never resolves current sets, writes PVE state, or resumes a
 // transfer. Recorded completion avoids depending on expired PVE task logs.
+//
+// The audit runs once the VM is located and before the rest of the readback,
+// so the readback can accept a node the audit accepted as a move on shared
+// storage. The audit reads only the located node from the readback.
 func observeManagedVMRecord(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record) (*managedVMObservation, error) {
 	fail := func(reason string) (*managedVMObservation, error) {
 		return nil, cpierrors.Cloud("allocation %s requires reconciliation: %s", record.ID, reason)
@@ -39,18 +43,21 @@ func observeManagedVMRecord(ctx context.Context, deps Deps, journal *aj.Journal,
 		return nil, err
 	}
 	readback := managedVMRecordReadback{deps: deps, record: record, plan: plan}
-	if err := readback.read(ctx); err != nil {
+	if err := readback.locate(ctx); err != nil {
 		return nil, err
 	}
-	node, vmid, cfg, volumes := readback.node, readback.vmid, readback.cfg, readback.volumes
-	sort.Strings(volumes)
-	audit, err := AuditStorageAllocations(ctx, deps, journal, []string{node})
+	audit, err := AuditStorageAllocations(ctx, deps, journal, []string{readback.node})
 	if err != nil {
 		return nil, err
 	}
 	if err := storageAuditGateError(ctx, deps, "VM allocation readback", audit, storageAuditGateVMScan|storageAuditGateConflicts); err != nil {
 		return nil, err
 	}
+	if err := readback.read(ctx, audit); err != nil {
+		return nil, err
+	}
+	node, vmid, cfg, volumes := readback.node, readback.vmid, readback.cfg, readback.volumes
+	sort.Strings(volumes)
 	sightings := 0
 	for _, evidence := range audit.Evidence {
 		if evidence.Kind == "vm" && evidence.VolumeID == "" && evidence.AllocationID == record.ID {
@@ -156,6 +163,9 @@ func resumeManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArgs,
 			if evidence.AllocationID == record.ID || evidence.Kind == "vm" && evidence.AgentSHA256 == hex.EncodeToString(hash[:]) {
 				return nil, cpierrors.Cloud("unsubmitted VM generation has remote provenance; audit required")
 			}
+		}
+		if err := storageAuditGateError(ctx, deps, "unsubmitted VM generation inspection", audit, storageAuditGateAll); err != nil {
+			return nil, err
 		}
 		proof, err := storageAllocationVerification(audit, map[string]any{"operation": "unsubmitted VM generation inspection", "allocation_id": record.ID, "outcome": "no mutation intent and no remote allocation provenance"})
 		if err != nil {

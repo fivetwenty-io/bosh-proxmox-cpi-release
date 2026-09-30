@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,8 +61,12 @@ func (r *managedVMRecordReadback) readTarget() error {
 	r.recorded = recorded
 	return nil
 }
+
+// readLocation finds the one node that holds the recorded VMID. Whether that
+// node is allowed is left to admitLocation, which needs the audit, and the
+// audit needs this node.
 func (r *managedVMRecordReadback) readLocation(ctx context.Context) error {
-	deps, record, vmid := r.deps, r.record, r.vmid
+	deps, vmid := r.deps, r.vmid
 	guests, skipped, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil || len(skipped) > 0 {
 		return r.fail("actual VM location could not be fully inspected")
@@ -78,22 +83,29 @@ func (r *managedVMRecordReadback) readLocation(ctx context.Context) error {
 	if node == "" {
 		return r.fail("recorded VM disappeared; absence alone does not release its generation")
 	}
-	allowed := false
+
+	r.node = node
+	return nil
+}
+
+// admitLocation accepts the node the VM was found on when a step of the
+// active attempt names it, or when audit accepted a move of this allocation
+// to that node on shared storage.
+func (r *managedVMRecordReadback) admitLocation(audit StorageAllocationAudit) error {
+	record, node, vmid := r.record, r.node, r.vmid
 	for i := range record.Steps {
 		step := &record.Steps[i]
 		if step.Attempt != record.ActiveAttempt() {
 			continue
 		}
 		if matched, _ := storageAuditVMTargetMatches(record, *step, node, vmid); matched {
-			allowed = true
+			return nil
 		}
 	}
-	if !allowed {
-		return r.fail("actual VM is outside recorded nodes")
+	if audit.observedMove(record.ID, node) {
+		return nil
 	}
-
-	r.node = node
-	return nil
+	return r.fail(fmt.Sprintf("actual VM is outside recorded nodes: VM %d on %s, recorded %s, and the audit accepted no move", vmid, node, strings.Join(storageAuditActiveVMNodes(record, vmid), ",")))
 }
 func (r *managedVMRecordReadback) readConfig(ctx context.Context) error {
 	deps, record, node, vmid := r.deps, r.record, r.node, r.vmid
@@ -260,11 +272,20 @@ func (r *managedVMRecordReadback) readVolumes(ctx context.Context) error {
 	}
 	return nil
 }
-func (r *managedVMRecordReadback) read(ctx context.Context) error {
+
+// locate reads the recorded VMID and the node that holds it, which is all the
+// audit needs before the rest of the readback can run.
+func (r *managedVMRecordReadback) locate(ctx context.Context) error {
 	if err := r.readTarget(); err != nil {
 		return err
 	}
-	if err := r.readLocation(ctx); err != nil {
+	return r.readLocation(ctx)
+}
+
+// read finishes the readback after locate, using audit to decide whether the
+// VM's node is allowed.
+func (r *managedVMRecordReadback) read(ctx context.Context, audit StorageAllocationAudit) error {
+	if err := r.admitLocation(audit); err != nil {
 		return err
 	}
 	if err := r.readConfig(ctx); err != nil {

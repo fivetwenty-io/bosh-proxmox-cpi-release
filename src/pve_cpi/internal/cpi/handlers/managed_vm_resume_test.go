@@ -17,10 +17,18 @@ import (
 type resumeVMNodes struct {
 	ns.Service
 	missing bool
+	// nodes, when set, replaces the single pve1 that GET /nodes lists.
+	nodes []string
 }
 
 func (n *resumeVMNodes) ListNodes(context.Context) (*ns.ListNodesResponse, error) {
 	response := ns.ListNodesResponse{json.RawMessage(`{"node":"pve1","status":"online"}`)}
+	if n.nodes != nil {
+		response = make(ns.ListNodesResponse, 0, len(n.nodes))
+		for _, node := range n.nodes {
+			response = append(response, json.RawMessage(`{"node":"`+node+`","status":"online"}`))
+		}
+	}
 	return &response, nil
 }
 

@@ -17,7 +17,9 @@ import (
 // retainManagedEphemeralForVMDelete reassigns a proven VM-owned ephemeral
 // volume to a parker. The caller holds and finishes the VM allocation; the
 // returned volume and all intermediate ownership evidence remain in that record.
-func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int, volume string) (retained string, operationErr error) {
+// moved reports that the caller's delete audit accepted a move of this VM to
+// node on shared storage, so steps recorded on another node still own volume.
+func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int, volume string, moved bool) (retained string, operationErr error) {
 	if handle == nil || handle.Record().Kind != "vm" {
 		return "", fmt.Errorf("ephemeral retention requires VM allocation ownership")
 	}
@@ -25,7 +27,7 @@ func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *a
 	if state != aj.Planned && state != aj.Observed {
 		return "", fmt.Errorf("VM allocation cannot admit ephemeral retention")
 	}
-	disk, backing, virtualBytes, err := prepareManagedEphemeralRetention(ctx, deps, handle, node, vmid, volume)
+	disk, backing, virtualBytes, err := prepareManagedEphemeralRetention(ctx, deps, handle, node, vmid, volume, moved)
 	if err != nil {
 		return "", err
 	}
@@ -142,12 +144,15 @@ func managedVMRetainedTarget(record aj.Record, volume string, originalVMID int) 
 	return result, nil
 }
 
-func prepareManagedEphemeralRetention(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int, volume string) (resolvedDisk, string, uint64, error) {
+func prepareManagedEphemeralRetention(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int, volume string, moved bool) (resolvedDisk, string, uint64, error) {
 	record := handle.Record()
+	// A step owns the volume on node, or on its recorded node when the delete
+	// audit accepted the VM's move to node.
+	onNode := func(step *aj.Step) bool { return step.Target.Node == node || moved }
 	owned := false
 	for stepIndex := range record.Steps {
 		step := &record.Steps[stepIndex]
-		if step.Target.External || step.Target.Node != node || step.Target.VMID != vmid {
+		if step.Target.External || !onNode(step) || step.Target.VMID != vmid {
 			continue
 		}
 		for _, actual := range step.VolIDs {
@@ -170,7 +175,7 @@ func prepareManagedEphemeralRetention(ctx context.Context, deps Deps, handle *aj
 	owned = false
 	for stepIndex := range record.Steps {
 		step := &record.Steps[stepIndex]
-		if step.Target.External || step.Target.Node != node || step.Target.VMID != vmid || step.Target.Storage != storage || step.Target.Backing != backing {
+		if step.Target.External || !onNode(step) || step.Target.VMID != vmid || step.Target.Storage != storage || step.Target.Backing != backing {
 			continue
 		}
 		for _, actual := range step.VolIDs {

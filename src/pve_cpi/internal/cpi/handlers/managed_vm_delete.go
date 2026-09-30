@@ -16,6 +16,11 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
+// managedVMCleanupAdmissionOperation names the verification disposeManagedVM
+// retains before its first delete step. Its evidence carries the moves the
+// admission audit accepted, which crashed-delete cleanup reads back.
+const managedVMCleanupAdmissionOperation = "VM cleanup admission"
+
 // cleanupManagedVMAttempt returns fresh disposition evidence without closing the
 // generation. The caller may close the attempt, admit a retry, or tombstone it.
 func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
@@ -64,7 +69,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 			return proof, fmt.Errorf("VM cleanup identity lacks exact live provenance")
 		}
 	}
-	admission, err := storageAllocationVerification(audit, map[string]any{"operation": "VM cleanup admission", allocationEvidenceIDField: record.ID})
+	admission, err := storageAllocationVerification(audit, map[string]any{allocationEvidenceOperationField: managedVMCleanupAdmissionOperation, allocationEvidenceIDField: record.ID})
 	if err != nil {
 		return proof, err
 	}
@@ -101,7 +106,10 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err := cleanupManagedVMInfrastructure(ctx, deps, journal, handle, node, vmid); err != nil {
 		return proof, storageCleanupFailure("vm_infrastructure", err)
 	}
-	retainedTargets, err := deleteManagedVMGuest(ctx, deps, handle, record, node, vmid, owned, retain)
+	// A VM the audit accepted as moved on shared storage keeps its recorded
+	// steps on the old node; ephemeral retention accepts them on this one.
+	moved := node != "" && audit.observedMove(record.ID, node)
+	retainedTargets, err := deleteManagedVMGuest(ctx, deps, handle, record, node, vmid, owned, retain, moved)
 	if err != nil {
 		return proof, err
 	}
@@ -114,7 +122,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err != nil {
 		return proof, err
 	}
-	return managedVMDispositionProof(audit, record, vmid, retainedTargets)
+	return managedVMDispositionProof(ctx, deps, audit, record, vmid, retainedTargets)
 }
 
 func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind string, target aj.Target, submit func() (any, error), observe func() error) error {
@@ -411,6 +419,9 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 			return proof, fmt.Errorf("retained cleanup artifacts remain")
 		}
 	}
+	if err := storageAuditGateError(ctx, deps, "retained VM cleanup completion", audit, storageAuditGateAll); err != nil {
+		return proof, err
+	}
 	proof, err = storageAllocationVerification(audit, map[string]any{"operation": "retained VM cleanup completion", allocationEvidenceIDField: record.ID, metadataKeyVMID: retention.VMID})
 	if err != nil {
 		return proof, err
@@ -421,10 +432,10 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	return proof, nil
 }
 
-func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain bool) ([]aj.Target, error) {
+func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {
 	var err error
 	if node == "" {
-		return managedVMRetentionTargets(ctx, deps, handle, record, node, vmid, false)
+		return managedVMRetentionTargets(ctx, deps, handle, record, node, vmid, false, false)
 	}
 	var retainedTargets []aj.Target
 
@@ -454,7 +465,7 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 		if err := detachManagedPersistentForVMDelete(ctx, deps, node, vmid, owned, handle); err != nil {
 			return nil, err
 		}
-		retainedTargets, err = managedVMRetentionTargets(ctx, deps, handle, record, node, vmid, retain)
+		retainedTargets, err = managedVMRetentionTargets(ctx, deps, handle, record, node, vmid, retain, moved)
 		if err != nil {
 			return nil, err
 		}
@@ -584,7 +595,7 @@ func managedVMDisposalIdentity(record aj.Record, audit StorageAllocationAudit) (
 	return node, vmid, owned, nil
 }
 
-func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, retain bool) ([]aj.Target, error) {
+func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, retain, moved bool) ([]aj.Target, error) {
 	var retainedTargets []aj.Target
 	// A completed transfer remains retained even if the process stopped before
 	// recording VM destruction or before the caller received success.
@@ -611,7 +622,7 @@ func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle
 			}
 		}
 		if original != "" {
-			landed, e := retainManagedEphemeralForVMDelete(ctx, deps, handle, node, vmid, original)
+			landed, e := retainManagedEphemeralForVMDelete(ctx, deps, handle, node, vmid, original, moved)
 			if e != nil {
 				return nil, e
 			}
@@ -628,7 +639,7 @@ func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle
 	return retainedTargets, nil
 }
 
-func managedVMDispositionProof(audit StorageAllocationAudit, record aj.Record, vmid int, retainedTargets []aj.Target) (proof aj.Verification, err error) {
+func managedVMDispositionProof(ctx context.Context, deps Deps, audit StorageAllocationAudit, record aj.Record, vmid int, retainedTargets []aj.Target) (proof aj.Verification, err error) {
 	for _, evidence := range audit.Evidence {
 		if evidence.AllocationID != record.ID {
 			continue
@@ -642,6 +653,9 @@ func managedVMDispositionProof(audit StorageAllocationAudit, record aj.Record, v
 		if !kept {
 			return proof, fmt.Errorf("VM allocation artifacts remain")
 		}
+	}
+	if err := storageAuditGateError(ctx, deps, "VM cleanup completion", audit, storageAuditGateAll); err != nil {
+		return proof, err
 	}
 	proof, err = storageAllocationVerification(audit, map[string]any{"operation": "VM cleanup completion", allocationEvidenceIDField: record.ID, metadataKeyVMID: vmid})
 	if err != nil {
