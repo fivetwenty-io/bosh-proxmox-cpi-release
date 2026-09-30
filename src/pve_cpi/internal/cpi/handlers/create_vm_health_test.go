@@ -268,8 +268,8 @@ func TestCreateVM_HealthGate_Enabled_AgentReadyFirstPing(t *testing.T) {
 
 func TestCreateVM_HealthGate_Enabled_TransientFaultThenReady(t *testing.T) {
 	t.Parallel()
-	// Disable production floor so the test does not pay real-time waits.
-	defer setHealthPollMinInterval(0)()
+	// A 1ms floor keeps the test from paying real-time waits.
+	ctx := handlers.WithHealthPollMinIntervalForTest(context.Background(), time.Millisecond)
 
 	callCount := 0
 	n := &healthNodes{
@@ -291,7 +291,7 @@ func TestCreateVM_HealthGate_Enabled_TransientFaultThenReady(t *testing.T) {
 		standardNetworks(), []string{}, map[string]any{})
 
 	h := handlers.HandleCreateVM(deps)
-	result, err := h.Handle(context.Background(), args, mkCtx("health-transient"))
+	result, err := h.Handle(ctx, args, mkCtx("health-transient"))
 	if err != nil {
 		t.Fatalf("create_vm with health gate, transient-then-ready: unexpected error: %v", err)
 	}
@@ -309,9 +309,9 @@ func TestCreateVM_HealthGate_Enabled_TransientFaultThenReady(t *testing.T) {
 
 func TestCreateVM_HealthGate_Enabled_Timeout_EnrichedErrorAndRollback(t *testing.T) {
 	t.Parallel()
-	// Disable production floor so the 1s timeout expires quickly without the
-	// floor adding extra latency between retries.
-	defer setHealthPollMinInterval(0)()
+	// A 1ms floor lets the 1s timeout expire quickly without the production
+	// floor adding latency between retries.
+	ctx := handlers.WithHealthPollMinIntervalForTest(context.Background(), time.Millisecond)
 
 	n := &healthNodes{
 		pingFn: func(_ context.Context, _, _ string) (*sdknodes.CreateQemuAgentPingResponse, error) {
@@ -337,7 +337,7 @@ func TestCreateVM_HealthGate_Enabled_Timeout_EnrichedErrorAndRollback(t *testing
 		standardNetworks(), []string{}, map[string]any{})
 
 	h := handlers.HandleCreateVM(deps)
-	_, err := h.Handle(context.Background(), args, mkCtx("health-timeout"))
+	_, err := h.Handle(ctx, args, mkCtx("health-timeout"))
 	if err == nil {
 		t.Fatal("expected error when agent ping times out, got nil")
 	}
@@ -362,8 +362,8 @@ func TestCreateVM_HealthGate_Enabled_Timeout_EnrichedErrorAndRollback(t *testing
 
 func TestCreateVM_HealthGate_Enabled_ContextCancelled(t *testing.T) {
 	t.Parallel()
-	// Disable production floor so context expiry (200ms) drives the test, not the floor.
-	defer setHealthPollMinInterval(0)()
+	// A 1ms floor lets the context expiry (200ms) drive the test, not the floor.
+	seamCtx := handlers.WithHealthPollMinIntervalForTest(context.Background(), time.Millisecond)
 
 	blockCh := make(chan struct{})
 	n := &healthNodes{
@@ -386,7 +386,7 @@ func TestCreateVM_HealthGate_Enabled_ContextCancelled(t *testing.T) {
 	// Long health-check timeout so only parent context expiry drives failure.
 	deps := buildHealthDeps(n, healthCheckCfg(true, 60, 0))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(seamCtx, 200*time.Millisecond)
 	defer cancel()
 	defer close(blockCh)
 
@@ -522,10 +522,8 @@ func TestHealthCheckConfig_Validate_TimeoutRange(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestCreateVM_HealthGate_ZeroInterval_FlooredToProdMin(t *testing.T) {
-	// Not parallel: this test relies on the production-default floor value (1s).
-	// Running in parallel with tests that override the floor via
-	// setHealthPollMinInterval would produce a racy result even with atomic storage.
-	defer setHealthPollMinInterval(1 * time.Second)()
+	t.Parallel()
+	// This test relies on the 1s production floor, which the context fallback supplies when no test floor is set.
 
 	// The floor (1s default) must limit call count to ≤3 within a 2s window.
 
@@ -672,7 +670,7 @@ func healthCfgWithSHA() *config.HealthCheckConfig {
 
 func TestCreateVM_AgentChecksum_Match(t *testing.T) {
 	t.Parallel()
-	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+	ctx := handlers.WithAgentChecksumTimingsForTest(context.Background(), 50*time.Millisecond, time.Millisecond)
 
 	n := &healthNodes{
 		pingFn: readyPingFn(),
@@ -690,7 +688,7 @@ func TestCreateVM_AgentChecksum_Match(t *testing.T) {
 
 	args := mkArgs("agent-checksum-match", testStemcellCID,
 		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
-	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-match"))
+	_, err := handlers.HandleCreateVM(deps).Handle(ctx, args, mkCtx("checksum-match"))
 	if err != nil {
 		t.Fatalf("matching checksum must succeed, got: %v", err)
 	}
@@ -704,7 +702,7 @@ func TestCreateVM_AgentChecksum_Match(t *testing.T) {
 
 func TestCreateVM_AgentChecksum_Mismatch_FailsAndRollsBack(t *testing.T) {
 	t.Parallel()
-	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+	ctx := handlers.WithAgentChecksumTimingsForTest(context.Background(), 50*time.Millisecond, time.Millisecond)
 
 	wrong := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	n := &healthNodes{
@@ -723,7 +721,7 @@ func TestCreateVM_AgentChecksum_Mismatch_FailsAndRollsBack(t *testing.T) {
 
 	args := mkArgs("agent-checksum-mismatch", testStemcellCID,
 		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
-	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-mismatch"))
+	_, err := handlers.HandleCreateVM(deps).Handle(ctx, args, mkCtx("checksum-mismatch"))
 	if err == nil {
 		t.Fatal("mismatched checksum must fail create_vm")
 	}
@@ -737,7 +735,7 @@ func TestCreateVM_AgentChecksum_Mismatch_FailsAndRollsBack(t *testing.T) {
 
 func TestCreateVM_AgentChecksum_ExecError_FailOpen(t *testing.T) {
 	t.Parallel()
-	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
+	ctx := handlers.WithAgentChecksumTimingsForTest(context.Background(), 50*time.Millisecond, time.Millisecond)
 
 	n := &healthNodes{
 		pingFn: readyPingFn(),
@@ -754,7 +752,7 @@ func TestCreateVM_AgentChecksum_ExecError_FailOpen(t *testing.T) {
 
 	args := mkArgs("agent-checksum-execerr", testStemcellCID,
 		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
-	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx("checksum-execerr"))
+	_, err := handlers.HandleCreateVM(deps).Handle(ctx, args, mkCtx("checksum-execerr"))
 	if err != nil {
 		t.Fatalf("exec error must be fail-open (success), got: %v", err)
 	}
@@ -775,7 +773,7 @@ func execPidFn(pid int64) func(context.Context, string, string, *sdknodes.Create
 // no rollback fires.
 func runChecksumFailOpenCase(t *testing.T, name string, statusFn func(context.Context, string, string, *sdknodes.ListQemuAgentExecStatusParams) (*sdknodes.ListQemuAgentExecStatusResponse, error)) {
 	t.Helper()
-	defer handlers.SetAgentChecksumTimings(40*time.Millisecond, time.Millisecond)()
+	ctx := handlers.WithAgentChecksumTimingsForTest(context.Background(), 40*time.Millisecond, time.Millisecond)
 
 	n := &healthNodes{
 		pingFn:            readyPingFn(),
@@ -791,7 +789,7 @@ func runChecksumFailOpenCase(t *testing.T, name string, statusFn func(context.Co
 
 	args := mkArgs(name, testStemcellCID,
 		map[string]any{"cores": 1, "memory": 512}, standardNetworks(), []string{}, map[string]any{})
-	_, err := handlers.HandleCreateVM(deps).Handle(context.Background(), args, mkCtx(name))
+	_, err := handlers.HandleCreateVM(deps).Handle(ctx, args, mkCtx(name))
 	if err != nil {
 		t.Fatalf("%s: must be fail-open (success), got: %v", name, err)
 	}

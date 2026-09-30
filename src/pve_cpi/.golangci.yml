@@ -72,11 +72,11 @@ linters:
         # via the path exclusion below.
         - pattern: '\.Tasks\b'
           msg: "await tasks via pve.AwaitTask / pve.AwaitTaskWithLogger, not raw Tasks() polling"
-        # The pve test seams put a shorter poll, backoff, or restore deadline on
-        # a request context. Production code must keep the real values, so only
-        # tests may call them; _test.go files are exempt below.
-        - pattern: '(^|\.)(WithClusterLockPollForTest|WithTestBackoff|WithParkerProtectionRestoreTimeoutForTest)$'
-          msg: "pve test seams are for tests only; production code keeps the real poll, backoff, and restore deadline"
+        # The test seams put a shorter poll, wait, backoff, floor, or restore
+        # deadline on a request context. Production code must keep the real
+        # values, so only tests may call them; _test.go files are exempt below.
+        - pattern: '(^|\.)(WithClusterLockPollForTest|WithTestBackoff|WithParkerProtectionRestoreTimeoutForTest|WithAgentChecksumTimingsForTest|WithHealthPollMinIntervalForTest|WithResizeConvergencePollForTest)$'
+          msg: "test seams are for tests only; production code keeps the real poll, wait, backoff, floor, and restore deadline"
 
     gocyclo:
       min-complexity: 40

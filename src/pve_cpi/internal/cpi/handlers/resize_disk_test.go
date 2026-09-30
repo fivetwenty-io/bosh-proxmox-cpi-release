@@ -206,7 +206,7 @@ func scriptedSizeQEMU(diskSlot, bareVolid string, sizes []string, configCalls *i
 // reported size reaches the target, then returns success.
 func TestHandleResizeDisk_ConvergenceWaitsThenConverges(t *testing.T) {
 	t.Parallel()
-	defer handlers.SetResizeConvergencePollInterval(time.Millisecond)()
+	ctx := handlers.WithResizeConvergencePollForTest(context.Background(), time.Millisecond)
 
 	var configCalls int
 	// call3=10G (current → delta 10, target 20); calls 4,5=10G (lagging); 6+=20G.
@@ -216,7 +216,7 @@ func TestHandleResizeDisk_ConvergenceWaitsThenConverges(t *testing.T) {
 	tru := true
 	deps.Config.ResizeWaitForConvergence = &tru
 
-	_, err := handlers.HandleResizeDisk(deps).Handle(context.Background(), marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
+	_, err := handlers.HandleResizeDisk(deps).Handle(ctx, marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestHandleResizeDisk_ConvergenceWaitsThenConverges(t *testing.T) {
 // blocks the director). A short-deadline context bounds the wait.
 func TestHandleResizeDisk_ConvergenceBestEffortTimeout(t *testing.T) {
 	t.Parallel()
-	defer handlers.SetResizeConvergencePollInterval(time.Millisecond)()
+	seamCtx := handlers.WithResizeConvergencePollForTest(context.Background(), time.Millisecond)
 
 	var configCalls int
 	// Always report the old 10G — target 20G is never reached.
@@ -242,7 +242,7 @@ func TestHandleResizeDisk_ConvergenceBestEffortTimeout(t *testing.T) {
 	deps.Config.ResizeWaitForConvergence = &tru
 	deps.Config.ResizeConvergenceTimeoutSec = 3600 // large; parent ctx bounds the test
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx, cancel := context.WithTimeout(seamCtx, 40*time.Millisecond)
 	defer cancel()
 
 	_, err := handlers.HandleResizeDisk(deps).Handle(ctx, marshalArgs(mustEncodeDiskCID(t, diskCID, nil), 20480), jsonrpc.Context{})

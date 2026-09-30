@@ -4,7 +4,6 @@ import (
 	"context"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -16,32 +15,52 @@ import (
 // is asserted against health_check.expected_agent_sha256 (§7.29).
 const agentChecksumPath = "/var/vcap/bosh/bin/bosh-agent"
 
-// agentChecksumExecMaxWaitNs bounds the total wait for the guest-agent exec to
-// finish, stored as nanoseconds in an atomic int64 so tests can shrink it.
-// sha256sum of the ~20 MiB agent binary completes well under a second; 30s is a
-// generous ceiling that still bounds a wedged guest agent.
-var agentChecksumExecMaxWaitNs atomic.Int64
+// agentChecksumExecMaxWait bounds the total wait for the guest-agent exec to
+// finish. sha256sum of the ~20 MiB agent binary completes well under a second;
+// 30s is a generous ceiling that still bounds a wedged guest agent.
+const agentChecksumExecMaxWait = 30 * time.Second
 
-// agentChecksumPollIntervalNs is the wait between exec-status polls. Default 1s.
-var agentChecksumPollIntervalNs atomic.Int64
+// agentChecksumPollInterval is the wait between exec-status polls.
+const agentChecksumPollInterval = 1 * time.Second
 
-func init() {
-	agentChecksumExecMaxWaitNs.Store(int64(30 * time.Second))
-	agentChecksumPollIntervalNs.Store(int64(1 * time.Second))
+// agentChecksumTimingsKey carries a test's shorter exec max-wait and poll
+// interval on the request context.
+type agentChecksumTimingsKey struct{}
+
+type agentChecksumTimings struct {
+	maxWait, pollInterval time.Duration
 }
 
-// SetAgentChecksumTimings overrides the exec max-wait and poll interval for the
-// duration of a test and returns a restore function. Keeps §7.29 unit tests
-// instant.
-//
-//	defer handlers.SetAgentChecksumTimings(50*time.Millisecond, time.Millisecond)()
-func SetAgentChecksumTimings(maxWait, pollInterval time.Duration) func() {
-	prevMax := agentChecksumExecMaxWaitNs.Swap(int64(maxWait))
-	prevPoll := agentChecksumPollIntervalNs.Swap(int64(pollInterval))
-	return func() {
-		agentChecksumExecMaxWaitNs.Store(prevMax)
-		agentChecksumPollIntervalNs.Store(prevPoll)
+// WithAgentChecksumTimingsForTest returns a context whose agent checksum waits
+// use maxWait and pollInterval instead of agentChecksumExecMaxWait and
+// agentChecksumPollInterval. Each value is ignored on its own when it is zero
+// or less, so a test can shorten one without the other. It rides the context
+// rather than a package variable, so tests that set it can run in parallel.
+// Production code never calls it; it mirrors pve.WithTestBackoff.
+func WithAgentChecksumTimingsForTest(ctx context.Context, maxWait, pollInterval time.Duration) context.Context {
+	current := agentChecksumTimingsFrom(ctx)
+	if maxWait > 0 {
+		current.maxWait = maxWait
 	}
+	if pollInterval > 0 {
+		current.pollInterval = pollInterval
+	}
+	return context.WithValue(ctx, agentChecksumTimingsKey{}, current)
+}
+
+// agentChecksumTimingsFrom returns the timings ctx carries, falling back to the
+// production constants for any value a test did not set.
+func agentChecksumTimingsFrom(ctx context.Context) agentChecksumTimings {
+	timings := agentChecksumTimings{maxWait: agentChecksumExecMaxWait, pollInterval: agentChecksumPollInterval}
+	if set, ok := ctx.Value(agentChecksumTimingsKey{}).(agentChecksumTimings); ok {
+		if set.maxWait > 0 {
+			timings.maxWait = set.maxWait
+		}
+		if set.pollInterval > 0 {
+			timings.pollInterval = set.pollInterval
+		}
+	}
+	return timings
 }
 
 // runHealthGate runs the opt-in post-create health gate: first wait for the
@@ -157,8 +176,8 @@ func awaitAgentExec(
 	pid int64,
 	logger *log.Logger,
 ) (*sdknodes.ListQemuAgentExecStatusResponse, bool) {
-	maxWait := time.Duration(agentChecksumExecMaxWaitNs.Load())
-	interval := time.Duration(agentChecksumPollIntervalNs.Load())
+	timings := agentChecksumTimingsFrom(ctx)
+	maxWait, interval := timings.maxWait, timings.pollInterval
 
 	ectx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
