@@ -864,3 +864,36 @@ func TestProcessLockOwner_KeepsSafeTokens(t *testing.T) {
 		t.Errorf("ProcessLockOwner(\"\") = %q, want the unnamed fallback", got)
 	}
 }
+
+// TestRelease_MarksItsOwnClaim pins which sentinel deletes carry the own-claim
+// mark a poisoned allocation guard honors. A release of our handle carries it
+// with the claim our confirming read returned. A steal's delete of someone
+// else's expired claim does not.
+func TestRelease_MarksItsOwnClaim(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	var marked []string
+	f.deleteHook = func(ctx context.Context, _, stored string) {
+		if claim, own := OwnLockClaim(ctx); own {
+			if claim != stored {
+				t.Errorf("own claim %q does not match the sentinel's %q", claim, stored)
+			}
+			marked = append(marked, "own")
+			return
+		}
+		marked = append(marked, "not own")
+	}
+	start := time.Unix(1000, 0)
+	f.pools["bosh-lock-web"] = encodeLockComment("crashed", start.Add(-time.Minute))
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 5*time.Second,
+		fixedClock(start, time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(marked, ",") != "not own,own" {
+		t.Fatalf("delete marks = %v, want the steal unmarked and the release marked", marked)
+	}
+}

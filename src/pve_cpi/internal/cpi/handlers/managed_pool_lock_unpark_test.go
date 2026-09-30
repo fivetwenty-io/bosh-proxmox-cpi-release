@@ -15,6 +15,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
 // contendedFlowPVE is one request's cluster in the lifecycle flow fixture. Its
@@ -26,8 +27,38 @@ type contendedFlowPVE struct {
 	locks *lockContention
 	gate  <-chan struct{}
 	// enter, when set, runs as a disk move reaches PVE, after the guard has
-	// admitted it.
-	enter func()
+	// admitted it, and moveErr, when set, is what that move then returns.
+	enter   func()
+	moveErr error
+	// onSnapshots and onConfig, when set, see a VM's snapshot listing and a
+	// VM's config read.
+	onSnapshots func(vmid int)
+	onConfig    func(ctx context.Context, vmid int)
+}
+
+func (c contendedFlowPVE) QEMU() qemu.Service {
+	return watchedFlowQEMU{Service: c.lifecycleFlowPVE.QEMU(), onSnapshots: c.onSnapshots, onConfig: c.onConfig}
+}
+
+// watchedFlowQEMU reports snapshot listings and config reads to the test.
+type watchedFlowQEMU struct {
+	qemu.Service
+	onSnapshots func(vmid int)
+	onConfig    func(ctx context.Context, vmid int)
+}
+
+func (q watchedFlowQEMU) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]interface{}, error) {
+	if q.onSnapshots != nil {
+		q.onSnapshots(vmid)
+	}
+	return q.Service.ListSnapshots(ctx, node, vmid)
+}
+
+func (q watchedFlowQEMU) Config(ctx context.Context, node string, vmid int) (map[string]interface{}, error) {
+	if q.onConfig != nil {
+		q.onConfig(ctx, vmid)
+	}
+	return q.Service.Config(ctx, node, vmid)
 }
 
 func (c contendedFlowPVE) Pools() pve.PoolService {
@@ -35,18 +66,22 @@ func (c contendedFlowPVE) Pools() pve.PoolService {
 }
 
 func (c contendedFlowPVE) Nodes() nodes.Service {
-	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE}, gate: c.gate, enter: c.enter}
+	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE}, gate: c.gate, enter: c.enter, moveErr: c.moveErr}
 }
 
 type gatedFlowNodes struct {
 	lifecycleFlowNodes
-	gate  <-chan struct{}
-	enter func()
+	gate    <-chan struct{}
+	enter   func()
+	moveErr error
 }
 
 func (n gatedFlowNodes) CreateQemuMoveDisk(ctx context.Context, node, vmid string, p *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
 	if n.enter != nil {
 		n.enter()
+	}
+	if n.moveErr != nil {
+		return nil, n.moveErr
 	}
 	if n.gate != nil {
 		select {
@@ -1036,4 +1071,73 @@ func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
 		t.Fatal("the read after the create never failed, so the test proves nothing")
 	}
 	assertReturnedRecord(t, "attached", disk.record(t))
+}
+
+// TestManagedAttachPoisonedWindowReleasesItsSentinel covers a window whose disk
+// move fails after the guard admitted it. The guard is poisoned and the
+// allocation needs reconciliation, as before. The window's own sentinel is
+// still released, because the release reads it back, finds exactly our claim,
+// and deletes it, so the next request on this parker does not wait out a
+// whole TTL behind one uncertain request.
+func TestManagedAttachPoisonedWindowReleasesItsSentinel(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	disk.deps.PVE = contendedFlowPVE{lifecycleFlowPVE: disk.client, locks: locks, moveErr: errors.New("move task failed")}
+
+	if err := disk.attach(t.Context()); err == nil {
+		t.Fatal("an attach whose move failed reported success")
+	}
+	if record := disk.record(t); record.State != aj.ReconciliationRequired {
+		t.Fatalf("allocation state = %s, want %s", record.State, aj.ReconciliationRequired)
+	}
+	if n := sentinelCount(locks); n != 0 {
+		t.Fatalf("the poisoned request left its sentinel standing: %v", locks.pools)
+	}
+}
+
+// TestManagedAttachEndedBeforeTheLockCreateFailsTheCall ends the request just
+// before its parker lock create. The guard refuses that create as not
+// attempted, and the call fails there instead of running the parker window
+// unserialized, where every write would be refused anyway. Nothing was
+// admitted, so the allocation is returned with a retriable error.
+func TestManagedAttachEndedBeforeTheLockCreateFailsTheCall(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ended := false
+	windowReads := 0
+	disk.deps.PVE = contendedFlowPVE{
+		lifecycleFlowPVE: disk.client, locks: locks,
+		// The attach lists the VM's snapshots right before it moves the
+		// disk, which is the last read before the parker lock create.
+		onSnapshots: func(vmid int) {
+			if vmid == 777 {
+				ended = true
+				cancel()
+			}
+		},
+		// The window's first call reads the parker's config on the ended
+		// request's context. The completion that returns the allocation
+		// reads it too, but on its own detached context.
+		onConfig: func(ctx context.Context, vmid int) {
+			if ctx.Err() != nil && vmid == disk.parker {
+				windowReads++
+			}
+		},
+	}
+
+	err := disk.attach(ctx)
+	if !ended {
+		t.Fatal("the attach never listed the VM's snapshots, so the test proves nothing")
+	}
+	if windowReads != 0 {
+		t.Fatalf("the parker window ran on the ended request: %d parker config reads", windowReads)
+	}
+	assertCleanCancellation(t, disk, err, errManagedRequestEnded)
+	if n := sentinelCount(locks); n != 0 {
+		t.Fatalf("a sentinel was created on the ended request: %v", locks.pools)
+	}
 }

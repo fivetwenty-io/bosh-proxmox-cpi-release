@@ -37,7 +37,10 @@ type lockGuardPools struct {
 	// readErrs scripts the plain reads in order. A nil entry reads the state
 	// as usual, and the reads after the script runs out do the same.
 	readErrs []error
-	calls    []string
+	// readComments scripts the comment each plain read answers with, in the
+	// same way. An empty entry answers with the stored state.
+	readComments []string
+	calls        []string
 }
 
 // poolVerdictError is PVE's 500 answer carrying message, as the SDK wraps it.
@@ -99,6 +102,13 @@ func (p *lockGuardPools) GetPoolComment(_ context.Context, id string) (string, b
 		p.readErrs = p.readErrs[1:]
 		if err != nil {
 			return "", false, err
+		}
+	}
+	if len(p.readComments) > 0 {
+		comment := p.readComments[0]
+		p.readComments = p.readComments[1:]
+		if comment != "" {
+			return comment, true, nil
 		}
 	}
 	return p.comment, p.found, p.readErr
@@ -604,5 +614,99 @@ func TestGuardedReleaseDeletesWhenPVENormalizesTheClaim(t *testing.T) {
 	}
 	if guard.Err() != nil {
 		t.Fatalf("the release poisoned the guard: %v", guard.Err())
+	}
+}
+
+// TestPoisonedGuardReleasesAProvenOwnSentinel covers our own release after the
+// guard was poisoned. begin refuses every write on a poisoned guard, so this
+// release used to be refused and our claim stood for a whole TTL. The release
+// is marked as our own claim, and the guard's read right before the delete
+// finds exactly that claim, so the sentinel is deleted.
+func TestPoisonedGuardReleasesAProvenOwnSentinel(t *testing.T) {
+	pools := &lockGuardPools{}
+	guard := newLockGuard(t, pools, &lockGuardEvents{})
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = guard.Poison(errors.New("an earlier write was uncertain"))
+	if err := handle.Release(t.Context()); err != nil {
+		t.Fatalf("the poisoned guard refused our own release: %v", err)
+	}
+	if pools.found || !deletedByPVE(pools) {
+		t.Fatalf("our sentinel is still standing: %v", pools.calls)
+	}
+}
+
+// TestPoisonedGuardLeavesAClaimItCannotProve is the other side. A poisoned
+// guard deletes nothing it cannot prove is our own claim: not when its read
+// right before the delete fails, not when that read finds another claim, and
+// never for a delete that is not marked as our own, such as a steal's.
+func TestPoisonedGuardLeavesAClaimItCannotProve(t *testing.T) {
+	for name, script := range map[string]func(p *lockGuardPools){
+		// Release reads the claim first, and the guard's own read comes next.
+		"the read fails": func(p *lockGuardPools) { p.readErrs = []error{nil, errors.New("connection reset by peer")} },
+		"another claim":  func(p *lockGuardPools) { p.readComments = []string{"", "owner=S1@h/2-b-1 exp=99999999999"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pools := &lockGuardPools{}
+			guard := newLockGuard(t, pools, &lockGuardEvents{})
+			handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = guard.Poison(errors.New("an earlier write was uncertain"))
+			script(pools)
+			_ = handle.Release(t.Context())
+			if deletedByPVE(pools) || !pools.found {
+				t.Fatalf("the poisoned guard deleted a claim it could not prove: %v", pools.calls)
+			}
+		})
+	}
+	t.Run("a steal's delete", func(t *testing.T) {
+		const expired = "owner=crashed@h/3-c-1 exp=1"
+		pools := &lockGuardPools{found: true, comment: expired}
+		guard := newLockGuard(t, pools, &lockGuardEvents{})
+		_ = guard.Poison(errors.New("an earlier write was uncertain"))
+		if err := guard.Client().Pools().DeletePool(pve.WithExpectedLockClaim(t.Context(), expired), lockGuardPool); err == nil {
+			t.Fatal("the poisoned guard accepted a steal's delete")
+		}
+		if deletedByPVE(pools) || !pools.found {
+			t.Fatalf("the poisoned guard deleted someone else's claim: %v", pools.calls)
+		}
+	})
+}
+
+// TestGuardedReleaseReadFailureNeverReadsAWaiterAsUnobserved pins why a
+// guarded release refuses its delete when its read right before the delete
+// fails. A waiter polls for exactly the moment our sentinel goes, and its new
+// sentinel can land before our readback. Without a known claim from before the
+// delete, that readback could not tell the waiter's sentinel from ours and
+// would report "lock deletion not observed", poisoning an allocation whose
+// release worked. expectedLockClaimRefusal refuses first, before PVE is
+// called, with a retriable error, so the release is retried instead.
+func TestGuardedReleaseReadFailureNeverReadsAWaiterAsUnobserved(t *testing.T) {
+	pools := &lockGuardPools{}
+	events := &lockGuardEvents{}
+	guard := newLockGuard(t, pools, events)
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pools.successor = "owner=waiter@h/9-z-1 exp=99999999999"
+	// Release reads the claim first, and the guard's own read comes next.
+	pools.readErrs = []error{nil, errors.New("connection reset by peer")}
+	err = handle.Release(t.Context())
+	if err == nil || strings.Contains(err.Error(), "lock deletion not observed") {
+		t.Fatalf("want the retriable pre-delete refusal, got %v", err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the refusal is not retriable: %v", err)
+	}
+	if deletedByPVE(pools) {
+		t.Fatalf("the delete reached PVE without a known claim: %v", pools.calls)
+	}
+	if guard.Err() != nil || events.failed != 0 {
+		t.Fatalf("the refused release poisoned the guard: %v", guard.Err())
 	}
 }
