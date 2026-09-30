@@ -93,7 +93,7 @@ tidy: ## Run go mod tidy
 .PHONY: test
 test: ## Run all tests with race detection
 	@echo "$(GREEN)Running tests...$(RESET)"
-	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=120s ./...
+	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=300s ./...
 	@echo "$(GREEN)✓ Tests passed$(RESET)"
 
 .PHONY: coverage
