@@ -191,11 +191,15 @@ func storageJournalLine(s string) string {
 // rerun as the right user. Tests supply their own, because CI runs as root and
 // cannot give a file to another owner portably.
 type storageJournalHost struct {
-	euid     int
-	lookup   func(uid string) (*user.User, error)
-	argv     []string
-	ownerOf  func(path string) (int, bool)
-	readable func(path string) error
+	euid    int
+	lookup  func(uid string) (*user.User, error)
+	argv    []string
+	ownerOf func(path string) (int, bool)
+	// groupReader returns the UID of the account named like the group of a
+	// group-readable path. BOSH renders job config root-owned and readable by
+	// the vcap group, so that account, not the root owner, is the one to name.
+	groupReader func(path string) (int, bool)
+	readable    func(path string) error
 }
 
 func newStorageJournalHost(args []string) storageJournalHost {
@@ -204,11 +208,12 @@ func newStorageJournalHost(args []string) storageJournalHost {
 		executable = "cpi"
 	}
 	return storageJournalHost{
-		euid:     os.Geteuid(),
-		lookup:   user.LookupId,
-		argv:     append([]string{executable, "storage-journal"}, args...),
-		ownerOf:  storageJournalPathOwner,
-		readable: storageJournalReadable,
+		euid:        os.Geteuid(),
+		lookup:      user.LookupId,
+		argv:        append([]string{executable, "storage-journal"}, args...),
+		ownerOf:     storageJournalPathOwner,
+		groupReader: storageJournalGroupReader,
+		readable:    storageJournalReadable,
 	}
 }
 
@@ -231,6 +236,33 @@ func storageJournalPathOwner(path string) (int, bool) {
 	}
 }
 
+// storageJournalGroupReader returns the UID of the account whose name matches
+// the group of path, when that group may read path. It reports false when the
+// group cannot read path or no account carries the group's name.
+func storageJournalGroupReader(path string) (int, bool) {
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm()&0o040 == 0 {
+		return -1, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1, false
+	}
+	group, err := user.LookupGroupId(strconv.FormatUint(uint64(stat.Gid), 10))
+	if err != nil {
+		return -1, false
+	}
+	account, err := user.Lookup(group.Name)
+	if err != nil {
+		return -1, false
+	}
+	uid, err := strconv.Atoi(account.Uid)
+	if err != nil {
+		return -1, false
+	}
+	return uid, true
+}
+
 func storageJournalReadable(path string) error {
 	f, err := os.Open(path) // #nosec G304 -- operator-supplied CLI config path; opened only to test access
 	if err != nil {
@@ -245,18 +277,24 @@ func storageJournalReadable(path string) error {
 // command to repeat. It fires for any other user, not only root, because an
 // operator's own account is as unable to open a vcap journal as root is.
 func journalOwnerHint(dirUID, euid int, lookup func(string) (*user.User, error), argv []string) string {
-	if dirUID < 0 || dirUID == euid || len(argv) == 0 {
+	return storageJournalRerunHint("owned by", dirUID, euid, lookup, argv)
+}
+
+// storageJournalRerunHint says how uid relates to a path and gives the command
+// that reruns this invocation as uid, or "" when there is nothing to rerun.
+func storageJournalRerunHint(relation string, uid, euid int, lookup func(string) (*user.User, error), argv []string) string {
+	if uid < 0 || uid == euid || len(argv) == 0 {
 		return ""
 	}
-	owner, target := fmt.Sprintf("uid %d", dirUID), fmt.Sprintf("#%d", dirUID)
-	if account, err := lookup(strconv.Itoa(dirUID)); err == nil && account != nil && account.Username != "" {
-		owner, target = account.Username, account.Username
+	name, target := fmt.Sprintf("uid %d", uid), fmt.Sprintf("#%d", uid)
+	if account, err := lookup(strconv.Itoa(uid)); err == nil && account != nil && account.Username != "" {
+		name, target = account.Username, account.Username
 	}
 	quoted := make([]string, len(argv))
 	for i, arg := range argv {
 		quoted[i] = shellQuoteArg(arg)
 	}
-	return fmt.Sprintf("owned by %s; rerun as that user: sudo -u %s %s", owner, shellQuoteArg(target), strings.Join(quoted, " "))
+	return fmt.Sprintf("%s %s; rerun as that user: sudo -u %s %s", relation, name, shellQuoteArg(target), strings.Join(quoted, " "))
 }
 
 func storageJournalUserName(uid int, lookup func(string) (*user.User, error)) string {
@@ -333,6 +371,13 @@ func storageJournalConfigProblem(path string, host storageJournalHost) string {
 		return fmt.Sprintf("config %s not found", path)
 	case errors.Is(err, fs.ErrPermission):
 		message := fmt.Sprintf("config %s is not readable by %s", path, storageJournalUserName(host.euid, host.lookup))
+		if host.groupReader != nil {
+			if reader, ok := host.groupReader(path); ok {
+				if hint := storageJournalRerunHint("readable by group", reader, host.euid, host.lookup, host.argv); hint != "" {
+					return message + "; it is " + hint
+				}
+			}
+		}
 		if owner, ok := host.ownerOf(path); ok {
 			if hint := journalOwnerHint(owner, host.euid, host.lookup, host.argv); hint != "" {
 				message += "; it is " + hint

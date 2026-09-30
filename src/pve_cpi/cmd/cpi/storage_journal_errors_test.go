@@ -192,6 +192,8 @@ func TestStorageJournalConfigProblem(t *testing.T) {
 		{"missing", missing, hintTestHost(0), "config " + missing + " not found"},
 		{"unreadable by another user", present, storageJournalHost{euid: 501, lookup: hintTestLookup, argv: hintTestArgv, ownerOf: func(string) (int, bool) { return 1000, true }, readable: denied},
 			"config " + present + " is not readable by operator; it is owned by vcap; rerun as that user: sudo -u vcap " + strings.Join(hintTestArgv, " ")},
+		{"root-owned and readable by the vcap group", present, storageJournalHost{euid: 501, lookup: hintTestLookup, argv: hintTestArgv, ownerOf: func(string) (int, bool) { return 0, true }, groupReader: func(string) (int, bool) { return 1000, true }, readable: denied},
+			"config " + present + " is not readable by operator; it is readable by group vcap; rerun as that user: sudo -u vcap " + strings.Join(hintTestArgv, " ")},
 		{"unreadable by its owner", present, storageJournalHost{euid: 1000, lookup: hintTestLookup, argv: hintTestArgv, ownerOf: func(string) (int, bool) { return 1000, true }, readable: denied},
 			"config " + present + " is not readable by vcap"},
 		{"a directory", base, storageJournalHost{euid: 1000, lookup: hintTestLookup, argv: hintTestArgv, ownerOf: func(string) (int, bool) { return 1000, true }, readable: func(string) error { return nil }},

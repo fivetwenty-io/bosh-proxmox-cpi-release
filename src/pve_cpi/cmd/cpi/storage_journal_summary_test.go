@@ -185,3 +185,20 @@ func TestStorageJournalSummaryAndJSONShareExitCodes(t *testing.T) {
 		t.Fatalf("index-lost summary exited %d: %s", code, out)
 	}
 }
+
+// An accepted move prints after the findings, naming the kind, allocation,
+// VM, recorded nodes, and observed node, so an operator can see which moves
+// the audit accepted without reading JSON.
+func TestStorageJournalSummaryListsObservedMoves(t *testing.T) {
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		ObservedMoves: []handlers.StorageAllocationMove{
+			{AllocationID: "180f7d1e", Kind: "vm", VMID: 4626, RecordedNodes: []string{"pvupvecf101"}, ObservedNode: "pvupvecf102"},
+		},
+	}
+	lines := storageJournalFindingLines(report)
+	want := []string{"observed move: vm allocation 180f7d1e (VM 4626) moved from pvupvecf101 to pvupvecf102"}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("lines = %q, want %q", lines, want)
+	}
+}
