@@ -65,7 +65,9 @@ func TestAllocationCleanupRefusalsPreserveJournalAndResources(t *testing.T) {
 				}
 			case "duplicate holder":
 				client.state.configs[778] = map[string]any{"scsi1": client.state.configs[777]["scsi1"]}
-				lead = "allocation cleanup refused: 1 audit conflict; disk allocation " + id + " has 2 holders"
+				// Two VMs on one volume also raise the shared-reference
+				// conflict, which sorts after the holder conflict.
+				lead = "allocation cleanup refused: 2 audit conflicts; disk allocation " + id + " has 2 holders"
 			case "malformed provenance":
 				client.state.configs[456] = map[string]any{"description": "<!--BOSH:{broken-provenance-->"}
 				lead = "allocation cleanup refused: 1 audit issue; VM 456 has malformed disk provenance on n1"
