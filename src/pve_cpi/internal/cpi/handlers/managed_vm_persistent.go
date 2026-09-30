@@ -8,6 +8,10 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 )
 
+// attachExistingDiskForVM is the disk attach attachPersistent runs. Tests
+// replace it to drive the VM allocation's side of a disk outcome.
+var attachExistingDiskForVM = attachExistingDiskToManagedVM
+
 // The persistent allocation owns its mutations and any parker. The VM records
 // the handoff without treating the independently owned disk as a VM allocation.
 func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolvedDisk) error {
@@ -29,8 +33,19 @@ func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolve
 	if err != nil {
 		return err
 	}
-	slot, err := attachExistingDiskToManagedVM(ctx, m.deps, m.handle, disk, m.shape.node, m.vmid)
+	slot, err := attachExistingDiskForVM(ctx, m.deps, m.handle, disk, m.shape.node, m.vmid)
 	if err != nil {
+		if isDiskReturnedAfterLockTimeout(err) && m.guard.Err() == nil {
+			// The disk's lifecycle waited out another request's parker window
+			// and returned the disk unchanged, so the handoff this step
+			// records never touched the VM. Settle the step and hand the
+			// retriable timeout back without poisoning the VM allocation, so
+			// its attempt retry or the Director's retry resumes from here.
+			if observeErr := storageMutationObserved(m.handle, step, nil, false); observeErr != nil {
+				return m.guard.Poison(storageAllocationUncertain(m.handle, "persistent disk attachment"))
+			}
+			return err
+		}
 		return m.guard.Poison(storageAllocationUncertain(m.handle, "persistent disk attachment"))
 	}
 	current, err := resolveDiskForOp(ctx, m.deps, "create_vm", disk.diskCID, disk.birth, disk.meta)

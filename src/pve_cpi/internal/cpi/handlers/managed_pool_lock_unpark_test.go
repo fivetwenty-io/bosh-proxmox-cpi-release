@@ -345,10 +345,243 @@ func TestManagedDetachLockTimeoutKeepsTheTimeout(t *testing.T) {
 	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("detach did not hand back the retriable lock timeout: %v", err)
 	}
-	t.Logf("record after the timed-out detach: %s (%s)", disk.record(t).State, disk.record(t).Reason)
+	// The parked detach waits for the parker lock before it touches the disk,
+	// so the timeout returns the allocation exactly as it was.
+	assertReturnedRecord(t, "timed-out detach", disk.record(t))
 	locks.reset()
 	if err := detach(); err != nil {
 		t.Fatalf("the detach retry failed: %v", err)
 	}
 	assertReturnedRecord(t, "retried detach", disk.record(t))
+}
+
+// TestManagedAttachOverlayBeforeTimeoutStaysUncertain drives the attach
+// ordering the mutation gate exists for. The parked disk carries drive-option
+// overrides, so the attach writes them onto the receiving VM before it waits
+// for the parker lock. That write is a real, observed change to the disk's
+// holders, so when the wait runs out the allocation must go uncertain rather
+// than snap back.
+func TestManagedAttachOverlayBeforeTimeoutStaysUncertain(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	withParkedOverlay(t, disk, map[string]string{"discard": "on", "ssd": "1"})
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	err := disk.attach(t.Context())
+	if !errors.Is(err, pve.ErrClusterLockTimeout) {
+		t.Fatalf("want the lock timeout, got %v", err)
+	}
+	if overlay := overlayOn(t, disk); !strings.Contains(overlay, `"ssd":"1"`) {
+		t.Fatalf("the attach did not write the overrides before it waited: %s", overlay)
+	}
+	record := disk.record(t)
+	if record.State != aj.ReconciliationRequired {
+		t.Fatalf("a timeout after an observed overlay write left the allocation %s", record.State)
+	}
+	observedWrite := false
+	for i := range record.Steps {
+		if record.Steps[i].Kind == "lifecycle_attach_disk_Nodes_UpdateQemuConfig" && record.Steps[i].State == aj.Observed && record.Steps[i].Target.VMID == 777 {
+			observedWrite = true
+		}
+	}
+	if !observedWrite {
+		t.Fatalf("the overlay write was not journaled as an observed step: %+v", record.Steps)
+	}
+}
+
+// resolveFlowDisk resolves a flow fixture disk the way the handlers do.
+func resolveFlowDisk(t *testing.T, disk *parkedFlowDisk) resolvedDisk {
+	t.Helper()
+	bare, meta, err := decodeDiskCID(t.Context(), disk.deps, "create_vm", disk.cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd, err := resolveDiskForOp(t.Context(), disk.deps, "create_vm", disk.cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rd
+}
+
+// assertCleanDiskTimeout checks what a caller holding its own allocation
+// relies on after a disk operation waited out a parker lock. The error carries
+// the returned-disk marker and the retriable timeout, the wait was the managed
+// one rather than the 15-second default, and the disk's record is returned.
+func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elapsed time.Duration) {
+	t.Helper()
+	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+	}
+	assertReturnedRecord(t, "timed-out", disk.record(t))
+}
+
+// TestCreateVMPreAttachUsesTheManagedWait covers create_vm's disk_cids
+// pre-attach, which unparks through the same parker lock as attach_disk.
+func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	rd := resolveFlowDisk(t, disk)
+	started := time.Now()
+	_, err := attachManagedPersistentDisk(t.Context(), disk.deps, "777", "n1", 777, rd)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+}
+
+// TestDeleteVMPreservationUsesTheManagedWait covers delete_vm's
+// preserve_disk, which parks the disk through the same parker lock as
+// detach_disk.
+func TestDeleteVMPreservationUsesTheManagedWait(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("attach before the preservation: %v", err)
+	}
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	rd := resolveFlowDisk(t, disk)
+	started := time.Now()
+	err := detachManagedPersistentForVMDeleteOne(t.Context(), disk.deps, "n1", 777, rd, nil)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+}
+
+// createdManagedVM is a VM allocation whose root exists, ready for the
+// post-create steps.
+func createdManagedVM(t *testing.T) *managedVMAllocation {
+	t.Helper()
+	m, _, _, _ := newManagedVMGuardCase(t, managedVMGuardCase{})
+	guarded := m.deps
+	guarded.PVE = m.guard.Client()
+	if err := createManagedVMRoot(t.Context(), guarded, m.parsed, m.shape, m.prepared.plan.Targets[0], 101, m.marker); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func withDiskAttachOutcome(t *testing.T, outcome error) {
+	t.Helper()
+	previous := attachExistingDiskForVM
+	attachExistingDiskForVM = func(context.Context, Deps, *aj.Handle, resolvedDisk, string, int) (string, error) {
+		return "", outcome
+	}
+	t.Cleanup(func() { attachExistingDiskForVM = previous })
+}
+
+func lockTimeoutError() error {
+	return cpierrors.WrapAs(errors.Join(errors.New("held"), pve.ErrClusterLockTimeout), cpierrors.TypeRetriableCloud, "AcquireClusterLock: timed out")
+}
+
+// TestVMAllocationSettlesACleanDiskTimeout is create_vm's side of the same
+// wait-out. The disk came back unchanged, so the VM's handoff step is settled,
+// the VM guard stays clean, and the post-create failure goes back retriable
+// without marking the VM allocation uncertain.
+func TestVMAllocationSettlesACleanDiskTimeout(t *testing.T) {
+	m := createdManagedVM(t)
+	withDiskAttachOutcome(t, &diskReturnedAfterLockTimeout{err: lockTimeoutError()})
+
+	err := m.attachPersistent(t.Context(), resolvedDisk{diskCID: "pvd-example"})
+	if !isDiskReturnedAfterLockTimeout(err) || m.guard.Err() != nil {
+		t.Fatalf("a clean disk timeout poisoned the VM allocation: err=%v guard=%v", err, m.guard.Err())
+	}
+	if final := m.postCreateFailure(err); !errors.Is(final, pve.ErrClusterLockTimeout) || !cpierrors.IsType(final, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the post-create failure lost the retriable timeout: %v", final)
+	}
+	record := m.handle.Record()
+	if record.State == aj.ReconciliationRequired {
+		t.Fatalf("a clean disk timeout demanded reconciliation: %s", record.Reason)
+	}
+	found := false
+	for i := range record.Steps {
+		if record.Steps[i].State != aj.Observed {
+			t.Fatalf("step %s (%s) left %s", record.Steps[i].ID, record.Steps[i].Kind, record.Steps[i].State)
+		}
+		found = found || strings.HasPrefix(record.Steps[i].Kind, "vm.persistent.")
+	}
+	if !found {
+		t.Fatal("the VM's handoff step was never journaled")
+	}
+}
+
+// TestVMAllocationPoisonsOnAnUncertainDiskFailure is the negative case. A disk
+// failure that is not a clean wait-out still poisons the VM allocation.
+func TestVMAllocationPoisonsOnAnUncertainDiskFailure(t *testing.T) {
+	for name, outcome := range map[string]error{
+		"bare timeout without the marker": lockTimeoutError(),
+		"other disk failure":              cpierrors.Cloud("transfer failed"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := createdManagedVM(t)
+			withDiskAttachOutcome(t, outcome)
+			err := m.attachPersistent(t.Context(), resolvedDisk{diskCID: "pvd-example"})
+			if err == nil || m.guard.Err() == nil {
+				t.Fatalf("an uncertain disk failure left the VM guard clean: %v", err)
+			}
+			if record := m.handle.Record(); record.State != aj.ReconciliationRequired {
+				t.Fatalf("an uncertain disk failure left the VM allocation %s", record.State)
+			}
+		})
+	}
+}
+
+// TestVMCleanupFailureRules covers delete_vm's side. A preservation that
+// waited out the parker lock leaves nothing uncertain while every step is
+// observed, and any other failure marks the VM allocation uncertain.
+func TestVMCleanupFailureRules(t *testing.T) {
+	m := createdManagedVM(t)
+	returned := &diskReturnedAfterLockTimeout{err: lockTimeoutError()}
+	if err := managedVMCleanupFailure(m.handle, returned); !isDiskReturnedAfterLockTimeout(err) || m.handle.Record().State == aj.ReconciliationRequired {
+		t.Fatalf("a clean preservation timeout marked the VM uncertain: %v %s", err, m.handle.Record().State)
+	}
+	if err := managedVMCleanupFailure(m.handle, cpierrors.Cloud("preservation failed")); err == nil || m.handle.Record().State != aj.ReconciliationRequired {
+		t.Fatalf("an uncertain preservation failure left the VM %s", m.handle.Record().State)
+	}
+}
+
+// TestManagedLockWaitDoesNotGrowTheRecord waits out a live holder for several
+// seconds, which is several polls. Only the first refused create reaches PVE
+// and the journal, so the disk record grows by one step however long the wait
+// runs.
+func TestManagedLockWaitDoesNotGrowTheRecord(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 5*time.Second)
+	before, err := json.Marshal(disk.record(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := disk.attach(t.Context()); !errors.Is(err, pve.ErrClusterLockTimeout) {
+		t.Fatalf("want the lock timeout, got %v", err)
+	}
+	record := disk.record(t)
+	after, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creates := 0
+	for i := range record.Steps {
+		if record.Steps[i].Kind == "lifecycle_attach_disk_Pool_CreatePool" {
+			creates++
+		}
+	}
+	locks.mu.Lock()
+	rejections := locks.rejections
+	locks.mu.Unlock()
+	if creates != 1 || rejections != 1 {
+		t.Fatalf("a 5-second wait journaled %d sentinel creates and sent PVE %d, want one of each", creates, rejections)
+	}
+	if growth := len(after) - len(before); growth > 2048 {
+		t.Fatalf("a 5-second wait grew the record by %d bytes", growth)
+	}
 }

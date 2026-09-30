@@ -50,23 +50,88 @@ func isManagedLockPool(poolID string) bool {
 //
 // Comparing claims relies on one invariant. Every owner token that reaches a
 // sentinel names its process, because the parker, VMID, and anti-affinity
-// owners all carry the pid and a per-process sequence, so two acquirers never
-// write the same claim. A new lock owner must keep that true, or a waiter that shares a
+// owners all go through pve.ProcessLockOwner, which adds the host, the pid, a
+// random per-process nonce, and a per-process sequence. So two acquirers never
+// write the same claim, even on two Directors that share a hostname. A new lock owner must keep that true, or a waiter that shares a
 // holder's claim reads the holder's sentinel as its own create and poisons its
 // allocation.
-func (t *managedPoolService) lockCreateRefused(ctx context.Context, poolID, comment string, err error) bool {
+//
+// It also returns the claim the readback found, which is empty when the
+// holder had already released.
+func (t *managedPoolService) lockCreateRefused(ctx context.Context, poolID, comment string, err error) (string, bool) {
 	if !isManagedLockPool(poolID) || !exactPoolAlreadyExists(err, poolID) {
-		return false
+		return "", false
 	}
 	reader, ok := t.PoolService.(pve.RawPoolCommentReader)
 	if !ok {
-		return false
+		return "", false
 	}
 	held, readErr := reader.ReadPoolComment(ctx, poolID)
 	if readErr != nil {
-		return exactPoolReadMissing(readErr, poolID)
+		return "", exactPoolReadMissing(readErr, poolID)
 	}
-	return held != comment
+	return held, held != comment
+}
+
+// lockRefusal is the claim that refused a guarded sentinel create and the
+// refusal PVE returned for it.
+type lockRefusal struct {
+	claim string
+	err   error
+}
+
+// rememberLockRefusal keeps the refusal a settled create drew, so the next
+// poll of the same sentinel can recognize the same holder. A refusal that did
+// not settle, or one whose holder had already released, is not kept.
+func (g *ManagedAllocationGuard) rememberLockRefusal(poolID, claim string, refusal error) {
+	if claim == "" || refusal == nil || g.poisoned != nil {
+		delete(g.lockRefusals, poolID)
+		return
+	}
+	if g.lockRefusals == nil {
+		g.lockRefusals = map[string]lockRefusal{}
+	}
+	g.lockRefusals[poolID] = lockRefusal{claim: claim, err: refusal}
+}
+
+func (g *ManagedAllocationGuard) forgetLockRefusal(poolID string) {
+	delete(g.lockRefusals, poolID)
+}
+
+// repeatLockRefusal answers a lock's poll without a mutation when nothing has
+// changed since the last refusal. A waiter polls its sentinel every second or
+// so for up to the whole wait, and each guarded create used to run a full
+// admission and journal a step, which grew a long-lived disk record by about
+// 300 bytes a poll. When the sentinel still holds the exact claim that refused
+// the last create, a create now would draw the same refusal, so the guard
+// hands that refusal back without calling PVE. No mutation is submitted, so
+// there is nothing to admit or journal. Any other answer, including a
+// different claim, a missing sentinel, or a failed read, lets the create go
+// through the guard as usual, and an expired holder is still stolen through the
+// guarded delete. A poisoned guard answers with its poison, as begin would.
+func (t *managedPoolService) repeatLockRefusal(ctx context.Context, poolID string) (bool, error) {
+	if !isManagedLockPool(poolID) {
+		return false, nil
+	}
+	g := t.guard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.poisoned != nil {
+		return true, g.poisoned
+	}
+	last, ok := g.lockRefusals[poolID]
+	if !ok {
+		return false, nil
+	}
+	reader, ok := t.PoolService.(pve.RawPoolCommentReader)
+	if !ok {
+		return false, nil
+	}
+	if held, err := reader.ReadPoolComment(ctx, poolID); err != nil || held != last.claim {
+		delete(g.lockRefusals, poolID)
+		return false, nil
+	}
+	return true, last.err
 }
 
 // lockDeletionClaim reads the claim a sentinel holds just before it is deleted.

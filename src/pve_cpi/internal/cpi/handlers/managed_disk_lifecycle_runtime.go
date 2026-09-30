@@ -133,6 +133,9 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")
 	}
+	if returned {
+		return &diskReturnedAfterLockTimeout{err: result}
+	}
 	return result
 }
 
@@ -152,6 +155,24 @@ func managedLockWaitContext(ctx context.Context) context.Context {
 // managedLockWait is the wait managedLockWaitContext sets. Tests shorten it,
 // and production leaves it at the lock's TTL.
 var managedLockWait = pve.ParkerProtectionLockTTL
+
+// diskReturnedAfterLockTimeout marks a disk operation that failed only because
+// a cluster lock wait ran out, after which finish returned the disk's
+// allocation unchanged. A caller that holds its own allocation around the disk
+// operation, such as create_vm's pre-attach or delete_vm's disk preservation,
+// reads the marker to tell a clean wait-out from an uncertain outcome. The
+// marker wraps the original error, so its CPI type and the timeout sentinel
+// stay visible.
+type diskReturnedAfterLockTimeout struct{ err error }
+
+func (e *diskReturnedAfterLockTimeout) Error() string { return e.err.Error() }
+func (e *diskReturnedAfterLockTimeout) Unwrap() error { return e.err }
+
+// isDiskReturnedAfterLockTimeout reports whether err carries that marker.
+func isDiskReturnedAfterLockTimeout(err error) bool {
+	var returned *diskReturnedAfterLockTimeout
+	return errors.As(err, &returned)
+}
 
 // completeOwned closes the session with fresh evidence of the disk's current
 // disposition: its absence after a delete, and its ownership otherwise.

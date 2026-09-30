@@ -310,7 +310,7 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 	// intercepted, and any later observation failure preserves the generation.
 	result, err = finishCreatedVM(ctx, guarded, guarded.Log(ctx), m.parsed, m.shape, m.vmid, candidateVMName(m.shape.initialName, m.parsed.agentID, m.vmid))
 	if err != nil {
-		return nil, storageAllocationUncertain(m.handle, "VM post-create")
+		return nil, m.postCreateFailure(err)
 	}
 	if err := m.guard.Err(); err != nil {
 		return nil, err
@@ -326,6 +326,19 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 	}
 	return result, nil
 }
+
+// postCreateFailure settles a failure after the VM root exists. A persistent
+// disk whose lock wait ran out before anything changed leaves nothing uncertain
+// when the guard is clean and every step this allocation wrote is observed, so
+// the retriable error goes back as it is. Anything else requires
+// reconciliation.
+func (m *managedVMAllocation) postCreateFailure(err error) error {
+	if isDiskReturnedAfterLockTimeout(err) && m.guard.Err() == nil && storageLifecycleSettled(m.handle.Record()) == nil {
+		return err
+	}
+	return storageAllocationUncertain(m.handle, "VM post-create")
+}
+
 func (m *managedVMAllocation) recordBindings(ctx context.Context) error {
 	cfg, err := m.deps.PVE.QEMU().Config(ctx, m.shape.node, m.vmid)
 	if err != nil {

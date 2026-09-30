@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -17,17 +15,12 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
-// aaOwnerSeq distinguishes successive lock acquisitions within one CPI process
-// so the owner token stamped on a sentinel pool is unique per acquire (the pid
-// alone would repeat across concurrent goroutines in the same process).
-var aaOwnerSeq atomic.Uint64
-
-// clusterLockOwner builds a process-and-request-unique owner token for a
-// sentinel cluster lock: "<pid>-<seq>-<key>-<vmid>". It is stamped into the
-// pool comment for diagnostics and to let an expired holder be distinguished
-// from a live one. The token never needs to be parsed back.
+// clusterLockOwner builds the owner token for an anti-affinity lock. It names
+// the group and the VM, and pve.ProcessLockOwner adds the host, the process,
+// and a per-process sequence, so the token is unique per acquisition across
+// every Director that shares the cluster.
 func clusterLockOwner(key string, vmid int) string {
-	return fmt.Sprintf("%d-%d-%s-%d", os.Getpid(), aaOwnerSeq.Add(1), key, vmid)
+	return pve.ProcessLockOwner(fmt.Sprintf("aa-%s-%d", key, vmid))
 }
 
 // antiAffinityLockPrefix prefixes an instance group's anti-affinity lock name.

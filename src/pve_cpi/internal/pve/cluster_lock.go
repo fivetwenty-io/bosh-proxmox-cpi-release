@@ -34,11 +34,15 @@ package pve
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -352,14 +356,65 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 // lockOwnerSeq numbers the owner tokens ProcessLockOwner issues in this process.
 var lockOwnerSeq atomic.Uint64
 
-// ProcessLockOwner qualifies a caller's owner token with this process's pid and
-// a per-process sequence, so no two acquirers anywhere write the same claim.
+// lockOwnerHostLimit caps the host part of an owner token. PVE sets no length
+// limit on a pool comment, and the cap only keeps claims short.
+const lockOwnerHostLimit = 63
+
+var (
+	lockOwnerIdentityOnce sync.Once
+	lockOwnerIdentity     string
+)
+
+// processLockIdentity names this process for owner tokens: the host it runs
+// on, its pid, and a random nonce drawn once per process. The host tells
+// Directors on different machines apart, and the nonce still tells them apart
+// when two machines share a hostname and a pid.
+func processLockIdentity() string {
+	lockOwnerIdentityOnce.Do(func() {
+		host, err := os.Hostname()
+		if err != nil {
+			host = ""
+		}
+		nonce := make([]byte, 4)
+		if _, err := rand.Read(nonce); err != nil {
+			binary.BigEndian.PutUint32(nonce, uint32(time.Now().UnixNano()))
+		}
+		lockOwnerIdentity = fmt.Sprintf("%s/%d-%s", lockOwnerHost(host), os.Getpid(), hex.EncodeToString(nonce))
+	})
+	return lockOwnerIdentity
+}
+
+// lockOwnerHost renders a hostname for an owner token. Anything outside
+// letters, digits, '-', '.', and '_' becomes '-', so the token never carries
+// the space a sentinel comment is split on, and the result is capped at
+// lockOwnerHostLimit bytes.
+func lockOwnerHost(host string) string {
+	var b strings.Builder
+	for _, r := range host {
+		if b.Len() >= lockOwnerHostLimit {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown-host"
+	}
+	return b.String()
+}
+
+// ProcessLockOwner qualifies a caller's owner token with this process's
+// identity and a per-process sequence, rendering "<owner>@<host>/<pid>-<nonce>-<seq>".
 // Two CPI processes that lock the same key in the same second would otherwise
 // stamp byte-identical claims, and a caller that compares claims could not
 // tell the holder's sentinel from its own. The token must not contain spaces,
 // because the sentinel comment is split on them.
 func ProcessLockOwner(owner string) string {
-	return fmt.Sprintf("%s@%d-%d", owner, os.Getpid(), lockOwnerSeq.Add(1))
+	return fmt.Sprintf("%s@%s-%d", owner, processLockIdentity(), lockOwnerSeq.Add(1))
 }
 
 // ErrClusterLockTimeout marks the acquire that ran out its timeout waiting for a

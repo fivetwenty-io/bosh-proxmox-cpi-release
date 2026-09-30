@@ -126,6 +126,7 @@ func cleanupManagedRetainedEphemeral(ctx context.Context, deps Deps, handle *aj.
 	lifecycle.guard = guard
 	local := deps
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
+	ctx = managedLockWaitContext(ctx)
 	defer func() {
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {
