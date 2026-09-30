@@ -772,8 +772,9 @@ func TestStorageStatusCorroborator_StringTypedInactive_Decodes(t *testing.T) {
 func TestStorageStatusCorroborator_TransportError_IsReturned(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("pveproxy backend gone (code: 596)")
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
 	_, err := pve.StorageStatusCorroborator(statusClient(nil, sentinel)).
-		CorroborateEmptyListing(context.Background(), sharedProbe())
+		CorroborateEmptyListing(ctx, sharedProbe())
 	if err == nil {
 		t.Fatal("a status read that did not land is not a status read that agreed")
 	}

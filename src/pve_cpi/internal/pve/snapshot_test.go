@@ -277,7 +277,8 @@ func TestWaitForSnapshotAbsent_TransientInPollLoop_Retries(t *testing.T) {
 		// Third call: snapshot absent → success.
 		return snapEntries("current"), nil
 	})
-	err := pve.WaitForSnapshotAbsent(context.Background(), client, "pve1", 9001, "snap1",
+	ctx := pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	err := pve.WaitForSnapshotAbsent(ctx, client, "pve1", 9001, "snap1",
 		pve.WithPollIntervalForTest(1*time.Millisecond), pve.WithMaxWait(30*time.Second))
 	if err != nil {
 		t.Fatalf("expected success after transient retries, got: %v", err)
