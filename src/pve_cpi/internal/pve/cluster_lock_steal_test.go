@@ -21,13 +21,17 @@ func whoOf(ctx context.Context) string {
 }
 
 // stealPools is a sentinel store for racing acquirers. Before every call it
-// runs hook with the caller's name and the operation, outside the store's
-// lock, so a test can hold one acquirer at an exact point while another runs.
+// runs hook with the caller's name and the operation, and once the call has
+// completed against the store it runs after with the same arguments. Both run
+// outside the store's lock. With hook a test can hold one acquirer at an exact
+// point while another runs. A call that hook has let go may not have reached
+// the store yet, so a test that waits for an operation to land waits on after.
 type stealPools struct {
 	mu    sync.Mutex
 	pools map[string]string
 	log   []string
 	hook  func(who, op string)
+	after func(who, op string)
 }
 
 func (p *stealPools) AddVM(context.Context, string, int64) error             { return nil }
@@ -40,8 +44,15 @@ func (p *stealPools) record(ctx context.Context, op string) {
 	}
 }
 
+func (p *stealPools) landed(ctx context.Context, op string) {
+	if p.after != nil {
+		p.after(whoOf(ctx), op)
+	}
+}
+
 func (p *stealPools) CreatePool(ctx context.Context, id, claim string) error {
 	p.record(ctx, "create")
+	defer p.landed(ctx, "create")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.log = append(p.log, whoOf(ctx)+" create")
@@ -54,6 +65,7 @@ func (p *stealPools) CreatePool(ctx context.Context, id, claim string) error {
 
 func (p *stealPools) DeletePool(ctx context.Context, id string) error {
 	p.record(ctx, "delete")
+	defer p.landed(ctx, "delete")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.log = append(p.log, whoOf(ctx)+" delete "+p.pools[id])
@@ -66,6 +78,7 @@ func (p *stealPools) DeletePool(ctx context.Context, id string) error {
 
 func (p *stealPools) GetPoolComment(ctx context.Context, id string) (string, bool, error) {
 	p.record(ctx, "get")
+	defer p.landed(ctx, "get")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	claim, found := p.pools[id]
@@ -202,14 +215,18 @@ func TestSteal_GraceCatchesAStaleDelete(t *testing.T) {
 				s3Released = true
 				mu.Unlock()
 			})
+		}
+	}
+	p.after = func(who, op string) {
+		if who != "S3" || op != "create" {
 			return
 		}
 		mu.Lock()
 		done := s3Released
 		mu.Unlock()
 		if done {
-			// This is S3's first call after its delete, so the stale delete
-			// has landed.
+			// S3's first create after its delete is in the store, so the
+			// stale delete has landed and S3's claim stands where S1's did.
 			landOnce.Do(func() { close(landed) })
 		}
 	}
