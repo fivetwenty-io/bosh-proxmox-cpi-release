@@ -175,6 +175,34 @@ func expectedLockClaimRefusal(ctx context.Context, poolID string, claim managedL
 	return nil
 }
 
+// releasePoisonedSentinel releases our own lock sentinel after this guard was
+// poisoned. begin refuses every write on a poisoned guard, and a release it
+// refused left our claim standing for a whole TTL, so every request waiting on
+// that parker stalled behind one uncertain request.
+//
+// The lock code marks a delete as releasing our own claim only when that claim
+// is one it created and read back, and the guard deletes only when its own read
+// right before the delete finds exactly that claim, through the same
+// expectedLockClaimRefusal a guarded delete runs. A read that fails, or that
+// finds any other claim or none, refuses the delete before PVE is called.
+//
+// Nothing is journaled. The guard is already poisoned, so its allocation
+// needs reconciliation whatever happens here, and a sentinel is an empty lock
+// marker that holds nothing the allocation owns.
+//
+// It does not take the guard's mutex. Nothing here reads or writes guard
+// state: the read goes to the pool service, the refusal check is pure, and the
+// delete is the pool service's own call. Holding the mutex across those two
+// PVE calls would only stall every Err caller on this guard. The caller's
+// poison check stays correct without it, because a poison is permanent.
+func (t *managedPoolService) releasePoisonedSentinel(ctx context.Context, poolID string) error {
+	claim, readErr := t.lockDeletionClaim(ctx, poolID)
+	if refusal := expectedLockClaimRefusal(ctx, poolID, claim, readErr); refusal != nil {
+		return refusal
+	}
+	return t.PoolService.DeletePool(ctx, poolID)
+}
+
 // observeLockPoolMutation proves a guarded sentinel mutation by readback. The
 // label names the guard in the errors it returns.
 func observeLockPoolMutation(ctx context.Context, pools pve.PoolService, call ManagedAllocationMutation, result any, label string) error {

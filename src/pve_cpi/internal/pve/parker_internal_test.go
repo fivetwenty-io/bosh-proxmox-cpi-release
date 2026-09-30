@@ -828,3 +828,31 @@ func TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow(t *testing.T)
 		t.Fatalf("want the interrupted wait, got %v", err)
 	}
 }
+
+// notAttemptedPools refuses every sentinel create the way a client wrapper
+// does before the call reaches PVE.
+type notAttemptedPools struct{ *fakeLockPools }
+
+func (p notAttemptedPools) CreatePool(context.Context, string, string) error {
+	return fmt.Errorf("allocation guard refused the write: %w", ErrMutationNotAttempted)
+}
+
+// TestWithParkerProtectionLock_NotAttemptedCreateFailsTheCall covers a lock
+// create that the client refused before it reached PVE, as a poisoned
+// allocation guard or an ended request does. The lock mechanism works, so the
+// window must not run unserialized. The call fails with the refusal instead.
+func TestWithParkerProtectionLock_NotAttemptedCreateFailsTheCall(t *testing.T) {
+	t.Parallel()
+	ran := false
+	pools := notAttemptedPools{newFakeLockPools()}
+	err := withParkerProtectionLock(context.Background(), &parkerLockClient{pools: pools}, nil, 90000, "unpark", func(context.Context) error {
+		ran = true
+		return nil
+	})
+	if ran {
+		t.Fatal("the window ran unserialized after the client refused the lock create")
+	}
+	if !errors.Is(err, ErrMutationNotAttempted) {
+		t.Fatalf("want the refused create, got %v", err)
+	}
+}

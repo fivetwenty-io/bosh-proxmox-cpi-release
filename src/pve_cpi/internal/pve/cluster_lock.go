@@ -175,6 +175,30 @@ func ExpectedLockClaim(ctx context.Context) (string, bool) {
 	return claim, ok
 }
 
+// ownLockClaimKey marks a sentinel delete whose expected claim is our own.
+type ownLockClaimKey struct{}
+
+// withOwnLockClaim carries claim as the delete's expected claim and marks it as
+// our own. Release and abandonLockCreate use it, because the claim they pass
+// is one this process created and read back. A steal passes someone else's
+// expired claim and never uses it.
+func withOwnLockClaim(ctx context.Context, claim string) context.Context {
+	return WithExpectedLockClaim(context.WithValue(ctx, ownLockClaimKey{}, true), claim)
+}
+
+// OwnLockClaim returns the expected claim of a sentinel delete that releases
+// our own lock, and false for any other delete, a steal's included. A pool
+// service that refuses other writes, such as a poisoned allocation guard, can
+// still let this delete through once a fresh read shows the sentinel holds
+// exactly that claim, so one uncertain request does not stall everyone who
+// waits on its sentinel for a whole TTL.
+func OwnLockClaim(ctx context.Context) (string, bool) {
+	if own, _ := ctx.Value(ownLockClaimKey{}).(bool); !own {
+		return "", false
+	}
+	return ExpectedLockClaim(ctx)
+}
+
 // ErrLockClaimChanged is a sentinel delete refused because the sentinel no
 // longer holds the claim the caller expected to remove. Nothing was deleted.
 var ErrLockClaimChanged = errors.New("lock sentinel no longer holds the expected claim")
@@ -583,7 +607,7 @@ func abandonLockCreate(
 	}
 	// A failed delete leaves the sentinel to its TTL steal, which is where it
 	// stood before this attempt, so cause is still the error to return.
-	_ = pools.DeletePool(WithExpectedLockClaim(cleanupCtx, comment), pool)
+	_ = pools.DeletePool(withOwnLockClaim(cleanupCtx, comment), pool)
 	return cause
 }
 
@@ -674,7 +698,7 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	}
 	deleteCtx := ctx
 	if h.claim != "" {
-		deleteCtx = WithExpectedLockClaim(ctx, h.claim)
+		deleteCtx = withOwnLockClaim(ctx, h.claim)
 	}
 	err := h.pools.DeletePool(deleteCtx, h.pool)
 	if errors.Is(err, ErrLockClaimChanged) {

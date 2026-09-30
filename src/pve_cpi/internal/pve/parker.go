@@ -2130,7 +2130,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
 	if lockErr != nil {
 		if errors.Is(lockErr, ErrClusterLockTimeout) || errors.Is(lockErr, ErrClusterLockStateUnknown) ||
-			errors.Is(lockErr, ErrClusterLockInterrupted) {
+			errors.Is(lockErr, ErrClusterLockInterrupted) || errors.Is(lockErr, ErrMutationNotAttempted) {
 			// A timeout is not "the lock is unavailable to me", it is "somebody
 			// else is inside the window right now": an expired or unreadable
 			// holder is stolen rather than waited on, so the only way to reach
@@ -2146,6 +2146,11 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			//
 			// A wait cut short by a cancelled request is the same case too. The
 			// request has ended, so there is no window left to run.
+			//
+			// So is a create that the client refused before it reached PVE,
+			// because the allocation guard is poisoned or the request has
+			// ended. The lock mechanism works, and the guard would refuse
+			// every write inside the window anyway, so the window does not run.
 			return lockErr
 		}
 		// Every other acquire failure means the mechanism is unavailable, not
