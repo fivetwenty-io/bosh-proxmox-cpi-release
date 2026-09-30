@@ -574,7 +574,7 @@ func managedVMDisposalIdentity(record aj.Record, audit StorageAllocationAudit) (
 		if record.Steps[rangeIndex50].Target.External || record.Steps[rangeIndex50].Attempt != record.ActiveAttempt() {
 			continue
 		}
-		if record.Steps[rangeIndex50].Target.VMID > 0 && !strings.HasPrefix(record.Steps[rangeIndex50].Kind, "lifecycle_delete_vm_retain_ephemeral_") {
+		if record.Steps[rangeIndex50].Target.VMID > 0 && !storageStepNamesRetentionParker(record, record.Steps[rangeIndex50]) {
 			if vmid != 0 && vmid != record.Steps[rangeIndex50].Target.VMID {
 				return "", 0, nil, fmt.Errorf("VM cleanup targets disagree")
 			}

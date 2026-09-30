@@ -681,6 +681,37 @@ func TestAllocationAuditPreservationTargetsDoNotRequireVMMarker(t *testing.T) {
 	}
 }
 
+// TestAllocationAuditRetainedCleanupStepsNameOnlyTheParker pins the steps
+// that explicit cleanup of a retained VM records on the VM record. They name
+// the retention parker, so the parker needs no VM marker, yet they never let
+// a VM at the parker's VMID claim the allocation, and the VM's own guest
+// still needs its marker.
+func TestAllocationAuditRetainedCleanupStepsNameOnlyTheParker(t *testing.T) {
+	own := aj.Step{ID: "own", Kind: "vm.QEMU.Create", Attempt: 1, State: aj.Observed, Target: aj.Target{Node: "pve1", VMID: 123}}
+	parker := aj.Step{ID: "parker", Kind: "lifecycle_delete_disk_Nodes_UpdateQemuConfig", Attempt: 1, State: aj.Observed, Target: aj.Target{Node: "pve1", VMID: 999, Storage: "a", IntendedVolume: "a:999/vm-999-disk-0.raw"}}
+	record := aj.Record{ID: "owned-vm", Namespace: "director", Kind: "vm", State: aj.VMDeletedRetained, AgentID: "agent", Steps: []aj.Step{own, parker}}
+	if storageStepNamesRetentionParker(aj.Record{Kind: "disk"}, parker) {
+		t.Fatal("a disk record's own delete_disk step was read as a retention parker")
+	}
+
+	report := StorageAllocationAudit{Complete: true, VMScanComplete: true}
+	collectAuditVMProvenance(&report, []aj.Record{record}, "director", "pve1", 999, "")
+	if len(report.Conflicts) > 0 {
+		t.Fatalf("retention parker required the VM marker: %v", report.Conflicts)
+	}
+	collectAuditVMProvenance(&report, []aj.Record{record}, "director", "pve1", 123, "")
+	if len(report.Conflicts) != 1 || !strings.Contains(report.Conflicts[0], "VM 123 on pve1 carries no allocation marker") {
+		t.Fatalf("own guest without its marker passed: %v", report.Conflicts)
+	}
+
+	sum := sha256.Sum256([]byte(record.AgentID))
+	report = StorageAllocationAudit{Complete: true, VMScanComplete: true, Evidence: []StorageAllocationEvidence{{AllocationID: record.ID, Kind: "vm", Node: "pve1", VMID: 999, AgentSHA256: hex.EncodeToString(sum[:])}}}
+	correlateStorageAuditEvidence(&report, map[string]aj.Record{record.ID: record}, nil, "director")
+	if !slices.ContainsFunc(report.Conflicts, func(c string) bool { return strings.Contains(c, "(VM 999) is outside recorded mutation targets") }) {
+		t.Fatalf("VM at the parker's VMID claimed the allocation: %v", report.Conflicts)
+	}
+}
+
 func TestAllocationAuditSkipsAndDisclosesDisabledStorage(t *testing.T) {
 	deps, j, c := auditFixture(t)
 	c.storageRead.definitions = append(c.storageRead.definitions,
