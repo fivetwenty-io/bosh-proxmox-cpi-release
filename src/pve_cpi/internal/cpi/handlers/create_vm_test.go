@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -1439,6 +1440,10 @@ func TestCreateVM_NICConfigTransient_Retriable(t *testing.T) {
 // TestCreateVM_AttachDiskTransient_Retriable verifies that when AttachDisk
 // returns a transient connection error, the returned cpierror is classified as
 // RetriableCloudError AND the VM rollback (DeleteQemu) is invoked.
+//
+// The retry ladder runs on the zeroed test backoff curve, so the attach is
+// still attempted the full DefaultTransientMaxAttempts times without paying
+// the production waits between them.
 func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 	t.Parallel()
 	transientErr := &sdkerrors.ConnectionError{
@@ -1447,8 +1452,10 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 		Message: "connection reset (simulated transient)",
 	}
 
+	var attachCalls atomic.Int32
 	q := &vmMockQEMU{
 		attachDiskFn: func(_ context.Context, _ string, _ int, _, _ string, _ *sdkqemu.AttachOpts) (string, error) {
+			attachCalls.Add(1)
 			return "", transientErr
 		},
 	}
@@ -1462,9 +1469,12 @@ func TestCreateVM_AttachDiskTransient_Retriable(t *testing.T) {
 		map[string]any{"default": map[string]any{"type": "dynamic", "cloud_properties": map[string]any{}}},
 		[]string{mustEncodeDiskCID(t, "local-lvm:vm-9002-disk-0", nil)}, map[string]any{})
 
-	_, err := h.Handle(context.Background(), args, mkCtx("attachdisk-transient"))
+	_, err := h.Handle(fastRetryCtx(context.Background()), args, mkCtx("attachdisk-transient"))
 	if err == nil {
 		t.Fatal("expected error from transient AttachDisk failure")
+	}
+	if got := attachCalls.Load(); got != pve.DefaultTransientMaxAttempts {
+		t.Errorf("expected %d AttachDisk attempts, got %d", pve.DefaultTransientMaxAttempts, got)
 	}
 
 	var cpiErr *cpierrors.Error
