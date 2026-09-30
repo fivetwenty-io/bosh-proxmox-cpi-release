@@ -258,8 +258,8 @@ func TestLockBugRecordSettlesPastALiveClaim(t *testing.T) {
 }
 
 // TestLockStepKinds pins which planned steps the rule may settle. A VM
-// record's pool steps are excluded, because the same kind also creates
-// deployment pools and a step does not record its pool.
+// record's pool step is admitted only in the shape the VM guard writes, with a
+// node and a VMID, so the bare kinds here are refused.
 func TestLockStepKinds(t *testing.T) {
 	for kind, want := range map[string]bool{
 		"lifecycle_attach_disk_Pool_CreatePool":        true,

@@ -43,9 +43,25 @@ import (
 
 // lockStepKinds are the step kinds a guard writes for a sentinel mutation. The
 // lifecycle and parker guards admit a Pool mutation only for a bosh-lock-
-// sentinel. A VM record's pool steps are not listed, because its guard also
-// creates deployment pools and a step does not record which pool it meant.
+// sentinel.
+//
+// A VM record's pool steps are listed too, although a step does not record
+// which pool it meant. Its CreatePool is either the deployment pool's ensure or
+// the anti-affinity lock's sentinel, and its DeletePool can only be that
+// sentinel, because the VM guard refuses every other pool delete. The
+// allocation owns neither pool. The sentinel is a TTL-bounded marker like any
+// other, and the deployment pool is shared infrastructure that cleanup never
+// deletes, so no outcome of either step changes anything the record owns. The
+// sentinel's name comes from the group the record froze in
+// VMExecution.PoolInstanceGroup. A VM pool step is admitted only in the shape
+// the VM guard writes, which is a target naming just a node and a VMID with
+// nothing else recorded, so a step that carries anything more is never settled
+// here.
 func isLockStep(step aj.Step) bool {
+	if step.Kind == "vm.Pool.CreatePool" || step.Kind == "vm.Pool.DeletePool" {
+		bare := aj.Target{Node: step.Target.Node, VMID: step.Target.VMID}
+		return step.Target == bare && bare.Node != "" && bare.VMID > 0 && step.UPID == "" && len(step.VolIDs) == 0 && len(step.Charges) == 0 && len(step.Parameters) == 0
+	}
 	if !strings.HasSuffix(step.Kind, "_Pool_CreatePool") && !strings.HasSuffix(step.Kind, "_Pool_DeletePool") {
 		return false
 	}
@@ -53,10 +69,18 @@ func isLockStep(step aj.Step) bool {
 }
 
 // lockStepSentinels names every sentinel a lock step in record could have
-// meant. Those guards only ever lock a parker's protection window or a VMID,
-// and both are keyed "vm-<vmid>", so the candidates are the sentinels of every
-// VM the active attempt's steps target. A step records no pool of its own, so
-// the rule reads them all and settles only when every one answers exactly.
+// meant. The disk guards only ever lock a parker's protection window or a
+// VMID, and both are keyed "vm-<vmid>", so the candidates are the sentinels of
+// every VM the active attempt's steps target. A VM record adds its instance
+// group's anti-affinity sentinel, rebuilt exactly as acquireAntiAffinityLock
+// names it, whenever the record froze a group.
+//
+// A VM record's pool step never touched its vm-<vmid> sentinel. That read is
+// kept as a probe that PVE is answering exactly, and for a record that froze
+// no group it is the only read, because the sentinel such a step meant belongs
+// to a group the record never stored. A step records no pool of its own, so
+// the rule reads every candidate and settles only when each one answers
+// exactly.
 func lockStepSentinels(record aj.Record) []string {
 	seen := map[int]bool{}
 	var sentinels []string
@@ -67,6 +91,19 @@ func lockStepSentinels(record aj.Record) []string {
 		}
 		seen[step.Target.VMID] = true
 		sentinels = append(sentinels, pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", step.Target.VMID)))
+	}
+	if record.Kind == "vm" {
+		plan, err := activeStorageAllocationPlan(record)
+		if err != nil {
+			// Without its plan the record cannot say which group it locked,
+			// so it names no sentinel at all.
+			return nil
+		}
+		if plan.VMExecution != nil {
+			if group := sanitizeTagValue(plan.VMExecution.PoolInstanceGroup); group != "" {
+				sentinels = append(sentinels, pve.ClusterLockPoolName(antiAffinityLockPrefix+group))
+			}
+		}
 	}
 	sort.Strings(sentinels)
 	return sentinels
@@ -123,6 +160,14 @@ func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.H
 		// already settles every step it holds.
 		return nil, nil
 	}
+	if record.Kind == "vm" && !managedVMWorkBegan(record) {
+		// A VM record whose own work never began is left alone. Its create_vm
+		// stopped between planning its first pool call and its first VM
+		// write, and closing such a record is what an attested cleanup's
+		// writer fencing exists for, so settlement must not become a way
+		// around it.
+		return nil, nil
+	}
 	var planned []int
 	for i := range record.Steps {
 		step := &record.Steps[i]
@@ -167,6 +212,19 @@ func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.H
 		return nil, err
 	}
 	return nil, nil
+}
+
+// managedVMWorkBegan reports whether the active attempt of a VM record holds
+// an observed step that is not a pool step, which shows that the VM's own work
+// began.
+func managedVMWorkBegan(record aj.Record) bool {
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Attempt == record.ActiveAttempt() && step.State == aj.Observed && !strings.HasPrefix(step.Kind, "vm.Pool.") {
+			return true
+		}
+	}
+	return false
 }
 
 func containsString(values []string, want string) bool {
