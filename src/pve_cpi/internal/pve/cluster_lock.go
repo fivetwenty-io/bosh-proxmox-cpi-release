@@ -105,24 +105,29 @@ func SetClusterLockGraceForTest(d time.Duration) func() {
 	return func() { clusterLockGraceNs.Store(prev) }
 }
 
-// clusterLockPollNs holds the poll interval acquires wait on. Tests shorten it
-// through SetClusterLockPollForTest.
-var clusterLockPollNs atomic.Int64
+// clusterLockPollKey carries a test's poll interval on the request context.
+type clusterLockPollKey struct{}
 
-func init() { clusterLockPollNs.Store(int64(clusterLockPollInterval)) }
+// WithClusterLockPollForTest returns a context whose cluster lock acquires wait
+// d between attempts instead of clusterLockPollInterval. It rides the context
+// rather than a package variable, so it changes only the acquires made under
+// that context, and tests that set it can run in parallel. A non-positive d
+// leaves ctx as it is. Production code never calls it; it mirrors
+// WithTestBackoff.
+func WithClusterLockPollForTest(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, clusterLockPollKey{}, d)
+}
 
-// clusterLockPoll returns the current poll interval.
-func clusterLockPoll() time.Duration { return time.Duration(clusterLockPollNs.Load()) }
-
-// SetClusterLockPollForTest replaces the poll interval for a test and returns a
-// function that restores it. Production code leaves the poll at
-// clusterLockPollInterval. A test that changes it must not run in parallel with
-// tests that take a lock.
-//
-//	defer pve.SetClusterLockPollForTest(time.Millisecond)()
-func SetClusterLockPollForTest(d time.Duration) func() {
-	prev := clusterLockPollNs.Swap(int64(d))
-	return func() { clusterLockPollNs.Store(prev) }
+// clusterLockPollFor returns the poll interval ctx carries when a test set
+// one, and clusterLockPollInterval otherwise.
+func clusterLockPollFor(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(clusterLockPollKey{}).(time.Duration); ok && d > 0 {
+		return d
+	}
+	return clusterLockPollInterval
 }
 
 // ClusterLockOption adjusts one acquire.
@@ -360,7 +365,7 @@ func acquireClusterLockWithClock(
 			}
 			return nil, timedOut(createErr)
 		}
-		if sleepErr := clk.sleep(ctx, clusterLockPollWait(now, deadline)); sleepErr != nil {
+		if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
 			return nil, cpierrors.WrapAs(errors.Join(sleepErr, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: interrupted waiting for lock %q", pool))
 		}
@@ -405,10 +410,10 @@ func clusterLockDeadline(ctx context.Context, now time.Time, timeout time.Durati
 }
 
 // clusterLockPollWait is how long an acquire waits before its next attempt,
-// which is the poll interval plus jitter, cut short so it never runs past
-// deadline.
-func clusterLockPollWait(now, deadline time.Time) time.Duration {
-	poll := clusterLockPoll()
+// which is the poll interval ctx carries plus jitter, cut short so it never
+// runs past deadline.
+func clusterLockPollWait(ctx context.Context, now, deadline time.Time) time.Duration {
+	poll := clusterLockPollFor(ctx)
 	wait := poll + time.Duration(jitterInt64N(int64(poll)))
 	if remaining := deadline.Sub(now); wait > remaining {
 		wait = remaining
@@ -559,7 +564,7 @@ func confirmLockCreate(
 			if !now.Before(deadline) {
 				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk, lockStateUnknown(pool, err))
 			}
-			if sleepErr := clk.sleep(ctx, clusterLockPollWait(now, deadline)); sleepErr != nil {
+			if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
 				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
 					lockStateUnknown(pool, errors.Join(err, sleepErr)))
 			}

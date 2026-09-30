@@ -233,12 +233,24 @@ func plantHeldParkerLock(locks *lockContention, parker int) {
 	locks.pools[pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", parker))] = fmt.Sprintf("owner=transfer_out/%d@1-1 exp=%d", parker, time.Now().Add(time.Hour).Unix())
 }
 
-// shortenManagedLockWait lowers the managed lock wait for one test.
-func shortenManagedLockWait(t *testing.T, d time.Duration) {
-	t.Helper()
-	previous := managedLockWait
-	managedLockWait = d
-	t.Cleanup(func() { managedLockWait = previous })
+// testLockPoll is the cluster lock poll the lock-wait tests use. It is short
+// enough that a wait of a tenth of a second still covers many polls.
+const testLockPoll = 5 * time.Millisecond
+
+// testManagedLockWait is the managed lock wait most lock-wait tests run out.
+// At testLockPoll it still covers about twenty polls.
+const testManagedLockWait = 150 * time.Millisecond
+
+// withShortLockPoll returns ctx with the test's short cluster lock poll.
+func withShortLockPoll(ctx context.Context) context.Context {
+	return pve.WithClusterLockPollForTest(ctx, testLockPoll)
+}
+
+// shortenManagedLockWait returns ctx with the managed lock wait lowered to d
+// and the short cluster lock poll. Both ride the context, so nothing another
+// test reads changes.
+func shortenManagedLockWait(ctx context.Context, d time.Duration) context.Context {
+	return withShortLockPoll(context.WithValue(ctx, managedLockWaitKey{}, d))
 }
 
 // TestManagedAttachLockTimeoutReturnsTheAllocation runs out the wait against a
@@ -250,16 +262,16 @@ func TestManagedAttachLockTimeoutReturnsTheAllocation(t *testing.T) {
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
-	err := disk.attach(t.Context())
+	err := disk.attach(ctx)
 	if err == nil || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout, got %v", err)
 	}
 	assertReturnedRecord(t, "timed-out", disk.record(t))
 
 	locks.reset()
-	if err := disk.attach(t.Context()); err != nil {
+	if err := disk.attach(ctx); err != nil {
 		t.Fatalf("the retry after the timeout failed: %v", err)
 	}
 	assertReturnedRecord(t, "retried", disk.record(t))
@@ -340,9 +352,8 @@ func TestManagedLockTimeoutSurvivesTheAttachWrappers(t *testing.T) {
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
-	ctx := t.Context()
 	bare, meta, err := decodeDiskCID(ctx, disk.deps, "attach_disk", disk.cid)
 	if err != nil {
 		t.Fatal(err)
@@ -377,10 +388,10 @@ func TestManagedDetachLockTimeoutKeepsTheTimeout(t *testing.T) {
 		t.Fatalf("attach before the detach: %v", err)
 	}
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
 	detach := func() error {
-		_, err := HandleDetachDisk(disk.deps).Handle(t.Context(), []json.RawMessage{json.RawMessage(`"777"`), json.RawMessage(fmt.Sprintf("%q", disk.cid))}, jsonrpc.Context{})
+		_, err := HandleDetachDisk(disk.deps).Handle(ctx, []json.RawMessage{json.RawMessage(`"777"`), json.RawMessage(fmt.Sprintf("%q", disk.cid))}, jsonrpc.Context{})
 		return err
 	}
 	err := detach()
@@ -428,9 +439,9 @@ func TestManagedAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 	locks.reset()
 	withParkedOverlay(t, disk, defaultDriveOverrides)
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
-	err := disk.attach(t.Context())
+	err := disk.attach(ctx)
 	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
 	}
@@ -439,7 +450,7 @@ func TestManagedAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 	assertReturnedRecord(t, "timed-out", record)
 
 	locks.reset()
-	if err := disk.attach(t.Context()); err != nil {
+	if err := disk.attach(ctx); err != nil {
 		t.Fatalf("the retry after the timeout failed: %v", err)
 	}
 	assertReturnedRecord(t, "retried", disk.record(t))
@@ -462,14 +473,18 @@ func resolveFlowDisk(t *testing.T, disk *parkedFlowDisk) resolvedDisk {
 // assertCleanDiskTimeout checks what a caller holding its own allocation
 // relies on after a disk operation waited out a parker lock. The error carries
 // the returned-disk marker and the retriable timeout, the wait was the managed
-// one rather than the 15-second default, and the disk's record is returned.
-func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elapsed time.Duration) {
+// one rather than the 15-second default, the timeout came only after that wait
+// ran out, and the disk's record is returned.
+func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elapsed, wait time.Duration) {
 	t.Helper()
 	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
 	}
 	if elapsed >= 10*time.Second {
 		t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+	}
+	if elapsed < wait {
+		t.Fatalf("the timeout came after %s, before the %s wait ran out", elapsed, wait)
 	}
 	assertReturnedRecord(t, "timed-out", disk.record(t))
 }
@@ -481,12 +496,12 @@ func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
 	rd := resolveFlowDisk(t, disk)
 	started := time.Now()
-	_, err := attachManagedPersistentDisk(t.Context(), disk.deps, "777", "n1", 777, rd)
-	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+	_, err := attachManagedPersistentDisk(ctx, disk.deps, "777", "n1", 777, rd)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started), testManagedLockWait)
 }
 
 // TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk is the create_vm
@@ -499,12 +514,12 @@ func TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 	locks.reset()
 	withParkedOverlay(t, disk, defaultDriveOverrides)
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
 	rd := resolveFlowDisk(t, disk)
 	started := time.Now()
-	_, err := attachManagedPersistentDisk(t.Context(), disk.deps, "777", "n1", 777, rd)
-	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+	_, err := attachManagedPersistentDisk(ctx, disk.deps, "777", "n1", 777, rd)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started), testManagedLockWait)
 	assertOverlayNoteObserved(t, disk, disk.record(t))
 }
 
@@ -519,12 +534,12 @@ func TestDeleteVMPreservationUsesTheManagedWait(t *testing.T) {
 		t.Fatalf("attach before the preservation: %v", err)
 	}
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
 	rd := resolveFlowDisk(t, disk)
 	started := time.Now()
-	err := detachManagedPersistentForVMDeleteOne(t.Context(), disk.deps, "n1", 777, rd, nil)
-	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+	err := detachManagedPersistentForVMDeleteOne(ctx, disk.deps, "n1", 777, rd, nil)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started), testManagedLockWait)
 }
 
 // createdManagedVM is a VM allocation whose root exists, ready for the
@@ -619,22 +634,22 @@ func TestVMCleanupFailureRules(t *testing.T) {
 	}
 }
 
-// TestManagedLockWaitDoesNotGrowTheRecord waits out a live holder for several
-// seconds, which is several polls. Only the first refused create reaches PVE
-// and the journal, so the disk record grows by one step however long the wait
-// runs.
+// TestManagedLockWaitDoesNotGrowTheRecord waits out a live holder for half a
+// second, which at the test poll is dozens of polls. Only the first refused
+// create reaches PVE and the journal, so the disk record grows by one step
+// however many polls the wait makes.
 func TestManagedLockWaitDoesNotGrowTheRecord(t *testing.T) {
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 5*time.Second)
+	ctx := shortenManagedLockWait(t.Context(), 500*time.Millisecond)
 	before, err := json.Marshal(disk.record(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := disk.attach(t.Context()); !errors.Is(err, pve.ErrClusterLockTimeout) {
+	if err := disk.attach(ctx); !errors.Is(err, pve.ErrClusterLockTimeout) {
 		t.Fatalf("want the lock timeout, got %v", err)
 	}
 	record := disk.record(t)
@@ -652,10 +667,10 @@ func TestManagedLockWaitDoesNotGrowTheRecord(t *testing.T) {
 	rejections := locks.rejections
 	locks.mu.Unlock()
 	if creates != 1 || rejections != 1 {
-		t.Fatalf("a 5-second wait journaled %d sentinel creates and sent PVE %d, want one of each", creates, rejections)
+		t.Fatalf("a wait of many polls journaled %d sentinel creates and sent PVE %d, want one of each", creates, rejections)
 	}
 	if growth := len(after) - len(before); growth > 2048 {
-		t.Fatalf("a 5-second wait grew the record by %d bytes", growth)
+		t.Fatalf("a wait of many polls grew the record by %d bytes", growth)
 	}
 }
 
@@ -721,16 +736,19 @@ func TestDeleteVMLegacyPreservationUsesTheManagedWait(t *testing.T) {
 	locks := newLockContention(t)
 	deps, client, handle, parker, _ := legacyPreservationFixture(t, locks)
 	plantHeldParkerLock(locks, parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
 	started := time.Now()
-	err := detachManagedPersistentForVMDelete(t.Context(), deps, "n1", 777, nil, handle)
+	err := detachManagedPersistentForVMDelete(ctx, deps, "n1", 777, nil, handle)
 	elapsed := time.Since(started)
 	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
 	}
 	if elapsed >= 10*time.Second {
 		t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+	}
+	if elapsed < testManagedLockWait {
+		t.Fatalf("the timeout came after %s, before the %s wait ran out", elapsed, testManagedLockWait)
 	}
 	if client.moves != 0 || !strings.Contains(fmt.Sprint(client.state.configs[777]["scsi1"]), "vm-123-disk-0") {
 		t.Fatalf("the preservation moved the disk before its wait ran out: moves=%d", client.moves)
@@ -763,17 +781,17 @@ func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
 	moves := client.moves
 	locks.reset()
 	plantHeldParkerLock(locks, parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 
-	bare, meta, err := decodeDiskCID(t.Context(), deps, "create_vm", cid)
+	bare, meta, err := decodeDiskCID(ctx, deps, "create_vm", cid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	disk, err := resolveDiskForOp(t.Context(), deps, "create_vm", cid, bare, meta)
+	disk, err := resolveDiskForOp(ctx, deps, "create_vm", cid, bare, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = attachExistingDiskToManagedVM(t.Context(), deps, handle, disk, "n1", 777)
+	_, err = attachExistingDiskToManagedVM(ctx, deps, handle, disk, "n1", 777)
 	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) {
 		t.Fatalf("want the lock timeout with the returned-disk marker, got %v", err)
 	}
@@ -823,9 +841,9 @@ func TestManagedAttachUnknownLockStateReturnsTheAllocation(t *testing.T) {
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
 	failConfirmingReads(locks)
-	shortenManagedLockWait(t, 1200*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), 120*time.Millisecond)
 
-	err := disk.attach(t.Context())
+	err := disk.attach(ctx)
 	if err == nil || !errors.Is(err, pve.ErrClusterLockStateUnknown) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable unknown lock state, got %v", err)
 	}
@@ -838,7 +856,7 @@ func TestManagedAttachUnknownLockStateReturnsTheAllocation(t *testing.T) {
 	}
 
 	locks.reset()
-	if err := disk.attach(t.Context()); err != nil {
+	if err := disk.attach(ctx); err != nil {
 		t.Fatalf("the retry after the unknown lock state failed: %v", err)
 	}
 	assertReturnedRecord(t, "retried", disk.record(t))
@@ -857,9 +875,9 @@ func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testi
 	locks.reset()
 	failConfirmingReads(locks)
 	locks.deleteErr = errors.New("connection reset by peer")
-	shortenManagedLockWait(t, 1200*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), 120*time.Millisecond)
 
-	if err := disk.attach(t.Context()); !errors.Is(err, pve.ErrClusterLockStateUnknown) {
+	if err := disk.attach(ctx); !errors.Is(err, pve.ErrClusterLockStateUnknown) {
 		t.Fatalf("want the unknown lock state, got %v", err)
 	}
 	record := disk.record(t)
@@ -879,7 +897,7 @@ func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testi
 		t.Fatal("the sentinel is gone although its delete never answered")
 	}
 
-	err := disk.attach(t.Context())
+	err := disk.attach(ctx)
 	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("the next attach should be admitted and wait out our old claim, got %v", err)
 	}
@@ -896,7 +914,7 @@ func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testi
 		locks.pools[sentinel] = fmt.Sprintf("owner=%s exp=%d", owner, time.Now().Add(-time.Minute).Unix())
 	}
 	locks.mu.Unlock()
-	if err := disk.attach(t.Context()); err != nil {
+	if err := disk.attach(ctx); err != nil {
 		t.Fatalf("the attach after our old claim lapsed failed: %v", err)
 	}
 	assertReturnedRecord(t, "completed", disk.record(t))
@@ -961,8 +979,8 @@ func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
 	plantHeldParkerLock(locks, disk.parker)
 	sentinel := pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", disk.parker))
 	holder := locks.pools[sentinel]
-	shortenManagedLockWait(t, 5*time.Second)
-	ctx, cancel := context.WithCancel(t.Context())
+	// The wait stays long so the cancel always lands before the deadline could.
+	ctx, cancel := context.WithCancel(shortenManagedLockWait(t.Context(), 5*time.Second))
 	defer cancel()
 	rejected := locks.rejected
 	go func() {
@@ -1046,7 +1064,7 @@ func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
 // stays clean. The poll is cut to a millisecond so the retry costs no real
 // wait.
 func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
-	defer pve.SetClusterLockPollForTest(time.Millisecond)()
+	ctx := pve.WithClusterLockPollForTest(t.Context(), time.Millisecond)
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -1064,7 +1082,7 @@ func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
 		return errors.New("connection reset by peer")
 	}
 
-	if err := disk.attach(t.Context()); err != nil {
+	if err := disk.attach(ctx); err != nil {
 		t.Fatalf("a failed read after an accepted create failed the attach: %v", err)
 	}
 	if failed != 1 {

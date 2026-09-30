@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -179,10 +178,10 @@ func createVMDiskLockTimeout(t *testing.T, overrides bool) (Deps, *createVMDiskC
 	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, overrides)
 	locks.reset()
 	plantHeldParkerLock(locks, parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 	args := createVMArgs(t, cid)
 
-	_, err := createVM(t.Context(), deps, args)
+	_, err := createVM(ctx, deps, args)
 	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout, got %v", err)
 	}

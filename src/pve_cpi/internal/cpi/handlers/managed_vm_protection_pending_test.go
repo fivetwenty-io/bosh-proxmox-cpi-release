@@ -98,7 +98,7 @@ func newProtectionPendingFlow(t *testing.T, fallback bool) *protectionPendingFlo
 	flow.locks.reset()
 	hang := &protectionHangPVE{rollbackFlowPVE: flow.parked.deps.PVE.(rollbackFlowPVE), parker: flow.parked.parker}
 	flow.parked.deps.PVE = hang
-	return &protectionPendingFlow{rollbackFlow: flow, pve: hang, ctx: pve.WithParkerProtectionRestoreTimeoutForTest(t.Context(), 200*time.Millisecond)}
+	return &protectionPendingFlow{rollbackFlow: flow, pve: hang, ctx: pve.WithParkerProtectionRestoreTimeoutForTest(flow.ctx, 200*time.Millisecond)}
 }
 
 func (f *protectionPendingFlow) createVM() (any, error) {
