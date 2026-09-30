@@ -721,6 +721,7 @@ func TestAllocationAuditRetainedCleanupStepsNameOnlyTheParker(t *testing.T) {
 	sum := sha256.Sum256([]byte(record.AgentID))
 	report = StorageAllocationAudit{Complete: true, VMScanComplete: true, Evidence: []StorageAllocationEvidence{{AllocationID: record.ID, Kind: "vm", Node: "pve1", VMID: 999, AgentSHA256: hex.EncodeToString(sum[:])}}}
 	correlateStorageAuditEvidence(&report, map[string]aj.Record{record.ID: record}, nil, "director")
+	settleStorageAuditRaces(context.Background(), Deps{}, &report, func() ([]aj.Record, error) { return []aj.Record{record}, nil }, nil, "director")
 	if !slices.ContainsFunc(report.Conflicts, func(c string) bool { return strings.Contains(c, "(VM 999) is outside recorded mutation targets") }) {
 		t.Fatalf("VM at the parker's VMID claimed the allocation: %v", report.Conflicts)
 	}
@@ -758,7 +759,7 @@ func TestAllocationAuditDisabledHistoricalStorageStaysAudited(t *testing.T) {
 		json.RawMessage(`{"storage":"local-lvm","type":"lvmthin","vgname":"pve","thinpool":"data","content":"images","disable":1}`))
 	c.nodesRead.failure = errors.New("storage 'local-lvm' is disabled")
 	records := []aj.Record{{ID: "old-disk", Namespace: "director", Kind: "disk", State: aj.Observed, Steps: []aj.Step{{ID: "owned", State: aj.Observed, Target: aj.Target{Node: "pve1", Storage: "local-lvm"}, VolIDs: []string{"local-lvm:vm-100-disk-0"}}}}}
-	report, err := auditStorageAllocationRecords(context.Background(), deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, records, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}

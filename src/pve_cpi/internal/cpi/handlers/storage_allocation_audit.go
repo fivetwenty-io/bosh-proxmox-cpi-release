@@ -73,6 +73,9 @@ type StorageAllocationAudit struct {
 	// pending holds the node mismatches that wait for the move rules, which
 	// need the storage listings and so run after correlation.
 	pending []storageAuditPendingMove
+	// unsettled holds the sightings that no record of the first journal read
+	// explains, which wait for the journal read that follows the scan.
+	unsettled []storageAuditUnsettled
 	// claims maps each volid a VM configuration holds to what PVE says about
 	// the volume at each holder, so a listing can tell a reused name from
 	// the volume a record once carried under it.
@@ -201,6 +204,22 @@ type storageAuditPendingMove struct {
 	// their recorded nodes from the journal record instead.
 	recorded        string
 	conflict, brief string
+}
+
+// storageAuditUnsettled is a sighting with no record, or with no step, in the
+// journal read that preceded the scan. A sibling create can write its record
+// and step and then clone its VM or create its volume while the scan runs, so
+// its conflict waits for a second journal read that follows the scan.
+type storageAuditUnsettled struct {
+	evidence        StorageAllocationEvidence
+	conflict, brief string
+}
+
+// storageAuditUnreadGuest is a listed VM whose configuration read failed,
+// with the issue the failure raises.
+type storageAuditUnreadGuest struct {
+	vmid  int
+	issue string
 }
 
 // markVMScanIncomplete records an issue that leaves the VM scan, and so the
@@ -336,16 +355,20 @@ func AuditStorageAllocations(ctx context.Context, deps Deps, journal *aj.Journal
 	if err != nil {
 		return StorageAllocationAudit{}, err
 	}
-	return auditStorageAllocationRecords(ctx, deps, records, nodes)
+	return auditStorageAllocationRecords(ctx, deps, records, journal.List, nodes)
 }
 
 // AuditStorageAllocationEnrollment scans for existing namespace provenance
 // before explicit first enrollment. It never constructs an empty journal.
 func AuditStorageAllocationEnrollment(ctx context.Context, deps Deps, nodes []string) (StorageAllocationAudit, error) {
-	return auditStorageAllocationRecords(ctx, deps, nil, nodes)
+	return auditStorageAllocationRecords(ctx, deps, nil, nil, nodes)
 }
 
-func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.Record, nodes []string) (StorageAllocationAudit, error) {
+// auditStorageAllocationRecords audits the cluster against records. When
+// reread is set, it reads the journal again after the scan to settle the
+// sightings that records could not explain; nil leaves records as the only
+// read.
+func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.Record, reread func() ([]aj.Record, error), nodes []string) (StorageAllocationAudit, error) {
 	result := StorageAllocationAudit{Complete: true, VMScanComplete: true, StartedAt: time.Now(), Records: records}
 	if ctx == nil || deps.Config == nil || deps.PVE == nil {
 		return result, fmt.Errorf("allocation audit requires configuration and client")
@@ -397,6 +420,7 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 	result.Evidence = slices.Compact(result.Evidence)
 	namespace := deps.Config.StoragePlacementNamespace
 	correlateStorageAuditEvidence(&result, byID, stores, namespace)
+	settleStorageAuditRaces(ctx, deps, &result, reread, stores, namespace)
 	resolveStorageAuditMoves(ctx, deps, &result, storageAuditMoveIndex{byID: byID, knownVolumes: knownVolumes, stores: stores, namespace: namespace})
 	sort.Strings(result.Issues)
 	result.Issues = slices.Compact(result.Issues)
@@ -700,13 +724,14 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 	}
 	diskHolders := map[string][]StorageAllocationEvidence{}
 	namespace := deps.Config.StoragePlacementNamespace
+	var unread []storageAuditUnreadGuest
 	for _, guest := range guests {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		cfg, e := deps.PVE.QEMU().Config(ctx, guest.Node, guest.VMID)
 		if e != nil {
-			markVMScanIncomplete(result, fmt.Sprintf("VM %d configuration could not be inspected on %s: %s", guest.VMID, guest.Node, pve.DescribeAuditError(e)))
+			unread = append(unread, storageAuditUnreadGuest{vmid: guest.VMID, issue: fmt.Sprintf("VM %d configuration could not be inspected on %s: %s", guest.VMID, guest.Node, pve.DescribeAuditError(e))})
 			continue
 		}
 		if cfg == nil {
@@ -729,9 +754,35 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 		inventory.vmstate, inventory.hasVMState = storageAuditVMState(cfg)
 		result.vms = append(result.vms, inventory)
 	}
+	if len(unread) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		storageAuditUnreadGuests(ctx, deps, unread, result)
+	}
 
 	return diskHolders, nil
 
+}
+
+// storageAuditUnreadGuests skips each unread guest that was deleted after the
+// first listing and marks the VM scan incomplete for every other one. Skipping
+// a guest claims that it is absent, so the check lists guests again with the
+// strict ListGuestsAuthoritative, which fails rather than leave out a node. A
+// guest is skipped only when that listing succeeds and no node carries its
+// VMID; one listed anywhere, even on another node, keeps its issue.
+func storageAuditUnreadGuests(ctx context.Context, deps Deps, unread []storageAuditUnreadGuest, result *StorageAllocationAudit) {
+	guests, err := pve.ListGuestsAuthoritative(ctx, deps.PVE, deps.Log(ctx))
+	listed := map[int]bool{}
+	for _, guest := range guests {
+		listed[guest.VMID] = true
+	}
+	for _, guest := range unread {
+		if err == nil && !listed[guest.vmid] {
+			continue
+		}
+		markVMScanIncomplete(result, guest.issue)
+	}
 }
 
 // storageAuditVMState returns the volid a configuration's vmstate key names.
@@ -1061,7 +1112,7 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 		subject := storageAuditSubject(evidence)
 		record, ok := byID[evidence.AllocationID]
 		if !ok {
-			result.addConflict("remote allocation "+evidence.AllocationID+" is missing from retained journal; audit required: observed "+subject, subject+" carries unknown allocation "+evidence.AllocationID)
+			result.unsettled = append(result.unsettled, storageAuditUnsettled{evidence: evidence, conflict: "remote allocation " + evidence.AllocationID + " is missing from retained journal; audit required: observed " + subject, brief: subject + " carries unknown allocation " + evidence.AllocationID})
 			continue
 		}
 		if record.State == aj.Deleted || record.State == aj.Cleaned {
@@ -1107,7 +1158,9 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 
 // storageAuditTargetMiss raises the conflict for evidence that no retained
 // step matched. A VM sighted only on another node waits for the move rules,
-// which need the storage listings, instead of raising its conflict now.
+// which need the storage listings, instead of raising its conflict now. A
+// sighting that no step names waits for the second journal read, because the
+// record may have gained its step during the scan.
 func storageAuditTargetMiss(result *StorageAllocationAudit, record aj.Record, evidence StorageAllocationEvidence, miss storageAuditMiss) {
 	observed := fmt.Sprintf("volume %s", evidence.VolumeID)
 	if evidence.VolumeID == "" {
@@ -1120,7 +1173,72 @@ func storageAuditTargetMiss(result *StorageAllocationAudit, record aj.Record, ev
 		result.pending = append(result.pending, storageAuditPendingMove{kind: "vm", evidence: evidence, conflict: conflict, brief: brief})
 		return
 	}
+	if miss.reason == "" || miss.reason == storageAuditReasonNotInStep {
+		result.unsettled = append(result.unsettled, storageAuditUnsettled{evidence: evidence, conflict: conflict, brief: brief})
+		return
+	}
 	result.addConflict(conflict, brief)
+}
+
+// settleStorageAuditRaces drops the conflict of each unsettled sighting that a
+// record in a second journal read explains, and raises every other one as
+// written. The read follows the VM scan and every storage listing, so it sees
+// any record a sibling create wrote before it cloned a VM or created a volume
+// the scan saw. With nothing unsettled or no reread it reads nothing. A failed
+// read settles nothing and adds no issue; the next audit reads afresh.
+func settleStorageAuditRaces(ctx context.Context, deps Deps, result *StorageAllocationAudit, reread func() ([]aj.Record, error), stores map[string]pve.StorageInfo, namespace string) {
+	unsettled := result.unsettled
+	result.unsettled = nil
+	byID := map[string]aj.Record{}
+	if len(unsettled) > 0 && reread != nil {
+		records, err := reread()
+		if err != nil {
+			deps.Log(ctx).Warn("storage allocation audit could not read the journal again; its unsettled conflicts stand", log.Int("unsettled_conflicts", len(unsettled)), log.ErrScrubbed(err))
+			records = nil
+		}
+		for recordIndex := range records {
+			byID[records[recordIndex].ID] = records[recordIndex]
+		}
+	}
+	for _, candidate := range unsettled {
+		if record, ok := byID[candidate.evidence.AllocationID]; ok && storageAuditActiveStepExplains(record, stores, namespace, candidate.evidence) {
+			continue
+		}
+		result.addConflict(candidate.conflict, candidate.brief)
+	}
+}
+
+// storageAuditActiveStepExplains reports whether a live record of this
+// namespace and kind owns evidence through a step of its active attempt. A VM
+// marker must also carry the record's agent. A Planned step counts, because a
+// create saves its step before it clones the VM or creates the volume.
+func storageAuditActiveStepExplains(record aj.Record, stores map[string]pve.StorageInfo, namespace string, evidence StorageAllocationEvidence) bool {
+	if record.State == aj.Deleted || record.State == aj.Cleaned || record.Namespace != namespace || record.Kind != evidence.Kind {
+		return false
+	}
+	marker := evidence.Kind == "vm" && evidence.VolumeID == ""
+	if marker {
+		sum := sha256.Sum256([]byte(record.AgentID))
+		if evidence.AgentSHA256 != hex.EncodeToString(sum[:]) {
+			return false
+		}
+	}
+	for stepIndex := range record.Steps {
+		step := record.Steps[stepIndex]
+		if step.Attempt != record.ActiveAttempt() {
+			continue
+		}
+		match := false
+		if marker {
+			match, _ = storageAuditVMTargetMatches(record, step, evidence.Node, evidence.VMID)
+		} else if evidence.VolumeID != "" {
+			match, _ = storageAuditVolumeTargetMatches(record, step, stores, evidence.Node, evidence.VolumeID)
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 func storageAuditRecordIndex(records []aj.Record) (map[string]aj.Record, map[string]map[string]bool, map[string][]aj.Record) {
