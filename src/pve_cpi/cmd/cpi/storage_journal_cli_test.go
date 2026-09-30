@@ -162,7 +162,7 @@ func TestStorageJournalEnrollmentFailuresAreNamed(t *testing.T) {
 func TestStorageJournalOutputFailuresAreReported(t *testing.T) {
 	var stderr bytes.Buffer
 	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true}
-	if code := writeStorageJournalAudit(brokenPipe{}, &stderr, report, nil, true); code != 1 || stderr.String() != "audit output could not be written: write /dev/stdout: broken pipe\n" {
+	if code := writeStorageJournalAudit(brokenPipe{}, &stderr, report, nil, true, false); code != 1 || stderr.String() != "audit output could not be written: write /dev/stdout: broken pipe\n" {
 		t.Fatalf("broken audit output reported as %d %q", code, stderr.String())
 	}
 	f := newStorageJournalFixture(t)
@@ -227,10 +227,10 @@ func TestStorageJournalRecoveryRefusalNamesItsPrecondition(t *testing.T) {
 func TestStorageJournalMissingGenerationRefusalNamesItsPrecondition(t *testing.T) {
 	now := time.Now()
 	clean := handlers.StorageAllocationAudit{StartedAt: now, CompletedAt: now, Complete: true, VMScanComplete: true}
-	request := storageJournalMissingGeneration{AgentID: "agent", AllocationID: "allocation", IndexFirstConfirmed: true}
+	request := storageJournalRequest{AgentID: "agent", AllocationID: "allocation", IndexFirstConfirmed: true}
 	for _, tc := range []struct {
 		name               string
-		request            storageJournalMissingGeneration
+		request            storageJournalRequest
 		authority          string
 		fenced             bool
 		clusterID          string
@@ -241,7 +241,7 @@ func TestStorageJournalMissingGenerationRefusalNamesItsPrecondition(t *testing.T
 	}{
 		{"unfenced", request, "writer", false, "cluster", clean, "precondition failed: the previous writer is not attested as fenced", false, true},
 		{"blank authority", request, " ", true, "cluster", clean, "precondition failed: authority-id is blank", false, true},
-		{"unconfirmed crash", storageJournalMissingGeneration{AgentID: "agent", AllocationID: "allocation"}, "writer", true, "cluster", clean, "precondition failed: the index-first crash is not confirmed", false, true},
+		{"unconfirmed crash", storageJournalRequest{AgentID: "agent", AllocationID: "allocation"}, "writer", true, "cluster", clean, "precondition failed: the index-first crash is not confirmed", false, true},
 		{"cluster continuity", request, "writer", true, "other-cluster", clean, "precondition failed: cluster continuity is lost; PVE reports a cluster identity other than the enrolled one", false, true},
 		{"unstamped audit", request, "writer", true, "cluster", handlers.StorageAllocationAudit{CompletedAt: now, Complete: true, VMScanComplete: true}, "precondition failed: the audit has no start time", false, true},
 		{"backwards audit", request, "writer", true, "cluster", handlers.StorageAllocationAudit{StartedAt: now, CompletedAt: now.Add(-time.Second), Complete: true, VMScanComplete: true}, "precondition failed: the audit completed before it started", false, true},
