@@ -45,6 +45,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -724,10 +726,38 @@ func lockOwnerHost(host string) string {
 // identity and a per-process sequence, rendering "<owner>@<host>/<pid>-<nonce>-<seq>".
 // Two CPI processes that lock the same key in the same second would otherwise
 // stamp byte-identical claims, and a caller that compares claims could not
-// tell the holder's sentinel from its own. The token must not contain spaces,
-// because the sentinel comment is split on them.
+// tell the holder's sentinel from its own. The sentinel comment is split on
+// whitespace, so lockOwnerToken replaces any in the caller's part, and the
+// owner this returns always decodes back to itself.
 func ProcessLockOwner(owner string) string {
-	return fmt.Sprintf("%s@%s-%d", owner, processLockIdentity(), lockOwnerSeq.Add(1))
+	return fmt.Sprintf("%s@%s-%d", lockOwnerToken(owner), processLockIdentity(), lockOwnerSeq.Add(1))
+}
+
+// lockOwnerToken makes a caller's owner token safe to stamp into a sentinel
+// comment. decodeLockOwner splits the comment with strings.Fields, so every
+// rune that unicode.IsSpace reports becomes '-', and an empty token becomes
+// "unnamed". Every other byte is copied as it is, so a token that was already
+// safe comes back byte for byte the same. That includes bytes that are not
+// valid UTF-8, which we keep on purpose. The owner only has to decode back to
+// itself through our own decoder so that a release can prove the claim ours,
+// and rewriting bytes that are already safe would give us a token that is no
+// longer the caller's. lockOwnerHost replaces such bytes because the host ends
+// up in text we print, which is a different job.
+func lockOwnerToken(owner string) string {
+	if owner == "" {
+		return "unnamed"
+	}
+	var b strings.Builder
+	for i := 0; i < len(owner); {
+		r, size := utf8.DecodeRuneInString(owner[i:])
+		if unicode.IsSpace(r) {
+			b.WriteByte('-')
+		} else {
+			b.WriteString(owner[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
 }
 
 // ErrClusterLockStateUnknown marks an acquire that created its sentinel but

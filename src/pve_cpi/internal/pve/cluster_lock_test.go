@@ -807,3 +807,60 @@ func TestAcquireClusterLock_CancelledWaitIsInterrupted(t *testing.T) {
 		t.Fatalf("the interrupted wait must be retriable and keep the cancellation: %v", err)
 	}
 }
+
+// TestProcessLockOwner_RoundTripsAnyCallerToken covers a caller token that
+// carries whitespace. The sentinel comment is split on whitespace, so such a
+// token used to decode as only its first part, and every release then read
+// its own claim as someone else's and left it standing for a whole TTL. The
+// owner now decodes back to itself, and a release proves the claim ours and
+// deletes it.
+func TestProcessLockOwner_RoundTripsAnyCallerToken(t *testing.T) {
+	t.Parallel()
+	for name, token := range map[string]string{
+		"space":           "set vm metadata/4242",
+		"tab":             "unpark\t90000",
+		"newline":         "park/90000\n",
+		"no-break space":  "aa\u00a0web",
+		"line separator":  "aa\u2028web",
+		"only whitespace": " \t\n",
+		"empty":           "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			owner := ProcessLockOwner(token)
+			expiry := time.Unix(5000, 0)
+			comment := encodeLockComment(owner, expiry)
+			if got, ok := decodeLockOwner(comment); !ok || got != owner {
+				t.Errorf("owner %q decoded as %q (ok=%t) from %q", owner, got, ok, comment)
+			}
+			f := newFakeLockPools()
+			f.pools["bosh-lock-web"] = comment
+			now := time.Unix(1000, 0)
+			h := &ClusterLockHandle{
+				pool: "bosh-lock-web", owner: owner, pools: f,
+				expiry: expiry, now: func() time.Time { return now },
+			}
+			if err := h.Release(context.Background()); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+			if f.deleteN != 1 {
+				t.Fatalf("Release did not prove the claim %q ours and delete it", comment)
+			}
+		})
+	}
+}
+
+// TestProcessLockOwner_KeepsSafeTokens pins that a token with no whitespace
+// passes through byte for byte, so the owners today's callers produce do not
+// change, and that an empty token gets a readable fallback.
+func TestProcessLockOwner_KeepsSafeTokens(t *testing.T) {
+	t.Parallel()
+	for _, token := range []string{"set_vm_metadata/4242", "unpark/90000", "aa-web/101", "caf\u00e9/1", "bad\xffbyte"} {
+		if got := ProcessLockOwner(token); !strings.HasPrefix(got, token+"@") {
+			t.Errorf("ProcessLockOwner(%q) = %q, want the token kept as it is", token, got)
+		}
+	}
+	if got := ProcessLockOwner(""); !strings.HasPrefix(got, "unnamed@") {
+		t.Errorf("ProcessLockOwner(\"\") = %q, want the unnamed fallback", got)
+	}
+}
