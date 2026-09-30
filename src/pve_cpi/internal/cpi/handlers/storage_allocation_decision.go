@@ -82,11 +82,15 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
 		return result, storageRefusal("allocation already has a terminal disposition")
 	}
-	for stepIndex := range record.Steps {
-		step := record.Steps[stepIndex]
-		if step.State != aj.Observed && !storageDecisionClosedAttemptStepSettled(record, step) {
-			return result, storageRefusal("allocation has unsettled mutation evidence; reconcile task completion before disposition")
-		}
+	// A lock step an earlier request left planned is settled by readback
+	// first. The write touches only the journal, never PVE.
+	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	if err != nil {
+		return result, storageDecisionSourceError(err)
+	}
+	record = handle.Record()
+	if text := unsettledStepText(record, gaps, func(step aj.Step) bool { return storageDecisionClosedAttemptStepSettled(record, step) }); text != "" {
+		return result, storageRefusal("allocation has unsettled mutation evidence; " + text + "; reconcile that step before disposition")
 	}
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {
@@ -97,7 +101,12 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	}
 	var ownership aj.Verification
 	if decision.Action == "adopt" {
-		if record.State != aj.ReadyToReturn || record.CID == "" || record.CID != decision.ExpectedCID {
+		// A disk the Director already holds keeps its CID when a later
+		// lifecycle leaves it in reconciliation_required, so adoption accepts
+		// that shape too. The ownership observation below proves the disk is
+		// where its record says, with no transfer in flight.
+		returned := record.State == aj.ReadyToReturn || record.Kind == allocationKindDisk && record.State == aj.ReconciliationRequired
+		if !returned || record.CID == "" || record.CID != decision.ExpectedCID {
 			return result, storageRefusal("adoption requires the exact ready-to-return CID")
 		}
 		ownership, err = observeAllocationDecisionOwnership(ctx, deps, journal, record)

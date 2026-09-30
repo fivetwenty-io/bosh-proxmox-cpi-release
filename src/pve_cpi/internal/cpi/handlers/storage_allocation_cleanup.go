@@ -56,6 +56,11 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
 		return result, storageRefusal("allocation already has a terminal disposition")
 	}
+	phase = "lock_step_settlement"
+	if _, err := settlePlannedLockSteps(ctx, deps.PVE, handle); err != nil {
+		return result, storageDecisionSourceError(err)
+	}
+	record = handle.Record()
 	phase = "pending_mutation_settlement"
 	ctx, settlement, err := admitStorageCleanupSettlement(ctx, deps, record, decision)
 	if err != nil {

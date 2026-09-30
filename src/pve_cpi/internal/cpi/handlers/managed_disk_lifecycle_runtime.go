@@ -64,6 +64,16 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 	if err != nil {
 		return fail(err)
 	}
+	// A lock step an earlier request left planned is settled by readback
+	// before readmission judges the record, so a retry is not refused for a
+	// sentinel that never held anything of ours.
+	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	if err != nil {
+		return fail(err)
+	}
+	if text := unsettledStepText(handle.Record(), gaps, func(step aj.Step) bool { return step.Attempt != handle.Record().ActiveAttempt() }); text != "" && len(gaps) > 0 {
+		return fail(storageRefusal("lifecycle has unresolved mutation evidence; " + text))
+	}
 	session, err := beginStorageLifecycle(handle, operation, proof)
 	if err != nil {
 		return fail(err)

@@ -87,7 +87,7 @@ The command retains the reconstruction evidence and a cleaned tombstone for that
 
 ## Record adoption or completed cleanup
 
-Use the exact CID from the audit when a completed allocation needs explicit adoption. The command checks current ownership and settled mutation evidence before recording the decision. It does not insert the CID into the Director database.
+Use the exact CID from the audit when a completed allocation needs explicit adoption. The command checks current ownership and settled mutation evidence before recording the decision. It does not insert the CID into the Director database. It accepts a VM in `ready_to_return`, and a disk in `ready_to_return` or in `reconciliation_required` with its CID, which is the shape a disk operation leaves when it fails after the Director already holds the disk. For that disk, the command also observes that the volume sits where its record says and that no transfer is in flight.
 
 ```sh
 cpi storage-journal adopt \
@@ -105,6 +105,14 @@ cpi storage-journal finalize-cleanup \
   --allocation-id ALLOCATION_UUID \
   --decision-id incident-1234-cleanup
 ```
+
+### What counts as settled
+
+A step is settled when it is `observed`, or when it belongs to an earlier attempt whose completion proof covers it. Every other step refuses `adopt` and `finalize-cleanup`, and the refusal names the first such step with its step name and kind, as in `step attempt-0-step-7 (lifecycle_attach_disk_Pool_CreatePool) is planned`.
+
+A planned lock step is the one exception, and the command settles it first. A lock step is one whose kind is `lifecycle_<operation>_Pool_CreatePool`, `lifecycle_<operation>_Pool_DeletePool`, `park_Pool_CreatePool`, or `park_Pool_DeletePool`. It records the create or delete of a `bosh-lock-` pool, which is an empty lock marker and never holds anything the allocation owns. The command reads the lock pool of every VM that the record's steps name, `bosh-lock-vm-<vmid>`. When each read answers exactly, either with the pool and whatever claim it holds or with PVE's own `pool '<id>' does not exist`, the command marks the planned lock steps observed. That writes only the journal. A claim that the failed request left behind stays in place, and the next request that wants the lock takes it over once the claim's TTL passes. When a read fails, or answers with anything else, the step stays planned and the refusal says which lock pool could not be read. A VM record's `vm.Pool.CreatePool` steps are not settled this way, because the same kind also creates deployment pools and the step does not record which pool it meant.
+
+The Director's retry of `attach_disk`, `detach_disk`, or `delete_disk` settles planned lock steps the same way before it readmits the record, and so does `cleanup`.
 
 Cleanup finalization does not delete resources. It requires settled mutations and a complete audit proving that the allocation's resources and provenance are absent. A remaining root volume, ISO, renamed disk, or uncertain task prevents finalization. Keep tombstones and verification history; age does not authorize purging them.
 

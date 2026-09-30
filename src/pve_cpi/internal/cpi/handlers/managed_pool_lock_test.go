@@ -39,10 +39,13 @@ type lockContention struct {
 	creates    int
 	rejections int
 	heldAt     time.Time
-	held       chan struct{}
-	rejected   chan struct{}
-	heldOnce   sync.Once
-	rejectOnce sync.Once
+	// createErr fails every sentinel create without creating, and readErr
+	// fails every raw sentinel read.
+	createErr, readErr error
+	held               chan struct{}
+	rejected           chan struct{}
+	heldOnce           sync.Once
+	rejectOnce         sync.Once
 }
 
 func newLockContention(t *testing.T) *lockContention {
@@ -55,6 +58,7 @@ func (l *lockContention) reset() {
 	defer l.mu.Unlock()
 	l.pools = map[string]string{}
 	l.creates, l.rejections = 0, 0
+	l.createErr, l.readErr = nil, nil
 	l.heldAt = time.Time{}
 	l.held, l.rejected = make(chan struct{}), make(chan struct{})
 	l.heldOnce, l.rejectOnce = sync.Once{}, sync.Once{}
@@ -89,6 +93,9 @@ func (p contendedPools) CreatePool(ctx context.Context, id, comment string) erro
 	l := p.locks
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.createErr != nil {
+		return l.createErr
+	}
 	if _, taken := l.pools[id]; taken {
 		l.rejections++
 		l.rejectOnce.Do(func() { close(l.rejected) })
@@ -125,6 +132,9 @@ func (p contendedPools) ReadPoolComment(ctx context.Context, id string) (string,
 	}
 	p.locks.mu.Lock()
 	defer p.locks.mu.Unlock()
+	if p.locks.readErr != nil {
+		return "", p.locks.readErr
+	}
 	comment, found := p.locks.pools[id]
 	if !found {
 		return "", livePoolVerdict(p.locks.t, "pool '"+id+"' does not exist")
