@@ -64,8 +64,9 @@ func writeStorageJournalEnrollmentText(w io.Writer, report handlers.StorageAlloc
 }
 
 // storageJournalFindingLines lists conflicts, then the issues that left the
-// VM scan incomplete, then every other issue. Issues holds the VM-scan
-// issues too, so they are printed once, under their own prefix.
+// VM scan incomplete, then every other issue, then the moves the audit
+// accepted. Issues holds the VM-scan issues too, so they are printed once,
+// under their own prefix.
 func storageJournalFindingLines(report handlers.StorageAllocationAudit) []string {
 	var lines []string
 	for _, conflict := range report.Conflicts {
@@ -78,6 +79,9 @@ func storageJournalFindingLines(report handlers.StorageAllocationAudit) []string
 		if !slices.Contains(report.VMScanIssues, issue) {
 			lines = append(lines, "issue: "+issue)
 		}
+	}
+	for _, move := range report.ObservedMoves {
+		lines = append(lines, "observed move: "+move.String())
 	}
 	return lines
 }
