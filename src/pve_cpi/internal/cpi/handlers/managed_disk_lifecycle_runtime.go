@@ -27,6 +27,9 @@ type managedDiskLifecycle struct {
 	journal         *aj.Journal
 	handle          *aj.Handle
 	session         *storageLifecycle
+	// diskMutationAdmitted records that the guard admitted a mutation other
+	// than a bosh-lock- sentinel create or delete during this operation.
+	diskMutationAdmitted bool
 }
 
 func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk, operation string) (*managedDiskLifecycle, error) {
@@ -161,16 +164,19 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 }
 
 // cleanLockTimeout reports whether an operation failed only because a cluster
-// lock wait ran out, with nothing left uncertain. That takes three things: the
-// failure carries pve.ErrClusterLockTimeout, the guard was never poisoned, and
-// every step the operation journaled has been observed. A timeout is positive
-// evidence that another request held the lock throughout, so this request
-// never entered the window it was waiting for.
+// lock wait ran out, before it changed the disk. That takes four things. The
+// failure carries pve.ErrClusterLockTimeout, the guard was never poisoned, the
+// guard admitted nothing but sentinel creates and deletes, and every step the
+// operation journaled has been observed. A timeout is positive evidence that
+// another request held the lock throughout, so this request never entered the
+// window it was waiting for. An operation that moved or migrated the disk
+// before it waited has changed it, even when every step settled, so it still
+// goes uncertain.
 func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	if operationErr == nil || !errors.Is(operationErr, pve.ErrClusterLockTimeout) {
 		return false
 	}
-	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {
+	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
 		return false
 	}
 	return storageLifecycleSettled(m.handle.Record()) == nil

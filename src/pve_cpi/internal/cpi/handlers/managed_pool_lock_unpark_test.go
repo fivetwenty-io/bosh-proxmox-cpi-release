@@ -231,22 +231,31 @@ func TestManagedLifecycleTimeoutRules(t *testing.T) {
 	timeout := cpierrors.WrapAs(errors.Join(errors.New("held"), pve.ErrClusterLockTimeout), cpierrors.TypeRetriableCloud, "AcquireClusterLock: timed out")
 	for _, tc := range []struct {
 		name    string
-		prepare func(t *testing.T, lifecycle *managedDiskLifecycle)
+		prepare func(t *testing.T, local Deps, lifecycle *managedDiskLifecycle)
 		err     error
 		want    aj.State
 	}{
 		{name: "settled timeout", err: timeout, want: aj.ReadyToReturn},
-		{name: "unsettled mutation", err: timeout, want: aj.ReconciliationRequired, prepare: func(t *testing.T, lifecycle *managedDiskLifecycle) {
+		{name: "unsettled mutation", err: timeout, want: aj.ReconciliationRequired, prepare: func(t *testing.T, _ Deps, lifecycle *managedDiskLifecycle) {
 			if _, err := lifecycle.session.Intent("unsettled_probe", aj.Target{Node: "n1"}); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{name: "poisoned guard", err: timeout, want: aj.ReconciliationRequired, prepare: func(t *testing.T, lifecycle *managedDiskLifecycle) {
+		{name: "poisoned guard", err: timeout, want: aj.ReconciliationRequired, prepare: func(t *testing.T, _ Deps, lifecycle *managedDiskLifecycle) {
 			if lifecycle.guard.Poison(nil) == nil {
 				t.Fatal("the guard did not record the poison")
 			}
 		}},
 		{name: "other failure", err: cpierrors.Cloud("transfer failed"), want: aj.ReconciliationRequired},
+		{name: "disk mutation before the timeout", err: timeout, want: aj.ReconciliationRequired, prepare: func(t *testing.T, local Deps, _ *managedDiskLifecycle) {
+			// A real guarded write to the disk's holder lands and settles
+			// before the wait runs out. Every step is observed, yet the disk
+			// has been touched, so the timeout must not return the allocation.
+			protect := true
+			if err := local.PVE.Nodes().UpdateQemuConfig(t.Context(), "n1", "777", &nodes.UpdateQemuConfigParams{Protection: &protect}); err != nil {
+				t.Fatalf("guarded holder write: %v", err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			deps, _, journal, id, cid := lifecycleFlowFixtureState(t, true, true)
@@ -258,12 +267,12 @@ func TestManagedLifecycleTimeoutRules(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, lifecycle, err := managedDiskOperation(t.Context(), deps, rd, "attach_disk")
+			local, lifecycle, err := managedDiskOperation(t.Context(), deps, rd, "attach_disk")
 			if err != nil || lifecycle == nil {
 				t.Fatalf("lifecycle admission: %v", err)
 			}
 			if tc.prepare != nil {
-				tc.prepare(t, lifecycle)
+				tc.prepare(t, local, lifecycle)
 			}
 			result := lifecycle.finish(t.Context(), tc.err, false)
 			if !errors.Is(result, tc.err) {
@@ -278,4 +287,68 @@ func TestManagedLifecycleTimeoutRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestManagedLockTimeoutSurvivesTheAttachWrappers checks the error finish
+// really receives. attachDiskViaTransfer wraps the transfer's failure with the
+// CPI's own error types, and the timeout sentinel must still be visible
+// through them, or a clean timeout would never be recognized.
+func TestManagedLockTimeoutSurvivesTheAttachWrappers(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	ctx := t.Context()
+	bare, meta, err := decodeDiskCID(ctx, disk.deps, "attach_disk", disk.cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd, err := resolveDiskForOp(ctx, disk.deps, "attach_disk", disk.cid, bare, meta)
+	if err != nil || rd.holder == nil {
+		t.Fatalf("resolving the parked disk: %v", err)
+	}
+	local, lifecycle, err := managedDiskOperation(ctx, disk.deps, rd, "attach_disk")
+	if err != nil || lifecycle == nil {
+		t.Fatalf("lifecycle admission: %v", err)
+	}
+	ctx = managedLockWaitContext(ctx)
+	_, _, opErr := attachDiskViaTransfer(ctx, local, "attach_disk", "777", "n1", 777, disk.cid, lifecycle.disk, attachPlan{viaTransfer: true, parker: *rd.holder}, "scsi1", nil)
+	if !errors.Is(opErr, pve.ErrClusterLockTimeout) || !cpierrors.IsType(opErr, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the attach wrappers hid the lock timeout: %v", opErr)
+	}
+	if result := lifecycle.finish(ctx, opErr, false); !errors.Is(result, pve.ErrClusterLockTimeout) {
+		t.Fatalf("finish lost the timeout: %v", result)
+	}
+	assertReturnedRecord(t, "timed-out", disk.record(t))
+}
+
+// TestManagedDetachLockTimeoutKeepsTheTimeout runs a parked detach against a
+// held parker lock. The Director must see the retriable timeout, and the
+// Director's retry must be admitted and complete once the lock frees.
+func TestManagedDetachLockTimeoutKeepsTheTimeout(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("attach before the detach: %v", err)
+	}
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	detach := func() error {
+		_, err := HandleDetachDisk(disk.deps).Handle(t.Context(), []json.RawMessage{json.RawMessage(`"777"`), json.RawMessage(fmt.Sprintf("%q", disk.cid))}, jsonrpc.Context{})
+		return err
+	}
+	err := detach()
+	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("detach did not hand back the retriable lock timeout: %v", err)
+	}
+	t.Logf("record after the timed-out detach: %s (%s)", disk.record(t).State, disk.record(t).Reason)
+	locks.reset()
+	if err := detach(); err != nil {
+		t.Fatalf("the detach retry failed: %v", err)
+	}
+	assertReturnedRecord(t, "retried detach", disk.record(t))
 }

@@ -161,6 +161,12 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		return "", err
 	}
 	g.observations[step] = observation
+	if call.Service != managedDiskServicePool {
+		// Only a sentinel create or delete leaves the disk and its holders
+		// alone. Anything else admitted here may have moved, migrated, or
+		// rewritten the disk, which a later lock timeout must not paper over.
+		m.diskMutationAdmitted = true
+	}
 	return step, nil
 }
 
