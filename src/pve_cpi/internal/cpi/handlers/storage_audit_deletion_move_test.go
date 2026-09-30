@@ -99,7 +99,7 @@ func TestAllocationAuditKeepsTheDeleteAdmissionsMove(t *testing.T) {
 			records := f.build()
 			records[0].State = tc.state
 			records[0].Verifications = tc.admit(t, f)
-			report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+			report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 			if err != nil {
 				t.Fatal(err)
 			}

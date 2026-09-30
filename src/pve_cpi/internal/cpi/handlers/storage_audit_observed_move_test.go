@@ -269,7 +269,7 @@ func stringsToAny(in map[string]string) map[string]any {
 func (f *moveFixture) audit() StorageAllocationAudit {
 	f.t.Helper()
 	records := f.build()
-	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestAllocationAuditAcceptsSharedStorageMoves(t *testing.T) {
 		c.nodesRead.volumesByNode[node] = []string{"a:4626/vm-4626-disk-0.qcow2", "a:4626/vm-4626-disk-1.qcow2", "a:4626/vm-4626-disk-2.qcow2", "a:7014/vm-7014-disk-0.qcow2", "a:7014/vm-7014-disk-1.qcow2"}
 	}
 
-	report, err := auditStorageAllocationRecords(context.Background(), deps, []aj.Record{vm4626, disk, vm7014}, []string{"pvupvecf101"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, []aj.Record{vm4626, disk, vm7014}, nil, []string{"pvupvecf101"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func moveParkerFixture(t *testing.T, storage string) (Deps, []aj.Record, aj.Reco
 // during a patch cycle, which moves stopped parker VMs along with the rest.
 func TestAllocationAuditAcceptsParkerMovedOnSharedStorage(t *testing.T) {
 	deps, records, disk, volume := moveParkerFixture(t, "a")
-	report, err := auditStorageAllocationRecords(context.Background(), deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, records, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func TestAllocationAuditAcceptsParkerMovedOnSharedStorage(t *testing.T) {
 
 func TestAllocationAuditRefusesParkerMovedWithLocalStorage(t *testing.T) {
 	deps, records, disk, volume := moveParkerFixture(t, "local")
-	report, err := auditStorageAllocationRecords(context.Background(), deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, records, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}

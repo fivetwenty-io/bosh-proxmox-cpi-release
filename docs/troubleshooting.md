@@ -1393,6 +1393,8 @@ charging: none
 
 In this report, VM 4626 moved with a node-local disk and stays a conflict, while VM 7015 moved on shared storage and was accepted. A `conflict:` line means the audit saw something that contradicts the journal. A `vm-scan issue:` line means the VM scan could not finish, so the audit cannot prove that no other copy of a VM exists. An `issue:` line means some other read failed, or that what the audit read disagrees with the journal in a way that is not a conflict, like the `(node_local_elsewhere)` line above or malformed disk provenance. An `observed move:` line is a move the audit accepted, and it never blocks anything. A `generation index:` line appears only when the journal's index is unhealthy, and a `skipped disabled storages:` line appears only when the audit skipped one. The command exits 1 when the audit or its VM scan is incomplete, when the index is unhealthy, or when cluster continuity is lost, and any conflict marks the audit incomplete. The findings name the allocation, the VMID, the recorded node, and the observed node, so each one matches one of the cases below.
 
+On releases before 0.9.0, a `create_vm` or `create_disk` could refuse because another create ran at the same moment and the audit saw that create's new VM or volume before the record behind it. The refusal then named `carries unknown allocation <id>`, `recorded no node (not_in_step)`, or a VM configuration that `does not exist`, and an audit we ran afterwards came back clean. In that case we rerun the deploy, and 0.9.0 no longer refuses this way.
+
 **An accepted move on shared storage**
 
 When the cluster operator migrates a VM, a persistent disk's holder, or a parker VM to another node, and everything it holds sits on shared storage the new node can see, the audit accepts the move. There is no refusal, and the summary lists the move instead.
@@ -1508,7 +1510,7 @@ This is a VM-scan issue, so it refuses every audit-gated call, `create_vm` inclu
 VM <vmid> configuration could not be inspected on <node>: <error>
 ```
 
-This is also a VM-scan issue. `<error>` is a safe description of what went wrong, which is an HTTP status with PVE's own message, `request timed out`, `connection to <host>:<port> failed`, or `unclassified error`. The message ends in `PVE returned an empty configuration` when the read succeeded but held nothing. We read the configuration ourselves with `pmx pve qemu config get <vmid> --node <node>`. An HTTP 403 means the CPI's token lacks `VM.Audit` on that VM, and an empty or unreadable configuration usually means a damaged file in `/etc/pve/qemu-server/` on that node.
+This is also a VM-scan issue. `<error>` is a safe description of what went wrong, which is an HTTP status with PVE's own message, `request timed out`, `connection to <host>:<port> failed`, or `unclassified error`. The message ends in `PVE returned an empty configuration` when the read succeeded but held nothing. We read the configuration ourselves with `pmx pve qemu config get <vmid> --node <node>`. An HTTP 403 means the CPI's token lacks `VM.Audit` on that VM, and an empty or unreadable configuration usually means a damaged file in `/etc/pve/qemu-server/` on that node. On releases before 0.9.0, a `does not exist` error for a VM that is no longer listed means the VM was deleted during the scan.
 
 **Unproven visibility**
 

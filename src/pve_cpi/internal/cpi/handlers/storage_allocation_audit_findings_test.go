@@ -311,7 +311,7 @@ func TestAllocationAuditFindingsNameWhatTheySaw(t *testing.T) {
 			var report StorageAllocationAudit
 			var err error
 			if tc.records {
-				report, err = auditStorageAllocationRecords(context.Background(), deps, records, []string{"pve1"})
+				report, err = auditStorageAllocationRecords(context.Background(), deps, records, nil, []string{"pve1"})
 			} else {
 				report, err = AuditStorageAllocations(context.Background(), deps, j, []string{"pve1"})
 			}

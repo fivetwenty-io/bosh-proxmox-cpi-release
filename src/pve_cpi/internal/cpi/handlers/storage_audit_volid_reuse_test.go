@@ -132,7 +132,7 @@ func (f *reuseFixture) build() []aj.Record {
 func (f *reuseFixture) audit() StorageAllocationAudit {
 	f.t.Helper()
 	records := f.build()
-	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestAllocationAuditReusedNameStillFindsTrueDuplicates(t *testing.T) {
 			}
 			f.c.configs[reuseOtherVM] = other
 			f.c.nodesRead.volumesByNode["pve1"] = append(f.c.nodesRead.volumesByNode["pve1"], reuseOtherVol, reuseOtherVM2Volume)
-			report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+			report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -294,7 +294,7 @@ func TestAllocationAuditFindsForeignSerialOnHeldVolume(t *testing.T) {
 	records := f.build()
 	f.c.configs[reuseOtherVM] = map[string]any{"virtio0": reuseOtherVol, "scsi2": reuseParked + ",serial=bpd-00000000000000aa"}
 	f.c.nodesRead.volumesByNode["pve1"] = append(f.c.nodesRead.volumesByNode["pve1"], reuseOtherVol)
-	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func sharedReferenceFixture(t *testing.T, nodes map[int]string, configs map[int]
 	for vmid, cfg := range configs {
 		c.configs[vmid] = cfg
 	}
-	report, err := auditStorageAllocationRecords(context.Background(), deps, nil, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, nil, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestAllocationAuditVMRecordYieldsReusedName(t *testing.T) {
 	provenance := pve.DiskAllocationProvenance{Version: 1, AllocationID: disk.ID, AllocationNamespace: "director", Volid: reused, Node: "pve1", Backing: a.BackingKey()}
 	c.configs[123] = map[string]any{"virtio0": root, "scsi1": reused + ",serial=" + token, "description": moveDescription(t, moveMarker(t, vm.ID, "agent"), provenance)}
 	c.nodesRead.volumesByNode = map[string][]string{"pve1": {root, reused}}
-	report, err := auditStorageAllocationRecords(context.Background(), deps, []aj.Record{vm, disk}, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), deps, []aj.Record{vm, disk}, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestAllocationAuditUnheldReusedNameStaysEvidenced(t *testing.T) {
 	cfg := f.c.configs[reuseVMID]
 	delete(cfg, "scsi1")
 	cfg["unused0"] = reuseVolume
-	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, []string{"pve1"})
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
 	}
