@@ -240,7 +240,11 @@ func TestWithVMIDLock_OwnerNamesTheProcess(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	marker := fmt.Sprintf("owner=set_vm_metadata/4242@%d-", os.Getpid())
+	marker := "owner=set_vm_metadata/4242@"
+	pid := fmt.Sprintf("/%d-", os.Getpid())
+	if !strings.Contains(claims[0], pid) || !strings.Contains(claims[1], pid) {
+		t.Fatalf("claims %q do not name this process", claims)
+	}
 	if !strings.HasPrefix(claims[0], marker) || !strings.HasPrefix(claims[1], marker) || claims[0] == claims[1] {
 		t.Fatalf("claims %q do not name this process and acquisition", claims)
 	}

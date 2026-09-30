@@ -242,3 +242,53 @@ func TestLockStepKinds(t *testing.T) {
 		t.Errorf("sentinel candidates = %v", got)
 	}
 }
+
+// TestLockBugCreateDiskRecordCleansUp covers the create_disk record the old
+// lock bug left behind. The volume was created and observed, the park's
+// sentinel create then failed with an outcome the guard could not classify, so
+// the park step stayed planned, and create_disk never returned a CID. The docs
+// send that record to cleanup, which must settle the lock step first and then
+// remove the volume.
+func TestLockBugCreateDiskRecordCleansUp(t *testing.T) {
+	deps, client, journal, id, _ := lifecycleFlowFixtureState(t, false)
+	delete(client.state.configs[777], "scsi1")
+	locks := newLockContention(t)
+	deps.PVE = contendedFlowPVE{lifecycleFlowPVE: client, locks: locks}
+
+	handle, err := journal.Acquire(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A handle on a record that never returned may only save it as uncertain,
+	// so the record is marked first and the planned step written after. The
+	// result is the shape the guard and create_disk left: the lock step planned,
+	// the record in reconciliation_required, and no CID.
+	if err := storageAllocationUncertain(handle, "parker Pool.CreatePool"); err == nil {
+		t.Fatal("marking the record uncertain returned no refusal")
+	}
+	birth := handle.Record().Steps[0].Target
+	step, err := storageMutationIntent(handle, "park_Pool_CreatePool", aj.Target{Node: birth.Node, Storage: birth.Storage, Backing: birth.Backing, IntendedVolume: birth.IntendedVolume}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storageAllocationUncertain(handle, "persistent parker completion"); err == nil {
+		t.Fatal("marking the record uncertain returned no refusal")
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if record, _ := journal.Inspect(id); record.CID != "" || record.State != aj.ReconciliationRequired {
+		t.Fatalf("replayed record is not the old create_disk shape: %s CID=%q", record.State, record.CID)
+	}
+
+	result, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "cleanup", AllocationID: id, DecisionID: "old-lock-bug-create-disk"})
+	if err != nil {
+		t.Fatalf("cleanup refused the old create_disk record: %v", err)
+	}
+	if result.State != aj.Cleaned || client.deletes != 1 {
+		t.Fatalf("cleanup left %s with %d volume deletes", result.State, client.deletes)
+	}
+	if settled := stepByID(t, result, step); settled.State != aj.Observed {
+		t.Fatalf("cleanup left the lock step %s", settled.State)
+	}
+}

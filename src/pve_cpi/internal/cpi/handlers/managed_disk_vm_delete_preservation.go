@@ -125,6 +125,7 @@ func detachManagedPersistentForVMDeleteOne(ctx context.Context, deps Deps, node 
 	if lifecycle == nil {
 		return fmt.Errorf("persistent disk preservation did not acquire allocation ownership")
 	}
+	ctx = managedLockWaitContext(ctx)
 	defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 	current := lifecycle.disk
 	if current.holder == nil || current.holder.Node != node || current.holder.VMID != vmid || current.volid != disk.volid {

@@ -536,6 +536,9 @@ func (t *managedPoolService) MoveVMToPool(ctx context.Context, poolID string, vm
 	return
 }
 func (t *managedPoolService) CreatePool(ctx context.Context, poolID, comment string) (err error) {
+	if repeated, refusal := t.repeatLockRefusal(ctx, poolID); repeated {
+		return refusal
+	}
 	m := ManagedAllocationMutation{Service: managedDiskServicePool, Method: "CreatePool", Args: map[string]any{managedArgumentPoolID: poolID, "comment": comment}}
 	token, err := t.guard.begin(ctx, m)
 	if err != nil {
@@ -543,9 +546,12 @@ func (t *managedPoolService) CreatePool(ctx context.Context, poolID, comment str
 	}
 	defer t.guard.end(ctx, m, token)
 	err = t.PoolService.CreatePool(ctx, poolID, comment)
-	if t.lockCreateRefused(ctx, poolID, comment, err) {
-		return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
+	if held, refused := t.lockCreateRefused(ctx, poolID, comment, err); refused {
+		err = t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
+		t.guard.rememberLockRefusal(poolID, held, err)
+		return err
 	}
+	t.guard.forgetLockRefusal(poolID)
 	err = t.guard.finish(ctx, m, token, nil, err)
 	return
 }

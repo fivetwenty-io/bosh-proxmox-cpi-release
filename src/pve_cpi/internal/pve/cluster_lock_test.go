@@ -538,9 +538,13 @@ func TestProcessLockOwner_IsUniquePerAcquisition(t *testing.T) {
 	if first == second {
 		t.Fatalf("two acquisitions share the owner token %q", first)
 	}
-	pid := fmt.Sprintf("@%d-", os.Getpid())
+	host, _ := os.Hostname()
+	identity := "@" + processLockIdentity() + "-"
+	if !strings.HasPrefix(identity, "@"+lockOwnerHost(host)+fmt.Sprintf("/%d-", os.Getpid())) {
+		t.Fatalf("process identity %q does not name this host and pid", identity)
+	}
 	for _, owner := range []string{first, second} {
-		if !strings.HasPrefix(owner, "unpark/90000"+pid) || strings.ContainsAny(owner, " \t\n") {
+		if !strings.HasPrefix(owner, "unpark/90000"+identity) || strings.ContainsAny(owner, " \t\n") {
 			t.Fatalf("owner token %q does not name the caller and this process", owner)
 		}
 		got, ok := decodeLockOwner(encodeLockComment(owner, time.Now()))
@@ -577,5 +581,20 @@ func TestAcquireClusterLock_DisplacedCreateReturnsNoHandle(t *testing.T) {
 	}
 	if f.pools["bosh-lock-vm-90000"] != stealer {
 		t.Fatalf("the stealer's claim was disturbed: %q", f.pools["bosh-lock-vm-90000"])
+	}
+}
+
+// TestLockOwnerHost keeps the host part of an owner token free of spaces and
+// bounded, so the token survives the sentinel comment's encoding.
+func TestLockOwnerHost(t *testing.T) {
+	for host, want := range map[string]string{
+		"bosh-director.example": "bosh-director.example",
+		"has space\tand tab":    "has-space-and-tab",
+		"":                      "unknown-host",
+		strings.Repeat("a", 90): strings.Repeat("a", lockOwnerHostLimit),
+	} {
+		if got := lockOwnerHost(host); got != want {
+			t.Errorf("lockOwnerHost(%q) = %q, want %q", host, got, want)
+		}
 	}
 }

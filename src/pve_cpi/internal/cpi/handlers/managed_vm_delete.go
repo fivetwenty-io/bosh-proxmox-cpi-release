@@ -102,11 +102,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err := handle.Save(record); err != nil {
 		return proof, err
 	}
-	defer func() {
-		if retErr != nil {
-			retErr = errors.Join(retErr, storageAllocationUncertain(handle, "VM cleanup"))
-		}
-	}()
+	defer func() { retErr = managedVMCleanupFailure(handle, retErr) }()
 	if err := cleanupManagedVMInfrastructure(ctx, deps, journal, handle, node, vmid); err != nil {
 		return proof, storageCleanupFailure("vm_infrastructure", err)
 	}
@@ -437,6 +433,21 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	proof.VMAbsenceVerified = true
 	proof.ArtifactDispositionVerified = true
 	return proof, nil
+}
+
+// managedVMCleanupFailure settles a VM cleanup failure. Preserving a
+// persistent disk can wait out another request's parker window and return the
+// disk unchanged. When every step this cleanup wrote is observed, nothing is
+// uncertain and the retry resumes from here. Anything else requires
+// reconciliation.
+func managedVMCleanupFailure(handle *aj.Handle, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isDiskReturnedAfterLockTimeout(err) && storageLifecycleSettled(handle.Record()) == nil {
+		return err
+	}
+	return errors.Join(err, storageAllocationUncertain(handle, "VM cleanup"))
 }
 
 func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {

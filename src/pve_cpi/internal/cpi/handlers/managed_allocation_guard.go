@@ -60,6 +60,9 @@ type ManagedAllocationGuard struct {
 	original pve.Client
 	hooks    ManagedAllocationHooks
 	poisoned error
+	// lockRefusals holds, per sentinel, the claim that last refused a guarded
+	// create and the refusal PVE returned for it. See repeatLockRefusal.
+	lockRefusals map[string]lockRefusal
 }
 
 // NewManagedAllocationGuard requires all three durable evidence hooks.
