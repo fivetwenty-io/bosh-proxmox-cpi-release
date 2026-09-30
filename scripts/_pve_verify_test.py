@@ -256,11 +256,18 @@ class TestVMExists(unittest.TestCase):
                 v.vm_exists(101)
 
     def test_missing_node_raises_pve_verify_error(self) -> None:
+        # The node is only needed once /cluster/resources cannot be read, so the
+        # stub refuses that call. Without it the test reached the real network
+        # and waited out DNS or the 30s connect timeout for pve.example.com.
         cfg = _token_config(node="")
         v = PVEVerifier(cfg)
-        with self.assertRaises(PVEVerifyError) as ctx:
-            v.vm_exists(101)
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 side_effect=_make_http_error(403, "Forbidden")) as urlopen:
+            with self.assertRaises(PVEVerifyError) as ctx:
+                v.vm_exists(101)
         self.assertIn("node", str(ctx.exception).lower())
+        urlopen.assert_called_once()
+        self.assertIn("/cluster/resources", urlopen.call_args.args[0].full_url)
 
 
 # ---------------------------------------------------------------------------
