@@ -134,7 +134,13 @@ type lockGuardEvents struct {
 
 func newLockGuard(t *testing.T, pools *lockGuardPools, events *lockGuardEvents) *ManagedAllocationGuard {
 	t.Helper()
-	raw := lockGuardClient{pools: pools}
+	return newLockGuardOver(t, lockGuardClient{pools: pools}, events)
+}
+
+// newLockGuardOver builds the same guard over any client, including another
+// guard's client.
+func newLockGuardOver(t *testing.T, raw pve.Client, events *lockGuardEvents) *ManagedAllocationGuard {
+	t.Helper()
 	guard, err := NewManagedAllocationGuard(raw, ManagedAllocationHooks{
 		Before: func(context.Context, ManagedAllocationMutation) (string, error) { return "step", nil },
 		After: func(ctx context.Context, call ManagedAllocationMutation, _ string, result any) error {
@@ -256,6 +262,40 @@ func TestManagedLockCreateFailuresStayUncertain(t *testing.T) {
 				t.Fatal("an uncertain failure leaked the upstream error")
 			}
 		})
+	}
+}
+
+// TestNestedGuardSettlesALockCreateRefusal builds a guard over another
+// guard's client. The outer guard proves a refused sentinel create by reading
+// the holder's claim through the inner guard's pool service, so a contended
+// create must settle as refused on both guards instead of poisoning the outer
+// one. The next poll then reads the same claim through the inner guard and is
+// answered with the same refusal without another create reaching PVE.
+func TestNestedGuardSettlesALockCreateRefusal(t *testing.T) {
+	refusal := livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
+	pools := &lockGuardPools{createErr: refusal, comment: "owner=holder exp=1", found: true}
+	innerEvents, outerEvents := &lockGuardEvents{}, &lockGuardEvents{}
+	inner := newLockGuard(t, pools, innerEvents)
+	outer := newLockGuardOver(t, inner.Client(), outerEvents)
+	err := outer.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=waiter exp=2")
+	if !unchangedError(err, refusal) {
+		t.Fatalf("refusal was replaced: got %v, want the original %v", err, refusal)
+	}
+	if outer.Err() != nil || outerEvents.failed != 0 || inner.Err() != nil || innerEvents.failed != 0 {
+		t.Fatalf("a held lock poisoned a guard: outer=%v inner=%v", outer.Err(), inner.Err())
+	}
+	if len(outerEvents.after) != 1 || len(innerEvents.after) != 1 {
+		t.Fatalf("refusal was not settled on both guards: outer=%v inner=%v", outerEvents.after, innerEvents.after)
+	}
+	pools.calls = nil
+	if err := outer.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=waiter exp=3"); !unchangedError(err, refusal) {
+		t.Fatalf("the outer guard refused the next poll: %v", err)
+	}
+	if want := []string{"raw:" + lockGuardPool}; strings.Join(pools.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("the next poll made calls %v, want only the claim read %v", pools.calls, want)
+	}
+	if len(outerEvents.after) != 1 || len(innerEvents.after) != 1 {
+		t.Fatalf("a repeated refusal was journaled: outer=%v inner=%v", outerEvents.after, innerEvents.after)
 	}
 }
 

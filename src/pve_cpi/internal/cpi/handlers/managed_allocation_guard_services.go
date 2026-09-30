@@ -3,6 +3,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -579,6 +580,23 @@ func (t *managedPoolService) DeletePool(ctx context.Context, poolID string) (err
 	}
 	err = t.guard.finish(ctx, m, token, result, err)
 	return
+}
+
+// ReadPoolComment forwards pve.RawPoolCommentReader, so a guard built over
+// another guard's client can still prove a refused sentinel create and answer
+// a repeated poll. Without it, lockCreateRefused and repeatLockRefusal on the
+// outer guard find no reader and every contended create poisons that guard. A
+// wrapped service that cannot read raw fails the read, as tracedPoolService
+// does. It is a read, so it skips begin and touches no guard state, and a
+// poisoned guard still answers it. A read changes nothing in PVE, so there is
+// nothing to admit or journal, and refusing it would only take away the
+// evidence the outer guard needs to settle a refusal instead of poisoning.
+func (t *managedPoolService) ReadPoolComment(ctx context.Context, poolID string) (string, error) {
+	reader, ok := t.PoolService.(pve.RawPoolCommentReader)
+	if !ok {
+		return "", errors.New("wrapped pool service cannot read a pool comment raw")
+	}
+	return reader.ReadPoolComment(ctx, poolID)
 }
 
 func (t *managedQEMUService) Clone(ctx context.Context, node string, vmid int, params map[string]interface{}) (upid string, err error) {
