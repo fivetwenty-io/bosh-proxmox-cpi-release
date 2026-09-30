@@ -73,6 +73,9 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	if err != nil {
 		return proof, err
 	}
+	// The disposition the record had before cleanup admitted its lifecycle,
+	// which a clean lock wait failure puts back.
+	prior := handle.Record()
 	session, err := beginStorageLifecycleCleanup(ctx, handle, "delete_disk", ownership)
 	if err != nil {
 		return proof, err
@@ -91,12 +94,26 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
 	ctx = managedLockWaitContext(ctx)
 	defer func() {
+		// A parker lock wait that failed before this cleanup changed the
+		// disk, judged by the same rules attach_disk uses, leaves the record
+		// as it was and hands the retriable failure back, so the operator
+		// reruns cleanup once the other request's window closes.
+		if lifecycle.cleanLockTimeout(operationErr) {
+			restoreErr := restoreExplicitCleanupDisposition(handle, prior)
+			if restoreErr == nil {
+				return
+			}
+			operationErr = errors.Join(operationErr, restoreErr)
+		}
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {
 			deps.recordStorageReconciliation(ctx, "required")
 			operationErr = errors.Join(operationErr, session.Uncertain("explicit disk cleanup incomplete"))
 		}
 	}()
+	if hook := explicitCleanupBeforeUnparkFrom(ctx); hook != nil {
+		hook(ctx, local, disk)
+	}
 	node := disk.allocation.provenance.Node
 	deleted := false
 	// Explicit cleanup has already audited ownership and current references.
@@ -122,4 +139,49 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 		return proof, err
 	}
 	return lifecycle.deletionProof(ctx)
+}
+
+// explicitCleanupBeforeUnparkKey carries a test's hook on the request context.
+type explicitCleanupBeforeUnparkKey struct{}
+
+// explicitCleanupHook runs after explicit cleanup admits its lifecycle and
+// before it touches the disk.
+type explicitCleanupHook func(ctx context.Context, local Deps, disk resolvedDisk)
+
+// withExplicitCleanupBeforeUnpark returns a context that runs hook at that
+// point. Only tests call it, to admit a guarded write ahead of the parker lock
+// wait. It rides the context, as WithTestBackoff does, so tests that set it can
+// run in parallel.
+func withExplicitCleanupBeforeUnpark(ctx context.Context, hook explicitCleanupHook) context.Context {
+	return context.WithValue(ctx, explicitCleanupBeforeUnparkKey{}, hook)
+}
+
+// explicitCleanupBeforeUnparkFrom returns the hook ctx carries, or nil.
+func explicitCleanupBeforeUnparkFrom(ctx context.Context) explicitCleanupHook {
+	hook, _ := ctx.Value(explicitCleanupBeforeUnparkKey{}).(explicitCleanupHook)
+	return hook
+}
+
+// restoreExplicitCleanupDisposition puts back the state and reason the record
+// had before explicit cleanup admitted its lifecycle. The admission and
+// ownership evidence cleanup appended stay, because the journal only ever
+// appends verifications. A record that was adopted passes through
+// reconciliation_required on the way back, the only route the journal allows
+// from the observed state admission leaves it in.
+func restoreExplicitCleanupDisposition(handle *aj.Handle, prior aj.Record) error {
+	record := handle.Record()
+	if record.State == prior.State && record.Reason == prior.Reason {
+		return nil
+	}
+	if prior.State == aj.Adopted {
+		record.State = aj.ReconciliationRequired
+		record.Reason = "explicit disk cleanup lock wait ended; restoring adoption"
+		if err := handle.Save(record); err != nil {
+			return err
+		}
+		record = handle.Record()
+	}
+	record.State = prior.State
+	record.Reason = prior.Reason
+	return handle.Save(record)
 }

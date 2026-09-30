@@ -362,6 +362,11 @@ const ClusterLockCompletionAllowance = 5 * time.Second
 // up with ErrClusterLockTimeout instead of being cut short by the deadline.
 const clusterLockContextMargin = clusterLockReleaseTimeout + ClusterLockCompletionAllowance
 
+// ClusterLockContextMargin exports clusterLockContextMargin for callers that
+// size a request's deadline around a lock wait, such as the storage-journal
+// CLI's cleanup budget.
+const ClusterLockContextMargin = clusterLockContextMargin
+
 // clusterLockDeadline is when an acquire started at now stops waiting. It is
 // now plus timeout, or the request's deadline less clusterLockContextMargin
 // when that comes first, and clamped reports that the request's deadline set

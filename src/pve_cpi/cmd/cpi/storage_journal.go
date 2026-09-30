@@ -102,7 +102,7 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		storageJournalFail(stderr, "storage journal PVE client unavailable", err)
 		return 1
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := storageJournalContext(action)
 	defer cancel()
 	nodes, err := storageJournalNodes(ctx, client)
 	if err != nil {
@@ -614,6 +614,40 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 		return 1
 	}
 	return 0
+}
+
+// storageJournalBaseBudget bounds an action that never waits on a parker's
+// protection lock. It covers node enumeration, the cluster identity read, the
+// historical audit, and the journal writes around them.
+const storageJournalBaseBudget = 2 * time.Minute
+
+// storageJournalCleanupBudget bounds cleanup, the one action that can take a
+// parker's protection lock, which it does when it preserves or deletes a
+// parked disk. On top of the base budget it covers one full wait for another
+// request's window (pve.ParkerProtectionLockTTL), the margin a lock wait
+// leaves before its request's deadline for the sentinel's release and the
+// caller's completion (pve.ClusterLockContextMargin), and the window cleanup
+// then runs itself, which fits inside its own claim's TTL together with its
+// protection restore, its sweep, and its release. A cleanup that meets a
+// second contended window in the same run has that wait end cleanly before
+// the deadline, and we rerun it.
+const storageJournalCleanupBudget = storageJournalBaseBudget + pve.ParkerProtectionLockTTL + pve.ClusterLockContextMargin + pve.ParkerProtectionLockTTL
+
+// storageJournalActionCleanup names the one action that can take a parker's
+// protection lock.
+const storageJournalActionCleanup = "cleanup"
+
+// storageJournalBudget is the time an action runs under.
+func storageJournalBudget(action string) time.Duration {
+	if action == storageJournalActionCleanup {
+		return storageJournalCleanupBudget
+	}
+	return storageJournalBaseBudget
+}
+
+// storageJournalContext is the context an action runs under.
+func storageJournalContext(action string) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), storageJournalBudget(action))
 }
 
 func supportedStorageJournalAction(action string) bool {
