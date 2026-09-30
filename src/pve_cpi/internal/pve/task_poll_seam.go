@@ -11,9 +11,8 @@ import (
 // retry config block existed, so an unconfigured process polls identically to
 // prior releases.
 //
-// This mirrors the package-level seam pattern already used for the health-check
-// poll floor: BOSH runs one CPI process per invocation with a single config, so
-// a startup-time package default is the simplest correct wiring and avoids
+// BOSH runs one CPI process per invocation with a single config, so a
+// startup-time package default is the simplest correct wiring and avoids
 // threading a poll policy through every one of the ~20 AwaitTask call sites.
 var (
 	taskPollIntervalNs    atomic.Int64 // default 2000ms
