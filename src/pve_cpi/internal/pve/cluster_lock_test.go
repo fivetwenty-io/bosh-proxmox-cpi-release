@@ -240,7 +240,12 @@ func TestAcquireClusterLock_MalformedCommentTreatedExpired(t *testing.T) {
 	}
 }
 
-func TestAcquireClusterLock_NonDuplicateCreateErrorRetriable(t *testing.T) {
+// TestAcquireClusterLock_UnknownCreateIsRetriableAndUnknown covers a create
+// that failed without a verdict from PVE, here a gateway's 503 text. The create
+// may have landed, so the error is retriable and says the lock state is
+// unknown, and the acquire reads the sentinel once on its way out. Nothing was
+// created, so that read finds nothing to delete.
+func TestAcquireClusterLock_UnknownCreateIsRetriableAndUnknown(t *testing.T) {
 	f := newFakeLockPools()
 	f.createFn = func(_, _ string) error { return fmt.Errorf("503 service unavailable") }
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
@@ -251,6 +256,12 @@ func TestAcquireClusterLock_NonDuplicateCreateErrorRetriable(t *testing.T) {
 	}
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("transient create failure must be retriable; got %v", err)
+	}
+	if !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Errorf("a create with no verdict must leave the lock state unknown; got %v", err)
+	}
+	if f.getN != 1 || f.deleteN != 0 {
+		t.Errorf("want one read on the way out and no delete; get=%d delete=%d", f.getN, f.deleteN)
 	}
 }
 
@@ -330,6 +341,9 @@ func TestTryStealExpired_DeleteNonNotFoundErrorRetriable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "steal-delete") {
 		t.Errorf("error should identify the steal-delete step; got %v", err)
+	}
+	if !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Errorf("a failed steal-delete leaves the holder unknown; got %v", err)
 	}
 	if f.createN != 0 {
 		t.Errorf("recreate must not be attempted after a delete failure; createN=%d", f.createN)

@@ -4,6 +4,7 @@
 package pve
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cloudinit"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	clusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -20,6 +22,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -855,4 +858,128 @@ func TestWithParkerProtectionLock_NotAttemptedCreateFailsTheCall(t *testing.T) {
 	if !errors.Is(err, ErrMutationNotAttempted) {
 		t.Fatalf("want the refused create, got %v", err)
 	}
+}
+
+// runParkerWindow runs a parker window on 90000 against pools and reports
+// whether its body ran, along with the call's error.
+func runParkerWindow(pools PoolService, logger *log.Logger) (bool, error) {
+	ran := false
+	ctx := withTestParkerLockTimeouts(context.Background(), 180*time.Second, 5*time.Second)
+	err := withParkerProtectionLock(ctx, &parkerLockClient{pools: pools}, logger, 90000, "transfer", func(context.Context) error {
+		ran = true
+		return nil
+	})
+	return ran, err
+}
+
+// assertLockStateUnknown fails the test unless err is the retriable unknown
+// lock state that a parker window returns instead of running.
+func assertLockStateUnknown(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("want ErrClusterLockStateUnknown, got %v", err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the unknown lock state must be retriable: %v", err)
+	}
+}
+
+// TestWithParkerProtectionLock_FailedHolderReadFailsTheCall covers a create
+// that PVE refused because the sentinel already exists, followed by a read of
+// its holder that fails. Somebody may be inside the window, so the window must
+// not run unserialized, and the call fails with the unknown lock state.
+func TestWithParkerProtectionLock_FailedHolderReadFailsTheCall(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools[ClusterLockPoolName("vm-90000")] = encodeLockComment("holder-a", time.Now().Add(time.Hour))
+	f.getFn = func(string) (string, bool, error, bool) {
+		return "", false, errors.New("503 pmxcfs read timeout"), true
+	}
+	ran, err := runParkerWindow(f, nil)
+	if ran {
+		t.Fatal("the window ran unserialized although PVE said the sentinel exists")
+	}
+	assertLockStateUnknown(t, err)
+}
+
+// TestWithParkerProtectionLock_FailedReReadBeforeAStealFailsTheCall covers an
+// expired holder whose claim the acquire reads again right before it steals,
+// and that second read fails. The holder is unknown again, so the window must
+// not run unserialized.
+func TestWithParkerProtectionLock_FailedReReadBeforeAStealFailsTheCall(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools[ClusterLockPoolName("vm-90000")] = encodeLockComment("holder-a", time.Now().Add(-time.Minute))
+	f.getFn = func(string) (string, bool, error, bool) {
+		if f.getN == 2 {
+			return "", false, errors.New("503 pmxcfs read timeout"), true
+		}
+		return "", false, nil, false
+	}
+	ran, err := runParkerWindow(f, nil)
+	if ran {
+		t.Fatal("the window ran unserialized after the read before a steal failed")
+	}
+	assertLockStateUnknown(t, err)
+}
+
+// TestWithParkerProtectionLock_RefusedStealDeleteFailsTheCall covers a steal
+// whose delete fails, as a journal-managed delete does when its own read of
+// the sentinel fails. The expired claim may still stand, and the window must
+// not run unserialized beside it.
+func TestWithParkerProtectionLock_RefusedStealDeleteFailsTheCall(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools[ClusterLockPoolName("vm-90000")] = encodeLockComment("holder-a", time.Now().Add(-time.Minute))
+	f.deleteFn = func(string) error {
+		return errors.New(`read lock sentinel "bosh-lock-vm-90000" before deleting it: 503 pmxcfs read timeout`)
+	}
+	ran, err := runParkerWindow(f, nil)
+	if ran {
+		t.Fatal("the window ran unserialized after the steal's delete failed")
+	}
+	assertLockStateUnknown(t, err)
+}
+
+// TestWithParkerProtectionLock_DeniedCreateRunsUnserialized covers the one
+// acquire failure that still runs the window without the lock. PVE refused the
+// lock pool's create with a 403, as it does for an identity without
+// Pool.Allocate, which says the lock is unavailable to us rather than that
+// somebody holds it. The window runs, and the CPI warns that it ran
+// unserialized.
+func TestWithParkerProtectionLock_DeniedCreateRunsUnserialized(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.createFn = func(string, string) error {
+		return sdkerrors.ParseAPIError(403, []byte(`{"data":null,"message":"Permission check failed (/pool/bosh-lock-vm-90000, Pool.Allocate)\n"}`))
+	}
+	sink := &bytes.Buffer{}
+	logger, err := log.NewLogger("debug", sink)
+	if err != nil {
+		t.Fatalf("build a logger: %v", err)
+	}
+	ran, err := runParkerWindow(f, logger)
+	if err != nil || !ran {
+		t.Fatalf("the window did not run after a denied lock create: ran=%t err=%v", ran, err)
+	}
+	if !strings.Contains(sink.String(), "running the window unserialized") {
+		t.Fatalf("the unserialized window was not warned about; log:\n%s", sink.String())
+	}
+}
+
+// TestWithParkerProtectionLock_UnknownCreateFailsTheCall covers a lock create
+// whose connection dropped before PVE answered. The create may have landed,
+// so the window must not run unserialized, and the call fails with the
+// unknown lock state.
+func TestWithParkerProtectionLock_UnknownCreateFailsTheCall(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.createFn = func(string, string) error {
+		return errors.New("read tcp 10.0.0.1:52144->10.0.0.2:8006: read: connection reset by peer")
+	}
+	ran, err := runParkerWindow(f, nil)
+	if ran {
+		t.Fatal("the window ran unserialized after a create with an unknown outcome")
+	}
+	assertLockStateUnknown(t, err)
 }
