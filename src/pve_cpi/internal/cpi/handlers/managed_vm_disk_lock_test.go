@@ -31,6 +31,9 @@ type createVMDiskClient struct {
 	*managedVMEntryClient
 	flow  *lifecycleFlowPVE
 	locks *lockContention
+	// destroyedConfigs keeps each destroyed VM's last configuration, so a
+	// test can still read what a rolled-back VM carried.
+	destroyedConfigs map[int]map[string]any
 }
 
 func (c *createVMDiskClient) Pools() pve.PoolService {
@@ -45,6 +48,7 @@ func (c *createVMDiskClient) Nodes() nodes.Service {
 	return &createVMDiskNodes{
 		managedVMEntryNodes: &managedVMEntryNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, client: c.managedVMEntryClient},
 		flow:                lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.flow},
+		disk:                c,
 	}
 }
 
@@ -67,6 +71,27 @@ func (q *createVMDiskQEMU) ListSnapshots(context.Context, string, int) ([]map[st
 type createVMDiskNodes struct {
 	*managedVMEntryNodes
 	flow lifecycleFlowNodes
+	disk *createVMDiskClient
+}
+
+// DeleteQemu keeps a copy of the VM's configuration before it is destroyed.
+func (n *createVMDiskNodes) DeleteQemu(ctx context.Context, node, id string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+	vmid, err := strconv.Atoi(id)
+	if err != nil {
+		return nil, err
+	}
+	last := map[string]any{}
+	for key, value := range n.state.configs[vmid] {
+		last[key] = value
+	}
+	result, err := n.managedVMEntryNodes.DeleteQemu(ctx, node, id, params)
+	if err == nil {
+		if n.disk.destroyedConfigs == nil {
+			n.disk.destroyedConfigs = map[int]map[string]any{}
+		}
+		n.disk.destroyedConfigs[vmid] = last
+	}
+	return result, err
 }
 
 func (n *createVMDiskNodes) UpdateQemuConfig(ctx context.Context, node, vmid string, p *nodes.UpdateQemuConfigParams) error {
@@ -145,8 +170,9 @@ func createVMArgs(t *testing.T, cid string) []json.RawMessage {
 // createVMDiskLockTimeout runs create_vm through its real entry with a parked
 // disk in disk_cids while another request holds the parker's lock. The
 // pre-attach waits out its wait and returns the disk unchanged, so create_vm
-// fails retriably without marking either allocation for reconciliation, and
-// the VM's persistent handoff step is settled rather than left planned.
+// rolls the attempt back and fails retriably. The VM is destroyed, its
+// generation is closed with every step observed, and the disk is returned on
+// its parker.
 func createVMDiskLockTimeout(t *testing.T, overrides bool) (Deps, *createVMDiskClient, *aj.Journal, *lockContention, []json.RawMessage) {
 	t.Helper()
 	locks := newLockContention(t)
@@ -160,7 +186,26 @@ func createVMDiskLockTimeout(t *testing.T, overrides bool) (Deps, *createVMDiskC
 	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("want the retriable lock timeout, got %v", err)
 	}
-	assertCreateVMDiskRecordsSettled(t, journal)
+	if client.creates != 1 || client.destroys != 1 {
+		t.Fatalf("the timed-out attempt was not rolled back: creates=%d destroys=%d", client.creates, client.destroys)
+	}
+	if _, found, err := journal.InspectVM("disk-agent"); err != nil || found {
+		t.Fatalf("the rollback left a VM generation for the retry to resume: found=%t err=%v", found, err)
+	}
+	records, err := journal.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range records {
+		if records[i].Kind != "vm" {
+			continue
+		}
+		if records[i].State != aj.Deleted {
+			t.Fatalf("the rolled-back VM generation is %s (reason %q), want %s", records[i].State, records[i].Reason, aj.Deleted)
+		}
+		assertStepsObserved(t, "VM", records[i])
+	}
+	assertCreateVMDiskReturned(t, journal)
 	return deps, client, journal, locks, args
 }
 
@@ -177,11 +222,23 @@ func assertCreateVMDiskRecordsSettled(t *testing.T, journal *aj.Journal) {
 	if vm.State == aj.ReconciliationRequired {
 		t.Fatalf("the VM allocation was marked for reconciliation: %s", vm.Reason)
 	}
-	for i := range vm.Steps {
-		if vm.Steps[i].State != aj.Observed {
-			t.Fatalf("VM step %s (%s) left %s", vm.Steps[i].ID, vm.Steps[i].Kind, vm.Steps[i].State)
+	assertStepsObserved(t, "VM", vm)
+	assertCreateVMDiskReturned(t, journal)
+}
+
+func assertStepsObserved(t *testing.T, name string, record aj.Record) {
+	t.Helper()
+	for i := range record.Steps {
+		if record.Steps[i].State != aj.Observed {
+			t.Fatalf("%s step %s (%s) left %s", name, record.Steps[i].ID, record.Steps[i].Kind, record.Steps[i].State)
 		}
 	}
+}
+
+// assertCreateVMDiskReturned checks that the one disk record is returned with
+// every step observed.
+func assertCreateVMDiskReturned(t *testing.T, journal *aj.Journal) {
+	t.Helper()
 	records, err := journal.List()
 	if err != nil {
 		t.Fatal(err)
@@ -207,9 +264,9 @@ func assertCreateVMDiskRecordsSettled(t *testing.T, journal *aj.Journal) {
 }
 
 // retryCreateVMAfterDiskLockTimeout is the Director's retry of create_vm under
-// the same agent ID once the parker lock is free. It must resume the VM the
-// first attempt created rather than create another, attach the disk, and end
-// with both allocations settled.
+// the same agent ID once the parker lock is free. The first attempt's VM is
+// gone, so the retry builds exactly one fresh VM in a new generation, attaches
+// the disk, and ends with both allocations settled.
 func retryCreateVMAfterDiskLockTimeout(t *testing.T, deps Deps, client *createVMDiskClient, journal *aj.Journal, locks *lockContention, args []json.RawMessage) {
 	t.Helper()
 	creates := client.creates
@@ -226,8 +283,8 @@ func retryCreateVMAfterDiskLockTimeout(t *testing.T, deps Deps, client *createVM
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.creates != creates {
-		t.Fatalf("the retry created another VM instead of resuming: creates %d then %d", creates, client.creates)
+	if client.creates != creates+1 {
+		t.Fatalf("the retry did not build exactly one fresh VM: creates %d then %d", creates, client.creates)
 	}
 	attached := false
 	for key := range client.state.configs[vmid] {
@@ -241,10 +298,10 @@ func retryCreateVMAfterDiskLockTimeout(t *testing.T, deps Deps, client *createVM
 	assertCreateVMDiskRecordsSettled(t, journal)
 }
 
-// TestCreateVMDiskLockTimeoutResumesOnRetry covers a parked disk with no
+// TestCreateVMDiskLockTimeoutRebuildsOnRetry covers a parked disk with no
 // drive-option overrides, whose attach writes nothing to the receiving VM
 // before it takes the parker lock.
-func TestCreateVMDiskLockTimeoutResumesOnRetry(t *testing.T) {
+func TestCreateVMDiskLockTimeoutRebuildsOnRetry(t *testing.T) {
 	deps, client, journal, locks, args := createVMDiskLockTimeout(t, false)
 	retryCreateVMAfterDiskLockTimeout(t, deps, client, journal, locks, args)
 }
@@ -252,11 +309,13 @@ func TestCreateVMDiskLockTimeoutResumesOnRetry(t *testing.T) {
 // TestCreateVMDiskLockTimeoutAfterOverlayNote is the default shape. Every
 // managed disk carries drive-option overrides, so the attach writes them onto
 // the receiving VM before it waits for the parker lock. That note does not
-// move or change the disk, so the timeout after it is still clean.
+// move or change the disk, so the timeout after it is still clean. The
+// rollback destroys the receiving VM, so the note is read from the
+// configuration the VM had when it was destroyed.
 func TestCreateVMDiskLockTimeoutAfterOverlayNote(t *testing.T) {
 	_, client, _, _, _ := createVMDiskLockTimeout(t, true)
 	noted := false
-	for _, cfg := range client.state.configs {
+	for _, cfg := range client.destroyedConfigs {
 		_, raw := pve.ParseSentinel(pve.DescriptionFromConfig(cfg))
 		if tags, _ := cfg["tags"].(string); len(raw[pve.DiskOptOverlaysSentinelKey]) > 0 && !strings.Contains(tags, "bosh-parker") {
 			noted = true
@@ -267,9 +326,9 @@ func TestCreateVMDiskLockTimeoutAfterOverlayNote(t *testing.T) {
 	}
 }
 
-// TestCreateVMDiskLockTimeoutAfterOverlayNoteResumesOnRetry is the Director's
+// TestCreateVMDiskLockTimeoutAfterOverlayNoteRebuildsOnRetry is the Director's
 // in-task retry of that default shape once the parker lock frees.
-func TestCreateVMDiskLockTimeoutAfterOverlayNoteResumesOnRetry(t *testing.T) {
+func TestCreateVMDiskLockTimeoutAfterOverlayNoteRebuildsOnRetry(t *testing.T) {
 	deps, client, journal, locks, args := createVMDiskLockTimeout(t, true)
 	retryCreateVMAfterDiskLockTimeout(t, deps, client, journal, locks, args)
 }

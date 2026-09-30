@@ -315,7 +315,22 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	if err != nil {
 		return true, err
 	}
-	record = handle.Record()
+	if err := closeDisposedManagedVM(handle, proof); err != nil {
+		return true, err
+	}
+	// Managed ISO disposition is part of the recorded resource audit above.
+	// The current Agent may point at a different node or storage than the
+	// frozen allocation and cannot authorize another deletion here.
+	return true, nil
+}
+
+// closeDisposedManagedVM closes a generation whose VM a disposal has just
+// removed. It retains the disposal proof and marks the generation deleted, or
+// deleted with retained artifacts when the proof could not show every artifact
+// absent. A closed generation is never resumed, so the next create_vm for the
+// same agent starts a new one.
+func closeDisposedManagedVM(handle *aj.Handle, proof aj.Verification) error {
+	record := handle.Record()
 	record.Verifications = append(record.Verifications, proof)
 	record.Reason = ""
 	if proof.AbsenceVerified {
@@ -323,13 +338,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	} else {
 		record.State = aj.VMDeletedRetained
 	}
-	if err := handle.Save(record); err != nil {
-		return true, err
-	}
-	// Managed ISO disposition is part of the recorded resource audit above.
-	// The current Agent may point at a different node or storage than the
-	// frozen allocation and cannot authorize another deletion here.
-	return true, nil
+	return handle.Save(record)
 }
 
 // Verify the physical backing immediately before deletion and reject any live
