@@ -1198,7 +1198,14 @@ If an audit reports incomplete visibility, check the propagated `VM.Audit` and `
 
 ### Choose the command for the record
 
-We choose the command by what the record still owns, and `storage-journal audit --summary` shows us that. Its record line gives the state and the CID, and each evidence line names a volume, VM, or parker that still carries the allocation.
+We choose the command by what the record still owns, and `storage-journal audit --summary` shows us that. It prints a `record:` line for each record that needs an operator, and under it one `evidence:` line for each volume, VM, or parker that still carries the allocation.
+
+```text
+record: id=65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3 kind=disk state=reconciliation_required charging=true cid=pvz-H4sIAAAAAAAC_zTMXW6DMBAE4LvMs7cF8xd8m_WutyAFnNo0fYi4e0WrPs030mheeCJgt0rrxh-pBt-3s39_bvQLirkuZKqTyjAP3ciR-5H4fs9C48A-dZ6pSTJRr3qjaNLRLfLUmFcT694-JX97OGwIL-THUa_UtQoXRUDe4bDmYymJr97CodY_nQ68y5ILwlG-koMh4P9vvTbxoRQTjyzz1HPTWvKM8_wZAIdmclDVAAAA reason="outcome requires reconciliation at lifecycle attach_disk Pool.CreatePool"
+evidence: allocation=65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3 kind=disk volume=nfs-images:24192/vm-24192-bosh-fdd7dc59536aba46-alloc-65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3.qcow2 node=lab-pmx-0 holder_vmid=90372
+```
+
+The record line gives the `state` and the full `cid`, which is `none` when the allocation never returned one. The evidence lines tell us whether the resources are still where the record says. A record in `ready_to_return`, `adopted`, `cleaned`, or `deleted` that is not charging needs nothing from us, so the summary leaves it out.
 
 | The record | What PVE still holds for it | What we run |
 |---|---|---|

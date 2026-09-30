@@ -566,6 +566,9 @@ type storageJournalAuditReport struct {
 	IndexFinding      string                          `json:"generation_index_finding,omitempty"`
 	ClusterContinuity bool                            `json:"cluster_continuity"`
 	Audit             handlers.StorageAllocationAudit `json:"audit"`
+	// Attention lists the records the text summary prints in full. The JSON
+	// output already carries every record, so it leaves this out.
+	Attention []storageJournalAttention `json:"-"`
 }
 
 // writeStorageJournalAudit prints the audit as JSON, or as a text summary
@@ -594,7 +597,7 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 			Charging:  handlers.StorageAllocationCharging(r.State),
 		})
 	}
-	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport}
+	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport, storageJournalAttentionRecords(report)}
 	if indexErr != nil {
 		output.IndexFinding = "generation index invalid or unavailable; record listing does not establish healthy authority"
 	}
