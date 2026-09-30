@@ -249,7 +249,7 @@ func TestManagedParkWaitsOutAHeldParkerLock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, waiterErr = waiter.execute(t.Context(), waiterHandle)
+		_, waiterErr = waiter.execute(withShortLockPoll(t.Context()), waiterHandle)
 	}()
 	waitFor(t, locks.rejected, "the waiter's sentinel create to be refused")
 	close(gate)
@@ -323,7 +323,7 @@ func TestManagedVMGuardWaitsOutAHeldAntiAffinityLock(t *testing.T) {
 
 	guarded := m.deps
 	guarded.PVE = m.guard.Client()
-	handle, err := acquireAntiAffinityLock(t.Context(), guarded, "web", m.vmid)
+	handle, err := acquireAntiAffinityLock(withShortLockPoll(t.Context()), guarded, "web", m.vmid)
 	if err != nil {
 		t.Fatalf("anti-affinity acquire did not wait out the holder: %v (guard=%v)", err, m.guard.Err())
 	}

@@ -159,13 +159,25 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 // shortest wait that outlasts any single holder, live or crashed, because a
 // claim that outlives its TTL is stolen. A queue of several holders can still
 // outlast it, and that timeout is settled cleanly by cleanLockTimeout.
+//
+// The wait is the lock's TTL unless the context carries a shorter one under
+// managedLockWaitKey, which only tests set. The wait is a context value, and it
+// must never become a context deadline. failConfirmingReads in the tests tells
+// the acquire's confirming reads from the reads on its way out only by whether
+// their context has a deadline, so a request context that gained one would
+// make every confirming read answer, and the tests that drive the unknown lock
+// state would no longer reach it.
 func managedLockWaitContext(ctx context.Context) context.Context {
-	return pve.WithParkerLockWait(ctx, managedLockWait)
+	wait := pve.ParkerProtectionLockTTL
+	if d, ok := ctx.Value(managedLockWaitKey{}).(time.Duration); ok && d > 0 {
+		wait = d
+	}
+	return pve.WithParkerLockWait(ctx, wait)
 }
 
-// managedLockWait is the wait managedLockWaitContext sets. Tests shorten it,
-// and production leaves it at the lock's TTL.
-var managedLockWait = pve.ParkerProtectionLockTTL
+// managedLockWaitKey carries a test's shorter managed lock wait on the request
+// context. Only tests set it, so production always waits the lock's TTL.
+type managedLockWaitKey struct{}
 
 // diskReturnedAfterLockTimeout marks a disk operation that failed only because
 // a cluster lock wait ran out, after which finish returned the disk's

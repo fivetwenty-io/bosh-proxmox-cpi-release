@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -212,6 +211,8 @@ func (c rollbackFlowCluster) ListSdnVnets(context.Context, *cluster.ListSdnVnets
 // persistent disks. The first is free and attaches without a parker. The
 // second sits on the parker, whose lock another request holds.
 type rollbackFlow struct {
+	// ctx carries the short managed lock wait every create_vm in the flow uses.
+	ctx    context.Context
 	parked *parkedFlowDisk
 	free   lifecycleFlowDisk
 	locks  *lockContention
@@ -245,13 +246,13 @@ func newRollbackFlow(t *testing.T) *rollbackFlow {
 	args := []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", rollbackFlowAgent)), json.RawMessage(`":heavy:a:import/stemcell.qcow2"`), json.RawMessage(`{"cpu":1,"ram":1024,"root_disk_size":1024}`), json.RawMessage(`{}`), disks, json.RawMessage(`{}`)}
 	locks.reset()
 	plantHeldParkerLock(locks, parked.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
-	return &rollbackFlow{parked: parked, free: free, locks: locks, vms: vms, args: args}
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+	return &rollbackFlow{ctx: ctx, parked: parked, free: free, locks: locks, vms: vms, args: args}
 }
 
 func (f *rollbackFlow) createVM(t *testing.T) (any, error) {
 	t.Helper()
-	return createVM(t.Context(), f.parked.deps, f.args)
+	return createVM(f.ctx, f.parked.deps, f.args)
 }
 
 // generation returns the agent's active VM generation, the one a create_vm

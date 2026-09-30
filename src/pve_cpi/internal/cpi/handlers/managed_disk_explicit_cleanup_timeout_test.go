@@ -37,7 +37,7 @@ func markRecordUncertain(t *testing.T, disk *parkedFlowDisk, reason string) {
 func contendedCleanup(t *testing.T, ctx context.Context, disk *parkedFlowDisk, locks *lockContention) (time.Duration, error) {
 	t.Helper()
 	plantHeldParkerLock(locks, disk.parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx = shortenManagedLockWait(ctx, testManagedLockWait)
 	decision := StorageAllocationDecision{Action: "cleanup", AllocationID: disk.id, DecisionID: "contended-cleanup"}
 	started := time.Now()
 	_, err := CleanupStorageAllocation(ctx, attestedCleanupDeps(disk.deps), disk.journal, []string{"n1"}, decision)
@@ -68,6 +68,9 @@ func TestExplicitCleanupLockTimeoutLeavesTheRecord(t *testing.T) {
 			}
 			if elapsed >= 10*time.Second {
 				t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+			}
+			if elapsed < testManagedLockWait {
+				t.Fatalf("the timeout came after %s, before the %s wait ran out", elapsed, testManagedLockWait)
 			}
 			after := disk.record(t)
 			if after.State != before.State || after.Reason != before.Reason || after.CID != before.CID {

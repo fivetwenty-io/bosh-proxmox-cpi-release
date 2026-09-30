@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
@@ -73,7 +72,7 @@ func TestCreateVMDiskNonCleanTimeoutVMCleanupPath(t *testing.T) {
 	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, true)
 	locks.reset()
 	plantHeldParkerLock(locks, parker)
-	shortenManagedLockWait(t, 1500*time.Millisecond)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
 	// The wrapper drops the returned-disk marker, so the VM allocation sees
 	// the uncertain outcome a pre-wait disk mutation would give it.
 	failPersistentHandoff(t, func(slot string, err error) (string, error) {
@@ -82,7 +81,7 @@ func TestCreateVMDiskNonCleanTimeoutVMCleanupPath(t *testing.T) {
 		}
 		return slot, nil
 	})
-	if _, err := createVM(t.Context(), deps, createVMArgs(t, cid)); err == nil {
+	if _, err := createVM(ctx, deps, createVMArgs(t, cid)); err == nil {
 		t.Fatal("create_vm succeeded behind a held parker lock")
 	}
 	vm := handoffRecord(t, journal)
@@ -93,18 +92,18 @@ func TestCreateVMDiskNonCleanTimeoutVMCleanupPath(t *testing.T) {
 	locks.reset()
 	cleanup := attestedCleanupDeps(deps)
 
-	_, err := CleanupStorageAllocation(t.Context(), cleanup, journal, []string{"n1"}, StorageAllocationDecision{Action: "cleanup", AllocationID: vm.ID, DecisionID: "plain-handoff"})
+	_, err := CleanupStorageAllocation(ctx, cleanup, journal, []string{"n1"}, StorageAllocationDecision{Action: "cleanup", AllocationID: vm.ID, DecisionID: "plain-handoff"})
 	if reason := StorageAllocationDecisionFailure(err); err == nil || !strings.HasPrefix(reason, "cleanup_pending_mutation_settlement") {
 		t.Fatalf("plain cleanup was not refused at pending mutation settlement: %v (%s)", err, reason)
 	}
-	if _, err := HandleDeleteVM(deps).Handle(t.Context(), []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", strconv.Itoa(vmid)))}, jsonrpc.Context{}); err == nil {
+	if _, err := HandleDeleteVM(deps).Handle(ctx, []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", strconv.Itoa(vmid)))}, jsonrpc.Context{}); err == nil {
 		t.Fatal("delete_vm accepted the VM record with an open handoff step")
 	}
 	if after := handoffRecord(t, journal); after.State != aj.ReconciliationRequired {
 		t.Fatalf("a refused path changed the VM record to %s", after.State)
 	}
 
-	cleaned, err := CleanupStorageAllocation(t.Context(), cleanup, journal, []string{"n1"}, cleanupAttestedDecision(vm.ID))
+	cleaned, err := CleanupStorageAllocation(ctx, cleanup, journal, []string{"n1"}, cleanupAttestedDecision(vm.ID))
 	if err != nil {
 		t.Fatalf("attested cleanup refused the handoff record: %v (%s)", err, StorageAllocationDecisionFailure(err))
 	}
