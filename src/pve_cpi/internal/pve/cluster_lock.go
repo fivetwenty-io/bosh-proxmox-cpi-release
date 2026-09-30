@@ -35,7 +35,6 @@ package pve
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -741,9 +740,8 @@ func processLockIdentity() string {
 			host = ""
 		}
 		nonce := make([]byte, 4)
-		if _, err := rand.Read(nonce); err != nil {
-			binary.BigEndian.PutUint32(nonce, uint32(time.Now().UnixNano()))
-		}
+		// rand.Read never returns an error on our Go version, so there is no fallback.
+		_, _ = rand.Read(nonce)
 		lockOwnerIdentity = fmt.Sprintf("%s/%d-%s", lockOwnerHost(host), os.Getpid(), hex.EncodeToString(nonce))
 	})
 	return lockOwnerIdentity
