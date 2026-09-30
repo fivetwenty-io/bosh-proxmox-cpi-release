@@ -144,8 +144,8 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 // managedLockWaitContext lets a journal-managed operation wait out a whole
 // parker window that another request holds. The default wait is 15 seconds,
 // while a holder's window may run for most of the lock's 180-second TTL. The
-// window budget is the TTL less about 85 seconds reserved for the sweep, the
-// protection restore, and the release. A waiter that gives up early fails its
+// window ends 90 seconds before the claim's recorded expiry, which leaves time
+// for the sweep, the protection restore, and the release. A waiter that gives up early fails its
 // Director task even though nothing went wrong. Waiting a full TTL is the
 // shortest wait that outlasts any single holder, live or crashed, because a
 // claim that outlives its TTL is stolen. A queue of several holders can still

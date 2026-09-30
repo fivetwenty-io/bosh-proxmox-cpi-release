@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -30,7 +31,13 @@ type lockGuardPools struct {
 	createGone, createDisplaced bool
 	// plain hides the raw read from the guard.
 	plain bool
-	calls []string
+	// normalize, when set, is what PVE stores for a created comment, for a
+	// PVE that does not keep the comment byte for byte.
+	normalize func(string) string
+	// readErrs scripts the plain reads in order. A nil entry reads the state
+	// as usual, and the reads after the script runs out do the same.
+	readErrs []error
+	calls    []string
 }
 
 // poolVerdictError is PVE's 500 answer carrying message, as the SDK wraps it.
@@ -61,6 +68,9 @@ func (p *lockGuardPools) CreatePool(_ context.Context, id, comment string) error
 		return p.createErr
 	}
 	p.comment, p.found = comment, true
+	if p.normalize != nil {
+		p.comment = p.normalize(comment)
+	}
 	switch {
 	case p.createGone:
 		p.found = false
@@ -84,6 +94,13 @@ func (p *lockGuardPools) DeletePool(_ context.Context, id string) error {
 
 func (p *lockGuardPools) GetPoolComment(_ context.Context, id string) (string, bool, error) {
 	p.calls = append(p.calls, "read:"+id)
+	if len(p.readErrs) > 0 {
+		err := p.readErrs[0]
+		p.readErrs = p.readErrs[1:]
+		if err != nil {
+			return "", false, err
+		}
+	}
 	return p.comment, p.found, p.readErr
 }
 
@@ -426,5 +443,166 @@ func TestGuardedAcquireNeverSharesAWindowWithAStealer(t *testing.T) {
 	defer locks.mu.Unlock()
 	if locks.pools[sentinel] != s3Claim {
 		t.Fatalf("the stealer's claim was disturbed: %q", locks.pools[sentinel])
+	}
+}
+
+// TestGuardedStealDeleteRefusesAChangedClaim covers the guard's last check
+// before a steal's delete. The lock code passes the claim it judged expired,
+// and the guard reads the sentinel once more right before it would call PVE.
+// When the sentinel now holds another claim, or none, the delete is refused
+// without reaching PVE, the refusal is settled as a non-mutation, and the lock
+// code gets ErrLockClaimChanged so it abandons the steal.
+func TestGuardedStealDeleteRefusesAChangedClaim(t *testing.T) {
+	for name, pools := range map[string]*lockGuardPools{
+		"a live claim replaced the judged one": {found: true, comment: "owner=S1@h/2-b-1 exp=99999999999"},
+		"the sentinel is already gone":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := &lockGuardEvents{}
+			guard := newLockGuard(t, pools, events)
+			ctx := pve.WithExpectedLockClaim(t.Context(), "owner=crashed@h/1-a-1 exp=1")
+			err := guard.Client().Pools().DeletePool(ctx, lockGuardPool)
+			if !errors.Is(err, pve.ErrLockClaimChanged) {
+				t.Fatalf("want ErrLockClaimChanged, got %v", err)
+			}
+			for _, call := range pools.calls {
+				if strings.HasPrefix(call, "delete:") {
+					t.Fatalf("the refused delete reached PVE: %v", pools.calls)
+				}
+			}
+			if guard.Err() != nil || events.failed != 0 {
+				t.Fatalf("a refused steal delete poisoned the guard: %v", guard.Err())
+			}
+		})
+	}
+	t.Run("the judged claim is still there", func(t *testing.T) {
+		pools := &lockGuardPools{found: true, comment: "owner=crashed@h/1-a-1 exp=1"}
+		guard := newLockGuard(t, pools, &lockGuardEvents{})
+		ctx := pve.WithExpectedLockClaim(t.Context(), "owner=crashed@h/1-a-1 exp=1")
+		if err := guard.Client().Pools().DeletePool(ctx, lockGuardPool); err != nil || guard.Err() != nil {
+			t.Fatalf("the steal of the judged claim was refused: %v", err)
+		}
+		if pools.found {
+			t.Fatal("the judged claim was not deleted")
+		}
+	})
+}
+
+// deletedByPVE reports whether a sentinel delete reached PVE.
+func deletedByPVE(pools *lockGuardPools) bool {
+	for _, call := range pools.calls {
+		if strings.HasPrefix(call, "delete:") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGuardedLockDeleteReadErrorIsNotAChangedClaim covers a failed read in the
+// guard's last check before a delete that expects a claim. A read that did not
+// answer tells us nothing about the claim, so the delete is refused without
+// reaching PVE and comes back as a retriable error, not as
+// ErrLockClaimChanged, which the lock code reads as "ours is gone".
+func TestGuardedLockDeleteReadErrorIsNotAChangedClaim(t *testing.T) {
+	pools := &lockGuardPools{found: true, comment: "owner=me@h/1-a-1 exp=99999999999", readErr: errors.New("connection reset by peer")}
+	events := &lockGuardEvents{}
+	guard := newLockGuard(t, pools, events)
+	ctx := pve.WithExpectedLockClaim(t.Context(), "owner=me@h/1-a-1 exp=99999999999")
+	err := guard.Client().Pools().DeletePool(ctx, lockGuardPool)
+	if err == nil || errors.Is(err, pve.ErrLockClaimChanged) {
+		t.Fatalf("a failed pre-delete read must not read as a changed claim, got %v", err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("a failed pre-delete read must be retriable, got %v", err)
+	}
+	if deletedByPVE(pools) || !pools.found {
+		t.Fatalf("the delete reached PVE although the guard could not read the claim: %v", pools.calls)
+	}
+	if guard.Err() != nil || events.failed != 0 {
+		t.Fatalf("a refused delete poisoned the guard: %v", guard.Err())
+	}
+}
+
+// TestGuardedReleaseRetriesAfterAFailedPreDeleteRead is the Release side of
+// the same case. A transient failure of the guard's read must not latch the
+// handle released while our live claim stands on the sentinel, or the claim
+// strands every other request for its whole TTL. The first Release fails and
+// leaves the sentinel, and a second Release deletes it.
+func TestGuardedReleaseRetriesAfterAFailedPreDeleteRead(t *testing.T) {
+	pools := &lockGuardPools{}
+	guard := newLockGuard(t, pools, &lockGuardEvents{})
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Release reads the claim first, and the guard's own read comes next.
+	pools.readErrs = []error{nil, errors.New("connection reset by peer")}
+	first := handle.Release(t.Context())
+	if first == nil && pools.found {
+		t.Fatalf("Release reported success but left our claim on the sentinel: %v", pools.calls)
+	}
+	if first != nil {
+		if errors.Is(first, pve.ErrLockClaimChanged) || !pools.found {
+			t.Fatalf("first Release: err=%v sentinel standing=%v", first, pools.found)
+		}
+		if err := handle.Release(t.Context()); err != nil {
+			t.Fatalf("the retried Release failed: %v", err)
+		}
+	}
+	if pools.found {
+		t.Fatalf("our sentinel is still standing: %v", pools.calls)
+	}
+	if guard.Err() != nil {
+		t.Fatalf("the release poisoned the guard: %v", guard.Err())
+	}
+}
+
+// TestGuardedStealReturnsAFailedPreDeleteRead covers the steal side. When the
+// guard cannot read the expired claim right before the steal's delete, the
+// acquire returns a retriable error at once rather than giving up the steal
+// quietly and waiting out its whole timeout behind a claim nobody holds.
+func TestGuardedStealReturnsAFailedPreDeleteRead(t *testing.T) {
+	pools := &lockGuardPools{
+		createErr: livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists"),
+		found:     true, comment: "owner=crashed@h/1-a-1 exp=1",
+		// The steal reads the holder, re-reads it, and then the guard reads.
+		readErrs: []error{nil, nil, errors.New("connection reset by peer")},
+	}
+	guard := newLockGuard(t, pools, &lockGuardEvents{})
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, 2*time.Second)
+	if handle != nil {
+		t.Fatal("the steal took the lock without deleting the expired claim")
+	}
+	if err == nil || errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want the retriable read failure from the steal, got %v", err)
+	}
+	if deletedByPVE(pools) {
+		t.Fatalf("the steal deleted without the guard's read: %v", pools.calls)
+	}
+	if guard.Err() != nil {
+		t.Fatalf("the refused steal poisoned the guard: %v", guard.Err())
+	}
+}
+
+// TestGuardedReleaseDeletesWhenPVENormalizesTheClaim covers a PVE that does
+// not return a pool comment byte for byte as it was sent. The handle compares
+// against the claim its confirming read returned, so the guard's check before
+// the delete compares two reads and still matches, and Release removes our
+// sentinel instead of stranding it for the TTL.
+func TestGuardedReleaseDeletesWhenPVENormalizesTheClaim(t *testing.T) {
+	pools := &lockGuardPools{normalize: func(comment string) string { return comment + "\n" }}
+	guard := newLockGuard(t, pools, &lockGuardEvents{})
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90372", pve.ProcessLockOwner("unpark/90372"), time.Minute, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Release(t.Context()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if pools.found {
+		t.Fatalf("Release left our sentinel standing: %q; calls %v", pools.comment, pools.calls)
+	}
+	if guard.Err() != nil {
+		t.Fatalf("the release poisoned the guard: %v", guard.Err())
 	}
 }

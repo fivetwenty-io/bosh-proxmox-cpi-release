@@ -148,7 +148,9 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 	timeout := time.Duration(deps.Config.ClusterLockTimeoutSecValue()) * time.Second
 	ttl := 2 * timeout
 	owner := clusterLockOwner(groupKey, vmid)
-	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+groupKey, owner, ttl, timeout)
+	// Two holders at once would place two instances of a group on one node,
+	// so this lock pays the grace pause on every create to narrow that.
+	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+groupKey, owner, ttl, timeout, pve.WithCreateGrace())
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under

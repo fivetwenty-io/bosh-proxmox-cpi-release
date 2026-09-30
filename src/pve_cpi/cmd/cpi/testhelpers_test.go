@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // buildState guards the cached binary path across the test process.
@@ -128,7 +129,11 @@ func TestMain(m *testing.M) {
 	// The allocation journal's fsyncs dominate the journal-backed CLI tests;
 	// the journal's own tests keep them on.
 	restoreSync := aj.SetFileSyncForTest(false)
+	// The parker and anti-affinity locks pause after every create. The tests
+	// that exercise the pause live in the pve and handlers packages.
+	restoreGrace := pve.SetClusterLockGraceForTest(0)
 	code := m.Run()
+	restoreGrace()
 	restoreSync()
 	buildState.mu.Lock()
 	bin := buildState.bin

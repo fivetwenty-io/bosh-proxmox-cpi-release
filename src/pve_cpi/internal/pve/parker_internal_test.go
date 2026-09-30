@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"time"
@@ -673,26 +674,129 @@ func TestWithParkerProtectionLock_StealsExpiredHolder(t *testing.T) {
 	}
 }
 
-// TestParkerWindowBudget pins the arithmetic that keeps a protection window
-// inside its lock's TTL: the budget is the TTL minus the reserve for the three
-// detached-context tails (sweep, protection restore, sentinel release), floored
-// at one second so a test-sized TTL still runs its body.
-func TestParkerWindowBudget(t *testing.T) {
+// TestParkerWindowDeadline pins the arithmetic that keeps a protection window
+// inside its lock's TTL. The deadline is the claim's recorded expiry less the
+// reserve for the three detached-context tails (sweep, protection restore,
+// sentinel release), floored at one second from now so a test-sized TTL still
+// runs its body.
+func TestParkerWindowDeadline(t *testing.T) {
 	t.Parallel()
 	reserve := parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
-	if got, want := parkerWindowBudget(parkerProtectionLockTTL), parkerProtectionLockTTL-reserve; got != want {
-		t.Errorf("budget(TTL) = %v, want %v", got, want)
+	if parkerWindowReserve != reserve {
+		t.Fatalf("parkerWindowReserve = %v, want %v", parkerWindowReserve, reserve)
 	}
-	if got := parkerWindowBudget(parkerProtectionLockTTL); got <= 0 {
-		t.Errorf("production TTL must leave a positive budget; got %v", got)
+	now := time.Unix(10_000, 0)
+	h := &ClusterLockHandle{expiry: now.Add(parkerProtectionLockTTL)}
+	if got, want := parkerWindowDeadline(h, now), now.Add(parkerProtectionLockTTL-reserve); !got.Equal(want) {
+		t.Errorf("deadline = %v, want %v", got, want)
 	}
-	// A TTL at or below the reserve floors at one second rather than going
-	// zero or negative, which would expire the window before its first call.
-	if got := parkerWindowBudget(reserve); got != time.Second {
-		t.Errorf("budget(reserve) = %v, want 1s floor", got)
+	if !parkerWindowDeadline(h, now).After(now) {
+		t.Error("the production TTL must leave the body some time")
 	}
-	if got := parkerWindowBudget(time.Millisecond); got != time.Second {
-		t.Errorf("budget(1ms) = %v, want 1s floor", got)
+	// A claim whose expiry is at or inside the reserve floors at one second
+	// rather than a deadline in the past, which would stop the window before
+	// its first call.
+	for _, left := range []time.Duration{reserve, time.Millisecond, -time.Minute} {
+		h := &ClusterLockHandle{expiry: now.Add(left)}
+		if got, want := parkerWindowDeadline(h, now), now.Add(time.Second); !got.Equal(want) {
+			t.Errorf("deadline with %v left = %v, want the one-second floor %v", left, got, want)
+		}
+	}
+}
+
+// slowConfirmPools answers the first read after a create only after delay, the
+// way a guard admission or a loaded cluster can hold up an acquire.
+type slowConfirmPools struct {
+	*fakeLockPools
+	delay   time.Duration
+	created bool
+	slowed  bool
+}
+
+func (p *slowConfirmPools) CreatePool(ctx context.Context, id, comment string) error {
+	err := p.fakeLockPools.CreatePool(ctx, id, comment)
+	p.created = err == nil
+	return err
+}
+
+func (p *slowConfirmPools) GetPoolComment(ctx context.Context, id string) (string, bool, error) {
+	if p.created && !p.slowed {
+		p.slowed = true
+		time.Sleep(p.delay)
+	}
+	return p.fakeLockPools.GetPoolComment(ctx, id)
+}
+
+// TestWithParkerProtectionLock_DeadlineFollowsTheClaim covers where the window
+// deadline is measured from. The claim's expiry is fixed before the create,
+// and the confirming reads and the grace run before the acquire returns. So the
+// deadline is the recorded expiry less the reserve, however long the acquire
+// took, and not the moment the acquire returned plus a budget.
+func TestWithParkerProtectionLock_DeadlineFollowsTheClaim(t *testing.T) {
+	defer SetClusterLockGraceForTest(10 * time.Millisecond)()
+	pools := &slowConfirmPools{fakeLockPools: newFakeLockPools(), delay: 100 * time.Millisecond}
+	sentinel := ClusterLockPoolName("vm-90000")
+	var deadline time.Time
+	var recorded string
+	err := withParkerProtectionLock(context.Background(), &parkerLockClient{pools: pools}, nil, 90000, "unpark", func(ctx context.Context) error {
+		deadline, _ = ctx.Deadline()
+		recorded = pools.pools[sentinel]
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry, ok := decodeLockExpiry(recorded)
+	if !ok {
+		t.Fatalf("the sentinel held no claim inside the window: %q", recorded)
+	}
+	want := expiry.Add(-(parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve))
+	if !deadline.Equal(want) {
+		t.Fatalf("window deadline = %v, want the recorded expiry %v less the reserve, %v (off by %v)",
+			deadline, expiry, want, deadline.Sub(want))
+	}
+}
+
+// TestParkerRestoreReserveCoversTheRetryCurve pins the protection restore's
+// reserve against the retry curve it runs. setParkerProtection retries up to
+// parkerWindowMaxAttempts times, and every sleep between attempts is counted at
+// the top of its jitter window, with one round trip for each write. A restore
+// that needs its last attempt must still fit before the deadline, or it is
+// cut off and reported unknown although one more second would have restored
+// the flag.
+func TestParkerRestoreReserveCoversTheRetryCurve(t *testing.T) {
+	t.Parallel()
+	worst := RetryOnTransientOrLockSleepBudget(parkerWindowMaxAttempts) + time.Duration(parkerWindowMaxAttempts)*clusterLockRoundTrip
+	if worst > parkerProtectionRestoreReserve {
+		t.Fatalf("the restore can take %v at worst, over its %v reserve", worst, parkerProtectionRestoreReserve)
+	}
+}
+
+// TestWithParkerProtectionLock_TakesTheGrace covers the parker lock's grace.
+// After its create it reads its claim back, waits out the grace, and reads it
+// again before the window body runs, so a stealer whose stale delete lands in
+// that pause cannot share the window with us.
+func TestWithParkerProtectionLock_TakesTheGrace(t *testing.T) {
+	defer SetClusterLockGraceForTest(20 * time.Millisecond)()
+	pools := newFakeLockPools()
+	var before []string
+	started := time.Now()
+	var elapsed time.Duration
+	err := withParkerProtectionLock(context.Background(), &parkerLockClient{pools: pools}, nil, 90000, "unpark", func(context.Context) error {
+		elapsed = time.Since(started)
+		before = append(before, pools.calls...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := ClusterLockPoolName("vm-90000")
+	want := []string{"create:" + sentinel, "get:" + sentinel, "get:" + sentinel}
+	if strings.Join(before, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls before the window = %v, want %v", before, want)
+	}
+	if elapsed < 20*time.Millisecond {
+		t.Fatalf("the window opened after %v, before the grace ran out", elapsed)
 	}
 }
 

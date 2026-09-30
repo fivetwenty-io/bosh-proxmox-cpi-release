@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -111,6 +112,29 @@ func TestWithVMIDLock_Success(t *testing.T) {
 	// Lock pool must be gone after release.
 	if _, held := pools.pools[expectedPool]; held {
 		t.Error("sentinel pool must be deleted after successful fn")
+	}
+}
+
+// TestWithVMIDLock_TakesNoGrace pins the VMID lock's exemption from the grace
+// pause that the parker and anti-affinity locks take. With the grace set far
+// longer than the test's context allows, the lock still confirms its claim
+// once and runs fn at once.
+func TestWithVMIDLock_TakesNoGrace(t *testing.T) {
+	defer pve.SetClusterLockGraceForTest(time.Hour)()
+	events := []string{}
+	pools := newVMIDLockPools(&events)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := withVMIDLock(ctx, pools, 12345, "test-owner", log.NewNopLogger(), func() error {
+		events = append(events, "fn")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withVMIDLock: %v", err)
+	}
+	want := []string{"create:bosh-lock-vm-12345", "get:bosh-lock-vm-12345", "fn"}
+	if len(events) < len(want) || strings.Join(events[:len(want)], ",") != strings.Join(want, ",") {
+		t.Fatalf("events before fn = %v, want %v", events, want)
 	}
 }
 
