@@ -1209,7 +1209,7 @@ The record line gives the `state` and the full `cid`, which is `none` when the a
 
 | The record | What PVE still holds for it | What we run |
 |---|---|---|
-| A disk with a CID, or a VM in `ready_to_return` | Its resources, where the record says they are | A rerun of the deploy that failed, or `adopt` with the CID from the audit |
+| A disk with a CID, or a VM in `ready_to_return` | Its resources, where the record says they are | `adopt` with the CID from the audit, and a rerun of the deploy that failed. A rerun keeps using the disk only when the deploy was moving it, not when it was resizing it, as [Records left behind by the old lock bug](#records-left-behind-by-the-old-lock-bug) explains |
 | An allocation that never returned a CID | Resources we intend to remove | `cleanup` |
 | Any allocation | Nothing, and the audit shows no evidence for it | `finalize-cleanup` |
 
@@ -1217,7 +1217,17 @@ The record line gives the `state` and the full `cid`, which is `none` when the a
 
 ### Records left behind by the old lock bug
 
-A CPI from 0.6.0 through 0.8.0 also left records here whenever two requests contended for one parker. The deploy failed with `requires reconciliation at lifecycle attach_disk Pool.CreatePool`, or with the same text for `detach_disk` or `delete_disk`. Every step of such a record is observed except the last one, a planned lock step named `lifecycle_<operation>_Pool_CreatePool`, and no `bosh-lock-` pool exists for it. A fixed CPI settles that step with a fresh read of the parker's lock pool. The Director does not retry these calls by itself, so we rerun the deploy, and the operation then completes. Alternatively, `adopt` with the CID from the audit records the disk as adopted. Anything the earlier attempt had already written, such as drive-option overrides on the receiving VM, is written again in place by the rerun. A `create_disk` that failed the same way reports `requires reconciliation at persistent parker completion` and never returned a CID, so its record takes `cleanup`, which settles the lock step the same way before it judges the evidence.
+A CPI from 0.6.0 through 0.8.0 also left records here whenever two requests contended for one parker. The deploy failed with `requires reconciliation at lifecycle attach_disk Pool.CreatePool`, or with the same text for `detach_disk` or `delete_disk`. Every step of such a record is observed except the last one, a planned lock step named `lifecycle_<operation>_Pool_CreatePool`, and no `bosh-lock-` pool exists for it. A fixed CPI settles that step with a fresh read of the parker's lock pool, whichever call touches the record next, whether that is a rerun operation, `adopt`, or `delete_disk`. The Director never retries these calls by itself, so we rerun the deploy, and what happens then depends on what the deploy was doing when it failed.
+
+- An attach that only moved an existing disk
+
+  The rerun issues the same `attach_disk` for the same disk, and it completes against that disk whether or not we adopted it first. Anything the earlier attempt had already written, such as drive-option overrides on the receiving VM, is written again in place.
+
+- A resize, or any change to the disk's size or cloud properties
+
+  The Director treats this as a disk migration. It creates a new disk, attaches it next to the old one, copies the data across, and orphans the disk it no longer needs. The disk our record describes is the new disk from the failed attempt, and the rerun does not reuse it. The rerun creates another new disk and orphans ours, which stays parked, and `bosh disks --orphaned` lists it. The Director deletes an orphaned disk after five days by default, and `bosh clean-up --all` or `bosh delete-disk` removes it sooner. Each of those calls `delete_disk`, and `delete_disk` settles the lock step itself, so the orphan is removed whether or not we adopted it. Adopting it first still records the disk as healthy and stops it charging capacity while it waits out those five days.
+
+A `create_disk` that failed the same way reports `requires reconciliation at persistent parker completion` and never returned a CID, so its record takes `cleanup`, which settles the lock step the same way before it judges the evidence.
 
 ### A parker lock wait runs out
 
