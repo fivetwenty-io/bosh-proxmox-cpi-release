@@ -38,7 +38,7 @@ Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocation
 make test
 ```
 
-This runs all Go tests with race detection. Every code change should come with tests that cover it.
+This runs all Go tests with race detection and writes the coverage profile to `src/pve_cpi/coverage.out`. Every code change should come with tests that cover it.
 
 ### Running the full check suite
 
@@ -46,7 +46,7 @@ This runs all Go tests with race detection. Every code change should come with t
 make check
 ```
 
-This runs `artifacts-check`, `linear-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `coverage-check`, and `test` in order, stopping at the first failure. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+This runs `artifacts-check`, `linear-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `test`, and `coverage-check` in order, stopping at the first failure. The `test` step runs the suite once with race detection and collects coverage as it goes, and `coverage-check` then reads that profile instead of running the tests a second time. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
 
 ### Installing the git hooks
 
