@@ -33,6 +33,7 @@ func withPoolsSvc(t *testing.T, deps handlers.Deps, ps pve.PoolService) {
 // none of these create_vm tests exercise pool membership or the delete_vm
 // reaper.
 type poolCallRecorder struct {
+	lockClaims
 	createPoolErr   error
 	createPoolCalls []poolCreateCall
 }
@@ -47,13 +48,19 @@ func (p *poolCallRecorder) MoveVMToPool(_ context.Context, _ string, _ int64) er
 
 func (p *poolCallRecorder) CreatePool(_ context.Context, poolID, comment string) error {
 	p.createPoolCalls = append(p.createPoolCalls, poolCreateCall{poolID: poolID, comment: comment})
+	if p.createPoolErr == nil {
+		p.put(poolID, comment)
+	}
 	return p.createPoolErr
 }
 
-func (p *poolCallRecorder) DeletePool(_ context.Context, _ string) error { return nil }
+func (p *poolCallRecorder) DeletePool(_ context.Context, poolID string) error {
+	p.drop(poolID)
+	return nil
+}
 
-func (p *poolCallRecorder) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (p *poolCallRecorder) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return p.get(poolID)
 }
 
 // ---------------------------------------------------------------------------

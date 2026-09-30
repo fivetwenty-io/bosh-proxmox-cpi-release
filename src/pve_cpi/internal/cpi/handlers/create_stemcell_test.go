@@ -35,15 +35,23 @@ import (
 // ============================================================
 
 // noopPoolService is a PoolService whose AddVM is a silent no-op.
-// Used by mocks when pool assignment is not under test.
-type noopPoolService struct{}
+// Used by mocks when pool assignment is not under test. It remembers the
+// comment each create stamped, because a lock reads its claim back before it
+// trusts a create.
+type noopPoolService struct{ lockClaims }
 
 func (n *noopPoolService) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
 func (n *noopPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
-func (n *noopPoolService) CreatePool(_ context.Context, _, _ string) error         { return nil }
-func (n *noopPoolService) DeletePool(_ context.Context, _ string) error            { return nil }
-func (n *noopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (n *noopPoolService) CreatePool(_ context.Context, poolID, comment string) error {
+	n.put(poolID, comment)
+	return nil
+}
+func (n *noopPoolService) DeletePool(_ context.Context, poolID string) error {
+	n.drop(poolID)
+	return nil
+}
+func (n *noopPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return n.get(poolID)
 }
 
 // stemcellMockClient implements pve.Client. All services default to no-ops or

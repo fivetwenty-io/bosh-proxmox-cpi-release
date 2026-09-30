@@ -91,15 +91,16 @@ func TestWithVMIDLock_Success(t *testing.T) {
 	// Lock key must be "vm-12345" → pool "bosh-lock-vm-12345".
 	expectedPool := "bosh-lock-vm-12345"
 
-	// acquire (create) before fn, release (delete) after fn.
-	if len(events) < 3 {
-		t.Fatalf("expected at least 3 events (create, fn, delete); got %v", events)
+	// acquire (create, then the read that confirms the claim) before fn,
+	// release (delete) after fn.
+	if len(events) < 4 {
+		t.Fatalf("expected at least 4 events (create, get, fn, delete); got %v", events)
 	}
-	if events[0] != "create:"+expectedPool {
-		t.Errorf("first event must be lock acquire; got %q (events=%v)", events[0], events)
+	if events[0] != "create:"+expectedPool || events[1] != "get:"+expectedPool {
+		t.Errorf("lock acquire must create and read back its claim first; got %v", events)
 	}
-	if events[1] != "fn" {
-		t.Errorf("second event must be fn; got %q (events=%v)", events[1], events)
+	if events[2] != "fn" {
+		t.Errorf("fn must run once the claim is confirmed; got %q (events=%v)", events[2], events)
 	}
 	// Last event must be the delete (release).
 	last := events[len(events)-1]

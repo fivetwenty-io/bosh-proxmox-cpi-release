@@ -157,12 +157,23 @@ func acquireClusterLockWithClock(
 		comment := encodeLockComment(owner, expiry)
 		createErr := pools.CreatePool(ctx, pool, comment)
 		if createErr == nil {
-			// Won the race: the sentinel pool is now ours.
-			return &ClusterLockHandle{
-				pool: pool, owner: owner, pools: pools, expiry: expiry, now: clk.now,
-			}, nil
-		}
-		if !isPoolAlreadyExists(createErr) {
+			// The create succeeded, but that alone does not make the sentinel
+			// ours. A stealer that read an expired claim can delete the sentinel
+			// we just created and recreate its own before we act, so read it
+			// back and take the handle only when our claim is still there.
+			mine, verifyErr := sentinelHoldsOwner(ctx, pools, pool, owner)
+			if verifyErr != nil {
+				return nil, cpierrors.WrapAs(verifyErr, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("AcquireClusterLock: verify lock %q", pool))
+			}
+			if mine {
+				return &ClusterLockHandle{
+					pool: pool, owner: owner, pools: pools, expiry: expiry, now: clk.now,
+				}, nil
+			}
+			// Displaced: someone else holds the sentinel now. Fall through to
+			// the same steal-or-wait decision a refused create takes.
+		} else if !isPoolAlreadyExists(createErr) {
 			// A non-duplicate failure (auth, transport, pmxcfs error) is mapped to
 			// a retriable cloud error so the director re-drives rather than failing
 			// the deploy on a transient lock-acquire fault.
@@ -180,6 +191,9 @@ func acquireClusterLockWithClock(
 		// Held by a live owner: wait and retry until the timeout.
 		now := clk.now()
 		if !now.Before(deadline) {
+			if createErr == nil {
+				createErr = errors.New("sentinel displaced after create")
+			}
 			return nil, cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: timed out after %s waiting for lock %q", timeout, pool))
 		}
@@ -269,6 +283,17 @@ func tryStealExpired(
 	return &ClusterLockHandle{
 		pool: pool, owner: owner, pools: pools, expiry: clk.now().Add(ttl), now: clk.now,
 	}, nil
+}
+
+// sentinelHoldsOwner reads the sentinel back and reports whether it carries
+// owner's claim. A read that fails is returned, because it cannot tell us who
+// holds the lock.
+func sentinelHoldsOwner(ctx context.Context, pools PoolService, pool, owner string) (bool, error) {
+	comment, found, err := pools.GetPoolComment(ctx, pool)
+	if err != nil {
+		return false, err
+	}
+	return found && strings.Contains(comment, lockCommentOwnerKey+owner+" "), nil
 }
 
 // expired reports whether this handle's claim has lapsed. A handle built without
