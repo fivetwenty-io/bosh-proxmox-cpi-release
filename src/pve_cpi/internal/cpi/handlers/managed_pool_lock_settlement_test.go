@@ -3,10 +3,12 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -290,5 +292,36 @@ func TestLockBugCreateDiskRecordCleansUp(t *testing.T) {
 	}
 	if settled := stepByID(t, result, step); settled.State != aj.Observed {
 		t.Fatalf("cleanup left the lock step %s", settled.State)
+	}
+}
+
+// TestLockBugRecordDeletesAsAnOrphan follows the disk a failed resize leaves
+// behind. The Director's rerun migrates to a fresh disk and orphans the one
+// the old lock bug stranded, and the orphan is later removed through
+// delete_disk. That delete settles the planned lock step itself, so it removes
+// the orphan whether or not an operator adopted it first.
+func TestLockBugRecordDeletesAsAnOrphan(t *testing.T) {
+	for _, adopted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without adoption", true: "after adoption"}[adopted], func(t *testing.T) {
+			disk, _, planned := lockBugRecord(t)
+			if adopted {
+				if _, err := ApplyStorageAllocationDecision(t.Context(), disk.deps, disk.journal, []string{"n1"}, adoptDecision(disk)); err != nil {
+					t.Fatalf("adopt: %v", err)
+				}
+			}
+			if _, err := HandleDeleteDisk(disk.deps).Handle(t.Context(), []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", disk.cid))}, jsonrpc.Context{}); err != nil {
+				t.Fatalf("delete_disk refused the orphan: %v", err)
+			}
+			record := disk.record(t)
+			if record.State != aj.Deleted {
+				t.Fatalf("delete_disk left the orphan's allocation %s (reason %q)", record.State, record.Reason)
+			}
+			if step := stepByID(t, record, planned.ID); step.State != aj.Observed {
+				t.Fatalf("delete_disk left the lock step %s", step.State)
+			}
+			if len(disk.client.state.volumes) != 0 {
+				t.Fatalf("delete_disk left volumes behind: %v", disk.client.state.volumes)
+			}
+		})
 	}
 }
