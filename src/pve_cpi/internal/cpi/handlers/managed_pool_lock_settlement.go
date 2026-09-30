@@ -209,7 +209,13 @@ func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.H
 		}
 	}
 	if err := handle.Save(record); err != nil {
-		return nil, err
+		// The journal's error stays in the chain, and the text names the
+		// steps this write was settling so a refusal says which ones.
+		names := make([]string, 0, len(planned))
+		for _, i := range planned {
+			names = append(names, fmt.Sprintf("step %s (%s)", record.Steps[i].ID, record.Steps[i].Kind))
+		}
+		return nil, fmt.Errorf("settling lock %s: %w", strings.Join(names, ", "), err)
 	}
 	return nil, nil
 }

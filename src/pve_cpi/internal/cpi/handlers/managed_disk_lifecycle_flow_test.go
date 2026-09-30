@@ -117,6 +117,14 @@ func lifecycleFlowFixture(t *testing.T) (Deps, *lifecycleFlowPVE, *aj.Journal, s
 }
 func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (Deps, *lifecycleFlowPVE, *aj.Journal, string, string) {
 	t.Helper()
+	return lifecycleFlowFixtureWith(t, returned, len(anchored) > 0 && anchored[0], nil)
+}
+
+// lifecycleFlowFixtureWith is lifecycleFlowFixtureState with a hook that runs
+// on the disk's creating handle just before it closes, so a test can leave the
+// record the way a request that stopped there would.
+func lifecycleFlowFixtureWith(t *testing.T, returned, anchored bool, beforeClose func(*aj.Handle)) (Deps, *lifecycleFlowPVE, *aj.Journal, string, string) {
+	t.Helper()
 	state := &managedDiskTestState{configs: map[int]map[string]any{}, volumes: map[string]*nodes.GetStorageContentResponse{}, pools: map[string]string{}}
 	client := &lifecycleFlowPVE{managedDiskTestPVE: managedDiskTestPVE{state: state}}
 	identity, err := pve.ObserveStorageClusterIdentity(context.Background(), client.Nodes(), []string{"n1"})
@@ -136,7 +144,7 @@ func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (D
 			t.Error(err)
 		}
 	})
-	disk := journalLifecycleFlowDisk(t, journal, state, returned, len(anchored) > 0 && anchored[0])
+	disk := journalLifecycleFlowDisk(t, journal, state, returned, anchored, beforeClose)
 	state.configs[777] = map[string]any{"name": "workload", "digest": "1", "scsi1": disk.volume + ",serial=" + disk.token + ",size=5G"}
 	// All original storage sets and role bindings have been removed.
 	deps := Deps{PVE: client, Config: &config.CPIConfig{Node: "n1", DiskStorage: disk.storage, StoragePlacementNamespace: lifecycleFlowNamespace, StorageAllocationJournalDir: dir}}
@@ -155,7 +163,7 @@ type lifecycleFlowDisk struct {
 // journalLifecycleFlowDisk plans a 5 GiB persistent disk the way create_disk
 // does, journals its observed creation, and places its volume on storage. The
 // volume starts without a holder, and the caller decides what holds it.
-func journalLifecycleFlowDisk(t *testing.T, journal *aj.Journal, state *managedDiskTestState, returned, anchored bool) lifecycleFlowDisk {
+func journalLifecycleFlowDisk(t *testing.T, journal *aj.Journal, state *managedDiskTestState, returned, anchored bool, beforeClose ...func(*aj.Handle)) lifecycleFlowDisk {
 	t.Helper()
 	id, err := aj.NewAllocationID()
 	if err != nil {
@@ -218,6 +226,11 @@ func journalLifecycleFlowDisk(t *testing.T, journal *aj.Journal, state *managedD
 	}
 	if err := handle.Save(record); err != nil {
 		t.Fatal(err)
+	}
+	for _, hook := range beforeClose {
+		if hook != nil {
+			hook(handle)
+		}
 	}
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)

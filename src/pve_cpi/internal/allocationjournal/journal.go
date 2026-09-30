@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -612,7 +614,7 @@ func (h *Handle) saveLocked(next Record, attemptTransition bool) error {
 		v := next.Verifications[len(next.Verifications)-1]
 		reconciled = validateVerification(v) && (v.OwnershipVerified || v.AbsenceVerified || next.State == VMDeletedRetained && v.VMAbsenceVerified && v.ArtifactDispositionVerified)
 	}
-	if h.requiresReconciliation && next.State != ReconciliationRequired && !reconciled {
+	if h.requiresReconciliation && next.State != ReconciliationRequired && !reconciled && !settlesPlannedSteps(h.record, next) {
 		return ErrReconciliationRequired
 	}
 	old := h.record
@@ -640,6 +642,54 @@ func (h *Handle) saveLocked(next Record, attemptTransition bool) error {
 		h.requiresReconciliation = false
 	}
 	return nil
+}
+
+// settlesPlannedSteps reports whether next differs from old only by settling
+// planned steps of the active attempt.
+//
+// A handle that Acquire opened must not save until the record requires
+// reconciliation or a verification proves what the allocation holds. That gate
+// stops a resumed writer from carrying on with an operation as if it had never
+// stopped. A settlement write cannot do that. It moves no state, adds no
+// evidence, and adds no step, and the caller proves each step's outcome by an
+// exact readback before it writes. So the gate lets such a write through, and
+// every later check in saveLocked still runs on it.
+//
+// Each step that changed must belong to the active attempt, must go from
+// planned to observed with no UPID, and may otherwise only extend its volume
+// list. Every field of the record other than its steps and its update time
+// must be unchanged, and so must the number of steps.
+func settlesPlannedSteps(old, next Record) bool {
+	was, now := cloneRecord(old), cloneRecord(next)
+	if len(was.Steps) != len(now.Steps) {
+		return false
+	}
+	rest, nextRest := was, now
+	rest.Steps, nextRest.Steps = nil, nil
+	rest.UpdatedAt, nextRest.UpdatedAt = time.Time{}, time.Time{}
+	if !reflect.DeepEqual(rest, nextRest) {
+		return false
+	}
+	settled := false
+	for i := range was.Steps {
+		before, after := was.Steps[i], now.Steps[i]
+		if reflect.DeepEqual(before, after) {
+			continue
+		}
+		if before.Attempt != old.ActiveAttempt() || before.State != Planned || after.State != Observed || after.UPID != "" {
+			return false
+		}
+		if len(after.VolIDs) < len(before.VolIDs) || !slices.Equal(after.VolIDs[:len(before.VolIDs)], before.VolIDs) {
+			return false
+		}
+		same := after
+		same.State, same.VolIDs = before.State, before.VolIDs
+		if !reflect.DeepEqual(same, before) {
+			return false
+		}
+		settled = true
+	}
+	return settled
 }
 
 // Close releases allocation ownership.
