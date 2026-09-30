@@ -58,6 +58,13 @@ func attachExistingDiskToManagedVM(ctx context.Context, deps Deps, handle *aj.Ha
 	local.PVE = wrapManagedDiskClient(guard, lifecycle)
 	ctx = managedLockWaitContext(ctx)
 	defer func() {
+		if operationErr != nil && lifecycle.cleanLockTimeout(operationErr) {
+			// The parker lock wait ran out before this attach changed the
+			// disk. The disk is where it was, so the VM allocation's own
+			// rule in attachPersistent decides what happens next.
+			operationErr = &diskReturnedAfterLockTimeout{err: operationErr}
+			return
+		}
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {
 			deps.recordStorageReconciliation(ctx, "required")
