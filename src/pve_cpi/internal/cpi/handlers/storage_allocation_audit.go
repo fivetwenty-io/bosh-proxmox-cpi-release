@@ -116,17 +116,24 @@ func (c storageAuditClaim) attributes(record aj.Record) (holds, decided bool) {
 	return false, false
 }
 
-// storageAuditSharedReferences raises a conflict for every volume that two or
-// more VMs reference at once, because each of them can write the one disk.
-// The check reads only VM configurations and never a record, so it catches a
-// hand-edited slot or a copied serial that the attribution rules would rule
-// out as a holder of any record. A reused name never trips it, because PVE
-// reuses a name only after the volume that carried it has gone. On shared
-// storage any two referencing VMs share the volume; on node-local storage, or
-// storage the definitions do not name, only VMs on the same node do, because
-// the same volid on two nodes names two volumes. CD-ROM entries are skipped.
-func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[string]pve.StorageInfo) {
+// storageAuditSharedReferences raises a conflict for every volume of ours
+// that two or more VMs reference at once, because each of them can write the
+// one disk. The check reads VM configurations rather than the attribution
+// rules, so it catches a hand-edited slot or a copied serial that those rules
+// would rule out as a holder of any record, and it counts every holder of such
+// a volume, ours or not. A volume that only other guests share, such as a
+// shared-disk cluster's data disk or a passed-through device, is not ours to
+// judge and raises nothing. A reused name never trips it, because PVE reuses a
+// name only after the volume that carried it has gone. On shared storage any
+// two referencing VMs share the volume; on node-local storage, or storage the
+// definitions do not name, only VMs on the same node do, because the same
+// volid on two nodes names two volumes. CD-ROM entries are skipped.
+func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, namespace string) {
+	tokens := storageAuditLiveDiskTokens(result.Records)
 	for volume, claims := range result.claims {
+		if !storageAuditVolumeOurs(volume, claims, knownVolumes, tokens, namespace) {
+			continue
+		}
 		shared := false
 		if storage, _, err := pve.ParseDiskCID(volume); err == nil {
 			shared = stores[storage].IsShared()
@@ -157,6 +164,42 @@ func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[str
 			result.addConflict(fmt.Sprintf("volume %s is referenced by more than one VM, so each can write the same disk: %s", volume, strings.Join(subjects, ", ")), fmt.Sprintf("volume %s is attached to %d VMs: %s", volume, len(holders), strings.Join(subjects, ", ")))
 		}
 	}
+}
+
+// storageAuditLiveDiskTokens collects the disk tokens of disk records that
+// are neither deleted nor cleaned.
+func storageAuditLiveDiskTokens(records []aj.Record) map[string]bool {
+	tokens := map[string]bool{}
+	for recordIndex := range records {
+		record := records[recordIndex]
+		if record.Kind == allocationKindDisk && record.DiskToken != "" && record.State != aj.Deleted && record.State != aj.Cleaned {
+			tokens[record.DiskToken] = true
+		}
+	}
+	return tokens
+}
+
+// storageAuditVolumeOurs reports whether a volume belongs to the audited
+// namespace. It does when its name carries the namespace locator, when a
+// record that is neither deleted nor cleaned names it, or when a holder ties
+// it to one of our allocations through disk provenance or through a live disk
+// token as its drive serial.
+func storageAuditVolumeOurs(volume string, claims []storageAuditClaim, knownVolumes map[string][]aj.Record, tokens map[string]bool, namespace string) bool {
+	if len(knownVolumes[volume]) > 0 {
+		return true
+	}
+	if namespace != "" {
+		ours := pve.AllocationNamespaceLocator(namespace)
+		if locator, _, ok := pve.ParseAllocationVolumeID(volume); ok && locator == ours {
+			return true
+		}
+		if locator, _, ok := pve.ParseManagedEphemeralVolumeID(volume); ok && locator == ours {
+			return true
+		}
+	}
+	return slices.ContainsFunc(claims, func(claim storageAuditClaim) bool {
+		return len(claim.allocations) > 0 || tokens[claim.serial]
+	})
 }
 
 // storageAuditNameDisowned reports whether the VMs holding a listed volume
@@ -388,7 +431,7 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		return result, err
 	}
 	stores := auditStorageDefinitions(ctx, deps, records, &result)
-	storageAuditSharedReferences(&result, stores)
+	storageAuditSharedReferences(&result, stores, knownVolumes, deps.Config.StoragePlacementNamespace)
 	targets := storageAuditTargets(ctx, deps, nodes, historical, stores, &result)
 	if err := collectStorageAuditContent(ctx, deps, targets, stores, knownVolumes, &result); err != nil {
 		return result, err
