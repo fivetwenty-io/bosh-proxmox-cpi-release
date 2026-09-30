@@ -231,6 +231,7 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string) {
 // the loser must wait for the holder instead of poisoning its allocation, and
 // both allocations must finish without asking for reconciliation.
 func TestManagedParkWaitsOutAHeldParkerLock(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	gate := make(chan struct{})
 	holder, holderHandle := contendedParkRequest(t, locks, gate)

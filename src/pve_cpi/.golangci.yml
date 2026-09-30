@@ -75,7 +75,7 @@ linters:
         # The test seams put a shorter poll, wait, backoff, floor, or restore
         # deadline on a request context. Production code must keep the real
         # values, so only tests may call them; _test.go files are exempt below.
-        - pattern: '(^|\.)(WithClusterLockPollForTest|WithTestBackoff|WithParkerProtectionRestoreTimeoutForTest|WithAgentChecksumTimingsForTest|WithHealthPollMinIntervalForTest|WithResizeConvergencePollForTest)$'
+        - pattern: '(^|\.)(WithClusterLockPollForTest|WithTestBackoff|WithParkerProtectionRestoreTimeoutForTest|WithAgentChecksumTimingsForTest|WithHealthPollMinIntervalForTest|WithResizeConvergencePollForTest|WithNetworkResolvePollForTest)$'
           msg: "test seams are for tests only; production code keeps the real poll, wait, backoff, floor, and restore deadline"
 
     gocyclo:

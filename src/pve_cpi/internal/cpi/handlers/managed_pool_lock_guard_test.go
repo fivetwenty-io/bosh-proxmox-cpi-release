@@ -455,6 +455,7 @@ func (c storeClient) Pools() pve.PoolService { return c.pools }
 // settles W's displaced create as observed, so the lock code must read its
 // claim back, find S3's, and wait instead of entering S3's window too.
 func TestGuardedAcquireNeverSharesAWindowWithAStealer(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	sentinel := pve.ClusterLockPoolName("vm-90000")
 	s3Claim := fmt.Sprintf("owner=steal/90000@3-1 exp=%d", time.Now().Add(time.Hour).Unix())
@@ -479,7 +480,7 @@ func TestGuardedAcquireNeverSharesAWindowWithAStealer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90000", "unpark/90000@9-1", time.Minute, 1500*time.Millisecond)
+	handle, err := pve.AcquireClusterLock(withShortLockPoll(t.Context()), guard.Client().Pools(), "vm-90000", "unpark/90000@9-1", time.Minute, testManagedLockWait)
 	if handle != nil {
 		t.Fatal("the waiter took a lock handle while the stealer holds the sentinel, so both are inside one window")
 	}

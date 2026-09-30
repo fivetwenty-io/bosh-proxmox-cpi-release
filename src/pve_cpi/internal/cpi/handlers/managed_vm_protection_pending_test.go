@@ -172,8 +172,10 @@ func (f *protectionPendingFlow) cutOff(t *testing.T) (aj.Record, int) {
 // same generation on the same VM with no second create and no destroy, the
 // disk's readmission settles the restore step, and both records finish.
 func TestCreateVMResumesALandedDiskOnceProtectionIsBack(t *testing.T) {
+	t.Parallel()
 	for _, fallback := range []bool{false, true} {
 		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			t.Parallel()
 			resumeLandedDisk(t, newProtectionPendingFlow(t, fallback))
 		})
 	}
@@ -216,8 +218,10 @@ func resumeLandedDisk(t *testing.T, flow *protectionPendingFlow) {
 // VM is kept, and the generation stays resumable, which the next retry after
 // protection is back then proves by finishing it.
 func TestCreateVMKeepsTheVMWhileProtectionIsOff(t *testing.T) {
+	t.Parallel()
 	for _, fallback := range []bool{false, true} {
 		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			t.Parallel()
 			keepVMWhileProtectionIsOff(t, newProtectionPendingFlow(t, fallback))
 		})
 	}

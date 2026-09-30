@@ -27,9 +27,35 @@ import (
 // motivates jitter in the cluster-lock acquire loop does not apply here.
 const networkResolvePollInterval = time.Second
 
+// networkResolvePollKey carries a test's poll interval on the request context.
+type networkResolvePollKey struct{}
+
+// WithNetworkResolvePollForTest returns a context whose SDN eventual-consistency
+// polls wait d between attempts instead of networkResolvePollInterval. It rides
+// the context rather than a package variable, so it changes only the polls made
+// under that context, and tests that set it can run in parallel. A non-positive
+// d leaves ctx as it is. Production code never calls it; it mirrors
+// WithClusterLockPollForTest.
+func WithNetworkResolvePollForTest(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, networkResolvePollKey{}, d)
+}
+
+// networkResolvePollFor returns the poll interval ctx carries when a test set
+// one, and networkResolvePollInterval otherwise.
+func networkResolvePollFor(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(networkResolvePollKey{}).(time.Duration); ok && d > 0 {
+		return d
+	}
+	return networkResolvePollInterval
+}
+
 // pollUntilResolved runs check immediately, then up to retries more times,
-// sleeping networkResolvePollInterval between attempts and bounded additionally
-// by timeout (measured against clk.now). It returns true as soon as check
+// sleeping the poll interval ctx carries (networkResolvePollInterval unless a
+// test set one) between attempts, and bounded additionally by timeout
+// (measured against clk.now). It returns true as soon as check
 // reports resolved, false when the retry/timeout budget is exhausted without
 // resolution, or a non-nil error if check or the sleep (ctx cancel) fails.
 func pollUntilResolved(
@@ -51,7 +77,7 @@ func pollUntilResolved(
 		if !clk.now().Before(deadline) {
 			return false, nil
 		}
-		if sleepErr := clk.sleep(ctx, networkResolvePollInterval); sleepErr != nil {
+		if sleepErr := clk.sleep(ctx, networkResolvePollFor(ctx)); sleepErr != nil {
 			return false, sleepErr
 		}
 	}
