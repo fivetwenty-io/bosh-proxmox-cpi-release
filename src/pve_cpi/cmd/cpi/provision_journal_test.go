@@ -67,6 +67,31 @@ func TestProvisionJournalCommandRejectsUsageAndUnsafeDirectory(t *testing.T) {
 		}
 	}
 }
+func TestProvisionJournalCommandNamesItsFailures(t *testing.T) {
+	base := provisionTemp(t)
+	missing := filepath.Join(base, "absent.json")
+	malformed := filepath.Join(base, "malformed.json")
+	if err := os.WriteFile(malformed, []byte(`{"password":"must-not-print",`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--config", missing}, "journal provisioning: cannot open config: open " + missing + ": no such file or directory\n"},
+		{[]string{"--config", malformed}, "journal provisioning: invalid config JSON: JSON syntax error at byte offset 29\n"},
+		{[]string{"--directory", "/"}, "journal directory / could not be provisioned: journal provisioning: require a clean absolute non-root path and valid owner\n"},
+	} {
+		var out, stderr bytes.Buffer
+		if code := runProvisionJournal(tc.args, &out, &stderr); code != 1 || stderr.String() != tc.want {
+			t.Fatalf("%v reported as %d %q, want %q", tc.args, code, stderr.String(), tc.want)
+		}
+		if strings.Contains(stderr.String(), "must-not-print") {
+			t.Fatal("provisioning printed config content")
+		}
+	}
+}
+
 func TestProvisionJournalPreStartLaunchResolution(t *testing.T) {
 	base := provisionTemp(t)
 	job := filepath.Join(base, "jobs", "pve_cpi")

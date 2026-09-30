@@ -47,7 +47,7 @@ func openNamespace(directory, namespace string) (*os.Root, error) {
 	if err := errors.Join(statErr, closeErr); err != nil {
 		return nil, err
 	}
-	if err := privateInfo(info, true); err != nil {
+	if err := privateInfo(path, info, true); err != nil {
 		return nil, err
 	}
 	return openPrivateRoot(path)

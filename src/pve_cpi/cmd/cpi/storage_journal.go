@@ -20,11 +20,13 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
+const storageJournalUsage = "usage: cpi storage-journal <audit-enrollment|initialize|audit|recover-authority|recover-index|resolve-missing-vm|adopt|finalize-cleanup|cleanup> --config PATH"
+
 // This command runs explicitly, outside the JSON-RPC startup path. Directory
 // provisioning never enrolls an authority and ordinary CPI calls never invoke it.
 func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: cpi storage-journal <audit-enrollment|initialize|audit|recover-authority|recover-index|resolve-missing-vm|adopt|finalize-cleanup|cleanup> --config PATH")
+		fmt.Fprintln(stderr, storageJournalUsage)
 		return 2
 	}
 	action := args[0]
@@ -52,7 +54,9 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 			fs.PrintDefaults()
 			return 0
 		}
-		fmt.Fprintln(stderr, "invalid storage-journal flags")
+		// The flag package's text names only what the operator typed.
+		fmt.Fprintln(stderr, "invalid storage-journal flags: "+boundStorageJournalText(err.Error()))
+		fmt.Fprintln(stderr, storageJournalUsage)
 		return 2
 	}
 	request := storageJournalMissingGeneration{AgentID: *agentID, AllocationID: *allocationID, IndexFirstConfirmed: *indexFirst, ExpectedCID: *expectedCID, DecisionID: *decisionID, RemoteTasksSettled: *remoteTasksSettled, RecoveredTaskStep: *recoveredTaskStep, RecoveredTaskUPID: *recoveredTaskUPID, RecoveredTaskEvidencePath: *recoveredTaskEvidence}
@@ -60,21 +64,28 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, "config is required; mutations require authority-id and previous-writer-fenced; missing-generation recovery also requires agent-id, allocation-id and index-first-crash-confirmed; adoption/cleanup decisions require allocation-id and decision-id, and adoption requires expected-cid; initialize and recover-index require remote-tasks-settled")
 		return 2
 	}
+	host := newStorageJournalHost(args)
 	if request.RecoveredTaskEvidencePath != "" {
 		evidence, err := readStorageRecoveredTaskEvidence(request.RecoveredTaskEvidencePath)
 		if err != nil {
-			fmt.Fprintln(stderr, "recovered task evidence could not be read or validated")
+			storageJournalFail(stderr, "recovered task evidence could not be read or validated", err)
 			return 1
 		}
 		request.RecoveredTaskEvidence = evidence
 	}
+	// The pre-check reads only file metadata. A load failure after it prints
+	// nothing from the error, because validation errors echo config values.
+	if problem := storageJournalConfigProblem(*configPath, host); problem != "" {
+		fmt.Fprintln(stderr, problem)
+		return 1
+	}
 	cfg, err := config.LoadFile(*configPath)
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal configuration could not be loaded")
+		fmt.Fprintln(stderr, "configuration invalid; check it with the CPI's startup validation")
 		return 1
 	}
 	if err = cfg.ValidateStoragePlacementAllocation(); err != nil {
-		fmt.Fprintln(stderr, "storage journal operation failed; inspect retained evidence")
+		fmt.Fprintln(stderr, "storage journal configuration incomplete: storage-journal commands require storage_placement_namespace and an absolute storage_allocation_journal_dir")
 		return 1
 	}
 	logger := log.NewNopLogger()
@@ -84,31 +95,32 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 	}
 	client, err := factory(cfg, logger, nil)
 	if err != nil || client == nil {
-		fmt.Fprintln(stderr, "storage journal PVE client unavailable")
+		storageJournalFail(stderr, "storage journal PVE client unavailable", err)
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	nodes, err := storageJournalNodes(ctx, client)
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal operation failed; inspect retained evidence")
+		storageJournalFail(stderr, "storage journal node enumeration failed", err)
 		return 1
 	}
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, client.Nodes(), nodes)
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal cluster identity unavailable")
+		storageJournalFail(stderr, "storage journal cluster identity unavailable", err)
 		return 1
 	}
 	if action == "audit" || action == "recover-authority" || action == "recover-index" || action == "resolve-missing-vm" || action == "adopt" || action == "finalize-cleanup" || action == "cleanup" {
-		return runStorageJournalRecovery(ctx, action, cfg, client, nodes, identity.ID(), *authority, *fenced, stdout, stderr, request)
+		return runStorageJournalRecovery(ctx, action, cfg, client, nodes, identity.ID(), *authority, *fenced, stdout, stderr, request, host)
 	}
 	report, err := handlers.AuditStorageAllocationEnrollment(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: logger}, nodes)
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal enrollment audit failed")
+		storageJournalFail(stderr, "storage journal enrollment audit failed", err)
 		return 1
 	}
 	if action == "audit-enrollment" {
 		if err = json.NewEncoder(stdout).Encode(report); err != nil {
+			storageJournalFail(stderr, "audit-enrollment output could not be written", err)
 			return 1
 		}
 		if !report.Complete || !report.VMScanComplete {
@@ -116,8 +128,8 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		}
 		return 0
 	}
-	if !report.Complete || !report.VMScanComplete || len(report.Conflicts) > 0 || len(report.Evidence) > 0 {
-		fmt.Fprintln(stderr, "initialization refused: complete historical absence is unproven; inspect audit-enrollment output")
+	if preconditions := storageJournalInitializePreconditions(report); len(preconditions) > 0 {
+		storageJournalRefuse(stderr, "initialization refused: complete historical absence is unproven; inspect audit-enrollment output", preconditions, report)
 		return 1
 	}
 	auditID, err := aj.RetainAudit(cfg.StorageAllocationJournalDir, struct {
@@ -126,16 +138,16 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		Audit                handlers.StorageAllocationAudit
 	}{cfg.StoragePlacementNamespace, identity.ID(), *remoteTasksSettled, report})
 	if err != nil {
-		fmt.Fprintln(stderr, "initialization refused: audit evidence could not be retained")
+		storageJournalOpenFailure(stderr, "initialization refused: audit evidence could not be retained", cfg.StorageAllocationJournalDir, cfg.StoragePlacementNamespace, err, host)
 		return 1
 	}
 	journal, err := aj.Initialize(ctx, cfg.StorageAllocationJournalDir, cfg.StoragePlacementNamespace, aj.Enrollment{ClusterID: identity.ID(), AuthorityID: *authority, AuditID: auditID, CompleteHistoricalAudit: true, PreviousWriterFenced: *fenced})
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal operation failed; inspect retained evidence")
+		storageJournalFail(stderr, "storage journal initialization failed (inspect retained evidence)", err)
 		return 1
 	}
 	if err = journal.Close(); err != nil {
-		fmt.Fprintln(stderr, "journal initialized but close failed; inspect enrollment before retrying")
+		storageJournalFail(stderr, "journal initialized but close failed (inspect enrollment before retrying)", err)
 		return 1
 	}
 	// The retained audit already records the storages the absence proof did
@@ -150,17 +162,21 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		summary["skipped_disabled_storages"] = report.SkippedDisabledStorages
 	}
 	if err = json.NewEncoder(stdout).Encode(summary); err != nil {
+		storageJournalFail(stderr, "initialize output could not be written", err)
 		return 1
 	}
 	return 0
 }
 func storageJournalNodes(ctx context.Context, client pve.Client) ([]string, error) {
 	if client.Nodes() == nil {
-		return nil, fmt.Errorf("storage journal node service unavailable")
+		return nil, storageJournalFixedError("PVE node service unavailable")
 	}
 	response, err := client.Nodes().ListNodes(ctx)
-	if err != nil || response == nil || len(*response) == 0 {
-		return nil, fmt.Errorf("storage journal node enumeration unavailable")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", storageJournalFixedError("PVE node listing failed"), err)
+	}
+	if response == nil || len(*response) == 0 {
+		return nil, storageJournalFixedError("PVE listed no nodes")
 	}
 	var names []string
 	for _, raw := range *response {
@@ -168,7 +184,7 @@ func storageJournalNodes(ctx context.Context, client pve.Client) ([]string, erro
 			Node string `json:"node"`
 		}
 		if json.Unmarshal(raw, &node) != nil || node.Node == "" {
-			return nil, fmt.Errorf("storage journal node enumeration malformed")
+			return nil, storageJournalFixedError("PVE node listing malformed")
 		}
 		names = append(names, node.Node)
 	}
@@ -176,25 +192,26 @@ func storageJournalNodes(ctx context.Context, client pve.Client) ([]string, erro
 	return slices.Compact(names), nil
 }
 
-func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.CPIConfig, client pve.Client, nodes []string, clusterID, authority string, fenced bool, stdout, stderr io.Writer, missing ...storageJournalMissingGeneration) (code int) {
-	enrolled, err := aj.InspectEnrollment(cfg.StorageAllocationJournalDir, cfg.StoragePlacementNamespace)
+func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.CPIConfig, client pve.Client, nodes []string, clusterID, authority string, fenced bool, stdout, stderr io.Writer, request storageJournalMissingGeneration, host storageJournalHost) (code int) {
+	dir, namespace := cfg.StorageAllocationJournalDir, cfg.StoragePlacementNamespace
+	enrolled, err := aj.InspectEnrollment(dir, namespace)
 	if err != nil {
-		fmt.Fprintln(stderr, "existing journal enrollment unavailable; restore retained authority before recovery")
+		storageJournalOpenFailure(stderr, "existing journal enrollment unavailable (restore retained authority before recovery)", dir, namespace, err, host)
 		return 1
 	}
-	journal, err := aj.Open(cfg.StorageAllocationJournalDir, cfg.StoragePlacementNamespace, enrolled.Enrollment.ClusterID)
+	journal, err := aj.Open(dir, namespace, enrolled.Enrollment.ClusterID)
 	if err != nil {
-		fmt.Fprintln(stderr, "existing journal cannot be opened for audit")
+		storageJournalOpenFailure(stderr, "existing journal cannot be opened for audit", dir, namespace, err, host)
 		return 1
 	}
 	defer func() {
 		if err := journal.Close(); err != nil {
-			fmt.Fprintln(stderr, "journal close failed; inspect recovery state")
+			storageJournalFail(stderr, "journal close failed (inspect recovery state)", err)
 			code = 1
 		}
 	}()
 	if action == "adopt" || action == "finalize-cleanup" || action == "cleanup" {
-		if clusterID != enrolled.Enrollment.ClusterID || len(missing) != 1 {
+		if clusterID != enrolled.Enrollment.ClusterID {
 			fmt.Fprintln(stderr, "allocation decision requires verified cluster continuity")
 			return 1
 		}
@@ -202,19 +219,20 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 		if action == "cleanup" {
 			applyDecision = handlers.CleanupStorageAllocation
 		}
-		record, err := applyDecision(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger()}, journal, nodes, handlers.StorageAllocationDecision{Action: action, AllocationID: missing[0].AllocationID, ExpectedCID: missing[0].ExpectedCID, DecisionID: missing[0].DecisionID, PreviousWriterFenced: fenced, RemoteTasksSettled: missing[0].RemoteTasksSettled, RecoveredTaskStep: missing[0].RecoveredTaskStep, RecoveredTaskUPID: missing[0].RecoveredTaskUPID, RecoveredTaskEvidence: missing[0].RecoveredTaskEvidence, AuthorityID: authority})
+		record, err := applyDecision(ctx, handlers.Deps{Config: cfg, PVE: client, Logger: log.NewNopLogger()}, journal, nodes, handlers.StorageAllocationDecision{Action: action, AllocationID: request.AllocationID, ExpectedCID: request.ExpectedCID, DecisionID: request.DecisionID, PreviousWriterFenced: fenced, RemoteTasksSettled: request.RemoteTasksSettled, RecoveredTaskStep: request.RecoveredTaskStep, RecoveredTaskUPID: request.RecoveredTaskUPID, RecoveredTaskEvidence: request.RecoveredTaskEvidence, AuthorityID: authority})
 		if err != nil {
 			fmt.Fprintf(stderr, "allocation decision refused (%s); inspect settled outcome, identity and audit evidence\n", handlers.StorageAllocationDecisionFailure(err))
 			return 1
 		}
 		if err = json.NewEncoder(stdout).Encode(map[string]string{"allocation_id": record.ID, "state": string(record.State), "cid": record.CID}); err != nil {
+			storageJournalFail(stderr, "allocation decision output could not be written", err)
 			return 1
 		}
 		return 0
 	}
 	report, err := handlers.AuditStorageAllocations(ctx, handlers.Deps{Config: cfg, PVE: client}, journal, nodes)
 	if err != nil {
-		fmt.Fprintln(stderr, "retained journal audit failed")
+		storageJournalFail(stderr, "retained journal audit failed", err)
 		return 1
 	}
 	probe := "storage-journal-generation-health-probe"
@@ -227,34 +245,31 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 	}
 	_, _, indexErr := journal.InspectVMContext(ctx, probe)
 	if action == "resolve-missing-vm" {
-		if len(missing) != 1 {
-			return 2
-		}
-		return resolveStorageJournalMissingVM(ctx, cfg, journal, clusterID, enrolled.Enrollment.ClusterID, report, missing[0], authority, fenced, stdout, stderr)
+		return resolveStorageJournalMissingVM(ctx, cfg, journal, clusterID, enrolled.Enrollment.ClusterID, report, request, authority, fenced, stdout, stderr)
 	}
 	if action == "audit" {
 		return writeStorageJournalAudit(stdout, stderr, report, indexErr, clusterID == enrolled.Enrollment.ClusterID)
 	}
-	if action == "recover-index" && (len(missing) != 1 || !missing[0].RemoteTasksSettled) {
+	if action == "recover-index" && !request.RemoteTasksSettled {
 		fmt.Fprintln(stderr, "index recovery requires independent attestation that all previous remote tasks settled before audit")
 		return 1
 	}
-	if !report.Complete || !report.VMScanComplete || len(report.Conflicts) > 0 || action == "recover-authority" && indexErr != nil {
-		fmt.Fprintln(stderr, "recovery requires a complete consistent historical audit")
+	if preconditions := storageJournalRecoveryPreconditions(action, report, indexErr); len(preconditions) > 0 {
+		storageJournalRefuse(stderr, "recovery requires a complete consistent historical audit", preconditions, report)
 		return 1
 	}
 	concise, err := conciseStorageJournalAudit(report)
 	if err != nil {
-		fmt.Fprintln(stderr, "recovery record evidence invalid")
+		storageJournalFail(stderr, "recovery record evidence invalid", err)
 		return 1
 	}
 	auditID, err := aj.RetainAudit(cfg.StorageAllocationJournalDir, struct {
 		Operation, Namespace, ClusterID string
 		RemoteTasksSettled              bool
 		Audit                           storageJournalRetainedAudit
-	}{action, cfg.StoragePlacementNamespace, clusterID, action == "recover-index" && missing[0].RemoteTasksSettled, concise})
+	}{action, cfg.StoragePlacementNamespace, clusterID, action == "recover-index" && request.RemoteTasksSettled, concise})
 	if err != nil {
-		fmt.Fprintln(stderr, "recovery audit could not be retained")
+		storageJournalFail(stderr, "recovery audit could not be retained", err)
 		return 1
 	}
 	var provenance []string
@@ -270,10 +285,11 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 		err = journal.RecoverIndex(ctx, enrollment)
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "storage journal operation failed; inspect retained evidence")
+		storageJournalFail(stderr, "storage journal "+action+" failed (inspect retained evidence)", err)
 		return 1
 	}
 	if err = json.NewEncoder(stdout).Encode(map[string]string{"namespace": cfg.StoragePlacementNamespace, "audit_id": auditID, "state": action + " completed"}); err != nil {
+		storageJournalFail(stderr, action+" output could not be written", err)
 		return 1
 	}
 	return 0
@@ -306,8 +322,8 @@ func conciseStorageJournalAudit(report handlers.StorageAllocationAudit) (storage
 	return result, nil
 }
 func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, journal *aj.Journal, clusterID, enrolledClusterID string, report handlers.StorageAllocationAudit, missing storageJournalMissingGeneration, authority string, fenced bool, stdout, stderr io.Writer) int {
-	if !missing.IndexFirstConfirmed || !fenced || strings.TrimSpace(authority) == "" || clusterID != enrolledClusterID || !report.Complete || !report.VMScanComplete || len(report.Conflicts) != 0 || report.StartedAt.IsZero() || report.CompletedAt.Before(report.StartedAt) {
-		fmt.Fprintln(stderr, "missing-generation recovery requires fencing, cluster continuity and a complete fresh audit")
+	if preconditions := storageJournalMissingGenerationPreconditions(missing, authority, fenced, clusterID, enrolledClusterID, report); len(preconditions) > 0 {
+		storageJournalRefuse(stderr, "missing-generation recovery requires fencing, cluster continuity and a complete fresh audit", preconditions, report)
 		return 1
 	}
 	agentHash := sha256.Sum256([]byte(missing.AgentID))
@@ -319,7 +335,7 @@ func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, 
 	}
 	concise, err := conciseStorageJournalAudit(report)
 	if err != nil {
-		fmt.Fprintln(stderr, "missing-generation audit evidence invalid")
+		storageJournalFail(stderr, "missing-generation audit evidence invalid", err)
 		return 1
 	}
 	evidence := struct {
@@ -329,12 +345,15 @@ func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, 
 	}{"resolve-missing-vm", cfg.StoragePlacementNamespace, clusterID, missing.AllocationID, hex.EncodeToString(agentHash[:]), authority, fenced, missing.IndexFirstConfirmed, concise}
 	evidenceID, evidenceJSON, err := aj.VerificationEvidence(evidence)
 	if err != nil {
-		fmt.Fprintln(stderr, "missing-generation evidence could not be encoded")
+		storageJournalFail(stderr, "missing-generation evidence could not be encoded", err)
 		return 1
 	}
 	auditID, err := aj.RetainAudit(cfg.StorageAllocationJournalDir, evidence)
-	if err != nil || auditID != evidenceID {
-		fmt.Fprintln(stderr, "missing-generation evidence could not be retained")
+	if err == nil && auditID != evidenceID {
+		err = storageJournalFixedError("the retained audit identity differs from the evidence identity")
+	}
+	if err != nil {
+		storageJournalFail(stderr, "missing-generation evidence could not be retained", err)
 		return 1
 	}
 	// An index-first crash cannot have submitted a mutation: the complete first
@@ -342,19 +361,113 @@ func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, 
 	// plan is explicitly an audit reconstruction, never a resumable create plan.
 	plan, err := json.Marshal(handlers.StorageAllocationPlan{Version: 1, Namespace: cfg.StoragePlacementNamespace, AllocationKey: missing.AgentID, PolicyFingerprint: evidenceID})
 	if err != nil {
-		fmt.Fprintln(stderr, "missing-generation reconstruction could not be encoded")
+		storageJournalFail(stderr, "missing-generation reconstruction could not be encoded", err)
 		return 1
 	}
 	intent := aj.Intent{IntentFingerprint: evidenceID, PolicyFingerprint: evidenceID, FrozenInputsFingerprint: evidenceID, PlanVersion: 1, Plan: plan}
 	verification := aj.Verification{EvidenceID: evidenceID, EvidenceJSON: evidenceJSON, Complete: true, AbsenceVerified: true, ArtifactDispositionVerified: true}
 	if err = journal.ResolveMissingVMGeneration(ctx, missing.AgentID, missing.AllocationID, intent, verification); err != nil {
-		fmt.Fprintln(stderr, "missing-generation recovery refused; exact indexed record absence must be proven")
+		storageJournalFail(stderr, "missing-generation recovery refused (exact indexed record absence must be proven)", err)
 		return 1
 	}
 	if err = json.NewEncoder(stdout).Encode(map[string]string{"namespace": cfg.StoragePlacementNamespace, "allocation_id": missing.AllocationID, "audit_id": auditID, "state": "missing generation resolved as cleaned"}); err != nil {
+		storageJournalFail(stderr, "resolve-missing-vm output could not be written", err)
 		return 1
 	}
 	return 0
+}
+
+// storageJournalRefuse prints a refusal as the fixed lead, then one line for
+// each precondition that failed, then the audit's finding summary when the
+// audit itself falls short. A precondition says why the command refused; the
+// summary says what the audit saw.
+func storageJournalRefuse(stderr io.Writer, lead string, preconditions []string, report handlers.StorageAllocationAudit) {
+	fmt.Fprintln(stderr, lead)
+	for _, precondition := range preconditions {
+		fmt.Fprintln(stderr, "precondition failed: "+storageJournalLine(precondition))
+	}
+	if summary := handlers.StorageAuditFindingSummary(report); summary != "" {
+		fmt.Fprintln(stderr, "audit findings: "+storageJournalLine(summary))
+	}
+}
+
+// storageJournalAuditPreconditions names the ways report falls short of the
+// complete, conflict-free audit that every journal mutation requires.
+func storageJournalAuditPreconditions(report handlers.StorageAllocationAudit) []string {
+	var failed []string
+	switch {
+	case !report.VMScanComplete:
+		failed = append(failed, "the VM scan is incomplete")
+	case !report.Complete:
+		failed = append(failed, "the storage audit is incomplete")
+	}
+	if n := len(report.Conflicts); n == 1 {
+		failed = append(failed, "the audit raised 1 conflict")
+	} else if n > 1 {
+		failed = append(failed, fmt.Sprintf("the audit raised %d conflicts", n))
+	}
+	return failed
+}
+
+// storageJournalInitializePreconditions adds the usual reason initialize
+// refuses, which is provenance that already exists on PVE. It names the
+// first few allocations so the operator can find them.
+func storageJournalInitializePreconditions(report handlers.StorageAllocationAudit) []string {
+	failed := storageJournalAuditPreconditions(report)
+	if len(report.Evidence) == 0 {
+		return failed
+	}
+	var ids []string
+	for _, evidence := range report.Evidence {
+		ids = append(ids, evidence.AllocationID)
+	}
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	listed := ids[:min(len(ids), 3)]
+	noun := "allocations"
+	if len(ids) == 1 {
+		noun = "allocation"
+	}
+	text := fmt.Sprintf("existing allocation provenance: %d evidence entries name %d %s: %s", len(report.Evidence), len(ids), noun, strings.Join(listed, ", "))
+	if more := len(ids) - len(listed); more > 0 {
+		text += fmt.Sprintf(" and %d more", more)
+	}
+	return append(failed, text)
+}
+
+// storageJournalRecoveryPreconditions adds the generation index, which
+// recover-authority needs healthy and recover-index exists to repair.
+func storageJournalRecoveryPreconditions(action string, report handlers.StorageAllocationAudit, indexErr error) []string {
+	failed := storageJournalAuditPreconditions(report)
+	if action == "recover-authority" && indexErr != nil {
+		failed = append(failed, "the generation index is invalid or unavailable: "+describeStorageJournalError(indexErr))
+	}
+	return failed
+}
+
+// storageJournalMissingGenerationPreconditions names each attestation,
+// continuity check, and audit property that resolve-missing-vm lacks.
+func storageJournalMissingGenerationPreconditions(missing storageJournalMissingGeneration, authority string, fenced bool, clusterID, enrolledClusterID string, report handlers.StorageAllocationAudit) []string {
+	var failed []string
+	if !missing.IndexFirstConfirmed {
+		failed = append(failed, "the index-first crash is not confirmed")
+	}
+	if !fenced {
+		failed = append(failed, "the previous writer is not attested as fenced")
+	}
+	if strings.TrimSpace(authority) == "" {
+		failed = append(failed, "authority-id is blank")
+	}
+	if clusterID != enrolledClusterID {
+		failed = append(failed, "cluster continuity is lost; PVE reports a cluster identity other than the enrolled one")
+	}
+	failed = append(failed, storageJournalAuditPreconditions(report)...)
+	if report.StartedAt.IsZero() {
+		failed = append(failed, "the audit has no start time")
+	} else if report.CompletedAt.Before(report.StartedAt) {
+		failed = append(failed, "the audit completed before it started")
+	}
+	return failed
 }
 
 // storageJournalRecordSummary is the operator-facing view of one journal
@@ -441,7 +554,7 @@ func validStorageJournalFlags(action string, fs *flag.FlagSet, configPath, autho
 func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageAllocationAudit, indexErr error, continuity bool) int {
 	concise, err := conciseStorageJournalAudit(report)
 	if err != nil {
-		fmt.Fprintln(stderr, "audit record summary unavailable")
+		storageJournalFail(stderr, "audit record summary unavailable", err)
 		return 1
 	}
 	outputReport := report
@@ -472,6 +585,7 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 		output.IndexFinding = "generation index invalid or unavailable; record listing does not establish healthy authority"
 	}
 	if err = json.NewEncoder(stdout).Encode(output); err != nil {
+		storageJournalFail(stderr, "audit output could not be written", err)
 		return 1
 	}
 	if !output.IndexHealthy || !output.ClusterContinuity || !report.Complete || !report.VMScanComplete {

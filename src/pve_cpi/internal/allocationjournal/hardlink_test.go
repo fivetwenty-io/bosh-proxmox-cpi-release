@@ -67,7 +67,7 @@ func TestUnlinkedInodeIsNotTreatedAsMultiplyLinked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := privateInfo(info, false); err != nil {
+	if err := privateInfo(name, info, false); err != nil {
 		t.Fatalf("an unlinked inode must not be refused: %v", err)
 	}
 }
