@@ -153,35 +153,8 @@ func assertParkedDiskUntouched(t *testing.T, client *createVMDiskClient, journal
 // VM cleanup runs delete_vm's preservation before the destroy, so the disk is
 // parked again under its own allocation and the VM goes away without it.
 func TestAttestedHandoffCleanupKeepsABoundPersistentDisk(t *testing.T) {
-	locks := newLockContention(t)
-	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, true)
-	locks.reset()
-	// The attach lands, and the slot reported back names nothing, so the
-	// binding readback fails.
-	failPersistentHandoff(t, func(slot string, err error) (string, error) {
-		if err != nil {
-			return slot, err
-		}
-		return "scsi29", nil
-	})
-	if _, err := createVM(t.Context(), deps, createVMArgs(t, cid)); err == nil {
-		t.Fatal("create_vm succeeded with an unreadable binding")
-	}
-	vm := handoffRecord(t, journal)
-	vmid, ok := managedVMRootVMID(vm)
-	if !ok {
-		t.Fatal("the VM record has no root VMID")
-	}
-	bound := false
-	for key := range client.state.configs[vmid] {
-		value, _ := pve.ConfigString(client.state.configs[vmid], key)
-		if isDiskOptionKey(key) && strings.HasPrefix(value, "b:") {
-			bound = true
-		}
-	}
-	if !bound {
-		t.Fatalf("the fixture did not bind the persistent volume to VM %d: %v", vmid, client.state.configs[vmid])
-	}
+	shape := newBoundHandoffShape(t)
+	deps, client, journal, cid, parker, vm, vmid := shape.deps, shape.client, shape.journal, shape.cid, shape.parker, shape.vm, shape.vmid
 
 	cleaned, err := CleanupStorageAllocation(t.Context(), attestedCleanupDeps(deps), journal, []string{"n1"}, cleanupAttestedDecision(vm.ID))
 	if err != nil {
@@ -201,6 +174,137 @@ func TestAttestedHandoffCleanupKeepsABoundPersistentDisk(t *testing.T) {
 	rd, err := resolveDiskForOp(t.Context(), deps, "attach_disk", cid, bare, meta)
 	if err != nil || rd.holder == nil || !rd.holder.IsParker || rd.holder.VMID != parker {
 		t.Fatalf("the disk no longer resolves onto its parker: holder=%+v err=%v", rd.holder, err)
+	}
+}
+
+// boundHandoffShape is a VM record whose only open step is the persistent disk
+// handoff, while the disk's volume sits in a slot on that VM.
+type boundHandoffShape struct {
+	deps    Deps
+	client  *createVMDiskClient
+	journal *aj.Journal
+	cid     string
+	parker  int
+	vm      aj.Record
+	vmid    int
+	slot    string
+	volume  string
+}
+
+// newBoundHandoffShape runs create_vm with a disk in disk_cids whose attach
+// lands, and then reports a slot that names nothing, so the VM allocation's
+// binding readback fails and leaves the handoff step planned.
+func newBoundHandoffShape(t *testing.T) boundHandoffShape {
+	t.Helper()
+	locks := newLockContention(t)
+	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, true)
+	locks.reset()
+	failPersistentHandoff(t, func(slot string, err error) (string, error) {
+		if err != nil {
+			return slot, err
+		}
+		return "scsi29", nil
+	})
+	if _, err := createVM(t.Context(), deps, createVMArgs(t, cid)); err == nil {
+		t.Fatal("create_vm succeeded with an unreadable binding")
+	}
+	vm := handoffRecord(t, journal)
+	vmid, ok := managedVMRootVMID(vm)
+	if !ok {
+		t.Fatal("the VM record has no root VMID")
+	}
+	shape := boundHandoffShape{deps: deps, client: client, journal: journal, cid: cid, parker: parker, vm: vm, vmid: vmid}
+	for key := range client.state.configs[vmid] {
+		value, _ := pve.ConfigString(client.state.configs[vmid], key)
+		if isDiskOptionKey(key) && strings.HasPrefix(value, "b:") {
+			shape.slot, shape.volume = key, strings.Split(value, ",")[0]
+		}
+	}
+	if shape.slot == "" {
+		t.Fatalf("the fixture did not bind the persistent volume to VM %d: %v", vmid, client.state.configs[vmid])
+	}
+	return shape
+}
+
+// openDiskStep leaves the disk's own record unsettled. It records a planned
+// config write against the VM, the way a disk attach that never read its
+// result back leaves it, and returns the record as saved.
+func openDiskStep(t *testing.T, journal *aj.Journal, vmid int) aj.Record {
+	t.Helper()
+	records, err := journal.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ""
+	for i := range records {
+		if records[i].Kind == "disk" {
+			id = records[i].ID
+		}
+	}
+	handle, err := journal.Acquire(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := handle.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	record := handle.Record()
+	record.State = aj.ReconciliationRequired
+	record.Reason = "outcome requires reconciliation at lifecycle attach_disk operation did not complete"
+	if err := handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record = handle.Record()
+	record.Steps = append(record.Steps, aj.Step{ID: fmt.Sprintf("attempt-%d-step-%d", record.ActiveAttempt(), len(record.Steps)), Attempt: record.ActiveAttempt(), Kind: "lifecycle_attach_disk_Nodes_UpdateQemuConfig", State: aj.Planned, Target: aj.Target{Node: "n1", VMID: vmid}})
+	if err := handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	return handle.Record()
+}
+
+// TestAttestedHandoffCleanupRefusesWhileTheDiskIsUnsettled pins the order the
+// recovery depends on. The disk's own record has to be settled before the VM
+// generation is cleaned up, because the cleanup preserves a bound disk through
+// that disk's own lifecycle, and the lifecycle refuses a record with an open
+// step. With the disk still bound to the VM and its record unsettled, attested
+// cleanup of the VM record is refused, and the VM, the binding, and the disk
+// record are all left as they were.
+func TestAttestedHandoffCleanupRefusesWhileTheDiskIsUnsettled(t *testing.T) {
+	shape := newBoundHandoffShape(t)
+	before := openDiskStep(t, shape.journal, shape.vmid)
+
+	_, err := CleanupStorageAllocation(t.Context(), attestedCleanupDeps(shape.deps), shape.journal, []string{"n1"}, cleanupAttestedDecision(shape.vm.ID))
+	if err == nil {
+		t.Fatal("attested cleanup removed the VM while the disk it holds had an unsettled record")
+	}
+	t.Logf("refused: %v (%s)", err, StorageAllocationDecisionFailure(err))
+	cfg, present := shape.client.state.configs[shape.vmid]
+	if !present {
+		t.Fatalf("the refused cleanup destroyed VM %d", shape.vmid)
+	}
+	value, _ := pve.ConfigString(cfg, shape.slot)
+	if strings.Split(value, ",")[0] != shape.volume {
+		t.Fatalf("the refused cleanup moved the disk out of %s: now %q, want %s", shape.slot, value, shape.volume)
+	}
+	if _, exists := shape.client.state.volumes[shape.volume]; !exists {
+		t.Fatalf("the refused cleanup removed the persistent volume %s", shape.volume)
+	}
+	after, err := shape.journal.Inspect(before.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHash, err := aj.Fingerprint(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterHash, err := aj.Fingerprint(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeHash != afterHash {
+		t.Fatalf("the refused cleanup changed the disk record: %s %q with %d steps, was %s %q with %d steps", after.State, after.Reason, len(after.Steps), before.State, before.Reason, len(before.Steps))
 	}
 }
 
