@@ -2129,7 +2129,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	handle, lockErr := AcquireClusterLock(ctx, pools,
 		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
 	if lockErr != nil {
-		if errors.Is(lockErr, ErrClusterLockTimeout) {
+		if errors.Is(lockErr, ErrClusterLockTimeout) || errors.Is(lockErr, ErrClusterLockStateUnknown) {
 			// A timeout is not "the lock is unavailable to me", it is "somebody
 			// else is inside the window right now": an expired or unreadable
 			// holder is stolen rather than waited on, so the only way to reach
@@ -2137,6 +2137,11 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			// Proceeding here would run the exact interleaving this lock exists
 			// to prevent, and it would do so precisely when contention is
 			// highest. Hand it back retriable and let the Director re-drive.
+			//
+			// An acquire that created its sentinel but could never read it
+			// back is the same case. That sentinel may be ours and may still
+			// stand, and another request may already be waiting on it, so
+			// running the window unserialized could overlap a holder.
 			return lockErr
 		}
 		// Every other acquire failure means the mechanism is unavailable, not
