@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"strings"
@@ -341,6 +342,75 @@ func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) 
 	}
 	if err := fresh.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRetainedVMCleanupCompletesAndLeavesAConflictFreeAudit drives explicit
+// cleanup of a retained VM end to end. Deleting the retained volume records
+// delete_disk steps on the VM record that name the retention parker, and the
+// completion audit must not read that parker as the VM's own guest.
+func TestRetainedVMCleanupCompletesAndLeavesAConflictFreeAudit(t *testing.T) {
+	deps, client, journal, vmID, _ := retainDeleteFixture(t)
+	if _, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{}); err != nil {
+		t.Fatal(err)
+	}
+	volume := strings.Split(retainedVolume(t, client), ",")[0]
+	cleaned, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1", "n2"}, cleanupAttestedDecision(vmID))
+	if err != nil {
+		t.Fatalf("retained VM cleanup: %v: %s", err, directorMessage(err))
+	}
+	if cleaned.State != aj.Cleaned || client.state.volumes[volume] != nil {
+		t.Fatalf("retained VM cleanup incomplete: state=%s volume present=%t", cleaned.State, client.state.volumes[volume] != nil)
+	}
+	assertRetainedCleanupStepsNameParker(t, cleaned)
+	report, err := AuditStorageAllocations(t.Context(), deps, journal, []string{"n1", "n2"})
+	if err != nil || !report.Complete || len(report.Conflicts) > 0 {
+		t.Fatalf("audit after retained cleanup: conflicts=%v issues=%v err=%v", report.Conflicts, report.Issues, err)
+	}
+}
+
+// TestRetainedVMCleanupRetryCompletesAfterVolumeDeletion covers a record left
+// behind when an earlier cleanup deleted the retained volume but failed its
+// completion audit, as every 0.8.0 cleanup did. The record stays retained
+// with observed delete_disk steps naming the parker, and a retry finishes it.
+func TestRetainedVMCleanupRetryCompletesAfterVolumeDeletion(t *testing.T) {
+	deps, client, journal, vmID, _ := retainDeleteFixture(t)
+	if _, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{}); err != nil {
+		t.Fatal(err)
+	}
+	volume := strings.Split(retainedVolume(t, client), ",")[0]
+	client.visibilityErrAfterDelete = errors.New("visibility lost")
+	if _, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1", "n2"}, cleanupAttestedDecision(vmID)); err == nil {
+		t.Fatal("completion without audit visibility succeeded")
+	}
+	stuck, err := journal.Inspect(vmID)
+	if err != nil || stuck.State != aj.VMDeletedRetained || client.state.volumes[volume] != nil {
+		t.Fatalf("interrupted cleanup: state=%s volume present=%t err=%v", stuck.State, client.state.volumes[volume] != nil, err)
+	}
+	assertRetainedCleanupStepsNameParker(t, stuck)
+	client.visibilityErrAfterDelete, client.visibilityErr = nil, nil
+	cleaned, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1", "n2"}, cleanupAttestedDecision(vmID))
+	if err != nil || cleaned.State != aj.Cleaned {
+		t.Fatalf("retried retained VM cleanup: state=%s err=%v: %s", cleaned.State, err, directorMessage(err))
+	}
+}
+
+// assertRetainedCleanupStepsNameParker pins the record shape the audit must
+// tolerate, which is owned, observed delete_disk steps with the parker's VMID.
+func assertRetainedCleanupStepsNameParker(t *testing.T, record aj.Record) {
+	t.Helper()
+	found := false
+	for stepIndex := range record.Steps {
+		step := &record.Steps[stepIndex]
+		if strings.HasPrefix(step.Kind, "lifecycle_delete_disk_") && step.Target.VMID > 0 {
+			found = true
+			if step.Target.External || step.Target.VMID == 777 || step.State != aj.Observed {
+				t.Fatalf("retained cleanup step changed shape: %+v", step)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("retained cleanup recorded no parker step: %+v", record.Steps)
 	}
 }
 

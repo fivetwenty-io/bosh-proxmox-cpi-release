@@ -380,11 +380,20 @@ func storageAllocationVerification(report StorageAllocationAudit, facts map[stri
 	return aj.Verification{EvidenceID: evidenceID, Complete: true, EvidenceJSON: evidenceJSON}, nil
 }
 
+// storageStepNamesRetentionParker reports whether a step names a retention
+// parker rather than the VM record's own guest. Retention moves the ephemeral
+// volume onto a parker, and explicit cleanup later deletes it there under the
+// delete_disk operation. Both record the parker's VMID as an owned target, and
+// records written by 0.8.0 already carry them, so readers classify by kind.
+func storageStepNamesRetentionParker(record aj.Record, step aj.Step) bool {
+	return strings.HasPrefix(step.Kind, "lifecycle_delete_vm_retain_ephemeral_") || record.Kind == "vm" && strings.HasPrefix(step.Kind, "lifecycle_delete_disk_")
+}
+
 // Recorded HA placement permits a VM to move between its original allowed
 // nodes. A matching VMID on another node still requires reconciliation. On a
 // miss, the second result is the reason code.
 func storageAuditVMTargetMatches(record aj.Record, step aj.Step, node string, vmid int) (bool, string) {
-	if step.Target.External || strings.HasPrefix(step.Kind, "lifecycle_delete_vm_retain_ephemeral_") {
+	if step.Target.External || storageStepNamesRetentionParker(record, step) {
 		return false, storageAuditReasonExternal
 	}
 	if step.Target.VMID != vmid || vmid <= 0 {

@@ -242,7 +242,7 @@ func storageAuditActiveVMNodes(record aj.Record, vmid int) []string {
 		if step.Attempt != record.ActiveAttempt() || step.Target.VMID != vmid || vmid <= 0 || step.Target.Node == "" {
 			continue
 		}
-		if step.Target.External || strings.HasPrefix(step.Kind, "lifecycle_delete_vm_retain_ephemeral_") {
+		if step.Target.External || storageStepNamesRetentionParker(record, step) {
 			continue
 		}
 		nodes = append(nodes, step.Target.Node)

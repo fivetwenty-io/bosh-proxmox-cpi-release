@@ -34,6 +34,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `cpi storage-journal` and `cpi provision-journal` no longer swallow their errors. About twenty-five failure lines used to drop the error in hand, and five output failures exited 1 with no text at all. Each one now prints its message followed by a safe description of the cause. A journal owned by another user prints `journal <path> is owned by <user>; rerun as that user:` and the exact command, which is what plain `sudo` on a Director now reports instead of an opaque failure. A missing journal directory, a namespace that was never enrolled, and a config file that is missing or unreadable each get their own message, and a config that fails validation prints no configuration values. When `initialize`, the recovery actions, or `resolve-missing-vm` refuse, they now print one `precondition failed:` line for each precondition that failed, followed by an `audit findings:` summary. A refused adoption or cleanup decision now carries the audit summary after its `identity_or_audit_evidence` class.
 
+- Explicit cleanup of a retained VM no longer fails when it finishes. The cleanup records its disk deletions with the retention parker's VMID, and the allocation audit read that parker as the VM's own guest and reported that it lacked the allocation marker. The audit now treats those steps as naming the parker, so a record that 0.8.0 left stuck this way finishes when the cleanup is retried.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added

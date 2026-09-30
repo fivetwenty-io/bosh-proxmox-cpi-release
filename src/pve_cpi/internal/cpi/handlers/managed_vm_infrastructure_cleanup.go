@@ -113,7 +113,7 @@ func managedVMRouteOwnerMatches(record aj.Record, vmid int) bool {
 	}
 	for i := range record.Steps {
 		step := &record.Steps[i]
-		if step.Attempt == record.ActiveAttempt() && !step.Target.External && step.Target.VMID == vmid && !strings.HasPrefix(step.Kind, "lifecycle_delete_vm_retain_ephemeral_") {
+		if step.Attempt == record.ActiveAttempt() && !step.Target.External && step.Target.VMID == vmid && !storageStepNamesRetentionParker(record, *step) {
 			return true
 		}
 	}
