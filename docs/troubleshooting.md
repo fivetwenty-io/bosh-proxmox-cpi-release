@@ -1196,6 +1196,24 @@ A changed caller request conflicts with the active VM generation. A changed glob
 
 If an audit reports incomplete visibility, check the propagated `VM.Audit` and `Datastore.Audit` privileges, the image-access grants, and the ACL inventory access described in [PVE API permissions](pve-api-permissions.md#multi-storage-audit-visibility). When PVE has filtered a listing by permission, that listing cannot prove that historical resources are absent.
 
+### Choose the command for the record
+
+We choose the command by what the record still owns, and `storage-journal audit --summary` shows us that. Its record line gives the state and the CID, and each evidence line names a volume, VM, or parker that still carries the allocation.
+
+| The record | What PVE still holds for it | What we run |
+|---|---|---|
+| A disk with a CID, or a VM in `ready_to_return` | Its resources, where the record says they are | A retry of the Director operation, or `adopt` with the CID from the audit |
+| An allocation that never returned a CID | Resources we intend to remove | `cleanup` |
+| Any allocation | Nothing, and the audit shows no evidence for it | `finalize-cleanup` |
+
+`adopt` is the safe first step whenever the Director still uses the disk, because it changes nothing on PVE. When a step is still unsettled, it refuses and names that step, for example `allocation has unsettled mutation evidence; step attempt-0-step-7 (lifecycle_attach_disk_Pool_CreatePool) is planned; ...`. [Record adoption or completed cleanup](storage-journal-operations.md#record-adoption-or-completed-cleanup) says which steps count as settled. A planned step that is not a lock step needs the investigation that [Delete an allocation through its retained authority](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority) describes, and `cleanup` deletes what the allocation owns, so we never use it on a disk the Director still holds.
+
+### Records left behind by the old lock bug
+
+A CPI from 0.6.0 through 0.8.0 also left records here whenever two requests contended for one parker. The deploy failed with `requires reconciliation at lifecycle attach_disk Pool.CreatePool`, or with the same text for `detach_disk` or `delete_disk`. Every step of such a record is observed except the last one, a planned lock step named `lifecycle_<operation>_Pool_CreatePool`, and no `bosh-lock-` pool exists for it. A fixed CPI settles that step with a fresh read of the parker's lock pool, so the Director's retry of the operation completes, and `adopt` with the CID from the audit records the disk as adopted. Anything the earlier attempt had already written, such as drive-option overrides on the receiving VM, is written again in place by the retry. A `create_disk` that failed the same way reports `requires reconciliation at persistent parker completion` and never returned a CID, so its record takes `cleanup`, which settles the lock step the same way before it judges the evidence.
+
+### A parker lock wait runs out
+
 A persistent disk on a parker can also end up here after a lock wait runs out. When several instances move disks into or out of the same parker at once, each request waits its turn for that parker's lock, and the error names it as `timed out after 3m0s waiting for lock "bosh-lock-vm-<parker>"`. The 180-second wait is one budget for the whole queue rather than a fresh allowance for each holder, so a request at the back of a long queue can still run out. An `attach_disk`, `detach_disk`, or `delete_disk` that had changed nothing before its wait ran out puts the allocation back as it was, so the record heals when the Director retries. A `create_disk` whose park runs out has already created its volume, and the Director's retry creates a new one under a new allocation, so that record stays `reconciliation_required` until we reconcile it.
 
 ### A crash-abandoned allocation keeps charging capacity

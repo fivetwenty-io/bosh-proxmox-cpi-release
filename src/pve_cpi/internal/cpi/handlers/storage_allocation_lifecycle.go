@@ -59,7 +59,7 @@ func storageLifecycleSettled(record aj.Record) error {
 	for stepIndex := range record.Steps {
 		step := &record.Steps[stepIndex]
 		if step.Attempt == record.ActiveAttempt() && step.State != aj.Observed {
-			return fmt.Errorf("lifecycle has unresolved mutation evidence; audit required")
+			return fmt.Errorf("lifecycle has unresolved mutation evidence; %s; audit required", unsettledStepName(*step))
 		}
 	}
 	return nil

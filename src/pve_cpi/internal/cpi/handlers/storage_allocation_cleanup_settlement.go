@@ -161,7 +161,7 @@ func storageCleanupSettled(ctx context.Context, record aj.Record) error {
 			continue
 		}
 		if proof == nil || proof.AllocationID != record.ID || proof.Attempt != record.ActiveAttempt() {
-			return storageRefusal("cleanup has unresolved mutation evidence")
+			return storageRefusal("cleanup has unresolved mutation evidence; " + unsettledStepName(*step))
 		}
 		hash, err := aj.Fingerprint(*step)
 		if err != nil || proof.Steps[step.ID] != hash {
