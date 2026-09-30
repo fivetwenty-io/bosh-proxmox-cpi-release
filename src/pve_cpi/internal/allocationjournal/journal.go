@@ -574,7 +574,7 @@ func (j *Journal) Acquire(ctx context.Context, id string) (*Handle, error) {
 	if err != nil {
 		return nil, errors.Join(err, l.close())
 	}
-	return &Handle{journal: j, lock: l, record: r, Resumed: true, requiresReconciliation: true}, nil
+	return &Handle{journal: j, lock: l, record: r, Resumed: true, requiresReconciliation: true, saveFault: saveFaultFor(ctx)}, nil
 }
 
 // Handle owns one allocation OS lock. Save/Record/Close serialize locally.
@@ -588,6 +588,9 @@ type Handle struct {
 	closed                 bool
 	poisoned               bool
 	requiresReconciliation bool
+	// saveFault is the fault WithSaveFaultForTest put on Acquire's context.
+	// It is nil outside tests.
+	saveFault func(Record) error
 }
 
 // Record returns an isolated copy of the currently held allocation.
@@ -633,6 +636,12 @@ func (h *Handle) saveLocked(next Record, attemptTransition bool) error {
 		return nil
 	}
 	next.UpdatedAt = time.Now().UTC()
+	if h.saveFault != nil {
+		if err := h.saveFault(cloneRecord(next)); err != nil {
+			h.poisoned = true
+			return err
+		}
+	}
 	if err := atomicJSON(h.journal.root, recordName(next.ID), next, h.journal.ops); err != nil {
 		h.poisoned = true
 		return err

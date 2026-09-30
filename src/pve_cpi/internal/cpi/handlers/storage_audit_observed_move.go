@@ -185,10 +185,10 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, ""
 }
 
-// storageAuditDeletionKeepsMove reports whether a record that delete took out
-// of ready_to_return or adopted may still be read as moved to the sighted
-// node. Delete admission audited the record while it was returned, and its
-// retained evidence names this VMID and node. Every other condition of the
+// storageAuditDeletionKeepsMove reports whether a record that delete or an
+// explicit cleanup took out of ready_to_return or adopted may still be read
+// as moved to the sighted node. The admission audited the record while it was
+// returned, and its retained evidence names this VMID and node. Every other condition of the
 // rule still applies to the live state, so a VM that moved again since the
 // admission stays a conflict. A record whose CID was never returned cannot
 // reach this, because no admission of it ever accepted a move.

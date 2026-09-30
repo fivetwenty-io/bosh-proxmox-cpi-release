@@ -88,7 +88,13 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 		return result, storageDecisionSourceError(err)
 	}
 	phase = "persist_admission"
-	id, payload, err := aj.VerificationEvidence(map[string]any{allocationEvidenceOperationField: "explicit_cleanup_admission", "decision": decision, "record_updated_at": record.UpdatedAt, "started_at": report.StartedAt, "completed_at": report.CompletedAt, "evidence": report.Evidence, "targeted_ownership": ownership, "cleanup_settlement": settlement})
+	facts := map[string]any{allocationEvidenceOperationField: "explicit_cleanup_admission", "decision": decision, "record_updated_at": record.UpdatedAt, "started_at": report.StartedAt, "completed_at": report.CompletedAt, "evidence": report.Evidence, "targeted_ownership": ownership, "cleanup_settlement": settlement}
+	// The key is left out when the audit accepted no move, so the admission
+	// stays byte for byte what earlier builds wrote.
+	if moves := storageAuditAllocationMoves(report, record.ID); len(moves) > 0 {
+		facts["observed_moves"] = moves
+	}
+	id, payload, err := aj.VerificationEvidence(facts)
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
@@ -111,6 +117,8 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	}
 	// VM cleanup independently proves ownership under this same handle. Persist
 	// its operator request without claiming ownership from inventory alone.
+	// The admission retains the moves its audit accepted, so the audits that
+	// follow this save keep reading the VM as moved.
 	if record.Kind == "vm" && record.State != aj.VMDeletedRetained && record.State != aj.ReconciliationRequired {
 		record.State = aj.ReconciliationRequired
 		record.Reason = "explicit VM cleanup requested"
@@ -129,6 +137,18 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	phase = "resource_cleanup"
 	return executeStorageAllocationCleanup(ctx, deps, journal, handle, record)
 
+}
+
+// storageAuditAllocationMoves returns the moves the audit accepted for
+// allocationID.
+func storageAuditAllocationMoves(r StorageAllocationAudit, allocationID string) []StorageAllocationMove {
+	var moves []StorageAllocationMove
+	for _, move := range r.ObservedMoves {
+		if move.AllocationID == allocationID {
+			moves = append(moves, move)
+		}
+	}
+	return moves
 }
 
 // cleanupNameUnsettledLockStep adds to the admission's refusal the lock step
