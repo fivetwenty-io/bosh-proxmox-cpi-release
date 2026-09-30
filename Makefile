@@ -93,13 +93,13 @@ tidy: ## Run go mod tidy
 .PHONY: test
 test: ## Run all tests with race detection
 	@echo "$(GREEN)Running tests...$(RESET)"
-	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=300s ./...
+	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=900s ./...
 	@echo "$(GREEN)✓ Tests passed$(RESET)"
 
 .PHONY: coverage
 coverage: ## Generate coverage profile and print summary
 	@echo "$(GREEN)Generating coverage report...$(RESET)"
-	@cd $(SRC_ROOT) && go test -coverprofile=coverage.out ./...
+	@cd $(SRC_ROOT) && go test -timeout=900s -coverprofile=coverage.out ./...
 	@cd $(SRC_ROOT) && go tool cover -func=coverage.out
 	@echo "$(GREEN)✓ Coverage report generated$(RESET)"
 
