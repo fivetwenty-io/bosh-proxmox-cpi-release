@@ -355,40 +355,52 @@ func TestManagedDetachLockTimeoutKeepsTheTimeout(t *testing.T) {
 	assertReturnedRecord(t, "retried detach", disk.record(t))
 }
 
-// TestManagedAttachOverlayBeforeTimeoutStaysUncertain drives the attach
-// ordering the mutation gate exists for. The parked disk carries drive-option
+// defaultDriveOverrides is the drive-option override set every managed
+// persistent disk carries by default, as its parker records it.
+var defaultDriveOverrides = map[string]string{"discard": "on", "iothread": "1", "ssd": "1"}
+
+// assertOverlayNoteObserved checks that the attach wrote the overrides onto VM
+// 777 before it waited, and that the write was journaled as an observed step.
+func assertOverlayNoteObserved(t *testing.T, disk *parkedFlowDisk, record aj.Record) {
+	t.Helper()
+	if overlay := overlayOn(t, disk); !strings.Contains(overlay, `"ssd":"1"`) {
+		t.Fatalf("the attach did not write the overrides before it waited: %s", overlay)
+	}
+	for i := range record.Steps {
+		if record.Steps[i].Kind == "lifecycle_attach_disk_Nodes_UpdateQemuConfig" && record.Steps[i].State == aj.Observed && record.Steps[i].Target.VMID == 777 {
+			return
+		}
+	}
+	t.Fatalf("the overlay write was not journaled as an observed step: %+v", record.Steps)
+}
+
+// TestManagedAttachOverlayBeforeTimeoutReturnsTheDisk drives the default
+// attach from a parker. The parked disk carries the default drive-option
 // overrides, so the attach writes them onto the receiving VM before it waits
-// for the parker lock. That write is a real, observed change to the disk's
-// holders, so when the wait runs out the allocation must go uncertain rather
-// than snap back.
-func TestManagedAttachOverlayBeforeTimeoutStaysUncertain(t *testing.T) {
+// for the parker lock. That note is journaled and observed, but it leaves the
+// disk where it was, so when the wait runs out the allocation is returned, the
+// Director gets the retriable timeout, and the retry attaches the disk.
+func TestManagedAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
-	withParkedOverlay(t, disk, map[string]string{"discard": "on", "ssd": "1"})
+	withParkedOverlay(t, disk, defaultDriveOverrides)
 	plantHeldParkerLock(locks, disk.parker)
 	shortenManagedLockWait(t, 1500*time.Millisecond)
 
 	err := disk.attach(t.Context())
-	if !errors.Is(err, pve.ErrClusterLockTimeout) {
-		t.Fatalf("want the lock timeout, got %v", err)
-	}
-	if overlay := overlayOn(t, disk); !strings.Contains(overlay, `"ssd":"1"`) {
-		t.Fatalf("the attach did not write the overrides before it waited: %s", overlay)
+	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
 	}
 	record := disk.record(t)
-	if record.State != aj.ReconciliationRequired {
-		t.Fatalf("a timeout after an observed overlay write left the allocation %s", record.State)
+	assertOverlayNoteObserved(t, disk, record)
+	assertReturnedRecord(t, "timed-out", record)
+
+	locks.reset()
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("the retry after the timeout failed: %v", err)
 	}
-	observedWrite := false
-	for i := range record.Steps {
-		if record.Steps[i].Kind == "lifecycle_attach_disk_Nodes_UpdateQemuConfig" && record.Steps[i].State == aj.Observed && record.Steps[i].Target.VMID == 777 {
-			observedWrite = true
-		}
-	}
-	if !observedWrite {
-		t.Fatalf("the overlay write was not journaled as an observed step: %+v", record.Steps)
-	}
+	assertReturnedRecord(t, "retried", disk.record(t))
 }
 
 // resolveFlowDisk resolves a flow fixture disk the way the handlers do.
@@ -433,6 +445,25 @@ func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
 	started := time.Now()
 	_, err := attachManagedPersistentDisk(t.Context(), disk.deps, "777", "n1", 777, rd)
 	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+}
+
+// TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk is the create_vm
+// disk_cids pre-attach of a disk carrying the default drive-option overrides.
+// The overlay note it writes onto the receiving VM before the wait does not
+// count as a disk mutation, so the timeout still returns the disk cleanly.
+func TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	withParkedOverlay(t, disk, defaultDriveOverrides)
+	plantHeldParkerLock(locks, disk.parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	rd := resolveFlowDisk(t, disk)
+	started := time.Now()
+	_, err := attachManagedPersistentDisk(t.Context(), disk.deps, "777", "n1", 777, rd)
+	assertCleanDiskTimeout(t, disk, err, time.Since(started))
+	assertOverlayNoteObserved(t, disk, disk.record(t))
 }
 
 // TestDeleteVMPreservationUsesTheManagedWait covers delete_vm's
