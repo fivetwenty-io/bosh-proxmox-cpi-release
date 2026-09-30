@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,12 +40,46 @@ type fileOps struct {
 	syncDir  func(*os.Root) error
 }
 
+// fileSyncOff is the switch behind SetFileSyncForTest. The zero value keeps
+// every sync on. The default ops read it on each call, so it also governs a
+// journal that was opened before the switch changed.
+var fileSyncOff atomic.Bool
+
+// syncFileHook and syncDirHook are the syncs the default ops perform. They
+// are variables only so a test in this package can observe the calls.
+var (
+	syncFileHook = func(f *os.File) error { return f.Sync() }
+	syncDirHook  = syncDirectory
+)
+
+// SetFileSyncForTest turns the default ops' file and directory syncs on or
+// off for a test binary and returns a restore function. Off makes both syncs
+// no-ops, and the write, rename, and error handling are unchanged. It exists
+// so packages whose tests write many journal records need not wait on disk
+// flushes, and production code never calls it.
+//
+//	defer allocationjournal.SetFileSyncForTest(false)()
+func SetFileSyncForTest(enabled bool) func() {
+	prev := fileSyncOff.Swap(!enabled)
+	return func() { fileSyncOff.Store(prev) }
+}
+
 func defaultFileOps() fileOps {
 	return fileOps{
-		write:    func(f *os.File, b []byte) (int, error) { return f.Write(b) },
-		syncFile: func(f *os.File) error { return f.Sync() },
-		rename:   func(r *os.Root, a, b string) error { return r.Rename(a, b) },
-		syncDir:  syncDirectory,
+		write: func(f *os.File, b []byte) (int, error) { return f.Write(b) },
+		syncFile: func(f *os.File) error {
+			if fileSyncOff.Load() {
+				return nil
+			}
+			return syncFileHook(f)
+		},
+		rename: func(r *os.Root, a, b string) error { return r.Rename(a, b) },
+		syncDir: func(r *os.Root) error {
+			if fileSyncOff.Load() {
+				return nil
+			}
+			return syncDirHook(r)
+		},
 	}
 }
 func syncDirectory(r *os.Root) error {
