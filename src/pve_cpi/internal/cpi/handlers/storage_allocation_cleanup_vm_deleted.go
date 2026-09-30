@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"strings"
@@ -77,12 +78,12 @@ func cleanupISODeletionHasPriorOwnership(step aj.Step, record aj.Record, iso Sto
 	return false
 }
 
-func cleanupVMDeletedOwnership(record aj.Record, report StorageAllocationAudit) (aj.Verification, error) {
+func cleanupVMDeletedOwnership(ctx context.Context, deps Deps, record aj.Record, report StorageAllocationAudit) (aj.Verification, error) {
 	_, vmid, _, err := managedVMDisposalIdentity(record, report)
 	if err != nil {
 		return aj.Verification{}, err
 	}
-	return managedVMDispositionProof(report, record, vmid, nil)
+	return managedVMDispositionProof(ctx, deps, report, record, vmid, nil)
 }
 
 func cleanupHasVMDeletion(record aj.Record, settlement *cleanupSettlement) bool {

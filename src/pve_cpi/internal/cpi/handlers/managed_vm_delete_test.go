@@ -23,6 +23,8 @@ type deleteManagedClient struct {
 	stopCount, destroyCount int
 	unknownDestroy          bool
 	stopped                 bool
+	// lostStop stops the VM but loses the stop task's response.
+	lostStop bool
 }
 
 func (c *deleteManagedClient) QEMU() qemu.Service {
@@ -68,6 +70,9 @@ func (q *deleteManagedQEMU) Status(context.Context, string, int) (map[string]any
 func (q *deleteManagedQEMU) Stop(context.Context, string, int) (string, error) {
 	q.c.stopCount++
 	q.c.stopped = true
+	if q.c.lostStop {
+		return "", errors.New("stop response lost")
+	}
 	return "UPID:pve1:stop", nil
 }
 

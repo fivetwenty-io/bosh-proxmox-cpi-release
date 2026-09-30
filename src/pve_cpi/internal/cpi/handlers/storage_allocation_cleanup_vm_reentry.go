@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -33,13 +35,14 @@ func cleanupPendingVMDeletion(step aj.Step, record aj.Record) bool {
 	if step.Target.VMID <= 0 || step.Target.Storage != "" || step.Target.Backing != "" || step.Target.IntendedVolume != "" || len(step.Parameters) != 0 {
 		return false
 	}
+	moved := cleanupVMDeletionAdmittedMove(record, step.Target.VMID, step.Target.Node)
 	linked := false
 	for index := range record.Steps {
 		prior := &record.Steps[index]
 		if prior.ID == step.ID {
 			break
 		}
-		if prior.Attempt == step.Attempt && !prior.Target.External && prior.Target.VMID == step.Target.VMID && prior.Target.Node == step.Target.Node && !strings.HasPrefix(prior.Kind, "vm.delete.") {
+		if prior.Attempt == step.Attempt && !prior.Target.External && prior.Target.VMID == step.Target.VMID && (prior.Target.Node == step.Target.Node || moved) && !strings.HasPrefix(prior.Kind, "vm.delete.") {
 			linked = true
 		}
 	}
@@ -55,6 +58,37 @@ func cleanupPendingVMDeletion(step aj.Step, record aj.Record) bool {
 	return true
 }
 
+// cleanupVMDeletionAdmittedMove reports whether the latest delete admission
+// of record accepted a move of VM vmid to node. The admission audit ran while
+// the record was still returned, the only state in which the audit accepts a
+// VM move, and it retained the moves it accepted in its evidence. A crashed
+// delete leaves the record in reconciliation, where a fresh audit can no
+// longer accept that move, so re-entry reads the admission's verdict instead.
+func cleanupVMDeletionAdmittedMove(record aj.Record, vmid int, node string) bool {
+	var moves []StorageAllocationMove
+	for _, verification := range record.Verifications {
+		var evidence struct {
+			ObservedMoves []StorageAllocationMove `json:"observed_moves"`
+			Facts         struct {
+				Operation    string `json:"operation"`
+				AllocationID string `json:"allocation_id"`
+			} `json:"facts"`
+		}
+		if !verification.Complete || !verification.OwnershipVerified || json.Unmarshal([]byte(verification.EvidenceJSON), &evidence) != nil {
+			continue
+		}
+		if evidence.Facts.Operation == managedVMCleanupAdmissionOperation && evidence.Facts.AllocationID == record.ID {
+			moves = evidence.ObservedMoves
+		}
+	}
+	return slices.ContainsFunc(moves, func(move StorageAllocationMove) bool {
+		return move.Kind == "vm" && move.AllocationID == record.ID && move.VMID == vmid && move.ObservedNode == node
+	})
+}
+
+// observeCleanupVMDeletion requires the pending stop to have reached exactly
+// the VM this record owns. The stop step names the node the delete admission
+// found the VM on, so a VM that moved again since then is refused here.
 func observeCleanupVMDeletion(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record, step aj.Step) error {
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {

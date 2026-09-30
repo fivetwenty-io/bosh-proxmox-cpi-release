@@ -182,7 +182,7 @@ func retainedCleanupDecisionAdmission(ctx context.Context, deps Deps, record aj.
 
 func storageCleanupDiskOwnership(ctx context.Context, deps Deps, record aj.Record, report StorageAllocationAudit, settlement *cleanupSettlement) (aj.Verification, error) {
 	if cleanupHasVMDeletion(record, settlement) {
-		return cleanupVMDeletedOwnership(record, report)
+		return cleanupVMDeletedOwnership(ctx, deps, record, report)
 	}
 	var ownership aj.Verification
 	if record.Kind == allocationKindDisk && len(record.Steps) > 0 {

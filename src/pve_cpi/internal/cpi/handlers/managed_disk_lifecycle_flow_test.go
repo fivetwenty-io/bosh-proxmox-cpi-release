@@ -37,6 +37,12 @@ type lifecycleFlowPVE struct {
 	resizeCalls int
 	dropResize  bool
 	snapshots   []map[string]any
+	// descriptionErr fails every configuration update that rewrites a VM
+	// description, before it takes effect.
+	descriptionErr error
+	// visibilityErrAfterDelete becomes visibilityErr once a volume is
+	// deleted, so only the audits after a deletion lose their visibility.
+	visibilityErrAfterDelete error
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -260,6 +266,9 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	if p.Digest != nil && *p.Digest != cfg["digest"] {
 		return fmt.Errorf("config generation conflict")
 	}
+	if p.Description != nil && n.c.descriptionErr != nil {
+		return n.c.descriptionErr
+	}
 	deletedVolume := ""
 	if p.Delete != nil && strings.HasPrefix(*p.Delete, "unused") {
 		value, _ := pve.ConfigString(cfg, *p.Delete)
@@ -280,6 +289,7 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	}
 	if owner, ok := pve.EmbeddedDiskVMID(deletedVolume); ok && owner == vmid {
 		delete(n.c.state.volumes, deletedVolume)
+		n.c.volumeDeleted()
 	}
 	if n.c.foreignUnlink && p.Delete != nil && !strings.HasPrefix(*p.Delete, "unused") {
 		for slot := range pve.FindUnusedDiskEntries(cfg) {
@@ -392,6 +402,13 @@ func TestManagedDiskAttachAndDetachAfterSetRemoval(t *testing.T) {
 }
 
 func (c *lifecycleFlowPVE) StorageAuditVisibility(context.Context) error { return c.visibilityErr }
+
+// volumeDeleted applies visibilityErrAfterDelete once any volume is deleted.
+func (c *lifecycleFlowPVE) volumeDeleted() {
+	if c.visibilityErrAfterDelete != nil {
+		c.visibilityErr = c.visibilityErrAfterDelete
+	}
+}
 func (c *lifecycleFlowPVE) Storage() storage.Service {
 	return lifecycleFlowStorage{managedDiskTestStorage: managedDiskTestStorage{state: c.state}, c: c}
 }
@@ -403,6 +420,7 @@ type lifecycleFlowStorage struct {
 
 func (s lifecycleFlowStorage) DeleteVolumeAsync(_ context.Context, node, pool, volume string) (string, error) {
 	s.c.deletes++
+	s.c.volumeDeleted()
 	delete(s.c.state.volumes, volume)
 	return fmt.Sprintf("UPID:%s:000573BD:03504636:6AA1786A:imgdel:123@%s:pmx@pve!pmx:", node, pool), nil
 }

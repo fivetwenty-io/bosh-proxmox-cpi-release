@@ -92,6 +92,32 @@ type allocationAuditCluster struct {
 	sdkcluster.Service
 	members []string
 	status  []map[string]any
+	// guestNodes, when set, moves each listed VM to its node in the
+	// cluster resource index, so the index agrees with a moved VM.
+	guestNodes map[int]string
+}
+
+func (cl *allocationAuditCluster) ListResources(ctx context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
+	response, err := cl.Service.ListResources(ctx, params)
+	if err != nil || response == nil || cl.guestNodes == nil {
+		return response, err
+	}
+	moved := sdkcluster.ListResourcesResponse{}
+	for _, raw := range *response {
+		var row map[string]any
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, err
+		}
+		if vmid, ok := row["vmid"].(float64); ok && cl.guestNodes[int(vmid)] != "" {
+			row["node"] = cl.guestNodes[int(vmid)]
+		}
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			return nil, err
+		}
+		moved = append(moved, encoded)
+	}
+	return &moved, nil
 }
 
 func (cl *allocationAuditCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {

@@ -182,7 +182,7 @@ func TestManagedVMEphemeralRetentionPreservesRenamedOwnedVolume(t *testing.T) {
 	if err := storageMutationObserved(handle, step, []string{volume}, false); err != nil {
 		t.Fatal(err)
 	}
-	retained, err := retainManagedEphemeralForVMDelete(context.Background(), deps, handle, "n1", 777, volume)
+	retained, err := retainManagedEphemeralForVMDelete(context.Background(), deps, handle, "n1", 777, volume, false)
 	if err != nil {
 		t.Fatalf("%v steps=%+v config=%+v", err, handle.Record().Steps, client.state.configs)
 	}
@@ -248,8 +248,16 @@ func TestManagedVMEphemeralRetentionPreservesRenamedOwnedVolume(t *testing.T) {
 
 }
 
-func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) {
+// retainDeleteFixture is a returned VM allocation for VM 777 on n1 whose one
+// recorded volume is an ephemeral disk, and whose VM is tagged to retain it
+// on delete. configure runs before the plan freezes storage "a", so a test
+// can make that storage node-local.
+func retainDeleteFixture(t *testing.T, configure ...func(*lifecycleFlowPVE)) (Deps, *lifecycleFlowPVE, *aj.Journal, string, aj.Intent) {
+	t.Helper()
 	deps, client, journal, id, _ := lifecycleFlowFixture(t)
+	for _, fn := range configure {
+		fn(client)
+	}
 	prior, err := journal.Inspect(id)
 	if err != nil {
 		t.Fatal(err)
@@ -259,6 +267,9 @@ func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) 
 	client.state.volumes[volume] = client.state.volumes[old]
 	delete(client.state.volumes, old)
 	client.state.configs[777]["scsi1"] = volume + ",size=5G"
+	if client.volumeNodes != nil {
+		client.volumeNodes[volume] = "n1"
+	}
 	frozenPlan, err := activeStorageAllocationPlan(prior)
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +290,7 @@ func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) 
 		t.Fatal(err)
 	}
 	vmID := handle.Record().ID
-	step, err := storageMutationIntent(handle, "vm.ephemeral.scsi1", aj.Target{Node: "n1", VMID: 777, Storage: "a", Backing: "nfs://nas/a", IntendedVolume: volume}, nil)
+	step, err := storageMutationIntent(handle, "vm.ephemeral.scsi1", aj.Target{Node: "n1", VMID: 777, Storage: "a", Backing: definition.BackingKey(), IntendedVolume: volume}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,6 +313,11 @@ func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) 
 	}
 	client.state.configs[777]["description"] = marker
 	client.state.configs[777]["tags"] = tagRetainEphemeral
+	return deps, client, journal, vmID, intent
+}
+
+func TestManagedVMNormalDeleteRetainsEphemeralAndClosesGeneration(t *testing.T) {
+	deps, client, journal, vmID, intent := retainDeleteFixture(t)
 	if _, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{}); err != nil {
 		report, auditErr := AuditStorageAllocations(context.Background(), deps, journal, []string{"n1", "n2"})
 		t.Fatalf("%v audit=%+v auditerr=%v", err, report, auditErr)

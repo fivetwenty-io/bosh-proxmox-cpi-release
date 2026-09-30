@@ -7,6 +7,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -186,6 +187,66 @@ func writeManagedDiskHolder(ctx context.Context, deps Deps, rd resolvedDisk, nod
 	}
 	return nil
 }
+
+// healMovedDiskProvenance runs before a detach transfers a managed disk to a
+// parker. A holder that was moved between nodes outside BOSH still carries a
+// provenance entry naming its old node, while rd carries the entry rebuilt on
+// the node the holder runs on now, and the removal after the transfer
+// compares against the rebuilt entry exactly. When the two differ in Node
+// alone and a fresh audit accepts the disk's move on shared storage, the
+// entry is rewritten on the holder's current node and the transfer proceeds.
+// Without that move the detach refuses here, while the disk is still
+// attached. Any other difference is left to the removal's own check.
+func healMovedDiskProvenance(ctx context.Context, deps Deps, node string, vmid int, rd resolvedDisk) error {
+	if rd.allocation == nil {
+		return nil
+	}
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil || cfg == nil {
+		return cpierrors.Cloud("managed disk holder provenance cannot be read before transfer; audit required")
+	}
+	entries, err := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(cfg))
+	if err != nil {
+		return cpierrors.Cloud("managed disk holder provenance is malformed; audit required")
+	}
+	stored, found := entries[rd.sentinelKey()]
+	current := rd.allocation.provenance
+	relocated := stored
+	relocated.Node = current.Node
+	if !found || stored == current || relocated != current {
+		return nil
+	}
+	// The audit only reads, so it runs beneath the lifecycle decorators the
+	// way the parker sweep does; the rewrite below stays journaled.
+	reader := deps
+	reader.PVE = unguardedPVE(deps.PVE)
+	journal, err := openStorageAllocationJournal(ctx, reader, []string{node})
+	if err != nil {
+		return err
+	}
+	audit, err := AuditStorageAllocations(ctx, reader, journal, []string{node})
+	if closeErr := journal.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if !audit.observedMove(current.AllocationID, node) {
+		return cpierrors.Cloud("detach refused before transfer: disk allocation %s (volume %s) held by VM %d on %s, provenance names %s, and the allocation audit accepted no move on shared storage; the disk stays attached", current.AllocationID, current.Volid, vmid, node, storageAuditField(stored.Node))
+	}
+	if err := pve.WriteDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), current); err != nil {
+		return cpierrors.Cloud("managed disk holder provenance could not be moved to %s before transfer; audit required", node)
+	}
+	deps.Log(ctx).Info("detach_disk: moved disk provenance to the holder's current node",
+		log.String("allocation_id", current.AllocationID),
+		log.String("volid", current.Volid),
+		log.Int("vmid", vmid),
+		log.String("recorded_node", storageAuditField(stored.Node)),
+		log.String("node", node),
+	)
+	return nil
+}
+
 func verifyManagedDiskParked(ctx context.Context, deps Deps, rd resolvedDisk, volid string) error {
 	if rd.allocation == nil {
 		return nil

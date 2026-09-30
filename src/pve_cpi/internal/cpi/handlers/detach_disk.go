@@ -361,6 +361,11 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return retriableUnlessPermanent(ovErr,
 			fmt.Sprintf("detach_disk: read recorded option overrides for disk %s before transfer", rd.diskCID))
 	}
+	// A holder moved outside BOSH still names its old node; heal that before
+	// the transfer, because the removal after it cannot be undone halfway.
+	if err := healMovedDiskProvenance(ctx, deps, node, vmid, rd); err != nil {
+		return err
+	}
 	parkerCfg := parkerWriteConfigFor(deps)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay})
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerCfg, pctx)
