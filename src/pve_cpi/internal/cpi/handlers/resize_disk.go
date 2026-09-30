@@ -465,7 +465,7 @@ func waitForResizeConvergence(
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	interval := resizeConvergencePollInterval()
+	interval := resizeConvergencePollInterval(ctx)
 	for {
 		cfg, err := deps.PVE.QEMU().Config(cctx, node, vmid)
 		if err != nil {

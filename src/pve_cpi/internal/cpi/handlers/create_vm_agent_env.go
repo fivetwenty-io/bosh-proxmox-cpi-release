@@ -366,9 +366,9 @@ func waitUntilAgentReady(
 
 	// Compute effective poll interval. The configured value of 0 is valid
 	// ("no explicit preference") but must not produce a tight busy-loop in
-	// production. Apply the package-level floor; tests may lower it to zero.
+	// production. Apply the floor, which tests may lower through the context.
 	effectiveInterval := time.Duration(intervalSec) * time.Second
-	if floor := healthPollMinInterval(); effectiveInterval < floor {
+	if floor := healthPollMinInterval(ctx); effectiveInterval < floor {
 		effectiveInterval = floor
 	}
 

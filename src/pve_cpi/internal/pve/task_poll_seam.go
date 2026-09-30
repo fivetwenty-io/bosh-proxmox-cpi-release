@@ -78,7 +78,8 @@ func taskPollDefaults() (intervalMs, maxIntervalMs, jitterPct int) {
 }
 
 // SetTaskPollingForTest overrides the poll cadence for a test and returns a
-// restore function. Mirrors SetHealthPollMinInterval.
+// restore function. A test that changes it must not run in parallel with tests
+// that await a task.
 //
 //	defer pve.SetTaskPollingForTest(1, 1, 0)()
 func SetTaskPollingForTest(intervalMs, maxIntervalMs, jitterPct int) func() {
