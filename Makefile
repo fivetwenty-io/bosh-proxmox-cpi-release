@@ -91,9 +91,9 @@ tidy: ## Run go mod tidy
 ##@ Testing
 
 .PHONY: test
-test: ## Run all tests with race detection
+test: ## Run all tests with race detection and write the coverage profile
 	@echo "$(GREEN)Running tests...$(RESET)"
-	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=900s ./...
+	@cd $(SRC_ROOT) && go test -race -count=1 -timeout=900s -covermode=atomic -coverprofile=coverage.out ./...
 	@echo "$(GREEN)✓ Tests passed$(RESET)"
 
 .PHONY: coverage
@@ -110,7 +110,7 @@ coverage-html: coverage ## Generate HTML coverage report
 	@echo "$(GREEN)✓ $(SRC_ROOT)/coverage.html written$(RESET)"
 
 .PHONY: coverage-check
-coverage-check: coverage ## Fail if total line coverage < $(COVERAGE_THRESHOLD)%
+coverage-check: test ## Fail if the race test run's total line coverage < $(COVERAGE_THRESHOLD)%
 	@echo "$(GREEN)Checking coverage threshold ($(COVERAGE_THRESHOLD)%)...$(RESET)"
 	@total=$$(cd $(SRC_ROOT) && go tool cover -func=coverage.out | grep '^total:' | awk '{print $$3}' | tr -d '%'); \
 	echo "Total coverage: $${total}%"; \
@@ -238,7 +238,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
 .PHONY: check
-check: artifacts-check linear-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check test ## Run artifact, formatting, vet, blob, template, Python, analysis, coverage, and race checks
+check: artifacts-check linear-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check ## Run artifact, formatting, vet, blob, template, Python, analysis, and race-test-with-coverage checks
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

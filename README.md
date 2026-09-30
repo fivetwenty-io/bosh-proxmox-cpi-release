@@ -164,11 +164,11 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | Target | Description |
 |---|---|
 | `make build` | Compile `bin/cpi` with version ldflags (alias `make bin/cpi`) |
-| `make test` | Run all Go tests with race detection |
+| `make test` | Run all Go tests with race detection and write `src/pve_cpi/coverage.out` |
 | `make coverage` | Generate coverage profile and print a function-level summary |
 | `make coverage-html` | Write HTML coverage report to `src/pve_cpi/coverage.html` |
 | `make coverage-check` | Fail if total line coverage falls below `COVERAGE_THRESHOLD` |
-| `make check` | Run `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` |
+| `make check` | Run `vet`, `staticcheck`, `lint`, `test`, and `coverage-check` |
 | `make bats` | Run the BOSH Acceptance Tests against the configured PVE lab |
 | `make fmt` | Format all Go sources with `gofmt` |
 | `make lint` | Run `golangci-lint` (pinned version via `go run` fallback) |
@@ -184,7 +184,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 
 ### CI gating
 
-CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `coverage-check`, and `test` in that order, stopping at the first failure. `COVERAGE_THRESHOLD` is `80`.
+CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `test`, and `coverage-check` in that order, stopping at the first failure. `COVERAGE_THRESHOLD` is `80`.
 
 Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocations must run from there; the `make` targets re-root automatically.
 
