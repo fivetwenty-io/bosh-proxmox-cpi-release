@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"unicode"
 	"unicode/utf8"
 
@@ -60,23 +61,33 @@ func (t *managedPoolService) existingPool(ctx context.Context, poolID string) (b
 // changing the pool. Generic conflicts, substrings and transport failures are
 // insufficient, even if a later read happens to find the requested pool.
 func exactPoolAlreadyExists(err error, poolID string) bool {
-	return exactPoolVerdict(err, "create pool failed", "pool '"+poolID+"' already exists")
+	verdict := "pool '" + poolID + "' already exists"
+	return exactPoolVerdict(err, verdict, "create pool failed: "+verdict)
 }
 
 // exactPoolDoesNotExist is the delete-side counterpart. Pool.pm raises it under
 // the same lock, before it deletes anything.
 func exactPoolDoesNotExist(err error, poolID string) bool {
-	return exactPoolVerdict(err, "delete pool failed", "pool '"+poolID+"' does not exist")
+	verdict := "pool '" + poolID + "' does not exist"
+	return exactPoolVerdict(err, verdict, "delete pool failed: "+verdict)
+}
+
+// exactPoolReadMissing matches the verdict a GET /pools/{poolid} returns for a
+// missing pool. read_pool reuses the index handler, which raises the verdict
+// outside lock_user_config, so it carries no prefix.
+func exactPoolReadMissing(err error, poolID string) bool {
+	return exactPoolVerdict(err, "pool '"+poolID+"' does not exist")
 }
 
 // exactPoolVerdict matches a Pool.pm verdict as a whole message. Pool.pm raises
-// each verdict inside lock_user_config, which re-raises it as "<errmsg>:
-// <verdict>", so a live cluster answers HTTP 500 with the prefixed form in the
-// body's message field. The bare verdict is accepted as well because it names
-// the same condition on the same pool. One trailing whitespace character, which
-// is the newline Perl's die carries, is tolerated. Anything else, including a
-// second trailing character, extra text, or a field-error map, is not proof.
-func exactPoolVerdict(err error, errmsg, verdict string) bool {
+// its create and delete verdicts inside lock_user_config, which re-raises them
+// as "<errmsg>: <verdict>", so a live cluster answers HTTP 500 with the
+// prefixed form in the body's message field. The bare verdict is accepted as
+// well because it names the same condition on the same pool. One trailing
+// whitespace character, which is the newline Perl's die carries, is tolerated.
+// Anything else, including a second trailing character, extra text, or a
+// field-error map, is not proof.
+func exactPoolVerdict(err error, accepted ...string) bool {
 	var apiErr *sdkerrors.APIError
 	if !errors.As(err, &apiErr) || apiErr.HTTPCode != http.StatusInternalServerError || len(apiErr.Errors) != 0 {
 		return false
@@ -85,5 +96,5 @@ func exactPoolVerdict(err error, errmsg, verdict string) bool {
 	if last, size := utf8.DecodeLastRuneInString(message); size > 0 && unicode.IsSpace(last) {
 		message = message[:len(message)-size]
 	}
-	return message == verdict || message == errmsg+": "+verdict
+	return slices.Contains(accepted, message)
 }

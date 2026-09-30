@@ -91,35 +91,89 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	if m == nil {
 		return operationErr
 	}
+	cleanTimeout := m.cleanLockTimeout(operationErr)
 	if m.guard != nil {
 		operationErr = errors.Join(operationErr, m.guard.Err())
 	}
 	var finalErr error
-	if operationErr != nil {
+	switch {
+	case cleanTimeout:
+		// The wait ran out before this operation changed anything it cannot
+		// account for, so the allocation is returned to the Director exactly as
+		// a success would return it, and the retriable timeout goes back for
+		// the Director to retry.
+		finalErr = m.completeOwned(ctx, false)
+		if finalErr != nil {
+			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a lock timeout failed"))
+		}
+	case operationErr != nil:
 		finalErr = m.session.Uncertain("operation did not complete")
-	} else {
-		var proof aj.Verification
-		if deleted {
-			proof, finalErr = m.deletionProof(ctx)
-		} else {
-			var current resolvedDisk
-			current, finalErr = resolveDiskForOp(ctx, m.deps, "lifecycle_complete", m.disk.diskCID, m.disk.birth, m.disk.meta)
-			if finalErr == nil {
-				proof, finalErr = managedDiskOwnershipProof(current)
-			}
-		}
-		if finalErr == nil {
-			finalErr = m.session.Finish(proof, deleted)
-		}
+	default:
+		finalErr = m.completeOwned(ctx, deleted)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit failed"))
 		}
 	}
-	result := errors.Join(operationErr, finalErr, m.handle.Close(), m.journal.Close())
-	if result != nil {
+	closeErr := errors.Join(m.handle.Close(), m.journal.Close())
+	result := errors.Join(operationErr, finalErr, closeErr)
+	returned := cleanTimeout && finalErr == nil && closeErr == nil
+	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")
 	}
 	return result
+}
+
+// managedLockWaitContext lets a journal-managed operation wait out a whole
+// parker window that another request holds. The default wait is 15 seconds,
+// while a holder's window may run for most of the lock's 180-second TTL. The
+// window budget is the TTL less about 85 seconds reserved for the sweep, the
+// protection restore, and the release. A waiter that gives up early fails its
+// Director task even though nothing went wrong. Waiting a full TTL is the
+// shortest wait that outlasts any single holder, live or crashed, because a
+// claim that outlives its TTL is stolen. A queue of several holders can still
+// outlast it, and that timeout is settled cleanly by cleanLockTimeout.
+func managedLockWaitContext(ctx context.Context) context.Context {
+	return pve.WithParkerLockWait(ctx, managedLockWait)
+}
+
+// managedLockWait is the wait managedLockWaitContext sets. Tests shorten it,
+// and production leaves it at the lock's TTL.
+var managedLockWait = pve.ParkerProtectionLockTTL
+
+// completeOwned closes the session with fresh evidence of the disk's current
+// disposition: its absence after a delete, and its ownership otherwise.
+func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) error {
+	var proof aj.Verification
+	var err error
+	if deleted {
+		proof, err = m.deletionProof(ctx)
+	} else {
+		var current resolvedDisk
+		current, err = resolveDiskForOp(ctx, m.deps, "lifecycle_complete", m.disk.diskCID, m.disk.birth, m.disk.meta)
+		if err == nil {
+			proof, err = managedDiskOwnershipProof(current)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return m.session.Finish(proof, deleted)
+}
+
+// cleanLockTimeout reports whether an operation failed only because a cluster
+// lock wait ran out, with nothing left uncertain. That takes three things: the
+// failure carries pve.ErrClusterLockTimeout, the guard was never poisoned, and
+// every step the operation journaled has been observed. A timeout is positive
+// evidence that another request held the lock throughout, so this request
+// never entered the window it was waiting for.
+func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
+	if operationErr == nil || !errors.Is(operationErr, pve.ErrClusterLockTimeout) {
+		return false
+	}
+	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {
+		return false
+	}
+	return storageLifecycleSettled(m.handle.Record()) == nil
 }
 
 func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verification, error) {

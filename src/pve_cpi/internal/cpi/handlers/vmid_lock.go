@@ -65,7 +65,9 @@ func withVMIDLock(
 	}
 
 	lockName := fmt.Sprintf("vm-%d", vmid)
-	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, owner, vmidLockTTL, vmidLockTimeout)
+	// Callers name the operation and the VMID. The pid and sequence make the
+	// claim unique to this acquisition, which a guarded create relies on.
+	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, pve.ProcessLockOwner(owner), vmidLockTTL, vmidLockTimeout)
 	if err != nil {
 		return err
 	}

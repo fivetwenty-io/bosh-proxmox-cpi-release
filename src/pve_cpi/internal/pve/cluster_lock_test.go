@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -525,4 +526,26 @@ func TestRelease_CommentNamesAnotherOwner_LeavesSentinel(t *testing.T) {
 // disambiguation supply their own fake.
 func (f *fakeLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
+}
+
+// TestProcessLockOwner_IsUniquePerAcquisition pins the invariant a guarded
+// sentinel create relies on: two acquirers never write the same claim, even
+// in one process and one second, and the token never contains the space the
+// sentinel comment is split on.
+func TestProcessLockOwner_IsUniquePerAcquisition(t *testing.T) {
+	first := ProcessLockOwner("unpark/90000")
+	second := ProcessLockOwner("unpark/90000")
+	if first == second {
+		t.Fatalf("two acquisitions share the owner token %q", first)
+	}
+	pid := fmt.Sprintf("@%d-", os.Getpid())
+	for _, owner := range []string{first, second} {
+		if !strings.HasPrefix(owner, "unpark/90000"+pid) || strings.ContainsAny(owner, " \t\n") {
+			t.Fatalf("owner token %q does not name the caller and this process", owner)
+		}
+		got, ok := decodeLockOwner(encodeLockComment(owner, time.Now()))
+		if !ok || got != owner {
+			t.Fatalf("owner token %q does not survive the sentinel comment: %q", owner, got)
+		}
+	}
 }

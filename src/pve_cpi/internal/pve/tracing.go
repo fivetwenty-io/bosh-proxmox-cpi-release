@@ -642,6 +642,18 @@ func (t *tracedPoolService) DeletePool(ctx context.Context, poolID string) (err 
 	return t.PoolService.DeletePool(ctx, poolID)
 }
 
+// ReadPoolComment forwards RawPoolCommentReader. A wrapped service that cannot
+// read raw fails the read, which callers proving absence treat as unreadable.
+func (t *tracedPoolService) ReadPoolComment(ctx context.Context, poolID string) (comment string, err error) {
+	ctx, span := t.tracer.Start(ctx, "pve.pools.read_pool_comment", trace.WithAttributes(attribute.String("pve.pool_id", poolID)))
+	defer func() { finishSpan(span, err) }()
+	reader, ok := t.PoolService.(RawPoolCommentReader)
+	if !ok {
+		return "", errors.New("wrapped pool service cannot read a pool comment raw")
+	}
+	return reader.ReadPoolComment(ctx, poolID)
+}
+
 func (t *tracedPoolService) GetPoolComment(ctx context.Context, poolID string) (comment string, found bool, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.pools.get_pool_comment", trace.WithAttributes(attribute.String("pve.pool_id", poolID)))
 	defer func() { finishSpan(span, err) }()

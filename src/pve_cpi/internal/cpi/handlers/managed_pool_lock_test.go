@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -48,6 +49,32 @@ func newLockContention(t *testing.T) *lockContention {
 	return &lockContention{t: t, pools: map[string]string{}, held: make(chan struct{}), rejected: make(chan struct{})}
 }
 
+// reset empties the store and rearms its signals for the next round.
+func (l *lockContention) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pools = map[string]string{}
+	l.creates, l.rejections = 0, 0
+	l.heldAt = time.Time{}
+	l.held, l.rejected = make(chan struct{}), make(chan struct{})
+	l.heldOnce, l.rejectOnce = sync.Once{}, sync.Once{}
+}
+
+// waitNextSecond waits until the wall clock has left the second in which the
+// holder took its lock. Claims carry a one-second expiry, and both requests in
+// a test share one process, so a waiter that started in the same second could
+// stamp a claim that differs from the holder's only by the owner sequence.
+// Separate CPI processes differ by pid as well; waiting keeps the two claims
+// apart on the expiry too, which is the shape production contention has.
+func (l *lockContention) waitNextSecond() {
+	l.mu.Lock()
+	heldAt := l.heldAt
+	l.mu.Unlock()
+	for time.Now().Unix() <= heldAt.Unix() {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // contendedPools routes every bosh-lock- sentinel call to the shared store and
 // leaves every other pool call on the fixture's own pool service.
 type contendedPools struct {
@@ -88,6 +115,21 @@ func (p contendedPools) DeletePool(ctx context.Context, id string) error {
 	}
 	delete(l.pools, id)
 	return nil
+}
+
+// ReadPoolComment answers a missing sentinel with the verdict read_pool sends,
+// which carries no lock_user_config prefix.
+func (p contendedPools) ReadPoolComment(ctx context.Context, id string) (string, error) {
+	if !strings.HasPrefix(id, reservedPoolLockPrefix) {
+		return "", errors.New("raw reads are only served for sentinels")
+	}
+	p.locks.mu.Lock()
+	defer p.locks.mu.Unlock()
+	comment, found := p.locks.pools[id]
+	if !found {
+		return "", livePoolVerdict(p.locks.t, "pool '"+id+"' does not exist")
+	}
+	return comment, nil
 }
 
 func (p contendedPools) GetPoolComment(ctx context.Context, id string) (string, bool, error) {
@@ -172,17 +214,7 @@ func TestManagedParkWaitsOutAHeldParkerLock(t *testing.T) {
 		_, holderErr = holder.execute(t.Context(), holderHandle)
 	}()
 	waitFor(t, locks.held, "the holder to take the parker lock")
-	// Both requests run in this one process, so they share the owner token
-	// "park/<pid>/<parker>", and a claim's expiry has one-second resolution. A
-	// waiter that started in the holder's second would stamp the holder's exact
-	// claim, which the guard rightly reads as its own create having landed.
-	// Separate CPI processes never share a pid, so start the waiter one second on.
-	locks.mu.Lock()
-	heldAt := locks.heldAt
-	locks.mu.Unlock()
-	for time.Now().Unix() <= heldAt.Unix() {
-		time.Sleep(20 * time.Millisecond)
-	}
+	locks.waitNextSecond()
 
 	wg.Add(1)
 	go func() {
@@ -290,5 +322,32 @@ func TestManagedVMGuardWaitsOutAHeldAntiAffinityLock(t *testing.T) {
 	defer locks.mu.Unlock()
 	if len(locks.pools) != 0 {
 		t.Fatalf("sentinel left behind: %v", locks.pools)
+	}
+}
+
+// TestManagedVMGuardRefusesOtherSentinelDeletes keeps the VM guard's delete
+// admission to the anti-affinity lock. A parker's or a VMID's sentinel belongs
+// to a lock a VM allocation never takes, so deleting one is refused before it
+// reaches PVE.
+func TestManagedVMGuardRefusesOtherSentinelDeletes(t *testing.T) {
+	for _, sentinel := range []string{pve.ClusterLockPoolName("vm-90000"), pve.ClusterLockPoolName("vm-101"), pve.ClusterLockPoolName("storage-a")} {
+		t.Run(sentinel, func(t *testing.T) {
+			m, fixture, _, _ := newManagedVMGuardCase(t, managedVMGuardCase{})
+			locks := newLockContention(t)
+			locks.pools[sentinel] = "owner=parker@1-1 exp=9999999999"
+			m.deps.PVE = lockedVMClient{managedVMGuardFixture: fixture, locks: locks}
+			m.guard = nil
+			if err := m.newGuard(); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.guard.Client().Pools().DeletePool(t.Context(), sentinel); err == nil || m.guard.Err() == nil {
+				t.Fatalf("the VM guard admitted a delete of %s", sentinel)
+			}
+			locks.mu.Lock()
+			defer locks.mu.Unlock()
+			if _, present := locks.pools[sentinel]; !present {
+				t.Fatalf("%s was deleted", sentinel)
+			}
+		})
 	}
 }

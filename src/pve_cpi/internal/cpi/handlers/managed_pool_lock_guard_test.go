@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // lockGuardPools is a scripted pool service for the guard's own classification.
@@ -19,8 +22,37 @@ type lockGuardPools struct {
 	readErr     error
 	deleteFound bool
 	successor   string
-	calls       []string
+	// rawErr, when set, is what a raw read answers instead of the state.
+	rawErr error
+	// createGone and createDisplaced model a stealer acting between a
+	// successful create and its readback.
+	createGone, createDisplaced bool
+	// plain hides the raw read from the guard.
+	plain bool
+	calls []string
 }
+
+// poolVerdictError is PVE's 500 answer carrying message, as the SDK wraps it.
+func poolVerdictError(message string) error {
+	body, _ := json.Marshal(map[string]any{"data": nil, "message": message + "\n"})
+	return fmt.Errorf("API request failed: %w", sdkerrors.ParseAPIError(500, body))
+}
+
+func (p *lockGuardPools) ReadPoolComment(_ context.Context, id string) (string, error) {
+	p.calls = append(p.calls, "raw:"+id)
+	switch {
+	case p.rawErr != nil:
+		return "", p.rawErr
+	case p.readErr != nil:
+		return "", p.readErr
+	case !p.found:
+		return "", poolVerdictError("pool '" + id + "' does not exist")
+	}
+	return p.comment, nil
+}
+
+// plainPools hides the raw read, like a pool service that cannot offer one.
+type plainPools struct{ pve.PoolService }
 
 func (p *lockGuardPools) CreatePool(_ context.Context, id, comment string) error {
 	p.calls = append(p.calls, "create:"+id)
@@ -28,6 +60,12 @@ func (p *lockGuardPools) CreatePool(_ context.Context, id, comment string) error
 		return p.createErr
 	}
 	p.comment, p.found = comment, true
+	switch {
+	case p.createGone:
+		p.found = false
+	case p.createDisplaced:
+		p.comment = "owner=stealer exp=9"
+	}
 	return nil
 }
 
@@ -53,7 +91,12 @@ type lockGuardClient struct {
 	pools *lockGuardPools
 }
 
-func (c lockGuardClient) Pools() pve.PoolService { return c.pools }
+func (c lockGuardClient) Pools() pve.PoolService {
+	if c.pools.plain {
+		return plainPools{c.pools}
+	}
+	return c.pools
+}
 
 type lockGuardEvents struct {
 	after   []any
@@ -133,6 +176,8 @@ func TestManagedLockCreateFailuresStayUncertain(t *testing.T) {
 		comment string
 		found   bool
 		readErr error
+		rawErr  error
+		plain   bool
 		after   func(context.Context, ManagedAllocationMutation, any) error
 	}{
 		{name: "operator pool duplicate", pool: "bosh-director", err: func(t *testing.T) error {
@@ -154,6 +199,15 @@ func TestManagedLockCreateFailuresStayUncertain(t *testing.T) {
 		{name: "holder unreadable", pool: lockGuardPool, err: func(t *testing.T) error {
 			return livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
 		}, readErr: errors.New("read failed")},
+		{name: "holder read answers loosely", pool: lockGuardPool, err: func(t *testing.T) error {
+			return livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
+		}, comment: "owner=holder exp=1", found: true, rawErr: errors.New("pools.GetPools: pool '" + lockGuardPool + "' does not exist")},
+		{name: "holder read names another pool", pool: lockGuardPool, err: func(t *testing.T) error {
+			return livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
+		}, rawErr: poolVerdictError("pool 'bosh-lock-vm-1' does not exist")},
+		{name: "pool service offers no raw read", pool: lockGuardPool, err: func(t *testing.T) error {
+			return livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
+		}, comment: "owner=holder exp=1", found: true, plain: true},
 		{name: "journal cannot settle", pool: lockGuardPool, err: func(t *testing.T) error {
 			return livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
 		}, comment: "owner=holder exp=1", found: true, after: func(context.Context, ManagedAllocationMutation, any) error {
@@ -163,7 +217,7 @@ func TestManagedLockCreateFailuresStayUncertain(t *testing.T) {
 	for i := range cases {
 		tc := &cases[i]
 		t.Run(tc.name, func(t *testing.T) {
-			pools := &lockGuardPools{createErr: tc.err(t), comment: tc.comment, found: tc.found, readErr: tc.readErr}
+			pools := &lockGuardPools{createErr: tc.err(t), comment: tc.comment, found: tc.found, readErr: tc.readErr, rawErr: tc.rawErr, plain: tc.plain}
 			events := &lockGuardEvents{afterFn: tc.after}
 			guard := newLockGuard(t, pools, events)
 			err := guard.Client().Pools().CreatePool(t.Context(), tc.pool, "owner=waiter exp=2")
@@ -172,6 +226,54 @@ func TestManagedLockCreateFailuresStayUncertain(t *testing.T) {
 			}
 			if errors.Is(err, pools.createErr) {
 				t.Fatal("an uncertain failure leaked the upstream error")
+			}
+		})
+	}
+}
+
+// TestManagedLockCreateRefusalAfterRelease covers a holder that released
+// between the refusal and the readback. The readback answers with the exact
+// missing-pool verdict, which still proves the refused create changed nothing.
+func TestManagedLockCreateRefusalAfterRelease(t *testing.T) {
+	refusal := livePoolVerdict(t, "create pool failed: pool '"+lockGuardPool+"' already exists")
+	pools := &lockGuardPools{createErr: refusal}
+	events := &lockGuardEvents{}
+	guard := newLockGuard(t, pools, events)
+	if err := guard.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=waiter exp=2"); !unchangedError(err, refusal) {
+		t.Fatalf("refusal was replaced: %v", err)
+	}
+	if guard.Err() != nil || events.failed != 0 {
+		t.Fatalf("a released holder poisoned the guard: %v", guard.Err())
+	}
+}
+
+// TestManagedLockCreateDisplacedAfterSuccess covers a stealer that acts between
+// a successful create and its readback. PVE accepted the create, so the step
+// is observed whatever the readback finds, and the lock code's own
+// verification decides who holds the lock. Only an unreadable sentinel stays
+// uncertain.
+func TestManagedLockCreateDisplacedAfterSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pools    *lockGuardPools
+		poisoned bool
+	}{
+		{name: "sentinel gone", pools: &lockGuardPools{createGone: true}},
+		{name: "another claim", pools: &lockGuardPools{createDisplaced: true}},
+		{name: "readback fails", pools: &lockGuardPools{readErr: errors.New("read failed")}, poisoned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := &lockGuardEvents{}
+			guard := newLockGuard(t, tc.pools, events)
+			err := guard.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=me exp=1")
+			if tc.poisoned {
+				if err == nil || guard.Err() == nil || events.failed != 1 {
+					t.Fatalf("an unreadable sentinel was accepted: %v", err)
+				}
+				return
+			}
+			if err != nil || guard.Err() != nil || events.failed != 0 {
+				t.Fatalf("a displaced create poisoned the guard: err=%v poison=%v", err, guard.Err())
 			}
 		})
 	}
@@ -242,9 +344,14 @@ func TestManagedLifecycleLockObservation(t *testing.T) {
 	pools := &lockGuardPools{found: true, comment: "owner=waiter exp=2"}
 	guard := managedDiskLifecycleGuard{lifecycle: &managedDiskLifecycle{deps: Deps{PVE: lockGuardClient{pools: pools}}, disk: resolvedDisk{volid: volume}}}
 	create := ManagedAllocationMutation{Service: managedDiskServicePool, Method: "CreatePool", Args: map[string]any{managedArgumentPoolID: lockGuardPool, "comment": "owner=me exp=1"}}
-	if _, err := guard.observePool(t.Context(), create, nil); err == nil {
-		t.Fatal("another owner's sentinel was read as our create")
+	if _, err := guard.observePool(t.Context(), create, nil); err != nil {
+		t.Fatalf("a create displaced before its readback was not observed: %v", err)
 	}
+	pools.readErr = errors.New("read failed")
+	if _, err := guard.observePool(t.Context(), create, nil); err == nil {
+		t.Fatal("an unreadable sentinel was observed as our create")
+	}
+	pools.readErr = nil
 	volumes, err := guard.observePool(t.Context(), create, managedLockPoolRejection{poolID: lockGuardPool, method: "CreatePool"})
 	if err != nil || len(volumes) != 1 || volumes[0] != volume {
 		t.Fatalf("refused create was not settled: %v %v", volumes, err)

@@ -186,6 +186,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		}
 		if lifecycle != nil {
 			rd = lifecycle.disk
+			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 		if rd.stableID != "" {

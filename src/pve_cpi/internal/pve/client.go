@@ -210,6 +210,33 @@ func (s *sdkPoolService) GetPoolComment(ctx context.Context, poolID string) (str
 	return *resp.Comment, true, nil
 }
 
+// RawPoolCommentReader reads a pool's comment and returns PVE's error for a
+// missing pool as it arrived, instead of folding it into found=false the way
+// GetPoolComment does. GetPoolComment recognizes absence by a loose text match,
+// which is fine for the pools it serves. A caller that must prove absence
+// applies its own exact classification to the raw error.
+type RawPoolCommentReader interface {
+	ReadPoolComment(ctx context.Context, poolID string) (string, error)
+}
+
+// ReadPoolComment implements RawPoolCommentReader via GET /pools/{poolid}.
+func (s *sdkPoolService) ReadPoolComment(ctx context.Context, poolID string) (string, error) {
+	if poolID == "" {
+		return "", cpierrors.Cloud("PoolService.ReadPoolComment: poolID must not be empty")
+	}
+	resp, err := s.svc.GetPools(ctx, poolID, nil)
+	if err != nil {
+		return "", err
+	}
+	if resp == nil {
+		return "", cpierrors.Cloud("PoolService.ReadPoolComment: empty response for pool %q", poolID)
+	}
+	if resp.Comment == nil {
+		return "", nil
+	}
+	return *resp.Comment, nil
+}
+
 // PoolHasVM implements PoolService.PoolHasVM via GET /pools/{poolid},
 // decoding the members list and matching on vmid. See the interface doc.
 func (s *sdkPoolService) PoolHasVM(ctx context.Context, poolID string, vmid int64) (bool, error) {

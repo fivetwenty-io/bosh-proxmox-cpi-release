@@ -36,8 +36,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -320,6 +322,19 @@ func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	}
 	h.released = true
 	return nil
+}
+
+// lockOwnerSeq numbers the owner tokens ProcessLockOwner issues in this process.
+var lockOwnerSeq atomic.Uint64
+
+// ProcessLockOwner qualifies a caller's owner token with this process's pid and
+// a per-process sequence, so no two acquirers anywhere write the same claim.
+// Two CPI processes that lock the same key in the same second would otherwise
+// stamp byte-identical claims, and a caller that compares claims could not
+// tell the holder's sentinel from its own. The token must not contain spaces,
+// because the sentinel comment is split on them.
+func ProcessLockOwner(owner string) string {
+	return fmt.Sprintf("%s@%d-%d", owner, os.Getpid(), lockOwnerSeq.Add(1))
 }
 
 // ErrClusterLockTimeout marks the acquire that ran out its timeout waiting for a

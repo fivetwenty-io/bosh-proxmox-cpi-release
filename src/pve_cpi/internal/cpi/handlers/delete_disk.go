@@ -279,6 +279,7 @@ func HandleDeleteDisk(deps Deps) Handler {
 		}
 		if lifecycle != nil {
 			rd = lifecycle.disk
+			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, true) }()
 		}
 		rd, err = resumeTransferIfNeeded(ctx, deps, "delete_disk", rd)
