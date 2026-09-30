@@ -70,6 +70,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - A `delete_vm` that fails partway through disposing of a journal-managed VM no longer invites a retry that can only be refused. When the failure itself was retriable, such as a destroy task that timed out, the Director read that retriable error and retried the delete, and the retry was refused because the VM's allocation already required reconciliation. For a retriable failure, the first error the Director sees now says that the allocation requires reconciliation, and it is not retriable, while the original cause still follows it in the same error. A failure that was never retriable, such as an audit refusal, keeps its own message first, so the Director still shows what the audit found. A failure with no CPI error type of its own used to show only the reconciliation notice, and it now shows its own text as a non-retriable error ahead of that notice.
 
+- Log and error scrubbing now also masks a `PVEAPIToken` or `PVEAuthCookie` value when the name follows a percent escape such as `%20` or an underscore, when a blank sits before the `=`, or when the value sits on the line after it. Before this, those forms reached Director messages, CLI output, and the CPI's logs with the value intact. The argument trees that the allocation journal fingerprints, and that the opt-in request trace logs, keep their current rule, so this change leaves the fingerprints as they were.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added

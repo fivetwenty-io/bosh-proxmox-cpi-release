@@ -351,7 +351,8 @@ func TestScrubMessageMasksPVECredentialHeaders(t *testing.T) {
 		if !strings.Contains(out, tc.keep) {
 			t.Errorf("ScrubMessage(%q) = %q, want it to keep %q", tc.in, out, tc.keep)
 		}
-		// The log field and the argument-tree redactor share the same rules.
+		// The log field shares these rules, and the argument-tree redactor
+		// masks every one of these forms the same way.
 		if field := log.ErrScrubbed(errors.New(tc.in)).Value.String(); field != out {
 			t.Errorf("ErrScrubbed(%q) = %q, want %q", tc.in, field, out)
 		}
@@ -360,6 +361,60 @@ func TestScrubMessageMasksPVECredentialHeaders(t *testing.T) {
 		}
 		if again := log.ScrubMessage(out); again != out {
 			t.Errorf("ScrubMessage is not idempotent: %q -> %q", out, again)
+		}
+	}
+}
+
+// TestScrubMessageMasksPVECredentialsWithoutWordBoundary pins the PVE forms
+// that have no word boundary before the name or that set the value off with a
+// line break or a blank before the "=". A name inside URL-encoded text follows
+// a percent escape whose last hex digit is a word character, and a name can
+// follow an underscore. The character before the name stays in the output.
+func TestScrubMessageMasksPVECredentialsWithoutWordBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ in, secret, want string }{
+		{"Authorization%3A%20PVEAPIToken%3Droot%40pam%21cpi%3Dsecret", "secret", "Authorization%3A%20PVEAPIToken%3D" + log.RedactedPlaceholder},
+		{"header%20PVEAPIToken%3Duser%40pve%21id%3Dencoded-token-value&next=1", "encoded-token-value", "header%20PVEAPIToken%3D" + log.RedactedPlaceholder},
+		{"_PVEAuthCookie=ticketsecret", "ticketsecret", "_PVEAuthCookie=" + log.RedactedPlaceholder},
+		{"PVEAPIToken=\nsecret-on-next-line", "secret-on-next-line", "PVEAPIToken=" + log.RedactedPlaceholder},
+		{"PVEAPIToken = secret", "secret", "PVEAPIToken =" + log.RedactedPlaceholder},
+	} {
+		out := log.ScrubMessage(tc.in)
+		if strings.Contains(out, tc.secret) {
+			t.Errorf("ScrubMessage leaks PVE credential %q: %q", tc.secret, out)
+		}
+		if out != tc.want {
+			t.Errorf("ScrubMessage(%q) = %q, want %q", tc.in, out, tc.want)
+		}
+		if field := log.ErrScrubbed(errors.New(tc.in)).Value.String(); field != tc.want {
+			t.Errorf("ErrScrubbed(%q) = %q, want %q", tc.in, field, tc.want)
+		}
+		if again := log.ScrubMessage(out); again != out {
+			t.Errorf("ScrubMessage is not idempotent: %q -> %q", out, again)
+		}
+	}
+}
+
+// TestRedactSecretsKeepsItsPVECredentialRule pins the argument-tree
+// redactor's PVE rule byte for byte. The allocation journal hashes its output
+// into the caller-intent, execution, and agent fingerprints and compares them
+// on a retry, so a wider rule here would turn a retry after an upgrade into a
+// fingerprint mismatch. The log scrubbers mask more forms than this one does.
+func TestRedactSecretsKeepsItsPVECredentialRule(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ in, want string }{
+		{"PVEAPIToken=abc", "PVEAPIToken=" + log.RedactedPlaceholder},
+		{"%20PVEAPIToken%3Dabc", "%20PVEAPIToken%3Dabc"},
+		{"_PVEAuthCookie=abc", "_PVEAuthCookie=abc"},
+		{"PVEAPIToken=\nabc", "PVEAPIToken=\nabc"},
+		{"PVEAPIToken = abc", "PVEAPIToken = abc"},
+	} {
+		in := map[string]any{"message": tc.in, "items": []any{tc.in}}
+		want := map[string]any{"message": tc.want, "items": []any{tc.want}}
+		if got := log.RedactSecrets(in); !reflect.DeepEqual(got, want) {
+			t.Errorf("RedactSecrets(%q) = %#v, want %#v", tc.in, got, want)
 		}
 	}
 }

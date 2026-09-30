@@ -79,7 +79,9 @@ func buildSensitiveQueryParamRegexp() *regexp.Regexp {
 
 // RedactSecrets returns a deep copy of tree with every value under a sensitive
 // key replaced by RedactedPlaceholder and every credential inside a string
-// value masked the way ScrubMessage masks it. Map and slice structure is preserved; the input is
+// value masked the way ScrubMessage masks it, except that PVE token and cookie
+// values follow the narrower treePVECredential rule so the fingerprints built
+// from this output stay stable. Map and slice structure is preserved; the input is
 // never mutated (no map or slice from tree is aliased into the result), so a
 // caller may safely log the result while continuing to use the original.
 //
@@ -106,7 +108,7 @@ func RedactSecrets(tree any) any {
 		}
 		return out
 	case string:
-		return scrubCredentials(t)
+		return redactTreeString(t)
 	default:
 		// Numbers, bools, nil, and any other scalar carry no key context and
 		// cannot themselves be a URL credential — return as-is.
@@ -132,23 +134,45 @@ func keyIsSensitive(key string) bool {
 
 // pveCredential masks the value of a PVE API token header or auth cookie
 // (PVEAPIToken=user@realm!id=secret, PVEAuthCookie=ticket), including a value
-// set off by blanks after the "=" and a URL-encoded "%3D". Neither has a URL
-// shape, so the userinfo and query-parameter rules never see them. The SDK
-// keeps both out of its errors today; this rule is defence in depth for any
-// text that echoes a request header.
-var pveCredential = regexp.MustCompile(`(?i)\b(PVEAPIToken|PVEAuthCookie)(=|%3D)[ \t]*\S+`)
+// set off by whitespace or a line break on either side of the "=" and a
+// URL-encoded "%3D". Neither has a URL shape, so the userinfo and
+// query-parameter rules never see them. The name needs only a non-letter
+// before it, not a word boundary, because in URL-encoded text it follows a
+// percent escape such as "%20" whose last hex digit is a word character. That
+// character is captured and kept in the output. The SDK keeps both values out
+// of its errors today; this rule is defence in depth for any text that echoes
+// a request header.
+var pveCredential = regexp.MustCompile(`(?i)(^|[^A-Za-z])(PVEAPIToken|PVEAuthCookie)(\s*(?:=|%3D))\s*\S+`)
+
+// treePVECredential is the narrower PVE rule RedactSecrets applies. The
+// allocation journal hashes RedactSecrets output into the fingerprints it
+// persists and compares on a retry, so this rule must not change. A different
+// one would make a retry against a generation opened under this rule fail its
+// fingerprint check.
+var treePVECredential = regexp.MustCompile(`(?i)\b(PVEAPIToken|PVEAuthCookie)(=|%3D)[ \t]*\S+`)
+
+// scrubURLCredentials masks the credentials a URL can carry inside a string
+// value: user:pass@ userinfo and a sensitive query parameter such as ?token=
+// or ?password=. It catches secrets embedded under a key whose name is not
+// itself sensitive, such as a blobstore or registry endpoint.
+func scrubURLCredentials(s string) string {
+	s = urlUserinfo.ReplaceAllString(s, "${1}"+RedactedPlaceholder+"@")
+	return sensitiveQueryParam.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
+}
 
 // scrubCredentials masks every credential shape the scrubbers know inside a
-// string value, leaving credential-free text unchanged. It catches secrets
-// embedded under a key whose name is not itself sensitive (a blobstore or
-// registry endpoint carrying either user:pass@ userinfo or a ?token= or
-// ?password= query parameter), and PVE token and cookie values. The log
-// fields, the argument trees, and ScrubMessage all share this one rule set.
+// string value, leaving credential-free text unchanged. The log fields and
+// ScrubMessage share this rule set.
 func scrubCredentials(s string) string {
-	s = urlUserinfo.ReplaceAllString(s, "${1}"+RedactedPlaceholder+"@")
-	s = sensitiveQueryParam.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
-	s = pveCredential.ReplaceAllString(s, "${1}${2}"+RedactedPlaceholder)
-	return s
+	return pveCredential.ReplaceAllString(scrubURLCredentials(s), "${1}${2}${3}"+RedactedPlaceholder)
+}
+
+// redactTreeString masks the credentials inside a string value of an argument
+// or result tree. It masks URL credentials exactly as scrubCredentials does
+// but keeps the narrower treePVECredential rule, because fingerprints hash
+// its output.
+func redactTreeString(s string) string {
+	return treePVECredential.ReplaceAllString(scrubURLCredentials(s), "${1}${2}"+RedactedPlaceholder)
 }
 
 // ScrubMessage returns s with URL-embedded credentials masked (userinfo and
