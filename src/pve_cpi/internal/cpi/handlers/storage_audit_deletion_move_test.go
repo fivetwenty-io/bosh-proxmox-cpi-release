@@ -15,11 +15,12 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
-// These tests cover the window in which delete_vm has taken a moved VM's
-// record out of ready_to_return. The delete admission accepted the move and
-// retained it in its evidence, so the audit keeps reading the VM as moved
-// until the guest is gone. Each test runs the same steps on an unmoved VM as
-// the control and requires the moved VM to behave exactly like it.
+// These tests cover the window in which delete_vm or an explicit cleanup has
+// taken a moved VM's record out of ready_to_return. The admission accepted
+// the move and retained it in its evidence, so the audit keeps reading the VM
+// as moved until the guest is gone. Each test runs the same steps on an
+// unmoved VM as the control and requires the moved VM to behave exactly like
+// it.
 
 // admissionVerification is the evidence a delete admission retains, naming
 // the moves its audit accepted.
@@ -36,11 +37,29 @@ func admissionVerification(t *testing.T, record aj.Record, ownership bool, moves
 	return aj.Verification{EvidenceID: "admission", Complete: true, OwnershipVerified: ownership, EvidenceJSON: string(raw)}
 }
 
+// explicitAdmissionVerification is the evidence an explicit cleanup admission
+// for allocationID retains. It names moves only when its audit accepted one,
+// and it verifies no ownership.
+func explicitAdmissionVerification(t *testing.T, allocationID string, moves ...StorageAllocationMove) aj.Verification {
+	t.Helper()
+	evidence := struct {
+		ObservedMoves []StorageAllocationMove `json:"observed_moves,omitempty"`
+		Operation     string                  `json:"operation"`
+		Decision      map[string]any          `json:"decision"`
+	}{moves, "explicit_cleanup_admission", map[string]any{"action": "cleanup", "allocation_id": allocationID, "decision_id": "incident-proof"}}
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return aj.Verification{EvidenceID: "explicit-admission", Complete: true, EvidenceJSON: string(raw)}
+}
+
 // TestAllocationAuditKeepsTheDeleteAdmissionsMove drives the VM rule's
 // deletion clause on the move fixture, where VM 123 was recorded on pve1 and
 // now runs on pve2. Only a deleting record whose latest ownership-verified
-// admission named this VMID and node keeps the move, and every live
-// condition of the rule still applies to it.
+// delete admission, or latest explicit cleanup admission that accepted a
+// move, named this VMID and node keeps the move, and every live condition of
+// the rule still applies to it.
 func TestAllocationAuditKeepsTheDeleteAdmissionsMove(t *testing.T) {
 	vmMove := func(f *moveFixture, vmid int, node string) StorageAllocationMove {
 		return StorageAllocationMove{AllocationID: f.vm.ID, Kind: "vm", VMID: vmid, RecordedNodes: []string{"pve1"}, ObservedNode: node}
@@ -81,6 +100,22 @@ func TestAllocationAuditKeepsTheDeleteAdmissionsMove(t *testing.T) {
 		{name: "a later admission accepted no move", state: aj.ReconciliationRequired, refusal: "the record is in state reconciliation_required",
 			admit: func(t *testing.T, f *moveFixture) []aj.Verification {
 				return []aj.Verification{admissionVerification(t, f.vm, true, vmMove(f, 123, "pve2")), admissionVerification(t, f.vm, true)}
+			}},
+		{name: "reconciliation after an explicit cleanup accepted pve2", state: aj.ReconciliationRequired,
+			admit: func(t *testing.T, f *moveFixture) []aj.Verification {
+				return []aj.Verification{explicitAdmissionVerification(t, f.vm.ID, vmMove(f, 123, "pve2"))}
+			}},
+		{name: "explicit cleanup that accepted no move", state: aj.ReconciliationRequired, refusal: "the record is in state reconciliation_required",
+			admit: func(t *testing.T, f *moveFixture) []aj.Verification {
+				return []aj.Verification{explicitAdmissionVerification(t, f.vm.ID)}
+			}},
+		{name: "explicit cleanup of another allocation", state: aj.ReconciliationRequired, refusal: "the record is in state reconciliation_required",
+			admit: func(t *testing.T, f *moveFixture) []aj.Verification {
+				return []aj.Verification{explicitAdmissionVerification(t, "another-allocation", vmMove(f, 123, "pve2"))}
+			}},
+		{name: "a delete admission after an explicit cleanup accepted no move", state: aj.ReconciliationRequired, refusal: "the record is in state reconciliation_required",
+			admit: func(t *testing.T, f *moveFixture) []aj.Verification {
+				return []aj.Verification{explicitAdmissionVerification(t, f.vm.ID, vmMove(f, 123, "pve2")), admissionVerification(t, f.vm, true)}
 			}},
 		{name: "submitted records stay strict", state: aj.Submitted, refusal: "the record is in state submitted, not ready_to_return or adopted",
 			admit: func(t *testing.T, f *moveFixture) []aj.Verification {

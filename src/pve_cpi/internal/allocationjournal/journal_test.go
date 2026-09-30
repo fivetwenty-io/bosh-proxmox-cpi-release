@@ -1015,3 +1015,68 @@ func TestAcquireVMResumesGenerationFromFingerprintOnlyIntent(t *testing.T) {
 		t.Fatalf("resume replaced the frozen intent: %+v", record.Intent)
 	}
 }
+
+// TestReturnedRecordGoesStraightToObservedOnlyWithFreshEvidence covers the one
+// write that takes a returned or adopted record straight to observed. It needs
+// a complete verification that proves ownership or absence, the same result
+// the journal already accepts as a write to reconciliation_required followed
+// by a write to observed with that evidence. A returned record still cannot
+// go back to planned or submitted.
+func TestReturnedRecordGoesStraightToObservedOnlyWithFreshEvidence(t *testing.T) {
+	owned := Verification{EvidenceID: "delete-admission", Complete: true, OwnershipVerified: true}
+	absent := Verification{EvidenceID: "delete-admission", Complete: true, AbsenceVerified: true}
+	neither := Verification{EvidenceID: "delete-admission", Complete: true}
+	incomplete := Verification{EvidenceID: "delete-admission", OwnershipVerified: true}
+	for _, tc := range []struct {
+		name     string
+		from     State
+		to       State
+		evidence []Verification
+		accepted bool
+	}{
+		{"ready_to_return with ownership", ReadyToReturn, Observed, []Verification{owned}, true},
+		{"ready_to_return with absence", ReadyToReturn, Observed, []Verification{absent}, true},
+		{"adopted with ownership", Adopted, Observed, []Verification{owned}, true},
+		{"ready_to_return without evidence", ReadyToReturn, Observed, nil, false},
+		{"adopted without evidence", Adopted, Observed, nil, false},
+		{"ready_to_return with evidence that verifies neither", ReadyToReturn, Observed, []Verification{neither}, false},
+		{"ready_to_return with incomplete evidence", ReadyToReturn, Observed, []Verification{incomplete}, false},
+		{"ready_to_return to planned", ReadyToReturn, Planned, []Verification{owned}, false},
+		{"ready_to_return to submitted", ReadyToReturn, Submitted, []Verification{owned}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j, _ := fixture(t)
+			h := acquireVM(t, j)
+			defer closeHandle(t, h)
+			observed(t, h)
+			r := h.Record()
+			r.State = ReadyToReturn
+			r.CID = "node-a/101"
+			save(t, h, r)
+			if tc.from == Adopted {
+				r = h.Record()
+				r.State = Adopted
+				r.Verifications = append(r.Verifications, Verification{EvidenceID: "director-adoption", Complete: true, OwnershipVerified: true})
+				save(t, h, r)
+			}
+			before := h.Record()
+			r = h.Record()
+			r.State = tc.to
+			r.Verifications = append(r.Verifications, tc.evidence...)
+			err := h.Save(r)
+			persisted, inspectErr := j.Inspect(before.ID)
+			if inspectErr != nil {
+				t.Fatal(inspectErr)
+			}
+			if tc.accepted {
+				if err != nil || persisted.State != tc.to || len(persisted.Verifications) != len(before.Verifications)+1 {
+					t.Fatalf("returned record did not reach %s: err=%v state=%s", tc.to, err, persisted.State)
+				}
+				return
+			}
+			if !errors.Is(err, ErrCorrupt) || persisted.State != tc.from || len(persisted.Verifications) != len(before.Verifications) {
+				t.Fatalf("returned record reached %s: err=%v state=%s", tc.to, err, persisted.State)
+			}
+		})
+	}
+}

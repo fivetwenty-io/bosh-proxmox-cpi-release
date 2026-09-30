@@ -119,14 +119,9 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 			admission.OwnershipVerified = true
 		}
 	}
-	if record.State == aj.ReadyToReturn || record.State == aj.Adopted {
-		record.State = aj.ReconciliationRequired
-		record.Reason = "VM deletion admitted; resource disposition pending"
-		if err := handle.Save(record); err != nil {
-			return proof, err
-		}
-		record = handle.Record()
-	}
+	// A returned record goes straight to observed with its admission in one
+	// write, so no failure can leave it out of ready_to_return or adopted
+	// without the admission that accepted its move.
 	if record.State != aj.VMDeletedRetained {
 		record.State = aj.Observed
 	}

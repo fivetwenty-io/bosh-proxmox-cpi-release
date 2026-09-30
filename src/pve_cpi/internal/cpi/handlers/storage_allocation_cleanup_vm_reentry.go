@@ -57,28 +57,39 @@ func cleanupPendingVMDeletion(step aj.Step, record aj.Record) bool {
 	return true
 }
 
-// cleanupVMDeletionAdmittedMove reports whether the latest delete admission
-// of record that verified ownership accepted a move of VM vmid to node. An
-// admission that found the VM absent is skipped, and it plans no stop or
-// destroy that an older move could link. The first admission audit ran while
-// the record was still returned, and it retained the moves it accepted in its
-// evidence. A delete in flight, or one that failed or crashed, leaves the
-// record in planned, observed, or reconciliation, so crash re-entry and the
-// audit's VM move rule both read the admission's verdict instead.
+// cleanupVMDeletionAdmittedMove reports whether the latest admission of
+// record that counts accepted a move of VM vmid to node. A delete admission
+// counts when it verified ownership, and one that found the VM absent is
+// skipped, since it plans no stop or destroy that an older move could link. An
+// operator's explicit cleanup admission counts when it accepted a move, and it
+// needs no verified ownership, because only an audit whose move rule checked
+// the marker, the digest, and the storage could accept one. Both admission
+// audits ran while the record was still returned, and each retained the moves
+// it accepted in its evidence. A delete or cleanup in flight, or one that
+// failed or crashed, leaves the record in planned, observed, or
+// reconciliation, so crash re-entry and the audit's VM move rule both read the
+// admission's verdict instead.
 func cleanupVMDeletionAdmittedMove(record aj.Record, vmid int, node string) bool {
 	var moves []StorageAllocationMove
 	for _, verification := range record.Verifications {
 		var evidence struct {
 			ObservedMoves []StorageAllocationMove `json:"observed_moves"`
-			Facts         struct {
+			Operation     string                  `json:"operation"`
+			Decision      struct {
+				AllocationID string `json:"allocation_id"`
+			} `json:"decision"`
+			Facts struct {
 				Operation    string `json:"operation"`
 				AllocationID string `json:"allocation_id"`
 			} `json:"facts"`
 		}
-		if !verification.Complete || !verification.OwnershipVerified || json.Unmarshal([]byte(verification.EvidenceJSON), &evidence) != nil {
+		if !verification.Complete || json.Unmarshal([]byte(verification.EvidenceJSON), &evidence) != nil {
 			continue
 		}
-		if evidence.Facts.Operation == managedVMCleanupAdmissionOperation && evidence.Facts.AllocationID == record.ID {
+		switch {
+		case verification.OwnershipVerified && evidence.Facts.Operation == managedVMCleanupAdmissionOperation && evidence.Facts.AllocationID == record.ID:
+			moves = evidence.ObservedMoves
+		case evidence.Operation == "explicit_cleanup_admission" && evidence.Decision.AllocationID == record.ID && len(evidence.ObservedMoves) > 0:
 			moves = evidence.ObservedMoves
 		}
 	}

@@ -317,6 +317,20 @@ func validTransition(from, to State) bool {
 	}
 	return false
 }
+
+// returnedDisposalAdmitted reports whether next takes a returned or adopted
+// record straight to observed with fresh evidence that proves ownership or
+// absence. The journal already accepts the same result as two writes, one to
+// reconciliation_required and then one to observed with that evidence, so
+// the single write admits nothing the two could not. validTransition stays
+// strict, because step history uses it too.
+func returnedDisposalAdmitted(old, next Record) bool {
+	if (old.State != ReadyToReturn && old.State != Adopted) || next.State != Observed || len(next.Verifications) <= len(old.Verifications) {
+		return false
+	}
+	v := next.Verifications[len(next.Verifications)-1]
+	return validateVerification(v) && (v.OwnershipVerified || v.AbsenceVerified)
+}
 func validateUpdate(old, next Record) error {
 	a, b := old, next
 	a.State = b.State
@@ -328,7 +342,7 @@ func validateUpdate(old, next Record) error {
 	if !reflect.DeepEqual(a, b) {
 		return fmt.Errorf("%w: immutable allocation identity, intent or plan changed", ErrConflict)
 	}
-	if !validTransition(old.State, next.State) {
+	if !validTransition(old.State, next.State) && !returnedDisposalAdmitted(old, next) {
 		return fmt.Errorf("%w: invalid transition %s to %s", ErrCorrupt, old.State, next.State)
 	}
 	if terminal(old.State) && !reflect.DeepEqual(old, next) {
