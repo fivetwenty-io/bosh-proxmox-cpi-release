@@ -86,6 +86,14 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 			deps.recordStoragePlacement(ctx, selection, "allocation")
 			return result, nil
 		}
+		if isManagedDiskProtectionPending(err) {
+			// The VM is placed and working, and only a persistent disk's
+			// parker protection is open. A fallback attempt exists for
+			// placement failures and a rollback would throw a good VM away,
+			// so the error goes back as it is on every attempt, and the
+			// Director's retry resumes this generation.
+			return nil, err
+		}
 		descriptor := m.prepared.plan.VMExecution
 		if descriptor == nil || descriptor.MaxAttempts <= m.handle.Record().ActiveAttempt()+1 || deps.Config.KeepFailedVMsEnabled() {
 			// keep_failed_vms asks us to keep the VM, so the timeout goes back

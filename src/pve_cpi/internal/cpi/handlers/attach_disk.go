@@ -473,8 +473,9 @@ func attachDiskViaTransfer(
 	if restoreCutOff != nil {
 		// Retriable: a retry comes back to this parker, and the settler
 		// resolves the planned protection step once the parker reads back
-		// protected.
-		return "", "", retriableUnlessPermanent(restoreCutOff,
+		// protected. The slot comes back beside the error because the disk
+		// is in it, and create_vm's handoff records that.
+		return targetSlot, devicePath, retriableUnlessPermanent(restoreCutOff,
 			fmt.Sprintf("%s: parker protection restore cut off after the disk reached VM %s as %s (disk %s)", op, vmCID, landed, diskCID))
 	}
 	return targetSlot, devicePath, nil
