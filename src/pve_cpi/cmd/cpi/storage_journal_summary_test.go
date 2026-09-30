@@ -90,6 +90,7 @@ func TestStorageJournalAuditSummaryFieldCase(t *testing.T) {
 		"conflict: remote allocation 2a4b0f7c (VM 7014) is outside recorded mutation targets: observed on pvupvecf103, recorded pvupvecf102 (node_mismatch) with an injected line",
 		"vm-scan issue: " + vmScanIssue,
 		`issue: storage "nas" on node "pvupvecf101" could not be inspected: context deadline exceeded`,
+		"record: id=planned-1 kind=vm state=planned charging=true cid=none reason=none",
 	}
 	if len(lines) != len(want)+2 {
 		t.Fatalf("summary has %d lines, want %d: %q", len(lines), len(want)+2, out.String())
@@ -200,5 +201,98 @@ func TestStorageJournalSummaryListsObservedMoves(t *testing.T) {
 	want := []string{"observed move: vm allocation 180f7d1e (VM 4626) moved from pvupvecf101 to pvupvecf102"}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("lines = %q, want %q", lines, want)
+	}
+}
+
+func TestStorageJournalAuditSummaryOmitsHealthyRecords(t *testing.T) {
+	now := time.Now().UTC()
+	adopted := storageJournalAuditTestRecord("adopted-1", aj.Adopted, now, now)
+	adopted.CID = "pvd-adopted"
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{
+			storageJournalAuditTestRecord("returned-1", aj.ReadyToReturn, now, now),
+			adopted,
+			storageJournalAuditTestRecord("cleaned-1", aj.Cleaned, now, now),
+			storageJournalAuditTestRecord("deleted-1", aj.Deleted, now, now),
+		},
+		Evidence: []handlers.StorageAllocationEvidence{{AllocationID: "adopted-1", Kind: "disk", Node: "n1", VMID: 90372, VolumeID: "nas:24192/vm-24192-disk.qcow2"}},
+	}
+	var out, stderr bytes.Buffer
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+		t.Fatalf("healthy audit exited %d: %s", code, stderr.String())
+	}
+	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=4\n" +
+		"charging: none\n"
+	if out.String() != want {
+		t.Fatalf("summary = %q, want %q", out.String(), want)
+	}
+}
+
+// TestStorageJournalAuditSummaryNamesARecordNeedingReconciliation is the shape
+// an operator reconciles by hand: a returned disk a lifecycle left in
+// reconciliation_required, with the parker still holding its volume.
+func TestStorageJournalAuditSummaryNamesARecordNeedingReconciliation(t *testing.T) {
+	now := time.Now().UTC()
+	disk := storageJournalAuditTestRecord("65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3", aj.ReconciliationRequired, now, now)
+	disk.Kind = "disk"
+	disk.CID = "pvz-H4sIAAAAAAAC_zTMXW6DMBAE4LvMs7cF8xd8m"
+	disk.Reason = "outcome requires reconciliation at lifecycle attach_disk Pool.CreatePool"
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{storageJournalAuditTestRecord("returned-1", aj.ReadyToReturn, now, now), disk},
+		Evidence: []handlers.StorageAllocationEvidence{
+			{AllocationID: "returned-1", Kind: "vm", Node: "lab-pmx-0", VMID: 4356},
+			{AllocationID: disk.ID, Kind: "disk", Node: "lab-pmx-0", VMID: 90372, VolumeID: "nfs-images:24192/vm-24192-bosh-alloc.qcow2"},
+		},
+	}
+	var out, stderr bytes.Buffer
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+		t.Fatalf("audit exited %d: %s", code, stderr.String())
+	}
+	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=2\n" +
+		"record: id=65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3 kind=disk state=reconciliation_required charging=true cid=pvz-H4sIAAAAAAAC_zTMXW6DMBAE4LvMs7cF8xd8m reason=\"outcome requires reconciliation at lifecycle attach_disk Pool.CreatePool\"\n" +
+		"evidence: allocation=65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3 kind=disk volume=nfs-images:24192/vm-24192-bosh-alloc.qcow2 node=lab-pmx-0 holder_vmid=90372\n"
+	if !strings.HasPrefix(out.String(), want) || !strings.Contains(out.String(), "\ncharging: 1 record, oldest 65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3") {
+		t.Fatalf("summary = %q, want it to open with %q", out.String(), want)
+	}
+}
+
+// TestStorageJournalAuditSummaryNamesChargingRecords prints every charging
+// record in ID order, with its evidence sorted and a scrubbed, one-line reason.
+func TestStorageJournalAuditSummaryNamesChargingRecords(t *testing.T) {
+	now := time.Now().UTC()
+	planned := storageJournalAuditTestRecord("b-planned", aj.Planned, now.Add(-time.Hour), now)
+	observed := storageJournalAuditTestRecord("a-observed", aj.Observed, now, now)
+	observed.Kind = "disk"
+	observed.Reason = "lifecycle attach_disk admitted; completion pending\nPVEAPIToken=root@pam!cpi=secret-value"
+	report := handlers.StorageAllocationAudit{
+		Complete: true, VMScanComplete: true,
+		Records: []aj.Record{planned, observed},
+		Evidence: []handlers.StorageAllocationEvidence{
+			{AllocationID: "a-observed", Kind: "disk", Node: "n2", VMID: 90000, VolumeID: "nas:1/b.qcow2"},
+			{AllocationID: "a-observed", Kind: "disk", Node: "n1", VolumeID: "nas:1/a.qcow2"},
+		},
+	}
+	var out, stderr bytes.Buffer
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+		t.Fatalf("audit exited %d: %s", code, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("summary has %d lines: %q", len(lines), out.String())
+	}
+	if !strings.HasPrefix(lines[1], "record: id=a-observed kind=disk state=observed charging=true cid=none reason=\"lifecycle attach_disk admitted; completion pending ") || strings.Contains(out.String(), "secret-value") {
+		t.Fatalf("record line = %q", lines[1])
+	}
+	if lines[2] != "evidence: allocation=a-observed kind=disk volume=nas:1/a.qcow2 node=n1 holder_vmid=none" ||
+		lines[3] != "evidence: allocation=a-observed kind=disk volume=nas:1/b.qcow2 node=n2 holder_vmid=90000" {
+		t.Fatalf("evidence lines = %q", lines[2:4])
+	}
+	if lines[4] != "record: id=b-planned kind=vm state=planned charging=true cid=none reason=none" {
+		t.Fatalf("second record line = %q", lines[4])
+	}
+	if !strings.HasPrefix(lines[5], "charging: 2 records, oldest b-planned") {
+		t.Fatalf("charging line = %q", lines[5])
 	}
 }

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sort"
 	"strings"
 
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
 )
 
@@ -31,8 +33,9 @@ func writeStorageJournalEnrollment(stdout, stderr io.Writer, report handlers.Sto
 }
 
 // writeStorageJournalAuditText prints the audit for a Director that has no
-// jq: an overview line, one line per finding, the charging summary, and the
-// skipped disabled storages. Every line is flattened, so a finding that
+// jq: an overview line, one line per finding, one record line for each record
+// that needs an operator with its evidence lines under it, the charging
+// summary, and the skipped disabled storages. Every line is flattened, so a finding that
 // carries a line break or a terminal escape still prints as one line.
 func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport) error {
 	audit := output.Audit
@@ -42,6 +45,7 @@ func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport)
 		lines = append(lines, "generation index: "+output.IndexFinding)
 	}
 	lines = append(lines, storageJournalFindingLines(audit)...)
+	lines = append(lines, storageJournalAttentionLines(output.Attention, audit.Evidence)...)
 	lines = append(lines, storageJournalChargingLine(output.ChargingSummary))
 	lines = append(lines, storageJournalSkippedLines(audit)...)
 	return writeStorageJournalLines(w, lines)
@@ -84,6 +88,93 @@ func storageJournalFindingLines(report handlers.StorageAllocationAudit) []string
 		lines = append(lines, "observed move: "+move.String())
 	}
 	return lines
+}
+
+// storageJournalAttention is one record the text summary prints in full.
+type storageJournalAttention struct {
+	ID, Kind, State, CID, Reason string
+	Charging                     bool
+}
+
+// storageJournalAttentionRecords picks the records that need an operator.
+// Those are records in any state other than ready_to_return, adopted,
+// cleaned, or deleted, and any record that charges bytes against new creates.
+// A healthy record is left out, so the summary stays short. The records come
+// back sorted by ID.
+func storageJournalAttentionRecords(report handlers.StorageAllocationAudit) []storageJournalAttention {
+	records := make([]storageJournalAttention, 0, len(report.Records))
+	for i := range report.Records {
+		r := &report.Records[i]
+		charging := handlers.StorageAllocationCharging(r.State)
+		switch r.State {
+		case aj.ReadyToReturn, aj.Adopted, aj.Cleaned, aj.Deleted:
+			if !charging {
+				continue
+			}
+		}
+		records = append(records, storageJournalAttention{ID: r.ID, Kind: r.Kind, State: string(r.State), CID: r.CID, Reason: r.Reason, Charging: charging})
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
+	return records
+}
+
+// storageJournalAttentionLines prints one record line per record that needs
+// an operator, followed by one evidence line for each volume, VM, or parker
+// the audit found still carrying that allocation. The CID is printed in full,
+// because adopt needs it exactly. The reason is the record's own, scrubbed and
+// flattened like every other line of the summary.
+func storageJournalAttentionLines(records []storageJournalAttention, evidence []handlers.StorageAllocationEvidence) []string {
+	var lines []string
+	for _, record := range records {
+		cid := record.CID
+		if cid == "" {
+			cid = "none"
+		}
+		reason := "none"
+		if record.Reason != "" {
+			reason = fmt.Sprintf("%q", boundStorageJournalText(record.Reason))
+		}
+		lines = append(lines, fmt.Sprintf("record: id=%s kind=%s state=%s charging=%t cid=%s reason=%s", record.ID, record.Kind, record.State, record.Charging, cid, reason))
+		var own []handlers.StorageAllocationEvidence
+		for _, item := range evidence {
+			if item.AllocationID == record.ID {
+				own = append(own, item)
+			}
+		}
+		sort.Slice(own, func(i, j int) bool {
+			a, b := own[i], own[j]
+			if a.Kind != b.Kind {
+				return a.Kind < b.Kind
+			}
+			if a.Node != b.Node {
+				return a.Node < b.Node
+			}
+			if a.VolumeID != b.VolumeID {
+				return a.VolumeID < b.VolumeID
+			}
+			return a.VMID < b.VMID
+		})
+		for _, item := range own {
+			lines = append(lines, "evidence: "+storageJournalAttentionEvidence(item))
+		}
+	}
+	return lines
+}
+
+// storageJournalAttentionEvidence names what still carries an allocation: the
+// kind of evidence, the volume, the node, and the VMID that holds it.
+func storageJournalAttentionEvidence(item handlers.StorageAllocationEvidence) string {
+	volume, node, holder := item.VolumeID, item.Node, "none"
+	if volume == "" {
+		volume = "none"
+	}
+	if node == "" {
+		node = "none"
+	}
+	if item.VMID != 0 {
+		holder = fmt.Sprint(item.VMID)
+	}
+	return fmt.Sprintf("allocation=%s kind=%s volume=%s node=%s holder_vmid=%s", item.AllocationID, item.Kind, volume, node, holder)
 }
 
 func storageJournalChargingLine(summary storageJournalChargingSummary) string {
