@@ -96,11 +96,42 @@ func managedVMVolumeDevice(key string) bool {
 	return false
 }
 
+// managedVMDisposalAdmitted reports whether the active attempt recorded a VM
+// cleanup admission. Such a VM may be stopped, out of HA, or missing a disk, so
+// it never resumes as a create. Verifications are not tied to an attempt, but a
+// later attempt's own admission evidence marks where its verifications begin,
+// and the first attempt owns every verification.
+func managedVMDisposalAdmitted(record aj.Record) bool {
+	start := 0
+	if n := len(record.Attempts); n > 0 && record.Attempts[n-1].Admission != nil {
+		for i := range record.Verifications {
+			if record.Verifications[i].EvidenceID == record.Attempts[n-1].Admission.EvidenceID {
+				start = i + 1
+			}
+		}
+	}
+	for _, verification := range record.Verifications[start:] {
+		var evidence struct {
+			Facts struct {
+				Operation    string `json:"operation"`
+				AllocationID string `json:"allocation_id"`
+			} `json:"facts"`
+		}
+		if json.Unmarshal([]byte(verification.EvidenceJSON), &evidence) == nil && evidence.Facts.Operation == managedVMCleanupAdmissionOperation && evidence.Facts.AllocationID == record.ID {
+			return true
+		}
+	}
+	return false
+}
+
 func saveManagedVMOwnership(handle *aj.Handle, observation *managedVMObservation) error {
 	if handle == nil || observation == nil || !observation.Verification.OwnershipVerified {
 		return storageRefusal("verified VM ownership required")
 	}
 	record := handle.Record()
+	if managedVMDisposalAdmitted(record) {
+		return storageAllocationUncertain(handle, "resume after VM disposal admission")
+	}
 	record.Verifications = append(record.Verifications, observation.Verification)
 	if record.State == aj.ReconciliationRequired {
 		settled := true

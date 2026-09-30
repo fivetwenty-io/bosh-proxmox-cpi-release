@@ -40,10 +40,11 @@ func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolve
 			// and returned the disk unchanged, so the handoff this step
 			// records never touched the VM. Settle the step and hand the
 			// retriable timeout back without poisoning the VM allocation.
-			// With fallback attempts left, the attempt retry does not resume
-			// this VM. It disposes of the attempt, preserving any disk already
-			// attached, and places a new VM. On the last attempt the timeout
-			// goes to the Director, whose retry resumes from here.
+			// create_vm never resumes this VM. It disposes of the attempt,
+			// preserving any disk already attached. A fallback attempt then
+			// places a new VM, and on the last attempt the generation is
+			// closed before the timeout reaches the Director, whose retry
+			// builds a fresh VM.
 			if observeErr := storageMutationObserved(m.handle, step, nil, false); observeErr != nil {
 				return m.guard.Poison(storageAllocationUncertain(m.handle, "persistent disk attachment"))
 			}
