@@ -76,6 +76,7 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 				proof.PendingVMAllocation = &pending
 			case cleanupUnknownDiskAllocation(*step, record):
 				proof.UnknownDiskAllocation = true
+			case cleanupPersistentHandoffStep(*step, record):
 			case !cleanupConfigStep(*step, record):
 				return ctx, nil, storageRefusal("cleanup refuses unresolved allocation or asynchronous mutation")
 			}
