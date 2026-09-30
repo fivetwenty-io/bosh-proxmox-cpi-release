@@ -52,8 +52,10 @@ func contendedCleanup(t *testing.T, ctx context.Context, disk *parkedFlowDisk, l
 // rerun. Both a returned record and one already needing reconciliation are
 // covered.
 func TestExplicitCleanupLockTimeoutLeavesTheRecord(t *testing.T) {
+	t.Parallel()
 	for name, uncertain := range map[string]bool{"ready_to_return": false, "reconciliation_required": true} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			locks := newLockContention(t)
 			disk := newParkedFlowDisk(t, locks)
 			locks.reset()
@@ -94,6 +96,7 @@ func TestExplicitCleanupLockTimeoutLeavesTheRecord(t *testing.T) {
 // The disk's holder has been touched, so the timeout is not clean and the
 // record goes to reconciliation_required, as any other failure does.
 func TestExplicitCleanupMutationBeforeTheWaitStaysUncertain(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()

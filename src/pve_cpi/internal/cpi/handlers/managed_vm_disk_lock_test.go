@@ -301,6 +301,7 @@ func retryCreateVMAfterDiskLockTimeout(t *testing.T, deps Deps, client *createVM
 // drive-option overrides, whose attach writes nothing to the receiving VM
 // before it takes the parker lock.
 func TestCreateVMDiskLockTimeoutRebuildsOnRetry(t *testing.T) {
+	t.Parallel()
 	deps, client, journal, locks, args := createVMDiskLockTimeout(t, false)
 	retryCreateVMAfterDiskLockTimeout(t, deps, client, journal, locks, args)
 }
@@ -312,6 +313,7 @@ func TestCreateVMDiskLockTimeoutRebuildsOnRetry(t *testing.T) {
 // rollback destroys the receiving VM, so the note is read from the
 // configuration the VM had when it was destroyed.
 func TestCreateVMDiskLockTimeoutAfterOverlayNote(t *testing.T) {
+	t.Parallel()
 	_, client, _, _, _ := createVMDiskLockTimeout(t, true)
 	noted := false
 	for _, cfg := range client.destroyedConfigs {
@@ -328,6 +330,7 @@ func TestCreateVMDiskLockTimeoutAfterOverlayNote(t *testing.T) {
 // TestCreateVMDiskLockTimeoutAfterOverlayNoteRebuildsOnRetry is the Director's
 // in-task retry of that default shape once the parker lock frees.
 func TestCreateVMDiskLockTimeoutAfterOverlayNoteRebuildsOnRetry(t *testing.T) {
+	t.Parallel()
 	deps, client, journal, locks, args := createVMDiskLockTimeout(t, true)
 	retryCreateVMAfterDiskLockTimeout(t, deps, client, journal, locks, args)
 }

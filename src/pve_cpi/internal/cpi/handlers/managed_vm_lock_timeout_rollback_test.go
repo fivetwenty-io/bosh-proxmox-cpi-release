@@ -326,6 +326,7 @@ func (f *rollbackFlow) created(t *testing.T) []int {
 // Director's retry under the same agent ID then starts a new generation and
 // builds a fresh VM with both disks.
 func TestCreateVMLockTimeoutRollsBackTheAttempt(t *testing.T) {
+	t.Parallel()
 	flow := newRollbackFlow(t)
 	flow.vms.onDisposal = flow.locks.reset
 
@@ -415,6 +416,7 @@ func TestCreateVMLockTimeoutRollsBackTheAttempt(t *testing.T) {
 // preserved to the parker, the VM is destroyed, the generation is closed, and
 // the Director gets the retriable error with the unknown state inside it.
 func TestCreateVMUnknownLockStateRollsBackTheAttempt(t *testing.T) {
+	t.Parallel()
 	flow := newRollbackFlow(t)
 	flow.locks.reset()
 	failConfirmingReads(flow.locks)
@@ -496,6 +498,7 @@ func (f *rollbackFlow) resumeAfterTimeout(t *testing.T, generation aj.Record, vm
 // retriable with the VM and its generation in place, and the next try resumes
 // that generation on the same VM.
 func TestCreateVMLockTimeoutKeepsTheVMUnderKeepFailedVMs(t *testing.T) {
+	t.Parallel()
 	flow := newRollbackFlow(t)
 	keep := true
 	flow.parked.deps.Config.Debug = &config.DebugConfig{KeepFailedVMs: &keep}
@@ -522,6 +525,7 @@ func TestCreateVMLockTimeoutKeepsTheVMUnderKeepFailedVMs(t *testing.T) {
 // so the error still reads retriable, the generation stays as it was with no
 // admission recorded, and the next try resumes it on the same VM.
 func TestCreateVMRefusedRollbackKeepsTheTimeoutRetriable(t *testing.T) {
+	t.Parallel()
 	flow := newRollbackFlow(t)
 	rejected := flow.locks.rejected
 	go func() {
@@ -557,6 +561,7 @@ func TestCreateVMRefusedRollbackKeepsTheTimeoutRetriable(t *testing.T) {
 // create on a VM the disposal had already begun to take apart. The recorded
 // disposal admission now refuses the resume, even after the parker lock frees.
 func TestCreateVMResumeRefusesAHalfDisposedGeneration(t *testing.T) {
+	t.Parallel()
 	flow := newRollbackFlow(t)
 	if _, err := flow.createVM(t); err == nil || flow.generation(t).State != aj.ReconciliationRequired {
 		t.Fatalf("the rollback did not leave a half-disposed generation: %v", err)
@@ -589,8 +594,10 @@ func TestCreateVMResumeRefusesAHalfDisposedGeneration(t *testing.T) {
 // generation requires reconciliation, and the Director reads a failure it does
 // not retry.
 func TestCreateVMRollbackPreservationTimeoutIsUncertain(t *testing.T) {
+	t.Parallel()
 	for _, fallback := range []bool{false, true} {
 		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			t.Parallel()
 			flow := newRollbackFlow(t)
 			if fallback {
 				limit := 1
@@ -643,6 +650,7 @@ func assertUncertainRollback(t *testing.T, flow *rollbackFlow) {
 // the joined error so the Director cannot read the timeout's retriable type
 // first. delete_vm's rule keeps its clean exit for that same timeout.
 func TestVMRollbackFailureRules(t *testing.T) {
+	t.Parallel()
 	returned := &diskReturnedAfterLockTimeout{err: lockTimeoutError()}
 
 	rollback := createdManagedVM(t)
@@ -670,6 +678,7 @@ func TestVMRollbackFailureRules(t *testing.T) {
 // is not retriable. A cleanup error that is already not retriable keeps its
 // place, so the Director still shows its own message.
 func TestVMCleanupFailureLeadsWithReconciliation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		cause   error
@@ -680,6 +689,7 @@ func TestVMCleanupFailureLeadsWithReconciliation(t *testing.T) {
 		{name: "untyped cleanup failure", cause: errors.New("cleanup used unbounded volume destruction"), leading: "cleanup used unbounded volume destruction"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			m := createdManagedVM(t)
 			err := managedVMCleanupFailure(m.handle, tc.cause)
 			if !errors.Is(err, tc.cause) {
