@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -247,6 +248,13 @@ func TransferDiskFromParker(
 		return innerErr
 	})
 	if lockErr != nil {
+		// A restore cut off after the disk landed comes back with the landed
+		// name, so the caller can record the disk where it now is before it
+		// reports the cut-off. Every other failure returns no name.
+		var cutOff *ProtectionRestoreCutOffError
+		if landedVolid != "" && errors.As(lockErr, &cutOff) && cutOff.WorkCompleted {
+			return landedVolid, lockErr
+		}
 		return "", lockErr
 	}
 	_ = cfg // band/attribution config reserved for parity with the other transfer entry points
@@ -293,29 +301,29 @@ func transferFromParkerLocked(
 			fmt.Sprintf("transfer out: clear protection on parker vmid %d", parker.VMID))
 	}
 	moveErr := moveDiskToVM(ctx, c, logger, parker.Node, parker.VMID, slot, targetVMID, targetSlot)
-	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, parker.Node, parker.VMID, true); protErr != nil && logger != nil {
-		logger.Warn("transfer out: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
-			log.Int("parker_vmid", parker.VMID),
-			log.String("node", parker.Node),
-			log.Err(protErr),
-		)
-	}
+	work := fmt.Sprintf("the disk transfer to vm %d slot %s completed", targetVMID, targetSlot)
 	if moveErr != nil {
-		return "", moveErr
+		work = fmt.Sprintf("the disk transfer to vm %d slot %s failed", targetVMID, targetSlot)
+	}
+	restoreErr := markWorkCompleted(restoreParkerProtection(ctx, c, logger, "transfer out", parker.Node, parker.VMID, work), moveErr == nil)
+	if moveErr != nil {
+		return "", joinWindowErrors(moveErr, restoreErr)
 	}
 
 	// The move renamed the volume for its new owner; read the landed name off
-	// the target slot.
+	// the target slot. This runs even when the restore was cut off, because
+	// the disk is on the VM either way and the caller needs its new name to
+	// record it there; the cut-off comes back beside the name.
 	targetCfg, tErr := c.QEMU().Config(ctx, parker.Node, targetVMID)
 	if tErr != nil {
-		return "", cpierrors.Wrap(WrapConfigReadError(tErr),
-			fmt.Sprintf("transfer out: config read for target vm %d after move", targetVMID))
+		return "", joinWindowErrors(cpierrors.Wrap(WrapConfigReadError(tErr),
+			fmt.Sprintf("transfer out: config read for target vm %d after move", targetVMID)), restoreErr)
 	}
 	landed, ok := slotBareVolid(targetCfg, targetSlot)
 	if !ok {
-		return "", cpierrors.Retriable(
+		return "", joinWindowErrors(cpierrors.Retriable(
 			"transfer out: move_disk reported success but target vm %d slot %s is empty; retry",
-			targetVMID, targetSlot)
+			targetVMID, targetSlot), restoreErr)
 	}
 	if logger != nil {
 		logger.Info("transfer out: disk reassigned from parker to VM",
@@ -326,7 +334,7 @@ func transferFromParkerLocked(
 			log.String("volid_after", landed),
 		)
 	}
-	return landed, nil
+	return landed, restoreErr
 }
 
 // RemoveParkerProvenanceEntry drops the provenance record naming bareVolid
@@ -805,6 +813,15 @@ func DeleteParkedOwnedDisk(
 		return deleteParkedOwnedDiskLocked(wctx, c, logger, node, parkerVMID, bareVolid)
 	})
 	if lockErr != nil {
+		// A restore cut off after the deletion completed says so. The volume
+		// is gone either way, so
+		// its provenance entry is removed as on success, and the cut-off is
+		// reported after it; otherwise the entry would name a volume that no
+		// longer exists and every later lookup of the disk would refuse it.
+		var cutOff *ProtectionRestoreCutOffError
+		if errors.As(lockErr, &cutOff) && cutOff.WorkCompleted {
+			removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+		}
 		return lockErr
 	}
 	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
@@ -848,16 +865,211 @@ func deleteParkedOwnedDiskLocked(ctx context.Context, c Client, logger *log.Logg
 	if detachErr == nil {
 		detachErr = sweepOwnedUnusedEntries(ctx, c, logger, node, parkerVMID, bareVolid)
 	}
-	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
-		logger.Warn("delete parked: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+	work := fmt.Sprintf("the deletion of %q completed", bareVolid)
+	if detachErr != nil {
+		detachErr = cpierrors.Wrap(WrapMutationError(detachErr),
+			fmt.Sprintf("delete parked: deallocate %q on parker vmid %d", bareVolid, parkerVMID))
+		work = fmt.Sprintf("the deletion of %q failed", bareVolid)
+	}
+	restoreErr := markWorkCompleted(restoreParkerProtection(ctx, c, logger, "delete parked", node, parkerVMID, work), detachErr == nil)
+	return joinWindowErrors(detachErr, restoreErr)
+}
+
+// markWorkCompleted records on a cut-off restore whether the window's own
+// change completed. Any other error, and nil, passes through unchanged.
+func markWorkCompleted(restoreErr error, completed bool) error {
+	var cutOff *ProtectionRestoreCutOffError
+	if errors.As(restoreErr, &cutOff) {
+		cutOff.WorkCompleted = completed
+	}
+	return restoreErr
+}
+
+// joinWindowErrors combines a protection window's own error with its restore's
+// error as errors.Join(workErr, restoreErr), except that a single error comes
+// back as itself rather than inside a join, so callers that compare or unwrap
+// it see exactly what they always did.
+//
+// When both are present, the work error wins classification. errors.As walks a
+// join in order, so the dispatcher, retriableUnlessPermanent, and every other
+// caller that reads the CPI error type find the work error's type first, and a
+// permanent move or deletion verdict stays permanent. The restore error's type
+// applies only when the work error carries no CPI type of its own, such as the
+// untyped snapshot refusal. The restore's text rides along in both cases, so
+// the operator still sees that protection needs checking.
+func joinWindowErrors(workErr, restoreErr error) error {
+	switch {
+	case workErr == nil:
+		return restoreErr
+	case restoreErr == nil:
+		return workErr
+	default:
+		return errors.Join(workErr, restoreErr)
+	}
+}
+
+// parkerProtectionRestoreTimeout bounds one protection restore. It is the
+// reserve parkerWindowBudget sets aside for the restore, so a window body that
+// runs its whole budget, then a restore that runs its whole deadline, the
+// demoted-slot sweep, and the lock release, still ends before the lock's TTL,
+// where a waiter may steal the lock and open its own window on this parker.
+const parkerProtectionRestoreTimeout = parkerProtectionRestoreReserve
+
+// parkerRestoreTimeoutKey carries a test's shorter protection restore
+// deadline on the request context.
+type parkerRestoreTimeoutKey struct{}
+
+// WithParkerProtectionRestoreTimeoutForTest returns a context whose protection
+// restores use deadline d instead of parkerProtectionRestoreTimeout. It rides
+// the context rather than a package variable so tests that shorten it can run
+// in parallel. A non-positive d leaves ctx as it is. Production code never
+// calls it; it mirrors WithTestBackoff.
+func WithParkerProtectionRestoreTimeoutForTest(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, parkerRestoreTimeoutKey{}, d)
+}
+
+// parkerRestoreTimeout returns the test override carried on ctx when one is
+// set, and parkerProtectionRestoreTimeout otherwise.
+func parkerRestoreTimeout(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(parkerRestoreTimeoutKey{}).(time.Duration); ok && d > 0 {
+		return d
+	}
+	return parkerProtectionRestoreTimeout
+}
+
+// ErrMutationNotAttempted marks a mutation that a client wrapper refused
+// before sending it to PVE, such as the allocation guard once an earlier
+// failure has made its operation uncertain. The write never reached PVE, so
+// its failure says nothing about PVE or the network.
+var ErrMutationNotAttempted = errors.New("mutation not attempted")
+
+// ProtectionWriteRefused reports whether err is PVE's own answer refusing a
+// protection write, which means the write did not apply and its outcome is
+// known. That is an API error carrying an HTTP status, except 596, which
+// pveproxy sends when it could not reach pvedaemon, and 502 through 504, which
+// a proxy in front of PVE sends. It is false for a transport fault, a timeout,
+// and a cancelled or expired context, where the write may have landed.
+func ProtectionWriteRefused(err error) bool {
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	code, ok := apiHTTPCode(err)
+	if !ok {
+		return false
+	}
+	switch code {
+	case 502, 503, 504, 596:
+		return false
+	}
+	return code >= 400 && code < 600
+}
+
+// ProtectionRestoreCutOffError is the error a protection restore returns when
+// it ended without an answer from PVE, because its deadline cut it off or its
+// transport failed, so nobody knows whether protection went back on.
+// Its text and its CPI error type (retriable) come from the error it wraps, so
+// callers that only read the message or the type see no difference. Callers
+// that need to tell a cut-off restore from every other failure, such as an
+// attach that still has receiving-side bookkeeping to finish after the disk
+// landed, match it with errors.As.
+type ProtectionRestoreCutOffError struct {
+	// ParkerVMID is the parker whose protection state is unknown.
+	ParkerVMID int
+	// WorkCompleted is true when the window's own change, the transfer or
+	// the deletion, completed before the restore was cut off. The caller
+	// then still records where the disk is, or that it is gone.
+	WorkCompleted bool
+	err           error
+}
+
+func (e *ProtectionRestoreCutOffError) Error() string { return e.err.Error() }
+
+func (e *ProtectionRestoreCutOffError) Unwrap() error { return e.err }
+
+// restoreParkerProtection puts protection back on a parker at the end of a
+// protection window. Every protection restore goes through it. op names the
+// window in log lines and in the error, for example "transfer out", and work
+// says how the window's own change ended, for example "the disk transfer to vm
+// 700 slot scsi1 completed", so an operator reading a cut-off restore knows
+// whether the disk moved.
+//
+// The restore runs on context.WithoutCancel(ctx), so a request that was
+// cancelled, or a window whose deadline stopped the work, still puts the flag
+// back. Without a deadline of its own, though, a PVE that never answers would
+// hold the restore open past the lock's TTL, so it gets
+// parkerRestoreTimeout.
+//
+// Three outcomes:
+//
+//   - The restore succeeds: nil.
+//   - PVE answers with a failure (ProtectionWriteRefused): the outcome is
+//     known, protection is off, and the Warn tells the operator how to put it
+//     back. It returns nil, as it always has, so the window's own result
+//     stands.
+//   - The client refused the restore before sending it
+//     (ErrMutationNotAttempted), because an earlier failure already made the
+//     operation uncertain: it returns the same retriable error, worded to say
+//     the restore was not attempted, since PVE never saw it.
+//   - The restore ends without an answer from PVE, because the deadline cut
+//     it off or the transport failed on the last attempt: nobody knows
+//     whether the write landed. It returns a retriable error that names the
+//     protection restore,
+//     says how the window's change ended, and gives the commands that check
+//     and fix the flag. Retriable because a retry does come back to this
+//     parker: the Director's in-task create_vm retry reuses the same
+//     disk_cids, a rerun deploy reissues attach_disk, and the restore is
+//     idempotent. In a journal-managed request the guard leaves the cut-off
+//     write's step planned without locking itself, so the operation can still
+//     record where the disk is, and the lifecycle then leaves the allocation
+//     reconciliation_required. That record, not this error's type, is what
+//     holds a managed retry until the parker reads back protected.
+//
+// Both the Warn and the returned error carry the underlying error, which can
+// hold PVE text; log.Err scrubs the log line, and the dispatcher scrubs the
+// error before it reaches the Director.
+func restoreParkerProtection(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int, work string) error {
+	timeout := parkerRestoreTimeout(ctx)
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	protErr := setParkerProtection(restoreCtx, c, logger, node, parkerVMID, true)
+	if protErr == nil {
+		return nil
+	}
+	// A restore the client refused before sending, because an earlier
+	// failure already made the operation uncertain, is checked first: PVE
+	// never saw it, so blaming the network or PVE would mislead.
+	notAttempted := errors.Is(protErr, ErrMutationNotAttempted)
+	if timedOut := errors.Is(restoreCtx.Err(), context.DeadlineExceeded); notAttempted || timedOut || !ProtectionWriteRefused(protErr) {
+		ending := "ended without an answer from PVE and its outcome is unknown"
+		switch {
+		case notAttempted:
+			ending = "was not attempted because the operation was already uncertain"
+		case timedOut:
+			ending = fmt.Sprintf("did not finish within %s and its outcome is unknown", timeout)
+		}
+		if logger != nil {
+			logger.Warn(op+": protection restore on parker "+ending+"; check the parker's protection flag",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("timeout", timeout.String()),
+				log.String("work", work),
+				log.Err(protErr),
+			)
+		}
+		return &ProtectionRestoreCutOffError{ParkerVMID: parkerVMID, err: cpierrors.WrapAs(protErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"%s: protection restore on parker vmid %d %s; %s; "+
+				"check the parker with qm config %d and run qm set %d --protection 1 if protection is off",
+			op, parkerVMID, ending, work, parkerVMID, parkerVMID))}
+	}
+	if logger != nil {
+		logger.Warn(op+": could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
 			log.Err(protErr),
 		)
-	}
-	if detachErr != nil {
-		return cpierrors.Wrap(WrapMutationError(detachErr),
-			fmt.Sprintf("delete parked: deallocate %q on parker vmid %d", bareVolid, parkerVMID))
 	}
 	return nil
 }

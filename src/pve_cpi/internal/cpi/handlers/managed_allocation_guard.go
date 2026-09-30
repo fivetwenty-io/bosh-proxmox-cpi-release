@@ -37,6 +37,14 @@ type ManagedAllocationHooks struct {
 	After func(context.Context, ManagedAllocationMutation, string, any) error
 	// Failed persists uncertainty after either a service or After failure.
 	Failed func(context.Context, ManagedAllocationMutation, string, error) error
+	// SettleProtectionWrites opts a guard into finishing a failed
+	// protection-only write without locking itself (see
+	// classifyProtectionWriteFailure). A write PVE refused is passed to After
+	// as a managedProtectionWriteRefusal and observed; a write cut off before
+	// PVE answered is left planned for the settler. Only a guard whose Before
+	// records protection-only parameters on the step may set it, because the
+	// settler reads those parameters to find the step later.
+	SettleProtectionWrites bool
 }
 
 // ManagedAllocationGuard serializes writes and blocks further mutations after uncertainty.
@@ -106,7 +114,7 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	if g.poisoned != nil {
 		err := g.poisoned
 		g.mu.Unlock()
-		return "", err
+		return "", &managedMutationNotAttempted{err: err}
 	}
 	token, err := g.hooks.Before(ctx, m)
 	if err == nil && token == "" {
@@ -115,11 +123,40 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	if err != nil {
 		g.poisoned = cpierrors.Cloud("managed allocation blocked before %s.%s", m.Service, m.Method)
 		g.mu.Unlock()
-		return "", g.poisoned
+		return "", &managedMutationNotAttempted{err: g.poisoned}
 	}
 	return token, nil
 }
+
+// managedMutationNotAttempted is the error begin returns when it refuses a
+// mutation before the service call, so the write never reached PVE. Its text
+// and CPI type are the refusal's own; it also matches
+// pve.ErrMutationNotAttempted, so a caller that reports on the write, such as
+// the parker protection restore, can say it was not attempted instead of
+// blaming PVE or the network.
+type managedMutationNotAttempted struct{ err error }
+
+func (e *managedMutationNotAttempted) Error() string { return e.err.Error() }
+
+func (e *managedMutationNotAttempted) Unwrap() []error {
+	return []error{e.err, pve.ErrMutationNotAttempted}
+}
 func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocationMutation, token string, result any, err error) error {
+	if err != nil && g.hooks.SettleProtectionWrites {
+		switch classifyProtectionWriteFailure(ctx, m, err) {
+		case protectionWriteCutOff:
+			// The step stays planned and the guard stays usable; the caller
+			// gets the failure unchanged.
+			return err
+		case protectionWriteRefused:
+			if g.hooks.After(ctx, m, token, managedProtectionWriteRefusal{}) == nil {
+				return err
+			}
+			// A refusal that cannot be observed is uncertain like any other
+			// failure, and falls through to the lock below.
+		case protectionWriteOther:
+		}
+	}
 	if err == nil {
 		err = g.hooks.After(ctx, m, token, result)
 	}
