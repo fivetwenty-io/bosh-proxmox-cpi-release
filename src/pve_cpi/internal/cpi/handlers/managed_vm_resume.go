@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -32,7 +31,7 @@ type managedVMObservation struct {
 // storage. The audit reads only the located node from the readback.
 func observeManagedVMRecord(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record) (*managedVMObservation, error) {
 	fail := func(reason string) (*managedVMObservation, error) {
-		return nil, cpierrors.Cloud("allocation %s requires reconciliation: %s", record.ID, reason)
+		return nil, cpierrors.WrapAs(storageRefusal(reason), cpierrors.TypeCloud, "allocation "+record.ID+" requires reconciliation")
 	}
 	if record.Kind != "vm" || record.State == aj.Deleted || record.State == aj.Cleaned || record.State == aj.VMDeletedRetained {
 		return fail("record does not describe an active VM")
@@ -99,7 +98,7 @@ func managedVMVolumeDevice(key string) bool {
 
 func saveManagedVMOwnership(handle *aj.Handle, observation *managedVMObservation) error {
 	if handle == nil || observation == nil || !observation.Verification.OwnershipVerified {
-		return fmt.Errorf("verified VM ownership required")
+		return storageRefusal("verified VM ownership required")
 	}
 	record := handle.Record()
 	record.Verifications = append(record.Verifications, observation.Verification)
@@ -201,7 +200,7 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 		return nil, false, nil
 	}
 	if parsed == nil {
-		return nil, false, fmt.Errorf("existing allocation lookup requires parsed VM arguments")
+		return nil, false, storageRefusal("existing allocation lookup requires parsed VM arguments")
 	}
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
@@ -219,7 +218,7 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 	continuation := func(ctx context.Context, deps Deps, parsed *createVMParsedArgs, _ *StoragePlacementSelection, journal *aj.Journal, handle *aj.Handle, plan *StorageAllocationPlan, observed *managedVMObservation) (any, error) {
 		current, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 		if err != nil {
-			return nil, fmt.Errorf("recorded VM continuation is blocked by current storage policy")
+			return nil, storageRefusal("recorded VM continuation is blocked by current storage policy")
 		}
 		return continueManagedVM(ctx, deps, parsed, current, journal, handle, plan, observed)
 	}

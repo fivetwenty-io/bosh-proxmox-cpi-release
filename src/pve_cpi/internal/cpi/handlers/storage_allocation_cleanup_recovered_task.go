@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"strconv"
 	"strings"
@@ -16,7 +15,7 @@ func cleanupRecoveredTask(record aj.Record, decision StorageAllocationDecision) 
 		return nil, nil
 	}
 	if decision.Action != "cleanup" || !decision.PreviousWriterFenced || !decision.RemoteTasksSettled || decision.RecoveredTaskStep == "" || decision.RecoveredTaskUPID == "" {
-		return nil, fmt.Errorf("recovered task requires an exact step and fenced settlement")
+		return nil, storageRefusal("recovered task requires an exact step and fenced settlement")
 	}
 	var found *aj.Step
 	for index := range record.Steps {
@@ -25,7 +24,7 @@ func cleanupRecoveredTask(record aj.Record, decision StorageAllocationDecision) 
 			continue
 		}
 		if found != nil || record.Kind != "vm" || step.Attempt != record.ActiveAttempt() || step.State != aj.Planned || step.UPID != "" || step.Target.External {
-			return nil, fmt.Errorf("recovered task does not identify one unknown active VM step")
+			return nil, storageRefusal("recovered task does not identify one unknown active VM step")
 		}
 		if err := validateRecoveredTaskReceipt(record, *step, decision); err != nil {
 			return nil, err
@@ -34,12 +33,12 @@ func cleanupRecoveredTask(record aj.Record, decision StorageAllocationDecision) 
 		effective.UPID = decision.RecoveredTaskUPID
 		effective.State = aj.Submitted
 		if _, ok := cleanupSubmittedISOUpload(effective, record); !ok && !cleanupPendingVMAllocation(effective, record) {
-			return nil, fmt.Errorf("recovered task does not match a supported exact mutation")
+			return nil, storageRefusal("recovered task does not match a supported exact mutation")
 		}
 		found = &effective
 	}
 	if found == nil {
-		return nil, fmt.Errorf("recovered task step was not found")
+		return nil, storageRefusal("recovered task step was not found")
 	}
 	return found, nil
 }

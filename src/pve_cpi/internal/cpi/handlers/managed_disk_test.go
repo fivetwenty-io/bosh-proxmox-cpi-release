@@ -444,6 +444,24 @@ func TestManagedDiskVerifiedFallbackRetainsAllocationIdentity(t *testing.T) {
 	}
 }
 
+// TestManagedDiskRetryNamesWhyTheRejectedVolumeBlocksIt leaves the rejected
+// volume behind, so the retry cannot prove its absence. The refusal names
+// the volume instead of a generic audit failure.
+func TestManagedDiskRetryNamesWhyTheRejectedVolumeBlocksIt(t *testing.T) {
+	m, h, state := managedDiskFixture(t, "spread", true)
+	state.createErr = &pveerrors.APIError{HTTPCode: 400, Message: "Parameter verification failed.", Errors: map[string]string{"filename": "rejected"}}
+	state.failFirst = true
+	state.partial = true
+	_, err := m.execute(t.Context(), h)
+	var cloud *cpierrors.Error
+	if !errors.As(err, &cloud) || !strings.HasPrefix(cloud.Error(), "create_disk retry refused: rejected volume "+state.created[0]+" is still present on n1") {
+		t.Fatalf("retry refusal = %v", err)
+	}
+	if len(state.created) != 1 {
+		t.Fatalf("the refused retry submitted another allocation: %v", state.created)
+	}
+}
+
 func TestManagedDiskParkedCIDAndPoison(t *testing.T) {
 	for _, fail := range []bool{false, true} {
 		t.Run(fmt.Sprint(fail), func(t *testing.T) {

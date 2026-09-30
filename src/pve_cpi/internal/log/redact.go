@@ -78,8 +78,8 @@ func buildSensitiveQueryParamRegexp() *regexp.Regexp {
 }
 
 // RedactSecrets returns a deep copy of tree with every value under a sensitive
-// key replaced by RedactedPlaceholder and every credential embedded in a URL
-// userinfo segment masked. Map and slice structure is preserved; the input is
+// key replaced by RedactedPlaceholder and every credential inside a string
+// value masked the way ScrubMessage masks it. Map and slice structure is preserved; the input is
 // never mutated (no map or slice from tree is aliased into the result), so a
 // caller may safely log the result while continuing to use the original.
 //
@@ -106,7 +106,7 @@ func RedactSecrets(tree any) any {
 		}
 		return out
 	case string:
-		return scrubURLString(t)
+		return scrubCredentials(t)
 	default:
 		// Numbers, bools, nil, and any other scalar carry no key context and
 		// cannot themselves be a URL credential — return as-is.
@@ -130,31 +130,33 @@ func keyIsSensitive(key string) bool {
 	return false
 }
 
-// scrubURLString masks credentials carried inside a URL-shaped string value,
-// leaving any non-URL string unchanged. It catches secrets embedded under a key
-// whose name is not itself sensitive (a blobstore or registry endpoint carrying
-// either user:pass@ userinfo or a ?token=/?password= query parameter). Both
-// forms are masked; an ordinary credential-free URL is returned untouched.
-func scrubURLString(s string) string {
-	s = urlUserinfo.ReplaceAllString(s, "${1}"+RedactedPlaceholder+"@")
-	s = sensitiveQueryParam.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
-	return s
-}
-
 // pveCredential masks the value of a PVE API token header or auth cookie
-// (PVEAPIToken=user@realm!id=secret, PVEAuthCookie=ticket). Neither has a URL
+// (PVEAPIToken=user@realm!id=secret, PVEAuthCookie=ticket), including a value
+// set off by blanks after the "=" and a URL-encoded "%3D". Neither has a URL
 // shape, so the userinfo and query-parameter rules never see them. The SDK
 // keeps both out of its errors today; this rule is defence in depth for any
 // text that echoes a request header.
-var pveCredential = regexp.MustCompile(`(?i)\b(PVEAPIToken|PVEAuthCookie)=\S+`)
+var pveCredential = regexp.MustCompile(`(?i)\b(PVEAPIToken|PVEAuthCookie)(=|%3D)[ \t]*\S+`)
+
+// scrubCredentials masks every credential shape the scrubbers know inside a
+// string value, leaving credential-free text unchanged. It catches secrets
+// embedded under a key whose name is not itself sensitive (a blobstore or
+// registry endpoint carrying either user:pass@ userinfo or a ?token= or
+// ?password= query parameter), and PVE token and cookie values. The log
+// fields, the argument trees, and ScrubMessage all share this one rule set.
+func scrubCredentials(s string) string {
+	s = urlUserinfo.ReplaceAllString(s, "${1}"+RedactedPlaceholder+"@")
+	s = sensitiveQueryParam.ReplaceAllString(s, "${1}"+RedactedPlaceholder)
+	s = pveCredential.ReplaceAllString(s, "${1}${2}"+RedactedPlaceholder)
+	return s
+}
 
 // ScrubMessage returns s with URL-embedded credentials masked (userinfo and
 // sensitive query parameters) and PVE token and cookie values masked, leaving
-// credential-free text unchanged. Use it
-// when a string derived from a guest-controlled or PVE-returned value (an
-// error message, a span status) leaves the process by a path that does not go
-// through ErrScrubbed — every external sink must apply the same scrubbing the
-// logs do.
+// credential-free text unchanged. Use it when a string derived from a
+// guest-controlled or PVE-returned value (an error message, a span status)
+// leaves the process by a path that does not go through ErrScrubbed. Every
+// external sink applies the same scrubbing the logs do.
 func ScrubMessage(s string) string {
-	return pveCredential.ReplaceAllString(scrubURLString(s), "${1}="+RedactedPlaceholder)
+	return scrubCredentials(s)
 }

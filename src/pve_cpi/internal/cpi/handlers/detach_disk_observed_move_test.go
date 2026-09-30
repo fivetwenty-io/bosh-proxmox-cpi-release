@@ -11,6 +11,8 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // attachMovedDisk attaches the fixture's managed disk to VM 777 on n1, which
@@ -107,6 +109,10 @@ func TestManagedDiskDetachRefusesHolderMovedWithLocalStorage(t *testing.T) {
 	_, err := HandleDetachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{})
 	if message := directorMessage(err); !strings.Contains(message, "detach refused before transfer: disk allocation "+id) || !strings.Contains(message, "held by VM 777 on n2, provenance names n1") {
 		t.Fatalf("local move not refused before transfer: %v", err)
+	}
+	// The refusal carries the audit's own reason for refusing the move.
+	if message := directorMessage(err); !strings.Contains(message, "accepted no move on shared storage (") || !strings.Contains(message, "not a move: volume "+birth+" is node-local); the disk stays attached") {
+		t.Fatalf("refusal lacks the audit's reason: %q", message)
 	}
 	if client.moves != 0 || heldDiskVolume(client) != birth {
 		t.Fatalf("refused detach moved the disk: moves=%d held=%q", client.moves, heldDiskVolume(client))
@@ -227,7 +233,7 @@ func TestManagedDiskParkerMovedOnSharedStorageStaysUsable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admission refused a parker moved on shared storage: %v", err)
 	}
-	if !report.observedMove(id, "n2") {
+	if !report.observedMove(storageMoveKindParker, id, parker, "n2") {
 		t.Fatalf("parker move not observed: %+v", report.ObservedMoves)
 	}
 	if !equalFiles(files, diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)) {
@@ -289,4 +295,38 @@ func equalFiles(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+type configFailQEMU struct{ lifecycleFlowQEMU }
+
+func (configFailQEMU) Config(context.Context, string, int) (map[string]any, error) {
+	return nil, sdkerrors.ParseAPIError(500, []byte(`{"message":"unable to read VM config"}`))
+}
+
+// configFailPVE fails every VM configuration read.
+type configFailPVE struct{ *lifecycleFlowPVE }
+
+func (c configFailPVE) QEMU() qemu.Service {
+	return configFailQEMU{c.lifecycleFlowPVE.QEMU().(lifecycleFlowQEMU)}
+}
+
+// TestManagedDiskProvenanceHealNamesAFailedConfigRead fails the holder's
+// configuration read that the heal makes before a transfer. The refusal
+// carries the classified read failure.
+func TestManagedDiskProvenanceHealNamesAFailedConfigRead(t *testing.T) {
+	deps, client, _, _, cid := lifecycleFlowFixture(t)
+	attachMovedDisk(t, deps, client, cid)
+	bare, meta, err := decodeDiskCID(context.Background(), deps, "test", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveDiskForOp(context.Background(), deps, "test", cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.PVE = configFailPVE{client}
+	err = healMovedDiskProvenance(context.Background(), deps, "n2", 777, resolved)
+	if message := directorMessage(err); message != "managed disk holder provenance cannot be read before transfer: VM 777 on n2: HTTP 500: unable to read VM config; audit required" {
+		t.Fatalf("heal refusal = %q", message)
+	}
 }

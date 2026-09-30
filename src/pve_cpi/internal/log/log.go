@@ -73,7 +73,8 @@ func Err(err error) Field { return ErrScrubbed(err) }
 func URL(key, raw string) Field { return slog.String(key, ScrubMessage(raw)) }
 
 // ErrScrubbed returns a Field carrying the error message under the "error" key
-// with any URL credentials scrubbed (userinfo and sensitive query parameters).
+// with any credentials scrubbed (URL userinfo, sensitive query parameters, and
+// PVE token and cookie values).
 // Err is identical (it delegates here); ErrScrubbed remains exported as a
 // separate name so a call site can still signal, for a reader, that it
 // specifically expects a credential-bearing value at that point.
@@ -81,7 +82,7 @@ func ErrScrubbed(err error) Field {
 	if err == nil {
 		return slog.String("error", "")
 	}
-	return slog.String("error", scrubURLString(err.Error()))
+	return slog.String("error", scrubCredentials(err.Error()))
 }
 
 // NewLogger constructs a JSON-encoded, leveled Logger writing to sink.

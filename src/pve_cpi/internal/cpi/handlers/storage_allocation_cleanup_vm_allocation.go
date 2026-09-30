@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"math"
@@ -99,7 +98,7 @@ func pendingVMAllocationMoved(record aj.Record, step aj.Step, node string, vmid 
 	if node == step.Target.Node && vmid == step.Target.VMID {
 		return nil
 	}
-	return fmt.Errorf("pending VM allocation %s moved from exact target: VM %d observed on %s, recorded VM %d on %s", record.ID, vmid, node, step.Target.VMID, step.Target.Node)
+	return storageRefusalf("pending VM allocation %s moved from exact target: VM %d observed on %s, recorded VM %d on %s", record.ID, vmid, node, step.Target.VMID, step.Target.Node)
 }
 
 // The task identifies submission completion; a fresh full VM marker and concrete
@@ -112,7 +111,7 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 	}
 	audit, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {
-		return aj.Verification{}, nil, fmt.Errorf("unknown VM allocation requires complete historical visibility")
+		return aj.Verification{}, nil, storageRefusalf("unknown VM allocation requires complete historical visibility: %s", pve.DescribeAuditError(err))
 	}
 	if err := storageAuditGateError(ctx, deps, "unknown VM allocation cleanup", audit, storageAuditGateAll); err != nil {
 		return aj.Verification{}, nil, err
@@ -127,7 +126,7 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 	}
 	definition, ok := plan.Definitions[step.Target.Storage]
 	if !ok {
-		return aj.Verification{}, nil, fmt.Errorf("pending VM allocation lacks frozen backing")
+		return aj.Verification{}, nil, storageRefusal("pending VM allocation lacks frozen backing")
 	}
 	if err := verifyManagedVMCleanupDefinition(ctx, deps, step.Target, definition); err != nil {
 		return aj.Verification{}, nil, err
@@ -154,7 +153,7 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 			m := managedVMAllocation{deps: deps}
 			size, err := m.observeTargetVolume(ctx, target, volume, target.VirtualBytes)
 			if err != nil || size != target.VirtualBytes {
-				return aj.Verification{}, nil, fmt.Errorf("ephemeral allocation content differs from frozen size")
+				return aj.Verification{}, nil, storageRefusal("ephemeral allocation content differs from frozen size")
 			}
 			if _, err := managedVMVerifyCleanupVolume(ctx, deps, step.Target, definition, true); err != nil {
 				return aj.Verification{}, nil, err
@@ -167,7 +166,7 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 		if !ok {
 			references, err := managedVMConfigVolumes(observed.Config)
 			if err != nil || len(references) != 0 {
-				return aj.Verification{}, nil, fmt.Errorf("missing root has other guest disk references")
+				return aj.Verification{}, nil, storageRefusal("missing root has other guest disk references")
 			}
 			if err := observePlannedVMStorageAbsence(ctx, deps, record, nodes, vmid); err != nil {
 				return aj.Verification{}, nil, err
@@ -175,20 +174,20 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 			return observed.Verification, nil, nil
 		}
 		if !ok || strings.Contains(drive, "media=cdrom") || target.Source == nil {
-			return aj.Verification{}, nil, fmt.Errorf("pending root device is unavailable")
+			return aj.Verification{}, nil, storageRefusal("pending root device is unavailable")
 		}
 		volume := strings.Split(drive, ",")[0]
 		if volume == target.Source.VolumeID {
-			return aj.Verification{}, nil, fmt.Errorf("pending root still references source image")
+			return aj.Verification{}, nil, storageRefusal("pending root still references source image")
 		}
 		owner, ok := pve.EmbeddedDiskVMID(volume)
 		if !ok || owner != vmid {
-			return aj.Verification{}, nil, fmt.Errorf("pending root volume belongs to another VM")
+			return aj.Verification{}, nil, storageRefusal("pending root volume belongs to another VM")
 		}
 		m := managedVMAllocation{deps: deps, shape: &createVMShape{rootDiskKey: plan.VMExecution.RootDevice}}
 		size, err := m.observeTargetVolume(ctx, target, volume, target.Source.VirtualBytes)
 		if err != nil || size != target.Source.VirtualBytes {
-			return aj.Verification{}, nil, fmt.Errorf("pending root size differs from submitted source")
+			return aj.Verification{}, nil, storageRefusal("pending root size differs from submitted source")
 		}
 		auxiliary, err := m.observeRootAuxiliary(ctx, observed.Config, target)
 		if err != nil {
@@ -205,7 +204,7 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 func verifyCleanupAllocationReferences(ctx context.Context, deps Deps, node string, vmid int, definition pve.StorageInfo, volumes []string) error {
 	guests, skipped, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil || len(skipped) > 0 {
-		return fmt.Errorf("pending allocation reference scan incomplete")
+		return storageRefusal("pending allocation reference scan incomplete")
 	}
 	for _, guest := range guests {
 		if guest.Node == node && guest.VMID == vmid {
@@ -221,7 +220,7 @@ func verifyCleanupAllocationReferences(ctx context.Context, deps Deps, node stri
 		}
 		for _, volume := range references {
 			if slices.Contains(volumes, volume) && (definition.IsShared() || guest.Node == node) {
-				return fmt.Errorf("pending allocation artifact is referenced by another VM")
+				return storageRefusal("pending allocation artifact is referenced by another VM")
 			}
 		}
 	}
@@ -268,7 +267,7 @@ func observeAbsentCleanupVMAllocation(ctx context.Context, deps Deps, record aj.
 		volume := step.Target.IntendedVolume
 		for _, evidence := range audit.Evidence {
 			if evidence.AllocationID == record.ID && evidence.VolumeID != volume {
-				return aj.Verification{}, nil, fmt.Errorf("absent VM has unrelated allocation artifacts")
+				return aj.Verification{}, nil, storageRefusal("absent VM has unrelated allocation artifacts")
 			}
 		}
 		if _, err := observePlannedVMAbsence(ctx, deps, record, nodes, vmid, volume); err != nil {
@@ -285,13 +284,13 @@ func observeAbsentCleanupVMAllocation(ctx context.Context, deps Deps, record aj.
 		m := managedVMAllocation{deps: deps}
 		size, err := m.observeTargetVolume(ctx, target, volume, target.VirtualBytes)
 		if err != nil || size != target.VirtualBytes {
-			return aj.Verification{}, nil, fmt.Errorf("orphan ephemeral content differs from frozen size")
+			return aj.Verification{}, nil, storageRefusal("orphan ephemeral content differs from frozen size")
 		}
 		return aj.Verification{Complete: true, OwnershipVerified: true, VMAbsenceVerified: true}, []string{volume}, nil
 	}
 	for _, evidence := range audit.Evidence {
 		if evidence.AllocationID == record.ID {
-			return aj.Verification{}, nil, fmt.Errorf("absent VM still has allocation artifacts")
+			return aj.Verification{}, nil, storageRefusal("absent VM still has allocation artifacts")
 		}
 	}
 	// Root names are selected by PVE. Check the entire VMID on every historical

@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -46,12 +45,12 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 		deps.recordStorageReconciliation(ctx, outcome)
 	}()
 	if ctx == nil || deps.Config == nil || deps.PVE == nil || journal == nil || strings.TrimSpace(decision.DecisionID) == "" || len(decision.DecisionID) > 256 || strings.ContainsAny(decision.DecisionID, "\r\n\x00") {
-		return result, fmt.Errorf("a journal and bounded nonsecret decision reference are required")
+		return result, storageRefusal("a journal and bounded nonsecret decision reference are required")
 	}
 	if decision.Action != "adopt" && decision.Action != "finalize-cleanup" {
-		return result, fmt.Errorf("unsupported allocation decision")
+		return result, storageRefusal("unsupported allocation decision")
 	}
-	denied := fmt.Errorf("allocation decisions cannot mutate PVE")
+	denied := storageRefusal("allocation decisions cannot mutate PVE")
 	guard, err := NewManagedAllocationGuard(deps.PVE, ManagedAllocationHooks{
 		Before: func(context.Context, ManagedAllocationMutation) (string, error) { return "", denied },
 		After:  func(context.Context, ManagedAllocationMutation, string, any) error { return denied },
@@ -73,20 +72,20 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	defer func() { retErr = errors.Join(retErr, storageDecisionSourceError(handle.Close())) }()
 	record := handle.Record()
 	if record.Namespace != deps.Config.StoragePlacementNamespace {
-		return result, fmt.Errorf("allocation decision namespace differs from journal authority")
+		return result, storageRefusal("allocation decision namespace differs from journal authority")
 	}
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, deps.PVE.Nodes(), nodes)
 	if err != nil || identity.ID() != record.ClusterID {
-		return result, fmt.Errorf("allocation decision requires verified live cluster continuity")
+		return result, storageRefusal("allocation decision requires verified live cluster continuity")
 	}
 
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
-		return result, fmt.Errorf("allocation already has a terminal disposition")
+		return result, storageRefusal("allocation already has a terminal disposition")
 	}
 	for stepIndex := range record.Steps {
 		step := record.Steps[stepIndex]
 		if step.State != aj.Observed && !storageDecisionClosedAttemptStepSettled(record, step) {
-			return result, fmt.Errorf("allocation has unsettled mutation evidence; reconcile task completion before disposition")
+			return result, storageRefusal("allocation has unsettled mutation evidence; reconcile task completion before disposition")
 		}
 	}
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
@@ -99,7 +98,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	var ownership aj.Verification
 	if decision.Action == "adopt" {
 		if record.State != aj.ReadyToReturn || record.CID == "" || record.CID != decision.ExpectedCID {
-			return result, fmt.Errorf("adoption requires the exact ready-to-return CID")
+			return result, storageRefusal("adoption requires the exact ready-to-return CID")
 		}
 		ownership, err = observeAllocationDecisionOwnership(ctx, deps, journal, record)
 		if err != nil {
@@ -108,7 +107,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	} else {
 		for _, evidence := range report.Evidence {
 			if evidence.AllocationID == record.ID {
-				return result, fmt.Errorf("allocation resources or provenance remain; cleanup cannot be finalized")
+				return result, storageRefusal("allocation resources or provenance remain; cleanup cannot be finalized")
 			}
 		}
 	}
@@ -178,7 +177,7 @@ func observeAllocationDecisionOwnership(ctx context.Context, deps Deps, journal 
 			return aj.Verification{}, storageDecisionSourceError(err)
 		}
 		if rd.allocation == nil || rd.allocation.record.ID != record.ID || rd.intent != nil {
-			return aj.Verification{}, fmt.Errorf("disk ownership or transfer disposition is unresolved")
+			return aj.Verification{}, storageRefusal("disk ownership or transfer disposition is unresolved")
 		}
 		storage, volume, err := pve.ParseDiskCID(rd.volid)
 		if err != nil {
@@ -186,7 +185,7 @@ func observeAllocationDecisionOwnership(ctx context.Context, deps Deps, journal 
 		}
 		info, err := deps.PVE.Nodes().GetStorageContent(ctx, rd.allocation.provenance.Node, storage, volume)
 		if err != nil || info == nil || info.Size <= 0 {
-			return aj.Verification{}, fmt.Errorf("adoption disk cannot be observed at its exact physical target")
+			return aj.Verification{}, storageRefusal("adoption disk cannot be observed at its exact physical target")
 		}
 		ownership, err = managedDiskOwnershipProof(rd)
 		if err != nil {

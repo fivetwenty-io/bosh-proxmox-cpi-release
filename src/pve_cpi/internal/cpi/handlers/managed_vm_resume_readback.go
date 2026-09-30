@@ -28,8 +28,10 @@ type managedVMRecordReadback struct {
 	volumes     []string
 }
 
+// fail refuses the readback. Every reason is fixed text or identifiers, so
+// the storage-journal CLI prints it through the typed refusal.
 func (r *managedVMRecordReadback) fail(reason string) error {
-	return cpierrors.Cloud("allocation %s requires reconciliation: %s", r.record.ID, reason)
+	return cpierrors.WrapAs(storageRefusal(reason), cpierrors.TypeCloud, "allocation "+r.record.ID+" requires reconciliation")
 }
 func (r *managedVMRecordReadback) readTarget() error {
 	record := r.record
@@ -102,7 +104,7 @@ func (r *managedVMRecordReadback) admitLocation(audit StorageAllocationAudit) er
 			return nil
 		}
 	}
-	if audit.observedMove(record.ID, node) {
+	if audit.observedMove("vm", record.ID, vmid, node) {
 		return nil
 	}
 	return r.fail(fmt.Sprintf("actual VM is outside recorded nodes: VM %d on %s, recorded %s, and the audit accepted no move", vmid, node, strings.Join(storageAuditActiveVMNodes(record, vmid), ",")))

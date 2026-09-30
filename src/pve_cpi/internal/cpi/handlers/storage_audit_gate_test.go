@@ -3,12 +3,15 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
 
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 const gateTestCommand = "sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json"
@@ -168,8 +171,72 @@ func TestStorageAllocationDecisionFailureAppendsGateSummary(t *testing.T) {
 	if !strings.HasPrefix(staged, "cleanup_historical_audit: 2 audit conflicts;") {
 		t.Fatalf("staged decision failure = %q, want the stage and the gate summary", staged)
 	}
-	if got := StorageAllocationDecisionFailure(errors.New("password=private")); got != "identity_or_audit_evidence" {
-		t.Fatalf("plain failure = %q, want the bare class", got)
+	// An error the CPI did not type is described, never echoed.
+	if got := StorageAllocationDecisionFailure(errors.New("password=private")); got != "identity_or_audit_evidence: unclassified error" {
+		t.Fatalf("plain failure = %q, want the class and the unclassified description", got)
+	}
+	api := StorageAllocationDecisionFailure(storageDecisionSourceError(fmt.Errorf("read failed: %w", sdkerrors.ParseAPIError(500, []byte(`{"message":"storage 'nas' is not online"}`)))))
+	if api != "identity_or_audit_evidence: HTTP 500: storage 'nas' is not online" {
+		t.Fatalf("API failure = %q, want its classified description", api)
+	}
+	if got := StorageAllocationDecisionFailure(nil); got != "identity_or_audit_evidence" {
+		t.Fatalf("nil failure = %q, want the bare class", got)
+	}
+}
+
+// TestStorageAllocationDecisionFailureNamesCPIRefusals pins that a refusal the
+// CPI wrote itself reaches the storage-journal CLI with its reason, wherever
+// it sits in the chain, while backend text beside it stays out.
+func TestStorageAllocationDecisionFailureNamesCPIRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"fixed refusal", storageDecisionSourceError(storageRefusal("pending stop lacks exact VM ownership")),
+			"identity_or_audit_evidence: pending stop lacks exact VM ownership"},
+		{"pending allocation moved", storageCleanupFailure("pending_mutation_settlement", pendingVMAllocationMoved(aj.Record{ID: "a1"}, aj.Step{Target: aj.Target{Node: "pve1", VMID: 123}}, "pve2", 123)),
+			"cleanup_pending_mutation_settlement: pending VM allocation a1 moved from exact target: VM 123 observed on pve2, recorded VM 123 on pve1"},
+		{"readback outside recorded nodes", storageDecisionSourceError(gateTestReadback().admitLocation(StorageAllocationAudit{})),
+			"identity_or_audit_evidence: actual VM is outside recorded nodes: VM 123 on pve2, recorded pve1, and the audit accepted no move"},
+		{"joined with an uncertain outcome", errors.Join(storageRefusal("VM stop not observed"), errors.New("Authorization: PVEAPIToken=root@pam!cpi=leaked")),
+			"identity_or_audit_evidence: VM stop not observed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := StorageAllocationDecisionFailure(tc.err)
+			if got != tc.want {
+				t.Fatalf("decision failure = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "leaked") {
+				t.Fatalf("decision failure leaked backend text: %q", got)
+			}
+		})
+	}
+	// The Director still reads the readback refusal exactly as before.
+	readback := gateTestReadback().admitLocation(StorageAllocationAudit{})
+	if message := directorMessage(readback); message != "allocation a1 requires reconciliation: actual VM is outside recorded nodes: VM 123 on pve2, recorded pve1, and the audit accepted no move" {
+		t.Fatalf("Director message = %q", message)
+	}
+}
+
+// gateTestReadback is a readback of VM 123, recorded on pve1, found on pve2.
+func gateTestReadback() *managedVMRecordReadback {
+	record := aj.Record{ID: "a1", Steps: []aj.Step{{Target: aj.Target{Node: "pve1", VMID: 123}}}}
+	return &managedVMRecordReadback{record: record, vmid: 123, node: "pve2"}
+}
+
+// TestStorageAuditGateHintQuotesACommandThatQuotesItself sets the command
+// off in double quotes when one of its arguments is single-quoted, so the
+// text between the quotes still pastes into a shell.
+func TestStorageAuditGateHintQuotesACommandThatQuotesItself(t *testing.T) {
+	command := "/home/op/cpi storage-journal audit --summary --config '/home/op/a b/cpi.json'"
+	err := storageAuditGateError(context.Background(), Deps{StorageAuditCommand: command}, "create_vm", gateTestReport(), storageAuditGateConflicts)
+	if err == nil || !strings.HasSuffix(err.Error(), `; run "`+command+`" for the full report`) {
+		t.Fatalf("gate error = %v, want the command in double quotes", err)
+	}
+	err = storageAuditGateError(context.Background(), Deps{StorageAuditCommand: gateTestCommand}, "create_vm", gateTestReport(), storageAuditGateConflicts)
+	if err == nil || !strings.HasSuffix(err.Error(), "; run '"+gateTestCommand+"' for the full report") {
+		t.Fatalf("gate error = %v, want the command in single quotes", err)
 	}
 }
 

@@ -218,6 +218,9 @@ func TestAllocationDecisionMalformedDiskSentinelBlocksAbsence(t *testing.T) {
 	if err == nil {
 		t.Fatal("malformed provenance certified artifact absence")
 	}
+	if message := directorMessage(err); !strings.HasPrefix(message, "allocation disposition refused: 1 audit issue; VM 456 has malformed disk provenance on pve1") {
+		t.Fatalf("disposition refusal = %q, want the audit issue it refused on", message)
+	}
 	current, err := journal.Inspect(record.ID)
 	if err != nil || current.State != record.State {
 		t.Fatalf("failed audit changed state %+v %v", current, err)

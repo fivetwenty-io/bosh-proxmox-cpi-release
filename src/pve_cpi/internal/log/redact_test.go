@@ -1,6 +1,7 @@
 package log_test
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -340,6 +341,8 @@ func TestScrubMessageMasksPVECredentialHeaders(t *testing.T) {
 		{"Authorization: PVEAPIToken=root@pam!cpi=0f1e2d3c-token-value rejected", "0f1e2d3c-token-value", "PVEAPIToken=" + log.RedactedPlaceholder + " rejected"},
 		{"cookie PVEAuthCookie=PVE:root@pam:65F0A1B2::c2lnbmF0dXJl; path=/", "c2lnbmF0dXJl", "PVEAuthCookie=" + log.RedactedPlaceholder},
 		{"pveapitoken=user@pve!id=lowercase-secret", "lowercase-secret", "pveapitoken=" + log.RedactedPlaceholder},
+		{"header PVEAPIToken= spaced-secret-value sent", "spaced-secret-value", "PVEAPIToken=" + log.RedactedPlaceholder + " sent"},
+		{"query ?PVEAuthCookie%3DPVE:root@pam::encoded-secret&x=1", "encoded-secret", "PVEAuthCookie%3D" + log.RedactedPlaceholder},
 	} {
 		out := log.ScrubMessage(tc.in)
 		if strings.Contains(out, tc.secret) {
@@ -347,6 +350,16 @@ func TestScrubMessageMasksPVECredentialHeaders(t *testing.T) {
 		}
 		if !strings.Contains(out, tc.keep) {
 			t.Errorf("ScrubMessage(%q) = %q, want it to keep %q", tc.in, out, tc.keep)
+		}
+		// The log field and the argument-tree redactor share the same rules.
+		if field := log.ErrScrubbed(errors.New(tc.in)).Value.String(); field != out {
+			t.Errorf("ErrScrubbed(%q) = %q, want %q", tc.in, field, out)
+		}
+		if tree, _ := log.RedactSecrets(map[string]any{"message": tc.in}).(map[string]any); tree["message"] != out {
+			t.Errorf("RedactSecrets(%q) = %q, want %q", tc.in, tree["message"], out)
+		}
+		if again := log.ScrubMessage(out); again != out {
+			t.Errorf("ScrubMessage is not idempotent: %q -> %q", out, again)
 		}
 	}
 }

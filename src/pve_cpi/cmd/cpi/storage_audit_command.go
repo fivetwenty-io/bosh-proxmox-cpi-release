@@ -50,14 +50,21 @@ func storageAuditExecutable() (string, error) {
 	return os.Executable()
 }
 
+// storageAuditJobRoot is where BOSH installs job packages. A CPI running from
+// it is a Director job, which always runs as the journal owner, while the
+// operator reading its refusal logs in as another user.
+const storageAuditJobRoot = "/var/vcap/"
+
 // renderStorageAuditCommand is the pure half of storageAuditCommand. owner and
-// euid are decimal UIDs, and lookup names the owner when the two differ.
+// euid are decimal UIDs, and lookup names the owner. A BOSH job's command
+// always carries the sudo prefix, and any other command carries it only when
+// the owner is not the effective UID.
 func renderStorageAuditCommand(executable, configPath, owner, euid string, lookup func(string) (*user.User, error)) string {
 	if executable == "" || configPath == "" {
 		return ""
 	}
 	command := shellQuoteArg(executable) + " storage-journal audit --summary --config " + shellQuoteArg(configPath)
-	if owner == euid {
+	if owner == euid && !strings.HasPrefix(executable, storageAuditJobRoot) {
 		return command
 	}
 	account, err := lookup(owner)

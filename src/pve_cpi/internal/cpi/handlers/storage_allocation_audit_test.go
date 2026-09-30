@@ -148,11 +148,16 @@ type allocationAuditStorage struct {
 	cs.Service
 	definitions cs.ListStorageResponse
 	failure     error
+	// noIndex answers with no storage index and no error.
+	noIndex bool
 }
 
 func (s *allocationAuditStorage) ListStorage(context.Context, *cs.ListStorageParams) (*cs.ListStorageResponse, error) {
 	if s.failure != nil {
 		return nil, s.failure
+	}
+	if s.noIndex {
+		return nil, nil
 	}
 	return &s.definitions, nil
 }
@@ -191,6 +196,9 @@ type allocationAuditNodes struct {
 	snapshots           map[int]map[string]map[string]any
 	snapshotListFailure map[int]error
 	snapshotFailure     map[string]error
+	// noNodeList and noContent answer GET /nodes and every content listing
+	// with no response and no error.
+	noNodeList, noContent bool
 }
 
 // ListStorageContent records every listing it serves; the audit fans out
@@ -201,6 +209,9 @@ func (n *allocationAuditNodes) ListStorageContent(_ context.Context, node, stora
 	n.mu.Unlock()
 	if err := n.failureByNode[node]; err != nil {
 		return nil, err
+	}
+	if n.noContent {
+		return nil, nil
 	}
 	if content, ok := n.contentByNode[node]; ok {
 		return &content, nil
@@ -275,6 +286,9 @@ func (n *allocationAuditNodes) ListQemu(ctx context.Context, node string, params
 func (n *allocationAuditNodes) ListNodes(ctx context.Context) (*ns.ListNodesResponse, error) {
 	if n.nodesFailure != nil {
 		return nil, n.nodesFailure
+	}
+	if n.noNodeList {
+		return nil, nil
 	}
 	if n.nodeNames == nil {
 		return n.Service.ListNodes(ctx)

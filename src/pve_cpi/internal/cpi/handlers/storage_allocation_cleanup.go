@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -29,7 +28,7 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 		deps.recordStorageReconciliation(ctx, outcome)
 	}()
 	if ctx == nil || deps.Config == nil || deps.PVE == nil || journal == nil || decision.Action != "cleanup" || strings.TrimSpace(decision.DecisionID) == "" || len(decision.DecisionID) > 256 || strings.ContainsAny(decision.DecisionID, "\r\n\x00") {
-		return result, fmt.Errorf("cleanup requires journal authority and a bounded nonsecret decision reference")
+		return result, storageRefusal("cleanup requires journal authority and a bounded nonsecret decision reference")
 	}
 	phase = "authority_read"
 	if _, err := journal.Inspect(decision.AllocationID); err != nil {
@@ -47,15 +46,15 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	}()
 	record := handle.Record()
 	if record.Namespace != deps.Config.StoragePlacementNamespace {
-		return result, fmt.Errorf("cleanup namespace differs from journal authority")
+		return result, storageRefusal("cleanup namespace differs from journal authority")
 	}
 	phase = "cluster_identity"
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, deps.PVE.Nodes(), nodes)
 	if err != nil || identity.ID() != record.ClusterID {
-		return result, fmt.Errorf("cleanup requires verified live cluster continuity")
+		return result, storageRefusal("cleanup requires verified live cluster continuity")
 	}
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
-		return result, fmt.Errorf("allocation already has a terminal disposition")
+		return result, storageRefusal("allocation already has a terminal disposition")
 	}
 	phase = "pending_mutation_settlement"
 	ctx, settlement, err := admitStorageCleanupSettlement(ctx, deps, record, decision)
@@ -91,7 +90,7 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	if cleanupCanFinalizeDirectly(record, settlement) {
 		for _, evidence := range report.Evidence {
 			if evidence.AllocationID == record.ID {
-				return result, fmt.Errorf("unsubmitted allocation has unexplained provenance")
+				return result, storageRefusal("unsubmitted allocation has unexplained provenance")
 			}
 		}
 		admission.AbsenceVerified = true
@@ -138,11 +137,11 @@ func retainedCleanupDecisionAdmission(ctx context.Context, deps Deps, record aj.
 		}
 	}
 	if retained.VMID <= 0 {
-		return aj.Verification{}, fmt.Errorf("retained VM disposition identity unavailable")
+		return aj.Verification{}, storageRefusal("retained VM disposition identity unavailable")
 	}
 	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, retained.VMID)
 	if err != nil || location.Found {
-		return aj.Verification{}, fmt.Errorf("retained cleanup requires absent original VM identity")
+		return aj.Verification{}, storageRefusal("retained cleanup requires absent original VM identity")
 	}
 	var present []aj.Target
 	for _, target := range retained.RetainedArtifacts {
@@ -162,7 +161,7 @@ func retainedCleanupDecisionAdmission(ctx context.Context, deps Deps, record aj.
 			continue
 		}
 		if e != nil || info == nil || info.Size <= 0 {
-			return aj.Verification{}, fmt.Errorf("retained artifact exact readback unavailable")
+			return aj.Verification{}, storageRefusal("retained artifact exact readback unavailable")
 		}
 		present = append(present, target)
 	}
@@ -196,10 +195,10 @@ func storageCleanupDiskOwnership(ctx context.Context, deps Deps, record aj.Recor
 				return aj.Verification{}, storageDecisionSourceError(e)
 			}
 			if rd.allocation == nil || rd.allocation.record.ID != record.ID || rd.intent != nil {
-				return aj.Verification{}, fmt.Errorf("disk cleanup identity or transfer remains unresolved")
+				return aj.Verification{}, storageRefusal("disk cleanup identity or transfer remains unresolved")
 			}
 			if rd.holder != nil && !rd.holder.IsParker {
-				return aj.Verification{}, fmt.Errorf("disk cleanup requires managed detach before deleting an attached disk")
+				return aj.Verification{}, storageRefusal("disk cleanup requires managed detach before deleting an attached disk")
 			}
 			ownership, e = managedDiskOwnershipProof(rd)
 			if e != nil {
@@ -234,7 +233,7 @@ func executeStorageAllocationCleanup(ctx context.Context, deps Deps, journal *aj
 			}
 		}
 		if !proof.Complete || !proof.AbsenceVerified || !proof.ArtifactDispositionVerified || proof.EvidenceJSON == "" {
-			return result, fmt.Errorf("VM cleanup did not prove durable complete disposition")
+			return result, storageRefusal("VM cleanup did not prove durable complete disposition")
 		}
 		record = handle.Record()
 		record.State = aj.Cleaned
@@ -250,7 +249,7 @@ func executeStorageAllocationCleanup(ctx context.Context, deps Deps, journal *aj
 		return result, storageDecisionSourceError(err)
 	}
 	if !proof.Complete || !proof.AbsenceVerified || !proof.ArtifactDispositionVerified || proof.EvidenceJSON == "" {
-		return result, fmt.Errorf("disk cleanup did not prove durable complete disposition")
+		return result, storageRefusal("disk cleanup did not prove durable complete disposition")
 	}
 	record = handle.Record()
 	record.State = aj.Cleaned
