@@ -1218,7 +1218,7 @@ Nothing clears such a record automatically, and that is deliberate, because deci
 
 **Symptom**
 
-A `create_vm`, `create_disk`, `delete_vm`, or `delete_disk` fails, and its error opens with the operation, the word `refused`, and a count of audit findings. Every refusal has the same shape.
+A `create_vm`, `create_disk`, `delete_vm`, or `delete_disk` fails, or a `storage-journal` decision is refused, and the error opens with the operation, the word `refused`, and a count of audit findings. Every refusal has the same shape.
 
 ```text
 <operation> refused: <counts>; <finding>; <finding>; <finding>; and <N> more; run '<audit command>' for the full report
@@ -1238,13 +1238,13 @@ The operation at the front tells us which call refused and which findings it ref
 |---|---|---|
 | `create_vm refused` | `create_vm` admission | Any conflict, or any issue that left the VM scan incomplete |
 | `VM allocation readback refused` | A Director retry of `create_vm` whose allocation already has a record | Any conflict, or any issue that left the VM scan incomplete |
-| `create_vm retry refused` | A `create_vm` retry that plans a new attempt | Any conflict or issue |
+| `create_vm retry refused` or `unsubmitted VM generation inspection refused` | A `create_vm` retry that plans a new attempt or inspects one that was never submitted | Any conflict or issue |
 | `storage allocation admission refused` | `create_disk` | Any conflict |
 | `create_disk retry refused` | A `create_disk` retry | Any conflict or issue |
-| `VM cleanup refused`, `retained VM cleanup refused`, or `post-destroy VM resource cleanup refused` | `delete_vm` | Any conflict or issue |
+| `VM cleanup refused`, `post-destroy VM resource cleanup refused`, or `VM cleanup completion refused` | `delete_vm`, or a `create_vm` retry that cleans up a failed attempt | Any conflict or issue |
 | `delete_disk refused` | `delete_disk` | Any conflict or issue |
 
-So a storage listing that failed on one node blocks `delete_vm` and `delete_disk` but not `create_vm`, while an offline node blocks all of them.
+So a storage listing that failed on one node blocks `delete_vm` and `delete_disk` but not `create_vm`. An offline node blocks every call in the table except `create_disk` admission, which refuses only on a conflict. The `storage-journal` actions `cleanup`, `adopt`, and `finalize-cleanup` run audit gates of their own, including the ones for retained VM cleanup. They print the same summary inside `allocation decision refused (<class>: <summary>)`, without the command, because we are already running it.
 
 **Diagnosis**
 
@@ -1256,19 +1256,19 @@ For the full report, we run the command the refusal names on the host that runs 
 sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json
 ```
 
-The `sudo -u vcap` matters. Plain `sudo` runs the audit as root, and the journal opens only for its owner, so the CLI stops with `journal <path> is owned by vcap; rerun as that user:` followed by the command to use. Under `bosh create-env` the CPI runs on our workstation as our own user, so the command the refusal prints has no `sudo -u` and uses the workstation's paths.
+The `sudo -u vcap` matters. The CPI itself runs as `vcap`, but we log in to the Director as another user, so a CPI that runs from `/var/vcap/` always prints the command with `sudo -u` and the journal's owner. Plain `sudo` runs the audit as root, and the journal opens only for its owner, so the CLI stops with `journal <path> is owned by vcap; rerun as that user:` followed by the command to use. Under `bosh create-env` the CPI runs on our workstation as our own user, so the command the refusal prints has no `sudo -u` and uses the workstation's paths.
 
-`--summary` prints one line per finding, so we can read the report on a Director that has no `jq`. The first line gives the overview, and every other line starts with its kind.
+`--summary` prints one line per finding, so we can read the report on a Director that has no `jq`. The first line gives the overview, and every other line starts with its kind. Here is the summary from a Director where one VM moved with a node-local disk and another moved on shared storage.
 
 ```text
 audit: complete=false vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=42
 conflict: remote allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9 (VM 4626) is outside recorded mutation targets: observed on pvupvecf102, recorded pvupvecf101 (node_mismatch); a migration outside BOSH is the usual cause; not accepted as a move because volume local-lvm:vm-4626-disk-0 is node-local
 issue: known volume local-lvm:vm-4626-disk-0 on storage "local-lvm" on node "pvupvecf102" disagrees with recorded physical target: allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9 recorded pvupvecf101 (node_local_elsewhere)
-observed move: vm allocation 5b1c9a47-2f0e-4d4b-9b3e-7a61e0c2d8f1 (VM 7014) moved from pvupvecf102 to pvupvecf103
+observed move: vm allocation 5b1c9a47-2f0e-4d4b-9b3e-7a61e0c2d8f1 (VM 7015) moved from pvupvecf102 to pvupvecf103
 charging: none
 ```
 
-In this report, VM 4626 moved with a node-local disk and stays a conflict, while VM 7014 moved on shared storage and was accepted. A `conflict:` line means the audit saw something that contradicts the journal. A `vm-scan issue:` line means the VM scan could not finish, so the audit cannot prove that no other copy of a VM exists. An `issue:` line means some other read failed. An `observed move:` line is a move the audit accepted, and it never blocks anything. A `generation index:` line appears only when the journal's index is unhealthy, and a `skipped disabled storages:` line appears only when the audit skipped one. The command exits 1 when the audit or its VM scan is incomplete, when the index is unhealthy, or when cluster continuity is lost, and any conflict marks the audit incomplete. The findings name the allocation, the VMID, the recorded node, and the observed node, so each one matches one of the cases below.
+In this report, VM 4626 moved with a node-local disk and stays a conflict, while VM 7015 moved on shared storage and was accepted. A `conflict:` line means the audit saw something that contradicts the journal. A `vm-scan issue:` line means the VM scan could not finish, so the audit cannot prove that no other copy of a VM exists. An `issue:` line means some other read failed, or that what the audit read disagrees with the journal in a way that is not a conflict, like the `(node_local_elsewhere)` line above or malformed disk provenance. An `observed move:` line is a move the audit accepted, and it never blocks anything. A `generation index:` line appears only when the journal's index is unhealthy, and a `skipped disabled storages:` line appears only when the audit skipped one. The command exits 1 when the audit or its VM scan is incomplete, when the index is unhealthy, or when cluster continuity is lost, and any conflict marks the audit incomplete. The findings name the allocation, the VMID, the recorded node, and the observed node, so each one matches one of the cases below.
 
 **An accepted move on shared storage**
 
@@ -1284,7 +1284,7 @@ The audit accepts a VM move only when all of these hold:
 
 - The VM scan is complete, so no offline node can hide a second copy.
 
-- The record belongs to our namespace and is in `ready_to_return` or `adopted`, which means the Director already holds the VM's CID.
+- The record belongs to our namespace and is in `ready_to_return` or `adopted`, which means the Director already holds the VM's CID. A record that `delete_vm` has since moved into `planned`, `observed`, or `reconciliation_required` also qualifies, but only when the latest delete admission that verified the VM's ownership accepted the same move of the same VMID to the same node.
 
 - The VMID is a target of the record's active attempt, the allocation marker was sighted exactly once, and the VM carries the record's agent digest.
 
@@ -1302,11 +1302,11 @@ A moved disk or parker needs the holder VM to be sighted exactly once in a compl
 
 - The new node's listing of that storage, taken in this same audit, shows the volume itself. A successful listing that lacks the volume is not enough, because a `dir` storage whose mount has dropped lists the empty directory underneath.
 
-The CPI never writes an accepted move into the journal. It decides every move afresh on every audit, and when an operation retains verification evidence, that evidence lists the moves its audit saw. The calls that run later read the same decision. Resume and adoption accept the VM on its new node, and so do `delete_vm` with retained ephemeral disks and a `delete_vm` that re-enters after a crash. A `detach_disk` first rewrites the disk's provenance on the VM so that it names the VM's current node, and it does this before the disk moves to its parker. Parker reuse, attaching from a parker, and parker cleanup accept a moved parker the same way.
+The CPI never records a step for an accepted move in the journal. It decides every move afresh on every audit, and when an operation retains verification evidence, that evidence lists the moves its audit saw. The calls that run later read the same decision. Resume and adoption accept the VM on its new node, and `delete_vm` stops and destroys it there, retains its ephemeral disks there, and heals the provenance of any persistent disk it detaches. While that delete runs, and after it fails partway, the audit keeps reading the VM as moved because the delete admission accepted the move. Other deployments can still create VMs in the meantime, and the Director's retry of `delete_vm` finishes the job. When a crash leaves a stop or destroy step unsettled, a plain `delete_vm` retry refuses with `cleanup has unresolved mutation evidence`, as it does for a VM that never moved, and `storage-journal cleanup` then links that step to the moved VM through the same admission. A `detach_disk` first rewrites the disk's provenance on the VM so that it names the VM's current node, and it does this before the disk moves to its parker. Parker reuse, attaching from a parker, and `delete_disk` of a parked disk accept a moved persistent-disk parker the same way.
 
-There is nothing to fix. We can leave the VM where it is or migrate it back. Downgrading the CPI below this release brings the conflicts back, because an older CPI does not know the rule.
+For a VM, a persistent disk, or a persistent-disk parker, there is nothing to fix. We can leave it where it is or migrate it back. Downgrading the CPI below this release brings the conflicts back, because an older CPI does not know the rule. The retention parker that `delete_vm` leaves behind for retained ephemeral disks is the exception, and the entry on a retention parker moved by a bulk migrate, further down, covers it.
 
-A few checks stay strict even on shared storage. A VM whose CID the Director never received still refuses with `pending VM allocation <id> moved from exact target: VM <vmid> observed on <node>, recorded VM <vmid> on <node>`. A `create_disk` whose hinted VM moves while the disk is planned refuses with `create_disk: hinted VM <cid> migrated outside observed nodes: now on <node>, observed <nodes>; no allocation submitted`, and simply retrying the deploy settles that one. ISO cleanup also stays strict about its node.
+A few checks stay strict even on shared storage. A VM whose CID the Director never received is not accepted as moved, so `storage-journal cleanup` of it refuses with `allocation decision refused (cleanup_historical_audit: 1 audit conflict; VM <vmid> on <node>, recorded <node> (node_mismatch); not a move: the record is in state <state>, not ready_to_return or adopted)`. A `create_disk` whose hinted VM moves while the disk is planned refuses with `create_disk: hinted VM <cid> migrated outside observed nodes: now on <node>, observed <nodes>; no allocation submitted`, and simply retrying the deploy settles that one. ISO cleanup also stays strict about its node, and so does cleanup of a retention parker.
 
 The rule has one blind spot. The CPI trusts the `shared` flag on a `dir` or `lvm` storage. If a storage was declared shared from the start but is really a local directory on each node, and the new node happens to hold a file of the same name, the audit cannot tell that file from the real volume.
 
@@ -1354,13 +1354,30 @@ If the names match, we run the audit again and the conflicts are gone. If a voli
 
 Parker VMs are ordinary stopped VMs that hold parked persistent disks, so a bulk migrate or `pvenode migrateall` during a patch cycle moves them along with everything else. On shared storage the audit accepts the move and prints a `parker allocation` line. On node-local storage the parked disk raises the `disk ownership provenance disagrees with actual holder node` conflict shown above, with the parker's VMID as the holder. The fix is the same as for any node-local move. We migrate the parker back to the node its provenance names, with `--with-local-disks`, and check its volids afterwards.
 
+**A retention parker moved by a bulk migrate**
+
+When `delete_vm` keeps a VM's ephemeral disks, it moves them onto a retention parker and leaves the record in `vm_deleted_retained`. That parker's entry carries no allocation ID, so the audit never decides a move for it, and the summary shows neither a conflict nor an `observed move:` line for it. The explicit cleanup that finally deletes those disks still reads the parker on the node it was created on. If a bulk migrate moved the parker, even on shared storage, `storage-journal cleanup` refuses with `allocation decision refused (cleanup_resource_cleanup: <description>)`. The description names the failed read of the parker on its recorded node, and it is usually an HTTP status with PVE's message.
+
+The retention steps in the VM's journal record name the parker's VMID and its recorded node. We read them on the Director like this.
+
+```bash
+sudo -u vcap find /var/vcap/store/pve_cpi/allocations -name 'allocation-<allocation id>.json' \
+  -exec grep -oE '"kind":"lifecycle_delete_vm_retain_ephemeral_QEMU_Create","target":\{[^}]*\}' {} +
+```
+
+The fix is to migrate the retention parker back to its recorded node and then retry the cleanup.
+
+```bash
+pmx pve qemu migrate <parker vmid> --target-node <recorded node>
+```
+
 **A node reported offline**
 
 ```text
 some cluster nodes could not be inspected: <node>, <node> (reported offline by /cluster/status)
 ```
 
-This is a VM-scan issue, so it refuses every audit-gated call, `create_vm` included. The audit cannot prove that an allocation has no second copy on a node it cannot read. A related issue, `cluster VM enumeration failed: could not list guests on node(s) <nodes>`, means the node was not reported offline but its guest listing failed. We bring the node back, or we restore its API if it is up but unreachable. If the node is gone for good, we remove it from the cluster the way PVE documents, and the next audit no longer counts it.
+This is a VM-scan issue, so it refuses every audit-gated call, `create_vm` included. The one exception is `create_disk` admission, which refuses only on a conflict. The audit cannot prove that an allocation has no second copy on a node it cannot read. A related issue, `cluster VM enumeration failed: could not list guests on node(s) <nodes>`, means the node was not reported offline but its guest listing failed. We bring the node back, or we restore its API if it is up but unreachable. If the node is gone for good, we remove it from the cluster the way PVE documents, and the next audit no longer counts it.
 
 **An unreadable VM configuration**
 
@@ -1385,4 +1402,4 @@ VM <vmid> has malformed allocation provenance on <node>: <parse error>
 VM <vmid> has malformed disk provenance on <node>: <parse error>
 ```
 
-The first is a VM-scan issue about the `[bosh_storage_allocation]` block in the VM's Notes, and it refuses `create_vm`. The second is about the `bosh_disk_allocations` or `bosh_parked_disks` provenance, and it names the carrier or key that failed. It refuses `delete_vm`, `delete_disk`, and the retries. The parse error is one of the CPI's fixed texts, such as `ambiguous storage allocation provenance` or `malformed JSON provenance`. Both usually mean somebody edited the VM's Notes by hand. We read them with `pmx pve qemu config get <vmid> --node <node>` and restore the block exactly as the CPI wrote it, from a backup of the VM configuration if we have one. We should not delete the block to clear the refusal, because the marker is how the CPI recognizes its own VM.
+The first is a VM-scan issue about the `[bosh_storage_allocation]` block in the VM's Notes, and it refuses `create_vm`. The second is about the `bosh_disk_allocations` or `bosh_parked_disks` provenance, and it names the carrier or key that failed. It refuses `delete_vm`, `delete_disk`, the `create_vm` and `create_disk` retries that plan a new attempt, and the `storage-journal` decisions. It does not refuse `create_vm` admission, `create_disk` admission, or a Director retry that reads back an existing allocation. The parse error is one of the CPI's fixed texts, such as `ambiguous storage allocation provenance` or `malformed JSON provenance`. Both usually mean somebody edited the VM's Notes by hand. We read them with `pmx pve qemu config get <vmid> --node <node>` and restore the block exactly as the CPI wrote it, from a backup of the VM configuration if we have one. We should not delete the block to clear the refusal, because the marker is how the CPI recognizes its own VM.
