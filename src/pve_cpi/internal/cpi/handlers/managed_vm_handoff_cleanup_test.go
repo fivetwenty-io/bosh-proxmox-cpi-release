@@ -68,6 +68,7 @@ func handoffRecord(t *testing.T, journal *aj.Journal) aj.Record {
 // one planned handoff step. Plain cleanup and delete_vm stay refused, and the
 // attested cleanup closes the VM generation without touching the disk.
 func TestCreateVMDiskNonCleanTimeoutVMCleanupPath(t *testing.T) {
+	// Stays serial: it swaps the package variable attachExistingDiskForVM.
 	locks := newLockContention(t)
 	deps, client, journal, cid, parker := createVMDiskFixture(t, locks, true)
 	locks.reset()
@@ -152,6 +153,7 @@ func assertParkedDiskUntouched(t *testing.T, client *createVMDiskClient, journal
 // VM cleanup runs delete_vm's preservation before the destroy, so the disk is
 // parked again under its own allocation and the VM goes away without it.
 func TestAttestedHandoffCleanupKeepsABoundPersistentDisk(t *testing.T) {
+	// Stays serial: it swaps the package variable attachExistingDiskForVM.
 	shape := newBoundHandoffShape(t)
 	deps, client, journal, cid, parker, vm, vmid := shape.deps, shape.client, shape.journal, shape.cid, shape.parker, shape.vm, shape.vmid
 
@@ -271,6 +273,7 @@ func openDiskStep(t *testing.T, journal *aj.Journal, vmid int) aj.Record {
 // cleanup of the VM record is refused, and the VM, the binding, and the disk
 // record are all left as they were.
 func TestAttestedHandoffCleanupRefusesWhileTheDiskIsUnsettled(t *testing.T) {
+	// Stays serial: it swaps the package variable attachExistingDiskForVM.
 	shape := newBoundHandoffShape(t)
 	before := openDiskStep(t, shape.journal, shape.vmid)
 
@@ -310,6 +313,7 @@ func TestAttestedHandoffCleanupRefusesWhileTheDiskIsUnsettled(t *testing.T) {
 // TestCleanupPersistentHandoffStepShape pins every condition the handoff
 // predicate checks, so a step that differs in any one of them stays refused.
 func TestCleanupPersistentHandoffStepShape(t *testing.T) {
+	t.Parallel()
 	kind := managedVMPersistentHandoffPrefix + strings.Repeat("0a", 32)
 	base := func() (aj.Step, aj.Record) {
 		root := aj.Step{ID: "attempt-0-step-0", Kind: "vm." + managedVMCallCreate, State: aj.Observed, Target: aj.Target{Node: "n1", VMID: 101}}
@@ -343,6 +347,7 @@ func TestCleanupPersistentHandoffStepShape(t *testing.T) {
 		"root on another VM": func(_ *aj.Step, r *aj.Record) { r.Steps[0].Target.VMID = 102 },
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			step, record := base()
 			mutate(&step, &record)
 			if cleanupPersistentHandoffStep(step, record) {

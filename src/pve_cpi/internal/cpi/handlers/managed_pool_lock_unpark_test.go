@@ -173,6 +173,7 @@ func assertReturnedRecord(t *testing.T, name string, record aj.Record) {
 // it must wait for the holder and then attach, leaving both allocations
 // returned with every step observed.
 func TestManagedAttachWaitsOutAHeldParkerLock(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	holder := newParkedFlowDisk(t, locks)
 	waiter := newParkedFlowDisk(t, locks)
@@ -195,7 +196,7 @@ func TestManagedAttachWaitsOutAHeldParkerLock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		waiterErr = waiter.attach(t.Context())
+		waiterErr = waiter.attach(withShortLockPoll(t.Context()))
 	}()
 	waitFor(t, locks.rejected, "the waiter's sentinel create to be refused")
 	close(gate)
@@ -258,6 +259,7 @@ func shortenManagedLockWait(ctx context.Context, d time.Duration) context.Contex
 // ready_to_return, the Director gets the retriable timeout, and the retry is
 // admitted and completes once the lock frees.
 func TestManagedAttachLockTimeoutReturnsTheAllocation(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -282,6 +284,7 @@ func TestManagedAttachLockTimeoutReturnsTheAllocation(t *testing.T) {
 // step the operation journaled but never observed, or that follows a poisoned
 // guard, goes uncertain.
 func TestManagedLifecycleTimeoutRules(t *testing.T) {
+	t.Parallel()
 	timeout := cpierrors.WrapAs(errors.Join(errors.New("held"), pve.ErrClusterLockTimeout), cpierrors.TypeRetriableCloud, "AcquireClusterLock: timed out")
 	for _, tc := range []struct {
 		name    string
@@ -312,6 +315,7 @@ func TestManagedLifecycleTimeoutRules(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			deps, _, journal, id, cid := lifecycleFlowFixtureState(t, true, true)
 			bare, meta, err := decodeDiskCID(t.Context(), deps, "attach_disk", cid)
 			if err != nil {
@@ -348,6 +352,7 @@ func TestManagedLifecycleTimeoutRules(t *testing.T) {
 // CPI's own error types, and the timeout sentinel must still be visible
 // through them, or a clean timeout would never be recognized.
 func TestManagedLockTimeoutSurvivesTheAttachWrappers(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -381,6 +386,7 @@ func TestManagedLockTimeoutSurvivesTheAttachWrappers(t *testing.T) {
 // held parker lock. The Director must see the retriable timeout, and the
 // Director's retry must be admitted and complete once the lock frees.
 func TestManagedDetachLockTimeoutKeepsTheTimeout(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -434,6 +440,7 @@ func assertOverlayNoteObserved(t *testing.T, disk *parkedFlowDisk, record aj.Rec
 // disk where it was, so when the wait runs out the allocation is returned, the
 // Director gets the retriable timeout, and the retry attaches the disk.
 func TestManagedAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -492,6 +499,7 @@ func assertCleanDiskTimeout(t *testing.T, disk *parkedFlowDisk, err error, elaps
 // TestCreateVMPreAttachUsesTheManagedWait covers create_vm's disk_cids
 // pre-attach, which unparks through the same parker lock as attach_disk.
 func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -509,6 +517,7 @@ func TestCreateVMPreAttachUsesTheManagedWait(t *testing.T) {
 // The overlay note it writes onto the receiving VM before the wait does not
 // count as a disk mutation, so the timeout still returns the disk cleanly.
 func TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -527,6 +536,7 @@ func TestCreateVMPreAttachOverlayBeforeTimeoutReturnsTheDisk(t *testing.T) {
 // preserve_disk, which parks the disk through the same parker lock as
 // detach_disk.
 func TestDeleteVMPreservationUsesTheManagedWait(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -573,6 +583,7 @@ func lockTimeoutError() error {
 // the VM guard stays clean, and the post-create failure goes back retriable
 // without marking the VM allocation uncertain.
 func TestVMAllocationSettlesACleanDiskTimeout(t *testing.T) {
+	// Stays serial: it swaps the package variable attachExistingDiskForVM.
 	m := createdManagedVM(t)
 	withDiskAttachOutcome(t, &diskReturnedAfterLockTimeout{err: lockTimeoutError()})
 
@@ -602,6 +613,7 @@ func TestVMAllocationSettlesACleanDiskTimeout(t *testing.T) {
 // TestVMAllocationPoisonsOnAnUncertainDiskFailure is the negative case. A disk
 // failure that is not a clean wait-out still poisons the VM allocation.
 func TestVMAllocationPoisonsOnAnUncertainDiskFailure(t *testing.T) {
+	// Stays serial: it swaps the package variable attachExistingDiskForVM.
 	for name, outcome := range map[string]error{
 		"bare timeout without the marker": lockTimeoutError(),
 		"other disk failure":              cpierrors.Cloud("transfer failed"),
@@ -624,6 +636,7 @@ func TestVMAllocationPoisonsOnAnUncertainDiskFailure(t *testing.T) {
 // waited out the parker lock leaves nothing uncertain while every step is
 // observed, and any other failure marks the VM allocation uncertain.
 func TestVMCleanupFailureRules(t *testing.T) {
+	t.Parallel()
 	m := createdManagedVM(t)
 	returned := &diskReturnedAfterLockTimeout{err: lockTimeoutError()}
 	if err := managedVMCleanupFailure(m.handle, returned); !isDiskReturnedAfterLockTimeout(err) || m.handle.Record().State == aj.ReconciliationRequired {
@@ -639,6 +652,7 @@ func TestVMCleanupFailureRules(t *testing.T) {
 // create reaches PVE and the journal, so the disk record grows by one step
 // however many polls the wait makes.
 func TestManagedLockWaitDoesNotGrowTheRecord(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -733,6 +747,7 @@ func legacyPreservationFixture(t *testing.T, locks *lockContention) (Deps, *life
 // before the preservation touched the disk leaves the VM allocation settled,
 // and delete_vm's cleanup rule does not mark it uncertain.
 func TestDeleteVMLegacyPreservationUsesTheManagedWait(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	deps, client, handle, parker, _ := legacyPreservationFixture(t, locks)
 	plantHeldParkerLock(locks, parker)
@@ -773,6 +788,7 @@ func TestDeleteVMLegacyPreservationUsesTheManagedWait(t *testing.T) {
 // attachPersistent settles its step instead of poisoning the VM allocation,
 // and the VM record is not marked uncertain.
 func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	deps, client, handle, parker, cid := legacyPreservationFixture(t, locks)
 	if err := detachManagedPersistentForVMDelete(t.Context(), deps, "n1", 777, nil, handle); err != nil {
@@ -837,6 +853,7 @@ func failConfirmingReads(locks *lockContention) {
 // and every step is observed. The allocation goes back to ready_to_return, the
 // error is retriable, the sentinel is gone, and the retry completes.
 func TestManagedAttachUnknownLockStateReturnsTheAllocation(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -870,6 +887,7 @@ func TestManagedAttachUnknownLockStateReturnsTheAllocation(t *testing.T) {
 // waits it out and times out cleanly, and once the claim has lapsed the
 // following attach completes.
 func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -946,6 +964,7 @@ func assertCleanCancellation(t *testing.T, disk *parkedFlowDisk, err error, sign
 // else was admitted, so the allocation is returned with a retriable error and
 // the sentinel is gone.
 func TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -973,6 +992,7 @@ func TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation(t *testing.T
 // The wait ends interrupted, the window never runs, and the allocation is
 // returned with a retriable error. The holder's claim is untouched.
 func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -1007,6 +1027,7 @@ func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
 // release of our sentinel. Nothing was admitted, so the allocation is returned
 // with a retriable error and the sentinel is gone.
 func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -1040,6 +1061,7 @@ func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T)
 // have changed the disk, so the guard is poisoned and the allocation needs
 // reconciliation, exactly as before.
 func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -1064,6 +1086,7 @@ func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
 // stays clean. The poll is cut to a millisecond so the retry costs no real
 // wait.
 func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
+	t.Parallel()
 	ctx := pve.WithClusterLockPollForTest(t.Context(), time.Millisecond)
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
@@ -1098,6 +1121,7 @@ func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
 // and deletes it, so the next request on this parker does not wait out a
 // whole TTL behind one uncertain request.
 func TestManagedAttachPoisonedWindowReleasesItsSentinel(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
@@ -1120,6 +1144,7 @@ func TestManagedAttachPoisonedWindowReleasesItsSentinel(t *testing.T) {
 // unserialized, where every write would be refused anyway. Nothing was
 // admitted, so the allocation is returned with a retriable error.
 func TestManagedAttachEndedBeforeTheLockCreateFailsTheCall(t *testing.T) {
+	t.Parallel()
 	locks := newLockContention(t)
 	disk := newParkedFlowDisk(t, locks)
 	locks.reset()
