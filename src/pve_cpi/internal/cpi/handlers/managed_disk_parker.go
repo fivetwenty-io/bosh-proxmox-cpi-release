@@ -141,7 +141,7 @@ func (m *managedDiskRequest) observeParkMutation(ctx context.Context, handle *aj
 		return err
 	}
 	if call.Service == "Pool" {
-		return m.observeParkPool(ctx, call)
+		return observeLockPoolMutation(ctx, m.deps.PVE.Pools(), call, result, "parker")
 	}
 	if call.Service == managedServiceQEMU && call.Method == "Create" {
 		upid, ok := result.(string)
@@ -235,21 +235,4 @@ func sortedTagString(s string) string {
 	parts := strings.Split(s, ";")
 	sort.Strings(parts)
 	return strings.Join(parts, ";")
-}
-
-func (m *managedDiskRequest) observeParkPool(ctx context.Context, call ManagedAllocationMutation) error {
-	pool, _ := call.Args["poolID"].(string)
-	comment, found, err := m.deps.PVE.Pools().GetPoolComment(ctx, pool)
-	if err != nil {
-		return err
-	}
-	if call.Method == "CreatePool" {
-		want, _ := call.Args["comment"].(string)
-		if !found || comment != want {
-			return fmt.Errorf("parker lock ownership readback mismatch")
-		}
-	} else if found {
-		return fmt.Errorf("parker lock deletion not observed")
-	}
-	return nil
 }

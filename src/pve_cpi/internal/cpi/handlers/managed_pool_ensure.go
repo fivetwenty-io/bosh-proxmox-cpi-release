@@ -14,8 +14,9 @@ import (
 // It does not establish CPI ownership of the pool or permission to delete it.
 type managedExistingPool struct{ poolID string }
 
-// EnsurePoolExists handles idempotence inside the guard. Direct CreatePool is
-// deliberately unchanged because pool-based locks require exclusive creation.
+// EnsurePoolExists handles idempotence inside the guard. Direct CreatePool keeps
+// exclusive semantics because pool-based locks require exclusive creation; it
+// hands a refused sentinel create back unchanged (see managed_pool_lock.go).
 func (t *managedPoolService) EnsurePoolExists(ctx context.Context, poolID, comment string) error {
 	found, err := t.existingPool(ctx, poolID)
 	if err != nil || found {
@@ -58,9 +59,26 @@ func (t *managedPoolService) existingPool(ctx context.Context, poolID string) (b
 // changing the pool. Generic conflicts, substrings and transport failures are
 // insufficient, even if a later read happens to find the requested pool.
 func exactPoolAlreadyExists(err error, poolID string) bool {
+	return exactPoolVerdict(err, "create pool failed", "pool '"+poolID+"' already exists")
+}
+
+// exactPoolDoesNotExist is the delete-side counterpart. Pool.pm raises it under
+// the same lock, before it deletes anything.
+func exactPoolDoesNotExist(err error, poolID string) bool {
+	return exactPoolVerdict(err, "delete pool failed", "pool '"+poolID+"' does not exist")
+}
+
+// exactPoolVerdict matches a Pool.pm verdict as a whole message. Pool.pm raises
+// each verdict inside lock_user_config, which re-raises it as "<errmsg>:
+// <verdict>", so a live cluster answers HTTP 500 with the prefixed form in the
+// body's message field. The bare verdict is accepted as well because it names
+// the same condition on the same pool. Anything else, including extra text or
+// a field-error map, is not proof.
+func exactPoolVerdict(err error, errmsg, verdict string) bool {
 	var apiErr *sdkerrors.APIError
 	if !errors.As(err, &apiErr) || apiErr.HTTPCode != http.StatusInternalServerError || len(apiErr.Errors) != 0 {
 		return false
 	}
-	return strings.TrimSuffix(apiErr.Message, "\n") == "pool '"+poolID+"' already exists"
+	message := strings.TrimSuffix(apiErr.Message, "\n")
+	return message == verdict || message == errmsg+": "+verdict
 }

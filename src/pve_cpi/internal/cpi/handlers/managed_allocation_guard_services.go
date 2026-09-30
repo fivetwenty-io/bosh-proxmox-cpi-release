@@ -543,6 +543,9 @@ func (t *managedPoolService) CreatePool(ctx context.Context, poolID, comment str
 	}
 	defer t.guard.end(ctx, m, token)
 	err = t.PoolService.CreatePool(ctx, poolID, comment)
+	if t.lockCreateRefused(ctx, poolID, comment, err) {
+		return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
+	}
 	err = t.guard.finish(ctx, m, token, nil, err)
 	return
 }
@@ -553,8 +556,15 @@ func (t *managedPoolService) DeletePool(ctx context.Context, poolID string) (err
 		return
 	}
 	defer t.guard.end(ctx, m, token)
+	var result any
+	if isManagedLockPool(poolID) {
+		result = t.lockDeletionClaim(ctx, poolID)
+	}
 	err = t.PoolService.DeletePool(ctx, poolID)
-	err = t.guard.finish(ctx, m, token, nil, err)
+	if isManagedLockPool(poolID) && exactPoolDoesNotExist(err, poolID) {
+		return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, err)
+	}
+	err = t.guard.finish(ctx, m, token, result, err)
 	return
 }
 
