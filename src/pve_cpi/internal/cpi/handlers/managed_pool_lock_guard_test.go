@@ -265,33 +265,31 @@ func TestManagedLockCreateRefusalAfterRelease(t *testing.T) {
 	}
 }
 
-// TestManagedLockCreateDisplacedAfterSuccess covers a stealer that acts between
-// a successful create and its readback. PVE accepted the create, so the step
-// is observed whatever the readback finds, and the lock code's own
-// verification decides who holds the lock. Only an unreadable sentinel stays
-// uncertain.
+// TestManagedLockCreateDisplacedAfterSuccess covers what can happen to a
+// sentinel between a successful create and anything that reads it: a stealer
+// deletes it, a stealer replaces it, or a read of it fails. PVE accepted the
+// create, so the step is observed in every case without a read, and the lock
+// code's own verification decides who holds the lock.
 func TestManagedLockCreateDisplacedAfterSuccess(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		pools    *lockGuardPools
-		poisoned bool
+		name  string
+		pools *lockGuardPools
 	}{
 		{name: "sentinel gone", pools: &lockGuardPools{createGone: true}},
 		{name: "another claim", pools: &lockGuardPools{createDisplaced: true}},
-		{name: "readback fails", pools: &lockGuardPools{readErr: errors.New("read failed")}, poisoned: true},
+		{name: "a read would fail", pools: &lockGuardPools{readErr: errors.New("read failed")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := &lockGuardEvents{}
 			guard := newLockGuard(t, tc.pools, events)
 			err := guard.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=me exp=1")
-			if tc.poisoned {
-				if err == nil || guard.Err() == nil || events.failed != 1 {
-					t.Fatalf("an unreadable sentinel was accepted: %v", err)
-				}
-				return
-			}
 			if err != nil || guard.Err() != nil || events.failed != 0 {
-				t.Fatalf("a displaced create poisoned the guard: err=%v poison=%v", err, guard.Err())
+				t.Fatalf("an accepted create poisoned the guard: err=%v poison=%v", err, guard.Err())
+			}
+			for _, call := range tc.pools.calls {
+				if strings.HasPrefix(call, "read:") {
+					t.Fatalf("the guard read the sentinel back after an accepted create: %v", tc.pools.calls)
+				}
 			}
 		})
 	}
@@ -365,9 +363,11 @@ func TestManagedLifecycleLockObservation(t *testing.T) {
 	if _, err := guard.observePool(t.Context(), create, nil); err != nil {
 		t.Fatalf("a create displaced before its readback was not observed: %v", err)
 	}
+	// PVE's acceptance is the observation, so a read that would fail no
+	// longer makes an accepted create uncertain. A delete still needs one.
 	pools.readErr = errors.New("read failed")
-	if _, err := guard.observePool(t.Context(), create, nil); err == nil {
-		t.Fatal("an unreadable sentinel was observed as our create")
+	if _, err := guard.observePool(t.Context(), create, nil); err != nil {
+		t.Fatalf("an accepted create was not observed while a read would fail: %v", err)
 	}
 	pools.readErr = nil
 	volumes, err := guard.observePool(t.Context(), create, managedLockPoolRejection{poolID: lockGuardPool, method: "CreatePool"})
