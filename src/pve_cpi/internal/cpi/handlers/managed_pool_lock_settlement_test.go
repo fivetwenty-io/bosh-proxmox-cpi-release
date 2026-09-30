@@ -126,6 +126,43 @@ func TestLockBugRecordHealsOnAttachRetry(t *testing.T) {
 	}
 }
 
+// TestLockBugRecordDetachesBeforeTheRerunOrphansIt is the rerun's route when
+// the failed attach was the disk's first. The Director still holds that disk
+// as inactive, so the rerun attaches a different disk and then calls
+// detach_disk on ours before it orphans it. The Director tolerates only
+// DiskNotAttached from that call, so the detach of a disk that never left its
+// parker must succeed, settle the planned lock step by readback, and return
+// the record without an operator adopting it first.
+func TestLockBugRecordDetachesBeforeTheRerunOrphansIt(t *testing.T) {
+	disk, locks, planned := lockBugRecord(t)
+	locks.mu.Lock()
+	sentinels := len(locks.pools)
+	locks.mu.Unlock()
+	if sentinels != 0 {
+		t.Fatalf("the replayed record left a sentinel behind: %v", locks.pools)
+	}
+	args := []json.RawMessage{json.RawMessage(`"777"`), json.RawMessage(fmt.Sprintf("%q", disk.cid))}
+	if _, err := HandleDetachDisk(disk.deps).Handle(t.Context(), args, jsonrpc.Context{}); err != nil {
+		t.Fatalf("detach_disk refused the never-attached disk: %v", err)
+	}
+	record := disk.record(t)
+	assertReturnedRecord(t, "detached", record)
+	if step := stepByID(t, record, planned.ID); step.State != aj.Observed {
+		t.Fatalf("detach_disk left the lock step %s", step.State)
+	}
+	if slot := disk.client.state.configs[777]["scsi1"]; slot != nil {
+		t.Fatalf("the detach attached the disk to the instance: %v", slot)
+	}
+	if len(disk.client.state.volumes) != 1 {
+		t.Fatalf("the detach changed the disk's volumes: %v", disk.client.state.volumes)
+	}
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if len(locks.pools) != 0 {
+		t.Fatalf("the detach left a sentinel behind: %v", locks.pools)
+	}
+}
+
 // TestLockBugRecordAdopts is the operator's route for the same record.
 func TestLockBugRecordAdopts(t *testing.T) {
 	disk, _, planned := lockBugRecord(t)
@@ -279,8 +316,15 @@ func TestLockBugCreateDiskRecordCleansUp(t *testing.T) {
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if record, _ := journal.Inspect(id); record.CID != "" || record.State != aj.ReconciliationRequired {
+	record, _ := journal.Inspect(id)
+	if record.CID != "" || record.State != aj.ReconciliationRequired {
 		t.Fatalf("replayed record is not the old create_disk shape: %s CID=%q", record.State, record.CID)
+	}
+	// The park's lock step names no VMID, so the only sentinel the settlement
+	// reads is the one named for the VMID in the new volume's name. That VMID
+	// comes from the persistent-disk band, which never overlaps the parker band.
+	if got, want := strings.Join(lockStepSentinels(record), ","), fmt.Sprintf("bosh-lock-vm-%d", birth.VMID); birth.VMID <= 0 || got != want {
+		t.Fatalf("settlement reads %q for the create_disk record, want %q", got, want)
 	}
 
 	result, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "cleanup", AllocationID: id, DecisionID: "old-lock-bug-create-disk"})
@@ -295,18 +339,23 @@ func TestLockBugCreateDiskRecordCleansUp(t *testing.T) {
 	}
 }
 
-// TestLockBugRecordDeletesAsAnOrphan follows the disk a failed resize leaves
-// behind. The Director's rerun migrates to a fresh disk and orphans the one
-// the old lock bug stranded, and the orphan is later removed through
-// delete_disk. That delete settles the planned lock step itself, so it removes
-// the orphan whether or not an operator adopted it first.
+// TestLockBugRecordDeletesAsAnOrphan checks that the Director's orphan
+// cleanup can remove a disk the old lock bug stranded. When the record still
+// carries its planned lock step, delete_disk settles that step by readback
+// before it admits the record. When an operator adopted the disk first, adopt
+// has already settled the step, so that subtest checks only that delete_disk
+// removes an adopted record.
 func TestLockBugRecordDeletesAsAnOrphan(t *testing.T) {
 	for _, adopted := range []bool{false, true} {
-		t.Run(map[bool]string{false: "without adoption", true: "after adoption"}[adopted], func(t *testing.T) {
+		name := map[bool]string{false: "delete_disk settles the planned lock step", true: "delete_disk removes an adopted record"}[adopted]
+		t.Run(name, func(t *testing.T) {
 			disk, _, planned := lockBugRecord(t)
 			if adopted {
 				if _, err := ApplyStorageAllocationDecision(t.Context(), disk.deps, disk.journal, []string{"n1"}, adoptDecision(disk)); err != nil {
 					t.Fatalf("adopt: %v", err)
+				}
+				if step := stepByID(t, disk.record(t), planned.ID); step.State != aj.Observed {
+					t.Fatalf("adopt left the lock step %s", step.State)
 				}
 			}
 			if _, err := HandleDeleteDisk(disk.deps).Handle(t.Context(), []json.RawMessage{json.RawMessage(fmt.Sprintf("%q", disk.cid))}, jsonrpc.Context{}); err != nil {
@@ -317,7 +366,7 @@ func TestLockBugRecordDeletesAsAnOrphan(t *testing.T) {
 				t.Fatalf("delete_disk left the orphan's allocation %s (reason %q)", record.State, record.Reason)
 			}
 			if step := stepByID(t, record, planned.ID); step.State != aj.Observed {
-				t.Fatalf("delete_disk left the lock step %s", step.State)
+				t.Fatalf("the orphan's lock step is %s after delete_disk", step.State)
 			}
 			if len(disk.client.state.volumes) != 0 {
 				t.Fatalf("delete_disk left volumes behind: %v", disk.client.state.volumes)
