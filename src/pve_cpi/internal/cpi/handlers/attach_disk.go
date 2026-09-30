@@ -387,6 +387,16 @@ func attachDiskViaTransfer(
 	parkerCfg := parkerReadConfigFor(deps)
 
 	landed, terr := pve.TransferDiskFromParker(ctx, deps.PVE, deps.Log(ctx), plan.parker, vmid, targetSlot, preVolid, optStr, parkerCfg)
+	// A protection restore cut off after the disk landed does not stop the
+	// attach. The disk is on the VM under its new name either way, so the
+	// receiving side is recorded first, exactly as on success, and the cut-off
+	// is reported last. Every write below already runs after the parker's
+	// window has closed.
+	var restoreCutOff error
+	var cutOff *pve.ProtectionRestoreCutOffError
+	if terr != nil && landed != "" && errors.As(terr, &cutOff) {
+		restoreCutOff, terr = terr, nil
+	}
 	if terr != nil {
 		if errors.Is(terr, pve.ErrMoveDiskSnapshotRefused) {
 			if embedded, ok := pve.EmbeddedDiskVMID(preVolid); ok && embedded == plan.parker.VMID {
@@ -425,7 +435,7 @@ func attachDiskViaTransfer(
 
 	devicePath, err := attachDiskConfirmAndPath(ctx, deps, vmCID, node, vmid, landed, targetSlot, deps.Log(ctx))
 	if err != nil {
-		return "", "", err
+		return "", "", errors.Join(err, restoreCutOff)
 	}
 
 	// Receiving side first: record the Director's CID on the VM, then drop
@@ -433,7 +443,7 @@ func attachDiskViaTransfer(
 	// recorded). Both best-effort — the drive serial is the authoritative
 	// carrier by this point.
 	if err := writeManagedDiskHolder(ctx, deps, rd, node, vmid, rd.volid); err != nil {
-		return "", "", err
+		return "", "", errors.Join(err, restoreCutOff)
 	}
 	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
 	pve.RemoveParkerProvenanceEntry(ctx, deps.PVE, deps.Log(ctx), plan.parker.Node, plan.parker.VMID, preVolid, parkerCfg)
@@ -459,6 +469,13 @@ func attachDiskViaTransfer(
 				log.Err(dErr),
 			)
 		}
+	}
+	if restoreCutOff != nil {
+		// Retriable: a retry comes back to this parker, and the settler
+		// resolves the planned protection step once the parker reads back
+		// protected.
+		return "", "", retriableUnlessPermanent(restoreCutOff,
+			fmt.Sprintf("%s: parker protection restore cut off after the disk reached VM %s as %s (disk %s)", op, vmCID, landed, diskCID))
 	}
 	return targetSlot, devicePath, nil
 }

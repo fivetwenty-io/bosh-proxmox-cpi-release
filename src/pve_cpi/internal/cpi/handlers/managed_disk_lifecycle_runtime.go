@@ -179,8 +179,19 @@ func isDiskReturnedAfterLockTimeout(err error) bool {
 // completeOwned closes the session with fresh evidence of the disk's current
 // disposition: its absence after a delete, and its ownership otherwise.
 func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) error {
+	// A protection restore that failed without an answer from PVE and then
+	// landed on a retry leaves the first attempt's step planned. Settle such
+	// steps by reading the parker back before completion judges the record,
+	// through the same settler every readmission runs.
+	gaps, err := settlePlannedProtectionSteps(ctx, m.deps.PVE, m.handle, nil, nil)
+	if err != nil {
+		return err
+	}
+	if len(gaps) > 0 {
+		record := m.handle.Record()
+		return storageRefusal("lifecycle has unresolved mutation evidence; " + unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() }))
+	}
 	var proof aj.Verification
-	var err error
 	if deleted {
 		proof, err = m.deletionProof(ctx)
 	} else {
@@ -302,7 +313,19 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 		return errors.Join(err, journal.Close())
 	}
 	m := &managedDiskLifecycle{requestContext: ctx, deps: deps, disk: rd, journal: journal, handle: handle, session: &storageLifecycle{handle: handle, operation: "delete_disk"}}
-	// No new mutation is submitted. Unknown prior tasks still block finalization.
+	// No new mutation is submitted. Steps the settlement dispatcher can prove
+	// by readback, a lock sentinel or a parker's protection, are settled first,
+	// exactly as a readmission settles them; unknown prior tasks still block
+	// finalization.
+	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	if err != nil {
+		return errors.Join(err, handle.Close(), journal.Close())
+	}
+	if len(gaps) > 0 {
+		record := handle.Record()
+		refusal := storageRefusal("lifecycle has unresolved mutation evidence; " + unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() }))
+		return errors.Join(refusal, handle.Close(), journal.Close())
+	}
 	if err := storageLifecycleSettled(handle.Record()); err != nil {
 		return errors.Join(err, handle.Close(), journal.Close())
 	}

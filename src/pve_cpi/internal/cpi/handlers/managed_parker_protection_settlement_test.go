@@ -1,0 +1,207 @@
+package handlers
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
+)
+
+// stepState returns the state of the step with id in record.
+func stepState(t *testing.T, record aj.Record, id string) aj.State {
+	t.Helper()
+	for i := range record.Steps {
+		if record.Steps[i].ID == id {
+			return record.Steps[i].State
+		}
+	}
+	t.Fatalf("record has no step %s", id)
+	return ""
+}
+
+// TestCutOffRestoreAdoptsOnceTheParkerReadsProtected is the operator's route:
+// a cut-off restore leaves its step planned, the operator puts protection
+// back, and adopt then settles the step by reading the parker and adopts the
+// disk.
+func TestCutOffRestoreAdoptsOnceTheParkerReadsProtected(t *testing.T) {
+	t.Parallel()
+	c := newCutOffRestore(t, 200*time.Millisecond)
+	step := c.restoreStep(t)
+	if v, _ := c.client.state.configs[c.parker]["protection"].(int); v != 0 {
+		t.Fatalf("parker protection after the cut-off restore = %v, want the window's clear to have left it off", c.client.state.configs[c.parker]["protection"])
+	}
+
+	c.setProtection(true)
+	next, err := c.adopt(t)
+	if err != nil {
+		t.Fatalf("adopt refused a record whose parker reads protected: %v", err)
+	}
+	if next.State != aj.Adopted || next.CID != c.cid {
+		t.Fatalf("adoption produced %s with CID %q", next.State, next.CID)
+	}
+	if got := stepState(t, c.record(t), step.ID); got != aj.Observed {
+		t.Fatalf("restore step %s left %s after a protected readback", step.ID, got)
+	}
+}
+
+// TestCutOffRestoreRefusesWhileProtectionIsOff checks that the settler never
+// settles a restore it cannot see landed. With protection off, adopt refuses,
+// names the step, and gives the qm set command that puts protection back. A
+// parker whose config is gone leaves the step planned too.
+func TestCutOffRestoreRefusesWhileProtectionIsOff(t *testing.T) {
+	t.Parallel()
+	t.Run("protection off", func(t *testing.T) {
+		t.Parallel()
+		c := newCutOffRestore(t, 200*time.Millisecond)
+		step := c.restoreStep(t)
+		c.setProtection(false)
+		_, err := c.adopt(t)
+		want := fmt.Sprintf("step %s (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned; its parker protection write could not be settled because protection is off on parker %d; run qm set %d --protection 1 on node n1, then retry",
+			step.ID, c.parker, c.parker)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("adopt with protection off = %v, want a refusal containing %q", err, want)
+		}
+		t.Logf("refusal: %v", err)
+		if got := stepState(t, c.record(t), step.ID); got != aj.Planned {
+			t.Fatalf("restore step settled to %s while protection is off", got)
+		}
+	})
+	t.Run("parker gone", func(t *testing.T) {
+		t.Parallel()
+		c := newCutOffRestore(t, 200*time.Millisecond)
+		step := c.restoreStep(t)
+		delete(c.client.state.configs, c.parker)
+		_, err := c.adopt(t)
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("its parker protection write could not be settled because parker %d", c.parker)) {
+			t.Fatalf("adopt with the parker gone = %v, want a refusal naming the parker", err)
+		}
+		t.Logf("refusal: %v", err)
+		if got := stepState(t, c.record(t), step.ID); got != aj.Planned {
+			t.Fatalf("restore step settled to %s with the parker gone", got)
+		}
+	})
+}
+
+// TestPlannedConfigStepWithOtherFieldsStaysPlanned plants two planned
+// configuration steps on the parker next to the cut-off restore: one whose
+// parameters carry a field besides protection, and one with no parameters at
+// all. With the parker protected, the settler settles the restore but neither
+// of those, and adopt refuses on the first of them.
+func TestPlannedConfigStepWithOtherFieldsStaysPlanned(t *testing.T) {
+	t.Parallel()
+	c := newCutOffRestore(t, 200*time.Millisecond)
+	restore := c.restoreStep(t)
+	handle, err := c.journal.Acquire(c.ctx, c.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := restore.Target
+	extra, err := storageMutationIntent(handle, "lifecycle_attach_disk_Nodes_UpdateQemuConfig", target, nil,
+		json.RawMessage(`{"comment":"x","kind":"parker_protection_on","version":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare, err := storageMutationIntent(handle, "lifecycle_attach_disk_Nodes_UpdateQemuConfig", target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c.setProtection(true)
+	_, err = c.adopt(t)
+	if err == nil || !strings.Contains(err.Error(), "step "+extra+" (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned") {
+		t.Fatalf("adopt = %v, want a refusal naming the step with a non-protection field", err)
+	}
+	record := c.record(t)
+	if got := stepState(t, record, restore.ID); got != aj.Observed {
+		t.Fatalf("the protection-only restore step was left %s", got)
+	}
+	for _, id := range []string{extra, bare} {
+		if got := stepState(t, record, id); got != aj.Planned {
+			t.Fatalf("step %s, which is not protection-only, was settled to %s", id, got)
+		}
+	}
+}
+
+// TestRerunAttachSettlesTheCutOffRestore is the deploy's route: once the
+// operator puts protection back, the rerun's attach_disk settles the restore
+// step through the same settlement as adopt and returns the disk.
+func TestRerunAttachSettlesTheCutOffRestore(t *testing.T) {
+	t.Parallel()
+	c := newCutOffRestore(t, 200*time.Millisecond)
+	step := c.restoreStep(t)
+
+	c.setProtection(false)
+	if _, err := HandleAttachDisk(c.deps).Handle(c.ctx, c.attachArgs, jsonrpc.Context{}); err == nil ||
+		!strings.Contains(err.Error(), fmt.Sprintf("run qm set %d --protection 1", c.parker)) {
+		t.Fatalf("rerun attach with protection off = %v, want a refusal naming qm set", err)
+	}
+
+	c.setProtection(true)
+	if _, err := HandleAttachDisk(c.deps).Handle(c.ctx, c.attachArgs, jsonrpc.Context{}); err != nil {
+		t.Fatalf("rerun attach after protection was put back: %v", err)
+	}
+	record := c.record(t)
+	if got := stepState(t, record, step.ID); got != aj.Observed {
+		t.Fatalf("restore step %s left %s after the rerun", step.ID, got)
+	}
+	assertReturnedRecord(t, "rerun", record)
+	if disk, _ := c.client.state.configs[777]["scsi1"].(string); !strings.Contains(disk, "vm-777-disk-") {
+		t.Fatalf("VM 777 slot scsi1 = %q, want the transferred disk", disk)
+	}
+}
+
+// TestRerunDeleteDiskSettlesTheCutOffRestore cuts off the protection restore
+// of a delete_disk on a parked disk, then reruns delete_disk. With protection
+// off the rerun is refused with the qm set text. Once the parker reads
+// protected, the rerun settles the restore step through the same settlement
+// before it judges the record.
+func TestRerunDeleteDiskSettlesTheCutOffRestore(t *testing.T) {
+	t.Parallel()
+	c := newParkedRestoreDisk(t, 200*time.Millisecond)
+	deleteArgs := []json.RawMessage{planJSON(t, c.cid)}
+	c.hung.arm(true)
+	_, err := HandleDeleteDisk(c.deps).Handle(c.ctx, deleteArgs, jsonrpc.Context{})
+	c.hung.arm(false)
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("protection restore on parker vmid %d", c.parker)) {
+		t.Fatalf("delete_disk with a hung restore = %v, want the cut-off restore", err)
+	}
+	t.Logf("delete_disk error: %v", err)
+	var step aj.Step
+	record := c.record(t)
+	for i := range record.Steps {
+		if record.Steps[i].Kind == "lifecycle_delete_disk_Nodes_UpdateQemuConfig" && record.Steps[i].State == aj.Planned {
+			step = record.Steps[i]
+		}
+	}
+	if step.ID == "" || !isParkerProtectionParameters(step.Parameters) || step.Target.VMID != c.parker {
+		t.Fatalf("the cut-off delete left no planned protection step on parker %d: %+v", c.parker, record.Steps)
+	}
+
+	c.setProtection(false)
+	if _, err := HandleDeleteDisk(c.deps).Handle(c.ctx, deleteArgs, jsonrpc.Context{}); err == nil ||
+		!strings.Contains(err.Error(), fmt.Sprintf("run qm set %d --protection 1", c.parker)) {
+		t.Fatalf("rerun delete_disk with protection off = %v, want a refusal naming qm set", err)
+	}
+	if got := stepState(t, c.record(t), step.ID); got != aj.Planned {
+		t.Fatalf("restore step settled to %s while protection is off", got)
+	}
+
+	c.setProtection(true)
+	if _, err := HandleDeleteDisk(c.deps).Handle(c.ctx, deleteArgs, jsonrpc.Context{}); err != nil {
+		t.Fatalf("rerun delete_disk after protection was put back: %v", err)
+	}
+	record = c.record(t)
+	if got := stepState(t, record, step.ID); got != aj.Observed {
+		t.Fatalf("restore step %s left %s after the rerun delete_disk", step.ID, got)
+	}
+	if record.State != aj.Deleted {
+		t.Fatalf("allocation state after the rerun delete_disk = %s (reason %q), want %s", record.State, record.Reason, aj.Deleted)
+	}
+}

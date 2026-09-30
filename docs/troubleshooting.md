@@ -1286,6 +1286,37 @@ A cross-node attach that created a mover VM or parked the disk before the wait c
 
 A `create_disk` whose park runs out has already created its volume, and the next deploy's `create_disk` creates a new one under a new allocation, so that record stays `reconciliation_required` until we reconcile it.
 
+### A parker's protection restore timed out
+
+When the CPI moves a parked disk onto a VM, or deletes a disk that is named for its parker, it clears the parker's protection for the change and puts it back afterwards. That last write has a deadline of its own, which fits inside the time the parker's lock sets aside for it. If PVE doesn't answer before the deadline, or the connection fails on every attempt, the CPI can't tell whether protection went back on. When the disk transfer itself completed, the CPI still records the disk on its new VM, with its provenance and CID, and removes the parker's record of it, so the disk is where the Director expects it. When a deletion completed, the CPI removes the parker's record of the deleted disk in the same way. The call then fails with a retriable error that names the parker and says whether the disk change completed.
+
+```text
+attach_disk: parker protection restore cut off after the disk reached VM 777 as data:vm-777-disk-2 (disk <disk CID>): transfer out: protection restore on parker vmid 90000 did not finish within 35s and its outcome is unknown; the disk transfer to vm 777 slot scsi1 completed; check the parker with qm config 90000 and run qm set 90000 --protection 1 if protection is off
+```
+
+We check the parker's protection first, on the node that hosts the parker. When the `protection` line is missing or reads `protection: 0`, protection is off, and we put it back.
+
+```bash
+qm config 90000 | grep ^protection
+qm set 90000 --protection 1
+```
+
+For a disk outside the allocation journal, we then rerun the deploy. When the transfer completed, the rerun's `attach_disk` finds the disk already on its VM and finishes, and when the deletion completed, the disk is already gone.
+
+For a journal-managed disk, the allocation is left in `reconciliation_required`, and the only step it has not settled is the restore, a planned `lifecycle_<operation>_Nodes_UpdateQemuConfig`. The next call that touches the record settles that step by reading the parker back before it judges the record. That call can be a rerun deploy's `attach_disk` or `delete_disk`, `storage-journal adopt`, or the `cleanup` precheck. When the parker reads protected, the step is marked observed and the call carries on, and nothing on PVE changes. When the parker reads unprotected, the call is refused and names the command that puts protection back.
+
+```text
+step attempt-0-step-18 (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned; its parker protection write could not be settled because protection is off on parker 90000; run qm set 90000 --protection 1 on node pve01, then retry
+```
+
+We run that command and retry the call. A parker that is gone, or whose config can't be read, leaves the step planned as well, and the refusal says which of the two it found.
+
+A `create_vm` is the exception. When its attach of a disk from `disk_cids` meets a cut-off restore, the VM's handoff step for that disk is left open as well, so the Director's retry of that `create_vm` is refused. Once we have put the parker's protection back, we recover in the same order as for a `create_vm` disk attach in [A parker lock wait runs out](#a-parker-lock-wait-runs-out). We run the audit first. We then resolve the disk from its own record, with `adopt` when the Director still holds its CID or with `cleanup` when it never got one, and that settles the restore step along the way. Next, an attested `storage-journal cleanup` of the VM's record with `--authority-id`, `--previous-writer-fenced`, and `--remote-tasks-settled` closes the handoff and removes the VM. Last, we rerun the deploy.
+
+When PVE answers the restore with a failure, the write did not apply, so the outcome is known. The call succeeds, the journal records the write as settled, and the CPI logs a warning that asks us to put protection back with the same `qm set` command.
+
+When an earlier step of the same operation has already failed in a way that leaves it uncertain, the CPI doesn't send the restore at all. The error then says that the protection restore was not attempted because the operation was already uncertain, so there is nothing to look for on the network or in PVE's logs. We still check the parker and put protection back the same way, and the record is reconciled for the earlier failure, not for the restore.
+
 ### A crash-abandoned allocation keeps charging capacity
 
 Every set-managed create charges the bytes that its in-flight siblings have already claimed, so an allocation left behind in an in-flight state goes on charging its bytes against every later create in the namespace. Nothing ages a record out of those states on its own. A CPI killed between writing its record and running its first step leaves a `planned` record, and that record keeps its claim until an operator resolves it.

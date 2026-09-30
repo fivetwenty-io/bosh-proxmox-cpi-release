@@ -45,7 +45,7 @@ func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGu
 	state := &managedDiskLifecycleGuard{lifecycle: m, observations: map[string]managedDiskMutationObservation{}, created: map[int]bool{}}
 	return NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: state.before, After: state.after, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 		return m.session.Uncertain(call.Service + "." + call.Method)
-	}})
+	}, SettleProtectionWrites: true})
 }
 func lifecycleMutationFields(params any) (map[string]any, error) {
 	encoded, err := json.Marshal(params)
@@ -156,7 +156,11 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 	if observation.targetNode != "" {
 		target.Node = observation.targetNode
 	}
-	step, err := storageMutationIntent(m.handle, "lifecycle_"+m.session.operation+"_"+call.Service+"_"+call.Method, target, charges)
+	// A protection-only configuration write records what it wrote, so a
+	// restore cut off by its deadline can be settled later by reading the
+	// parker back (settlePlannedProtectionSteps). Every other write records
+	// no parameters, as before.
+	step, err := storageMutationIntent(m.handle, "lifecycle_"+m.session.operation+"_"+call.Service+"_"+call.Method, target, charges, lifecycleStepParameters(key, observation.fields))
 	if err != nil {
 		return "", err
 	}
@@ -235,6 +239,19 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 		return fmt.Errorf("missing lifecycle mutation observation")
 	}
 	key := call.Service + "." + call.Method
+	if _, refused := result.(managedProtectionWriteRefusal); refused {
+		// PVE refused a protection-only write, so nothing changed and there is
+		// nothing to read back. The guard hands the refusal here only after
+		// classifyProtectionWriteFailure matched the write.
+		if key != "Nodes.UpdateQemuConfig" || !isParkerProtectionParameters(parkerProtectionStepParameters(observation.fields)) {
+			return fmt.Errorf("protection refusal names another mutation")
+		}
+		if err := storageMutationObserved(m.handle, step, nil, false); err != nil {
+			return err
+		}
+		delete(g.observations, step)
+		return nil
+	}
 	async := key == "QEMU.Create" || key == "QEMU.ResizeDisk" || key == "QEMU.Snapshot" || key == "QEMU.DeleteSnapshot" || key == "Nodes.CreateQemuMoveDisk" || key == "Nodes.CreateQemuMigrate" || key == "Nodes.DeleteQemu" || strings.HasSuffix(call.Method, "Async")
 	if key == "Storage.DeleteVolumeIfExistsAsync" {
 		values, ok := result.([]any)
