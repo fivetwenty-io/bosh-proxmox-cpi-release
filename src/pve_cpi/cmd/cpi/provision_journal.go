@@ -36,20 +36,23 @@ func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
 	if *configPath != "" {
 		f, err := os.Open(*configPath)
 		if err != nil {
-			fmt.Fprintln(stderr, "journal provisioning: cannot open config")
+			storageJournalFail(stderr, "journal provisioning: cannot open config", err)
 			return 1
 		}
 		raw, readErr := io.ReadAll(io.LimitReader(f, config.MaxConfigBytes+1))
 		err = errors.Join(readErr, f.Close())
-		if err != nil || int64(len(raw)) > config.MaxConfigBytes {
-			fmt.Fprintln(stderr, "journal provisioning: cannot read bounded config")
+		if err == nil && int64(len(raw)) > config.MaxConfigBytes {
+			err = storageJournalFixedError(fmt.Sprintf("config exceeds %d bytes", config.MaxConfigBytes))
+		}
+		if err != nil {
+			storageJournalFail(stderr, "journal provisioning: cannot read bounded config", err)
 			return 1
 		}
 		var local struct {
 			Directory string `json:"storage_allocation_journal_dir"`
 		}
 		if err := json.Unmarshal(raw, &local); err != nil {
-			fmt.Fprintln(stderr, "journal provisioning: invalid config JSON")
+			storageJournalFail(stderr, "journal provisioning: invalid config JSON", err)
 			return 1
 		}
 		path = local.Directory
@@ -65,25 +68,26 @@ func runProvisionJournal(args []string, stdout, stderr io.Writer) int {
 		}
 		account, err := user.Lookup(*owner)
 		if err != nil {
-			fmt.Fprintln(stderr, "journal provisioning: runtime owner lookup failed")
+			storageJournalFail(stderr, "journal provisioning: runtime owner lookup failed", err)
 			return 1
 		}
 		uid, err = strconv.Atoi(account.Uid)
 		if err != nil {
-			fmt.Fprintln(stderr, "journal provisioning: invalid runtime UID")
+			storageJournalFail(stderr, "journal provisioning: invalid runtime UID", err)
 			return 1
 		}
 		gid, err = strconv.Atoi(account.Gid)
 		if err != nil {
-			fmt.Fprintln(stderr, "journal provisioning: invalid runtime GID")
+			storageJournalFail(stderr, "journal provisioning: invalid runtime GID", err)
 			return 1
 		}
 	}
 	if err := allocationjournal.ProvisionDirectory(path, uid, gid); err != nil {
-		fmt.Fprintln(stderr, err)
+		storageJournalFail(stderr, "journal directory "+path+" could not be provisioned", err)
 		return 1
 	}
 	if _, err := fmt.Fprintln(stdout, "Journal directory provisioned; authority enrollment is unchanged."); err != nil {
+		storageJournalFail(stderr, "provision-journal output could not be written", err)
 		return 1
 	}
 	return 0

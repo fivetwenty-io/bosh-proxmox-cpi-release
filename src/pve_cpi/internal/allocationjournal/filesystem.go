@@ -61,10 +61,66 @@ func validateNamespace(namespace string) error {
 	}
 	return nil
 }
-func privateInfo(info os.FileInfo, directory bool) error {
+
+// Unsafe path causes. An UnsafePathError wraps exactly one of them, so a
+// caller can tell an ownership mismatch, which a rerun as the owner fixes,
+// from a mode or file type that only the operator can repair.
+var (
+	ErrUnsafeOwnership = errors.New("journal: unsafe ownership")
+	ErrUnsafeMode      = errors.New("journal: unsafe permissions")
+	ErrUnsafeFileType  = errors.New("journal: unsafe file type")
+)
+
+// UnsafePathError names a journal path that privateInfo refused. UID is the
+// path's owner, or -1 when the platform reported no ownership metadata, and
+// EUID is the effective UID the check compared it against. WantDirectory
+// says which file type the check expected. Its text carries only the path,
+// the two UIDs, and the mode, so the CLI may print it.
+type UnsafePathError struct {
+	Path          string
+	UID, EUID     int
+	Mode          os.FileMode
+	WantDirectory bool
+	Cause         error
+}
+
+func (e *UnsafePathError) Error() string {
+	switch {
+	case errors.Is(e.Cause, ErrUnsafeOwnership) && e.UID < 0:
+		return fmt.Sprintf("%v: %s has no ownership metadata", e.Cause, e.Path)
+	case errors.Is(e.Cause, ErrUnsafeOwnership):
+		return fmt.Sprintf("%v: %s is owned by uid %d, not effective uid %d", e.Cause, e.Path, e.UID, e.EUID)
+	case errors.Is(e.Cause, ErrUnsafeMode):
+		return fmt.Sprintf("%v: %s has mode %04o and must grant no group or other access", e.Cause, e.Path, e.Mode.Perm())
+	case e.WantDirectory:
+		return fmt.Sprintf("%v: %s is not a directory", e.Cause, e.Path)
+	default:
+		return fmt.Sprintf("%v: %s is not a regular file", e.Cause, e.Path)
+	}
+}
+
+func (e *UnsafePathError) Unwrap() error { return e.Cause }
+
+// privateInfo refuses a journal path that another user owns, whose type is
+// not the one expected, or that grants any group or other access, in that
+// order of precedence. path is only reported; every check reads info.
+func privateInfo(path string, info os.FileInfo, directory bool) error {
+	euid := os.Geteuid()
 	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int64(st.Uid) != int64(os.Geteuid()) || info.Mode().Perm()&0o077 != 0 || info.IsDir() != directory || !directory && !info.Mode().IsRegular() {
-		return fmt.Errorf("journal: unsafe ownership, permissions, or file type")
+	unsafe := &UnsafePathError{Path: path, UID: -1, EUID: euid, Mode: info.Mode(), WantDirectory: directory}
+	if ok {
+		unsafe.UID = int(st.Uid)
+	}
+	switch {
+	case !ok || int64(st.Uid) != int64(euid):
+		unsafe.Cause = ErrUnsafeOwnership
+	case info.IsDir() != directory || !directory && !info.Mode().IsRegular():
+		unsafe.Cause = ErrUnsafeFileType
+	case info.Mode().Perm()&0o077 != 0:
+		unsafe.Cause = ErrUnsafeMode
+	}
+	if unsafe.Cause != nil {
+		return unsafe
 	}
 	// Reject a second link, not a missing one. A link count of zero is what a
 	// concurrent atomicJSON rename looks like from the reader's side: the
@@ -93,7 +149,7 @@ func openPrivateRoot(path string) (*os.Root, error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("journal: symlink directory rejected")
 	}
-	if err := privateInfo(info, true); err != nil {
+	if err := privateInfo(path, info, true); err != nil {
 		return nil, err
 	}
 	r, err := os.OpenRoot(path)
@@ -125,7 +181,7 @@ func openPrivateWith(r *os.Root, name string, flags int, open func(int, string, 
 	}
 	prior, err := r.Lstat(name)
 	if err == nil {
-		if err := privateInfo(prior, false); err != nil {
+		if err := privateInfo(filepath.Join(r.Name(), name), prior, false); err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -147,7 +203,7 @@ func openPrivateWith(r *os.Root, name string, flags int, open func(int, string, 
 	}
 	info, err := f.Stat()
 	if err == nil {
-		err = privateInfo(info, false)
+		err = privateInfo(filepath.Join(r.Name(), name), info, false)
 	}
 	if err == nil && prior != nil && !os.SameFile(prior, info) {
 		err = fmt.Errorf("%w: private file changed during open", ErrReconciliationRequired)
@@ -231,7 +287,7 @@ func atomicJSON(r *os.Root, name string, value any, ops fileOps) (retErr error) 
 		return fmt.Errorf("journal: record exceeds size limit")
 	}
 	if info, err := r.Lstat(name); err == nil {
-		if err := privateInfo(info, false); err != nil {
+		if err := privateInfo(filepath.Join(r.Name(), name), info, false); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
