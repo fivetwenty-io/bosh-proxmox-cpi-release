@@ -166,6 +166,11 @@ func TestExactPoolAlreadyExistsRejectsAmbiguity(t *testing.T) {
 		`{"message":"update pools failed: pool 'bosh-director' already exists"}`,
 		`{"message":"create pool failed: pool 'bosh-director' already exists after unknown failure"}`,
 		`{"message":"create pool failed:pool 'bosh-director' already exists"}`,
+		`{"message":"create pool failed: pool 'bosh-director' already exists \n"}`,
+		`{"message":"create pool failed: pool 'bosh-director' already exists\n\n"}`,
+		`{"message":"create pool failed: pool 'bosh-director-2' already exists\n"}`,
+		`{"message":"create pool failed: pool 'bosh-direct' already exists"}`,
+		`{"message":" create pool failed: pool 'bosh-director' already exists"}`,
 	} {
 		if exactPoolAlreadyExists(sdkerrors.ParseAPIError(500, []byte(body)), ensureTestPool) {
 			t.Fatalf("accepted %s", body)
@@ -178,6 +183,15 @@ func TestExactPoolAlreadyExistsRejectsAmbiguity(t *testing.T) {
 	exact := sdkerrors.ParseAPIError(500, []byte(`{"message":"pool 'bosh-director' already exists"}`))
 	if !exactPoolAlreadyExists(fmt.Errorf("create pool: %w", exact), ensureTestPool) {
 		t.Fatal("wrapped exact API error rejected")
+	}
+	for _, body := range []string{
+		`{"message":"create pool failed: pool 'bosh-director' already exists"}`,
+		`{"message":"create pool failed: pool 'bosh-director' already exists "}`,
+		`{"message":"pool 'bosh-director' already exists\n"}`,
+	} {
+		if !exactPoolAlreadyExists(sdkerrors.ParseAPIError(500, []byte(body)), ensureTestPool) {
+			t.Fatalf("rejected %s", body)
+		}
 	}
 	live := sdkerrors.ParseAPIError(500, []byte(`{"data":null,"message":"create pool failed: pool 'bosh-director' already exists\n"}`))
 	if !exactPoolAlreadyExists(fmt.Errorf("API request failed: %w", live), ensureTestPool) {

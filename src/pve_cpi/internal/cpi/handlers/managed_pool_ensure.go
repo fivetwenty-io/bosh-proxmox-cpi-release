@@ -5,7 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -72,13 +73,17 @@ func exactPoolDoesNotExist(err error, poolID string) bool {
 // each verdict inside lock_user_config, which re-raises it as "<errmsg>:
 // <verdict>", so a live cluster answers HTTP 500 with the prefixed form in the
 // body's message field. The bare verdict is accepted as well because it names
-// the same condition on the same pool. Anything else, including extra text or
-// a field-error map, is not proof.
+// the same condition on the same pool. One trailing whitespace character, which
+// is the newline Perl's die carries, is tolerated. Anything else, including a
+// second trailing character, extra text, or a field-error map, is not proof.
 func exactPoolVerdict(err error, errmsg, verdict string) bool {
 	var apiErr *sdkerrors.APIError
 	if !errors.As(err, &apiErr) || apiErr.HTTPCode != http.StatusInternalServerError || len(apiErr.Errors) != 0 {
 		return false
 	}
-	message := strings.TrimSuffix(apiErr.Message, "\n")
+	message := apiErr.Message
+	if last, size := utf8.DecodeLastRuneInString(message); size > 0 && unicode.IsSpace(last) {
+		message = message[:len(message)-size]
+	}
 	return message == verdict || message == errmsg+": "+verdict
 }
