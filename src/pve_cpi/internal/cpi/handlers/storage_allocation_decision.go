@@ -93,8 +93,8 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
-	if !report.Complete || !report.VMScanComplete || len(report.Issues) != 0 || len(report.Conflicts) != 0 {
-		return result, fmt.Errorf("allocation disposition requires a complete conflict-free historical audit")
+	if err := storageAuditGateError(ctx, deps, "allocation disposition", report, storageAuditGateAll); err != nil {
+		return result, err
 	}
 	var ownership aj.Verification
 	if decision.Action == "adopt" {

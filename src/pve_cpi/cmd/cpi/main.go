@@ -693,6 +693,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		NodeEndpoints:  nodeEndpoints,
 		Inflight:       handlers.NewInflightRegistry(),
 		Overrides:      overrideRuntime,
+		// Rendered once at startup, so every audit-gated refusal can end
+		// with the exact audit command for this host.
+		StorageAuditCommand: storageAuditCommand(*configPath, cfg.StorageAllocationJournalDir),
 	})
 
 	maxLine := opts.MaxLineBytes

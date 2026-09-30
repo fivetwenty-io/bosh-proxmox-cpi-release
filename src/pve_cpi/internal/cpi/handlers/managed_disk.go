@@ -566,7 +566,7 @@ func managedDiskPlanningNodes(ctx context.Context, deps Deps, hint string, nodes
 		return nil, err
 	}
 	if !slices.Contains(observed, node) {
-		return nil, cpierrors.Cloud("create_disk: hinted VM migrated outside observed nodes; no allocation submitted")
+		return nil, cpierrors.Cloud("create_disk: hinted VM %s migrated outside observed nodes: now on %s, observed %s; no allocation submitted", hint, node, strings.Join(observed, ", "))
 	}
 	return []string{node}, nil
 }

@@ -74,6 +74,12 @@ type Deps struct {
 	// fixture source here rather than through a package variable, so
 	// parallel tests cannot race on it.
 	ReplicaInventory inv.Source
+	// StorageAuditCommand is the exact command that prints the full
+	// allocation audit on the host running this CPI, rendered once at
+	// startup from the executable, the --config path, and the journal
+	// owner. Audit-gated refusals end with it. Empty (the CLI and every
+	// test Deps literal) makes them name the command generically instead.
+	StorageAuditCommand string
 }
 
 // Log returns the per-request, span-correlated logger stored in ctx (attached

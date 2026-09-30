@@ -48,8 +48,8 @@ func observeManagedVMRecord(ctx context.Context, deps Deps, journal *aj.Journal,
 	if err != nil {
 		return nil, err
 	}
-	if !audit.VMScanComplete || len(audit.Conflicts) > 0 {
-		return fail("VM provenance audit is incomplete or inconsistent")
+	if err := storageAuditGateError(ctx, deps, "VM allocation readback", audit, storageAuditGateVMScan|storageAuditGateConflicts); err != nil {
+		return nil, err
 	}
 	sightings := 0
 	for _, evidence := range audit.Evidence {

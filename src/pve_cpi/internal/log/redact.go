@@ -141,12 +141,20 @@ func scrubURLString(s string) string {
 	return s
 }
 
+// pveCredential masks the value of a PVE API token header or auth cookie
+// (PVEAPIToken=user@realm!id=secret, PVEAuthCookie=ticket). Neither has a URL
+// shape, so the userinfo and query-parameter rules never see them. The SDK
+// keeps both out of its errors today; this rule is defence in depth for any
+// text that echoes a request header.
+var pveCredential = regexp.MustCompile(`(?i)\b(PVEAPIToken|PVEAuthCookie)=\S+`)
+
 // ScrubMessage returns s with URL-embedded credentials masked (userinfo and
-// sensitive query parameters), leaving credential-free text unchanged. Use it
+// sensitive query parameters) and PVE token and cookie values masked, leaving
+// credential-free text unchanged. Use it
 // when a string derived from a guest-controlled or PVE-returned value (an
 // error message, a span status) leaves the process by a path that does not go
 // through ErrScrubbed — every external sink must apply the same scrubbing the
 // logs do.
 func ScrubMessage(s string) string {
-	return scrubURLString(s)
+	return pveCredential.ReplaceAllString(scrubURLString(s), "${1}="+RedactedPlaceholder)
 }

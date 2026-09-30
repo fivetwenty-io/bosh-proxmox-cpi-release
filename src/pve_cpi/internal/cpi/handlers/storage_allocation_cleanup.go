@@ -67,8 +67,8 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
-	if !report.Complete || !report.VMScanComplete || len(report.Conflicts) > 0 || len(report.Issues) > 0 {
-		return result, fmt.Errorf("cleanup requires complete conflict-free historical visibility")
+	if err := storageAuditGateError(ctx, deps, "allocation cleanup", report, storageAuditGateAll); err != nil {
+		return result, err
 	}
 	var ownership aj.Verification
 	phase = "disk_ownership"

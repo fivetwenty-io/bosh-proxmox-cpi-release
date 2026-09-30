@@ -44,8 +44,8 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err != nil {
 		return proof, err
 	}
-	if !audit.Complete || !audit.VMScanComplete || len(audit.Issues) != 0 || len(audit.Conflicts) != 0 {
-		return proof, fmt.Errorf("VM cleanup requires complete conflict-free historical visibility")
+	if err := storageAuditGateError(ctx, deps, "VM cleanup", audit, storageAuditGateAll); err != nil {
+		return proof, err
 	}
 	node, vmid, owned, err := managedVMDisposalIdentity(record, audit)
 	if err != nil {
@@ -360,8 +360,8 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	if err != nil {
 		return proof, err
 	}
-	if !audit.Complete || len(audit.Conflicts) > 0 {
-		return proof, fmt.Errorf("retained cleanup requires complete historical visibility")
+	if err := storageAuditGateError(ctx, deps, "retained VM cleanup", audit, storageAuditGateComplete|storageAuditGateConflicts); err != nil {
+		return proof, err
 	}
 	location, err := pve.FindVMAuthoritative(ctx, deps.PVE, retention.VMID)
 	if err != nil {
@@ -492,8 +492,8 @@ func deleteManagedVMOrphanVolumes(ctx context.Context, deps Deps, journal *aj.Jo
 	if err != nil {
 		return err
 	}
-	if !audit.Complete || len(audit.Conflicts) != 0 {
-		return fmt.Errorf("post-destroy resource audit is incomplete")
+	if err := storageAuditGateError(ctx, deps, "post-destroy VM resource cleanup", audit, storageAuditGateComplete|storageAuditGateConflicts); err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	for _, evidence := range audit.Evidence {

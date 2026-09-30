@@ -88,8 +88,11 @@ func (m *managedDiskRequest) retryRejected(ctx context.Context, handle *aj.Handl
 		return fmt.Errorf("failed allocation absence unproven")
 	}
 	report, err := AuditStorageAllocations(ctx, m.deps, m.journal, m.inventory.Nodes())
-	if err != nil || !report.Complete || len(report.Conflicts) > 0 {
+	if err != nil {
 		return fmt.Errorf("failed allocation historical audit incomplete")
+	}
+	if err := storageAuditGateError(ctx, m.deps, "create_disk retry", report, storageAuditGateComplete|storageAuditGateConflicts); err != nil {
+		return err
 	}
 	for _, evidence := range report.Evidence {
 		if evidence.AllocationID == m.id {
