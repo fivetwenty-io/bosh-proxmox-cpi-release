@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -203,5 +204,31 @@ func TestRerunDeleteDiskSettlesTheCutOffRestore(t *testing.T) {
 	}
 	if record.State != aj.Deleted {
 		t.Fatalf("allocation state after the rerun delete_disk = %s (reason %q), want %s", record.State, record.Reason, aj.Deleted)
+	}
+}
+
+// TestProtectionPendingNeedsEveryUnsettledStepToBeAProtectionGap pins that a
+// refusal is marked protection-pending only when every unsettled step of the
+// active attempt is a protection write left planned. One other planned step
+// beside the protection step keeps the refusal unmarked.
+func TestProtectionPendingNeedsEveryUnsettledStepToBeAProtectionGap(t *testing.T) {
+	protection := []byte(`{"version":1,"kind":"parker_protection_on"}`)
+	record := aj.Record{
+		Attempts: []aj.Attempt{{}},
+		Steps: []aj.Step{
+			{ID: "s0", Attempt: 0, Kind: "lifecycle_attach_disk_Nodes_CreateQemuMoveDisk", State: aj.Observed, Target: aj.Target{Node: "n1", VMID: 90000}},
+			{ID: "s1", Attempt: 0, Kind: "lifecycle_attach_disk_Nodes_UpdateQemuConfig", State: aj.Planned, Target: aj.Target{Node: "n1", VMID: 90000}, Parameters: protection},
+			{ID: "s2", Attempt: 0, Kind: "lifecycle_attach_disk_Nodes_CreateQemuMoveDisk", State: aj.Planned, Target: aj.Target{Node: "n1", VMID: 777}},
+		},
+	}
+	gaps := map[string]error{"s1": &protectionSettlementGap{text: "protection is off on parker 90000"}}
+	refusal := errors.New("lifecycle has unresolved mutation evidence")
+	var pending *protectionPendingRefusal
+	if errors.As(protectionPendingOr(record, gaps, refusal), &pending) {
+		t.Fatal("a refusal with a planned move beside the protection step was marked protection-pending")
+	}
+	record.Steps = record.Steps[:2]
+	if !errors.As(protectionPendingOr(record, gaps, refusal), &pending) {
+		t.Fatal("a refusal whose only unsettled step is a protection gap was not marked protection-pending")
 	}
 }

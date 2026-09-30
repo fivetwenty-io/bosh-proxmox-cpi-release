@@ -727,3 +727,23 @@ func TestStorageAuditMoveRefusalNamesTheReason(t *testing.T) {
 		t.Fatalf("refusal = %q, want the incomplete VM scan", got)
 	}
 }
+
+// TestAuditRefusesADiskMoveTheVMNoLongerHolds pins that the audit does not
+// accept a disk move when the VM that provenance names has dropped the volume
+// from its configuration.
+func TestAuditRefusesADiskMoveTheVMNoLongerHolds(t *testing.T) {
+	f := newMoveFixture(t)
+	records := f.build()
+	delete(f.c.configs[123], "scsi2")
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.observedMove(allocationKindDisk, f.disk.ID, 123, "pve2") {
+		t.Fatal("the move was accepted for a VM that no longer holds the volume")
+	}
+	want := "not accepted as a move because VM 123 does not hold volume " + f.pdisk + " in its configuration"
+	if conflicts := strings.Join(report.Conflicts, "\n"); !strings.Contains(conflicts, want) {
+		t.Fatalf("conflicts do not name the missing volume, want %q in:\n%s", want, conflicts)
+	}
+}
