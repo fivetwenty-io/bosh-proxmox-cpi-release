@@ -90,9 +90,9 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 		if descriptor == nil || descriptor.MaxAttempts <= m.handle.Record().ActiveAttempt()+1 || deps.Config.KeepFailedVMsEnabled() {
 			return nil, err
 		}
-		proof, cleanupErr := cleanupManagedVMAttempt(ctx, deps, journal, m.handle)
+		proof, cleanupErr := rollbackManagedVMAttempt(ctx, deps, journal, m.handle)
 		if cleanupErr != nil {
-			return nil, errors.Join(err, cleanupErr)
+			return nil, managedVMRollbackError(ctx, deps, m.handle, err, cleanupErr)
 		}
 		if cleanupErr := m.handle.CompleteAttempt(aj.AttemptVerification{Verification: proof, OutcomesKnown: true}); cleanupErr != nil {
 			return nil, cleanupErr
@@ -123,4 +123,19 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 		observed = nil
 		deps.recordStoragePlacement(ctx, selection, "fallback")
 	}
+}
+
+// managedVMRollbackError joins a failed rollback onto the attempt's own error.
+// A rollback that failed after its disposal was admitted has left the
+// generation requiring reconciliation, and that error leads, so the Director
+// reads a failure it must not retry rather than the attempt's retriable one. A
+// rollback refused before its disposal began has left the attempt's VM and
+// generation as they were, and the attempt's error keeps its place, so a retry
+// under the same agent ID resumes that generation.
+func managedVMRollbackError(ctx context.Context, deps Deps, handle *aj.Handle, attemptErr, rollbackErr error) error {
+	if handle.Record().State != aj.ReconciliationRequired {
+		return errors.Join(attemptErr, rollbackErr)
+	}
+	deps.recordStorageReconciliation(ctx, "required")
+	return errors.Join(rollbackErr, attemptErr)
 }
