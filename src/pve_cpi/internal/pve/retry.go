@@ -114,6 +114,13 @@ func expBackoffDuration(base time.Duration, attempt int, maxBackoff time.Duratio
 // at 15s. Tuned for pvedaemon worker recycling, which completes in roughly a
 // second; longer waits buy nothing.
 func TransientBackoff(attempt int) time.Duration {
+	return transientBackoff(attempt, jitterInt64N)
+}
+
+// transientBackoff is TransientBackoff with the jitter draw supplied, so the
+// worst-case budget helpers below evaluate the same curve at the top of its
+// jitter window instead of restating it.
+func transientBackoff(attempt int, draw func(int64) int64) time.Duration {
 	// maxBackoff renamed from the builtin-shadowing `cap` so go vet stops
 	// flagging this scope and the symbol is unambiguous when reading the
 	// jitter math below.
@@ -125,7 +132,7 @@ func TransientBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(jitterInt64N(jitterWindow))
+		jitter = time.Duration(draw(jitterWindow))
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {
@@ -168,6 +175,12 @@ func backoffFromCtx(ctx context.Context) func(attempt int) time.Duration {
 // The curve is configurable via ConfigureStorageLockBackoff (called once at
 // startup from operator config); tests may override via SetStorageLockBackoffForTest.
 func StorageLockBackoff(attempt int) time.Duration {
+	return storageLockBackoff(attempt, jitterInt64N)
+}
+
+// storageLockBackoff is StorageLockBackoff with the jitter draw supplied; see
+// transientBackoff.
+func storageLockBackoff(attempt int, draw func(int64) int64) time.Duration {
 	baseMs, capMs, jPct := storageLockDefaults()
 	base := time.Duration(baseMs) * time.Millisecond
 	maxBackoff := time.Duration(capMs) * time.Millisecond
@@ -183,7 +196,7 @@ func StorageLockBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * int64(jPct) * 2 / 100
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(jitterInt64N(jitterWindow))
+		jitter = time.Duration(draw(jitterWindow))
 	}
 	// Shift the window so it is centered: subtract jPct% then add the draw.
 	out := d - time.Duration(int64(d)*int64(jPct)/100) + jitter
@@ -220,6 +233,12 @@ func PushbackBackoffCap() time.Duration {
 // StorageLockBackoff reflect that PVE worker-pool saturation takes longer to
 // drain than a single per-storage lock hold.
 func PushbackBackoff(attempt int) time.Duration {
+	return pushbackBackoff(attempt, jitterInt64N)
+}
+
+// pushbackBackoff is PushbackBackoff with the jitter draw supplied; see
+// transientBackoff.
+func pushbackBackoff(attempt int, draw func(int64) int64) time.Duration {
 	baseMs, capMs := pushbackDefaults()
 	base := time.Duration(baseMs) * time.Millisecond
 	maxBackoff := time.Duration(capMs) * time.Millisecond
@@ -229,13 +248,58 @@ func PushbackBackoff(attempt int) time.Duration {
 	jitterWindow := int64(d) * 6 / 10
 	var jitter time.Duration
 	if jitterWindow > 0 {
-		jitter = time.Duration(jitterInt64N(jitterWindow))
+		jitter = time.Duration(draw(jitterWindow))
 	}
 	out := d - d*3/10 + jitter
 	if out > maxBackoff {
 		out = maxBackoff
 	}
 	return out
+}
+
+// maxJitterDraw stands in for jitterInt64N when a caller needs the longest
+// sleep a curve can produce. jitterInt64N draws from [0, n), so n-1 is the top
+// of the window.
+func maxJitterDraw(n int64) int64 { return n - 1 }
+
+// RetryOnTransientSleepBudget returns the longest total time one
+// RetryOnTransient call made with maxAttempts can spend sleeping between its
+// attempts, under the backoff curves configured now. maxAttempts resolves
+// exactly as the loop resolves it. The loop picks its curve per error, and
+// nothing tells us in advance which errors a call will meet, so every sleep is
+// counted at the longest either of its curves (pushback and transient) can
+// draw for that attempt. The time the attempts themselves take is not
+// included; callers that need a wall-clock bound add their own per-call
+// allowance for each attempt.
+func RetryOnTransientSleepBudget(maxAttempts int) time.Duration {
+	if maxAttempts <= 0 {
+		maxAttempts = transientMaxAttemptsDefault()
+	}
+	var total time.Duration
+	for attempt := 0; attempt < maxAttempts-1; attempt++ {
+		total += max(pushbackBackoff(attempt, maxJitterDraw), transientBackoff(attempt, maxJitterDraw))
+	}
+	return total
+}
+
+// RetryOnTransientOrLockSleepBudget is RetryOnTransientSleepBudget for
+// RetryOnTransientOrLock. That loop can also sleep on the storage-lock curve,
+// so each sleep is counted at the longest of the storage-lock, pushback, and
+// transient curves, and maxAttempts <= 0 resolves to
+// DefaultStorageLockMaxAttempts as it does in the loop.
+func RetryOnTransientOrLockSleepBudget(maxAttempts int) time.Duration {
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultStorageLockMaxAttempts
+	}
+	var total time.Duration
+	for attempt := 0; attempt < maxAttempts-1; attempt++ {
+		total += max(
+			storageLockBackoff(attempt, maxJitterDraw),
+			pushbackBackoff(attempt, maxJitterDraw),
+			transientBackoff(attempt, maxJitterDraw),
+		)
+	}
+	return total
 }
 
 // RetryOnTransient invokes op up to maxAttempts times, retrying when the
