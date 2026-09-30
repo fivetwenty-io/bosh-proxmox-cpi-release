@@ -585,3 +585,129 @@ func TestManagedLockWaitDoesNotGrowTheRecord(t *testing.T) {
 		t.Fatalf("a 5-second wait grew the record by %d bytes", growth)
 	}
 }
+
+// legacyPreservationFixture is a VM allocation in delete, holding a legacy
+// stable-ID disk that no allocation owns, with the parker the preservation
+// will use pinned so a test can hold its lock.
+func legacyPreservationFixture(t *testing.T, locks *lockContention) (Deps, *lifecycleFlowPVE, *aj.Handle, int, string) {
+	t.Helper()
+	deps, client, journal, id, _ := lifecycleFlowFixture(t)
+	deps.PVE = contendedFlowPVE{lifecycleFlowPVE: client, locks: locks}
+	deps.Config.DetachedDiskStrategy = "parked"
+	parker := deps.Config.ParkedDiskVMIDRangeStartValue()
+	client.state.configs[parker] = map[string]any{"name": fmt.Sprintf("bosh-parker-%d", parker), "tags": "bosh-parker", "protection": 1, "scsihw": "virtio-scsi-pci", "digest": "1"}
+	record, err := journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
+	volume := "a:123/vm-123-disk-0.raw"
+	token, err := pve.GenerateDiskStableID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cid, err := pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: token, Format: "raw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.state.volumes[volume] = client.state.volumes[old]
+	delete(client.state.volumes, old)
+	client.state.configs[777]["scsi1"] = volume + ",serial=" + token + ",size=5G"
+	pve.UpdateAttachedDiskCID(t.Context(), client, deps.Log(t.Context()), "n1", 777, token, cid)
+	handle, err := journal.AcquireVM(t.Context(), "vm-agent", record.Intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := handle.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	step, err := storageMutationIntent(handle, "vm_create", aj.Target{Node: "n1", VMID: 777}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storageMutationObserved(handle, step, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	vm := handle.Record()
+	vm.State = aj.Observed
+	vm.CID = "777"
+	if err := handle.Save(vm); err != nil {
+		t.Fatal(err)
+	}
+	return deps, client, handle, parker, cid
+}
+
+// TestDeleteVMLegacyPreservationUsesTheManagedWait covers delete_vm's legacy
+// branch, which preserves a stable-ID disk that no allocation owns. It takes
+// the same parker lock, so it gets the managed wait. A wait that runs out
+// before the preservation touched the disk leaves the VM allocation settled,
+// and delete_vm's cleanup rule does not mark it uncertain.
+func TestDeleteVMLegacyPreservationUsesTheManagedWait(t *testing.T) {
+	locks := newLockContention(t)
+	deps, client, handle, parker, _ := legacyPreservationFixture(t, locks)
+	plantHeldParkerLock(locks, parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	started := time.Now()
+	err := detachManagedPersistentForVMDelete(t.Context(), deps, "n1", 777, nil, handle)
+	elapsed := time.Since(started)
+	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want the retriable lock timeout with the returned-disk marker, got %v", err)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("the wait took %s, so the managed wait was not applied", elapsed)
+	}
+	if client.moves != 0 || !strings.Contains(fmt.Sprint(client.state.configs[777]["scsi1"]), "vm-123-disk-0") {
+		t.Fatalf("the preservation moved the disk before its wait ran out: moves=%d", client.moves)
+	}
+	if final := managedVMCleanupFailure(handle, err); !isDiskReturnedAfterLockTimeout(final) {
+		t.Fatalf("delete_vm's cleanup rule lost the marker: %v", final)
+	}
+	record := handle.Record()
+	if record.State == aj.ReconciliationRequired {
+		t.Fatalf("a clean legacy preservation timeout demanded reconciliation: %s", record.Reason)
+	}
+	for i := range record.Steps {
+		if record.Steps[i].State != aj.Observed {
+			t.Fatalf("step %s (%s) left %s", record.Steps[i].ID, record.Steps[i].Kind, record.Steps[i].State)
+		}
+	}
+}
+
+// TestCreateVMLegacyAttachReturnsTheDiskOnATimeout covers create_vm's attach
+// of a legacy stable-ID disk from its parker. A wait that runs out before the
+// attach touched the disk hands back the returned-disk marker, so
+// attachPersistent settles its step instead of poisoning the VM allocation,
+// and the VM record is not marked uncertain.
+func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
+	locks := newLockContention(t)
+	deps, client, handle, parker, cid := legacyPreservationFixture(t, locks)
+	if err := detachManagedPersistentForVMDelete(t.Context(), deps, "n1", 777, nil, handle); err != nil {
+		t.Fatalf("parking the legacy disk: %v", err)
+	}
+	moves := client.moves
+	locks.reset()
+	plantHeldParkerLock(locks, parker)
+	shortenManagedLockWait(t, 1500*time.Millisecond)
+
+	bare, meta, err := decodeDiskCID(t.Context(), deps, "create_vm", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := resolveDiskForOp(t.Context(), deps, "create_vm", cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = attachExistingDiskToManagedVM(t.Context(), deps, handle, disk, "n1", 777)
+	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) {
+		t.Fatalf("want the lock timeout with the returned-disk marker, got %v", err)
+	}
+	if client.moves != moves {
+		t.Fatal("the attach moved the disk before its wait ran out")
+	}
+	if record := handle.Record(); record.State == aj.ReconciliationRequired {
+		t.Fatalf("a clean legacy attach timeout demanded reconciliation: %s", record.Reason)
+	}
+}

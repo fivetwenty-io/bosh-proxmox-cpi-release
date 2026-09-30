@@ -115,6 +115,9 @@ func managedVMPreservationCandidates(ctx context.Context, deps Deps, node string
 }
 
 func detachManagedPersistentForVMDeleteOne(ctx context.Context, deps Deps, node string, vmid int, disk resolvedDisk, handle *aj.Handle) (operationErr error) {
+	// Both preservations below take the parker lock through a guarded client,
+	// so both get the managed wait, the legacy one included.
+	ctx = managedLockWaitContext(ctx)
 	if disk.allocation == nil {
 		return preserveLegacyDiskForVMDelete(ctx, deps, node, vmid, disk, handle)
 	}
@@ -125,7 +128,6 @@ func detachManagedPersistentForVMDeleteOne(ctx context.Context, deps Deps, node 
 	if lifecycle == nil {
 		return fmt.Errorf("persistent disk preservation did not acquire allocation ownership")
 	}
-	ctx = managedLockWaitContext(ctx)
 	defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 	current := lifecycle.disk
 	if current.holder == nil || current.holder.Node != node || current.holder.VMID != vmid || current.volid != disk.volid {
@@ -177,6 +179,13 @@ func preserveLegacyDiskForVMDelete(ctx context.Context, deps Deps, node string, 
 		}
 	}
 	err = errors.Join(err, guard.Err())
+	if err != nil && lifecycle.cleanLockTimeout(err) {
+		// The parker lock wait ran out before this preservation changed the
+		// disk, and every step on the VM's record is observed. The disk is
+		// where it was, so nothing here is uncertain, and delete_vm's own
+		// cleanup rule reads the marker.
+		return &diskReturnedAfterLockTimeout{err: err}
+	}
 	if err == nil {
 		if disk.stableID != "" {
 			err = verifyLegacyDiskPreservation(ctx, deps, disk)
