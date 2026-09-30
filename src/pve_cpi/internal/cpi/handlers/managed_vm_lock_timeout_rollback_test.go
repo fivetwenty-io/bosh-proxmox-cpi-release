@@ -614,3 +614,39 @@ func TestVMRollbackFailureRules(t *testing.T) {
 		t.Fatalf("a delete_vm preservation timeout lost its clean exit: %v %s", err, deletion.handle.Record().State)
 	}
 }
+
+// TestVMCleanupFailureLeadsWithReconciliation covers a delete_vm disposal
+// that fails after it was admitted. The generation requires reconciliation, so
+// a Director retry would only meet a refusal. A retriable cleanup error goes
+// behind the reconciliation error, so the first CPI error the Director reads
+// is not retriable. A cleanup error that is already not retriable keeps its
+// place, so the Director still shows its own message.
+func TestVMCleanupFailureLeadsWithReconciliation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cause   error
+		leading string
+	}{
+		{name: "retriable cleanup failure", cause: cpierrors.Retriable("VM destroy task timed out"), leading: "requires reconciliation at VM cleanup"},
+		{name: "audit refusal", cause: cpierrors.Cloud("VM cleanup refused: 1 audit issue"), leading: "VM cleanup refused: 1 audit issue"},
+		{name: "untyped cleanup failure", cause: errors.New("cleanup used unbounded volume destruction"), leading: "cleanup used unbounded volume destruction"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := createdManagedVM(t)
+			err := managedVMCleanupFailure(m.handle, tc.cause)
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("the cleanup error left the chain: %v", err)
+			}
+			var typed *cpierrors.Error
+			if !errors.As(err, &typed) || typed.Type() != cpierrors.TypeCloud || typed.OkToRetry() {
+				t.Fatalf("the Director would read the failed disposal as retriable: %v", err)
+			}
+			if !strings.Contains(typed.Error(), tc.leading) {
+				t.Fatalf("the Director would show %q, want it to name %q", typed.Error(), tc.leading)
+			}
+			if state := m.handle.Record().State; state != aj.ReconciliationRequired {
+				t.Fatalf("the failed disposal left the generation %s", state)
+			}
+		})
+	}
+}
