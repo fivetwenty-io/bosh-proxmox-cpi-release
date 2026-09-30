@@ -93,8 +93,18 @@ func storageAuditGateError(ctx context.Context, deps Deps, operation string, rep
 		log.Int("issue_count", len(report.Issues)),
 		log.String("conflicts", log.ScrubMessage(strings.Join(report.Conflicts, " | "))),
 		log.String("vm_scan_issues", log.ScrubMessage(strings.Join(report.VMScanIssues, " | "))),
-		log.String("issues", log.ScrubMessage(strings.Join(report.Issues, " | "))))
+		log.String("issues", log.ScrubMessage(strings.Join(report.Issues, " | "))),
+		log.String("observed_moves", log.ScrubMessage(strings.Join(storageAuditMoveLines(report.ObservedMoves), " | "))))
 	return cpierrors.WrapAs(&storageAuditGateFailure{summary: log.ScrubMessage(summary), hint: hint}, cpierrors.TypeCloud, operation+" refused")
+}
+
+// storageAuditMoveLines renders each accepted move as one line.
+func storageAuditMoveLines(moves []StorageAllocationMove) []string {
+	lines := make([]string, 0, len(moves))
+	for _, move := range moves {
+		lines = append(lines, move.String())
+	}
+	return lines
 }
 
 func storageAuditCount(n int, noun string) string {

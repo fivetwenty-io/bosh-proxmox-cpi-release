@@ -4,6 +4,7 @@ package handlers_test
 
 import (
 	"context"
+	"errors"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -1047,8 +1048,12 @@ func (s *panicNodesStub) GetQemuSnapshot(ctx context.Context, node string, vmid 
 	panic("panicNodesStub.GetQemuSnapshot: not expected")
 }
 
+// ListQemuSnapshotConfig fails instead of panicking. The allocation audit
+// reads snapshot configurations whenever it weighs a moved VM, and a failed
+// read makes it refuse the move, which is the safe outcome for any test that
+// did not script snapshots.
 func (s *panicNodesStub) ListQemuSnapshotConfig(ctx context.Context, node string, vmid string, snapname string) (*nodes.ListQemuSnapshotConfigResponse, error) {
-	panic("panicNodesStub.ListQemuSnapshotConfig: not expected")
+	return nil, errors.New("panicNodesStub.ListQemuSnapshotConfig: no snapshot configuration scripted")
 }
 
 func (s *panicNodesStub) UpdateQemuSnapshotConfig(ctx context.Context, node string, vmid string, snapname string, params *nodes.UpdateQemuSnapshotConfigParams) error {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,7 +48,7 @@ func (c *allocationAuditClient) Cluster() sdkcluster.Service {
 }
 
 func (c *allocationAuditClient) QEMU() sdkqemu.Service {
-	if c.configFailure == nil && c.emptyConfigs == nil {
+	if c.configFailure == nil && c.emptyConfigs == nil && c.nodesRead.snapshots == nil && c.nodesRead.snapshotListFailure == nil {
 		return c.idFakeClient.QEMU()
 	}
 	return &allocationAuditQEMU{Service: c.idFakeClient.QEMU(), client: c}
@@ -66,6 +67,23 @@ func (q *allocationAuditQEMU) Config(ctx context.Context, node string, vmid int)
 		return nil, nil
 	}
 	return q.Service.Config(ctx, node, vmid)
+}
+
+// ListSnapshots serves the scripted snapshots of one VM, plus the synthetic
+// "current" entry that PVE always lists.
+func (q *allocationAuditQEMU) ListSnapshots(ctx context.Context, node string, vmid int) ([]map[string]any, error) {
+	nodes := q.client.nodesRead
+	if err := nodes.snapshotListFailure[vmid]; err != nil {
+		return nil, err
+	}
+	if nodes.snapshots == nil {
+		return q.Service.ListSnapshots(ctx, node, vmid)
+	}
+	entries := []map[string]any{{"name": "current"}}
+	for name := range nodes.snapshots[vmid] {
+		entries = append(entries, map[string]any{"name": name})
+	}
+	return entries, nil
 }
 
 // allocationAuditCluster reports a multi-node membership and a scripted
@@ -134,6 +152,19 @@ type allocationAuditNodes struct {
 	// fixture's empty listing.
 	nodeNames    []string
 	nodesFailure error
+	// volumesByNode, when a node has an entry, serves on that node only the
+	// volids that belong to the storage being listed, so shared and local
+	// storages can list different content on the same node.
+	volumesByNode map[string][]string
+	// malformedListing appends an entry without a volid to the listing of
+	// one "node/storage" that volumesByNode serves.
+	malformedListing map[string]bool
+	// snapshots maps a VMID to its snapshot configurations by name.
+	// snapshotListFailure fails a VM's snapshot listing, and snapshotFailure
+	// fails the configuration read of one snapshot name.
+	snapshots           map[int]map[string]map[string]any
+	snapshotListFailure map[int]error
+	snapshotFailure     map[string]error
 }
 
 // ListStorageContent records every listing it serves; the audit fans out
@@ -148,7 +179,44 @@ func (n *allocationAuditNodes) ListStorageContent(_ context.Context, node, stora
 	if content, ok := n.contentByNode[node]; ok {
 		return &content, nil
 	}
+	if volumes, ok := n.volumesByNode[node]; ok {
+		content := ns.ListStorageContentResponse{}
+		for _, volume := range volumes {
+			if strings.HasPrefix(volume, storage+":") {
+				raw, err := json.Marshal(map[string]any{"volid": volume})
+				if err != nil {
+					return nil, err
+				}
+				content = append(content, raw)
+			}
+		}
+		if n.malformedListing[node+"/"+storage] {
+			content = append(content, json.RawMessage(`{"size":1}`))
+		}
+		return &content, nil
+	}
 	return &n.content, n.failure
+}
+
+// ListQemuSnapshotConfig serves one scripted snapshot configuration.
+func (n *allocationAuditNodes) ListQemuSnapshotConfig(_ context.Context, _ string, vmid string, name string) (*ns.ListQemuSnapshotConfigResponse, error) {
+	if err := n.snapshotFailure[name]; err != nil {
+		return nil, err
+	}
+	id, err := strconv.Atoi(vmid)
+	if err != nil {
+		return nil, err
+	}
+	cfg, found := n.snapshots[id][name]
+	if !found {
+		return nil, errors.New("snapshot not scripted")
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	response := ns.ListQemuSnapshotConfigResponse(raw)
+	return &response, nil
 }
 
 func (n *allocationAuditNodes) ListQemu(ctx context.Context, node string, params *ns.ListQemuParams) (*ns.ListQemuResponse, error) {
