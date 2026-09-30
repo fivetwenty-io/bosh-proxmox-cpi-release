@@ -25,6 +25,9 @@ type contendedFlowPVE struct {
 	*lifecycleFlowPVE
 	locks *lockContention
 	gate  <-chan struct{}
+	// enter, when set, runs as a disk move reaches PVE, after the guard has
+	// admitted it.
+	enter func()
 }
 
 func (c contendedFlowPVE) Pools() pve.PoolService {
@@ -32,15 +35,19 @@ func (c contendedFlowPVE) Pools() pve.PoolService {
 }
 
 func (c contendedFlowPVE) Nodes() nodes.Service {
-	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE}, gate: c.gate}
+	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE}, gate: c.gate, enter: c.enter}
 }
 
 type gatedFlowNodes struct {
 	lifecycleFlowNodes
-	gate <-chan struct{}
+	gate  <-chan struct{}
+	enter func()
 }
 
 func (n gatedFlowNodes) CreateQemuMoveDisk(ctx context.Context, node, vmid string, p *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
+	if n.enter != nil {
+		n.enter()
+	}
 	if n.gate != nil {
 		select {
 		case <-n.gate:
@@ -861,4 +868,140 @@ func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testi
 		t.Fatalf("the attach after our old claim lapsed failed: %v", err)
 	}
 	assertReturnedRecord(t, "completed", disk.record(t))
+}
+
+// sentinelCount reports how many sentinels the shared store holds.
+func sentinelCount(locks *lockContention) int {
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	return len(locks.pools)
+}
+
+// assertCleanCancellation checks what a clean exit on an ended request owes
+// the Director: a retriable error and the disk's allocation returned with
+// every step observed, which also shows the guard was never poisoned.
+func assertCleanCancellation(t *testing.T, disk *parkedFlowDisk, err error, signal error) {
+	t.Helper()
+	if !errors.Is(err, signal) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want a retriable error carrying %v, got %v", signal, err)
+	}
+	assertReturnedRecord(t, "cancelled", disk.record(t))
+}
+
+// TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation cancels the
+// request while its parker lock is confirming a create whose reads fail. The
+// acquire cannot tell whether it holds the lock and gives up. Its way out runs
+// on a detached context, reads the sentinel, proves it ours, and deletes it,
+// and the guard admits that delete although the request has ended. Nothing
+// else was admitted, so the allocation is returned with a retriable error and
+// the sentinel is gone.
+func TestManagedAttachCancelledDuringTheConfirmReturnsTheAllocation(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	failConfirmingReads(locks)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	failing := locks.plainRead
+	locks.plainRead = func(readCtx context.Context, pool string) error {
+		err := failing(readCtx, pool)
+		if err != nil {
+			cancel()
+		}
+		return err
+	}
+
+	err := disk.attach(ctx)
+	assertCleanCancellation(t, disk, err, pve.ErrClusterLockStateUnknown)
+	if n := sentinelCount(locks); n != 0 {
+		t.Fatalf("the proven sentinel was left standing: %v", locks.pools)
+	}
+}
+
+// TestManagedAttachCancelledWhileWaitingReturnsTheAllocation cancels the
+// request while its parker lock waits behind another request's live claim.
+// The wait ends interrupted, the window never runs, and the allocation is
+// returned with a retriable error. The holder's claim is untouched.
+func TestManagedAttachCancelledWhileWaitingReturnsTheAllocation(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	plantHeldParkerLock(locks, disk.parker)
+	sentinel := pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", disk.parker))
+	holder := locks.pools[sentinel]
+	shortenManagedLockWait(t, 5*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	rejected := locks.rejected
+	go func() {
+		select {
+		case <-rejected:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	err := disk.attach(ctx)
+	assertCleanCancellation(t, disk, err, pve.ErrClusterLockInterrupted)
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if locks.pools[sentinel] != holder {
+		t.Fatalf("the holder's claim was disturbed: %q", locks.pools[sentinel])
+	}
+}
+
+// TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation cancels the
+// request as its parker lock confirms the claim for the last time, so the
+// window opens on an ended request. The guard refuses the window's first
+// mutation before it reaches PVE, without poisoning, and still admits the
+// release of our sentinel. Nothing was admitted, so the allocation is returned
+// with a retriable error and the sentinel is gone.
+func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reads := -1
+	locks.afterCreate = func(string) { reads = 0 }
+	locks.plainRead = func(context.Context, string) error {
+		if reads < 0 {
+			return nil
+		}
+		reads++
+		// The guard's readback of the create comes first, then the two
+		// confirming reads. The second of those is the last read before the
+		// window opens.
+		if reads == 3 {
+			cancel()
+		}
+		return nil
+	}
+
+	err := disk.attach(ctx)
+	assertCleanCancellation(t, disk, err, errManagedRequestEnded)
+	if n := sentinelCount(locks); n != 0 {
+		t.Fatalf("our sentinel was not released: %v", locks.pools)
+	}
+}
+
+// TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain is the other
+// side. The guard admitted the disk move before the request ended, and the
+// move then failed on the ended request. A mutation that was admitted may
+// have changed the disk, so the guard is poisoned and the allocation needs
+// reconciliation, exactly as before.
+func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	disk.deps.PVE = contendedFlowPVE{lifecycleFlowPVE: disk.client, locks: locks, gate: make(chan struct{}), enter: cancel}
+
+	if err := disk.attach(ctx); err == nil {
+		t.Fatal("an attach whose admitted move failed reported success")
+	}
+	if record := disk.record(t); record.State != aj.ReconciliationRequired {
+		t.Fatalf("allocation state = %s, want %s", record.State, aj.ReconciliationRequired)
+	}
 }

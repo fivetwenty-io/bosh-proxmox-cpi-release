@@ -3,8 +3,10 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -67,8 +69,8 @@ func lifecycleInt(value any) (int, error) {
 }
 func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllocationMutation) (string, error) {
 	m := g.lifecycle
-	if m.requestContext == nil || m.requestContext.Err() != nil {
-		return "", fmt.Errorf("managed lifecycle request cancelled before mutation")
+	if err := m.requestEndedRefusal(ctx, call); err != nil {
+		return "", err
 	}
 	node, _ := call.Args[resourceTypeNode].(string)
 	if node == "" {
@@ -828,4 +830,41 @@ func (g *managedDiskLifecycleGuard) observeMove(ctx context.Context, observation
 	volumes = append(volumes, landed)
 	m.disk.volid = landed
 	return volumes, nil
+}
+
+// errManagedRequestEnded marks a lifecycle mutation that the guard refused
+// because the request's own context had already ended. Nothing reached PVE, so
+// begin hands the refusal back as not attempted and leaves the guard usable,
+// and cleanLockTimeout can count the operation clean when nothing else was
+// admitted and every step is settled.
+var errManagedRequestEnded = errors.New("managed lifecycle request ended before mutation")
+
+// managedRequestEnded is the refusal before gives a mutation on an ended
+// request. It is retriable, because nothing changed and the Director may try
+// again, and it carries both the context's own error and errManagedRequestEnded.
+func managedRequestEnded(cause error) error {
+	return cpierrors.WrapAs(errors.Join(cause, errManagedRequestEnded), cpierrors.TypeRetriableCloud,
+		"managed lifecycle request ended before mutation")
+}
+
+// requestEndedRefusal refuses a mutation on a request whose context has
+// ended, except the release of a lock sentinel on its own live context.
+func (m *managedDiskLifecycle) requestEndedRefusal(ctx context.Context, call ManagedAllocationMutation) error {
+	if m.requestContext == nil {
+		return fmt.Errorf("managed lifecycle request cancelled before mutation")
+	}
+	if cause := m.requestContext.Err(); cause != nil && (ctx.Err() != nil || !isLockSentinelDelete(call)) {
+		return managedRequestEnded(cause)
+	}
+	return nil
+}
+
+// isLockSentinelDelete reports whether call deletes a bosh-lock- sentinel. A
+// lock the request still holds has to be released after the request's context
+// ends, or every other request waits out its TTL. That release runs on its own
+// detached, bounded context, and before admits it while that context is live.
+// The release deletes only a claim a fresh read proves ours.
+func isLockSentinelDelete(call ManagedAllocationMutation) bool {
+	pool, _ := call.Args[managedArgumentPoolID].(string)
+	return call.Service == managedDiskServicePool && call.Method == "DeletePool" && isManagedLockPool(pool)
 }

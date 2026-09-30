@@ -739,3 +739,71 @@ func TestAcquireClusterLock_HandleKeepsTheClaimPVEReturned(t *testing.T) {
 		t.Fatalf("handle claim = %q, want the comment PVE returned %q", h.claim, sent+"\n")
 	}
 }
+
+// TestAcquireClusterLock_RequestDeadlineEndsTheWait covers a request whose
+// deadline lands inside the lock wait. The wait ends at that deadline less
+// clusterLockContextMargin, which leaves the caller time to release and close
+// out its request, and it ends with ErrClusterLockTimeout rather than being cut
+// short by the deadline itself. The request's deadline is set on the test
+// clock's time line.
+func TestAcquireClusterLock_RequestDeadlineEndsTheWait(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(1000, 0)
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("holder", start.Add(time.Hour))
+	clk, _ := sleepLog(start)
+	ctx, cancel := context.WithDeadline(context.Background(), start.Add(40*time.Second))
+	defer cancel()
+	h, err := acquireClusterLockWithClock(ctx, f, "web", "me", time.Minute, 3*time.Minute, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockTimeout) || errors.Is(err, ErrClusterLockInterrupted) {
+		t.Fatalf("want the lock timeout, got handle=%v err=%v", h != nil, err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the timeout must be retriable: %v", err)
+	}
+	if got, want := clk.now(), start.Add(40*time.Second-clusterLockContextMargin); !got.Equal(want) {
+		t.Fatalf("the wait ended at %v, want the request's deadline less the margin, %v", got, want)
+	}
+}
+
+// TestAcquireClusterLock_TooLittleTimeLeftCreatesNothing covers a request
+// that starts with less than clusterLockContextMargin before its deadline. It
+// gets the lock timeout at once and creates no sentinel, because it could not
+// release one and close out in the time left.
+func TestAcquireClusterLock_TooLittleTimeLeftCreatesNothing(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(1000, 0)
+	f := newFakeLockPools()
+	clk, _ := sleepLog(start)
+	ctx, cancel := context.WithDeadline(context.Background(), start.Add(clusterLockContextMargin-time.Second))
+	defer cancel()
+	h, err := acquireClusterLockWithClock(ctx, f, "web", "me", time.Minute, 3*time.Minute, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockTimeout) {
+		t.Fatalf("want the lock timeout, got handle=%v err=%v", h != nil, err)
+	}
+	if f.createN != 0 || len(f.pools) != 0 {
+		t.Fatalf("an acquire with no time left created a sentinel: creates=%d pools=%v", f.createN, f.pools)
+	}
+}
+
+// TestAcquireClusterLock_CancelledWaitIsInterrupted covers a plain
+// cancellation, as a SIGTERM makes. The wait ends with
+// ErrClusterLockInterrupted, which callers match with errors.Is, and not with
+// the timeout, so the two stay apart.
+func TestAcquireClusterLock_CancelledWaitIsInterrupted(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(1000, 0)
+	f := newFakeLockPools()
+	f.pools["bosh-lock-web"] = encodeLockComment("holder", start.Add(time.Hour))
+	clk := lockClock{
+		now:   func() time.Time { return start },
+		sleep: func(context.Context, time.Duration) error { return context.Canceled },
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 3*time.Minute, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockInterrupted) || errors.Is(err, ErrClusterLockTimeout) {
+		t.Fatalf("want the interrupted wait, got handle=%v err=%v", h != nil, err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("the interrupted wait must be retriable and keep the cancellation: %v", err)
+	}
+}

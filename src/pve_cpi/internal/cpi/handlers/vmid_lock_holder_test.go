@@ -56,6 +56,54 @@ func TestVMIDLockTimeoutNamesTheHolder(t *testing.T) {
 	}
 }
 
+// TestVMIDLockNoTimeToWaitSaysSo covers a request whose deadline leaves less
+// than the lock's margin. The acquire gives up before it waits at all, so the
+// error must not claim a wait. It says the deadline left no time to wait and
+// quotes the holder's claim as a timed-out wait does, or says the lock is free
+// when nobody holds it.
+func TestVMIDLockNoTimeToWaitSaysSo(t *testing.T) {
+	exp := time.Now().Add(20 * time.Minute).Unix()
+	owner := "set_vm_metadata/4242@director-0/1234-9f2c1a7e-7"
+	const prefix = `withVMIDLock: lock "bosh-lock-vm-4242" was not waited for, because the request's deadline left no time to wait`
+	for name, tc := range map[string]struct {
+		claim string
+		want  string
+	}{
+		"held": {
+			claim: fmt.Sprintf("owner=%s exp=%d", owner, exp),
+			want: fmt.Sprintf(prefix+`, and it is held by owner=%s exp=%d, which lapses at %s`,
+				owner, exp, time.Unix(exp, 0).UTC().Format(time.RFC3339)),
+		},
+		"free": {want: prefix + `, and it is free now, so a retry can take it`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pools := newVMIDLockPools(nil)
+			if tc.claim != "" {
+				pools.pools["bosh-lock-vm-4242"] = tc.claim
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			ran := false
+			err := withVMIDLock(ctx, pools, 4242, "set_vm_metadata/4242", nil, func() error {
+				ran = true
+				return nil
+			})
+			if ran || err == nil {
+				t.Fatalf("the lock was taken with no time to wait: ran=%t err=%v", ran, err)
+			}
+			if !strings.HasPrefix(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to start with %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "throughout the wait") {
+				t.Fatalf("error %q claims a wait that never happened", err)
+			}
+			if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+				t.Fatalf("error %q lost its retriable timeout cause", err)
+			}
+		})
+	}
+}
+
 // failingCommentPools answers every pool comment read with an error.
 type failingCommentPools struct{ *vmidLockPools }
 

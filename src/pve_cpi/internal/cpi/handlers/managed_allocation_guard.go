@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -119,6 +120,14 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	token, err := g.hooks.Before(ctx, m)
 	if err == nil && token == "" {
 		err = fmt.Errorf("managed mutation did not produce durable intent identity")
+	}
+	if errors.Is(err, errManagedRequestEnded) {
+		// The request's context ended before this mutation, and the refusal
+		// came before any intent was written or PVE was called. Nothing is
+		// uncertain, so the guard stays usable, the way a cut-off protection
+		// write leaves it.
+		g.mu.Unlock()
+		return "", &managedMutationNotAttempted{err: err}
 	}
 	if err != nil {
 		g.poisoned = cpierrors.Cloud("managed allocation blocked before %s.%s", m.Service, m.Method)
