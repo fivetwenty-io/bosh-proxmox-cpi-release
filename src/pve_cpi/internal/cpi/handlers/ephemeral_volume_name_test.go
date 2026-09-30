@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -59,8 +60,10 @@ func (s *namedEphemeralStorage) Exists(_ context.Context, _, _, volume string) (
 }
 
 func TestLegacyEphemeralFileNameAndReplayUseOwnerDirectory(t *testing.T) {
+	t.Parallel()
 	for _, replay := range []bool{false, true} {
 		t.Run(fmt.Sprintf("replay=%t", replay), func(t *testing.T) {
+			t.Parallel()
 			store := &namedEphemeralStorage{replay: replay}
 			guest := &ephemeralQEMU{configFn: func() (map[string]any, error) { return map[string]any{}, nil }, attachDiskFn: func(volume, _ string, _ *qemu.AttachOpts) (string, error) {
 				if volume != "e:123/vm-123-ephemeral-0.qcow2" {
@@ -70,7 +73,7 @@ func TestLegacyEphemeralFileNameAndReplayUseOwnerDirectory(t *testing.T) {
 			}}
 			deps := Deps{PVE: &namedEphemeralClient{ephemeralClient: &ephemeralClient{qemu: guest, storage: store}}, Logger: log.NewNopLogger()}
 			shape := &createVMShape{node: "n1", ephemeralStorage: "e", ephemeralDiskGiB: 1, vmDiskFormat: "qcow2"}
-			if _, err := attachEphemeralDisk(t.Context(), deps, deps.Logger, shape, 123); err != nil {
+			if _, err := attachEphemeralDisk(pve.WithTestBackoff(t.Context(), func(int) time.Duration { return 0 }), deps, deps.Logger, shape, 123); err != nil {
 				t.Fatal(err)
 			}
 			if replay && (store.calls != 2 || len(store.probes) != 1 || store.probes[0] != "e:123/vm-123-ephemeral-0.qcow2") {

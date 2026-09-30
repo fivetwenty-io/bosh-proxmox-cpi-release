@@ -5,10 +5,12 @@ package handlers
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // nrIntPtr is a local *int helper for NetworkResolveRetries assignments —
@@ -139,14 +141,15 @@ func TestConfigureNICs_GateDefaultUnset_Active(t *testing.T) {
 }
 
 func TestConfigureNICs_GateOn_BridgeAbsent_RetriableNoWrite(t *testing.T) {
+	t.Parallel()
 	cfg := icMinConfig()
-	cfg.NetworkResolveRetries = nrIntPtr(1) // 1 retry → at most one ~1s sleep
+	cfg.NetworkResolveRetries = nrIntPtr(1) // 1 retry → one sleep on the test's short poll
 	cl := &fwClusterStub{sdnVnets: []string{"v1"}}
 	nd := &fwNodesStub{nodeIfaces: []string{"vmbr0"}} // v1 never appears
 	deps := fwDeps(cl, nd, cfg)
 	shape := &createVMShape{node: "pve1"}
 
-	_, err := configureNICs(context.Background(), deps, log.NewNopLogger(), nrParsed("v1"), shape, 100)
+	_, err := configureNICs(pve.WithNetworkResolvePollForTest(context.Background(), time.Millisecond), deps, log.NewNopLogger(), nrParsed("v1"), shape, 100)
 	if err == nil || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Fatalf("absent SDN bridge: want retriable-cloud, got %v", err)
 	}
