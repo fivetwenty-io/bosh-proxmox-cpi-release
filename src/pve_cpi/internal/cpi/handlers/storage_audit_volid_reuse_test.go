@@ -306,32 +306,13 @@ func TestAllocationAuditFindsForeignSerialOnHeldVolume(t *testing.T) {
 	}
 }
 
-// sharedReferenceFixture places two VMs, 500 and 501, on the given nodes of
-// a three-node cluster with shared storage "a" and node-local storage
-// "local", and gives each the given config.
-func sharedReferenceFixture(t *testing.T, nodes map[int]string, configs map[int]map[string]any) StorageAllocationAudit {
-	t.Helper()
-	deps, _, c := auditFixture(t)
-	c.storageRead.definitions = cs.ListStorageResponse{json.RawMessage(moveDefinitions["a"]), json.RawMessage(moveDefinitions["local"])}
-	c.clusterRead = &allocationAuditCluster{Service: c.idFakeClient.Cluster(), members: moveNodes}
-	c.nodesRead.nodeNames = moveNodes
-	c.nodesRead.guestNodes = nodes
-	for vmid, cfg := range configs {
-		c.configs[vmid] = cfg
-	}
-	report, err := auditStorageAllocationRecords(context.Background(), deps, nil, nil, []string{"pve1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return report
-}
-
 // TestAllocationAuditSharedReferenceRespectsNodeLocalStorage shows that the
 // same volid on node-local storage names one physical volume only on one
 // node. Two VMs on different nodes hold two different volumes, and two VMs
-// on the same node share one.
+// on the same node share one. The volume's name carries our namespace's
+// locator, because only a volume of ours raises the conflict.
 func TestAllocationAuditSharedReferenceRespectsNodeLocalStorage(t *testing.T) {
-	const volume = "local:500/vm-500-disk-0.qcow2"
+	volume := sharedReferenceAllocationVolume(t, "local")
 	configs := map[int]map[string]any{500: {"scsi0": volume}, 501: {"scsi0": volume}}
 	for _, tc := range []struct {
 		name  string
@@ -342,7 +323,7 @@ func TestAllocationAuditSharedReferenceRespectsNodeLocalStorage(t *testing.T) {
 		{name: "holders on the same node", nodes: map[int]string{500: "pve2", 501: "pve2"}, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			report := sharedReferenceFixture(t, tc.nodes, configs)
+			_, _, report := sharedReferenceCluster(t, tc.nodes, configs, nil)
 			if got := sharedReferenceConflict(report, volume); got != tc.want {
 				t.Fatalf("shared-reference conflict = %t, want %t:\n%s", got, tc.want, strings.Join(report.Conflicts, "\n"))
 			}
@@ -351,13 +332,18 @@ func TestAllocationAuditSharedReferenceRespectsNodeLocalStorage(t *testing.T) {
 }
 
 // TestAllocationAuditSharedISOIsNotADuplicate shows that many VMs mounting
-// one ISO as a CD-ROM is normal and raises nothing.
+// one ISO as a CD-ROM is normal and raises nothing. The ISO is ours, named by
+// the upload step of VM 500's record, so only the CD-ROM rule keeps it quiet.
 func TestAllocationAuditSharedISOIsNotADuplicate(t *testing.T) {
-	const iso = "a:iso/shared.iso"
-	report := sharedReferenceFixture(t, map[int]string{500: "pve1", 501: "pve1"}, map[int]map[string]any{
-		500: {"scsi0": "a:500/vm-500-disk-0.qcow2", "ide2": iso + ",media=cdrom"},
+	const iso = "a:iso/vm-500-config.iso"
+	a := moveDefinition(t, moveDefinitions["a"])
+	root := "a:500/vm-500-disk-0.qcow2"
+	vm := moveVMRecord(t, "agent", "pve1", 500, map[string]pve.StorageInfo{"a": a}, root)
+	vm.Steps = append(vm.Steps, aj.Step{ID: "upload", Kind: managedVMStepUpload, State: aj.Observed, Target: aj.Target{Node: "pve1", VMID: 500, Storage: "a", Backing: a.BackingKey(), IntendedVolume: iso}})
+	_, _, report := sharedReferenceCluster(t, map[int]string{500: "pve1", 501: "pve1"}, map[int]map[string]any{
+		500: {"scsi0": root, "ide2": iso + ",media=cdrom", "description": moveMarker(t, vm.ID, "agent")},
 		501: {"scsi0": "a:501/vm-501-disk-0.qcow2", "ide2": iso + ",media=cdrom"},
-	})
+	}, []aj.Record{vm})
 	if len(report.Conflicts) != 0 {
 		t.Fatalf("shared ISO raised conflicts:\n%s", strings.Join(report.Conflicts, "\n"))
 	}
