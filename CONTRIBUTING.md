@@ -46,7 +46,7 @@ This runs all Go tests with race detection and writes the coverage profile to `s
 make check
 ```
 
-This runs `artifacts-check`, `linear-check`, `fmt-check`, `vet`, `go-blob-check`, `erb-check`, `py-test`, `staticcheck`, `lint`, `test`, and `coverage-check` in order, stopping at the first failure. The `test` step runs the suite once with race detection and collects coverage as it goes, and `coverage-check` then reads that profile instead of running the tests a second time. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+This runs the quick gates first, which are `artifacts-check`, `linear-check`, `fmt-check`, and `go-blob-check`, and it stops at the first of them that fails. It then runs the slower gates in three lanes at once. The test lane runs the suite once with race detection and collects coverage as it goes, and `coverage-check` then reads that profile instead of running the tests a second time. The analysis lane runs `vet`, `staticcheck`, and `lint`, and the scripts lane runs `erb-check` and `py-test`. Each lane stops at its own first failure, and `make check` fails if any lane fails. The test output streams as the tests run, and the other two lanes print their logs whole once every lane has finished, so a `lint` failure shows up after the test output rather than before it. When we want the old one-at-a-time order, `make check CHECK_LANES=0` runs the same gates serially. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
 
 ### Installing the git hooks
 
