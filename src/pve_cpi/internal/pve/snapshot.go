@@ -2,8 +2,10 @@ package pve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -48,6 +50,29 @@ func HasSnapshots(ctx context.Context, client Client, node string, vmid int) ([]
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+// SnapshotConfig reads the configuration PVE keeps for one snapshot of a VM.
+// Its drive keys and its vmstate key name the volumes the snapshot holds,
+// which the VM's current configuration does not list.
+//
+// A read that returns nothing, or anything other than a JSON object, is an
+// error rather than an empty snapshot, because a caller uses the result to
+// prove what the snapshot holds. A failed read wraps the SDK error with %w,
+// so DescribeAuditError can still classify it.
+func SnapshotConfig(ctx context.Context, client Client, node string, vmid int, name string) (map[string]any, error) {
+	response, err := client.Nodes().ListQemuSnapshotConfig(ctx, node, strconv.Itoa(vmid), name)
+	if err != nil {
+		return nil, fmt.Errorf("SnapshotConfig: read snapshot %q of vm %d on node %s: %w", name, vmid, node, err)
+	}
+	if response == nil || len(*response) == 0 {
+		return nil, fmt.Errorf("SnapshotConfig: snapshot %q of vm %d on node %s returned no configuration", name, vmid, node)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(*response, &cfg); err != nil || cfg == nil {
+		return nil, fmt.Errorf("SnapshotConfig: snapshot %q of vm %d on node %s returned a malformed configuration", name, vmid, node)
+	}
+	return cfg, nil
 }
 
 // WaitForSnapshotAbsent polls until snapName no longer appears in the VM's

@@ -47,13 +47,15 @@ func (s *snapQEMUService) ListSnapshots(ctx context.Context, node string, vmid i
 
 type snapMockClient struct {
 	qemuSvc sdkqemu.Service
+	// nodesSvc serves SnapshotConfig; it stays nil for HasSnapshots tests.
+	nodesSvc nodes.Service
 }
 
 func (c *snapMockClient) QEMU() sdkqemu.Service                  { return c.qemuSvc }
 func (c *snapMockClient) Storage() storage.Service               { return nil }
 func (c *snapMockClient) CloudInit() cloudinit.Service           { return nil }
 func (c *snapMockClient) Tasks() tasks.Service                   { return nil }
-func (c *snapMockClient) Nodes() nodes.Service                   { return nil }
+func (c *snapMockClient) Nodes() nodes.Service                   { return c.nodesSvc }
 func (c *snapMockClient) Cluster() cluster.Service               { return nil }
 func (c *snapMockClient) ClusterStorage() clusterstorage.Service { return nil }
 func (c *snapMockClient) Pools() pve.PoolService                 { return nil }

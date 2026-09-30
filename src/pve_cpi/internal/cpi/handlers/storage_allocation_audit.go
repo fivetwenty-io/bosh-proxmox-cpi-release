@@ -55,10 +55,51 @@ type StorageAllocationAudit struct {
 	// proof. The list is disclosed so an operator who re-enables one of them
 	// knows it was never audited.
 	SkippedDisabledStorages []string `json:"skipped_disabled_storages"`
+	// ObservedMoves lists the VMs, disks, and parkers the audit found on a
+	// node other than the recorded one and accepted as moves on shared
+	// storage. An accepted move raises no conflict. The audit decides every
+	// move afresh on each call and never records one in the journal.
+	ObservedMoves []StorageAllocationMove `json:"observed_moves"`
 	// briefs maps a conflict to the short form a gate error leads with, which
 	// names the VM or volume before the allocation. It is not serialized,
 	// because the conflict itself is the durable record.
 	briefs map[string]string
+	// listed holds the volids that each (node, storage) listing returned. A
+	// listing that failed, or that returned a malformed entry, is absent,
+	// because it cannot prove that a volume is present on that node.
+	listed map[storageAuditTarget]map[string]bool
+	// vms is the inventory the VM scan kept for the move rules.
+	vms []storageAuditVM
+	// pending holds the node mismatches that wait for the move rules, which
+	// need the storage listings and so run after correlation.
+	pending []storageAuditPendingMove
+}
+
+// storageAuditVM is what the VM scan kept of one VM's configuration.
+type storageAuditVM struct {
+	node string
+	vmid int
+	// volumes maps each volume slot to its volid. It is nil when a slot held
+	// a reference that managedVMConfigVolumes does not recognize.
+	volumes map[string]string
+	// hasVMState reports a top-level vmstate key, which a hibernated VM
+	// carries; vmstate is the volid it names.
+	hasVMState bool
+	vmstate    string
+	// disks maps each disk allocation whose provenance this VM carries in the
+	// audited namespace to the volid that provenance names.
+	disks map[string]string
+}
+
+// storageAuditPendingMove is a node mismatch that the move rules resolve. A
+// refused move raises conflict, followed by the reason it was refused.
+type storageAuditPendingMove struct {
+	kind     string
+	evidence StorageAllocationEvidence
+	// recorded is the node the disk provenance names. VM mismatches take
+	// their recorded nodes from the journal record instead.
+	recorded        string
+	conflict, brief string
 }
 
 // markVMScanIncomplete records an issue that leaves the VM scan, and so the
@@ -238,7 +279,6 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		}
 		result.Evidence = append(result.Evidence, holders...)
 	}
-	correlateStorageAuditEvidence(&result, byID, stores, deps.Config.StoragePlacementNamespace)
 	sort.Slice(result.Evidence, func(i, j int) bool {
 		a, b := result.Evidence[i], result.Evidence[j]
 		if a.AllocationID != b.AllocationID {
@@ -253,6 +293,9 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		return a.VolumeID < b.VolumeID
 	})
 	result.Evidence = slices.Compact(result.Evidence)
+	namespace := deps.Config.StoragePlacementNamespace
+	correlateStorageAuditEvidence(&result, byID, stores, namespace)
+	resolveStorageAuditMoves(ctx, deps, &result, storageAuditMoveIndex{byID: byID, knownVolumes: knownVolumes, stores: stores, namespace: namespace})
 	sort.Strings(result.Issues)
 	result.Issues = slices.Compact(result.Issues)
 	sort.Strings(result.Conflicts)
@@ -321,13 +364,16 @@ func storageAllocationVerification(report StorageAllocationAudit, facts map[stri
 			return aj.Verification{}, fmt.Errorf("unrecognized allocation verification fact")
 		}
 	}
+	// ObservedMoves is omitted when empty, so evidence from an audit that saw
+	// no move stays byte-identical to what earlier releases retained.
 	evidenceID, evidenceJSON, err := aj.VerificationEvidence(struct {
-		Version     int                         `json:"version"`
-		StartedAt   time.Time                   `json:"started_at"`
-		CompletedAt time.Time                   `json:"completed_at"`
-		Evidence    []StorageAllocationEvidence `json:"evidence"`
-		Facts       any                         `json:"facts"`
-	}{1, report.StartedAt, report.CompletedAt, report.Evidence, log.RedactSecrets(facts)})
+		Version       int                         `json:"version"`
+		StartedAt     time.Time                   `json:"started_at"`
+		CompletedAt   time.Time                   `json:"completed_at"`
+		Evidence      []StorageAllocationEvidence `json:"evidence"`
+		ObservedMoves []StorageAllocationMove     `json:"observed_moves,omitempty"`
+		Facts         any                         `json:"facts"`
+	}{1, report.StartedAt, report.CompletedAt, report.Evidence, report.ObservedMoves, log.RedactSecrets(facts)})
 	if err != nil {
 		return aj.Verification{}, err
 	}
@@ -455,17 +501,22 @@ func collectAuditVMProvenance(result *StorageAllocationAudit, records []aj.Recor
 
 }
 
-func collectAuditDiskProvenance(result *StorageAllocationAudit, namespace, node string, vmid int, description string) {
+// collectAuditDiskProvenance records the disk provenance one VM carries and
+// returns each audited allocation's volid. A provenance entry that names
+// another node waits in pending for the move rules, which need the storage
+// listings that the VM scan runs before.
+func collectAuditDiskProvenance(result *StorageAllocationAudit, namespace, node string, vmid int, description string) map[string]string {
 	// Legacy ParseSentinel deliberately tolerates corruption. Absence audits
 	// must first use the strict managed-provenance parser so malformed or
 	// duplicated carriers cannot silently disappear from the inventory.
 	if _, _, parseErr := pve.FindDiskAllocationProvenance(description, ""); parseErr != nil {
 		result.Complete = false
 		result.Issues = append(result.Issues, fmt.Sprintf("VM %d has malformed disk provenance on %s: %s", vmid, node, pve.DescribeAuditError(parseErr)))
-		return
+		return nil
 	}
 	_, sentinel := pve.ParseSentinel(description)
 	keys := map[string]bool{}
+	parked := map[string]bool{}
 	for _, carrier := range []string{"bosh_parked_disks", "bosh_disk_allocations"} {
 		raw, found := sentinel[carrier]
 		if !found {
@@ -479,8 +530,10 @@ func collectAuditDiskProvenance(result *StorageAllocationAudit, namespace, node 
 		}
 		for key := range entries {
 			keys[key] = true
+			parked[key] = parked[key] || carrier == "bosh_parked_disks"
 		}
 	}
+	disks := map[string]string{}
 	for key := range keys {
 		entry, found, parseErr := pve.FindDiskAllocationProvenance(description, key)
 		if parseErr != nil {
@@ -489,13 +542,26 @@ func collectAuditDiskProvenance(result *StorageAllocationAudit, namespace, node 
 			continue
 		}
 		if found && entry.AllocationNamespace == namespace {
+			evidence := StorageAllocationEvidence{AllocationID: entry.AllocationID, Kind: allocationKindDisk, Node: node, VMID: vmid, VolumeID: entry.Volid}
 			if entry.Node != node {
+				kind := allocationKindDisk
+				if parked[key] {
+					kind = storageMoveKindParker
+				}
 				recorded := storageAuditField(entry.Node)
-				result.addConflict(fmt.Sprintf("disk ownership provenance disagrees with actual holder node: disk allocation %s (volume %s) held by VM %d on %s, provenance names %s; a migration outside BOSH is the usual cause", entry.AllocationID, entry.Volid, vmid, node, recorded), fmt.Sprintf("VM %d on %s holds disk allocation %s, provenance names %s", vmid, node, entry.AllocationID, recorded))
+				result.pending = append(result.pending, storageAuditPendingMove{
+					kind:     kind,
+					evidence: evidence,
+					recorded: entry.Node,
+					conflict: fmt.Sprintf("disk ownership provenance disagrees with actual holder node: disk allocation %s (volume %s) held by VM %d on %s, provenance names %s; a migration outside BOSH is the usual cause", entry.AllocationID, entry.Volid, vmid, node, recorded),
+					brief:    fmt.Sprintf("VM %d on %s holds disk allocation %s, provenance names %s", vmid, node, entry.AllocationID, recorded),
+				})
 			}
-			result.Evidence = append(result.Evidence, StorageAllocationEvidence{AllocationID: entry.AllocationID, Kind: allocationKindDisk, Node: node, VMID: vmid, VolumeID: entry.Volid})
+			disks[entry.AllocationID] = entry.Volid
+			result.Evidence = append(result.Evidence, evidence)
 		}
 	}
+	return disks
 }
 
 func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownVolumes map[string][]aj.Record, result *StorageAllocationAudit) (map[string][]StorageAllocationEvidence, error) {
@@ -524,11 +590,27 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 		collectAuditDiskHolders(records, knownVolumes, cfg, guest.Node, guest.VMID, diskHolders)
 		description := pve.DescriptionFromConfig(cfg)
 		collectAuditVMProvenance(result, records, namespace, guest.Node, guest.VMID, description)
-		collectAuditDiskProvenance(result, namespace, guest.Node, guest.VMID, description)
+		inventory := storageAuditVM{node: guest.Node, vmid: guest.VMID}
+		inventory.disks = collectAuditDiskProvenance(result, namespace, guest.Node, guest.VMID, description)
+		if volumes, err := managedVMConfigVolumes(cfg); err == nil {
+			inventory.volumes = volumes
+		}
+		inventory.vmstate, inventory.hasVMState = storageAuditVMState(cfg)
+		result.vms = append(result.vms, inventory)
 	}
 
 	return diskHolders, nil
 
+}
+
+// storageAuditVMState returns the volid a configuration's vmstate key names.
+// A hibernated VM, and a snapshot taken with RAM, carry one.
+func storageAuditVMState(cfg map[string]any) (string, bool) {
+	value, found := pve.ConfigString(cfg, "vmstate")
+	if !found {
+		return "", false
+	}
+	return strings.Split(value, ",")[0], true
 }
 
 func auditStorageDefinitions(ctx context.Context, deps Deps, records []aj.Record, result *StorageAllocationAudit) map[string]pve.StorageInfo {
@@ -695,10 +777,15 @@ func storageAuditTargets(ctx context.Context, deps Deps, nodes []string, histori
 
 }
 
-func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, namespace string) ([]StorageAllocationEvidence, []string) {
+// storageAuditContent lists one storage on one node. Beside the evidence and
+// issues, it returns every volid the listing held, or nil when the listing
+// failed or held a malformed entry and so proves nothing about its content.
+func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, namespace string) ([]StorageAllocationEvidence, map[string]bool, []string) {
 	response, e := deps.PVE.Nodes().ListStorageContent(ctx, target.node, target.storage, nil)
 	observations := []StorageAllocationEvidence{}
 	var issues []string
+	listed := map[string]bool{}
+	malformed := false
 	switch {
 	case e != nil:
 		issues = append(issues, fmt.Sprintf("storage %q on node %q could not be inspected: %s", target.storage, target.node, pve.DescribeAuditError(e)))
@@ -711,8 +798,10 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 			}
 			if json.Unmarshal(raw, &item) != nil || item.VolID == "" || !strings.HasPrefix(item.VolID, target.storage+":") {
 				issues = append(issues, fmt.Sprintf("storage %q on node %q returned malformed content: entry %d has no volid on this storage", target.storage, target.node, index))
+				malformed = true
 				continue
 			}
+			listed[item.VolID] = true
 			seenRecords := map[string]bool{}
 			for recordIndex := range knownVolumes[item.VolID] {
 				record := knownVolumes[item.VolID][recordIndex]
@@ -744,9 +833,12 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 				observations = append(observations, StorageAllocationEvidence{AllocationID: id, Kind: "vm", Node: target.node, VolumeID: item.VolID})
 			}
 		}
+		if !malformed {
+			return observations, listed, issues
+		}
 	}
 
-	return observations, issues
+	return observations, nil, issues
 
 }
 
@@ -757,9 +849,15 @@ func collectStorageAuditContent(ctx context.Context, deps Deps, targets []storag
 	for range min(4, len(targets)) {
 		wg.Go(func() {
 			for target := range jobs {
-				observations, issues := storageAuditContent(ctx, deps, target, stores, knownVolumes, deps.Config.StoragePlacementNamespace)
+				observations, listed, issues := storageAuditContent(ctx, deps, target, stores, knownVolumes, deps.Config.StoragePlacementNamespace)
 				mu.Lock()
 				result.Evidence = append(result.Evidence, observations...)
+				if listed != nil {
+					if result.listed == nil {
+						result.listed = map[storageAuditTarget]map[string]bool{}
+					}
+					result.listed[target] = listed
+				}
 				if len(issues) > 0 {
 					result.Complete = false
 					result.Issues = append(result.Issues, issues...)
@@ -823,12 +921,7 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 		}
 
 		if !matchedTarget {
-			observed := fmt.Sprintf("volume %s", evidence.VolumeID)
-			if evidence.VolumeID == "" {
-				observed = fmt.Sprintf("VM %d", evidence.VMID)
-			}
-			recorded := miss.describe(record)
-			result.addConflict(fmt.Sprintf("remote allocation %s (%s) is outside recorded mutation targets: observed on %s, %s%s", record.ID, observed, evidence.Node, recorded, storageAuditMoveHint(miss.reason)), fmt.Sprintf("%s on %s, %s", observed, evidence.Node, recorded))
+			storageAuditTargetMiss(result, record, evidence, miss)
 		}
 		if evidence.Kind == "vm" && evidence.VolumeID == "" {
 			sum := sha256.Sum256([]byte(record.AgentID))
@@ -838,6 +931,24 @@ func correlateStorageAuditEvidence(result *StorageAllocationAudit, byID map[stri
 		}
 	}
 
+}
+
+// storageAuditTargetMiss raises the conflict for evidence that no retained
+// step matched. A VM sighted only on another node waits for the move rules,
+// which need the storage listings, instead of raising its conflict now.
+func storageAuditTargetMiss(result *StorageAllocationAudit, record aj.Record, evidence StorageAllocationEvidence, miss storageAuditMiss) {
+	observed := fmt.Sprintf("volume %s", evidence.VolumeID)
+	if evidence.VolumeID == "" {
+		observed = fmt.Sprintf("VM %d", evidence.VMID)
+	}
+	recorded := miss.describe(record)
+	conflict := fmt.Sprintf("remote allocation %s (%s) is outside recorded mutation targets: observed on %s, %s%s", record.ID, observed, evidence.Node, recorded, storageAuditMoveHint(miss.reason))
+	brief := fmt.Sprintf("%s on %s, %s", observed, evidence.Node, recorded)
+	if evidence.Kind == "vm" && evidence.VolumeID == "" && miss.reason == storageAuditReasonNodeMismatch {
+		result.pending = append(result.pending, storageAuditPendingMove{kind: "vm", evidence: evidence, conflict: conflict, brief: brief})
+		return
+	}
+	result.addConflict(conflict, brief)
 }
 
 func storageAuditRecordIndex(records []aj.Record) (map[string]aj.Record, map[string]map[string]bool, map[string][]aj.Record) {
