@@ -59,18 +59,119 @@ const clusterLockPoolPrefix = "bosh-lock-"
 // added on top so concurrent waiters do not synchronize.
 const clusterLockPollInterval = 500 * time.Millisecond
 
+// clusterLockStealBudget bounds one steal. It runs from the moment the stealer
+// sends the re-read that confirms the expired claim to the moment its delete of
+// that claim returns. A stealer that has not finished its delete within the
+// budget abandons the steal instead of creating, and the next poll starts over
+// with an ordinary create, so running over costs one poll and nothing else.
+//
+// A journal-managed steal delete makes several PVE calls in that span: the
+// re-read, the guard's admission reads, the guard's own read of the claim, the
+// delete, and the readback, plus two journal writes. The change that set this
+// value measured the span, and on a cluster that answers in tens of
+// milliseconds two seconds is several times its worst case.
+const clusterLockStealBudget = 2 * time.Second
+
+// clusterLockRoundTrip is the allowance for one PVE API round trip in the lock
+// arithmetic below.
+const clusterLockRoundTrip = 500 * time.Millisecond
+
+// clusterLockDefaultGrace is how long an acquire that takes the grace waits
+// after its create before the second readback that confirms its claim. It is
+// the steal budget plus one round trip, so a stealer whose re-read went out
+// before our create has, by the time we read again, either deleted our sentinel
+// or run past its budget and abandoned the steal. Both the steal path and the
+// release margin depend on this value.
+const clusterLockDefaultGrace = clusterLockStealBudget + clusterLockRoundTrip
+
+// clusterLockGraceNs holds the grace pause that the locks taking it wait out.
+// Tests shorten it through SetClusterLockGraceForTest.
+var clusterLockGraceNs atomic.Int64
+
+func init() { clusterLockGraceNs.Store(int64(clusterLockDefaultGrace)) }
+
+// clusterLockGrace returns the current grace pause.
+func clusterLockGrace() time.Duration { return time.Duration(clusterLockGraceNs.Load()) }
+
+// SetClusterLockGraceForTest replaces the grace pause for a test and returns a
+// function that restores it. Production code leaves the grace at
+// clusterLockDefaultGrace. A test that changes it must not run in parallel with
+// tests that take a lock with the grace.
+//
+//	defer pve.SetClusterLockGraceForTest(0)()
+func SetClusterLockGraceForTest(d time.Duration) func() {
+	prev := clusterLockGraceNs.Swap(int64(d))
+	return func() { clusterLockGraceNs.Store(prev) }
+}
+
+// ClusterLockOption adjusts one acquire.
+type ClusterLockOption func(*clusterLockSettings)
+
+type clusterLockSettings struct{ grace bool }
+
+// WithCreateGrace makes the acquire wait out the grace pause after every
+// create that PVE accepts, a steal's or an ordinary one, and confirm its claim
+// a second time before it takes the lock. The parker protection-window lock
+// and the anti-affinity lock take it. The per-VMID lock does not, and
+// withVMIDLock says why its remaining window is accepted.
+func WithCreateGrace() ClusterLockOption {
+	return func(s *clusterLockSettings) { s.grace = true }
+}
+
+// graceDuration is the pause this acquire waits after a create, which is zero
+// without WithCreateGrace.
+func (s clusterLockSettings) graceDuration() time.Duration {
+	if !s.grace {
+		return 0
+	}
+	return clusterLockGrace()
+}
+
+// releaseMargin is how close to its expiry a claim may be and still be
+// deleted by Release. It covers a stealer's whole budget, the grace a stealer's
+// create waits before it trusts its claim, and the round trip of our own
+// delete. A lock without the grace drops that term.
+func (s clusterLockSettings) releaseMargin() time.Duration {
+	return clusterLockStealBudget + s.graceDuration() + clusterLockRoundTrip
+}
+
+// expectedLockClaimKey carries the claim a sentinel delete expects to remove.
+type expectedLockClaimKey struct{}
+
+// WithExpectedLockClaim tells the pool service which claim a sentinel delete
+// expects to remove. PVE has no conditional delete, so a service that can read
+// the sentinel right before it deletes, as the managed allocation guard does,
+// refuses with ErrLockClaimChanged when the claim differs. A service that
+// cannot check deletes as before.
+func WithExpectedLockClaim(ctx context.Context, claim string) context.Context {
+	return context.WithValue(ctx, expectedLockClaimKey{}, claim)
+}
+
+// ExpectedLockClaim returns the claim WithExpectedLockClaim set, if any.
+func ExpectedLockClaim(ctx context.Context) (string, bool) {
+	claim, ok := ctx.Value(expectedLockClaimKey{}).(string)
+	return claim, ok
+}
+
+// ErrLockClaimChanged is a sentinel delete refused because the sentinel no
+// longer holds the claim the caller expected to remove. Nothing was deleted.
+var ErrLockClaimChanged = errors.New("lock sentinel no longer holds the expected claim")
+
 // ClusterLockHandle is returned by AcquireClusterLock and released via Release.
 // It is safe to call Release more than once; the second call is a no-op.
 type ClusterLockHandle struct {
-	pool     string
-	owner    string
+	pool  string
+	owner string
+	// claim is the comment the confirming readback returned, which is what a
+	// guarded delete compares against. PVE is not proven to store a comment
+	// byte for byte as it was sent, so the claim never comes from our own copy.
+	claim    string
+	settings clusterLockSettings
 	released bool
 	pools    PoolService
-	// expiry is when this handle's claim lapses, and now is the clock that
-	// judges it. Release consults them before falling through to a blind delete:
-	// past the expiry the lock is provably not ours any more, and deleting the
-	// sentinel would remove a stealer's claim while they are still inside their
-	// window.
+	// expiry is the expiry our claim records, in the whole seconds the comment
+	// carries, and now is the clock that judges it. Release refuses to delete
+	// a claim that is close to it, and WindowDeadline measures from it.
 	expiry time.Time
 	now    func() time.Time
 }
@@ -129,17 +230,24 @@ func ClusterLockPoolName(name string) string {
 // timeout bounds the total wait; on timeout a TypeRetriableCloud error is
 // returned so the BOSH director re-drives the operation.
 //
+// opts adjust the acquire. A lock whose double holder would do real harm
+// passes WithCreateGrace.
+//
 // The returned handle's Release must be deferred by the caller; it deletes the
 // sentinel pool and is idempotent and best-effort.
 func AcquireClusterLock(
-	ctx context.Context, pools PoolService, name, owner string, ttl, timeout time.Duration,
+	ctx context.Context, pools PoolService, name, owner string, ttl, timeout time.Duration, opts ...ClusterLockOption,
 ) (*ClusterLockHandle, error) {
-	return acquireClusterLockWithClock(ctx, pools, name, owner, ttl, timeout, defaultLockClock())
+	return acquireClusterLockWithClock(ctx, pools, name, owner, ttl, timeout, defaultLockClock(), opts...)
 }
 
 func acquireClusterLockWithClock(
-	ctx context.Context, pools PoolService, name, owner string, ttl, timeout time.Duration, clk lockClock,
+	ctx context.Context, pools PoolService, name, owner string, ttl, timeout time.Duration, clk lockClock, opts ...ClusterLockOption,
 ) (*ClusterLockHandle, error) {
+	var settings clusterLockSettings
+	for _, opt := range opts {
+		opt(&settings)
+	}
 	if pools == nil {
 		return nil, cpierrors.Cloud("AcquireClusterLock: pool service must not be nil")
 	}
@@ -157,26 +265,21 @@ func acquireClusterLockWithClock(
 	deadline := clk.now().Add(timeout)
 
 	for {
-		expiry := clk.now().Add(ttl)
+		expiry := claimExpiry(clk.now(), ttl)
 		comment := encodeLockComment(owner, expiry)
 		createErr := pools.CreatePool(ctx, pool, comment)
 		if createErr == nil {
 			// The create succeeded, but that alone does not make the sentinel
-			// ours. A stealer that read an expired claim can delete the sentinel
-			// we just created and recreate its own before we act, so read it
-			// back and take the handle only when our claim is still there.
-			mine, verifyErr := sentinelHoldsOwner(ctx, pools, pool, owner)
-			if verifyErr != nil {
-				return nil, cpierrors.WrapAs(verifyErr, cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("AcquireClusterLock: verify lock %q", pool))
+			// ours. A stealer that judged an older claim expired can delete the
+			// sentinel we just created, so confirm our claim, twice for a lock
+			// that takes the grace, before taking the handle.
+			handle, confirmErr := confirmLockCreate(ctx, pools, pool, owner, expiry, settings, clk)
+			if confirmErr != nil || handle != nil {
+				return handle, confirmErr
 			}
-			if mine {
-				return &ClusterLockHandle{
-					pool: pool, owner: owner, pools: pools, expiry: expiry, now: clk.now,
-				}, nil
-			}
-			// Displaced: someone else holds the sentinel now. Fall through to
-			// the same steal-or-wait decision a refused create takes.
+			// We were displaced, and someone else holds the sentinel now, or
+			// nobody does. Fall through to the same steal-or-wait decision a
+			// refused create takes.
 		} else if !isPoolAlreadyExists(createErr) {
 			// A non-duplicate failure (auth, transport, pmxcfs error) is mapped to
 			// a retriable cloud error so the director re-drives rather than failing
@@ -186,7 +289,7 @@ func acquireClusterLockWithClock(
 		}
 
 		// Pool exists: inspect the holder's recorded expiry to decide steal-or-wait.
-		if stole, err := tryStealExpired(ctx, pools, pool, owner, ttl, clk); err != nil {
+		if stole, err := tryStealExpired(ctx, pools, pool, owner, ttl, settings, clk); err != nil {
 			return nil, err
 		} else if stole != nil {
 			return stole, nil
@@ -215,24 +318,39 @@ func acquireClusterLockWithClock(
 // tryStealExpired reads the existing sentinel pool's comment and, when the
 // recorded expiry has passed (or the comment is unreadable/malformed), attempts
 // to steal the lock via delete+recreate. It returns a non-nil handle ONLY after
-// confirming the post-steal pool carries OUR owner token. It returns (nil, nil)
-// when the lock is still live or when another stealer won the race, signalling
-// the caller to wait/retry.
+// confirmLockCreate has confirmed the new sentinel carries OUR claim. It returns
+// (nil, nil) when the lock is still live, when the claim changed before the
+// delete, when the steal ran over its budget, or when another acquirer won the
+// recreate, signalling the caller to wait/retry.
 //
-// Residual steal race: two stealers A,B may both read the expired comment,
-// both delete, and both try to recreate. One wins CreatePool; the other sees dup
-// and loops. However, A (the first creator) can then have its freshly-created
-// pool deleted by B's DeletePool (which runs before B's CreatePool), transiently
-// giving both A and B a live handle. The post-steal re-read below closes this
-// window for the FIRST stealer: if our comment is not present after recreate,
-// we yield the handle and loop. The residual window is the period between
-// CreatePool success and the re-read GET — a concurrent B delete in that window
-// would cause GetPoolComment to see B's owner or nothing, and we correctly loop.
-// The read-after-write verify in verifyAntiAffinityMember is the correctness
-// backstop: a double-held RMW produces one canonical rule (last writer), and
-// verify catches a lost member. Together the two mechanisms bound the impact.
+// PVE has no compare-and-delete, so two stealers that both judged the same
+// claim expired race each other, and a stale delete can remove the claim the
+// faster stealer just created and confirmed. Three measures narrow that race.
+//
+//   - The stealer re-reads the claim immediately before its delete and abandons
+//     the steal when the claim changed in any way. The delete carries the
+//     expected claim, and the managed allocation guard reads the sentinel once
+//     more right before it calls PVE and refuses with ErrLockClaimChanged when
+//     the claim differs. The guard gives the same answer for a sentinel that
+//     has already vanished, so a steal whose sentinel another request released
+//     waits one poll before it creates.
+//   - The steal budget runs from the moment the re-read is sent, not from when
+//     it returns. A stealer that has not finished its delete within
+//     clusterLockStealBudget of that moment abandons the steal without creating.
+//   - A lock that takes WithCreateGrace makes every create, a steal's or a plain
+//     one, wait out a grace pause of at least the budget plus a round trip and
+//     confirm its claim a second time.
+//
+// What remains for such a lock is this. Two holders can overlap only when a
+// stealer stalls between its last re-read and its delete for longer than the
+// grace pause, so that its delete lands after the rightful holder's second
+// confirmation. A lock without the grace keeps the first two measures, and
+// only a stale delete can still overlap two holders. The read-after-write
+// verify in verifyAntiAffinityMember remains the correctness backstop for the
+// anti-affinity lock, because a double-held RMW produces one canonical rule,
+// the last writer's, and the verify catches a member that rule lost.
 func tryStealExpired(
-	ctx context.Context, pools PoolService, pool, owner string, ttl time.Duration, clk lockClock,
+	ctx context.Context, pools PoolService, pool, owner string, ttl time.Duration, settings clusterLockSettings, clk lockClock,
 ) (*ClusterLockHandle, error) {
 	comment, found, err := pools.GetPoolComment(ctx, pool)
 	if err != nil {
@@ -252,101 +370,192 @@ func tryStealExpired(
 		return nil, nil
 	}
 
-	// Expired or unparseable holder: steal by delete+recreate. A not-found on
-	// delete means someone else already released/stole it — fall through to the
-	// recreate, which is the authoritative test-and-set.
-	if delErr := pools.DeletePool(ctx, pool); delErr != nil && !isPoolNotFound(delErr) {
+	// Expired or unparseable holder. Read it again immediately before the
+	// delete, and steal only the exact claim that was judged expired. The
+	// budget starts before the re-read is sent, because the claim may already
+	// have changed while the re-read was in flight.
+	started := clk.now()
+	current, stillFound, err := pools.GetPoolComment(ctx, pool)
+	if err != nil {
+		return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("AcquireClusterLock: re-read holder of lock %q", pool))
+	}
+	if !stillFound || current != comment {
+		// Someone released, stole, or recreated it since the first read. The
+		// next poll decides afresh.
+		return nil, nil
+	}
+	if clk.now().Sub(started) > clusterLockStealBudget {
+		// The re-read itself ran over the budget, so its answer is older than
+		// another acquirer's grace covers. Leave the sentinel alone.
+		return nil, nil
+	}
+	delErr := pools.DeletePool(WithExpectedLockClaim(ctx, comment), pool)
+	switch {
+	case delErr == nil, isPoolNotFound(delErr):
+	case errors.Is(delErr, ErrLockClaimChanged):
+		return nil, nil
+	default:
 		return nil, cpierrors.WrapAs(delErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: steal-delete lock %q", pool))
 	}
-	recreateComment := encodeLockComment(owner, clk.now().Add(ttl))
+	if clk.now().Sub(started) > clusterLockStealBudget {
+		// The delete finished outside the budget, so our re-read may be older
+		// than another acquirer's grace. Abandon the steal; the sentinel is
+		// gone, and the next poll creates it the ordinary way.
+		return nil, nil
+	}
+	expiry := claimExpiry(clk.now(), ttl)
+	recreateComment := encodeLockComment(owner, expiry)
 	if createErr := pools.CreatePool(ctx, pool, recreateComment); createErr != nil {
 		if isPoolAlreadyExists(createErr) {
-			// Another stealer won the recreate; loop back to wait/steal.
+			// Another acquirer won the recreate; loop back to wait/steal.
 			return nil, nil
 		}
 		return nil, cpierrors.WrapAs(createErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: steal-recreate lock %q", pool))
 	}
+	return confirmLockCreate(ctx, pools, pool, owner, expiry, settings, clk)
+}
 
-	// Post-steal owner verification: re-read the pool and confirm
-	// our owner token is the one persisted. If a concurrent stealer B deleted our
-	// freshly-created pool between our CreatePool and this re-read, we will see B's
-	// owner (or nothing) and correctly refuse the handle, looping back to wait/steal.
-	verifyComment, verifyFound, verifyErr := pools.GetPoolComment(ctx, pool)
-	if verifyErr != nil {
-		// Cannot confirm — yield the handle and let the caller retry.
-		return nil, cpierrors.WrapAs(verifyErr, cpierrors.TypeRetriableCloud,
-			fmt.Sprintf("AcquireClusterLock: verify steal of lock %q", pool))
+// confirmLockCreate decides whether a create that PVE accepted gave us the
+// lock. It reads the sentinel back at once. A lock that takes the grace then
+// waits out the grace pause and reads it again, and a stealer whose re-read
+// went out before our create has deleted our sentinel by then unless it
+// stalled for longer than the grace. Only when every read shows our claim does
+// it return a handle, carrying the claim the last read returned. It returns
+// (nil, nil) when we were displaced.
+func confirmLockCreate(
+	ctx context.Context, pools PoolService, pool, owner string, expiry time.Time, settings clusterLockSettings, clk lockClock,
+) (*ClusterLockHandle, error) {
+	passes := 1
+	if settings.grace {
+		passes = 2
 	}
-	if !verifyFound || !strings.Contains(verifyComment, "owner="+owner+" ") {
-		// Our comment is not present: another stealer displaced us. Re-loop.
-		return nil, nil
+	var claim string
+	for pass := 0; pass < passes; pass++ {
+		if pass == 1 {
+			if err := clk.sleep(ctx, settings.graceDuration()); err != nil {
+				return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+					fmt.Sprintf("AcquireClusterLock: interrupted confirming lock %q", pool))
+			}
+		}
+		comment, mine, err := sentinelClaim(ctx, pools, pool, owner)
+		if err != nil {
+			return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("AcquireClusterLock: verify lock %q", pool))
+		}
+		if !mine {
+			return nil, nil
+		}
+		claim = comment
 	}
-
 	return &ClusterLockHandle{
-		pool: pool, owner: owner, pools: pools, expiry: clk.now().Add(ttl), now: clk.now,
+		pool: pool, owner: owner, claim: claim, settings: settings, pools: pools, expiry: expiry, now: clk.now,
 	}, nil
 }
 
-// sentinelHoldsOwner reads the sentinel back and reports whether it carries
-// owner's claim. A read that fails is returned, because it cannot tell us who
-// holds the lock.
-func sentinelHoldsOwner(ctx context.Context, pools PoolService, pool, owner string) (bool, error) {
+// sentinelClaim reads the sentinel back and returns its comment and whether it
+// carries owner's claim. A read that fails is returned, because it cannot tell
+// us who holds the lock.
+func sentinelClaim(ctx context.Context, pools PoolService, pool, owner string) (string, bool, error) {
 	comment, found, err := pools.GetPoolComment(ctx, pool)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return found && strings.Contains(comment, lockCommentOwnerKey+owner+" "), nil
+	return comment, found && strings.Contains(comment, lockCommentOwnerKey+owner+" "), nil
 }
 
-// expired reports whether this handle's claim has lapsed. A handle built without
-// a clock (a zero expiry) never expires, which keeps the previous behavior for
-// any construction path that does not set one.
-func (h *ClusterLockHandle) expired() bool {
-	if h == nil || h.now == nil || h.expiry.IsZero() {
-		return false
-	}
-	return h.now().After(h.expiry)
+// claimExpiry is the expiry a claim made at now records. The comment carries
+// whole seconds, and every other acquirer judges the claim by that value, so
+// the handle keeps the same truncated time rather than the finer one it
+// started from.
+func claimExpiry(now time.Time, ttl time.Duration) time.Time {
+	return time.Unix(now.Add(ttl).Unix(), 0)
+}
+
+// WindowDeadline returns when work under this lock must stop so that reserve
+// still fits before the claim's recorded expiry. The expiry was fixed before
+// the create, so the guard admission, the confirming reads, and the grace
+// pause that ran before the acquire returned are already counted against it.
+func (h *ClusterLockHandle) WindowDeadline(reserve time.Duration) time.Time {
+	return h.expiry.Add(-reserve)
 }
 
 // Release deletes the sentinel pool, freeing the lock. It is idempotent: a
 // second call is a no-op, and a not-found pool is treated as success (the lock
 // may already have been stolen after expiry). All other delete failures are
-// returned for the caller to log; Release never blocks the surrounding
-// operation. A nil handle Release is a no-op.
+// returned for the caller to log, and they leave the handle unreleased so a
+// retry can still delete. A nil handle Release is a no-op.
+//
+// Release checks the owner before it deletes, and that check and the delete
+// are two separate calls. The only thing that can replace our sentinel between
+// them is a steal, and a steal needs our claim to have expired. So Release
+// refuses to delete a claim that is expired or will expire within the release
+// margin, which is the steal budget, plus the grace for a lock that takes it,
+// plus one round trip. Such a sentinel is left for its TTL steal, which costs
+// nothing once the claim has lapsed. A second re-read right before the delete
+// would look safer but would not close the gap, because that read and the
+// delete are still two calls that a steal can fall between. The margin closes
+// it, because a claim that is outside the margin at the check cannot become
+// stealable before our delete lands.
 func (h *ClusterLockHandle) Release(ctx context.Context) error {
 	if h == nil || h.released {
 		return nil
 	}
-	// Delete only a pool this handle still owns. A window that outlives its TTL
-	// is stolen by the next acquirer, and a blind delete here would then remove
-	// THEIR sentinel and let a third caller in while they are still inside their
-	// window -- one late holder cascading into unbounded concurrency. A read
-	// that fails, or a comment that cannot be parsed, falls through to the
-	// delete: leaving the pool behind would block acquires until the TTL lapses,
-	// which is the worse of the two.
-	if comment, found, readErr := h.pools.GetPoolComment(ctx, h.pool); readErr == nil && found {
-		if owner, ok := decodeLockOwner(comment); ok && owner != h.owner {
+	margin := h.settings.releaseMargin()
+	comment, found, readErr := h.pools.GetPoolComment(ctx, h.pool)
+	switch {
+	case readErr == nil && !found:
+		// The sentinel is already gone, so there is nothing to delete.
+		h.released = true
+		return nil
+	case readErr == nil:
+		owner, ownerOK := decodeLockOwner(comment)
+		exp, expOK := decodeLockExpiry(comment)
+		if !ownerOK || !expOK {
+			// A comment we cannot parse is never deleted. Acquirers treat it
+			// as expired and steal it, so leaving it costs nothing.
+			h.released = true
+			return nil
+		}
+		if owner != h.owner {
 			// Somebody else holds it now. Ours is already gone.
 			h.released = true
 			return nil
 		}
-	} else if h.expired() {
-		// The read did not answer, and our own claim has lapsed. A lapsed claim
-		// is one a later acquirer is entitled to steal, so the sentinel standing
-		// here is more likely theirs than ours -- and deleting theirs lets a
-		// third caller in while they are mid-window, which is the cascade the
-		// owner check exists to stop. Leave it: the worst case is a sentinel that
-		// outlives us until its own TTL lapses, which acquirers already handle.
+		if h.now != nil && !h.now().Add(margin).Before(exp) {
+			// Our claim is expired or within the margin. A steal may land
+			// before our delete would, so leave it for the TTL steal.
+			h.released = true
+			return nil
+		}
+	default:
+		// The read did not answer, so we judge by our own recorded expiry. A
+		// claim within the margin is left alone, as above. Otherwise the
+		// delete below carries our claim, and a guarded pool service refuses
+		// it when the sentinel holds anything else.
+		if h.now != nil && !h.expiry.IsZero() && !h.now().Add(margin).Before(h.expiry) {
+			h.released = true
+			return nil
+		}
+	}
+	deleteCtx := ctx
+	if h.claim != "" {
+		deleteCtx = WithExpectedLockClaim(ctx, h.claim)
+	}
+	err := h.pools.DeletePool(deleteCtx, h.pool)
+	if errors.Is(err, ErrLockClaimChanged) {
+		// The sentinel holds someone else's claim, or none. Ours is gone.
 		h.released = true
 		return nil
 	}
-	if err := h.pools.DeletePool(ctx, h.pool); err != nil && !isPoolNotFound(err) {
+	if err != nil && !isPoolNotFound(err) {
 		// released stays false: a failed delete (cancelled ctx, transient
-		// API fault) must not latch the handle closed, or a retried Release
-		// silently no-ops and the sentinel pool is orphaned until a later
-		// acquirer steals it past the TTL.
+		// API fault, a failed pre-delete read in the guard) must not latch
+		// the handle closed, or a retried Release silently no-ops and the
+		// sentinel pool is orphaned until a later acquirer steals it past the
+		// TTL.
 		return cpierrors.Wrap(err, fmt.Sprintf("ReleaseClusterLock: delete sentinel pool %q", h.pool))
 	}
 	h.released = true

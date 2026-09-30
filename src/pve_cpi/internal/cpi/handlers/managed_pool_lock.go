@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -136,10 +137,42 @@ func (t *managedPoolService) repeatLockRefusal(ctx context.Context, poolID strin
 
 // lockDeletionClaim reads the claim a sentinel holds just before it is deleted.
 // A claim that cannot be read is recorded as unknown, which keeps the readback
-// after the delete strict.
-func (t *managedPoolService) lockDeletionClaim(ctx context.Context, poolID string) managedLockPoolDeletion {
+// after the delete strict, and the failed read is returned as well so that a
+// delete which expects a particular claim can tell "we could not look" from
+// "the claim is gone".
+func (t *managedPoolService) lockDeletionClaim(ctx context.Context, poolID string) (managedLockPoolDeletion, error) {
 	comment, found, err := t.GetPoolComment(ctx, poolID)
-	return managedLockPoolDeletion{poolID: poolID, comment: comment, known: err == nil && found}
+	return managedLockPoolDeletion{poolID: poolID, comment: comment, known: err == nil && found}, err
+}
+
+// expectedLockClaimRefusal decides whether a sentinel delete that carries an
+// expected claim (pve.WithExpectedLockClaim) must be refused, and with what.
+// PVE has no conditional delete, so the guard's read just before the delete is
+// the last check. A refusal is returned before PVE is called, which proves the
+// delete changed nothing. A delete that carries no expected claim is never
+// refused here.
+//
+// A read that failed is not a changed claim. It comes back as a retriable
+// error, so a Release keeps its handle unreleased and can delete on a retry,
+// and a steal returns the error instead of quietly giving up.
+//
+// A claim that differs from the expected one, or a sentinel that is gone,
+// comes back as pve.ErrLockClaimChanged, because deleting would remove a claim
+// nobody judged. A vanished sentinel gets that answer too, not PVE's not-found,
+// so a steal whose holder released in the meantime waits one poll before it
+// creates instead of creating at once.
+func expectedLockClaimRefusal(ctx context.Context, poolID string, claim managedLockPoolDeletion, readErr error) error {
+	expected, ok := pve.ExpectedLockClaim(ctx)
+	switch {
+	case !ok:
+		return nil
+	case readErr != nil:
+		return cpierrors.WrapAs(readErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("read lock sentinel %q before deleting it", poolID))
+	case !claim.known || claim.comment != expected:
+		return pve.ErrLockClaimChanged
+	}
+	return nil
 }
 
 // observeLockPoolMutation proves a guarded sentinel mutation by readback. The

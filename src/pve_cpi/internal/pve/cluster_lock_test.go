@@ -199,10 +199,11 @@ func TestAcquireClusterLock_HeldExpiredOwnerSteals(t *testing.T) {
 	if h.pool != "bosh-lock-web" {
 		t.Fatalf("pool = %q; want bosh-lock-web", h.pool)
 	}
-	// Steal = first create fails (dup) -> get holder -> delete -> recreate ->
-	// post-steal get confirming our owner token won.
+	// Steal = first create fails (dup) -> get holder -> re-read it right
+	// before the delete -> delete -> recreate -> post-steal get confirming our
+	// owner token won. This acquire takes no grace, so it confirms once.
 	want := []string{
-		"create:bosh-lock-web", "get:bosh-lock-web", "delete:bosh-lock-web",
+		"create:bosh-lock-web", "get:bosh-lock-web", "get:bosh-lock-web", "delete:bosh-lock-web",
 		"create:bosh-lock-web", "get:bosh-lock-web",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
@@ -280,7 +281,7 @@ func TestTryStealExpired_PoolVanishedBeforeRead(t *testing.T) {
 	// attempted; the caller must retry the top-level create instead.
 	f := newFakeLockPools()
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("expected no error when pool vanished before read, got %v", err)
 	}
@@ -305,7 +306,7 @@ func TestTryStealExpired_DeleteNonNotFoundErrorRetriable(t *testing.T) {
 	f.deleteFn = func(_ string) error { return fmt.Errorf("500 pmxcfs temporarily unavailable") }
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
 	if h != nil {
 		t.Fatal("expected nil handle on steal-delete failure")
 	}
@@ -338,7 +339,7 @@ func TestTryStealExpired_RecreateLosesToConcurrentStealer(t *testing.T) {
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("losing the recreate race must signal loop/retry, not an error: %v", err)
 	}
@@ -359,15 +360,16 @@ func TestTryStealExpired_VerifyReadErrorRetriable(t *testing.T) {
 	getCalls := 0
 	f.getFn = func(_ string) (string, bool, error, bool) {
 		getCalls++
-		if getCalls == 2 {
-			// Second GetPoolComment call is the post-steal verify read.
+		if getCalls == 3 {
+			// The first two reads judge the holder and re-read it before the
+			// delete. The third is the post-steal verify read.
 			return "", false, fmt.Errorf("500 pmxcfs read timeout"), true
 		}
 		return "", false, nil, false // first call: fall through to normal map lookup
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
 	if h != nil {
 		t.Fatal("expected nil handle when the post-steal verify read errors")
 	}
@@ -400,7 +402,7 @@ func TestTryStealExpired_VerifyShowsDifferentOwnerDisplaced(t *testing.T) {
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("displacement by a concurrent stealer must signal loop/retry, not an error: %v", err)
 	}
@@ -596,5 +598,132 @@ func TestLockOwnerHost(t *testing.T) {
 		if got := lockOwnerHost(host); got != want {
 			t.Errorf("lockOwnerHost(%q) = %q, want %q", host, got, want)
 		}
+	}
+}
+
+// TestRelease_LeavesAClaimNearItsExpiry covers the release margin. Release
+// reads the claim and then deletes, and a steal can fall between the two once
+// our claim has lapsed. So a claim that has expired, or will expire within the
+// steal budget plus a round trip, is left for the TTL steal instead of being
+// deleted. A claim outside the margin is still deleted.
+func TestRelease_LeavesAClaimNearItsExpiry(t *testing.T) {
+	t.Parallel()
+	expiry := time.Unix(5000, 0)
+	for name, tc := range map[string]struct {
+		now        time.Time
+		wantDelete bool
+	}{
+		"expired":                          {now: expiry.Add(time.Second)},
+		"at its expiry":                    {now: expiry},
+		"inside the budget and round trip": {now: expiry.Add(-2 * time.Second)},
+		"outside the margin":               {now: expiry.Add(-time.Minute), wantDelete: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLockPools()
+			f.pools["bosh-lock-web"] = encodeLockComment("me", expiry)
+			now := tc.now
+			h := &ClusterLockHandle{
+				pool: "bosh-lock-web", owner: "me", pools: f,
+				expiry: expiry, now: func() time.Time { return now },
+			}
+			if err := h.Release(context.Background()); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+			_, standing := f.pools["bosh-lock-web"]
+			if tc.wantDelete && (standing || f.deleteN != 1) {
+				t.Fatalf("a claim outside the margin must be deleted; deletes=%d standing=%v", f.deleteN, standing)
+			}
+			if !tc.wantDelete && (!standing || f.deleteN != 0) {
+				t.Fatalf("a claim within the margin of its expiry was deleted; deletes=%d", f.deleteN)
+			}
+			if !h.released {
+				t.Error("the handle should latch released either way")
+			}
+		})
+	}
+}
+
+// TestRelease_GraceWidensTheMargin pins the margin for a lock that takes the
+// grace. A stealer's create waits out the grace before it trusts its claim, so
+// the margin adds it. Four seconds before expiry is inside the margin with the
+// grace and outside it without.
+func TestRelease_GraceWidensTheMargin(t *testing.T) {
+	defer SetClusterLockGraceForTest(clusterLockDefaultGrace)()
+	expiry := time.Unix(5000, 0)
+	now := expiry.Add(-4 * time.Second)
+	for name, settings := range map[string]clusterLockSettings{"with the grace": {grace: true}, "without it": {}} {
+		f := newFakeLockPools()
+		f.pools["bosh-lock-web"] = encodeLockComment("me", expiry)
+		h := &ClusterLockHandle{
+			pool: "bosh-lock-web", owner: "me", pools: f, settings: settings,
+			expiry: expiry, now: func() time.Time { return now },
+		}
+		if err := h.Release(context.Background()); err != nil {
+			t.Fatalf("%s: Release: %v", name, err)
+		}
+		if deleted := f.deleteN == 1; deleted == settings.grace {
+			t.Errorf("%s: deleted=%v four seconds before expiry", name, deleted)
+		}
+	}
+}
+
+// TestRelease_NeverDeletesAClaimItCannotParse covers a sentinel whose comment
+// names no owner or no expiry. Release cannot tell whose it is, so it leaves
+// it. Acquirers treat such a comment as expired and steal it, so leaving it
+// costs nothing, while deleting it could remove a claim that is not ours.
+func TestRelease_NeverDeletesAClaimItCannotParse(t *testing.T) {
+	t.Parallel()
+	for name, comment := range map[string]string{
+		"no owner":    "exp=99999999999",
+		"no expiry":   "owner=me ",
+		"not a claim": "operator notes",
+		"empty":       "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLockPools()
+			f.pools["bosh-lock-web"] = comment
+			now := time.Unix(2000, 0)
+			h := &ClusterLockHandle{
+				pool: "bosh-lock-web", owner: "me", pools: f,
+				expiry: time.Unix(9000, 0), now: func() time.Time { return now },
+			}
+			if err := h.Release(context.Background()); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+			if f.deleteN != 0 {
+				t.Fatalf("Release deleted a sentinel whose comment %q it cannot parse", comment)
+			}
+		})
+	}
+}
+
+// TestAcquireClusterLock_HandleKeepsTheClaimPVEReturned covers a PVE that does
+// not return a comment byte for byte as it was sent. The handle keeps the
+// claim its confirming read returned, because a guarded delete compares the
+// expected claim with another read, and two reads agree where a read and our
+// own copy might not.
+func TestAcquireClusterLock_HandleKeepsTheClaimPVEReturned(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	var sent string
+	f.createFn = func(_, comment string) error {
+		sent = comment
+		return nil
+	}
+	f.getFn = func(id string) (string, bool, error, bool) {
+		if c, ok := f.pools[id]; ok {
+			return c + "\n", true, nil, true
+		}
+		return "", false, nil, false
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, time.Second,
+		fixedClock(time.Unix(1000, 0), time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.claim != sent+"\n" {
+		t.Fatalf("handle claim = %q, want the comment PVE returned %q", h.claim, sent+"\n")
 	}
 }

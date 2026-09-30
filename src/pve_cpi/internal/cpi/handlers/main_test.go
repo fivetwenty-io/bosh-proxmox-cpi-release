@@ -6,6 +6,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // TestMain zeroes the template-cache recheck delay for the whole test binary.
@@ -20,7 +21,11 @@ import (
 func TestMain(m *testing.M) {
 	restore := handlers.SetTemplateCacheRecheckDelay(0)
 	restoreSync := aj.SetFileSyncForTest(false)
+	// The parker and anti-affinity locks pause after every create. The tests
+	// that exercise the pause set it themselves.
+	restoreGrace := pve.SetClusterLockGraceForTest(0)
 	code := m.Run()
+	restoreGrace()
 	restoreSync()
 	restore()
 	os.Exit(code)

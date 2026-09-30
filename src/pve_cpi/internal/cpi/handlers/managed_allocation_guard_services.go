@@ -564,7 +564,11 @@ func (t *managedPoolService) DeletePool(ctx context.Context, poolID string) (err
 	defer t.guard.end(ctx, m, token)
 	var result any
 	if isManagedLockPool(poolID) {
-		result = t.lockDeletionClaim(ctx, poolID)
+		claim, readErr := t.lockDeletionClaim(ctx, poolID)
+		if refusal := expectedLockClaimRefusal(ctx, poolID, claim, readErr); refusal != nil {
+			return t.guard.settleRefused(ctx, m, token, managedLockPoolRejection{poolID: poolID, method: m.Method}, refusal)
+		}
+		result = claim
 	}
 	err = t.PoolService.DeletePool(ctx, poolID)
 	if isManagedLockPool(poolID) && exactPoolDoesNotExist(err, poolID) {

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
@@ -157,6 +159,30 @@ func TestEnsureAntiAffinity_LockPool_AcquireBeforeReadReleaseAfter(t *testing.T)
 	}
 	if acquireIdx == -1 || firstReadIdx == -1 || acquireIdx >= firstReadIdx {
 		t.Errorf("acquire(%d) must precede first read(%d); events=%v", acquireIdx, firstReadIdx, events)
+	}
+}
+
+// TestEnsureAntiAffinity_LockPool_TakesTheGrace covers the anti-affinity
+// lock's grace. Two holders at once would place two instances of a group on
+// one node, so after its create the lock reads its claim back, waits out the
+// grace, and reads it again before the read-modify-write starts.
+func TestEnsureAntiAffinity_LockPool_TakesTheGrace(t *testing.T) {
+	defer pve.SetClusterLockGraceForTest(20 * time.Millisecond)()
+	events := []string{}
+	stub := newAAStub()
+	stub.events = &events
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	pools := newAALockPools(&events)
+	started := time.Now()
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(aaLockConfig("pool", false, 30), stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"lock-create:bosh-lock-aa-web", "lock-get:bosh-lock-aa-web", "lock-get:bosh-lock-aa-web"}
+	if len(events) <= len(want) || strings.Join(events[:len(want)], ",") != strings.Join(want, ",") || strings.HasPrefix(events[len(want)], "lock-") {
+		t.Fatalf("the acquire must confirm its claim twice before the RMW; events %v", events)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("the RMW finished after %v, inside the grace", elapsed)
 	}
 }
 

@@ -91,6 +91,18 @@ func withVMIDLock(
 	lockName := fmt.Sprintf("vm-%d", vmid)
 	// Callers name the operation and the VMID. The pid and sequence make the
 	// claim unique to this acquisition, which a guarded create relies on.
+	//
+	// This lock alone does not take pve.WithCreateGrace. Its steals still
+	// re-read the claim before the delete and keep to the steal budget, so the
+	// only way two holders overlap is a stale delete from a stealer that
+	// stalled between its re-read and its delete. The cost of that is small
+	// here. Two metadata writes race on one VM and the last writer wins, or two
+	// create_vm calls pick the same VMID and PVE refuses the second, which the
+	// CPI retries. The grace would add about two seconds to every
+	// set_vm_metadata across a large deploy, which that residual does not
+	// justify. The parker and anti-affinity locks share the sentinel mechanism
+	// but not this reasoning, because a double holder there races disk moves
+	// or places two instances on one node.
 	handle, err := pve.AcquireClusterLock(ctx, pools, lockName, pve.ProcessLockOwner(owner), vmidLockTTLNow(), vmidLockTimeout)
 	if err != nil {
 		if errors.Is(err, pve.ErrClusterLockTimeout) {

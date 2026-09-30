@@ -2017,8 +2017,8 @@ func UnparkDiskAt(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 // iterations of config read, attach, task await, and verify read, then a
 // protection write and a provenance write. Rather than assume 180s covers the
 // sum of those retry curves -- it does not, on the pushback curve -- the window
-// runs under a deadline derived from this TTL (parkerWindowBudget), so work
-// that would outlive the lock is cut off instead of continuing past the point
+// runs under a deadline derived from the claim's expiry (parkerWindowDeadline),
+// so work that would outlive the lock is cut off instead of continuing past the point
 // where another caller may enter. A waiter that times out is handed a retriable
 // error rather than proceeding unserialized, since reaching the deadline means a
 // live holder was inside the window throughout.
@@ -2127,7 +2127,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	owner := ProcessLockOwner(fmt.Sprintf("%s/%d", purpose, parkerVMID))
 	ttl, timeout := parkerLockTimeoutsFrom(ctx)
 	handle, lockErr := AcquireClusterLock(ctx, pools,
-		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout)
+		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
 	if lockErr != nil {
 		if errors.Is(lockErr, ErrClusterLockTimeout) {
 			// A timeout is not "the lock is unavailable to me", it is "somebody
@@ -2169,8 +2169,8 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			)
 		}
 	}()
-	// The window runs on a deadline derived from the lock's own TTL, less the
-	// release budget. Bounding each retry loop separately is not enough: their
+	// The window runs on a deadline derived from the claim's recorded expiry,
+	// less the reserve. Bounding each retry loop separately is not enough: their
 	// worst cases compose, and a window that outlives its TTL is stolen by the
 	// next acquirer while this one is still inside it -- protection restored
 	// mid-detach, the sweep refused, exactly the interleaving the lock exists to
@@ -2178,38 +2178,46 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	//
 	// Restores use context.WithoutCancel, so protection still goes back on when
 	// this deadline is what stopped the work.
-	windowCtx, windowCancel := context.WithTimeout(ctx, parkerWindowBudget(ttl))
+	//
+	// The expiry was fixed before the create. The guard admission, the
+	// confirming reads, and the grace pause all run between the create and the
+	// acquire returning, so a deadline measured from the return would overrun
+	// the TTL by that much.
+	windowCtx, windowCancel := context.WithDeadline(ctx, parkerWindowDeadline(handle, time.Now()))
 	defer windowCancel()
 	return fn(windowCtx)
 }
 
 // parkerProtectionRestoreReserve is time set aside for the protection restore
 // that runs after the window body, on a detached context so a cancelled call
-// still puts the flag back. Four attempts on the pushback curve (5s, 7.5s,
-// 11.25s) plus the writes themselves land under 30s.
-const parkerProtectionRestoreReserve = 30 * time.Second
+// still puts the flag back. The restore makes up to four attempts, and the
+// three sleeps between them on the pushback curve (5s, 7.5s, and 11.25s, each
+// up to 30% longer with jitter) come to about 30.9s. With a round trip for
+// each write, 35s lets a restore that needs its last attempt still finish
+// under its own deadline.
+const parkerProtectionRestoreReserve = 35 * time.Second
 
-// parkerWindowBudget is how long work may run inside a protection window whose
-// lock carries the given TTL.
-//
-// Not simply the TTL: three things run AFTER the body, all on detached contexts
+// parkerWindowReserve is the time a protection window leaves before its
+// claim's expiry. Three things run AFTER the body, all on detached contexts
 // precisely so a deadline cannot stop them -- the deferred unusedN sweep
 // (parkerDemotedSweepTimeout), the protection restore
 // (parkerProtectionRestoreReserve), and the sentinel release
 // (parkerLockReleaseTimeout). Give the body the whole TTL and those three run
 // past the recorded expiry, where a waiter is entitled to steal the lock and
 // enter its own window -- so the deadline would move the interleaving past the
-// fence rather than remove it. The reserve is subtracted instead.
-//
-// Never less than a second, so a test clock that sets a tiny TTL still runs its
-// body rather than expiring before the first call.
-func parkerWindowBudget(ttl time.Duration) time.Duration {
-	reserve := parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
-	budget := ttl - reserve
-	if budget < time.Second {
-		return time.Second
+// fence rather than remove it.
+const parkerWindowReserve = parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
+
+// parkerWindowDeadline is when work inside a protection window must stop,
+// which is the claim's recorded expiry less parkerWindowReserve. It is never
+// less than a second from now, so a test clock that sets a tiny TTL still runs
+// its body rather than expiring before the first call.
+func parkerWindowDeadline(handle *ClusterLockHandle, now time.Time) time.Time {
+	deadline := handle.WindowDeadline(parkerWindowReserve)
+	if floor := now.Add(time.Second); deadline.Before(floor) {
+		return floor
 	}
-	return budget
+	return deadline
 }
 
 // unparkAt performs the detach itself once the parker, its node, and the slot
@@ -2340,7 +2348,7 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	// most. On the window context this sweep would fail on the dead context
 	// without looking at the parker at all, and report a permanent action item
 	// telling the operator to unlink a key the SDK's second request had probably
-	// already removed. The window budget reserves this time (parkerWindowBudget).
+	// already removed. The window reserves this time (parkerWindowReserve).
 	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
 	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, parkerNode, parkerVMID, bareVolid)
 	sweepCancel()
