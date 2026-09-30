@@ -351,6 +351,35 @@ pvesh get /cluster/resources --type vm | jq '.[] | select(.tags != null and (.ta
 
 A VM found this way needs the same `qm unlock <vmid>` fix before it can be destroyed or adopted.
 
+### A VM's metadata lock is held by a process that died
+
+`set_vm_metadata`, `set_disk_metadata`, and stemcell reference counting each take a lock on the VM before they rewrite its tags and description. The lock lives in a PVE resource pool named `bosh-lock-vm-<vmid>`, and the pool's comment holds the claim of whoever has it. When another process holds the lock for the whole 10-second wait, the call fails with a retriable error that quotes that claim.
+
+```text
+withVMIDLock: lock "bosh-lock-vm-4242" is held by owner=set_vm_metadata/4242@director-0/1234-9f2c1a7e-7 exp=1790778395, which lapses at 2026-09-30T14:26:35Z: AcquireClusterLock: timed out after 10s waiting for lock "bosh-lock-vm-4242": ...
+```
+
+We read the owner token from left to right. `set_vm_metadata/4242` is the operation that took the lock and the VMID it locked, `director-0` is the host the CPI ran on, and `1234` is the CPI's process ID on that host. `9f2c1a7e` is a random number that process drew when it started, and the trailing `7` counts the locks that process has taken. `exp` is the claim's expiry in Unix seconds, and the error repeats it as a UTC time.
+
+A claim clears by itself at its recorded expiry. A VM lock's claim lasts 25 minutes from the moment it was taken, so a lock that a dead process left behind is free again within 25 minutes, and the first call after that takes it over. When we have lengthened a backoff curve or the transient attempt budget under `pve.retry`, the claim lasts longer, and `exp` still says exactly when it lapses.
+
+When we can't wait that long, we can clear the lock at once, but only after we have confirmed that the process is gone. We log in to the host the token names and look for the process ID.
+
+```bash
+ps -p 1234 -o pid,cmd
+```
+
+If `ps` prints no process, or prints one that isn't the CPI, the holder is gone. We read the claim once more to make sure it is still the same one, and then we delete the pool.
+
+```bash
+pvesh get /pools/bosh-lock-vm-4242 --output-format json
+pvesh delete /pools --poolid bosh-lock-vm-4242
+```
+
+Deleting the pool while the process that holds it is still alive lets two writers into the VM's metadata at the same time, which is exactly what the lock exists to prevent. Each writer reads the tags and rewrites them, and whichever writes last silently drops the other's changes. We never delete the pool on a guess.
+
+A parker's protection lock uses the same pool name. Its claim names a parker operation such as `transfer_out/90000`, and it lasts only three minutes, so we let it lapse rather than delete it.
+
 ### Every create_vm times out reaching the PVE API
 
 **Symptom**

@@ -165,7 +165,9 @@ func registerStemcellDirectorRef(
 // Lock envelope: destroy is a purge-destroy of a template VM plus
 // AwaitTaskWithLogger — routinely tens of seconds on real storage, and the
 // caller's closure typically also sweeps every replica in the same call.
-// That is far longer than vmidLockTTL (30s), so destroy runs AFTER the
+// The lock's TTL budget (vmidLockBodies) does not count it, and holding the
+// lock through it would stall every other writer on the template for that
+// long, so destroy runs AFTER the
 // per-VMID lock (withVMIDLock) is released — the lock is held only for the
 // fast read-modify-write that decides whether this was the last ref. Ordering
 // (the fix for the historical trapdoor bug where refs were cleared BEFORE a
