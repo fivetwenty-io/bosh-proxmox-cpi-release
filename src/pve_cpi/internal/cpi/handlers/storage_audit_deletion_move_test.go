@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	nodesapi "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -174,11 +175,18 @@ type deleteWindowOutcome struct {
 	GuestRemains bool
 }
 
+// deleteWindowText is the text the Director reads for err, which is the
+// first CPI error in the chain when there is one.
 func deleteWindowText(err error, vmID string) string {
 	if err == nil {
 		return ""
 	}
-	return strings.ReplaceAll(err.Error(), vmID, "<vm>")
+	text := err.Error()
+	var typed *cpierrors.Error
+	if errors.As(err, &typed) {
+		text = typed.Error()
+	}
+	return strings.ReplaceAll(text, vmID, "<vm>")
 }
 
 type statusFailQEMU struct {
@@ -214,7 +222,7 @@ func TestDeleteOfMovedVMSurvivesATransientStatusFailure(t *testing.T) {
 		deps.PVE = statusFailPVE{lifecycleFlowPVE: client, fail: &fail}
 		var outcome deleteWindowOutcome
 		_, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
-		outcome.FirstDelete = deleteWindowText(errors.Unwrap(err), vmID)
+		outcome.FirstDelete = deleteWindowText(err, vmID)
 		outcome.Admission = deleteWindowText(admitStorageVMAllocation(context.Background(), deps, journal, []string{"n1", "n2"}, "other-agent"), vmID)
 		fail = false
 		_, err = HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
@@ -266,7 +274,7 @@ func TestDeleteOfMovedVMKeepsItsMoveAfterRetentionFails(t *testing.T) {
 		return outcome, report, strings.ReplaceAll(cleanup, vmID, "<vm>")
 	}
 	control, _, controlCleanup := run(t, false)
-	if control.FirstDelete == "" || control.Admission != "" || len(control.Conflicts) != 0 || control.RetryDelete == "" || strings.Contains(control.RetryDelete, "refused: ") || control.FinalState != aj.ReconciliationRequired || !control.GuestRemains {
+	if control.FirstDelete == "" || control.Admission != "" || len(control.Conflicts) != 0 || control.RetryDelete != unsettledRetainStep || control.FinalState != aj.ReconciliationRequired || !control.GuestRemains {
 		t.Fatalf("unmoved control changed: %+v", control)
 	}
 	moved, report, movedCleanup := run(t, true)

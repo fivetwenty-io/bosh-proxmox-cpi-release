@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -391,11 +392,27 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, err
 		}
 		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmCID, vmid); handled || managedErr != nil {
-			return nil, storageDecisionSourceError(managedErr)
+			return nil, managedDeleteVMError(managedErr)
 		}
 
 		return deleteLegacyVM(ctx, deps, vmCID, vmid)
 	})
+}
+
+// managedDeleteVMError decides what the Director reads when a journal-managed
+// delete fails. A typed CPI error, such as an audit gate's findings or a lock
+// timeout, and a refusal the CPI wrote itself, such as the one naming an
+// unsettled step, keep their own text, because a retry is useless unless it
+// says what refused it. Anything else, such as a journal write that failed or
+// a PVE answer no classifier recognized, keeps the generic evidence line, so
+// its backend text never reaches the Director.
+func managedDeleteVMError(err error) error {
+	var typed *cpierrors.Error
+	var refusal *storageRefusalError
+	if errors.As(err, &typed) || errors.As(err, &refusal) {
+		return err
+	}
+	return storageDecisionSourceError(err)
 }
 
 func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any, error) {
