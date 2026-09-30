@@ -273,7 +273,7 @@ func acquireClusterLockWithClock(
 			// ours. A stealer that judged an older claim expired can delete the
 			// sentinel we just created, so confirm our claim, twice for a lock
 			// that takes the grace, before taking the handle.
-			handle, confirmErr := confirmLockCreate(ctx, pools, pool, owner, expiry, settings, clk)
+			handle, confirmErr := confirmLockCreate(ctx, pools, pool, owner, expiry, deadline, settings, clk)
 			if confirmErr != nil || handle != nil {
 				return handle, confirmErr
 			}
@@ -289,7 +289,7 @@ func acquireClusterLockWithClock(
 		}
 
 		// Pool exists: inspect the holder's recorded expiry to decide steal-or-wait.
-		if stole, err := tryStealExpired(ctx, pools, pool, owner, ttl, settings, clk); err != nil {
+		if stole, err := tryStealExpired(ctx, pools, pool, owner, ttl, deadline, settings, clk); err != nil {
 			return nil, err
 		} else if stole != nil {
 			return stole, nil
@@ -304,15 +304,22 @@ func acquireClusterLockWithClock(
 			return nil, cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: timed out after %s waiting for lock %q", timeout, pool))
 		}
-		wait := clusterLockPollInterval + time.Duration(jitterInt64N(int64(clusterLockPollInterval)))
-		if remaining := deadline.Sub(now); wait > remaining {
-			wait = remaining
-		}
-		if sleepErr := clk.sleep(ctx, wait); sleepErr != nil {
+		if sleepErr := clk.sleep(ctx, clusterLockPollWait(now, deadline)); sleepErr != nil {
 			return nil, cpierrors.WrapAs(sleepErr, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: interrupted waiting for lock %q", pool))
 		}
 	}
+}
+
+// clusterLockPollWait is how long an acquire waits before its next attempt,
+// which is the poll interval plus jitter, cut short so it never runs past
+// deadline.
+func clusterLockPollWait(now, deadline time.Time) time.Duration {
+	wait := clusterLockPollInterval + time.Duration(jitterInt64N(int64(clusterLockPollInterval)))
+	if remaining := deadline.Sub(now); wait > remaining {
+		wait = remaining
+	}
+	return wait
 }
 
 // tryStealExpired reads the existing sentinel pool's comment and, when the
@@ -350,7 +357,8 @@ func acquireClusterLockWithClock(
 // anti-affinity lock, because a double-held RMW produces one canonical rule,
 // the last writer's, and the verify catches a member that rule lost.
 func tryStealExpired(
-	ctx context.Context, pools PoolService, pool, owner string, ttl time.Duration, settings clusterLockSettings, clk lockClock,
+	ctx context.Context, pools PoolService, pool, owner string, ttl time.Duration, deadline time.Time,
+	settings clusterLockSettings, clk lockClock,
 ) (*ClusterLockHandle, error) {
 	comment, found, err := pools.GetPoolComment(ctx, pool)
 	if err != nil {
@@ -415,7 +423,7 @@ func tryStealExpired(
 		return nil, cpierrors.WrapAs(createErr, cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: steal-recreate lock %q", pool))
 	}
-	return confirmLockCreate(ctx, pools, pool, owner, expiry, settings, clk)
+	return confirmLockCreate(ctx, pools, pool, owner, expiry, deadline, settings, clk)
 }
 
 // confirmLockCreate decides whether a create that PVE accepted gave us the
@@ -425,8 +433,18 @@ func tryStealExpired(
 // stalled for longer than the grace. Only when every read shows our claim does
 // it return a handle, carrying the claim the last read returned. It returns
 // (nil, nil) when we were displaced.
+//
+// A read that fails decides nothing, so the same pass reads again on the poll
+// cadence until the acquire's deadline, which keeps the retries inside the
+// wait the caller already allowed. Failing at once would leave the sentinel we
+// just created standing for a whole TTL while the caller could not tell
+// whether it holds the lock. When the reads still fail at the deadline, the
+// acquire returns ErrClusterLockStateUnknown without a handle, and on the way
+// out abandonLockCreate removes the sentinel only when a fresh read proves it
+// is ours.
 func confirmLockCreate(
-	ctx context.Context, pools PoolService, pool, owner string, expiry time.Time, settings clusterLockSettings, clk lockClock,
+	ctx context.Context, pools PoolService, pool, owner string, expiry, deadline time.Time,
+	settings clusterLockSettings, clk lockClock,
 ) (*ClusterLockHandle, error) {
 	passes := 1
 	if settings.grace {
@@ -436,14 +454,22 @@ func confirmLockCreate(
 	for pass := 0; pass < passes; pass++ {
 		if pass == 1 {
 			if err := clk.sleep(ctx, settings.graceDuration()); err != nil {
-				return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-					fmt.Sprintf("AcquireClusterLock: interrupted confirming lock %q", pool))
+				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
+					cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+						fmt.Sprintf("AcquireClusterLock: interrupted confirming lock %q", pool)))
 			}
 		}
 		comment, mine, err := sentinelClaim(ctx, pools, pool, owner)
-		if err != nil {
-			return nil, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AcquireClusterLock: verify lock %q", pool))
+		for err != nil {
+			now := clk.now()
+			if !now.Before(deadline) {
+				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk, lockStateUnknown(pool, err))
+			}
+			if sleepErr := clk.sleep(ctx, clusterLockPollWait(now, deadline)); sleepErr != nil {
+				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
+					lockStateUnknown(pool, errors.Join(err, sleepErr)))
+			}
+			comment, mine, err = sentinelClaim(ctx, pools, pool, owner)
 		}
 		if !mine {
 			return nil, nil
@@ -453,6 +479,45 @@ func confirmLockCreate(
 	return &ClusterLockHandle{
 		pool: pool, owner: owner, claim: claim, settings: settings, pools: pools, expiry: expiry, now: clk.now,
 	}, nil
+}
+
+// lockStateUnknown is the error an acquire returns when it created its
+// sentinel but no read of it answered before the deadline.
+func lockStateUnknown(pool string, cause error) error {
+	return cpierrors.WrapAs(errors.Join(cause, ErrClusterLockStateUnknown), cpierrors.TypeRetriableCloud,
+		fmt.Sprintf("AcquireClusterLock: could not confirm who holds lock %q", pool))
+}
+
+// clusterLockAbandonTimeout bounds the read and delete that clean up after a
+// create whose ownership could not be confirmed.
+const clusterLockAbandonTimeout = 10 * time.Second
+
+// abandonLockCreate gives up on a create whose ownership could not be
+// confirmed, and it returns cause. Our sentinel would otherwise block every
+// other acquirer until its TTL, so it reads the sentinel on a detached context
+// and deletes it when that read proves the claim is ours. The delete carries
+// the comment the read returned, never the one we sent, so a guarded pool
+// service compares two reads. It leaves the sentinel alone when the read
+// fails, names another owner, cannot be parsed, or shows a claim within the
+// release margin of its expiry, the same rules Release follows.
+func abandonLockCreate(
+	ctx context.Context, pools PoolService, pool, owner string, settings clusterLockSettings, clk lockClock, cause error,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterLockAbandonTimeout)
+	defer cancel()
+	comment, found, err := pools.GetPoolComment(cleanupCtx, pool)
+	if err != nil || !found {
+		return cause
+	}
+	holder, ownerOK := decodeLockOwner(comment)
+	exp, expOK := decodeLockExpiry(comment)
+	if !ownerOK || !expOK || holder != owner || !clk.now().Add(settings.releaseMargin()).Before(exp) {
+		return cause
+	}
+	// A failed delete leaves the sentinel to its TTL steal, which is where it
+	// stood before this attempt, so cause is still the error to return.
+	_ = pools.DeletePool(WithExpectedLockClaim(cleanupCtx, comment), pool)
+	return cause
 }
 
 // sentinelClaim reads the sentinel back and returns its comment and whether it
@@ -625,6 +690,13 @@ func lockOwnerHost(host string) string {
 func ProcessLockOwner(owner string) string {
 	return fmt.Sprintf("%s@%s-%d", owner, processLockIdentity(), lockOwnerSeq.Add(1))
 }
+
+// ErrClusterLockStateUnknown marks an acquire that created its sentinel but
+// could not read it back before its deadline, so it cannot tell whether it
+// holds the lock. Like a timeout, it is not a sign that the lock mechanism is
+// unavailable, and a caller must not run the guarded work unserialized beside
+// a sentinel that may be ours.
+var ErrClusterLockStateUnknown = errors.New("cluster lock state unknown after create")
 
 // ErrClusterLockTimeout marks the acquire that ran out its timeout waiting for a
 // holder that was live on every attempt. It is distinct from every other acquire

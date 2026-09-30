@@ -31,6 +31,12 @@ type fakeLockPools struct {
 	// steal's initial read succeeds but the post-steal verify read fails/shows a
 	// different owner).
 	getFn func(id string) (comment string, found bool, err error, override bool)
+	// normalize, when set, is what the store keeps for a created comment, for
+	// a PVE that does not keep a comment byte for byte.
+	normalize func(comment string) string
+	// deleteHook, when set, sees every delete with its context and the
+	// comment the store held at that moment.
+	deleteHook func(ctx context.Context, id, stored string)
 }
 
 func newFakeLockPools() *fakeLockPools {
@@ -53,15 +59,21 @@ func (f *fakeLockPools) CreatePool(_ context.Context, poolID, comment string) er
 	if _, ok := f.pools[poolID]; ok {
 		return fmt.Errorf("pool '%s' already exists", poolID)
 	}
+	if f.normalize != nil {
+		comment = f.normalize(comment)
+	}
 	f.pools[poolID] = comment
 	return nil
 }
 
-func (f *fakeLockPools) DeletePool(_ context.Context, poolID string) error {
+func (f *fakeLockPools) DeletePool(ctx context.Context, poolID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteN++
 	f.calls = append(f.calls, "delete:"+poolID)
+	if f.deleteHook != nil {
+		f.deleteHook(ctx, poolID, f.pools[poolID])
+	}
 	if f.deleteFn != nil {
 		if err := f.deleteFn(poolID); err != nil {
 			return err
@@ -281,7 +293,7 @@ func TestTryStealExpired_PoolVanishedBeforeRead(t *testing.T) {
 	// attempted; the caller must retry the top-level create instead.
 	f := newFakeLockPools()
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, time.Unix(1000, 0), clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("expected no error when pool vanished before read, got %v", err)
 	}
@@ -306,7 +318,7 @@ func TestTryStealExpired_DeleteNonNotFoundErrorRetriable(t *testing.T) {
 	f.deleteFn = func(_ string) error { return fmt.Errorf("500 pmxcfs temporarily unavailable") }
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, time.Unix(1000, 0), clusterLockSettings{}, clk)
 	if h != nil {
 		t.Fatal("expected nil handle on steal-delete failure")
 	}
@@ -339,7 +351,7 @@ func TestTryStealExpired_RecreateLosesToConcurrentStealer(t *testing.T) {
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, time.Unix(1000, 0), clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("losing the recreate race must signal loop/retry, not an error: %v", err)
 	}
@@ -369,7 +381,7 @@ func TestTryStealExpired_VerifyReadErrorRetriable(t *testing.T) {
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, time.Unix(1000, 0), clusterLockSettings{}, clk)
 	if h != nil {
 		t.Fatal("expected nil handle when the post-steal verify read errors")
 	}
@@ -379,8 +391,8 @@ func TestTryStealExpired_VerifyReadErrorRetriable(t *testing.T) {
 	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
 		t.Errorf("verify-read failure must be retriable; got %v", err)
 	}
-	if !strings.Contains(err.Error(), "verify") {
-		t.Errorf("error should identify the verify step; got %v", err)
+	if !strings.Contains(err.Error(), "could not confirm who holds lock") || !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Errorf("error should say the lock state is unknown; got %v", err)
 	}
 }
 
@@ -402,7 +414,7 @@ func TestTryStealExpired_VerifyShowsDifferentOwnerDisplaced(t *testing.T) {
 	}
 
 	clk := fixedClock(time.Unix(1000, 0), time.Second)
-	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, clusterLockSettings{}, clk)
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", 60*time.Second, time.Unix(1000, 0), clusterLockSettings{}, clk)
 	if err != nil {
 		t.Fatalf("displacement by a concurrent stealer must signal loop/retry, not an error: %v", err)
 	}

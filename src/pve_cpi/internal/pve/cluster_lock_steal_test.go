@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 // stealWho names the acquirer a pool call belongs to.
@@ -338,4 +340,244 @@ func TestSteal_SlowReReadAbandonsTheSteal(t *testing.T) {
 		}
 	}
 	t.Fatalf("the acquirer never waited a poll; events %v", events)
+}
+
+// confirmReads scripts the reads of one sentinel for the confirm tests. Every
+// read of a sentinel that does not exist yet answers normally. Once the
+// sentinel exists, fail says whether the next read fails; a read that does
+// not fail answers with what the store holds.
+func confirmReads(f *fakeLockPools, fail func(read int) bool) *int {
+	reads := 0
+	f.getFn = func(poolID string) (string, bool, error, bool) {
+		if _, exists := f.pools[poolID]; !exists {
+			return "", false, nil, false
+		}
+		reads++
+		if fail(reads) {
+			return "", false, errors.New("503 pmxcfs read timeout"), true
+		}
+		return "", false, nil, false
+	}
+	return &reads
+}
+
+// failsUntilTheWayOut fails every confirming read, including the last one,
+// which is made once the clock has reached deadline. Only the read after it,
+// the one abandonLockCreate makes on the way out, answers.
+func failsUntilTheWayOut(clk lockClock, deadline time.Time) func(int) bool {
+	atDeadline := 0
+	return func(int) bool {
+		if clk.now().Before(deadline) {
+			return true
+		}
+		atDeadline++
+		return atDeadline == 1
+	}
+}
+
+// sleepLog records the pauses a fixed test clock is asked for.
+func sleepLog(start time.Time) (lockClock, *[]time.Duration) {
+	cur := start
+	var slept []time.Duration
+	return lockClock{
+		now: func() time.Time { return cur },
+		sleep: func(_ context.Context, d time.Duration) error {
+			slept = append(slept, d)
+			cur = cur.Add(d)
+			return nil
+		},
+	}, &slept
+}
+
+// TestConfirm_ReadRetriesUntilItAnswers covers a transient failure of the read
+// that confirms a fresh create. The pass reads again on the poll cadence and
+// takes the lock once a read answers, instead of failing at once and leaving
+// its own sentinel standing for a whole TTL.
+func TestConfirm_ReadRetriesUntilItAnswers(t *testing.T) {
+	f := newFakeLockPools()
+	reads := confirmReads(f, func(read int) bool { return read <= 2 })
+	clk, slept := sleepLog(time.Unix(1000, 0))
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 30*time.Second, clk)
+	if err != nil || h == nil {
+		t.Fatalf("a transient read failure lost the lock: %v", err)
+	}
+	if *reads != 3 || len(*slept) != 2 {
+		t.Fatalf("want two failed reads and two poll waits before the answer, got reads=%d waits=%v", *reads, *slept)
+	}
+	for _, d := range *slept {
+		if d < clusterLockPollInterval || d >= 2*clusterLockPollInterval {
+			t.Fatalf("a retry waited %v, off the poll cadence", d)
+		}
+	}
+	if f.deleteN != 0 || !strings.Contains(f.pools["bosh-lock-web"], "owner=me ") {
+		t.Fatalf("the acquired sentinel was disturbed: deletes=%d sentinel=%q", f.deleteN, f.pools["bosh-lock-web"])
+	}
+}
+
+// TestConfirm_SecondPassRetriesThatPass covers the pass shape for a lock that
+// takes the grace. The first pass confirms the claim, the second pass's reads
+// fail, and a retry of that same pass answers. The acquire takes the lock
+// without starting over and without a second grace pause, and the handle
+// carries the claim that answering read returned.
+func TestConfirm_SecondPassRetriesThatPass(t *testing.T) {
+	defer SetClusterLockGraceForTest(clusterLockDefaultGrace)()
+	f := newFakeLockPools()
+	reads := 0
+	f.getFn = func(poolID string) (string, bool, error, bool) {
+		stored, exists := f.pools[poolID]
+		if !exists {
+			return "", false, nil, false
+		}
+		reads++
+		switch reads {
+		case 1:
+			return "", false, nil, false
+		case 2, 3:
+			return "", false, errors.New("503 pmxcfs read timeout"), true
+		}
+		return stored + "\n", true, nil, true
+	}
+	clk, slept := sleepLog(time.Unix(1000, 0))
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 30*time.Second, clk, WithCreateGrace())
+	if err != nil || h == nil {
+		t.Fatalf("the second pass's transient failure lost the lock: %v", err)
+	}
+	if f.createN != 1 || reads != 4 {
+		t.Fatalf("want one create and four reads, got creates=%d reads=%d", f.createN, reads)
+	}
+	graces := 0
+	for _, d := range *slept {
+		if d == clusterLockDefaultGrace {
+			graces++
+		}
+	}
+	if graces != 1 || len(*slept) != 3 {
+		t.Fatalf("want one grace pause and two poll waits, got %v", *slept)
+	}
+	if want := f.pools["bosh-lock-web"] + "\n"; h.claim != want {
+		t.Fatalf("handle claim = %q, want the claim the answering read returned %q", h.claim, want)
+	}
+}
+
+// TestConfirm_UnknownStateAtTheDeadline covers reads that never answer. The
+// acquire cannot tell whether it holds the lock, so it returns
+// ErrClusterLockStateUnknown with no handle, retriable, once its own deadline
+// passes. No read proved the sentinel ours, so it is left standing.
+func TestConfirm_UnknownStateAtTheDeadline(t *testing.T) {
+	f := newFakeLockPools()
+	confirmReads(f, func(int) bool { return true })
+	clk, _ := sleepLog(time.Unix(1000, 0))
+	start := clk.now()
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 3*time.Second, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("want no handle and ErrClusterLockStateUnknown, got handle=%v err=%v", h != nil, err)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || errors.Is(err, ErrClusterLockTimeout) {
+		t.Fatalf("the unknown state must be retriable and distinct from a timeout: %v", err)
+	}
+	if got := clk.now().Sub(start); got != 3*time.Second {
+		t.Fatalf("the retries ran %v, want exactly the acquire's 3s wait", got)
+	}
+	if f.deleteN != 0 {
+		t.Fatalf("a sentinel no read could attribute to us was deleted")
+	}
+}
+
+// TestConfirm_AbandonDeletesAProvenOwnSentinel covers the way out. The
+// confirming reads fail until the deadline, and the read on the way out
+// answers with our claim, so the acquire deletes its own sentinel rather than
+// block every other acquirer for a whole TTL. The delete carries the comment
+// that read returned, which here differs from the one we sent, so a guarded
+// delete compares two reads.
+func TestConfirm_AbandonDeletesAProvenOwnSentinel(t *testing.T) {
+	f := newFakeLockPools()
+	f.normalize = func(comment string) string { return comment + "\n" }
+	clk, _ := sleepLog(time.Unix(1000, 0))
+	confirmReads(f, failsUntilTheWayOut(clk, clk.now().Add(3*time.Second)))
+	f.deleteHook = func(ctx context.Context, _, stored string) {
+		if expected, ok := ExpectedLockClaim(ctx); !ok || expected != stored {
+			t.Errorf("the delete expected claim %q (set=%v), but the sentinel holds %q", expected, ok, stored)
+		}
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 3*time.Second, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("want no handle and ErrClusterLockStateUnknown, got handle=%v err=%v", h != nil, err)
+	}
+	if f.deleteN != 1 {
+		t.Fatalf("want one delete of our proven sentinel, got %d", f.deleteN)
+	}
+	if left, ok := f.pools["bosh-lock-web"]; ok {
+		t.Fatalf("our own proven sentinel was left behind: %q", left)
+	}
+}
+
+// TestConfirm_AbandonLeavesAClaimItCannotProve covers the way out when the
+// read does not prove the sentinel ours. Another owner's claim, a read that
+// still fails, and a claim of ours too close to its expiry are all left
+// standing, and no delete is attempted.
+func TestConfirm_AbandonLeavesAClaimItCannotProve(t *testing.T) {
+	other := encodeLockComment("S1@h/2-b-1", time.Unix(99_999, 0))
+	for name, atDeadline := range map[string]func(f *fakeLockPools, id string) (string, bool, error, bool){
+		"another owner's claim": func(f *fakeLockPools, id string) (string, bool, error, bool) {
+			f.pools[id] = other
+			return "", false, nil, false
+		},
+		"the read still fails": func(*fakeLockPools, string) (string, bool, error, bool) {
+			return "", false, errors.New("503 pmxcfs read timeout"), true
+		},
+		"our claim about to expire": func(*fakeLockPools, string) (string, bool, error, bool) {
+			return encodeLockComment("me", time.Unix(1004, 0)), true, nil, true
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeLockPools()
+			clk, _ := sleepLog(time.Unix(1000, 0))
+			failing := failsUntilTheWayOut(clk, clk.now().Add(3*time.Second))
+			f.getFn = func(id string) (string, bool, error, bool) {
+				if _, exists := f.pools[id]; !exists {
+					return "", false, nil, false
+				}
+				if failing(0) {
+					return "", false, errors.New("503 pmxcfs read timeout"), true
+				}
+				return atDeadline(f, id)
+			}
+			before := ""
+			f.deleteHook = func(_ context.Context, _, stored string) { before = stored }
+			h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 3*time.Second, clk)
+			if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) {
+				t.Fatalf("want no handle and ErrClusterLockStateUnknown, got handle=%v err=%v", h != nil, err)
+			}
+			if f.deleteN != 0 {
+				t.Fatalf("a delete was attempted on a sentinel holding %q", before)
+			}
+			if _, ok := f.pools["bosh-lock-web"]; !ok {
+				t.Fatal("the sentinel was removed")
+			}
+			if name == "another owner's claim" && f.pools["bosh-lock-web"] != other {
+				t.Fatalf("another owner's claim was disturbed: %q", f.pools["bosh-lock-web"])
+			}
+		})
+	}
+}
+
+// TestConfirm_UnknownStateDoesNotRunTheWindow covers the parker window. Every
+// read after the create fails, so the acquire cannot tell whether it holds the
+// lock. The window must not run unserialized next to a sentinel that may be
+// ours, and the call fails with the unknown state instead.
+func TestConfirm_UnknownStateDoesNotRunTheWindow(t *testing.T) {
+	f := newFakeLockPools()
+	confirmReads(f, func(int) bool { return true })
+	ran := false
+	ctx := withTestParkerLockTimeouts(context.Background(), 90*time.Second, time.Millisecond)
+	err := withParkerProtectionLock(ctx, &parkerLockClient{pools: f}, nil, 90000, "unpark", func(context.Context) error {
+		ran = true
+		return nil
+	})
+	if ran {
+		t.Fatal("the window ran unserialized next to a sentinel that may be ours")
+	}
+	if !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("want ErrClusterLockStateUnknown, got %v", err)
+	}
 }
