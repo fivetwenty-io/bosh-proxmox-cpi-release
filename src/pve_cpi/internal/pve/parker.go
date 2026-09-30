@@ -2036,7 +2036,7 @@ const ParkerProtectionLockTTL = parkerProtectionLockTTL
 const parkerProtectionLockTimeout = 15 * time.Second
 
 // parkerLockReleaseTimeout bounds the deferred sentinel-pool delete.
-const parkerLockReleaseTimeout = 10 * time.Second
+const parkerLockReleaseTimeout = clusterLockReleaseTimeout
 
 // parkerLockTimeoutsKey carries an override for the protection-window lock's
 // TTL and acquire timeout. The production values are tuned for a real cluster
@@ -2129,7 +2129,8 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	handle, lockErr := AcquireClusterLock(ctx, pools,
 		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
 	if lockErr != nil {
-		if errors.Is(lockErr, ErrClusterLockTimeout) || errors.Is(lockErr, ErrClusterLockStateUnknown) {
+		if errors.Is(lockErr, ErrClusterLockTimeout) || errors.Is(lockErr, ErrClusterLockStateUnknown) ||
+			errors.Is(lockErr, ErrClusterLockInterrupted) {
 			// A timeout is not "the lock is unavailable to me", it is "somebody
 			// else is inside the window right now": an expired or unreadable
 			// holder is stolen rather than waited on, so the only way to reach
@@ -2142,6 +2143,9 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			// back is the same case. That sentinel may be ours and may still
 			// stand, and another request may already be waiting on it, so
 			// running the window unserialized could overlap a holder.
+			//
+			// A wait cut short by a cancelled request is the same case too. The
+			// request has ended, so there is no window left to run.
 			return lockErr
 		}
 		// Every other acquire failure means the mechanism is unavailable, not

@@ -123,7 +123,9 @@ func TestWithVMIDLock_TakesNoGrace(t *testing.T) {
 	defer pve.SetClusterLockGraceForTest(time.Hour)()
 	events := []string{}
 	pools := newVMIDLockPools(&events)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The context leaves the wait more than the lock's request-deadline
+	// margin, so a grace pause, had this lock taken one, would run it out.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := withVMIDLock(ctx, pools, 12345, "test-owner", log.NewNopLogger(), func() error {
 		events = append(events, "fn")

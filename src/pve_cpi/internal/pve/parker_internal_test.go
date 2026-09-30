@@ -805,3 +805,26 @@ func TestWithParkerProtectionLock_TakesTheGrace(t *testing.T) {
 func (r *recordingPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
 }
+
+// TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow covers a
+// request cancelled while its parker lock waits behind a live holder. The wait
+// ends interrupted, and the window must not run unserialized on the ended
+// request.
+func TestWithParkerProtectionLock_CancelledWaitDoesNotRunTheWindow(t *testing.T) {
+	t.Parallel()
+	pools := newFakeLockPools()
+	pools.pools[ClusterLockPoolName("vm-90000")] = encodeLockComment("unpark/1/90000", time.Now().Add(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ran := false
+	err := withParkerProtectionLock(ctx, &parkerLockClient{pools: pools}, nil, 90000, "unpark", func(context.Context) error {
+		ran = true
+		return nil
+	})
+	if ran {
+		t.Fatal("the window ran unserialized on a cancelled request")
+	}
+	if !errors.Is(err, ErrClusterLockInterrupted) {
+		t.Fatalf("want the interrupted wait, got %v", err)
+	}
+}

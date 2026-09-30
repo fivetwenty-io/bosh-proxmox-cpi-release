@@ -262,7 +262,19 @@ func acquireClusterLockWithClock(
 	}
 
 	pool := ClusterLockPoolName(name)
-	deadline := clk.now().Add(timeout)
+	deadline, clamped := clusterLockDeadline(ctx, clk.now(), timeout)
+	timedOut := func(cause error) error {
+		message := fmt.Sprintf("AcquireClusterLock: timed out after %s waiting for lock %q", timeout, pool)
+		if clamped {
+			message = fmt.Sprintf("AcquireClusterLock: timed out waiting for lock %q before the request's deadline", pool)
+		}
+		return cpierrors.WrapAs(errors.Join(cause, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud, message)
+	}
+	if !clk.now().Before(deadline) {
+		// The request does not leave the margin its caller needs after the
+		// wait, so the acquire gives up before it creates anything.
+		return nil, timedOut(ErrClusterLockNoTimeToWait)
+	}
 
 	for {
 		expiry := claimExpiry(clk.now(), ttl)
@@ -301,14 +313,45 @@ func acquireClusterLockWithClock(
 			if createErr == nil {
 				createErr = errors.New("sentinel displaced after create")
 			}
-			return nil, cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockTimeout), cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("AcquireClusterLock: timed out after %s waiting for lock %q", timeout, pool))
+			return nil, timedOut(createErr)
 		}
 		if sleepErr := clk.sleep(ctx, clusterLockPollWait(now, deadline)); sleepErr != nil {
-			return nil, cpierrors.WrapAs(sleepErr, cpierrors.TypeRetriableCloud,
+			return nil, cpierrors.WrapAs(errors.Join(sleepErr, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("AcquireClusterLock: interrupted waiting for lock %q", pool))
 		}
 	}
+}
+
+// clusterLockReleaseTimeout bounds a release or an abandon of a sentinel the
+// lock code holds, which runs on a detached context after the work it guarded.
+const clusterLockReleaseTimeout = 10 * time.Second
+
+// ClusterLockCompletionAllowance is the time a caller needs after a lock wait
+// gives up to close out its request: the reads that settle planned protection
+// steps and re-read the disk's ownership, and the journal writes that record
+// the outcome. A caller that closes out on a detached context, because its
+// request context has already ended, uses it as that context's bound.
+const ClusterLockCompletionAllowance = 5 * time.Second
+
+// clusterLockContextMargin is how much of a request's own deadline a lock wait
+// leaves unused. It covers the release of the sentinel and the caller's
+// completion after the wait, and it leaves the dispatcher a moment to write
+// the response once the handler returns. A wait that would run into it gives
+// up with ErrClusterLockTimeout instead of being cut short by the deadline.
+const clusterLockContextMargin = clusterLockReleaseTimeout + ClusterLockCompletionAllowance
+
+// clusterLockDeadline is when an acquire started at now stops waiting. It is
+// now plus timeout, or the request's deadline less clusterLockContextMargin
+// when that comes first, and clamped reports that the request's deadline set
+// it.
+func clusterLockDeadline(ctx context.Context, now time.Time, timeout time.Duration) (time.Time, bool) {
+	deadline := now.Add(timeout)
+	if requestDeadline, ok := ctx.Deadline(); ok {
+		if limit := requestDeadline.Add(-clusterLockContextMargin); limit.Before(deadline) {
+			return limit, true
+		}
+	}
+	return deadline, false
 }
 
 // clusterLockPollWait is how long an acquire waits before its next attempt,
@@ -455,7 +498,7 @@ func confirmLockCreate(
 		if pass == 1 {
 			if err := clk.sleep(ctx, settings.graceDuration()); err != nil {
 				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
-					cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
+					cpierrors.WrapAs(errors.Join(err, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
 						fmt.Sprintf("AcquireClusterLock: interrupted confirming lock %q", pool)))
 			}
 		}
@@ -488,10 +531,6 @@ func lockStateUnknown(pool string, cause error) error {
 		fmt.Sprintf("AcquireClusterLock: could not confirm who holds lock %q", pool))
 }
 
-// clusterLockAbandonTimeout bounds the read and delete that clean up after a
-// create whose ownership could not be confirmed.
-const clusterLockAbandonTimeout = 10 * time.Second
-
 // abandonLockCreate gives up on a create whose ownership could not be
 // confirmed, and it returns cause. Our sentinel would otherwise block every
 // other acquirer until its TTL, so it reads the sentinel on a detached context
@@ -503,7 +542,7 @@ const clusterLockAbandonTimeout = 10 * time.Second
 func abandonLockCreate(
 	ctx context.Context, pools PoolService, pool, owner string, settings clusterLockSettings, clk lockClock, cause error,
 ) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterLockAbandonTimeout)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterLockReleaseTimeout)
 	defer cancel()
 	comment, found, err := pools.GetPoolComment(cleanupCtx, pool)
 	if err != nil || !found {
@@ -703,8 +742,22 @@ var ErrClusterLockStateUnknown = errors.New("cluster lock state unknown after cr
 // failure: an expired or unreadable holder is stolen rather than waited on, so a
 // timeout is positive evidence that somebody else is inside the window right
 // now. Callers that would otherwise proceed unserialized use it to tell "nobody
-// can lock here" from "somebody is locked here".
+// can lock here" from "somebody is locked here". An acquire whose request
+// deadline came first, less clusterLockContextMargin, returns it too, having
+// changed nothing, and so does one that starts with less than that margin left.
 var ErrClusterLockTimeout = errors.New("cluster lock acquire timed out")
+
+// ErrClusterLockNoTimeToWait marks the lock timeout of an acquire that gave up
+// before it waited at all, because its request's deadline left less than
+// clusterLockContextMargin. It comes joined with ErrClusterLockTimeout, so a
+// caller that reports on the wait can say none happened.
+var ErrClusterLockNoTimeToWait = errors.New("the request's deadline leaves no time to wait")
+
+// ErrClusterLockInterrupted marks an acquire whose wait was cut short because
+// its request context was cancelled, as a SIGTERM does. It is kept apart from a
+// timeout, so callers can tell the two, and like a timeout it is not a sign
+// that the lock mechanism is unavailable.
+var ErrClusterLockInterrupted = errors.New("cluster lock wait interrupted")
 
 // decodeLockOwner extracts the owner token from a sentinel pool comment.
 func decodeLockOwner(comment string) (string, bool) {

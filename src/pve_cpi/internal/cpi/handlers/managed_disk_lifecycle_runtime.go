@@ -116,8 +116,17 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 		// The wait ran out before this operation changed anything it cannot
 		// account for, so the allocation is returned to the Director exactly as
 		// a success would return it, and the retriable timeout goes back for
-		// the Director to retry.
-		finalErr = m.completeOwned(ctx, false)
+		// the Director to retry. When the request's context has already
+		// ended, the completion runs on a detached, bounded context instead,
+		// because every read it makes would otherwise fail at once. That path
+		// is only ever taken for a clean exit, never after an operation error.
+		completionCtx := ctx
+		if ctx.Err() != nil {
+			detached, cancel := detachedContext(ctx, pve.ClusterLockCompletionAllowance)
+			defer cancel()
+			completionCtx = detached
+		}
+		finalErr = m.completeOwned(completionCtx, false)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a lock timeout failed"))
 		}
@@ -217,6 +226,11 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // before it waited has changed it, even when every step settled, so it still
 // goes uncertain.
 //
+// A request whose context ended counts the same way. pve.ErrClusterLockInterrupted
+// is a lock wait that a cancelled request cut short, and errManagedRequestEnded
+// is a mutation the guard refused on an ended request before it reached PVE.
+// Neither changed anything, so the same conditions decide.
+//
 // pve.ErrClusterLockStateUnknown counts the same way. The acquire created its
 // sentinel but no read of it answered before the deadline, so it never entered
 // the window either. When the read on its way out proved the sentinel ours and
@@ -228,7 +242,8 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	if operationErr == nil {
 		return false
 	}
-	if !errors.Is(operationErr, pve.ErrClusterLockTimeout) && !errors.Is(operationErr, pve.ErrClusterLockStateUnknown) {
+	if !errors.Is(operationErr, pve.ErrClusterLockTimeout) && !errors.Is(operationErr, pve.ErrClusterLockStateUnknown) &&
+		!errors.Is(operationErr, pve.ErrClusterLockInterrupted) && !errors.Is(operationErr, errManagedRequestEnded) {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {

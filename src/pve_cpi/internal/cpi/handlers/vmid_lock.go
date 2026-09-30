@@ -138,13 +138,22 @@ func withVMIDLock(
 // holder released it; when the read fails, the error says the claim could not
 // be read. The timeout stays the cause in every case, so the error keeps its
 // retriable type and still matches pve.ErrClusterLockTimeout.
+//
+// An acquire whose request deadline left no time to wait never waited, so the
+// error says that instead of describing a wait, and it still quotes the claim.
 func vmidLockHeldError(ctx context.Context, pools pve.PoolService, lockName string, timeoutErr error) error {
 	pool := pve.ClusterLockPoolName(lockName)
 	readCtx, cancel := detachedContext(ctx, vmidLockHolderReadTimeout)
 	defer cancel()
 	comment, found, readErr := pools.GetPoolComment(readCtx, pool)
 	var msg string
-	switch {
+	switch noWait := fmt.Sprintf("withVMIDLock: lock %q was not waited for, because the request's deadline left no time to wait", pool); {
+	case errors.Is(timeoutErr, pve.ErrClusterLockNoTimeToWait) && readErr != nil:
+		msg = noWait + ", and its claim could not be read"
+	case errors.Is(timeoutErr, pve.ErrClusterLockNoTimeToWait) && !found:
+		msg = noWait + ", and it is free now, so a retry can take it"
+	case errors.Is(timeoutErr, pve.ErrClusterLockNoTimeToWait):
+		msg = fmt.Sprintf("%s, and it is held by %s", noWait, describeVMIDLockClaim(comment))
 	case readErr != nil:
 		msg = fmt.Sprintf("withVMIDLock: lock %q is held by another process, and its claim could not be read", pool)
 	case !found:
