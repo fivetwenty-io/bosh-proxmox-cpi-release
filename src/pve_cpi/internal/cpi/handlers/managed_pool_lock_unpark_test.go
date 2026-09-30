@@ -742,3 +742,123 @@ func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
 		t.Fatalf("a clean legacy attach timeout demanded reconciliation: %s", record.Reason)
 	}
 }
+
+// failConfirmingReads makes the parker lock's confirming reads fail until the
+// acquire gives up, while the reads around them answer. The guard's readback
+// of the create is the first read after it and answers, so the create step is
+// observed. After that, a read answers only when its context carries a
+// deadline. In this flow the reads on the lock code's way out are the only
+// bounded ones, because they run on its own detached context with a timeout,
+// while the request context under test has no deadline and the managed wait
+// rides a context value rather than a deadline. So the way out can prove the
+// sentinel ours and delete it. If that ever stops being true, the confirming
+// reads answer too, the acquire takes the lock, and the test fails loudly on
+// the missing unknown state rather than passing for the wrong reason.
+func failConfirmingReads(locks *lockContention) {
+	createdReads := -1
+	locks.afterCreate = func(string) { createdReads = 0 }
+	locks.plainRead = func(ctx context.Context, _ string) error {
+		if createdReads < 0 {
+			return nil
+		}
+		createdReads++
+		if createdReads == 1 {
+			return nil
+		}
+		if _, bounded := ctx.Deadline(); bounded {
+			return nil
+		}
+		return errors.New("connection reset by peer")
+	}
+}
+
+// TestManagedAttachUnknownLockStateReturnsTheAllocation covers an attach whose
+// parker lock create landed but whose confirming reads failed up to the
+// deadline. The acquire cannot tell whether it holds the lock, so it fails
+// with the unknown lock state. The read on its way out proves the sentinel
+// ours and the guarded delete answers, so nothing the allocation owns changed
+// and every step is observed. The allocation goes back to ready_to_return, the
+// error is retriable, the sentinel is gone, and the retry completes.
+func TestManagedAttachUnknownLockStateReturnsTheAllocation(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	failConfirmingReads(locks)
+	shortenManagedLockWait(t, 1200*time.Millisecond)
+
+	err := disk.attach(t.Context())
+	if err == nil || !errors.Is(err, pve.ErrClusterLockStateUnknown) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want the retriable unknown lock state, got %v", err)
+	}
+	assertReturnedRecord(t, "unknown-state", disk.record(t))
+	locks.mu.Lock()
+	sentinels := len(locks.pools)
+	locks.mu.Unlock()
+	if sentinels != 0 {
+		t.Fatalf("the proven sentinel was left standing: %v", locks.pools)
+	}
+
+	locks.reset()
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("the retry after the unknown lock state failed: %v", err)
+	}
+	assertReturnedRecord(t, "retried", disk.record(t))
+}
+
+// TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall covers the
+// same attach when the delete on the way out does not answer. That delete's
+// step stays planned and the guard is poisoned, so the allocation needs
+// reconciliation. The next attach reads the sentinel back, settles the planned
+// delete step, and is admitted. Our old claim still stands, so that attach
+// waits it out and times out cleanly, and once the claim has lapsed the
+// following attach completes.
+func TestManagedAttachUnknownLockStateUnansweredDeleteIsSettledNextCall(t *testing.T) {
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	failConfirmingReads(locks)
+	locks.deleteErr = errors.New("connection reset by peer")
+	shortenManagedLockWait(t, 1200*time.Millisecond)
+
+	if err := disk.attach(t.Context()); !errors.Is(err, pve.ErrClusterLockStateUnknown) {
+		t.Fatalf("want the unknown lock state, got %v", err)
+	}
+	record := disk.record(t)
+	if record.State != aj.ReconciliationRequired {
+		t.Fatalf("allocation state = %s, want %s", record.State, aj.ReconciliationRequired)
+	}
+	last := record.Steps[len(record.Steps)-1]
+	if last.Kind != "lifecycle_attach_disk_Pool_DeletePool" || last.State != aj.Planned {
+		t.Fatalf("last step = %s (%s), want a planned lifecycle_attach_disk_Pool_DeletePool", last.Kind, last.State)
+	}
+	sentinel := pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", disk.parker))
+	locks.mu.Lock()
+	claim, standing := locks.pools[sentinel]
+	locks.plainRead, locks.deleteErr, locks.afterCreate = nil, nil, nil
+	locks.mu.Unlock()
+	if !standing {
+		t.Fatal("the sentinel is gone although its delete never answered")
+	}
+
+	err := disk.attach(t.Context())
+	if !errors.Is(err, pve.ErrClusterLockTimeout) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("the next attach should be admitted and wait out our old claim, got %v", err)
+	}
+	record = disk.record(t)
+	assertReturnedRecord(t, "settled", record)
+	for i := range record.Steps {
+		if record.Steps[i].Kind == last.Kind && record.Steps[i].ID == last.ID && record.Steps[i].State != aj.Observed {
+			t.Fatalf("the planned delete step was not settled: %s", record.Steps[i].State)
+		}
+	}
+
+	locks.mu.Lock()
+	if owner, ok := strings.CutPrefix(strings.Fields(claim)[0], "owner="); ok {
+		locks.pools[sentinel] = fmt.Sprintf("owner=%s exp=%d", owner, time.Now().Add(-time.Minute).Unix())
+	}
+	locks.mu.Unlock()
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("the attach after our old claim lapsed failed: %v", err)
+	}
+	assertReturnedRecord(t, "completed", disk.record(t))
+}
