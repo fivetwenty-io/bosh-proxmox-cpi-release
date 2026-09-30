@@ -237,8 +237,15 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 	fi; \
 	echo "$(GREEN)✓ Go blob $(GO_BLOB_VER) satisfies go.mod ($${required})$(RESET)"
 
+# The cheap gates run first as prerequisites, so they still fail in seconds.
+# scripts/_check_lanes.sh then runs the race tests beside two background lanes,
+# one for vet, staticcheck, and lint and one for erb-check and py-test.
+# CHECK_LANES=0 runs those gates one after another instead.
+CHECK_LANES ?= 1
+
 .PHONY: check
-check: artifacts-check linear-check fmt-check vet go-blob-check erb-check py-test staticcheck lint coverage-check ## Run artifact, formatting, vet, blob, template, Python, analysis, and race-test-with-coverage checks
+check: artifacts-check linear-check fmt-check go-blob-check ## Run artifact, formatting, blob, vet, analysis, template, Python, and race-test-with-coverage checks
+	@MAKE='$(MAKE)' CHECK_LANES='$(CHECK_LANES)' sh scripts/_check_lanes.sh
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
 ##@ Security

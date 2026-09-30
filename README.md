@@ -184,7 +184,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 
 ### CI gating
 
-CI runs `make check` on every push. The composite target gates `vet`, `staticcheck`, `lint`, `test`, and `coverage-check` in that order, stopping at the first failure. `COVERAGE_THRESHOLD` is `80`.
+CI runs `make check` on every push. The composite target runs its slow gates in three lanes at once. The first runs the race tests with `coverage-check`, the second runs `vet`, `staticcheck`, and `lint`, and the third runs `erb-check` and `py-test`. The target fails when any lane fails. `COVERAGE_THRESHOLD` is `80`.
 
 Go sources live under `src/pve_cpi/`. Direct `go test` and `go build` invocations must run from there; the `make` targets re-root automatically.
 
