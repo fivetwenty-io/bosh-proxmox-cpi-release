@@ -188,17 +188,20 @@ func observeLockPoolMutation(ctx context.Context, pools pve.PoolService, call Ma
 		}
 		return nil
 	}
+	if call.Method == "CreatePool" {
+		// PVE accepted the create, and that acceptance is the observation. A
+		// read here could not change the answer, because a sentinel that holds
+		// our claim, holds another one, or is already gone all mean the create
+		// happened, and a stealer that displaced us afterwards leaves nothing
+		// of ours behind. So no read is made, and a read that happens to fail
+		// cannot turn an accepted create into an uncertain one. The acquire's
+		// own confirming reads decide whether we hold the lock, and they retry
+		// a failed read on the lock's poll cadence.
+		return nil
+	}
 	comment, found, err := pools.GetPoolComment(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("cannot verify %s lock mutation", label)
-	}
-	if call.Method == "CreatePool" {
-		// PVE accepted the create, so it happened. A readback that finds our
-		// claim confirms it. One that finds the sentinel gone, or holding
-		// another claim, means a stealer displaced us after the create, which
-		// is contention and not uncertainty: nothing of ours remains, and the
-		// lock code's own verification decides whether we hold the lock.
-		return nil
 	}
 	if !found {
 		return nil

@@ -751,10 +751,10 @@ func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
 }
 
 // failConfirmingReads makes the parker lock's confirming reads fail until the
-// acquire gives up, while the reads around them answer. The guard's readback
-// of the create is the first read after it and answers, so the create step is
-// observed. After that, a read answers only when its context carries a
-// deadline. In this flow the reads on the lock code's way out are the only
+// acquire gives up, while the reads around them answer. The guard observes an
+// accepted create without reading it back, so every read after the create
+// until the way out is a confirming read. A read answers only when its
+// context carries a deadline. In this flow the reads on the lock code's way out are the only
 // bounded ones, because they run on its own detached context with a timeout,
 // while the request context under test has no deadline and the managed wait
 // rides a context value rather than a deadline. So the way out can prove the
@@ -769,9 +769,6 @@ func failConfirmingReads(locks *lockContention) {
 			return nil
 		}
 		createdReads++
-		if createdReads == 1 {
-			return nil
-		}
 		if _, bounded := ctx.Deadline(); bounded {
 			return nil
 		}
@@ -969,10 +966,9 @@ func TestManagedAttachCancelledInsideTheWindowReturnsTheAllocation(t *testing.T)
 			return nil
 		}
 		reads++
-		// The guard's readback of the create comes first, then the two
-		// confirming reads. The second of those is the last read before the
-		// window opens.
-		if reads == 3 {
+		// The two confirming reads come right after the create, and the
+		// second of them is the last read before the window opens.
+		if reads == 2 {
 			cancel()
 		}
 		return nil
@@ -1004,4 +1000,40 @@ func TestManagedAttachCancelledAfterAnAdmittedMoveStaysUncertain(t *testing.T) {
 	if record := disk.record(t); record.State != aj.ReconciliationRequired {
 		t.Fatalf("allocation state = %s, want %s", record.State, aj.ReconciliationRequired)
 	}
+}
+
+// TestManagedAttachLockCreateReadFailureStaysClean covers a read of the parker
+// sentinel that fails right after PVE accepted our create. That read used to
+// be the guard's readback, which poisoned the allocation with "cannot verify
+// lifecycle lock mutation" although the create had happened. The acquire's
+// own confirming read now makes it, retries on the lock's poll cadence, and
+// takes the lock once a read answers, so the attach completes and the record
+// stays clean. The poll is cut to a millisecond so the retry costs no real
+// wait.
+func TestManagedAttachLockCreateReadFailureStaysClean(t *testing.T) {
+	defer pve.SetClusterLockPollForTest(time.Millisecond)()
+	locks := newLockContention(t)
+	disk := newParkedFlowDisk(t, locks)
+	locks.reset()
+	failed := -1
+	locks.afterCreate = func(string) {
+		if failed < 0 {
+			failed = 0
+		}
+	}
+	locks.plainRead = func(context.Context, string) error {
+		if failed != 0 {
+			return nil
+		}
+		failed = 1
+		return errors.New("connection reset by peer")
+	}
+
+	if err := disk.attach(t.Context()); err != nil {
+		t.Fatalf("a failed read after an accepted create failed the attach: %v", err)
+	}
+	if failed != 1 {
+		t.Fatal("the read after the create never failed, so the test proves nothing")
+	}
+	assertReturnedRecord(t, "attached", disk.record(t))
 }

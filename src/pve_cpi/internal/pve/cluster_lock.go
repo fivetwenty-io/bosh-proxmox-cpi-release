@@ -106,6 +106,26 @@ func SetClusterLockGraceForTest(d time.Duration) func() {
 	return func() { clusterLockGraceNs.Store(prev) }
 }
 
+// clusterLockPollNs holds the poll interval acquires wait on. Tests shorten it
+// through SetClusterLockPollForTest.
+var clusterLockPollNs atomic.Int64
+
+func init() { clusterLockPollNs.Store(int64(clusterLockPollInterval)) }
+
+// clusterLockPoll returns the current poll interval.
+func clusterLockPoll() time.Duration { return time.Duration(clusterLockPollNs.Load()) }
+
+// SetClusterLockPollForTest replaces the poll interval for a test and returns a
+// function that restores it. Production code leaves the poll at
+// clusterLockPollInterval. A test that changes it must not run in parallel with
+// tests that take a lock.
+//
+//	defer pve.SetClusterLockPollForTest(time.Millisecond)()
+func SetClusterLockPollForTest(d time.Duration) func() {
+	prev := clusterLockPollNs.Swap(int64(d))
+	return func() { clusterLockPollNs.Store(prev) }
+}
+
 // ClusterLockOption adjusts one acquire.
 type ClusterLockOption func(*clusterLockSettings)
 
@@ -360,7 +380,8 @@ func clusterLockDeadline(ctx context.Context, now time.Time, timeout time.Durati
 // which is the poll interval plus jitter, cut short so it never runs past
 // deadline.
 func clusterLockPollWait(now, deadline time.Time) time.Duration {
-	wait := clusterLockPollInterval + time.Duration(jitterInt64N(int64(clusterLockPollInterval)))
+	poll := clusterLockPoll()
+	wait := poll + time.Duration(jitterInt64N(int64(poll)))
 	if remaining := deadline.Sub(now); wait > remaining {
 		wait = remaining
 	}
