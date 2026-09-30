@@ -541,7 +541,7 @@ func (g *managedDiskLifecycleGuard) observeResult(ctx context.Context, call Mana
 	key := call.Service + "." + call.Method
 	switch {
 	case call.Service == managedDiskServicePool:
-		return g.observePool(ctx, call)
+		return g.observePool(ctx, call, result)
 	case call.Service == managedDiskServiceStorage:
 		return g.observeStorage(ctx, call, observation)
 	case key == "Nodes.CreateQemuMigrate":
@@ -552,22 +552,11 @@ func (g *managedDiskLifecycleGuard) observeResult(ctx context.Context, call Mana
 		return g.observeConfigResult(ctx, call, observation, result)
 	}
 }
-func (g *managedDiskLifecycleGuard) observePool(ctx context.Context, call ManagedAllocationMutation) ([]string, error) {
-	m := g.lifecycle
+func (g *managedDiskLifecycleGuard) observePool(ctx context.Context, call ManagedAllocationMutation, result any) ([]string, error) {
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
-	pool, _ := call.Args["poolID"].(string)
-	comment, found, err := m.deps.PVE.Pools().GetPoolComment(ctx, pool)
-	if err != nil {
-		return nil, fmt.Errorf("cannot verify lifecycle lock mutation")
-	}
-	if call.Method == "CreatePool" {
-		want, _ := call.Args["comment"].(string)
-		if !found || comment != want {
-			return nil, fmt.Errorf("lifecycle lock readback mismatch")
-		}
-	} else if found {
-		return nil, fmt.Errorf("lifecycle lock deletion not observed")
+	if err := observeLockPoolMutation(ctx, g.lifecycle.deps.PVE.Pools(), call, result, "lifecycle"); err != nil {
+		return nil, err
 	}
 
 	return volumes, nil

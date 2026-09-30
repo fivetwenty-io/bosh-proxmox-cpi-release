@@ -84,6 +84,7 @@ func TestManagedEnsurePoolExistsMutationBoundary(t *testing.T) {
 		{name: "existing operator pool", found: true, want: []string{"read"}},
 		{name: "missing pool", want: []string{"read", "intent", "create", "observe", "read"}},
 		{name: "concurrent existing pool", createErr: sdkerrors.ParseAPIError(500, []byte(`{"message":"pool 'bosh-director' already exists\n"}`)), want: []string{"read", "intent", "create", "read", "observe", "read"}},
+		{name: "concurrent existing pool, live verdict", createErr: fmt.Errorf("API request failed: %w", sdkerrors.ParseAPIError(500, []byte(`{"data":null,"message":"create pool failed: pool 'bosh-director' already exists\n"}`))), want: []string{"read", "intent", "create", "read", "observe", "read"}},
 		{name: "uncertain create despite pool appearing", createErr: errors.New("connection lost"), failed: true, want: []string{"read", "intent", "create", "failed"}},
 		{name: "untyped duplicate is uncertain", createErr: errors.New("pool 'bosh-director' already exists"), failed: true, want: []string{"read", "intent", "create", "failed"}},
 		{name: "unrelated duplicate", createErr: sdkerrors.ParseAPIError(500, []byte(`{"message":"pool 'other' already exists"}`)), failed: true, want: []string{"read", "intent", "create", "failed"}},
@@ -162,6 +163,9 @@ func TestExactPoolAlreadyExistsRejectsAmbiguity(t *testing.T) {
 		`{"message":"pool 'bosh-director' already exists","errors":{"other":"bad"}}`,
 		`{"message":"pool 'bosh-director' already exists after unknown failure"}`,
 		`{"message":"pool 'bosh-director' already exists\n\n"}`,
+		`{"message":"update pools failed: pool 'bosh-director' already exists"}`,
+		`{"message":"create pool failed: pool 'bosh-director' already exists after unknown failure"}`,
+		`{"message":"create pool failed:pool 'bosh-director' already exists"}`,
 	} {
 		if exactPoolAlreadyExists(sdkerrors.ParseAPIError(500, []byte(body)), ensureTestPool) {
 			t.Fatalf("accepted %s", body)
@@ -174,5 +178,16 @@ func TestExactPoolAlreadyExistsRejectsAmbiguity(t *testing.T) {
 	exact := sdkerrors.ParseAPIError(500, []byte(`{"message":"pool 'bosh-director' already exists"}`))
 	if !exactPoolAlreadyExists(fmt.Errorf("create pool: %w", exact), ensureTestPool) {
 		t.Fatal("wrapped exact API error rejected")
+	}
+	live := sdkerrors.ParseAPIError(500, []byte(`{"data":null,"message":"create pool failed: pool 'bosh-director' already exists\n"}`))
+	if !exactPoolAlreadyExists(fmt.Errorf("API request failed: %w", live), ensureTestPool) {
+		t.Fatal("live lock_user_config verdict rejected")
+	}
+	if exactPoolDoesNotExist(live, ensureTestPool) {
+		t.Fatal("duplicate verdict read as a missing pool")
+	}
+	missing := sdkerrors.ParseAPIError(500, []byte(`{"data":null,"message":"delete pool failed: pool 'bosh-director' does not exist\n"}`))
+	if !exactPoolDoesNotExist(missing, ensureTestPool) || exactPoolDoesNotExist(missing, "bosh-other") {
+		t.Fatal("missing-pool verdict misclassified")
 	}
 }

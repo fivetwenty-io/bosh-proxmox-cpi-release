@@ -127,6 +127,9 @@ func (m *managedVMAllocation) observePolicyMutation(ctx context.Context, call Ma
 
 func (m *managedVMAllocation) observePoolMutation(ctx context.Context, call ManagedAllocationMutation, result any) error {
 	pool, _ := call.Args["poolID"].(string)
+	if isManagedLockPool(pool) && (call.Method == "CreatePool" || call.Method == "DeletePool") {
+		return observeLockPoolMutation(ctx, m.deps.PVE.Pools(), call, result, "VM")
+	}
 	if call.Method == "CreatePool" {
 		comment, found, err := m.deps.PVE.Pools().GetPoolComment(ctx, pool)
 		if err != nil {

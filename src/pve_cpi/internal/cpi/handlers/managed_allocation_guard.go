@@ -32,6 +32,8 @@ type ManagedAllocationHooks struct {
 	Before func(context.Context, ManagedAllocationMutation) (string, error)
 	// After must await asynchronous tasks and prove the mutation by readback before
 	// marking it observed. Use the original client, not the decorated write path.
+	// A refusal that PVE made before changing anything reaches After too, with
+	// the refusal proof as its result (see settleRefused).
 	After func(context.Context, ManagedAllocationMutation, string, any) error
 	// Failed persists uncertainty after either a service or After failure.
 	Failed func(context.Context, ManagedAllocationMutation, string, error) error
@@ -129,6 +131,18 @@ func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocation
 		return g.poisoned
 	}
 	return nil
+}
+
+// settleRefused closes the intent of a mutation that PVE provably refused
+// before changing anything. After receives the refusal proof as its result and
+// settles the planned step, and the refusal goes back to the caller unchanged
+// so that it can still classify it. If After cannot settle the step, the
+// refusal is treated like any other failure.
+func (g *ManagedAllocationGuard) settleRefused(ctx context.Context, m ManagedAllocationMutation, token string, proof any, refusal error) error {
+	if err := g.hooks.After(ctx, m, token, proof); err != nil {
+		return g.finish(ctx, m, token, nil, refusal)
+	}
+	return refusal
 }
 
 type managedAllocationClient struct {
