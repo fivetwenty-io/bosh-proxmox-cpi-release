@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
 // stealWho names the acquirer a pool call belongs to.
@@ -596,5 +598,298 @@ func TestConfirm_UnknownStateDoesNotRunTheWindow(t *testing.T) {
 	}
 	if !errors.Is(err, ErrClusterLockStateUnknown) {
 		t.Fatalf("want ErrClusterLockStateUnknown, got %v", err)
+	}
+}
+
+// lostAnswerCreate makes the create calls that answer says to fail land in the
+// store anyway, the way PVE applies a create whose answer the connection lost.
+func lostAnswerCreate(f *fakeLockPools, lost func(create int) bool) {
+	creates := 0
+	f.createFn = func(id, comment string) error {
+		creates++
+		if !lost(creates) {
+			return nil
+		}
+		f.pools[id] = comment
+		return errors.New("read tcp 10.0.0.1:52144->10.0.0.2:8006: read: connection reset by peer")
+	}
+}
+
+// TestAcquireClusterLock_CreateWithUnknownOutcomeAbandonsItsClaim covers a
+// create that PVE applied but whose answer never arrived. The acquire cannot
+// tell whether it holds the lock, so it fails with the unknown state. On its
+// way out it reads the sentinel, finds its own claim, and deletes it, so the
+// claim does not block every other acquirer for a whole TTL.
+func TestAcquireClusterLock_CreateWithUnknownOutcomeAbandonsItsClaim(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	lostAnswerCreate(f, func(int) bool { return true })
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := acquireClusterLockWithClock(context.Background(), f, "vm-4242", "set_vm_metadata/4242@me", 25*time.Minute, 10*time.Second, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want no handle and a retriable unknown state, got handle=%v err=%v", h != nil, err)
+	}
+	if !strings.Contains(err.Error(), `create sentinel pool "bosh-lock-vm-4242" has an unknown outcome`) {
+		t.Fatalf("the error does not say the create's outcome is unknown: %v", err)
+	}
+	want := []string{"create:bosh-lock-vm-4242", "get:bosh-lock-vm-4242", "delete:bosh-lock-vm-4242"}
+	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls = %v, want %v", f.calls, want)
+	}
+	if left, stands := f.pools["bosh-lock-vm-4242"]; stands {
+		t.Fatalf("our own claim %q was left standing with no handle", left)
+	}
+}
+
+// TestAcquireClusterLock_NextAcquirerTakesTheLockAfterAnUnknownCreate covers
+// the request after such a create. The first acquire removed its own claim on
+// the way out, so the next acquirer on the same key takes the lock with one
+// create instead of waiting on a claim that nobody holds.
+func TestAcquireClusterLock_NextAcquirerTakesTheLockAfterAnUnknownCreate(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	lostAnswerCreate(f, func(create int) bool { return create == 1 })
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	if _, err := acquireClusterLockWithClock(context.Background(), f, "vm-4242", "a", 25*time.Minute, 10*time.Second, clk); err == nil {
+		t.Fatal("the create with a lost answer took the lock")
+	}
+	creates := f.createN
+	h, err := acquireClusterLockWithClock(context.Background(), f, "vm-4242", "b", 25*time.Minute, 10*time.Second, clk)
+	if err != nil || h == nil {
+		t.Fatalf("the next acquirer could not take the lock: %v", err)
+	}
+	if got := f.createN - creates; got != 1 {
+		t.Fatalf("the next acquirer made %d creates, want 1", got)
+	}
+	if !strings.Contains(f.pools["bosh-lock-vm-4242"], "owner=b ") {
+		t.Fatalf("the sentinel holds %q, want the next acquirer's claim", f.pools["bosh-lock-vm-4242"])
+	}
+}
+
+// TestAcquireClusterLock_StealRecreateWithUnknownOutcomeAbandonsItsClaim
+// covers the create that takes over an expired lock. The steal deleted the
+// expired claim, and PVE applied the recreate, but its answer never arrived.
+// The acquire fails with the unknown state and deletes the claim it proves its
+// own, rather than leave it standing with no handle.
+func TestAcquireClusterLock_StealRecreateWithUnknownOutcomeAbandonsItsClaim(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.pools["bosh-lock-vm-90000"] = encodeLockComment("holder-a", time.Unix(500, 0))
+	lostAnswerCreate(f, func(create int) bool { return create == 2 })
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := acquireClusterLockWithClock(context.Background(), f, "vm-90000", "me", 180*time.Second, 10*time.Second, clk)
+	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want no handle and a retriable unknown state, got handle=%v err=%v", h != nil, err)
+	}
+	if !strings.Contains(err.Error(), `steal-recreate lock "bosh-lock-vm-90000" has an unknown outcome`) {
+		t.Fatalf("the error does not say the recreate's outcome is unknown: %v", err)
+	}
+	if f.deleteN != 2 {
+		t.Fatalf("want the steal's delete and the abandon's delete, got %d deletes; calls=%v", f.deleteN, f.calls)
+	}
+	if left, stands := f.pools["bosh-lock-vm-90000"]; stands {
+		t.Fatalf("our recreated claim %q was left standing with no handle", left)
+	}
+}
+
+// TestAcquireClusterLock_ReadbackThatMissesOurCreateStillTakesTheLock covers a
+// read after our own create that reports the sentinel missing, as a lagging
+// or proxied read can. The acquire's next read finds a live claim carrying its
+// own owner token, which only this acquisition writes, so it confirms that
+// claim and takes the lock with the one create it already made, with or
+// without the grace, rather than wait on itself until it times out.
+func TestAcquireClusterLock_ReadbackThatMissesOurCreateStillTakesTheLock(t *testing.T) {
+	t.Parallel()
+	for name, opts := range map[string][]ClusterLockOption{
+		"without the grace": nil,
+		"with the grace":    {WithCreateGrace()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeLockPools()
+			f.getFn = func(string) (string, bool, error, bool) {
+				if f.getN == 1 {
+					return "", false, nil, true
+				}
+				return "", false, nil, false
+			}
+			owner := "set_vm_metadata/4242@host/99-abc-1"
+			clk := fixedClock(time.Unix(1000, 0), time.Second)
+			h, err := acquireClusterLockWithClock(context.Background(), f, "vm-4242", owner, 25*time.Minute, 10*time.Second, clk, opts...)
+			if err != nil || h == nil {
+				t.Fatalf("the acquire did not take its own lock: %v; calls=%v", err, f.calls)
+			}
+			if f.createN != 1 || f.deleteN != 0 {
+				t.Fatalf("want one create and no delete, got creates=%d deletes=%d; calls=%v", f.createN, f.deleteN, f.calls)
+			}
+			if !strings.Contains(h.claim, "owner="+owner+" ") {
+				t.Fatalf("the handle carries claim %q, want our own", h.claim)
+			}
+		})
+	}
+}
+
+// TestAcquireClusterLock_OwnClaimNearItsExpiryIsNotReconfirmed covers a live
+// claim carrying our owner token that is within the release margin of its
+// expiry. Release would not delete such a claim, because a steal may land
+// first, so the acquire waits on it like any other holder's claim instead of
+// taking the lock on it.
+func TestAcquireClusterLock_OwnClaimNearItsExpiryIsNotReconfirmed(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	now := time.Unix(1000, 0)
+	f.pools["bosh-lock-web"] = encodeLockComment("me", now.Add(time.Second))
+	h, err := tryStealExpired(context.Background(), f, "bosh-lock-web", "me", time.Minute, now.Add(30*time.Second), clusterLockSettings{}, fixedClock(now, time.Second))
+	if h != nil || err != nil {
+		t.Fatalf("want a wait on the claim, got handle=%v err=%v", h != nil, err)
+	}
+	if f.getN != 1 || f.createN != 0 || f.deleteN != 0 {
+		t.Fatalf("want the one holder read and nothing else, got calls=%v", f.calls)
+	}
+}
+
+// TestAcquireClusterLock_DeniedCreateIsMarkedRefused covers a create that PVE
+// refused with a 403, as it does for an identity without Pool.Allocate. PVE
+// checks permissions before it changes anything, so the refusal proves no
+// sentinel was created. The error is retriable and carries
+// ErrClusterLockCreateRefused, and the acquire reads and deletes nothing.
+func TestAcquireClusterLock_DeniedCreateIsMarkedRefused(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.createFn = func(string, string) error {
+		return sdkerrors.ParseAPIError(403, []byte(`{"data":null,"message":"Permission check failed (/pool/bosh-lock-web, Pool.Allocate)\n"}`))
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 30*time.Second, fixedClock(time.Unix(1000, 0), time.Second))
+	if h != nil || !errors.Is(err, ErrClusterLockCreateRefused) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want no handle and a retriable refused create, got handle=%v err=%v", h != nil, err)
+	}
+	if errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("a refused create says who holds the lock, but the error says the state is unknown: %v", err)
+	}
+	if f.getN != 0 || f.deleteN != 0 {
+		t.Fatalf("a refused create was read back or deleted: calls=%v", f.calls)
+	}
+}
+
+// TestAcquireClusterLock_NotAttemptedCreateIsNotAbandoned covers a create the
+// client refused before it reached PVE, as a poisoned allocation guard does.
+// Nothing reached PVE, so the acquire reads and deletes nothing, and the error
+// still matches ErrMutationNotAttempted.
+func TestAcquireClusterLock_NotAttemptedCreateIsNotAbandoned(t *testing.T) {
+	t.Parallel()
+	f := newFakeLockPools()
+	f.createFn = func(string, string) error {
+		return fmt.Errorf("allocation guard refused the write: %w", ErrMutationNotAttempted)
+	}
+	h, err := acquireClusterLockWithClock(context.Background(), f, "web", "me", time.Minute, 30*time.Second, fixedClock(time.Unix(1000, 0), time.Second))
+	if h != nil || !errors.Is(err, ErrMutationNotAttempted) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("want no handle and a retriable refusal, got handle=%v err=%v", h != nil, err)
+	}
+	if f.getN != 0 || f.deleteN != 0 {
+		t.Fatalf("a create that never reached PVE was read back or deleted: calls=%v", f.calls)
+	}
+}
+
+// hungFirstReadPools holds the first sentinel read until its context ends, the
+// way a PVE that stopped answering holds it, and answers every later read from
+// the store.
+type hungFirstReadPools struct {
+	*fakeLockPools
+	reads atomic.Int32
+}
+
+func (p *hungFirstReadPools) GetPoolComment(ctx context.Context, id string) (string, bool, error) {
+	if p.reads.Add(1) == 1 {
+		<-ctx.Done()
+		return "", false, ctx.Err()
+	}
+	return p.fakeLockPools.GetPoolComment(ctx, id)
+}
+
+// TestAcquireClusterLock_HungConfirmingReadEndsInsideTheMargin covers a read
+// that confirms our create and never answers, under a request deadline. The
+// request leaves the lock's margin plus a quarter second, so the acquire's
+// deadline is a quarter second away, and the read ends there instead of at the
+// request's own deadline. The acquire then gives up before the request's
+// deadline less the caller's completion allowance, and the read on its way out
+// proves the sentinel ours and deletes it.
+func TestAcquireClusterLock_HungConfirmingReadEndsInsideTheMargin(t *testing.T) {
+	t.Parallel()
+	pools := &hungFirstReadPools{fakeLockPools: newFakeLockPools()}
+	requestDeadline := time.Now().Add(clusterLockContextMargin + 250*time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), requestDeadline)
+	defer cancel()
+	h, err := AcquireClusterLock(ctx, pools, "vm-4242", "set_vm_metadata/4242@me", 25*time.Minute, 30*time.Second)
+	returned := time.Now()
+	if h != nil || !errors.Is(err, ErrClusterLockStateUnknown) {
+		t.Fatalf("want no handle and the unknown state, got handle=%v err=%v", h != nil, err)
+	}
+	if limit := requestDeadline.Add(-ClusterLockCompletionAllowance); !returned.Before(limit) {
+		t.Fatalf("the acquire returned %v past the point that leaves its caller the completion allowance", returned.Sub(limit))
+	}
+	if pools.deleteN != 1 {
+		t.Fatalf("want one delete of our proven sentinel, got %d; calls=%v", pools.deleteN, pools.calls)
+	}
+	if left, stands := pools.pools["bosh-lock-vm-4242"]; stands {
+		t.Fatalf("our proven sentinel %q was left standing", left)
+	}
+}
+
+// TestLockReadDeadline pins when a sentinel read ends. It is the later of the
+// acquire's deadline and clusterLockReadTimeout from the read's start, capped
+// at the request's deadline less clusterLockContextMargin when the request has
+// one.
+func TestLockReadDeadline(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(10_000, 0)
+	requestCtx := func(t *testing.T, d time.Duration) context.Context {
+		t.Helper()
+		ctx, cancel := context.WithDeadline(context.Background(), now.Add(d))
+		t.Cleanup(cancel)
+		return ctx
+	}
+	clampedCtx := func(t *testing.T) (context.Context, time.Time) {
+		t.Helper()
+		ctx := requestCtx(t, 20*time.Second)
+		deadline, clamped := clusterLockDeadline(ctx, now, 30*time.Second)
+		if !clamped {
+			t.Fatal("a 20-second request did not clamp a 30-second wait")
+		}
+		return ctx, deadline
+	}
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (ctx context.Context, start, deadline, want time.Time)
+	}{
+		{"no request deadline and a long wait", func(*testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			return context.Background(), now, now.Add(time.Minute), now.Add(time.Minute)
+		}},
+		{"no request deadline and a short wait", func(*testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			return context.Background(), now, now.Add(2 * time.Second), now.Add(clusterLockReadTimeout)
+		}},
+		{"a far request deadline", func(t *testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			return requestCtx(t, time.Hour), now, now.Add(2 * time.Second), now.Add(clusterLockReadTimeout)
+		}},
+		{"a clamped deadline", func(t *testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			ctx, deadline := clampedCtx(t)
+			return ctx, now, deadline, deadline
+		}},
+		{"a read that starts past the acquire's deadline", func(*testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			start := now.Add(3 * time.Second)
+			return context.Background(), start, now, start.Add(clusterLockReadTimeout)
+		}},
+		{"a read that starts past a clamped deadline", func(t *testing.T) (context.Context, time.Time, time.Time, time.Time) {
+			ctx, deadline := clampedCtx(t)
+			return ctx, deadline.Add(2 * time.Second), deadline, deadline
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, start, deadline, want := tc.setup(t)
+			if got := lockReadDeadline(ctx, start, deadline); !got.Equal(want) {
+				t.Fatalf("lockReadDeadline = %v after the start, want %v", got.Sub(start), want.Sub(start))
+			}
+		})
 	}
 }

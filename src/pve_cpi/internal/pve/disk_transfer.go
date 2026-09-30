@@ -948,23 +948,34 @@ var ErrMutationNotAttempted = errors.New("mutation not attempted")
 
 // ProtectionWriteRefused reports whether err is PVE's own answer refusing a
 // protection write, which means the write did not apply and its outcome is
-// known. That is an API error carrying an HTTP status, except 596, which
-// pveproxy sends when it could not reach pvedaemon, and 502 through 504, which
-// a proxy in front of PVE sends. It is false for a transport fault, a timeout,
-// and a cancelled or expired context, where the write may have landed.
+// known. pveAnswered says which errors are PVE's own answer.
 func ProtectionWriteRefused(err error) bool {
+	_, answered := pveAnswered(err)
+	return answered
+}
+
+// pveAnswered reports whether err is PVE's own answer refusing a request, and
+// returns its HTTP status when it is. That is an API error carrying a 4xx or
+// 5xx status, except 596, which pveproxy sends when it could not reach
+// pvedaemon, and 502 through 504, which a proxy in front of PVE sends. It is
+// false for a transport fault, a timeout, and a cancelled or expired context,
+// where the request may have been applied.
+func pveAnswered(err error) (int, bool) {
 	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false
+		return 0, false
 	}
 	code, ok := apiHTTPCode(err)
 	if !ok {
-		return false
+		return 0, false
 	}
 	switch code {
 	case 502, 503, 504, 596:
-		return false
+		return 0, false
 	}
-	return code >= 400 && code < 600
+	if code < 400 || code >= 600 {
+		return 0, false
+	}
+	return code, true
 }
 
 // ProtectionRestoreCutOffError is the error a protection restore returns when

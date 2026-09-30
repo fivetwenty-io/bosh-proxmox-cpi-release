@@ -197,8 +197,10 @@ func TestEnsureAntiAffinity_LockPool_AcquireFailsRetriableNoRMW(t *testing.T) {
 	pools := newAALockPools(&events)
 	// A non-duplicate create failure (transport/pmxcfs fault) is classified
 	// retriable immediately, so the acquire never enters its poll loop — the test
-	// stays deterministic with no real sleep. The held-live → wait → timeout path
-	// is covered against a fake clock in the internal/pve cluster-lock tests.
+	// stays deterministic with no real sleep. It reads the sentinel once on its
+	// way out, because the create may have landed, and finds nothing to delete.
+	// The held-live → wait → timeout path is covered against a fake clock in the
+	// internal/pve cluster-lock tests.
 	pools.createErr = func(_ string) error { return fmt.Errorf("pmxcfs unavailable") }
 
 	cfg := aaLockConfig("pool", false, 1)

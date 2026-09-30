@@ -2103,13 +2103,16 @@ const parkerDemotedSweepTimeout = 45 * time.Second
 // cluster-wide. Nothing here ever holds a second lock, so there is no ordering
 // to deadlock on.
 //
-// An acquire failure the CPI causes is not fatal: the mechanism is advisory, the
-// uncontended path is correct without it, and refusing to unpark a disk because
-// the CPI cannot create a sentinel pool would be a worse trade than the race it
-// prevents. A missing pool service, a denied grant, and a transport fault all
-// proceed unlocked and say so. A timeout is the one exception and is returned
-// retriably: reaching the deadline means a live holder was inside the window the
-// whole time, which is exactly the interleaving this lock exists to prevent.
+// Two cases proceed unlocked and say so. One is a missing pool service, and the
+// other is a lock create that PVE refused outright, such as for an identity
+// without Pool.Allocate. The mechanism is advisory, the uncontended path is
+// correct without it, and refusing to unpark a disk because the CPI cannot
+// create a sentinel pool would be a worse trade than the race it prevents.
+// Every other acquire failure is returned retriably. Reaching the deadline
+// means a live holder was inside the window the whole time, which is exactly
+// the interleaving this lock exists to prevent, and a failure that leaves the
+// holder unknown, a create whose answer was lost included, may be that same
+// interleaving.
 func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger, parkerVMID int, purpose string, fn func(context.Context) error) error {
 	var pools PoolService
 	if c != nil {
@@ -2129,8 +2132,10 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	handle, lockErr := AcquireClusterLock(ctx, pools,
 		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
 	if lockErr != nil {
-		if errors.Is(lockErr, ErrClusterLockTimeout) || errors.Is(lockErr, ErrClusterLockStateUnknown) ||
-			errors.Is(lockErr, ErrClusterLockInterrupted) || errors.Is(lockErr, ErrMutationNotAttempted) {
+		if !errors.Is(lockErr, ErrClusterLockCreateRefused) {
+			// Only a create that PVE refused outright shows that the lock is
+			// unavailable to us, so every other failure is returned.
+			//
 			// A timeout is not "the lock is unavailable to me", it is "somebody
 			// else is inside the window right now": an expired or unreadable
 			// holder is stolen rather than waited on, so the only way to reach
@@ -2139,10 +2144,13 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			// to prevent, and it would do so precisely when contention is
 			// highest. Hand it back retriable and let the Director re-drive.
 			//
-			// An acquire that created its sentinel but could never read it
-			// back is the same case. That sentinel may be ours and may still
-			// stand, and another request may already be waiting on it, so
-			// running the window unserialized could overlap a holder.
+			// An acquire that cannot tell who holds the lock is the same case.
+			// Its create may have landed without an answer, or it could never
+			// read its sentinel back, or PVE said the sentinel exists and the
+			// reads or the steal that would judge its holder failed. That
+			// sentinel may be ours or a live holder's, and another request may
+			// already be waiting on it, so running the window unserialized
+			// could overlap a holder.
 			//
 			// A wait cut short by a cancelled request is the same case too. The
 			// request has ended, so there is no window left to run.
@@ -2153,13 +2161,13 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			// every write inside the window anyway, so the window does not run.
 			return lockErr
 		}
-		// Every other acquire failure means the mechanism is unavailable, not
-		// that somebody holds it: no pool service, a denied CreatePool, a
-		// transport fault. Proceed unserialized rather than fail. An identity
-		// without Pool.Allocate on bosh-lock-* would otherwise never complete an
-		// attach_disk or delete_disk for a parked disk, and running unlocked is
-		// what every release before this one did. Matches the nil-pool branch
-		// above and stampDeletingTag's fallback.
+		// PVE refused the create with a 4xx, which proves no sentinel was
+		// created and means the mechanism is unavailable to this identity, not
+		// that somebody holds it. Proceed unserialized rather than fail. An
+		// identity without Pool.Allocate on bosh-lock-* would otherwise never
+		// complete an attach_disk or delete_disk for a parked disk, and running
+		// unlocked is what every release before this lock did. Matches the
+		// nil-pool branch above and stampDeletingTag's fallback.
 		if logger != nil {
 			logger.Warn("parker: could not acquire the protection-window lock; running the window unserialized",
 				log.Int("parker_vmid", parkerVMID),

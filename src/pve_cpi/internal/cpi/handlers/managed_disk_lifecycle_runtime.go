@@ -243,13 +243,16 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // is a mutation the guard refused on an ended request before it reached PVE.
 // Neither changed anything, so the same conditions decide.
 //
-// pve.ErrClusterLockStateUnknown counts the same way. The acquire created its
-// sentinel but no read of it answered before the deadline, so it never entered
-// the window either. When the read on its way out proved the sentinel ours and
-// the guarded delete answered, both steps are observed and the record is
-// returned like any clean timeout. When that delete did not answer, its step
-// stays planned and the guard is poisoned, so the other conditions send the
-// record to reconciliation, and the next call's readback settles the step.
+// pve.ErrClusterLockStateUnknown counts the same way. The acquire could not
+// tell who holds the lock, because no read of its new sentinel answered before
+// the deadline, its create ended without an answer, or PVE said the sentinel
+// exists and a read or steal that would judge its holder failed. In each case
+// it never entered the window either. When the read on its way out proved the
+// sentinel ours and the guarded delete answered, both steps are observed and
+// the record is returned like any clean timeout. When that delete did not
+// answer, its step stays planned and the guard is poisoned, so the other
+// conditions send the record to reconciliation, and the next call's readback
+// settles the step.
 func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	if operationErr == nil {
 		return false

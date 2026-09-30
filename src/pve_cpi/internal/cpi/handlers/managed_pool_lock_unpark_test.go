@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -822,26 +823,40 @@ func TestCreateVMLegacyAttachReturnsTheDiskOnATimeout(t *testing.T) {
 // failConfirmingReads makes the parker lock's confirming reads fail until the
 // acquire gives up, while the reads around them answer. The guard observes an
 // accepted create without reading it back, so every read after the create
-// until the way out is a confirming read. A read answers only when its
-// context carries a deadline. In this flow the reads on the lock code's way out are the only
-// bounded ones, because they run on its own detached context with a timeout,
-// while the request context under test has no deadline and the managed wait
-// rides a context value rather than a deadline. So the way out can prove the
-// sentinel ours and delete it. If that ever stops being true, the confirming
-// reads answer too, the acquire takes the lock, and the test fails loudly on
-// the missing unknown state rather than passing for the wrong reason.
+// until the way out is a confirming read. A read answers only when
+// readOnTheWayOut finds pve.abandonLockCreate on its stack, so the way out can
+// prove the sentinel ours and delete it. If that function is ever renamed, the
+// way out fails too, and the tests that use this fail loudly on the sentinel
+// left standing rather than passing for the wrong reason.
 func failConfirmingReads(locks *lockContention) {
 	createdReads := -1
 	locks.afterCreate = func(string) { createdReads = 0 }
-	locks.plainRead = func(ctx context.Context, _ string) error {
+	locks.plainRead = func(context.Context, string) error {
 		if createdReads < 0 {
 			return nil
 		}
 		createdReads++
-		if _, bounded := ctx.Deadline(); bounded {
+		if readOnTheWayOut() {
 			return nil
 		}
 		return errors.New("connection reset by peer")
+	}
+}
+
+// readOnTheWayOut reports whether the read in progress is the one the lock
+// code makes on its way out of an acquire it could not confirm. Every read the
+// acquire makes carries a deadline, so the stack is what tells that read apart.
+func readOnTheWayOut() bool {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		frame, more := frames.Next()
+		if strings.HasSuffix(frame.Function, "pve.abandonLockCreate") {
+			return true
+		}
+		if !more {
+			return false
+		}
 	}
 }
 

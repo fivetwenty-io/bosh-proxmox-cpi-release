@@ -154,3 +154,40 @@ func TestDescribeVMIDLockClaimFlattensForeignComments(t *testing.T) {
 		t.Fatalf("claim text is %d bytes, over the cap", len(got))
 	}
 }
+
+// missFirstReadPools reports the sentinel missing on the first read, the way a
+// lagging or proxied read can miss a pool that was just created, and answers
+// every later read from the store.
+type missFirstReadPools struct {
+	*vmidLockPools
+	reads int
+}
+
+func (p *missFirstReadPools) GetPoolComment(ctx context.Context, poolID string) (string, bool, error) {
+	p.reads++
+	if p.reads == 1 {
+		return "", false, nil
+	}
+	return p.vmidLockPools.GetPoolComment(ctx, poolID)
+}
+
+// TestWithVMIDLock_ReadbackThatMissesOurCreateStillRunsTheBody covers a VM's
+// metadata lock whose read after its own create misses the new sentinel. The
+// next read finds our own live claim, so the lock is ours, the body runs, and
+// the sentinel is released afterwards, rather than the wait running out on our
+// own claim and leaving it standing for a whole TTL.
+func TestWithVMIDLock_ReadbackThatMissesOurCreateStillRunsTheBody(t *testing.T) {
+	shortenVMIDLockWait(t, 300*time.Millisecond)
+	pools := &missFirstReadPools{vmidLockPools: newVMIDLockPools(nil)}
+	ran := false
+	err := withVMIDLock(t.Context(), pools, 4242, "set_vm_metadata/4242", nil, func() error {
+		ran = true
+		return nil
+	})
+	if err != nil || !ran {
+		t.Fatalf("the body did not run under our own lock: ran=%t err=%v", ran, err)
+	}
+	if left, stands := pools.pools["bosh-lock-vm-4242"]; stands {
+		t.Fatalf("the sentinel %q was not released after the body ran", left)
+	}
+}
