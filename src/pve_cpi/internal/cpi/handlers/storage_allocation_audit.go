@@ -73,6 +73,107 @@ type StorageAllocationAudit struct {
 	// pending holds the node mismatches that wait for the move rules, which
 	// need the storage listings and so run after correlation.
 	pending []storageAuditPendingMove
+	// claims maps each volid a VM configuration holds to what PVE says about
+	// the volume at each holder, so a listing can tell a reused name from
+	// the volume a record once carried under it.
+	claims map[string][]storageAuditClaim
+}
+
+// storageAuditClaim is what one VM's configuration says about a volume it
+// holds. PVE reuses a freed name such as vm-2353-disk-1 for the next disk a
+// VM receives, so a record's historical volids can name a volume that now
+// belongs to another allocation. The drive serial and the VM's disk
+// provenance identify the volume at its location; the name does not.
+type storageAuditClaim struct {
+	node string
+	vmid int
+	// cdrom marks a media=cdrom entry. Many VMs mount one ISO at once, so a
+	// CD-ROM never counts as a second writer of a volume.
+	cdrom bool
+	// serial is the drive's stable-ID serial, or "" when it carries none.
+	serial string
+	// allocations are the audited allocations whose disk provenance on this
+	// VM names the volume.
+	allocations []string
+}
+
+// attributes reports whether the claim decides that the volume belongs to
+// record, and whether the claim decides it at all. The serial is the disk's
+// identity, so it decides first. Provenance decides for a drive without a
+// serial. A volume with neither is undecided, and the caller falls back to
+// the record's volids, so an unattributed volume that bears a name the
+// record carried still counts as the record's.
+func (c storageAuditClaim) attributes(record aj.Record) (holds, decided bool) {
+	if c.serial != "" && record.DiskToken != "" {
+		return c.serial == record.DiskToken, true
+	}
+	if len(c.allocations) > 0 {
+		return slices.Contains(c.allocations, record.ID), true
+	}
+	return false, false
+}
+
+// storageAuditSharedReferences raises a conflict for every volume that two or
+// more VMs reference at once, because each of them can write the one disk.
+// The check reads only VM configurations and never a record, so it catches a
+// hand-edited slot or a copied serial that the attribution rules would rule
+// out as a holder of any record. A reused name never trips it, because PVE
+// reuses a name only after the volume that carried it has gone. On shared
+// storage any two referencing VMs share the volume; on node-local storage, or
+// storage the definitions do not name, only VMs on the same node do, because
+// the same volid on two nodes names two volumes. CD-ROM entries are skipped.
+func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[string]pve.StorageInfo) {
+	for volume, claims := range result.claims {
+		shared := false
+		if storage, _, err := pve.ParseDiskCID(volume); err == nil {
+			shared = stores[storage].IsShared()
+		}
+		groups := map[string]map[int]string{}
+		for _, claim := range claims {
+			if claim.cdrom {
+				continue
+			}
+			key := claim.node
+			if shared {
+				key = ""
+			}
+			if groups[key] == nil {
+				groups[key] = map[int]string{}
+			}
+			groups[key][claim.vmid] = claim.node
+		}
+		for _, holders := range groups {
+			if len(holders) < 2 {
+				continue
+			}
+			subjects := make([]string, 0, len(holders))
+			for vmid, node := range holders {
+				subjects = append(subjects, fmt.Sprintf("VM %d on %s", vmid, node))
+			}
+			sort.Strings(subjects)
+			result.addConflict(fmt.Sprintf("volume %s is referenced by more than one VM, so each can write the same disk: %s", volume, strings.Join(subjects, ", ")), fmt.Sprintf("volume %s is attached to %d VMs: %s", volume, len(holders), strings.Join(subjects, ", ")))
+		}
+	}
+}
+
+// storageAuditNameDisowned reports whether the VMs holding a listed volume
+// all attribute it to allocations other than record. Only a holder that
+// sees the same physical volume counts: any holder on shared storage, and on
+// node-local storage only a holder on the listing's own node. A volume no
+// VM holds, or one with any undecided or agreeing holder, is not disowned.
+func storageAuditNameDisowned(claims []storageAuditClaim, record aj.Record, node string, shared bool) bool {
+	disowned := false
+	for _, claim := range claims {
+		if !shared && claim.node != node {
+			continue
+		}
+		holds, decided := claim.attributes(record)
+		if !decided || holds {
+			return false
+		}
+		disowned = true
+	}
+	return disowned
 }
 
 // storageAuditVM is what the VM scan kept of one VM's configuration.
@@ -264,6 +365,7 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		return result, err
 	}
 	stores := auditStorageDefinitions(ctx, deps, records, &result)
+	storageAuditSharedReferences(&result, stores)
 	targets := storageAuditTargets(ctx, deps, nodes, historical, stores, &result)
 	if err := collectStorageAuditContent(ctx, deps, targets, stores, knownVolumes, &result); err != nil {
 		return result, err
@@ -455,26 +557,41 @@ func storageAuditVolumeTargetMatches(record aj.Record, step aj.Step, stores map[
 
 type storageAuditTarget struct{ node, storage string }
 
-func collectAuditDiskHolders(records []aj.Record, knownVolumes map[string][]aj.Record, cfg map[string]any, node string, vmid int, diskHolders map[string][]StorageAllocationEvidence) {
-	for recordIndex := range records {
-		record := records[recordIndex]
-		if record.Kind != allocationKindDisk || record.State == aj.Deleted || record.State == aj.Cleaned {
-			continue
-		}
-		for _, drive := range qemu.ParseDisks(cfg) {
-			volume := strings.Split(drive, ",")[0]
-			serial, serialFound := pve.StableIDFromDriveOptStr(drive)
-			matched := serialFound && serial == record.DiskToken
-			for knownIndex := range knownVolumes[volume] {
-				known := knownVolumes[volume][knownIndex]
-				matched = matched || known.ID == record.ID
+// collectAuditDiskHolders counts each drive of one VM as a holder of the
+// disk records it belongs to, and returns what the VM says about each volume
+// it holds. provenance maps each allocation whose disk provenance this VM
+// carries to the volid that provenance names. A drive belongs to a record
+// when its serial or, without a serial, the VM's provenance names the
+// record. Only a drive that neither identifies falls back to the record's
+// volids, because PVE reuses freed names and a historical volid alone would
+// count another allocation's disk as a second holder.
+func collectAuditDiskHolders(records []aj.Record, knownVolumes map[string][]aj.Record, cfg map[string]any, provenance map[string]string, node string, vmid int, diskHolders map[string][]StorageAllocationEvidence) map[string]storageAuditClaim {
+	named := map[string][]string{}
+	for id, volume := range provenance {
+		named[volume] = append(named[volume], id)
+	}
+	claims := map[string]storageAuditClaim{}
+	for _, drive := range qemu.ParseDisks(cfg) {
+		volume := strings.Split(drive, ",")[0]
+		serial, _ := pve.StableIDFromDriveOptStr(drive)
+		allocations := slices.Sorted(slices.Values(named[volume]))
+		claim := storageAuditClaim{node: node, vmid: vmid, cdrom: slices.Contains(strings.Split(drive, ",")[1:], "media=cdrom"), serial: serial, allocations: allocations}
+		claims[volume] = claim
+		for recordIndex := range records {
+			record := records[recordIndex]
+			if record.Kind != allocationKindDisk || record.State == aj.Deleted || record.State == aj.Cleaned {
+				continue
 			}
-			if matched {
+			holds, decided := claim.attributes(record)
+			if !decided {
+				holds = slices.ContainsFunc(knownVolumes[volume], func(known aj.Record) bool { return known.ID == record.ID })
+			}
+			if holds {
 				diskHolders[record.ID] = append(diskHolders[record.ID], StorageAllocationEvidence{AllocationID: record.ID, Kind: allocationKindDisk, Node: node, VMID: vmid, VolumeID: volume})
 			}
 		}
 	}
-
+	return claims
 }
 
 func collectAuditVMProvenance(result *StorageAllocationAudit, records []aj.Record, namespace, node string, vmid int, description string) {
@@ -596,11 +713,16 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 			markVMScanIncomplete(result, fmt.Sprintf("VM %d configuration could not be inspected on %s: PVE returned an empty configuration", guest.VMID, guest.Node))
 			continue
 		}
-		collectAuditDiskHolders(records, knownVolumes, cfg, guest.Node, guest.VMID, diskHolders)
 		description := pve.DescriptionFromConfig(cfg)
 		collectAuditVMProvenance(result, records, namespace, guest.Node, guest.VMID, description)
 		inventory := storageAuditVM{node: guest.Node, vmid: guest.VMID}
 		inventory.disks = collectAuditDiskProvenance(result, namespace, guest.Node, guest.VMID, description)
+		for volume, claim := range collectAuditDiskHolders(records, knownVolumes, cfg, inventory.disks, guest.Node, guest.VMID, diskHolders) {
+			if result.claims == nil {
+				result.claims = map[string][]storageAuditClaim{}
+			}
+			result.claims[volume] = append(result.claims[volume], claim)
+		}
 		if volumes, err := managedVMConfigVolumes(cfg); err == nil {
 			inventory.volumes = volumes
 		}
@@ -808,10 +930,46 @@ func storageAuditTargets(ctx context.Context, deps Deps, nodes []string, histori
 
 }
 
+// storageAuditKnownVolume correlates one listed volume with the records whose
+// volids name it. It returns the evidence, the issues, and the IDs of the
+// records it evidenced. A volume that every VM holding it attributes to
+// another allocation is a reused name, not the record's volume, so it is
+// neither evidence of that record nor a disagreement with its targets.
+func storageAuditKnownVolume(target storageAuditTarget, stores map[string]pve.StorageInfo, records []aj.Record, claims []storageAuditClaim, volume string) ([]StorageAllocationEvidence, []string, map[string]bool) {
+	var observations []StorageAllocationEvidence
+	var issues []string
+	seen := map[string]bool{}
+	for recordIndex := range records {
+		record := records[recordIndex]
+		if storageAuditNameDisowned(claims, record, target.node, stores[target.storage].IsShared()) {
+			continue
+		}
+		matched := false
+		var miss storageAuditMiss
+		for stepIndex := range record.Steps {
+			step := record.Steps[stepIndex]
+			match, reason := storageAuditVolumeTargetMatches(record, step, stores, target.node, volume)
+			matched = matched || match
+			if !match {
+				miss.consider(step, reason)
+			}
+		}
+		if !matched {
+			issues = append(issues, fmt.Sprintf("known volume %s on storage %q on node %q disagrees with recorded physical target: allocation %s %s", volume, target.storage, target.node, record.ID, miss.describe(record)))
+			continue
+		}
+		if !seen[record.ID] {
+			observations = append(observations, StorageAllocationEvidence{AllocationID: record.ID, Kind: record.Kind, Node: target.node, VolumeID: volume})
+			seen[record.ID] = true
+		}
+	}
+	return observations, issues, seen
+}
+
 // storageAuditContent lists one storage on one node. Beside the evidence and
 // issues, it returns every volid the listing held, or nil when the listing
 // failed or held a malformed entry and so proves nothing about its content.
-func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, namespace string) ([]StorageAllocationEvidence, map[string]bool, []string) {
+func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, claims map[string][]storageAuditClaim, namespace string) ([]StorageAllocationEvidence, map[string]bool, []string) {
 	response, e := deps.PVE.Nodes().ListStorageContent(ctx, target.node, target.storage, nil)
 	observations := []StorageAllocationEvidence{}
 	var issues []string
@@ -833,28 +991,9 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 				continue
 			}
 			listed[item.VolID] = true
-			seenRecords := map[string]bool{}
-			for recordIndex := range knownVolumes[item.VolID] {
-				record := knownVolumes[item.VolID][recordIndex]
-				matched := false
-				var miss storageAuditMiss
-				for stepIndex := range record.Steps {
-					step := record.Steps[stepIndex]
-					match, reason := storageAuditVolumeTargetMatches(record, step, stores, target.node, item.VolID)
-					matched = matched || match
-					if !match {
-						miss.consider(step, reason)
-					}
-				}
-				if !matched {
-					issues = append(issues, fmt.Sprintf("known volume %s on storage %q on node %q disagrees with recorded physical target: allocation %s %s", item.VolID, target.storage, target.node, record.ID, miss.describe(record)))
-					continue
-				}
-				if !seenRecords[record.ID] {
-					observations = append(observations, StorageAllocationEvidence{AllocationID: record.ID, Kind: record.Kind, Node: target.node, VolumeID: item.VolID})
-					seenRecords[record.ID] = true
-				}
-			}
+			known, knownIssues, seenRecords := storageAuditKnownVolume(target, stores, knownVolumes[item.VolID], claims[item.VolID], item.VolID)
+			observations = append(observations, known...)
+			issues = append(issues, knownIssues...)
 			locator, id, ok := pve.ParseAllocationVolumeID(item.VolID)
 			if ok && !seenRecords[id] && locator == pve.AllocationNamespaceLocator(namespace) {
 				observations = append(observations, StorageAllocationEvidence{AllocationID: id, Kind: allocationKindDisk, Node: target.node, VolumeID: item.VolID})
@@ -874,13 +1013,15 @@ func storageAuditContent(ctx context.Context, deps Deps, target storageAuditTarg
 }
 
 func collectStorageAuditContent(ctx context.Context, deps Deps, targets []storageAuditTarget, stores map[string]pve.StorageInfo, knownVolumes map[string][]aj.Record, result *StorageAllocationAudit) error {
+	// The VM scan has finished, so the workers only read the claims.
+	claims := result.claims
 	jobs := make(chan storageAuditTarget)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for range min(4, len(targets)) {
 		wg.Go(func() {
 			for target := range jobs {
-				observations, listed, issues := storageAuditContent(ctx, deps, target, stores, knownVolumes, deps.Config.StoragePlacementNamespace)
+				observations, listed, issues := storageAuditContent(ctx, deps, target, stores, knownVolumes, claims, deps.Config.StoragePlacementNamespace)
 				mu.Lock()
 				result.Evidence = append(result.Evidence, observations...)
 				if listed != nil {
