@@ -140,8 +140,8 @@ func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verificati
 	if err != nil {
 		return aj.Verification{}, err
 	}
-	if !report.Complete || !report.VMScanComplete || len(report.Issues) != 0 || len(report.Conflicts) != 0 {
-		return aj.Verification{}, fmt.Errorf("managed disk absence requires a complete conflict-free historical audit")
+	if err := storageAuditGateError(ctx, m.deps, "delete_disk", report, storageAuditGateAll); err != nil {
+		return aj.Verification{}, err
 	}
 	for _, e := range report.Evidence {
 		if e.AllocationID == m.handle.Record().ID {

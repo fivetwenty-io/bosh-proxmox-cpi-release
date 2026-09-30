@@ -59,7 +59,7 @@ func observeStorageAuditVisibility(ctx context.Context, reader auditPermissionGe
 		return err
 	}
 	if _, ok := access["Sys.Audit"]; !ok {
-		return fmt.Errorf("allocation audit requires Sys.Audit at /access to inspect unfiltered ACL paths")
+		return &AuditVisibilityError{Privilege: "Sys.Audit", Path: "/access"}
 	}
 	raw, err := reader.GetCtx(ctx, "/access/acl", nil)
 	if err != nil {
@@ -102,7 +102,7 @@ func observeStorageAuditVisibility(ctx context.Context, reader auditPermissionGe
 			return err
 		}
 		if len(values) == 0 {
-			return fmt.Errorf("allocation audit visibility is restricted at %s", path)
+			return &AuditVisibilityError{Path: path}
 		}
 		observed[path] = values
 		if privilege := required[path]; privilege != "" {
@@ -140,7 +140,7 @@ func requireImageListingVisibility(paths []string, observed map[string]map[strin
 func requireAuditPrivilege(values map[string]json.RawMessage, privilege, path string) error {
 	value, present := values[privilege]
 	if !present {
-		return fmt.Errorf("allocation audit requires %s at %s", privilege, path)
+		return &AuditVisibilityError{Privilege: privilege, Path: path}
 	}
 	// Permission values describe propagation, not whether the grant exists.
 	propagates := false
@@ -152,7 +152,7 @@ func requireAuditPrivilege(values map[string]json.RawMessage, privilege, path st
 		return fmt.Errorf("allocation audit propagation flag malformed")
 	}
 	if (path == "/vms" || path == "/storage") && !propagates {
-		return fmt.Errorf("allocation audit requires propagated %s at %s", privilege, path)
+		return &AuditVisibilityError{Privilege: privilege, Path: path, Propagated: true}
 	}
 	return nil
 }

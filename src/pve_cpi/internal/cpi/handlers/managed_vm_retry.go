@@ -62,8 +62,8 @@ func proveManagedVMAttemptAbsent(ctx context.Context, deps Deps, journal *aj.Jou
 	if err != nil {
 		return aj.Verification{}, err
 	}
-	if !audit.Complete || !audit.VMScanComplete || len(audit.Issues) > 0 || len(audit.Conflicts) > 0 {
-		return aj.Verification{}, fmt.Errorf("VM retry requires complete conflict-free fresh absence audit")
+	if err := storageAuditGateError(ctx, deps, "create_vm retry", audit, storageAuditGateAll); err != nil {
+		return aj.Verification{}, err
 	}
 	for _, evidence := range audit.Evidence {
 		if evidence.AllocationID == record.ID {

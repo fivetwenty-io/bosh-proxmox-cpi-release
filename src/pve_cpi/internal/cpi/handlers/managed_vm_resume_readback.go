@@ -81,7 +81,10 @@ func (r *managedVMRecordReadback) readLocation(ctx context.Context) error {
 	allowed := false
 	for i := range record.Steps {
 		step := &record.Steps[i]
-		if step.Attempt == record.ActiveAttempt() && storageAuditVMTargetMatches(record, *step, node, vmid) {
+		if step.Attempt != record.ActiveAttempt() {
+			continue
+		}
+		if matched, _ := storageAuditVMTargetMatches(record, *step, node, vmid); matched {
 			allowed = true
 		}
 	}
@@ -177,7 +180,8 @@ func (r *managedVMRecordReadback) verifyVolume(ctx context.Context, volume strin
 	for i := range record.Steps {
 		step := &record.Steps[i]
 		if step.Attempt == record.ActiveAttempt() {
-			physicalMatch = physicalMatch || storageAuditVolumeTargetMatches(record, *step, actualDefinitions, node, volume)
+			matched, _ := storageAuditVolumeTargetMatches(record, *step, actualDefinitions, node, volume)
+			physicalMatch = physicalMatch || matched
 		}
 	}
 	if !physicalMatch {

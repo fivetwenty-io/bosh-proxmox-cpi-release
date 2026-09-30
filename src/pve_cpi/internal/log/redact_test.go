@@ -329,3 +329,24 @@ func TestScrubMessage(t *testing.T) {
 		t.Errorf("credential-free text altered: %q -> %q", plain, got)
 	}
 }
+
+// TestScrubMessageMasksPVECredentialHeaders pins the PVE-specific rules. An
+// API token header value and an auth cookie carry no URL shape, so neither the
+// userinfo nor the query-parameter rule would catch them on their own.
+func TestScrubMessageMasksPVECredentialHeaders(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ in, secret, keep string }{
+		{"Authorization: PVEAPIToken=root@pam!cpi=0f1e2d3c-token-value rejected", "0f1e2d3c-token-value", "PVEAPIToken=" + log.RedactedPlaceholder + " rejected"},
+		{"cookie PVEAuthCookie=PVE:root@pam:65F0A1B2::c2lnbmF0dXJl; path=/", "c2lnbmF0dXJl", "PVEAuthCookie=" + log.RedactedPlaceholder},
+		{"pveapitoken=user@pve!id=lowercase-secret", "lowercase-secret", "pveapitoken=" + log.RedactedPlaceholder},
+	} {
+		out := log.ScrubMessage(tc.in)
+		if strings.Contains(out, tc.secret) {
+			t.Errorf("ScrubMessage leaks PVE credential %q: %q", tc.secret, out)
+		}
+		if !strings.Contains(out, tc.keep) {
+			t.Errorf("ScrubMessage(%q) = %q, want it to keep %q", tc.in, out, tc.keep)
+		}
+	}
+}

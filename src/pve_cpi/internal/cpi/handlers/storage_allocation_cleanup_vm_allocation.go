@@ -91,6 +91,17 @@ func cleanupPendingVMAllocation(step aj.Step, record aj.Record) bool {
 	return true
 }
 
+// pendingVMAllocationMoved refuses a pending VM allocation observed anywhere but
+// its exact recorded node and VMID. It stays strict for a VM moved on shared
+// storage too, because a VM whose CID was never returned has no operator
+// reason to move.
+func pendingVMAllocationMoved(record aj.Record, step aj.Step, node string, vmid int) error {
+	if node == step.Target.Node && vmid == step.Target.VMID {
+		return nil
+	}
+	return fmt.Errorf("pending VM allocation %s moved from exact target: VM %d observed on %s, recorded VM %d on %s", record.ID, vmid, node, step.Target.VMID, step.Target.Node)
+}
+
 // The task identifies submission completion; a fresh full VM marker and concrete
 // storage/device readback establish ownership separately. A filename or task ID
 // alone never grants cleanup authority.
@@ -100,8 +111,11 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 		return aj.Verification{}, nil, err
 	}
 	audit, err := AuditStorageAllocations(ctx, deps, journal, nodes)
-	if err != nil || !audit.Complete || !audit.VMScanComplete || len(audit.Issues) > 0 || len(audit.Conflicts) > 0 {
+	if err != nil {
 		return aj.Verification{}, nil, fmt.Errorf("unknown VM allocation requires complete historical visibility")
+	}
+	if err := storageAuditGateError(ctx, deps, "unknown VM allocation cleanup", audit, storageAuditGateAll); err != nil {
+		return aj.Verification{}, nil, err
 	}
 	node, vmid, _, err := managedVMDisposalIdentity(record, audit)
 	if err != nil {
@@ -121,8 +135,8 @@ func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Jour
 	if node == "" {
 		return observeAbsentCleanupVMAllocation(ctx, deps, record, step, nodes, vmid, audit, plan, definition)
 	}
-	if node != step.Target.Node || vmid != step.Target.VMID {
-		return aj.Verification{}, nil, fmt.Errorf("pending VM allocation moved from exact target")
+	if err := pendingVMAllocationMoved(record, step, node, vmid); err != nil {
+		return aj.Verification{}, nil, err
 	}
 	observed, err := observeManagedVMRecord(ctx, deps, journal, record)
 	if err != nil {

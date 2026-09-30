@@ -20,12 +20,19 @@ func storageCleanupFailure(stage string, cause error) error {
 	return &storageCleanupStageError{stage: stage, cause: cause}
 }
 
-// StorageAllocationDecisionFailure returns a bounded stage identifier. Backend
-// response text, credentials, and resource payloads are never included.
+// StorageAllocationDecisionFailure returns a bounded stage identifier. When an
+// audit gate refused, it appends the gate's summary, whose findings are built
+// only from identifiers and classified error descriptions. Backend response
+// text, credentials, and resource payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
+	class := "identity_or_audit_evidence"
 	var stage *storageCleanupStageError
 	if errors.As(err, &stage) {
-		return "cleanup_" + stage.stage
+		class = "cleanup_" + stage.stage
 	}
-	return "identity_or_audit_evidence"
+	var gate *storageAuditGateFailure
+	if errors.As(err, &gate) {
+		return class + ": " + gate.summary
+	}
+	return class
 }

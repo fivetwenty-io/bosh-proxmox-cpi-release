@@ -298,7 +298,27 @@ func observeDiagnosticJournal(ctx context.Context, deps Deps, nodes []string, ou
 		out.Findings = append(out.Findings, "historical allocation observations unavailable")
 		return
 	}
-	out.Findings = append(out.Findings, fmt.Sprintf("historical audit complete=%t; conflicts=%d; issues=%d", report.Complete, len(report.Conflicts), len(report.Issues)))
+	out.Findings = append(out.Findings, storageDiagnosticAuditFindings(report)...)
+}
+
+// storageDiagnosticAuditFindings summarizes an audit and lists up to three of
+// its conflicts and three of its issues, so a diagnostic names what blocks
+// allocation instead of only counting it.
+func storageDiagnosticAuditFindings(report StorageAllocationAudit) []string {
+	findings := []string{fmt.Sprintf("historical audit complete=%t; conflicts=%d; issues=%d", report.Complete, len(report.Conflicts), len(report.Issues))}
+	for _, list := range []struct {
+		noun  string
+		items []string
+	}{{"conflict", report.Conflicts}, {"issue", report.Issues}} {
+		listed := list.items[:min(len(list.items), storageAuditGateListLimit)]
+		for _, item := range listed {
+			findings = append(findings, "historical audit "+list.noun+": "+item)
+		}
+		if more := len(list.items) - len(listed); more > 0 {
+			findings = append(findings, fmt.Sprintf("historical audit %ss: %d more not listed", list.noun, more))
+		}
+	}
+	return findings
 }
 
 func collectStorageSelectorDiagnostics(out *StoragePlanDiagnostic, s *StoragePlacementSelection, snapshot *inv.Snapshot, ids map[string]bool) {

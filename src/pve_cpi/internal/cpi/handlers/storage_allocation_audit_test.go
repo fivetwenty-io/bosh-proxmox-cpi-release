@@ -17,25 +17,99 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	cs "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	ns "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
 type allocationAuditClient struct {
 	*idFakeClient
 	storageRead *allocationAuditStorage
 	nodesRead   *allocationAuditNodes
+	// clusterRead, when set, replaces the single-node fixture membership
+	// and its always-empty /cluster/status.
+	clusterRead *allocationAuditCluster
+	// configFailure and emptyConfigs inject per-VM configuration read
+	// failures; both nil leaves the fixture's config store unchanged.
+	configFailure map[int]error
+	emptyConfigs  map[int]bool
 }
 
 func (c *allocationAuditClient) ClusterStorage() cs.Service { return c.storageRead }
 func (c *allocationAuditClient) Nodes() ns.Service          { return c.nodesRead }
 
+func (c *allocationAuditClient) Cluster() sdkcluster.Service {
+	if c.clusterRead == nil {
+		return c.idFakeClient.Cluster()
+	}
+	return c.clusterRead
+}
+
+func (c *allocationAuditClient) QEMU() sdkqemu.Service {
+	if c.configFailure == nil && c.emptyConfigs == nil {
+		return c.idFakeClient.QEMU()
+	}
+	return &allocationAuditQEMU{Service: c.idFakeClient.QEMU(), client: c}
+}
+
+type allocationAuditQEMU struct {
+	sdkqemu.Service
+	client *allocationAuditClient
+}
+
+func (q *allocationAuditQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if err := q.client.configFailure[vmid]; err != nil {
+		return nil, err
+	}
+	if q.client.emptyConfigs[vmid] {
+		return nil, nil
+	}
+	return q.Service.Config(ctx, node, vmid)
+}
+
+// allocationAuditCluster reports a multi-node membership and a scripted
+// /cluster/status, so an audit can see a node the cluster reports offline.
+type allocationAuditCluster struct {
+	sdkcluster.Service
+	members []string
+	status  []map[string]any
+}
+
+func (cl *allocationAuditCluster) ListConfigNodes(context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
+	response := sdkcluster.ListConfigNodesResponse{}
+	for _, member := range cl.members {
+		raw, err := json.Marshal(map[string]any{"name": member})
+		if err != nil {
+			return nil, err
+		}
+		response = append(response, raw)
+	}
+	return &response, nil
+}
+
+func (cl *allocationAuditCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
+	response := sdkcluster.ListStatusResponse{}
+	for _, row := range cl.status {
+		raw, err := json.Marshal(row)
+		if err != nil {
+			return nil, err
+		}
+		response = append(response, raw)
+	}
+	return &response, nil
+}
+
 type allocationAuditStorage struct {
 	cs.Service
 	definitions cs.ListStorageResponse
+	failure     error
 }
 
 func (s *allocationAuditStorage) ListStorage(context.Context, *cs.ListStorageParams) (*cs.ListStorageResponse, error) {
+	if s.failure != nil {
+		return nil, s.failure
+	}
 	return &s.definitions, nil
 }
 
@@ -45,6 +119,21 @@ type allocationAuditNodes struct {
 	failure error
 	mu      sync.Mutex
 	listed  []string
+	// base is the fixture's config store, read by the node-aware ListQemu.
+	base *idFakeClient
+	// contentByNode and failureByNode override content and failure for one
+	// node, so a listing can fail or differ on a single member.
+	contentByNode map[string]ns.ListStorageContentResponse
+	failureByNode map[string]error
+	// guestNodes places a VM on a node; an unplaced VM lists on pve1. With
+	// guestNodes and qemuFailure both nil, ListQemu serves every VM on every
+	// node, as the single-node fixture always has.
+	guestNodes  map[int]string
+	qemuFailure map[string]error
+	// nodeNames and nodesFailure script GET /nodes; both unset keeps the
+	// fixture's empty listing.
+	nodeNames    []string
+	nodesFailure error
 }
 
 // ListStorageContent records every listing it serves; the audit fans out
@@ -53,7 +142,58 @@ func (n *allocationAuditNodes) ListStorageContent(_ context.Context, node, stora
 	n.mu.Lock()
 	n.listed = append(n.listed, node+"/"+storage)
 	n.mu.Unlock()
+	if err := n.failureByNode[node]; err != nil {
+		return nil, err
+	}
+	if content, ok := n.contentByNode[node]; ok {
+		return &content, nil
+	}
 	return &n.content, n.failure
+}
+
+func (n *allocationAuditNodes) ListQemu(ctx context.Context, node string, params *ns.ListQemuParams) (*ns.ListQemuResponse, error) {
+	if n.guestNodes == nil && n.qemuFailure == nil {
+		return n.Service.ListQemu(ctx, node, params)
+	}
+	if err := n.qemuFailure[node]; err != nil {
+		return nil, err
+	}
+	n.base.mu.Lock()
+	defer n.base.mu.Unlock()
+	response := ns.ListQemuResponse{}
+	for vmid := range n.base.configs {
+		placed := n.guestNodes[vmid]
+		if placed == "" {
+			placed = "pve1"
+		}
+		if placed != node {
+			continue
+		}
+		raw, err := json.Marshal(map[string]any{"vmid": vmid})
+		if err != nil {
+			return nil, err
+		}
+		response = append(response, raw)
+	}
+	return &response, nil
+}
+
+func (n *allocationAuditNodes) ListNodes(ctx context.Context) (*ns.ListNodesResponse, error) {
+	if n.nodesFailure != nil {
+		return nil, n.nodesFailure
+	}
+	if n.nodeNames == nil {
+		return n.Service.ListNodes(ctx)
+	}
+	response := ns.ListNodesResponse{}
+	for _, name := range n.nodeNames {
+		raw, err := json.Marshal(map[string]any{"node": name})
+		if err != nil {
+			return nil, err
+		}
+		response = append(response, raw)
+	}
+	return &response, nil
 }
 
 func (n *allocationAuditNodes) listedStorages() []string {
@@ -68,7 +208,7 @@ func auditFixture(t *testing.T) (Deps, *aj.Journal, *allocationAuditClient) {
 		t.Fatal(err)
 	}
 	base := newIDFakeClient(map[int]map[string]any{})
-	c := &allocationAuditClient{idFakeClient: base, storageRead: &allocationAuditStorage{definitions: cs.ListStorageResponse{json.RawMessage(`{"storage":"a","type":"nfs","server":"nas","export":"/a","content":"images","shared":1}`)}}, nodesRead: &allocationAuditNodes{Service: base.Nodes(), content: ns.ListStorageContentResponse{}}}
+	c := &allocationAuditClient{idFakeClient: base, storageRead: &allocationAuditStorage{definitions: cs.ListStorageResponse{json.RawMessage(`{"storage":"a","type":"nfs","server":"nas","export":"/a","content":"images","shared":1}`)}}, nodesRead: &allocationAuditNodes{Service: base.Nodes(), base: base, content: ns.ListStorageContentResponse{}}}
 	identity, err := pve.ObserveStorageClusterIdentity(t.Context(), c.Nodes(), []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)
@@ -322,18 +462,58 @@ func TestAllocationAuditVolumeMatchingRequiresPhysicalScope(t *testing.T) {
 	for _, tc := range []struct {
 		name, node, backing, storage string
 		definition                   pve.StorageInfo
+		external                     bool
+		stepVolume                   string
+		stores                       map[string]pve.StorageInfo
 		want                         bool
+		reason                       string
 	}{
-		{"local same node", "n1", local.BackingKey(), "a", local, true},
-		{"local other node", "n2", local.BackingKey(), "a", local, false},
-		{"shared other node", "n2", shared.BackingKey(), "a", shared, true},
-		{"changed backing", "n1", "nfs://other/a", "a", shared, false},
-		{"different logical storage", "n1", shared.BackingKey(), "b", shared, false},
+		{name: "local same node", node: "n1", backing: local.BackingKey(), storage: "a", definition: local, want: true},
+		{name: "local other node", node: "n2", backing: local.BackingKey(), storage: "a", definition: local, reason: storageAuditReasonNodeLocalElsewhere},
+		{name: "shared other node", node: "n2", backing: shared.BackingKey(), storage: "a", definition: shared, want: true},
+		{name: "changed backing", node: "n1", backing: "nfs://other/a", storage: "a", definition: shared, reason: storageAuditReasonBackingChanged},
+		{name: "different logical storage", node: "n1", backing: shared.BackingKey(), storage: "b", definition: shared, reason: storageAuditReasonStorageChanged},
+		{name: "unknown storage", node: "n1", backing: shared.BackingKey(), storage: "a", definition: shared, stores: map[string]pve.StorageInfo{}, reason: storageAuditReasonStorageUnknown},
+		{name: "unrecorded backing", node: "n1", storage: "a", definition: shared, reason: storageAuditReasonStorageUnknown},
+		{name: "volume not in step", node: "n1", backing: shared.BackingKey(), storage: "a", definition: shared, stepVolume: "a:123/vm-123-disk-9.raw", reason: storageAuditReasonNotInStep},
+		{name: "external target", node: "n1", backing: shared.BackingKey(), storage: "a", definition: shared, external: true, reason: storageAuditReasonExternal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			step := aj.Step{Target: aj.Target{Node: "n1", Storage: tc.storage, Backing: tc.backing}, VolIDs: []string{volume}}
-			if got := storageAuditVolumeTargetMatches(aj.Record{}, step, map[string]pve.StorageInfo{"a": tc.definition}, tc.node, volume); got != tc.want {
-				t.Fatalf("match=%t expected=%t", got, tc.want)
+			stepVolume := volume
+			if tc.stepVolume != "" {
+				stepVolume = tc.stepVolume
+			}
+			stores := tc.stores
+			if stores == nil {
+				stores = map[string]pve.StorageInfo{"a": tc.definition}
+			}
+			step := aj.Step{Target: aj.Target{Node: "n1", Storage: tc.storage, Backing: tc.backing, External: tc.external}, VolIDs: []string{stepVolume}}
+			got, reason := storageAuditVolumeTargetMatches(aj.Record{}, step, stores, tc.node, volume)
+			if got != tc.want || reason != tc.reason {
+				t.Fatalf("match=%t reason=%q, expected match=%t reason=%q", got, reason, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+func TestAllocationAuditVMMatchingReportsReasons(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		step   aj.Step
+		node   string
+		want   bool
+		reason string
+	}{
+		{"same node", aj.Step{Target: aj.Target{Node: "n1", VMID: 123}}, "n1", true, ""},
+		{"other node", aj.Step{Target: aj.Target{Node: "n1", VMID: 123}}, "n2", false, storageAuditReasonNodeMismatch},
+		{"other VMID", aj.Step{Target: aj.Target{Node: "n1", VMID: 124}}, "n1", false, storageAuditReasonNotInStep},
+		{"external", aj.Step{Target: aj.Target{Node: "n1", VMID: 123, External: true}}, "n1", false, storageAuditReasonExternal},
+		{"retained ephemeral", aj.Step{Kind: "lifecycle_delete_vm_retain_ephemeral_QEMU.Create", Target: aj.Target{Node: "n1", VMID: 123}}, "n1", false, storageAuditReasonExternal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := storageAuditVMTargetMatches(aj.Record{}, tc.step, tc.node, 123)
+			if got != tc.want || reason != tc.reason {
+				t.Fatalf("match=%t reason=%q, expected match=%t reason=%q", got, reason, tc.want, tc.reason)
 			}
 		})
 	}
@@ -386,7 +566,9 @@ func TestAllocationAuditExternalTargetsNeverEstablishOwnership(t *testing.T) {
 	def := pve.StorageInfo{Name: "a", Type: "nfs", Server: "nas", Export: "/a", Shared: true}
 	target := aj.Target{External: true, Node: "pve1", VMID: 123, Storage: "a", Backing: def.BackingKey(), IntendedVolume: "a:123/vm-123-disk-0.raw"}
 	step := aj.Step{Target: target, VolIDs: []string{target.IntendedVolume}}
-	if storageAuditVMTargetMatches(aj.Record{}, step, "pve1", 123) || storageAuditVolumeTargetMatches(aj.Record{}, step, map[string]pve.StorageInfo{"a": def}, "pve1", target.IntendedVolume) {
+	vmMatched, _ := storageAuditVMTargetMatches(aj.Record{}, step, "pve1", 123)
+	volumeMatched, _ := storageAuditVolumeTargetMatches(aj.Record{}, step, map[string]pve.StorageInfo{"a": def}, "pve1", target.IntendedVolume)
+	if vmMatched || volumeMatched {
 		t.Fatal("external preservation target authorized allocation ownership")
 	}
 }

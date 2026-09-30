@@ -14,8 +14,6 @@ package pve
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"strings"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 
@@ -298,7 +296,9 @@ func listNodeGuests(ctx context.Context, c Client, logger *log.Logger, node stri
 // unclassifiable transport error (partition, refused connection) keeps the
 // retriable default, because a rebooting or briefly partitioned node answers
 // on the Director's next attempt, and concluding from a partial fleet would
-// repeat the stale-index bug with a different source.
+// repeat the stale-index bug with a different source. Both shapes carry a
+// GuestEnumerationError, so an audit can name the failed nodes without
+// repeating the transport text.
 func partialFleetError(failedNodes []string, failedErrs []error) error {
 	for i, fe := range failedErrs {
 		if _, isAPIVerdict := apiHTTPCode(fe); !isAPIVerdict {
@@ -307,11 +307,7 @@ func partialFleetError(failedNodes []string, failedErrs []error) error {
 		if cpierrors.IsType(WrapError(fe), cpierrors.TypeRetriableCloud) {
 			continue
 		}
-		return cpierrors.Wrap(WrapError(fe), fmt.Sprintf(
-			"ListGuestsAuthoritative: could not list guests on node %s; refusing to decide from a partial fleet",
-			failedNodes[i]))
+		return cpierrors.Wrap(&GuestEnumerationError{Nodes: []string{failedNodes[i]}, Cause: WrapError(fe)}, "ListGuestsAuthoritative")
 	}
-	return cpierrors.Retriable(
-		"ListGuestsAuthoritative: could not list guests on node(s) %s; refusing to decide from a partial fleet",
-		strings.Join(failedNodes, ","))
+	return cpierrors.WrapAs(&GuestEnumerationError{Nodes: failedNodes}, cpierrors.TypeRetriableCloud, "ListGuestsAuthoritative")
 }

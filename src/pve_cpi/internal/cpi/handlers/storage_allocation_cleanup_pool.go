@@ -73,8 +73,8 @@ func observePlannedVMStorageAbsence(ctx context.Context, deps Deps, record aj.Re
 	stores := auditStorageDefinitions(ctx, deps, []aj.Record{record}, &report)
 	_, historical, _ := storageAuditRecordIndex([]aj.Record{record})
 	targets := storageAuditTargets(ctx, deps, nodes, historical, stores, &report)
-	if !report.Complete || len(report.Issues) != 0 {
-		return fmt.Errorf("pool-only cleanup storage scope unavailable")
+	if err := storageAuditGateError(ctx, deps, "pool-only cleanup storage scope", report, storageAuditGateComplete); err != nil {
+		return err
 	}
 	for _, target := range targets {
 		if err := observePoolOnlyStorageAbsent(ctx, deps, target, vmid, allowed...); err != nil {
