@@ -216,8 +216,19 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // so this request never entered the window it was waiting for. An operation that moved or migrated the disk
 // before it waited has changed it, even when every step settled, so it still
 // goes uncertain.
+//
+// pve.ErrClusterLockStateUnknown counts the same way. The acquire created its
+// sentinel but no read of it answered before the deadline, so it never entered
+// the window either. When the read on its way out proved the sentinel ours and
+// the guarded delete answered, both steps are observed and the record is
+// returned like any clean timeout. When that delete did not answer, its step
+// stays planned and the guard is poisoned, so the other conditions send the
+// record to reconciliation, and the next call's readback settles the step.
 func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
-	if operationErr == nil || !errors.Is(operationErr, pve.ErrClusterLockTimeout) {
+	if operationErr == nil {
+		return false
+	}
+	if !errors.Is(operationErr, pve.ErrClusterLockTimeout) && !errors.Is(operationErr, pve.ErrClusterLockStateUnknown) {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {

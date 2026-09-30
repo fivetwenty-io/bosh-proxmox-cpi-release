@@ -45,10 +45,14 @@ type lockContention struct {
 	// afterCreate runs under the store's lock right after a create succeeds,
 	// which is where a stealer's delete and recreate can land.
 	afterCreate func(pool string)
-	held        chan struct{}
-	rejected    chan struct{}
-	heldOnce    sync.Once
-	rejectOnce  sync.Once
+	// plainRead, when set, can fail a plain sentinel read, and deleteErr
+	// fails every sentinel delete without deleting.
+	plainRead  func(ctx context.Context, pool string) error
+	deleteErr  error
+	held       chan struct{}
+	rejected   chan struct{}
+	heldOnce   sync.Once
+	rejectOnce sync.Once
 }
 
 func newLockContention(t *testing.T) *lockContention {
@@ -63,6 +67,7 @@ func (l *lockContention) reset() {
 	l.creates, l.rejections = 0, 0
 	l.createErr, l.readErr = nil, nil
 	l.afterCreate = nil
+	l.plainRead, l.deleteErr = nil, nil
 	l.heldAt = time.Time{}
 	l.held, l.rejected = make(chan struct{}), make(chan struct{})
 	l.heldOnce, l.rejectOnce = sync.Once{}, sync.Once{}
@@ -124,6 +129,9 @@ func (p contendedPools) DeletePool(ctx context.Context, id string) error {
 	l := p.locks
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.deleteErr != nil {
+		return l.deleteErr
+	}
 	if _, taken := l.pools[id]; !taken {
 		return livePoolVerdict(l.t, "delete pool failed: pool '"+id+"' does not exist")
 	}
@@ -155,6 +163,11 @@ func (p contendedPools) GetPoolComment(ctx context.Context, id string) (string, 
 	}
 	p.locks.mu.Lock()
 	defer p.locks.mu.Unlock()
+	if p.locks.plainRead != nil {
+		if err := p.locks.plainRead(ctx, id); err != nil {
+			return "", false, err
+		}
+	}
 	comment, found := p.locks.pools[id]
 	return comment, found, nil
 }

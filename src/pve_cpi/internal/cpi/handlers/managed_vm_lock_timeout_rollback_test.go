@@ -405,6 +405,53 @@ func TestCreateVMLockTimeoutRollsBackTheAttempt(t *testing.T) {
 	}
 }
 
+// TestCreateVMUnknownLockStateRollsBackTheAttempt runs the same attach with no
+// other holder. The parker lock's create lands, but its confirming reads fail
+// up to the deadline, so the acquire ends in the unknown lock state. The read
+// on its way out proves the sentinel ours and the delete answers, so the disk
+// comes back returned exactly as it does after a timed-out wait. create_vm
+// therefore rolls the attempt back the same way: the attached disk is
+// preserved to the parker, the VM is destroyed, the generation is closed, and
+// the Director gets the retriable error with the unknown state inside it.
+func TestCreateVMUnknownLockStateRollsBackTheAttempt(t *testing.T) {
+	flow := newRollbackFlow(t)
+	flow.locks.reset()
+	failConfirmingReads(flow.locks)
+	flow.vms.onDisposal = flow.locks.reset
+
+	_, err := flow.createVM(t)
+	if !errors.Is(err, pve.ErrClusterLockStateUnknown) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("create_vm did not hand the Director the retriable unknown lock state: %v", err)
+	}
+	created := flow.created(t)
+	if len(created) != 1 || len(flow.vms.destroyed) != 1 || flow.vms.disposals == 0 {
+		t.Fatalf("the attempt's VM was not disposed of: created=%v destroyed=%v disposals=%d", created, flow.vms.destroyed, flow.vms.disposals)
+	}
+	if _, exists := flow.parked.client.state.configs[created[0]]; exists {
+		t.Fatalf("the attempt's VM %d is still on PVE", created[0])
+	}
+	for name, cid := range map[string]string{"attached": flow.free.cid, "parked": flow.parked.cid} {
+		holder := flow.holderOf(t, cid)
+		if holder == nil || !holder.IsParker || holder.VMID != flow.parked.parker {
+			t.Fatalf("the %s disk is not on the parker after the rollback: %+v", name, holder)
+		}
+	}
+	assertReturnedRecord(t, "attached disk", flow.diskRecord(t, flow.free.id))
+	assertReturnedRecord(t, "parked disk", flow.parked.record(t))
+	if _, found, err := flow.parked.journal.InspectVM(rollbackFlowAgent); err != nil || found {
+		t.Fatalf("the rollback left a generation for a retry to resume: found=%t err=%v", found, err)
+	}
+	generations := flow.generations(t)
+	if len(generations) != 1 || generations[0].State != aj.Deleted {
+		t.Fatalf("the rolled-back generation was not closed: %d generations", len(generations))
+	}
+	for i := range generations[0].Steps {
+		if step := &generations[0].Steps[i]; step.State != aj.Observed {
+			t.Fatalf("rolled-back step %s (%s) left %s", step.ID, step.Kind, step.State)
+		}
+	}
+}
+
 // hasDisposalAdmission reports whether a record carries a VM cleanup
 // admission, which a disposal records before its first delete step.
 func hasDisposalAdmission(record aj.Record) bool {
