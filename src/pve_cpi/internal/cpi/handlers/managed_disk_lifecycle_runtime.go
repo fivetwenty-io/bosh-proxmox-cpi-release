@@ -74,7 +74,7 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 		return fail(err)
 	}
 	if text := unsettledStepText(handle.Record(), gaps, func(step aj.Step) bool { return step.Attempt != handle.Record().ActiveAttempt() }); text != "" && len(gaps) > 0 {
-		return fail(storageRefusal("lifecycle has unresolved mutation evidence; " + text))
+		return fail(protectionPendingOr(handle.Record(), gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+text)))
 	}
 	session, err := beginStorageLifecycle(handle, operation, proof)
 	if err != nil {

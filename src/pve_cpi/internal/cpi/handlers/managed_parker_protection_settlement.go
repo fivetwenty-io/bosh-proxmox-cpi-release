@@ -304,3 +304,35 @@ func settlePlannedProtectionSteps(ctx context.Context, client pve.Client, handle
 	}
 	return reasons, nil
 }
+
+// protectionPendingRefusal is a readmission refusal whose only cause is a
+// parker protection write the settler could not settle yet. Nothing about the
+// disk itself is in doubt: it is where its record says, and the refusal lifts
+// as soon as the parker reads back protected. Its text is the refusal's own.
+type protectionPendingRefusal struct{ err error }
+
+func (e *protectionPendingRefusal) Error() string { return e.err.Error() }
+
+func (e *protectionPendingRefusal) Unwrap() error { return e.err }
+
+// protectionPendingOr returns refusal marked as a protectionPendingRefusal
+// when every unsettled step of record's active attempt is a protection-only
+// write the settler left planned, and refusal unchanged otherwise.
+func protectionPendingOr(record aj.Record, gaps map[string]error, refusal error) error {
+	pending := false
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Attempt != record.ActiveAttempt() || step.State == aj.Observed {
+			continue
+		}
+		var gap *protectionSettlementGap
+		if !isParkerProtectionStep(record, *step) || !errors.As(gaps[step.ID], &gap) {
+			return refusal
+		}
+		pending = true
+	}
+	if !pending {
+		return refusal
+	}
+	return &protectionPendingRefusal{err: refusal}
+}

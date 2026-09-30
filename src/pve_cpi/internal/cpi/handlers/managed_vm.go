@@ -337,6 +337,12 @@ func (m *managedVMAllocation) postCreateFailure(err error) error {
 	if isDiskReturnedAfterLockTimeout(err) && m.guard.Err() == nil && storageLifecycleSettled(m.handle.Record()) == nil {
 		return err
 	}
+	// A persistent disk that waits only on its parker's protection left the
+	// VM placed, working, and with every step observed. The error goes back
+	// as it is, and the Director's retry resumes this generation.
+	if isManagedDiskProtectionPending(err) && m.guard.Err() == nil && storageLifecycleSettled(m.handle.Record()) == nil {
+		return err
+	}
 	return storageAllocationUncertain(m.handle, "VM post-create")
 }
 
