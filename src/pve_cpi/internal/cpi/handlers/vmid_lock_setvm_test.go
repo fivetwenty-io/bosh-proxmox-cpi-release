@@ -40,7 +40,7 @@ func (p *recordingPoolService) MoveVMToPool(_ context.Context, poolID string, vm
 	return nil
 }
 
-func (p *recordingPoolService) CreatePool(_ context.Context, poolID, _ string) error {
+func (p *recordingPoolService) CreatePool(_ context.Context, poolID, comment string) error {
 	p.record("create:" + poolID)
 	if p.createErr != nil {
 		return p.createErr
@@ -48,7 +48,7 @@ func (p *recordingPoolService) CreatePool(_ context.Context, poolID, _ string) e
 	if _, ok := p.pools[poolID]; ok {
 		return fmt.Errorf("pool '%s' already exists", poolID)
 	}
-	p.pools[poolID] = "held"
+	p.pools[poolID] = comment
 	return nil
 }
 

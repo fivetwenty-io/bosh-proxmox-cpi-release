@@ -371,16 +371,22 @@ func (m *digestReplicationMockClient) Cluster() sdkcluster.Service              
 func (m *digestReplicationMockClient) ClusterStorage() sdkclusterstorage.Service { return nil }
 func (m *digestReplicationMockClient) Pools() pve.PoolService                    { return &noopReplicationPoolService{} }
 
-type noopReplicationPoolService struct{}
+type noopReplicationPoolService struct{ lockClaims }
 
 func (n *noopReplicationPoolService) AddVM(_ context.Context, _ string, _ int64) error { return nil }
 func (n *noopReplicationPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error {
 	return nil
 }
-func (n *noopReplicationPoolService) CreatePool(_ context.Context, _, _ string) error { return nil }
-func (n *noopReplicationPoolService) DeletePool(_ context.Context, _ string) error    { return nil }
-func (n *noopReplicationPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (n *noopReplicationPoolService) CreatePool(_ context.Context, poolID, comment string) error {
+	n.put(poolID, comment)
+	return nil
+}
+func (n *noopReplicationPoolService) DeletePool(_ context.Context, poolID string) error {
+	n.drop(poolID)
+	return nil
+}
+func (n *noopReplicationPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return n.get(poolID)
 }
 
 // countingNodesService wraps sdknodes.Service and counts ListQemu calls per node.

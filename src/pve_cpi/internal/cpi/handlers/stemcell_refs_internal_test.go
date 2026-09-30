@@ -18,14 +18,20 @@ import (
 // ============================================================
 
 // refsPoolSvc is a PoolService that always succeeds — allows lock acquisition.
-type refsPoolSvc struct{}
+type refsPoolSvc struct{ lockClaims }
 
 func (p *refsPoolSvc) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
 func (p *refsPoolSvc) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
-func (p *refsPoolSvc) CreatePool(_ context.Context, _, _ string) error         { return nil }
-func (p *refsPoolSvc) DeletePool(_ context.Context, _ string) error            { return nil }
-func (p *refsPoolSvc) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (p *refsPoolSvc) CreatePool(_ context.Context, poolID, comment string) error {
+	p.put(poolID, comment)
+	return nil
+}
+func (p *refsPoolSvc) DeletePool(_ context.Context, poolID string) error {
+	p.drop(poolID)
+	return nil
+}
+func (p *refsPoolSvc) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return p.get(poolID)
 }
 
 // refsQEMUSvc satisfies sdkqemu.Service for stemcell_refs tests.

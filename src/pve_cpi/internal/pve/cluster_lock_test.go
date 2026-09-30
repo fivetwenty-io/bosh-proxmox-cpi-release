@@ -126,8 +126,8 @@ func TestAcquireClusterLock_FreeCreatesPool(t *testing.T) {
 	if h.pool != "bosh-lock-web" {
 		t.Fatalf("pool = %q; want bosh-lock-web", h.pool)
 	}
-	if f.createN != 1 || f.getN != 0 {
-		t.Fatalf("free acquire should create once and never read; create=%d get=%d", f.createN, f.getN)
+	if f.createN != 1 || f.getN != 1 {
+		t.Fatalf("free acquire should create once and read its claim back once; create=%d get=%d", f.createN, f.getN)
 	}
 	if _, ok := f.pools["bosh-lock-web"]; !ok {
 		t.Fatal("sentinel pool not present after acquire")
@@ -547,5 +547,35 @@ func TestProcessLockOwner_IsUniquePerAcquisition(t *testing.T) {
 		if !ok || got != owner {
 			t.Fatalf("owner token %q does not survive the sentinel comment: %q", owner, got)
 		}
+	}
+}
+
+// TestAcquireClusterLock_DisplacedCreateReturnsNoHandle covers a create that
+// succeeds and is then displaced before the acquirer acts. A stealer that read
+// a crashed holder's expired claim deletes our fresh sentinel and recreates its
+// own. The acquire must read its claim back, see the stealer's, and wait rather
+// than hand back a lock the stealer also holds.
+func TestAcquireClusterLock_DisplacedCreateReturnsNoHandle(t *testing.T) {
+	f := newFakeLockPools()
+	stealer := encodeLockComment("stealer@7-1", time.Unix(1000, 0).Add(time.Hour))
+	displaced := false
+	f.getFn = func(poolID string) (string, bool, error, bool) {
+		if !displaced {
+			displaced = true
+			f.pools[poolID] = stealer
+		}
+		return "", false, nil, false
+	}
+	clk := fixedClock(time.Unix(1000, 0), time.Second)
+	h, err := acquireClusterLockWithClock(context.Background(), f, "vm-90000", "waiter@9-1",
+		time.Minute, 5*time.Second, clk)
+	if h != nil {
+		t.Fatalf("a displaced create returned a lock handle while %q holds the sentinel", f.pools["bosh-lock-vm-90000"])
+	}
+	if !errors.Is(err, ErrClusterLockTimeout) {
+		t.Fatalf("want a lock timeout behind the stealer, got %v", err)
+	}
+	if f.pools["bosh-lock-vm-90000"] != stealer {
+		t.Fatalf("the stealer's claim was disturbed: %q", f.pools["bosh-lock-vm-90000"])
 	}
 }

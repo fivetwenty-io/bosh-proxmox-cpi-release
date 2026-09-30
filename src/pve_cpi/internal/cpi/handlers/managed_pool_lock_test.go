@@ -42,10 +42,13 @@ type lockContention struct {
 	// createErr fails every sentinel create without creating, and readErr
 	// fails every raw sentinel read.
 	createErr, readErr error
-	held               chan struct{}
-	rejected           chan struct{}
-	heldOnce           sync.Once
-	rejectOnce         sync.Once
+	// afterCreate runs under the store's lock right after a create succeeds,
+	// which is where a stealer's delete and recreate can land.
+	afterCreate func(pool string)
+	held        chan struct{}
+	rejected    chan struct{}
+	heldOnce    sync.Once
+	rejectOnce  sync.Once
 }
 
 func newLockContention(t *testing.T) *lockContention {
@@ -59,6 +62,7 @@ func (l *lockContention) reset() {
 	l.pools = map[string]string{}
 	l.creates, l.rejections = 0, 0
 	l.createErr, l.readErr = nil, nil
+	l.afterCreate = nil
 	l.heldAt = time.Time{}
 	l.held, l.rejected = make(chan struct{}), make(chan struct{})
 	l.heldOnce, l.rejectOnce = sync.Once{}, sync.Once{}
@@ -103,6 +107,9 @@ func (p contendedPools) CreatePool(ctx context.Context, id, comment string) erro
 	}
 	l.pools[id] = comment
 	l.creates++
+	if l.afterCreate != nil {
+		l.afterCreate(id)
+	}
 	l.heldOnce.Do(func() {
 		l.heldAt = time.Now()
 		close(l.held)

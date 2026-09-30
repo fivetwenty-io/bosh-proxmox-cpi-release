@@ -433,22 +433,32 @@ func (p *parkerLockClient) Pools() PoolService                     { return p.po
 type recordingPoolService struct {
 	events    []string
 	createErr error
+	claims    map[string]string
 }
 
 func (r *recordingPoolService) AddVM(context.Context, string, int64) error              { return nil }
 func (r *recordingPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
-func (r *recordingPoolService) CreatePool(_ context.Context, poolID, _ string) error {
+func (r *recordingPoolService) CreatePool(_ context.Context, poolID, comment string) error {
 	r.events = append(r.events, "create:"+poolID)
-	return r.createErr
+	if r.createErr != nil {
+		return r.createErr
+	}
+	if r.claims == nil {
+		r.claims = map[string]string{}
+	}
+	r.claims[poolID] = comment
+	return nil
 }
 
 func (r *recordingPoolService) DeletePool(_ context.Context, poolID string) error {
 	r.events = append(r.events, "delete:"+poolID)
+	delete(r.claims, poolID)
 	return nil
 }
 
-func (r *recordingPoolService) GetPoolComment(context.Context, string) (string, bool, error) {
-	return "", false, nil
+func (r *recordingPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	claim, found := r.claims[poolID]
+	return claim, found, nil
 }
 
 // TestWithParkerProtectionLock_SerializesOnVMIDPool proves the window runs

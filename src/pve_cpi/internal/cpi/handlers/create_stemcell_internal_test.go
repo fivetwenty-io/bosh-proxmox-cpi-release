@@ -257,14 +257,20 @@ func wbExistingVolumeListFn(storage, qcow2Filename string) func(_ context.Contex
 // _test package mocks to avoid import cycles (the wb file is package handlers).
 
 // wbNoopPoolService is a PoolService no-op for white-box tests not exercising pool logic.
-type wbNoopPoolService struct{}
+type wbNoopPoolService struct{ lockClaims }
 
 func (n *wbNoopPoolService) AddVM(_ context.Context, _ string, _ int64) error        { return nil }
 func (n *wbNoopPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error { return nil }
-func (n *wbNoopPoolService) CreatePool(_ context.Context, _, _ string) error         { return nil }
-func (n *wbNoopPoolService) DeletePool(_ context.Context, _ string) error            { return nil }
-func (n *wbNoopPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (n *wbNoopPoolService) CreatePool(_ context.Context, poolID, comment string) error {
+	n.put(poolID, comment)
+	return nil
+}
+func (n *wbNoopPoolService) DeletePool(_ context.Context, poolID string) error {
+	n.drop(poolID)
+	return nil
+}
+func (n *wbNoopPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return n.get(poolID)
 }
 
 type wbMockClient struct {
@@ -1740,6 +1746,7 @@ func TestStemcellCloudProps_validateLightMutex_Direct(t *testing.T) {
 // wbRecordingPoolService records AddVM and CreatePool calls for assertion.
 // Replaces wbNoopPoolService in tests that exercise pool assignment.
 type wbRecordingPoolService struct {
+	lockClaims
 	calls  []wbPoolCall
 	addErr error // when non-nil, returned from every AddVM call
 
@@ -1770,14 +1777,20 @@ func (p *wbRecordingPoolService) AddVM(_ context.Context, poolID string, vmid in
 func (p *wbRecordingPoolService) CreatePool(_ context.Context, poolID, comment string) error {
 	p.createCalls = append(p.createCalls, wbPoolCreateCall{poolID: poolID, comment: comment})
 	p.callOrder = append(p.callOrder, "create")
+	if p.createErr == nil {
+		p.put(poolID, comment)
+	}
 	return p.createErr
 }
-func (p *wbRecordingPoolService) DeletePool(_ context.Context, _ string) error { return nil }
+func (p *wbRecordingPoolService) DeletePool(_ context.Context, poolID string) error {
+	p.drop(poolID)
+	return nil
+}
 func (p *wbRecordingPoolService) MoveVMToPool(_ context.Context, _ string, _ int64) error {
 	return nil
 }
-func (p *wbRecordingPoolService) GetPoolComment(_ context.Context, _ string) (string, bool, error) {
-	return "", false, nil
+func (p *wbRecordingPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+	return p.get(poolID)
 }
 
 // buildEnsureTemplateDepsWithPool returns a Deps wired with a recording pool service.

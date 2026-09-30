@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
@@ -368,5 +369,62 @@ func TestManagedLifecycleLockObservation(t *testing.T) {
 	}
 	if _, err := guard.observePool(t.Context(), remove, nil); err == nil {
 		t.Fatal("a present sentinel without delete evidence was observed as deleted")
+	}
+}
+
+// storeClient serves one pool service to a guard.
+type storeClient struct {
+	pve.Client
+	pools pve.PoolService
+}
+
+func (c storeClient) Pools() pve.PoolService { return c.pools }
+
+// TestGuardedAcquireNeverSharesAWindowWithAStealer runs three contenders for
+// one parker lock through a guard. Holder H crashed, so its claim expired, and
+// stealers S1 and S3 both read that expired claim. S1 deletes H's sentinel.
+// Waiter W's create then lands and succeeds, and S3's steal deletes W's fresh
+// sentinel and recreates its own, which S3 verifies and holds. The guard
+// settles W's displaced create as observed, so the lock code must read its
+// claim back, find S3's, and wait instead of entering S3's window too.
+func TestGuardedAcquireNeverSharesAWindowWithAStealer(t *testing.T) {
+	locks := newLockContention(t)
+	sentinel := pve.ClusterLockPoolName("vm-90000")
+	s3Claim := fmt.Sprintf("owner=steal/90000@3-1 exp=%d", time.Now().Add(time.Hour).Unix())
+	locks.afterCreate = func(pool string) {
+		if pool == sentinel {
+			locks.pools[pool] = s3Claim
+			locks.afterCreate = nil
+		}
+	}
+	client := storeClient{pools: contendedPools{locks: locks}}
+	failed := 0
+	guard, err := NewManagedAllocationGuard(client, ManagedAllocationHooks{
+		Before: func(context.Context, ManagedAllocationMutation) (string, error) { return "step", nil },
+		After: func(ctx context.Context, call ManagedAllocationMutation, _ string, result any) error {
+			return observeLockPoolMutation(ctx, client.Pools(), call, result, "test")
+		},
+		Failed: func(context.Context, ManagedAllocationMutation, string, error) error {
+			failed++
+			return errors.New("allocation requires reconciliation")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := pve.AcquireClusterLock(t.Context(), guard.Client().Pools(), "vm-90000", "unpark/90000@9-1", time.Minute, 1500*time.Millisecond)
+	if handle != nil {
+		t.Fatal("the waiter took a lock handle while the stealer holds the sentinel, so both are inside one window")
+	}
+	if !errors.Is(err, pve.ErrClusterLockTimeout) {
+		t.Fatalf("want the waiter to time out behind the stealer, got %v", err)
+	}
+	if guard.Err() != nil || failed != 0 {
+		t.Fatalf("waiting behind a stealer poisoned the guard: %v", guard.Err())
+	}
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if locks.pools[sentinel] != s3Claim {
+		t.Fatalf("the stealer's claim was disturbed: %q", locks.pools[sentinel])
 	}
 }
