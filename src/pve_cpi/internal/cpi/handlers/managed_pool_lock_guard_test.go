@@ -718,6 +718,24 @@ func TestPoisonedGuardLeavesAClaimItCannotProve(t *testing.T) {
 	})
 }
 
+// TestPoisonedGuardLockCreateIsMarkedNotAttempted pins the mark on a lock
+// create that a poisoned guard refuses. Like every other write on the guard,
+// the create is refused before it reaches PVE. The parker lock fails its call
+// retriable on the mark, where an unmarked fault would let its window run
+// unserialized.
+func TestPoisonedGuardLockCreateIsMarkedNotAttempted(t *testing.T) {
+	pools := &lockGuardPools{}
+	guard := newLockGuard(t, pools, &lockGuardEvents{})
+	_ = guard.Poison(errors.New("an earlier write was uncertain"))
+	err := guard.Client().Pools().CreatePool(t.Context(), lockGuardPool, "owner=x exp=9999999999")
+	if !errors.Is(err, pve.ErrMutationNotAttempted) {
+		t.Fatalf("the poisoned guard's lock create was not marked not attempted: %v", err)
+	}
+	if len(pools.calls) != 0 {
+		t.Fatalf("the poisoned guard's lock create reached PVE: %v", pools.calls)
+	}
+}
+
 // TestGuardedReleaseReadFailureNeverReadsAWaiterAsUnobserved pins why a
 // guarded release refuses its delete when its read right before the delete
 // fails. A waiter polls for exactly the moment our sentinel goes, and its new

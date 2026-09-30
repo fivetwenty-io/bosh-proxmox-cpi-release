@@ -109,7 +109,8 @@ func (g *ManagedAllocationGuard) forgetLockRefusal(poolID string) {
 // there is nothing to admit or journal. Any other answer, including a
 // different claim, a missing sentinel, or a failed read, lets the create go
 // through the guard as usual, and an expired holder is still stolen through the
-// guarded delete. A poisoned guard answers with its poison, as begin would.
+// guarded delete. A poisoned guard answers with its poison marked as not
+// attempted, as begin would.
 func (t *managedPoolService) repeatLockRefusal(ctx context.Context, poolID string) (bool, error) {
 	if !isManagedLockPool(poolID) {
 		return false, nil
@@ -118,7 +119,7 @@ func (t *managedPoolService) repeatLockRefusal(ctx context.Context, poolID strin
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.poisoned != nil {
-		return true, g.poisoned
+		return true, &managedMutationNotAttempted{err: g.poisoned}
 	}
 	last, ok := g.lockRefusals[poolID]
 	if !ok {
