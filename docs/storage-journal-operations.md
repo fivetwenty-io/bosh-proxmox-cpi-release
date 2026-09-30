@@ -34,6 +34,18 @@ cpi storage-journal audit --config /path/to/cpi.json
 
 The audit reports cluster continuity, generation-index health, retained record summaries, exact recorded CIDs, observed provenance, and incomplete access. A readable record does not establish a healthy index. Resolve access failures before relying on absence, including access to stores removed from current placement policy.
 
+The journal opens only for the user that owns it, so we run the audit as that user. On a Director the owner is `vcap`, the binary lives in the job's package, and no `cpi` is on the `PATH`, so the full command is this one.
+
+```sh
+sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json
+```
+
+Plain `sudo` runs the audit as root, and the CLI then stops with `journal <path> is owned by vcap; rerun as that user:` followed by the command to rerun. A config the current user cannot read stops it the same way, with `config <path> is not readable by <user>`. Under `bosh create-env` the CPI runs on our workstation as our own user, so we run the command as ourselves, with the binary and config paths that deployment uses. Every audit-gated refusal ends with the exact command for the host that raised it.
+
+Without `--summary`, the audit prints JSON. Four lists in the `audit` object say what it found. `conflicts` holds evidence that contradicts the journal. `issues` holds every read that failed, and `vm_scan_issues` repeats the ones that left the VM scan incomplete. Those are the issues that also block `create_vm`. `observed_moves` holds each VM, disk, or parker that the cluster operator moved to another node on shared storage and that the audit accepted. Each move carries `allocation_id`, `kind` (`vm`, `disk`, or `parker`), `vmid`, `recorded_nodes`, `observed_node`, and `volumes`, which lists every volume the audit checked before it accepted the move. The audit decides each move afresh and never writes one into the journal, so a move stays in this list only while the VM stays where it is. [Troubleshooting](troubleshooting.md#an-operation-fails-with-an-allocation-audit-refusal) lists the conditions a move has to meet.
+
+`--summary` prints the same audit as plain text, one line per finding, for a Director that has no `jq`. The first line gives `complete`, `vm_scan_complete`, `generation_index_healthy`, `cluster_continuity`, and the record count. After it come lines that begin with `conflict:`, `vm-scan issue:`, `issue:`, and `observed move:`, then the charging summary, and then any skipped disabled storages. The exit code is the same in both modes. The command exits 1 when the audit or its VM scan is incomplete, when the generation index is unhealthy, or when cluster continuity is lost, and it exits 0 otherwise. `audit-enrollment` takes `--summary` too, and it adds one `provenance:` line for each existing provenance entry, since existing provenance is what makes `initialize` refuse. Every other action rejects the flag.
+
 For a proposed deployment request, `pve-cid storage-plan` explains current placement without reserving capacity or claiming allocation ownership. Use the [configuration examples](../manifests/examples/multi-storage-placement/README.md) to prepare its sanitized request file.
 
 ## Restore authority or repair its index
