@@ -117,6 +117,46 @@ func lifecycleFlowFixture(t *testing.T) (Deps, *lifecycleFlowPVE, *aj.Journal, s
 }
 func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (Deps, *lifecycleFlowPVE, *aj.Journal, string, string) {
 	t.Helper()
+	state := &managedDiskTestState{configs: map[int]map[string]any{}, volumes: map[string]*nodes.GetStorageContentResponse{}, pools: map[string]string{}}
+	client := &lifecycleFlowPVE{managedDiskTestPVE: managedDiskTestPVE{state: state}}
+	identity, err := pve.ObserveStorageClusterIdentity(context.Background(), client.Nodes(), []string{"n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := aj.Initialize(context.Background(), dir, lifecycleFlowNamespace, aj.Enrollment{ClusterID: identity.ID(), AuthorityID: "authority", AuditID: "audit", PreviousWriterFenced: true, CompleteHistoricalAudit: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	disk := journalLifecycleFlowDisk(t, journal, state, returned, len(anchored) > 0 && anchored[0])
+	state.configs[777] = map[string]any{"name": "workload", "digest": "1", "scsi1": disk.volume + ",serial=" + disk.token + ",size=5G"}
+	// All original storage sets and role bindings have been removed.
+	deps := Deps{PVE: client, Config: &config.CPIConfig{Node: "n1", DiskStorage: disk.storage, StoragePlacementNamespace: lifecycleFlowNamespace, StorageAllocationJournalDir: dir}}
+	return deps, client, journal, disk.id, disk.cid
+}
+
+// lifecycleFlowNamespace is the placement namespace planFixture plans in, and
+// so the one every flow fixture journal is initialized with.
+const lifecycleFlowNamespace = "director"
+
+// lifecycleFlowDisk is one journal-managed persistent disk in a flow fixture.
+type lifecycleFlowDisk struct {
+	id, cid, volume, token, storage string
+}
+
+// journalLifecycleFlowDisk plans a 5 GiB persistent disk the way create_disk
+// does, journals its observed creation, and places its volume on storage. The
+// volume starts without a holder, and the caller decides what holds it.
+func journalLifecycleFlowDisk(t *testing.T, journal *aj.Journal, state *managedDiskTestState, returned, anchored bool) lifecycleFlowDisk {
+	t.Helper()
 	id, err := aj.NewAllocationID()
 	if err != nil {
 		t.Fatal(err)
@@ -142,29 +182,13 @@ func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (D
 	if err != nil {
 		t.Fatal(err)
 	}
+	if plan.Namespace != lifecycleFlowNamespace {
+		t.Fatalf("disk planned in namespace %q, want %q", plan.Namespace, lifecycleFlowNamespace)
+	}
 	intent, err := storageJournalIntent("create_disk", []json.RawMessage{planJSON(t, 5120)}, selection, request.Inventory, plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := &managedDiskTestState{configs: map[int]map[string]any{}, volumes: map[string]*nodes.GetStorageContentResponse{}, pools: map[string]string{}}
-	client := &lifecycleFlowPVE{managedDiskTestPVE: managedDiskTestPVE{state: state}}
-	identity, err := pve.ObserveStorageClusterIdentity(context.Background(), client.Nodes(), []string{"n1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	journal, err := aj.Initialize(context.Background(), dir, plan.Namespace, aj.Enrollment{ClusterID: identity.ID(), AuthorityID: "authority", AuditID: "audit", PreviousWriterFenced: true, CompleteHistoricalAudit: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := journal.Close(); err != nil {
-			t.Error(err)
-		}
-	})
 	handle, err := journal.CreateDisk(context.Background(), id, intent)
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +200,7 @@ func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (D
 	target := plan.Targets[0]
 	volume := target.StorageID + ":123/" + name
 	token := handle.Record().DiskToken
-	cid, err := pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: token, Format: "raw", Anchor: len(anchored) > 0 && anchored[0]})
+	cid, err := pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: token, Format: "raw", Anchor: anchored})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,11 +222,8 @@ func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (D
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)
 	}
-	state.configs[777] = map[string]any{"name": "workload", "digest": "1", "scsi1": volume + ",serial=" + token + ",size=5G"}
 	state.volumes[volume] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
-	// All original storage sets and role bindings have been removed.
-	deps := Deps{PVE: client, Config: &config.CPIConfig{Node: "n1", DiskStorage: target.StorageID, StoragePlacementNamespace: plan.Namespace, StorageAllocationJournalDir: dir}}
-	return deps, client, journal, id, cid
+	return lifecycleFlowDisk{id: id, cid: cid, volume: volume, token: token, storage: target.StorageID}
 }
 func TestManagedDiskResizeAfterSetRemoval(t *testing.T) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)

@@ -21,13 +21,45 @@ import (
 // admission audit accepted, which crashed-delete cleanup reads back.
 const managedVMCleanupAdmissionOperation = "VM cleanup admission"
 
+// managedVMDisposal names the operation a disposal runs for, which decides how
+// a failure partway through is settled.
+type managedVMDisposal int
+
+const (
+	// managedVMDeletion disposes of a VM for delete_vm or for an operator's
+	// storage-journal cleanup. A retry of either one resumes the disposal.
+	managedVMDeletion managedVMDisposal = iota
+	// managedVMCreateRollback disposes of a create_vm attempt so that a retry
+	// can build a fresh VM. A retry of create_vm never resumes a disposal.
+	managedVMCreateRollback
+)
+
+// settle applies the failure rule for this kind of disposal.
+func (d managedVMDisposal) settle(handle *aj.Handle, err error) error {
+	if d == managedVMCreateRollback {
+		return managedVMRollbackFailure(handle, err)
+	}
+	return managedVMCleanupFailure(handle, err)
+}
+
 // cleanupManagedVMAttempt returns fresh disposition evidence without closing the
 // generation. The caller may close the attempt, admit a retry, or tombstone it.
 func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
 	return disposeManagedVM(ctx, deps, journal, handle, false)
 }
 
-func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool) (proof aj.Verification, retErr error) {
+// rollbackManagedVMAttempt is cleanupManagedVMAttempt for a create_vm attempt
+// that failed. It runs the same disposal, and any failure after the disposal
+// was admitted leaves the generation requiring reconciliation.
+func rollbackManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
+	return disposeManagedVMFor(ctx, deps, journal, handle, false, managedVMCreateRollback)
+}
+
+func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool) (aj.Verification, error) {
+	return disposeManagedVMFor(ctx, deps, journal, handle, retain, managedVMDeletion)
+}
+
+func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool, disposal managedVMDisposal) (proof aj.Verification, retErr error) {
 	if handle == nil || journal == nil {
 		return proof, storageRefusal("VM cleanup requires held journal authority")
 	}
@@ -102,7 +134,7 @@ func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handl
 	if err := handle.Save(record); err != nil {
 		return proof, err
 	}
-	defer func() { retErr = managedVMCleanupFailure(handle, retErr) }()
+	defer func() { retErr = disposal.settle(handle, retErr) }()
 	if err := cleanupManagedVMInfrastructure(ctx, deps, journal, handle, node, vmid); err != nil {
 		return proof, storageCleanupFailure("vm_infrastructure", err)
 	}
@@ -435,11 +467,11 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 	return proof, nil
 }
 
-// managedVMCleanupFailure settles a VM cleanup failure. Preserving a
-// persistent disk can wait out another request's parker window and return the
-// disk unchanged. When every step this cleanup wrote is observed, nothing is
-// uncertain and the retry resumes from here. Anything else requires
-// reconciliation.
+// managedVMCleanupFailure settles a failure while delete_vm or an operator's
+// cleanup disposes of a VM. Preserving a persistent disk can wait out another
+// request's parker window and return the disk unchanged. When every step this
+// cleanup wrote is observed, nothing is uncertain, and the retried delete
+// resumes the disposal from here. Anything else requires reconciliation.
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
@@ -448,6 +480,21 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 		return err
 	}
 	return errors.Join(err, storageAllocationUncertain(handle, "VM cleanup"))
+}
+
+// managedVMRollbackFailure settles a failure while create_vm rolls back one of
+// its attempts. By then the disposal has recorded its deletion admission and
+// may have stopped the guest or removed its HA resource, so the generation is
+// half disposed. A create_vm retry would resume it as a create, which is never
+// safe, so every failure requires reconciliation. That includes a persistent
+// disk preservation that waited out a parker lock and changed nothing. The
+// reconciliation error leads the joined error, so the Director reads it ahead
+// of the timeout's retriable type.
+func managedVMRollbackFailure(handle *aj.Handle, err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.Join(storageAllocationUncertain(handle, "VM create rollback"), err)
 }
 
 func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {
