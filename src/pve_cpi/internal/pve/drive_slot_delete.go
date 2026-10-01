@@ -33,6 +33,15 @@ const (
 	// caller wants, and a stop of the VM applies it, so it doesn't revert it.
 	// The error carries no Cause.
 	DriveDeletePendingFound DriveDeletePendingReason = "found_pending"
+	// DriveDeletePendingReplaced means the slot carries a pending value that
+	// names a different volume than its current drive, so DeleteDriveSlot sent
+	// nothing. A delete there would either re-arm the old drive's pending
+	// delete and keep the pending value, or drop the pending value's
+	// reference, and neither is the detach the caller asked for. PVE applies
+	// the change at the VM's next clean stop, or at its next start when the VM
+	// is already stopped, and the slot is an ordinary one after that. The
+	// error carries no Cause.
+	DriveDeletePendingReplaced DriveDeletePendingReason = "pending_replacement"
 )
 
 // DriveDeletePendingError is the one error DeleteDriveSlot returns when PVE
@@ -72,6 +81,9 @@ func (e *DriveDeletePendingError) Error() string {
 	case DriveDeletePendingFound:
 		text = fmt.Sprintf("the delete of slot %s on VM %d (node %s) was already pending, left by an earlier attempt or an operator, "+
 			"and we left it alone, so the running guest still has the disk", e.Slot, e.VMID, e.Node)
+	case DriveDeletePendingReplaced:
+		text = fmt.Sprintf("slot %s on VM %d (node %s) carries a pending change to another volume, so we didn't send its delete",
+			e.Slot, e.VMID, e.Node)
 	default:
 		text = fmt.Sprintf("the guest on VM %d (node %s) still holds the disk on slot %s, so PVE recorded its delete as pending, "+
 			"and we reverted it, so the disk is still attached", e.VMID, e.Node, e.Slot)
@@ -106,6 +118,10 @@ func IsDriveDeletePending(err error) (*DriveDeletePendingError, bool) {
 // and the caller chooses whether to retry. A busy unplug is retried first, on
 // the transient budget maxAttempts selects.
 //
+// It reads the pending view before the delete too. A slot whose pending value
+// names a different volume than its current drive isn't one a delete can
+// detach, so it sends nothing and returns DriveDeletePendingReplaced.
+//
 // digest guards the first attempt only. A delete that left a pending entry
 // changes the config digest, so a retry with the same digest would fail for
 // that reason alone. A guard-wrapped managed client supplies its own digest on
@@ -120,6 +136,17 @@ func DeleteDriveSlot(
 ) error {
 	if c == nil || c.Nodes() == nil {
 		return cpierrors.Cloud("DeleteDriveSlot: nodes service not available")
+	}
+	before, beforeErr := ReadQemuViews(ctx, c, node, vmid)
+	if beforeErr != nil {
+		if IsNotFound(beforeErr) {
+			return beforeErr
+		}
+		return cpierrors.Wrap(WrapConfigReadError(beforeErr),
+			fmt.Sprintf("read the pending view of VM %d (node %s) before deleting slot %s", vmid, node, slot))
+	}
+	if _, replaced := before.PendingReplacements()[slot]; replaced {
+		return &DriveDeletePendingError{Reason: DriveDeletePendingReplaced, Node: node, VMID: vmid, Slot: slot}
 	}
 	vmidText := strconv.Itoa(vmid)
 	first := true

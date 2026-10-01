@@ -221,33 +221,39 @@ func deleteDiskVolume(ctx context.Context, deps Deps, diskCID, bareDiskCID, stor
 }
 
 // refusePendingDeleteHolder refuses to delete a disk whose holder is an
-// ordinary VM with a pending delete on the disk's slot. The Director believes
-// the disk is detached, but the running guest still has it plugged in, and
-// PVE's content delete has no in-use check. A pending delete doesn't clear
-// while the VM runs, so the refusal isn't retriable.
+// ordinary VM with a pending change on the disk's slot. The change is a
+// pending delete, or a pending value that names another volume. Either way the
+// Director believes the disk is detached, while the VM's current config still
+// names it and a running guest still has it plugged in. PVE's content delete
+// has no in-use check. A pending change doesn't apply while the VM runs, so
+// the refusal isn't retriable.
 //
-// The text tells the operator to let the delete apply by stopping the VM and
-// then to rerun the clean-up, and it never suggests reverting the pending
-// delete. The Director sends delete_disk only for a disk it treats as
-// orphaned, so a revert would put the disk back on the VM while the Director
-// still wants it gone, and the next delete_disk would then delete the volume
-// from under the running VM, with only the optional lock guard in the way.
-// detach_disk reverts its own pending delete for the opposite reason, because
-// there the Director still believes the disk is attached.
+// The text tells the operator to let the change apply, by stopping the VM if
+// it's running or starting it if it's already stopped, and then to rerun the
+// clean-up. It never suggests reverting the change. The Director sends
+// delete_disk only for a disk it treats as orphaned, so a revert would put the
+// disk back on the VM while the Director still wants it gone, and the next
+// delete_disk would then delete the volume from under the running VM, with
+// only the optional lock guard in the way. detach_disk reverts its own pending
+// delete for the opposite reason, because there the Director still believes
+// the disk is attached.
 //
-// An ordinary holder with no pending delete stays with the optional lock
-// guard, as before.
+// An ordinary holder with nothing pending stays with the optional lock guard,
+// as before.
 func refusePendingDeleteHolder(diskCID string, holder pve.DiskHolder) error {
-	if !holder.Found || holder.IsParker || holder.PendingDeleteSlot == "" {
+	if !holder.Found || holder.IsParker || holder.PendingSlot == "" {
 		return nil
 	}
-	return pendingDeleteRefusal(diskCID, holder.VMID, holder.Node, holder.PendingDeleteSlot)
+	if holder.PendingChange == pve.PendingChangeReplaced {
+		return pendingReplacementRefusal(diskCID, holder.VMID, holder.Node, holder.PendingSlot)
+	}
+	return pendingDeleteRefusal(diskCID, holder.VMID, holder.Node, holder.PendingSlot)
 }
 
 // refuseDeleteBeforeLifecycle runs delete_disk's refusals that come before a
 // managed lifecycle opens. It refuses a disk stranded on an unused entry, and a
-// disk whose holder, as the identity resolution found it, still has it plugged
-// in on a slot whose delete is pending.
+// disk whose holder, as the identity resolution found it, still names it on a
+// slot with a pending delete or a pending change to another volume.
 func refuseDeleteBeforeLifecycle(deps Deps, rd resolvedDisk) error {
 	if err := refuseStrandedDelete(deps, rd); err != nil {
 		return err
@@ -262,14 +268,30 @@ func refuseDeleteBeforeLifecycle(deps Deps, rd resolvedDisk) error {
 // troubleshooting entry that says why a revert is the wrong way out.
 const pendingDeleteRunbook = `see "delete_disk refuses a disk whose slot delete is pending" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
 
+// pendingChangeInstruction is what both pending refusals tell the operator to
+// do. A clean stop applies a running VM's pending changes, and a start applies
+// a stopped VM's before the guest boots (QemuServer.pm:6250, :6281, and :5549
+// at qemu-server a7b4240b).
+const pendingChangeInstruction = "Stop the VM if it's running, or start it if it's already stopped, which applies the change before " +
+	"the guest boots, and then rerun the clean-up"
+
 // pendingDeleteRefusal is delete_disk's refusal for a disk that VM vmid still
-// has plugged in on slot, whose delete PVE has only recorded as pending.
+// names on slot, whose delete PVE has only recorded as pending.
 func pendingDeleteRefusal(diskCID string, vmid int, node, slot string) error {
 	return cpierrors.Cloud(
-		"delete_disk: refusing to delete disk %s, because VM %d on node %s still has it plugged in on slot %s, and PVE has "+
-			"only recorded that slot's delete as pending. Let the delete apply by stopping VM %d at a convenient time, and then "+
-			"rerun the clean-up. Nothing was deleted; %s",
-		diskCID, vmid, node, slot, vmid, pendingDeleteRunbook)
+		"delete_disk: refusing to delete disk %s, because VM %d on node %s still names it on slot %s, and PVE has "+
+			"only recorded that slot's delete as pending. %s. Nothing was deleted; %s",
+		diskCID, vmid, node, slot, pendingChangeInstruction, pendingDeleteRunbook)
+}
+
+// pendingReplacementRefusal is delete_disk's refusal for a disk that VM vmid
+// still names as slot's current drive, while the slot carries a pending value
+// that names another volume.
+func pendingReplacementRefusal(diskCID string, vmid int, node, slot string) error {
+	return cpierrors.Cloud(
+		"delete_disk: refusing to delete disk %s, because VM %d on node %s still names it on slot %s, and the slot "+
+			"carries a pending change to another volume. %s. Nothing was deleted; %s",
+		diskCID, vmid, node, slot, pendingChangeInstruction, pendingDeleteRunbook)
 }
 
 // resolveDeleteDiskCID is delete_disk's identity seam: decode the CID, map it
@@ -322,9 +344,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if decErr != nil {
 			return nil, decErr
 		}
-		// A disk stranded on an unused entry, or still plugged into a running
-		// guest whose slot delete is pending, is refused before a managed
-		// lifecycle opens, so the refusal leaves its record as it was.
+		// A disk stranded on an unused entry, or still named on a slot with a
+		// pending delete or a pending change to another volume, is refused
+		// before a managed lifecycle opens, so the refusal leaves its record
+		// as it was.
 		if err := refuseDeleteBeforeLifecycle(deps, rd); err != nil {
 			return nil, err
 		}

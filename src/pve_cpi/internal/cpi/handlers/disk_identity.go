@@ -107,13 +107,21 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 		log.Int("parker_vmid", rd.intent.ParkerVMID),
 	)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts})
+	pctx.ApplyFoundPendingDelete = resumeAppliesFoundPendingDelete(op)
 	parkerCfg := parkerWriteConfigFor(deps)
 	if _, err := resumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerCfg, pctx); err != nil {
-		// The resume found the source's delete pending and left it alone.
-		// delete_disk gives the same refusal it gives a holder with a pending
-		// delete, and every other operation retries until the VM stops.
-		if pending, found := pve.IsDriveDeletePending(err); found && op == "delete_disk" && pending.Reason == pve.DriveDeletePendingFound {
-			return resolvedDisk{}, pendingDeleteRefusal(rd.diskCID, pending.VMID, pending.Node, pending.Slot)
+		// The resume found the source's delete pending and left it alone, or
+		// found the source's slot carrying a pending change to another volume.
+		// delete_disk gives the same refusal the holder route gives for each
+		// shape, whichever route finds it, and every other operation retries
+		// until the VM's next clean stop or start applies the change.
+		if pending, found := pve.IsDriveDeletePending(err); found && op == "delete_disk" {
+			switch pending.Reason {
+			case pve.DriveDeletePendingFound:
+				return resolvedDisk{}, pendingDeleteRefusal(rd.diskCID, pending.VMID, pending.Node, pending.Slot)
+			case pve.DriveDeletePendingReplaced:
+				return resolvedDisk{}, pendingReplacementRefusal(rd.diskCID, pending.VMID, pending.Node, pending.Slot)
+			}
 		}
 		if pending := driveDeletePendingDiskError(op, err); pending != nil {
 			return resolvedDisk{}, pending
@@ -126,6 +134,17 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	// parker's own node rather than the one this request is aimed at.
 	sweepParkerPool(ctx, deps, rd.intent.ParkerNode, parkerCfg)
 	return resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
+}
+
+// resumeAppliesFoundPendingDelete reports whether op moves the disk off its
+// source, so a resume it runs applies a pending delete it finds on a stopped
+// source rather than leave it alone. detach_disk and attach_disk move the disk,
+// and so does delete_vm's preservation, which runs the detach. delete_disk
+// keeps its refusal on both routes, because the holder scan refuses a stopped
+// holder with a pending delete and the resume must give the same answer, and
+// update_disk only needs the disk parked where it already is.
+func resumeAppliesFoundPendingDelete(op string) bool {
+	return op == "detach_disk" || op == "attach_disk"
 }
 
 // parkerWriteConfigFor is parkerReadConfigFor plus the park-only fields a

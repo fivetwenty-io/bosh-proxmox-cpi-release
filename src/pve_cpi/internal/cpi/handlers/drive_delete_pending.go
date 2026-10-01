@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -40,8 +41,10 @@ func classPendingDelete(classed *cpierrors.Error, pending *pve.DriveDeletePendin
 // succeed while the VM runs with it. An unconfirmed revert is retriable, so the
 // operator and the next attempt both know a pending delete may still be there,
 // and the next attempt reverts it again. A pending delete that a resume found
-// and left alone is retriable, because a stop of the VM applies it and the
-// transfer then finishes.
+// and left alone is retriable, because the VM's next clean stop applies it and
+// the transfer then finishes. A slot whose pending value replaces its drive is
+// retriable too, because the next clean stop, or the next start of a stopped
+// VM, applies that change, and the slot is an ordinary one after it.
 func driveDeletePendingDiskError(op string, err error) error {
 	pending, ok := pve.IsDriveDeletePending(err)
 	if !ok {
@@ -63,7 +66,13 @@ func driveDeletePendingDiskError(op string, err error) error {
 	case pve.DriveDeletePendingFound:
 		return classPendingDelete(cpierrors.Retriable(
 			"%s: an earlier attempt or an operator left the delete of slot %s on VM %d (node %s) pending, so the running guest still "+
-				"has the disk, and nothing was attached to a parker. The transfer finishes once the VM stops and PVE applies the delete",
+				"has the disk, and nothing was attached to a parker. %s",
+			op, pending.Slot, pending.VMID, pending.Node, foundPendingApplies(op)), pending)
+	case pve.DriveDeletePendingReplaced:
+		return classPendingDelete(cpierrors.Retriable(
+			"%s: slot %s on VM %d (node %s) carries a pending change from one volume to another, so we changed nothing on it. "+
+				"PVE applies the change at the VM's next clean stop, or at its next start when the VM is already stopped, "+
+				"and the next attempt then goes ahead",
 			op, pending.Slot, pending.VMID, pending.Node), pending)
 	default:
 		return classPendingDelete(cpierrors.Retriable(
@@ -71,6 +80,19 @@ func driveDeletePendingDiskError(op string, err error) error {
 				"We reverted that pending delete, and the disk is still attached. A retry can succeed once the guest lets go of the disk",
 			op, pending.VMID, pending.Node, pending.Slot), pending)
 	}
+}
+
+// foundPendingApplies says what applies a pending delete the resume found and
+// left alone. An operation that moves the disk has the resume apply a found
+// delete on a stopped source itself, so it only ever leaves one alone on a
+// running VM, which applies it at its next clean stop. Any other operation
+// leaves it alone on a stopped VM too, which applies it at its next start.
+func foundPendingApplies(op string) string {
+	if resumeAppliesFoundPendingDelete(op) {
+		return "PVE applies the delete at the VM's next clean stop, and the transfer then finishes"
+	}
+	return "PVE applies the delete at the VM's next clean stop, or at its next start when the VM is already stopped, " +
+		"and the transfer then finishes"
 }
 
 // deleteVMStop says how far delete_vm's stop had got when it detached the VM's
@@ -98,6 +120,13 @@ func deleteVMDriveDeletePendingError(err error, vmCID string, stop deleteVMStop)
 	pending, ok := pve.IsDriveDeletePending(err)
 	if !ok {
 		return err
+	}
+	if pending.Reason == pve.DriveDeletePendingReplaced {
+		return classPendingDelete(cpierrors.Retriable(
+			"delete_vm: refusing to destroy VM %s yet, because slot %s on VM %d carries a pending change from one volume to "+
+				"another, so we couldn't detach the disk there. PVE applies the change at the VM's next clean stop, or at its "+
+				"next start when the VM is already stopped, and then the next delete_vm goes ahead. Nothing was destroyed",
+			vmCID, pending.Slot, pending.VMID), pending)
 	}
 	if pending.Reason == pve.DriveDeletePendingFound {
 		if stop == deleteVMStopAwaited {
@@ -138,7 +167,9 @@ func deleteVMDriveDeletePendingError(err error, vmCID string, stop deleteVMStop)
 // and offers no revert, because a revert keeps the current drive and drops
 // the other volume's reference, and only the operator can choose which one
 // to keep. It runs only on reads after delete_vm's stop, so that stop gets
-// the chance to apply the change.
+// the chance to apply the change. The refusal comes before anything on the VM
+// changes, so a journal-managed delete_vm hands its record back resumable
+// rather than uncertain (see managedVMCleanupFailure).
 func refusePendingDriveReplacement(op, vmCID string, holding pve.QemuHolding) error {
 	if len(holding.Replaced) == 0 {
 		return nil
@@ -152,9 +183,40 @@ func refusePendingDriveReplacement(op, vmCID string, holding pve.QemuHolding) er
 	for _, key := range keys {
 		slots = append(slots, fmt.Sprintf("%s (%s)", key, strings.Join(holding.Volumes(key), " and ")))
 	}
-	return cpierrors.Retriable(
+	return &pendingDriveReplacementRefusal{classed: cpierrors.Retriable(
 		"%s: refusing to destroy VM %s yet, because a pending drive change puts a second volume on %s, and the destroy "+
 			"would take a volume either value names. PVE applies the change at the VM's next clean stop, or at its next start "+
 			"when the VM is already stopped, and then the next attempt goes ahead. Nothing was destroyed",
-		op, vmCID, strings.Join(slots, ", "))
+		op, vmCID, strings.Join(slots, ", "))}
+}
+
+// pendingDriveReplacementRefusal is the error refusePendingDriveReplacement
+// returns. Its text and class are the classed error's, which is what the
+// dispatcher finds and sends to the Director, and its type tells a
+// journal-managed delete_vm that the refusal changed nothing.
+type pendingDriveReplacementRefusal struct {
+	classed *cpierrors.Error
+}
+
+func (e *pendingDriveReplacementRefusal) Error() string { return e.classed.Error() }
+
+func (e *pendingDriveReplacementRefusal) Unwrap() error { return e.classed }
+
+// isWholePendingDriveReplacementRefusal reports whether err is the refusal
+// refusePendingDriveReplacement returns and nothing else. It follows only
+// single-error unwrapping and gives up at the first error that joins several,
+// because a refusal joined with another failure, such as the reconciliation a
+// preservation records when its unlink fails, isn't a refusal that changed
+// nothing.
+func isWholePendingDriveReplacementRefusal(err error) bool {
+	for err != nil {
+		if _, ok := err.(*pendingDriveReplacementRefusal); ok { //nolint:errorlint // The walk unwraps one error at a time itself, so it can stop at a joined error, which errors.As would search through.
+			return true
+		}
+		if _, joined := err.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }

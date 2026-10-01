@@ -192,6 +192,11 @@ type ParkContext struct {
 	// overrides survive the park and are merged back into the drive string at
 	// the next attach. Empty means no overrides are recorded.
 	Opts map[string]string
+	// ApplyFoundPendingDelete lets ResumeDiskTransferToParker apply a pending
+	// delete it finds on a stopped source, rather than leave it alone. Only a
+	// caller whose request moves the disk off the source sets it. It isn't
+	// part of the provenance entry.
+	ApplyFoundPendingDelete bool
 }
 
 // parkerProvEntry is a single parked-disk record stored in the sentinel.
@@ -1275,9 +1280,11 @@ type diskHolder struct {
 	// the referencing guest runs on. It is set even when no holder was found,
 	// because that is the case a caller is about to prove an absence for.
 	storageReferences StorageReferenceCounts
-	// pendingDeleteSlot names the holder's slot for the volume when PVE could
-	// only record its delete as pending, and is empty otherwise.
-	pendingDeleteSlot string
+	// pendingSlot names the holder's slot for the volume when a pending
+	// change hides the volume from the config endpoint's view, and
+	// pendingChange says which change. pendingSlot is empty otherwise.
+	pendingSlot   string
+	pendingChange PendingChange
 }
 
 // resolveDiskHolder answers "who holds this volid, and is it a parker?" in a
@@ -1304,10 +1311,9 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	// from the scan, so a caller that needs to tell a stranded parker from an
 	// ordinary VM can do it without a second read.
 	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
-		return diskHolder{
-			found: true, vmid: holderVMID, node: holderNode, tags: holderTags, storageReferences: refs,
-			pendingDeleteSlot: pendingDeleteSlotOf(hit),
-		}, nil
+		holder := diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: holderTags, storageReferences: refs}
+		holder.pendingSlot, holder.pendingChange = pendingSlotOf(hit)
+		return holder, nil
 	}
 
 	vmCfg, cfgErr := c.QEMU().Config(ctx, holderNode, holderVMID)
@@ -1356,10 +1362,9 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 				log.String("tags", tagsRaw),
 			)
 		}
-		return diskHolder{
-			found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw, storageReferences: refs,
-			pendingDeleteSlot: pendingDeleteSlotOf(hit),
-		}, nil
+		holder := diskHolder{found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw, storageReferences: refs}
+		holder.pendingSlot, holder.pendingChange = pendingSlotOf(hit)
+		return holder, nil
 	}
 
 	slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
@@ -1474,11 +1479,14 @@ type DiskHolder struct {
 	// only when no scan ran. pve.ConfigReferenceCorroborator turns it into the
 	// second opinion an empty content listing needs.
 	StorageReferences StorageReferenceCounts
-	// PendingDeleteSlot names the holder's slot for the volume when PVE could
-	// only record that slot's delete as pending, and is empty otherwise. The
-	// config endpoint hides such a slot, but the running guest still has the
-	// disk. Slot stays parker-only.
-	PendingDeleteSlot string
+	// PendingSlot names the holder's slot for the volume when a pending change
+	// hides the volume from the config endpoint's view, and is empty
+	// otherwise. PendingChange says which change it is. A slot whose delete is
+	// pending is missing from that view, and a slot whose pending value names
+	// another volume shows that volume there, but either way the running
+	// guest still has the disk. Slot stays parker-only.
+	PendingSlot   string
+	PendingChange PendingChange
 }
 
 // ResolveDiskHolder answers "who holds this volid, and is it a parker?" with one
@@ -1503,7 +1511,7 @@ func ResolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	}
 	return DiskHolder{
 		Found: h.found, VMID: h.vmid, Node: h.node, IsParker: h.isParker, Slot: h.slot, Tags: h.tags,
-		StorageReferences: h.storageReferences, PendingDeleteSlot: h.pendingDeleteSlot,
+		StorageReferences: h.storageReferences, PendingSlot: h.pendingSlot, PendingChange: h.pendingChange,
 	}, nil
 }
 

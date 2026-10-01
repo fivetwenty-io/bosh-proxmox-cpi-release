@@ -29,6 +29,20 @@ func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *a
 	if err != nil {
 		return "", err
 	}
+	// The read runs after delete_vm's stop and takes both of PVE's views, so
+	// a slot whose delete a crash left pending is still the ephemeral
+	// volume's slot. The serial write below cancels that pending delete on
+	// the stopped VM, and the transfer then moves the volume off it. A
+	// pending drive replacement is refused before the retention opens, so
+	// the refusal changes nothing and leaves the record resumable.
+	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	if err != nil {
+		return "", err
+	}
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
+		return "", err
+	}
+	cfg := holding.Config
 	token, cid := disk.stableID, disk.diskCID
 	start := len(handle.Record().Steps)
 	session := &storageLifecycle{handle: handle, operation: "delete_vm_retain_ephemeral"}
@@ -58,10 +72,6 @@ func retainManagedEphemeralForVMDelete(ctx context.Context, deps Deps, handle *a
 		deps.recordStorageReconciliation(ctx, "required")
 		operationErr = errors.Join(operationErr, session.Uncertain("ephemeral retention incomplete"))
 	}()
-	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
-	if err != nil {
-		return "", err
-	}
 	volumes, err := managedVMConfigVolumes(cfg)
 	if err != nil {
 		return "", err

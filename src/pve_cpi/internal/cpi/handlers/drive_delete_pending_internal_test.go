@@ -287,14 +287,16 @@ func TestDetachDisk_LegacyRetryAfterAPendingDeleteWasLeftBehind(t *testing.T) {
 // TestDeleteDisk_RefusesAHolderWithAPendingDelete covers a disk whose holder's
 // slot has a pending delete, so the disk's CID otherwise looks free.
 // delete_disk refuses it with a non-retriable error that names the VM, the
-// node, and the slot, says to stop the VM and rerun the clean-up, and doesn't
-// suggest a revert. It deletes nothing.
+// node, and the slot, says to stop the VM if it's running or start it if it's
+// already stopped and then rerun the clean-up, and doesn't suggest a revert.
+// It deletes nothing.
 func TestDeleteDisk_RefusesAHolderWithAPendingDelete(t *testing.T) {
 	deps, client, volume, cid := legacyPendingFixture(t, "scsi2", "")
 	client.pending.holdDelete(777, client.state.configs[777], "scsi2")
 	_, err := HandleDeleteDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, cid)}, jsonrpc.Context{})
 	requirePermanent(t, err, "delete_disk")
-	requireText(t, err, "delete_disk", []string{"VM 777", "node n1", "slot scsi2", "stopping VM 777", "rerun the clean-up", "Nothing was deleted"}, "revert")
+	requireText(t, err, "delete_disk", []string{"VM 777", "node n1", "still names it on slot scsi2", "Stop the VM if it's running",
+		"start it if it's already stopped", "rerun the clean-up", "Nothing was deleted"}, "revert", "plugged in")
 	if client.state.volumes[volume] == nil || client.deletes != 0 {
 		t.Fatalf("delete_disk deleted the volume of a disk the running guest still has (deletes=%d)", client.deletes)
 	}
@@ -651,9 +653,10 @@ func requireLeftAlone(t *testing.T, c *idFakeClient, reverts, deletes int, where
 }
 
 // TestDetachDisk_ResumeLeavesAFoundPendingDeleteAlone covers detach_disk
-// through the resume window. The resume finds the source's delete pending,
-// leaves it alone, and attaches nothing, and detach_disk fails retriably,
-// because the transfer finishes once the VM stops.
+// through the resume window on a running source. The resume finds the
+// source's delete pending, leaves it alone, and attaches nothing, and
+// detach_disk fails retriably, because the VM's next clean stop applies the
+// delete and the transfer then finishes.
 func TestDetachDisk_ResumeLeavesAFoundPendingDeleteAlone(t *testing.T) {
 	deps, c, diskCID := pendingResumeFixture(t)
 	reverts, deletes := len(c.pending.reverts), len(c.pending.deleteCalls)
@@ -661,26 +664,35 @@ func TestDetachDisk_ResumeLeavesAFoundPendingDeleteAlone(t *testing.T) {
 	err := handleDetachStableID(pendingRowContext(), deps, "700", 700, resolveTransferDisk(t, deps, diskCID))
 	requireRetriable(t, err, "detach through the resume")
 	requireText(t, err, "detach through the resume",
-		[]string{"earlier attempt", "slot scsi1", "VM 700", "once the VM stops"}, "reverted", "revert it")
+		[]string{"earlier attempt", "slot scsi1", "VM 700", "next clean stop"}, "reverted", "revert it", "next start")
 	requireLeftAlone(t, c, reverts, deletes, "detach through the resume")
 }
 
 // TestDeleteDisk_ResumeLeavesAFoundPendingDeleteAlone covers delete_disk
 // through the resume window. It gets the same non-retriable refusal a holder
 // with a pending delete gets, whichever route finds the shape, and nothing is
-// reverted or deleted.
+// reverted or deleted. That holds on a stopped source too, where a resume for
+// detach_disk or attach_disk would apply the delete, because the holder scan
+// refuses a stopped holder with a pending delete and both routes must agree.
 func TestDeleteDisk_ResumeLeavesAFoundPendingDeleteAlone(t *testing.T) {
-	deps, c, diskCID := pendingResumeFixture(t)
-	reverts, deletes := len(c.pending.reverts), len(c.pending.deleteCalls)
+	for name, stopped := range map[string]bool{"running source": false, "stopped source": true} {
+		t.Run(name, func(t *testing.T) {
+			deps, c, diskCID := pendingResumeFixture(t)
+			if stopped {
+				c.pending.stop(700)
+			}
+			reverts, deletes := len(c.pending.reverts), len(c.pending.deleteCalls)
 
-	_, err := HandleDeleteDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, diskCID)}, jsonrpc.Context{})
-	requirePermanent(t, err, "delete_disk through the resume")
-	if want := pendingDeleteRefusal(diskCID, 700, "pve1", "scsi1").Error(); err.Error() != want {
-		t.Fatalf("delete_disk through the resume = %q, want the holder refusal %q", err, want)
-	}
-	requireLeftAlone(t, c, reverts, deletes, "delete_disk through the resume")
-	if len(c.destroyed) != 0 {
-		t.Fatalf("delete_disk destroyed %v", c.destroyed)
+			_, err := HandleDeleteDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, diskCID)}, jsonrpc.Context{})
+			requirePermanent(t, err, "delete_disk through the resume")
+			if want := pendingDeleteRefusal(diskCID, 700, "pve1", "scsi1").Error(); err.Error() != want {
+				t.Fatalf("delete_disk through the resume = %q, want the holder refusal %q", err, want)
+			}
+			requireLeftAlone(t, c, reverts, deletes, "delete_disk through the resume")
+			if len(c.destroyed) != 0 {
+				t.Fatalf("delete_disk destroyed %v", c.destroyed)
+			}
+		})
 	}
 }
 
@@ -993,4 +1005,250 @@ func TestDeleteVM_OwnedLegacyVolumeOnlyAPendingValueNamesRefusesBeforeTheStop(t 
 			}
 		})
 	}
+}
+
+// replacedSlot is what replacedSlotFixture builds: the fixture's deps and
+// client, and the slot's two volumes with their CIDs.
+type replacedSlot struct {
+	deps                Deps
+	client              *lifecycleFlowPVE
+	current, currentCID string
+	pending, pendingCID string
+}
+
+// replacedSlotFixture is legacyPendingFixture with a second legacy volume on
+// storage, and with VM 777's scsi2 keeping the first volume as its current
+// drive while a pending value names the second. An earlier release's attach
+// onto a slot whose delete was pending leaves that shape on a running VM.
+func replacedSlotFixture(t *testing.T) replacedSlot {
+	t.Helper()
+	var f replacedSlot
+	f.deps, f.client, f.current, f.currentCID = legacyPendingFixture(t, "scsi2", "")
+	f.pending = strings.Split(f.current, ":")[0] + ":9002/vm-9002-disk-0.raw"
+	f.client.state.volumes[f.pending] = f.client.state.volumes[f.current]
+	f.client.pending.holdReplacement(777, f.client.state.configs[777], "scsi2", f.pending+",size=5G")
+	cid, err := pve.EncodeDiskCID(f.pending, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.pendingCID = cid
+	return f
+}
+
+// requireReplacementKept checks that scsi2 still carries both of its values,
+// that no delete or revert was sent, and that no other slot of any guest names
+// either volume.
+func requireReplacementKept(t *testing.T, client *lifecycleFlowPVE, current, pending, where string) {
+	t.Helper()
+	if value, _ := client.state.configs[777]["scsi2"].(string); !strings.HasPrefix(value, pending+",") {
+		t.Fatalf("%s: VM 777 scsi2 = %q, want its pending value %s left in place", where, value, pending)
+	}
+	if held, _ := client.pending.replaced[777]["scsi2"].(string); !strings.HasPrefix(held, current+",") {
+		t.Fatalf("%s: VM 777 scsi2's current drive = %q, want %s left in place", where, held, current)
+	}
+	if len(client.pending.deleteCalls) != 0 || len(client.pending.reverts) != 0 {
+		t.Fatalf("%s: deletes %v and reverts %v were sent, want none", where, client.pending.deleteCalls, client.pending.reverts)
+	}
+	for vmid, cfg := range client.state.configs {
+		for key, raw := range cfg {
+			text, _ := raw.(string)
+			if bare := strings.Split(text, ",")[0]; (bare == current || bare == pending) && (vmid != 777 || key != "scsi2") {
+				t.Fatalf("%s: VM %d %s names %s as well", where, vmid, key, bare)
+			}
+		}
+	}
+}
+
+// TestDeleteDisk_RefusesTheCurrentDriveUnderAPendingReplacement covers
+// delete_disk of the volume a running guest still has as scsi2's current
+// drive, while a pending value names another volume. The config endpoint shows
+// only the other volume there, so the disk's CID otherwise looks free.
+// delete_disk refuses it with a non-retriable error that names the VM, the
+// node, and the slot, says the slot carries a pending change, and says to stop
+// the VM if it's running or start it if it's already stopped. It deletes
+// nothing and doesn't suggest a revert.
+func TestDeleteDisk_RefusesTheCurrentDriveUnderAPendingReplacement(t *testing.T) {
+	f := replacedSlotFixture(t)
+	deps, client, current, currentCID, pending := f.deps, f.client, f.current, f.currentCID, f.pending
+
+	_, err := HandleDeleteDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, currentCID)}, jsonrpc.Context{})
+	requirePermanent(t, err, "delete_disk")
+	requireText(t, err, "delete_disk", []string{"VM 777", "node n1", "still names it on slot scsi2", "pending change to another volume",
+		"Stop the VM if it's running", "start it if it's already stopped", "Nothing was deleted"}, "revert")
+	if client.state.volumes[current] == nil || client.deletes != 0 {
+		t.Fatalf("delete_disk deleted the current drive of a running guest's slot (deletes=%d)", client.deletes)
+	}
+	requireReplacementKept(t, client, current, pending, "delete_disk")
+}
+
+// TestDetachDisk_LegacyDetachRefusesAReplacedSlot covers detach_disk of the
+// current drive of the same slot. A delete there would either re-arm the old
+// drive's pending delete or drop the pending value's reference, so the slot
+// delete sends nothing and detach_disk fails retriably, saying the change
+// applies at the VM's next clean stop or next start. The slot keeps both
+// values.
+func TestDetachDisk_LegacyDetachRefusesAReplacedSlot(t *testing.T) {
+	f := replacedSlotFixture(t)
+	deps, client, current, currentCID, pending := f.deps, f.client, f.current, f.currentCID, f.pending
+
+	_, err := HandleDetachDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, "777"), planJSON(t, currentCID)}, jsonrpc.Context{})
+	requireRetriable(t, err, "detach_disk")
+	requireText(t, err, "detach_disk", []string{"slot scsi2", "VM 777", "pending change from one volume to another",
+		"next clean stop", "next start"}, "revert")
+	requireReplacementKept(t, client, current, pending, "detach_disk")
+}
+
+// TestAttachDisk_ReattachRefusesAReplacedSlot covers attach_disk onto the VM
+// whose scsi2 carries the replacement, for either volume. The pending value is
+// a drive the guest doesn't have yet, and the current drive is one the guest
+// drops when the change applies, so neither is an idempotent reattach.
+// attach_disk fails retriably, writes nothing, and the slot keeps both values.
+func TestAttachDisk_ReattachRefusesAReplacedSlot(t *testing.T) {
+	for _, name := range []string{"the current drive", "the pending value"} {
+		t.Run(name, func(t *testing.T) {
+			f := replacedSlotFixture(t)
+			deps, client, current, pending := f.deps, f.client, f.current, f.pending
+			cid := f.currentCID
+			if name == "the pending value" {
+				cid = f.pendingCID
+			}
+
+			_, err := HandleAttachDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{})
+			requireRetriable(t, err, "attach_disk")
+			requireText(t, err, "attach_disk", []string{"slot scsi2", "VM 777", "pending change from one volume to another",
+				"next clean stop", "next start"}, "revert")
+			requireReplacementKept(t, client, current, pending, "attach_disk")
+		})
+	}
+}
+
+// TestGetDisks_ListsADiskEitherViewNames covers get_disks on a running VM
+// whose slot hides a disk from the config endpoint while the guest still has
+// it. On a slot whose delete is pending, and as the current drive of a slot
+// whose pending value names another volume, the disk is listed, so cloud check
+// isn't told it's missing. The replaced slot lists the pending volume too.
+func TestGetDisks_ListsADiskEitherViewNames(t *testing.T) {
+	listed := func(t *testing.T, deps Deps) []string {
+		t.Helper()
+		result, err := HandleGetDisks(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
+		if err != nil {
+			t.Fatalf("get_disks: %v", err)
+		}
+		cids, ok := result.([]string)
+		if !ok {
+			t.Fatalf("get_disks result = %#v, want a list of CIDs", result)
+		}
+		return cids
+	}
+	requireListed := func(t *testing.T, cids []string, want ...string) {
+		t.Helper()
+		for _, cid := range want {
+			found := false
+			for _, got := range cids {
+				found = found || got == cid
+			}
+			if !found {
+				t.Fatalf("get_disks = %v, want %s listed", cids, cid)
+			}
+		}
+	}
+
+	t.Run("a slot whose delete is pending", func(t *testing.T) {
+		deps, client, _, cid := legacyPendingFixture(t, "scsi2", "")
+		client.pending.holdDelete(777, client.state.configs[777], "scsi2")
+		requireListed(t, listed(t, deps), cid)
+	})
+	t.Run("a slot whose pending value replaces its drive", func(t *testing.T) {
+		f := replacedSlotFixture(t)
+		requireListed(t, listed(t, f.deps), f.currentCID, f.pendingCID)
+	})
+}
+
+// TestDetachDisk_ResumeAppliesAFoundPendingDeleteOnAStoppedSource covers
+// detach_disk through the resume window when a crash or a kill left the
+// source stopped with its delete pending. Nothing would apply that delete
+// until the VM starts, so the resume applies it, which a stopped VM does at
+// once, and parks the disk with its serial on one parker slot. It reverts
+// nothing.
+func TestDetachDisk_ResumeAppliesAFoundPendingDeleteOnAStoppedSource(t *testing.T) {
+	captureParkerPoolSweep(t)
+	deps, c, diskCID := pendingResumeFixture(t)
+	c.pending.stop(700)
+	reverts := len(c.pending.reverts)
+
+	if err := handleDetachStableID(pendingRowContext(), deps, "700", 700, resolveTransferDisk(t, deps, diskCID)); err != nil {
+		t.Fatalf("detach through the resume on a stopped source: %v", err)
+	}
+	if len(c.pending.reverts) != reverts {
+		t.Fatalf("reverts went from %d to %v, want none on a stopped source", reverts, c.pending.reverts)
+	}
+	if _, present := c.configs[700]["scsi1"]; present || c.pending.pendingDelete(700, "scsi1") {
+		t.Fatalf("source after the detach = %v, want scsi1 gone with nothing pending", c.configs[700])
+	}
+	carriers := 0
+	for vmid, cfg := range c.configs {
+		tags, _ := cfg["tags"].(string)
+		for _, value := range qemu.ParseDisks(cfg) {
+			if serial, ok := pve.StableIDFromDriveOptStr(value); ok && serial == idTestToken {
+				if !tagsContain(tags, pve.ParkerTag) {
+					t.Fatalf("VM %d carries the disk's serial and isn't a parker", vmid)
+				}
+				carriers++
+			}
+		}
+	}
+	if carriers != 1 {
+		t.Fatalf("%d slots carry the disk's serial, want one parker slot", carriers)
+	}
+}
+
+// TestDetachDisk_ResumeMeetsARunningSourceAfterAStoppedStatus covers the race
+// the stopped-source apply accepts. The status read says stopped, and then the
+// source starts before the delete lands, so the delete meets a running VM whose
+// busy guest keeps it pending. The slot-delete helper reverts it, the disk is
+// back on its slot with nothing pending, nothing lands on a parker, and
+// detach_disk fails retriably with the busy text.
+func TestDetachDisk_ResumeMeetsARunningSourceAfterAStoppedStatus(t *testing.T) {
+	const volid = pendingTransferVolid
+	deps, c, diskCID := pendingResumeFixture(t)
+	c.pending.busy[700] = true
+	c.staleStopped = map[int]bool{700: true}
+	reverts := len(c.pending.reverts)
+
+	err := handleDetachStableID(pendingRowContext(), deps, "700", 700, resolveTransferDisk(t, deps, diskCID))
+	requireRetriable(t, err, "detach through the resume")
+	requireText(t, err, "detach through the resume", []string{"VM 700", "scsi1", "still holds the disk"})
+	if got := len(c.pending.reverts) - reverts; got != 1 {
+		t.Fatalf("reverts went from %d to %v, want the helper's one revert", reverts, c.pending.reverts)
+	}
+	requireStillAttached(t, c, volid, "detach through the resume")
+	requireNoParkerSlot(t, c.configs, "detach through the resume")
+}
+
+// TestDeleteDisk_ResumeRefusesAReplacedSourceLikeTheHolderRoute covers
+// delete_disk through the resume window when the source's slot keeps the disk
+// as its current drive while a pending value names another volume. The source
+// is missing from the listings, so the resolver returns the intent and the
+// resume finds the shape. delete_disk gives exactly the refusal the holder
+// route gives, non-retriable, and nothing is deleted or reverted.
+func TestDeleteDisk_ResumeRefusesAReplacedSourceLikeTheHolderRoute(t *testing.T) {
+	deps, c, diskCID := pendingResumeFixture(t)
+	current := c.pending.deletes[700]["scsi1"]
+	delete(c.pending.deletes[700], "scsi1")
+	c.configs[700]["scsi1"] = current
+	c.pending.holdReplacement(700, c.configs[700], "scsi1", "data:vm-9002-disk-0,size=10G")
+	reverts, deletes := len(c.pending.reverts), len(c.pending.deleteCalls)
+
+	_, err := HandleDeleteDisk(deps).Handle(pendingRowContext(), []json.RawMessage{planJSON(t, diskCID)}, jsonrpc.Context{})
+	requirePermanent(t, err, "delete_disk through the resume")
+	if want := pendingReplacementRefusal(diskCID, 700, "pve1", "scsi1").Error(); err.Error() != want {
+		t.Fatalf("delete_disk through the resume = %q, want the holder refusal %q", err, want)
+	}
+	if len(c.pending.reverts) != reverts || len(c.pending.deleteCalls) != deletes {
+		t.Fatalf("reverts %v and deletes %v, want none new", c.pending.reverts, c.pending.deleteCalls)
+	}
+	if len(c.destroyed) != 0 {
+		t.Fatalf("delete_disk destroyed %v", c.destroyed)
+	}
+	requireNoParkerSlot(t, c.configs, "delete_disk through the resume")
 }

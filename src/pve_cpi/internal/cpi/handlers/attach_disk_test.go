@@ -564,15 +564,18 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
 			// Call 3, slot selection: legacy scsi0 attachment present.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
-			// Call 4, the slot-delete helper's pending read after its delete:
+			// Call 4, the slot-delete helper's pending read before its
+			// delete: scsi0 carries no pending change.
+			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
+			// Call 5, the slot-delete helper's pending read after its delete:
 			// scsi0 gone in both views.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 5, the detach's read for unused entries naming the volume:
+			// Call 6, the detach's read for unused entries naming the volume:
 			// none.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 6, re-read after the detach: scsi0 gone.
+			// Call 7, re-read after the detach: scsi0 gone.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 7 and later, Resolve after AttachDisk: scsi1 present with volid.
+			// Call 8 and later, Resolve after AttachDisk: scsi1 present with volid.
 			{"virtio0": "data:vm-100-disk-0", "scsi1": diskCID},
 		},
 	}

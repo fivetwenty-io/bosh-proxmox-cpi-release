@@ -108,7 +108,9 @@ func TestDetachForeignActiveDisks_ForeignDisk(t *testing.T) {
 
 	var detachSlots []string
 	q := &fdQEMU{
-		configs: []map[string]any{initialCfg, postDetachCfg},
+		// The slot-delete helper reads the slot once before its delete, which
+		// still finds the foreign disk there.
+		configs: []map[string]any{initialCfg, initialCfg, postDetachCfg},
 		deleteFn: func(_ string, _ int, slot string) error {
 			detachSlots = append(detachSlots, slot)
 			return nil
@@ -139,9 +141,10 @@ func TestDetachForeignActiveDisks_DetachFails(t *testing.T) {
 
 	detachErr := errors.New("pve: lock timeout")
 	q := &fdQEMU{
-		// The failed delete changes nothing, so the helper's read after it
-		// still finds the foreign disk on scsi1.
-		configs: []map[string]any{initialCfg, initialCfg},
+		// The helper reads the slot before its delete, and the failed delete
+		// changes nothing, so its read after the delete still finds the
+		// foreign disk on scsi1.
+		configs: []map[string]any{initialCfg, initialCfg, initialCfg},
 		deleteFn: func(_ string, _ int, _ string) error {
 			return detachErr
 		},
@@ -200,10 +203,11 @@ func TestDetachForeignActiveDisks_SilentNoOpStillActive(t *testing.T) {
 		"virtio0": "zfs-1:vm-100-disk-0",
 		"scsi1":   "zfs-1:vm-777-disk-0,size=128G",
 	}
-	// Both reads return the same config: the foreign disk is still on scsi1
-	// after the (silently no-op) delete, which the helper's own read catches.
+	// Every read returns the same config: the foreign disk is still on scsi1
+	// before the delete, and after the (silently no-op) delete, which the
+	// helper's own read catches.
 	q := &fdQEMU{
-		configs: []map[string]any{cfg, cfg},
+		configs: []map[string]any{cfg, cfg, cfg},
 		deleteFn: func(_ string, _ int, _ string) error {
 			return nil // pretends to succeed but changes nothing
 		},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -105,15 +106,22 @@ func HandleGetDisks(deps Deps) Handler {
 		)
 
 		// ----------------------------------------------------------------
-		// 3. Fetch VM config.
+		// 3. Fetch VM config in both of PVE's views. A disk on a slot whose
+		//    delete PVE could only record as pending is missing from the
+		//    config endpoint's view, while the running guest still has it,
+		//    and a disk whose slot carries a pending value naming another
+		//    volume is the guest's current drive. cloud check must not be
+		//    told such a disk is missing, so the list takes every disk either
+		//    view names.
 		// ----------------------------------------------------------------
-		cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+		views, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
 		if err != nil {
 			if pve.IsNotFound(err) {
 				return nil, cpierrors.VMNotFound(vmCID)
 			}
 			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: fetch config for VM "+vmCID)
 		}
+		cfg := views.Applied()
 
 		// ----------------------------------------------------------------
 		// 4. Parse disk entries from config and filter to persistent disks.
@@ -132,12 +140,13 @@ func HandleGetDisks(deps Deps) Handler {
 		// detach_disk, delete_disk, ...), so a fallback CID must be a
 		// well-formed envelope, not the pre-envelope-era bare form.
 		// ----------------------------------------------------------------
-		allDisks := qemu.ParseDisks(cfg)
+		allDisks := getDisksDriveEntries(views)
 		recordedCIDs := pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(cfg))
 		diskCIDs := make([]string, 0, len(allDisks))
 		recordedCount, fallbackCount := 0, 0
 
-		for diskSlot, optStr := range allDisks {
+		for _, entry := range allDisks {
+			diskSlot, optStr := entry.slot, entry.optStr
 			// Skip system disk slots by name.
 			if systemDiskSlots[diskSlot] {
 				continue
@@ -190,6 +199,27 @@ func HandleGetDisks(deps Deps) Handler {
 
 		return diskCIDs, nil
 	})
+}
+
+// getDisksDriveEntry is one drive get_disks considers, with the slot that
+// names it.
+type getDisksDriveEntry struct {
+	slot, optStr string
+}
+
+// getDisksDriveEntries returns, sorted by slot, every drive either of the VM's
+// views names. That is each bus slot of the current view, which keeps a slot
+// whose delete is pending, each slot that exists only as a pending value, and
+// the pending value of each slot that replaces its current drive.
+func getDisksDriveEntries(views pve.QemuViews) []getDisksDriveEntry {
+	var entries []getDisksDriveEntry
+	for _, cfg := range []map[string]any{views.Holding(), views.PendingReplacements()} {
+		for slot, optStr := range qemu.ParseDisks(cfg) {
+			entries = append(entries, getDisksDriveEntry{slot: slot, optStr: optStr})
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].slot < entries[j].slot })
+	return entries
 }
 
 // recordedCIDForDrive looks up the Director-supplied CID recorded for one
