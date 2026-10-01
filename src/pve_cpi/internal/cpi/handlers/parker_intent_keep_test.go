@@ -300,14 +300,16 @@ func TestStrandedLegacyDetachResumesToOneParkedReference(t *testing.T) {
 // refused at the planned move step, and the record that leads back to the
 // volume survives for the settlement to use. Before the keep rule both shapes
 // fail, because the record was collected, and the renamed shape refused as a
-// terminal disk instead of naming the step.
+// terminal disk instead of with the cleanup refusal. This line's cleanup
+// refusal doesn't name the unsettled step, so the row reads the step from the
+// journal.
 func TestStrandedManagedDetachRefusesAndKeepsItsRecord(t *testing.T) {
 	for _, renamed := range []bool{true, false} {
 		t.Run(fmt.Sprintf("renamed=%t", renamed), func(t *testing.T) {
 			s := buildStrandedDisk(t, true, renamed, false)
 			err := detachDiskAt(t, atProvenanceTime(strandedEpoch.Add(3*time.Hour)), s.deps, "777", s.cid)
-			if err == nil || !strings.Contains(err.Error(), "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk") {
-				t.Fatalf("detach_disk = %v, want the refusal that names the planned move step", err)
+			if err == nil || !strings.Contains(err.Error(), "cleanup has unresolved mutation evidence") {
+				t.Fatalf("detach_disk = %v, want the cleanup refusal", err)
 			}
 			if s.client.state.volumes[s.stranded] == nil || !strings.Contains(strings.Join(s.references(s.stranded), " "), "777.unused") {
 				t.Fatalf("the volume %s left 777's unused entry: present=%t refs=%v", s.stranded, s.client.state.volumes[s.stranded] != nil, s.references(s.stranded))
@@ -315,8 +317,34 @@ func TestStrandedManagedDetachRefusesAndKeepsItsRecord(t *testing.T) {
 			if s.intentParker() == 0 {
 				t.Fatal("the transfer record was collected")
 			}
+			s.requirePlannedMoveStep(t)
 		})
 	}
+}
+
+// requirePlannedMoveStep finds the stranded disk's record in the journal and
+// requires it to wait in reconciliation_required at the planned move step.
+func (s *strandedDisk) requirePlannedMoveStep(t *testing.T) {
+	t.Helper()
+	records, err := s.journal.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if record.DiskToken != s.token {
+			continue
+		}
+		if record.State != aj.ReconciliationRequired {
+			t.Fatalf("the disk's record is %s, want %s", record.State, aj.ReconciliationRequired)
+		}
+		for _, step := range record.Steps {
+			if step.Kind == "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk" && step.State == aj.Planned {
+				return
+			}
+		}
+		t.Fatalf("the disk's record has no planned lifecycle_detach_disk_Nodes_CreateQemuMoveDisk step: %+v", record.Steps)
+	}
+	t.Fatalf("the journal has no record for disk token %s", s.token)
 }
 
 // TestDeleteVMUnusedSlotRefusalPointsAtTheRecovery pins the refusal text. Before
