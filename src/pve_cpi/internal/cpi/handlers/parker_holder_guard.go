@@ -57,6 +57,9 @@ func parkerReadConfigFor(deps Deps) pve.ParkerConfig {
 		// read (or before an unpark detach) is refused under strict rather
 		// than silently treated as free-floating. See ParkerConfig.AnchorStrict.
 		AnchorStrict: deps.Config.ParkedAnchorStrictValue(),
+		// The keep rule proves a transfer record's volume gone with the same
+		// second opinions the local backend's sweep gets.
+		EmptyListingCorroborators: BackendCorroborators(deps.Config, deps.PVE),
 	}
 }
 

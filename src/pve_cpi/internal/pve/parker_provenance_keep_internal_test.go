@@ -17,6 +17,7 @@ import (
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -45,7 +46,29 @@ type keepWorld struct {
 	// its current value. The config read leaves those keys out, the way the
 	// config endpoint does, and the pending endpoint reports them.
 	pending map[string]map[int]map[string]any
+	// volumes is the set of volumes the storage still has, which the absence
+	// proof's point probe answers from, and existsErr fails that probe and
+	// the content listing behind it, so the proof can't land.
+	volumes   map[string]bool
+	existsErr error
+	// storages is the /storage index LiveStorageInfo reads, storagesErr fails
+	// that read, listing is the content listing of the stranded volume's
+	// storage, and corroborators are the second opinions the parker config
+	// supplies. With listing nil, the content listing fails.
+	storages      []map[string]any
+	storagesErr   error
+	storageReads  int
+	listing       []string
+	corroborators []EmptyListingCorroborator
 }
+
+// keepWorldClient is the keep world's client with the storage visibility proof
+// a production client carries, which a listing that omits the volume needs.
+type keepWorldClient struct {
+	*findVMTestClient
+}
+
+func (keepWorldClient) StorageAuditVisibility(context.Context) error { return nil }
 
 func newKeepWorld() *keepWorld {
 	return &keepWorld{configs: map[string]map[int]map[string]any{"n1": {}, "n2": {}}, errs: map[string]error{}}
@@ -71,8 +94,27 @@ func (w *keepWorld) client() Client {
 			return out, nil
 		},
 	}
-	return &findVMTestClient{
+	return keepWorldClient{&findVMTestClient{
 		backendTestClient: backendTestClient{
+			clusterStorageSvc: &fakeClusterStorageService{
+				listFn: func(context.Context, *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					w.storageReads++
+					if w.storagesErr != nil {
+						return nil, w.storagesErr
+					}
+					resp := clusterstorage.ListStorageResponse{}
+					for _, entry := range w.storages {
+						raw, err := json.Marshal(entry)
+						if err != nil {
+							return nil, err
+						}
+						resp = append(resp, raw)
+					}
+					return &resp, nil
+				},
+			},
 			clusterSvc: &fakeCluster{
 				listFn: func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 					return clusterResp(w.index...), nil
@@ -84,8 +126,47 @@ func (w *keepWorld) client() Client {
 					return findVMConfigNodes("n1", "n2")(ctx)
 				},
 			},
+			storageSvc: &fakeStorage{
+				existsFn: func(_ context.Context, _, _, volume string) (bool, error) {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					if w.existsErr != nil {
+						return false, w.existsErr
+					}
+					return w.volumes[volume], nil
+				},
+			},
 			nodesSvc: &fakeNodesService{
 				qemuConfigFn: qemuSvc.Config,
+				listQemuFn: func(_ context.Context, node string, _ *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					rows := sdknodes.ListQemuResponse{}
+					for vmid := range w.configs[node] {
+						raw, err := json.Marshal(map[string]any{"vmid": vmid})
+						if err != nil {
+							return nil, err
+						}
+						rows = append(rows, raw)
+					}
+					return &rows, nil
+				},
+				listStorageContentFn: func(context.Context, string, string, *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					if w.listing == nil {
+						return nil, errors.New("keepWorld: no content listing")
+					}
+					resp := sdknodes.ListStorageContentResponse{}
+					for _, volid := range w.listing {
+						raw, err := json.Marshal(map[string]any{"volid": volid})
+						if err != nil {
+							return nil, err
+						}
+						resp = append(resp, raw)
+					}
+					return &resp, nil
+				},
 				listQemuPendingFn: func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
 					resp, err := PendingFromConfigRead(ctx, qemuSvc.Config, node, vmid)
 					if err != nil {
@@ -115,7 +196,7 @@ func (w *keepWorld) client() Client {
 			},
 		},
 		qemuSvc: qemuSvc,
-	}
+	}}
 }
 
 // sourceReads returns the config reads that were not of the parker.
@@ -153,7 +234,11 @@ func (w *keepWorld) withParker(t *testing.T, disks map[string]parkerProvEntry) {
 func (w *keepWorld) writeFresh(t *testing.T) error {
 	t.Helper()
 	fresh := parkerProvEntry{DiskCID: "pvd-fresh", ParkedAt: keepNow.Format(time.RFC3339), Node: "n1", Volid: "a:90000/vm-90000-disk-5.raw", Slot: "scsi5"}
-	return writeParkerProvenance(context.Background(), w.client(), nil, "n1", keepParkerVMID, "bpd-fresh", fresh, provTestClock(keepNow))
+	cfg := provTestClock(keepNow)
+	if w.corroborators != nil {
+		cfg.EmptyListingCorroborators = func() []EmptyListingCorroborator { return w.corroborators }
+	}
+	return writeParkerProvenance(context.Background(), w.client(), nil, "n1", keepParkerVMID, "bpd-fresh", fresh, cfg)
 }
 
 func (w *keepWorld) survived(t *testing.T, key string) bool {
@@ -189,7 +274,9 @@ func TestKeepRule_SourceStillNamesTheVolume(t *testing.T) {
 // TestKeepRule_CollectsWhenTheSourceNoLongerHoldsTheVolume covers U3 and U4.
 // The record goes, and it goes because the rule read the source and found no
 // hold, not by default. Before the keep rule both fail on that second point:
-// the collector removed the record without reading anything.
+// the collector removed the record without reading anything. The storage in
+// both rows no longer has the volume, so the absence proof lets the record go
+// too.
 func TestKeepRule_CollectsWhenTheSourceNoLongerHoldsTheVolume(t *testing.T) {
 	t.Parallel()
 	t.Run("U3 source config names something else", func(t *testing.T) {
@@ -203,8 +290,8 @@ func TestKeepRule_CollectsWhenTheSourceNoLongerHoldsTheVolume(t *testing.T) {
 		if w.survived(t, keepKey) {
 			t.Fatal("a record whose source no longer names its volume must be collected")
 		}
-		if reads := w.sourceReads(); len(reads) != 1 || reads[0] != fmt.Sprintf("n1/%d", keepSourceVMID) {
-			t.Fatalf("source reads = %v, want the one read that found no hold", reads)
+		if reads := w.sourceReads(); len(reads) == 0 || reads[0] != fmt.Sprintf("n1/%d", keepSourceVMID) {
+			t.Fatalf("source reads = %v, want the source read first, which found no hold", reads)
 		}
 	})
 	t.Run("U4 source proven absent cluster-wide", func(t *testing.T) {
@@ -452,5 +539,164 @@ func TestWithProvenanceClock(t *testing.T) {
 	raw, _ := json.Marshal(entry)
 	if !strings.Contains(string(raw), `"parked_at":"2026-01-02T03:04:05Z"`) {
 		t.Fatalf("record = %s", raw)
+	}
+}
+
+// TestKeepRule_HoldsAVolumeNoGuestNames covers the record a transfer of a
+// volume its source doesn't own leaves when it stops between the slot delete
+// and the parker attach. PVE keeps no unused entry for such a volume, so the
+// source names nothing, and the record is the only link to the volume. It's
+// kept while the volume exists and no guest names it, it's released once the
+// volume is proven gone, and it's kept when the proof can't land.
+func TestKeepRule_HoldsAVolumeNoGuestNames(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T) *keepWorld {
+		t.Helper()
+		w := newKeepWorld()
+		w.withParker(t, map[string]parkerProvEntry{keepKey: strandedIntent(2 * time.Hour)})
+		w.configs["n1"][keepSourceVMID] = map[string]any{"scsi0": "a:777/vm-777-disk-0.raw"}
+		return w
+	}
+	t.Run("the volume exists", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		w.volumes = map[string]bool{keepStranded: true}
+		if err := w.writeFresh(t); err != nil {
+			t.Fatal(err)
+		}
+		if !w.survived(t, keepKey) {
+			t.Fatalf("the transfer record was collected while %s exists and no guest names it", keepStranded)
+		}
+	})
+	t.Run("the volume is proven gone", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		if err := w.writeFresh(t); err != nil {
+			t.Fatal(err)
+		}
+		if w.survived(t, keepKey) {
+			t.Fatal("the transfer record survived although its volume is proven gone")
+		}
+	})
+	t.Run("the absence proof can't land", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		w.existsErr = errors.New("volume_size_info on a.raw failed - no format")
+		if err := w.writeFresh(t); err != nil {
+			t.Fatal(err)
+		}
+		if !w.survived(t, keepKey) {
+			t.Fatal("the transfer record was collected although nothing proved its volume gone")
+		}
+	})
+}
+
+// TestKeepRule_ReleasesARecordAGuestNamesAfterACrossNodeUnpark covers a
+// finalized record left on the parker because its removal failed after the
+// disk was unparked by config edit to a VM on another node. The volume still
+// exists, so the volume alone would hold the record forever. Once the grace
+// window has passed, the guest that now names the volume releases it.
+func TestKeepRule_ReleasesARecordAGuestNamesAfterACrossNodeUnpark(t *testing.T) {
+	t.Parallel()
+	w := newKeepWorld()
+	record := strandedIntent(2 * time.Hour)
+	record.Slot = "scsi3"
+	w.withParker(t, map[string]parkerProvEntry{keepKey: record})
+	w.configs["n1"][keepSourceVMID] = map[string]any{"scsi0": "a:777/vm-777-disk-0.raw"}
+	w.configs["n2"][888] = map[string]any{"scsi1": keepStranded + ",serial=" + keepKey + ",size=5G"}
+	w.volumes = map[string]bool{keepStranded: true}
+	if err := w.writeFresh(t); err != nil {
+		t.Fatal(err)
+	}
+	if w.survived(t, keepKey) {
+		t.Fatalf("the record survived although VM 888 on n2 names %s", keepStranded)
+	}
+}
+
+// TestKeepRule_ProvesAbsenceTheWayTheBackendSweepDoes covers the absence proof
+// the keep rule runs for a record whose volume no guest names, when the point
+// probe can't answer and the content listing has to. The storage is
+// classified once per pass from its live definition, and the second opinions
+// come from the parker config's supplier, the same ones the local backend's
+// sweep uses. Only a listing that can carry a proof, with no second opinion
+// against it, lets the record go.
+func TestKeepRule_ProvesAbsenceTheWayTheBackendSweepDoes(t *testing.T) {
+	t.Parallel()
+	const noFormat = "volume_size_info on a:777/vm-777-disk-2.raw failed - no format"
+	setup := func(t *testing.T) *keepWorld {
+		t.Helper()
+		w := newKeepWorld()
+		w.withParker(t, map[string]parkerProvEntry{keepKey: strandedIntent(2 * time.Hour)})
+		w.configs["n1"][keepSourceVMID] = map[string]any{"scsi0": "a:777/vm-777-disk-0.raw"}
+		w.existsErr = errors.New(noFormat)
+		return w
+	}
+	for _, row := range []struct {
+		name     string
+		prepare  func(w *keepWorld, asked *int)
+		survives bool
+		// asks says the row's second opinion must be consulted.
+		asks bool
+	}{
+		{"a plain dir storage with an empty listing keeps the record", func(w *keepWorld, _ *int) {
+			w.storages = []map[string]any{{"storage": "a", "type": "dir", "path": "/a", "content": "images"}}
+			w.listing = []string{}
+		}, true, false},
+		{"an nfs listing with other volumes releases the record", func(w *keepWorld, _ *int) {
+			w.storages = []map[string]any{{"storage": "a", "type": "nfs", "server": "nas", "export": "/a", "content": "images", "shared": 1}}
+			w.listing = []string{"a:777/vm-777-disk-0.raw"}
+		}, false, false},
+		{"an unreadable storage definition keeps the record", func(w *keepWorld, _ *int) {
+			w.storagesErr = errors.New("storage index unreachable")
+			w.listing = []string{"a:777/vm-777-disk-0.raw"}
+		}, true, false},
+		{"an empty nfs listing a second opinion contradicts keeps the record", func(w *keepWorld, asked *int) {
+			w.storages = []map[string]any{{"storage": "a", "type": "nfs", "server": "nas", "export": "/a", "content": "images", "shared": 1}}
+			w.listing = []string{}
+			w.corroborators = []EmptyListingCorroborator{contradictingCorroborator(asked)}
+		}, true, true},
+		{"an empty nfs listing with no second opinion supplied keeps the record", func(w *keepWorld, _ *int) {
+			w.storages = []map[string]any{{"storage": "a", "type": "nfs", "server": "nas", "export": "/a", "content": "images", "shared": 1}}
+			w.listing = []string{}
+		}, true, false},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			w := setup(t)
+			asked := 0
+			row.prepare(w, &asked)
+			if err := w.writeFresh(t); err != nil {
+				t.Fatal(err)
+			}
+			if got := w.survived(t, keepKey); got != row.survives {
+				t.Fatalf("record survived = %t, want %t", got, row.survives)
+			}
+			if row.asks && asked == 0 {
+				t.Fatal("the keep rule never asked the parker config's second opinion")
+			}
+		})
+	}
+}
+
+// TestKeepRule_ClassifiesEachStorageOncePerPass covers two stale records whose
+// volumes no guest names, on the same storage. One keep pass weighs both, and
+// it reads the storage's live definition once for both of them.
+func TestKeepRule_ClassifiesEachStorageOncePerPass(t *testing.T) {
+	t.Parallel()
+	w := newKeepWorld()
+	second := strandedIntent(2 * time.Hour)
+	second.Volid = "a:777/vm-777-disk-3.raw"
+	w.withParker(t, map[string]parkerProvEntry{keepKey: strandedIntent(2 * time.Hour), "bpd-8899aabbccddeeff": second})
+	w.configs["n1"][keepSourceVMID] = map[string]any{"scsi0": "a:777/vm-777-disk-0.raw"}
+	w.existsErr = errors.New("volume_size_info failed - no format")
+	w.storages = []map[string]any{{"storage": "a", "type": "nfs", "server": "nas", "export": "/a", "content": "images", "shared": 1}}
+	w.listing = []string{"a:777/vm-777-disk-0.raw"}
+	if err := w.writeFresh(t); err != nil {
+		t.Fatal(err)
+	}
+	if w.survived(t, keepKey) || w.survived(t, "bpd-8899aabbccddeeff") {
+		t.Fatal("a record survived although the listing proves its volume gone")
+	}
+	if w.storageReads != 1 {
+		t.Fatalf("storage definition reads = %d, want one for the pass", w.storageReads)
 	}
 }
