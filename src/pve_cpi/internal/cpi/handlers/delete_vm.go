@@ -155,6 +155,14 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		if !allowed {
 			continue
 		}
+		// A straggler holding a legacy persistent disk named for it would lose
+		// that disk to the purge, and no retry can make the destroy safe. It
+		// stays tagged for the operator, before anything below mutates it.
+		if owned := pve.FindOwnedLegacyPersistentDisks(strCfg, int(item.VMID.Int())); len(owned) > 0 {
+			sweepLogger.Warn("delete_vm: straggler sweep: a legacy persistent disk is named for this VM, so the destroy would free it; leaving the straggler for the operator",
+				log.String("slots", ownedLegacySlots(owned)))
+			continue
+		}
 		// Base value is pve.destroy_unreferenced_disks (default false; see the
 		// config field doc for the cross-cluster shared-storage data-loss
 		// hazard enabling it introduces).
@@ -443,6 +451,13 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any
 	}
 	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(liveConfig)); markerErr != nil || managed {
 		return nil, cpierrors.Cloud("delete_vm: allocation provenance requires its original storage journal authority")
+	}
+	// A legacy persistent disk named for this VM is one PVE counts as the
+	// VM's own, so either destroy below would free it. Refusing here, before
+	// the stop and before the fast path stamps bosh-deleting, leaves the VM
+	// exactly as it was.
+	if err := refuseOwnedLegacyDestroy(liveConfig, vmCID, vmid); err != nil {
+		return nil, err
 	}
 
 	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
@@ -981,12 +996,16 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 // transferred disk fails the VMID heuristic and the serial is what still
 // marks it persistent.
 //
-// A legacy foreign disk is detached: DetachDisk fully unreferences the volume
-// (the SDK demotes the slot to unusedN and sweeps it), leaving the volume
-// intact on storage. A stable-ID disk is instead transferred to a parker —
-// its volume is owner-named, and the detach's unusedN sweep would let PVE
-// deallocate it. Only after every foreign disk is off the VM does delete_vm
-// proceed to destroy it.
+// A legacy foreign disk is detached: DetachDisk deletes the bus slot, and the
+// volume stays on storage only because this VM does not own it. PVE creates an
+// unusedN entry, which the SDK's sweep would delete and so free the volume,
+// only when the volume's name carries this VMID, and a foreign disk's name
+// carries another. A legacy disk named for this VM is not foreign by this
+// test; deleteLegacyVM refuses it before this runs, and the stable-ID branch
+// takes every renamed one. A stable-ID disk is instead transferred to a
+// parker, because its volume is owner-named and the detach's unusedN sweep
+// would let PVE deallocate it. Only after every foreign disk is off the VM does
+// delete_vm proceed to destroy it.
 //
 // Fail-closed: if a foreign disk cannot be detached, or any foreign disk still
 // remains on an active slot after the attempt, a RETRIABLE error is returned

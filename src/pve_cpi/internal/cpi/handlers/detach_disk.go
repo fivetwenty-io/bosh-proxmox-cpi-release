@@ -84,12 +84,15 @@ func detachDiskResolveSlot(
 	if err != nil {
 		if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
 			// Disk is not on an active bus. It may still linger as an unusedN
-			// slot: a prior detach with allow_disk_ops_with_snapshots=true
-			// parked it there, but PVE's unusedN sweep was blocked by a
-			// snapshot. Once the snapshot is gone a follow-up detach_disk lands
-			// here — completing that sweep is what makes the documented "delete
-			// snapshots, then retry detach_disk" recovery actually free the
-			// volume (delete_disk) and unblock delete_vm.
+			// slot. PVE registers an unusedN entry on detach only for a volume
+			// this VM owns, which for a legacy disk means one named for this
+			// VMID, so a lingering entry left by a detach whose sweep a
+			// snapshot blocked is always that owned shape. Removing it would
+			// free the volume, so sweepUnusedDiskSlot refuses it instead. An
+			// entry for a volume this VM does not own appears only through a
+			// hand edit of the VM config, and for that one the sweep still
+			// drops the reference, so delete_disk can remove the volume and
+			// delete_vm is unblocked.
 			//
 			// The sentinel check (errors.Is) narrows the previously broad
 			// TypeCloud catch: any other Cloud error from ResolveDiskID
@@ -203,6 +206,11 @@ func HandleDetachDisk(deps Deps) Handler {
 			// if not, resolve its node and park it now so retries converge to parked state.
 			return nil, handleAlreadyDetachedParked(ctx, deps, diskCID, bareDiskCID)
 		}
+		// A volume named for this VM is one PVE counts as the VM's own, and
+		// the detach below would free it. Refuse before anything mutates.
+		if err := refuseOwnedLegacyDetach(vmCID, vmid, diskCID, bareDiskCID, diskID); err != nil {
+			return nil, err
+		}
 
 		// --------------------------------------------------------------------
 		// 2b. Read the disk's recorded option overrides off the holder before
@@ -245,9 +253,13 @@ func HandleDetachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 4. Detach disk via SDK. Synchronous config PUT; no UPID returned.
 		// --------------------------------------------------------------------
-		// SDK ≥ v3.1.2 sweeps any unusedN slot PVE auto-creates on detach,
-		// so the disk is fully removed from the VM config and survives a
-		// subsequent delete_vm DELETE. No additional cleanup required here.
+		// The SDK deletes the bus slot, then deletes any unusedN entry naming the
+		// same volume. PVE creates that unusedN entry only when this VM owns the
+		// volume (its name carries this VMID), and deleting it makes PVE free the
+		// volume, not just drop the reference. A legacy disk is named for a VMID
+		// from the disk band, so PVE creates no unusedN entry and the sweep finds
+		// nothing. The check above refuses a volume this VM owns, and the
+		// stable-ID branch takes every renamed one.
 		if err := pve.RetryOnTransientOrUnplugBusy(ctx, deps.Log(ctx), "detach_disk", 0, func() error {
 			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, diskID)
 		}); err != nil {
@@ -654,8 +666,13 @@ func resolveNodeForDetachedDisk(ctx context.Context, deps Deps, bareDiskCID stri
 // references the disk (the allow_disk_ops_with_snapshots bypass path), so the
 // slot can linger. ResolveDiskID does not see unusedN slots (PVE's disk-key
 // pattern covers only active buses), so a retried detach_disk reaches here once
-// the snapshot is gone and completes the cleanup. PUT delete=unusedN frees the
-// reference so delete_disk can remove the volume and delete_vm is unblocked.
+// the snapshot is gone. PVE registers the unusedN entry only for a volume this
+// VM owns (its name carries this VMID), and for such a volume PUT
+// delete=unusedN frees the volume itself, so the sweep refuses that entry
+// instead of removing it. An entry for a volume this VM does not own comes
+// only from a hand edit of the config. For that one, PUT delete=unusedN drops
+// only the reference, so delete_disk can remove the volume and delete_vm is
+// unblocked.
 func sweepUnusedDiskSlot(
 	ctx context.Context, deps Deps, node string, vmid int, vmCID, diskCID string,
 ) (bool, error) {
@@ -670,6 +687,9 @@ func sweepUnusedDiskSlot(
 	for slot, volid := range pve.FindUnusedDiskEntries(cfg) {
 		if volid != diskCID {
 			continue
+		}
+		if refusal := refuseOwnedLegacyDetach(vmCID, vmid, diskCID, diskCID, slot); refusal != nil {
+			return false, refusal
 		}
 		// RetryOnTransientOrLock, matching the parker twin of this sweep:
 		// removing the unusedN reference contends on the same VM config and

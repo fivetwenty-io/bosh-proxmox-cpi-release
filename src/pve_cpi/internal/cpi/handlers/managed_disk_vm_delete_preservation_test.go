@@ -337,6 +337,11 @@ func testPreStablePreservation(t *testing.T, foreign bool) {
 	}
 	old := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
 	volume := "a:777/vm-777-disk-9.raw"
+	if foreign {
+		// A volume PVE unlinks without an unused entry is one named for
+		// another VMID, and only such a volume can attach back to VM 777.
+		volume = "a:9777/vm-9777-disk-9.raw"
+	}
 	cid, err := pve.EncodeDiskCID(volume, nil)
 	if err != nil {
 		t.Fatal(err)
