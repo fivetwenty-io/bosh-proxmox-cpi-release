@@ -1,9 +1,22 @@
 name: Release
 
-# Tag-driven final releases: push an annotated tag vX.Y.Z on main and this
-# workflow gates on the full CI check suite, builds the BOSH release tarball,
-# and publishes it as a GitHub Release with a sha256 checksum and a
+# Tag-driven final releases: push an annotated tag vX.Y.Z and this workflow
+# gates on the full CI check suite, builds the BOSH release tarball, and
+# publishes it as a GitHub Release with a sha256 checksum and a
 # ready-to-paste manifest snippet.
+#
+# A patch tag vX.Y.Z whose Z is above zero comes from the release/X.Y branch
+# whenever that branch exists. It must be a final tag, and its commit must be
+# on that branch, whether or not the commit is also on main, so main's newer
+# work never ships under an older line's version. Every other tag must point
+# at a commit on main. That covers every tag whose Z is zero, and every patch
+# tag or prerelease for a line that has no release branch. Any tag that
+# breaks these rules fails the version step before anything is built. The
+# release is marked Latest only when its tag is the highest final version tag
+# in the repository. scripts/_release_tag.py holds these rules, and
+# scripts/_release_tag_test.py covers them. A tag runs this file from its own
+# commit, so a change here reaches a release branch only once we cherry-pick
+# it there.
 
 on:
   push:
@@ -82,25 +95,12 @@ jobs:
 
       - name: Verify tag and derive version
         id: version
+        # The golang image ships python3 and git, which is all the script needs.
         run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "ERROR: tag '${GITHUB_REF_NAME}' is not vX.Y.Z or vX.Y.Z-<prerelease>" >&2
-            exit 1
-          fi
-          git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "ERROR: tag '${GITHUB_REF_NAME}' points at ${GITHUB_SHA}, which is not on main." >&2
-            echo "Releases are cut only from main. Delete the tag, merge the commit, re-tag." >&2
-            exit 1
-          fi
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          if [[ "${VERSION}" == *-* ]]; then
-            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
-          fi
+          python3 scripts/_release_tag.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --github-output "${GITHUB_OUTPUT}"
 
       - name: Install bosh and gh CLIs
         run: |
@@ -183,6 +183,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          LATEST: ${{ steps.version.outputs.latest }}
+          NOTES_START_TAG: ${{ steps.version.outputs.notes_start_tag }}
           TARBALL: ${{ steps.build.outputs.tarball }}
           SHA256: ${{ steps.build.outputs.sha256 }}
         run: |
@@ -203,6 +205,13 @@ jobs:
           ARGS=(--verify-tag --title "${RELEASE_NAME} ${VERSION}" --notes-file "${RUNNER_TEMP}/release-notes.md" --generate-notes)
           if [[ "${PRERELEASE}" == "true" ]]; then
             ARGS+=(--prerelease)
+          fi
+          # GitHub would mark every new final release Latest, so we always say
+          # which way it goes. Only a release from a branch sets where its
+          # generated notes start.
+          ARGS+=("--latest=${LATEST}")
+          if [[ -n "${NOTES_START_TAG}" ]]; then
+            ARGS+=(--notes-start-tag "${NOTES_START_TAG}")
           fi
           gh release create "${GITHUB_REF_NAME}" "${ARGS[@]}" \
             "${TARBALL}" "${TARBALL}.sha256"
