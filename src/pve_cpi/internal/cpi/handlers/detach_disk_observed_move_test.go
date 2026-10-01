@@ -11,6 +11,7 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
@@ -308,6 +309,13 @@ type configFailPVE struct{ *lifecycleFlowPVE }
 
 func (c configFailPVE) QEMU() qemu.Service {
 	return configFailQEMU{c.lifecycleFlowPVE.QEMU().(lifecycleFlowQEMU)}
+}
+
+// Nodes serves the pending endpoint from the same failing config read.
+func (c configFailPVE) Nodes() nodes.Service {
+	n := c.lifecycleFlowPVE.Nodes().(lifecycleFlowNodes)
+	n.cfg = c.QEMU().Config
+	return n
 }
 
 // TestManagedDiskProvenanceHealNamesAFailedConfigRead fails the holder's

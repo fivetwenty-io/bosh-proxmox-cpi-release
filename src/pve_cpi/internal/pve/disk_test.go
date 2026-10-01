@@ -401,12 +401,25 @@ func (c *diskClusterClient) Tasks() tasks.Service { return nil }
 // diskFakeCluster serves the enumeration the production scans now read.
 func (c *diskClusterClient) Nodes() nodes.Service {
 	if c.nodesOverride != nil {
+		// An override built in a test has no route to this client's config
+		// read, so a copy of it gets one; the override itself stays untouched.
+		if o, ok := c.nodesOverride.(*diskFakeNodesFromCluster); ok && o.cfg == nil {
+			wired := *o
+			wired.cfg = c.qemuConfig
+			return &wired
+		}
 		return c.nodesOverride
 	}
 	if f, ok := c.clusterSvc.(*diskFakeCluster); ok {
-		return &diskFakeNodesFromCluster{f: f}
+		return &diskFakeNodesFromCluster{f: f, cfg: c.qemuConfig}
 	}
 	return nil
+}
+
+// qemuConfig is the client's own config read, resolved at call time so a
+// client without a QEMU service fails at the read, as the read itself does.
+func (c *diskClusterClient) qemuConfig(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	return c.QEMU().Config(ctx, node, vmid)
 }
 func (c *diskClusterClient) Cluster() cluster.Service               { return c.clusterSvc }
 func (c *diskClusterClient) ClusterStorage() clusterstorage.Service { return nil }
@@ -499,6 +512,8 @@ type diskFakeNodesFromCluster struct {
 	// (e.g. powered-off) member.
 	failNode string
 	failErr  error
+	// cfg is the owning client's config read, which serves ListQemuPending.
+	cfg func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 // UpdateQemuConfig and ListStorageContent are no-ops, mirroring the nil
@@ -514,6 +529,12 @@ func (s *diskFakeNodesFromCluster) ListStorageContent(
 	_ context.Context, _, _ string, _ *nodes.ListStorageContentParams,
 ) (*nodes.ListStorageContentResponse, error) {
 	return &nodes.ListStorageContentResponse{}, nil
+}
+
+func (s *diskFakeNodesFromCluster) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*nodes.ListQemuPendingResponse, error) {
+	return pve.PendingFromConfigRead(ctx, s.cfg, node, vmid)
 }
 
 func (s *diskFakeNodesFromCluster) ListQemu(ctx context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {

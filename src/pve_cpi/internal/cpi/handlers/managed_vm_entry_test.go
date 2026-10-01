@@ -52,6 +52,10 @@ type managedVMEntryNodes struct {
 	client *managedVMEntryClient
 }
 
+func (n *managedVMEntryNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.client.QEMU().Config, node, vmid)
+}
+
 func (n *managedVMEntryNodes) ListCertificatesInfo(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
 	return (&allocationAuditNodes{}).ListCertificatesInfo(ctx, node)
 }

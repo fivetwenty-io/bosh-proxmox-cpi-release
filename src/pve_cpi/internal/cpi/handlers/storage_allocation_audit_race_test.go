@@ -124,6 +124,7 @@ func raceAuditFixture(t *testing.T, hook func(*raceSibling) error) (Deps, *aj.Jo
 	c.configs[500] = map[string]any{}
 	sibling := newRaceSibling(t, j, c)
 	deps.PVE = &raceAuditClient{allocationAuditClient: c, vmid: 500, hook: func() error { return hook(sibling) }}
+	c.nodesRead.client = deps.PVE
 	return deps, j, sibling
 }
 
@@ -214,6 +215,7 @@ func TestAllocationAuditSkipsAGuestDeletedDuringTheScan(t *testing.T) {
 					}
 					return sdkerrors.ParseAPIError(500, []byte(`{"message":"Configuration file 'nodes/pve1/qemu-server/124.conf' does not exist"}`))
 				}}
+				c.nodesRead.client = deps.PVE
 				return deps, j
 			}
 			t.Run("audit", func(t *testing.T) {

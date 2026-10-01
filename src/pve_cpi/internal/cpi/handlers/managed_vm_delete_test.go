@@ -81,6 +81,10 @@ type deleteManagedNodes struct {
 	c *deleteManagedClient
 }
 
+func (n *deleteManagedNodes) ListQemuPending(ctx context.Context, node, vmid string) (*ns.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
+}
+
 func (n *deleteManagedNodes) DeleteQemu(_ context.Context, _ string, vmid string, params *ns.DeleteQemuParams) (*ns.DeleteQemuResponse, error) {
 	n.c.destroyCount++
 	if params == nil || params.DestroyUnreferencedDisks == nil || *params.DestroyUnreferencedDisks || params.Purge == nil || !*params.Purge {

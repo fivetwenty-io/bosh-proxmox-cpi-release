@@ -85,8 +85,23 @@ type lgClient struct {
 }
 
 func (c *lgClient) Cluster() sdkcluster.Service { return c.cluster }
-func (c *lgClient) Nodes() sdknodes.Service     { return c.nodes }
+func (c *lgClient) Nodes() sdknodes.Service     { return &lgClientNodes{lgNodes: c.nodes, c: c} }
 func (c *lgClient) QEMU() sdkqemu.Service       { return c.qemu }
+
+// lgClientNodes serves the test's own *lgNodes, so its counters still count,
+// and adds the pending read, which goes through the client's config read.
+type lgClientNodes struct {
+	*lgNodes
+	c *lgClient
+}
+
+func (n *lgClientNodes) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return n.c.QEMU().Config(ctx, node, vmid)
+	}, node, vmid)
+}
 
 func lgCtx() context.Context {
 	return WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })

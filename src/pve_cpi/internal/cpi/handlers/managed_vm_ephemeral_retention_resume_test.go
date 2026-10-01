@@ -119,6 +119,10 @@ type watchedDestroyNodes struct {
 	c watchedDestroyPVE
 }
 
+func (n watchedDestroyNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
+}
+
 func (n watchedDestroyNodes) DeleteQemu(ctx context.Context, node, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
 	var drives []string
 	var id int

@@ -67,7 +67,7 @@ func (c contendedFlowPVE) Pools() pve.PoolService {
 }
 
 func (c contendedFlowPVE) Nodes() nodes.Service {
-	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE}, gate: c.gate, enter: c.enter, moveErr: c.moveErr}
+	return gatedFlowNodes{lifecycleFlowNodes: lifecycleFlowNodes{managedDiskTestNodes: managedDiskTestNodes{state: c.state}, c: c.lifecycleFlowPVE, cfg: c.QEMU().Config}, gate: c.gate, enter: c.enter, moveErr: c.moveErr}
 }
 
 type gatedFlowNodes struct {

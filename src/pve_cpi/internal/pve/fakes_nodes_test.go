@@ -43,6 +43,9 @@ type fakeNodesService struct {
 	createQemuFirewallIpset2Fn          func(ctx context.Context, node string, vmid string, name string, params *nodes.CreateQemuFirewallIpset2Params) error
 	createQemuFirewallRulesFn           func(ctx context.Context, node, vmid string, params *nodes.CreateQemuFirewallRulesParams) error
 	updateQemuFirewallOptionsFn         func(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuFirewallOptionsParams) error
+	// qemuConfigFn is the owning client's config read; ListQemuPending
+	// serves the pending endpoint through it.
+	qemuConfigFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 func (f *fakeNodesService) CreateQemuMoveDisk(ctx context.Context, node string, vmid string, params *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
@@ -59,6 +62,10 @@ func (f *fakeNodesService) UpdateNetwork(ctx context.Context, node string, param
 
 func (f *fakeNodesService) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
 	return f.listQemuFn(ctx, node, params)
+}
+
+func (f *fakeNodesService) ListQemuPending(ctx context.Context, node string, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, f.qemuConfigFn, node, vmid)
 }
 
 func (f *fakeNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {

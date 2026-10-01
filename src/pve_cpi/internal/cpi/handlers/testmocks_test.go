@@ -70,10 +70,13 @@ func (m *mockPVEClient) Nodes() nodes.Service {
 	if m.nodesSvc != nil {
 		return &authNodesService{
 			Service: m.nodesSvc, listFn: m.Cluster().ListResources, fallbackNode: testNode, client: m,
+			configRead: clientConfigRead(m),
 		}
 	}
 	if m.clusterSvc != nil {
-		return &authNodesService{listFn: m.clusterSvc.ListResources, fallbackNode: testNode, client: m}
+		return &authNodesService{
+			listFn: m.clusterSvc.ListResources, fallbackNode: testNode, client: m, configRead: clientConfigRead(m),
+		}
 	}
 	return nil
 }
@@ -959,6 +962,28 @@ type authNodesService struct {
 	// owns the scripted storage-status answer and its call count; a wrapper a
 	// suite builds by hand leaves it nil and gets the default answer.
 	client *mockPVEClient
+	// configRead is the building client's QEMU().Config, which serves the
+	// pending read; the delegate can't reach it.
+	configRead configReadFn
+}
+
+// configReadFn is the shape of qemu.Service.Config, the read a fake's pending
+// endpoint is served from.
+type configReadFn = func(ctx context.Context, node string, vmid int) (map[string]any, error)
+
+// clientConfigRead resolves the client's QEMU service on every call, so a fake
+// built before a suite swaps in its QEMU service still reads the current one.
+func clientConfigRead(c pve.Client) configReadFn {
+	return func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.QEMU().Config(ctx, node, vmid)
+	}
+}
+
+// ListQemuPending serves the pending read from the client's config read.
+func (s *authNodesService) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*nodes.ListQemuPendingResponse, error) {
+	return handlers.PendingFromConfigRead(ctx, s.configRead, node, vmid)
 }
 
 // ListStorageStatus answers the empty-listing corroboration's status read

@@ -290,11 +290,15 @@ func (c *wbMockClient) Tasks() sdktasks.Service         { return nil }
 // Nodes wraps the wired nodes service so pve.ListGuestsAuthoritative sees
 // the guests scripted through the cluster ListResources fixture (delegate
 // rows win on vmid collisions; every other method delegates through).
-func (c *wbMockClient) Nodes() sdknodes.Service {
+func (c *wbMockClient) Nodes() sdknodes.Service { return c.nodesReading(c.QEMU) }
+
+// nodesReading is Nodes with the QEMU accessor whose config read the
+// wrapper's pending endpoint serves, so an embedding client can pass its own.
+func (c *wbMockClient) nodesReading(q func() sdkqemu.Service) sdknodes.Service {
 	if c.clusterSvc == nil {
 		return c.nodesSvc
 	}
-	return &icNodesService{Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: "pve-node1"}
+	return &icNodesService{Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: "pve-node1", qemu: q}
 }
 func (c *wbMockClient) Cluster() sdkcluster.Service               { return c.clusterSvc }
 func (c *wbMockClient) ClusterStorage() sdkclusterstorage.Service { return c.clusterStorageSvc }
@@ -903,6 +907,7 @@ type wbTemplateMockClient struct {
 }
 
 func (c *wbTemplateMockClient) QEMU() sdkqemu.Service   { return c.qemuSvc }
+func (c *wbTemplateMockClient) Nodes() sdknodes.Service { return c.nodesReading(c.QEMU) }
 func (c *wbTemplateMockClient) Tasks() sdktasks.Service { return c.tasksSvc }
 func (c *wbTemplateMockClient) Pools() pve.PoolService {
 	if c.poolsSvc != nil {

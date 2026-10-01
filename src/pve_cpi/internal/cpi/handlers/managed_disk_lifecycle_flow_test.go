@@ -67,6 +67,9 @@ func (c *lifecycleFlowPVE) QEMU() qemu.Service {
 type lifecycleFlowNodes struct {
 	managedDiskTestNodes
 	c *lifecycleFlowPVE
+	// cfg, when set, is the config read of a client that wraps the flow
+	// fake's QEMU service, which the pending endpoint then serves from.
+	cfg func(ctx context.Context, node string, vmid int) (map[string]any, error)
 }
 
 func (n lifecycleFlowNodes) ListStorageContent(ctx context.Context, node, pool string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
@@ -596,6 +599,13 @@ func (n lifecycleFlowNodes) ListQemu(_ context.Context, node string, _ *nodes.Li
 		rows = append(rows, raw)
 	}
 	return &rows, nil
+}
+func (n lifecycleFlowNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	read := n.cfg
+	if read == nil {
+		read = n.c.QEMU().Config
+	}
+	return PendingFromConfigRead(ctx, read, node, vmid)
 }
 func (n lifecycleFlowNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
 	rows := nodes.ListNodesResponse{json.RawMessage(`{"node":"n1","status":"online"}`), json.RawMessage(`{"node":"n2","status":"online"}`)}

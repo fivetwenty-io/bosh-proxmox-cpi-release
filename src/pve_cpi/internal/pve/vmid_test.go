@@ -44,6 +44,12 @@ func (s *stubNodesService) ListQemu(ctx context.Context, node string, params *sd
 	return &resp, nil
 }
 
+// ListQemuPending fails the way the config read does, because mockClient
+// serves no QEMU service and the nodes fake has no client to read through.
+func (s *stubNodesService) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("stubNodesService.ListQemuPending: mockClient serves no config read")
+}
+
 // buildStorageContent marshals volid strings into a ListStorageContentResponse.
 func buildStorageContent(volids ...string) *sdknodes.ListStorageContentResponse {
 	resp := make(sdknodes.ListStorageContentResponse, 0, len(volids))

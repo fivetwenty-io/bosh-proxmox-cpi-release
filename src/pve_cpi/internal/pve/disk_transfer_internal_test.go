@@ -153,6 +153,7 @@ func (c *scanFakeClient) Nodes() sdknodes.Service {
 	return &fakeNodesService{
 		updateQemuConfigFn:   c.updateQemuConfig,
 		createQemuMoveDiskFn: c.createQemuMoveDisk,
+		qemuConfigFn:         c.QEMU().Config,
 		// The authoritative per-node listing the parker and holder scans now
 		// read, derived from the same configs the ListResources fake serves.
 		listQemuFn: func(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {

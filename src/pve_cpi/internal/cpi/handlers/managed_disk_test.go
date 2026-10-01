@@ -195,6 +195,9 @@ func (n managedDiskTestNodes) ListQemu(context.Context, string, *nodes.ListQemuP
 	}
 	return &r, nil
 }
+func (n managedDiskTestNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, managedDiskTestQEMU{state: n.state}.Config, node, vmid)
+}
 func (managedDiskTestNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
 	r := nodes.ListNodesResponse{json.RawMessage(`{"node":"n1","status":"online"}`)}
 	return &r, nil
