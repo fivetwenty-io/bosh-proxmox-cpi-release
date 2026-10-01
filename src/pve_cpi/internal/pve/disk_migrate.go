@@ -334,7 +334,7 @@ func migrateMoverToNode(
 		return inner
 	})
 	if migErr != nil {
-		reassertParkerProtection(context.WithoutCancel(ctx), c, logger, mover.Node, mover.VMID)
+		restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", mover.Node, mover.VMID)
 		return "", "", cpierrors.Wrap(WrapMutationError(migErr),
 			fmt.Sprintf("disk migrate: migrate mover vmid %d from node %s to node %s", mover.VMID, mover.Node, spec.TargetNode))
 	}
@@ -374,7 +374,7 @@ func migrateMoverToNode(
 					fmt.Sprintf("disk migrate: the migrate task for mover vmid %d is still running server-side; the copy continues — retry the attach and it completes once the migration lands", mover.VMID))
 			}
 			// The task failed for real; the mover stayed on the source node.
-			reassertParkerProtection(context.WithoutCancel(ctx), c, logger, mover.Node, mover.VMID)
+			restoreParkerProtectionLogged(ctx, c, logger, "disk migrate", mover.Node, mover.VMID)
 			return "", "", cpierrors.Wrap(awaitErr,
 				fmt.Sprintf("disk migrate: migrate task for mover vmid %d to node %s", mover.VMID, spec.TargetNode))
 		}

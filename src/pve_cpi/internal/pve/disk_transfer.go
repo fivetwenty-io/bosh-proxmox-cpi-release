@@ -303,7 +303,7 @@ func transferFromParkerLocked(
 	moveErr := moveDiskToVM(ctx, c, logger, parker.Node, parker.VMID, slot, targetVMID, targetSlot)
 	work := fmt.Sprintf("the disk transfer to vm %d slot %s completed", targetVMID, targetSlot)
 	if moveErr != nil {
-		work = fmt.Sprintf("the disk transfer to vm %d slot %s failed", targetVMID, targetSlot)
+		work = windowWorkEnding(fmt.Sprintf("the disk transfer to vm %d slot %s", targetVMID, targetSlot), moveErr)
 	}
 	restoreErr := markWorkCompleted(restoreParkerProtection(ctx, c, logger, "transfer out", parker.Node, parker.VMID, work), moveErr == nil)
 	if moveErr != nil {
@@ -869,7 +869,7 @@ func deleteParkedOwnedDiskLocked(ctx context.Context, c Client, logger *log.Logg
 	if detachErr != nil {
 		detachErr = cpierrors.Wrap(WrapMutationError(detachErr),
 			fmt.Sprintf("delete parked: deallocate %q on parker vmid %d", bareVolid, parkerVMID))
-		work = fmt.Sprintf("the deletion of %q failed", bareVolid)
+		work = windowWorkEnding(fmt.Sprintf("the deletion of %q", bareVolid), detachErr)
 	}
 	restoreErr := markWorkCompleted(restoreParkerProtection(ctx, c, logger, "delete parked", node, parkerVMID, work), detachErr == nil)
 	return joinWindowErrors(detachErr, restoreErr)
@@ -883,6 +883,21 @@ func markWorkCompleted(restoreErr error, completed bool) error {
 		cutOff.WorkCompleted = completed
 	}
 	return restoreErr
+}
+
+// windowWorkEnding says how a protection window's own change ended when it
+// returned err, for the work string a cut-off restore carries. work names the
+// change, for example "the disk transfer to vm 700 slot scsi1". It says the
+// change failed only when PVE gave a verdict: a task that exited with a
+// failure, the snapshot refusal, or another answer pveAnswered accepts. A
+// dropped connection, a poll that gave up, or an ended context leaves the
+// change's outcome unknown, because PVE may still have applied it, and the
+// string says so.
+func windowWorkEnding(work string, err error) string {
+	if _, answered := pveAnswered(err); answered || IsTaskExitVerdict(err) || IsMoveDiskSnapshotRefusal(err) {
+		return work + " failed"
+	}
+	return "the outcome of " + work + " is unknown"
 }
 
 // joinWindowErrors combines a protection window's own error with its restore's
@@ -1000,20 +1015,92 @@ func (e *ProtectionRestoreCutOffError) Error() string { return e.err.Error() }
 
 func (e *ProtectionRestoreCutOffError) Unwrap() error { return e.err }
 
-// restoreParkerProtection puts protection back on a parker at the end of a
-// protection window. Every protection restore goes through it. op names the
-// window in log lines and in the error, for example "transfer out", and work
-// says how the window's own change ended, for example "the disk transfer to vm
-// 700 slot scsi1 completed", so an operator reading a cut-off restore knows
-// whether the disk moved.
+// putParkerProtectionBack writes protection back on a parker at the end of a
+// protection window. Every protection restore goes through it, whether its
+// caller returns a failed restore or only logs it. reassertParkerProtection
+// is a different write: it re-asserts the flag after a park or a completed
+// migration, on that window's own live context.
 //
-// The restore runs on context.WithoutCancel(ctx), so a request that was
+// The write runs on context.WithoutCancel(ctx), so a request that was
 // cancelled, or a window whose deadline stopped the work, still puts the flag
 // back. Without a deadline of its own, though, a PVE that never answers would
 // hold the restore open past the lock's TTL, so it gets
-// parkerRestoreTimeout.
+// parkerRestoreTimeout. It returns the write's error and whether that
+// deadline cut the write off.
+func putParkerProtectionBack(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int) (bool, error) {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRestoreTimeout(ctx))
+	defer cancel()
+	protErr := setParkerProtection(restoreCtx, c, logger, node, parkerVMID, true)
+	return errors.Is(restoreCtx.Err(), context.DeadlineExceeded), protErr
+}
+
+// protectionRestoreEnding says how a failed protection restore ended when
+// nobody knows whether protection went back on, in the words both the
+// returned error and the log use. It returns "" when PVE answered with a
+// failure, because then the write provably did not apply and protection is
+// off. A restore the client refused before sending, because an earlier
+// failure already made the operation uncertain, is checked first: PVE never
+// saw it, so blaming the network or PVE would mislead.
+func protectionRestoreEnding(protErr error, timedOut bool, timeout time.Duration) string {
+	switch {
+	case errors.Is(protErr, ErrMutationNotAttempted):
+		return "was not attempted because the operation was already uncertain"
+	case timedOut:
+		return fmt.Sprintf("did not finish within %s and its outcome is unknown", timeout)
+	case !ProtectionWriteRefused(protErr):
+		return "ended without an answer from PVE and its outcome is unknown"
+	default:
+		return ""
+	}
+}
+
+// restoreParkerProtectionLogged puts protection back on a parker, or on a
+// mover, for a window whose contract is to log a failed restore rather than
+// return it: the unpark, its sweep of a demoted reference, the park path's
+// deferred sweep, and a mover's migration that failed. Those callers act on
+// their own result, and a later park re-asserts the flag. op names the window
+// in the log line, for example "UnparkDisk".
 //
-// Three outcomes:
+// The restore goes through putParkerProtectionBack, so it ends at the same
+// deadline as the transfer and deletion restores. The one Warn it logs uses
+// the same endings as restoreParkerProtection, so an operator reading it can
+// tell a restore PVE refused from one whose outcome is unknown. In a
+// journal-managed request, a cut-off write leaves its step planned, so the
+// operation's record still says the restore is unsettled.
+func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int) {
+	timedOut, protErr := putParkerProtectionBack(ctx, c, logger, node, parkerVMID)
+	if protErr == nil || logger == nil {
+		return
+	}
+	timeout := parkerRestoreTimeout(ctx)
+	if ending := protectionRestoreEnding(protErr, timedOut, timeout); ending != "" {
+		logger.Warn(op+": protection restore on parker "+ending+"; check the parker with qm config <vmid> "+
+			"and run qm set <vmid> --protection 1 if protection is off",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.String("timeout", timeout.String()),
+			log.Err(protErr),
+		)
+		return
+	}
+	logger.Warn(op+": could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+		log.Int("parker_vmid", parkerVMID),
+		log.String("node", node),
+		log.Err(protErr),
+	)
+}
+
+// restoreParkerProtection puts protection back on a parker at the end of a
+// transfer or deletion window and reports a restore whose outcome is unknown.
+// op names the window in log lines and in the error, for example "transfer
+// out", and work says how the window's own change ended, for example "the
+// disk transfer to vm 700 slot scsi1 completed", so an operator reading a
+// cut-off restore knows whether the disk moved.
+//
+// The write goes through putParkerProtectionBack, so a cancelled request still
+// sends it, and parkerRestoreTimeout bounds it.
+//
+// Four outcomes:
 //
 //   - The restore succeeds: nil.
 //   - PVE answers with a failure (ProtectionWriteRefused): the outcome is
@@ -1042,25 +1129,12 @@ func (e *ProtectionRestoreCutOffError) Unwrap() error { return e.err }
 // hold PVE text; log.Err scrubs the log line, and the dispatcher scrubs the
 // error before it reaches the Director.
 func restoreParkerProtection(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int, work string) error {
-	timeout := parkerRestoreTimeout(ctx)
-	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-	defer cancel()
-	protErr := setParkerProtection(restoreCtx, c, logger, node, parkerVMID, true)
+	timedOut, protErr := putParkerProtectionBack(ctx, c, logger, node, parkerVMID)
 	if protErr == nil {
 		return nil
 	}
-	// A restore the client refused before sending, because an earlier
-	// failure already made the operation uncertain, is checked first: PVE
-	// never saw it, so blaming the network or PVE would mislead.
-	notAttempted := errors.Is(protErr, ErrMutationNotAttempted)
-	if timedOut := errors.Is(restoreCtx.Err(), context.DeadlineExceeded); notAttempted || timedOut || !ProtectionWriteRefused(protErr) {
-		ending := "ended without an answer from PVE and its outcome is unknown"
-		switch {
-		case notAttempted:
-			ending = "was not attempted because the operation was already uncertain"
-		case timedOut:
-			ending = fmt.Sprintf("did not finish within %s and its outcome is unknown", timeout)
-		}
+	timeout := parkerRestoreTimeout(ctx)
+	if ending := protectionRestoreEnding(protErr, timedOut, timeout); ending != "" {
 		if logger != nil {
 			logger.Warn(op+": protection restore on parker "+ending+"; check the parker's protection flag",
 				log.Int("parker_vmid", parkerVMID),

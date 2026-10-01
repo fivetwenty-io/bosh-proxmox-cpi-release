@@ -2377,19 +2377,15 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 
 	// Restore protection whether or not the detach succeeded: leaving a parker
 	// unprotected is the one outcome worse than a failed unpark, since the
-	// parker may still hold other deployments' disks. context.WithoutCancel
-	// keeps the restore reachable when the request context is already done —
-	// a cancelled or timed-out unpark is exactly when the window would otherwise
-	// stay open indefinitely. A restore failure is logged rather than returned:
-	// the detach result is what the caller acts on, and the park path re-asserts
-	// the flag on every attach.
-	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, parkerNode, parkerVMID, true); protErr != nil && logger != nil {
-		logger.Warn("UnparkDisk: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
-			log.Int("parker_vmid", parkerVMID),
-			log.String("node", parkerNode),
-			log.Err(protErr),
-		)
-	}
+	// parker may still hold other deployments' disks. The restore runs on a
+	// detached context, so it stays reachable when the request context is
+	// already done, and a cancelled or timed-out unpark is exactly when the
+	// window would otherwise stay open indefinitely. It also has its own
+	// deadline, so a PVE that stops answering cannot hold it past the lock's
+	// TTL. A restore failure is logged rather than returned: the detach result
+	// is what the caller acts on, and the park path re-asserts the flag on
+	// every attach.
+	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", parkerNode, parkerVMID)
 
 	if retryErr != nil {
 		// Classified like the protection write one line up: a 403 for a missing
@@ -2444,13 +2440,7 @@ func sweepDemotedUnderProtection(ctx context.Context, c Client, logger *log.Logg
 	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
 	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, node, parkerVMID, bareVolid)
 	sweepCancel()
-	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
-		logger.Warn("UnparkDisk: could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
-			log.Int("parker_vmid", parkerVMID),
-			log.String("node", node),
-			log.Err(protErr),
-		)
-	}
+	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", node, parkerVMID)
 	if sweepErr != nil {
 		// Same condition, same consequence as the detach path: see
 		// reportUnsweptReference.
@@ -2672,12 +2662,9 @@ func sweepParkerUnusedSlotsProtectedLocked(ctx context.Context, c Client, logger
 	if sweepErr != nil {
 		reportUnsweptReference(logger, node, parkerVMID, bareVolid, sweepErr)
 	}
-	if protErr := setParkerProtection(context.WithoutCancel(ctx), c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
-		logger.Warn("parker: could not restore protection after a sweep — re-set it by hand (qm set <vmid> --protection 1)",
-			log.Int("parker_vmid", parkerVMID),
-			log.Err(protErr),
-		)
-	}
+	// The restore gets its own deadline rather than what is left of ctx's, so
+	// a sweep that used its whole budget still puts protection back.
+	restoreParkerProtectionLogged(ctx, c, logger, "parker", node, parkerVMID)
 	return sweepErr == nil
 }
 
