@@ -415,17 +415,13 @@ func attachDiskViaTransfer(
 				return "", "", retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s (snapshot fallback)", op, diskCID))
 			}
 			slot, devicePath, putErr := attachDiskConfigPut(ctx, deps, op, vmCID, node, vmid, diskCID, rd, targetSlot, effectiveOpts)
-			// The unpark above emptied a single-purpose mover on this path;
-			// destroy it like the mainline transfer does (best-effort, same
-			// guard, never failing the attach that just landed).
+			// A volume named for its mover takes the hard error above, so a
+			// mover only gets here holding a volume named for something else.
+			// It goes through the same function as the mainline transfer below,
+			// so both places follow one rule about when a mover is destroyed
+			// and when it is kept.
 			if putErr == nil && plan.destroyMover {
-				if dErr := pve.DestroyEmptyMover(ctx, deps.PVE, deps.Log(ctx), plan.parker); dErr != nil {
-					deps.Log(ctx).Warn(op+": could not destroy the migration mover after the snapshot-fallback attach; it holds no disks and an operator cleanup removes it",
-						log.Int("mover_vmid", plan.parker.VMID),
-						log.String("node", plan.parker.Node),
-						log.Err(dErr),
-					)
-				}
+				destroyOrKeepMover(ctx, deps, op, plan.parker, nil)
 			}
 			return slot, devicePath, putErr
 		}
@@ -457,18 +453,11 @@ func attachDiskViaTransfer(
 	)
 
 	// A single-purpose migration mover has served its purpose once the disk
-	// is on the VM. Destroy it through the guard that refuses a mover still
-	// referencing any volume — best-effort, never failing the attach that
-	// already landed: a leftover mover carries the parker provenance tags,
-	// and the next attach (or an operator) cleans it.
+	// is on the VM, so it is destroyed here unless that would do harm, which
+	// destroyOrKeepMover decides. It never fails the attach that already
+	// landed.
 	if plan.destroyMover {
-		if dErr := pve.DestroyEmptyMover(ctx, deps.PVE, deps.Log(ctx), plan.parker); dErr != nil {
-			deps.Log(ctx).Warn(op+": could not destroy the migration mover after the attach; it holds no disks and a later attach or operator cleanup removes it",
-				log.Int("mover_vmid", plan.parker.VMID),
-				log.String("node", plan.parker.Node),
-				log.Err(dErr),
-			)
-		}
+		destroyOrKeepMover(ctx, deps, op, plan.parker, restoreCutOff)
 	}
 	if restoreCutOff != nil {
 		// Retriable: a retry comes back to this parker, and the settler
@@ -479,6 +468,58 @@ func attachDiskViaTransfer(
 			fmt.Sprintf("%s: parker protection restore cut off after the disk reached VM %s as %s (disk %s)", op, vmCID, landed, diskCID))
 	}
 	return targetSlot, devicePath, nil
+}
+
+// destroyOrKeepMover deals with a single-purpose migration mover once the disk
+// has moved off it. Both places in attachDiskViaTransfer that empty a mover
+// call it, so they follow one rule.
+//
+// The mover is kept in two cases. When restoreCutOff is set, nobody knows
+// whether the write that puts the mover's protection back applied. The
+// cut-off error tells the operator to check the mover, and in a
+// journal-managed request the next call settles that write by reading the
+// mover back, so the mover has to still be there. And when a guard wraps the
+// client and this request didn't create the mover, the guard refuses to
+// delete it. The protection-off write that comes before the delete would then
+// land for nothing, and the refusal would fail an attach that already landed.
+//
+// Every other mover goes to pve.DestroyEmptyMover, whose own checks refuse a
+// mover that still holds a volume. Nothing in the CPI removes a mover that is
+// left behind, so each warning says how to remove it by hand.
+func destroyOrKeepMover(ctx context.Context, deps Deps, op string, mover pve.DiskHolder, restoreCutOff error) {
+	const afterThisCall = "once this call has gone through and the mover holds no disks"
+	switch {
+	case restoreCutOff != nil:
+		// For a journal-managed disk, a retry settles the restore by reading
+		// the mover back, so removing the mover before a retry has succeeded
+		// would strand that restore. Waiting for the retry does no harm
+		// without a journal.
+		warnMoverLeft(ctx, deps, op, mover,
+			"kept the migration mover because its protection restore was cut off, and the mover is where that restore gets checked and settled",
+			"only after a retry of this attach has succeeded and the mover holds no disks", nil)
+	case !guardDeletesHolder(deps.PVE, mover.VMID):
+		warnMoverLeft(ctx, deps, op, mover,
+			"kept the migration mover because an earlier request created it, so this request's journal can't delete it",
+			afterThisCall, nil)
+	default:
+		if err := pve.DestroyEmptyMover(ctx, deps.PVE, deps.Log(ctx), mover); err != nil {
+			warnMoverLeft(ctx, deps, op, mover, "could not destroy the migration mover after the attach", afterThisCall, err)
+		}
+	}
+}
+
+// warnMoverLeft logs the warning for a migration mover that the attach left
+// behind. Every such warning has the same shape. reason says why the mover is
+// still there, when says at what point it is safe to remove, and the warning
+// ends with the order in which to remove it by hand.
+func warnMoverLeft(ctx context.Context, deps Deps, op string, mover pve.DiskHolder, reason, when string, err error) {
+	fields := []log.Field{log.Int("mover_vmid", mover.VMID), log.String("node", mover.Node)}
+	if err != nil {
+		fields = append(fields, log.Err(err))
+	}
+	deps.Log(ctx).Warn(fmt.Sprintf(
+		"%s: %s. Nothing in the CPI removes it later, so %s, run qm set %d --protection 0 and then qm destroy %d on node %s",
+		op, reason, when, mover.VMID, mover.VMID, mover.Node), fields...)
 }
 
 // attachDiskGlobalPerfOpts resolves the global (no call-level cloud_properties)
@@ -924,11 +965,12 @@ type attachPlan struct {
 	// target VM's own sentinel on an idempotent re-attach). attachDiskCore
 	// merges it as the rightmost layer over global and CID options.
 	overlay map[string]string
-	// destroyMover is true when parker is a single-purpose migration mover
-	// (created by this call's cross-node migration, or adopted from an
-	// interrupted one): once the transfer lands, attachDiskViaTransfer
-	// destroys it through the guard that refuses a mover still referencing
-	// any volume. Meaningful only when viaTransfer is true.
+	// destroyMover is true when parker is a single-purpose migration mover,
+	// whether this call's cross-node migration created it or it was adopted
+	// from an interrupted one. Once the transfer lands, attachDiskViaTransfer
+	// hands the mover to destroyOrKeepMover, which destroys it unless its
+	// protection restore was cut off or a guard won't delete a mover this
+	// request didn't create. Meaningful only when viaTransfer is true.
 	destroyMover bool
 }
 
@@ -1036,7 +1078,8 @@ func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if holder.Node == node {
 			// A mover already on the target node is an interrupted migration
-			// resuming: the ordinary transfer drains it, then destroys it.
+			// resuming. The ordinary transfer drains it, and destroyOrKeepMover
+			// then decides whether to destroy it.
 			return attachPlan{
 				viaTransfer:  true,
 				parker:       holder,

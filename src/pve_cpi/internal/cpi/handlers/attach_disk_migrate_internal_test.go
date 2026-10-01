@@ -6,13 +6,16 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	clusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
@@ -21,6 +24,8 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -51,6 +56,13 @@ type migFakeClient struct {
 	// renameOnMigrate mimics node-local storage: migration renames each disk
 	// volume for the target storage's naming (fresh disk index).
 	renameOnMigrate bool
+	// failProtectionOn, when non-zero, fails every write that turns
+	// protection on for that VMID in transport, before it lands, the way a
+	// request to a PVE that stopped answering does.
+	failProtectionOn int
+	// protectionWrites lists, per VMID, the protection value of every write
+	// that landed, oldest first.
+	protectionWrites map[int][]bool
 }
 
 type migRecord struct {
@@ -183,6 +195,9 @@ func (n *migFakeNodes) UpdateQemuConfig(_ context.Context, node string, vmidStr 
 	if !ok || n.c.nodes[vmid] != node {
 		return fmt.Errorf("migFake: no config for vmid %s on node %s: %w", vmidStr, node, sdkerrors.ErrNotFound)
 	}
+	if params.Protection != nil && *params.Protection && vmid == n.c.failProtectionOn {
+		return &sdkerrors.ConnectionError{Host: "pve", Port: 8006, Message: "connection reset by peer"}
+	}
 	if params.Delete != nil {
 		slot := *params.Delete
 		if raw, present := cfg[slot]; present {
@@ -204,6 +219,10 @@ func (n *migFakeNodes) UpdateQemuConfig(_ context.Context, node string, vmidStr 
 	}
 	if params.Protection != nil {
 		cfg["protection"] = *params.Protection
+		if n.c.protectionWrites == nil {
+			n.c.protectionWrites = map[int][]bool{}
+		}
+		n.c.protectionWrites[vmid] = append(n.c.protectionWrites[vmid], *params.Protection)
 	}
 	return nil
 }
@@ -537,6 +556,104 @@ func TestAttachCrossNode_MigratesViaMover(t *testing.T) {
 	}
 	if _, ok := c.configs[90000]; !ok {
 		t.Error("shared parker destroyed")
+	}
+}
+
+// TestAttachCrossNode_KeepsTheMoverWhenItsProtectionRestoreIsCutOff runs the
+// mover flow with no journal behind it and cuts off the write that puts the
+// mover's protection back after the disk lands on the VM. Nobody knows whether
+// that write applied, and the cut-off error tells the operator to check the
+// mover with qm config and qm set, so the mover has to still exist. The
+// attach returns the slot beside the retriable cut-off error, the disk is on
+// the VM, and nothing reaches the mover after the cut-off: no protection-off
+// write and no delete.
+func TestAttachCrossNode_KeepsTheMoverWhenItsProtectionRestoreIsCutOff(t *testing.T) {
+	t.Parallel()
+
+	c := newMigFakeClient(map[int]map[string]any{
+		700: {},
+		90000: {
+			"tags":       "bosh-cpi;bosh-parker",
+			"protection": true,
+			"scsi0":      "data:vm-90000-disk-0,serial=" + migTestToken,
+		},
+	}, map[int]string{700: "pve2", 90000: "pve1"})
+	deps := migTestDeps(c)
+	var logged bytes.Buffer
+	logger, err := log.NewLogger("debug", &logged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps.Logger = logger
+
+	meta := &pve.DiskCIDMeta{ID: migTestToken, Anchor: true}
+	holder := pve.DiskHolder{Found: true, VMID: 90000, Node: "pve1", IsParker: true, Slot: "scsi0", Tags: "bosh-cpi;bosh-parker"}
+	rd := resolvedDisk{
+		diskCID: "pvd-x", birth: "data:vm-9001-disk-0", volid: "data:vm-90000-disk-0",
+		meta: meta, stableID: migTestToken, holder: &holder,
+	}
+	plan, err := guardAndUnparkBeforeAttach(context.Background(), deps, "attach_disk", &rd, "pve2", 700)
+	if err != nil {
+		t.Fatalf("guardAndUnparkBeforeAttach: %v", err)
+	}
+	if !plan.viaTransfer || !plan.destroyMover {
+		t.Fatalf("plan = %+v, want a transfer plan that destroys its mover", plan)
+	}
+	mover := plan.parker.VMID
+
+	c.mu.Lock()
+	c.failProtectionOn = mover
+	c.protectionWrites = nil
+	deletedBefore := len(c.deletedVMs)
+	c.mu.Unlock()
+	ctx := pve.WithParkerProtectionRestoreTimeoutForTest(
+		pve.WithTestBackoff(context.Background(), func(int) time.Duration { return 0 }), 2*time.Second)
+	diskID, devPath, err := attachDiskCore(ctx, deps, "attach_disk", "700", "pve2", 700, "pvd-x", rd, plan)
+	if err == nil {
+		t.Fatal("attachDiskCore succeeded although the mover's protection restore never got an answer")
+	}
+	msg := log.ScrubMessage(err.Error())
+	t.Logf("attach error: %s", msg)
+	var cutOff *pve.ProtectionRestoreCutOffError
+	if !errors.As(err, &cutOff) || !cutOff.WorkCompleted || cutOff.ParkerVMID != mover {
+		t.Fatalf("error %q does not carry the completed transfer's cut-off restore on mover %d", msg, mover)
+	}
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) || !typed.OkToRetry() {
+		t.Fatalf("error %q is not retriable", msg)
+	}
+	if diskID != "scsi1" || !strings.Contains(devPath, "scsi1") {
+		t.Errorf("diskID=%q devPath=%q, want the slot the disk landed in", diskID, devPath)
+	}
+
+	c.mu.Lock()
+	attached, _ := c.configs[700]["scsi1"].(string)
+	writes := append([]bool(nil), c.protectionWrites[mover]...)
+	deleted := append([]int(nil), c.deletedVMs[deletedBefore:]...)
+	c.mu.Unlock()
+	if !strings.Contains(attached, "serial="+migTestToken) {
+		t.Errorf("VM 700 scsi1 = %q, want the disk with its identity serial", attached)
+	}
+	if got := findMoverVMID(t, c); got != mover {
+		t.Errorf("mover after the cut-off = %d, want mover %d kept", got, mover)
+	}
+	if len(deleted) != 0 {
+		t.Errorf("deletedVMs after the cut-off = %v, want none", deleted)
+	}
+	// The transfer's own window opens with one protection-off write. Nothing
+	// that turns protection on lands, so anything after that first write
+	// came after the cut-off.
+	if len(writes) != 1 || writes[0] {
+		t.Errorf("protection writes that landed on mover %d = %v, want only the transfer's [false]", mover, writes)
+	}
+	logText := logged.String()
+	for _, want := range []string{
+		"kept the migration mover because its protection restore was cut off",
+		fmt.Sprintf("only after a retry of this attach has succeeded and the mover holds no disks, run qm set %d --protection 0 and then qm destroy %d", mover, mover),
+	} {
+		if !strings.Contains(logText, want) {
+			t.Errorf("the log does not contain %q: %s", want, log.ScrubMessage(logText))
+		}
 	}
 }
 

@@ -32,6 +32,9 @@ type managedDiskLifecycle struct {
 	// drive-option overlay note alone (see lifecycleOverlayOnlyConfigWrite),
 	// during this operation.
 	diskMutationAdmitted bool
+	// holders is the guard's hook state, which records the holders this
+	// operation created. createdHolder answers from it.
+	holders *managedDiskLifecycleGuard
 }
 
 func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk, operation string) (*managedDiskLifecycle, error) {

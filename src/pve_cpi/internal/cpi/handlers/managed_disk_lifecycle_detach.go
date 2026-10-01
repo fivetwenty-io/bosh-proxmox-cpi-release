@@ -21,6 +21,13 @@ type managedDiskLifecycleClient struct {
 // client the CPI built.
 func (c *managedDiskLifecycleClient) unguardedClient() pve.Client { return c.Client }
 
+// deletesHolder reports whether this lifecycle's guard would let the operation
+// delete the VM with this VMID, which it does only for a holder the operation
+// created itself. guardDeletesHolder asks it.
+func (c *managedDiskLifecycleClient) deletesHolder(vmid int) bool {
+	return c.lifecycle.holders != nil && c.lifecycle.holders.createdHolder(vmid)
+}
+
 func (c *managedDiskLifecycleClient) QEMU() qemu.Service {
 	return &managedDiskLifecycleQEMU{Service: c.Client.QEMU(), client: c.Client, lifecycle: c.lifecycle}
 }
