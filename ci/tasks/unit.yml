@@ -1,9 +1,14 @@
 # ci/tasks/unit.yml
 #
-# Runs `make check` from the repository root. The root Makefile delegates
-# Go linting, vetting, and tests to src/pve_cpi.
+# Runs `make check` and `make security` from the repository root. The root
+# Makefile delegates Go linting, vetting, and tests to src/pve_cpi.
 #
-# No secrets required. Runs on any Concourse worker.
+# The golang image ships none of the tools those targets gate on, so the task
+# installs them first, at the versions .github/workflows/ci.yml and
+# security.yml pin. Both targets run with REQUIRE_TOOLS=1, so a missing
+# scanner fails the task instead of being skipped with a notice.
+#
+# No secrets required. Runs on any amd64 or arm64 Concourse worker.
 
 platform: linux
 
@@ -23,6 +28,55 @@ run:
     - -euc
     - |
       export NO_COLOR=1
+
+      # py-test needs python3 with PyYAML, which scripts/_integration.py
+      # imports, and erb-check needs ruby. Both come from the image's own
+      # Debian release, so their versions track the pinned digest.
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends python3 python3-yaml ruby
+
+      # The same Go tool pins as the ci.yml and security.yml install steps.
+      go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+      go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      # trivy comes from its release download for the worker's architecture.
+      # The sha256 values are the ones trivy_0.74.0_checksums.txt publishes
+      # with the release; update them together with TRIVY_VERSION.
+      TRIVY_VERSION="0.74.0"
+      case "$(uname -m)" in
+        x86_64)
+          trivy_arch="64bit"
+          trivy_sha256="2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+          ;;
+        aarch64 | arm64)
+          trivy_arch="ARM64"
+          trivy_sha256="b94ce1976bbf3c15b514b605ee88be7c6d94a29be2302847ff01cb794d47aad5"
+          ;;
+        *)
+          echo "no trivy ${TRIVY_VERSION} checksum is pinned for $(uname -m)" >&2
+          exit 1
+          ;;
+      esac
+      trivy_tgz="/tmp/trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz"
+      curl -fsSL -o "${trivy_tgz}" \
+        "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz"
+      echo "${trivy_sha256}  ${trivy_tgz}" | sha256sum -c -
+      tar -xzf "${trivy_tgz}" -C /usr/local/bin trivy
+      rm -f "${trivy_tgz}"
+
+      # Print each tool's version, which also fails the task early when an
+      # install step left a tool off the PATH.
+      python3 --version
+      python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+      ruby --version
+      for tool in staticcheck golangci-lint govulncheck gosec; do
+        tool_path="$(command -v "${tool}")" || { echo "${tool} is not on the PATH" >&2; exit 1; }
+        go version -m "${tool_path}" | awk -v tool="${tool}" '$1 == "mod" { print tool, $3; exit }'
+      done
+      trivy --version
+
       cd repo
-      make check
-      make security
+      make check REQUIRE_TOOLS=1
+      make security REQUIRE_TOOLS=1
