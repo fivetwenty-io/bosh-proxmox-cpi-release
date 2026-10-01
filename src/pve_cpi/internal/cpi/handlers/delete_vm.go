@@ -160,14 +160,14 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// config field doc for the cross-cluster shared-storage data-loss
 		// hazard enabling it introduces).
 		//
-		// A straggler may carry tagRetainEphemeral: its original fast-path delete
-		// stamped bosh-deleting before the retain detach ran, so the straggler can
-		// hold an ephemeral disk in any state — still attached, or already
-		// unlinked+swept (unreferenced with a matching VMID, exactly what
-		// DestroyUnreferencedDisks=true frees). Re-run the detach to finish any
-		// pending unlink, and force the destroy flag false for retain-tagged
-		// stragglers regardless of the config knob. On detach failure, skip this
-		// straggler (left for the next sweep) rather than destroy with the
+		// A straggler may carry tagRetainEphemeral. Its original fast-path delete
+		// stamped bosh-deleting before the retention ran, so the straggler may
+		// still hold its ephemeral disk, or an earlier attempt may already have
+		// transferred that disk to a parker. Re-running the retention transfers a
+		// volume the guest still holds and verifies one that is already parked,
+		// and the destroy flag is forced false for retain-tagged stragglers
+		// regardless of the config knob. When the retention fails, the straggler
+		// is skipped and left for the next sweep rather than destroyed with the
 		// volume in an unknown state. The tag is read from the authoritative
 		// config for the same staleness reason as the deleting tag above.
 		destroyDisks := deps.Config.DestroyUnreferencedDisks
@@ -310,9 +310,10 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
 		return protErr
 	}
-	// Preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set.
-	// Returns retained=true whenever the retain tag is present (even if the disk
-	// was already unlinked on a prior attempt). The retained flag gates
+	// Preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set
+	// by transferring its volume to a parker before the destroy. Returns
+	// retained=true whenever the retain tag is present, including when an
+	// earlier attempt already parked the disk. The retained flag gates
 	// DestroyUnreferencedDisks below.
 	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
 	if retainErr != nil {
@@ -336,10 +337,11 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	//
 	// DestroyUnreferencedDisks is pve.destroy_unreferenced_disks (default
 	// false; see the config field doc for the cross-cluster shared-storage
-	// data-loss hazard it introduces when enabled) AND-ed with !retained:
-	// retain semantics always win regardless of the knob -- after the
-	// unlink+sweep sequence the ephemeral volume is unreferenced AND has a
-	// matching VMID, exactly what DestroyUnreferencedDisks=true would free.
+	// data-loss hazard it introduces when enabled) AND-ed with !retained, so
+	// retain semantics always win regardless of the knob. The retention above
+	// has already transferred the ephemeral volume to a parker, which renames
+	// it for the parker's VMID, and so this destroy neither references nor
+	// owns it. Forcing the flag off on that path is a second guard.
 	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
 	purge := true
 	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
@@ -526,9 +528,10 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 	}
 
 	// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
-	// retained=true whenever the retain tag is present (even if a prior attempt
-	// already unlinked the disk); DestroyUnreferencedDisks must be false on that
-	// path. See function doc.
+	// Retention transfers the volume to a parker before the destroy below.
+	// retained=true whenever the retain tag is present, including when an
+	// earlier attempt already parked the disk, and DestroyUnreferencedDisks is
+	// false on that path. See function doc.
 	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
 	if retainErr != nil {
 		return nil, retainErr
@@ -726,10 +729,12 @@ func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.L
 // shrinking immediately after delete_vm without checking your PVE version.
 //
 // DestroyUnreferencedDisks is pve.destroy_unreferenced_disks (default false)
-// AND-ed with !retained: it is always false on the retain path (the
-// ephemeral disk is now unreferenced + own-VMID — true would destroy it)
-// regardless of the config knob, and otherwise reflects the operator's
-// opt-in. See detachRetainedEphemeralDisk for the retain rationale and the
+// AND-ed with !retained, so it is always false on the retain path regardless
+// of the config knob, and otherwise reflects the operator's opt-in. On the
+// retain path the retention has already transferred the ephemeral volume to a
+// parker, which renames it for the parker's VMID, so this destroy neither
+// references nor owns it, and the forced false is a second guard. See
+// detachRetainedEphemeralDisk for the retain rationale and the
 // DestroyUnreferencedDisks field doc on config.CPIConfig for the
 // cross-cluster shared-storage data-loss hazard enabling the knob
 // introduces. When true it triggers pvesm free under the per-storage
@@ -1104,13 +1109,6 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 	return nil
 }
 
-// ephemeralVolidPattern matches the volume name suffix created by attachEphemeralDisk:
-// "vm-<vmid>-ephemeral-<n>". This is distinct from "vm-<n>-disk-<n>" (persistent disks)
-// so EmbeddedDiskVMID does not match it; a dedicated check is required.
-// The pattern anchors on "vm-" + digits + "-ephemeral-" to avoid false-positives
-// on unrelated volume names.
-const ephemeralVolidInfix = "-ephemeral-"
-
 // detachRetainedEphemeralDisk transfers retained ephemeral volumes to parkers
 // before destroying their original VM. Removing unused entries would physically
 // delete VM-owned volumes, so retention never uses the old unused-slot sweep.
@@ -1119,27 +1117,16 @@ func detachRetainedEphemeralDisk(ctx context.Context, deps Deps, node, vmCID str
 }
 
 // findEphemeralActiveDisks returns every (slot -> bare volid) on an active bus slot
-// of cfg whose bare volid contains ephemeralVolidInfix AND whose embedded storage
-// VMID matches ownerVMID. Only own-VMID ephemeral volumes are returned; foreign-VMID
-// volumes are left for detachForeignActiveDisks.
-//
-// Detection uses a string-infix check on the bare volid ("vm-<vmid>-ephemeral-<n>")
-// because EmbeddedDiskVMID matches "vm-<n>-disk-<n>" only and would not match the
-// ephemeral naming convention.
+// of cfg that pve.IsOwnEphemeralVolume reads as ownerVMID's own ephemeral volume,
+// in the block or the file form. Foreign-VMID volumes are left for
+// detachForeignActiveDisks. The retention loops over unused slots and recorded
+// source CIDs use the same matcher, so all three read a volume's name the same
+// way.
 func findEphemeralActiveDisks(cfg map[string]any, ownerVMID int) map[string]string {
 	out := make(map[string]string)
-	prefix := fmt.Sprintf("vm-%d%s", ownerVMID, ephemeralVolidInfix)
 	for slot, optstr := range sdkqemu.ParseDisks(cfg) {
-		bare := optstr
-		if comma := strings.Index(optstr, ","); comma >= 0 {
-			bare = optstr[:comma]
-		}
-		// bare volid is "storage:vm-<vmid>-ephemeral-<n>"; strip storage prefix.
-		volPart := bare
-		if colon := strings.Index(bare, ":"); colon >= 0 {
-			volPart = bare[colon+1:]
-		}
-		if strings.HasPrefix(volPart, prefix) {
+		if pve.IsOwnEphemeralVolume(optstr, ownerVMID) {
+			bare, _, _ := strings.Cut(optstr, ",")
 			out[slot] = bare
 		}
 	}

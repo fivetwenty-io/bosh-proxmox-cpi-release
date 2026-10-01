@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -24,14 +23,10 @@ func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID stri
 	}
 	slots := findEphemeralActiveDisks(cfg, vmid)
 	for slot, volume := range pve.FindUnusedDiskEntries(cfg) {
-		_, name, err := pve.ParseDiskCID(volume)
-		if err != nil {
+		if _, _, err := pve.ParseDiskCID(volume); err != nil {
 			return false, err
 		}
-		if slash := strings.LastIndex(name, "/"); slash >= 0 {
-			name = name[slash+1:]
-		}
-		if strings.HasPrefix(name, fmt.Sprintf("vm-%d%s", vmid, ephemeralVolidInfix)) {
+		if pve.IsOwnEphemeralVolume(volume, vmid) {
 			slots[slot] = volume
 		}
 	}
@@ -42,14 +37,7 @@ func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID stri
 	// A transfer can have finished before the original VM's delete. Verify its
 	// durable source CID on retry, including a transfer left in an unused slot.
 	for birth, cid := range pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(cfg)) {
-		_, name, err := pve.ParseDiskCID(birth)
-		if err != nil {
-			continue
-		}
-		if slash := strings.LastIndex(name, "/"); slash >= 0 {
-			name = name[slash+1:]
-		}
-		if !strings.HasPrefix(name, fmt.Sprintf("vm-%d%s", vmid, ephemeralVolidInfix)) {
+		if !pve.IsOwnEphemeralVolume(birth, vmid) {
 			continue
 		}
 		if _, meta, err := decodeDiskCID(ctx, deps, "retain_ephemeral", cid); err != nil || meta == nil || meta.ID == "" {
