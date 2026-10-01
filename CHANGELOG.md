@@ -12,7 +12,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
-## [0.8.1] - YYYY-MM-DD
+## [0.8.1] - 2026-10-01
 
 ### Fixed
 
