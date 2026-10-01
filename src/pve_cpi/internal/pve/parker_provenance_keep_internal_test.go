@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,10 @@ type keepWorld struct {
 	nodesErr error
 	reads    []string
 	written  string
+	// pending holds, per node and VM, each key whose delete is pending with
+	// its current value. The config read leaves those keys out, the way the
+	// config endpoint does, and the pending endpoint reports them.
+	pending map[string]map[int]map[string]any
 }
 
 func newKeepWorld() *keepWorld {
@@ -81,6 +86,23 @@ func (w *keepWorld) client() Client {
 			},
 			nodesSvc: &fakeNodesService{
 				qemuConfigFn: qemuSvc.Config,
+				listQemuPendingFn: func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
+					resp, err := PendingFromConfigRead(ctx, qemuSvc.Config, node, vmid)
+					if err != nil {
+						return nil, err
+					}
+					id, _ := strconv.Atoi(vmid)
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					for key, value := range w.pending[node][id] {
+						raw, err := json.Marshal(map[string]any{"key": key, "value": value, "delete": 1})
+						if err != nil {
+							return nil, err
+						}
+						*resp = append(*resp, raw)
+					}
+					return resp, nil
+				},
 				updateQemuConfigFn: func(_ context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
 					w.mu.Lock()
 					defer w.mu.Unlock()

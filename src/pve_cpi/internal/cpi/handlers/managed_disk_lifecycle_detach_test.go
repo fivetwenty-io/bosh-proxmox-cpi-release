@@ -39,6 +39,12 @@ type lifecycleDetachNodes struct {
 	c *lifecycleDetachFake
 }
 
+// ListQemuPending serves the pending endpoint from the fake's own config read,
+// which managedDetachDisk and the pending-delete helper both reach.
+func (n *lifecycleDetachNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
+}
+
 func (n *lifecycleDetachNodes) UpdateQemuConfig(_ context.Context, _ string, _ string, p *nodes.UpdateQemuConfigParams) error {
 	if p.Digest == nil || *p.Digest != n.c.config["digest"] {
 		return fmt.Errorf("generation conflict")

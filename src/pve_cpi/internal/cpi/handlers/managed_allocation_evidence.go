@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"sort"
@@ -40,10 +41,27 @@ func managedMutationUPID(result any) (string, error) {
 	return upid, nil
 }
 
+// errManagedConfigDeletePending is the readback answer for a requested delete
+// that PVE could only record as pending. The key is missing from the config the
+// readback reads, but the running guest still has it, so the delete was not
+// applied, and an observer must not record it as one.
+var errManagedConfigDeletePending = errors.New("VM config deletion is pending, not applied")
+
 // managedConfigFieldsMatch compares the exact writable fields returned by the
 // typed SDK's JSON encoder against authoritative QEMU config. It handles PVE's
 // scalar encodings and property-string order without logging any values.
 func managedConfigFieldsMatch(config map[string]any, params any) error {
+	return managedConfigFieldsMatchPending(config, nil, params)
+}
+
+// managedConfigFieldsMatchPending is managedConfigFieldsMatch with the
+// holder's pending deletes in hand. The config endpoint leaves out a key whose
+// delete is pending, so an absent key alone doesn't prove a delete. A requested
+// delete counts only when the key is absent and its delete isn't pending. Every
+// other field is still checked, and when they all match, a pending delete wraps
+// errManagedConfigDeletePending. A nil pendingDelete means the caller read no
+// pending view.
+func managedConfigFieldsMatchPending(config map[string]any, pendingDelete func(string) bool, params any) error {
 	raw, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("cannot encode requested VM config")
@@ -52,6 +70,7 @@ func managedConfigFieldsMatch(config map[string]any, params any) error {
 	if err = json.Unmarshal(raw, &fields); err != nil || len(fields) == 0 {
 		return fmt.Errorf("empty or malformed requested VM config")
 	}
+	var pendingErr error
 	for key, want := range fields {
 		if key == "digest" {
 			continue
@@ -64,6 +83,9 @@ func managedConfigFieldsMatch(config map[string]any, params any) error {
 			for _, deleted := range strings.Split(text, ",") {
 				if _, present := config[deleted]; present {
 					return fmt.Errorf("VM config deletion not observed for %s", deleted)
+				}
+				if pendingDelete != nil && pendingDelete(deleted) && pendingErr == nil {
+					pendingErr = fmt.Errorf("VM config deletion of %s: %w", deleted, errManagedConfigDeletePending)
 				}
 			}
 			continue
@@ -81,7 +103,7 @@ func managedConfigFieldsMatch(config map[string]any, params any) error {
 			return fmt.Errorf("VM config field %s differs from requested value", key)
 		}
 	}
-	return nil
+	return pendingErr
 }
 
 func managedConfigReadback(key string, got, want any) string {

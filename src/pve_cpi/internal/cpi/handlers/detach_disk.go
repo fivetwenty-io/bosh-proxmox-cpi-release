@@ -80,7 +80,9 @@ func detachDiskResolveSlot(
 	}
 
 	// Resolve the active bus slot for diskCID in the VM config.
-	diskID, err = pve.ResolveDiskID(ctx, deps.PVE, node, vmid, diskCID)
+	// Both views: a slot whose delete is pending is still attached, so a retry
+	// after a delete PVE left pending never takes the already-detached branch.
+	diskID, err = pve.ResolveAttachedSlot(ctx, deps.PVE, node, vmid, diskCID)
 	if err != nil {
 		if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
 			// Disk is not on an active bus. It may still linger as an unusedN
@@ -263,15 +265,11 @@ func HandleDetachDisk(deps Deps) Handler {
 		// volume, not just drop the reference. A legacy disk is named for a VMID
 		// from the disk band, so PVE creates no unusedN entry and the sweep finds
 		// nothing. The check above refuses a volume this VM owns, and the
-		// stable-ID branch takes every renamed one.
-		if err := pve.RetryOnTransientOrUnplugBusy(ctx, deps.Log(ctx), "detach_disk", 0, func() error {
-			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, diskID)
-		}); err != nil {
-			wrapped := pve.WrapError(err)
-			if pve.IsNotFound(err) {
-				return nil, cpierrors.VMNotFound(vmCID)
-			}
-			return nil, cpierrors.Wrap(wrapped, fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
+		// stable-ID branch takes every renamed one. A delete PVE can only
+		// record as pending is reverted and refused, so the disk is never
+		// parked while the running guest still has it.
+		if err := detachLegacySlot(ctx, deps, vmCID, diskCID, bareDiskCID, node, vmid, diskID); err != nil {
+			return nil, err
 		}
 
 		deps.Log(ctx).Info("detach_disk",
@@ -416,6 +414,12 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
 			pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid, rd.birth)
 			return nil
+		}
+		// The slot delete inside the transfer may have stayed pending. It has
+		// been reverted, nothing reached the parker, and the class depends on
+		// why the delete stayed pending.
+		if pending := driveDeletePendingDiskError("detach_disk", transferErr); pending != nil {
+			return pending
 		}
 		return retriableUnlessPermanent(transferErr,
 			fmt.Sprintf("detach_disk: transfer disk %s to parker (fail-closed: retry resumes the transfer)", rd.diskCID))
@@ -614,6 +618,37 @@ func detachDiskSnapshotGuard(ctx context.Context, deps Deps, vmCID, node string,
 		vmCID, node, len(snapNames), strings.Join(snapNames, ", "),
 		diskCID, strings.Join(snapNames, ", "),
 	)
+}
+
+// detachLegacySlot runs detach_disk's legacy slot detach and classes its
+// failure. A pending delete gets the class the pending-delete mapping
+// chooses, a VM that's gone is VMNotFound, and anything else keeps the class
+// PVE's error carries.
+func detachLegacySlot(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string, vmid int, diskID string) error {
+	err := detachDriveSlot(ctx, deps, node, vmid, diskID, bareDiskCID)
+	if err == nil {
+		return nil
+	}
+	if pending := driveDeletePendingDiskError("detach_disk", err); pending != nil {
+		return pending
+	}
+	if pve.IsNotFound(err) {
+		return cpierrors.VMNotFound(vmCID)
+	}
+	return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("detach_disk: DetachDisk failed for VM %s disk %s (diskID=%s)", vmCID, diskCID, diskID))
+}
+
+// detachDriveSlot detaches one bus slot that names volid through the
+// pending-delete helper, which reverts a delete PVE could only record as
+// pending and returns a *pve.DriveDeletePendingError for the caller to class.
+// A managed lifecycle client keeps its own DetachDisk, which exposes each
+// config write to the journal guard and sends its bus-slot delete through the
+// same helper.
+func detachDriveSlot(ctx context.Context, deps Deps, node string, vmid int, slot, volid string) error {
+	if managed, ok := deps.PVE.(*managedDiskLifecycleClient); ok {
+		return managed.QEMU().DetachDisk(ctx, node, vmid, slot)
+	}
+	return pve.DetachDriveSlot(ctx, deps.PVE, deps.Log(ctx), node, vmid, slot, volid, 0)
 }
 
 // parkAfterDetach parks bareDiskCID onto a parker VM after a successful

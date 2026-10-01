@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,21 @@ type scanFakeClient struct {
 	configErr map[int]error
 	// renameCounter numbers vm-<target>-disk-<n> names per target VM.
 	renameCounter map[int]int
+	// running marks VMs that are running, whose bus-slot deletes PVE can
+	// only record as pending. It holds one when the VM's hotplug setting
+	// lacks disk, and when busy marks the guest as holding the device, in
+	// which case the delete also fails busy. A revert drops the pending
+	// delete.
+	running map[int]bool
+	busy    map[int]bool
+	// held is each VM's pending section, every key whose delete is pending
+	// with its current value. The config read serves the applied view
+	// without them, and the pending endpoint reports them.
+	held map[int]map[string]any
+	// revertErr, when set, fails every revert, and revertKeepsPending makes
+	// every revert succeed without dropping the pending delete.
+	revertErr          error
+	revertKeepsPending bool
 }
 
 func newScanFakeClient(configs map[int]map[string]any) *scanFakeClient {
@@ -154,6 +170,7 @@ func (c *scanFakeClient) Nodes() sdknodes.Service {
 		updateQemuConfigFn:   c.updateQemuConfig,
 		createQemuMoveDiskFn: c.createQemuMoveDisk,
 		qemuConfigFn:         c.QEMU().Config,
+		listQemuPendingFn:    c.listQemuPending,
 		// The authoritative per-node listing the parker and holder scans now
 		// read, derived from the same configs the ListResources fake serves.
 		listQemuFn: func(context.Context, string, *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -191,7 +208,13 @@ func (c *scanFakeClient) updateQemuConfig(_ context.Context, _ string, vmidStr s
 	if !ok {
 		return fmt.Errorf("fake: no config for vmid %s", vmidStr)
 	}
+	if params.Revert != nil {
+		return c.revertLocked(cfg, vmid, *params.Revert)
+	}
 	if params.Delete != nil {
+		if held, err := c.holdDeleteLocked(cfg, vmid, *params.Delete); held {
+			return err
+		}
 		c.deleteConfigKeyLocked(cfg, vmid, *params.Delete)
 	}
 	if params.Description != nil {
@@ -203,6 +226,82 @@ func (c *scanFakeClient) updateQemuConfig(_ context.Context, _ string, vmidStr s
 		c.logEvent("protection:%d:%v", vmid, *params.Protection)
 	}
 	return nil
+}
+
+// holdDeleteLocked records a bus-slot delete on a running VM as pending, the
+// way qemu-server does when the VM's hotplug setting lacks disk or the guest
+// still holds the device, and reports whether it did. A busy guest also fails
+// the delete.
+func (c *scanFakeClient) holdDeleteLocked(cfg map[string]any, vmid int, slot string) (bool, error) {
+	if !c.running[vmid] || strings.HasPrefix(slot, "unused") {
+		return false, nil
+	}
+	hotplug, set := cfg["hotplug"].(string)
+	lacksDisk := set && !strings.Contains(","+hotplug+",", ",disk,")
+	if !lacksDisk && !c.busy[vmid] {
+		return false, nil
+	}
+	if value, present := cfg[slot]; present {
+		if c.held == nil {
+			c.held = map[int]map[string]any{}
+		}
+		if c.held[vmid] == nil {
+			c.held[vmid] = map[string]any{}
+		}
+		c.held[vmid][slot] = value
+		delete(cfg, slot)
+	}
+	c.logEvent("pending-delete:%d:%s", vmid, slot)
+	if lacksDisk {
+		return true, nil
+	}
+	return true, fmt.Errorf("API request failed: parameter error: Parameter verification failed. (code: 0, errors: %s: "+
+		"hotplug problem - error on hot-unplugging device 'virtio%s' - still busy in guest?)", slot, slot)
+}
+
+// revertLocked drops the pending delete of each named key, which puts the key
+// back in the applied view.
+func (c *scanFakeClient) revertLocked(cfg map[string]any, vmid int, keys string) error {
+	c.logEvent("revert:%d:%s", vmid, keys)
+	if c.revertErr != nil {
+		return c.revertErr
+	}
+	if c.revertKeepsPending {
+		return nil
+	}
+	for _, key := range strings.Split(keys, ",") {
+		if value, held := c.held[vmid][key]; held {
+			cfg[key] = value
+			delete(c.held[vmid], key)
+		}
+	}
+	return nil
+}
+
+// listQemuPending serves the pending endpoint from the config read, so an
+// injected config failure fails it the same way, and adds each held key with
+// its current value and a delete flag.
+func (c *scanFakeClient) listQemuPending(ctx context.Context, node, vmidText string) (*sdknodes.ListQemuPendingResponse, error) {
+	resp, err := PendingFromConfigRead(ctx, c.QEMU().Config, node, vmidText)
+	if err != nil {
+		return nil, err
+	}
+	vmid, _ := strconv.Atoi(vmidText)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keys := make([]string, 0, len(c.held[vmid]))
+	for key := range c.held[vmid] {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		raw, err := json.Marshal(map[string]any{"key": key, "value": c.held[vmid][key], "delete": 1})
+		if err != nil {
+			return nil, err
+		}
+		*resp = append(*resp, raw)
+	}
+	return resp, nil
 }
 
 // deleteConfigKeyLocked applies PVE's config-delete semantics: a deleted bus

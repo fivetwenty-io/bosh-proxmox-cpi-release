@@ -62,6 +62,9 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 		}
 		refs = holder.StorageReferences
 	}
+	if err := refusePendingDeleteHolder(rd.diskCID, holder); err != nil {
+		return false, err
+	}
 	// A disk whose CID promises a parker anchor must have a holder while
 	// detached; no holder at all means the parker vanished out-of-band, and
 	// deleting the volume would destroy the one copy of the data before
@@ -217,6 +220,58 @@ func deleteDiskVolume(ctx context.Context, deps Deps, diskCID, bareDiskCID, stor
 		"delete_disk: DeleteVolume failed for "+diskCID+" on node "+node)
 }
 
+// refusePendingDeleteHolder refuses to delete a disk whose holder is an
+// ordinary VM with a pending delete on the disk's slot. The Director believes
+// the disk is detached, but the running guest still has it plugged in, and
+// PVE's content delete has no in-use check. A pending delete doesn't clear
+// while the VM runs, so the refusal isn't retriable.
+//
+// The text tells the operator to let the delete apply by stopping the VM and
+// then to rerun the clean-up, and it never suggests reverting the pending
+// delete. The Director sends delete_disk only for a disk it treats as
+// orphaned, so a revert would put the disk back on the VM while the Director
+// still wants it gone, and the next delete_disk would then delete the volume
+// from under the running VM, with only the optional lock guard in the way.
+// detach_disk reverts its own pending delete for the opposite reason, because
+// there the Director still believes the disk is attached.
+//
+// An ordinary holder with no pending delete stays with the optional lock
+// guard, as before.
+func refusePendingDeleteHolder(diskCID string, holder pve.DiskHolder) error {
+	if !holder.Found || holder.IsParker || holder.PendingDeleteSlot == "" {
+		return nil
+	}
+	return pendingDeleteRefusal(diskCID, holder.VMID, holder.Node, holder.PendingDeleteSlot)
+}
+
+// refuseDeleteBeforeLifecycle runs delete_disk's refusals that come before a
+// managed lifecycle opens. It refuses a disk stranded on an unused entry, and a
+// disk whose holder, as the identity resolution found it, still has it plugged
+// in on a slot whose delete is pending.
+func refuseDeleteBeforeLifecycle(deps Deps, rd resolvedDisk) error {
+	if err := refuseStrandedDelete(deps, rd); err != nil {
+		return err
+	}
+	if rd.holder == nil {
+		return nil
+	}
+	return refusePendingDeleteHolder(rd.diskCID, *rd.holder)
+}
+
+// pendingDeleteRunbook points the pending-delete refusal at the
+// troubleshooting entry that says why a revert is the wrong way out.
+const pendingDeleteRunbook = `see "delete_disk refuses a disk whose slot delete is pending" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// pendingDeleteRefusal is delete_disk's refusal for a disk that VM vmid still
+// has plugged in on slot, whose delete PVE has only recorded as pending.
+func pendingDeleteRefusal(diskCID string, vmid int, node, slot string) error {
+	return cpierrors.Cloud(
+		"delete_disk: refusing to delete disk %s, because VM %d on node %s still has it plugged in on slot %s, and PVE has "+
+			"only recorded that slot's delete as pending. Let the delete apply by stopping VM %d at a convenient time, and then "+
+			"rerun the clean-up. Nothing was deleted; %s",
+		diskCID, vmid, node, slot, vmid, pendingDeleteRunbook)
+}
+
 // resolveDeleteDiskCID is delete_disk's identity seam: decode the CID, map it
 // to the volume's current name — after a reassignment the envelope volid is
 // only the birth record — and converge an interrupted transfer to its parked
@@ -267,9 +322,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if decErr != nil {
 			return nil, decErr
 		}
-		// A disk stranded on an unused entry is refused before a managed
+		// A disk stranded on an unused entry, or still plugged into a running
+		// guest whose slot delete is pending, is refused before a managed
 		// lifecycle opens, so the refusal leaves its record as it was.
-		if err := refuseStrandedDelete(deps, rd); err != nil {
+		if err := refuseDeleteBeforeLifecycle(deps, rd); err != nil {
 			return nil, err
 		}
 		if rd.allocation != nil && rd.allocation.terminalAbsent {

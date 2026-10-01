@@ -302,6 +302,17 @@ func RetryOnTransientOrLockSleepBudget(maxAttempts int) time.Duration {
 	return total
 }
 
+// stopsRetry reports whether err ends a retry loop at once, before any
+// classifier reads it. A *DriveDeletePendingError anywhere in the chain does.
+// It's a verdict on a slot delete whose busy retries and revert have already
+// run, so sending the op again can't change it. The classifiers read
+// err.Error(), which carries the text of the PUT or the revert that failed, so
+// a busy or lock-timeout cause would otherwise read as a reason to retry.
+func stopsRetry(err error) bool {
+	_, pending := IsDriveDeletePending(err)
+	return pending
+}
+
 // RetryOnTransient invokes op up to maxAttempts times, retrying when the
 // returned error is a transient transport-layer fault (IsTransientTransport)
 // or a PVE rate-limit / worker-pool exhaustion signal (IsPVEPushback).
@@ -330,6 +341,9 @@ func RetryOnTransient(
 		err := op()
 		if err == nil {
 			return nil
+		}
+		if stopsRetry(err) {
+			return err
 		}
 		isPushback := IsPVEPushback(err)
 		if !isPushback && !IsTransientTransport(err) {
@@ -450,6 +464,9 @@ func RetryOnTransientOrLock(
 		if err == nil {
 			return nil
 		}
+		if stopsRetry(err) {
+			return err
+		}
 		isPushback := IsPVEPushback(err)
 		isLock := IsStorageLockTimeout(err)
 		isQuorum := IsClusterNotQuorate(err)
@@ -513,6 +530,9 @@ func RetryOnTransientOrUnplugBusy(
 		err := op()
 		if err == nil {
 			return nil
+		}
+		if stopsRetry(err) {
+			return err
 		}
 		isPushback := IsPVEPushback(err)
 		isBusy := IsHotUnplugBusy(err)

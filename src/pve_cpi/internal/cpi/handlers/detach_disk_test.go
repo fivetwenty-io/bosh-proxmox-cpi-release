@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -44,6 +45,19 @@ func (m *detachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskI
 	m.detachCalled = true
 	m.detachedDiskID = diskID
 	return m.detachErr
+}
+
+// deleteConfigKey is the raw config delete the slot-delete helper sends for a
+// bus slot. It records into the same fields as DetachDisk, which the unused
+// sweep still calls, and removes the key the way PVE does.
+func (m *detachQEMUService) deleteConfigKey(_ string, _ int, key string) error {
+	m.detachCalled = true
+	m.detachedDiskID = key
+	if m.detachErr != nil {
+		return m.detachErr
+	}
+	delete(m.configCfg, key)
+	return nil
 }
 
 func (m *detachQEMUService) AttachDisk(_ context.Context, _ string, _ int, _ string, _ string, _ *qemu.AttachOpts) (string, error) {
@@ -822,6 +836,22 @@ func (m *parkerQEMUService) DetachDisk(_ context.Context, _ string, _ int, slot 
 	// real-VM-holder guard) no longer see the disk on the source VM.
 	if m.sourceCfg != nil && slot != "" {
 		delete(m.sourceCfg, slot)
+	}
+	return nil
+}
+
+// deleteConfigKey is the raw config delete the slot-delete helper sends. Like
+// DetachDisk, it applies to the source VM.
+func (m *parkerQEMUService) deleteConfigKey(_ string, vmid int, key string) error {
+	if vmid != m.sourceVMID && m.sourceVMID != 0 {
+		return fmt.Errorf("parkerQEMUService: unexpected slot delete on vm %d", vmid)
+	}
+	m.detachCalled = true
+	if m.detachErr != nil {
+		return m.detachErr
+	}
+	if m.sourceCfg != nil && key != "" {
+		delete(m.sourceCfg, key)
 	}
 	return nil
 }

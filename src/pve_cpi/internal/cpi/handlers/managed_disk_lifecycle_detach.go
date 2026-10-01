@@ -51,9 +51,19 @@ func managedDetachDisk(ctx context.Context, client pve.Client, node string, vmid
 		return fmt.Errorf("managed detach requires an exact volume identity")
 	}
 
-	cfg, err := client.QEMU().Config(ctx, node, vmid)
-	if err != nil || cfg == nil {
+	// One pending read gives both views. A slot whose delete is pending is
+	// missing from the config endpoint's view while the running guest still
+	// has the disk, so it is still there to delete, and the helper reverts and
+	// refuses it.
+	views, err := pve.ReadQemuViews(ctx, client, node, vmid)
+	if err != nil {
 		return fmt.Errorf("managed detach holder unavailable")
+	}
+	cfg := views.Applied()
+	if views.PendingDelete(slot) {
+		if current, ok := views.Current()[slot]; ok {
+			cfg[slot] = current
+		}
 	}
 	value, present := pve.ConfigString(cfg, slot)
 	if present {
@@ -100,5 +110,14 @@ func managedDeleteSlot(ctx context.Context, client pve.Client, node string, vmid
 	if !ok || digest == "" {
 		return fmt.Errorf("managed detach requires config generation digest")
 	}
-	return client.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), &nodes.UpdateQemuConfigParams{Delete: &slot, Digest: &digest})
+	if strings.HasPrefix(slot, "unused") {
+		// PVE removes an unused key at once, outside the pending path.
+		return client.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), &nodes.UpdateQemuConfigParams{Delete: &slot, Digest: &digest})
+	}
+	// A bus-slot delete on a running VM can stay pending, so it goes through
+	// the helper that reverts and refuses one. Its revert is one more guarded
+	// config write, which the lifecycle guard admits only for a slot of the
+	// managed volume whose delete is pending.
+	value, _ := pve.ConfigString(cfg, slot)
+	return pve.DeleteDriveSlot(ctx, client, nil, node, vmid, slot, strings.Split(value, ",")[0], &digest, 0)
 }

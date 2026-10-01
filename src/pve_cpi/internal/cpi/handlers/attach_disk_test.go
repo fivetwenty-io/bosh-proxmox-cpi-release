@@ -102,6 +102,22 @@ func (m *attachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskI
 	m.detachCalls = append(m.detachCalls, diskID)
 	return m.detachErr
 }
+
+// deleteConfigKey is the raw config delete the slot-delete helper sends for a
+// bus slot, where DetachDisk used to run. It records into detachCalls, which
+// the parker unpark's DetachDisk still fills too, and removes the key from
+// configCfg. A staged configCfgs sequence models the delete in its later
+// entries instead.
+func (m *attachQEMUService) deleteConfigKey(_ string, _ int, key string) error {
+	m.detachCalls = append(m.detachCalls, key)
+	if m.detachErr != nil {
+		return m.detachErr
+	}
+	if len(m.configCfgs) == 0 {
+		delete(m.configCfg, key)
+	}
+	return nil
+}
 func (m *attachQEMUService) ResizeDisk(_ context.Context, _ string, _ int, _ string, _ int) (string, error) {
 	panic("attachQEMUService.ResizeDisk: not expected")
 }
@@ -548,9 +564,15 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
 			// Call 3, slot selection: legacy scsi0 attachment present.
 			{"virtio0": "data:vm-100-disk-0", "scsi0": diskCID},
-			// Call 4, re-read after Detach: scsi0 gone.
+			// Call 4, the slot-delete helper's pending read after its delete:
+			// scsi0 gone in both views.
 			{"virtio0": "data:vm-100-disk-0"},
-			// Call 5 and later, Resolve after AttachDisk: scsi1 present with volid.
+			// Call 5, the detach's read for unused entries naming the volume:
+			// none.
+			{"virtio0": "data:vm-100-disk-0"},
+			// Call 6, re-read after the detach: scsi0 gone.
+			{"virtio0": "data:vm-100-disk-0"},
+			// Call 7 and later, Resolve after AttachDisk: scsi1 present with volid.
 			{"virtio0": "data:vm-100-disk-0", "scsi1": diskCID},
 		},
 	}
@@ -563,7 +585,7 @@ func TestHandleAttachDisk_LegacySCSI0Migration(t *testing.T) {
 	}
 
 	if len(qemuSvc.detachCalls) != 1 || qemuSvc.detachCalls[0] != "scsi0" {
-		t.Errorf("expected DetachDisk(\"scsi0\") to be called exactly once, got %v", qemuSvc.detachCalls)
+		t.Errorf("expected one delete of scsi0, got %v", qemuSvc.detachCalls)
 	}
 
 	const wantPath = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1"

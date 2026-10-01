@@ -194,6 +194,9 @@ func settleStrandedBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	parkerCfg := parkerWriteConfigFor(deps)
 	pctx := pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: strconv.Itoa(ref.VMID), StableID: rd.stableID, Opts: overlay}
 	if _, err := pve.TransferDiskToParker(ctx, deps.PVE, logger, ref.Node, ref.VMID, rd.volid, parkerCfg, pctx); err != nil {
+		if pending := driveDeletePendingDiskError(op, err); pending != nil {
+			return false, pending
+		}
 		return false, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: move disk %s off %s to a parker (fail-closed: retry resumes the transfer)", op, rd.diskCID, describeUnusedEntry(ref)))
 	}

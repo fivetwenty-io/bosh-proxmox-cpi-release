@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -25,6 +26,10 @@ type managedVMAllocation struct {
 	volumes                  map[string]string
 	chargeSteps              map[string]string
 	chargeIndices            map[string]int
+	// configBefore holds, per step, the current view the guard read before a
+	// config write that deletes or reverts a key, so its readback can tell a
+	// pending delete that changed nothing else from any other outcome.
+	configBefore map[string]map[string]any
 }
 
 func (m *managedVMAllocation) revalidate(ctx context.Context) error {
@@ -48,7 +53,7 @@ func (m *managedVMAllocation) newGuard() error {
 	}
 	guard, err := NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: m.beforeMutation, After: m.afterMutation, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 		return storageAllocationUncertain(m.handle, "VM "+call.Service+"."+call.Method)
-	}})
+	}, SettleFailedWrite: m.settleFailedConfigDelete})
 	if err != nil {
 		return err
 	}
@@ -112,6 +117,12 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 	if err != nil {
 		return "", err
 	}
+	var configBefore map[string]any
+	if configWriteDeletesOrReverts(call) {
+		if configBefore, err = m.admitPendingConfigWrite(ctx, call); err != nil {
+			return "", err
+		}
+	}
 	if method == managedVMCallCreateVolume {
 		parameters, err = aj.MutationParameters(map[string]any{"version": 1, "kind": "ephemeral_birth", "absence_verified": true})
 		if err != nil {
@@ -121,6 +132,12 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 	step, err := storageMutationIntent(m.handle, "vm."+method, target, charges, parameters)
 	if err != nil {
 		return "", err
+	}
+	if configBefore != nil {
+		if m.configBefore == nil {
+			m.configBefore = map[string]map[string]any{}
+		}
+		m.configBefore[step] = configBefore
 	}
 	if m.prepared.iterator != nil {
 		m.prepared.iterator.MarkSubmitted()
@@ -200,17 +217,10 @@ func (m *managedVMAllocation) afterMutation(ctx context.Context, call ManagedAll
 	case managedVMCallUpload:
 		return m.observeISOUpload(ctx, call, step, result)
 	case managedVMCallUpdateConfig:
-		cfg, err := m.deps.PVE.QEMU().Config(ctx, m.shape.node, m.vmid)
-		if err != nil {
+		settled, err := m.observeConfigUpdate(ctx, call, step)
+		if err != nil || settled {
 			return err
 		}
-		if err := managedConfigFieldsMatch(cfg, call.Args["params"]); err != nil {
-			return err
-		}
-		if err := m.verifyMarker(cfg); err != nil {
-			return err
-		}
-		m.needsMarker = false
 	case managedVMCallAttach:
 		cfg, err := m.deps.PVE.QEMU().Config(ctx, m.shape.node, m.vmid)
 		if err != nil {
@@ -462,4 +472,117 @@ func (m *managedVMAllocation) prepareMutationCharges(ctx context.Context, method
 		}
 	}
 	return charges, nil
+}
+
+// observeConfigUpdate observes a guarded config write. A write that deletes or
+// reverts a key is checked against both views, and settled reports that its
+// step is already settled as not applied. Every other write is matched field
+// by field against the config read back. Either way the allocation marker has
+// to read back intact.
+func (m *managedVMAllocation) observeConfigUpdate(ctx context.Context, call ManagedAllocationMutation, step string) (settled bool, err error) {
+	cfg, err := m.deps.PVE.QEMU().Config(ctx, m.shape.node, m.vmid)
+	if err != nil {
+		return false, err
+	}
+	if configWriteDeletesOrReverts(call) {
+		settled, err := m.observePendingConfigWrite(ctx, call, step, cfg)
+		if err != nil || settled {
+			return settled, err
+		}
+	} else if err := managedConfigFieldsMatch(cfg, call.Args["params"]); err != nil {
+		return false, err
+	}
+	if err := m.verifyMarker(cfg); err != nil {
+		return false, err
+	}
+	m.needsMarker = false
+	return false, nil
+}
+
+// admitPendingConfigWrite reads both views before a config write that deletes
+// or reverts a key. A revert is admitted only for keys whose delete is
+// pending. It returns the current view, which the readback compares against.
+func (m *managedVMAllocation) admitPendingConfigWrite(ctx context.Context, call ManagedAllocationMutation) (map[string]any, error) {
+	views, err := pve.ReadQemuViews(ctx, m.deps.PVE, m.shape.node, m.vmid)
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify VM pending changes before mutation")
+	}
+	if params := configWriteParams(call); params != nil && params.Revert != nil {
+		for _, key := range strings.Split(*params.Revert, ",") {
+			if !views.PendingDelete(key) {
+				return nil, fmt.Errorf("VM configuration revert affects a key with no pending delete")
+			}
+		}
+	}
+	return views.Current(), nil
+}
+
+// observePendingConfigWrite observes a config write that deletes or reverts a
+// key against both views. A revert is observed when its keys are back in the
+// config with no pending delete. A delete PVE could only record as pending is
+// never observed as a delete. When it is the whole change, with every other
+// key unchanged, the step is settled as not applied and settled is true.
+func (m *managedVMAllocation) observePendingConfigWrite(ctx context.Context, call ManagedAllocationMutation, step string, cfg map[string]any) (settled bool, err error) {
+	views, err := pve.ReadQemuViews(ctx, m.deps.PVE, m.shape.node, m.vmid)
+	if err != nil {
+		return false, fmt.Errorf("cannot read VM mutation pending result")
+	}
+	params := configWriteParams(call)
+	if params == nil {
+		return false, fmt.Errorf("VM configuration mutation is malformed")
+	}
+	if params.Revert != nil {
+		for _, key := range strings.Split(*params.Revert, ",") {
+			if _, present := cfg[key]; !present || views.PendingDelete(key) {
+				return false, fmt.Errorf("VM config revert not observed for %s", key)
+			}
+		}
+	}
+	fields, err := lifecycleMutationFields(params)
+	if err != nil {
+		return false, err
+	}
+	// A write that carries a revert and no other field has nothing left for
+	// the readback to match, and the revert check above has already observed
+	// it. Every other write goes through the matcher.
+	rest := withoutRevert(fields)
+	if params.Revert != nil && len(rest) == 0 {
+		return false, nil
+	}
+	err = managedConfigFieldsMatchPending(cfg, views.PendingDelete, rest)
+	if !errors.Is(err, errManagedConfigDeletePending) {
+		return false, err
+	}
+	deleted := strings.Split(*params.Delete, ",")
+	if !pendingDeleteOnlyChange(m.configBefore[step], views, deleted) {
+		return false, fmt.Errorf("VM config deletion is pending alongside another change")
+	}
+	if err := storageMutationObserved(m.handle, step, nil, false); err != nil {
+		return false, err
+	}
+	delete(m.configBefore, step)
+	return true, nil
+}
+
+// settleFailedConfigDelete is the VM guard's settle for a slot delete that PVE
+// answered with an error after it recorded the delete as pending, the way the
+// disk lifecycle guard settles one. When the only change both views show is a
+// pending delete of the slots the write named, the step is settled as not
+// applied and the guard stays usable. Anything else leaves the failure to
+// poison the guard.
+func (m *managedVMAllocation) settleFailedConfigDelete(ctx context.Context, call ManagedAllocationMutation, step string, _ error) bool {
+	deleted := configWriteDeletedSlots(call)
+	before, ok := m.configBefore[step]
+	if len(deleted) == 0 || !ok {
+		return false
+	}
+	views, err := pve.ReadQemuViews(ctx, m.deps.PVE, m.shape.node, m.vmid)
+	if err != nil || !pendingDeleteOnlyChange(before, views, deleted) {
+		return false
+	}
+	if err := storageMutationObserved(m.handle, step, nil, false); err != nil {
+		return false
+	}
+	delete(m.configBefore, step)
+	return true
 }

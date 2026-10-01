@@ -1237,15 +1237,15 @@ func attachEphemeralDisk(
 		}
 	}
 
-	// Read current VM config to find next free scsi slot.
-	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, shape.node, vmid)
+	// Read both views of the VM config to find the next free scsi slot.
+	views, cfgErr := pve.ReadQemuViews(ctx, deps.PVE, shape.node, vmid)
 	if cfgErr != nil {
 		cleanupVol()
 		return "", cpierrors.Wrap(pve.WrapError(cfgErr),
 			fmt.Sprintf("create_vm: read VM config for ephemeral slot vmid=%d", vmid))
 	}
 
-	slot := nextFreeSCSIIndexAtLeast(vmCfg, 1)
+	slot := nextFreeSCSIIndexInViews(views)
 	if slot >= 29 {
 		cleanupVol()
 		return "", cpierrors.Cloud(

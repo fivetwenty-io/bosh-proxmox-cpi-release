@@ -46,6 +46,9 @@ type fakeNodesService struct {
 	// qemuConfigFn is the owning client's config read; ListQemuPending
 	// serves the pending endpoint through it.
 	qemuConfigFn func(ctx context.Context, node string, vmid int) (map[string]any, error)
+	// listQemuPendingFn, when set, answers the pending endpoint in place of
+	// qemuConfigFn, for a fake that holds pending changes of its own.
+	listQemuPendingFn func(ctx context.Context, node string, vmid string) (*nodes.ListQemuPendingResponse, error)
 }
 
 func (f *fakeNodesService) CreateQemuMoveDisk(ctx context.Context, node string, vmid string, params *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
@@ -65,6 +68,9 @@ func (f *fakeNodesService) ListQemu(ctx context.Context, node string, params *no
 }
 
 func (f *fakeNodesService) ListQemuPending(ctx context.Context, node string, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	if f.listQemuPendingFn != nil {
+		return f.listQemuPendingFn(ctx, node, vmid)
+	}
 	return PendingFromConfigRead(ctx, f.qemuConfigFn, node, vmid)
 }
 

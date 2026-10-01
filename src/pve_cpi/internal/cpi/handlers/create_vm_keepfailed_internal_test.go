@@ -68,8 +68,13 @@ type kfClient struct {
 	cluster *naClusterStub
 }
 
-func (c *kfClient) Nodes() sdknodes.Service { return c.nodes }
-func (c *kfClient) QEMU() qemu.Service      { return c.qemu }
+// Nodes serves the pending read from the QEMU fake's config read.
+func (c *kfClient) Nodes() sdknodes.Service {
+	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.qemu.Config(ctx, node, vmid)
+	}}
+}
+func (c *kfClient) QEMU() qemu.Service { return c.qemu }
 func (c *kfClient) Cluster() cluster.Service {
 	if c.cluster == nil {
 		return newNAStub()

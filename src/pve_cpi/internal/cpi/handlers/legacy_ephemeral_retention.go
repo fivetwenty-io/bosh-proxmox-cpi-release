@@ -11,13 +11,19 @@ import (
 )
 
 func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) (bool, error) {
-	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// Both views, so an ephemeral slot whose delete is pending is still found
+	// and retained rather than left for the destroy.
+	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if pve.IsNotFound(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
+	if err := refusePendingDriveReplacement("delete_vm", vmCID, holding); err != nil {
+		return false, err
+	}
+	cfg := holding.Config
 	tags, _ := pve.ConfigString(cfg, jsonKeyTags)
 	if !tagsContain(tags, tagRetainEphemeral) {
 		return false, nil

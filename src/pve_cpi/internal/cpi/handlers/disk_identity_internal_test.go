@@ -46,6 +46,14 @@ type idFakeClient struct {
 	// moveErr, when set, fails the next CreateQemuMoveDisk with it and
 	// clears itself (one-shot), e.g. PVE's snapshot refusal.
 	moveErr error
+	// pending, when set, holds a slot delete on a running VM pending the way
+	// qemu-server does, and serves the pending endpoint from it. Without it
+	// every delete applies at once, as on a stopped VM.
+	pending *fakePendingModel
+	// unlisted hides VMs from the guest listings, the way a listing that
+	// hasn't caught up with a guest does, so the identity scan misses them
+	// while their configs still answer.
+	unlisted map[int]bool
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -137,6 +145,9 @@ func (n *idFakeNodes) ListQemu(_ context.Context, _ string, _ *sdknodes.ListQemu
 	defer n.c.mu.Unlock()
 	out := sdknodes.ListQemuResponse{}
 	for vmid, cfg := range n.c.configs {
+		if n.c.unlisted[vmid] {
+			continue
+		}
 		row := map[string]any{"vmid": vmid}
 		if tags, ok := cfg["tags"].(string); ok {
 			row["tags"] = tags
@@ -154,6 +165,9 @@ func (n *idFakeNodes) ListQemu(_ context.Context, _ string, _ *sdknodes.ListQemu
 }
 
 func (n *idFakeNodes) ListQemuPending(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
+	if n.c.pending != nil {
+		return n.c.pending.pendingRead(ctx, n.c.QEMU().Config, node, vmid)
+	}
 	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
 }
 
@@ -164,6 +178,11 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 	cfg, ok := n.c.configs[vmid]
 	if !ok {
 		return fmt.Errorf("idFake: no config for vmid %s", vmidStr)
+	}
+	if n.c.pending != nil {
+		if handled, err := n.c.pending.update(vmid, cfg, params); handled {
+			return err
+		}
 	}
 	if params.Delete != nil {
 		slot := *params.Delete
@@ -245,6 +264,9 @@ func (cl *idFakeCluster) ListResources(context.Context, *sdkcluster.ListResource
 	defer cl.c.mu.Unlock()
 	var resp sdkcluster.ListResourcesResponse
 	for vmid, cfg := range cl.c.configs {
+		if cl.c.unlisted[vmid] {
+			continue
+		}
 		tags, _ := cfg["tags"].(string)
 		b, err := json.Marshal(map[string]any{"vmid": vmid, "node": "pve1", "type": "qemu", "tags": tags})
 		if err != nil {

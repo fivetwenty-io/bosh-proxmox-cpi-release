@@ -279,7 +279,9 @@ func preserveFailedVMError(orig error, vmid int, node string) error {
 // byte-identical with the delete path they mirror.
 func protectForeignDisksOnRollback(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
 	if deps.Config == nil {
-		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+		// Both views, the same read delete_vm's guards make, so a foreign slot
+		// whose delete is pending still refuses the purge.
+		holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 		if cfgErr != nil {
 			if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
 				return nil // VM gone -- the purge below is idempotent about that
@@ -287,6 +289,10 @@ func protectForeignDisksOnRollback(ctx context.Context, deps Deps, node, vmCID s
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("create_vm: rollback: read config for VM %s before purge", vmCID))
 		}
+		if err := refusePendingDriveReplacement("create_vm: rollback", vmCID, holding); err != nil {
+			return err
+		}
+		cfg := holding.Config
 		if foreign := pve.FindForeignActiveDisks(cfg, vmid); len(foreign) > 0 {
 			return cpierrors.Cloud(
 				"create_vm: rollback: refusing to purge VM %s -- persistent disks still attached on active slots and no CPI config is available to park them: %v",

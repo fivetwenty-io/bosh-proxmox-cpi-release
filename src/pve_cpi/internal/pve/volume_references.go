@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
-
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
@@ -49,7 +47,7 @@ func FindVolumeReferences(ctx context.Context, c Client, volid string) ([]Volume
 	}
 	var refs []VolumeReference
 	for _, g := range guests {
-		cfg, cfgErr := c.QEMU().Config(ctx, g.Node, g.VMID)
+		views, cfgErr := ReadQemuViews(ctx, c, g.Node, g.VMID)
 		if cfgErr != nil {
 			if IsNotFound(cfgErr) {
 				continue
@@ -59,15 +57,11 @@ func FindVolumeReferences(ctx context.Context, c Client, volid string) ([]Volume
 				fmt.Sprintf("FindVolumeReferences: Config error for vm %d on node %s", g.VMID, g.Node),
 			)
 		}
-		for slot, optstr := range qemu.ParseDisks(cfg) {
-			if bareDriveVolid(optstr) == volid {
-				refs = append(refs, VolumeReference{VMID: g.VMID, Node: g.Node, Slot: slot})
-			}
-		}
-		for slot, unused := range FindUnusedDiskEntries(cfg) {
-			if unused == volid {
-				refs = append(refs, VolumeReference{VMID: g.VMID, Node: g.Node, Slot: slot})
-			}
+		// A key counts when either view names the volume, so a slot whose
+		// delete is pending, which the config endpoint hides, is still a
+		// reference.
+		for _, slot := range views.SlotsNaming(volid) {
+			refs = append(refs, VolumeReference{VMID: g.VMID, Node: g.Node, Slot: slot})
 		}
 	}
 	sortVolumeReferences(refs)

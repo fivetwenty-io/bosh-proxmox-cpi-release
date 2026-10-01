@@ -528,7 +528,7 @@ func TestHandleDeleteVM_DetachesForeignDiskThenDestroys(t *testing.T) {
 			// After detach: foreign disk fully unreferenced; no unusedN remains.
 			return map[string]any{"virtio0": "local-lvm:vm-6031-disk-0"}, nil
 		},
-		detachDiskFn: func(_ context.Context, _ string, _ int, slot string) error {
+		slotDeleteFn: func(_ string, _ int, slot string) error {
 			detachedSlots = append(detachedSlots, slot)
 			return nil
 		},

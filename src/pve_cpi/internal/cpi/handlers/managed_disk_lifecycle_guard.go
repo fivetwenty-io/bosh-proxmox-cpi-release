@@ -24,23 +24,32 @@ const (
 )
 
 type managedDiskMutationObservation struct {
-	preAbsent  bool
-	copyLocal  bool
-	node       string
-	vmid       int
-	before     map[string]any
-	fields     map[string]any
-	targetNode string
-	targetVMID int
-	targetSlot string
-	targetGiB  int
-	charges    bool
+	preAbsent bool
+	copyLocal bool
+	node      string
+	vmid      int
+	before    map[string]any
+	// pendingDeletes names the keys of the holder whose delete PVE recorded
+	// as pending when the guard read it before a config write. Their current
+	// values are in before too, because the config endpoint hides them while
+	// the running guest still has the disk.
+	pendingDeletes map[string]bool
+	fields         map[string]any
+	targetNode     string
+	targetVMID     int
+	targetSlot     string
+	targetGiB      int
+	charges        bool
 }
 
 type managedDiskLifecycleGuard struct {
 	lifecycle    *managedDiskLifecycle
 	observations map[string]managedDiskMutationObservation
 	created      map[int]bool
+	// pendingDeleteSettled records that a delete this operation sent stayed
+	// pending and was settled as not applied, so the revert that follows it is
+	// the pending-delete helper's own.
+	pendingDeleteSettled bool
 }
 
 func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGuard, error) {
@@ -48,7 +57,7 @@ func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGu
 	m.holders = state
 	return NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: state.before, After: state.after, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 		return m.session.Uncertain(call.Service + "." + call.Method)
-	}, SettleProtectionWrites: true})
+	}, SettleProtectionWrites: true, SettleFailedWrite: state.settleFailedWrite})
 }
 func lifecycleMutationFields(params any) (map[string]any, error) {
 	encoded, err := json.Marshal(params)
@@ -114,11 +123,8 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		if err != nil {
 			return "", err
 		}
-		if key != "QEMU.Create" {
-			observation.before, err = g.readHolderConfig(ctx, call, node, storage, observation.vmid)
-			if err != nil {
-				return "", err
-			}
+		if err := g.readHolderState(ctx, call, key, node, storage, &observation); err != nil {
+			return "", err
 		}
 	}
 	var charges []inv.ChargeRecord
@@ -198,6 +204,24 @@ func (g *managedDiskLifecycleGuard) observeContinuity(ctx context.Context, call 
 	return backing, nil
 }
 
+// readHolderState reads what the guard checks a mutation against on the VM it
+// targets. Every mutation but a holder create reads the holder's config, and a
+// config write that deletes or reverts a key also reads its pending view.
+func (g *managedDiskLifecycleGuard) readHolderState(ctx context.Context, call ManagedAllocationMutation, key, node, storage string, observation *managedDiskMutationObservation) error {
+	if key == "QEMU.Create" {
+		return nil
+	}
+	before, err := g.readHolderConfig(ctx, call, node, storage, observation.vmid)
+	if err != nil {
+		return err
+	}
+	observation.before = before
+	if key == managedVMCallUpdateConfig && configWriteDeletesOrReverts(call) {
+		return g.addPendingDeletes(ctx, node, observation)
+	}
+	return nil
+}
+
 // readHolderConfig reads the configuration of the VM a mutation targets. As in
 // observeContinuity, a protection restore whose read returns an error ends in
 // restoreChecksIncomplete, and a read that returns nothing still locks the
@@ -211,6 +235,32 @@ func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call M
 		return nil, fmt.Errorf("cannot verify lifecycle holder before mutation")
 	}
 	return config, nil
+}
+
+// addPendingDeletes reads the holder's pending view before a config write and
+// adds every key whose delete is pending to the observation, with its current
+// value merged into before. A slot delete that PVE could only record as pending
+// is then still the managed volume's slot when the delete is sent again, or
+// when its revert is sent.
+func (g *managedDiskLifecycleGuard) addPendingDeletes(ctx context.Context, node string, observation *managedDiskMutationObservation) error {
+	views, err := pve.ReadQemuViews(ctx, g.lifecycle.deps.PVE, node, observation.vmid)
+	if err != nil {
+		return fmt.Errorf("cannot verify lifecycle holder pending changes before mutation")
+	}
+	current := views.Current()
+	for key := range current {
+		if !views.PendingDelete(key) {
+			continue
+		}
+		if observation.pendingDeletes == nil {
+			observation.pendingDeletes = map[string]bool{}
+		}
+		observation.pendingDeletes[key] = true
+		if _, present := observation.before[key]; !present {
+			observation.before[key] = current[key]
+		}
+	}
+	return nil
 }
 
 func isDiskOptionKey(key string) bool {
@@ -453,7 +503,10 @@ func (g *managedDiskLifecycleGuard) prepareConfig(call ManagedAllocationMutation
 	if err != nil {
 		return err
 	}
-	if err := lifecycleValidateConfigMutation(observation.before, observation.fields, m.disk.volid); err != nil {
+	if err := lifecycleValidateRevert(observation, m.disk.volid); err != nil {
+		return err
+	}
+	if err := lifecycleValidateConfigMutation(observation.before, withoutRevert(observation.fields), m.disk.volid); err != nil {
 		return err
 	}
 	params, ok := call.Args["params"].(*sdknodes.UpdateQemuConfigParams)
@@ -470,6 +523,38 @@ func (g *managedDiskLifecycleGuard) prepareConfig(call ManagedAllocationMutation
 	params.Digest = &digest
 
 	return nil
+}
+
+// lifecycleValidateRevert admits a revert only of keys whose delete PVE
+// recorded as pending and whose current value is the managed volume, which is
+// the revert the pending-delete helper sends after one of our own slot deletes.
+func lifecycleValidateRevert(observation *managedDiskMutationObservation, volume string) error {
+	text, present := observation.fields["revert"]
+	if !present {
+		return nil
+	}
+	for _, key := range strings.Split(fmt.Sprint(text), ",") {
+		existing, _ := pve.ConfigString(observation.before, key)
+		if !isDiskOptionKey(key) || !observation.pendingDeletes[key] || strings.Split(existing, ",")[0] != volume {
+			return fmt.Errorf("configuration revert affects another resource")
+		}
+	}
+	return nil
+}
+
+// withoutRevert returns fields without the revert key, which
+// lifecycleValidateRevert has already checked.
+func withoutRevert(fields map[string]any) map[string]any {
+	if _, present := fields["revert"]; !present {
+		return fields
+	}
+	out := make(map[string]any, len(fields))
+	for key, value := range fields {
+		if key != "revert" {
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func (g *managedDiskLifecycleGuard) prepareMove(ctx context.Context, call ManagedAllocationMutation, observation *managedDiskMutationObservation) (err error) {
@@ -746,7 +831,7 @@ func (g *managedDiskLifecycleGuard) observeConfigResult(ctx context.Context, cal
 	case "QEMU.Snapshot", "QEMU.DeleteSnapshot":
 		return g.observeSnapshot(ctx, call, observation)
 	case "Nodes.UpdateQemuConfig":
-		return g.observeConfigFields(observation, cfg)
+		return g.observeConfigWrite(ctx, observation, cfg)
 	case "Nodes.CreateQemuMoveDisk":
 		return g.observeMove(ctx, observation, cfg)
 	}
@@ -854,10 +939,67 @@ func (g *managedDiskLifecycleGuard) observeSnapshot(ctx context.Context, call Ma
 func (g *managedDiskLifecycleGuard) observeConfigFields(observation managedDiskMutationObservation, cfg map[string]any) ([]string, error) {
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
-	if err := managedConfigFieldsMatch(cfg, observation.fields); err != nil {
+	if err := managedConfigFieldsMatch(cfg, withoutRevert(observation.fields)); err != nil {
 		return nil, err
 	}
 
+	return volumes, nil
+}
+
+// observeConfigWrite observes a config write. A write that deletes or reverts
+// a key is checked against the pending view too, which the config read back
+// afterwards can't show.
+//
+// A delete PVE could only record as pending is missing from that config while
+// the running guest still has the disk, so it is never observed as a delete.
+// The write is settled with no volume instead, the way a refused protection
+// write is, because PVE applied nothing the journal has to account for, and
+// the pending-delete helper reverts it with a write of its own straight after.
+// A revert is observed when its key is back in the config, naming the managed
+// volume, with no pending delete left.
+func (g *managedDiskLifecycleGuard) observeConfigWrite(ctx context.Context, observation managedDiskMutationObservation, cfg map[string]any) ([]string, error) {
+	_, hasDelete := observation.fields["delete"]
+	reverted, hasRevert := observation.fields["revert"]
+	if !hasDelete && !hasRevert {
+		return g.observeConfigFields(observation, cfg)
+	}
+	views, err := pve.ReadQemuViews(ctx, g.lifecycle.deps.PVE, observation.node, observation.vmid)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read lifecycle mutation pending result")
+	}
+	if hasRevert {
+		for _, key := range strings.Split(fmt.Sprint(reverted), ",") {
+			value, _ := pve.ConfigString(cfg, key)
+			if views.PendingDelete(key) || strings.Split(value, ",")[0] != g.lifecycle.disk.volid {
+				return nil, fmt.Errorf("VM config revert not observed for %s", key)
+			}
+		}
+	}
+	// A write that carries a revert and no other field has nothing left for
+	// the readback to match, and the revert check above has already observed
+	// it. Every other write, an empty one included, goes through the matcher.
+	if rest := withoutRevert(observation.fields); !hasRevert || len(rest) > 0 {
+		err = managedConfigFieldsMatchPending(cfg, views.PendingDelete, rest)
+	}
+	if errors.Is(err, errManagedConfigDeletePending) {
+		// Settled as not applied only when the pending delete is the whole
+		// change, with each slot's current value still what the guard read
+		// before the write.
+		deleted := strings.Split(fmt.Sprint(observation.fields["delete"]), ",")
+		if !pendingDeleteOnlyChange(observation.before, views, deleted) {
+			return nil, fmt.Errorf("VM config deletion is pending alongside another change")
+		}
+		g.pendingDeleteSettled = true
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hasRevert && g.pendingDeleteSettled {
+		g.lifecycle.pendingDeleteReverted = true
+	}
+	volumes := make([]string, 1, 2)
+	volumes[0] = g.lifecycle.disk.volid
 	return volumes, nil
 }
 
@@ -1016,4 +1158,38 @@ func isProtectionRestore(call ManagedAllocationMutation) bool {
 	}
 	on, _ := fields[pveConfigKeyProtection].(bool)
 	return on && isParkerProtectionParameters(parkerProtectionStepParameters(fields))
+}
+
+// settleFailedWrite settles a lifecycle slot delete that PVE answered with an
+// error, when PVE recorded the delete as pending before the unplug failed
+// busy. qemu-server writes the pending delete and then tries the unplug, so a
+// busy guest leaves exactly that pending delete behind. The guard reads both
+// views, and when the only change is a pending delete of the slots the write
+// named, with each slot's current value still the managed volume, it settles
+// the step as not applied and stays usable, so the helper's busy retries and
+// its revert still pass. Any other readback, or a failed read, leaves the
+// failure to poison the guard as before.
+func (g *managedDiskLifecycleGuard) settleFailedWrite(ctx context.Context, call ManagedAllocationMutation, step string, _ error) bool {
+	deleted := configWriteDeletedSlots(call)
+	observation, ok := g.observations[step]
+	if len(deleted) == 0 || !ok {
+		return false
+	}
+	views, err := pve.ReadQemuViews(ctx, g.lifecycle.deps.PVE, observation.node, observation.vmid)
+	if err != nil || !pendingDeleteOnlyChange(observation.before, views, deleted) {
+		return false
+	}
+	current := views.Current()
+	for _, slot := range deleted {
+		value, _ := pve.ConfigString(current, slot)
+		if strings.Split(value, ",")[0] != g.lifecycle.disk.volid {
+			return false
+		}
+	}
+	if err := storageMutationObserved(g.lifecycle.handle, step, nil, false); err != nil {
+		return false
+	}
+	delete(g.observations, step)
+	g.pendingDeleteSettled = true
+	return true
 }

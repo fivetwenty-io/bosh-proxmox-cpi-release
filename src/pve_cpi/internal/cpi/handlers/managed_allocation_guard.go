@@ -46,6 +46,14 @@ type ManagedAllocationHooks struct {
 	// records protection-only parameters on the step may set it, because the
 	// settler reads those parameters to find the step later.
 	SettleProtectionWrites bool
+	// SettleFailedWrite, when set, gets a write that PVE answered with an
+	// error before the guard treats the failure as uncertain. It returns true
+	// only when it read back that the write changed nothing but what it
+	// settled in the journal, such as a slot delete that PVE recorded as
+	// pending before the unplug failed busy. The guard then stays usable and
+	// hands the failure back unchanged, so a caller can still classify it and
+	// its follow-up writes, such as the revert, still pass.
+	SettleFailedWrite func(context.Context, ManagedAllocationMutation, string, error) bool
 }
 
 // ManagedAllocationGuard serializes writes and blocks further mutations after uncertainty.
@@ -175,6 +183,9 @@ func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocation
 			// failure, and falls through to the lock below.
 		case protectionWriteOther:
 		}
+	}
+	if err != nil && g.hooks.SettleFailedWrite != nil && g.hooks.SettleFailedWrite(ctx, m, token, err) {
+		return err
 	}
 	if err == nil {
 		err = g.hooks.After(ctx, m, token, result)

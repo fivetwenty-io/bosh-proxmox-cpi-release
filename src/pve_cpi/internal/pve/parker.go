@@ -1275,6 +1275,9 @@ type diskHolder struct {
 	// the referencing guest runs on. It is set even when no holder was found,
 	// because that is the case a caller is about to prove an absence for.
 	storageReferences StorageReferenceCounts
+	// pendingDeleteSlot names the holder's slot for the volume when PVE could
+	// only record its delete as pending, and is empty otherwise.
+	pendingDeleteSlot string
 }
 
 // resolveDiskHolder answers "who holds this volid, and is it a parker?" in a
@@ -1303,6 +1306,7 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	if holderVMID < cfg.VMIDRangeStart || holderVMID > cfg.VMIDRangeEnd {
 		return diskHolder{
 			found: true, vmid: holderVMID, node: holderNode, tags: holderTags, storageReferences: refs,
+			pendingDeleteSlot: pendingDeleteSlotOf(hit),
 		}, nil
 	}
 
@@ -1354,6 +1358,7 @@ func resolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 		}
 		return diskHolder{
 			found: true, vmid: holderVMID, node: holderNode, tags: tagsRaw, storageReferences: refs,
+			pendingDeleteSlot: pendingDeleteSlotOf(hit),
 		}, nil
 	}
 
@@ -1469,6 +1474,11 @@ type DiskHolder struct {
 	// only when no scan ran. pve.ConfigReferenceCorroborator turns it into the
 	// second opinion an empty content listing needs.
 	StorageReferences StorageReferenceCounts
+	// PendingDeleteSlot names the holder's slot for the volume when PVE could
+	// only record that slot's delete as pending, and is empty otherwise. The
+	// config endpoint hides such a slot, but the running guest still has the
+	// disk. Slot stays parker-only.
+	PendingDeleteSlot string
 }
 
 // ResolveDiskHolder answers "who holds this volid, and is it a parker?" with one
@@ -1493,7 +1503,7 @@ func ResolveDiskHolder(ctx context.Context, c Client, logger *log.Logger, bareVo
 	}
 	return DiskHolder{
 		Found: h.found, VMID: h.vmid, Node: h.node, IsParker: h.isParker, Slot: h.slot, Tags: h.tags,
-		StorageReferences: h.storageReferences,
+		StorageReferences: h.storageReferences, PendingDeleteSlot: h.pendingDeleteSlot,
 	}, nil
 }
 

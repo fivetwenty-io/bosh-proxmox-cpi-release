@@ -183,7 +183,18 @@ func (p *diskSizingPVE) Tasks() sdktasks.Service {
 	}
 	return &diskSizingTasks{}
 }
-func (p *diskSizingPVE) Nodes() sdknodes.Service     { panic("diskSizingPVE.Nodes: not expected") }
+
+// Nodes serves only the pending read, from the QEMU fake's config read, which
+// the ephemeral slot choice makes. Every other nodes call panics as before.
+func (p *diskSizingPVE) Nodes() sdknodes.Service {
+	return &configPendingNodes{Service: diskSizingNodes{}, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return p.qemu.Config(ctx, node, vmid)
+	}}
+}
+
+// diskSizingNodes panics on every nodes call but the pending read.
+type diskSizingNodes struct{ sdknodes.Service }
+
 func (p *diskSizingPVE) Cluster() sdkcluster.Service { panic("diskSizingPVE.Cluster: not expected") }
 func (p *diskSizingPVE) ClusterStorage() sdkclusterstorage.Service {
 	panic("diskSizingPVE.ClusterStorage: not expected")

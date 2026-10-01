@@ -109,6 +109,15 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts})
 	parkerCfg := parkerWriteConfigFor(deps)
 	if _, err := resumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerCfg, pctx); err != nil {
+		// The resume found the source's delete pending and left it alone.
+		// delete_disk gives the same refusal it gives a holder with a pending
+		// delete, and every other operation retries until the VM stops.
+		if pending, found := pve.IsDriveDeletePending(err); found && op == "delete_disk" && pending.Reason == pve.DriveDeletePendingFound {
+			return resolvedDisk{}, pendingDeleteRefusal(rd.diskCID, pending.VMID, pending.Node, pending.Slot)
+		}
+		if pending := driveDeletePendingDiskError(op, err); pending != nil {
+			return resolvedDisk{}, pending
+		}
 		return resolvedDisk{}, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: resume interrupted transfer for disk %s", op, rd.diskCID))
 	}
