@@ -54,6 +54,12 @@ func (s *templateNodesService) ListQemu(ctx context.Context, node string, params
 	return &out, nil
 }
 
+// ListQemuPending fails the way the config read does, because mockClient
+// serves no QEMU service and the nodes fake has no client to read through.
+func (s *templateNodesService) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("templateNodesService.ListQemuPending: mockClient serves no config read")
+}
+
 // newTemplateClient wires a templateNodesService into a mockClient.
 func newTemplateClient(nodesSvc sdknodes.Service) *mockClient {
 	return &mockClient{
@@ -777,6 +783,12 @@ func (s *authFixtureNodes) ListQemu(ctx context.Context, node string, _ *sdknode
 		resp = append(resp, raw)
 	}
 	return &resp, nil
+}
+
+// ListQemuPending fails the way the config read does, because mockClient
+// serves no QEMU service and the nodes fake has no client to read through.
+func (s *authFixtureNodes) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("authFixtureNodes.ListQemuPending: mockClient serves no config read")
 }
 
 // newClusterTemplateClient builds a mockClient serving the fixture fn through

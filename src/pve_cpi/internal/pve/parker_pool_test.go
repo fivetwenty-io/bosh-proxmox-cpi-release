@@ -162,6 +162,19 @@ func (n *sweepNodesSvc) ListQemu(
 	return &resp, nil
 }
 
+// sweepClientNodes serves the fixture's nodes fake unchanged and adds the
+// pending read, which goes through the client's config read.
+type sweepClientNodes struct {
+	sdknodes.Service
+	c *sweepTestClient
+}
+
+func (n *sweepClientNodes) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
+}
+
 // sweepClusterSvc fails the test the moment the sweep reads the cluster index.
 type sweepClusterSvc struct {
 	sdkcluster.Service
@@ -203,10 +216,16 @@ func (c *sweepTestClient) QEMU() sdkqemu.Service {
 func (c *sweepTestClient) Storage() sdkstorage.Service               { return nil }
 func (c *sweepTestClient) CloudInit() sdkcloudinit.Service           { return nil }
 func (c *sweepTestClient) Tasks() sdktasks.Service                   { return nil }
-func (c *sweepTestClient) Nodes() sdknodes.Service                   { return c.nodes }
 func (c *sweepTestClient) Cluster() sdkcluster.Service               { return c.cluster }
 func (c *sweepTestClient) ClusterStorage() sdkclusterstorage.Service { return nil }
 func (c *sweepTestClient) Pools() PoolService                        { return c.pools }
+
+func (c *sweepTestClient) Nodes() sdknodes.Service {
+	if c.nodes == nil {
+		return nil
+	}
+	return &sweepClientNodes{Service: c.nodes, c: c}
+}
 
 func sweepCfg() ParkerConfig {
 	return ParkerConfig{

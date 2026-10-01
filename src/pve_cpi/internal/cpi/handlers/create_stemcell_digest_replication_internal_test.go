@@ -434,6 +434,13 @@ func (c *countingNodesService) ListStorageContent(ctx context.Context, node, sto
 	return &empty, nil
 }
 
+// ListQemuPending fails the way the config read does. Every client this fake
+// serves wires either no QEMU service or a replicationMockQEMU without Config,
+// and the fake has no client to read through.
+func (c *countingNodesService) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("countingNodesService.ListQemuPending: its clients serve no config read")
+}
+
 func (c *countingNodesService) DeleteQemu(ctx context.Context, node, vmid string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 	if c.deleteQemuFn != nil {
 		return c.deleteQemuFn(ctx, node, vmid, params)

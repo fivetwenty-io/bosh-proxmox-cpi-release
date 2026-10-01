@@ -196,6 +196,10 @@ type hungAdmissionNodes struct {
 	owner *hungAdmissionPVE
 }
 
+func (n hungAdmissionNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.owner.QEMU().Config, node, vmid)
+}
+
 func (n hungAdmissionNodes) ListCertificatesInfo(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
 	disagree, err := n.owner.intercept(ctx, admissionClusterIdentity)
 	if err != nil {

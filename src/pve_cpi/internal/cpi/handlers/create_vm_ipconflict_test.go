@@ -373,9 +373,19 @@ func (c *icPVEClient) Cluster() sdkcluster.Service            { return c.cluster
 func (c *icPVEClient) Storage() storage.Service               { return nil }
 func (c *icPVEClient) CloudInit() cloudinit.Service           { return nil }
 func (c *icPVEClient) Tasks() tasks.Service                   { return nil }
-func (c *icPVEClient) Nodes() nodes.Service                   { return c.nodesSvc }
 func (c *icPVEClient) ClusterStorage() clusterstorage.Service { return nil }
 func (c *icPVEClient) Pools() pve.PoolService                 { return c.poolsSvc }
+
+func (c *icPVEClient) Nodes() nodes.Service {
+	// A copy, so the listing fake reads this client's config without a
+	// write to the shared fixture.
+	if s, ok := c.nodesSvc.(*icNodesService); ok {
+		wired := *s
+		wired.qemu = c.QEMU
+		return &wired
+	}
+	return c.nodesSvc
+}
 
 // icQEMUService satisfies qemu.Service for IP-conflict tests.
 // Only Config() is exercised; all other methods panic on accidental call.
@@ -499,6 +509,13 @@ type icNodesService struct {
 	// fallbackNode is where a fixture row without a "node" key lands;
 	// defaults to "pve1".
 	fallbackNode string
+	// qemu is the owning client's QEMU accessor, whose config read the
+	// pending endpoint serves. The client's Nodes method sets it.
+	qemu func() qemu.Service
+}
+
+func (s *icNodesService) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, s.qemu().Config, node, vmid)
 }
 
 func (s *icNodesService) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {

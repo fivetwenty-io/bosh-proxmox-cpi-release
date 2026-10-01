@@ -199,6 +199,12 @@ type allocationAuditNodes struct {
 	// noNodeList and noContent answer GET /nodes and every content listing
 	// with no response and no error.
 	noNodeList, noContent bool
+	// client is the client whose config read the pending endpoint serves.
+	client pve.Client
+}
+
+func (n *allocationAuditNodes) ListQemuPending(ctx context.Context, node, vmid string) (*ns.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.client.QEMU().Config, node, vmid)
 }
 
 // ListStorageContent records every listing it serves; the audit fans out
@@ -317,6 +323,7 @@ func auditFixture(t *testing.T) (Deps, *aj.Journal, *allocationAuditClient) {
 	}
 	base := newIDFakeClient(map[int]map[string]any{})
 	c := &allocationAuditClient{idFakeClient: base, storageRead: &allocationAuditStorage{definitions: cs.ListStorageResponse{json.RawMessage(`{"storage":"a","type":"nfs","server":"nas","export":"/a","content":"images","shared":1}`)}}, nodesRead: &allocationAuditNodes{Service: base.Nodes(), base: base, content: ns.ListStorageContentResponse{}}}
+	c.nodesRead.client = c
 	identity, err := pve.ObserveStorageClusterIdentity(t.Context(), c.Nodes(), []string{"pve1"})
 	if err != nil {
 		t.Fatal(err)

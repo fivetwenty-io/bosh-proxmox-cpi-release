@@ -208,6 +208,15 @@ type parkerNodesService struct {
 	// the cluster scans now read); buildParkerClientWithNodes wires it to
 	// the base client's fixture-derived nodes surface.
 	listQemuDelegate sdknodes.Service
+	// cfg serves ListQemuPending; buildParkerClientWithNodes wires it to the
+	// base client's config read.
+	cfg func(ctx context.Context, node string, vmid int) (map[string]any, error)
+}
+
+func (n *parkerNodesService) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return pve.PendingFromConfigRead(ctx, n.cfg, node, vmid)
 }
 
 func (n *parkerNodesService) ListQemu(
@@ -256,6 +265,11 @@ func buildParkerClientWithNodes(
 	base := buildParkerClient(qemuSvc, listFn)
 	if pn, ok := nodesSvc.(*parkerNodesService); ok && pn.listQemuDelegate == nil {
 		pn.listQemuDelegate = base.Nodes()
+	}
+	if pn, ok := nodesSvc.(*parkerNodesService); ok && pn.cfg == nil {
+		pn.cfg = func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+			return base.QEMU().Config(ctx, node, vmid)
+		}
 	}
 	return &parkerClientWithNodes{Client: base, nodesSvc: nodesSvc}
 }

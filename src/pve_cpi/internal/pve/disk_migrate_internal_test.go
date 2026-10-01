@@ -68,6 +68,12 @@ type dmFakeNodes struct {
 	c *dmFakeClient
 }
 
+func (n *dmFakeNodes) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, (&dmFakeQEMU{c: n.c}).Config, node, vmid)
+}
+
 func (n *dmFakeNodes) UpdateQemuConfig(_ context.Context, node string, vmidStr string, params *sdknodes.UpdateQemuConfigParams) error {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()

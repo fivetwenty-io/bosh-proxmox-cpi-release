@@ -79,7 +79,10 @@ func (m *stemcellMockClient) Nodes() sdknodes.Service {
 	if m.clusterSvc == nil {
 		return m.nodesSvc
 	}
-	return &authNodesService{Service: m.nodesSvc, listFn: m.clusterSvc.ListResources, fallbackNode: vmNode}
+	return &authNodesService{
+		Service: m.nodesSvc, listFn: m.clusterSvc.ListResources, fallbackNode: vmNode,
+		configRead: clientConfigRead(m),
+	}
 }
 func (m *stemcellMockClient) Cluster() sdkcluster.Service { return m.clusterSvc }
 func (m *stemcellMockClient) ClusterStorage() sdkclusterstorage.Service {

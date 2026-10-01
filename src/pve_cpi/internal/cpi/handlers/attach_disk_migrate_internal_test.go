@@ -318,6 +318,10 @@ func (n *migFakeNodes) ListQemu(_ context.Context, node string, _ *sdknodes.List
 	return &resp, nil
 }
 
+func (n *migFakeNodes) ListQemuPending(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.c.QEMU().Config, node, vmid)
+}
+
 func (n *migFakeNodes) DeleteQemu(_ context.Context, node string, vmidStr string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()

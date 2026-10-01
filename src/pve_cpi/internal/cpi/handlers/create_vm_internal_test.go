@@ -1423,6 +1423,11 @@ func (n *templateGapNodesSvc) CreateQemuClone(_ context.Context, node, vmidStr s
 type templateGapAuthNodes struct {
 	*templateGapNodesSvc
 	cluster *templateGapClusterSvc
+	client  *templateGapPVE
+}
+
+func (n *templateGapAuthNodes) ListQemuPending(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, n.client.QEMU().Config, node, vmid)
 }
 
 func (n *templateGapAuthNodes) ListQemu(ctx context.Context, node string, p *sdknodes.ListQemuParams) (*sdknodes.ListQemuResponse, error) {
@@ -1470,7 +1475,7 @@ func (p *templateGapPVE) QEMU() sdkqemu.Service {
 // (which lists the template's own node) sees the resourceRows fixture, while
 // listQemuFn stays the replica guard's observable on every other node.
 func (p *templateGapPVE) Nodes() sdknodes.Service {
-	return &templateGapAuthNodes{templateGapNodesSvc: p.nodes, cluster: p.cluster}
+	return &templateGapAuthNodes{templateGapNodesSvc: p.nodes, cluster: p.cluster, client: p}
 }
 func (p *templateGapPVE) Tasks() sdktasks.Service         { panic("not needed") }
 func (p *templateGapPVE) Storage() sdkstorage.Service     { panic("not needed") }

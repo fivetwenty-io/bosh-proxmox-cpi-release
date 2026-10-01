@@ -107,6 +107,16 @@ type diskMetaNodesMock struct {
 	// (pve.ListGuestsAuthoritative) with the suite's cluster fixture rows.
 	// buildDiskMetaPVE wires it to the cluster service's ListResources.
 	listQemuSrc func(ctx context.Context, params *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error)
+	// configRead serves the pending read. diskMetaClientMock.Nodes wires it to
+	// the client's QEMU().Config.
+	configRead configReadFn
+}
+
+// ListQemuPending serves the pending read from the client's config read.
+func (m *diskMetaNodesMock) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return handlers.PendingFromConfigRead(ctx, m.configRead, node, vmid)
 }
 
 // ListQemu serves the node's guests from the cluster fixture (empty when unwired).
@@ -175,12 +185,16 @@ func (c *diskMetaClientMock) CloudInit() cloudinit.Service { return nil }
 func (c *diskMetaClientMock) Tasks() tasks.Service         { return nil }
 
 // Nodes wires the nodes mock's authoritative listing source to the cluster
-// fixture on first use (unless a test already set one), so every
-// construction site of diskMetaClientMock gets pve.ListGuestsAuthoritative
-// coverage without repeating the wiring.
+// fixture, and its pending read to this client's config read, on first use
+// (unless a test already set one), so every construction site of
+// diskMetaClientMock gets pve.ListGuestsAuthoritative coverage without
+// repeating the wiring.
 func (c *diskMetaClientMock) Nodes() sdknodes.Service {
 	if c.nodesSvc != nil && c.nodesSvc.listQemuSrc == nil && c.clusterSvc != nil {
 		c.nodesSvc.listQemuSrc = c.clusterSvc.ListResources
+	}
+	if c.nodesSvc != nil && c.nodesSvc.configRead == nil {
+		c.nodesSvc.configRead = clientConfigRead(c)
 	}
 	return c.nodesSvc
 }
@@ -1251,7 +1265,10 @@ func (c *diskMetaFullMock) Nodes() sdknodes.Service {
 	if c.clusterSvc == nil {
 		return c.nodesSvc
 	}
-	return &authNodesService{Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: testNode}
+	return &authNodesService{
+		Service: c.nodesSvc, listFn: c.clusterSvc.ListResources, fallbackNode: testNode,
+		configRead: clientConfigRead(c),
+	}
 }
 func (c *diskMetaFullMock) Cluster() sdkclusterapi.Service         { return c.clusterSvc }
 func (c *diskMetaFullMock) ClusterStorage() clusterstorage.Service { return nil }

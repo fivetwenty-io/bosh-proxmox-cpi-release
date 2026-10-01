@@ -882,6 +882,12 @@ func (n *guardScopeNodes) ListQemu(
 	return &resp, nil
 }
 
+// ListQemuPending fails the way the config read does, because the
+// parkerCfgClient under guardScopeClient wires no QEMU service.
+func (n *guardScopeNodes) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("guardScopeNodes.ListQemuPending: parkerCfgClient serves no config read")
+}
+
 // guardScopeAdmission records every mutation a guard admits and applies the one
 // rule the real hooks apply to pools, which is that a pool outside bosh-lock-
 // is refused and the refusal poisons the allocation. It stands in for

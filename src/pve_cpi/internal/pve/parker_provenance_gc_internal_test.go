@@ -44,6 +44,7 @@ func (c *provFakeClient) QEMU() qemu.Service {
 
 func (c *provFakeClient) Nodes() sdknodes.Service {
 	return &fakeNodesService{
+		qemuConfigFn: c.QEMU().Config,
 		updateQemuConfigFn: func(_ context.Context, _ string, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			c.writes++
 			if params != nil && params.Description != nil {

@@ -95,6 +95,13 @@ func (n *parkerCfgNodes) ListQemu(
 	return &empty, nil
 }
 
+// ListQemuPending fails the way the config read does, because
+// parkerCfgClient wires no QEMU service and the nodes fake has no client to
+// read through.
+func (n *parkerCfgNodes) ListQemuPending(context.Context, string, string) (*sdknodes.ListQemuPendingResponse, error) {
+	panic("parkerCfgNodes.ListQemuPending: parkerCfgClient serves no config read")
+}
+
 // parkerCfgClient implements pve.Client with only Cluster() and Nodes() wired,
 // which is all the holder scan needs once the park itself runs through the
 // seam. Every other service is nil so an unintended call panics loudly.

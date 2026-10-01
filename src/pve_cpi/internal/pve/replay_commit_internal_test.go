@@ -120,6 +120,12 @@ func (n *rpNodes) ListStorageContent(
 	return &empty, nil
 }
 
+func (n *rpNodes) ListQemuPending(
+	ctx context.Context, node, vmid string,
+) (*sdknodes.ListQemuPendingResponse, error) {
+	return PendingFromConfigRead(ctx, (&rpQEMU{c: n.c}).Config, node, vmid)
+}
+
 // ListQemu derives the node's listing from the committed configs, mirroring
 // ListResources, so the allocator's authoritative leg sees the same state.
 func (n *rpNodes) ListQemu(

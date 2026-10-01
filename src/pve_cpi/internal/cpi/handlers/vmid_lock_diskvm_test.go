@@ -86,6 +86,14 @@ type ldmNodes struct {
 	// (pve.ListGuestsAuthoritative) with the same rows the cluster fixture
 	// serves through the index.
 	guests *sdkclusterapi.ListResourcesResponse
+	// configRead serves the pending read; suites point it at their ldmQEMU's
+	// Config.
+	configRead configReadFn
+}
+
+// ListQemuPending serves the pending read from the suite's config read.
+func (n *ldmNodes) ListQemuPending(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
+	return handlers.PendingFromConfigRead(ctx, n.configRead, node, vmid)
 }
 
 // ListQemu serves the node's guests from the guests fixture (empty when unset).
@@ -176,13 +184,16 @@ func TestHandleSetDiskMetadata_LockAcquiredBeforeRead(t *testing.T) {
 	pools := newRecordingPoolService(&events)
 	expectedPool := fmt.Sprintf("bosh-lock-vm-%d", vmid)
 
+	qemuSvc := &ldmQEMU{diskCID: diskCID, events: &events}
 	deps := handlers.Deps{
 		Config: testConfig(),
 		Logger: log.NewNopLogger(),
 		Agent:  &mockAgentService{},
 		PVE: &lockTestPVEClient{
-			qemuSvc:    &ldmQEMU{diskCID: diskCID, events: &events},
-			nodesSvc:   &ldmNodes{events: &events, guests: ldmClusterResources(vmid, lockTestNode)},
+			qemuSvc: qemuSvc,
+			nodesSvc: &ldmNodes{
+				events: &events, guests: ldmClusterResources(vmid, lockTestNode), configRead: qemuSvc.Config,
+			},
 			clusterSvc: &ldmCluster{resp: ldmClusterResources(vmid, lockTestNode)},
 			poolsSvc:   pools,
 		},
@@ -258,18 +269,20 @@ func TestHandleSetDiskMetadata_LockAcquireFailureRetriable(t *testing.T) {
 	pools.createErr = fmt.Errorf("pmxcfs unavailable")
 
 	var updateCalled bool
+	qemuSvc := &ldmQEMU{diskCID: diskCID}
 	deps := handlers.Deps{
 		Config: testConfig(),
 		Logger: log.NewNopLogger(),
 		Agent:  &mockAgentService{},
 		PVE: &lockTestPVEClient{
-			qemuSvc: &ldmQEMU{diskCID: diskCID},
+			qemuSvc: qemuSvc,
 			nodesSvc: &ldmNodes{
 				updateFn: func(_ context.Context, _, _ string, _ *sdknodes.UpdateQemuConfigParams) error {
 					updateCalled = true
 					return nil
 				},
-				guests: ldmClusterResources(vmid, lockTestNode),
+				guests:     ldmClusterResources(vmid, lockTestNode),
+				configRead: qemuSvc.Config,
 			},
 			clusterSvc: &ldmCluster{resp: ldmClusterResources(vmid, lockTestNode)},
 			poolsSvc:   pools,

@@ -47,6 +47,25 @@ func newKeepWorld() *keepWorld {
 }
 
 func (w *keepWorld) client() Client {
+	qemuSvc := &fakeQEMUService{
+		configFn: func(_ context.Context, node string, vmid int) (map[string]any, error) {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.reads = append(w.reads, fmt.Sprintf("%s/%d", node, vmid))
+			if err := w.errs[fmt.Sprintf("%s/%d", node, vmid)]; err != nil {
+				return nil, err
+			}
+			cfg, ok := w.configs[node][vmid]
+			if !ok {
+				return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+			}
+			out := make(map[string]any, len(cfg))
+			for k, v := range cfg {
+				out[k] = v
+			}
+			return out, nil
+		},
+	}
 	return &findVMTestClient{
 		backendTestClient: backendTestClient{
 			clusterSvc: &fakeCluster{
@@ -61,6 +80,7 @@ func (w *keepWorld) client() Client {
 				},
 			},
 			nodesSvc: &fakeNodesService{
+				qemuConfigFn: qemuSvc.Config,
 				updateQemuConfigFn: func(_ context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
 					w.mu.Lock()
 					defer w.mu.Unlock()
@@ -72,25 +92,7 @@ func (w *keepWorld) client() Client {
 				},
 			},
 		},
-		qemuSvc: &fakeQEMUService{
-			configFn: func(_ context.Context, node string, vmid int) (map[string]any, error) {
-				w.mu.Lock()
-				defer w.mu.Unlock()
-				w.reads = append(w.reads, fmt.Sprintf("%s/%d", node, vmid))
-				if err := w.errs[fmt.Sprintf("%s/%d", node, vmid)]; err != nil {
-					return nil, err
-				}
-				cfg, ok := w.configs[node][vmid]
-				if !ok {
-					return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
-				}
-				out := make(map[string]any, len(cfg))
-				for k, v := range cfg {
-					out[k] = v
-				}
-				return out, nil
-			},
-		},
+		qemuSvc: qemuSvc,
 	}
 }
 

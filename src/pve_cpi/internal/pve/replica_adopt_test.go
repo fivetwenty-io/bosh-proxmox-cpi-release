@@ -30,6 +30,13 @@ func (f *adoptFakeNodes) ListQemu(_ context.Context, _ string, _ *nodes.ListQemu
 	return f.fn(n)
 }
 
+// ListQemuPending fails the way the config read does, because adoptFakeClient
+// takes QEMU from its nil embedded Client and the nodes fake has no client to
+// read through.
+func (f *adoptFakeNodes) ListQemuPending(context.Context, string, string) (*nodes.ListQemuPendingResponse, error) {
+	panic("adoptFakeNodes.ListQemuPending: adoptFakeClient serves no config read")
+}
+
 func (f *adoptFakeNodes) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -81,6 +88,13 @@ func (f *adoptCtxFakeNodes) ListQemu(ctx context.Context, _ string, _ *nodes.Lis
 	n := f.calls
 	f.mu.Unlock()
 	return f.fn(n, ctx)
+}
+
+// ListQemuPending fails the way the config read does, because adoptCtxFakeClient
+// takes QEMU from its nil embedded Client and the nodes fake has no client to
+// read through.
+func (f *adoptCtxFakeNodes) ListQemuPending(context.Context, string, string) (*nodes.ListQemuPendingResponse, error) {
+	panic("adoptCtxFakeNodes.ListQemuPending: adoptCtxFakeClient serves no config read")
 }
 
 // adoptCtxFakeClient exposes adoptCtxFakeNodes via Nodes().
