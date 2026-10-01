@@ -29,6 +29,11 @@ Warnings are printed to stderr when:
     workload VM the CPI never moves out on its own, and an operator has to
     move it by hand. A pool counts as a parker pool when a parker VM belongs
     to it, and --parker-pool names one that holds no parker yet.
+  - a volume is named by more than one guest's config, on an active slot or
+    an unused entry. Earlier releases could leave a disk this way, and
+    destroying the guest that owns the volume by name deletes it while the
+    other guest still uses it. The report also warns when it could not read
+    every guest, because then a second reference could be missing.
 
 Config file format (JSON, subset of the CPI config):
 
@@ -230,6 +235,57 @@ class PVEClient:
         except json.JSONDecodeError as exc:
             _die(f"GET {path}: invalid JSON response: {exc}")
         return payload.get("data")
+
+    def get_soft(self, path: str) -> "tuple[Any, str]":
+        """GET /api2/json<path> without ending the audit on failure.
+
+        Returns (data, "") on success and (None, reason) on any HTTP, network,
+        or JSON failure, for reads whose failure the report can describe
+        rather than die on.
+        """
+        headers = self._auth_headers()
+        req = urllib.request.Request(f"{self._base}{path}", headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return None, f"HTTP {exc.code} {exc.reason}"
+        except (urllib.error.URLError, OSError) as exc:
+            return None, str(exc)
+        except json.JSONDecodeError as exc:
+            return None, f"invalid JSON response: {exc}"
+        if not isinstance(payload, dict):
+            return None, "unexpected response shape"
+        return payload.get("data"), ""
+
+    def vms_permissions(self) -> "tuple[dict[str, Any] | None, str]":
+        """Return this principal's effective privileges on /vms.
+
+        GET /access/permissions?path=/vms answers with a map from path to
+        privileges. Returns (privileges, "") on success, which may be empty,
+        and (None, reason) when the read failed.
+        """
+        data, err = self.get_soft("/access/permissions?path=%2Fvms")
+        if err:
+            return None, err
+        if not isinstance(data, dict):
+            return {}, ""
+        privs = data.get("/vms")
+        return (privs if isinstance(privs, dict) else {}), ""
+
+    def vm_config_soft(self, node: str, vmid: int) -> "dict[str, Any] | None":
+        """Return qemu VM config dict, or None when the read failed for any reason.
+
+        Unlike vm_config, an HTTP error other than 404 or 501, a network
+        error, or bad JSON does not end the audit. The double-reference report
+        lists such a guest as unreadable instead, because a guest on a down
+        node is exactly what an audit of a degraded cluster runs into.
+        """
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/config"
+        data, err = self.get_soft(path)
+        if err or not isinstance(data, dict):
+            return None
+        return data
 
     def list_nodes(self) -> list[str]:
         """Return all online node names visible to the authenticated principal."""
@@ -677,11 +733,207 @@ def find_pool_intruders(
     return intruders
 
 
+# ---------------------------------------------------------------------------
+# Volumes that more than one guest names
+# ---------------------------------------------------------------------------
+
+# PVE decides which VM owns a volume from the volume's name alone: the last
+# path segment starts vm-<vmid>- or base-<vmid>-. That holds on every storage
+# type, including a linked clone, whose name carries its base volume's path
+# in front ("base-100-disk-0/vm-101-disk-0" belongs to VM 101).
+_OWNER_NAME_RE = re.compile(r"^(?:vm|base)-(\d+)-")
+
+# The volid of a drive the double-reference report counts carries a storage
+# prefix. Anything else on a bus key is a passthrough path or a placeholder.
+_STORAGE_VOLID_RE = re.compile(r"^[^:/\s]+:\S+$")
+
+
+def volume_owner_vmid(volid: str) -> "int | None":
+    """Return the VMID that owns volid by name, or None when the name encodes none.
+
+    Inputs:
+      volid - a PVE volid, <storage>:<name>
+
+    Failure modes:
+      no vm-N- or base-N- prefix on the last path segment - return None
+    """
+    name = volid.split(":", 1)[1] if ":" in volid else volid
+    last = name.rsplit("/", 1)[-1]
+    m = _OWNER_NAME_RE.match(last)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _referenced_volids(config: dict[str, Any]) -> "list[tuple[str, str, str]]":
+    """Return (slot, kind, volid) for every volume a guest config names.
+
+    Covers the bus slots _BUS_KEY_RE matches and every unusedN entry. A cdrom
+    drive is left out, and that includes the cloud-init drive, which sits on a
+    bus key such as ide2 as "<storage>:vm-<vmid>-cloudinit,media=cdrom". The
+    "none" placeholder and a passthrough path are left out too. efidisk and
+    tpmstate live on keys of their own, which this never reads. Kind is
+    "active" for a bus slot and "unused" for an unusedN entry.
+    """
+    out: list[tuple[str, str, str]] = []
+    for key in sorted(config):
+        val = config[key]
+        if not isinstance(val, str) or not val:
+            continue
+        if _BUS_KEY_RE.match(key):
+            kind = "active"
+        elif _UNUSED_KEY_RE.match(key):
+            kind = "unused"
+        else:
+            continue
+        options = val.split(",")[1:]
+        if any(opt.strip().lower() == "media=cdrom" for opt in options):
+            continue
+        volid = _bus_disk_volid_from_slot(val).strip()
+        if not _STORAGE_VOLID_RE.match(volid):
+            continue
+        out.append((key, kind, volid))
+    return out
+
+
+class MultiRefRecord:
+    """One volume that more than one guest config names."""
+
+    __slots__ = ("volid", "owner_vmid", "owner_present", "owner_holds", "references")
+
+    def __init__(self, volid: str, owner_vmid: "int | None", owner_present: bool, references: list[dict[str, Any]]) -> None:
+        self.volid = volid
+        self.owner_vmid = owner_vmid
+        # True when a guest with the owning VMID exists in the cluster index.
+        self.owner_present = owner_present
+        self.references = references
+        self.owner_holds = any(ref["owns"] for ref in references)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "volid": self.volid,
+            "owner_vmid": self.owner_vmid,
+            "owner_present": self.owner_present,
+            "owner_holds_reference": self.owner_holds,
+            "references": [dict(ref) for ref in self.references],
+        }
+
+
+class MultiRefReport:
+    """The double-reference findings together with how much of the cluster they cover.
+
+    visibility is "full" when the principal can audit every guest, "limited"
+    when it lacks VM.Audit on /vms and so sees only part of the cluster, and
+    "unknown" when its permissions could not be read. unreadable_vmids lists
+    the QEMU guests whose configs did not come back. A report is complete only
+    when visibility is "full" and unreadable_vmids is empty.
+    """
+
+    __slots__ = ("records", "unreadable_vmids", "visibility", "visibility_error")
+
+    def __init__(
+        self,
+        records: "list[MultiRefRecord]",
+        unreadable_vmids: "list[int]",
+        visibility: str = "full",
+        visibility_error: str = "",
+    ) -> None:
+        self.records = records
+        self.unreadable_vmids = unreadable_vmids
+        self.visibility = visibility
+        self.visibility_error = visibility_error
+
+    @property
+    def complete(self) -> bool:
+        return self.visibility == "full" and not self.unreadable_vmids
+
+
+def find_multiply_referenced(
+    vm_map: dict[int, dict[str, str]],
+    configs: "dict[int, dict[str, Any] | None]",
+    parker_band: "tuple[int, int]",
+) -> "tuple[list[MultiRefRecord], list[int]]":
+    """Find every volume that two or more guests name, active slot or unused entry.
+
+    Only QEMU guests count. A row whose type is not qemu is skipped before its
+    config is looked at, because the config read for a container goes through
+    the qemu endpoint and comes back empty, which would otherwise read as an
+    unreadable guest. A row without a type is treated as qemu.
+
+    One guest naming the same volume twice is not a finding. PVE refuses to
+    free a volume that its own VM's config still names (try_deallocate_drive,
+    qemu-server QemuServer.pm:4905-4907), so a second reference on the same VM
+    cannot lose the volume.
+
+    Inputs:
+      vm_map      - vmid -> {node, name, tags, pool, type} from the cluster index
+      configs     - vmid -> config dict, or None when the read failed
+      parker_band - (start, end) of the parker VMID band
+
+    Returns:
+      (records ordered by volid, VMIDs of QEMU guests whose config is None)
+    """
+    by_volid: dict[str, list[dict[str, Any]]] = {}
+    unreadable: list[int] = []
+    for vmid_int in sorted(vm_map):
+        info = vm_map[vmid_int]
+        if (info.get("type") or "qemu") != "qemu":
+            continue
+        config = configs.get(vmid_int)
+        if config is None:
+            unreadable.append(vmid_int)
+            continue
+        parker = (
+            parker_band[0] <= vmid_int <= parker_band[1]
+            and _tags_contain_parker(str(info.get("tags", "") or ""))
+        )
+        for slot, kind, volid in _referenced_volids(config):
+            by_volid.setdefault(volid, []).append({
+                "vmid": vmid_int,
+                "node": str(info.get("node", "") or ""),
+                "name": str(info.get("name", "") or ""),
+                "slot": slot,
+                "kind": kind,
+                "parker": parker,
+            })
+
+    records: list[MultiRefRecord] = []
+    for volid in sorted(by_volid):
+        refs = by_volid[volid]
+        if len({ref["vmid"] for ref in refs}) < 2:
+            continue
+        owner = volume_owner_vmid(volid)
+        for ref in refs:
+            ref["owns"] = owner is not None and ref["vmid"] == owner
+        records.append(MultiRefRecord(volid, owner, owner is not None and owner in vm_map, refs))
+    return records, unreadable
+
+
+def double_reference_visibility(client: Any) -> "tuple[str, str]":
+    """Say how much of the cluster the principal can see for this report.
+
+    A token scoped to a pool sees only the guests it can audit, so the cluster
+    index leaves the rest out and a second holder outside its view would make
+    the report read clean. Returns ("full", "") when the principal holds
+    VM.Audit on /vms, ("limited", "") when it does not, and ("unknown", reason)
+    when the permissions read failed.
+    """
+    privs, err = client.vms_permissions()
+    if privs is None:
+        return "unknown", err or "permissions read failed"
+    if privs.get("VM.Audit"):
+        return "full", ""
+    return "limited", ""
+
+
 def collect_inventory(
     client: PVEClient,
     cfg: AuditConfig,
     extra_parker_pools: "list[str] | None" = None,
-) -> "tuple[list[DiskRecord], list[ParkerRecord], list[PoolIntruderRecord]]":
+) -> "tuple[list[DiskRecord], list[ParkerRecord], list[PoolIntruderRecord], MultiRefReport]":
     """Collect the full disk and parker inventory from PVE.
 
     Algorithm:
@@ -709,6 +961,10 @@ def collect_inventory(
          still references a live volume, so it is not a teardown candidate.
       7. Work out which pools hold parkers, add any the operator named, and
          report every VM in one of them that carries no bosh-parker tag.
+      8. Read every QEMU guest's config, reusing the cache, and report each
+         volume that more than one guest names, along with the guests whose
+         configs did not come back and how much of the cluster the
+         principal can see.
 
     Inputs:
       client             - authenticated PVE API client
@@ -718,7 +974,7 @@ def collect_inventory(
                            currently belongs to them
 
     Returns:
-      (disk_records, parker_records, pool_intruders)
+      (disk_records, parker_records, pool_intruders, multi_ref_report)
     """
     # ---- Step 1: cluster VM map ----
     vm_map: dict[int, dict[str, str]] = {}
@@ -735,6 +991,7 @@ def collect_inventory(
             "name": str(entry.get("name", "") or ""),
             "tags": str(entry.get("tags", "") or ""),
             "pool": str(entry.get("pool", "") or ""),
+            "type": str(entry.get("type", "") or ""),
         }
 
     # ---- Step 2: node list ----
@@ -914,7 +1171,27 @@ def collect_inventory(
     # ---- Step 7: workload VMs sitting in a parker pool ----
     pool_intruders = find_pool_intruders(vm_map, parker_pool_names(parker_records, extra_parker_pools))
 
-    return disk_records, parker_records, pool_intruders
+    # ---- Step 8: volumes that more than one guest names ----
+    # Every QEMU guest is read, cluster-wide, whatever cfg.node says, because
+    # the second reference can sit on any node. Step 4 already filled the
+    # cache when there were disk-band volumes to match; otherwise we read
+    # the configs here. Containers are skipped before the cache is consulted.
+    # These reads are soft: a guest whose config does not come back is listed
+    # as unreadable rather than ending the audit.
+    for vmid_int, info in vm_map.items():
+        if (info.get("type") or "qemu") != "qemu" or vmid_int in vm_config_cache:
+            continue
+        if not info["node"]:
+            vm_config_cache[vmid_int] = None
+            continue
+        vm_config_cache[vmid_int] = client.vm_config_soft(info["node"], vmid_int)
+    multi_records, unreadable = find_multiply_referenced(
+        vm_map, vm_config_cache, (cfg.parker_vmid_start, cfg.parker_vmid_end),
+    )
+    visibility, visibility_error = double_reference_visibility(client)
+    multi_ref = MultiRefReport(multi_records, unreadable, visibility, visibility_error)
+
+    return disk_records, parker_records, pool_intruders, multi_ref
 
 
 # ---------------------------------------------------------------------------
@@ -950,6 +1227,7 @@ def print_human_report(
     disk_records: list[DiskRecord],
     parker_records: list[ParkerRecord],
     cfg: AuditConfig,
+    multi_ref: "MultiRefReport | None" = None,
 ) -> None:
     """Print a human-readable table report to stdout."""
     counts: dict[str, int] = {"attached": 0, "parked": 0, "free-floating": 0, "unknown": 0}
@@ -968,6 +1246,10 @@ def print_human_report(
     print(f"    parked:        {counts['parked']}")
     print(f"    free-floating: {counts['free-floating']}")
     print(f"    unknown:       {counts['unknown']}")
+    if multi_ref is not None:
+        print(f"  Volumes named by more than one guest: {len(multi_ref.records)}")
+        if not multi_ref.complete:
+            print(f"    coverage: {_multi_ref_coverage_text(multi_ref)}")
     print()
 
     # Attached
@@ -1012,6 +1294,18 @@ def print_human_report(
             print(f"  {_trunc(r.volid, 55):<55} {_human_size(r.size_bytes):>10}  {r.storage:<20}  {r.node:<15}")
         print()
 
+    # Volumes more than one guest names
+    if multi_ref is not None and multi_ref.records:
+        print("MULTIPLY REFERENCED VOLUMES  [WARNING: more than one guest names these]")
+        for mr in multi_ref.records:
+            print(f"  {mr.volid}")
+            note = _multi_ref_owner_note(mr)
+            if note:
+                print(f"    {note}")
+            for ref in mr.references:
+                print(f"    {_multi_ref_reference_text(ref)}")
+        print()
+
     # Unknown
     unknowns = [r for r in disk_records if r.classification == "unknown"]
     if unknowns:
@@ -1045,6 +1339,7 @@ def print_json_report(
     disk_records: list[DiskRecord],
     parker_records: list[ParkerRecord],
     cfg: AuditConfig,
+    multi_ref: "MultiRefReport | None" = None,
 ) -> None:
     """Print a JSON report to stdout."""
     out = {
@@ -1062,7 +1357,57 @@ def print_json_report(
         "disks": [r.to_dict() for r in sorted(disk_records, key=lambda x: x.volid)],
         "parkers": [pr.to_dict() for pr in parker_records],
     }
+    if multi_ref is not None:
+        out["summary"]["multiply_referenced"] = len(multi_ref.records)
+        out["multiply_referenced"] = [mr.to_dict() for mr in multi_ref.records]
+        out["multiply_referenced_unreadable_vmids"] = list(multi_ref.unreadable_vmids)
+        out["multiply_referenced_visibility"] = multi_ref.visibility
+        out["multiply_referenced_complete"] = multi_ref.complete
     print(json.dumps(out, indent=2))
+
+
+def _multi_ref_reference_text(ref: dict[str, Any]) -> str:
+    """One reference, as the report and the warning both print it."""
+    marks = []
+    if ref.get("owns"):
+        marks.append("owns by name")
+    if ref.get("parker"):
+        marks.append("parker")
+    suffix = f" [{', '.join(marks)}]" if marks else ""
+    name = ref.get("name") or "unnamed"
+    return f"VM {ref['vmid']} ({name}) on {ref.get('node') or '?'} {ref['slot']}{suffix}"
+
+
+def _multi_ref_owner_note(mr: MultiRefRecord) -> str:
+    """Say who owns the volume by name when that matters for what not to do."""
+    if mr.owner_vmid is None:
+        return "no VM owns this volume by name"
+    if mr.owner_holds:
+        return ""
+    if mr.owner_present:
+        return (
+            f"VM {mr.owner_vmid} owns this volume by name and holds none of these references; "
+            "destroying it with destroy-unreferenced-disks deletes the volume"
+        )
+    return f"VM {mr.owner_vmid} would own this volume by name, and no such VM is in the cluster index"
+
+
+def _multi_ref_coverage_text(multi_ref: MultiRefReport) -> str:
+    """Say why the double-reference report may be incomplete."""
+    parts = []
+    if multi_ref.visibility == "limited":
+        parts.append("limited (this token lacks VM.Audit on /vms)")
+    elif multi_ref.visibility == "unknown":
+        parts.append("unknown (the permissions read failed)")
+    if multi_ref.unreadable_vmids:
+        parts.append(f"{len(multi_ref.unreadable_vmids)} guest config(s) unreadable")
+    return "; ".join(parts)
+
+
+_MULTI_REF_DOCS = (
+    'see "Auditing parked disks with scripts/disk-audit" in docs/operations.md '
+    "of bosh-proxmox-cpi-release"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1419,7 @@ def emit_warnings(
     parker_records: list[ParkerRecord],
     pool_intruders: list[PoolIntruderRecord],
     cfg: AuditConfig,
+    multi_ref: "MultiRefReport | None" = None,
 ) -> None:
     """Emit advisory warnings to stderr."""
     parked_count = sum(1 for r in disk_records if r.classification == "parked")
@@ -1139,6 +1485,45 @@ def emit_warnings(
             f"pvesh set /pools/<workload-pool> --vms {ir.vmid} --allow-move 1"
         )
 
+    if multi_ref is None:
+        return
+
+    # Warn about every volume more than one guest names. No fix command: the
+    # right repair depends on how the volume got there, and the docs section
+    # says how to tell which guest really holds the disk.
+    for mr in multi_ref.records:
+        refs = "; ".join(_multi_ref_reference_text(ref) for ref in mr.references)
+        note = _multi_ref_owner_note(mr)
+        if mr.owner_vmid is not None and mr.owner_holds:
+            hazard = (
+                f"destroying VM {mr.owner_vmid}, or removing its unused entry, deletes the volume "
+                "while another guest still names it"
+            )
+        else:
+            hazard = note
+        _warn(
+            f"volume {mr.volid} is named by {len({r['vmid'] for r in mr.references})} guests: {refs}. "
+            f"Leave every reference in place until we know which guest really holds the disk; "
+            f"{hazard}; {_MULTI_REF_DOCS}"
+        )
+
+    if multi_ref.unreadable_vmids:
+        vmids = ", ".join(str(v) for v in multi_ref.unreadable_vmids)
+        _warn(
+            f"the configs of {len(multi_ref.unreadable_vmids)} QEMU guest(s) did not come back "
+            f"({vmids}), so the report of volumes named by more than one guest may be incomplete"
+        )
+    if multi_ref.visibility == "limited":
+        _warn(
+            "this token lacks VM.Audit on /vms, so the report of volumes named by more than one guest "
+            "covers only the guests this token can see; a second guest outside its view would not show up"
+        )
+    elif multi_ref.visibility == "unknown":
+        _warn(
+            f"could not read this token's permissions on /vms ({multi_ref.visibility_error}), so the "
+            "coverage of the report of volumes named by more than one guest is unknown"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -1193,18 +1578,18 @@ def main(argv: "list[str] | None" = None) -> int:
 
     try:
         client = PVEClient(cfg)
-        disk_records, parker_records, pool_intruders = collect_inventory(client, cfg, extra_parker_pools)
+        disk_records, parker_records, pool_intruders, multi_ref = collect_inventory(client, cfg, extra_parker_pools)
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
         _die(f"inventory collection failed: {exc}")
 
-    emit_warnings(disk_records, parker_records, pool_intruders, cfg)
+    emit_warnings(disk_records, parker_records, pool_intruders, cfg, multi_ref)
 
     if args.json:
-        print_json_report(disk_records, parker_records, cfg)
+        print_json_report(disk_records, parker_records, cfg, multi_ref)
     else:
-        print_human_report(disk_records, parker_records, cfg)
+        print_human_report(disk_records, parker_records, cfg, multi_ref)
 
     free_floating = [r for r in disk_records if r.classification == "free-floating"]
     if free_floating:

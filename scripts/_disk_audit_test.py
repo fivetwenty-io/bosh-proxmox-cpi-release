@@ -317,5 +317,388 @@ class TestPoolIntruderWarning(unittest.TestCase):
         self.assertEqual(self._warnings([]), "")
 
 
+# ---------------------------------------------------------------------------
+# Volumes that more than one guest names
+# ---------------------------------------------------------------------------
+
+def _vm(node: str = "pve1", name: str = "", tags: str = "", vtype: str = "qemu") -> dict:
+    return {"node": node, "name": name, "tags": tags, "pool": "", "type": vtype}
+
+
+class TestVolumeOwnerVmid(unittest.TestCase):
+    """PVE reads the owner from the last path segment of the volume name."""
+
+    def test_owner_name_shapes(self) -> None:
+        cases = {
+            "a:777/vm-777-disk-2.raw": 777,  # dir-style
+            "local-lvm:base-100-disk-0/vm-101-disk-0": 101,  # LVM-thin linked clone
+            "local:100/base-100-disk-0.qcow2/101/vm-101-disk-0.qcow2": 101,  # dir linked clone
+            "ceph:vm-123-disk-0": 123,  # RBD
+            "local-lvm:base-100-disk-0": 100,  # template base volume
+            "nfs:custom/data-volume.raw": None,  # no VMID in the name
+            "nfs:vm-disk-0.raw": None,
+        }
+        for volid, want in cases.items():
+            with self.subTest(volid=volid):
+                self.assertEqual(disk_audit.volume_owner_vmid(volid), want)
+
+
+class TestFindMultiplyReferenced(unittest.TestCase):
+    """Tests for the pure finder."""
+
+    BAND = (90000, 90999)
+
+    def _find(self, vm_map: dict, configs: dict) -> tuple:
+        return disk_audit.find_multiply_referenced(vm_map, configs, self.BAND)
+
+    def test_active_slot_and_unused_entry_on_two_guests(self) -> None:
+        vm_map = {777: _vm(name="web-0"), 90656: _vm(name="bosh-parker-90656", tags="bosh-cpi;bosh-parker")}
+        configs = {
+            777: {"unused0": "a:123/vm-123-disk-0.raw"},
+            90656: {"scsi1": "a:123/vm-123-disk-0.raw,serial=bpd-0011223344556677"},
+        }
+        records, unreadable = self._find(vm_map, configs)
+        self.assertEqual(unreadable, [])
+        self.assertEqual(len(records), 1)
+        mr = records[0]
+        self.assertEqual(mr.volid, "a:123/vm-123-disk-0.raw")
+        self.assertEqual(mr.owner_vmid, 123)
+        self.assertFalse(mr.owner_present)
+        refs = {(r["vmid"], r["slot"], r["kind"], r["parker"]) for r in mr.references}
+        self.assertEqual(refs, {(777, "unused0", "unused", False), (90656, "scsi1", "active", True)})
+
+    def test_two_active_slots_on_two_guests(self) -> None:
+        vm_map = {777: _vm(), 888: _vm(node="pve2")}
+        configs = {777: {"scsi1": "a:777/vm-777-disk-2.raw,size=5G"}, 888: {"virtio2": "a:777/vm-777-disk-2.raw"}}
+        records, _ = self._find(vm_map, configs)
+        self.assertEqual(len(records), 1)
+        self.assertEqual({r["kind"] for r in records[0].references}, {"active"})
+
+    def test_same_guest_twice_is_not_a_finding(self) -> None:
+        vm_map = {777: _vm()}
+        configs = {777: {"scsi1": "a:777/vm-777-disk-2.raw", "unused0": "a:777/vm-777-disk-2.raw"}}
+        records, _ = self._find(vm_map, configs)
+        self.assertEqual(records, [])
+
+    def test_cdrom_none_and_passthrough_are_skipped(self) -> None:
+        vm_map = {777: _vm(), 888: _vm()}
+        shared = {
+            "ide2": "local:iso/ubuntu.iso,media=cdrom",
+            "ide3": "local-lvm:vm-100-cloudinit,media=cdrom",
+            "ide0": "none,media=cdrom",
+            "sata0": "/dev/disk/by-id/ata-shared",
+            "scsi3": "none",
+        }
+        records, _ = self._find(vm_map, {777: dict(shared), 888: dict(shared)})
+        self.assertEqual(records, [])
+
+    def test_volume_outside_the_disk_band_is_reported(self) -> None:
+        vm_map = {777: _vm(), 90100: _vm(tags="bosh-parker")}
+        configs = {777: {"unused0": "a:90100/vm-90100-disk-3.raw"}, 90100: {"scsi0": "a:90100/vm-90100-disk-3.raw"}}
+        records, _ = self._find(vm_map, configs)
+        self.assertEqual([r.volid for r in records], ["a:90100/vm-90100-disk-3.raw"])
+
+    def test_owner_marker_goes_on_the_owner_only(self) -> None:
+        vm_map = {777: _vm(), 888: _vm()}
+        configs = {777: {"scsi1": "a:777/vm-777-disk-2.raw"}, 888: {"unused0": "a:777/vm-777-disk-2.raw"}}
+        records, _ = self._find(vm_map, configs)
+        owns = {r["vmid"]: r["owns"] for r in records[0].references}
+        self.assertEqual(owns, {777: True, 888: False})
+        self.assertTrue(records[0].owner_holds)
+
+    def test_non_owner_unused_reference_carries_no_owner_marker(self) -> None:
+        vm_map = {777: _vm(), 888: _vm()}
+        configs = {777: {"unused0": "a:888/vm-888-disk-1.raw"}, 888: {"scsi1": "a:888/vm-888-disk-1.raw"}}
+        records, _ = self._find(vm_map, configs)
+        unused = next(r for r in records[0].references if r["kind"] == "unused")
+        self.assertEqual(unused["vmid"], 777)
+        self.assertFalse(unused["owns"])
+
+    def test_owner_present_but_holding_no_reference(self) -> None:
+        vm_map = {123: _vm(name="reused-vmid"), 777: _vm(), 888: _vm()}
+        configs = {123: {}, 777: {"unused0": "a:123/vm-123-disk-0.raw"}, 888: {"scsi1": "a:123/vm-123-disk-0.raw"}}
+        records, _ = self._find(vm_map, configs)
+        mr = records[0]
+        self.assertEqual(mr.owner_vmid, 123)
+        self.assertTrue(mr.owner_present)
+        self.assertFalse(mr.owner_holds)
+        self.assertIn("destroy-unreferenced-disks", disk_audit._multi_ref_owner_note(mr))
+
+    def test_name_with_no_owner_gives_null_owner(self) -> None:
+        vm_map = {777: _vm(), 888: _vm()}
+        configs = {777: {"scsi1": "nfs:custom/data.raw"}, 888: {"unused0": "nfs:custom/data.raw"}}
+        records, _ = self._find(vm_map, configs)
+        self.assertIsNone(records[0].owner_vmid)
+        self.assertIsNone(records[0].to_dict()["owner_vmid"])
+
+    def test_container_row_is_skipped_and_not_unreadable(self) -> None:
+        vm_map = {200: _vm(vtype="lxc"), 777: _vm()}
+        records, unreadable = self._find(vm_map, {200: None, 777: {}})
+        self.assertEqual(records, [])
+        self.assertEqual(unreadable, [])
+
+    def test_unreadable_qemu_guest_is_listed(self) -> None:
+        vm_map = {777: _vm(), 778: _vm()}
+        _, unreadable = self._find(vm_map, {777: {}, 778: None})
+        self.assertEqual(unreadable, [778])
+
+
+class _StubClient:
+    """A PVE client that answers from fixed data, for collect_inventory and main."""
+
+    def __init__(self, rows: list, configs: dict, privs: "dict | None" = None, perm_err: str = "") -> None:
+        self.rows = rows
+        self.configs = configs
+        self.privs = {"VM.Audit": 1} if privs is None else privs
+        self.perm_err = perm_err
+        self.reads: list = []
+
+    def cluster_resources_vms(self) -> list:
+        return self.rows
+
+    def list_nodes(self) -> list:
+        return ["pve1"]
+
+    def node_storages(self, node: str) -> list:
+        return []
+
+    def storage_content(self, node: str, storage: str) -> list:
+        return []
+
+    def vm_config(self, node: str, vmid: int):
+        self.reads.append((node, vmid))
+        return self.configs.get(vmid)
+
+    def vm_config_soft(self, node: str, vmid: int):
+        return self.vm_config(node, vmid)
+
+    def vms_permissions(self):
+        if self.perm_err:
+            return None, self.perm_err
+        return self.privs, ""
+
+
+def _audit_cfg() -> SimpleNamespace:
+    cfg = _make_cfg()
+    cfg.detached_disk_strategy = "parked"
+    return cfg
+
+
+_DOUBLE_ROWS = [
+    {"vmid": 777, "node": "pve1", "name": "web-0", "type": "qemu"},
+    {"vmid": 90656, "node": "pve1", "name": "bosh-parker-90656", "type": "qemu", "tags": "bosh-cpi;bosh-parker"},
+    {"vmid": 200, "node": "pve1", "name": "ct", "type": "lxc"},
+]
+_DOUBLE_CONFIGS = {
+    777: {"unused0": "a:123/vm-123-disk-0.raw"},
+    90656: {"scsi1": "a:123/vm-123-disk-0.raw,serial=bpd-0011223344556677", "tags": "bosh-cpi;bosh-parker"},
+}
+
+
+class TestCollectInventoryDoubleReferences(unittest.TestCase):
+    """Step 8 through collect_inventory with a stub client."""
+
+    def test_reads_guests_and_skips_the_container(self) -> None:
+        client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS)
+        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        self.assertEqual([r.volid for r in report.records], ["a:123/vm-123-disk-0.raw"])
+        self.assertEqual(report.unreadable_vmids, [])
+        self.assertNotIn(("pve1", 200), client.reads)
+        self.assertTrue(report.complete)
+
+    def test_missing_vm_audit_limits_visibility(self) -> None:
+        client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, privs={})
+        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        self.assertEqual(report.visibility, "limited")
+        self.assertFalse(report.complete)
+
+    def test_failed_permissions_read_makes_visibility_unknown(self) -> None:
+        client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, perm_err="HTTP 403 Forbidden")
+        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        self.assertEqual(report.visibility, "unknown")
+        self.assertEqual(report.visibility_error, "HTTP 403 Forbidden")
+
+
+class TestDoubleReferenceOutput(unittest.TestCase):
+    """Rendering, warnings, and the exit code."""
+
+    def _report(self, **kw) -> object:
+        client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, **kw)
+        return disk_audit.collect_inventory(client, _audit_cfg())[3]
+
+    def test_human_report_lists_the_volume_and_each_reference(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report([], [], _make_cfg(), self._report())
+        out = buf.getvalue()
+        self.assertIn("Volumes named by more than one guest: 1", out)
+        self.assertIn("MULTIPLY REFERENCED VOLUMES", out)
+        self.assertIn("  a:123/vm-123-disk-0.raw", out)
+        self.assertIn("VM 777 (web-0) on pve1 unused0", out)
+        self.assertIn("VM 90656 (bosh-parker-90656) on pve1 scsi1 [parker]", out)
+        self.assertIn("VM 123 would own this volume by name", out)
+
+    def test_human_report_without_the_report_is_unchanged(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report([], [], _make_cfg())
+        self.assertNotIn("more than one guest", buf.getvalue())
+
+    def test_json_fields_and_existing_keys(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_json_report([], [], _make_cfg(), self._report(privs={}))
+        out = json.loads(buf.getvalue())
+        for key in ("host", "port", "disk_band", "parker_band", "summary", "disks", "parkers"):
+            self.assertIn(key, out)
+        self.assertEqual(out["summary"]["multiply_referenced"], 1)
+        self.assertEqual(out["multiply_referenced"][0]["owner_vmid"], 123)
+        self.assertEqual(out["multiply_referenced_unreadable_vmids"], [])
+        self.assertEqual(out["multiply_referenced_visibility"], "limited")
+        self.assertFalse(out["multiply_referenced_complete"])
+
+    def test_json_lists_unreadable_vmids(self) -> None:
+        configs = dict(_DOUBLE_CONFIGS)
+        del configs[777]
+        client = _StubClient(_DOUBLE_ROWS, configs)
+        report = disk_audit.collect_inventory(client, _audit_cfg())[3]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_json_report([], [], _make_cfg(), report)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["multiply_referenced_unreadable_vmids"], [777])
+        self.assertFalse(out["multiply_referenced_complete"])
+
+    def _warnings(self, report: object) -> str:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            disk_audit.emit_warnings([], [], [], _audit_cfg(), report)
+        return buf.getvalue()
+
+    def test_warning_names_every_reference_and_points_at_the_docs(self) -> None:
+        out = self._warnings(self._report())
+        self.assertIn("volume a:123/vm-123-disk-0.raw is named by 2 guests", out)
+        self.assertIn("VM 777 (web-0) on pve1 unused0", out)
+        self.assertIn("Leave every reference in place until we know which guest really holds the disk", out)
+        self.assertIn('see "Auditing parked disks with scripts/disk-audit" in docs/operations.md of bosh-proxmox-cpi-release', out)
+        self.assertNotIn("qm ", out)
+
+    def test_warning_names_the_owner_hazard(self) -> None:
+        vm_map = {777: _vm(name="web-0"), 888: _vm(name="web-1")}
+        configs = {777: {"scsi1": "a:777/vm-777-disk-2.raw"}, 888: {"unused0": "a:777/vm-777-disk-2.raw"}}
+        records, _ = disk_audit.find_multiply_referenced(vm_map, configs, (90000, 90999))
+        out = self._warnings(disk_audit.MultiRefReport(records, []))
+        self.assertIn("VM 777 (web-0) on pve1 scsi1 [owns by name]", out)
+        self.assertIn("destroying VM 777, or removing its unused entry, deletes the volume", out)
+
+    def test_limited_and_unknown_visibility_warnings(self) -> None:
+        limited = self._warnings(self._report(privs={}))
+        self.assertIn("lacks VM.Audit on /vms", limited)
+        self.assertIn("covers only the guests this token can see", limited)
+        unknown = self._warnings(self._report(perm_err="HTTP 500 boom"))
+        self.assertIn("could not read this token's permissions on /vms (HTTP 500 boom)", unknown)
+        self.assertIn("coverage of the report of volumes named by more than one guest is unknown", unknown)
+
+    def test_full_visibility_gives_no_coverage_warning(self) -> None:
+        out = self._warnings(self._report())
+        self.assertNotIn("VM.Audit", out)
+        self.assertNotIn("did not come back", out)
+
+    def test_exit_code_stays_zero_with_only_a_double_reference(self) -> None:
+        import os
+        import tempfile
+        client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, privs={})
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"}, fh)
+            path = fh.name
+        original = disk_audit.PVEClient
+        disk_audit.PVEClient = lambda cfg: client
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = disk_audit.main(["--config", path])
+        finally:
+            disk_audit.PVEClient = original
+            os.unlink(path)
+        self.assertEqual(rc, 0)
+        self.assertIn("is named by 2 guests", err.getvalue())
+        self.assertIn("lacks VM.Audit", err.getvalue())
+
+
+class TestDoubleReferenceDocsPointer(unittest.TestCase):
+    """The warning names a docs heading that has to exist."""
+
+    def test_heading_exists_in_operations_doc(self) -> None:
+        pointer = disk_audit._MULTI_REF_DOCS
+        heading = pointer.split('"')[1]
+        doc = Path(__file__).resolve().parent.parent / "docs" / "operations.md"
+        headings = [
+            line.lstrip("#").strip().replace("`", "")
+            for line in doc.read_text(encoding="utf-8").splitlines()
+            if line.startswith("#")
+        ]
+        self.assertIn(heading, headings)
+        self.assertIn("docs/operations.md of bosh-proxmox-cpi-release", pointer)
+
+
+class _FakeResponse:
+    def __init__(self, data: object) -> None:
+        self._body = json.dumps({"data": data}).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class TestStepEightReadsSoftly(unittest.TestCase):
+    """A guest config that fails to come back is listed, not fatal.
+
+    The real PVEClient runs against a patched urlopen, so the soft read is the
+    one under test. VM 777 answers HTTP 500, VM 778 fails at the network, and
+    VM 779 and VM 780 name the same volume.
+    """
+
+    def _urlopen(self, req, context=None, timeout=None):
+        import urllib.error
+        url = req.full_url
+        if url.endswith("/cluster/resources?type=vm"):
+            return _FakeResponse([
+                {"vmid": 777, "node": "pve1", "type": "qemu"},
+                {"vmid": 778, "node": "pve2", "type": "qemu"},
+                {"vmid": 779, "node": "pve1", "type": "qemu"},
+                {"vmid": 780, "node": "pve1", "type": "qemu"},
+            ])
+        if url.endswith("/nodes"):
+            return _FakeResponse([{"node": "pve1", "status": "online"}])
+        if url.endswith("/nodes/pve1/storage"):
+            return _FakeResponse([])
+        if url.endswith("/nodes/pve1/qemu/777/config"):
+            raise urllib.error.HTTPError(url, 500, "Internal Server Error", None, None)
+        if url.endswith("/nodes/pve2/qemu/778/config"):
+            raise urllib.error.URLError("No route to host")
+        if url.endswith("/qemu/779/config"):
+            return _FakeResponse({"scsi1": "a:779/vm-779-disk-1.raw"})
+        if url.endswith("/qemu/780/config"):
+            return _FakeResponse({"unused0": "a:779/vm-779-disk-1.raw"})
+        if "/access/permissions" in url:
+            return _FakeResponse({"/vms": {"VM.Audit": 1}})
+        raise AssertionError(f"unexpected request {url}")
+
+    def test_failed_reads_are_listed_and_the_audit_completes(self) -> None:
+        from unittest import mock
+        cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
+        client = disk_audit.PVEClient(cfg)
+        with mock.patch.object(disk_audit.urllib.request, "urlopen", self._urlopen):
+            _, _, _, report = disk_audit.collect_inventory(client, cfg)
+        self.assertEqual(report.unreadable_vmids, [777, 778])
+        self.assertEqual([r.volid for r in report.records], ["a:779/vm-779-disk-1.raw"])
+        self.assertFalse(report.complete)
+
+
 if __name__ == "__main__":
     unittest.main()
