@@ -114,20 +114,47 @@ Write commit messages that describe the code change, not the process that produc
 
 ## Releasing (maintainers)
 
-Releases are tag driven. Pushing a tag of the form `vX.Y.Z` on `main` runs the release workflow, which gates on the full CI check suite, builds the BOSH release tarball with a pinned `bosh` CLI, and publishes a GitHub Release with the tarball, a sha256 checksum file, and a manifest snippet ready to paste into a deployment.
+Releases are tag driven. Pushing a tag of the form `vX.Y.Z` runs the release workflow, which gates on the full CI check suite and builds the BOSH release tarball with a pinned `bosh` CLI. It then publishes a GitHub Release that carries the tarball, a sha256 checksum file, and a manifest snippet ready to paste into a deployment.
 
-To cut a release, first rename the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) to the new version, date it, open a fresh empty `Unreleased` section above it, update the link references at the bottom of the file, and merge that to `main`. Then tag it:
+To cut a release from `main`, we first rename the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md) to the new version, date it, open a fresh empty `Unreleased` section above it, update the link references at the bottom of the file, and merge that to `main`. Then we tag it:
 
 ```bash
 git tag -a v1.2.3 -m "Version 1.2.3"
 git push origin v1.2.3
 ```
 
-A tag with a prerelease suffix, such as `v1.2.3-rc.1`, is published as a GitHub prerelease. The workflow refuses tags that do not point at a commit on `main`.
+A tag with a prerelease suffix, such as `v1.2.3-rc.1`, is published as a GitHub prerelease.
 
-The build syncs blobs from the private S3 blobstore, so the repository needs two Actions secrets: `BLOBSTORE_ACCESS_KEY_ID` and `BLOBSTORE_SECRET_ACCESS_KEY`, holding a key with read access to the bucket named in `config/final.yml`. Set them with `gh secret set`. The workflow fails with instructions when they are missing.
+The build syncs blobs from the private S3 blobstore, so the repository needs two Actions secrets, `BLOBSTORE_ACCESS_KEY_ID` and `BLOBSTORE_SECRET_ACCESS_KEY`, which hold a key with read access to the bucket named in `config/final.yml`. We set them with `gh secret set`. The workflow fails with instructions when they are missing.
 
-After the GitHub Release is published, finalize the release so [bosh.io](https://bosh.io/releases) can index it. bosh.io ignores GitHub Releases; it reads the final release metadata tracked in `releases/` and `.final_builds/` on `main`. Download the published tarball, then run (this needs `config/private.yml` with blobstore write credentials):
+### Releasing a patch for an older line
+
+Once `main` has moved on to the next minor version, we ship a fix for an older line from its own release branch, named `release/X.Y`. We cut the branch from the line's `vX.Y.0` tag, and we bring each fix over from `main` with `git cherry-pick -x`, so every commit on the branch names the `main` commit it came from. Pushes to the branch run CI, Security, and CodeQL, just as pushes to `main` do.
+
+The branch keeps its own CHANGELOG.md. Before we tag a patch there, we add a dated section for that version to the branch's CHANGELOG, describe each fix in it, and add the version's link reference at the bottom of the file. A 0.8.1, for example, goes like this:
+
+```bash
+git switch -c release/0.8 v0.8.0
+git cherry-pick -x <commit on main>
+# add the 0.8.1 section to CHANGELOG.md and commit it on the branch
+git push origin release/0.8
+git tag -a v0.8.1 -m "Version 0.8.1"
+git push origin v0.8.1
+```
+
+After the branch release ships, we record it on `main` as well. We add a commit to `main` that gives the version its own dated section in CHANGELOG.md and moves the entries for the backported fixes out of `Unreleased` into that section, so the next minor release doesn't present those fixes as new. We keep that commit separate from the `chore(release)` commit that tracks the final release metadata.
+
+### Checking tags and marking the latest release
+
+The release workflow checks every tag before it builds anything, and `scripts/_release_tag.py` holds the rules it applies. When `release/X.Y` exists, a patch tag `vX.Y.Z` whose Z is above zero has to be a final tag, and its commit has to be on that branch. The workflow refuses such a tag when its commit is on `main` but not on the branch, because `main` carries newer work that must not ship under the older line's version.
+
+Every other tag has to point at a commit on `main`. That covers every tag whose Z is zero and every patch or prerelease for a line that has no release branch. We cut 0.7.1 through 0.7.3 that way, because the 0.7 line never had a release branch. When the workflow refuses a tag, its error names the rule the tag broke and says how to fix it.
+
+The workflow also decides which release GitHub marks as Latest. A release gets the badge only when its tag is the highest final version tag in the repository, so a 0.8.2 that ships after 0.9.0 leaves 0.9.0 as the latest release. Prereleases never get the badge, and they don't count when the workflow looks for the highest tag.
+
+### Finalizing a release for bosh.io
+
+After the GitHub Release is published, we finalize the release so [bosh.io](https://bosh.io/releases) can index it. bosh.io ignores GitHub Releases, and it reads only the final release metadata tracked in `releases/` and `.final_builds/` on `main`. We download the published tarball and then run these commands, which need `config/private.yml` with blobstore write credentials:
 
 ```bash
 bosh finalize-release --version X.Y.Z bosh-proxmox-cpi-X.Y.Z.tgz
@@ -137,6 +164,8 @@ git push origin main
 ```
 
 Skipping this step means the new version never appears on bosh.io.
+
+A release from a branch gets its metadata on both `main` and `release/X.Y`. We finalize on `main` exactly as above, because that's the copy bosh.io reads. Then we cherry-pick that metadata commit onto `release/X.Y` with `-x` and push the branch, so a later patch on the same line finalizes on top of a complete record. If the cherry-pick conflicts in an `index.yml`, we keep the entries from both sides.
 
 ## License
 
