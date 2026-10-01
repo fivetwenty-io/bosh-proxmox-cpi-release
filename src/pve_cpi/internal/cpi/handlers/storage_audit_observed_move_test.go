@@ -397,9 +397,6 @@ func TestAllocationAuditMoveRulesRefuseUnsafeMoves(t *testing.T) {
 		{name: "volume missing from the new node's listing", mutate: func(f *moveFixture) {
 			f.unlisted = map[string]bool{"a:123/vm-123-disk-2.qcow2": true}
 		}, vmReason: `volume a:123/vm-123-disk-2.qcow2 was not listed on storage "a" on pve2`, diskReason: `volume a:123/vm-123-disk-2.qcow2 was not listed on storage "a" on pve2`},
-		{name: "malformed listing on the new node", mutate: func(f *moveFixture) {
-			f.c.nodesRead.malformedListing = map[string]bool{"pve2/a": true}
-		}, vmReason: `volume a:123/vm-123-disk-0.qcow2 was not listed on storage "a" on pve2`, diskReason: `volume a:123/vm-123-disk-2.qcow2 was not listed on storage "a" on pve2`},
 		{name: "storage flipped to shared after the plan froze", mutate: func(f *moveFixture) {
 			f.rootStorage = "d"
 			f.current["d"] = strings.Replace(moveDefinitions["d"], `"content":"images"`, `"content":"images","shared":1`, 1)

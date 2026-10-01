@@ -16,6 +16,11 @@ import (
 // storageMoveKindParker names a parked disk moved with its parker VM.
 const storageMoveKindParker = "parker"
 
+// storageAuditReasonListingFailed marks a move the audit could neither accept
+// nor refuse, because the new node's listing of a volume's storage failed or
+// returned a malformed entry.
+const storageAuditReasonListingFailed = "listing_failed"
+
 // StorageAllocationMove is a VM, disk, or parker that the audit found on a
 // node other than the one the journal records, and accepted as a move on
 // shared storage. Kind is vm, disk, or parker. RecordedNodes are the nodes
@@ -47,12 +52,18 @@ func (r StorageAllocationAudit) observedMove(kind, allocationID string, vmid int
 
 // storageAuditMoveRefusal names why the audit accepted no move of
 // allocationID. It returns the short form of the first conflict that names
-// the allocation, which carries the move rule's reason, or says that the VM
-// scan was incomplete or that no finding named the allocation.
+// the allocation, which carries the move rule's reason, or of the issue that
+// left its move undecided. Otherwise it says that the VM scan was incomplete
+// or that no finding named the allocation.
 func storageAuditMoveRefusal(audit StorageAllocationAudit, allocationID string) string {
 	for _, conflict := range audit.Conflicts {
 		if strings.Contains(conflict, allocationID) {
 			return audit.brief(conflict)
+		}
+	}
+	for _, issue := range audit.Issues {
+		if brief, undecided := audit.briefs[issue]; undecided && strings.Contains(issue, allocationID) {
+			return brief
 		}
 	}
 	if !audit.VMScanComplete {
@@ -80,18 +91,27 @@ type storageAuditFrozen struct {
 // resolveStorageAuditMoves decides each pending node mismatch after the
 // storage listings and correlation have run. An accepted move is reported in
 // ObservedMoves; a refused one raises its conflict with the reason appended.
-// It reads PVE only for snapshot configurations and never writes anything.
+// A move that rests on a listing that failed stays undecided. It raises an
+// issue instead of a conflict, because a failed read proves nothing about
+// the volume. It reads PVE only for snapshot configurations and never writes
+// anything.
 func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex) {
 	for pendingIndex := range result.pending {
 		pending := &result.pending[pendingIndex]
 		var move StorageAllocationMove
 		var refusal string
+		var unread bool
 		if pending.kind == "vm" {
-			move, refusal = storageAuditObservedSharedMove(ctx, deps, result, index, pending.evidence)
+			move, refusal, unread = storageAuditObservedSharedMove(ctx, deps, result, index, pending.evidence)
 		} else {
-			move, refusal = storageAuditObservedSharedDiskMove(result, index, *pending)
+			move, refusal, unread = storageAuditObservedSharedDiskMove(result, index, *pending)
 		}
-		if refusal != "" {
+		switch {
+		case unread:
+			undecided := "; move undecided (" + storageAuditReasonListingFailed + "): " + refusal
+			result.addIssue(pending.conflict+undecided, pending.brief+undecided)
+			continue
+		case refusal != "":
 			result.addConflict(pending.conflict+"; not accepted as a move because "+refusal, pending.brief+"; not a move: "+refusal)
 			continue
 		}
@@ -104,7 +124,9 @@ func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAll
 
 // storageAuditObservedSharedMove decides whether a VM sighted on a node its
 // record does not name was moved there on shared storage. It returns the
-// accepted move, or the reason the mismatch stays a conflict.
+// accepted move, or the reason the mismatch stays a conflict. The third
+// result is true when the only reason is a failed listing, which leaves the
+// move undecided.
 //
 // It accepts only a returned or adopted record whose active attempt targets
 // this VMID, whose marker was sighted exactly once in a complete VM scan, and
@@ -114,35 +136,35 @@ func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAll
 // the active attempt recorded, must sit on storage that is shared now, was
 // shared and had the same backing when the owning plan was frozen, is
 // available on the new node, and listed that volume there in this audit.
-func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) (StorageAllocationMove, string) {
+func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) (StorageAllocationMove, string, bool) {
 	if !result.VMScanComplete {
-		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden"
+		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden", false
 	}
 	record, found := index.byID[evidence.AllocationID]
 	if !found || record.Kind != "vm" || record.Namespace != index.namespace {
-		return StorageAllocationMove{}, "no VM record of this namespace owns the allocation"
+		return StorageAllocationMove{}, "no VM record of this namespace owns the allocation", false
 	}
 	if record.State != aj.ReadyToReturn && record.State != aj.Adopted && !storageAuditDeletionKeepsMove(record, evidence) {
-		return StorageAllocationMove{}, fmt.Sprintf("the record is in state %s, not ready_to_return or adopted", record.State)
+		return StorageAllocationMove{}, fmt.Sprintf("the record is in state %s, not ready_to_return or adopted", record.State), false
 	}
 	recorded := storageAuditActiveVMNodes(record, evidence.VMID)
 	if len(recorded) == 0 {
-		return StorageAllocationMove{}, fmt.Sprintf("VM %d is not a target of the record's active attempt", evidence.VMID)
+		return StorageAllocationMove{}, fmt.Sprintf("VM %d is not a target of the record's active attempt", evidence.VMID), false
 	}
 	if sightings := storageAuditMarkerSightings(result, record.ID); sightings != 1 {
-		return StorageAllocationMove{}, fmt.Sprintf("the allocation marker was sighted %d times", sightings)
+		return StorageAllocationMove{}, fmt.Sprintf("the allocation marker was sighted %d times", sightings), false
 	}
 	digest := sha256.Sum256([]byte(record.AgentID))
 	if evidence.AgentSHA256 != hex.EncodeToString(digest[:]) {
-		return StorageAllocationMove{}, "the VM carries a different agent digest"
+		return StorageAllocationMove{}, "the VM carries a different agent digest", false
 	}
 	vm, refusal := storageAuditHolder(result, evidence.Node, evidence.VMID)
 	if refusal != "" {
-		return StorageAllocationMove{}, refusal
+		return StorageAllocationMove{}, refusal, false
 	}
 	plan, err := activeStorageAllocationPlan(record)
 	if err != nil {
-		return StorageAllocationMove{}, "the record's plan could not be decoded"
+		return StorageAllocationMove{}, "the record's plan could not be decoded", false
 	}
 	// Every volume maps to the backing its owner froze. Config volumes need a
 	// journal owner; other held volumes fall back to the VM's own plan.
@@ -150,13 +172,13 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 	for _, volume := range storageAuditSortedValues(vm.volumes) {
 		frozen, owned := storageAuditConfigVolumeOwner(index, record, plan, vm, volume)
 		if !owned {
-			return StorageAllocationMove{}, fmt.Sprintf("volume %s is owned by no journal record of this VM", volume)
+			return StorageAllocationMove{}, fmt.Sprintf("volume %s is owned by no journal record of this VM", volume), false
 		}
 		held[volume] = frozen
 	}
 	extra, refusal := storageAuditSnapshotVolumes(ctx, deps, vm)
 	if refusal != "" {
-		return StorageAllocationMove{}, refusal
+		return StorageAllocationMove{}, refusal, false
 	}
 	if vm.hasVMState {
 		extra = append(extra, vm.vmstate)
@@ -177,12 +199,23 @@ func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *Stor
 		volumes = append(volumes, volume)
 	}
 	sort.Strings(volumes)
+	// A volume that fails a condition the audit did read refuses the move,
+	// even when the listing of another volume failed.
+	unlisted := ""
 	for _, volume := range volumes {
-		if refusal := storageAuditSharedVolumeRefusal(result, index, evidence.Node, volume, held[volume]); refusal != "" {
-			return StorageAllocationMove{}, refusal
+		refusal, failed := storageAuditSharedVolumeRefusal(result, index, evidence.Node, volume, held[volume])
+		switch {
+		case refusal == "":
+		case !failed:
+			return StorageAllocationMove{}, refusal, false
+		case unlisted == "":
+			unlisted = refusal
 		}
 	}
-	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, ""
+	if unlisted != "" {
+		return StorageAllocationMove{}, unlisted, true
+	}
+	return StorageAllocationMove{AllocationID: record.ID, Kind: "vm", VMID: evidence.VMID, RecordedNodes: recorded, ObservedNode: evidence.Node, Volumes: volumes}, "", false
 }
 
 // storageAuditDeletionKeepsMove reports whether a record that delete or an
@@ -205,65 +238,73 @@ func storageAuditDeletionKeepsMove(record aj.Record, evidence StorageAllocationE
 // both current disk provenance and parked disks. The holder must be sighted
 // exactly once in a complete VM scan and still hold the volume, and the volume
 // must meet the same storage conditions as a moved VM's volumes, measured
-// against the backing the disk record froze.
-func storageAuditObservedSharedDiskMove(result *StorageAllocationAudit, index storageAuditMoveIndex, pending storageAuditPendingMove) (StorageAllocationMove, string) {
+// against the backing the disk record froze. Like the VM rule, its third
+// result is true when only a failed listing stands in the way.
+func storageAuditObservedSharedDiskMove(result *StorageAllocationAudit, index storageAuditMoveIndex, pending storageAuditPendingMove) (StorageAllocationMove, string, bool) {
 	evidence := pending.evidence
 	if !result.VMScanComplete {
-		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden"
+		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden", false
 	}
 	vm, refusal := storageAuditHolder(result, evidence.Node, evidence.VMID)
 	if refusal != "" {
-		return StorageAllocationMove{}, refusal
+		return StorageAllocationMove{}, refusal, false
 	}
 	if !slices.Contains(storageAuditSortedValues(vm.volumes), evidence.VolumeID) {
-		return StorageAllocationMove{}, fmt.Sprintf("VM %d does not hold volume %s in its configuration", evidence.VMID, evidence.VolumeID)
+		return StorageAllocationMove{}, fmt.Sprintf("VM %d does not hold volume %s in its configuration", evidence.VMID, evidence.VolumeID), false
 	}
 	record, found := index.byID[evidence.AllocationID]
 	if !found || record.Kind != allocationKindDisk || record.Namespace != index.namespace {
-		return StorageAllocationMove{}, "no disk record of this namespace owns the allocation"
+		return StorageAllocationMove{}, "no disk record of this namespace owns the allocation", false
 	}
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
-		return StorageAllocationMove{}, fmt.Sprintf("the disk record is in state %s", record.State)
+		return StorageAllocationMove{}, fmt.Sprintf("the disk record is in state %s", record.State), false
 	}
 	frozen := storageAuditDiskFrozen(record, evidence.VolumeID)
-	if refusal := storageAuditSharedVolumeRefusal(result, index, evidence.Node, evidence.VolumeID, frozen); refusal != "" {
-		return StorageAllocationMove{}, refusal
+	if refusal, failed := storageAuditSharedVolumeRefusal(result, index, evidence.Node, evidence.VolumeID, frozen); refusal != "" {
+		return StorageAllocationMove{}, refusal, failed
 	}
-	return StorageAllocationMove{AllocationID: record.ID, Kind: pending.kind, VMID: evidence.VMID, RecordedNodes: []string{pending.recorded}, ObservedNode: evidence.Node, Volumes: []string{evidence.VolumeID}}, ""
+	return StorageAllocationMove{AllocationID: record.ID, Kind: pending.kind, VMID: evidence.VMID, RecordedNodes: []string{pending.recorded}, ObservedNode: evidence.Node, Volumes: []string{evidence.VolumeID}}, "", false
 }
 
 // storageAuditSharedVolumeRefusal returns why volume on node fails the
 // shared-storage conditions, or "" when it meets all of them. A successful
 // listing is not proof on its own, because an unmounted dir storage lists
-// the empty directory beneath it, so the volume itself must be listed.
-func storageAuditSharedVolumeRefusal(result *StorageAllocationAudit, index storageAuditMoveIndex, node, volume string, frozen storageAuditFrozen) string {
+// the empty directory beneath it, so the volume itself must be listed. A
+// listing that failed proves neither presence nor absence, so its reason
+// comes back with true, and only after every condition the audit could read
+// has passed.
+func storageAuditSharedVolumeRefusal(result *StorageAllocationAudit, index storageAuditMoveIndex, node, volume string, frozen storageAuditFrozen) (string, bool) {
 	storage, _, err := pve.ParseDiskCID(volume)
 	if err != nil {
-		return fmt.Sprintf("volume %s names no storage", volume)
+		return fmt.Sprintf("volume %s names no storage", volume), false
 	}
 	current, defined := index.stores[storage]
 	if !defined {
-		return fmt.Sprintf("storage %q of volume %s is not defined", storage, volume)
+		return fmt.Sprintf("storage %q of volume %s is not defined", storage, volume), false
 	}
 	if !current.IsShared() {
-		return fmt.Sprintf("volume %s is node-local", volume)
+		return fmt.Sprintf("volume %s is node-local", volume), false
 	}
 	if !frozen.found {
-		return fmt.Sprintf("the owning record froze no definition of storage %q for volume %s", storage, volume)
+		return fmt.Sprintf("the owning record froze no definition of storage %q for volume %s", storage, volume), false
 	}
 	if !frozen.shared {
-		return fmt.Sprintf("storage %q of volume %s was node-local when its plan was frozen", storage, volume)
+		return fmt.Sprintf("storage %q of volume %s was node-local when its plan was frozen", storage, volume), false
 	}
 	if frozen.backing == "" || current.BackingKey() != frozen.backing {
-		return fmt.Sprintf("the backing of storage %q changed since the plan for volume %s was frozen", storage, volume)
+		return fmt.Sprintf("the backing of storage %q changed since the plan for volume %s was frozen", storage, volume), false
 	}
 	if len(current.Nodes) > 0 && !slices.Contains(current.Nodes, node) {
-		return fmt.Sprintf("storage %q of volume %s is not available on %s", storage, volume, node)
+		return fmt.Sprintf("storage %q of volume %s is not available on %s", storage, volume, node), false
 	}
-	if !result.listed[storageAuditTarget{node: node, storage: storage}][volume] {
-		return fmt.Sprintf("volume %s was not listed on storage %q on %s", volume, storage, node)
+	target := storageAuditTarget{node: node, storage: storage}
+	if result.unread[target] {
+		return fmt.Sprintf("storage %q on %s could not be listed, so volume %s is unproven there", storage, node, volume), true
 	}
-	return ""
+	if !result.listed[target][volume] {
+		return fmt.Sprintf("volume %s was not listed on storage %q on %s", volume, storage, node), false
+	}
+	return "", false
 }
 
 // storageAuditActiveVMNodes returns the sorted nodes the record's active

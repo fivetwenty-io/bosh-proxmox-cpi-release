@@ -14,6 +14,11 @@ import (
 
 const diskAllocationsKey = "bosh_disk_allocations"
 
+// maxPVENodeNameLength caps the node a disk's provenance names. PVE names a
+// node for its host, and a hostname label holds at most 63 bytes (RFC 1035),
+// so a longer value in a VM's Notes names no node and is malformed.
+const maxPVENodeNameLength = 63
+
 // DiskAllocationProvenance corroborates one managed disk's current location.
 // Neither this marker nor its stable token authorizes deletion without the full
 // journal, cluster identity, and actual resource ownership checks.
@@ -27,7 +32,7 @@ type DiskAllocationProvenance struct {
 }
 
 func validateDiskAllocationProvenance(p DiskAllocationProvenance) error {
-	if p.Version != 1 || !allocationUUID.MatchString(p.AllocationID) || p.AllocationNamespace == "" || strings.TrimSpace(p.AllocationNamespace) != p.AllocationNamespace || len(p.AllocationNamespace) > 1024 || strings.ContainsAny(p.AllocationNamespace, "/\\\x00\r\n") || p.AllocationNamespace == "." || p.AllocationNamespace == ".." || p.Node == "" || p.Backing == "" {
+	if p.Version != 1 || !allocationUUID.MatchString(p.AllocationID) || p.AllocationNamespace == "" || strings.TrimSpace(p.AllocationNamespace) != p.AllocationNamespace || len(p.AllocationNamespace) > 1024 || strings.ContainsAny(p.AllocationNamespace, "/\\\x00\r\n") || p.AllocationNamespace == "." || p.AllocationNamespace == ".." || p.Node == "" || len(p.Node) > maxPVENodeNameLength || p.Backing == "" {
 		return fmt.Errorf("invalid managed disk provenance")
 	}
 	if _, _, err := ParseDiskCID(p.Volid); err != nil {

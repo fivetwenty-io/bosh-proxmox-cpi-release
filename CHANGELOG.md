@@ -92,6 +92,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - A request that ends while a parker window has protection off, because `pve.operation_timeout` fired or the CPI process was told to stop, now still puts protection back for a journal-managed disk. The allocation journal refused that restore once the request had ended, so the parker stayed unprotected until the next window on it, and the error said the operation was already uncertain.
 
+- A storage listing that fails on the node a moved VM now runs on no longer blocks `create_vm` and `create_disk`. The audit read that failure as a missing volume and refused the move with `was not listed on storage`, which is the same text it gives a volume that is really gone. So one listing that timed out, or that answered that its storage was not online, could stop every create in the namespace. A failed listing proves nothing either way, so the move now stays undecided. Instead of a conflict, the audit raises an issue that ends in `move undecided (listing_failed)`. That issue keeps `delete_vm` and `delete_disk` refused until a later audit can read the listing, and the audit accepts no move in the meantime. When the listing succeeds and the volume is missing from it, the audit still refuses the move. The audit also puts a limit on the provenance node it copies into `observed_moves` and the evidence it retains. A node longer than the 63 bytes a PVE node name can hold is now malformed provenance, and the audit reports it the way it reports any other provenance it cannot parse.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added
