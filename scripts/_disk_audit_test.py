@@ -678,7 +678,9 @@ class TestStepEightReadsSoftly(unittest.TestCase):
         if url.endswith("/nodes/pve1/storage"):
             return _FakeResponse([])
         if url.endswith("/nodes/pve1/qemu/777/config"):
-            raise urllib.error.HTTPError(url, 500, "Internal Server Error", None, None)
+            err = urllib.error.HTTPError(url, 500, "Internal Server Error", None, None)
+            self.addCleanup(err.close)
+            raise err
         if url.endswith("/nodes/pve2/qemu/778/config"):
             raise urllib.error.URLError("No route to host")
         if url.endswith("/qemu/779/config"):
