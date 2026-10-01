@@ -70,6 +70,33 @@ func TestDiskAllocationLifecycleRejectsAmbiguousEvidence(t *testing.T) {
 		}
 	}
 }
+
+// TestDiskAllocationProvenanceRefusesANodeLongerThanPVEAllows pins the bound
+// on the provenance node. PVE names a node for its host, and a hostname label
+// holds at most 63 bytes, so a longer node is malformed in a current entry
+// and in a parked one.
+func TestDiskAllocationProvenanceRefusesANodeLongerThanPVEAllows(t *testing.T) {
+	longest := lifecycleEntry()
+	longest.Node = strings.Repeat("n", 63)
+	b, _ := json.Marshal(longest)
+	if _, err := ParseDiskAllocationProvenance(`<!--BOSH:{"bosh_disk_allocations":{"token":` + string(b) + `}}-->`); err != nil {
+		t.Fatalf("63-byte node refused: %v", err)
+	}
+	overlong := lifecycleEntry()
+	overlong.Node = strings.Repeat("n", 64)
+	b, _ = json.Marshal(overlong)
+	if _, err := ParseDiskAllocationProvenance(`<!--BOSH:{"bosh_disk_allocations":{"token":` + string(b) + `}}-->`); err == nil || err.Error() != "invalid managed disk provenance" {
+		t.Fatalf("64-byte node: err = %v, want invalid managed disk provenance", err)
+	}
+	if err := WriteDiskAllocationProvenance(context.Background(), newScanFakeClient(map[int]map[string]any{100: {"description": ""}}), "node-a", 100, "token", overlong); err == nil {
+		t.Fatal("a 64-byte node was written")
+	}
+	parked, _ := json.Marshal(map[string]any{"token": map[string]any{"allocation_id": overlong.AllocationID, "allocation_namespace": overlong.AllocationNamespace, "allocation_backing": overlong.Backing, "volid": overlong.Volid, "node": overlong.Node}})
+	if _, _, err := FindDiskAllocationProvenance(`<!--BOSH:{"bosh_parked_disks":`+string(parked)+`}-->`, "token"); err == nil || err.Error() != "malformed parked allocation provenance" {
+		t.Fatalf("parked 64-byte node: err = %v, want malformed parked allocation provenance", err)
+	}
+}
+
 func TestDiskAllocationLifecycleLegacyAttachedMapIsUnmanaged(t *testing.T) {
 	_, ok, err := FindDiskAllocationProvenance(`<!--BOSH:{"bosh_attached_disks":{"token":"cid"}}-->`, "token")
 	if err != nil || ok {

@@ -60,14 +60,19 @@ type StorageAllocationAudit struct {
 	// storage. An accepted move raises no conflict. The audit decides every
 	// move afresh on each call and never records one in the journal.
 	ObservedMoves []StorageAllocationMove `json:"observed_moves"`
-	// briefs maps a conflict to the short form a gate error leads with, which
-	// names the VM or volume before the allocation. It is not serialized,
-	// because the conflict itself is the durable record.
+	// briefs maps a conflict, or an issue that leaves a move undecided, to
+	// the short form a refusal leads with, which names the VM or volume
+	// before the allocation. It is not serialized, because the finding
+	// itself is the durable record.
 	briefs map[string]string
 	// listed holds the volids that each (node, storage) listing returned. A
 	// listing that failed, or that returned a malformed entry, is absent,
 	// because it cannot prove that a volume is present on that node.
 	listed map[storageAuditTarget]map[string]bool
+	// unread holds the (node, storage) listings the audit ran that failed or
+	// returned a malformed entry. Such a listing cannot prove that a volume
+	// is absent either, so a move that rests on it stays undecided.
+	unread map[storageAuditTarget]bool
 	// vms is the inventory the VM scan kept for the move rules.
 	vms []storageAuditVM
 	// pending holds the node mismatches that wait for the move rules, which
@@ -277,13 +282,25 @@ func markVMScanIncomplete(result *StorageAllocationAudit, issue string) {
 // addConflict records a conflict and the brief a gate error shows for it.
 func (r *StorageAllocationAudit) addConflict(conflict, brief string) {
 	r.Conflicts = append(r.Conflicts, conflict)
+	r.setBrief(conflict, brief)
+}
+
+// addIssue records an issue, which leaves the audit incomplete, and the brief
+// a refusal that names it shows.
+func (r *StorageAllocationAudit) addIssue(issue, brief string) {
+	r.Complete = false
+	r.Issues = append(r.Issues, issue)
+	r.setBrief(issue, brief)
+}
+
+func (r *StorageAllocationAudit) setBrief(finding, brief string) {
 	if brief == "" {
 		return
 	}
 	if r.briefs == nil {
 		r.briefs = map[string]string{}
 	}
-	r.briefs[conflict] = brief
+	r.briefs[finding] = brief
 }
 
 // brief returns the short form of a finding, or the finding itself.
@@ -1123,6 +1140,11 @@ func collectStorageAuditContent(ctx context.Context, deps Deps, targets []storag
 						result.listed = map[storageAuditTarget]map[string]bool{}
 					}
 					result.listed[target] = listed
+				} else {
+					if result.unread == nil {
+						result.unread = map[storageAuditTarget]bool{}
+					}
+					result.unread[target] = true
 				}
 				if len(issues) > 0 {
 					result.Complete = false
