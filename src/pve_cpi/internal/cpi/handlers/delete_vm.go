@@ -994,12 +994,21 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	}
 	if len(protected) > 0 {
 		return cpierrors.Cloud(
-			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve.disk_storage configuration)",
-			vmCID, protected,
+			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve.disk_storage configuration; "+
+				"if detach_disk succeeds and the slot stays, do not remove the slot or destroy the VM by hand, because PVE then deletes a volume named for the VM; %s)",
+			vmCID, protected, unusedSlotRecoveryRunbook,
 		)
 	}
 	return nil
 }
+
+// unusedSlotRecoveryRunbook points the unused-slot refusal at the recovery for
+// a stable-ID disk whose transfer to a parker stopped after its slot was
+// deleted. Such a disk sits on an unused entry with no serial, so detach_disk
+// can report success without finding it, and the obvious manual fix frees it.
+// The docs do not ship in the release, so it names the repository as well as
+// the file, and a test pins the heading it quotes.
+const unusedSlotRecoveryRunbook = `see "delete_vm refuses to destroy VM with attached unused disks" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
 
 // detachForeignActiveDisks protects persistent disks the BOSH Director attached
 // to this VM but has not yet detached (e.g. an interrupted recreate). PVE's

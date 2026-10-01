@@ -73,13 +73,14 @@ linters:
         - pattern: '\.Tasks\b'
           msg: "await tasks via pve.AwaitTask / pve.AwaitTaskWithLogger, not raw Tasks() polling"
         # The test seams shorten a poll, wait, backoff, floor, or restore
-        # deadline, switch off a file sync, or swap a step out for a fake.
+        # deadline, switch off a file sync, pin the provenance clock, or swap
+        # a step out for a fake.
         # Production code must keep the real behavior, so only tests may call
         # them; _test.go files are exempt below. The first alternative covers
         # every *ForTest seam in any package, exported or not; the rest are
         # test seams whose names do not end in ForTest.
-        - pattern: '(^|\.)(\w*ForTest|WithTestBackoff|withExplicitCleanupBeforeUnpark)$'
-          msg: "test seams are for tests only; production code keeps the real poll, wait, backoff, sync, cleanup, and restore behavior"
+        - pattern: '(^|\.)(\w*ForTest|WithTestBackoff|WithProvenanceClock|withExplicitCleanupBeforeUnpark)$'
+          msg: "test seams are for tests only; production code keeps the real poll, wait, backoff, sync, cleanup, restore, and clock behavior"
 
     gocyclo:
       min-complexity: 40
