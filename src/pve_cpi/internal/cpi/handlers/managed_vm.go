@@ -199,7 +199,7 @@ func continueManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArg
 			return nil, cpierrors.Cloud("allocation %s retains a failed attempt for operator inspection", handle.Record().ID)
 		}
 		if step.Attempt == recorded.ActiveAttempt() && step.State != aj.Observed {
-			return nil, storageAllocationUncertain(handle, "unsettled recorded mutation")
+			return nil, storageAllocationUncertain(handle, "unsettled recorded mutation; "+unsettledStepName(*step))
 		}
 	}
 
