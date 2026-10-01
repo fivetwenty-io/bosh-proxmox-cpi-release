@@ -49,6 +49,15 @@ type fakeNodesService struct {
 	// listQemuPendingFn, when set, answers the pending endpoint in place of
 	// qemuConfigFn, for a fake that holds pending changes of its own.
 	listQemuPendingFn func(ctx context.Context, node string, vmid string) (*nodes.ListQemuPendingResponse, error)
+	// listQemuSnapshotConfigFn serves one snapshot's configuration.
+	listQemuSnapshotConfigFn func(ctx context.Context, node, vmid, snapname string) (*nodes.ListQemuSnapshotConfigResponse, error)
+}
+
+func (f *fakeNodesService) ListQemuSnapshotConfig(ctx context.Context, node, vmid, snapname string) (*nodes.ListQemuSnapshotConfigResponse, error) {
+	if f.listQemuSnapshotConfigFn != nil {
+		return f.listQemuSnapshotConfigFn(ctx, node, vmid, snapname)
+	}
+	panic("fakeNodesService: ListQemuSnapshotConfig not wired")
 }
 
 func (f *fakeNodesService) CreateQemuMoveDisk(ctx context.Context, node string, vmid string, params *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {

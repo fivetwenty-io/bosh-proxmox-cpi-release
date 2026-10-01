@@ -153,3 +153,46 @@ func WaitForSnapshotAbsent(
 		}
 	}
 }
+
+// refuseSnapshotNamingVolume refuses a config-edit park of volid while a
+// snapshot of the source VM still names it. PVE's move_disk refuses an owned
+// volume in that case, because is_volume_in_use reads every snapshot section
+// as well as the current config, but a config-edit attach has no such check.
+// Without this one, the parker would take a volume that a rollback of the
+// snapshot puts back on the source as a second reference.
+//
+// The refusal wraps ErrMoveDiskSnapshotRefused, so IsMoveDiskSnapshotRefusal
+// reports it and every caller treats it as the deferred park it already knows
+// for an owned volume. Snapshots that don't name the volume don't block the
+// park. A source that's gone has no snapshots. Any other read error refuses
+// too, as a plain retriable error rather than a snapshot refusal, whatever
+// require_snapshot_check_pass says, because going ahead without an answer
+// risks a second reference.
+func refuseSnapshotNamingVolume(ctx context.Context, c Client, node string, vmid int, volid string) error {
+	names, err := HasSnapshots(ctx, c, node, vmid)
+	if err != nil {
+		if parkerConfigGone(err) {
+			return nil
+		}
+		return cpierrors.Retriable("transfer in: could not list the snapshots of source vm %d before parking %q, so nothing was attached: %s",
+			vmid, volid, err.Error())
+	}
+	for _, name := range names {
+		cfg, cfgErr := SnapshotConfig(ctx, c, node, vmid, name)
+		if cfgErr != nil {
+			return cpierrors.Retriable("transfer in: could not read snapshot %q of source vm %d before parking %q, so nothing was attached: %s",
+				name, vmid, volid, cfgErr.Error())
+		}
+		for key, value := range cfg {
+			if !isQemuDiskKey(key) && key != "vmstate" {
+				continue
+			}
+			text, ok := ConfigStringValue(value)
+			if ok && bareDriveVolid(text) == volid {
+				return fmt.Errorf("transfer in: snapshot %q of source vm %d names %q on %s, so the park waits until that snapshot is deleted: %w",
+					name, vmid, volid, key, ErrMoveDiskSnapshotRefused)
+			}
+		}
+	}
+	return nil
+}

@@ -5,7 +5,9 @@ package handlers
 // slot, PVE keeps the owned volume as an unused entry, the move fails, and
 // before 0.9.0 the parker's transfer record was collected an hour later. These
 // tests build that state through the real handlers with PVE-faithful
-// demotion, then remove the record the way an earlier release did.
+// demotion, then remove the record the way an earlier release did. A birth
+// name the guest doesn't own leaves no unused entry, and its transfer stops
+// only when the parker attach after the slot delete fails.
 
 import (
 	"context"
@@ -33,10 +35,11 @@ const strandedRunbookPointer = `see "delete_disk refuses a disk stranded on an u
 
 // buildBirthStrand strands one legacy stable-ID disk on guest 777 through the
 // real detach_disk, with PVE-faithful demotion. owner is the VMID the disk's
-// birth name carries: 777 is the owned birth shape, and any other VMID gives
-// PVE no reason to keep an unused entry. With keepRecord false the parker's
-// transfer record is removed afterwards, the way 0.5.1 through 0.8.0
-// collected it.
+// birth name carries: 777 is the owned birth shape, whose move fails, and any
+// other VMID gives PVE no reason to keep an unused entry, so the transfer
+// takes the config-edit attach, and that attach fails instead. With
+// keepRecord false the parker's transfer record is removed afterwards, the way
+// 0.5.1 through 0.8.0 collected it.
 func buildBirthStrand(t *testing.T, owner int, local, keepRecord bool) *strandedDisk {
 	t.Helper()
 	deps, client, journal, _, _ := lifecycleFlowFixture(t)
@@ -73,11 +76,15 @@ func buildBirthStrand(t *testing.T, owner int, local, keepRecord bool) *stranded
 	client.state.configs[777]["scsi1"] = birth + ",serial=" + token + ",size=5G"
 	s := &strandedDisk{deps: deps, client: client, recorder: recorder, journal: journal, cid: cid, token: token}
 
-	client.moveErr = errors.New("move_disk: storage migration failed")
-	if err := detachDiskAt(t, context.Background(), deps, "777", cid); err == nil {
-		t.Fatal("the transfer whose move fails reported success")
+	if owner == 777 {
+		client.moveErr = errors.New("move_disk: storage migration failed")
+	} else {
+		client.state.parkErr = errors.New("parker attach failed")
 	}
-	client.moveErr = nil
+	if err := detachDiskAt(t, context.Background(), deps, "777", cid); err == nil {
+		t.Fatal("the transfer whose last step fails reported success")
+	}
+	client.moveErr, client.state.parkErr = nil, nil
 	for _, volume := range pve.FindUnusedDiskEntries(client.state.configs[777]) {
 		s.stranded = volume
 	}

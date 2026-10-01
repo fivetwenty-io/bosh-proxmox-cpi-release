@@ -65,6 +65,10 @@ type scanFakeClient struct {
 	// pendingErrOnce fails the next pending read of each listed VM with its
 	// error, and only that read.
 	pendingErrOnce map[int]error
+	// snapshots holds, per VM, each snapshot's configuration by name, and
+	// snapshotErr fails every snapshot listing and configuration read.
+	snapshots   map[int]map[string]map[string]any
+	snapshotErr error
 	// revertErr, when set, fails every revert, and revertKeepsPending makes
 	// every revert succeed without dropping the pending delete.
 	revertErr          error
@@ -107,6 +111,18 @@ func (c *scanFakeClient) renameFor(target int, oldVolid string) string {
 
 func (c *scanFakeClient) QEMU() qemu.Service {
 	return &fakeQEMUService{
+		listSnapshotsFn: func(_ context.Context, _ string, vmid int) ([]map[string]any, error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.snapshotErr != nil {
+				return nil, c.snapshotErr
+			}
+			out := []map[string]any{{"name": "current"}}
+			for name := range c.snapshots[vmid] {
+				out = append(out, map[string]any{"name": name})
+			}
+			return out, nil
+		},
 		configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
@@ -175,6 +191,24 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 
 func (c *scanFakeClient) Nodes() sdknodes.Service {
 	return &fakeNodesService{
+		listQemuSnapshotConfigFn: func(_ context.Context, _, vmidText, name string) (*sdknodes.ListQemuSnapshotConfigResponse, error) {
+			vmid, _ := strconv.Atoi(vmidText)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.snapshotErr != nil {
+				return nil, c.snapshotErr
+			}
+			cfg, ok := c.snapshots[vmid][name]
+			if !ok {
+				return nil, fmt.Errorf("fake: vm %d has no snapshot %q", vmid, name)
+			}
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				return nil, err
+			}
+			resp := sdknodes.ListQemuSnapshotConfigResponse(raw)
+			return &resp, nil
+		},
 		updateQemuConfigFn:   c.updateQemuConfig,
 		createQemuMoveDiskFn: c.createQemuMoveDisk,
 		qemuConfigFn:         c.QEMU().Config,

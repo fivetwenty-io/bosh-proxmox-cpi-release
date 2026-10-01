@@ -55,6 +55,10 @@ type lifecycleFlowPVE struct {
 	// vmSnapshots, when set, answers ListSnapshots per VM instead of
 	// snapshots, which every VM shares.
 	vmSnapshots map[int][]map[string]any
+	// snapshotConfigs serves each snapshot's configuration per VM and name,
+	// and snapshotErr fails every snapshot listing and configuration read.
+	snapshotConfigs map[int]map[string]map[string]any
+	snapshotErr     error
 	// pending, when set, is PVE's pending section. A slot delete on a
 	// running VM whose hotplug setting lacks disk stays pending, one whose
 	// guest holds the device stays pending and fails busy, and a revert drops
@@ -115,6 +119,28 @@ func (n lifecycleFlowNodes) ListStorageContent(ctx context.Context, node, pool s
 	return &local, nil
 }
 
+// ListQemuSnapshotConfig serves a snapshot's configuration from
+// snapshotConfigs.
+func (n lifecycleFlowNodes) ListQemuSnapshotConfig(_ context.Context, _, vmidText, name string) (*nodes.ListQemuSnapshotConfigResponse, error) {
+	if n.c.snapshotErr != nil {
+		return nil, n.c.snapshotErr
+	}
+	vmid, err := strconv.Atoi(vmidText)
+	if err != nil {
+		return nil, err
+	}
+	cfg, ok := n.c.snapshotConfigs[vmid][name]
+	if !ok {
+		return nil, fmt.Errorf("flow fake: vm %d has no snapshot %q", vmid, name)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	resp := nodes.ListQemuSnapshotConfigResponse(raw)
+	return &resp, nil
+}
+
 func (n lifecycleFlowNodes) ListCertificatesInfo(context.Context, string) (*nodes.ListCertificatesInfoResponse, error) {
 	raw, _ := json.Marshal(map[string]any{"filename": "pve-root-ca.pem", "fingerprint": strings.TrimSuffix(strings.Repeat("11:", 32), ":")})
 	r := nodes.ListCertificatesInfoResponse{raw}
@@ -172,6 +198,9 @@ func (c *lifecycleFlowPVE) dropUnusedEntries(vmid int, value string) {
 }
 
 func (q lifecycleFlowQEMU) ListSnapshots(_ context.Context, _ string, vmid int) ([]map[string]any, error) {
+	if q.c.snapshotErr != nil {
+		return nil, q.c.snapshotErr
+	}
 	if q.c.vmSnapshots != nil {
 		return q.c.vmSnapshots[vmid], nil
 	}

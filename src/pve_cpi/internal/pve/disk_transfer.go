@@ -9,7 +9,10 @@
 // source VM refuses direct reassignment, so the detach direction (VM →
 // parker) detaches the slot to an unusedN entry first and reassigns that;
 // unused entries carry no options, so the serial is re-applied on the landed
-// parker slot afterwards. The crash window that opens between those steps is
+// parker slot afterwards. PVE keeps that unused entry only for a volume the
+// source owns, so a volume named for any other VMID loses its last reference
+// with the slot delete, and the parker takes it by config edit instead, under
+// the name it already has. The crash window that opens between those steps is
 // covered by write ordering: the receiving parker's provenance record (the
 // intent) is written BEFORE the source slot is deleted, so a scan always
 // finds at least one identity carrier.
@@ -443,7 +446,7 @@ func transferIntoParker(
 	return landed, lockErr
 }
 
-//nolint:gocognit // Sequential transfer protocol: slot choice, intent, detach, demote-find, move, serial, finalize. The step count is the protocol; splitting it would scatter the ordering the crash-window analysis depends on.
+//nolint:gocognit // Sequential transfer protocol: slot choice, intent, detach, the branch on what PVE left, finalize. The step count is the protocol; splitting it would scatter the ordering the crash-window analysis depends on.
 func transferIntoParkerLocked(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID, srcVMID int, bareVolid string,
@@ -496,9 +499,14 @@ func transferIntoParkerLocked(
 	}
 	srcCfg := srcViews.Applied()
 
-	// 4. Find the unusedN entry PVE demoted the volume to. Absent on both the
-	// active bus and the unused keys means another actor moved it mid-window;
-	// hand it back retriable so the caller re-resolves.
+	// 4. Branch on what PVE left, never on a prediction of ownership. PVE
+	// keeps an unused entry for a deleted slot only when the VM owns the
+	// volume (vm_is_volid_owner in qemu-server's
+	// vmconfig_register_unused_drive), so an unused entry that names the
+	// volume means the move path. When neither view names the volume
+	// anywhere, PVE let the reference go, and the parker takes the volume by
+	// config edit. Any other key that still names it means something else
+	// holds the volume, and the caller re-resolves.
 	unusedKey := ""
 	for key, volid := range FindUnusedDiskEntries(srcCfg) {
 		if volid == bareVolid {
@@ -506,38 +514,19 @@ func transferIntoParkerLocked(
 			break
 		}
 	}
+	var landed string
 	if unusedKey == "" {
-		return "", cpierrors.Retriable(
-			"transfer in: volume %q is on neither an active nor an unused slot of source vm %d after detach; re-resolve and retry",
-			bareVolid, srcVMID)
-	}
-
-	// 5. Reassign the unused entry to the parker slot. The parker's
-	// protection flag does not block receiving a disk (an add, not a remove).
-	if moveErr := moveDiskToVM(ctx, c, logger, node, srcVMID, unusedKey, parkerVMID, slot); moveErr != nil {
-		return "", moveErr
-	}
-
-	// 6. The unused-entry path drops all drive options (live-spike result);
-	// read the landed volid and re-apply the serial at this attach boundary.
-	landedCfg, landedErr := c.QEMU().Config(ctx, node, parkerVMID)
-	if landedErr != nil {
-		return "", cpierrors.Wrap(WrapConfigReadError(landedErr),
-			fmt.Sprintf("transfer in: config read for parker vmid %d after move", parkerVMID))
-	}
-	landed, ok := slotBareVolid(landedCfg, slot)
-	if !ok {
-		return "", cpierrors.Retriable(
-			"transfer in: move_disk reported success but parker vmid %d slot %s is empty; retry",
-			parkerVMID, slot)
-	}
-	serialErr := RetryOnTransientOrLock(ctx, logger, "disk_transfer_serial", parkerWindowMaxAttempts, func() error {
-		_, err := c.QEMU().AttachDisk(ctx, node, parkerVMID, landed+",serial="+pctx.StableID, "scsi", &qemu.AttachOpts{DiskID: slot})
-		return err
-	})
-	if serialErr != nil {
-		return "", cpierrors.Wrap(WrapMutationError(serialErr),
-			fmt.Sprintf("transfer in: re-apply serial on parker vmid %d slot %s", parkerVMID, slot))
+		attached, attachErr := attachReleasedSourceVolume(ctx, c, logger, node, parkerVMID, srcVMID, bareVolid, pctx.StableID, srcViews)
+		if attachErr != nil {
+			return "", attachErr
+		}
+		slot, landed = attached, bareVolid
+	} else {
+		moved, moveErr := moveUnusedEntryToParker(ctx, c, logger, node, srcVMID, unusedKey, parkerVMID, slot, pctx.StableID)
+		if moveErr != nil {
+			return "", moveErr
+		}
+		landed = moved
 	}
 
 	// 7. Finalize the landed volume identity. Managed disks require durable
@@ -545,6 +534,7 @@ func transferIntoParkerLocked(
 	// Legacy disks retain their serial-based best-effort behavior.
 	final := intent
 	final.Volid = landed
+	final.Slot = slot
 	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil {
 		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
 			return "", cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
@@ -569,6 +559,69 @@ func transferIntoParkerLocked(
 		)
 	}
 	return landed, nil
+}
+
+// moveUnusedEntryToParker is the move path, steps 5 and 6 of the transfer. It
+// reassigns the unused entry PVE kept on the source to the parker slot, reads
+// the landed volid, and re-applies the serial, which the unused-entry move
+// drops along with every other drive option (live-spike result). The parker's
+// protection flag doesn't block receiving a disk, because that's an add, not a
+// remove.
+func moveUnusedEntryToParker(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, srcVMID int, unusedKey string, parkerVMID int, slot, stableID string,
+) (string, error) {
+	if moveErr := moveDiskToVM(ctx, c, logger, node, srcVMID, unusedKey, parkerVMID, slot); moveErr != nil {
+		return "", moveErr
+	}
+	landedCfg, landedErr := c.QEMU().Config(ctx, node, parkerVMID)
+	if landedErr != nil {
+		return "", cpierrors.Wrap(WrapConfigReadError(landedErr),
+			fmt.Sprintf("transfer in: config read for parker vmid %d after move", parkerVMID))
+	}
+	landed, ok := slotBareVolid(landedCfg, slot)
+	if !ok {
+		return "", cpierrors.Retriable(
+			"transfer in: move_disk reported success but parker vmid %d slot %s is empty; retry",
+			parkerVMID, slot)
+	}
+	serialErr := RetryOnTransientOrLock(ctx, logger, "disk_transfer_serial", parkerWindowMaxAttempts, func() error {
+		_, err := c.QEMU().AttachDisk(ctx, node, parkerVMID, landed+",serial="+stableID, "scsi", &qemu.AttachOpts{DiskID: slot})
+		return err
+	})
+	if serialErr != nil {
+		return "", cpierrors.Wrap(WrapMutationError(serialErr),
+			fmt.Sprintf("transfer in: re-apply serial on parker vmid %d slot %s", parkerVMID, slot))
+	}
+	return landed, nil
+}
+
+// attachReleasedSourceVolume is the transfer's path for a volume the source
+// doesn't own. After the slot delete, PVE kept no unused entry, so no key of
+// the source names the volume, and the parker takes it by the same config-edit
+// attach the resume's released-source window uses, with the serial baked in.
+// The volume keeps the name it was created with, so the parker doesn't own it
+// either, and nothing PVE does to either VM frees it.
+//
+// A key that still names the volume in either view is something other than
+// the slot this transfer deleted, so it attaches nothing and hands back a
+// retriable error for the caller to re-resolve. A snapshot of the source that
+// still names the volume defers the park the way PVE's move refusal does for
+// an owned volume, because a rollback of that snapshot would put the volume
+// back on the source as a second reference.
+func attachReleasedSourceVolume(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, parkerVMID, srcVMID int, bareVolid, stableID string, srcViews QemuViews,
+) (string, error) {
+	if keys := srcViews.SlotsNaming(bareVolid); len(keys) > 0 {
+		return "", cpierrors.Retriable(
+			"transfer in: source vm %d still names %q on %s after its slot delete; re-resolve and retry",
+			srcVMID, bareVolid, strings.Join(keys, ", "))
+	}
+	if err := refuseSnapshotNamingVolume(ctx, c, node, srcVMID, bareVolid); err != nil {
+		return "", err
+	}
+	return attachToParkerLocked(ctx, c, logger, node, parkerVMID, bareVolid, stableID)
 }
 
 // ResumeDiskTransferToParker completes a detach-side transfer a crash left
@@ -722,6 +775,14 @@ func ResumeDiskTransferToParker(
 				sourceReleased = !srcViews.NamesVolume(intent.Volid)
 			}
 			if sourceReleased {
+				// A snapshot of a source that still exists can name the volume
+				// and would put it back on the source if rolled back, so the
+				// park waits for it, whichever release left the intent.
+				if srcErr == nil {
+					if snapErr := refuseSnapshotNamingVolume(wctx, c, intent.ParkerNode, srcVMID, intent.Volid); snapErr != nil {
+						return snapErr
+					}
+				}
 				slot, attachErr := attachToParkerLocked(wctx, c, logger, intent.ParkerNode, intent.ParkerVMID, intent.Volid, stableID)
 				if attachErr != nil {
 					return attachErr
@@ -752,16 +813,15 @@ func ResumeDiskTransferToParker(
 // DriveDeletePendingReplaced for the caller to class, the same reason the slot
 // delete and the transfer give. A bus slot that still names the volid without
 // a pending delete means the detach never happened, so this isn't a resume at
-// all. The identity scan
-// should have found it, and a race between the scan and this read is the only
-// path here. A bus slot whose delete is pending was left by a crash, an
-// earlier release, or an operator, and nothing may land on the parker until
-// the VM lets go of the disk. The resume can't tell whose delete it is. On a
-// running source the guest still has the disk and the VM's next clean stop
-// applies the delete, so the resume leaves it alone and hands back the typed
-// error for the caller to class. On a stopped source nothing applies it until
-// the VM starts, so a caller whose request moves the disk off the source has
-// the resume apply it now, through applyFoundPendingDelete.
+// all. The identity scan should have found it, and a race between the scan
+// and this read is the only path here. A bus slot whose delete is pending was
+// left by a crash, an earlier release, or an operator, and nothing may land on
+// the parker until the VM lets go of the disk. The resume can't tell whose
+// delete it is. On a running source the guest still has the disk and the VM's
+// next clean stop applies the delete, so the resume leaves it alone and hands
+// back the typed error for the caller to class. On a stopped source nothing
+// applies it until the VM starts, so a caller whose request moves the disk off
+// the source has the resume apply it now, through applyFoundPendingDelete.
 func resumeSourceOffBus(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, srcVMID int, srcViews QemuViews, pctx ParkContext,

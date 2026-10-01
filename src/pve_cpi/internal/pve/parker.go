@@ -152,6 +152,15 @@ type ParkerConfig struct {
 	// one means an out-of-band deletion. Gated on ParkedEnabled: under "free"
 	// or a stood-down default the permissive behavior stands regardless.
 	AnchorStrict bool
+	// EmptyListingCorroborators supplies the second opinions the keep rule
+	// hands to ProveVolumeAbsent when it weighs whether a transfer record's
+	// volume is gone. It's the same supplier the local backend's sweep gets
+	// through WithEmptyListingCorroborators, because the keep rule runs in this
+	// package too, where it can't see the allocation journal. A nil supplier
+	// means no second opinion is available, so the keep rule never reads an
+	// empty listing as an absence and keeps the record. A listing that carries
+	// other volumes still proves an absence without one.
+	EmptyListingCorroborators func() []EmptyListingCorroborator
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +509,7 @@ func parkerProvenanceRoom(
 	// The same keep rule as the write, so the probe never counts room that a
 	// record the write keeps is still using.
 	now := provenanceNow(ctx, cfg)
-	held := parkerProvenanceSourceKeeps(ctx, c, nil, vmCfg, key, now)
+	held := parkerProvenanceSourceKeeps(ctx, c, nil, vmCfg, key, now, cfg)
 	_, _, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
 	return projectErr
 }
@@ -527,10 +536,10 @@ func writeParkerProvenance(
 	}
 
 	now := provenanceNow(ctx, cfg)
-	held := parkerProvenanceSourceKeeps(ctx, c, logger, vmCfg, key, now)
+	held := parkerProvenanceSourceKeeps(ctx, c, logger, vmCfg, key, now, cfg)
 	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
 	if len(held) > 0 && logger != nil {
-		logger.Info("parker provenance: kept stale transfer records whose source VM still holds the volume",
+		logger.Info("parker provenance: kept stale transfer records that are still the only link to their volume",
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
 			log.String("keys", strings.Join(heldKeys(held), ",")),
