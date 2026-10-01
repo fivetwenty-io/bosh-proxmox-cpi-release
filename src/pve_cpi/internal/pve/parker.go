@@ -155,14 +155,6 @@ type ParkerConfig struct {
 	AnchorStrict bool
 }
 
-// parkerNow returns the configured clock time or time.Now().UTC() when NowFunc is nil.
-func parkerNow(cfg ParkerConfig) time.Time {
-	if cfg.NowFunc != nil {
-		return cfg.NowFunc()
-	}
-	return time.Now().UTC()
-}
-
 // ---------------------------------------------------------------------------
 // Provenance sentinel codec (local to pve package — no handlers import to avoid cycle)
 // ---------------------------------------------------------------------------
@@ -281,7 +273,7 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 // provenance entry. The disk itself remains correctly attached; provenance
 // is advisory metadata for disk-audit.
 func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) {
-	entry := buildParkerProvEntry(node, bareVolid, slot, cfg, pctx)
+	entry := buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, pctx)
 	if err := writeParkerProvenance(ctx, c, logger, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg); err != nil {
 		if logger != nil {
 			logger.Warn("parker provenance: provenance not updated",
@@ -308,7 +300,7 @@ func parkerProvKey(bareVolid, stableID string) string {
 // pre-stable-ID JSON shape, which external readers (scripts/disk-audit,
 // scripts/_pve_verify.py, pve-cid) parse; those readers tolerate the
 // optional opts field, which either generation may carry.
-func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) parkerProvEntry {
+func buildParkerProvEntry(ctx context.Context, node, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) parkerProvEntry {
 	// disk_cid: prefer the full encoded CID from ParkContext (as the Director
 	// knows it); fall back to bareVolid when context is absent.
 	diskCIDField := bareVolid
@@ -321,7 +313,7 @@ func buildParkerProvEntry(node, bareVolid, slot string, cfg ParkerConfig, pctx P
 		AllocationBacking:   pctx.AllocationBacking,
 		DiskCID:             diskCIDField,
 		SourceVMCID:         pctx.SourceVMCID,
-		ParkedAt:            parkerNow(cfg).Format(time.RFC3339),
+		ParkedAt:            provenanceNow(ctx, cfg).Format(time.RFC3339),
 		Node:                node,
 		DirectorID:          cfg.DirectorID,
 	}
@@ -405,7 +397,9 @@ func provEntryVolid(key string, entry parkerProvEntry) string {
 
 // collectStaleParkerProvenance deletes from disks every record whose volume
 // nothing on the parker references and whose parked_at is older than the
-// grace window. It returns the keys it removed, for the caller's log line.
+// grace window, except the keys in held, whose source VM still names the
+// record's volume (see parkerProvenanceSourceKeeps). It returns the keys it
+// removed, for the caller's log line.
 //
 // keepKey is the record being written and is never collected — it is the
 // youngest record in the store by definition, and for a transfer intent it is
@@ -416,40 +410,29 @@ func provEntryVolid(key string, entry parkerProvEntry) string {
 // corruption rather than a young record, and corruption that also names a
 // volume nothing holds is exactly what this is here to clear.
 func collectStaleParkerProvenance(
-	disks map[string]parkerProvEntry, vmCfg map[string]any, keepKey string, now time.Time,
+	disks map[string]parkerProvEntry, vmCfg map[string]any, keepKey string, now time.Time, held map[string]bool,
 ) []string {
-	referenced := parkerReferencedVolids(vmCfg)
 	var pruned []string
-	for key := range disks {
-		entry := disks[key]
-		if key == keepKey {
+	for _, key := range staleParkerProvenanceKeys(disks, vmCfg, keepKey, now) {
+		if held[key] {
 			continue
-		}
-		if referenced[provEntryVolid(key, entry)] {
-			continue
-		}
-		if parsed, parseErr := time.Parse(time.RFC3339, entry.ParkedAt); parseErr == nil {
-			if now.Sub(parsed) < parkerProvenanceGraceWindow {
-				continue
-			}
 		}
 		delete(disks, key)
 		pruned = append(pruned, key)
 	}
-	sort.Strings(pruned)
 	return pruned
 }
 
 // projectParkerProvenance renders the description a provenance write would
-// push for vmCfg with entry added under key, applying collection first, and
-// reports the keys it collected. It returns ErrProvenanceFull when the result
-// would exceed the budget: the refusal belongs here rather than at the PUT,
-// because a caller that learns the store is full can still choose another
-// parker, while PVE's rejection arrives too late to be useful and says only
-// that a string was too long.
+// push for vmCfg with entry added under key, applying collection at now first
+// and sparing the keys in held, and reports the keys it collected. It returns
+// ErrProvenanceFull when the result would exceed the budget: the refusal
+// belongs here rather than at the PUT, because a caller that learns the store
+// is full can still choose another parker, while PVE's rejection arrives too
+// late to be useful and says only that a string was too long.
 func projectParkerProvenance(
 	vmCfg map[string]any, node string, parkerVMID int,
-	key string, entry parkerProvEntry, cfg ParkerConfig,
+	key string, entry parkerProvEntry, now time.Time, held map[string]bool,
 ) (desc string, pruned []string, err error) {
 	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
 	if previous, ok := disks[key]; ok && previous.AllocationID != "" {
@@ -466,7 +449,7 @@ func projectParkerProvenance(
 
 	// The caller's config read is the same one the reference test needs, so
 	// collection costs no extra API call.
-	pruned = collectStaleParkerProvenance(disks, vmCfg, key, parkerNow(cfg))
+	pruned = collectStaleParkerProvenance(disks, vmCfg, key, now, held)
 
 	desc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
@@ -508,8 +491,13 @@ func parkerProvenanceRoom(
 	// The landed slot is unknown before the attach. Probe with the widest slot
 	// name a parker can hand out so the estimate is never optimistic.
 	widestSlot := fmt.Sprintf("scsi%d", parkerMaxSlots-1)
-	entry := buildParkerProvEntry(node, bareVolid, widestSlot, cfg, pctx)
-	_, _, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg)
+	key := parkerProvKey(bareVolid, pctx.StableID)
+	entry := buildParkerProvEntry(ctx, node, bareVolid, widestSlot, cfg, pctx)
+	// The same keep rule as the write, so the probe never counts room that a
+	// record the write keeps is still using.
+	now := provenanceNow(ctx, cfg)
+	held := parkerProvenanceSourceKeeps(ctx, c, nil, vmCfg, key, now)
+	_, _, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
 	return projectErr
 }
 
@@ -534,7 +522,16 @@ func writeParkerProvenance(
 		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
 	}
 
-	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, cfg)
+	now := provenanceNow(ctx, cfg)
+	held := parkerProvenanceSourceKeeps(ctx, c, logger, vmCfg, key, now)
+	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
+	if len(held) > 0 && logger != nil {
+		logger.Info("parker provenance: kept stale transfer records whose source VM still holds the volume",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.String("keys", strings.Join(heldKeys(held), ",")),
+		)
+	}
 	if len(pruned) > 0 && logger != nil {
 		logger.Info("parker provenance: collected stale parked-disk records",
 			log.Int("parker_vmid", parkerVMID),

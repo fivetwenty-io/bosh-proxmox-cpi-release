@@ -153,7 +153,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 			StableID: overlayTestStableID,
 			Opts:     map[string]string{"cache": "writeback", "serial": "bpd-evil"},
 		}
-		entry := buildParkerProvEntry("pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, pctx)
+		entry := buildParkerProvEntry(context.Background(), "pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, pctx)
 		if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, overlayTestStableID, entry, parkerTestCfgInternal()); err != nil {
 			t.Fatalf("writeParkerProvenance: %v", err)
 		}
@@ -174,7 +174,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 		c := newScanFakeClient(map[int]map[string]any{
 			90000: {"tags": "bosh-cpi;bosh-parker"},
 		})
-		entry := buildParkerProvEntry("pve1", "data:vm-90000-disk-3", "scsi3", transferTestCfg, ParkContext{
+		entry := buildParkerProvEntry(context.Background(), "pve1", "data:vm-90000-disk-3", "scsi3", transferTestCfg, ParkContext{
 			DiskCID: "pvd-x", StableID: overlayTestStableID, Opts: map[string]string{"iothread": "0"},
 		})
 		if err := writeParkerProvenance(context.Background(), c, nil, "pve1", 90000, overlayTestStableID, entry, parkerTestCfgInternal()); err != nil {
@@ -195,7 +195,7 @@ func TestParkerDiskOverlay(t *testing.T) {
 		c := newScanFakeClient(map[int]map[string]any{
 			90000: {"tags": "bosh-cpi;bosh-parker"},
 		})
-		entry := buildParkerProvEntry("pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, ParkContext{
+		entry := buildParkerProvEntry(context.Background(), "pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, ParkContext{
 			DiskCID: "pvd-x", SourceVMCID: "700", StableID: overlayTestStableID,
 			Opts: map[string]string{"cache": "none"},
 		})
@@ -258,7 +258,7 @@ func TestResumeDiskTransferKeepsOverlay(t *testing.T) {
 			"scsi0": "data:vm-90000-disk-0,serial=" + transferStableID,
 		},
 	})
-	intentEntry := buildParkerProvEntry("pve1", "data:vm-9001-disk-0", "scsi0", transferTestCfg, ParkContext{
+	intentEntry := buildParkerProvEntry(context.Background(), "pve1", "data:vm-9001-disk-0", "scsi0", transferTestCfg, ParkContext{
 		DiskCID: "pvd-x", SourceVMCID: "700", StableID: transferStableID,
 		Opts: map[string]string{"cache": "writeback"},
 	})

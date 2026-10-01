@@ -198,6 +198,94 @@ func lifecycleFlowFixtureState(t *testing.T, returned bool, anchored ...bool) (D
 	deps := Deps{PVE: client, Config: &config.CPIConfig{Node: "n1", DiskStorage: target.StorageID, StoragePlacementNamespace: plan.Namespace, StorageAllocationJournalDir: dir}}
 	return deps, client, journal, id, cid
 }
+
+// lifecycleFlowNamespace is the placement namespace planFixture plans in, and
+// so the one every flow fixture journal is initialized with.
+const lifecycleFlowNamespace = "director"
+
+// lifecycleFlowDisk is one journal-managed persistent disk in a flow fixture.
+type lifecycleFlowDisk struct {
+	id, cid, volume, token, storage string
+}
+
+// journalLifecycleFlowDisk plans a 5 GiB persistent disk the way create_disk
+// does, journals its observed creation, and places its volume on storage. The
+// volume starts without a holder, and the caller decides what holds it.
+func journalLifecycleFlowDisk(t *testing.T, journal *aj.Journal, state *managedDiskTestState, returned, anchored bool, beforeClose ...func(*aj.Handle)) lifecycleFlowDisk {
+	t.Helper()
+	id, err := aj.NewAllocationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _, _ := planFixture(t, func(_ *planFixtureSource, cfg *config.CPIConfig) {
+		cfg.EphemeralStorageSet = ""
+		cfg.PersistentStorageSet = "E"
+	})
+	selection, err := ResolveStoragePlacementSelectors(request.Selection.Policy, "create_disk", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Selection = selection
+	request.RootBytes = 0
+	request.Sources = nil
+	request.PersistentBytes = 5 << 30
+	request.AllocationKey = id
+	iterator, err := NewStoragePlanIterator(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := iterator.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Namespace != lifecycleFlowNamespace {
+		t.Fatalf("disk planned in namespace %q, want %q", plan.Namespace, lifecycleFlowNamespace)
+	}
+	intent, err := storageJournalIntent("create_disk", []json.RawMessage{planJSON(t, 5120)}, selection, request.Inventory, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := journal.CreateDisk(context.Background(), id, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := pve.AllocationVolumeName(123, plan.Namespace, id, "raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := plan.Targets[0]
+	volume := target.StorageID + ":123/" + name
+	token := handle.Record().DiskToken
+	cid, err := pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: token, Format: "raw", Anchor: anchored})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step, err := storageMutationIntent(handle, "create", aj.Target{Node: "n1", Storage: target.StorageID, Backing: target.BackingKey, VMID: 123, IntendedVolume: volume}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storageMutationObserved(handle, step, []string{volume}, false); err != nil {
+		t.Fatal(err)
+	}
+	record := handle.Record()
+	if returned {
+		record.State = aj.ReadyToReturn
+		record.CID = cid
+	}
+	if err := handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	for _, hook := range beforeClose {
+		if hook != nil {
+			hook(handle)
+		}
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state.volumes[volume] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
+	return lifecycleFlowDisk{id: id, cid: cid, volume: volume, token: token, storage: target.StorageID}
+}
 func TestManagedDiskResizeAfterSetRemoval(t *testing.T) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	args := []json.RawMessage{planJSON(t, cid), planJSON(t, 6144)}

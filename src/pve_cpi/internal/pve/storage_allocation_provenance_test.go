@@ -90,14 +90,14 @@ func TestAllocationVolumeOrphansReserveVMID(t *testing.T) {
 func TestAllocationParkerProvenanceUpdatePreservesIdentity(t *testing.T) {
 	const id = "12345678-1234-4234-8234-123456789abc"
 	cfg := ParkerConfig{}
-	first := buildParkerProvEntry("node", "nfs:9000/disk.qcow2", "scsi0", cfg, ParkContext{StableID: "bpd-1234567890abcdef", AllocationID: id, AllocationNamespace: "abc"})
-	desc, _, err := projectParkerProvenance(map[string]any{}, "node", 9000, "bpd-1234567890abcdef", first, cfg)
+	first := buildParkerProvEntry(context.Background(), "node", "nfs:9000/disk.qcow2", "scsi0", cfg, ParkContext{StableID: "bpd-1234567890abcdef", AllocationID: id, AllocationNamespace: "abc"})
+	desc, _, err := projectParkerProvenance(map[string]any{}, "node", 9000, "bpd-1234567890abcdef", first, provenanceNow(context.Background(), cfg), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	vm := map[string]any{"description": desc, "scsi0": "nfs:9000/disk.qcow2,serial=bpd-1234567890abcdef"}
-	updated := buildParkerProvEntry("node", "nfs:9000/disk.qcow2", "scsi0", cfg, ParkContext{StableID: "bpd-1234567890abcdef"})
-	desc, _, err = projectParkerProvenance(vm, "node", 9000, "bpd-1234567890abcdef", updated, cfg)
+	updated := buildParkerProvEntry(context.Background(), "node", "nfs:9000/disk.qcow2", "scsi0", cfg, ParkContext{StableID: "bpd-1234567890abcdef"})
+	desc, _, err = projectParkerProvenance(vm, "node", 9000, "bpd-1234567890abcdef", updated, provenanceNow(context.Background(), cfg), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestAllocationParkerProvenanceUpdatePreservesIdentity(t *testing.T) {
 	}
 	updated.AllocationID = "22345678-1234-4234-8234-123456789abc"
 	updated.AllocationNamespace = "abc"
-	if _, _, err = projectParkerProvenance(vm, "node", 9000, "bpd-1234567890abcdef", updated, cfg); err == nil {
+	if _, _, err = projectParkerProvenance(vm, "node", 9000, "bpd-1234567890abcdef", updated, provenanceNow(context.Background(), cfg), nil); err == nil {
 		t.Fatal("accepted identity replacement under existing token")
 	}
 }
