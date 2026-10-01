@@ -90,6 +90,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The anti-affinity lock's claim now lasts at least 30 seconds however low `pve.cluster_lock_timeout_sec` is set, and the wait still follows the setting. The claim used to last twice the setting, and at a setting of 4 or less, the pause each acquire takes after its create and the margin a release leaves before a claim's expiry used up most or all of that time. At 1, a second request could take the lock while the first still held it, and from 2 to 4, the release left the lock pool standing until the claim expired.
 
+- A request that ends while a parker window has protection off, because `pve.operation_timeout` fired or the CPI process was told to stop, now still puts protection back for a journal-managed disk. The allocation journal refused that restore once the request had ended, so the parker stayed unprotected until the next window on it, and the error said the operation was already uncertain.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added
