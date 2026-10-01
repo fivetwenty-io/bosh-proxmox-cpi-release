@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -298,8 +299,11 @@ func TestTransferDiskFromParker_FailedMoveAndCutOffRestoreJoin(t *testing.T) {
 		snapshot bool
 	}{
 		{
-			name:     "permanent move verdict wins",
-			moveErr:  errors.New("Configuration file 'nodes/pve1/qemu-server/700.conf' does not exist"),
+			// PVE sends the pmxcfs text as a 500, which is its own answer, so
+			// the transfer is known to have failed.
+			name: "permanent move verdict wins",
+			moveErr: &sdkerrors.APIError{HTTPCode: 500, Code: 500,
+				Message: "Configuration file 'nodes/pve1/qemu-server/700.conf' does not exist"},
 			wantType: cpierrors.TypeCloud,
 		},
 		{
@@ -349,6 +353,129 @@ func TestTransferDiskFromParker_FailedMoveAndCutOffRestoreJoin(t *testing.T) {
 				t.Fatalf("errors.Is(err, ErrMoveDiskSnapshotRefused) = %t, want %t", got, tc.snapshot)
 			}
 		})
+	}
+}
+
+// droppedWorkClient is a hangingRestoreClient whose window work, the move off
+// the parker or the detach on it, fails in transport on every attempt, so PVE
+// never answers and nobody knows whether the change applied.
+type droppedWorkClient struct {
+	*hangingRestoreClient
+	dropMove   bool
+	dropDetach bool
+}
+
+func droppedConnection() error {
+	return &sdkerrors.ConnectionError{Host: "pve1", Port: 8006, Message: "connection reset by peer"}
+}
+
+func (c *droppedWorkClient) Nodes() sdknodes.Service {
+	nodes := c.hangingRestoreClient.Nodes()
+	if c.dropMove {
+		inner, ok := nodes.(*fakeNodesService)
+		if !ok {
+			panic("hangingRestoreClient.Nodes is not a *fakeNodesService")
+		}
+		inner.createQemuMoveDiskFn = func(context.Context, string, string, *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {
+			return nil, droppedConnection()
+		}
+	}
+	return nodes
+}
+
+func (c *droppedWorkClient) QEMU() qemu.Service {
+	svc := c.hangingRestoreClient.QEMU()
+	if c.dropDetach {
+		inner, ok := svc.(*fakeQEMUService)
+		if !ok {
+			panic("scanFakeClient.QEMU is not a *fakeQEMUService")
+		}
+		inner.detachDiskFn = func(context.Context, string, int, string) error {
+			return droppedConnection()
+		}
+	}
+	return svc
+}
+
+// TestTransferDiskFromParker_MoveWithUnknownOutcomeSaysSo drops the move's
+// connection on every attempt and cuts the restore off. PVE never answered
+// the move, so the error says the transfer's outcome is unknown rather than
+// that it failed, and it does not count the transfer as completed.
+func TestTransferDiskFromParker_MoveWithUnknownOutcomeSaysSo(t *testing.T) {
+	t.Parallel()
+	ctx := WithParkerProtectionRestoreTimeoutForTest(context.Background(), 100*time.Millisecond)
+	ctx = WithTestBackoff(ctx, func(int) time.Duration { return 0 })
+	c := &droppedWorkClient{dropMove: true, hangingRestoreClient: &hangingRestoreClient{parker: 90000,
+		scanFakeClient: newScanFakeClient(map[int]map[string]any{
+			90000: {
+				cfgKeyTags:      "bosh-cpi;bosh-parker",
+				paramProtection: true,
+				"scsi0":         "data:vm-90000-disk-0,serial=" + transferStableID,
+			},
+			700: {},
+		})}}
+	parker := DiskHolder{Found: true, VMID: 90000, Node: "pve1", IsParker: true, Slot: "scsi0"}
+	landed, err := TransferDiskFromParker(ctx, c, nil, parker, 700, "scsi1",
+		"data:vm-90000-disk-0", "data:vm-90000-disk-0,serial="+transferStableID, transferTestCfg)
+	if err == nil {
+		t.Fatal("a dropped move with a cut-off restore returned no error")
+	}
+	t.Logf("error: %s", err)
+	msg := err.Error()
+	if !strings.Contains(msg, "the outcome of the disk transfer to vm 700 slot scsi1 is unknown") {
+		t.Fatalf("error %q does not say the transfer's outcome is unknown", msg)
+	}
+	if strings.Contains(msg, "scsi1 failed") {
+		t.Fatalf("error %q says the transfer failed, but PVE never answered the move", msg)
+	}
+	if landed != "" {
+		t.Fatalf("landed volid = %q, want none for a move with an unknown outcome", landed)
+	}
+	var cutOff *ProtectionRestoreCutOffError
+	if !errors.As(err, &cutOff) || cutOff.WorkCompleted {
+		t.Fatalf("error %q does not carry a cut-off restore marked as not completed", msg)
+	}
+}
+
+// TestDeleteParkedOwnedDisk_DetachWithUnknownOutcomeSaysSo is the same check
+// for the parked-disk deletion: the detach's connection drops on every
+// attempt, the restore is cut off, and the error says the deletion's outcome
+// is unknown.
+func TestDeleteParkedOwnedDisk_DetachWithUnknownOutcomeSaysSo(t *testing.T) {
+	t.Parallel()
+	ctx := WithParkerProtectionRestoreTimeoutForTest(context.Background(), 100*time.Millisecond)
+	ctx = WithTestBackoff(ctx, func(int) time.Duration { return 0 })
+	desc := `<!--BOSH:{"bosh_parked_disks":{"` + transferStableID + `":{"disk_cid":"pvd-x","parked_at":"t",` +
+		`"node":"pve1","volid":"data:vm-90000-disk-2","slot":"scsi1"}}}-->`
+	c := &droppedWorkClient{dropDetach: true, hangingRestoreClient: &hangingRestoreClient{parker: 90000,
+		scanFakeClient: newScanFakeClient(map[int]map[string]any{
+			90000: {
+				cfgKeyTags:      "bosh-cpi;bosh-parker",
+				paramProtection: true,
+				"scsi1":         "data:vm-90000-disk-2,serial=" + transferStableID,
+				"description":   desc,
+			},
+		})}}
+	err := DeleteParkedOwnedDisk(ctx, c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferTestCfg)
+	if err == nil {
+		t.Fatal("a dropped detach with a cut-off restore returned no error")
+	}
+	t.Logf("error: %s", err)
+	msg := err.Error()
+	if !strings.Contains(msg, `the outcome of the deletion of "data:vm-90000-disk-2" is unknown`) {
+		t.Fatalf("error %q does not say the deletion's outcome is unknown", msg)
+	}
+	if strings.Contains(msg, `"data:vm-90000-disk-2" failed`) {
+		t.Fatalf("error %q says the deletion failed, but PVE never answered the detach", msg)
+	}
+	var cutOff *ProtectionRestoreCutOffError
+	if !errors.As(err, &cutOff) || cutOff.WorkCompleted {
+		t.Fatalf("error %q does not carry a cut-off restore marked as not completed", msg)
+	}
+	// The deletion is not known to have completed, so the parker keeps its
+	// record of the disk.
+	if entries := c.parkedEntries(t); len(entries) != 1 {
+		t.Fatalf("provenance entries = %+v, want the disk's entry kept", entries)
 	}
 }
 
