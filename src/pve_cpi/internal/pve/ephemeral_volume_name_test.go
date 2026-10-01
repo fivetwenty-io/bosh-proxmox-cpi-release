@@ -42,3 +42,22 @@ func TestEphemeralVolumeFormatUsesRawForBlockCompanion(t *testing.T) {
 		}
 	}
 }
+
+func TestIsOwnEphemeralVolumeReadsBlockAndFileForms(t *testing.T) {
+	for _, volid := range []string{
+		"e:vm-123-ephemeral-0", "e:vm-123-ephemeral-0,size=5G", "e:123/vm-123-ephemeral-0.raw",
+		"e:123/vm-123-ephemeral-0.qcow2,serial=x,size=5G",
+	} {
+		if !IsOwnEphemeralVolume(volid, 123) {
+			t.Errorf("own ephemeral volume %q not matched", volid)
+		}
+	}
+	for _, volid := range []string{
+		"e:vm-1234-ephemeral-0", "e:12/vm-12-ephemeral-0.raw", "e:123/vm-123-disk-0.raw", "e:vm-123-cloudinit",
+		"vm-123-ephemeral-0", "/dev/pve/vm-123-ephemeral-0", "none", ":vm-123-ephemeral-0", "e:",
+	} {
+		if IsOwnEphemeralVolume(volid, 123) {
+			t.Errorf("volume %q matched VM 123's ephemeral", volid)
+		}
+	}
+}
