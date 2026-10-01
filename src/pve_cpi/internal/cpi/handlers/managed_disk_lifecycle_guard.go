@@ -82,13 +82,9 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 	if err != nil {
 		return "", err
 	}
-	backing, err := managedDiskActualBacking(ctx, m.deps, storage)
-	if err != nil || backing != m.diskBacking() {
-		return "", fmt.Errorf("managed disk backing changed before mutation")
-	}
-	identity, err := pve.ObserveStorageClusterIdentity(ctx, m.deps.PVE.Nodes(), []string{node})
-	if err != nil || identity.ID() != m.handle.Record().ClusterID {
-		return "", fmt.Errorf("managed disk cluster continuity changed before mutation")
+	backing, err := g.observeContinuity(ctx, call, node, storage)
+	if err != nil {
+		return "", err
 	}
 	key := call.Service + "." + call.Method
 	if m.external {
@@ -119,9 +115,9 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 			return "", err
 		}
 		if key != "QEMU.Create" {
-			observation.before, err = m.deps.PVE.QEMU().Config(ctx, node, observation.vmid)
-			if err != nil || observation.before == nil {
-				return "", fmt.Errorf("cannot verify lifecycle holder before mutation")
+			observation.before, err = g.readHolderConfig(ctx, call, node, storage, observation.vmid)
+			if err != nil {
+				return "", err
 			}
 		}
 	}
@@ -176,6 +172,45 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		m.diskMutationAdmitted = true
 	}
 	return step, nil
+}
+
+// observeContinuity reads the disk's actual backing and the cluster's identity
+// and checks both against the record, returning the backing. A protection
+// restore whose read returns an error is not admitted, and it does not lock
+// the guard either (see restoreChecksIncomplete). A read that finishes with an
+// answer that disagrees still locks it, as it does for every other mutation.
+func (g *managedDiskLifecycleGuard) observeContinuity(ctx context.Context, call ManagedAllocationMutation, node, storage string) (string, error) {
+	m := g.lifecycle
+	backing, err := managedDiskActualBacking(ctx, m.deps, storage)
+	if err != nil && isProtectionRestore(call) {
+		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk backing")
+	}
+	if err != nil || backing != m.diskBacking() {
+		return "", fmt.Errorf("managed disk backing changed before mutation")
+	}
+	identity, err := pve.ObserveStorageClusterIdentity(ctx, m.deps.PVE.Nodes(), []string{node})
+	if err != nil && isProtectionRestore(call) {
+		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk cluster identity")
+	}
+	if err != nil || identity.ID() != m.handle.Record().ClusterID {
+		return "", fmt.Errorf("managed disk cluster continuity changed before mutation")
+	}
+	return backing, nil
+}
+
+// readHolderConfig reads the configuration of the VM a mutation targets. As in
+// observeContinuity, a protection restore whose read returns an error ends in
+// restoreChecksIncomplete, and a read that returns nothing still locks the
+// guard.
+func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call ManagedAllocationMutation, node, storage string, vmid int) (map[string]any, error) {
+	config, err := g.lifecycle.deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil && isProtectionRestore(call) {
+		return nil, g.restoreChecksIncomplete(call, node, storage, "parker configuration")
+	}
+	if err != nil || config == nil {
+		return nil, fmt.Errorf("cannot verify lifecycle holder before mutation")
+	}
+	return config, nil
 }
 
 func isDiskOptionKey(key string) bool {
@@ -859,6 +894,75 @@ func (g *managedDiskLifecycleGuard) observeMove(ctx context.Context, observation
 // and cleanLockTimeout can count the operation clean when nothing else was
 // admitted and every step is settled.
 var errManagedRequestEnded = errors.New("managed lifecycle request ended before mutation")
+
+// errManagedRestoreChecksIncomplete marks a parker protection restore that
+// before did not admit because one of its reads returned an error. before has
+// already recorded the restore as a planned step, so begin hands the refusal
+// back unchanged and leaves the guard usable.
+var errManagedRestoreChecksIncomplete = errors.New("parker protection restore checks did not finish")
+
+// managedRestoreChecksIncomplete is the refusal before gives a parker
+// protection restore when one of its reads returned an error. Its text names
+// the check that could not finish. It matches errManagedRestoreChecksIncomplete
+// and pve.ErrMutationChecksIncomplete, and on purpose it matches neither the
+// read's own error nor the context's. The retry loop around the restore would
+// take either one for a transport fault and return the bare context error in
+// its place, which would lose the fact that the restore was never sent.
+type managedRestoreChecksIncomplete struct{ check string }
+
+func (e *managedRestoreChecksIncomplete) Error() string {
+	return e.check + " could not be checked before the parker protection restore"
+}
+
+func (e *managedRestoreChecksIncomplete) Unwrap() []error {
+	return []error{errManagedRestoreChecksIncomplete, pve.ErrMutationChecksIncomplete}
+}
+
+// restoreChecksIncomplete ends the admission of a parker protection restore
+// whose check could not finish, because one of before's reads returned an
+// error. It doesn't matter whether PVE answered with a failure or the
+// restore's deadline ended the read. The restore is not sent. Its intent is
+// recorded as a planned protection-on step instead, so the next call reads the
+// parker back before it takes the disk, and the refusal leaves the guard usable
+// (see begin).
+//
+// Every error from those reads lands here on purpose, including a storage
+// missing from the listing, a storage definition that is ambiguous or
+// malformed, and a certificate answer that was rejected. None of those reaches
+// a verdict on this disk, and treating them like a read that failed costs
+// nothing, because the restore isn't sent and the planned step only causes a
+// read-back. The attach's next guarded write and every later lifecycle open
+// call the same helpers, so they still lock or refuse on that answer before
+// anything mutates. Narrowing it to a smaller set of errors would buy no safety.
+//
+// The intent uses only what the lifecycle already holds. The backing is the
+// one the record names, which is the backing every admitted write records,
+// and the parameters are rendered from the call's own fields. Nothing comes
+// from the read that failed. That is safe because isProtectionRestore has
+// proved the write is protection-only and the write is never sent. A backing
+// or a cluster that really changed still stops this operation's next guarded
+// write, and every later lifecycle open, when they make their own reads.
+//
+// No observation is stored for the step, because only after reads one and
+// after never runs for a write that was not sent. diskMutationAdmitted is left
+// alone, because a protection write never touches the disk.
+func (g *managedDiskLifecycleGuard) restoreChecksIncomplete(call ManagedAllocationMutation, node, storage, check string) error {
+	m := g.lifecycle
+	vmid, err := lifecycleInt(call.Args[metadataKeyVMID])
+	if err != nil {
+		return err
+	}
+	fields, err := lifecycleMutationFields(call.Args[managedArgumentParams])
+	if err != nil {
+		return err
+	}
+	key := call.Service + "." + call.Method
+	target := aj.Target{External: m.external && !m.ownedRetention, VirtualBytes: m.retainedBytes, Node: node, Storage: storage, Backing: m.diskBacking(), VMID: vmid, IntendedVolume: m.disk.volid}
+	if _, err := storageMutationIntent(m.handle, "lifecycle_"+m.session.operation+"_"+call.Service+"_"+call.Method, target, nil, lifecycleStepParameters(key, fields)); err != nil {
+		return err
+	}
+	return &managedRestoreChecksIncomplete{check: check}
+}
 
 // managedRequestEnded is the refusal before gives a mutation on an ended
 // request. It is retriable, because nothing changed and the Director may try

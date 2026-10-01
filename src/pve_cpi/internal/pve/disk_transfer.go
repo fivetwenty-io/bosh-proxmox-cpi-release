@@ -961,6 +961,15 @@ func parkerRestoreTimeout(ctx context.Context) time.Duration {
 // its failure says nothing about PVE or the network.
 var ErrMutationNotAttempted = errors.New("mutation not attempted")
 
+// ErrMutationChecksIncomplete marks a mutation that a client wrapper did not
+// send because it could not finish the checks it makes before sending one,
+// such as a read the allocation guard makes to admit a parker protection
+// restore that failed or ran out of time. The mutation never reached PVE, so
+// whatever those checks guard is still as it was. It differs from
+// ErrMutationNotAttempted, where the wrapper refused because an earlier
+// failure had already made its operation uncertain.
+var ErrMutationChecksIncomplete = errors.New("mutation checks incomplete")
+
 // ProtectionWriteRefused reports whether err is PVE's own answer refusing a
 // protection write, which means the write did not apply and its outcome is
 // known. pveAnswered says which errors are PVE's own answer.
@@ -994,15 +1003,20 @@ func pveAnswered(err error) (int, bool) {
 }
 
 // ProtectionRestoreCutOffError is the error a protection restore returns when
-// it ended without an answer from PVE, because its deadline cut it off or its
-// transport failed, so nobody knows whether protection went back on.
+// it did not put protection back and PVE never refused it. That covers a
+// restore that ended without an answer from PVE, because its deadline cut it
+// off or its transport failed, so nobody knows whether protection went back
+// on. It also covers a restore the client never sent, because an earlier
+// failure made the operation uncertain or the checks before the write could
+// not finish, and then protection is known to be still off.
 // Its text and its CPI error type (retriable) come from the error it wraps, so
 // callers that only read the message or the type see no difference. Callers
 // that need to tell a cut-off restore from every other failure, such as an
 // attach that still has receiving-side bookkeeping to finish after the disk
 // landed, match it with errors.As.
 type ProtectionRestoreCutOffError struct {
-	// ParkerVMID is the parker whose protection state is unknown.
+	// ParkerVMID is the parker whose restore ended without an answer or was
+	// never sent, so its protection is unknown or still off.
 	ParkerVMID int
 	// WorkCompleted is true when the window's own change, the transfer or
 	// the deletion, completed before the restore was cut off. The caller
@@ -1034,15 +1048,26 @@ func putParkerProtectionBack(ctx context.Context, c Client, logger *log.Logger, 
 	return errors.Is(restoreCtx.Err(), context.DeadlineExceeded), protErr
 }
 
-// protectionRestoreEnding says how a failed protection restore ended when
-// nobody knows whether protection went back on, in the words both the
-// returned error and the log use. It returns "" when PVE answered with a
-// failure, because then the write provably did not apply and protection is
-// off. A restore the client refused before sending, because an earlier
-// failure already made the operation uncertain, is checked first: PVE never
-// saw it, so blaming the network or PVE would mislead.
+// protectionRestoreEnding says how a failed protection restore ended, in the
+// words both the returned error and the log use, for every restore that ends
+// in the retriable error. It returns "" when PVE answered with a failure,
+// because then the write provably did not apply and protection is off, and
+// that restore only warns.
+//
+// A restore the client did not send because it could not finish the checks
+// before it is checked first. The window's protection-off write was observed
+// and nothing was sent after it, so protection is still off, and the ending
+// says whether those checks failed or ran out of time. A restore the client
+// refused before sending, because an earlier failure already made the
+// operation uncertain, comes next. PVE never saw either one, so blaming the
+// network or PVE would mislead.
 func protectionRestoreEnding(protErr error, timedOut bool, timeout time.Duration) string {
 	switch {
+	case errors.Is(protErr, ErrMutationChecksIncomplete):
+		if timedOut {
+			return fmt.Sprintf("was not sent because the checks before it did not finish within %s, so protection is still off", timeout)
+		}
+		return "was not sent because the checks before it failed, so protection is still off"
 	case errors.Is(protErr, ErrMutationNotAttempted):
 		return "was not attempted because the operation was already uncertain"
 	case timedOut:
@@ -1064,8 +1089,10 @@ func protectionRestoreEnding(protErr error, timedOut bool, timeout time.Duration
 // The restore goes through putParkerProtectionBack, so it ends at the same
 // deadline as the transfer and deletion restores. The one Warn it logs uses
 // the same endings as restoreParkerProtection, so an operator reading it can
-// tell a restore PVE refused from one whose outcome is unknown. In a
-// journal-managed request, a cut-off write leaves its step planned, so the
+// tell a restore PVE refused from one whose outcome is unknown, and both of
+// those from one that was never sent because the checks before it did not
+// finish. In a journal-managed request, a cut-off write leaves its step
+// planned, and so does a restore whose checks did not finish, so the
 // operation's record still says the restore is unsettled.
 func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int) {
 	timedOut, protErr := putParkerProtectionBack(ctx, c, logger, node, parkerVMID)
@@ -1100,13 +1127,22 @@ func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Lo
 // The write goes through putParkerProtectionBack, so a cancelled request still
 // sends it, and parkerRestoreTimeout bounds it.
 //
-// Four outcomes:
+// Five outcomes:
 //
 //   - The restore succeeds: nil.
 //   - PVE answers with a failure (ProtectionWriteRefused): the outcome is
 //     known, protection is off, and the Warn tells the operator how to put it
 //     back. It returns nil, as it always has, so the window's own result
 //     stands.
+//   - The client did not send the restore because it could not finish the
+//     checks it makes before the write (ErrMutationChecksIncomplete), for
+//     example because a read the allocation guard needs failed or ran out of
+//     time. The outcome is known: protection is still off, because the
+//     window's protection-off write was observed and nothing was sent after
+//     it. It returns the same retriable error, worded to say the restore was
+//     not sent and whether the checks failed or did not finish in time. In a
+//     journal-managed request the guard has left the restore planned without
+//     locking itself, the same way it leaves a cut-off write.
 //   - The client refused the restore before sending it
 //     (ErrMutationNotAttempted), because an earlier failure already made the
 //     operation uncertain: it returns the same retriable error, worded to say

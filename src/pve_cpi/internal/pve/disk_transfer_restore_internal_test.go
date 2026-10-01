@@ -506,3 +506,107 @@ func TestRestoreParkerProtection_TransportFailureIsUnknown(t *testing.T) {
 		t.Fatalf("restore attempted %d times, want the retry loop to try again", restores)
 	}
 }
+
+// checksIncompleteRestoreClient is a scanFakeClient whose protection restore
+// on the parker is refused the way the allocation guard refuses one whose
+// checks before the write could not finish: the write is not sent, and the
+// refusal matches ErrMutationChecksIncomplete and nothing that the retry loop
+// treats as a transport fault. With hang set, the refusal comes only once the
+// write's context has ended, the way a check whose read hung until the
+// restore deadline returns.
+type checksIncompleteRestoreClient struct {
+	*scanFakeClient
+	parker int
+	hang   bool
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *checksIncompleteRestoreClient) Nodes() sdknodes.Service {
+	inner, ok := c.scanFakeClient.Nodes().(*fakeNodesService)
+	if !ok {
+		panic("scanFakeClient.Nodes is not a *fakeNodesService")
+	}
+	passThrough := inner.updateQemuConfigFn
+	inner.updateQemuConfigFn = func(ctx context.Context, node, vmid string, params *sdknodes.UpdateQemuConfigParams) error {
+		if params.Protection == nil || !*params.Protection || vmid != strconv.Itoa(c.parker) {
+			return passThrough(ctx, node, vmid, params)
+		}
+		c.mu.Lock()
+		c.calls++
+		c.mu.Unlock()
+		if c.hang {
+			<-ctx.Done()
+		}
+		return fmt.Errorf("parker configuration could not be checked before the parker protection restore: %w", ErrMutationChecksIncomplete)
+	}
+	return inner
+}
+
+func (c *checksIncompleteRestoreClient) restores() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestPutParkerProtectionBack_ChecksIncompleteIsNotRetried sends a restore
+// that the client refuses because its checks could not finish, once with the
+// restore's context ended by the time the refusal comes back and once with it
+// still live. Either way the retry loop must try the write exactly once and
+// return the refusal itself, not the bare context error, so the restore can
+// still say why it was not sent.
+func TestPutParkerProtectionBack_ChecksIncompleteIsNotRetried(t *testing.T) {
+	t.Parallel()
+	for _, hang := range []bool{true, false} {
+		name := "context live"
+		if hang {
+			name = "context ended"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := &checksIncompleteRestoreClient{parker: 90000, hang: hang,
+				scanFakeClient: newScanFakeClient(map[int]map[string]any{90000: {cfgKeyTags: "bosh-parker"}})}
+			ctx := WithParkerProtectionRestoreTimeoutForTest(context.Background(), 100*time.Millisecond)
+			timedOut, err := putParkerProtectionBack(ctx, c, nil, "pve1", 90000)
+			if !errors.Is(err, ErrMutationChecksIncomplete) {
+				t.Fatalf("restore whose checks did not finish = %v, want ErrMutationChecksIncomplete", err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("restore error %v carries the deadline, which the retry loop would take for a transport fault", err)
+			}
+			if timedOut != hang {
+				t.Fatalf("timedOut = %t, want %t", timedOut, hang)
+			}
+			if calls := c.restores(); calls != 1 {
+				t.Fatalf("the restore was tried %d times, want exactly once", calls)
+			}
+		})
+	}
+}
+
+// TestProtectionRestoreEnding_ChecksIncomplete covers the two endings for a
+// restore the client did not send because the checks before it could not
+// finish. The transfer's protection-off write was observed and nothing was
+// sent after it, so protection is known to be off, and the ending says so
+// instead of calling the outcome unknown.
+func TestProtectionRestoreEnding_ChecksIncomplete(t *testing.T) {
+	t.Parallel()
+	notSent := fmt.Errorf("managed disk backing could not be checked before the parker protection restore: %w", ErrMutationChecksIncomplete)
+	cases := []struct {
+		name     string
+		timedOut bool
+		want     string
+	}{
+		{"checks ran out of time", true, "was not sent because the checks before it did not finish within 2s, so protection is still off"},
+		{"checks failed", false, "was not sent because the checks before it failed, so protection is still off"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := protectionRestoreEnding(notSent, tc.timedOut, 2*time.Second); got != tc.want {
+				t.Fatalf("ending = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -129,6 +129,16 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 		g.mu.Unlock()
 		return "", &managedMutationNotAttempted{err: err}
 	}
+	if errors.Is(err, errManagedRestoreChecksIncomplete) {
+		// The checks that admit a parker protection restore could not
+		// finish, and Before recorded the restore as a planned step instead
+		// of sending it. Nothing was sent, and the record already tells the
+		// next call to read the parker back, so the guard stays usable. The
+		// refusal goes back unchanged, so the restore can say it was not sent
+		// rather than that the operation was already uncertain.
+		g.mu.Unlock()
+		return "", err
+	}
 	if err != nil {
 		g.poisoned = cpierrors.Cloud("managed allocation blocked before %s.%s", m.Service, m.Method)
 		g.mu.Unlock()
