@@ -154,6 +154,67 @@ func TestGuardFinishesProtectionWritesWithoutLocking(t *testing.T) {
 	}
 }
 
+// countingProbeNodes counts the configuration writes that reach it and
+// answers each one with success.
+type countingProbeNodes struct {
+	nodes.Service
+	sent *int
+}
+
+func (n countingProbeNodes) UpdateQemuConfig(context.Context, string, string, *nodes.UpdateQemuConfigParams) error {
+	*n.sent++
+	return nil
+}
+
+// TestGuardBeginKeepsARestoreWhoseChecksDidNotFinish drives the allocation
+// guard's begin with a Before that could not finish the checks for a parker
+// protection restore. That Before has already recorded the restore as a
+// planned step, so begin must hand its refusal back as it is, rather than as a
+// write refused by an uncertain operation. It must not send the write, must
+// not record uncertainty, and must leave the guard usable for the next write.
+func TestGuardBeginKeepsARestoreWhoseChecksDidNotFinish(t *testing.T) {
+	t.Parallel()
+	on := true
+	refusal := fmt.Errorf("parker configuration could not be checked before the parker protection restore: %w", errManagedRestoreChecksIncomplete)
+	sent, befores, failed := 0, 0, 0
+	guard, err := NewManagedAllocationGuard(guardProbeClient{nodes: countingProbeNodes{sent: &sent}}, ManagedAllocationHooks{
+		Before: func(context.Context, ManagedAllocationMutation) (string, error) {
+			befores++
+			if befores == 1 {
+				return "", refusal
+			}
+			return "step", nil
+		},
+		After: func(context.Context, ManagedAllocationMutation, string, any) error { return nil },
+		Failed: func(context.Context, ManagedAllocationMutation, string, error) error {
+			failed++
+			return errors.New("uncertain")
+		},
+		SettleProtectionWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := &nodes.UpdateQemuConfigParams{Protection: &on}
+	writeErr := guard.Client().Nodes().UpdateQemuConfig(t.Context(), "n1", "90000", params)
+	if writeErr == nil || writeErr.Error() != refusal.Error() || errors.Is(writeErr, pve.ErrMutationNotAttempted) ||
+		!errors.Is(writeErr, errManagedRestoreChecksIncomplete) {
+		t.Fatalf("begin handed back %v, want the refusal %q unchanged", writeErr, refusal)
+	}
+	if guard.Err() != nil {
+		t.Fatalf("the guard locked itself on a restore that Before recorded as planned: %v", guard.Err())
+	}
+	if sent != 0 || failed != 0 {
+		t.Fatalf("the refused restore sent %d writes and recorded uncertainty %d times, want neither", sent, failed)
+	}
+	if err := guard.Client().Nodes().UpdateQemuConfig(t.Context(), "n1", "90000", params); err != nil {
+		t.Fatalf("the next write after the refusal: %v", err)
+	}
+	if sent != 1 {
+		t.Fatalf("the next write reached PVE %d times, want once", sent)
+	}
+}
+
 // TestProtectionPredicateIsTheOnlyRule pins the one definition of a
 // protection-only write that admission, finish, and the settler share.
 func TestProtectionPredicateIsTheOnlyRule(t *testing.T) {
