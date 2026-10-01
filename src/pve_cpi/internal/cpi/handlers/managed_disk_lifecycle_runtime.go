@@ -121,9 +121,10 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	var finalErr error
 	switch {
 	case cleanPending:
-		// The slot delete stayed pending, and the guard observed both the
-		// delete settling as not applied and its revert, so the disk is where
-		// the operation found it. The allocation goes back to the Director the
+		// A pending change on the slot stopped the operation, and either the
+		// guard observed our delete settling as not applied and its revert, or
+		// nothing was sent to the slot, so the disk is where the operation
+		// found it. The allocation goes back to the Director the
 		// way a success returns it, and the refusal goes back unchanged.
 		finalErr = m.completeOwned(ctx, false)
 		if finalErr != nil {
@@ -284,16 +285,29 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	return storageLifecycleSettled(m.handle.Record()) == nil
 }
 
-// cleanPendingDelete reports whether an operation failed only because a slot
-// delete stayed pending and was reverted, which leaves the disk where the
-// operation found it. That takes four things. The failure's chain holds a
-// *pve.DriveDeletePendingError whose reason isn't an unconfirmed revert, so
-// no other failure rides along on the clean return. The guard observed the
-// revert after it had settled the delete as not applied. The guard was never
-// poisoned. And every step the operation journaled has been observed.
+// cleanPendingDelete reports whether an operation failed only because of a
+// pending change on the disk's slot, which leaves the disk where the operation
+// found it. The failure's chain has to hold a *pve.DriveDeletePendingError
+// whose reason isn't an unconfirmed revert, so no other failure rides along on
+// the clean return. The guard must never have been poisoned, and every step
+// the operation journaled must be observed. When the reason says our own
+// delete stayed pending, the guard must also have observed the revert after
+// it had settled the delete as not applied. A pending delete the resume found
+// and left alone, and a slot whose pending value replaces its drive, need no
+// revert, because nothing was sent to the slot. For those two the guard must
+// also never have admitted a disk mutation during the operation, the same
+// proof cleanLockTimeout asks for, so the clean return rests on what the guard
+// saw rather than on the reason alone.
 func (m *managedDiskLifecycle) cleanPendingDelete(operationErr error) bool {
 	pending, ok := pve.IsDriveDeletePending(operationErr)
-	if !ok || pending.Reason == pve.DriveDeletePendingRevertUnconfirmed || !m.pendingDeleteReverted {
+	if !ok || pending.Reason == pve.DriveDeletePendingRevertUnconfirmed {
+		return false
+	}
+	sentNothing := pending.Reason == pve.DriveDeletePendingFound || pending.Reason == pve.DriveDeletePendingReplaced
+	if sentNothing && m.diskMutationAdmitted {
+		return false
+	}
+	if !sentNothing && !m.pendingDeleteReverted {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {

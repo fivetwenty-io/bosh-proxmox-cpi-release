@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -109,15 +110,22 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	}
 	// A deletion keeps the ephemeral volume whenever delete_vm would have, and
 	// whenever the record shows the retention already started, even when the
-	// caller is an operator's cleanup that did not ask for it.
+	// caller is an operator's cleanup that did not ask for it. The read takes
+	// both of PVE's views, so a retention serial on a slot whose delete a
+	// crash left pending still counts. It comes before deleteManagedVMGuest's
+	// stop, which may yet apply a pending drive replacement, so it checks
+	// both values of such a slot and never refuses on the shape alone.
 	if disposal == managedVMDeletion && !retain {
-		var guest map[string]any
+		var guest, replaced map[string]any
 		if node != "" && vmid > 0 {
-			if guest, err = deps.PVE.QEMU().Config(ctx, node, vmid); err != nil {
-				return proof, err
+			holding, e := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+			if e != nil {
+				return proof, e
 			}
+			guest, replaced = holding.Config, holding.Replaced
 		}
-		retain = managedVMDisposalRetains(disposal, retain, record, vmid, guest)
+		retain = managedVMDisposalRetains(disposal, retain, record, vmid, guest) ||
+			managedVMConfigCarriesSerial(replaced, managedVMRetentionToken(record.ID))
 	}
 	admission, err := storageAllocationVerification(audit, map[string]any{allocationEvidenceOperationField: managedVMCleanupAdmissionOperation, allocationEvidenceIDField: record.ID})
 	if err != nil {
@@ -377,11 +385,7 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 			return false, storageRefusal("cleanup volume reference scan incomplete")
 		}
 		for _, guest := range guests {
-			cfg, e := deps.PVE.QEMU().Config(ctx, guest.Node, guest.VMID)
-			if e != nil {
-				return false, e
-			}
-			volumes, e := managedVMConfigVolumes(cfg)
+			volumes, e := managedVMReferencedVolumes(ctx, deps, guest.Node, guest.VMID)
 			if e != nil {
 				return false, e
 			}
@@ -490,12 +494,20 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 // cleanup disposes of a VM. Preserving a persistent disk can wait out another
 // request's parker window and return the disk unchanged. When every step this
 // cleanup wrote is observed, nothing is uncertain, and the retried delete
-// resumes the disposal from here. Anything else requires reconciliation.
+// resumes the disposal from here. A read after the VM's stop can also find a
+// pending drive replacement and refuse before it changes anything. That
+// refusal is handed back the same way only when it is the whole failure and
+// nothing has already marked the record for reconciliation, which a
+// preservation does when it joins the refusal with its own uncertainty.
+// Anything else requires reconciliation.
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
 	}
 	if isDiskReturnedAfterLockTimeout(err) && storageLifecycleSettled(handle.Record()) == nil {
+		return err
+	}
+	if isWholePendingDriveReplacementRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
 		return err
 	}
 	return joinReconciliation(err, storageAllocationUncertain(handle, "VM cleanup"))
@@ -784,11 +796,21 @@ func managedVMDispositionProof(ctx context.Context, deps Deps, audit StorageAllo
 	return proof, nil
 }
 
+// verifyManagedVMDestroyDevices checks, just before the destroy, every device
+// the destroy would take. It runs after deleteManagedVMGuest's stop and reads
+// both of PVE's views, because destroy_vm frees owned drives from the current
+// config, which still has a slot whose delete a crash left pending. A slot
+// whose pending value names another volume is refused retriably, as at every
+// other read after the stop.
 func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Record, node string, vmid int, owned map[string]bool) error {
-	cfg, e := deps.PVE.QEMU().Config(ctx, node, vmid)
+	holding, e := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if e != nil {
 		return e
 	}
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
+		return err
+	}
+	cfg := holding.Config
 	for device, value := range cfg {
 		if !managedVMVolumeDevice(device) {
 			continue
@@ -838,6 +860,26 @@ func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Rec
 		}
 	}
 	return nil
+}
+
+// managedVMReferencedVolumes returns every volume a guest's config names in
+// either of PVE's views. A slot whose delete is pending still names its volume,
+// because the running guest still has it, and a slot whose pending value names
+// another volume names both. A reference scan counts all of them.
+func managedVMReferencedVolumes(ctx context.Context, deps Deps, node string, vmid int) ([]string, error) {
+	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, cfg := range []map[string]any{holding.Config, holding.Replaced} {
+		volumes, err := managedVMConfigVolumes(cfg)
+		if err != nil {
+			return nil, err
+		}
+		out = slices.AppendSeq(out, maps.Values(volumes))
+	}
+	return out, nil
 }
 
 // managedVMMarkerMatches reports whether config carries this VM allocation's

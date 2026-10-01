@@ -848,12 +848,19 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		cfg, e := deps.PVE.QEMU().Config(ctx, guest.Node, guest.VMID)
+		// One pending read gives both of PVE's views. The holders come from
+		// every volume either view names, so a running guest that still has a
+		// volume on a slot whose delete is pending, or as the current drive of
+		// a slot whose pending value names another volume, still holds it.
+		// Everything else reads the applied view, as the config endpoint
+		// returns it.
+		views, e := pve.ReadQemuViews(ctx, deps.PVE, guest.Node, guest.VMID)
 		if e != nil {
 			unread = append(unread, storageAuditUnreadGuest{vmid: guest.VMID, issue: fmt.Sprintf("VM %d configuration could not be inspected on %s: %s", guest.VMID, guest.Node, pve.DescribeAuditError(e))})
 			continue
 		}
-		if cfg == nil {
+		cfg := views.Applied()
+		if len(cfg) == 0 {
 			markVMScanIncomplete(result, fmt.Sprintf("VM %d configuration could not be inspected on %s: PVE returned an empty configuration", guest.VMID, guest.Node))
 			continue
 		}
@@ -861,11 +868,13 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 		collectAuditVMProvenance(result, records, namespace, guest.Node, guest.VMID, description)
 		inventory := storageAuditVM{node: guest.Node, vmid: guest.VMID}
 		inventory.disks = collectAuditDiskProvenance(result, namespace, guest.Node, guest.VMID, description)
-		for volume, claim := range collectAuditDiskHolders(records, knownVolumes, cfg, inventory.disks, guest.Node, guest.VMID, diskHolders) {
-			if result.claims == nil {
-				result.claims = map[string][]storageAuditClaim{}
+		for _, held := range []map[string]any{views.Holding(), views.PendingReplacements()} {
+			for volume, claim := range collectAuditDiskHolders(records, knownVolumes, held, inventory.disks, guest.Node, guest.VMID, diskHolders) {
+				if result.claims == nil {
+					result.claims = map[string][]storageAuditClaim{}
+				}
+				result.claims[volume] = append(result.claims[volume], claim)
 			}
-			result.claims[volume] = append(result.claims[volume], claim)
 		}
 		if volumes, err := managedVMConfigVolumes(cfg); err == nil {
 			inventory.volumes = volumes

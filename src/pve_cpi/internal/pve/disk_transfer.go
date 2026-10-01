@@ -372,6 +372,18 @@ func TransferDiskToParker(
 	if cfg.FallbackNode == "" {
 		cfg.FallbackNode = node
 	}
+	// A source slot whose pending value replaces its drive can't be detached
+	// until PVE applies the change, so the transfer refuses it before it
+	// creates a parker or writes an intent record, and a journal-managed
+	// caller can see that nothing was written. A read that fails leaves the
+	// decision to the source read inside the parker window, which reports it.
+	if views, err := ReadQemuViews(ctx, c, node, srcVMID); err == nil {
+		if slot, onBus := views.BusSlotNaming(bareVolid); onBus {
+			if _, replaced := views.PendingReplacements()[slot]; replaced {
+				return "", &DriveDeletePendingError{Reason: DriveDeletePendingReplaced, Node: node, VMID: srcVMID, Slot: slot}
+			}
+		}
+	}
 
 	// Parker selection mirrors parkDiskOnNode: first existing parker with a
 	// free slot, then fresh parkers, bounded.
@@ -569,7 +581,11 @@ func transferIntoParkerLocked(
 //     the record and finish.
 //   - source VM still holds the recorded volid on an unusedN entry: the move
 //     never ran — re-run it (re-choosing the slot; the recorded one may have
-//     been taken while the lock was down).
+//     been taken while the lock was down). A bus slot whose delete is pending
+//     comes first. On a running source the resume leaves it alone and returns
+//     DriveDeletePendingFound. On a stopped source it applies the delete when
+//     pctx.ApplyFoundPendingDelete asks for it, and then goes on to whichever
+//     window PVE left.
 //   - the recorded parker slot holds a parker-named volume with no serial:
 //     the move landed but the serial write was lost — claim it.
 //
@@ -626,26 +642,11 @@ func ResumeDiskTransferToParker(
 				return cpierrors.Wrap(WrapConfigReadError(srcErr),
 					fmt.Sprintf("transfer resume: config read for source vm %d", srcVMID))
 			case srcErr == nil:
-				srcCfg := srcViews.Applied()
-				if slot, onBus := srcViews.BusSlotNaming(intent.Volid); onBus {
-					if srcViews.PendingDelete(slot) {
-						// A crash, an earlier release, or an operator left the
-						// source's delete pending, so the running guest still
-						// has the disk, and nothing may land on the parker until
-						// the VM lets go of it. The resume can't tell whose
-						// delete this is or what its caller wants, and a stop
-						// of the VM applies it, so it leaves it alone and hands
-						// back the typed error for the caller to class.
-						return &DriveDeletePendingError{Reason: DriveDeletePendingFound, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
-					}
-					// Still attached: the detach never happened, so this is not
-					// a resume at all. The identity scan should have found it;
-					// a race between the scan and this read is the only path
-					// here.
-					return cpierrors.Retriable(
-						"transfer resume: volume %q is still attached to source vm %d; re-resolve and retry",
-						intent.Volid, srcVMID)
+				offBus, offErr := resumeSourceOffBus(wctx, c, logger, intent, srcVMID, srcViews, pctx)
+				if offErr != nil {
+					return offErr
 				}
+				srcCfg := offBus.Applied()
 				for key, volid := range FindUnusedDiskEntries(srcCfg) {
 					if volid != intent.Volid {
 						continue
@@ -740,6 +741,100 @@ func ResumeDiskTransferToParker(
 		return "", lockErr
 	}
 	return landed, nil
+}
+
+// resumeSourceOffBus is the start of the resume's move window. It returns the
+// source's views once no bus slot names the recorded volid, which is what the
+// move window needs before it reassigns an unused entry.
+//
+// A bus slot whose pending value names a different volume than its current
+// drive can't be detached until PVE applies the change, so the resume returns
+// DriveDeletePendingReplaced for the caller to class, the same reason the slot
+// delete and the transfer give. A bus slot that still names the volid without
+// a pending delete means the detach never happened, so this isn't a resume at
+// all. The identity scan
+// should have found it, and a race between the scan and this read is the only
+// path here. A bus slot whose delete is pending was left by a crash, an
+// earlier release, or an operator, and nothing may land on the parker until
+// the VM lets go of the disk. The resume can't tell whose delete it is. On a
+// running source the guest still has the disk and the VM's next clean stop
+// applies the delete, so the resume leaves it alone and hands back the typed
+// error for the caller to class. On a stopped source nothing applies it until
+// the VM starts, so a caller whose request moves the disk off the source has
+// the resume apply it now, through applyFoundPendingDelete.
+func resumeSourceOffBus(
+	ctx context.Context, c Client, logger *log.Logger,
+	intent DiskTransferIntent, srcVMID int, srcViews QemuViews, pctx ParkContext,
+) (QemuViews, error) {
+	slot, onBus := srcViews.BusSlotNaming(intent.Volid)
+	if !onBus {
+		return srcViews, nil
+	}
+	if _, replaced := srcViews.PendingReplacements()[slot]; replaced {
+		return QemuViews{}, &DriveDeletePendingError{Reason: DriveDeletePendingReplaced, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
+	}
+	if !srcViews.PendingDelete(slot) {
+		return QemuViews{}, cpierrors.Retriable(
+			"transfer resume: volume %q is still attached to source vm %d; re-resolve and retry",
+			intent.Volid, srcVMID)
+	}
+	applied, err := applyFoundPendingDelete(ctx, c, logger, intent.ParkerNode, srcVMID, slot, intent.Volid, pctx)
+	if err != nil {
+		return QemuViews{}, err
+	}
+	if !applied {
+		return QemuViews{}, &DriveDeletePendingError{Reason: DriveDeletePendingFound, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
+	}
+	after, err := ReadQemuViews(ctx, c, intent.ParkerNode, srcVMID)
+	if err != nil {
+		return QemuViews{}, cpierrors.Wrap(WrapConfigReadError(err),
+			fmt.Sprintf("transfer resume: re-read source vm %d after applying its pending delete", srcVMID))
+	}
+	if _, stillOnBus := after.BusSlotNaming(intent.Volid); stillOnBus {
+		return QemuViews{}, cpierrors.Retriable(
+			"transfer resume: volume %q is still on a slot of source vm %d after its pending delete was applied; re-resolve and retry",
+			intent.Volid, srcVMID)
+	}
+	return after, nil
+}
+
+// applyFoundPendingDelete applies a pending delete of slot that the resume
+// found on its source VM and didn't send, and reports whether it did. It does
+// so only when the caller asked for it and the source reads stopped. A stopped
+// VM applies every pending change with the next config write, which is what a
+// start would do anyway (API2/Qemu.pm:2595 and QemuServer.pm:5549 at
+// qemu-server a7b4240b), and the intent record already says the disk is
+// leaving this source. So the delete goes through DeleteDriveSlot, which
+// applies at once on a stopped VM.
+//
+// The source can start between the status read and the delete. Then
+// DeleteDriveSlot meets a running VM, and when the delete stays pending, it
+// reverts it and returns the busy or hotplug reason. The revert leaves the disk
+// on the slot where the running guest has it, and the caller fails retriably
+// or permanently as it does for its own delete, so that outcome is accepted.
+func applyFoundPendingDelete(ctx context.Context, c Client, logger *log.Logger, node string, vmid int, slot, volid string, pctx ParkContext) (bool, error) {
+	if !pctx.ApplyFoundPendingDelete {
+		return false, nil
+	}
+	status, err := c.QEMU().Status(ctx, node, vmid)
+	if err != nil {
+		return false, cpierrors.Wrap(WrapError(err), fmt.Sprintf("transfer resume: status of source vm %d", vmid))
+	}
+	if state, _ := ConfigString(status, "status"); state != "stopped" {
+		return false, nil
+	}
+	if logger != nil {
+		logger.Warn("transfer resume: applying a pending delete found on a stopped source",
+			log.Int("source_vmid", vmid),
+			log.String("slot", slot),
+			log.String("volid", volid),
+		)
+	}
+	if err := DeleteDriveSlot(ctx, c, logger, node, vmid, slot, volid, nil, parkerWindowMaxAttempts); err != nil {
+		return false, cpierrors.Wrap(err,
+			fmt.Sprintf("transfer resume: apply the pending delete of slot %s on stopped source vm %d", slot, vmid))
+	}
+	return true, nil
 }
 
 // resumeTargetSlot prefers the intent's recorded slot when it is still free

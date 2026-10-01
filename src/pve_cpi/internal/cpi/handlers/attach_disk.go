@@ -898,6 +898,12 @@ func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string
 //     unconfirmed revert fails the attach retriably. PVE used to cancel such
 //     a delete by accident when the attach happened to write the volume back
 //     onto the same slot, and the explicit revert replaces that.
+//   - If that slot carries a pending value naming a different volume than its
+//     current drive, the attach fails retriably with nothing changed. volid
+//     is then either the pending value, which the guest doesn't have yet, or
+//     the current drive, which the guest drops when the change applies, so
+//     neither is an idempotent reattach. PVE applies the change at the VM's
+//     next clean stop, or at its next start when the VM is already stopped.
 //   - If volid is present at scsi0 (legacy from prior CPI versions), the
 //     attachment is removed and a fresh scsi index >= 1 is chosen. Persistent
 //     disks orphaned at scsi0 have, by construction, never been successfully
@@ -919,6 +925,11 @@ func chooseSCSISlotSkippingZero(
 	}
 
 	if existing, ok := views.BusSlotNaming(volid); ok {
+		if _, replaced := views.PendingReplacements()[existing]; replaced {
+			return "", driveDeletePendingDiskError(op, &pve.DriveDeletePendingError{
+				Reason: pve.DriveDeletePendingReplaced, Node: node, VMID: vmid, Slot: existing,
+			})
+		}
 		if existing != diskKeyScsi0 {
 			if views.PendingDelete(existing) {
 				deps.Log(ctx).Warn(op+": the disk's slot has a pending delete on the target VM; reverting it before the reattach",

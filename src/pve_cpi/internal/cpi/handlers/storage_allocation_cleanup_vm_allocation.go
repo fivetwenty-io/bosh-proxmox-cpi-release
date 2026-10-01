@@ -210,11 +210,9 @@ func verifyCleanupAllocationReferences(ctx context.Context, deps Deps, node stri
 		if guest.Node == node && guest.VMID == vmid {
 			continue
 		}
-		cfg, err := deps.PVE.QEMU().Config(ctx, guest.Node, guest.VMID)
-		if err != nil {
-			return err
-		}
-		references, err := managedVMConfigVolumes(cfg)
+		// Both views, so a running guest that still has an artifact on a slot
+		// whose delete is pending keeps it referenced.
+		references, err := managedVMReferencedVolumes(ctx, deps, guest.Node, guest.VMID)
 		if err != nil {
 			return err
 		}

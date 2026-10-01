@@ -133,10 +133,10 @@ func TestCleanupVM_ForeignDisk_DetachedBeforePurge(t *testing.T) {
 	callLog := []string{}
 	qemuStub := &rbfdQEMUStub{
 		callLog: &callLog,
-		// Scan read sees the foreign disk; the slot-delete helper's reads, the
-		// confirm re-read, and the unusedN guard read see it gone after the
-		// detach.
-		configs: []map[string]any{rbfdForeignCfg(), rbfdCleanCfg(), rbfdCleanCfg()},
+		// Scan read and the slot-delete helper's read before its delete see
+		// the foreign disk; the helper's reads after it, the confirm re-read,
+		// and the unusedN guard read see it gone after the detach.
+		configs: []map[string]any{rbfdForeignCfg(), rbfdForeignCfg(), rbfdCleanCfg(), rbfdCleanCfg()},
 	}
 	nodesStub := &rbfdNodesStub{callLog: &callLog}
 	deps := rbfdDeps(qemuStub, nodesStub)

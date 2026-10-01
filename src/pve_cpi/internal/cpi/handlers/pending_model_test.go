@@ -72,6 +72,14 @@ func (m *fakePendingModel) run(vmid int) {
 	m.running[vmid] = true
 }
 
+// isRunning reports whether a VM is running, which is what a fake's status
+// read answers from.
+func (m *fakePendingModel) isRunning(vmid int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.running[vmid]
+}
+
 // issueStop records a stop issued through the API. A stop of a VM that isn't
 // running does nothing, the way vm_stop returns early without a pid, so its
 // pending changes stay.
@@ -185,6 +193,8 @@ func (m *fakePendingModel) dropHeld(vmid int) []string {
 // drive, the way PVE does when a volume is written onto a slot whose old drive
 // a running guest still holds. The fake's config, the applied view, takes the
 // pending value, and the model keeps the current one.
+//
+//nolint:unparam // vmid kept for parity with holdDelete and every other model method; every row so far uses VM 777
 func (m *fakePendingModel) holdReplacement(vmid int, cfg map[string]any, key string, pending any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -231,6 +241,14 @@ func (m *fakePendingModel) update(vmid int, cfg map[string]any, params *sdknodes
 			}
 		}
 		return true, nil
+	}
+	// Writing a key drops its pending delete, the way update_vm calls
+	// remove_from_pending_delete for every key it sets (API2/Qemu.pm:2571),
+	// and the fake then applies the write as it always has.
+	if fields, err := lifecycleMutationFields(params); err == nil {
+		for key := range fields {
+			delete(m.deletes[vmid], key)
+		}
 	}
 	if params.Delete == nil {
 		return false, nil

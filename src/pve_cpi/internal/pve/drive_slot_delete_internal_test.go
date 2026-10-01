@@ -393,3 +393,156 @@ func TestRetryLoops_StopOnAPendingDeleteError(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteDriveSlot_RefusesAReplacedKey covers a slot whose pending value
+// names a different volume than its current drive, which an attach onto a
+// slot whose delete was pending could leave on a running VM. A delete there
+// would either re-arm the old drive's pending delete or drop the pending
+// value's reference, so the helper reads the pending view first, sends no
+// delete and no revert, and returns the replaced reason with no CPI class.
+func TestDeleteDriveSlot_RefusesAReplacedKey(t *testing.T) {
+	t.Parallel()
+	const current, replacement = "data:vm-9001-disk-0", "data:vm-9002-disk-0"
+	for name, volid := range map[string]string{"the current drive": current, "the pending value": replacement} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := pendingDeleteWorld("network,usb")
+			c.configs[700]["scsi1"] = replacement + ",size=10G"
+			c.replaced = map[int]map[string]any{700: {"scsi1": current + ",size=10G"}}
+			err := DeleteDriveSlot(noBackoff(), c, nil, "pve1", 700, "scsi1", volid, nil, 3)
+			pending, ok := IsDriveDeletePending(err)
+			if !ok || pending.Reason != DriveDeletePendingReplaced || pending.VMID != 700 || pending.Node != "pve1" || pending.Slot != "scsi1" || pending.Cause != nil {
+				t.Fatalf("DeleteDriveSlot = %v, want the replaced reason on VM 700 node pve1 slot scsi1 with no cause", err)
+			}
+			var typed *cpierrors.Error
+			if errors.As(err, &typed) {
+				t.Fatalf("the helper chose class %s; the caller chooses it", typed.Type())
+			}
+			if len(c.events) != 0 {
+				t.Fatalf("events = %v, want no delete and no revert sent", c.events)
+			}
+			if value, _ := c.configs[700]["scsi1"].(string); value != replacement+",size=10G" || c.replaced[700]["scsi1"] != current+",size=10G" {
+				t.Fatalf("scsi1 = %q over %v, want both values left as they were", value, c.replaced[700]["scsi1"])
+			}
+		})
+	}
+}
+
+// TestFindVMByDiskVolid_ReplacedKeyHoldsBothVolumes covers the same slot seen
+// by the identity scan. The config endpoint shows the pending value there,
+// while the running guest still has the current drive. A scan for either
+// volume returns the VM and the slot, and the scan for the current drive says
+// the slot carries a replacement, which is how delete_disk knows to refuse it.
+func TestFindVMByDiskVolid_ReplacedKeyHoldsBothVolumes(t *testing.T) {
+	t.Parallel()
+	const current, replacement = "data:vm-9001-disk-0", "data:vm-9002-disk-0"
+	c := pendingDeleteWorld("")
+	c.configs[700]["scsi1"] = replacement + ",size=10G"
+	c.replaced = map[int]map[string]any{700: {"scsi1": current + ",size=10G"}}
+	for volid, want := range map[string]PendingChange{current: PendingChangeReplaced, replacement: PendingChangeNone} {
+		hit, found, err := findVMByDiskVolidHit(context.Background(), c, volid)
+		if err != nil || !found {
+			t.Fatalf("scan for %s: found=%v err=%v, want VM 700", volid, found, err)
+		}
+		if hit.VMID != 700 || hit.Node != "pve1" || hit.Slot != "scsi1" || hit.Volid != volid || hit.PendingChange != want {
+			t.Fatalf("scan for %s = %+v, want VM 700 node pve1 slot scsi1 with pending change %q", volid, hit, want)
+		}
+	}
+}
+
+// replacedTransferWorld is VM 700 running with scsi1 keeping current as its
+// drive while a pending value names replacement, and an empty parker 90000.
+func replacedTransferWorld(current, replacement string) *scanFakeClient {
+	c := newScanFakeClient(map[int]map[string]any{
+		700: {"scsi1": replacement + ",size=10G"},
+		90000: {
+			cfgKeyTags:      "bosh-cpi;bosh-parker",
+			paramProtection: true,
+		},
+	})
+	c.running = map[int]bool{700: true}
+	c.replaced = map[int]map[string]any{700: {"scsi1": current + ",serial=" + transferStableID + ",size=10G"}}
+	return c
+}
+
+// TestTransferDiskToParker_RefusesAReplacedSlotBeforeWriting covers a source
+// slot whose pending value names a different volume than its current drive.
+// The transfer can't detach the volume there until PVE applies the change, so
+// it refuses with the replaced reason before it creates a parker or writes an
+// intent record, whichever side of the replacement the moved volume is on.
+// The current side is the drive the running guest has, and the pending side is
+// the volume an attach onto a slot whose delete was pending can leave there.
+func TestTransferDiskToParker_RefusesAReplacedSlotBeforeWriting(t *testing.T) {
+	t.Parallel()
+	const current, replacement = "data:vm-9001-disk-0", "data:vm-9002-disk-0"
+	for name, volid := range map[string]string{"current side": current, "pending side": replacement} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := replacedTransferWorld(current, replacement)
+			pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+			_, err := TransferDiskToParker(noBackoff(), c, nil, "pve1", 700, volid, transferTestCfg, pctx)
+			pending, ok := IsDriveDeletePending(err)
+			if !ok || pending.Reason != DriveDeletePendingReplaced || pending.VMID != 700 || pending.Slot != "scsi1" {
+				t.Fatalf("TransferDiskToParker = %v, want the replaced reason on VM 700 slot scsi1", err)
+			}
+			if len(c.events) != 0 {
+				t.Fatalf("events = %v, want no parker write, intent record, delete, or move", c.events)
+			}
+			if len(c.configs) != 2 {
+				t.Fatalf("guests after the refusal = %d, want no parker created", len(c.configs))
+			}
+			if desc, _ := c.configs[90000]["description"].(string); desc != "" {
+				t.Fatalf("parker 90000 description = %q, want no intent record", desc)
+			}
+		})
+	}
+}
+
+// TestTransferDiskToParker_PreCheckReadFailureLeavesTheWindowToDecide covers
+// a pending read that fails before the transfer opens its parker window. The
+// pre-check leaves the decision to the source read inside the window, as the
+// transfer made it before the pre-check existed. On a replaced slot that read
+// leads to the slot delete's own refusal, after the intent record, with no
+// delete sent. On an ordinary slot the transfer parks the disk.
+func TestTransferDiskToParker_PreCheckReadFailureLeavesTheWindowToDecide(t *testing.T) {
+	t.Parallel()
+	const current, replacement = "data:vm-9001-disk-0", "data:vm-9002-disk-0"
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+	readErr := errors.New("pending read failed once")
+
+	t.Run("replaced slot", func(t *testing.T) {
+		t.Parallel()
+		c := replacedTransferWorld(current, replacement)
+		c.pendingErrOnce = map[int]error{700: readErr}
+		_, err := TransferDiskToParker(noBackoff(), c, nil, "pve1", 700, current, transferTestCfg, pctx)
+		pending, ok := IsDriveDeletePending(err)
+		if !ok || pending.Reason != DriveDeletePendingReplaced {
+			t.Fatalf("TransferDiskToParker = %v, want the slot delete's replaced refusal", err)
+		}
+		if c.eventIndex("description:90000") < 0 {
+			t.Fatalf("events = %v, want the intent record written inside the window", c.events)
+		}
+		if c.eventIndex("pending-delete:") >= 0 || c.eventIndex("config-delete:") >= 0 || c.eventIndex("move:") >= 0 {
+			t.Fatalf("events = %v, want no delete or move sent", c.events)
+		}
+	})
+
+	t.Run("ordinary slot", func(t *testing.T) {
+		t.Parallel()
+		c := newScanFakeClient(map[int]map[string]any{
+			700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
+			90000: {
+				cfgKeyTags:      "bosh-cpi;bosh-parker",
+				paramProtection: true,
+			},
+		})
+		c.pendingErrOnce = map[int]error{700: readErr}
+		landed, err := TransferDiskToParker(noBackoff(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg, pctx)
+		if err != nil {
+			t.Fatalf("TransferDiskToParker after a failed pre-check read: %v", err)
+		}
+		if !strings.HasPrefix(landed, "data:vm-90000-disk-") {
+			t.Fatalf("landed volid = %q, want a parker-named volume", landed)
+		}
+	})
+}

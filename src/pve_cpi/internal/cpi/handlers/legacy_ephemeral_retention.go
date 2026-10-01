@@ -108,6 +108,9 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 	parkContext := pve.ParkContext{DiskCID: cid, SourceVMCID: vmCID, StableID: meta.ID}
 	switch {
 	case identity.intent != nil:
+		// The retention moves the volume off the VM it is destroying, so a
+		// resume applies a pending delete it finds on the stopped source.
+		parkContext.ApplyFoundPendingDelete = true
 		parkerCfg := parkerWriteConfigFor(deps)
 		if _, err := resumeDiskTransferToParker(ctx, deps.PVE, logger, *identity.intent, meta.ID, parkerCfg, parkContext); err != nil {
 			return err

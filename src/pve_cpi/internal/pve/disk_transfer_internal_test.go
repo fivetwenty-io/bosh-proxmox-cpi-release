@@ -57,6 +57,14 @@ type scanFakeClient struct {
 	// with its current value. The config read serves the applied view
 	// without them, and the pending endpoint reports them.
 	held map[int]map[string]any
+	// replaced holds, per VM, each key whose config value is a pending value
+	// that replaces a different current drive, with that current value. The
+	// config read serves the pending value, and the pending endpoint reports
+	// both.
+	replaced map[int]map[string]any
+	// pendingErrOnce fails the next pending read of each listed VM with its
+	// error, and only that read.
+	pendingErrOnce map[int]error
 	// revertErr, when set, fails every revert, and revertKeepsPending makes
 	// every revert succeed without dropping the pending delete.
 	revertErr          error
@@ -279,9 +287,19 @@ func (c *scanFakeClient) revertLocked(cfg map[string]any, vmid int, keys string)
 }
 
 // listQemuPending serves the pending endpoint from the config read, so an
-// injected config failure fails it the same way, and adds each held key with
-// its current value and a delete flag.
+// injected config failure fails it the same way. A replaced key comes with its
+// current value and its pending one, and each held key comes with its current
+// value and a delete flag.
 func (c *scanFakeClient) listQemuPending(ctx context.Context, node, vmidText string) (*sdknodes.ListQemuPendingResponse, error) {
+	if vmid, err := strconv.Atoi(vmidText); err == nil {
+		c.mu.Lock()
+		failure, once := c.pendingErrOnce[vmid]
+		delete(c.pendingErrOnce, vmid)
+		c.mu.Unlock()
+		if once {
+			return nil, failure
+		}
+	}
 	resp, err := PendingFromConfigRead(ctx, c.QEMU().Config, node, vmidText)
 	if err != nil {
 		return nil, err
@@ -289,6 +307,22 @@ func (c *scanFakeClient) listQemuPending(ctx context.Context, node, vmidText str
 	vmid, _ := strconv.Atoi(vmidText)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	for i, raw := range *resp {
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, err
+		}
+		key, _ := item["key"].(string)
+		current, isReplaced := c.replaced[vmid][key]
+		if !isReplaced {
+			continue
+		}
+		rewritten, err := json.Marshal(map[string]any{"key": key, "value": current, "pending": item["value"]})
+		if err != nil {
+			return nil, err
+		}
+		(*resp)[i] = rewritten
+	}
 	keys := make([]string, 0, len(c.held[vmid]))
 	for key := range c.held[vmid] {
 		keys = append(keys, key)

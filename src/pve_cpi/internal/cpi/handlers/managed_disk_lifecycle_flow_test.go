@@ -62,6 +62,22 @@ type lifecycleFlowPVE struct {
 	// delete flag. Without it every delete applies at once, as on a stopped
 	// VM.
 	pending *fakePendingModel
+	// afterMove, when set, runs after each move_disk lands, so a row can
+	// change a VM while an operation is between its steps.
+	afterMove func()
+	// unlinkedVolumes are volumes a bus-slot delete leaves without an
+	// unusedN entry, the way PVE drops a volume the VM doesn't own, while
+	// every other delete keeps the fake's usual demotion.
+	unlinkedVolumes map[string]bool
+	// afterConfigWrite, when set, runs after each config write the fake
+	// applies, with the VM it wrote, and onContentRead runs before each
+	// single-volume content read, with the volume. Both let a row change
+	// a VM while an operation is between its steps.
+	afterConfigWrite func(vmid int)
+	onContentRead    func(volume string)
+	// unlisted hides VMs from the guest listings, the way a listing that
+	// hasn't caught up with a guest does, while their configs still answer.
+	unlisted map[int]bool
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -419,6 +435,9 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 		delete(n.c.state.volumes, deletedVolume)
 		n.c.volumeDeleted()
 	}
+	if detachedVolume != "" && n.c.unlinkedVolumes[detachedVolume] {
+		n.c.dropUnusedEntries(vmid, detachedVolume)
+	}
 	if n.c.foreignUnlink && p.Delete != nil && !strings.HasPrefix(*p.Delete, "unused") {
 		for slot := range pve.FindUnusedDiskEntries(cfg) {
 			delete(cfg, slot)
@@ -426,6 +445,9 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	}
 	n.c.generation++
 	cfg["digest"] = fmt.Sprint(n.c.generation + 100)
+	if n.c.afterConfigWrite != nil {
+		n.c.afterConfigWrite(vmid)
+	}
 	return nil
 }
 func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sourceText string, p *nodes.CreateQemuMoveDiskParams) (*nodes.CreateQemuMoveDiskResponse, error) {
@@ -467,6 +489,9 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 	source["digest"] = fmt.Sprint(n.c.generation + 100)
 	n.c.generation++
 	target["digest"] = fmt.Sprint(n.c.generation + 100)
+	if n.c.afterMove != nil {
+		n.c.afterMove()
+	}
 	raw := json.RawMessage(`"UPID:n1:move"`)
 	return &raw, nil
 }
@@ -615,6 +640,9 @@ func TestManagedDiskBareCIDRecoversJournalToken(t *testing.T) {
 }
 
 func (n lifecycleFlowNodes) GetStorageContent(ctx context.Context, node, pool, volume string) (*nodes.GetStorageContentResponse, error) {
+	if n.c.onContentRead != nil {
+		n.c.onContentRead(pool + ":" + volume)
+	}
 	if _, exists := n.c.state.volumes[pool+":"+volume]; !exists || n.c.localStorage && n.c.volumeNodes[pool+":"+volume] != node {
 		return nil, sdkerrors.ParseAPIError(404, []byte(`{"message":"volume not found"}`))
 	}
@@ -636,7 +664,7 @@ func (q lifecycleFlowQEMU) Config(ctx context.Context, node string, vmid int) (m
 func (n lifecycleFlowNodes) ListQemu(_ context.Context, node string, _ *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
 	rows := nodes.ListQemuResponse{}
 	for id, cfg := range n.c.state.configs {
-		if n.c.vmNode(id) != node {
+		if n.c.vmNode(id) != node || n.c.unlisted[id] {
 			continue
 		}
 		raw, _ := json.Marshal(map[string]any{"vmid": id, "tags": cfg["tags"], "name": cfg["name"]})
@@ -686,6 +714,9 @@ func (c lifecycleFlowCluster) ListStatus(context.Context) (*cluster.ListStatusRe
 func (c lifecycleFlowCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	r := make(cluster.ListResourcesResponse, 0, len(c.c.state.configs))
 	for id, cfg := range c.c.state.configs {
+		if c.c.unlisted[id] {
+			continue
+		}
 		raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": id, "node": c.c.vmNode(id), "tags": cfg["tags"]})
 		r = append(r, raw)
 	}
@@ -762,8 +793,24 @@ func TestManagedDiskSharedMigrationAfterSetRemoval(t *testing.T) {
 	}
 }
 
-func (q lifecycleFlowQEMU) Status(context.Context, string, int) (map[string]any, error) {
+// Status reports a VM the pending model runs as running, and every other VM
+// as stopped.
+func (q lifecycleFlowQEMU) Status(_ context.Context, _ string, vmid int) (map[string]any, error) {
+	if q.c.pending != nil && q.c.pending.isRunning(vmid) {
+		return map[string]any{"status": "running"}, nil
+	}
 	return map[string]any{"status": "stopped"}, nil
+}
+
+// Stop stops a VM the pending model runs and completes the stop at once, the
+// way vm_stop_cleanup applies the VM's pending changes when a stop finishes, so
+// the stop's task is already done when the caller awaits it.
+func (q lifecycleFlowQEMU) Stop(_ context.Context, _ string, vmid int) (string, error) {
+	if q.c.pending != nil {
+		q.c.pending.issueStop(vmid)
+		q.c.pending.completeStops(q.c.state.configs)
+	}
+	return "UPID:n1:stop", nil
 }
 func (c lifecycleFlowCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
 	return nil, &sdkerrors.APIError{Code: 404, Message: "not found"}

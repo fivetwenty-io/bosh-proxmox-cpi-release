@@ -642,19 +642,37 @@ type DiskScanHit struct {
 	// deleted the slot of a guest that owns its birth name and the move never
 	// finished.
 	Unused []VolumeReference
-	// PendingDelete is true when the matching slot has a delete PVE could
-	// only record as pending, so the slot is missing from the config
-	// endpoint's view while the running guest still has the disk.
-	PendingDelete bool
+	// PendingChange says what is pending on the matching slot when the match
+	// came from the current view only. PendingChangeDelete means PVE could
+	// only record the slot's delete as pending, so the slot is missing from
+	// the config endpoint's view while the running guest still has the disk.
+	// PendingChangeReplaced means the slot's pending value names another
+	// volume, so the config endpoint shows that volume while the running
+	// guest still has this one.
+	PendingChange PendingChange
 }
 
-// pendingDeleteSlotOf returns the hit's slot when its delete is pending, and
-// the empty string otherwise.
-func pendingDeleteSlotOf(hit DiskScanHit) string {
-	if hit.PendingDelete {
-		return hit.Slot
+// PendingChange is the kind of pending change on a disk's slot that hides the
+// disk from the config endpoint's view while the running guest still has it.
+type PendingChange string
+
+const (
+	// PendingChangeNone means the config endpoint's view shows the disk.
+	PendingChangeNone PendingChange = ""
+	// PendingChangeDelete means the slot's delete is pending.
+	PendingChangeDelete PendingChange = "delete"
+	// PendingChangeReplaced means the slot's pending value names another
+	// volume.
+	PendingChangeReplaced PendingChange = "replaced"
+)
+
+// pendingSlotOf returns the hit's slot and the kind of change pending on it,
+// or an empty slot when nothing pending hides the disk.
+func pendingSlotOf(hit DiskScanHit) (string, PendingChange) {
+	if hit.PendingChange == PendingChangeNone {
+		return "", PendingChangeNone
 	}
-	return ""
+	return hit.Slot, hit.PendingChange
 }
 
 // StorageReferenceCounts maps a storage name to the number of volumes the
@@ -888,11 +906,23 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
 			}, nil
 		}
-		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(views.Current()), volid, stableID); ok && views.PendingDelete(slot) {
-			tags, _ := ConfigString(cfg, "tags")
-			return DiskScanHit{
-				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts, PendingDelete: true,
-			}, nil
+		// The current view also counts a slot whose pending value names
+		// another volume, because the running guest still has its current
+		// drive until PVE applies the change at the next clean stop or start.
+		replacements := views.PendingReplacements()
+		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(views.Current()), volid, stableID); ok {
+			change := PendingChangeNone
+			if views.PendingDelete(slot) {
+				change = PendingChangeDelete
+			} else if _, replaced := replacements[slot]; replaced {
+				change = PendingChangeReplaced
+			}
+			if change != PendingChangeNone {
+				tags, _ := ConfigString(cfg, "tags")
+				return DiskScanHit{
+					VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts, PendingChange: change,
+				}, nil
+			}
 		}
 		if stableID != "" {
 			for key, value := range FindUnusedDiskEntries(cfg) {

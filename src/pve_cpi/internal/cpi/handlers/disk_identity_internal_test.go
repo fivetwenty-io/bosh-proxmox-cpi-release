@@ -54,6 +54,10 @@ type idFakeClient struct {
 	// hasn't caught up with a guest does, so the identity scan misses them
 	// while their configs still answer.
 	unlisted map[int]bool
+	// staleStopped makes the status read report these VMs stopped whatever
+	// the pending model says, the way a status read that lands just before
+	// the VM starts does.
+	staleStopped map[int]bool
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -131,6 +135,15 @@ func (q *idFakeQEMU) DetachDisk(_ context.Context, _ string, vmid int, diskID st
 		q.c.destroyed = append(q.c.destroyed, bare)
 	}
 	return nil
+}
+
+// Status reports a VM the pending model runs as running, and every other VM
+// as stopped.
+func (q *idFakeQEMU) Status(_ context.Context, _ string, vmid int) (map[string]any, error) {
+	if q.c.pending != nil && q.c.pending.isRunning(vmid) && !q.c.staleStopped[vmid] {
+		return map[string]any{"status": "running"}, nil
+	}
+	return map[string]any{"status": "stopped"}, nil
 }
 
 type idFakeNodes struct {

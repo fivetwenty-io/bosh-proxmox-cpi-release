@@ -20,12 +20,22 @@ var managedVMVolumeSlot = regexp.MustCompile(`^(scsi|virtio|sata|ide|unused|efid
 // outside the VM allocation's exact owned volume set. The caller holds the VM
 // generation lock and supplies its original services. Each managed disk acquires
 // its own allocation lock. Unknown volumes prevent every preservation mutation.
+//
+// It runs after delete_vm's stop, and it reads what the destroy would take
+// from both of PVE's views. A crash or a kill can leave a stopped VM with a
+// slot whose delete is pending, which the config endpoint hides, while
+// destroy_vm frees owned drives from the current config. A slot whose pending
+// value names another volume is refused retriably, as on the legacy path,
+// because the stop before this read has had its chance to apply the change.
 func detachManagedPersistentForVMDelete(ctx context.Context, deps Deps, node string, vmid int, ownedVolumes map[string]bool, handle *aj.Handle) error {
-	config, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return fmt.Errorf("read VM disks before preservation: %w", err)
 	}
-	disks, err := managedVMPreservationCandidates(ctx, deps, node, vmid, config, ownedVolumes)
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
+		return err
+	}
+	disks, err := managedVMPreservationCandidates(ctx, deps, node, vmid, holding.Config, ownedVolumes)
 	if err != nil {
 		return err
 	}
@@ -34,11 +44,14 @@ func detachManagedPersistentForVMDelete(ctx context.Context, deps Deps, node str
 			return err
 		}
 	}
-	config, err = deps.PVE.QEMU().Config(ctx, node, vmid)
+	holding, err = pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return fmt.Errorf("read VM after persistent disk preservation: %w", err)
 	}
-	volumes, err := managedVMConfigVolumes(config)
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
+		return err
+	}
+	volumes, err := managedVMConfigVolumes(holding.Config)
 	if err != nil {
 		return err
 	}
@@ -242,11 +255,19 @@ func verifyLegacyDiskPreservation(ctx context.Context, deps Deps, disk resolvedD
 // An active non-force config delete cannot free an ordinary disk. If PVE
 // registers an unused entry, the VM owns its physical volume: deleting that
 // entry would free it, so preserve it and stop instead of sweeping.
+//
+// Both reads take both of PVE's views, so a slot a crash left with its delete
+// pending still counts as the disk's slot, and the delete sent to it applies
+// at once on the stopped VM.
 func unlinkLegacyPersistentForVMDelete(ctx context.Context, deps Deps, node string, vmid int, disk resolvedDisk) error {
-	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return err
 	}
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
+		return err
+	}
+	cfg := holding.Config
 	volumes, err := managedVMConfigVolumes(cfg)
 	if err != nil {
 		return err
@@ -267,11 +288,14 @@ func unlinkLegacyPersistentForVMDelete(ctx context.Context, deps Deps, node stri
 	if err := managedDeleteSlot(ctx, deps.PVE, node, vmid, slot, cfg); err != nil {
 		return err
 	}
-	after, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	after, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return err
 	}
-	remaining, err := managedVMConfigVolumes(after)
+	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), after); err != nil {
+		return err
+	}
+	remaining, err := managedVMConfigVolumes(after.Config)
 	if err != nil {
 		return err
 	}
