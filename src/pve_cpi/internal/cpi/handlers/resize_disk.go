@@ -74,6 +74,9 @@ func HandleResizeDisk(deps Deps) Handler {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
+		if err := refuseStrandedDisk(deps, "resize_disk", rd); err != nil {
+			return nil, err
+		}
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "resize_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr

@@ -754,7 +754,7 @@ The VM's description carries a `bosh_attached_disks` entry for each disk the CPI
 
 Never remove the unused entry, unlink it, or destroy the VM by hand while it is there. When the volume's name carries the VM's VMID, PVE deletes the volume in each of those cases.
 
-On this release, we start by retrying the failed task or rerunning the deploy. The parker keeps its record of the transfer while the VM still names the volume, so the retried `detach_disk` usually finishes the move on its own and the unused entry goes away. We go further only when `detach_disk` succeeds and the unused entry is still there, which happens when an earlier release already removed the record.
+On this release, we start by retrying the failed task or rerunning the deploy. The parker keeps its record of the transfer while the VM still names the volume, so the retried `detach_disk` usually finishes the move on its own and the unused entry goes away. When the unused entry still carries the name the volume was created with, the retried `detach_disk` also finds it without the record and moves it. We go further only when `detach_disk` succeeds and the unused entry is still there, which happens when an earlier release already removed the record.
 
 Before we touch anything, all four of these checks have to pass. If any one of them fails, or if more than one disk could be the candidate, we stop and leave the VM, its unused entry, and every parker exactly as they are.
 
@@ -783,6 +783,34 @@ PVE drops the unused entry when it sees the same volume attached again, and it f
 A journal-managed disk also stays in `reconciliation_required` after the failed move, at a planned `lifecycle_detach_disk_Nodes_CreateQemuMoveDisk` step. No `storage-journal` command settles that step yet, so leave the VM and its unused entry exactly as they are. `storage-journal audit --summary` shows the allocation and the volume it still holds on the VM.
 
 For ordinary drift, run `bosh -d <deployment> cloud-check` to reconcile state. The Director offers to detach the disks and clean up the record. If the deployment can't be recovered, detach the disks with `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
+
+### delete_disk refuses a disk stranded on an unused entry
+
+**Symptom**
+
+```text
+delete_disk: refusing to delete disk <cid>, because VM <N> on node <node> still names its volume <volid> as unusedN, and no other configuration does. Removing that entry by hand makes PVE free the volume. Nothing was deleted; see "delete_disk refuses a disk stranded on an unused entry" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+```
+
+Other calls refuse the same disk with the same pointer. `detach_disk` from a VM other than `<N>`, `attach_disk` on a journal-managed disk, `resize_disk`, and `snapshot_disk` each name the unused entry the same way. When more than one unused entry names the volume, or the only one sits on a VM in the parker band, every call refuses, because those entries can't be tied to one guest.
+
+**Diagnosis**
+
+The disk's move to a parker stopped after the CPI deleted its slot on VM `<N>`, and the parker's record of the transfer was lost afterwards, which releases before 0.9.0 did once the record was an hour old. The volume's name carries VM `<N>`'s own VMID, which can happen after the VM band was moved over VMIDs that still name disks, so PVE kept the volume on an unused entry instead of letting it go. No slot carries the disk's serial. The Director treats the disk as orphaned, so it sends `delete_disk` and has no detach to send.
+
+**Fix**
+
+As in the section above, never destroy VM `<N>` by hand while the entry is there. There are two ways out, and the one we take depends on whether we want to keep the disk.
+
+To keep the disk, we attach it to an instance with `bosh -d <deployment> attach-disk <instance-group>/<id> <cid>`. The attach moves the volume off VM `<N>`'s unused entry onto a parker first and then attaches it to the instance, so it ends up with one reference. That works for a disk without an allocation journal. A journal-managed disk refuses the attach for now, so we leave it exactly as it is and run `storage-journal audit --summary` to see its allocation.
+
+To delete the disk, we run checks 2 through 4 from the section above against VM `<N>`, with the CID from the refusal. This is the one case where removing the unused entry is right, because removing it frees the volume, and freeing the volume is the delete the Director asked for. If any of those checks fails, we stop and leave the VM and its entry as they are. Only when all of them pass do we remove the entry:
+
+```bash
+qm set <N> --delete unusedN
+```
+
+Then we rerun the clean-up, for example with `bosh clean-up --all`. The next `delete_disk` finds that the volume is gone and finishes.
 
 ## Network, bridge, and SDN failures
 

@@ -171,6 +171,9 @@ func ObserveStorageExistingVolumes(ctx context.Context, deps Deps, cids []string
 		if resolved.intent != nil {
 			return nil, planError(StoragePlanReconciliation, "existing disk has interrupted transfer: %s", cid)
 		}
+		if len(resolved.unused) > 0 {
+			return nil, planError(StoragePlanReconciliation, "existing disk is stranded on an unused entry: %s", cid)
+		}
 		holder := resolved.holder
 		if holder == nil {
 			found, err := pve.ResolveDiskHolder(ctx, deps.PVE, deps.Log(ctx), resolved.volid, parkerReadConfigFor(deps))

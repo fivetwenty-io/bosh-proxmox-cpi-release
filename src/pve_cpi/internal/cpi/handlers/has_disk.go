@@ -67,7 +67,7 @@ func HandleHasDisk(deps Deps) Handler {
 			// visibility. Do not replace that proof with a legacy image probe.
 			return !rd.allocation.terminalAbsent && !rd.allocation.absent, nil
 		}
-		if rd.holder != nil || rd.intent != nil {
+		if rd.holder != nil || rd.intent != nil || len(rd.unused) > 0 {
 			deps.Log(ctx).Debug("has_disk: resolved by identity scan",
 				log.String("disk_cid", diskCID),
 				log.String("volid", rd.volid),

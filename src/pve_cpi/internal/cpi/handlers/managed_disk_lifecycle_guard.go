@@ -579,7 +579,7 @@ func (g *managedDiskLifecycleGuard) prepareDeletion(ctx context.Context, call Ma
 		return fmt.Errorf("delete refers to an unrelated volume")
 	}
 	current, identityErr := resolveDiskForOp(ctx, m.deps, "delete_disk_pre_submission", m.disk.diskCID, m.disk.birth, m.disk.meta)
-	if identityErr != nil || current.intent != nil || current.holder != nil {
+	if identityErr != nil || current.intent != nil || current.holder != nil || len(current.unused) > 0 {
 		return fmt.Errorf("storage deletion requires a volume with no remaining guest references")
 	}
 	exists, err := managedVolumePresent(ctx, m.deps, node, volume)

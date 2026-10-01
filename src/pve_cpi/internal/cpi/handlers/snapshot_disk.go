@@ -63,6 +63,9 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
+		if err := refuseStrandedDisk(deps, "snapshot_disk", rd); err != nil {
+			return nil, err
+		}
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "snapshot_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
