@@ -29,13 +29,20 @@ type cleanupSettlement struct {
 	CompletedDeletion     *aj.Target                        `json:"completed_deletion,omitempty"`
 }
 
-func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Record, decision StorageAllocationDecision) (context.Context, *cleanupSettlement, error) {
+// admitStorageCleanupSettlement admits the open steps of record that this
+// cleanup can settle by fresh observation. gaps are the reasons lock and
+// protection settlement left steps planned, and a refusal of a step it cannot
+// admit names that step with its own reason. A refusal for missing
+// attestations names the first step it admitted and the storage-journal flags
+// the decision lacks.
+func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Record, decision StorageAllocationDecision, gaps map[string]error) (context.Context, *cleanupSettlement, error) {
 	recovered, err := cleanupRecoveredTask(record, decision)
 	if err != nil {
 		return ctx, nil, err
 	}
 	proof := &cleanupSettlement{AllocationID: record.ID, Attempt: record.ActiveAttempt(), Steps: map[string]string{}, RecoveredTask: recovered}
 	var upids []string
+	admitted := ""
 	for i := range record.Steps {
 		original := &record.Steps[i]
 		effective := *original
@@ -78,7 +85,7 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 				proof.UnknownDiskAllocation = true
 			case cleanupPersistentHandoffStep(*step, record):
 			case !cleanupConfigStep(*step, record):
-				return ctx, nil, storageRefusal("cleanup refuses unresolved allocation or asynchronous mutation")
+				return ctx, nil, storageRefusal("cleanup refuses unresolved allocation or asynchronous mutation; " + unsettledStepName(*original) + unsettledStepReason(*original, gaps))
 			}
 		}
 		hash, err := aj.Fingerprint(*original)
@@ -86,12 +93,15 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 			return ctx, nil, err
 		}
 		proof.Steps[step.ID] = hash
+		if admitted == "" {
+			admitted = unsettledStepName(*original)
+		}
 	}
 	if len(proof.Steps) == 0 {
 		return ctx, nil, nil
 	}
-	if !decision.PreviousWriterFenced || !decision.RemoteTasksSettled || strings.TrimSpace(decision.AuthorityID) == "" {
-		return ctx, nil, storageRefusal("pending mutation cleanup requires explicit writer fencing and independently settled remote tasks")
+	if missing := cleanupMissingAttestations(decision); len(missing) > 0 {
+		return ctx, nil, storageRefusal("pending mutation cleanup requires explicit writer fencing and independently settled remote tasks; " + admitted + "; rerun with " + joinWithOxfordComma(missing))
 	}
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {
@@ -106,6 +116,39 @@ func admitStorageCleanupSettlement(ctx context.Context, deps Deps, record aj.Rec
 		return ctx, nil, err
 	}
 	return context.WithValue(ctx, cleanupSettlementKey{}, proof), proof, nil
+}
+
+// cleanupMissingAttestations names the storage-journal flags that a cleanup
+// of pending mutations needs and decision lacks, always in the same order. The
+// names are the CLI's flags in cmd/cpi/storage_journal.go, because that CLI is
+// the only production caller of CleanupStorageAllocation.
+func cleanupMissingAttestations(decision StorageAllocationDecision) []string {
+	var missing []string
+	if !decision.PreviousWriterFenced {
+		missing = append(missing, "--previous-writer-fenced")
+	}
+	if !decision.RemoteTasksSettled {
+		missing = append(missing, "--remote-tasks-settled")
+	}
+	if strings.TrimSpace(decision.AuthorityID) == "" {
+		missing = append(missing, "--authority-id")
+	}
+	return missing
+}
+
+// joinWithOxfordComma joins items as a list in prose: "a", "a and b", or "a,
+// b, and c".
+func joinWithOxfordComma(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+	}
 }
 
 func cleanupConfigStep(step aj.Step, record aj.Record) bool {
@@ -153,7 +196,18 @@ func cleanupConfigStep(step aj.Step, record aj.Record) bool {
 // storageCleanupSettled is storageOperationSettled for explicit cleanup and
 // delete_vm, whose refusals name cleanup.
 func storageCleanupSettled(ctx context.Context, record aj.Record) error {
-	return storageOperationSettled(ctx, "cleanup", record)
+	return storageOperationSettled(ctx, "cleanup", record, nil)
+}
+
+// storageCleanupSettledAfter is storageCleanupSettled for delete_vm, which has
+// just run settlePlannedLockSteps on record. gaps is what settlement returned,
+// and the refusal adds why settlement left the step it names planned, the way
+// adopt's refusal does.
+func storageCleanupSettledAfter(ctx context.Context, record aj.Record, gaps map[string]error) error {
+	if gaps == nil {
+		gaps = map[string]error{}
+	}
+	return storageOperationSettled(ctx, "cleanup", record, gaps)
 }
 
 // storageOperationSettled permits only the exact pending configuration, ISO
@@ -161,8 +215,10 @@ func storageCleanupSettled(ctx context.Context, record aj.Record) error {
 // by this explicit cleanup invocation. New failed cleanup steps, ordinary
 // lifecycle calls and allocation replay retain strict refusal. operation names
 // the call in the refusal, such as attach_disk for an ordinary lifecycle call,
-// so the Director's error says which call found the unsettled step.
-func storageOperationSettled(ctx context.Context, operation string, record aj.Record) error {
+// so the Director's error says which call found the unsettled step. When gaps
+// is not nil, the caller has just run settlement, and the refusal for an
+// unsettled step adds the reason settlement left it planned.
+func storageOperationSettled(ctx context.Context, operation string, record aj.Record, gaps map[string]error) error {
 	proof, _ := ctx.Value(cleanupSettlementKey{}).(*cleanupSettlement)
 	for i := range record.Steps {
 		step := &record.Steps[i]
@@ -170,11 +226,15 @@ func storageOperationSettled(ctx context.Context, operation string, record aj.Re
 			continue
 		}
 		if proof == nil || proof.AllocationID != record.ID || proof.Attempt != record.ActiveAttempt() {
-			return storageRefusal(operation + " has unresolved mutation evidence; " + unsettledStepName(*step))
+			text := unsettledStepName(*step)
+			if gaps != nil {
+				text += unsettledStepReason(*step, gaps)
+			}
+			return storageRefusal(operation + " has unresolved mutation evidence; " + text)
 		}
 		hash, err := aj.Fingerprint(*step)
 		if err != nil || proof.Steps[step.ID] != hash {
-			return storageRefusal(operation + " has new or changed unresolved mutation evidence")
+			return storageRefusal(operation + " has new or changed unresolved mutation evidence; " + unsettledStepName(*step))
 		}
 	}
 	return nil

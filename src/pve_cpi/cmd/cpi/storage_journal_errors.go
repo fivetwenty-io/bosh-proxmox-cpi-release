@@ -30,13 +30,6 @@ type storageJournalFixedError string
 
 func (e storageJournalFixedError) Error() string { return string(e) }
 
-// storageJournalSentinels are the journal's own error classes. Each renders
-// as its fixed text, followed by the fixed detail the journal put after it.
-var storageJournalSentinels = []error{
-	aj.ErrNotInitialized, aj.ErrConflict, aj.ErrReconciliationRequired,
-	aj.ErrAuthority, aj.ErrCorrupt, aj.ErrClosed,
-}
-
 // storageJournalFail prints message and, when err is not nil, a description of
 // err that is safe to show. It never prints err.Error() for an error it does
 // not recognise, because transport and decode errors can carry response
@@ -50,8 +43,9 @@ func storageJournalFail(stderr io.Writer, message string, err error) {
 
 // describeStorageJournalError renders the journal, filesystem, decode, and
 // CLI errors the storage-journal commands meet, and hands everything else to
-// pve.DescribeAuditError. The result is scrubbed, flattened to one line, and
-// capped in length.
+// pve.DescribeAuditError. The errors the journal owns and filesystem path
+// errors render as the allocation journal renders them for every caller. The
+// result is scrubbed, flattened to one line, and capped in length.
 func describeStorageJournalError(err error) string {
 	if err == nil {
 		return ""
@@ -61,18 +55,8 @@ func describeStorageJournalError(err error) string {
 
 //nolint:gocyclo // One flat classification table reads better than nested helpers.
 func storageJournalErrorText(err error) string {
-	var unsafe *aj.UnsafePathError
-	if errors.As(err, &unsafe) {
-		return unsafe.Error()
-	}
-	var durability *aj.DurabilityError
-	if errors.As(err, &durability) {
-		return "journal durability failure; reconcile before mutation (" + storageJournalErrorText(durability.Err) + ")"
-	}
-	for _, sentinel := range storageJournalSentinels {
-		if errors.Is(err, sentinel) {
-			return storageJournalLead(err, sentinel.Error())
-		}
+	if text, ok := aj.DescribeError(err, storageJournalErrorText); ok {
+		return text
 	}
 	if errors.Is(err, pve.ErrStorageClusterIdentity) {
 		return storageJournalWithCause(storageJournalIdentityText(err), err)
@@ -89,13 +73,8 @@ func storageJournalErrorText(err error) string {
 	if errors.As(err, &typeErr) {
 		return fmt.Sprintf("JSON field %s has the wrong type (%s)", typeErr.Field, typeErr.Value)
 	}
-	var pathErr *fs.PathError
-	if errors.As(err, &pathErr) {
-		var errno syscall.Errno
-		if errors.As(pathErr.Err, &errno) {
-			return pathErr.Op + " " + pathErr.Path + ": " + errno.Error()
-		}
-		return pathErr.Op + " " + pathErr.Path + " failed"
+	if text, ok := aj.DescribePathError(err); ok {
+		return text
 	}
 	var unknownUser user.UnknownUserError
 	if errors.As(err, &unknownUser) {
@@ -107,31 +86,10 @@ func storageJournalErrorText(err error) string {
 	}
 	for _, prefix := range []string{"journal: ", "journal provisioning: "} {
 		if strings.HasPrefix(err.Error(), prefix) {
-			return storageJournalLead(err, strings.TrimSuffix(prefix, ": "))
+			return aj.ErrorLead(err, strings.TrimSuffix(prefix, ": "))
 		}
 	}
 	return pve.DescribeAuditError(err)
-}
-
-// storageJournalLead returns the fixed lead of a journal error: lead itself,
-// followed by the next segment of the error's first line when the text
-// starts with lead. The journal formats its errors as "<fixed>: <fixed
-// detail>: <wrapped cause>", so the segment after lead is still text the
-// journal wrote, while the wrapped cause may carry file content. When the
-// text does not start with lead, a caller wrapped the error, and only lead
-// is safe to show.
-func storageJournalLead(err error, lead string) string {
-	text, _, _ := strings.Cut(err.Error(), "\n")
-	rest, ok := strings.CutPrefix(text, lead)
-	if !ok {
-		return lead
-	}
-	detail, found := strings.CutPrefix(rest, ": ")
-	if !found || detail == "" {
-		return lead
-	}
-	detail, _, _ = strings.Cut(detail, ": ")
-	return lead + ": " + detail
 }
 
 // storageJournalIdentityText keeps the lines of a cluster identity error.

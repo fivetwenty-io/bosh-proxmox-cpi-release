@@ -220,7 +220,7 @@ func TestPersistedCleanupEvidenceDoesNotAuthorizeOrdinaryLifecycle(t *testing.T)
 			t.Error(err)
 		}
 	}()
-	ctx, settlement, err := admitStorageCleanupSettlement(t.Context(), deps, h.Record(), cleanupAttestedDecision(record.ID))
+	ctx, settlement, err := admitStorageCleanupSettlement(t.Context(), deps, h.Record(), cleanupAttestedDecision(record.ID), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

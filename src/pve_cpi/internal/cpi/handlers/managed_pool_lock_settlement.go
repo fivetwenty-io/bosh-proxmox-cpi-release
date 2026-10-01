@@ -213,15 +213,72 @@ func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.H
 		}
 	}
 	if err := handle.Save(record); err != nil {
-		// The journal's error stays in the chain, and the text names the
-		// steps this write was settling so a refusal says which ones.
-		names := make([]string, 0, len(planned))
+		steps := make([]aj.Step, 0, len(planned))
 		for _, i := range planned {
-			names = append(names, fmt.Sprintf("step %s (%s)", record.Steps[i].ID, record.Steps[i].Kind))
+			steps = append(steps, record.Steps[i])
 		}
-		return nil, fmt.Errorf("settling lock %s: %w", strings.Join(names, ", "), err)
+		return nil, refusedSettlementSave("lock", steps, err)
 	}
 	return nil, nil
+}
+
+// settlementSaveError is a settlement write the journal refused. Its text
+// names the steps the write was settling, and the journal's error stays in
+// the chain, so errors.Is still finds the journal's class. It is neither a
+// CPI error nor a storage refusal, so delete_vm keeps showing the Director
+// the generic evidence line for it, and only the storage-journal CLI, through
+// StorageAllocationDecisionFailure, prints its description.
+type settlementSaveError struct {
+	// settling says what the write settled, such as "lock" or "parker
+	// protection".
+	settling string
+	// steps names each step the write settled, as "step <id> (<kind>)".
+	steps []string
+	cause error
+}
+
+func (e *settlementSaveError) Error() string {
+	return "settling " + e.settling + " " + strings.Join(e.steps, ", ") + ": " + e.cause.Error()
+}
+
+func (e *settlementSaveError) Unwrap() error { return e.cause }
+
+// description is the safe form of the error. It names the first step and how
+// many more the write was settling, and it describes the journal's error
+// through describeJournalError, never through its raw text.
+func (e *settlementSaveError) description() string {
+	text := "the journal refused to save the " + e.settling + " settlement of " + e.steps[0]
+	switch more := len(e.steps) - 1; {
+	case more == 1:
+		text += " and 1 more step"
+	case more > 1:
+		text += fmt.Sprintf(" and %d more steps", more)
+	}
+	return text + ": " + describeJournalError(e.cause)
+}
+
+// describeJournalError renders an error a journal write returned. The
+// allocation journal renders what it owns and any filesystem path error, and
+// pve.DescribeAuditError describes anything else.
+func describeJournalError(err error) string {
+	if text, ok := aj.DescribeError(err, describeJournalError); ok {
+		return text
+	}
+	if text, ok := aj.DescribePathError(err); ok {
+		return text
+	}
+	return pve.DescribeAuditError(err)
+}
+
+// refusedSettlementSave wraps the journal's refusal of a settlement write that
+// was settling steps. steps is never empty, because a settler writes only
+// when it settled at least one step.
+func refusedSettlementSave(settling string, steps []aj.Step, cause error) error {
+	names := make([]string, 0, len(steps))
+	for i := range steps {
+		names = append(names, fmt.Sprintf("step %s (%s)", steps[i].ID, steps[i].Kind))
+	}
+	return &settlementSaveError{settling: settling, steps: names, cause: cause}
 }
 
 // managedVMWorkBegan reports whether the active attempt of a VM record holds
@@ -260,16 +317,24 @@ func unsettledStepText(record aj.Record, reasons map[string]error, settled func(
 		if step.State == aj.Observed || settled != nil && settled(step) {
 			continue
 		}
-		text := unsettledStepName(step)
-		var gap *lockSettlementGap
-		if errors.As(reasons[step.ID], &gap) {
-			text += "; its lock sentinel could not be settled because " + gap.Error()
-		} else if extra := protectionSettlementText(reasons[step.ID]); extra != "" {
-			text += extra
-		} else if isLockStep(step) {
-			text += "; its lock sentinel was not read"
-		}
-		return text
+		return unsettledStepName(step) + unsettledStepReason(step, reasons)
+	}
+	return ""
+}
+
+// unsettledStepReason is the clause a refusal adds after naming step: why
+// settlement left a lock or protection step planned, from reasons, or that a
+// lock step's sentinel was not read. It returns "" for every other step.
+func unsettledStepReason(step aj.Step, reasons map[string]error) string {
+	var gap *lockSettlementGap
+	if errors.As(reasons[step.ID], &gap) {
+		return "; its lock sentinel could not be settled because " + gap.Error()
+	}
+	if extra := protectionSettlementText(reasons[step.ID]); extra != "" {
+		return extra
+	}
+	if isLockStep(step) {
+		return "; its lock sentinel was not read"
 	}
 	return ""
 }

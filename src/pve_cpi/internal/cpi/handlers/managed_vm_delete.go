@@ -71,11 +71,12 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	if record.Kind != "vm" {
 		return proof, storageRefusal("VM cleanup requires a VM allocation")
 	}
-	if _, err := settlePlannedLockSteps(ctx, deps.PVE, handle); err != nil {
+	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	if err != nil {
 		return proof, err
 	}
 	record = handle.Record()
-	if err := storageCleanupSettled(ctx, record); err != nil {
+	if err := storageCleanupSettledAfter(ctx, record, gaps); err != nil {
 		return proof, err
 	}
 	clusterNodes, err := clusterNodeNames(ctx, deps)
@@ -383,11 +384,12 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 }
 
 func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (proof aj.Verification, retErr error) {
-	if _, err := settlePlannedLockSteps(ctx, deps.PVE, handle); err != nil {
+	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	if err != nil {
 		return proof, err
 	}
 	record := handle.Record()
-	if err := storageCleanupSettled(ctx, record); err != nil {
+	if err := storageCleanupSettledAfter(ctx, record, gaps); err != nil {
 		return proof, err
 	}
 	var retention aj.VMRetentionEvidence

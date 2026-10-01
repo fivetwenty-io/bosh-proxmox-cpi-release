@@ -47,9 +47,13 @@ func storageRefusalf(format string, args ...any) error {
 // safe description of why the decision was refused. A refused audit gate
 // contributes its summary and the runbook pointer, and a CPI-authored refusal
 // its reason, both built only from identifiers and classified error
-// descriptions. Only an audit refusal points at the audit runbook. Anything
-// else is described by pve.DescribeAuditError, so backend response text,
-// credentials, and resource payloads are never included.
+// descriptions. Only an audit refusal points at the audit runbook. A
+// settlement write the journal refused names the steps it was settling and
+// the journal's class of failure, which can include the journal's own file
+// path. That is safe because the storage-journal CLI, which runs on the
+// journal's host, is this function's only production caller. Anything else is
+// described by pve.DescribeAuditError, so backend response text, credentials,
+// and resource payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
 	class := "identity_or_audit_evidence"
 	var stage *storageCleanupStageError
@@ -63,6 +67,10 @@ func StorageAllocationDecisionFailure(err error) string {
 	var refusal *storageRefusalError
 	if errors.As(err, &refusal) {
 		return class + ": " + log.ScrubMessage(refusal.reason)
+	}
+	var settlement *settlementSaveError
+	if errors.As(err, &settlement) {
+		return class + ": " + log.ScrubMessage(settlement.description())
 	}
 	if err == nil {
 		return class

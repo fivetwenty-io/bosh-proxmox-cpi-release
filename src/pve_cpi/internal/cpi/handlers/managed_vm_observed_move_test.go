@@ -357,7 +357,7 @@ func crashDeleteOfMovedVM(t *testing.T) (Deps, *aj.Journal, *deleteManagedClient
 func TestCleanupReentersCrashedDeleteOfVMMovedOnSharedStorage(t *testing.T) {
 	deps, j, _, record, stop := crashDeleteOfMovedVM(t)
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
-	ctx, settlement, err := admitStorageCleanupSettlement(t.Context(), deps, record, cleanupAttestedDecision(record.ID))
+	ctx, settlement, err := admitStorageCleanupSettlement(t.Context(), deps, record, cleanupAttestedDecision(record.ID), nil)
 	if err != nil {
 		t.Fatalf("crashed delete of a moved VM not admitted for cleanup: %v", err)
 	}

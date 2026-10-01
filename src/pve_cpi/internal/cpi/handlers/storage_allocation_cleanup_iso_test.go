@@ -262,7 +262,7 @@ func TestCleanupRecoveredISOUploadWorkerIdentity(t *testing.T) {
 			decision.RecoveredTaskUPID = strings.Replace(cleanupTestUploadUPID, "UPID:pve1:", "UPID:pve0:", 1)
 			decision.RecoveredTaskEvidence = recoveredTaskTestEvidence(t, r, decision)
 			before := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
-			_, proof, err := admitStorageCleanupSettlement(t.Context(), deps, r, decision)
+			_, proof, err := admitStorageCleanupSettlement(t.Context(), deps, r, decision, nil)
 			if (err == nil) == foreign {
 				t.Fatalf("foreign=%v proof=%+v err=%v", foreign, proof, err)
 			}
