@@ -281,7 +281,10 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 		if rangeEnd == 0 {
 			rangeEnd = pve.VMIDRangeVMEnd
 		}
-		m.vmid, err = pve.NextVMID(ctx, m.deps.PVE, pve.WithRange(rangeStart, rangeEnd))
+		// The images scan leaves out any VMID that still names a volume the
+		// node can see, which PVE would count as the new VM's own disk. See
+		// allocateVM for the plain path's twin.
+		m.vmid, err = pve.NextVMID(ctx, m.deps.PVE, pve.WithRange(rangeStart, rangeEnd), pve.WithNodeImageStorageScan(m.shape.node))
 		if err != nil {
 			return nil, err
 		}

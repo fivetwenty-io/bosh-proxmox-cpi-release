@@ -448,8 +448,13 @@ func TestReapEmptyPool_NotEmptyVerdict_SingleCall(t *testing.T) {
 
 func TestSweepUnusedDiskSlot_LockTimeout_RetriesAndSweeps(t *testing.T) {
 	t.Parallel()
+	// The unused entry names a volume VM 596 does not own. PVE never
+	// registers such an entry on detach, so only a hand edit of the config
+	// makes one, and this test uses it for the retry mechanics. An entry
+	// named for VM 596 itself is the shape a real detach leaves, and the
+	// sweep refuses it because removing it would free the volume.
 	q := &crhQEMU{
-		cfg: map[string]any{"unused0": "local:vm-596-disk-2"},
+		cfg: map[string]any{"unused0": "local:vm-9596-disk-2"},
 		detachFn: func(call int) error {
 			if call == 1 {
 				return crhLockErr()
@@ -459,7 +464,7 @@ func TestSweepUnusedDiskSlot_LockTimeout_RetriesAndSweeps(t *testing.T) {
 	}
 	deps := Deps{PVE: &crhClient{qemuSvc: q}, Logger: log.NewNopLogger()}
 
-	swept, err := sweepUnusedDiskSlot(crhCtx(), deps, "pve1", 596, "596", "local:vm-596-disk-2")
+	swept, err := sweepUnusedDiskSlot(crhCtx(), deps, "pve1", 596, "596", "local:vm-9596-disk-2")
 	if err != nil {
 		t.Fatalf("expected success after lock-timeout retry, got: %v", err)
 	}
@@ -590,12 +595,12 @@ func TestReapEmptyPool_PersistentLockTimeout_BoundedBudget(t *testing.T) {
 func TestSweepUnusedDiskSlot_PersistentLockTimeout_TransientBudget(t *testing.T) {
 	t.Parallel()
 	q := &crhQEMU{
-		cfg:      map[string]any{"unused0": "local:vm-596-disk-2"},
+		cfg:      map[string]any{"unused0": "local:vm-9596-disk-2"},
 		detachFn: func(int) error { return crhLockErr() },
 	}
 	deps := Deps{PVE: &crhClient{qemuSvc: q}, Logger: log.NewNopLogger()}
 
-	swept, err := sweepUnusedDiskSlot(crhCtx(), deps, "pve1", 596, "596", "local:vm-596-disk-2")
+	swept, err := sweepUnusedDiskSlot(crhCtx(), deps, "pve1", 596, "596", "local:vm-9596-disk-2")
 	if err == nil {
 		t.Fatal("a sweep that never succeeded must surface its error")
 	}

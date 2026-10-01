@@ -31,6 +31,12 @@ func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolve
 	if err := m.verifyMarker(cfg); err != nil {
 		return err
 	}
+	// The attach below refuses a legacy volume named for this VM too, but by
+	// then the step is recorded and a refusal would leave the allocation
+	// uncertain. Nothing has changed at this point, so refuse cleanly first.
+	if err := refuseOwnedLegacyAttach("create_vm", disk, m.shape.node, m.vmid); err != nil {
+		return err
+	}
 	digest := sha256.Sum256([]byte(disk.diskCID))
 	step, err := storageMutationIntent(m.handle, fmt.Sprintf("vm.persistent.%x", digest), aj.Target{Node: m.shape.node, VMID: m.vmid}, nil)
 	if err != nil {
