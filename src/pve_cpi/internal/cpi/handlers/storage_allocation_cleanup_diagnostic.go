@@ -45,10 +45,11 @@ func storageRefusalf(format string, args ...any) error {
 
 // StorageAllocationDecisionFailure returns a bounded stage identifier and a
 // safe description of why the decision was refused. A refused audit gate
-// contributes its summary, and a CPI-authored refusal its reason, both built
-// only from identifiers and classified error descriptions. Anything else is
-// described by pve.DescribeAuditError, so backend response text, credentials,
-// and resource payloads are never included.
+// contributes its summary and the runbook pointer, and a CPI-authored refusal
+// its reason, both built only from identifiers and classified error
+// descriptions. Only an audit refusal points at the audit runbook. Anything
+// else is described by pve.DescribeAuditError, so backend response text,
+// credentials, and resource payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
 	class := "identity_or_audit_evidence"
 	var stage *storageCleanupStageError
@@ -57,7 +58,7 @@ func StorageAllocationDecisionFailure(err error) string {
 	}
 	var gate *storageAuditGateFailure
 	if errors.As(err, &gate) {
-		return class + ": " + gate.summary
+		return class + ": " + gate.summary + "; " + StorageAuditRunbook
 	}
 	var refusal *storageRefusalError
 	if errors.As(err, &refusal) {

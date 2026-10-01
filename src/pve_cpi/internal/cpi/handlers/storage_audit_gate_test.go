@@ -18,8 +18,8 @@ const gateTestCommand = "sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage
 
 func gateTestReport() StorageAllocationAudit {
 	report := StorageAllocationAudit{Complete: false, VMScanComplete: false}
-	report.addConflict("remote allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9 (VM 4626) is outside recorded mutation targets: observed on pvupvecf102, recorded pvupvecf101 (node_mismatch)", "VM 4626 on pvupvecf102, recorded pvupvecf101 (node_mismatch)")
-	report.addConflict("remote allocation 2a4b0f7c-1c2d-4e5f-8a9b-0c1d2e3f4a5b (VM 7014) is outside recorded mutation targets: observed on pvupvecf103, recorded pvupvecf102 (node_mismatch)", "VM 7014 on pvupvecf103, recorded pvupvecf102 (node_mismatch)")
+	report.addConflict("remote allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9 (VM 4626) is outside recorded mutation targets: observed on pvupvecf102, recorded pvupvecf101 (node_mismatch)", "VM 4626 on pvupvecf102, recorded pvupvecf101 (node_mismatch), allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9")
+	report.addConflict("remote allocation 2a4b0f7c-1c2d-4e5f-8a9b-0c1d2e3f4a5b (VM 7014) is outside recorded mutation targets: observed on pvupvecf103, recorded pvupvecf102 (node_mismatch)", "VM 7014 on pvupvecf103, recorded pvupvecf102 (node_mismatch), allocation 2a4b0f7c-1c2d-4e5f-8a9b-0c1d2e3f4a5b")
 	markVMScanIncomplete(&report, "some cluster nodes could not be inspected: pvupvecf104 (reported offline by /cluster/status)")
 	report.Issues = append(report.Issues, `storage "nas" on node "pvupvecf101" could not be inspected: context deadline exceeded`)
 	return report
@@ -56,7 +56,7 @@ func TestStorageAuditGateErrorListsOnlyTheFailedGate(t *testing.T) {
 			"create_vm refused: 1 VM-scan issue; some cluster nodes could not be inspected: pvupvecf104",
 			nil, []string{"VM 4626", `storage "nas"`}},
 		{"conflicts only", storageAuditGateConflicts,
-			"create_vm refused: 2 audit conflicts; VM 4626 on pvupvecf102, recorded pvupvecf101 (node_mismatch); VM 7014",
+			"create_vm refused: 2 audit conflicts; VM 4626 on pvupvecf102, recorded pvupvecf101 (node_mismatch), allocation 180f7d1e-08e3-437d-8163-7c9bdfe00dc9; VM 7014",
 			nil, []string{"pvupvecf104", `storage "nas"`}},
 		{"complete", storageAuditGateComplete,
 			"create_vm refused: 2 audit conflicts, 2 audit issues; VM 4626 on pvupvecf102",
@@ -111,10 +111,10 @@ func TestStorageAuditGateErrorCapsFindings(t *testing.T) {
 		report.addConflict("remote allocation x (VM "+vmid+") is outside recorded mutation targets", "VM "+vmid+" on pve2")
 	}
 	message := storageAuditGateError(context.Background(), Deps{}, "delete_vm", report, storageAuditGateConflicts).Error()
-	if !strings.Contains(message, "VM 101 on pve2; VM 102 on pve2; VM 103 on pve2; and 2 more;") {
-		t.Fatalf("message = %q, want three findings and a remainder count", message)
+	if !strings.Contains(message, "VM 101 on pve2; VM 102 on pve2; VM 103 on pve2; and 2 more audit conflicts (VM 104, VM 105);") {
+		t.Fatalf("message = %q, want three findings and a remainder that names the rest", message)
 	}
-	if strings.Contains(message, "VM 104") {
+	if strings.Contains(message, "VM 104 on pve2") {
 		t.Fatalf("message = %q lists more than three findings", message)
 	}
 }

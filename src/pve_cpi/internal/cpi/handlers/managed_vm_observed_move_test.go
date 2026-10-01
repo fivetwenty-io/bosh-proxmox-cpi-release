@@ -419,7 +419,7 @@ func TestCleanupPendingVMAllocationStaysStrictWhenMoved(t *testing.T) {
 		t.Fatal("moved pending allocation cleaned up")
 	}
 	// The runbook quotes this refusal for a VM whose CID was never returned.
-	if failure := StorageAllocationDecisionFailure(err); failure != "cleanup_historical_audit: 1 audit conflict; VM 123 on pve2, recorded pve1 (node_mismatch); not a move: the record is in state "+string(record.State)+", not ready_to_return or adopted" {
+	if failure := StorageAllocationDecisionFailure(err); failure != "cleanup_historical_audit: 1 audit conflict; VM 123 on pve2, recorded pve1 (node_mismatch), allocation "+record.ID+"; not a move: the record is in state "+string(record.State)+", not ready_to_return or adopted; "+gateTestRunbook {
 		t.Fatalf("decision failure = %q", failure)
 	}
 	if c.destroyCount != 0 || c.volumeDeletes != 0 || !reflect.DeepEqual(files, diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)) {

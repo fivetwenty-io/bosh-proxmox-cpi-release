@@ -381,14 +381,14 @@ func resolveStorageJournalMissingVM(ctx context.Context, cfg *config.CPIConfig, 
 // storageJournalRefuse prints a refusal as the fixed lead, then one line for
 // each precondition that failed, then the audit's finding summary when the
 // audit itself falls short. A precondition says why the command refused; the
-// summary says what the audit saw.
+// summary says what the audit saw, and it ends with the runbook pointer.
 func storageJournalRefuse(stderr io.Writer, lead string, preconditions []string, report handlers.StorageAllocationAudit) {
 	fmt.Fprintln(stderr, lead)
 	for _, precondition := range preconditions {
 		fmt.Fprintln(stderr, "precondition failed: "+storageJournalLine(precondition))
 	}
 	if summary := handlers.StorageAuditFindingSummary(report); summary != "" {
-		fmt.Fprintln(stderr, "audit findings: "+storageJournalLine(summary))
+		fmt.Fprintln(stderr, "audit findings: "+storageJournalLine(summary+"; "+handlers.StorageAuditRunbook))
 	}
 }
 

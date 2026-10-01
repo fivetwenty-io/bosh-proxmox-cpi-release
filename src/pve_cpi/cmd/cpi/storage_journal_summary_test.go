@@ -90,6 +90,7 @@ func TestStorageJournalAuditSummaryFieldCase(t *testing.T) {
 		"conflict: remote allocation 2a4b0f7c (VM 7014) is outside recorded mutation targets: observed on pvupvecf103, recorded pvupvecf102 (node_mismatch) with an injected line",
 		"vm-scan issue: " + vmScanIssue,
 		`issue: storage "nas" on node "pvupvecf101" could not be inspected: context deadline exceeded`,
+		"runbook: " + storageJournalTestRunbook,
 		"record: id=planned-1 kind=vm state=planned charging=true cid=none reason=none",
 	}
 	if len(lines) != len(want)+2 {

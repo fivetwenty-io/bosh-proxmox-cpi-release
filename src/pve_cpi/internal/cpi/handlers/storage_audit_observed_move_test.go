@@ -530,7 +530,7 @@ func TestAllocationAuditRefusedMoveBriefNamesTheReason(t *testing.T) {
 	f.rootStorage = "local"
 	report := f.audit()
 	err := storageAuditGateError(context.Background(), f.deps, "create_vm", report, storageAuditGateVMScan|storageAuditGateConflicts)
-	if err == nil || !strings.Contains(err.Error(), "VM 123 on pve2, recorded pve1 (node_mismatch); not a move: volume local:123/vm-123-disk-0.qcow2 is node-local") {
+	if err == nil || !strings.Contains(err.Error(), "VM 123 on pve2, recorded pve1 (node_mismatch), allocation "+f.vm.ID+"; not a move: volume local:123/vm-123-disk-0.qcow2 is node-local") {
 		t.Fatalf("gate error lacks the refusal brief: %v", err)
 	}
 }

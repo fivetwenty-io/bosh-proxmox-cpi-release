@@ -53,8 +53,9 @@ func (r StorageAllocationAudit) observedMove(kind, allocationID string, vmid int
 // storageAuditMoveRefusal names why the audit accepted no move of
 // allocationID. It returns the short form of the first conflict that names
 // the allocation, which carries the move rule's reason, or of the issue that
-// left its move undecided. Otherwise it says that the VM scan was incomplete
-// or that no finding named the allocation.
+// left its move undecided. Otherwise it says that the VM scan was incomplete,
+// naming the nodes it could not inspect, or that no finding named the
+// allocation.
 func storageAuditMoveRefusal(audit StorageAllocationAudit, allocationID string) string {
 	for _, conflict := range audit.Conflicts {
 		if strings.Contains(conflict, allocationID) {
@@ -67,7 +68,7 @@ func storageAuditMoveRefusal(audit StorageAllocationAudit, allocationID string) 
 		}
 	}
 	if !audit.VMScanComplete {
-		return "the VM scan is incomplete"
+		return audit.incompleteScan()
 	}
 	return "no audit finding names the allocation"
 }
@@ -138,7 +139,7 @@ func resolveStorageAuditMoves(ctx context.Context, deps Deps, result *StorageAll
 // available on the new node, and listed that volume there in this audit.
 func storageAuditObservedSharedMove(ctx context.Context, deps Deps, result *StorageAllocationAudit, index storageAuditMoveIndex, evidence StorageAllocationEvidence) (StorageAllocationMove, string, bool) {
 	if !result.VMScanComplete {
-		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden", false
+		return StorageAllocationMove{}, result.incompleteScan() + ", so another sighting could be hidden", false
 	}
 	record, found := index.byID[evidence.AllocationID]
 	if !found || record.Kind != "vm" || record.Namespace != index.namespace {
@@ -243,7 +244,7 @@ func storageAuditDeletionKeepsMove(record aj.Record, evidence StorageAllocationE
 func storageAuditObservedSharedDiskMove(result *StorageAllocationAudit, index storageAuditMoveIndex, pending storageAuditPendingMove) (StorageAllocationMove, string, bool) {
 	evidence := pending.evidence
 	if !result.VMScanComplete {
-		return StorageAllocationMove{}, "the VM scan is incomplete, so another sighting could be hidden", false
+		return StorageAllocationMove{}, result.incompleteScan() + ", so another sighting could be hidden", false
 	}
 	vm, refusal := storageAuditHolder(result, evidence.Node, evidence.VMID)
 	if refusal != "" {
