@@ -1435,6 +1435,11 @@ func buildAndStartVMAttempt(
 // matters when that cluster shares its VM/images storage with another BOSH
 // AZ's cluster (see pve.WithStorageScan's doc comment for the co-mingling
 // risk this closes).
+//
+// pve.WithNodeImageStorageScan(shape.node) widens the scan to every images
+// storage the node sees, so a VMID that still names a persistent disk on a
+// pool other than vm_storage is never handed to a new VM. PVE would count
+// that disk as one of the new VM's own and free it on detach or destroy.
 func allocateVM(
 	ctx context.Context,
 	deps Deps,
@@ -1470,6 +1475,7 @@ func allocateVM(
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
 		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
+		pve.WithNodeImageStorageScan(shape.node),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)
@@ -1513,6 +1519,7 @@ func allocateVMForFallback(
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
 		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
+		pve.WithNodeImageStorageScan(shape.node),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
 	)

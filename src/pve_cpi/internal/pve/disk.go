@@ -154,6 +154,71 @@ func FindForeignActiveDiskDetails(cfg map[string]any, ownerVMID int) map[string]
 	return out
 }
 
+// VolumeNamedForVM reports whether volid's "vm-<vmid>-disk-<n>" label carries
+// vmid. PVE decides who owns a volume from its name, so a VM owns every volume
+// named for it: deleting such a volume's unusedN entry frees it, and so does
+// destroying the VM.
+func VolumeNamedForVM(volid string, vmid int) bool {
+	n, ok := EmbeddedDiskVMID(volid)
+	return ok && n == vmid
+}
+
+// FindOwnedLegacyPersistentDisks returns every (slot -> bare volid) on an
+// active bus slot of cfg that holds a legacy persistent disk whose volume is
+// named for ownerVMID. PVE counts such a disk as one of the VM's own, so
+// destroying the VM frees it, and FindForeignActiveDisks cannot see it
+// because the names match.
+//
+// The VM's own system disk can carry exactly the same volume name on another
+// pool, so the name cannot tell them apart. The legacy attach records the
+// Director's CID in the description sentinel under the disk's bare volid (see
+// UpdateAttachedDiskCID), and nothing records the VM's own disks there, so
+// that record is the signal. A drive that carries a bpd- serial is left out,
+// because FindForeignActiveDiskDetails already returns it and delete_vm moves
+// it to a parker. What the record's CID says is not consulted: a drive with no
+// serial whose volume is named for the VM is freed by the destroy whatever
+// identity its CID claims, so any recorded entry counts, including one whose
+// CID no longer decodes.
+//
+// Legacy ephemeral retention also writes a record under a bare volid. It
+// records the VM's own ephemeral volume before it transfers that volume to a
+// parker, and a transfer cut short leaves the volume on its active slot with
+// the record in place. That volume is never a persistent disk, so
+// IsOwnEphemeralVolume leaves it out by name, in both the block and the
+// file-backed form. IsOwnEphemeralVolume matches only a value with a storage
+// prefix, and nothing is lost by that. VolumeNamedForVM never matches an
+// ephemeral name, so an unprefixed ephemeral value is left out by the next
+// check anyway.
+//
+// Only active bus slots are read. An owned legacy disk on an unusedN entry is
+// left to guardUnusedVolumes, which every delete path runs and which refuses
+// any unused volume that still exists.
+//
+// The record is best-effort when written, so a legacy attach whose sentinel
+// write failed is not found here. attach_disk refuses to create this shape,
+// which leaves only disks attached before that refusal existed.
+func FindOwnedLegacyPersistentDisks(cfg map[string]any, ownerVMID int) map[string]string {
+	out := make(map[string]string)
+	recorded := GetAttachedDiskCIDs(DescriptionFromConfig(cfg))
+	if len(recorded) == 0 {
+		return out
+	}
+	for slot, optstr := range qemu.ParseDisks(cfg) {
+		bare, _, _ := strings.Cut(optstr, ",")
+		if IsOwnEphemeralVolume(bare, ownerVMID) {
+			continue
+		}
+		if _, has := StableIDFromDriveOptStr(optstr); has || !VolumeNamedForVM(bare, ownerVMID) {
+			continue
+		}
+		if recorded[bare] == "" {
+			continue
+		}
+		out[slot] = bare
+	}
+	return out
+}
+
 // ParseDiskCID splits a disk CID of the form "<storage>:<volume>" on the first
 // colon. Returns an error if cid is empty or contains no colon.
 func ParseDiskCID(cid string) (storage, volume string, err error) {
