@@ -196,11 +196,18 @@ func legacyRetainVolumeFixture(t *testing.T, volume, slot string) (Deps, *lifecy
 	return deps, client, recorder, journal
 }
 
-// assertLegacyFileRetained requires exactly one destroy of VM 777, sent only
+// assertLegacyFileRetained is assertLegacyRetained for the file-backed
+// ephemeral volume the file fixture holds.
+func assertLegacyFileRetained(t *testing.T, deps Deps, client *lifecycleFlowPVE, recorder *legacyDestroyRecorder) {
+	t.Helper()
+	assertLegacyRetained(t, deps, client, recorder, legacyFileEphemeral)
+}
+
+// assertLegacyRetained requires exactly one destroy of VM 777, sent only
 // after the ephemeral volume had left the guest for a parker slot that
 // carries the volume's serial, and while the guest's description still
 // recorded the source CID that names the volume and that serial.
-func assertLegacyFileRetained(t *testing.T, deps Deps, client *lifecycleFlowPVE, recorder *legacyDestroyRecorder) {
+func assertLegacyRetained(t *testing.T, deps Deps, client *lifecycleFlowPVE, recorder *legacyDestroyRecorder, source string) {
 	t.Helper()
 	destroys := recorder.guestDestroys()
 	if len(destroys) != 1 {
@@ -216,9 +223,9 @@ func assertLegacyFileRetained(t *testing.T, deps Deps, client *lifecycleFlowPVE,
 			t.Fatalf("DeleteQemu for VM 777 was submitted while %s still held %v, so the destroy frees the ephemeral volume", key, value)
 		}
 	}
-	cid := pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(guest))[legacyFileEphemeral]
+	cid := pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(guest))[source]
 	birth, meta, err := decodeDiskCID(context.Background(), deps, "test", cid)
-	if err != nil || birth != legacyFileEphemeral || meta == nil || meta.ID == "" {
+	if err != nil || birth != source || meta == nil || meta.ID == "" {
 		t.Fatalf("guest 777 did not record the source CID when its destroy was submitted: cid=%q birth=%q err=%v", cid, birth, err)
 	}
 	holders := 0
@@ -309,26 +316,23 @@ func TestLegacyStragglerSweepRetainsFileBackedEphemeral(t *testing.T) {
 	assertJournalUntouched(t, journal, before)
 }
 
-// TestLegacyDeleteVMKeepsEphemeralInUnusedSlot is a control that passes with
-// and without the matcher fix, in the block and the file form. A detach can
-// leave the ephemeral volume on an unused slot, and the retention loop over
-// unused entries matches it there. The refusal below is the evidence of that
-// match, because a volume the loops miss leaves retention with nothing to do,
-// and the delete would go on to destroy the guest. The identity scan reads
-// only active slots, and an unused entry carries no serial, so retention finds
-// no holder and refuses before it changes or destroys anything.
-func TestLegacyDeleteVMKeepsEphemeralInUnusedSlot(t *testing.T) {
+// TestLegacyDeleteVMRetainsEphemeralInUnusedSlot covers an ephemeral volume
+// that sits on an unused slot of its own VM, in the block and the file form.
+// The identity scan reads only active slots and an unused entry carries no
+// serial, so retention finds no holder. The VM's own config is the only
+// reference to the volume, though, so retention treats the VM as the holder
+// and transfers the volume to a parker before the destroy.
+func TestLegacyDeleteVMRetainsEphemeralInUnusedSlot(t *testing.T) {
 	for _, volume := range []string{"a:vm-777-ephemeral-0", legacyFileEphemeral} {
 		t.Run(volume, func(t *testing.T) {
 			deps, client, recorder, journal := legacyRetainVolumeFixture(t, volume, "unused0")
 			before := journalRecords(t, journal)
-			_, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
-			t.Logf("PROBE unused-slot %s delete_vm error=%v destroys=%d moves=%d", volume, err, len(recorder.submissions), client.moves)
-			if err == nil || !strings.Contains(err.Error(), "retained ephemeral ownership is ambiguous") {
-				t.Fatalf("delete_vm did not refuse the unused-slot volume it cannot attribute: %v", err)
+			if _, err := HandleDeleteVM(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{}); err != nil {
+				t.Fatalf("delete_vm refused the unused-slot volume its own VM holds: %v", err)
 			}
-			if len(recorder.submissions) != 0 || client.moves != 0 || client.state.volumes[volume] == nil || client.state.configs[777]["unused0"] != volume {
-				t.Fatalf("refused delete changed the guest or its volume: destroys=%d moves=%d", len(recorder.submissions), client.moves)
+			assertLegacyRetained(t, deps, client, recorder, volume)
+			if client.moves != 1 {
+				t.Fatalf("retention moved the volume %d times, want once", client.moves)
 			}
 			assertJournalUntouched(t, journal, before)
 		})
