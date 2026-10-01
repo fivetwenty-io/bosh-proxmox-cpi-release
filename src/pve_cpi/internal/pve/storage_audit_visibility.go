@@ -3,7 +3,6 @@ package pve
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +13,13 @@ import (
 // cover the namespace. The normal Client interface remains unchanged for legacy
 // consumers; managed audit requires this additional read capability.
 type StorageAuditVisibilityReader interface{ StorageAuditVisibility(context.Context) error }
+
+// The reads the visibility proof makes, as AuditVisibilityReadError names them.
+const (
+	auditReadPermissions = "effective permissions"
+	auditReadACL         = "ACL entries"
+)
+
 type auditPermissionGetter interface {
 	GetCtx(context.Context, string, map[string]interface{}) (interface{}, error)
 }
@@ -50,7 +56,7 @@ func (c *sdkClient) StorageAuditVisibility(ctx context.Context) error {
 // NoAccess rules that can hide members despite inherited VM/storage privileges.
 func observeStorageAuditVisibility(ctx context.Context, reader auditPermissionGetter) error {
 	if ctx == nil || reader == nil {
-		return fmt.Errorf("allocation audit visibility reader unavailable")
+		return ErrAuditVisibilityReaderUnavailable
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -63,23 +69,23 @@ func observeStorageAuditVisibility(ctx context.Context, reader auditPermissionGe
 	}
 	raw, err := reader.GetCtx(ctx, "/access/acl", nil)
 	if err != nil {
-		return fmt.Errorf("allocation audit ACL visibility unavailable")
+		return &AuditVisibilityReadError{Read: auditReadACL, Path: "/access/acl", Cause: err, text: "allocation audit ACL visibility unavailable"}
 	}
 	encoded, err := json.Marshal(raw)
 	if err != nil {
-		return fmt.Errorf("allocation audit ACL inventory malformed")
+		return &AuditVisibilityReadError{Read: auditReadACL, Path: "/access/acl", Malformed: true, Cause: err, text: "allocation audit ACL inventory malformed"}
 	}
 	var rows []struct {
 		Path string `json:"path"`
 		Role string `json:"roleid"`
 	}
 	if json.Unmarshal(encoded, &rows) != nil || rows == nil || len(rows) > 4096 {
-		return fmt.Errorf("allocation audit ACL inventory malformed or exceeds limit")
+		return &AuditVisibilityReadError{Read: auditReadACL, Path: "/access/acl", Malformed: true, text: "allocation audit ACL inventory malformed or exceeds limit"}
 	}
 	required := map[string]string{"/vms": "VM.Audit", "/storage": "Datastore.Audit"}
 	for _, row := range rows {
 		if !strings.HasPrefix(row.Path, "/") || row.Role == "" {
-			return fmt.Errorf("allocation audit ACL entry malformed")
+			return &AuditVisibilityReadError{Read: auditReadACL, Path: "/access/acl", Malformed: true, text: "allocation audit ACL entry malformed"}
 		}
 		switch {
 		case row.Path == "/vms" || strings.HasPrefix(row.Path, "/vms/"):
@@ -149,7 +155,7 @@ func requireAuditPrivilege(values map[string]json.RawMessage, privilege, path st
 		propagates = true
 	case "0", "false":
 	default:
-		return fmt.Errorf("allocation audit propagation flag malformed")
+		return &AuditVisibilityReadError{Read: auditReadPermissions, Path: path, Malformed: true, text: "allocation audit propagation flag malformed"}
 	}
 	if (path == "/vms" || path == "/storage") && !propagates {
 		return &AuditVisibilityError{Privilege: privilege, Path: path, Propagated: true}
@@ -160,22 +166,22 @@ func requireAuditPrivilege(values map[string]json.RawMessage, privilege, path st
 func auditPermissionsAt(ctx context.Context, reader auditPermissionGetter, path string) (map[string]json.RawMessage, error) {
 	raw, err := reader.GetCtx(ctx, "/access/permissions", map[string]interface{}{"path": path})
 	if err != nil {
-		return nil, fmt.Errorf("allocation audit effective permission observation unavailable")
+		return nil, &AuditVisibilityReadError{Read: auditReadPermissions, Path: path, Cause: err, text: "allocation audit effective permission observation unavailable"}
 	}
 	encoded, err := json.Marshal(raw)
 	if err != nil {
-		return nil, fmt.Errorf("allocation audit effective permissions malformed")
+		return nil, &AuditVisibilityReadError{Read: auditReadPermissions, Path: path, Malformed: true, Cause: err, text: "allocation audit effective permissions malformed"}
 	}
 	var permissions map[string]map[string]json.RawMessage
 	if json.Unmarshal(encoded, &permissions) != nil || permissions == nil {
-		return nil, fmt.Errorf("allocation audit effective permissions malformed")
+		return nil, &AuditVisibilityReadError{Read: auditReadPermissions, Path: path, Malformed: true, text: "allocation audit effective permissions malformed"}
 	}
 	values := permissions[path]
 	for _, value := range values {
 		switch string(value) {
 		case "0", "1", "true", "false":
 		default:
-			return nil, fmt.Errorf("allocation audit effective permission flag malformed")
+			return nil, &AuditVisibilityReadError{Read: auditReadPermissions, Path: path, Malformed: true, text: "allocation audit effective permission flag malformed"}
 		}
 	}
 	return values, nil

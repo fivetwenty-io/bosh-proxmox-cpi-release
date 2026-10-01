@@ -33,10 +33,11 @@ func writeStorageJournalEnrollment(stdout, stderr io.Writer, report handlers.Sto
 }
 
 // writeStorageJournalAuditText prints the audit for a Director that has no
-// jq: an overview line, one line per finding, one record line for each record
-// that needs an operator with its evidence lines under it, the charging
-// summary, and the skipped disabled storages. Every line is flattened, so a finding that
-// carries a line break or a terminal escape still prints as one line.
+// jq: an overview line, one line per finding, the runbook pointer when the
+// audit raised a conflict or an issue, one record line for each record that
+// needs an operator with its evidence lines under it, the charging summary,
+// and the skipped disabled storages. Every line is flattened, so a finding
+// that carries a line break or a terminal escape still prints as one line.
 func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport) error {
 	audit := output.Audit
 	lines := []string{fmt.Sprintf("audit: complete=%t vm_scan_complete=%t generation_index_healthy=%t cluster_continuity=%t records=%d",
@@ -45,6 +46,9 @@ func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport)
 		lines = append(lines, "generation index: "+output.IndexFinding)
 	}
 	lines = append(lines, storageJournalFindingLines(audit)...)
+	if len(audit.Conflicts) > 0 || len(audit.Issues) > 0 {
+		lines = append(lines, "runbook: "+handlers.StorageAuditRunbook)
+	}
 	lines = append(lines, storageJournalAttentionLines(output.Attention, audit.Evidence)...)
 	lines = append(lines, storageJournalChargingLine(output.ChargingSummary))
 	lines = append(lines, storageJournalSkippedLines(audit)...)

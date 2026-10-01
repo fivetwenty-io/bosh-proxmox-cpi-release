@@ -89,7 +89,7 @@ func TestDeleteVMRetryShowsTheDirectorTheUnsettledStep(t *testing.T) {
 // retry flag is the one the same failure carried behind the generic line.
 func TestManagedDeleteVMFailuresReachTheDirector(t *testing.T) {
 	const generic = "allocation decision could not verify or persist evidence"
-	gate := cpierrors.WrapAs(&storageAuditGateFailure{summary: "1 audit conflict; VM 777 on n2, recorded n1 (node_mismatch)", hint: "run 'cpi storage-journal audit --summary' for the full report"}, cpierrors.TypeCloud, "VM cleanup refused")
+	gate := cpierrors.WrapAs(&storageAuditGateFailure{summary: "1 audit conflict; VM 777 on n2, recorded n1 (node_mismatch), allocation 5b0e2f4c-9d1a-4c3e-8f7a-6b5c4d3e2f1a", hint: "run 'cpi storage-journal audit --summary' for the full report"}, cpierrors.TypeCloud, "VM cleanup refused")
 	persistence := fmt.Errorf("settling lock step attempt-0-step-2 (vm.Pool.CreatePool): %w", &fs.PathError{Op: "rename", Path: "/var/vcap/store/pve_cpi/journal/a.json", Err: syscall.ENOSPC})
 	for _, tc := range []struct {
 		name      string

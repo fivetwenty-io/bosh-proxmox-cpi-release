@@ -37,6 +37,38 @@ func (e *AuditVisibilityError) Error() string {
 	}
 }
 
+// AuditVisibilityReadError is a read the audit visibility proof could not
+// complete, or an answer it could not parse. Its text is fixed and never
+// carries the cause, so err.Error() stays safe to log. DescribeAuditError
+// renders the read, the path, and the class of the cause instead, and Unwrap
+// exposes the cause to errors.Is and errors.As. An empty Read means the
+// client has no visibility reader at all.
+type AuditVisibilityReadError struct {
+	// Read names what the proof was reading, such as "effective permissions"
+	// or "ACL entries".
+	Read string
+	// Path is the ACL path the read asked about, or the API path it read.
+	Path string
+	// Malformed marks an answer that arrived but could not be parsed.
+	Malformed bool
+	Cause     error
+	// text is the fixed text Error returns.
+	text string
+}
+
+func (e *AuditVisibilityReadError) Error() string {
+	if e.text == "" {
+		return "allocation audit visibility read failed"
+	}
+	return e.text
+}
+
+func (e *AuditVisibilityReadError) Unwrap() error { return e.Cause }
+
+// ErrAuditVisibilityReaderUnavailable reports a client with no audit
+// visibility reader, which is a CPI defect.
+var ErrAuditVisibilityReaderUnavailable error = &AuditVisibilityReadError{text: "allocation audit visibility reader unavailable"}
+
 // GuestEnumerationError names the cluster members whose guest listing failed.
 // Its own text carries only node names; Cause holds the per-node failure when
 // one API verdict decided the classification.
@@ -77,8 +109,9 @@ var knownProvenanceErrors = map[string]bool{
 // DescribeAuditError renders err as text that is safe to retain in an audit
 // finding, a Director error, or CLI output. It renders only fields whose
 // content it knows: an API error's status and message, a connection
-// endpoint, a timeout or cancellation class, a missing audit grant, the nodes
-// of a failed guest enumeration, and the parsers' fixed provenance texts.
+// endpoint, a timeout or cancellation class, a missing audit grant, the read
+// and path of a failed visibility read, the nodes of a failed guest
+// enumeration, and the parsers' fixed provenance texts.
 // Anything else renders as "unclassified error"; it never falls back to
 // err.Error(), because transport text can carry response bodies and
 // credentials. The result is scrubbed, stripped of control characters, and
@@ -95,6 +128,21 @@ func describeAuditErrorClass(err error) string {
 	var visibility *AuditVisibilityError
 	if errors.As(err, &visibility) {
 		return visibility.Error()
+	}
+	// A read failure must be recognized before the context checks, or a
+	// timed-out read would lose its read and path.
+	var read *AuditVisibilityReadError
+	if errors.As(err, &read) {
+		switch {
+		case read.Read == "":
+			return "the audit visibility reader is unavailable (CPI defect)"
+		case read.Malformed:
+			return fmt.Sprintf("PVE returned malformed %s at %s", read.Read, read.Path)
+		case read.Cause != nil:
+			return fmt.Sprintf("could not read %s at %s (%s)", read.Read, read.Path, describeAuditErrorClass(read.Cause))
+		default:
+			return fmt.Sprintf("could not read %s at %s", read.Read, read.Path)
+		}
 	}
 	var enumeration *GuestEnumerationError
 	if errors.As(err, &enumeration) {

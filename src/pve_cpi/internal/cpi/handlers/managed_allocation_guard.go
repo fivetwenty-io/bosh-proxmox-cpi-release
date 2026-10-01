@@ -297,7 +297,7 @@ func (g *ManagedAllocationGuard) end(ctx context.Context, m ManagedAllocationMut
 func (c *managedAllocationClient) StorageAuditVisibility(ctx context.Context) error {
 	reader, ok := c.Client.(pve.StorageAuditVisibilityReader)
 	if !ok {
-		return fmt.Errorf("allocation audit visibility reader unavailable")
+		return pve.ErrAuditVisibilityReaderUnavailable
 	}
 	return reader.StorageAuditVisibility(ctx)
 }

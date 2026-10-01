@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -65,6 +66,11 @@ type StorageAllocationAudit struct {
 	// before the allocation. It is not serialized, because the finding
 	// itself is the durable record.
 	briefs map[string]string
+	// scanGaps names the nodes that left the VM scan incomplete, each with
+	// its reason, phrased to follow "because". It holds offline nodes and
+	// nodes whose guest listing failed, and nothing for any other VM-scan
+	// issue.
+	scanGaps []string
 	// listed holds the volids that each (node, storage) listing returned. A
 	// listing that failed, or that returned a malformed entry, is absent,
 	// because it cannot prove that a volume is present on that node.
@@ -144,6 +150,7 @@ func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[str
 			shared = stores[storage].IsShared()
 		}
 		groups := map[string]map[int]string{}
+		groupClaims := map[string][]storageAuditClaim{}
 		for _, claim := range claims {
 			if claim.cdrom {
 				continue
@@ -156,8 +163,9 @@ func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[str
 				groups[key] = map[int]string{}
 			}
 			groups[key][claim.vmid] = claim.node
+			groupClaims[key] = append(groupClaims[key], claim)
 		}
-		for _, holders := range groups {
+		for key, holders := range groups {
 			if len(holders) < 2 {
 				continue
 			}
@@ -166,9 +174,38 @@ func storageAuditSharedReferences(result *StorageAllocationAudit, stores map[str
 				subjects = append(subjects, fmt.Sprintf("VM %d on %s", vmid, node))
 			}
 			sort.Strings(subjects)
-			result.addConflict(fmt.Sprintf("volume %s is referenced by more than one VM, so each can write the same disk: %s", volume, strings.Join(subjects, ", ")), fmt.Sprintf("volume %s is attached to %d VMs: %s", volume, len(holders), strings.Join(subjects, ", ")))
+			brief := fmt.Sprintf("volume %s is attached to %d VMs: %s", volume, len(holders), strings.Join(subjects, ", "))
+			for _, id := range storageAuditVolumeAllocations(volume, key, groupClaims[key], knownVolumes) {
+				brief += ", allocation " + id
+			}
+			result.addConflict(fmt.Sprintf("volume %s is referenced by more than one VM, so each can write the same disk: %s", volume, strings.Join(subjects, ", ")), brief)
 		}
 	}
+}
+
+// storageAuditVolumeAllocations lists the allocations that a record or a
+// holder's disk provenance attributes to the volume one group of holders
+// shares, sorted and without repeats. claims are that group's own claims.
+// node is the group's node on node-local storage, where the same volid on
+// another node names another volume, so only a record with a step that names
+// the volume on node counts; it is "" on shared storage, where every record
+// that names the volid counts. A volume that is ours only by its name's
+// locator, or by a disk token as its drive serial, lists none.
+func storageAuditVolumeAllocations(volume, node string, claims []storageAuditClaim, knownVolumes map[string][]aj.Record) []string {
+	var ids []string
+	for recordIndex := range knownVolumes[volume] {
+		record := knownVolumes[volume][recordIndex]
+		if node == "" || slices.ContainsFunc(record.Steps, func(step aj.Step) bool {
+			return !step.Target.External && step.Target.Node == node && (step.Target.IntendedVolume == volume || slices.Contains(step.VolIDs, volume))
+		}) {
+			ids = append(ids, record.ID)
+		}
+	}
+	for _, claim := range claims {
+		ids = append(ids, claim.allocations...)
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids)
 }
 
 // storageAuditLiveDiskTokens collects the disk tokens of disk records that
@@ -309,6 +346,15 @@ func (r StorageAllocationAudit) brief(finding string) string {
 		return brief
 	}
 	return finding
+}
+
+// incompleteScan says that the VM scan is incomplete and, when
+// the scan named them, which nodes it could not inspect and why.
+func (r StorageAllocationAudit) incompleteScan() string {
+	if len(r.scanGaps) == 0 {
+		return "the VM scan is incomplete"
+	}
+	return "the VM scan is incomplete because " + strings.Join(r.scanGaps, " and ")
 }
 
 // storageAuditSubject names what one evidence entry observed.
@@ -778,9 +824,22 @@ func auditStorageVMs(ctx context.Context, deps Deps, records []aj.Record, knownV
 	guests, skipped, err := pve.ListGuestsAuthoritativeTolerant(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil {
 		markVMScanIncomplete(result, "cluster VM enumeration failed: "+pve.DescribeAuditError(err))
+		var enumeration *pve.GuestEnumerationError
+		if errors.As(err, &enumeration) {
+			gap := "guests could not be listed on " + strings.Join(enumeration.Nodes, ", ")
+			if enumeration.Cause != nil {
+				gap += " (" + pve.DescribeAuditError(enumeration.Cause) + ")"
+			}
+			result.scanGaps = append(result.scanGaps, gap)
+		}
 	}
 	if len(skipped) > 0 {
 		markVMScanIncomplete(result, "some cluster nodes could not be inspected: "+strings.Join(skipped, ", ")+" (reported offline by /cluster/status)")
+		verb := "is"
+		if len(skipped) > 1 {
+			verb = "are"
+		}
+		result.scanGaps = append(result.scanGaps, strings.Join(skipped, ", ")+" "+verb+" reported offline")
 	}
 	diskHolders := map[string][]StorageAllocationEvidence{}
 	namespace := deps.Config.StoragePlacementNamespace
@@ -1233,7 +1292,7 @@ func storageAuditTargetMiss(result *StorageAllocationAudit, record aj.Record, ev
 	}
 	recorded := miss.describe(record)
 	conflict := fmt.Sprintf("remote allocation %s (%s) is outside recorded mutation targets: observed on %s, %s%s", record.ID, observed, evidence.Node, recorded, storageAuditMoveHint(miss.reason))
-	brief := fmt.Sprintf("%s on %s, %s", observed, evidence.Node, recorded)
+	brief := fmt.Sprintf("%s on %s, %s, allocation %s", observed, evidence.Node, recorded, record.ID)
 	if evidence.Kind == "vm" && evidence.VolumeID == "" && miss.reason == storageAuditReasonNodeMismatch {
 		result.pending = append(result.pending, storageAuditPendingMove{kind: "vm", evidence: evidence, conflict: conflict, brief: brief})
 		return

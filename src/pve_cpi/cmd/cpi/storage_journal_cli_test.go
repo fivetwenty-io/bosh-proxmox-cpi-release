@@ -203,7 +203,7 @@ func TestStorageJournalInitializeRefusalNamesExistingProvenance(t *testing.T) {
 	for _, line := range []string{
 		"precondition failed: the VM scan is incomplete",
 		"precondition failed: the audit raised 1 conflict",
-		"audit findings: 1 audit conflict, 1 audit issue; remote allocation x (VM 4626) is outside recorded mutation targets; cluster-wide VM and storage audit visibility is unproven: allocation audit requires Datastore.Audit at /storage",
+		"audit findings: 1 audit conflict, 1 audit issue; remote allocation x (VM 4626) is outside recorded mutation targets; cluster-wide VM and storage audit visibility is unproven: allocation audit requires Datastore.Audit at /storage; " + storageJournalTestRunbook,
 	} {
 		if !strings.Contains(stderr.String(), line+"\n") {
 			t.Fatalf("refusal %q lacks %q", stderr.String(), line)
@@ -228,7 +228,7 @@ func TestStorageJournalRecoveryRefusalNamesItsPrecondition(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("partial audit permitted recovery: %s", out)
 	}
-	for _, want := range []string{"recovery requires a complete consistent historical audit\n", "precondition failed: the VM scan is incomplete\n", "audit findings: 1 audit issue; cluster-wide VM and storage audit visibility is unproven: allocation audit visibility is restricted at /storage\n"} {
+	for _, want := range []string{"recovery requires a complete consistent historical audit\n", "precondition failed: the VM scan is incomplete\n", "audit findings: 1 audit issue; cluster-wide VM and storage audit visibility is unproven: allocation audit visibility is restricted at /storage; " + storageJournalTestRunbook + "\n"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("recovery refusal %q lacks %q", out, want)
 		}
