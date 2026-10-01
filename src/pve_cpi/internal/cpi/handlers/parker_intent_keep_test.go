@@ -330,14 +330,16 @@ func (s *strandedDisk) requirePlannedMoveStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, record := range records {
+	for i := range records {
+		record := &records[i]
 		if record.DiskToken != s.token {
 			continue
 		}
 		if record.State != aj.ReconciliationRequired {
 			t.Fatalf("the disk's record is %s, want %s", record.State, aj.ReconciliationRequired)
 		}
-		for _, step := range record.Steps {
+		for j := range record.Steps {
+			step := &record.Steps[j]
 			if step.Kind == "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk" && step.State == aj.Planned {
 				return
 			}
