@@ -33,6 +33,27 @@ type SentinelMatch struct {
 	Parked      *parkedDiskEntry `json:"parked,omitempty"`
 }
 
+// DiskHolderMatch is one active bus slot that matches the disk, either because
+// it names the located volid or because its drive carries the disk's serial.
+type DiskHolderMatch struct {
+	VMID int    `json:"vmid"`
+	Node string `json:"node"`
+	Slot string `json:"slot"`
+	// Volid is the volid this slot actually carries.
+	Volid string `json:"volid"`
+	// Match is "volid" or "serial", saying which test the slot passed.
+	Match string `json:"match"`
+}
+
+// UnusedReference is one unusedN entry that names the disk's volume, under its
+// located volid or under a name a serial-matched slot carries.
+type UnusedReference struct {
+	VMID  int    `json:"vmid"`
+	Node  string `json:"node"`
+	Slot  string `json:"slot"`
+	Volid string `json:"volid"`
+}
+
 // DiskLocateResult is the result of locating a disk volume across the
 // cluster.
 type DiskLocateResult struct {
@@ -44,24 +65,39 @@ type DiskLocateResult struct {
 	StableID string `json:"stable_id,omitempty"`
 	// CurrentVolid is the volid the holder's drive entry actually carries.
 	// Differs from BareVolid after a reassignment renamed the volume.
-	CurrentVolid    string          `json:"current_volid,omitempty"`
+	CurrentVolid string `json:"current_volid,omitempty"`
+	// Holder is the first matching active slot in VMID order, kept for
+	// callers that read a single holder. Holders lists every match.
 	Holder          *DiskHolder     `json:"holder,omitempty"`
 	SentinelMatches []SentinelMatch `json:"sentinel_matches,omitempty"`
+	// Holders lists every active slot on every guest that matches the disk,
+	// in VMID order. More than one guest here means the volume is named
+	// twice, and the Director's VM CID decides which guest really holds it.
+	Holders []DiskHolderMatch `json:"holders,omitempty"`
+	// UnusedRefs lists every unusedN entry that names the disk's volume.
+	UnusedRefs []UnusedReference `json:"unused_refs,omitempty"`
+	// UnreadableVMIDs lists the guests whose config could not be read, so a
+	// match there would be missing from this result.
+	UnreadableVMIDs []int `json:"unreadable_vmids,omitempty"`
 }
 
-// locateDisk scans every cluster VM for bareVolid on an active bus slot
-// (scsi/virtio/ide/sata — this is the exact set qemu.ParseDisks recognizes,
-// the same helper internal/pve's own FindVMByDiskVolid uses) and,
-// independently, for a bosh_attached_disks or bosh_parked_disks sentinel
-// entry naming bareVolid on every VM's description regardless of bus-slot
-// presence.
+// locateDisk scans every cluster VM for the disk on an active bus slot
+// (scsi/virtio/ide/sata, the exact set qemu.ParseDisks recognizes and the same
+// helper internal/pve's own FindVMByDiskVolid uses), by its volid or, when
+// stableID is set, by a serial=<stableID> drive option. It records every
+// match on every guest rather than stopping at the first, because a volume
+// that two guests name is exactly what an operator runs this to find, and it
+// then records every unusedN entry that names the volume under any of the
+// names those slots carry. Independently, it records a bosh_attached_disks or
+// bosh_parked_disks sentinel entry naming the disk on any VM's description.
 //
-// VMs whose config cannot be fetched are skipped (best-effort operator
-// scan, matching scripts/disk-audit's tolerance of individual VM fetch
-// failures) rather than aborting the whole locate.
+// Holder and CurrentVolid keep their meaning: the first match in VMID order,
+// with a volid match ahead of a serial match on the same guest.
 //
-// Returns an error only when the initial cluster VM listing itself fails;
-// per-VM config fetch failures are silently skipped.
+// A VM whose config cannot be fetched is listed in UnreadableVMIDs rather
+// than aborting the whole locate.
+//
+// Returns an error only when the initial cluster VM listing itself fails.
 func locateDisk(ctx context.Context, r Reader, bareVolid, stableID string) (*DiskLocateResult, error) {
 	if bareVolid == "" {
 		return nil, fmt.Errorf("pve-cid: locateDisk: bareVolid must not be empty")
@@ -79,30 +115,20 @@ func locateDisk(ctx context.Context, r Reader, bareVolid, stableID string) (*Dis
 
 	result := &DiskLocateResult{BareVolid: bareVolid, StableID: stableID}
 
+	type readVM struct {
+		vm  ClusterVM
+		cfg map[string]any
+	}
+	var read []readVM
 	for _, vm := range vms {
 		cfg, cfgErr := r.VMConfig(ctx, vm.Node, vm.VMID)
 		if cfgErr != nil || cfg == nil {
+			result.UnreadableVMIDs = append(result.UnreadableVMIDs, vm.VMID)
 			continue
 		}
+		read = append(read, readVM{vm: vm, cfg: cfg})
 
-		disks := qemu.ParseDisks(cfg)
-		if result.Holder == nil {
-			if slot, ok := pve.FindDiskIDByVolID(disks, bareVolid); ok {
-				result.Holder = &DiskHolder{VMID: vm.VMID, Node: vm.Node, Slot: slot}
-				result.CurrentVolid = bareVolid
-			} else if stableID != "" {
-				// Mirror the CPI's identity resolution: a serial=<stableID>
-				// drive option identifies the disk after a reassignment
-				// renamed the volume away from its birth volid.
-				for slot, optStr := range disks {
-					if serial, has := pve.StableIDFromDriveOptStr(optStr); has && serial == stableID {
-						result.Holder = &DiskHolder{VMID: vm.VMID, Node: vm.Node, Slot: slot}
-						result.CurrentVolid = bareVolidFromDriveOptStr(optStr)
-						break
-					}
-				}
-			}
-		}
+		result.Holders = append(result.Holders, matchingSlots(vm, qemu.ParseDisks(cfg), bareVolid, stableID)...)
 
 		desc := pve.DescriptionFromConfig(cfg)
 		match := SentinelMatch{VMID: vm.VMID, Node: vm.Node}
@@ -121,7 +147,62 @@ func locateDisk(ctx context.Context, r Reader, bareVolid, stableID string) (*Dis
 		}
 	}
 
+	if len(result.Holders) > 0 {
+		first := result.Holders[0]
+		result.Holder = &DiskHolder{VMID: first.VMID, Node: first.Node, Slot: first.Slot}
+		result.CurrentVolid = first.Volid
+	}
+
+	// An unused entry carries no serial, so it is matched by name: the
+	// located volid, and every name a matching active slot carries, which is
+	// how a volume renamed for one guest shows up on another guest's unused
+	// entry.
+	names := map[string]bool{bareVolid: true}
+	for _, h := range result.Holders {
+		names[h.Volid] = true
+	}
+	for _, rv := range read {
+		unused := pve.FindUnusedDiskEntries(rv.cfg)
+		slots := make([]string, 0, len(unused))
+		for slot := range unused {
+			slots = append(slots, slot)
+		}
+		sort.Strings(slots)
+		for _, slot := range slots {
+			if names[unused[slot]] {
+				result.UnusedRefs = append(result.UnusedRefs, UnusedReference{VMID: rv.vm.VMID, Node: rv.vm.Node, Slot: slot, Volid: unused[slot]})
+			}
+		}
+	}
+
 	return result, nil
+}
+
+// matchingSlots returns every active slot of one guest that matches the disk,
+// volid matches first and serial matches after, each in slot order.
+func matchingSlots(vm ClusterVM, disks map[string]string, bareVolid, stableID string) []DiskHolderMatch {
+	slots := make([]string, 0, len(disks))
+	for slot := range disks {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	var byVolid, bySerial []DiskHolderMatch
+	for _, slot := range slots {
+		optStr := disks[slot]
+		if optStr == bareVolid || strings.HasPrefix(optStr, bareVolid+",") {
+			byVolid = append(byVolid, DiskHolderMatch{VMID: vm.VMID, Node: vm.Node, Slot: slot, Volid: bareVolid, Match: "volid"})
+			continue
+		}
+		// Mirror the CPI's identity resolution: a serial=<stableID> drive
+		// option identifies the disk after a reassignment renamed the volume
+		// away from its birth volid.
+		if stableID != "" {
+			if serial, has := pve.StableIDFromDriveOptStr(optStr); has && serial == stableID {
+				bySerial = append(bySerial, DiskHolderMatch{VMID: vm.VMID, Node: vm.Node, Slot: slot, Volid: bareVolidFromDriveOptStr(optStr), Match: "serial"})
+			}
+		}
+	}
+	return append(byVolid, bySerial...)
 }
 
 // bareVolidFromDriveOptStr strips the option suffix from a PVE drive value.
@@ -305,6 +386,7 @@ func runLocate(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, locErr)
 		return exitError
 	}
+	printDiskLocateWarnings(stderr, result)
 	if *jsonOut {
 		return writeJSON(stdout, stderr, result)
 	}
@@ -325,6 +407,15 @@ func printDiskLocateResult(w io.Writer, result *DiskLocateResult) {
 	} else {
 		_, _ = fmt.Fprintln(w, "holder: unattached (no active bus slot found on any cluster VM)")
 	}
+	for _, h := range result.Holders {
+		if result.Holder != nil && h.VMID == result.Holder.VMID && h.Slot == result.Holder.Slot {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "also held by: vmid=%d node=%s slot=%s volid=%s (matched by %s)\n", h.VMID, h.Node, h.Slot, h.Volid, h.Match)
+	}
+	for _, u := range result.UnusedRefs {
+		_, _ = fmt.Fprintf(w, "unused: vmid=%d node=%s slot=%s volid=%s\n", u.VMID, u.Node, u.Slot, u.Volid)
+	}
 
 	if len(result.SentinelMatches) == 0 {
 		_, _ = fmt.Fprintln(w, "sentinels: none")
@@ -341,6 +432,42 @@ func printDiskLocateResult(w io.Writer, result *DiskLocateResult) {
 		if result.Holder == nil {
 			_, _ = fmt.Fprintln(w, "warning: sentinel entry found with no matching bus-slot holder anywhere in the cluster — possibly stale")
 		}
+	}
+}
+
+// locateDocsPointer names the runbook section on volumes that more than one
+// guest names. The docs do not ship in the release, so it names the repository
+// as well as the file.
+const locateDocsPointer = `see "Auditing parked disks with scripts/disk-audit" in docs/operations.md of bosh-proxmox-cpi-release`
+
+// printDiskLocateWarnings writes to stderr when more than one guest names the
+// disk, counting active slots and unused entries, and when a guest's config
+// could not be read. Neither changes the exit code.
+func printDiskLocateWarnings(w io.Writer, result *DiskLocateResult) {
+	guests := map[int]bool{}
+	for _, h := range result.Holders {
+		guests[h.VMID] = true
+	}
+	for _, u := range result.UnusedRefs {
+		guests[u.VMID] = true
+	}
+	if len(guests) > 1 {
+		msg := fmt.Sprintf("warning: %d guests name this disk (active slots: %d, unused entries: %d).",
+			len(guests), len(result.Holders), len(result.UnusedRefs))
+		if len(result.Holders) > 0 {
+			msg += " The holder shows only the first active slot in VMID order."
+		}
+		msg += " The Director's VM CID decides which guest really holds the disk." +
+			" Leave every reference in place until that is settled; " + locateDocsPointer
+		_, _ = fmt.Fprintln(w, msg)
+	}
+	if len(result.UnreadableVMIDs) > 0 {
+		ids := make([]string, 0, len(result.UnreadableVMIDs))
+		for _, id := range result.UnreadableVMIDs {
+			ids = append(ids, fmt.Sprint(id))
+		}
+		_, _ = fmt.Fprintf(w, "warning: the configs of %d VM(s) could not be read (%s), so this result may be incomplete\n",
+			len(result.UnreadableVMIDs), strings.Join(ids, ", "))
 	}
 }
 
