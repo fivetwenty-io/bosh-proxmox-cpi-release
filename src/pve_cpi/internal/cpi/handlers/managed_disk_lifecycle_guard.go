@@ -848,15 +848,20 @@ func managedRequestEnded(cause error) error {
 }
 
 // requestEndedRefusal refuses a mutation on a request whose context has
-// ended, except the release of a lock sentinel on its own live context.
+// ended, except the release of a lock sentinel or a parker protection restore
+// on its own live context.
 func (m *managedDiskLifecycle) requestEndedRefusal(ctx context.Context, call ManagedAllocationMutation) error {
 	if m.requestContext == nil {
 		return fmt.Errorf("managed lifecycle request cancelled before mutation")
 	}
-	if cause := m.requestContext.Err(); cause != nil && (ctx.Err() != nil || !isLockSentinelDelete(call)) {
-		return managedRequestEnded(cause)
+	cause := m.requestContext.Err()
+	if cause == nil {
+		return nil
 	}
-	return nil
+	if ctx.Err() == nil && (isLockSentinelDelete(call) || isProtectionRestore(call)) {
+		return nil
+	}
+	return managedRequestEnded(cause)
 }
 
 // isLockSentinelDelete reports whether call deletes a bosh-lock- sentinel. A
@@ -867,4 +872,23 @@ func (m *managedDiskLifecycle) requestEndedRefusal(ctx context.Context, call Man
 func isLockSentinelDelete(call ManagedAllocationMutation) bool {
 	pool, _ := call.Args[managedArgumentPoolID].(string)
 	return call.Service == managedDiskServicePool && call.Method == "DeletePool" && isManagedLockPool(pool)
+}
+
+// isProtectionRestore reports whether call is a configuration write that only
+// puts protection back, with or without a digest. A window that cleared a
+// parker's protection has to put it back after the request's context ends, or
+// the parker stays unprotected until the next window on it. That restore runs
+// on its own detached, bounded context, and before admits it while that
+// context is live. A write that clears protection or changes anything else is
+// still refused.
+func isProtectionRestore(call ManagedAllocationMutation) bool {
+	if call.Service != managedServiceNodes || call.Method != "UpdateQemuConfig" {
+		return false
+	}
+	fields, err := lifecycleMutationFields(call.Args[managedArgumentParams])
+	if err != nil {
+		return false
+	}
+	on, _ := fields[pveConfigKeyProtection].(bool)
+	return on && isParkerProtectionParameters(parkerProtectionStepParameters(fields))
 }
