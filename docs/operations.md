@@ -1052,6 +1052,14 @@ python3 scripts/disk-audit --config /path/to/audit-config.json --json
 
 The report also lists the parker VMs themselves, and that listing carries a `POOL` column naming the resource pool each parker belongs to, left blank for a parker that belongs to no pool. The parker warnings below name the same pool, and write `none` where the column is blank, so a finding says where the parker lives without a second lookup. The column is read from the cluster index, which lags a membership change by minutes, so a parker that was swept into its pool moments ago can still read as unpooled.
 
+The report also lists every volume that more than one guest's config names, whether on an active slot or an unused entry. Earlier releases could leave a disk this way. When a transfer to a parker stopped partway, the volume could stay on the guest's unused entry, and a later detach or attach could then name the same volume from a parker or a second VM. The report shows each such volume once and follows it with every guest that names it, the slot, and whether that guest is a parker. It also marks the guest that owns the volume by name, and the JSON output carries the same findings under `multiply_referenced`.
+
+The owner matters because PVE decides from the volume's name alone which VM owns it, reading the VMID from the start of the name's last segment, as in `vm-<vmid>-` or `base-<vmid>-`. Destroying the owner deletes the volume, and so does removing the owner's unused entry, even while another guest still names it. Removing a non-owner's entry, or destroying a VM that doesn't own the volume, only drops that reference and leaves the volume alone. When the owner exists but names the volume nowhere, destroying it with `destroy-unreferenced-disks` deletes the volume too, so a deployment that sets `pve.destroy_unreferenced_disks` needs the same care there. Until we know which guest really holds the disk, we leave every reference in place and destroy none of the guests involved.
+
+To find the real holder, we start from the Director's own pairing. `bosh -d <deployment> instances --details` puts each instance's VM CID next to its disk CIDs. On the Director VM, `/var/vcap/packages/pve_cpi/bin/pve-cid decode <vm-cid>` gives the VMID of the guest the Director believes holds the disk, and the same command on the disk CID gives the disk's `stable_id` and the `volid` it was created with. That guest holds the disk when one of its active slots carries `serial=<stable_id>`, and for a disk with no `stable_id`, an active slot that names that `volid` confirms it the same way. When the active slots of two guests both match, the Director's VM CID decides which one holds the disk. When no active slot matches, the volume most likely sits on a guest's unused entry after a transfer that stopped partway, and [delete_vm refuses to destroy VM with attached unused disks](troubleshooting.md#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) gives the checks and the recovery for that case.
+
+The report reads each guest's current config only, so a reference kept only in a snapshot section isn't counted, and it reads QEMU guests only, so a container that names a volume isn't counted either. It can also see only the guests the token can audit. When the token lacks `VM.Audit` on `/vms`, or when the script can't read the token's permissions, the script warns that the report may miss a second guest, and the JSON sets `multiply_referenced_visibility` to `limited` or `unknown`. A guest whose config didn't come back is listed in `multiply_referenced_unreadable_vmids`, and `multiply_referenced_complete` is `true` only when nothing is missing. None of this changes the exit code.
+
 The script prints warnings to stderr when:
 
 - Parked disks exist but `detached_disk_strategy` in the config file is set to `"free"`. These disks still drain — the parker band resolves under every strategy, so each unparks on its next `attach_disk` or `delete_disk` — but no new detaches will park.
@@ -1061,6 +1069,10 @@ The script prints warnings to stderr when:
 - A parker carries an `unusedN` reference to a live volume, left by a sweep that did not complete. The warning names the `qm unlink` sequence that clears it. That parker is not a teardown candidate: `qm destroy --purge` frees the volume behind an `unusedN` entry as readily as one in a `scsiN` slot.
 
 - A parker's config did not come back, so its contents are unknown and it is not reported as empty.
+
+- More than one guest names a volume. The warning names every guest and slot, says which deletion would free the volume, and points back at this section.
+
+- The report of volumes named by more than one guest may be incomplete, because a guest's config didn't come back, the token lacks `VM.Audit` on `/vms`, or the token's permissions couldn't be read.
 
 ### Moving parkers after a parker pool rename
 
