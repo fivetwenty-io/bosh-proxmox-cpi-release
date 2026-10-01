@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,9 @@ type managedVMGuardFixture struct {
 	visibilityErr    error
 	visibilityChecks int
 	taskWaits        int
+	// pending, when set, holds a slot delete on a running VM pending the way
+	// qemu-server does, and serves the pending endpoint from it.
+	pending *fakePendingModel
 }
 type managedVMGuardQEMU struct {
 	qemu.Service
@@ -192,7 +196,27 @@ func (n *managedVMGuardNodes) CreateQemuClone(_ context.Context, _ string, _ str
 	raw := json.RawMessage(`"UPID:n1:clone"`)
 	return &raw, nil
 }
-func (n *managedVMGuardNodes) UpdateQemuConfig(_ context.Context, _ string, _ string, params *nodes.UpdateQemuConfigParams) error {
+
+// ListQemuPending serves the pending endpoint from the fixture's config read,
+// adding the pending model's held deletes when the fixture has one.
+func (n *managedVMGuardNodes) ListQemuPending(ctx context.Context, node, vmid string) (*nodes.ListQemuPendingResponse, error) {
+	read := (&managedVMGuardQEMU{f: n.f}).Config
+	if n.f.pending != nil {
+		return n.f.pending.pendingRead(ctx, read, node, vmid)
+	}
+	return PendingFromConfigRead(ctx, read, node, vmid)
+}
+
+func (n *managedVMGuardNodes) UpdateQemuConfig(_ context.Context, _ string, vmid string, params *nodes.UpdateQemuConfigParams) error {
+	if n.f.pending != nil {
+		id, err := strconv.Atoi(vmid)
+		if err != nil {
+			return err
+		}
+		if handled, err := n.f.pending.update(id, n.f.cfg, params); handled {
+			return err
+		}
+	}
 	fields, err := managedEvidenceObject(params)
 	if err != nil {
 		return err

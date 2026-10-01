@@ -812,6 +812,48 @@ qm set <N> --delete unusedN
 
 Then we rerun the clean-up, for example with `bosh clean-up --all`. The next `delete_disk` finds that the volume is gone and finishes.
 
+### A disk detach stays pending on a running VM
+
+**Symptom**
+
+One of these comes from `detach_disk`, or from `attach_disk` when it moves a disk off a legacy `scsi0` slot:
+
+```text
+detach_disk: VM <N> on node <node> can't hot-unplug a disk while it runs, because its hotplug setting "<setting>" doesn't include disk. PVE could only record the delete of slot <slot> as pending, so we reverted it, and the disk is still attached. Add disk to the VM's hotplug setting or stop the VM, and then retry
+```
+
+```text
+detach_disk: the guest on VM <N> (node <node>) still holds the disk on slot <slot>, so PVE could only record its delete as pending. We reverted that pending delete, and the disk is still attached. A retry can succeed once the guest lets go of the disk
+```
+
+`delete_vm` reports the same condition as retriable, because the VM it's destroying is on its way to stopped, and the next `delete_vm` finishes the detach. A retried `detach_disk` that finds a delete an earlier attempt or an operator left pending leaves it alone and fails retriably, with a message saying the transfer finishes once the VM stops.
+
+**Diagnosis**
+
+On a running VM, PVE removes a disk slot by hot-unplugging it. When the VM's hotplug setting doesn't include disk, PVE can't unplug it, so it records the delete as pending and applies it when the VM stops. When the guest still holds the device, the unplug fails, and the delete is left pending in the same way. In both cases the running guest keeps the disk, while PVE's ordinary config read no longer shows the slot. Releases before 0.9.0 read only that config, so they could take the disk as detached and attach it to a parker while the guest still had it. The CPI now reads PVE's pending view as well, and when one of its own deletes stays pending it reverts that delete and reports it, so the disk stays exactly where the Director thinks it is.
+
+**Fix**
+
+For the hotplug message, we add `disk` to the hotplug setting the VM is created with, which is `pve.hotplug` or the VM type's `cloud_properties.hotplug`, and recreate the VM. Alternatively, we stop the VM and retry the operation, because PVE applies the delete at once on a stopped VM. For the busy message, the guest is still using the disk, usually because a filesystem on it is mounted. The Director retries on its own, and the detach finishes once the guest lets go.
+
+### delete_disk refuses a disk whose slot delete is pending
+
+**Symptom**
+
+```text
+delete_disk: refusing to delete disk <cid>, because VM <N> on node <node> still has it plugged in on slot <slot>, and PVE has only recorded that slot's delete as pending. Let the delete apply by stopping VM <N> at a convenient time, and then rerun the clean-up. Nothing was deleted; see "delete_disk refuses a disk whose slot delete is pending" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+```
+
+**Diagnosis**
+
+A delete of slot `<slot>` on VM `<N>` is pending, so PVE's ordinary config read hides the slot while the running guest still has the disk plugged in. The section above explains how that happens. A release before 0.9.0 could leave this state behind, because it took a pending delete as a finished detach, and so can a crash or an operator's `qm set --delete` on a running VM. The Director believes the disk is detached, treats it as orphaned, and sends `delete_disk`. PVE deletes a volume without checking whether a guest uses it, so the CPI refuses rather than pull the volume out from under the running guest. The refusal isn't retriable, because a pending delete doesn't clear while the VM runs.
+
+**Fix**
+
+We let the pending delete apply by stopping VM `<N>` at a convenient time, for example with `bosh -d <deployment> stop <instance-group>/<id>`. PVE applies the delete when the VM stops, and the disk leaves the VM. Then we start the instance again and rerun the clean-up, for example with `bosh clean-up --all`, and the next `delete_disk` deletes the disk.
+
+We don't revert the pending delete, even though `detach_disk` reverts its own pending deletes. A revert puts the disk back on the VM, while the Director still wants it gone. The next `delete_disk` would then find an ordinary holder, which only the optional lock guard protects, and it would delete the volume from under the running VM. `detach_disk` reverts for the opposite reason, because there the Director still believes the disk is attached, and the revert keeps the disk where the Director expects it.
+
 ## Network, bridge, and SDN failures
 
 ### Bridge not found

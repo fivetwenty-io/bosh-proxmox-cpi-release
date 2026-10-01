@@ -238,6 +238,20 @@ func (q *ownerSimQEMU) DetachDisk(_ context.Context, _ string, vmid int, slot st
 	return nil
 }
 
+// deleteConfigKey is the raw config delete the slot-delete helper sends, which
+// replaced DetachDisk on the legacy detach paths. Unlike DetachDisk it doesn't
+// sweep the unused entry PVE leaves for an owned volume; the helper's caller
+// does that itself, the way the SDK did.
+func (q *ownerSimQEMU) deleteConfigKey(_ string, vmid int, key string) error {
+	q.sim.mu.Lock()
+	defer q.sim.mu.Unlock()
+	if _, ok := q.sim.configs[vmid]; !ok {
+		return &sdkerrors.APIError{HTTPCode: 404}
+	}
+	q.sim.deleteSlotLocked(vmid, key)
+	return nil
+}
+
 func (q *ownerSimQEMU) AttachDisk(_ context.Context, _ string, vmid int, volid, _ string, opts *qemu.AttachOpts) (string, error) {
 	q.sim.mu.Lock()
 	defer q.sim.mu.Unlock()

@@ -255,6 +255,10 @@ func attachDiskCore(
 	const bus = "scsi"
 
 	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, rd.volid)
+	if _, pending := pve.IsDriveDeletePending(prepErr); pending {
+		// Already classed by the slot choice.
+		return "", "", prepErr
+	}
 	if prepErr != nil {
 		if pve.IsNotFound(prepErr) {
 			return "", "", cpierrors.VMNotFound(vmCID)
@@ -886,14 +890,21 @@ func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string
 //
 // Behavior:
 //
-//   - If volid is already present in the VM config at scsiN with N >= 1, that
-//     diskID is reused (idempotent reattach).
+//   - If volid is already present in the VM config at scsiN with N >= 1, in
+//     either view, that diskID is reused (idempotent reattach). When that
+//     slot's delete is pending, the running guest still has the disk while
+//     the config endpoint hides the slot, so the delete is reverted and
+//     confirmed with a pending read before the slot is returned, and an
+//     unconfirmed revert fails the attach retriably. PVE used to cancel such
+//     a delete by accident when the attach happened to write the volume back
+//     onto the same slot, and the explicit revert replaces that.
 //   - If volid is present at scsi0 (legacy from prior CPI versions), the
 //     attachment is removed and a fresh scsi index >= 1 is chosen. Persistent
 //     disks orphaned at scsi0 have, by construction, never been successfully
 //     partitioned by the agent (the resolver always picked /dev/vda instead),
 //     so detaching them loses no data.
-//   - Otherwise the lowest free scsi index >= 1 is returned.
+//   - Otherwise the lowest scsi index >= 1 that no key occupies in either view
+//     is returned.
 func chooseSCSISlotSkippingZero(
 	ctx context.Context,
 	deps Deps,
@@ -902,34 +913,51 @@ func chooseSCSISlotSkippingZero(
 	vmid int,
 	volid string,
 ) (string, error) {
-	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	views, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return "", err
 	}
 
-	if existing, ok := pve.FindDiskIDByVolID(qemu.ParseDisks(cfg), volid); ok {
+	if existing, ok := views.BusSlotNaming(volid); ok {
 		if existing != diskKeyScsi0 {
+			if views.PendingDelete(existing) {
+				deps.Log(ctx).Warn(op+": the disk's slot has a pending delete on the target VM; reverting it before the reattach",
+					log.Int("vmid", vmid),
+					log.String("slot", existing),
+					log.String("volid", volid),
+				)
+				if revertErr := pve.RevertPendingDriveDelete(ctx, deps.PVE, node, vmid, existing); revertErr != nil {
+					if pending := driveDeletePendingDiskError(op, revertErr); pending != nil {
+						return "", pending
+					}
+					return "", revertErr
+				}
+			}
 			return existing, nil
 		}
 		// Legacy scsi0 attachment from a prior CPI version. Detach so the
-		// reattach below lands on scsi1+. DetachDisk also sweeps the
-		// resulting unusedN entry, leaving the config clean.
+		// reattach below lands on scsi1+. The detach also sweeps the
+		// resulting unusedN entry, leaving the config clean, and it reverts and
+		// refuses a delete PVE could only record as pending, so the same volume
+		// never ends up on two slots of a running guest.
 		deps.Log(ctx).Warn(op+": migrating legacy scsi0 attachment to scsi1+",
 			log.Int("vmid", vmid),
 			log.String("volid", volid),
 		)
-		if detachErr := deps.PVE.QEMU().DetachDisk(ctx, node, vmid, "scsi0"); detachErr != nil {
+		if detachErr := detachDriveSlot(ctx, deps, node, vmid, "scsi0", volid); detachErr != nil {
+			if pending := driveDeletePendingDiskError(op, detachErr); pending != nil {
+				return "", pending
+			}
 			return "", cpierrors.Wrap(detachErr, op+": detach legacy scsi0")
 		}
-		// Re-read config so NextFreeSCSIIndexAtLeast sees scsi0 as free.
-		cfg, err = deps.PVE.QEMU().Config(ctx, node, vmid)
+		// Re-read both views so the slot choice below sees scsi0 as free.
+		views, err = pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
 		if err != nil {
 			return "", cpierrors.Wrap(err, op+": re-read config after scsi0 detach")
 		}
 	}
 
-	idx := nextFreeSCSIIndexAtLeast(cfg, 1)
-	return fmt.Sprintf("scsi%d", idx), nil
+	return fmt.Sprintf("scsi%d", nextFreeSCSIIndexInViews(views)), nil
 }
 
 // devicePathByID returns the PVE-stable udev by-id symlink path for the
@@ -1251,6 +1279,18 @@ func foreignHolderError(deps Deps, op, diskCID string, targetVMID int, holder pv
 			"attaching one volume to two VMs corrupts it. Detach it from VM %d first",
 		op, diskCID, holder.VMID, holder.Node, targetVMID, holder.VMID,
 	)
+}
+
+// nextFreeSCSIIndexInViews returns the lowest scsi slot index from 1 up that no
+// key occupies in either view of a VM, so scsi0 stays free for the reason
+// chooseSCSISlotSkippingZero gives. A key counts as occupied when either
+// view has it, and that includes a slot whose delete is pending. The config
+// endpoint hides such a slot while the running guest still has its drive, and
+// writing another volume there would leave PVE holding the old drive as
+// current and the new one as pending. Every slot choice for a disk attach
+// goes through it.
+func nextFreeSCSIIndexInViews(views pve.QemuViews) int {
+	return nextFreeSCSIIndexAtLeast(views.Holding(), 1)
 }
 
 // nextFreeSCSIIndexAtLeast returns the lowest scsi slot index >= floor that is

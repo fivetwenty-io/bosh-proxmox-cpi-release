@@ -55,6 +55,13 @@ type lifecycleFlowPVE struct {
 	// vmSnapshots, when set, answers ListSnapshots per VM instead of
 	// snapshots, which every VM shares.
 	vmSnapshots map[int][]map[string]any
+	// pending, when set, is PVE's pending section. A slot delete on a
+	// running VM whose hotplug setting lacks disk stays pending, one whose
+	// guest holds the device stays pending and fails busy, and a revert drops
+	// the pending delete. The pending endpoint reports each held key with its
+	// delete flag. Without it every delete applies at once, as on a stopped
+	// VM.
+	pending *fakePendingModel
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -111,6 +118,30 @@ func (q lifecycleFlowQEMU) AttachDisk(ctx context.Context, node string, vmid int
 		q.c.dropUnusedEntries(vmid, volume)
 	}
 	return slot, err
+}
+
+// DetachDisk does what the SDK's DetachDisk does against PVE. It deletes the
+// slot through the fake's own config write, so on a running VM the pending
+// model holds the delete the way qemu-server does, and then it removes every
+// unusedN entry of the VM that names the slot's volume.
+func (q lifecycleFlowQEMU) DetachDisk(ctx context.Context, node string, vmid int, slot string) error {
+	svc := q.c.Nodes()
+	value, _ := pve.ConfigString(q.c.state.configs[vmid], slot)
+	volume := strings.Split(value, ",")[0]
+	del := slot
+	if err := svc.UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), &nodes.UpdateQemuConfigParams{Delete: &del}); err != nil {
+		return err
+	}
+	for key, unused := range pve.FindUnusedDiskEntries(q.c.state.configs[vmid]) {
+		if volume == "" || unused != volume {
+			continue
+		}
+		swept := key
+		if err := svc.UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), &nodes.UpdateQemuConfigParams{Delete: &swept}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dropUnusedEntries removes every unusedN entry of the VM that names the
@@ -342,6 +373,14 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	if p.Description != nil && n.c.descriptionErr != nil {
 		return n.c.descriptionErr
 	}
+	if n.c.pending != nil {
+		if handled, pendingErr := n.c.pending.update(vmid, cfg, p); handled {
+			// PVE writes the pending section, so the digest moves on.
+			n.c.generation++
+			cfg["digest"] = fmt.Sprint(n.c.generation + 100)
+			return pendingErr
+		}
+	}
 	deletedVolume := ""
 	if p.Delete != nil && strings.HasPrefix(*p.Delete, "unused") {
 		value, _ := pve.ConfigString(cfg, *p.Delete)
@@ -355,6 +394,11 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	fake := newIDFakeClient(n.c.state.configs)
 	if err := (&idFakeNodes{c: fake}).UpdateQemuConfig(ctx, node, vmidText, p); err != nil {
 		return err
+	}
+	if p.Tags != nil {
+		// A tag write lands the way PVE applies it, so a row can see the
+		// bosh-deleting tag delete_vm stamps.
+		cfg["tags"] = *p.Tags
 	}
 	fields, err := lifecycleMutationFields(p)
 	if err != nil {
@@ -604,6 +648,9 @@ func (n lifecycleFlowNodes) ListQemuPending(ctx context.Context, node, vmid stri
 	read := n.cfg
 	if read == nil {
 		read = n.c.QEMU().Config
+	}
+	if n.c.pending != nil {
+		return n.c.pending.pendingRead(ctx, read, node, vmid)
 	}
 	return PendingFromConfigRead(ctx, read, node, vmid)
 }

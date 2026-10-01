@@ -47,6 +47,13 @@ func (n volumeDestroyingNodes) DeleteQemu(ctx context.Context, node, vmidText st
 			delete(n.c.state.volumes, strings.Split(text, ",")[0])
 			delete(config, key)
 		}
+		// PVE's destroy works from the current config, which still has a slot
+		// whose delete is pending, so it takes that slot's volume too.
+		if n.c.pending != nil {
+			for _, text := range n.c.pending.dropHeld(vmid) {
+				delete(n.c.state.volumes, strings.Split(text, ",")[0])
+			}
+		}
 	}
 	return n.lifecycleFlowNodes.DeleteQemu(ctx, node, vmidText, p)
 }

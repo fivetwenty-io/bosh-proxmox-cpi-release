@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
-
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
@@ -99,9 +97,10 @@ func parkerProvenanceSourceKeeps(
 	return held
 }
 
-// provenanceSourceNamesVolume reports whether the source VM's current config
-// names entry.Volid on an active slot or an unused entry. An error means the
-// answer is unknown, and the caller keeps the record.
+// provenanceSourceNamesVolume reports whether the source VM names entry.Volid
+// on an active slot or an unused entry, in either the current or the pending
+// view, so a source whose delete is still pending keeps its record. An error
+// means the answer is unknown, and the caller keeps the record.
 //
 // The record's node is where the transfer ran, which is where the source was
 // then, not necessarily where it is now. So a config that is gone at that node
@@ -110,9 +109,9 @@ func parkerProvenanceSourceKeeps(
 // the record go.
 func provenanceSourceNamesVolume(ctx context.Context, c Client, entry parkerProvEntry, vmid int) (bool, error) {
 	if entry.Node != "" {
-		cfg, err := c.QEMU().Config(ctx, entry.Node, vmid)
+		views, err := ReadQemuViews(ctx, c, entry.Node, vmid)
 		if err == nil {
-			return configNamesVolume(cfg, entry.Volid), nil
+			return views.NamesVolume(entry.Volid), nil
 		}
 		if !parkerConfigGone(err) {
 			return false, err
@@ -125,22 +124,11 @@ func provenanceSourceNamesVolume(ctx context.Context, c Client, entry parkerProv
 	if !loc.Found {
 		return false, nil
 	}
-	cfg, err := c.QEMU().Config(ctx, loc.Node, vmid)
+	views, err := ReadQemuViews(ctx, c, loc.Node, vmid)
 	if err != nil {
 		return false, err
 	}
-	return configNamesVolume(cfg, entry.Volid), nil
-}
-
-// configNamesVolume reports whether any active bus slot or unused entry of cfg
-// names bareVolid.
-func configNamesVolume(cfg map[string]any, bareVolid string) bool {
-	for _, optstr := range qemu.ParseDisks(cfg) {
-		if bareDriveVolid(optstr) == bareVolid {
-			return true
-		}
-	}
-	return unusedEntriesReference(cfg, bareVolid)
+	return views.NamesVolume(entry.Volid), nil
 }
 
 // staleParkerProvenanceKeys returns, sorted, the keys the age-and-reference

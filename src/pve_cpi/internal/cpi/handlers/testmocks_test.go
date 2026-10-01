@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -63,9 +64,10 @@ func (m *mockPVEClient) QEMU() qemu.Service { return m.qemuSvc }
 // (pve.ListGuestsAuthoritative) by deriving ListQemu rows from the wired
 // cluster fixture, so suites scripted against the /cluster/resources index
 // keep working after the production migration to per-node listings. A wired
-// nodes service keeps handling every other method through delegation; with
-// neither service wired, Nodes stays nil so production nil-guards behave as
-// before.
+// nodes service keeps handling every other method through delegation. A QEMU
+// fake that applies slot deletes to its own config gets a wrapper too, for the
+// slot-delete helper's raw delete and pending read. With none of those wired,
+// Nodes stays nil so production nil-guards behave as before.
 func (m *mockPVEClient) Nodes() nodes.Service {
 	if m.nodesSvc != nil {
 		return &authNodesService{
@@ -73,12 +75,43 @@ func (m *mockPVEClient) Nodes() nodes.Service {
 			configRead: clientConfigRead(m),
 		}
 	}
-	if m.clusterSvc != nil {
+	if m.clusterSvc != nil || m.slotDeleter() != nil {
 		return &authNodesService{
-			listFn: m.clusterSvc.ListResources, fallbackNode: testNode, client: m, configRead: clientConfigRead(m),
+			listFn: m.Cluster().ListResources, fallbackNode: testNode, client: m, configRead: clientConfigRead(m),
 		}
 	}
 	return nil
+}
+
+// slotConfigDeleter is a QEMU fake that keeps its VM configs itself and so
+// applies the raw config delete the slot-delete helper sends for a bus slot,
+// where the SDK's DetachDisk used to run. It removes the key and nothing
+// else, the way PVE removes a slot whose volume the VM doesn't own.
+type slotConfigDeleter interface {
+	deleteConfigKey(node string, vmid int, key string) error
+}
+
+// slotDeleter returns the client's QEMU fake as a slotConfigDeleter, or nil.
+// The shared mockQEMUService counts as one only when a test scripts its
+// slotDeleteFn, so the many suites that use it without one keep a nil Nodes.
+func (m *mockPVEClient) slotDeleter() slotConfigDeleter {
+	if q, ok := m.qemuSvc.(*mockQEMUService); ok {
+		if q.slotDeleteFn == nil {
+			return nil
+		}
+		return slotDeleteFunc(q.slotDeleteFn)
+	}
+	if deleter, ok := m.qemuSvc.(slotConfigDeleter); ok {
+		return deleter
+	}
+	return nil
+}
+
+// slotDeleteFunc adapts a scripted function to slotConfigDeleter.
+type slotDeleteFunc func(node string, vmid int, key string) error
+
+func (f slotDeleteFunc) deleteConfigKey(node string, vmid int, key string) error {
+	return f(node, vmid, key)
 }
 
 // listStorageStatus answers the corroboration's status read and records that it
@@ -198,6 +231,9 @@ type mockQEMUService struct {
 	statusFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	configFn     func(ctx context.Context, node string, vmid int) (map[string]any, error)
 	detachDiskFn func(ctx context.Context, node string, vmid int, slot string) error
+	// slotDeleteFn, when set, receives the raw config delete the slot-delete
+	// helper sends for a bus slot, where the SDK's DetachDisk used to run.
+	slotDeleteFn func(node string, vmid int, key string) error
 }
 
 func (m *mockQEMUService) Stop(ctx context.Context, node string, vmid int) (string, error) {
@@ -1003,7 +1039,8 @@ func (s *authNodesService) ListStorageStatus(
 // ListStorageContent and UpdateQemuConfig delegate to the embedded Service
 // when one is wired; without a delegate they fall back to what paths that
 // previously saw a nil nodes service tolerated: an empty content listing and
-// an accepted config write.
+// an accepted config write. A delete-only write goes to the QEMU fake first
+// when that fake is a slotConfigDeleter.
 func (s *authNodesService) ListStorageContent(ctx context.Context, node, storageName string, params *nodes.ListStorageContentParams) (*nodes.ListStorageContentResponse, error) {
 	if s.Service != nil {
 		return s.Service.ListStorageContent(ctx, node, storageName, params)
@@ -1013,6 +1050,15 @@ func (s *authNodesService) ListStorageContent(ctx context.Context, node, storage
 }
 
 func (s *authNodesService) UpdateQemuConfig(ctx context.Context, node, vmid string, params *nodes.UpdateQemuConfigParams) error {
+	if s.client != nil && handlers.IsDeleteOnlyWrite(params) {
+		if deleter := s.client.slotDeleter(); deleter != nil {
+			id, err := strconv.Atoi(vmid)
+			if err != nil {
+				return fmt.Errorf("fake slot delete: vmid %q: %w", vmid, err)
+			}
+			return deleter.deleteConfigKey(node, id, *params.Delete)
+		}
+	}
 	if s.Service != nil {
 		return s.Service.UpdateQemuConfig(ctx, node, vmid, params)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	nodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
 // legacyFileEphemeral is the volume ID create_vm gives VM 777's ephemeral
@@ -113,10 +114,28 @@ func (c legacyDestroyPVE) Nodes() nodes.Service {
 // QEMU accepts the fast path's fire-and-forget stop, which the flow fake
 // does not model.
 func (c legacyDestroyPVE) QEMU() qemu.Service {
-	return legacyDestroyQEMU{Service: c.lifecycleFlowPVE.QEMU()}
+	return legacyDestroyQEMU{Service: c.lifecycleFlowPVE.QEMU(), c: c.lifecycleFlowPVE}
 }
 
-type legacyDestroyQEMU struct{ qemu.Service }
+type legacyDestroyQEMU struct {
+	qemu.Service
+	c *lifecycleFlowPVE
+}
+
+// Tasks completes an issued stop when the sync path awaits its task, the way
+// PVE's stop applies the VM's pending changes when it finishes. The fast path
+// never awaits its stop, so its stop stays issued until a row completes it.
+func (c legacyDestroyPVE) Tasks() tasks.Service {
+	return &diskSizingTasks{waitFn: func(_ context.Context, _, upid string, _ *tasks.WaitOptions) (*tasks.Status, error) {
+		if upid == legacyDestroyStopUPID && c.pending != nil {
+			c.pending.completeStops(c.state.configs)
+		}
+		return &tasks.Status{Status: "stopped", ExitStatus: "OK", UpID: upid}, nil
+	}}
+}
+
+// legacyDestroyStopUPID is the task the fake's stop returns.
+const legacyDestroyStopUPID = "UPID:n1:stop"
 
 // Cluster answers the HA and node-affinity cleanup that every legacy delete
 // runs with an empty HA configuration, which the flow fake does not model.
@@ -131,8 +150,11 @@ func (legacyDestroyCluster) DeleteHaResources(context.Context, string, *cluster.
 	return nil
 }
 
-func (legacyDestroyQEMU) Stop(context.Context, string, int) (string, error) {
-	return "UPID:n1:stop", nil
+func (q legacyDestroyQEMU) Stop(_ context.Context, _ string, vmid int) (string, error) {
+	if q.c != nil && q.c.pending != nil {
+		q.c.pending.issueStop(vmid)
+	}
+	return legacyDestroyStopUPID, nil
 }
 
 type legacyDestroyNodes struct {

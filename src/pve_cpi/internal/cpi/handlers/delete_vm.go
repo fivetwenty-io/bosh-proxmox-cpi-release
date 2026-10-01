@@ -316,7 +316,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// foreign active disks before destroying), so the disk survives until a
 	// delete_vm retry detaches it.
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
-		return protErr
+		return deleteVMDriveDeletePendingError(protErr, vmCID, deleteVMStopIssued)
 	}
 	// Preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set
 	// by transferring its volume to a parker before the destroy. Returns
@@ -325,7 +325,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// DestroyUnreferencedDisks below.
 	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
 	if retainErr != nil {
-		return retainErr
+		return deleteVMDriveDeletePendingError(retainErr, vmCID, deleteVMStopIssued)
 	}
 	// Same unusedN guard the sync path runs. Without it the fast-path purge would
 	// still destroy a persistent volume left in an unusedN slot — e.g. a foreign
@@ -461,19 +461,27 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any
 	}
 
 	// A removed placement configuration cannot turn an allocated VM into a
-	// legacy guest and bypass its durable cleanup authority.
-	liveConfig, configErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// legacy guest and bypass its durable cleanup authority. Both views count,
+	// so a slot whose delete is pending still decides what the destroy takes.
+	holding, configErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if configErr != nil {
 		return nil, cpierrors.Retriable("delete_vm: cannot verify allocation provenance for VM %s", vmCID)
 	}
+	liveConfig := holding.Config
 	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(liveConfig)); markerErr != nil || managed {
 		return nil, cpierrors.Cloud("delete_vm: allocation provenance requires its original storage journal authority")
 	}
 	// A legacy persistent disk named for this VM is one PVE counts as the
 	// VM's own, so either destroy below would free it. Refusing here, before
 	// the stop and before the fast path stamps bosh-deleting, leaves the VM
-	// exactly as it was.
+	// exactly as it was. That includes a disk only a pending value names,
+	// because the destroy frees an owned drive from the pending section too.
+	// A pending drive change on its own isn't refused here: the stop below
+	// applies it, and the reads after the stop refuse while it's still there.
 	if err := refuseOwnedLegacyDestroy(liveConfig, vmCID, vmid); err != nil {
+		return nil, err
+	}
+	if err := refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid); err != nil {
 		return nil, err
 	}
 
@@ -539,7 +547,7 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 	//     the destroy below cannot take them; refuse if a detach is not
 	//     guaranteed (fail-closed, retriable) ---
 	if protErr := detachForeignActiveDisks(ctx, deps, node, vmCID, vmid, logger); protErr != nil {
-		return nil, protErr
+		return nil, deleteVMDriveDeletePendingError(protErr, vmCID, deleteVMStopAwaited)
 	}
 
 	// --- preserve the VM's own ephemeral disk when retain_ephemeral_on_delete is set ---
@@ -549,7 +557,7 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 	// false on that path. See function doc.
 	retained, retainErr := detachRetainedEphemeralDisk(ctx, deps, node, vmCID, vmid, logger)
 	if retainErr != nil {
-		return nil, retainErr
+		return nil, deleteVMDriveDeletePendingError(retainErr, vmCID, deleteVMStopAwaited)
 	}
 
 	// --- guard: refuse to destroy if a persistent volume is still attached ---
@@ -911,7 +919,10 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 // Returns cpierrors.Cloud when protected volumes are present.
 // Returns a wrapped error when the config read fails for reasons other than 404.
 func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid int, diskStorage string) error {
-	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// Both views: a slot whose delete is pending is still in the config the
+	// destroy works from, and a stop applies the delete, which can turn an
+	// owned volume into an unused entry the destroy would free.
+	holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if cfgErr != nil {
 		if !pve.IsNotFound(cfgErr) && !pve.IsPmxcfsConfigMissing(cfgErr) {
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
@@ -923,6 +934,10 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 		// which handles the NotFound case idempotently.
 		return nil
 	}
+	if err := refusePendingDriveReplacement("delete_vm", vmCID, holding); err != nil {
+		return err
+	}
+	vmCfg := holding.Config
 
 	// Only an unusedN slot whose volume STILL EXISTS represents a real
 	// persistent disk that the DELETE below would silently destroy. PVE
@@ -1039,7 +1054,10 @@ const unusedSlotRecoveryRunbook = `see "delete_vm refuses to destroy VM with att
 // data loss. The Director retries delete_vm; the next attempt re-detaches and
 // proceeds.
 func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
-	cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// Both views: the config endpoint leaves out a slot whose delete is
+	// pending, while PVE's destroy works from the current config that still
+	// has it, so a foreign disk a crash left that way still counts.
+	holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if cfgErr != nil {
 		if pve.IsNotFound(cfgErr) || pve.IsPmxcfsConfigMissing(cfgErr) {
 			// VM gone (404, or pmxcfs's config-missing 500) — the destroy
@@ -1049,6 +1067,10 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		return cpierrors.Wrap(pve.WrapError(cfgErr),
 			fmt.Sprintf("delete_vm: read config for VM %s before foreign-disk detach", vmCID))
 	}
+	if err := refusePendingDriveReplacement("delete_vm", vmCID, holding); err != nil {
+		return err
+	}
+	cfg := holding.Config
 	foreign := pve.FindForeignActiveDiskDetails(cfg, vmid)
 	if len(foreign) == 0 {
 		return nil
@@ -1100,9 +1122,24 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		}
 		logger.Warn("delete_vm: persistent disk still attached on active slot -- detaching to preserve volume before destroy",
 			log.String("slot", slot), log.String("volid", entry.Volid))
+		// On the fast path the stop above is fire-and-forget, so the guest can
+		// still be running here, and the detach goes through the pending-delete
+		// helper like every other slot delete that can reach a running VM. A
+		// pending delete ends the retry loop at once, because deleting the slot
+		// again can't change it, and the caller gives it the delete_vm text.
+		var pendingErr error
 		detachErr := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm.foreign_detach", 0, func() error {
-			return deps.PVE.QEMU().DetachDisk(ctx, node, vmid, slot)
+			err := detachDriveSlot(ctx, deps, node, vmid, slot, entry.Volid)
+			if _, pending := pve.IsDriveDeletePending(err); pending {
+				pendingErr = err
+				return nil
+			}
+			return err
 		})
+		if pendingErr != nil {
+			return cpierrors.WrapAs(pendingErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"delete_vm: refusing to destroy VM %s -- could not detach persistent disk %s=%s to preserve it", vmCID, slot, entry.Volid))
+		}
 		if detachErr != nil {
 			return cpierrors.Retriable(
 				"delete_vm: refusing to destroy VM %s -- could not detach persistent disk %s=%s to preserve it: %s (the volume would otherwise be destroyed; retry re-attempts detach)",
@@ -1121,7 +1158,7 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 	// detach that demoted the disk to unusedN but could not sweep it (a snapshot
 	// reference blocks the sweep) is caught by the guardUnusedVolumes pass that
 	// follows this call on BOTH the sync and fast paths.
-	confirmCfg, confErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	confirmHolding, confErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if confErr != nil {
 		if pve.IsNotFound(confErr) {
 			return nil
@@ -1129,6 +1166,10 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 		return cpierrors.Wrap(pve.WrapError(confErr),
 			fmt.Sprintf("delete_vm: re-read config for VM %s after foreign-disk detach", vmCID))
 	}
+	if err := refusePendingDriveReplacement("delete_vm", vmCID, confirmHolding); err != nil {
+		return err
+	}
+	confirmCfg := confirmHolding.Config
 	if remaining := pve.FindForeignActiveDisks(confirmCfg, vmid); len(remaining) > 0 {
 		return cpierrors.Retriable(
 			"delete_vm: refusing to destroy VM %s -- persistent disks still attached after detach attempt: %v (retry)",
@@ -1335,7 +1376,9 @@ func reapEmptyPoolIfManaged(ctx context.Context, deps Deps, poolID string, logge
 }
 
 func legacySweepConfig(ctx context.Context, deps Deps, node string, vmid int, sweepLogger *log.Logger) (map[string]any, string, bool) {
-	strCfg, strCfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// Both views, so a straggler whose disk slot has a pending delete still
+	// shows that disk to the sweep's guards.
+	holding, strCfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if strCfgErr != nil {
 		if pve.IsNotFound(strCfgErr) || pve.IsPmxcfsConfigMissing(strCfgErr) {
 			sweepLogger.Debug("delete_vm: straggler sweep: VM already gone")
@@ -1345,6 +1388,12 @@ func legacySweepConfig(ctx context.Context, deps Deps, node string, vmid int, sw
 			log.Err(strCfgErr))
 		return nil, "", false
 	}
+	if err := refusePendingDriveReplacement("delete_vm: straggler sweep", strconv.Itoa(vmid), holding); err != nil {
+		sweepLogger.Warn("delete_vm: straggler sweep: a pending drive change names a second volume; deferring straggler to next sweep (non-fatal)",
+			log.Err(err))
+		return nil, "", false
+	}
+	strCfg := holding.Config
 	// Re-test the deleting tag from the authoritative config, not the
 	// index row. Tag absent means the row is stale — this VMID's current
 	// occupant was never marked for deletion, so it must not be destroyed.

@@ -642,6 +642,19 @@ type DiskScanHit struct {
 	// deleted the slot of a guest that owns its birth name and the move never
 	// finished.
 	Unused []VolumeReference
+	// PendingDelete is true when the matching slot has a delete PVE could
+	// only record as pending, so the slot is missing from the config
+	// endpoint's view while the running guest still has the disk.
+	PendingDelete bool
+}
+
+// pendingDeleteSlotOf returns the hit's slot when its delete is pending, and
+// the empty string otherwise.
+func pendingDeleteSlotOf(hit DiskScanHit) string {
+	if hit.PendingDelete {
+		return hit.Slot
+	}
+	return ""
 }
 
 // StorageReferenceCounts maps a storage name to the number of volumes the
@@ -836,7 +849,11 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	for _, g := range guests {
 		vmid := g.VMID
 		vmNode := g.Node
-		cfg, cfgErr := c.QEMU().Config(ctx, vmNode, vmid)
+		// Both views come from one pending read. A slot whose delete PVE could
+		// only record as pending is missing from the config endpoint's view,
+		// while the running guest still has the disk, so the scan matches the
+		// current view too and counts such a slot as holding the disk.
+		views, cfgErr := ReadQemuViews(ctx, c, vmNode, vmid)
 		if cfgErr != nil {
 			// Skip a clean 404: the VM was deleted between the listing and
 			// this read, so it holds no QEMU disk. Any other error is
@@ -861,6 +878,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 			)
 		}
 
+		cfg := views.Applied()
 		disks := qemu.ParseDisks(cfg)
 		addStorageReferences(counts, vmNode, volid, cfg, disks)
 
@@ -868,6 +886,12 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 			tags, _ := ConfigString(cfg, "tags")
 			return DiskScanHit{
 				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
+			}, nil
+		}
+		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(views.Current()), volid, stableID); ok && views.PendingDelete(slot) {
+			tags, _ := ConfigString(cfg, "tags")
+			return DiskScanHit{
+				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts, PendingDelete: true,
 			}, nil
 		}
 		if stableID != "" {

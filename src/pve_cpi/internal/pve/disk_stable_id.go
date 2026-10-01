@@ -187,6 +187,7 @@ func ResolveDiskIdentity(
 func holderFromScanHit(logger *log.Logger, hit DiskScanHit, birthVolid string, cfg ParkerConfig) DiskHolder {
 	holder := DiskHolder{
 		Found: true, VMID: hit.VMID, Node: hit.Node, Tags: hit.Tags, StorageReferences: hit.StorageReferences,
+		PendingDeleteSlot: pendingDeleteSlotOf(hit),
 	}
 	inBand := hit.VMID >= cfg.VMIDRangeStart && hit.VMID <= cfg.VMIDRangeEnd
 	if !inBand {

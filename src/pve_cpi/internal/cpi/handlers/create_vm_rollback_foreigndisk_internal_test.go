@@ -48,7 +48,8 @@ func (n *rbfdNodesStub) UpdateQemuConfig(_ context.Context, _, _ string, _ *sdkn
 
 // --------------------------------------------------------------------------
 // rbfdQEMUStub -- qemu.Service fake: Stop no-ops, Config replays a scripted
-// sequence (last entry repeats), DetachDisk records and returns detachErr.
+// sequence (last entry repeats), and the slot-delete helper's raw config
+// delete records the slot and returns detachErr.
 // --------------------------------------------------------------------------
 
 type rbfdQEMUStub struct {
@@ -79,7 +80,7 @@ func (q *rbfdQEMUStub) Config(_ context.Context, _ string, _ int) (map[string]an
 	return q.configs[idx], nil
 }
 
-func (q *rbfdQEMUStub) DetachDisk(_ context.Context, _ string, _ int, slot string) error {
+func (q *rbfdQEMUStub) deleteConfigKey(_ string, _ int, slot string) error {
 	q.detaches = append(q.detaches, slot)
 	*q.callLog = append(*q.callLog, "detach:"+slot)
 	return q.detachErr
@@ -91,7 +92,11 @@ type rbfdClient struct {
 	qemu  *rbfdQEMUStub
 }
 
-func (c *rbfdClient) Nodes() sdknodes.Service  { return c.nodes }
+// Nodes hands the slot-delete helper's raw delete and pending read to the
+// QEMU stub and every other call to the nodes stub.
+func (c *rbfdClient) Nodes() sdknodes.Service {
+	return &SlotDeleteNodes{Service: c.nodes, Config: c.qemu.Config, Delete: c.qemu.deleteConfigKey}
+}
 func (c *rbfdClient) QEMU() qemu.Service       { return c.qemu }
 func (c *rbfdClient) Cluster() cluster.Service { return newNAStub() }
 func (c *rbfdClient) Pools() pve.PoolService   { return nil }
@@ -128,8 +133,9 @@ func TestCleanupVM_ForeignDisk_DetachedBeforePurge(t *testing.T) {
 	callLog := []string{}
 	qemuStub := &rbfdQEMUStub{
 		callLog: &callLog,
-		// Scan read sees the foreign disk; confirm re-read and the unusedN
-		// guard read see it gone after the detach.
+		// Scan read sees the foreign disk; the slot-delete helper's reads, the
+		// confirm re-read, and the unusedN guard read see it gone after the
+		// detach.
 		configs: []map[string]any{rbfdForeignCfg(), rbfdCleanCfg(), rbfdCleanCfg()},
 	}
 	nodesStub := &rbfdNodesStub{callLog: &callLog}

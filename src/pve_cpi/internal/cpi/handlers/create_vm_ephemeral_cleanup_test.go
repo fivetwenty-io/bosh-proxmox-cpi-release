@@ -90,8 +90,15 @@ type ephemeralClient struct {
 	storage sdkstorage.Service
 }
 
-func (c *ephemeralClient) QEMU() sdkqemu.Service                     { return c.qemu }
-func (c *ephemeralClient) Nodes() sdknodes.Service                   { return nil }
+func (c *ephemeralClient) QEMU() sdkqemu.Service { return c.qemu }
+
+// Nodes serves only the pending read, from the QEMU fake's config read, which
+// the ephemeral slot choice makes. Every other nodes call meets a nil service.
+func (c *ephemeralClient) Nodes() sdknodes.Service {
+	return &configPendingNodes{config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.qemu.Config(ctx, node, vmid)
+	}}
+}
 func (c *ephemeralClient) Storage() sdkstorage.Service               { return c.storage }
 func (c *ephemeralClient) CloudInit() sdkcloudinit.Service           { return nil }
 func (c *ephemeralClient) Tasks() sdktasks.Service                   { return nil }

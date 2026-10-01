@@ -63,22 +63,28 @@ func attachCreatedVMEphemeral(ctx context.Context, deps Deps, logger *log.Logger
 			return "", err
 		}
 	}
-	cfg, err := m.deps.PVE.QEMU().Config(ctx, shape.node, vmid)
+	// Both views. The VM has never run, so it can't have a pending delete,
+	// and a slot of this volume whose delete is pending is a state this path
+	// doesn't produce, so it fails closed rather than attach or revert.
+	views, err := pve.ReadQemuViews(ctx, m.deps.PVE, shape.node, vmid)
 	if err != nil {
 		return "", err
 	}
 	slot := ""
-	for key, value := range cfg {
-		drive, ok := pve.ConfigStringValue(value)
-		if ok && strings.HasPrefix(key, "scsi") && strings.Split(drive, ",")[0] == volume {
-			if slot != "" {
-				return "", fmt.Errorf("ephemeral volume has ambiguous devices")
-			}
-			slot = key
+	for _, key := range views.SlotsNaming(volume) {
+		if !strings.HasPrefix(key, "scsi") {
+			continue
 		}
+		if slot != "" {
+			return "", fmt.Errorf("ephemeral volume has ambiguous devices")
+		}
+		slot = key
+	}
+	if slot != "" && views.PendingDelete(slot) {
+		return "", fmt.Errorf("ephemeral volume's device %s has a pending delete", slot)
 	}
 	if slot == "" {
-		index := nextFreeSCSIIndexAtLeast(cfg, 1)
+		index := nextFreeSCSIIndexInViews(views)
 		if index >= 29 {
 			return "", fmt.Errorf("no ephemeral SCSI device available")
 		}

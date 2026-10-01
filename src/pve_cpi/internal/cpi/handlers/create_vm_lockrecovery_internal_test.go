@@ -134,7 +134,12 @@ type lrClient struct {
 	qemu  *lrQEMUStub
 }
 
-func (c *lrClient) Nodes() sdknodes.Service  { return c.nodes }
+// Nodes serves the pending read from the QEMU stub's config read.
+func (c *lrClient) Nodes() sdknodes.Service {
+	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.qemu.Config(ctx, node, vmid)
+	}}
+}
 func (c *lrClient) QEMU() qemu.Service       { return c.qemu }
 func (c *lrClient) Cluster() cluster.Service { return newNAStub() }
 

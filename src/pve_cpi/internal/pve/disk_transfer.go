@@ -460,33 +460,29 @@ func transferIntoParkerLocked(
 	// 3. Delete the source slot — a raw config delete, NOT the SDK's
 	// DetachDisk: its unusedN sweep physically removes a volume its holder
 	// owns, which after a reassignment this volume is.
-	srcCfg, srcErr := c.QEMU().Config(ctx, node, srcVMID)
+	// Both views: a slot whose delete is pending still counts as attached, so
+	// the transfer sends the delete again rather than skipping it, and the
+	// helper proves the source let go before anything lands on the parker.
+	srcViews, srcErr := ReadQemuViews(ctx, c, node, srcVMID)
 	if srcErr != nil {
 		return "", cpierrors.Wrap(WrapConfigReadError(srcErr),
 			fmt.Sprintf("transfer in: config read for source vm %d", srcVMID))
 	}
-	actualSlot, onBus := FindDiskIDByVolID(qemu.ParseDisks(srcCfg), bareVolid)
-	if onBus {
-		nodesSvc := c.Nodes()
-		if nodesSvc == nil {
-			return "", cpierrors.Cloud("transfer in: nodes service not available")
-		}
-		del := actualSlot
-		delErr := RetryOnTransientOrUnplugBusy(ctx, logger, "disk_transfer_detach", parkerWindowMaxAttempts, func() error {
-			return nodesSvc.UpdateQemuConfig(ctx, node, strconv.Itoa(srcVMID), &sdknodes.UpdateQemuConfigParams{
-				Delete: &del,
-			})
-		})
-		if delErr != nil {
-			return "", cpierrors.Wrap(WrapMutationError(delErr),
+	if actualSlot, onBus := srcViews.BusSlotNaming(bareVolid); onBus {
+		// A delete PVE could only record as pending comes back as a
+		// *DriveDeletePendingError, already reverted, and the wrap keeps it
+		// visible to errors.As, so each caller chooses its class.
+		if delErr := DeleteDriveSlot(ctx, c, logger, node, srcVMID, actualSlot, bareVolid, nil, parkerWindowMaxAttempts); delErr != nil {
+			return "", cpierrors.Wrap(delErr,
 				fmt.Sprintf("transfer in: detach %q (slot %s) from source vm %d", bareVolid, actualSlot, srcVMID))
 		}
-		srcCfg, srcErr = c.QEMU().Config(ctx, node, srcVMID)
+		srcViews, srcErr = ReadQemuViews(ctx, c, node, srcVMID)
 		if srcErr != nil {
 			return "", cpierrors.Wrap(WrapConfigReadError(srcErr),
 				fmt.Sprintf("transfer in: re-read source vm %d after detach", srcVMID))
 		}
 	}
+	srcCfg := srcViews.Applied()
 
 	// 4. Find the unusedN entry PVE demoted the volume to. Absent on both the
 	// active bus and the unused keys means another actor moved it mid-window;
@@ -624,14 +620,24 @@ func ResumeDiskTransferToParker(
 		// Window: the move never ran — the source VM still holds the volume
 		// on an unusedN entry under its recorded (pre-move) name.
 		if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
-			srcCfg, srcErr := c.QEMU().Config(wctx, intent.ParkerNode, srcVMID)
+			srcViews, srcErr := ReadQemuViews(wctx, c, intent.ParkerNode, srcVMID)
 			switch {
 			case srcErr != nil && !parkerConfigGone(srcErr):
 				return cpierrors.Wrap(WrapConfigReadError(srcErr),
 					fmt.Sprintf("transfer resume: config read for source vm %d", srcVMID))
 			case srcErr == nil:
-				srcDisks := qemu.ParseDisks(srcCfg)
-				if _, onBus := FindDiskIDByVolID(srcDisks, intent.Volid); onBus {
+				srcCfg := srcViews.Applied()
+				if slot, onBus := srcViews.BusSlotNaming(intent.Volid); onBus {
+					if srcViews.PendingDelete(slot) {
+						// A crash, an earlier release, or an operator left the
+						// source's delete pending, so the running guest still
+						// has the disk, and nothing may land on the parker until
+						// the VM lets go of it. The resume can't tell whose
+						// delete this is or what its caller wants, and a stop
+						// of the VM applies it, so it leaves it alone and hands
+						// back the typed error for the caller to class.
+						return &DriveDeletePendingError{Reason: DriveDeletePendingFound, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
+					}
 					// Still attached: the detach never happened, so this is not
 					// a resume at all. The identity scan should have found it;
 					// a race between the scan and this read is the only path
@@ -700,7 +706,7 @@ func ResumeDiskTransferToParker(
 		// attach, so a volume that truly vanished fails the attach instead of
 		// parking a dangling reference.
 		if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
-			srcCfg, srcErr := c.QEMU().Config(wctx, intent.ParkerNode, srcVMID)
+			srcViews, srcErr := ReadQemuViews(wctx, c, intent.ParkerNode, srcVMID)
 			sourceReleased := false
 			switch {
 			case srcErr != nil:
@@ -710,8 +716,9 @@ func ResumeDiskTransferToParker(
 				// the source released the volume.
 				sourceReleased = parkerConfigGone(srcErr)
 			default:
-				_, onBus := FindDiskIDByVolID(qemu.ParseDisks(srcCfg), intent.Volid)
-				sourceReleased = !onBus && !unusedEntriesReference(srcCfg, intent.Volid)
+				// Released only when neither view names the volume: a pending
+				// delete leaves the volume plugged into the running guest.
+				sourceReleased = !srcViews.NamesVolume(intent.Volid)
 			}
 			if sourceReleased {
 				slot, attachErr := attachToParkerLocked(wctx, c, logger, intent.ParkerNode, intent.ParkerVMID, intent.Volid, stableID)

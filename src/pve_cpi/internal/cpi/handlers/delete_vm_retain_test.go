@@ -69,8 +69,12 @@ type retainClient struct {
 	nodes sdknodes.Service
 }
 
-func (c *retainClient) QEMU() sdkqemu.Service                     { return c.qemu }
-func (c *retainClient) Nodes() sdknodes.Service                   { return c.nodes }
+func (c *retainClient) QEMU() sdkqemu.Service { return c.qemu }
+func (c *retainClient) Nodes() sdknodes.Service {
+	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.qemu.Config(ctx, node, vmid)
+	}}
+}
 func (c *retainClient) Storage() sdkstorage.Service               { return nil }
 func (c *retainClient) CloudInit() sdkcloudinit.Service           { return nil }
 func (c *retainClient) Tasks() sdktasks.Service                   { return nil }
@@ -337,7 +341,8 @@ func TestForeignDiskAlreadyPreserved_ForeignGuardFires(t *testing.T) {
 		"virtio0": "zfs-1:vm-100-disk-0",
 		"scsi1":   "zfs-1:vm-9999-disk-0,size=64G", // foreign VMID → detachForeignActiveDisks fires
 	}
-	// After detach, scsi1 is gone (DetachDisk swept the unusedN entry).
+	// After the delete, scsi1 is gone, and the volume isn't named for VM 100,
+	// so PVE leaves no unused entry for it.
 	postCfg := map[string]any{
 		"virtio0": "zfs-1:vm-100-disk-0",
 	}
@@ -345,7 +350,7 @@ func TestForeignDiskAlreadyPreserved_ForeignGuardFires(t *testing.T) {
 	var detachSlots []string
 	q := &fdQEMU{
 		configs: []map[string]any{initCfg, postCfg},
-		detachFn: func(_ context.Context, _ string, _ int, slot string) error {
+		deleteFn: func(_ string, _ int, slot string) error {
 			detachSlots = append(detachSlots, slot)
 			return nil
 		},
@@ -356,9 +361,9 @@ func TestForeignDiskAlreadyPreserved_ForeignGuardFires(t *testing.T) {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
 	if len(detachSlots) != 1 || detachSlots[0] != "scsi1" {
-		t.Errorf("DetachDisk: want [scsi1], got %v", detachSlots)
+		t.Errorf("slot deletes: want [scsi1], got %v", detachSlots)
 	}
-	// Volume is preserved because DetachDisk was called (not DeleteQemu).
+	// Volume is preserved because the slot was deleted before any destroy.
 }
 
 // ---------------------------------------------------------------------------

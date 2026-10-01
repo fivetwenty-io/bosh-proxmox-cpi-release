@@ -66,8 +66,14 @@ type etClient struct {
 	nodes sdknodes.Service
 }
 
-func (c *etClient) QEMU() qemu.Service      { return c.qemu }
-func (c *etClient) Nodes() sdknodes.Service { return c.nodes }
+func (c *etClient) QEMU() qemu.Service { return c.qemu }
+
+// Nodes serves the pending read from the QEMU fake's config read.
+func (c *etClient) Nodes() sdknodes.Service {
+	return &configPendingNodes{Service: c.nodes, config: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return c.qemu.Config(ctx, node, vmid)
+	}}
+}
 
 // Cluster returns a fresh not-found-tolerant HA stub: cleanupVM now removes the
 // node-affinity pin unconditionally, so every rollback path touches Cluster().

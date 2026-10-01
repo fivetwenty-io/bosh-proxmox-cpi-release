@@ -23,7 +23,7 @@ import (
 // answer instead.
 
 // nodeCapturingQEMU wraps attachQEMUService and records the node argument of
-// every Config / AttachDisk / DetachDisk call.
+// every Config / AttachDisk / DetachDisk call and every raw slot delete.
 type nodeCapturingQEMU struct {
 	attachQEMUService
 	nodes []string
@@ -42,6 +42,13 @@ func (m *nodeCapturingQEMU) AttachDisk(ctx context.Context, node string, vmid in
 func (m *nodeCapturingQEMU) DetachDisk(ctx context.Context, node string, vmid int, diskID string) error {
 	m.nodes = append(m.nodes, node)
 	return m.attachQEMUService.DetachDisk(ctx, node, vmid, diskID)
+}
+
+// deleteConfigKey records the node of the slot-delete helper's raw config
+// delete, which replaced DetachDisk on the detach path.
+func (m *nodeCapturingQEMU) deleteConfigKey(node string, vmid int, key string) error {
+	m.nodes = append(m.nodes, node)
+	return m.attachQEMUService.deleteConfigKey(node, vmid, key)
 }
 
 // clusterReportingVMOn returns a mockClusterSvc whose resource list places
@@ -123,10 +130,19 @@ func TestHandleDetachDisk_SharedDisk_TargetsVMNodeNotDefault(t *testing.T) {
 			},
 		},
 	}
+	// Strategy "free" keeps the detach from parking the disk afterwards. This
+	// row used to pass under the parked default without ever parking, because
+	// the no-op DetachDisk mock left scsi1 in place, so the disk still looked
+	// held and the park skipped it. The fake's slot delete now really removes
+	// the slot, and a park would need a parker this node-targeting fake
+	// doesn't model. The parked path's node choice is covered by
+	// TestParkAfterDetach_HandsDownPrefixPoolAndEmptyFallbackNode and
+	// TestHandleAlreadyDetachedParked_SweepsThePoolOnTheDisksOwnNode.
 	deps := handlers.Deps{
 		Config: &config.CPIConfig{
-			Node:         testNode,
-			VMDiskFormat: "qcow2",
+			Node:                 testNode,
+			VMDiskFormat:         "qcow2",
+			DetachedDiskStrategy: "free",
 		},
 		PVE: &mockPVEClient{
 			qemuSvc:    qemuSvc,
@@ -143,6 +159,6 @@ func TestHandleDetachDisk_SharedDisk_TargetsVMNodeNotDefault(t *testing.T) {
 	}
 	assertAllNodes(t, qemuSvc.nodes, vmNode)
 	if len(qemuSvc.detachCalls) != 1 {
-		t.Errorf("expected exactly 1 DetachDisk call; got %v", qemuSvc.detachCalls)
+		t.Errorf("expected exactly 1 slot delete; got %v", qemuSvc.detachCalls)
 	}
 }

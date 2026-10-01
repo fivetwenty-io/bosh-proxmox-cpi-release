@@ -32,6 +32,10 @@ type managedDiskLifecycle struct {
 	// drive-option overlay note alone (see lifecycleOverlayOnlyConfigWrite),
 	// during this operation.
 	diskMutationAdmitted bool
+	// pendingDeleteReverted records that the guard observed the revert of a
+	// slot delete PVE could only record as pending, after it had settled that
+	// delete as not applied, during this operation (see cleanPendingDelete).
+	pendingDeleteReverted bool
 	// holders is the guard's hook state, which records the holders this
 	// operation created. createdHolder answers from it.
 	holders *managedDiskLifecycleGuard
@@ -110,11 +114,21 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 		return operationErr
 	}
 	cleanTimeout := m.cleanLockTimeout(operationErr)
+	cleanPending := !cleanTimeout && m.cleanPendingDelete(operationErr)
 	if m.guard != nil {
 		operationErr = errors.Join(operationErr, m.guard.Err())
 	}
 	var finalErr error
 	switch {
+	case cleanPending:
+		// The slot delete stayed pending, and the guard observed both the
+		// delete settling as not applied and its revert, so the disk is where
+		// the operation found it. The allocation goes back to the Director the
+		// way a success returns it, and the refusal goes back unchanged.
+		finalErr = m.completeOwned(ctx, false)
+		if finalErr != nil {
+			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a reverted pending delete failed"))
+		}
 	case cleanTimeout:
 		// The wait ran out before this operation changed anything it cannot
 		// account for, so the allocation is returned to the Director exactly as
@@ -143,11 +157,11 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	}
 	closeErr := errors.Join(m.handle.Close(), m.journal.Close())
 	result := errors.Join(operationErr, finalErr, closeErr)
-	returned := cleanTimeout && finalErr == nil && closeErr == nil
+	returned := (cleanTimeout || cleanPending) && finalErr == nil && closeErr == nil
 	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")
 	}
-	if returned {
+	if returned && cleanTimeout {
 		return &diskReturnedAfterLockTimeout{err: result}
 	}
 	return result
@@ -265,6 +279,24 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
+		return false
+	}
+	return storageLifecycleSettled(m.handle.Record()) == nil
+}
+
+// cleanPendingDelete reports whether an operation failed only because a slot
+// delete stayed pending and was reverted, which leaves the disk where the
+// operation found it. That takes four things. The failure's chain holds a
+// *pve.DriveDeletePendingError whose reason isn't an unconfirmed revert, so
+// no other failure rides along on the clean return. The guard observed the
+// revert after it had settled the delete as not applied. The guard was never
+// poisoned. And every step the operation journaled has been observed.
+func (m *managedDiskLifecycle) cleanPendingDelete(operationErr error) bool {
+	pending, ok := pve.IsDriveDeletePending(operationErr)
+	if !ok || pending.Reason == pve.DriveDeletePendingRevertUnconfirmed || !m.pendingDeleteReverted {
+		return false
+	}
+	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {
 		return false
 	}
 	return storageLifecycleSettled(m.handle.Record()) == nil
