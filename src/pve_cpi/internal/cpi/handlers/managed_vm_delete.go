@@ -107,6 +107,18 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 			return proof, storageRefusal("VM cleanup identity lacks exact live provenance")
 		}
 	}
+	// A deletion keeps the ephemeral volume whenever delete_vm would have, and
+	// whenever the record shows the retention already started, even when the
+	// caller is an operator's cleanup that did not ask for it.
+	if disposal == managedVMDeletion && !retain {
+		var guest map[string]any
+		if node != "" && vmid > 0 {
+			if guest, err = deps.PVE.QEMU().Config(ctx, node, vmid); err != nil {
+				return proof, err
+			}
+		}
+		retain = managedVMDisposalRetains(disposal, retain, record, vmid, guest)
+	}
 	admission, err := storageAllocationVerification(audit, map[string]any{allocationEvidenceOperationField: managedVMCleanupAdmissionOperation, allocationEvidenceIDField: record.ID})
 	if err != nil {
 		return proof, err
@@ -686,48 +698,50 @@ func managedVMDisposalIdentity(record aj.Record, audit StorageAllocationAudit) (
 	return node, vmid, owned, nil
 }
 
+// managedVMRetentionTargets returns the parker targets that keep the guest's
+// ephemeral volume. A transfer counts only when a parker reads back holding it
+// under our token at a recorded slot, so a parker-create step alone never
+// does. When no parker holds it and retain is set, the retention runs, or
+// resumes from the serial an earlier attempt wrote, and its landing is read
+// back the same way.
 func managedVMRetentionTargets(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, retain, moved bool) ([]aj.Target, error) {
-	var retainedTargets []aj.Target
-	// A completed transfer remains retained even if the process stopped before
-	// recording VM destruction or before the caller received success.
-	var previousRetained aj.Target
-	for rangeIndex120 := range record.Steps {
-		if record.Steps[rangeIndex120].Attempt == record.ActiveAttempt() && strings.HasPrefix(record.Steps[rangeIndex120].Kind, "lifecycle_delete_vm_retain_ephemeral_") && record.Steps[rangeIndex120].State == aj.Observed && record.Steps[rangeIndex120].Target.VMID != vmid && record.Steps[rangeIndex120].Target.VMID > 0 && record.Steps[rangeIndex120].Target.IntendedVolume != "" {
-			previousRetained = record.Steps[rangeIndex120].Target
+	transferred, err := managedVMTransferredRetention(ctx, deps, handle, vmid)
+	if err != nil {
+		return nil, err
+	}
+	if transferred != nil {
+		return []aj.Target{*transferred}, nil
+	}
+	if !retain {
+		return nil, nil
+	}
+	original := ""
+	for rangeIndex159 := range record.Steps {
+		if record.Steps[rangeIndex159].Attempt == record.ActiveAttempt() && strings.HasPrefix(record.Steps[rangeIndex159].Kind, "vm.ephemeral.") && len(record.Steps[rangeIndex159].VolIDs) == 1 {
+			if original != "" {
+				return nil, storageRefusal("multiple ephemeral retention bindings")
+			}
+			original = record.Steps[rangeIndex159].VolIDs[0]
 		}
 	}
-	if previousRetained.VMID > 0 {
-		if err := observeManagedRetainedEphemeral(ctx, deps, handle, previousRetained); err != nil {
-			return nil, err
-		}
-		retainedTargets = append(retainedTargets, previousRetained)
+	if original == "" {
+		return nil, nil
 	}
-	if retain && len(retainedTargets) == 0 {
-		original := ""
-		for rangeIndex159 := range record.Steps {
-			if record.Steps[rangeIndex159].Attempt == record.ActiveAttempt() && strings.HasPrefix(record.Steps[rangeIndex159].Kind, "vm.ephemeral.") && len(record.Steps[rangeIndex159].VolIDs) == 1 {
-				if original != "" {
-					return nil, storageRefusal("multiple ephemeral retention bindings")
-				}
-				original = record.Steps[rangeIndex159].VolIDs[0]
-			}
-		}
-		if original != "" {
-			landed, e := retainManagedEphemeralForVMDelete(ctx, deps, handle, node, vmid, original, moved)
-			if e != nil {
-				return nil, e
-			}
-			retainedTarget, e := managedVMRetainedTarget(handle.Record(), landed, vmid)
-			if e != nil {
-				return nil, e
-			}
-			if retainedTarget.VMID <= 0 || retainedTarget.Storage == "" || retainedTarget.Backing == "" {
-				return nil, storageRefusal("retained ephemeral physical target is not proven")
-			}
-			retainedTargets = append(retainedTargets, retainedTarget)
-		}
+	landed, err := retainManagedEphemeralForVMDelete(ctx, deps, handle, node, vmid, original, moved)
+	if err != nil {
+		return nil, err
 	}
-	return retainedTargets, nil
+	retainedTarget, err := managedVMRetainedTarget(handle.Record(), landed, vmid)
+	if err != nil {
+		return nil, err
+	}
+	if retainedTarget.VMID <= 0 || retainedTarget.Storage == "" || retainedTarget.Backing == "" {
+		return nil, storageRefusal("retained ephemeral physical target is not proven")
+	}
+	if err := observeManagedRetainedEphemeral(ctx, deps, handle, retainedTarget); err != nil {
+		return nil, err
+	}
+	return []aj.Target{retainedTarget}, nil
 }
 
 func managedVMDispositionProof(ctx context.Context, deps Deps, audit StorageAllocationAudit, record aj.Record, vmid int, retainedTargets []aj.Target) (proof aj.Verification, err error) {
@@ -787,9 +801,15 @@ func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Rec
 		if strings.Contains(volume, ":") && !owned[volume] {
 			return storageRefusal("VM destruction would include an unowned volume")
 		}
+		// A stable-ID serial marks a disk the CPI parks rather than destroys,
+		// which is a persistent disk or a retained ephemeral volume. Both are
+		// moved off before the destroy, so one still here means something
+		// went wrong, and the destroy would take it with the VM.
+		if _, has := pve.StableIDFromDriveOptStr(drive); has {
+			return storageRefusalf("VM destruction would take the disk on %s, which carries a stable-ID serial", device)
+		}
 	}
-	marker, found, err := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
-	if err != nil || !found || marker.Kind != "vm" || marker.Namespace != record.Namespace || marker.AllocationID != record.ID || marker.AgentSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(record.AgentID))) {
+	if !managedVMMarkerMatches(cfg, record) {
 		return storageRefusal("VM destruction provenance changed")
 	}
 	plan, err := activeStorageAllocationPlan(record)
@@ -818,6 +838,13 @@ func verifyManagedVMDestroyDevices(ctx context.Context, deps Deps, record aj.Rec
 		}
 	}
 	return nil
+}
+
+// managedVMMarkerMatches reports whether config carries this VM allocation's
+// own marker.
+func managedVMMarkerMatches(cfg map[string]any, record aj.Record) bool {
+	marker, found, err := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
+	return err == nil && found && marker.Kind == "vm" && marker.Namespace == record.Namespace && marker.AllocationID == record.ID && marker.AgentSHA256 == fmt.Sprintf("%x", sha256.Sum256([]byte(record.AgentID)))
 }
 
 func managedVMRecordForCID(records []aj.Record, cid string) (*aj.Record, error) {

@@ -2,8 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,11 +59,10 @@ func resolveManagedRetainedEphemeral(ctx context.Context, deps Deps, handle *aj.
 	if err := json.Unmarshal(sentinel["bosh_parked_disks"], &entries); err != nil {
 		return resolvedDisk{}, fmt.Errorf("retained parker provenance unavailable")
 	}
-	sum := sha256.Sum256([]byte("vm-ephemeral-retention\x00" + record.ID))
-	token := "bpd-" + hex.EncodeToString(sum[:8])
+	token := managedVMRetentionToken(record.ID)
 	entry, ok := entries[token]
 	if !ok || entry.Volid != target.IntendedVolume || entry.Node != target.Node || entry.Slot == "" {
-		return resolvedDisk{}, fmt.Errorf("retained parker identity differs")
+		return resolvedDisk{}, errRetainedParkerIdentity
 	}
 	birth, meta, err := decodeDiskCID(ctx, deps, "retained_ephemeral", entry.DiskCID)
 	if err != nil || meta == nil || meta.ID != token {

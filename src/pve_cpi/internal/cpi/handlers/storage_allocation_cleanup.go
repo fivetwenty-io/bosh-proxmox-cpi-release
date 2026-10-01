@@ -246,6 +246,10 @@ func executeStorageAllocationCleanup(ctx context.Context, deps Deps, journal *aj
 			return result, storageDecisionSourceError(e)
 		}
 		if proof.Complete && proof.VMAbsenceVerified && proof.ArtifactDispositionVerified && !proof.AbsenceVerified && proof.EvidenceJSON != "" {
+			// The disposal kept the guest's ephemeral volume, which the
+			// operator asked for with retain_ephemeral_on_delete, so cleanup
+			// stops here. Deleting the retained volume takes a second cleanup
+			// of the vm_deleted_retained record.
 			retained := handle.Record()
 			retained.State = aj.VMDeletedRetained
 			retained.Reason = ""
@@ -253,10 +257,7 @@ func executeStorageAllocationCleanup(ctx context.Context, deps Deps, journal *aj
 			if e = handle.Save(retained); e != nil {
 				return result, storageDecisionSourceError(e)
 			}
-			proof, e = cleanupManagedVMAttempt(ctx, deps, journal, handle)
-			if e != nil {
-				return result, storageDecisionSourceError(e)
-			}
+			return handle.Record(), nil
 		}
 		if !proof.Complete || !proof.AbsenceVerified || !proof.ArtifactDispositionVerified || proof.EvidenceJSON == "" {
 			return result, storageRefusal("VM cleanup did not prove durable complete disposition")
