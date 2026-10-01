@@ -29,8 +29,8 @@ func detachManagedPersistentForVMDelete(ctx context.Context, deps Deps, node str
 	if err != nil {
 		return err
 	}
-	for _, disk := range disks {
-		if err := detachManagedPersistentForVMDeleteOne(ctx, deps, node, vmid, disk, handle); err != nil {
+	for i := range disks {
+		if err := detachManagedPersistentForVMDeleteOne(ctx, deps, node, vmid, disks[i], handle); err != nil {
 			return err
 		}
 	}

@@ -43,6 +43,18 @@ type lifecycleFlowPVE struct {
 	// visibilityErrAfterDelete becomes visibilityErr once a volume is
 	// deleted, so only the audits after a deletion lose their visibility.
 	visibilityErrAfterDelete error
+	// faithfulDemotion makes slot deletes and attaches follow PVE. Deleting
+	// a bus slot leaves an unusedN entry only when the VM owns the volume by
+	// name (vmconfig_register_unused_drive in qemu-server), and attaching a
+	// volume the VM already names on an unusedN entry drops that entry
+	// (write_vm_config). Without it, every deleted slot becomes an unused
+	// entry and an attach leaves the entry in place.
+	faithfulDemotion bool
+	// offlineNodes are the cluster members ListStatus reports offline.
+	offlineNodes map[string]bool
+	// vmSnapshots, when set, answers ListSnapshots per VM instead of
+	// snapshots, which every VM shares.
+	vmSnapshots map[int][]map[string]any
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -88,7 +100,31 @@ type lifecycleFlowQEMU struct {
 	c *lifecycleFlowPVE
 }
 
-func (q lifecycleFlowQEMU) ListSnapshots(context.Context, string, int) ([]map[string]any, error) {
+// AttachDisk drops the unused entry that names the attached volume when
+// faithfulDemotion is set, the way write_vm_config does.
+func (q lifecycleFlowQEMU) AttachDisk(ctx context.Context, node string, vmid int, volume, bus string, opts *qemu.AttachOpts) (string, error) {
+	slot, err := q.managedDiskTestQEMU.AttachDisk(ctx, node, vmid, volume, bus, opts)
+	if err == nil && q.c.faithfulDemotion {
+		q.c.dropUnusedEntries(vmid, volume)
+	}
+	return slot, err
+}
+
+// dropUnusedEntries removes every unusedN entry of the VM that names the
+// bare volid of value.
+func (c *lifecycleFlowPVE) dropUnusedEntries(vmid int, value string) {
+	volume := strings.Split(value, ",")[0]
+	for key, unused := range pve.FindUnusedDiskEntries(c.state.configs[vmid]) {
+		if unused == volume {
+			delete(c.state.configs[vmid], key)
+		}
+	}
+}
+
+func (q lifecycleFlowQEMU) ListSnapshots(_ context.Context, _ string, vmid int) ([]map[string]any, error) {
+	if q.c.vmSnapshots != nil {
+		return q.c.vmSnapshots[vmid], nil
+	}
 	return q.c.snapshots, nil
 }
 func (q lifecycleFlowQEMU) ResizeDisk(_ context.Context, _ string, vmid int, slot string, delta int) (string, error) {
@@ -308,6 +344,11 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 		value, _ := pve.ConfigString(cfg, *p.Delete)
 		deletedVolume = strings.Split(value, ",")[0]
 	}
+	detachedVolume := ""
+	if p.Delete != nil && !strings.HasPrefix(*p.Delete, "unused") {
+		value, _ := pve.ConfigString(cfg, *p.Delete)
+		detachedVolume = strings.Split(value, ",")[0]
+	}
 	fake := newIDFakeClient(n.c.state.configs)
 	if err := (&idFakeNodes{c: fake}).UpdateQemuConfig(ctx, node, vmidText, p); err != nil {
 		return err
@@ -319,7 +360,13 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	for key, value := range fields {
 		if isDiskOptionKey(key) {
 			cfg[key] = value
+			if n.c.faithfulDemotion && !strings.HasPrefix(key, "unused") {
+				n.c.dropUnusedEntries(vmid, fmt.Sprint(value))
+			}
 		}
+	}
+	if owner, ok := pve.EmbeddedDiskVMID(detachedVolume); n.c.faithfulDemotion && detachedVolume != "" && (!ok || owner != vmid) {
+		n.c.dropUnusedEntries(vmid, detachedVolume)
 	}
 	if owner, ok := pve.EmbeddedDiskVMID(deletedVolume); ok && owner == vmid {
 		delete(n.c.state.volumes, deletedVolume)
@@ -568,7 +615,15 @@ func (c lifecycleFlowCluster) ListConfigNodes(context.Context) (*cluster.ListCon
 	return &r, nil
 }
 func (c lifecycleFlowCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
-	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1}`), json.RawMessage(`{"type":"node","name":"n2","online":1}`)}
+	r := make(cluster.ListStatusResponse, 0, 3)
+	r = append(r, json.RawMessage(`{"type":"cluster","quorate":1}`))
+	for _, node := range []string{"n1", "n2"} {
+		online := 1
+		if c.c.offlineNodes[node] {
+			online = 0
+		}
+		r = append(r, json.RawMessage(fmt.Sprintf(`{"type":"node","name":%q,"online":%d}`, node, online)))
+	}
 	return &r, nil
 }
 func (c lifecycleFlowCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {

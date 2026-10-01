@@ -108,6 +108,13 @@ type DiskIdentity struct {
 	// handlers resume the transfer before proceeding; read paths treat the
 	// recorded volid as the best-known name.
 	Intent *DiskTransferIntent
+	// Unused is non-empty when no active slot carries the disk and no
+	// parker records its transfer, but one or more unusedN entries name its
+	// birth volid. That is a disk stranded by a transfer that deleted the
+	// guest's slot and never moved the volume, after its transfer record was
+	// lost. Holder stays empty, because no slot holds the disk, and the
+	// handlers that can act on an unused entry read this list instead.
+	Unused []VolumeReference
 }
 
 // ResolveDiskIdentity resolves a disk's current volid and holder, in the
@@ -167,8 +174,11 @@ func ResolveDiskIdentity(
 	// The holder is empty, but the reference counts the scan gathered on its
 	// way to that answer ride out on it: a free-floating disk is exactly what
 	// delete_disk is about to prove absent, and the counts are the cheapest
-	// second opinion it has.
-	return DiskIdentity{Volid: birthVolid, Holder: DiskHolder{StorageReferences: hit.StorageReferences}}, nil
+	// second opinion it has. The unused entries that name the birth volid
+	// ride out too. They come after the intent on purpose, because a deferred
+	// park leaves the volume on an unused entry with its intent in place, and
+	// that disk has to keep resuming.
+	return DiskIdentity{Volid: birthVolid, Holder: DiskHolder{StorageReferences: hit.StorageReferences}, Unused: hit.Unused}, nil
 }
 
 // holderFromScanHit classifies an identity-scan hit into the DiskHolder shape

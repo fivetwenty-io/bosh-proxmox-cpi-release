@@ -358,7 +358,7 @@ func (m *managedDiskRequest) executeAttempt(ctx context.Context, handle *aj.Hand
 		if e != nil {
 			return nil, cpierrors.Cloud("allocation %s: shortened-token ownership observation failed; no mutation submitted", m.id)
 		}
-		if identity.Holder.Found || identity.Intent != nil {
+		if identity.Holder.Found || identity.Intent != nil || len(identity.Unused) > 0 {
 			return nil, cpierrors.Cloud("allocation %s shortened token collision; no volume allocated", m.id)
 		}
 	}

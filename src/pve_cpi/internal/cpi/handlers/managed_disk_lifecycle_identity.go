@@ -74,7 +74,7 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, rd resolvedDisk, r
 		return resolvedDisk{}, err
 	}
 	if record.State == aj.Deleted || record.State == aj.Cleaned {
-		if rd.holder != nil || rd.intent != nil {
+		if rd.holder != nil || rd.intent != nil || len(rd.unused) > 0 {
 			return resolvedDisk{}, cpierrors.Cloud("terminal managed disk still has ownership provenance; audit required")
 		}
 		exists, err := managedVolumePresent(ctx, deps, node, rd.volid)

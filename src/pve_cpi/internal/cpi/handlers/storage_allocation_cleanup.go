@@ -223,7 +223,7 @@ func storageCleanupDiskOwnership(ctx context.Context, deps Deps, record aj.Recor
 			if rd.allocation == nil || rd.allocation.record.ID != record.ID || rd.intent != nil {
 				return aj.Verification{}, storageRefusal("disk cleanup identity or transfer remains unresolved")
 			}
-			if rd.holder != nil && !rd.holder.IsParker {
+			if (rd.holder != nil && !rd.holder.IsParker) || len(rd.unused) > 0 {
 				return aj.Verification{}, storageRefusal("disk cleanup requires managed detach before deleting an attached disk")
 			}
 			ownership, e = managedDiskOwnershipProof(rd)

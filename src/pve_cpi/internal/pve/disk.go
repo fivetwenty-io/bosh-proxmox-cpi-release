@@ -634,6 +634,14 @@ type DiskScanHit struct {
 	// nothing. See StorageReferenceCounts for which reading a caller wants
 	// and where the count is only a lower bound.
 	StorageReferences StorageReferenceCounts
+	// Unused lists the unusedN entries whose volid is exactly the one the
+	// scan looked for. Only a stable-ID scan collects them, and only the
+	// not-found answer carries them, because an active match anywhere wins.
+	// Deleting a slot adds such an entry only for a volume the VM owns by
+	// name, so a stable-ID disk shows up here when its transfer to a parker
+	// deleted the slot of a guest that owns its birth name and the move never
+	// finished.
+	Unused []VolumeReference
 }
 
 // StorageReferenceCounts maps a storage name to the number of volumes the
@@ -823,6 +831,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	// counted at zero either, but only the first of those is an absence of
 	// evidence.
 	counts := make(StorageReferenceCounts)
+	var unused []VolumeReference
 
 	for _, g := range guests {
 		vmid := g.VMID
@@ -861,6 +870,13 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
 			}, nil
 		}
+		if stableID != "" {
+			for key, value := range FindUnusedDiskEntries(cfg) {
+				if value == volid {
+					unused = append(unused, VolumeReference{VMID: vmid, Node: vmNode, Slot: key})
+				}
+			}
+		}
 	}
 
 	if len(excludedNodes) > 0 {
@@ -871,7 +887,8 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	// The counts ride out on the not-found answer too, and that is the case
 	// they exist for: a disk nothing references is the one delete_disk is about
 	// to prove absent from an empty listing.
-	return DiskScanHit{StorageReferences: counts}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+	sortVolumeReferences(unused)
+	return DiskScanHit{StorageReferences: counts, Unused: unused}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
 }
 
 // matchDiskIdentity matches one parsed disk map against a disk identity: the

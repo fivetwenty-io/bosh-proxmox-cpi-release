@@ -267,6 +267,11 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if decErr != nil {
 			return nil, decErr
 		}
+		// A disk stranded on an unused entry is refused before a managed
+		// lifecycle opens, so the refusal leaves its record as it was.
+		if err := refuseStrandedDelete(deps, rd); err != nil {
+			return nil, err
+		}
 		if rd.allocation != nil && rd.allocation.terminalAbsent {
 			return nil, nil
 		}

@@ -40,6 +40,11 @@ type resolvedDisk struct {
 	// provenance intent record names it. Mutating handlers resume the
 	// transfer before acting; read handlers treat the disk as existing.
 	intent *pve.DiskTransferIntent
+	// unused lists the unusedN entries that name the disk's birth volid when
+	// no slot carries the disk and no parker records its transfer. One entry
+	// on a guest outside the parker band is a disk stranded on that guest;
+	// anything else is ambiguous. See strandedEntry.
+	unused []pve.VolumeReference
 	// storageRefs counts, per storage, the volumes the cluster's configs
 	// referenced when the identity scan read them. It is set whether or not
 	// the scan found a holder, because the caller that needs it most is the
@@ -86,6 +91,7 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 		rd.holder = &h
 	}
 	rd.intent = ident.Intent
+	rd.unused = ident.Unused
 	return resolveManagedDiskIdentity(ctx, deps, rd)
 }
 

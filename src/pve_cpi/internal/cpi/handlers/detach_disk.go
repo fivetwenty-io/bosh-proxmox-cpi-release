@@ -183,6 +183,9 @@ func HandleDetachDisk(deps Deps) Handler {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
+		if err := refuseStrandedDetach(deps, vmid, rd); err != nil {
+			return nil, err
+		}
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "detach_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
@@ -343,7 +346,17 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		}
 		rd = refreshed
 	}
+	var node string
 	switch {
+	case rd.holder == nil && len(rd.unused) > 0:
+		// No slot carries the disk, but this VM's unused entry names its
+		// birth volume: a transfer deleted the slot and never moved it. The
+		// transfer below finds the entry and moves it, and a parked
+		// config-edit attach would leave the entry naming the same volume.
+		if err := refuseStrandedDetach(deps, vmid, rd); err != nil {
+			return err
+		}
+		node = rd.unused[0].Node
 	case rd.holder == nil:
 		return parkFreeFloatingStableID(ctx, deps, rd)
 	case rd.holder.IsParker:
@@ -358,9 +371,10 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 			log.Int("holder_vmid", rd.holder.VMID),
 		)
 		return nil
+	default:
+		node = rd.holder.Node
 	}
 
-	node := rd.holder.Node
 	if err := detachDiskSnapshotGuard(ctx, deps, vmCID, node, vmid, rd.diskCID, deps.Config, logger); err != nil {
 		return err
 	}

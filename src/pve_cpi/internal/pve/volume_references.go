@@ -70,11 +70,17 @@ func FindVolumeReferences(ctx context.Context, c Client, volid string) ([]Volume
 			}
 		}
 	}
+	sortVolumeReferences(refs)
+	return refs, nil
+}
+
+// sortVolumeReferences orders references by VMID and then slot, so a caller
+// that names them in an error or compares two lists sees a stable order.
+func sortVolumeReferences(refs []VolumeReference) {
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].VMID != refs[j].VMID {
 			return refs[i].VMID < refs[j].VMID
 		}
 		return refs[i].Slot < refs[j].Slot
 	})
-	return refs, nil
 }

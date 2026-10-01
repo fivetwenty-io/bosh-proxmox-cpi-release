@@ -66,7 +66,7 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 	if disk.allocation.absent {
 		return lifecycle.deletionProof(ctx)
 	}
-	if disk.holder != nil && !disk.holder.IsParker {
+	if (disk.holder != nil && !disk.holder.IsParker) || len(disk.unused) > 0 {
 		return proof, fmt.Errorf("cleanup requires detached or parked persistent disk")
 	}
 	ownership, err := managedDiskOwnershipProof(disk)

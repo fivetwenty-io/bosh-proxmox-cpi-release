@@ -108,6 +108,9 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, err
 		}
+		if err := refuseStrandedManagedAttach(deps, vmCID, rd); err != nil {
+			return nil, err
+		}
 		deps, lifecycle, lifecycleErr := managedDiskOperation(ctx, deps, rd, "attach_disk")
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
@@ -1016,6 +1019,14 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 		return attachPlan{}, resumeErr
 	}
 	*rd = refreshed
+	// A disk stranded on another VM's unused entry moves to a parker first, so
+	// the parked plan below attaches it with one reference. One stranded on
+	// the target itself takes the ordinary attach, and it has no holder only
+	// because no slot carries it, so the missing-anchor refusal doesn't apply.
+	strandedOnTarget, strandedErr := settleStrandedBeforeAttach(ctx, deps, op, rd, targetVMID)
+	if strandedErr != nil {
+		return attachPlan{}, strandedErr
+	}
 
 	parkerCfg := parkerReadConfigFor(deps)
 	var holder pve.DiskHolder
@@ -1048,10 +1059,7 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 	// pick the new outcome up from here. The proof resolves the disk's own
 	// location rather than using node, which by this point names the VM the
 	// disk is being attached to.
-	if anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder); anchorErr != nil {
-		if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid, refs) {
-			return attachPlan{}, anchorVolumeGoneRefusal(op, rd.diskCID, rd.volid)
-		}
+	if anchorErr := attachAnchorRefusal(ctx, deps, op, rd, holder, refs, strandedOnTarget); anchorErr != nil {
 		return attachPlan{}, anchorErr
 	}
 
@@ -1165,6 +1173,24 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 		return attachPlan{}, retriableUnlessPermanent(unErr, fmt.Sprintf("%s: unpark disk %s", op, rd.diskCID))
 	}
 	return attachPlan{overlay: overlay}, nil
+}
+
+// attachAnchorRefusal is the missing-anchor refusal for the attach guard, or
+// the refusal that says the data is gone when the volume is provably off
+// storage too. A disk stranded on the target VM's own unused entry has no
+// holder only because no slot carries it, so strandedOnTarget skips the check.
+func attachAnchorRefusal(ctx context.Context, deps Deps, op string, rd *resolvedDisk, holder pve.DiskHolder, refs pve.StorageReferenceCounts, strandedOnTarget bool) error {
+	if strandedOnTarget {
+		return nil
+	}
+	anchorErr := anchorMissingRefusal(ctx, deps, op, rd.diskCID, rd.meta, holder)
+	if anchorErr == nil {
+		return nil
+	}
+	if proveAnchorVolumeGone(ctx, deps, op, rd.diskCID, rd.volid, refs) {
+		return anchorVolumeGoneRefusal(op, rd.diskCID, rd.volid)
+	}
+	return anchorErr
 }
 
 // attachOverlayForHolder reads the disk's recorded drive-option overrides
