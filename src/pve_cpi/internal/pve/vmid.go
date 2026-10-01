@@ -64,12 +64,19 @@ type allocOpts struct {
 	// distinct iso_storage). Empty by default — zero extra API calls and
 	// byte-identical behavior for every caller that does not use it.
 	extraStorageScans []storageScanTarget
+	// imageStorageScanNode, when non-empty, makes NextVMID also scan every
+	// enabled storage with images content that this node sees. Set via
+	// WithNodeImageStorageScan.
+	imageStorageScanNode string
 }
 
 // storageScanTarget is one (node, storage) pair queued by WithExtraStorageScan.
+// owner marks a pair the scan reads by PVE's owner rule (any vm-<N>-* or
+// base-<N>-* name) rather than by the disk-name pattern alone.
 type storageScanTarget struct {
 	node    string
 	storage string
+	owner   bool
 }
 
 // AllocOption is a functional option for NextVMID and the retry helpers.
@@ -143,16 +150,44 @@ func WithStorageScan(node, storage string) AllocOption {
 // cover.
 //
 // Either argument empty is a no-op: nothing is queued and behavior is
-// unaffected for that call. Duplicate (node, storage) pairs — including one
-// identical to the primary WithStorageScan pair — are queued and scanned
-// again; listStorageVMIDs is idempotent so this only costs a redundant API
-// call, never a correctness issue.
+// unaffected for that call. Duplicate (node, storage) pairs, including one
+// identical to the primary WithStorageScan pair, are scanned once.
 func WithExtraStorageScan(node, storage string) AllocOption {
 	return func(o *allocOpts) {
 		if node == "" || storage == "" {
 			return
 		}
 		o.extraStorageScans = append(o.extraStorageScans, storageScanTarget{node: node, storage: storage})
+	}
+}
+
+// WithNodeImageStorageScan makes NextVMID leave out every VMID that names a
+// volume on any enabled storage with images content that node sees, not only
+// on the pools WithStorageScan and WithExtraStorageScan name.
+//
+// PVE decides who owns a volume from its name alone. A volume named
+// vm-<N>-* or base-<N>-* belongs to VM N, so a new VM that draws N
+// inherits that volume as one of its own disks. Attaching it makes a
+// detach free it, and destroying the VM frees it with the VM's other disks,
+// as does PVE's unreferenced-disk sweep. This set of storages is the scope
+// that sweep reads, so it is exactly the set of volumes PVE would hand the
+// new VM. The case it closes is a VM band moved over VMIDs that still name
+// persistent disks on a pool other than vm_storage.
+//
+// The node's storage list and each storage's content list fail the
+// allocation when they cannot be read, the same as WithStorageScan. A
+// storage the node reports as not active is skipped, because nothing on it
+// can be listed, attached, or freed until it comes back. A storage this
+// option shares with WithStorageScan or WithExtraStorageScan
+// is listed once. Storage that is local to other nodes is not read, so a
+// VM that later migrates onto a node whose local storage names its VMID is
+// covered by the refusals in attach_disk, detach_disk, and delete_vm
+// instead.
+//
+// An empty node makes the option a no-op.
+func WithNodeImageStorageScan(node string) AllocOption {
+	return func(o *allocOpts) {
+		o.imageStorageScanNode = node
 	}
 }
 
@@ -330,7 +365,9 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 // list. Omitted (or either argument empty), behavior is unchanged from
 // before this option existed. WithExtraStorageScan queues additional
 // (node, storage) pairs scanned the same way, for callers that must cover
-// more than one pool in a single allocation.
+// more than one pool in a single allocation. WithNodeImageStorageScan adds
+// every images storage the node sees, read by PVE's owner rule. Each
+// (node, storage) pair is listed once however many options name it.
 //
 // Inputs and failure modes:
 //   - ctx nil → returns *cpierrors.Error before any SDK call.
@@ -339,6 +376,8 @@ func nextVMIDInRange(used map[int]struct{}, start, end int) (int, error) {
 //   - Storage-scan failure (when WithStorageScan is set) → returns
 //     *cpierrors.Error wrapping the SDK error; the allocation fails rather
 //     than proceeding blind to shared-storage content.
+//   - Node storage list failure (when WithNodeImageStorageScan is set) →
+//     returns *cpierrors.Error; the allocation fails for the same reason.
 //   - Range exhausted → returns *cpierrors.Error "no free VMID in range".
 func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 	if ctx == nil {
@@ -363,17 +402,12 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 		return 0, err
 	}
 
-	if ao.storageScanNode != "" && ao.storageScanStorage != "" {
-		storageUsed, sErr := listStorageVMIDs(ctx, c, ao.storageScanNode, ao.storageScanStorage)
-		if sErr != nil {
-			return 0, sErr
-		}
-		for id := range storageUsed {
-			used[id] = struct{}{}
-		}
+	targets, err := storageScanTargets(ctx, c, ao)
+	if err != nil {
+		return 0, err
 	}
-	for _, extra := range ao.extraStorageScans {
-		storageUsed, sErr := listStorageVMIDs(ctx, c, extra.node, extra.storage)
+	for _, target := range targets {
+		storageUsed, sErr := listStorageVMIDsFor(ctx, c, target)
 		if sErr != nil {
 			return 0, sErr
 		}
@@ -463,6 +497,128 @@ var volumeVMIDRegexp = regexp.MustCompile(`(?:^|[/:])(?:vm|base)-(\d+)-disk-\d+(
 // On API error returns a wrapped *cpierrors.Error. An empty content list
 // is not an error — returns an empty map.
 func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[int]struct{}, error) {
+	return listStorageVMIDsFor(ctx, c, storageScanTarget{node: node, storage: storage})
+}
+
+// volumeOwnerRegexp reads the owner PVE's storage plugins parse from a
+// volume's last path segment: VM N owns any vm-<N>-* or base-<N>-* name,
+// whatever follows the VMID.
+var volumeOwnerRegexp = regexp.MustCompile(`^(?:vm|base)-([1-9]\d*)-`)
+
+// volumeOwnerVMID returns the VMID PVE treats as the owner of an images
+// volume, and false for any other name.
+func volumeOwnerVMID(volid string) (string, bool) {
+	m := volumeOwnerRegexp.FindStringSubmatch(volid[strings.LastIndexAny(volid, "/:")+1:])
+	if len(m) != 2 {
+		return "", false
+	}
+	return m[1], true
+}
+
+// storageScanTargets collects every (node, storage) pair NextVMID reads, in
+// option order, with each pair once. A pair named by more than one option
+// keeps the owner rule if any of them asks for it.
+func storageScanTargets(ctx context.Context, c Client, ao *allocOpts) ([]storageScanTarget, error) {
+	var targets []storageScanTarget
+	seen := map[storageScanTarget]int{}
+	add := func(t storageScanTarget) {
+		key := storageScanTarget{node: t.node, storage: t.storage}
+		if i, ok := seen[key]; ok {
+			targets[i].owner = targets[i].owner || t.owner
+			return
+		}
+		seen[key] = len(targets)
+		targets = append(targets, t)
+	}
+	if ao.storageScanNode != "" && ao.storageScanStorage != "" {
+		add(storageScanTarget{node: ao.storageScanNode, storage: ao.storageScanStorage})
+	}
+	for _, extra := range ao.extraStorageScans {
+		add(extra)
+	}
+	if ao.imageStorageScanNode != "" {
+		storages, err := listNodeImageStorages(ctx, c, ao.imageStorageScanNode)
+		if err != nil {
+			return nil, err
+		}
+		for _, storage := range storages {
+			add(storageScanTarget{node: ao.imageStorageScanNode, storage: storage, owner: true})
+		}
+	}
+	return targets, nil
+}
+
+// listNodeImageStorages names every enabled storage with images content that
+// node sees. A row whose own content or enabled field contradicts the filter
+// the request asked for is skipped too. A row the node reports as not active
+// is skipped as well. Its content cannot be listed, so failing closed on it
+// would stop every create_vm on a node that merely lacks a storage defined for
+// the whole cluster, and a disk on it cannot be attached until the storage
+// comes back, when attach_disk refuses one named for the VM. A row that does
+// not decode and a nil response are errors, because skipping them would let
+// the allocation proceed blind.
+func listNodeImageStorages(ctx context.Context, c Client, node string) ([]string, error) {
+	nodesSvc := c.Nodes()
+	if nodesSvc == nil {
+		// Test fixtures may stub Nodes() as nil, as listStorageVMIDs allows.
+		return nil, nil
+	}
+	content, enabled := "images", true
+	var resp *sdknodes.ListStorageResponse
+	err := RetryOnTransient(ctx, nil, "vmid_list_node_storage", 0, func() error {
+		var inner error
+		resp, inner = nodesSvc.ListStorage(ctx, node, &sdknodes.ListStorageParams{Content: &content, Enabled: &enabled})
+		return inner
+	})
+	if err != nil {
+		return nil, cpierrors.Wrap(WrapError(err),
+			fmt.Sprintf("vmid: list images storages on node %q", node))
+	}
+	if resp == nil {
+		return nil, cpierrors.Retriable("vmid: nil response listing images storages on node %q", node)
+	}
+	var storages []string
+	for _, raw := range *resp {
+		var entry struct {
+			Storage string             `json:"storage"`
+			Content string             `json:"content"`
+			Enabled *sdkclient.PVEBool `json:"enabled"`
+			Active  *sdkclient.PVEBool `json:"active"`
+		}
+		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
+			return nil, cpierrors.Retriable("vmid: unreadable images storage row on node %q", node)
+		}
+		if entry.Storage == "" {
+			continue
+		}
+		if (entry.Enabled != nil && !entry.Enabled.Bool()) || (entry.Active != nil && !entry.Active.Bool()) {
+			continue
+		}
+		if entry.Content != "" && !hasImagesContent(entry.Content) {
+			continue
+		}
+		storages = append(storages, entry.Storage)
+	}
+	return storages, nil
+}
+
+// hasImagesContent reports whether a storage's comma-separated content list
+// includes images.
+func hasImagesContent(content string) bool {
+	for _, kind := range strings.Split(content, ",") {
+		if strings.TrimSpace(kind) == "images" {
+			return true
+		}
+	}
+	return false
+}
+
+// listStorageVMIDsFor is listStorageVMIDs for one target. An owner target
+// also reserves the VMID of every images volume whose name PVE reads as
+// owned, such as vm-<N>-cloudinit or vm-<N>-ephemeral-0, which the disk-name
+// pattern alone does not match.
+func listStorageVMIDsFor(ctx context.Context, c Client, target storageScanTarget) (map[int]struct{}, error) {
+	node, storage := target.node, target.storage
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {
 		// Test fixtures may stub Nodes() as nil; treat as no observed
@@ -492,25 +648,35 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 		var entry struct {
 			VolID    string `json:"volid"`
 			Filename string `json:"filename"`
+			Content  string `json:"content"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
 		// Prefer volid ("storage:vm-9000-disk-0"); fall back to filename.
-		target := entry.VolID
-		if target == "" {
-			target = entry.Filename
+		volume := entry.VolID
+		if volume == "" {
+			volume = entry.Filename
 		}
-		if target == "" {
+		if volume == "" {
 			continue
 		}
-		matches := volumeVMIDRegexp.FindStringSubmatch(target)
+		matches := volumeVMIDRegexp.FindStringSubmatch(volume)
 		if len(matches) < 2 {
 			// Managed file volumes retain the allocation UUID in their name.
 			// Their VMID must remain reserved even before any VM references it.
-			filename := target[strings.LastIndexAny(target, "/:")+1:]
+			filename := volume[strings.LastIndexAny(volume, "/:")+1:]
 			if managed := allocationVolume.FindStringSubmatch(filename); len(managed) >= 4 && allocationUUID.MatchString(managed[3]) {
-				matches = []string{target, managed[1]}
+				matches = []string{volume, managed[1]}
+			}
+		}
+		// ISOs, templates, backups, and snippets have no owner in PVE, so
+		// only guest volumes are read by the owner rule. A row without a
+		// content field is read as a guest volume, which errs on the side of
+		// reserving the VMID.
+		if len(matches) < 2 && target.owner && (entry.Content == "" || entry.Content == "images" || entry.Content == "rootdir") {
+			if owner, ok := volumeOwnerVMID(volume); ok {
+				matches = []string{volume, owner}
 			}
 		}
 		if len(matches) < 2 {

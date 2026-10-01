@@ -993,7 +993,21 @@ type attachPlan struct {
 // scan per attach_disk is a cheap price for turning silent volume loss into a
 // message naming the VM to look at. For stable-ID disks the identity
 // resolution already paid that scan, so the holder comes from rd.
+//
+// Before any of that, a legacy volume named for the target VM is refused. It
+// would become that VM's own disk in PVE's eyes, and the next detach or
+// delete would free it. Both attach callers come through here before any
+// mutation, and the check costs no API call.
 func guardAndUnparkBeforeAttach(ctx context.Context, deps Deps, op string, rd *resolvedDisk, node string, targetVMID int) (attachPlan, error) {
+	if err := refuseOwnedLegacyAttach(op, *rd, node, targetVMID); err != nil {
+		return attachPlan{}, err
+	}
+	return guardHolderAndUnpark(ctx, deps, op, rd, node, targetVMID)
+}
+
+// guardHolderAndUnpark is guardAndUnparkBeforeAttach after the owned-volume
+// refusal: the holder scan, the resume, and the unpark or transfer plan.
+func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolvedDisk, node string, targetVMID int) (attachPlan, error) {
 	if deps.Config == nil {
 		return attachPlan{}, nil
 	}
