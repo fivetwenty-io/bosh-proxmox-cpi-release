@@ -732,16 +732,57 @@ with `qm set <parker-vmid> --description`, preserving the rest of the JSON. See
 **Symptom**
 
 ```text
-delete_vm: refusing to destroy VM <N> — persistent volumes still attached as unused slots on storage "X": [unusedN=<volid>] (call detach_disk first)
+delete_vm: refusing to destroy VM <N> -- persistent volumes still attached as unused slots: [unusedN=<volid>] (call detach_disk first or verify pve.disk_storage configuration; if detach_disk succeeds and the slot stays, do not remove the slot or destroy the VM by hand, because PVE then deletes a volume named for the VM; see "delete_vm refuses to destroy VM with attached unused disks" in docs/troubleshooting.md of bosh-proxmox-cpi-release)
 ```
 
 **Diagnosis**
 
-The BOSH director's view of disk state has drifted from PVE state. The VM config still contains `unusedN` slots referencing live persistent volumes.
+The VM's config still has an `unusedN` entry that names a live volume on the disk storage. PVE leaves a volume there whenever a disk slot is deleted and nothing removes the entry afterwards. Most of the time the Director's view of the disk has drifted from PVE, and a detach puts it right.
+
+One case needs more care. A persistent disk with a stable ID moves to a parker in three steps. The CPI writes a record of the transfer on the parker, deletes the disk's slot on the VM, and then moves the volume. If the move fails, the volume sits on the VM's unused entry, and an unused entry carries no serial, so the parker's record is the only link from the disk's CID to the volume. From 0.5.1 through 0.8.0 the next write to that parker removed the record once it was an hour old. After that, `detach_disk` can report success while the volume stays on the VM. Since this release the record stays for as long as the VM still names the volume, and a retried `detach_disk` finishes the move.
+
+To tell the cases apart, read the VM's config:
+
+```bash
+qm config <N>
+pve-cid decode <cid>
+```
+
+The VM's description carries a `bosh_attached_disks` entry for each disk the CPI attached. When an entry is keyed by a `bpd-` serial that no active slot of the VM carries, the unused entry is that disk's volume. `pve-cid decode` on the entry's CID prints the serial and the name the volume was created with. If the unused entry still has that name, it is the same disk.
 
 **Fix**
 
-Run `bosh -d <deployment> cloud-check` to reconcile state. The director will offer to detach the disks and clean up the record. If the deployment is unrecoverable, detach the disks manually via `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
+Never remove the unused entry, unlink it, or destroy the VM by hand while it is there. When the volume's name carries the VM's VMID, PVE deletes the volume in each of those cases.
+
+On this release, we start by retrying the failed task or rerunning the deploy. The parker keeps its record of the transfer while the VM still names the volume, so the retried `detach_disk` usually finishes the move on its own and the unused entry goes away. We go further only when `detach_disk` succeeds and the unused entry is still there, which happens when an earlier release already removed the record.
+
+Before we touch anything, all four of these checks have to pass. If any one of them fails, or if more than one disk could be the candidate, we stop and leave the VM, its unused entry, and every parker exactly as they are.
+
+1. The retried `detach_disk` succeeded, and the unused entry is still on the VM.
+
+2. Nothing else in the cluster holds the disk's serial. We search every guest config on any node, because `/etc/pve` carries the whole cluster:
+
+   ```bash
+   grep -n '<bpd-serial>' /etc/pve/nodes/*/qemu-server/*.conf
+   ```
+
+   Every line it prints must come from `<N>.conf`, the VM we are recovering, and the text after the file name and line number must start with `#`, which is how PVE stores the description. A line from any other VM means another guest or a parker still names the disk, and a line that doesn't start with `#` means a drive of that VM still carries the serial. Either one fails the check.
+
+3. The VM has exactly one candidate. Its description's `bosh_attached_disks` names exactly one `bpd-` serial that none of its active slots carries, and its config has exactly one unused entry on the disk storage. When the volume still has its birth name, the unused entry must name exactly the `volid` that `pve-cid decode <cid>` prints for that serial's CID.
+
+4. When the volume was renamed for the VM, which is when its name carries the VM's VMID, its size must match the disk the Director knows. `pvesm list <storage> --vmid <N>` prints the volume's size in bytes. The Director's size comes from the instance group's `persistent_disk` in `bosh -d <deployment> manifest`, or from its `persistent_disk_type` and that type's `disk_size` in `bosh cloud-config`. The CPI rounds that size up to whole GiB when it creates the disk, and a later resize changes it, so we compare against the size the disk has now.
+
+When all four checks pass, we put the volume back on a free bus slot with its serial, then let BOSH detach it again:
+
+```bash
+qm set <N> --scsi<free-slot> <volid>,serial=<bpd-serial>
+```
+
+PVE drops the unused entry when it sees the same volume attached again, and it frees nothing. If the VM is running and disk hotplug is off, the change waits as pending until the VM restarts. Then we retry the failed task or rerun the deploy. `detach_disk` finds the disk by its serial and parks it the usual way, and `delete_vm` can go ahead after that.
+
+A journal-managed disk also stays in `reconciliation_required` after the failed move, at a planned `lifecycle_detach_disk_Nodes_CreateQemuMoveDisk` step. No `storage-journal` command settles that step yet, so leave the VM and its unused entry exactly as they are. `storage-journal audit --summary` shows the allocation and the volume it still holds on the VM.
+
+For ordinary drift, run `bosh -d <deployment> cloud-check` to reconcile state. The Director offers to detach the disks and clean up the record. If the deployment can't be recovered, detach the disks with `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
 
 ## Network, bridge, and SDN failures
 

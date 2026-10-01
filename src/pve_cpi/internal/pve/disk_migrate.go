@@ -208,7 +208,7 @@ func isolateDiskOntoMover(
 	// Intent record, strict: once the volume moves it is mover-named, and the
 	// record (plus the serial riding the drive entry) is what the identity
 	// scan finds after a crash.
-	intent := buildParkerProvEntry(spec.Holder.Node, spec.Volid, moverIsolationSlot, cfg, pctx)
+	intent := buildParkerProvEntry(ctx, spec.Holder.Node, spec.Volid, moverIsolationSlot, cfg, pctx)
 	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, intent, cfg); provErr != nil {
 		destroyMoverBestEffort(ctx, c, logger, moverVMID, spec.Holder.Node, cfg)
 		return DiskHolder{}, "", cpierrors.Wrap(provErr,
@@ -428,7 +428,7 @@ func convergeMigratedMover(
 
 	reassertParkerProtection(ctx, c, logger, spec.TargetNode, moverVMID)
 
-	entry := buildParkerProvEntry(spec.TargetNode, landed, slot, cfg, pctx)
+	entry := buildParkerProvEntry(ctx, spec.TargetNode, landed, slot, cfg, pctx)
 	if provErr := writeParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil {
 		if spec.AllocationID != "" || spec.AllocationNamespace != "" {
 			return "", "", cpierrors.Cloud("managed migration destination provenance requires reconciliation")

@@ -451,7 +451,7 @@ func transferIntoParkerLocked(
 	// 2. Intent record, strict: from the moment the source slot is deleted
 	// until the serial lands on the parker, this record is the disk's only
 	// identity carrier, so the transfer must not proceed without it.
-	intent := buildParkerProvEntry(node, bareVolid, slot, cfg, pctx)
+	intent := buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, pctx)
 	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, intent, cfg); provErr != nil {
 		return "", cpierrors.Wrap(provErr,
 			fmt.Sprintf("transfer in: write intent record on parker vmid %d (fail-closed: the record is the crash-window identity carrier)", parkerVMID))
@@ -769,7 +769,7 @@ func finalizeResumedTransfer(
 	intent DiskTransferIntent, stableID, slot, landed string,
 	cfg ParkerConfig, pctx ParkContext,
 ) error {
-	entry := buildParkerProvEntry(intent.ParkerNode, landed, slot, cfg, pctx)
+	entry := buildParkerProvEntry(ctx, intent.ParkerNode, landed, slot, cfg, pctx)
 	if provErr := writeParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil {
 		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
 			return cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")

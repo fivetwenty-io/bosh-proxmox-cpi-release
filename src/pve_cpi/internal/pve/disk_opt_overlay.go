@@ -377,7 +377,7 @@ func ApplyParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVM
 		// from the live config, the disk's identity from the caller.
 		slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
 		key = parkerProvKey(bareVolid, stableID)
-		entry = buildParkerProvEntry(node, bareVolid, slot, cfg, ParkContext{DiskCID: diskCID, StableID: stableID})
+		entry = buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, ParkContext{DiskCID: diskCID, StableID: stableID})
 	}
 	merged := mergeOverlayUpdates(entry.Opts, updates)
 	entry.Opts = merged
