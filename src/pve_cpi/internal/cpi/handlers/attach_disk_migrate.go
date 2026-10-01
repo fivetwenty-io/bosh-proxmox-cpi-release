@@ -122,8 +122,10 @@ func localDiskNode(ctx context.Context, deps Deps, op, volid string) (string, er
 // attachViaMigration moves a cross-node parked disk to the target VM's node
 // through the mover flow, then hands back the ordinary same-node reassignment
 // plan: the disk ends the call parked on a single-purpose mover ON the target
-// node, attachDiskViaTransfer moves it onto the VM, and the now-empty mover
-// is destroyed. rd is updated in place with the renamed volid and the mover
+// node, and attachDiskViaTransfer moves it onto the VM. destroyOrKeepMover
+// then destroys the empty mover, or keeps it when its protection restore was
+// cut off or when the request's journal can't delete a mover an earlier
+// request created. rd is updated in place with the renamed volid and the mover
 // as holder, so everything downstream operates on the disk's current name.
 //
 // The migrate-task await runs under the retry.disk_migrate budget; when the

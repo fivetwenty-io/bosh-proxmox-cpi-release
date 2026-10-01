@@ -45,6 +45,7 @@ type managedDiskLifecycleGuard struct {
 
 func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGuard, error) {
 	state := &managedDiskLifecycleGuard{lifecycle: m, observations: map[string]managedDiskMutationObservation{}, created: map[int]bool{}}
+	m.holders = state
 	return NewManagedAllocationGuard(m.deps.PVE, ManagedAllocationHooks{Before: state.before, After: state.after, Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 		return m.session.Uncertain(call.Service + "." + call.Method)
 	}, SettleProtectionWrites: true})
@@ -553,6 +554,26 @@ func (g *managedDiskLifecycleGuard) prepareDeletion(ctx context.Context, call Ma
 	observation.preAbsent = !exists
 
 	return nil
+}
+
+// createdHolder reports whether this operation created the VM with this VMID
+// and read it back, which is what prepareHolderDeletion asks before it lets
+// the operation delete a holder. It answers only who created the VM. Whether
+// the VM is empty is left to the caller's own check and to
+// prepareHolderDeletion.
+//
+// It reads created under the allocation guard's mutex. That can't deadlock
+// only because the handler asks between guarded calls and never from inside a
+// hook. begin takes the mutex when it admits a call and end releases it, and
+// every hook runs while it is held, so a hook that asked would wait on itself.
+func (g *managedDiskLifecycleGuard) createdHolder(vmid int) bool {
+	guard := g.lifecycle.guard
+	if guard == nil {
+		return false
+	}
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	return g.created[vmid]
 }
 
 func (g *managedDiskLifecycleGuard) prepareHolderDeletion(observation *managedDiskMutationObservation) (err error) {

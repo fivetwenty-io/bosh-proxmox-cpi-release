@@ -8,10 +8,13 @@
 // keeps sibling parked disks from traveling: a node's shared parker is
 // durable infrastructure and never migrates.
 //
-// The mover is never started, carries the parker provenance tags plus its own
-// mover tag, and is destroyed after the attach lands — through a guard that
-// refuses to destroy a mover still referencing any volume, so a mover
-// teardown can never take a disk with it. A crash at any point leaves a
+// The mover is never started, and it carries the parker provenance tags plus
+// its own mover tag. After the attach lands, the attach normally destroys it
+// through a guard that refuses to destroy a mover still referencing any
+// volume, so a mover teardown can never take a disk with it. The attach keeps
+// the empty mover instead when its protection restore was cut off, or when
+// the request's journal can't delete a mover an earlier request created, and
+// it logs how to remove the mover by hand. A crash at any point leaves a
 // provenance-tagged mover the next attach adopts (same node: the ordinary
 // reassignment transfer; cross-node: this flow, skipping the isolation step)
 // or an operator cleans by hand.
@@ -100,9 +103,11 @@ type DiskMigrationSpec struct {
 
 // MigrateDiskViaMover moves one parked stable-ID disk to spec.TargetNode and
 // returns the mover now holding it there plus the volid the volume landed
-// under. On return the disk is parked on the mover ON the target node — the
+// under. On return the disk is parked on the mover ON the target node. The
 // caller finishes with the ordinary same-node reassignment transfer and then
-// destroys the mover via DestroyEmptyMover.
+// normally destroys the mover through DestroyEmptyMover, though it keeps the
+// mover when destroying it would strand an unsettled protection restore or
+// when its journal can't delete the mover.
 //
 // Re-entry safe: every step re-derives its state from the cluster, so a
 // Director retry after a crash or an exhausted await budget resumes rather

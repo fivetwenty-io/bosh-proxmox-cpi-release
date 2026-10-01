@@ -237,6 +237,39 @@ func unguardedPVE(c pve.Client) pve.Client {
 	return c
 }
 
+// holderDeletionAnswerer is implemented by a client decorator whose guard
+// decides which holder VMs an operation may delete.
+type holderDeletionAnswerer interface {
+	deletesHolder(vmid int) bool
+}
+
+// guardDeletesHolder reports whether a delete of the VM with this VMID, sent
+// through c, would get past the guard that wraps c. It walks the same
+// decorator chain as unguardedPVE and returns the first answer a decorator
+// gives. A client that no guard wraps has nothing to refuse the delete, so the
+// answer is yes.
+//
+// The answer covers only who created the VM. Whether the VM is empty stays
+// with the caller's own check, which pve.DestroyEmptyMover makes before it
+// writes anything.
+func guardDeletesHolder(c pve.Client, vmid int) bool {
+	for range 8 {
+		if answerer, ok := c.(holderDeletionAnswerer); ok {
+			return answerer.deletesHolder(vmid)
+		}
+		wrapper, ok := c.(guardWrappedClient)
+		if !ok {
+			return true
+		}
+		inner := wrapper.unguardedClient()
+		if inner == nil || inner == c {
+			return true
+		}
+		c = inner
+	}
+	return true
+}
+
 func (g *ManagedAllocationGuard) end(ctx context.Context, m ManagedAllocationMutation, token string) {
 	defer g.mu.Unlock()
 	if recovered := recover(); recovered != nil {

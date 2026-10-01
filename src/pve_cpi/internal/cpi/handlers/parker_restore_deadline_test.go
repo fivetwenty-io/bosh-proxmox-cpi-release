@@ -40,6 +40,33 @@ type hungRestorePVE struct {
 	// dropped counts down the parker protection restores that fail in
 	// transport, with no answer from PVE, before the rest go through.
 	dropped int
+	// protectionWrites lists, in order, the protection value of every write
+	// that landed on the parker's config.
+	protectionWrites []bool
+	// parkerDeletes counts the deletes of the parker that reached PVE.
+	parkerDeletes int
+}
+
+// landedProtectionWrites returns the protection writes that landed on the
+// parker so far, oldest first.
+func (c *hungRestorePVE) landedProtectionWrites() []bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]bool(nil), c.protectionWrites...)
+}
+
+// forgetParkerWrites clears the recorded protection writes and deletes, so a
+// test sees only what its own call sends.
+func (c *hungRestorePVE) forgetParkerWrites() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.protectionWrites, c.parkerDeletes = nil, 0
+}
+
+func (c *hungRestorePVE) deletesOfParker() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.parkerDeletes
 }
 
 func (c *hungRestorePVE) Nodes() nodes.Service {
@@ -105,8 +132,22 @@ func (n hungRestoreNodes) UpdateQemuConfig(ctx context.Context, node, vmid strin
 			return fmt.Errorf("fake: no config for vmid %s", vmid)
 		}
 		cfg["protection"] = protection
+		if id == n.owner.parker {
+			n.owner.mu.Lock()
+			n.owner.protectionWrites = append(n.owner.protectionWrites, *p.Protection)
+			n.owner.mu.Unlock()
+		}
 	}
 	return nil
+}
+
+func (n hungRestoreNodes) DeleteQemu(ctx context.Context, node, vmid string, p *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+	if vmid == strconv.Itoa(n.owner.parker) {
+		n.owner.mu.Lock()
+		n.owner.parkerDeletes++
+		n.owner.mu.Unlock()
+	}
+	return n.lifecycleFlowNodes.DeleteQemu(ctx, node, vmid, p)
 }
 
 // cutOffRestore is a journal-managed disk whose transfer off its parker
@@ -440,5 +481,91 @@ func TestManagedAttachSaysARestoreWasNotAttempted(t *testing.T) {
 	}
 	if record := c.record(t); record.State != aj.ReconciliationRequired {
 		t.Fatalf("allocation state = %s, want %s", record.State, aj.ReconciliationRequired)
+	}
+}
+
+// TestManagedAttachKeepsAnAdoptedMoverWhoseRestoreIsCutOff attaches a
+// journal-managed disk off a mover an earlier request left on the VM's node,
+// and hangs the write that puts the mover's protection back until its
+// deadline cuts it off. The record then holds that restore as a planned step,
+// and only a read of the mover can settle it, so the attach has to keep the
+// mover and send it nothing more: no protection-off write and no delete. The
+// attach fails with the retriable cut-off error rather than with a guard that
+// refused a delete, and once protection reads on, adopt settles the step.
+func TestManagedAttachKeepsAnAdoptedMoverWhoseRestoreIsCutOff(t *testing.T) {
+	t.Parallel()
+	const timeout = 300 * time.Millisecond
+	c, logged := newAdoptedMoverDisk(t, timeout)
+	c.hung.arm(true)
+	_, err := HandleAttachDisk(c.deps).Handle(c.ctx, c.attachArgs, jsonrpc.Context{})
+	c.hung.arm(false)
+	writes := c.hung.landedProtectionWrites()
+	t.Logf("protection writes that landed on mover %d, oldest first: %v", c.parker, writes)
+	logMoverLines(t, logged)
+
+	if !errors.Is(c.hung.outcome(), context.DeadlineExceeded) {
+		t.Fatalf("the hung restore ended with %v, want the restore deadline", c.hung.outcome())
+	}
+	if err == nil {
+		t.Fatal("attach_disk succeeded although the mover's protection restore was cut off")
+	}
+	msg := log.ScrubMessage(err.Error())
+	t.Logf("attach_disk error: %s", msg)
+	if !strings.Contains(msg, "parker protection restore cut off after the disk reached VM 777") {
+		t.Errorf("error %q does not lead with the cut-off restore", msg)
+	}
+	if strings.Contains(msg, "blocked before Nodes.DeleteQemu") {
+		t.Errorf("error %q comes from a delete the guard refused", msg)
+	}
+	var typed *cpierrors.Error
+	if !errors.As(err, &typed) || !typed.OkToRetry() {
+		t.Errorf("error %q is not retriable", msg)
+	}
+
+	// The transfer's window opens with one protection-off write, and the hung
+	// restore never lands, so any write after that first one came after the
+	// cut-off.
+	if len(writes) != 1 || writes[0] {
+		t.Errorf("protection writes that landed on mover %d = %v, want only the transfer's [false]", c.parker, writes)
+	}
+	if n := c.hung.deletesOfParker(); n != 0 {
+		t.Errorf("%d deletes reached mover %d", n, c.parker)
+	}
+	kept, ok := c.client.state.configs[c.parker]
+	if !ok {
+		t.Fatalf("mover %d is gone, so nothing can settle its restore", c.parker)
+	}
+	if lifecycleConfigHasAnyVolume(kept) {
+		t.Errorf("mover %d still holds a volume: %v", c.parker, kept)
+	}
+	if !strings.Contains(logged.String(), "because its protection restore was cut off") {
+		t.Errorf("the attach logged no warning saying why it kept mover %d", c.parker)
+	}
+	if want := fmt.Sprintf("only after a retry of this attach has succeeded and the mover holds no disks, run qm set %d --protection 0 and then qm destroy %d", c.parker, c.parker); !strings.Contains(logged.String(), want) {
+		t.Errorf("the keep warning does not say to remove mover %d only after a retry of the attach has succeeded", c.parker)
+	}
+
+	record := c.record(t)
+	if record.State != aj.ReconciliationRequired {
+		t.Fatalf("allocation state = %s (reason %q), want %s", record.State, record.Reason, aj.ReconciliationRequired)
+	}
+	step := c.restoreStep(t)
+	for i := range record.Steps {
+		other := &record.Steps[i]
+		if other.ID != step.ID && other.State != aj.Observed {
+			t.Errorf("step %s (%s, vmid %d) is %s; the restore should be the only unsettled step", other.ID, other.Kind, other.Target.VMID, other.State)
+		}
+	}
+
+	c.setProtection(true)
+	next, err := c.adopt(t)
+	if err != nil {
+		t.Fatalf("adopt refused a record whose mover reads protected: %s", log.ScrubMessage(err.Error()))
+	}
+	if next.State != aj.Adopted {
+		t.Errorf("adoption produced %s, want %s", next.State, aj.Adopted)
+	}
+	if got := stepState(t, c.record(t), step.ID); got != aj.Observed {
+		t.Errorf("restore step %s left %s after a protected readback", step.ID, got)
 	}
 }
