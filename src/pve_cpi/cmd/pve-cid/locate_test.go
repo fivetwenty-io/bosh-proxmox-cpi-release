@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -374,5 +378,219 @@ func TestResolveBareVolid(t *testing.T) {
 	// garbage
 	if _, _, err := resolveBareVolid("not-a-volid-or-cid"); err == nil {
 		t.Error("expected error for garbage input")
+	}
+}
+
+// TestLocateDisk_ListsEveryActiveHolder is a volume that two guests name on
+// an active slot. Holder keeps naming the first by VMID, and Holders names
+// both. Before this, the scan stopped at the first match and the second
+// guest was invisible.
+func TestLocateDisk_ListsEveryActiveHolder(t *testing.T) {
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 888, Node: "pve2"}, {VMID: 777, Node: "pve1"}},
+		configs: map[string]map[string]any{
+			"pve1/777": diskCfg("", map[string]string{"scsi1": "a:123/vm-123-disk-0.raw,size=5G"}),
+			"pve2/888": diskCfg("", map[string]string{"virtio2": "a:123/vm-123-disk-0.raw"}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "a:123/vm-123-disk-0.raw", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Holder == nil || result.Holder.VMID != 777 || result.Holder.Slot != "scsi1" {
+		t.Fatalf("holder = %+v, want the first match by VMID, 777 scsi1", result.Holder)
+	}
+	want := []DiskHolderMatch{
+		{VMID: 777, Node: "pve1", Slot: "scsi1", Volid: "a:123/vm-123-disk-0.raw", Match: "volid"},
+		{VMID: 888, Node: "pve2", Slot: "virtio2", Volid: "a:123/vm-123-disk-0.raw", Match: "volid"},
+	}
+	if fmt.Sprint(result.Holders) != fmt.Sprint(want) {
+		t.Fatalf("holders = %+v, want %+v", result.Holders, want)
+	}
+}
+
+// TestLocateDisk_SerialOnOneGuestVolidOnAnother keeps Holder as the first
+// match in VMID order while listing both kinds of match.
+func TestLocateDisk_SerialOnOneGuestVolidOnAnother(t *testing.T) {
+	const stableID = "bpd-0011223344556677"
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 700, Node: "pve1"}, {VMID: 90100, Node: "pve1"}},
+		configs: map[string]map[string]any{
+			"pve1/700":   diskCfg("", map[string]string{"scsi1": "a:700/vm-700-disk-2.raw,serial=" + stableID}),
+			"pve1/90100": diskCfg("", map[string]string{"scsi4": "a:123/vm-123-disk-0.raw,serial=bpd-ffffffffffffffff"}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "a:123/vm-123-disk-0.raw", stableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Holder == nil || result.Holder.VMID != 700 || result.CurrentVolid != "a:700/vm-700-disk-2.raw" {
+		t.Fatalf("holder = %+v current_volid = %q, want 700 under its renamed name", result.Holder, result.CurrentVolid)
+	}
+	if len(result.Holders) != 2 || result.Holders[0].Match != "serial" || result.Holders[1].Match != "volid" || result.Holders[1].VMID != 90100 {
+		t.Fatalf("holders = %+v, want the serial match on 700 and the volid match on 90100", result.Holders)
+	}
+}
+
+// TestLocateDisk_ListsUnusedEntriesUnderEveryName finds the volume on unused
+// entries under its located name and under the name a serial match carries.
+// Before this, unused entries were never read.
+func TestLocateDisk_ListsUnusedEntriesUnderEveryName(t *testing.T) {
+	const stableID = "bpd-0011223344556677"
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 777, Node: "pve1"}, {VMID: 778, Node: "pve1"}, {VMID: 90100, Node: "pve1"}},
+		configs: map[string]map[string]any{
+			"pve1/777":   diskCfg("", map[string]string{"unused0": "a:123/vm-123-disk-0.raw"}),
+			"pve1/778":   diskCfg("", map[string]string{"unused1": "a:90100/vm-90100-disk-3.raw", "unused0": "a:778/vm-778-disk-0.raw"}),
+			"pve1/90100": diskCfg("", map[string]string{"scsi0": "a:90100/vm-90100-disk-3.raw,serial=" + stableID}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "a:123/vm-123-disk-0.raw", stableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []UnusedReference{
+		{VMID: 777, Node: "pve1", Slot: "unused0", Volid: "a:123/vm-123-disk-0.raw"},
+		{VMID: 778, Node: "pve1", Slot: "unused1", Volid: "a:90100/vm-90100-disk-3.raw"},
+	}
+	if fmt.Sprint(result.UnusedRefs) != fmt.Sprint(want) {
+		t.Fatalf("unused_refs = %+v, want %+v", result.UnusedRefs, want)
+	}
+}
+
+// TestLocateDisk_ListsUnreadableVMs records the guests whose config read
+// failed. Before this, they were skipped without a trace.
+func TestLocateDisk_ListsUnreadableVMs(t *testing.T) {
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 100, Node: "pve1"}, {VMID: 200, Node: "pve1"}, {VMID: 300, Node: "pve2"}},
+		configs: map[string]map[string]any{
+			"pve1/200": diskCfg("", map[string]string{"scsi1": "local-lvm:vm-500-disk-0"}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-500-disk-0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(result.UnreadableVMIDs) != "[100 300]" {
+		t.Fatalf("unreadable_vmids = %v, want [100 300]", result.UnreadableVMIDs)
+	}
+	var stderr bytes.Buffer
+	printDiskLocateWarnings(&stderr, result)
+	if !strings.Contains(stderr.String(), "warning: the configs of 2 VM(s) could not be read (100, 300), so this result may be incomplete") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+// TestLocateDisk_SingleHolderOutputIsUnchanged pins compatibility: one holder
+// and nothing else prints exactly the text it printed before and warns about
+// nothing. The JSON gains only the one-entry holders list.
+func TestLocateDisk_SingleHolderOutputIsUnchanged(t *testing.T) {
+	r := &fakeReader{
+		vms:     []ClusterVM{{VMID: 200, Node: "pve1"}},
+		configs: map[string]map[string]any{"pve1/200": diskCfg("", map[string]string{"scsi3": "local-lvm:vm-9500-disk-0,size=64G"})},
+	}
+	result, err := locateDisk(context.Background(), r, "local-lvm:vm-9500-disk-0", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	printDiskLocateResult(&out, result)
+	printDiskLocateWarnings(&stderr, result)
+	if out.String() != "volid: local-lvm:vm-9500-disk-0\nholder: vmid=200 node=pve1 slot=scsi3\nsentinels: none\n" {
+		t.Fatalf("stdout = %q", out.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want nothing", stderr.String())
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"holders":[{"vmid":200,"node":"pve1","slot":"scsi3","volid":"local-lvm:vm-9500-disk-0","match":"volid"}]`) {
+		t.Fatalf("json = %s, want the one-entry holders list", raw)
+	}
+	for _, key := range []string{`"unused_refs"`, `"unreadable_vmids"`} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("json = %s, want no %s key for a single clean holder", raw, key)
+		}
+	}
+}
+
+// TestLocateDisk_WarnsWhenMoreThanOneGuestNamesTheDisk prints the extra
+// holders and unused entries and warns on stderr, pointing at the runbook.
+func TestLocateDisk_WarnsWhenMoreThanOneGuestNamesTheDisk(t *testing.T) {
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 777, Node: "pve1"}, {VMID: 888, Node: "pve2"}, {VMID: 999, Node: "pve2"}},
+		configs: map[string]map[string]any{
+			"pve1/777": diskCfg("", map[string]string{"scsi1": "a:123/vm-123-disk-0.raw"}),
+			"pve2/888": diskCfg("", map[string]string{"scsi2": "a:123/vm-123-disk-0.raw"}),
+			"pve2/999": diskCfg("", map[string]string{"unused0": "a:123/vm-123-disk-0.raw"}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "a:123/vm-123-disk-0.raw", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	printDiskLocateResult(&out, result)
+	printDiskLocateWarnings(&stderr, result)
+	for _, want := range []string{
+		"holder: vmid=777 node=pve1 slot=scsi1\n",
+		"also held by: vmid=888 node=pve2 slot=scsi2 volid=a:123/vm-123-disk-0.raw (matched by volid)\n",
+		"unused: vmid=999 node=pve2 slot=unused0 volid=a:123/vm-123-disk-0.raw\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stdout = %q, missing %q", out.String(), want)
+		}
+	}
+	for _, want := range []string{
+		"warning: 3 guests name this disk (active slots: 2, unused entries: 1). The holder shows only the first active slot in VMID order.",
+		"The Director's VM CID decides which guest really holds the disk.",
+		`see "Auditing parked disks with scripts/disk-audit" in docs/operations.md of bosh-proxmox-cpi-release`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, missing %q", stderr.String(), want)
+		}
+	}
+}
+
+// TestLocateDocsPointerHeadingExists pins the heading the warning quotes to a
+// heading that exists in docs/operations.md.
+func TestLocateDocsPointerHeadingExists(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "docs", "operations.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	heading := strings.Split(locateDocsPointer, `"`)[1]
+	for line := range strings.Lines(string(doc)) {
+		if strings.HasPrefix(line, "#") && strings.ReplaceAll(strings.TrimSpace(strings.TrimLeft(line, "#")), "`", "") == heading {
+			return
+		}
+	}
+	t.Fatalf("docs/operations.md has no heading %q", heading)
+}
+
+// TestLocateDisk_WarnsWhenOnlyUnusedEntriesNameTheDisk is two guests naming
+// the volume only on unused entries. The warning still fires, and it leaves
+// out the holder sentence, because there is no active slot to show.
+func TestLocateDisk_WarnsWhenOnlyUnusedEntriesNameTheDisk(t *testing.T) {
+	r := &fakeReader{
+		vms: []ClusterVM{{VMID: 777, Node: "pve1"}, {VMID: 888, Node: "pve2"}},
+		configs: map[string]map[string]any{
+			"pve1/777": diskCfg("", map[string]string{"unused0": "a:123/vm-123-disk-0.raw"}),
+			"pve2/888": diskCfg("", map[string]string{"unused3": "a:123/vm-123-disk-0.raw"}),
+		},
+	}
+	result, err := locateDisk(context.Background(), r, "a:123/vm-123-disk-0.raw", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	printDiskLocateWarnings(&stderr, result)
+	if !strings.HasPrefix(stderr.String(), "warning: 2 guests name this disk (active slots: 0, unused entries: 2). The Director's VM CID decides") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "The holder shows") {
+		t.Fatalf("stderr = %q, want no holder sentence when no active slot matches", stderr.String())
 	}
 }
