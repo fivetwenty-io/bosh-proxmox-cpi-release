@@ -43,6 +43,22 @@ func storageRefusalf(format string, args ...any) error {
 	return &storageRefusalError{reason: fmt.Sprintf(format, args...)}
 }
 
+// errRetainedParkerIdentity refuses a retained ephemeral volume whose parker
+// no longer records it under the allocation's retention token, on the node
+// and volume the record names.
+var errRetainedParkerIdentity = errors.New("retained parker identity differs")
+
+// storageFixedRefusals are refusals the CPI wrote as fixed errors rather than
+// as storageRefusalError. They keep that plain type, so delete_vm still wraps
+// them and shows them to the Director exactly as before, and
+// StorageAllocationDecisionFailure prints their fixed text for the CLI.
+var storageFixedRefusals = []error{errRetainedParkerIdentity}
+
+// storageLockWaitReturned is what the CLI prints when a disk operation inside
+// a decision ran out a parker lock wait before it moved the disk. The record
+// stays where it was, so the same decision can run again.
+const storageLockWaitReturned = "a parker lock wait ran out before the disk moved, so nothing was destroyed; run cleanup again once the lock is free"
+
 // StorageAllocationDecisionFailure returns a bounded stage identifier and a
 // safe description of why the decision was refused. A refused audit gate
 // contributes its summary and the runbook pointer, and a CPI-authored refusal
@@ -51,9 +67,11 @@ func storageRefusalf(format string, args ...any) error {
 // settlement write the journal refused names the steps it was settling and
 // the journal's class of failure, which can include the journal's own file
 // path. That is safe because the storage-journal CLI, which runs on the
-// journal's host, is this function's only production caller. Anything else is
-// described by pve.DescribeAuditError, so backend response text, credentials,
-// and resource payloads are never included.
+// journal's host, is this function's only production caller. A fixed refusal
+// in storageFixedRefusals contributes its own text, and so does a parker lock
+// wait that ran out before the disk moved. Anything else is described by
+// pve.DescribeAuditError, so backend response text, credentials, and resource
+// payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
 	class := "identity_or_audit_evidence"
 	var stage *storageCleanupStageError
@@ -71,6 +89,14 @@ func StorageAllocationDecisionFailure(err error) string {
 	var settlement *settlementSaveError
 	if errors.As(err, &settlement) {
 		return class + ": " + log.ScrubMessage(settlement.description())
+	}
+	for _, fixed := range storageFixedRefusals {
+		if errors.Is(err, fixed) {
+			return class + ": " + fixed.Error()
+		}
+	}
+	if isDiskReturnedAfterLockTimeout(err) {
+		return class + ": " + storageLockWaitReturned
 	}
 	if err == nil {
 		return class

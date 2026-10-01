@@ -86,10 +86,12 @@ type explicitCleanupOutcome struct {
 // operator's cleanup on the returned record of VM 777 with no delete_vm
 // first. The cleanup's own audit accepts the move before the cleanup takes
 // the record out of ready_to_return, and the admission it writes retains that
-// move, so the disposal that follows keeps reading the VM as moved. The
-// record must end cleaned, another deployment's create_vm must be admitted,
-// a second cleanup must see the terminal record, and the Director's delete_vm
-// must find nothing left to do, just as for an unmoved VM.
+// move, so the disposal that follows keeps reading the VM as moved. VM 777 is
+// tagged to retain its ephemeral disk, so the first cleanup keeps the volume
+// and stops at vm_deleted_retained, and another deployment's create_vm must
+// be admitted. The second cleanup deletes the retained volume and ends the
+// record cleaned, and the Director's delete_vm must find nothing left to do,
+// just as for an unmoved VM.
 func TestExplicitCleanupOfMovedReturnedVMFinishesLikeItsControl(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -138,7 +140,7 @@ func TestExplicitCleanupOfMovedReturnedVMFinishesLikeItsControl(t *testing.T) {
 				return outcome, explicitAdmissionMoves(t, final)
 			}
 			control, controlMoves := run(t, false)
-			if control.FirstCleanup != "" || control.CleanupState != aj.Cleaned || len(control.Conflicts) != 0 || control.Admission != "" || !strings.Contains(control.SecondCleanup, "allocation already has a terminal disposition") || control.DirectorDelete != "" || control.FinalState != aj.Cleaned || control.GuestRemains {
+			if control.FirstCleanup != "" || control.CleanupState != aj.VMDeletedRetained || len(control.Conflicts) != 0 || control.Admission != "" || control.SecondCleanup != "" || control.DirectorDelete != "" || control.FinalState != aj.Cleaned || control.GuestRemains {
 				t.Fatalf("unmoved control changed: %+v", control)
 			}
 			if len(controlMoves) != 0 {
