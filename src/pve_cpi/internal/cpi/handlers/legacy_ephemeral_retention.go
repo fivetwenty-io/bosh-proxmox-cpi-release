@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -117,9 +118,47 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 			return err
 		}
 		sweepParkerPool(ctx, deps, node, parkerCfg)
-	case identity.holder == nil || !identity.holder.IsParker:
+	case identity.holder == nil:
+		sole, err := legacyUnusedSoleHolder(ctx, deps, node, vmid, volume, identity.volid)
+		if err != nil {
+			return err
+		}
+		if !sole {
+			return fmt.Errorf("retained ephemeral ownership is ambiguous")
+		}
+		parkerCfg := parkerWriteConfigFor(deps)
+		if _, err := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, volume, parkerCfg, parkContext); err != nil {
+			return err
+		}
+		sweepParkerPool(ctx, deps, node, parkerCfg)
+	case !identity.holder.IsParker:
 		return fmt.Errorf("retained ephemeral ownership is ambiguous")
 	}
 	disk := resolvedDisk{diskCID: cid, birth: volume, volid: volume, meta: meta, stableID: meta.ID}
 	return verifyLegacyDiskPreservation(ctx, deps, disk)
+}
+
+// legacyUnusedSoleHolder reports whether this VM holds volume as its own
+// ephemeral disk even though no active slot anywhere names it, so the identity
+// scan found no holder. A retention transfer that stopped after deleting the
+// source slot leaves that state, because PVE turns the deleted slot into an
+// unusedN entry, and so does an operator's detach without force. The volume
+// must carry this VM's ephemeral name, the scan must not have resolved it to
+// another name, and the only reference to it in any guest's current config
+// must be one unusedN key of this VM on this node. Anything else stays
+// ambiguous, because another guest, or a second slot of this one, could be
+// the volume's real owner.
+func legacyUnusedSoleHolder(ctx context.Context, deps Deps, node string, vmid int, volume, resolved string) (bool, error) {
+	if resolved != volume || !pve.IsOwnEphemeralVolume(volume, vmid) {
+		return false, nil
+	}
+	refs, err := pve.FindVolumeReferences(ctx, deps.PVE, volume)
+	if err != nil {
+		return false, err
+	}
+	if len(refs) != 1 {
+		return false, nil
+	}
+	ref := refs[0]
+	return ref.VMID == vmid && ref.Node == node && strings.HasPrefix(ref.Slot, "unused"), nil
 }
