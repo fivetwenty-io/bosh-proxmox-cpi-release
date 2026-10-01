@@ -749,7 +749,7 @@ qm set <N> --scsi<free-slot> <volid>,serial=<bpd-serial>
 
 PVE drops the unused entry when it sees the same volume attached again, and it frees nothing. If the VM is running and disk hotplug is off, the change waits as pending until the VM restarts. Then we retry the failed task or rerun the deploy. `detach_disk` finds the disk by its serial and parks it the usual way, and `delete_vm` can go ahead after that.
 
-A journal-managed disk also stays in `reconciliation_required` after the failed move, at a planned `lifecycle_detach_disk_Nodes_CreateQemuMoveDisk` step. No `storage-journal` command settles that step yet, so leave the VM and its unused entry exactly as they are. `storage-journal audit --summary` shows the allocation and the volume it still holds on the VM.
+A journal-managed disk also stays in `reconciliation_required` after the failed move, at a planned `lifecycle_detach_disk_Nodes_CreateQemuMoveDisk` step. No `storage-journal` command settles that step yet, so leave the VM and its unused entry exactly as they are. `cpi storage-journal audit` lists the allocation as `reconciliation_required`, and its evidence names the volume.
 
 For ordinary drift, run `bosh -d <deployment> cloud-check` to reconcile state. The Director offers to detach the disks and clean up the record. If the deployment can't be recovered, detach the disks with `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
 
