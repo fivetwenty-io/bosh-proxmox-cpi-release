@@ -918,10 +918,11 @@ type CPIConfig struct {
 
 	// ClusterLockTimeoutSec bounds how long the anti-affinity RMW waits to acquire
 	// the cluster lock before returning a retriable error (the BOSH director then
-	// re-drives the operation). It also serves as the lock's TTL: a holder whose
-	// recorded expiry has passed is treated as crashed and its lock is stolen. Only
-	// meaningful when ClusterLockMode is "pool"; 0 resolves to 60s. Validate >= 0
-	// when set. Use ClusterLockTimeoutSecValue().
+	// re-drives the operation). The lock's claim lasts twice this long, and at
+	// least 30 seconds, so below 15 the value changes only the wait. A holder
+	// whose recorded expiry has passed is treated as crashed and its lock is
+	// stolen. Only meaningful when ClusterLockMode is "pool"; 0 resolves to 60s.
+	// Validate >= 0 when set. Use ClusterLockTimeoutSecValue().
 	ClusterLockTimeoutSec int `json:"cluster_lock_timeout_sec,omitempty"`
 
 	// AntiAffinityVerify enables a read-after-write check: after recreating a
