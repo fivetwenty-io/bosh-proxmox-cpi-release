@@ -5,6 +5,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -311,4 +312,113 @@ func encodeAALockComment(owner string, expUnix int64) string {
 // disambiguation supply their own fake.
 func (p *aaLockPools) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
+}
+
+// aaLockClaimExpiry reads the expiry a lock comment records.
+func aaLockClaimExpiry(t *testing.T, comment string) int64 {
+	t.Helper()
+	for _, field := range strings.Fields(comment) {
+		if v, ok := strings.CutPrefix(field, "exp="); ok {
+			exp, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("claim %q has an unreadable expiry: %v", comment, err)
+			}
+			return exp
+		}
+	}
+	t.Fatalf("claim %q records no expiry", comment)
+	return 0
+}
+
+// TestAntiAffinityLockTTLHasAFloor reads the expiry that the anti-affinity
+// lock's claim records. The claim lasts twice cluster_lock_timeout_sec, and
+// never less than 30 seconds, so the grace and the release margin always fit
+// inside it with time left for the read-modify-write.
+func TestAntiAffinityLockTTLHasAFloor(t *testing.T) {
+	for _, tc := range []struct {
+		sec int
+		ttl time.Duration
+	}{
+		{1, 30 * time.Second},
+		{3, 30 * time.Second},
+		{14, 30 * time.Second},
+		{15, 30 * time.Second},
+		{60, 120 * time.Second},
+	} {
+		t.Run(fmt.Sprintf("cluster_lock_timeout_sec=%d", tc.sec), func(t *testing.T) {
+			pools := newAALockPools(nil)
+			deps := aaDepsLock(aaLockConfig("pool", false, tc.sec), newAAStub(), pools)
+			before := time.Now()
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, "web", 101)
+			after := time.Now()
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			t.Cleanup(func() { _ = handle.Release(context.Background()) })
+			exp := aaLockClaimExpiry(t, pools.pools["bosh-lock-aa-web"])
+			if earliest, latest := before.Add(tc.ttl).Unix(), after.Add(tc.ttl).Unix(); exp < earliest || exp > latest {
+				t.Fatalf("the claim expires %ds after the acquire started, want a TTL of %v", exp-before.Unix(), tc.ttl)
+			}
+		})
+	}
+}
+
+// productionClusterLockGrace and productionReleaseMargin are the grace pause
+// the anti-affinity lock takes outside tests and the margin a release then
+// needs before the claim's expiry, which is the steal budget, that grace, and
+// one round trip.
+const (
+	productionClusterLockGrace = 2500 * time.Millisecond
+	productionReleaseMargin    = 2*time.Second + productionClusterLockGrace + 500*time.Millisecond
+)
+
+// TestAntiAffinityLockOutlastsTheGraceAtShortTimeouts covers the anti-affinity
+// lock at small cluster_lock_timeout_sec values, where twice the setting used
+// to be shorter than the grace plus the release margin. The test shortens the
+// grace so it runs fast. What the claim has left when the acquire returns,
+// less the grace this run didn't wait out, is what it would have left under
+// the production grace, and that must still exceed the production release
+// margin. A release right away must delete the sentinel, and at a setting of
+// 1, a second request must not get the lock while the first holds it.
+func TestAntiAffinityLockOutlastsTheGraceAtShortTimeouts(t *testing.T) {
+	const grace = 20 * time.Millisecond
+	t.Cleanup(pve.SetClusterLockGraceForTest(grace))
+	sentinel := pve.ClusterLockPoolName(antiAffinityLockPrefix + "web")
+	for _, sec := range []int{1, 2, 3, 4, 60} {
+		t.Run(fmt.Sprintf("cluster_lock_timeout_sec=%d", sec), func(t *testing.T) {
+			pools := newAALockPools(nil)
+			deps := aaDepsLock(aaLockConfig("pool", false, sec), newAAStub(), pools)
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, "web", 101)
+			if err != nil {
+				t.Fatalf("first acquire: %v", err)
+			}
+			left := time.Until(handle.WindowDeadline(0)) - (productionClusterLockGrace - grace)
+			if left <= productionReleaseMargin {
+				t.Fatalf("under the production grace the claim would have %v left when the acquire returns, want more than %v",
+					left.Round(time.Millisecond), productionReleaseMargin)
+			}
+			if sec == 1 {
+				claim := pools.pools[sentinel]
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				// The second request stops at its first poll wait, once it
+				// has found the sentinel taken and read the claim.
+				pools.createErr = func(string) error { cancel(); return nil }
+				second, err := acquireAntiAffinityLock(ctx, deps, "web", 102)
+				pools.createErr = nil
+				if second != nil || err == nil {
+					t.Fatalf("a second request took the lock while the first held it: err=%v", err)
+				}
+				if pools.pools[sentinel] != claim {
+					t.Fatalf("the second request replaced the first request's claim %q with %q", claim, pools.pools[sentinel])
+				}
+			}
+			if err := handle.Release(t.Context()); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+			if _, standing := pools.pools[sentinel]; standing {
+				t.Fatal("a release right after the acquire left the sentinel standing until its claim expired")
+			}
+		})
+	}
 }

@@ -86,6 +86,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - When a parker's protection restore is cut off, its error now says that the disk transfer or deletion has an unknown outcome when that change ended without a verdict from PVE, where it used to say that the change failed. It says the change failed only when PVE answered with a failure.
 
+- When a VM's metadata lock gives up because the request's deadline left no time to wait, the read that names the holder now ends 5 seconds before that deadline, so the error that quotes the claim reaches the Director instead of a generic timeout. With less than 5 seconds left, the CPI skips the read and says the claim couldn't be read.
+
+- The anti-affinity lock's claim now lasts at least 30 seconds however low `pve.cluster_lock_timeout_sec` is set, and the wait still follows the setting. The claim used to last twice the setting, and at a setting of 4 or less, the pause each acquire takes after its create and the margin a release leaves before a claim's expiry used up most or all of that time. At 1, a second request could take the lock while the first still held it, and from 2 to 4, the release left the lock pool standing until the claim expired.
+
 ## [0.8.0] - 2026-09-15
 
 ### Added

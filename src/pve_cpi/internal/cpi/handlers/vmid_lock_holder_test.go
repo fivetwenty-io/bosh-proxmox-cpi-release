@@ -81,7 +81,9 @@ func TestVMIDLockNoTimeToWaitSaysSo(t *testing.T) {
 			if tc.claim != "" {
 				pools.pools["bosh-lock-vm-4242"] = tc.claim
 			}
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			// Twelve seconds is inside the lock's margin, so the acquire does
+			// not wait, and it still leaves the holder read its time.
+			ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
 			defer cancel()
 			ran := false
 			err := withVMIDLock(ctx, pools, 4242, "set_vm_metadata/4242", nil, func() error {
@@ -135,6 +137,85 @@ func TestVMIDLockHeldErrorWhenTheClaimCannotBeRead(t *testing.T) {
 			}
 			if !errors.Is(err, pve.ErrClusterLockTimeout) {
 				t.Fatalf("error %q lost its timeout cause", err)
+			}
+		})
+	}
+}
+
+// hangingCommentPools stands for a PVE node that stops answering. Every
+// comment read holds until its context ends, and it records the deadline the
+// read carried. So that a read nobody bounded cannot stall the test, it also
+// gives up a moment after the request's own deadline.
+type hangingCommentPools struct {
+	pve.PoolService
+	requestDeadline time.Time
+	creates         int
+	deadlines       []time.Time
+}
+
+func (p *hangingCommentPools) CreatePool(context.Context, string, string) error {
+	p.creates++
+	return errors.New("create pool failed: pool 'bosh-lock-vm-4242' already exists")
+}
+
+func (p *hangingCommentPools) GetPoolComment(ctx context.Context, _ string) (string, bool, error) {
+	deadline, _ := ctx.Deadline()
+	p.deadlines = append(p.deadlines, deadline)
+	select {
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	case <-time.After(time.Until(p.requestDeadline.Add(100 * time.Millisecond))):
+		return "", false, errors.New("the read outlived the request")
+	}
+}
+
+// TestVMIDLockHolderReadEndsBeforeTheRequestDeadline covers the read that
+// names a VM lock's holder after the request's deadline left no time to wait.
+// That read runs on a detached context, and it must still end the completion
+// allowance before the request's deadline, so the error that explains the
+// timeout reaches the Director before the dispatcher gives up on the handler.
+// With less than the allowance left, the read is skipped.
+func TestVMIDLockHolderReadEndsBeforeTheRequestDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		left     time.Duration
+		wantRead bool
+	}{
+		{"less than the allowance left", 3 * time.Second, false},
+		{"a moment more than the allowance left", pve.ClusterLockCompletionAllowance + 200*time.Millisecond, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), tc.left)
+			defer cancel()
+			deadline, _ := ctx.Deadline()
+			pools := &hangingCommentPools{requestDeadline: deadline}
+			err := withVMIDLock(ctx, pools, 4242, "set_vm_metadata/4242", nil, func() error {
+				t.Fatal("the body ran without the lock")
+				return nil
+			})
+			returned := time.Now()
+			if !returned.Before(deadline) {
+				t.Fatalf("the handler returned %v after the request's deadline", returned.Sub(deadline))
+			}
+			if pools.creates != 0 {
+				t.Fatalf("the acquire created the sentinel %d times with no time to wait", pools.creates)
+			}
+			switch {
+			case !tc.wantRead && len(pools.deadlines) != 0:
+				t.Fatalf("the holder was read %d times with less than the allowance left", len(pools.deadlines))
+			case tc.wantRead && len(pools.deadlines) != 1:
+				t.Fatalf("the holder was read %d times, want once", len(pools.deadlines))
+			case tc.wantRead && pools.deadlines[0].After(deadline.Add(-pve.ClusterLockCompletionAllowance)):
+				t.Fatalf("the holder read ran to %v before the request's deadline, want at least %v",
+					deadline.Sub(pools.deadlines[0]), pve.ClusterLockCompletionAllowance)
+			}
+			want := `withVMIDLock: lock "bosh-lock-vm-4242" was not waited for, because the request's deadline left no time to wait, and its claim could not be read`
+			if err == nil || !strings.HasPrefix(err.Error(), want) {
+				t.Fatalf("error = %v, want it to start with %q", err, want)
+			}
+			if !errors.Is(err, pve.ErrClusterLockNoTimeToWait) || !errors.Is(err, pve.ErrClusterLockTimeout) ||
+				!cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+				t.Fatalf("error %q lost its retriable timeout cause", err)
 			}
 		})
 	}

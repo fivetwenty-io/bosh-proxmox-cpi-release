@@ -784,8 +784,10 @@ properties:
     description: |
       Bounds how long the anti-affinity read-modify-write waits to acquire the
       cluster lock before returning a retriable error (the BOSH director then
-      re-drives the operation). It also serves as the lock's TTL: a holder whose
-      recorded expiry has passed is treated as crashed and its lock is stolen.
+      re-drives the operation). The lock's claim lasts twice this long, and at
+      least 30 seconds, so below 15 the value changes only the wait. A holder
+      whose recorded expiry has passed is treated as crashed, and its lock is
+      stolen.
       Only meaningful when cluster_lock_mode is "pool"; 0 resolves to 60 seconds.
     default: 0
   pve.antiaffinity_verify:

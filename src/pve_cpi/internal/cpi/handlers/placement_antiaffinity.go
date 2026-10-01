@@ -26,6 +26,18 @@ func clusterLockOwner(key string, vmid int) string {
 // antiAffinityLockPrefix prefixes an instance group's anti-affinity lock name.
 const antiAffinityLockPrefix = "aa-"
 
+// antiAffinityLockMinTTL is the shortest claim the anti-affinity lock records,
+// whatever cluster_lock_timeout_sec says. Part of every claim is spent before
+// the read-modify-write starts or after it must stop: up to a second lost when
+// the expiry is cut to whole seconds, the create and its admission, the grace
+// pause, two confirming reads, and the margin a release leaves before the
+// expiry. That comes to about ten seconds, which is more than twice a small
+// setting. A claim that expires inside the grace can be stolen while its
+// holder still runs, and one inside the release margin is never deleted, so the lock
+// pool stands until the claim expires. Thirty seconds leaves about twenty for
+// the read-modify-write.
+const antiAffinityLockMinTTL = 30 * time.Second
+
 // haRuleNamePrefix namespaces every CPI-managed HA anti-affinity rule so a
 // cluster-wide scan can find and clean them by vmid without knowing the group.
 const haRuleNamePrefix = "bosh-aa-"
@@ -142,11 +154,12 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 	// TTL and timeout are deliberately decoupled: TTL is 2× the acquire
 	// timeout so a holder whose RMW runs for the full timeout duration is not
 	// stolen mid-flight by a concurrent waiter. A crashed holder (RMW aborted,
-	// release never called) is reclaimed at 2×timeout — acceptable for the
-	// advisory lock use-case. The 2× factor is a sane default; the exact ratio
-	// is tunable by adjusting cluster_lock_timeout_sec (timeout) independently.
+	// release never called) is reclaimed once the TTL lapses, which is
+	// acceptable for the advisory lock use-case. The TTL never drops below
+	// antiAffinityLockMinTTL, which raises it only for a setting under 15
+	// seconds, and the wait stays the setting either way.
 	timeout := time.Duration(deps.Config.ClusterLockTimeoutSecValue()) * time.Second
-	ttl := 2 * timeout
+	ttl := max(2*timeout, antiAffinityLockMinTTL)
 	owner := clusterLockOwner(groupKey, vmid)
 	// Two holders at once would place two instances of a group on one node,
 	// so this lock pays the grace pause on every create to narrow that.

@@ -37,7 +37,8 @@ var vmidLockTimeout = 10 * time.Second
 
 // vmidLockHolderReadTimeout bounds the read that names the holder after the
 // wait for a VMID lock runs out. It runs on a detached context, because the
-// request's own context may be what ran out.
+// request's own context may be what ran out. vmidLockHolderReadContext also
+// ends it before the request's deadline.
 const vmidLockHolderReadTimeout = 10 * time.Second
 
 // vmidLockClaimLimit caps how much of a sentinel comment the timeout error
@@ -133,19 +134,27 @@ func withVMIDLock(
 // vmidLockHeldError turns a VMID lock wait that ran out into an error that
 // names the holder, so an operator can see which host and process hold the
 // lock and when the claim lapses without reading the pool by hand. It reads the
-// sentinel once more on a detached, bounded context and quotes the claim's
-// owner token and expiry. When the sentinel is gone by then, the error says the
-// holder released it; when the read fails, the error says the claim could not
-// be read. The timeout stays the cause in every case, so the error keeps its
-// retriable type and still matches pve.ErrClusterLockTimeout.
+// sentinel once more on the context vmidLockHolderReadContext returns and
+// quotes the claim's owner token and expiry. When the sentinel is gone by then,
+// the error says the holder released it; when the read fails or no time is
+// left for it, the error says the claim could not be read. The timeout stays
+// the cause in every case, so the error keeps its retriable type and still
+// matches pve.ErrClusterLockTimeout.
 //
 // An acquire whose request deadline left no time to wait never waited, so the
 // error says that instead of describing a wait, and it still quotes the claim.
 func vmidLockHeldError(ctx context.Context, pools pve.PoolService, lockName string, timeoutErr error) error {
 	pool := pve.ClusterLockPoolName(lockName)
-	readCtx, cancel := detachedContext(ctx, vmidLockHolderReadTimeout)
+	readCtx, cancel := vmidLockHolderReadContext(ctx)
 	defer cancel()
-	comment, found, readErr := pools.GetPoolComment(readCtx, pool)
+	var comment string
+	var found bool
+	// A read with no time left is skipped, and its context's own error says
+	// the claim could not be read.
+	readErr := readCtx.Err()
+	if readErr == nil {
+		comment, found, readErr = pools.GetPoolComment(readCtx, pool)
+	}
 	var msg string
 	switch noWait := fmt.Sprintf("withVMIDLock: lock %q was not waited for, because the request's deadline left no time to wait", pool); {
 	case errors.Is(timeoutErr, pve.ErrClusterLockNoTimeToWait) && readErr != nil:
@@ -162,6 +171,27 @@ func vmidLockHeldError(ctx context.Context, pools pve.PoolService, lockName stri
 		msg = fmt.Sprintf("withVMIDLock: lock %q is held by %s", pool, describeVMIDLockClaim(comment))
 	}
 	return cpierrors.WrapAs(timeoutErr, cpierrors.TypeRetriableCloud, msg)
+}
+
+// vmidLockHolderReadContext returns the context for the holder read. It is
+// detached from the request and bounded at vmidLockHolderReadTimeout, and when
+// the request has a deadline, it also ends pve.ClusterLockCompletionAllowance
+// before that deadline. The lock's margin reserves that allowance for what the
+// caller still does after a lock wait gives up. A read that ran past the
+// request's deadline would also let the dispatcher replace vmidLockHeldError's
+// error with its generic timeout, so the holder's claim would never reach the
+// Director. The returned context is already done when no time is left.
+func vmidLockHolderReadContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	readCtx, cancel := detachedContext(ctx, vmidLockHolderReadTimeout)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return readCtx, cancel
+	}
+	bounded, boundedCancel := context.WithDeadline(readCtx, deadline.Add(-pve.ClusterLockCompletionAllowance))
+	return bounded, func() {
+		boundedCancel()
+		cancel()
+	}
 }
 
 // describeVMIDLockClaim renders a sentinel comment of the form
