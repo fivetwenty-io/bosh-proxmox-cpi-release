@@ -45,7 +45,7 @@ func beginStorageLifecycleContext(ctx context.Context, handle *aj.Handle, operat
 	if err := storageLifecycleEvidence(record, ownership, false); err != nil {
 		return nil, err
 	}
-	if err := storageOperationSettled(ctx, caller, record); err != nil {
+	if err := storageOperationSettled(ctx, caller, record, nil); err != nil {
 		return nil, err
 	}
 	session := &storageLifecycle{handle: handle, operation: operation, adopted: record.State == aj.Adopted}

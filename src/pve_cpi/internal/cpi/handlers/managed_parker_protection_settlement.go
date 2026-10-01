@@ -273,7 +273,7 @@ func settlePlannedProtectionSteps(ctx context.Context, client pve.Client, handle
 		}
 		reasons[id] = reason
 	}
-	settled := false
+	var settled []aj.Step
 	for i := range record.Steps {
 		step := &record.Steps[i]
 		if !isParkerProtectionStep(record, *step) {
@@ -295,11 +295,11 @@ func settlePlannedProtectionSteps(ctx context.Context, client pve.Client, handle
 		if step.Target.IntendedVolume != "" && !containsString(step.VolIDs, step.Target.IntendedVolume) {
 			step.VolIDs = append(step.VolIDs, step.Target.IntendedVolume)
 		}
-		settled = true
+		settled = append(settled, *step)
 	}
-	if settled {
+	if len(settled) > 0 {
 		if saveErr := handle.Save(record); saveErr != nil {
-			return nil, saveErr
+			return nil, refusedSettlementSave("parker protection", settled, saveErr)
 		}
 	}
 	return reasons, nil

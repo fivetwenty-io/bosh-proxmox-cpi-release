@@ -63,9 +63,9 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 	}
 	record = handle.Record()
 	phase = "pending_mutation_settlement"
-	ctx, settlement, err := admitStorageCleanupSettlement(ctx, deps, record, decision)
+	ctx, settlement, err := admitStorageCleanupSettlement(ctx, deps, record, decision, gaps)
 	if err != nil {
-		return result, storageDecisionSourceError(cleanupNameUnsettledLockStep(record, gaps, err))
+		return result, storageDecisionSourceError(err)
 	}
 	phase = "historical_audit"
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
@@ -149,23 +149,6 @@ func storageAuditAllocationMoves(r StorageAllocationAudit, allocationID string) 
 		}
 	}
 	return moves
-}
-
-// cleanupNameUnsettledLockStep adds to the admission's refusal the lock step
-// that settlement left planned and the reason its sentinel read failed, the
-// way adopt names them. The admission never admits a planned lock step, so
-// whenever settlement leaves one planned, the admission refuses the record and
-// that step is part of the reason. Any other error goes back as it is.
-func cleanupNameUnsettledLockStep(record aj.Record, gaps map[string]error, err error) error {
-	var refusal *storageRefusalError
-	if len(gaps) == 0 || !errors.As(err, &refusal) {
-		return err
-	}
-	text := unsettledStepText(record, gaps, func(step aj.Step) bool { return gaps[step.ID] == nil })
-	if text == "" {
-		return err
-	}
-	return storageRefusal(refusal.reason + "; " + text)
 }
 
 func retainedCleanupDecisionAdmission(ctx context.Context, deps Deps, record aj.Record, report StorageAllocationAudit, decision StorageAllocationDecision) (aj.Verification, error) {
