@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,8 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 const (
@@ -35,13 +38,16 @@ var keepNow = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 // the /cluster/resources index, and a log of every config read, so a test can
 // prove which source reads ran.
 type keepWorld struct {
-	mu       sync.Mutex
-	configs  map[string]map[int]map[string]any
-	errs     map[string]error
-	index    []map[string]any
-	nodesErr error
-	reads    []string
-	written  string
+	mu      sync.Mutex
+	configs map[string]map[int]map[string]any
+	errs    map[string]error
+	// pendingErrs fails the pending-view read of a guest, keyed node/vmid,
+	// while the config read of the same guest still answers.
+	pendingErrs map[string]error
+	index       []map[string]any
+	nodesErr    error
+	reads       []string
+	written     string
 	// pending holds, per node and VM, each key whose delete is pending with
 	// its current value. The config read leaves those keys out, the way the
 	// config endpoint does, and the pending endpoint reports them.
@@ -71,7 +77,7 @@ type keepWorldClient struct {
 func (keepWorldClient) StorageAuditVisibility(context.Context) error { return nil }
 
 func newKeepWorld() *keepWorld {
-	return &keepWorld{configs: map[string]map[int]map[string]any{"n1": {}, "n2": {}}, errs: map[string]error{}}
+	return &keepWorld{configs: map[string]map[int]map[string]any{"n1": {}, "n2": {}}, errs: map[string]error{}, pendingErrs: map[string]error{}}
 }
 
 func (w *keepWorld) client() Client {
@@ -168,7 +174,7 @@ func (w *keepWorld) client() Client {
 					return &resp, nil
 				},
 				listQemuPendingFn: func(ctx context.Context, node, vmid string) (*sdknodes.ListQemuPendingResponse, error) {
-					resp, err := PendingFromConfigRead(ctx, qemuSvc.Config, node, vmid)
+					resp, err := PendingFromConfigRead(ctx, w.pendingRead(qemuSvc.Config), node, vmid)
 					if err != nil {
 						return nil, err
 					}
@@ -197,6 +203,22 @@ func (w *keepWorld) client() Client {
 		},
 		qemuSvc: qemuSvc,
 	}}
+}
+
+// pendingRead wraps a config read for the pending endpoint, so a guest in
+// pendingErrs fails there and nowhere else.
+func (w *keepWorld) pendingRead(
+	read func(context.Context, string, int) (map[string]any, error),
+) func(context.Context, string, int) (map[string]any, error) {
+	return func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		w.mu.Lock()
+		err := w.pendingErrs[fmt.Sprintf("%s/%d", node, vmid)]
+		w.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return read(ctx, node, vmid)
+	}
 }
 
 // sourceReads returns the config reads that were not of the parker.
@@ -698,5 +720,133 @@ func TestKeepRule_ClassifiesEachStorageOncePerPass(t *testing.T) {
 	}
 	if w.storageReads != 1 {
 		t.Fatalf("storage definition reads = %d, want one for the pass", w.storageReads)
+	}
+}
+
+// landingFixture is a parker at its budget whose stale transfer record would
+// fit the store only if it were released.
+type landingFixture struct {
+	stranded parkerProvEntry
+	pctx     ParkContext
+	newEntry parkerProvEntry
+	cfg      ParkerConfig
+}
+
+// fillLandingParker installs parker 90000 on w with slot as its scsi0 drive
+// (nothing when slot is nil), the stale transfer record, the other records, and
+// enough live records to fill the budget. The store fits the new record
+// without the stale one and overflows with it.
+func fillLandingParker(t *testing.T, w *keepWorld, slot any, other map[string]parkerProvEntry) landingFixture {
+	t.Helper()
+	fx := landingFixture{
+		stranded: strandedIntent(2 * time.Hour),
+		pctx:     ParkContext{DiskCID: "pvd-" + strings.Repeat("N", 120), SourceVMCID: "701", StableID: "bpd-ffeeddccbbaa9988"},
+		cfg:      provTestClock(keepNow),
+	}
+	fx.stranded.DiskCID = "pvd-" + strings.Repeat("S", 700)
+	widest := fmt.Sprintf("scsi%d", parkerMaxSlots-1)
+	fx.newEntry = buildParkerProvEntry(context.Background(), "n1", "a:701/vm-701-disk-0.raw", widest, fx.cfg, fx.pctx)
+
+	parker := map[string]any{"tags": ParkerTag}
+	if slot != nil {
+		parker["scsi0"] = slot
+	}
+	disks := maps.Clone(other)
+	if disks == nil {
+		disks = map[string]parkerProvEntry{}
+	}
+	size := func(withStranded bool) int {
+		all := map[string]parkerProvEntry{fx.pctx.StableID: fx.newEntry}
+		maps.Copy(all, disks)
+		if withStranded {
+			all[keepKey] = fx.stranded
+		}
+		return len(provSentinel(t, all))
+	}
+	for i := 1; size(true) <= parkerDescriptionBudget; i++ {
+		volid := fmt.Sprintf("a:90000/vm-90000-disk-%d.raw", i)
+		parker[fmt.Sprintf("scsi%d", i)] = volid + ",size=1G"
+		disks[fmt.Sprintf("bpd-%016x", i)] = parkerProvEntry{DiskCID: "pvd-" + strings.Repeat("L", 40), ParkedAt: keepNow.Format(time.RFC3339), Node: "n1", Volid: volid, Slot: fmt.Sprintf("scsi%d", i)}
+	}
+	if size(false) > parkerDescriptionBudget {
+		t.Fatalf("fixture: the store does not fit the new record even without the stranded intent (%d bytes)", size(false))
+	}
+	disks[keepKey] = fx.stranded
+	parker["description"] = provSentinel(t, disks)
+	w.configs["n1"][keepParkerVMID] = parker
+	return fx
+}
+
+// warnedAboutKey reports whether obs holds a WARN entry for the record key.
+func warnedAboutKey(obs *log.Observer, key string) bool {
+	for _, entry := range obs.All() {
+		if entry.Level == log.LevelWarn && entry.Attrs["key"] == key {
+			return true
+		}
+	}
+	return false
+}
+
+// TestKeepRule_HoldsAnUnclaimedLandingPastTheHour covers the record a transfer
+// leaves when its move landed after the answer was lost. The volume was
+// renamed onto the parker and the serial was never written, so the source
+// names nothing, the old volume is proven gone, and the record is the only
+// link to the disk's stable ID. It's kept while its slot holds a volume named
+// for the parker with no serial and no other record names that volume, and it's
+// kept when the parker read that would tell fails. Every row also fills the
+// parker to the budget, so a kept record shows up as a refusal from both the
+// capacity probe and the write, and a released one as room for both.
+func TestKeepRule_HoldsAnUnclaimedLandingPastTheHour(t *testing.T) {
+	t.Parallel()
+	const landed = "a:90000/vm-90000-disk-0.raw"
+	otherLive := parkerProvEntry{DiskCID: "pvd-other", ParkedAt: keepNow.Format(time.RFC3339), Node: "n1", Volid: landed, Slot: "scsi0"}
+	rows := []struct {
+		name  string
+		slot  any
+		other map[string]parkerProvEntry
+		kept  bool
+		// viewsErr fails the parker's pending-view read, so the rule can't
+		// tell whether the slot holds a landing.
+		viewsErr bool
+	}{
+		{name: "slot holds an unserialed parker-named volume", slot: landed + ",size=5G", kept: true},
+		{name: "recorded slot is empty", slot: nil},
+		{name: "slot volume carries a stable-ID serial", slot: landed + ",serial=" + keepKey + ",size=5G"},
+		{name: "another live record names the slot volume", slot: landed + ",size=5G", other: map[string]parkerProvEntry{"bpd-8899aabbccddeeff": otherLive}},
+		{name: "parker read fails", slot: landed + ",size=5G", kept: true, viewsErr: true},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			t.Parallel()
+			w := newKeepWorld()
+			if row.viewsErr {
+				w.pendingErrs[fmt.Sprintf("n1/%d", keepParkerVMID)] = &sdkerrors.APIError{HTTPCode: 500, Message: "got timeout"}
+			}
+			fx := fillLandingParker(t, w, row.slot, row.other)
+
+			roomErr := parkerProvenanceRoom(context.Background(), w.client(), "n1", keepParkerVMID, "a:701/vm-701-disk-0.raw", fx.cfg, fx.pctx)
+			logger, obs := log.NewObservedLogger(log.LevelWarn)
+			writeErr := writeParkerProvenance(context.Background(), w.client(), logger, "n1", keepParkerVMID, fx.pctx.StableID, fx.newEntry, fx.cfg)
+			desc, _ := w.configs["n1"][keepParkerVMID]["description"].(string)
+			_, survived := provRecords(t, desc)[keepKey]
+			if warned := warnedAboutKey(obs, keepKey); warned != row.viewsErr {
+				t.Fatalf("warned=%v, want %v; only a read that failed logs that the record was kept", warned, row.viewsErr)
+			}
+			if !row.kept {
+				if roomErr != nil || writeErr != nil {
+					t.Fatalf("probe=%v write=%v; both must find room once the record is released", roomErr, writeErr)
+				}
+				if survived {
+					t.Fatal("the transfer record was kept although its slot holds no unclaimed landing")
+				}
+				return
+			}
+			if !errors.Is(roomErr, ErrProvenanceFull) || !errors.Is(writeErr, ErrProvenanceFull) {
+				t.Fatalf("probe=%v write=%v; both must refuse, because the kept record fills the store", roomErr, writeErr)
+			}
+			if !survived {
+				t.Fatal("the transfer record was released although its slot holds an unclaimed landing or the read failed")
+			}
+		})
 	}
 }
