@@ -569,6 +569,10 @@ type storageJournalAuditReport struct {
 	// Attention lists the records the text summary prints in full. The JSON
 	// output already carries every record, so it leaves this out.
 	Attention []storageJournalAttention `json:"-"`
+	// PlannedSteps lists every planned step in the journal for the text
+	// summary. The JSON output already carries each record's steps, so it
+	// leaves this out too.
+	PlannedSteps []storageJournalPlannedStep `json:"-"`
 }
 
 // writeStorageJournalAudit prints the audit as JSON, or as a text summary
@@ -597,7 +601,7 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 			Charging:  handlers.StorageAllocationCharging(r.State),
 		})
 	}
-	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport, storageJournalAttentionRecords(report)}
+	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport, storageJournalAttentionRecords(report), storageJournalPlannedSteps(report)}
 	if indexErr != nil {
 		output.IndexFinding = "generation index invalid or unavailable; record listing does not establish healthy authority"
 	}

@@ -50,6 +50,7 @@ func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport)
 		lines = append(lines, "runbook: "+handlers.StorageAuditRunbook)
 	}
 	lines = append(lines, storageJournalAttentionLines(output.Attention, audit.Evidence)...)
+	lines = append(lines, storageJournalPlannedStepLines(output.PlannedSteps)...)
 	lines = append(lines, storageJournalChargingLine(output.ChargingSummary))
 	lines = append(lines, storageJournalSkippedLines(audit)...)
 	return writeStorageJournalLines(w, lines)
@@ -161,6 +162,56 @@ func storageJournalAttentionLines(records []storageJournalAttention, evidence []
 		for _, item := range own {
 			lines = append(lines, "evidence: "+storageJournalAttentionEvidence(item))
 		}
+	}
+	return lines
+}
+
+// storageJournalPlannedStep is one planned step the text summary prints. A
+// parker protection step also carries the parker's VMID and node.
+type storageJournalPlannedStep struct {
+	RecordID, StepID, Kind string
+	Parker                 bool
+	ParkerVMID             int
+	Node                   string
+}
+
+// storageJournalPlannedSteps finds every planned step in the journal, in
+// record ID order and then step order. A planned step is a mutation whose
+// outcome the journal never settled. Adopt and cleanup act on any record they
+// admit, so an operator who is rolling back reads this list instead of running
+// them to find these records. A parker protection step
+// is recognized by the one definition the allocation guard uses.
+func storageJournalPlannedSteps(report handlers.StorageAllocationAudit) []storageJournalPlannedStep {
+	var steps []storageJournalPlannedStep
+	for i := range report.Records {
+		record := report.Records[i]
+		for j := range record.Steps {
+			step := &record.Steps[j]
+			if step.State != aj.Planned {
+				continue
+			}
+			planned := storageJournalPlannedStep{RecordID: record.ID, StepID: step.ID, Kind: step.Kind}
+			if handlers.IsParkerProtectionStep(record, *step) {
+				planned.Parker, planned.ParkerVMID, planned.Node = true, step.Target.VMID, step.Target.Node
+			}
+			steps = append(steps, planned)
+		}
+	}
+	sort.SliceStable(steps, func(i, j int) bool { return steps[i].RecordID < steps[j].RecordID })
+	return steps
+}
+
+// storageJournalPlannedStepLines prints one line for each planned step. The
+// line names the record, the step, and its kind, and a parker protection step
+// also names the parker and its node.
+func storageJournalPlannedStepLines(steps []storageJournalPlannedStep) []string {
+	lines := make([]string, 0, len(steps))
+	for _, step := range steps {
+		line := fmt.Sprintf("planned step: record=%s step=%s kind=%s", step.RecordID, step.StepID, step.Kind)
+		if step.Parker {
+			line += fmt.Sprintf(" parker_vmid=%d node=%s", step.ParkerVMID, step.Node)
+		}
+		lines = append(lines, line)
 	}
 	return lines
 }
