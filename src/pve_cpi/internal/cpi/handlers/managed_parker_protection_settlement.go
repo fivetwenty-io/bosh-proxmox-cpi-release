@@ -123,10 +123,11 @@ func lifecycleStepParameters(key string, fields map[string]any) json.RawMessage 
 	return nil
 }
 
-// isParkerProtectionStep reports whether step is a planned protection-only
+// IsParkerProtectionStep reports whether step is a planned protection-only
 // configuration write of the active attempt, read from its recorded
-// parameters.
-func isParkerProtectionStep(record aj.Record, step aj.Step) bool {
+// parameters. It is exported so the audit summary in cmd/cpi decides through
+// the same rule the settler does.
+func IsParkerProtectionStep(record aj.Record, step aj.Step) bool {
 	if step.Attempt != record.ActiveAttempt() || step.State != aj.Planned || step.Target.VMID <= 0 {
 		return false
 	}
@@ -276,7 +277,7 @@ func settlePlannedProtectionSteps(ctx context.Context, client pve.Client, handle
 	var settled []aj.Step
 	for i := range record.Steps {
 		step := &record.Steps[i]
-		if !isParkerProtectionStep(record, *step) {
+		if !IsParkerProtectionStep(record, *step) {
 			continue
 		}
 		if !recordNamesParker(record, step.Target.VMID) {
@@ -326,7 +327,7 @@ func protectionPendingOr(record aj.Record, gaps map[string]error, refusal error)
 			continue
 		}
 		var gap *protectionSettlementGap
-		if !isParkerProtectionStep(record, *step) || !errors.As(gaps[step.ID], &gap) {
+		if !IsParkerProtectionStep(record, *step) || !errors.As(gaps[step.ID], &gap) {
 			return refusal
 		}
 		pending = true

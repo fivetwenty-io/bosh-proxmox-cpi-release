@@ -299,7 +299,7 @@ func (c *admissionCutOff) plannedRestore(t *testing.T) (aj.Step, bool) {
 	record := c.record(t)
 	for i := range record.Steps {
 		step := &record.Steps[i]
-		if step.Target.VMID == c.parker && step.State == aj.Planned && isParkerProtectionStep(record, *step) &&
+		if step.Target.VMID == c.parker && step.State == aj.Planned && IsParkerProtectionStep(record, *step) &&
 			string(step.Parameters) == `{"kind":"parker_protection_on","version":1}` {
 			return *step, true
 		}
