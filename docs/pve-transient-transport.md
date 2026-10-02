@@ -10,7 +10,7 @@ The shape pveproxy returns to the client depends on where the worker died:
 
 - **Mid-response** → empty body and a TCP RST. SDKs that expect JSON report it as `EOF` or `failed to parse response`.
 
-- **Before accepting the request** → pveproxy retries the backend, fails to connect, and emits its non-standard **HTTP 596** ("backend gone") to the client.
+- **While pveproxy forwards the request** → the call breaks after pveproxy has connected to the worker, while it sends the request or reads the reply, and pveproxy relays its HTTP client's non-standard **HTTP 596** to the client. The worker may already have the request, so the CPI treats a 596 as unanswered, as `pveAnswered` in `internal/pve/disk_transfer.go` does. When pveproxy can't connect to a worker at all, it sends **HTTP 595** instead, which is the connect failure, and nothing reached the backend.
 
 - **During TLS handshake** → SDK reports `connection refused` or `tls: read on closed connection`.
 
@@ -46,7 +46,7 @@ Observed at Task 343 (cf deploy retry):
 13:15:44 pve pvedaemon[5599]: worker 1106002 started
 ```
 
-Two in-flight `create_vm` POSTs riding worker 1072563 died at exactly that timestamp — one with HTTP 596 (POST never reached the new worker), one with auth-EOF (login response truncated).
+Two in-flight `create_vm` POSTs riding worker 1072563 died at exactly that timestamp — one with HTTP 596 (the forwarded call broke, so the CPI couldn't tell whether the worker had the request), one with auth-EOF (login response truncated).
 
 ## The retry strategy
 
