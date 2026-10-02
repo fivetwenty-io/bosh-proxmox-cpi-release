@@ -1066,9 +1066,9 @@ func TestDetachTailRenamedOldNameHeldByAnotherDirector(t *testing.T) {
 // removes only the renamed disk's allocation entry and leaves the legacy
 // disk's notes, slot, and volume byte for byte as they were. delete_disk then
 // destroys the renamed disk's landed volume, which is the data the Director
-// asked to delete. The completion audit still counts the legacy disk's
-// serial-less volume under the old name as the renamed disk's artifact, so the
-// record stays in reconciliation_required, as it does today.
+// asked to delete. The move that renamed the disk is observed, so the
+// completion audit no longer counts the legacy disk's serial-less volume under
+// the old name as the renamed disk's artifact, and the record ends Deleted.
 func TestDetachTailRenamedOldNameHeldByLegacyDisk(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f, key, entry := tailManagedOnDiskZero(t)
@@ -1081,37 +1081,21 @@ func TestDetachTailRenamedOldNameHeldByLegacyDisk(t *testing.T) {
 	if err := pve.SetVMDiskOptOverlay(ctx, f.client, "n1", 777, f.volume, map[string]string{"cache": "none"}); err != nil {
 		t.Fatal(err)
 	}
-	before := oldNameHolding(t, f, "")
-	if len(before) != 4 {
-		t.Fatalf("777 keeps %v for the legacy disk on %s, want its attached-disk entry, overlay, slot, and volume", before, f.volume)
+	held := oldNameHolding(t, f, "")
+	if len(held) != 4 {
+		t.Fatalf("777 keeps %v for the legacy disk on %s, want its attached-disk entry, overlay, slot, and volume", held, f.volume)
 	}
-	volumesBefore := volumeNames(f)
-	_, err := HandleDeleteDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-	if err == nil || !strings.Contains(err.Error(), "managed disk artifact or provenance remains; reconciliation required") {
-		t.Fatalf("delete_disk with a legacy disk on the old name: err = %v, want the completion audit's refusal", err)
+	before := captureRenamedNameState(t, f)
+	if _, err := HandleDeleteDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{}); err != nil {
+		t.Fatalf("delete_disk with a legacy disk on the old name: %v", err)
 	}
 	if notes := notesFiledUnder(t, f.client.state.configs[777], key); len(notes) != 0 {
 		t.Fatalf("777 still files %v under the renamed disk's serial", notes)
 	}
-	if after := oldNameHolding(t, f, ""); fmt.Sprint(after) != fmt.Sprint(before) {
-		t.Fatalf("777 keeps %v for the legacy disk on the old name, want %v", after, before)
+	if after := oldNameHolding(t, f, ""); fmt.Sprint(after) != fmt.Sprint(held) {
+		t.Fatalf("777 keeps %v for the legacy disk on the old name, want %v", after, held)
 	}
-	var destroyed []string
-	for _, volid := range volumesBefore {
-		if f.client.state.volumes[volid] == nil {
-			destroyed = append(destroyed, volid)
-		}
-	}
-	if len(destroyed) != 1 || destroyed[0] != landed || len(volumeNames(f)) != len(volumesBefore)-1 {
-		t.Fatalf("delete_disk destroyed %v and left %v, want only the landed volume %s destroyed", destroyed, volumeNames(f), landed)
-	}
-	record, err := f.journal.Inspect(f.id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.State != aj.ReconciliationRequired {
-		t.Fatalf("record state = %s (%s), want %s", record.State, record.Reason, aj.ReconciliationRequired)
-	}
+	requireRenamedDiskDeletedAlone(t, f, key, landed, before)
 }
 
 // descriptionNotes returns every note 777's description files, keyed by its

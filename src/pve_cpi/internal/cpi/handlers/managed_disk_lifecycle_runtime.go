@@ -428,5 +428,11 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 	if err := storageLifecycleSettled(handle.Record()); err != nil {
 		return errors.Join(err, handle.Close(), journal.Close())
 	}
+	// A renamed disk's allocation entry can outlive its volume on the VM the
+	// disk was moved off, and the completion audit would count it as the
+	// disk's, so it comes off before the audit runs.
+	if err := removeAbsentDiskNotes(ctx, deps, rd, handle.Record()); err != nil {
+		return errors.Join(err, handle.Close(), journal.Close())
+	}
 	return m.finish(ctx, nil, true)
 }

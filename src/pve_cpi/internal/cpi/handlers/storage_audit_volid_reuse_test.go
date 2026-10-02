@@ -41,6 +41,9 @@ type reuseFixture struct {
 	// noSerial leaves the serial off VM 2353's drive, and noProvenance
 	// leaves disk "new"'s provenance off VM 2353.
 	noSerial, noProvenance bool
+	// definition, when set, replaces storage a's definition, so a test can
+	// put the volumes on node-local storage.
+	definition string
 
 	old, fresh aj.Record
 }
@@ -80,8 +83,12 @@ func reuseDiskRecord(t *testing.T, a pve.StorageInfo) aj.Record {
 
 func (f *reuseFixture) build() []aj.Record {
 	t := f.t
-	a := moveDefinition(t, moveDefinitions["a"])
-	f.c.storageRead.definitions = cs.ListStorageResponse{json.RawMessage(moveDefinitions["a"])}
+	definition := moveDefinitions["a"]
+	if f.definition != "" {
+		definition = f.definition
+	}
+	a := moveDefinition(t, definition)
+	f.c.storageRead.definitions = cs.ListStorageResponse{json.RawMessage(definition)}
 
 	// Disk "old" went on from VM 2353 to parker 90366, where PVE renamed it.
 	f.old = reuseDiskRecord(t, a)
@@ -197,7 +204,9 @@ func TestAllocationAuditReusedVolumeNameIsNotASecondHolder(t *testing.T) {
 
 // TestAllocationAuditReusedNameStillFindsTrueDuplicates shows that a volume
 // still counts as a holder whenever the evidence at its location agrees with
-// the record, so a real duplicate stays a conflict.
+// the record, so a real duplicate stays a conflict. The last row is a name
+// the record has given up, where the volume is no longer the record's, and
+// the audit still refuses on the conflicts that the other disk raises.
 func TestAllocationAuditReusedNameStillFindsTrueDuplicates(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -208,6 +217,9 @@ func TestAllocationAuditReusedNameStillFindsTrueDuplicates(t *testing.T) {
 		// freshToo expects a duplicate-holder conflict for the new
 		// allocation as well, because VM 2400 shares its volume.
 		freshToo bool
+		// givenUp expects no duplicate-holder conflict for the old
+		// allocation, because it gave up the name VM 2400's drive holds.
+		givenUp bool
 	}{
 		{
 			// The old disk's serial rides a second drive, so one stable
@@ -241,13 +253,17 @@ func TestAllocationAuditReusedNameStillFindsTrueDuplicates(t *testing.T) {
 		},
 		{
 			// A drive with no serial and no provenance holds a historical
-			// name of the old record. Nothing at that holder attributes it
-			// to any other allocation, so the name match still stands. The
-			// drive is also a second reference to the new disk's volume, so
-			// the new allocation has two holders too.
+			// name of the old record. The old record's observed move took
+			// its disk off that name and landed it on the parker, and a VM
+			// holds the volume on a slot, so the old record has given the
+			// name up and VM 2400 isn't its second holder. The drive is
+			// still a second reference to the new disk's volume, so the new
+			// allocation has two holders, and the shared reference still
+			// refuses.
 			name:     "unattributed volume at a historical name",
 			drive:    func(aj.Record) string { return reuseVolume + ",size=1G" },
 			freshToo: true,
+			givenUp:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,8 +281,11 @@ func TestAllocationAuditReusedNameStillFindsTrueDuplicates(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !holderConflict(report, f.old.ID) {
-				t.Fatalf("true duplicate of allocation %s not reported:\n%s", f.old.ID, strings.Join(report.Conflicts, "\n"))
+			if holderConflict(report, f.old.ID) == tc.givenUp {
+				t.Fatalf("duplicate-holder conflict for allocation %s = %t, want %t:\n%s", f.old.ID, tc.givenUp, !tc.givenUp, strings.Join(report.Conflicts, "\n"))
+			}
+			if tc.givenUp && !sharedReferenceConflict(report, reuseVolume) {
+				t.Fatalf("two VMs referencing %s not reported:\n%s", reuseVolume, strings.Join(report.Conflicts, "\n"))
 			}
 			if report.Complete {
 				t.Fatal("audit with a duplicate holder reported complete")
