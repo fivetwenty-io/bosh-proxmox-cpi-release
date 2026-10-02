@@ -411,6 +411,45 @@ func TestUpdateDisk_WhileParked_RecordsWithoutRewriting(t *testing.T) {
 	})
 }
 
+// TestUpdateDisk_WhileParked_PastBudgetRefused pins the budget on the parked
+// path: when recording the override would push the parker's description past
+// what a provenance write may hold, update_disk refuses with a retriable error
+// that names the parker, and nothing reaches the parker's description.
+func TestUpdateDisk_WhileParked_PastBudgetRefused(t *testing.T) {
+	t.Parallel()
+
+	parkedStr := "data:vm-90000-disk-0,serial=" + idTestToken
+	note := strings.Repeat("n", 7700)
+	c := newIDFakeClient(map[int]map[string]any{
+		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true, "description": note, diskKeyScsi0: parkedStr},
+	})
+	deps := overlayTestDeps(c)
+	diskCID := overlayCID(t, "data:vm-9001-disk-0", &pve.DiskCIDMeta{ID: idTestToken, Anchor: true})
+
+	h := HandleUpdateDisk(deps)
+	_, err := h.Handle(context.Background(), overlayArgs(t, diskCID, map[string]any{"cache": "writeback"}), jsonrpc.Context{})
+	if err == nil {
+		t.Fatal("update_disk must refuse an override that does not fit the parker's description")
+	}
+	if !errors.Is(err, pve.ErrProvenanceFull) {
+		t.Errorf("error must wrap ErrProvenanceFull, got %v", err)
+	}
+	if !okToRetryCPIError(err) {
+		t.Errorf("the refusal must be retriable so the Director can try again, got %v", err)
+	}
+	for _, want := range []string{"parker vmid 90000", "node pve1", " bytes of description"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must contain %q", err, want)
+		}
+	}
+	if len(c.descWrites) != 0 {
+		t.Errorf("no description write may reach the parker, saw %d", len(c.descWrites))
+	}
+	if got, _ := c.configs[90000]["description"].(string); got != note {
+		t.Error("the parker description must stay as it was")
+	}
+}
+
 // TestUpdateDisk_RecordWriteFails_FailClosed pins the fail-closed contract:
 // when the override record cannot be written, update_disk errors and the
 // drive string is untouched.
