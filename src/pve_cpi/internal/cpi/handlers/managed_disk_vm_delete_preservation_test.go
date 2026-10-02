@@ -15,7 +15,7 @@ import (
 )
 
 func TestManagedVMDeletePreservesManagedDiskAfterSetRemoval(t *testing.T) {
-	deps, client, journal, id, _ := lifecycleFlowFixture(t)
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	client.state.configs[777]["scsi0"] = "a:777/vm-777-disk-0.raw,size=10G"
 	owned := map[string]bool{"a:777/vm-777-disk-0.raw": true}
 	if err := detachManagedPersistentForVMDelete(context.Background(), deps, "n1", 777, owned, nil); err != nil {
@@ -25,9 +25,16 @@ func TestManagedVMDeletePreservesManagedDiskAfterSetRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != aj.ReadyToReturn || record.ID != id || client.moves != 1 {
+	// The managed volume carries the disk band's VMID, so 777 doesn't own it
+	// and the preservation parks it by config edit, with no move.
+	if record.State != aj.ReadyToReturn || record.ID != id || client.moves != 0 {
 		t.Fatalf("disk preservation lost identity: state=%s moves=%d", record.State, client.moves)
 	}
+	volume, _, err := decodeDiskCID(context.Background(), deps, "test", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireConfigEditPark(t, client, record.DiskToken, volume)
 	if _, ok := client.state.configs[777]["scsi1"]; ok {
 		t.Fatal("persistent disk remains attached")
 	}
@@ -37,9 +44,10 @@ func TestManagedVMDeletePreservesManagedDiskAfterSetRemoval(t *testing.T) {
 	if err := detachManagedPersistentForVMDelete(context.Background(), deps, "n1", 777, owned, nil); err != nil {
 		t.Fatal(err)
 	}
-	if client.moves != 1 {
+	if client.moves != 0 {
 		t.Fatal("repeat preservation moved disk again")
 	}
+	requireConfigEditPark(t, client, record.DiskToken, volume)
 }
 
 func TestManagedVMDeleteUnknownVolumePreventsAllPreservation(t *testing.T) {
@@ -114,9 +122,12 @@ func TestManagedVMDeletePreservesLegacyStableDiskWithExternalEvidence(t *testing
 		t.Fatal(err)
 	}
 	after := handle.Record()
-	if after.State != aj.Observed || len(after.Steps) == 0 || client.moves != 1 {
+	// 777 doesn't own a volume named for 123, so the preservation parks it by
+	// config edit, with no move, and the volume keeps its name.
+	if after.State != aj.Observed || len(after.Steps) == 0 || client.moves != 0 {
 		t.Fatalf("external preservation incomplete: %+v", after)
 	}
+	requireConfigEditPark(t, client, token, volume)
 	for _, step := range after.Steps[1:] {
 		if !step.Target.External || step.State != aj.Observed {
 			t.Fatalf("foreign resource acquired VM ownership or lost evidence: %+v", step)
@@ -134,8 +145,9 @@ func TestManagedVMDeletePreservesLegacyStableDiskWithExternalEvidence(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slot == "" || client.moves != 2 {
-		t.Fatal("legacy parker was not safely reattached")
+	// The reattach is the first move, which renames the volume for 777.
+	if slot == "" || client.moves != 1 {
+		t.Fatalf("legacy parker was not safely reattached: slot=%q moves=%d", slot, client.moves)
 	}
 	for _, cfg := range client.state.configs {
 		entries, err := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(cfg))

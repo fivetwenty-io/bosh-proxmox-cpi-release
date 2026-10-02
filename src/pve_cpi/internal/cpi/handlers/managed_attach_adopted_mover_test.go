@@ -162,12 +162,12 @@ func TestManagedAttachKeepsAMoverAnEarlierRequestCreated(t *testing.T) {
 func TestManagedAttachDestroysTheMoverItCreated(t *testing.T) {
 	t.Parallel()
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	deps.Config.DetachedDiskStrategy = "parked"
 	deps.Config.DiskMigration = "on_attach"
 	ctx := pve.WithTestBackoff(t.Context(), func(int) time.Duration { return 0 })
-	if _, err := HandleDetachDisk(deps).Handle(ctx, []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
-		t.Fatalf("setup detach into the parker: %v", err)
-	}
+	// The park, attach, park cycle names the volume for the parker, which is
+	// what makes the cross-node attach need a mover. A volume that still
+	// carried its vm-123 name would reach n2 by config edit.
+	parkRenameCycle(t, ctx, deps, client, cid)
 	if client.vmNodes == nil {
 		client.vmNodes = map[int]string{}
 	}

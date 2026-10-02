@@ -11,8 +11,6 @@ import (
 	"sync"
 
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
-
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // fakePendingModel is the pending section of PVE's VM configs, for the fakes
@@ -123,7 +121,7 @@ func (m *fakePendingModel) completeStop(vmid int, cfg map[string]any) {
 		for _, value := range held {
 			text, _ := value.(string)
 			volume := strings.Split(text, ",")[0]
-			if owner, ok := pve.EmbeddedDiskVMID(volume); ok && owner == vmid && cfg != nil {
+			if fakeVolumeOwnedBy(volume, vmid) && cfg != nil {
 				for i := 0; ; i++ {
 					key := fmt.Sprintf("unused%d", i)
 					if _, taken := cfg[key]; !taken {
@@ -192,7 +190,10 @@ func (m *fakePendingModel) dropHeld(vmid int) []string {
 // holdReplacement records a pending value for key that replaces its current
 // drive, the way PVE does when a volume is written onto a slot whose old drive
 // a running guest still holds. The fake's config, the applied view, takes the
-// pending value, and the model keeps the current one.
+// pending value, and the model keeps the current one. Writing the pending value
+// also drops any unusedN entry that names its volume, because write_vm_config
+// counts the pending section when it removes the unused entries of a volume
+// that is added again.
 //
 //nolint:unparam // vmid kept for parity with holdDelete and every other model method; every row so far uses VM 777
 func (m *fakePendingModel) holdReplacement(vmid int, cfg map[string]any, key string, pending any) {
@@ -206,6 +207,8 @@ func (m *fakePendingModel) holdReplacement(vmid int, cfg map[string]any, key str
 	}
 	m.replaced[vmid][key] = cfg[key]
 	cfg[key] = pending
+	text, _ := pending.(string)
+	dropUnusedNaming(cfg, strings.Split(text, ",")[0])
 }
 
 // pendingDelete reports whether a delete of key is pending on a VM.

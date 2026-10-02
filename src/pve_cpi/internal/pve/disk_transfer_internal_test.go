@@ -4,7 +4,10 @@
 // behaviors the live spike established: move_disk renames the volume for its
 // new owner, an attached-slot move carries the option string, an
 // unused-entry move drops it, and removing an unusedN entry physically
-// deletes a volume its holder owns.
+// deletes a volume its holder owns. Deleting a bus slot leaves an unusedN
+// entry only for a volume the VM owns by name
+// (vmconfig_register_unused_drive), and attaching a volume the VM already
+// names on an unusedN entry drops that entry (write_vm_config).
 package pve
 
 import (
@@ -12,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,6 +151,15 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 				slot = opts.DiskID
 			}
 			cfg[slot] = volid
+			bare := volid
+			if comma := strings.IndexByte(bare, ','); comma >= 0 {
+				bare = bare[:comma]
+			}
+			for key, unused := range FindUnusedDiskEntries(cfg) {
+				if unused == bare {
+					delete(cfg, key)
+				}
+			}
 			c.logEvent("attach:%d:%s:%s", vmid, slot, volid)
 			return slot, nil
 		},
@@ -172,7 +185,7 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 			delete(cfg, diskID)
 			c.logEvent("detach:%d:%s:%s", vmid, diskID, bare)
 			if strings.HasPrefix(diskID, "unused") {
-				if owner, ok := EmbeddedDiskVMID(bare); ok && owner == vmid {
+				if scanFakeOwns(bare, vmid) {
 					c.destroyed = append(c.destroyed, bare)
 					c.logEvent("destroy:%s", bare)
 				}
@@ -180,7 +193,7 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 			}
 			// The demote-and-sweep pair, collapsed: options drop on the
 			// unused entry, and the sweep removes it again immediately.
-			if owner, ok := EmbeddedDiskVMID(bare); ok && owner == vmid {
+			if scanFakeOwns(bare, vmid) {
 				c.destroyed = append(c.destroyed, bare)
 				c.logEvent("destroy:%s", bare)
 			}
@@ -373,7 +386,8 @@ func (c *scanFakeClient) listQemuPending(ctx context.Context, node, vmidText str
 }
 
 // deleteConfigKeyLocked applies PVE's config-delete semantics: a deleted bus
-// slot is demoted to the first free unusedN key, dropping the options.
+// slot whose volume the VM owns is demoted to the first free unusedN key,
+// dropping the options, and any other volume loses its last reference.
 func (c *scanFakeClient) deleteConfigKeyLocked(cfg map[string]any, vmid int, slot string) {
 	raw, present := cfg[slot]
 	if !present {
@@ -385,7 +399,7 @@ func (c *scanFakeClient) deleteConfigKeyLocked(cfg map[string]any, vmid int, slo
 		bare = bare[:comma]
 	}
 	delete(cfg, slot)
-	if !strings.HasPrefix(slot, "unused") {
+	if !strings.HasPrefix(slot, "unused") && scanFakeOwns(bare, vmid) {
 		for i := 0; ; i++ {
 			key := fmt.Sprintf("unused%d", i)
 			if _, taken := cfg[key]; !taken {
@@ -395,6 +409,19 @@ func (c *scanFakeClient) deleteConfigKeyLocked(cfg map[string]any, vmid int, slo
 		}
 	}
 	c.logEvent("config-delete:%d:%s:%s", vmid, slot, bare)
+}
+
+// scanFakeOwnerPattern is the fake's own copy of PVE's owner rule, kept apart
+// from volumeOwnerVMID so the fake can disagree with production. VM N owns any
+// vm-<N>-* or base-<N>-* name. The block storage plugins read it from the
+// volume name, and the directory plugin reads it from the images/<vmid>/
+// directory, which agree on every name PVE allocates.
+var scanFakeOwnerPattern = regexp.MustCompile(`^(?:vm|base)-([1-9]\d*)-`)
+
+// scanFakeOwns reports whether PVE counts vmid as the owner of volid.
+func scanFakeOwns(volid string, vmid int) bool {
+	m := scanFakeOwnerPattern.FindStringSubmatch(volid[strings.LastIndexAny(volid, "/:")+1:])
+	return len(m) == 2 && m[1] == strconv.Itoa(vmid)
 }
 
 func (c *scanFakeClient) createQemuMoveDisk(_ context.Context, _ string, vmidStr string, params *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {

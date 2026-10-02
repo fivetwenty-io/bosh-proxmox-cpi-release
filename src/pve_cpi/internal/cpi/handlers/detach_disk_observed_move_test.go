@@ -60,7 +60,7 @@ func heldDiskVolume(client *lifecycleFlowPVE) string {
 // TestManagedDiskDetachHealsProvenanceOfHolderMovedOnSharedStorage moves the
 // holder of a shared managed disk to n2. Detach rewrites the provenance on n2
 // before the transfer, so the removal after it matches and the detach
-// completes in one call.
+// completes in one call, parking the volume by config edit under its own name.
 func TestManagedDiskDetachHealsProvenanceOfHolderMovedOnSharedStorage(t *testing.T) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	attachMovedDisk(t, deps, client, cid)
@@ -80,7 +80,9 @@ func TestManagedDiskDetachHealsProvenanceOfHolderMovedOnSharedStorage(t *testing
 	if len(record.Steps) < len(before.Steps) || !reflect.DeepEqual(record.Steps[:len(before.Steps)], before.Steps) {
 		t.Fatal("detach rewrote recorded steps")
 	}
-	if record.State != aj.ReadyToReturn || client.moves != 1 || heldDiskVolume(client) != "" {
+	// The managed volume carries the disk band's VMID, which 777 doesn't own,
+	// so PVE keeps no unused entry for it and the park is a config edit.
+	if record.State != aj.ReadyToReturn || client.moves != 0 || heldDiskVolume(client) != "" {
 		t.Fatalf("detach incomplete: state=%s moves=%d held=%q", record.State, client.moves, heldDiskVolume(client))
 	}
 	if entries, err := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(client.state.configs[777])); err != nil || len(entries) != 0 {
@@ -90,6 +92,7 @@ func TestManagedDiskDetachHealsProvenanceOfHolderMovedOnSharedStorage(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireConfigEditPark(t, client, record.DiskToken, bare)
 	resolved, err := resolveDiskForOp(context.Background(), deps, "test", cid, bare, meta)
 	if err != nil {
 		t.Fatal(err)
@@ -190,11 +193,16 @@ func relocateFixtureDiskToLocalStorage(t *testing.T, deps Deps, client *lifecycl
 
 // parkThenMoveParker parks the fixture's disk from VM 777 on n1 and then moves
 // the parker to n2, the way a bulk migrate during a patch cycle does. The
-// parked entry keeps naming n1. It returns the parker's VMID.
-func parkThenMoveParker(t *testing.T, deps Deps, client *lifecycleFlowPVE, cid string) int {
+// parked entry keeps naming n1. With renamed false the disk parks by config
+// edit under its disk-band name, and with renamed true it runs the park,
+// attach, park cycle, so it sits on the parker under a name the parker owns. It
+// returns the parker's VMID.
+func parkThenMoveParker(t *testing.T, deps Deps, client *lifecycleFlowPVE, cid string, renamed bool) int {
 	t.Helper()
 	deps.Config.DetachedDiskStrategy = "parked"
-	if _, err := HandleDetachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
+	if renamed {
+		parkRenameCycle(t, context.Background(), deps, client, cid)
+	} else if _, err := HandleDetachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
 		t.Fatal(err)
 	}
 	holder := resolvedFixtureHolder(t, deps, cid)
@@ -207,6 +215,14 @@ func parkThenMoveParker(t *testing.T, deps Deps, client *lifecycleFlowPVE, cid s
 	client.vmNodes[holder.VMID] = "n2"
 	return holder.VMID
 }
+
+// parkNames are the two ways a managed disk sits on a parker. One park leaves
+// it under its disk-band name, and the park, attach, park cycle renames it for
+// the parker, so the audit then meets steps that name the volume's old names.
+var parkNames = []struct {
+	name    string
+	renamed bool
+}{{"disk-band name", false}, {"parker-owned name", true}}
 
 func resolvedFixtureHolder(t *testing.T, deps Deps, cid string) *pve.DiskHolder {
 	t.Helper()
@@ -226,8 +242,17 @@ func resolvedFixtureHolder(t *testing.T, deps Deps, cid string) *pve.DiskHolder 
 // the move without touching the journal, attach takes the disk from the
 // parker on its new node, and a later detach parks it on that node again.
 func TestManagedDiskParkerMovedOnSharedStorageStaysUsable(t *testing.T) {
+	for _, park := range parkNames {
+		t.Run(park.name, func(t *testing.T) {
+			parkerMovedOnSharedStorageStaysUsable(t, park.renamed)
+		})
+	}
+}
+
+func parkerMovedOnSharedStorageStaysUsable(t *testing.T, renamed bool) {
+	t.Helper()
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	parker := parkThenMoveParker(t, deps, client, cid)
+	parker := parkThenMoveParker(t, deps, client, cid, renamed)
 
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
 	report, err := admitStorageAllocation(context.Background(), deps, journal, []string{"n1", "n2"})
@@ -272,17 +297,21 @@ func TestManagedDiskParkerMovedOnSharedStorageStaysUsable(t *testing.T) {
 // TestManagedDiskDeletesDiskFromParkerMovedOnSharedStorage covers parker
 // cleanup: delete_disk removes a disk whose parker a bulk migrate moved.
 func TestManagedDiskDeletesDiskFromParkerMovedOnSharedStorage(t *testing.T) {
-	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	parkThenMoveParker(t, deps, client, cid)
-	if _, err := HandleDeleteDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
-		t.Fatalf("delete_disk from a moved parker failed: %v", err)
-	}
-	record, err := journal.Inspect(id)
-	if err != nil || record.State != aj.Deleted {
-		t.Fatalf("disk record after delete: %+v %v", record.State, err)
-	}
-	if len(client.state.volumes) != 0 {
-		t.Fatalf("delete left volumes behind: %v", client.state.volumes)
+	for _, park := range parkNames {
+		t.Run(park.name, func(t *testing.T) {
+			deps, client, journal, id, cid := lifecycleFlowFixture(t)
+			parkThenMoveParker(t, deps, client, cid, park.renamed)
+			if _, err := HandleDeleteDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
+				t.Fatalf("delete_disk from a moved parker failed: %v", err)
+			}
+			record, err := journal.Inspect(id)
+			if err != nil || record.State != aj.Deleted {
+				t.Fatalf("disk record after delete: %+v %v", record.State, err)
+			}
+			if len(client.state.volumes) != 0 {
+				t.Fatalf("delete left volumes behind: %v", client.state.volumes)
+			}
+		})
 	}
 }
 

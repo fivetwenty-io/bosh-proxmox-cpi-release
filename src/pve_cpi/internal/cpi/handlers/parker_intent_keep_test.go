@@ -52,9 +52,17 @@ type strandedDisk struct {
 //
 // managed picks a journal-managed disk over a legacy one. renamed first parks
 // the disk and attaches it back, so the volume is named for 777; otherwise it
-// keeps its birth name. local puts every volume on node-local storage.
+// keeps its birth name, which for a legacy disk is the name 777 owns. local puts
+// every volume on node-local storage.
+//
+// A managed disk can't be built with its birth name. The journal fixes that
+// name on the disk band's VMID, which 777 doesn't own, so PVE keeps no unused
+// entry for it, and a failing move is never attempted.
 func buildStrandedDisk(t *testing.T, managed, renamed, local bool) *strandedDisk {
 	t.Helper()
+	if managed && !renamed {
+		t.Fatal("a managed disk's birth name is never owned by 777, so it can't be stranded on an unused entry")
+	}
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	if local {
 		client.localStorage = true
@@ -102,7 +110,7 @@ func buildStrandedDisk(t *testing.T, managed, renamed, local bool) *strandedDisk
 			client.state.configs[vmid]["scsi1"] = volume + ",serial=" + token + ",size=5G"
 			return encoded, token
 		}
-		s.cid, s.token = legacyDisk(777, 123)
+		s.cid, s.token = legacyDisk(777, 777)
 		otherCID, _ = legacyDisk(778, 124)
 	}
 	if local {
@@ -229,7 +237,8 @@ func (s *strandedDisk) requireSingleHolder(t *testing.T, onParker bool) int {
 }
 
 // strandedShapes are the legacy shapes the probe found: renamed or birth-named,
-// on shared or node-local storage.
+// on shared or node-local storage. A birth-named legacy disk is named for 777,
+// the VMID the probe's disk was created under.
 var strandedShapes = []struct {
 	name           string
 	renamed, local bool
@@ -241,11 +250,13 @@ var strandedShapes = []struct {
 }
 
 // TestStrandedTransferRecordSurvivesTheCollectingPark is A1. Before the keep
-// rule every shape fails: the park two hours later collected the record.
+// rule every shape fails: the park two hours later collected the record. The
+// managed disk has only its renamed shapes, because a managed disk's birth name
+// is never owned by 777 and so can't be stranded.
 func TestStrandedTransferRecordSurvivesTheCollectingPark(t *testing.T) {
 	for _, managed := range []bool{false, true} {
 		for _, shape := range strandedShapes {
-			if managed && shape.local {
+			if managed && (shape.local || !shape.renamed) {
 				continue
 			}
 			t.Run(fmt.Sprintf("managed=%t/%s", managed, shape.name), func(t *testing.T) {
@@ -298,24 +309,21 @@ func TestStrandedLegacyDetachResumesToOneParkedReference(t *testing.T) {
 
 // TestStrandedManagedDetachRefusesAndKeepsItsRecord is A4. A managed disk stays
 // refused at the planned move step, and the record that leads back to the
-// volume survives for the settlement to use. Before the keep rule both shapes
-// fail, because the record was collected, and the renamed shape refused as a
-// terminal disk instead of naming the step.
+// volume survives for the settlement to use. Before the keep rule the record
+// was collected, and the refusal said the disk was terminal instead of naming
+// the step. Only the renamed shape exists for a managed disk, because its birth
+// name is never owned by 777.
 func TestStrandedManagedDetachRefusesAndKeepsItsRecord(t *testing.T) {
-	for _, renamed := range []bool{true, false} {
-		t.Run(fmt.Sprintf("renamed=%t", renamed), func(t *testing.T) {
-			s := buildStrandedDisk(t, true, renamed, false)
-			err := detachDiskAt(t, atProvenanceTime(strandedEpoch.Add(3*time.Hour)), s.deps, "777", s.cid)
-			if err == nil || !strings.Contains(err.Error(), "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk") {
-				t.Fatalf("detach_disk = %v, want the refusal that names the planned move step", err)
-			}
-			if s.client.state.volumes[s.stranded] == nil || !strings.Contains(strings.Join(s.references(s.stranded), " "), "777.unused") {
-				t.Fatalf("the volume %s left 777's unused entry: present=%t refs=%v", s.stranded, s.client.state.volumes[s.stranded] != nil, s.references(s.stranded))
-			}
-			if s.intentParker() == 0 {
-				t.Fatal("the transfer record was collected")
-			}
-		})
+	s := buildStrandedDisk(t, true, true, false)
+	err := detachDiskAt(t, atProvenanceTime(strandedEpoch.Add(3*time.Hour)), s.deps, "777", s.cid)
+	if err == nil || !strings.Contains(err.Error(), "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk") {
+		t.Fatalf("detach_disk = %v, want the refusal that names the planned move step", err)
+	}
+	if s.client.state.volumes[s.stranded] == nil || !strings.Contains(strings.Join(s.references(s.stranded), " "), "777.unused") {
+		t.Fatalf("the volume %s left 777's unused entry: present=%t refs=%v", s.stranded, s.client.state.volumes[s.stranded] != nil, s.references(s.stranded))
+	}
+	if s.intentParker() == 0 {
+		t.Fatal("the transfer record was collected")
 	}
 }
 

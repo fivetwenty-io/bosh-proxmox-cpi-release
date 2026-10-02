@@ -28,16 +28,15 @@ import (
 const unownedVolume = "a:9005/vm-9005-disk-0.raw"
 
 // buildUnownedDisk puts one stable-ID disk whose volume 777 doesn't own on
-// 777's scsi1, with PVE-faithful demotion. A legacy disk uses unownedVolume,
-// which is the state the probe's cross-node config-edit attach left on 777.
-// A managed disk keeps the flow fixture's journal-managed volume, whose name
-// carries the disk-band VMID 123. local puts the volumes on node-local
-// storage. A second legacy disk whose volume 778 doesn't own sits on 778, for
-// the rows that need an unrelated park on the same parker.
+// 777's scsi1. A legacy disk uses unownedVolume, which is the state the probe's
+// cross-node config-edit attach left on 777. A managed disk keeps the flow
+// fixture's journal-managed volume, whose name carries the disk-band VMID 123.
+// local puts the volumes on node-local storage. A second legacy disk whose
+// volume 778 doesn't own sits on 778, for the rows that need an unrelated park
+// on the same parker.
 func buildUnownedDisk(t *testing.T, managed, local bool) (s *strandedDisk, id, otherCID string) {
 	t.Helper()
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	client.faithfulDemotion = true
 	if local {
 		client.localStorage = true
 		client.volumeNodes = map[string]string{}
@@ -302,7 +301,7 @@ func TestOwnedDiskStillTakesTheMovePath(t *testing.T) {
 }
 
 // buildBirthStrandOwnedReady is a legacy stable-ID disk named for 777 on 777's
-// scsi1, with PVE-faithful demotion, before any detach.
+// scsi1, before any detach.
 func buildBirthStrandOwnedReady(t *testing.T) *strandedDisk {
 	t.Helper()
 	s, _, _ := buildUnownedDisk(t, false, false)
