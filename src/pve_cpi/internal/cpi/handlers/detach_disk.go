@@ -358,8 +358,9 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	case rd.holder == nil:
 		return parkFreeFloatingStableID(ctx, deps, rd)
 	case rd.holder.IsParker:
-		// Already in the detached (parked) state — idempotent success.
-		return nil
+		// Already in the detached (parked) state, which is idempotent success
+		// once the source VM no longer carries the disk's entries.
+		return finishParkedDetachTail(ctx, deps, "detach_disk", rd)
 	case rd.holder.VMID != vmid:
 		// Stale-Director retry: the disk was re-attached elsewhere after the
 		// original detach. Preserve the legacy idempotent warn+nil semantics.
@@ -431,10 +432,10 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return err
 	}
 	sweepParkerPool(ctx, deps, node, parkerCfg)
-	if rd.allocation != nil {
-		if err := pve.RemoveDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), rd.allocation.provenance); err != nil {
-			return err
-		}
+	moved := rd
+	moved.volid = landed
+	if err := finishDetachTailOn(ctx, deps, "detach_disk", moved, node, vmid); err != nil {
+		return err
 	}
 	// Giving side's record last: the parker's provenance entry (the receiving
 	// side) was written before the source slot was touched, so the holder

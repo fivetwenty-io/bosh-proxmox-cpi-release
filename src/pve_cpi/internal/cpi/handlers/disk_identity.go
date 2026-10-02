@@ -133,7 +133,19 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	// somebody sweeps, so we sweep it the way every park funnel does, on the
 	// parker's own node rather than the one this request is aimed at.
 	sweepParkerPool(ctx, deps, rd.intent.ParkerNode, parkerCfg)
-	return resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
+	refreshed, err := resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
+	if err != nil {
+		return resolvedDisk{}, err
+	}
+	// The detach that started this transfer never reached its tail, so the
+	// source VM still carries the disk's entries. A failure here comes after
+	// the landing, and the next call that resolves the disk heals it.
+	if source, ok := intentSourceVMID(rd.intent); ok {
+		if err := finishDetachTail(ctx, deps, op, refreshed, source); err != nil {
+			return resolvedDisk{}, err
+		}
+	}
+	return refreshed, nil
 }
 
 // resumeAppliesFoundPendingDelete reports whether op moves the disk off its

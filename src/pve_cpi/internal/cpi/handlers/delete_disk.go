@@ -366,7 +366,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, true) }()
 		}
-		rd, err = resumeTransferIfNeeded(ctx, deps, "delete_disk", rd)
+		// A parked disk whose source VM still carries its allocation entry
+		// would fail the deletion proof after the volume is gone, so the
+		// entry comes off first, and a failure leaves the volume alone.
+		rd, err = resumeAndFinishParkedTail(ctx, deps, "delete_disk", rd)
 		if err != nil {
 			return nil, err
 		}
