@@ -340,6 +340,12 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 		delete(g.observations, step)
 		return nil
 	}
+	if _, refused := result.(managedMoveDigestRefusal); refused {
+		if key != "Nodes.CreateQemuMoveDisk" {
+			return fmt.Errorf("move refusal names another mutation")
+		}
+		return g.settleRefusedMove(ctx, step, observation)
+	}
 	async := key == "QEMU.Create" || key == "QEMU.ResizeDisk" || key == "QEMU.Snapshot" || key == "QEMU.DeleteSnapshot" || key == "Nodes.CreateQemuMoveDisk" || key == "Nodes.CreateQemuMigrate" || key == "Nodes.DeleteQemu" || strings.HasSuffix(call.Method, "Async")
 	if key == "Storage.DeleteVolumeIfExistsAsync" {
 		values, ok := result.([]any)
@@ -364,6 +370,11 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 			return err
 		}
 		if err := pve.AwaitTask(ctx, m.deps.PVE, observation.node, upid); err != nil {
+			if key == "Nodes.CreateQemuMoveDisk" && pve.IsMoveDigestRefusal(err) {
+				// The move task checked both digests under the configuration
+				// locks and refused before its rename, so nothing moved.
+				return g.settleRefusedMove(ctx, step, observation)
+			}
 			return fmt.Errorf("managed lifecycle task outcome requires reconciliation")
 		}
 	}
@@ -1001,6 +1012,39 @@ func (g *managedDiskLifecycleGuard) observeConfigWrite(ctx context.Context, obse
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
 	return volumes, nil
+}
+
+// managedMoveDigestRefusal is the After result for a move PVE refused in the
+// request because a configuration changed after its digest was read.
+type managedMoveDigestRefusal struct{}
+
+// settleRefusedMove records a move that PVE refused on its digest check as
+// observed with the pre-move volume, once a readback of both views shows the
+// source still naming the managed disk on the same key and the receiving slot
+// still empty. A readback that shows anything else returns an error, and the
+// guard treats the move as uncertain.
+func (g *managedDiskLifecycleGuard) settleRefusedMove(ctx context.Context, step string, observation managedDiskMutationObservation) error {
+	m := g.lifecycle
+	sourceSlot, _ := observation.fields["disk"].(string)
+	source, err := pve.ReadQemuViews(ctx, m.deps.PVE, observation.node, observation.vmid)
+	if err != nil {
+		return fmt.Errorf("refused move source readback unavailable")
+	}
+	if !pve.MoveSourceStillNames(source, sourceSlot, m.disk.volid) {
+		return fmt.Errorf("refused move source no longer names managed disk")
+	}
+	target, err := pve.ReadQemuViews(ctx, m.deps.PVE, observation.node, observation.targetVMID)
+	if err != nil {
+		return fmt.Errorf("refused move receiver readback unavailable")
+	}
+	if !pve.MoveSlotEmpty(target, observation.targetSlot) {
+		return fmt.Errorf("refused move receiving slot is occupied")
+	}
+	if err := storageMutationObserved(m.handle, step, []string{m.disk.volid}, false); err != nil {
+		return err
+	}
+	delete(g.observations, step)
+	return nil
 }
 
 func (g *managedDiskLifecycleGuard) observeMove(ctx context.Context, observation managedDiskMutationObservation, cfg map[string]any) ([]string, error) {
