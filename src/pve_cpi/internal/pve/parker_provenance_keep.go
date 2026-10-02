@@ -76,13 +76,21 @@ func provenanceSourceVMID(entry parkerProvEntry) (int, bool) {
 // longer names was either renamed by a finished move or freed, and the
 // absence proof settles both.
 //
+// A record whose source names nothing and whose volume is gone is kept too,
+// while its own slot on this parker holds a volume named for the parker in both
+// views, with no stable-ID serial, and no other record on the parker names that
+// volume. That's a transfer whose move landed after the answer was lost: the
+// volume was renamed onto the parker, the serial was never written, and the
+// record is the only link to the disk's stable ID. Keeping it costs description
+// bytes, not a disk, and it counts toward the budget like any other record.
+//
 // Reads run only for source-bearing collection candidates, so a parker with no
 // stale intent costs nothing extra. Any read that fails keeps the record: a
 // kept record only delays a collection, and a wrongly collected one loses a
 // disk.
 func parkerProvenanceSourceKeeps(
 	ctx context.Context, c Client, logger *log.Logger,
-	vmCfg map[string]any, keepKey string, now time.Time, cfg ParkerConfig,
+	parkerNode string, parkerVMID int, vmCfg map[string]any, keepKey string, now time.Time, cfg ParkerConfig,
 ) map[string]bool {
 	_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
 	held := map[string]bool{}
@@ -96,6 +104,9 @@ func parkerProvenanceSourceKeeps(
 		names, err := provenanceSourceNamesVolume(ctx, c, entry, vmid)
 		if err == nil && !names {
 			names, err = provenanceVolumeUnclaimed(ctx, c, entry, proof)
+		}
+		if err == nil && !names {
+			names, err = provenanceLandingUnclaimed(ctx, c, parkerNode, parkerVMID, key, entry, disks)
 		}
 		if err != nil && logger != nil {
 			logger.Warn("parker provenance: could not tell whether a stale transfer record still links its volume; keeping the record",
@@ -238,6 +249,48 @@ func provenanceVolumeUnclaimed(ctx context.Context, c Client, entry parkerProvEn
 		return false, err
 	}
 	return !absent, nil
+}
+
+// provenanceLandingUnclaimed reports whether entry's recorded slot on the
+// parker holds a landed volume nobody has claimed: a volume named for the
+// parker in both the current and the pending view, carrying no stable-ID serial
+// in either, that no other record on the parker names. It's the shape a
+// transfer's resume claims when the move landed and the serial write was lost.
+// An error means the answer is unknown, and the caller keeps the record.
+func provenanceLandingUnclaimed(
+	ctx context.Context, c Client, parkerNode string, parkerVMID int,
+	key string, entry parkerProvEntry, disks map[string]parkerProvEntry,
+) (bool, error) {
+	if entry.Slot == "" || parkerNode == "" || parkerVMID <= 0 {
+		return false, nil
+	}
+	views, err := ReadQemuViews(ctx, c, parkerNode, parkerVMID)
+	if err != nil {
+		return false, err
+	}
+	current, applied := views.Current(), views.Applied()
+	landed, ok := slotBareVolid(current, entry.Slot)
+	if !ok {
+		return false, nil
+	}
+	if other, ok := slotBareVolid(applied, entry.Slot); !ok || other != landed {
+		return false, nil
+	}
+	if embedded, named := EmbeddedDiskVMID(landed); !named || embedded != parkerVMID {
+		return false, nil
+	}
+	for _, view := range []map[string]any{current, applied} {
+		drive, _ := ConfigString(view, entry.Slot)
+		if _, hasSerial := StableIDFromDriveOptStr(drive); hasSerial {
+			return false, nil
+		}
+	}
+	for otherKey := range disks {
+		if otherKey != key && provEntryVolid(otherKey, disks[otherKey]) == landed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // staleParkerProvenanceKeys returns, sorted, the keys the age-and-reference

@@ -509,7 +509,7 @@ func parkerProvenanceRoom(
 	// The same keep rule as the write, so the probe never counts room that a
 	// record the write keeps is still using.
 	now := provenanceNow(ctx, cfg)
-	held := parkerProvenanceSourceKeeps(ctx, c, nil, vmCfg, key, now, cfg)
+	held := parkerProvenanceSourceKeeps(ctx, c, nil, node, parkerVMID, vmCfg, key, now, cfg)
 	_, _, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
 	return projectErr
 }
@@ -536,7 +536,7 @@ func writeParkerProvenance(
 	}
 
 	now := provenanceNow(ctx, cfg)
-	held := parkerProvenanceSourceKeeps(ctx, c, logger, vmCfg, key, now, cfg)
+	held := parkerProvenanceSourceKeeps(ctx, c, logger, node, parkerVMID, vmCfg, key, now, cfg)
 	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
 	if len(held) > 0 && logger != nil {
 		logger.Info("parker provenance: kept stale transfer records that are still the only link to their volume",
