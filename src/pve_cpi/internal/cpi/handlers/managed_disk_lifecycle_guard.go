@@ -43,6 +43,10 @@ type managedDiskMutationObservation struct {
 	// ontoParker records that a move's receiving VM is a parker and not a
 	// mover. Only such a move settles a snapshot refusal.
 	ontoParker bool
+	// notesRemoval records that a description-only write carries its
+	// caller's digest and only removes notes from the description the guard
+	// read, the way pve.RemoveDescriptionNotes builds it.
+	notesRemoval bool
 }
 
 type managedDiskLifecycleGuard struct {
@@ -541,7 +545,13 @@ func (g *managedDiskLifecycleGuard) prepareConfig(call ManagedAllocationMutation
 		return fmt.Errorf("managed config mutation requires generation digest")
 	}
 	if params.Digest != nil && *params.Digest != digest {
+		if descriptionOnlyConfigWrite(call) {
+			return errManagedDescriptionDigestStale
+		}
 		return fmt.Errorf("managed config generation changed")
+	}
+	if params.Digest != nil && params.Description != nil && descriptionOnlyConfigWrite(call) {
+		_, observation.notesRemoval = pve.DescriptionNotesRemoved(pve.DescriptionFromConfig(observation.before), *params.Description)
 	}
 	params.Digest = &digest
 
@@ -839,6 +849,14 @@ func (g *managedDiskLifecycleGuard) observeConfigResult(ctx context.Context, cal
 	key := call.Service + "." + call.Method
 	volumes := make([]string, 1, 2)
 	volumes[0] = g.lifecycle.disk.volid
+	if key == managedVMCallUpdateConfig && observation.notesRemoval {
+		// PVE checks the digest before it writes, so a pinned removal that it
+		// answered with success has landed. Any change to the description
+		// since then is another writer's, so the guard doesn't read it back.
+		// The caller checks that the notes it removed are gone, and a note
+		// that is back is retriable rather than an unknown outcome.
+		return volumes, nil
+	}
 	cfg, err := m.deps.PVE.QEMU().Config(ctx, observation.node, observation.vmid)
 	if err != nil || cfg == nil {
 		return nil, fmt.Errorf("cannot read lifecycle mutation result")
@@ -1246,9 +1264,13 @@ func isProtectionRestore(call ManagedAllocationMutation) bool {
 // views, and when the only change is a pending delete of the slots the write
 // named, with each slot's current value still the managed volume, it settles
 // the step as not applied and stays usable, so the helper's busy retries and
-// its revert still pass. Any other readback, or a failed read, leaves the
-// failure to poison the guard as before.
-func (g *managedDiskLifecycleGuard) settleFailedWrite(ctx context.Context, call ManagedAllocationMutation, step string, _ error) bool {
+// its revert still pass. A description-only write that PVE refused for a
+// stale digest settles the same way (see settleRefusedDescription). Any other
+// readback, or a failed read, leaves the failure to poison the guard as before.
+func (g *managedDiskLifecycleGuard) settleFailedWrite(ctx context.Context, call ManagedAllocationMutation, step string, writeErr error) bool {
+	if g.settleRefusedDescription(ctx, call, step, writeErr) {
+		return true
+	}
 	deleted := configWriteDeletedSlots(call)
 	observation, ok := g.observations[step]
 	if len(deleted) == 0 || !ok {
