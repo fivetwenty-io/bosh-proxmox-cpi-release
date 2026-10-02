@@ -257,12 +257,13 @@ type createVMCloudProps struct {
 	// delete_vm is called. When *true, create_vm stamps the tag tagRetainEphemeral
 	// ("bosh-retain-ephemeral") onto the VM. The tag survives set_vm_metadata's
 	// tag RMW (not in reservedBoshTagPrefixes). On delete_vm both paths check for
-	// this tag: when present, the ephemeral disk slot (volid containing
-	// "vm-<vmid>-ephemeral-") is unlinked (force=false → unusedN), the unusedN
-	// config entry is then removed without freeing storage, and the volid is WARN-
-	// logged for operator recovery. DeleteQemu proceeds after unlink and does not
-	// see any reference to the ephemeral volume, so the backing storage survives.
-	// Nil → byte-identical (no tag, no unlink, ephemeral is destroyed with the VM).
+	// this tag: when present, each ephemeral volume (volid containing
+	// "vm-<vmid>-ephemeral-", on an active slot or left in an unusedN slot) is
+	// transferred to a parker before the destroy, so DeleteQemu sees no reference
+	// to it and the backing storage survives. Retention never deletes an unusedN
+	// entry, because PVE frees a volume the VM owns when its unusedN entry is
+	// deleted (qemu-server try_deallocate_drive).
+	// Nil → byte-identical (no tag, no transfer, ephemeral is destroyed with the VM).
 	RetainEphemeralOnDelete *bool `json:"retain_ephemeral_on_delete,omitempty"`
 	// PCIPassthroughs lists host PCI devices to pass through to the VM.
 	// Each entry carries a PCI address (e.g. "0000:01:00.0") that must be

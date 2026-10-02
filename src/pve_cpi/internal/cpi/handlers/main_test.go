@@ -12,9 +12,10 @@ import (
 // TestMain zeroes the template-cache recheck delay for the whole test binary.
 // Nearly every create_vm test misses the stemcell template cache by design
 // (fake PVE, import path), and each miss otherwise waits out the real
-// 750ms × 2 recheck budget — enough summed across the package to blow the
-// 120s per-package CI timeout on small runners. The recheck behavior itself
-// is attempt-count based, so the tests that exercise it are unaffected.
+// 750ms × 2 recheck budget, which adds minutes to the package's run and eats
+// into the 900s per-package timeout that make test sets. The recheck
+// behavior itself is attempt-count based, so the tests that exercise it are
+// unaffected.
 //
 // It also turns off the allocation journal's fsyncs, which dominate the
 // journal-backed tests here. The journal's own tests keep them on.
