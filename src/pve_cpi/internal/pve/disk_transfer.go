@@ -52,6 +52,52 @@ func IsMoveDiskSnapshotRefusal(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "used by a snapshot")
 }
 
+// moveSnapshotRefusalText is the message PVE's reassign check dies with when
+// a snapshot or another drive key of the source VM still names the volume.
+const moveSnapshotRefusalText = "Can't move disk used by a snapshot to another VM"
+
+// IsMoveSnapshotRefusalAnswer reports whether err is PVE's own answer to a
+// move_disk request that it refused because the volume is still in use. PVE
+// makes that check in the request, before it forks a task or changes any
+// configuration, so the answer proves that the request moved nothing. It
+// needs PVE's whole sentence and an HTTP answer from PVE. A task's exit status
+// with the same text, the CPI's own snapshot refusal, and a dropped
+// connection don't count, so it is narrower than IsMoveDiskSnapshotRefusal.
+// IsMoveSnapshotRefusalTaskExit covers the task's exit status.
+func IsMoveSnapshotRefusalAnswer(err error) bool {
+	if err == nil || !strings.Contains(err.Error(), moveSnapshotRefusalText) {
+		return false
+	}
+	_, answered := pveAnswered(err)
+	return answered
+}
+
+// IsMoveSnapshotRefusalTaskExit reports whether err is a finished move task
+// whose exit status is PVE's snapshot refusal and nothing else. The task makes
+// the same in-use check again under both configuration locks before its
+// rename, and PVE keeps a worker's die message as the task's exit status, so
+// the exit proves that the task moved nothing. The status has to be the whole
+// sentence, so a longer status that contains it doesn't count, and neither
+// does a poll fault or a task whose status is unknown.
+func IsMoveSnapshotRefusalTaskExit(err error) bool {
+	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("failed: exit status %q", moveSnapshotRefusalText))
+}
+
+// stopOnMoveSnapshotRefusal ends the move's retry loop on PVE's answer to the
+// request when it refuses for a snapshot. PVE sends that answer as a 500,
+// which reads as a transient fault to the loop, and it refuses again for as
+// long as anything still names the volume. The refusal leaves the loop with
+// its text, which is what IsMoveDiskSnapshotRefusal and the callers read, but
+// without the transport error underneath it. A task's exit status with the
+// same text needs no stop, because a task verdict never reads as transient.
+// Any other error comes back unchanged.
+func stopOnMoveSnapshotRefusal(err error) error {
+	if !IsMoveDiskSnapshotRefusal(err) {
+		return err
+	}
+	return errors.New(err.Error())
+}
+
 // ErrMoveDiskDigestRefused wraps PVE's refusal of a move_disk reassignment
 // whose source or target configuration changed after the CPI read the digest
 // it sent. PVE compares both digests before it renames anything, once in the
@@ -369,7 +415,7 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			pendingUPID = ""
 			return nil
 		}
-		return inner
+		return stopOnMoveSnapshotRefusal(inner)
 	})
 	if moveErr != nil && unanswered && (errFromDigestRead || IsMoveDigestRefusal(moveErr)) {
 		// The refusal or the read error comes from a later attempt, and the

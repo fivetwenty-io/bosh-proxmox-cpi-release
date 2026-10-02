@@ -87,6 +87,19 @@ type lifecycleFlowPVE struct {
 	// moveTaskRefusal makes the next move start a task that refuses on its
 	// digest check inside the configuration locks, the check at Qemu.pm:5031.
 	moveTaskRefusal bool
+	// moveSnapshotRefusal makes every move POST that passes the digest check
+	// refuse in the request with PVE's answer for a volume a snapshot still
+	// names, the check at Qemu.pm:5060, before any task forks.
+	moveSnapshotRefusal bool
+	// snapshotAnswers counts the move POSTs refused that way.
+	snapshotAnswers int
+	// moveTaskExit, when set, makes the next move start a task that exits
+	// with this status before its rename, so nothing moves.
+	moveTaskExit string
+	// moveTaskUnreadable makes the next move start a task that moves nothing
+	// and whose status every read fails to get, over a dropped connection.
+	moveTaskUnreadable bool
+	unreadableTasks    map[string]bool
 	// loseMoveResponse makes every move pass PVE's request checks, record the
 	// task PVE would fork in lostMoves, and answer with a lost response. It
 	// models a lost response that ends the call, because the move's retry
@@ -138,6 +151,12 @@ func moveDigestRefusal(vmid int) error {
 	return sdkerrors.ParseAPIError(500, body)
 }
 
+// moveSnapshotRefusal is PVE's answer to a move whose volume a snapshot or
+// another drive key of the source still names, as an HTTP 500.
+func moveSnapshotRefusal() error {
+	return sdkerrors.ParseAPIError(500, []byte(`{"message":"Can't move disk used by a snapshot to another VM\n"}`))
+}
+
 // moveDigestMismatch reports which side of a move no longer matches the digest
 // the POST carried, or 0 when both match or none was sent.
 func (c *lifecycleFlowPVE) moveDigestMismatch(sourceID, targetID int, digest, targetDigest *string) int {
@@ -179,6 +198,9 @@ type lifecycleFlowTasks struct {
 }
 
 func (t lifecycleFlowTasks) Wait(ctx context.Context, node, upid string, opts *tasks.WaitOptions) (*tasks.Status, error) {
+	if t.c.unreadableTasks[upid] {
+		return nil, &sdkerrors.ConnectionError{Host: "n1", Port: 8006, Message: "connection reset by peer"}
+	}
 	if exit, failed := t.c.failedTasks[upid]; failed {
 		return nil, fmt.Errorf("task failed: %s", exit)
 	}
@@ -604,6 +626,10 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 	if vmid := n.c.moveDigestMismatch(sourceID, targetID, p.Digest, p.TargetDigest); vmid != 0 {
 		return nil, moveDigestRefusal(vmid)
 	}
+	if n.c.moveSnapshotRefusal {
+		n.c.snapshotAnswers++
+		return nil, moveSnapshotRefusal()
+	}
 	forked := lostMove{source: sourceID, target: targetID, disk: p.Disk, slot: *p.TargetDisk, digest: p.Digest, targetDigest: p.TargetDigest}
 	if n.c.loseMoveResponse {
 		n.c.lostMoves = append(n.c.lostMoves, forked)
@@ -634,6 +660,26 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 			n.c.failedTasks = map[string]string{}
 		}
 		n.c.failedTasks[upid] = fmt.Sprintf("VM %d: detected modified configuration - file changed by other user? Try again.", sourceID)
+		raw := json.RawMessage(strconv.Quote(upid))
+		return &raw, nil
+	}
+	if n.c.moveTaskUnreadable {
+		n.c.moveTaskUnreadable = false
+		upid := fmt.Sprintf("UPID:n1:000573BF:03504636:6AA1786A:qmmove:%d-%s>%d-%s:root@pam:", sourceID, p.Disk, targetID, *p.TargetDisk)
+		if n.c.unreadableTasks == nil {
+			n.c.unreadableTasks = map[string]bool{}
+		}
+		n.c.unreadableTasks[upid] = true
+		raw := json.RawMessage(strconv.Quote(upid))
+		return &raw, nil
+	}
+	if n.c.moveTaskExit != "" {
+		upid := fmt.Sprintf("UPID:n1:000573BE:03504636:6AA1786A:qmmove:%d-%s>%d-%s:root@pam:", sourceID, p.Disk, targetID, *p.TargetDisk)
+		if n.c.failedTasks == nil {
+			n.c.failedTasks = map[string]string{}
+		}
+		n.c.failedTasks[upid] = n.c.moveTaskExit
+		n.c.moveTaskExit = ""
 		raw := json.RawMessage(strconv.Quote(upid))
 		return &raw, nil
 	}

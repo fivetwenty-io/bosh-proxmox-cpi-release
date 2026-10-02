@@ -655,6 +655,13 @@ func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid
 		// the step settles by readback and the guard stays usable.
 		return nil, t.guard.settleRefused(ctx, m, token, managedMoveDigestRefusal{}, err)
 	}
+	if err != nil && ctx.Err() == nil && pve.IsMoveSnapshotRefusalAnswer(err) {
+		// PVE refused the move in the request, before any task, because a
+		// snapshot or another drive key still names the volume. Nothing
+		// moved, so a move onto a parker settles by readback and the guard
+		// stays usable. Any other move keeps the guard's failure path.
+		return nil, t.guard.settleRefused(ctx, m, token, managedMoveSnapshotRefusal{}, err)
+	}
 	err = t.guard.finish(ctx, m, token, resp, err)
 	return
 }

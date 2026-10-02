@@ -40,6 +40,9 @@ type managedDiskMutationObservation struct {
 	targetSlot     string
 	targetGiB      int
 	charges        bool
+	// ontoParker records that a move's receiving VM is a parker and not a
+	// mover. Only such a move settles a snapshot refusal.
+	ontoParker bool
 }
 
 type managedDiskLifecycleGuard struct {
@@ -346,6 +349,9 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 		}
 		return g.settleRefusedMove(ctx, step, observation)
 	}
+	if _, refused := result.(managedMoveSnapshotRefusal); refused {
+		return g.settleSnapshotRefusedMove(ctx, key, step, observation)
+	}
 	async := key == "QEMU.Create" || key == "QEMU.ResizeDisk" || key == "QEMU.Snapshot" || key == "QEMU.DeleteSnapshot" || key == "Nodes.CreateQemuMoveDisk" || key == "Nodes.CreateQemuMigrate" || key == "Nodes.DeleteQemu" || strings.HasSuffix(call.Method, "Async")
 	if key == "Storage.DeleteVolumeIfExistsAsync" {
 		values, ok := result.([]any)
@@ -374,6 +380,12 @@ func (g *managedDiskLifecycleGuard) after(ctx context.Context, call ManagedAlloc
 				// The move task checked both digests under the configuration
 				// locks and refused before its rename, so nothing moved.
 				return g.settleRefusedMove(ctx, step, observation)
+			}
+			if observation.ontoParker && pve.IsMoveSnapshotRefusalTaskExit(err) {
+				// The move task found the volume still in use when it checked
+				// again under the configuration locks, and it refused before
+				// its rename, so nothing moved onto the parker.
+				return g.settleSnapshotRefusedMove(ctx, key, step, observation)
 			}
 			return fmt.Errorf("managed lifecycle task outcome requires reconciliation")
 		}
@@ -595,6 +607,8 @@ func (g *managedDiskLifecycleGuard) prepareMove(ctx context.Context, call Manage
 	if value, ok := pve.ConfigString(target, observation.targetSlot); ok && value != "" {
 		return fmt.Errorf("move receiver slot already occupied")
 	}
+	tags, _ := pve.ConfigString(target, "tags")
+	observation.ontoParker = pve.IsParkerVM(observation.targetVMID, tags, parkerReadConfigFor(m.deps)) && !pve.TagsMarkDiskMover(tags)
 	params, ok := call.Args["params"].(*sdknodes.CreateQemuMoveDiskParams)
 	if !ok || params == nil {
 		return fmt.Errorf("managed move requires typed parameters")
@@ -1018,11 +1032,32 @@ func (g *managedDiskLifecycleGuard) observeConfigWrite(ctx context.Context, obse
 // request because a configuration changed after its digest was read.
 type managedMoveDigestRefusal struct{}
 
-// settleRefusedMove records a move that PVE refused on its digest check as
-// observed with the pre-move volume, once a readback of both views shows the
-// source still naming the managed disk on the same key and the receiving slot
-// still empty. A readback that shows anything else returns an error, and the
-// guard treats the move as uncertain.
+// managedMoveSnapshotRefusal is the After result for a move PVE refused in
+// the request because a snapshot or another drive key still names the volume.
+type managedMoveSnapshotRefusal struct{}
+
+// settleSnapshotRefusedMove settles a move that PVE refused because a
+// snapshot still names the volume. Only a move onto a parker settles, and any
+// other move keeps the guard's failure path.
+func (g *managedDiskLifecycleGuard) settleSnapshotRefusedMove(ctx context.Context, key, step string, observation managedDiskMutationObservation) error {
+	if key != "Nodes.CreateQemuMoveDisk" {
+		return fmt.Errorf("move refusal names another mutation")
+	}
+	if !observation.ontoParker {
+		// A move off a parker goes on to a fallback that can edit the
+		// volume onto the VM while a parker snapshot still names it, so
+		// the refusal stays uncertain there.
+		return fmt.Errorf("snapshot refusal settles only a move onto a parker")
+	}
+	return g.settleRefusedMove(ctx, step, observation)
+}
+
+// settleRefusedMove records a move that PVE refused before its rename as
+// refused, once a readback of both views shows the source still naming the
+// managed disk on the same key and the receiving slot still empty. The step
+// goes to the journal's Observed state holding only the pre-move volume. A
+// readback that shows anything else returns an error, and the guard treats the
+// move as uncertain.
 func (g *managedDiskLifecycleGuard) settleRefusedMove(ctx context.Context, step string, observation managedDiskMutationObservation) error {
 	m := g.lifecycle
 	sourceSlot, _ := observation.fields["disk"].(string)

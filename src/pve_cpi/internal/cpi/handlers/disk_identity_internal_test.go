@@ -51,6 +51,11 @@ type idFakeClient struct {
 	// moveErr, when set, fails the next CreateQemuMoveDisk with it and
 	// clears itself (one-shot), e.g. PVE's snapshot refusal.
 	moveErr error
+	// keepMoveErr makes moveErr fail every CreateQemuMoveDisk instead of
+	// only the next one, the way PVE repeats a refusal on every retry.
+	keepMoveErr bool
+	// moveCalls counts every CreateQemuMoveDisk, refused ones included.
+	moveCalls int
 	// attachErr, when set, fails the next AttachDisk with it and clears itself
 	// (one-shot), the way a lost attach response fails a config-edit park.
 	attachErr error
@@ -266,9 +271,12 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 func (n *idFakeNodes) CreateQemuMoveDisk(_ context.Context, _ string, vmidStr string, params *sdknodes.CreateQemuMoveDiskParams) (*sdknodes.CreateQemuMoveDiskResponse, error) {
 	n.c.mu.Lock()
 	defer n.c.mu.Unlock()
+	n.c.moveCalls++
 	if n.c.moveErr != nil {
 		err := n.c.moveErr
-		n.c.moveErr = nil
+		if !n.c.keepMoveErr {
+			n.c.moveErr = nil
+		}
 		return nil, err
 	}
 	srcVMID, _ := strconv.Atoi(vmidStr)
