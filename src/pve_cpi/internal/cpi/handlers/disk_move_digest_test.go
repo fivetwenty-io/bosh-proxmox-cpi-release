@@ -112,11 +112,11 @@ func digestAttach(t *testing.T, deps Deps, cid string) error {
 	return err
 }
 
-// changeConfig models another writer changing vmid's configuration, which
+// changeConfig models another writer changing VM 777's configuration, which
 // gives it a new digest.
-func changeConfig(client *lifecycleFlowPVE, vmid int) {
+func changeConfig(client *lifecycleFlowPVE) {
 	client.generation++
-	client.state.configs[vmid]["digest"] = fmt.Sprint(client.generation + 100)
+	client.state.configs[777]["digest"] = fmt.Sprint(client.generation + 100)
 }
 
 // unusedHolding returns the unused key of VM 777 that names volume.
@@ -187,7 +187,7 @@ func TestLegacyLateMoveRefusedAfterSourceChange(t *testing.T) {
 	if len(client.lostMoves) != 1 || unusedHolding(client, volume) == "" {
 		t.Fatalf("the lost move did not leave the volume on 777's unused entry: lost=%d cfg=%v", len(client.lostMoves), client.state.configs[777])
 	}
-	changeConfig(client, 777)
+	changeConfig(client)
 	outcome := client.runLostMove(0)
 	if !strings.HasPrefix(outcome, "refused: VM 777: detected modified configuration") {
 		t.Fatalf("the late task was not refused by its digest: %s", outcome)
@@ -303,7 +303,7 @@ func TestManagedLateMoveRefusedByDigest(t *testing.T) {
 	if len(client.lostMoves) != 1 {
 		t.Fatalf("want one lost move, got %d", len(client.lostMoves))
 	}
-	changeConfig(client, 777)
+	changeConfig(client)
 	if outcome := client.runLostMove(0); !strings.HasPrefix(outcome, "refused: VM 777: detected modified configuration") {
 		t.Fatalf("the late managed task was not refused by its digest: %s", outcome)
 	}
@@ -585,7 +585,7 @@ func TestLegacyDroppedMoveRefusalStandsWhenNothingMoved(t *testing.T) {
 	client.dropMoveResponses = 1
 	client.beforeMoveCheck = func(call int, _ *nodes.CreateQemuMoveDiskParams) {
 		if call == 2 {
-			changeConfig(client, 777)
+			changeConfig(client)
 		}
 	}
 	err := digestDetach(t, deps, cid)

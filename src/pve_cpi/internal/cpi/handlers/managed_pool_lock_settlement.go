@@ -154,7 +154,10 @@ func readLockSentinel(ctx context.Context, pools pve.PoolService, sentinel strin
 // step is recorded as the guard records one: observed, with the disk volume a
 // lifecycle step names, and without touching the record's own state.
 func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.Handle) (gaps map[string]error, settleErr error) {
-	defer func() { gaps, settleErr = settlePlannedProtectionSteps(ctx, client, handle, gaps, settleErr) }()
+	defer func() {
+		gaps, settleErr = settlePlannedProtectionSteps(ctx, client, handle, gaps, settleErr)
+		gaps, settleErr = settlePlannedMoveSteps(ctx, client, handle, gaps, settleErr)
+	}()
 	if handle == nil {
 		return nil, nil
 	}
@@ -323,14 +326,18 @@ func unsettledStepText(record aj.Record, reasons map[string]error, settled func(
 }
 
 // unsettledStepReason is the clause a refusal adds after naming step: why
-// settlement left a lock or protection step planned, from reasons, or that a
-// lock step's sentinel was not read. It returns "" for every other step.
+// settlement left a lock, protection, or move step planned, from reasons, or
+// that a lock step's sentinel was not read. It returns "" for every other
+// step.
 func unsettledStepReason(step aj.Step, reasons map[string]error) string {
 	var gap *lockSettlementGap
 	if errors.As(reasons[step.ID], &gap) {
 		return "; its lock sentinel could not be settled because " + gap.Error()
 	}
 	if extra := protectionSettlementText(reasons[step.ID]); extra != "" {
+		return extra
+	}
+	if extra := moveSettlementText(reasons[step.ID]); extra != "" {
 		return extra
 	}
 	if isLockStep(step) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"sort"
 	"time"
@@ -413,7 +414,15 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 	}
 	if len(gaps) > 0 {
 		record := handle.Record()
-		refusal := storageRefusal("lifecycle has unresolved mutation evidence; " + unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() }))
+		text := "lifecycle has unresolved mutation evidence; " + unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() })
+		refusal := storageRefusal(text)
+		if hasMoveSettlementGap(gaps) {
+			// A move step the settler left planned refuses as a Cloud error
+			// that is not retried. That's the answer the Director got when
+			// storageLifecycleSettled refused the step as a plain error, and
+			// the typed error gives it on purpose.
+			refusal = cpierrors.Cloud("%s", text)
+		}
 		return errors.Join(refusal, handle.Close(), journal.Close())
 	}
 	if err := storageLifecycleSettled(handle.Record()); err != nil {

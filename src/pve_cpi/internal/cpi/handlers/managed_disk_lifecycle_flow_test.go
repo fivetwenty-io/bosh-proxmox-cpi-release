@@ -134,6 +134,17 @@ type lifecycleFlowPVE struct {
 	// onConfigRead, when set, runs before every config read, and an error it
 	// returns fails that read.
 	onConfigRead func(vmid int) error
+	// activeMoveTasks is each node's active qmmove task list, and
+	// activeMoveTaskErr fails every listing. onActiveMoveTasks runs before
+	// each listing with its node, and moveTaskListings records the nodes
+	// listed, in order.
+	activeMoveTasks   map[string][]pve.ActiveTask
+	activeMoveTaskErr error
+	onActiveMoveTasks func(node string)
+	moveTaskListings  []string
+	// destroyed records every volume PVE destroyed, in order, whether a
+	// storage delete or the delete of an unused entry its VM owns took it.
+	destroyed []string
 }
 
 // lostMove is a move task PVE forked for a POST whose response was lost.
@@ -580,7 +591,13 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 			}
 		}
 	}
+	// Deleting an unused entry destroys the volume when the VM owns it by
+	// name, as qemu-server's update_vm_api does through try_deallocate_drive
+	// and PVE::Storage::vdisk_free (src/PVE/API2/Qemu.pm line 2321 and
+	// src/PVE/QemuServer.pm line 4908 at a7b4240b). The volume is recorded
+	// in destroyed, but deletes counts only storage deletes.
 	if fakeVolumeOwnedBy(deletedVolume, vmid) {
+		n.c.destroyed = append(n.c.destroyed, deletedVolume)
 		delete(n.c.state.volumes, deletedVolume)
 		n.c.volumeDeleted()
 	}
@@ -831,6 +848,19 @@ func TestManagedDiskConfigEditParkKeepsItsVolumeAndIdentity(t *testing.T) {
 
 func (c *lifecycleFlowPVE) StorageAuditVisibility(context.Context) error { return c.visibilityErr }
 
+// ActiveMoveTasks serves activeMoveTasks for node, the way PVE's active task
+// list answers a qmmove typefilter.
+func (c *lifecycleFlowPVE) ActiveMoveTasks(_ context.Context, node string) ([]pve.ActiveTask, error) {
+	c.moveTaskListings = append(c.moveTaskListings, node)
+	if c.onActiveMoveTasks != nil {
+		c.onActiveMoveTasks(node)
+	}
+	if c.activeMoveTaskErr != nil {
+		return nil, c.activeMoveTaskErr
+	}
+	return append([]pve.ActiveTask{}, c.activeMoveTasks[node]...), nil
+}
+
 // volumeDeleted applies visibilityErrAfterDelete once any volume is deleted.
 func (c *lifecycleFlowPVE) volumeDeleted() {
 	if c.visibilityErrAfterDelete != nil {
@@ -849,6 +879,7 @@ type lifecycleFlowStorage struct {
 func (s lifecycleFlowStorage) DeleteVolumeAsync(_ context.Context, node, pool, volume string) (string, error) {
 	s.c.deletes++
 	s.c.volumeDeleted()
+	s.c.destroyed = append(s.c.destroyed, volume)
 	delete(s.c.state.volumes, volume)
 	return fmt.Sprintf("UPID:%s:000573BD:03504636:6AA1786A:imgdel:123@%s:pmx@pve!pmx:", node, pool), nil
 }
