@@ -190,15 +190,25 @@ func readBackUnansweredMove(ctx context.Context, c Client, node string, srcVMID 
 
 // uncertainUnansweredMove is what moveDiskToVM returns when one of its POSTs
 // went unanswered and the readback can't settle what the move came to. The
-// error is retriable and carries none of PVE's text, so it doesn't wrap
-// ErrMoveDiskDigestRefused, and windowWorkEnding reads the outcome as
-// unknown. readDigestFailed says the call ended on a failed digest read with
-// the disk still in place, rather than on a readback that proved neither
-// outcome.
-func uncertainUnansweredMove(logger *log.Logger, moveErr error, srcVMID int, disk string, targetVMID int, targetSlot, volume string, readDigestFailed bool) error {
+// error is retriable, wraps nothing, and carries none of a refusal's text, so
+// it doesn't wrap ErrMoveDiskDigestRefused, and windowWorkEnding reads the
+// outcome as unknown. readFailed says the call ended on a failed digest read
+// rather than on a refusal, and inPlace says the readback after that read
+// error found the disk still in place, rather than proving neither outcome.
+//
+// After a failed digest read, the message ends with that read error's text,
+// so the Director sees why the read failed. The error carries only the text
+// and doesn't wrap the read error, because a wrapped API error or ended
+// context would let pveAnswered, windowWorkEnding, and the callers' own checks
+// classify the outcome as the read error rather than as unknown.
+func uncertainUnansweredMove(logger *log.Logger, moveErr error, srcVMID int, disk string, targetVMID int, targetSlot, volume string, readFailed, inPlace bool) error {
 	found := fmt.Sprintf("a readback showed neither the landed move nor %q still on vm %d %s with the receiving slot empty", volume, srcVMID, disk)
-	if readDigestFailed {
+	if inPlace {
 		found = fmt.Sprintf("a digest read failed, which can't rule out that request's task landing later, even though a readback found %q still on vm %d %s with the receiving slot empty", volume, srcVMID, disk)
+	}
+	cause := ""
+	if readFailed {
+		cause = fmt.Sprintf(". The digest read failed with %s", strings.TrimSpace(moveErr.Error()))
 	}
 	if logger != nil {
 		logger.Warn("disk transfer: a move ended on a digest refusal or read error after an unanswered request, and its outcome is unknown",
@@ -211,8 +221,8 @@ func uncertainUnansweredMove(logger *log.Logger, moveErr error, srcVMID int, dis
 		)
 	}
 	return cpierrors.Retriable(
-		"move_disk %s of vm %d to vm %d slot %s has an unknown outcome, because an earlier request got no answer from PVE and %s; retry",
-		disk, srcVMID, targetVMID, targetSlot, found)
+		"move_disk %s of vm %d to vm %d slot %s has an unknown outcome, because an earlier request got no answer from PVE and %s; retry%s",
+		disk, srcVMID, targetVMID, targetSlot, found, cause)
 }
 
 // moveDiskToVM issues one move_disk reassignment and awaits its task. disk is
@@ -371,14 +381,14 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			return nil
 		}
 		if readback == moveReadbackUncertain {
-			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, false)
+			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, errFromDigestRead, false)
 		}
 		if errFromDigestRead {
 			// A refusal proves that a configuration changed since the
 			// unanswered POST's digests were read, and a read error proves
 			// nothing, so that POST's task could still land after this
 			// readback.
-			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, true)
+			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, true, true)
 		}
 		// The source still names the volume and the slot is empty, so the
 		// refusal stands as it is.

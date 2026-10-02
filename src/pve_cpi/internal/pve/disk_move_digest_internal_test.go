@@ -89,10 +89,13 @@ func TestPVEAnsweredSeparatesAnswersFromLostRequests(t *testing.T) {
 // read of the parker fails with it before any second POST, and the first task
 // hasn't run yet, so it can still land after the readback.
 //
-// The parker's protection restore hangs on cutOff, a context the fake cancels
-// at the mid-commit read, which is the readback's pending read of the parker.
-// The restore then ends without an answer from PVE, so the cut-off restore
-// reports how the transfer ended, and the row waits on no real deadline.
+// The parker's protection restore returns at once with an ended context, the
+// way a restore that its deadline cut off would. The restore then ends without
+// an answer from PVE, so the cut-off restore reports how the transfer ended,
+// and the row waits on no real deadline. cutOff is a context the fake cancels
+// at the mid-commit read, which is the readback's pending read of the parker,
+// and a restore that arrives before that read sets restoreEarly, so a row can
+// check that the restore came after the readback.
 type unansweredMoveClient struct {
 	*scanFakeClient
 	parker  int
@@ -232,27 +235,78 @@ func TestTransferDiskFromParker_MidCommitReadbackIsUnknown(t *testing.T) {
 
 // TestTransferDiskFromParker_ReadErrorAfterUnansweredMoveIsUnknown drops the
 // response to the move off the parker, and the second attempt's config read
-// of the parker fails with a permission error, which the loop doesn't retry.
-// The readback finds the disk still on the parker and the target's slot
-// empty. A read error, unlike a refusal, doesn't prove that a configuration
-// changed, so the first task could still land after the readback. The
-// transfer comes back retriable without the read error or the digest
-// refusal, and the cut-off restore says the transfer's outcome is unknown.
+// of the parker fails with an error the loop doesn't retry, either PVE's
+// permission refusal or an ended context. The readback finds the disk still
+// on the parker and the target's slot empty. A read error, unlike a refusal,
+// doesn't prove that a configuration changed, so the first task could still
+// land after the readback. The transfer comes back retriable without the
+// digest refusal, and the cut-off restore says the transfer's outcome is
+// unknown. The move's own error names the read error's text, so the Director
+// sees why the read failed, but it doesn't wrap the read error, so neither
+// PVE's answer nor the ended context changes how a caller classifies it.
 func TestTransferDiskFromParker_ReadErrorAfterUnansweredMoveIsUnknown(t *testing.T) {
 	t.Parallel()
-	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
-	c := newUnansweredMoveClient(sdkerrors.ParseAPIError(403, []byte(`{"message":"Permission check failed (/vms/90000, VM.Audit)\n"}`)))
-	parker := DiskHolder{Found: true, VMID: 90000, Node: "pve1", IsParker: true, Slot: "scsi0"}
-	landed, err := TransferDiskFromParker(ctx, c, nil, parker, 700, "scsi1",
-		"data:vm-90000-disk-0", "data:vm-90000-disk-0,serial="+transferStableID, transferTestCfg)
-	if c.posts != 1 || !c.readFailed {
-		t.Fatalf("want one move POST and the failed read, got %d POSTs and failed read %t", c.posts, c.readFailed)
+	for name, tc := range map[string]struct {
+		readErr error
+		text    string
+	}{
+		"permission refusal": {
+			readErr: sdkerrors.ParseAPIError(403, []byte(`{"message":"Permission check failed (/vms/90000, VM.Audit)\n"}`)),
+			text:    "Permission check failed (/vms/90000, VM.Audit)",
+		},
+		"ended context": {
+			readErr: fmt.Errorf("read the config of vm 90000: %w", context.Canceled),
+			text:    "read the config of vm 90000: context canceled",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+			c := newUnansweredMoveClient(tc.readErr)
+			parker := DiskHolder{Found: true, VMID: 90000, Node: "pve1", IsParker: true, Slot: "scsi0"}
+			landed, err := TransferDiskFromParker(ctx, c, nil, parker, 700, "scsi1",
+				"data:vm-90000-disk-0", "data:vm-90000-disk-0,serial="+transferStableID, transferTestCfg)
+			if c.posts != 1 || !c.readFailed {
+				t.Fatalf("want one move POST and the failed read, got %d POSTs and failed read %t", c.posts, c.readFailed)
+			}
+			if held, _ := ConfigString(c.configs[90000], "scsi0"); !strings.HasPrefix(held, "data:vm-90000-disk-0") {
+				t.Fatalf("parker scsi0 holds %q, want the disk still in place", held)
+			}
+			if err == nil {
+				t.Fatal("a move with an unknown outcome returned no error")
+			}
+			assertTransferOutcomeUnknown(t, c, landed, err)
+
+			// The protection restore's cut-off wraps an ended context of its
+			// own, so we check the move's error, which joinWindowErrors puts
+			// first in the join.
+			var joined interface{ Unwrap() []error }
+			if !errors.As(err, &joined) || len(joined.Unwrap()) != 2 {
+				t.Fatalf("error %q is not the move's error joined with the restore's", err)
+			}
+			moveErr := joined.Unwrap()[0]
+			if msg := moveErr.Error(); !strings.Contains(msg, "has an unknown outcome") || !strings.Contains(msg, tc.text) {
+				t.Fatalf("move error %q doesn't say why the digest read failed, want %q in it", msg, tc.text)
+			}
+			if errors.Is(moveErr, ErrMoveDiskDigestRefused) || IsMoveDigestRefusal(moveErr) {
+				t.Fatalf("move error %q reads as a digest refusal", moveErr)
+			}
+			if got := windowWorkEnding("the move", moveErr); got != "the outcome of the move is unknown" {
+				t.Fatalf("windowWorkEnding = %q, want the outcome unknown", got)
+			}
+			var typed *cpierrors.Error
+			if !errors.As(moveErr, &typed) || typed.Type() != cpierrors.TypeRetriableCloud || !typed.OkToRetry() {
+				t.Fatalf("move error %q is not retriable", moveErr)
+			}
+			if errors.Is(moveErr, context.Canceled) || errors.Is(moveErr, context.DeadlineExceeded) {
+				t.Fatalf("move error %q reaches an ended context", moveErr)
+			}
+			if code, ok := apiHTTPCode(moveErr); ok {
+				t.Fatalf("move error %q reaches PVE's answer with status %d", moveErr, code)
+			}
+			if _, answered := pveAnswered(moveErr); answered {
+				t.Fatalf("move error %q reads as PVE's answer", moveErr)
+			}
+		})
 	}
-	if held, _ := ConfigString(c.configs[90000], "scsi0"); !strings.HasPrefix(held, "data:vm-90000-disk-0") {
-		t.Fatalf("parker scsi0 holds %q, want the disk still in place", held)
-	}
-	if strings.Contains(err.Error(), "Permission check failed") {
-		t.Fatalf("error %q lets the read error stand", err)
-	}
-	assertTransferOutcomeUnknown(t, c, landed, err)
 }
