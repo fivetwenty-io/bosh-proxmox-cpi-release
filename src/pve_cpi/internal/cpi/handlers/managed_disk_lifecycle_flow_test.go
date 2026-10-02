@@ -73,6 +73,10 @@ type lifecycleFlowPVE struct {
 	// a VM while an operation is between its steps.
 	afterConfigWrite func(vmid int)
 	onContentRead    func(volume string)
+	// beforeConfigWrite, when set, runs as each config write arrives, before
+	// the fake checks its digest, so a row can change the VM under a writer
+	// that has already read it.
+	beforeConfigWrite func(vmid int)
 	// unlisted hides VMs from the guest listings, the way a listing that
 	// hasn't caught up with a guest does, while their configs still answer.
 	unlisted map[int]bool
@@ -544,6 +548,9 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	vmid, err := strconv.Atoi(vmidText)
 	if err != nil {
 		return err
+	}
+	if n.c.beforeConfigWrite != nil {
+		n.c.beforeConfigWrite(vmid)
 	}
 	cfg := n.c.state.configs[vmid]
 	if p.Digest != nil && *p.Digest != cfg["digest"] {
