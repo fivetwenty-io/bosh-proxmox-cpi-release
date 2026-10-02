@@ -14,6 +14,7 @@ import (
 	nodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 	sdk "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 	"os"
@@ -75,6 +76,124 @@ type lifecycleFlowPVE struct {
 	// unlisted hides VMs from the guest listings, the way a listing that
 	// hasn't caught up with a guest does, while their configs still answer.
 	unlisted map[int]bool
+	// moveCalls counts every move POST the fake received.
+	moveCalls int
+	// moveDigests records the source and target digests each move POST
+	// carried, empty when the POST sent none.
+	moveDigests [][2]string
+	// changeSourceBeforeMove makes the next move POST see its source
+	// configuration changed by another writer after the caller read it.
+	changeSourceBeforeMove bool
+	// moveTaskRefusal makes the next move start a task that refuses on its
+	// digest check inside the configuration locks, the check at Qemu.pm:5031.
+	moveTaskRefusal bool
+	// loseMoveResponse makes every move pass PVE's request checks, record the
+	// task PVE would fork in lostMoves, and answer with a lost response. It
+	// models a lost response that ends the call, because the move's retry
+	// loop doesn't retry its plain error, so no second POST goes out.
+	loseMoveResponse bool
+	lostMoves        []lostMove
+	// failedTasks maps a UPID to the exit status its task reports.
+	failedTasks map[string]string
+	// dropMoveResponses makes that many of the next move POSTs pass PVE's
+	// request checks, record the task PVE would fork in lostMoves, and fail
+	// with a dropped connection. It models a transport fault that the move's
+	// retry loop retries, so the call goes on to a second attempt.
+	dropMoveResponses int
+	// dropMoveStatus, when set, makes each dropped POST fail with that HTTP
+	// status and no text from PVE instead of a dropped connection. It models
+	// a status such as 597, which pveproxy relays from its own client when
+	// the response breaks off after the backend forked the task, and which
+	// the move's retry loop retries as a server error.
+	dropMoveStatus int
+	// deferMoveTasks makes every move that passes PVE's request checks record
+	// its task in lostMoves and answer with a UPID. The task runs only when
+	// the CPI awaits it, after beforeMoveTask, so a row can land an earlier
+	// task between a POST and its await. deferredOutcomes records what each
+	// such task did, in the order the tasks ran.
+	deferMoveTasks   bool
+	beforeMoveTask   func()
+	deferredMoves    map[string]int
+	deferredOutcomes []string
+	// beforeMoveCheck, when set, runs before PVE's request checks on every
+	// move POST, with the POST's number and parameters.
+	beforeMoveCheck func(call int, p *nodes.CreateQemuMoveDiskParams)
+	// onConfigRead, when set, runs before every config read, and an error it
+	// returns fails that read.
+	onConfigRead func(vmid int) error
+}
+
+// lostMove is a move task PVE forked for a POST whose response was lost.
+type lostMove struct {
+	source, target       int
+	disk, slot           string
+	digest, targetDigest *string
+}
+
+// moveDigestRefusal is PVE's answer to a move whose digest no longer matches
+// the configuration of vmid: assert_if_modified's text behind the move
+// handler's "VM <vmid>: " prefix, as an HTTP 500.
+func moveDigestRefusal(vmid int) error {
+	body, _ := json.Marshal(map[string]string{"message": fmt.Sprintf("VM %d: detected modified configuration - file changed by other user? Try again.\n", vmid)})
+	return sdkerrors.ParseAPIError(500, body)
+}
+
+// moveDigestMismatch reports which side of a move no longer matches the digest
+// the POST carried, or 0 when both match or none was sent.
+func (c *lifecycleFlowPVE) moveDigestMismatch(sourceID, targetID int, digest, targetDigest *string) int {
+	if digest != nil && *digest != c.state.configs[sourceID]["digest"] {
+		return sourceID
+	}
+	if targetDigest != nil && *targetDigest != c.state.configs[targetID]["digest"] {
+		return targetID
+	}
+	return 0
+}
+
+// runLostMove plays the task of lost move i the way PVE's worker runs it,
+// with the digest check (Qemu.pm:5031) and the disk key check (:5040) made
+// against the configurations as they are now. It reports what the task did.
+func (c *lifecycleFlowPVE) runLostMove(i int) string {
+	lost := c.lostMoves[i]
+	if vmid := c.moveDigestMismatch(lost.source, lost.target, lost.digest, lost.targetDigest); vmid != 0 {
+		return fmt.Sprintf("refused: VM %d: detected modified configuration - file changed by other user? Try again.", vmid)
+	}
+	if _, exists := c.state.configs[lost.source][lost.disk]; !exists {
+		return fmt.Sprintf("refused: Disk '%s' for VM '%d' does not exist", lost.disk, lost.source)
+	}
+	if err := c.reassignVolume(lost.source, lost.disk, lost.target, lost.slot); err != nil {
+		return "failed: " + err.Error()
+	}
+	return fmt.Sprintf("moved vm%d.%s to vm%d.%s", lost.source, lost.disk, lost.target, lost.slot)
+}
+
+// Tasks reports the exit status of every task failedTasks names, and success
+// for every other task.
+func (c *lifecycleFlowPVE) Tasks() tasks.Service {
+	return lifecycleFlowTasks{c: c}
+}
+
+type lifecycleFlowTasks struct {
+	diskSizingTasks
+	c *lifecycleFlowPVE
+}
+
+func (t lifecycleFlowTasks) Wait(ctx context.Context, node, upid string, opts *tasks.WaitOptions) (*tasks.Status, error) {
+	if exit, failed := t.c.failedTasks[upid]; failed {
+		return nil, fmt.Errorf("task failed: %s", exit)
+	}
+	if i, deferred := t.c.deferredMoves[upid]; deferred {
+		delete(t.c.deferredMoves, upid)
+		if t.c.beforeMoveTask != nil {
+			t.c.beforeMoveTask()
+		}
+		outcome := t.c.runLostMove(i)
+		t.c.deferredOutcomes = append(t.c.deferredOutcomes, outcome)
+		if !strings.HasPrefix(outcome, "moved ") {
+			return nil, fmt.Errorf("task failed: %s", strings.TrimPrefix(outcome, "refused: "))
+		}
+	}
+	return t.diskSizingTasks.Wait(ctx, node, upid, opts)
 }
 
 func (c *lifecycleFlowPVE) Nodes() nodes.Service {
@@ -462,46 +581,106 @@ func (n lifecycleFlowNodes) CreateQemuMoveDisk(_ context.Context, _ string, sour
 	if n.c.moveErr != nil {
 		return nil, n.c.moveErr
 	}
-	sourceID, _ := strconv.Atoi(sourceText)
-	source := n.c.state.configs[sourceID]
-	targetID := int(*p.TargetVmid)
-	target := n.c.state.configs[targetID]
-	if p.Digest != nil && *p.Digest != source["digest"] || p.TargetDigest != nil && *p.TargetDigest != target["digest"] {
-		return nil, fmt.Errorf("move generation conflict")
+	n.c.moveCalls++
+	digests := [2]string{}
+	if p.Digest != nil {
+		digests[0] = *p.Digest
 	}
-	value, _ := pve.ConfigString(source, p.Disk)
-	old := strings.Split(value, ",")[0]
-	storage, _, err := pve.ParseDiskCID(old)
-	if err != nil {
+	if p.TargetDigest != nil {
+		digests[1] = *p.TargetDigest
+	}
+	n.c.moveDigests = append(n.c.moveDigests, digests)
+	sourceID, _ := strconv.Atoi(sourceText)
+	targetID := int(*p.TargetVmid)
+	if n.c.beforeMoveCheck != nil {
+		n.c.beforeMoveCheck(n.c.moveCalls, p)
+	}
+	if n.c.changeSourceBeforeMove {
+		n.c.changeSourceBeforeMove = false
+		n.c.generation++
+		n.c.state.configs[sourceID]["digest"] = fmt.Sprint(n.c.generation + 100)
+	}
+	// PVE's request checks, before any fork (Qemu.pm:5191).
+	if vmid := n.c.moveDigestMismatch(sourceID, targetID, p.Digest, p.TargetDigest); vmid != 0 {
+		return nil, moveDigestRefusal(vmid)
+	}
+	forked := lostMove{source: sourceID, target: targetID, disk: p.Disk, slot: *p.TargetDisk, digest: p.Digest, targetDigest: p.TargetDigest}
+	if n.c.loseMoveResponse {
+		n.c.lostMoves = append(n.c.lostMoves, forked)
+		return nil, fmt.Errorf("move_disk response lost")
+	}
+	if n.c.dropMoveResponses > 0 {
+		n.c.dropMoveResponses--
+		n.c.lostMoves = append(n.c.lostMoves, forked)
+		if n.c.dropMoveStatus != 0 {
+			return nil, sdkerrors.ParseAPIError(n.c.dropMoveStatus, []byte(`{"data":null}`))
+		}
+		return nil, &sdkerrors.ConnectionError{Host: "n1", Port: 8006, Message: "connection reset by peer"}
+	}
+	if n.c.deferMoveTasks {
+		n.c.lostMoves = append(n.c.lostMoves, forked)
+		upid := fmt.Sprintf("UPID:n1:%08X:03504636:6AA1786A:qmmove:%d-%s>%d-%s:root@pam:", len(n.c.lostMoves), sourceID, p.Disk, targetID, *p.TargetDisk)
+		if n.c.deferredMoves == nil {
+			n.c.deferredMoves = map[string]int{}
+		}
+		n.c.deferredMoves[upid] = len(n.c.lostMoves) - 1
+		raw := json.RawMessage(strconv.Quote(upid))
+		return &raw, nil
+	}
+	if n.c.moveTaskRefusal {
+		n.c.moveTaskRefusal = false
+		upid := fmt.Sprintf("UPID:n1:000573BD:03504636:6AA1786A:qmmove:%d-%s>%d-%s:root@pam:", sourceID, p.Disk, targetID, *p.TargetDisk)
+		if n.c.failedTasks == nil {
+			n.c.failedTasks = map[string]string{}
+		}
+		n.c.failedTasks[upid] = fmt.Sprintf("VM %d: detected modified configuration - file changed by other user? Try again.", sourceID)
+		raw := json.RawMessage(strconv.Quote(upid))
+		return &raw, nil
+	}
+	if err := n.c.reassignVolume(sourceID, p.Disk, targetID, *p.TargetDisk); err != nil {
 		return nil, err
 	}
-	info := n.c.state.volumes[old]
-	if info == nil {
-		return nil, fmt.Errorf("source volume missing")
-	}
-	n.c.moves++
-	landed := fmt.Sprintf("%s:%d/vm-%d-disk-%d.raw", storage, targetID, targetID, n.c.moves)
-	opts := strings.TrimPrefix(value, old)
-	if strings.HasPrefix(p.Disk, "unused") {
-		opts = ""
-	}
-	delete(source, p.Disk)
-	target[*p.TargetDisk] = landed + opts
-	delete(n.c.state.volumes, old)
-	n.c.state.volumes[landed] = info
-	if n.c.volumeNodes != nil {
-		n.c.volumeNodes[landed] = n.c.volumeNodes[old]
-		delete(n.c.volumeNodes, old)
-	}
-	n.c.generation++
-	source["digest"] = fmt.Sprint(n.c.generation + 100)
-	n.c.generation++
-	target["digest"] = fmt.Sprint(n.c.generation + 100)
 	if n.c.afterMove != nil {
 		n.c.afterMove()
 	}
 	raw := json.RawMessage(`"UPID:n1:move"`)
 	return &raw, nil
+}
+
+// reassignVolume moves the volume on disk of sourceID to slot of targetID and
+// renames it for its new owner, the way a completed reassign does.
+func (c *lifecycleFlowPVE) reassignVolume(sourceID int, disk string, targetID int, slot string) error {
+	source := c.state.configs[sourceID]
+	target := c.state.configs[targetID]
+	value, _ := pve.ConfigString(source, disk)
+	old := strings.Split(value, ",")[0]
+	storage, _, err := pve.ParseDiskCID(old)
+	if err != nil {
+		return err
+	}
+	info := c.state.volumes[old]
+	if info == nil {
+		return fmt.Errorf("source volume missing")
+	}
+	c.moves++
+	landed := fmt.Sprintf("%s:%d/vm-%d-disk-%d.raw", storage, targetID, targetID, c.moves)
+	opts := strings.TrimPrefix(value, old)
+	if strings.HasPrefix(disk, "unused") {
+		opts = ""
+	}
+	delete(source, disk)
+	target[slot] = landed + opts
+	delete(c.state.volumes, old)
+	c.state.volumes[landed] = info
+	if c.volumeNodes != nil {
+		c.volumeNodes[landed] = c.volumeNodes[old]
+		delete(c.volumeNodes, old)
+	}
+	c.generation++
+	source["digest"] = fmt.Sprint(c.generation + 100)
+	c.generation++
+	target["digest"] = fmt.Sprint(c.generation + 100)
+	return nil
 }
 func (q lifecycleFlowQEMU) Create(ctx context.Context, node string, params map[string]any) (string, error) {
 	upid, err := q.managedDiskTestQEMU.Create(ctx, node, params)
@@ -706,6 +885,11 @@ func (c *lifecycleFlowPVE) vmNode(vmid int) string {
 	return "n1"
 }
 func (q lifecycleFlowQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.c.onConfigRead != nil {
+		if err := q.c.onConfigRead(vmid); err != nil {
+			return nil, err
+		}
+	}
 	if _, exists := q.c.state.configs[vmid]; !exists || q.c.vmNode(vmid) != node {
 		return nil, sdkerrors.ParseAPIError(404, []byte(`{"message":"VM not found"}`))
 	}

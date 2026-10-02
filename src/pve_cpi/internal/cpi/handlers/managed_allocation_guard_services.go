@@ -649,6 +649,12 @@ func (t *managedNodesService) CreateQemuMoveDisk(ctx context.Context, node, vmid
 	}
 	defer t.guard.end(ctx, m, token)
 	resp, err = t.Service.CreateQemuMoveDisk(ctx, node, vmid, params)
+	if err != nil && ctx.Err() == nil && pve.IsMoveDigestRefusal(err) {
+		// PVE refused the move in the request, before any task, because a
+		// configuration changed after its digest was read. Nothing moved, so
+		// the step settles by readback and the guard stays usable.
+		return nil, t.guard.settleRefused(ctx, m, token, managedMoveDigestRefusal{}, err)
+	}
 	err = t.guard.finish(ctx, m, token, resp, err)
 	return
 }

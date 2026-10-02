@@ -52,6 +52,169 @@ func IsMoveDiskSnapshotRefusal(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "used by a snapshot")
 }
 
+// ErrMoveDiskDigestRefused wraps PVE's refusal of a move_disk reassignment
+// whose source or target configuration changed after the CPI read the digest
+// it sent. PVE compares both digests before it renames anything, once in the
+// request and again inside the task under both configuration locks, so the
+// refusal proves that its own request or task changed nothing. moveDiskToVM
+// returns it only when no earlier POST of the call went unanswered, or when a
+// readback shows the disk still where it was.
+var ErrMoveDiskDigestRefused = errors.New("move_disk refused: configuration changed after its digest was read")
+
+// moveDigestRefusalText is the message PVE's assert_if_modified dies with.
+// The move handler prefixes it with "VM <vmid>: " for the side that changed.
+const moveDigestRefusalText = "detected modified configuration - file changed by other user"
+
+// IsMoveDigestRefusal reports whether err is PVE's digest refusal of a
+// move_disk reassignment, either as the request's own answer or as the move
+// task's exit status. It is meant for move results only. A configuration
+// update with a stale digest fails with the same text, and that failure keeps
+// its own handling.
+func IsMoveDigestRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrMoveDiskDigestRefused) {
+		return true
+	}
+	if !strings.Contains(err.Error(), moveDigestRefusalText) {
+		return false
+	}
+	_, answered := pveAnswered(err)
+	return answered || IsTaskExitVerdict(err)
+}
+
+// stopOnMoveDigestRefusal ends the move's retry loop on a digest refusal. A
+// 500 reads as a transient fault to the loop, and a retry would read fresh
+// digests and could move whatever volume holds the disk key by then, so the
+// refusal leaves the loop as ErrMoveDiskDigestRefused with PVE's text and
+// without the transport error underneath it.
+func stopOnMoveDigestRefusal(err error) error {
+	return fmt.Errorf("%w: %s", ErrMoveDiskDigestRefused, err.Error())
+}
+
+// moveDigests reads the source and target configurations immediately before a
+// move POST and returns their digests, along with the volume the source's
+// disk key names. Every write the caller makes before the move, the source
+// slot delete included, lands before these reads, so the digests match the
+// configurations PVE checks. A late task whose response was lost then refuses
+// to move anything once either configuration has changed. A configuration
+// without a digest leaves that digest empty, and PVE skips the check for an
+// empty one. The volume is what a readback after an unanswered POST compares
+// the source against.
+func moveDigests(ctx context.Context, c Client, node string, srcVMID int, disk string, targetVMID int) (digest, targetDigest, sourceVolume string, err error) {
+	source, err := c.QEMU().Config(ctx, node, srcVMID)
+	if err != nil {
+		return "", "", "", cpierrors.Wrap(WrapConfigReadError(err), fmt.Sprintf("move_disk: config read for source vm %d", srcVMID))
+	}
+	target, err := c.QEMU().Config(ctx, node, targetVMID)
+	if err != nil {
+		return "", "", "", cpierrors.Wrap(WrapConfigReadError(err), fmt.Sprintf("move_disk: config read for target vm %d", targetVMID))
+	}
+	digest, _ = ConfigString(source, "digest")
+	targetDigest, _ = ConfigString(target, "digest")
+	sourceVolume, _ = slotBareVolid(source, disk)
+	return digest, targetDigest, sourceVolume, nil
+}
+
+// MoveSourceStillNames reports whether a move's source key still names volume
+// the way it did before the move. The applied view has to name it, and the
+// key can't have a pending delete or a pending replacement. A refusal proves
+// only that its own request or task moved nothing, so a caller reads this
+// back, together with MoveSlotEmpty, before it relies on the refusal.
+func MoveSourceStillNames(source QemuViews, key, volume string) bool {
+	if volume == "" || source.PendingDelete(key) {
+		return false
+	}
+	if _, replaced := source.PendingReplacements()[key]; replaced {
+		return false
+	}
+	held, _ := slotBareVolid(source.Applied(), key)
+	return held == volume
+}
+
+// MoveSlotEmpty reports whether a move's receiving slot is empty in both
+// views, so neither a drive nor a pending add holds it.
+func MoveSlotEmpty(target QemuViews, slot string) bool {
+	_, applied := slotBareVolid(target.Applied(), slot)
+	_, current := slotBareVolid(target.Current(), slot)
+	return !applied && !current
+}
+
+// moveReadback is what a readback after an unanswered move POST found.
+type moveReadback int
+
+const (
+	// moveReadbackUncertain means the readback failed or found a state
+	// that proves neither outcome, such as an earlier task mid-commit.
+	moveReadbackUncertain moveReadback = iota
+	// moveReadbackLanded means the move landed, as moveDiskLanded reports.
+	moveReadbackLanded
+	// moveReadbackInPlace means the source still names the original volume
+	// on the same key and the receiving slot is empty.
+	moveReadbackInPlace
+)
+
+// readBackUnansweredMove decides what a move came to when one of its POSTs
+// went unanswered and a later attempt ended on a digest refusal or a failed
+// digest read. PVE may have forked the unanswered POST's task, and that task
+// can land after a later attempt read its digests. The later refusal then
+// proves only that its own request or task moved nothing. volume is what the
+// source's disk key named before the first POST.
+//
+// When the source still names volume on the same key and the receiving slot
+// is empty, the configuration has changed since the first POST's digests were
+// read, so any earlier task that hasn't committed yet will fail its own digest
+// check. While a task holds both configuration locks, no API write lands, so
+// a refusal can't come back while a task that passed its check is still
+// waiting. That reasoning holds only for a refusal. A failed digest read
+// proves no change, so moveDiskToVM treats the disk in place after one as an
+// uncertain outcome.
+func readBackUnansweredMove(ctx context.Context, c Client, node string, srcVMID int, disk string, targetVMID int, targetSlot, volume string) moveReadback {
+	if moveDiskLanded(ctx, c, node, srcVMID, disk, targetVMID, targetSlot) {
+		return moveReadbackLanded
+	}
+	source, err := ReadQemuViews(ctx, c, node, srcVMID)
+	if err != nil {
+		return moveReadbackUncertain
+	}
+	target, err := ReadQemuViews(ctx, c, node, targetVMID)
+	if err != nil {
+		return moveReadbackUncertain
+	}
+	if MoveSourceStillNames(source, disk, volume) && MoveSlotEmpty(target, targetSlot) {
+		return moveReadbackInPlace
+	}
+	return moveReadbackUncertain
+}
+
+// uncertainUnansweredMove is what moveDiskToVM returns when one of its POSTs
+// went unanswered and the readback can't settle what the move came to. The
+// error is retriable and carries none of PVE's text, so it doesn't wrap
+// ErrMoveDiskDigestRefused, and windowWorkEnding reads the outcome as
+// unknown. readDigestFailed says the call ended on a failed digest read with
+// the disk still in place, rather than on a readback that proved neither
+// outcome.
+func uncertainUnansweredMove(logger *log.Logger, moveErr error, srcVMID int, disk string, targetVMID int, targetSlot, volume string, readDigestFailed bool) error {
+	found := fmt.Sprintf("a readback showed neither the landed move nor %q still on vm %d %s with the receiving slot empty", volume, srcVMID, disk)
+	if readDigestFailed {
+		found = fmt.Sprintf("a digest read failed, which can't rule out that request's task landing later, even though a readback found %q still on vm %d %s with the receiving slot empty", volume, srcVMID, disk)
+	}
+	if logger != nil {
+		logger.Warn("disk transfer: a move ended on a digest refusal or read error after an unanswered request, and its outcome is unknown",
+			log.Int("src_vmid", srcVMID),
+			log.String("disk", disk),
+			log.Int("target_vmid", targetVMID),
+			log.String("target_slot", targetSlot),
+			log.String("readback", found),
+			log.Err(moveErr),
+		)
+	}
+	return cpierrors.Retriable(
+		"move_disk %s of vm %d to vm %d slot %s has an unknown outcome, because an earlier request got no answer from PVE and %s; retry",
+		disk, srcVMID, targetVMID, targetSlot, found)
+}
+
 // moveDiskToVM issues one move_disk reassignment and awaits its task. disk is
 // the source config key ("scsi3" or "unused0"), targetSlot the config key the
 // volume lands on. Same-node only — PVE refuses cross-node reassignment.
@@ -75,12 +238,32 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 	// re-awaits that same task instead of re-POSTing CreateQemuMoveDisk:
 	// the earlier move may still be executing on PVE, and a second POST
 	// would double-apply it. Mirrors resizeDiskConverging.
+	//
+	// unanswered records that one of this call's POSTs ended without an
+	// answer from PVE, so its task may have forked and may still land. After
+	// that, a later attempt's digest refusal or failed digest read goes
+	// through readBackUnansweredMove before it surfaces. originalVolume is
+	// what the source's disk key named at the first digest read.
 	attempts := 0
 	errFromAwait := false
+	errFromDigestRead := false
+	unanswered := false
+	originalVolume := ""
 	pendingUPID := ""
+	logReplay := func() {
+		if logger != nil {
+			logger.Info("disk transfer: move replay found the reassignment already committed",
+				log.Int("src_vmid", srcVMID),
+				log.String("disk", disk),
+				log.Int("target_vmid", targetVMID),
+				log.String("target_slot", targetSlot),
+			)
+		}
+	}
 	moveErr := RetryOnTransientOrLock(ctx, logger, "disk_transfer_move", parkerWindowMaxAttempts, func() error {
 		attempts++
 		errFromAwait = false
+		errFromDigestRead = false
 
 		if pendingUPID != "" {
 			upid := pendingUPID
@@ -89,6 +272,10 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			if inner == nil {
 				pendingUPID = ""
 				return nil
+			}
+			if IsMoveDigestRefusal(inner) {
+				pendingUPID = ""
+				return stopOnMoveDigestRefusal(inner)
 			}
 			if IsTaskExitVerdict(inner) {
 				// Resolved with a failure verdict: the task settled, so a
@@ -106,11 +293,32 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			return inner
 		}
 
-		raw, inner := nodesSvc.CreateQemuMoveDisk(ctx, node, strconv.Itoa(srcVMID), &sdknodes.CreateQemuMoveDiskParams{
+		digest, targetDigest, sourceVolume, digestErr := moveDigests(ctx, c, node, srcVMID, disk, targetVMID)
+		if digestErr != nil {
+			errFromDigestRead = true
+			return digestErr
+		}
+		if originalVolume == "" {
+			originalVolume = sourceVolume
+		}
+		params := &sdknodes.CreateQemuMoveDiskParams{
 			Disk:       disk,
 			TargetVmid: &tv,
 			TargetDisk: &ts,
-		})
+		}
+		if digest != "" {
+			params.Digest = &digest
+		}
+		if targetDigest != "" {
+			params.TargetDigest = &targetDigest
+		}
+		raw, inner := nodesSvc.CreateQemuMoveDisk(ctx, node, strconv.Itoa(srcVMID), params)
+		if inner != nil && IsMoveDigestRefusal(inner) {
+			return stopOnMoveDigestRefusal(inner)
+		}
+		if _, answered := pveAnswered(inner); inner != nil && !answered {
+			unanswered = true
+		}
 		if inner == nil {
 			var upid string
 			if raw != nil {
@@ -127,6 +335,10 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 			}
 			pendingUPID = upid
 			inner = AwaitTaskWithLogger(ctx, c, node, upid, logger)
+			if inner != nil && IsMoveDigestRefusal(inner) {
+				pendingUPID = ""
+				return stopOnMoveDigestRefusal(inner)
+			}
 			if inner == nil {
 				pendingUPID = ""
 				return nil
@@ -143,23 +355,46 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 		// source slot no longer does. Only a repeat attempt can be a replay;
 		// a first-attempt failure surfaces as-is.
 		if attempts > 1 && moveDiskLanded(ctx, c, node, srcVMID, disk, targetVMID, targetSlot) {
-			if logger != nil {
-				logger.Info("disk transfer: move replay found the reassignment already committed",
-					log.Int("src_vmid", srcVMID),
-					log.String("disk", disk),
-					log.Int("target_vmid", targetVMID),
-					log.String("target_slot", targetSlot),
-				)
-			}
+			logReplay()
 			pendingUPID = ""
 			return nil
 		}
 		return inner
 	})
+	if moveErr != nil && unanswered && (errFromDigestRead || IsMoveDigestRefusal(moveErr)) {
+		// The refusal or the read error comes from a later attempt, and the
+		// unanswered POST's task may have landed in between. Only the
+		// readback says which.
+		readback := readBackUnansweredMove(ctx, c, node, srcVMID, disk, targetVMID, targetSlot, originalVolume)
+		if readback == moveReadbackLanded {
+			logReplay()
+			return nil
+		}
+		if readback == moveReadbackUncertain {
+			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, false)
+		}
+		if errFromDigestRead {
+			// A refusal proves that a configuration changed since the
+			// unanswered POST's digests were read, and a read error proves
+			// nothing, so that POST's task could still land after this
+			// readback.
+			return uncertainUnansweredMove(logger, moveErr, srcVMID, disk, targetVMID, targetSlot, originalVolume, true)
+		}
+		// The source still names the volume and the slot is empty, so the
+		// refusal stands as it is.
+	}
 	if moveErr != nil {
 		if IsMoveDiskSnapshotRefusal(moveErr) {
 			return fmt.Errorf("move %s of vm %d to vm %d slot %s: %w: %s",
 				disk, srcVMID, targetVMID, targetSlot, ErrMoveDiskSnapshotRefused, moveErr.Error())
+		}
+		// A digest refusal that gets here means the volume is still where it
+		// was, because no earlier POST went unanswered or the readback above
+		// showed it in place. It is retriable, because a retry reads fresh
+		// digests, and it must not read as an uncertain outcome.
+		if IsMoveDigestRefusal(moveErr) {
+			return cpierrors.WrapAs(moveErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("move_disk %s of vm %d to vm %d slot %s refused because a configuration changed; retry", disk, srcVMID, targetVMID, targetSlot))
 		}
 		// Preserve the pre-loop classification split: a task-body failure
 		// carries a verdict about the move itself (unsupported target
@@ -1056,7 +1291,7 @@ func markWorkCompleted(restoreErr error, completed bool) error {
 // change's outcome unknown, because PVE may still have applied it, and the
 // string says so.
 func windowWorkEnding(work string, err error) string {
-	if _, answered := pveAnswered(err); answered || IsTaskExitVerdict(err) || IsMoveDiskSnapshotRefusal(err) {
+	if _, answered := pveAnswered(err); answered || IsTaskExitVerdict(err) || IsMoveDiskSnapshotRefusal(err) || IsMoveDigestRefusal(err) {
 		return work + " failed"
 	}
 	return "the outcome of " + work + " is unknown"
@@ -1142,10 +1377,14 @@ func ProtectionWriteRefused(err error) bool {
 
 // pveAnswered reports whether err is PVE's own answer refusing a request, and
 // returns its HTTP status when it is. That is an API error carrying a 4xx or
-// 5xx status, except 596, which pveproxy sends when it could not reach
-// pvedaemon, and 502 through 504, which a proxy in front of PVE sends. It is
-// false for a transport fault, a timeout, and a cancelled or expired context,
-// where the request may have been applied.
+// 5xx status, except 502 through 504, which a proxy in front of PVE sends,
+// and 596 through 599, which pveproxy relays from its own HTTP client when a
+// call it forwards to pvedaemon or another node fails. A 597, for one, means
+// the body broke off after the backend had answered, so the backend may
+// already have forked a task. 595 stays an answer, because pveproxy sends it
+// when it could not connect, before anything reached the backend. It is false
+// for a transport fault, a timeout, and a cancelled or expired context, where
+// the request may have been applied.
 func pveAnswered(err error) (int, bool) {
 	if err == nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return 0, false
@@ -1155,7 +1394,7 @@ func pveAnswered(err error) (int, bool) {
 		return 0, false
 	}
 	switch code {
-	case 502, 503, 504, 596:
+	case 502, 503, 504, 596, 597, 598, 599:
 		return 0, false
 	}
 	if code < 400 || code >= 600 {
