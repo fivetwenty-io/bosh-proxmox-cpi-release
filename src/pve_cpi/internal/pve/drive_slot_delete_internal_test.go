@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -545,4 +546,42 @@ func TestTransferDiskToParker_PreCheckReadFailureLeavesTheWindowToDecide(t *test
 			t.Fatalf("landed volid = %q, want a parker-named volume", landed)
 		}
 	})
+}
+
+// TestDetachDriveSlot_SweepsOnlyTheUnusedEntryPVEKeeps covers the second step of
+// the detach. PVE keeps an unused entry only for a volume the VM owns by name,
+// so the sweep removes that entry with one more config delete. A volume named
+// for another VM leaves no entry, and the sweep then has nothing to remove and
+// sends no second delete.
+func TestDetachDriveSlot_SweepsOnlyTheUnusedEntryPVEKeeps(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, volid string
+		wantEvents  []string
+	}{
+		{"owned volume", "data:vm-700-disk-0", []string{"config-delete:700:scsi1:data:vm-700-disk-0", "config-delete:700:unused0:data:vm-700-disk-0"}},
+		{"another VM's volume", "data:vm-9001-disk-0", []string{"config-delete:700:scsi1:data:vm-9001-disk-0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := newScanFakeClient(map[int]map[string]any{700: {"scsi1": tc.volid + ",size=10G"}})
+			if err := DetachDriveSlot(noBackoff(), c, nil, "pve1", 700, "scsi1", tc.volid, 3); err != nil {
+				t.Fatalf("DetachDriveSlot: %v", err)
+			}
+			for key, value := range c.configs[700] {
+				if strings.Split(fmt.Sprint(value), ",")[0] == tc.volid {
+					t.Fatalf("VM 700 still names %s on %s", tc.volid, key)
+				}
+			}
+			var deletes []string
+			for _, event := range c.events {
+				if strings.HasPrefix(event, "config-delete:") {
+					deletes = append(deletes, event)
+				}
+			}
+			if !reflect.DeepEqual(deletes, tc.wantEvents) {
+				t.Fatalf("config deletes = %v, want %v", deletes, tc.wantEvents)
+			}
+		})
+	}
 }

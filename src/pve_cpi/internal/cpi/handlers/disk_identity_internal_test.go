@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,10 @@ const idTestToken = "bpd-aabbccdd00112233"
 // stateful single-node PVE, faithful to the move_disk semantics the live
 // spike established (rename on move, options carried on attached-slot moves,
 // dropped on unused-entry moves, owned unused volumes physically removed).
+// It follows qemu-server on unused entries too. Deleting a bus slot leaves an
+// unusedN entry only for a volume the VM owns by name
+// (vmconfig_register_unused_drive), and attaching a volume the VM already
+// names on an unusedN entry drops that entry (write_vm_config).
 type idFakeClient struct {
 	pve.Client
 
@@ -46,6 +51,9 @@ type idFakeClient struct {
 	// moveErr, when set, fails the next CreateQemuMoveDisk with it and
 	// clears itself (one-shot), e.g. PVE's snapshot refusal.
 	moveErr error
+	// attachErr, when set, fails the next AttachDisk with it and clears itself
+	// (one-shot), the way a lost attach response fails a config-edit park.
+	attachErr error
 	// pending, when set, holds a slot delete on a running VM pending the way
 	// qemu-server does, and serves the pending endpoint from it. Without it
 	// every delete applies at once, as on a stopped VM.
@@ -110,13 +118,42 @@ func (q *idFakeQEMU) Config(_ context.Context, _ string, vmid int) (map[string]a
 func (q *idFakeQEMU) AttachDisk(_ context.Context, _ string, vmid int, volid, _ string, opts *qemu.AttachOpts) (string, error) {
 	q.c.mu.Lock()
 	defer q.c.mu.Unlock()
+	if q.c.attachErr != nil {
+		err := q.c.attachErr
+		q.c.attachErr = nil
+		return "", err
+	}
 	cfg := q.c.configs[vmid]
 	slot := ""
 	if opts != nil {
 		slot = opts.DiskID
 	}
 	cfg[slot] = volid
+	dropUnusedNaming(cfg, q.c.bareOf(volid))
 	return slot, nil
+}
+
+// fakeVolumeOwnerPattern is the fake's own copy of PVE's owner rule, kept apart
+// from pve.volumeOwnerVMID so the fake can disagree with production. VM N owns
+// any vm-<N>-* or base-<N>-* name, whatever follows the VMID. The LVM, ZFS, and
+// RBD plugins read that from the volume name, and the directory plugin reads
+// it from the images/<vmid>/ directory, which agree on every name PVE
+// allocates.
+var fakeVolumeOwnerPattern = regexp.MustCompile(`^(?:vm|base)-([1-9]\d*)-`)
+
+// fakeVolumeOwnedBy reports whether PVE counts vmid as the owner of volid.
+func fakeVolumeOwnedBy(volid string, vmid int) bool {
+	m := fakeVolumeOwnerPattern.FindStringSubmatch(volid[strings.LastIndexAny(volid, "/:")+1:])
+	return len(m) == 2 && m[1] == strconv.Itoa(vmid)
+}
+
+// dropUnusedNaming removes every unusedN entry of cfg that names volid.
+func dropUnusedNaming(cfg map[string]any, volid string) {
+	for key, unused := range pve.FindUnusedDiskEntries(cfg) {
+		if unused == volid {
+			delete(cfg, key)
+		}
+	}
 }
 
 func (q *idFakeQEMU) DetachDisk(_ context.Context, _ string, vmid int, diskID string) error {
@@ -131,7 +168,7 @@ func (q *idFakeQEMU) DetachDisk(_ context.Context, _ string, vmid int, diskID st
 	delete(cfg, diskID)
 	// SDK detach-and-sweep: an owned volume is physically removed with its
 	// unused entry.
-	if owner, ok := pve.EmbeddedDiskVMID(bare); ok && owner == vmid {
+	if fakeVolumeOwnedBy(bare, vmid) {
 		q.c.destroyed = append(q.c.destroyed, bare)
 	}
 	return nil
@@ -202,7 +239,7 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 		if raw, present := cfg[slot]; present {
 			bare := n.c.bareOf(raw.(string))
 			delete(cfg, slot)
-			if !strings.HasPrefix(slot, "unused") {
+			if !strings.HasPrefix(slot, "unused") && fakeVolumeOwnedBy(bare, vmid) {
 				for i := 0; ; i++ {
 					key := fmt.Sprintf("unused%d", i)
 					if _, taken := cfg[key]; !taken {

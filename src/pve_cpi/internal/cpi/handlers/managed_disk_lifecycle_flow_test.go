@@ -43,13 +43,6 @@ type lifecycleFlowPVE struct {
 	// visibilityErrAfterDelete becomes visibilityErr once a volume is
 	// deleted, so only the audits after a deletion lose their visibility.
 	visibilityErrAfterDelete error
-	// faithfulDemotion makes slot deletes and attaches follow PVE. Deleting
-	// a bus slot leaves an unusedN entry only when the VM owns the volume by
-	// name (vmconfig_register_unused_drive in qemu-server), and attaching a
-	// volume the VM already names on an unusedN entry drops that entry
-	// (write_vm_config). Without it, every deleted slot becomes an unused
-	// entry and an attach leaves the entry in place.
-	faithfulDemotion bool
 	// offlineNodes are the cluster members ListStatus reports offline.
 	offlineNodes map[string]bool
 	// vmSnapshots, when set, answers ListSnapshots per VM instead of
@@ -152,12 +145,12 @@ type lifecycleFlowQEMU struct {
 	c *lifecycleFlowPVE
 }
 
-// AttachDisk drops the unused entry that names the attached volume when
-// faithfulDemotion is set, the way write_vm_config does.
+// AttachDisk drops the unused entry that names the attached volume, the way
+// write_vm_config does.
 func (q lifecycleFlowQEMU) AttachDisk(ctx context.Context, node string, vmid int, volume, bus string, opts *qemu.AttachOpts) (string, error) {
 	slot, err := q.managedDiskTestQEMU.AttachDisk(ctx, node, vmid, volume, bus, opts)
-	if err == nil && q.c.faithfulDemotion {
-		q.c.dropUnusedEntries(vmid, volume)
+	if err == nil {
+		dropUnusedNaming(q.c.state.configs[vmid], strings.Split(volume, ",")[0])
 	}
 	return slot, err
 }
@@ -184,17 +177,6 @@ func (q lifecycleFlowQEMU) DetachDisk(ctx context.Context, node string, vmid int
 		}
 	}
 	return nil
-}
-
-// dropUnusedEntries removes every unusedN entry of the VM that names the
-// bare volid of value.
-func (c *lifecycleFlowPVE) dropUnusedEntries(vmid int, value string) {
-	volume := strings.Split(value, ",")[0]
-	for key, unused := range pve.FindUnusedDiskEntries(c.state.configs[vmid]) {
-		if unused == volume {
-			delete(c.state.configs[vmid], key)
-		}
-	}
 }
 
 func (q lifecycleFlowQEMU) ListSnapshots(_ context.Context, _ string, vmid int) ([]map[string]any, error) {
@@ -452,20 +434,17 @@ func (n lifecycleFlowNodes) UpdateQemuConfig(ctx context.Context, node, vmidText
 	for key, value := range fields {
 		if isDiskOptionKey(key) {
 			cfg[key] = value
-			if n.c.faithfulDemotion && !strings.HasPrefix(key, "unused") {
-				n.c.dropUnusedEntries(vmid, fmt.Sprint(value))
+			if !strings.HasPrefix(key, "unused") {
+				dropUnusedNaming(cfg, strings.Split(fmt.Sprint(value), ",")[0])
 			}
 		}
 	}
-	if owner, ok := pve.EmbeddedDiskVMID(detachedVolume); n.c.faithfulDemotion && detachedVolume != "" && (!ok || owner != vmid) {
-		n.c.dropUnusedEntries(vmid, detachedVolume)
-	}
-	if owner, ok := pve.EmbeddedDiskVMID(deletedVolume); ok && owner == vmid {
+	if fakeVolumeOwnedBy(deletedVolume, vmid) {
 		delete(n.c.state.volumes, deletedVolume)
 		n.c.volumeDeleted()
 	}
 	if detachedVolume != "" && n.c.unlinkedVolumes[detachedVolume] {
-		n.c.dropUnusedEntries(vmid, detachedVolume)
+		dropUnusedNaming(cfg, detachedVolume)
 	}
 	if n.c.foreignUnlink && p.Delete != nil && !strings.HasPrefix(*p.Delete, "unused") {
 		for slot := range pve.FindUnusedDiskEntries(cfg) {
@@ -549,8 +528,12 @@ func TestManagedDiskSnapshotAfterSetRemoval(t *testing.T) {
 		t.Fatalf("snapshot lifecycle incomplete: %+v", record)
 	}
 }
-func TestManagedDiskAttachAndDetachAfterSetRemoval(t *testing.T) {
-	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+
+// attachManagedDiskToFreshSlot removes the fixture's own attachment and attaches
+// the disk to VM 777 through attach_disk, which writes the receiving
+// provenance.
+func attachManagedDiskToFreshSlot(t *testing.T, deps Deps, client *lifecycleFlowPVE, cid string) {
+	t.Helper()
 	delete(client.state.configs[777], "scsi1")
 	if _, err := HandleAttachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
 		t.Fatal(err)
@@ -559,15 +542,21 @@ func TestManagedDiskAttachAndDetachAfterSetRemoval(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("receiving provenance absent: %v %v", entries, err)
 	}
-	deps.Config.DetachedDiskStrategy = "parked"
-	if _, err := HandleDetachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
-		t.Fatal(err)
-	}
+}
+
+// TestManagedDiskAttachAndDetachAfterSetRemoval proves that allocation identity
+// survives a rename. A managed disk keeps its CID name through its first park,
+// so the row runs the park, attach, park cycle, where the detach renames the
+// volume for the parker, and then resolves the disk by its CID.
+func TestManagedDiskAttachAndDetachAfterSetRemoval(t *testing.T) {
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	attachManagedDiskToFreshSlot(t, deps, client, cid)
+	parkRenameCycle(t, context.Background(), deps, client, cid)
 	record, err := journal.Inspect(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != aj.ReadyToReturn || client.moves != 1 {
+	if record.State != aj.ReadyToReturn || client.moves != 2 {
 		t.Fatalf("detach lifecycle incomplete: moves=%d record=%+v", client.moves, record)
 	}
 	bare, meta, err := decodeDiskCID(context.Background(), deps, "test", cid)
@@ -580,6 +569,38 @@ func TestManagedDiskAttachAndDetachAfterSetRemoval(t *testing.T) {
 	}
 	if resolved.volid == bare || resolved.allocation == nil || resolved.allocation.record.ID != id {
 		t.Fatal("rename lost full allocation identity")
+	}
+}
+
+// TestManagedDiskConfigEditParkKeepsItsVolumeAndIdentity is the other half. The
+// first detach of a managed disk moves nothing, because 777 doesn't own the
+// disk band's name and PVE keeps no unused entry for it. The volume lands on
+// one parker slot under its CID name, and the allocation ID still resolves.
+func TestManagedDiskConfigEditParkKeepsItsVolumeAndIdentity(t *testing.T) {
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	attachManagedDiskToFreshSlot(t, deps, client, cid)
+	deps.Config.DetachedDiskStrategy = "parked"
+	if err := detachDiskAt(t, context.Background(), deps, "777", cid); err != nil {
+		t.Fatal(err)
+	}
+	record, err := journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != aj.ReadyToReturn || client.moves != 0 {
+		t.Fatalf("detach lifecycle incomplete: moves=%d record=%+v", client.moves, record)
+	}
+	bare, meta, err := decodeDiskCID(context.Background(), deps, "test", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireConfigEditPark(t, client, record.DiskToken, bare)
+	resolved, err := resolveDiskForOp(context.Background(), deps, "test", cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.volid != bare || resolved.allocation == nil || resolved.allocation.record.ID != id {
+		t.Fatalf("config-edit park lost identity: volid=%s want %s allocation=%+v", resolved.volid, bare, resolved.allocation)
 	}
 }
 
@@ -782,13 +803,16 @@ func (n lifecycleFlowNodes) DeleteQemu(_ context.Context, node, vmidText string,
 	raw := json.RawMessage(`"UPID:n2:destroy"`)
 	return &raw, nil
 }
+
+// TestManagedDiskSharedMigrationAfterSetRemoval attaches a parker-named managed
+// disk on shared storage to a VM on another node, which needs the mover flow.
+// The park, attach, park cycle gives the disk the parker's name first, because
+// a vm-123 volume on shared storage reaches the other node by config edit and
+// never needs a migration (see the pin row below).
 func TestManagedDiskSharedMigrationAfterSetRemoval(t *testing.T) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	deps.Config.DetachedDiskStrategy = "parked"
 	deps.Config.DiskMigration = "on_attach"
-	if _, err := HandleDetachDisk(deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777"), planJSON(t, cid)}, jsonrpc.Context{}); err != nil {
-		t.Fatal(err)
-	}
+	parkRenameCycle(t, context.Background(), deps, client, cid)
 	if client.vmNodes == nil {
 		client.vmNodes = map[int]string{}
 	}
@@ -819,6 +843,64 @@ func TestManagedDiskSharedMigrationAfterSetRemoval(t *testing.T) {
 	}
 	if rd.holder == nil || rd.holder.Node != "n2" || rd.holder.VMID != 888 || rd.allocation.record.ID != id {
 		t.Fatalf("migration lost identity: %+v", rd)
+	}
+}
+
+// TestManagedDiskOnSharedStorageReachesAnotherNodeByConfigEdit pins the fact the
+// migration row relies on. A vm-123 disk on shared storage that one detach
+// parked, with its name unchanged, attaches to a VM on n2 by config edit. No
+// migration runs, the disk ends on 888 under its own name, and the parker no
+// longer names it.
+func TestManagedDiskOnSharedStorageReachesAnotherNodeByConfigEdit(t *testing.T) {
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	deps.Config.DetachedDiskStrategy = "parked"
+	deps.Config.DiskMigration = "on_attach"
+	if err := detachDiskAt(t, context.Background(), deps, "777", cid); err != nil {
+		t.Fatal(err)
+	}
+	bare, meta, err := decodeDiskCID(context.Background(), deps, "test", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireConfigEditPark(t, client, record.DiskToken, bare)
+	if client.vmNodes == nil {
+		client.vmNodes = map[int]string{}
+	}
+	client.vmNodes[888] = "n2"
+	client.state.configs[888] = map[string]any{"name": "target", "digest": "1"}
+	if err := attachDiskAt(t, context.Background(), deps, "888", cid); err != nil {
+		t.Fatal(err)
+	}
+	if client.migrations != 0 || client.moves != 0 {
+		t.Fatalf("a vm-123 disk on shared storage migrated or moved: migrations=%d moves=%d", client.migrations, client.moves)
+	}
+	holders := map[string]string{}
+	for vmid, cfg := range client.state.configs {
+		for key, value := range cfg {
+			text, _ := value.(string)
+			if isDiskOptionKey(key) && strings.Split(text, ",")[0] == bare {
+				holders[fmt.Sprintf("%d.%s", vmid, key)] = text
+			}
+		}
+	}
+	if len(holders) != 1 {
+		t.Fatalf("%s is named by %v, want exactly one slot on VM 888", bare, holders)
+	}
+	for slot := range holders {
+		if !strings.HasPrefix(slot, "888.") {
+			t.Fatalf("%s is named by %s, want VM 888", bare, slot)
+		}
+	}
+	rd, err := resolveDiskForOp(context.Background(), deps, "test", cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rd.holder == nil || rd.holder.Node != "n2" || rd.holder.VMID != 888 || rd.allocation.record.ID != id {
+		t.Fatalf("config-edit attach lost identity: %+v", rd)
 	}
 }
 

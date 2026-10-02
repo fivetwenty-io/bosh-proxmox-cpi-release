@@ -34,16 +34,14 @@ import (
 const strandedRunbookPointer = `see "delete_disk refuses a disk stranded on an unused entry" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
 
 // buildBirthStrand strands one legacy stable-ID disk on guest 777 through the
-// real detach_disk, with PVE-faithful demotion. owner is the VMID the disk's
-// birth name carries: 777 is the owned birth shape, whose move fails, and any
-// other VMID gives PVE no reason to keep an unused entry, so the transfer
-// takes the config-edit attach, and that attach fails instead. With
-// keepRecord false the parker's transfer record is removed afterwards, the way
-// 0.5.1 through 0.8.0 collected it.
+// real detach_disk. owner is the VMID the disk's birth name carries: 777 is the
+// owned birth shape, whose move fails, and any other VMID gives PVE no reason
+// to keep an unused entry, so the transfer takes the config-edit attach, and
+// that attach fails instead. With keepRecord false the parker's transfer record
+// is removed afterwards, the way 0.5.1 through 0.8.0 collected it.
 func buildBirthStrand(t *testing.T, owner int, local, keepRecord bool) *strandedDisk {
 	t.Helper()
 	deps, client, journal, _, _ := lifecycleFlowFixture(t)
-	client.faithfulDemotion = true
 	if local {
 		client.localStorage = true
 		client.volumeNodes = map[string]string{}

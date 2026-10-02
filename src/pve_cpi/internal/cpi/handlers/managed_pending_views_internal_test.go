@@ -35,12 +35,13 @@ func flowDiskToken(t *testing.T, client *lifecycleFlowPVE) string {
 // managed VM whose journal-managed persistent disk sits on a slot whose delete
 // a crash left pending. The preservation reads both views, so the disk is
 // still a candidate, its slot delete applies at once on the stopped VM, and the
-// disk ends on a parker with its serial, the way it would without the pending
-// delete.
+// disk ends on one parker slot with its serial and its own name, the way it
+// would without the pending delete. Neither view of 777 names it afterwards.
 func TestManagedDeleteVM_PreservesADiskWhoseSlotDeleteIsPending(t *testing.T) {
 	captureParkerPoolSweep(t)
 	deps, client, journal, id, _ := lifecycleFlowFixture(t)
 	token := flowDiskToken(t, client)
+	volume := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
 	client.state.configs[777]["scsi0"] = "a:777/vm-777-disk-0.raw,size=10G"
 	owned := map[string]bool{"a:777/vm-777-disk-0.raw": true}
 	client.pending = newFakePendingModel()
@@ -53,9 +54,12 @@ func TestManagedDeleteVM_PreservesADiskWhoseSlotDeleteIsPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != aj.ReadyToReturn || client.moves != 1 {
-		t.Fatalf("preservation: state=%s moves=%d, want the disk returned after one move", record.State, client.moves)
+	// The managed volume carries the disk band's VMID, which 777 doesn't own,
+	// so the preservation parks it by config edit and no move runs.
+	if record.State != aj.ReadyToReturn || client.moves != 0 {
+		t.Fatalf("preservation: state=%s moves=%d, want the disk returned by config edit with no move", record.State, client.moves)
 	}
+	requireConfigEditPark(t, client, token, volume)
 	if _, present := client.state.configs[777]["scsi1"]; present || client.pending.pendingDelete(777, "scsi1") {
 		t.Fatalf("VM 777 after the preservation = %v, want scsi1 gone with nothing pending", client.state.configs[777])
 	}
@@ -66,21 +70,31 @@ func TestManagedDeleteVM_PreservesADiskWhoseSlotDeleteIsPending(t *testing.T) {
 // read that confirms only owned volumes remain once the preservation is done.
 // Something put a foreign volume on scsi3 while the preservation ran, and its
 // delete is pending. The confirm reads both views and refuses, so the destroy
-// never goes out with that volume still on the VM.
+// never goes out with that volume still on the VM. The foreign volume appears
+// when the parker takes the disk, a write every preservation of this disk
+// makes, because a managed disk parks by config edit and no move runs.
 func TestManagedDeleteVM_PreservationConfirmSeesAPendingDeletedSlot(t *testing.T) {
 	captureParkerPoolSweep(t)
 	deps, client, _, _, _ := lifecycleFlowFixture(t)
+	token := flowDiskToken(t, client)
 	client.state.configs[777]["scsi0"] = "a:777/vm-777-disk-0.raw,size=10G"
 	owned := map[string]bool{"a:777/vm-777-disk-0.raw": true}
 	client.pending = newFakePendingModel()
-	client.afterMove = func() {
-		client.afterMove = nil
+	planted := false
+	client.afterConfigWrite = func(vmid int) {
+		if planted || vmid == 777 || len(parkerSlotsCarrying(client, vmid, token)) == 0 {
+			return
+		}
+		planted = true
 		cfg := client.state.configs[777]
 		cfg["scsi3"] = "a:9003/vm-9003-disk-0.raw,size=1G"
 		client.pending.holdDelete(777, cfg, "scsi3")
 	}
 
 	err := detachManagedPersistentForVMDelete(pendingRowContext(), deps, "n1", 777, owned, nil)
+	if !planted {
+		t.Fatal("the parker attach never ran, so the foreign volume was never planted")
+	}
 	if err == nil || !strings.Contains(err.Error(), "VM still references a volume outside its recorded allocation") {
 		t.Fatalf("confirm read = %v, want the refusal for the foreign volume on the pending-deleted slot", err)
 	}

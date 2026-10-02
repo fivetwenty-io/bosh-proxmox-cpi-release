@@ -36,7 +36,8 @@ const migTestToken = "bpd-1122334455667788"
 // behavior migrateMoverToNode's source-vs-target probing depends on), move
 // operations refuse to cross nodes (PVE's real constraint that makes the
 // mover necessary), and the migrate endpoint moves a VM between nodes,
-// renaming its volumes when the local-disk flag rides along.
+// renaming its volumes when the local-disk flag rides along. Its unused
+// entries follow qemu-server the way idFakeClient's do.
 type migFakeClient struct {
 	pve.Client
 
@@ -155,6 +156,7 @@ func (q *migFakeQEMU) AttachDisk(_ context.Context, node string, vmid int, volid
 		slot = opts.DiskID
 	}
 	cfg[slot] = volid
+	dropUnusedNaming(cfg, q.c.bareOf(volid))
 	return slot, nil
 }
 
@@ -171,7 +173,7 @@ func (q *migFakeQEMU) DetachDisk(_ context.Context, node string, vmid int, diskI
 	}
 	bare := q.c.bareOf(raw.(string))
 	delete(cfg, diskID)
-	if owner, ok := pve.EmbeddedDiskVMID(bare); ok && owner == vmid {
+	if fakeVolumeOwnedBy(bare, vmid) {
 		q.c.destroyed = append(q.c.destroyed, bare)
 	}
 	return nil
@@ -203,7 +205,7 @@ func (n *migFakeNodes) UpdateQemuConfig(_ context.Context, node string, vmidStr 
 		if raw, present := cfg[slot]; present {
 			bare := n.c.bareOf(raw.(string))
 			delete(cfg, slot)
-			if !strings.HasPrefix(slot, "unused") {
+			if !strings.HasPrefix(slot, "unused") && fakeVolumeOwnedBy(bare, vmid) {
 				for i := 0; ; i++ {
 					key := fmt.Sprintf("unused%d", i)
 					if _, taken := cfg[key]; !taken {

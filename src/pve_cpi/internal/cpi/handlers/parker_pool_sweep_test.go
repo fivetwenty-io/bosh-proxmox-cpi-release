@@ -397,20 +397,39 @@ func TestDetachForeignActiveDisks_SweepsThePoolAfterTheTransfer(t *testing.T) {
 	assertSweptOnce(t, *calls, "detachForeignActiveDisks", "pve1", deps)
 }
 
+// TestDetachForeignActiveDisks_SkipsTheSweepWhenTheTransferFails covers both
+// transfer paths. PVE keeps an unused entry only for a volume the holder owns,
+// so the transfer moves a volume named for VM 700 and attaches any other
+// volume to the parker by config edit. Each path gets its own failure, because
+// a foreign name has no move to fail and an owned one has no attach to fail.
 func TestDetachForeignActiveDisks_SkipsTheSweepWhenTheTransferFails(t *testing.T) {
-	calls := captureParkerPoolSweep(t)
+	for _, path := range []struct {
+		name  string
+		volid string
+		fail  func(c *idFakeClient)
+	}{
+		{"foreign name fails on the parker attach", "data:vm-777-disk-1", func(c *idFakeClient) {
+			c.attachErr = errors.New("API request failed: storage is busy")
+		}},
+		{"owned name fails on the move", "data:vm-700-disk-1", func(c *idFakeClient) {
+			c.moveErr = errors.New("API request failed: storage is busy")
+		}},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			calls := captureParkerPoolSweep(t)
 
-	const volid = "data:vm-777-disk-1"
-	c := transferFunnelClient(volid)
-	deps := transferFunnelDeps(c)
-	c.moveErr = errors.New("API request failed: storage is busy")
+			c := transferFunnelClient(path.volid)
+			deps := transferFunnelDeps(c)
+			path.fail(c)
 
-	if err := detachForeignActiveDisks(context.Background(), deps, "pve1", "700", 700,
-		deps.Log(context.Background())); err == nil {
-		t.Fatal("detachForeignActiveDisks: want the transfer's failure, got nil")
+			if err := detachForeignActiveDisks(context.Background(), deps, "pve1", "700", 700,
+				deps.Log(context.Background())); err == nil {
+				t.Fatal("detachForeignActiveDisks: want the transfer's failure, got nil")
+			}
+
+			assertNotSwept(t, *calls, "detachForeignActiveDisks")
+		})
 	}
-
-	assertNotSwept(t, *calls, "detachForeignActiveDisks")
 }
 
 func TestDetachForeignActiveDisks_SweepsOncePerCallNotOncePerDisk(t *testing.T) {
