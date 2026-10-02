@@ -1492,6 +1492,41 @@ Nothing clears such a record automatically, and that is deliberate, because deci
 
 [Charge in-flight siblings against a placement](multi-storage-placement.md#charge-in-flight-siblings-against-a-placement) lists which record states charge and which do not.
 
+### A disk delete is refused after its volume is already gone
+
+An orphaned disk can fail `delete_disk` with the following error, even though PVE no longer holds the volume.
+
+```text
+allocation 65a2e32a-0ec7-4dd8-bfc3-8ba70f2dfcf3 requires reconciliation at lifecycle delete_disk completion audit failed; no alternate allocation was attempted
+```
+
+The error is not retriable, so the Director keeps the orphan on its list. Each pass of its orphan cleanup, each `bosh clean-up --all`, and each `bosh delete-disk` then fails the same way. The allocation is left in `reconciliation_required`. In the output of `storage-journal audit --summary`, the allocation shows a `record:` line and an `evidence:` line. The evidence line has a `kind` of `disk`, and its `holder_vmid` is the ID of the VM the disk was last attached to. The same error text also appears when the completion audit fails for another reason, such as an audit read that failed, so we confirm the cause from that evidence line before we act.
+
+By the time we see this error, the CPI has already deleted the volume that the Director asked it to delete. What remains is a note in the description of the VM the disk was last attached to. That note is the disk's allocation entry, and the audit treats it as proof that something of the allocation remains. Only a `detach_disk` that finishes the move on its first attempt removes the note, so a disk whose detach needed a second attempt leaves it behind.
+
+A disk reaches that state in the following way. A `detach_disk` for the disk fails with a retriable error after the CPI has already deleted the disk's slot on the VM, and the deploy fails with it. The volume is then on no slot of that VM, and the CPI holds a record of the transfer on a parker VM. When a later `detach_disk` finds that record, as it can on a rerun of the deploy, it finishes the move to the parker. That call returns as soon as it sees the disk on a parker, so it never reaches the step that removes the note. On 0.8.0 the second `detach_disk` has to come within an hour of the first, because that release removes the parker's transfer record once it is an hour old, so only some disks reach this state there. Later the Director orphans the disk while the VM it came from still exists, and its `delete_disk` deletes the volume and then finds the note.
+
+A change to the disk type or the disk size is one way the Director orphans a disk while its VM lives on. With `director.enable_cpi_resize_disk` and `director.enable_cpi_update_disk` off, as they are by default, the Director creates a new disk, migrates the data, detaches the old disk, and orphans it, and the instance keeps its VM throughout.
+
+That VM still exists, which is what lets the audit find the note. Deleting a VM deletes its description, and the note with it, so a disk whose VM is already gone does not meet this refusal.
+
+The CPI has no command that removes the note once the volume is gone. `adopt` cannot help, because it needs the disk on storage, `cleanup` refuses on the same evidence, and `finalize-cleanup` refuses while any audit evidence names the allocation. What does clear the note is deleting or recreating the VM the disk was last attached to, which for a Director means `bosh recreate` of that instance. The delete is not blocked by the note, because the CPI reads a VM's disk notes only for volumes that the VM's slots still name. We have read this in the code and have not run it against a lab. Once the VM is gone, the audit shows no evidence for the allocation, and either of the following closes the record.
+
+- A retry of `delete_disk`
+
+  The Director's scheduled orphan cleanup calls it again every 30 minutes for an orphan older than `director.disks.max_orphaned_age_in_days`, and `bosh clean-up --all` or `bosh delete-disk` calls it sooner.
+
+- A `finalize-cleanup` decision
+
+  ```sh
+  cpi storage-journal finalize-cleanup \
+    --config /path/to/cpi.json \
+    --allocation-id ALLOCATION_UUID \
+    --decision-id incident-1234-cleanup
+  ```
+
+Recreating the VM through the Director keeps the instance's persistent disk, because `bosh recreate` detaches the disk, replaces the VM, and attaches the disk to the new VM. We delete a VM directly in PVE only when no instance depends on it, because that destroys its guest. When the Director is about to recreate the VM anyway, we can let the recreate do the work.
+
 ### An operation fails with an allocation audit refusal
 
 **Symptom**
