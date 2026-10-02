@@ -6,6 +6,8 @@ package pve
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -283,4 +285,97 @@ func TestResumeDiskTransferKeepsOverlay(t *testing.T) {
 	if disks[transferStableID].Opts["cache"] != "writeback" {
 		t.Errorf("resume must re-persist the recorded overrides, got %+v", disks[transferStableID])
 	}
+}
+
+// nearlyFullOverlayParker builds a parker whose store holds the target disk's
+// entry plus enough filler records that the description sits at least slack
+// bytes under parkerDescriptionBudget, as close as one record allows, and
+// returns the parker's config.
+func nearlyFullOverlayParker(t *testing.T, slack int) map[string]any {
+	t.Helper()
+	target := buildParkerProvEntry(context.Background(), "pve1", "data:vm-90000-disk-0", "scsi0", transferTestCfg, ParkContext{
+		DiskCID: "pvd-x", StableID: overlayTestStableID, Opts: map[string]string{"cache": "none"},
+	})
+	disks := map[string]parkerProvEntry{overlayTestStableID: target}
+	parker := map[string]any{
+		"tags":  "bosh-cpi;bosh-parker",
+		"scsi0": "data:vm-90000-disk-0,serial=" + overlayTestStableID,
+	}
+	for i := 1; ; i++ {
+		volid := fmt.Sprintf("data:vm-90000-disk-%d", i)
+		slot := fmt.Sprintf("scsi%d", i)
+		key := fmt.Sprintf("bpd-%016x", i)
+		disks[key] = parkerProvEntry{
+			DiskCID: "pvd-" + strings.Repeat("L", 40), ParkedAt: "2026-10-01T00:00:00Z",
+			Node: "pve1", Volid: volid, Slot: slot,
+		}
+		if len(provSentinel(t, disks)) > parkerDescriptionBudget-slack {
+			delete(disks, key)
+			break
+		}
+		parker[slot] = volid + ",size=1G"
+	}
+	if size := len(provSentinel(t, disks)); size > parkerDescriptionBudget {
+		t.Fatalf("fixture: the store is already over budget at %d bytes", size)
+	}
+	parker["description"] = provSentinel(t, disks)
+	return parker
+}
+
+// TestApplyParkerDiskOverlay_RefusesPastBudget covers the budget every other
+// provenance writer respects. An overlay that grows the description past it is
+// refused before any write, with an error that names the parker, and one that
+// stays under it still lands.
+func TestApplyParkerDiskOverlay_RefusesPastBudget(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an overlay past the budget is refused without a write", func(t *testing.T) {
+		t.Parallel()
+		parker := nearlyFullOverlayParker(t, 100)
+		before, _ := parker["description"].(string)
+		c := newScanFakeClient(map[int]map[string]any{90000: parker})
+
+		merged, err := ApplyParkerDiskOverlay(context.Background(), c, "pve1", 90000,
+			"data:vm-90000-disk-0", overlayTestStableID, "pvd-x",
+			map[string]string{"cache": "writeback", "mbps_rd": strings.Repeat("9", 400)}, transferTestCfg)
+		if err == nil {
+			t.Fatalf("an overlay past the budget must be refused, got merged %v", merged)
+		}
+		if !errors.Is(err, ErrProvenanceFull) {
+			t.Errorf("error must wrap ErrProvenanceFull, got %v", err)
+		}
+		for _, want := range []string{"parker vmid 90000", "node pve1", " bytes of description"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q must contain %q", err, want)
+			}
+		}
+		if idx := c.eventIndex("description:"); idx >= 0 {
+			t.Errorf("no description write may reach the fake, saw %v", c.events)
+		}
+		if after, _ := c.configs[90000]["description"].(string); after != before {
+			t.Error("the parker description must stay as it was")
+		}
+	})
+
+	t.Run("an overlay under the budget still writes", func(t *testing.T) {
+		t.Parallel()
+		parker := nearlyFullOverlayParker(t, 300)
+		c := newScanFakeClient(map[int]map[string]any{90000: parker})
+
+		merged, err := ApplyParkerDiskOverlay(context.Background(), c, "pve1", 90000,
+			"data:vm-90000-disk-0", overlayTestStableID, "pvd-x",
+			map[string]string{"cache": "writeback"}, transferTestCfg)
+		if err != nil {
+			t.Fatalf("ApplyParkerDiskOverlay: %v", err)
+		}
+		if merged["cache"] != "writeback" {
+			t.Errorf("merged = %v", merged)
+		}
+		if c.eventIndex("description:90000") < 0 {
+			t.Error("the description must be written")
+		}
+		if got := c.parkedEntries(t)[overlayTestStableID]; got.Opts["cache"] != "writeback" {
+			t.Errorf("entry opts not updated: %+v", got)
+		}
+	})
 }

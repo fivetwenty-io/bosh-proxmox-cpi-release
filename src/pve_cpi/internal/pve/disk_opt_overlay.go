@@ -356,6 +356,8 @@ func ReadParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVMI
 // kept as deletion markers, and the serial key is stripped. Returns the
 // merged map. Fail-closed read-modify-write on the parker description, with
 // the same accepted concurrent-writer race every provenance write here has.
+// It returns ErrProvenanceFull, without writing, when the merged description
+// would pass parkerDescriptionBudget.
 func ApplyParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVMID int, bareVolid, stableID, diskCID string, updates map[string]string, cfg ParkerConfig) (map[string]string, error) {
 	if c == nil || node == "" || parkerVMID <= 0 || bareVolid == "" {
 		return nil, cpierrors.Cloud("ApplyParkerDiskOverlay: client, node, parker VMID, and volid are all required")
@@ -386,6 +388,14 @@ func ApplyParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVM
 	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
 	if marshalErr != nil {
 		return nil, cpierrors.Wrap(marshalErr, "disk option overrides: marshal parker sentinel")
+	}
+	// The overlay can grow an entry, or create one, so it meets the same
+	// budget every provenance writer does. Collection stays with those
+	// writers, so the refusal here leaves the other records as they are.
+	if len(newDesc) > parkerDescriptionBudget {
+		return nil, fmt.Errorf(
+			"disk option overrides: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
+			parkerVMID, node, len(disks), len(newDesc), parkerDescriptionBudget, ErrProvenanceFull)
 	}
 	if writeErr := writeVMDescription(ctx, c, node, parkerVMID, newDesc); writeErr != nil {
 		return nil, writeErr
