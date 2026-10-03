@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -412,8 +413,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 				log.String("disk_cid", rd.diskCID),
 				log.String("volid", rd.volid),
 			)
-			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
-			pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid, rd.birth)
+			removeDetachedDiskNotes(ctx, deps, "detach_disk", node, vmid, rd, true)
 			return nil
 		}
 		// The slot delete inside the transfer may have stayed pending. It has
@@ -440,8 +440,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	// Giving side's record last: the parker's provenance entry (the receiving
 	// side) was written before the source slot was touched, so the holder
 	// sentinel can now come off. Both keyings, in case an older write raced.
-	pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid)
-	pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, rd.stableID, rd.volid, rd.birth)
+	removeDetachedDiskNotes(ctx, deps, "detach_disk", node, vmid, rd, false)
 
 	logger.Info("detach_disk: disk transferred to parker",
 		log.String("vm_cid", vmCID),
@@ -450,6 +449,73 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		log.String("volid_after", landed),
 	)
 	return nil
+}
+
+// leftNotesRunbook points an operator at the steps for removing the notes that
+// removeDetachedDiskNotes leaves on a VM it couldn't read.
+const leftNotesRunbook = `see "A detach left a disk's notes on the VM it left" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// removeDetachedDiskNotes removes a stable-ID disk's attached-disk note and
+// drive-option overlay from the VM it left, under its stable ID, the volid it
+// had on the VM, and, for the overlay, its birth name. A move renames the
+// volume, so another disk on the VM can hold the birth name by now and file
+// its own notes under it. We read the VM once in both views. When a slot or
+// an unused entry on it still holds one of the disk's names, that name belongs
+// to whatever sits there, so we keep it out of both removals, the way the
+// detach tail does.
+//
+// parkDeferred says the move to the parker didn't happen, so the disk's own
+// unused entry still holds its volid. That name is still this disk's, and no
+// other disk on the VM can hold it, so it never counts as held. The notes
+// under it describe an attachment that has ended, and they come off now just
+// as they do after a landed move.
+//
+// When the read still fails after the transient retries, we can't tell which
+// of the other names are held, so we leave the entries under them in place,
+// remove the rest, and log a warning that names the keys we left. When no key
+// is left, there's nothing to name, so we log no warning. Nothing
+// finds this disk through those entries, because a stable-ID disk resolves
+// only by its serial and the stranded-disk step looks its note up under the
+// stable ID. As with the removals themselves, a failed read doesn't fail the
+// detach, because the disk has already left the VM.
+//
+// op names the operation for the warning and the retry label. detach_disk
+// passes its own name, and the attach that recovers a stranded disk passes its
+// own, because both take the disk off a VM and remove its notes the same way.
+func removeDetachedDiskNotes(ctx context.Context, deps Deps, op, node string, vmid int, rd resolvedDisk, parkDeferred bool) {
+	logger := deps.Log(ctx)
+	var views pve.QemuViews
+	err := pve.RetryOnTransient(ctx, logger, op+".read_source_names", 0, func() error {
+		var readErr error
+		views, readErr = pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
+		return readErr
+	})
+	held := map[string]bool{}
+	for _, name := range []string{rd.volid, rd.birth} {
+		if parkDeferred && name == rd.volid {
+			continue
+		}
+		if name != "" && name != rd.stableID && (err != nil || views.NamesVolume(name)) {
+			held[name] = true
+		}
+	}
+	if err != nil && len(held) > 0 {
+		left := make([]string, 0, len(held))
+		for name := range held {
+			left = append(left, name)
+		}
+		sort.Strings(left)
+		logger.Warn(op+": couldn't read the VM the disk left to see which of the disk's names another disk holds, so any entries under keys_left_in_place stay in that VM's description, in bosh_attached_disks and "+
+			pve.DiskOptOverlaysSentinelKey+"; "+leftNotesRunbook,
+			log.Int("vmid", vmid),
+			log.String("node", node),
+			log.String("disk_cid", rd.diskCID),
+			log.String("keys_left_in_place", strings.Join(left, ",")),
+			log.Err(err),
+		)
+	}
+	pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, unheldNames(held, rd.stableID, rd.volid)...)
+	pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, node, vmid, unheldNames(held, rd.stableID, rd.volid, rd.birth)...)
 }
 
 // parkFreeFloatingStableID parks a free-floating stable-ID disk so a detach

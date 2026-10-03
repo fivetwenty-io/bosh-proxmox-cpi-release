@@ -711,7 +711,7 @@ ends up holding a volume it carries no entry for.
 Read the store to confirm what is in it:
 
 ```bash
-qm config <parker-vmid> | grep -o '<!--BOSH:.*-->'
+pvesh get /nodes/<node>/qemu/<parker-vmid>/config --output-format json | jq -r .description | grep -o '<!--BOSH:.*-->'
 ./scripts/disk-audit --config cpi.json
 ```
 
@@ -1075,6 +1075,47 @@ For a journal-managed disk, `delete_disk` refuses while the journal holds a chan
 `bosh orphan-disk` sends nothing to the instance's agent, while cck asks the agent to unmount the disk when the agent still lists it, and only then detaches it. We haven't read the agent's side, so we can't say how an agent treats a disk that its settings may still list.
 
 We worked this procedure out from the CPI's code and the BOSH Director's code at v283.1.11, and we have not run it against a lab.
+
+### A detach left a disk's notes on the VM it left
+
+**Symptom**
+
+```text
+WARN <operation>: couldn't read the VM the disk left to see which of the disk's names another disk holds, so any entries under keys_left_in_place stay in that VM's description, in bosh_attached_disks and bosh_disk_opt_overlays; see "A detach left a disk's notes on the VM it left" in docs/troubleshooting.md of bosh-proxmox-cpi-release  vmid=<N> node=<node> disk_cid=<cid> keys_left_in_place=<volid>,<volid> error=...
+```
+
+The operation is `detach_disk`. It is `attach_disk` or `create_vm` when the call first moved a disk off an unused entry of another VM.
+
+**Diagnosis**
+
+The call that moved the disk succeeded, and the disk is off VM `<N>`'s bus. After the move, the CPI reads VM `<N>` to see which of the disk's old names another disk now uses, so it can remove the disk's attached-disk note and drive-option overrides without touching that other disk's. When the read kept failing, the CPI removed the entries under the disk's stable ID, unless another warning says that removal failed. It left any entries under the names in `keys_left_in_place`, because another disk could be using one of those names. Those names are volume names. A later disk that lands on VM `<N>` under one of those names could pick up the drive options stored under that name, such as a cache mode or an I/O limit. Nothing removes these entries on a schedule, so they stay until we remove them, until a later detach or attach rewrites them, or until VM `<N>` is deleted.
+
+**Fix**
+
+We first make sure the entries aren't another disk's. We make these edits only while no BOSH operation is running against VM `<N>`, because the CPI rewrites the same description.
+
+We check the VM's disk keys with `qm pending`, and we don't use `qm config` for this. `qm config` shows pending changes as already applied, so it hides a slot whose delete is still pending, even though the running guest still has that disk plugged in:
+
+```bash
+qm pending <N>
+```
+
+We look at every `scsiN`, `virtioN`, `sataN`, `ideN`, `efidiskN`, `tpmstateN`, and `unusedN` key. Any of those keys that `qm pending` lists, whether as a current value, a pending value, or a pending delete, belongs to a disk the VM still holds. When one of them names a volume in `keys_left_in_place`, the entries under that name belong to that disk, so we leave them. We remove the entries only under the names that no key mentions.
+
+We then read the description, where the CPI's records sit in the `<!--BOSH:{...}-->` block at the end of the text. `pvesh` gives us the description as plain text:
+
+```bash
+pvesh get /nodes/<node>/qemu/<N>/config --output-format json | jq -r .description
+```
+
+In the JSON inside that block, we delete each unclaimed name's key from the `bosh_attached_disks` object and from the `bosh_disk_opt_overlays` object, keep everything else as it is, and write the whole description back, including any text above the block:
+
+```bash
+qm set <N> --description '<the text above the block>
+<!--BOSH:{...the edited JSON...}-->'
+```
+
+We then read the description again the same way, to check that the JSON parses and that only those keys are gone.
 
 ### A disk detach stays pending on a running VM
 
