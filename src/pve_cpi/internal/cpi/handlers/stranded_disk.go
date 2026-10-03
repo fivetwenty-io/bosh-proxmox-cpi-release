@@ -202,9 +202,10 @@ func settleStrandedBeforeAttach(ctx context.Context, deps Deps, op string, rd *r
 	}
 	sweepParkerPool(ctx, deps, ref.Node, parkerCfg)
 	// The parker's record now carries the disk, so the stranded VM's own
-	// records of it can come off, as they do after an ordinary detach.
-	pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, ref.Node, ref.VMID, rd.stableID, rd.volid)
-	pve.RemoveVMDiskOptOverlay(ctx, deps.PVE, logger, ref.Node, ref.VMID, rd.stableID, rd.volid, rd.birth)
+	// records of it can come off, as they do after an ordinary detach. The
+	// transfer landed, so the removal runs with the same held-name filter that
+	// detach_disk uses, which keeps another disk's notes on that VM in place.
+	removeDetachedDiskNotes(ctx, deps, op, ref.Node, ref.VMID, *rd, false)
 
 	refreshed, err := resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
 	if err != nil {
