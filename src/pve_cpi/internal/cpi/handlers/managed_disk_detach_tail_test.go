@@ -1544,9 +1544,10 @@ func TestDetachTailBirthOnHeldOldNameKeepsHolder(t *testing.T) {
 }
 
 // TestDetachTailNotRunByUpdateDisk pins that update_disk stays out of the
-// tail. It never runs the lifecycle guard the tail needs, so a parked disk
-// whose source VM still carries its allocation entry keeps that entry and
-// 777's description through update_disk.
+// tail. It resumes an unfinished transfer inside the disk's lifecycle, but it
+// skips the tail even there, so a parked disk whose source VM still carries
+// its allocation entry keeps that entry and 777's description through
+// update_disk.
 func TestDetachTailNotRunByUpdateDisk(t *testing.T) {
 	captureParkerPoolSweep(t)
 	for _, tc := range []struct {

@@ -206,6 +206,28 @@ type ParkContext struct {
 	// caller whose request moves the disk off the source sets it. It isn't
 	// part of the provenance entry.
 	ApplyFoundPendingDelete bool
+	// ClaimOnly limits ResumeDiskTransferToParker to the windows that write
+	// only the parker's serial and the finalize, and it runs them only under
+	// the parker's lock, on the transfer record it reads again there, and on a
+	// landing ClaimLandings proves. Where the resume would move the volume,
+	// apply a pending delete, or attach by config edit, it returns a
+	// ClaimOnlyRefusal and writes nothing to the disk or its VMs. Only the
+	// managed identity check sets it, because it resumes before the disk's
+	// lifecycle can open. It isn't part of the provenance entry.
+	ClaimOnly bool
+	// ClaimLandings lists the moves the disk's allocation record observed.
+	// A claim-only resume claims a parker slot that has no serial only when
+	// one of them moved the transfer's recorded volume off its source VM and
+	// landed it as the volume on that slot. It isn't part of the provenance
+	// entry.
+	ClaimLandings []RecordedLanding
+}
+
+// RecordedLanding is one move a disk's allocation record observed, from the
+// volid the move started with to the volid it landed under, off SourceVMID.
+type RecordedLanding struct {
+	SourceVMID int
+	From, To   string
 }
 
 // parkerProvEntry is a single parked-disk record stored in the sentinel.
@@ -2112,6 +2134,19 @@ const parkerProvenanceRemoveTimeout = 20 * time.Second
 // config read, and a detach, so it is generous relative to the lock's own wait.
 const parkerDemotedSweepTimeout = 45 * time.Second
 
+// parkerLockUnserializedKey marks the context of a protection window that
+// runs without the lock because PVE refused the lock's create or the client
+// has no pool service.
+type parkerLockUnserializedKey struct{}
+
+// parkerLockUnserialized reports whether ctx belongs to a protection window
+// that runs without the lock because PVE refused the lock's create or the
+// client has no pool service.
+func parkerLockUnserialized(ctx context.Context) bool {
+	unserialized, _ := ctx.Value(parkerLockUnserializedKey{}).(bool)
+	return unserialized
+}
+
 // withParkerProtectionLock serializes the protection windows on one parker VM.
 //
 // Every window is clear protection -> mutate -> restore protection, and two of
@@ -2129,7 +2164,8 @@ const parkerDemotedSweepTimeout = 45 * time.Second
 //
 // Two cases proceed unlocked and say so. One is a missing pool service, and the
 // other is a lock create that PVE refused outright, such as for an identity
-// without Pool.Allocate. The mechanism is advisory, the uncontended path is
+// without Pool.Allocate. Both mark the window's context, so a caller that
+// needs the lock can refuse instead. The mechanism is advisory, the uncontended path is
 // correct without it, and refusing to unpark a disk because the CPI cannot
 // create a sentinel pool would be a worse trade than the race it prevents.
 // Every other acquire failure is returned retriably. Reaching the deadline
@@ -2149,7 +2185,7 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 				log.String("purpose", purpose),
 			)
 		}
-		return fn(ctx)
+		return fn(context.WithValue(ctx, parkerLockUnserializedKey{}, true))
 	}
 	owner := ProcessLockOwner(fmt.Sprintf("%s/%d", purpose, parkerVMID))
 	ttl, timeout := parkerLockTimeoutsFrom(ctx)
@@ -2200,7 +2236,9 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 			)
 		}
 		// No lock, no TTL to stay inside: run on the caller's own deadline.
-		return fn(ctx)
+		// The window learns that it runs unserialized, so a caller that
+		// needs the lock can refuse instead.
+		return fn(context.WithValue(ctx, parkerLockUnserializedKey{}, true))
 	}
 	defer func() {
 		// Release on a detached context: an already-cancelled request would

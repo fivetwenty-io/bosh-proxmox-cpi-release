@@ -145,7 +145,7 @@ func HandleUpdateDisk(deps Deps) Handler {
 // cluster scan the other disk handlers do.
 func updateDiskHolder(ctx context.Context, deps Deps, diskCID string, rd *resolvedDisk) (pve.DiskHolder, error) {
 	if rd.stableID != "" {
-		refreshed, err := resumeTransferIfNeeded(ctx, deps, "update_disk", *rd)
+		refreshed, err := resumeUpdateDiskTransfer(ctx, deps, *rd)
 		if err != nil {
 			return pve.DiskHolder{}, err
 		}
@@ -160,6 +160,28 @@ func updateDiskHolder(ctx context.Context, deps Deps, diskCID string, rd *resolv
 		return pve.DiskHolder{}, wrapHolderScanError(err, fmt.Sprintf("update_disk: locate VM for disk %q", diskCID))
 	}
 	return holder, nil
+}
+
+// resumeUpdateDiskTransfer finishes a transfer to a parker that the disk has
+// in flight, the way set_disk_metadata does. When the journal manages the
+// disk, the resume runs inside the disk's lifecycle, so the landing is
+// journaled under the allocation journal's lock. The lifecycle ends before we
+// return, so the update that follows runs outside the journal's lock, just as
+// it did before. The resume leaves the source VM's tail alone, and a disk with
+// no transfer in flight takes no lifecycle at all.
+func resumeUpdateDiskTransfer(ctx context.Context, deps Deps, rd resolvedDisk) (_ resolvedDisk, operationErr error) {
+	if rd.intent == nil {
+		return rd, nil
+	}
+	local, lifecycle, err := managedDiskOperation(ctx, deps, rd, "update_disk")
+	if err != nil {
+		return resolvedDisk{}, err
+	}
+	if lifecycle != nil {
+		rd = lifecycle.disk
+		defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
+	}
+	return resumeTransferIfNeeded(ctx, local, "update_disk", rd)
 }
 
 // updateSpecSizeMB extracts and validates the optional "size" field. Returns

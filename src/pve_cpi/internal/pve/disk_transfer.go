@@ -933,10 +933,20 @@ func attachReleasedSourceVolume(
 //   - the recorded parker slot holds a parker-named volume with no serial:
 //     the move landed but the serial write was lost — claim it.
 //
+// With pctx.ClaimOnly set, the resume runs only the finalize and the claim,
+// and it returns a ClaimOnlyRefusal before any other write. It refuses when
+// the window would run without the parker's lock, and when the transfer
+// record it reads again under the lock differs from the intent the caller
+// read. It claims a slot only when pctx.ClaimLandings proves
+// the slot's volume is this transfer's landing. Where it would move the
+// volume, apply a pending delete, or attach by config edit, it refuses before
+// that write, and when no window applies, its refusal wraps the permanent
+// error below.
+//
 // Anything else is a state this code cannot safely converge; it returns a
 // permanent error naming what it found so an operator can look.
 //
-//nolint:gocognit // Case analysis over the transfer's crash windows; each branch is one window and the ordering between them is load-bearing.
+//nolint:gocognit,gocyclo // Case analysis over the transfer's crash windows; each branch is one window and the ordering between them is load-bearing.
 func ResumeDiskTransferToParker(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, stableID string,
@@ -960,6 +970,11 @@ func ResumeDiskTransferToParker(
 		if cfgErr != nil {
 			return cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("transfer resume: config read for parker vmid %d", intent.ParkerVMID))
+		}
+		if pctx.ClaimOnly {
+			if claimErr := claimOnlyPreconditions(wctx, parkerCfg, intent, stableID); claimErr != nil {
+				return claimErr
+			}
 		}
 
 		// Window: everything landed, only the finalize write was lost.
@@ -999,6 +1014,21 @@ func ResumeDiskTransferToParker(
 					if slotErr != nil {
 						return slotErr
 					}
+					if pctx.ClaimOnly {
+						// The source VM's config names the volume by its old
+						// name here, but the identity check runs a claim-only
+						// resume only after storage said that name is gone, so
+						// the entry may be dangling. The identity check
+						// resolves the disk once more. If the old name is back,
+						// its caller's full resume finishes the transfer, and
+						// if it's still gone, the check refuses for audit,
+						// permanently. We haven't proven the full resume safe
+						// against a volume that reused the old name, and that
+						// proof belongs to the full resume's caller.
+						return claimOnlyResumeRefusal(ClaimOnlyMove, intent, stableID,
+							"the transfer needs a full resume to move the volume off source vm "+intent.SourceVMCID+
+								", which a claim-only resume doesn't do")
+					}
 					if moveErr := moveDiskToVM(wctx, c, logger, intent.ParkerNode, srcVMID, key, intent.ParkerVMID, slot); moveErr != nil {
 						return moveErr
 					}
@@ -1029,6 +1059,11 @@ func ResumeDiskTransferToParker(
 			if bare, ok := slotBareVolid(parkerCfg, intent.Slot); ok {
 				_, hasSerial := StableIDFromDriveOptStr(disks[intent.Slot])
 				if embedded, named := EmbeddedDiskVMID(bare); named && embedded == intent.ParkerVMID && !hasSerial {
+					if pctx.ClaimOnly && !landingRecorded(pctx.ClaimLandings, intent, bare) {
+						return claimOnlyResumeRefusal(ClaimOnlyUnprovenLanding, intent, stableID,
+							fmt.Sprintf("parker slot %s holds %s with no serial, and no move the disk's record observed landed it there",
+								intent.Slot, bare))
+					}
 					if serialErr := applyResumedSerial(wctx, c, logger, intent, stableID, intent.Slot, bare); serialErr != nil {
 						return serialErr
 					}
@@ -1074,6 +1109,10 @@ func ResumeDiskTransferToParker(
 						return snapErr
 					}
 				}
+				if pctx.ClaimOnly {
+					return claimOnlyResumeRefusal(ClaimOnlyConfigEdit, intent, stableID,
+						"the transfer needs a full resume to attach the released volume by config edit, which a claim-only resume doesn't do")
+				}
 				slot, attachErr := attachToParkerLocked(wctx, c, logger, intent.ParkerNode, intent.ParkerVMID, intent.Volid, stableID)
 				if attachErr != nil {
 					return attachErr
@@ -1083,11 +1122,15 @@ func ResumeDiskTransferToParker(
 			}
 		}
 
-		return cpierrors.Cloud(
+		neither := cpierrors.Cloud(
 			"transfer resume: disk %s has an intent record on parker vmid %d (node %s, slot %q, recorded volid %q, source %q) "+
 				"but neither the parker nor the source VM holds a state this transfer can converge; inspect the parker's "+
 				"slots and the source VM's unused entries by hand before retrying",
 			stableID, intent.ParkerVMID, intent.ParkerNode, intent.Slot, intent.Volid, intent.SourceVMCID)
+		if pctx.ClaimOnly {
+			return &ClaimOnlyRefusal{Window: ClaimOnlyNoWindow, err: neither}
+		}
+		return neither
 	})
 	if lockErr != nil {
 		return "", lockErr
@@ -1129,6 +1172,11 @@ func resumeSourceOffBus(
 			"transfer resume: volume %q is still attached to source vm %d; re-resolve and retry",
 			intent.Volid, srcVMID)
 	}
+	if pctx.ClaimOnly {
+		return QemuViews{}, claimOnlyResumeRefusal(ClaimOnlyPendingDelete, intent, pctx.StableID,
+			"the transfer needs a full resume to apply the pending delete of slot "+slot+" on source vm "+intent.SourceVMCID+
+				", which a claim-only resume doesn't do")
+	}
 	applied, err := applyFoundPendingDelete(ctx, c, logger, intent.ParkerNode, srcVMID, slot, intent.Volid, pctx)
 	if err != nil {
 		return QemuViews{}, err
@@ -1147,6 +1195,109 @@ func resumeSourceOffBus(
 			intent.Volid, srcVMID)
 	}
 	return after, nil
+}
+
+// ClaimOnlyWindow names the point where a claim-only resume stopped.
+type ClaimOnlyWindow string
+
+const (
+	// ClaimOnlyMove is the move window, where the source VM's unused entry
+	// still names the volume by its old name.
+	ClaimOnlyMove ClaimOnlyWindow = "move"
+	// ClaimOnlyPendingDelete is a source slot whose delete is still pending.
+	ClaimOnlyPendingDelete ClaimOnlyWindow = "pending_delete"
+	// ClaimOnlyConfigEdit is a source that released the volume, which only a
+	// config-edit attach parks.
+	ClaimOnlyConfigEdit ClaimOnlyWindow = "config_edit"
+	// ClaimOnlyUnprovenLanding is a slot with no serial whose volume no
+	// recorded move of this transfer landed.
+	ClaimOnlyUnprovenLanding ClaimOnlyWindow = "unproven_landing"
+	// ClaimOnlyIntentMoved is a transfer record that changed between the
+	// caller's read and the resume's read under the parker's lock.
+	ClaimOnlyIntentMoved ClaimOnlyWindow = "intent_moved"
+	// ClaimOnlyUnserialized is a window that would run without the parker's
+	// lock because PVE refused the lock's create or the client has no pool
+	// service that could grant it.
+	ClaimOnlyUnserialized ClaimOnlyWindow = "unserialized"
+	// ClaimOnlyNoWindow is a state no window of the resume converges.
+	ClaimOnlyNoWindow ClaimOnlyWindow = "no_window"
+)
+
+// ClaimOnlyRefusal is what a claim-only resume returns where it stops without
+// a write. Window says where it stopped, and Reason says why in a phrase a
+// caller can put after "because". The wrapped error carries the CPI class.
+// A refusal at the move, at a changed record, or at an unserialized lock is
+// retriable, because a retry resolves the disk again. Every other refusal is
+// permanent. The identity check, which is the only caller, resolves the disk
+// once more after a refusal at the move and refuses for audit, permanently,
+// when the old name is still gone. It refuses for audit, permanently, at an
+// unserialized lock too, because no retry grants the lock's privilege.
+type ClaimOnlyRefusal struct {
+	Window ClaimOnlyWindow
+	Reason string
+	err    error
+}
+
+func (e *ClaimOnlyRefusal) Error() string { return e.err.Error() }
+
+// Unwrap returns the classed CPI error the refusal carries.
+func (e *ClaimOnlyRefusal) Unwrap() error { return e.err }
+
+// AsClaimOnlyRefusal returns the ClaimOnlyRefusal in err's chain, if any.
+func AsClaimOnlyRefusal(err error) (*ClaimOnlyRefusal, bool) {
+	var refusal *ClaimOnlyRefusal
+	if errors.As(err, &refusal) {
+		return refusal, true
+	}
+	return nil, false
+}
+
+// claimOnlyResumeRefusal builds the refusal a claim-only resume returns at
+// window, with reason saying why it stopped there.
+func claimOnlyResumeRefusal(window ClaimOnlyWindow, intent DiskTransferIntent, stableID, reason string) error {
+	text := fmt.Sprintf("transfer resume: claim-only resume of disk %s on parker vmid %d stopped, because %s",
+		stableID, intent.ParkerVMID, reason)
+	switch window {
+	case ClaimOnlyMove, ClaimOnlyIntentMoved, ClaimOnlyUnserialized:
+		return &ClaimOnlyRefusal{Window: window, Reason: reason, err: cpierrors.Retriable("%s; retry", text)}
+	default:
+		return &ClaimOnlyRefusal{Window: window, Reason: reason, err: cpierrors.Cloud("%s", text)}
+	}
+}
+
+// claimOnlyPreconditions refuses a claim-only resume before any window runs.
+// The claim is safe to repeat only while the parker's lock keeps a second
+// resume out, so a window that runs without the lock refuses. The caller read
+// the transfer record before the lock, and another call may have finished or
+// changed the transfer while this one waited, so the record read again here
+// must still name the caller's slot, volume, and source VM.
+func claimOnlyPreconditions(ctx context.Context, parkerCfg map[string]any, intent DiskTransferIntent, stableID string) error {
+	if parkerLockUnserialized(ctx) {
+		return claimOnlyResumeRefusal(ClaimOnlyUnserialized, intent, stableID,
+			"PVE refused the parker's lock or no pool service could take it, and a claim-only resume runs only under that lock")
+	}
+	_, entries, _ := parseParkerSentinel(DescriptionFromConfig(parkerCfg))
+	entry, found := entries[stableID]
+	if found && entry.Slot == intent.Slot && entry.Volid == intent.Volid && entry.SourceVMCID == intent.SourceVMCID {
+		return nil
+	}
+	return claimOnlyResumeRefusal(ClaimOnlyIntentMoved, intent, stableID,
+		"the transfer moved underneath this call, and its record on the parker no longer matches the one the call read")
+}
+
+// landingRecorded reports whether one of landings moved the transfer's
+// recorded volume off its source VM and landed it as bare.
+func landingRecorded(landings []RecordedLanding, intent DiskTransferIntent, bare string) bool {
+	source, err := strconv.Atoi(intent.SourceVMCID)
+	if err != nil || source <= 0 || intent.Volid == "" {
+		return false
+	}
+	for _, landing := range landings {
+		if landing.SourceVMID == source && landing.From == intent.Volid && landing.To == bare {
+			return true
+		}
+	}
+	return false
 }
 
 // applyFoundPendingDelete applies a pending delete of slot that the resume

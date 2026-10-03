@@ -55,6 +55,12 @@ type diskHints struct {
 //     later get_disks call can return the exact CID the Director stored.
 //  7. Return disk_hints{"path": devicePath}.
 //
+// A disk whose transfer to a parker stopped after its move gets that transfer
+// finished before the node lookup, inside the disk's lifecycle when the
+// journal manages it. attachDiskResolveNode can't go first, because it finds
+// the node from the disk's volid, and until the resume finishes, the volid
+// the transfer record names is gone.
+//
 // Device path convention:
 //
 //	virtio0 → /dev/vda  (default root disk bus — not a persistent disk)
@@ -119,6 +125,15 @@ func HandleAttachDisk(deps Deps) Handler {
 			rd = lifecycle.disk
 			ctx = managedLockWaitContext(ctx)
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
+		}
+		// A transfer to a parker that stopped after its move leaves rd naming
+		// the volume the disk had before the move, and that name is gone. We
+		// finish the transfer first, inside the lifecycle when the journal
+		// manages the disk, so the node lookup below finds the disk where it
+		// landed. A resume that can't run comes back retriable.
+		rd, err = resumeTransferIfNeeded(ctx, deps, "attach_disk", rd)
+		if err != nil {
+			return nil, err
 		}
 
 		// --------------------------------------------------------------------
