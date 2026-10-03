@@ -18,9 +18,10 @@ type managedDiskIdentity struct {
 	record         aj.Record
 	provenance     pve.DiskAllocationProvenance
 	// shared reports whether the disk's storage is shared. Every move the
-	// CPI makes keeps the volume on its storage, so it holds for each name
-	// the record's moves landed. Only the identity check's claim-only resume
-	// reads it, to scope a later move that took a landing away.
+	// CPI makes keeps the volume on its storage, so the answer is the same
+	// for each name the record's moves landed. Only the identity check's
+	// claim-only resume reads it, to scope a later move that took a landing
+	// away.
 	shared bool
 }
 
@@ -182,18 +183,19 @@ type identityResumeKey struct{}
 // later call gets past this check to do that write, so the refusal is the
 // permanent audit refusal with the reason added. The same goes for a window
 // that would run without the parker's lock. PVE refuses that lock to a token
-// that lacks Pool.Allocate on bosh-lock-*, and no retry grants it.
+// that lacks Pool.Allocate on bosh-lock-*, and no retry grants that privilege.
 //
 // Where the resume would move the volume, the source VM's config still names
 // the old name that storage just said is gone, so a retry would only meet the
-// same refusal. In that case,
-// and when the transfer moved underneath the resume or no window applied,
-// the check resolves the disk once more. A disk whose old name is back, or
-// that has settled, is returned, and the caller's full resume finishes a
+// same refusal. In that case, and when the transfer moved underneath the
+// resume or no window applied, the check resolves the disk once more. A disk
+// whose old name is back, or that has settled, is returned, and the next call
+// that changes the disk, such as attach_disk or detach_disk, finishes a
 // transfer that's still open. A transfer that changed again comes back
-// retriable. An unchanged one keeps the resume's answer, which for the move
-// is the permanent audit refusal with the move's reason, and it adds that
-// storage doesn't list the old name, so the source VM's entry may dangle.
+// retriable. An unchanged one gets the resume's answer, which for the move is
+// the permanent audit refusal with the move's reason. That refusal also says
+// that storage doesn't list the old name, so the source VM's entry for it may
+// be dangling.
 //
 // shared reports whether the disk's storage is shared, and the claim-only
 // resume uses it to scope the moves that took a landing away.
@@ -298,8 +300,10 @@ func unsettledRecordStep(record aj.Record) (aj.Step, bool) {
 // A claim-only resume claims a parker slot only when one of them landed the
 // slot's volume.
 //
-// A landing that a later observed move took away again is left out, because
-// the disk no longer holds that name, and another volume may hold it now.
+// A landing that a later observed move or migrate took away again is left
+// out, because the disk no longer holds that name, and another volume may
+// hold it now.
+//
 // shared reports whether the disk's storage is shared, which decides where
 // that later move has to run for it to count.
 func recordedLandings(record aj.Record, shared bool) []pve.RecordedLanding {
@@ -327,6 +331,12 @@ func observedMoveStep(step *aj.Step) bool {
 	return step.State == aj.Observed && strings.HasSuffix(step.Kind, "_Nodes_CreateQemuMoveDisk")
 }
 
+// observedMigrateStep reports whether step is a migrate that the record
+// observed.
+func observedMigrateStep(step *aj.Step) bool {
+	return step.State == aj.Observed && strings.HasSuffix(step.Kind, "_Nodes_CreateQemuMigrate")
+}
+
 // landingMovedAway reports whether any observed move in later started from
 // landed, the name an earlier move gave the volume. The steps in later are
 // the ones the record observed after that earlier move, which ran on node.
@@ -337,11 +347,20 @@ func observedMoveStep(step *aj.Step) bool {
 // it leaves the volume where it was. A volid names one volume on a node, or
 // across the cluster on shared storage, so a later move counts when it ran
 // on node, or on any node when the storage is shared. The VM that move ran
-// on doesn't matter, because attach_disk can attach a volume that one VM's
-// name embeds to another VM by a config edit.
+// on doesn't matter, because attach_disk can attach a volume whose name
+// carries one VM's number to another VM by a config edit.
+//
+// A migrate counts as well when the record observed it starting from landed,
+// on whatever node it ran and under whatever name it landed. The VM that
+// held the landing left its node then, so the landing is no longer there to
+// claim. As with a move, a migrate step that holds only the name it started
+// from records no landing, and it doesn't count.
 func landingMovedAway(later []aj.Step, landed, node string, shared bool) bool {
 	for i := range later {
 		step := &later[i]
+		if observedMigrateStep(step) && len(step.VolIDs) >= 2 && step.VolIDs[0] == landed {
+			return true
+		}
 		if !observedMoveStep(step) || len(step.VolIDs) < 2 || step.VolIDs[0] != landed || step.VolIDs[len(step.VolIDs)-1] == landed {
 			continue
 		}

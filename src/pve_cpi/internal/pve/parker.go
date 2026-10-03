@@ -552,9 +552,19 @@ func writeParkerProvenance(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
 ) error {
+	_, err := writeParkerProvenanceCollecting(ctx, c, logger, node, parkerVMID, key, entry, cfg)
+	return err
+}
+
+// writeParkerProvenanceCollecting is writeParkerProvenance for a caller that
+// needs to know which records the write collected. It returns their keys.
+func writeParkerProvenanceCollecting(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
+) ([]string, error) {
 	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
 	if err != nil {
-		return cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
+		return nil, cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
 	}
 
 	now := provenanceNow(ctx, cfg)
@@ -576,21 +586,21 @@ func writeParkerProvenance(
 		)
 	}
 	if projectErr != nil {
-		return projectErr
+		return nil, projectErr
 	}
 
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {
 		// No nodes service available (e.g. test stub without injection). Skip silently.
-		return nil
+		return nil, nil
 	}
 	vmidStr := fmt.Sprintf("%d", parkerVMID)
 	if updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
 		Description: &newDesc,
 	}); updateErr != nil {
-		return cpierrors.Wrap(WrapMutationError(updateErr), "parker provenance: UpdateQemuConfig")
+		return nil, cpierrors.Wrap(WrapMutationError(updateErr), "parker provenance: UpdateQemuConfig")
 	}
-	return nil
+	return pruned, nil
 }
 
 // removeParkerProvenance removes the bareVolid entry from the parker VM
@@ -1880,7 +1890,13 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 				fmt.Sprintf("attachToParker: config fetch for parker vmid %d", parkerVMID))
 		}
 
-		slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(vmCfg), stolen)
+		// A slot that another disk's unfinished transfer record names is where
+		// that disk's move lands, so the park leaves it free as well.
+		exclude := slotSet(otherUnfinishedTransferSlots(stableID, vmCfg))
+		for stolenSlot := range stolen {
+			exclude[stolenSlot] = true
+		}
+		slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(vmCfg), exclude)
 		if slotErr != nil {
 			// A full parker that already names our volume on an unusedN key is
 			// not a parker to walk away from. ErrNoSlots sends the caller to the

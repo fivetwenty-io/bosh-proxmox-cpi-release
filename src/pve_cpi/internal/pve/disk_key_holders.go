@@ -190,29 +190,8 @@ func FindDiskTransferRecords(ctx context.Context, c Client, stableID string) ([]
 // order, whose current or pending value is a volume named for the parker with
 // no stable-ID serial, or "" when no key holds one.
 func parkerUnclaimedLanding(views QemuViews, parkerVMID int) string {
-	keys := make([]string, 0, len(views.entries))
-	for key := range views.entries {
-		if isQemuDiskKey(key) {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		entry := views.entries[key]
-		for _, value := range []struct {
-			present bool
-			text    string
-		}{{entry.hasValue, entry.value}, {entry.hasPending, entry.pending}} {
-			if !value.present {
-				continue
-			}
-			if embedded, named := EmbeddedDiskVMID(bareDriveVolid(value.text)); !named || embedded != parkerVMID {
-				continue
-			}
-			if _, hasSerial := StableIDFromDriveOptStr(value.text); !hasSerial {
-				return key
-			}
-		}
+	if landings := parkerUnclaimedLandings(views, parkerVMID); len(landings) > 0 {
+		return landings[0].Key
 	}
 	return ""
 }

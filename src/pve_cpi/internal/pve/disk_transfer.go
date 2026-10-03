@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -271,12 +272,47 @@ func uncertainUnansweredMove(logger *log.Logger, moveErr error, srcVMID int, dis
 		disk, srcVMID, targetVMID, targetSlot, found, cause)
 }
 
+// movePin is what a caller proved before it asked for a move. It holds the
+// source's and the target's configuration digests from the caller's own read
+// and the volume the source's disk key named when the caller read it.
+type movePin struct {
+	SourceDigest string
+	TargetDigest string
+	Volume       string
+}
+
+// check compares the pin with the digests and the volume a move attempt read
+// just before its POST, and names the first that changed.
+func (p movePin) check(srcVMID, targetVMID int, disk, digest, targetDigest, sourceVolume string) error {
+	switch {
+	case digest != p.SourceDigest:
+		return fmt.Errorf("source vm %d's digest is %q, not the %q its proof read", srcVMID, digest, p.SourceDigest)
+	case targetDigest != p.TargetDigest:
+		return fmt.Errorf("target vm %d's digest is %q, not the %q its proof read", targetVMID, targetDigest, p.TargetDigest)
+	case sourceVolume != p.Volume:
+		return fmt.Errorf("%s of source vm %d names %q, not the proven volume %q", disk, srcVMID, sourceVolume, p.Volume)
+	}
+	return nil
+}
+
 // moveDiskToVM issues one move_disk reassignment and awaits its task. disk is
 // the source config key ("scsi3" or "unused0"), targetSlot the config key the
 // volume lands on. Same-node only — PVE refuses cross-node reassignment.
+func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string, srcVMID int, disk string, targetVMID int, targetSlot string) error {
+	return moveDiskToVMPinned(ctx, c, logger, node, srcVMID, disk, targetVMID, targetSlot, nil)
+}
+
+// moveDiskToVMPinned is moveDiskToVM for a caller that proved which volume it
+// moves. Each attempt's fresh digests and source volume must still match pin
+// before its POST. A mismatch stops the move the way PVE's digest refusal
+// does, so it's retriable unless an earlier POST went unanswered, and then the
+// readback decides. A nil pin checks nothing.
 //
 //nolint:gocognit // Move retry-state machine: pendingUPID re-await, replay probe, and the POST+await path are one ordered decision tree; splitting it would scatter the ordering the double-apply protection depends on.
-func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string, srcVMID int, disk string, targetVMID int, targetSlot string) error {
+func moveDiskToVMPinned(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, srcVMID int, disk string, targetVMID int, targetSlot string, pin *movePin,
+) error {
 	nodesSvc := c.Nodes()
 	if nodesSvc == nil {
 		return cpierrors.Cloud("moveDiskToVM: nodes service not available")
@@ -356,6 +392,11 @@ func moveDiskToVM(ctx context.Context, c Client, logger *log.Logger, node string
 		}
 		if originalVolume == "" {
 			originalVolume = sourceVolume
+		}
+		if pin != nil {
+			if pinErr := pin.check(srcVMID, targetVMID, disk, digest, targetDigest, sourceVolume); pinErr != nil {
+				return stopOnMoveDigestRefusal(pinErr)
+			}
 		}
 		params := &sdknodes.CreateQemuMoveDiskParams{
 			Disk:       disk,
@@ -749,7 +790,9 @@ func transferIntoParkerLocked(
 		return "", cpierrors.Wrap(WrapConfigReadError(cfgErr),
 			fmt.Sprintf("transfer in: config read for parker vmid %d", parkerVMID))
 	}
-	slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(parkerCfg), nil)
+	// A slot another disk's unfinished record names is that disk's landing
+	// spot, so it stays out of the choice even while it's empty.
+	slot, slotErr := chooseParkSlotExcluding(qemu.ParseDisks(parkerCfg), slotSet(otherUnfinishedTransferSlots(pctx.StableID, parkerCfg)))
 	if slotErr != nil {
 		return "", slotErr // ErrNoSlots — caller tries the next parker
 	}
@@ -929,9 +972,39 @@ func attachReleasedSourceVolume(
 //     comes first. On a running source the resume leaves it alone and returns
 //     DriveDeletePendingFound. On a stopped source it applies the delete when
 //     pctx.ApplyFoundPendingDelete asks for it, and then goes on to whichever
-//     window PVE left.
-//   - the recorded parker slot holds a parker-named volume with no serial:
-//     the move landed but the serial write was lost — claim it.
+//     window PVE left. A fallback slot is written into the record before the
+//     move, so a landing whose serial write is lost sits on the slot the
+//     record names.
+//   - the recorded parker slot holds a parker-named volume with no serial,
+//     which means the move landed but the serial write was lost, so claim it.
+//     Claim it only when that volume is the one volume on the parker named for
+//     the parker with no serial in either view, and only when no other disk's
+//     unfinished record names the slot. In any other case the resume refuses.
+//     A landing on the slot of another disk's unfinished transfer counts as
+//     that disk's only when that disk's move is proved, which means its
+//     source exists and names its recorded volume nowhere, and that volume is
+//     either gone from storage or named by another guest. Every other answer
+//     leaves that disk's move unknown, and a landing on an unknown disk's slot
+//     refuses with audit required. A proved move with no landing on its slot
+//     refuses the same way, and so does a claim that rests on setting another
+//     landing aside by inference rather than by its serial. While another
+//     transfer's move is unknown or unmoved with nothing on its slot, the claim
+//     also refuses with audit required unless this disk's own move is proved,
+//     because the landing may then be that disk's. A failed read refuses
+//     retriably. While the parker holds a parker-named volume with no serial
+//     that the resume can't set aside as another disk's landing, the move
+//     window doesn't run, because PVE renamed a landed volume off the recorded
+//     name and another disk may have taken it.
+//
+// Before it moves a volume or writes the serial onto one, the resume proves
+// which volume is the disk, the same way the settlement of a move step does
+// (disk_transfer_resume_proof.go).
+// It refuses when another parker keeps a record of the disk's transfer, when
+// any guest carries the serial, or when another parker names the volume. A
+// source that reads as gone counts as gone only when the cluster can't find
+// it either, and a released volume may have no guest naming it at all. In
+// every window it refuses with audit required while another unfinished record
+// on the parker names the same source VM and recorded volume as this one.
 //
 // With pctx.ClaimOnly set, the resume runs only the finalize and the claim,
 // and it returns a ClaimOnlyRefusal before any other write. It refuses when
@@ -992,85 +1065,52 @@ func ResumeDiskTransferToParker(
 			return finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
 		}
 
+		// A volume named for the parker with no serial is a move that landed
+		// before its serial write, this transfer's or another's. While one is
+		// there, the recorded volid on the source may already be another
+		// disk's, because PVE renamed this disk's volume off that name when it
+		// landed. So the move window doesn't run, and the landing window below
+		// claims the landing or refuses.
+		// A landing on the slot of another disk's unfinished transfer whose
+		// move is proved is that disk's, and readResumeParker refuses any
+		// other landing it can't attribute.
+		parker, parkerErr := readResumeParker(wctx, c, intent, stableID, cfg)
+		if parkerErr != nil {
+			return parkerErr
+		}
+
 		// Window: the move never ran — the source VM still holds the volume
 		// on an unusedN entry under its recorded (pre-move) name.
-		if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
-			srcViews, srcErr := ReadQemuViews(wctx, c, intent.ParkerNode, srcVMID)
-			switch {
-			case srcErr != nil && !parkerConfigGone(srcErr):
-				return cpierrors.Wrap(WrapConfigReadError(srcErr),
-					fmt.Sprintf("transfer resume: config read for source vm %d", srcVMID))
-			case srcErr == nil:
-				offBus, offErr := resumeSourceOffBus(wctx, c, logger, intent, srcVMID, srcViews, pctx)
-				if offErr != nil {
-					return offErr
-				}
-				srcCfg := offBus.Applied()
-				for key, volid := range FindUnusedDiskEntries(srcCfg) {
-					if volid != intent.Volid {
-						continue
-					}
-					slot, slotErr := resumeTargetSlot(disks, intent.Slot)
-					if slotErr != nil {
-						return slotErr
-					}
-					if pctx.ClaimOnly {
-						// The source VM's config names the volume by its old
-						// name here, but the identity check runs a claim-only
-						// resume only after storage said that name is gone, so
-						// the entry may be dangling. The identity check
-						// resolves the disk once more. If the old name is back,
-						// its caller's full resume finishes the transfer, and
-						// if it's still gone, the check refuses for audit,
-						// permanently. We haven't proven the full resume safe
-						// against a volume that reused the old name, and that
-						// proof belongs to the full resume's caller.
-						return claimOnlyResumeRefusal(ClaimOnlyMove, intent, stableID,
-							"the transfer needs a full resume to move the volume off source vm "+intent.SourceVMCID+
-								", which a claim-only resume doesn't do")
-					}
-					if moveErr := moveDiskToVM(wctx, c, logger, intent.ParkerNode, srcVMID, key, intent.ParkerVMID, slot); moveErr != nil {
-						return moveErr
-					}
-					afterCfg, afterErr := c.QEMU().Config(wctx, intent.ParkerNode, intent.ParkerVMID)
-					if afterErr != nil {
-						return cpierrors.Wrap(WrapConfigReadError(afterErr),
-							fmt.Sprintf("transfer resume: config read for parker vmid %d after move", intent.ParkerVMID))
-					}
-					bare, ok := slotBareVolid(afterCfg, slot)
-					if !ok {
-						return cpierrors.Retriable(
-							"transfer resume: move_disk reported success but parker vmid %d slot %s is empty; retry",
-							intent.ParkerVMID, slot)
-					}
-					if serialErr := applyResumedSerial(wctx, c, logger, intent, stableID, slot, bare); serialErr != nil {
-						return serialErr
-					}
-					landed = bare
-					return finalizeResumedTransfer(wctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
-				}
+		srcVMID, convErr := strconv.Atoi(intent.SourceVMCID)
+		if len(parker.landings) == 0 && convErr == nil && srcVMID > 0 && intent.Volid != "" {
+			moved, handled, moveErr := resumeMoveWindow(wctx, c, logger, intent, stableID, srcVMID, parker, disks, cfg, pctx)
+			if moveErr != nil || handled {
+				landed = moved
+				return moveErr
 			}
 		}
 
 		// Window: the move landed on the recorded slot but the serial write
-		// was lost. Claimable only when the slot holds a parker-named volume
-		// carrying no stable-ID serial — anything else is not this transfer.
-		if intent.Slot != "" {
-			if bare, ok := slotBareVolid(parkerCfg, intent.Slot); ok {
-				_, hasSerial := StableIDFromDriveOptStr(disks[intent.Slot])
-				if embedded, named := EmbeddedDiskVMID(bare); named && embedded == intent.ParkerVMID && !hasSerial {
-					if pctx.ClaimOnly && !landingRecorded(pctx.ClaimLandings, intent, bare) {
-						return claimOnlyResumeRefusal(ClaimOnlyUnprovenLanding, intent, stableID,
-							fmt.Sprintf("parker slot %s holds %s with no serial, and no move the disk's record observed landed it there",
-								intent.Slot, bare))
-					}
-					if serialErr := applyResumedSerial(wctx, c, logger, intent, stableID, intent.Slot, bare); serialErr != nil {
-						return serialErr
-					}
-					landed = bare
-					return finalizeResumedTransfer(wctx, c, logger, intent, stableID, intent.Slot, bare, cfg, pctx)
-				}
+		// was lost. Claimable only when the landing is the parker's one volume
+		// named for it with no stable-ID serial, it sits on the recorded slot,
+		// no other disk's unfinished record names that slot, and nothing else
+		// in the cluster holds the disk. Any other landing can't be told apart
+		// from this transfer's, so the resume refuses.
+		if len(parker.landings) > 0 {
+			bare, proofErr := proveRecordedLanding(wctx, c, intent, stableID, parker)
+			if proofErr != nil {
+				return proofErr
 			}
+			if pctx.ClaimOnly && !landingRecorded(pctx.ClaimLandings, intent, bare) {
+				return claimOnlyResumeRefusal(ClaimOnlyUnprovenLanding, intent, stableID,
+					fmt.Sprintf("parker slot %s holds %s with no serial, and no move the disk's record observed landed it there",
+						intent.Slot, bare))
+			}
+			if serialErr := applyResumedSerial(wctx, c, logger, intent, stableID, intent.Slot, bare); serialErr != nil {
+				return serialErr
+			}
+			landed = bare
+			return finalizeResumedTransfer(wctx, c, logger, intent, stableID, intent.Slot, bare, cfg, pctx)
 		}
 
 		// Window: the move never ran and the source VM no longer exists (or no
@@ -1085,16 +1125,20 @@ func ResumeDiskTransferToParker(
 		// attach boundary a legacy park uses. PVE validates the volid on
 		// attach, so a volume that truly vanished fails the attach instead of
 		// parking a dangling reference.
-		if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
+		if convErr == nil && srcVMID > 0 && intent.Volid != "" {
 			srcViews, srcErr := ReadQemuViews(wctx, c, intent.ParkerNode, srcVMID)
 			sourceReleased := false
 			switch {
 			case srcErr != nil:
 				// Window 2 already returned every non-gone read error, so a
 				// second failing read here is either the same gone answer or a
-				// fault that appeared mid-resume; only the gone answer proves
-				// the source released the volume.
-				sourceReleased = parkerConfigGone(srcErr)
+				// fault that appeared mid-resume. Only the gone answer, with
+				// the cluster agreeing, proves the source released the volume.
+				gone, goneErr := resumeSourceGone(wctx, c, intent, stableID, srcVMID, srcErr)
+				if goneErr != nil {
+					return goneErr
+				}
+				sourceReleased = gone
 			default:
 				// Released only when neither view names the volume: a pending
 				// delete leaves the volume plugged into the running guest.
@@ -1108,6 +1152,9 @@ func ResumeDiskTransferToParker(
 					if snapErr := refuseSnapshotNamingVolume(wctx, c, intent.ParkerNode, srcVMID, intent.Volid); snapErr != nil {
 						return snapErr
 					}
+				}
+				if proofErr := proveReleasedVolume(wctx, c, intent, stableID); proofErr != nil {
+					return proofErr
 				}
 				if pctx.ClaimOnly {
 					return claimOnlyResumeRefusal(ClaimOnlyConfigEdit, intent, stableID,
@@ -1138,9 +1185,198 @@ func ResumeDiskTransferToParker(
 	return landed, nil
 }
 
+// resumeMoveWindow is the resume's window for a move that never ran, where the
+// source VM still names the recorded volid. It proves the disk, takes the
+// volume off any source bus slot that names it, moves the unused entry onto the
+// parker, writes the serial, and finalizes the record. The move is pinned to
+// the digests of the source and parker reads the proof used and to the recorded
+// volid. A fallback slot goes into the record first, through recordResumeSlot,
+// and the move is then pinned to the parker read after that write. It returns
+// the landed volid and handled true once it has acted, and handled false when
+// the source is gone or names the volume on no unused entry, so the later
+// windows decide.
+func resumeMoveWindow(
+	ctx context.Context, c Client, logger *log.Logger,
+	intent DiskTransferIntent, stableID string, srcVMID int, parker resumeParker, disks map[string]string,
+	cfg ParkerConfig, pctx ParkContext,
+) (string, bool, error) {
+	srcViews, srcErr := ReadQemuViews(ctx, c, intent.ParkerNode, srcVMID)
+	if srcErr != nil {
+		gone, goneErr := resumeSourceGone(ctx, c, intent, stableID, srcVMID, srcErr)
+		if goneErr != nil {
+			return "", true, goneErr
+		}
+		if gone {
+			return "", false, nil
+		}
+		return "", true, cpierrors.Wrap(WrapConfigReadError(srcErr),
+			fmt.Sprintf("transfer resume: config read for source vm %d", srcVMID))
+	}
+	if !srcViews.NamesVolume(intent.Volid) {
+		return "", false, nil
+	}
+	if proofErr := proveSourceNamesDisk(ctx, c, intent, stableID, srcVMID, srcViews); proofErr != nil {
+		return "", true, proofErr
+	}
+	// The proof read srcViews, but the pending delete that resumeSourceOffBus
+	// applies isn't pinned to that read. DeleteDriveSlot takes a digest, but on a
+	// mismatch it reverts the pending delete it finds, and that delete isn't the
+	// resume's to revert. So a change to the source between the proof and the
+	// apply goes unchecked here. proveSourceKey checks the source again after the
+	// apply, and the move is pinned to that later read.
+	offBus, appliedSlot, offErr := resumeSourceOffBus(ctx, c, logger, intent, srcVMID, srcViews, pctx)
+	if offErr != nil {
+		return "", true, offErr
+	}
+	// Once resumeSourceOffBus applied a pending delete, every refusal after it
+	// says so, because the source no longer holds that slot.
+	afterDelete := func(err error, then string) error {
+		if appliedSlot == "" {
+			return err
+		}
+		return cpierrors.Wrap(err, fmt.Sprintf(
+			"transfer resume: applied the pending delete of %s on source vm %d, and then %s did not go through",
+			appliedSlot, srcVMID, then))
+	}
+	for key, volid := range FindUnusedDiskEntries(offBus.Applied()) {
+		if volid != intent.Volid {
+			continue
+		}
+		if proofErr := proveSourceKey(intent, stableID, srcVMID, offBus, key, appliedSlot); proofErr != nil {
+			return "", true, proofErr
+		}
+		slot, slotErr := resumeTargetSlot(disks, intent.Slot, slotSet(parker.others))
+		if slotErr != nil {
+			return "", true, afterDelete(slotErr, fmt.Sprintf("the choice of a slot on parker vmid %d", intent.ParkerVMID))
+		}
+		if pctx.ClaimOnly {
+			// The source VM's config names the volume by its old
+			// name here, but the identity check runs a claim-only
+			// resume only after storage said that name is gone, so
+			// the entry may be dangling. The identity check
+			// resolves the disk once more. If the old name is back,
+			// the next call that changes the disk, such as
+			// attach_disk or detach_disk, finishes the transfer, and
+			// if it's still gone, the check refuses for audit,
+			// permanently. We haven't proven that full resume safe
+			// against a volume that reused the old name, and that
+			// proof belongs to the call that runs it.
+			return "", true, claimOnlyResumeRefusal(ClaimOnlyMove, intent, stableID,
+				"the transfer needs a full resume to move the volume off source vm "+intent.SourceVMCID+
+					", which a claim-only resume doesn't do")
+		}
+		pinned := parker.views
+		if slot != intent.Slot {
+			rewritten, rewriteErr := recordResumeSlot(ctx, c, logger, intent, stableID, slot, parker.views, cfg)
+			if rewriteErr != nil {
+				return "", true, afterDelete(rewriteErr, fmt.Sprintf(
+					"the rewrite of disk %s's record on parker vmid %d", stableID, intent.ParkerVMID))
+			}
+			pinned = rewritten
+		}
+		sourceDigest, _ := ConfigString(offBus.Applied(), "digest")
+		parkerDigest, _ := ConfigString(pinned.Applied(), "digest")
+		pin := &movePin{SourceDigest: sourceDigest, TargetDigest: parkerDigest, Volume: intent.Volid}
+		if moveErr := moveDiskToVMPinned(ctx, c, logger, intent.ParkerNode, srcVMID, key, intent.ParkerVMID, slot, pin); moveErr != nil {
+			return "", true, afterDelete(moveErr, fmt.Sprintf("the move of %s", key))
+		}
+		afterCfg, afterErr := c.QEMU().Config(ctx, intent.ParkerNode, intent.ParkerVMID)
+		if afterErr != nil {
+			return "", true, cpierrors.Wrap(WrapConfigReadError(afterErr),
+				fmt.Sprintf("transfer resume: config read for parker vmid %d after move", intent.ParkerVMID))
+		}
+		bare, ok := slotBareVolid(afterCfg, slot)
+		if !ok {
+			return "", true, cpierrors.Retriable(
+				"transfer resume: move_disk reported success but parker vmid %d slot %s is empty; retry",
+				intent.ParkerVMID, slot)
+		}
+		if serialErr := applyResumedSerial(ctx, c, logger, intent, stableID, slot, bare); serialErr != nil {
+			return "", true, serialErr
+		}
+		return bare, true, finalizeResumedTransfer(ctx, c, logger, intent, stableID, slot, bare, cfg, pctx)
+	}
+	return "", false, nil
+}
+
+// recordResumeSlot points this disk's transfer record at slot, the fallback
+// the move window chose because the recorded slot was taken, before the move
+// runs. A move that lands and then loses its serial write leaves its landing
+// on the slot the record names, so the next resume claims that landing rather
+// than refusing it for an audit. The helper rewrites the record the resume
+// read and changes only its slot, and it refuses retriably when that record no
+// longer matches the intent. The write changes the parker's digest, so the
+// helper reads the parker again and returns that read for the move to pin. It
+// refuses retriably when the new read doesn't show the slot it wrote, or when
+// anything besides this disk's record changed between the two reads, apart
+// from the stale records the write collected, because the move would then be
+// pinned to a parker the proof never saw.
+func recordResumeSlot(
+	ctx context.Context, c Client, logger *log.Logger,
+	intent DiskTransferIntent, stableID, slot string, before QemuViews, cfg ParkerConfig,
+) (QemuViews, error) {
+	_, records, _ := parseParkerSentinel(DescriptionFromConfig(before.Applied()))
+	entry, ok := records[stableID]
+	if !ok || entry.Slot != intent.Slot || entry.Volid != intent.Volid || entry.SourceVMCID != intent.SourceVMCID {
+		return QemuViews{}, cpierrors.Retriable(
+			"transfer resume: parker vmid %d no longer keeps the record of disk %s that the resume read; retry",
+			intent.ParkerVMID, stableID)
+	}
+	entry.Slot = slot
+	collected, err := writeParkerProvenanceCollecting(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg)
+	if err != nil {
+		return QemuViews{}, cpierrors.Wrap(err, fmt.Sprintf(
+			"transfer resume: point the record of disk %s on parker vmid %d at fallback slot %s",
+			stableID, intent.ParkerVMID, slot))
+	}
+	after, err := ReadQemuViews(ctx, c, intent.ParkerNode, intent.ParkerVMID)
+	if err != nil {
+		return QemuViews{}, cpierrors.Wrap(WrapConfigReadError(err), fmt.Sprintf(
+			"transfer resume: read parker vmid %d in both views after its record write", intent.ParkerVMID))
+	}
+	_, written, _ := parseParkerSentinel(DescriptionFromConfig(after.Applied()))
+	if written[stableID].Slot != slot || !sameParkerApartFromRecords(before, after, stableID, collected) {
+		return QemuViews{}, cpierrors.Retriable(
+			"transfer resume: parker vmid %d changed while the resume pointed disk %s's record at slot %s; retry",
+			intent.ParkerVMID, stableID, slot)
+	}
+	return after, nil
+}
+
+// sameParkerApartFromRecords reports whether two reads of a parker agree. They
+// agree when both hold the same keys with the same values in both views, and
+// the same transfer records in both views. Four things don't count as a
+// difference. They are the description's own text, the digest that changes
+// with it, the record of the disk that own names, which the write changed, and
+// the records of the disks that collected names, which the write removed. Any
+// other difference means someone else wrote to the parker between the reads.
+func sameParkerApartFromRecords(before, after QemuViews, own string, collected []string) bool {
+	for _, pair := range [][2]QemuViews{{before, after}, {after, before}} {
+		for key, entry := range pair[0].entries {
+			if key == "description" || key == "digest" {
+				continue
+			}
+			if other, ok := pair[1].entries[key]; !ok || other != entry {
+				return false
+			}
+		}
+	}
+	setAside := func(views map[string]any) map[string]parkerProvEntry {
+		_, records, _ := parseParkerSentinel(DescriptionFromConfig(views))
+		delete(records, own)
+		for _, key := range collected {
+			delete(records, key)
+		}
+		return records
+	}
+	return reflect.DeepEqual(setAside(before.Applied()), setAside(after.Applied())) &&
+		reflect.DeepEqual(setAside(before.Current()), setAside(after.Current()))
+}
+
 // resumeSourceOffBus is the start of the resume's move window. It returns the
 // source's views once no bus slot names the recorded volid, which is what the
-// move window needs before it reassigns an unused entry.
+// move window needs before it reassigns an unused entry, and the bus slot
+// whose pending delete it applied to get there, if any.
 //
 // A bus slot whose pending value names a different volume than its current
 // drive can't be detached until PVE applies the change, so the resume returns
@@ -1159,42 +1395,42 @@ func ResumeDiskTransferToParker(
 func resumeSourceOffBus(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, srcVMID int, srcViews QemuViews, pctx ParkContext,
-) (QemuViews, error) {
+) (QemuViews, string, error) {
 	slot, onBus := srcViews.BusSlotNaming(intent.Volid)
 	if !onBus {
-		return srcViews, nil
+		return srcViews, "", nil
 	}
 	if _, replaced := srcViews.PendingReplacements()[slot]; replaced {
-		return QemuViews{}, &DriveDeletePendingError{Reason: DriveDeletePendingReplaced, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
+		return QemuViews{}, "", &DriveDeletePendingError{Reason: DriveDeletePendingReplaced, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
 	}
 	if !srcViews.PendingDelete(slot) {
-		return QemuViews{}, cpierrors.Retriable(
+		return QemuViews{}, "", cpierrors.Retriable(
 			"transfer resume: volume %q is still attached to source vm %d; re-resolve and retry",
 			intent.Volid, srcVMID)
 	}
 	if pctx.ClaimOnly {
-		return QemuViews{}, claimOnlyResumeRefusal(ClaimOnlyPendingDelete, intent, pctx.StableID,
+		return QemuViews{}, "", claimOnlyResumeRefusal(ClaimOnlyPendingDelete, intent, pctx.StableID,
 			"the transfer needs a full resume to apply the pending delete of slot "+slot+" on source vm "+intent.SourceVMCID+
 				", which a claim-only resume doesn't do")
 	}
 	applied, err := applyFoundPendingDelete(ctx, c, logger, intent.ParkerNode, srcVMID, slot, intent.Volid, pctx)
 	if err != nil {
-		return QemuViews{}, err
+		return QemuViews{}, "", err
 	}
 	if !applied {
-		return QemuViews{}, &DriveDeletePendingError{Reason: DriveDeletePendingFound, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
+		return QemuViews{}, "", &DriveDeletePendingError{Reason: DriveDeletePendingFound, Node: intent.ParkerNode, VMID: srcVMID, Slot: slot}
 	}
 	after, err := ReadQemuViews(ctx, c, intent.ParkerNode, srcVMID)
 	if err != nil {
-		return QemuViews{}, cpierrors.Wrap(WrapConfigReadError(err),
+		return QemuViews{}, "", cpierrors.Wrap(WrapConfigReadError(err),
 			fmt.Sprintf("transfer resume: re-read source vm %d after applying its pending delete", srcVMID))
 	}
 	if _, stillOnBus := after.BusSlotNaming(intent.Volid); stillOnBus {
-		return QemuViews{}, cpierrors.Retriable(
+		return QemuViews{}, "", cpierrors.Retriable(
 			"transfer resume: volume %q is still on a slot of source vm %d after its pending delete was applied; re-resolve and retry",
 			intent.Volid, srcVMID)
 	}
-	return after, nil
+	return after, slot, nil
 }
 
 // ClaimOnlyWindow names the point where a claim-only resume stopped.
@@ -1229,9 +1465,10 @@ const (
 // A refusal at the move, at a changed record, or at an unserialized lock is
 // retriable, because a retry resolves the disk again. Every other refusal is
 // permanent. The identity check, which is the only caller, resolves the disk
-// once more after a refusal at the move and refuses for audit, permanently,
-// when the old name is still gone. It refuses for audit, permanently, at an
-// unserialized lock too, because no retry grants the lock's privilege.
+// once more after a refusal at the move, and it refuses for audit, permanently,
+// when the old name is still gone. It also refuses for audit, permanently, at
+// the unserialized window, because no retry can grant the privilege the lock
+// needs.
 type ClaimOnlyRefusal struct {
 	Window ClaimOnlyWindow
 	Reason string
@@ -1341,14 +1578,16 @@ func applyFoundPendingDelete(ctx context.Context, c Client, logger *log.Logger, 
 
 // resumeTargetSlot prefers the intent's recorded slot when it is still free
 // and falls back to a fresh choice — a concurrent park may have taken the
-// recorded one while the crashed transfer's lock was expired.
-func resumeTargetSlot(disks map[string]string, recorded string) (string, error) {
-	if recorded != "" {
+// recorded one while the crashed transfer's lock was expired. exclude holds
+// the slots other disks' unfinished records name, and neither the recorded
+// slot nor the fallback may be one of them.
+func resumeTargetSlot(disks map[string]string, recorded string, exclude map[string]bool) (string, error) {
+	if recorded != "" && !exclude[recorded] {
 		if _, occupied := disks[recorded]; !occupied {
 			return recorded, nil
 		}
 	}
-	return chooseParkSlotExcluding(disks, nil)
+	return chooseParkSlotExcluding(disks, exclude)
 }
 
 // applyResumedSerial re-applies the stable-ID serial on a resumed transfer's
