@@ -67,17 +67,17 @@ func TestMatchDiskIdentity(t *testing.T) {
 		"scsi2": "data:vm-9001-disk-0,size=5G",
 	}
 	// Volid match wins the entry it names.
-	slot, current, ok := matchDiskIdentity(disks, "data:vm-9001-disk-0", "")
+	slot, current, ok := matchDiskIdentityAs(disks, "data:vm-9001-disk-0", "", matchSerial)
 	if !ok || slot != "scsi2" || current != "data:vm-9001-disk-0" {
 		t.Errorf("volid match = (%q, %q, %v)", slot, current, ok)
 	}
 	// Serial match finds the renamed volume and reports its CURRENT volid.
-	slot, current, ok = matchDiskIdentity(disks, "data:vm-9001-disk-9", "bpd-aaaabbbbccccdddd")
+	slot, current, ok = matchDiskIdentityAs(disks, "data:vm-9001-disk-9", "bpd-aaaabbbbccccdddd", matchSerial)
 	if !ok || slot != "scsi1" || current != "data:vm-700-disk-1" {
 		t.Errorf("serial match = (%q, %q, %v)", slot, current, ok)
 	}
 	// No serial matching without a stable ID.
-	if _, _, ok := matchDiskIdentity(disks, "data:vm-9001-disk-9", ""); ok {
+	if _, _, ok := matchDiskIdentityAs(disks, "data:vm-9001-disk-9", "", matchSerial); ok {
 		t.Error("matched without volid or stable ID")
 	}
 }

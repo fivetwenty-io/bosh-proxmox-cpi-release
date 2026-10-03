@@ -93,6 +93,14 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
+		// A disk whose transfer to a parker stopped part way resolves to the
+		// parker's record, and the record names the volume the disk had
+		// before the move. Another disk can hold that name by now, so we
+		// finish the transfer first and write to the VM where it settles.
+		rd, resolveErr = resumeSetDiskMetadataTransfer(ctx, deps, rd)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
 		bareDiskCID = rd.volid
 
 		var metadata map[string]any
@@ -161,6 +169,28 @@ func HandleSetDiskMetadata(deps Deps) cpi.Handler {
 			)
 		}
 	})
+}
+
+// resumeSetDiskMetadataTransfer finishes a transfer to a parker that the disk
+// has in flight. When the journal manages the disk, the resume runs inside the
+// disk's lifecycle, so the landing and the source VM's tail run under the
+// allocation journal's lock, the way they do for the other disk calls. The
+// lifecycle ends before we return, because the handler takes the hosting VM's
+// lock next and must never hold it under the journal's lock. A disk with no
+// transfer in flight takes no lifecycle at all.
+func resumeSetDiskMetadataTransfer(ctx context.Context, deps Deps, rd resolvedDisk) (_ resolvedDisk, operationErr error) {
+	if rd.intent == nil {
+		return rd, nil
+	}
+	local, lifecycle, err := managedDiskOperation(ctx, deps, rd, "set_disk_metadata")
+	if err != nil {
+		return resolvedDisk{}, err
+	}
+	if lifecycle != nil {
+		rd = lifecycle.disk
+		defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
+	}
+	return resumeTransferIfNeeded(ctx, local, "set_disk_metadata", rd)
 }
 
 // coerceTagMap accepts an arbitrary JSON value supplied under metadata[jsonKeyTags]

@@ -559,7 +559,7 @@ func TestTransferDiskToParker_ProtocolAndOrdering(t *testing.T) {
 	// The parker slot carries the serial (re-applied after the unused-entry
 	// move dropped the options).
 	parkerDisks := qemu.ParseDisks(c.configs[90000])
-	slot, current, ok := matchDiskIdentity(parkerDisks, "none", transferStableID)
+	slot, current, ok := matchDiskIdentityAs(parkerDisks, "none", transferStableID, matchSerial)
 	if !ok || current != landed {
 		t.Fatalf("parker slot after transfer: slot=%q current=%q ok=%v", slot, current, ok)
 	}

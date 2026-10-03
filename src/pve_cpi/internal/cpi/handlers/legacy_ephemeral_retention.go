@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -66,10 +67,14 @@ func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID stri
 }
 
 func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID string, vmid int, volume string, logger *log.Logger) error {
-	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	// We read both views, because the scan reports a slot whose delete is
+	// pending from the current view, and the own-slot check below has to find
+	// it there.
+	views, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return err
 	}
+	cfg := views.Applied()
 	if _, err := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(cfg)); err != nil {
 		return err
 	}
@@ -96,12 +101,35 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 			return err
 		}
 		pve.UpdateAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, volume, cid)
-		after, err := deps.PVE.QEMU().Config(ctx, node, vmid)
-		if err != nil || pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(after))[volume] != cid {
+		after, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
+		if err != nil || pve.GetAttachedDiskCIDs(pve.DescriptionFromConfig(after.Applied()))[volume] != cid {
 			return fmt.Errorf("retained ephemeral source provenance was not persisted")
 		}
+		// The note write moved the config on, so the read that confirmed it
+		// is the config the resolution below has to agree with.
+		views, cfg = after, after.Applied()
 	}
+	// A legacy ephemeral slot carries no serial, and a token minted above is
+	// on no slot yet, so the resolution refuses the volume whenever this VM's
+	// own slot is what names it. We take that refusal as this VM's slot only
+	// when that slot is the one entry naming the volume, in the same config we
+	// read above, so a volume that another guest or a second slot here also
+	// names is never retained. Every other error, the offline-node one
+	// included, goes back unchanged. The digest check sees only this VM's
+	// config as the scan read it, so two changes get past it. Another guest can
+	// gain a slot for the volume after the scan has read that guest. This VM
+	// can also change after the scan reads it and before the transfer reads it
+	// again. The transfer's own checks cover the second change, and no test row
+	// covers either one.
 	identity, err := resolveDiskForOp(ctx, deps, "retain_ephemeral", cid, volume, meta)
+	if held, ok := pve.IsDiskBirthNameHeld(err); ok {
+		// The scan reports a slot from the applied view and, while the slot's
+		// delete is pending, from the current view, so we read the own slot
+		// the same way. The applied view's keys, the digest among them, win.
+		seen := views.Current()
+		maps.Copy(seen, cfg)
+		identity, err = retainedOwnSlotIdentity(held, seen, node, vmid, cid, volume, meta)
+	}
 	if err != nil {
 		return err
 	}
@@ -145,6 +173,36 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 	}
 	disk := resolvedDisk{diskCID: cid, birth: volume, volid: volume, meta: meta, stableID: meta.ID}
 	return verifyLegacyDiskPreservation(ctx, deps, disk)
+}
+
+// retainedOwnSlotIdentity resolves a retained ephemeral volume whose only
+// name holder is a slot of the VM being deleted. The resolution's refusal
+// lists every entry naming the volume, and we accept it only when that list
+// is one serial-less slot of this VM on this node, read from a config whose
+// digest matches cfg's, and cfg names the volume in that slot. The scan
+// reads every guest's config again, so the digest is what proves both reads
+// saw the same config. A bus slot becomes the holder. An unused entry leaves
+// the holder empty, so the caller's sole-reference proof decides it, as
+// before.
+func retainedOwnSlotIdentity(
+	held *pve.DiskBirthNameHeldError, cfg map[string]any, node string, vmid int, cid, volume string, meta *pve.DiskCIDMeta,
+) (resolvedDisk, error) {
+	if len(held.Holders) != 1 {
+		return resolvedDisk{}, fmt.Errorf("retained ephemeral ownership is ambiguous")
+	}
+	own := held.Holders[0]
+	value, _ := cfg[own.Slot].(string)
+	if own.VMID != vmid || own.Node != node || own.Serial != "" || strings.Split(value, ",")[0] != volume {
+		return resolvedDisk{}, fmt.Errorf("retained ephemeral ownership is ambiguous")
+	}
+	if digest, _ := pve.ConfigString(cfg, "digest"); digest == "" || own.Digest != digest {
+		return resolvedDisk{}, fmt.Errorf("retained ephemeral config changed while its volume was resolved")
+	}
+	rd := resolvedDisk{diskCID: cid, birth: volume, volid: volume, meta: meta, stableID: meta.ID}
+	if !own.Unused {
+		rd.holder = &pve.DiskHolder{Found: true, VMID: vmid, Node: node}
+	}
+	return rd, nil
 }
 
 // legacyUnusedSoleHolder reports whether this VM holds volume as its own

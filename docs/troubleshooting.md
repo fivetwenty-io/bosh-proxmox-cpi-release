@@ -813,9 +813,11 @@ delete_disk: refusing to delete disk <cid>, because VM <N> on node <node> still 
 
 Other calls refuse the same disk with the same pointer. `detach_disk` from a VM other than `<N>`, `attach_disk` on a journal-managed disk, `resize_disk`, and `snapshot_disk` each name the unused entry the same way. When more than one unused entry names the volume, or the only one sits on a VM in the parker band, every call refuses, because those entries can't be tied to one guest.
 
+These refusals need VM `<N>`'s description to still hold the disk's attached-disk note under its stable ID, and `attach_disk` is what writes that note. When the note is gone, nothing proves that the unused entry holds this disk rather than another volume that took its old name. Every call then refuses with the error in [Another entry names a disk's birth volume](#another-entry-names-a-disks-birth-volume), and that section replaces this one for the disk, so the Fix below doesn't apply to it. That includes `delete_disk` on a journal-managed disk whose record already says it was deleted. That call used to refuse with `terminal managed disk still has ownership provenance`, and it now checks for the note before it reads the record.
+
 **Diagnosis**
 
-The disk's move to a parker stopped after the CPI deleted its slot on VM `<N>`, and the parker's record of the transfer was lost afterwards, which releases before 0.9.0 did once the record was an hour old. The volume's name carries VM `<N>`'s own VMID, which can happen after the VM band was moved over VMIDs that still name disks, so PVE kept the volume on an unused entry instead of letting it go. No slot carries the disk's serial. The Director treats the disk as orphaned, so it sends `delete_disk` and has no detach to send.
+The disk's move to a parker stopped after the CPI deleted its slot on VM `<N>`, and the parker's record of the transfer was lost afterwards, which releases up to 0.8.0 did once the record was an hour old. The volume's name carries VM `<N>`'s own VMID. That happens when the VM band was moved over VMIDs that still name disks, and PVE then kept the volume on an unused entry instead of freeing it. No slot carries the disk's serial, and the Director treats the disk as orphaned, so it sends `delete_disk` and has no detach to send. A park that a snapshot defers leaves the disk in the same state, and when `detach_disk` reports such a park as a success, it still removes the disk's attached-disk note from VM `<N>`. Since 0.8.1, the parker keeps that record while VM `<N>` still holds the volume, so the disk resumes from it. A park like that can't move the volume while any snapshot of VM `<N>` names it, because PVE refuses the move for every such snapshot. `qm delsnapshot` can't be undone, and it removes VM `<N>`'s rollback point for all of its disks and its saved RAM state, so deleting a snapshot is the deployment owner's decision. A disk that lost both its record and its note gets the error in the next section instead of this one, and a release up to 0.8.0 could leave a disk in that state.
 
 **Fix**
 
@@ -829,7 +831,250 @@ To delete the disk, we run checks 2 through 4 from the section above against VM 
 qm set <N> --delete unusedN
 ```
 
-Then we rerun the clean-up, for example with `bosh clean-up --all`. The next `delete_disk` finds that the volume is gone and finishes.
+Then we delete that one orphan with `bosh -d <deployment> delete-disk <cid>`. We don't use `bosh clean-up --all` here, because it deletes every orphaned disk on the Director. The `delete_disk` that `delete-disk` sends finds that the volume is gone and finishes.
+
+### Another entry names a disk's birth volume
+
+**Symptom**
+
+```text
+<op>: resolve disk identity for <cid>: ResolveDiskIdentity: refusing to resolve the disk by its birth volume: no slot carries the disk's serial bpd-<id>, but slot scsiN of VM <N> on node <node> with no serial names its birth volume <volid>, so we can't tell whether that volume is still the disk. Nothing acts on the volume until an operator confirms whose it is; see "Another entry names a disk's birth volume" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+```
+
+The entry can also read `with serial bpd-<other>`, or `unused entry unusedN of VM <N> on node <node>, whose description holds no note for the disk`, and one refusal can list more than one entry. `attach_disk`, `detach_disk`, `resize_disk`, `update_disk`, `snapshot_disk`, `set_disk_metadata`, `delete_disk`, and the attach inside `create_vm` all refuse this way, and the refusal is permanent, so the Director doesn't retry it. `has_disk` answers false for the same disk.
+
+**Diagnosis**
+
+A disk with a stable ID keeps the name its volume had at `create_disk` in its CID, but a move to a parker or another VM renames the volume, so that birth name can later go to another volume. A legacy `create_disk` that reuses a freed VMID is the likeliest way that happens. The CPI finds such a disk by the `serial=bpd-<id>` on its drive entry, or by its parker's transfer record. While a parker keeps the disk's transfer record, the CPI resumes that transfer instead of refusing, even when the move landed the volume under its birth name before the serial was written. In this state, no slot carries the serial, and no parker keeps the disk's transfer record. The entry the refusal names holds the birth name under another serial or none, so we can't tell whether that volume is our disk or another one.
+
+Earlier releases took the entry as our disk, so they could grow, snapshot, move, or hand out another disk's volume. An `unusedN` entry carries no serial, so the CPI takes it as our disk only when that VM's description still holds the disk's attached-disk note under its stable ID, and `attach_disk` is what writes that note. An operator who removed a disk's serial by hand, or cleared a VM's description, leaves the same state. This refusal comes before the refusals in the section titled [delete_disk refuses a disk stranded on an unused entry](#delete_disk-refuses-a-disk-stranded-on-an-unused-entry), so a disk stranded on a VM whose note is gone gets this error, and so does a journal-managed disk whose journal record already says it was deleted.
+
+Earlier releases also left disks in this state themselves. When a snapshot blocks a park, `detach_disk` still removes the disk's note from the VM and reports success, and releases up to 0.8.0 then dropped the parker's record once it was an hour old, so the volume sat on an `unusedN` entry with neither. That's the likeliest way to reach this error from an `unusedN` entry. Since 0.8.1, the parker keeps its transfer record while the VM still holds the volume, so the disk resumes from that record. A resume like that can't move the volume while any snapshot of the VM names it, but a disk in this state has no record to resume from, so nothing in this section needs a snapshot deleted. Deleting one is the deployment owner's decision, because `qm delsnapshot` can't be undone and removes the VM's rollback point for all of its disks and its saved RAM state.
+
+**Fix**
+
+We worked this procedure out from the code and haven't run it against a lab, so we read each command's output before we take the next step.
+
+We never delete the volume, remove its entry by hand, or destroy VM `<N>` while we work through this, because the volume may belong to another disk. We also never attach the volume to a slot, snapshot it, or run `qm rescan`, because each of those changes the state we're trying to keep. Nothing that PVE or the CPI records can prove which disk the volume is. PVE hands a freed name to the next volume it creates or moves onto the same VM. A volume can therefore carry our disk's old name, sit where our disk sat, and match its size and format, and still be another disk. So this recovery restores no note and puts no serial back on any slot. The only change it makes to any VM's configuration or to any volume's name is to move the entry, with its data untouched, onto an unused entry of a quarantine VM, and it makes that move only after every check below passes. Activating a volume for the copy changes only its activation state. After that, we release the disk's record from the Director, and the instance gets a new, empty disk.
+
+**Keep the Director away from the disk**
+
+Before anyone runs cck's "Delete disk reference" on this disk, we ignore the instance that owns it, because that resolution fails on this disk and leaves its record inactive, as the release step below explains. While its record is active, `bosh -d <deployment> instances --details` lists `<cid>` under that instance. Once the record is inactive, that list leaves it out, but `bosh -d <deployment> cloud-check --report` still names the instance on the disk's line. That holds only until we ignore the instance, because the report skips ignored instances.
+
+```bash
+bosh -d <deployment> ignore <instance-group>/<id>
+```
+
+While the flag is set, every deploy skips the instance and warns that it did, and cck and the resurrector leave its VM and its disks alone. The Director also refuses `bosh delete-deployment` for the deployment and any manifest that removes the instance group. It refuses `bosh start`, `stop`, `restart`, and `recreate` aimed at the instance, and it refuses `bosh attach-disk` to it. When an earlier cck run already left the record inactive, the flag also stops deploys from failing on it, because the Director no longer updates the instance.
+
+**Gather what we can and copy the data out**
+
+We gather what we can, using reads alone. None of it shows that a volume is our disk, because a name match proves nothing about which disk a volume is. We keep what we find for the deployment owner, who decides what happens to the volume later.
+
+1. We search the CPI's output, which the Director keeps with each task, for the disk's CID `<cid>` from the refusal. Disk calls record the CID as `disk_cid`, and a line that records a move gives the name the volume moved to as `volid_after`. From a workstation that is logged in to the Director, we print each recent task's CPI output and search it for the CID. The loop makes one Director request for each of up to 1,000 tasks, and it changes nothing:
+
+   ```bash
+   for id in $(bosh tasks --recent=1000 --all --json | jq -r '.Tables[0].Rows[].id'); do bosh task "$id" --cpi 2>/dev/null | grep -F '<cid>' | sed "s/^/task $id: /"; done
+   ```
+
+   The search can miss lines. The Director prunes old tasks, a `pve.log_level` of `warn` or `error` drops the lines that record moves, and a CPI that `bosh create-env` or another Director launches writes its logs somewhere else. A name the search finds is only a candidate, because another volume can have taken that name since.
+
+2. We read the entry on node `<node>` with `qm config <N>`. A serial on it that names another stable ID means another disk last held that slot. An entry without a serial tells us nothing about whose volume it is.
+
+3. On an LVM storage, we read whether the volume is active with `lvs --noheadings -o lv_active <path>`, where `<path>` is what `pvesm path <volid>` prints for it. The command prints `active` for an active volume, and we note the answer, because the copy below can change it.
+
+Then we copy the volume's data out, and we only read the volume. The copy writes a file to other storage, and activating an LVM volume changes its activation state but no data. On the PVE node `<node>` that the refusal names, we read the volume's format from its storage entry and its path from `pvesm`. Here `<storage>` is the part of `<volid>` before the colon. Then we convert the volume into a file outside the storage that holds it:
+
+```bash
+pvesh get /nodes/<node>/storage/<storage>/content --output-format json | jq -r '.[] | select(.volid == "<volid>") | .format'
+pvesm path <volid>
+qemu-img convert -U -f <format> -O qcow2 <path> <destination>
+```
+
+On LVM, the path may not exist until we activate the volume with `lvchange -ay <path>`, which changes no data. On Ceph RBD, we export the image with `rbd export <pool>/<image> <destination>` instead, where `<pool>` is the pool that storage `<storage>` uses in `/etc/pve/storage.cfg`, and `<image>` is the volume's name without its `<storage>:` prefix. When the entry is a slot of a running VM, that VM can write while we read, so the copy may not be consistent. When the search in the gather list named a candidate that still exists, we copy it out the same way, because it may hold our data instead. After the copy, when the volume was inactive in the third gather item, we deactivate it again with `lvchange -an <path>`. When it was already active, we leave it as it was.
+
+**Prove that no other CID names the volume**
+
+Next we prove that no disk CID other than `<cid>` names the volume `<volid>`, and that no CID names a volume of the quarantine VM we're about to create. The move gives the volume a new name under the quarantine VM's VMID, so a CID that already names that new name would own our volume after the move. This check is manual, and it's only as complete as the list of Directors and state files we feed it. A CID it misses can still destroy the volume later, because `delete_disk` deletes whatever volume carries the name in its CID, and PVE's content delete doesn't check whether a volume is in use.
+
+We pick the quarantine VM's VMID `<Q>` first. It has to sit outside every VMID band. The bands are configurable, so we read them from every CPI configuration that uses this cluster, on each Director and in each `bosh create-env` CPI configuration, and we don't trust the defaults. That configuration holds the API token, so we read only the band property names below and never print or paste the whole file. On a Director, the rendered file is `/var/vcap/jobs/pve_cpi/config/cpi.json`:
+
+```bash
+sudo jq '{vmid_range_start, vmid_range_end, disk_vmid_range_start, disk_vmid_range_end, stemcell_template_vmid_range_start, stemcell_template_vmid_range_end, parked_disk_vmid_range_start, parked_disk_vmid_range_end}' /var/vcap/jobs/pve_cpi/config/cpi.json
+```
+
+A property that prints `null` isn't set, and its default applies. The defaults are 100-8999 for VMs, 9000-29999 for disks, 30000-30999 for stemcell templates, and 90000-90999 for parkers. `<Q>` is a free VMID outside all four bands of every one of those configurations. On node `<node>`, `pvesm list <storage> --vmid <Q>` has to print no volumes.
+
+From a workstation with `jq`, we define a function that decodes a disk CID into the volume it names and the stable ID it carries:
+
+```bash
+decode_cid() {
+  p=$(printf '%s' "${1#pv?-}" | tr '_-' '/+')
+  while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+  case "$1" in
+    pvz-*) printf '%s' "$p" | base64 -d | gunzip ;;
+    pvd-*) printf '%s' "$p" | base64 -d ;;
+  esac | jq -r '"\(.v) \(.m.id // "-")"'
+}
+```
+
+Then we log in to each Director that uses this PVE cluster in turn and collect every disk CID it knows. `instances --details` lists only a deployment's active disks, so we add `cloud-check --report`, which also names the inactive and missing disk records of instances that aren't ignored. The report runs a scan task that takes each deployment's lock and records what it finds, and it changes nothing on PVE. We read every error the loop prints, because a Director or deployment we can't read adds nothing to the list and makes the search look clean.
+
+```bash
+{
+  for d in $(bosh deployments --json | jq -r '.Tables[0].Rows[].name'); do
+    bosh -d "$d" instances --details --json
+    bosh -d "$d" cloud-check --report --json
+  done
+  bosh disks --orphaned --json
+  bosh disks --dynamic --json
+} | grep -oE 'pv[dz]-[A-Za-z0-9_-]+' >> cids.txt
+```
+
+We add the CIDs from every `bosh create-env` state file that uses this cluster, and then we decode them all and search the result:
+
+```bash
+grep -oE 'pv[dz]-[A-Za-z0-9_-]+' <state-file> >> cids.txt
+sort -u cids.txt | while read -r c; do echo "$c $(decode_cid "$c")"; done > decoded.txt
+awk 'NF != 3' decoded.txt
+grep -F ' <volid> ' decoded.txt
+grep -F 'vm-<Q>-' decoded.txt
+```
+
+The `awk` check has to print nothing before we trust either search. A CID that fails to decode, for example because it's truncated or `gunzip` is missing, leaves a line that holds only the CID, and neither search can match that line. When `awk` prints anything, we fix the cause and rebuild `decoded.txt` before we go on.
+
+The first search must print no CID other than `<cid>`. When it prints any other CID, the volume may be that disk's live data, and we follow the part below titled When the volume belongs to another disk instead of moving it. The same goes for an entry whose serial, as we read it in the gather list, names another stable ID. When the second search prints anything, we stop, because a CID already names a volume of `<Q>`. We pick another `<Q>` and run both searches again. The second search matches `vm-<Q>-` anywhere in a line, so it also catches the new name on file storage, where `<Q>/` comes first.
+
+The search covers only this CPI's CID envelopes, so a Director that runs another CPI against the cluster is a gap, and the legacy Perl CPI is one example, because it keeps bare volids that the search can't match.
+
+The Director can't show us an ignored instance's inactive disk records. The `instances --details` listing leaves out inactive disks, and `cloud-check --report` skips ignored instances. Our own instance doesn't matter here, because the refusal gives us its CID. On every Director we searched, we list the ignored instances of every deployment, which `instances --details` marks with an `ignore` flag:
+
+```bash
+for d in $(bosh deployments --json | jq -r '.Tables[0].Rows[].name'); do
+  bosh -d "$d" instances --details --json | jq -r --arg d "$d" '.Tables[0].Rows[] | select(.ignore == "true") | "\($d) \(.instance)"'
+done
+```
+
+When this prints any instance other than ours, the search has a gap we can't close, so we don't move the entry, and we follow the part titled When the volume belongs to another disk. The one exception is an instance whose owner agrees to unignore it until a fresh `cloud-check --report` has run. After the scan, the owner sets the flag again, and we add that report's CIDs to `cids.txt` and run the searches again.
+
+**Move the entry onto a quarantine VM**
+
+We move the entry only when all of the following hold on node `<node>`:
+
+- The refusal lists exactly one entry. The move renames the volume, so any other entry that names it would then point at nothing.
+
+- The entry is an `unusedN` entry. We never move a slot.
+
+- VM `<N>` is a VM CID that a Director we searched knows, `<N>` sits outside the parker band we read above, and VM `<N>` has no `bosh-parker` tag. We run the first command below on each Director we searched, in turn, and it has to print `<N>` on at least one of them. The second command has to print nothing:
+
+  ```bash
+  for d in $(bosh deployments --json | jq -r '.Tables[0].Rows[].name'); do bosh -d "$d" vms --json | jq -r '.Tables[0].Rows[].vm_cid'; done | grep -x '<N>'
+  qm config <N> | grep -E '^tags:.*bosh-parker'
+  ```
+
+- No snapshot of VM `<N>` names the volume, and no other entry of VM `<N>` does. This command prints every line of VM `<N>`'s configuration that names the volume, together with the section it sits in, and it must print exactly one line, marked `[current]`:
+
+  ```bash
+  awk -v v='<volid>' '/^\[/ { s = $0 } { n = split($0, f, /[ ,]/); for (i = 1; i <= n; i++) if (f[i] == v) print (s == "" ? "[current]" : s) " " $0 }' /etc/pve/nodes/<node>/qemu-server/<N>.conf
+  ```
+
+A snapshot of VM `<N>` that names the volume stops PVE from moving it, and we never delete a snapshot to make room for the move. `qm delsnapshot` can't be undone, and it removes VM `<N>`'s rollback point for all of its disks and its saved RAM state, so deleting a snapshot is the deployment owner's decision.
+
+We move only an unused entry on a VM that a Director we searched knows, because a slot with no serial proves nothing, and our CID searches can't see a boot disk, a non-BOSH VM's disk, or a stable-ID disk whose serial someone removed. A slot of any kind, and an unused entry on a VM that no Director we searched knows, go to the part titled When the volume belongs to another disk, and we don't move them.
+
+Then we create the quarantine VM on node `<node>`, with no disks and no tags, and move the entry onto it. We never start the quarantine VM, because it exists only to hold the entry. Here `<slot>` is the entry's key from the refusal, such as `unused0`:
+
+```bash
+qm create <Q> --name quarantine-<Q> --description 'Holds a stranded volume. Never start or delete this VM.'
+qm disk move <N> <slot> --target-vmid <Q> --target-disk unused0
+qm config <N>
+qm config <Q>
+```
+
+After the move, VM `<N>` no longer names the volume, and VM `<Q>` lists it as `unused0` under a new name. On block storage such as LVM or Ceph RBD, the name after the colon starts with `vm-<Q>-`, and on file storage such as directory, NFS, or CIFS, it reads `<Q>/vm-<Q>-disk-<n>.<format>`, such as `.qcow2`. We record that new name with the copy for the deployment owner.
+
+A refusal before the move changes nothing, and we stop. Any other failure can leave the volume renamed while VM `<N>` still names its old name, or while neither VM names it, because PVE renames the volume before it updates either configuration. In that case we read and keep the output of these commands, and then we stop. We don't retry the move, and we don't release the record:
+
+```bash
+qm config <N>
+qm config <Q>
+pvesm list <storage> --vmid <Q>
+```
+
+When any check in this section fails, we don't move the entry. We leave the volume and its entry exactly as they are and keep the instance ignored, and removing them later is a separate decision for the deployment owner. When the volume sits on an unused entry of VM `<N>`, `delete_vm` on that VM refuses permanently for as long as the volume stays there. So every recreate and stemcell upgrade of the instance on VM `<N>` fails until the volume leaves VM `<N>`. Once the check that failed passes, for example after the deployment owner deletes a snapshot, we come back to this section. Instead of waiting, we can release the record without the move, as the part titled When the volume belongs to another disk describes, and accept the failing cleanup that part explains.
+
+**Release the record and deploy**
+
+We release the record with `bosh orphan-disk` and never with cck. The cck resolution "Delete disk reference" calls `detach_disk` for the disk, and while the entry names the birth volume, `detach_disk` refuses with the error above. By then the failed run has already marked the disk's record inactive, and it doesn't undo that. The next deploy of the instance creates and attaches a new, empty disk, and then it fails when it calls `detach_disk` on the old disk, and every deploy after that fails on the same call. Even after the move, cck is the wrong tool. For a disk without an allocation journal, its `detach_disk` would park whatever volume carries the birth name by then under our disk's serial, and for a journal-managed disk, its `detach_disk` fails, because the CPI reads the allocation as gone. `bosh orphan-disk` makes no call to the CPI at all. It moves the record to the Director's orphaned disks in one database step, whether the record is active or inactive.
+
+Before we release anything, we check whether the Director holds snapshots of this disk, because releasing the record deletes them:
+
+```bash
+bosh -d <deployment> snapshots <instance-group>/<id>
+```
+
+When it lists any snapshot, we stop and hand the decision to the deployment owner. The Director moves a disk's snapshots to its orphaned snapshots along with the record, and when it deletes the orphan, it calls the CPI's `delete_snapshot` for each of them before it calls `delete_disk`. This CPI's snapshot CID names a whole-VM PVE snapshot, so the delete removes that VM's rollback point for all of its disks and its saved RAM state, and it can't be undone. A snapshot delete that fails also keeps the orphan and skips `delete_disk`.
+
+When it lists no snapshot, we take these four steps in this order:
+
+1. We release the record. `bosh orphan-disk` takes no lock on the deployment, so it would race any task that's working there. We run it only when `bosh -d <deployment> tasks` shows no task running or queued for the deployment, and we start no task there until it finishes:
+
+   ```bash
+   bosh -d <deployment> tasks
+   bosh -d <deployment> orphan-disk <cid>
+   ```
+
+   When an earlier run already orphaned the record, `orphan-disk` warns that the disk doesn't exist and changes nothing.
+
+2. We delete the orphan right away, and we don't wait for the scheduled cleanup. Before we do, we confirm that `pvesm list <storage>`, run on every node that sees the storage, shows no `<volid>`. When one does, we stop there. The move freed the birth name. PVE's `find_free_diskname` hands the lowest free index to the next volume that's created or moved onto that VMID, so the deploy's new disk can take the birth name. Our orphan's `delete_disk` would then meet that disk under the name, and it would refuse or, when the disk is free-floating, delete it in our disk's place.
+
+   ```bash
+   pvesm list <storage>
+   bosh -d <deployment> delete-disk <cid>
+   ```
+
+3. We confirm that `bosh disks --orphaned` no longer lists `<cid>`. When it still does, we stop, read the error of the delete task, and go no further.
+
+   ```bash
+   bosh disks --orphaned
+   ```
+
+4. Only then do we let the Director manage the instance again and deploy it:
+
+   ```bash
+   bosh -d <deployment> unignore <instance-group>/<id>
+   bosh -d <deployment> deploy <manifest>
+   ```
+
+The deploy finds the instance without a persistent disk, so it creates a new, empty disk and attaches it, and there's nothing to migrate. Restoring data onto that disk from the copy is the deployment owner's decision.
+
+**What the orphan cleanup does afterwards**
+
+The Director's scheduled orphan cleanup runs every 30 minutes, and by default it calls `delete_disk` for each orphan that's more than five days old. `bosh -d <deployment> delete-disk <cid>` in step 2 sends the same call for this one disk straight away. For a disk without an allocation journal, `delete_disk` finds no volume under the birth name, treats the disk as already deleted, and deletes nothing, and with no snapshots to delete first, the Director drops the orphan. For a journal-managed disk, `delete_disk` settles the journal record and deletes nothing. The exception is a journal that still holds evidence of a change to the disk that never settled, and then `delete_disk` refuses and the orphan stays. Neither answer touches the quarantined volume, because no CID names it.
+
+**When the volume belongs to another disk**
+
+The volume may be live data that isn't our disk's, and we don't move it, when any of these holds. The entry carries another disk's serial, the search finds another CID that names `<volid>`, the entry is a slot, the entry is an unused entry on a VM that no Director we searched knows, or a gap we can't close remains. A move would rename it, and whatever refers to it by its old name would then lose it. We still release our record. We run the snapshot check from the release step first, then `bosh -d <deployment> orphan-disk <cid>` while no task runs on the deployment, and then we unignore the instance and deploy it as step 4 describes, so the instance gets a new disk. We skip steps 2 and 3, because the volume still carries the birth name, and the delete in step 2 would refuse.
+
+Our orphan's `delete_disk` then refuses with the error above every time the cleanup reaches it, so the scheduled cleanup task fails every 30 minutes. It still deletes the other orphans it picks up, because it reports the failure only at the end of its run. The Director at v283.1.11 removes an orphaned disk's row only when that disk's `delete_disk` succeeds or answers that the disk isn't found. `bosh delete-disk` and `bosh clean-up --all` run the same delete and fail the same way. `bosh attach-disk` takes the row out of the orphans only by putting the record back on an instance, which brings the refusal back, and nothing else in the Director removes the row. So the row and the failing task stay until the other disk's volume no longer carries the birth name, for example after that disk is deleted or its own detach parks it under a new name. The next `delete_disk` then finds no volume under the birth name, and the Director drops the row. We tell the other disk's owner about our orphan, because anything that leaves that volume free-floating under the birth name would let our orphan's next `delete_disk` delete it.
+
+**What stays at risk**
+
+The CID checks are manual. A Director or state file we didn't search can still hold a CID that names the quarantined volume, and a `delete_disk` through that CID would destroy it, because PVE's content delete doesn't check whether a volume is in use.
+
+Until our orphan's `delete_disk` has run, a volume that nothing references could take over the birth name. That `delete_disk` would then delete it, because the CPI resolves a free-floating volume under the birth name as the disk's own. This applies only to a disk without a strict parked anchor, which means a disk whose CID promises no parker anchor, a deployment that runs the free strategy, or a deployment that sets `pve.parked_anchor_strict` to false. For any other disk, `delete_disk` refuses when no VM references the volume.
+
+Any `delete_vm` on a VM that holds a legacy slot with no serial, naming a volume of another VMID, detaches that slot and leaves its volume free-floating. When that volume carries a stranded record's birth name, the record's next `delete_disk` deletes it, and if it held another disk's data, that data is lost.
+
+We run `bosh orphan-disk` only while no task works on the deployment, as the release step says.
+
+We checked PVE's own rule in qemu-server 9.2.10. It refuses to move a slot off a running VM and allows an unused entry. This procedure is stricter, because it moves only an unused entry.
+
+For a journal-managed disk, `delete_disk` refuses while the journal holds a change that never settled, so the orphan cleanup can still fail for that reason.
+
+`bosh orphan-disk` sends nothing to the instance's agent, while cck asks the agent to unmount the disk when the agent still lists it, and only then detaches it. We haven't read the agent's side, so we can't say how an agent treats a disk that its settings may still list.
+
+We worked this procedure out from the CPI's code and the BOSH Director's code at v283.1.11, and we have not run it against a lab.
 
 ### A disk detach stays pending on a running VM
 
@@ -877,7 +1122,7 @@ VM `<N>`'s current config still names the disk on slot `<slot>`, while a change 
 
 **Fix**
 
-We let the pending change apply. When VM `<N>` is running, we stop it at a convenient time, for example with `bosh -d <deployment> stop <instance-group>/<id>`. PVE applies the change when the VM stops, and then we start the instance again. When the VM is already stopped, we start it, for example with `bosh -d <deployment> start <instance-group>/<id>`. PVE applies the change before the guest boots, and there's no need to stop the VM again afterwards unless we want it stopped. Either way the disk leaves the VM. Then we rerun the clean-up, for example with `bosh clean-up --all`, and the next `delete_disk` deletes the disk.
+We let the pending change apply. When VM `<N>` is running, we stop it at a convenient time, for example with `bosh -d <deployment> stop <instance-group>/<id>`. PVE applies the change when the VM stops, and then we start the instance again. When the VM is already stopped, we start it, for example with `bosh -d <deployment> start <instance-group>/<id>`. PVE applies the change before the guest boots, and there's no need to stop the VM again afterwards unless we want it stopped. Either way the disk leaves the VM. Then we rerun the delete, for example with `bosh -d <deployment> delete-disk <cid>`, and the next `delete_disk` deletes the disk.
 
 We don't revert the pending delete, even though `detach_disk` reverts its own pending deletes. A revert puts the disk back on the VM, while the Director still wants it gone. The next `delete_disk` would then find an ordinary holder, which only the optional lock guard protects, and it would delete the volume from under the running VM. `detach_disk` reverts for the opposite reason, because there the Director still believes the disk is attached, and the revert keeps the disk where the Director expects it.
 
@@ -1390,7 +1635,7 @@ When a lock step or a parker protection write is still planned because the CPI c
 
 A CPI from 0.6.0 through 0.8.0 also left records here whenever two requests contended for one parker. In a deploy, the call that failed was an `attach_disk` or a `detach_disk`, and the deploy failed with `requires reconciliation at lifecycle attach_disk Pool.CreatePool` or with the same text for `detach_disk`. A `delete_disk` could fail the same way, but only during orphan cleanup, because a deploy never deletes a persistent disk and orphans it instead. Every step of such a record is observed except the last one, a planned lock step named `lifecycle_<operation>_Pool_CreatePool`. Its `bosh-lock-` pool is usually gone by the time we look, but another request may hold it again, and the step settles in either case. A fixed CPI settles that step with a fresh read of the lock pool for each VM that the steps of the record's active attempt target, which for a parked disk includes its parker. It does that in whichever call touches the record next, whether that is a rerun `attach_disk` or `detach_disk`, a `delete_disk`, `adopt`, or `cleanup`.
 
-The Director retries only `create_vm` within a task, so a failed `attach_disk` or `detach_disk` stays failed until we rerun the deploy, which reissues the call. A failed `delete_disk` needs nothing from us, and that is good news for the orphans the old bug left behind. The Director keeps an orphan on its list when `delete_disk` fails, and its scheduled orphan cleanup calls `delete_disk` again every 30 minutes for each orphan older than `director.disks.max_orphaned_age_in_days`. Once a fixed CPI is in place, the next of those calls settles the lock step and deletes the orphan with no action from us. A `bosh clean-up --all` or `bosh delete-disk` that failed the same way can be run again to remove the orphan sooner.
+The Director retries only `create_vm` within a task, so a failed `attach_disk` or `detach_disk` stays failed until we rerun the deploy, which reissues the call. A failed `delete_disk` needs nothing from us, and that is good news for the orphans the old bug left behind. The Director keeps an orphan on its list when `delete_disk` fails, and its scheduled orphan cleanup calls `delete_disk` again every 30 minutes for each orphan older than `director.disks.max_orphaned_age_in_days`. Once a fixed CPI is in place, the next of those calls settles the lock step and deletes the orphan with no action from us. A `bosh -d <deployment> delete-disk <cid>` that failed the same way can be run again to remove the orphan sooner.
 
 What a rerun deploy does with our disk depends on whether the Director already had that disk active on the instance before the deploy that failed.
 
@@ -1400,7 +1645,7 @@ What a rerun deploy does with our disk depends on whether the Director already h
 
 - The disk was new in the deploy that failed
 
-  This covers the most common case, which is the first attach of a disk that the same deploy created for a new instance, a scale-out, or a persistent disk added to an instance group. It also covers a change to a disk's size or cloud properties while `director.enable_cpi_resize_disk` and `director.enable_cpi_update_disk` are off, as they are by default, because the Director then migrates the data to a new disk. In every one of these cases, the Director created a new disk, and the attach that failed was that disk's first. The Director's model still holds that disk as inactive, so the rerun does not reuse it. The rerun creates another new disk, attaches that one, calls `detach_disk` on ours, and orphans it. Nothing is lost, because the failed attempt never wrote data to our disk. That `detach_disk` settles the lock step and returns the record to `ready_to_return`, so the record stops charging capacity before the disk is even orphaned. Adopting the disk helps only between the failure and the rerun, when it stops the record charging capacity early. After the rerun, `bosh disks --orphaned` lists our disk, and the Director's scheduled orphan cleanup deletes it after five days by default, while `bosh clean-up --all` or `bosh delete-disk` removes it sooner.
+  This covers the most common case, which is the first attach of a disk that the same deploy created for a new instance, a scale-out, or a persistent disk added to an instance group. It also covers a change to a disk's size or cloud properties while `director.enable_cpi_resize_disk` and `director.enable_cpi_update_disk` are off, as they are by default, because the Director then migrates the data to a new disk. In every one of these cases, the Director created a new disk, and the attach that failed was that disk's first. The Director's model still holds that disk as inactive, so the rerun does not reuse it. The rerun creates another new disk, attaches that one, calls `detach_disk` on ours, and orphans it. Nothing is lost, because the failed attempt never wrote data to our disk. That `detach_disk` settles the lock step and returns the record to `ready_to_return`, so the record stops charging capacity before the disk is even orphaned. Adopting the disk helps only between the failure and the rerun, when it stops the record charging capacity early. After the rerun, `bosh disks --orphaned` lists our disk, and the Director's scheduled orphan cleanup deletes it after five days by default, while `bosh -d <deployment> delete-disk <cid>` removes it sooner.
 
 With `director.enable_cpi_resize_disk` on, the Director resizes the disk in place instead, so the disk was already active on the instance, and the rerun resizes and attaches that same disk again.
 
@@ -1565,7 +1810,7 @@ The removal also doesn't take that VM's own lock. So a writer that rewrites the 
 
 - A retry of `delete_disk`
 
-  The Director's scheduled orphan cleanup calls it again every 30 minutes for an orphan older than `director.disks.max_orphaned_age_in_days`, and `bosh clean-up --all` or `bosh delete-disk` calls it sooner.
+  The Director's scheduled orphan cleanup calls it again every 30 minutes for an orphan older than `director.disks.max_orphaned_age_in_days`, and `bosh -d <deployment> delete-disk <cid>` calls it sooner.
 
 - A `finalize-cleanup` decision
 
@@ -1582,7 +1827,7 @@ Recreating the VM through the Director keeps the instance's persistent disk, bec
 
 A `delete_disk` can fail with the same `completion audit failed` error when another volume has taken the disk's old name. When the CPI moves a disk onto a parker, PVE gives the disk a new name, and the next volume that lands on that VM can take the old one. If a VM holds that volume on a disk slot, the audit no longer counts it as ours once the journal shows the move that renamed our disk. A volume that sits under the old name only as an `unusedN` entry still counts as ours, because it could be a leftover of our disk's data or another disk caught in its own unfinished detach, and the name alone can't tell us which. So the allocation stays in `reconciliation_required` until we sort the volume out. In the output of `storage-journal audit --summary`, the allocation's `evidence:` line has a `kind` of `disk`, a `volume` with the disk's old name, and a `holder_vmid` of `none`.
 
-We start by finding out whose data the volume holds. `qm config` on the VM that the volume's name points at shows the `unusedN` entry. If the volume belongs to another disk on that VM, we attach it back to its owner on a slot, or we let the Director's own operation for that disk finish its detach. If the volume holds a leftover of our disk's data that we no longer need, we remove it. Deleting an `unusedN` entry with `qm set VMID --delete unusedN` destroys the volume, so we do that only once we know nobody needs its data. After that, we rerun the delete with `bosh clean-up --all` or `bosh delete-disk`, or we wait for the Director's next orphan cleanup. When that VM carries no note of our disk, the allocation ends `deleted`. If the rerun still refuses and `storage-journal audit --summary` shows an `evidence:` line for the allocation with that VM's ID as its `holder_vmid`, our disk's note is still in that VM's description. A retry can't remove it now unless the volume went back onto a disk slot of that VM, because the retry removes the note only from a VM that holds the old name on a slot. So we follow the recovery in [A disk delete is refused after its volume is already gone](#a-disk-delete-is-refused-after-its-volume-is-already-gone), which is safe once no VM holds the old name.
+We start by finding out whose data the volume holds. `qm config` on the VM that the volume's name points at shows the `unusedN` entry. If the volume belongs to another disk on that VM, we attach it back to its owner on a slot, or we let the Director's own operation for that disk finish its detach. If the volume holds a leftover of our disk's data that we no longer need, we remove it. Deleting an `unusedN` entry with `qm set VMID --delete unusedN` destroys the volume, so we do that only once we know nobody needs its data. After that, we rerun the delete with `bosh -d <deployment> delete-disk <cid>`, or we wait for the Director's next orphan cleanup. When that VM carries no note of our disk, the allocation ends `deleted`. If the rerun still refuses and `storage-journal audit --summary` shows an `evidence:` line for the allocation with that VM's ID as its `holder_vmid`, our disk's note is still in that VM's description. A retry can't remove it now unless the volume went back onto a disk slot of that VM, because the retry removes the note only from a VM that holds the old name on a slot. So we follow the recovery in [A disk delete is refused after its volume is already gone](#a-disk-delete-is-refused-after-its-volume-is-already-gone), which is safe once no VM holds the old name.
 
 ### An operation fails with an allocation audit refusal
 

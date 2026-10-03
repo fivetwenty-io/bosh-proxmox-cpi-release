@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -614,7 +615,7 @@ func FindVMByDiskVolid(ctx context.Context, c Client, volid string) (int, string
 // snapshot_disk asking whether the holder is a parker -- would otherwise pay a
 // second read of a config this function just discarded.
 func FindVMByDiskVolidTagged(ctx context.Context, c Client, volid string) (int, string, string, error) {
-	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "")
+	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "", matchSerial)
 	return hit.VMID, hit.Node, hit.Tags, err
 }
 
@@ -640,8 +641,17 @@ type DiskScanHit struct {
 	// Deleting a slot adds such an entry only for a volume the VM owns by
 	// name, so a stable-ID disk shows up here when its transfer to a parker
 	// deleted the slot of a guest that owns its birth name and the move never
-	// finished.
+	// finished. A scan that matches by serial alone lists an entry here only
+	// when its guest's description still holds the disk's attached-disk note
+	// under the stable ID, and it lists any other entry in NameHolders.
 	Unused []VolumeReference
+	// NameHolders lists the config entries that name the birth volume without
+	// proving they are the disk, from a scan that matches by serial alone. A
+	// slot is listed when it names the volume under another serial or none,
+	// and an unusedN entry is listed when its guest holds no note for the
+	// disk. Only the not-found answer carries them, because a slot carrying
+	// the disk's serial wins wherever it is.
+	NameHolders []BirthNameHolder
 	// PendingChange says what is pending on the matching slot when the match
 	// came from the current view only. PendingChangeDelete means PVE could
 	// only record the slot's delete as pending, so the slot is missing from
@@ -651,6 +661,38 @@ type DiskScanHit struct {
 	// guest still has this one.
 	PendingChange PendingChange
 }
+
+// BirthNameHolder is one config entry that names a stable-ID disk's birth
+// volume without proving that the volume is still the disk. Another disk can
+// take a birth name once a move renames the disk off it, so nothing about the
+// name alone says whose volume the entry holds.
+type BirthNameHolder struct {
+	VolumeReference
+	// Serial is the stable-ID serial the slot carries. It is empty when the
+	// slot carries none, and always empty for an unusedN entry.
+	Serial string
+	// Unused is true for an unusedN entry, which carries no options at all.
+	Unused bool
+	// Digest is the digest of the guest config the scan read this entry from,
+	// so a caller that read the guest's config itself can tell whether both
+	// reads saw the same config.
+	Digest string
+}
+
+// diskMatch says how the identity scan matches the slots of a disk that has a
+// stable ID. A disk without one is always matched by its volid.
+type diskMatch int
+
+const (
+	// matchSerial matches only a slot whose serial is the stable ID. Every
+	// handler resolves a disk this way, because the birth volid is only the
+	// name the volume had at create_disk, and another volume can hold it now.
+	matchSerial diskMatch = iota
+	// matchNameOrSerial also matches a slot that names the birth volid, under
+	// any serial or none. It suits a caller that asks whether anything names
+	// the volume at all, such as the allocation collision check.
+	matchNameOrSerial
+)
 
 // PendingChange is the kind of pending change on a disk's slot that hides the
 // disk from the config endpoint's view while the running guest still has it.
@@ -817,12 +859,13 @@ func driveOptStrIsCDROM(optstr string) bool {
 
 // findVMByDiskIdentityScan is the single cluster-wide disk scan behind
 // FindVMByDiskVolid and the stable-ID resolver. It reads every QEMU guest
-// config once and matches each active-bus drive entry two ways in the same
-// pass: by volid (exact or option-string prefix), and — when stableID is
-// non-empty — by a serial=<stableID> drive option. The serial match is what
-// finds a volume move_disk renamed, at zero extra API cost over the volid
-// scan every caller already paid.
-func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID string) (DiskScanHit, error) {
+// config once. With an empty stableID it matches each active-bus drive entry
+// by volid (exact or option-string prefix). With a stableID it matches by a
+// serial=<stableID> drive option, which is what finds a volume move_disk
+// renamed, and under matchNameOrSerial it matches by volid as well. A scan
+// that matches by serial alone notes, without matching, every entry that
+// names the volid, and the not-found answer carries them in NameHolders.
+func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID string, match diskMatch) (DiskScanHit, error) {
 	if c == nil {
 		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: client must not be nil")
 	}
@@ -863,6 +906,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	// evidence.
 	counts := make(StorageReferenceCounts)
 	var unused []VolumeReference
+	var nameHolders []BirthNameHolder
 
 	for _, g := range guests {
 		vmid := g.VMID
@@ -900,7 +944,7 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		disks := qemu.ParseDisks(cfg)
 		addStorageReferences(counts, vmNode, volid, cfg, disks)
 
-		if slot, current, ok := matchDiskIdentity(disks, volid, stableID); ok {
+		if slot, current, ok := matchDiskIdentityAs(disks, volid, stableID, match); ok {
 			tags, _ := ConfigString(cfg, "tags")
 			return DiskScanHit{
 				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
@@ -910,7 +954,8 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		// another volume, because the running guest still has its current
 		// drive until PVE applies the change at the next clean stop or start.
 		replacements := views.PendingReplacements()
-		if slot, current, ok := matchDiskIdentity(qemu.ParseDisks(views.Current()), volid, stableID); ok {
+		currentDisks := qemu.ParseDisks(views.Current())
+		if slot, current, ok := matchDiskIdentityAs(currentDisks, volid, stableID, match); ok {
 			change := PendingChangeNone
 			if views.PendingDelete(slot) {
 				change = PendingChangeDelete
@@ -924,12 +969,24 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 				}, nil
 			}
 		}
-		if stableID != "" {
-			for key, value := range FindUnusedDiskEntries(cfg) {
-				if value == volid {
-					unused = append(unused, VolumeReference{VMID: vmid, Node: vmNode, Slot: key})
-				}
+		if stableID == "" {
+			continue
+		}
+		digest, _ := ConfigString(cfg, "digest")
+		if match == matchSerial {
+			nameHolders = appendSlotNameHolders(nameHolders, vmid, vmNode, digest, volid, disks, currentDisks)
+		}
+		noted := match == matchNameOrSerial || attachedDiskNoted(cfg, stableID)
+		for key, value := range FindUnusedDiskEntries(cfg) {
+			if value != volid {
+				continue
 			}
+			ref := VolumeReference{VMID: vmid, Node: vmNode, Slot: key}
+			if noted {
+				unused = append(unused, ref)
+				continue
+			}
+			nameHolders = append(nameHolders, BirthNameHolder{VolumeReference: ref, Unused: true, Digest: digest})
 		}
 	}
 
@@ -942,29 +999,79 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	// they exist for: a disk nothing references is the one delete_disk is about
 	// to prove absent from an empty listing.
 	sortVolumeReferences(unused)
-	return DiskScanHit{StorageReferences: counts, Unused: unused}, fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+	sortBirthNameHolders(nameHolders)
+	return DiskScanHit{StorageReferences: counts, Unused: unused, NameHolders: nameHolders},
+		fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
 }
 
-// matchDiskIdentity matches one parsed disk map against a disk identity: the
-// volid itself (exact or "<volid>,options" prefix), or — when stableID is
-// non-empty — a serial=<stableID> option on any entry. Returns the slot and
-// the bare volid the entry actually carries.
-func matchDiskIdentity(disks map[string]string, volid, stableID string) (slot, currentVolid string, ok bool) {
+// matchDiskIdentityAs matches one parsed disk map against a disk identity the
+// way every handler resolves one. With an empty stableID it matches the volid
+// itself (exact or "<volid>,options" prefix). With a stableID and matchSerial
+// it matches only a serial=<stableID> option, on any entry, because a slot
+// that names the birth volid under another serial or none can hold another
+// disk's volume. Under matchNameOrSerial a stable-ID disk also matches an
+// entry that names its volid. It returns the slot and the bare volid the entry
+// actually carries.
+func matchDiskIdentityAs(disks map[string]string, volid, stableID string, match diskMatch) (slot, currentVolid string, ok bool) {
+	byName := stableID == "" || match == matchNameOrSerial
 	for id, v := range disks {
-		if v == volid || strings.HasPrefix(v, volid+",") {
+		if byName && driveNamesVolid(v, volid) {
 			return id, volid, true
 		}
 		if stableID != "" {
 			if serial, has := StableIDFromDriveOptStr(v); has && serial == stableID {
-				bare := v
-				if comma := strings.Index(v, ","); comma >= 0 {
-					bare = v[:comma]
-				}
-				return id, bare, true
+				return id, bareDriveVolid(v), true
 			}
 		}
 	}
 	return "", "", false
+}
+
+// driveNamesVolid reports whether a drive value names volid, either bare or
+// followed by its options.
+func driveNamesVolid(value, volid string) bool {
+	return value == volid || strings.HasPrefix(value, volid+",")
+}
+
+// appendSlotNameHolders notes each slot of one guest that names volid, from
+// the applied view and then from the current view, which still shows a slot
+// whose delete or replacement is pending. A slot both views show is noted
+// once, with the digest of the config both views came from. The scan calls it
+// only after neither view matched the disk's serial, so every slot it notes
+// carries another serial or none.
+func appendSlotNameHolders(holders []BirthNameHolder, vmid int, node, digest, volid string, views ...map[string]string) []BirthNameHolder {
+	seen := map[string]bool{}
+	for _, disks := range views {
+		for slot, value := range disks {
+			if seen[slot] || !driveNamesVolid(value, volid) {
+				continue
+			}
+			seen[slot] = true
+			serial, _ := StableIDFromDriveOptStr(value)
+			holders = append(holders, BirthNameHolder{
+				VolumeReference: VolumeReference{VMID: vmid, Node: node, Slot: slot}, Serial: serial, Digest: digest,
+			})
+		}
+	}
+	return holders
+}
+
+// attachedDiskNoted reports whether a guest's description holds the
+// attached-disk note attach_disk wrote for the disk under its stable ID.
+func attachedDiskNoted(cfg map[string]any, stableID string) bool {
+	_, ok := GetAttachedDiskCIDs(DescriptionFromConfig(cfg))[stableID]
+	return ok
+}
+
+// sortBirthNameHolders orders the holders by VMID and then by slot, so a
+// refusal that names them reads the same on every call.
+func sortBirthNameHolders(holders []BirthNameHolder) {
+	sort.Slice(holders, func(i, j int) bool {
+		if holders[i].VMID != holders[j].VMID {
+			return holders[i].VMID < holders[j].VMID
+		}
+		return holders[i].Slot < holders[j].Slot
+	})
 }
 
 // FindVMByDiskVolidOrNone is a wrapper around FindVMByDiskVolid that maps the
@@ -1009,7 +1116,7 @@ func FindVMByDiskVolidOrNoneTagged(
 // The not-found answer carries the counts too: the scan read every config in
 // the cluster to reach it, and that answer is where the counts matter most.
 func findVMByDiskVolidHit(ctx context.Context, c Client, volid string) (DiskScanHit, bool, error) {
-	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "")
+	hit, err := findVMByDiskIdentityScan(ctx, c, volid, "", matchSerial)
 	if err != nil {
 		if errors.Is(err, ErrDiskNotAttachedToAnyVM) {
 			return DiskScanHit{StorageReferences: hit.StorageReferences}, false, nil
