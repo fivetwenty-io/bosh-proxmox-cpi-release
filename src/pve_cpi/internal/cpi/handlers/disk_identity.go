@@ -79,7 +79,7 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 		rd.stableID = meta.ID
 	}
 	if rd.stableID == "" || deps.Config == nil {
-		return resolveManagedDiskIdentity(ctx, deps, rd)
+		return resolveManagedDiskIdentity(ctx, deps, op, rd)
 	}
 	ident, err := pve.ResolveDiskIdentity(ctx, deps.PVE, deps.Log(ctx), bareDiskCID, rd.stableID, parkerReadConfigFor(deps))
 	if err != nil {
@@ -96,13 +96,21 @@ func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID s
 	}
 	rd.intent = ident.Intent
 	rd.unused = ident.Unused
-	return resolveManagedDiskIdentity(ctx, deps, rd)
+	return resolveManagedDiskIdentity(ctx, deps, op, rd)
 }
 
 // resumeTransferIfNeeded converges a mid-transfer disk to its parked state
 // before a mutating handler acts on it, then re-resolves so the caller works
 // from the converged state. A no-op for disks not mid-transfer.
 func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolvedDisk) (resolvedDisk, error) {
+	return resumeTransfer(ctx, deps, op, rd, false)
+}
+
+// resumeTransfer is resumeTransferIfNeeded with the resume's mode passed in.
+// A claim-only resume writes the parker's serial and the finalize and nothing
+// else, so it also leaves the parker pool sweep and the detach tail to the
+// next call that moves or deletes the disk.
+func resumeTransfer(ctx context.Context, deps Deps, op string, rd resolvedDisk, claimOnly bool) (resolvedDisk, error) {
 	if rd.intent == nil {
 		return rd, nil
 	}
@@ -112,6 +120,10 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	)
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: rd.intent.SourceVMCID, StableID: rd.stableID, Opts: rd.intent.Opts})
 	pctx.ApplyFoundPendingDelete = resumeAppliesFoundPendingDelete(op)
+	pctx.ClaimOnly = claimOnly
+	if claimOnly && rd.allocation != nil {
+		pctx.ClaimLandings = recordedLandings(rd.allocation.record, rd.allocation.shared)
+	}
 	parkerCfg := parkerWriteConfigFor(deps)
 	if _, err := resumeDiskTransferToParker(ctx, deps.PVE, deps.Log(ctx), *rd.intent, rd.stableID, parkerCfg, pctx); err != nil {
 		// The resume found the source's delete pending and left it alone, or
@@ -136,7 +148,9 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	// The parker the interrupted transfer created stays outside the pool until
 	// somebody sweeps, so we sweep it the way every park funnel does, on the
 	// parker's own node rather than the one this request is aimed at.
-	sweepParkerPool(ctx, deps, rd.intent.ParkerNode, parkerCfg)
+	if !claimOnly {
+		sweepParkerPool(ctx, deps, rd.intent.ParkerNode, parkerCfg)
+	}
 	refreshed, err := resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, rd.meta)
 	if err != nil {
 		return resolvedDisk{}, err
@@ -147,7 +161,7 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	// that names the source VM from then on. detach_disk, attach_disk,
 	// delete_disk, and create_vm's disk attach each run the tail again from
 	// that entry before they act on the parked disk, and that's what heals it.
-	if source, ok := intentSourceVMID(rd.intent); ok {
+	if source, ok := intentSourceVMID(rd.intent); ok && !claimOnly && resumeRunsDetachTail(op) {
 		if err := finishDetachTail(ctx, deps, op, refreshed, source); err != nil {
 			return resolvedDisk{}, err
 		}
@@ -164,6 +178,14 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 // update_disk only needs the disk parked where it already is.
 func resumeAppliesFoundPendingDelete(op string) bool {
 	return op == "detach_disk" || op == "attach_disk"
+}
+
+// resumeRunsDetachTail reports whether a resume that op runs ends with the
+// detach tail. update_disk resumes inside the disk's lifecycle only to find
+// where the disk sits now, and it leaves the source VM's entries to the calls
+// that move or delete the disk.
+func resumeRunsDetachTail(op string) bool {
+	return op != "update_disk"
 }
 
 // parkerWriteConfigFor is parkerReadConfigFor plus the park-only fields a

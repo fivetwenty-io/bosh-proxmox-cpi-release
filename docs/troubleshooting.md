@@ -803,6 +803,36 @@ So on this release, we rerun the deploy once the quiet period has passed. When t
 
 For ordinary drift, run `bosh -d <deployment> cloud-check` to reconcile state. The Director offers to detach the disks and clean up the record. If the deployment can't be recovered, detach the disks with `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
 
+### A disk call refuses while a move to a parker is unsettled
+
+**Symptom**
+
+```text
+managed disk ownership provenance references a missing volume; audit required, because move step attempt-<n>-step-<m> of the disk's record isn't settled; see "A disk call refuses while a move to a parker is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+```
+
+Every call that resolves the journal-managed disk refuses this way, including `has_disk`, and the refusal is permanent, so the Director doesn't retry it. The call writes nothing to PVE or to the journal before it refuses.
+
+This refusal can also come from a call that overlapped another call's move of the same disk while that move was still in progress, such as a `has_disk` that ran during a `detach_disk`. In that case nothing is wrong with the disk. Once the other call finishes, its move step is settled, and rerunning the refused call clears the refusal with no change from us. So before we look at anything else, we check whether another Director task on this disk was running when the refusal came, and if so, we let it finish and rerun. We go on to the diagnosis below only when the refusal comes back on a rerun with nothing else running on the disk.
+
+**Diagnosis**
+
+A move of the disk onto a parker sent its request, and the CPI never got PVE's answer, so the journal keeps that move step planned and the record sits in `reconciliation_required`. The parker still keeps its record of the transfer under the volume's old name, and that name is gone. The usual cause is that the move landed after its answer was lost, which leaves the disk's data on the parker under a name for that parker and with no serial. No step of the record names that landed volume, so the CPI can't finish the transfer, and it refuses before it writes anything. The settlement described in [delete_vm refuses to destroy VM with attached unused disks](#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) settles only a move that never started, so a rerun doesn't clear this state.
+
+**Fix**
+
+We start with checks that only read, and we change nothing on PVE or in the journal while we work out where the volume is.
+
+1. We run `sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi storage-journal audit --summary --config /var/vcap/jobs/pve_cpi/config/cpi.json` on the Director and find the disk's allocation. Its `planned step:` line names the move step from the refusal.
+
+2. We run the landing check from [delete_vm refuses to destroy VM with attached unused disks](#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) on a PVE node. It lists every disk key on a parker that names a volume for that parker and carries no serial.
+
+3. For each line it prints, we read the parker's config with `pvesh get /nodes/<node>/qemu/<parker>/config` and the volume with `pvesh get /nodes/<node>/storage/<storage>/content/<volid>`. The volume is this disk's own when its size matches the disk and the parker's description still names the disk's serial `bpd-<id>`.
+
+When the volume is this disk's own, the move did happen, and the step needs the investigation that [Delete an allocation through its retained authority](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority) describes. We don't add the serial to the parker's slot by hand. The CPI would then find the disk by its serial, but because no step names the landed volume, every call would refuse it with `managed disk physical backing or volume conflicts with journal; audit required` instead.
+
+When the check prints nothing, or the volume it names belongs to another disk, we leave every parker as it is and follow the same investigation, because the journal can't say where this disk's data went.
+
 ### delete_disk refuses a disk stranded on an unused entry
 
 **Symptom**

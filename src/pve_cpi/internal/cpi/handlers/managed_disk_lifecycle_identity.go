@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -16,9 +17,14 @@ type managedDiskIdentity struct {
 	absent         bool
 	record         aj.Record
 	provenance     pve.DiskAllocationProvenance
+	// shared reports whether the disk's storage is shared. Every move the
+	// CPI makes keeps the volume on its storage, so it holds for each name
+	// the record's moves landed. Only the identity check's claim-only resume
+	// reads it, to scope a later move that took a landing away.
+	shared bool
 }
 
-func resolveManagedDiskIdentity(ctx context.Context, deps Deps, rd resolvedDisk) (resolvedDisk, error) {
+func resolveManagedDiskIdentity(ctx context.Context, deps Deps, op string, rd resolvedDisk) (resolvedDisk, error) {
 	locator, id, managed := pve.ParseAllocationVolumeID(rd.birth)
 	if !managed {
 		if strings.Contains(rd.birth, "-bosh-") && strings.Contains(rd.birth, "-alloc-") {
@@ -63,11 +69,11 @@ func resolveManagedDiskIdentity(ctx context.Context, deps Deps, rd resolvedDisk)
 			metadata = *rd.meta
 		}
 		metadata.ID = record.DiskToken
-		return resolveDiskForOp(ctx, deps, "managed_disk_identity", rd.diskCID, rd.birth, &metadata)
+		return resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, &metadata)
 	}
-	return resolveManagedDiskRecord(ctx, deps, rd, record, node)
+	return resolveManagedDiskRecord(ctx, deps, op, rd, record, node)
 }
-func resolveManagedDiskRecord(ctx context.Context, deps Deps, rd resolvedDisk, record aj.Record, node string) (resolvedDisk, error) {
+func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd resolvedDisk, record aj.Record, node string) (resolvedDisk, error) {
 	id := record.ID
 	storage, _, err := pve.ParseDiskCID(rd.volid)
 	if err != nil {
@@ -84,9 +90,13 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, rd resolvedDisk, r
 		rd.allocation = &managedDiskIdentity{record: record, terminalAbsent: true}
 		return rd, nil
 	}
-	backing, err := managedDiskActualBacking(ctx, deps, storage)
+	definition, err := managedDiskActualDefinition(ctx, deps, storage)
 	if err != nil {
 		return resolvedDisk{}, err
+	}
+	backing := definition.BackingKey()
+	if backing == "" {
+		return resolvedDisk{}, cpierrors.Cloud("managed disk backing identity unavailable")
 	}
 	if err := validateManagedDiskJournalIdentity(record, rd.birth, rd.volid, backing); err != nil {
 		return resolvedDisk{}, err
@@ -101,10 +111,13 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, rd resolvedDisk, r
 		return resolvedDisk{}, err
 	}
 
+	provenance := pve.DiskAllocationProvenance{Version: 1, AllocationID: id, AllocationNamespace: record.Namespace, Node: node, Volid: rd.volid, Backing: backing}
+	if !exists && rd.holder == nil && rd.intent != nil {
+		return resumeBeforeManagedIdentity(ctx, deps, op, rd, record, provenance, definition.IsShared())
+	}
 	if !exists && (rd.holder != nil || rd.intent != nil) {
 		return resolvedDisk{}, cpierrors.Cloud("managed disk ownership provenance references a missing volume; audit required")
 	}
-	provenance := pve.DiskAllocationProvenance{Version: 1, AllocationID: id, AllocationNamespace: record.Namespace, Node: node, Volid: rd.volid, Backing: backing}
 	if rd.holder != nil {
 		cfg, err := deps.PVE.QEMU().Config(ctx, rd.holder.Node, rd.holder.VMID)
 		if err != nil || cfg == nil {
@@ -128,6 +141,215 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, rd resolvedDisk, r
 	}
 	rd.allocation = &managedDiskIdentity{record: record, provenance: provenance, absent: !exists}
 	return rd, nil
+}
+
+// unsettledMoveRunbook points the unsettled-move refusal at its runbook entry.
+const unsettledMoveRunbook = `see "A disk call refuses while a move to a parker is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// identityResumeKey marks a context whose disk resolution runs inside a
+// resume that resumeBeforeManagedIdentity started.
+type identityResumeKey struct{}
+
+// resumeBeforeManagedIdentity handles a managed disk whose transfer to a
+// parker stopped after the move renamed its volume, so the volume its transfer
+// record names is gone. Nothing the identity check reads can say where the
+// disk landed until the transfer finishes, so we finish it first and return
+// the disk resolved again from the settled state.
+//
+// A transfer record that doesn't match the journal's allocation is refused
+// before anything is written. A resume that can't run comes back retriable,
+// and an error the resume already marks permanent stays permanent. A disk
+// that still names a missing volume after its own resume is refused for audit,
+// as it was before the resume ran.
+//
+// A record with a step that isn't settled, on any attempt, gets that same
+// refusal before the resume runs, and the refusal names the step. A step that
+// a closed attempt's completion proof covers counts as settled. So does a
+// record that needs reconciliation. An unsettled move can land the volume
+// under a name that no step of the record names, and any other unsettled
+// step leaves the disk's state unknown, so the check would refuse the
+// claimed disk anyway, after the resume had already written to the parker.
+//
+// The resume runs with the client the caller passed in. The check can't open
+// the disk's lifecycle here, because the lifecycle's ownership proof refuses a
+// missing volume, and the check already runs under the allocation journal's
+// lock when a lifecycle resolves the disk again. So the resume is claim-only.
+// It writes the parker's serial and the finalize, which are safe to repeat,
+// and it writes them only under the parker's lock, on a transfer record that
+// still matches, and on a landing an observed move of the record proves.
+//
+// Where the resume would apply a pending delete or attach by config edit, no
+// later call gets past this check to do that write, so the refusal is the
+// permanent audit refusal with the reason added. The same goes for a window
+// that would run without the parker's lock. PVE refuses that lock to a token
+// that lacks Pool.Allocate on bosh-lock-*, and no retry grants it.
+//
+// Where the resume would move the volume, the source VM's config still names
+// the old name that storage just said is gone, so a retry would only meet the
+// same refusal. In that case,
+// and when the transfer moved underneath the resume or no window applied,
+// the check resolves the disk once more. A disk whose old name is back, or
+// that has settled, is returned, and the caller's full resume finishes a
+// transfer that's still open. A transfer that changed again comes back
+// retriable. An unchanged one keeps the resume's answer, which for the move
+// is the permanent audit refusal with the move's reason, and it adds that
+// storage doesn't list the old name, so the source VM's entry may dangle.
+//
+// shared reports whether the disk's storage is shared, and the claim-only
+// resume uses it to scope the moves that took a landing away.
+func resumeBeforeManagedIdentity(ctx context.Context, deps Deps, op string, rd resolvedDisk, record aj.Record, provenance pve.DiskAllocationProvenance, shared bool) (resolvedDisk, error) {
+	if rd.intent.AllocationID != record.ID || rd.intent.AllocationNamespace != record.Namespace || rd.intent.AllocationBacking != "" && rd.intent.AllocationBacking != provenance.Backing {
+		return resolvedDisk{}, cpierrors.Cloud("managed disk transfer provenance conflicts; audit required")
+	}
+	if ctx.Value(identityResumeKey{}) != nil {
+		return resolvedDisk{}, cpierrors.Cloud(missingVolumeAudit)
+	}
+	if recheck, ok := ctx.Value(identityRecheckKey{}).(identityRecheck); ok {
+		if sameTransfer(recheck.intent, *rd.intent) && reflect.DeepEqual(recheck.record, record) {
+			return resolvedDisk{}, recheck.unchanged
+		}
+		return resolvedDisk{}, transferMovedUnderneath(rd)
+	}
+	if step, ok := unsettledRecordStep(record); ok {
+		if strings.HasSuffix(step.Kind, "_Nodes_CreateQemuMoveDisk") {
+			return resolvedDisk{}, cpierrors.Cloud("%s, because move step %s of the disk's record isn't settled; %s", missingVolumeAudit, step.ID, unsettledMoveRunbook)
+		}
+		return resolvedDisk{}, cpierrors.Cloud("%s, because %s in the disk's record", missingVolumeAudit, unsettledStepName(step))
+	}
+	if record.State == aj.ReconciliationRequired {
+		return resolvedDisk{}, cpierrors.Cloud("%s, because the disk's record needs reconciliation", missingVolumeAudit)
+	}
+	// The resume takes the allocation's identity from rd, so the landing
+	// writes the journal's backing even when the transfer record left it out.
+	rd.allocation = &managedDiskIdentity{record: record, provenance: provenance, absent: true, shared: shared}
+	resumed, err := resumeTransfer(context.WithValue(ctx, identityResumeKey{}, true), deps, op, rd, true)
+	if err == nil {
+		return resumed, nil
+	}
+	refusal, ok := pve.AsClaimOnlyRefusal(err)
+	if !ok {
+		return resolvedDisk{}, err
+	}
+	switch refusal.Window {
+	case pve.ClaimOnlyPendingDelete, pve.ClaimOnlyConfigEdit, pve.ClaimOnlyUnprovenLanding, pve.ClaimOnlyUnserialized:
+		return resolvedDisk{}, cpierrors.Cloud("%s, because %s", missingVolumeAudit, refusal.Reason)
+	case pve.ClaimOnlyMove, pve.ClaimOnlyIntentMoved, pve.ClaimOnlyNoWindow:
+		unchanged := err
+		switch refusal.Window {
+		case pve.ClaimOnlyMove:
+			unchanged = cpierrors.Cloud("%s, because %s, and storage doesn't list %s, so source vm %s's entry for it may be dangling",
+				missingVolumeAudit, refusal.Reason, rd.intent.Volid, rd.intent.SourceVMCID)
+		case pve.ClaimOnlyIntentMoved:
+			unchanged = transferMovedUnderneath(rd)
+		}
+		recheck := identityRecheck{intent: *rd.intent, record: record, unchanged: unchanged}
+		return resolveDiskForOp(context.WithValue(ctx, identityRecheckKey{}, recheck), deps, op, rd.diskCID, rd.birth, rd.meta)
+	default:
+		return resolvedDisk{}, err
+	}
+}
+
+// missingVolumeAudit is the identity check's refusal for a disk whose
+// ownership provenance names a volume that's gone.
+const missingVolumeAudit = "managed disk ownership provenance references a missing volume; audit required"
+
+// identityRecheckKey marks a context whose disk resolution runs again after
+// the identity check's claim-only resume stopped at the move, found the
+// transfer moved underneath it, or found no window to run. Its value is an
+// identityRecheck.
+type identityRecheckKey struct{}
+
+// identityRecheck is what the identity check's second resolution compares.
+// When the transfer record and the journal record both read as they did
+// before the resume, the check returns unchanged instead of resuming again.
+type identityRecheck struct {
+	intent    pve.DiskTransferIntent
+	record    aj.Record
+	unchanged error
+}
+
+// sameTransfer reports whether two reads of a transfer record name the same
+// parker, slot, volume, and source VM.
+func sameTransfer(a, b pve.DiskTransferIntent) bool {
+	return a.ParkerVMID == b.ParkerVMID && a.ParkerNode == b.ParkerNode && a.Slot == b.Slot && a.Volid == b.Volid && a.SourceVMCID == b.SourceVMCID
+}
+
+// transferMovedUnderneath is the retriable refusal for a transfer that
+// another call changed while the identity check was resuming it.
+func transferMovedUnderneath(rd resolvedDisk) error {
+	return cpierrors.Retriable("managed disk %s: its transfer to parker vmid %d moved underneath the identity check; retry",
+		rd.diskCID, rd.intent.ParkerVMID)
+}
+
+// unsettledRecordStep returns the first step of record, on any attempt, that
+// isn't observed and that no closed attempt's completion proof covers.
+func unsettledRecordStep(record aj.Record) (aj.Step, bool) {
+	for i := range record.Steps {
+		step := record.Steps[i]
+		if step.State != aj.Observed && !storageDecisionClosedAttemptStepSettled(record, step) {
+			return step, true
+		}
+	}
+	return aj.Step{}, false
+}
+
+// recordedLandings lists the moves record observed, each from the volid the
+// move started with to the volid it landed under, off the VM it moved from.
+// A claim-only resume claims a parker slot only when one of them landed the
+// slot's volume.
+//
+// A landing that a later observed move took away again is left out, because
+// the disk no longer holds that name, and another volume may hold it now.
+// shared reports whether the disk's storage is shared, which decides where
+// that later move has to run for it to count.
+func recordedLandings(record aj.Record, shared bool) []pve.RecordedLanding {
+	var landings []pve.RecordedLanding
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if !observedMoveStep(step) || len(step.VolIDs) < 2 {
+			continue
+		}
+		landed := step.VolIDs[len(step.VolIDs)-1]
+		if landingMovedAway(record.Steps[i+1:], landed, step.Target.Node, shared) {
+			continue
+		}
+		landings = append(landings, pve.RecordedLanding{
+			SourceVMID: step.Target.VMID,
+			From:       step.VolIDs[0],
+			To:         landed,
+		})
+	}
+	return landings
+}
+
+// observedMoveStep reports whether step is a move that the record observed.
+func observedMoveStep(step *aj.Step) bool {
+	return step.State == aj.Observed && strings.HasSuffix(step.Kind, "_Nodes_CreateQemuMoveDisk")
+}
+
+// landingMovedAway reports whether any observed move in later started from
+// landed, the name an earlier move gave the volume. The steps in later are
+// the ones the record observed after that earlier move, which ran on node.
+//
+// A move counts only when PVE landed the volume under another name, so it
+// has to hold at least two volids, and its last one has to differ from
+// landed. A move that PVE refused holds only the name it started from, and
+// it leaves the volume where it was. A volid names one volume on a node, or
+// across the cluster on shared storage, so a later move counts when it ran
+// on node, or on any node when the storage is shared. The VM that move ran
+// on doesn't matter, because attach_disk can attach a volume that one VM's
+// name embeds to another VM by a config edit.
+func landingMovedAway(later []aj.Step, landed, node string, shared bool) bool {
+	for i := range later {
+		step := &later[i]
+		if !observedMoveStep(step) || len(step.VolIDs) < 2 || step.VolIDs[0] != landed || step.VolIDs[len(step.VolIDs)-1] == landed {
+			continue
+		}
+		if shared || step.Target.Node == node {
+			return true
+		}
+	}
+	return false
 }
 
 func managedDiskActualBacking(ctx context.Context, deps Deps, storage string) (string, error) {
