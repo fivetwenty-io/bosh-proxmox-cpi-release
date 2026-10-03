@@ -187,7 +187,23 @@ func cleanupConfigStep(step aj.Step, record aj.Record) bool {
 		}
 		return false
 	case "disk":
-		return step.Kind == "park_Nodes_UpdateQemuConfig" || step.Kind == "lifecycle_detach_disk_Nodes_UpdateQemuConfig" || step.Kind == "lifecycle_delete_disk_Nodes_UpdateQemuConfig"
+		// Cleanup settles these on the operator's attestations and a fresh
+		// observation of the disk's owner, and neither depends on which call
+		// planned the write. attach_disk's own config writes, and the detach
+		// tail it runs first, can leave such a step just as detach_disk and
+		// delete_disk can. A lifecycle write that turns a parker's
+		// protection back on is the exception. The write settles only once
+		// the parker reads back protected, so cleanup declines it here and
+		// lets the protection settlement refuse it with its own reason. A
+		// park_ step never records the protection parameters, so it can't
+		// be one.
+		switch step.Kind {
+		case "park_Nodes_UpdateQemuConfig":
+			return true
+		case "lifecycle_attach_disk_Nodes_UpdateQemuConfig", "lifecycle_detach_disk_Nodes_UpdateQemuConfig", "lifecycle_delete_disk_Nodes_UpdateQemuConfig":
+			return !IsParkerProtectionStep(record, step)
+		}
+		return false
 	default:
 		return false
 	}

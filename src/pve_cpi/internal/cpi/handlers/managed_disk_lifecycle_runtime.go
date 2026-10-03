@@ -28,10 +28,11 @@ type managedDiskLifecycle struct {
 	journal         *aj.Journal
 	handle          *aj.Handle
 	session         *storageLifecycle
-	// diskMutationAdmitted records that the guard admitted a mutation other
-	// than a bosh-lock- sentinel create or delete, or a write of the
-	// drive-option overlay note alone (see lifecycleOverlayOnlyConfigWrite),
-	// during this operation.
+	// diskMutationAdmitted records that, during this operation, the guard
+	// admitted a mutation other than a bosh-lock- sentinel create or delete, a
+	// write of the drive-option overlay note alone (see
+	// lifecycleOverlayOnlyConfigWrite), or a pinned removal of notes from a VM
+	// that doesn't name the disk (see lifecycleMutationTouchesDisk).
 	diskMutationAdmitted bool
 	// pendingDeleteReverted records that the guard observed the revert of a
 	// slot delete PVE could only record as pending, after it had settled that
@@ -115,7 +116,8 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 		return operationErr
 	}
 	cleanTimeout := m.cleanLockTimeout(operationErr)
-	cleanPending := !cleanTimeout && m.cleanPendingDelete(operationErr)
+	cleanTail := !cleanTimeout && m.cleanTailRefusal(operationErr)
+	cleanPending := !cleanTimeout && !cleanTail && m.cleanPendingDelete(operationErr)
 	if m.guard != nil {
 		operationErr = errors.Join(operationErr, m.guard.Err())
 	}
@@ -149,6 +151,15 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a lock timeout failed"))
 		}
+	case cleanTail:
+		// The detach tail stopped before it changed the source VM, and
+		// nothing else in this operation touched the disk. So the
+		// allocation returns to the Director the way a success returns
+		// it. The tail's error also goes back for the Director to retry.
+		finalErr = m.completeOwned(ctx, false)
+		if finalErr != nil {
+			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a detach tail refusal failed"))
+		}
 	case operationErr != nil:
 		finalErr = m.session.Uncertain("operation did not complete")
 	default:
@@ -159,12 +170,15 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	}
 	closeErr := errors.Join(m.handle.Close(), m.journal.Close())
 	result := errors.Join(operationErr, finalErr, closeErr)
-	returned := (cleanTimeout || cleanPending) && finalErr == nil && closeErr == nil
+	returned := (cleanTimeout || cleanTail || cleanPending) && finalErr == nil && closeErr == nil
 	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")
 	}
 	if returned && cleanTimeout {
 		return &diskReturnedAfterLockTimeout{err: result}
+	}
+	if returned && cleanTail {
+		return &diskReturnedAfterTailRefusal{err: result}
 	}
 	return result
 }
@@ -216,6 +230,23 @@ func isDiskReturnedAfterLockTimeout(err error) bool {
 	return errors.As(err, &returned)
 }
 
+// diskReturnedAfterTailRefusal marks a disk operation that failed only because
+// the detach tail left the source VM as it found it, after which finish
+// returned the disk's allocation unchanged. create_vm's pre-attach reads it
+// the way it reads diskReturnedAfterLockTimeout. The marker wraps the original
+// error, so its CPI type stays visible.
+type diskReturnedAfterTailRefusal struct{ err error }
+
+func (e *diskReturnedAfterTailRefusal) Error() string { return e.err.Error() }
+func (e *diskReturnedAfterTailRefusal) Unwrap() error { return e.err }
+
+// isDiskReturnedUnchanged reports whether err carries either marker, so the
+// disk operation returned the disk's allocation unchanged.
+func isDiskReturnedUnchanged(err error) bool {
+	var refused *diskReturnedAfterTailRefusal
+	return isDiskReturnedAfterLockTimeout(err) || errors.As(err, &refused)
+}
+
 // completeOwned closes the session with fresh evidence of the disk's current
 // disposition: its absence after a delete, and its ownership otherwise.
 func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) error {
@@ -249,13 +280,14 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 
 // cleanLockTimeout reports whether an operation failed only because a cluster
 // lock wait ran out, before it changed the disk. That takes four things. The
-// failure carries pve.ErrClusterLockTimeout, the guard was never poisoned, the
-// guard admitted nothing but sentinel creates and deletes and the drive-option
-// overlay note, and every step the operation journaled has been observed. A
-// timeout is positive evidence that another request held the lock throughout,
-// so this request never entered the window it was waiting for. An operation that moved or migrated the disk
-// before it waited has changed it, even when every step settled, so it still
-// goes uncertain.
+// failure carries pve.ErrClusterLockTimeout. The guard was never poisoned, and
+// it admitted only sentinel creates and deletes, writes of the drive-option
+// overlay note, and pinned note removals from a VM that doesn't name the disk.
+// Every step the operation journaled has been observed. A timeout is positive
+// evidence that another request held the lock throughout, so this request
+// never entered the window it was waiting for. An operation that moved or
+// migrated the disk before it waited has changed it, even when every step
+// settled, so it still goes uncertain.
 //
 // A request whose context ended counts the same way. pve.ErrClusterLockInterrupted
 // is a lock wait that a cancelled request cut short, and errManagedRequestEnded
@@ -278,6 +310,22 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	}
 	if !errors.Is(operationErr, pve.ErrClusterLockTimeout) && !errors.Is(operationErr, pve.ErrClusterLockStateUnknown) &&
 		!errors.Is(operationErr, pve.ErrClusterLockInterrupted) && !errors.Is(operationErr, errManagedRequestEnded) {
+		return false
+	}
+	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
+		return false
+	}
+	return storageLifecycleSettled(m.handle.Record()) == nil
+}
+
+// cleanTailRefusal reports whether an operation failed only because the
+// detach tail left the source VM as it found it, which detachTailNotSent marks.
+// The same conditions as cleanLockTimeout apply. The guard must never have
+// been poisoned, it must never have admitted a disk mutation during the
+// operation, and every step the operation journaled must be observed. So a
+// tail that runs after a move in the same call never counts.
+func (m *managedDiskLifecycle) cleanTailRefusal(operationErr error) bool {
+	if !isDetachTailNotSent(operationErr) {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {

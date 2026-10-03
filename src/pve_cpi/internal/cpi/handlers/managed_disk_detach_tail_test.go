@@ -45,6 +45,13 @@ type tailWrites struct {
 	// afterSourceRead, when set, runs after each read of 777's pending view
 	// has been served.
 	afterSourceRead func()
+	// configRead, when set, runs before each read of 777's config is served,
+	// and an error it returns is the read's answer in place of the config.
+	configRead func() error
+	// identityRead, when set, runs before each read of the cluster's identity
+	// is served, and an error it returns is the read's answer in place of the
+	// identity.
+	identityRead func() error
 }
 
 // tailWritePVE is the stranded-disk client with 777's description writes
@@ -96,14 +103,20 @@ func runTailHook(ctx context.Context, vmid int, event tailEvent) {
 }
 
 func (c tailWritePVE) QEMU() qemu.Service {
-	return tailWriteQEMU{Service: c.legacyDestroyPVE.QEMU()}
+	return tailWriteQEMU{Service: c.legacyDestroyPVE.QEMU(), w: c.w}
 }
 
 type tailWriteQEMU struct {
 	qemu.Service
+	w *tailWrites
 }
 
 func (q tailWriteQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if vmid == 777 && q.w.configRead != nil {
+		if err := q.w.configRead(); err != nil {
+			return nil, err
+		}
+	}
 	cfg, err := q.Service.Config(ctx, node, vmid)
 	runTailHook(ctx, vmid, tailRead)
 	return cfg, err
@@ -155,6 +168,15 @@ func (n tailWriteNodes) updateDescription(ctx context.Context, node, vmidText st
 	}
 	n.w.removals++
 	return nil
+}
+
+func (n tailWriteNodes) ListCertificatesInfo(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
+	if n.w.identityRead != nil {
+		if err := n.w.identityRead(); err != nil {
+			return nil, err
+		}
+	}
+	return n.Service.ListCertificatesInfo(ctx, node)
 }
 
 func (n tailWriteNodes) ListQemuPending(ctx context.Context, node, vmidText string) (*nodes.ListQemuPendingResponse, error) {
@@ -400,16 +422,20 @@ func TestDetachTailDigestConflictRetries(t *testing.T) {
 }
 
 // TestDetachTailFailureKeepsTheVolume is a latent record whose tail can't read
-// 777. delete_disk fails retriably before anything deletes the volume, and
-// the next delete_disk heals the entry and deletes it.
+// 777. delete_disk fails retriably before anything deletes the volume, with
+// the record returned because the tail sent nothing, and the next delete_disk
+// heals the entry and deletes it.
 func TestDetachTailFailureKeepsTheVolume(t *testing.T) {
 	captureParkerPoolSweep(t)
 	s, id, _ := buildLatentTailDisk(t)
-	// 777 answers every read until delete_disk's lifecycle is admitted, so
-	// only the reads inside the operation fail, and the tail's is the first.
+	// 777 answers every read but the first one after delete_disk's lifecycle
+	// is admitted, which is the tail's. The completion audit's reads of 777
+	// are served, because a failed audit read is its own uncertainty.
+	failed := false
 	s.client.onConfigRead = func(vmid int) error {
 		record, err := s.journal.Inspect(id)
-		if vmid == 777 && err == nil && record.Reason == "lifecycle delete_disk admitted; completion pending" {
+		if vmid == 777 && !failed && err == nil && record.Reason == "lifecycle delete_disk admitted; completion pending" {
+			failed = true
 			return errors.New("connection reset reading 777")
 		}
 		return nil
@@ -419,9 +445,11 @@ func TestDetachTailFailureKeepsTheVolume(t *testing.T) {
 	if s.client.state.volumes[s.stranded] == nil {
 		t.Fatalf("delete_disk deleted %s although the tail failed", s.stranded)
 	}
+	s.requireSingleHolder(t, true)
 	if !s.hasEntry(777) {
 		t.Fatal("777's entry went missing although the tail could not read 777")
 	}
+	s.requireRecord(t, id, aj.ReadyToReturn)
 	s.client.onConfigRead = nil
 	if err := deleteDiskAt(t, context.Background(), s.deps, s.cid); err != nil {
 		t.Fatalf("the retried delete_disk: %v", err)
@@ -602,6 +630,7 @@ func TestDetachTailExhaustedRetryKeepsTheVolume(t *testing.T) {
 	if planned, _ := countSteps(t, s.journal, id, "_Nodes_UpdateQemuConfig"); planned != 0 {
 		t.Fatalf("%d refused writes were left planned, want each settled", planned)
 	}
+	s.requireRecord(t, id, aj.ReadyToReturn)
 	w.conflictAlways = false
 	if err := deleteDiskAt(t, context.Background(), s.deps, s.cid); err != nil {
 		t.Fatalf("the retried delete_disk: %v", err)
@@ -1213,7 +1242,7 @@ func TestDetachTailRenamedOldNameUnknownAllocationRefuses(t *testing.T) {
 	other := entry
 	other.AllocationID = unknown
 	other.AllocationNamespace = lifecycleFlowNamespace
-	if err := pve.RemoveDiskAllocationProvenance(context.Background(), f.client, "n1", 777, serial, other); err != nil {
+	if err := pve.RemoveDiskAllocationEntry(context.Background(), f.client, "n1", 777, serial, other, f.client.state.configs[777], nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	resolved, volumesResolved := fmt.Sprint(cfg), fmt.Sprint(volumeNames(f))

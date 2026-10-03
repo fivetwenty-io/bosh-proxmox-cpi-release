@@ -84,7 +84,10 @@ func cleanupAttestedDecision(id string) StorageAllocationDecision {
 	return StorageAllocationDecision{Action: "cleanup", AllocationID: id, DecisionID: "incident-proof", AuthorityID: "fenced-writer", PreviousWriterFenced: true, RemoteTasksSettled: true}
 }
 func TestCleanupPendingConfigRetainsHistoryAndCannotAuthorizeReplay(t *testing.T) {
-	for _, kind := range []string{"vm", "disk"} {
+	// The attach row is a config write that attach_disk planned, such as
+	// the detach tail's removal on the disk's old VM. Cleanup settles it on
+	// the same evidence it uses for a step that delete_disk plans.
+	for _, kind := range []string{"vm", "disk", "attach"} {
 		t.Run(kind, func(t *testing.T) {
 			var deps Deps
 			var j *aj.Journal
@@ -98,12 +101,16 @@ func TestCleanupPendingConfigRetainsHistoryAndCannotAuthorizeReplay(t *testing.T
 				d, c, jj, allocation, _ := lifecycleFlowFixture(t)
 				delete(c.state.configs[777], "scsi1")
 				deps, j, id = d, jj, allocation
-				step = appendCleanupPending(t, j, id, "lifecycle_delete_disk_Nodes_UpdateQemuConfig")
+				stepKind := "lifecycle_delete_disk_Nodes_UpdateQemuConfig"
+				if kind == "attach" {
+					stepKind = "lifecycle_attach_disk_Nodes_UpdateQemuConfig"
+				}
+				step = appendCleanupPending(t, j, id, stepKind)
 			}
 			c := &cleanupTaskClient{Client: deps.PVE}
 			deps.PVE = c
 			node := "pve1"
-			if kind == "disk" {
+			if kind != "vm" {
 				node = "n1"
 			}
 			record, err := CleanupStorageAllocation(t.Context(), deps, j, []string{node}, cleanupAttestedDecision(id))
@@ -132,6 +139,62 @@ func TestCleanupPendingConfigRetainsHistoryAndCannotAuthorizeReplay(t *testing.T
 				t.Fatal("independent task observation missing")
 			}
 		})
+	}
+	// Each of these is a call that put the disk on parker 90000 or moved it
+	// off, and then couldn't turn the parker's protection back on. A
+	// delete_disk finds the disk where an earlier detach_disk parked it.
+	t.Run("attach protection restore", cleanupRefusesProtectionRestore("lifecycle_attach_disk_QEMU_AttachDisk", "lifecycle_attach_disk_Nodes_UpdateQemuConfig"))
+	t.Run("detach protection restore", cleanupRefusesProtectionRestore("lifecycle_detach_disk_QEMU_AttachDisk", "lifecycle_detach_disk_Nodes_UpdateQemuConfig"))
+	t.Run("delete protection restore", cleanupRefusesProtectionRestore("lifecycle_detach_disk_QEMU_AttachDisk", "lifecycle_delete_disk_Nodes_UpdateQemuConfig"))
+}
+
+// cleanupRefusesProtectionRestore returns a row whose record names parker
+// 90000 through an observed step of parkerKind and then holds a planned
+// protection_on write of protectionKind, which is what a call leaves when it
+// couldn't turn the parker's protection back on. While the parker reads
+// unprotected, cleanup must refuse with the command that puts protection
+// back, even with every attestation given.
+func cleanupRefusesProtectionRestore(parkerKind, protectionKind string) func(*testing.T) {
+	return func(t *testing.T) {
+		checkCleanupRefusesProtectionRestore(t, parkerKind, protectionKind)
+	}
+}
+
+func checkCleanupRefusesProtectionRestore(t *testing.T, parkerKind, protectionKind string) {
+	deps, c, j, id, _ := lifecycleFlowFixture(t)
+	const parker = 90000
+	c.state.configs[parker] = map[string]any{"name": "parker", "digest": "1", "tags": pve.ParkerTag, "protection": "0"}
+	h, err := j.Acquire(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := h.Record()
+	target := r.Steps[0].Target
+	target.VMID, target.Node, target.IntendedVolume = parker, "n1", ""
+	r.State = aj.ReconciliationRequired
+	r.Reason = "lifecycle operation did not complete"
+	// The journal takes a step only as planned, so the parker step is saved
+	// planned and then observed before the protection write is planned.
+	r.Steps = append(r.Steps, aj.Step{ID: "on-parker", Kind: parkerKind, State: aj.Planned, Attempt: r.ActiveAttempt(), Target: target})
+	if err := h.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	r = h.Record()
+	r.Steps[len(r.Steps)-1].State = aj.Observed
+	r.Steps = append(r.Steps, aj.Step{ID: "protection-on", Kind: protectionKind, State: aj.Planned, Attempt: r.ActiveAttempt(), Target: target,
+		Parameters: parkerProtectionStepParameters(map[string]any{"protection": true})})
+	if err := h.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record, err := CleanupStorageAllocation(t.Context(), deps, j, []string{"n1"}, cleanupAttestedDecision(id))
+	if want := "qm set 90000 --protection 1"; err == nil || !strings.Contains(StorageAllocationDecisionFailure(err), want) {
+		t.Fatalf("cleanup with parker %d unprotected returned %v, want a refusal that says %q", parker, err, want)
+	}
+	if record.State == aj.Cleaned {
+		t.Fatal("cleanup closed the record while the parker's protection restore was unsettled")
 	}
 }
 func TestCleanupSettlementRejectsMissingProofAndUnknownAllocation(t *testing.T) {

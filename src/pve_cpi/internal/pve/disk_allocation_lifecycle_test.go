@@ -34,17 +34,20 @@ func TestDiskAllocationLifecyclePreservesSharedMetadata(t *testing.T) {
 	if err != nil || !ok || found != entry {
 		t.Fatalf("provenance=%+v found=%v err=%v", found, ok, err)
 	}
+	read := func() map[string]any {
+		return map[string]any{"description": c.configs[100]["description"], "digest": "d1"}
+	}
 	foreign := entry
 	foreign.AllocationNamespace = "another"
-	if err := RemoveDiskAllocationProvenance(context.Background(), c, "node-a", 100, "token", foreign); err == nil {
+	if err := RemoveDiskAllocationEntry(context.Background(), c, "node-a", 100, "token", foreign, read(), nil, nil); err == nil {
 		t.Fatal("foreign identity erased")
 	}
 	stale := entry
 	stale.Volid = "pool:200/vm-200-disk-0.raw"
-	if err := RemoveDiskAllocationProvenance(context.Background(), c, "node-a", 100, "token", stale); err == nil {
+	if err := RemoveDiskAllocationEntry(context.Background(), c, "node-a", 100, "token", stale, read(), nil, nil); err == nil {
 		t.Fatal("stale location erased current provenance")
 	}
-	if err := RemoveDiskAllocationProvenance(context.Background(), c, "node-a", 100, "token", entry); err != nil {
+	if err := RemoveDiskAllocationEntry(context.Background(), c, "node-a", 100, "token", entry, read(), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := FindDiskAllocationProvenance(c.configs[100]["description"].(string), "token"); err != nil || ok {

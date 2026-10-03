@@ -239,7 +239,7 @@ func readParkerProtection(ctx context.Context, client pve.Client, step aj.Step) 
 	cfg, err := qemu.Config(ctx, step.Target.Node, vmid)
 	if err != nil {
 		if pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err) {
-			return &protectionSettlementGap{text: fmt.Sprintf("parker %d no longer exists on node %s", vmid, step.Target.Node), cause: err}
+			return &protectionSettlementGap{text: fmt.Sprintf("parker %d wasn't found on its recorded node %s", vmid, step.Target.Node), cause: err}
 		}
 		return &protectionSettlementGap{text: fmt.Sprintf("the config of parker %d could not be read", vmid), cause: err}
 	}

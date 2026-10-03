@@ -96,9 +96,9 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 		}
 		descriptor := m.prepared.plan.VMExecution
 		if descriptor == nil || descriptor.MaxAttempts <= m.handle.Record().ActiveAttempt()+1 || deps.Config.KeepFailedVMsEnabled() {
-			// keep_failed_vms asks us to keep the VM, so the timeout goes back
+			// keep_failed_vms asks us to keep the VM, so the error goes back
 			// with it in place and the next try resumes the generation.
-			if isDiskReturnedAfterLockTimeout(err) && !deps.Config.KeepFailedVMsEnabled() {
+			if isDiskReturnedUnchanged(err) && !deps.Config.KeepFailedVMsEnabled() {
 				return nil, rollbackManagedVMAfterLockTimeout(ctx, deps, journal, m.handle, err)
 			}
 			return nil, err
@@ -140,13 +140,16 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 
 // rollbackManagedVMAfterLockTimeout ends a create_vm whose persistent disk
 // waited out another request's parker lock on the generation's last attempt.
-// The disk came back unchanged, but the attempt's VM exists, and any disk
-// attached before the wait is still attached to it. If the retriable timeout
-// went back with the VM in place, a later deploy under a new agent ID would
-// orphan that VM and strand those disks on it. So we dispose of the attempt
-// first, which preserves every attached disk and destroys the VM, and then
-// close the generation. Only then does the timeout go back, and the Director's
-// retry under the same agent ID starts a new generation and builds a fresh VM.
+// It also handles a create_vm whose persistent disk failed because its detach
+// tail stopped before it changed the source VM, and it ends that attempt the
+// same way. The disk came back unchanged, but the attempt's VM exists, and any
+// disk attached before the failure is still attached to it. If the retriable
+// error went back with the VM in place, a later deploy under a new agent ID
+// would orphan that VM and strand those disks on it. So we dispose of the
+// attempt first, which preserves every attached disk and destroys the VM, and
+// then close the generation. Only then does the error go back, and the
+// Director's retry under the same agent ID starts a new generation and builds
+// a fresh VM.
 func rollbackManagedVMAfterLockTimeout(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, timeout error) error {
 	proof, err := rollbackManagedVMAttempt(ctx, deps, journal, handle)
 	if err != nil {

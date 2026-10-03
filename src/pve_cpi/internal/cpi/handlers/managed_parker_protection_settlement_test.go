@@ -52,7 +52,9 @@ func TestCutOffRestoreAdoptsOnceTheParkerReadsProtected(t *testing.T) {
 // TestCutOffRestoreRefusesWhileProtectionIsOff checks that the settler never
 // settles a restore it cannot see landed. With protection off, adopt refuses,
 // names the step, and gives the qm set command that puts protection back. A
-// parker whose config is gone leaves the step planned too.
+// parker that isn't on its recorded node leaves the step planned too, whether
+// it's gone or has moved to another node, and a parker moved back settles the
+// step on the next call.
 func TestCutOffRestoreRefusesWhileProtectionIsOff(t *testing.T) {
 	t.Parallel()
 	t.Run("protection off", func(t *testing.T) {
@@ -77,12 +79,39 @@ func TestCutOffRestoreRefusesWhileProtectionIsOff(t *testing.T) {
 		step := c.restoreStep(t)
 		delete(c.client.state.configs, c.parker)
 		_, err := c.adopt(t)
-		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("its parker protection write could not be settled because parker %d", c.parker)) {
-			t.Fatalf("adopt with the parker gone = %v, want a refusal naming the parker", err)
+		want := fmt.Sprintf("its parker protection write could not be settled because parker %d wasn't found on its recorded node n1", c.parker)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("adopt with the parker gone = %v, want a refusal containing %q", err, want)
 		}
 		t.Logf("refusal: %v", err)
 		if got := stepState(t, c.record(t), step.ID); got != aj.Planned {
 			t.Fatalf("restore step settled to %s with the parker gone", got)
+		}
+	})
+	t.Run("parker moved to another node", func(t *testing.T) {
+		t.Parallel()
+		c := newCutOffRestore(t, 200*time.Millisecond)
+		step := c.restoreStep(t)
+		c.setProtection(true)
+		if c.client.vmNodes == nil {
+			c.client.vmNodes = map[int]string{}
+		}
+		c.client.vmNodes[c.parker] = "n2"
+		_, err := c.adopt(t)
+		want := fmt.Sprintf("its parker protection write could not be settled because parker %d wasn't found on its recorded node n1", c.parker)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("adopt with the parker on n2 = %v, want a refusal containing %q", err, want)
+		}
+		if got := stepState(t, c.record(t), step.ID); got != aj.Planned {
+			t.Fatalf("restore step settled to %s with the parker on n2", got)
+		}
+
+		c.client.vmNodes[c.parker] = "n1"
+		if _, err := c.adopt(t); err != nil {
+			t.Fatalf("adopt once the parker is back on n1: %v", err)
+		}
+		if got := stepState(t, c.record(t), step.ID); got != aj.Observed {
+			t.Fatalf("restore step left %s once the parker was back on its recorded node", got)
 		}
 	})
 }

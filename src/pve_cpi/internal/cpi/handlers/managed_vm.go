@@ -331,13 +331,13 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 }
 
 // postCreateFailure settles a failure after the VM root exists. A persistent
-// disk whose lock wait ran out before anything changed leaves nothing uncertain
-// when the guard is clean and every step this allocation wrote is observed, so
-// the retriable error goes back as it is, and runManagedVMWithRetries rolls the
-// attempt back before the error leaves create_vm. Anything else requires
-// reconciliation.
+// disk whose lock wait ran out, or whose detach tail stopped, before anything
+// changed leaves nothing uncertain when the guard is clean and every step this
+// allocation wrote is observed. So the error goes back as it is, and
+// runManagedVMWithRetries rolls the attempt back before the error leaves
+// create_vm. Anything else requires reconciliation.
 func (m *managedVMAllocation) postCreateFailure(err error) error {
-	if isDiskReturnedAfterLockTimeout(err) && m.guard.Err() == nil && storageLifecycleSettled(m.handle.Record()) == nil {
+	if isDiskReturnedUnchanged(err) && m.guard.Err() == nil && storageLifecycleSettled(m.handle.Record()) == nil {
 		return err
 	}
 	// A persistent disk that waits only on its parker's protection left the

@@ -9,13 +9,25 @@ import (
 // lifecycleMutationTouchesDisk reports whether a mutation the lifecycle guard
 // just admitted counts as a disk mutation for cleanLockTimeout. A bosh-lock-
 // sentinel create or delete does not, and neither does a config write of the
-// drive-option overlay note alone. Everything else does.
-func lifecycleMutationTouchesDisk(call ManagedAllocationMutation, observation managedDiskMutationObservation) bool {
+// drive-option overlay note alone, nor a pinned removal of notes from a VM
+// that doesn't name the volume. Everything else does.
+//
+// The removal is the detach tail's write to the VM a parked disk came off. The
+// guard has checked that the removal only drops notes from the description it
+// read. That read shows the disk on no slot, unused entry, or pending change,
+// and PVE applies the removal only against that read. So the removal leaves
+// the disk, and whatever holds it, where they were, and a parker lock timeout
+// that follows it can still be clean. The tail runs again on the retry and finds nothing
+// left to remove.
+func lifecycleMutationTouchesDisk(call ManagedAllocationMutation, observation managedDiskMutationObservation, volume string) bool {
 	if call.Service == managedDiskServicePool {
 		return false
 	}
 	if call.Service+"."+call.Method != "Nodes.UpdateQemuConfig" {
 		return true
+	}
+	if observation.notesRemoval && !lifecycleConfigHasVolume(observation.before, volume) {
+		return false
 	}
 	return !lifecycleOverlayOnlyConfigWrite(observation.before, observation.fields)
 }

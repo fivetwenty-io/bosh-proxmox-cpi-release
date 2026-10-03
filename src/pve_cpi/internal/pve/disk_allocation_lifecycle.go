@@ -146,14 +146,6 @@ func ParseDiskAllocationProvenance(description string) (map[string]DiskAllocatio
 // WriteDiskAllocationProvenance preserves unrelated metadata and verifies the
 // full receiving-side identity before a caller may erase source provenance.
 func WriteDiskAllocationProvenance(ctx context.Context, c Client, node string, vmid int, key string, entry DiskAllocationProvenance) error {
-	return updateDiskAllocationProvenance(ctx, c, node, vmid, key, entry, false)
-}
-
-// RemoveDiskAllocationProvenance removes only a matching allocation identity.
-func RemoveDiskAllocationProvenance(ctx context.Context, c Client, node string, vmid int, key string, expected DiskAllocationProvenance) error {
-	return updateDiskAllocationProvenance(ctx, c, node, vmid, key, expected, true)
-}
-func updateDiskAllocationProvenance(ctx context.Context, c Client, node string, vmid int, key string, entry DiskAllocationProvenance, remove bool) error {
 	if c == nil || c.Nodes() == nil || c.QEMU() == nil || node == "" || vmid <= 0 || key == "" {
 		return fmt.Errorf("managed disk provenance requires a concrete holder")
 	}
@@ -177,17 +169,7 @@ func updateDiskAllocationProvenance(ctx context.Context, c Client, node string, 
 	if exists && (prior.AllocationID != entry.AllocationID || prior.AllocationNamespace != entry.AllocationNamespace) {
 		return fmt.Errorf("managed disk provenance identity conflicts")
 	}
-	if remove && exists && prior != entry {
-		return fmt.Errorf("managed disk provenance location changed before removal")
-	}
-	if remove {
-		if !exists {
-			return nil
-		}
-		delete(entries, key)
-	} else {
-		entries[key] = entry
-	}
+	entries[key] = entry
 	encoded, err := json.Marshal(entries)
 	if err != nil {
 		return err
@@ -206,7 +188,7 @@ func updateDiskAllocationProvenance(ctx context.Context, c Client, node string, 
 		params.Digest = &digest
 	}
 	if err := c.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), params); err != nil {
-		return fmt.Errorf("cannot persist managed disk provenance")
+		return fmt.Errorf("cannot persist managed disk provenance: %w", err)
 	}
 	check, err := c.QEMU().Config(ctx, node, vmid)
 	if err != nil || check == nil {
@@ -217,7 +199,7 @@ func updateDiskAllocationProvenance(ctx context.Context, c Client, node string, 
 		return err
 	}
 	actual, found := observed[key]
-	if remove && found || !remove && (!found || actual != entry) {
+	if !found || actual != entry {
 		return fmt.Errorf("managed disk provenance readback mismatch")
 	}
 	return nil

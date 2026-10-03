@@ -129,10 +129,11 @@ func (g *ManagedAllocationGuard) begin(ctx context.Context, m ManagedAllocationM
 	if err == nil && token == "" {
 		err = fmt.Errorf("managed mutation did not produce durable intent identity")
 	}
-	if errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedDescriptionDigestStale) {
-		// The request's context ended before this mutation, or a
+	if errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedDescriptionDigestStale) || errors.Is(err, errManagedTailReadFailed) {
+		// The request's context ended before this mutation, a
 		// description-only write carried a digest the guard's own read no
-		// longer matches, and the refusal came before any intent was written
+		// longer matches, or a read the guard makes before the detach tail's
+		// removal failed, and the refusal came before any intent was written
 		// or PVE was called. Nothing is uncertain, so the guard stays usable,
 		// the way a cut-off protection write leaves it.
 		g.mu.Unlock()
