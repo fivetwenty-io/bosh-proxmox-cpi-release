@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -76,11 +75,14 @@ func buildOnce(t *testing.T) (string, error) {
 
 // attemptBuild runs go build once and returns the binary path on success.
 func attemptBuild() (string, error) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", errors.New("runtime.Caller failed")
+	// go test runs a package with its own directory as the working directory,
+	// so the module root is two levels up. runtime.Caller is no help here,
+	// because under -trimpath it returns a module path, not a file path.
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("Getwd: %w", err)
 	}
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	repoRoot := filepath.Join(wd, "..", "..")
 
 	dir, err := os.MkdirTemp("", "bosh-proxmox-cpi-bin-*")
 	if err != nil {
