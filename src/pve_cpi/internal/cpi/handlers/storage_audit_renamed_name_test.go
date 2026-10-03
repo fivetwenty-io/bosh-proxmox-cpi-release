@@ -337,6 +337,42 @@ func TestAllocationAuditGivenUpNameKeepsOtherConflicts(t *testing.T) {
 	}
 }
 
+// TestAllocationAuditGivenUpNameSecondHolderWithOwnSerial guards the rule that
+// an old record gives up a name, against a claim from another VM. VM 2353
+// holds the old record's historical name on a slot with no serial and no
+// provenance, so on its own the old record has given that name up. VM 2400
+// holds the same volume as well, and its drive carries the old record's own
+// stable ID as its serial. That claim names the volume as the old record's,
+// so the audit keeps the name for the record, counts it in the storage
+// listing, and reports the record's two holders and the volume's two VMs.
+func TestAllocationAuditGivenUpNameSecondHolderWithOwnSerial(t *testing.T) {
+	f := newReuseFixture(t)
+	f.noSerial, f.noProvenance = true, true
+	records := f.build()
+	f.c.configs[reuseOtherVM] = map[string]any{"virtio0": reuseOtherVol, "scsi2": reuseVolume + ",serial=" + f.old.DiskToken}
+	f.c.nodesRead.volumesByNode["pve1"] = append(f.c.nodesRead.volumesByNode["pve1"], reuseOtherVol)
+	report, err := auditStorageAllocationRecords(context.Background(), f.deps, records, nil, []string{"pve1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vmid := range []int{reuseOtherVM, 0} {
+		if !slices.ContainsFunc(report.Evidence, func(e StorageAllocationEvidence) bool {
+			return e.AllocationID == f.old.ID && e.VolumeID == reuseVolume && e.VMID == vmid
+		}) {
+			t.Fatalf("old record not evidenced at %s with VMID %d: %+v\nconflicts:\n%s", reuseVolume, vmid, report.Evidence, strings.Join(report.Conflicts, "\n"))
+		}
+	}
+	if !holderConflict(report, f.old.ID) {
+		t.Fatalf("the old record's second holder not reported:\n%s", strings.Join(report.Conflicts, "\n"))
+	}
+	if !sharedReferenceConflict(report, reuseVolume) {
+		t.Fatalf("two VMs referencing %s not reported:\n%s", reuseVolume, strings.Join(report.Conflicts, "\n"))
+	}
+	if report.Complete {
+		t.Fatal("audit with a second holder of the given-up name reported complete")
+	}
+}
+
 // reuseLocalDefinition is storage a as a directory on each node, so the same
 // volid on two nodes names two volumes.
 const reuseLocalDefinition = `{"storage":"a","type":"dir","path":"/mnt/a","content":"images,iso"}`

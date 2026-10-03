@@ -44,6 +44,9 @@ type lifecycleFlowPVE struct {
 	// visibilityErrAfterDelete becomes visibilityErr once a volume is
 	// deleted, so only the audits after a deletion lose their visibility.
 	visibilityErrAfterDelete error
+	// onVolumeDeleted, when set, runs once a volume is deleted, so a row can
+	// change a VM between the deletion and the audit that follows it.
+	onVolumeDeleted func()
 	// offlineNodes are the cluster members ListStatus reports offline.
 	offlineNodes map[string]bool
 	// vmSnapshots, when set, answers ListSnapshots per VM instead of
@@ -868,10 +871,14 @@ func (c *lifecycleFlowPVE) ActiveMoveTasks(_ context.Context, node string) ([]pv
 	return append([]pve.ActiveTask{}, c.activeMoveTasks[node]...), nil
 }
 
-// volumeDeleted applies visibilityErrAfterDelete once any volume is deleted.
+// volumeDeleted applies visibilityErrAfterDelete and runs onVolumeDeleted
+// once any volume is deleted.
 func (c *lifecycleFlowPVE) volumeDeleted() {
 	if c.visibilityErrAfterDelete != nil {
 		c.visibilityErr = c.visibilityErrAfterDelete
+	}
+	if c.onVolumeDeleted != nil {
+		c.onVolumeDeleted()
 	}
 }
 func (c *lifecycleFlowPVE) Storage() storage.Service {

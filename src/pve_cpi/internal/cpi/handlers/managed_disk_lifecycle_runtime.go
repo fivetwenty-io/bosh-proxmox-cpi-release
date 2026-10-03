@@ -264,7 +264,7 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 	}
 	var proof aj.Verification
 	if deleted {
-		proof, err = m.deletionProof(ctx)
+		proof, err = m.absentDeletionProof(ctx)
 	} else {
 		var current resolvedDisk
 		current, err = resolveDiskForOp(ctx, m.deps, "lifecycle_complete", m.disk.diskCID, m.disk.birth, m.disk.meta)
@@ -366,6 +366,43 @@ func (m *managedDiskLifecycle) cleanPendingDelete(operationErr error) bool {
 }
 
 func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verification, error) {
+	report, err := m.deletionAudit(ctx)
+	if err != nil {
+		return aj.Verification{}, err
+	}
+	return m.judgeDeletion(ctx, report)
+}
+
+// absentDeletionProof is the form of deletionProof that delete_disk uses.
+// Between the audit and judgeDeletion it removes this disk's own notes from
+// each VM that carries them and holds the volume nowhere
+// (removeAbsentDiskNotes), and it audits again when it has removed any, so the
+// verdict rests on a fresh audit.
+func (m *managedDiskLifecycle) absentDeletionProof(ctx context.Context) (aj.Verification, error) {
+	report, err := m.deletionAudit(ctx)
+	if err != nil {
+		return aj.Verification{}, err
+	}
+	removed, unsettled, err := removeAbsentDiskNotes(ctx, m.deps, m.disk, m.handle.Record(), report)
+	if err != nil {
+		return aj.Verification{}, err
+	}
+	if removed {
+		if report, err = m.deletionAudit(ctx); err != nil {
+			return aj.Verification{}, err
+		}
+	}
+	verification, err := m.judgeDeletion(ctx, report)
+	if err != nil && unsettled != nil {
+		return verification, fmt.Errorf("%w; every VM keeps the disk's notes while step %s (%s) of the record's active attempt is %s",
+			err, unsettled.ID, unsettled.Kind, unsettled.State)
+	}
+	return verification, err
+}
+
+// deletionAudit runs the allocation audit over every node the record's steps
+// name.
+func (m *managedDiskLifecycle) deletionAudit(ctx context.Context) (StorageAllocationAudit, error) {
 	nodes := map[string]bool{}
 	record := m.handle.Record()
 	for stepIndex := range record.Steps {
@@ -379,10 +416,12 @@ func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verificati
 		nodeList = append(nodeList, node)
 	}
 	sort.Strings(nodeList)
-	report, err := AuditStorageAllocations(ctx, m.deps, m.journal, nodeList)
-	if err != nil {
-		return aj.Verification{}, err
-	}
+	return AuditStorageAllocations(ctx, m.deps, m.journal, nodeList)
+}
+
+// judgeDeletion certifies the disk's absence from report, or refuses when the
+// audit is gated or still finds anything of the allocation.
+func (m *managedDiskLifecycle) judgeDeletion(ctx context.Context, report StorageAllocationAudit) (aj.Verification, error) {
 	if err := storageAuditGateError(ctx, m.deps, "delete_disk", report, storageAuditGateAll); err != nil {
 		return aj.Verification{}, err
 	}
@@ -474,12 +513,6 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 		return errors.Join(refusal, handle.Close(), journal.Close())
 	}
 	if err := storageLifecycleSettled(handle.Record()); err != nil {
-		return errors.Join(err, handle.Close(), journal.Close())
-	}
-	// A renamed disk's allocation entry can outlive its volume on the VM the
-	// disk was moved off, and the completion audit would count it as the
-	// disk's, so it comes off before the audit runs.
-	if err := removeAbsentDiskNotes(ctx, deps, rd, handle.Record()); err != nil {
 		return errors.Join(err, handle.Close(), journal.Close())
 	}
 	return m.finish(ctx, nil, true)

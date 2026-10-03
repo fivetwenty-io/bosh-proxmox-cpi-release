@@ -52,6 +52,9 @@ type tailWrites struct {
 	// is served, and an error it returns is the read's answer in place of the
 	// identity.
 	identityRead func() error
+	// malformNext makes the next read of 777's pending view come back with a
+	// row that isn't an object.
+	malformNext bool
 }
 
 // tailWritePVE is the stranded-disk client with 777's description writes
@@ -181,6 +184,10 @@ func (n tailWriteNodes) ListCertificatesInfo(ctx context.Context, node string) (
 
 func (n tailWriteNodes) ListQemuPending(ctx context.Context, node, vmidText string) (*nodes.ListQemuPendingResponse, error) {
 	resp, err := n.Service.ListQemuPending(ctx, node, vmidText)
+	if vmidText == "777" && n.w.malformNext {
+		n.w.malformNext = false
+		resp, err = &nodes.ListQemuPendingResponse{json.RawMessage(`[1]`)}, nil
+	}
 	if vmidText == "777" && n.w.afterSourceRead != nil {
 		n.w.afterSourceRead()
 	}
@@ -531,26 +538,32 @@ func (s *strandedDisk) requireMismatchStays(t *testing.T, id string, entry pve.D
 	}
 }
 
-// TestDetachTailOtherHolderStillRefuses is a control. When a VM other than
-// the source still carries the allocation's entry, the tail leaves it alone,
-// and deletionProof still refuses.
-func TestDetachTailOtherHolderStillRefuses(t *testing.T) {
+// TestDetachTailOtherHolderWithoutVolumeHealsAndDeletes covers a VM other than
+// the source that carries the allocation's entry, names the volume nowhere,
+// and is named by no record. The tail leaves 778 alone, and delete_disk's
+// absence path removes 778's entry before the completion audit, so the record
+// ends Deleted.
+func TestDetachTailOtherHolderWithoutVolumeHealsAndDeletes(t *testing.T) {
 	captureParkerPoolSweep(t)
 	s, id, _ := buildLatentTailDisk(t)
 	s.seedSourceEntry(t, 778, id)
-	if err := deleteDiskAt(t, context.Background(), s.deps, s.cid); err == nil {
-		t.Fatal("delete_disk certified absence while 778 carries the allocation's entry")
+	writes := 0
+	s.client.afterConfigWrite = func(vmid int) {
+		if vmid == 778 {
+			writes++
+		}
 	}
-	if !s.hasEntry(778) {
-		t.Fatal("778's entry was removed")
+	if err := deleteDiskAt(t, context.Background(), s.deps, s.cid); err != nil {
+		t.Fatalf("delete_disk with a stale entry on 778: %v", err)
 	}
-	record, err := s.journal.Inspect(id)
-	if err != nil {
-		t.Fatal(err)
+	if s.hasEntry(778) {
+		t.Fatal("778 still carries the allocation's entry")
 	}
-	if record.State == aj.Deleted {
-		t.Fatal("the record ended Deleted while 778 carries an entry for it")
+	if writes != 1 {
+		t.Fatalf("778 was written %d times, want once", writes)
 	}
+	s.requireSourceClean(t)
+	s.requireRecord(t, id, aj.Deleted)
 }
 
 // countSteps counts the record's steps whose kind ends with suffix and that

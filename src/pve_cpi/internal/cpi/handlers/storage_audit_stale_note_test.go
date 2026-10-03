@@ -1,20 +1,23 @@
 package handlers
 
-// A renamed disk whose delete_disk an earlier release refused at its
-// completion audit can still carry its allocation entry on the VM it was
-// moved off, under its old name, after its volume is gone. When another disk
-// holds the old name on a slot of that VM, a retry reaches delete_disk's
-// absence path, which removes that entry, and the attached-disk notes that
-// map to the disk's own CID, in one write pinned to the digest of its read,
-// before the completion audit runs. Most rows run that retry with a
-// hand-attached volume on the old name. The last row leaves the old name
-// free and shows that the retry still refuses.
+// An earlier release may have refused delete_disk for a renamed disk at its
+// completion audit. That disk can still carry its allocation entry on the VM
+// it was moved off, under its old name, after its volume is gone. A retry
+// reaches delete_disk's absence path. That path removes the entry and the
+// attached-disk notes that map to the disk's own CID in one write, pinned to
+// the digest of its read, before the completion audit runs. Most rows run
+// that retry with a hand-attached volume on the old name. The last row leaves
+// the old name free, and the retry heals it the same way.
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -298,21 +301,109 @@ func descriptionNotesText(t *testing.T, f digestManaged) string {
 	return text.String()
 }
 
-// TestDeleteDiskStaleNoteWithoutHolderStillRefuses is the disk's own stale
-// entry and attached-disk note on 777 with no other disk on the old name. The
-// removal covers only an old name that another disk holds on a slot, so the
-// retry writes nothing to 777, refuses at its completion audit, and leaves
-// the record in reconciliation_required with both notes in place.
-func TestDeleteDiskStaleNoteWithoutHolderStillRefuses(t *testing.T) {
+// TestDeleteDiskStaleNoteWithoutHolderHealsOnRetry covers the disk's own stale
+// entry and attached-disk note on 777 with no other disk on the old name,
+// which is the plain shape of a delete refused after its volume is gone. The
+// retry removes both notes in one write and ends Deleted, and the rest of
+// 777's configuration stays as it was.
+func TestDeleteDiskStaleNoteWithoutHolderHealsOnRetry(t *testing.T) {
 	s := newStaleNote(t, false, true)
-	if err := s.deleteDisk(t); err == nil {
-		t.Fatal("retried delete_disk with the stale entry and a free old name succeeded, want a refusal")
+	if err := s.deleteDisk(t); err != nil {
+		t.Fatalf("retried delete_disk with the stale entry and a free old name: %v", err)
 	}
-	s.requireState(t, aj.ReconciliationRequired)
-	if notes := descriptionNotes(t, s.f.client.state.configs[777]); fmt.Sprint(notes) != fmt.Sprint(s.before) {
-		t.Fatalf("777's notes went from %v to %v, want them left as they were", s.before, notes)
+	s.requireState(t, aj.Deleted)
+	cfg := s.f.client.state.configs[777]
+	notes := descriptionNotes(t, cfg)
+	for _, note := range []string{"bosh_disk_allocations/" + s.key, "bosh_attached_disks/" + s.key} {
+		if _, found := notes[note]; found {
+			t.Fatalf("777 still carries %s", note)
+		}
 	}
-	if s.writes != 0 {
-		t.Fatalf("the retry wrote 777 %d times, want none", s.writes)
+	if len(notes) != len(s.before)-2 {
+		t.Fatalf("777's notes went from %v to %v, want only the disk's two gone", s.before, notes)
+	}
+	if rest := configWithoutNotes(cfg); rest != s.rest {
+		t.Fatalf("777's config changed beyond its notes:\nbefore %s\nafter  %s", s.rest, rest)
+	}
+	if s.writes != 1 {
+		t.Fatalf("the retry wrote 777 %d times, want once", s.writes)
+	}
+}
+
+// TestDeleteDiskStaleNoteRetryCreatedDiskHeals covers a disk that create_disk
+// made on a retry. PVE rejected the first create before it ran, so the
+// record's first attempt closed with proof that it left nothing behind, and
+// its create step stays planned for good. That step can't put the disk
+// anywhere and can never settle, so the retry removes the stale notes from
+// 777 in one write and ends Deleted.
+func TestDeleteDiskStaleNoteRetryCreatedDiskHeals(t *testing.T) {
+	s := newStaleNote(t, false, false)
+	record, err := s.f.journal.Inspect(s.f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, _ = withRejectedFirstAttempt(t, s.f.id, record)
+	rewriteJournalRecord(t, s.f.deps, s.f.id, record)
+	if err := s.deleteDisk(t); err != nil {
+		t.Fatalf("retried delete_disk of a disk created on a retry: %v", err)
+	}
+	s.requireDeleted(t)
+	if s.writes != 1 {
+		t.Fatalf("the retry wrote 777 %d times, want once", s.writes)
+	}
+}
+
+// withRejectedFirstAttempt returns record as a create_disk retry leaves it
+// after PVE rejected the first create before it ran. The first attempt closed
+// with proof that it left nothing behind, and it holds the create step, which
+// stays planned for good. Every step the record already had moves to the
+// second attempt. The function also returns the create step that it adds, so a
+// caller can tell that step from the others.
+func withRejectedFirstAttempt(t *testing.T, id string, record aj.Record) (aj.Record, aj.Step) {
+	t.Helper()
+	if len(record.Attempts) > 1 || len(record.Steps) == 0 {
+		t.Fatalf("record %s has %d attempts and %d steps, want one attempt with steps", id, len(record.Attempts), len(record.Steps))
+	}
+	evidenceID, evidenceJSON, err := aj.VerificationEvidence(map[string]any{"operation": "validated pre-execution rejection", "allocation_id": id, "absence": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := aj.AttemptVerification{Verification: aj.Verification{EvidenceID: evidenceID, EvidenceJSON: evidenceJSON, Complete: true, AbsenceVerified: true, ArtifactDispositionVerified: true}, OutcomesKnown: true, NoSubmissionVerified: true}
+	plan := record.ActivePlan()
+	rejected := aj.Step{ID: "rejected-create", Kind: record.Steps[0].Kind, Target: record.Steps[0].Target, State: aj.Planned}
+	steps := slices.Clone(record.Steps)
+	for i := range steps {
+		steps[i].Attempt = 1
+	}
+	record.Steps = append([]aj.Step{rejected}, steps...)
+	record.Attempts = []aj.Attempt{{Number: 0, Plan: plan, Completion: &proof}, {Number: 1, Plan: plan, Admission: &proof}}
+	record.Verifications = append(slices.Clone(record.Verifications), proof.Verification)
+	return record, rejected
+}
+
+// rewriteJournalRecord writes record over id's record file without going
+// through the journal's save gate, so the record reads back the way one that
+// an earlier release left behind does.
+func rewriteJournalRecord(t *testing.T, deps Deps, id string, record aj.Record) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(deps.Config.StorageAllocationJournalDir, "*", "allocation-"+id+".json"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("want one record file for %s, got %v (%v)", id, matches, err)
+	}
+	info, err := os.Stat(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	encoded, err := json.Marshal(map[string]any{"version": aj.Version, "sha256": hex.EncodeToString(sum[:]), "payload": json.RawMessage(payload)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(matches[0], encoded, info.Mode().Perm()); err != nil {
+		t.Fatal(err)
 	}
 }
