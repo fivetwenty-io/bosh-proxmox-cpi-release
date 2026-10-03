@@ -1197,6 +1197,232 @@ We let the pending change apply. When VM `<N>` is running, we stop it at a conve
 
 We don't revert the pending delete, even though `detach_disk` reverts its own pending deletes. A revert puts the disk back on the VM, while the Director still wants it gone. The next `delete_disk` would then find an ordinary holder, which only the optional lock guard protects, and it would delete the volume from under the running VM. `detach_disk` reverts for the opposite reason, because there the Director still believes the disk is attached, and the revert keeps the disk where the Director expects it.
 
+### A transfer resume can't prove which volume is the disk
+
+**Symptom**
+
+```text
+update_disk: resume interrupted transfer for disk <cid>: transfer resume: disk <stable id> has an intent record on parker vmid <P> (node <node>, slot "<slot>", recorded volid "<volid>", source "<N>"), but <finding>, so the resume can't prove which volume is this disk. It moved nothing and wrote no serial; see "A transfer resume can't prove which volume is the disk" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+```
+
+`detach_disk`, `attach_disk`, `resize_disk`, `snapshot_disk`, `set_disk_metadata`, and `delete_disk` give the same refusal with their own name in front, and so does `delete_vm` when it keeps a legacy ephemeral disk. For a journal-managed disk, the identity check that every disk call runs first, `has_disk` included, tries to finish the move by claiming its landing, and it gives the same refusal with the call's name in front. The error isn't retriable, because a retry reads the same state and reaches the same answer.
+
+`detach_disk` and `attach_disk` apply a pending delete they find on a stopped VM `<N>` before they move the disk. When the check refuses after that, the error says `It applied the pending delete of <slot> on source vm <N>, but it moved nothing and wrote no serial` in place of `It moved nothing and wrote no serial`. PVE would have applied that delete at the VM's next start anyway.
+
+When a read the check needs fails, the error is retriable, and it names the read that failed:
+
+```text
+update_disk: resume interrupted transfer for disk <cid>: transfer resume: read source vm <M> of disk <other id>'s transfer: <error>
+```
+
+The Director retries it, and the next attempt reads again. A read that fails in a way a retry can't change, such as a configuration that PVE returns malformed, keeps its permanent class. Every other refusal in this section is permanent, and when one names another disk's record, it doesn't go away by waiting. We rerun the other disk's operation, or we prove its record stale as the Fix below describes, and then we rerun this disk's operation.
+
+**Diagnosis**
+
+The disk's move to parker `<P>` stopped partway, and the CPI tried to finish it before it acted on the disk. A move that lands on the parker renames the volume for the parker, and the serial that ties the volume to the disk's stable ID is written in a later step. When the CPI stops between those two steps, the parker holds a volume named for the parker with no serial, and the parker's record still names the old volume `<volid>`. That old name is then free on VM `<N>`, and another disk can take it there and be left on one of `<N>`'s unused entries by its own unfinished detach. Neither the unused entry nor the landed volume carries a serial, so the CPI can no longer tell the two disks apart from VM `<N>` alone.
+
+Before it moves a volume or writes the disk's serial onto one, the CPI checks the parker and the rest of the cluster, and `<finding>` names the check that failed:
+
+- `parker vmid <P> also keeps an unfinished transfer record of disk <other id> naming slot "<slot>"`
+
+  Another disk's transfer to the same parker names the slot this record names, and neither transfer has written its serial yet. A volume that landed on that slot may be either disk's. The CPI never gives two unfinished transfers the same slot, so this state comes from transfers that started on an older release.
+
+- `<key> of parker vmid <P> holds <volume>, a volume named for the parker with no serial, while the record names slot "<slot>"`
+
+  A volume landed on a slot other than the one this record names, and no other disk whose move is proved accounts for it. It may be this disk's landing or another disk's. When a resume finds this record's slot taken and falls back to another one, it writes the new slot into the record before it moves the volume, so this state comes from an older release's fallback or from a hand change.
+
+- `<volume> on <key> is named for the parker, while this disk's recorded volume <volid> isn't named for its source vm <N>, so this disk's park attaches that volume under its own name and <volume> isn't this disk's (disk cid <cid>)`
+
+  This disk's recorded volume isn't named for VM `<N>`, so VM `<N>` never owned it, and the disk's park attaches it to the parker under its recorded name by editing the parker's configuration. A volume that PVE renamed for the parker therefore can't be this disk's.
+
+- `parker vmid <P> holds more than one volume named for it with no serial`
+
+  Two landings are waiting on the parker, and the CPI can't tell which one is this disk.
+
+- `<key> of parker vmid <P> has a pending change to volume <volume>`, or `<key> of source vm <N> has a pending change to volume <volid>`
+
+  A configuration change on that key hasn't applied yet, so the key may not name the volume once it does.
+
+- `disk keys <keys> of source vm <N> all name volume <volid>`
+
+  More than one key of VM `<N>` names the recorded volume.
+
+- `<key> of source vm <N> names volume <volid> with another disk's serial <serial>`
+
+  The volume under the recorded name already belongs to another disk.
+
+- `parker vmid <other> keeps a record of the disk's transfer as well as parker vmid <P>`
+
+  Two parkers each keep a record of this disk, and the CPI can't tell which one received it.
+
+- `vm <M> holds the disk's serial on <key>`, or `parker vmid <M> names volume <volume> on <key>`
+
+  Another guest already carries this disk's serial, or another parker names the volume the CPI was about to take.
+
+- `vm <M> names volume <volid> on <key>`
+
+  VM `<N>` has let go of the recorded volume, but guest `<M>` still names it. Attaching the volume to the parker would give it two owners, and destroying `<M>` would then free it.
+
+- `source vm <N> has no configuration on node <node> and the cluster finds it on node <other node>`
+
+  VM `<N>` moved to another node, and the volume went with it. The CPI can only move a disk between guests on one node, so it doesn't treat the VM as gone.
+
+**Whose landing it is**
+
+A landing carries no serial, so the CPI works out whose landing it is from the parker's records, their source VMs, and storage. Each record names its disk's old volume, the VM the disk came from, and the slot its move aims at. The CPI counts a record as moved only when two things hold together. First, the source VM exists and doesn't name the old volume anywhere, whether in its current configuration, its pending changes, its unused entries, or its snapshots. Second, the old volume is either gone from storage or named by another guest, which shows that its name was reused. The CPI proves a volume gone by listing everything on the storage from the source's node, and it doesn't take an empty listing or a failed lookup of the one volume as proof. A record reads as unmoved when its source names the old volume on an unused entry, or on a slot with no serial or with that disk's own serial. Every other answer leaves the record's move unknown, and that includes a source VM that's gone from the cluster, a record that names no source VM, and an old volume that still exists while no guest names it. A record whose old volume isn't named for its source VM, or that the parker already names, never owns a volume renamed for the parker, because its park attaches the old volume under its own name.
+
+The CPI reads each source VM once per attempt, on the node where the cluster finds it, so a source that migrated to another node is an ordinary read. A landing on the slot of a record whose move is proved belongs to that record's disk, and the CPI leaves it alone. In every other state where a landing might belong to another disk, the CPI refuses permanently with a message that ends in `(audit required)` and names both disks' CIDs and both slots, because nothing in its metadata says whose landing it is. Five states get that refusal:
+
+- `<volume> on <key> sits on the slot disk <other id>'s unfinished record names (disk cid <other cid>), but <its status>, so it can't count as that disk's, and this disk's record (disk cid <cid>) names slot "<slot>" (audit required)`
+
+  A volume landed on another record's slot, but that record's move isn't proved. The landing may be that disk's, or it may be this disk's, landed there by an older release's fallback.
+
+- `disk <other id>'s unfinished record (disk cid <other cid>, slot "<other slot>") reads as moved, because <its status>, and no landing on its slot accounts for it, so <volume> on <key> may be that disk's and not this disk's (disk cid <cid>, slot "<slot>") (audit required)`
+
+  Another disk's move is proved, but its slot holds no landing. An older release could land a disk on another free slot when its recorded slot was taken, so any landing on the parker may be that disk's. A stale record whose old volume is gone gives the same picture.
+
+- `<volume> on <key> counts as disk <other id>'s (disk cid <other cid>, slot "<other slot>") only because its record reads as moved, since <its status>, and no serial says so, so <landing> on <slot> may be that disk's and not this disk's (disk cid <cid>, slot "<slot>") (audit required)`
+
+  Two disks whose moves are proved each left a landing with no serial. If each landing sits on its own disk's slot, the slots give the right answer. But two fallbacks from an older release that took each other's slots leave exactly the same picture, and the CPI can't tell the two cases apart. So the CPI won't hand out the landings by slot alone, and a double crash, where two transfers to one parker both landed and both stopped before their serial writes, needs an operator as well.
+
+- `<volume> on <slot>, the slot this record names, may be this disk's (disk cid <cid>) or disk <other id>'s (disk cid <other cid>), because <this disk's status>, while disk <other id>'s unfinished record names slot "<other slot>", which holds no landing, and <its status> (audit required)`
+
+  A volume landed on this record's slot, but this disk's own move isn't proved, and another disk's record reads as unmoved or unknown while its slot stays empty. The landing may be this disk's, with a new disk holding this disk's freed name on VM `<N>`. It may also be the other disk's, landed here by an older release, with a new disk holding that disk's freed name on VM `<M>`. When this disk's source names its old volume only under another disk's serial, the name was reused, so the CPI counts this disk's move as proved and claims the landing.
+
+- `disk <other id>'s unfinished record (disk cid <other cid>, slot "<other slot>") names the same source vm <N> and recorded volume <volid> as this disk's record (disk cid <cid>, slot "<slot>"), so one of the two names a volume that took the other's old name (audit required)`
+
+  Two unfinished records name the same old volume on the same VM. That happens only when one disk's move freed the name, a new disk took it, and the new disk's own transfer started. The CPI gives this refusal whether or not a landing sits on the parker.
+
+The `<its status>` and `<this disk's status>` parts say what the CPI read for that record:
+
+| Status | What it means |
+|--------|---------------|
+| `its source vm <M> names its recorded volume <volid> nowhere, and storage <storage> no longer holds it` | Moved |
+| `its source vm <M> names its recorded volume <volid> nowhere, and vm <V> names it on <key> now` | Moved |
+| `its source vm <M> still names its recorded volume <volid> on <keys>` | Unmoved |
+| `its source vm <M> names its recorded volume <volid> on <keys> under another disk's serial <serial>` | Unknown |
+| `snapshot "<name>" of its source vm <M> names its recorded volume <volid> on <key>` | Unknown |
+| `its source vm <M> is gone from the cluster` | Unknown |
+| `its record names no source vm and volume` | Unknown |
+| `its recorded volume <volid> names no storage` | Unknown |
+| `its recorded volume <volid> still exists on storage <storage> and no guest names it` | Unknown, because the transfer may be released and not yet attached, or the record may be stale |
+| `vm <V> carries its disk's serial on <key>, which shows its record is stale` | Unknown, because that disk's transfer finished on VM `<V>`, and its record outlived it |
+| `its recorded volume <volid> isn't named for its source vm <M>, so its park attaches it under that name` | Never the owner of a volume renamed for the parker |
+| `parker vmid <P> names its recorded volume <volid>` | Never the owner of a volume renamed for the parker |
+
+When VM `<N>` or the parker changes between the check and the move, the move doesn't go out. The operation then fails with a retriable error that names the digest or the volume that changed, and the next attempt checks again.
+
+**What the check doesn't cover**
+
+Two states still pass the check, and both follow a hand change while the parker holds no landing and no guest carries the disk's serial. The record's old name is then all the CPI has to go on. In the first, someone removed the disk's unused entry from VM `<N>` by hand, and PVE freed the disk's volume. In the second, someone destroyed VM `<N>` by hand, and PVE later gave its VM ID to a new VM. Either way, another disk that later takes the same name on a VM with that ID passes the check, and the CPI moves that disk onto the parker and writes this disk's serial onto it. Closing these gaps takes a size or content check that the record would have to carry, and the record doesn't carry one today.
+
+A stale record no longer slips through the check. Suppose an unpark wrote a disk's serial onto a guest and then failed before it removed that disk's record. The record's move reads as proved, so the check could once set aside a landing on the record's slot as belonging to that disk. Now the CPI reads such a record as unknown while any guest carries its disk's serial, and a landing on the record's slot gets the refusal described above, which says that the landing sits on a slot named by disk `<other id>`'s unfinished record. When the guest that carries the serial is the parker itself, another call finished that disk's transfer after the CPI read the parker, so the call gets a retriable error and the next one settles it.
+
+The CPI doesn't settle any of the five `(audit required)` states listed above on its own, so each of them needs an operator.
+
+So while a parker keeps a transfer record for a disk, we don't remove that disk's unused entry from its source VM by hand, and we don't destroy that VM by hand. The record sits in the parker's description under `bosh_parked_disks`, keyed by the stable ID, and the transfer is unfinished while no slot on any guest carries that stable ID as its serial. Removing the entry is right only for the delete described in "delete_disk refuses a disk stranded on an unused entry" above, where no parker keeps a record any more.
+
+**Fix**
+
+We leave the parker, VM `<N>`, and every unused entry as they are, and we don't destroy either VM. Then we read the state the refusal names:
+
+```bash
+qm config <P>
+qm pending <P>
+qm config <N>
+qm pending <N>
+pvesm list <storage> --vmid <P>
+pvesm list <storage> --vmid <N>
+```
+
+When the finding is a pending change, we let the change apply and then rerun the operation. PVE applies it at the VM's next clean stop, or at its next start when the VM is already stopped, as "delete_disk refuses a disk whose slot delete is pending" above describes. The check runs again on the applied state.
+
+Every other finding about a landing means we have to work out whose landing each volume is. The records and their sources tell us which disks a landing could belong to, and the volume's contents decide. We never decide from the records alone, and never from sizes, because the disks of one instance group usually share a size. Every record in parker `<P>`'s description sits under `bosh_parked_disks`, keyed by a stable ID. A record names its disk's old volume as `volid`, the VM the disk came from as `source_vm_cid`, and the slot its move aims at as `slot`:
+
+```bash
+pvesh get /nodes/<node>/qemu/<P>/config --output-format json | jq -r .description
+```
+
+A record's transfer is unfinished while no key of `<P>` carries its stable ID as `serial=`. For each unfinished record, we find the node its source VM is on, and then we read the VM and its snapshots there:
+
+```bash
+pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.vmid == <source_vm_cid>) | .node'
+qm config <source_vm_cid>
+qm pending <source_vm_cid>
+qm listsnapshot <source_vm_cid>
+qm config <source_vm_cid> --snapshot <snapshot name>
+```
+
+We run the `qm` commands on the node the first command prints, and we read every snapshot `qm listsnapshot` shows. Then we check whether the record's `volid` is still on its storage. We list the whole storage on that node, because a lookup of the one volume can fail on file storage even while the volume is missing. We also check that the listing isn't empty, because a storage that didn't answer can list nothing at all:
+
+```bash
+pvesm list <storage> > content.txt
+wc -l content.txt
+awk -v volid='<volid>' '$1 == volid' content.txt
+```
+
+We sort each record by the rule the CPI uses. It has moved when its source exists and names the `volid` nowhere in its configuration, its pending changes, its unused entries, or its snapshots, and the `volid` is either missing from the full listing or named by another guest. It hasn't moved when its source names the `volid` on an unused entry, or on a slot with no serial or with the record's own stable ID. When the `volid` still exists and no guest names it, the transfer was released and hasn't attached yet, or the record is stale, and the paragraphs below tell those apart. Anything else leaves the record open, and its disk stays a candidate for every landing.
+
+That sorting narrows the candidates, but it never settles a landing on its own. Even when exactly one record has moved and the parker holds exactly one landing, a stale or released record can look like the moved one, and a serial written from the records alone would give one disk's identity to another disk's data. So we find which instance each disk CID belongs to with `bosh -d <deployment> instances --details`, and then we inspect each landing and each volume the sources name, read-only on its node, without attaching any of them to a guest. On file or block storage we map a volume like this:
+
+```bash
+pvesm path <volume>
+losetup --find --show --read-only --partscan <path>
+mount -o ro,noload /dev/<loop device>p1 /mnt/inspect
+```
+
+On Ceph RBD storage, `pvesm path` doesn't give a path `losetup` can use, so we map the image read-only with `rbd map --read-only <pool>/<image>` and mount the partition of the device it prints with `-o ro,noload`. On any other network storage we use that storage's own read-only mapping, and we never map a volume read-write while we inspect it.
+
+The persistent disk's data sits under the instance's job directories, which tell us which instance group the volume belongs to. We unmount the volume and remove the mapping, with `losetup --detach /dev/<loop device>` or `rbd unmap /dev/<rbd device>`, before we look at the next one. Then we settle one landing at a time. When the contents tie a landing to one record's disk, we write that disk's serial onto it. If the landing sits on a bus slot, such as `scsi4`, we write the serial where it sits. If it sits on one of the parker's unused entries, we attach it with the serial to the slot the record names when that slot is free, or to another free bus slot when it isn't. Attaching it this way also drops the unused entry:
+
+```bash
+qm set <P> --<slot> <volume>,serial=<that record's stable id>
+```
+
+We never put a serial on an unused entry, because PVE keeps no options there. Then we rerun that disk's operation, and the CPI finds the serial on the parker and finishes the transfer from it. We read the parker and every source again before we settle the next landing, and each record we haven't settled resumes from its own source on its next operation. A volume whose contents tie it to no record's disk, such as a new disk's, stays where it is. Until the contents tie a landing to one disk, every operation it blocks stays refused, and waiting loses nothing.
+
+A record can be stale. The CPI removes a record when it unparks a disk, but a failed read or write there leaves the record behind, on this parker or on another one. A stale record looks like an unfinished transfer, and it can name the slot this disk's record names. The record of disk `<other id>` is stale when its stable ID is the serial on a slot of a guest other than the parker, because that disk's transfer finished there. We search every guest in the cluster for it:
+
+```bash
+pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.type == "qemu") | "\(.node) \(.vmid)"' | while read -r node vmid; do pvesh get /nodes/$node/qemu/$vmid/config --output-format json | grep -q 'serial=<other id>' && echo "$node $vmid"; done
+```
+
+The record on parker `<P>` is also stale when four things hold together. First, no key of `<P>` carries `serial=<other id>`. Second, the record's source is gone or names its `volid` nowhere. Third, the full listing of its storage doesn't show the `volid`. Fourth, the contents tie every landing on the parker to another disk. When the `volid` still exists and no guest names it, the record isn't stale. Its transfer was released and hasn't attached yet, and removing the record would leave the volume with no disk CID that resolves to it. We leave that record in place, settle the landings on the parker first, and then rerun that disk's operation, which attaches the volume under its recorded name. If none of these proofs holds, the record isn't stale, and we leave it in place.
+
+When the finding names a second parker's record, that record may be stale for the same reason. Before we touch it, we read parker `<other>`:
+
+```bash
+qm config <other>
+qm pending <other>
+```
+
+The record is stale only when no key of `<other>` names a `vm-<other>-disk-*` volume without a `serial=bpd-` option, and no key carries `serial=<stable id>`. If either shows up, the record isn't stale, and we leave it in place.
+
+No command-line tool edits parker records, so we remove a stale record by editing the description of the parker `<Q>` that keeps it. We make the edit while no deploy touches that parker, for example while `bosh tasks` shows no running task, because the CPI rewrites the same description when it parks, unparks, or transfers a disk there, and the later write undoes the earlier one. We save the description first:
+
+```bash
+pvesh get /nodes/<Q node>/qemu/<Q>/config --output-format json | jq -r .description > description.txt
+```
+
+In `description.txt` we delete the `"<stale id>": {...}` entry from the `bosh_parked_disks` object inside the `<!--BOSH:...-->` block, together with the comma that joins it to a neighboring entry. We keep every other entry and all the text outside the block exactly as it was, and we check that the block still holds valid JSON. Then we write it back, read it back, and rerun the operation:
+
+```bash
+qm set <Q> --description "$(cat description.txt)"
+pvesh get /nodes/<Q node>/qemu/<Q>/config --output-format json | jq -r .description
+```
+
+A landing on one of the parker's unused entries whose contents tie it to no transfer's disk may be what's left of a `delete_disk` that stopped after it took a parked disk off its slot and before PVE freed the volume. That delete leaves the disk's record in place, and the record's slot on `<P>` is empty. We list the disks the Director is deleting with `bosh disks --orphaned` and compare their disk CIDs with the `disk_cid` of each record whose slot on `<P>` is empty. When one matches, we finish that delete first by rerunning the clean-up, for example with `bosh clean-up --all`, and then we rerun the operation.
+
+When the finding names another guest that holds the serial or names the volume, or another parker that names the volume, the disk may already be somewhere else. We find it with `bosh -d <deployment> instances --details` and the guest's own configuration before we change anything, and we leave every record in place.
+
+When the finding says VM `<N>` has no configuration on the parker's node and the cluster finds it on another node, we migrate nothing yet, because PVE reuses free VM IDs, and the guest it found may have nothing to do with this disk. We read that guest on the node the finding names:
+
+```bash
+pvesh get /nodes/<other node>/qemu/<N>/config --output-format json
+```
+
+When its name and description show that it's the VM this disk came from, and one of its keys still names `<volid>`, the VM moved with the disk. We then migrate it back to the parker's node and rerun the operation. When it's another VM, or none of its keys names `<volid>`, the disk's source is gone. The disk's old volume may then have landed on the parker, gone with the destroyed VM, or survived on its storage because VM `<N>` never owned it. We list the storage as above. When the `volid` is still there and no guest names it, we leave the record in place, settle any landing on the parker, and rerun the operation, which attaches the volume under its recorded name. Otherwise we work out whose landing each volume is from its contents, as above. When no landing on the parker is this disk's and no guest carries its serial, the record is stale, and we remove it as above.
+
 ## Network, bridge, and SDN failures
 
 ### Bridge not found

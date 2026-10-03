@@ -99,3 +99,38 @@ func TestRecordedLandingsLeaveOutALandingAMoveTookAway(t *testing.T) {
 		})
 	}
 }
+
+// TestRecordedLandingsLeaveOutALandingAMigrateTookAway covers a migrate after
+// the landing. An observed migrate that starts from the landed name takes the
+// VM that held the landing off its node, so the landing is left out, whatever
+// node the migrate ran on and whatever name it landed under. A migrate that
+// holds only the name it started from records no landing, a migrate that
+// started from another name leaves the landing alone, and so does one the
+// record never observed.
+func TestRecordedLandingsLeaveOutALandingAMigrateTookAway(t *testing.T) {
+	const moveKind = "lifecycle_detach_disk_Nodes_CreateQemuMoveDisk"
+	const migrateKind = "lifecycle_update_disk_Nodes_CreateQemuMigrate"
+	const from, landed = "a:vm-777-disk-1", "a:vm-90000-disk-3"
+	landing := aj.Step{ID: "landed", Kind: moveKind, State: aj.Observed, Target: aj.Target{Node: "pve1", VMID: 777}, VolIDs: []string{from, landed}}
+	want := pve.RecordedLanding{SourceVMID: 777, From: from, To: landed}
+	for _, tc := range []struct {
+		name  string
+		later aj.Step
+		kept  bool
+	}{
+		{"migrated to another node", aj.Step{State: aj.Observed, Target: aj.Target{Node: "pve2", VMID: 90000}, VolIDs: []string{landed, landed}}, false},
+		{"migrated under another name", aj.Step{State: aj.Observed, Target: aj.Target{Node: "pve2", VMID: 90000}, VolIDs: []string{landed, "a:vm-90000-disk-7"}}, false},
+		{"holds only its start", aj.Step{State: aj.Observed, Target: aj.Target{Node: "pve2", VMID: 90000}, VolIDs: []string{landed}}, true},
+		{"started from another name", aj.Step{State: aj.Observed, Target: aj.Target{Node: "pve2", VMID: 90000}, VolIDs: []string{"a:vm-90000-disk-9", "a:vm-90000-disk-9"}}, true},
+		{"not observed", aj.Step{State: aj.Submitted, Target: aj.Target{Node: "pve2", VMID: 90000}, VolIDs: []string{landed, landed}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			later := tc.later
+			later.ID, later.Kind = "later", migrateKind
+			got := recordedLandings(aj.Record{Steps: []aj.Step{landing, later}}, false)
+			if kept := slices.Contains(got, want); kept != tc.kept {
+				t.Fatalf("recorded landings = %+v, want the landing %+v kept %v", got, want, tc.kept)
+			}
+		})
+	}
+}

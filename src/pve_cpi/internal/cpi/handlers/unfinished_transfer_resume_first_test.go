@@ -433,6 +433,21 @@ func requireTransferUnfinished(t *testing.T, f digestManaged, parker int, token 
 	}
 }
 
+// requireTransferFinalized fails unless the parker's record for token names
+// the volume that landed, which is the volume the resume claimed, because that
+// shows the claim finalized the transfer.
+func requireTransferFinalized(t *testing.T, f digestManaged, parker int, token, landed string) {
+	t.Helper()
+	_, raw := pve.ParseSentinel(pve.DescriptionFromConfig(f.client.state.configs[parker]))
+	var disks map[string]map[string]any
+	if err := json.Unmarshal(raw["bosh_parked_disks"], &disks); err != nil {
+		t.Fatal(err)
+	}
+	if volid, _ := disks[token]["volid"].(string); volid != landed {
+		t.Fatalf("parker %d's record for %s names %q, want the finalized record naming %s", parker, token, volid, landed)
+	}
+}
+
 // resumeRun is one call through the resume seam, with the mode it ran in
 // and the answer it gave.
 type resumeRun struct {
@@ -470,34 +485,69 @@ func requireClaimOnlyMove(t *testing.T, run resumeRun) {
 // TestManagedIdentityResumeIsClaimOnly covers a volume that takes the
 // record's old name on 777 after the identity check saw the name gone and
 // before the resume reads the source. The full resume would move that volume
-// onto the parker, unjournaled, from a read such as has_disk. The identity
-// check's resume is claim-only, so it stops at the move window, sends no
-// move, and writes no serial. The check then resolves the disk once more,
-// finds the old name, and has_disk answers from there, leaving the transfer
-// for the next call that changes the disk.
+// onto the parker, unjournaled, from a read such as has_disk, if it ever
+// reached its move window. While the parker holds the disk's landing, the
+// resume's identity proof never runs the move window, because PVE renamed the
+// landed volume off the old name and another disk may hold that name now. So
+// it claims the landing, which the disk's record proves, and leaves the volume
+// on 777 alone. Once the landing is gone, the move window is all that's left,
+// and the identity check's resume is claim-only, so it stops at the move
+// window, sends no move, and writes no serial. The check then resolves the
+// disk once more, finds the old name, and has_disk answers from there,
+// leaving the transfer for the next call that changes the disk.
 func TestManagedIdentityResumeIsClaimOnly(t *testing.T) {
 	captureParkerPoolSweep(t)
-	f := digestManagedFixture(t)
-	parker, token, _ := landedBeforeSerial(t, f)
-	runs := recordResumes(t, func(int) {
-		f.client.state.configs[777]["unused7"] = f.volume
-		f.client.state.volumes[f.volume] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
+	t.Run("landing on the parker", func(t *testing.T) {
+		f := digestManagedFixture(t)
+		parker, token, landed := landedBeforeSerial(t, f)
+		slot := landedSlot(t, f, parker, landed)
+		runs := recordResumes(t, func(int) {
+			f.client.state.configs[777]["unused7"] = f.volume
+			f.client.state.volumes[f.volume] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
+		})
+		result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
+		if len(*runs) != 1 || !(*runs)[0].claimOnly || (*runs)[0].err != nil {
+			t.Fatalf("the resume ran %+v, want one claim-only resume that claims the landing (err = %v)", *runs, err)
+		}
+		if err != nil || result != true {
+			t.Fatalf("has_disk while another volume takes the old name = %v, %v, want true for the landed disk", result, err)
+		}
+		if f.client.moveCalls != 0 {
+			t.Fatalf("has_disk sent %d moves, want none", f.client.moveCalls)
+		}
+		if f.client.state.configs[777]["unused7"] != f.volume {
+			t.Fatalf("777's unused7 = %v, want the volume left where it is", f.client.state.configs[777]["unused7"])
+		}
+		want := []string{strconv.Itoa(parker) + "." + slot}
+		if got := serialSlots(f.client.state.configs, token); !slices.Equal(got, want) {
+			t.Fatalf("the disk's serial is on %v, want only the landing on %v", got, want)
+		}
+		requireTransferFinalized(t, f, parker, token, landed)
 	})
-	result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-	if len(*runs) != 1 {
-		t.Fatalf("the resume ran %d times, want once (err = %v)", len(*runs), err)
-	}
-	requireClaimOnlyMove(t, (*runs)[0])
-	if err != nil || result != true {
-		t.Fatalf("has_disk once the old name is back = %v, %v, want true", result, err)
-	}
-	if f.client.moveCalls != 0 {
-		t.Fatalf("has_disk sent %d moves, want none", f.client.moveCalls)
-	}
-	if f.client.state.configs[777]["unused7"] != f.volume {
-		t.Fatalf("777's unused7 = %v, want the volume left where it is", f.client.state.configs[777]["unused7"])
-	}
-	requireTransferUnfinished(t, f, parker, token)
+	t.Run("no landing on the parker", func(t *testing.T) {
+		f := digestManagedFixture(t)
+		parker, token, landed := landedBeforeSerial(t, f)
+		delete(f.client.state.configs[parker], landedSlot(t, f, parker, landed))
+		runs := recordResumes(t, func(int) {
+			f.client.state.configs[777]["unused7"] = f.volume
+			f.client.state.volumes[f.volume] = &nodes.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
+		})
+		result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
+		if len(*runs) != 1 {
+			t.Fatalf("the resume ran %d times, want once (err = %v)", len(*runs), err)
+		}
+		requireClaimOnlyMove(t, (*runs)[0])
+		if err != nil || result != true {
+			t.Fatalf("has_disk once the old name is back = %v, %v, want true", result, err)
+		}
+		if f.client.moveCalls != 0 {
+			t.Fatalf("has_disk sent %d moves, want none", f.client.moveCalls)
+		}
+		if f.client.state.configs[777]["unused7"] != f.volume {
+			t.Fatalf("777's unused7 = %v, want the volume left where it is", f.client.state.configs[777]["unused7"])
+		}
+		requireTransferUnfinished(t, f, parker, token)
+	})
 }
 
 // nodeUnreachable is the answer pveproxy relays when the node a request is
@@ -975,60 +1025,99 @@ func TestIdentityCheckRefusesARecordNeedingReconciliation(t *testing.T) {
 
 // TestIdentityCheckRefusesADanglingUnusedEntry covers a source VM whose
 // unused0 still names the transfer's old name after storage stopped listing
-// it, the way an entry dangles once someone removes the volume by hand. The
-// identity check's claim-only resume stops at the move, and the check
-// resolves the disk once more. The old name is still gone and nothing
-// changed, so the check refuses for audit, permanently, with the move's
-// reason. A second call gets the same answer, and neither call writes
-// anything.
+// it, the way an entry dangles once someone removes the volume by hand. While
+// the parker holds the disk's landing, the resume's identity proof never runs
+// the move window, so it claims the landing, which the disk's record proves,
+// and leaves the dangling entry alone. Once the landing is gone, the identity
+// check's claim-only resume stops at the move, and the check resolves the
+// disk once more. The old name is still gone and nothing changed, so the
+// check refuses for audit, permanently, with the move's reason. A second call
+// gets the same answer, and neither call writes anything.
 func TestIdentityCheckRefusesADanglingUnusedEntry(t *testing.T) {
 	captureParkerPoolSweep(t)
-	f := digestManagedFixture(t)
-	parker, token, _ := landedBeforeSerial(t, f)
-	if taken, ok := f.client.state.configs[777]["unused0"]; ok {
-		t.Fatalf("777's unused0 already holds %v", taken)
-	}
-	if f.client.state.volumes[f.volume] != nil {
-		t.Fatalf("storage still lists %s", f.volume)
-	}
-	f.client.state.configs[777]["unused0"] = f.volume
-	runs := recordResumes(t, func(int) {})
-	fakeBefore := flowFakeWrites(t, f.client)
-	journalBefore := journalFiles(t, f.deps.Config.StorageAllocationJournalDir)
-	for call := 1; call <= 2; call++ {
-		before := len(*runs)
-		_, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-		if len(*runs) != before+1 {
-			t.Fatalf("has_disk call %d ran the resume %d times, want once (err = %v)", call, len(*runs)-before, err)
+	dangling := func(t *testing.T, f digestManaged) {
+		t.Helper()
+		if taken, ok := f.client.state.configs[777]["unused0"]; ok {
+			t.Fatalf("777's unused0 already holds %v", taken)
 		}
-		requireClaimOnlyMove(t, (*runs)[before])
-		if err == nil || !isTypedCPIError(err) || okToRetryCPIError(err) || !strings.HasPrefix(err.Error(), missingVolumeRefusal) {
-			t.Fatalf("has_disk call %d: error %v, want the permanent missing-volume refusal for audit", call, err)
+		if f.client.state.volumes[f.volume] != nil {
+			t.Fatalf("storage still lists %s", f.volume)
 		}
-		requireText(t, err, fmt.Sprintf("has_disk call %d", call), []string{
-			"move the volume off source vm 777", "storage doesn't list " + f.volume + ", so source vm 777's entry for it may be dangling",
-		})
+		f.client.state.configs[777]["unused0"] = f.volume
 	}
-	if after := flowFakeWrites(t, f.client); after != fakeBefore {
-		t.Errorf("has_disk wrote to PVE\nbefore %s\nafter  %s", fakeBefore, after)
-	}
-	if after := journalFiles(t, f.deps.Config.StorageAllocationJournalDir); !reflect.DeepEqual(after, journalBefore) {
-		t.Error("has_disk changed the journal")
-	}
-	requireTransferUnfinished(t, f, parker, token)
+	t.Run("landing on the parker", func(t *testing.T) {
+		f := digestManagedFixture(t)
+		parker, token, landed := landedBeforeSerial(t, f)
+		slot := landedSlot(t, f, parker, landed)
+		dangling(t, f)
+		runs := recordResumes(t, func(int) {})
+		result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
+		if len(*runs) != 1 || !(*runs)[0].claimOnly || (*runs)[0].err != nil {
+			t.Fatalf("the resume ran %+v, want one claim-only resume that claims the landing", *runs)
+		}
+		if err != nil || result != true {
+			t.Fatalf("has_disk beside a dangling entry = %v, %v, want true for the landed disk", result, err)
+		}
+		if f.client.moveCalls != 0 {
+			t.Fatalf("has_disk sent %d moves, want none", f.client.moveCalls)
+		}
+		if f.client.state.configs[777]["unused0"] != f.volume {
+			t.Fatalf("777's unused0 = %v, want the dangling entry left where it is", f.client.state.configs[777]["unused0"])
+		}
+		want := []string{strconv.Itoa(parker) + "." + slot}
+		if got := serialSlots(f.client.state.configs, token); !slices.Equal(got, want) {
+			t.Fatalf("the disk's serial is on %v, want only the landing on %v", got, want)
+		}
+	})
+	t.Run("no landing on the parker", func(t *testing.T) {
+		f := digestManagedFixture(t)
+		parker, token, landed := landedBeforeSerial(t, f)
+		delete(f.client.state.configs[parker], landedSlot(t, f, parker, landed))
+		dangling(t, f)
+		runs := recordResumes(t, func(int) {})
+		fakeBefore := flowFakeWrites(t, f.client)
+		journalBefore := journalFiles(t, f.deps.Config.StorageAllocationJournalDir)
+		for call := 1; call <= 2; call++ {
+			before := len(*runs)
+			_, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
+			if len(*runs) != before+1 {
+				t.Fatalf("has_disk call %d ran the resume %d times, want once (err = %v)", call, len(*runs)-before, err)
+			}
+			requireClaimOnlyMove(t, (*runs)[before])
+			if err == nil || !isTypedCPIError(err) || okToRetryCPIError(err) || !strings.HasPrefix(err.Error(), missingVolumeRefusal) {
+				t.Fatalf("has_disk call %d: error %v, want the permanent missing-volume refusal for audit", call, err)
+			}
+			requireText(t, err, fmt.Sprintf("has_disk call %d", call), []string{
+				"move the volume off source vm 777", "storage doesn't list " + f.volume + ", so source vm 777's entry for it may be dangling",
+			})
+		}
+		if after := flowFakeWrites(t, f.client); after != fakeBefore {
+			t.Errorf("has_disk wrote to PVE\nbefore %s\nafter  %s", fakeBefore, after)
+		}
+		if after := journalFiles(t, f.deps.Config.StorageAllocationJournalDir); !reflect.DeepEqual(after, journalBefore) {
+			t.Error("has_disk changed the journal")
+		}
+		requireTransferUnfinished(t, f, parker, token)
+	})
 }
 
-// TestIdentityCheckFinishesTheMoveWhenTheOldNameIsBack covers a case where
-// storage doesn't list the transfer's old name when the identity check looks,
-// but lists it again by the time the claim-only resume reads the source VM,
-// which names it on unused7. The resume stops at the move, the check resolves
-// the disk once more and finds the old name, and detach_disk goes on from
-// there. detach_disk's own resume runs inside the disk's lifecycle, moves the
-// volume onto the parker, and finishes the transfer.
+// TestIdentityCheckFinishesTheMoveWhenTheOldNameIsBack covers a transfer
+// whose move never ran. The parker holds no landing, the disk's record holds
+// no move off the old name, and storage doesn't list the old name when the
+// identity check looks. By the time the claim-only resume reads the source
+// VM, storage lists the old name again, and the source names it on unused7.
+// The resume stops at the move, the check resolves the disk once more and
+// finds the old name, and detach_disk goes on from there. detach_disk's own
+// resume runs inside the disk's lifecycle, moves the volume onto the parker,
+// and finishes the transfer. Nothing in the record says the disk ever left
+// that name, so the volume under it is still the disk's.
 func TestIdentityCheckFinishesTheMoveWhenTheOldNameIsBack(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
 	parker, token, landed := landedBeforeSerial(t, f)
+	delete(f.client.state.configs[parker], landedSlot(t, f, parker, landed))
+	delete(f.client.state.volumes, landed)
+	stopBeforeTheMove(t, f)
 	runs := recordResumes(t, func(run int) {
 		if run == 0 {
 			f.client.state.configs[777]["unused7"] = f.volume
@@ -1056,7 +1145,7 @@ func TestIdentityCheckFinishesTheMoveWhenTheOldNameIsBack(t *testing.T) {
 		t.Fatalf("the disk's serial sits on %v, want one slot on parker %d", slots, parker)
 	}
 	moved, _, _ := strings.Cut(f.client.state.configs[parker][strings.TrimPrefix(slots[0], strconv.Itoa(parker)+".")].(string), ",")
-	if moved == landed || moved == f.volume {
+	if moved == f.volume {
 		t.Fatalf("the disk's serial sits on %s, want the volume the resume moved", moved)
 	}
 	_, raw := pve.ParseSentinel(pve.DescriptionFromConfig(f.client.state.configs[parker]))
@@ -1079,13 +1168,39 @@ func TestIdentityCheckFinishesTheMoveWhenTheOldNameIsBack(t *testing.T) {
 	}
 }
 
+// stopBeforeTheMove cuts the disk's record off just before its last move,
+// the detach's move off the old name, so the record reads as a detach that
+// stopped before that move ran. The steps before it stay, including the
+// earlier attach's move that put the disk on 777 under the old name, so the
+// record holds no move off that name. It rewrites the record file the way
+// appendObservedMove does.
+func stopBeforeTheMove(t *testing.T, f digestManaged) {
+	t.Helper()
+	record, err := f.journal.Inspect(f.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := -1
+	for i := range record.Steps {
+		if strings.HasSuffix(record.Steps[i].Kind, "_Nodes_CreateQemuMoveDisk") {
+			last = i
+		}
+	}
+	if last < 0 || len(record.Steps[last].VolIDs) == 0 || record.Steps[last].VolIDs[0] != f.volume {
+		t.Fatalf("the disk's record holds no move off %s to cut: %+v", f.volume, record.Steps)
+	}
+	record.Steps = record.Steps[:last]
+	(&unfiredMove{digestManaged: f}).rewriteRecord(t, record)
+}
+
 // appendObservedMove adds an observed move to the disk's record. The move
-// takes the volume named from off the VM numbered vmid, lands it as to, and
-// carries the target of the record's last move. A handle that Acquire opens
-// can't add a step to a record that went through a crash, so the row rewrites
-// the record file through rewriteRecord, which gives the same result as
-// reading back a record that a release left behind. A to equal to from
-// records a move that PVE refused, which holds only the name it started from.
+// takes the volume that from names off the VM numbered vmid, lands it under
+// the name to, and carries the target of the record's last move. A handle
+// that Acquire opens can't add a step to a record that went through a crash,
+// so the row rewrites the record file through rewriteRecord, which gives the
+// same result as reading back a record that a release left behind. When to
+// equals from, the step records a move that PVE refused, which holds only the
+// name the move started from.
 func appendObservedMove(t *testing.T, f digestManaged, vmid int, from, to string) {
 	t.Helper()
 	record, err := f.journal.Inspect(f.id)
@@ -1169,14 +1284,14 @@ func TestIdentityCheckKeepsALandingARefusedMoveLeft(t *testing.T) {
 }
 
 // TestIdentityCheckDropsALandingAnotherVMMovedOff covers a landing that a
-// later move took away from a VM whose number the landed name doesn't embed.
-// After the disk landed on the parker, attach_disk put the volume on 778 by a
-// config edit under the parker's name, and a detach from 778 then moved it
-// off under another name. Meanwhile another volume with no serial took the
-// landed name on the slot that the transfer's record names. The move ran on
-// the landing's node, so the landing proves nothing about that name anymore,
-// and the identity check refuses for audit, permanently, and leaves the
-// volume untouched.
+// later move took away on another VM, one whose number the landed name
+// doesn't carry. After the disk landed on the parker, attach_disk put the
+// volume on 778 by a config edit under the parker's name, and a detach from
+// 778 then moved it off under another name. Meanwhile another volume with no
+// serial took the landed name on the slot that the transfer's record names.
+// The move ran on the landing's node, so the landing proves nothing about
+// that name anymore, and the identity check refuses for audit, permanently,
+// and leaves the volume untouched.
 func TestIdentityCheckDropsALandingAnotherVMMovedOff(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
