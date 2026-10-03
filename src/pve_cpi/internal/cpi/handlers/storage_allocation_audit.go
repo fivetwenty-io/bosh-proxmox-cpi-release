@@ -91,6 +91,13 @@ type StorageAllocationAudit struct {
 	// the volume at each holder, so a listing can tell a reused name from
 	// the volume a record once carried under it.
 	claims map[string][]storageAuditClaim
+	// holders maps each disk allocation to the drives the VM scan counted as
+	// holding it. Evidence merges a holder with a VM's provenance entry for
+	// the same volume, so a caller that has to tell a held disk from one whose
+	// VMs only carry its notes reads them here.
+	holders map[string][]StorageAllocationEvidence
+	// stores holds the storage definitions the audit read.
+	stores map[string]pve.StorageInfo
 }
 
 // storageAuditClaim is what one VM's configuration says about a volume it
@@ -577,6 +584,7 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 		}
 		result.Evidence = append(result.Evidence, holders...)
 	}
+	result.holders, result.stores = diskHolders, stores
 	sort.Slice(result.Evidence, func(i, j int) bool {
 		a, b := result.Evidence[i], result.Evidence[j]
 		if a.AllocationID != b.AllocationID {
