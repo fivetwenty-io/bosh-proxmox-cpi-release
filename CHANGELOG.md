@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-03
+
 ### Added
 
 - `storage-journal audit` and `storage-journal audit-enrollment` take a new `--summary` flag, which prints the audit as plain text for a Director that has no `jq`. For `audit`, the first line gives `complete`, `vm_scan_complete`, `generation_index_healthy`, `cluster_continuity`, and the record count. Each finding then gets a line of its own, prefixed `conflict:`, `vm-scan issue:`, `issue:`, or `observed move:`, and the charging summary and any skipped disabled storages come last. `audit-enrollment` opens with its own line, which gives `complete`, `vm_scan_complete`, and the evidence count, and it prints no charging line. After its findings it prints one `provenance:` line per existing provenance entry. The exit code matches the JSON mode exactly, and every other action rejects the flag with exit code 2 and the usage line. See [Inspect retained allocations](docs/storage-journal-operations.md#inspect-retained-allocations).
@@ -622,7 +624,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.2...v0.7.3
