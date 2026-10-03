@@ -865,25 +865,78 @@ func TestMoveSettlementRefusesWhenSerialHeldElsewhere(t *testing.T) {
 	}
 }
 
-// TestMoveSettlementRefusesWhenParkerNamesVolume gives parker 90031 a slot
-// naming the volume. A parker that names it may have taken the disk, so the
-// settlement refuses.
+// TestMoveSettlementRefusesWhenParkerNamesVolume gives a second parker, at
+// the first VMID from 90031 up that no guest uses, a slot naming the volume.
+// A parker that names it may have taken the disk, so the settlement refuses.
+// The last row renumbers the fixture's own parker to 90031 first, the
+// collision a random allocation would sometimes make.
 func TestMoveSettlementRefusesWhenParkerNamesVolume(t *testing.T) {
 	for _, shape := range pendingShapes {
 		for _, row := range holderRows {
 			t.Run(shape.name+"/"+row, func(t *testing.T) {
-				m := shape.build(t, false)
-				volume := m.step.Target.IntendedVolume
-				m.client.state.configs[90031] = map[string]any{"name": "bosh-parker-90031", "tags": "bosh-cpi;" + pve.ParkerTag, "digest": "1", "scsi3": volume}
-				if row == "pending-delete" {
-					m.client.pending = newFakePendingModel()
-					m.client.pending.holdDelete(90031, m.client.state.configs[90031], "scsi3")
-				}
-				m.requireRefusedBy(t, func() error { return m.finalizeCleanup(settleAt(pastQuietPeriod)) }, "parker 90031 names volume "+volume+" on scsi3")
-				m.requireNothingDeleted(t)
+				requireParkerNamingVolumeRefused(t, shape.build(t, false), row)
 			})
 		}
 	}
+	t.Run("real-parker-at-90031", func(t *testing.T) {
+		m := unfiredDetach(t, false)
+		moveRealParkerTo(t, m, 90031)
+		requireParkerNamingVolumeRefused(t, m, "applied")
+	})
+}
+
+// moveRealParkerTo renumbers the fixture's only parker to vmid, the way a
+// random allocation could have placed it.
+func moveRealParkerTo(t *testing.T, m *unfiredMove, vmid int) {
+	t.Helper()
+	parker := 0
+	for id := range m.client.state.configs {
+		if isParkerVM(m.client, id) {
+			if parker != 0 {
+				t.Fatalf("want one parker, got %d and %d", parker, id)
+			}
+			parker = id
+		}
+	}
+	if parker == 0 {
+		t.Fatal("the fixture has no parker")
+	}
+	if parker == vmid {
+		return
+	}
+	if _, taken := m.client.state.configs[vmid]; taken {
+		t.Fatalf("VM %d is already a guest", vmid)
+	}
+	m.client.state.configs[vmid] = m.client.state.configs[parker]
+	delete(m.client.state.configs, parker)
+	if node, ok := m.client.vmNodes[parker]; ok {
+		m.client.vmNodes[vmid] = node
+		delete(m.client.vmNodes, parker)
+	}
+}
+
+// requireParkerNamingVolumeRefused gives an injected parker a slot naming the
+// step's volume, applied or behind a pending delete, and requires the
+// settlement to refuse on it. The injected parker takes the first VMID from
+// 90031 up that no guest uses, because the fixture's own parker lands on a
+// random VMID in the same range.
+func requireParkerNamingVolumeRefused(t *testing.T, m *unfiredMove, row string) {
+	t.Helper()
+	volume := m.step.Target.IntendedVolume
+	injected := 90031
+	for {
+		if _, taken := m.client.state.configs[injected]; !taken {
+			break
+		}
+		injected++
+	}
+	m.client.state.configs[injected] = map[string]any{"name": fmt.Sprintf("bosh-parker-%d", injected), "tags": "bosh-cpi;" + pve.ParkerTag, "digest": "1", "scsi3": volume}
+	if row == "pending-delete" {
+		m.client.pending = newFakePendingModel()
+		m.client.pending.holdDelete(injected, m.client.state.configs[injected], "scsi3")
+	}
+	m.requireRefusedBy(t, func() error { return m.finalizeCleanup(settleAt(pastQuietPeriod)) }, fmt.Sprintf("parker %d names volume %s on scsi3", injected, volume))
+	m.requireNothingDeleted(t)
 }
 
 // TestMoveSettlementReadsBothNodesAfterMigration moves the source to n2 after
