@@ -49,16 +49,17 @@ func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolve
 				return pending
 			}
 		}
-		if isDiskReturnedAfterLockTimeout(err) && m.guard.Err() == nil {
-			// The disk's lifecycle waited out another request's parker window
-			// and returned the disk unchanged, so the handoff this step
-			// records never touched the VM. Settle the step and hand the
-			// retriable timeout back without poisoning the VM allocation.
-			// create_vm never resumes this VM. It disposes of the attempt,
-			// preserving any disk already attached. A fallback attempt then
-			// places a new VM, and on the last attempt the generation is
-			// closed before the timeout reaches the Director, whose retry
-			// builds a fresh VM.
+		if isDiskReturnedUnchanged(err) && m.guard.Err() == nil {
+			// The disk's lifecycle waited out another request's parker
+			// window, or its detach tail stopped before it changed the
+			// source VM, and either way it returned the disk unchanged. So
+			// the handoff this step records never touched the VM. We settle
+			// the step and hand the error back without poisoning the VM
+			// allocation. create_vm never resumes this VM. It disposes of the
+			// attempt, preserving any disk already attached. A fallback
+			// attempt then places a new VM, and on the last attempt the
+			// generation is closed before the error reaches the Director,
+			// whose retry builds a fresh VM.
 			if observeErr := storageMutationObserved(m.handle, step, nil, false); observeErr != nil {
 				return m.guard.Poison(storageAllocationUncertain(m.handle, "persistent disk attachment"))
 			}

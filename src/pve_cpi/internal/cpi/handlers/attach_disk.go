@@ -1053,7 +1053,12 @@ func guardHolderAndUnpark(ctx context.Context, deps Deps, op string, rd *resolve
 	if deps.Config == nil {
 		return attachPlan{}, nil
 	}
-	refreshed, resumeErr := resumeTransferIfNeeded(ctx, deps, op, *rd)
+	// A parked disk's source VM can still carry its allocation entry, its
+	// attached-disk entry, and its overlay. Only the parker's landed entry
+	// says which VM that is, and the move below takes the disk off the
+	// parker, so the detach tail runs first. A failure leaves the disk parked
+	// for the retry to heal.
+	refreshed, resumeErr := resumeAndFinishParkedTail(ctx, deps, op, *rd)
 	if resumeErr != nil {
 		return attachPlan{}, resumeErr
 	}

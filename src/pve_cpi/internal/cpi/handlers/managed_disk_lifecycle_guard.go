@@ -177,9 +177,10 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		return "", err
 	}
 	g.observations[step] = observation
-	if lifecycleMutationTouchesDisk(call, observation) {
-		// Only a sentinel create or delete, or a write of the drive-option
-		// overlay note alone, leaves the disk and its holders alone. Anything
+	if lifecycleMutationTouchesDisk(call, observation, m.disk.volid) {
+		// Only a sentinel create or delete, a write of the drive-option
+		// overlay note alone, or a pinned removal of notes from a VM that
+		// doesn't name the disk leaves the disk and its holders untouched. Anything
 		// else admitted here may have moved, migrated, or rewritten the disk,
 		// which a later lock timeout must not paper over.
 		m.diskMutationAdmitted = true
@@ -198,12 +199,18 @@ func (g *managedDiskLifecycleGuard) observeContinuity(ctx context.Context, call 
 	if err != nil && isProtectionRestore(call) {
 		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk backing")
 	}
+	if refusal := tailRemovalReadFailed(ctx, call, "the managed disk's backing", err); refusal != nil {
+		return "", refusal
+	}
 	if err != nil || backing != m.diskBacking() {
 		return "", fmt.Errorf("managed disk backing changed before mutation")
 	}
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, m.deps.PVE.Nodes(), []string{node})
 	if err != nil && isProtectionRestore(call) {
 		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk cluster identity")
+	}
+	if refusal := tailRemovalReadFailed(ctx, call, "the managed disk's cluster identity", err); refusal != nil {
+		return "", refusal
 	}
 	if err != nil || identity.ID() != m.handle.Record().ClusterID {
 		return "", fmt.Errorf("managed disk cluster continuity changed before mutation")
@@ -237,6 +244,9 @@ func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call M
 	config, err := g.lifecycle.deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil && isProtectionRestore(call) {
 		return nil, g.restoreChecksIncomplete(call, node, storage, "parker configuration")
+	}
+	if refusal := tailRemovalReadFailed(ctx, call, fmt.Sprintf("VM %d's configuration", vmid), err); refusal != nil {
+		return nil, refusal
 	}
 	if err != nil || config == nil {
 		return nil, fmt.Errorf("cannot verify lifecycle holder before mutation")

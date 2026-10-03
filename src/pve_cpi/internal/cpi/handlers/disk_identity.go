@@ -139,7 +139,10 @@ func resumeTransferIfNeeded(ctx context.Context, deps Deps, op string, rd resolv
 	}
 	// The detach that started this transfer never reached its tail, so the
 	// source VM still carries the disk's entries. A failure here comes after
-	// the landing, and the next call that resolves the disk heals it.
+	// the landing, when the intent is gone, so it's the parker's landed entry
+	// that names the source VM from then on. detach_disk, attach_disk,
+	// delete_disk, and create_vm's disk attach each run the tail again from
+	// that entry before they act on the parked disk, and that's what heals it.
 	if source, ok := intentSourceVMID(rd.intent); ok {
 		if err := finishDetachTail(ctx, deps, op, refreshed, source); err != nil {
 			return resolvedDisk{}, err

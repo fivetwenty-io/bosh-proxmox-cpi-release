@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +30,26 @@ func IsConfigDigestRefusal(err error) bool {
 	}
 	_, answered := pveAnswered(err)
 	return answered
+}
+
+// IsAnsweredConfigRefusal reports whether err is PVE's own answer refusing a
+// configuration update. That's any 4xx status, such as a token that lacks the
+// privilege or a parameter PVE won't take, and a 500 whose message says the VM
+// is locked, which qemu-server's check_lock gives before the update writes
+// anything. A transport fault, a timeout, an ended context, a gateway or relay
+// status, and any other 500 may hide a write that landed, so none of them
+// matches. A match says only that PVE answered. It doesn't prove that nothing
+// was written, and only a read of the VM afterwards can show that.
+//
+// err has to be the update's own error. A read that fails after PVE accepted
+// the update is no refusal, so RemoveDescriptionNotes returns it as
+// ErrDescriptionReadbackFailed, which never matches.
+func IsAnsweredConfigRefusal(err error) bool {
+	code, answered := pveAnswered(err)
+	if !answered {
+		return false
+	}
+	return code >= 400 && code < 500 || code == 500 && IsVMConfigLocked(err)
 }
 
 // ReadParkerSourceVMID returns the VM a parker's landed entry for a disk says
@@ -100,18 +121,29 @@ type DescriptionNoteKeys struct {
 // again and retry.
 var ErrDescriptionNoteReturned = errors.New("a removed description note is back")
 
+// ErrDescriptionReadbackFailed marks a description write that PVE accepted
+// and that the read after it couldn't check. Nothing then shows what the
+// write changed, so the caller treats its outcome as unknown.
+var ErrDescriptionReadbackFailed = errors.New("cannot read back description note removal")
+
 // RemoveDescriptionNotes removes the notes keys names from a VM whose
-// configuration the caller has already read as cfg. It builds one description
-// from that read and sends it with the read's digest, so PVE refuses it if the
-// configuration changed since, and no note another writer added or removed in
-// the meantime comes back. A key the read doesn't carry is skipped, and when
-// nothing is left to remove it writes nothing. After PVE accepts the write, it
-// reads the VM again and checks only that the notes it removed are gone,
-// because any other change to the description is another writer's.
+// configuration the caller has already read as cfg. The function builds one
+// description from that read and renders it the way withoutDescriptionNotes
+// does, which can move or drop free text that sits after the sentinel. The
+// function sends that description with the read's digest, so PVE refuses it
+// if the configuration changed since, and the write never reverts a note that
+// another writer added or removed in the meantime. A key the read doesn't
+// carry is skipped, and when nothing is left to remove, the function writes
+// nothing. After PVE accepts the write, the function reads the VM again and
+// checks only that the notes it removed are gone, because any other change to the
+// description is another writer's.
 //
 // A failed write keeps its cause, so the caller can tell PVE's digest refusal,
 // which IsConfigDigestRefusal matches, from a write whose outcome is unknown.
 // A note that is back after the write comes back as ErrDescriptionNoteReturned.
+// A readback that fails after PVE accepted the write comes back as
+// ErrDescriptionReadbackFailed, with its cause in the text only, so no status
+// in that cause can make the accepted write look refused.
 func RemoveDescriptionNotes(ctx context.Context, c Client, node string, vmid int, cfg map[string]any, keys DescriptionNoteKeys) error {
 	if c == nil || c.Nodes() == nil || c.QEMU() == nil || node == "" || vmid <= 0 || cfg == nil {
 		return fmt.Errorf("description note removal requires a client, a node, a VMID, and a config read")
@@ -134,8 +166,15 @@ func RemoveDescriptionNotes(ctx context.Context, c Client, node string, vmid int
 		return fmt.Errorf("cannot remove description notes: %w", err)
 	}
 	check, err := c.QEMU().Config(ctx, node, vmid)
-	if err != nil || check == nil {
-		return errors.Join(fmt.Errorf("cannot read back description note removal"), err)
+	if err != nil {
+		// The %v keeps the read's status out of the chain, so it can't make the
+		// accepted write look refused. It also flattens the class of a typed
+		// cause to retriable on purpose, because a readback after an accepted
+		// write is a read we can safely repeat.
+		return fmt.Errorf("%w: %v", ErrDescriptionReadbackFailed, err) //nolint:errorlint // The read's cause stays as text, so its status can't make the accepted write look refused.
+	}
+	if check == nil {
+		return ErrDescriptionReadbackFailed
 	}
 	return requireNotesGone(DescriptionFromConfig(check), removed)
 }
@@ -169,13 +208,58 @@ func DescriptionNotesRemoved(before, sent string) (DescriptionNoteKeys, bool) {
 	return keys, true
 }
 
+// DescriptionNotesKept reports whether the after description still carries
+// every note that keys names, each exactly as the before description carried
+// it. If before doesn't carry a note, that note doesn't count as kept. A
+// carrier that fails to decode doesn't count either when keys names one of its
+// notes.
+func DescriptionNotesKept(before, after string, keys DescriptionNoteKeys) bool {
+	if len(keys.Allocations) > 0 {
+		beforeEntries, err := ParseDiskAllocationProvenance(before)
+		if err != nil {
+			return false
+		}
+		afterEntries, err := ParseDiskAllocationProvenance(after)
+		if err != nil {
+			return false
+		}
+		if !notesKept(beforeEntries, afterEntries, keys.Allocations, func(a, b DiskAllocationProvenance) bool { return a == b }) {
+			return false
+		}
+	}
+	_, beforeDisks, _ := parseAttachedDisksSentinel(before)
+	_, afterDisks, _ := parseAttachedDisksSentinel(after)
+	if !notesKept(beforeDisks, afterDisks, keys.AttachedDisks, func(a, b string) bool { return a == b }) {
+		return false
+	}
+	_, beforeOverlays, _ := parseDiskOptOverlaysSentinel(before)
+	_, afterOverlays, _ := parseDiskOptOverlaysSentinel(after)
+	return notesKept(beforeOverlays, afterOverlays, keys.Overlays, maps.Equal[map[string]string])
+}
+
+// notesKept reports whether the after map carries every key in keys with the
+// value that the before map carries under the same key.
+func notesKept[V any](before, after map[string]V, keys []string, equal func(a, b V) bool) bool {
+	for _, key := range keys {
+		was, found := before[key]
+		if !found {
+			return false
+		}
+		now, found := after[key]
+		if !found || !equal(was, now) {
+			return false
+		}
+	}
+	return true
+}
+
 // requireNotesGone returns ErrDescriptionNoteReturned when desc still carries
 // any of the notes removed names.
 func requireNotesGone(desc string, removed DescriptionNoteKeys) error {
 	if len(removed.Allocations) > 0 {
 		entries, err := ParseDiskAllocationProvenance(desc)
 		if err != nil {
-			return fmt.Errorf("cannot read back description note removal: %w", err)
+			return fmt.Errorf("%w: %w", ErrDescriptionReadbackFailed, err)
 		}
 		if carriesAnyKey(entries, removed.Allocations) {
 			return fmt.Errorf("%w: an allocation entry", ErrDescriptionNoteReturned)
@@ -195,6 +279,14 @@ func requireNotesGone(desc string, removed DescriptionNoteKeys) error {
 // entry. The attached-disk and overlay carriers use the same codecs as
 // RemoveAttachedDiskCID and RemoveVMDiskOptOverlay. A carrier with nothing to
 // remove, or a note carrier whose JSON doesn't decode, is left as it was.
+//
+// A carrier that loses a note is rendered again, and the text outside the
+// sentinel doesn't always come through as it was. When an allocation entry
+// comes off, the strict codec joins the text before and after the sentinel,
+// trims it, and puts all of it before the new sentinel. When only an
+// attached-disk entry or an overlay comes off, the shared codec keeps the
+// trimmed text before the sentinel and drops any text after it, as every
+// other writer of those two carriers does.
 func withoutDescriptionNotes(desc string, keys DescriptionNoteKeys) (string, error) {
 	if len(keys.Allocations) > 0 {
 		nonBOSH, raw, err := strictDiskAllocationSentinel(desc)
