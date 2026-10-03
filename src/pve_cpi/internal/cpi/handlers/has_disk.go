@@ -59,6 +59,19 @@ func HandleHasDisk(deps Deps) Handler {
 		// references it — so the storage probe below is only needed for the
 		// unreferenced case, against the resolved name.
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "has_disk", diskCID, bareDiskCID, meta)
+		if held, ok := pve.IsDiskBirthNameHeld(resolveErr); ok {
+			// No slot carries the disk's serial, and the only entries naming
+			// its birth volume can't be proved to hold it. Every other handler
+			// refuses the disk, so we report it missing, and bosh cck can then
+			// report the loss. Answering true would hide the loss behind a
+			// volume that may belong to another disk.
+			deps.Log(ctx).Warn("has_disk: reporting the disk missing, because only entries that can't be proved to hold it name its birth volume",
+				log.String("disk_cid", diskCID),
+				log.String("birth_volid", held.BirthVolid),
+				log.Err(resolveErr),
+			)
+			return false, nil
+		}
 		if resolveErr != nil {
 			return nil, resolveErr
 		}

@@ -354,7 +354,11 @@ func (m *managedDiskRequest) executeAttempt(ctx context.Context, handle *aj.Hand
 		return nil, err
 	}
 	if m.deps.Config.DetachedDiskParkedEnabled() {
-		identity, e := pve.ResolveDiskIdentity(ctx, m.deps.PVE, m.deps.Log(ctx), volume, m.token, parkerReadConfigFor(m.deps))
+		// This asks whether anything names the new volume or carries the new
+		// token, not which volume a disk is, so it keeps the variant that
+		// matches a slot by name under any serial, and verifyBirthAbsence
+		// below proves the volume itself is absent.
+		identity, e := pve.ResolveDiskIdentityMatchingName(ctx, m.deps.PVE, m.deps.Log(ctx), volume, m.token, parkerReadConfigFor(m.deps))
 		if e != nil {
 			return nil, cpierrors.Cloud("allocation %s: shortened-token ownership observation failed; no mutation submitted", m.id)
 		}

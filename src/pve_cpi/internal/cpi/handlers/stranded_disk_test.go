@@ -72,6 +72,7 @@ func buildBirthStrand(t *testing.T, owner int, local, keepRecord bool) *stranded
 		deps.Resolver = pve.NewBackendResolver(deps.PVE, nil, "n1")
 	}
 	client.state.configs[777]["scsi1"] = birth + ",serial=" + token + ",size=5G"
+	noteAttachedDisk(t, client.state.configs[777], token, cid)
 	s := &strandedDisk{deps: deps, client: client, recorder: recorder, journal: journal, cid: cid, token: token}
 
 	if owner == 777 {
@@ -311,6 +312,8 @@ func TestStrandedAmbiguousEntriesRefuseEverywhere(t *testing.T) {
 		t.Run(call, func(t *testing.T) {
 			s := buildBirthStrand(t, 777, false, false)
 			s.client.state.configs[778] = map[string]any{"name": "w778", "digest": "1", "unused0": s.stranded}
+			// Both guests hold the disk's note, so each entry is a candidate.
+			noteAttachedDisk(t, s.client.state.configs[778], s.token, s.cid)
 			s.client.state.configs[888] = map[string]any{"name": "w888", "digest": "1"}
 			before, deletes := s.snapshot(), s.client.deletes
 			err := strandedCall(t, s, call)
@@ -331,6 +334,9 @@ func TestStrandedOnParkerBandRefusesAsAmbiguous(t *testing.T) {
 			s := buildBirthStrand(t, 777, false, false)
 			delete(s.client.state.configs[777], "unused0")
 			s.client.state.configs[90500] = map[string]any{"name": "w90500", "digest": "1", "unused0": s.stranded}
+			// 90500 holds the disk's note, so its entry reaches the parker-band
+			// check rather than the refusal of an entry nothing ties to the disk.
+			noteAttachedDisk(t, s.client.state.configs[90500], s.token, s.cid)
 			s.client.state.configs[888] = map[string]any{"name": "w888", "digest": "1"}
 			before, deletes := s.snapshot(), s.client.deletes
 			err := strandedCall(t, s, call)
@@ -517,10 +523,17 @@ func TestStrandedDiskResizeAndSnapshotRefuse(t *testing.T) {
 // managedStrand moves the flow fixture's journal-managed disk from 777's
 // scsi1 to its unused0, the state a failed managed transfer leaves once its
 // planned move step is settled. The managed rows can't build that through
-// the handlers until the settlement exists, so they seed it.
-func managedStrand(t *testing.T, client *lifecycleFlowPVE) string {
+// the handlers until the settlement exists, so they seed it, along with the
+// attached-disk note attach_disk left on 777 under the disk's stable ID.
+func managedStrand(t *testing.T, client *lifecycleFlowPVE, cid string) string {
 	t.Helper()
-	volume := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
+	value := client.state.configs[777]["scsi1"].(string)
+	token, ok := pve.StableIDFromDriveOptStr(value)
+	if !ok {
+		t.Fatalf("777's scsi1 %q carries no stable ID", value)
+	}
+	noteAttachedDisk(t, client.state.configs[777], token, cid)
+	volume := strings.Split(value, ",")[0]
 	delete(client.state.configs[777], "scsi1")
 	client.state.configs[777]["unused0"] = volume
 	return volume
@@ -546,7 +559,7 @@ func TestStrandedManagedDiskRefusesBeforeItsLifecycle(t *testing.T) {
 	for _, op := range []string{"attach_disk", "resize_disk"} {
 		t.Run(op, func(t *testing.T) {
 			deps, client, journal, id, cid := lifecycleFlowFixture(t)
-			volume := managedStrand(t, client)
+			volume := managedStrand(t, client, cid)
 			client.state.configs[888] = map[string]any{"name": "w888", "digest": "1"}
 			before, err := journal.Inspect(id)
 			if err != nil {
@@ -579,7 +592,7 @@ func TestStrandedManagedDiskRefusesBeforeItsLifecycle(t *testing.T) {
 // the same way it can't around an interrupted transfer.
 func TestStrandedManagedDiskPlacementRefuses(t *testing.T) {
 	deps, client, _, _, cid := lifecycleFlowFixture(t)
-	managedStrand(t, client)
+	managedStrand(t, client, cid)
 	_, err := ObserveStorageExistingVolumes(context.Background(), deps, []string{cid})
 	if err == nil || !strings.Contains(err.Error(), "existing disk is stranded on an unused entry: "+cid) {
 		t.Fatalf("placement = %v, want the stranded plan error", err)
@@ -590,8 +603,8 @@ func TestStrandedManagedDiskPlacementRefuses(t *testing.T) {
 // Before the guard only an attached holder refused, so cleanup deleted the
 // volume while 777's unused entry still named it.
 func TestStrandedManagedDiskExplicitCleanupRefuses(t *testing.T) {
-	deps, client, journal, id, _ := lifecycleFlowFixtureState(t, false)
-	managedStrand(t, client)
+	deps, client, journal, id, cid := lifecycleFlowFixtureState(t, false)
+	managedStrand(t, client, cid)
 	h, err := journal.Acquire(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
@@ -612,8 +625,8 @@ func TestStrandedManagedDiskExplicitCleanupRefuses(t *testing.T) {
 // TestStrandedManagedDiskCleanupPrecheckRefuses is the storage cleanup
 // precheck row. Before the guard it admitted the cleanup.
 func TestStrandedManagedDiskCleanupPrecheckRefuses(t *testing.T) {
-	deps, client, journal, id, _ := lifecycleFlowFixture(t)
-	managedStrand(t, client)
+	deps, client, journal, id, cid := lifecycleFlowFixture(t)
+	managedStrand(t, client, cid)
 	record, err := journal.Inspect(id)
 	if err != nil {
 		t.Fatal(err)
@@ -658,14 +671,55 @@ func TestStrandedManagedDiskDeleteSubmissionRefuses(t *testing.T) {
 // record as already deleted and returned success.
 func TestStrandedManagedTerminalRecordRefuses(t *testing.T) {
 	deps, client, _, _, cid := lifecycleFlowFixture(t)
-	volume := strings.Split(client.state.configs[777]["scsi1"].(string), ",")[0]
+	value := client.state.configs[777]["scsi1"].(string)
+	volume := strings.Split(value, ",")[0]
 	delete(client.state.configs[777], "scsi1")
 	if err := callHandler(t, HandleDeleteDisk(deps), cid); err != nil {
 		t.Fatalf("delete_disk: %v", err)
 	}
+	// 777 keeps the disk's note, so the entry resolves as the disk and the
+	// terminal record is what refuses it.
+	token, _ := pve.StableIDFromDriveOptStr(value)
+	noteAttachedDisk(t, client.state.configs[777], token, cid)
 	client.state.configs[777]["unused0"] = volume
 	if err := callHandler(t, HandleDeleteDisk(deps), cid); err == nil || !strings.Contains(err.Error(), "terminal managed disk still has ownership provenance") {
 		t.Fatalf("delete_disk after the delete = %v, want the terminal ownership refusal", err)
+	}
+}
+
+// TestStrandedManagedTerminalRecordWithoutTheNoteNeedsAnAudit is the terminal
+// record row with 777's note gone. Nothing then proves the unused entry holds
+// the disk rather than another volume at its birth name, so delete_disk asks
+// for an audit before the terminal record is read, and deletes nothing. Before
+// the fix the entry resolved as the disk and the terminal record refused it.
+func TestStrandedManagedTerminalRecordWithoutTheNoteNeedsAnAudit(t *testing.T) {
+	deps, client, _, _, cid := lifecycleFlowFixture(t)
+	value := client.state.configs[777]["scsi1"].(string)
+	volume := strings.Split(value, ",")[0]
+	delete(client.state.configs[777], "scsi1")
+	if err := callHandler(t, HandleDeleteDisk(deps), cid); err != nil {
+		t.Fatalf("delete_disk: %v", err)
+	}
+	dropAttachedDiskNotes(t, client.state.configs[777])
+	client.state.configs[777]["unused0"] = volume
+	deletes := client.deletes
+	err := callHandler(t, HandleDeleteDisk(deps), cid)
+	token, _ := pve.StableIDFromDriveOptStr(value)
+	var typed *cpierrors.Error
+	if err == nil || !errors.As(err, &typed) || typed.Type() != cpierrors.TypeCloud || typed.OkToRetry() {
+		t.Fatalf("delete_disk after the delete = %v, want a permanent CloudError", err)
+	}
+	for _, want := range []string{
+		"no slot carries the disk's serial " + token,
+		"unused entry unused0 of VM 777",
+		"Nothing acts on the volume until an operator confirms whose it is",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("delete_disk after the delete = %v\nwant it to contain %q", err, want)
+		}
+	}
+	if client.deletes != deletes {
+		t.Fatalf("delete_disk deleted %d volumes, want none", client.deletes-deletes)
 	}
 }
 
@@ -722,7 +776,7 @@ func TestStrandedDiskRunbookHeadingExists(t *testing.T) {
 // config edit while 777's unused entry still named it.
 func TestStrandedManagedDiskDetachParksIt(t *testing.T) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
-	managedStrand(t, client)
+	managedStrand(t, client, cid)
 	record, err := journal.Inspect(id)
 	if err != nil {
 		t.Fatal(err)

@@ -117,15 +117,99 @@ type DiskIdentity struct {
 	Unused []VolumeReference
 }
 
-// ResolveDiskIdentity resolves a disk's current volid and holder, in the
-// D13 fallback order: stable-ID scan (which also matches the birth volid in
-// the same pass) → parker provenance sentinel → birth volid.
+// DiskBirthNameRunbook points the refusal of a disk whose birth volume another
+// entry names at the way out. The docs do not ship in the release, so it names
+// the repository as well as the file, and a test pins the heading it quotes.
+const DiskBirthNameRunbook = `see "Another entry names a disk's birth volume" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// DiskBirthNameHeldError is the refusal ResolveDiskIdentity returns when no
+// slot carries a disk's serial, no parker records its transfer, and some entry
+// names its birth volume without proving it is the disk. The entry can be a
+// slot under another serial or none, or an unusedN entry on a guest that holds
+// no note for the disk. Another disk can take a birth name once a move renames
+// the disk off it, so acting on that volume could write to another disk or
+// hand it to this disk's consumer. The state stays until an operator acts, so
+// the refusal is permanent.
+type DiskBirthNameHeldError struct {
+	StableID   string
+	BirthVolid string
+	Holders    []BirthNameHolder
+}
+
+func (e *DiskBirthNameHeldError) Error() string {
+	names := make([]string, 0, len(e.Holders))
+	for _, h := range e.Holders {
+		names = append(names, describeBirthNameHolder(h))
+	}
+	verb := "names"
+	if len(names) > 1 {
+		verb = "name"
+	}
+	return fmt.Sprintf(
+		"no slot carries the disk's serial %s, but %s %s its birth volume %s, so we can't tell whether that volume is still the disk. "+
+			"Nothing acts on the volume until an operator confirms whose it is; %s",
+		e.StableID, strings.Join(names, " and "), verb, e.BirthVolid, DiskBirthNameRunbook)
+}
+
+// describeBirthNameHolder names one entry the way the refusal quotes it.
+func describeBirthNameHolder(h BirthNameHolder) string {
+	switch {
+	case h.Unused:
+		return fmt.Sprintf("unused entry %s of VM %d on node %s, whose description holds no note for the disk", h.Slot, h.VMID, h.Node)
+	case h.Serial != "":
+		return fmt.Sprintf("slot %s of VM %d on node %s with serial %s", h.Slot, h.VMID, h.Node, h.Serial)
+	default:
+		return fmt.Sprintf("slot %s of VM %d on node %s with no serial", h.Slot, h.VMID, h.Node)
+	}
+}
+
+// IsDiskBirthNameHeld reports whether err carries a DiskBirthNameHeldError
+// and returns it.
+func IsDiskBirthNameHeld(err error) (*DiskBirthNameHeldError, bool) {
+	var held *DiskBirthNameHeldError
+	if errors.As(err, &held) {
+		return held, true
+	}
+	return nil, false
+}
+
+// ResolveDiskIdentity resolves a disk's current volid and holder. It looks
+// for the disk in this order: the slot carrying the disk's serial, then a
+// parker's transfer record, then the unusedN entries that name the birth
+// volid on a guest holding the disk's note, and then the birth volid itself.
+// The birth volid is only the volume's name at create_disk, and another
+// volume can hold it after a move renamed the disk, so a slot that names it
+// under another serial or none never resolves as the disk. When such a slot,
+// or an unusedN entry on a guest holding no note for the disk, names the
+// birth volid and neither the serial nor a record locates the disk, it
+// returns a permanent DiskBirthNameHeldError in place of the birth volid,
+// even when a noted unusedN entry names it too. A scan that couldn't read
+// every node still fails retriably first. A disk nothing names resolves to
+// its birth volid.
 //
 // stableID == "" is the legacy case and returns the birth volid immediately,
 // with no API calls: legacy CIDs are volid-resolved forever, and their
 // callers keep the exact call pattern they had before stable IDs existed.
 func ResolveDiskIdentity(
 	ctx context.Context, c Client, logger *log.Logger, birthVolid, stableID string, cfg ParkerConfig,
+) (DiskIdentity, error) {
+	return resolveDiskIdentity(ctx, c, logger, birthVolid, stableID, cfg, matchSerial)
+}
+
+// ResolveDiskIdentityMatchingName is ResolveDiskIdentity with a slot that
+// names the birth volid matched as the disk, under any serial or none, and
+// every unusedN entry that names it reported in Unused. It never returns a
+// DiskBirthNameHeldError. It is for a caller that wants to know whether
+// anything names the volume or carries the token at all, which is what the
+// allocation collision check asks before it proves the volume absent.
+func ResolveDiskIdentityMatchingName(
+	ctx context.Context, c Client, logger *log.Logger, birthVolid, stableID string, cfg ParkerConfig,
+) (DiskIdentity, error) {
+	return resolveDiskIdentity(ctx, c, logger, birthVolid, stableID, cfg, matchNameOrSerial)
+}
+
+func resolveDiskIdentity(
+	ctx context.Context, c Client, logger *log.Logger, birthVolid, stableID string, cfg ParkerConfig, match diskMatch,
 ) (DiskIdentity, error) {
 	if birthVolid == "" {
 		return DiskIdentity{}, cpierrors.Cloud("ResolveDiskIdentity: birthVolid must not be empty")
@@ -137,7 +221,7 @@ func ResolveDiskIdentity(
 		return DiskIdentity{}, cpierrors.Cloud("ResolveDiskIdentity: client must not be nil")
 	}
 
-	hit, err := findVMByDiskIdentityScan(ctx, c, birthVolid, stableID)
+	hit, err := findVMByDiskIdentityScan(ctx, c, birthVolid, stableID, match)
 	if err == nil {
 		return DiskIdentity{Volid: hit.Volid, Holder: holderFromScanHit(logger, hit, birthVolid, cfg)}, nil
 	}
@@ -148,6 +232,10 @@ func ResolveDiskIdentity(
 	// No active bus slot anywhere carries the disk. A detach-side transfer
 	// that crashed between the intent record and the serial re-apply leaves
 	// the volume findable only through the receiving parker's provenance.
+	// The record comes before the birth-name refusal below on purpose. A move
+	// that landed before its serial write can take the disk's birth name
+	// back, and the resume that settles it starts only from the record we
+	// return here, so refusing would leave that crash with no way out.
 	intent, found, provErr := findParkedDiskIntentByStableID(ctx, c, stableID, cfg)
 	if provErr != nil {
 		return DiskIdentity{}, cpierrors.Wrap(provErr, "ResolveDiskIdentity: parker provenance scan")
@@ -170,14 +258,27 @@ func ResolveDiskIdentity(
 		}, nil
 	}
 
+	// No slot carries the serial and no parker records a transfer, so the
+	// entries that name the birth volume are all that's left, and none of them
+	// proves it is the disk. A slot there holds another serial or none, and an
+	// unused entry sits on a guest that holds no note for the disk. This check
+	// comes before the default below that reports the noted unused entries, so
+	// when any of these entries exists, the resolution refuses even if a noted
+	// unused entry names the volume too.
+	if len(hit.NameHolders) > 0 {
+		return DiskIdentity{}, cpierrors.Wrap(
+			&DiskBirthNameHeldError{StableID: stableID, BirthVolid: birthVolid, Holders: hit.NameHolders},
+			"ResolveDiskIdentity: refusing to resolve the disk by its birth volume")
+	}
+
 	// Never transferred (or free-floating): the volume keeps its birth name.
 	// The holder is empty, but the reference counts the scan gathered on its
 	// way to that answer ride out on it: a free-floating disk is exactly what
 	// delete_disk is about to prove absent, and the counts are the cheapest
-	// second opinion it has. The unused entries that name the birth volid
-	// ride out too. They come after the intent on purpose, because a deferred
-	// park leaves the volume on an unused entry with its intent in place, and
-	// that disk has to keep resuming.
+	// second opinion it has. The unused entries that name the birth volid on
+	// a guest holding the disk's note ride out too. They come after the intent
+	// on purpose, because a deferred park leaves the volume on an unused entry
+	// with its intent in place, and that disk has to keep resuming.
 	return DiskIdentity{Volid: birthVolid, Holder: DiskHolder{StorageReferences: hit.StorageReferences}, Unused: hit.Unused}, nil
 }
 

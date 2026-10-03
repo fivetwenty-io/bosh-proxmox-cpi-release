@@ -85,6 +85,14 @@ func HandleResizeDisk(deps Deps) Handler {
 			rd = lifecycle.disk
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
+		// A disk whose transfer to a parker stopped part way resolves to the
+		// parker's record, and the record names the volume the disk had
+		// before the move. Another disk can hold that name by now, so we
+		// finish the transfer first and resize the volume it settles on.
+		rd, resumeErr := resumeTransferIfNeeded(ctx, deps, "resize_disk", rd)
+		if resumeErr != nil {
+			return nil, resumeErr
+		}
 		bareDiskCID = rd.volid
 
 		var newSizeMB int

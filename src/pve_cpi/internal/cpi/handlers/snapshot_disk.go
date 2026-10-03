@@ -74,6 +74,14 @@ func HandleSnapshotDisk(deps Deps) Handler {
 			rd = lifecycle.disk
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
+		// A disk whose transfer to a parker stopped part way resolves to the
+		// parker's record, and the record names the volume the disk had
+		// before the move. Another disk can hold that name by now, so we
+		// finish the transfer first and look for the VM where it settles.
+		rd, resumeErr := resumeTransferIfNeeded(ctx, deps, "snapshot_disk", rd)
+		if resumeErr != nil {
+			return nil, resumeErr
+		}
 		bareDiskCID = rd.volid
 
 		// metadata arg is optional and may be null or absent.

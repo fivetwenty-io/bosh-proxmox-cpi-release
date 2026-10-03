@@ -69,6 +69,10 @@ func (rd resolvedDisk) sentinelKey() string {
 // and no API calls — their handlers behave byte-identically to before stable
 // IDs existed. Stable-ID CIDs pay one cluster scan (plus a parker provenance
 // sweep only when nothing references the volume).
+//
+// A stable-ID disk resolves by its serial, never by a slot that only names its
+// birth volume, and pve.ResolveDiskIdentity refuses the disk when such a slot
+// is all that names it. The wrap below keeps that refusal permanent.
 func resolveDiskForOp(ctx context.Context, deps Deps, op, diskCID, bareDiskCID string, meta *pve.DiskCIDMeta) (resolvedDisk, error) {
 	rd := resolvedDisk{diskCID: diskCID, birth: bareDiskCID, volid: bareDiskCID, meta: meta}
 	if meta != nil {
