@@ -1008,7 +1008,7 @@ Under `detached_disk_strategy: parked` (the default), the CPI holds detached dis
 
 ### Auditing parked disks with `scripts/disk-audit`
 
-`scripts/disk-audit` is a Python 3 operator tool that queries the PVE API directly and classifies every persistent disk volume in the disk-band (default 9000–29999) across all nodes. Run it from the repo root or any host with PVE API access.
+`scripts/disk-audit` is a Python 3 operator tool that queries the PVE API directly and classifies every persistent disk volume across all nodes. We count a volume as ours when its name carries a VMID in the disk-band (default 9000–29999), when a drive line in any guest's config holds its `bpd-` serial, when a sentinel in any guest's description names its full volid, or when it sits on a bus slot of a parker VM, because the CPI renames a stable-ID disk to the VMID of its guest or parker and the band alone would miss it. Storages that PVE lists as disabled or inactive are skipped, and disks on a skipped storage are not in the report. The script prints a `SKIPPED` line on stderr for each one, lists them under `Skipped storages` in the report header, and adds a `skipped_storages` array to the JSON output. A storage that is enabled but not active may hold our disks, so the report words that case as partial coverage. Run it from the repo root or any host with PVE API access.
 
 **Setup — create a config file with PVE credentials:**
 
@@ -1047,8 +1047,10 @@ python3 scripts/disk-audit --config /path/to/audit-config.json --json
 |---|---|
 | `attached` | Volume held by a real (non-parker) VM on an active bus slot |
 | `parked` | Volume held by a parker VM (tag `bosh-parker`, VMID 90000–90999); provenance pulled from parker VM description |
-| `free-floating` | Volume in storage but no VM holds it — potential orphan; triggers exit 1 |
+| `free-floating` | Volume in storage but no VM holds it, which makes it a potential orphan and triggers exit 1. A volume that only a sentinel note named is marked as found only by a sentinel note |
 | `unknown` | Volume found in storage but VMID cannot be determined from the volid pattern |
+
+A sentinel note can go stale, because a record keeps naming the volume under its old name until a transfer finishes, and PVE reuses volume names. When a free-floating volume was found only because a sentinel named it, the report marks it with the VM whose sentinel pointed at it and says to verify with `bosh disks --orphaned` before deleting. The JSON record carries `found_only_by_sentinel`, `sentinel_vmid`, and `sentinel_name`. When a guest still names that volume on an `unusedN` entry, the report names that guest as the holder and the JSON record carries its `holder_slot` and `held_by_unused_entry: true`, which means the volume is referenced by a guest and must not be deleted. Any free-floating record that a guest names on an `unusedN` entry carries the same holder and key, and the stderr `EXIT 1` line names the volume and the guest. The exit code stays 1 for these volumes. Every disk record in the JSON output carries a `discovered_by` list, which names the signals that found it, drawn from `band`, `serial`, `parker`, and `sentinel`.
 
 The report also lists the parker VMs themselves, and that listing carries a `POOL` column naming the resource pool each parker belongs to, left blank for a parker that belongs to no pool. The parker warnings below name the same pool, and write `none` where the column is blank, so a finding says where the parker lives without a second lookup. The column is read from the cluster index, which lags a membership change by minutes, so a parker that was swept into its pool moments ago can still read as unpooled.
 
@@ -1058,7 +1060,7 @@ The owner matters because PVE decides from the volume's name alone which VM owns
 
 To find the real holder, we start from the Director's own pairing. `bosh -d <deployment> instances --details` puts each instance's VM CID next to its disk CIDs. On the Director VM, `/var/vcap/packages/pve_cpi/bin/pve-cid locate <disk-cid>` lists the candidates. It names every guest whose active slot carries the disk's serial or its volid. It also names every unused entry that refers to the volume, whether by its original volid or by the name a matching slot gives it. When more than one guest turns up, locate warns on stderr, and it warns as well when it can't read a guest's config, because a candidate could then be missing. The same tool's `decode <vm-cid>` gives the VMID of the guest the Director believes holds the disk. That guest holds the disk when locate lists it on an active slot. When locate lists more than one guest on an active slot, the Director's VM CID decides which one holds the disk. When locate finds no active slot at all, the volume most likely sits on a guest's unused entry after a transfer that stopped partway, and [delete_vm refuses to destroy VM with attached unused disks](troubleshooting.md#delete_vm-refuses-to-destroy-vm-with-attached-unused-disks) gives the checks and the recovery for that case.
 
-The report reads each guest's current config only, so a reference kept only in a snapshot section isn't counted, and it reads QEMU guests only, so a container that names a volume isn't counted either. It can also see only the guests the token can audit. When the token lacks `VM.Audit` on `/vms`, or when the script can't read the token's permissions, the script warns that the report may miss a second guest, and the JSON sets `multiply_referenced_visibility` to `limited` or `unknown`. A guest whose config didn't come back is listed in `multiply_referenced_unreadable_vmids`, and `multiply_referenced_complete` is `true` only when nothing is missing. None of this changes the exit code.
+The report reads each guest's config in both of PVE's views, the running one and the one with pending changes applied, so a drive whose delete is only pending still counts as held. It doesn't count a reference kept only in a snapshot section, and it reads QEMU guests only, so a container that names a volume isn't counted either. It can also see only the guests the token can audit. When the token lacks `VM.Audit` on `/vms`, or when the script can't read the token's permissions, the script warns that the report may miss a second guest, and the JSON sets `multiply_referenced_visibility` to `limited` or `unknown`. A guest whose config didn't come back is listed in `multiply_referenced_unreadable_vmids`, and `multiply_referenced_complete` is `true` only when nothing is missing. None of this changes the exit code.
 
 The script prints warnings to stderr when:
 
@@ -1069,6 +1071,8 @@ The script prints warnings to stderr when:
 - A parker carries an `unusedN` reference to a live volume, left by a sweep that did not complete. The warning names the `qm unlink` sequence that clears it. That parker is not a teardown candidate: `qm destroy --purge` frees the volume behind an `unusedN` entry as readily as one in a `scsiN` slot.
 
 - A parker's config did not come back, so its contents are unknown and it is not reported as empty.
+
+- One `bpd-` serial appears on two different volumes, which happens when someone clones a BOSH VM. The warning names both volumes and the guests that hold them.
 
 - More than one guest names a volume. The warning names every guest and slot, says which deletion would free the volume, and points back at this section.
 

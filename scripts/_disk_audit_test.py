@@ -472,6 +472,14 @@ class _StubClient:
     def vm_config_soft(self, node: str, vmid: int):
         return self.vm_config(node, vmid)
 
+    def vm_views(self, node: str, vmid: int):
+        cfg = self.vm_config(node, vmid)
+        return None if cfg is None else (cfg, cfg)
+
+    def vm_views_soft(self, node: str, vmid: int):
+        cfg = self.vm_config_soft(node, vmid)
+        return None if cfg is None else (cfg, cfg)
+
     def vms_permissions(self):
         if self.perm_err:
             return None, self.perm_err
@@ -500,7 +508,7 @@ class TestCollectInventoryDoubleReferences(unittest.TestCase):
 
     def test_reads_guests_and_skips_the_container(self) -> None:
         client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS)
-        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        _, _, _, report, _ = disk_audit.collect_inventory(client, _audit_cfg())
         self.assertEqual([r.volid for r in report.records], ["a:123/vm-123-disk-0.raw"])
         self.assertEqual(report.unreadable_vmids, [])
         self.assertNotIn(("pve1", 200), client.reads)
@@ -508,13 +516,13 @@ class TestCollectInventoryDoubleReferences(unittest.TestCase):
 
     def test_missing_vm_audit_limits_visibility(self) -> None:
         client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, privs={})
-        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        _, _, _, report, _ = disk_audit.collect_inventory(client, _audit_cfg())
         self.assertEqual(report.visibility, "limited")
         self.assertFalse(report.complete)
 
     def test_failed_permissions_read_makes_visibility_unknown(self) -> None:
         client = _StubClient(_DOUBLE_ROWS, _DOUBLE_CONFIGS, perm_err="HTTP 403 Forbidden")
-        _, _, _, report = disk_audit.collect_inventory(client, _audit_cfg())
+        _, _, _, report, _ = disk_audit.collect_inventory(client, _audit_cfg())
         self.assertEqual(report.visibility, "unknown")
         self.assertEqual(report.visibility_error, "HTTP 403 Forbidden")
 
@@ -677,16 +685,16 @@ class TestStepEightReadsSoftly(unittest.TestCase):
             return _FakeResponse([{"node": "pve1", "status": "online"}])
         if url.endswith("/nodes/pve1/storage"):
             return _FakeResponse([])
-        if url.endswith("/nodes/pve1/qemu/777/config"):
+        if url.endswith("/nodes/pve1/qemu/777/pending"):
             err = urllib.error.HTTPError(url, 500, "Internal Server Error", None, None)
             self.addCleanup(err.close)
             raise err
-        if url.endswith("/nodes/pve2/qemu/778/config"):
+        if url.endswith("/nodes/pve2/qemu/778/pending"):
             raise urllib.error.URLError("No route to host")
-        if url.endswith("/qemu/779/config"):
-            return _FakeResponse({"scsi1": "a:779/vm-779-disk-1.raw"})
-        if url.endswith("/qemu/780/config"):
-            return _FakeResponse({"unused0": "a:779/vm-779-disk-1.raw"})
+        if url.endswith("/qemu/779/pending"):
+            return _FakeResponse([{"key": "scsi1", "value": "a:779/vm-779-disk-1.raw"}])
+        if url.endswith("/qemu/780/pending"):
+            return _FakeResponse([{"key": "unused0", "value": "a:779/vm-779-disk-1.raw"}])
         if "/access/permissions" in url:
             return _FakeResponse({"/vms": {"VM.Audit": 1}})
         raise AssertionError(f"unexpected request {url}")
@@ -696,10 +704,711 @@ class TestStepEightReadsSoftly(unittest.TestCase):
         cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
         client = disk_audit.PVEClient(cfg)
         with mock.patch.object(disk_audit.urllib.request, "urlopen", self._urlopen):
-            _, _, _, report = disk_audit.collect_inventory(client, cfg)
+            _, _, _, report, _ = disk_audit.collect_inventory(client, cfg)
         self.assertEqual(report.unreadable_vmids, [777, 778])
         self.assertEqual([r.volid for r in report.records], ["a:779/vm-779-disk-1.raw"])
         self.assertFalse(report.complete)
+
+
+class _DiscoveryClient(_StubClient):
+    """A stub with storages, their content, and per-storage read failures."""
+
+    def __init__(self, rows, configs, storages, content, fail_content=()) -> None:
+        super().__init__(rows, configs)
+        self.storages = storages
+        self.content = content
+        self.fail_content = set(fail_content)
+        self.content_reads: list = []
+
+    def node_storages(self, node: str) -> list:
+        return self.storages
+
+    def storage_content(self, node: str, storage: str) -> list:
+        self.content_reads.append(storage)
+        if storage in self.fail_content:
+            raise SystemExit(2)
+        return [{"volid": v, "size": 1 << 30} for v in self.content.get(storage, [])]
+
+
+def _images(name: str, **extra) -> dict:
+    return {"storage": name, "content": "images,rootdir", **extra}
+
+
+_BPD = "bpd-0011223344556677"
+
+
+def _inventory(client):
+    err = io.StringIO()
+    with redirect_stderr(err):
+        disks, parkers, _, report, _ = disk_audit.collect_inventory(client, _audit_cfg())
+    return {d.volid: d for d in disks}, parkers, report, err.getvalue()
+
+
+def _inventory_skipped(client):
+    """Like _inventory, but returns the skipped-storage list."""
+    with redirect_stderr(io.StringIO()):
+        return disk_audit.collect_inventory(client, _audit_cfg())[4]
+
+
+class TestDisabledStorages(unittest.TestCase):
+    """A storage the listing marks off is skipped, and the run carries on."""
+
+    def _run(self, **flags):
+        client = _DiscoveryClient(
+            [], {}, [_images("off", **flags), _images("on")],
+            {"off": ["off:vm-9001-disk-0"], "on": ["on:vm-9002-disk-0"]},
+            fail_content={"off"},
+        )
+        disks, _, _, err = _inventory(client)
+        return client, disks, err
+
+    def test_enabled_zero_is_skipped_with_a_line(self) -> None:
+        client, disks, err = self._run(enabled=0)
+        self.assertNotIn("off", client.content_reads)
+        self.assertEqual(list(disks), ["on:vm-9002-disk-0"])
+        self.assertIn("SKIPPED: node pve1 storage off:", err)
+
+    def test_active_zero_is_skipped_with_a_line(self) -> None:
+        client, disks, err = self._run(active=0)
+        self.assertNotIn("off", client.content_reads)
+        self.assertIn("SKIPPED: node pve1 storage off:", err)
+        self.assertEqual(err.count("SKIPPED"), 1)
+
+    def test_string_and_false_forms_are_skipped(self) -> None:
+        for flags in ({"enabled": "0"}, {"active": "0"}, {"active": False}, {"enabled": False}):
+            client, _, err = self._run(**flags)
+            self.assertNotIn("off", client.content_reads, flags)
+            self.assertIn("SKIPPED", err, flags)
+
+    def test_missing_and_set_fields_are_still_read(self) -> None:
+        for flags in ({}, {"enabled": 1, "active": 1}, {"enabled": "1", "active": "1"}):
+            client = _DiscoveryClient([], {}, [_images("on", **flags)], {"on": ["on:vm-9002-disk-0"]})
+            disks, _, _, err = _inventory(client)
+            self.assertEqual(list(disks), ["on:vm-9002-disk-0"], flags)
+            self.assertNotIn("SKIPPED", err)
+
+    def test_a_500_on_an_enabled_storage_still_fails_the_run(self) -> None:
+        client = _DiscoveryClient([], {}, [_images("on")], {"on": ["on:vm-9002-disk-0"]}, fail_content={"on"})
+        with self.assertRaises(SystemExit) as ctx:
+            _inventory(client)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_real_client_still_dies_on_http_500(self) -> None:
+        import urllib.error
+        from unittest import mock
+        cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
+        client = disk_audit.PVEClient(cfg)
+
+        def urlopen(req, context=None, timeout=None):
+            err = urllib.error.HTTPError(req.full_url, 500, "storage 'x' is disabled", None, None)
+            self.addCleanup(err.close)
+            raise err
+
+        with mock.patch.object(disk_audit.urllib.request, "urlopen", urlopen):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                client.storage_content("pve1", "x")
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class TestStableIDParser(unittest.TestCase):
+    """stable_id_from_drive_opt_str ports StableIDFromDriveOptStr."""
+
+    def test_shapes(self) -> None:
+        f = disk_audit.stable_id_from_drive_opt_str
+        self.assertEqual(f(f"a:vm-1-disk-0,serial={_BPD},size=8G"), _BPD)
+        self.assertEqual(f(f"a:vm-1-disk-0,size=8G,serial={_BPD}"), _BPD)
+        self.assertEqual(f("a:vm-1-disk-0,serial=guest123,size=8G"), "")
+        self.assertEqual(f("a:vm-1-disk-0,size=8G"), "")
+        self.assertEqual(f(f"serial={_BPD}"), "")  # the volid slot is never an option
+        self.assertEqual(f("a:vm-1-disk-0"), "")
+
+
+class TestRenamedDiskDiscovery(unittest.TestCase):
+    """Disks found by identity rather than by the VMID in their name."""
+
+    ROWS = [
+        {"vmid": 777, "node": "pve1", "name": "web-0", "type": "qemu"},
+        {"vmid": 778, "node": "pve1", "name": "web-1", "type": "qemu"},
+        {"vmid": 90656, "node": "pve1", "name": "bosh-parker-90656", "type": "qemu", "tags": "bosh-cpi;bosh-parker"},
+    ]
+
+    def _client(self, configs, volumes):
+        return _DiscoveryClient(self.ROWS, configs, [_images("a")], {"a": volumes})
+
+    def test_band_discovery_is_unchanged(self) -> None:
+        client = self._client({777: {"scsi1": "a:vm-9001-disk-0"}}, ["a:vm-9001-disk-0", "a:vm-9002-disk-0"])
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks["a:vm-9001-disk-0"].classification, "attached")
+        self.assertEqual(disks["a:vm-9002-disk-0"].classification, "free-floating")
+        self.assertEqual(disks["a:vm-9001-disk-0"].discovered_by, ["band"])
+        self.assertEqual(disks["a:vm-9001-disk-0"].to_dict()["discovered_by"], ["band"])
+
+    def test_guest_vmid_disk_with_bpd_serial_is_found_and_attached(self) -> None:
+        client = self._client({777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD},size=8G"}}, ["a:vm-777-disk-1"])
+        disks, _, _, _ = _inventory(client)
+        rec = disks["a:vm-777-disk-1"]
+        self.assertEqual(rec.classification, "attached")
+        self.assertEqual(rec.holder_vmid, 777)
+        self.assertEqual(rec.discovered_by, ["serial"])
+        self.assertEqual(rec.to_dict()["discovered_by"], ["serial"])
+
+    def test_parker_vmid_disk_named_in_a_sentinel_is_found_and_parked(self) -> None:
+        desc = "<!--BOSH:" + json.dumps({"bosh_parked_disks": {_BPD: {
+            "volid": "a:vm-90656-disk-0", "disk_cid": "cid-1", "node": "pve1"}}}) + "-->"
+        client = self._client(
+            {90656: {"scsi0": "a:vm-90656-disk-0", "description": desc}}, ["a:vm-90656-disk-0"])
+        disks, _, _, _ = _inventory(client)
+        rec = disks["a:vm-90656-disk-0"]
+        self.assertEqual(rec.classification, "parked")
+        self.assertEqual(rec.disk_cid, "cid-1")
+        self.assertEqual(rec.discovered_by, ["parker", "sentinel"])
+
+    def test_attached_sentinel_full_volid_key_names_the_volume(self) -> None:
+        desc = "<!--BOSH:" + json.dumps({"bosh_attached_disks": {"a:vm-777-disk-2": "cid-2"}}) + "-->"
+        client = self._client(
+            {777: {"scsi2": "a:vm-777-disk-2", "description": desc}}, ["a:vm-777-disk-2"])
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks["a:vm-777-disk-2"].classification, "attached")
+        self.assertEqual(disks["a:vm-777-disk-2"].discovered_by, ["sentinel"])
+
+    def test_renamed_disk_two_guests_name_is_listed_as_shared(self) -> None:
+        client = self._client({
+            777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"},
+            778: {"unused0": "a:vm-777-disk-1"},
+        }, ["a:vm-777-disk-1"])
+        disks, _, report, _ = _inventory(client)
+        self.assertIn("a:vm-777-disk-1", disks)
+        self.assertEqual([r.volid for r in report.records], ["a:vm-777-disk-1"])
+        self.assertEqual({ref["vmid"] for ref in report.records[0].references}, {777, 778})
+
+    def test_non_bosh_volume_outside_the_band_is_ignored(self) -> None:
+        client = self._client({
+            777: {"scsi1": "a:vm-777-disk-1,serial=guest-serial", "scsi2": "a:vm-777-disk-2"},
+        }, ["a:vm-777-disk-1", "a:vm-777-disk-2", "a:vm-31000-disk-0"])
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks, {})
+
+    def test_unreadable_guest_is_warned_about(self) -> None:
+        client = self._client({777: None}, ["a:vm-777-disk-1"])
+        _, _, _, err = _inventory(client)
+        self.assertIn("could not be read", err)
+
+    def test_json_report_carries_discovered_by(self) -> None:
+        client = self._client({777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"}}, ["a:vm-777-disk-1"])
+        disks, parkers, report, _ = _inventory(client)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_json_report(list(disks.values()), parkers, _make_cfg(), report, [])
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["disks"][0]["discovered_by"], ["serial"])
+        self.assertEqual(out["summary"]["attached"], 1)
+        self.assertEqual(out["skipped_storages"], [])
+
+
+def _sentinel(data: dict) -> str:
+    return "<!--BOSH:" + json.dumps(data) + "-->"
+
+
+class _FailClient(_DiscoveryClient):
+    """A discovery stub whose soft and hard config reads fail for chosen VMIDs."""
+
+    def __init__(self, *args, soft_fail=(), hard_fail=(), **kw) -> None:
+        super().__init__(*args, **kw)
+        self.soft_fail = set(soft_fail)
+        self.hard_fail = set(hard_fail)
+        self.hard_reads: list = []
+
+    def vm_config_soft(self, node: str, vmid: int):
+        if vmid in self.soft_fail:
+            return None
+        return self.configs.get(vmid)
+
+    def vm_config(self, node: str, vmid: int):
+        self.hard_reads.append(vmid)
+        if vmid in self.hard_fail:
+            raise SystemExit(2)
+        return self.configs.get(vmid)
+
+
+class _ViewsClient(_DiscoveryClient):
+    """A discovery stub that answers both config views, one pair per VM."""
+
+    def __init__(self, *args, views=None, **kw) -> None:
+        super().__init__(*args, **kw)
+        self.views = views or {}
+
+    def vm_views_soft(self, node: str, vmid: int):
+        return self.views.get(vmid)
+
+    def vm_views(self, node: str, vmid: int):
+        return self.views.get(vmid)
+
+
+_FIX_ROWS = [
+    {"vmid": 777, "node": "pve1", "name": "web-0", "type": "qemu"},
+    {"vmid": 778, "node": "pve1", "name": "web-1", "type": "qemu"},
+    {"vmid": 500, "node": "pve1", "name": "operator-vm", "type": "qemu"},
+    {"vmid": 90656, "node": "pve1", "name": "bosh-parker-90656", "type": "qemu", "tags": "bosh-cpi;bosh-parker"},
+]
+
+
+class TestSentinelOnlyEvidence(unittest.TestCase):
+    """A sentinel counts by its full volid only, and a lone sentinel proves little."""
+
+    def test_bare_name_never_matches_a_volume_on_another_storage(self) -> None:
+        desc = _sentinel({"bosh_attached_disks": {"vm-500-disk-0": "cid"}})
+        client = _DiscoveryClient(
+            _FIX_ROWS, {777: {"scsi1": "a:vm-500-disk-0", "description": desc}, 500: {"unused0": "b:vm-500-disk-0"}},
+            [_images("a"), _images("b")], {"a": ["a:vm-500-disk-0"], "b": ["b:vm-500-disk-0"]},
+        )
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks, {})
+
+    def test_parse_returns_only_full_volids(self) -> None:
+        desc = _sentinel({
+            "bosh_attached_disks": {"vm-1-disk-0": "c", "a:vm-1-disk-1": "c", _BPD: "c"},
+            "bosh_parked_disks": {_BPD: {"volid": "vm-2-disk-0"}, "a:vm-3-disk-0": {"volid": "a:vm-3-disk-0"}},
+        })
+        self.assertEqual(
+            disk_audit.parse_sentinel_volume_names(desc), {"a:vm-1-disk-1", "a:vm-3-disk-0"})
+
+    def _lone_sentinel(self, configs):
+        desc = _sentinel({"bosh_parked_disks": {_BPD: {"volid": "a:vm-31000-disk-0", "slot": "scsi9"}}})
+        configs = dict(configs)
+        configs[90656] = {"description": desc}
+        return _DiscoveryClient(_FIX_ROWS, configs, [_images("a")], {"a": ["a:vm-31000-disk-0"]})
+
+    def test_lone_sentinel_volume_is_marked_not_plain(self) -> None:
+        disks, parkers, report, _ = _inventory(self._lone_sentinel({}))
+        rec = disks["a:vm-31000-disk-0"]
+        self.assertEqual(rec.classification, "free-floating")
+        self.assertTrue(rec.sentinel_only)
+        self.assertEqual((rec.sentinel_vmid, rec.sentinel_name), (90656, "bosh-parker-90656"))
+        d = rec.to_dict()
+        self.assertTrue(d["found_only_by_sentinel"])
+        self.assertEqual(d["sentinel_vmid"], 90656)
+        self.assertEqual(d["sentinel_name"], "bosh-parker-90656")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report(list(disks.values()), parkers, _make_cfg(), report, [])
+        out = buf.getvalue()
+        self.assertIn("found only by a sentinel note on VM 90656 (bosh-parker-90656)", out)
+        self.assertIn("`bosh disks --orphaned` before deleting", out)
+
+    def test_band_orphan_is_not_marked(self) -> None:
+        client = _DiscoveryClient(_FIX_ROWS, {}, [_images("a")], {"a": ["a:vm-9001-disk-0"]})
+        disks, _, _, _ = _inventory(client)
+        rec = disks["a:vm-9001-disk-0"]
+        self.assertFalse(rec.sentinel_only)
+        self.assertNotIn("found_only_by_sentinel", rec.to_dict())
+
+    def test_guest_naming_the_volume_on_an_unused_entry_is_reported_as_its_holder(self) -> None:
+        client = self._lone_sentinel({500: {"unused0": "a:vm-31000-disk-0"}})
+        disks, parkers, report, _ = _inventory(client)
+        rec = disks["a:vm-31000-disk-0"]
+        self.assertTrue(rec.sentinel_only)
+        self.assertEqual((rec.holder_vmid, rec.holder_name, rec.holder_slot), (500, "operator-vm", "unused0"))
+        self.assertEqual(rec.to_dict()["holder_slot"], "unused0")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report(list(disks.values()), parkers, _make_cfg(), report, [])
+        out = buf.getvalue()
+        self.assertIn("DO NOT DELETE: VM 500 (operator-vm) still names it on unused0, so PVE references it", out)
+        self.assertLess(out.index("DO NOT DELETE"), out.index("found only by a sentinel note"))
+        self.assertTrue(rec.to_dict()["held_by_unused_entry"])
+
+    def test_band_volume_named_on_an_unused_entry_gets_the_holder(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS, {500: {"unused0": "a:vm-9001-disk-0"}}, [_images("a")], {"a": ["a:vm-9001-disk-0"]},
+        )
+        disks, _, _, _ = _inventory(client)
+        rec = disks["a:vm-9001-disk-0"]
+        self.assertEqual(rec.classification, "free-floating")
+        self.assertFalse(rec.sentinel_only)
+        self.assertEqual((rec.holder_vmid, rec.holder_slot), (500, "unused0"))
+        self.assertTrue(rec.to_dict()["held_by_unused_entry"])
+
+    def test_unheld_volume_has_no_held_key(self) -> None:
+        disks, _, _, _ = _inventory(_DiscoveryClient(_FIX_ROWS, {}, [_images("a")], {"a": ["a:vm-9001-disk-0"]}))
+        self.assertNotIn("held_by_unused_entry", disks["a:vm-9001-disk-0"].to_dict())
+
+    def test_exit_line_names_the_holding_guest(self) -> None:
+        import os
+        import tempfile
+        client = self._lone_sentinel({500: {"unused0": "a:vm-31000-disk-0"}})
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"}, fh)
+            path = fh.name
+        original = disk_audit.PVEClient
+        disk_audit.PVEClient = lambda cfg: client
+        err = io.StringIO()
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                disk_audit.main(["--config", path])
+        finally:
+            disk_audit.PVEClient = original
+            os.unlink(path)
+        self.assertIn("still named by VM 500", err.getvalue())
+
+    def test_exit_code_stays_one_for_a_lone_sentinel_volume(self) -> None:
+        import os
+        import tempfile
+        client = self._lone_sentinel({})
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"}, fh)
+            path = fh.name
+        original = disk_audit.PVEClient
+        disk_audit.PVEClient = lambda cfg: client
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = disk_audit.main(["--config", path])
+        finally:
+            disk_audit.PVEClient = original
+            os.unlink(path)
+        self.assertEqual(rc, 1)
+
+
+class TestFailClosedConfigReads(unittest.TestCase):
+    """An unreadable guest or parker ends the run, whatever the volumes are named."""
+
+    _HELD = {777: {"scsi1": f"a:vm-777-disk-2,serial={_BPD}"}}
+
+    def test_unreadable_holder_with_no_band_volume_fails_the_run(self) -> None:
+        desc = _sentinel({"bosh_parked_disks": {_BPD: {"volid": "a:vm-777-disk-2", "slot": "scsi3"}}})
+        client = _FailClient(
+            _FIX_ROWS, {**self._HELD, 90656: {"description": desc}}, [_images("a")],
+            {"a": ["a:vm-777-disk-2"]}, soft_fail={777}, hard_fail={777},
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            _inventory(client)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_unreadable_parker_with_no_band_volume_fails_the_run(self) -> None:
+        client = _FailClient(
+            _FIX_ROWS, {777: {"scsi0": "a:vm-777-disk-0"}, 90656: {"scsi0": f"a:vm-90656-disk-0,serial={_BPD}"}},
+            [_images("a")], {"a": ["a:vm-777-disk-0", "a:vm-90656-disk-0"]}, soft_fail={90656}, hard_fail={90656},
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            _inventory(client)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_failed_soft_read_falls_back_to_a_hard_read_that_can_succeed(self) -> None:
+        client = _FailClient(
+            _FIX_ROWS, dict(self._HELD), [_images("a")], {"a": ["a:vm-777-disk-2"]}, soft_fail={777},
+        )
+        disks, _, _, _ = _inventory(client)
+        self.assertIn(777, client.hard_reads)
+        self.assertEqual(disks["a:vm-777-disk-2"].classification, "attached")
+
+    def test_parker_whose_step_four_read_failed_is_hard_read_again(self) -> None:
+        client = _FailClient(
+            _FIX_ROWS, {777: {}}, [_images("a")], {"a": ["a:vm-9001-disk-0"]}, soft_fail={90656},
+        )
+        _, parkers, _, _ = _inventory(client)
+        self.assertGreaterEqual(client.hard_reads.count(90656), 2)
+        self.assertFalse(parkers[0].config_read)
+
+    def test_no_volumes_keeps_the_soft_reads(self) -> None:
+        client = _FailClient(_FIX_ROWS, {}, [_images("a")], {"a": []}, soft_fail={777}, hard_fail={777})
+        _, _, report, _ = _inventory(client)
+        self.assertIn(777, report.unreadable_vmids)
+
+
+class TestSkippedStorageReport(unittest.TestCase):
+    """A skipped storage shows up in the report, the JSON, and the return value."""
+
+    def _client(self, **flags):
+        return _DiscoveryClient(
+            [], {}, [_images("off", **flags), _images("on")],
+            {"off": ["off:vm-9001-disk-0"], "on": ["on:vm-9002-disk-0"]},
+        )
+
+    def test_collect_inventory_returns_the_skipped_tuples(self) -> None:
+        skipped = _inventory_skipped(self._client(enabled=0))
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0][:2], ("pve1", "off"))
+        self.assertIn("disabled", skipped[0][2])
+        self.assertEqual(_inventory_skipped(_DiscoveryClient([], {}, [_images("on")], {"on": []})), [])
+
+    def test_inactive_storage_is_worded_as_partial_coverage(self) -> None:
+        skipped = _inventory_skipped(self._client(active=0))
+        self.assertIn("not active", skipped[0][2])
+        self.assertIn("partial", skipped[0][2])
+
+    def test_human_header_lists_the_skipped_storages(self) -> None:
+        skipped = _inventory_skipped(self._client(enabled=0))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report([], [], _make_cfg(), None, skipped)
+        out = buf.getvalue()
+        self.assertIn("Skipped storages", out)
+        self.assertIn("are not in this report", out)
+        self.assertIn("node pve1 storage off:", out)
+        self.assertLess(out.index("Parker band"), out.index("Skipped storages"))
+        self.assertLess(out.index("Skipped storages"), out.index("Total disk volumes"))
+
+    def test_human_header_omits_the_block_when_nothing_was_skipped(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_human_report([], [], _make_cfg(), None, [])
+        self.assertNotIn("Skipped storages", buf.getvalue())
+
+    def test_json_carries_a_skipped_storages_array(self) -> None:
+        skipped = _inventory_skipped(self._client(active="0"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_json_report([], [], _make_cfg(), None, skipped)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["skipped_storages"][0]["node"], "pve1")
+        self.assertEqual(out["skipped_storages"][0]["storage"], "off")
+        self.assertIn("reason", out["skipped_storages"][0])
+
+    def test_exit_code_is_unchanged_by_a_skipped_storage(self) -> None:
+        import os
+        import tempfile
+        client = self._client(enabled=0)
+        client.content["on"] = []
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"}, fh)
+            path = fh.name
+        original = disk_audit.PVEClient
+        disk_audit.PVEClient = lambda cfg: client
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = disk_audit.main(["--config", path])
+        finally:
+            disk_audit.PVEClient = original
+            os.unlink(path)
+        self.assertEqual(rc, 0)
+
+
+class TestParkerSlotsAndCrashedTransfers(unittest.TestCase):
+    """A volume on a parker's bus slot is ours, even in a crashed transfer window."""
+
+    def test_crash_window_volume_on_a_parker_slot_is_found(self) -> None:
+        desc = _sentinel({"bosh_parked_disks": {_BPD: {"volid": "a:vm-777-disk-2", "slot": "scsi3", "disk_cid": "c"}}})
+        client = _DiscoveryClient(
+            _FIX_ROWS, {90656: {"scsi3": "a:vm-90656-disk-1", "description": desc}}, [_images("a")],
+            {"a": ["a:vm-90656-disk-1"]},
+        )
+        disks, parkers, _, _ = _inventory(client)
+        rec = disks["a:vm-90656-disk-1"]
+        self.assertEqual(rec.classification, "parked")
+        self.assertIn("parker", rec.discovered_by)
+        self.assertEqual(parkers[0].disk_count, 1)
+
+    def test_any_bus_slot_volume_of_a_parker_counts_without_a_sentinel(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS, {90656: {"scsi0": "a:vm-90656-disk-0"}}, [_images("a")], {"a": ["a:vm-90656-disk-0"]})
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks["a:vm-90656-disk-0"].discovered_by, ["parker"])
+        self.assertEqual(disks["a:vm-90656-disk-0"].classification, "parked")
+
+    def test_untagged_vm_in_the_parker_band_does_not_count(self) -> None:
+        rows = [{"vmid": 90700, "node": "pve1", "name": "intruder", "type": "qemu"}]
+        client = _DiscoveryClient(rows, {90700: {"scsi0": "a:vm-90700-disk-0"}}, [_images("a")],
+                                  {"a": ["a:vm-90700-disk-0"]})
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks, {})
+
+    def test_tagged_vm_outside_the_parker_band_does_not_count(self) -> None:
+        rows = [{"vmid": 600, "node": "pve1", "name": "tagged", "type": "qemu", "tags": "bosh-parker"}]
+        client = _DiscoveryClient(rows, {600: {"scsi0": "a:vm-600-disk-0"}}, [_images("a")],
+                                  {"a": ["a:vm-600-disk-0"]})
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks, {})
+
+    def test_slot_field_names_the_volume_on_that_slot(self) -> None:
+        desc = _sentinel({"bosh_parked_disks": {_BPD: {"volid": "a:vm-1-disk-0", "slot": "scsi3"}}})
+        got = disk_audit.parse_sentinel_volume_names(desc, {"scsi3": "a:vm-90656-disk-1,size=8G"})
+        self.assertEqual(got, {"a:vm-1-disk-0", "a:vm-90656-disk-1"})
+        self.assertEqual(disk_audit.parse_sentinel_volume_names(desc, {}), {"a:vm-1-disk-0"})
+
+
+class TestPendingViews(unittest.TestCase):
+    """A key counts as held when either the current or the pending view names it."""
+
+    _ROWS = [
+        {"key": "scsi1", "value": f"a:vm-777-disk-2,serial={_BPD}", "delete": 1},
+        {"key": "scsi2", "pending": f"a:vm-777-disk-3,serial=bpd-aabbccddeeff0011"},
+        {"key": "scsi3", "value": "a:vm-777-disk-4", "pending": "a:vm-777-disk-5"},
+        {"key": "digest", "value": "abc"},
+        {"key": "memory", "value": 2048},
+    ]
+
+    def test_parse_pending_views_shape(self) -> None:
+        current, applied = disk_audit.parse_pending_views(self._ROWS)
+        self.assertIn("scsi1", current)
+        self.assertNotIn("scsi1", applied)
+        self.assertNotIn("scsi2", current)
+        self.assertEqual(applied["scsi2"], "a:vm-777-disk-3,serial=bpd-aabbccddeeff0011")
+        self.assertEqual(current["scsi3"], "a:vm-777-disk-4")
+        self.assertEqual(applied["scsi3"], "a:vm-777-disk-5")
+        self.assertEqual(applied["memory"], "2048")
+        self.assertIsNone(disk_audit.parse_pending_views(None))
+        self.assertIsNone(disk_audit.parse_pending_views({"scsi0": "x"}))
+
+    def test_merged_config_keeps_a_pending_delete(self) -> None:
+        merged = disk_audit.merge_views(disk_audit.parse_pending_views(self._ROWS))
+        self.assertIn("scsi1", merged)
+        self.assertEqual(merged["scsi3"], "a:vm-777-disk-5")
+
+    def test_pending_delete_still_holds_the_volume_and_carries_its_serial(self) -> None:
+        views = {777: ({"scsi1": f"a:vm-777-disk-2,serial={_BPD}"}, {})}
+        desc = _sentinel({"bosh_parked_disks": {_BPD: {"volid": "a:vm-777-disk-2", "slot": "scsi3"}}})
+        views[90656] = ({"description": desc}, {"description": desc})
+        client = _ViewsClient(_FIX_ROWS, {}, [_images("a")], {"a": ["a:vm-777-disk-2"]}, views=views)
+        disks, _, _, _ = _inventory(client)
+        rec = disks["a:vm-777-disk-2"]
+        self.assertEqual(rec.classification, "attached")
+        self.assertEqual(rec.holder_vmid, 777)
+        self.assertEqual(rec.discovered_by, ["serial", "sentinel"])
+
+    def test_pending_only_key_is_held(self) -> None:
+        views = {777: ({}, {"scsi1": f"a:vm-777-disk-2,serial={_BPD}"})}
+        client = _ViewsClient(_FIX_ROWS, {}, [_images("a")], {"a": ["a:vm-777-disk-2"]}, views=views)
+        disks, _, _, _ = _inventory(client)
+        self.assertEqual(disks["a:vm-777-disk-2"].classification, "attached")
+
+    def test_real_client_reads_the_pending_endpoint_with_get_only(self) -> None:
+        from unittest import mock
+        cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
+        client = disk_audit.PVEClient(cfg)
+        seen = []
+
+        def urlopen(req, context=None, timeout=None):
+            seen.append((req.get_method(), req.full_url))
+            return _FakeResponse(self._ROWS)
+
+        with mock.patch.object(disk_audit.urllib.request, "urlopen", urlopen):
+            hard = client.vm_views("pve1", 777)
+            soft = client.vm_views_soft("pve1", 777)
+        self.assertEqual(hard, soft)
+        self.assertEqual([m for m, _ in seen], ["GET", "GET"])
+        self.assertTrue(all(u.endswith("/nodes/pve1/qemu/777/pending") for _, u in seen))
+
+    def test_failed_pending_read_still_fails_closed(self) -> None:
+        import urllib.error
+        from unittest import mock
+        cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
+        client = disk_audit.PVEClient(cfg)
+
+        def urlopen(req, context=None, timeout=None):
+            if req.full_url.endswith("/pending"):
+                err = urllib.error.HTTPError(req.full_url, 500, "boom", None, None)
+                self.addCleanup(err.close)
+                raise err
+            return _FakeResponse([{"vmid": 777, "node": "pve1", "type": "qemu"}] if "resources" in req.full_url
+                                 else [{"node": "pve1", "status": "online"}] if req.full_url.endswith("/nodes")
+                                 else [_images("a")] if req.full_url.endswith("/storage")
+                                 else [{"volid": "a:vm-777-disk-1", "size": 1}])
+
+        with mock.patch.object(disk_audit.urllib.request, "urlopen", urlopen):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                disk_audit.collect_inventory(client, _audit_cfg())
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class TestDiscoveredByShape(unittest.TestCase):
+    """Every disk record carries discovered_by, so readers see one shape."""
+
+    def test_band_only_record_carries_band(self) -> None:
+        rec = disk_audit.DiskRecord("a:vm-9001-disk-0", "a", "pve1", 1)
+        self.assertEqual(rec.to_dict()["discovered_by"], ["band"])
+
+    def test_json_report_has_discovered_by_on_every_disk(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS, {777: {"scsi1": "a:vm-9001-disk-0", "scsi2": f"a:vm-777-disk-2,serial={_BPD}"}},
+            [_images("a")], {"a": ["a:vm-9001-disk-0", "a:vm-777-disk-2"]},
+        )
+        disks, parkers, report, _ = _inventory(client)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            disk_audit.print_json_report(list(disks.values()), parkers, _make_cfg(), report, [])
+        out = json.loads(buf.getvalue())
+        self.assertEqual(len(out["disks"]), 2)
+        self.assertTrue(all("discovered_by" in d for d in out["disks"]))
+        self.assertEqual(
+            {d["volid"]: d["discovered_by"] for d in out["disks"]},
+            {"a:vm-9001-disk-0": ["band"], "a:vm-777-disk-2": ["serial"]},
+        )
+
+
+class TestDuplicateSerials(unittest.TestCase):
+    """One bpd- token on two volumes draws a warning that names both."""
+
+    def test_clone_sharing_a_serial_warns_with_both_volids_and_holders(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS,
+            {777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"}, 778: {"scsi1": f"a:vm-778-disk-1,serial={_BPD}"}},
+            [_images("a")], {"a": ["a:vm-777-disk-1", "a:vm-778-disk-1"]},
+        )
+        disks, _, _, err = _inventory(client)
+        self.assertEqual(len(disks), 2)
+        self.assertIn(f"serial {_BPD} appears on 2 different volumes", err)
+        self.assertIn("a:vm-777-disk-1 (held by VM 777 (web-0))", err)
+        self.assertIn("a:vm-778-disk-1 (held by VM 778 (web-1))", err)
+
+    def test_one_volume_named_by_two_guests_is_not_a_duplicate_serial(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS,
+            {777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"}, 778: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"}},
+            [_images("a")], {"a": ["a:vm-777-disk-1"]},
+        )
+        _, _, _, err = _inventory(client)
+        self.assertNotIn("different volumes", err)
+
+    def test_distinct_serials_do_not_warn(self) -> None:
+        client = _DiscoveryClient(
+            _FIX_ROWS,
+            {777: {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"}, 778: {"scsi1": "a:vm-778-disk-1,serial=bpd-1122334455667788"}},
+            [_images("a")], {"a": ["a:vm-777-disk-1", "a:vm-778-disk-1"]},
+        )
+        _, _, _, err = _inventory(client)
+        self.assertNotIn("different volumes", err)
+
+
+class TestPendingViewShapes(unittest.TestCase):
+    """A reply the audit cannot read as config rows ends the run."""
+
+    def _client(self, data):
+        cfg = disk_audit.AuditConfig({"host": "pve.example.com", "user": "root@pam", "api_token": "root@pam!t=x"})
+        client = disk_audit.PVEClient(cfg)
+        client.get = lambda path, allow_missing=False: data
+        return client
+
+    def _dies(self, data) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                self._client(data).vm_views("pve1", 777)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_non_list_body_ends_the_run(self) -> None:
+        self._dies({"key": "scsi0"})
+
+    def test_malformed_row_ends_the_run(self) -> None:
+        self._dies([{"key": "scsi0", "value": "a:vm-1-disk-0"}, "oops"])
+        self._dies([{"value": "x"}])
+
+    def test_missing_guest_and_good_rows_still_read(self) -> None:
+        self.assertIsNone(self._client(None).vm_views("pve1", 777))
+        views = self._client([{"key": "scsi0", "value": "a:vm-1-disk-0"}]).vm_views("pve1", 777)
+        self.assertEqual(views[0], {"scsi0": "a:vm-1-disk-0"})
+
+
+class TestPendingSerialIsNotAClone(unittest.TestCase):
+    def test_same_disk_with_a_new_volid_in_the_pending_view_does_not_warn(self) -> None:
+        client = _ViewsClient(
+            _FIX_ROWS, {}, [_images("a")], {"a": ["a:vm-777-disk-1", "a:vm-777-disk-2"]},
+            views={
+                777: (
+                    {"scsi1": f"a:vm-777-disk-1,serial={_BPD}"},
+                    {"scsi1": f"a:vm-777-disk-2,serial={_BPD}"},
+                ),
+            },
+        )
+        _, _, _, err = _inventory(client)
+        self.assertNotIn("different volumes", err)
 
 
 if __name__ == "__main__":
