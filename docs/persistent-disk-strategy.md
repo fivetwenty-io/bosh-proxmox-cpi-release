@@ -201,9 +201,7 @@ cannot follow it.
 
 The `disk-audit` script reads these sentinel entries to build its inventory.
 Free-floating disks have no provenance entry because PVE provides no field to
-write one. That gap is why `disk-audit` classifies free-floating volumes
-separately: their presence is inferred from the CID band rather than a recorded
-origin.
+write one. That gap is why `disk-audit` classifies free-floating volumes separately. We find them through the disk band or a sentinel that names them, not through a recorded origin.
 
 ### Create lifecycle (parked strategy)
 
@@ -689,14 +687,7 @@ entry is present the audit displays its `disk_cid`, `source_vm_cid`,
 columns are empty, but the disk still appears as `parked` because holder
 classification is based on the actual `scsiN` slot scan, not the sentinel.
 
-The audit also scans all VMs in the configured disk VMID band for unattached
-volumes not held by any parker. Those are reported as `free-floating` and cause
-a non-zero exit code. A parker is reported as empty, and offered as a teardown
-candidate, only when its config was read and holds neither a bus disk nor an
-`unusedN` reference. An `unusedN` entry gets its own warning naming the `qm
-unlink` sequence that clears it, because `qm destroy --purge` frees the volume
-behind such an entry as readily as one in a `scsiN` slot. An empty parker is the
-expected state after a full strategy migration.
+The audit also looks for volumes that no VM holds. We count a volume as ours when its name carries a VMID in the configured disk band, when a drive line in any VM's config carries its `bpd-` serial, when a sentinel names its full volid, or when it sits on a bus slot of a parker VM, so a disk the CPI renamed to a guest or parker VMID is still found. A serial can only mark a volume that some VM holds, because it lives on that VM's drive line. Volumes that no VM holds are reported as `free-floating` and cause a non-zero exit code, and one that only a sentinel named is marked as such, because a sentinel can go stale. Disks on a storage that PVE lists as disabled or inactive are not in the report, and the report header lists each skipped storage. A parker is reported as empty, and offered as a teardown candidate, only when its config was read and holds neither a bus disk nor an `unusedN` reference. An `unusedN` entry gets its own warning naming the `qm unlink` sequence that clears it, because `qm destroy --purge` frees the volume behind such an entry as readily as one in a `scsiN` slot. An empty parker is the expected state after a full strategy migration.
 
 ---
 

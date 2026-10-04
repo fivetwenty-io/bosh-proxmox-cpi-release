@@ -41,7 +41,7 @@ flowchart TB
 
 ## Trust, then verify
 
-Because disks are where mistakes are unrecoverable, the tooling assumes we will want to check. The `scripts/disk-audit` tool walks the entire disk band across every node and classifies each volume — attached, parked, free-floating, or unknown — with stable exit codes, so it works equally well as a monthly human habit or a CI gate. The reference docs pair it with a firm rule of thumb: before deleting anything that looks orphaned, ask the Director first (`bosh disks --orphaned`), because a disk BOSH still tracks is not an orphan, no matter how lonely it looks.
+Because disks are where mistakes are unrecoverable, the tooling assumes we will want to check. The `scripts/disk-audit` tool finds every disk the CPI manages across every node, by its serial, its sentinel notes, and its parker slot as well as its VMID band, and classifies each volume as attached, parked, free-floating, or unknown, with stable exit codes, so it works equally well as a monthly human habit or a CI gate. The reference docs pair it with a firm rule of thumb: before deleting anything that looks orphaned, ask the Director first (`bosh disks --orphaned`), because a disk BOSH still tracks is not an orphan, no matter how lonely it looks.
 
 Performance settings follow the same carried-not-remembered philosophy: caching, I/O threading, and throughput caps chosen at creation ride inside the ID envelope and are applied at every attach. Defaults for all of these resolve sensibly from the storage backend, so most deployments never set any of them.
 

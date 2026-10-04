@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """Operator audit tool for BOSH persistent disks managed by the PVE CPI.
 
-Enumerates all persistent disk volumes in the configured disk-VMID band across
-every PVE node and classifies each one:
+Finds every persistent disk volume that the CPI manages across every PVE node
+and classifies each one. We count a volume as ours when its name carries a VMID
+in the configured disk band, when a drive line in a guest's config carries its
+bpd- serial, when a sentinel in a guest's description names its full volid, or
+when it sits on a bus slot of a parker VM. The CPI renames a stable-ID disk to
+the VMID of its guest or parker, so the band alone misses renamed disks.
+Storages that PVE lists as disabled or inactive are skipped, and disks on a
+skipped storage are not in the report.
+
+Each volume gets one of these classifications:
 
   attached     — volume is attached to a real (non-parker) VM
   parked       — volume is held by a parker VM (bosh-parker tag + parker VMID range);
                  provenance columns are pulled from the <!--BOSH:{...}--> sentinel
                  in the parker VM description
-  free-floating — volume exists in storage but no VM holds it (potential orphan)
+  free-floating — volume exists in storage but no VM holds it (potential orphan).
+                  A volume that only a sentinel note named is marked as such,
+                  because a sentinel can go stale, and should be checked with
+                  `bosh disks --orphaned` before anyone deletes it
   unknown       — volume found in storage content but VMID cannot be determined
                   from the volid pattern
 
@@ -29,6 +40,8 @@ Warnings are printed to stderr when:
     workload VM the CPI never moves out on its own, and an operator has to
     move it by hand. A pool counts as a parker pool when a parker VM belongs
     to it, and --parker-pool names one that holds no parker yet.
+  - one bpd- serial appears on two different volumes, which a clone of a BOSH
+    VM can cause
   - a volume is named by more than one guest's config, on an active slot or
     an unused entry. Earlier releases could leave a disk this way, and
     destroying the guest that owns the volume by name deletes it while the
@@ -273,19 +286,20 @@ class PVEClient:
         privs = data.get("/vms")
         return (privs if isinstance(privs, dict) else {}), ""
 
-    def vm_config_soft(self, node: str, vmid: int) -> "dict[str, Any] | None":
-        """Return qemu VM config dict, or None when the read failed for any reason.
+    def vm_views_soft(self, node: str, vmid: int) -> "tuple[dict[str, Any], dict[str, Any]] | None":
+        """Return a qemu VM's (current, applied) config views, or None when the read failed.
 
-        Unlike vm_config, an HTTP error other than 404 or 501, a network
-        error, or bad JSON does not end the audit. The double-reference report
-        lists such a guest as unreadable instead, because a guest on a down
-        node is exactly what an audit of a degraded cluster runs into.
+        Reads GET /qemu/{vmid}/pending, which carries both views in one call.
+        Unlike vm_views, an HTTP error other than 404 or 501, a network error,
+        or bad JSON does not end the audit. The double-reference report lists
+        such a guest as unreadable instead, because a guest on a down node is
+        exactly what an audit of a degraded cluster runs into.
         """
-        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/config"
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/pending"
         data, err = self.get_soft(path)
-        if err or not isinstance(data, dict):
+        if err:
             return None
-        return data
+        return parse_pending_views(data)
 
     def list_nodes(self) -> list[str]:
         """Return all online node names visible to the authenticated principal."""
@@ -331,13 +345,90 @@ class PVEClient:
             return []
         return [e for e in data if isinstance(e, dict)]
 
-    def vm_config(self, node: str, vmid: int) -> "dict[str, Any] | None":
-        """Return qemu VM config dict, or None if not found."""
-        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/config"
+    def vm_views(self, node: str, vmid: int) -> "tuple[dict[str, Any], dict[str, Any]] | None":
+        """Return a qemu VM's (current, applied) config views, or None if not found.
+
+        The current view is what the running guest has now. The applied view is
+        the config with pending changes applied, which is what the config
+        endpoint returns. A drive whose delete is pending is in the first view
+        only, and the running guest still has it plugged in.
+        """
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{vmid}/pending"
         data = self.get(path, allow_missing=True)
-        if not isinstance(data, dict):
+        if data is None:
             return None
-        return data
+        if not isinstance(data, list):
+            _die(f"GET {path}: expected a list of config rows, got {type(data).__name__}")
+        for row in data:
+            if not isinstance(row, dict) or not isinstance(row.get("key"), str) or not row["key"]:
+                _die(f"GET {path}: malformed config row {row!r}")
+        return parse_pending_views(data)
+
+
+def _pending_scalar(value: Any) -> "str | None":
+    """Render one JSON scalar of a pending row as the config map's values read."""
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def parse_pending_views(data: Any) -> "tuple[dict[str, Any], dict[str, Any]] | None":
+    """Split the rows of GET /qemu/{vmid}/pending into (current, applied) config dicts.
+
+    Mirrors ReadQemuViews in internal/pve/qemu_views.go. Each row carries a
+    key, its current value, an optional pending value, and a delete flag. The
+    current view takes every row's value. The applied view takes the pending
+    value over the current one and leaves out a key whose delete is pending.
+    Returns None when the response is not a list, which reads as an unreadable
+    or missing guest.
+    """
+    if not isinstance(data, list):
+        return None
+    current: dict[str, Any] = {}
+    applied: dict[str, Any] = {}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        key = row.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        value = _pending_scalar(row.get("value"))
+        pending = _pending_scalar(row.get("pending"))
+        flag = _pending_scalar(row.get("delete"))
+        if value is not None:
+            current[key] = value
+        if flag not in (None, "", "0"):
+            continue
+        if pending is not None:
+            applied[key] = pending
+        elif value is not None:
+            applied[key] = value
+    return current, applied
+
+
+def merge_views(views: "tuple[dict[str, Any], dict[str, Any]]") -> dict[str, Any]:
+    """Fold both views into one config dict that names a key when either view does.
+
+    The applied value wins for a key both views have. A key whose delete is
+    pending keeps its current value, because the running guest still holds it.
+    """
+    current, applied = views
+    merged = dict(current)
+    merged.update(applied)
+    return merged
+
+
+def views_bus_values(views: "tuple[dict[str, Any], dict[str, Any]]") -> list[str]:
+    """Return every distinct raw bus-slot value either view holds, in a stable order."""
+    seen: list[str] = []
+    for cfg in views:
+        for key in sorted(cfg):
+            val = cfg[key]
+            if _BUS_KEY_RE.match(key) and isinstance(val, str) and val and val not in seen:
+                seen.append(val)
+    return seen
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +466,119 @@ def parse_parker_sentinel(description: str) -> dict[str, Any]:
     return disks
 
 
+# Disk identity the CPI gives a persistent disk, independent of the VMID in
+# the volume's name. DiskStableIDPrefix in internal/pve/disk_stable_id.go.
+STABLE_ID_PREFIX = "bpd-"
+
+# The sentinel carriers that name volumes. bosh_parked_disks and
+# bosh_disk_allocations map a volid, or a bpd- token, to an entry object whose
+# "volid" field names the volume. bosh_attached_disks maps a bare volid, or a
+# bpd- token, to the Director's disk CID, so its entries name a volume only
+# through the key.
+_SENTINEL_VOLUME_CARRIERS = ("bosh_parked_disks", "bosh_attached_disks", "bosh_disk_allocations")
+
+
+def stable_id_from_drive_opt_str(opt_str: str) -> str:
+    """Return the bpd- serial on a drive option string, or "" when it has none.
+
+    Ports StableIDFromDriveOptStr in internal/pve/disk_stable_id.go exactly.
+    The string is "<volid>,serial=bpd-...,size=...". The first serial option
+    decides: a serial without the bpd- prefix is an operator or guest-tooling
+    serial and not a CPI identity, and the scan stops there.
+    """
+    rest = opt_str
+    while True:
+        comma = rest.find(",")
+        if comma < 0:
+            return ""
+        rest = rest[comma + 1:]
+        if rest.startswith("serial="):
+            v = rest[len("serial="):]
+            end = v.find(",")
+            if end >= 0:
+                v = v[:end]
+            return v if v.startswith(STABLE_ID_PREFIX) else ""
+
+
+def parse_sentinel_volume_names(description: str, config: "dict[str, Any] | None" = None) -> set[str]:
+    """Return the full volids a VM description's sentinel names.
+
+    Reads bosh_parked_disks, bosh_attached_disks, and bosh_disk_allocations. The
+    CPI writes a sentinel entry under a bpd- token or under a full
+    "storage:vm-N-disk-M" volid, and its "volid" field must carry the storage
+    prefix, so a name without a colon is not one the CPI wrote and we ignore it.
+    A bpd- token names no volume by itself, because the drive that carries the
+    token already counts through its serial. When config is given, a
+    bosh_parked_disks entry that carries a "slot" also names the volume on that
+    slot, because a transfer that crashed before its finalize write leaves the
+    entry naming the pre-move volid. A missing or corrupt sentinel gives an
+    empty set, the same best-effort stance parse_parker_sentinel takes.
+    """
+    full: set[str] = set()
+    if not description:
+        return full
+    m = _SENTINEL_RE.search(description)
+    if not m:
+        return full
+    try:
+        top = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return full
+    if not isinstance(top, dict):
+        return full
+
+    def add(name: Any) -> None:
+        if not isinstance(name, str):
+            return
+        name = name.strip()
+        if name and ":" in name and not name.startswith(STABLE_ID_PREFIX):
+            full.add(name)
+
+    slots = _parse_bus_disks(config) if config else {}
+    for carrier in _SENTINEL_VOLUME_CARRIERS:
+        entries = top.get(carrier)
+        if not isinstance(entries, dict):
+            continue
+        for key, entry in entries.items():
+            add(key)
+            if not isinstance(entry, dict):
+                continue
+            add(entry.get("volid"))
+            slot = entry.get("slot")
+            if carrier == "bosh_parked_disks" and isinstance(slot, str) and slot in slots:
+                add(_bus_disk_volid_from_slot(slots[slot]).strip())
+    return full
+
+
+def _is_zero_flag(value: Any) -> bool:
+    """True when a PVE flag field reads as zero, whether it came as 0, "0", or false."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        value = value.strip()
+        return value == "0"
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    return False
+
+
+def storage_skip_reason(entry: dict[str, Any]) -> str:
+    """Say why a storage listing entry cannot be read, or "" when it can.
+
+    PVE answers HTTP 500 to a content read on a disabled storage, so we skip
+    a storage whose listing marks it enabled=0 or active=0. A missing field
+    counts as enabled and active. An enabled storage that is not active may
+    hold our disks, so we word that reason as partial coverage.
+    """
+    if _is_zero_flag(entry.get("enabled")):
+        return "storage is disabled (enabled=0)"
+    if _is_zero_flag(entry.get("active")):
+        return "storage is enabled but not active (active=0), so coverage of it is partial"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Volid helpers
 # ---------------------------------------------------------------------------
@@ -399,22 +603,6 @@ def disk_vmid_from_volid(volid: str) -> "int | None":
         return int(m.group(1))
     except ValueError:
         return None
-
-
-def bare_volid(volid: str) -> str:
-    """Return the path component of a PVE volid, stripping the storage prefix.
-
-    PVE volids are <storage>:<path>. Returns the path segment only
-    (e.g. 'local-lvm:vm-9001-disk-0' -> 'vm-9001-disk-0'). When no colon is
-    present the input is returned unchanged.
-
-    Not used for parker provenance lookups — those keys are the full volid
-    (storage:path) as written by detach_disk via ParseEncodedDiskCID.
-    Retained as a utility for callers that need the raw path segment.
-    """
-    if ":" in volid:
-        return volid.split(":", 1)[1]
-    return volid
 
 
 # Tag separators, mirroring splitTagString in internal/pve/parker.go: PVE writes
@@ -459,6 +647,15 @@ class DiskRecord:
         "parked_at",
         "parked_node",
         "director_id",
+        # how the audit found the volume: "band", "serial", "parker", "sentinel"
+        "discovered_by",
+        # Set on a free-floating volume that only a sentinel note named: the
+        # VM whose sentinel pointed at it, and the unusedN slot of a guest that
+        # still names it, when one does.
+        "sentinel_only",
+        "sentinel_vmid",
+        "sentinel_name",
+        "holder_slot",
     )
 
     def __init__(self, volid: str, storage: str, node: str, size_bytes: int) -> None:
@@ -476,6 +673,11 @@ class DiskRecord:
         self.parked_at: str = ""
         self.parked_node: str = ""
         self.director_id: str = ""
+        self.discovered_by: list[str] = ["band"]
+        self.sentinel_only = False
+        self.sentinel_vmid: "int | None" = None
+        self.sentinel_name: str = ""
+        self.holder_slot: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -501,6 +703,16 @@ class DiskRecord:
             d["parked_node"] = self.parked_node
         if self.director_id:
             d["director_id"] = self.director_id
+        if self.holder_slot:
+            d["holder_slot"] = self.holder_slot
+            d["held_by_unused_entry"] = True
+        d["discovered_by"] = list(self.discovered_by)
+        if self.sentinel_only:
+            d["found_only_by_sentinel"] = True
+            if self.sentinel_vmid is not None:
+                d["sentinel_vmid"] = self.sentinel_vmid
+            if self.sentinel_name:
+                d["sentinel_name"] = self.sentinel_name
         return d
 
 
@@ -608,7 +820,7 @@ def _parse_bus_disks(config: dict[str, Any]) -> dict[str, str]:
       config — raw qemu VM config dict from the PVE API
 
     Failure modes:
-      non-dict config    — treated as empty by caller (vm_config returns None)
+      non-dict config    — treated as empty by caller (a failed read gives None)
       missing bus keys   — simply absent from output; not an error
     """
     out: dict[str, str] = {}
@@ -648,7 +860,7 @@ def _count_unused_refs(config: dict[str, Any]) -> int:
       config — raw qemu VM config dict from the PVE API
 
     Failure modes:
-      non-dict config — treated as empty by caller (vm_config returns None)
+      non-dict config — treated as empty by caller (a failed read gives None)
     """
     return sum(
         1 for key, val in config.items()
@@ -933,28 +1145,40 @@ def collect_inventory(
     client: PVEClient,
     cfg: AuditConfig,
     extra_parker_pools: "list[str] | None" = None,
-) -> "tuple[list[DiskRecord], list[ParkerRecord], list[PoolIntruderRecord], MultiRefReport]":
+) -> "tuple[list[DiskRecord], list[ParkerRecord], list[PoolIntruderRecord], MultiRefReport, list[tuple[str, str, str]]]":
     """Collect the full disk and parker inventory from PVE.
 
     Algorithm:
       1. List all cluster VM resources to build vmid -> {node, name, tags, pool}.
       2. Determine which nodes to scan (all online, or cfg.node if set).
-      3. For each node, list storages; enumerate image content. Collect
-         all volids whose embedded disk-band VMID falls in [disk_vmid_start,
-         disk_vmid_range_end]. Deduplicate across nodes (shared storage).
-      4. Build a holder map: volid -> (holder_vmid, holder_node, holder_name,
-         holder_tags) by fetching each cluster VM's qemu config and scanning
-         scsi|virtio|ide|sata bus slots for matching volids. This mirrors
-         FindVMByDiskVolid in disk.go exactly — it is the only correct approach
-         because the embedded VMID in vm-<N>-disk-<n> is a SYNTHETIC disk-band
-         VMID (9000-29999) that no real VM or parker VM ever owns by VMID;
-         the disk is a foreign volume attached to an arbitrary holder VM.
-         O(#VMs) config fetches; acceptable for an operator audit tool.
+      3. For each node, list storages and skip any marked enabled=0 or
+         active=0, printing a SKIPPED line for each and remembering it for the
+         report. Enumerate image content of the rest, deduplicating across
+         nodes (shared storage).
+      4. Read every QEMU guest's config in both of PVE's views, through the
+         pending endpoint, so a drive whose delete is only pending still
+         counts as held. A soft read that fails falls back to a hard read,
+         which ends the audit, so an unreadable guest never turns a held
+         volume into a false orphan. From the configs, index the volumes whose
+         drive line carries a bpd- serial, the volumes a sentinel names, and
+         the volumes on a bus slot of a parker VM. We count a volume as ours
+         when its embedded VMID falls in the disk band, or it carries a bpd-
+         serial, or a sentinel names its full volid, or a parker holds it on
+         a bus slot. Then build a holder map: volid -> (holder_vmid,
+         holder_node, holder_name, holder_tags) by scanning the
+         scsi|virtio|ide|sata bus slots of each guest for matching volids.
+         This mirrors FindVMByDiskVolid in disk.go. The holder is found by
+         scanning configs, never by comparing the VMID in the volume's name,
+         because the CPI renames a stable-ID disk to the VMID of whichever
+         guest or parker holds it. O(#VMs) config fetches; acceptable for an
+         operator audit tool.
       5. Classify each disk volume using the holder map:
            - holder VMID in parker band AND bosh-parker tag -> parked
              (fetch parker sentinel for provenance; config already cached)
            - holder found, not a parker -> attached
            - no holder in any VM config -> free-floating
+         A free-floating volume that only a sentinel named is marked, with
+         the VM whose sentinel pointed at it.
       6. Enumerate parker VMs independently (catches empty parkers whose
          disk_count is 0 and therefore never appear as disk holders).
          Count unusedN references alongside bus slots: a parker holding one
@@ -974,7 +1198,9 @@ def collect_inventory(
                            currently belongs to them
 
     Returns:
-      (disk_records, parker_records, pool_intruders, multi_ref_report)
+      (disk_records, parker_records, pool_intruders, multi_ref_report,
+       skipped_storages), where skipped_storages lists the
+      (node, storage, reason) of every storage we did not read
     """
     # ---- Step 1: cluster VM map ----
     vm_map: dict[int, dict[str, str]] = {}
@@ -1003,9 +1229,10 @@ def collect_inventory(
             _warn("no online nodes found; inventory may be empty")
 
     # ---- Step 3: storage content scan ----
-    # raw_disks: list of (volid, storage_name, first_seen_node, size_bytes)
-    raw_disks: list[tuple[str, str, str, int]] = []
-    visited_volids: set[str] = set()  # deduplicate shared storage across nodes
+    # all_volumes: volid -> (storage_name, first_seen_node, size_bytes), in
+    # first-seen order; shared storage shows the same volid on every node.
+    all_volumes: dict[str, tuple[str, str, int]] = {}
+    skipped_storages: list[tuple[str, str, str]] = []
 
     for node in nodes:
         storages = client.node_storages(node)
@@ -1016,59 +1243,171 @@ def collect_inventory(
             content_types = str(st.get("content", "") or "")
             if "images" not in [p.strip() for p in content_types.split(",")]:
                 continue  # skip storages that can't hold disk images
+            # PVE answers a content read on a disabled storage with HTTP 500,
+            # which get() treats as a failure. The listing already says the
+            # storage is off, so we skip it here instead and carry the skip
+            # into the report, because the disks on it are not in the report.
+            skip_reason = storage_skip_reason(st)
+            if skip_reason:
+                skipped_storages.append((node, storage_name, skip_reason))
+                print(f"SKIPPED: node {node} storage {storage_name}: {skip_reason}", file=sys.stderr)
+                continue
             for item in client.storage_content(node, storage_name):
                 volid = str(item.get("volid", "") or "").strip()
-                if not volid or volid in visited_volids:
+                if not volid or volid in all_volumes:
                     continue
-                embedded_vmid = disk_vmid_from_volid(volid)
-                if embedded_vmid is None:
-                    continue
-                if not (cfg.disk_vmid_start <= embedded_vmid <= cfg.disk_vmid_end):
-                    continue
-                visited_volids.add(volid)
                 size_bytes = 0
                 try:
                     size_bytes = int(item.get("size", 0) or 0)
                 except (TypeError, ValueError):
                     pass
-                raw_disks.append((volid, storage_name, node, size_bytes))
+                all_volumes[volid] = (storage_name, node, size_bytes)
 
-    # ---- Step 4: build holder map via VM config scans ----
-    # Mirrors FindVMByDiskVolid in disk.go: fetch each VM's config and scan
-    # scsi|virtio|ide|sata bus slots for the target volid.  The embedded VMID
-    # in vm-<N>-disk-<n> is a synthetic disk-band VMID; no real VM or parker
-    # ever owns it.  The disk is a foreign volume attached to an arbitrary
-    # holder VM identified only by scanning configs, not by VMID equality.
+    def _in_band(volid: str) -> bool:
+        embedded = disk_vmid_from_volid(volid)
+        return embedded is not None and cfg.disk_vmid_start <= embedded <= cfg.disk_vmid_end
+
+    # ---- Step 4: read guest configs, find our disks, build the holder map ----
+    # Mirrors FindVMByDiskVolid in disk.go: scan each VM's scsi|virtio|ide|sata
+    # bus slots for the target volid. The holder is a VM identified only by
+    # scanning configs, never by VMID equality with the volume's name.
     # O(#VMs) config fetches; acceptable for an operator audit tool.
     #
-    # holder_map: volid -> {"vmid": int, "node": str, "name": str, "tags": str}
-    target_volids = {v for (v, _, _, _) in raw_disks}
-
-    # Cache: vmid -> config dict (or None on fetch failure).
-    # Built here; reused in step 5 for provenance and step 6 for parker counts.
+    # The same configs tell us which volumes are ours. A stable-ID disk keeps
+    # its bpd- serial on the drive line, and the CPI renames the volume to the
+    # holder's VMID on attach and to the parker's VMID on detach, so the VMID
+    # in a name says nothing reliable. A sentinel in any VM's description can
+    # name a volume too, and every bus slot of a parker holds one of ours.
+    #
+    # Each guest is read in both views. A drive whose delete is only pending is
+    # still plugged into the running guest, so a key counts as held when either
+    # view names it.
+    #
+    # vm_config_cache: vmid -> merged config dict (or None on fetch failure),
+    # reused in step 5 for provenance, step 6 for parker counts, and step 8.
+    # vm_bus_cache: vmid -> raw bus-slot values from both views.
     vm_config_cache: dict[int, "dict[str, Any] | None"] = {}
-    holder_map: dict[str, dict[str, Any]] = {}
+    vm_bus_cache: dict[int, list[str]] = {}
+    vm_current_serials: dict[int, dict[str, str]] = {}  # vmid -> token -> volid in the current view
+    serial_volids: dict[str, str] = {}       # volid -> bpd- serial on its drive line
+    serial_holders: dict[str, dict[str, set[tuple[int, str]]]] = {}  # token -> volid -> {(vmid, name)}
+    sentinel_refs: dict[str, tuple[int, str]] = {}  # full volid a sentinel names -> first (vmid, name)
+    parker_volids: set[str] = set()          # volids on a bus slot of a parker VM
+    unread_guests = 0
 
-    if target_volids:
-        # Only fetch VM configs when there are disk volumes to match against.
+    def _read_guest(vmid: int, node: str, hard_only: bool = False) -> None:
+        views = None if hard_only else client.vm_views_soft(node, vmid)
+        if views is None:
+            # An unread guest could hold a volume we would then call free-floating,
+            # and a parker we cannot read hides its parked disks. The hard read
+            # ends the audit on a real failure, so neither goes unnoticed.
+            views = client.vm_views(node, vmid)
+        if views is None:
+            vm_config_cache[vmid] = None
+            vm_bus_cache.pop(vmid, None)
+            return
+        vm_config_cache[vmid] = merge_views(views)
+        vm_bus_cache[vmid] = views_bus_values(views)
+        current_serials: dict[str, str] = {}
+        for raw in views_bus_values((views[0], {})):
+            token = stable_id_from_drive_opt_str(raw)
+            if token:
+                current_serials.setdefault(token, _bus_disk_volid_from_slot(raw))
+        vm_current_serials[vmid] = current_serials
+
+    if all_volumes:
+        # Nothing to discover without image volumes, and step 8 reads the
+        # configs softly in that case.
         for vmid_int, info in vm_map.items():
             vm_node = info["node"]
-            if not vm_node:
+            if (info.get("type") or "qemu") != "qemu" or not vm_node:
                 continue
-            config = client.vm_config(vm_node, vmid_int)
-            vm_config_cache[vmid_int] = config
+            _read_guest(vmid_int, vm_node)
+            config = vm_config_cache[vmid_int]
             if config is None:
+                unread_guests += 1
                 continue
-            bus_disks = _parse_bus_disks(config)
-            for _slot, raw_val in bus_disks.items():
+            is_parker = (
+                cfg.parker_vmid_start <= vmid_int <= cfg.parker_vmid_end
+                and _tags_contain_parker(info["tags"])
+            )
+            for raw_val in vm_bus_cache[vmid_int]:
                 slot_volid = _bus_disk_volid_from_slot(raw_val)
-                if slot_volid in target_volids and slot_volid not in holder_map:
-                    holder_map[slot_volid] = {
-                        "vmid": vmid_int,
-                        "node": vm_node,
-                        "name": info["name"],
-                        "tags": info["tags"],
-                    }
+                serial = stable_id_from_drive_opt_str(raw_val)
+                if serial:
+                    serial_volids.setdefault(slot_volid, serial)
+                    current_volid = vm_current_serials.get(vmid_int, {}).get(serial)
+                    # A volid only the pending view names, for a token the
+                    # current view gave to another volid, is the same disk
+                    # mid-change and not a second holder.
+                    if current_volid is None or current_volid == slot_volid:
+                        serial_holders.setdefault(serial, {}).setdefault(slot_volid, set()).add(
+                            (vmid_int, info["name"])
+                        )
+                if is_parker:
+                    parker_volids.add(slot_volid)
+            for named in parse_sentinel_volume_names(str(config.get("description", "") or ""), config):
+                sentinel_refs.setdefault(named, (vmid_int, info["name"]))
+        if unread_guests:
+            _warn(
+                f"{unread_guests} guest config(s) could not be read; a renamed "
+                "disk held only by such a guest may be missing from this report."
+            )
+        # qm clone copies drive options, so a clone of a BOSH VM carries the
+        # original's serial on its own volumes. One token on two volumes is
+        # not a stable identity, and we say so rather than count both quietly.
+        for token in sorted(serial_holders):
+            volids = serial_holders[token]
+            if len(volids) < 2:
+                continue
+            parts = []
+            for volid in sorted(volids):
+                holders = ", ".join(f"VM {v} ({n or 'unnamed'})" for v, n in sorted(volids[volid]))
+                parts.append(f"{volid} (held by {holders})")
+            _warn(
+                f"serial {token} appears on {len(volids)} different volumes: {'; '.join(parts)}. "
+                "A clone of a BOSH VM copies the serial, so we cannot tell which volume the CPI means."
+            )
+
+    # raw_disks: list of (volid, storage_name, first_seen_node, size_bytes, signals)
+    raw_disks: list[tuple[str, str, str, int, list[str]]] = []
+    for volid, (storage_name, first_node, size_bytes) in all_volumes.items():
+        signals: list[str] = []
+        if _in_band(volid):
+            signals.append("band")
+        if volid in serial_volids:
+            signals.append("serial")
+        if volid in parker_volids:
+            signals.append("parker")
+        if volid in sentinel_refs:
+            signals.append("sentinel")
+        if signals:
+            raw_disks.append((volid, storage_name, first_node, size_bytes, signals))
+
+    # holder_map: volid -> {"vmid": int, "node": str, "name": str, "tags": str}
+    target_volids = {v for (v, _, _, _, _) in raw_disks}
+    holder_map: dict[str, dict[str, Any]] = {}
+    for vmid_int, info in vm_map.items():
+        for raw_val in vm_bus_cache.get(vmid_int, []):
+            slot_volid = _bus_disk_volid_from_slot(raw_val)
+            if slot_volid in target_volids and slot_volid not in holder_map:
+                holder_map[slot_volid] = {
+                    "vmid": vmid_int,
+                    "node": info["node"],
+                    "name": info["name"],
+                    "tags": info["tags"],
+                }
+
+    # unused_holders: the first guest that names a target volid on an unusedN
+    # entry. A volume found only by a sentinel and held this way is not unheld.
+    unused_holders: dict[str, tuple[int, str, str, str]] = {}
+    for vmid_int, info in vm_map.items():
+        config = vm_config_cache.get(vmid_int)
+        if config is None:
+            continue
+        for slot, kind, ref_volid in _referenced_volids(config):
+            if kind == "unused" and ref_volid in target_volids and ref_volid not in unused_holders:
+                unused_holders[ref_volid] = (vmid_int, info["node"], info["name"], slot)
 
     # ---- Step 5: classify each disk ----
     # provenance cache: parker vmid -> {full_volid: prov_dict}
@@ -1076,12 +1415,21 @@ def collect_inventory(
 
     disk_records: list[DiskRecord] = []
 
-    for (volid, storage, node, size_bytes) in raw_disks:
+    for (volid, storage, node, size_bytes, signals) in raw_disks:
         rec = DiskRecord(volid, storage, node, size_bytes)
+        rec.discovered_by = signals
 
         holder = holder_map.get(volid)
         if holder is None:
             rec.classification = "free-floating"
+            unused = unused_holders.get(volid)
+            if unused is not None:
+                rec.holder_vmid, rec.holder_node, rec.holder_name, rec.holder_slot = unused
+            if signals == ["sentinel"]:
+                # Only a sentinel note named this volume, and sentinels go
+                # stale, so it is not a plain orphan.
+                rec.sentinel_only = True
+                rec.sentinel_vmid, rec.sentinel_name = sentinel_refs[volid]
             disk_records.append(rec)
             continue
 
@@ -1111,8 +1459,7 @@ def collect_inventory(
             # Two keying generations coexist in the sentinel map (parker.go):
             # legacy entries are keyed by the full "storage:vm-N-disk-n" volid
             # (the storage prefix preserved — the same form the PVE
-            # storage-content API returns, so look up by volid directly, not
-            # bare_volid() which would strip the prefix and miss); stable-ID
+            # storage-content API returns, so we look up by the whole volid); stable-ID
             # entries are keyed by the disk's bpd- token and name the volid
             # the parker currently holds the volume under in their "volid"
             # field. Match either.
@@ -1148,12 +1495,13 @@ def collect_inventory(
         if not _tags_contain_parker(info["tags"]):
             continue
         vm_node = info["node"]
-        # Reuse cached config from step 4; fetch only when absent (e.g. node-scoped run).
-        if vmid_int in vm_config_cache:
+        # Reuse the cached config from step 4. A parker whose step-4 read
+        # failed, or that step 4 never read, gets a hard read here, so an
+        # unreadable parker ends the audit rather than reading as empty.
+        pconfig = vm_config_cache.get(vmid_int)
+        if pconfig is None:
+            _read_guest(vmid_int, vm_node, hard_only=True)
             pconfig = vm_config_cache[vmid_int]
-        else:
-            pconfig = client.vm_config(vm_node, vmid_int)
-            vm_config_cache[vmid_int] = pconfig
         disk_count = _count_bus_disks(pconfig) if pconfig is not None else 0
         unused_count = _count_unused_refs(pconfig) if pconfig is not None else 0
         parker_records.append(ParkerRecord(
@@ -1174,8 +1522,8 @@ def collect_inventory(
     # ---- Step 8: volumes that more than one guest names ----
     # Every QEMU guest is read, cluster-wide, whatever cfg.node says, because
     # the second reference can sit on any node. Step 4 already filled the
-    # cache when there were disk-band volumes to match; otherwise we read
-    # the configs here. Containers are skipped before the cache is consulted.
+    # cache when there were volumes to match; otherwise we read the configs
+    # here. Containers are skipped before the cache is consulted.
     # These reads are soft: a guest whose config does not come back is listed
     # as unreadable rather than ending the audit.
     for vmid_int, info in vm_map.items():
@@ -1184,14 +1532,15 @@ def collect_inventory(
         if not info["node"]:
             vm_config_cache[vmid_int] = None
             continue
-        vm_config_cache[vmid_int] = client.vm_config_soft(info["node"], vmid_int)
+        views = client.vm_views_soft(info["node"], vmid_int)
+        vm_config_cache[vmid_int] = merge_views(views) if views is not None else None
     multi_records, unreadable = find_multiply_referenced(
         vm_map, vm_config_cache, (cfg.parker_vmid_start, cfg.parker_vmid_end),
     )
     visibility, visibility_error = double_reference_visibility(client)
     multi_ref = MultiRefReport(multi_records, unreadable, visibility, visibility_error)
 
-    return disk_records, parker_records, pool_intruders, multi_ref
+    return disk_records, parker_records, pool_intruders, multi_ref, skipped_storages
 
 
 # ---------------------------------------------------------------------------
@@ -1228,6 +1577,7 @@ def print_human_report(
     parker_records: list[ParkerRecord],
     cfg: AuditConfig,
     multi_ref: "MultiRefReport | None" = None,
+    skipped: "list[tuple[str, str, str]] | None" = None,
 ) -> None:
     """Print a human-readable table report to stdout."""
     counts: dict[str, int] = {"attached": 0, "parked": 0, "free-floating": 0, "unknown": 0}
@@ -1241,6 +1591,10 @@ def print_human_report(
     print(f"  Parker band: [{cfg.parker_vmid_start}, {cfg.parker_vmid_end}]")
     if cfg.node:
         print(f"  Scope: node={cfg.node}")
+    if skipped:
+        print("  Skipped storages (disks on a skipped storage are not in this report):")
+        for sk_node, sk_storage, sk_reason in skipped:
+            print(f"    node {sk_node} storage {sk_storage}: {sk_reason}")
     print(f"  Total disk volumes: {total}")
     print(f"    attached:      {counts['attached']}")
     print(f"    parked:        {counts['parked']}")
@@ -1292,6 +1646,19 @@ def print_human_report(
         print(f"  {'-'*55} {'-'*10}  {'-'*20}  {'-'*15}")
         for r in sorted(floating, key=lambda x: x.volid):
             print(f"  {_trunc(r.volid, 55):<55} {_human_size(r.size_bytes):>10}  {r.storage:<20}  {r.node:<15}")
+            if r.holder_slot:
+                print(
+                    f"    DO NOT DELETE: VM {r.holder_vmid} ({r.holder_name or 'unnamed'}) "
+                    f"still names it on {r.holder_slot}, so PVE references it"
+                )
+            if r.sentinel_only:
+                who = f"VM {r.sentinel_vmid}" if r.sentinel_vmid is not None else "a VM"
+                if r.sentinel_name:
+                    who += f" ({r.sentinel_name})"
+                print(
+                    f"    found only by a sentinel note on {who}; verify with "
+                    "`bosh disks --orphaned` before deleting"
+                )
         print()
 
     # Volumes more than one guest names
@@ -1340,6 +1707,7 @@ def print_json_report(
     parker_records: list[ParkerRecord],
     cfg: AuditConfig,
     multi_ref: "MultiRefReport | None" = None,
+    skipped: "list[tuple[str, str, str]] | None" = None,
 ) -> None:
     """Print a JSON report to stdout."""
     out = {
@@ -1357,6 +1725,10 @@ def print_json_report(
         "disks": [r.to_dict() for r in sorted(disk_records, key=lambda x: x.volid)],
         "parkers": [pr.to_dict() for pr in parker_records],
     }
+    if skipped is not None:
+        out["skipped_storages"] = [
+            {"node": n, "storage": st, "reason": reason} for n, st, reason in skipped
+        ]
     if multi_ref is not None:
         out["summary"]["multiply_referenced"] = len(multi_ref.records)
         out["multiply_referenced"] = [mr.to_dict() for mr in multi_ref.records]
@@ -1578,7 +1950,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     try:
         client = PVEClient(cfg)
-        disk_records, parker_records, pool_intruders, multi_ref = collect_inventory(client, cfg, extra_parker_pools)
+        disk_records, parker_records, pool_intruders, multi_ref, skipped = collect_inventory(
+            client, cfg, extra_parker_pools
+        )
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1587,14 +1961,20 @@ def main(argv: "list[str] | None" = None) -> int:
     emit_warnings(disk_records, parker_records, pool_intruders, cfg, multi_ref)
 
     if args.json:
-        print_json_report(disk_records, parker_records, cfg, multi_ref)
+        print_json_report(disk_records, parker_records, cfg, multi_ref, skipped)
     else:
-        print_human_report(disk_records, parker_records, cfg, multi_ref)
+        print_human_report(disk_records, parker_records, cfg, multi_ref, skipped)
 
     free_floating = [r for r in disk_records if r.classification == "free-floating"]
     if free_floating:
+        held = [r for r in free_floating if r.holder_slot]
+        note = ""
+        if held:
+            note = ", " + ", ".join(
+                f"{r.volid} still named by VM {r.holder_vmid}" for r in sorted(held, key=lambda x: x.volid)
+            )
         print(
-            f"EXIT 1: {len(free_floating)} free-floating disk(s) found.",
+            f"EXIT 1: {len(free_floating)} free-floating disk(s) found{note}.",
             file=sys.stderr,
         )
         return 1
