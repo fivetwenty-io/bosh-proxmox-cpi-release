@@ -62,9 +62,38 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 	fail := func(err error) (*managedDiskLifecycle, error) {
 		return nil, errors.Join(err, handle.Close(), journal.Close())
 	}
+	// A lock step an earlier request left planned is settled by readback
+	// before readmission judges the record, so a retry is not refused for a
+	// sentinel that never held anything of ours. A step that still can't
+	// settle refuses with the reason the settler found, such as a parker that
+	// doesn't read back protected, because that names what the operator does
+	// next.
+	settle := func() error {
+		gaps, err := settlePlannedLockSteps(ctx, deps, handle)
+		if err != nil {
+			return err
+		}
+		if text := unsettledStepText(handle.Record(), gaps, func(step aj.Step) bool { return step.Attempt != handle.Record().ActiveAttempt() }); text != "" && len(gaps) > 0 {
+			return protectionPendingOr(handle.Record(), gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+text))
+		}
+		return nil
+	}
 	// The earlier read-only lookup did not acquire generation ownership. Repeat
 	// the complete targeted identity read after taking the allocation lock.
-	current, err := resolveDiskForOp(ctx, deps, operation, rd.diskCID, rd.birth, rd.meta)
+	// This is the one resolution that writes a holder's missing provenance
+	// entry (see healUnrecordedHolder), because only here does the journal's
+	// lock keep another call from changing the disk while it writes.
+	current, err := resolveDiskForOp(withHolderHeal(ctx, holderHealWrite), deps, operation, rd.diskCID, rd.birth, rd.meta)
+	if isHolderNotRecorded(err) {
+		// The heal writes nothing while a step of the record is unsettled, so
+		// the steps a readback can settle are settled first, and the disk is
+		// resolved once more. A step that is left unsettled, such as one no
+		// readback covers, still gets the heal's retriable refusal.
+		if err := settle(); err != nil {
+			return fail(err)
+		}
+		current, err = resolveDiskForOp(withHolderHeal(ctx, holderHealWrite), deps, operation, rd.diskCID, rd.birth, rd.meta)
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -75,15 +104,8 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 	if err != nil {
 		return fail(err)
 	}
-	// A lock step an earlier request left planned is settled by readback
-	// before readmission judges the record, so a retry is not refused for a
-	// sentinel that never held anything of ours.
-	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
-	if err != nil {
+	if err := settle(); err != nil {
 		return fail(err)
-	}
-	if text := unsettledStepText(handle.Record(), gaps, func(step aj.Step) bool { return step.Attempt != handle.Record().ActiveAttempt() }); text != "" && len(gaps) > 0 {
-		return fail(protectionPendingOr(handle.Record(), gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+text)))
 	}
 	session, err := beginStorageLifecycle(handle, operation, proof)
 	if err != nil {
@@ -297,6 +319,11 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // is a mutation the guard refused on an ended request before it reached PVE.
 // Neither changed anything, so the same conditions decide.
 //
+// errManagedAdmissionReadFailed counts the same way. It is a mutation, such as
+// the lock's sentinel create, that the guard refused before it reached PVE
+// because a read it makes to admit the mutation failed, so nothing changed
+// either.
+//
 // pve.ErrClusterLockStateUnknown counts the same way. The acquire could not
 // tell who holds the lock, because no read of its new sentinel answered before
 // the deadline, its create ended without an answer, or PVE said the sentinel
@@ -330,13 +357,15 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 // (pve.ErrClusterLockTimeout), an acquire that could not tell who holds the
 // lock (pve.ErrClusterLockStateUnknown), one that confirmed its claim too late
 // to use it (pve.ErrClusterLockClaimTooShort), a wait a cancelled request cut
-// short (pve.ErrClusterLockInterrupted), and a mutation the guard refused on
-// an ended request (errManagedRequestEnded). It is only the first test a clean
-// timeout passes. The callers also judge the guard and the journaled steps.
+// short (pve.ErrClusterLockInterrupted), a mutation the guard refused on an
+// ended request (errManagedRequestEnded), and a mutation the guard refused
+// because a read that admits it failed (errManagedAdmissionReadFailed). It is
+// only the first test a clean timeout passes. The callers also judge the guard
+// and the journaled steps.
 func isLockWaitWithoutEntry(err error) bool {
 	return errors.Is(err, pve.ErrClusterLockTimeout) || errors.Is(err, pve.ErrClusterLockStateUnknown) ||
 		errors.Is(err, pve.ErrClusterLockClaimTooShort) || errors.Is(err, pve.ErrClusterLockInterrupted) ||
-		errors.Is(err, errManagedRequestEnded)
+		errors.Is(err, errManagedRequestEnded) || errors.Is(err, errManagedAdmissionReadFailed)
 }
 
 // cleanTailRefusal reports whether an operation failed only because the
