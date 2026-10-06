@@ -2,6 +2,7 @@ package errors_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -380,5 +381,52 @@ func TestNewTypeConstructors(t *testing.T) {
 				t.Errorf("IsType(%q) returned false", tc.wantType)
 			}
 		})
+	}
+}
+
+// TestDefinite checks that the Definite mark is found anywhere in a chain,
+// and that it changes neither the error's type, message, nor retriable flag.
+func TestDefinite(t *testing.T) {
+	t.Parallel()
+
+	plain := cpierrors.Cloud("allocation %s requires reconciliation", "a1")
+	marked := cpierrors.Definite(plain)
+	if cpierrors.IsDefinite(plain) {
+		t.Fatal("Definite marked the error it was given instead of a copy")
+	}
+	if !cpierrors.IsDefinite(marked) {
+		t.Fatal("IsDefinite missed the mark on the marked error")
+	}
+	if marked.Type() != plain.Type() || marked.Error() != plain.Error() || marked.OkToRetry() != plain.OkToRetry() {
+		t.Fatalf("the mark changed the error: %q %s %t", marked.Error(), marked.Type(), marked.OkToRetry())
+	}
+	if retriable := cpierrors.Definite(cpierrors.Retriable("held")); !retriable.OkToRetry() || !cpierrors.IsDefinite(retriable) {
+		t.Fatal("the mark changed a retriable error's flag")
+	}
+	if cpierrors.Definite(nil) != nil {
+		t.Fatal("Definite(nil) returned an error")
+	}
+
+	for name, err := range map[string]error{
+		"joined behind another error": errors.Join(cpierrors.Cloud("VM disposal failed"), marked),
+		"wrapped by Wrap":             cpierrors.Wrap(marked, "rollback"),
+		"wrapped by fmt %w":           fmt.Errorf("rollback: %w", marked),
+	} {
+		if !cpierrors.IsDefinite(err) {
+			t.Errorf("IsDefinite missed the mark %s", name)
+		}
+	}
+	for name, err := range map[string]error{
+		"nil":            nil,
+		"plain":          errors.New("context deadline exceeded"),
+		"unmarked typed": errors.Join(plain, cpierrors.Retriable("timed out")),
+		"text only":      errors.New("rollback: " + marked.Error()),
+	} {
+		if cpierrors.IsDefinite(err) {
+			t.Errorf("IsDefinite found a mark on %s", name)
+		}
+	}
+	if !errors.Is(marked, marked) || errors.Is(marked, plain) {
+		t.Fatal("the mark changed identity comparison through errors.Is")
 	}
 }

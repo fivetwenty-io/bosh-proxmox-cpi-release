@@ -297,12 +297,16 @@ func (c *managedRetentionTimeoutCheck) returned(ctx context.Context, deps Deps, 
 	if guestWrites > 2 || len(creates) > 1 {
 		return false
 	}
-	if ctx.Err() != nil {
-		detached, cancel := detachedContext(ctx, pve.ClusterLockCompletionAllowance)
-		defer cancel()
-		ctx = detached
-	}
-	return c.readBack(ctx, deps, record, creates)
+	// The readback runs after a lock wait that stopped short of the request's
+	// deadline by only pve.ClusterLockCompletionAllowance and the lock
+	// release, or after the request ended. A read cut off by the deadline
+	// would make the timeout unclean, so the readback gets at least that
+	// allowance. It has always run after the request ended, so it runs on a
+	// closingContext, which also outlives a stop signal on a request without
+	// a deadline.
+	readCtx, cancel := closingContext(ctx)
+	defer cancel()
+	return c.readBack(readCtx, deps, record, creates)
 }
 
 func (c *managedRetentionTimeoutCheck) readBack(ctx context.Context, deps Deps, record aj.Record, creates []aj.Target) bool {

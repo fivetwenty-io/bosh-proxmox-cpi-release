@@ -687,6 +687,8 @@ func TestVMCleanupFailureLeadsWithReconciliation(t *testing.T) {
 		{name: "retriable cleanup failure", cause: cpierrors.Retriable("VM destroy task timed out"), leading: "requires reconciliation at VM cleanup"},
 		{name: "audit refusal", cause: cpierrors.Cloud("VM cleanup refused: 1 audit issue"), leading: "VM cleanup refused: 1 audit issue"},
 		{name: "untyped cleanup failure", cause: errors.New("cleanup used unbounded volume destruction"), leading: "cleanup used unbounded volume destruction"},
+		{name: "cleanup cut off by the deadline", cause: context.DeadlineExceeded, leading: "requires reconciliation at VM cleanup"},
+		{name: "cleanup cut off by a stop signal", cause: fmt.Errorf("read VM config: %w", context.Canceled), leading: "requires reconciliation at VM cleanup"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

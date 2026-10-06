@@ -3,6 +3,7 @@ package cpi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -238,5 +239,39 @@ func TestDispatcher_MethodTimeout_ParentCancelNotTimeout(t *testing.T) {
 	// (non-retriable) error must survive.
 	if strings.Contains(resp.Error.Message, "deadline") {
 		t.Errorf("parent cancellation should not be relabeled as a deadline timeout: %s", resp.Error.Message)
+	}
+}
+
+// definiteHandler blocks until its context ends, then returns the definite
+// answer a handler settled on its way out, the way a rollback that moved an
+// allocation to reconciliation_required does.
+type definiteHandler struct{}
+
+func (definiteHandler) Handle(ctx context.Context, _ []json.RawMessage, _ jsonrpc.Context) (any, error) {
+	<-ctx.Done()
+	return nil, errors.Join(
+		cpierrors.Definite(cpierrors.Cloud("allocation a1 requires reconciliation at VM create rollback")),
+		cpierrors.Cloud("handler aborted: %v", ctx.Err()))
+}
+
+// TestDispatcher_MethodTimeout_KeepsDefiniteAnswer verifies that the deadline
+// rewrite leaves an error marked cpierrors.Definite unchanged, so the Director
+// does not retry into an allocation that refuses the retry.
+func TestDispatcher_MethodTimeout_KeepsDefiniteAnswer(t *testing.T) {
+	t.Parallel()
+
+	resolver := func(string) time.Duration { return 20 * time.Millisecond }
+	d := cpi.NewDispatcherWithOptions(nopLogger(), cpi.WithMethodTimeouts(resolver))
+	mustRegister(t, d, "create_vm", definiteHandler{})
+
+	resp := d.Handle(context.Background(), req("create_vm"))
+	if resp.Error == nil {
+		t.Fatalf("expected error response, got success: %+v", resp)
+	}
+	if resp.Error.OkToRetry {
+		t.Errorf("a definite refusal must not become retriable: %s", resp.Error.Message)
+	}
+	if !strings.Contains(resp.Error.Message, "requires reconciliation") {
+		t.Errorf("message %q should be the handler's own answer", resp.Error.Message)
 	}
 }

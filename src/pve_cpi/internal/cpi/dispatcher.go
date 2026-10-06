@@ -144,7 +144,9 @@ func WithHooks(hooks ...Hook) func(*Dispatcher) {
 // of that size, and a zero (or a nil resolver) leaves the context unwrapped.
 // When the deadline fires before the handler returns, Handle converts the
 // resulting error into a retriable CloudError so the Director retries the
-// operation rather than treating a wedged call as a permanent failure.
+// operation rather than treating a wedged call as a permanent failure. An
+// error the handler marked cpierrors.Definite is the exception, and it goes
+// back unchanged.
 func WithMethodTimeouts(resolver func(method string) time.Duration) func(*Dispatcher) {
 	return func(d *Dispatcher) {
 		d.methodTimeout = resolver
@@ -323,17 +325,23 @@ func (d *Dispatcher) Handle(ctx context.Context, req *jsonrpc.Request) (resp *js
 
 	result, err := h.Handle(callCtx, req.Arguments, req.Context)
 
-	// If our deadline fired before the handler returned, translate whatever the
+	// If our deadline fired before the handler returned, translate what the
 	// handler reported into a retriable timeout so the Director gets a clear,
 	// actionable signal. Only do this when the handler actually errored: a
 	// handler that returned success just as the deadline elapsed genuinely
-	// succeeded and its result must not be clobbered. Parent (signal) shutdown
-	// is deliberately excluded — that is process shutdown, not a per-operation
-	// budget overrun. The ctx.Err()==nil guard closes the razor-thin race where
-	// the parent is cancelled at the same instant the child deadline fires: in
-	// that window callCtx.Err() may report DeadlineExceeded even though the real
-	// cause was shutdown, so we additionally require the parent to be live.
-	if err != nil && budget > 0 && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+	// succeeded and its result must not be clobbered. A handler's definite
+	// answer is not clobbered either. An error marked cpierrors.Definite
+	// records an outcome the handler settled, such as an allocation it moved
+	// to reconciliation_required, and a retry would be refused, so the
+	// handler's own error goes back even when the deadline fired while the
+	// handler was settling it. Parent (signal) shutdown is deliberately
+	// excluded, because that is process shutdown, not a per-operation budget
+	// overrun.
+	// The ctx.Err()==nil guard closes the razor-thin race where the parent is
+	// cancelled at the same instant the child deadline fires: in that window
+	// callCtx.Err() may report DeadlineExceeded even though the real cause was
+	// shutdown, so we additionally require the parent to be live.
+	if err != nil && budget > 0 && callCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil && !cpierrors.IsDefinite(err) {
 		durationMS := float64(time.Since(start).Microseconds()) / 1000.0
 		d.logger.Info("dispatch", requestFields(ctx, req.Method, req.Context.RequestID,
 			log.Float64("duration_ms", durationMS),

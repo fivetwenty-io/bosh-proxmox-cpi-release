@@ -597,7 +597,7 @@ The pushback and storage-lock curves, meaning their `base_ms` and `cap_ms` and t
 
 ## Operation Timeouts
 
-Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a context deadline. A wedged retry/poll combination converts to a retriable timeout the Director can act on, rather than holding a queue slot forever.
+Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a context deadline. A wedged retry/poll combination converts to a retriable timeout the Director can act on, rather than holding a queue slot forever. The exception is an error that records an outcome the CPI has already settled, such as an allocation it moved to `reconciliation_required`. That error goes back as the CPI reported it, because a retry would be refused until we reconcile the allocation. Work that must finish once it starts doesn't stop at the deadline either. When a `create_vm` rolls back an attempt, the disposal of the attempt's VM gets at least the `delete_sec` budget. Every completion audit that a call on a journal-managed disk runs as it finishes gets at least 5 seconds, and so does the readback that `delete_vm` runs after a retention lock timeout. Such a call can therefore run past its own deadline by up to that much.
 
 | Property | Type | Default | Description |
 |---|---|---|---|

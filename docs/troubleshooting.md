@@ -2014,7 +2014,7 @@ Use these patterns to distinguish normal retry noise from actionable failures.
 
 ## Multi-storage allocation requires reconciliation
 
-Use the allocation UUID in the error to inspect the retained journal and the actual PVE resources. A missing task response does not establish that the mutation failed, so preserve the record, the VM marker, the disk provenance, and the historical backing while we reconcile the outcome.
+Use the allocation UUID in the error to inspect the retained journal and the actual PVE resources. A missing task response does not establish that the mutation failed, so preserve the record, the VM marker, the disk provenance, and the historical backing while we reconcile the outcome. When `attach_disk`, `detach_disk`, or `delete_disk` returns this error, running the same call again audits the disk afresh and heals the record once its steps are settled, so a rerun of the deploy, or for the `delete_disk` of an orphaned disk the Director's next scheduled orphan cleanup, is the first thing we try.
 
 A changed caller request conflicts with the active VM generation. A changed global strategy on its own does not create a replacement generation, though a more restrictive boundary can block the mutations that remain. Operating on an existing disk CID should never require restoring an unrelated set that is unavailable.
 

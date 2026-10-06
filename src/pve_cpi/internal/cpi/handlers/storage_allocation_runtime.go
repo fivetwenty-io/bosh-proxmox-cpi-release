@@ -241,19 +241,61 @@ func storageMutationObserved(handle *allocationjournal.Handle, id string, volume
 
 // storageAllocationUncertain deliberately does not chain an upstream retriable
 // error or its response text. The allocation ID points to retained audit evidence.
+// The error is marked cpierrors.Definite when the record now refuses a retry
+// until an operator reconciles it, so the per-method deadline envelope does
+// not turn it into a retriable timeout. A VM generation that delete_vm
+// retained stays retained. The next delete_vm settles a planned lock step, a
+// planned parker protection step, and a planned move step that never fired,
+// and then resumes the generation from its state and its retention evidence,
+// which the reason does not affect. So when every step of its active attempt
+// is observed or one of those settleable kinds, its error is left unmarked
+// and a retry after the deadline is still offered. When a submitted step or
+// any other planned step remains, the next delete_vm refuses at its cleanup
+// settlement check, so the error is marked and names that step and what
+// settles it.
 func storageAllocationUncertain(handle *allocationjournal.Handle, phase string) error {
 	if handle == nil {
-		return cpierrors.Cloud("storage allocation requires reconciliation at %s", phase)
+		return cpierrors.Definite(cpierrors.Cloud("storage allocation requires reconciliation at %s", phase))
 	}
 	record := handle.Record()
-	if record.State != allocationjournal.VMDeletedRetained {
+	retained := record.State == allocationjournal.VMDeletedRetained
+	if !retained {
 		record.State = allocationjournal.ReconciliationRequired
 	}
 	record.Reason = "outcome requires reconciliation at " + phase
-	if err := handle.Save(record); err != nil {
-		return cpierrors.Cloud("allocation %s requires reconciliation at %s; journal persistence also failed", record.ID, phase)
+	next := ""
+	if retained {
+		next = retainedUnsettledNextStep(record)
 	}
-	return cpierrors.Cloud("allocation %s requires reconciliation at %s; no alternate allocation was attempted", record.ID, phase)
+	uncertain := cpierrors.Cloud("allocation %s requires reconciliation at %s%s; no alternate allocation was attempted", record.ID, phase, next)
+	if err := handle.Save(record); err != nil {
+		uncertain = cpierrors.Cloud("allocation %s requires reconciliation at %s%s; journal persistence also failed", record.ID, phase, next)
+	}
+	if retained && next == "" {
+		return uncertain
+	}
+	return cpierrors.Definite(uncertain)
+}
+
+// retainedUnsettledNextStep names the first step of a retained VM
+// generation's active attempt that is not yet observed, and what the operator
+// does about it, in the form storageAllocationUncertain appends to its
+// phase. It skips a planned lock step, a planned parker protection step, and
+// a planned move step that never fired, because the next delete_vm settles
+// those before it checks the cleanup. It returns "" when no other step of the
+// active attempt is unobserved, which is when the next delete_vm can resume
+// the generation.
+func retainedUnsettledNextStep(record allocationjournal.Record) string {
+	for i := range record.Steps {
+		step := record.Steps[i]
+		if step.Attempt == record.ActiveAttempt() && step.State != allocationjournal.Observed {
+			if step.State == allocationjournal.Planned && (isLockStep(step) || IsParkerProtectionStep(record, step) || isUnfiredMoveCandidate(record, step)) {
+				continue
+			}
+			return "; " + unsettledStepName(step) + ", so the next delete_vm refuses this retained VM until an operator reconciles that step from storage-journal audit"
+		}
+	}
+	return ""
 }
 
 // storageCallerIntentFingerprint permits active-generation lookup before planning.

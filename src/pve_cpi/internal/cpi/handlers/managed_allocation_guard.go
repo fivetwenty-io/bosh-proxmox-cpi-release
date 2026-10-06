@@ -199,8 +199,19 @@ func (g *ManagedAllocationGuard) finish(ctx context.Context, m ManagedAllocation
 		if reported == nil {
 			reported = cpierrors.Cloud("managed allocation requires reconciliation after %s.%s", m.Service, m.Method)
 		}
-		// Never propagate an upstream retriable error after submission.
-		g.poisoned = cpierrors.Cloud("%s", reported.Error())
+		// Never propagate an upstream retriable error after submission. The
+		// mutation's outcome is unknown and the allocation needs
+		// reconciliation, so the error is definite, and the per-method
+		// deadline envelope leaves it as it is. A hook that reports a typed
+		// error without that mark has left its record resumable, such as a VM
+		// generation that delete_vm retained with every step observed, so the
+		// poison carries no mark either.
+		poisoned := cpierrors.Cloud("%s", reported.Error())
+		var typed *cpierrors.Error
+		if !errors.As(reported, &typed) || cpierrors.IsDefinite(reported) {
+			poisoned = cpierrors.Definite(poisoned)
+		}
+		g.poisoned = poisoned
 		return g.poisoned
 	}
 	return nil
