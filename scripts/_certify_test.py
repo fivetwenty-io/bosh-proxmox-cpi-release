@@ -227,6 +227,7 @@ class MainCheckoutLookupTest(unittest.TestCase):
         self.assertIn(os.path.realpath(self.main_state), out)
         self.assertNotIn("DRY-RUN: ", out)
 
+    @unittest.skipUnless(shutil.which("bosh"), "the dry run past the slot guard needs bosh on PATH")
     def test_a_state_of_its_own_passes_the_slot_guard(self) -> None:
         (self.slot / "state.json").write_text(
             json.dumps({"director_id": "own-director", "current_vm_cid": "4002"}))
