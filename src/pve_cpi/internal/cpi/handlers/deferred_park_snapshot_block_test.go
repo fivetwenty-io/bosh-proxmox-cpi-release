@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	nodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -518,4 +520,61 @@ func TestDeferredParkCPIRefusalOnAManagedDisk(t *testing.T) {
 	s.client.moveErr = nil
 	call := deferredParkCall{name: "attach_disk to 888 after the snapshot was deleted", op: "attach_disk", target: "888"}
 	call.requireConverged(t, s, id)
+}
+
+// TestDeferredParkSnapshotBlocksDeleteVMOnAManagedVM covers delete_vm on a
+// journal-managed VM whose journal-managed disk's park a snapshot deferred.
+// While the snapshot blocks the park, delete_vm refuses permanently with the
+// same SnapshotBlocked error the disk calls give, naming the snapshot and the
+// unused entry, and it destroys nothing. Before the fix, the resume inside
+// delete_vm treated the refusal as a finished detach, and delete_vm refused
+// with a plain permanent error that named no snapshot. Once the snapshot is
+// gone, a rerun finishes the park and destroys the VM.
+func TestDeferredParkSnapshotBlocksDeleteVMOnAManagedVM(t *testing.T) {
+	captureParkerPoolSweep(t)
+	s, id := buildDeferredPark(t, true)
+	prior, err := s.journal.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmID := stageMovedVMRecord(t, s.deps, s.client, s.journal, prior, s.stranded)
+	deleteVM := func() error {
+		_, err := HandleDeleteVM(s.deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
+		return err
+	}
+	for range 2 {
+		err := deleteVM()
+		s.requireSnapshotBlocked(t, "delete_vm", err, "pre-upgrade")
+		for _, want := range []string{"delete_vm: can't finish the deferred park of disk", "nothing was moved or destroyed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("delete_vm refusal %q doesn't say %q", err, want)
+			}
+		}
+		if s.client.state.configs[777] == nil || len(s.recorder.guestDestroys()) != 0 {
+			t.Fatal("delete_vm destroyed 777 while the snapshot blocked its disk's park")
+		}
+		if refs := s.references(s.stranded); len(refs) != 1 || refs[0] != "777.unused0" {
+			t.Fatalf("%s is referenced by %v, want only 777.unused0", s.stranded, refs)
+		}
+		s.requireRecord(t, id, aj.ReadyToReturn)
+	}
+	s.client.moveErr = nil
+	s.client.vmSnapshots = nil
+	if err := deleteVM(); err != nil {
+		t.Fatalf("delete_vm after the snapshot was deleted: %v", err)
+	}
+	if s.client.state.configs[777] != nil {
+		t.Fatal("delete_vm left 777 in place after the park finished")
+	}
+	if refs := s.references(s.stranded); len(refs) != 0 {
+		t.Fatalf("%s is still referenced by %v after the park finished", s.stranded, refs)
+	}
+	s.requireSingleHolder(t, true)
+	vm, err := s.journal.Inspect(vmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vm.State != aj.VMDeletedRetained {
+		t.Fatalf("the VM's record is %s (reason %q), want %s", vm.State, vm.Reason, aj.VMDeletedRetained)
+	}
 }

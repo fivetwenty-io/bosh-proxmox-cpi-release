@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -300,19 +301,53 @@ func TestStorageJournalAuditSummaryNamesChargingRecords(t *testing.T) {
 
 // TestStorageJournalAuditSummaryNamesAListingStop prints the observed VM
 // record that delete_vm leaves when a storage's content listing stopped its
-// cleanup. The record line carries the whole reason the cleanup saved, with
-// the storage, the node, the listing's reason, and what to rerun.
+// cleanup. The reason comes from the cleanup's own save on a journal record,
+// so the record line carries the whole reason the cleanup saved, with the
+// storage, the node, the listing's reason, and what to rerun.
 func TestStorageJournalAuditSummaryNamesAListingStop(t *testing.T) {
-	now := time.Now().UTC()
-	vm := storageJournalAuditTestRecord("listing-stop-1", aj.Observed, now, now)
-	vm.CID = "4356"
-	vm.Reason = "VM cleanup stopped because storage nfs-images on node lab-pmx-0 could not be listed (listing_http_500); rerun delete_vm or storage-journal cleanup once that storage lists"
+	f := newStorageJournalFixture(t)
+	j := f.open(t)
+	fingerprint := strings.Repeat("a", 64)
+	plan, err := json.Marshal(map[string]any{"Version": 1, "Namespace": "director", "AllocationKey": "agent", "PolicyFingerprint": fingerprint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := j.AcquireVM(t.Context(), "agent", aj.Intent{IntentFingerprint: fingerprint, PolicyFingerprint: fingerprint, PlanVersion: 1, Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := handle.Record().ID
+	record := handle.Record()
+	record.Steps = append(record.Steps, aj.Step{ID: "attempt-0-step-0", Kind: "Nodes.CreateQemu", Attempt: record.ActiveAttempt(), Target: aj.Target{Node: "lab-pmx-0", VMID: 4356}, State: aj.Planned})
+	if err = handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	record.Steps[0].State = aj.Observed
+	record.State, record.CID = aj.Observed, "4356"
+	if err = handle.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	stop := handlers.NoteVMListingStopForTest(handle, "nfs-images", "lab-pmx-0", "listing_http_500")
+	if stop == nil || !strings.Contains(stop.Error(), "could not list storage nfs-images on node lab-pmx-0 (listing_http_500)") {
+		t.Fatalf("the listing stop returned %v, want the delete_vm error that names the storage", stop)
+	}
+	if err = handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	vm, err := j.Inspect(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
 	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true, Records: []aj.Record{vm}}
 	var out, stderr bytes.Buffer
 	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
 		t.Fatalf("audit exited %d: %s", code, stderr.String())
 	}
-	want := "record: id=listing-stop-1 kind=vm state=observed charging=true cid=4356 reason=\"" + vm.Reason + "\"\n"
+	reason := "VM cleanup stopped because storage nfs-images on node lab-pmx-0 could not be listed (listing_http_500); rerun delete_vm or storage-journal cleanup once that storage lists"
+	want := "record: id=" + id + " kind=vm state=observed charging=true cid=4356 reason=\"" + reason + "\"\n"
 	if !strings.Contains(out.String(), want) {
 		t.Fatalf("summary = %q, want the record line %q", out.String(), want)
 	}

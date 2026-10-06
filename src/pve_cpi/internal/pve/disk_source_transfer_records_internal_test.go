@@ -101,6 +101,38 @@ func TestFindSourceTransferRecords(t *testing.T) {
 		}
 	})
 
+	t.Run("a record whose parker carries its serial has landed and is left out", func(t *testing.T) {
+		t.Parallel()
+		// The landed record's parker holds the volume on a slot with the
+		// record's serial, and a parker's unused entry that carries a serial
+		// counts the same way. The record still in flight stays.
+		c := &scanFakeClient{
+			configs: map[int]map[string]any{
+				90000: {
+					cfgKeyTags: "bosh-cpi;bosh-parker",
+					"description": sourceRecordsDescription(
+						sourceRecordEntry("bpd-00000000000000aa", "700", "data:vm-700-disk-1"),
+						sourceRecordEntry("bpd-00000000000000bb", "700", "data:vm-700-disk-2"),
+						sourceRecordEntry("bpd-00000000000000cc", "700", "data:vm-700-disk-3"),
+					),
+					"scsi4":   "data:vm-90000-disk-0,serial=bpd-00000000000000aa,size=1G",
+					"unused0": "data:vm-90000-disk-2,serial=bpd-00000000000000cc",
+					// Another disk's serial on a parker slot says nothing about
+					// this record.
+					"scsi5": "data:vm-90000-disk-1,serial=bpd-00000000000000dd,size=1G",
+				},
+			},
+			rows: []map[string]any{clusterRow(90000, "")},
+		}
+		got, err := FindSourceTransferRecords(context.Background(), c, "700", cfg)
+		if err != nil {
+			t.Fatalf("FindSourceTransferRecords: %v", err)
+		}
+		if len(got) != 1 || got[0].StableID != "bpd-00000000000000bb" {
+			t.Fatalf("records = %+v, want only the record still in flight", got)
+		}
+	})
+
 	t.Run("a source with no records gets an empty answer", func(t *testing.T) {
 		t.Parallel()
 		c := &scanFakeClient{

@@ -957,7 +957,7 @@ func findParkedDiskIntentByStableID(
 	ctx context.Context, c Client, stableID string, cfg ParkerConfig,
 ) ([]DiskTransferIntent, error) {
 	var intents []DiskTransferIntent
-	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, disks map[string]parkerProvEntry) bool {
+	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, _ map[string]any, disks map[string]parkerProvEntry) bool {
 		entry, ok := disks[stableID]
 		if !ok {
 			return false
@@ -993,10 +993,12 @@ type SourceTransferRecord struct {
 // configured finds nothing. The records come back sorted by parker and then by
 // stable ID.
 //
-// A record whose transfer is still in flight names the volume by the name it
-// has on the source VM. A finished record names the volume the parker holds,
-// so a caller that matches records against the source VM's own entries only
-// ever matches a transfer that hasn't landed.
+// It leaves out a record whose transfer has landed, which is one whose parker
+// carries the record's serial on a disk key. It reads that from the same
+// parker config it reads the record from, so a landed record costs no extra
+// read, and a caller never resolves a disk whose move is already finished. A
+// record whose transfer is still in flight names the volume by the name it has
+// on the source VM.
 func FindSourceTransferRecords(ctx context.Context, c Client, sourceVMCID string, cfg ParkerConfig) ([]SourceTransferRecord, error) {
 	if c == nil {
 		return nil, cpierrors.Cloud("FindSourceTransferRecords: client must not be nil")
@@ -1005,10 +1007,13 @@ func FindSourceTransferRecords(ctx context.Context, c Client, sourceVMCID string
 		return nil, cpierrors.Cloud("FindSourceTransferRecords: source VM CID must not be empty")
 	}
 	var out []SourceTransferRecord
-	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, disks map[string]parkerProvEntry) bool {
+	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, vmCfg map[string]any, disks map[string]parkerProvEntry) bool {
 		for key := range disks {
 			entry := disks[key]
 			if !strings.HasPrefix(key, DiskStableIDPrefix) || entry.SourceVMCID != sourceVMCID || entry.Volid == "" {
+				continue
+			}
+			if configCarriesSerial(vmCfg, key) {
 				continue
 			}
 			out = append(out, SourceTransferRecord{StableID: key, DiskCID: entry.DiskCID, Intent: intentFromParkerEntry(p, entry)})
@@ -1027,14 +1032,29 @@ func FindSourceTransferRecords(ctx context.Context, c Client, sourceVMCID string
 	return out, nil
 }
 
+// configCarriesSerial reports whether any disk key in vmCfg carries
+// serial=<stableID>.
+func configCarriesSerial(vmCfg map[string]any, stableID string) bool {
+	for key := range vmCfg {
+		if !isQemuDiskKey(key) {
+			continue
+		}
+		text, _ := ConfigString(vmCfg, key)
+		if serial, has := StableIDFromDriveOptStr(text); has && serial == stableID {
+			return true
+		}
+	}
+	return false
+}
+
 // walkParkerRecords reads every tagged parker in the band and passes each
-// one's bosh_parked_disks map to visit, stopping early when visit returns
-// true. A band that isn't usable has no parkers to read, which isn't an error.
+// one's config and bosh_parked_disks map to visit, stopping early when visit
+// returns true. A band that isn't usable has no parkers to read, which isn't an error.
 // A parker whose config vanished between the listing and the read is skipped,
 // and any other read failure stops the walk and comes back, because a record
 // we never read must not count as a record that isn't there.
 func walkParkerRecords(
-	ctx context.Context, c Client, cfg ParkerConfig, visit func(parkerCandidate, map[string]parkerProvEntry) bool,
+	ctx context.Context, c Client, cfg ParkerConfig, visit func(parkerCandidate, map[string]any, map[string]parkerProvEntry) bool,
 ) error {
 	if cfg.VMIDRangeStart <= 0 || cfg.VMIDRangeEnd <= cfg.VMIDRangeStart {
 		return nil
@@ -1056,7 +1076,7 @@ func walkParkerRecords(
 			continue
 		}
 		_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
-		if visit(p, disks) {
+		if visit(p, vmCfg, disks) {
 			return nil
 		}
 	}

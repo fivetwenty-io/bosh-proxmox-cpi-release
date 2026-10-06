@@ -181,7 +181,9 @@ func resumeTransfer(ctx context.Context, deps Deps, op string, rd resolvedDisk, 
 // journal-managed disk, the attach of a disk without a journal under a
 // journal-managed VM, and the attach on a create_vm that runs without a
 // journal. detach_disk succeeds instead, because the disk is already off the
-// bus, and delete_vm gives its own refusal for the VM it won't destroy.
+// bus. delete_vm calls deferredParkSnapshotRefusal itself when it finishes a
+// journal-managed disk's transfer, and the legacy path gives its own refusal
+// for the VM it won't destroy.
 func resumeRefusesSnapshotBlock(op string) bool {
 	return op == "attach_disk" || op == "delete_disk" || isCreateVMDiskAttachOp(op)
 }
@@ -201,9 +203,9 @@ func isCreateVMDiskAttachOp(op string) bool {
 // keeps being refused. The text names the unused entry the source VM's config
 // holds for the volume, and it names the volume alone when the config read
 // fails or no entry names it. create_vm's disk attaches ask for create_vm to
-// run again, because that's the call the Director retries. It returns nil
-// when the record names no source VM, and the caller keeps its retriable
-// error.
+// run again, because that's the call the Director retries, and delete_vm says
+// that nothing was destroyed. It returns nil when the record names no source
+// VM, and the caller keeps its retriable error.
 func deferredParkSnapshotRefusal(ctx context.Context, deps Deps, op string, rd resolvedDisk, cause error) error {
 	source, ok := intentSourceVMID(rd.intent)
 	if !ok {
@@ -224,8 +226,11 @@ func deferredParkSnapshotRefusal(ctx context.Context, deps Deps, op string, rd r
 		}
 	}
 	held := "nothing was moved"
-	if op == "delete_disk" {
+	switch op {
+	case "delete_disk":
 		held = "nothing was moved or deleted"
+	case "delete_vm":
+		held = "nothing was moved or destroyed"
 	}
 	retry := op
 	if isCreateVMDiskAttachOp(op) {
