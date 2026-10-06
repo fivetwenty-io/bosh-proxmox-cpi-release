@@ -189,10 +189,39 @@ func refuseSnapshotNamingVolume(ctx context.Context, c Client, node string, vmid
 			}
 			text, ok := ConfigStringValue(value)
 			if ok && bareDriveVolid(text) == volid {
-				return fmt.Errorf("transfer in: snapshot %q of source vm %d names %q on %s, so the park waits until that snapshot is deleted: %w",
-					name, vmid, volid, key, ErrMoveDiskSnapshotRefused)
+				return &snapshotNamesVolumeRefusal{
+					snapshot: name,
+					err: fmt.Errorf("transfer in: snapshot %q of source vm %d names %q on %s, so the park waits until that snapshot is deleted: %w",
+						name, vmid, volid, key, ErrMoveDiskSnapshotRefused),
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// snapshotNamesVolumeRefusal is refuseSnapshotNamingVolume's refusal. Its text
+// and its ErrMoveDiskSnapshotRefused cause are the refusal's own, so every
+// caller that reads a snapshot refusal reads it unchanged, and it also says
+// that the CPI declined the park before it sent anything to PVE.
+type snapshotNamesVolumeRefusal struct {
+	snapshot string
+	err      error
+}
+
+func (e *snapshotNamesVolumeRefusal) Error() string { return e.err.Error() }
+
+func (e *snapshotNamesVolumeRefusal) Unwrap() error { return e.err }
+
+// SnapshotNamingVolumeRefusal reports whether err is the CPI's own refusal to
+// park a volume that a snapshot of the source VM still names, and returns
+// that snapshot's name. The CPI makes the check before it sends a move or a
+// config edit, so the refusal is the CPI's and not PVE's. PVE's refusal of a
+// move doesn't count.
+func SnapshotNamingVolumeRefusal(err error) (string, bool) {
+	var refusal *snapshotNamesVolumeRefusal
+	if errors.As(err, &refusal) {
+		return refusal.snapshot, true
+	}
+	return "", false
 }

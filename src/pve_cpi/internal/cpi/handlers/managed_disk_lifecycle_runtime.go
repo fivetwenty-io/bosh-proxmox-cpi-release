@@ -41,6 +41,12 @@ type managedDiskLifecycle struct {
 	// holders is the guard's hook state, which records the holders this
 	// operation created. createdHolder answers from it.
 	holders *managedDiskLifecycleGuard
+	// stepsFrom is the index of the first step this operation journaled on
+	// its handle. It is zero when the handle is the disk's own, and for a
+	// disk without a journal it is the length of the VM's record when the
+	// attach began. The clean exits judge only the steps from it on, because
+	// the VM allocation settles the steps it journaled itself.
+	stepsFrom int
 }
 
 func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk, operation string) (*managedDiskLifecycle, error) {
@@ -140,6 +146,7 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	cleanTimeout := m.cleanLockTimeout(operationErr)
 	cleanTail := !cleanTimeout && m.cleanTailRefusal(operationErr)
 	cleanPending := !cleanTimeout && !cleanTail && m.cleanPendingDelete(operationErr)
+	cleanSnapshot := !cleanTimeout && !cleanTail && !cleanPending && m.cleanSnapshotRefusal(operationErr)
 	if m.guard != nil {
 		operationErr = errors.Join(operationErr, m.guard.Err())
 	}
@@ -196,6 +203,18 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a detach tail refusal failed"))
 			completionFailed = true
 		}
+	case cleanSnapshot:
+		// PVE refused to move the disk onto its parker because a snapshot
+		// still references the volume, and the guard settled that move as
+		// refused, so the disk stays on the source VM's unused entry with its
+		// park deferred, as the detach that deferred it left it. The
+		// allocation goes back to the Director the way that detach returned
+		// it, and the refusal goes back unchanged for the operator.
+		finalErr = complete(false)
+		if finalErr != nil {
+			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a snapshot refused the move to a parker failed"))
+			completionFailed = true
+		}
 	case operationErr != nil:
 		finalErr = m.session.Uncertain("operation did not complete")
 	default:
@@ -219,7 +238,7 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	if completionFailed {
 		result = errors.Join(leadWithReconciliation(operationErr, finalErr), closeErr)
 	}
-	returned := (cleanTimeout || cleanTail || cleanPending) && finalErr == nil && closeErr == nil
+	returned := (cleanTimeout || cleanTail || cleanPending || cleanSnapshot) && finalErr == nil && closeErr == nil
 	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")
 	}
@@ -228,6 +247,9 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	}
 	if returned && cleanTail {
 		return &diskReturnedAfterTailRefusal{err: result}
+	}
+	if returned && cleanSnapshot {
+		return &diskReturnedAfterSnapshotRefusal{err: result}
 	}
 	return result
 }
@@ -292,11 +314,26 @@ type diskReturnedAfterTailRefusal struct{ err error }
 func (e *diskReturnedAfterTailRefusal) Error() string { return e.err.Error() }
 func (e *diskReturnedAfterTailRefusal) Unwrap() error { return e.err }
 
-// isDiskReturnedUnchanged reports whether err carries either marker, so the
-// disk operation returned the disk's allocation unchanged.
+// diskReturnedAfterSnapshotRefusal marks a disk operation that failed only
+// because PVE refused to move the disk onto its parker while a snapshot still
+// references the volume, after which the guard settled the move as refused
+// and the disk stayed where it was. For a journal-managed disk, finish
+// returned its allocation unchanged. For a disk without a journal that
+// create_vm attaches under its VM's allocation, every step the attach
+// journaled there is observed. create_vm's pre-attach reads it the way it reads
+// diskReturnedAfterLockTimeout. The marker wraps the original error, so its
+// CPI type stays visible.
+type diskReturnedAfterSnapshotRefusal struct{ err error }
+
+func (e *diskReturnedAfterSnapshotRefusal) Error() string { return e.err.Error() }
+func (e *diskReturnedAfterSnapshotRefusal) Unwrap() error { return e.err }
+
+// isDiskReturnedUnchanged reports whether err carries any of the three
+// markers, so the disk operation returned the disk's allocation unchanged.
 func isDiskReturnedUnchanged(err error) bool {
 	var refused *diskReturnedAfterTailRefusal
-	return isDiskReturnedAfterLockTimeout(err) || errors.As(err, &refused)
+	var blocked *diskReturnedAfterSnapshotRefusal
+	return isDiskReturnedAfterLockTimeout(err) || errors.As(err, &refused) || errors.As(err, &blocked)
 }
 
 // completeOwned closes the session with fresh evidence of the disk's current
@@ -376,7 +413,7 @@ func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
 		return false
 	}
-	return storageLifecycleSettled(m.handle.Record()) == nil
+	return m.ownStepsSettled()
 }
 
 // isLockWaitWithoutEntry reports whether err is a lock acquire that gave up
@@ -408,7 +445,7 @@ func (m *managedDiskLifecycle) cleanTailRefusal(operationErr error) bool {
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
 		return false
 	}
-	return storageLifecycleSettled(m.handle.Record()) == nil
+	return m.ownStepsSettled()
 }
 
 // cleanPendingDelete reports whether an operation failed only because of a
@@ -439,7 +476,42 @@ func (m *managedDiskLifecycle) cleanPendingDelete(operationErr error) bool {
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {
 		return false
 	}
-	return storageLifecycleSettled(m.handle.Record()) == nil
+	return m.ownStepsSettled()
+}
+
+// cleanSnapshotRefusal reports whether an operation failed only because PVE
+// refused to move the disk onto its parker while a snapshot still references
+// the volume. The failure has to be that refusal, either as PVE's own text or
+// as the SnapshotBlocked error a resume builds from it, and the guard has to
+// have settled a refused move onto a parker by reading both VMs back. The
+// guard must never have been poisoned, and every step the operation journaled
+// must be observed. The move the guard admitted counts as a disk mutation, so
+// diskMutationAdmitted can't rule this exit out. The settlement is the proof
+// that the move changed nothing, and completeOwned still proves the disk's
+// ownership afresh before the allocation goes back.
+func (m *managedDiskLifecycle) cleanSnapshotRefusal(operationErr error) bool {
+	if !pve.IsMoveDiskSnapshotRefusal(operationErr) && !cpierrors.IsType(operationErr, cpierrors.TypeSnapshotBlocked) {
+		return false
+	}
+	if m.holders == nil || !m.holders.snapshotRefusalSettled {
+		return false
+	}
+	if m.guard == nil || m.guard.Err() != nil || m.handle == nil {
+		return false
+	}
+	return m.ownStepsSettled()
+}
+
+// ownStepsSettled reports whether every step this operation journaled on its
+// handle in the active attempt is observed. It judges the steps from stepsFrom
+// on, and a handle whose record no longer reaches stepsFrom never counts.
+func (m *managedDiskLifecycle) ownStepsSettled() bool {
+	record := m.handle.Record()
+	if m.stepsFrom < 0 || m.stepsFrom > len(record.Steps) {
+		return false
+	}
+	record.Steps = record.Steps[m.stepsFrom:]
+	return storageLifecycleSettled(record) == nil
 }
 
 func (m *managedDiskLifecycle) deletionProof(ctx context.Context) (aj.Verification, error) {
