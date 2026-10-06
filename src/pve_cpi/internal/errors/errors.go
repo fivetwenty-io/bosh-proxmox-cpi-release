@@ -81,6 +81,8 @@ type Error struct {
 	msg       string
 	cause     error
 	retriable bool
+	// definite marks the handler's settled answer. See Definite.
+	definite bool
 }
 
 // Error implements the error interface. When a cause is chained it is appended
@@ -308,4 +310,38 @@ func IsType(err error, typ Type) bool {
 // or DiskNotFound error.
 func IsNotFound(err error) bool {
 	return IsType(err, TypeVMNotFound) || IsType(err, TypeDiskNotFound)
+}
+
+// errDefinite is the target IsDefinite matches through errors.Is. It is
+// unexported, so only an *Error that Definite marked can match it.
+var errDefinite = errors.New("definite CPI outcome")
+
+// Definite returns a copy of e marked as the handler's definite answer. A
+// handler marks an error this way when the error records an outcome the
+// handler has already settled, such as an allocation it moved to
+// reconciliation_required, so a retry with identical arguments would be
+// refused. The per-method deadline envelope never rewrites an error that
+// carries this mark into its retriable timeout, even when the deadline fired
+// while the handler was settling the outcome. The mark changes neither the
+// error's type nor its retriable flag. A nil e returns nil.
+func Definite(e *Error) *Error {
+	if e == nil {
+		return nil
+	}
+	marked := *e
+	marked.definite = true
+	return &marked
+}
+
+// Is lets errors.Is find a Definite mark anywhere in a chain, including inside
+// errors.Join trees and behind Wrap, where errors.As would stop at the first
+// *Error it reaches.
+func (e *Error) Is(target error) bool {
+	return target == errDefinite && e.definite
+}
+
+// IsDefinite reports whether any error in err's chain carries the Definite
+// mark.
+func IsDefinite(err error) bool {
+	return errors.Is(err, errDefinite)
 }

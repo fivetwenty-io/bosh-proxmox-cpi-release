@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"time"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // rollbackCleanupTimeout bounds handler-level rollback/cleanup work that runs
@@ -79,4 +81,49 @@ func detachedContext(parent context.Context, d time.Duration) (context.Context, 
 		base = context.WithoutCancel(parent)
 	}
 	return context.WithTimeout(base, d)
+}
+
+// finishingContext returns the context for work that must finish once it has
+// started, such as a create_vm rollback's VM disposal or a disk operation's
+// completion audit, plus the cancel the caller must defer. Under a request
+// deadline the work keeps the request's values, and it gets at least budget
+// from now even when the deadline is nearer or has already passed. A deadline
+// further out than budget still applies in full, so the work never gets less
+// time than the request had left. The work is detached from the request's
+// cancellation, so a deadline that arrives partway through cannot cut it off
+// and leave a record that refuses the retry.
+//
+// A request without a deadline has no deadline to outlive, so the work runs on
+// the request's own context, even when a stop signal has already cancelled it.
+// That is the case for every CPI call when operation_timeout is off, so the
+// work keeps the same unbounded time it has always had there, and a stop
+// signal still stops it.
+func finishingContext(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		return context.WithTimeout(context.Background(), budget)
+	}
+	deadline, bounded := parent.Deadline()
+	if !bounded {
+		return parent, func() {}
+	}
+	if left := time.Until(deadline); left > budget {
+		budget = left
+	}
+	return detachedContext(parent, budget)
+}
+
+// closingContext is finishingContext with pve.ClusterLockCompletionAllowance
+// for completion work that has always run after the request ended, such as the
+// audit that returns a disk after a clean lock timeout or delete_vm's readback
+// after a retention lock timeout. That work already ran detached for the
+// allowance whenever the request had ended, so a request without a deadline
+// that a stop signal has cancelled still gets the allowance here, the way it
+// did before finishingContext existed.
+func closingContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := finishingContext(parent, pve.ClusterLockCompletionAllowance)
+	if ctx.Err() == nil {
+		return ctx, cancel
+	}
+	cancel()
+	return detachedContext(parent, pve.ClusterLockCompletionAllowance)
 }

@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -53,8 +54,26 @@ func cleanupManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal
 // rollbackManagedVMAttempt is cleanupManagedVMAttempt for a create_vm attempt
 // that failed. It runs the same disposal, and any failure after the disposal
 // was admitted leaves the generation requiring reconciliation.
+//
+// The rollback often starts late in the request, after a lock wait that
+// stopped short of the request's deadline to leave time for closing out, and
+// that margin is far too small for a whole disposal. A disposal cut off by the
+// request's deadline would leave the generation requiring reconciliation, and
+// the Director's retry would be refused. So the disposal runs on a
+// finishingContext with managedVMRollbackBudget.
 func rollbackManagedVMAttempt(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (aj.Verification, error) {
-	return disposeManagedVMFor(ctx, deps, journal, handle, false, managedVMCreateRollback)
+	rollbackCtx, cancel := finishingContext(ctx, managedVMRollbackBudget(deps))
+	defer cancel()
+	return disposeManagedVMFor(rollbackCtx, deps, journal, handle, false, managedVMCreateRollback)
+}
+
+// managedVMRollbackBudget is the least time a create_vm rollback's VM disposal
+// gets once it starts. The disposal is the work delete_vm does for the same
+// VM, so it gets the delete-class budget of operation_timeout, which operators
+// size for a delete_vm whose disks wait on other requests' parker locks. That
+// budget is delete_sec when it is set and the built-in default otherwise.
+func managedVMRollbackBudget(deps Deps) time.Duration {
+	return time.Duration(deps.Config.OperationTimeoutDeleteSec()) * time.Second
 }
 
 func disposeManagedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, retain bool) (aj.Verification, error) {
@@ -517,17 +536,46 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 // the allocation requiring it. The Director reads only the first CPI error in
 // the chain. A retriable failure goes behind the reconciliation error, which
 // is not retriable, so the Director does not retry into a record that then
-// refuses. Any other failure keeps its place, so its own message, such as an
-// audit gate's findings, is still the one the Director shows. An untyped
-// failure is wrapped as a non-retriable CloudError first, because otherwise
-// the reconciliation error would be the first typed error and its text would
-// replace the failure's own.
+// refuses. A failure that the request's deadline or a stop signal cut off goes
+// behind it too, because the Director would otherwise read the cut-off as a
+// disposal failure instead of the reconciliation the record now needs. Any
+// other failure keeps its place, so its own message, such as an audit gate's
+// findings, is still the one the Director shows. An untyped failure is wrapped
+// as a non-retriable CloudError first, because otherwise the reconciliation
+// error would be the first typed error and its text would replace the
+// failure's own.
 func joinReconciliation(err, reconciliation error) error {
+	if reconciliationLeads(err) {
+		return errors.Join(reconciliation, err)
+	}
 	var typed *cpierrors.Error
 	if !errors.As(err, &typed) {
 		return errors.Join(cpierrors.WrapAs(err, cpierrors.TypeCloud, "VM disposal failed"), reconciliation)
 	}
-	if typed.OkToRetry() || typed.Type() == cpierrors.TypeRetriableCloud {
+	return errors.Join(err, reconciliation)
+}
+
+// reconciliationLeads reports whether a reconciliation error belongs in front
+// of err. That holds for a retriable failure, and for one that the request's
+// deadline or a stop signal cut off, since the Director would retry either
+// into a record that then refuses.
+func reconciliationLeads(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var typed *cpierrors.Error
+	return errors.As(err, &typed) && (typed.OkToRetry() || typed.Type() == cpierrors.TypeRetriableCloud)
+}
+
+// leadWithReconciliation joins the error of a failed completion, which carries
+// the reconciliation error, onto an operation's error by the same rule as
+// joinReconciliation. An untyped operation error is not wrapped, because the
+// Director skips it and reads the completion's error first anyway.
+func leadWithReconciliation(err, reconciliation error) error {
+	if err == nil {
+		return reconciliation
+	}
+	if reconciliationLeads(err) {
 		return errors.Join(reconciliation, err)
 	}
 	return errors.Join(err, reconciliation)

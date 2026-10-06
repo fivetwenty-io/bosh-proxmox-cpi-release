@@ -143,7 +143,23 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 	if m.guard != nil {
 		operationErr = errors.Join(operationErr, m.guard.Err())
 	}
+	// Every completion below is a clean exit, and it must finish once it
+	// starts. A lock wait that gave up stopped short of the request's deadline
+	// by only pve.ClusterLockCompletionAllowance and the lock release, so a
+	// completion on what is left of the request could be cut off partway, and
+	// a cut-off completion sends the record to reconciliation even though the
+	// operation changed nothing it cannot account for. So each completion runs
+	// on a finishingContext that gives it at least that allowance under a
+	// request deadline, including when the deadline has already passed,
+	// because every read it makes would otherwise fail at once. The audit
+	// after a clean lock timeout runs on a closingContext instead.
+	complete := func(deleted bool) error {
+		completionCtx, cancelCompletion := finishingContext(ctx, pve.ClusterLockCompletionAllowance)
+		defer cancelCompletion()
+		return m.completeOwned(completionCtx, deleted)
+	}
 	var finalErr error
+	completionFailed := false
 	switch {
 	case cleanPending:
 		// A pending change on the slot stopped the operation, and either the
@@ -151,47 +167,58 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 		// nothing was sent to the slot, so the disk is where the operation
 		// found it. The allocation goes back to the Director the
 		// way a success returns it, and the refusal goes back unchanged.
-		finalErr = m.completeOwned(ctx, false)
+		finalErr = complete(false)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a reverted pending delete failed"))
+			completionFailed = true
 		}
 	case cleanTimeout:
 		// The wait ran out before this operation changed anything it cannot
 		// account for, so the allocation is returned to the Director exactly as
 		// a success would return it, and the retriable timeout goes back for
-		// the Director to retry. When the request's context has already
-		// ended, the completion runs on a detached, bounded context instead,
-		// because every read it makes would otherwise fail at once. That path
-		// is only ever taken for a clean exit, never after an operation error.
-		completionCtx := ctx
-		if ctx.Err() != nil {
-			detached, cancel := detachedContext(ctx, pve.ClusterLockCompletionAllowance)
-			defer cancel()
-			completionCtx = detached
-		}
-		finalErr = m.completeOwned(completionCtx, false)
+		// the Director to retry. This completion has always run after the
+		// request ended, so it runs on a closingContext, which also outlives
+		// a stop signal on a request without a deadline.
+		closing, cancelClosing := closingContext(ctx)
+		defer cancelClosing()
+		finalErr = m.completeOwned(closing, false)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a lock timeout failed"))
+			completionFailed = true
 		}
 	case cleanTail:
 		// The detach tail stopped before it changed the source VM, and
 		// nothing else in this operation touched the disk. So the
 		// allocation returns to the Director the way a success returns
 		// it. The tail's error also goes back for the Director to retry.
-		finalErr = m.completeOwned(ctx, false)
+		finalErr = complete(false)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit after a detach tail refusal failed"))
+			completionFailed = true
 		}
 	case operationErr != nil:
 		finalErr = m.session.Uncertain("operation did not complete")
 	default:
-		finalErr = m.completeOwned(ctx, deleted)
+		finalErr = complete(deleted)
 		if finalErr != nil {
 			finalErr = errors.Join(finalErr, m.session.Uncertain("completion audit failed"))
+			completionFailed = true
 		}
 	}
 	closeErr := errors.Join(m.handle.Close(), m.journal.Close())
+	// A failed completion leaves the allocation requiring reconciliation, and
+	// the Director acts on the first CPI error in the chain. So when a
+	// completion failed, its error goes in front of a retriable operation
+	// error, such as the lock timeout a clean exit hands back. The Director
+	// then reads the completion's own answer, or the reconciliation error
+	// when that answer is untyped, instead of a timeout that invites a retry
+	// the record would refuse. A completion that failed retriably still
+	// answers retriable, because a rerun of the call audits the disk again
+	// and can settle the record.
 	result := errors.Join(operationErr, finalErr, closeErr)
+	if completionFailed {
+		result = errors.Join(leadWithReconciliation(operationErr, finalErr), closeErr)
+	}
 	returned := (cleanTimeout || cleanTail || cleanPending) && finalErr == nil && closeErr == nil
 	if result != nil && !returned {
 		m.deps.recordStorageReconciliation(ctx, "required")

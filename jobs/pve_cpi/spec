@@ -1883,7 +1883,13 @@ properties:
       wraps handler execution and behavior is identical to prior releases. When
       true, each CPI method runs under a context deadline sized by its class so a
       wedged retry/poll combination converts into a retriable timeout the
-      Director can act on instead of holding a queue slot indefinitely.
+      Director can act on instead of holding a queue slot indefinitely. An
+      error that records an outcome the CPI has already settled, such as an
+      allocation it moved to reconciliation_required, goes back unchanged.
+      A create_vm rollback's VM disposal gets at least the delete_sec budget.
+      Every completion audit of a call on a journal-managed disk, and the
+      readback delete_vm runs after a retention lock timeout, gets at least
+      5 s, so such a call can run past its own deadline by that much.
     default: false
   pve.operation_timeout.create_sec:
     description: |
