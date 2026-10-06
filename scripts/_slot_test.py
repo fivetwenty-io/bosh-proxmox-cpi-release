@@ -20,6 +20,7 @@ import importlib.util as _ilu
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1210,7 +1211,6 @@ class BoshScriptSlotTest(_SyntheticRoot):
         self.assertEqual(mod.STATE, self.slot_dir / "state.json")
         self.assertEqual(mod.CREDS, self.slot_dir / "creds.yml")
         self.assertEqual(mod.BOSH_ALIAS, "pve-cert")
-        self.assertEqual(mod.DIRECTOR_NAME, "cert")
         self.assertEqual(mod.internal_ip(), "192.0.2.12")
 
     def test_default_slot_is_unchanged(self) -> None:
@@ -1218,7 +1218,199 @@ class BoshScriptSlotTest(_SyntheticRoot):
         self.assertEqual(mod.STATE, mod.REPO_ROOT / "manifests" / "bosh" / "state.json")
         self.assertEqual(mod.CREDS, mod.REPO_ROOT / "manifests" / "bosh" / "creds.yml")
         self.assertEqual(mod.BOSH_ALIAS, "pve")
-        self.assertEqual(mod.DIRECTOR_NAME, "ocfp-mgmt")
+
+    def _director_name_argv(self, mod: object) -> list:
+        """The create-env argv the module would run, with its inputs stubbed."""
+        captured: list = []
+        mod.cpi_release_path = lambda: Path(self.tmp.name) / "release.tgz"
+        mod._cpi_release_name = lambda _p: "bosh-proxmox-cpi"
+        mod._light_stemcell_create_env_vars = lambda: []
+        mod.bosh_deployment_dir = lambda: Path(self.tmp.name)
+        mod.compiled_ops_layer = lambda: []
+        mod.run = lambda *argv, **_kw: captured.append(argv) or 0
+        with _environ():
+            mod.cmd_create_env([])
+        return list(captured[0])
+
+    def test_director_name_falls_back_when_no_vars_file_sets_it(self) -> None:
+        mod = self._load({})
+        with _environ():
+            self.assertEqual(mod.director_name_vars(), ["-v", "director_name=ocfp-mgmt"])
+        slot_mod = self._load({"BOSH_STATE_DIR": str(self.slot_dir)})
+        (self.slot_dir / "slot.yml").write_text(
+            "internal_ip: 192.0.2.12\npve_create_env_deployment: create-env-cert\n")
+        with _environ():
+            self.assertEqual(slot_mod.director_name_vars(), ["-v", "director_name=ocfp-mgmt"])
+
+    def test_director_name_comes_from_the_base_vars_file(self) -> None:
+        (self.repo.default_dir / "vars.yml").write_text(
+            "internal_gw: 172.31.0.1\ndirector_name: lab-director\n")
+        mod = self._load({})
+        with _environ():
+            self.assertEqual(mod.director_name_vars(), [])
+            argv = self._director_name_argv(mod)
+        self.assertFalse(any(str(a).startswith("director_name=") for a in argv))
+        self.assertEqual(argv.count(str(mod.VARS)), 1)
+
+    def test_director_name_comes_from_the_env_vars_file(self) -> None:
+        env_vars = self.repo.root / "manifests" / "envs" / "cpitest" / "vars.yml"
+        env_vars.write_text("director_name: env-director\n")
+        mod = self._load({})
+        with _environ():
+            self.assertEqual(mod.director_name_vars(), [])
+
+    def test_director_name_comes_from_slot_yml(self) -> None:
+        mod = self._load({"BOSH_STATE_DIR": str(self.slot_dir)})
+        with _environ():
+            self.assertEqual(mod.director_name_vars(), [])
+
+    def test_the_fallback_name_is_the_only_director_name_flag(self) -> None:
+        mod = self._load({})
+        argv = self._director_name_argv(mod)
+        pairs = [(argv[i], argv[i + 1]) for i in range(len(argv) - 1) if argv[i] == "-v"]
+        self.assertEqual([v for _f, v in pairs if v.startswith("director_name=")],
+                         ["director_name=ocfp-mgmt"])
+
+    def test_layered_var_takes_the_last_file_that_sets_it(self) -> None:
+        mod = self._load({})
+        base = Path(self.tmp.name) / "base.yml"
+        env = Path(self.tmp.name) / "env.yml"
+        top = Path(self.tmp.name) / "top.yml"
+        gone = Path(self.tmp.name) / "gone.yml"
+        base.write_text("director_name: base\n")
+        env.write_text("director_name: env\n")
+        top.write_text("other: 1\n")
+        self.assertEqual(mod.layered_var("director_name", [gone, base]), "base")
+        self.assertEqual(mod.layered_var("director_name", [base, env]), "env")
+        self.assertEqual(mod.layered_var("director_name", [base, env, top]), "env")
+        self.assertIsNone(mod.layered_var("director_name", [gone, top]))
+        self.assertIsNone(mod.layered_var("absent", [base, env]))
+
+    def test_layered_var_ignores_a_file_that_is_not_a_mapping(self) -> None:
+        mod = self._load({})
+        listy = Path(self.tmp.name) / "list.yml"
+        listy.write_text("- director_name\n")
+        self.assertIsNone(mod.layered_var("director_name", [listy]))
+
+    def test_layered_var_stops_on_a_file_it_cannot_parse(self) -> None:
+        mod = self._load({})
+        broken = Path(self.tmp.name) / "broken.yml"
+        broken.write_text("director_name: [unclosed\n")
+        with self.assertRaises(SystemExit) as cm:
+            mod.layered_var("director_name", [broken])
+        self.assertIn("Fix the file", str(cm.exception))
+        self.assertRegex(str(cm.exception), re.escape(f"{broken} at line ") + "[0-9]+")
+
+    def test_layered_var_does_not_quote_the_line_it_cannot_parse(self) -> None:
+        mod = self._load({})
+        broken = Path(self.tmp.name) / "broken.yml"
+        broken.write_text("other: fine\nadmin_password: [hunter2-planted-secret\n")
+        with self.assertRaises(SystemExit) as cm:
+            mod.layered_var("director_name", [broken])
+        message = str(cm.exception)
+        self.assertNotIn("hunter2-planted-secret", message)
+        self.assertNotIn("admin_password", message)
+        self.assertIn(str(broken), message)
+        self.assertRegex(message, r"at line [0-9]+")
+
+    def test_layered_var_stops_on_a_value_yaml_cannot_load(self) -> None:
+        mod = self._load({})
+        broken = Path(self.tmp.name) / "bad-date.yml"
+        broken.write_text("rotated: 2026-13-45\n")
+        with self.assertRaises(SystemExit) as cm:
+            mod.layered_var("director_name", [broken])
+        message = str(cm.exception)
+        self.assertIn(str(broken), message)
+        self.assertIn("Fix the file", message)
+        self.assertNotIn("2026-13-45", message)
+
+    def _layer_files(self, base: str = "", env: str = "") -> Path:
+        """Write the base and env vars files, and return the env file's path."""
+        (self.repo.default_dir / "vars.yml").write_text(base)
+        env_vars = self.repo.root / "manifests" / "envs" / "cpitest" / "vars.yml"
+        env_vars.write_text(env)
+        return env_vars
+
+    def test_layered_var_stops_on_a_file_that_is_not_utf8(self) -> None:
+        mod = self._load({})
+        latin = Path(self.tmp.name) / "latin.yml"
+        latin.write_bytes(b"\xff\xfed\x00i\x00r\x00")
+        with self.assertRaises(SystemExit) as cm:
+            mod.layered_var("director_name", [latin])
+        self.assertIn(str(latin), str(cm.exception))
+        self.assertIn("Fix the file", str(cm.exception))
+
+    def test_layered_var_stops_on_a_blank_or_null_value(self) -> None:
+        mod = self._load({})
+        base = Path(self.tmp.name) / "base.yml"
+        top = Path(self.tmp.name) / "top.yml"
+        base.write_text("director_name: base\n")
+        for text in ("director_name:\n", "director_name: null\n", "director_name: ''\n",
+                     "director_name: '  '\n"):
+            with self.subTest(text=text):
+                top.write_text(text + "other: 1\n")
+                for files in ([base, top], [top]):
+                    with self.assertRaises(SystemExit) as cm:
+                        mod.layered_var("director_name", files)
+                    self.assertIn(str(top), str(cm.exception))
+                    self.assertIn("Fix the file", str(cm.exception))
+
+    def test_a_blank_name_in_a_higher_layer_stops_over_a_set_lower_layer(self) -> None:
+        for blank in ("director_name:\n", "director_name: ''\n", "director_name: null\n"):
+            with self.subTest(blank=blank):
+                env_vars = self._layer_files("director_name: base\n", blank)
+                mod = self._load({})
+                with _environ(), self.assertRaises(SystemExit) as cm:
+                    mod.director_name_vars()
+                self.assertIn(str(env_vars), str(cm.exception))
+                self.assertIn("Fix the file", str(cm.exception))
+        self._layer_files("director_name: base\n", "director_name: env\n")
+        slot_yml = self.slot_dir / "slot.yml"
+        slot_yml.write_text(GOOD_SLOT_YML.replace("director_name: cert\n", "director_name:\n"))
+        mod = self._load({"BOSH_STATE_DIR": str(self.slot_dir)})
+        with _environ(), self.assertRaises(SystemExit) as cm:
+            mod.director_name_vars()
+        self.assertIn(str(slot_yml), str(cm.exception))
+
+    def test_vars_layer_files_go_base_then_env_then_slot(self) -> None:
+        env_vars = self._layer_files()
+        mod = self._load({})
+        with _environ():
+            self.assertEqual(mod.vars_layer_files(), [mod.VARS, env_vars])
+        slot_mod = self._load({"BOSH_STATE_DIR": str(self.slot_dir)})
+        with _environ():
+            self.assertEqual(slot_mod.vars_layer_files(),
+                             [slot_mod.VARS, env_vars, self.slot_dir / "slot.yml"])
+
+    def test_a_higher_layer_name_wins_over_a_lower_one(self) -> None:
+        env_vars = self._layer_files("director_name: base\n", "director_name: env\n")
+        slot_yml = self.slot_dir / "slot.yml"
+        mod = self._load({"BOSH_STATE_DIR": str(self.slot_dir)})
+        with _environ():
+            self.assertEqual(mod.layered_var("director_name", mod.vars_layer_files()), "cert")
+            argv = self._director_name_argv(mod)
+        ls = [argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "-l"]
+        self.assertEqual(ls, [str(mod.VARS), str(env_vars), str(slot_yml)])
+        self.assertFalse(any(str(a).startswith("director_name=") for a in argv))
+        # With no name in slot.yml the env's name wins over the base file's.
+        slot_yml.write_text(GOOD_SLOT_YML.replace("director_name: cert\n", ""))
+        with _environ():
+            self.assertEqual(mod.layered_var("director_name", mod.vars_layer_files()), "env")
+        env_vars.write_text("other: 1\n")
+        with _environ():
+            self.assertEqual(mod.layered_var("director_name", mod.vars_layer_files()), "base")
+
+    def test_teardown_stops_on_an_unreadable_vars_file_before_deleting_anything(self) -> None:
+        _write_state(self.slot_dir / "state.json", "4001", "director-7")
+        (self.repo.default_dir / "vars.yml").write_bytes(b"\xff\xfedirector_name")
+        deleted: list = []
+        mod = self._slot_module(_never)
+        self.assertTrue(_slot.write_owner(mod.SLOT, None, {}))
+        mod._delete_all_deployments = lambda: deleted.append(True)
+        with _environ(), self.assertRaises(SystemExit) as cm:
+            mod.cmd_teardown([])
+        self.assertIn("Fix the file", str(cm.exception))
+        self.assertEqual(deleted, [])
 
     def test_teardown_of_an_empty_dedicated_slot_is_a_no_op(self) -> None:
         mod = self._refusing({"BOSH_STATE_DIR": str(self.slot_dir)})

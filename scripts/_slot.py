@@ -21,7 +21,10 @@ that must differ per Director:
                                (required, and it must differ from the env's)
     bosh_alias                 the bosh CLI alias (default: pve-<dir name>;
                                never 'pve')
-    director_name              the Director's name (default: ocfp-mgmt)
+    director_name              the Director's name (optional; scripts/bosh reads
+                               it from the vars layers, this file's value
+                               winning, and names the Director ocfp-mgmt only
+                               when no layer sets one)
 
 scripts/bosh layers slot.yml last, after manifests/bosh/vars.yml and the env
 bundle's vars.yml, so its keys win everywhere the manifests read them.

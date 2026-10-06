@@ -63,8 +63,10 @@ Director slot (where create-env keeps state.json and creds.yml):
                            internal_ip (inside the env's reserved band) and
                            pve_create_env_deployment, plus optional bosh_alias
                            (never 'pve') and director_name. It is layered
-                           after every other vars file. Its alias defaults to
-                           pve-<dir name>. net-down refuses in a non-default
+                           after every other vars file, so its director_name
+                           wins over theirs, and ocfp-mgmt names the Director
+                           only when none of them sets one. Its alias defaults
+                           to pve-<dir name>. net-down refuses in a non-default
                            slot, since the network is shared.
                            After create-env or teardown in such a slot,
                            scripts/bosh writes <dir>/slot-owner.json naming
@@ -145,7 +147,6 @@ CREDS = SLOT.creds
 STATE = SLOT.state
 try:
     BOSH_ALIAS = SLOT.alias
-    DIRECTOR_NAME = SLOT.director_name
 except _slot.SlotError as _exc:
     sys.exit(f"Director slot: {_exc}")
 # Pins the cloudfoundry/bosh release version (282.1.13) regardless of the
@@ -242,6 +243,75 @@ def env_vars_layer() -> list[str]:
     """Return the `-l <env vars.yml>` flag pair, or [] when absent."""
     f = env_vars_file()
     return ["-l", str(f)] if f else []
+
+
+def vars_layer_files() -> list[Path]:
+    """The vars files create-env and delete-env layer, lowest precedence first.
+
+    The base vars.yml, then the active env's vars.yml, then the slot's
+    slot.yml, which is the order their `-l` flags go on the command line.
+    """
+    files = [VARS]
+    env_f = env_vars_file()
+    if env_f:
+        files.append(env_f)
+    if SLOT.vars_layer():
+        files.append(SLOT.config)
+    return files
+
+
+def layered_var(key: str, files: list[Path]) -> "str | None":
+    """The top-level `key` as the last of `files` that sets it, or None.
+
+    A missing file, a file that isn't a mapping, and a file that doesn't
+    mention the key all leave it to the layers below. A file that mentions
+    the key with a null or blank value stops the command, because bosh lets
+    that later file win and would render an empty name. A file that exists
+    and can't be read as UTF-8 YAML stops the command too, since bosh would
+    fail on it as well. The message names the file and, for a YAML error, the
+    line, and never quotes the file.
+    """
+    import yaml
+
+    found: "str | None" = None
+    for f in files:
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except yaml.YAMLError as exc:
+            # The error's own text quotes the bad line, and a vars file holds
+            # lab credentials, so only the path and the line number go out.
+            mark = getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}" if mark is not None else ""
+            sys.exit(f"cannot read {f}{where} to look up {key}: it is not valid YAML. "
+                     "Fix the file, then run again.")
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.exit(f"cannot read {f} to look up {key}: {exc}. Fix the file, then run again.")
+        except (ValueError, RecursionError):
+            sys.exit(f"cannot read {f} to look up {key}: it holds a value YAML can't load. "
+                     "Fix the file, then run again.")
+        if not isinstance(data, dict) or key not in data:
+            continue
+        value = data[key]
+        if value is None or not str(value).strip():
+            sys.exit(f"{key} in {f} is empty, and bosh would render an empty name from it. "
+                     f"Set {key} there to a name, or remove the key. Fix the file, then run again.")
+        found = str(value).strip()
+    return found
+
+
+def director_name_vars() -> list[str]:
+    """The `-v director_name=` pair create-env and delete-env pass, or [].
+
+    The Director's name comes from the vars layers like every other manifest
+    value, because a `-v` on the command line beats every `-l` file. So the
+    pair is only emitted when no layer sets director_name, and then it carries
+    the default name the lab has always used.
+    """
+    if layered_var("director_name", vars_layer_files()):
+        return []
+    return ["-v", f"director_name={_slot.DEFAULT_DIRECTOR_NAME}"]
 
 
 def env_cc_reserved_ops() -> list[str]:
@@ -495,7 +565,7 @@ def cmd_create_env(args: list[str]) -> int:
         "-l", str(VARS),
         *env_vars_layer(),
         *SLOT.vars_layer(),
-        "-v", f"director_name={DIRECTOR_NAME}",
+        *director_name_vars(),
         "-v", f"pve_cpi_release_path={release}",
         # The manifest's release name must match the name embedded in the
         # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).
@@ -641,6 +711,9 @@ def cmd_teardown(args: list[str]) -> int:
     if _state_is_empty():
         print(f"teardown: state file absent or empty ({STATE}), nothing to delete")
         return 0
+    # Resolve the Director's name first, so a vars file the script can't read
+    # stops it before anything is deleted.
+    name_vars = director_name_vars()
     # Remove all deployments (their VMs) before delete-env strands them as
     # orphans on the SDN — see _delete_all_deployments for the duplicate-IP
     # failure this prevents.
@@ -665,7 +738,7 @@ def cmd_teardown(args: list[str]) -> int:
         "-l", str(VARS),
         *env_vars_layer(),
         *SLOT.vars_layer(),
-        "-v", f"director_name={DIRECTOR_NAME}",
+        *name_vars,
         "-v", f"pve_cpi_release_path={release}",
         # The manifest's release name must match the name embedded in the
         # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).

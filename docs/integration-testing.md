@@ -264,7 +264,7 @@ One coverage caveat: the per-pool matrix overrides `disk_storage` only. `vm_stor
 
 | Key | Description | Example |
 |-----|-------------|---------|
-| `director_name` | Value passed as `-v director_name` to `bosh create-env` | `ocfp-mgmt` |
+| `director_name` | The name the config summary prints for the Director. It doesn't name the Director, which takes its name from `director_name` in the vars files that `./scripts/bosh` layers, and from `ocfp-mgmt` only when none of them sets one | `ocfp-mgmt` |
 | `bosh_env_alias` | Alias registered via `bosh alias-env` | `pve` |
 | `deployment_name` | Name of the emptyvm smoke deployment | `emptyvm` |
 | `smoke_timeout_s` | Seconds to wait for the emptyvm deploy | `300` |
