@@ -141,6 +141,10 @@ type lifecycleFlowPVE struct {
 	// onConfigRead, when set, runs before every config read, and an error it
 	// returns fails that read.
 	onConfigRead func(vmid int) error
+	// onNodeConfigRead, when set, runs before every config read with the
+	// node it is sent to, and an error it returns fails that read, the way
+	// a read routed to a node that doesn't answer fails.
+	onNodeConfigRead func(node string, vmid int) error
 	// onConfigReadContext, when set, runs before every config read with the
 	// read's context, and an error it returns fails that read, so a row can
 	// hold a read until its context ends.
@@ -987,6 +991,11 @@ func (c *lifecycleFlowPVE) vmNode(vmid int) string {
 func (q lifecycleFlowQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if q.c.onConfigRead != nil {
 		if err := q.c.onConfigRead(vmid); err != nil {
+			return nil, err
+		}
+	}
+	if q.c.onNodeConfigRead != nil {
+		if err := q.c.onNodeConfigRead(node, vmid); err != nil {
 			return nil, err
 		}
 	}

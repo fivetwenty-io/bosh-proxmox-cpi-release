@@ -84,7 +84,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	}
 	// A lock step an earlier request left planned is settled by readback
 	// first. The write touches only the journal, never PVE.
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}

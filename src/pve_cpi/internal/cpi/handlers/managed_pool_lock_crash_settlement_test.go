@@ -50,7 +50,7 @@ func TestCrashedLockStepSettlesOutsideReconciliation(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	if _, err := settlePlannedLockSteps(t.Context(), deps.PVE, handle); err != nil {
+	if _, err := settlePlannedLockSteps(t.Context(), deps, handle); err != nil {
 		t.Fatalf("settlement failed on the crashed record: %v", err)
 	}
 	record := handle.Record()
@@ -91,7 +91,7 @@ func TestRefusedSettlementNamesItsSteps(t *testing.T) {
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = settlePlannedLockSteps(t.Context(), deps.PVE, handle)
+	_, err = settlePlannedLockSteps(t.Context(), deps, handle)
 	if !errors.Is(err, aj.ErrClosed) || !strings.Contains(err.Error(), "step "+step+" (lifecycle_attach_disk_Pool_CreatePool)") {
 		t.Fatalf("the refused settlement did not name its step: %v", err)
 	}

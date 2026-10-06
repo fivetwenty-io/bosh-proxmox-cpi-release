@@ -288,7 +288,7 @@ func TestVMPoolStepCarryingMoreStaysPlanned(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			if _, err := settlePlannedLockSteps(t.Context(), client, handle); err != nil {
+			if _, err := settlePlannedLockSteps(t.Context(), Deps{PVE: client}, handle); err != nil {
 				t.Fatal(err)
 			}
 			want := map[string]aj.State{"bare": aj.Observed, "volume": aj.Planned, "parameters": aj.Planned}[shape]
@@ -366,7 +366,7 @@ func testVMPoolStepBeforeVMWork(t *testing.T, pool string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := settlePlannedLockSteps(t.Context(), deps.PVE, handle); err != nil {
+	if _, err := settlePlannedLockSteps(t.Context(), deps, handle); err != nil {
 		t.Fatal(err)
 	}
 	if step := stepByID(t, handle.Record(), planned); step.State != aj.Planned {
