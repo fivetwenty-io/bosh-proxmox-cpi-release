@@ -13,6 +13,7 @@ const (
 	allocationKindDisk               = "disk"
 	allocationEvidenceIDField        = "allocation_id"
 	allocationEvidenceOperationField = "operation"
+	decisionActionAdopt              = "adopt"
 )
 
 // StorageAllocationDecision records an explicit operator disposition. DecisionID
@@ -36,7 +37,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	defer func() {
 		outcome := "rejected"
 		if retErr == nil {
-			if decision.Action == "adopt" {
+			if decision.Action == decisionActionAdopt {
 				outcome = "adopted"
 			} else {
 				outcome = "cleaned"
@@ -47,7 +48,7 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	if ctx == nil || deps.Config == nil || deps.PVE == nil || journal == nil || strings.TrimSpace(decision.DecisionID) == "" || len(decision.DecisionID) > 256 || strings.ContainsAny(decision.DecisionID, "\r\n\x00") {
 		return result, storageRefusal("a journal and bounded nonsecret decision reference are required")
 	}
-	if decision.Action != "adopt" && decision.Action != "finalize-cleanup" {
+	if decision.Action != decisionActionAdopt && decision.Action != "finalize-cleanup" {
 		return result, storageRefusal("unsupported allocation decision")
 	}
 	denied := storageRefusal("allocation decisions cannot mutate PVE")
@@ -89,7 +90,13 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 		return result, storageDecisionSourceError(err)
 	}
 	record = handle.Record()
-	if text := unsettledStepText(record, gaps, func(step aj.Step) bool { return storageDecisionClosedAttemptStepSettled(record, step) }); text != "" {
+	// An attested adopt then plans to settle a planned configuration write on
+	// the disk's holder from a readback of the slot it left. The checks below
+	// run against the settled view, and adopt saves the settlement only once
+	// they pass, so a refusal leaves the journal as it was.
+	settlement, adoptReasons := planAdoptConfigSettlement(ctx, deps, record, decision)
+	view := settlement.view(record)
+	if text := unsettledDecisionText(view, gaps, adoptReasons); text != "" {
 		return result, storageRefusal("allocation has unsettled mutation evidence; " + text + "; reconcile that step before disposition")
 	}
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
@@ -100,16 +107,9 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 		return result, err
 	}
 	var ownership aj.Verification
-	if decision.Action == "adopt" {
-		// A disk the Director already holds keeps its CID when a later
-		// lifecycle leaves it in reconciliation_required, so adoption accepts
-		// that shape too. The ownership observation below proves the disk is
-		// where its record says, with no transfer in flight.
-		returned := record.State == aj.ReadyToReturn || record.Kind == allocationKindDisk && record.State == aj.ReconciliationRequired
-		if !returned || record.CID == "" || record.CID != decision.ExpectedCID {
-			return result, storageRefusal("adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID")
-		}
-		ownership, err = observeAllocationDecisionOwnership(ctx, deps, journal, record)
+	var settled []adoptSettledConfigStep
+	if decision.Action == decisionActionAdopt {
+		ownership, settled, err = observeAdoptOwnership(ctx, deps, journal, record, view, decision, settlement)
 		if err != nil {
 			return result, err
 		}
@@ -122,17 +122,21 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	}
 	// Omit Records: their retained verification history must not recursively grow
 	// each new audit. The immutable record remains protected by this handle lock.
-	id, body, err := aj.VerificationEvidence(map[string]any{
+	fields := map[string]any{
 		"decision": decision, "namespace": record.Namespace, "record_updated_at": record.UpdatedAt,
 		"started_at": report.StartedAt, "completed_at": report.CompletedAt,
 		"complete": report.Complete, "vm_scan_complete": report.VMScanComplete,
 		"evidence": report.Evidence, "ownership": ownership,
-	})
+	}
+	if len(settled) > 0 {
+		fields["settled_configuration_steps"] = settled
+	}
+	id, body, err := aj.VerificationEvidence(fields)
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
 	proof := aj.Verification{EvidenceID: id, EvidenceJSON: body, Complete: true}
-	if decision.Action == "adopt" {
+	if decision.Action == decisionActionAdopt {
 		proof.OwnershipVerified = true
 		record.State = aj.Adopted
 	} else {
@@ -143,10 +147,57 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 	if guard.Err() != nil {
 		return result, denied
 	}
+	return saveAllocationDecision(ctx, deps, handle, settlement, record, proof)
+}
+
+// observeAdoptOwnership checks that adopt accepts view, the record as the
+// settlement leaves it, and observes the disk's ownership. A disk the
+// Director already holds keeps its CID when a later lifecycle leaves it in
+// reconciliation_required, so adoption accepts that shape too. The
+// observation proves the disk is where its record says, with no transfer in
+// flight. It returns the readback evidence for the configuration writes that
+// adopt settled, whether in this decision or in an earlier attested adopt
+// that stopped before it saved the adoption.
+func observeAdoptOwnership(ctx context.Context, deps Deps, journal *aj.Journal, record, view aj.Record, decision StorageAllocationDecision, settlement *adoptSettlement) (aj.Verification, []adoptSettledConfigStep, error) {
+	if !adoptableRecord(view, decision) {
+		return aj.Verification{}, nil, storageRefusal("adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID")
+	}
+	observeCtx, settled, err := adoptOwnershipContext(ctx, deps, view, decision, settlement)
+	if err != nil {
+		return aj.Verification{}, nil, err
+	}
+	if settlement != nil {
+		settled = settlement.steps
+	}
+	ownership, err := observeAllocationDecisionOwnership(observeCtx, deps, journal, record)
+	if err != nil {
+		return aj.Verification{}, nil, err
+	}
+	return ownership, settled, nil
+}
+
+// saveAllocationDecision saves record, which carries the decision's state,
+// with proof appended and its reason cleared. When adopt settled
+// configuration writes, it saves that settlement on its own first, because
+// the journal admits adopted only from reconciliation_required or
+// ready_to_return, and a record a stopped disk call left planned reaches
+// reconciliation_required only through it.
+func saveAllocationDecision(ctx context.Context, deps Deps, handle *aj.Handle, settlement *adoptSettlement, record aj.Record, proof aj.Verification) (aj.Record, error) {
+	if settlement != nil {
+		if err := saveAdoptSettlement(ctx, deps, handle, settlement); err != nil {
+			return aj.Record{}, err
+		}
+		state := record.State
+		record = handle.Record()
+		record.State = state
+	}
 	record.Verifications = append(record.Verifications, proof)
 	record.Reason = ""
-	if err = handle.Save(record); err != nil {
-		return result, storageDecisionSourceError(err)
+	if err := handle.Save(record); err != nil {
+		if settlement != nil {
+			return aj.Record{}, adoptionAfterSettlementSaveError(settlement, err)
+		}
+		return aj.Record{}, storageDecisionSourceError(err)
 	}
 	return handle.Record(), nil
 }

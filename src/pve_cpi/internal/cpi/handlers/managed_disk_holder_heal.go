@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -42,6 +44,13 @@ const (
 	// it can prove the disk is the holder's. Only acquireManagedDiskLifecycle
 	// asks for it, for its resolution under the allocation journal's lock.
 	holderHealWrite
+	// holderHealProve runs proveSettledHolder, which accepts the disk
+	// without the entry when it proves what healUnrecordedHolder proves
+	// before it writes, and writes nothing. Only an attested adopt that has
+	// read back a configuration write on that holder asks for it (see
+	// planAdoptConfigSettlement), for its ownership observation under the
+	// allocation journal's lock.
+	holderHealProve
 )
 
 // withHolderHeal returns ctx marked so that a disk resolution made with it
@@ -65,10 +74,14 @@ func holderHealFor(ctx context.Context) holderHeal {
 // which is retriable unless a step of the disk's record that no readback
 // settles holds the heal back (see unsettledStepHolderRefusal). Its cause
 // says in a few words which disk lacks its entry and what holds the heal
-// back, for the reason a refused VM cleanup saves on the VM's record.
+// back, for the reason a refused VM cleanup saves on the VM's record. Its
+// journal text, when it has one, is what a storage-journal command prints
+// instead, because rerunning that command never writes the entry, and only
+// the next disk call on the holder heals the record.
 type holderNotRecorded struct {
-	err   error
-	cause string
+	err     error
+	cause   string
+	journal string
 }
 
 func (e *holderNotRecorded) Error() string { return e.err.Error() }
@@ -81,13 +94,20 @@ func isHolderNotRecorded(err error) bool {
 }
 
 // holderNotRecordedRefusal builds that refusal for rd, with reason added after
-// the missing entry when the heal itself refused to write.
+// the missing entry when the heal itself refused to write. A refusal with no
+// reason is one the next disk call on the holder heals, so it also carries
+// the text a storage-journal command prints for it.
 func holderNotRecordedRefusal(rd resolvedDisk, reason string) error {
-	return &holderNotRecorded{
+	refusal := &holderNotRecorded{
 		err: cpierrors.Retriable("managed disk %s is attached to VM %d as %s without its provenance entry%s; retry the operation, and the next call that changes the disk, such as attach_disk, detach_disk, or delete_vm, checks the disk again under its allocation lock and writes the entry",
 			rd.diskCID, rd.holder.VMID, rd.volid, reason),
 		cause: fmt.Sprintf("persistent disk %s lacks its provenance entry on VM %d%s", rd.volid, rd.holder.VMID, reason),
 	}
+	if reason == "" {
+		refusal.journal = fmt.Sprintf("managed disk %s is attached to VM %d as %s without its provenance entry, and storage-journal doesn't write that entry; the next attach_disk, detach_disk, or delete_vm on VM %d writes it under the disk's allocation lock and heals the disk's record",
+			rd.diskCID, rd.holder.VMID, rd.volid, rd.holder.VMID)
+	}
+	return refusal
 }
 
 // unsettledStepRunbook is the guide section an unsettled step's heal refusal
@@ -171,16 +191,7 @@ func healUnrecordedHolder(ctx context.Context, deps Deps, rd resolvedDisk, recor
 		return unsettledStepHolderRefusal(rd, step)
 	}
 	holder := *rd.holder
-	if holder.IsParker || pve.TagsMarkParker(holder.Tags) {
-		return cpierrors.Cloud("%s, because its holder VM %d is a parker", renamedHolderAudit, holder.VMID)
-	}
-	if !holderSlotCarriesDisk(cfg, rd.volid, rd.stableID) {
-		return cpierrors.Cloud("%s, because no drive slot on VM %d names %s with the disk's serial", renamedHolderAudit, holder.VMID, rd.volid)
-	}
-	if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); !ok || embedded != holder.VMID {
-		return cpierrors.Cloud("%s, because volume %s is not named for its holder VM %d", renamedHolderAudit, rd.volid, holder.VMID)
-	}
-	if err := otherHolderProvenanceClaim(ctx, deps, rd, record, shared); err != nil {
+	if err := unrecordedHolderProof(ctx, deps, rd, record, shared, cfg); err != nil {
 		return err
 	}
 	key := rd.sentinelKey()
@@ -201,10 +212,43 @@ func healUnrecordedHolder(ctx context.Context, deps Deps, rd resolvedDisk, recor
 	return nil
 }
 
+// unrecordedHolderProof proves, from cfg and from the cluster, that rd's
+// holder holds the disk although its notes carry no provenance entry for it.
+// The holder is a workload VM and not a parker, a drive slot in cfg names the
+// volume with the disk's serial, the volume's name carries the holder's VMID,
+// and no VM other than the holder claims the disk's key, apart from the
+// leftover parked entry that leftoverParkedEntry accepts. healUnrecordedHolder
+// writes the entry only after these proofs hold, and proveSettledHolder
+// accepts the holder on them without writing. The caller has already checked
+// that rd has a holder and a stable identity.
+func unrecordedHolderProof(ctx context.Context, deps Deps, rd resolvedDisk, record aj.Record, shared bool, cfg map[string]any) error {
+	holder := *rd.holder
+	if holder.IsParker || pve.TagsMarkParker(holder.Tags) {
+		return cpierrors.Cloud("%s, because its holder VM %d is a parker", renamedHolderAudit, holder.VMID)
+	}
+	if !holderSlotCarriesDisk(cfg, rd.volid, rd.stableID) {
+		return cpierrors.Cloud("%s, because no drive slot on VM %d names %s with the disk's serial", renamedHolderAudit, holder.VMID, rd.volid)
+	}
+	if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); !ok || embedded != holder.VMID {
+		return cpierrors.Cloud("%s, because volume %s is not named for its holder VM %d", renamedHolderAudit, rd.volid, holder.VMID)
+	}
+	return otherHolderProvenanceClaim(ctx, deps, rd, record, shared)
+}
+
 // holderSlotCarriesDisk reports whether a drive slot in cfg names volid and
 // carries stableID as its serial.
 func holderSlotCarriesDisk(cfg map[string]any, volid, stableID string) bool {
-	for _, value := range qemu.ParseDisks(cfg) {
+	_, ok := holderSlotWithDisk(cfg, volid, stableID)
+	return ok
+}
+
+// holderSlotWithDisk returns the key of the drive slot in cfg that names
+// volid and carries stableID as its serial, such as scsi1. Slots are checked
+// in key order, so the answer is the same on every read of the same cfg.
+func holderSlotWithDisk(cfg map[string]any, volid, stableID string) (string, bool) {
+	disks := qemu.ParseDisks(cfg)
+	for _, key := range slices.Sorted(maps.Keys(disks)) {
+		value := disks[key]
 		bare := value
 		if comma := strings.IndexByte(value, ','); comma >= 0 {
 			bare = value[:comma]
@@ -213,10 +257,10 @@ func holderSlotCarriesDisk(cfg map[string]any, volid, stableID string) bool {
 			continue
 		}
 		if serial, ok := pve.StableIDFromDriveOptStr(value); ok && serial == stableID {
-			return true
+			return key, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // otherHolderProvenanceClaim returns nil when no VM in the cluster other than

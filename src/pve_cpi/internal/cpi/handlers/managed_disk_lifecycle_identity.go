@@ -153,7 +153,8 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd reso
 // disk whose holder carries no entry gets holderNotRecordedRefusal, unless
 // ctx asks for holderHealWrite. Then it goes to healUnrecordedHolder, which
 // writes the entry when it can prove the disk is the holder's and refuses for
-// audit otherwise.
+// audit otherwise. A ctx that asks for holderHealProve goes to
+// proveSettledHolder instead, which makes the same proofs and writes nothing.
 func verifyManagedHolderProvenance(ctx context.Context, deps Deps, rd resolvedDisk, record aj.Record, shared bool, provenance pve.DiskAllocationProvenance) error {
 	cfg, err := deps.PVE.QEMU().Config(ctx, rd.holder.Node, rd.holder.VMID)
 	if err != nil || cfg == nil {
@@ -172,10 +173,14 @@ func verifyManagedHolderProvenance(ctx context.Context, deps Deps, rd resolvedDi
 	if rd.volid == rd.birth {
 		return nil
 	}
-	if holderHealFor(ctx) != holderHealWrite {
+	switch holderHealFor(ctx) {
+	case holderHealWrite:
+		return healUnrecordedHolder(ctx, deps, rd, record, shared, provenance, cfg)
+	case holderHealProve:
+		return proveSettledHolder(ctx, deps, rd, record, shared, cfg)
+	default:
 		return holderNotRecordedRefusal(rd, "")
 	}
-	return healUnrecordedHolder(ctx, deps, rd, record, shared, provenance, cfg)
 }
 
 // managedJournalIdentityRefusal checks that the disk's record names the

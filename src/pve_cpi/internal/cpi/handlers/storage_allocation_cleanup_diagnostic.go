@@ -74,8 +74,12 @@ const storageLockClaimReturned = "a parker lock was not taken before the disk mo
 // settlement write the journal refused names the steps it was settling and
 // the journal's class of failure, which can include the journal's own file
 // path. That is safe because the storage-journal CLI, which runs on the
-// journal's host, is this function's only production caller. A fixed refusal
-// in storageFixedRefusals contributes its own text, and so does a parker lock
+// journal's host, is this function's only production caller. The identity
+// check's refusal of a holder without the disk's provenance entry contributes
+// its storage-journal text when it has one, which sends the operator to the
+// next disk call on the holder rather than to a retry, and its own text
+// otherwise. Both name only the disk's CID, the VM, the volume, and the steps
+// of the disk's record. A fixed refusal in storageFixedRefusals contributes its own text, and so does a parker lock
 // wait that ran out or a parker lock claim that was refused before the disk
 // moved, and a storage content listing that failed alone names its storage,
 // node, and reason. Anything else is described by
@@ -102,6 +106,13 @@ func StorageAllocationDecisionFailure(err error) string {
 	var returned *explicitCleanupReturnedError
 	if errors.As(err, &returned) {
 		return class + ": " + returned.Error()
+	}
+	var unrecorded *holderNotRecorded
+	if errors.As(err, &unrecorded) {
+		if unrecorded.journal != "" {
+			return class + ": " + log.ScrubMessage(unrecorded.journal)
+		}
+		return class + ": " + log.ScrubMessage(unrecorded.Error())
 	}
 	for _, fixed := range storageFixedRefusals {
 		if errors.Is(err, fixed) {
