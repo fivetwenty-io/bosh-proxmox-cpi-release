@@ -60,10 +60,10 @@ func observeStorageVolumeContent(
 	}
 	listing, err := client.Nodes().ListStorageContent(ctx, node, storage, nil)
 	if err != nil {
-		return false, 0, storageContentFailure(err)
+		return false, 0, storageContentFailureAt(err, storage, node)
 	}
 	if listing == nil || *listing == nil {
-		return false, 0, &storageContentObservationError{reason: "listing_data_missing"}
+		return false, 0, &storageContentObservationError{reason: "listing_data_missing", storage: storage, node: node}
 	}
 	listed := len(*listing)
 	found := false

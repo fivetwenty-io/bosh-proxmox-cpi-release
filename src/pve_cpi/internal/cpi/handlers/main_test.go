@@ -25,7 +25,11 @@ func TestMain(m *testing.M) {
 	// The parker and anti-affinity locks pause after every create. The tests
 	// that exercise the pause set it themselves.
 	restoreGrace := pve.SetClusterLockGraceForTest(0)
+	// A managed volume's presence read waits between the reads of a listing
+	// that failed. The tests that exercise the wait set it themselves.
+	restoreListing := handlers.SetManagedVolumePresenceRetryDelay(0)
 	code := m.Run()
+	restoreListing()
 	restoreGrace()
 	restoreSync()
 	restore()
