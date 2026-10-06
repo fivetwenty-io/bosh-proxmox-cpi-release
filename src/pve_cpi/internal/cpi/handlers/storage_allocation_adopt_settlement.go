@@ -44,11 +44,14 @@ import (
 
 // adoptSettledKinds are the configuration writes adopt settles from a
 // readback, which are the ones attach_disk, detach_disk, and delete_disk plan
-// on a disk's holder.
+// on a disk's holder, and the one delete_vm plans on the VM it deletes while
+// it preserves a persistent disk there. delete_vm's preservation runs the
+// detach under its own operation name, so its write carries that name.
 var adoptSettledKinds = map[string]bool{
-	"lifecycle_attach_disk_Nodes_UpdateQemuConfig": true,
-	"lifecycle_detach_disk_Nodes_UpdateQemuConfig": true,
-	"lifecycle_delete_disk_Nodes_UpdateQemuConfig": true,
+	"lifecycle_attach_disk_Nodes_UpdateQemuConfig":             true,
+	"lifecycle_detach_disk_Nodes_UpdateQemuConfig":             true,
+	"lifecycle_delete_disk_Nodes_UpdateQemuConfig":             true,
+	"lifecycle_delete_vm.preserve_disk_Nodes_UpdateQemuConfig": true,
 }
 
 // adoptSettledConfigStep is the evidence adopt keeps in its verification for
@@ -240,7 +243,7 @@ func adoptMissingAttestations(decision StorageAllocationDecision) []string {
 
 // adoptConfigStepAdmission reports whether adopt can settle step from a
 // readback, which takes a planned configuration write of attach_disk,
-// detach_disk, or delete_disk in the record's active attempt that has no
+// detach_disk, delete_disk, or delete_vm in the record's active attempt that has no
 // task, charges nothing, records no volume, targets a VM, and isn't a parker
 // protection write. When adopt can't settle step, reason says which condition
 // failed, and it is empty for a step that isn't a configuration write at all,
@@ -252,12 +255,12 @@ func adoptConfigStepAdmission(record aj.Record, step aj.Step) (admitted bool, re
 	case IsParkerProtectionStep(record, step):
 		return false, "; adopt doesn't settle a parker protection write from the disk's readback, because that write settles only when the parker reads back protected"
 	case !adoptSettledKinds[step.Kind]:
-		return false, "; adopt settles only a configuration write that attach_disk, detach_disk, or delete_disk planned"
+		return false, "; adopt settles only a configuration write that attach_disk, detach_disk, delete_disk, or delete_vm planned"
 	case step.UPID != "":
 		return false, "; it has a PVE task, and adopt settles only a configuration write that has none"
 	case len(step.Charges) != 0:
 		return false, "; it charges capacity, and adopt settles only a configuration write that charges nothing"
-	case !cleanupConfigStep(step, record):
+	case !plannedVMConfigStep(step, record):
 		return false, "; adopt settles only a planned configuration write of the disk record's active attempt that targets a VM and records no volume"
 	}
 	return true, ""

@@ -297,3 +297,23 @@ func TestStorageJournalAuditSummaryNamesChargingRecords(t *testing.T) {
 		t.Fatalf("charging line = %q", lines[5])
 	}
 }
+
+// TestStorageJournalAuditSummaryNamesAListingStop prints the observed VM
+// record that delete_vm leaves when a storage's content listing stopped its
+// cleanup. The record line carries the whole reason the cleanup saved, with
+// the storage, the node, the listing's reason, and what to rerun.
+func TestStorageJournalAuditSummaryNamesAListingStop(t *testing.T) {
+	now := time.Now().UTC()
+	vm := storageJournalAuditTestRecord("listing-stop-1", aj.Observed, now, now)
+	vm.CID = "4356"
+	vm.Reason = "VM cleanup stopped because storage nfs-images on node lab-pmx-0 could not be listed (listing_http_500); rerun delete_vm or storage-journal cleanup once that storage lists"
+	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true, Records: []aj.Record{vm}}
+	var out, stderr bytes.Buffer
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+		t.Fatalf("audit exited %d: %s", code, stderr.String())
+	}
+	want := "record: id=listing-stop-1 kind=vm state=observed charging=true cid=4356 reason=\"" + vm.Reason + "\"\n"
+	if !strings.Contains(out.String(), want) {
+		t.Fatalf("summary = %q, want the record line %q", out.String(), want)
+	}
+}

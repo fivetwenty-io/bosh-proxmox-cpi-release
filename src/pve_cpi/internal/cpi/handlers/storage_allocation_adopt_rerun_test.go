@@ -231,18 +231,25 @@ func TestAdoptSettlesOnlyTheWriteOfTheCallThatStopped(t *testing.T) {
 }
 
 // TestAdoptStalledReasonReadsBack checks that adopt reads the operation and
-// the settled steps back from every reason it writes, and from nothing else.
+// the settled steps back from every reason it writes, and from nothing else,
+// and that the write each operation plans on a disk's holder is one adopt
+// settles.
 func TestAdoptStalledReasonReadsBack(t *testing.T) {
 	t.Parallel()
-	for _, steps := range [][]string{
-		{"attempt-0-step-18"},
-		{"attempt-0-step-18", "attempt-0-step-19"},
-		{"attempt-1-step-3", "attempt-1-step-4", "attempt-1-step-5"},
-	} {
-		reason := adoptStalledReason("detach_disk", steps)
-		operation, got, ok := adoptStalledSettlement(reason)
-		if !ok || operation != "detach_disk" || !reflect.DeepEqual(got, steps) {
-			t.Fatalf("adoptStalledSettlement(%q) = %q, %v, %v, want detach_disk, %v", reason, operation, got, ok, steps)
+	for _, stalled := range []string{"attach_disk", "detach_disk", "delete_disk", "delete_vm.preserve_disk"} {
+		if !adoptSettledKinds[adoptStalledKind(stalled)] {
+			t.Fatalf("adopt doesn't settle %s, the write %s plans on a disk's holder", adoptStalledKind(stalled), stalled)
+		}
+		for _, steps := range [][]string{
+			{"attempt-0-step-18"},
+			{"attempt-0-step-18", "attempt-0-step-19"},
+			{"attempt-1-step-3", "attempt-1-step-4", "attempt-1-step-5"},
+		} {
+			reason := adoptStalledReason(stalled, steps)
+			operation, got, ok := adoptStalledSettlement(reason)
+			if !ok || operation != stalled || !reflect.DeepEqual(got, steps) {
+				t.Fatalf("adoptStalledSettlement(%q) = %q, %v, %v, want %s, %v", reason, operation, got, ok, stalled, steps)
+			}
 		}
 	}
 	for _, reason := range []string{

@@ -151,8 +151,16 @@ func joinWithOxfordComma(items []string) string {
 	}
 }
 
+// plannedVMConfigStep reports whether step is a planned step of record's
+// active attempt that has no task, charges nothing, records no volume, and
+// targets a VM on a node, which is the shape of every configuration write
+// cleanup or adopt settles. It doesn't look at the step's kind.
+func plannedVMConfigStep(step aj.Step, record aj.Record) bool {
+	return step.Attempt == record.ActiveAttempt() && step.State == aj.Planned && step.UPID == "" && len(step.Charges) == 0 && len(step.VolIDs) == 0 && step.Target.VMID > 0 && step.Target.Node != "" && !step.Target.External
+}
+
 func cleanupConfigStep(step aj.Step, record aj.Record) bool {
-	if step.Attempt != record.ActiveAttempt() || step.State != aj.Planned || step.UPID != "" || len(step.Charges) != 0 || len(step.VolIDs) != 0 || step.Target.VMID <= 0 || step.Target.Node == "" || step.Target.External {
+	if !plannedVMConfigStep(step, record) {
 		return false
 	}
 	switch record.Kind {
