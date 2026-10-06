@@ -73,11 +73,12 @@ jobs:
     name: Certify and BATS
     # Pinned to the bosh-lab label, which only the runners on the first
     # worker VM carry. The lab fleet grew to two VMs on 2026-08-24, and
-    # gha-lab-state below is a host directory that exists on that first VM
-    # alone: a run scheduled onto the second VM would find an empty mount,
-    # treat the deployment as new, and build a second director in the lab
-    # while orphaning the live one. Keep this pin as long as the director's
-    # state lives on a single runner host.
+    # gha-lab-state-certification below is a host directory that exists on
+    # that first VM alone. A run scheduled onto the second VM would find an
+    # empty mount, treat the certification Director as new, and build a
+    # second one on the same IP while orphaning the live one. Keep this pin
+    # as long as the certification Director's state lives on a single runner
+    # host.
     runs-on: [self-hosted, bosh-lab]
     # BATS alone has taken 2h22m and certify 56m on this lab; six hours gives
     # both room plus the bootstrap without masking a wedged run forever.
@@ -92,21 +93,27 @@ jobs:
       # from the digest a ci-image.yml run prints after a Dockerfile change.
       image: ghcr.io/fivetwenty-io/bosh-proxmox-cpi-ci@sha256:0861097ffeede7570271c78110c4a09d8e4affabecfd0db3eb7c85f99cdf1beb
       # Host-path caches follow the gha-container-cache pattern from ci.yml.
-      # gha-lab-state is DIFFERENT in kind: it persists the director's
-      # create-env products (creds.yml, state.json) between runs, because
-      # losing them means every run rebuilds the director and orphans the old
-      # one. It holds lab credentials: keep it mode 0700, owner runner, and
-      # inside the lab. Only one runner VM carries it, which is why this job
-      # pins its label; the lab's scripts/80-gha-runner copies it daily to
-      # that VM's Proxmox node (/var/lib/gha-lab-state, root-only) so a
-      # rebuilt VM can be restored. The other VMs carry a tripwire file at
-      # this path, so a run scheduled onto one fails on its first write
-      # instead of building a second director.
+      # gha-lab-state-certification is DIFFERENT in kind: it is the
+      # certification Director's slot (BOSH_STATE_DIR below), holding that
+      # Director's create-env products (creds.yml, state.json) and its
+      # slot.yml between runs, because losing them means every run rebuilds
+      # the Director and orphans the old one. create-env reads and writes the
+      # mounted directory directly. It holds lab credentials, so keep it mode
+      # 0700, owner runner, and inside the lab. Only one runner VM carries
+      # it, which is why this job pins its label. The other VMs should carry
+      # a tripwire file at this path, so a run scheduled onto one fails on
+      # its first write instead of building a second Director.
+      #
+      # The main Director's slot (gha-lab-state) is deliberately NOT mounted.
+      # This job tears its Director down on every run, so it must have no
+      # path at all to another Director's state. The certification slot must
+      # start empty, and gha-lab-state must never be copied, moved, or linked
+      # into it (docs/certification/scheduled.md).
       volumes:
         - /home/runner/gha-container-cache/go:/go
         - /home/runner/gha-container-cache/go-build:/root/.cache/go-build
         - /home/runner/gha-container-cache/uv:/root/.cache/uv
-        - /home/runner/gha-lab-state:/var/lib/lab-state
+        - /home/runner/gha-lab-state-certification:/var/lib/lab-state-certification
 
     defaults:
       run:
@@ -117,7 +124,22 @@ jobs:
       # the caches at the mounted paths (same reasoning as ci.yml).
       GOCACHE: /root/.cache/go-build
       UV_CACHE_DIR: /root/.cache/uv
-      LAB_STATE_DIR: /var/lib/lab-state
+      # Every scripts/bosh, scripts/certify, and scripts/bats call in this
+      # job uses the certification slot. BOSH_REFUSE_DEFAULT_SLOT makes
+      # scripts/bosh, scripts/certify, and the harnesses' shared Director env
+      # refuse to run when the slot resolves to manifests/bosh in any
+      # checkout, so a lost BOSH_STATE_DIR stops the job.
+      BOSH_STATE_DIR: /var/lib/lab-state-certification
+      BOSH_REFUSE_DEFAULT_SLOT: "1"
+      # The main Director's VM CIDs, which on PVE are bare VMIDs, comma
+      # separated. Every Director command refuses a slot whose state names
+      # one of them, and with BOSH_REFUSE_DEFAULT_SLOT set they all refuse
+      # while this is empty or malformed, so the job fails until the
+      # repository variable of the same name holds a VMID list. The runner's
+      # checkout holds no main Director state, so nothing here can notice a
+      # stale list. Each create-env that rebuilds the main Director gives it
+      # a new VMID, and the variable must be updated after every one.
+      BOSH_PROTECTED_DIRECTOR_CIDS: ${{ vars.BOSH_PROTECTED_DIRECTOR_CIDS }}
       BOSH_PVE_ENV: cpitest
       # scripts/certify and the release-resolution step shell out to gh.
       GH_TOKEN: ${{ github.token }}
@@ -168,14 +190,14 @@ jobs:
           if [[ -z "${LAB_BOSH_VARS_YML}" ]]; then
             echo "ERROR: the LAB_BOSH_VARS_YML secret is not configured for this repository." >&2
             echo "Add it from a checkout that has the lab vars file:" >&2
-            echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-proxmox-cpi-release --body-file manifests/bosh/vars.yml" >&2
+            echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-proxmox-cpi-release < manifests/bosh/vars.yml" >&2
             exit 1
           fi
           umask 077
           printf '%s\n' "${LAB_BOSH_VARS_YML}" > manifests/bosh/vars.yml
 
       - name: Write lab SSH key
-        # scripts/bosh net-up/net-down and the firewall ensure run pvesh on
+        # scripts/bosh net-up and the firewall ensure run pvesh on
         # the PVE node over `ssh root@<pve_host>`; the key is authorized on
         # lab-pmx-0 restricted to the pipes node's SNAT address.
         env:
@@ -195,22 +217,63 @@ jobs:
           mkdir -p "${ssh_home}/.ssh"
           printf '%s\n' "${LAB_PVE_SSH_KEY}" > "${ssh_home}/.ssh/id_ed25519"
 
-      - name: Restore director state from the runner host
-        # creds.yml and state.json are create-env products. Without them a
-        # standing director from the previous run is invisible: create-env
-        # would build a second director on the same IP instead of updating,
-        # and certify's --force teardown would have nothing to tear down.
+      - name: Write the certification slot config
+        # The slot directory is mounted from the runner host, so the
+        # Director's creds.yml and state.json from the previous run are
+        # already in place and create-env reads and writes them there. This
+        # step renders slot.yml, which gives the certification Director its
+        # own IP, alias, name, and VM name segment, from the committed
+        # template and the certification_director_ip key in the vars secret.
+        # Only this step writes slot.yml, so a state.json or creds.yml in a
+        # slot without one was put there by hand and the step stops.
         run: |
           set -euo pipefail
           umask 077
-          for f in creds.yml state.json; do
-            if [[ -f "${LAB_STATE_DIR}/${f}" ]]; then
-              install -m 0600 "${LAB_STATE_DIR}/${f}" "manifests/bosh/${f}"
-              echo "restored manifests/bosh/${f}"
+          if [[ -z "$(tr -d ' ,' <<<"${BOSH_PROTECTED_DIRECTOR_CIDS:-}")" ]]; then
+            echo "ERROR: the BOSH_PROTECTED_DIRECTOR_CIDS repository variable is empty, so nothing protects the main Director." >&2
+            echo "Set it to the main Director's VM CID, which on PVE is the bare VMID (comma-separate several):" >&2
+            echo "  gh variable set BOSH_PROTECTED_DIRECTOR_CIDS --repo fivetwenty-io/bosh-proxmox-cpi-release --body <vmid>" >&2
+            exit 1
+          fi
+          vmid_list='^[[:space:]]*[1-9][0-9]*[[:space:]]*(,[[:space:]]*[1-9][0-9]*[[:space:]]*)*$'
+          if [[ ! "${BOSH_PROTECTED_DIRECTOR_CIDS}" =~ ${vmid_list} ]]; then
+            echo "ERROR: the BOSH_PROTECTED_DIRECTOR_CIDS repository variable is not a list of VMIDs, so it would protect nothing." >&2
+            echo "It must be bare PVE VMIDs, comma separated with nothing else in it, such as 3808 or 3808,3809:" >&2
+            echo "  gh variable set BOSH_PROTECTED_DIRECTOR_CIDS --repo fivetwenty-io/bosh-proxmox-cpi-release --body <vmid>" >&2
+            exit 1
+          fi
+          if [[ ! -d "${BOSH_STATE_DIR}" || ! -w "${BOSH_STATE_DIR}" ]]; then
+            echo "ERROR: the certification slot ${BOSH_STATE_DIR} is not a writable directory." >&2
+            echo "Create /home/runner/gha-lab-state-certification on the bosh-lab runner VM (owner runner, mode 0700)." >&2
+            exit 1
+          fi
+          if [[ ! -e "${BOSH_STATE_DIR}/slot.yml" ]]; then
+            for seeded in state.json creds.yml; do
+              if [[ -e "${BOSH_STATE_DIR}/${seeded}" || -L "${BOSH_STATE_DIR}/${seeded}" ]]; then
+                echo "ERROR: ${BOSH_STATE_DIR}/${seeded} exists, but no earlier run of this workflow wrote slot.yml there." >&2
+                echo "The slot must start empty. Never copy, move, or link gha-lab-state or any other Director's files into it." >&2
+                echo "Move state.json and creds.yml out of /home/runner/gha-lab-state-certification on the runner host, leave the VM they name alone, and run again." >&2
+                exit 1
+              fi
+            done
+          fi
+          rendered="$(mktemp)"
+          errors="$(mktemp)"
+          if ! bosh int ci/certification-slot.yml -l manifests/bosh/vars.yml --var-errs > "${rendered}" 2> "${errors}"; then
+            if grep -q certification_director_ip "${errors}"; then
+              echo "ERROR: the LAB_BOSH_VARS_YML secret has no certification_director_ip." >&2
+              echo "Add certification_director_ip (a free cpitest address inside cpitest_reserved, not the main Director's internal_ip) to the lab vars file, then:" >&2
+              echo "  gh secret set LAB_BOSH_VARS_YML --repo fivetwenty-io/bosh-proxmox-cpi-release < manifests/bosh/vars.yml" >&2
             else
-              echo "no persisted ${f} (first run, or the last run tore down cleanly)"
+              echo "ERROR: bosh could not render ci/certification-slot.yml against the LAB_BOSH_VARS_YML secret:" >&2
+              cat "${errors}" >&2
             fi
-          done
+            rm -f "${rendered}" "${errors}"
+            exit 1
+          fi
+          install -m 0600 "${rendered}" "${BOSH_STATE_DIR}/slot.yml"
+          rm -f "${rendered}" "${errors}"
+          echo "wrote ${BOSH_STATE_DIR}/slot.yml"
 
       - name: Validate candidate selection
         env:
@@ -282,9 +345,12 @@ jobs:
       - name: Upgrade certification (scripts/certify)
         if: ${{ !inputs.skip_certify }}
         timeout-minutes: 150
-        # --force: unattended slot handling — a director left standing by a
-        # previous run is torn down instead of failing preflight. --keep OFF:
-        # the run must end with a free slot for the bootstrap below.
+        # --force gives unattended slot handling, so the certification
+        # Director left standing by the previous run's bootstrap is torn down
+        # instead of failing preflight. BOSH_STATE_DIR (job env) points
+        # certify at the certification slot, and certify refuses to run in
+        # the default slot. --keep stays off because the run must end with a
+        # free slot for the bootstrap below.
         run: |
           set -euo pipefail
           cpi_args=()
@@ -296,10 +362,11 @@ jobs:
 
       - name: Bootstrap director on the selected release
         timeout-minutes: 90
-        # Minimal director bring-up (the emptyvm smoke and CF are out of
-        # scope here: BATS itself is the acceptance check). net-up first —
-        # certify's teardown removed the cpitest SDN objects along with the
-        # director.
+        # Minimal director bring-up in the certification slot (the emptyvm
+        # smoke and CF are out of scope here: BATS itself is the acceptance
+        # check). net-up is idempotent; it only matters when certify was
+        # skipped on a lab whose cpitest SDN objects are missing, because
+        # certify no longer removes the network the main Director shares.
         run: |
           set -euo pipefail
           echo "bootstrapping director from ${PVE_CPI_RELEASE_PATH}"
@@ -410,26 +477,17 @@ jobs:
           }
           approve_held_runs
 
-      - name: Persist director state to the runner host
+      - name: Remove materialized secrets
         if: always()
-        # The state dir holds lab credentials; it lives on the runner host
-        # only (see the volumes comment above).
-        run: |
-          set -euo pipefail
-          umask 077
-          for f in creds.yml state.json; do
-            if [[ -f "manifests/bosh/${f}" ]]; then
-              install -m 0600 "manifests/bosh/${f}" "${LAB_STATE_DIR}/${f}"
-              echo "persisted manifests/bosh/${f}"
-            fi
-          done
-
-      - name: Remove materialized secrets and state
-        if: always()
-        # The workspace persists between jobs on a self-hosted runner; the
-        # state just persisted above is restored from the state dir next run.
+        # The workspace persists between jobs on a self-hosted runner. The
+        # certification Director's state stays in the mounted slot directory
+        # on the runner host (see the volumes comment above), so nothing in
+        # the workspace needs persisting.
         run: |
           ssh_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+          # creds.yml and state.json under manifests/bosh are the default
+          # slot's files. This job never writes them, and removing any stray
+          # copy keeps the workspace free of another Director's state.
           rm -f manifests/bosh/vars.yml manifests/bosh/creds.yml \
             manifests/bosh/state.json ci/integration.yml \
             "${ssh_home}/.ssh/id_ed25519"

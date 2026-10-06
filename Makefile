@@ -149,11 +149,11 @@ bats: ## Run the BOSH Acceptance Tests against the configured PVE lab (see docs/
 	fi
 
 .PHONY: certify-upgrade
-certify-upgrade: ## Run the BOSH Director Upgrade Test against the configured PVE lab (see docs/certification/upgrade.md)
+certify-upgrade: ## Run the BOSH Director Upgrade Test in the BOSH_STATE_DIR slot against the configured PVE lab (see docs/certification/upgrade.md)
 	@./scripts/certify upgrade
 
 .PHONY: certify-upgrade-dry-run
-certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would run, without executing any
+certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would run in the BOSH_STATE_DIR slot, without executing any
 	@./scripts/certify upgrade --dry-run
 
 ##@ Code Quality

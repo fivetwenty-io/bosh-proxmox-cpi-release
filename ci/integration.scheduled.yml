@@ -12,7 +12,8 @@
 # but not committed anywhere (the BATS target node) are ${VAR} placeholders
 # the workflow fills from repository variables — topology, never credentials.
 # Secrets stay in manifests/bosh/vars.yml (materialized from a GitHub secret)
-# and manifests/bosh/creds.yml (persisted create-env product).
+# and the certification slot's creds.yml (a create-env product kept in the
+# BOSH_STATE_DIR the workflow mounts from the runner host).
 #
 # Placeholders:
 #   ${BATS_TARGET_NODE}  PVE node pin for the BATS az, from the repository
@@ -33,8 +34,9 @@ tiers:
   light:     false
 
 # Secret manifest files (relative to repo root, all gitignored). vars.yml is
-# materialized from the LAB_BOSH_VARS_YML secret; creds.yml is restored from
-# the runner-host state directory before the run.
+# materialized from the LAB_BOSH_VARS_YML secret. The workflow sets
+# BOSH_STATE_DIR, and the director env then reads the creds.yml in that slot
+# instead of bosh_creds, which only names the default slot's file.
 bosh_vars:  manifests/bosh/vars.yml
 bosh_creds: manifests/bosh/creds.yml
 cf_vars:    manifests/cf/vars.yml
@@ -74,20 +76,24 @@ tier3:
 
 # BOSH Acceptance Tests (scripts/bats). cidr, gateway, and bridge default to
 # the cpitest env bundle's committed values (internal_cidr 172.31.0.0/24,
-# internal_gw 172.31.0.1, pve_network_bridge cpitest0); the bands below are
-# the documented cpitest layout from ci/integration.yml.example (Director
-# .10, infra reserved below .20 and from .200 up, static band .190-.199).
+# internal_gw 172.31.0.1, pve_network_bridge cpitest0). The scheduled run
+# deploys BATS through the certification Director (BOSH_STATE_DIR), so every
+# address it uses stays inside that Director's band, .150-.189, and never in
+# the main Director's: dynamic .150-.179 and static .180-.189. Everything
+# else is reserved, including .190-.199, the static band local BATS runs
+# against the main Director use (ci/integration.yml.example).
 bats:
   network_cidr:    ""
   network_gateway: ""
   network_bridge:  ""
   network_reserved:
   - 172.31.0.1-172.31.0.19
-  - 172.31.0.200-172.31.0.254
+  - 172.31.0.20-172.31.0.149
+  - 172.31.0.190-172.31.0.254
   network_static:
-  - 172.31.0.190-172.31.0.199
-  static_ip:        172.31.0.190
-  second_static_ip: 172.31.0.191
+  - 172.31.0.180-172.31.0.189
+  static_ip:        172.31.0.180
+  second_static_ip: 172.31.0.181
   nic_group:        1
   # The bootstrap job creates the director with plain create-env and applies
   # no cpi-config, so the BATS az needs no cpi-config entry name.

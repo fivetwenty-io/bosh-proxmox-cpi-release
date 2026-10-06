@@ -35,6 +35,11 @@ Subcommands:
                            show the SDN zone/vnet/subnet + node bridge state.
     credhub <args>         passthrough → credhub <args> with the director's
                            credhub URL, admin client, and CA pre-exported
+    check-vars [--cpi-config] [ucc flags]
+                           interpolate the Director manifest and cloud-config
+                           (and cpi-config with --cpi-config) offline against
+                           the vars files and name every variable none of them
+                           sets; extra -o/-v flags apply to the cloud-config
     compile-releases       compile bosh + bosh-proxmox-cpi once against the active
                            stemcell (no-VM compilation deployment + export-
                            release), store the tarballs (file:// default or S3),
@@ -42,7 +47,7 @@ Subcommands:
                            Storage via COMPILED_RELEASES_STORE; see
                            docs/compiled-releases.md.
     help                   show this help
-    <anything else>        passthrough → bosh -e pve <args>
+    <anything else>        passthrough → bosh -e <slot alias> <args>
 
 Env selection (isolated networks):
     BOSH_PVE_ENV=<name>    layer manifests/envs/<name>/{network.yml,vars.yml}
@@ -51,8 +56,38 @@ Env selection (isolated networks):
                            layers the matching cf-cloud-config.yml + vars.yml.
                            Ships with `cpitest` (isolated 172.x SDN vnet).
 
+Director slot (where create-env keeps state.json and creds.yml):
+    BOSH_STATE_DIR=<dir>   use <dir> instead of manifests/bosh/ for this
+                           Director's state.json and creds.yml. A slot other
+                           than the default needs <dir>/slot.yml with its own
+                           internal_ip (inside the env's reserved band) and
+                           pve_create_env_deployment, plus optional bosh_alias
+                           (never 'pve') and director_name. It is layered
+                           after every other vars file. Its alias defaults to
+                           pve-<dir name>. net-down refuses in a non-default
+                           slot, since the network is shared.
+                           After create-env or teardown in such a slot,
+                           scripts/bosh writes <dir>/slot-owner.json naming
+                           the Director, VM, disks, and stemcells its state
+                           records, and every command in the slot refuses a
+                           non-empty state that records anything else, and a
+                           creds.yml copied from the main Director. Every
+                           command there runs the slot.yml checks, and an
+                           extra --state or --vars-store that points outside
+                           the slot is refused.
+    BOSH_REFUSE_DEFAULT_SLOT=1
+                           every Director command refuses the default slot,
+                           any checkout's manifests/bosh/, and the main
+                           checkout's state (scripts/certify sets this).
+    BOSH_PROTECTED_DIRECTOR_CIDS=<vmid>[,<vmid>...]
+                           Director VM CIDs (on PVE, the bare VMID) that no
+                           slot may manage, as positive whole numbers only.
+                           The main Director's VM, read from its state, is
+                           protected too. Required when
+                           BOSH_REFUSE_DEFAULT_SLOT is set.
+
 Env (auto-exported for non-create-env subcommands when creds.yml exists):
-    BOSH_ENVIRONMENT=pve
+    BOSH_ENVIRONMENT=pve (or the slot's alias)
     BOSH_CLIENT=admin
     BOSH_CLIENT_SECRET=<creds.yml:/admin_password>
     BOSH_CA_CERT=<creds.yml:/director_ssl/ca>
@@ -84,6 +119,8 @@ import _compiled
 import _lightstemcell
 import _artifacts
 import _checkouts
+import _slot
+import _upgrade_checks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -100,8 +137,17 @@ def bosh_deployment_dir() -> Path:
 MANIFESTS = REPO_ROOT / "manifests"
 BOSH_DIR = MANIFESTS / "bosh"
 VARS = BOSH_DIR / "vars.yml"
-CREDS = BOSH_DIR / "creds.yml"
-STATE = BOSH_DIR / "state.json"
+# The Director slot: where create-env keeps this Director's state.json and
+# creds.yml. BOSH_STATE_DIR selects one; unset, it is manifests/bosh/ as it has
+# always been. See scripts/_slot.py.
+SLOT = _slot.resolve(REPO_ROOT)
+CREDS = SLOT.creds
+STATE = SLOT.state
+try:
+    BOSH_ALIAS = SLOT.alias
+    DIRECTOR_NAME = SLOT.director_name
+except _slot.SlotError as _exc:
+    sys.exit(f"Director slot: {_exc}")
 # Pins the cloudfoundry/bosh release version (282.1.13) regardless of the
 # local bosh-deployment checkout's default. See manifests/bosh/bosh-release.yml.
 BOSH_RELEASE_OPS = BOSH_DIR / "bosh-release.yml"
@@ -233,7 +279,10 @@ def run(*cmd: str, env: dict[str, str] | None = None) -> int:
 
 
 def internal_ip() -> str:
-    """Director IP, honoring the active BOSH_PVE_ENV vars layer.
+    """Director IP, honoring the Director slot and the BOSH_PVE_ENV vars layer.
+
+    A non-default slot (BOSH_STATE_DIR) names its own internal_ip in slot.yml,
+    and that wins over everything else.
 
     manifests/bosh/vars.yml carries the base internal_ip; an env bundle's
     vars.yml (manifests/envs/<env>/vars.yml) overrides it. These are plain
@@ -242,6 +291,15 @@ def internal_ip() -> str:
     everywhere the Director address is needed (alias-env, credhub) so they
     target the env's network rather than the base one.
     """
+    if not SLOT.is_default:
+        ip = _slot_value("internal_ip")
+        if ip:
+            return ip
+    return default_slot_ip()
+
+
+def default_slot_ip() -> str:
+    """The Director IP the default slot uses: env vars.yml, then base vars."""
     f = env_vars_file()
     if f:
         try:
@@ -251,11 +309,86 @@ def internal_ip() -> str:
     return bosh_int(VARS, "/internal_ip")
 
 
+def _slot_value(key: str) -> str:
+    try:
+        return SLOT.value(key)
+    except _slot.SlotError as exc:
+        sys.exit(f"Director slot: {exc}")
+
+
+def slot_env_facts() -> _slot.EnvFacts:
+    """What the active env and the base vars say about the main Director."""
+    return _slot.env_facts(REPO_ROOT, active_env())
+
+
+def slot_refusal(action: str) -> "str | None":
+    """The guard's refusal for this slot, or None when the command may run.
+
+    The guard runs for every non-default slot, so a command never builds on a
+    state copied in from another Director's slot. It also runs for the default
+    slot when BOSH_REFUSE_DEFAULT_SLOT is set (scripts/certify and the
+    certification workflow set it), and then BOSH_PROTECTED_DIRECTOR_CIDS must
+    name the Director VMs to protect.
+    """
+    refuse = _slot.refuse_mode()
+    if SLOT.is_default and not refuse:
+        return None
+    return _slot.guard_repo(action, SLOT, REPO_ROOT, require_deny_list=refuse)
+
+
+def require_slot(action: str) -> None:
+    """Exit before a Director command when the slot cannot be used safely.
+
+    A non-default slot must pass the guard (see slot_refusal) and carry
+    slot.yml with an internal_ip and VM name segment of its own, or its
+    Director would come up on the main Director's address or under its name.
+    """
+    message = slot_refusal(action)
+    if message:
+        print(message, file=sys.stderr)
+        sys.exit(2)
+    if SLOT.is_default:
+        return
+    problem = _slot.config_problem(SLOT, slot_env_facts())
+    if problem:
+        print(f"{action}: {problem}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _refuse_director_command() -> None:
+    """Exit before handing out Director credentials the guard refuses.
+
+    Every command that talks to a running Director (login, ucc, deployments,
+    passthrough) gets its credentials here, so with BOSH_REFUSE_DEFAULT_SLOT
+    set none of them can reach the main Director through the default slot.
+    In a dedicated slot they run the same slot.yml checks as create-env, so a
+    slot.yml that takes the main Director's alias refuses here too.
+    """
+    require_slot("run a Director command")
+
+
+def require_own_paths(action: str, args: "list[str]") -> None:
+    """Exit before bosh sees a --state or --vars-store the guard never checked.
+
+    In a dedicated slot, or with BOSH_REFUSE_DEFAULT_SLOT set, such an
+    argument must name a file inside the slot's own directory and never the
+    main Director's state or creds. Local use of the default slot is
+    unchanged.
+    """
+    if SLOT.is_default and not _slot.refuse_mode():
+        return
+    message = _slot.explicit_path_refusal(action, args, SLOT, REPO_ROOT)
+    if message:
+        print(message, file=sys.stderr)
+        sys.exit(2)
+
+
 def director_env() -> dict[str, str]:
+    _refuse_director_command()
     if not CREDS.exists():
         sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
     env = os.environ.copy()
-    env["BOSH_ENVIRONMENT"] = "pve"
+    env["BOSH_ENVIRONMENT"] = BOSH_ALIAS
     env["BOSH_CLIENT"] = "admin"
     env["BOSH_CLIENT_SECRET"] = bosh_int(CREDS, "/admin_password")
     env["BOSH_CA_CERT"] = bosh_int(CREDS, "/director_ssl/ca")
@@ -263,6 +396,7 @@ def director_env() -> dict[str, str]:
 
 
 def credhub_env() -> dict[str, str]:
+    _refuse_director_command()
     if not CREDS.exists():
         sys.exit(f"creds file missing: {CREDS} — run 'scripts/bosh create-env' first")
     director_ip = internal_ip()
@@ -334,10 +468,12 @@ def _light_stemcell_create_env_vars() -> list[str]:
 
 
 def cmd_create_env(args: list[str]) -> int:
+    require_slot("create-env")
+    require_own_paths("create-env", args)
     release = cpi_release_path()
     light_vars = _light_stemcell_create_env_vars()
     bd = bosh_deployment_dir()
-    return run(
+    rc = run(
         "bosh", "create-env",
         str(bd / "bosh.yml"),
         "-n",
@@ -358,7 +494,8 @@ def cmd_create_env(args: list[str]) -> int:
         *env_network_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
-        "-v", "director_name=ocfp-mgmt",
+        *SLOT.vars_layer(),
+        "-v", f"director_name={DIRECTOR_NAME}",
         "-v", f"pve_cpi_release_path={release}",
         # The manifest's release name must match the name embedded in the
         # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).
@@ -370,6 +507,55 @@ def cmd_create_env(args: list[str]) -> int:
         f"--vars-store={CREDS}",
         *args,
     )
+    return record_slot_owner(rc)
+
+
+def record_slot_owner(rc: int, action: str = "create-env") -> int:
+    """Write the slot's owner record once create-env or delete-env has run.
+
+    The guard let the command run, so the slot's state was empty or already
+    this slot's own. Whatever the state records now, that command wrote it in
+    this slot, and the owner record says so. That holds when the command
+    failed partway, too, because a create-env may still have created a VM or
+    disk, and a delete-env may have deleted some of them, and a later teardown
+    must be able to act on what is left. The state is checked against the
+    protected states and the deny list again first, because the command can
+    run for minutes and a state from elsewhere may have landed in the slot
+    meanwhile. Returns rc, or 1 when the record can't be written or the state
+    fails the check.
+    """
+    if SLOT.is_default:
+        return rc
+    try:
+        main_root = _slot.main_checkout_root(REPO_ROOT)
+    except _slot.SlotError as exc:
+        print(
+            f"{action}: {exc}, so the main checkout's Director state can't be "
+            f"ruled out and no owner record was written. Later commands in "
+            f"this slot will refuse until {STATE} is recorded. Run from a "
+            "working git checkout of this repository.",
+            file=sys.stderr,
+        )
+        return rc or 1
+    try:
+        _slot.write_owner(SLOT, main_root)
+    except _slot.OwnerRefusedError as exc:
+        print(
+            f"{action}: {exc} No owner record was written, so later commands "
+            "in this slot will refuse until the steps above are done.",
+            file=sys.stderr,
+        )
+        return rc or 1
+    except _slot.SlotError as exc:
+        print(
+            f"{action}: {exc}. This command ran in this slot and may have "
+            "created or changed a Director VM on the slot's internal_ip, so do "
+            "not remove state.json yet. Later commands in this slot will refuse "
+            f"until {SLOT.owner} records what {STATE} names. {_slot.OWN_STATE_REMEDY}",
+            file=sys.stderr,
+        )
+        return rc or 1
+    return rc
 
 
 def _state_is_empty() -> bool:
@@ -426,7 +612,7 @@ def _delete_all_deployments() -> None:
     """
     try:
         proc = subprocess.run(
-            ["bosh", "-e", "pve", "deployments", "--column=name", "--json"],
+            ["bosh", "-e", BOSH_ALIAS, "deployments", "--column=name", "--json"],
             cwd=REPO_ROOT, env=director_env(),
             capture_output=True, text=True, timeout=60,
         )
@@ -445,11 +631,13 @@ def _delete_all_deployments() -> None:
         names = []
     for name in names:
         print(f"teardown: deleting deployment '{name}' before delete-env")
-        run("bosh", "-e", "pve", "-n", "-d", name, "delete-deployment", "--force",
+        run("bosh", "-e", BOSH_ALIAS, "-n", "-d", name, "delete-deployment", "--force",
             env=director_env())
 
 
 def cmd_teardown(args: list[str]) -> int:
+    require_slot("delete-env")
+    require_own_paths("delete-env", args)
     if _state_is_empty():
         print(f"teardown: state file absent or empty ({STATE}), nothing to delete")
         return 0
@@ -476,7 +664,8 @@ def cmd_teardown(args: list[str]) -> int:
         *env_network_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
-        "-v", "director_name=ocfp-mgmt",
+        *SLOT.vars_layer(),
+        "-v", f"director_name={DIRECTOR_NAME}",
         "-v", f"pve_cpi_release_path={release}",
         # The manifest's release name must match the name embedded in the
         # tarball (published tarballs through v0.4.0 embed bosh-pve-cpi).
@@ -487,31 +676,32 @@ def cmd_teardown(args: list[str]) -> int:
     )
     if rc != 0:
         print(f"teardown: bosh delete-env exited {rc}", file=sys.stderr)
-    return rc
+    return record_slot_owner(rc, "delete-env")
 
 
 def cmd_alias_env(args: list[str]) -> int:
+    require_slot("alias-env")
     if not CREDS.exists():
         sys.exit(f"creds.yml missing at {CREDS} — run 'scripts/bosh create-env' first")
     director_ip = internal_ip()
     ca = bosh_int(CREDS, "/director_ssl/ca")
-    # Drop any existing 'pve' alias first. A stale entry from a previous
-    # environment carries that director's stored credentials, and the CLI
+    # Drop any existing alias of this slot's name first. A stale entry from a
+    # previous environment carries that director's stored credentials, and the CLI
     # replays them against the new director's UAA during alias-env — the
     # resulting 401 masks a perfectly healthy director.
     subprocess.run(
-        ["bosh", "unalias-env", "pve"],
+        ["bosh", "unalias-env", BOSH_ALIAS],
         cwd=REPO_ROOT, capture_output=True,
     )
     proc = subprocess.run(
-        ["bosh", "alias-env", "pve", "-e", director_ip, "--ca-cert", ca, *args],
+        ["bosh", "alias-env", BOSH_ALIAS, "-e", director_ip, "--ca-cert", ca, *args],
         cwd=REPO_ROOT,
     )
     return proc.returncode
 
 
 def cmd_login(args: list[str]) -> int:
-    return run("bosh", "-e", "pve", "login", *args, env=director_env())
+    return run("bosh", "-e", BOSH_ALIAS, "login", *args, env=director_env())
 
 
 def cmd_env(args: list[str]) -> int:
@@ -527,12 +717,13 @@ def cmd_ucc(args: list[str]) -> int:
     # 192.168.1.x but NATS is on cpitest0/172.31.0.10, so the agent can never
     # reach mbus and the deploy fails with "Timed out pinging VM ... agent".
     return run(
-        "bosh", "-e", "pve", "-n", "update-cloud-config",
+        "bosh", "-e", BOSH_ALIAS, "-n", "update-cloud-config",
         str(CLOUD_CONFIG),
         *env_network_ops(),
         *env_cc_reserved_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
+        *SLOT.vars_layer(),
         *args,
         env=director_env(),
     )
@@ -540,7 +731,7 @@ def cmd_ucc(args: list[str]) -> int:
 
 def cmd_runtime_config(args: list[str]) -> int:
     return run(
-        "bosh", "-e", "pve", "-n", "update-runtime-config",
+        "bosh", "-e", BOSH_ALIAS, "-n", "update-runtime-config",
         str(PVE_GUEST_AGENT_RC),
         "--name", "pve-guest-agent",
         *args,
@@ -561,7 +752,7 @@ def _emptyvm_is_wedged() -> bool:
     Director unreachable, unparseable output) returns False — nothing to heal.
     """
     res = subprocess.run(
-        ["bosh", "-e", "pve", "-d", "emptyvm", "instances", "--json"],
+        ["bosh", "-e", BOSH_ALIAS, "-d", "emptyvm", "instances", "--json"],
         cwd=REPO_ROOT, env=director_env(), capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -588,14 +779,15 @@ def cmd_emptyvm(args: list[str]) -> int:
             "record for a VM no longer on PVE); force-deleting before redeploy"
         )
         run(
-            "bosh", "-e", "pve", "-n", "-d", "emptyvm",
+            "bosh", "-e", BOSH_ALIAS, "-n", "-d", "emptyvm",
             "delete-deployment", "--force",
             env=director_env(),
         )
     return run(
-        "bosh", "-e", "pve", "-n", "-d", "emptyvm", "deploy",
+        "bosh", "-e", BOSH_ALIAS, "-n", "-d", "emptyvm", "deploy",
         str(EMPTYVM),
         "-l", str(VARS),
+        *SLOT.vars_layer(),
         *args,
         env=director_env(),
     )
@@ -615,7 +807,7 @@ def cmd_upload_stemcell(args: list[str]) -> int:
     # the qcow2 upload fast-paths on the cached SHA.
     light = _ensure_light_stemcell(build_tarball=True)
     return run(
-        "bosh", "-e", "pve", "-n", "upload-stemcell", str(light.create_env_tarball),
+        "bosh", "-e", BOSH_ALIAS, "-n", "upload-stemcell", str(light.create_env_tarball),
         "--fix", *args, env=director_env(),
     )
 
@@ -627,10 +819,11 @@ def cmd_update_cpi_config(args: list[str]) -> int:
     # "Expected to find variables: ..." — the intended signal until the second
     # cluster exists (see manifests/envs/pmx/vars.yml).
     rc = run(
-        "bosh", "-e", "pve", "-n", "update-cpi-config",
+        "bosh", "-e", BOSH_ALIAS, "-n", "update-cpi-config",
         str(CPI_CONFIG),
         "-l", str(VARS),
         *env_vars_layer(),
+        *SLOT.vars_layer(),
         *args,
         env=director_env(),
     )
@@ -919,6 +1112,15 @@ def _net_down_update_firewall(pve_host: str, node: str, subnet: str) -> int:
 
 
 def cmd_net_down(_args: list[str]) -> int:
+    if not SLOT.is_default:
+        print(
+            f"net-down: refusing in the Director slot {SLOT.dir}. The env network "
+            "is shared with the default slot's Director, and removing it would "
+            "cut that Director off. Run net-down without BOSH_STATE_DIR when you "
+            "mean to remove the network for every Director on it.",
+            file=sys.stderr,
+        )
+        return 2
     p = _sdn_params()
     print(
         f">>> net-down: removing SDN subnet/vnet/zone for vnet={p['vnet']} "
@@ -1019,7 +1221,7 @@ def cmd_help(args: list[str]) -> int:
 
 
 def cmd_passthrough(args: list[str]) -> int:
-    return run("bosh", "-e", "pve", *args, env=director_env())
+    return run("bosh", "-e", BOSH_ALIAS, *args, env=director_env())
 
 
 # ---------------------------------------------------------------------------
@@ -1165,7 +1367,7 @@ def _export_compiled(
     """export-release one release, store its tarball, return a CompiledRelease."""
     with tempfile.TemporaryDirectory(prefix="compiled-") as tmpd:
         rc = run(
-            "bosh", "-e", "pve", "-d", COMPILE_DEPLOYMENT, "export-release",
+            "bosh", "-e", BOSH_ALIAS, "-d", COMPILE_DEPLOYMENT, "export-release",
             f"{name}/{version}", f"{os_name}/{sc_version}", f"--dir={tmpd}",
             env=director_env(),
         )
@@ -1190,7 +1392,7 @@ def _export_compiled(
 def _director_rows(denv: dict[str, str], what: str) -> list[dict]:
     """Rows of `bosh <what> --json` (stemcells/releases), or [] on any failure."""
     out = subprocess.run(
-        ["bosh", "-e", "pve", what, "--json"], env=denv, capture_output=True, text=True
+        ["bosh", "-e", BOSH_ALIAS, what, "--json"], env=denv, capture_output=True, text=True
     ).stdout
     try:
         return json.loads(out)["Tables"][0]["Rows"]
@@ -1273,7 +1475,7 @@ def cmd_compile_releases(args: list[str]) -> int:
         print(f"    stemcell {os_name}/{sc_version} present")
     else:
         print(f"    uploading stemcell {os_name}/{sc_version}")
-        if run("bosh", "-e", "pve", "-n", "upload-stemcell", "--sha1", sc_sha, sc_url, env=denv) != 0:
+        if run("bosh", "-e", BOSH_ALIAS, "-n", "upload-stemcell", "--sha1", sc_sha, sc_url, env=denv) != 0:
             sys.exit("compile-releases: stemcell upload failed")
 
     # 2. Upload the source release(s) to compile.
@@ -1289,7 +1491,7 @@ def cmd_compile_releases(args: list[str]) -> int:
     bosh_ver, bosh_url, bosh_sha = _bosh_release_pin()
     targets = [("bosh", bosh_ver)]
     print(f"    uploading source release bosh/{bosh_ver}")
-    if run("bosh", "-e", "pve", "-n", "upload-release", "--sha1", bosh_sha, bosh_url, env=denv) != 0:
+    if run("bosh", "-e", BOSH_ALIAS, "-n", "upload-release", "--sha1", bosh_sha, bosh_url, env=denv) != 0:
         sys.exit("compile-releases: upload bosh release failed")
     # Verify the version we will export-release actually registered on the director;
     # a mismatch would otherwise surface as a confusing "release not found".
@@ -1300,7 +1502,7 @@ def cmd_compile_releases(args: list[str]) -> int:
         cpi_name = _cpi_release_name(cpi_path)
         cpi_ver = _cpi_release_version(cpi_path)
         print(f"    uploading source release {cpi_name}/{cpi_ver} (COMPILE_RELEASES_WITH_CPI)")
-        if run("bosh", "-e", "pve", "-n", "upload-release", cpi_path, env=denv) != 0:
+        if run("bosh", "-e", BOSH_ALIAS, "-n", "upload-release", cpi_path, env=denv) != 0:
             sys.exit(f"compile-releases: upload {cpi_name} release failed")
         if not _release_present(denv, cpi_name, cpi_ver):
             sys.exit(
@@ -1326,13 +1528,13 @@ def cmd_compile_releases(args: list[str]) -> int:
     try:
         mf.write(manifest)
         mf.close()
-        if run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "deploy", mf.name, env=denv) != 0:
+        if run("bosh", "-e", BOSH_ALIAS, "-n", "-d", COMPILE_DEPLOYMENT, "deploy", mf.name, env=denv) != 0:
             sys.exit("compile-releases: compilation deploy failed")
         # 4. Export each target (compiles on the director's compilation VMs).
         compiled = [_export_compiled(n, v, os_name, sc_version, cfg) for n, v in targets]
     finally:
         os.unlink(mf.name)
-        run("bosh", "-e", "pve", "-n", "-d", COMPILE_DEPLOYMENT, "delete-deployment", "--force", env=denv)
+        run("bosh", "-e", BOSH_ALIAS, "-n", "-d", COMPILE_DEPLOYMENT, "delete-deployment", "--force", env=denv)
 
     # 5. Write the create-env ops file pinning the compiled tarballs.
     ops = _compiled.compiled_releases_ops(compiled, stemcell=f"{os_name}/{sc_version}")
@@ -1388,6 +1590,134 @@ def compiled_ops_layer() -> list[str]:
     return ["-o", str(COMPILED_OPS)]
 
 
+def _director_manifest_argv(bd: Path) -> list[str]:
+    """The create-env manifest, ops, and vars layers, without the -v pins.
+
+    Mirrors cmd_create_env so check-vars interpolates exactly what create-env
+    would. The compiled-release ops only swap release URLs and carry no
+    variables, so they are left out.
+    """
+    return [
+        str(bd / "bosh.yml"),
+        "-o", str(BOSH_RELEASE_OPS),
+        "-o", str(CPI_OPS),
+        "-o", str(bd / "uaa.yml"),
+        "-o", str(bd / "credhub.yml"),
+        "-o", str(OS_CONF_OPS),
+        "-o", str(NATS_TUNING_OPS),
+        "-o", str(HM_TUNING_OPS),
+        "-o", str(DIRECTOR_TUNING_OPS),
+        "-o", str(bd / "jumpbox-user.yml"),
+        *env_network_ops(),
+        "-l", str(VARS),
+        *env_vars_layer(),
+        *SLOT.vars_layer(),
+    ]
+
+
+def _missing_vars(label: str, argv: list[str]) -> "list[str] | None":
+    """Variables `bosh int --var-errs` cannot resolve for one manifest.
+
+    Returns the names no vars file sets, leaving out the ones the manifest
+    declares under `variables:` (create-env generates those into creds.yml)
+    and the ones scripts/bosh passes itself with -v. Returns None when bosh
+    int fails for some other reason, after printing why.
+    """
+    import yaml
+
+    declared: set[str] = set()
+    decl = subprocess.run(
+        ["bosh", "int", *argv, "--path", "/variables"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if decl.returncode == 0:
+        try:
+            declared = _upgrade_checks.declared_variable_names(yaml.safe_load(decl.stdout))
+        except yaml.YAMLError:
+            declared = set()
+    proc = subprocess.run(
+        ["bosh", "int", *argv, "--var-errs"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if proc.returncode == 0:
+        return []
+    reported = _upgrade_checks.parse_missing_vars(proc.stderr + "\n" + proc.stdout)
+    if not reported:
+        tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-15:])
+        print(
+            f"check-vars: bosh int could not render the {label}, and not because "
+            f"of a missing variable. Fix the error below and run again.\n{tail}",
+            file=sys.stderr,
+        )
+        return None
+    return _upgrade_checks.truly_missing(reported, declared)
+
+
+def cmd_check_vars(args: list[str]) -> int:
+    """Interpolate the Director, cloud-config, and cpi-config manifests offline.
+
+    Fails fast, naming every variable the vars files leave unset, so a stale
+    vars file stops a run in seconds instead of halfway through create-env.
+    Remaining args are the extra -o/-v flags a later `ucc` will pass, and
+    --cpi-config adds the cpi-config manifest to the check.
+    """
+    with_cpi_config = "--cpi-config" in args
+    ucc_args = [a for a in args if a != "--cpi-config"]
+    require_slot("check-vars")
+    checks: list[tuple[str, list[str]]] = [
+        ("Director manifest", _director_manifest_argv(bosh_deployment_dir())),
+        ("cloud-config", [
+            str(CLOUD_CONFIG),
+            *env_network_ops(),
+            *env_cc_reserved_ops(),
+            "-l", str(VARS),
+            *env_vars_layer(),
+            *SLOT.vars_layer(),
+            *ucc_args,
+        ]),
+    ]
+    if with_cpi_config:
+        checks.append(("cpi-config", [
+            str(CPI_CONFIG),
+            "-l", str(VARS),
+            *env_vars_layer(),
+            *SLOT.vars_layer(),
+        ]))
+    layers = [str(VARS)]
+    env_file = env_vars_file()
+    if env_file:
+        layers.append(str(env_file))
+    if SLOT.vars_layer():
+        layers.append(str(SLOT.config))
+
+    failed = False
+    for label, argv in checks:
+        missing = _missing_vars(label, argv)
+        if missing is None:
+            failed = True
+            continue
+        if missing:
+            failed = True
+            print(f"check-vars: the {label} needs variables that no vars file sets:",
+                  file=sys.stderr)
+            for name in missing:
+                print(f"    - {name}", file=sys.stderr)
+            continue
+        print(f"check-vars: {label}: every variable resolves")
+    if failed:
+        print(
+            "check-vars: set each missing variable in manifests/bosh/vars.yml "
+            "(manifests/bosh/vars.yml.example lists every key with its default). "
+            "Where a workflow materializes that file from the LAB_BOSH_VARS_YML "
+            "secret, update the secret from the fixed file with "
+            "`gh secret set LAB_BOSH_VARS_YML < manifests/bosh/vars.yml`. "
+            f"Vars files read, in order: {', '.join(layers)}.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 COMMANDS = {
     "create-env": cmd_create_env,
     "deploy": cmd_create_env,
@@ -1410,6 +1740,7 @@ COMMANDS = {
     "network-status": cmd_net_status,
     "credhub": cmd_credhub,
     "compile-releases": cmd_compile_releases,
+    "check-vars": cmd_check_vars,
     "help": cmd_help,
     "-h": cmd_help,
     "--help": cmd_help,
@@ -1421,6 +1752,11 @@ def main(argv: list[str]) -> int:
         return cmd_help([])
     sub, *rest = argv
     handler = COMMANDS.get(sub)
+    if handler is cmd_help:
+        return handler(rest)
+    # Any command can hand bosh an argv (a passthrough `-n delete-env`, or
+    # `bosh int` under check-vars), so the path check covers all of them.
+    require_own_paths(sub if handler else "run a Director command", argv)
     if handler is None:
         return cmd_passthrough(argv)
     return handler(rest)

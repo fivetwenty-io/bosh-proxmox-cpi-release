@@ -1,0 +1,39 @@
+# ci/certification-slot.yml
+#
+# Template for the certification Director's slot.yml. The certification
+# workflow (.github/workflows/certification.yml) renders it into its own slot
+# directory, BOSH_STATE_DIR, with
+#
+#   bosh int ci/certification-slot.yml -l manifests/bosh/vars.yml --var-errs
+#
+# so the Director it builds and tears down never shares an IP, an alias, a
+# name, or a state file with the main Director (see _slot.py and
+# docs/certification/upgrade.md).
+#
+# This file is COMMITTED. The Director IP stays out of it, because it comes
+# from the variable certification_director_ip, which the LAB_BOSH_VARS_YML
+# secret supplies. That address must be a free one on the cpitest network
+# inside the reserved infra band (cpitest_reserved), so no deployment's
+# dynamic placement can land on it, and it must differ from the main
+# Director's internal_ip.
+# docs/certification/scheduled.md lists the addresses the tracked files
+# already claim.
+internal_ip: ((certification_director_ip))
+bosh_alias: pve-certification
+director_name: certification
+pve_create_env_deployment: create-env-certification
+
+# The certification Director's cloud config reserves everything the main
+# Director's does (manifests/envs/cpitest/vars.yml) plus .20-.149 and
+# .190-.199, so its deployments place dynamic IPs only in .150-.189. BOSH
+# hands out the lowest free address first, so the main Director, whose
+# dynamic band starts at .20, fills from the bottom while this Director keeps
+# to the top. `scripts/bosh ucc` layers slot.yml after the env vars, so this
+# list replaces the env's cpitest_reserved for this slot only; the main
+# Director's cloud config is unchanged. Keep every entry of the env's
+# cpitest_reserved here (scripts/_slot_test.py checks it).
+cpitest_reserved:
+- 172.31.0.1-172.31.0.19
+- 172.31.0.20-172.31.0.149
+- 172.31.0.190-172.31.0.199
+- 172.31.0.200-172.31.0.254

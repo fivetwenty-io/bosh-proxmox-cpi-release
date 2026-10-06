@@ -29,6 +29,11 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _slot  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 # ---------------------------------------------------------------------------
 # Required config keys
 # ---------------------------------------------------------------------------
@@ -892,17 +897,47 @@ def director_env(cfg: dict, dry_run: bool = False) -> dict:
         cfg:     Validated config dict from load_config.
         dry_run: Passed to bosh_int; prevents shell-out in dry_run mode.
 
+    When BOSH_STATE_DIR names a Director slot other than the default, that
+    slot's creds.yml and alias replace the config's bosh_creds and
+    tier2.bosh_env_alias, so every harness talks to the slot's Director and
+    never to the main one (see scripts/_slot.py).
+
     Returns:
         Dict with BOSH_ENVIRONMENT, BOSH_CLIENT, BOSH_CLIENT_SECRET, BOSH_CA_CERT.
 
+    The slot guard runs first for any slot other than the default, and for
+    the default slot too when BOSH_REFUSE_DEFAULT_SLOT is set, so a harness
+    that refuses the default slot never gets the main Director's credentials.
+
     Raises:
-        SystemExit: bosh int fails for admin_password or director_ssl/ca.
+        SystemExit: the slot guard refuses, a dedicated slot's slot.yml fails
+            the checks scripts/bosh runs, or bosh int fails for
+            admin_password or director_ssl/ca.
     """
     bosh_creds = cfg["bosh_creds"]
-    tier2 = cfg["tier2"]
+    alias = str(cfg["tier2"]["bosh_env_alias"])
+    slot = _slot.resolve(REPO_ROOT)
+    refuse = _slot.refuse_mode()
+    if refuse or not slot.is_default:
+        message = _slot.guard_repo("run a Director command", slot, REPO_ROOT,
+                                   require_deny_list=refuse)
+        if message:
+            sys.exit(message)
+    if not slot.is_default:
+        # The same slot.yml checks scripts/bosh runs, so a slot.yml that takes
+        # the main Director's alias can't point a harness at it.
+        problem = _slot.config_problem(
+            slot, _slot.env_facts(REPO_ROOT, os.environ.get("BOSH_PVE_ENV", "")))
+        if problem:
+            sys.exit(_slot.refusal_message("run a Director command", slot, problem))
+        bosh_creds = str(slot.creds)
+        try:
+            alias = slot.alias
+        except _slot.SlotError as exc:
+            sys.exit(f"Director slot: {exc}")
 
     return {
-        "BOSH_ENVIRONMENT": str(tier2["bosh_env_alias"]),
+        "BOSH_ENVIRONMENT": alias,
         "BOSH_CLIENT": "admin",
         "BOSH_CLIENT_SECRET": bosh_int(bosh_creds, "/admin_password", dry_run=dry_run),
         "BOSH_CA_CERT": bosh_int(bosh_creds, "/director_ssl/ca", dry_run=dry_run),

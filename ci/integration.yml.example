@@ -271,11 +271,13 @@ bats:
 # BOSH Director Upgrade Test (scripts/certify).
 # Run with: make certify-upgrade  /  ./scripts/certify upgrade --env <env>
 #
-# DESTRUCTIVE: the run takes over this repo's Director slot. It deploys a
-# Director on the previous CPI release, deploys the upstream certification
-# release under it, upgrades the Director in place onto the new CPI release,
-# recreates the deployment, and tears everything down. See
-# docs/certification/upgrade.md.
+# DESTRUCTIVE for its own slot: the run deploys a Director on the previous
+# CPI release, deploys the upstream certification release under it, upgrades
+# the Director in place onto the new CPI release, recreates the deployment,
+# and tears everything down. It refuses to run in this repo's default
+# Director slot (manifests/bosh), so set BOSH_STATE_DIR to a directory kept
+# for the certification Director, with a slot.yml naming its own
+# internal_ip. See docs/certification/upgrade.md.
 certification:
   deployment_name: certification  # BOSH deployment name (default: certification)
   release_name:    certification  # BOSH release name (default: certification)
