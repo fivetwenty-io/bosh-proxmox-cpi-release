@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/certify` could leave its Director running at the end of a run. The teardown step ran `scripts/bosh teardown` without `PVE_CPI_RELEASE_PATH`, so `delete-env` fell back to the newest dev release in the checkout and failed when there was none. Teardown now passes the CPI tarball that the Director was last built with, which is the new CPI once the upgrade has started and the old CPI before that. When certify has no tarball of its own, `scripts/bosh` still chooses one as before. The CPI never deletes a parker, so its parker VMs still outlive the Director, and we remove an empty one by hand as [Recovering empty parker VMs](docs/operations.md#recovering-empty-parker-vms) describes.
+
 ## [0.9.1] - 2026-10-06
 
 ### Added

@@ -752,6 +752,9 @@ class Certify:
         self.certification_release = ""
         self.deployed = False
         self.director_up = False
+        # Which CPI tarball the standing Director was last built with, so
+        # teardown hands delete-env the same one.
+        self.director_side: "str | None" = None
         self.pre: dict = {}
         self.post: dict = {}
         self.invariants: list[dict] = []
@@ -1171,6 +1174,20 @@ class Certify:
         assert path is not None
         return {"PVE_CPI_RELEASE_PATH": str(path)}
 
+    def _teardown_env(self) -> "dict[str, str] | None":
+        """The CPI tarball for delete-env, which needs the Director's CPI.
+
+        Without PVE_CPI_RELEASE_PATH, scripts/bosh falls back to the newest
+        dev release in the checkout and fails when there is none, which
+        leaves the run's Director standing. When the run has no tarball to
+        offer, scripts/bosh keeps choosing as before.
+        """
+        side = self.director_side or "old"
+        path = self.new_cpi_path if side == "new" else self.old_cpi_path
+        if path is None:
+            return None
+        return {"PVE_CPI_RELEASE_PATH": str(path)}
+
     def deploy_old(self) -> bool:
         self.rep.section("deploy-old")
 
@@ -1205,6 +1222,7 @@ class Certify:
         if not ok:
             return False
         self.director_up = True
+        self.director_side = "old"
 
         ok, _ = self.runner.step(
             "director:alias", [BOSH_SCRIPT, "alias-env"], timeout=SHORT_TIMEOUT_S,
@@ -1484,6 +1502,9 @@ class Certify:
         self.rep.section("upgrade")
         if not self._guard_step("create-env", "director:create-env-new"):
             return False
+        # Set before the step, because a create-env that fails partway may
+        # already have replaced the Director's VM with one on the new CPI.
+        self.director_side = "new"
         ok, _ = self.runner.step(
             "director:create-env-new", self._create_env_argv("new"),
             env=self._create_env_env("new"), timeout=CREATE_ENV_TIMEOUT_S,
@@ -1771,7 +1792,7 @@ class Certify:
         if self.director_up or self.dry_run:
             self._cleanup_step(
                 "director:delete-env", [BOSH_SCRIPT, "teardown"],
-                CREATE_ENV_TIMEOUT_S,
+                CREATE_ENV_TIMEOUT_S, env=self._teardown_env(),
             )
             if self._env_manages_sdn():
                 # The run's Director shares the env network with the main

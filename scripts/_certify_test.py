@@ -393,6 +393,57 @@ class GuardedStepsTest(_SyntheticRoot):
         self.assertEqual(c.rep.status("director:slot-guard"), ["FAIL"])
 
 
+class TeardownCpiTest(_SyntheticRoot):
+    """delete-env gets the CPI tarball the standing Director was built with."""
+
+    OLD = "/releases/bosh-proxmox-cpi-old.tgz"
+    NEW = "/releases/bosh-proxmox-cpi-new.tgz"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mod = _load_certify(None, self.repo)
+
+    def _certify(self, side: "str | None") -> object:
+        c = object.__new__(self.mod.Certify)
+        c.old_cpi_path = Path(self.OLD)
+        c.new_cpi_path = Path(self.NEW)
+        c.director_side = side
+        return c
+
+    def test_an_upgraded_director_tears_down_on_the_new_cpi(self) -> None:
+        self.assertEqual(self._certify("new")._teardown_env(), {"PVE_CPI_RELEASE_PATH": self.NEW})
+
+    def test_a_director_never_upgraded_tears_down_on_the_old_cpi(self) -> None:
+        for side in ("old", None):
+            self.assertEqual(self._certify(side)._teardown_env(), {"PVE_CPI_RELEASE_PATH": self.OLD}, side)
+
+    def test_without_a_tarball_scripts_bosh_still_chooses(self) -> None:
+        c = self._certify("new")
+        c.new_cpi_path = None
+        self.assertIsNone(c._teardown_env())
+
+    def test_teardown_hands_the_tarball_to_delete_env(self) -> None:
+        c = self._certify("new")
+        c.args = argparse.Namespace(keep=False)
+        c.rep = _Rep()
+        c.dry_run = False
+        c.deployed = False
+        c.director_up = True
+        c.ccfg = {"deployment_name": "certification"}
+        c._slot_refusal = lambda _op: ""
+        c._env_manages_sdn = lambda: False
+        c._sdn_skip_reason = lambda: "the env has no SDN"
+        calls = []
+
+        def record(name, argv, timeout, env=None):
+            calls.append((name, env))
+            return True
+
+        c._cleanup_step = record
+        c.teardown()
+        self.assertEqual(calls, [("director:delete-env", {"PVE_CPI_RELEASE_PATH": self.NEW})])
+
+
 class BackupStateTest(_SyntheticRoot):
     """The run directory's backup keeps the owner record with the state."""
 
