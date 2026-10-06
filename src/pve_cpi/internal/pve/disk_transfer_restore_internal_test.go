@@ -257,6 +257,10 @@ func TestRestoreParkerProtection_KnownFailureStaysAWarning(t *testing.T) {
 	if !strings.Contains(logged.String(), "could not restore protection on parker") {
 		t.Fatalf("no warning logged for the failed restore: %s", logged.String())
 	}
+	want := "delete parked: could not restore protection on parker 90000; confirm with pvesh get /pools --poolid bosh-lock-vm-90000 that no CPI operation holds the parker's lock, and only when it answers that the pool does not exist, run qm set 90000 --protection 1"
+	if !strings.Contains(logged.String(), want) {
+		t.Fatalf("the warning %s does not contain %q", logged.String(), want)
+	}
 }
 
 // TestParkerRestoreDeadlineFitsInsideTheLockTTL checks that a window that uses
@@ -498,7 +502,8 @@ func TestRestoreParkerProtection_TransportFailureIsUnknown(t *testing.T) {
 	if !errors.As(err, &cutOff) || cutOff.ParkerVMID != 90000 {
 		t.Fatalf("restore that never got an answer = %v, want a cut-off restore for parker 90000", err)
 	}
-	for _, want := range []string{"transfer out: protection restore on parker vmid 90000 ended without an answer from PVE and its outcome is unknown", "qm set 90000 --protection 1"} {
+	for _, want := range []string{"transfer out: protection restore on parker vmid 90000 ended without an answer from PVE and its outcome is unknown",
+		"check the parker with qm config 90000, and if protection is off, confirm with pvesh get /pools --poolid bosh-lock-vm-90000 that no CPI operation holds the parker's lock, and only when it answers that the pool does not exist, run qm set 90000 --protection 1"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
@@ -612,5 +617,31 @@ func TestProtectionRestoreEnding_ChecksIncomplete(t *testing.T) {
 				t.Fatalf("ending = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRestoreParkerProtection_CutOffWithoutTheParkerLock fails every restore
+// try in transport inside a window that runs without the parker's lock, the
+// way it does on a cluster that can't host the lock pool. The cut-off error
+// must not send the operator to a lock pool that never exists there, so it
+// says to put protection back only once no BOSH task or storage-journal
+// command runs.
+func TestRestoreParkerProtection_CutOffWithoutTheParkerLock(t *testing.T) {
+	t.Parallel()
+	c := &hangingRestoreClient{parker: 90000, dropped: true,
+		scanFakeClient: newScanFakeClient(map[int]map[string]any{90000: {cfgKeyTags: "bosh-parker"}})}
+	ctx := WithTestBackoff(context.Background(), func(int) time.Duration { return 0 })
+	ctx = context.WithValue(ctx, parkerLockUnserializedKey{}, true)
+	err := restoreParkerProtection(ctx, c, nil, "transfer out", "pve1", 90000, "the disk transfer to vm 700 slot scsi1 completed")
+	var cutOff *ProtectionRestoreCutOffError
+	if !errors.As(err, &cutOff) {
+		t.Fatalf("restore that never got an answer = %v, want a cut-off restore", err)
+	}
+	want := "check the parker with qm config 90000, and if protection is off, the CPI can't take the parker's lock on this cluster, so only when bosh tasks lists no running task and no storage-journal command is running, run qm set 90000 --protection 1"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error %q does not contain %q", err, want)
+	}
+	if strings.Contains(err.Error(), "pvesh") || strings.Contains(err.Error(), "bosh-lock-vm-") {
+		t.Fatalf("error %q sends the operator to a lock pool on a cluster that has none", err)
 	}
 }

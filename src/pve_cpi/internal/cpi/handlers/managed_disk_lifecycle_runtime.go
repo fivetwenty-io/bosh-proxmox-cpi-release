@@ -74,7 +74,7 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 			return err
 		}
 		if text := unsettledStepText(handle.Record(), gaps, func(step aj.Step) bool { return step.Attempt != handle.Record().ActiveAttempt() }); text != "" && len(gaps) > 0 {
-			return protectionPendingOr(handle.Record(), gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+text))
+			return parkerLockBusyOr(handle.Record(), gaps, protectionPendingOr(handle.Record(), gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+text)))
 		}
 		return nil
 	}
@@ -312,7 +312,7 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 	}
 	if len(gaps) > 0 {
 		record := m.handle.Record()
-		return storageRefusal("lifecycle has unresolved mutation evidence; " + unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() }))
+		return parkerLockBusyOr(record, gaps, storageRefusal("lifecycle has unresolved mutation evidence; "+unsettledStepText(record, gaps, func(step aj.Step) bool { return step.Attempt != record.ActiveAttempt() })))
 	}
 	var proof aj.Verification
 	if deleted {
@@ -587,7 +587,7 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 			// the typed error gives it on purpose.
 			refusal = cpierrors.Cloud("%s", text)
 		}
-		return errors.Join(refusal, handle.Close(), journal.Close())
+		return errors.Join(parkerLockBusyOr(record, gaps, refusal), handle.Close(), journal.Close())
 	}
 	if err := storageLifecycleSettled(handle.Record()); err != nil {
 		return errors.Join(err, handle.Close(), journal.Close())

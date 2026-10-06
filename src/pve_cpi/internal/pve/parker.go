@@ -1965,7 +1965,7 @@ func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node str
 			return attachErr
 		}
 		landedSlot = slot
-		reassertParkerProtection(wctx, c, logger, node, parkerVMID)
+		reassertParkerProtection(wctx, c, logger, node, parkerVMID, parkerWindowLockCheck(wctx, parkerVMID))
 		return nil
 	}); lockErr != nil {
 		return lockErr
@@ -2584,6 +2584,45 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	return fn(windowCtx)
 }
 
+// RunUnderParkerLock runs fn while it holds the protection-window lock on
+// parkerVMID, the lock every park, unpark, transfer, and parked delete takes,
+// which lives in PVE as the sentinel pool ClusterLockPoolName("vm-<vmid>").
+// It is withParkerProtectionLock for a caller outside this package that must
+// not run while another request is inside a window on that parker, such as a
+// reader that judges the parker's protection flag, which a window clears on
+// purpose. The wait is the one ctx carries, set through WithParkerLockWait,
+// and a lock that stays held past it fails retriably with
+// ErrClusterLockTimeout. fn must not take another lock, because no order is
+// defined between this lock and any lock taken under it.
+func RunUnderParkerLock(ctx context.Context, c Client, logger *log.Logger, parkerVMID int, purpose string, fn func(context.Context) error) error {
+	return withParkerProtectionLock(ctx, c, logger, parkerVMID, purpose, fn)
+}
+
+// ParkerLockUnserialized reports whether ctx is the context RunUnderParkerLock
+// handed to fn without the lock, because PVE refused the lock's create or the
+// client has no pool service. Every window on that parker then runs without
+// the lock too, so its sentinel pool never exists.
+func ParkerLockUnserialized(ctx context.Context) bool { return parkerLockUnserialized(ctx) }
+
+// ParkerLockCheck is the clause an operator-facing text puts right before the
+// qm set command that turns a parker's protection back on, and it ends where
+// that command begins. Another CPI operation turns the flag off on purpose for
+// as long as it holds the parker's lock, so the clause has us confirm that no
+// operation holds it. The lock is the sentinel pool ClusterLockPoolName gives,
+// which qm config doesn't show, so the check reads the pool through the
+// GET /pools form the API schema keeps, where a missing pool answers that it
+// does not exist. When unserialized is set, the CPI runs this parker's windows
+// without the lock, so the pool never exists and proves nothing, and the
+// clause has us confirm that nothing that drives the CPI is running instead.
+func ParkerLockCheck(parkerVMID int, unserialized bool) string {
+	if unserialized {
+		return "the CPI can't take the parker's lock on this cluster, so only when bosh tasks lists no running task " +
+			"and no storage-journal command is running, "
+	}
+	return fmt.Sprintf("confirm with pvesh get /pools --poolid %s that no CPI operation holds the parker's lock, "+
+		"and only when it answers that the pool does not exist, ", ClusterLockPoolName(fmt.Sprintf("vm-%d", parkerVMID)))
+}
+
 // parkerProtectionRestoreReserveFloor is the time set aside for the protection
 // restore on the shipped retry curves. The restore makes up to four attempts,
 // and the three sleeps between them on the pushback curve (5s, 7.5s, and
@@ -2817,7 +2856,7 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	// TTL. A restore failure is logged rather than returned: the detach result
 	// is what the caller acts on, and the park path re-asserts the flag on
 	// every attach.
-	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", parkerNode, parkerVMID)
+	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", parkerNode, parkerVMID, parkerWindowLockCheck(ctx, parkerVMID))
 
 	if retryErr != nil {
 		// Classified like the protection write one line up: a 403 for a missing
@@ -2885,7 +2924,7 @@ func sweepDemotedUnderProtection(ctx context.Context, c Client, logger *log.Logg
 	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeoutNow())
 	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, node, parkerVMID, bareVolid)
 	sweepCancel()
-	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", node, parkerVMID)
+	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", node, parkerVMID, parkerWindowLockCheck(ctx, parkerVMID))
 	if sweepErr != nil {
 		// Same condition, same consequence as the detach path: see
 		// reportUnsweptReference.
@@ -3113,7 +3152,7 @@ func sweepParkerUnusedSlotsProtectedLocked(ctx context.Context, c Client, logger
 	}
 	// The restore gets its own deadline rather than what is left of ctx's, so
 	// a sweep that used its whole budget still puts protection back.
-	restoreParkerProtectionLogged(ctx, c, logger, "parker", node, parkerVMID)
+	restoreParkerProtectionLogged(ctx, c, logger, "parker", node, parkerVMID, parkerWindowLockCheck(ctx, parkerVMID))
 	return sweepErr == nil
 }
 
@@ -3127,9 +3166,9 @@ func sweepParkerUnusedSlotsProtectedLocked(ctx context.Context, c Client, logger
 // A failure is logged, never returned: the disk is parked either way, and
 // failing the park would be a worse outcome than a protection flag that stays
 // down until the next park.
-func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int) {
+func reassertParkerProtection(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, check string) {
 	if protErr := setParkerProtection(ctx, c, logger, node, parkerVMID, true); protErr != nil && logger != nil {
-		logger.Warn("parker: could not re-assert protection after a park — re-set it by hand (qm set <vmid> --protection 1)",
+		logger.Warn(fmt.Sprintf("parker: could not re-assert protection on parker %d after a park; %srun qm set %d --protection 1", parkerVMID, check, parkerVMID),
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
 			log.Err(protErr),

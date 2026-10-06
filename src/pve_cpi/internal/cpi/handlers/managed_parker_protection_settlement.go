@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -63,9 +64,20 @@ import (
 // what the CPI read instead, and the journal records it exactly as a plain
 // readback, so no release that reads the record sees anything new.
 //
-// The settler only reads. It never writes to PVE, and it runs only while the
-// caller holds the record's journal lock, so the request that planned the step
-// has finished or died.
+// The settler only reads the parker. It runs only while the caller holds the
+// record's journal lock, so the request that planned the step has finished or
+// died. Another request may still be inside a protection window on the same
+// parker for another disk, with the flag cleared on purpose, so the settler
+// reads the parker only while it holds the parker's lock, which every window
+// takes, and it takes that lock once per parker for every step on it. Its one
+// write to PVE is that lock's sentinel pool. A lock that another request holds
+// for the whole wait leaves the steps planned with a retriable refusal that
+// gives no qm set command (parkerLockBusyOr).
+//
+// The order is the journal lock first and then the parker's lock, the order
+// every disk operation that opens a window under its record already takes.
+// Nothing takes a journal lock while it holds a parker's lock, and nothing
+// calls the settler from inside a window, so the order can't invert.
 
 // The parameter kinds a protection-only configuration write records. The kind
 // carries the value written instead of a "protection" field, because the
@@ -221,11 +233,17 @@ func recordNamesParker(record aj.Record, vmid int) bool {
 // protectionSettlementGap says why settlement left a protection step planned.
 // Its text is the CPI's own, and a PVE error behind it is only ever rendered
 // through pve.DescribeAuditError. The rendered cause follows text in
-// parentheses, and after, when set, finishes the sentence behind it.
+// parentheses, and after, when set, finishes the sentence behind it. lock,
+// when set, is the failure to take the parker's lock that kept the settler
+// from reading the parker at all, and a gap that carries it is retriable
+// (parkerLockBusyOr). A lock that another request held for the whole wait is
+// said in the CPI's own words, and every other lock failure is also the
+// gap's cause, so its text renders what failed (parkerLockGap).
 type protectionSettlementGap struct {
 	text  string
 	cause error
 	after string
+	lock  error
 }
 
 func (g *protectionSettlementGap) Error() string {
@@ -235,7 +253,12 @@ func (g *protectionSettlementGap) Error() string {
 	return g.text + g.after
 }
 
-func (g *protectionSettlementGap) Unwrap() error { return g.cause }
+func (g *protectionSettlementGap) Unwrap() error {
+	if g.cause != nil {
+		return g.cause
+	}
+	return g.lock
+}
 
 // protectionSettlementText is the clause a refusal adds for a protection step
 // the settler left planned, or "" when reason is not one of its gaps.
@@ -259,44 +282,200 @@ type protectionReading struct {
 	warning string
 }
 
-// readParkerProtection decides whether a protection step's parker leaves
-// anything unprotected. It reads the parker on its recorded node first. When
-// that read answers that the VM is missing, it looks the VMID up across the
-// cluster through pve.FindVMAuthoritative and reads the config wherever the
-// VMID lives now. When the cluster proves the VMID gone, the step settles
-// only if the disk is accounted for without the parker. When the read fails
-// any other way, readPastRecordedNode decides. It returns the reading for a
-// step it settles, and a gap for every other answer. It only reads PVE and
-// takes no lock.
-func readParkerProtection(ctx context.Context, deps Deps, record aj.Record, step aj.Step) (protectionReading, error) {
-	vmid, recorded := step.Target.VMID, step.Target.Node
-	client := unguardedPVE(deps.PVE)
-	qemu := client.QEMU()
-	if qemu == nil {
-		return protectionReading{}, &protectionSettlementGap{text: fmt.Sprintf("no PVE client is available to read parker %d", vmid)}
+// settleProtectionLockPurpose names the settler in the owner of the parker
+// lock claims it takes.
+const settleProtectionLockPurpose = "settle_protection"
+
+// protectionResult is what the settler concluded for one protection step: a
+// reading for a step it settles, or the gap that keeps it planned.
+type protectionResult struct {
+	reading protectionReading
+	err     error
+}
+
+// readParkerProtection decides, for every protection step on parker vmid,
+// whether the parker leaves anything unprotected. It reads the parker only
+// while it holds the parker's lock, the one every protection window on that
+// parker takes, because a window clears the flag on purpose and a read inside
+// one would judge a parker that another request is still working on. It takes
+// the lock once for all of steps, so the journal lock its caller holds waits
+// on each parker at most once. The lock is named for the VMID alone, so it is
+// the same lock on whichever node the parker is found. It waits for the lock
+// as long as a journal-managed disk operation does (managedLockWaitContext),
+// and when the lock stays held, or can't be taken, every step stays planned
+// with a gap that says so and gives no qm set command.
+//
+// Under the lock it reads the parker on each step's recorded node first, once
+// per node. When that read answers that the VM is missing, it looks the VMID
+// up across the cluster through pve.FindVMAuthoritative and reads the config
+// wherever the VMID lives now. When the read fails any other way,
+// readPastRecordedNode decides. When the cluster proves the VMID gone, the
+// lock is released first, and the steps settle only if the disk is accounted
+// for without the parker. The results line up with steps. It writes nothing to
+// PVE but the lock's sentinel.
+func readParkerProtection(ctx context.Context, deps Deps, record aj.Record, vmid int, steps []aj.Step) []protectionResult {
+	results := make([]protectionResult, len(steps))
+	every := func(err error) []protectionResult {
+		for i := range results {
+			results[i] = protectionResult{err: err}
+		}
+		return results
 	}
-	cfg, err := qemu.Config(ctx, recorded, vmid)
+	client := unguardedPVE(deps.PVE)
+	if client.QEMU() == nil {
+		return every(&protectionSettlementGap{text: fmt.Sprintf("no PVE client is available to read parker %d", vmid)})
+	}
+	type nodeReading struct {
+		reading protectionReading
+		gone    bool
+		err     error
+	}
+	readings := map[string]nodeReading{}
+	logger := deps.Log(ctx)
+	lockErr := pve.RunUnderParkerLock(managedLockWaitContext(ctx), client, logger, vmid, settleProtectionLockPurpose,
+		func(lockedCtx context.Context) error {
+			check := pve.ParkerLockCheck(vmid, pve.ParkerLockUnserialized(lockedCtx))
+			for i := range steps {
+				node := steps[i].Target.Node
+				if _, read := readings[node]; read {
+					continue
+				}
+				reading, gone, err := readParkerUnderLock(lockedCtx, client, vmid, node, check)
+				readings[node] = nodeReading{reading: reading, gone: gone, err: err}
+			}
+			return nil
+		})
+	if lockErr != nil {
+		gap := parkerLockGap(vmid, lockErr)
+		logger.Warn("left the parker protection restore planned because "+gap.Error(),
+			log.Int("vmid", vmid),
+			log.String("lock", pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", vmid))),
+			log.Bool("held_by_another_operation", parkerLockHeld(lockErr)),
+			log.Int("steps", len(steps)),
+			log.Err(lockErr))
+		return every(gap)
+	}
+	var gone *protectionResult
+	for i := range steps {
+		read := readings[steps[i].Target.Node]
+		if !read.gone {
+			results[i] = protectionResult{reading: read.reading, err: read.err}
+			continue
+		}
+		if gone == nil {
+			// The disk's resolution reads every VM that may hold it and needs
+			// nothing from the parker, which is gone, so it runs once, after
+			// the lock is released and never inside a window's deadline.
+			reading, err := goneParkerReading(ctx, deps, record, vmid)
+			gone = &protectionResult{reading: reading, err: err}
+		}
+		results[i] = *gone
+	}
+	return results
+}
+
+// parkerLockHeld reports whether lockErr says that another request held the
+// parker's lock for the whole wait. A wait the request's deadline left no room
+// for, and an acquire that could not tell who holds the lock, say nothing of
+// the kind, even when a timeout comes with them.
+func parkerLockHeld(lockErr error) bool {
+	switch {
+	case errors.Is(lockErr, pve.ErrClusterLockNoTimeToWait),
+		errors.Is(lockErr, pve.ErrClusterLockStateUnknown),
+		errors.Is(lockErr, pve.ErrClusterLockClaimTooShort),
+		errors.Is(lockErr, pve.ErrClusterLockInterrupted):
+		return false
+	}
+	return errors.Is(lockErr, pve.ErrClusterLockTimeout)
+}
+
+// parkerLockGap is the gap for steps whose parker lock the settler could not
+// take. A lock that stayed held for the whole wait means another request is
+// inside a window on the parker, where protection is off on purpose, so the
+// gap says that operation is in progress and to retry once it ends. Every
+// other acquire failure leaves the holder unknown, so the gap says what failed
+// instead, with the lock error as its cause, and never claims that another
+// operation holds the lock. Neither reads the parker, so neither gives a qm
+// set command.
+func parkerLockGap(vmid int, lockErr error) *protectionSettlementGap {
+	lock := pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", vmid))
+	if parkerLockHeld(lockErr) {
+		return &protectionSettlementGap{
+			text:  fmt.Sprintf("another operation on parker %d is in progress and holds the parker's lock %s", vmid, lock),
+			after: "; retry once that operation finishes",
+			lock:  lockErr,
+		}
+	}
+	gap := &protectionSettlementGap{
+		text:  fmt.Sprintf("the parker's lock %s could not be taken to read parker %d, because %s", lock, vmid, parkerLockFailure(lockErr)),
+		after: "; retry",
+		lock:  lockErr,
+	}
+	if !parkerLockReasonSaysAll(lockErr) {
+		gap.cause = lockErr
+	}
+	return gap
+}
+
+// parkerLockReasonSaysAll reports whether parkerLockFailure's reason already
+// says everything about lockErr. The CPI raises these failures itself, so
+// they carry no PVE answer to render, and the audit description of such an
+// error would only say that it is unclassified.
+func parkerLockReasonSaysAll(lockErr error) bool {
+	return errors.Is(lockErr, pve.ErrClusterLockNoTimeToWait) ||
+		errors.Is(lockErr, pve.ErrClusterLockClaimTooShort) ||
+		errors.Is(lockErr, pve.ErrMutationNotAttempted)
+}
+
+// parkerLockFailure says in the CPI's own words why an acquire of the
+// parker's lock failed without showing that another request holds it. The
+// gap renders the error itself behind it.
+func parkerLockFailure(lockErr error) string {
+	switch {
+	case errors.Is(lockErr, pve.ErrClusterLockNoTimeToWait):
+		return "the request had no time left to wait for it"
+	case errors.Is(lockErr, pve.ErrClusterLockInterrupted):
+		return "the request ended while it waited for it"
+	case errors.Is(lockErr, pve.ErrClusterLockClaimTooShort):
+		return "the CPI confirmed its claim too late to use it"
+	case errors.Is(lockErr, pve.ErrClusterLockStateUnknown):
+		return "PVE never confirmed who holds it"
+	case errors.Is(lockErr, pve.ErrMutationNotAttempted):
+		return "the CPI did not send the lock's create to PVE"
+	}
+	return "its create or a read of it failed"
+}
+
+// readParkerUnderLock reads and judges the parker while the caller holds its
+// lock. gone reports that the cluster proved the VMID gone, which the caller
+// decides once the lock is released. check is the clause a refusal puts
+// before its qm set command (pve.ParkerLockCheck).
+func readParkerUnderLock(ctx context.Context, client pve.Client, vmid int, recorded, check string) (protectionReading, bool, error) {
+	cfg, err := client.QEMU().Config(ctx, recorded, vmid)
 	if err == nil {
-		return judgeParkerConfig(cfg, vmid, recorded, recorded)
+		reading, judgeErr := judgeParkerConfig(cfg, vmid, recorded, recorded, check)
+		return reading, false, judgeErr
 	}
 	if !pve.IsNotFound(err) && !pve.IsPmxcfsConfigMissing(err) {
-		return readPastRecordedNode(ctx, client, vmid, recorded, err)
+		reading, pastErr := readPastRecordedNode(ctx, client, vmid, recorded, check, err)
+		return reading, false, pastErr
 	}
 	missing := fmt.Sprintf("parker %d wasn't found on its recorded node %s, and the cluster could not be searched for it", vmid, recorded)
 	const searchRetry = "; retry once every node answers"
 	if client.Cluster() == nil {
 		// FindVMAuthoritative answers not found without a cluster service,
 		// which would read as proven absence here.
-		return protectionReading{}, &protectionSettlementGap{text: missing, after: searchRetry}
+		return protectionReading{}, false, &protectionSettlementGap{text: missing, after: searchRetry}
 	}
 	location, findErr := pve.FindVMAuthoritative(ctx, client, vmid)
 	if findErr != nil {
-		return protectionReading{}, &protectionSettlementGap{text: missing, cause: findErr, after: searchRetry}
+		return protectionReading{}, false, &protectionSettlementGap{text: missing, cause: findErr, after: searchRetry}
 	}
 	if !location.Found {
-		return goneParkerReading(ctx, deps, record, step)
+		return protectionReading{}, true, nil
 	}
-	return readListedParker(ctx, client, vmid, recorded, location.Node)
+	reading, listedErr := readListedParker(ctx, client, vmid, recorded, location.Node, check)
+	return reading, false, listedErr
 }
 
 // readPastRecordedNode decides a step whose recorded node failed the read of
@@ -311,7 +490,7 @@ func readParkerProtection(ctx context.Context, deps Deps, record aj.Record, step
 // nothing about a parker on it, so even a VMID the cluster places nowhere is
 // no proof that the parker is gone. A node removed from the cluster never
 // answers again, and the refusal stands until we resolve the record.
-func readPastRecordedNode(ctx context.Context, client pve.Client, vmid int, recorded string, readErr error) (protectionReading, error) {
+func readPastRecordedNode(ctx context.Context, client pve.Client, vmid int, recorded, check string, readErr error) (protectionReading, error) {
 	unreadable := fmt.Sprintf("the config of parker %d could not be read on its recorded node %s", vmid, recorded)
 	retry := fmt.Sprintf("; retry once node %s answers", recorded)
 	if client.Cluster() == nil {
@@ -326,14 +505,14 @@ func readPastRecordedNode(ctx context.Context, client pve.Client, vmid int, reco
 		return protectionReading{}, &protectionSettlementGap{text: unreadable, cause: readErr,
 			after: ", and the cluster places it on no other node" + retry}
 	}
-	return readListedParker(ctx, client, vmid, recorded, location.Node)
+	return readListedParker(ctx, client, vmid, recorded, location.Node, check)
 }
 
 // readListedParker reads and judges the VM at the parker's VMID on node, a
 // node other than the recorded one where the cluster places that VMID now.
 // The VM there may be the parker after a migration or a VM created later at
 // the same VMID, and the reading says only what the config shows.
-func readListedParker(ctx context.Context, client pve.Client, vmid int, recorded, node string) (protectionReading, error) {
+func readListedParker(ctx context.Context, client pve.Client, vmid int, recorded, node, check string) (protectionReading, error) {
 	cfg, err := client.QEMU().Config(ctx, node, vmid)
 	if err != nil && (pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err)) {
 		// The cluster's resource list still places the VMID on a node whose
@@ -351,7 +530,7 @@ func readListedParker(ctx context.Context, client pve.Client, vmid int, recorded
 			after: fmt.Sprintf("; bring %s back and retry. When %s has been removed from the cluster, no retry settles the step and resolving the record is up to the operator, who first checks whether the disk's volume still exists, "+parkerAnchorRunbook, node, node),
 		}
 	}
-	return judgeParkerConfig(cfg, vmid, recorded, node)
+	return judgeParkerConfig(cfg, vmid, recorded, node, check)
 }
 
 // judgeParkerConfig reads the tag and the protection flag from the config of
@@ -362,8 +541,12 @@ func readListedParker(ctx context.Context, client pve.Client, vmid int, recorded
 // tell which, so the refusal leaves that check to us. On a node other than
 // the recorded one, even a tagged VM may be a parker the CPI created later at
 // the same VMID, so the texts name the VM and its node and never say that the
-// parker moved.
-func judgeParkerConfig(cfg map[string]any, vmid int, recorded, node string) (protectionReading, error) {
+// parker moved. The caller reads cfg under the parker's lock whenever PVE
+// lets the CPI take it, so a flag that reads off is then no window of ours.
+// A request that starts after the refusal may still open one, so every text
+// that gives a qm set command puts check before it, the clause that has us
+// confirm that no CPI operation holds the parker's lock (pve.ParkerLockCheck).
+func judgeParkerConfig(cfg map[string]any, vmid int, recorded, node, check string) (protectionReading, error) {
 	tags, _ := pve.ConfigString(cfg, "tags")
 	tagged := pve.TagsMarkParker(tags)
 	protected := false
@@ -377,8 +560,8 @@ func judgeParkerConfig(cfg map[string]any, vmid int, recorded, node string) (pro
 	case !tagged:
 		return protectionReading{}, &protectionSettlementGap{text: fmt.Sprintf(
 			"VM %d on node %s no longer carries the %s tag and its protection is off; the CPI writes nothing to it, "+
-				"so check with qm config %d whether it is still the parker, put protection back with "+
-				"qm set %d --protection 1 on node %s, and retry", vmid, node, pve.ParkerTag, vmid, vmid, node)}
+				"so check with qm config %d whether it is still the parker; %sput protection back with "+
+				"qm set %d --protection 1 on node %s, and retry", vmid, node, pve.ParkerTag, vmid, check, vmid, node)}
 	case node != recorded && protected:
 		return protectionReading{warning: fmt.Sprintf(
 			"VM %d on node %s carries the %s tag and reads protected, and the parker's recorded node is %s",
@@ -386,10 +569,10 @@ func judgeParkerConfig(cfg map[string]any, vmid int, recorded, node string) (pro
 	case node != recorded:
 		return protectionReading{}, &protectionSettlementGap{text: fmt.Sprintf(
 			"VM %d on node %s carries the %s tag and its protection is off, and the parker's recorded node is %s; "+
-				"run qm set %d --protection 1 on node %s, then retry", vmid, node, pve.ParkerTag, recorded, vmid, node)}
+				"%srun qm set %d --protection 1 on node %s, then retry", vmid, node, pve.ParkerTag, recorded, check, vmid, node)}
 	case !protected:
 		return protectionReading{}, &protectionSettlementGap{text: fmt.Sprintf(
-			"protection is off on parker %d; run qm set %d --protection 1 on node %s, then retry", vmid, vmid, node)}
+			"protection is off on parker %d; %srun qm set %d --protection 1 on node %s, then retry", vmid, check, vmid, node)}
 	}
 	return protectionReading{}, nil
 }
@@ -409,8 +592,7 @@ func judgeParkerConfig(cfg map[string]any, vmid int, recorded, node string) (pro
 // The resolution runs marked as a resume, so a disk whose transfer would need
 // finishing is refused instead of resumed, and the settler still writes
 // nothing to PVE.
-func goneParkerReading(ctx context.Context, deps Deps, record aj.Record, step aj.Step) (protectionReading, error) {
-	vmid := step.Target.VMID
+func goneParkerReading(ctx context.Context, deps Deps, record aj.Record, vmid int) (protectionReading, error) {
 	gone := fmt.Sprintf("parker %d is gone from the cluster", vmid)
 	const mayHaveTaken = ", so the parker may have taken the disk with it; check that the volume still exists before anything else, and " + parkerAnchorRunbook
 	if record.Kind != allocationKindDisk || record.CID == "" {
@@ -501,7 +683,10 @@ func parkerProtectionKind(raw json.RawMessage) string {
 // the disk volume it names, and the record's own state is left alone. A step
 // settled on anything but a tagged, protected parker on its recorded node logs
 // a warning that says what the CPI read instead, and the journal records
-// nothing more than a plain readback would.
+// nothing more than a plain readback would. The steps are grouped by parker,
+// in the order the record first names each one, and every step on a parker is
+// settled under one acquire of that parker's lock, so a record that a run of
+// cut-off restore tries left with several steps waits on each parker once.
 func settlePlannedProtectionSteps(ctx context.Context, deps Deps, handle *aj.Handle, reasons map[string]error, err error) (map[string]error, error) {
 	if err != nil || handle == nil {
 		return reasons, err
@@ -516,32 +701,49 @@ func settlePlannedProtectionSteps(ctx context.Context, deps Deps, handle *aj.Han
 		}
 		reasons[id] = reason
 	}
-	var settled []aj.Step
-	var warnings []string
+	var parkers []int
+	byParker := map[int][]int{}
 	for i := range record.Steps {
 		step := &record.Steps[i]
 		if !IsParkerProtectionStep(record, *step) {
 			continue
 		}
-		if !recordNamesParker(record, step.Target.VMID) {
-			gap(step.ID, &protectionSettlementGap{text: fmt.Sprintf("the record names no parker at VM %d", step.Target.VMID)})
+		vmid := step.Target.VMID
+		if !recordNamesParker(record, vmid) {
+			gap(step.ID, &protectionSettlementGap{text: fmt.Sprintf("the record names no parker at VM %d", vmid)})
 			continue
 		}
 		if deps.PVE == nil {
-			gap(step.ID, &protectionSettlementGap{text: fmt.Sprintf("no PVE client is available to read parker %d", step.Target.VMID)})
+			gap(step.ID, &protectionSettlementGap{text: fmt.Sprintf("no PVE client is available to read parker %d", vmid)})
 			continue
 		}
-		reading, readErr := readParkerProtection(ctx, deps, record, *step)
-		if readErr != nil {
-			gap(step.ID, readErr)
-			continue
+		if _, named := byParker[vmid]; !named {
+			parkers = append(parkers, vmid)
 		}
-		step.State = aj.Observed
-		if step.Target.IntendedVolume != "" && !containsString(step.VolIDs, step.Target.IntendedVolume) {
-			step.VolIDs = append(step.VolIDs, step.Target.IntendedVolume)
+		byParker[vmid] = append(byParker[vmid], i)
+	}
+	var settled []aj.Step
+	var warnings []string
+	for _, vmid := range parkers {
+		indexes := byParker[vmid]
+		steps := make([]aj.Step, len(indexes))
+		for j, i := range indexes {
+			steps[j] = record.Steps[i]
 		}
-		settled = append(settled, *step)
-		warnings = append(warnings, reading.warning)
+		results := readParkerProtection(ctx, deps, record, vmid, steps)
+		for j, i := range indexes {
+			step := &record.Steps[i]
+			if results[j].err != nil {
+				gap(step.ID, results[j].err)
+				continue
+			}
+			step.State = aj.Observed
+			if step.Target.IntendedVolume != "" && !containsString(step.VolIDs, step.Target.IntendedVolume) {
+				step.VolIDs = append(step.VolIDs, step.Target.IntendedVolume)
+			}
+			settled = append(settled, *step)
+			warnings = append(warnings, results[j].reading.warning)
+		}
 	}
 	if len(settled) > 0 {
 		if saveErr := handle.Save(record); saveErr != nil {
@@ -560,6 +762,38 @@ func settlePlannedProtectionSteps(ctx context.Context, deps Deps, handle *aj.Han
 			log.String("recorded_node", step.Target.Node))
 	}
 	return reasons, nil
+}
+
+// parkerLockBusyOr returns refusal as a retriable error when every unsettled
+// step of record's active attempt is a protection-only write the settler left
+// planned because it could not take the parker's lock, and refusal unchanged
+// otherwise. Nothing was read, so nothing is in doubt but timing, and the
+// Director's retry settles the step once the lock is free. The wrapper says
+// that another operation is in progress only when every one of those gaps is
+// a lock that another request held for the whole wait, and otherwise says
+// only that the lock could not be taken. The refusal's own type stays in the
+// chain, so a caller that tells refusals apart by type still finds it.
+func parkerLockBusyOr(record aj.Record, gaps map[string]error, refusal error) error {
+	busy, held := false, true
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Attempt != record.ActiveAttempt() || step.State == aj.Observed {
+			continue
+		}
+		var gap *protectionSettlementGap
+		if !IsParkerProtectionStep(record, *step) || !errors.As(gaps[step.ID], &gap) || gap.lock == nil {
+			return refusal
+		}
+		busy = true
+		held = held && parkerLockHeld(gap.lock)
+	}
+	if !busy {
+		return refusal
+	}
+	if !held {
+		return cpierrors.WrapAs(refusal, cpierrors.TypeRetriableCloud, "the parker's lock could not be taken, so retry")
+	}
+	return cpierrors.WrapAs(refusal, cpierrors.TypeRetriableCloud, "another operation on the parker is in progress, so retry")
 }
 
 // protectionPendingRefusal is a readmission refusal whose only cause is a

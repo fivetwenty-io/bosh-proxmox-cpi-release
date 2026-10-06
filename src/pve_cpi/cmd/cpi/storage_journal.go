@@ -623,35 +623,59 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 	return 0
 }
 
-// storageJournalBaseBudget bounds an action that never waits on a parker's
-// protection lock. It covers node enumeration, the cluster identity read, the
-// historical audit, and the journal writes around them.
+// storageJournalBaseBudget bounds the work every action does besides waiting
+// on a parker's protection lock. It covers node enumeration, the cluster
+// identity read, the historical audit, and the journal writes around them.
+// Actions that never take a parker's lock run under it alone.
 const storageJournalBaseBudget = 2 * time.Minute
 
-// storageJournalCleanupBudget bounds cleanup, the one action that can take a
-// parker's protection lock, which it does when it preserves or deletes a
-// parked disk. On top of the base budget it covers one full wait for another
-// request's window (pve.ParkerProtectionLockTTLNow), the margin a lock wait
-// leaves before its request's deadline for the sentinel's release and the
-// caller's completion (pve.ClusterLockContextMargin), and the window cleanup
-// then runs itself, which fits inside its own claim's TTL together with its
-// protection restore, its sweep, and its release. The TTL follows the retry
-// curves the CLI applied from its config. A cleanup that meets a second
-// contended window in the same run has that wait end cleanly before the
-// deadline, and we rerun it.
-func storageJournalCleanupBudget() time.Duration {
-	ttl := pve.ParkerProtectionLockTTLNow()
-	return storageJournalBaseBudget + ttl + pve.ClusterLockContextMargin + ttl
+// storageJournalSettleWait is the time an action that settles a record's
+// planned steps sets aside for the settler. The settler reads a parker whose
+// protection restore was cut off only while it holds that parker's lock, so
+// it can wait one full holder out (pve.ParkerProtectionLockTTLNow) and then
+// needs the margin a lock wait leaves before its request's deadline for the
+// read, the sentinel's release, and the caller's completion
+// (pve.ClusterLockContextMargin). The settler takes each parker's lock once,
+// and a record's steps almost always name one parker. A record whose steps
+// name a second contended parker has that second wait end cleanly before the
+// deadline, with the retry text, and we rerun the action.
+func storageJournalSettleWait() time.Duration {
+	return pve.ParkerProtectionLockTTLNow() + pve.ClusterLockContextMargin
 }
 
-// storageJournalActionCleanup names the one action that can take a parker's
-// protection lock.
+// storageJournalSettlingBudget bounds adopt and finalize-cleanup, which take
+// a parker's protection lock only to settle a record's planned protection
+// steps. On top of the base budget it covers that settle (storageJournalSettleWait).
+func storageJournalSettlingBudget() time.Duration {
+	return storageJournalBaseBudget + storageJournalSettleWait()
+}
+
+// storageJournalCleanupBudget bounds cleanup, the one action that can take a
+// parker's protection lock twice. It settles the record's planned steps first
+// (storageJournalSettleWait), and then, when it preserves or deletes a parked
+// disk, it waits once more for another request's window
+// (pve.ParkerProtectionLockTTLNow) with the margin that wait leaves
+// (pve.ClusterLockContextMargin), and runs its own window, which fits inside
+// its own claim's TTL together with its protection restore, its sweep, and its
+// release. The TTL follows the retry curves the CLI applied from its config. A
+// cleanup that meets a second contended window in the same run has that wait
+// end cleanly before the deadline, and we rerun it.
+func storageJournalCleanupBudget() time.Duration {
+	ttl := pve.ParkerProtectionLockTTLNow()
+	return storageJournalBaseBudget + storageJournalSettleWait() + ttl + pve.ClusterLockContextMargin + ttl
+}
+
+// storageJournalActionCleanup names the action that can take a parker's
+// protection lock twice, once to settle and once for its own window.
 const storageJournalActionCleanup = "cleanup"
 
 // storageJournalBudget is the time an action runs under.
 func storageJournalBudget(action string) time.Duration {
-	if action == storageJournalActionCleanup {
+	switch action {
+	case storageJournalActionCleanup:
 		return storageJournalCleanupBudget()
+	case "adopt", "finalize-cleanup":
+		return storageJournalSettlingBudget()
 	}
 	return storageJournalBaseBudget
 }

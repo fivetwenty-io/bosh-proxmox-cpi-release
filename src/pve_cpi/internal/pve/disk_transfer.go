@@ -928,7 +928,7 @@ func transferIntoParkerLocked(
 			return "", cpierrors.Cloud("managed transfer provenance readback requires reconciliation")
 		}
 	}
-	reassertParkerProtection(ctx, c, logger, node, parkerVMID)
+	reassertParkerProtection(ctx, c, logger, node, parkerVMID, parkerWindowLockCheck(ctx, parkerVMID))
 	if logger != nil {
 		logger.Info("transfer in: disk reassigned from VM to parker",
 			log.Int("source_vmid", srcVMID),
@@ -1669,7 +1669,7 @@ func finalizeResumedTransfer(
 			logger.Warn("transfer resume: could not finalize legacy provenance", log.Err(provErr))
 		}
 	}
-	reassertParkerProtection(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID)
+	reassertParkerProtection(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, parkerWindowLockCheck(ctx, intent.ParkerVMID))
 	if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
 		return VerifyAllocationParked(ctx, c, logger, landed, stableID, pctx.AllocationNamespace, pctx.AllocationID, cfg)
 	}
@@ -1984,6 +1984,20 @@ func protectionRestoreEnding(protErr error, timedOut bool, timeout time.Duration
 	}
 }
 
+// parkerWindowLockCheck is the lock clause for a restore message about a
+// parker whose protection window ran under ctx (ParkerLockCheck).
+func parkerWindowLockCheck(ctx context.Context, parkerVMID int) string {
+	return ParkerLockCheck(parkerVMID, parkerLockUnserialized(ctx))
+}
+
+// moverLockCheck is the lock clause for a restore message about a migration
+// mover. The migration never takes the mover's lock, so the lock's pool
+// proves nothing about it, and an attach_disk that a rerun starts clears the
+// mover's protection without that lock, as does a delete_disk of the disk.
+// What can have the protection off on purpose is a running attach_disk or
+// delete_disk, so the clause has us look for one.
+const moverLockCheck = "only when bosh tasks lists no running attach_disk or delete_disk task for the disk, "
+
 // restoreParkerProtectionLogged puts protection back on a parker, or on a
 // mover, for a window whose contract is to log a failed restore rather than
 // return it: the unpark, its sweep of a demoted reference, the park path's
@@ -1999,15 +2013,15 @@ func protectionRestoreEnding(protErr error, timedOut bool, timeout time.Duration
 // finish. In a journal-managed request, a cut-off write leaves its step
 // planned, and so does a restore whose checks did not finish, so the
 // operation's record still says the restore is unsettled.
-func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int) {
+func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Logger, op, node string, parkerVMID int, check string) {
 	timedOut, protErr := putParkerProtectionBack(ctx, c, logger, node, parkerVMID)
 	if protErr == nil || logger == nil {
 		return
 	}
 	timeout := parkerRestoreTimeout(ctx)
 	if ending := protectionRestoreEnding(protErr, timedOut, timeout); ending != "" {
-		logger.Warn(op+": protection restore on parker "+ending+"; check the parker with qm config <vmid> "+
-			"and run qm set <vmid> --protection 1 if protection is off",
+		logger.Warn(fmt.Sprintf("%s: protection restore on parker %s; check the parker with qm config %d, and if protection is off, %srun qm set %d --protection 1",
+			op, ending, parkerVMID, check, parkerVMID),
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
 			log.String("timeout", timeout.String()),
@@ -2015,7 +2029,8 @@ func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Lo
 		)
 		return
 	}
-	logger.Warn(op+": could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+	logger.Warn(fmt.Sprintf("%s: could not restore protection on parker %d; %srun qm set %d --protection 1",
+		op, parkerVMID, check, parkerVMID),
 		log.Int("parker_vmid", parkerVMID),
 		log.String("node", node),
 		log.Err(protErr),
@@ -2089,11 +2104,12 @@ func restoreParkerProtection(ctx context.Context, c Client, logger *log.Logger, 
 		}
 		return &ProtectionRestoreCutOffError{ParkerVMID: parkerVMID, err: cpierrors.WrapAs(protErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"%s: protection restore on parker vmid %d %s; %s; "+
-				"check the parker with qm config %d and run qm set %d --protection 1 if protection is off",
-			op, parkerVMID, ending, work, parkerVMID, parkerVMID))}
+				"check the parker with qm config %d, and if protection is off, %srun qm set %d --protection 1",
+			op, parkerVMID, ending, work, parkerVMID, ParkerLockCheck(parkerVMID, parkerLockUnserialized(ctx)), parkerVMID))}
 	}
 	if logger != nil {
-		logger.Warn(op+": could not restore protection on parker — re-set it by hand (qm set <vmid> --protection 1)",
+		logger.Warn(fmt.Sprintf("%s: could not restore protection on parker %d; %srun qm set %d --protection 1",
+			op, parkerVMID, ParkerLockCheck(parkerVMID, parkerLockUnserialized(ctx)), parkerVMID),
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
 			log.Err(protErr),
