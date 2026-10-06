@@ -348,6 +348,22 @@ func decisionCause(err error) error {
 	return nil
 }
 
+// restoreTimeout is the deadline the case gives the protection restore. The
+// restore's deadline runs on the real clock from the moment the restore
+// starts, and the reads and writes before the one the case breaks must finish
+// inside it, so a deadline a loaded machine can overrun fails the case before
+// it reaches the read it means to break. A case whose read fails at once never
+// waits for the deadline, so it gets one long enough that nothing in a test
+// run reaches it. A case that hangs does wait for it, because the restore has
+// no clock a test can advance, so it gets the shortest deadline that a loaded
+// machine still meets.
+func (a admissionCase) restoreTimeout() time.Duration {
+	if a.answer == admissionHangs {
+		return time.Second
+	}
+	return 30 * time.Second
+}
+
 // admissionCutOffCases are the cases whose restore must be left planned: each
 // read hung until the restore deadline, each read failing at once with a PVE
 // 500, and the control that hangs the restore write itself.
@@ -372,11 +388,10 @@ var admissionCutOffCases = []admissionCase{
 // that the next call reads the parker back before it takes the disk.
 func TestManagedAttachRestoreAdmissionReadCutOff(t *testing.T) {
 	t.Parallel()
-	const timeout = 200 * time.Millisecond
 	for _, a := range admissionCutOffCases {
 		t.Run(a.String(), func(t *testing.T) {
 			t.Parallel()
-			c := newAdmissionCutOff(t, a, timeout)
+			c := newAdmissionCutOff(t, a, a.restoreTimeout())
 			msg := c.firstCallMessage(t)
 			if c.attachErr == nil {
 				t.Fatal("attach_disk succeeded although the parker's protection was never put back")
@@ -399,7 +414,7 @@ func TestManagedAttachRestoreAdmissionAnswerDisagrees(t *testing.T) {
 		a := admissionCase{read, admissionDisagrees}
 		t.Run(a.String(), func(t *testing.T) {
 			t.Parallel()
-			c := newAdmissionCutOff(t, a, 200*time.Millisecond)
+			c := newAdmissionCutOff(t, a, a.restoreTimeout())
 			msg := c.firstCallMessage(t)
 			if c.attachErr == nil {
 				t.Fatal("attach_disk succeeded although the restore's admission found the record contradicted")
@@ -532,7 +547,7 @@ func TestRestoreAdmissionCutOffNextCalls(t *testing.T) {
 
 func runAdmissionProbe(t *testing.T, a admissionCase, protected bool, p admissionProbe) {
 	t.Helper()
-	c := newAdmissionCutOff(t, a, 200*time.Millisecond)
+	c := newAdmissionCutOff(t, a, a.restoreTimeout())
 	step, planned := c.plannedRestore(t)
 	c.setProtection(protected)
 	c.hung.forgetParkerWrites()
