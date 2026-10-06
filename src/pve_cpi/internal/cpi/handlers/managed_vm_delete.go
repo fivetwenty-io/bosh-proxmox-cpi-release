@@ -517,8 +517,15 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 // pending drive replacement and refuse before it changes anything. That
 // refusal is handed back the same way only when it is the whole failure and
 // nothing has already marked the record for reconciliation, which a
-// preservation does when it joins the refusal with its own uncertainty.
-// Anything else requires reconciliation.
+// preservation does when it joins the refusal with its own uncertainty. The
+// same holds for the refusals a preservation returns before it changes a
+// disk, whether its holder lacks the disk's provenance entry or a parker
+// protection write of its record waits to be settled (see
+// isWholePreservationRefusal). Each of those keeps its own CPI type, so one
+// that a retry can repair is retriable, and one that needs an operator says
+// so. Anything else requires reconciliation. A preservation refusal handed
+// back this way leaves the VM's record observed, so it saves a reason on the
+// record that names the refusal (see noteVMCleanupRefusal).
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
@@ -529,7 +536,50 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if isWholePendingDriveReplacementRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
 		return err
 	}
+	if isWholePreservationRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
+		return noteVMCleanupRefusal(handle, err)
+	}
 	return joinReconciliation(err, storageAllocationUncertain(handle, "VM cleanup"))
+}
+
+// noteVMCleanupRefusal saves a reason on an observed VM record whose cleanup
+// a preservation refusal stopped, so the journal audit's summary line says
+// why the record is still listed. The state stays as it is, and the next
+// disposal clears the reason when it admits the record again. It returns err
+// unchanged in every case. A failed save leaves the record as it was, with
+// an empty reason, which costs the summary its explanation and nothing else,
+// so the refusal still goes back to the caller as it is.
+func noteVMCleanupRefusal(handle *aj.Handle, err error) error {
+	record := handle.Record()
+	if record.State != aj.Observed {
+		return err
+	}
+	record.Reason = vmCleanupRefusalReason(err)
+	_ = handle.Save(record) //nolint:errcheck // The reason only explains the record, and the refusal is the answer either way.
+	return err
+}
+
+// vmCleanupRefusalReason is the reason noteVMCleanupRefusal saves. It says
+// that the VM's disks stayed where they were, names the refusal, and says
+// what clears it.
+func vmCleanupRefusalReason(err error) string {
+	cause := "a persistent disk's preservation refused before it changed the disk"
+	var holder *holderNotRecorded
+	var unread *journalDiskCIDUnread
+	var pending *protectionPendingRefusal
+	switch {
+	case errors.As(err, &holder) && holder.cause != "":
+		cause = holder.cause
+	case errors.As(err, &unread):
+		cause = "the allocation journal couldn't be read to find a persistent disk's CID"
+	case errors.As(err, &pending):
+		cause = "a parker protection write in a persistent disk's allocation record waits for the parker's lock or for the parker to read back protected"
+	}
+	next := "the next delete_vm or storage-journal cleanup of this record resumes it"
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		next = "clear the cause as the error says, and then rerun delete_vm or storage-journal cleanup of this record"
+	}
+	return "VM cleanup left the VM's persistent disks in place because " + cause + "; " + next
 }
 
 // joinReconciliation joins the reconciliation error onto a failure that left

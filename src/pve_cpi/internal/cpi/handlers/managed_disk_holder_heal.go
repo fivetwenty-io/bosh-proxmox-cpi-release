@@ -61,9 +61,15 @@ func holderHealFor(ctx context.Context) holderHeal {
 
 // holderNotRecorded is the identity check's refusal for a renamed managed
 // disk whose holder carries no provenance entry for it, when the check
-// doesn't write the entry. Its text and CPI type are the retriable error it
-// carries.
-type holderNotRecorded struct{ err error }
+// doesn't write the entry. Its text and CPI type are the error it carries,
+// which is retriable unless a step of the disk's record that no readback
+// settles holds the heal back (see unsettledStepHolderRefusal). Its cause
+// says in a few words which disk lacks its entry and what holds the heal
+// back, for the reason a refused VM cleanup saves on the VM's record.
+type holderNotRecorded struct {
+	err   error
+	cause string
+}
 
 func (e *holderNotRecorded) Error() string { return e.err.Error() }
 func (e *holderNotRecorded) Unwrap() error { return e.err }
@@ -77,8 +83,35 @@ func isHolderNotRecorded(err error) bool {
 // holderNotRecordedRefusal builds that refusal for rd, with reason added after
 // the missing entry when the heal itself refused to write.
 func holderNotRecordedRefusal(rd resolvedDisk, reason string) error {
-	return &holderNotRecorded{err: cpierrors.Retriable("managed disk %s is attached to VM %d as %s without its provenance entry%s; retry the operation, and the next call that changes the disk, such as attach_disk or detach_disk, checks the disk again under its allocation lock and writes the entry",
-		rd.diskCID, rd.holder.VMID, rd.volid, reason)}
+	return &holderNotRecorded{
+		err: cpierrors.Retriable("managed disk %s is attached to VM %d as %s without its provenance entry%s; retry the operation, and the next call that changes the disk, such as attach_disk, detach_disk, or delete_vm, checks the disk again under its allocation lock and writes the entry",
+			rd.diskCID, rd.holder.VMID, rd.volid, reason),
+		cause: fmt.Sprintf("persistent disk %s lacks its provenance entry on VM %d%s", rd.volid, rd.holder.VMID, reason),
+	}
+}
+
+// unsettledStepRunbook is the guide section an unsettled step's heal refusal
+// points to.
+const unsettledStepRunbook = `see "Choose the command for the record" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// unsettledStepHolderRefusal is the heal's refusal under the allocation lock
+// when step of the disk's record isn't settled. acquireManagedDiskLifecycle
+// runs every readback settler before it takes this answer, so step is one no
+// readback settles, and no retry changes that. The error is therefore not
+// retriable, and it sends the operator to the investigation such a step needs
+// instead of telling the Director to retry.
+func unsettledStepHolderRefusal(rd resolvedDisk, step aj.Step) error {
+	return &holderNotRecorded{
+		err: cpierrors.Cloud("managed disk %s is attached to VM %d as %s without its provenance entry, and %s in the disk's allocation record, which no readback settles, so the CPI won't write the entry; investigate the step and settle the record (%s), and then rerun the operation, which writes the entry under the disk's allocation lock",
+			rd.diskCID, rd.holder.VMID, rd.volid, unsettledStepName(step), unsettledStepRunbook),
+		cause: fmt.Sprintf("persistent disk %s lacks its provenance entry on VM %d, and %s in the disk's allocation record, which no readback settles", rd.volid, rd.holder.VMID, unsettledStepName(step)),
+	}
+}
+
+// transferInFlightReason is the reason holderNotRecordedRefusal adds when a
+// transfer of the disk to a parker is still in flight.
+func transferInFlightReason(intent *pve.DiskTransferIntent) string {
+	return fmt.Sprintf(", and a transfer of the disk to parker %d is still in flight", intent.ParkerVMID)
 }
 
 // healUnrecordedHolder handles a managed disk whose volume was renamed onto
@@ -118,10 +151,13 @@ func holderNotRecordedRefusal(rd resolvedDisk, reason string) error {
 // with the client the lifecycle resolves with. Even there it writes nothing
 // while a step of the record isn't settled or a transfer of the disk to a
 // parker is in flight, because either one leaves the disk's name open to
-// change. It returns holderNotRecordedRefusal instead, which is retriable.
-// Before acquireManagedDiskLifecycle takes that answer, it settles by readback
-// the steps a readback can settle and resolves the disk once more, so only a
-// step that stays unsettled holds the heal back.
+// change. It returns a holderNotRecorded refusal instead. Before
+// acquireManagedDiskLifecycle takes that answer, it settles by readback the
+// steps a readback can settle and resolves the disk once more, so only a step
+// that no readback settles holds the heal back, and the refusal for it is not
+// retriable (see unsettledStepHolderRefusal). A step that a settler left
+// planned never reaches the heal, because the settler's own refusal comes
+// first.
 // The parker's leftover entry is left for the parker sweeps, as it was before
 // the entry went missing.
 func healUnrecordedHolder(ctx context.Context, deps Deps, rd resolvedDisk, record aj.Record, shared bool, provenance pve.DiskAllocationProvenance, cfg map[string]any) error {
@@ -129,10 +165,10 @@ func healUnrecordedHolder(ctx context.Context, deps Deps, rd resolvedDisk, recor
 		return cpierrors.Cloud("%s, because the disk has no holder with a stable identity to check", renamedHolderAudit)
 	}
 	if rd.intent != nil {
-		return holderNotRecordedRefusal(rd, fmt.Sprintf(", and a transfer of the disk to parker %d is still in flight", rd.intent.ParkerVMID))
+		return holderNotRecordedRefusal(rd, transferInFlightReason(rd.intent))
 	}
 	if step, ok := unsettledRecordStep(record); ok {
-		return holderNotRecordedRefusal(rd, ", and "+unsettledStepName(step)+" in the disk's record")
+		return unsettledStepHolderRefusal(rd, step)
 	}
 	holder := *rd.holder
 	if holder.IsParker || pve.TagsMarkParker(holder.Tags) {

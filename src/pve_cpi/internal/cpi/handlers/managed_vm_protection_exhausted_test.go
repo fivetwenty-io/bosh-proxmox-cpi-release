@@ -102,9 +102,10 @@ func TestExhaustedTriesRecoverWithPlainCleanup(t *testing.T) {
 	if flow.fingerprints(t, flow.parked.id)[0] != diskBefore {
 		t.Fatal("the refused cleanup changed the disk's record")
 	}
-	// The VM record keeps every step it had and gains none. The cleanup's
-	// own admission still marks it as needing reconciliation, which the
-	// cleanup below then closes.
+	// The VM record keeps every step it had and gains none, and it stays
+	// observed, with a reason that names the protection write. The refusal
+	// came before the cleanup changed anything, so nothing needs
+	// reconciling, and the cleanup below runs on the record as it is.
 	kept := flow.generation(t)
 	vmStepsAfter, err := aj.Fingerprint(kept.Steps)
 	if err != nil {
@@ -113,8 +114,11 @@ func TestExhaustedTriesRecoverWithPlainCleanup(t *testing.T) {
 	if vmStepsAfter != vmStepsBefore {
 		t.Fatalf("the refused cleanup changed the VM record's steps: %d before, %d after", len(generation.Steps), len(kept.Steps))
 	}
-	if kept.State != aj.ReconciliationRequired {
-		t.Fatalf("the VM record after the refused cleanup is %s (reason %q), want %s", kept.State, kept.Reason, aj.ReconciliationRequired)
+	if kept.State != aj.Observed {
+		t.Fatalf("the VM record after the refused cleanup is %s (reason %q), want %s", kept.State, kept.Reason, aj.Observed)
+	}
+	if !strings.Contains(kept.Reason, "a parker protection write") {
+		t.Fatalf("the VM record after the refused cleanup has reason %q, want it to name the protection write", kept.Reason)
 	}
 
 	flow.setParkerProtection(true)
