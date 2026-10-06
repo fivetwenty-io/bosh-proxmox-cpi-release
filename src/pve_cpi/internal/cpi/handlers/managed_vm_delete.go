@@ -72,7 +72,7 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	if record.Kind != "vm" {
 		return proof, storageRefusal("VM cleanup requires a VM allocation")
 	}
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return proof, err
 	}
@@ -400,7 +400,7 @@ func managedVMVerifyCleanupVolume(ctx context.Context, deps Deps, target aj.Targ
 }
 
 func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle) (proof aj.Verification, retErr error) {
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return proof, err
 	}

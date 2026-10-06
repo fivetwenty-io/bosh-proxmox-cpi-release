@@ -58,7 +58,7 @@ func TestStorageAllocationDecisionFailureNamesRefusedSettlementSteps(t *testing.
 		if err := handle.Close(); err != nil {
 			t.Fatal(err)
 		}
-		_, err = settlePlannedLockSteps(t.Context(), deps.PVE, handle)
+		_, err = settlePlannedLockSteps(t.Context(), deps, handle)
 		want := "identity_or_audit_evidence: the journal refused to save the lock settlement of step " + step +
 			" (lifecycle_attach_disk_Pool_CreatePool): journal allocation handle is closed"
 		if got := StorageAllocationDecisionFailure(storageDecisionSourceError(err)); got != want {
@@ -125,7 +125,7 @@ func TestRefusedProtectionSettlementNamesItsSteps(t *testing.T) {
 	if err := handle.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = settlePlannedLockSteps(c.ctx, c.deps.PVE, handle)
+	_, err = settlePlannedLockSteps(c.ctx, c.deps, handle)
 	if !errors.Is(err, aj.ErrClosed) || !strings.Contains(err.Error(), "settling parker protection step "+step.ID+" (lifecycle_attach_disk_Nodes_UpdateQemuConfig)") {
 		t.Fatalf("the refused protection settlement did not name its step: %v", err)
 	}

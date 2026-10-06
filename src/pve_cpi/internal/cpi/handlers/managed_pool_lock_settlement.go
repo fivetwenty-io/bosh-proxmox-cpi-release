@@ -153,9 +153,10 @@ func readLockSentinel(ctx context.Context, pools pve.PoolService, sentinel strin
 // exactly. It returns, per step it left planned, the reason it did. A settled
 // step is recorded as the guard records one: observed, with the disk volume a
 // lifecycle step names, and without touching the record's own state.
-func settlePlannedLockSteps(ctx context.Context, client pve.Client, handle *aj.Handle) (gaps map[string]error, settleErr error) {
+func settlePlannedLockSteps(ctx context.Context, deps Deps, handle *aj.Handle) (gaps map[string]error, settleErr error) {
+	client := deps.PVE
 	defer func() {
-		gaps, settleErr = settlePlannedProtectionSteps(ctx, client, handle, gaps, settleErr)
+		gaps, settleErr = settlePlannedProtectionSteps(ctx, deps, handle, gaps, settleErr)
 		gaps, settleErr = settlePlannedMoveSteps(ctx, client, handle, gaps, settleErr)
 	}()
 	if handle == nil {

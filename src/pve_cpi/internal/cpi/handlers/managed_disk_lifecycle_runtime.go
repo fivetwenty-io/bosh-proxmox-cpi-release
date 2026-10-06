@@ -78,7 +78,7 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 	// A lock step an earlier request left planned is settled by readback
 	// before readmission judges the record, so a retry is not refused for a
 	// sentinel that never held anything of ours.
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return fail(err)
 	}
@@ -254,7 +254,7 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 	// landed on a retry leaves the first attempt's step planned. Settle such
 	// steps by reading the parker back before completion judges the record,
 	// through the same settler every readmission runs.
-	gaps, err := settlePlannedProtectionSteps(ctx, m.deps.PVE, m.handle, nil, nil)
+	gaps, err := settlePlannedProtectionSteps(ctx, m.deps, m.handle, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -495,7 +495,7 @@ func finalizeAbsentManagedDisk(ctx context.Context, deps Deps, rd resolvedDisk) 
 	// by readback, a lock sentinel or a parker's protection, are settled first,
 	// exactly as a readmission settles them; unknown prior tasks still block
 	// finalization.
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return errors.Join(err, handle.Close(), journal.Close())
 	}

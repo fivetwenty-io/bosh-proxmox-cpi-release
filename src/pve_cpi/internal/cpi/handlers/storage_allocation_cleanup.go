@@ -57,7 +57,7 @@ func CleanupStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 		return result, storageRefusal("allocation already has a terminal disposition")
 	}
 	phase = "lock_step_settlement"
-	gaps, err := settlePlannedLockSteps(ctx, deps.PVE, handle)
+	gaps, err := settlePlannedLockSteps(ctx, deps, handle)
 	if err != nil {
 		return result, storageDecisionSourceError(err)
 	}
