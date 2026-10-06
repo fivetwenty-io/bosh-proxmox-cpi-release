@@ -523,15 +523,25 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 // protection write of its record waits to be settled (see
 // isWholePreservationRefusal). Each of those keeps its own CPI type, so one
 // that a retry can repair is retriable, and one that needs an operator says
-// so. Anything else requires reconciliation. A preservation refusal handed
-// back this way leaves the VM's record observed, so it saves a reason on the
-// record that names the refusal (see noteVMCleanupRefusal).
+// so. A preservation refusal handed back this way leaves the VM's record
+// observed, so it saves a reason on the record that names the refusal (see
+// noteVMCleanupRefusal). A failed storage content listing is handed back the
+// same way, with an error that names the storage, when it is the whole
+// failure and every step this cleanup wrote is observed. Anything else
+// requires reconciliation.
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
 	}
 	if isDiskReturnedAfterLockTimeout(err) && storageLifecycleSettled(handle.Record()) == nil {
 		return err
+	}
+	// A storage content listing that failed, after its bounded re-reads, stopped
+	// the cleanup before its next change. When it is the whole failure and
+	// every step this cleanup wrote is observed, the record stays as it is and a
+	// rerun of the delete resumes the disposal once the storage lists.
+	if storage, node, reason, ok := wholeStorageListingFailure(err); ok && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
+		return storageListingStoppedDelete(storage, node, reason)
 	}
 	if isWholePendingDriveReplacementRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
 		return err
@@ -642,7 +652,7 @@ func managedVMRollbackFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
 	}
-	return joinReconciliation(err, storageAllocationUncertain(handle, "VM create rollback"))
+	return joinReconciliation(describeStorageListingFailure(err), storageAllocationUncertain(handle, "VM create rollback"))
 }
 
 func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, record aj.Record, node string, vmid int, owned map[string]bool, retain, moved bool) ([]aj.Target, error) {

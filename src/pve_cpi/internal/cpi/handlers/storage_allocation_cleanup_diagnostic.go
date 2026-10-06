@@ -77,7 +77,8 @@ const storageLockClaimReturned = "a parker lock was not taken before the disk mo
 // journal's host, is this function's only production caller. A fixed refusal
 // in storageFixedRefusals contributes its own text, and so does a parker lock
 // wait that ran out or a parker lock claim that was refused before the disk
-// moved. Anything else is described by
+// moved, and a storage content listing that failed alone names its storage,
+// node, and reason. Anything else is described by
 // pve.DescribeAuditError, so backend response text, credentials, and resource
 // payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
@@ -106,6 +107,10 @@ func StorageAllocationDecisionFailure(err error) string {
 		if errors.Is(err, fixed) {
 			return class + ": " + fixed.Error()
 		}
+	}
+	var listingStop *storageListingStop
+	if errors.As(err, &listingStop) {
+		return class + ": " + log.ScrubMessage(fmt.Sprintf("could not list storage %s on node %s (%s) and stopped before its next change, with every step it took recorded; run cleanup again once that storage lists", listingStop.storage, listingStop.node, listingStop.reason))
 	}
 	if isDiskReturnedAfterLockTimeout(err) {
 		if errors.Is(err, pve.ErrClusterLockClaimTooShort) {

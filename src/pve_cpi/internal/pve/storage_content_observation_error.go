@@ -10,10 +10,14 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
-// storageContentObservationError retains only a bounded diagnostic category.
-// Backend messages, endpoint URLs, and response bodies must not reach logs.
+// storageContentObservationError retains only a bounded diagnostic category,
+// with the storage it listed and the node it asked when the listing knows
+// them. Backend messages, endpoint URLs, and response bodies must not reach
+// logs.
 type storageContentObservationError struct {
-	reason string
+	reason  string
+	storage string
+	node    string
 }
 
 func (e *storageContentObservationError) Error() string {
@@ -28,6 +32,23 @@ func StorageVolumeObservationReason(err error) string {
 		return observation.reason
 	}
 	return ""
+}
+
+// StorageVolumeObservationTarget returns the storage and node of a failed
+// listing. Both are empty when the error did not originate from this
+// observation path or the listing did not record its target.
+func StorageVolumeObservationTarget(err error) (storage, node string) {
+	var observation *storageContentObservationError
+	if errors.As(err, &observation) {
+		return observation.storage, observation.node
+	}
+	return "", ""
+}
+
+// storageContentFailureAt classifies a failed listing of storage on node and
+// records that target with the reason.
+func storageContentFailureAt(err error, storage, node string) error {
+	return &storageContentObservationError{reason: StorageVolumeObservationReason(storageContentFailure(err)), storage: storage, node: node}
 }
 
 func storageContentFailure(err error) error {

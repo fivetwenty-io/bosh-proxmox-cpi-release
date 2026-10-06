@@ -414,6 +414,12 @@ var errGuardSiteNotFound = &sdkerrors.APIError{HTTPCode: 404, Message: "does not
 // is gone from the node it reads.
 var errGuardSiteConfigGone = &sdkerrors.APIError{HTTPCode: 500, Message: "Configuration file 'nodes/n1/qemu-server/777.conf' does not exist"}
 
+// errGuardSiteListingDenied is PVE refusing a storage content listing. The
+// presence read does not read a listing again after a refusal, so the fault's
+// one firing is the whole failure. A server error would be read again and
+// answered by the next read.
+var errGuardSiteListingDenied = &sdkerrors.PermissionError{What: "Datastore.Audit"}
+
 func guardSiteFails(err error) func(context.Context) error {
 	return func(context.Context) error { return err }
 }
@@ -555,7 +561,7 @@ func TestManagedGuardRefusalSites(t *testing.T) {
 		{
 			name: "delete presence read fails", operation: "delete_disk", call: (*guardSiteFixture).deletion,
 			fault: func(*guardSiteFixture) *guardSiteFault {
-				return &guardSiteFault{read: guardSiteReadListing, within: []string{"prepareDeletion", "managedVolumePresent"}, outside: []string{"resolveDiskForOp"}, act: guardSiteFails(errAdmissionReadRefused)}
+				return &guardSiteFault{read: guardSiteReadListing, within: []string{"prepareDeletion", "managedVolumePresent"}, outside: []string{"resolveDiskForOp"}, act: guardSiteFails(errGuardSiteListingDenied)}
 			},
 			setup: func(_ *testing.T, s *guardSiteFixture) { s.detach() },
 			want:  guardSiteReadFailed,

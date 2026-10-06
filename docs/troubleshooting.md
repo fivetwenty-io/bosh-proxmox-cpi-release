@@ -2244,6 +2244,8 @@ Each record summary carries `charging`, which is true for exactly the states tha
 
 Nothing clears such a record automatically, and that is deliberate, because deciding that an in-flight allocation is abandoned rather than merely slow is a human's call. The `reconciliation_required` state exists for exactly that wait. Reconcile the record the way this section describes, by reading it, settling what the allocation left behind on PVE, and then moving or cleaning it with the commands in [Audit and recover storage allocations](storage-journal-operations.md).
 
+A `delete_vm` that fails only because it could not read a storage's content listing keeps its record `observed` instead of moving it to `reconciliation_required`. The CPI has already read that listing up to three times about two seconds apart, and the delete stops before its next change with every step it took recorded. The VM's record keeps charging its bytes, and the error names the storage, the node, and the reason, such as `listing_http_500`. Once that storage lists again, we rerun the delete, and the rerun finishes the disposal and closes the record. The `storage-journal cleanup` command prints the same storage, node, and reason, and we run it again once the storage lists. A listing failure that comes with any other uncertainty still leaves the record in `reconciliation_required`.
+
 [Charge in-flight siblings against a placement](multi-storage-placement.md#charge-in-flight-siblings-against-a-placement) lists which record states charge and which do not.
 
 ### A disk delete is refused after its volume is already gone
