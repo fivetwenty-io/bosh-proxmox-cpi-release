@@ -563,32 +563,61 @@ func (r *transferReader) readSource(ctx context.Context, id string, vmid int) (t
 // names volid, or empty strings when none does. A failed read keeps a class
 // it already carries and is otherwise retriable.
 func (r *transferReader) snapshotNaming(ctx context.Context, id string, vmid int, node, volid string) (string, string, error) {
-	names, err := HasSnapshots(ctx, r.c, node, vmid)
-	if err != nil {
+	name, key, failed, err := snapshotNamingVolume(ctx, r.c, node, vmid, volid, "")
+	switch {
+	case err == nil:
+		return name, key, nil
+	case failed == "":
 		return "", "", resumeReadFailure(err,
 			fmt.Sprintf("transfer resume: list the snapshots of source vm %d of disk %s's transfer", vmid, id))
+	default:
+		return "", "", resumeReadFailure(err,
+			fmt.Sprintf("transfer resume: read snapshot %q of source vm %d of disk %s's transfer", failed, vmid, id))
+	}
+}
+
+// snapshotNamingVolume returns the first snapshot of a VM, in name order, and
+// the first of its drive or vmstate keys, in key order, that names volid, or
+// empty strings when none does. It lists and reads the snapshots the way
+// refuseSnapshotNamingVolume does. Only the resolver checks the serial: when
+// serial isn't empty, a key counts only when its value carries that stable-ID
+// serial or none, so a snapshot line of another disk that took the volume's
+// name doesn't count. The transfer resume passes no serial and counts every
+// line, as the park gate does. When a read fails, failed names the
+// snapshot whose configuration couldn't be read, and it is empty when the
+// listing itself failed. The error is the read's own, with no class added.
+func snapshotNamingVolume(
+	ctx context.Context, c Client, node string, vmid int, volid, serial string,
+) (name, key, failed string, err error) {
+	names, err := HasSnapshots(ctx, c, node, vmid)
+	if err != nil {
+		return "", "", "", err
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		cfg, cfgErr := SnapshotConfig(ctx, r.c, node, vmid, name)
+	for _, snapshot := range names {
+		cfg, cfgErr := SnapshotConfig(ctx, c, node, vmid, snapshot)
 		if cfgErr != nil {
-			return "", "", resumeReadFailure(cfgErr,
-				fmt.Sprintf("transfer resume: read snapshot %q of source vm %d of disk %s's transfer", name, vmid, id))
+			return "", "", snapshot, cfgErr
 		}
 		keys := make([]string, 0, len(cfg))
-		for key := range cfg {
-			if isQemuDiskKey(key) || key == "vmstate" {
-				keys = append(keys, key)
+		for k := range cfg {
+			if isQemuDiskKey(k) || k == "vmstate" {
+				keys = append(keys, k)
 			}
 		}
 		sort.Strings(keys)
-		for _, key := range keys {
-			if text, ok := ConfigStringValue(cfg[key]); ok && bareDriveVolid(text) == volid {
-				return name, key, nil
+		for _, k := range keys {
+			text, ok := ConfigStringValue(cfg[k])
+			if !ok || bareDriveVolid(text) != volid {
+				continue
 			}
+			if found, hasSerial := StableIDFromDriveOptStr(text); serial != "" && hasSerial && found != serial {
+				continue
+			}
+			return snapshot, k, "", nil
 		}
 	}
-	return "", "", nil
+	return "", "", "", nil
 }
 
 // recordedDiskCID returns the disk CID that stableID's record on the parker

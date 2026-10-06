@@ -72,6 +72,19 @@ func HandleHasDisk(deps Deps) Handler {
 			)
 			return false, nil
 		}
+		if copied, ok := pve.IsDiskIdentityCopied(resolveErr); ok {
+			// Two guests carry the disk's serial, two parkers record its
+			// transfer, or a slot and a parker's record name different
+			// volumes that are both still there. One of them holds the disk,
+			// so it exists, and every other handler refuses it until an
+			// operator removes the copy.
+			deps.Log(ctx).Warn("has_disk: reporting the disk present, but more than one guest carries its identity, so every other disk call refuses it",
+				log.String("disk_cid", diskCID),
+				log.String("stable_id", copied.StableID),
+				log.Err(resolveErr),
+			)
+			return true, nil
+		}
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
