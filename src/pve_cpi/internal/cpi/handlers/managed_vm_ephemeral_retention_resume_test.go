@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -866,7 +867,10 @@ func TestEphemeralRetentionRecordedParkerReadback(t *testing.T) {
 				var mu sync.Mutex
 				answered := false
 				c.pve.configAnswer = func(vmid int) error {
-					if vmid != parker {
+					// delete_vm reads every parker for transfers off the VM
+					// before it preserves its disks, and that read has its
+					// own refusal, so the answer is kept for the readback.
+					if vmid != parker || strings.Contains(string(debug.Stack()), "managedSourceTransferRecords") {
 						return nil
 					}
 					record, err := c.journal.Inspect(c.id)

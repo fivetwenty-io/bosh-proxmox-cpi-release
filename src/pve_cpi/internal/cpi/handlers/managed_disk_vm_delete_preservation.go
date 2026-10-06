@@ -28,7 +28,23 @@ var managedVMVolumeSlot = regexp.MustCompile(`^(scsi|virtio|sata|ide|unused|efid
 // destroy_vm frees owned drives from the current config. A slot whose pending
 // value names another volume is refused retriably, as on the legacy path,
 // because the stop before this read has had its chance to apply the change.
+//
+// A journal-managed disk whose transfer to a parker stopped after its slot
+// delete is in no slot of the VM, so the slots don't find it. The parker's
+// transfer record names the VM as the transfer's source, and the records are
+// read before the slots, so such a disk is preserved by finishing its transfer
+// under the disk's own lifecycle (see preserveManagedTransferForVMDelete). An
+// unused entry such a record names is left to that transfer, which moves it.
+// A record that can't be read, resolved, or finished refuses the destroy.
 func detachManagedPersistentForVMDelete(ctx context.Context, deps Deps, node string, vmid int, ownedVolumes map[string]bool, handle *aj.Handle) error {
+	transfers, err := managedSourceTransferRecords(ctx, deps, vmid)
+	if err != nil {
+		return err
+	}
+	transferring := map[string]bool{}
+	for i := range transfers {
+		transferring[transfers[i].Intent.Volid] = true
+	}
 	holding, err := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return fmt.Errorf("read VM disks before preservation: %w", err)
@@ -36,12 +52,17 @@ func detachManagedPersistentForVMDelete(ctx context.Context, deps Deps, node str
 	if err := refusePendingDriveReplacement("delete_vm", strconv.Itoa(vmid), holding); err != nil {
 		return err
 	}
-	disks, err := managedVMPreservationCandidates(ctx, deps, node, vmid, holding.Config, ownedVolumes)
+	disks, err := managedVMPreservationCandidates(ctx, deps, node, vmid, holding.Config, ownedVolumes, transferring)
 	if err != nil {
 		return err
 	}
 	for i := range disks {
 		if err := detachManagedPersistentForVMDeleteOne(ctx, deps, node, vmid, disks[i], handle); err != nil {
+			return err
+		}
+	}
+	for i := range transfers {
+		if err := preserveManagedTransferForVMDelete(ctx, deps, vmid, transfers[i]); err != nil {
 			return err
 		}
 	}
@@ -86,7 +107,7 @@ func managedVMConfigVolumes(config map[string]any) (map[string]string, error) {
 	return volumes, nil
 }
 
-func managedVMPreservationCandidates(ctx context.Context, deps Deps, node string, vmid int, config map[string]any, owned map[string]bool) ([]resolvedDisk, error) {
+func managedVMPreservationCandidates(ctx context.Context, deps Deps, node string, vmid int, config map[string]any, owned, transferring map[string]bool) ([]resolvedDisk, error) {
 	volumes, err := managedVMConfigVolumes(config)
 	if err != nil {
 		return nil, err
@@ -116,7 +137,7 @@ func managedVMPreservationCandidates(ctx context.Context, deps Deps, node string
 			return nil, fmt.Errorf("ambiguous duplicate VM volume reference")
 		}
 		seen[volume] = true
-		if owned[volume] {
+		if owned[volume] || (strings.HasPrefix(slot, "unused") && transferring[volume]) {
 			continue
 		}
 		disk, err := managedVMPreservationCandidate(ctx, deps, node, vmid, config, slot, volume, provenance, recorded)

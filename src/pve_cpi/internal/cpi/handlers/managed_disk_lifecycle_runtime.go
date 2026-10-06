@@ -106,6 +106,14 @@ func acquireManagedDiskLifecycle(ctx context.Context, deps Deps, rd resolvedDisk
 	if current.allocation == nil || current.allocation.record.ID != handle.Record().ID {
 		return fail(fmt.Errorf("managed disk identity changed before lifecycle admission"))
 	}
+	// A transfer to a parker cut off after PVE applied its source slot delete
+	// leaves that delete's step planned, and the disk is in no slot. Its
+	// readback settles here, under this lock, so the operation admits and
+	// resumes the transfer before its own work (see
+	// settlePlannedTransferSourceWrite).
+	if err := settlePlannedTransferSourceWrite(ctx, deps.PVE, handle, current); err != nil {
+		return fail(err)
+	}
 	proof, err := managedDiskOwnershipProof(current)
 	if err != nil {
 		return fail(err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -434,7 +435,7 @@ func adoptConfigReadback(ctx context.Context, deps Deps, rd resolvedDisk, record
 	case rd.allocation == nil || rd.allocation.record.ID != record.ID:
 		return adoptSettledConfigStep{}, "; adopt read the disk back, and it doesn't resolve to this allocation"
 	case rd.intent != nil:
-		return adoptSettledConfigStep{}, fmt.Sprintf("; adopt read the disk back and found a transfer of it to parker %d still in flight", rd.intent.ParkerVMID)
+		return adoptSettledConfigStep{}, adoptTransferInFlightReason(*rd.intent, target)
 	case rd.holder == nil || rd.stableID == "":
 		return adoptSettledConfigStep{}, fmt.Sprintf("; adopt read the disk back and found it in no drive slot, where the step targets VM %d on node %s", target.VMID, target.Node)
 	case rd.holder.Node != target.Node || rd.holder.VMID != target.VMID:
@@ -457,6 +458,20 @@ func adoptConfigReadback(ctx context.Context, deps Deps, rd resolvedDisk, record
 		return adoptSettledConfigStep{}, fmt.Sprintf("; adopt read VM %d on node %s back, and no drive slot there names %s with the disk's serial %s", target.VMID, target.Node, rd.volid, rd.stableID)
 	}
 	return adoptSettledConfigStep{StepID: step.ID, Kind: step.Kind, Node: target.Node, VMID: target.VMID, Slot: slot, Volume: rd.volid, Serial: rd.stableID}, ""
+}
+
+// adoptTransferInFlightReason is the clause adopt's refusal adds when the disk
+// resolved with a transfer to a parker in flight. Adopt writes nothing to PVE,
+// so it can't finish the transfer. When the step targets the transfer's
+// source, the step is the source write the transfer planned, and the clause
+// names the calls that finish the transfer under the disk's allocation lock
+// and settle the step (see settlePlannedTransferSourceWrite).
+func adoptTransferInFlightReason(intent pve.DiskTransferIntent, target aj.Target) string {
+	reason := fmt.Sprintf("; adopt read the disk back and found a transfer of it to parker %d still in flight", intent.ParkerVMID)
+	if intent.SourceVMCID != strconv.Itoa(target.VMID) {
+		return reason
+	}
+	return reason + fmt.Sprintf(", and adopt writes nothing to PVE, so it leaves that transfer to the disk's next attach_disk, detach_disk, or delete_disk, or to a rerun of delete_vm on VM %d, each of which finishes the transfer under the disk's allocation lock and settles the step", target.VMID)
 }
 
 // adoptUnresolvedReason is the clause adopt's refusal adds for step when the

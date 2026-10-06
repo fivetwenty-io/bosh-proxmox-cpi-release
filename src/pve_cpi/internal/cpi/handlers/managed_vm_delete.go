@@ -588,6 +588,16 @@ func noteVMListingStop(handle *aj.Handle, err error, storage, node, reason strin
 	return err
 }
 
+// NoteVMListingStopForTest saves, on handle's VM record, the reason delete_vm
+// saves when a failed content listing of storage on node, for reason, stopped
+// the VM's cleanup. It makes the same call managedVMCleanupFailure makes, so the
+// storage-journal command's tests can print a reason the cleanup itself saved.
+//
+// Production code MUST NOT call this.
+func NoteVMListingStopForTest(handle *aj.Handle, storage, node, reason string) error {
+	return noteVMListingStop(handle, storageListingStoppedDelete(storage, node, reason), storage, node, reason)
+}
+
 // vmCleanupRefusalReason is the reason noteVMCleanupRefusal saves. It says
 // that the VM's disks stayed where they were, names the refusal, and says
 // what clears it.
