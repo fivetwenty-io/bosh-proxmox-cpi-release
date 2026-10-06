@@ -150,7 +150,9 @@ jobs:
           # sparse checkout materializes only the script itself.
           fetch-depth: 0
           filter: tree:0
-          sparse-checkout: scripts/_linear_history_check.sh
+          sparse-checkout: |
+            scripts/_linear_history_check.sh
+            scripts/_attribution_check.sh
           sparse-checkout-cone-mode: false
           # This clone lives in its own directory, because a promisor clone
           # left in the shared workspace breaks the next job's full checkout
@@ -163,3 +165,7 @@ jobs:
       - name: Refuse merge commits
         working-directory: linear-history
         run: sh scripts/_linear_history_check.sh
+
+      - name: Refuse AI attribution in commit messages
+        working-directory: linear-history
+        run: sh scripts/_attribution_check.sh "${{ github.event.pull_request.head.sha || github.sha }}"

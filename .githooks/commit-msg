@@ -1,0 +1,5 @@
+#!/bin/sh
+# Commit-message gate: refuse a message that names an AI tool as an author.
+# Install with `make hooks`. Bypass a single commit with `git commit --no-verify`.
+
+exec sh scripts/_attribution_check.sh msg "$1"

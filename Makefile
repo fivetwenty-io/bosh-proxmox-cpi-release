@@ -159,7 +159,7 @@ certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would 
 ##@ Code Quality
 
 .PHONY: hooks
-hooks: ## Point git at the repo-managed hooks (pre-commit and pre-merge-commit gates, pre-push make check)
+hooks: ## Point git at the repo-managed hooks (pre-commit, pre-merge-commit, and commit-msg gates, pre-push make check)
 	@git config core.hooksPath .githooks
 	@echo "$(GREEN)✓ git hooks installed (core.hooksPath=.githooks)$(RESET)"
 
@@ -180,6 +180,12 @@ linear-check: ## Fail if a merge commit is reachable from HEAD (main stays linea
 	@echo "$(GREEN)Checking the history for merge commits...$(RESET)"
 	@sh scripts/_linear_history_check.sh
 	@echo "$(GREEN)✓ history is linear$(RESET)"
+
+.PHONY: attribution-check
+attribution-check: ## Fail if a commit reachable from HEAD names an AI tool as an author
+	@echo "$(GREEN)Checking commit messages for AI attribution...$(RESET)"
+	@sh scripts/_attribution_check.sh
+	@echo "$(GREEN)✓ no AI attribution$(RESET)"
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source file is not gofmt-formatted
@@ -244,7 +250,7 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 CHECK_LANES ?= 1
 
 .PHONY: check
-check: artifacts-check linear-check fmt-check go-blob-check ## Run artifact, formatting, blob, vet, analysis, template, Python, and race-test-with-coverage checks
+check: artifacts-check linear-check attribution-check fmt-check go-blob-check ## Run artifact, formatting, blob, vet, analysis, template, Python, and race-test-with-coverage checks
 	@MAKE='$(MAKE)' CHECK_LANES='$(CHECK_LANES)' sh scripts/_check_lanes.sh
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
 
