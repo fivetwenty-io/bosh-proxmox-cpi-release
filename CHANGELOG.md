@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-06
+
 ### Added
 
 - The Director Upgrade Test now checks that the persistent disk kept its data and its serial across the upgrade. Before the pre-upgrade capture, the run now writes a random nonce and 1 MiB of checksummed random data to the certification instance's persistent disk through `bosh ssh`, and after the upgrade and recreate it reads them back. The new `verify:disk-data-survived` step fails when the nonce or the checksum differs. Each capture now also records every drive's `serial=` on the Director VM and the deployment's VMs, and the new `verify:disk-serial-stable` step fails unless every persistent disk's `bpd-` stable id sits on a drive both before and after the upgrade. Both checks appear in the dry-run plan, in the run report's invariant table, and in [What the run asserts](docs/certification/upgrade.md#what-the-run-asserts).
@@ -680,7 +682,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.7.3...v0.8.0
