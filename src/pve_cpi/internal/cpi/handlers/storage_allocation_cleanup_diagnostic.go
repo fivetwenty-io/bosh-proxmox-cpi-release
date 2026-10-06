@@ -98,6 +98,10 @@ func StorageAllocationDecisionFailure(err error) string {
 	if errors.As(err, &settlement) {
 		return class + ": " + log.ScrubMessage(settlement.description())
 	}
+	var returned *explicitCleanupReturnedError
+	if errors.As(err, &returned) {
+		return class + ": " + returned.Error()
+	}
 	for _, fixed := range storageFixedRefusals {
 		if errors.Is(err, fixed) {
 			return class + ": " + fixed.Error()
