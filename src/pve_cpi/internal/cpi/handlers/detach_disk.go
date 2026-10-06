@@ -182,7 +182,10 @@ func HandleDetachDisk(deps Deps) Handler {
 		// two flows share nothing past this point — a renamed volume must
 		// never meet the SDK's detach-and-sweep, whose unused sweep would let
 		// PVE deallocate a volume its holder owns.
-		rd, resolveErr := resolveDiskForOp(ctx, deps, "detach_disk", diskCID, bareDiskCID, meta)
+		// A holder that lacks the disk's provenance entry doesn't stop this
+		// first look. The lifecycle below resolves the disk again under the
+		// allocation journal's lock and writes the entry there.
+		rd, resolveErr := resolveDiskForOp(withHolderHeal(ctx, holderHealDefer), deps, "detach_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}

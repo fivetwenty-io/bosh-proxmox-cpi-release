@@ -19,6 +19,7 @@ func TestIsLockWaitWithoutEntry_CountsEveryAcquireThatNeverEnteredTheLock(t *tes
 		pve.ErrClusterLockClaimTooShort,
 		pve.ErrClusterLockInterrupted,
 		errManagedRequestEnded,
+		errManagedAdmissionReadFailed,
 	} {
 		wrapped := fmt.Errorf("attach disk: %w", sentinel)
 		if !isLockWaitWithoutEntry(wrapped) {

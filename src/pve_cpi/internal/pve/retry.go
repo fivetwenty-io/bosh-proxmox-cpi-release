@@ -117,6 +117,16 @@ func TransientBackoff(attempt int) time.Duration {
 	return transientBackoff(attempt, jitterInt64N)
 }
 
+// TransientBackoffFor is TransientBackoff for a caller that runs its own
+// retry loop. When ctx carries an override from WithTestBackoff, the override
+// decides the wait instead, the same way it does for RetryOnTransient.
+func TransientBackoffFor(ctx context.Context, attempt int) time.Duration {
+	if override := backoffFromCtx(ctx); override != nil {
+		return override(attempt)
+	}
+	return TransientBackoff(attempt)
+}
+
 // transientBackoff is TransientBackoff with the jitter draw supplied, so the
 // worst-case budget helpers below evaluate the same curve at the top of its
 // jitter window instead of restating it.

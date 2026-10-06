@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -131,20 +132,9 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd reso
 		return resolvedDisk{}, cpierrors.Cloud("managed disk ownership provenance references a missing volume; audit required")
 	}
 	if rd.holder != nil {
-		cfg, err := deps.PVE.QEMU().Config(ctx, rd.holder.Node, rd.holder.VMID)
-		if err != nil || cfg == nil {
-			return resolvedDisk{}, cpierrors.Cloud("managed disk holder cannot be verified; audit required")
-		}
-		actual, found, err := pve.FindDiskAllocationProvenance(pve.DescriptionFromConfig(cfg), rd.sentinelKey())
-		if err != nil {
+		err := verifyManagedHolderProvenance(ctx, deps, rd, record, definition.IsShared(), provenance)
+		if err != nil && (!isHolderNotRecorded(err) || holderHealFor(ctx) != holderHealDefer) {
 			return resolvedDisk{}, err
-		}
-		if found {
-			if actual.AllocationID != id || actual.AllocationNamespace != record.Namespace || actual.Volid != rd.volid || actual.Backing != "" && actual.Backing != backing {
-				return resolvedDisk{}, identityConflict(cpierrors.Cloud("managed disk holder provenance conflicts; audit required"))
-			}
-		} else if rd.volid != rd.birth {
-			return resolvedDisk{}, cpierrors.Cloud("renamed managed disk lacks full ownership provenance; audit required")
 		}
 	} else if rd.intent != nil {
 		if rd.intent.AllocationID != id || rd.intent.AllocationNamespace != record.Namespace || rd.intent.AllocationBacking != "" && rd.intent.AllocationBacking != backing {
@@ -153,6 +143,39 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd reso
 	}
 	rd.allocation = &managedDiskIdentity{record: record, provenance: provenance, absent: !exists}
 	return rd, nil
+}
+
+// verifyManagedHolderProvenance checks the provenance that rd's holder carries
+// for the disk against the record and against provenance, the entry the
+// identity check built from the journal and the disk's actual backing. A
+// holder that can't be read is refused for audit, and an entry that names
+// another allocation, namespace, volume, or backing is a conflict. A renamed
+// disk whose holder carries no entry gets holderNotRecordedRefusal, unless
+// ctx asks for holderHealWrite. Then it goes to healUnrecordedHolder, which
+// writes the entry when it can prove the disk is the holder's and refuses for
+// audit otherwise.
+func verifyManagedHolderProvenance(ctx context.Context, deps Deps, rd resolvedDisk, record aj.Record, shared bool, provenance pve.DiskAllocationProvenance) error {
+	cfg, err := deps.PVE.QEMU().Config(ctx, rd.holder.Node, rd.holder.VMID)
+	if err != nil || cfg == nil {
+		return cpierrors.Cloud("managed disk holder cannot be verified; audit required")
+	}
+	actual, found, err := pve.FindDiskAllocationProvenance(pve.DescriptionFromConfig(cfg), rd.sentinelKey())
+	if err != nil {
+		return err
+	}
+	if found {
+		if actual.AllocationID != record.ID || actual.AllocationNamespace != record.Namespace || actual.Volid != rd.volid || actual.Backing != "" && actual.Backing != provenance.Backing {
+			return identityConflict(cpierrors.Cloud("managed disk holder provenance conflicts; audit required"))
+		}
+		return nil
+	}
+	if rd.volid == rd.birth {
+		return nil
+	}
+	if holderHealFor(ctx) != holderHealWrite {
+		return holderNotRecordedRefusal(rd, "")
+	}
+	return healUnrecordedHolder(ctx, deps, rd, record, shared, provenance, cfg)
 }
 
 // managedJournalIdentityRefusal checks that the disk's record names the
@@ -431,9 +454,25 @@ func managedDiskActualDefinition(ctx context.Context, deps Deps, storage string)
 		}
 	}
 	if found.Name == "" {
-		return pve.StorageInfo{}, cpierrors.Cloud("managed disk actual storage is unavailable")
+		return pve.StorageInfo{}, &managedStorageUnlisted{err: cpierrors.Cloud("managed disk actual storage is unavailable")}
 	}
 	return found, nil
+}
+
+// managedStorageUnlisted is managedDiskActualDefinition's error when the
+// cluster's storage listing answered without the disk's storage. The listing
+// was read, so this is an answer about the storage rather than a failed read.
+// Its text and CPI type are those of the error it carries.
+type managedStorageUnlisted struct{ err error }
+
+func (e *managedStorageUnlisted) Error() string { return e.err.Error() }
+func (e *managedStorageUnlisted) Unwrap() error { return e.err }
+
+// isManagedStorageUnlisted reports whether err says the storage listing
+// answered without the disk's storage.
+func isManagedStorageUnlisted(err error) bool {
+	var unlisted *managedStorageUnlisted
+	return errors.As(err, &unlisted)
 }
 func managedDiskParkContext(rd resolvedDisk, pctx pve.ParkContext) pve.ParkContext {
 	if rd.allocation != nil {
@@ -443,6 +482,64 @@ func managedDiskParkContext(rd resolvedDisk, pctx pve.ParkContext) pve.ParkConte
 	}
 	return pctx
 }
+
+// managedHolderProvenanceAttempts bounds how many times writeManagedDiskHolder
+// tries the holder's provenance write when the write stops before anything is
+// sent to PVE, or PVE answers it with an error and a readback shows it changed
+// nothing.
+const managedHolderProvenanceAttempts = 3
+
+// holderProvenanceWriteKey marks the context of the holder's provenance write
+// that writeManagedDiskHolder sends. Its value is a *holderProvenanceWrite, so
+// the lifecycle guard can settle that write when PVE answers it with an error
+// (see settleHolderProvenanceWrite).
+type holderProvenanceWriteKey struct{}
+
+// holderProvenanceWrite names the entry a holder's provenance write carries
+// and records what the guard's readback found after PVE answered the write
+// with an error.
+type holderProvenanceWrite struct {
+	key   string
+	entry pve.DiskAllocationProvenance
+	// landed is set when the readback found the entry, and unchanged when it
+	// found no entry and the configuration's digest still the one the write
+	// was pinned to, or found no entry and every setting as it was after PVE
+	// refused the write because the digest had moved. The guard settles the
+	// write's step in each case.
+	landed, unchanged bool
+	// answer is the error PVE answered the write with, and readback says what
+	// the readback found when it settled neither way.
+	answer, readback string
+}
+
+// writeManagedDiskHolder records the disk's provenance on the VM that now
+// holds it, as volid on node.
+//
+// A write that stops before anything is sent, because a read the write or the
+// lifecycle guard makes first failed, or because the guard found the holder's
+// configuration changed under the write, is tried again, up to
+// managedHolderProvenanceAttempts times in all with a short wait between
+// tries. So is a write PVE answered with an error, or whose answer was lost,
+// when the guard's readback finds the holder without the entry and its
+// configuration's digest still the one the write was pinned to, because then
+// the write changed nothing. A write PVE refused because the digest had moved
+// is tried again too when the readback finds the holder without the entry and
+// with every setting as it was, because PVE checks the digest before it
+// writes. When the readback finds the entry, the write landed, and the disk's
+// holder is recorded.
+//
+// When every try stops or changes nothing, or the request ends before a write
+// is sent, the error is retriable and names the VM and volume, because the
+// next call's lifecycle writes the missing provenance itself (see
+// healUnrecordedHolder). A write PVE accepted whose readback couldn't be read
+// is retriable too, because the next call reads the provenance back. A write
+// PVE answered with an error that leaves the holder changed without the entry
+// keeps the audit refusal, and says what the readback found. So does a write
+// PVE refused for a moved digest when the readback finds a setting that
+// changed. Anything else, such as provenance for another allocation under the
+// disk's key, notes that don't parse, a readback that differs from the write,
+// or a guard that an earlier failure already locked, keeps the audit refusal
+// too.
 func writeManagedDiskHolder(ctx context.Context, deps Deps, rd resolvedDisk, node string, vmid int, volid string) error {
 	if rd.allocation == nil {
 		return nil
@@ -450,10 +547,81 @@ func writeManagedDiskHolder(ctx context.Context, deps Deps, rd resolvedDisk, nod
 	entry := rd.allocation.provenance
 	entry.Node = node
 	entry.Volid = volid
-	if err := pve.WriteDiskAllocationProvenance(ctx, deps.PVE, node, vmid, rd.sentinelKey(), entry); err != nil {
+	var err error
+	var write *holderProvenanceWrite
+	for attempt := 0; attempt < managedHolderProvenanceAttempts; attempt++ {
+		if attempt > 0 {
+			wait := time.NewTimer(pve.TransientBackoffFor(ctx, attempt-1))
+			select {
+			case <-ctx.Done():
+				wait.Stop()
+				return holderProvenanceRequestEnded(vmid, volid)
+			case <-wait.C:
+			}
+		}
+		write = &holderProvenanceWrite{key: rd.sentinelKey(), entry: entry}
+		err = pve.WriteDiskAllocationProvenance(context.WithValue(ctx, holderProvenanceWriteKey{}, write), deps.PVE, node, vmid, rd.sentinelKey(), entry)
+		if err == nil {
+			return nil
+		}
+		if write.landed {
+			deps.Log(ctx).Warn("managed disk holder provenance write failed, but a readback found the entry, so it landed",
+				log.Int("vmid", vmid),
+				log.String("volid", volid),
+				log.Err(err),
+			)
+			return nil
+		}
+		if errors.Is(err, errManagedRequestEnded) || ctx.Err() != nil && holderProvenanceNotSent(err) {
+			return holderProvenanceRequestEnded(vmid, volid)
+		}
+		if !write.unchanged && !holderProvenanceNotSent(err) {
+			break
+		}
+		message := "managed disk holder provenance write stopped before it was sent"
+		if write.unchanged {
+			message = "managed disk holder provenance write failed, and a readback found the holder unchanged"
+		}
+		deps.Log(ctx).Warn(message,
+			log.Int("vmid", vmid),
+			log.String("volid", volid),
+			log.Int("attempt", attempt+1),
+			log.Int("max_attempts", managedHolderProvenanceAttempts),
+			log.Err(err),
+		)
+	}
+	switch {
+	case write.unchanged:
+		return cpierrors.Retriable("managed disk holder provenance was not written: the disk is attached to VM %d as %s, but PVE answered the last of %d writes with an error (%s), and a readback showed VM %d's configuration unchanged, so the write did not land; retry the operation, which writes the provenance",
+			vmid, volid, managedHolderProvenanceAttempts, err.Error(), vmid)
+	case holderProvenanceNotSent(err):
+		return cpierrors.Retriable("managed disk holder provenance was not written: the disk is attached to VM %d as %s, but the checks before the write failed %d times (last: %s), so nothing was sent; retry the operation, which writes the provenance",
+			vmid, volid, managedHolderProvenanceAttempts, err.Error())
+	case errors.Is(err, pve.ErrProvenanceReadbackUnread):
+		return cpierrors.Retriable("managed disk holder provenance was sent to VM %d for %s, but its readback could not be read; retry the operation, which reads the provenance back and writes it if it is missing",
+			vmid, volid)
+	case write.readback != "":
+		return cpierrors.Cloud("managed disk holder provenance was not verified; audit required, because PVE answered the write of the disk's entry onto VM %d for %s with an error (%s), and %s; run qm config %d to see what changed the VM's notes, then reconcile the allocation as \"Multi-storage allocation requires reconciliation\" in docs/troubleshooting.md of bosh-proxmox-cpi-release describes",
+			vmid, volid, write.answer, write.readback, vmid)
+	default:
 		return cpierrors.Cloud("managed disk holder provenance was not verified; audit required")
 	}
-	return nil
+}
+
+// holderProvenanceNotSent reports whether a provenance write stopped before
+// anything reached PVE, so trying it again is safe. That's a holder whose
+// configuration couldn't be read, a guard admission read that failed, and a
+// description write whose digest the guard's own read no longer matched.
+func holderProvenanceNotSent(err error) bool {
+	return errors.Is(err, pve.ErrProvenanceHolderUnread) || errors.Is(err, errManagedAdmissionReadFailed) ||
+		errors.Is(err, errManagedDescriptionDigestStale)
+}
+
+// holderProvenanceRequestEnded is writeManagedDiskHolder's refusal when the
+// request ended before the provenance write was sent.
+func holderProvenanceRequestEnded(vmid int, volid string) error {
+	return cpierrors.Retriable("managed disk holder provenance was not written because the request ended before the write was sent; the disk is attached to VM %d as %s, and a retry of the operation writes the provenance",
+		vmid, volid)
 }
 
 // healMovedDiskProvenance runs before a detach transfers a managed disk to a

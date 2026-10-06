@@ -49,7 +49,8 @@ func withDetachTailRemoval(ctx context.Context) context.Context {
 // tailRemovalReadFailed builds the refusal that the guard's before hook gives
 // the detach tail's removal when one of the guard's reads returned err. It's
 // nil for a read that answered, for any other write, and for a request whose
-// context has ended, because those keep the guard's usual handling. The read's
+// context has ended, because admissionReadFailed gives those their own
+// refusal, which leaves the guard usable as well. The read's
 // cause goes into the text only, so no status in it can make the refusal look
 // like PVE's answer to the write. The %v also flattens the class of a typed
 // cause to retriable on purpose. A failed read before the write is a read we

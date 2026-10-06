@@ -340,7 +340,10 @@ func HandleDeleteDisk(deps Deps) Handler {
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		rd, decErr := resolveDeleteDiskCID(ctx, deps, diskCID)
+		// A holder that lacks the disk's provenance entry doesn't stop this
+		// first look. The lifecycle below resolves the disk again under the
+		// allocation journal's lock and writes the entry there.
+		rd, decErr := resolveDeleteDiskCID(withHolderHeal(ctx, holderHealDefer), deps, diskCID)
 		if decErr != nil {
 			return nil, decErr
 		}

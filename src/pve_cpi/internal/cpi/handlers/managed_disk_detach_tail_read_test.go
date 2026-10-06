@@ -3,14 +3,16 @@ package handlers
 // These tests cover a failed read of 777's config, or of the cluster's
 // identity, around the detach tail's removal write. When the guard's read
 // before that write fails while the request is live, nothing has gone out, so
-// the call returns the disk unchanged. The same failure on any other write, or
-// on a request whose context ended, still poisons the guard. A readback that
+// the call returns the disk unchanged. The same failure on any other write is
+// refused unsent and leaves the guard usable, and a request whose context ended
+// during that read returns the disk unchanged as well. A readback that
 // fails after PVE accepted the write leaves the record for reconciliation,
 // because nothing shows what the write changed.
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -157,14 +159,17 @@ func TestDetachTailGuardIdentityReadFailureReturnsTheDisk(t *testing.T) {
 	}
 }
 
-// TestDetachTailGuardReadFailureOnOtherWritePoisons checks that the guard keeps
-// its old behavior for any other write. A description-only write to 777 that
-// isn't the detach tail's removal meets a failed read of 777's config before it
-// goes out. The guard can't tell what the write would change, so the guard is
-// poisoned as before, and nothing is sent.
-func TestDetachTailGuardReadFailureOnOtherWritePoisons(t *testing.T) {
+// TestDetachTailGuardReadFailureOnOtherWriteLeavesTheGuardUsable checks a
+// description-only write to 777 that isn't the detach tail's removal and that
+// meets a failed read of 777's config before it goes out. Nothing is sent, so
+// the write comes back retriable and marked as not attempted, and the guard
+// stays usable. The refusal is the guard's general one and not the tail's, and
+// the read's cause stays in the text only. Nothing else in the operation
+// touched the disk, so finishing the lifecycle returns the allocation
+// unchanged rather than leaving it for reconciliation.
+func TestDetachTailGuardReadFailureOnOtherWriteLeavesTheGuardUsable(t *testing.T) {
 	captureParkerPoolSweep(t)
-	s, _, w := buildLatentTailDisk(t)
+	s, id, w := buildLatentTailDisk(t)
 	rd, err := resolveDeleteDiskCID(context.Background(), s.deps, s.cid)
 	if err != nil {
 		t.Fatal(err)
@@ -180,21 +185,32 @@ func TestDetachTailGuardReadFailureOnOtherWritePoisons(t *testing.T) {
 	writeErr := local.PVE.Nodes().UpdateQemuConfig(context.Background(), "n1", "777", &nodes.UpdateQemuConfigParams{Description: &description, Digest: &digest})
 	guardErr := lifecycle.guard.Err()
 	w.configRead = nil
-	_ = lifecycle.finish(context.Background(), writeErr, false)
-	if writeErr == nil || guardErr == nil {
-		t.Fatalf("write err=%v guard err=%v, want the write refused and the guard poisoned", writeErr, guardErr)
+	finished := lifecycle.finish(context.Background(), writeErr, false)
+	if writeErr == nil || guardErr != nil {
+		t.Fatalf("write err=%v guard err=%v, want the write refused and the guard left usable", writeErr, guardErr)
+	}
+	requireRetriable(t, writeErr, "description write whose guard read of 777's config failed")
+	if !errors.Is(writeErr, errManagedAdmissionReadFailed) || !errors.Is(writeErr, pve.ErrMutationNotAttempted) || errors.Is(writeErr, errManagedTailReadFailed) {
+		t.Fatalf("write err = %v, want the guard's admission read refusal, marked as not attempted", writeErr)
+	}
+	if text := writeErr.Error(); !strings.Contains(text, "nothing was sent; retry the operation") || !strings.Contains(text, "connection reset by peer") {
+		t.Fatalf("write err = %q, want it to say nothing was sent, to retry, and why the read failed", text)
 	}
 	if w.conflicts != 0 || w.removals != 0 || pve.DescriptionFromConfig(s.client.state.configs[777]) == description {
 		t.Fatalf("conflicts=%d removals=%d, want nothing sent to 777 by this description-only write, which isn't the tail's removal", w.conflicts, w.removals)
 	}
+	if !isDiskReturnedUnchanged(finished) {
+		t.Fatalf("finish = %v, want the allocation returned unchanged after a refusal that sent nothing", finished)
+	}
+	s.requireRecord(t, id, aj.ReadyToReturn)
 }
 
-// TestDetachTailGuardReadEndedContextPoisons starts from a latent record and
-// reruns detach_disk, and the request ends while the guard reads 777's config,
-// just before the tail's removal would go out. The read fails because the
-// request ended, which says nothing about 777, so the guard is poisoned as
-// before. The error carries neither marker, and the record isn't returned.
-func TestDetachTailGuardReadEndedContextPoisons(t *testing.T) {
+// TestDetachTailGuardReadEndedContextReturnsTheDisk starts from a latent record
+// and reruns detach_disk, and the request ends while the guard reads 777's
+// config, just before the tail's removal would go out. Nothing is sent, so the
+// call comes back with the ordinary retriable deadline error, the record is
+// returned unchanged, and 777's entry stays for the next call.
+func TestDetachTailGuardReadEndedContextReturnsTheDisk(t *testing.T) {
 	captureParkerPoolSweep(t)
 	s, id, w := buildLatentTailDisk(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -211,19 +227,30 @@ func TestDetachTailGuardReadEndedContextPoisons(t *testing.T) {
 	if *failed != 1 || w.conflicts != 0 || w.removals != 0 {
 		t.Fatalf("failed reads=%d conflicts=%d removals=%d, want one failed read and no write sent to 777", *failed, w.conflicts, w.removals)
 	}
-	if isDetachTailNotSent(err) || isDiskReturnedUnchanged(err) {
-		t.Fatalf("err = %v, want the ended request left unmarked", err)
+	requireRetriable(t, err, "detach_disk whose request ended during the guard's read")
+	if !errors.Is(err, errManagedRequestEnded) || !errors.Is(err, context.Canceled) || !isDiskReturnedUnchanged(err) {
+		t.Fatalf("err = %v, want the ended request returned unchanged", err)
 	}
-	record, inspectErr := s.journal.Inspect(id)
-	if inspectErr != nil {
-		t.Fatal(inspectErr)
+	if isDetachTailNotSent(err) {
+		t.Fatalf("err = %v, want the ended request's refusal and not the tail's own not-sent refusal", err)
 	}
-	if record.State == aj.ReadyToReturn || record.State == aj.Deleted {
-		t.Fatalf("record state = %s after the guard's read was cut off, want it left for reconciliation", record.State)
+	if strings.Contains(err.Error(), "reconciliation") {
+		t.Fatalf("err = %v, want the ordinary deadline error with no reconciliation", err)
 	}
+	s.requireRecord(t, id, aj.ReadyToReturn)
 	if !s.hasEntry(777) {
 		t.Fatal("777's entry went missing although no write was sent")
 	}
+
+	w.afterSourceRead, w.configRead = nil, nil
+	if err := detachDiskAt(t, context.Background(), s.deps, "777", s.cid); err != nil {
+		t.Fatalf("detach_disk once the request runs to the end: %v", err)
+	}
+	if w.removals != 1 {
+		t.Fatalf("777's entry was removed %d times, want once", w.removals)
+	}
+	s.requireSourceClean(t)
+	s.requireRecord(t, id, aj.ReadyToReturn)
 }
 
 // TestDetachTailReadbackFailureAfterWriteStaysForReconciliation starts from a

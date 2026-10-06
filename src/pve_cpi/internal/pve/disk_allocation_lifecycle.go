@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -143,8 +144,28 @@ func ParseDiskAllocationProvenance(description string) (map[string]DiskAllocatio
 	return result, nil
 }
 
+// ErrProvenanceHolderUnread marks a provenance write that stopped because the
+// holder's configuration could not be read, so nothing was sent to PVE.
+var ErrProvenanceHolderUnread = errors.New("cannot read managed disk provenance holder")
+
+// ErrProvenanceReadbackUnread marks a provenance write that PVE accepted but
+// whose readback could not be read, so the write may well have landed and a
+// later read decides whether it did.
+var ErrProvenanceReadbackUnread = errors.New("cannot verify managed disk provenance")
+
+// ErrProvenancePersistFailed marks a provenance write that PVE did not accept,
+// or whose answer never came back, so whether it landed is unknown until the
+// holder is read again.
+var ErrProvenancePersistFailed = errors.New("cannot persist managed disk provenance")
+
 // WriteDiskAllocationProvenance preserves unrelated metadata and verifies the
 // full receiving-side identity before a caller may erase source provenance.
+//
+// A holder configuration that can't be read returns an error matching
+// ErrProvenanceHolderUnread. A write that fails returns one matching
+// ErrProvenancePersistFailed that wraps the write's own error, and a readback
+// that can't be read after PVE accepted the write returns one matching
+// ErrProvenanceReadbackUnread.
 func WriteDiskAllocationProvenance(ctx context.Context, c Client, node string, vmid int, key string, entry DiskAllocationProvenance) error {
 	if c == nil || c.Nodes() == nil || c.QEMU() == nil || node == "" || vmid <= 0 || key == "" {
 		return fmt.Errorf("managed disk provenance requires a concrete holder")
@@ -154,8 +175,35 @@ func WriteDiskAllocationProvenance(ctx context.Context, c Client, node string, v
 	}
 	cfg, err := c.QEMU().Config(ctx, node, vmid)
 	if err != nil || cfg == nil {
-		return fmt.Errorf("cannot read managed disk provenance holder")
+		return fmt.Errorf("%w", ErrProvenanceHolderUnread)
 	}
+	return writeDiskAllocationProvenanceOnto(ctx, c, node, vmid, key, entry, cfg)
+}
+
+// WriteDiskAllocationProvenanceOnto writes entry under key onto the holder
+// configuration cfg that the caller already read and checked. The write
+// carries cfg's digest, so PVE refuses it when the holder changed after that
+// read, and a refusal like that matches IsConfigDigestRefusal. A cfg without a
+// digest is refused before anything is sent, because the write could not be
+// pinned to what the caller checked. The readback and its errors are the same
+// as WriteDiskAllocationProvenance's.
+func WriteDiskAllocationProvenanceOnto(ctx context.Context, c Client, node string, vmid int, key string, entry DiskAllocationProvenance, cfg map[string]any) error {
+	if c == nil || c.Nodes() == nil || c.QEMU() == nil || node == "" || vmid <= 0 || key == "" || cfg == nil {
+		return fmt.Errorf("managed disk provenance requires a concrete holder")
+	}
+	if digest, ok := ConfigString(cfg, "digest"); !ok || digest == "" {
+		return fmt.Errorf("managed disk provenance holder configuration carries no digest to pin the write to")
+	}
+	if err := validateDiskAllocationProvenance(entry); err != nil {
+		return err
+	}
+	return writeDiskAllocationProvenanceOnto(ctx, c, node, vmid, key, entry, cfg)
+}
+
+// writeDiskAllocationProvenanceOnto is the shared write and readback behind
+// both exported writers. cfg is the holder configuration the write is built
+// from, and its digest, when it has one, pins the write.
+func writeDiskAllocationProvenanceOnto(ctx context.Context, c Client, node string, vmid int, key string, entry DiskAllocationProvenance, cfg map[string]any) error {
 	description := DescriptionFromConfig(cfg)
 	nonBOSH, raw, err := strictDiskAllocationSentinel(description)
 	if err != nil {
@@ -188,11 +236,11 @@ func WriteDiskAllocationProvenance(ctx context.Context, c Client, node string, v
 		params.Digest = &digest
 	}
 	if err := c.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid), params); err != nil {
-		return fmt.Errorf("cannot persist managed disk provenance: %w", err)
+		return fmt.Errorf("%w: %w", ErrProvenancePersistFailed, err)
 	}
 	check, err := c.QEMU().Config(ctx, node, vmid)
 	if err != nil || check == nil {
-		return fmt.Errorf("cannot verify managed disk provenance")
+		return fmt.Errorf("%w", ErrProvenanceReadbackUnread)
 	}
 	observed, err := ParseDiskAllocationProvenance(DescriptionFromConfig(check))
 	if err != nil {

@@ -70,7 +70,10 @@ func HandleResizeDisk(deps Deps) Handler {
 		// Resolve to the volume's current name (identity seam): the locator
 		// and slot resolver below match VM config entries, which carry the
 		// post-reassignment name for stable-ID disks.
-		rd, resolveErr := resolveDiskForOp(ctx, deps, "resize_disk", diskCID, bareDiskCID, meta)
+		// A holder that lacks the disk's provenance entry doesn't stop this
+		// first look. The lifecycle below resolves the disk again under the
+		// allocation journal's lock and writes the entry there.
+		rd, resolveErr := resolveDiskForOp(withHolderHeal(ctx, holderHealDefer), deps, "resize_disk", diskCID, bareDiskCID, meta)
 		if resolveErr != nil {
 			return nil, resolveErr
 		}

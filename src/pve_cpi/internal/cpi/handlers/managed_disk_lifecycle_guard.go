@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	"maps"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -191,28 +192,33 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 // observeContinuity reads the disk's actual backing and the cluster's identity
 // and checks both against the record, returning the backing. A protection
 // restore whose read returns an error is not admitted, and it does not lock
-// the guard either (see restoreChecksIncomplete). A read that finishes with an
-// answer that disagrees still locks it, as it does for every other mutation.
+// the guard either (see restoreChecksIncomplete). Any other mutation whose read
+// returns an error is refused unsent and leaves the guard usable as well (see
+// admissionReadFailed). A read that finishes with an answer that disagrees
+// still locks the guard, for every mutation.
 func (g *managedDiskLifecycleGuard) observeContinuity(ctx context.Context, call ManagedAllocationMutation, node, storage string) (string, error) {
 	m := g.lifecycle
 	backing, err := managedDiskActualBacking(ctx, m.deps, storage)
 	if err != nil && isProtectionRestore(call) {
 		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk backing")
 	}
-	if refusal := tailRemovalReadFailed(ctx, call, "the managed disk's backing", err); refusal != nil {
-		return "", refusal
+	if isManagedStorageUnlisted(err) {
+		return "", g.answeredRefusal(ctx, call, "the managed disk's backing", err, fmt.Errorf("managed disk backing changed before mutation"))
 	}
-	if err != nil || backing != m.diskBacking() {
+	if err != nil {
+		return "", g.admissionReadFailed(ctx, call, "the managed disk's backing", err)
+	}
+	if backing != m.diskBacking() {
 		return "", fmt.Errorf("managed disk backing changed before mutation")
 	}
 	identity, err := pve.ObserveStorageClusterIdentity(ctx, m.deps.PVE.Nodes(), []string{node})
 	if err != nil && isProtectionRestore(call) {
 		return "", g.restoreChecksIncomplete(call, node, storage, "managed disk cluster identity")
 	}
-	if refusal := tailRemovalReadFailed(ctx, call, "the managed disk's cluster identity", err); refusal != nil {
-		return "", refusal
+	if err != nil {
+		return "", g.admissionReadFailed(ctx, call, "the managed disk's cluster identity", err)
 	}
-	if err != nil || identity.ID() != m.handle.Record().ClusterID {
+	if identity.ID() != m.handle.Record().ClusterID {
 		return "", fmt.Errorf("managed disk cluster continuity changed before mutation")
 	}
 	return backing, nil
@@ -231,24 +237,28 @@ func (g *managedDiskLifecycleGuard) readHolderState(ctx context.Context, call Ma
 	}
 	observation.before = before
 	if key == managedVMCallUpdateConfig && configWriteDeletesOrReverts(call) {
-		return g.addPendingDeletes(ctx, node, observation)
+		return g.addPendingDeletes(ctx, call, node, observation)
 	}
 	return nil
 }
 
 // readHolderConfig reads the configuration of the VM a mutation targets. As in
 // observeContinuity, a protection restore whose read returns an error ends in
-// restoreChecksIncomplete, and a read that returns nothing still locks the
+// restoreChecksIncomplete, any other mutation whose read returns an error ends
+// in admissionReadFailed, and a read that returns nothing still locks the
 // guard.
 func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call ManagedAllocationMutation, node, storage string, vmid int) (map[string]any, error) {
 	config, err := g.lifecycle.deps.PVE.QEMU().Config(ctx, node, vmid)
 	if err != nil && isProtectionRestore(call) {
 		return nil, g.restoreChecksIncomplete(call, node, storage, "parker configuration")
 	}
-	if refusal := tailRemovalReadFailed(ctx, call, fmt.Sprintf("VM %d's configuration", vmid), err); refusal != nil {
-		return nil, refusal
+	if configReadAnswered(err) {
+		return nil, g.answeredRefusal(ctx, call, fmt.Sprintf("VM %d's configuration", vmid), err, fmt.Errorf("cannot verify lifecycle holder before mutation"))
 	}
-	if err != nil || config == nil {
+	if err != nil {
+		return nil, g.admissionReadFailed(ctx, call, fmt.Sprintf("VM %d's configuration", vmid), err)
+	}
+	if config == nil {
 		return nil, fmt.Errorf("cannot verify lifecycle holder before mutation")
 	}
 	return config, nil
@@ -258,11 +268,15 @@ func (g *managedDiskLifecycleGuard) readHolderConfig(ctx context.Context, call M
 // adds every key whose delete is pending to the observation, with its current
 // value merged into before. A slot delete that PVE could only record as pending
 // is then still the managed volume's slot when the delete is sent again, or
-// when its revert is sent.
-func (g *managedDiskLifecycleGuard) addPendingDeletes(ctx context.Context, node string, observation *managedDiskMutationObservation) error {
+// when its revert is sent. A read that returns an error ends in
+// admissionReadFailed.
+func (g *managedDiskLifecycleGuard) addPendingDeletes(ctx context.Context, call ManagedAllocationMutation, node string, observation *managedDiskMutationObservation) error {
 	views, err := pve.ReadQemuViews(ctx, g.lifecycle.deps.PVE, node, observation.vmid)
+	if configReadAnswered(err) {
+		return g.answeredRefusal(ctx, call, fmt.Sprintf("VM %d's pending changes", observation.vmid), err, fmt.Errorf("cannot verify lifecycle holder pending changes before mutation"))
+	}
 	if err != nil {
-		return fmt.Errorf("cannot verify lifecycle holder pending changes before mutation")
+		return g.admissionReadFailed(ctx, call, fmt.Sprintf("VM %d's pending changes", observation.vmid), err)
 	}
 	current := views.Current()
 	for key := range current {
@@ -517,7 +531,7 @@ func (g *managedDiskLifecycleGuard) prepareResize(ctx context.Context, call Mana
 		}
 		charges, err = managedDiskLifecycleCapacity(ctx, m.deps, m.handle.Record(), node, storage, backing, uint64(delta)<<30)
 		if err != nil {
-			return nil, err
+			return nil, g.verdictUnlessRequestEnded(ctx, call, err)
 		}
 		observation.charges = true
 	}
@@ -621,7 +635,13 @@ func (g *managedDiskLifecycleGuard) prepareMove(ctx context.Context, call Manage
 		return fmt.Errorf("move requires exact receiving slot")
 	}
 	target, err := m.deps.PVE.QEMU().Config(ctx, node, observation.targetVMID)
-	if err != nil || target == nil {
+	if configReadAnswered(err) {
+		return g.answeredRefusal(ctx, call, fmt.Sprintf("VM %d's configuration", observation.targetVMID), err, fmt.Errorf("move receiver cannot be verified"))
+	}
+	if err != nil {
+		return g.admissionReadFailed(ctx, call, fmt.Sprintf("VM %d's configuration", observation.targetVMID), err)
+	}
+	if target == nil {
 		return fmt.Errorf("move receiver cannot be verified")
 	}
 	if value, ok := pve.ConfigString(target, observation.targetSlot); ok && value != "" {
@@ -669,12 +689,18 @@ func (g *managedDiskLifecycleGuard) prepareMigration(ctx context.Context, call M
 		return nil, fmt.Errorf("migration holder lacks managed disk")
 	}
 	continuity, err := pve.ObserveStorageClusterIdentity(ctx, m.deps.PVE.Nodes(), []string{observation.targetNode})
-	if err != nil || continuity.ID() != m.handle.Record().ClusterID {
+	if err != nil {
+		return nil, g.admissionReadFailed(ctx, call, "the migration target's cluster identity", err)
+	}
+	if continuity.ID() != m.handle.Record().ClusterID {
 		return nil, fmt.Errorf("migration target cluster continuity differs")
 	}
 	definition, err := managedDiskActualDefinition(ctx, m.deps, storage)
+	if isManagedStorageUnlisted(err) {
+		return nil, g.answeredRefusal(ctx, call, "the managed disk's storage definition", err, err)
+	}
 	if err != nil {
-		return nil, err
+		return nil, g.admissionReadFailed(ctx, call, "the managed disk's storage definition", err)
 	}
 	observation.copyLocal = !definition.IsShared()
 	if observation.copyLocal {
@@ -686,13 +712,19 @@ func (g *managedDiskLifecycleGuard) prepareMigration(ctx context.Context, call M
 			return nil, fmt.Errorf("migration source volume is invalid")
 		}
 		content, contentErr := m.deps.PVE.Nodes().GetStorageContent(ctx, node, storage, contentName)
-		if contentErr != nil || content == nil || content.Size <= 0 {
+		if pve.IsVolumeMissing(contentErr) {
+			return nil, g.answeredRefusal(ctx, call, "the migration source volume", contentErr, fmt.Errorf("migration source size unavailable"))
+		}
+		if contentErr != nil {
+			return nil, g.admissionReadFailed(ctx, call, "the migration source volume", contentErr)
+		}
+		if content == nil || content.Size <= 0 {
 			return nil, fmt.Errorf("migration source size unavailable")
 		}
 		bytes := uint64(content.Size)
 		charges, err = managedDiskLifecycleCapacity(ctx, m.deps, m.handle.Record(), observation.targetNode, storage, backing, bytes)
 		if err != nil {
-			return nil, err
+			return nil, g.verdictUnlessRequestEnded(ctx, call, err)
 		}
 		observation.charges = true
 	}
@@ -709,12 +741,15 @@ func (g *managedDiskLifecycleGuard) prepareDeletion(ctx context.Context, call Ma
 		return fmt.Errorf("delete refers to an unrelated volume")
 	}
 	current, identityErr := resolveDiskForOp(ctx, m.deps, "delete_disk_pre_submission", m.disk.diskCID, m.disk.birth, m.disk.meta)
-	if identityErr != nil || current.intent != nil || current.holder != nil || len(current.unused) > 0 {
+	if identityErr != nil {
+		return g.identityVerdict(ctx, call, identityErr, fmt.Errorf("storage deletion requires a volume with no remaining guest references"))
+	}
+	if current.intent != nil || current.holder != nil || len(current.unused) > 0 {
 		return fmt.Errorf("storage deletion requires a volume with no remaining guest references")
 	}
 	exists, err := managedVolumePresent(ctx, m.deps, node, volume)
 	if err != nil {
-		return fmt.Errorf("cannot verify delete target before submission")
+		return g.admissionReadFailed(ctx, call, "the delete target's presence", err)
 	}
 	observation.preAbsent = !exists
 
@@ -1251,6 +1286,96 @@ func (m *managedDiskLifecycle) requestEndedRefusal(ctx context.Context, call Man
 	return managedRequestEnded(cause)
 }
 
+// errManagedAdmissionReadFailed marks a lifecycle mutation that the guard
+// refused because one of the reads it makes to admit the mutation returned an
+// error. The refusal comes before any intent is written or PVE is called, so
+// begin hands it back as not attempted and leaves the guard usable. A read that
+// answers with something the record doesn't expect is a different matter, and
+// it still locks the guard.
+var errManagedAdmissionReadFailed = errors.New("managed lifecycle read failed before mutation")
+
+// admissionReadFailed builds the refusal before gives a mutation when one of
+// its admission reads returned err, which must not be nil. A request whose
+// context ended gets the request's own refusal, which counts as a clean lock
+// wait (see cleanLockTimeout), so a request cut off by its deadline partway
+// through admission leaves the allocation as it found it. The detach tail's
+// removal keeps its own refusal, which the tail marks as not sent. Every other
+// mutation gets a retriable refusal that carries errManagedAdmissionReadFailed.
+//
+// The read's cause goes into the text only, so no status in it can make the
+// refusal look like PVE's answer to the mutation. The %v also flattens the
+// class of a typed cause to retriable on purpose. A failed read before the
+// mutation is safe to repeat, because nothing has been sent. A storage
+// definition that is ambiguous or malformed lands here too, as it does for a
+// protection restore (see restoreChecksIncomplete), because it says nothing
+// certain about this disk and the next admission makes the same read again.
+//
+// A read that answered doesn't come here. A VM configuration that doesn't
+// exist, a storage the listing doesn't name, and a migration source volume
+// that's missing are answers only an operator can change, so the callers send
+// them to answeredRefusal before they call this, and the guard locks as it did
+// before reads that fail were told apart from answers.
+func (g *managedDiskLifecycleGuard) admissionReadFailed(ctx context.Context, call ManagedAllocationMutation, what string, err error) error {
+	if ended := g.lifecycle.requestEndedRefusal(ctx, call); ended != nil {
+		return ended
+	}
+	if refusal := tailRemovalReadFailed(ctx, call, what, err); refusal != nil {
+		return refusal
+	}
+	return cpierrors.WrapAs(errors.Join(fmt.Errorf("cannot read %s: %v", what, err), errManagedAdmissionReadFailed), cpierrors.TypeRetriableCloud, //nolint:errorlint // The read's cause stays as text, so its status can't read as PVE refusing the mutation.
+		"managed lifecycle could not check "+call.Service+"."+call.Method+" before sending it, so nothing was sent; retry the operation")
+}
+
+// answeredRefusal is the refusal for an admission read that answered, rather
+// than failed, with err. The detach tail's removal keeps its own refusal, as
+// it did for every error before failed reads got their own path. Every other
+// mutation gets verdict, which locks the guard, so the call stops at the first
+// sign of a condition a retry can't clear.
+func (g *managedDiskLifecycleGuard) answeredRefusal(ctx context.Context, call ManagedAllocationMutation, what string, err, verdict error) error {
+	if refusal := tailRemovalReadFailed(ctx, call, what, err); refusal != nil {
+		return refusal
+	}
+	return verdict
+}
+
+// configReadAnswered reports whether err from a VM configuration read is PVE
+// answering that the configuration doesn't exist, with a 404 or with the 500
+// it returns when the VM's configuration file is gone from this node, as
+// after a migration outside BOSH.
+func configReadAnswered(err error) bool {
+	return pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err)
+}
+
+// verdictUnlessRequestEnded returns verdict, which locks the guard, unless the
+// request's context ended, in which case it returns the request's own refusal.
+// It is for the checks that combine several reads with the conclusions drawn
+// from them, such as the capacity check and the pre-delete reference check,
+// where an error can't be told apart from an answer. Only a request that ended
+// is known not to be an answer, and it leaves the allocation as it found it.
+func (g *managedDiskLifecycleGuard) verdictUnlessRequestEnded(ctx context.Context, call ManagedAllocationMutation, verdict error) error {
+	if ended := g.lifecycle.requestEndedRefusal(ctx, call); ended != nil {
+		return ended
+	}
+	return verdict
+}
+
+// identityVerdict returns verdict, which locks the guard, for an identity
+// check that failed with identityErr before a deletion. The request's own
+// refusal takes its place only when identityErr carries the request's context
+// error, so the check stopped because the request ended. A conflict between
+// PVE and the record is reported as one even when the request ends at the
+// same moment, because it is an answer and the next call finds it again.
+func (g *managedDiskLifecycleGuard) identityVerdict(ctx context.Context, call ManagedAllocationMutation, identityErr, verdict error) error {
+	var conflict *managedIdentityConflict
+	if errors.As(identityErr, &conflict) {
+		return verdict
+	}
+	if !errors.Is(identityErr, context.Canceled) && !errors.Is(identityErr, context.DeadlineExceeded) {
+		return verdict
+	}
+	return g.verdictUnlessRequestEnded(ctx, call, verdict)
+}
+
 // isLockSentinelDelete reports whether call deletes a bosh-lock- sentinel. A
 // lock the request still holds has to be released after the request's context
 // ends, or every other request waits out its TTL. That release runs on its own
@@ -1280,6 +1405,77 @@ func isProtectionRestore(call ManagedAllocationMutation) bool {
 	return on && isParkerProtectionParameters(parkerProtectionStepParameters(fields))
 }
 
+// settleHolderProvenanceWrite settles the holder's provenance write that
+// writeManagedDiskHolder sent, when PVE answered it with an error or the
+// answer was lost. It reads the holder's configuration back once. When the
+// entry the write carried is there, the write landed. When the entry is
+// missing and the configuration's digest is still the one the write was
+// pinned to, the write changed nothing, because PVE checks the digest before
+// it writes. The write changed nothing either when PVE refused it because the
+// digest no longer matched, and the readback shows every setting as it was
+// before the write, with only the digest moved on. That happens when another
+// writer changed only a part of the file that a configuration read doesn't
+// return, such as an older snapshot's section. In each of these cases the
+// step is observed with no volume, the guard stays usable, and write records
+// which it was, so writeManagedDiskHolder can return or send the write again. A readback that fails, a request that
+// has ended, or a configuration whose settings changed without the entry
+// leaves the failure to lock the guard as before, and write says what the
+// readback found.
+func (g *managedDiskLifecycleGuard) settleHolderProvenanceWrite(ctx context.Context, call ManagedAllocationMutation, step string, writeErr error, write *holderProvenanceWrite) bool {
+	write.answer = writeErr.Error()
+	observation, ok := g.observations[step]
+	if !ok || !descriptionOnlyConfigWrite(call) {
+		return false
+	}
+	if ctx.Err() != nil {
+		write.readback = "the request ended before VM " + strconv.Itoa(observation.vmid) + "'s configuration could be read back"
+		return false
+	}
+	pinned, _ := pve.ConfigString(observation.before, "digest")
+	cfg, err := g.lifecycle.deps.PVE.QEMU().Config(ctx, observation.node, observation.vmid)
+	if err != nil || cfg == nil {
+		reason := "it returned no configuration"
+		if err != nil {
+			reason = err.Error()
+		}
+		write.readback = fmt.Sprintf("a readback of VM %d's configuration failed (%s)", observation.vmid, reason)
+		return false
+	}
+	entries, parseErr := pve.ParseDiskAllocationProvenance(pve.DescriptionFromConfig(cfg))
+	actual, found := entries[write.key]
+	digest, _ := pve.ConfigString(cfg, "digest")
+	switch {
+	case parseErr == nil && found && actual == write.entry:
+		write.landed = true
+	case pinned != "" && digest == pinned:
+		write.unchanged = true
+	case parseErr == nil && !found && pve.IsConfigDigestRefusal(writeErr) && sameSettingsApartFromDigest(observation.before, cfg):
+		write.unchanged = true
+	default:
+		write.readback = fmt.Sprintf("a readback found VM %d's configuration changed since the write was pinned to digest %s, now %s, without the disk's entry", observation.vmid, pinned, digest)
+		return false
+	}
+	if err := storageMutationObserved(g.lifecycle.handle, step, nil, false); err != nil {
+		write.landed, write.unchanged = false, false
+		write.readback = "the readback's result could not be recorded in the allocation journal (" + err.Error() + ")"
+		return false
+	}
+	delete(g.observations, step)
+	return true
+}
+
+// sameSettingsApartFromDigest reports whether two reads of a VM's
+// configuration carry the same settings, whatever their digests say.
+func sameSettingsApartFromDigest(before, after map[string]any) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	a, b := maps.Clone(before), maps.Clone(after)
+	delete(a, "digest")
+	delete(b, "digest")
+	return reflect.DeepEqual(a, b)
+}
+
 // settleFailedWrite settles a lifecycle slot delete that PVE answered with an
 // error, when PVE recorded the delete as pending before the unplug failed
 // busy. qemu-server writes the pending delete and then tries the unplug, so a
@@ -1291,6 +1487,9 @@ func isProtectionRestore(call ManagedAllocationMutation) bool {
 // stale digest settles the same way (see settleRefusedDescription). Any other
 // readback, or a failed read, leaves the failure to poison the guard as before.
 func (g *managedDiskLifecycleGuard) settleFailedWrite(ctx context.Context, call ManagedAllocationMutation, step string, writeErr error) bool {
+	if write, ok := ctx.Value(holderProvenanceWriteKey{}).(*holderProvenanceWrite); ok && write != nil {
+		return g.settleHolderProvenanceWrite(ctx, call, step, writeErr, write)
+	}
 	if g.settleRefusedDescription(ctx, call, step, writeErr) {
 		return true
 	}

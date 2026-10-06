@@ -110,7 +110,10 @@ func HandleAttachDisk(deps Deps) Handler {
 		// by (the identity seam): legacy CIDs come back as-is with no API
 		// cost; stable-ID CIDs pay one cluster scan and may surface an
 		// interrupted transfer, which the guard below resumes.
-		rd, err := resolveDiskForOp(ctx, deps, "attach_disk", diskCID, bareDiskCID, meta)
+		// A holder that lacks the disk's provenance entry doesn't stop this
+		// first look. The lifecycle below resolves the disk again under the
+		// allocation journal's lock and writes the entry there.
+		rd, err := resolveDiskForOp(withHolderHeal(ctx, holderHealDefer), deps, "attach_disk", diskCID, bareDiskCID, meta)
 		if err != nil {
 			return nil, err
 		}
