@@ -104,6 +104,12 @@ func cleanupManagedDiskAllocation(ctx context.Context, deps Deps, journal *aj.Jo
 				return
 			}
 			operationErr = errors.Join(operationErr, restoreErr)
+			var returned *explicitCleanupReturnedError
+			if errors.As(restoreErr, &returned) {
+				// The record is intact in ready_to_return, so it needs no
+				// reconciliation, and the error says what to run next.
+				return
+			}
 		}
 		operationErr = errors.Join(operationErr, guard.Err())
 		if operationErr != nil {
@@ -162,24 +168,58 @@ func explicitCleanupBeforeUnparkFrom(ctx context.Context) explicitCleanupHook {
 	return hook
 }
 
+// explicitCleanupReturnedError reports that explicit cleanup of an adopted
+// record could not finish putting the record back after its lock was never
+// entered, because the wait ran out or an admission read failed.
+// The first write persisted, so the record sits in ready_to_return with its CID
+// and every step observed, and the disk was never touched.
+type explicitCleanupReturnedError struct {
+	allocationID string
+	cause        error
+}
+
+func (e *explicitCleanupReturnedError) Error() string {
+	return fmt.Sprintf("the parker lock wait ran out, or a read that admits the lock failed, before cleanup of allocation %s moved the disk, and the write that puts its record back to adopted failed (%s). "+
+		"The disk is still on its parker and the record is in ready_to_return, which needs no reconciliation. "+
+		"Run storage-journal cleanup again once the lock is free to retry the cleanup, or run storage-journal adopt to put the record back to adopted",
+		e.allocationID, describeJournalError(e.cause))
+}
+
+func (e *explicitCleanupReturnedError) Unwrap() error { return e.cause }
+
 // restoreExplicitCleanupDisposition puts back the state and reason the record
 // had before explicit cleanup admitted its lifecycle. The admission and
 // ownership evidence cleanup appended stay, because the journal only ever
-// appends verifications. A record that was adopted passes through
-// reconciliation_required on the way back, the only route the journal allows
-// from the observed state admission leaves it in.
+// appends verifications. The journal has no direct route from the observed
+// state admission leaves the record in to adopted, so a record that was
+// adopted goes back through ready_to_return, the route a finished lifecycle
+// takes. It must not pass through reconciliation_required, because the
+// journal lets a record leave that state only with new evidence, and a clean
+// timeout has none. The ownership evidence admission appended is still the
+// record's latest, and it is what adopted requires. A crash between the two
+// writes leaves the record ready_to_return with its CID and every step
+// observed, which the CPI treats as it treats adopted, and adopt accepts it
+// again. A failure of the second write comes back as an
+// explicitCleanupReturnedError so the caller can tell that state apart from a
+// failure that left the record elsewhere.
 func restoreExplicitCleanupDisposition(handle *aj.Handle, prior aj.Record) error {
 	record := handle.Record()
 	if record.State == prior.State && record.Reason == prior.Reason {
 		return nil
 	}
-	if prior.State == aj.Adopted {
-		record.State = aj.ReconciliationRequired
-		record.Reason = "explicit disk cleanup lock wait ended; restoring adoption"
+	if prior.State == aj.Adopted && record.State != aj.Adopted {
+		record.State = aj.ReadyToReturn
+		record.Reason = prior.Reason
 		if err := handle.Save(record); err != nil {
 			return err
 		}
 		record = handle.Record()
+		record.State = prior.State
+		record.Reason = prior.Reason
+		if err := handle.Save(record); err != nil {
+			return &explicitCleanupReturnedError{allocationID: prior.ID, cause: err}
+		}
+		return nil
 	}
 	record.State = prior.State
 	record.Reason = prior.Reason
