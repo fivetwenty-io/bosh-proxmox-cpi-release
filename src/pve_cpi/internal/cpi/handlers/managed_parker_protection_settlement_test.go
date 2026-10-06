@@ -61,8 +61,8 @@ func TestCutOffRestoreRefusesWhileProtectionIsOff(t *testing.T) {
 		step := c.restoreStep(t)
 		c.setProtection(false)
 		_, err := c.adopt(t)
-		want := fmt.Sprintf("step %s (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned; its parker protection write could not be settled because protection is off on parker %d; run qm set %d --protection 1 on node n1, then retry",
-			step.ID, c.parker, c.parker)
+		want := fmt.Sprintf("step %s (lifecycle_attach_disk_Nodes_UpdateQemuConfig) is planned; its parker protection write could not be settled because protection is off on parker %d; confirm with pvesh get /pools --poolid bosh-lock-vm-%d that no CPI operation holds the parker's lock, and only when it answers that the pool does not exist, run qm set %d --protection 1 on node n1, then retry",
+			step.ID, c.parker, c.parker, c.parker)
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("adopt with protection off = %v, want a refusal containing %q", err, want)
 		}

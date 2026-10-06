@@ -77,7 +77,7 @@ func TestRestoreParkerProtectionLogged_RefusalBeforeTheDeadlineStaysARefusal(t *
 	logger, logged := newRestoreTestLogger(t)
 	ctx := lastAttemptRestoreContext()
 	_, elapsed := callWithCeiling(t, func() struct{} {
-		restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", "pve1", 90000)
+		restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", "pve1", 90000, parkerWindowLockCheck(ctx, 90000))
 		return struct{}{}
 	})
 	if elapsed < lastAttemptRestoreTimeout {
