@@ -49,6 +49,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,13 +196,79 @@ class Slot:
 
     @property
     def director_name(self) -> str:
-        return self.value("director_name") or DEFAULT_DIRECTOR_NAME
+        """The Director's name, resolved the way scripts/bosh resolves it.
+
+        The last of the base vars.yml, the active env's vars.yml, and the
+        slot's slot.yml that sets director_name wins, and the default name
+        stands when none does.
+        """
+        return layered_var("director_name", self.vars_layer_files()) or DEFAULT_DIRECTOR_NAME
+
+    def vars_layer_files(self) -> list[Path]:
+        """The vars files create-env and delete-env layer, lowest precedence first.
+
+        The base vars.yml, then the active env's vars.yml when it exists, then
+        the slot's slot.yml when a non-default slot carries one, which is the
+        order their `-l` flags go on the command line.
+        """
+        files = [self.default_dir / "vars.yml"]
+        env_file = self.default_dir.parent / "envs" / active_env() / "vars.yml"
+        if env_file.exists():
+            files.append(env_file)
+        if self.vars_layer():
+            files.append(self.config)
+        return files
 
     def vars_layer(self) -> list[str]:
         """`-l slot.yml` when a non-default slot carries one, else []."""
         if self.is_default or not self.config.exists():
             return []
         return ["-l", str(self.config)]
+
+
+def active_env(environ: "dict[str, str] | None" = None) -> str:
+    """Active env-bundle name from BOSH_PVE_ENV, defaulting to 'cpitest'."""
+    env = os.environ if environ is None else environ
+    return (env.get("BOSH_PVE_ENV") or "").strip() or DEFAULT_ENV
+
+
+def layered_var(key: str, files: list[Path]) -> "str | None":
+    """The top-level `key` as the last of `files` that sets it, or None.
+
+    A missing file, a file that isn't a mapping, and a file that doesn't
+    mention the key all leave it to the layers below. A file that mentions
+    the key with a null or blank value stops the command, because bosh lets
+    that later file win and would render an empty name. A file that exists
+    and can't be read as UTF-8 YAML stops the command too, since bosh would
+    fail on it as well. The message names the file and, for a YAML error, the
+    line, and never quotes the file.
+    """
+    found: "str | None" = None
+    for f in files:
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except yaml.YAMLError as exc:
+            # The error's own text quotes the bad line, and a vars file holds
+            # lab credentials, so only the path and the line number go out.
+            mark = getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}" if mark is not None else ""
+            sys.exit(f"cannot read {f}{where} to look up {key}: it is not valid YAML. "
+                     "Fix the file, then run again.")
+        except (OSError, UnicodeDecodeError) as exc:
+            sys.exit(f"cannot read {f} to look up {key}: {exc}. Fix the file, then run again.")
+        except (ValueError, RecursionError):
+            sys.exit(f"cannot read {f} to look up {key}: it holds a value YAML can't load. "
+                     "Fix the file, then run again.")
+        if not isinstance(data, dict) or key not in data:
+            continue
+        value = data[key]
+        if value is None or not str(value).strip():
+            sys.exit(f"{key} in {f} is empty, and bosh would render an empty name from it. "
+                     f"Set {key} there to a name, or remove the key. Fix the file, then run again.")
+        found = str(value).strip()
+    return found
 
 
 def _same_path(a: Path, b: Path) -> bool:

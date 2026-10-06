@@ -26,7 +26,8 @@ Commands:
     delete-deployment  Alias for teardown.
     api                Point the cf CLI at https://api.<system_domain>.
     login              cf api + cf login -u admin (password from credhub).
-    admin-password     Print /ocfp-mgmt/cf/cf_admin_password from credhub.
+    admin-password     Print /<director_name>/cf/cf_admin_password from credhub
+                       (ocfp-mgmt unless the vars files name another Director).
     help               Show this message.
 
 Extra args after the command are forwarded to the underlying bosh deploy
@@ -59,6 +60,7 @@ import _cfcompile  # noqa: E402
 import _lightstemcell  # noqa: E402
 import _artifacts  # noqa: E402
 import _checkouts  # noqa: E402
+import _slot  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -1060,9 +1062,19 @@ def credhub_env() -> dict[str, str]:
     return env
 
 
+def director_name() -> str:
+    """The Director's name, which prefixes its credhub paths.
+
+    It resolves the way scripts/bosh resolves it from the base and env vars
+    files, and falls back to ocfp-mgmt when neither names one. This script
+    works against the default slot's Director.
+    """
+    return _slot.resolve(REPO_ROOT, {}).director_name
+
+
 def admin_password() -> str:
     return subprocess.run(
-        ["credhub", "get", "-n", "/ocfp-mgmt/cf/cf_admin_password", "-q"],
+        ["credhub", "get", "-n", f"/{director_name()}/cf/cf_admin_password", "-q"],
         check=True, capture_output=True, text=True, env=credhub_env(),
     ).stdout.strip()
 

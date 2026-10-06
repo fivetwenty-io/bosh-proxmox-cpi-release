@@ -179,6 +179,48 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(slot.director_name, "ocfp-mgmt")
         self.assertEqual(slot.vars_layer(), [])
 
+    def _write_vars(self, base: str = "", env: str = "", env_name: str = "cpitest") -> None:
+        (self.repo.default_dir / "vars.yml").write_text(base)
+        env_dir = self.repo.root / "manifests" / "envs" / env_name
+        env_dir.mkdir(parents=True, exist_ok=True)
+        (env_dir / "vars.yml").write_text(env)
+
+    def test_director_name_comes_from_the_base_vars_file(self) -> None:
+        self._write_vars(base="director_name: lab-director\n")
+        slot = _slot.resolve(self.repo.root, {})
+        with _environ():
+            self.assertEqual(slot.director_name, "lab-director")
+
+    def test_director_name_env_vars_file_wins_over_the_base_file(self) -> None:
+        self._write_vars(base="director_name: base\n", env="director_name: env-director\n")
+        slot = _slot.resolve(self.repo.root, {})
+        with _environ():
+            self.assertEqual(slot.director_name, "env-director")
+        # A different active env leaves the cpitest file out of the layers.
+        self._write_vars(base="director_name: base\n", env="director_name: other\n",
+                         env_name="other")
+        with _environ(BOSH_PVE_ENV="other"):
+            self.assertEqual(slot.director_name, "other")
+        with _environ(BOSH_PVE_ENV="missing"):
+            self.assertEqual(slot.director_name, "base")
+
+    def test_director_name_slot_yml_wins_over_the_vars_files(self) -> None:
+        self._write_vars(base="director_name: base\n", env="director_name: env\n")
+        d = self.repo.slot_dir()
+        (d / "slot.yml").write_text("internal_ip: 192.0.2.12\ndirector_name: cert\n")
+        slot = _slot.resolve(self.repo.root, {"BOSH_STATE_DIR": str(d)})
+        with _environ():
+            self.assertEqual(slot.director_name, "cert")
+        (d / "slot.yml").write_text("internal_ip: 192.0.2.12\n")
+        with _environ():
+            self.assertEqual(slot.director_name, "env")
+
+    def test_director_name_falls_back_when_no_layer_sets_it(self) -> None:
+        self._write_vars(base="internal_gw: 172.31.0.1\n", env="other: 1\n")
+        slot = _slot.resolve(self.repo.root, {})
+        with _environ():
+            self.assertEqual(slot.director_name, "ocfp-mgmt")
+
     def test_slot_yml_sets_alias_name_and_layer(self) -> None:
         d = self.repo.slot_dir()
         (d / "slot.yml").write_text(
