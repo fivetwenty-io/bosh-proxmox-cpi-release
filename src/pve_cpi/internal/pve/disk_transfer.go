@@ -1935,10 +1935,21 @@ func (e *ProtectionRestoreCutOffError) Unwrap() error { return e.err }
 // hold the restore open past the lock's TTL, so it gets
 // parkerRestoreTimeout. It returns the write's error and whether that
 // deadline cut the write off.
+//
+// A deadline that ends the retry loop while it waits out the backoff after
+// PVE refused the write didn't cut a write off, because no write went out
+// after that refusal. The restore judges the last attempt, as it does when
+// the loop runs out of attempts, so it returns the refusal itself and reports no cut-off, the same as a refusal on the
+// loop's last attempt. A deadline that ends the backoff after an attempt that
+// got no answer still reports a cut-off, because that attempt may have
+// applied.
 func putParkerProtectionBack(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int) (bool, error) {
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerRestoreTimeout(ctx))
 	defer cancel()
 	protErr := setParkerProtection(restoreCtx, c, logger, node, parkerVMID, true)
+	if last := lastAttemptBeforeContextEnded(protErr); ProtectionWriteRefused(last) {
+		return false, last
+	}
 	return errors.Is(restoreCtx.Err(), context.DeadlineExceeded), protErr
 }
 
@@ -2027,7 +2038,9 @@ func restoreParkerProtectionLogged(ctx context.Context, c Client, logger *log.Lo
 //   - PVE answers with a failure (ProtectionWriteRefused): the outcome is
 //     known, protection is off, and the Warn tells the operator how to put it
 //     back. It returns nil, as it always has, so the window's own result
-//     stands.
+//     stands. That holds too when the deadline ends the retries during the
+//     backoff after PVE refused, because no write went out after the refusal
+//     (see putParkerProtectionBack).
 //   - The client did not send the restore because it could not finish the
 //     checks it makes before the write (ErrMutationChecksIncomplete), for
 //     example because a read the allocation guard needs failed or ran out of
