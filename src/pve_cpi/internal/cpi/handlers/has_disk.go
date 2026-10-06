@@ -25,6 +25,13 @@ import (
 //     reason is logged at Warn by decodeDiskCID.
 //   - 404 from PVE → false, nil (volume absent is normal).
 //   - Other SDK errors → non-nil error propagated to the dispatcher.
+//   - A managed disk the identity check refuses, or finds absent while its
+//     allocation record isn't terminal, and a stable-ID disk the probe finds
+//     gone while such a record names its token → has_disk waits for any
+//     lifecycle that holds the record and always asks again under a shared
+//     hold. A wait that runs out, a request that ends first, too little time
+//     left for the second look after a wait, or a journal it can't read is
+//     retriable.
 //
 // Node selection: deps.Config.Node is used as the target node. Shared storage
 // volumes are cluster-visible; local storage volumes require the correct node.
@@ -59,139 +66,191 @@ func HandleHasDisk(deps Deps) Handler {
 		// references it — so the storage probe below is only needed for the
 		// unreferenced case, against the resolved name.
 		rd, resolveErr := resolveDiskForOp(ctx, deps, "has_disk", diskCID, bareDiskCID, meta)
-		if held, ok := pve.IsDiskBirthNameHeld(resolveErr); ok {
-			// No slot carries the disk's serial, and the only entries naming
-			// its birth volume can't be proved to hold it. Every other handler
-			// refuses the disk, so we report it missing, and bosh cck can then
-			// report the loss. Answering true would hide the loss behind a
-			// volume that may belong to another disk.
-			deps.Log(ctx).Warn("has_disk: reporting the disk missing, because only entries that can't be proved to hold it name its birth volume",
+		// A lifecycle partway through a managed disk can make the identity
+		// check refuse it, or miss every guest that carries it, so we wait
+		// for that lifecycle and ask again before we answer.
+		rd, present, resolveErr := waitOutHasDiskRefusal(ctx, deps, diskCID, bareDiskCID, meta, rd, resolveErr)
+		if present {
+			return true, nil
+		}
+		if present, answered, err := answerHasDiskResolution(ctx, deps, diskCID, rd, resolveErr); answered {
+			if err != nil {
+				return nil, err
+			}
+			return present, nil
+		}
+		present, err = probeHasDiskVolume(ctx, deps, diskCID, rd.volid)
+		if err != nil {
+			return nil, err
+		}
+		if present || rd.stableID == "" {
+			return present, nil
+		}
+		// The storage probe found the disk's name gone, but a lifecycle may
+		// be moving a disk with a stable ID between two guests, so we check
+		// for one before we answer false.
+		present, err = waitOutUnresolvedHasDisk(ctx, deps, diskCID, bareDiskCID, meta, rd)
+		if err != nil {
+			return nil, err
+		}
+		return present, nil
+	})
+}
+
+// answerHasDiskResolution answers has_disk from a resolution of the disk,
+// when the resolution settles the answer: a refusal, an allocation the
+// identity check verified, or a holder, transfer record, or unused entry
+// that carries the disk. answered is false when only a storage probe of the
+// resolved name can answer.
+func answerHasDiskResolution(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, resolveErr error) (present, answered bool, err error) {
+	if present, answered := answerHasDiskIdentityRefusal(ctx, deps, diskCID, resolveErr); answered {
+		return present, true, nil
+	}
+	if resolveErr != nil {
+		return false, true, resolveErr
+	}
+	if rd.allocation != nil {
+		// Managed resolution already verified physical membership and
+		// visibility, and an absent disk whose record isn't terminal was
+		// looked at again after any lifecycle on it. Do not replace that
+		// proof with a legacy image probe.
+		return !rd.allocation.terminalAbsent && !rd.allocation.absent, true, nil
+	}
+	if !hasDiskUnresolved(rd) {
+		deps.Log(ctx).Debug("has_disk: resolved by identity scan",
+			log.String("disk_cid", diskCID),
+			log.String("volid", rd.volid),
+		)
+		return true, true, nil
+	}
+	return false, false, nil
+}
+
+// probeHasDiskVolume reports whether storage holds volid, the resolved name
+// of a disk no guest, transfer record, or allocation carries.
+func probeHasDiskVolume(ctx context.Context, deps Deps, diskCID, volid string) (bool, error) {
+	// ----------------------------------------------------------------
+	// Parse the volid → storage + volume.
+	// ----------------------------------------------------------------
+	storage, _, err := pve.ParseDiskCID(volid)
+	if err != nil {
+		return false, cpierrors.Wrap(err, "has_disk: invalid disk_cid "+diskCID)
+	}
+
+	// ----------------------------------------------------------------
+	// Resolve node via backend. For local backends, NodeForExisting
+	//    scans the cluster for the owning node and returns DiskNotFound
+	//    when no node holds the volume — surface that as has_disk=false
+	//    rather than an error. PVE's storage content endpoint wants the
+	//    canonical "<storage>:<volname>" volid.
+	// ----------------------------------------------------------------
+	backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
+	if err != nil {
+		return false, cpierrors.Wrap(err, "has_disk: backend resolution failed for storage "+storage)
+	}
+	node, err := backend.NodeForExisting(ctx, volid)
+	if err != nil {
+		if pve.IsNotFound(err) {
+			deps.Log(ctx).Debug("has_disk: backend reports volume not present on any node",
 				log.String("disk_cid", diskCID),
-				log.String("birth_volid", held.BirthVolid),
-				log.Err(resolveErr),
 			)
 			return false, nil
 		}
-		if copied, ok := pve.IsDiskIdentityCopied(resolveErr); ok {
-			// Two guests carry the disk's serial, two parkers record its
-			// transfer, or a slot and a parker's record name different
-			// volumes that are both still there. One of them holds the disk,
-			// so it exists, and every other handler refuses it until an
-			// operator removes the copy.
-			deps.Log(ctx).Warn("has_disk: reporting the disk present, but more than one guest carries its identity, so every other disk call refuses it",
-				log.String("disk_cid", diskCID),
-				log.String("stable_id", copied.StableID),
-				log.Err(resolveErr),
-			)
-			return true, nil
-		}
-		if resolveErr != nil {
-			return nil, resolveErr
-		}
-		if rd.allocation != nil {
-			// Managed resolution already verified physical membership and
-			// visibility. Do not replace that proof with a legacy image probe.
-			return !rd.allocation.terminalAbsent && !rd.allocation.absent, nil
-		}
-		if rd.holder != nil || rd.intent != nil || len(rd.unused) > 0 {
-			deps.Log(ctx).Debug("has_disk: resolved by identity scan",
-				log.String("disk_cid", diskCID),
-				log.String("volid", rd.volid),
-			)
-			return true, nil
-		}
-		bareDiskCID = rd.volid
+		return false, cpierrors.Wrap(pve.WrapError(err), "has_disk")
+	}
 
-		// ----------------------------------------------------------------
-		// 2. Parse disk CID → storage + volume.
-		// ----------------------------------------------------------------
-		storage, _, err := pve.ParseDiskCID(bareDiskCID)
-		if err != nil {
-			return nil, cpierrors.Wrap(err, "has_disk: invalid disk_cid "+diskCID)
-		}
-
-		// ----------------------------------------------------------------
-		// 3. Resolve node via backend. For local backends, NodeForExisting
-		//    scans the cluster for the owning node and returns DiskNotFound
-		//    when no node holds the volume — surface that as has_disk=false
-		//    rather than an error. PVE's storage content endpoint wants the
-		//    canonical "<storage>:<volname>" volid, which is the disk_cid.
-		// ----------------------------------------------------------------
-		backend, err := backendResolverOrDefault(deps).Resolve(ctx, storage)
-		if err != nil {
-			return nil, cpierrors.Wrap(err, "has_disk: backend resolution failed for storage "+storage)
-		}
-		node, err := backend.NodeForExisting(ctx, bareDiskCID)
-		if err != nil {
-			if pve.IsNotFound(err) {
-				deps.Log(ctx).Debug("has_disk: backend reports volume not present on any node",
-					log.String("disk_cid", diskCID),
-				)
-				return false, nil
-			}
-			return nil, cpierrors.Wrap(pve.WrapError(err), "has_disk")
-		}
-
-		// ----------------------------------------------------------------
-		// 4. Settle existence through pve.ProveVolumeAbsent. It starts from
-		//    the same tolerant point probe, so block-backed storages
-		//    (lvmthin/zfspool) that return 500 wrapping "Failed to find
-		//    logical volume" / "dataset does not exist" for a missing volume
-		//    still report a clean false. When the point probe cannot answer
-		//    at all, which is what dir, NFS, and CIFS storage do for a
-		//    missing file, with an HTTP 500 naming volume_size_info rather
-		//    than a 404, so a storage content listing settles it instead, and
-		//    bosh cck gets the false it needs. An absence the listing cannot
-		//    prove stays an error rather than becoming a guess.
-		// ----------------------------------------------------------------
-		// RetryOnTransient + WrapError below: without them a single pvedaemon
-		// worker recycle (HTTP 596/5xx) during the Exists call turned
-		// has_disk into a permanent non-retriable failure — the only PVE
-		// call on this path that had no transient absorption at all.
-		var exists bool
-		err = pve.RetryOnTransient(ctx, deps.Log(ctx), "has_disk_exists", 0, func() error {
-			var inner error
-			exists, inner = pve.ExistsTolerant(ctx, deps.PVE, node, storage, bareDiskCID)
-			return inner
-		})
-		if err != nil {
-			// Belt-and-braces: any not-found classification surfacing through
-			// a non-Exists path still resolves to false.
-			if pve.IsVolumeMissing(err) {
-				deps.Log(ctx).Debug("has_disk: not found via error path, returning false",
-					log.String("disk_cid", diskCID),
-				)
-				return false, nil
-			}
-			// The point probe never answered. Settle the question from a
-			// storage content listing, which is the observation that can tell
-			// a missing file from a backing that went away. The probe error
-			// travels on rather than the proof's, so a cycling pvedaemon
-			// worker still reaches the Director as the retriable fault it is.
-			// No holder scan ran on this path, so the corroborators are the
-			// two that need none: the allocation journal, and PVE's own
-			// status for the storage. An empty listing either of them
-			// contradicts leaves has_disk reporting the probe error rather
-			// than the false a wrong export would otherwise produce.
-			absent, proofErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, bareDiskCID,
-				handlerStorageClassifier(deps, storage), emptyListingCorroborators(deps, nil)...)
-			if proofErr != nil {
-				deps.Log(ctx).Warn("has_disk: the volume's presence could not be proven from a content listing",
-					log.String("disk_cid", diskCID),
-					log.String("node", node),
-					log.Err(proofErr),
-				)
-				return nil, cpierrors.Wrap(pve.WrapError(err),
-					"has_disk: Exists check failed for "+diskCID+" on node "+node)
-			}
-			deps.Log(ctx).Debug("has_disk: settled from a storage content listing",
-				log.String("disk_cid", diskCID),
-				log.Bool("exists", !absent),
-			)
-			return !absent, nil
-		}
-
-		deps.Log(ctx).Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))
-		return exists, nil
+	// ----------------------------------------------------------------
+	// Settle existence through pve.ProveVolumeAbsent. It starts from
+	//    the same tolerant point probe, so block-backed storages
+	//    (lvmthin/zfspool) that return 500 wrapping "Failed to find
+	//    logical volume" / "dataset does not exist" for a missing volume
+	//    still report a clean false. When the point probe cannot answer
+	//    at all, which is what dir, NFS, and CIFS storage do for a
+	//    missing file, with an HTTP 500 naming volume_size_info rather
+	//    than a 404, so a storage content listing settles it instead, and
+	//    bosh cck gets the false it needs. An absence the listing cannot
+	//    prove stays an error rather than becoming a guess.
+	// ----------------------------------------------------------------
+	// RetryOnTransient + WrapError below: without them a single pvedaemon
+	// worker recycle (HTTP 596/5xx) during the Exists call turned
+	// has_disk into a permanent non-retriable failure — the only PVE
+	// call on this path that had no transient absorption at all.
+	var exists bool
+	err = pve.RetryOnTransient(ctx, deps.Log(ctx), "has_disk_exists", 0, func() error {
+		var inner error
+		exists, inner = pve.ExistsTolerant(ctx, deps.PVE, node, storage, volid)
+		return inner
 	})
+	if err != nil {
+		// Belt-and-braces: any not-found classification surfacing through
+		// a non-Exists path still resolves to false.
+		if pve.IsVolumeMissing(err) {
+			deps.Log(ctx).Debug("has_disk: not found via error path, returning false",
+				log.String("disk_cid", diskCID),
+			)
+			return false, nil
+		}
+		// The point probe never answered. Settle the question from a
+		// storage content listing, which is the observation that can tell
+		// a missing file from a backing that went away. The probe error
+		// travels on rather than the proof's, so a cycling pvedaemon
+		// worker still reaches the Director as the retriable fault it is.
+		// No holder scan ran on this path, so the corroborators are the
+		// two that need none: the allocation journal, and PVE's own
+		// status for the storage. An empty listing either of them
+		// contradicts leaves has_disk reporting the probe error rather
+		// than the false a wrong export would otherwise produce.
+		absent, proofErr := pve.ProveVolumeAbsent(ctx, deps.PVE, node, storage, volid,
+			handlerStorageClassifier(deps, storage), emptyListingCorroborators(deps, nil)...)
+		if proofErr != nil {
+			deps.Log(ctx).Warn("has_disk: the volume's presence could not be proven from a content listing",
+				log.String("disk_cid", diskCID),
+				log.String("node", node),
+				log.Err(proofErr),
+			)
+			return false, cpierrors.Wrap(pve.WrapError(err),
+				"has_disk: Exists check failed for "+diskCID+" on node "+node)
+		}
+		deps.Log(ctx).Debug("has_disk: settled from a storage content listing",
+			log.String("disk_cid", diskCID),
+			log.Bool("exists", !absent),
+		)
+		return !absent, nil
+	}
+
+	deps.Log(ctx).Debug("has_disk", log.String("disk_cid", diskCID), log.Bool("exists", exists))
+	return exists, nil
+}
+
+// answerHasDiskIdentityRefusal settles the two identity refusals that have
+// an answer of their own in has_disk, and answered is false for any other
+// error.
+func answerHasDiskIdentityRefusal(ctx context.Context, deps Deps, diskCID string, resolveErr error) (present, answered bool) {
+	if held, ok := pve.IsDiskBirthNameHeld(resolveErr); ok {
+		// No slot carries the disk's serial, and the only entries naming
+		// its birth volume can't be proved to hold it. Every other handler
+		// refuses the disk, so we report it missing, and bosh cck can then
+		// report the loss. Answering true would hide the loss behind a
+		// volume that may belong to another disk.
+		deps.Log(ctx).Warn("has_disk: reporting the disk missing, because only entries that can't be proved to hold it name its birth volume",
+			log.String("disk_cid", diskCID),
+			log.String("birth_volid", held.BirthVolid),
+			log.Err(resolveErr),
+		)
+		return false, true
+	}
+	if copied, ok := pve.IsDiskIdentityCopied(resolveErr); ok {
+		// Two guests carry the disk's serial, two parkers record its
+		// transfer, or a slot and a parker's record name different volumes
+		// that are both still there. One of them holds the disk, so it
+		// exists, and every other handler refuses it until an operator
+		// removes the copy.
+		deps.Log(ctx).Warn("has_disk: reporting the disk present, but more than one guest carries its identity, so every other disk call refuses it",
+			log.String("disk_cid", diskCID),
+			log.String("stable_id", copied.StableID),
+			log.Err(resolveErr),
+		)
+		return true, true
+	}
+	return false, false
 }

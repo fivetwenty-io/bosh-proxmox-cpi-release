@@ -813,17 +813,23 @@ So on this release, we rerun the deploy once the quiet period has passed. When t
 
 For ordinary drift, run `bosh -d <deployment> cloud-check` to reconcile state. The Director offers to detach the disks and clean up the record. If the deployment can't be recovered, detach the disks with `bosh -d <deployment> detach-disk` before deleting the VM. See the [Operations Runbook](operations.md) for recovery procedures.
 
-### A disk call refuses while a move to a parker is unsettled
+<a id="a-disk-call-refuses-while-a-move-to-a-parker-is-unsettled"></a>
+
+### A disk call refuses while a move of the disk is unsettled
 
 **Symptom**
 
 ```text
-managed disk ownership provenance references a missing volume; audit required, because move step attempt-<n>-step-<m> of the disk's record isn't settled; see "A disk call refuses while a move to a parker is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release
+managed disk ownership provenance references a missing volume; audit required, because move step attempt-<n>-step-<m> of the disk's record isn't settled; see "A disk call refuses while a move of the disk is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release
 ```
 
-Every call that resolves the journal-managed disk refuses this way, including `has_disk`, and the refusal is permanent, so the Director doesn't retry it. The call writes nothing to PVE or to the journal before it refuses.
+The 0.9.0 release printed this entry's earlier title, "A disk call refuses while a move to a parker is unsettled", so a refusal from that release points here under that title.
 
-This refusal can also come from a call that overlapped another call's move of the same disk while that move was still in progress, such as a `has_disk` that ran during a `detach_disk`. In that case nothing is wrong with the disk. Once the other call finishes, its move step is settled, and rerunning the refused call clears the refusal with no change from us. So before we look at anything else, we check whether another Director task on this disk was running when the refusal came, and if so, we let it finish and rerun. We go on to the diagnosis below only when the refusal comes back on a rerun with nothing else running on the disk.
+Every call that resolves the journal-managed disk refuses this way, and the refusal is permanent, so the Director doesn't retry it. The call writes nothing to PVE or to the journal before it refuses. `has_disk` is the exception while something still carries the disk. When no other call holds the disk's record and the parker's transfer record still carries the disk, `has_disk` answers true, because the disk's data still exists, and a false answer could lead `bosh cloud-check` to forget the disk. It logs a warning that names the unsettled step. The other disk calls keep refusing until we settle that step.
+
+`has_disk` refuses this way too when nothing carries the disk. That happens when no other call holds the disk's record, no VM or parker carries the disk, the name the record last gave the disk is gone from storage, and a move that set out from that name isn't settled. The record doesn't say where that move landed, so `has_disk` can't show the disk is missing, and a `false` answer could lead `bosh cloud-check` to forget a disk whose data still exists. In this case no parker keeps a record of the transfer, so we don't look for one. We start at step 1 of the fix below, because the audit's `planned step:` line still names the move. We then look for the landed volume on the guest the move was headed for. For a move onto a parker, that's the landing check in step 2. For an attach, it's the instance's VM, where the landed volume is named for that VM and its drive line carries no serial. We settle the step through the same investigation as the rest of this entry, and we don't add the serial or the disk's notes by hand.
+
+This refusal can also come from a call that overlapped another call's move of the same disk while that move was still in progress. In that case nothing is wrong with the disk. Once the other call finishes, its move step is settled, and rerunning the refused call clears the refusal with no change from us. `has_disk` doesn't need that rerun. When its first look finds another call partway through the disk, it waits for that call to let go of the disk's record and then looks again before it answers. It does the same before it reports a journal-managed disk missing, because a disk on its way between two guests can escape every read of the first look. The wait stops 10 seconds before the request's deadline, which leaves that time for the second look, or after 120 seconds when the request has none. If the other call still holds the record by then, or the request ends first, `has_disk` fails with a retriable error that names the other call's operation, and we rerun the cloud check once that operation completes. When `has_disk` can't read the journal, it fails with a retriable error rather than report the disk missing. So before we look at anything else, we check whether another Director task on this disk was running when the refusal came, and if so, we let it finish and rerun. We go on to the diagnosis below only when the refusal comes back on a rerun with nothing else running on the disk.
 
 **Diagnosis**
 
@@ -842,6 +848,16 @@ We start with checks that only read, and we change nothing on PVE or in the jour
 When the volume is this disk's own, the move did happen, and the step needs the investigation that [Delete an allocation through its retained authority](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority) describes. We don't add the serial to the parker's slot by hand. The CPI would then find the disk by its serial, but because no step names the landed volume, every call would refuse it with `managed disk physical backing or volume conflicts with journal; audit required` instead.
 
 When the check prints nothing, or the volume it names belongs to another disk, we leave every parker as it is and follow the same investigation, because the journal can't say where this disk's data went.
+
+**An attach that stopped the same way**
+
+The same state can come from `attach_disk`. When the CPI recorded the task of the move that brings the disk from its parker onto the instance's VM, and then stopped before it settled that move step, the VM carries the disk's serial on a volume that no step of the record names. Every disk call then refuses with this error.
+
+```text
+managed disk physical backing or volume conflicts with journal; audit required
+```
+
+`has_disk` answers true for this disk as well and logs a warning that names the step, but only when no other call holds the disk's record, the unsettled move's task names that VM as the move's target, and the move is on the same storage backing as the VM's volume. A move whose task is missing from the record, or names another VM, explains nothing, so `has_disk` keeps the refusal too, because the volume may be another disk's. We settle the step through the same investigation in [Delete an allocation through its retained authority](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority), and we don't edit the VM's config or description by hand while we do.
 
 ### delete_disk refuses a disk stranded on an unused entry
 
