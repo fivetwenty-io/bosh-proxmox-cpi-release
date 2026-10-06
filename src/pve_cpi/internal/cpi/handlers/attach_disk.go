@@ -457,14 +457,15 @@ func attachDiskViaTransfer(
 	}
 
 	// Receiving side first: record the Director's CID on the VM, then drop
-	// the parker's provenance entry (matched by the pre-move volid it
-	// recorded). Both best-effort — the drive serial is the authoritative
-	// carrier by this point.
+	// the parker's provenance entry (the one under the disk's stable ID that
+	// names the pre-move volid, so a disk PVE parks here meanwhile under that
+	// freed name keeps its own). Both best-effort — the drive serial is the
+	// authoritative carrier by this point.
 	if err := writeManagedDiskHolder(ctx, deps, rd, node, vmid, rd.volid); err != nil {
 		return "", "", errors.Join(err, restoreCutOff)
 	}
 	pve.UpdateAttachedDiskCID(ctx, deps.PVE, deps.Log(ctx), node, vmid, rd.sentinelKey(), diskCID)
-	pve.RemoveParkerProvenanceEntry(ctx, deps.PVE, deps.Log(ctx), plan.parker.Node, plan.parker.VMID, preVolid, parkerCfg)
+	pve.RemoveParkerProvenanceEntry(ctx, deps.PVE, deps.Log(ctx), plan.parker.Node, plan.parker.VMID, preVolid, rd.stableID, parkerCfg)
 
 	deps.Log(ctx).Info(op+": persistent disk attached by reassignment",
 		log.String("vm_cid", vmCID),

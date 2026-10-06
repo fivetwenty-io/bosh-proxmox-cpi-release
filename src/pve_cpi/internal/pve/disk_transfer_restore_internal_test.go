@@ -201,11 +201,14 @@ func TestDeleteParkedOwnedDisk_HungRestoreHitsItsDeadline(t *testing.T) {
 			paramProtection: true,
 			"scsi1":         "data:vm-90000-disk-2,serial=" + transferStableID,
 			"description":   desc,
+			// PVE answers every config read with a digest, and the
+			// provenance removal writes only with one.
+			"digest": "digest-0",
 		},
 	})}
 	logger, logged := newRestoreTestLogger(t)
 	start := time.Now()
-	err := DeleteParkedOwnedDisk(ctx, c, logger, "pve1", 90000, "data:vm-90000-disk-2", transferTestCfg)
+	err := DeleteParkedOwnedDisk(ctx, c, logger, "pve1", 90000, "data:vm-90000-disk-2", transferStableID, transferTestCfg)
 	elapsed := time.Since(start)
 	if err != nil && !strings.HasPrefix(err.Error(), "delete parked:") {
 		t.Fatalf("error %q does not name the deletion", err)
@@ -261,22 +264,23 @@ func TestRestoreParkerProtection_KnownFailureStaysAWarning(t *testing.T) {
 // demoted-slot sweep, and the lock release, still ends before the protection
 // lock's TTL, so no waiter can steal the lock while the restore is in flight.
 func TestParkerRestoreDeadlineFitsInsideTheLockTTL(t *testing.T) {
-	ttl := ParkerProtectionLockTTL
-	// A window's body stops parkerWindowReserve before its claim's expiry
+	ttl := parkerProtectionLockTTLNow()
+	// A window's body stops parkerWindowReserveNow before its claim's expiry
 	// (parkerWindowDeadline), so the longest body is the TTL less that reserve.
-	window := ttl - parkerWindowReserve
-	if parkerProtectionRestoreTimeout > parkerProtectionRestoreReserve {
-		t.Fatalf("restore deadline %s exceeds the reserve %s the window leaves for it", parkerProtectionRestoreTimeout, parkerProtectionRestoreReserve)
+	window := ttl - parkerWindowReserveNow()
+	restore := parkerRestoreTimeout(context.Background())
+	if restore > parkerProtectionRestoreReserveNow() {
+		t.Fatalf("restore deadline %s exceeds the reserve %s the window leaves for it", restore, parkerProtectionRestoreReserveNow())
 	}
-	if window+parkerProtectionRestoreTimeout >= ttl {
-		t.Fatalf("window budget %s plus restore deadline %s reaches the TTL %s", window, parkerProtectionRestoreTimeout, ttl)
+	if window+restore >= ttl {
+		t.Fatalf("window budget %s plus restore deadline %s reaches the TTL %s", window, restore, ttl)
 	}
-	if total := window + parkerProtectionRestoreTimeout + parkerDemotedSweepTimeout + parkerLockReleaseTimeout; total > ttl {
+	if total := window + restore + parkerDemotedSweepTimeoutNow() + parkerLockReleaseTimeout; total > ttl {
 		t.Fatalf("window %s, restore %s, sweep %s, and release %s add up to %s, past the TTL %s",
-			window, parkerProtectionRestoreTimeout, parkerDemotedSweepTimeout, parkerLockReleaseTimeout, total, ttl)
+			window, restore, parkerDemotedSweepTimeoutNow(), parkerLockReleaseTimeout, total, ttl)
 	}
-	if got := parkerRestoreTimeout(context.Background()); got != parkerProtectionRestoreTimeout {
-		t.Fatalf("restore deadline without an override = %s, want %s", got, parkerProtectionRestoreTimeout)
+	if restore != parkerProtectionRestoreReserveNow() {
+		t.Fatalf("restore deadline without an override = %s, want %s", restore, parkerProtectionRestoreReserveNow())
 	}
 	if got := parkerRestoreTimeout(WithParkerProtectionRestoreTimeoutForTest(context.Background(), time.Second)); got != time.Second {
 		t.Fatalf("restore deadline with a 1s override = %s", got)
@@ -456,7 +460,7 @@ func TestDeleteParkedOwnedDisk_DetachWithUnknownOutcomeSaysSo(t *testing.T) {
 				"description":   desc,
 			},
 		})}}
-	err := DeleteParkedOwnedDisk(ctx, c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferTestCfg)
+	err := DeleteParkedOwnedDisk(ctx, c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferStableID, transferTestCfg)
 	if err == nil {
 		t.Fatal("a dropped detach with a cut-off restore returned no error")
 	}

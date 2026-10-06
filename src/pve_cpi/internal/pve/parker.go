@@ -45,7 +45,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -300,25 +302,44 @@ func renderParkerSentinel(nonBOSH string, disks map[string]parkerProvEntry, raw 
 // updateParkerProvenance merges a parked-disk entry into the parker VM
 // description sentinel and writes it back via UpdateQemuConfig.
 //
-// Best-effort: any failure is logged at WARN and the function returns nil.
-// Park/unpark success is never gated on provenance writes.
+// The write is digest-guarded (see writeParkerProvenance), so a park that
+// races another request's write on the same parker no longer overwrites that
+// request's record: PVE refuses whichever write was built on the older read,
+// and that writer reads again and adds its record to what the other left.
 //
-// Concurrent-park lost-update is acceptable — two CPI processes racing to
-// park different disks on the same parker may each overwrite the other's
-// provenance entry. The disk itself remains correctly attached; provenance
-// is advisory metadata for disk-audit.
-func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) {
+// Most failures are logged at WARN and the function returns nil, because the
+// disk itself is already correctly attached. The two ways the guard itself
+// stops the write are the exception and come back as an error: giving up after
+// every round was refused, and giving up after every read came back without a
+// digest. Before the guard, such a write would have landed, by overwriting the
+// other writer or by writing over a read that carried nothing; now it lands
+// nothing, and the record is what findParkedDiskIntentByStableID reads to
+// resolve a disk whose volume was renamed. A park that ends without its record
+// must say so, so the caller fails the park rather than report a disk parked
+// without its identity record.
+func updateParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, slot string, cfg ParkerConfig, pctx ParkContext) error {
 	entry := buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, pctx)
-	if err := writeParkerProvenance(ctx, c, logger, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg); err != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: provenance not updated",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("node", node),
-				log.String("volid", bareVolid),
-				log.Err(err),
-			)
-		}
+	err := writeParkerProvenance(ctx, c, logger, node, parkerVMID, parkerProvKey(bareVolid, pctx.StableID), entry, cfg)
+	if err == nil {
+		return nil
 	}
+	if errors.Is(err, ErrParkerDescriptionContended) {
+		return cpierrors.Wrap(err, fmt.Sprintf(
+			"ParkDisk: record provenance for %s on parker vmid %d: the parker's config kept changing, so the record was not written", bareVolid, parkerVMID))
+	}
+	if errors.Is(err, errParkerConfigNoDigest) {
+		return cpierrors.Wrap(err, fmt.Sprintf(
+			"ParkDisk: record provenance for %s on parker vmid %d: the parker's config reads carried no digest, so the record was not written", bareVolid, parkerVMID))
+	}
+	if logger != nil {
+		logger.Warn("parker provenance: provenance not updated",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.String("volid", bareVolid),
+			log.Err(err),
+		)
+	}
+	return nil
 }
 
 // parkerProvKey is the sentinel key a provenance entry lives under: the
@@ -510,10 +531,10 @@ func projectParkerProvenance(
 // renamed under it. Losing it silently costs more than parking one slot later
 // on the next parker, so capacity is checked before the disk moves.
 //
-// The probe is one config read outside the protection window. A park that wins
-// the race between this read and the write still lands on a full store and
-// still drops its record; that is the same concurrent-park lost update the
-// ParkContext doc already declares acceptable, narrowed to the moments two
+// The probe is one config read outside the protection window. A park that
+// loses the race between this read and its write to another park that filled
+// the store meets ErrProvenanceFull at the write, which updateParkerProvenance
+// logs, and its record is dropped. That gap is narrowed to the moments two
 // parks target one nearly-full parker.
 func parkerProvenanceRoom(
 	ctx context.Context, c Client, node string, parkerVMID int, bareVolid string,
@@ -537,10 +558,19 @@ func parkerProvenanceRoom(
 }
 
 // writeParkerProvenance is the strict read-modify-write behind every
-// provenance update. Ordinary parks treat a failure as advisory (the
-// best-effort wrapper above); the detach-side transfer does not — its intent
+// provenance update. Ordinary parks treat most failures as advisory (the
+// wrapper above), though not a write that gave up because the parker's config
+// kept changing. The detach-side transfer treats none as advisory — its intent
 // record is the crash-window identity carrier, so the transfer refuses to
 // delete the source slot until this write has landed.
+//
+// The write is digest-guarded (see writeParkerDescriptionGuarded). Each round
+// reads the parker, adds or updates only the record under key, collects stale
+// records from that same read, and sends the result with the read's digest. A
+// write refused because another writer changed the parker in between is
+// retried from a fresh read, so the other writer's records survive. When every
+// round is refused it returns ErrParkerDescriptionContended, retriable, and has
+// written nothing.
 //
 // Every write collects stale records first. Nothing else does: the only other
 // deletion, removeParkerProvenance, removes the single volid it was handed, so
@@ -548,28 +578,105 @@ func parkerProvenanceRoom(
 // remove whose config write failed and logged, a director torn down while its
 // disks were reaped by hand) leaves its record behind forever. That is how the
 // store reaches PVE's description cap by accumulation rather than by load.
+//
+// This is the replace mode: the caller's entry is the whole record, and a record
+// the fresh read already keeps under key is overwritten apart from the
+// allocation identity projectParkerProvenance carries forward. The intent and
+// park writes use it, because a record they find under key is history from an
+// earlier park, and its option overrides must not come back. A write that only
+// moves this transfer's own record on uses rewriteParkerProvenance instead.
 func writeParkerProvenance(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
 ) error {
-	_, err := writeParkerProvenanceCollecting(ctx, c, logger, node, parkerVMID, key, entry, cfg)
+	_, err := writeParkerProvenanceCollecting(ctx, c, logger, node, parkerVMID, key, entry, cfg, parkerProvReplace)
 	return err
 }
 
-// writeParkerProvenanceCollecting is writeParkerProvenance for a caller that
-// needs to know which records the write collected. It returns their keys.
+// rewriteParkerProvenance is writeParkerProvenance in update mode, for the
+// writes that move a transfer's record on after its intent was written: the
+// transfer's finalize, the resumed transfer's finalize, a resume's fallback
+// slot, and a migration's finalize and converge. Each builds the entry from a
+// snapshot taken earlier in the call, and an update_disk on the same disk can
+// write new option overrides into the record in between, because the overlay
+// takes no parker lock. In update mode each round keeps the option overrides
+// the fresh read shows for this record, so the overrides update_disk reported
+// as recorded survive the rewrite. Everything else comes from entry.
+func rewriteParkerProvenance(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
+) error {
+	_, err := writeParkerProvenanceCollecting(ctx, c, logger, node, parkerVMID, key, entry, cfg, parkerProvUpdate)
+	return err
+}
+
+// parkerProvWriteMode says how a provenance write treats the record that a
+// fresh read already keeps under the write's key.
+type parkerProvWriteMode int
+
+const (
+	// parkerProvReplace writes the caller's entry over the recorded one.
+	parkerProvReplace parkerProvWriteMode = iota
+	// parkerProvUpdate writes the caller's entry but keeps the recorded
+	// entry's option overrides when the recorded entry is this transfer's.
+	parkerProvUpdate
+)
+
+// withRecordedOpts returns entry with the option overrides vmCfg's record
+// under key carries, when that record belongs to the same transfer as entry.
+// A record belongs to the same transfer when it names the same source VM and
+// the same allocation, where a side that leaves either field empty doesn't
+// count against it. Without such a record, entry comes back unchanged. The
+// recorded overrides replace entry's whole map, including an empty one, so an
+// option that update_disk cleared stays cleared.
+func withRecordedOpts(vmCfg map[string]any, key string, entry parkerProvEntry) parkerProvEntry {
+	_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	recorded, ok := disks[key]
+	if !ok {
+		return entry
+	}
+	if recorded.SourceVMCID != "" && entry.SourceVMCID != "" && recorded.SourceVMCID != entry.SourceVMCID {
+		return entry
+	}
+	if recorded.AllocationID != "" && entry.AllocationID != "" && recorded.AllocationID != entry.AllocationID {
+		return entry
+	}
+	entry.Opts = maps.Clone(recorded.Opts)
+	return entry
+}
+
+// writeParkerProvenanceCollecting is the write behind writeParkerProvenance
+// and rewriteParkerProvenance, for a caller that also needs to know which
+// records the write collected. It returns their keys, from the read the
+// landed write was built on.
 func writeParkerProvenanceCollecting(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
+	mode parkerProvWriteMode,
 ) ([]string, error) {
-	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
-	if err != nil {
-		return nil, cpierrors.Wrap(WrapConfigReadError(err), "parker provenance: config fetch")
-	}
-
-	now := provenanceNow(ctx, cfg)
-	held := parkerProvenanceSourceKeeps(ctx, c, logger, node, parkerVMID, vmCfg, key, now, cfg)
-	newDesc, pruned, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, entry, now, held)
+	var held map[string]bool
+	var pruned []string
+	err := writeParkerDescriptionGuarded(ctx, c, parkerDescriptionWrite{
+		node: node,
+		vmid: parkerVMID,
+		what: "parker provenance",
+		edit: func(vmCfg map[string]any) (string, bool, error) {
+			now := provenanceNow(ctx, cfg)
+			held = parkerProvenanceSourceKeeps(ctx, c, logger, node, parkerVMID, vmCfg, key, now, cfg)
+			write := entry
+			if mode == parkerProvUpdate {
+				write = withRecordedOpts(vmCfg, key, entry)
+			}
+			desc, collected, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, write, now, held)
+			pruned = collected
+			if projectErr != nil {
+				return "", false, projectErr
+			}
+			return desc, true, nil
+		},
+	})
+	// Logged once, from the last round's read, so a refused round does not
+	// report the same records twice.
 	if len(held) > 0 && logger != nil {
 		logger.Info("parker provenance: kept stale transfer records that are still the only link to their volume",
 			log.Int("parker_vmid", parkerVMID),
@@ -577,7 +684,9 @@ func writeParkerProvenanceCollecting(
 			log.String("keys", strings.Join(heldKeys(held), ",")),
 		)
 	}
-	if len(pruned) > 0 && logger != nil {
+	// Only a write that landed collected anything. After a refusal, a give-up,
+	// or a failed write the records are all still on the parker.
+	if err == nil && len(pruned) > 0 && logger != nil {
 		logger.Info("parker provenance: collected stale parked-disk records",
 			log.Int("parker_vmid", parkerVMID),
 			log.String("node", node),
@@ -585,31 +694,49 @@ func writeParkerProvenanceCollecting(
 			log.String("keys", strings.Join(pruned, ",")),
 		)
 	}
-	if projectErr != nil {
-		return nil, projectErr
-	}
-
-	nodesSvc := c.Nodes()
-	if nodesSvc == nil {
-		// No nodes service available (e.g. test stub without injection). Skip silently.
-		return nil, nil
-	}
-	vmidStr := fmt.Sprintf("%d", parkerVMID)
-	if updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
-		Description: &newDesc,
-	}); updateErr != nil {
-		return nil, cpierrors.Wrap(WrapMutationError(updateErr), "parker provenance: UpdateQemuConfig")
+	if err != nil {
+		return nil, err
 	}
 	return pruned, nil
 }
 
-// removeParkerProvenance removes the bareVolid entry from the parker VM
-// description sentinel. When no entry exists, no API call is made.
+// removeParkerProvenance removes the record of the disk that just left the
+// parker as bareVolid from the parker VM description sentinel. When no such
+// record exists, nothing is written.
 //
-// Best-effort: any failure is logged at WARN and the function returns nil.
-func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, _ ParkerConfig) {
-	vmidStr := fmt.Sprintf("%d", parkerVMID)
-
+// The record is found by the disk's identity, not by the volume name alone.
+// PVE gives a freed name to the next volume it renames onto the same parker,
+// so once our disk has left, another disk can be parked under bareVolid and
+// carry a record that names it. Matching on the name would delete that
+// disk's record. So a disk with a stable ID has only the record under that
+// stable ID removed, and only while the record still names bareVolid. A legacy
+// record, keyed by the bare volid itself, is removed by that key. A caller
+// that can't name the disk's stable ID passes an empty one, and then every
+// record that names bareVolid goes, which the check below keeps safe.
+//
+// The removal is also skipped when the fresh read shows bareVolid on one of
+// the parker's bus slots or unusedN entries, because the record may then
+// belong to a disk that really is there. The one exception is a slot whose
+// serial names another stable ID while we know our own: that is another disk
+// under a reused name, so our own stable-ID record is removed, and nothing
+// else. A record that names a volume no key of the parker names any more is
+// a leftover, whichever disk wrote it, because a transfer records the name
+// its volume lands under only after the volume has landed.
+//
+// The removal can run after the protection claim has expired, so another
+// holder may write its own provenance entry to this parker while we work. The
+// write is digest-guarded (see writeParkerDescriptionGuarded): each round reads
+// the config, removes only our record from that read, and sends the result with
+// the read's digest. PVE refuses the write if the config changed in between,
+// and the next round reads again and removes our record from what the other
+// writer left, so every other entry survives. A read that carries no digest
+// can't guard the write, so nothing is written from it. When our record is
+// already gone, nothing is written either.
+//
+// Best-effort: the removal is cleanup, so every failure is logged and the
+// function returns nothing. A record left behind names a volume that is no
+// longer on this parker, and a later provenance write collects it as stale.
+func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, stableID string, _ ParkerConfig) {
 	// Detached and bounded: this runs after the volume has already left the
 	// parker, so a context stopped by the protection window's deadline would
 	// leave a provenance entry naming a volume that is no longer there -- the
@@ -617,70 +744,126 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkerProvenanceRemoveTimeout)
 	defer cancel()
 
-	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
-	if err != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: config fetch failed on remove — provenance not removed",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("node", node),
-				log.String("volid", bareVolid),
-				log.Err(err),
-			)
-		}
-		return
-	}
-
-	currentDesc := DescriptionFromConfig(vmCfg)
-
-	nonBOSH, disks, rawOther := parseParkerSentinel(currentDesc)
-
-	// Match both keyings: legacy entries are keyed by the bare volid; stable-ID
-	// entries are keyed by the bpd- token and name the volid in their Volid
-	// field. The caller only ever knows the volid it just moved off the parker,
-	// and that matches exactly one entry under either scheme.
-	removed := false
-	for key := range disks {
-		entry := disks[key]
-		if key == bareVolid || entry.Volid == bareVolid {
-			delete(disks, key)
-			removed = true
-		}
-	}
-	// Absent entry — nothing to remove; skip the API call.
-	if !removed {
-		return
-	}
-
-	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
-	if marshalErr != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: marshal failed on remove — provenance not removed",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("volid", bareVolid),
-				log.Err(marshalErr),
-			)
-		}
-		return
-	}
-
-	nodesSvc := c.Nodes()
-	if nodesSvc == nil {
-		// No nodes service available (e.g. test stub without injection). Skip silently.
-		return
-	}
-	updateErr := nodesSvc.UpdateQemuConfig(ctx, node, vmidStr, &sdknodes.UpdateQemuConfigParams{
-		Description: &newDesc,
+	stillHeld := false
+	err := writeParkerDescriptionGuarded(ctx, c, parkerDescriptionWrite{
+		node: node,
+		vmid: parkerVMID,
+		what: "parker provenance",
+		edit: func(vmCfg map[string]any) (string, bool, error) {
+			nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+			keys := parkerProvenanceRecordsOf(disks, bareVolid, stableID)
+			// Absent record — nothing to remove; skip the API call. On a later
+			// round this means another writer removed it after our first read.
+			if len(keys) == 0 {
+				stillHeld = false
+				return "", false, nil
+			}
+			holds, onlyOtherDisks := parkerConfigNamesVolume(vmCfg, bareVolid, stableID)
+			stillHeld = holds && (stableID == "" || !onlyOtherDisks)
+			if stillHeld {
+				return "", false, nil
+			}
+			if holds {
+				// Another disk holds the name now. Its record, if it has one,
+				// is under its own stable ID, so only ours goes, and a legacy
+				// record under the name stays with the name.
+				if !slices.Contains(keys, stableID) {
+					return "", false, nil
+				}
+				keys = []string{stableID}
+			}
+			for _, key := range keys {
+				delete(disks, key)
+			}
+			newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
+			if marshalErr != nil {
+				return "", false, cpierrors.Wrap(marshalErr, "parker provenance: marshal")
+			}
+			return newDesc, true, nil
+		},
 	})
-	if updateErr != nil {
-		if logger != nil {
-			logger.Warn("parker provenance: UpdateQemuConfig failed on remove — provenance not removed",
+	if logger == nil {
+		return
+	}
+	if err == nil {
+		if stillHeld {
+			logger.Info("parker provenance: the parker still holds the volume, so its record stays",
 				log.Int("parker_vmid", parkerVMID),
 				log.String("node", node),
 				log.String("volid", bareVolid),
-				log.Err(updateErr),
+				log.String("stable_id", stableID),
 			)
 		}
+		return
 	}
+	if errors.Is(err, ErrParkerDescriptionContended) {
+		logger.Info("parker provenance: config kept changing under the remove — provenance left for later collection",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.String("volid", bareVolid),
+			log.Int("attempts", parkerDescriptionWriteAttempts),
+		)
+		return
+	}
+	logger.Warn("parker provenance: provenance not removed",
+		log.Int("parker_vmid", parkerVMID),
+		log.String("node", node),
+		log.String("volid", bareVolid),
+		log.Err(err),
+	)
+}
+
+// parkerProvenanceRecordsOf returns the keys of the records in disks that
+// belong to the disk that was parked as bareVolid: the record under stableID
+// when it names bareVolid, and a legacy record keyed by bareVolid itself. A
+// record under any other key belongs to another disk, even when it names
+// bareVolid, because PVE reuses a freed volume name for the next volume it
+// renames onto the parker. With stableID empty it returns every record keyed
+// by bareVolid or naming it, sorted, and the caller must first make sure that
+// nothing on the parker holds bareVolid.
+func parkerProvenanceRecordsOf(disks map[string]parkerProvEntry, bareVolid, stableID string) []string {
+	var keys []string
+	if stableID == "" {
+		for key := range disks {
+			if key == bareVolid || disks[key].Volid == bareVolid {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		return keys
+	}
+	if entry, ok := disks[stableID]; ok && entry.Volid == bareVolid {
+		keys = append(keys, stableID)
+	}
+	if _, ok := disks[bareVolid]; ok {
+		keys = append(keys, bareVolid)
+	}
+	return keys
+}
+
+// parkerConfigNamesVolume reports whether a bus slot or an unusedN entry in
+// vmCfg names bareVolid, and whether every key that names it carries a
+// stable-ID serial other than stableID. Only a drive line on a bus slot can
+// carry a serial, so a name on an unusedN entry, or on a slot without a
+// serial, never counts as another disk's. With stableID empty no serial
+// counts as another disk's either.
+func parkerConfigNamesVolume(vmCfg map[string]any, bareVolid, stableID string) (holds, onlyOtherDisks bool) {
+	onlyOtherDisks = true
+	for key, raw := range vmCfg {
+		if !isQemuDiskKey(key) {
+			continue
+		}
+		value, ok := ConfigStringValue(raw)
+		if !ok || bareDriveVolid(value) != bareVolid {
+			continue
+		}
+		holds = true
+		serial, hasSerial := StableIDFromDriveOptStr(value)
+		if stableID == "" || !hasSerial || serial == stableID {
+			onlyOtherDisks = false
+		}
+	}
+	return holds, holds && onlyOtherDisks
 }
 
 // parkerTagSanitizeRe removes characters that PVE rejects in tag values.
@@ -1727,7 +1910,7 @@ func parkDiskOnNode(ctx context.Context, c Client, logger *log.Logger, node, bar
 
 // parkerWindowMaxAttempts bounds every retry loop that runs inside a parker's
 // protection window. The window is guarded by a cluster lock with a TTL
-// (parkerProtectionLockTTL), and a later acquirer steals a lock whose TTL has
+// (parkerProtectionLockTTLNow), and a later acquirer steals a lock whose TTL has
 // expired -- so a call that retries past the TTL does not just run slowly, it
 // runs on past the point where another park or unpark is entitled to enter the
 // same window. The storage-lock curve alone would sleep past two minutes over
@@ -1787,13 +1970,18 @@ func attachAndSecure(ctx context.Context, c Client, logger *log.Logger, node str
 	}); lockErr != nil {
 		return lockErr
 	}
-	// Provenance is written OUTSIDE the window on purpose. It is advisory
-	// metadata for disk-audit whose lost-update race is already declared
-	// acceptable (see the ParkContext doc), so serializing it protects nothing
-	// that matters -- while a config read plus a description write on a parker
-	// carrying up to 31 sentinel entries is real time added to a critical
-	// section that must finish inside the lock's TTL.
-	updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, landedSlot, cfg, pctx)
+	// Provenance is written OUTSIDE the window on purpose. A config read plus a
+	// description write on a parker carrying up to 31 sentinel entries is real
+	// time added to a critical section that must finish inside the lock's TTL,
+	// and the lock is not what keeps the write from losing another holder's
+	// record. The write's digest does that: PVE refuses it when the parker's
+	// config changed after our read, and updateParkerProvenance reads again and
+	// adds only our record to what the other holder left. A write that is
+	// refused on every round fails the park, because the disk would otherwise
+	// sit on the parker without its record.
+	if provErr := updateParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, landedSlot, cfg, pctx); provErr != nil {
+		return provErr
+	}
 	return nil
 }
 
@@ -1841,7 +2029,7 @@ func attachToParkerLocked(ctx context.Context, c Client, logger *log.Logger, nod
 		// and both the sentinel-pool acquire and the detach it guards would
 		// otherwise fail instantly on the dead context and leave the unusedN
 		// key behind for good.
-		sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+		sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeoutNow())
 		defer sweepCancel()
 		// The *Locked* variant: this runs with the parker's protection lock
 		// already held by attachAndSecure, and AcquireClusterLock is not
@@ -2068,27 +2256,47 @@ func UnparkDiskAt(ctx context.Context, c Client, logger *log.Logger, bareVolid s
 	return unparkAt(ctx, c, logger, bareVolid, holder.VMID, holder.Node, holder.Slot, cfg)
 }
 
-// parkerProtectionLockTTL bounds how long a held protection-window lock is
-// considered live. A holder whose recorded expiry has passed is treated as
-// crashed and its lock is stolen, so this has to exceed the longest window any
-// caller can legitimately hold — otherwise the lock is taken from a process
-// that is still inside its own window, which is the exact race it exists to
-// prevent, now silent.
+// parkerProtectionLockTTL is the base from which parkerProtectionLockTTLNow
+// derives how long a held protection-window lock is considered live. A holder
+// whose recorded expiry has passed is treated as crashed and its lock is
+// stolen, so the TTL has to exceed the longest window any caller can
+// legitimately hold. Otherwise the lock is taken from a process that is still
+// inside its own window, which is the exact race it exists to prevent, now
+// silent.
 //
 // The longest window is the park path: up to attachParkerVerifyRetries
 // iterations of config read, attach, task await, and verify read, then a
-// protection write and a provenance write. Rather than assume 180s covers the
-// sum of those retry curves -- it does not, on the pushback curve -- the window
-// runs under a deadline derived from the claim's expiry (parkerWindowDeadline),
-// so work that would outlive the lock is cut off instead of continuing past the point
-// where another caller may enter. A waiter that times out is handed a retriable
-// error rather than proceeding unserialized, since reaching the deadline means a
-// live holder was inside the window throughout.
+// protection write and a provenance write. Rather than assume the TTL covers
+// the sum of those retry curves -- it does not, on the pushback curve -- the
+// window runs under a deadline derived from the claim's expiry
+// (parkerWindowDeadline), so work that would outlive the lock is cut off
+// instead of continuing past the point where another caller may enter. A
+// waiter that times out is handed a retriable error rather than proceeding
+// unserialized, since reaching the deadline means a live holder was inside
+// the window throughout.
+//
+// Code that sizes a wait, a budget, or a timeout around this lock uses
+// ParkerProtectionLockTTLNow, never this base.
 const parkerProtectionLockTTL = 180 * time.Second
 
-// ParkerProtectionLockTTL exports the protection-window lock's TTL, which is
-// the longest a live holder's claim can stand before a waiter may steal it.
-const ParkerProtectionLockTTL = parkerProtectionLockTTL
+// parkerProtectionLockTTLNow is the TTL a protection-window lock claims with.
+// It is parkerProtectionLockTTL plus however far the deferred sweep's reserve
+// and the protection restore's reserve grow past their floors on the retry
+// curves configured now. The window's body then keeps the 90 seconds it has
+// when both fit their floors rather than giving that time up to the sweep or
+// the restore. On the shipped curves the sweep's worst case already exceeds
+// its floor, so the shipped TTL is longer than parkerProtectionLockTTL, and a
+// pve.retry that lengthens a curve lengthens it further.
+func parkerProtectionLockTTLNow() time.Duration {
+	return parkerProtectionLockTTL +
+		parkerDemotedSweepTimeoutNow() - parkerDemotedSweepReserveFloor +
+		parkerProtectionRestoreReserveNow() - parkerProtectionRestoreReserveFloor
+}
+
+// ParkerProtectionLockTTLNow exports parkerProtectionLockTTLNow for callers
+// that wait out a whole holder, so their wait follows the TTL when the retry
+// curves lengthen it.
+func ParkerProtectionLockTTLNow() time.Duration { return parkerProtectionLockTTLNow() }
 
 // parkerProtectionLockTimeout bounds the wait for the lock. On timeout the
 // acquire fails retriably with ErrClusterLockTimeout, because a live holder was
@@ -2102,8 +2310,8 @@ const parkerLockReleaseTimeout = clusterLockReleaseTimeout
 
 // parkerLockTimeoutsKey carries an override for the protection-window lock's
 // TTL and acquire timeout. The production values are tuned for a real cluster
-// -- a 15s wait and a 180s TTL. Production code overrides only the wait, and
-// only through WithParkerLockWait. Tests shorten both through
+// -- a 15s wait and parkerProtectionLockTTLNow. Production code overrides only
+// the wait, and only through WithParkerLockWait. Tests shorten both through
 // withTestParkerLockTimeouts, since a test that exercises the contended paths
 // would otherwise have to spend them in wall-clock time.
 type parkerLockTimeoutsKey struct{}
@@ -2131,24 +2339,112 @@ func WithParkerLockWait(ctx context.Context, d time.Duration) context.Context {
 	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: d})
 }
 
+// WithParkerLockTTLForTest returns a context whose protection-window lock
+// claims with ttl instead of the production TTL, and keeps the wait ctx
+// already sets. It lets a handler test drive a refused claim without spending
+// a production TTL in wall-clock time. A non-positive ttl leaves ctx as it is.
+// Production code never calls it.
+func WithParkerLockTTLForTest(ctx context.Context, ttl time.Duration) context.Context {
+	if ttl <= 0 {
+		return ctx
+	}
+	_, timeout := parkerLockTimeoutsFrom(ctx)
+	return context.WithValue(ctx, parkerLockTimeoutsKey{}, parkerLockTimeouts{ttl: ttl, timeout: timeout})
+}
+
+// parkerLockClockKey carries the clock a test runs the protection-window
+// lock's acquire on, so a test can spend a production-sized TTL without
+// waiting for it.
+type parkerLockClockKey struct{}
+
+// withTestParkerLockClock returns a context whose protection-window lock
+// acquires run on clk.
+func withTestParkerLockClock(ctx context.Context, clk lockClock) context.Context {
+	return context.WithValue(ctx, parkerLockClockKey{}, clk)
+}
+
+// WithParkerLockClockForTest returns a context whose protection-window lock
+// acquires read the time from now and pause through sleep instead of the wall
+// clock. It lets a test outside this package spend a production-sized TTL and
+// wait without waiting for them. A nil now or sleep leaves ctx as it is.
+// Production code never calls it.
+func WithParkerLockClockForTest(
+	ctx context.Context, now func() time.Time, sleep func(context.Context, time.Duration) error,
+) context.Context {
+	if now == nil || sleep == nil {
+		return ctx
+	}
+	return withTestParkerLockClock(ctx, lockClock{now: now, sleep: sleep})
+}
+
+// parkerLockClockFrom returns the clock installed by withTestParkerLockClock,
+// or else the wall clock.
+func parkerLockClockFrom(ctx context.Context) lockClock {
+	if clk, ok := ctx.Value(parkerLockClockKey{}).(lockClock); ok && clk.now != nil && clk.sleep != nil {
+		return clk
+	}
+	return defaultLockClock()
+}
+
 // parkerLockTimeoutsFrom returns the override installed by
-// withTestParkerLockTimeouts, or the production constants.
+// withTestParkerLockTimeouts or WithParkerLockWait, or else the TTL under the
+// retry curves configured now and the production wait.
 func parkerLockTimeoutsFrom(ctx context.Context) (time.Duration, time.Duration) {
 	if o, ok := ctx.Value(parkerLockTimeoutsKey{}).(parkerLockTimeouts); ok && o.ttl > 0 && o.timeout > 0 {
 		return o.ttl, o.timeout
 	}
-	return parkerProtectionLockTTL, parkerProtectionLockTimeout
+	return parkerProtectionLockTTLNow(), parkerProtectionLockTimeout
 }
 
 // parkerProvenanceRemoveTimeout bounds the detached provenance removal that runs
-// after a volume leaves its parker. Two calls, a config read and a description
-// write, on a context the window deadline cannot stop.
+// after a volume leaves its parker. Each round is two calls, a config read and
+// a description write, and every round of up to parkerDescriptionWriteAttempts
+// shares this one bound, on a context the window deadline cannot stop.
 const parkerProvenanceRemoveTimeout = 20 * time.Second
 
-// parkerDemotedSweepTimeout bounds the detached cleanup that clears an unusedN
-// key left by a slot lost to a concurrent park. It covers a lock acquire, a
-// config read, and a detach, so it is generous relative to the lock's own wait.
-const parkerDemotedSweepTimeout = 45 * time.Second
+// parkerDemotedSweepReserveFloor is the least time set aside for the
+// detached sweep that clears an unusedN key a parker was left with. The sweep
+// runs inside a protection window whose lock is already held, so it takes no
+// lock of its own. parkerDemotedSweepTimeoutNow raises it when the sweep's
+// worst case on the retry curves is longer.
+const parkerDemotedSweepReserveFloor = 45 * time.Second
+
+// parkerDemotedSweepWorstCase is the longest the deferred sweep can take on
+// the retry curves configured now. The longest form is the park path's, which
+// clears protection, reads the config once without retrying, removes the
+// unusedN key, and reads the config back to verify the removal. The clear and
+// the removal each retry on RetryOnTransientOrLock, the verify retries on
+// RetryOnTransient, and each makes up to parkerWindowMaxAttempts attempts, so
+// every sleep between them is counted at the top of its jitter window on the
+// longest curve its loop can pick, with one round trip per attempt. One
+// removal is counted, because a detach demotes a volume to a single unusedN
+// key. The restore after the sweep has its own deadline and its own
+// reserve.
+func parkerDemotedSweepWorstCase() time.Duration {
+	attempts := time.Duration(parkerWindowMaxAttempts) * clusterLockRoundTrip
+	unprotect := RetryOnTransientOrLockSleepBudget(parkerWindowMaxAttempts) + attempts
+	remove := RetryOnTransientOrLockSleepBudget(parkerWindowMaxAttempts) + attempts
+	verify := RetryOnTransientSleepBudget(parkerWindowMaxAttempts) + attempts
+	return unprotect + clusterLockRoundTrip + remove + verify
+}
+
+// parkerDemotedSweepTimeoutNow bounds the detached sweep and is the time the
+// window sets aside for it. It is the sweep's worst case on the curves
+// configured now, rounded up to a whole second, and never less than
+// parkerDemotedSweepReserveFloor, so the deadline never cuts off a removal or
+// a verify the retry loops would still have landed.
+func parkerDemotedSweepTimeoutNow() time.Duration {
+	return max(parkerDemotedSweepReserveFloor, ceilToSecond(parkerDemotedSweepWorstCase()))
+}
+
+// ceilToSecond rounds d up to a whole second. The reserves a window sets
+// aside are whole seconds, like the claim expiry they are measured against.
+func ceilToSecond(d time.Duration) time.Duration {
+	if rounded := d.Truncate(time.Second); rounded < d {
+		return rounded + time.Second
+	}
+	return d
+}
 
 // parkerLockUnserializedKey marks the context of a protection window that
 // runs without the lock because PVE refused the lock's create or the client
@@ -2205,8 +2501,8 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	}
 	owner := ProcessLockOwner(fmt.Sprintf("%s/%d", purpose, parkerVMID))
 	ttl, timeout := parkerLockTimeoutsFrom(ctx)
-	handle, lockErr := AcquireClusterLock(ctx, pools,
-		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, WithCreateGrace())
+	handle, lockErr := acquireClusterLockWithClock(ctx, pools,
+		fmt.Sprintf("vm-%d", parkerVMID), owner, ttl, timeout, parkerLockClockFrom(ctx), parkerLockOptions(ttl)...)
 	if lockErr != nil {
 		if !errors.Is(lockErr, ErrClusterLockCreateRefused) {
 			// Only a create that PVE refused outright shows that the lock is
@@ -2288,32 +2584,78 @@ func withParkerProtectionLock(ctx context.Context, c Client, logger *log.Logger,
 	return fn(windowCtx)
 }
 
-// parkerProtectionRestoreReserve is time set aside for the protection restore
-// that runs after the window body, on a detached context so a cancelled call
-// still puts the flag back. The restore makes up to four attempts, and the
-// three sleeps between them on the pushback curve (5s, 7.5s, and 11.25s, each
-// up to 30% longer with jitter) come to about 30.9s. With a round trip for
-// each write, 35s lets a restore that needs its last attempt still finish
-// under its own deadline.
-const parkerProtectionRestoreReserve = 35 * time.Second
+// parkerProtectionRestoreReserveFloor is the time set aside for the protection
+// restore on the shipped retry curves. The restore makes up to four attempts,
+// and the three sleeps between them on the pushback curve (5s, 7.5s, and
+// 11.25s, each up to 30% longer with jitter) come to about 30.9s. With a round
+// trip for each write that is about 32.9s, so 35s lets a restore that needs
+// its last attempt still finish under its own deadline.
+const parkerProtectionRestoreReserveFloor = 35 * time.Second
 
-// parkerWindowReserve is the time a protection window leaves before its
+// parkerProtectionRestoreWorstCase is the longest a protection restore can
+// take on the retry curves configured now. setParkerProtection retries on
+// RetryOnTransientOrLock up to parkerWindowMaxAttempts times, so every sleep
+// between those attempts is counted at the top of its jitter window on the
+// longest of the curves that loop can pick, and each attempt gets one round
+// trip.
+func parkerProtectionRestoreWorstCase() time.Duration {
+	return RetryOnTransientOrLockSleepBudget(parkerWindowMaxAttempts) +
+		time.Duration(parkerWindowMaxAttempts)*clusterLockRoundTrip
+}
+
+// parkerProtectionRestoreReserveNow is the time set aside for the protection
+// restore that runs after the window body, on a detached context so a
+// cancelled call still puts the flag back. It is also the restore's own
+// deadline. It is parkerProtectionRestoreReserveFloor unless pve.retry
+// lengthens a curve far enough that a restore needing its last attempt no
+// longer fits, and then it is that worst case rounded up to a whole second,
+// so the deadline never cuts off a restore the retry loop would still have
+// landed.
+func parkerProtectionRestoreReserveNow() time.Duration {
+	return max(parkerProtectionRestoreReserveFloor, ceilToSecond(parkerProtectionRestoreWorstCase()))
+}
+
+// parkerWindowReserveNow is the time a protection window leaves before its
 // claim's expiry. Three things run AFTER the body, all on detached contexts
 // precisely so a deadline cannot stop them -- the deferred unusedN sweep
-// (parkerDemotedSweepTimeout), the protection restore
-// (parkerProtectionRestoreReserve), and the sentinel release
+// (parkerDemotedSweepTimeoutNow), the protection restore
+// (parkerProtectionRestoreReserveNow), and the sentinel release
 // (parkerLockReleaseTimeout). Give the body the whole TTL and those three run
 // past the recorded expiry, where a waiter is entitled to steal the lock and
 // enter its own window -- so the deadline would move the interleaving past the
 // fence rather than remove it.
-const parkerWindowReserve = parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
+func parkerWindowReserveNow() time.Duration {
+	return parkerLockReleaseTimeout + parkerDemotedSweepTimeoutNow() + parkerProtectionRestoreReserveNow()
+}
+
+// parkerMinimumWindowBody is the least time a protection window's body must
+// have before its deadline for the acquire to hand the claim back. A claim
+// that leaves the window its reserve and nothing more would start a body
+// that the deadline stops at once, after the window had cleared protection.
+const parkerMinimumWindowBody = 10 * time.Second
+
+// parkerLockOptions are the options a protection-window acquire with this TTL
+// passes. Every one takes the grace. One whose TTL can hold the window's
+// reserve and parkerMinimumWindowBody also tells the acquire that much as its
+// claim reserve. A claim confirmed too late to leave it is then refused
+// instead of running a window whose body has no time to work, or whose sweep,
+// restore, and release would outlive the claim. A TTL that cannot hold it is
+// a test-sized one, whose window runs on parkerWindowDeadline's one-second
+// floor, and it keeps only the release margin every acquire applies.
+func parkerLockOptions(ttl time.Duration) []ClusterLockOption {
+	opts := []ClusterLockOption{WithCreateGrace()}
+	if need := parkerWindowReserveNow() + parkerMinimumWindowBody; ttl > need {
+		opts = append(opts, WithClaimReserve(need))
+	}
+	return opts
+}
 
 // parkerWindowDeadline is when work inside a protection window must stop,
-// which is the claim's recorded expiry less parkerWindowReserve. It is never
+// which is the claim's recorded expiry less parkerWindowReserveNow. It is never
 // less than a second from now, so a test clock that sets a tiny TTL still runs
 // its body rather than expiring before the first call.
 func parkerWindowDeadline(handle *ClusterLockHandle, now time.Time) time.Time {
-	deadline := handle.WindowDeadline(parkerWindowReserve)
+	deadline := handle.WindowDeadline(parkerWindowReserveNow())
 	if floor := now.Add(time.Second); deadline.Before(floor) {
 		return floor
 	}
@@ -2364,6 +2706,15 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 			fmt.Sprintf("UnparkDisk: re-read parker vmid %d on node %s before detach", parkerVMID, parkerNode))
 	}
 	actualSlot, onActiveBus := FindDiskIDByVolID(qemu.ParseDisks(verifyCfg), bareVolid)
+	// The serial on the slot names the disk, so the record removal at the end
+	// can find the disk's record by its stable ID rather than by the volume
+	// name, which PVE hands to the next volume it renames onto this parker.
+	// A legacy disk carries no serial and its record is keyed by the name.
+	var stableID string
+	if onActiveBus {
+		drive, _ := ConfigString(verifyCfg, actualSlot)
+		stableID, _ = StableIDFromDriveOptStr(drive)
+	}
 	if onActiveBus {
 		if actualSlot != slot && logger != nil {
 			logger.Info("parker: disk moved slots between the holder scan and the unpark; using the current one",
@@ -2383,8 +2734,11 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 			// The volume is off this parker entirely. Drop the provenance entry
 			// as every other success path does: the record exists to name what
 			// this parker holds, and one that outlives the disk it names is what
-			// a later audit reads as a parker still holding a volume.
-			removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
+			// a later audit reads as a parker still holding a volume. No slot
+			// names the disk any more, so no serial gives its stable ID, and
+			// the removal matches by name on a parker that holds no key
+			// naming the volume.
+			removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, "", cfg)
 			return nil
 		}
 		return sweepDemotedUnderProtection(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
@@ -2448,8 +2802,8 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 	// most. On the window context this sweep would fail on the dead context
 	// without looking at the parker at all, and report a permanent action item
 	// telling the operator to unlink a key the SDK's second request had probably
-	// already removed. The window reserves this time (parkerWindowReserve).
-	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+	// already removed. The window reserves this time (parkerWindowReserveNow).
+	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeoutNow())
 	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, parkerNode, parkerVMID, bareVolid)
 	sweepCancel()
 
@@ -2488,7 +2842,20 @@ func unparkAtLocked(ctx context.Context, c Client, logger *log.Logger, bareVolid
 		reportUnsweptReference(logger, parkerNode, parkerVMID, bareVolid, sweepErr)
 		return unsweptReferenceError(parkerNode, parkerVMID, bareVolid, sweepErr)
 	}
-	removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, cfg)
+	// The provenance removal runs after the sweep and the restore on its own
+	// detached bound, parkerProvenanceRemoveTimeout, which the window's reserve
+	// does not count, so it can finish after the claim expires and a new
+	// holder can write its own provenance entry to this parker meanwhile. The
+	// removal guards against that writer. It sends each description write with
+	// the digest of the read it was built from, so PVE refuses the write if the
+	// config changed in between, and it then reads again and takes out only
+	// our own record, found by the stable ID the slot's serial carried, or by
+	// the volume name for a legacy disk. Every other entry survives, including
+	// the record of a disk that PVE has since parked here under the same name.
+	// The removal is advisory, so after a bounded number of refused rounds, or
+	// on any other failure, it logs and stops, and a later provenance write
+	// collects the entry it left behind as stale.
+	removeParkerProvenance(ctx, c, logger, parkerNode, parkerVMID, bareVolid, stableID, cfg)
 	return nil
 }
 
@@ -2515,7 +2882,7 @@ func sweepDemotedUnderProtection(ctx context.Context, c Client, logger *log.Logg
 	// Detached and bounded, as in unparkAtLocked: this sweep is the whole point
 	// of the call, and running it on a context that may already be done would
 	// report an action item for work never attempted.
-	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeout)
+	sweepCtx, sweepCancel := context.WithTimeout(context.WithoutCancel(ctx), parkerDemotedSweepTimeoutNow())
 	sweepErr := sweepParkerUnusedSlots(sweepCtx, c, logger, node, parkerVMID, bareVolid)
 	sweepCancel()
 	restoreParkerProtectionLogged(ctx, c, logger, "UnparkDisk", node, parkerVMID)
@@ -2525,7 +2892,11 @@ func sweepDemotedUnderProtection(ctx context.Context, c Client, logger *log.Logg
 		reportUnsweptReference(logger, node, parkerVMID, bareVolid, sweepErr)
 		return unsweptReferenceError(node, parkerVMID, bareVolid, sweepErr)
 	}
-	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+	// Outside the window's reserve, as in unparkAtLocked, which says how the
+	// removal keeps a new holder's entry intact. The volume was on an unusedN
+	// entry, which carries no serial, so the removal matches by name, and
+	// only on a parker that no longer holds a key naming the volume.
+	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, "", cfg)
 	return nil
 }
 

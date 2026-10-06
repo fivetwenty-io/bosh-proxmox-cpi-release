@@ -131,7 +131,7 @@ func cleanupManagedRetainedEphemeral(ctx context.Context, deps Deps, handle *aj.
 			operationErr = errors.Join(operationErr, session.Uncertain("retained ephemeral cleanup incomplete"))
 		}
 	}()
-	if err := pve.DeleteParkedOwnedDisk(ctx, local.PVE, local.Log(ctx), target.Node, target.VMID, target.IntendedVolume, parkerWriteConfigFor(local)); err != nil {
+	if err := pve.DeleteParkedOwnedDisk(ctx, local.PVE, local.Log(ctx), target.Node, target.VMID, target.IntendedVolume, disk.stableID, parkerWriteConfigFor(local)); err != nil {
 		return err
 	}
 	absent, err := volumeAbsentFromStorage(ctx, deps, target.Node, target.IntendedVolume, nil)

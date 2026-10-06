@@ -60,7 +60,7 @@ func (q *dmFakeQEMU) Config(_ context.Context, node string, vmid int) (map[strin
 	for k, v := range cfg {
 		out[k] = v
 	}
-	return out, nil
+	return withAnsweredDigest(out), nil
 }
 
 type dmFakeNodes struct {

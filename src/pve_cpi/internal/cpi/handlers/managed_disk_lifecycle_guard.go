@@ -871,6 +871,19 @@ func (g *managedDiskLifecycleGuard) observeConfigResult(ctx context.Context, cal
 	if err != nil || cfg == nil {
 		return nil, fmt.Errorf("cannot read lifecycle mutation result")
 	}
+	if key == managedVMCallUpdateConfig && callerSentDescriptionDigest(observation.fields) {
+		// The caller built the description from a read at the digest it sent,
+		// the guard confirmed its own read carried the same digest, and PVE
+		// applied the write only against that config. So the write landed as
+		// sent, and the readback only has to show the records the write
+		// changed as it changed them. Another writer may have changed any
+		// other record since, such as another holder's record on a parker.
+		sent, _ := observation.fields[pveConfigKeyDescription].(string)
+		if !pve.DescriptionWriteLanded(pve.DescriptionFromConfig(observation.before), sent, pve.DescriptionFromConfig(cfg)) {
+			return nil, fmt.Errorf("VM config field %s did not apply", pveConfigKeyDescription)
+		}
+		return volumes, nil
+	}
 
 	switch key {
 	case "QEMU.Create":

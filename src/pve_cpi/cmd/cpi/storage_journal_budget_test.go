@@ -21,17 +21,18 @@ func TestStorageJournalCleanupBudgetOutlastsTheParkerWait(t *testing.T) {
 	if !ok {
 		t.Fatal("cleanup runs without a deadline")
 	}
+	ttl := pve.ParkerProtectionLockTTLNow()
 	start := now.Add(storageJournalBaseBudget)
 	// These two lines copy the clamp in clusterLockDeadline in
 	// pve/cluster_lock.go. A wait ends at its start plus its timeout, unless
 	// the request's deadline less the margin comes first. A change to that
 	// rule has to be matched here.
-	waitEnd, limit := start.Add(pve.ParkerProtectionLockTTL), deadline.Add(-pve.ClusterLockContextMargin)
+	waitEnd, limit := start.Add(ttl), deadline.Add(-pve.ClusterLockContextMargin)
 	if limit.Before(waitEnd) {
 		t.Fatalf("a parker wait started after %s of work is cut to %s by the cleanup deadline; it needs the full %s",
-			storageJournalBaseBudget, limit.Sub(start).Round(time.Second), pve.ParkerProtectionLockTTL)
+			storageJournalBaseBudget, limit.Sub(start).Round(time.Second), ttl)
 	}
-	if end := waitEnd.Add(pve.ParkerProtectionLockTTL).Add(pve.ClusterLockContextMargin); end.After(deadline) {
+	if end := waitEnd.Add(ttl).Add(pve.ClusterLockContextMargin); end.After(deadline) {
 		t.Fatalf("the window after a full wait ends %s past the cleanup deadline", end.Sub(deadline).Round(time.Second))
 	}
 }

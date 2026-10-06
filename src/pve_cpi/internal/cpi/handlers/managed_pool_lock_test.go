@@ -211,7 +211,7 @@ func contendedParkRequest(t *testing.T, locks *lockContention, gate <-chan struc
 	m, h, state := managedDiskFixture(t, "spread", false)
 	m.deps.Config.DetachedDiskStrategy = "parked"
 	vmid := m.deps.Config.ParkedDiskVMIDRangeStartValue()
-	state.configs = map[int]map[string]any{vmid: {"name": fmt.Sprintf("bosh-parker-%d", vmid), "tags": "bosh-parker", "protection": 1, "scsihw": "virtio-scsi-pci"}}
+	state.configs = map[int]map[string]any{vmid: {"name": fmt.Sprintf("bosh-parker-%d", vmid), "tags": "bosh-parker", "protection": 1, "scsihw": "virtio-scsi-pci", "digest": "1"}}
 	m.deps.PVE = contendedDiskPVE{managedDiskTestPVE: managedDiskTestPVE{state: state}, locks: locks, gate: gate}
 	return m, h
 }

@@ -117,6 +117,11 @@ func (q *migFakeQEMU) Config(_ context.Context, node string, vmid int) (map[stri
 	for k, v := range cfg {
 		out[k] = v
 	}
+	// PVE answers every config read with a digest, and a mover's or parker's
+	// description write refuses a read without one.
+	if _, has := out["digest"]; !has {
+		out["digest"] = "migfake-digest"
+	}
 	return out, nil
 }
 

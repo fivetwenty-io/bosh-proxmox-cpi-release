@@ -604,17 +604,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// releases.
 	pve.ConfigureAdaptiveTaskPoll(cfg.TaskPollAdaptiveEnabled())
 
-	// Apply the operator's pushback-backoff curve process-wide. With an unset
-	// retry.pushback block these resolve to the shipped defaults (5s/60s), so
-	// backoff is byte-identical to prior releases.
-	pb := cfg.RetryPushback()
-	pve.ConfigurePushbackBackoff(pb.BaseMs, pb.CapMs)
-
-	// Apply the operator's storage-lock backoff curve process-wide. With an
-	// unset retry.storage_lock block these resolve to the shipped defaults
-	// (2s/30s/30%), so backoff is byte-identical to prior releases.
-	sl := cfg.RetryStorageLock()
-	pve.ConfigureStorageLockBackoff(sl.BaseMs, sl.CapMs, sl.JitterPct)
+	// Apply the operator's pushback and storage-lock backoff curves
+	// process-wide.
+	applyRetryCurves(cfg)
 
 	// Apply the operator's transient attempt budget process-wide. With an
 	// unset retry.transient block this is 0 and the shipped default
@@ -1069,4 +1061,21 @@ func shutdownOTelSignals(cfg *config.CPIConfig, logger *log.Logger, otelShutdown
 	if shutdownErr := metricsShutdown(metricsShutdownCtx); shutdownErr != nil {
 		logger.Warn("otel metrics shutdown/flush failed", log.ErrScrubbed(shutdownErr))
 	}
+}
+
+// applyRetryCurves applies the operator's pushback and storage-lock backoff
+// curves process-wide. With an unset retry.pushback block the pushback curve
+// resolves to the shipped defaults (5s/60s), and with an unset
+// retry.storage_lock block the storage-lock curve resolves to its shipped
+// defaults (2s/30s/30%), so backoff is byte-identical to prior releases. The
+// CPI applies them at startup, and the storage-journal CLI applies them once
+// it has loaded the same config. The parker protection lock's TTL, its wait,
+// and the restore and sweep deadlines all follow these curves, so the CLI
+// would otherwise wait out a CPI's window on the shipped lengths while the
+// CPI holds it for longer.
+func applyRetryCurves(cfg *config.CPIConfig) {
+	pb := cfg.RetryPushback()
+	pve.ConfigurePushbackBackoff(pb.BaseMs, pb.CapMs)
+	sl := cfg.RetryStorageLock()
+	pve.ConfigureStorageLockBackoff(sl.BaseMs, sl.CapMs, sl.JitterPct)
 }

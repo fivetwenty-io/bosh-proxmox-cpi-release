@@ -90,7 +90,7 @@ func unparkBeforeDelete(ctx context.Context, deps Deps, rd resolvedDisk, node st
 	}
 	if holder.Found && holder.IsParker && rd.stableID != "" {
 		if embedded, ok := pve.EmbeddedDiskVMID(rd.volid); ok && embedded == holder.VMID {
-			if delErr := pve.DeleteParkedOwnedDisk(ctx, deps.PVE, deps.Log(ctx), holder.Node, holder.VMID, rd.volid, parkerCfg); delErr != nil {
+			if delErr := pve.DeleteParkedOwnedDisk(ctx, deps.PVE, deps.Log(ctx), holder.Node, holder.VMID, rd.volid, rd.stableID, parkerCfg); delErr != nil {
 				return false, retriableUnlessPermanent(delErr,
 					fmt.Sprintf("delete_disk: deallocate parked disk %s on its parker", rd.diskCID))
 			}

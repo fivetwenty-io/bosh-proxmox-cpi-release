@@ -354,51 +354,67 @@ func ReadParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVMI
 // by a parker's provenance entry for a parked disk, creating the entry when
 // the (best-effort) park never recorded one. Empty-string update values are
 // kept as deletion markers, and the serial key is stripped. Returns the
-// merged map. Fail-closed read-modify-write on the parker description, with
-// the same accepted concurrent-writer race every provenance write here has.
+// merged map. Fail-closed read-modify-write on the parker description.
 // It returns ErrProvenanceFull, without writing, when the merged description
 // would pass parkerDescriptionBudget.
+//
+// update_disk calls this with no parker lock, so another request can write
+// the same parker's description while we work. The write is digest-guarded
+// (see writeParkerDescriptionGuarded): each round merges the updates into the
+// disk's entry from a fresh read and sends the result with that read's digest,
+// so a write built on a stale read is refused and redone instead of
+// overwriting what the other request wrote. Only this disk's entry changes.
+// When every round is refused it returns ErrParkerDescriptionContended,
+// retriable, and nothing was written. A parker whose config reads keep coming
+// back without a digest gets the same treatment, because a merge built on such
+// a read could erase every other record on the parker.
 func ApplyParkerDiskOverlay(ctx context.Context, c Client, node string, parkerVMID int, bareVolid, stableID, diskCID string, updates map[string]string, cfg ParkerConfig) (map[string]string, error) {
 	if c == nil || node == "" || parkerVMID <= 0 || bareVolid == "" {
 		return nil, cpierrors.Cloud("ApplyParkerDiskOverlay: client, node, parker VMID, and volid are all required")
 	}
-	vmCfg, err := c.QEMU().Config(ctx, node, parkerVMID)
+
+	var merged map[string]string
+	err := writeParkerDescriptionGuarded(ctx, c, parkerDescriptionWrite{
+		node: node,
+		vmid: parkerVMID,
+		what: "disk option overrides",
+		edit: func(vmCfg map[string]any) (string, bool, error) {
+			nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+			key, found := matchParkerOverlayEntry(disks, bareVolid, stableID)
+			var entry parkerProvEntry
+			if found {
+				entry = disks[key]
+			} else {
+				// The park's provenance write may have been lost; the
+				// override cannot be, so a fresh entry carries it. The slot
+				// comes from the live config, the disk's identity from the
+				// caller.
+				slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
+				key = parkerProvKey(bareVolid, stableID)
+				entry = buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, ParkContext{DiskCID: diskCID, StableID: stableID})
+			}
+			entry.Opts = mergeOverlayUpdates(entry.Opts, updates)
+			disks[key] = entry
+
+			newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
+			if marshalErr != nil {
+				return "", false, cpierrors.Wrap(marshalErr, "disk option overrides: marshal parker sentinel")
+			}
+			// The overlay can grow an entry, or create one, so it meets the
+			// same budget every provenance writer does. Collection stays with
+			// those writers, so the refusal here leaves the other records as
+			// they are.
+			if len(newDesc) > parkerDescriptionBudget {
+				return "", false, fmt.Errorf(
+					"disk option overrides: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
+					parkerVMID, node, len(disks), len(newDesc), parkerDescriptionBudget, ErrProvenanceFull)
+			}
+			merged = entry.Opts
+			return newDesc, true, nil
+		},
+	})
 	if err != nil {
-		return nil, cpierrors.Wrap(WrapConfigReadError(err),
-			fmt.Sprintf("disk option overrides: config fetch for parker vmid %d", parkerVMID))
-	}
-
-	nonBOSH, disks, rawOther := parseParkerSentinel(DescriptionFromConfig(vmCfg))
-	key, found := matchParkerOverlayEntry(disks, bareVolid, stableID)
-	var entry parkerProvEntry
-	if found {
-		entry = disks[key]
-	} else {
-		// The park's provenance write is best-effort and may have been lost;
-		// the override cannot be, so a fresh entry carries it. The slot comes
-		// from the live config, the disk's identity from the caller.
-		slot, _ := FindDiskIDByVolID(qemu.ParseDisks(vmCfg), bareVolid)
-		key = parkerProvKey(bareVolid, stableID)
-		entry = buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, ParkContext{DiskCID: diskCID, StableID: stableID})
-	}
-	merged := mergeOverlayUpdates(entry.Opts, updates)
-	entry.Opts = merged
-	disks[key] = entry
-
-	newDesc, marshalErr := renderParkerSentinel(nonBOSH, disks, rawOther)
-	if marshalErr != nil {
-		return nil, cpierrors.Wrap(marshalErr, "disk option overrides: marshal parker sentinel")
-	}
-	// The overlay can grow an entry, or create one, so it meets the same
-	// budget every provenance writer does. Collection stays with those
-	// writers, so the refusal here leaves the other records as they are.
-	if len(newDesc) > parkerDescriptionBudget {
-		return nil, fmt.Errorf(
-			"disk option overrides: parker vmid %d on node %s holds %d live records in %d bytes of description, over the %d budget: %w",
-			parkerVMID, node, len(disks), len(newDesc), parkerDescriptionBudget, ErrProvenanceFull)
-	}
-	if writeErr := writeVMDescription(ctx, c, node, parkerVMID, newDesc); writeErr != nil {
-		return nil, writeErr
+		return nil, err
 	}
 	return merged, nil
 }

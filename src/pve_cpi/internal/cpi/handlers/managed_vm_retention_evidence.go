@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -267,8 +266,7 @@ func (c *managedRetentionTimeoutCheck) returned(ctx context.Context, deps Deps, 
 	if c == nil || err == nil || guardErr != nil {
 		return false
 	}
-	if !errors.Is(err, pve.ErrClusterLockTimeout) && !errors.Is(err, pve.ErrClusterLockStateUnknown) &&
-		!errors.Is(err, pve.ErrClusterLockInterrupted) && !errors.Is(err, errManagedRequestEnded) {
+	if !isLockWaitWithoutEntry(err) {
 		return false
 	}
 	if storageLifecycleSettled(record) != nil || c.start < 0 || c.start > len(record.Steps) {

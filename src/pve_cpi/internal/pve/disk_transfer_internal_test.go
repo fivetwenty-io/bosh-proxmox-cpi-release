@@ -87,6 +87,21 @@ func (c *scanFakeClient) logEvent(format string, args ...any) {
 	c.events = append(c.events, fmt.Sprintf(format, args...))
 }
 
+// fakeAnsweredDigest stands in for the digest PVE puts in every config
+// answer, for a fake config whose test sets none. A parker description write
+// refuses a read without a digest, because a write built from it could erase
+// records it never saw.
+const fakeAnsweredDigest = "fake-answered-digest"
+
+// withAnsweredDigest gives cfg the digest PVE would answer with when the test
+// set none, and returns cfg.
+func withAnsweredDigest(cfg map[string]any) map[string]any {
+	if _, ok := cfg["digest"]; !ok {
+		cfg["digest"] = fakeAnsweredDigest
+	}
+	return cfg
+}
+
 func (c *scanFakeClient) configCopy(vmid int) (map[string]any, bool) {
 	cfg, ok := c.configs[vmid]
 	if !ok {
@@ -137,7 +152,7 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 			if !ok {
 				return nil, fmt.Errorf("fake: no config for vmid %d", vmid)
 			}
-			return cfg, nil
+			return withAnsweredDigest(cfg), nil
 		},
 		attachDiskFn: func(_ context.Context, _ string, vmid int, volid, _ string, opts *qemu.AttachOpts) (string, error) {
 			c.mu.Lock()
@@ -830,9 +845,12 @@ func TestDeleteParkedOwnedDisk_DeallocatesAndCleansProvenance(t *testing.T) {
 			paramProtection: true,
 			"scsi1":         "data:vm-90000-disk-2,serial=" + transferStableID,
 			"description":   desc,
+			// PVE answers every config read with a digest, and the
+			// provenance removal writes only with one.
+			"digest": "digest-0",
 		},
 	})
-	err := DeleteParkedOwnedDisk(context.Background(), c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferTestCfg)
+	err := DeleteParkedOwnedDisk(context.Background(), c, nil, "pve1", 90000, "data:vm-90000-disk-2", transferStableID, transferTestCfg)
 	if err != nil {
 		t.Fatalf("DeleteParkedOwnedDisk: %v", err)
 	}
@@ -850,7 +868,7 @@ func TestDeleteParkedOwnedDisk_DeallocatesAndCleansProvenance(t *testing.T) {
 func TestDeleteParkedOwnedDisk_RefusesForeignNamedVolume(t *testing.T) {
 	t.Parallel()
 	c := newScanFakeClient(map[int]map[string]any{90000: {cfgKeyTags: "bosh-parker"}})
-	err := DeleteParkedOwnedDisk(context.Background(), c, nil, "pve1", 90000, "data:vm-9001-disk-0", transferTestCfg)
+	err := DeleteParkedOwnedDisk(context.Background(), c, nil, "pve1", 90000, "data:vm-9001-disk-0", transferStableID, transferTestCfg)
 	if err == nil || !strings.Contains(err.Error(), "not named for parker") {
 		t.Fatalf("err = %v, want the not-owner-named refusal", err)
 	}

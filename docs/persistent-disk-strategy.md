@@ -165,10 +165,9 @@ confirmed before an ordinary park moves the disk, so a parker whose store is
 full routes the disk elsewhere instead of taking it and dropping the entry; see
 [Store capacity and collection](#store-capacity-and-collection). Past that
 check, a write that fails for some other reason logs a warning and does not
-block the park. Because PVE has no atomic read-modify-write on VM descriptions,
-two concurrent park operations targeting the same parker VM may overwrite each
-other's provenance entry. The disk remains correctly attached in its `scsiN`
-slot; only the advisory provenance record may be incomplete.
+block the park.
+
+PVE has no atomic read-modify-write on VM descriptions, but it checks the digest that a write carries under the VM's lock. Every write to a parker's description, whether it adds, rewrites, or removes an entry, carries the digest of the read it was built from. When another request changed the parker after that read, PVE refuses the write, and the CPI reads the description again and changes only its own entry, so two concurrent writes on one parker no longer overwrite each other's entries. After three refusals in a row the CPI writes nothing and returns a retriable error, and a read that comes back without a digest is treated the same way, because a write built from it could erase entries it never saw. A removal finds its entry by the disk's stable ID, so it can't remove the entry of a newer disk that PVE gave the same volume name, and it leaves the entry in place while the parker still holds the volume. A removal that gives up leaves its entry for a later write on that parker to collect. Whatever happens to the record, the disk remains correctly attached in its `scsiN` slot.
 
 The detach-side transfer goes further still. Between the source slot's deletion
 and the serial landing on the parker, its intent record carries the disk's only
@@ -447,6 +446,8 @@ unlike the neighboring best-effort provenance writers. A disk parked at
 update time gets the record only — the parker slot's drive string stays
 CPI-owned — and the change takes effect at the next attach.
 
+When the same `update_disk` also resizes a parked disk, the resize runs first. If the record then can't be written, the call fails with an error that says the disk already has its new size and that its option overrides were not recorded, so a retry records the overrides and finds the size already in place.
+
 Two paths drop the record by design, and say so in the logs: a detach under
 strategy `free` leaves the disk with no carrier for it, and `delete_vm`'s
 plain detach of a legacy foreign disk destroys the description that held it.
@@ -468,7 +469,7 @@ the attach boundaries, and every overlay read and write strips it.
 | `resize_disk` while detached | Proceeds via storage backend | Proceeds via storage backend (parker stopped; no extra gate) |
 | Provenance | None natively; CID encodes pool/node/AZ | Sentinel entry in parker description; `disk-audit` reads it |
 | Capacity limit | Unlimited | 31 disks per parker VM; additional parkers created automatically |
-| Concurrency | No extra synchronization | Parks and unparks on one parker are serialized against each other by a per-VMID sentinel-pool lock, advisory in the sense that a lock the CPI cannot take does not stop the work: a nil pool service, a denied `Pool.Allocate`, or a transport fault runs the window unserialized and warns. An acquire *timeout* is the exception, and is returned retriably, because it means another park or unpark is inside the window right now. Work inside the window runs under a deadline derived from the lock TTL, so a window cannot outlive the claim that entitles it; concurrent parks may still overwrite each other's provenance entry, and the disks themselves are safe either way |
+| Concurrency | No extra synchronization | Parks and unparks on one parker are serialized against each other by a per-VMID sentinel-pool lock, advisory in the sense that a lock the CPI cannot take does not stop the work, so a nil pool service, a denied `Pool.Allocate`, or a transport fault runs the window unserialized and warns. An acquire *timeout* is the exception, and is returned retriably, because it means another park or unpark is inside the window right now. Work inside the window runs under a deadline derived from the lock TTL, so a window cannot outlive the claim that entitles it. Provenance writes that land outside the window carry the digest of their own read, so concurrent writes on one parker don't overwrite each other's entries |
 | Blast radius on parker accidental delete | n/a | All disks attached to that parker VM are destroyed |
 | Migration from free-floating | Existing disks remain free-floating | New detaches park; first `attach_disk` or `delete_disk` finds the free-floating disk and operates normally |
 

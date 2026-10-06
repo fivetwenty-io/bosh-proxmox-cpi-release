@@ -230,7 +230,7 @@ func isolateDiskOntoMover(
 	// verified at the receiver before the source record can be removed.
 	final := intent
 	final.Volid = landed
-	if provErr := writeParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, final, cfg); provErr != nil {
+	if provErr := rewriteParkerProvenance(ctx, c, logger, spec.Holder.Node, moverVMID, spec.StableID, final, cfg); provErr != nil {
 		if spec.AllocationID != "" || spec.AllocationNamespace != "" {
 			return DiskHolder{}, "", cpierrors.Cloud("managed migration isolation provenance requires reconciliation")
 		}
@@ -243,7 +243,7 @@ func isolateDiskOntoMover(
 			return DiskHolder{}, "", cpierrors.Cloud("managed migration receiver provenance is not verified")
 		}
 	}
-	RemoveParkerProvenanceEntry(ctx, c, logger, spec.Holder.Node, spec.Holder.VMID, spec.Volid, cfg)
+	RemoveParkerProvenanceEntry(ctx, c, logger, spec.Holder.Node, spec.Holder.VMID, spec.Volid, spec.StableID, cfg)
 
 	if logger != nil {
 		logger.Info("disk migrate: disk isolated onto a fresh mover",
@@ -429,7 +429,7 @@ func convergeMigratedMover(
 	reassertParkerProtection(ctx, c, logger, spec.TargetNode, moverVMID)
 
 	entry := buildParkerProvEntry(ctx, spec.TargetNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil {
+	if provErr := rewriteParkerProvenance(ctx, c, logger, spec.TargetNode, moverVMID, spec.StableID, entry, cfg); provErr != nil {
 		if spec.AllocationID != "" || spec.AllocationNamespace != "" {
 			return "", "", cpierrors.Cloud("managed migration destination provenance requires reconciliation")
 		}

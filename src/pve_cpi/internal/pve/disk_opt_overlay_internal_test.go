@@ -319,6 +319,8 @@ func nearlyFullOverlayParker(t *testing.T, slack int) map[string]any {
 		t.Fatalf("fixture: the store is already over budget at %d bytes", size)
 	}
 	parker["description"] = provSentinel(t, disks)
+	// The overlay writes only from a read that carries a digest.
+	parker["digest"] = "overlay-budget-digest"
 	return parker
 }
 

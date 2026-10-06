@@ -133,7 +133,12 @@ func clusterLockPollFor(ctx context.Context) time.Duration {
 // ClusterLockOption adjusts one acquire.
 type ClusterLockOption func(*clusterLockSettings)
 
-type clusterLockSettings struct{ grace bool }
+type clusterLockSettings struct {
+	grace bool
+	// claimReserve is the time the caller needs on its claim after the
+	// acquire returns. Zero leaves only the release margin.
+	claimReserve time.Duration
+}
 
 // WithCreateGrace makes the acquire wait out the grace pause after every
 // create that PVE accepts, a steal's or an ordinary one, and confirm its claim
@@ -142,6 +147,21 @@ type clusterLockSettings struct{ grace bool }
 // withVMIDLock says why its remaining window is accepted.
 func WithCreateGrace() ClusterLockOption {
 	return func(s *clusterLockSettings) { s.grace = true }
+}
+
+// WithClaimReserve tells the acquire how much time the caller needs on its
+// claim once the acquire returns, for the work under the lock and whatever
+// must still run before the claim's expiry, such as a cleanup and the
+// release. An acquire whose confirming reads ran so late that less than
+// reserve is left refuses the claim rather than hand back a handle the caller
+// cannot use safely. A non-positive reserve changes nothing. The parker
+// protection-window lock passes its window's reserve.
+func WithClaimReserve(reserve time.Duration) ClusterLockOption {
+	return func(s *clusterLockSettings) {
+		if reserve > 0 {
+			s.claimReserve = reserve
+		}
+	}
 }
 
 // graceDuration is the pause this acquire waits after a create, which is zero
@@ -159,6 +179,14 @@ func (s clusterLockSettings) graceDuration() time.Duration {
 // delete. A lock without the grace drops that term.
 func (s clusterLockSettings) releaseMargin() time.Duration {
 	return clusterLockStealBudget + s.graceDuration() + clusterLockRoundTrip
+}
+
+// claimNeed is the least time a confirmed claim must have left for the
+// acquire to hand it back. It is the caller's claim reserve, and never less
+// than the release margin, because a claim inside that margin may be stolen
+// before the caller uses it, and Release would refuse to delete it.
+func (s clusterLockSettings) claimNeed() time.Duration {
+	return max(s.releaseMargin(), s.claimReserve)
 }
 
 // expectedLockClaimKey carries the claim a sentinel delete expects to remove.
@@ -336,6 +364,13 @@ func acquireClusterLockWithClock(
 			// sentinel we just created, so confirm our claim, twice for a lock
 			// that takes the grace, before taking the handle.
 			handle, confirmErr := confirmLockCreate(ctx, pools, pool, owner, expiry, deadline, settings, clk)
+			retake, confirmErr := retakeShortClaim(ctx, confirmErr, ttl, deadline, settings, clk)
+			if retake {
+				// We gave up a claim confirmed too late and deleted it, and a
+				// fresh claim can still start inside the wait and be used
+				// before the request ends, so create it at once.
+				continue
+			}
 			if confirmErr != nil || handle != nil {
 				return handle, confirmErr
 			}
@@ -351,9 +386,15 @@ func acquireClusterLockWithClock(
 		}
 
 		// Pool exists: inspect the holder's recorded expiry to decide steal-or-wait.
-		if stole, err := tryStealExpired(ctx, pools, pool, owner, ttl, deadline, settings, clk); err != nil {
-			return nil, err
-		} else if stole != nil {
+		stole, stealErr := tryStealExpired(ctx, pools, pool, owner, ttl, deadline, settings, clk)
+		retake, stealErr := retakeShortClaim(ctx, stealErr, ttl, deadline, settings, clk)
+		if retake {
+			continue
+		}
+		if stealErr != nil {
+			return nil, stealErr
+		}
+		if stole != nil {
 			return stole, nil
 		}
 
@@ -563,6 +604,19 @@ func tryStealExpired(
 // out abandonLockCreate removes the sentinel only when a fresh read proves it
 // is ours. Each read is bounded by lockReadDeadline, so a read that never
 // answers still ends inside the margin the request's deadline leaves.
+//
+// Retried reads can run most of the wait, and a wait as long as the TTL can
+// leave a confirmed claim with only seconds before its expiry. So a claim is
+// handed back only while it has claimNeed left. That is the test
+// tryStealExpired already applies, with the release margin, before it
+// confirms a claim of ours that an earlier read missed. A claim confirmed
+// later than that is refused with ErrClusterLockClaimTooShort. On the way out
+// abandonLockCreate deletes it when a fresh read proves it ours and outside
+// the release margin. Otherwise, because that read failed or the claim was
+// already inside the margin, it is left for the TTL steal once its claim
+// lapses. The refusal comes back as a shortClaimRefusal that says which of
+// the two happened, and the acquire loop decides from it whether to take a
+// fresh claim.
 func confirmLockCreate(
 	ctx context.Context, pools PoolService, pool, owner string, expiry, deadline time.Time,
 	settings clusterLockSettings, clk lockClock,
@@ -575,7 +629,7 @@ func confirmLockCreate(
 	for pass := 0; pass < passes; pass++ {
 		if pass == 1 {
 			if err := clk.sleep(ctx, settings.graceDuration()); err != nil {
-				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
+				return nil, giveUpLockCreate(ctx, pools, pool, owner, settings, clk,
 					cpierrors.WrapAs(errors.Join(err, ErrClusterLockInterrupted), cpierrors.TypeRetriableCloud,
 						fmt.Sprintf("AcquireClusterLock: interrupted confirming lock %q", pool)))
 			}
@@ -584,10 +638,10 @@ func confirmLockCreate(
 		for err != nil {
 			now := clk.now()
 			if !now.Before(deadline) {
-				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk, lockStateUnknown(pool, err))
+				return nil, giveUpLockCreate(ctx, pools, pool, owner, settings, clk, lockStateUnknown(pool, err))
 			}
 			if sleepErr := clk.sleep(ctx, clusterLockPollWait(ctx, now, deadline)); sleepErr != nil {
-				return nil, abandonLockCreate(ctx, pools, pool, owner, settings, clk,
+				return nil, giveUpLockCreate(ctx, pools, pool, owner, settings, clk,
 					lockStateUnknown(pool, errors.Join(err, sleepErr)))
 			}
 			comment, mine, err = sentinelClaim(ctx, pools, pool, owner, deadline, clk)
@@ -597,9 +651,28 @@ func confirmLockCreate(
 		}
 		claim = comment
 	}
+	if need := settings.claimNeed(); !clk.now().Add(need).Before(expiry) {
+		refused := claimTooShort(pool, expiry.Sub(clk.now()), need)
+		released := abandonLockCreate(ctx, pools, pool, owner, settings, clk)
+		return nil, &shortClaimRefusal{err: refused, released: released}
+	}
 	return &ClusterLockHandle{
 		pool: pool, owner: owner, claim: claim, settings: settings, pools: pools, expiry: expiry, now: clk.now,
 	}, nil
+}
+
+// claimTooShort is the error an acquire returns when it confirmed its claim
+// with less than need left before the claim's expiry. remaining is the time
+// that was left, which is not positive when the claim had already expired.
+func claimTooShort(pool string, remaining, need time.Duration) error {
+	left := "its claim had already expired"
+	if remaining > 0 {
+		left = fmt.Sprintf("only %s was left on its claim", remaining.Round(time.Millisecond))
+	}
+	return cpierrors.WrapAs(ErrClusterLockClaimTooShort, cpierrors.TypeRetriableCloud,
+		fmt.Sprintf("AcquireClusterLock: confirmed lock %q too late to use it, because %s, less than the %s "+
+			"the work under the lock needs; the claim was given up, and a retry takes the lock with a fresh claim",
+			pool, left, need))
 }
 
 // lockStateUnknown is the error an acquire returns when it created its
@@ -650,38 +723,135 @@ func createFailed(
 		return cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockCreateRefused), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: %s %q", step, pool))
 	}
-	return abandonLockCreate(ctx, pools, pool, owner, settings, clk,
+	return giveUpLockCreate(ctx, pools, pool, owner, settings, clk,
 		cpierrors.WrapAs(errors.Join(createErr, ErrClusterLockStateUnknown), cpierrors.TypeRetriableCloud,
 			fmt.Sprintf("AcquireClusterLock: %s %q has an unknown outcome", step, pool)))
 }
 
-// abandonLockCreate gives up on a create whose ownership could not be
-// confirmed, or whose answer never arrived, and it returns cause. A sentinel of
-// ours would otherwise block every other acquirer until its TTL, so it reads
-// the sentinel on a detached context and deletes it when that read proves the
-// claim is ours. The delete carries the comment the read returned, never the
-// one we sent, so a guarded pool service compares two reads. It leaves the
-// sentinel alone when the read fails, names another owner, cannot be parsed,
-// or shows a claim within the release margin of its expiry, the same rules
-// Release follows.
-func abandonLockCreate(
+// giveUpLockCreate gives up on a create whose ownership could not be
+// confirmed, or whose answer never arrived, and it returns cause. It removes
+// a sentinel of ours through abandonLockCreate first. Whether that delete went
+// through does not change the error, because these failures leave the holder
+// unknown or the request interrupted, and the acquire ends either way.
+func giveUpLockCreate(
 	ctx context.Context, pools PoolService, pool, owner string, settings clusterLockSettings, clk lockClock, cause error,
 ) error {
+	abandonLockCreate(ctx, pools, pool, owner, settings, clk)
+	return cause
+}
+
+// abandonLockCreate removes a sentinel this acquire created and will not use.
+// A sentinel of ours would otherwise block every other acquirer until its
+// TTL, so it reads the sentinel on a detached context and deletes it when that
+// read proves the claim is ours. The delete carries the comment the read
+// returned, never the one we sent, so a guarded pool service compares two
+// reads. It leaves the sentinel alone when the read fails, names another
+// owner, cannot be parsed, or shows a claim within the release margin of its
+// expiry, the same rules Release follows.
+//
+// It reports whether our claim is gone, which is true when the delete went
+// through or PVE says the sentinel no longer exists. A read that finds no
+// sentinel, or another owner's, is not reported as gone, because it says
+// nothing about whether another acquirer has already taken the lock, and only
+// a claim we removed ourselves lets the acquire create again at once. A failed
+// delete leaves the sentinel to its TTL steal, which is where it stood before
+// this attempt.
+func abandonLockCreate(
+	ctx context.Context, pools PoolService, pool, owner string, settings clusterLockSettings, clk lockClock,
+) bool {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clusterLockReleaseTimeout)
 	defer cancel()
 	comment, found, err := pools.GetPoolComment(cleanupCtx, pool)
 	if err != nil || !found {
-		return cause
+		return false
 	}
 	holder, ownerOK := decodeLockOwner(comment)
 	exp, expOK := decodeLockExpiry(comment)
 	if !ownerOK || !expOK || holder != owner || !clk.now().Add(settings.releaseMargin()).Before(exp) {
-		return cause
+		return false
 	}
-	// A failed delete leaves the sentinel to its TTL steal, which is where it
-	// stood before this attempt, so cause is still the error to return.
-	_ = pools.DeletePool(withOwnLockClaim(cleanupCtx, comment), pool)
-	return cause
+	delErr := pools.DeletePool(withOwnLockClaim(cleanupCtx, comment), pool)
+	return delErr == nil || isPoolNotFound(delErr)
+}
+
+// shortClaimRefusal is how confirmLockCreate hands a refused claim back to
+// the acquire loop. err is the ErrClusterLockClaimTooShort error the acquire
+// returns, and released reports whether abandonLockCreate removed the claim.
+// The loop takes a fresh claim only when it did, and it never returns the
+// wrapper itself.
+type shortClaimRefusal struct {
+	err      error
+	released bool
+}
+
+func (r *shortClaimRefusal) Error() string { return r.err.Error() }
+
+func (r *shortClaimRefusal) Unwrap() error { return r.err }
+
+// claimAttemptDuration is the least time one more create and its confirmation
+// take, which is the create's round trip, one read round trip per confirming
+// pass, and the grace pause between the passes for a lock that takes it.
+func (s clusterLockSettings) claimAttemptDuration() time.Duration {
+	reads := time.Duration(1)
+	if s.grace {
+		reads = 2
+	}
+	return clusterLockRoundTrip*(1+reads) + s.graceDuration()
+}
+
+// retakeShortClaim decides what the acquire does with err, the error a
+// confirm returned. For any error but a short-claim refusal it returns err
+// unchanged. For a refusal it returns retake true only when all of these hold,
+// and otherwise it returns the refusal's own error.
+//
+//   - abandonLockCreate removed the refused claim. A claim it left standing
+//     may already belong to a stealer, so the acquire never creates over it.
+//   - A fresh attempt still fits inside the wait, which means that one claim
+//     attempt from now is not past deadline.
+//   - The fresh claim still has claimNeed left once that attempt is over. Its
+//     expiry is fixed in whole seconds before its create is sent, so the test
+//     is made one attempt from now against the expiry a claim made now would
+//     record.
+//   - The fresh claim can still be used. When ctx has a deadline, that
+//     deadline less clusterLockContextMargin must leave claimNeed after the
+//     attempt, because the work under the lock runs inside the request. A
+//     request without a deadline sets no such limit, so the acquire's own
+//     deadline must leave claimNeed after the attempt instead.
+//
+// A wait as long as the TTL never passes the last test without a request
+// deadline, because a claim is refused only once less than claimNeed is left
+// of it, and its create came after the wait began.
+//
+// Only the deadline bounds how often a claim is retaken. A fresh claim records
+// more than claimNeed plus one attempt from the moment of its retake, and it
+// is refused only once less than claimNeed is left, so a retaken claim can be
+// refused again no sooner than one attempt after its retake. Each retake
+// needs one attempt before the deadline, so the loop ends.
+func retakeShortClaim(
+	ctx context.Context, err error, ttl time.Duration, deadline time.Time, settings clusterLockSettings,
+	clk lockClock,
+) (bool, error) {
+	var refusal *shortClaimRefusal
+	if !errors.As(err, &refusal) {
+		return false, err
+	}
+	if !refusal.released {
+		return false, refusal.err
+	}
+	now := clk.now()
+	need := settings.claimNeed()
+	confirmed := now.Add(settings.claimAttemptDuration())
+	starts := !confirmed.After(deadline)
+	fits := confirmed.Add(need).Before(claimExpiry(now, ttl))
+	usableUntil := deadline
+	if requestDeadline, ok := ctx.Deadline(); ok {
+		usableUntil = requestDeadline.Add(-clusterLockContextMargin)
+	}
+	usable := !confirmed.Add(need).After(usableUntil)
+	if starts && fits && usable {
+		return true, nil
+	}
+	return false, refusal.err
 }
 
 // sentinelClaim reads the sentinel back and returns its comment and whether it
@@ -929,6 +1099,19 @@ func lockOwnerToken(owner string) string {
 // the lock mechanism is unavailable, and a caller must not run the guarded
 // work unserialized beside a sentinel that may be ours or a live holder's.
 var ErrClusterLockStateUnknown = errors.New("cluster lock state unknown")
+
+// ErrClusterLockClaimTooShort marks an acquire that confirmed its own claim
+// too late to use it, because the reads that confirm it failed until less
+// than the caller's claim reserve, or the release margin, was left before the
+// claim's expiry. The acquire never handed back a handle, so the caller never
+// entered the work the lock guards. On its way out the acquire deleted the
+// claim when a fresh read proved it ours and outside the release margin, and
+// otherwise left it for the TTL steal once its claim lapses. An acquire whose
+// delete went through takes a fresh claim when retakeShortClaim finds room
+// for one, so this error comes back only when there was no room or the claim
+// was left standing. Like a timeout, it is not a sign that the lock mechanism is
+// unavailable, and a caller must not run the guarded work unserialized.
+var ErrClusterLockClaimTooShort = errors.New("cluster lock claim confirmed too late to use")
 
 // ErrClusterLockCreateRefused marks an acquire whose sentinel create PVE
 // refused with a 4xx other than the duplicate verdict, such as the 403 an

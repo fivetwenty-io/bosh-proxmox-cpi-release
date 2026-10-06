@@ -596,6 +596,35 @@ func TransferDiskFromParker(
 	return landedVolid, nil
 }
 
+// transferLandedNameReadTimeout bounds the config read that finds a
+// transferred disk's new name after the protection restore. The read runs on
+// a detached context, so without this bound a PVE that never answered would
+// hold the call open until the API client's own timeout.
+const transferLandedNameReadTimeout = 10 * time.Second
+
+// landedNameReadTimeoutKey carries a test's shorter bound for the landed-name
+// read.
+type landedNameReadTimeoutKey struct{}
+
+// withTestLandedNameReadTimeout returns a context whose landed-name reads are
+// bounded by d instead of transferLandedNameReadTimeout. A non-positive d
+// leaves ctx as it is.
+func withTestLandedNameReadTimeout(ctx context.Context, d time.Duration) context.Context {
+	if d <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, landedNameReadTimeoutKey{}, d)
+}
+
+// landedNameReadTimeout is the bound of the landed-name read, which is
+// transferLandedNameReadTimeout unless a test override rides ctx.
+func landedNameReadTimeout(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(landedNameReadTimeoutKey{}).(time.Duration); ok && d > 0 {
+		return d
+	}
+	return transferLandedNameReadTimeout
+}
+
 // transferFromParkerLocked is TransferDiskFromParker's body, run inside the
 // parker's protection window.
 func transferFromParkerLocked(
@@ -649,7 +678,19 @@ func transferFromParkerLocked(
 	// the target slot. This runs even when the restore was cut off, because
 	// the disk is on the VM either way and the caller needs its new name to
 	// record it there; the cut-off comes back beside the name.
-	targetCfg, tErr := c.QEMU().Config(ctx, parker.Node, targetVMID)
+	//
+	// The read runs on a detached context with its own bound, not on the
+	// window's. The restore before it runs on the time the window reserves
+	// after its deadline, so a restore that uses that time up returns after the
+	// window's deadline has passed, and a read on the window's context would
+	// fail at once and drop the name of a disk that did land. A read changes
+	// nothing on PVE, so running it past the window's deadline cannot
+	// interleave with another window's writes, and the transfer runs no
+	// demoted-slot sweep, so the read fits in the share of the reserve that
+	// sweep would have used.
+	readCtx, cancelRead := context.WithTimeout(context.WithoutCancel(ctx), landedNameReadTimeout(ctx))
+	targetCfg, tErr := c.QEMU().Config(readCtx, parker.Node, targetVMID)
+	cancelRead()
 	if tErr != nil {
 		return "", joinWindowErrors(cpierrors.Wrap(WrapConfigReadError(tErr),
 			fmt.Sprintf("transfer out: config read for target vm %d after move", targetVMID)), restoreErr)
@@ -672,12 +713,15 @@ func transferFromParkerLocked(
 	return landed, restoreErr
 }
 
-// RemoveParkerProvenanceEntry drops the provenance record naming bareVolid
-// from a parker's sentinel (either keying scheme). Best-effort, exported for
-// the handlers that finish an attach-side transfer: sentinel on the receiving
-// VM first, then this — the giving side's record is removed last.
-func RemoveParkerProvenanceEntry(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid string, cfg ParkerConfig) {
-	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+// RemoveParkerProvenanceEntry drops from a parker's sentinel the record of the
+// disk with stableID that left the parker as bareVolid, or the legacy record
+// keyed by bareVolid. Another disk's record survives even when PVE has
+// already parked that disk under the same name (see removeParkerProvenance).
+// Best-effort, exported for the handlers that finish an attach-side transfer:
+// sentinel on the receiving VM first, then this — the giving side's record is
+// removed last.
+func RemoveParkerProvenanceEntry(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, stableID string, cfg ParkerConfig) {
+	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, stableID, cfg)
 }
 
 // TransferDiskToParker moves an attached stable-ID disk from a workload VM
@@ -866,10 +910,12 @@ func transferIntoParkerLocked(
 	// 7. Finalize the landed volume identity. Managed disks require durable
 	// full provenance and receiving-side readback before source cleanup.
 	// Legacy disks retain their serial-based best-effort behavior.
+	// The record is rewritten in update mode, so option overrides that an
+	// update_disk on this disk wrote into the intent meanwhile survive.
 	final := intent
 	final.Volid = landed
 	final.Slot = slot
-	if provErr := writeParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil {
+	if provErr := rewriteParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, final, cfg); provErr != nil {
 		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
 			return "", cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
 		}
@@ -1323,7 +1369,7 @@ func recordResumeSlot(
 			intent.ParkerVMID, stableID)
 	}
 	entry.Slot = slot
-	collected, err := writeParkerProvenanceCollecting(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg)
+	collected, err := writeParkerProvenanceCollecting(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg, parkerProvUpdate)
 	if err != nil {
 		return QemuViews{}, cpierrors.Wrap(err, fmt.Sprintf(
 			"transfer resume: point the record of disk %s on parker vmid %d at fallback slot %s",
@@ -1606,14 +1652,16 @@ func applyResumedSerial(ctx context.Context, c Client, logger *log.Logger, inten
 
 // finalizeResumedTransfer rewrites the provenance record with the landed
 // volid and re-asserts protection. Best-effort on both counts: the serial on
-// the slot is the authoritative carrier by the time this runs.
+// the slot is the authoritative carrier by the time this runs. The rewrite is
+// in update mode, so it keeps the option overrides the record carries at the
+// write rather than the ones the resume read when it started.
 func finalizeResumedTransfer(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, stableID, slot, landed string,
 	cfg ParkerConfig, pctx ParkContext,
 ) error {
 	entry := buildParkerProvEntry(ctx, intent.ParkerNode, landed, slot, cfg, pctx)
-	if provErr := writeParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil {
+	if provErr := rewriteParkerProvenance(ctx, c, logger, intent.ParkerNode, intent.ParkerVMID, stableID, entry, cfg); provErr != nil {
 		if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
 			return cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
 		}
@@ -1638,7 +1686,7 @@ func finalizeResumedTransfer(
 // protection window, verified.
 func DeleteParkedOwnedDisk(
 	ctx context.Context, c Client, logger *log.Logger,
-	node string, parkerVMID int, bareVolid string, cfg ParkerConfig,
+	node string, parkerVMID int, bareVolid, stableID string, cfg ParkerConfig,
 ) error {
 	if c == nil {
 		return cpierrors.Cloud("DeleteParkedOwnedDisk: client must not be nil")
@@ -1663,11 +1711,11 @@ func DeleteParkedOwnedDisk(
 		// longer exists and every later lookup of the disk would refuse it.
 		var cutOff *ProtectionRestoreCutOffError
 		if errors.As(lockErr, &cutOff) && cutOff.WorkCompleted {
-			removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+			removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, stableID, cfg)
 		}
 		return lockErr
 	}
-	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, cfg)
+	removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, stableID, cfg)
 	return nil
 }
 
@@ -1766,19 +1814,12 @@ func joinWindowErrors(workErr, restoreErr error) error {
 	}
 }
 
-// parkerProtectionRestoreTimeout bounds one protection restore. It is the
-// reserve parkerWindowBudget sets aside for the restore, so a window body that
-// runs its whole budget, then a restore that runs its whole deadline, the
-// demoted-slot sweep, and the lock release, still ends before the lock's TTL,
-// where a waiter may steal the lock and open its own window on this parker.
-const parkerProtectionRestoreTimeout = parkerProtectionRestoreReserve
-
 // parkerRestoreTimeoutKey carries a test's shorter protection restore
 // deadline on the request context.
 type parkerRestoreTimeoutKey struct{}
 
 // WithParkerProtectionRestoreTimeoutForTest returns a context whose protection
-// restores use deadline d instead of parkerProtectionRestoreTimeout. It rides
+// restores use deadline d instead of parkerProtectionRestoreReserveNow. It rides
 // the context rather than a package variable so tests that shorten it can run
 // in parallel. A non-positive d leaves ctx as it is. Production code never
 // calls it; it mirrors WithTestBackoff.
@@ -1789,13 +1830,19 @@ func WithParkerProtectionRestoreTimeoutForTest(ctx context.Context, d time.Durat
 	return context.WithValue(ctx, parkerRestoreTimeoutKey{}, d)
 }
 
-// parkerRestoreTimeout returns the test override carried on ctx when one is
-// set, and parkerProtectionRestoreTimeout otherwise.
+// parkerRestoreTimeout is the deadline of one protection restore. It is the
+// reserve parkerWindowReserveNow sets aside for the restore, so a window body
+// that runs to its deadline, then a restore that runs its whole deadline, the
+// demoted-slot sweep, and the lock release, still ends before the lock's TTL,
+// where a waiter may steal the lock and open its own window on this parker.
+// The reserve follows the retry curves configured now, so a restore whose
+// retries need longer on a lengthened curve gets that time. A test override
+// carried on ctx replaces it.
 func parkerRestoreTimeout(ctx context.Context) time.Duration {
 	if d, ok := ctx.Value(parkerRestoreTimeoutKey{}).(time.Duration); ok && d > 0 {
 		return d
 	}
-	return parkerProtectionRestoreTimeout
+	return parkerProtectionRestoreReserveNow()
 }
 
 // ErrMutationNotAttempted marks a mutation that a client wrapper refused

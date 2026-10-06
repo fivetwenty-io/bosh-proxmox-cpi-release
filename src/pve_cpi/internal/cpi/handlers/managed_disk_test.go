@@ -90,7 +90,9 @@ func (q managedDiskTestQEMU) Create(_ context.Context, _ string, params map[stri
 	if q.state.configs == nil {
 		q.state.configs = map[int]map[string]any{}
 	}
-	q.state.configs[vmid] = map[string]any{}
+	// PVE gives every config a digest, and a parker description write refuses
+	// a read without one.
+	q.state.configs[vmid] = map[string]any{"digest": "created-digest"}
 	for key, value := range params {
 		if key != "vmid" {
 			q.state.configs[vmid][key] = value
@@ -471,7 +473,7 @@ func TestManagedDiskParkedCIDAndPoison(t *testing.T) {
 			m, h, state := managedDiskFixture(t, "spread", false)
 			m.deps.Config.DetachedDiskStrategy = "parked"
 			vmid := m.deps.Config.ParkedDiskVMIDRangeStartValue()
-			state.configs = map[int]map[string]any{vmid: {"name": fmt.Sprintf("bosh-parker-%d", vmid), "tags": "bosh-parker", "protection": 1, "scsihw": "virtio-scsi-pci"}}
+			state.configs = map[int]map[string]any{vmid: {"name": fmt.Sprintf("bosh-parker-%d", vmid), "tags": "bosh-parker", "protection": 1, "scsihw": "virtio-scsi-pci", "digest": "1"}}
 			if fail {
 				state.parkErr = errors.New("lost attach response")
 			}

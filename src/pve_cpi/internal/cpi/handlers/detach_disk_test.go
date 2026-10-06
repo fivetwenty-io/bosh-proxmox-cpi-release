@@ -802,6 +802,16 @@ type parkerQEMUService struct {
 	listSnapshotsFn func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
 }
 
+// withParkerDigest gives a parker config the digest PVE answers every config
+// read with, when the test set none, and returns cfg. A parker description
+// write refuses a read without a digest.
+func withParkerDigest(cfg map[string]any) map[string]any {
+	if _, has := cfg["digest"]; !has {
+		cfg["digest"] = "parker-digest"
+	}
+	return cfg
+}
+
 func (m *parkerQEMUService) Config(_ context.Context, _ string, vmid int) (map[string]any, error) {
 	if vmid >= m.parkerVMIDStart {
 		if m.parkerCfgErr != nil {
@@ -817,9 +827,13 @@ func (m *parkerQEMUService) Config(_ context.Context, _ string, vmid int) (map[s
 			for slot, volid := range m.parkerAttached {
 				merged[slot] = volid
 			}
-			return merged, nil
+			return withParkerDigest(merged), nil
 		}
-		return m.parkerCfg, nil
+		answered := make(map[string]any, len(m.parkerCfg)+1)
+		for k, v := range m.parkerCfg {
+			answered[k] = v
+		}
+		return withParkerDigest(answered), nil
 	}
 	if m.realHolderVMID != 0 && vmid == m.realHolderVMID {
 		return m.realHolderCfg, nil

@@ -97,7 +97,7 @@ func (w *keepWorld) client() Client {
 			for k, v := range cfg {
 				out[k] = v
 			}
-			return out, nil
+			return withAnsweredDigest(out), nil
 		},
 	}
 	return keepWorldClient{&findVMTestClient{
