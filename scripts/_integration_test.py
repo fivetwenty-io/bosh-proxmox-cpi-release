@@ -740,5 +740,45 @@ class TestBuildCpiConfigParkerPool(unittest.TestCase):
     def test_explicit_pool_wins(self):
         self.assertEqual(self._build({"pool": "lab-parker"})["parker_pool"], "lab-parker")
 
+
+class TestCfScripts_AdminPassword_UsesDirectorName(unittest.TestCase):
+    """admin_password builds its credhub path from the Director's name."""
+
+    def setUp(self):
+        self._cf = _load_cf_module()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._root = Path(self._tmp.name)
+        (self._root / "manifests" / "bosh").mkdir(parents=True)
+        self._cf.REPO_ROOT = self._root
+
+    def _credhub_path(self) -> str:
+        done = unittest.mock.Mock(stdout="secret-value\n")
+        with unittest.mock.patch.dict("os.environ"), \
+                unittest.mock.patch.object(self._cf, "credhub_env", return_value={}), \
+                unittest.mock.patch.object(self._cf.subprocess, "run", return_value=done) as run:
+            import os
+            os.environ.pop("BOSH_PVE_ENV", None)
+            os.environ.pop("BOSH_STATE_DIR", None)
+            self.assertEqual(self._cf.admin_password(), "secret-value")
+        argv = run.call_args.args[0]
+        return argv[argv.index("-n") + 1]
+
+    def test_a_director_name_in_the_base_vars_file_prefixes_the_path(self):
+        (self._root / "manifests" / "bosh" / "vars.yml").write_text("director_name: lab-director\n")
+        self.assertEqual(self._credhub_path(), "/lab-director/cf/cf_admin_password")
+
+    def test_a_director_name_in_the_env_vars_file_wins(self):
+        (self._root / "manifests" / "bosh" / "vars.yml").write_text("director_name: base\n")
+        env_dir = self._root / "manifests" / "envs" / "cpitest"
+        env_dir.mkdir(parents=True)
+        (env_dir / "vars.yml").write_text("director_name: env-director\n")
+        self.assertEqual(self._credhub_path(), "/env-director/cf/cf_admin_password")
+
+    def test_no_name_falls_back_to_ocfp_mgmt(self):
+        self.assertEqual(self._credhub_path(), "/ocfp-mgmt/cf/cf_admin_password")
+        (self._root / "manifests" / "bosh" / "vars.yml").write_text("internal_gw: 172.31.0.1\n")
+        self.assertEqual(self._credhub_path(), "/ocfp-mgmt/cf/cf_admin_password")
+
 if __name__ == "__main__":
     unittest.main()
