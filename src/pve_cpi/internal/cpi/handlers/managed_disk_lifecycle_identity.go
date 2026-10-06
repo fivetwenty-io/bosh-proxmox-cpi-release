@@ -23,6 +23,10 @@ type managedDiskIdentity struct {
 	// claim-only resume reads it, to scope a later move that took a landing
 	// away.
 	shared bool
+	// journalNode is the node whose certificates opened the journal the
+	// record was read from. has_disk opens the journal the same way when it
+	// waits for the disk's lifecycle.
+	journalNode string
 }
 
 func resolveManagedDiskIdentity(ctx context.Context, deps Deps, op string, rd resolvedDisk) (resolvedDisk, error) {
@@ -72,7 +76,14 @@ func resolveManagedDiskIdentity(ctx context.Context, deps Deps, op string, rd re
 		metadata.ID = record.DiskToken
 		return resolveDiskForOp(ctx, deps, op, rd.diskCID, rd.birth, &metadata)
 	}
-	return resolveManagedDiskRecord(ctx, deps, op, rd, record, node)
+	resolved, err := resolveManagedDiskRecord(ctx, deps, op, rd, record, node)
+	if err != nil {
+		return resolvedDisk{}, asManagedDiskRefusal(err, record, rd, node)
+	}
+	if resolved.allocation != nil && resolved.allocation.journalNode == "" {
+		resolved.allocation.journalNode = node
+	}
+	return resolved, nil
 }
 func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd resolvedDisk, record aj.Record, node string) (resolvedDisk, error) {
 	id := record.ID
@@ -99,7 +110,7 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd reso
 	if backing == "" {
 		return resolvedDisk{}, cpierrors.Cloud("managed disk backing identity unavailable")
 	}
-	if err := validateManagedDiskJournalIdentity(record, rd.birth, rd.volid, backing); err != nil {
+	if err := managedJournalIdentityRefusal(record, rd, backing); err != nil {
 		return resolvedDisk{}, err
 	}
 	exists := false
@@ -130,22 +141,38 @@ func resolveManagedDiskRecord(ctx context.Context, deps Deps, op string, rd reso
 		}
 		if found {
 			if actual.AllocationID != id || actual.AllocationNamespace != record.Namespace || actual.Volid != rd.volid || actual.Backing != "" && actual.Backing != backing {
-				return resolvedDisk{}, cpierrors.Cloud("managed disk holder provenance conflicts; audit required")
+				return resolvedDisk{}, identityConflict(cpierrors.Cloud("managed disk holder provenance conflicts; audit required"))
 			}
 		} else if rd.volid != rd.birth {
 			return resolvedDisk{}, cpierrors.Cloud("renamed managed disk lacks full ownership provenance; audit required")
 		}
 	} else if rd.intent != nil {
 		if rd.intent.AllocationID != id || rd.intent.AllocationNamespace != record.Namespace || rd.intent.AllocationBacking != "" && rd.intent.AllocationBacking != backing {
-			return resolvedDisk{}, cpierrors.Cloud("managed disk transfer provenance conflicts; audit required")
+			return resolvedDisk{}, identityConflict(cpierrors.Cloud("managed disk transfer provenance conflicts; audit required"))
 		}
 	}
 	rd.allocation = &managedDiskIdentity{record: record, provenance: provenance, absent: !exists}
 	return rd, nil
 }
 
+// managedJournalIdentityRefusal checks that the disk's record names the
+// volume rd resolved on backing. A record that doesn't is a conflict, unless
+// an unsettled move to the disk's holder explains the volume the record
+// doesn't name yet. That refusal shows an unsettled step rather than a
+// contradiction, so a caller that waits for lifecycles waits for it.
+func managedJournalIdentityRefusal(record aj.Record, rd resolvedDisk, backing string) error {
+	err := validateManagedDiskJournalIdentity(record, rd.birth, rd.volid, backing)
+	if err == nil {
+		return nil
+	}
+	if rd.holder != nil && unsettledMoveLandsOnHolder(record, rd.birth, backing, rd.holder.VMID) {
+		return err
+	}
+	return identityConflict(err)
+}
+
 // unsettledMoveRunbook points the unsettled-move refusal at its runbook entry.
-const unsettledMoveRunbook = `see "A disk call refuses while a move to a parker is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+const unsettledMoveRunbook = `see "A disk call refuses while a move of the disk is unsettled" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
 
 // identityResumeKey marks a context whose disk resolution runs inside a
 // resume that resumeBeforeManagedIdentity started.
@@ -201,7 +228,7 @@ type identityResumeKey struct{}
 // resume uses it to scope the moves that took a landing away.
 func resumeBeforeManagedIdentity(ctx context.Context, deps Deps, op string, rd resolvedDisk, record aj.Record, provenance pve.DiskAllocationProvenance, shared bool) (resolvedDisk, error) {
 	if rd.intent.AllocationID != record.ID || rd.intent.AllocationNamespace != record.Namespace || rd.intent.AllocationBacking != "" && rd.intent.AllocationBacking != provenance.Backing {
-		return resolvedDisk{}, cpierrors.Cloud("managed disk transfer provenance conflicts; audit required")
+		return resolvedDisk{}, identityConflict(cpierrors.Cloud("managed disk transfer provenance conflicts; audit required"))
 	}
 	if ctx.Value(identityResumeKey{}) != nil {
 		return resolvedDisk{}, cpierrors.Cloud(missingVolumeAudit)

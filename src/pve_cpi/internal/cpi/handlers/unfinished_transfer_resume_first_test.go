@@ -691,10 +691,11 @@ type resumeOutcome struct {
 // as observed. While that resume still holds the parker's lock before its
 // serial write, has_disk resolves the same disk. Its identity check sees the
 // old name gone, and it finds the serial write planned and not yet settled in
-// the disk's record. It refuses for audit the way an overlapping call does
-// while a move is unsettled, names that step, and writes nothing, so it never
-// reaches the parker's lock. The lifecycle's resume then writes the one serial
-// and the one record, and has_disk finds the disk once attach_disk is done.
+// the disk's record. That first answer refuses for audit, names that step, and
+// writes nothing, so it never reaches the parker's lock. has_disk then waits
+// for the lifecycle to let go of the disk's record. The lifecycle's resume
+// writes the one serial and the one record, and has_disk, asking again once
+// attach_disk is done, finds the disk.
 func TestIdentityResumeYieldsToLifecycleResume(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
@@ -735,39 +736,26 @@ func TestIdentityResumeYieldsToLifecycleResume(t *testing.T) {
 		return landed, err
 	}))
 
-	var hasDiskErr error
-	var fakeBefore, fakeAfter string
-	raced := false
+	var overlap *hasDiskOverlap
 	race.beforeSerial = func() {
-		if raced {
+		if overlap != nil {
 			return
 		}
-		raced = true
-		fakeBefore = flowFakeWrites(t, f.client)
-		done := make(chan error, 1)
-		go func() {
-			// The short lock wait bounds the row if has_disk ever reaches the
-			// lock the lifecycle's resume holds.
-			ctx := pve.WithParkerLockWait(digestCtx(), 50*time.Millisecond)
-			_, err := HandleHasDisk(f.deps).Handle(ctx, []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-			done <- err
-		}()
-		hasDiskErr = <-done
-		fakeAfter = flowFakeWrites(t, f.client)
+		// The short lock wait bounds the row if has_disk ever reaches the
+		// lock the lifecycle's resume holds.
+		overlap = startHasDiskOverlap(t, pve.WithParkerLockWait(digestCtx(), 50*time.Millisecond), f)
 	}
 	if err := digestAttach(t, f.deps, f.cid); err != nil {
 		t.Fatalf("attach_disk: %v", err)
 	}
-	if !raced {
+	if overlap == nil {
 		t.Fatal("attach_disk's resume wrote no serial, so has_disk never overlapped it")
 	}
-	if hasDiskErr == nil || !isTypedCPIError(hasDiskErr) || okToRetryCPIError(hasDiskErr) || !strings.HasPrefix(hasDiskErr.Error(), missingVolumeRefusal) {
-		t.Fatalf("has_disk during the lifecycle's resume: error %v, want the permanent missing-volume refusal for audit", hasDiskErr)
+	overlap.requireWaitedQuietly(t, "has_disk during the lifecycle's resume", missingVolumeRefusal)
+	if !isTypedCPIError(overlap.refusal) || okToRetryCPIError(overlap.refusal) {
+		t.Errorf("has_disk's first answer during the lifecycle's resume: error %v, want the permanent refusal", overlap.refusal)
 	}
-	requireText(t, hasDiskErr, "has_disk during the lifecycle's resume", []string{"QEMU_AttachDisk) is planned in the disk's record"})
-	if fakeAfter != fakeBefore {
-		t.Errorf("the overlapping has_disk wrote to PVE\nbefore %s\nafter  %s", fakeBefore, fakeAfter)
-	}
+	requireText(t, overlap.refusal, "has_disk during the lifecycle's resume", []string{"QEMU_AttachDisk) is planned in the disk's record"})
 	race.mu.Lock()
 	if len(outcomes) != 1 || !outcomes[0].lifecycle || outcomes[0].err != nil {
 		t.Errorf("resume outcomes = %+v, want only the lifecycle's resume, landing", outcomes)
@@ -779,10 +767,14 @@ func TestIdentityResumeYieldsToLifecycleResume(t *testing.T) {
 		t.Errorf("the resume wrote %d serials and %d parker records, want one of each", race.serials, race.finalizes)
 	}
 	race.mu.Unlock()
-	result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-	if err != nil || result != true {
-		t.Errorf("has_disk after attach_disk = %v, %v, want true", result, err)
+	if present, err := overlap.finish(t); err != nil || present != true {
+		t.Errorf("has_disk during the lifecycle's resume = %v, %v, want true once attach_disk finished", present, err)
 	}
+	race.mu.Lock()
+	if len(outcomes) != 1 {
+		t.Errorf("resume outcomes after has_disk asked again = %+v, want only the lifecycle's resume", outcomes)
+	}
+	race.mu.Unlock()
 }
 
 // TestIdentityResumeWaiterFindsTheTransferFinished races two has_disk calls
@@ -963,10 +955,10 @@ func editParkedRecord(t *testing.T, f digestManaged, parker int, token string, e
 // TestIdentityCheckKeepsTheAnswerWhenNothingMoved covers a transfer record
 // that no window of the resume converges, here one that names no source VM
 // after the parker's landed slot is gone. The identity check's claim-only
-// resume returns the transfer's permanent error, and the check resolves the
-// disk once more in case another call changed the transfer in the meantime.
-// Nothing changed, so the check gives the resume's permanent answer without
-// resuming again and without writing anything.
+// resume returns the transfer's permanent error, and has_disk resolves the
+// disk once more under the record's hold in case another call changed the
+// transfer in the meantime, so the resume runs once per look. Nothing changed,
+// so has_disk gives the resume's permanent answer without writing anything.
 func TestIdentityCheckKeepsTheAnswerWhenNothingMoved(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
@@ -977,8 +969,8 @@ func TestIdentityCheckKeepsTheAnswerWhenNothingMoved(t *testing.T) {
 	resumeThen(t, func() { calls++ })
 	fakeBefore := flowFakeWrites(t, f.client)
 	_, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-	if calls != 1 {
-		t.Fatalf("the resume ran %d times, want once (err = %v)", calls, err)
+	if calls != 2 {
+		t.Fatalf("the resume ran %d times, want twice, once per look (err = %v)", calls, err)
 	}
 	if err == nil || !isTypedCPIError(err) || okToRetryCPIError(err) || !strings.Contains(err.Error(), "neither the parker nor the source VM holds a state") {
 		t.Fatalf("has_disk: error %v, want the transfer's permanent error for a state no window converges", err)
@@ -1029,10 +1021,11 @@ func TestIdentityCheckRefusesARecordNeedingReconciliation(t *testing.T) {
 // the parker holds the disk's landing, the resume's identity proof never runs
 // the move window, so it claims the landing, which the disk's record proves,
 // and leaves the dangling entry alone. Once the landing is gone, the identity
-// check's claim-only resume stops at the move, and the check resolves the
-// disk once more. The old name is still gone and nothing changed, so the
-// check refuses for audit, permanently, with the move's reason. A second call
-// gets the same answer, and neither call writes anything.
+// check's claim-only resume stops at the move, and has_disk resolves the disk
+// once more under the record's hold, so the resume runs once per look. The old
+// name is still gone and nothing changed, so the check refuses for audit,
+// permanently, with the move's reason. A second call gets the same answer, and
+// neither call writes anything.
 func TestIdentityCheckRefusesADanglingUnusedEntry(t *testing.T) {
 	captureParkerPoolSweep(t)
 	dangling := func(t *testing.T, f digestManaged) {
@@ -1080,10 +1073,12 @@ func TestIdentityCheckRefusesADanglingUnusedEntry(t *testing.T) {
 		for call := 1; call <= 2; call++ {
 			before := len(*runs)
 			_, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-			if len(*runs) != before+1 {
-				t.Fatalf("has_disk call %d ran the resume %d times, want once (err = %v)", call, len(*runs)-before, err)
+			if len(*runs) != before+2 {
+				t.Fatalf("has_disk call %d ran the resume %d times, want twice, once per look (err = %v)", call, len(*runs)-before, err)
 			}
-			requireClaimOnlyMove(t, (*runs)[before])
+			for _, run := range (*runs)[before:] {
+				requireClaimOnlyMove(t, run)
+			}
 			if err == nil || !isTypedCPIError(err) || okToRetryCPIError(err) || !strings.HasPrefix(err.Error(), missingVolumeRefusal) {
 				t.Fatalf("has_disk call %d: error %v, want the permanent missing-volume refusal for audit", call, err)
 			}
@@ -1353,9 +1348,10 @@ func (p lockForbiddenPools) CreatePool(ctx context.Context, id, comment string) 
 // TestIdentityCheckRefusesWhenPVERefusesTheParkerLock covers a token that
 // lacks Pool.Allocate on bosh-lock-*, so PVE refuses the parker's lock. The
 // identity check's claim-only resume never claims without that lock, and no
-// retry grants it, so has_disk refuses for audit, permanently, and names the
-// lock. A second call gets the same answer, and neither call writes anything
-// or changes the journal.
+// retry grants it. has_disk looks a second time under the record's hold, which
+// runs the resume once more and meets the same refusal, so has_disk refuses for
+// audit, permanently, and names the lock. A second call gets the same answer,
+// and neither call writes anything or changes the journal.
 func TestIdentityCheckRefusesWhenPVERefusesTheParkerLock(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
@@ -1368,12 +1364,13 @@ func TestIdentityCheckRefusesWhenPVERefusesTheParkerLock(t *testing.T) {
 	for call := 1; call <= 2; call++ {
 		before, refusedBefore := len(*runs), refused
 		_, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-		if len(*runs) != before+1 {
-			t.Fatalf("has_disk call %d ran the resume %d times, want once (err = %v)", call, len(*runs)-before, err)
+		if len(*runs) != before+2 {
+			t.Fatalf("has_disk call %d ran the resume %d times, want twice, once per look (err = %v)", call, len(*runs)-before, err)
 		}
-		run := (*runs)[before]
-		if refusal, ok := pve.AsClaimOnlyRefusal(run.err); !run.claimOnly || !ok || refusal.Window != pve.ClaimOnlyUnserialized {
-			t.Fatalf("has_disk call %d's resume = claim-only %v, %v, want a claim-only refusal for running unserialized", call, run.claimOnly, run.err)
+		for _, run := range (*runs)[before:] {
+			if refusal, ok := pve.AsClaimOnlyRefusal(run.err); !run.claimOnly || !ok || refusal.Window != pve.ClaimOnlyUnserialized {
+				t.Fatalf("has_disk call %d's resume = claim-only %v, %v, want a claim-only refusal for running unserialized", call, run.claimOnly, run.err)
+			}
 		}
 		if refused == refusedBefore {
 			t.Fatalf("has_disk call %d never asked PVE for the parker's lock", call)
@@ -1457,14 +1454,16 @@ func journalFiles(t *testing.T, dir string) map[string][]byte {
 	return files
 }
 
-// TestIdentityResumeRefusesAnUnsettledMove covers a detach whose move answer
-// was lost after PVE forked the task, so the record keeps the move step
+// TestUnsettledMoveLeavesTheDiskPresentButRefused covers a detach whose move
+// answer was lost after PVE forked the task, so the record keeps the move step
 // planned, and the move then lands on the parker without the disk's serial.
 // The landed name is in no step of the record, so the identity check would
-// refuse the disk after any claim. has_disk and then detach_disk refuse for
-// audit the way they did before the identity check could resume, and neither
-// writes to PVE or the journal.
-func TestIdentityResumeRefusesAnUnsettledMove(t *testing.T) {
+// refuse the disk after any claim, and detach_disk refuses it for audit. No
+// live call holds the record, and the parker's transfer record still carries
+// the disk, so has_disk reports it present rather than missing, which bosh
+// cck could act on by forgetting the disk. Neither call writes to PVE or the
+// journal.
+func TestUnsettledMoveLeavesTheDiskPresentButRefused(t *testing.T) {
 	captureParkerPoolSweep(t)
 	m := unfiredDetach(t, true)
 	if outcome := m.client.runLostMove(0); !strings.HasPrefix(outcome, "moved ") {
@@ -1478,7 +1477,7 @@ func TestIdentityResumeRefusesAnUnsettledMove(t *testing.T) {
 	fakeBefore := flowFakeWrites(t, m.client)
 	journalBefore := journalFiles(t, m.deps.Config.StorageAllocationJournalDir)
 
-	_, hasErr := HandleHasDisk(m.deps).Handle(settleAt(pastQuietPeriod), []json.RawMessage{planJSON(t, m.cid)}, jsonrpc.Context{})
+	present, hasErr := HandleHasDisk(m.deps).Handle(settleAt(pastQuietPeriod), []json.RawMessage{planJSON(t, m.cid)}, jsonrpc.Context{})
 	detachErr := detachDiskAt(t, settleAt(pastQuietPeriod), m.deps, "777", m.cid)
 	if after := flowFakeWrites(t, m.client); after != fakeBefore || poolWrites != 0 {
 		t.Errorf("PVE took writes (%d pool writes)\nbefore %s\nafter  %s", poolWrites, fakeBefore, after)
@@ -1486,55 +1485,11 @@ func TestIdentityResumeRefusesAnUnsettledMove(t *testing.T) {
 	if after := journalFiles(t, m.deps.Config.StorageAllocationJournalDir); !reflect.DeepEqual(after, journalBefore) {
 		t.Error("the journal changed")
 	}
-	for _, call := range []struct {
-		name string
-		err  error
-	}{{"has_disk", hasErr}, {"detach_disk", detachErr}} {
-		where := call.name + " after the lost move landed"
-		if call.err == nil || !isTypedCPIError(call.err) || okToRetryCPIError(call.err) || !strings.HasPrefix(call.err.Error(), missingVolumeRefusal) {
-			t.Errorf("%s: error %v, want the permanent missing-volume refusal for audit", where, call.err)
-		}
+	if hasErr != nil || present != true {
+		t.Errorf("has_disk after the lost move landed = %v, %v, want true", present, hasErr)
 	}
-}
-
-// TestOverlappingMoveRefusalClearsOnRerun covers a call that overlaps a
-// detach whose move has landed and whose step isn't observed yet. has_disk
-// then sees the parker's transfer record name a volume that's gone, and it
-// refuses for audit the way it did before the identity check could resume,
-// without writing anything. Once the detach has finished, the same has_disk
-// finds the disk on its parker, with no change made in between.
-func TestOverlappingMoveRefusalClearsOnRerun(t *testing.T) {
-	captureParkerPoolSweep(t)
-	f := digestManagedFixture(t)
-	var overlapErr error
-	overlapped := false
-	f.client.afterMove = func() {
-		if overlapped {
-			return
-		}
-		overlapped = true
-		fakeBefore := flowFakeWrites(t, f.client)
-		journalBefore := journalFiles(t, f.deps.Config.StorageAllocationJournalDir)
-		_, overlapErr = HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-		if after := flowFakeWrites(t, f.client); after != fakeBefore {
-			t.Errorf("the overlapping has_disk wrote to PVE\nbefore %s\nafter  %s", fakeBefore, after)
-		}
-		if after := journalFiles(t, f.deps.Config.StorageAllocationJournalDir); !reflect.DeepEqual(after, journalBefore) {
-			t.Error("the overlapping has_disk changed the journal")
-		}
-	}
-	if err := digestDetach(t, f.deps, f.cid); err != nil {
-		t.Fatalf("detach_disk: %v", err)
-	}
-	if !overlapped {
-		t.Fatal("detach_disk sent no move, so has_disk never overlapped it")
-	}
-	if overlapErr == nil || !isTypedCPIError(overlapErr) || okToRetryCPIError(overlapErr) || !strings.HasPrefix(overlapErr.Error(), missingVolumeRefusal) {
-		t.Errorf("has_disk during the detach's move: error %v, want the permanent missing-volume refusal for audit", overlapErr)
-	}
-	result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
-	if err != nil || result != true {
-		t.Errorf("has_disk after the detach finished = %v, %v, want true", result, err)
+	if detachErr == nil || !isTypedCPIError(detachErr) || okToRetryCPIError(detachErr) || !strings.HasPrefix(detachErr.Error(), missingVolumeRefusal) {
+		t.Errorf("detach_disk after the lost move landed: error %v, want the permanent missing-volume refusal for audit", detachErr)
 	}
 }
 
@@ -1542,7 +1497,7 @@ func TestOverlappingMoveRefusalClearsOnRerun(t *testing.T) {
 // refusal points at a heading docs/troubleshooting.md has, so a rename of the
 // section can't leave the pointer dangling.
 func TestUnsettledMoveRefusalNamesItsRunbook(t *testing.T) {
-	const heading = "A disk call refuses while a move to a parker is unsettled"
+	const heading = "A disk call refuses while a move of the disk is unsettled"
 	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..", "docs", "troubleshooting.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -1559,8 +1514,8 @@ func TestUnsettledMoveRefusalNamesItsRunbook(t *testing.T) {
 	if outcome := m.client.runLostMove(0); !strings.HasPrefix(outcome, "moved ") {
 		t.Fatalf("the lost move didn't land: %s", outcome)
 	}
-	_, err = HandleHasDisk(m.deps).Handle(settleAt(pastQuietPeriod), []json.RawMessage{planJSON(t, m.cid)}, jsonrpc.Context{})
-	requireText(t, err, "has_disk after the lost move landed", []string{`see "` + heading + `" in docs/troubleshooting.md of bosh-proxmox-cpi-release`})
+	err = detachDiskAt(t, settleAt(pastQuietPeriod), m.deps, "777", m.cid)
+	requireText(t, err, "detach_disk after the lost move landed", []string{`see "` + heading + `" in docs/troubleshooting.md of bosh-proxmox-cpi-release`})
 }
 
 // TestClaimLeavesTheSweepAndTailToLaterCalls covers the work a claim-only

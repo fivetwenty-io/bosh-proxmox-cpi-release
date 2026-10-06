@@ -1900,6 +1900,9 @@ properties:
       Deadline in seconds for read-only methods (info, has_vm, has_disk,
       get_disks, calculate_vm_cloud_properties). Zero (default) applies the
       built-in 120 s. Honored only when operation_timeout.enabled is true.
+      When has_disk waits for another call on the same disk, it keeps the
+      last 10 s of this deadline to look at the disk again, so a value well
+      over 10 s is needed. The built-in 120 s leaves room for both.
     default: 0
   pve.operation_timeout.default_sec:
     description: |

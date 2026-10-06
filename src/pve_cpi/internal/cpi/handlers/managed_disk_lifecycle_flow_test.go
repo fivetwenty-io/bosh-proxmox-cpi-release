@@ -141,6 +141,10 @@ type lifecycleFlowPVE struct {
 	// onConfigRead, when set, runs before every config read, and an error it
 	// returns fails that read.
 	onConfigRead func(vmid int) error
+	// onConfigReadContext, when set, runs before every config read with the
+	// read's context, and an error it returns fails that read, so a row can
+	// hold a read until its context ends.
+	onConfigReadContext func(ctx context.Context, vmid int) error
 	// activeMoveTasks is each node's active qmmove task list, and
 	// activeMoveTaskErr fails every listing. onActiveMoveTasks runs before
 	// each listing with its node, and moveTaskListings records the nodes
@@ -152,6 +156,8 @@ type lifecycleFlowPVE struct {
 	// destroyed records every volume PVE destroyed, in order, whether a
 	// storage delete or the delete of an unused entry its VM owns took it.
 	destroyed []string
+	// certificateErr fails every certificate read of the nodes it names.
+	certificateErr map[string]error
 }
 
 // lostMove is a move task PVE forked for a POST whose response was lost.
@@ -293,7 +299,10 @@ func (n lifecycleFlowNodes) ListQemuSnapshotConfig(_ context.Context, _, vmidTex
 	return &resp, nil
 }
 
-func (n lifecycleFlowNodes) ListCertificatesInfo(context.Context, string) (*nodes.ListCertificatesInfoResponse, error) {
+func (n lifecycleFlowNodes) ListCertificatesInfo(_ context.Context, node string) (*nodes.ListCertificatesInfoResponse, error) {
+	if err := n.c.certificateErr[node]; err != nil {
+		return nil, err
+	}
 	raw, _ := json.Marshal(map[string]any{"filename": "pve-root-ca.pem", "fingerprint": strings.TrimSuffix(strings.Repeat("11:", 32), ":")})
 	r := nodes.ListCertificatesInfoResponse{raw}
 	return &r, nil
@@ -978,6 +987,11 @@ func (c *lifecycleFlowPVE) vmNode(vmid int) string {
 func (q lifecycleFlowQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	if q.c.onConfigRead != nil {
 		if err := q.c.onConfigRead(vmid); err != nil {
+			return nil, err
+		}
+	}
+	if q.c.onConfigReadContext != nil {
+		if err := q.c.onConfigReadContext(ctx, vmid); err != nil {
 			return nil, err
 		}
 	}
