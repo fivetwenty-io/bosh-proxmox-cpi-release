@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -174,6 +176,115 @@ func IsDiskBirthNameHeld(err error) (*DiskBirthNameHeldError, bool) {
 	return nil, false
 }
 
+// DiskIdentityCopiedRunbook points the refusal of a disk whose identity more
+// than one guest carries at the way out. A test pins the heading it quotes.
+const DiskIdentityCopiedRunbook = `see "A disk's serial or transfer record is on more than one guest" in docs/troubleshooting.md of bosh-proxmox-cpi-release`
+
+// diskIdentityCopiedTellApart is how every form of the copy refusal tells the
+// operator to find the copy. PVE files a restore under the guest it created
+// and a clone under the guest it copied, so the VMID a task is filed under
+// can name either one, and the Director and the CPI's own log settle it.
+const diskIdentityCopiedTellApart = "PVE files a qmrestore task under the copy it created, but it files a qmclone task under " +
+	"the VM it copied, so the VMID a task is filed under doesn't say which guest is the copy. The original is the guest " +
+	"that runs the VM CID `bosh instances --details` lists with the disk, or the guest that holds the volume the CPI's " +
+	"latest log line for the disk gives as volid_after."
+
+// DiskIdentityCopiedError is the refusal ResolveDiskIdentity returns when a
+// second read of the cluster still finds a disk's identity in more than one
+// place. Holders lists the guests whose slots carry the disk's serial. When no
+// slot carries it, Records lists the parkers that each keep a record of the
+// disk's transfer. When one slot carries it, Records lists the parkers whose
+// record names another volume that is still there, and Evidence says, for
+// each of those records in turn, where that volume still is. A clone or a
+// backup restore copies a guest's drive lines with their serials and its
+// description with its records, so one of the volumes is a copy, and acting
+// on the first one the scan reads could mount, grow, or delete the copy in
+// place of the disk. The state stays until an operator removes the copy, so
+// the refusal is permanent.
+type DiskIdentityCopiedError struct {
+	StableID string
+	Holders  []DiskSerialHolder
+	Records  []DiskTransferIntent
+	Evidence []string
+}
+
+func (e *DiskIdentityCopiedError) Error() string {
+	switch {
+	case len(e.Holders) == 0:
+		return e.recordsError()
+	case len(e.Holders) == 1 && len(e.Records) > 0:
+		return e.slotAndRecordError()
+	}
+	guests := make([]string, 0, len(e.Holders))
+	for _, h := range e.Holders {
+		guests = append(guests, describeSerialHolder(h))
+	}
+	return fmt.Sprintf(
+		"the disk's serial %s is on %s, so we can't tell which volume is the disk. A clone or a backup restore copies a "+
+			"drive line with its serial. %s Nothing acts on the disk until an operator removes serial=%s from the copy's "+
+			"drive line; %s",
+		e.StableID, strings.Join(guests, " and "), diskIdentityCopiedTellApart, e.StableID, DiskIdentityCopiedRunbook)
+}
+
+// recordsError is the refusal's text when no slot carries the serial and
+// more than one parker keeps a record of the disk's transfer.
+func (e *DiskIdentityCopiedError) recordsError() string {
+	parkers := make([]string, 0, len(e.Records))
+	for i := range e.Records {
+		r := &e.Records[i]
+		parkers = append(parkers, fmt.Sprintf("parker VM %d on node %s (recorded volume %s, source VM %q)",
+			r.ParkerVMID, r.ParkerNode, r.Volid, r.SourceVMCID))
+	}
+	return fmt.Sprintf(
+		"no slot carries the disk's serial %s, but %s each keep a record of its transfer, so we can't tell which parker "+
+			"received the disk. A clone or a backup restore of a parker copies its records. %s Nothing acts on the disk "+
+			"until an operator removes the record from every parker but the one that received the disk; %s",
+		e.StableID, strings.Join(parkers, " and "), diskIdentityCopiedTellApart, DiskIdentityCopiedRunbook)
+}
+
+// slotAndRecordError is the refusal's text when one slot carries the serial
+// and a parker's record of the disk's transfer names another volume that is
+// still there.
+func (e *DiskIdentityCopiedError) slotAndRecordError() string {
+	records := make([]string, 0, len(e.Records))
+	for i := range e.Records {
+		r := &e.Records[i]
+		evidence := ""
+		if i < len(e.Evidence) {
+			evidence = ", and " + e.Evidence[i]
+		}
+		records = append(records, fmt.Sprintf("parker VM %d on node %s keeps a record of the disk's transfer that names volume %s%s",
+			r.ParkerVMID, r.ParkerNode, r.Volid, evidence))
+	}
+	return fmt.Sprintf(
+		"the disk's serial %s is on %s, but %s, so we can't tell which volume is the disk. A clone or a backup restore "+
+			"taken while the disk was moving to a parker copies its drive line with the serial, so the slot can be the "+
+			"copy's while the disk waits for the parker. %s Nothing acts on the disk until an operator removes serial=%s "+
+			"from the slot's drive line when the slot is the copy's, or removes the record from the parker when the slot "+
+			"holds the disk; %s",
+		e.StableID, describeSerialHolder(e.Holders[0]), strings.Join(records, "; and "), diskIdentityCopiedTellApart,
+		e.StableID, DiskIdentityCopiedRunbook)
+}
+
+// describeSerialHolder names one slot the way the refusal quotes it.
+func describeSerialHolder(h DiskSerialHolder) string {
+	kind := "VM"
+	if h.Parker {
+		kind = "parker VM"
+	}
+	return fmt.Sprintf("slot %s of %s %d on node %s with volume %s", h.Slot, kind, h.VMID, h.Node, h.Volid)
+}
+
+// IsDiskIdentityCopied reports whether err carries a DiskIdentityCopiedError
+// and returns it.
+func IsDiskIdentityCopied(err error) (*DiskIdentityCopiedError, bool) {
+	var copied *DiskIdentityCopiedError
+	if errors.As(err, &copied) {
+		return copied, true
+	}
+	return nil, false
+}
+
 // ResolveDiskIdentity resolves a disk's current volid and holder. It looks
 // for the disk in this order: the slot carrying the disk's serial, then a
 // parker's transfer record, then the unusedN entries that name the birth
@@ -187,6 +298,13 @@ func IsDiskBirthNameHeld(err error) (*DiskBirthNameHeldError, bool) {
 // even when a noted unusedN entry names it too. A scan that couldn't read
 // every node still fails retriably first. A disk nothing names resolves to
 // its birth volid.
+//
+// When two guests carry the disk's serial, or no slot carries it and two
+// parkers each keep a record of its transfer, or one slot carries it while a
+// parker's record names another volume that is still there, the resolution
+// reads the cluster a second time, and when that read finds the same, it
+// returns a permanent DiskIdentityCopiedError. One guest counts once,
+// whichever of its views or slots carries the serial.
 //
 // stableID == "" is the legacy case and returns the birth volid immediately,
 // with no API calls: legacy CIDs are volid-resolved forever, and their
@@ -222,8 +340,46 @@ func resolveDiskIdentity(
 		return DiskIdentity{}, cpierrors.Cloud("ResolveDiskIdentity: client must not be nil")
 	}
 
+	identity, err := resolveDiskIdentityOnce(ctx, c, logger, birthVolid, stableID, cfg, match)
+	if _, copied := IsDiskIdentityCopied(err); !copied {
+		return identity, err
+	}
+	// The scan reads one guest at a time and holds no lock, so a move that
+	// lands between two of its reads shows the disk on the guest it left and
+	// on the guest it reached, and a move in flight can hide the disk from
+	// every slot while both parkers of a mover hand-off keep a record. No
+	// transfer leaves two guests carrying the serial at once, because PVE
+	// writes the giving guest's config before the receiving one's, and the
+	// CPI writes a serial only onto a guest that holds the volume alone. A
+	// second pass therefore reads the moved disk in one place, and only a
+	// copy is still there to refuse.
+	if logger != nil {
+		logger.Warn("disk identity read on more than one guest; reading the cluster again before refusing",
+			log.String("stable_id", stableID),
+			log.String("birth_volid", birthVolid),
+			log.Err(err),
+		)
+	}
+	return resolveDiskIdentityOnce(ctx, c, logger, birthVolid, stableID, cfg, match)
+}
+
+// resolveDiskIdentityOnce is one pass of resolveDiskIdentity, from the slot
+// scan through the parker records to the birth volid.
+func resolveDiskIdentityOnce(
+	ctx context.Context, c Client, logger *log.Logger, birthVolid, stableID string, cfg ParkerConfig, match diskMatch,
+) (DiskIdentity, error) {
 	hit, err := findVMByDiskIdentityScan(ctx, c, birthVolid, stableID, match)
 	if err == nil {
+		if len(hit.SerialHolders) > 1 {
+			return DiskIdentity{}, cpierrors.Wrap(
+				&DiskIdentityCopiedError{StableID: stableID, Holders: hit.SerialHolders},
+				"ResolveDiskIdentity: refusing to resolve a disk whose serial more than one guest carries")
+		}
+		if len(hit.SerialHolders) == 1 {
+			if refusal := refuseRecordOfAnotherVolume(ctx, c, hit, birthVolid, stableID, cfg); refusal != nil {
+				return DiskIdentity{}, refusal
+			}
+		}
 		return DiskIdentity{Volid: hit.Volid, Holder: holderFromScanHit(logger, hit, birthVolid, cfg)}, nil
 	}
 	if !errors.Is(err, ErrDiskNotAttachedToAnyVM) {
@@ -237,11 +393,21 @@ func resolveDiskIdentity(
 	// that landed before its serial write can take the disk's birth name
 	// back, and the resume that settles it starts only from the record we
 	// return here, so refusing would leave that crash with no way out.
-	intent, found, provErr := findParkedDiskIntentByStableID(ctx, c, stableID, cfg)
+	intents, provErr := findParkedDiskIntentByStableID(ctx, c, stableID, cfg)
 	if provErr != nil {
 		return DiskIdentity{}, cpierrors.Wrap(provErr, "ResolveDiskIdentity: parker provenance scan")
 	}
-	if found {
+	// Two parkers that each keep a record leave nothing to say which one
+	// received the disk. The transfer resume refuses the same state before it
+	// moves a volume or writes a serial, so we refuse it here as well, before
+	// a handler acts on either record.
+	if len(intents) > 1 {
+		return DiskIdentity{}, cpierrors.Wrap(
+			&DiskIdentityCopiedError{StableID: stableID, Records: intents},
+			"ResolveDiskIdentity: refusing to resolve a disk that more than one parker records")
+	}
+	if len(intents) == 1 {
+		intent := intents[0]
 		volid := intent.Volid
 		if volid == "" {
 			volid = birthVolid
@@ -281,6 +447,463 @@ func resolveDiskIdentity(
 	// on purpose, because a deferred park leaves the volume on an unused entry
 	// with its intent in place, and that disk has to keep resuming.
 	return DiskIdentity{Volid: birthVolid, Holder: DiskHolder{StorageReferences: hit.StorageReferences}, Unused: hit.Unused}, nil
+}
+
+// refuseRecordOfAnotherVolume refuses a disk that one slot carries when a
+// parker's record of the disk's transfer names another volume that is still
+// there. A clone or a backup restore taken while the disk was moving to a
+// parker copies the drive line with its serial, so the copy's slot is then
+// the only one that carries it, and the record is all that shows the disk is
+// elsewhere.
+//
+// The records are the ones on the parkers the identity scan read, from the
+// configs that scan already holds, so a parker on a node the quorate cluster
+// reports offline goes unseen here as it does in the scan, and no parker is
+// read twice.
+//
+// A record doesn't refuse when the slot carrier keeps it, because the name in
+// a parker's own record is out of date between the move and the record's
+// finalize, and the slot is what the transfer resume trusts. It doesn't
+// refuse when it names the slot's own volume either, because that's a
+// transfer that hasn't deleted the source slot yet. Any other record refuses
+// while its volume is still there, as recordPresence.stillThere decides. A
+// record whose volume is gone was left behind by a finished move that renamed
+// the volume, as an attach does when it lands before it removes the parker's
+// record, or as a mover does before it removes the shared parker's. A read
+// that can't settle whether the volume is there returns a retriable error and
+// never counts as a volume that's gone.
+func refuseRecordOfAnotherVolume(
+	ctx context.Context, c Client, hit DiskScanHit, birthVolid, stableID string, cfg ParkerConfig,
+) error {
+	carrier := hit.SerialHolders[0]
+	var presence *recordPresence
+	var live []DiskTransferIntent
+	var evidence []string
+	records := scannedParkerRecords(hit, stableID, cfg)
+	for i := range records {
+		record := &records[i]
+		volume := record.intent.Volid
+		if volume == "" {
+			volume = birthVolid
+		}
+		if record.intent.ParkerVMID == carrier.VMID || volume == carrier.Volid {
+			continue
+		}
+		if presence == nil {
+			presence = newRecordPresence(c, hit, stableID, cfg)
+		}
+		found, err := presence.stillThere(ctx, record, volume)
+		if err != nil {
+			return err
+		}
+		if found != "" {
+			intent := record.intent
+			intent.Volid = volume
+			live = append(live, intent)
+			evidence = append(evidence, found)
+		}
+	}
+	if len(live) == 0 {
+		return nil
+	}
+	return cpierrors.Wrap(
+		&DiskIdentityCopiedError{StableID: stableID, Holders: []DiskSerialHolder{carrier}, Records: live, Evidence: evidence},
+		"ResolveDiskIdentity: refusing to resolve a disk whose slot and transfer record name different volumes")
+}
+
+// scannedRecord is one parker's record of a disk's transfer, read from the
+// parker config the identity scan holds.
+type scannedRecord struct {
+	intent DiskTransferIntent
+	parker *scannedParker
+}
+
+// scannedParkerRecords returns the record keyed by stableID on each parker the
+// identity scan read, in the order it read them. It applies the rules
+// walkParkerRecords applies to the same applied view, so a band that isn't
+// usable has no records, and a guest outside the band or without the parker
+// tag keeps none.
+func scannedParkerRecords(hit DiskScanHit, stableID string, cfg ParkerConfig) []scannedRecord {
+	if cfg.VMIDRangeStart <= 0 || cfg.VMIDRangeEnd <= cfg.VMIDRangeStart {
+		return nil
+	}
+	var records []scannedRecord
+	for i := range hit.parkers {
+		p := &hit.parkers[i]
+		if p.vmid < cfg.VMIDRangeStart || p.vmid > cfg.VMIDRangeEnd {
+			continue
+		}
+		_, disks, _ := parseParkerSentinel(DescriptionFromConfig(p.views.Applied()))
+		entry, ok := disks[stableID]
+		if !ok {
+			continue
+		}
+		records = append(records, scannedRecord{
+			intent: intentFromParkerEntry(parkerCandidate{vmid: p.vmid, node: p.node}, entry),
+			parker: p,
+		})
+	}
+	return records
+}
+
+// recordPresence decides, for the records of one resolution, whether the
+// volume a record names is still there. It shares one absence proof across
+// the records, so each storage is classified at most once.
+type recordPresence struct {
+	c        Client
+	hit      DiskScanHit
+	stableID string
+	proof    *keepAbsenceProof
+}
+
+func newRecordPresence(c Client, hit DiskScanHit, stableID string, cfg ParkerConfig) *recordPresence {
+	return &recordPresence{c: c, hit: hit, stableID: stableID, proof: newKeepAbsenceProof(c, cfg)}
+}
+
+// stillThere says where the volume a parker's record names is still found, in
+// words the refusal quotes, or returns "" when the volume isn't the disk's any
+// more. It checks, in this order:
+//
+//  1. The record's own slot on its parker holds a volume named for the parker
+//     with no serial, and no other disk's unfinished record names that slot.
+//     That's the landing a move leaves before its serial write, and it's the
+//     rule the transfer resume proves a landing by.
+//  2. A disk key on a guest names the volume as this disk's, with this disk's
+//     serial or none, outside the carrier's slot.
+//  3. A snapshot of the record's source VM names the volume on a drive line
+//     that carries this disk's serial or none. Only the resolver checks the
+//     serial, so the read isn't the one refuseSnapshotNamingVolume makes at
+//     the park gate, which counts a line whatever its serial. A deferred
+//     park of a volume the source doesn't own leaves only the snapshot
+//     naming it. A snapshot names
+//     a volume by the name it had when the snapshot was taken, and the
+//     transfer resume refuses to move a volume a snapshot names, so no other
+//     disk's key or record overrides it. PVE reuses a freed VMID, so the
+//     source can be a new guest whose own disk took the volume's name, and a
+//     snapshot line under that disk's serial is that disk's and doesn't count.
+//  4. The volume is another disk's, and so not this one's. That's a key that
+//     names it under another disk's serial, a key with no serial on a parker
+//     slot that another disk's unfinished record names, or another disk's
+//     unfinished record. PVE gives a freed name to the next volume it renames
+//     onto the same guest, which is how another disk comes to hold it. A
+//     record counts as unfinished under the otherUnfinishedTransfers rule,
+//     and only while no guest the scan read carries its disk's serial. A
+//     record whose disk's serial is on some guest is left over from a
+//     finished move, so it says nothing about who holds the name now. While
+//     the scan left a node out, a guest there could carry that serial, so no
+//     record sets the volume aside then. On node-local storage, or storage we
+//     can't classify, a key or record sets aside only the volume on the node
+//     where its guest sits, because the same name names another volume on
+//     every other node, and step 5 still proves those. While the snapshot read
+//     of step 3 failed, no key or record sets a volume aside, because a
+//     snapshot outranks both, and the answer is a retriable error.
+//  5. Storage still holds the volume, proven the way the transfer resume
+//     proves a volume absent. proveOnStorage says on which nodes, and it
+//     applies step 4 node by node.
+//
+// The guest read in step 2 skips a node the quorate cluster reports offline,
+// as the identity scan does. A key found settles step 2 even then, but when
+// only storage shows the volume while a node was left out, a guest on that
+// node could name it under another disk's serial, so the answer is a
+// retriable error rather than a refusal that never clears. When the reads
+// can't settle whether the volume is there, the answer is a retriable error
+// too. A record whose volume names no storage refuses permanently, because no
+// retry can change that record.
+func (p *recordPresence) stillThere(ctx context.Context, record *scannedRecord, volume string) (string, error) {
+	intent := &record.intent
+	views := record.parker.views
+	otherSlots := otherUnfinishedTransferSlots(p.stableID, views.Applied(), views.Current())
+	if intent.Slot != "" && len(otherSlots[intent.Slot]) == 0 {
+		for _, landing := range parkerUnclaimedLandings(views, intent.ParkerVMID) {
+			if landing.Key == intent.Slot {
+				return fmt.Sprintf("the parker holds volume %s on %s with no serial, the slot the record names, which is what a "+
+					"move that landed before its serial write leaves", landing.Volume, landing.Key), nil
+			}
+		}
+	}
+
+	holders, excluded, err := findDiskKeyHoldersTolerant(ctx, p.c, volume, p.stableID)
+	if err != nil {
+		return "", cpierrors.Wrap(err, fmt.Sprintf("ResolveDiskIdentity: read the guests that name recorded volume %s", volume))
+	}
+	offline := unionNodes(p.hit.excludedNodes, excluded)
+	carrier := p.hit.SerialHolders[0]
+	// others collects the node of each guest that holds the volume as another
+	// disk's, for proveOnStorage to apply node by node.
+	var others []string
+	for i := range holders {
+		h := &holders[i]
+		if !h.NamesVolume || (h.VMID == carrier.VMID && h.Slot == carrier.Slot) {
+			continue
+		}
+		if h.OtherDisk || (h.Parker && len(p.otherUnfinishedSlotsOn(h.VMID)[h.Slot]) > 0) {
+			others = unionNodes(others, []string{h.Node})
+			continue
+		}
+		return fmt.Sprintf("%s of VM %d on node %s still names that volume", h.Slot, h.VMID, h.Node), nil
+	}
+
+	snapshotFound, snapshotErr := p.snapshotOfSource(ctx, intent, volume)
+	if snapshotFound != "" {
+		return snapshotFound, nil
+	}
+	if len(offline) == 0 {
+		others = unionNodes(others, p.unfinishedRecordNodes(volume))
+	}
+
+	storage, _, err := ParseDiskCID(volume)
+	if err != nil {
+		return "", cpierrors.Cloud(
+			"ResolveDiskIdentity: refusing to resolve disk %s, because parker VM %d on node %s keeps a record of its "+
+				"transfer that names volume %q, which names no storage, so we can't tell whether that volume is still "+
+				"there, and a retry won't change the record. Once the slot that carries the serial is known to hold the "+
+				"disk, remove the %q entry from bosh_parked_disks in parker VM %d's description and rerun; %s",
+			p.stableID, intent.ParkerVMID, intent.ParkerNode, volume, p.stableID, intent.ParkerVMID, DiskIdentityCopiedRunbook)
+	}
+	return p.proveOnStorage(ctx, intent, volume, storage, offline, others, snapshotErr)
+}
+
+// proveOnStorage says on which node storage still holds volume, in words the
+// refusal quotes, or returns "" once every node that could hold it proves it
+// gone or holds it as another disk's. Shared storage shows every node the
+// same content, so one proof on the parker's node settles it, and a guest in
+// others, which hold the volume as another disk's, sets it aside everywhere.
+// Node-local storage holds the volume only on the node it was written on, and
+// a parker migrated after its transfer leaves that volume behind, so the
+// proof runs on every node where the storage is enabled, which is its node
+// list or else every cluster member, and a node in others is set aside on its
+// own, because the volume of that name there is another volume than the one
+// on any other node. A storage we can't classify gets the node-local proof
+// unless others isn't empty, because then we can't tell whether the storage
+// is shared and the other disk's claim covers every node, so the answer is a
+// retriable error.
+// When the snapshot read failed and any node is set aside, the answer is a
+// retriable error, because a snapshot would outrank the other disk's claim.
+// When a node the proof needs is offline or its read fails and no other node
+// holds the volume, the answer is unsettled and comes back as a retriable
+// error too.
+func (p *recordPresence) proveOnStorage(
+	ctx context.Context, intent *DiskTransferIntent, volume, storage string, offline, others []string, snapshotErr error,
+) (string, error) {
+	info, classified := p.proof.classifier(storage)(ctx)
+	if !classified && len(others) > 0 {
+		return "", cpierrors.Retriable(
+			"ResolveDiskIdentity: can't tell whether volume %s, which parker vmid %d's record of the disk's transfer names, "+
+				"is still the disk's on storage %s, because the read of storage %s failed, so we can't tell whether it is "+
+				"shared, and another disk's key or unfinished record names the volume on node(s) %s, which would set it "+
+				"aside on every node if the storage is shared; retry once storage %s can be read",
+			volume, intent.ParkerVMID, storage, storage, strings.Join(others, ","), storage)
+	}
+	shared := classified && info.IsShared()
+	nodes, err := p.proofNodes(ctx, storage, intent.ParkerNode, info, classified, shared)
+	if errors.Is(err, errStorageNodesNoMember) {
+		return "", cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"ResolveDiskIdentity: can't tell whether volume %s, which parker vmid %d's record of the disk's transfer names, "+
+				"is still there, because the nodes list of storage %s, %s, names no current cluster member; the operator has "+
+				"to fix that list, and a retry won't change it", volume, intent.ParkerVMID, storage, strings.Join(info.Nodes, ",")))
+	}
+	if err != nil {
+		return "", resumeReadFailure(err, fmt.Sprintf(
+			"ResolveDiskIdentity: list the nodes where storage %s is enabled, to tell whether volume %s, which parker vmid "+
+				"%d's record of the disk's transfer names, is still there; retry once the cluster answers",
+			storage, volume, intent.ParkerVMID))
+	}
+	var setAside []string
+	for _, node := range nodes {
+		if (shared && len(others) > 0) || slices.Contains(others, node) {
+			setAside = append(setAside, node)
+		}
+	}
+	if len(setAside) > 0 && snapshotErr != nil {
+		// On shared storage the set-aside is the proof node, so the message
+		// names the nodes where the other disk's claim sits instead.
+		claimNodes := setAside
+		if shared {
+			claimNodes = others
+		}
+		return "", cpierrors.WrapAs(snapshotErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"ResolveDiskIdentity: can't tell whether volume %s, which parker vmid %d's record of the disk's transfer names, "+
+				"is still the disk's on storage %s, because another disk's key or unfinished record names it on node(s) %s, "+
+				"and the read of source VM %s's snapshots, which would outrank that, failed; retry once the snapshots "+
+				"can be read", volume, intent.ParkerVMID, storage, strings.Join(claimNodes, ","), intent.SourceVMCID))
+	}
+	corroborators := append([]EmptyListingCorroborator{ConfigReferenceCorroborator(p.hit.StorageReferences)},
+		p.proof.secondOpinions()...)
+	var down, failed []string
+	var failure error
+	for _, node := range nodes {
+		if slices.Contains(setAside, node) {
+			continue
+		}
+		if slices.Contains(offline, node) {
+			down = append(down, node)
+			continue
+		}
+		absent, proofErr := ProveVolumeAbsent(ctx, p.c, node, storage, volume, p.proof.classifier(storage), corroborators...)
+		if proofErr != nil {
+			failed = append(failed, node)
+			if failure == nil {
+				failure = proofErr
+			}
+			continue
+		}
+		if absent {
+			continue
+		}
+		if len(offline) > 0 {
+			return "", cpierrors.Retriable(
+				"ResolveDiskIdentity: storage %s on node %s still holds volume %s, which parker vmid %d's record of the "+
+					"disk's transfer names, and no guest we could read names it, but node(s) %s are offline, and a guest "+
+					"there could hold it as another disk's; retry once those nodes are back",
+				storage, node, volume, intent.ParkerVMID, strings.Join(offline, ","))
+		}
+		return fmt.Sprintf("storage %s on node %s still holds that volume and no guest names it", storage, node), nil
+	}
+	if failure != nil {
+		msg := fmt.Sprintf("ResolveDiskIdentity: can't tell whether volume %s, which parker vmid %d's record of the disk's "+
+			"transfer names, is still on storage %s on node(s) %s", volume, intent.ParkerVMID, storage, strings.Join(failed, ","))
+		if snapshotErr != nil {
+			msg += fmt.Sprintf(", and the snapshot read failed too (%s); retry once both answer", snapshotErr.Error())
+		} else {
+			msg += "; retry once storage answers"
+		}
+		return "", resumeReadFailure(failure, msg)
+	}
+	if len(down) > 0 {
+		return "", cpierrors.Retriable(
+			"ResolveDiskIdentity: can't tell whether volume %s, which parker vmid %d's record of the disk's transfer names, "+
+				"is still on node-local storage %s, because node(s) %s are offline and could hold it; retry once those "+
+				"nodes are back", volume, intent.ParkerVMID, storage, strings.Join(down, ","))
+	}
+	return "", nil
+}
+
+// proofNodes returns the nodes on which proveOnStorage proves volume gone,
+// with the parker's node first when it's one of them. Shared storage needs
+// only the parker's node. Any other storage needs every cluster member it's
+// enabled on. A node its nodes list names that isn't a member any more, as
+// pvecm delnode leaves storage.cfg, can't be asked and can't hold a volume
+// the cluster reaches, so it's left out. A nodes list with no member left is
+// errStorageNodesNoMember.
+func (p *recordPresence) proofNodes(
+	ctx context.Context, storage, parkerNode string, info StorageInfo, classified, shared bool,
+) ([]string, error) {
+	if shared {
+		return []string{parkerNode}, nil
+	}
+	members, err := ListClusterMemberNames(ctx, p.c)
+	if err != nil {
+		return nil, err
+	}
+	enabled := members
+	if classified && len(info.Nodes) > 0 {
+		enabled = nil
+		for _, node := range info.Nodes {
+			if slices.Contains(members, node) {
+				enabled = append(enabled, node)
+			}
+		}
+	}
+	var nodes []string
+	if slices.Contains(enabled, parkerNode) {
+		nodes = append(nodes, parkerNode)
+	}
+	for _, node := range enabled {
+		if node != "" && !slices.Contains(nodes, node) {
+			nodes = append(nodes, node)
+		}
+	}
+	if len(nodes) == 0 {
+		if classified && len(info.Nodes) > 0 {
+			return nil, errStorageNodesNoMember
+		}
+		return nil, cpierrors.Retriable("no cluster member is listed for storage %s", storage)
+	}
+	return nodes, nil
+}
+
+// errStorageNodesNoMember is what proofNodes returns when a storage's nodes
+// list names no current cluster member. A retry doesn't change that, so the
+// caller words the error for the operator who has to fix the list.
+var errStorageNodesNoMember = errors.New("the storage's nodes list names no current cluster member")
+
+// otherUnfinishedSlotsOn returns the slots of a parker the scan read that
+// another disk's unfinished record names, or nil when the scan read no such
+// parker.
+func (p *recordPresence) otherUnfinishedSlotsOn(vmid int) map[string][]string {
+	for i := range p.hit.parkers {
+		if parker := &p.hit.parkers[i]; parker.vmid == vmid {
+			return otherUnfinishedTransferSlots(p.stableID, parker.views.Applied(), parker.views.Current())
+		}
+	}
+	return nil
+}
+
+// unfinishedRecordNodes returns the node of each parker the scan read that
+// keeps an unfinished record of another disk naming volume, once each. A
+// record is unfinished under the otherUnfinishedTransfers rule, and only
+// while no guest the scan read carries its disk's serial.
+func (p *recordPresence) unfinishedRecordNodes(volume string) []string {
+	var nodes []string
+	for i := range p.hit.parkers {
+		parker := &p.hit.parkers[i]
+		transfers := otherUnfinishedTransfers(p.stableID, parker.views.Applied(), parker.views.Current())
+		for id := range transfers {
+			if !p.hit.carriedSerials[id] && provEntryVolid(id, transfers[id]) == volume {
+				nodes = unionNodes(nodes, []string{parker.node})
+				break
+			}
+		}
+	}
+	return nodes
+}
+
+// snapshotOfSource says which snapshot of the record's source VM names volume
+// on a drive line that carries this disk's serial or none, in words the
+// refusal quotes, or returns "" with the reason it couldn't tell. A record
+// that names no source VM has no snapshot to read. A source the scan didn't
+// list is gone and has no snapshots, unless the scan left a node out, and
+// then its snapshots can't be read. A source that's gone by the time of the
+// read has none either.
+func (p *recordPresence) snapshotOfSource(ctx context.Context, intent *DiskTransferIntent, volume string) (string, error) {
+	vmid, err := strconv.Atoi(intent.SourceVMCID)
+	if err != nil || vmid <= 0 {
+		return "", nil
+	}
+	node, listed := p.hit.guestNodes[vmid]
+	if !listed {
+		if len(p.hit.excludedNodes) > 0 {
+			return "", fmt.Errorf("source VM %d isn't on a node we could read, and node(s) %s are offline",
+				vmid, strings.Join(p.hit.excludedNodes, ","))
+		}
+		return "", nil
+	}
+	name, key, failed, err := snapshotNamingVolume(ctx, p.c, node, vmid, volume, p.stableID)
+	switch {
+	case err != nil && parkerConfigGone(err):
+		return "", nil
+	case err != nil && failed == "":
+		return "", fmt.Errorf("listing the snapshots of source VM %d on node %s: %w", vmid, node, err)
+	case err != nil:
+		return "", fmt.Errorf("reading snapshot %q of source VM %d on node %s: %w", failed, vmid, node, err)
+	case name == "":
+		return "", nil
+	}
+	return fmt.Sprintf("snapshot %q of source VM %d on node %s names that volume on %s", name, vmid, node, key), nil
+}
+
+// unionNodes returns the node names in a and then those in b that a doesn't
+// have, once each.
+func unionNodes(a, b []string) []string {
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, node := range list {
+			if !slices.Contains(out, node) {
+				out = append(out, node)
+			}
+		}
+	}
+	return out
 }
 
 // holderFromScanHit classifies an identity-scan hit into the DiskHolder shape
@@ -325,25 +948,32 @@ func holderFromScanHit(logger *log.Logger, hit DiskScanHit, birthVolid string, c
 // resolution one. Any other config-read failure propagates — concluding "no
 // record" from a read that never arrived is how a mid-transfer disk gets
 // treated as free-floating.
+//
+// It reads every parker even after it finds a record, and it returns one
+// intent for each parker that keeps one, in the order it read them. More than
+// one means it can't tell which parker received the disk. A parker that the
+// listing names twice is one parker.
 func findParkedDiskIntentByStableID(
 	ctx context.Context, c Client, stableID string, cfg ParkerConfig,
-) (DiskTransferIntent, bool, error) {
-	var (
-		intent DiskTransferIntent
-		found  bool
-	)
+) ([]DiskTransferIntent, error) {
+	var intents []DiskTransferIntent
 	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, disks map[string]parkerProvEntry) bool {
 		entry, ok := disks[stableID]
 		if !ok {
 			return false
 		}
-		intent, found = intentFromParkerEntry(p, entry), true
-		return true
+		for i := range intents {
+			if intents[i].ParkerVMID == p.vmid {
+				return false
+			}
+		}
+		intents = append(intents, intentFromParkerEntry(p, entry))
+		return false
 	})
 	if err != nil {
-		return DiskTransferIntent{}, false, err
+		return nil, err
 	}
-	return intent, found, nil
+	return intents, nil
 }
 
 // SourceTransferRecord is one stable-ID record on a parker that names a given

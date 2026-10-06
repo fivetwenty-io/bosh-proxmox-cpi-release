@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	nodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -228,6 +229,16 @@ func prepareManagedEphemeralRetention(ctx context.Context, deps Deps, handle *aj
 	// it, and the refusal should say where it went.
 	token := managedVMRetentionToken(record.ID)
 	identity, err := pve.ResolveDiskIdentity(ctx, deps.PVE, deps.Log(ctx), storage+":bosh-retention-probe-"+record.ID, token, parkerReadConfigFor(deps))
+	if copied, ok := pve.IsDiskIdentityCopied(err); ok {
+		// A token that more than one guest or record carries identifies a
+		// live resource as surely as one that a single holder carries, so the
+		// retention refuses it the same way. The log keeps where each one is.
+		deps.Log(ctx).Warn("ephemeral retention: the retention token already identifies a live resource in more than one place",
+			log.String("stable_id", copied.StableID),
+			log.Err(err),
+		)
+		return resolvedDisk{}, "", 0, false, storageRefusal("ephemeral retention token already identifies a live resource; audit recorded retention")
+	}
 	if err != nil {
 		return resolvedDisk{}, "", 0, false, err
 	}

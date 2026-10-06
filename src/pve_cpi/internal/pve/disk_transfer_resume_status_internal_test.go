@@ -8,10 +8,12 @@ package pve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
 
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/storage"
 
@@ -63,6 +65,16 @@ type storageFakeClient struct {
 
 func (c *storageFakeClient) Storage() storage.Service {
 	return volumeStorage(c.scanFakeClient, c.floating)
+}
+
+// ClusterStorage serves one node-local entry for storage "data", so the
+// absence proof can classify it. A test that needs the /storage read to fail
+// wraps the client in unclassifiedStorageClient.
+func (c *storageFakeClient) ClusterStorage() clusterstorage.Service {
+	return &fakeClusterStorageService{listFn: func(context.Context, *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
+		resp := clusterstorage.ListStorageResponse{json.RawMessage(localDataStorage)}
+		return &resp, nil
+	}}
 }
 
 // migratedStorageClient is a migratedSourceClient with the storage service

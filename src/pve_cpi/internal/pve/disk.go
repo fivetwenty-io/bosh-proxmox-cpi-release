@@ -660,6 +660,46 @@ type DiskScanHit struct {
 	// volume, so the config endpoint shows that volume while the running
 	// guest still has this one.
 	PendingChange PendingChange
+	// SerialHolders lists, from a stable-ID scan that found the disk, every
+	// guest with a slot that carries the disk's serial, one entry per VMID, in
+	// the order the scan read them. The hit itself is the first of them. A
+	// guest counts once however many of its views or slots carry the serial,
+	// so a slot that both views show, or a slot whose delete or replacement is
+	// pending, is one guest. More than one entry means two guests carry the
+	// serial, which only a copy such as a clone or a backup restore leaves.
+	SerialHolders []DiskSerialHolder
+
+	// parkers, guestNodes, and excludedNodes are what a stable-ID scan read
+	// on its way to a hit, kept for the resolver's check of the parkers'
+	// transfer records, so that check reads the parkers the scan read with the
+	// scan's tolerance of an offline node and never reads them twice. parkers
+	// lists every guest whose applied tags mark it as a parker, once per VMID,
+	// in the order the scan read them. guestNodes maps each guest the scan
+	// read to its node. carriedSerials holds every stable ID that a disk key
+	// of a guest the scan read carries as its serial, in either view.
+	// excludedNodes lists the nodes the scan left out because the quorate
+	// cluster reports them offline.
+	parkers        []scannedParker
+	guestNodes     map[int]string
+	carriedSerials map[string]bool
+	excludedNodes  []string
+}
+
+// scannedParker is one parker the identity scan read, with both views of its
+// configuration as that read returned them.
+type scannedParker struct {
+	vmid  int
+	node  string
+	views QemuViews
+}
+
+// DiskSerialHolder is one guest whose slot carries a stable-ID disk's serial.
+type DiskSerialHolder struct {
+	VolumeReference
+	// Volid is the volume the slot names.
+	Volid string
+	// Parker is set when the guest's tags mark it as a parker.
+	Parker bool
 }
 
 // BirthNameHolder is one config entry that names a stable-ID disk's birth
@@ -732,10 +772,12 @@ func pendingSlotOf(hit DiskScanHit) (string, PendingChange) {
 // own "local-lvm". Read the counts through OnNode for a storage only one node
 // can see, and through Anywhere for a storage the whole cluster shares.
 //
-// The counts are a lower bound rather than a census. The scan stops at the
-// first config that matches the disk it was looking for, so a hit leaves the
-// configs behind it unread. That only ever under-counts, so a non-zero count is
-// still evidence, which is all the corroborator asks of it.
+// The counts are a lower bound rather than a census. A scan by volid stops at
+// the first config that matches the disk it was looking for, so a hit leaves
+// the configs behind it unread. A scan by stable ID reads every config, because
+// it has to see a second guest that carries the serial. That only ever
+// under-counts, so a non-zero count is still evidence, which is all the
+// corroborator asks of it.
 //
 // A nil map means no scan ran, which is an absence of evidence rather than
 // evidence of absence. Both methods read nil as zero, so a caller that never
@@ -865,6 +907,13 @@ func driveOptStrIsCDROM(optstr string) bool {
 // renamed, and under matchNameOrSerial it matches by volid as well. A scan
 // that matches by serial alone notes, without matching, every entry that
 // names the volid, and the not-found answer carries them in NameHolders.
+//
+// A scan by volid returns at the first guest that matches. A scan by stable ID
+// reads every guest even after a match, and the hit lists in SerialHolders
+// each guest that matched, because a clone or a backup restore copies a drive
+// line with its serial, and the first guest that carries the serial can be the
+// copy. The hit is the first guest that matched, and the caller decides what a
+// second one means.
 func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID string, match diskMatch) (DiskScanHit, error) {
 	if c == nil {
 		return DiskScanHit{}, cpierrors.Cloud("FindVMByDiskVolid: client must not be nil")
@@ -907,6 +956,8 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	counts := make(StorageReferenceCounts)
 	var unused []VolumeReference
 	var nameHolders []BirthNameHolder
+	hits := diskScanHits{everyHolder: stableID != ""}
+	seen := newIdentityScanReads(stableID != "")
 
 	for _, g := range guests {
 		vmid := g.VMID
@@ -943,30 +994,25 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		cfg := views.Applied()
 		disks := qemu.ParseDisks(cfg)
 		addStorageReferences(counts, vmNode, volid, cfg, disks)
+		tags, _ := ConfigString(cfg, "tags")
+		seen.note(vmid, vmNode, tags, views)
 
 		if slot, current, ok := matchDiskIdentityAs(disks, volid, stableID, match); ok {
-			tags, _ := ConfigString(cfg, "tags")
-			return DiskScanHit{
-				VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts,
-			}, nil
+			if hits.add(DiskScanHit{VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current}) {
+				break
+			}
+			continue
 		}
 		// The current view also counts a slot whose pending value names
 		// another volume, because the running guest still has its current
 		// drive until PVE applies the change at the next clean stop or start.
-		replacements := views.PendingReplacements()
 		currentDisks := qemu.ParseDisks(views.Current())
 		if slot, current, ok := matchDiskIdentityAs(currentDisks, volid, stableID, match); ok {
-			change := PendingChangeNone
-			if views.PendingDelete(slot) {
-				change = PendingChangeDelete
-			} else if _, replaced := replacements[slot]; replaced {
-				change = PendingChangeReplaced
-			}
-			if change != PendingChangeNone {
-				tags, _ := ConfigString(cfg, "tags")
-				return DiskScanHit{
-					VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, StorageReferences: counts, PendingChange: change,
-				}, nil
+			if change := pendingChangeOf(views, slot); change != PendingChangeNone {
+				if hits.add(DiskScanHit{VMID: vmid, Node: vmNode, Tags: tags, Slot: slot, Volid: current, PendingChange: change}) {
+					break
+				}
+				continue
 			}
 		}
 		if stableID == "" {
@@ -990,6 +1036,15 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 		}
 	}
 
+	// A match on any listed node settles the holder even when nodes were
+	// excluded, as it always has. A guest on an excluded node that carries
+	// the serial as well goes unseen, and the next scan that can read that
+	// node sees it.
+	if hit, ok := hits.first(counts); ok {
+		seen.keepOn(&hit, excludedNodes)
+		return hit, nil
+	}
+
 	if len(excludedNodes) > 0 {
 		return DiskScanHit{StorageReferences: counts}, cpierrors.Retriable(
 			"disk %q: not found among the reachable guests, but node(s) %s were excluded as offline; cannot prove the disk is unattached",
@@ -1002,6 +1057,121 @@ func findVMByDiskIdentityScan(ctx context.Context, c Client, volid, stableID str
 	sortBirthNameHolders(nameHolders)
 	return DiskScanHit{StorageReferences: counts, Unused: unused, NameHolders: nameHolders},
 		fmt.Errorf("disk %q: %w", volid, ErrDiskNotAttachedToAnyVM)
+}
+
+// diskScanHits collects the guests whose slots match a disk during an
+// identity scan. A scan by volid stops at the first one, as it always has. A
+// scan by stable ID keeps every holder and reads on, because a clone or a
+// backup restore copies a drive line with its serial, and only the full list
+// shows that two guests carry it. A guest that a listing names twice is one
+// guest, so its second match adds nothing.
+type diskScanHits struct {
+	everyHolder bool
+	hits        []DiskScanHit
+}
+
+// add records hit and reports whether the scan can stop.
+func (s *diskScanHits) add(hit DiskScanHit) bool {
+	if !s.everyHolder {
+		s.hits = append(s.hits, hit)
+		return true
+	}
+	for i := range s.hits {
+		if s.hits[i].VMID == hit.VMID {
+			return false
+		}
+	}
+	s.hits = append(s.hits, hit)
+	return false
+}
+
+// first returns the first hit with the scan's counts, and on a scan by stable
+// ID, with every holder in read order.
+func (s *diskScanHits) first(counts StorageReferenceCounts) (DiskScanHit, bool) {
+	if len(s.hits) == 0 {
+		return DiskScanHit{}, false
+	}
+	hit := s.hits[0]
+	hit.StorageReferences = counts
+	if s.everyHolder {
+		for i := range s.hits {
+			h := &s.hits[i]
+			hit.SerialHolders = append(hit.SerialHolders, DiskSerialHolder{
+				VolumeReference: VolumeReference{VMID: h.VMID, Node: h.Node, Slot: h.Slot},
+				Volid:           h.Volid,
+				Parker:          tagContainsParker(h.Tags),
+			})
+		}
+	}
+	return hit, true
+}
+
+// identityScanReads collects, for a stable-ID scan, the parkers it read, the
+// node of every guest it read, and every serial those guests' disk keys carry,
+// so a hit can carry them to the resolver's check of the parkers' transfer
+// records. A scan by volume name alone keeps nothing, because only a
+// stable-ID resolve makes that check.
+type identityScanReads struct {
+	enabled        bool
+	parkers        []scannedParker
+	guestNodes     map[int]string
+	carriedSerials map[string]bool
+}
+
+func newIdentityScanReads(enabled bool) *identityScanReads {
+	return &identityScanReads{enabled: enabled, guestNodes: make(map[int]string), carriedSerials: make(map[string]bool)}
+}
+
+// note records a guest the scan read. It keeps the guest as a parker when its
+// applied tags mark it as one, which is the tag rule the walk of the parkers'
+// records applies to the same view. A guest the listing names twice is one
+// parker, so its second read adds nothing.
+func (r *identityScanReads) note(vmid int, node, tags string, views QemuViews) {
+	if !r.enabled {
+		return
+	}
+	r.guestNodes[vmid] = node
+	for _, cfg := range []map[string]any{views.Applied(), views.Current()} {
+		for key := range cfg {
+			if !isQemuDiskKey(key) {
+				continue
+			}
+			text, _ := ConfigString(cfg, key)
+			if serial, has := StableIDFromDriveOptStr(text); has {
+				r.carriedSerials[serial] = true
+			}
+		}
+	}
+	if !tagContainsParker(tags) {
+		return
+	}
+	for i := range r.parkers {
+		if r.parkers[i].vmid == vmid {
+			return
+		}
+	}
+	r.parkers = append(r.parkers, scannedParker{vmid: vmid, node: node, views: views})
+}
+
+// keepOn puts what the scan read on hit, with the nodes the scan left out.
+func (r *identityScanReads) keepOn(hit *DiskScanHit, excludedNodes []string) {
+	if !r.enabled {
+		return
+	}
+	hit.parkers, hit.guestNodes, hit.carriedSerials, hit.excludedNodes = r.parkers, r.guestNodes, r.carriedSerials, excludedNodes
+}
+
+// pendingChangeOf reports the change PVE holds pending for slot, which is why
+// the running guest's current view still shows a drive the applied view no
+// longer does.
+func pendingChangeOf(views QemuViews, slot string) PendingChange {
+	if views.PendingDelete(slot) {
+		return PendingChangeDelete
+	}
+	if _, replaced := views.PendingReplacements()[slot]; replaced {
+		return PendingChangeReplaced
+	}
+	return PendingChangeNone
 }
 
 // matchDiskIdentityAs matches one parsed disk map against a disk identity the

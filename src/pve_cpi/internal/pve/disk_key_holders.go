@@ -23,6 +23,11 @@ type DiskKeyHolder struct {
 	// CarriesSerial is set when the key's current or pending value carries
 	// the serial.
 	CarriesSerial bool
+	// OtherDisk is set when every value of the key that names the volume
+	// carries a stable-ID serial other than the one asked for. The key then
+	// holds another disk under a name this disk had once, because PVE gives a
+	// freed name to the next volume it renames onto the same guest.
+	OtherDisk bool
 	// StillNames is MoveSourceStillNames for the key and the volume, read
 	// from the same views, so the applied value names the volume and the key
 	// has no pending delete and no pending replacement.
@@ -42,15 +47,41 @@ type DiskKeyHolder struct {
 // was deleted after the listing and holds nothing, and any other read error
 // fails the call.
 func FindDiskKeyHolders(ctx context.Context, c Client, volume, serial string) ([]DiskKeyHolder, error) {
+	holders, _, err := findDiskKeyHolders(ctx, c, volume, serial, false)
+	return holders, err
+}
+
+// findDiskKeyHoldersTolerant is FindDiskKeyHolders with the identity scan's
+// tolerance of a node that the quorate cluster reports offline, through
+// ListGuestsAuthoritativeTolerant. It returns the nodes it left out, and a
+// non-empty list means a guest on one of them could hold a key the answer
+// doesn't list. So a caller may act on a holder it lists, but it must not
+// read an answer with no holder as proof that nothing names the volume while
+// any node was left out.
+func findDiskKeyHoldersTolerant(ctx context.Context, c Client, volume, serial string) ([]DiskKeyHolder, []string, error) {
+	return findDiskKeyHolders(ctx, c, volume, serial, true)
+}
+
+// findDiskKeyHolders is the read behind FindDiskKeyHolders and its tolerant
+// form. tolerant chooses the guest listing, and the excluded nodes come back
+// only from the tolerant one.
+func findDiskKeyHolders(ctx context.Context, c Client, volume, serial string, tolerant bool) ([]DiskKeyHolder, []string, error) {
 	if c == nil {
-		return nil, cpierrors.Cloud("FindDiskKeyHolders: client must not be nil")
+		return nil, nil, cpierrors.Cloud("FindDiskKeyHolders: client must not be nil")
 	}
 	if volume == "" || serial == "" {
-		return nil, cpierrors.Cloud("FindDiskKeyHolders: volume and serial must not be empty")
+		return nil, nil, cpierrors.Cloud("FindDiskKeyHolders: volume and serial must not be empty")
 	}
-	guests, err := ListGuestsAuthoritative(ctx, c, nil)
+	var guests []GuestRef
+	var excluded []string
+	var err error
+	if tolerant {
+		guests, excluded, err = ListGuestsAuthoritativeTolerant(ctx, c, nil)
+	} else {
+		guests, err = ListGuestsAuthoritative(ctx, c, nil)
+	}
 	if err != nil {
-		return nil, cpierrors.Wrap(err, "FindDiskKeyHolders: enumerate cluster guests")
+		return nil, nil, cpierrors.Wrap(err, "FindDiskKeyHolders: enumerate cluster guests")
 	}
 	var holders []DiskKeyHolder
 	for _, g := range guests {
@@ -59,7 +90,7 @@ func FindDiskKeyHolders(ctx context.Context, c Client, volume, serial string) ([
 			if IsNotFound(cfgErr) {
 				continue
 			}
-			return nil, cpierrors.Wrap(
+			return nil, nil, cpierrors.Wrap(
 				WrapConfigReadError(cfgErr),
 				fmt.Sprintf("FindDiskKeyHolders: Config error for vm %d on node %s", g.VMID, g.Node),
 			)
@@ -72,6 +103,7 @@ func FindDiskKeyHolders(ctx context.Context, c Client, volume, serial string) ([
 				continue
 			}
 			holder := DiskKeyHolder{VMID: g.VMID, Node: g.Node, Slot: key, Parker: parker}
+			namesAsThisDisk := false
 			for _, value := range []struct {
 				present bool
 				text    string
@@ -79,13 +111,16 @@ func FindDiskKeyHolders(ctx context.Context, c Client, volume, serial string) ([
 				if !value.present {
 					continue
 				}
+				found, hasSerial := StableIDFromDriveOptStr(value.text)
 				if bareDriveVolid(value.text) == volume {
 					holder.NamesVolume = true
+					namesAsThisDisk = namesAsThisDisk || !hasSerial || found == serial
 				}
-				if found, ok := StableIDFromDriveOptStr(value.text); ok && found == serial {
+				if hasSerial && found == serial {
 					holder.CarriesSerial = true
 				}
 			}
+			holder.OtherDisk = holder.NamesVolume && !namesAsThisDisk
 			if holder.NamesVolume || holder.CarriesSerial {
 				holder.StillNames = MoveSourceStillNames(views, key, volume)
 				holders = append(holders, holder)
@@ -93,7 +128,7 @@ func FindDiskKeyHolders(ctx context.Context, c Client, volume, serial string) ([
 		}
 	}
 	sortDiskKeyHolders(holders)
-	return holders, nil
+	return holders, excluded, nil
 }
 
 func sortDiskKeyHolders(holders []DiskKeyHolder) {
