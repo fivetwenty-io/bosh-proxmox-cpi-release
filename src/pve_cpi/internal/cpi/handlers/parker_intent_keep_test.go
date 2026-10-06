@@ -330,9 +330,11 @@ func TestStrandedManagedDetachRefusesAndKeepsItsRecord(t *testing.T) {
 // TestDeleteVMUnusedSlotRefusalPointsAtTheRecovery pins the refusal text. Before
 // this change it ended at "verify pve.disk_storage configuration", and the
 // operator's obvious next step, removing the unused entry, deletes a volume
-// named for the VM.
+// named for the VM. With the parker's record in place delete_vm finishes the
+// transfer itself, so the row removes the record to reach the refusal.
 func TestDeleteVMUnusedSlotRefusalPointsAtTheRecovery(t *testing.T) {
 	s := buildStrandedDisk(t, false, true, true)
+	s.dropTransferRecord(t)
 	_, err := HandleDeleteVM(s.deps).Handle(context.Background(), []json.RawMessage{planJSON(t, "777")}, jsonrpc.Context{})
 	if err == nil {
 		t.Fatal("delete_vm destroyed a VM that holds a stranded volume on an unused entry")

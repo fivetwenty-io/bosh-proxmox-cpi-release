@@ -376,6 +376,8 @@ naming the volid and the target slot) is written before the source slot is
 deleted, and a retry resumes the transfer from whichever step the failure
 left behind.
 
+The retry that resumes it can be a `detach_disk` or a `delete_vm`. When the transfer stopped after the slot delete, the volume sits on the source VM's `unusedN` entry with no serial. A `delete_vm` of that VM then looks for the parker's record that names the volume as a transfer from that VM. It goes on only when exactly one record names the volume, that record belongs to no journal-managed disk, and its parker is on the VM's own node. It finishes the move through the same resume `detach_disk` runs, and only then destroys the VM. If a snapshot of the VM blocks the move, `delete_vm` fails permanently and names the snapshots to delete. That matters for a Director that `create-env` manages, because `create-env` can't issue a `detach_disk`. When no record names the volume, `delete_vm` refuses and leaves the volume where it is.
+
 Two operations deliberately avoid the SDK's ordinary detach for these disks.
 After a transfer the volume is named for whichever VM holds it, and PVE
 physically removes an unused volume its holder owns when the entry is swept —

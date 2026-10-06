@@ -432,7 +432,7 @@ func TestDeleteVMWithASnapshotNamingAnUnownedDisk(t *testing.T) {
 
 	_, err := HandleDeleteVM(s.deps).Handle(context.Background(), args, jsonrpc.Context{})
 	requirePermanent(t, err, "first delete_vm")
-	requireText(t, err, "first delete_vm", []string{"retry resumes the transfer", `snapshot "before" of source vm 777`, "the park waits until that snapshot is deleted"})
+	requireText(t, err, "first delete_vm", []string{"If this VM doesn't own the volume, PVE keeps no entry for it, so the retry destroys the VM", `snapshot "before" of source vm 777`, "the park waits until that snapshot is deleted"})
 	if destroys := s.recorder.guestDestroys(); len(destroys) != 0 {
 		t.Fatalf("VM 777 was destroyed %d times on the first attempt", len(destroys))
 	}
