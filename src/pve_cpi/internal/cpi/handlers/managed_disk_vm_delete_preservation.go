@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
@@ -136,7 +137,7 @@ func detachManagedPersistentForVMDeleteOne(ctx context.Context, deps Deps, node 
 	}
 	local, lifecycle, err := managedDiskOperation(ctx, deps, disk, "delete_vm.preserve_disk")
 	if err != nil {
-		return err
+		return protectionPendingPreservation(vmid, err)
 	}
 	if lifecycle == nil {
 		return fmt.Errorf("persistent disk preservation did not acquire allocation ownership")
@@ -324,6 +325,27 @@ func managedVMPreservationCandidate(ctx context.Context, deps Deps, node string,
 	if cid == "" {
 		cid = recorded[volume]
 	}
+	// A disk the VM's notes don't record may still be one the allocation
+	// journal knows, and its CID then comes from the journal (see
+	// managedVMJournalDiskCID). The first resolution of a disk with a stable
+	// identity defers a missing holder entry to the disk's lifecycle, which
+	// writes the entry under the disk's allocation lock before it preserves
+	// the disk, as attach_disk and detach_disk do. Without that, a retry of
+	// delete_vm would meet the same refusal, and the Director sends no other
+	// call for the disk of an instance it is deleting.
+	resolveCtx := ctx
+	if token != "" {
+		resolveCtx = withHolderHeal(ctx, holderHealDefer)
+	}
+	if cid == "" && token != "" {
+		journaled, lookupErr := managedVMJournalDiskCID(deps, vmid, volume, token)
+		if lookupErr != nil {
+			return resolvedDisk{}, lookupErr
+		}
+		if journaled != "" {
+			cid = journaled
+		}
+	}
 	if cid == "" {
 		cid, err = pve.EncodeDiskCID(volume, &pve.DiskCIDMeta{ID: token})
 		if err != nil {
@@ -341,7 +363,7 @@ func managedVMPreservationCandidate(ctx context.Context, deps Deps, node string,
 			return resolvedDisk{}, fmt.Errorf("recorded persistent disk CID contradicts live identity")
 		}
 	}
-	disk, err := resolveDiskForOp(ctx, deps, "delete_vm.preserve_disk", cid, birth, meta)
+	disk, err := resolveDiskForOp(resolveCtx, deps, "delete_vm.preserve_disk", cid, birth, meta)
 	if err != nil {
 		return resolvedDisk{}, err
 	}
@@ -355,11 +377,137 @@ func managedVMPreservationCandidate(ctx context.Context, deps Deps, node string,
 		}
 		disk.holder = &pve.DiskHolder{Found: true, Node: node, VMID: vmid, Slot: slot}
 	}
-	if disk.holder == nil || disk.holder.Node != node || disk.holder.VMID != vmid || disk.volid != volume || disk.intent != nil {
-		return resolvedDisk{}, fmt.Errorf("persistent disk has no unambiguous current ownership proof")
+	_, holderRecorded := provenance[token]
+	if err := managedVMCandidateOwnership(disk, node, vmid, volume, holderRecorded); err != nil {
+		return resolvedDisk{}, err
 	}
 	if disk.allocation == nil && recorded[token] == "" && recorded[volume] == "" {
 		return resolvedDisk{}, fmt.Errorf("legacy persistent disk lacks its recorded CPI CID")
 	}
 	return disk, nil
+}
+
+// managedVMCandidateOwnership checks that disk, resolved for the slot on VM
+// vmid that names volume, is held by that VM on node and by nothing else. A
+// disk with a transfer to a parker in flight fails the check.
+//
+// The current resolver never returns a found holder together with a transfer
+// intent, because it reads the intent only when no slot carries the disk's
+// serial, so the branch for a journal-managed disk that VM vmid holds without
+// its provenance entry while a transfer is in flight is a guard in case that
+// changes. It returns the retriable refusal the holder heal returns for the
+// same state (see healUnrecordedHolder). A disk whose entry VM vmid does
+// carry keeps the plain refusal.
+func managedVMCandidateOwnership(disk resolvedDisk, node string, vmid int, volume string, holderRecorded bool) error {
+	held := disk.holder != nil && disk.holder.Node == node && disk.holder.VMID == vmid && disk.volid == volume
+	if held && disk.intent != nil && disk.allocation != nil && !holderRecorded {
+		return holderNotRecordedRefusal(disk, transferInFlightReason(disk.intent))
+	}
+	if !held || disk.intent != nil {
+		return fmt.Errorf("persistent disk has no unambiguous current ownership proof")
+	}
+	return nil
+}
+
+// journalDiskCIDUnread is managedVMJournalDiskCID's error when the allocation
+// journal can't be read. Its text and CPI type are the retriable error it
+// carries, and its type tells a journal-managed delete_vm that the
+// preservation changed nothing (see isWholePreservationRefusal).
+type journalDiskCIDUnread struct{ err error }
+
+func (e *journalDiskCIDUnread) Error() string { return e.err.Error() }
+
+func (e *journalDiskCIDUnread) Unwrap() error { return e.err }
+
+// isWholePreservationRefusal reports whether err is, and is only, one of the
+// refusals delete_vm's preservation returns before it changes a disk. Those
+// are the holder heal's refusal for a disk whose holder lacks its provenance
+// entry, the failed journal read that looks up such a disk's CID, and the
+// lifecycle's refusal while a parker protection write of the disk's record
+// waits to be settled (see protectionPendingPreservation).
+func isWholePreservationRefusal(err error) bool {
+	return isWholeRefusal(err, func(err error) bool {
+		switch err.(type) { //nolint:errorlint // isWholeRefusal unwraps one error at a time and hands each one here.
+		case *holderNotRecorded, *journalDiskCIDUnread, *protectionPendingRefusal:
+			return true
+		}
+		return false
+	})
+}
+
+// isWholeRefusal reports whether err is, and is only, an error that match
+// accepts. It follows single-error unwrapping and a join that holds one
+// error, which is how the disk's lifecycle hands back a refusal after it
+// closes the journal cleanly. It gives up at a join of several errors,
+// because a refusal joined with another failure, such as a journal close that
+// failed or the reconciliation a preservation records, isn't a refusal that
+// changed nothing.
+func isWholeRefusal(err error, match func(error) bool) bool {
+	for err != nil {
+		if match(err) {
+			return true
+		}
+		if joined, ok := err.(interface{ Unwrap() []error }); ok { //nolint:errorlint // The walk unwraps one error at a time itself, so it can stop at a join of several errors, which errors.As would search through.
+			errs := joined.Unwrap()
+			if len(errs) != 1 {
+				return false
+			}
+			err = errs[0]
+			continue
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+// protectionPendingPreservation returns err as a retriable error when the
+// disk's lifecycle refused the disk before it changed anything, and the only
+// reason is a parker protection write of the disk's record that the settler
+// left planned (protectionPendingOr). The disk is where its record says, so a
+// retry settles the step by readback once the parker reads back protected,
+// which happens when another operation releases the parker's lock or when we
+// run the qm set command the refusal names. A refusal that parkerLockBusyOr
+// already made retriable, and every other error, is returned unchanged.
+func protectionPendingPreservation(vmid int, err error) error {
+	pending := isWholeRefusal(err, func(err error) bool {
+		_, ok := err.(*protectionPendingRefusal) //nolint:errorlint // isWholeRefusal unwraps one error at a time and hands each one here.
+		return ok
+	})
+	if !pending || cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		return err
+	}
+	return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf("a persistent disk stays on VM %d until the parker protection write in the disk's record is settled, so retry once the parker reads back protected", vmid))
+}
+
+// managedVMJournalDiskCID returns the CID that the allocation journal records
+// for the disk whose stable token is token, or "" when no live disk record
+// names the token. delete_vm needs it for a disk that attach_disk moved onto
+// the VM and then left without the VM's provenance entry and without the
+// disk's CID in the VM's notes, because the holder write failed. A CID built
+// from the volume's new name resolves that disk as a legacy disk with no
+// allocation, which every retry refuses, and the Director sends no
+// attach_disk or detach_disk that would write the entry for an instance it is
+// deleting. The journal's CID resolves it as the managed disk it is.
+//
+// A deployment without an enrolled journal, a token that no disk record
+// names, and a terminal record find nothing, so those disks keep the refusal
+// they had. A journal that is enrolled but can't be read is retriable,
+// because nothing then shows that the journal doesn't know the disk.
+func managedVMJournalDiskCID(deps Deps, vmid int, volume, token string) (string, error) {
+	if deps.Config == nil {
+		return "", nil
+	}
+	directory := strings.TrimSpace(deps.Config.StorageAllocationJournalDir)
+	namespace := strings.TrimSpace(deps.Config.StoragePlacementNamespace)
+	if directory == "" || namespace == "" {
+		return "", nil
+	}
+	record, found, err := inspectAllocationJournalDiskToken(directory, namespace, token)
+	if err != nil {
+		return "", &journalDiskCIDUnread{err: cpierrors.Retriable("delete_vm: couldn't read the allocation journal to find the CID of persistent disk %s on VM %d (%v); retry delete_vm once the journal can be read", volume, vmid, err)}
+	}
+	if !found || record.Kind != allocationKindDisk || record.DiskToken != token || record.State == aj.Deleted || record.State == aj.Cleaned {
+		return "", nil
+	}
+	return record.CID, nil
 }

@@ -323,7 +323,7 @@ func TestHealUnrecordedHolderWaitsForASettledRecord(t *testing.T) {
 	planned := record
 	planned.Steps = append(append([]aj.Step(nil), record.Steps...), aj.Step{ID: "attempt-0-step-99", Attempt: record.ActiveAttempt(), Kind: "lifecycle_attach_disk_Nodes_UpdateQemuConfig", State: aj.Planned, Target: aj.Target{Node: "n1", VMID: 777}})
 	err = healUnrecordedHolder(ctx, disk.deps, rd, planned, definition.IsShared(), provenance, cfg)
-	requireNotRecorded(t, "the heal with a planned step", err)
+	requireUnsettledStepRefusal(t, "the heal with a planned step", err, "attempt-0-step-99")
 
 	moving := rd
 	moving.intent = &pve.DiskTransferIntent{AllocationID: record.ID, AllocationNamespace: record.Namespace, ParkerVMID: disk.parker, ParkerNode: "n1", Volid: volid}
