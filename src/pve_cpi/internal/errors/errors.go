@@ -313,7 +313,8 @@ func IsNotFound(err error) bool {
 }
 
 // errDefinite is the target IsDefinite matches through errors.Is. It is
-// unexported, so only an *Error that Definite marked can match it.
+// unexported, so only an error that Definite or MarkDefinite marked can match
+// it.
 var errDefinite = errors.New("definite CPI outcome")
 
 // Definite returns a copy of e marked as the handler's definite answer. A
@@ -332,6 +333,29 @@ func Definite(e *Error) *Error {
 	marked.definite = true
 	return &marked
 }
+
+// MarkDefinite returns err with the Definite mark added, for a settled answer
+// whose *Error sits inside a wrapper or beside other errors in a join, where
+// Definite on that one *Error would drop the rest of the chain. The result
+// keeps err's text and its whole chain, so errors.As, IsType, and a caller's
+// own wrapper types find what they found before. A nil err returns nil.
+func MarkDefinite(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &definiteChain{err: err}
+}
+
+// definiteChain is the wrapper MarkDefinite returns.
+type definiteChain struct{ err error }
+
+func (e *definiteChain) Error() string { return e.err.Error() }
+
+func (e *definiteChain) Unwrap() error { return e.err }
+
+// Is matches only the Definite mark, and errors.Is goes on down the chain for
+// every other target.
+func (e *definiteChain) Is(target error) bool { return target == errDefinite }
 
 // Is lets errors.Is find a Definite mark anywhere in a chain, including inside
 // errors.Join trees and behind Wrap, where errors.As would stop at the first

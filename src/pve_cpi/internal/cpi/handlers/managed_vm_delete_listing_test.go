@@ -146,12 +146,33 @@ func requireListingStoppedDelete(t *testing.T, err error, storage, node, reason 
 	}
 }
 
+// requireListingStopReason checks that reason, the reason a listing stop
+// saved on the VM's record, names the storage, the node, and the listing's
+// reason, says what resumes the record, carries no backend text, and fits in
+// the 200 bytes the journal audit's summary prints of a reason.
+func requireListingStopReason(t *testing.T, reason, storage, node, listing string) {
+	t.Helper()
+	for _, want := range []string{"VM cleanup stopped because storage " + storage + " on node " + node + " could not be listed (" + listing + ")", "rerun delete_vm or storage-journal cleanup once that storage lists"} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("the record's reason %q does not contain %q", reason, want)
+		}
+	}
+	if strings.Contains(reason, listingSecret) {
+		t.Fatalf("the record's reason %q carries backend text", reason)
+	}
+	if len(reason) > 200 {
+		t.Fatalf("the record's reason %q is %d bytes, and the audit summary would cut it", reason, len(reason))
+	}
+}
+
 // TestManagedVMDeleteListingFailureLeavesRecordObservedAndRerunCompletes
 // fails every content listing of the VM's storage once the VM is stopped, so
 // the check of the VM's volumes before its destroy can't read the storage.
 // delete_vm stops before the destroy, names the storage, the node, and the
-// reason, and leaves the record observed. Once the storage lists again, a
-// rerun destroys the VM and closes the record without stopping it again.
+// reason, and leaves the record observed with a reason that names them too,
+// which the journal audit's summary prints. Once the storage lists again, a
+// rerun destroys the VM, clears the reason, and closes the record without
+// stopping it again.
 func TestManagedVMDeleteListingFailureLeavesRecordObservedAndRerunCompletes(t *testing.T) {
 	deps, journal, c, record := deleteManagedFixture(t)
 	fault := &listingFault{storage: "a", active: func() bool { return c.stopped }, failures: -1, err: &sdkerrors.APIError{HTTPCode: 500, Message: listingSecret}}
@@ -166,9 +187,10 @@ func TestManagedVMDeleteListingFailureLeavesRecordObservedAndRerunCompletes(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.State != aj.Observed || after.Reason != "" {
+	if after.State != aj.Observed {
 		t.Fatalf("record after the failed listing is %s (%q), want observed", after.State, after.Reason)
 	}
+	requireListingStopReason(t, after.Reason, "a", "pve1", "listing_http_500")
 	if c.stopCount != 1 || c.destroyCount != 0 || len(c.destroyed) != 0 {
 		t.Fatalf("stop %d destroy %d deleted volumes %v, want one stop and nothing destroyed", c.stopCount, c.destroyCount, c.destroyed)
 	}
@@ -187,6 +209,9 @@ func TestManagedVMDeleteListingFailureLeavesRecordObservedAndRerunCompletes(t *t
 	}
 	if after.State != aj.Deleted || c.stopCount != 1 || c.destroyCount != 1 {
 		t.Fatalf("rerun left state %s stop %d destroy %d, want deleted with one stop and one destroy", after.State, c.stopCount, c.destroyCount)
+	}
+	if strings.Contains(after.Reason, "could not be listed") {
+		t.Fatalf("rerun kept the listing stop's reason %q on the closed record", after.Reason)
 	}
 }
 
@@ -514,6 +539,7 @@ func TestManagedVMDeletePersistentDiskListingFailureUnderLockLeavesRecordObserve
 	if state := handle.Record().State; state != aj.Observed {
 		t.Fatalf("record state = %s, want observed", state)
 	}
+	requireListingStopReason(t, handle.Record().Reason, storage, "n1", "listing_http_500")
 	if client.state.configs[777]["scsi1"] != slot || client.moves != 0 {
 		t.Fatalf("scsi1 = %v after %d moves, want the disk still in its slot", client.state.configs[777]["scsi1"], client.moves)
 	}

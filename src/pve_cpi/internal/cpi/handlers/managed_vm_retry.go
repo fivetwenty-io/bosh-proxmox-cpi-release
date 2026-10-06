@@ -160,7 +160,10 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 // VM and strand those disks on it. So we dispose of the attempt first, which
 // preserves every attached disk and destroys the VM, and then close the
 // generation. Only then does the error go back, and the Director's retry
-// under the same agent ID starts a new generation and builds a fresh VM.
+// under the same agent ID starts a new generation and builds a fresh VM. The
+// error carries the Definite mark, because the rollback settled the
+// generation, and the deadline must not trade the attempt's own answer, such
+// as a permanent snapshot refusal, for its retriable timeout.
 func rollbackManagedVMAfterLockTimeout(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, attemptErr error) error {
 	proof, err := rollbackManagedVMAttempt(ctx, deps, journal, handle)
 	if err != nil {
@@ -173,7 +176,11 @@ func rollbackManagedVMAfterLockTimeout(ctx context.Context, deps Deps, journal *
 		deps.recordStorageReconciliation(ctx, "required")
 		return errors.Join(uncertain, err, attemptErr)
 	}
-	return attemptErr
+	// The rollback settled the generation, so the attempt's error is our
+	// answer even when the rollback finished after the request's deadline.
+	// A snapshot refusal stays permanent, and the Director doesn't rebuild a
+	// VM that meets the same snapshot on every try.
+	return cpierrors.MarkDefinite(attemptErr)
 }
 
 // managedVMRollbackError joins a failed rollback onto the attempt's own error.

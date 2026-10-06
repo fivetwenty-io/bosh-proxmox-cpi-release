@@ -526,9 +526,9 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 // so. A preservation refusal handed back this way leaves the VM's record
 // observed, so it saves a reason on the record that names the refusal (see
 // noteVMCleanupRefusal). A failed storage content listing is handed back the
-// same way, with an error that names the storage, when it is the whole
-// failure and every step this cleanup wrote is observed. Anything else
-// requires reconciliation.
+// same way, with an error and a saved reason that name the storage (see
+// noteVMListingStop), when it is the whole failure and every step this
+// cleanup wrote is observed. Anything else requires reconciliation.
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
@@ -541,7 +541,7 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	// every step this cleanup wrote is observed, the record stays as it is and a
 	// rerun of the delete resumes the disposal once the storage lists.
 	if storage, node, reason, ok := wholeStorageListingFailure(err); ok && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
-		return storageListingStoppedDelete(storage, node, reason)
+		return noteVMListingStop(handle, storageListingStoppedDelete(storage, node, reason), storage, node, reason)
 	}
 	if isWholePendingDriveReplacementRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
 		return err
@@ -566,6 +566,25 @@ func noteVMCleanupRefusal(handle *aj.Handle, err error) error {
 	}
 	record.Reason = vmCleanupRefusalReason(err)
 	_ = handle.Save(record) //nolint:errcheck // The reason only explains the record, and the refusal is the answer either way.
+	return err
+}
+
+// noteVMListingStop saves a reason on an observed VM record whose cleanup a
+// failed storage content listing stopped, the way noteVMCleanupRefusal does
+// for a preservation refusal. The reason names the storage, the node, and the
+// listing's reason, so the journal audit's summary line ties the record to the
+// storage that failed to list. It stays short, because the summary cuts a
+// reason at 200 bytes. The state stays as it is, and the next
+// disposal clears the reason when it admits the record again. It returns err
+// unchanged in every case, and a failed save costs the summary its
+// explanation and nothing else.
+func noteVMListingStop(handle *aj.Handle, err error, storage, node, reason string) error {
+	record := handle.Record()
+	if record.State != aj.Observed {
+		return err
+	}
+	record.Reason = fmt.Sprintf("VM cleanup stopped because storage %s on node %s could not be listed (%s); rerun delete_vm or storage-journal cleanup once that storage lists", storage, node, reason)
+	_ = handle.Save(record) //nolint:errcheck // The reason only explains the record, and the listing stop is the answer either way.
 	return err
 }
 

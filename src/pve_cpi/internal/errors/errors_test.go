@@ -430,3 +430,48 @@ func TestDefinite(t *testing.T) {
 		t.Fatal("the mark changed identity comparison through errors.Is")
 	}
 }
+
+// wrapperForMark is a caller's own wrapper type, the kind of marker a handler
+// puts around an *Error.
+type wrapperForMark struct{ err error }
+
+func (w *wrapperForMark) Error() string { return w.err.Error() }
+func (w *wrapperForMark) Unwrap() error { return w.err }
+
+// TestMarkDefinite checks that MarkDefinite adds the mark to a whole chain and
+// keeps the chain's text, its typed error, its wrapper types, and every
+// member of a join.
+func TestMarkDefinite(t *testing.T) {
+	t.Parallel()
+
+	blocked := cpierrors.SnapshotBlocked("delete snapshot %s, then retry", "pre-upgrade")
+	sentinel := errors.New("disk came back unchanged")
+	chain := &wrapperForMark{err: errors.Join(blocked, sentinel)}
+	marked := cpierrors.MarkDefinite(chain)
+	if cpierrors.IsDefinite(chain) {
+		t.Fatal("MarkDefinite marked the error it was given")
+	}
+	if !cpierrors.IsDefinite(marked) {
+		t.Fatal("IsDefinite missed the mark MarkDefinite added")
+	}
+	if marked.Error() != chain.Error() {
+		t.Fatalf("the mark changed the text: %q, want %q", marked.Error(), chain.Error())
+	}
+	var typed *cpierrors.Error
+	if !errors.As(marked, &typed) || typed != blocked || typed.OkToRetry() {
+		t.Fatalf("the marked chain doesn't lead to its own typed error: %v", typed)
+	}
+	var wrapper *wrapperForMark
+	if !errors.As(marked, &wrapper) || wrapper != chain {
+		t.Fatal("the marked chain lost its wrapper")
+	}
+	if !errors.Is(marked, sentinel) || !cpierrors.IsType(marked, cpierrors.TypeSnapshotBlocked) {
+		t.Fatal("the marked chain lost a member of its join")
+	}
+	if retriable := cpierrors.MarkDefinite(cpierrors.Retriable("held")); !cpierrors.IsDefinite(retriable) || !errors.As(retriable, &typed) || !typed.OkToRetry() {
+		t.Fatal("the mark changed a retriable error's flag")
+	}
+	if cpierrors.MarkDefinite(nil) != nil {
+		t.Fatal("MarkDefinite(nil) returned an error")
+	}
+}

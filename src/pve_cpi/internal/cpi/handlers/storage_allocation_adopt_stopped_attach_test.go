@@ -444,9 +444,9 @@ func TestAdoptNamesTheReadbackThatFailedForEveryWrite(t *testing.T) {
 
 // TestAdoptSettlesOnlyTheConfigurationWritesOfDiskCalls runs the attested
 // adopt on a planned configuration write that no attach_disk, detach_disk,
-// or delete_disk planned. Adopt leaves it and says which writes it settles,
-// and leaves the stopped attach's write with it, naming the step it can't
-// settle.
+// delete_disk, or delete_vm planned. Adopt leaves it and says which writes it
+// settles, and leaves the stopped attach's write with it, naming the step it
+// can't settle.
 func TestAdoptSettlesOnlyTheConfigurationWritesOfDiskCalls(t *testing.T) {
 	t.Parallel()
 	for _, fixture := range adoptFixtures {
@@ -479,7 +479,7 @@ func requireOnlyDiskCallWritesSettle(t *testing.T, fixture adoptFixture) {
 	}
 	rewriteJournalRecord(t, disk.deps, disk.id, record)
 	requireAdoptLeavesStep(t, disk, attestedAdopt(disk), other, "is planned",
-		"adopt settles only a configuration write that attach_disk, detach_disk, or delete_disk planned")
+		"adopt settles only a configuration write that attach_disk, detach_disk, delete_disk, or delete_vm planned")
 }
 
 // TestAdoptSettlesOnlyARecordItCanAdopt runs the attested adopt on a stopped
