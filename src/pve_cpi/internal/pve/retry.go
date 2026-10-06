@@ -8,6 +8,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	mrand "math/rand/v2"
 	"sync"
 	"time"
@@ -323,12 +324,54 @@ func stopsRetry(err error) bool {
 	return pending
 }
 
+// retryContextEndedError is what the RetryOn* helpers return when the context
+// ends while they wait out the backoff after a failed attempt. A backoff only
+// ever follows a failed attempt, and no attempt goes out once the context has
+// ended, so both facts hold at once. The request ended, and the last attempt
+// failed the way lastAttempt says.
+//
+// To every caller that doesn't ask, it is the context's error and nothing
+// more. Its text is the context error's text, and it unwraps only to that
+// error, so errors.Is, errors.As, and every text classifier give exactly the
+// verdict a bare ctx.Err() gave. A caller that reads the last attempt, such as
+// a protection restore telling a refusal from an unknown outcome, asks for it
+// with lastAttemptBeforeContextEnded.
+type retryContextEndedError struct {
+	ctxErr      error
+	lastAttempt error
+}
+
+func (e *retryContextEndedError) Error() string { return e.ctxErr.Error() }
+
+func (e *retryContextEndedError) Unwrap() error { return e.ctxErr }
+
+// contextEndedDuringBackoff builds the error a retry loop returns when ctx
+// ended during the backoff that followed lastAttempt.
+func contextEndedDuringBackoff(ctxErr, lastAttempt error) error {
+	return &retryContextEndedError{ctxErr: ctxErr, lastAttempt: lastAttempt}
+}
+
+// lastAttemptBeforeContextEnded returns the error of the last attempt a RetryOn*
+// helper made before its context ended during a backoff. It returns nil for
+// every other error, including a context error that an attempt itself
+// returned. The last attempt's own error says whether its outcome is known.
+// PVE's refusal stays a refusal, and an attempt that got no answer stays
+// unknown.
+func lastAttemptBeforeContextEnded(err error) error {
+	var ended *retryContextEndedError
+	if errors.As(err, &ended) {
+		return ended.lastAttempt
+	}
+	return nil
+}
+
 // RetryOnTransient invokes op up to maxAttempts times, retrying when the
 // returned error is a transient transport-layer fault (IsTransientTransport)
 // or a PVE rate-limit / worker-pool exhaustion signal (IsPVEPushback).
 // Other errors (or success) return immediately. Backoff curve: pushback errors
 // use PushbackBackoff; transient errors use TransientBackoff. Context
-// cancellation short-circuits the sleep.
+// cancellation short-circuits the sleep and returns the context's error, which
+// still carries the last attempt's error (see retryContextEndedError).
 //
 // Use for SDK calls that don't touch the per-storage lock (config edits,
 // listings, login) but can still die to a pvedaemon worker recycling or a
@@ -387,7 +430,7 @@ func RetryOnTransient(
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextEndedDuringBackoff(ctx.Err(), err)
 		case <-time.After(d):
 		}
 	}
@@ -456,6 +499,10 @@ func IsRetryableOrLockFault(err error) bool {
 // conditions. Backoff continues from a single attempt counter across all
 // failure modes.
 //
+// A context that ends during a backoff short-circuits the sleep and returns
+// the context's error, which still carries the last attempt's error (see
+// retryContextEndedError).
+//
 // maxAttempts ≤ 0 falls back to DefaultStorageLockMaxAttempts (the longer of
 // the non-pushback budgets — the helper subsumes all failure modes).
 func RetryOnTransientOrLock(
@@ -504,7 +551,7 @@ func RetryOnTransientOrLock(
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextEndedDuringBackoff(ctx.Err(), err)
 		case <-time.After(d):
 		}
 	}
@@ -522,6 +569,9 @@ func RetryOnTransientOrLock(
 //
 // Use for hot-unplug config edits (detach_disk); other callers have no
 // hot-unplug surface and should stay on RetryOnTransient.
+//
+// A context that ends during a backoff ends the loop the same way it ends
+// RetryOnTransient's.
 //
 // maxAttempts ≤ 0 falls back to DefaultTransientMaxAttempts, or the
 // operator override installed by ConfigureTransientRetry.
@@ -576,7 +626,7 @@ func RetryOnTransientOrUnplugBusy(
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return contextEndedDuringBackoff(ctx.Err(), err)
 		case <-time.After(d):
 		}
 	}
