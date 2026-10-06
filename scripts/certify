@@ -31,15 +31,19 @@ Usage:
 
 Commands:
     upgrade      (default, alias `run`) preflight -> resolve -> deploy-old ->
-                 deploy-cert -> capture-pre -> upgrade -> recreate -> verify ->
+                 deploy-cert -> write-marker -> capture-pre -> upgrade ->
+                 recreate -> capture-post -> read-marker -> verify ->
                  finalize -> teardown.
     report       Re-print the summary table from the most recent run.
     help         Show this message.
 
-DESTRUCTIVE: the run takes over this repo's Director slot (manifests/bosh/
-state.json and the env bundle's Director IP). A standing Director is refused by
-preflight unless --force is passed, which tears it down first. state.json and
-creds.yml are copied into the run directory before anything is deployed.
+DESTRUCTIVE: the run takes over a Director slot, the directory BOSH_STATE_DIR
+names, and deletes and replaces whatever Director its state.json records. It
+refuses to run against the default slot (manifests/bosh/) or the main
+checkout's state, so the main Director is never touched. The slot needs a
+slot.yml with its own internal_ip. A standing Director in the slot is refused
+by preflight unless --force is passed, which tears it down first. state.json
+and creds.yml are copied into the run directory before anything is deployed.
 
 Flags:
     --config FILE       Integration config YAML (default: ci/integration.yml).
@@ -75,6 +79,9 @@ Flags:
     --no-color          Disable ANSI color.
 
 Env:
+    BOSH_STATE_DIR      Director slot directory holding this run's state.json,
+                        creds.yml, and slot.yml (required; see
+                        docs/certification/upgrade.md).
     BOSH_PVE_ENV        Env bundle selector (see manifests/envs/).
     BOSH_CPI_CERTIFICATION_DIR
                         Existing bosh-cpi-certification checkout to use instead
@@ -95,6 +102,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -113,7 +121,10 @@ import _checkouts  # noqa: E402
 import _release_artifact
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
+import _pve_verify  # noqa: E402
 import _rundoc  # noqa: E402
+import _slot  # noqa: E402
+import _upgrade_checks  # noqa: E402
 from _rundoc import (  # noqa: E402
     ScrubbedLog,
     _bosh_int_opt,
@@ -136,8 +147,11 @@ BOSH_SCRIPT = str(SCRIPTS_DIR / "bosh")
 CREATE_RELEASE = str(SCRIPTS_DIR / "create-release")
 BOSH_DIR = REPO_ROOT / "manifests" / "bosh"
 BOSH_VARS = BOSH_DIR / "vars.yml"
-STATE = BOSH_DIR / "state.json"
-CREDS = BOSH_DIR / "creds.yml"
+# The Director slot this run owns (BOSH_STATE_DIR); see scripts/_slot.py.
+SLOT = _slot.resolve(REPO_ROOT)
+STATE = SLOT.state
+CREDS = SLOT.creds
+OWNER = SLOT.owner
 ENVS_DIR = REPO_ROOT / "manifests" / "envs"
 CERT_MANIFESTS = REPO_ROOT / "manifests" / "certification"
 CC_OPS = CERT_MANIFESTS / "cloud-config-ops.yml"
@@ -159,6 +173,9 @@ DEFAULT_CONFIG = "ci/integration.yml"
 DEFAULT_RESULTS_DIR = ".e2e-results"
 CHECKOUT_NAME = "bosh-cpi-certification"
 CERT_RELEASE_SUBPATH = "shared/assets/certification-release"
+# The certification release's one instance, which carries the persistent disk
+# the marker is written to.
+CERT_INSTANCE = "simple/0"
 JUNIT_STEPS = "junit-steps.xml"
 RUN_META_MARK = "certify-run-meta"
 
@@ -556,6 +573,15 @@ def write_run_doc(
         "state the old CPI wrote."
     )
     extra.append("")
+    extra.append(
+        "The persistent disk marker row compares a per-run nonce and the "
+        "sha256 of a block of random data written to the certification "
+        "instance's persistent disk before the upgrade with what the run read "
+        "back after it. The disk serial row names, for each persistent disk, "
+        "the drive whose `serial=` carried the disk's `bpd-` stable id before "
+        "and after."
+    )
+    extra.append("")
     extra.append("| Invariant | Before | After | Held |")
     extra.append("|---|---|---|---|")
     for inv in meta.get("invariants", []):
@@ -592,6 +618,7 @@ def write_run_doc(
         steps=steps,
         env_table=[
             ("Env bundle", "env"),
+            ("Director slot", "director_slot"),
             ("BOSH director", "director_version"),
             ("Certification suite revision", "certification_ref"),
             ("Certification release", "certification_release"),
@@ -602,8 +629,9 @@ def write_run_doc(
             "Machine artifacts for this run live in the gitignored results "
             f"directory `{meta.get('run_dir', '')}`: `results.json`, "
             f"`{JUNIT_STEPS}`, `console.log`, the rendered deployment manifest, and "
-            "the pre- and post-upgrade state captures. This document is the "
-            "committed record.",
+            "the pre- and post-upgrade state captures, which include every "
+            "drive's `serial=` and the persistent disk marker. This document is "
+            "the committed record.",
             "",
         ],
     )
@@ -672,6 +700,19 @@ class Certify:
         # Keep in-process env reads (layered vars) and every child process on
         # the same env bundle. Must happen before load_config's passthrough.
         os.environ["BOSH_PVE_ENV"] = self.env_name
+        # Pin the slot for every child (scripts/bosh, bosh via the director
+        # env) as an absolute path, and have scripts/bosh and the in-process
+        # director env refuse the default slot on their own as well, in case
+        # anything here resolves it wrongly.
+        self.slot = SLOT
+        os.environ[_slot.REFUSE_DEFAULT_ENV] = "1"
+        slot_env = {
+            "BOSH_PVE_ENV": self.env_name,
+            _slot.REFUSE_DEFAULT_ENV: "1",
+        }
+        if not SLOT.is_default:
+            os.environ[_slot.ENV_VAR] = str(SLOT.dir)
+            slot_env[_slot.ENV_VAR] = str(SLOT.dir)
 
         results_dir = Path(args.results_dir)
         if not results_dir.is_absolute():
@@ -687,7 +728,7 @@ class Certify:
             self.console_log = ScrubbedLog(self.console_fh)
 
         self.runner = Runner(
-            rep, {"BOSH_PVE_ENV": self.env_name}, self.dry_run, REPO_ROOT,
+            rep, slot_env, self.dry_run, REPO_ROOT,
             logfile=self.console_log,
         )
 
@@ -714,6 +755,10 @@ class Certify:
         self.pre: dict = {}
         self.post: dict = {}
         self.invariants: list[dict] = []
+        self.marker_nonce = ""
+        self.marker_written: "tuple[str, str] | None" = None
+        self.marker_read: "tuple[str, str] | None" = None
+        self.marker_problem = "the run never reached the marker write"
 
     # -- env helpers -------------------------------------------------------- #
 
@@ -821,6 +866,8 @@ class Certify:
 
     def preflight(self) -> bool:
         self.rep.section("preflight")
+        if not self._preflight_slot_guard():
+            return False
         ok = True
 
         for tool in ("uv", "bosh", "git"):
@@ -888,8 +935,83 @@ class Certify:
             )
             ok = ok and present
 
+        if not ok:
+            return False
+        # The vars check is offline and takes seconds, so a stale vars file
+        # fails here rather than after the lab has been touched.
+        if not self._preflight_vars():
+            self.rep.skip("director:slot-free", "the vars preflight failed")
+            self.rep.skip("lab:reachable", "the vars preflight failed")
+            return False
         ok = self._preflight_slot() and ok
         ok = self._preflight_lab() and ok
+        return ok
+
+    def _slot_refusal(self, action: str) -> str:
+        """Why this run must not touch its slot's Director, or "".
+
+        The run always needs BOSH_PROTECTED_DIRECTOR_CIDS, because it deletes
+        and replaces the Director its slot's state records.
+        """
+        message = _slot.guard_repo(action, self.slot, REPO_ROOT,
+                                   require_deny_list=True)
+        if message:
+            return message
+        problem = _slot.config_problem(
+            self.slot, _slot.env_facts(REPO_ROOT, self.env_name))
+        return problem or ""
+
+    def _preflight_slot_guard(self) -> bool:
+        """Refuse the default slot before anything else runs.
+
+        The run deletes and replaces the Director its state records, so it may
+        only ever own a dedicated slot. This check reads local files only and
+        runs in dry-run too, so a misconfigured slot shows up there first.
+        """
+        refusal = self._slot_refusal("run the upgrade test")
+        if refusal:
+            self.rep.record("director:slot-guard", FAIL, 0.0, refusal)
+            return False
+        self.rep.record(
+            "director:slot-guard", PASS, 0.0,
+            f"slot {self.slot.dir} (alias {self.slot.alias})",
+        )
+        return True
+
+    def _guard_step(self, action: str, step: str) -> bool:
+        """Re-check the slot right before a step that deletes or replaces a Director."""
+        refusal = self._slot_refusal(action)
+        if refusal:
+            self.rep.record(step, FAIL, 0.0, refusal)
+            return False
+        return True
+
+    def _cloud_config_args(self) -> list[str]:
+        """The -o/-v flags the certification cloud-config upload layers on."""
+        args = [
+            "-o", str(CC_OPS),
+            "-v", f"certification_vm_cores={self.ccfg['vm_cores']}",
+            "-v", f"certification_vm_memory_mib={self.ccfg['vm_memory_mib']}",
+            "-v", f"certification_vm_disk_mib={self.ccfg['vm_disk_mib']}",
+        ]
+        if self.ccfg["cpi_id"]:
+            args += [
+                "-o", str(CC_CPI_OPS),
+                "-v", f"certification_cpi_id={self.ccfg['cpi_id']}",
+            ]
+        return args
+
+    def _preflight_vars(self) -> bool:
+        """Interpolate every manifest the run applies against the slot's vars.
+
+        scripts/bosh check-vars names each variable no vars file sets, leaving
+        out the ones scripts/bosh passes itself and the ones create-env
+        generates into creds.yml.
+        """
+        argv = [BOSH_SCRIPT, "check-vars", *self._cloud_config_args()]
+        if self.ccfg["cpi_id"]:
+            argv.append("--cpi-config")
+        ok, _ = self.runner.step("preflight:vars", argv, timeout=SHORT_TIMEOUT_S)
         return ok
 
     @staticmethod
@@ -901,10 +1023,10 @@ class Certify:
         return proc.stdout.strip() if proc.returncode == 0 else "unknown"
 
     def _preflight_slot(self) -> bool:
-        """The upgrade test takes over this repo's Director slot.
+        """The upgrade test takes over its Director slot.
 
-        It deploys, upgrades, and deletes the Director recorded in
-        manifests/bosh/state.json, on the env bundle's Director IP. A standing
+        It deploys, upgrades, and deletes the Director recorded in the slot's
+        state.json, on the slot's own Director IP. A standing
         Director is therefore not something the run can leave alone, and
         clobbering one silently would be the worst possible behavior — so
         refuse unless the operator says otherwise with --force.
@@ -925,9 +1047,10 @@ class Certify:
             return True
         self.rep.record(
             "director:slot-free", FAIL, 0.0,
-            f"Director {identity['vm_cid']} is live in state.json — the upgrade "
-            "test replaces it. Run `./scripts/bosh teardown` first, or pass "
-            "--force to tear it down as part of this run.",
+            f"Director {identity['vm_cid']} is live in {STATE}, and the upgrade "
+            "test replaces it. Run `./scripts/bosh teardown` with the same "
+            "BOSH_STATE_DIR first, or pass --force to tear it down as part of "
+            "this run.",
         )
         return False
 
@@ -1052,6 +1175,9 @@ class Certify:
         self.rep.section("deploy-old")
 
         if self.args.force and not self.dry_run and self._director_identity()["vm_cid"]:
+            if not self._guard_step("tear down the standing Director",
+                                    "director:teardown-existing"):
+                return False
             ok, _ = self.runner.step(
                 "director:teardown-existing", [BOSH_SCRIPT, "teardown"],
                 timeout=CREATE_ENV_TIMEOUT_S,
@@ -1070,6 +1196,8 @@ class Certify:
         else:
             self.rep.skip("net:up", self._sdn_skip_reason())
 
+        if not self._guard_step("create-env", "director:create-env-old"):
+            return False
         ok, _ = self.runner.step(
             "director:create-env-old", self._create_env_argv("old"),
             env=self._create_env_env("old"), timeout=CREATE_ENV_TIMEOUT_S,
@@ -1097,32 +1225,23 @@ class Certify:
         return self._upload_cloud_config()
 
     def _upload_cloud_config(self) -> bool:
-        argv = [
-            BOSH_SCRIPT, "ucc",
-            "-o", str(CC_OPS),
-            "-v", f"certification_vm_cores={self.ccfg['vm_cores']}",
-            "-v", f"certification_vm_memory_mib={self.ccfg['vm_memory_mib']}",
-            "-v", f"certification_vm_disk_mib={self.ccfg['vm_disk_mib']}",
-        ]
-        if self.ccfg["cpi_id"]:
-            argv += [
-                "-o", str(CC_CPI_OPS),
-                "-v", f"certification_cpi_id={self.ccfg['cpi_id']}",
-            ]
+        argv = [BOSH_SCRIPT, "ucc", *self._cloud_config_args()]
         ok, _ = self.runner.step(
             "director:cloud-config", argv, timeout=SHORT_TIMEOUT_S,
         )
         return ok
 
     def _backup_state(self, tag: str) -> None:
-        """Copy the Director state and creds into the run directory.
+        """Copy the Director state, creds, and owner record into the run directory.
 
-        The run overwrites both. Keeping a copy alongside the console log is
-        the difference between a recoverable failure and a lost Director.
+        The run overwrites all three. Keeping a copy alongside the console log
+        is the difference between a recoverable failure and a lost Director.
+        The owner record goes with the state, because the guard refuses a
+        restored state whose owner record no longer matches it.
         """
         if self.dry_run:
             return
-        for src in (STATE, CREDS):
+        for src in (STATE, CREDS, OWNER):
             if src.exists():
                 shutil.copy2(src, self.run_dir / f"{src.name}.{tag}")
 
@@ -1244,6 +1363,7 @@ class Certify:
             ),
             "orphaned_disks": self._orphaned_disk_count(),
         })
+        target["disks"] = self._disk_serials(target)
         (self.run_dir / f"capture-{when}.json").write_text(
             json.dumps(target, indent=2, sort_keys=True) + "\n"
         )
@@ -1254,8 +1374,116 @@ class Certify:
             f"disks {len(target['deployment']['disk_cids'])}",
         )
 
+    def _disk_serials(self, target: dict) -> dict:
+        """Each persistent disk's stable id and the drive carrying it as serial=.
+
+        Reads every drive's serial= off the Director VM and the deployment's
+        VMs through the PVE API, and decodes each disk CID's bpd- stable id
+        from its envelope. A read error is kept in the capture rather than
+        failing it, so verify:disk-serial-stable can say what went wrong.
+        """
+        disk_cids = list(target["director"]["disk_cids"]) + list(
+            target["deployment"]["disk_cids"]
+        )
+        vm_cids = [target["director"]["vm_cid"], *target["deployment"]["vm_cids"]]
+        stable_ids = {cid: _pve_verify.disk_stable_id(cid) for cid in disk_cids}
+        serials: dict[str, dict[str, str]] = {}
+        errors: list[str] = []
+        try:
+            cfg = self._pve_cfg()
+            nodes = {
+                str(row.get("vmid")): str(row.get("node"))
+                for row in (_integration.pve_api_get(cfg, "/cluster/resources?type=vm") or [])
+                if row.get("vmid") is not None and row.get("node")
+            }
+            for vmid in vm_cids:
+                if not vmid:
+                    continue
+                node = nodes.get(str(vmid))
+                if node is None:
+                    errors.append(f"VM {vmid} is not in /cluster/resources")
+                    continue
+                config = _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config")
+                serials[str(vmid)] = _upgrade_checks.drive_serials(config or {})
+        except (RuntimeError, OSError, KeyError) as exc:
+            errors.append(f"PVE API read failed: {exc}")
+        return {
+            "stable_ids": stable_ids,
+            "drive_serials": serials,
+            "locations": _upgrade_checks.serial_locations(stable_ids, serials),
+            "errors": errors,
+        }
+
+    # -- persistent-disk marker ---------------------------------------------- #
+
+    def _marker_ssh(self, step: str, script: str) -> "tuple[bool, str]":
+        """Run a marker script as root on the certification instance."""
+        dep = self.ccfg["deployment_name"]
+        ok, tail = self._bosh(
+            step,
+            ["bosh", "-n", "-d", dep, "ssh", CERT_INSTANCE,
+             "-c", _upgrade_checks.remote_command(script)],
+            timeout=SHORT_TIMEOUT_S,
+        )
+        return ok, "\n".join(tail)
+
+    def write_marker(self) -> bool:
+        """Write a nonce and checksummed random data to the persistent disk.
+
+        Runs before the pre-upgrade capture. A failure here does not stop the
+        run, since the other invariants still mean something, but it does fail
+        verify:disk-data-survived.
+        """
+        self.rep.section("write-marker")
+        self.marker_nonce = secrets.token_hex(16)
+        if self.dry_run:
+            self._marker_ssh("cert:write-marker",
+                             _upgrade_checks.write_marker_script(self.marker_nonce))
+            self.marker_written = (self.marker_nonce, "<dry-run>")
+            return True
+        ok, out = self._marker_ssh(
+            "cert:write-marker", _upgrade_checks.write_marker_script(self.marker_nonce),
+        )
+        parsed = _upgrade_checks.parse_marker(out)
+        if not ok or parsed is None:
+            reason = _upgrade_checks.marker_error(out) or "bosh ssh printed no marker line"
+            self.marker_problem = f"the marker write failed: {reason}"
+            if ok:
+                self.rep.record("cert:write-marker-parse", FAIL, 0.0, self.marker_problem)
+            return False
+        if parsed[0] != self.marker_nonce:
+            self.marker_problem = "the marker write echoed a different nonce"
+            self.rep.record("cert:write-marker-parse", FAIL, 0.0, self.marker_problem)
+            return False
+        self.marker_written = parsed
+        self.marker_problem = ""
+        return True
+
+    def read_marker(self) -> bool:
+        """Read the marker back after the upgrade and recreate."""
+        self.rep.section("read-marker")
+        if self.dry_run:
+            self._marker_ssh("cert:read-marker", _upgrade_checks.read_marker_script())
+            self.marker_read = self.marker_written
+            return True
+        if self.marker_written is None:
+            self.rep.skip("cert:read-marker", self.marker_problem)
+            return False
+        ok, out = self._marker_ssh("cert:read-marker", _upgrade_checks.read_marker_script())
+        parsed = _upgrade_checks.parse_marker(out)
+        if not ok or parsed is None:
+            reason = _upgrade_checks.marker_error(out) or "bosh ssh printed no marker line"
+            self.marker_problem = f"the marker read failed: {reason}"
+            if ok:
+                self.rep.record("cert:read-marker-parse", FAIL, 0.0, self.marker_problem)
+            return False
+        self.marker_read = parsed
+        return True
+
     def upgrade(self) -> bool:
         self.rep.section("upgrade")
+        if not self._guard_step("create-env", "director:create-env-new"):
+            return False
         ok, _ = self.runner.step(
             "director:create-env-new", self._create_env_argv("new"),
             env=self._create_env_env("new"), timeout=CREATE_ENV_TIMEOUT_S,
@@ -1280,6 +1508,7 @@ class Certify:
         if self.dry_run:
             for name in ("verify:director-vm-replaced", "verify:director-disk-identity",
                          "verify:deployment-disk-identity", "verify:cpi-upgraded",
+                         "verify:disk-data-survived", "verify:disk-serial-stable",
                          "verify:instance-running", "verify:no-new-orphans",
                          "verify:cloud-check"):
                 self.rep.record(name, PASS, 0.0, "dry-run")
@@ -1327,6 +1556,9 @@ class Certify:
             f"{self.old_cpi_label}",
         ) and ok
 
+        ok = self._verify_disk_data() and ok
+        ok = self._verify_disk_serials() and ok
+
         states = post_dep.get("process_states", [])
         running = bool(states) and all(s == "running" for s in states)
         self.rep.record(
@@ -1357,6 +1589,60 @@ class Certify:
         ok = ok and cc_ok
 
         return ok
+
+    def _verify_disk_data(self) -> bool:
+        """The bytes written before the upgrade read back unchanged after it."""
+        written = self.marker_written
+        read = self.marker_read
+        before = (
+            f"nonce {written[0][:8]}, sha256 {written[1][:12]}" if written
+            else "(not written)"
+        )
+        after = (
+            f"nonce {read[0][:8]}, sha256 {read[1][:12]}" if read
+            else "(not read)"
+        )
+        held = written is not None and read is not None and written == read
+        if held:
+            detail = "the data written before the upgrade read back byte for byte"
+        elif written is None or read is None:
+            detail = self.marker_problem or "the marker was not read back"
+        elif written[0] != read[0]:
+            detail = "the nonce on the disk is not this run's, so the disk is not the one written"
+        else:
+            detail = "the marker data's sha256 changed across the upgrade"
+        self.rep.record(
+            "verify:disk-data-survived", PASS if held else FAIL, 0.0, detail,
+        )
+        self.invariants.append({
+            "name": "Persistent disk marker",
+            "before": before, "after": after, "held": held,
+        })
+        return held
+
+    def _verify_disk_serials(self) -> bool:
+        """Every disk kept a drive whose serial= is its CID's bpd- stable id."""
+        pre = self.pre.get("disks") or {}
+        post = self.post.get("disks") or {}
+        held, why = _upgrade_checks.serials_stable(pre, post)
+        errors = list(pre.get("errors") or []) + list(post.get("errors") or [])
+        if not held and errors:
+            why = f"{why} ({'; '.join(errors)})"
+        before = _upgrade_checks.describe_serials(
+            pre.get("stable_ids") or {}, pre.get("locations") or {},
+        )
+        after = _upgrade_checks.describe_serials(
+            post.get("stable_ids") or {}, post.get("locations") or {},
+        )
+        self.rep.record(
+            "verify:disk-serial-stable", PASS if held else FAIL, 0.0,
+            "every persistent disk's bpd- serial still matches its CID" if held else why,
+        )
+        self.invariants.append({
+            "name": "Disk serials (bpd- stable id on a drive)",
+            "before": before or "(none)", "after": after or "(none)", "held": held,
+        })
+        return held
 
     def _invariant(self, step: str, name: str, before: str, after: str,
                    holds, detail: str) -> bool:
@@ -1446,6 +1732,7 @@ class Certify:
             "certification_ref": self.certification_ref or "unknown",
             "certification_release": self.certification_release or self.ccfg["release_name"],
             "pve_version": self.pve_version or "unknown",
+            "director_slot": self.slot.dir.name,
             "run_dir": str(self.run_dir.relative_to(REPO_ROOT))
             if self.run_dir.is_relative_to(REPO_ROOT) else str(self.run_dir),
             "invariants": self.invariants,
@@ -1459,10 +1746,17 @@ class Certify:
             print(self.rep.color.yellow(
                 "    --keep: the upgraded Director and the certification "
                 "deployment are still running. Tear them down with "
-                "`./scripts/bosh teardown` when you are done."
+                f"`BOSH_STATE_DIR={self.slot.dir} ./scripts/bosh teardown` "
+                "when you are done."
             ))
             return
         self.rep.section("teardown")
+        refusal = self._slot_refusal("delete-env")
+        if refusal:
+            for name in ("cert:delete-deployment", "director:clean-up",
+                         "director:delete-env"):
+                self.rep.skip(name, refusal)
+            return
         dep = self.ccfg["deployment_name"]
         if self.deployed or self.dry_run:
             self._cleanup_step(
@@ -1480,8 +1774,11 @@ class Certify:
                 CREATE_ENV_TIMEOUT_S,
             )
             if self._env_manages_sdn():
-                self._cleanup_step(
-                    "net:down", [BOSH_SCRIPT, "net-down"], SHORT_TIMEOUT_S,
+                # The run's Director shares the env network with the main
+                # Director, so the network stays up.
+                self.rep.skip(
+                    "net:down",
+                    "the env network is shared with the default slot's Director",
                 )
             else:
                 self.rep.skip("net:down", self._sdn_skip_reason())
@@ -1523,6 +1820,7 @@ class Certify:
                 return False
             if not self.deploy_cert():
                 return False
+            self.write_marker()
             if not self.capture("pre"):
                 return False
             if not self.upgrade():
@@ -1531,6 +1829,7 @@ class Certify:
                 return False
             if not self.capture("post"):
                 return False
+            self.read_marker()
             ok = self.verify()
         finally:
             # The report is the point of the run; write it even when a phase

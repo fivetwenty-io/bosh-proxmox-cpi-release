@@ -217,7 +217,10 @@ See [Running BATS](docs/certification/bats.md) for prerequisites, configuration,
 
 BATS proves the CPI satisfies the director contract at one version. The upstream certification suite's [director upgrade test](https://github.com/cloudfoundry/bosh-cpi-certification) proves what BATS never touches: that a live director and the deployment it manages survive a CPI version change. A director is stood up on the previous CPI release, the upstream certification release is deployed under it, the director is upgraded onto the new CPI release over the same state, and the deployment is recreated. Every disk CID and stemcell reference the old CPI wrote must still resolve under the new one.
 
+The run builds and deletes a Director of its own, so it refuses to run in this repo's default Director slot. Point `BOSH_STATE_DIR` at a directory kept for that Director, with a `slot.yml` naming its own `internal_ip`, before running it.
+
 ```bash
+export BOSH_STATE_DIR=~/.bosh-slots/certification
 make certify-upgrade                    # previous released CPI to current, against the configured lab
 ./scripts/certify upgrade --env <env>   # explicit env bundle selection
 ```
