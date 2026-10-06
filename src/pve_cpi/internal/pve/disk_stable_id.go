@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -327,14 +328,90 @@ func holderFromScanHit(logger *log.Logger, hit DiskScanHit, birthVolid string, c
 func findParkedDiskIntentByStableID(
 	ctx context.Context, c Client, stableID string, cfg ParkerConfig,
 ) (DiskTransferIntent, bool, error) {
+	var (
+		intent DiskTransferIntent
+		found  bool
+	)
+	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, disks map[string]parkerProvEntry) bool {
+		entry, ok := disks[stableID]
+		if !ok {
+			return false
+		}
+		intent, found = intentFromParkerEntry(p, entry), true
+		return true
+	})
+	if err != nil {
+		return DiskTransferIntent{}, false, err
+	}
+	return intent, found, nil
+}
+
+// SourceTransferRecord is one stable-ID record on a parker that names a given
+// source VM. DiskCID is the CID the record was written with, which is the
+// Director's CID when the transfer came from a disk call and the volume's own
+// name when delete_vm started it.
+type SourceTransferRecord struct {
+	StableID string
+	DiskCID  string
+	Intent   DiskTransferIntent
+}
+
+// FindSourceTransferRecords returns every stable-ID record, on every parker in
+// the band, whose source VM is sourceVMCID. It reads the parkers the way
+// findParkedDiskIntentByStableID does, so a parker that is gone is skipped with
+// its records, any other read failure fails the scan, and a band that isn't
+// configured finds nothing. The records come back sorted by parker and then by
+// stable ID.
+//
+// A record whose transfer is still in flight names the volume by the name it
+// has on the source VM. A finished record names the volume the parker holds,
+// so a caller that matches records against the source VM's own entries only
+// ever matches a transfer that hasn't landed.
+func FindSourceTransferRecords(ctx context.Context, c Client, sourceVMCID string, cfg ParkerConfig) ([]SourceTransferRecord, error) {
+	if c == nil {
+		return nil, cpierrors.Cloud("FindSourceTransferRecords: client must not be nil")
+	}
+	if sourceVMCID == "" {
+		return nil, cpierrors.Cloud("FindSourceTransferRecords: source VM CID must not be empty")
+	}
+	var out []SourceTransferRecord
+	err := walkParkerRecords(ctx, c, cfg, func(p parkerCandidate, disks map[string]parkerProvEntry) bool {
+		for key := range disks {
+			entry := disks[key]
+			if !strings.HasPrefix(key, DiskStableIDPrefix) || entry.SourceVMCID != sourceVMCID || entry.Volid == "" {
+				continue
+			}
+			out = append(out, SourceTransferRecord{StableID: key, DiskCID: entry.DiskCID, Intent: intentFromParkerEntry(p, entry)})
+		}
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Intent.ParkerVMID != out[j].Intent.ParkerVMID {
+			return out[i].Intent.ParkerVMID < out[j].Intent.ParkerVMID
+		}
+		return out[i].StableID < out[j].StableID
+	})
+	return out, nil
+}
+
+// walkParkerRecords reads every tagged parker in the band and passes each
+// one's bosh_parked_disks map to visit, stopping early when visit returns
+// true. A band that isn't usable has no parkers to read, which isn't an error.
+// A parker whose config vanished between the listing and the read is skipped,
+// and any other read failure stops the walk and comes back, because a record
+// we never read must not count as a record that isn't there.
+func walkParkerRecords(
+	ctx context.Context, c Client, cfg ParkerConfig, visit func(parkerCandidate, map[string]parkerProvEntry) bool,
+) error {
 	if cfg.VMIDRangeStart <= 0 || cfg.VMIDRangeEnd <= cfg.VMIDRangeStart {
-		// No usable band, no parkers to scan. Not an error: resolution simply
-		// has no provenance fallback to consult.
-		return DiskTransferIntent{}, false, nil
+		return nil
 	}
 	parkers, err := listParkersCluster(ctx, c, cfg)
 	if err != nil {
-		return DiskTransferIntent{}, false, err
+		return err
 	}
 	for _, p := range parkers {
 		vmCfg, cfgErr := c.QEMU().Config(ctx, p.node, p.vmid)
@@ -342,28 +419,31 @@ func findParkedDiskIntentByStableID(
 			if parkerConfigGone(cfgErr) {
 				continue
 			}
-			return DiskTransferIntent{}, false, cpierrors.Wrap(WrapConfigReadError(cfgErr),
+			return cpierrors.Wrap(WrapConfigReadError(cfgErr),
 				fmt.Sprintf("provenance scan: config fetch for parker vmid %d on node %s", p.vmid, p.node))
 		}
 		if tags, _ := ConfigString(vmCfg, "tags"); !tagContainsParker(tags) {
 			continue
 		}
 		_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
-		entry, ok := disks[stableID]
-		if !ok {
-			continue
+		if visit(p, disks) {
+			return nil
 		}
-		return DiskTransferIntent{
-			AllocationID: entry.AllocationID, AllocationNamespace: entry.AllocationNamespace, AllocationBacking: entry.AllocationBacking,
-			ParkerVMID:  p.vmid,
-			ParkerNode:  p.node,
-			Slot:        entry.Slot,
-			Volid:       entry.Volid,
-			SourceVMCID: entry.SourceVMCID,
-			Opts:        sanitizeDiskOptOverlay(entry.Opts),
-		}, true, nil
 	}
-	return DiskTransferIntent{}, false, nil
+	return nil
+}
+
+// intentFromParkerEntry is the transfer intent one parker record describes.
+func intentFromParkerEntry(p parkerCandidate, entry parkerProvEntry) DiskTransferIntent {
+	return DiskTransferIntent{
+		AllocationID: entry.AllocationID, AllocationNamespace: entry.AllocationNamespace, AllocationBacking: entry.AllocationBacking,
+		ParkerVMID:  p.vmid,
+		ParkerNode:  p.node,
+		Slot:        entry.Slot,
+		Volid:       entry.Volid,
+		SourceVMCID: entry.SourceVMCID,
+		Opts:        sanitizeDiskOptOverlay(entry.Opts),
+	}
 }
 
 // parkerCandidate is one in-band cluster row a provenance scan reads.

@@ -206,7 +206,7 @@ Every VM is also created with `serial0=socket`, adding a virtual serial console.
 - **Sync path** (default): issues `DeleteQemu` and awaits the returned UPID task to completion before returning. The Director never observes a still-pending volume on the storage backend.
 - **Fast path** (`pve.fast_path_delete=true`): issues stop and destroy fire-and-forget, discards the UPID, and returns immediately. Eventual consistency — `has_vm` may briefly still see the VM while PVE's async destroy runs. The `bosh-deleting` tag marks such VMs; `sweepFastDeleteStragglers` reaps stalled fast-path destroys on the next `delete_vm` call.
 
-Both paths protect persistent disks before destroying the VM. `detachForeignActiveDisks` detects disks whose volume ID belongs to a different VMID (foreign disks), detaches them from the VM config, and preserves them. Destroy is blocked (fail-closed, retriable) if a detach cannot be confirmed. `guardUnusedVolumes` then checks the `unusedN` slots and refuses to proceed if a persistent volume cannot be confirmed absent from storage. If the VM does not exist, the call returns success.
+Both paths protect persistent disks before destroying the VM. `detachForeignActiveDisks` detects disks whose volume ID belongs to a different VMID (foreign disks), detaches them from the VM config, and preserves them. Destroy is blocked (fail-closed, retriable) if a detach cannot be confirmed. `guardUnusedVolumesResumingTransfers` then checks the `unusedN` slots. When a slot holds a volume that exactly one parker record, on the VM's own node and outside any journal-managed disk, names as a transfer from this VM, it finishes that move through the same resume `detach_disk` runs and checks the slots again. It then refuses to proceed if a persistent volume still cannot be confirmed absent from storage. A snapshot of the VM that blocks the move fails the call permanently and names the snapshots to delete. If the VM does not exist, the call returns success.
 
 **Parker refusal:** A VM tagged `bosh-parker` is refused before either destroy
 path runs. The Director never hands a parker CID to `delete_vm`, but `bosh
@@ -230,7 +230,7 @@ flowchart TD
     C -- No --> SP[stopVMBeforeDelete]
     FP --> D[detachForeignActiveDisks]
     SP --> D
-    D --> E[guardUnusedVolumes]
+    D --> E[guardUnusedVolumesResumingTransfers\nresume stranded parker transfers,\nthen refuse any unused volume left]
     E --> F{fast path?}
     F -- Yes --> G[DeleteQemu skiplock\ndiscard UPID]
     F -- No --> H[DeleteQemu\nawaitDeleteTask]

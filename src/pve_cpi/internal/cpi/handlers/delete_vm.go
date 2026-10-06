@@ -332,8 +332,9 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// disk whose detach above demoted it to unusedN but could not sweep it
 	// because a snapshot references the volume. guardUnusedVolumes existence-
 	// probes the configured pve.disk_storage and fails closed on any volume it
-	// cannot confirm deleted.
-	if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
+	// cannot confirm deleted. A transfer to a parker that stopped after the
+	// slot delete is finished first, from the parker's record.
+	if guardErr := guardUnusedVolumesResumingTransfers(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage, logger); guardErr != nil {
 		return guardErr
 	}
 
@@ -560,8 +561,10 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 		return nil, deleteVMDriveDeletePendingError(retainErr, vmCID, deleteVMStopAwaited)
 	}
 
-	// --- guard: refuse to destroy if a persistent volume is still attached ---
-	if guardErr := guardUnusedVolumes(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage); guardErr != nil {
+	// --- guard: refuse to destroy if a persistent volume is still attached,
+	//     after finishing any transfer to a parker that stopped after the slot
+	//     delete ---
+	if guardErr := guardUnusedVolumesResumingTransfers(ctx, deps, node, vmCID, vmid, deps.Config.DiskStorage, logger); guardErr != nil {
 		return nil, guardErr
 	}
 
@@ -919,23 +922,55 @@ func waitForVMStopped(ctx context.Context, deps Deps, node string, vmid int, vmC
 // Returns cpierrors.Cloud when protected volumes are present.
 // Returns a wrapped error when the config read fails for reasons other than 404.
 func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid int, diskStorage string) error {
+	protected, err := protectedUnusedVolumes(ctx, deps, node, vmCID, vmid, diskStorage)
+	if err != nil {
+		return err
+	}
+	return unusedVolumesRefusal(vmCID, protected)
+}
+
+// unusedVolume is one unusedN entry the guard protects.
+type unusedVolume struct {
+	slot, volid string
+}
+
+// unusedVolumesRefusal is the guard's refusal over the protected entries, or
+// nil when there are none.
+func unusedVolumesRefusal(vmCID string, protected []unusedVolume) error {
+	if len(protected) == 0 {
+		return nil
+	}
+	named := make([]string, 0, len(protected))
+	for _, entry := range protected {
+		named = append(named, fmt.Sprintf("%s=%s", entry.slot, entry.volid))
+	}
+	return cpierrors.Cloud(
+		"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve.disk_storage configuration; "+
+			"if detach_disk succeeds and the slot stays, do not remove the slot or destroy the VM by hand, because PVE then deletes a volume named for the VM; %s)",
+		vmCID, named, unusedSlotRecoveryRunbook,
+	)
+}
+
+// protectedUnusedVolumes is the guard's scan. It returns every unusedN entry
+// on the VM whose volume the destroy could free, and nil when the VM is gone.
+func protectedUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid int, diskStorage string) ([]unusedVolume, error) {
 	// Both views: a slot whose delete is pending is still in the config the
 	// destroy works from, and a stop applies the delete, which can turn an
 	// owned volume into an unused entry the destroy would free.
 	holding, cfgErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
 	if cfgErr != nil {
 		if !pve.IsNotFound(cfgErr) && !pve.IsPmxcfsConfigMissing(cfgErr) {
-			return cpierrors.Wrap(pve.WrapError(cfgErr),
+			return nil, cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("delete_vm: read config for VM %s before destroy", vmCID))
 		}
 		// A 404 -- or pmxcfs's "Configuration file ... does not exist" 500,
 		// which is the same condition wearing a different status code --
 		// means the VM is gone; fall through to the destroy call below,
 		// which handles the NotFound case idempotently.
-		return nil
+		return nil, nil
 	}
 	if err := refusePendingDriveReplacement("delete_vm", vmCID, holding); err != nil {
-		return err
+		return nil, err
 	}
 	vmCfg := holding.Config
 
@@ -962,7 +997,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 	// local disk to answer.
 	slotCorroborators := emptyListingCorroborators(deps, nil)
 
-	var protected []string
+	var protected []unusedVolume
 	for slot, volid := range pve.FindUnusedDiskEntries(vmCfg) {
 		storage, _, parseErr := pve.ParseDiskCID(volid)
 		if parseErr != nil {
@@ -976,7 +1011,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 			// Fail closed -- block destroy to avoid data loss.
 			deps.Log(ctx).Warn("delete_vm: unused-slot present but pve.disk_storage not configured -- failing closed",
 				log.String("slot", slot), log.String("volid", volid))
-			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+			protected = append(protected, unusedVolume{slot: slot, volid: volid})
 			continue
 		}
 		if storage != diskStorage {
@@ -985,7 +1020,7 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 			deps.Log(ctx).Warn("delete_vm: unused-slot storage does not match pve.disk_storage -- failing closed",
 				log.String("slot", slot), log.String("volid", volid),
 				log.String("slot_storage", storage), log.String("disk_storage", diskStorage))
-			protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+			protected = append(protected, unusedVolume{slot: slot, volid: volid})
 			continue
 		}
 		// ProveVolumeAbsent: block-backed storages return 500 with
@@ -1005,16 +1040,9 @@ func guardUnusedVolumes(ctx context.Context, deps Deps, node, vmCID string, vmid
 				log.String("slot", slot), log.String("volid", volid))
 			continue
 		}
-		protected = append(protected, fmt.Sprintf("%s=%s", slot, volid))
+		protected = append(protected, unusedVolume{slot: slot, volid: volid})
 	}
-	if len(protected) > 0 {
-		return cpierrors.Cloud(
-			"delete_vm: refusing to destroy VM %s -- persistent volumes still attached as unused slots: %v (call detach_disk first or verify pve.disk_storage configuration; "+
-				"if detach_disk succeeds and the slot stays, do not remove the slot or destroy the VM by hand, because PVE then deletes a volume named for the VM; %s)",
-			vmCID, protected, unusedSlotRecoveryRunbook,
-		)
-	}
-	return nil
+	return protected, nil
 }
 
 // unusedSlotRecoveryRunbook points the unused-slot refusal at the recovery for
@@ -1051,8 +1079,14 @@ const unusedSlotRecoveryRunbook = `see "delete_vm refuses to destroy VM with att
 // Fail-closed: if a foreign disk cannot be detached, or any foreign disk still
 // remains on an active slot after the attempt, a RETRIABLE error is returned
 // and the VM is NOT destroyed — a transient PVE error never escalates to silent
-// data loss. The Director retries delete_vm; the next attempt re-detaches and
-// proceeds.
+// data loss. The Director retries delete_vm. When the disk is still on its
+// slot, the next attempt detaches or transfers it again. When a transfer
+// stopped after deleting the slot of a volume this VM owns, the disk sits on
+// an unused entry with no serial, and the next attempt's
+// guardUnusedVolumesResumingTransfers finishes the move from the parker's
+// transfer record. A volume this VM doesn't own leaves no entry, so the next
+// attempt destroys the VM, and the parker's record leads the next disk call
+// back to the volume.
 func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) error {
 	// Both views: the config endpoint leaves out a slot whose delete is
 	// pending, while PVE's destroy works from the current config that still
@@ -1106,8 +1140,12 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 			}
 			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerCfg, pctx); transferErr != nil {
 				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
-					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it (the volume would otherwise be destroyed; retry resumes the transfer)",
-					vmCID, slot, entry.Volid))
+					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it, so nothing was destroyed. "+
+						"A delete_vm retry transfers the disk again while it is still on its slot. If the slot was already deleted and this VM owns the volume, "+
+						"the volume sits on an unused entry, and the retry finishes the move from the parker's transfer record, or refuses and leaves the volume there "+
+						"when no record proves it is this disk. If this VM doesn't own the volume, PVE keeps no entry for it, so the retry destroys the VM, "+
+						"and the next disk call for the disk finishes the move from the parker's record (%s)",
+					vmCID, slot, entry.Volid, unusedSlotRecoveryRunbook))
 			}
 			transferred = true
 			pve.RemoveAttachedDiskCID(ctx, deps.PVE, logger, node, vmid, entry.StableID, entry.Volid)
