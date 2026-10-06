@@ -319,24 +319,9 @@ error), `delete_vm` refuses to destroy the VM and returns a retriable error.
 The Director retries; the next attempt re-detaches before proceeding. No volume
 is lost to a transient PVE failure.
 
-A persistent volume can also linger in an `unusedN` config slot when a
-snapshot reference prevents PVE from fully sweeping it during the detach. The CPI
-probes the configured `pve.disk_storage` for the volume and refuses to destroy the VM
-while any such volume still exists. This refusal is not retriable, so remove the
-snapshot before deleting the VM. An `unusedN` slot whose
-volume has already been deleted from storage does not block the destroy.
+A persistent volume can also linger in an `unusedN` config slot when a snapshot reference prevents PVE from fully sweeping it during the detach. The CPI probes the configured `pve.disk_storage` for the volume and refuses to destroy the VM while any such volume still exists. This refusal is not retriable, so remove the snapshot before deleting the VM. An `unusedN` slot whose volume has already been deleted from storage does not block the destroy.
 
-For a stable-ID disk the lingering `unusedN` slot marks a deferred park. PVE
-refuses to reassign a snapshot-referenced volume to the parker, so a bypassed
-detach succeeds with the disk off the bus and leaves an intent record on the
-parker carrying the disk's identity and recorded option overrides. The park
-completes on the disk's next mutating call after the snapshot is deleted, and
-the `delete_vm` refusal above keeps the volume safe in the meantime. Until
-then, `attach_disk`, `delete_disk`, and the disk attach inside `create_vm`
-refuse with a permanent `SnapshotBlocked` error that names the `unusedN`
-entry and, when the CPI can list them, the snapshots to delete. They move
-nothing, and `create_vm` makes no fallback attempt on another placement after that refusal. See
-[A snapshot blocks a disk's deferred park](troubleshooting.md#a-snapshot-blocks-a-disks-deferred-park).
+For a stable-ID disk the lingering `unusedN` slot marks a deferred park. PVE refuses to reassign a snapshot-referenced volume to the parker, so a bypassed detach succeeds with the disk off the bus and leaves an intent record on the parker carrying the disk's identity and recorded option overrides. The park completes on the disk's next mutating call after the snapshot is deleted, and the `delete_vm` refusal above keeps the volume safe in the meantime. Until then, `attach_disk`, `delete_disk`, and the disk attach inside `create_vm` refuse with a permanent `SnapshotBlocked` error that names the `unusedN` entry and, when the CPI can list them, the snapshots to delete. They move nothing, and `create_vm` makes no fallback attempt on another placement after that refusal. See [A snapshot blocks a disk's deferred park](troubleshooting.md#a-snapshot-blocks-a-disks-deferred-park).
 
 **Operator note:** An interrupted `create-env` recreate sequence no longer risks
 the Director database disk. The guard runs on both the synchronous delete path
