@@ -1199,3 +1199,39 @@ func TestManagedAttachEndedBeforeTheLockCreateFailsTheCall(t *testing.T) {
 		t.Fatalf("a sentinel was created on the ended request: %v", locks.pools)
 	}
 }
+
+// TestCreateVMLegacyAttachTimeoutBesideAPlannedHandoff covers the same wait
+// with the VM's handoff step for the disk already planned, which is how
+// create_vm calls the attach. The attach judges only the steps it journaled,
+// so the planned handoff doesn't keep it from returning the marker, and the
+// VM record is not marked uncertain.
+func TestCreateVMLegacyAttachTimeoutBesideAPlannedHandoff(t *testing.T) {
+	t.Parallel()
+	locks := newLockContention(t)
+	deps, _, handle, parker, cid := legacyPreservationFixture(t, locks)
+	if err := detachManagedPersistentForVMDelete(t.Context(), deps, "n1", 777, nil, handle); err != nil {
+		t.Fatalf("parking the legacy disk: %v", err)
+	}
+	locks.reset()
+	plantHeldParkerLock(locks, parker)
+	ctx := shortenManagedLockWait(t.Context(), testManagedLockWait)
+	bare, meta, err := decodeDiskCID(ctx, deps, "create_vm", cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := resolveDiskForOp(ctx, deps, "create_vm", cid, bare, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storageMutationIntent(handle, "vm.persistent.example", aj.Target{Node: "n1", VMID: 777}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = attachExistingDiskToManagedVM(ctx, deps, handle, disk, "n1", 777)
+	if !isDiskReturnedAfterLockTimeout(err) || !errors.Is(err, pve.ErrClusterLockTimeout) {
+		t.Fatalf("want the lock timeout with the returned-disk marker, got %v", err)
+	}
+	if record := handle.Record(); record.State == aj.ReconciliationRequired {
+		t.Fatalf("a clean legacy attach timeout demanded reconciliation: %s", record.Reason)
+	}
+}

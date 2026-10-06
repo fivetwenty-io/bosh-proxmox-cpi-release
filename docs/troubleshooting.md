@@ -747,7 +747,7 @@ delete_vm: refusing to destroy VM <N> -- persistent volumes still attached as un
 
 The VM's config still has an `unusedN` entry that names a live volume on the disk storage. PVE leaves a volume there whenever a disk slot is deleted and nothing removes the entry afterwards. Most of the time the Director's view of the disk has drifted from PVE, and a detach puts it right.
 
-Since this release, `delete_vm` checks the parkers before it refuses. When a parker's record names the volume as a transfer from this VM that hasn't landed, `delete_vm` finishes the move to that parker through the same resume `detach_disk` runs, and then it destroys the VM. So this refusal now means that no record could finish the move. Either no parker holds a record that names the volume, or a record does and `delete_vm` left it alone, because its parker is on another node, it belongs to a journal-managed disk, more than one record names the volume, the record's disk CID doesn't decode or carries another stable ID, or the disk the record names resolves to some other transfer. In each of the cases with a record, the CPI log carries a `delete_vm:` warning that names the unused entry and the reason. Three other outcomes replace this refusal with a different error. When the resume itself can't prove the volume is the disk, `delete_vm` fails with the resume's own refusal, and that refusal names its own section of this guide. When resolving the disk fails, or a parker can't be read, `delete_vm` returns that error, retriable unless PVE gave a verdict, and nothing is destroyed or moved. When PVE refuses the move because a snapshot of the VM still references the volume, `delete_vm` fails permanently and names the snapshots to delete. Delete them, and the next `delete_vm` finishes the move.
+Since this release, `delete_vm` checks the parkers before it refuses. When a parker's record names the volume as a transfer from this VM that hasn't landed, `delete_vm` finishes the move to that parker through the same resume `detach_disk` runs, and then it destroys the VM. So this refusal now means that no record could finish the move. Either no parker holds a record that names the volume, or a record does and `delete_vm` left it alone, because its parker is on another node, it belongs to a journal-managed disk, more than one record names the volume, the record's disk CID doesn't decode or carries another stable ID, or the disk the record names resolves to some other transfer. In each of the cases with a record, the CPI log carries a `delete_vm:` warning that names the unused entry and the reason. Three other outcomes replace this refusal with a different error. When the resume itself can't prove the volume is the disk, `delete_vm` fails with the resume's own refusal, and that refusal names its own section of this guide. When resolving the disk fails, or a parker can't be read, `delete_vm` returns that error, retriable unless PVE gave a verdict, and nothing is destroyed or moved. When PVE refuses the move because a snapshot of the VM still references the volume, `delete_vm` fails permanently, destroys nothing, and tells us what to delete. When it can list the VM's snapshots, the error names them. When the listing fails, the error asks us to delete the VM's snapshot that references the volume, without a name, and `qm listsnapshot <N>` shows the candidates. When the VM lists no snapshot, the error says so and asks us to check the VM's configuration for another reference to the volume. The fourth text, in which the CPI finds the snapshot itself and declines the park, never comes from `delete_vm`, because this refusal starts from an unused entry the VM still holds, and the CPI declines a park only after the VM has let go of the volume. Once the snapshots are gone, the next `delete_vm` finishes the move. See [A snapshot blocks a disk's deferred park](#a-snapshot-blocks-a-disks-deferred-park) for the other calls that meet the same snapshot.
 
 One case needs more care. A persistent disk with a stable ID moves to a parker in three steps, both when `detach_disk` parks it and when `delete_vm` preserves a disk that is still attached. The CPI writes a record of the transfer on the parker, deletes the disk's slot on the VM, and then moves the volume. If the move fails, the volume sits on the VM's unused entry, and an unused entry carries no serial, so the parker's record is the only link from the disk's CID to the volume. PVE keeps that unused entry only for a volume the VM owns, which is one whose name carries the VM's VMID. A volume named for any other VMID loses its last reference when the slot is deleted, so it never reaches the VM's unused entry, and since this release the CPI attaches it to the parker by config edit in place of the move. From 0.5.1 through 0.8.0 the next write to that parker removed the record once it was an hour old. After that, `detach_disk` can report success while the volume stays on the VM. Since this release the record stays for as long as the VM still names the volume, and a retried `detach_disk` finishes the move.
 
@@ -888,6 +888,37 @@ qm set <N> --delete unusedN
 ```
 
 Then we delete that one orphan with `bosh -d <deployment> delete-disk <cid>`. We don't use `bosh clean-up --all` here, because it deletes every orphaned disk on the Director. The `delete_disk` that `delete-disk` sends finds that the volume is gone and finishes.
+
+### A snapshot blocks a disk's deferred park
+
+**Symptom**
+
+```text
+attach_disk: can't finish the deferred park of disk <cid> from VM <vm-cid> -- PVE won't move unused entry unusedN=<volid> to its parker while the VM's snapshot(s) [<names>] reference it, so nothing was moved. Delete snapshot(s) [<names>], then retry attach_disk
+```
+
+`delete_disk` fails the same way and says that nothing was moved or deleted. The disk attach inside `create_vm` starts with `create_vm.attach_disk` for a journal-managed disk, with `create_vm.attach_existing` for a disk without a journal record under a journal-managed VM, and with `create_vm` for a disk without a journal record when the VM isn't journal-managed either, and each of them asks us to retry `create_vm`. The error is permanent, so the Director doesn't retry it, and `create_vm` makes no fallback attempt on another placement, because the snapshot stays on the VM that holds the disk wherever the new VM goes. Three variants of the text tell us more.
+
+- When the VM lists no snapshot, the error reads `PVE reports unused entry unusedN=<volid> in use by a snapshot and won't move it to its parker, but the VM lists no snapshot` and asks us to check the VM's configuration for another reference to the volume.
+
+- When the CPI finds the snapshot itself, the error reads `the CPI found that the VM's snapshot <name> names volume <volid> and declined to park it before sending PVE anything`. PVE never saw a move in that case.
+
+- When the call first applied a pending delete of the disk's slot, the error adds `The resume applied the pending delete of slot <slot> first, and the volume stayed on the unused entry that delete left.`
+
+**Diagnosis**
+
+An earlier `detach_disk` took the disk off the bus, but PVE refused to move its volume onto a parker because a snapshot of the VM still names the volume. The detach succeeded and left the volume on the VM's `unusedN` entry, and the parker keeps a record of the transfer. Every call that needs the disk on a parker resumes that transfer first and meets the same refusal until the snapshot is gone. The disk is safe where it is. The volume stays on the unused entry, the parker's record still ties it to the disk's CID, and when PVE refused the move, a journal-managed disk's allocation goes back as `ready_to_return`. In the variant where the CPI declined the park, the VM holds no entry for the volume, and the parker's record alone ties the volume to the disk. Nothing reads the VMs back after a park the CPI declined, so a journal-managed disk's allocation lands in `reconciliation_required` instead, and it stays there through each refused call. The next call after the snapshot is gone finishes the park and returns the allocation as `ready_to_return`.
+
+**Fix**
+
+We delete the snapshots that the error names, and then we run the call again. In the commands below, `<N>` is the VMID that the error names as `<vm-cid>`.
+
+```bash
+qm listsnapshot <N>
+qm delsnapshot <N> <name>
+```
+
+The next call finishes the park and then does its own work. When the VM lists no snapshot, we read `qm config <N>` for another entry that names the volume, and we read the config of each snapshot that `qm listsnapshot <N>` shows. We never remove the `unusedN` entry by hand, because PVE then frees a volume named for the VM, and that volume is our disk.
 
 ### Another entry names a disk's birth volume
 

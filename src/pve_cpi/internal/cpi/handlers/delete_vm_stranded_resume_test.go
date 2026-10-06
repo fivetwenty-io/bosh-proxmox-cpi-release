@@ -409,6 +409,23 @@ func TestDeleteVMRetryStoppedBySnapshotAsksForTheSnapshotsGone(t *testing.T) {
 	}
 }
 
+// TestDeleteVMRetryStoppedBySnapshotWithNoneListed covers PVE's snapshot
+// refusal of the move while the VM's snapshot listing answers with none. The
+// refusal stays permanent and destroys nothing, and since no snapshot can be
+// named, it asks for the VM's configuration to be checked for another
+// reference to the volume rather than for a snapshot's deletion.
+func TestDeleteVMRetryStoppedBySnapshotWithNoneListed(t *testing.T) {
+	s := buildDeleteStrandedDisk(t, true, false, false)
+	s.client.moveErr = errors.New("Can't move disk used by a snapshot to another VM")
+	s.client.snapshots = nil
+	err := deleteVMAt(t, atProvenanceTime(deleteStrandedEpoch.Add(time.Hour)), s.deps)
+	requireSnapshotBlock(t, err, s, false)
+	requireText(t, err, "delete_vm with no snapshot listed",
+		[]string{"in use by a snapshot", "lists no snapshot", "nothing was destroyed",
+			"Check the VM's configuration for another reference to the volume, then retry delete_vm"},
+		"Delete the VM's snapshot")
+}
+
 // requireSnapshotBlock fails unless err is the permanent snapshot block that
 // names the stranded volume and the snapshots to delete, and nothing was
 // destroyed or moved. With listed false the snapshot names are unavailable,
@@ -423,8 +440,9 @@ func requireSnapshotBlock(t *testing.T, err error, s *strandedDisk, listed bool)
 		t.Fatalf("delete_vm error is %s retriable=%t, want a permanent snapshot block: %v", cpiErr.Type(), cpiErr.OkToRetry(), err)
 	}
 	text := err.Error()
-	if !strings.Contains(text, "Delete snapshot") && !strings.Contains(text, "Delete the VM's snapshot") {
-		t.Fatalf("delete_vm = %q, want it to say what to delete", text)
+	if !strings.Contains(text, "Delete snapshot") && !strings.Contains(text, "Delete the VM's snapshot") &&
+		!strings.Contains(text, "Check the VM's configuration for another reference") {
+		t.Fatalf("delete_vm = %q, want it to say what to delete or check", text)
 	}
 	if listed && !strings.Contains(text, "pre-upgrade") {
 		t.Fatalf("delete_vm = %q, want it to name snapshot pre-upgrade", text)

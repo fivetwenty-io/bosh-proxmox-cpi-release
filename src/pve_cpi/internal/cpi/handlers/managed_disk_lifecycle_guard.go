@@ -58,6 +58,10 @@ type managedDiskLifecycleGuard struct {
 	// pending and was settled as not applied, so the revert that follows it is
 	// the pending-delete helper's own.
 	pendingDeleteSettled bool
+	// snapshotRefusalSettled records that PVE refused a move onto a parker
+	// because a snapshot still references the volume, and that the readback
+	// settled the move as refused, with nothing moved (see cleanSnapshotRefusal).
+	snapshotRefusalSettled bool
 }
 
 func newManagedDiskLifecycleGuard(m *managedDiskLifecycle) (*ManagedAllocationGuard, error) {
@@ -1125,7 +1129,11 @@ func (g *managedDiskLifecycleGuard) settleSnapshotRefusedMove(ctx context.Contex
 		// the refusal stays uncertain there.
 		return fmt.Errorf("snapshot refusal settles only a move onto a parker")
 	}
-	return g.settleRefusedMove(ctx, step, observation)
+	if err := g.settleRefusedMove(ctx, step, observation); err != nil {
+		return err
+	}
+	g.snapshotRefusalSettled = true
+	return nil
 }
 
 // settleRefusedMove records a move that PVE refused before its rename as

@@ -163,18 +163,72 @@ func resumeStrandedTransfer(
 // strandedSnapshotRefusal is the error for a resume that PVE's snapshot check
 // stopped. The refusal comes from reassigning the volume, and only an operator
 // can clear it, so it is permanent, the class detach_disk gives a snapshot
-// block, and its text names the snapshots to delete. A failed snapshot listing
-// leaves the names out and keeps the class.
+// block, and its text names the snapshots to delete.
 func strandedSnapshotRefusal(ctx context.Context, deps Deps, node, vmCID string, vmid int, entry unusedVolume) error {
-	names, err := pve.HasSnapshots(ctx, deps.PVE, node, vmid)
-	if err != nil || len(names) == 0 {
-		return cpierrors.SnapshotBlocked(
-			"delete_vm: refusing to destroy VM %s -- PVE won't move unused entry %s=%s to its parker while a snapshot of the VM references it, so nothing was destroyed."+
-				" Delete the VM's snapshot that references the volume, then retry delete_vm",
-			vmCID, entry.slot, entry.volid)
+	return snapshotBlockedMove(ctx, deps, snapshotBlock{
+		node:  node,
+		vmid:  vmid,
+		lead:  fmt.Sprintf("delete_vm: refusing to destroy VM %s", vmCID),
+		what:  fmt.Sprintf("unused entry %s=%s", entry.slot, entry.volid),
+		held:  "nothing was destroyed",
+		retry: "delete_vm",
+	})
+}
+
+// snapshotBlock describes a move onto a parker that a snapshot of the source
+// VM stopped. lead says which call stopped and what it refused to do, what
+// names the volume the move would have taken, held says what the call left as
+// it was, and retry is the call to run again. cause is the refusal, and a nil
+// cause reads as a refusal that PVE returned with no step of the call applied
+// before it.
+type snapshotBlock struct {
+	node  string
+	vmid  int
+	lead  string
+	what  string
+	held  string
+	retry string
+	cause error
+}
+
+// snapshotBlockedMove is the permanent SnapshotBlocked error for a snapshot
+// block. The text says who refused. A refusal PVE returned names the VM's
+// snapshots to delete, and a failed snapshot listing leaves the names out and
+// keeps the class. When PVE refused but the VM lists no snapshot, something
+// else in the VM's configuration still names the volume, so the text asks for
+// that reference instead. A refusal the CPI made before it sent the move names
+// the snapshot it found. When the resume applied a pending delete before the
+// refusal, the text says so, because the volume moved from that slot to an
+// unused entry. The text asks for nothing but the snapshot's deletion, because
+// removing the unused entry by hand makes PVE free a volume named for the VM.
+func snapshotBlockedMove(ctx context.Context, deps Deps, b snapshotBlock) error {
+	note := ""
+	if slot, ok := pve.ResumeAppliedPendingDelete(b.cause); ok {
+		note = fmt.Sprintf(" The resume applied the pending delete of slot %s first,"+
+			" and the volume stayed on the unused entry that delete left.", slot)
 	}
+	if snapshot, ok := pve.SnapshotNamingVolumeRefusal(b.cause); ok {
+		return cpierrors.SnapshotBlocked(
+			"%s -- the CPI found that the VM's snapshot %s names %s and declined to park it before sending PVE anything,"+
+				" so %s.%s Delete snapshot %s and any other snapshot of the VM that names the volume, then retry %s",
+			b.lead, snapshot, b.what, b.held, note, snapshot, b.retry)
+	}
+	names, err := pve.HasSnapshots(ctx, deps.PVE, b.node, b.vmid)
+	switch {
+	case err != nil:
+		return cpierrors.SnapshotBlocked(
+			"%s -- PVE won't move %s to its parker while a snapshot of the VM references it, so %s.%s"+
+				" Delete the VM's snapshot that references the volume, then retry %s",
+			b.lead, b.what, b.held, note, b.retry)
+	case len(names) == 0:
+		return cpierrors.SnapshotBlocked(
+			"%s -- PVE reports %s in use by a snapshot and won't move it to its parker, but the VM lists no snapshot,"+
+				" so %s.%s Check the VM's configuration for another reference to the volume, then retry %s",
+			b.lead, b.what, b.held, note, b.retry)
+	}
+	listed := strings.Join(names, ", ")
 	return cpierrors.SnapshotBlocked(
-		"delete_vm: refusing to destroy VM %s -- PVE won't move unused entry %s=%s to its parker while the VM's snapshot(s) [%s] reference it, so nothing was destroyed."+
-			" Delete snapshot(s) [%s], then retry delete_vm",
-		vmCID, entry.slot, entry.volid, strings.Join(names, ", "), strings.Join(names, ", "))
+		"%s -- PVE won't move %s to its parker while the VM's snapshot(s) [%s] reference it, so %s.%s"+
+			" Delete snapshot(s) [%s], then retry %s",
+		b.lead, b.what, listed, b.held, note, listed, b.retry)
 }

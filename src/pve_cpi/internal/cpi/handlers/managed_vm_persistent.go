@@ -51,13 +51,16 @@ func (m *managedVMAllocation) attachPersistent(ctx context.Context, disk resolve
 		}
 		if isDiskReturnedUnchanged(err) && m.guard.Err() == nil {
 			// The disk's lifecycle waited out another request's parker
-			// window, or its detach tail stopped before it changed the
-			// source VM, and either way it returned the disk unchanged. So
-			// the handoff this step records never touched the VM. We settle
-			// the step and hand the error back without poisoning the VM
-			// allocation. create_vm never resumes this VM. It disposes of the
-			// attempt, preserving any disk already attached. A fallback
-			// attempt then places a new VM, and on the last attempt the
+			// window, its detach tail stopped before it changed the source
+			// VM, or a snapshot on the VM holding it stopped the deferred
+			// park this attach resumed. Each way it returned the disk
+			// unchanged, so the handoff this step records never touched the
+			// VM. We settle the step and hand the error back without
+			// poisoning the VM allocation. create_vm never resumes this VM.
+			// It disposes of the attempt, preserving any disk already
+			// attached. A fallback attempt then places a new VM, except after
+			// a snapshot refusal, which no other placement clears. On the
+			// last attempt, and after a snapshot refusal on any attempt, the
 			// generation is closed before the error reaches the Director,
 			// whose retry builds a fresh VM.
 			if observeErr := storageMutationObserved(m.handle, step, nil, false); observeErr != nil {

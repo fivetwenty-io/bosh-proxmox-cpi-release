@@ -10,6 +10,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -142,6 +143,11 @@ func resumeTransfer(ctx context.Context, deps Deps, op string, rd resolvedDisk, 
 		if pending := driveDeletePendingDiskError(op, err); pending != nil {
 			return resolvedDisk{}, pending
 		}
+		if pve.IsMoveDiskSnapshotRefusal(err) && resumeRefusesSnapshotBlock(op) {
+			if refusal := deferredParkSnapshotRefusal(ctx, deps, op, rd, err); refusal != nil {
+				return resolvedDisk{}, refusal
+			}
+		}
 		return resolvedDisk{}, retriableUnlessPermanent(err,
 			fmt.Sprintf("%s: resume interrupted transfer for disk %s", op, rd.diskCID))
 	}
@@ -167,6 +173,73 @@ func resumeTransfer(ctx context.Context, deps Deps, op string, rd resolvedDisk, 
 		}
 	}
 	return refreshed, nil
+}
+
+// resumeRefusesSnapshotBlock reports whether op answers a resume that a
+// snapshot stopped with deferredParkSnapshotRefusal. attach_disk, delete_disk,
+// and each of create_vm's disk attaches do. Those are the attach of a
+// journal-managed disk, the attach of a disk without a journal under a
+// journal-managed VM, and the attach on a create_vm that runs without a
+// journal. detach_disk succeeds instead, because the disk is already off the
+// bus, and delete_vm gives its own refusal for the VM it won't destroy.
+func resumeRefusesSnapshotBlock(op string) bool {
+	return op == "attach_disk" || op == "delete_disk" || isCreateVMDiskAttachOp(op)
+}
+
+// isCreateVMDiskAttachOp reports whether op names one of create_vm's disk
+// attaches, whose refusals ask for create_vm to run again.
+func isCreateVMDiskAttachOp(op string) bool {
+	return op == "create_vm" || op == "create_vm.attach_disk" || op == "create_vm.attach_existing"
+}
+
+// deferredParkSnapshotRefusal is the error for a resume that a snapshot of the
+// source VM stopped, whether PVE refused the move or the CPI declined the park
+// before sending it. A detach that met the same refusal left the disk on the
+// source VM's unused entry with its park deferred, and the park goes through
+// only once an operator deletes the snapshot. So the call refuses permanently,
+// the way delete_vm does for the same state, and doesn't retry a park that
+// keeps being refused. The text names the unused entry the source VM's config
+// holds for the volume, and it names the volume alone when the config read
+// fails or no entry names it. create_vm's disk attaches ask for create_vm to
+// run again, because that's the call the Director retries. It returns nil
+// when the record names no source VM, and the caller keeps its retriable
+// error.
+func deferredParkSnapshotRefusal(ctx context.Context, deps Deps, op string, rd resolvedDisk, cause error) error {
+	source, ok := intentSourceVMID(rd.intent)
+	if !ok {
+		return nil
+	}
+	what := "volume " + rd.intent.Volid
+	if cfg, err := deps.PVE.QEMU().Config(ctx, rd.intent.ParkerNode, source); err == nil {
+		entries := pve.FindUnusedDiskEntries(cfg)
+		keys := make([]string, 0, len(entries))
+		for key, volid := range entries {
+			if volid == rd.intent.Volid {
+				keys = append(keys, key)
+			}
+		}
+		if len(keys) > 0 {
+			sort.Strings(keys)
+			what = fmt.Sprintf("unused entry %s=%s", keys[0], rd.intent.Volid)
+		}
+	}
+	held := "nothing was moved"
+	if op == "delete_disk" {
+		held = "nothing was moved or deleted"
+	}
+	retry := op
+	if isCreateVMDiskAttachOp(op) {
+		retry = "create_vm"
+	}
+	return snapshotBlockedMove(ctx, deps, snapshotBlock{
+		node:  rd.intent.ParkerNode,
+		vmid:  source,
+		lead:  fmt.Sprintf("%s: can't finish the deferred park of disk %s from VM %s", op, rd.diskCID, rd.intent.SourceVMCID),
+		what:  what,
+		held:  held,
+		retry: retry,
+		cause: cause,
+	})
 }
 
 // resumeAppliesFoundPendingDelete reports whether op moves the disk off its

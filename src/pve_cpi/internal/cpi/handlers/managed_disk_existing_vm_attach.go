@@ -48,7 +48,10 @@ func attachExistingDiskToManagedVM(ctx context.Context, deps Deps, handle *aj.Ha
 		return "", fmt.Errorf("existing persistent volume is not observed")
 	}
 	session := &storageLifecycle{handle: handle, operation: "create_vm_attach_legacy"}
-	lifecycle := &managedDiskLifecycle{external: true, externalNode: sourceNode, externalBacking: backing, requestContext: ctx, deps: deps, disk: disk, handle: handle, session: session}
+	// The VM's record may already hold the handoff step attachPersistent
+	// planned for this disk, which stays planned until the attach returns. So
+	// the clean exits below judge only the steps this attach journals.
+	lifecycle := &managedDiskLifecycle{external: true, externalNode: sourceNode, externalBacking: backing, requestContext: ctx, deps: deps, disk: disk, handle: handle, session: session, stepsFrom: len(handle.Record().Steps)}
 	guard, err := newManagedDiskLifecycleGuard(lifecycle)
 	if err != nil {
 		return "", err
@@ -63,6 +66,14 @@ func attachExistingDiskToManagedVM(ctx context.Context, deps Deps, handle *aj.Ha
 			// disk. The disk is where it was, so the VM allocation's own
 			// rule in attachPersistent decides what happens next.
 			operationErr = &diskReturnedAfterLockTimeout{err: operationErr}
+			return
+		}
+		if operationErr != nil && lifecycle.cleanSnapshotRefusal(operationErr) {
+			// A snapshot on the disk's holder stopped the deferred park this
+			// attach resumes, and the guard read both VMs back unchanged. The
+			// disk is where it was, so attachPersistent settles its handoff
+			// step the same way.
+			operationErr = &diskReturnedAfterSnapshotRefusal{err: operationErr}
 			return
 		}
 		operationErr = errors.Join(operationErr, guard.Err())

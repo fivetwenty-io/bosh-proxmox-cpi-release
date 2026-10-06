@@ -1280,7 +1280,7 @@ func resumeMoveWindow(
 		if appliedSlot == "" {
 			return err
 		}
-		return cpierrors.Wrap(err, fmt.Sprintf(
+		return cpierrors.Wrap(&appliedPendingDeleteError{slot: appliedSlot, err: err}, fmt.Sprintf(
 			"transfer resume: applied the pending delete of %s on source vm %d, and then %s did not go through",
 			appliedSlot, srcVMID, then))
 	}
@@ -2177,4 +2177,29 @@ func resumeDiskTransferContext(intent DiskTransferIntent, stableID string, cfg P
 	}
 
 	return pctx, cfg, nil
+}
+
+// appliedPendingDeleteError carries the source slot whose pending delete a
+// resume applied before a later step of the resume failed. Its text and class
+// are the failure's own, so it changes nothing a caller reads except through
+// ResumeAppliedPendingDelete.
+type appliedPendingDeleteError struct {
+	slot string
+	err  error
+}
+
+func (e *appliedPendingDeleteError) Error() string { return e.err.Error() }
+
+func (e *appliedPendingDeleteError) Unwrap() error { return e.err }
+
+// ResumeAppliedPendingDelete reports whether a transfer resume applied the
+// pending delete of a source slot before err stopped it, and returns that
+// slot. Once the delete is applied, the source holds the volume on an unused
+// entry rather than on the slot.
+func ResumeAppliedPendingDelete(err error) (string, bool) {
+	var applied *appliedPendingDeleteError
+	if errors.As(err, &applied) {
+		return applied.slot, true
+	}
+	return "", false
 }

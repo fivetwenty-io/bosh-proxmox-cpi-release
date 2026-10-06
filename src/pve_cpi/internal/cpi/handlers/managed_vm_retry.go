@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
 func beginManagedVMRetry(ctx context.Context, deps Deps, parsed *createVMParsedArgs, selection *StoragePlacementSelection, handle *aj.Handle, next *managedVMPlan, proof aj.Verification) (*managedVMAllocation, error) {
@@ -95,7 +96,16 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 			return nil, err
 		}
 		descriptor := m.prepared.plan.VMExecution
-		if descriptor == nil || descriptor.MaxAttempts <= m.handle.Record().ActiveAttempt()+1 || deps.Config.KeepFailedVMsEnabled() {
+		lastAttempt := descriptor == nil || descriptor.MaxAttempts <= m.handle.Record().ActiveAttempt()+1
+		// A snapshot that blocks a persistent disk's deferred park sits on
+		// the VM that holds the disk, and no other placement clears it. So it
+		// ends the generation the way the last attempt does, without a
+		// fallback attempt. A settled refusal can still carry PVE's own
+		// retriable text instead of the permanent class, so the marker counts
+		// as well.
+		var refused *diskReturnedAfterSnapshotRefusal
+		snapshotBlocked := cpierrors.IsType(err, cpierrors.TypeSnapshotBlocked) || errors.As(err, &refused)
+		if lastAttempt || snapshotBlocked || deps.Config.KeepFailedVMsEnabled() {
 			// keep_failed_vms asks us to keep the VM, so the error goes back
 			// with it in place and the next try resumes the generation.
 			if isDiskReturnedUnchanged(err) && !deps.Config.KeepFailedVMsEnabled() {
@@ -139,30 +149,31 @@ func runManagedVMWithRetries(ctx context.Context, deps Deps, journal *aj.Journal
 }
 
 // rollbackManagedVMAfterLockTimeout ends a create_vm whose persistent disk
-// waited out another request's parker lock on the generation's last attempt.
-// It also handles a create_vm whose persistent disk failed because its detach
-// tail stopped before it changed the source VM, and it ends that attempt the
-// same way. The disk came back unchanged, but the attempt's VM exists, and any
-// disk attached before the failure is still attached to it. If the retriable
-// error went back with the VM in place, a later deploy under a new agent ID
-// would orphan that VM and strand those disks on it. So we dispose of the
-// attempt first, which preserves every attached disk and destroys the VM, and
-// then close the generation. Only then does the error go back, and the
-// Director's retry under the same agent ID starts a new generation and builds
-// a fresh VM.
-func rollbackManagedVMAfterLockTimeout(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, timeout error) error {
+// came back unchanged, with one of the markers isDiskReturnedUnchanged reads,
+// on the generation's last attempt. The disk waited out another request's
+// parker lock, its detach tail stopped before it changed the source VM, or a
+// snapshot on the VM holding it stopped the deferred park the attach resumed.
+// The last of these ends the generation on any attempt, because no fallback
+// placement clears the snapshot. The attempt's VM exists, and any disk
+// attached before the failure is still attached to it. If the error went back
+// with the VM in place, a later deploy under a new agent ID would orphan that
+// VM and strand those disks on it. So we dispose of the attempt first, which
+// preserves every attached disk and destroys the VM, and then close the
+// generation. Only then does the error go back, and the Director's retry
+// under the same agent ID starts a new generation and builds a fresh VM.
+func rollbackManagedVMAfterLockTimeout(ctx context.Context, deps Deps, journal *aj.Journal, handle *aj.Handle, attemptErr error) error {
 	proof, err := rollbackManagedVMAttempt(ctx, deps, journal, handle)
 	if err != nil {
-		return managedVMRollbackError(ctx, deps, handle, timeout, err)
+		return managedVMRollbackError(ctx, deps, handle, attemptErr, err)
 	}
 	if err := closeDisposedManagedVM(handle, proof); err != nil {
 		// The VM is gone, but the generation still reads as a create in
 		// progress. A retry cannot resume it, so it needs an operator.
 		uncertain := storageAllocationUncertain(handle, "VM create rollback closure")
 		deps.recordStorageReconciliation(ctx, "required")
-		return errors.Join(uncertain, err, timeout)
+		return errors.Join(uncertain, err, attemptErr)
 	}
-	return timeout
+	return attemptErr
 }
 
 // managedVMRollbackError joins a failed rollback onto the attempt's own error.
