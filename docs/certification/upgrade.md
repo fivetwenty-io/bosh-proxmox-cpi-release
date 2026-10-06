@@ -148,7 +148,7 @@ A dedicated slot needs a `slot.yml` beside its state, with the values that must 
 |---|---|---|
 | `internal_ip` | yes | The run's Director IP. It must be a free address inside the env's reserved band (`cpitest_reserved` on cpitest), and it must differ from the main Director's `internal_ip`, the gateway (`internal_gw`), and the artifacts VM's address |
 | `bosh_alias` | no | The bosh CLI alias (default `pve-<slot directory name>`), so the run never repoints the main Director's `pve` alias. The guard refuses `pve` itself |
-| `director_name` | no | The Director's name (default `ocfp-mgmt`) |
+| `director_name` | no | The Director's name. It defaults to the `director_name` in `manifests/bosh/vars.yml` or the env's `vars.yml`, and to `ocfp-mgmt` when neither sets one |
 | `pve_create_env_deployment` | yes | The deployment segment of the Director VM's name, so the two Director VMs are told apart in PVE. It must differ from the main Director's value |
 | `cpitest_reserved` | on cpitest | The reserved bands of the run's cloud config. It replaces the env's list for this slot only, so it must keep every entry the env reserves and add the part of the dynamic range the main Director uses |
 
