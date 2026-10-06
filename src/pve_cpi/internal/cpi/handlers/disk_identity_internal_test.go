@@ -117,6 +117,12 @@ func (q *idFakeQEMU) Config(_ context.Context, _ string, vmid int) (map[string]a
 	for k, v := range cfg {
 		out[k] = v
 	}
+	// PVE answers every config read with a digest, and a parker description
+	// write refuses a read without one, because a write built from it could
+	// erase records it never saw. A test that sets its own digest keeps it.
+	if _, has := out["digest"]; !has {
+		out["digest"] = "idfake-digest"
+	}
 	return out, nil
 }
 

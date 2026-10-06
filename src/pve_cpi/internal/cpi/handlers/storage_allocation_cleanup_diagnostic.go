@@ -59,6 +59,13 @@ var storageFixedRefusals = []error{errRetainedParkerIdentity}
 // stays where it was, so the same decision can run again.
 const storageLockWaitReturned = "a parker lock wait ran out before the disk moved, so nothing was destroyed; run cleanup again once the lock is free"
 
+// storageLockClaimReturned is what the CLI prints when a disk operation inside
+// a decision took the parker lock's claim too late to use it, so the lock was
+// never held and the disk did not move. The record stays where it was, so the
+// same decision can run again.
+const storageLockClaimReturned = "a parker lock was not taken before the disk moved, so nothing was destroyed; " +
+	"run cleanup again once the lock is free"
+
 // StorageAllocationDecisionFailure returns a bounded stage identifier and a
 // safe description of why the decision was refused. A refused audit gate
 // contributes its summary and the runbook pointer, and a CPI-authored refusal
@@ -69,7 +76,8 @@ const storageLockWaitReturned = "a parker lock wait ran out before the disk move
 // path. That is safe because the storage-journal CLI, which runs on the
 // journal's host, is this function's only production caller. A fixed refusal
 // in storageFixedRefusals contributes its own text, and so does a parker lock
-// wait that ran out before the disk moved. Anything else is described by
+// wait that ran out or a parker lock claim that was refused before the disk
+// moved. Anything else is described by
 // pve.DescribeAuditError, so backend response text, credentials, and resource
 // payloads are never included.
 func StorageAllocationDecisionFailure(err error) string {
@@ -96,6 +104,9 @@ func StorageAllocationDecisionFailure(err error) string {
 		}
 	}
 	if isDiskReturnedAfterLockTimeout(err) {
+		if errors.Is(err, pve.ErrClusterLockClaimTooShort) {
+			return class + ": " + storageLockClaimReturned
+		}
 		return class + ": " + storageLockWaitReturned
 	}
 	if err == nil {

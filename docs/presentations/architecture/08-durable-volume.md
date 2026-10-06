@@ -136,7 +136,7 @@ class: visual-right
 
 <!--
 - Key distinction we will hold: the scsiN slot attachment is the durable physical fact; the provenance sentinel in the parker description is best-effort advisory.
-- Concurrent parks on the same parker can overwrite each other's provenance — PVE has no atomic read-modify-write on VM descriptions. The disk will stay correctly attached; only the advisory record may be incomplete.
+- PVE has no atomic read-modify-write on VM descriptions, but it checks a digest, so every provenance write will carry the digest of its own read and retry from a fresh read when PVE refuses it. Concurrent parks on the same parker won't overwrite each other's provenance. A write that gives up leaves the disk correctly attached, and only the advisory record may be incomplete.
 - Park failure will be fail-closed retriable: on retry the disk is free-floating, so the idempotency check will re-park without repeating the detach.
 - Guard: snapshot_disk on a parked disk will be refused — a PVE snapshot is whole-VM, so it would bundle every deployment's disks on that parker into one snapshot.
 - Guard: delete_vm will refuse a VMID in the parker band carrying the bosh-parker tag — bypassing protection=1 via skiplock would destroy every scsiN disk. An unreadable in-band VMID will also be refused, directing the caller to retry.

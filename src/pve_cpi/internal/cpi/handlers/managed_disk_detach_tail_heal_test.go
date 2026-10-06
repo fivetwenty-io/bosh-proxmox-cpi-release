@@ -371,31 +371,30 @@ func TestDetachTailRefusalWithEveryNoteKeptSettles(t *testing.T) {
 	s.requireSourceClean(t)
 }
 
-// TestDetachTailRefusalWithNotesGoneStaysUnsettled is a refused tail write
+// TestDetachTailRefusalWithNotesGoneStillSettles is a refused tail write
 // after which 777 still carries the allocation entry but no longer carries the
-// attached-disk entry or the overlay the write meant to remove. The readback
-// can't show that the refused write changed nothing, so the refusal isn't
-// settled, its step stays planned, and the volume stays in place.
-func TestDetachTailRefusalWithNotesGoneStaysUnsettled(t *testing.T) {
+// attached-disk entry or the overlay the write meant to remove. The tail built
+// its write from a read at the digest it sent, and PVE checks that digest under
+// 777's lock before it writes, so the refusal alone shows the write changed
+// nothing, whatever another writer removed since. The refusal is settled, the
+// tail removes the entry that is left from a fresh read, and delete_disk ends
+// Deleted.
+func TestDetachTailRefusalWithNotesGoneStillSettles(t *testing.T) {
 	captureParkerPoolSweep(t)
 	s, id, w := buildLatentTailDisk(t)
 	s.seedTailNotes(t)
 	ctx, changed := s.refuseFirstTailWrite(t, id, true)
-	err := deleteDiskAt(t, ctx, s.deps, s.cid)
-	requirePermanent(t, err, "delete_disk whose refused write's notes were gone on the readback")
-	s.requireRecord(t, id, aj.ReconciliationRequired)
-	if *changed != 1 || w.conflicts != 1 || w.removals != 0 {
-		t.Fatalf("changed=%d conflicts=%d removals=%d, want one refused write and no removal", *changed, w.conflicts, w.removals)
+	if err := deleteDiskAt(t, ctx, s.deps, s.cid); err != nil {
+		t.Fatalf("delete_disk whose refused write's notes were gone on the readback: %v", err)
 	}
-	if planned, _ := countSteps(t, s.journal, id, "_Nodes_UpdateQemuConfig"); planned != 1 {
-		t.Fatalf("%d of 777's config steps were left planned, want the refused write unsettled", planned)
+	if *changed != 1 || w.conflicts != 1 || w.removals != 1 {
+		t.Fatalf("changed=%d conflicts=%d removals=%d, want one refused write and one removal", *changed, w.conflicts, w.removals)
 	}
-	if !s.hasEntry(777) {
-		t.Fatal("777's entry went missing although PVE refused the write")
+	if planned, _ := countSteps(t, s.journal, id, "_Nodes_UpdateQemuConfig"); planned != 0 {
+		t.Fatalf("%d of 777's config steps were left planned, want the refusal settled", planned)
 	}
-	if s.client.state.volumes[s.stranded] == nil {
-		t.Fatalf("delete_disk deleted %s although the tail never finished", s.stranded)
-	}
+	s.requireRecord(t, id, aj.Deleted)
+	s.requireSourceClean(t)
 }
 
 // configSteps counts the record's config steps on any VM, planned or

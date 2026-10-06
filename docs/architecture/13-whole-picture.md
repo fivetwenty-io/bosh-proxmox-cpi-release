@@ -68,7 +68,7 @@ A hard anti-affinity rule that refuses to co-locate siblings can, on a two- or t
 PVE restricts the flag that destroys a locked VM to the literal root user, and that flag is governed by no privilege at all. Full least-privilege operation, the goal of [Chapter 11](11-hostile-by-default.md), therefore cannot clear locked VMs. The design states the trade-off plainly instead of quietly demanding root.
 
 - **Cleanup and provenance are best-effort, not guaranteed**
-The rollback that prevents a leaked VM can itself fail and leave one behind. The provenance written into a parker VM can be overwritten by a concurrent park. In both cases the durable physical fact — the resource state, the slot attachment — is protected; only the convenience record is at risk. That is a deliberate split, but it is a limit worth naming.
+The rollback that prevents a leaked VM can itself fail and leave one behind. The provenance written into a parker VM can go unwritten when concurrent writes to that parker keep changing it, because the write refuses rather than overwrite another disk's entry. In both cases the durable physical fact, which is the resource state or the slot attachment, is protected, and only the convenience record is at risk. That is a deliberate split, but it is a limit worth naming.
 
 - **A node-local disk does not move itself**
 Once a disk lands on local storage on one node, the CPI will not silently relocate it to another. Recreating its owner elsewhere is refused, not papered over; moving the bytes is an operator's deliberate act or a job for shared storage.

@@ -92,6 +92,9 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 		fmt.Fprintln(stderr, "storage journal configuration incomplete: "+err.Error())
 		return 1
 	}
+	// The retry curves set the parker lock's TTL and wait and the cleanup
+	// budget, so they are applied before any of those is read.
+	applyRetryCurves(cfg)
 	logger := log.NewNopLogger()
 	factory := opts.ClientFactory
 	if factory == nil {
@@ -628,14 +631,18 @@ const storageJournalBaseBudget = 2 * time.Minute
 // storageJournalCleanupBudget bounds cleanup, the one action that can take a
 // parker's protection lock, which it does when it preserves or deletes a
 // parked disk. On top of the base budget it covers one full wait for another
-// request's window (pve.ParkerProtectionLockTTL), the margin a lock wait
+// request's window (pve.ParkerProtectionLockTTLNow), the margin a lock wait
 // leaves before its request's deadline for the sentinel's release and the
 // caller's completion (pve.ClusterLockContextMargin), and the window cleanup
 // then runs itself, which fits inside its own claim's TTL together with its
-// protection restore, its sweep, and its release. A cleanup that meets a
-// second contended window in the same run has that wait end cleanly before
-// the deadline, and we rerun it.
-const storageJournalCleanupBudget = storageJournalBaseBudget + pve.ParkerProtectionLockTTL + pve.ClusterLockContextMargin + pve.ParkerProtectionLockTTL
+// protection restore, its sweep, and its release. The TTL follows the retry
+// curves the CLI applied from its config. A cleanup that meets a second
+// contended window in the same run has that wait end cleanly before the
+// deadline, and we rerun it.
+func storageJournalCleanupBudget() time.Duration {
+	ttl := pve.ParkerProtectionLockTTLNow()
+	return storageJournalBaseBudget + ttl + pve.ClusterLockContextMargin + ttl
+}
 
 // storageJournalActionCleanup names the one action that can take a parker's
 // protection lock.
@@ -644,7 +651,7 @@ const storageJournalActionCleanup = "cleanup"
 // storageJournalBudget is the time an action runs under.
 func storageJournalBudget(action string) time.Duration {
 	if action == storageJournalActionCleanup {
-		return storageJournalCleanupBudget
+		return storageJournalCleanupBudget()
 	}
 	return storageJournalBaseBudget
 }

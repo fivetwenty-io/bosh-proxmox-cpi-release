@@ -278,9 +278,11 @@ func updateAttachedDisk(ctx context.Context, deps Deps, diskCID string, rd resol
 // string stays CPI-owned (volid plus serial) — the next attach bakes the
 // merged string, which is when the option update takes effect.
 func updateParkedDisk(ctx context.Context, deps Deps, diskCID string, rd resolvedDisk, holder pve.DiskHolder, updateSpec map[string]any) error {
-	if newSizeMB, hasSz, sizeErr := updateSpecSizeMB(updateSpec); sizeErr != nil {
+	newSizeMB, hasSz, sizeErr := updateSpecSizeMB(updateSpec)
+	if sizeErr != nil {
 		return sizeErr
-	} else if hasSz {
+	}
+	if hasSz {
 		if holder.Slot == "" {
 			return cpierrors.Retriable(
 				"update_disk: disk %s confirmed on parker vmid %d but slot not found in config (possible race)",
@@ -298,8 +300,7 @@ func updateParkedDisk(ctx context.Context, deps Deps, diskCID string, rd resolve
 	merged, ovErr := pve.ApplyParkerDiskOverlay(ctx, deps.PVE, holder.Node, holder.VMID,
 		rd.volid, rd.stableID, rd.diskCID, newOpts, parkerReadConfigFor(deps))
 	if ovErr != nil {
-		return retriableUnlessPermanent(ovErr,
-			fmt.Sprintf("update_disk: record option overrides for parked disk %s (fail-closed: nothing was changed)", diskCID))
+		return retriableUnlessPermanent(ovErr, parkedOverlayFailureMessage(diskCID, hasSz, newSizeMB))
 	}
 	deps.Log(ctx).Info("update_disk: disk is parked; option overrides recorded and applied at the next attach",
 		log.String("disk_cid", diskCID),
@@ -307,6 +308,18 @@ func updateParkedDisk(ctx context.Context, deps Deps, diskCID string, rd resolve
 		log.Int("override_keys", len(merged)),
 	)
 	return nil
+}
+
+// parkedOverlayFailureMessage names what an update of a parked disk changed
+// when recording its option overrides failed. A resize runs before the
+// overrides are recorded, so once it has succeeded the disk already has the
+// requested size, and only the overrides are missing.
+func parkedOverlayFailureMessage(diskCID string, resized bool, newSizeMB int) string {
+	if resized {
+		return fmt.Sprintf("update_disk: parked disk %s now has the requested size of %d MiB, "+
+			"but its option overrides were not recorded", diskCID, newSizeMB)
+	}
+	return fmt.Sprintf("update_disk: record option overrides for parked disk %s (fail-closed: nothing was changed)", diskCID)
 }
 
 // resizeDiskInternal performs the additive GiB resize for a disk already located

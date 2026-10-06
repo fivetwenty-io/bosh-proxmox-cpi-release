@@ -185,15 +185,18 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 
 // managedLockWaitContext lets a journal-managed operation wait out a whole
 // parker window that another request holds. The default wait is 15 seconds,
-// while a holder's window may run for most of the lock's 180-second TTL. The
-// window ends 90 seconds before the claim's recorded expiry, which leaves time
-// for the sweep, the protection restore, and the release. A waiter that gives up early fails its
-// Director task even though nothing went wrong. Waiting a full TTL is the
-// shortest wait that outlasts any single holder, live or crashed, because a
-// claim that outlives its TTL is stolen. A queue of several holders can still
-// outlast it, and that timeout is settled cleanly by cleanLockTimeout.
+// while a holder's window may run for most of the lock's TTL, which is 235
+// seconds on the shipped retry curves and longer when pve.retry lengthens
+// them. The window ends early enough before the claim's recorded expiry to
+// leave time for the sweep, the protection restore, and the release. A waiter
+// that gives up early fails its Director task even though nothing went wrong.
+// Waiting a full TTL is the shortest wait that outlasts any single holder,
+// live or crashed, because a claim that outlives its TTL is stolen. A queue of
+// several holders can still outlast it, and that timeout is settled cleanly by
+// cleanLockTimeout.
 //
-// The wait is the lock's TTL unless the context carries a shorter one under
+// The wait is the lock's TTL under the retry curves configured now, from
+// pve.ParkerProtectionLockTTLNow, unless the context carries a shorter one under
 // managedLockWaitKey, which only tests set. The wait is a context value, and it
 // must never become a context deadline. failConfirmingReads in the tests tells
 // the acquire's confirming reads from the reads on its way out only by whether
@@ -201,7 +204,7 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 // make every confirming read answer, and the tests that drive the unknown lock
 // state would no longer reach it.
 func managedLockWaitContext(ctx context.Context) context.Context {
-	wait := pve.ParkerProtectionLockTTL
+	wait := pve.ParkerProtectionLockTTLNow()
 	if d, ok := ctx.Value(managedLockWaitKey{}).(time.Duration); ok && d > 0 {
 		wait = d
 	}
@@ -304,18 +307,36 @@ func (m *managedDiskLifecycle) completeOwned(ctx context.Context, deleted bool) 
 // answer, its step stays planned and the guard is poisoned, so the other
 // conditions send the record to reconciliation, and the next call's readback
 // settles the step.
+//
+// pve.ErrClusterLockClaimTooShort counts the same way. The acquire confirmed
+// its claim too late to use it and gave it up without entering the window,
+// and on its way out it reads and deletes its sentinel exactly as the
+// unknown state does, so the same steps decide.
 func (m *managedDiskLifecycle) cleanLockTimeout(operationErr error) bool {
 	if operationErr == nil {
 		return false
 	}
-	if !errors.Is(operationErr, pve.ErrClusterLockTimeout) && !errors.Is(operationErr, pve.ErrClusterLockStateUnknown) &&
-		!errors.Is(operationErr, pve.ErrClusterLockInterrupted) && !errors.Is(operationErr, errManagedRequestEnded) {
+	if !isLockWaitWithoutEntry(operationErr) {
 		return false
 	}
 	if m.guard == nil || m.guard.Err() != nil || m.handle == nil || m.diskMutationAdmitted {
 		return false
 	}
 	return storageLifecycleSettled(m.handle.Record()) == nil
+}
+
+// isLockWaitWithoutEntry reports whether err is a lock acquire that gave up
+// without entering the work its lock guards. That is a wait that ran out
+// (pve.ErrClusterLockTimeout), an acquire that could not tell who holds the
+// lock (pve.ErrClusterLockStateUnknown), one that confirmed its claim too late
+// to use it (pve.ErrClusterLockClaimTooShort), a wait a cancelled request cut
+// short (pve.ErrClusterLockInterrupted), and a mutation the guard refused on
+// an ended request (errManagedRequestEnded). It is only the first test a clean
+// timeout passes. The callers also judge the guard and the journaled steps.
+func isLockWaitWithoutEntry(err error) bool {
+	return errors.Is(err, pve.ErrClusterLockTimeout) || errors.Is(err, pve.ErrClusterLockStateUnknown) ||
+		errors.Is(err, pve.ErrClusterLockClaimTooShort) || errors.Is(err, pve.ErrClusterLockInterrupted) ||
+		errors.Is(err, errManagedRequestEnded)
 }
 
 // cleanTailRefusal reports whether an operation failed only because the

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,17 @@ type parkerQEMU struct {
 	attached map[int]map[string]string
 }
 
+// withParkerAnsweredDigest gives cfg the digest PVE puts in every config
+// answer when the test set none, and returns cfg. A parker description write
+// refuses a read without a digest, because a write built from it could erase
+// records it never saw.
+func withParkerAnsweredDigest(cfg map[string]any) map[string]any {
+	if _, ok := cfg["digest"]; !ok {
+		cfg["digest"] = "fake-answered-digest"
+	}
+	return cfg
+}
+
 func (q *parkerQEMU) Config(_ context.Context, node string, vmid int) (map[string]any, error) {
 	var base map[string]any
 	if q.configFn != nil {
@@ -109,9 +121,14 @@ func (q *parkerQEMU) Config(_ context.Context, node string, vmid int) (map[strin
 		for slot, volid := range slots {
 			merged[slot] = volid
 		}
-		return merged, nil
+		return withParkerAnsweredDigest(merged), nil
 	}
-	return base, nil
+	// Copy before adding the digest, so the test's own map stays as written.
+	out := make(map[string]any, len(base)+1)
+	for k, v := range base {
+		out[k] = v
+	}
+	return withParkerAnsweredDigest(out), nil
 }
 
 func (q *parkerQEMU) Create(_ context.Context, node string, params map[string]any) (string, error) {
@@ -153,8 +170,13 @@ func (q *parkerQEMU) AttachDisk(_ context.Context, node string, vmid int, volid,
 
 func (q *parkerQEMU) DetachDisk(_ context.Context, node string, vmid int, diskID string) error {
 	if q.detachFn != nil {
-		return q.detachFn(node, vmid, diskID)
+		if err := q.detachFn(node, vmid, diskID); err != nil {
+			return err
+		}
 	}
+	// A detached slot no longer holds what AttachDisk recorded there, so later
+	// config reads must stop showing it.
+	delete(q.attached[vmid], diskID)
 	return nil
 }
 
@@ -2795,12 +2817,18 @@ func TestParkerProvenance_ForeignSentinelKeysPreservedRoundTrip(t *testing.T) {
 		NowFunc:        fixedClock(time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)),
 	}
 
-	// descState tracks the current description as UpdateQemuConfig writes it.
+	// descState tracks the current description as UpdateQemuConfig writes it,
+	// and slotHeld tracks whether the parker's scsi0 still holds the disk, which
+	// the unpark's detach clears.
 	descState := seededDesc
+	slotHeld := true
 	nodesSvc := &parkerNodesService{
 		updateFn: func(_, _ string, params *sdknodes.UpdateQemuConfigParams) error {
 			if params.Description != nil {
 				descState = *params.Description
+			}
+			if params.Delete != nil && slices.Contains(strings.Split(*params.Delete, ","), "scsi0") {
+				slotHeld = false
 			}
 			return nil
 		},
@@ -2862,16 +2890,29 @@ func TestParkerProvenance_ForeignSentinelKeysPreservedRoundTrip(t *testing.T) {
 	}
 
 	// Unpark phase: configure the QEMU config to show disk at scsi0 so
-	// IsDiskParked returns parked=true.
+	// IsDiskParked returns parked=true, until the unpark detaches it. The
+	// removal keeps the record while the parker still holds the volume.
 	qemuSvc.configFn = func(_ string, vmid int) (map[string]any, error) {
 		if vmid == parkerVMID {
-			return map[string]any{
+			// PVE answers every config read with a digest, and the
+			// provenance removal writes only with one.
+			cfg := map[string]any{
 				"tags":        "bosh-parker",
-				"scsi0":       bareVolid,
 				"description": descState,
-			}, nil
+				"digest":      "digest-0",
+			}
+			if slotHeld {
+				cfg["scsi0"] = bareVolid
+			}
+			return cfg, nil
 		}
 		return map[string]any{}, nil
+	}
+	qemuSvc.detachFn = func(_ string, vmid int, diskID string) error {
+		if vmid == parkerVMID && diskID == "scsi0" {
+			slotHeld = false
+		}
+		return nil
 	}
 	// Reset cluster list to always return parker (unpark path uses IsDiskParked
 	// which does a cluster scan).

@@ -206,9 +206,11 @@ func TestUpdateDiskOverlay_RoundTrip(t *testing.T) {
 	const birth = "data:vm-9001-disk-0"
 	attachedVolid := "data:vm-700-disk-1"
 	c := newIDFakeClient(map[int]map[string]any{
-		700:   {"scsi1": attachedVolid + ",serial=" + idTestToken + ",size=10G"},
-		701:   {},
-		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true},
+		700: {"scsi1": attachedVolid + ",serial=" + idTestToken + ",size=10G"},
+		701: {},
+		// PVE answers every config read with a digest, and the parker's
+		// provenance removal writes only with one.
+		90000: {"tags": "bosh-cpi;bosh-parker", "protection": true, "digest": "digest-0"},
 	})
 	deps := overlayTestDeps(c)
 	diskCID := overlayCID(t, birth, &pve.DiskCIDMeta{ID: idTestToken, Anchor: true, Opts: map[string]string{"cache": cmNone}})

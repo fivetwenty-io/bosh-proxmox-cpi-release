@@ -21,8 +21,10 @@ const detachTailAttempts = 3
 // write that the lifecycle guard refused because the digest it carried no
 // longer matched the guard's own read. Nothing was journaled or sent, so begin
 // hands the refusal back as not attempted and leaves the guard usable, and the
-// caller reads the VM again.
-var errManagedDescriptionDigestStale = errors.New("managed config generation changed before a description write")
+// caller reads the VM again. It wraps pve.ErrConfigDigestStale, so a writer in
+// the pve package, such as a parker provenance write, sees the same refusal it
+// would get from PVE and retries from a fresh read.
+var errManagedDescriptionDigestStale = fmt.Errorf("managed config generation changed before a description write: %w", pve.ErrConfigDigestStale)
 
 // errManagedTailReadFailed marks the refusal of the detach tail's removal write
 // when one of the lifecycle guard's own reads before that write returned an
@@ -372,6 +374,19 @@ func intentSourceVMID(intent *pve.DiskTransferIntent) (int, bool) {
 	return vmid, true
 }
 
+// callerSentDescriptionDigest reports whether fields, the parameters a
+// config write carried when its caller handed it to the lifecycle guard and
+// before the guard stamped its own digest, are exactly a description and the
+// caller's digest.
+func callerSentDescriptionDigest(fields map[string]any) bool {
+	if len(fields) != 2 {
+		return false
+	}
+	_, description := fields[pveConfigKeyDescription]
+	digest, ok := fields["digest"].(string)
+	return description && ok && digest != ""
+}
+
 // descriptionOnlyConfigWrite reports whether call is a configuration write
 // whose parameters are exactly a description and a digest.
 func descriptionOnlyConfigWrite(call ManagedAllocationMutation) bool {
@@ -392,15 +407,33 @@ func descriptionOnlyConfigWrite(call ManagedAllocationMutation) bool {
 // the VM is locked. qemu-server's update_vm_api checks the digest under the
 // VM's lock before it writes anything, so the digest refusal changed nothing,
 // and the 4xx and locked-500 refusals are answers PVE gives instead of a write.
-// The step is observed with no volume once a fresh read shows the VM still
-// carrying every note the write meant to remove, each as it was before the
-// write. Those notes are an allocation entry, an attached-disk entry, and a
-// drive-option overlay. Anything else, including a failure PVE may not have
-// answered, stays with the guard's usual handling.
+//
+// A digest refusal of a write whose caller sent its own digest settles at
+// once, whatever the description adds or removes. Such a caller built the
+// description from a read carrying that digest, the guard confirmed before
+// sending that its own read carried the same one, and PVE's refusal under the
+// lock says the config changed after both reads, so the refusal itself proves
+// nothing was written. The caller, such as a parker provenance write, reads
+// again and retries, which it can only do while the guard stays usable.
+//
+// Any other settled refusal needs more proof. The step is observed with no
+// volume once a fresh read shows the VM still carrying every note the write
+// meant to remove, each as it was before the write. Those notes are an
+// allocation entry, an attached-disk entry, and a drive-option overlay.
+// Anything else, including a write that changes a disk key, a digest refusal
+// of a write whose digest only the guard stamped, and a failure PVE may not
+// have answered, stays with the guard's usual handling.
 func (g *managedDiskLifecycleGuard) settleRefusedDescription(ctx context.Context, call ManagedAllocationMutation, step string, writeErr error) bool {
 	observation, ok := g.observations[step]
 	if !ok || ctx.Err() != nil || !descriptionOnlyConfigWrite(call) {
 		return false
+	}
+	if pve.IsConfigDigestRefusal(writeErr) && callerSentDescriptionDigest(observation.fields) {
+		if err := storageMutationObserved(g.lifecycle.handle, step, nil, false); err != nil {
+			return false
+		}
+		delete(g.observations, step)
+		return true
 	}
 	if !pve.IsConfigDigestRefusal(writeErr) && !pve.IsAnsweredConfigRefusal(writeErr) {
 		return false

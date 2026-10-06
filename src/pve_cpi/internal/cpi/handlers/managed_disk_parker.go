@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -72,6 +74,9 @@ func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, v
 		Failed: func(_ context.Context, call ManagedAllocationMutation, _ string, _ error) error {
 			return storageAllocationUncertain(handle, "parker "+call.Service+"."+call.Method)
 		},
+		SettleFailedWrite: func(ctx context.Context, call ManagedAllocationMutation, step string, writeErr error) bool {
+			return settleRefusedParkerDescription(ctx, m.deps.PVE, handle, call, step, writeErr, m.plan.Node)
+		},
 	})
 	if err != nil {
 		return err
@@ -93,6 +98,43 @@ func (m *managedDiskRequest) park(ctx context.Context, handle *aj.Handle, cid, v
 	// uncertain allocation that needs reconciliation.
 	sweepParkerPool(ctx, m.deps, m.plan.Node, cfg)
 	return nil
+}
+
+// settleRefusedParkerDescription settles a parker provenance write that PVE
+// refused for a stale digest. The provenance writer sends each description
+// write with the digest of the read it built the description from, so PVE
+// refuses the write when another request wrote the parker in between, and
+// qemu-server checks that digest under the VM's lock before it writes
+// anything. The refusal therefore changed nothing, and the writer reads the
+// parker again and retries, which it can only do while the guard stays usable.
+// The step is observed with no volume once a fresh read shows the parker's
+// digest has moved past the one the write carried, which is what the refusal
+// says happened. Anything else, including a failure PVE may not have answered,
+// stays with the guard's usual handling and makes the allocation uncertain.
+func settleRefusedParkerDescription(
+	ctx context.Context, client pve.Client, handle *aj.Handle,
+	call ManagedAllocationMutation, step string, writeErr error, defaultNode string,
+) bool {
+	if ctx.Err() != nil || client == nil || handle == nil || !descriptionOnlyConfigWrite(call) || !pve.IsConfigDigestRefusal(writeErr) {
+		return false
+	}
+	params, ok := call.Args[managedArgumentParams].(*sdknodes.UpdateQemuConfigParams)
+	if !ok || params == nil || params.Digest == nil || *params.Digest == "" {
+		return false
+	}
+	node, vmid, err := managedDiskParkIdentity(call, defaultNode)
+	if err != nil {
+		return false
+	}
+	config, err := client.QEMU().Config(ctx, node, vmid)
+	if err != nil || config == nil {
+		return false
+	}
+	current, ok := pve.ConfigString(config, "digest")
+	if !ok || current == "" || current == *params.Digest {
+		return false
+	}
+	return storageMutationObserved(handle, step, nil, false) == nil
 }
 
 func managedDiskParkIdentity(call ManagedAllocationMutation, defaultNode string) (string, int, error) {
@@ -188,8 +230,29 @@ func (m *managedDiskRequest) observeParkMutation(ctx context.Context, handle *aj
 			return err
 		}
 	}
+	return m.parkFieldsReadBack(config, fields, call.Method)
+}
+
+// parkFieldsReadBack checks that the parker's config, read back after a
+// create or config write sent by method, carries every field the CPI sent.
+func (m *managedDiskRequest) parkFieldsReadBack(config, fields map[string]any, method string) error {
+	_, sentDigest := fields["digest"]
 	for key, want := range fields {
 		if key == metadataKeyVMID || key == "digest" {
+			continue
+		}
+		if key == pveConfigKeyDescription && sentDigest && method != "Create" && m.token != "" {
+			// A description write that carried its digest landed exactly as
+			// sent, because PVE checks the digest under the parker's lock
+			// before it writes. Another request may have written the parker
+			// since, so only our own record has to read back as we wrote it,
+			// and every other record may read anything.
+			// VerifyAllocationParked checks the record's identity afterwards.
+			sent, _ := want.(string)
+			current, _ := pve.ConfigString(config, pveConfigKeyDescription)
+			if !pve.ParkerRecordLanded(sent, current, m.token) {
+				return fmt.Errorf("parker %s readback mismatch", key)
+			}
 			continue
 		}
 		got, ok := config[key]

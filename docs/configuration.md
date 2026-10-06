@@ -570,6 +570,8 @@ When enabled, `create_vm` polls the QEMU guest agent after the VM starts, waitin
 
 Exponential-backoff parameters for storage imports, VMID allocation, task polling, and HTTP 429 pushback. All properties default to `0`, applying the built-in value described in each row. Override only when the built-in values do not suit your cluster's latency profile.
 
+The pushback and storage-lock curves, meaning their `base_ms` and `cap_ms` and the storage-lock curve's `jitter_pct`, also set how long the parker protection lock lasts, the protection restore and unused-slot sweep deadlines inside it, and how long a journal-managed disk call waits for the lock. They act in both directions, and whichever curve is longer at each retry is the one that counts. A longer curve lengthens all of these, and a shorter one shortens them, though the lock never drops below 180 seconds. On the shipped curves the lock lasts 235 seconds.
+
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `pve.retry.storage_import.max_attempts` | Integer | `0` (→ handler budget) | Maximum attempts for the storage-import retry loop (serialized disk/template imports under a storage lock). `0` keeps the built-in per-handler budget (`create_vm`: 10). Raise on slow Ceph where lock windows are wide. |
@@ -582,12 +584,12 @@ Exponential-backoff parameters for storage imports, VMID allocation, task pollin
 | `pve.retry.task_poll.base_ms` | Integer | `0` (→ 2000 ms) | PVE task poll interval in milliseconds. Raise to reduce API pressure on large clusters. |
 | `pve.retry.task_poll.cap_ms` | Integer | `0` (→ 10000 ms) | Maximum PVE task poll interval in milliseconds; the poller backs off toward this value. Clamped up to `base_ms` if smaller. |
 | `pve.retry.task_poll.jitter_pct` | Integer | `0` (→ 10%) | Plus/minus jitter percentage (0–100) applied to each task poll interval. |
-| `pve.retry.pushback.base_ms` | Integer | `0` (→ 5000 ms) | Initial backoff in milliseconds for HTTP 429 pushback responses from PVE. Longer than the storage-lock curve by design. |
+| `pve.retry.pushback.base_ms` | Integer | `0` (→ 5000 ms) | Initial backoff in milliseconds for HTTP 429 pushback responses from PVE. Longer than the storage-lock curve by design. This curve also sizes the parker protection lock, as the note above this table describes. |
 | `pve.retry.pushback.cap_ms` | Integer | `0` (→ 60000 ms) | Maximum pushback backoff in milliseconds. Clamped up to `base_ms` if smaller. |
 | `pve.retry.transient.max_attempts` | Integer | `0` (→ 8) | Maximum attempts for transport-layer transient retries (pvedaemon worker recycling, connection refusals, request timeouts). The backoff curve for this class is fixed (1 s growing to 15 s, plus or minus 30 percent jitter) and is not configurable. |
 | `pve.retry.storage_upload.max_attempts` | Integer | `0` (→ 30) | Maximum attempts for the storage upload retry loops (stemcell image and per-VM ConfigDrive ISO uploads): roughly six minutes on the transient curve, roughly twelve when storage-lock contention dominates. Each attempt reopens the file and re-sends the upload; the backoff curve is selected per fault from the shared transient and storage-lock curves. |
 | `pve.retry.storage_lock.max_attempts` | Integer | `0` (→ 10) | Maximum attempts for the inner PVE storage-lock retry loop (`"got timeout waiting for worker"` / `"storage locked"` signal) in `create_disk` and `create_vm`. Primary knob; `storage_import.max_attempts` is honored as a legacy fallback when this is unset. |
-| `pve.retry.storage_lock.base_ms` | Integer | `0` (→ 2000 ms) | Base delay in milliseconds for the storage-lock exponential backoff (`base × 1.5^attempt`). |
+| `pve.retry.storage_lock.base_ms` | Integer | `0` (→ 2000 ms) | Base delay in milliseconds for the storage-lock exponential backoff (`base × 1.5^attempt`). This curve also sizes the parker protection lock, as the note above this table describes. |
 | `pve.retry.storage_lock.cap_ms` | Integer | `0` (→ 30000 ms) | Maximum delay in milliseconds for the storage-lock backoff. Must be ≥ `base_ms` when both are set. |
 | `pve.retry.storage_lock.jitter_pct` | Integer | `0` (→ 30%) | Plus/minus jitter percentage (0–100) applied to each storage-lock backoff delay. |
 | `pve.retry.disk_migrate.max_attempts` | Integer | `0` (→ 4) | Maximum attempts for transient retries of the cross-node disk-migration request `attach_disk` issues when `pve.disk_migration` resolves to `on_attach`. The request runs while the mover's protection flag is down, so a long budget widens that window. |
@@ -601,7 +603,7 @@ Opt-in per-method deadline envelopes. When enabled, each CPI method runs under a
 |---|---|---|---|
 | `pve.operation_timeout.enabled` | Boolean | `false` | Opt-in per-method deadline envelope. When `true`, each CPI method runs under a context deadline sized by its class. Default `false` (no deadline; behavior identical to prior releases). |
 | `pve.operation_timeout.create_sec` | Integer | `0` (→ 1800 s) | Deadline in seconds for `create_*` methods. `0` applies the built-in 1800 s. Honored only when `operation_timeout.enabled` is `true`. |
-| `pve.operation_timeout.delete_sec` | Integer | `0` (→ 900 s) | Deadline in seconds for `delete_*` methods. `0` applies the built-in 900 s. Honored only when `operation_timeout.enabled` is `true`. |
+| `pve.operation_timeout.delete_sec` | Integer | `0` (→ 900 s) | Deadline in seconds for `delete_*` methods. `0` applies the built-in 900 s. Honored only when `operation_timeout.enabled` is `true`. A `delete_vm` that holds several disks whose parkers other requests have locked can need more than the default, so we raise `delete_sec` when we enable the timeout. |
 | `pve.operation_timeout.query_sec` | Integer | `0` (→ 120 s) | Deadline in seconds for read-only methods (`info`, `has_vm`, `has_disk`, `get_disks`, `calculate_vm_cloud_properties`). `0` applies the built-in 120 s. When `has_disk` waits for another call on the same disk, it keeps the last 10 s to look at the disk again, so a value well over 10 s is needed. Honored only when `operation_timeout.enabled` is `true`. |
 | `pve.operation_timeout.default_sec` | Integer | `0` (→ 600 s) | Deadline in seconds for all other mutating methods (`reboot_vm`, `attach_disk`, `detach_disk`, `resize_disk`, `snapshot_disk`, `set_*_metadata`, `update_disk`). `0` applies the built-in 600 s. Honored only when `operation_timeout.enabled` is `true`. |
 

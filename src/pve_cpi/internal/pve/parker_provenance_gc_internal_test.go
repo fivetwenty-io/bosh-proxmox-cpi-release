@@ -37,6 +37,11 @@ func (c *provFakeClient) QEMU() qemu.Service {
 			for k, v := range c.cfg {
 				out[k] = v
 			}
+			// Real PVE answers every config read with a digest, and the
+			// provenance writer refuses to build a write from a read without one.
+			if _, ok := out["digest"]; !ok {
+				out["digest"] = "prov-fake-digest"
+			}
 			return out, nil
 		},
 	}

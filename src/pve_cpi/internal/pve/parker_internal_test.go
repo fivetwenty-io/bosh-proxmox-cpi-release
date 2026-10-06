@@ -684,9 +684,9 @@ func TestWithParkerProtectionLock_StealsExpiredHolder(t *testing.T) {
 // runs its body.
 func TestParkerWindowDeadline(t *testing.T) {
 	t.Parallel()
-	reserve := parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve
-	if parkerWindowReserve != reserve {
-		t.Fatalf("parkerWindowReserve = %v, want %v", parkerWindowReserve, reserve)
+	reserve := parkerLockReleaseTimeout + parkerDemotedSweepTimeoutNow() + parkerProtectionRestoreReserveNow()
+	if got := parkerWindowReserveNow(); got != reserve {
+		t.Fatalf("parkerWindowReserveNow() = %v, want %v", got, reserve)
 	}
 	now := time.Unix(10_000, 0)
 	h := &ClusterLockHandle{expiry: now.Add(parkerProtectionLockTTL)}
@@ -753,7 +753,7 @@ func TestWithParkerProtectionLock_DeadlineFollowsTheClaim(t *testing.T) {
 	if !ok {
 		t.Fatalf("the sentinel held no claim inside the window: %q", recorded)
 	}
-	want := expiry.Add(-(parkerLockReleaseTimeout + parkerDemotedSweepTimeout + parkerProtectionRestoreReserve))
+	want := expiry.Add(-(parkerLockReleaseTimeout + parkerDemotedSweepTimeoutNow() + parkerProtectionRestoreReserveNow()))
 	if !deadline.Equal(want) {
 		t.Fatalf("window deadline = %v, want the recorded expiry %v less the reserve, %v (off by %v)",
 			deadline, expiry, want, deadline.Sub(want))
@@ -770,8 +770,8 @@ func TestWithParkerProtectionLock_DeadlineFollowsTheClaim(t *testing.T) {
 func TestParkerRestoreReserveCoversTheRetryCurve(t *testing.T) {
 	t.Parallel()
 	worst := RetryOnTransientOrLockSleepBudget(parkerWindowMaxAttempts) + time.Duration(parkerWindowMaxAttempts)*clusterLockRoundTrip
-	if worst > parkerProtectionRestoreReserve {
-		t.Fatalf("the restore can take %v at worst, over its %v reserve", worst, parkerProtectionRestoreReserve)
+	if reserve := parkerProtectionRestoreReserveNow(); worst > reserve {
+		t.Fatalf("the restore can take %v at worst, over its %v reserve", worst, reserve)
 	}
 }
 
