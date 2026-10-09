@@ -20,7 +20,9 @@ import (
 
 // unsettledRetainStep is the refusal a delete_vm retry meets when the first
 // delete failed its ephemeral retention transfer and left that step planned.
-const unsettledRetainStep = "cleanup has unresolved mutation evidence; step attempt-0-step-7 (lifecycle_delete_vm_retain_ephemeral_Nodes_CreateQemuMoveDisk) is planned"
+// The steps before it include the per-disk transfer lock's pool create, which
+// the retention takes before the parker lock.
+const unsettledRetainStep = "cleanup has unresolved mutation evidence; step attempt-0-step-8 (lifecycle_delete_vm_retain_ephemeral_Nodes_CreateQemuMoveDisk) is planned"
 
 // TestDeleteVMRetryNamesTheUnsettledStep fails a delete_vm's retention
 // transfer and retries it. The retry refuses on the planned transfer step,

@@ -71,6 +71,11 @@ type idFakeClient struct {
 	// the pending model says, the way a status read that lands just before
 	// the VM starts does.
 	staleStopped map[int]bool
+	// released holds volumes a slot delete took off a VM that doesn't own
+	// them, so no unused entry names them while they still exist on storage.
+	// The storage content listing serves them alongside every volume a config
+	// names.
+	released map[string]bool
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -250,6 +255,12 @@ func (n *idFakeNodes) UpdateQemuConfig(_ context.Context, _ string, vmidStr stri
 		if raw, present := cfg[slot]; present {
 			bare := n.c.bareOf(raw.(string))
 			delete(cfg, slot)
+			if !strings.HasPrefix(slot, "unused") && !fakeVolumeOwnedBy(bare, vmid) {
+				if n.c.released == nil {
+					n.c.released = map[string]bool{}
+				}
+				n.c.released[bare] = true
+			}
 			if !strings.HasPrefix(slot, "unused") && fakeVolumeOwnedBy(bare, vmid) {
 				for i := 0; ; i++ {
 					key := fmt.Sprintf("unused%d", i)
@@ -524,6 +535,45 @@ func TestDiskHandlersRouteThroughIdentityResolver(t *testing.T) {
 func (cl *idFakeCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
 	empty := sdkcluster.ListStatusResponse{}
 	return &empty, nil
+}
+
+// fakeDriveKeyPattern matches the config keys that name a volume.
+var fakeDriveKeyPattern = regexp.MustCompile(`^(?:scsi|virtio|sata|ide|unused|efidisk|tpmstate)\d+$`)
+
+// ListStorageContent lists every volume of storage that a config names or a
+// slot delete released and that no sweep destroyed, the way an unfiltered
+// content listing shows what exists on the storage.
+func (n *idFakeNodes) ListStorageContent(
+	_ context.Context, _, storage string, _ *sdknodes.ListStorageContentParams,
+) (*sdknodes.ListStorageContentResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	present := map[string]bool{}
+	for v := range n.c.released {
+		present[v] = true
+	}
+	for _, cfg := range n.c.configs {
+		for key, raw := range cfg {
+			if val, ok := raw.(string); ok && fakeDriveKeyPattern.MatchString(key) {
+				present[n.c.bareOf(val)] = true
+			}
+		}
+	}
+	for _, gone := range n.c.destroyed {
+		delete(present, gone)
+	}
+	resp := sdknodes.ListStorageContentResponse{}
+	for v := range present {
+		if !strings.HasPrefix(v, storage+":") {
+			continue
+		}
+		b, err := json.Marshal(map[string]any{"volid": v})
+		if err != nil {
+			return nil, err
+		}
+		resp = append(resp, b)
+	}
+	return &resp, nil
 }
 
 // ListNodes reports an empty node list; the standalone-membership

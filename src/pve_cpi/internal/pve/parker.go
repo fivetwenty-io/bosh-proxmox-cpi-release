@@ -593,6 +593,23 @@ func writeParkerProvenance(
 	return err
 }
 
+// writeParkerTransferIntent is writeParkerProvenance for a detach-side
+// transfer's intent record, in intent mode. It replaces a record the fresh read
+// keeps under key the way replace mode does, so an intent left by an earlier
+// transfer of the disk that never finished is overwritten. It refuses with a
+// *ParkerRecordFinishedError, and writes nothing, when the record under key is
+// finished, which means one of the parker's disk slots already carries key as
+// its serial. That record belongs to a transfer that landed the disk here, and
+// an intent written over it would name a volume and a slot the disk no longer
+// has.
+func writeParkerTransferIntent(
+	ctx context.Context, c Client, logger *log.Logger,
+	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
+) error {
+	_, err := writeParkerProvenanceCollecting(ctx, c, logger, node, parkerVMID, key, entry, cfg, parkerProvIntent)
+	return err
+}
+
 // rewriteParkerProvenance is writeParkerProvenance in update mode, for the
 // writes that move a transfer's record on after its intent was written: the
 // transfer's finalize, the resumed transfer's finalize, a resume's fallback
@@ -620,7 +637,72 @@ const (
 	// parkerProvUpdate writes the caller's entry but keeps the recorded
 	// entry's option overrides when the recorded entry is this transfer's.
 	parkerProvUpdate
+	// parkerProvIntent writes the caller's entry over the recorded one, like
+	// parkerProvReplace, except over a finished record, which it refuses (see
+	// writeParkerTransferIntent).
+	parkerProvIntent
 )
+
+// errParkerRecordFinished is what a *ParkerRecordFinishedError matches with
+// errors.Is.
+var errParkerRecordFinished = errors.New("parker already keeps a finished transfer record for the disk")
+
+// ParkerRecordFinishedError is the refusal of an intent write whose key names
+// a finished record: the parker keeps a record for the disk, and its slot Slot
+// carries the disk's serial on volume Volid. The disk is already parked there.
+type ParkerRecordFinishedError struct {
+	ParkerVMID int
+	StableID   string
+	Slot       string
+	Volid      string
+}
+
+func (e *ParkerRecordFinishedError) Error() string {
+	return fmt.Sprintf("parker vmid %d already keeps a finished transfer record for disk %s, whose serial is on slot %s as %s, "+
+		"so the intent record was not written over it", e.ParkerVMID, e.StableID, e.Slot, e.Volid)
+}
+
+// Is matches errParkerRecordFinished.
+func (e *ParkerRecordFinishedError) Is(target error) bool { return target == errParkerRecordFinished }
+
+// parkerSlotCarryingSerial returns the first bus slot of vmCfg, in slot order,
+// whose drive line carries stableID as its serial, with the bare volume on it.
+// Only a slot counts, because an unused entry carries no options.
+func parkerSlotCarryingSerial(vmCfg map[string]any, stableID string) (slot, volid string, ok bool) {
+	if stableID == "" {
+		return "", "", false
+	}
+	disks := qemu.ParseDisks(vmCfg)
+	keys := make([]string, 0, len(disks))
+	for key := range disks {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if strings.HasPrefix(key, "unused") {
+			continue
+		}
+		if serial, has := StableIDFromDriveOptStr(disks[key]); has && serial == stableID {
+			return key, bareDriveVolid(disks[key]), true
+		}
+	}
+	return "", "", false
+}
+
+// finishedParkerRecord reports the refusal an intent write under key gets
+// from vmCfg, which is a *ParkerRecordFinishedError when vmCfg keeps a record
+// under key and one of its slots carries key as its serial, and nil otherwise.
+func finishedParkerRecord(vmCfg map[string]any, parkerVMID int, key string) error {
+	_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	if _, recorded := disks[key]; !recorded {
+		return nil
+	}
+	slot, volid, carried := parkerSlotCarryingSerial(vmCfg, key)
+	if !carried {
+		return nil
+	}
+	return &ParkerRecordFinishedError{ParkerVMID: parkerVMID, StableID: key, Slot: slot, Volid: volid}
+}
 
 // withRecordedOpts returns entry with the option overrides vmCfg's record
 // under key carries, when that record belongs to the same transfer as entry.
@@ -664,8 +746,14 @@ func writeParkerProvenanceCollecting(
 			now := provenanceNow(ctx, cfg)
 			held = parkerProvenanceSourceKeeps(ctx, c, logger, node, parkerVMID, vmCfg, key, now, cfg)
 			write := entry
-			if mode == parkerProvUpdate {
+			switch mode {
+			case parkerProvUpdate:
 				write = withRecordedOpts(vmCfg, key, entry)
+			case parkerProvIntent:
+				if finished := finishedParkerRecord(vmCfg, parkerVMID, key); finished != nil {
+					return "", false, finished
+				}
+			case parkerProvReplace:
 			}
 			desc, collected, projectErr := projectParkerProvenance(vmCfg, node, parkerVMID, key, write, now, held)
 			pruned = collected
@@ -2471,8 +2559,10 @@ func parkerLockUnserialized(ctx context.Context) bool {
 //
 // The key is the same "vm-<vmid>" scheme the handlers use for per-VMID
 // read-modify-write serialization, so a parker is serialized under one name
-// cluster-wide. Nothing here ever holds a second lock, so there is no ordering
-// to deadlock on.
+// cluster-wide. Nothing inside a window ever takes a second lock. The one lock
+// that can be held around a window is a detach-side transfer's per-disk lock
+// (withDiskTransferLock), which is always taken before this one and never
+// inside it, so the order is fixed and there is nothing to deadlock on.
 //
 // Two cases proceed unlocked and say so. One is a missing pool service, and the
 // other is a lock create that PVE refused outright, such as for an identity

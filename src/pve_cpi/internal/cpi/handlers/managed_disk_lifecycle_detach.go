@@ -28,6 +28,33 @@ func (c *managedDiskLifecycleClient) deletesHolder(vmid int) bool {
 	return c.lifecycle.holders != nil && c.lifecycle.holders.createdHolder(vmid)
 }
 
+// ObserveDiskRelocated follows the managed disk to the volume name a
+// transfer's re-resolve found it under, the way observeMove follows a move the
+// guard observed, so the guard's later checks, such as prepareMove's refusal
+// of a source that no longer names the disk, compare against the disk's live
+// name. It refuses a relocation of another disk, one that doesn't start from
+// the name the guard holds, and one onto a different physical backing, and in
+// each case the guard keeps the name it had.
+func (c *managedDiskLifecycleClient) ObserveDiskRelocated(ctx context.Context, stableID, from, to string) error {
+	m := c.lifecycle
+	if stableID != m.disk.stableID {
+		return fmt.Errorf("relocation names another disk")
+	}
+	if from != m.disk.volid {
+		return fmt.Errorf("relocation does not start from the managed disk's volume")
+	}
+	storage, _, err := pve.ParseDiskCID(to)
+	if err != nil {
+		return fmt.Errorf("relocated volume names no storage")
+	}
+	backing, err := managedDiskActualBacking(ctx, m.deps, storage)
+	if err != nil || backing != m.diskBacking() {
+		return fmt.Errorf("relocation changed physical storage backing")
+	}
+	m.disk.volid = to
+	return nil
+}
+
 func (c *managedDiskLifecycleClient) QEMU() qemu.Service {
 	return &managedDiskLifecycleQEMU{Service: c.Client.QEMU(), client: c.Client, lifecycle: c.lifecycle}
 }

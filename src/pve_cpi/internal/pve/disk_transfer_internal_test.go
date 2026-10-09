@@ -77,6 +77,18 @@ type scanFakeClient struct {
 	// every revert succeed without dropping the pending delete.
 	revertErr          error
 	revertKeepsPending bool
+	// released holds volumes a slot delete took off a VM that doesn't own
+	// them, which no config names afterwards while they still sit on
+	// storage. unlistedVolumes hides volumes from the storage content
+	// listing, the way a volume something else renamed or removed is gone
+	// from it, and the listing serves every other volume a config names or
+	// a delete released.
+	released        map[string]bool
+	unlistedVolumes map[string]bool
+	// attachErr, when set, fails every AttachDisk with it, and attachCalls
+	// counts every AttachDisk, refused ones included.
+	attachErr   error
+	attachCalls int
 }
 
 func newScanFakeClient(configs map[int]map[string]any) *scanFakeClient {
@@ -157,6 +169,10 @@ func (c *scanFakeClient) QEMU() qemu.Service {
 		attachDiskFn: func(_ context.Context, _ string, vmid int, volid, _ string, opts *qemu.AttachOpts) (string, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
+			c.attachCalls++
+			if c.attachErr != nil {
+				return "", c.attachErr
+			}
 			cfg, ok := c.configs[vmid]
 			if !ok {
 				return "", fmt.Errorf("fake: no config for vmid %d", vmid)
@@ -239,6 +255,7 @@ func (c *scanFakeClient) Nodes() sdknodes.Service {
 		},
 		updateQemuConfigFn:   c.updateQemuConfig,
 		createQemuMoveDiskFn: c.createQemuMoveDisk,
+		listStorageContentFn: c.listStorageContent,
 		qemuConfigFn:         c.QEMU().Config,
 		listQemuPendingFn:    c.listQemuPending,
 		// The authoritative per-node listing the parker and holder scans now
@@ -414,6 +431,12 @@ func (c *scanFakeClient) deleteConfigKeyLocked(cfg map[string]any, vmid int, slo
 		bare = bare[:comma]
 	}
 	delete(cfg, slot)
+	if !strings.HasPrefix(slot, "unused") && !scanFakeOwns(bare, vmid) {
+		if c.released == nil {
+			c.released = map[string]bool{}
+		}
+		c.released[bare] = true
+	}
 	if !strings.HasPrefix(slot, "unused") && scanFakeOwns(bare, vmid) {
 		for i := 0; ; i++ {
 			key := fmt.Sprintf("unused%d", i)
@@ -424,6 +447,53 @@ func (c *scanFakeClient) deleteConfigKeyLocked(cfg map[string]any, vmid int, slo
 		}
 	}
 	c.logEvent("config-delete:%d:%s:%s", vmid, slot, bare)
+}
+
+// scanFakeDriveKeyPattern matches the config keys that name a volume.
+var scanFakeDriveKeyPattern = regexp.MustCompile(`^(?:scsi|virtio|sata|ide|unused|efidisk|tpmstate)\d+$`)
+
+// listStorageContent serves an unfiltered content listing of storage. It
+// lists every volume a config names or a slot delete released, less the
+// volumes PVE destroyed and the ones the test hid.
+func (c *scanFakeClient) listStorageContent(
+	_ context.Context, _, storage string, _ *sdknodes.ListStorageContentParams,
+) (*sdknodes.ListStorageContentResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	present := map[string]bool{}
+	for volid := range c.released {
+		present[volid] = true
+	}
+	for _, cfg := range c.configs {
+		for key, raw := range cfg {
+			if val, ok := raw.(string); ok && scanFakeDriveKeyPattern.MatchString(key) {
+				bare := val
+				if comma := strings.IndexByte(bare, ','); comma >= 0 {
+					bare = bare[:comma]
+				}
+				present[bare] = true
+			}
+		}
+	}
+	for _, gone := range c.destroyed {
+		delete(present, gone)
+	}
+	volids := make([]string, 0, len(present))
+	for volid := range present {
+		if c.storageOf(volid) == storage && !c.unlistedVolumes[volid] {
+			volids = append(volids, volid)
+		}
+	}
+	sort.Strings(volids)
+	resp := sdknodes.ListStorageContentResponse{}
+	for _, volid := range volids {
+		b, err := json.Marshal(map[string]any{"volid": volid})
+		if err != nil {
+			return nil, err
+		}
+		resp = append(resp, b)
+	}
+	return &resp, nil
 }
 
 // scanFakeOwnerPattern is the fake's own copy of PVE's owner rule, kept apart
