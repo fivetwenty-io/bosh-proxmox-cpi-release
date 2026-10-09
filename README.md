@@ -169,6 +169,7 @@ See [Network configuration](docs/networks.md) for the full `cloud_properties` sc
 | `make coverage-html` | Write HTML coverage report to `src/pve_cpi/coverage.html` |
 | `make coverage-check` | Fail if total line coverage falls below `COVERAGE_THRESHOLD` |
 | `make check` | Run `vet`, `staticcheck`, `lint`, `test`, and `coverage-check` |
+| `make ci` | Run CI's checks in CI's pinned golang image under Docker, including the security scans when Go source or dependencies changed (`CI_SECURITY=1` forces them) |
 | `make bats` | Run the BOSH Acceptance Tests against the configured PVE lab |
 | `make fmt` | Format all Go sources with `gofmt` |
 | `make lint` | Run `golangci-lint` (pinned version via `go run` fallback) |

@@ -1,13 +1,39 @@
 #!/bin/sh
-# Pre-push gate: run the same `make check` the CI workflow runs, so a push
-# never lands a commit that CI will reject.
+# Pre-push gate: run `make ci`, which runs the CI workflows' checks inside the
+# workflows' own digest-pinned golang image under Docker. That covers the
+# linear-history and AI-attribution checks over the commits being pushed, the
+# `make check` gate, and the security scans when the push changes Go source,
+# go.mod, go.sum, or vendored code. A push that passes here should pass CI.
+# Docker has to be running, and the hook fails with a message when it is not.
+#
+# Git feeds this hook one "<local ref> <local sha> <remote ref> <remote sha>"
+# line per ref being pushed; we hand the shas to `make ci` as CI_RANGES.
 # Install with `make hooks`. Bypass once with SKIP_CHECKS=1 git push
-# (or git push --no-verify).
+# (or git push --no-verify). Force the security scans with CI_SECURITY=1.
 
 if [ -n "$SKIP_CHECKS" ]; then
-    echo "pre-push: SKIP_CHECKS set, skipping make check" >&2
+    echo "pre-push: SKIP_CHECKS set, skipping make ci" >&2
     exit 0
 fi
 
-echo "pre-push: running make check (SKIP_CHECKS=1 git push to bypass)" >&2
-exec make check
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "pre-push: Docker is not running, and make ci needs it to run CI's checks in CI's image." >&2
+    echo "pre-push: start Docker and push again, or bypass with SKIP_CHECKS=1 git push." >&2
+    exit 1
+fi
+
+ranges=
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -n "$local_sha" ] || continue
+    ranges="${ranges}${remote_sha} ${local_sha}
+"
+done
+
+if [ -z "$ranges" ]; then
+    exit 0
+fi
+
+echo "pre-push: running make ci (SKIP_CHECKS=1 git push to bypass)" >&2
+CI_RANGES=$ranges
+export CI_RANGES
+exec make ci

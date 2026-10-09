@@ -46,7 +46,17 @@ This runs all Go tests with race detection and writes the coverage profile to `s
 make check
 ```
 
-This runs the quick gates first, which are `artifacts-check`, `linear-check`, `fmt-check`, and `go-blob-check`, and it stops at the first of them that fails. It then runs the slower gates in three lanes at once. The test lane runs the suite once with race detection and collects coverage as it goes, and `coverage-check` then reads that profile instead of running the tests a second time. The analysis lane runs `vet`, `staticcheck`, and `lint`, and the scripts lane runs `erb-check` and `py-test`. Each lane stops at its own first failure, and `make check` fails if any lane fails. The test output streams as the tests run, and the other two lanes print their logs whole once every lane has finished, so a `lint` failure shows up after the test output rather than before it. When we want the old one-at-a-time order, `make check CHECK_LANES=0` runs the same gates serially. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+This runs the quick gates first, which are `artifacts-check`, `linear-check`, `attribution-check`, `ci-image-check`, `fmt-check`, and `go-blob-check`, and it stops at the first of them that fails. It then runs the slower gates in three lanes at once. The test lane runs the suite once with race detection and collects coverage as it goes, and `coverage-check` then reads that profile instead of running the tests a second time. The analysis lane runs `vet`, `staticcheck`, and `lint`, and the scripts lane runs `erb-check` and `py-test`. Each lane stops at its own first failure, and `make check` fails if any lane fails. The test output streams as the tests run, and the other two lanes print their logs whole once every lane has finished, so a `lint` failure shows up after the test output rather than before it. When we want the old one-at-a-time order, `make check CHECK_LANES=0` runs the same gates serially. CI runs the same target on every push, so a green `make check` locally means CI should pass too. The coverage gate is 80 percent.
+
+### Predicting CI before a push
+
+```bash
+make ci
+```
+
+A green `make check` on the Mac does not always mean a green CI run, because the workflows run in a digest-pinned `golang` container, they run the AI-attribution check over the commits being pushed, and the Security workflow runs scans that `make check` never touches. `make ci` closes that gap by running those same steps locally, inside that same image, under Docker. It runs the linear-history and attribution checks over the pushed range, then `make check REQUIRE_TOOLS=1`, then `make security REQUIRE_TOOLS=1` when the pushed range changes Go source, `go.mod`, `go.sum`, or vendored code. When the range changes none of those, it prints a one-line note and skips the scans. `CI_SECURITY=1 make ci` forces the scans, and `CI_SECURITY=0 make ci` skips them.
+
+We read the image reference from `.github/workflows/ci.yml`, so there is one place to bump it, and `make ci-image-check` (part of `make check`) fails when another workflow pins a different `golang` digest. The first run builds a small local layer on that digest that holds `python3`, PyYAML, `ruby`, and the pinned `staticcheck`, `golangci-lint`, `govulncheck`, `gosec`, and `trivy`, which are the tools the workflow steps install before they call `make`. The Go module cache, the Go build cache, and the trivy database live in a named Docker volume called `bosh-proxmox-cpi-ci-cache`, never in a host directory. `docker volume rm bosh-proxmox-cpi-ci-cache` starts them cold. The worktree is mounted as it stands, so uncommitted changes are tested too. The `golang` tag is a multi-architecture index, so an Apple Silicon Mac pulls the arm64 build and runs it natively, while CI runs the amd64 build of the same digest.
 
 ### Installing the git hooks
 
@@ -62,7 +72,7 @@ This points `core.hooksPath` at the repo's `.githooks/` directory. Two hooks run
 
 - `pre-push`
 
-  Runs the same `make check` suite CI runs, so a push never lands a commit CI will reject. Bypass one push with `SKIP_CHECKS=1 git push` when you know CI already covered the commit.
+  Runs `make ci` with the range being pushed, so a push never lands a commit CI will reject. Docker has to be running, and the hook stops with a message when it is not. Bypass one push with `SKIP_CHECKS=1 git push` when you know CI already covered the commit.
 
 ### Keeping agent working state out of the tree
 

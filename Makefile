@@ -159,7 +159,7 @@ certify-upgrade-dry-run: ## Print every command the Director Upgrade Test would 
 ##@ Code Quality
 
 .PHONY: hooks
-hooks: ## Point git at the repo-managed hooks (pre-commit, pre-merge-commit, and commit-msg gates, pre-push make check)
+hooks: ## Point git at the repo-managed hooks (pre-commit, pre-merge-commit, and commit-msg gates, pre-push make ci)
 	@git config core.hooksPath .githooks
 	@echo "$(GREEN)✓ git hooks installed (core.hooksPath=.githooks)$(RESET)"
 
@@ -186,6 +186,10 @@ attribution-check: ## Fail if a commit reachable from HEAD names an AI tool as a
 	@echo "$(GREEN)Checking commit messages for AI attribution...$(RESET)"
 	@sh scripts/_attribution_check.sh
 	@echo "$(GREEN)✓ no AI attribution$(RESET)"
+
+.PHONY: ci-image-check
+ci-image-check: ## Fail if the workflows pin different golang build images (make ci reads the digest from ci.yml)
+	@sh scripts/_ci_image_check.sh
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source file is not gofmt-formatted
@@ -250,9 +254,22 @@ go-blob-check: ## Fail if the packaged Go blob is older than the go.mod toolchai
 CHECK_LANES ?= 1
 
 .PHONY: check
-check: artifacts-check linear-check attribution-check fmt-check go-blob-check ## Run artifact, formatting, blob, vet, analysis, template, Python, and race-test-with-coverage checks
+check: artifacts-check linear-check attribution-check ci-image-check fmt-check go-blob-check ## Run artifact, formatting, blob, vet, analysis, template, Python, and race-test-with-coverage checks
 	@MAKE='$(MAKE)' CHECK_LANES='$(CHECK_LANES)' sh scripts/_check_lanes.sh
 	@echo "$(GREEN)✓ All checks passed$(RESET)"
+
+##@ CI parity
+
+# CI_RANGES is the pushed range, one "<remote sha> <local sha>" pair per line,
+# which is what the pre-push hook reads on stdin. It reaches the script through
+# the environment, because a make variable cannot carry the newline safely. CI_SECURITY is 1 to force the
+# security scans, 0 to skip them, and auto to run them only when the range
+# changes Go source, go.mod, go.sum, or vendored code.
+CI_SECURITY ?= auto
+
+.PHONY: ci
+ci: ci-image-check ## Run CI's checks (linear history, attribution, make check, and make security when Go changed) in CI's golang image via Docker; CI_SECURITY=1 forces the scans
+	@CI_SECURITY='$(CI_SECURITY)' sh scripts/_ci_local.sh
 
 ##@ Security
 
@@ -453,7 +470,7 @@ clean: release-clean ## Remove coverage files, bin/, and stray release artifacts
 	@echo "$(GREEN)✓ Clean complete$(RESET)"
 
 .PHONY: help build install tidy test coverage coverage-html coverage-check py-test bats fmt vet lint \
-        staticcheck check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
+        staticcheck check ci ci-image-check govulncheck gosec trivy security download-blobs upload-blobs sync-blobs \
         release-build dev-release release release-clean release-hygiene bosh-clean \
         slides-architecture slides-architecture-export slides-architecture-build \
         slides-intro-overview slides-intro-overview-export slides-intro-overview-build \

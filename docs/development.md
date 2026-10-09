@@ -32,6 +32,7 @@ The Makefile re-roots every `go` invocation into `src/pve_cpi/` — prefer the `
 | `make vet`      | Run `go vet ./...`                                       |
 | `make staticcheck` | Run `staticcheck ./...` when installed                |
 | `make check`    | Every gate CI runs, with the quick gates first and the slower ones in three lanes at once. See [Running the full check suite](../CONTRIBUTING.md#running-the-full-check-suite) |
+| `make ci`       | CI's checks run locally in CI's golang image under Docker, with the security scans when Go changed. See [Predicting CI before a push](../CONTRIBUTING.md#predicting-ci-before-a-push) |
 | `make security` | `govulncheck` + `gosec`                                  |
 | `make tidy`     | Run `go mod tidy`                                        |
 | `make clean`    | Remove build artifacts                                   |
