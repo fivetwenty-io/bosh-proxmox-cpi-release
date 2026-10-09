@@ -1447,6 +1447,80 @@ func TestRetryOnTransient_DoesNotRetryVolumeFormatUnknown(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// IsStorageVolumeMissing — permanent PVE 500 for a volume that no longer exists
+// ---------------------------------------------------------------------------
+
+// liveNoSuchLogicalVolume is the body PVE answered a parker attach with when a
+// concurrent detach had already renamed the volume away, as the CPI logged it.
+const liveNoSuchLogicalVolume = "no such logical volume labdata/vm-6535-disk-2\n (code: 0)"
+
+func TestIsStorageVolumeMissing(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"lvm live text", liveNoSuchLogicalVolume, true},
+		{"lvm lookup", "Failed to find logical volume \"pve/vm-100-disk-0\"", true},
+		{"zfs", "cannot open 'rpool/data/vm-100-disk-0': dataset does not exist", true},
+		{"rbd", "rbd: error opening image vm-100-disk-0: (2) No such file or directory", true},
+		{"plugin quoted", "volume 'local:100/vm-100-disk-0.qcow2' does not exist", true},
+		{"plugin bare", "volume local-lvm:vm-100-disk-0 does not exist", true},
+		// A missing storage, VM, or volume group is a different verdict, and a
+		// plain 500 stays transient.
+		{"missing storage", "storage 'data' does not exist", false},
+		{"missing vm", "Configuration file 'nodes/pve1/qemu-server/700.conf' does not exist", false},
+		{"missing volume group", "volume group 'pve' does not exist", false},
+		{"rbd other failure", "rbd: error opening image vm-100-disk-0: (13) Permission denied", false},
+		{"unrelated 500", "internal server error", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pve.IsStorageVolumeMissing(makeAPIErr(500, tc.msg)); got != tc.want {
+				t.Errorf("IsStorageVolumeMissing(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+	if pve.IsStorageVolumeMissing(nil) {
+		t.Error("nil error should not match")
+	}
+}
+
+// TestIsTransientTransport_StorageVolumeMissingIsPermanent pins that the blanket
+// 5xx rule no longer covers a volume that doesn't exist. The field failure
+// spent four park_disk_attach attempts on this verdict before it surfaced.
+func TestIsTransientTransport_StorageVolumeMissingIsPermanent(t *testing.T) {
+	t.Parallel()
+	err := makeAPIErr(500, liveNoSuchLogicalVolume)
+	if pve.IsTransientTransport(err) {
+		t.Error("a missing volume is permanent and must not be transient")
+	}
+	if pve.IsPVEPushback(err) {
+		t.Error("a missing volume must not be classified as pushback either")
+	}
+}
+
+// TestRetryOnTransientOrLock_DoesNotRetryStorageVolumeMissing asserts the retry
+// helper the parker attach uses returns on the first attempt.
+func TestRetryOnTransientOrLock_DoesNotRetryStorageVolumeMissing(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	err := pve.RetryOnTransientOrLock(context.Background(), nil, "park_disk_attach", 8, func() error {
+		calls++
+		return makeAPIErr(500, liveNoSuchLogicalVolume)
+	})
+	if err == nil {
+		t.Fatal("expected the error to surface")
+	}
+	if calls != 1 {
+		t.Errorf("expected exactly 1 attempt (permanent error), got %d", calls)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // WrapConfigReadError / WrapMutationError
 // ---------------------------------------------------------------------------
 

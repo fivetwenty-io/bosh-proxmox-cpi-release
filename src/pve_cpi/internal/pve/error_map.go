@@ -533,8 +533,9 @@ func IsTransientTransport(err error) bool {
 	// Permanent 500-with-text shapes are excluded before the blanket 5xx rule
 	// below: PVE answers a request-shaped rejection with a 500 body rather than
 	// a 4xx, so "is a 5xx" alone cannot distinguish a cycling worker from a
-	// verdict that will never change. See IsVolumeFormatUnknown.
-	if IsVolumeFormatUnknown(err) {
+	// verdict that will never change. See IsVolumeFormatUnknown and
+	// IsStorageVolumeMissing.
+	if IsVolumeFormatUnknown(err) || IsStorageVolumeMissing(err) {
 		return false
 	}
 	if errors.Is(err, sdkerrors.ErrServer) {
@@ -986,6 +987,53 @@ func IsVolumeFormatUnknown(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "volume_size_info") && strings.Contains(msg, "no format")
+}
+
+// storageVolumeMissingPattern matches the API's own refusal to use a volume
+// that isn't there, as qemu-server words it when a config write names a volume
+// whose size it can't read: "volume 'local:vm-100-disk-0' does not exist", with
+// or without the quotes.
+var storageVolumeMissingPattern = regexp.MustCompile(`volume '?[^\s']+'? does not exist`)
+
+// IsStorageVolumeMissing reports whether err is a storage plugin's verdict
+// that the volume a request names does not exist. PVE answers a config write
+// or a storage call that names a missing volume with HTTP 500 and the plugin's
+// text, so the blanket 5xx rule in IsTransientTransport would call it
+// transient, and every retry loop would send the same doomed request again.
+// The observed shape is the LVM plugin's, from a parker attach whose volume a
+// concurrent transfer had already renamed:
+//
+//	no such logical volume labdata/vm-6535-disk-2
+//
+// The other shapes are the equivalents from the LVM tools ("Failed to find
+// logical volume"), zfs ("dataset does not exist"), librbd ("error opening
+// image" with errno 2), and qemu-server's own check on a config write
+// ("volume ... does not exist").
+//
+// Only the retry loops read this. It stops them from re-sending a request whose
+// answer will not change. It does not on its own prove that the volume is gone,
+// because a rename can take a name away while the volume lives on under
+// another one, so a caller that needs to know where the disk is re-resolves it.
+// IsVolumeFormatUnknown's file-storage "no format" text stays out of it on
+// purpose, because that text also covers an export that went away.
+//
+// nil → false.
+func IsStorageVolumeMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "no such logical volume"):
+		return true
+	case strings.Contains(msg, "failed to find logical volume"):
+		return true
+	case strings.Contains(msg, "dataset does not exist"):
+		return true
+	case strings.Contains(msg, "error opening image") && strings.Contains(msg, "no such file or directory"):
+		return true
+	}
+	return storageVolumeMissingPattern.MatchString(msg)
 }
 
 // IsPVEPushback reports whether err signals PVE server-side rate-limiting or
