@@ -152,7 +152,6 @@ jobs:
           filter: tree:0
           sparse-checkout: |
             scripts/_linear_history_check.sh
-            scripts/_attribution_check.sh
           sparse-checkout-cone-mode: false
           # This clone lives in its own directory, because a promisor clone
           # left in the shared workspace breaks the next job's full checkout
@@ -168,4 +167,16 @@ jobs:
 
       - name: Refuse AI attribution in commit messages
         working-directory: linear-history
-        run: sh scripts/_attribution_check.sh "${{ github.event.pull_request.head.sha || github.sha }}"
+        # The checker comes from the base branch, never from the commit under
+        # audit. A branch cut before the script existed has no copy of it, and
+        # running a script from a pull-request head on a self-hosted runner
+        # would let the branch choose its own gate. A pull request reads
+        # origin/<base>; a push reads origin/main, which the full-depth fetch
+        # above brings in with every other branch.
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          checker="${RUNNER_TEMP}/attribution_check.sh"
+          git show "origin/${BASE_REF}:scripts/_attribution_check.sh" > "$checker"
+          sh "$checker" "$HEAD_SHA"
