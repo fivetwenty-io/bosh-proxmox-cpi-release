@@ -52,7 +52,7 @@ jobs:
           export BOSH_INSTALL_TARGET="${RUNNER_TEMP}/candidate-package/pve_cpi"
           export BOSH_PACKAGE_VERSION="0.0.0-candidate.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${RUNNER_TEMP}/candidate-package/golang-1.27"
-          tar -xzf blobs/golang-1.27/go1.27.1.linux-amd64.tar.gz \
+          tar -xzf blobs/golang-1.27/go1.27.2.linux-amd64.tar.gz \
             --strip-components=1 -C "${RUNNER_TEMP}/candidate-package/golang-1.27"
           bash packages/pve_cpi/packaging
           "${BOSH_INSTALL_TARGET}/bin/cpi" --version

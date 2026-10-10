@@ -14,7 +14,7 @@
 # .github/workflows/release.yml verifies; the cf, credhub, and uv downloads
 # are version-pinned over TLS from their vendors' release channels.
 
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.2
 ARG RUBY_VERSION=3.3
 ARG BOSH_CLI_VERSION=7.10.10
 # sha256 of bosh-cli-7.10.10-linux-amd64 from cloudfoundry/bosh-cli releases
