@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -47,12 +48,13 @@ import (
 
 // lockStepKinds are the step kinds a guard writes for a sentinel mutation. The
 // lifecycle and parker guards admit a Pool mutation only for a bosh-lock-
-// sentinel. Under a disk record that sentinel is a parker's or a VMID's
-// "vm-<vmid>" lock, or, for an operation that transfers the disk into a
-// parker, the disk's own per-disk transfer lock, "disk-<stable ID>", which the
-// transfer takes around its parker windows. A step doesn't record which of
-// them it meant, and its target names no VMID for the disk lock, so
-// lockStepSentinels lists them all.
+// sentinel. That sentinel is a parker's or a VMID's "vm-<vmid>" lock, or a
+// disk's own per-disk transfer lock, "disk-<stable ID>", which a transfer or
+// a resume takes around its parker windows. A step of a vm-<vmid> lock
+// doesn't record which VMID it meant, so lockStepSentinels lists every VM the
+// attempt targets. A step of a per-disk lock records the disk's stable ID in
+// its parameters (diskTransferLockStepParameters), because neither its target
+// nor its record has to name that disk.
 //
 // A VM record's pool steps are listed too, although a step does not record
 // which pool it meant. Its CreatePool is either the deployment pool's ensure or
@@ -79,14 +81,16 @@ func isLockStep(step aj.Step) bool {
 
 // lockStepSentinels names every sentinel a lock step in record could have
 // meant. The disk guards lock a parker's protection window or a VMID, both
-// keyed "vm-<vmid>", and an operation that transfers the disk into a parker
-// also takes the disk's own per-disk transfer lock, keyed "disk-<stable ID>".
-// So the candidates are the sentinels of every VM the active attempt's steps
-// target, and for a disk record whose active attempt has a planned lock step
-// of such an operation (takesDiskTransferLock), the per-disk lock of the disk
-// the record's token names, which is the disk's stable ID. A lock step that
-// was already observed is never settled, so it adds no candidate. A VM record adds its
-// instance group's anti-affinity sentinel, rebuilt exactly as
+// keyed "vm-<vmid>", so the candidates are the sentinels of every VM the
+// active attempt's steps target. An operation that transfers a disk into a
+// parker, or resumes such a transfer, also takes that disk's per-disk transfer
+// lock, keyed "disk-<stable ID>", and each of its lock steps records that
+// stable ID (diskTransferLockStepToken). So every planned lock step of the
+// active attempt that names a disk adds that disk's lock, whatever the
+// operation or the record's kind, and a step that names none, such as an
+// attach's or a create_disk's parker lock, adds nothing. A lock step that was
+// already observed is never settled, so it adds no candidate. A VM record
+// adds its instance group's anti-affinity sentinel, rebuilt exactly as
 // acquireAntiAffinityLock names it, whenever the record froze a group.
 //
 // A VM record's pool step never touched its vm-<vmid> sentinel. That read is
@@ -94,7 +98,8 @@ func isLockStep(step aj.Step) bool {
 // no group it is the only read, because the sentinel such a step meant belongs
 // to a group the record never stored. A step records no pool of its own, so
 // the rule reads every candidate and settles only when each one answers
-// exactly.
+// exactly. That includes the per-disk lock a step names, so no step that took
+// one settles without its own sentinel read back.
 func lockStepSentinels(record aj.Record) []string {
 	seen := map[int]bool{}
 	var sentinels []string
@@ -106,13 +111,15 @@ func lockStepSentinels(record aj.Record) []string {
 		seen[step.Target.VMID] = true
 		sentinels = append(sentinels, pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", step.Target.VMID)))
 	}
-	if record.Kind == allocationKindDisk && record.DiskToken != "" {
-		for i := range record.Steps {
-			step := &record.Steps[i]
-			if step.Attempt == record.ActiveAttempt() && step.State == aj.Planned && isLockStep(*step) && takesDiskTransferLock(*step) {
-				sentinels = append(sentinels, pve.DiskTransferLockPoolName(record.DiskToken))
-				break
-			}
+	disks := map[string]bool{}
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Attempt != record.ActiveAttempt() || step.State != aj.Planned || !isLockStep(*step) {
+			continue
+		}
+		if token, ok := diskTransferLockStepToken(*step); ok && !disks[token] {
+			disks[token] = true
+			sentinels = append(sentinels, pve.DiskTransferLockPoolName(token))
 		}
 	}
 	if record.Kind == "vm" {
@@ -132,21 +139,53 @@ func lockStepSentinels(record aj.Record) []string {
 	return sentinels
 }
 
-// diskTransferLockOperations are the managed disk lifecycle operations that
-// transfer the disk into a parker under the journal, through
-// pve.TransferDiskToParker, and so take the disk's per-disk transfer lock.
-// Every other operation's lock steps can only have meant a vm-<vmid> sentinel.
-var diskTransferLockOperations = []string{"detach_disk"}
+// diskTransferLockStepKind is the parameter kind a lifecycle guard records on
+// a lock step for a disk's per-disk transfer lock. The disk's stable ID goes
+// under "resources", a key the journal already accepts, so a release that
+// predates the per-disk lock still reads the record.
+const diskTransferLockStepKind = "disk_transfer_lock"
 
-// takesDiskTransferLock reports whether step is a lock step of an operation
-// in diskTransferLockOperations.
-func takesDiskTransferLock(step aj.Step) bool {
-	for _, operation := range diskTransferLockOperations {
-		if strings.HasPrefix(step.Kind, "lifecycle_"+operation+"_Pool_") {
-			return true
-		}
+// diskTransferLockStepParameters returns the parameters a lifecycle guard
+// records for a sentinel create or delete of pool: the stable ID of the disk
+// whose per-disk transfer lock pool is, and nil for every other sentinel.
+func diskTransferLockStepParameters(pool string) json.RawMessage {
+	token, ok := diskTransferLockPoolToken(pool)
+	if !ok {
+		return nil
 	}
-	return false
+	raw, err := json.Marshal(map[string]any{"version": 1, "kind": diskTransferLockStepKind, "resources": token})
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// diskTransferLockPoolToken returns the stable ID whose per-disk transfer lock
+// pool is, and false when pool is any other sentinel.
+func diskTransferLockPoolToken(pool string) (string, bool) {
+	token, ok := strings.CutPrefix(pool, pve.DiskTransferLockPoolName(""))
+	if !ok || token == "" || pve.DiskTransferLockPoolName(token) != pool {
+		return "", false
+	}
+	return token, true
+}
+
+// diskTransferLockStepToken returns the stable ID a lock step's parameters
+// record for the per-disk transfer lock it took, and false when the step
+// records none, or anything other than exactly that.
+func diskTransferLockStepToken(step aj.Step) (string, bool) {
+	var fields map[string]any
+	if len(step.Parameters) == 0 || json.Unmarshal(step.Parameters, &fields) != nil || len(fields) != 3 {
+		return "", false
+	}
+	if fields["version"] != float64(1) || fields["kind"] != diskTransferLockStepKind {
+		return "", false
+	}
+	token, _ := fields["resources"].(string)
+	if got, ok := diskTransferLockPoolToken(pve.DiskTransferLockPoolName(token)); !ok || got != token {
+		return "", false
+	}
+	return token, true
 }
 
 // lockSettlementGap says why settlement left a lock step planned. Its text is

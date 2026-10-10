@@ -99,6 +99,7 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		node = m.diskNode()
 	}
 	observation := managedDiskMutationObservation{node: node}
+	var lockPool string
 	storage, _, err := pve.ParseDiskCID(m.disk.volid)
 	if err != nil {
 		return "", err
@@ -122,6 +123,7 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 		if !strings.HasPrefix(pool, "bosh-lock-") || (call.Method != "CreatePool" && call.Method != "DeletePool") {
 			return "", fmt.Errorf("unrelated pool mutation in disk lifecycle")
 		}
+		lockPool = pool
 	} else if call.Service != managedDiskServiceStorage {
 		value := call.Args["vmid"]
 		if key == "QEMU.Create" {
@@ -175,9 +177,15 @@ func (g *managedDiskLifecycleGuard) before(ctx context.Context, call ManagedAllo
 	}
 	// A protection-only configuration write records what it wrote, so a
 	// restore cut off by its deadline can be settled later by reading the
-	// parker back (settlePlannedProtectionSteps). Every other write records
-	// no parameters, as before.
-	step, err := storageMutationIntent(m.handle, "lifecycle_"+m.session.operation+"_"+call.Service+"_"+call.Method, target, charges, lifecycleStepParameters(key, observation.fields))
+	// parker back (settlePlannedProtectionSteps). A sentinel create or delete
+	// of a disk's per-disk transfer lock records that disk's stable ID, so
+	// settlement reads that sentinel back whatever the operation
+	// (lockStepSentinels). Every other write records no parameters, as before.
+	parameters := lifecycleStepParameters(key, observation.fields)
+	if lockPool != "" {
+		parameters = diskTransferLockStepParameters(lockPool)
+	}
+	step, err := storageMutationIntent(m.handle, "lifecycle_"+m.session.operation+"_"+call.Service+"_"+call.Method, target, charges, parameters)
 	if err != nil {
 		return "", err
 	}
