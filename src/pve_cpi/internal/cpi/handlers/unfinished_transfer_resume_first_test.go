@@ -779,12 +779,13 @@ func TestIdentityResumeYieldsToLifecycleResume(t *testing.T) {
 
 // TestIdentityResumeWaiterFindsTheTransferFinished races two has_disk calls
 // over one transfer that stopped between its move and its serial write. The
-// first call's claim-only resume takes the parker's lock. The second call
-// reads the same transfer record and then waits for that lock while the first
-// writes the serial, finalizes the record, and lets the lock go. Under the
-// lock, the second call reads the parker's record again, finds that the
-// transfer moved underneath it, and resolves the disk again. It finds the disk
-// on its parker with no second serial write and no second finalize.
+// first call's claim-only resume takes the disk's per-disk transfer lock,
+// which it takes before the parker's. The second call reads the same transfer
+// record and then waits for that lock while the first writes the serial,
+// finalizes the record, and lets both locks go. Under the locks, the second
+// call reads the parker's record again, finds that the transfer moved
+// underneath it, and resolves the disk again. It finds the disk on its parker
+// with no second serial write and no second finalize.
 func TestIdentityResumeWaiterFindsTheTransferFinished(t *testing.T) {
 	captureParkerPoolSweep(t)
 	f := digestManagedFixture(t)
@@ -806,7 +807,7 @@ func TestIdentityResumeWaiterFindsTheTransferFinished(t *testing.T) {
 	// the second call's create meets the held lock. The second call then
 	// waits inside that refusal until the first call has returned, so the
 	// two calls never touch the fake at the same time.
-	lock := reservedPoolLockPrefix + "vm-" + strconv.Itoa(parker)
+	lock := pve.DiskTransferLockPoolName(token)
 	waiting, release := make(chan struct{}), make(chan struct{})
 	type answer struct {
 		result any
@@ -836,7 +837,7 @@ func TestIdentityResumeWaiterFindsTheTransferFinished(t *testing.T) {
 	}
 	result, err := HandleHasDisk(f.deps).Handle(digestCtx(), []json.RawMessage{planJSON(t, f.cid)}, jsonrpc.Context{})
 	if !launched {
-		t.Fatalf("the first has_disk took no parker lock (result %v, err %v), so nothing waited on it", result, err)
+		t.Fatalf("the first has_disk took no disk lock (result %v, err %v), so nothing waited on it", result, err)
 	}
 	close(release)
 	second := <-waiter
@@ -849,7 +850,7 @@ func TestIdentityResumeWaiterFindsTheTransferFinished(t *testing.T) {
 	race.mu.Lock()
 	defer race.mu.Unlock()
 	if race.lockRefusals == 0 {
-		t.Error("the second has_disk never met the first one's parker lock")
+		t.Error("the second has_disk never met the first one's disk lock")
 	}
 	if race.serials != 1 || race.finalizes != 1 {
 		t.Errorf("the two calls wrote %d serials and %d parker records, want one of each", race.serials, race.finalizes)
