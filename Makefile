@@ -262,13 +262,14 @@ check: artifacts-check linear-check attribution-check ci-image-check fmt-check g
 
 # CI_RANGES is the pushed range, one "<remote sha> <local sha>" pair per line,
 # which is what the pre-push hook reads on stdin. It reaches the script through
-# the environment, because a make variable cannot carry the newline safely. CI_SECURITY is 1 to force the
-# security scans, 0 to skip them, and auto to run them only when the range
-# changes Go source, go.mod, go.sum, or vendored code.
+# the environment, because a make variable cannot carry the newline safely.
+# CI_SECURITY is 1 to force the security scans, 0 to skip them, and auto to run
+# them only when the range changes Go source, dependency files, or the
+# security setup.
 CI_SECURITY ?= auto
 
 .PHONY: ci
-ci: ci-image-check ## Run CI's checks (linear history, attribution, make check, and make security when Go changed) in CI's golang image via Docker; CI_SECURITY=1 forces the scans
+ci: ci-image-check ## Run CI's checks in CI's golang image under Docker (CI_SECURITY=1 forces the scans)
 	@CI_SECURITY='$(CI_SECURITY)' sh scripts/_ci_local.sh
 
 ##@ Security

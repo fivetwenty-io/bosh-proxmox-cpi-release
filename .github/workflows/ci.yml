@@ -167,12 +167,12 @@ jobs:
 
       - name: Refuse AI attribution in commit messages
         working-directory: linear-history
-        # The checker comes from the base branch, never from the commit under
-        # audit. A branch cut before the script existed has no copy of it, and
-        # running a script from a pull-request head on a self-hosted runner
-        # would let the branch choose its own gate. A pull request reads
-        # origin/<base>; a push reads origin/main, which the full-depth fetch
-        # above brings in with every other branch.
+        # On a pull request the checker comes from the base branch, never from
+        # the commit under audit. A branch cut before the script existed has
+        # no copy of it, and running a script from a pull-request head on a
+        # self-hosted runner would let the branch choose its own gate. A pull
+        # request reads origin/<base>; a push reads origin/main, which the
+        # full-depth fetch above brings in with every other branch.
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

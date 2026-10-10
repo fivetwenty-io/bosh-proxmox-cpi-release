@@ -56,7 +56,7 @@ make ci
 
 A green `make check` on the Mac does not always mean a green CI run, because the workflows run in a digest-pinned `golang` container, they run the AI-attribution check over the commits being pushed, and the Security workflow runs scans that `make check` never touches. `make ci` closes that gap by running those same steps locally, inside that same image, under Docker. It runs the linear-history and attribution checks over the pushed range, then `make check REQUIRE_TOOLS=1`, then `make security REQUIRE_TOOLS=1` when the pushed range changes Go source, `go.mod`, `go.sum`, or vendored code. When the range changes none of those, it prints a one-line note and skips the scans. `CI_SECURITY=1 make ci` forces the scans, and `CI_SECURITY=0 make ci` skips them.
 
-We read the image reference from `.github/workflows/ci.yml`, so there is one place to bump it, and `make ci-image-check` (part of `make check`) fails when another workflow pins a different `golang` digest. The first run builds a small local layer on that digest that holds `python3`, PyYAML, `ruby`, and the pinned `staticcheck`, `golangci-lint`, `govulncheck`, `gosec`, and `trivy`, which are the tools the workflow steps install before they call `make`. The Go module cache, the Go build cache, and the trivy database live in a named Docker volume called `bosh-proxmox-cpi-ci-cache`, never in a host directory. `docker volume rm bosh-proxmox-cpi-ci-cache` starts them cold. The worktree is mounted as it stands, so uncommitted changes are tested too. The `golang` tag is a multi-architecture index, so an Apple Silicon Mac pulls the arm64 build and runs it natively, while CI runs the amd64 build of the same digest.
+We read the image reference from `.github/workflows/ci.yml`, so there is one place to bump it, and `make ci-image-check` (part of `make check`) fails when another workflow pins a different `golang` digest. The first run builds a small local layer on that digest that holds `python3`, PyYAML, `ruby`, and the pinned `staticcheck`, `golangci-lint`, `govulncheck`, `gosec`, and `trivy`, which are the tools the workflow steps install before they call `make`. The Go module cache, the Go build cache, and the trivy database live in a named Docker volume called `bosh-proxmox-cpi-ci-cache`, never in a host directory. `docker volume rm bosh-proxmox-cpi-ci-cache` starts them cold. The worktree is mounted as it stands, so `make check` and the security scans test the checked-out tree, uncommitted changes included, while the attribution and linear-history checks cover the commits being pushed. That is why the pre-push hook warns when the pushed sha differs from `HEAD`. The security scans also run when the pushed range changes a `package.json`, a `package-lock.json`, a `Dockerfile`, the security workflow, or the root `Makefile`. Each new digest or tool-version set leaves an old `bosh-proxmox-cpi-ci:<hash>` image behind, and `docker image ls bosh-proxmox-cpi-ci` lists them so we can remove the old ones with `docker image rm`. A pull request's CI run tests GitHub's merge ref, while `make ci` tests the branch tip, so a branch that has fallen behind `main` can still differ. `make ci` also stops early when `go.mod` asks for a newer Go than the pinned image carries, and the fix is to bump the image digest first. The `golang` tag is a multi-architecture index, so an Apple Silicon Mac pulls the arm64 build and runs it natively, while CI runs the amd64 build of the same digest.
 
 ### Installing the git hooks
 
@@ -64,11 +64,19 @@ We read the image reference from `.github/workflows/ci.yml`, so there is one pla
 make hooks
 ```
 
-This points `core.hooksPath` at the repo's `.githooks/` directory. Two hooks run from then on:
+This points `core.hooksPath` at the repo's `.githooks/` directory. Four hooks run from then on:
 
 - `pre-commit`
 
   Refuses the commit if the index holds AI-agent working state, a path that `.gitignore` matches, or a blob over 5 MB. It then checks the staged Go files with `gofmt` and refuses the commit if any of them need formatting. It takes well under a second. Bypass one commit with `git commit --no-verify`, or set `ALLOW_LARGE_FILES=1` when a large file belongs in the commit.
+
+- `commit-msg`
+
+  Refuses a commit message that names an AI tool as an author.
+
+- `pre-merge-commit`
+
+  Refuses a merge commit, because this repository keeps a linear history. Bypass once with `git merge --no-verify`.
 
 - `pre-push`
 

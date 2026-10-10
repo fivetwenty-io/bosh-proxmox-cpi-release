@@ -17,8 +17,21 @@ set -eu
 dir=${CI_WORKFLOW_DIR:-.github/workflows}
 
 images() {
-	sed -n 's/^[[:space:]]*image:[[:space:]]*\(golang:[^[:space:]#]*\).*/\1/p' "$@"
+	sed -n "s/^[[:space:]-]*image:[[:space:]]*[\"']\{0,1\}\(golang:[^[:space:]#\"']*\).*/\1/p" "$@"
 }
+
+# Every uncommented line that mentions golang: must have matched the parser
+# above. A line it missed, such as a differently shaped key, would otherwise
+# slip past the drift check.
+for f in "$dir"/*.yml; do
+	total=$(grep -Ev '^[[:space:]]*#' "$f" | grep -c 'golang:' || true)
+	parsed=$(images "$f" | grep -c . || true)
+	if [ "$total" -ne "$parsed" ]; then
+		echo "ci-image: $f has a golang: image line that the checker could not parse:" >&2
+		grep -Ev '^[[:space:]]*#' "$f" | grep 'golang:' >&2
+		exit 1
+	fi
+done
 
 refs=$(images "$dir"/*.yml | sort -u)
 count=$(printf '%s\n' "$refs" | grep -c . || true)
