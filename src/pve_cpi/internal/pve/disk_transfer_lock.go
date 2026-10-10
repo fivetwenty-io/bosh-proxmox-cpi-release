@@ -28,20 +28,30 @@ func DiskTransferLockPoolName(stableID string) string {
 
 // diskTransferLockTimeouts returns the TTL and the acquire wait of a per-disk
 // transfer lock under ctx. The TTL is the parker protection-window lock's TTL
-// plus that lock's wait, because the disk lock is taken first and must still
-// be held when a parker window that waited its whole wait for the parker lock
-// runs to the end of its own claim. A test that shortens the parker lock
-// through withTestParkerLockTimeouts shortens this one too.
+// plus that lock's default wait (parkerProtectionLockTimeout), because the
+// disk lock is taken first and must still be held when a parker window that
+// waited for the parker lock runs to the end of its own claim. A test that
+// shortens the parker lock through withTestParkerLockTimeouts shortens this
+// one too.
+//
+// The wait added to the TTL is capped at the default parker wait, not the
+// longer wait a managed caller asks for (WithParkerLockWait), because the TTL
+// is also how long a crashed holder blocks every other transfer of the disk.
+// On the shipped curves that bound is about 250s: the parker TTL of about
+// 235s plus the 15s default wait. A parker window whose acquire waited longer
+// than the default runs on what is left of the disk claim, which
+// diskTransferWindowContext checks before the window opens.
 //
 // The wait is the whole TTL plus the create grace, so a second transfer of the
 // disk waits out a holder that keeps the lock for as long as its claim allows,
-// and a crashed holder's claim expires and is stolen inside the wait. The
-// acquire itself stops waiting before the request's deadline
-// (clusterLockDeadline), which is the bound the journal lock's wait has too
-// (managedLockWaitContext in the handlers).
+// and a crashed holder's claim expires and is stolen inside the wait. A waiter
+// is therefore bounded by the TTL plus the grace, and the acquire itself also
+// stops waiting before the request's deadline (clusterLockDeadline), which is
+// the bound the journal lock's wait has too (managedLockWaitContext in the
+// handlers).
 func diskTransferLockTimeouts(ctx context.Context) (time.Duration, time.Duration) {
 	parkerTTL, parkerWait := parkerLockTimeoutsFrom(ctx)
-	ttl := parkerTTL + parkerWait
+	ttl := parkerTTL + min(parkerWait, parkerProtectionLockTimeout)
 	return ttl, ttl + clusterLockGrace()
 }
 
@@ -84,6 +94,18 @@ type diskTransferLockUnserializedKey struct{}
 func diskTransferLockUnserialized(ctx context.Context) bool {
 	unserialized, _ := ctx.Value(diskTransferLockUnserializedKey{}).(bool)
 	return unserialized
+}
+
+// diskTransferLockHeldKey marks the context of work that already runs under
+// the per-disk transfer lock of the disk whose stable ID it carries, whether
+// the lock was taken or the work fell back to running without it.
+type diskTransferLockHeldKey struct{}
+
+// diskTransferLockHeld reports whether ctx already runs under the per-disk
+// transfer lock of the disk with stableID.
+func diskTransferLockHeld(ctx context.Context, stableID string) bool {
+	held, _ := ctx.Value(diskTransferLockHeldKey{}).(string)
+	return held != "" && held == stableID
 }
 
 // diskTransferBudgetKey carries the time a transfer holds its per-disk lock
@@ -167,6 +189,12 @@ func diskTransferWindowContext(ctx context.Context, stableID string, now time.Ti
 // (diskTransferLockDeadline), and its context carries the budget each parker
 // window checks before it opens (diskTransferWindowContext).
 //
+// A call whose context already runs under this disk's lock
+// (diskTransferLockHeld) runs fn on that context at once, with the outer
+// holder's deadline and budget. The lock is a sentinel pool, not a reentrant
+// mutex, so a nested acquire would wait on its own claim until the claim
+// expired.
+//
 // The fallbacks match withParkerProtectionLock. A client with no pool service,
 // or a lock create that PVE refused outright, runs fn unserialized, because
 // the transfer's own checks inside the parker window still stop it from acting
@@ -175,10 +203,14 @@ func diskTransferWindowContext(ctx context.Context, stableID string, now time.Ti
 // marked (diskTransferLockUnserialized). Every other acquire failure is
 // returned, retriably, because a live holder may be moving the disk right now.
 func withDiskTransferLock(ctx context.Context, c Client, logger *log.Logger, stableID, purpose string, fn func(context.Context) error) error {
+	if diskTransferLockHeld(ctx, stableID) {
+		return fn(ctx)
+	}
 	var pools PoolService
 	if c != nil {
 		pools = c.Pools()
 	}
+	ctx = context.WithValue(ctx, diskTransferLockHeldKey{}, stableID)
 	unserialized := context.WithValue(ctx, diskTransferLockUnserializedKey{}, true)
 	if pools == nil {
 		if logger != nil {
@@ -242,15 +274,25 @@ const diskTransferLockSweepReadTimeout = 5 * time.Second
 // transfers again would keep its sentinel forever, and one sentinel per disk
 // adds up. So the parker pool sweep runs this one too.
 //
-// It acts only on a claim whose comment carries an expiry that has passed. A
-// live claim, and a comment it can't parse, are never touched, because an
-// unparseable comment may be a holder this release doesn't understand. Each
-// removal follows the discipline a stealing acquirer follows
-// (tryStealExpired). The sentinel is read again right before the delete, the
-// delete happens only when that read shows the exact claim the listing showed,
-// and only when the re-read came back within clusterLockStealBudget, and the
-// delete carries the expected claim. An acquirer that creates a fresh claim
-// meanwhile waits out its create grace and confirms its claim again, so a
+// It acts only on a claim whose comment carries an expiry that passed more
+// than clusterLockStealBudget plus the create grace ago (sweepExpiredLockAge).
+// A live claim, and a comment it can't parse, are never touched, because an
+// unparseable comment may be a holder this release doesn't understand. A claim
+// that expired only just now is left to a stealing acquirer, which is waiting
+// for exactly that expiry and replaces the claim through its own
+// read-and-steal (tryStealExpired), so the sweep doesn't race it for the
+// sentinel.
+//
+// Each removal follows the discipline a stealing acquirer follows. The
+// sentinel is read again right before the delete, and the delete happens only
+// when that read shows the exact claim the listing showed and came back within
+// clusterLockStealBudget. The delete itself is unconditional. The sweep runs
+// on the client the parker pool sweep hands it, which isn't the journal's
+// guarded pool service, and the SDK's DeletePool ignores the expected claim
+// the context carries (WithExpectedLockClaim), so nothing on the PVE side
+// refuses a delete whose sentinel changed after the re-read. The protection
+// is on the acquirer's side instead. An acquirer that creates a fresh claim in
+// that gap waits out its create grace and confirms its claim again, so a
 // delete that slipped in between displaces it rather than overlapping it.
 //
 // A pool service without PoolCommentLister has nothing to list, and the sweep
@@ -286,7 +328,7 @@ func SweepExpiredDiskTransferLocks(ctx context.Context, c Client, logger *log.Lo
 	for _, name := range names {
 		comment := listed[name]
 		expiry, parsed := decodeLockExpiry(comment)
-		if !parsed || !clk.now().After(expiry) {
+		if !parsed || !clk.now().After(expiry.Add(sweepExpiredLockAge())) {
 			continue
 		}
 		deleted, sweepErr := sweepExpiredLockSentinel(ctx, pools, name, comment, clk)
@@ -308,6 +350,15 @@ func SweepExpiredDiskTransferLocks(ctx context.Context, c Client, logger *log.Lo
 	return removed, errors.Join(errs...)
 }
 
+// sweepExpiredLockAge is how long ago a claim must have expired before the
+// sweep deletes its sentinel. A stealer that saw the claim expire takes up to
+// clusterLockStealBudget to re-read and replace it, and then the create grace
+// to confirm its own claim, so a claim younger than both is still a stealer's
+// to take.
+func sweepExpiredLockAge() time.Duration {
+	return clusterLockStealBudget + clusterLockGrace()
+}
+
 // sweepExpiredLockSentinel deletes the sentinel pool when it still carries
 // exactly comment, which the caller judged expired. It reports whether it
 // deleted it. A sentinel that is gone, carries another claim, or whose re-read
@@ -323,6 +374,8 @@ func sweepExpiredLockSentinel(ctx context.Context, pools PoolService, name, comm
 	if !found || current != comment || clk.now().Sub(started) > clusterLockStealBudget {
 		return false, nil
 	}
+	// The expected claim is passed for a guarded pool service that checks it.
+	// The SDK service the sweep normally runs on deletes unconditionally.
 	delErr := pools.DeletePool(WithExpectedLockClaim(ctx, comment), name)
 	switch {
 	case delErr == nil:

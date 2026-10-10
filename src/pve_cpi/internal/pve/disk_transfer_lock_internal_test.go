@@ -458,6 +458,37 @@ func TestWithDiskTransferLock(t *testing.T) {
 		}
 	})
 
+	t.Run("a nested call for the same disk runs inside the held lock", func(t *testing.T) {
+		t.Parallel()
+		pools := &recordingPoolService{}
+		c := &parkerLockClient{pools: pools}
+		other := ClusterLockPoolName(diskTransferLockName("other-disk"))
+		err := withDiskTransferLock(context.Background(), c, nil, transferStableID, "transfer_in", func(outer context.Context) error {
+			outerDeadline, _ := outer.Deadline()
+			if err := withDiskTransferLock(outer, c, nil, transferStableID, "transfer_resume", func(inner context.Context) error {
+				if d, ok := inner.Deadline(); !ok || !d.Equal(outerDeadline) {
+					t.Errorf("nested deadline = %v (set %v), want the outer holder's %v", d, ok, outerDeadline)
+				}
+				pools.events = append(pools.events, "nested")
+				return nil
+			}); err != nil {
+				return err
+			}
+			// Another disk's lock is its own, so it is still taken.
+			return withDiskTransferLock(outer, c, nil, "other-disk", "transfer_in", func(context.Context) error {
+				pools.events = append(pools.events, "other")
+				return nil
+			})
+		})
+		if err != nil {
+			t.Fatalf("withDiskTransferLock: %v", err)
+		}
+		want := []string{"create:" + key, "nested", "create:" + other, "other", "delete:" + other, "delete:" + key}
+		if strings.Join(pools.events, ",") != strings.Join(want, ",") {
+			t.Fatalf("events = %v, want %v", pools.events, want)
+		}
+	})
+
 	t.Run("no pool service", func(t *testing.T) {
 		t.Parallel()
 		ran := false
@@ -569,6 +600,44 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	if elapsed := time.Duration(clk.offset.Load()); elapsed < holdFor {
 		t.Fatalf("the contender acquired after %s, before the holder let go at %s", elapsed, holdFor)
 	}
+}
+
+// TestDiskTransferLockTimeouts_CapTheManagedWait pins how long a crashed
+// holder can block a disk. A managed caller stretches the parker lock's wait
+// to about a whole parker TTL (WithParkerLockWait), and the disk lock's TTL
+// adds only the default parker wait on top of the parker TTL, never that
+// stretched wait. A waiter is bounded by that TTL plus the create grace.
+func TestDiskTransferLockTimeouts_CapTheManagedWait(t *testing.T) {
+	t.Parallel()
+	parkerTTL := parkerProtectionLockTTLNow()
+	cases := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"default wait", context.Background()},
+		{"managed wait of a whole parker TTL", WithParkerLockWait(context.Background(), parkerTTL)},
+		{"managed wait of an hour", WithParkerLockWait(context.Background(), time.Hour)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ttl, wait := diskTransferLockTimeouts(tc.ctx)
+			if want := parkerTTL + parkerProtectionLockTimeout; ttl != want {
+				t.Fatalf("ttl = %s, want the parker TTL plus the default parker wait, %s", ttl, want)
+			}
+			if wait != ttl+clusterLockGrace() {
+				t.Fatalf("wait = %s, want the TTL plus the create grace, %s", wait, ttl+clusterLockGrace())
+			}
+		})
+	}
+
+	t.Run("a shorter test wait is kept", func(t *testing.T) {
+		t.Parallel()
+		ctx := withTestParkerLockTimeouts(context.Background(), 2*time.Second, 300*time.Millisecond)
+		if ttl, _ := diskTransferLockTimeouts(ctx); ttl != 2300*time.Millisecond {
+			t.Fatalf("ttl = %s, want the test TTL plus the test wait, 2.3s", ttl)
+		}
+	})
 }
 
 // TestWithDiskTransferLock_UnserializedFallbacksAreLoud covers the two
@@ -724,8 +793,9 @@ func (l *listingLockPools) ListPoolComments(context.Context) (map[string]string,
 // TestSweepExpiredDiskTransferLocks covers the sweep of per-disk lock
 // sentinels a crashed transfer left behind. It deletes only a per-disk
 // sentinel whose claim has expired and still reads the same, and it leaves a
-// live claim, a comment it can't parse, another lock's sentinel, a claim that
-// changed after the listing, and one whose re-read ran over the steal budget.
+// live claim, a claim that expired too recently for a stealer to have taken
+// it, a comment it can't parse, another lock's sentinel, a claim that changed
+// after the listing, and one whose re-read ran over the steal budget.
 func TestSweepExpiredDiskTransferLocks(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
@@ -766,6 +836,28 @@ func TestSweepExpiredDiskTransferLocks(t *testing.T) {
 		}
 		if obs.Len() != 1 {
 			t.Fatalf("log = %+v, want one line for the removed sentinel", obs.All())
+		}
+	})
+
+	t.Run("a claim that expired just now is left to a stealer", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		// The comment keeps whole seconds, so the sweep runs at a whole second.
+		base := now.Truncate(time.Second)
+		recent := encodeLockComment("crashed", base.Add(-sweepExpiredLockAge()))
+		pools.pools[diskPool("recent")] = recent
+		removed, err := SweepExpiredDiskTransferLocks(at(base), &parkerLockClient{pools: pools}, nil)
+		if err != nil || removed != 1 {
+			t.Fatalf("removed=%d err=%v, want only the long-expired sentinel removed", removed, err)
+		}
+		if pools.pools[diskPool("recent")] != recent {
+			t.Fatal("the sweep deleted a claim that expired inside the steal budget and grace")
+		}
+		// Once the claim is older than the steal budget and grace, the sweep
+		// takes it.
+		removed, err = SweepExpiredDiskTransferLocks(at(base.Add(time.Second)), &parkerLockClient{pools: pools}, nil)
+		if err != nil || removed != 1 {
+			t.Fatalf("removed=%d err=%v, want the now-old claim removed", removed, err)
 		}
 	})
 
