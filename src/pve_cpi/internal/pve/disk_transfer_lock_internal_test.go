@@ -602,28 +602,30 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	}
 }
 
-// TestDiskTransferLockTimeouts_CapTheManagedWait pins how long a crashed
-// holder can block a disk. A managed caller stretches the parker lock's wait
-// to about a whole parker TTL (WithParkerLockWait), and the disk lock's TTL
-// adds only the default parker wait on top of the parker TTL, never that
-// stretched wait. A waiter is bounded by that TTL plus the create grace.
-func TestDiskTransferLockTimeouts_CapTheManagedWait(t *testing.T) {
+// TestDiskTransferLockTimeouts_CoverTheParkerWait pins the disk lock's TTL
+// against the caller's effective parker wait. The TTL is the parker TTL plus
+// that wait, whether it is the default or a managed one from
+// WithParkerLockWait, so the parker acquire inside the disk lock is never
+// shortened by the disk claim. A waiter is bounded by the TTL plus the create
+// grace.
+func TestDiskTransferLockTimeouts_CoverTheParkerWait(t *testing.T) {
 	t.Parallel()
 	parkerTTL := parkerProtectionLockTTLNow()
 	cases := []struct {
-		name string
-		ctx  context.Context
+		name     string
+		ctx      context.Context
+		wantWait time.Duration
 	}{
-		{"default wait", context.Background()},
-		{"managed wait of a whole parker TTL", WithParkerLockWait(context.Background(), parkerTTL)},
-		{"managed wait of an hour", WithParkerLockWait(context.Background(), time.Hour)},
+		{"default wait", context.Background(), parkerProtectionLockTimeout},
+		{"managed wait of a whole parker TTL", WithParkerLockWait(context.Background(), parkerTTL), parkerTTL},
+		{"managed wait of an hour", WithParkerLockWait(context.Background(), time.Hour), time.Hour},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ttl, wait := diskTransferLockTimeouts(tc.ctx)
-			if want := parkerTTL + parkerProtectionLockTimeout; ttl != want {
-				t.Fatalf("ttl = %s, want the parker TTL plus the default parker wait, %s", ttl, want)
+			if want := parkerTTL + tc.wantWait; ttl != want {
+				t.Fatalf("ttl = %s, want the parker TTL plus the caller's parker wait, %s", ttl, want)
 			}
 			if wait != ttl+clusterLockGrace() {
 				t.Fatalf("wait = %s, want the TTL plus the create grace, %s", wait, ttl+clusterLockGrace())
@@ -638,6 +640,44 @@ func TestDiskTransferLockTimeouts_CapTheManagedWait(t *testing.T) {
 			t.Fatalf("ttl = %s, want the test TTL plus the test wait, 2.3s", ttl)
 		}
 	})
+}
+
+// TestWithDiskTransferLock_ManagedParkerWaitSurvivesTheDiskClaim pins that a
+// managed caller's parker acquire inside the disk lock may wait as long as the
+// managed wait less the acquire's own context margin, even a wait longer than a
+// parker TTL. Another holder keeps the
+// parker lock until just before that point, and the acquire must still win it.
+func TestWithDiskTransferLock_ManagedParkerWaitSurvivesTheDiskClaim(t *testing.T) {
+	t.Parallel()
+	const parkerStable = 90000
+	managedWait := 2 * parkerProtectionLockTTLNow()
+	parkerKey := ClusterLockPoolName(fmt.Sprintf("vm-%d", parkerStable))
+	pools := newFakeLockPools()
+	clk := &fakeLockClock{base: time.Now()}
+	holder := encodeLockComment("holder", clk.base.Add(30*time.Minute))
+	pools.pools[parkerKey] = holder
+	holdFor := managedWait - clusterLockContextMargin
+	clk.onSleep = func(elapsed time.Duration) {
+		if elapsed >= holdFor {
+			pools.mu.Lock()
+			if pools.pools[parkerKey] == holder {
+				delete(pools.pools, parkerKey)
+			}
+			pools.mu.Unlock()
+		}
+	}
+	ctx := withTestParkerLockClock(WithParkerLockWait(context.Background(), managedWait), clk.clock())
+	client := &parkerLockClient{pools: pools}
+	ran := false
+	err := withDiskTransferLock(ctx, client, nil, transferStableID, "transfer", func(diskCtx context.Context) error {
+		return withParkerProtectionLock(diskCtx, client, nil, parkerStable, "transfer", func(context.Context) error {
+			ran = true
+			return nil
+		})
+	})
+	if err != nil || !ran {
+		t.Fatalf("err=%v ran=%v, want the parker acquire to outwait a holder for %s", err, ran, holdFor)
+	}
 }
 
 // TestWithDiskTransferLock_UnserializedFallbacksAreLoud covers the two

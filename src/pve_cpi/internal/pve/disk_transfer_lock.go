@@ -34,13 +34,22 @@ func DiskTransferLockPoolName(stableID string) string {
 // shortens the parker lock through withTestParkerLockTimeouts shortens this
 // one too.
 //
-// The wait added to the TTL is capped at the default parker wait, not the
-// longer wait a managed caller asks for (WithParkerLockWait), because the TTL
-// is also how long a crashed holder blocks every other transfer of the disk.
-// On the shipped curves that bound is about 250s: the parker TTL of about
-// 235s plus the 15s default wait. A parker window whose acquire waited longer
-// than the default runs on what is left of the disk claim, which
-// diskTransferWindowContext checks before the window opens.
+// The wait added to the TTL is the caller's own effective parker wait, the
+// default wait or the longer one a managed caller asks for
+// (WithParkerLockWait). A parker window inside this lock runs on what is left
+// of the disk claim, and its lock acquire stops clusterLockContextMargin
+// before the end of that window. A TTL that added only the default wait would
+// leave a managed caller, which managedLockWaitContext promises a parker wait
+// of about one parker TTL, with about 80s of real wait, and several managed
+// disks detaching into one parker could then fail with nothing wrong. So the
+// TTL has to cover the full parker wait, and the disk claim never shortens it.
+//
+// On the shipped curves an unmanaged caller gets about 250s, which is the
+// parker TTL of about 235s plus the 15s default wait. A managed caller gets
+// about 470s, which is the parker TTL plus a managed wait of about one parker
+// TTL. The longer figure is also how long a crashed holder blocks every other
+// transfer of the disk, and we accept that bound because a waiter steals a
+// claim as soon as it expires.
 //
 // The wait is the whole TTL plus the create grace, so a second transfer of the
 // disk waits out a holder that keeps the lock for as long as its claim allows,
@@ -51,7 +60,7 @@ func DiskTransferLockPoolName(stableID string) string {
 // handlers).
 func diskTransferLockTimeouts(ctx context.Context) (time.Duration, time.Duration) {
 	parkerTTL, parkerWait := parkerLockTimeoutsFrom(ctx)
-	ttl := parkerTTL + min(parkerWait, parkerProtectionLockTimeout)
+	ttl := parkerTTL + parkerWait
 	return ttl, ttl + clusterLockGrace()
 }
 

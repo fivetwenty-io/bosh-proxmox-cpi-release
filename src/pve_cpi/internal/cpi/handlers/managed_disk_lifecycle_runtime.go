@@ -274,6 +274,10 @@ func (m *managedDiskLifecycle) finish(ctx context.Context, operationErr error, d
 // several holders can still outlast it, and that timeout is settled cleanly by
 // cleanLockTimeout.
 //
+// The per-disk transfer lock's TTL is the parker TTL plus this wait, so a parker
+// acquire inside the disk lock keeps the whole wait instead of running on a
+// shorter disk claim. That makes the disk claim about 470s on the shipped curves.
+//
 // The wait is the lock's TTL under the retry curves configured now, from
 // pve.ParkerProtectionLockTTLNow, unless the context carries a shorter one under
 // managedLockWaitKey, which only tests set. The wait is a context value, and it
