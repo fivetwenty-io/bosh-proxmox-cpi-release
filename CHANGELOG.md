@@ -12,9 +12,27 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- The pre-push hook now runs `make ci`, which runs the checks from the CI and Security workflows inside the same digest-pinned golang image those workflows use, so a push that passes locally should pass CI. It checks the pushed commits for merge commits and AI attribution, runs `make check` on the checked-out tree, and runs the security scans when the push changes Go code, module files, vendored code, package manifests, a Dockerfile, the Security workflow, or the Makefile. `CI_SECURITY=1` forces the scans and `CI_SECURITY=0` skips them. The hook needs a running Docker, it skips pushes that add no new commits, and `SKIP_CHECKS=1` still bypasses it. A new `make ci-image-check`, which `make check` also runs, fails when the workflows and the Concourse unit task disagree on the golang image digest or the staticcheck and golangci-lint versions. See [CONTRIBUTING](CONTRIBUTING.md) for details.
+
+- The "Refuse AI attribution" CI step now runs the base branch's copy of `scripts/_attribution_check.sh` on a pull request, so a pull request whose branch predates the script no longer fails, and the step never runs a checker from the commits it audits.
+
+- Downgrading from 0.9.2 to 0.9.1 can leave a journal-managed disk's record waiting for an audit. A 0.9.1 CPI doesn't know the per-disk lock, so if a 0.9.2 call stopped while it was creating that lock and PVE's answer was ambiguous, 0.9.1 can't settle the lock step and keeps the record in reconciliation until 0.9.2 runs again. A cluster that runs 0.9.1 and 0.9.2 side by side also gets no per-disk serialization from its 0.9.1 calls.
+
 ### Fixed
 
 - `scripts/certify` could leave its Director running at the end of a run. The teardown step ran `scripts/bosh teardown` without `PVE_CPI_RELEASE_PATH`, so `delete-env` fell back to the newest dev release in the checkout and failed when there was none. Teardown now passes the CPI tarball that the Director was last built with, which is the new CPI once the upgrade has started and the old CPI before that. When certify has no tarball of its own, `scripts/bosh` still chooses one as before. The CPI never deletes a parker, so its parker VMs still outlive the Director, and we remove an empty one by hand as [Recovering empty parker VMs](docs/operations.md#recovering-empty-parker-vms) describes.
+
+- Two `detach_disk` calls for the same disk could race each other. The BOSH Director doesn't serialize a dynamic-disk broker's detach against a deploy's detach of the same disk, and on a live cluster the second call overwrote the first call's finished parker record, tried to attach the volume under the name it had before the move, and failed the deploy with "no such logical volume". Every transfer of a disk into a parker now takes a per-disk cluster lock, keyed on the disk's stable ID, before it takes the parker's lock. That includes journal-managed disks, `delete_vm`'s preserving transfer, `create_vm`'s rollback, and the resume of an unfinished transfer. A second call waits for as long as the first can hold the lock, bounded by its own request deadline, and then finds the disk already parked and returns success without touching it. A transfer that crashes while holding the lock blocks that disk for at most about 250 seconds, or about 470 seconds for a journal-managed disk, whose lock has to outlast its longer parker wait, and then the next call takes the lock over. A parked record that names a different allocation is never adopted, and the call fails as a provenance conflict that needs an audit. A transfer never replaces the record of a disk that has already landed on a parker, and it proves that a released volume still exists before it attaches it. Taking the lock adds about 2.5 seconds to each transfer, because the cluster lock waits that long after it creates its sentinel pool. The parker pool sweep now also deletes the expired per-disk lock sentinels that a crashed transfer leaves behind.
+
+- The CPI retried a storage plugin's answer that a volume does not exist as if it were a transient fault, so the failure above took four attempts to surface. LVM, ZFS, RBD, and plugin "does not exist" answers for a volume are now final, while an answer that names a missing storage or ZFS pool is still retried.
+
+### Security
+
+- The CPI is now built with Go 1.27.2, which fixes ten standard-library vulnerabilities that govulncheck reported as reachable from the CPI in Go 1.27.1. The `golang-1.27` package now carries `go1.27.2.linux-amd64.tar.gz`.
+
+- `golang.org/x/net` moves from v0.58.0 to v0.60.0 to fix CVE-2026-78669, and `golang.org/x/sync`, `golang.org/x/sys`, `golang.org/x/term`, and `golang.org/x/text` move up with it.
 
 ## [0.9.1] - 2026-10-06
 
