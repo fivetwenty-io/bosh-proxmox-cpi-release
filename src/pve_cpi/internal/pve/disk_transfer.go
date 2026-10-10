@@ -1514,8 +1514,18 @@ func finishAlreadyParked(
 	// The managed transfer that waited on the disk lock then stamps its own
 	// allocation onto that record, because the serial on the parker's slot
 	// already proves the record is this disk's. A record that names another
-	// allocation is left alone, and the readback below refuses it.
+	// allocation or namespace is left alone, and the transfer refuses with
+	// audit required, the class the handlers give a managed transfer whose
+	// provenance conflicts (resolveManagedDiskRecord). Two allocations
+	// claim one disk, and neither a retry nor the readback can say which
+	// claim is right.
 	managed := pctx.AllocationID != "" || pctx.AllocationNamespace != ""
+	if managed && recorded && recordNamesOtherAllocation(record, pctx) {
+		return "", cpierrors.Cloud(
+			"transfer in: disk %s on parker vmid %d is recorded under allocation %q in namespace %q, not %q in %q; "+
+				"managed disk transfer provenance conflicts; audit required",
+			pctx.StableID, parkerVMID, record.AllocationID, record.AllocationNamespace, pctx.AllocationID, pctx.AllocationNamespace)
+	}
 	stamp := managed && recorded && record.AllocationID == "" && record.AllocationNamespace == ""
 	if stamp {
 		record.AllocationID = pctx.AllocationID
@@ -1553,6 +1563,15 @@ func finishAlreadyParked(
 		)
 	}
 	return parkedVolid, nil
+}
+
+// recordNamesOtherAllocation reports whether record names an allocation or a
+// namespace other than the one pctx carries. A side that leaves a field empty
+// doesn't count against it, so a record without an allocation is one a
+// managed transfer may stamp.
+func recordNamesOtherAllocation(record parkerProvEntry, pctx ParkContext) bool {
+	return (record.AllocationID != "" && record.AllocationID != pctx.AllocationID) ||
+		(record.AllocationNamespace != "" && record.AllocationNamespace != pctx.AllocationNamespace)
 }
 
 // ResumeDiskTransferToParker completes a detach-side transfer a crash left

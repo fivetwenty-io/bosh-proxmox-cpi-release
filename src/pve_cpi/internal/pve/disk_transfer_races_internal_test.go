@@ -928,28 +928,42 @@ func raceTwoTransfers(t *testing.T, order [2]ParkContext) transferRace {
 
 // TestTransferDiskToParker_AlreadyParkedUnderAnotherAllocation pins that a
 // managed transfer never stamps its allocation over a record that already
-// names a different one. It moves nothing, writes nothing, and refuses for
-// reconciliation.
+// names a different allocation or namespace. It moves nothing, writes
+// nothing, and refuses permanently with audit required, because two
+// allocations claim the disk.
 func TestTransferDiskToParker_AlreadyParkedUnderAnotherAllocation(t *testing.T) {
 	t.Parallel()
-	c := transferSourceAndParker()
-	first, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg,
-		ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID, AllocationID: "alloc-1", AllocationNamespace: "ns-1"})
-	if err != nil {
-		t.Fatalf("first transfer: %v", err)
+	cases := []struct {
+		name      string
+		id, space string
+	}{
+		{"another allocation", "alloc-2", "ns-1"},
+		{"another namespace", "alloc-1", "ns-2"},
 	}
-	before := c.parkedEntries(t)[transferStableID]
-	mark := len(c.events)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := transferSourceAndParker()
+			first, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg,
+				ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID, AllocationID: "alloc-1", AllocationNamespace: "ns-1"})
+			if err != nil {
+				t.Fatalf("first transfer: %v", err)
+			}
+			before := c.parkedEntries(t)[transferStableID]
+			mark := len(c.events)
 
-	_, err = TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg,
-		ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID, AllocationID: "alloc-2", AllocationNamespace: "ns-1"})
-	if err == nil || !strings.Contains(err.Error(), "requires reconciliation") {
-		t.Fatalf("a transfer under another allocation returned %v, want a refusal for reconciliation", err)
-	}
-	if after := mutationEvents(c.events, mark); len(after) != 0 {
-		t.Fatalf("the refused transfer changed state: %v", after)
-	}
-	if after := c.parkedEntries(t)[transferStableID]; !reflect.DeepEqual(after, before) || after.Volid != first {
-		t.Fatalf("the record changed from %+v to %+v", before, after)
+			_, err = TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg,
+				ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID, AllocationID: tc.id, AllocationNamespace: tc.space})
+			var cpiErr *cpierrors.Error
+			if !errors.As(err, &cpiErr) || cpiErr.OkToRetry() || !strings.HasSuffix(err.Error(), "provenance conflicts; audit required") {
+				t.Fatalf("a transfer under another allocation returned %v, want a permanent audit-required refusal", err)
+			}
+			if after := mutationEvents(c.events, mark); len(after) != 0 {
+				t.Fatalf("the refused transfer changed state: %v", after)
+			}
+			if after := c.parkedEntries(t)[transferStableID]; !reflect.DeepEqual(after, before) || after.Volid != first {
+				t.Fatalf("the record changed from %+v to %+v", before, after)
+			}
+		})
 	}
 }
