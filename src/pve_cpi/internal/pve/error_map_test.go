@@ -827,9 +827,20 @@ func TestIsVolumeMissing_LvmthinCantGetSize(t *testing.T) {
 
 func TestIsVolumeMissing_ZfspoolDatasetMissing(t *testing.T) {
 	t.Parallel()
-	err := errors.New(`zfs error: dataset does not exist`)
+	err := errors.New(`zfs error: cannot open 'rpool/data/vm-100-disk-1': dataset does not exist`)
 	if !pve.IsVolumeMissing(err) {
 		t.Errorf("expected zfspool 'dataset does not exist' to classify as missing; err=%v", err)
+	}
+	// The same verdict about the pool or a parent dataset means the storage
+	// is missing, which says nothing about the volume.
+	for _, text := range []string{
+		`zfs error: cannot open 'rpool/data': dataset does not exist`,
+		`zfs error: cannot open 'rpool': no such pool or dataset`,
+		`zfs error: dataset does not exist`,
+	} {
+		if pve.IsVolumeMissing(errors.New(text)) {
+			t.Errorf("IsVolumeMissing(%q) = true, want false for a verdict that doesn't name the volume", text)
+		}
 	}
 }
 
@@ -1061,7 +1072,7 @@ func TestExistsTolerant_FoldsLVMThinMissing(t *testing.T) {
 
 func TestExistsTolerant_FoldsZFSPoolMissing(t *testing.T) {
 	t.Parallel()
-	rawErr := errors.New("zfs error: dataset does not exist")
+	rawErr := errors.New("zfs error: cannot open 'rpool/vm-200-disk-0': dataset does not exist")
 	c := existsTolerantClient(func(_ context.Context, _, _, _ string) (bool, error) {
 		return false, rawErr
 	})
@@ -1464,6 +1475,12 @@ func TestIsStorageVolumeMissing(t *testing.T) {
 		{"lvm live text", liveNoSuchLogicalVolume, true},
 		{"lvm lookup", "Failed to find logical volume \"pve/vm-100-disk-0\"", true},
 		{"zfs", "cannot open 'rpool/data/vm-100-disk-0': dataset does not exist", true},
+		{"zfs container volume", "zfs error: cannot open 'tank/subvol-101-disk-0': dataset does not exist", true},
+		// zfs says the same about a pool or a parent dataset, which means the
+		// storage is missing, not the volume.
+		{"zfs parent dataset", "zfs error: cannot open 'rpool/data': dataset does not exist", false},
+		{"zfs pool", "zfs error: cannot open 'rpool': dataset does not exist", false},
+		{"zfs without a path", "zfs error: dataset does not exist", false},
 		{"rbd", "rbd: error opening image vm-100-disk-0: (2) No such file or directory", true},
 		{"plugin quoted", "volume 'local:100/vm-100-disk-0.qcow2' does not exist", true},
 		{"plugin bare", "volume local-lvm:vm-100-disk-0 does not exist", true},
@@ -1541,6 +1558,11 @@ func TestWrapConfigReadError(t *testing.T) {
 		{"500 is a server fault", makeAPIErr(500, "internal error"), true},
 		{"596 transport shape", errors.New("pveproxy backend gone (code: 596)"), true},
 		{"unrecognized prose stays permanent", errors.New("something we do not model"), false},
+		// A storage plugin's missing-volume verdict skips the 5xx fallback, as
+		// IsTransientTransport skips it, and WrapError's own 5xx verdict still
+		// hands it to the Director as retriable, because the Director's retry
+		// re-resolves the disk under the name it has now.
+		{"500 naming a missing volume", makeAPIErr(500, "no such logical volume labdata/vm-6535-disk-2"), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

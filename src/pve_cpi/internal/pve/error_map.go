@@ -51,9 +51,10 @@ func WrapConfigReadError(err error) error {
 	// Any 5xx on a config read is the server failing, not a verdict about the
 	// request: a cycling pvedaemon worker answers this way and comes back within
 	// seconds. IsTransientTransport catches the wrapped shapes; this catches a
-	// bare APIError carrying only the code. The permanent 500-with-text shapes
-	// are excluded for the same reason IsTransientTransport excludes them.
-	if code, ok := apiHTTPCode(err); ok && code >= 500 && !IsVolumeFormatUnknown(err) {
+	// bare APIError carrying only the code. The 500-with-text verdicts that
+	// never change are excluded for the same reason IsTransientTransport
+	// excludes them, and WrapError then classifies them.
+	if code, ok := apiHTTPCode(err); ok && code >= 500 && !IsVolumeFormatUnknown(err) && !IsStorageVolumeMissing(err) {
 		return cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, "PVE server error")
 	}
 	return WrapError(err)
@@ -319,8 +320,12 @@ func IsNotFound(err error) bool {
 //   - lvmthin: GET /nodes/<n>/storage/<s>/content/<volid> on a deleted LV
 //     returns 500 with "can't get size of '/dev/<vg>/<lv>': Failed to find
 //     logical volume \"<vg>/<lv>\"". Either substring is sufficient.
-//   - zfspool: similar pattern with "dataset does not exist" or
-//     "no such pool or dataset".
+//   - zfspool: "cannot open '<pool>/<path>/<volume>': dataset does not
+//     exist" or "... no such pool or dataset", only when the path ends in a
+//     PVE volume name (zfsVolumeMissingPattern). The same text about a pool
+//     or a parent dataset means the storage is missing, not the volume, and
+//     reporting that as an absence would let an idempotent delete call a
+//     volume gone that it never reached.
 //   - rbd: the imgdel task body carries the librbd wording, "error opening
 //     image <name>: (2) No such file or directory". The errno is what makes
 //     it an absence: rbd reports connectivity and permission faults through
@@ -349,9 +354,7 @@ func IsVolumeMissing(err error) bool {
 		return true
 	case strings.Contains(msg, "can't get size of"):
 		return true
-	case strings.Contains(msg, "dataset does not exist"):
-		return true
-	case strings.Contains(msg, "no such pool or dataset"):
+	case zfsVolumeMissingPattern.MatchString(msg):
 		return true
 	case strings.Contains(msg, "error opening image") && strings.Contains(msg, "no such file or directory"):
 		return true
@@ -995,6 +998,15 @@ func IsVolumeFormatUnknown(err error) bool {
 // or without the quotes.
 var storageVolumeMissingPattern = regexp.MustCompile(`volume '?[^\s']+'? does not exist`)
 
+// zfsVolumeMissingPattern is zfs's verdict on a missing dataset, anchored to a
+// dataset path whose last component is a PVE volume name, as in "cannot open
+// 'rpool/data/vm-100-disk-1': dataset does not exist". The same words about a
+// pool or a parent dataset, such as 'rpool/data', mean the storage itself is
+// missing or unreachable, which says nothing about the volume, so they don't
+// match.
+var zfsVolumeMissingPattern = regexp.MustCompile(
+	`cannot open '[^']*/(?:vm|base|subvol|basevol)-\d+-[^'/]+': (?:dataset does not exist|no such pool or dataset)`)
+
 // IsStorageVolumeMissing reports whether err is a storage plugin's verdict
 // that the volume a request names does not exist. PVE answers a config write
 // or a storage call that names a missing volume with HTTP 500 and the plugin's
@@ -1006,9 +1018,10 @@ var storageVolumeMissingPattern = regexp.MustCompile(`volume '?[^\s']+'? does no
 //	no such logical volume labdata/vm-6535-disk-2
 //
 // The other shapes are the equivalents from the LVM tools ("Failed to find
-// logical volume"), zfs ("dataset does not exist"), librbd ("error opening
-// image" with errno 2), and qemu-server's own check on a config write
-// ("volume ... does not exist").
+// logical volume"), zfs ("dataset does not exist" about the volume's own
+// dataset, see zfsVolumeMissingPattern), librbd ("error opening image" with
+// errno 2), and qemu-server's own check on a config write ("volume ... does
+// not exist").
 //
 // Only the retry loops read this. It stops them from re-sending a request whose
 // answer will not change. It does not on its own prove that the volume is gone,
@@ -1028,7 +1041,7 @@ func IsStorageVolumeMissing(err error) bool {
 		return true
 	case strings.Contains(msg, "failed to find logical volume"):
 		return true
-	case strings.Contains(msg, "dataset does not exist"):
+	case zfsVolumeMissingPattern.MatchString(msg):
 		return true
 	case strings.Contains(msg, "error opening image") && strings.Contains(msg, "no such file or directory"):
 		return true
