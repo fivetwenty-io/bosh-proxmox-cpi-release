@@ -156,7 +156,7 @@ RUN GOBIN=/usr/local/bin go install honnef.co/go/tools/cmd/staticcheck@${STATICC
  && GOBIN=/usr/local/bin go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC} \
  && go clean -cache -modcache
 RUN arch=$(dpkg --print-architecture) \
- && case "$arch" in amd64) asset=64bit ;; arm64) asset=ARM64 ;; *) echo "no trivy build for $arch" >&2; exit 1 ;; esac \
+ && if [ "$arch" = amd64 ]; then asset=64bit; elif [ "$arch" = arm64 ]; then asset=ARM64; else echo "no trivy build for $arch" >&2; exit 1; fi \
  && curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/${TRIVY}/trivy_${TRIVY#v}_Linux-${asset}.tar.gz" \
     | tar -xz -C /usr/local/bin trivy
 DOCKERFILE
