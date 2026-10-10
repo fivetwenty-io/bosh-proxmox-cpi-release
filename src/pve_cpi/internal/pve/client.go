@@ -237,6 +237,42 @@ func (s *sdkPoolService) ReadPoolComment(ctx context.Context, poolID string) (st
 	return *resp.Comment, nil
 }
 
+// PoolCommentLister lists every pool PVE has, with each pool's comment, keyed
+// by pool ID. It is an optional extension of PoolService, which the sweep of
+// expired per-disk transfer locks needs (SweepExpiredDiskTransferLocks). A
+// pool service that doesn't implement it leaves that sweep with nothing to do.
+type PoolCommentLister interface {
+	ListPoolComments(ctx context.Context) (map[string]string, error)
+}
+
+// ListPoolComments implements PoolCommentLister via GET /pools. A pool listed
+// without a comment maps to the empty string.
+func (s *sdkPoolService) ListPoolComments(ctx context.Context) (map[string]string, error) {
+	resp, err := s.svc.ListPools(ctx, nil)
+	if err != nil {
+		return nil, cpierrors.Wrap(err, "PoolService.ListPoolComments: list pools")
+	}
+	out := map[string]string{}
+	if resp == nil {
+		return out, nil
+	}
+	for _, raw := range *resp {
+		var item struct {
+			Poolid  string  `json:"poolid"`
+			Comment *string `json:"comment"`
+		}
+		if json.Unmarshal(raw, &item) != nil || item.Poolid == "" {
+			continue
+		}
+		comment := ""
+		if item.Comment != nil {
+			comment = *item.Comment
+		}
+		out[item.Poolid] = comment
+	}
+	return out, nil
+}
+
 // PoolHasVM implements PoolService.PoolHasVM via GET /pools/{poolid},
 // decoding the members list and matching on vmid. See the interface doc.
 func (s *sdkPoolService) PoolHasVM(ctx context.Context, poolID string, vmid int64) (bool, error) {

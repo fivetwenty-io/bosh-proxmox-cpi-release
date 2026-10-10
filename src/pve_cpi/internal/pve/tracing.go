@@ -654,6 +654,18 @@ func (t *tracedPoolService) ReadPoolComment(ctx context.Context, poolID string) 
 	return reader.ReadPoolComment(ctx, poolID)
 }
 
+// ListPoolComments forwards PoolCommentLister. A wrapped service that cannot
+// list pools fails the list, which the expired-lock sweep reports and skips.
+func (t *tracedPoolService) ListPoolComments(ctx context.Context) (comments map[string]string, err error) {
+	ctx, span := t.tracer.Start(ctx, "pve.pools.list_pool_comments")
+	defer func() { finishSpan(span, err) }()
+	lister, ok := t.PoolService.(PoolCommentLister)
+	if !ok {
+		return nil, errors.New("wrapped pool service cannot list pools")
+	}
+	return lister.ListPoolComments(ctx)
+}
+
 func (t *tracedPoolService) GetPoolComment(ctx context.Context, poolID string) (comment string, found bool, err error) {
 	ctx, span := t.tracer.Start(ctx, "pve.pools.get_pool_comment", trace.WithAttributes(attribute.String("pve.pool_id", poolID)))
 	defer func() { finishSpan(span, err) }()
