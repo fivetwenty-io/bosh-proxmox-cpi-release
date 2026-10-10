@@ -3,7 +3,8 @@
 # workflows' own digest-pinned golang image under Docker. That covers the
 # linear-history and AI-attribution checks over the commits being pushed, the
 # `make check` gate, and the security scans when the push changes Go source,
-# go.mod, go.sum, or vendored code. A push that passes here should pass CI.
+# go.mod, go.sum, vendor/, package.json, package-lock.json, any Dockerfile,
+# .github/workflows/security.yml, or the root Makefile. A push that passes here should pass CI.
 # Docker has to be running, and the hook fails with a message when it is not.
 #
 # Git feeds this hook one "<local ref> <local sha> <remote ref> <remote sha>"
@@ -24,7 +25,19 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     # A branch or tag deletion pushes no commits, so it needs neither Docker
     # nor the gate.
     [ "$local_sha" = "$zero" ] && continue
-    if [ -n "$head_sha" ] && [ "$local_sha" != "$head_sha" ]; then
+    # Compare commits, not raw shas, so an annotated tag of HEAD does not warn.
+    local_commit=$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null)
+    # A ref whose commit origin/main, or the remote sha, already reaches pushes
+    # nothing new, so it needs no Docker.
+    if [ -n "$local_commit" ]; then
+        if git merge-base --is-ancestor "$local_commit" origin/main 2>/dev/null; then
+            continue
+        fi
+        if [ "$remote_sha" != "$zero" ] && git merge-base --is-ancestor "$local_commit" "$remote_sha" 2>/dev/null; then
+            continue
+        fi
+    fi
+    if [ -n "$head_sha" ] && [ "$local_commit" != "$head_sha" ]; then
         echo "pre-push: warning: pushing $local_sha but HEAD is $head_sha; make ci tests the checked-out tree, not the pushed ref." >&2
     fi
     ranges="${ranges}${remote_sha} ${local_sha}
