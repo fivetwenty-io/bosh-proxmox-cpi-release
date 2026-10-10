@@ -139,7 +139,11 @@ auto)
 *) die "CI_SECURITY must be 1, 0, or auto, not '${CI_SECURITY}'" ;;
 esac
 
-dockerfile=$(cat <<'DOCKERFILE'
+# The Dockerfile lives in a function, not a $(...) heredoc, because macOS
+# /bin/sh and bash 3.2 join backslash continuations inside one and dash does
+# not, so every shell has to see identical text.
+dockerfile() {
+	cat <<'DOCKERFILE'
 ARG BASE
 FROM ${BASE}
 ARG STATICCHECK
@@ -160,13 +164,13 @@ RUN arch=$(dpkg --print-architecture) \
  && curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/${TRIVY}/trivy_${TRIVY#v}_Linux-${asset}.tar.gz" \
     | tar -xz -C /usr/local/bin trivy
 DOCKERFILE
-)
+}
 
 # Build the local layer once per image digest, tool-version set, and Dockerfile.
-tag="bosh-proxmox-cpi-ci:$(printf '%s %s %s %s %s %s\n%s' "$image" "$staticcheck_v" "$golangci_v" "$govulncheck_v" "$gosec_v" "$trivy_v" "$dockerfile" | shasum -a 256 | cut -c1-12)"
+tag="bosh-proxmox-cpi-ci:$({ printf '%s %s %s %s %s %s\n' "$image" "$staticcheck_v" "$golangci_v" "$govulncheck_v" "$gosec_v" "$trivy_v"; dockerfile; } | shasum -a 256 | cut -c1-12)"
 if ! docker image inspect "$tag" >/dev/null 2>&1; then
 	echo "ci: building $tag from $image (one time per digest, tool-version set, and Dockerfile)"
-	printf '%s\n' "$dockerfile" | docker build --quiet -t "$tag" \
+	dockerfile | docker build --quiet -t "$tag" \
 		--build-arg "BASE=$image" \
 		--build-arg "STATICCHECK=$staticcheck_v" \
 		--build-arg "GOLANGCI=$golangci_v" \
