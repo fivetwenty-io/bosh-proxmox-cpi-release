@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-10
+
 ### Changed
 
 - The pre-push hook now runs `make ci`, which runs the checks from the CI and Security workflows inside the same digest-pinned golang image those workflows use, so a push that passes locally should pass CI. It checks the pushed commits for merge commits and AI attribution, runs `make check` on the checked-out tree, and runs the security scans when the push changes Go code, module files, vendored code, package manifests, a Dockerfile, the Security workflow, or the Makefile. `CI_SECURITY=1` forces the scans and `CI_SECURITY=0` skips them. The hook needs a running Docker, it skips pushes that add no new commits, and `SKIP_CHECKS=1` still bypasses it. A new `make ci-image-check`, which `make check` also runs, fails when the workflows and the Concourse unit task disagree on the golang image digest or the staticcheck and golangci-lint versions. See [CONTRIBUTING](CONTRIBUTING.md) for details.
@@ -704,7 +706,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.0...v0.8.1
