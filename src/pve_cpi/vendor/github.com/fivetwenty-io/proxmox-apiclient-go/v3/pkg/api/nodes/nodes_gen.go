@@ -2433,7 +2433,7 @@ func (s *service) DeleteCephMds(ctx context.Context, node string, name string) (
 
 // CreateCephMdsParams is the request payload for CreateCephMds.
 type CreateCephMdsParams struct {
-	// Hotstandby Determines whether a ceph-mds daemon should poll and replay the log of an active MDS. Faster switch on MDS failure, but needs more idle resources.
+	// Hotstandby Determines whether a ceph-mds daemon should poll and replay the log of an active MDS. Faster switch on MDS failure, but needs more idle resources. Deprecated: the setting was removed in Ceph 14.1.1.
 	Hotstandby *bool `json:"hotstandby,omitempty"`
 }
 
@@ -3504,7 +3504,7 @@ func (s *service) CreateCephRestart(ctx context.Context, node string, params *Cr
 type CreateCephRestartBulkParams struct {
 	// DryRun Log the plan (which OSDs would be restarted, in what order) without actually doing anything.
 	DryRun *bool `json:"dry-run,omitempty"`
-	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. HEALTH_ERR is always fatal regardless. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
+	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. A blocking HEALTH_ERR is fatal regardless of this flag. Checks that ceph reports as muted, and checks known to be harmless for a rolling restart, never block and are named in the task log. The cluster-wide OSD map flags are only ever evaluated for an OSD restart, since they govern nothing a mon, mgr or mds restart touches. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
 	Force *bool `json:"force,omitempty"`
 	// OnlyOutdated Restart only OSDs whose running version differs from the locally-installed ceph-osd binary. Useful for post-upgrade rolling restarts that should touch only daemons that need it. Refuses if the local binary version cannot be determined. Ignored on resume (the saved plan is used as-is).
 	OnlyOutdated *bool `json:"only-outdated,omitempty"`
