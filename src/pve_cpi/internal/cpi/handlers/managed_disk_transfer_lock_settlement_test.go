@@ -77,7 +77,7 @@ func TestLockStepSentinelsTakeTheDiskLockFromTheStep(t *testing.T) {
 	if got := diskTransferLockStepParameters(pve.ClusterLockPoolName("vm-90000")); got != nil {
 		t.Fatalf("a parker lock sentinel recorded parameters %s", got)
 	}
-	if _, err := aj.MutationParameters(json.RawMessage(params)); err != nil {
+	if _, err := aj.MutationParameters(params); err != nil {
 		t.Fatalf("the journal refuses the per-disk lock parameters: %v", err)
 	}
 	step := func(kind string, state aj.State, parameters json.RawMessage) aj.Step {
@@ -285,58 +285,70 @@ func TestDiskLockStepSettlesForEveryTransferOperation(t *testing.T) {
 		t.Run(tc.operation, func(t *testing.T) {
 			deps, journal, locks, id, stepAndToken := tc.build(t)
 			step, token, _ := strings.Cut(stepAndToken, "|")
-			diskLock := pve.DiskTransferLockPoolName(token)
-			log := &sentinelReadLog{}
-			pools := diskLockReadPools{PoolService: deps.PVE.Pools(), sentinel: diskLock, log: log,
-				fail: poolVerdictError("permission check failed for /pool/" + diskLock + " (Pool.Audit)")}
-			deps.PVE = diskLockReadClient{Client: deps.PVE, pools: pools}
-
-			settle := func() (aj.Record, map[string]error) {
-				t.Helper()
-				handle, err := journal.Acquire(t.Context(), id)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					if err := handle.Close(); err != nil {
-						t.Error(err)
-					}
-				}()
-				if handle.Record().Kind != tc.kind {
-					t.Fatalf("the record is a %s record, want %s", handle.Record().Kind, tc.kind)
-				}
-				gaps, err := settlePlannedLockSteps(t.Context(), deps, handle)
-				if err != nil {
-					t.Fatalf("settlement failed: %v", err)
-				}
-				return handle.Record(), gaps
-			}
-
-			record, gaps := settle()
-			if !slices.Contains(log.names(), diskLock) {
-				t.Fatalf("settlement read %v, never the step's own sentinel %s", log.names(), diskLock)
-			}
-			if stepByID(t, record, step).State != aj.Planned {
-				t.Fatal("an ambiguous read of the step's own sentinel settled the step")
-			}
-			if gap := gaps[step]; gap == nil || !strings.Contains(gap.Error(), "PVE did not answer exactly for sentinel "+diskLock) {
-				t.Fatalf("gap = %v, want it to name the per-disk lock it could not read", gap)
-			}
-
-			pools.fail = nil
-			deps.PVE = diskLockReadClient{Client: deps.PVE.(diskLockReadClient).Client, pools: pools}
-			record, gaps = settle()
-			if len(gaps) != 0 {
-				t.Fatalf("gaps = %v, want the ownerless readback to settle the step", gaps)
-			}
-			if stepByID(t, record, step).State != aj.Observed {
-				t.Fatalf("the readback left the step %s", stepByID(t, record, step).State)
-			}
-			locks.mu.Lock()
-			defer locks.mu.Unlock()
-			if len(locks.pools) != 0 {
-				t.Fatalf("settlement created or left a sentinel: %v", locks.pools)
-			}
+			assertDiskLockStepSettles(t, deps, journal, locks, tc.kind, id, step, token)
 		})
+	}
+}
+
+// assertDiskLockStepSettles settles the record id twice: first while PVE
+// answers the step's own per-disk lock sentinel ambiguously, which must leave
+// the step planned with a gap naming that sentinel, and then while PVE answers
+// that the sentinel is missing, which must settle the step and leave no
+// sentinel behind.
+func assertDiskLockStepSettles(t *testing.T, deps Deps, journal *aj.Journal, locks *lockContention,
+	kind, id, step, token string,
+) {
+	t.Helper()
+	diskLock := pve.DiskTransferLockPoolName(token)
+	log := &sentinelReadLog{}
+	pools := diskLockReadPools{PoolService: deps.PVE.Pools(), sentinel: diskLock, log: log,
+		fail: poolVerdictError("permission check failed for /pool/" + diskLock + " (Pool.Audit)")}
+	deps.PVE = diskLockReadClient{Client: deps.PVE, pools: pools}
+
+	settle := func() (aj.Record, map[string]error) {
+		t.Helper()
+		handle, err := journal.Acquire(t.Context(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := handle.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if handle.Record().Kind != kind {
+			t.Fatalf("the record is a %s record, want %s", handle.Record().Kind, kind)
+		}
+		gaps, err := settlePlannedLockSteps(t.Context(), deps, handle)
+		if err != nil {
+			t.Fatalf("settlement failed: %v", err)
+		}
+		return handle.Record(), gaps
+	}
+
+	record, gaps := settle()
+	if !slices.Contains(log.names(), diskLock) {
+		t.Fatalf("settlement read %v, never the step's own sentinel %s", log.names(), diskLock)
+	}
+	if stepByID(t, record, step).State != aj.Planned {
+		t.Fatal("an ambiguous read of the step's own sentinel settled the step")
+	}
+	if gap := gaps[step]; gap == nil || !strings.Contains(gap.Error(), "PVE did not answer exactly for sentinel "+diskLock) {
+		t.Fatalf("gap = %v, want it to name the per-disk lock it could not read", gap)
+	}
+
+	pools.fail = nil
+	deps.PVE = diskLockReadClient{Client: deps.PVE.(diskLockReadClient).Client, pools: pools}
+	record, gaps = settle()
+	if len(gaps) != 0 {
+		t.Fatalf("gaps = %v, want the ownerless readback to settle the step", gaps)
+	}
+	if stepByID(t, record, step).State != aj.Observed {
+		t.Fatalf("the readback left the step %s", stepByID(t, record, step).State)
+	}
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if len(locks.pools) != 0 {
+		t.Fatalf("settlement created or left a sentinel: %v", locks.pools)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -145,6 +146,15 @@ func lockStepSentinels(record aj.Record) []string {
 // predates the per-disk lock still reads the record.
 const diskTransferLockStepKind = "disk_transfer_lock"
 
+// diskTransferLockStepFields is the shape of a per-disk lock step's
+// parameters. Its fields are in key order, so it encodes to the same canonical
+// JSON a map would.
+type diskTransferLockStepFields struct {
+	Kind      string `json:"kind"`
+	Resources string `json:"resources"`
+	Version   int    `json:"version"`
+}
+
 // diskTransferLockStepParameters returns the parameters a lifecycle guard
 // records for a sentinel create or delete of pool: the stable ID of the disk
 // whose per-disk transfer lock pool is, and nil for every other sentinel.
@@ -153,7 +163,7 @@ func diskTransferLockStepParameters(pool string) json.RawMessage {
 	if !ok {
 		return nil
 	}
-	raw, err := json.Marshal(map[string]any{"version": 1, "kind": diskTransferLockStepKind, "resources": token})
+	raw, err := json.Marshal(diskTransferLockStepFields{Kind: diskTransferLockStepKind, Resources: token, Version: 1})
 	if err != nil {
 		return nil
 	}
@@ -174,18 +184,27 @@ func diskTransferLockPoolToken(pool string) (string, bool) {
 // record for the per-disk transfer lock it took, and false when the step
 // records none, or anything other than exactly that.
 func diskTransferLockStepToken(step aj.Step) (string, bool) {
-	var fields map[string]any
-	if len(step.Parameters) == 0 || json.Unmarshal(step.Parameters, &fields) != nil || len(fields) != 3 {
+	var fields diskTransferLockStepFields
+	if len(step.Parameters) == 0 || json.Unmarshal(step.Parameters, &fields) != nil {
 		return "", false
 	}
-	if fields["version"] != float64(1) || fields["kind"] != diskTransferLockStepKind {
+	// The step must hold exactly what the guard writes for that token, which
+	// rules out another kind, another version, extra keys, and keys that only
+	// match the field names without regard to case.
+	want := diskTransferLockStepParameters(pve.DiskTransferLockPoolName(fields.Resources))
+	if want == nil || !sameJSONValue(step.Parameters, want) {
 		return "", false
 	}
-	token, _ := fields["resources"].(string)
-	if got, ok := diskTransferLockPoolToken(pve.DiskTransferLockPoolName(token)); !ok || got != token {
-		return "", false
+	return fields.Resources, true
+}
+
+// sameJSONValue reports whether a and b decode to the same JSON value.
+func sameJSONValue(a, b json.RawMessage) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
 	}
-	return token, true
+	return reflect.DeepEqual(av, bv)
 }
 
 // lockSettlementGap says why settlement left a lock step planned. Its text is

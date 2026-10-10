@@ -793,8 +793,7 @@ func (l *listingLockPools) ListPoolComments(context.Context) (map[string]string,
 // TestSweepExpiredDiskTransferLocks covers the sweep of per-disk lock
 // sentinels a crashed transfer left behind. It deletes only a per-disk
 // sentinel whose claim has expired and still reads the same, and it leaves a
-// live claim, a claim that expired too recently for a stealer to have taken
-// it, a comment it can't parse, another lock's sentinel, a claim that changed
+// live claim, a comment it can't parse, another lock's sentinel, a claim that changed
 // after the listing, and one whose re-read ran over the steal budget.
 func TestSweepExpiredDiskTransferLocks(t *testing.T) {
 	t.Parallel()
@@ -836,28 +835,6 @@ func TestSweepExpiredDiskTransferLocks(t *testing.T) {
 		}
 		if obs.Len() != 1 {
 			t.Fatalf("log = %+v, want one line for the removed sentinel", obs.All())
-		}
-	})
-
-	t.Run("a claim that expired just now is left to a stealer", func(t *testing.T) {
-		t.Parallel()
-		pools := fixture()
-		// The comment keeps whole seconds, so the sweep runs at a whole second.
-		base := now.Truncate(time.Second)
-		recent := encodeLockComment("crashed", base.Add(-sweepExpiredLockAge()))
-		pools.pools[diskPool("recent")] = recent
-		removed, err := SweepExpiredDiskTransferLocks(at(base), &parkerLockClient{pools: pools}, nil)
-		if err != nil || removed != 1 {
-			t.Fatalf("removed=%d err=%v, want only the long-expired sentinel removed", removed, err)
-		}
-		if pools.pools[diskPool("recent")] != recent {
-			t.Fatal("the sweep deleted a claim that expired inside the steal budget and grace")
-		}
-		// Once the claim is older than the steal budget and grace, the sweep
-		// takes it.
-		removed, err = SweepExpiredDiskTransferLocks(at(base.Add(time.Second)), &parkerLockClient{pools: pools}, nil)
-		if err != nil || removed != 1 {
-			t.Fatalf("removed=%d err=%v, want the now-old claim removed", removed, err)
 		}
 	})
 
@@ -929,6 +906,42 @@ func TestSweepExpiredDiskTransferLocks(t *testing.T) {
 			t.Fatal("a failed listing was not reported")
 		}
 	})
+}
+
+// TestSweepExpiredDiskTransferLocks_LeavesAFreshExpiry leaves a claim that
+// expired too recently for a stealer to have taken it, since the sweep's
+// delete is unconditional, and takes it once it is older than the steal budget
+// and grace.
+func TestSweepExpiredDiskTransferLocks_LeavesAFreshExpiry(t *testing.T) {
+	t.Parallel()
+	// The comment keeps whole seconds, so the sweep runs at a whole second.
+	base := time.Now().Truncate(time.Second)
+	at := func(t time.Time) context.Context {
+		return withTestParkerLockClock(context.Background(), lockClock{
+			now:   func() time.Time { return t },
+			sleep: func(context.Context, time.Duration) error { return nil },
+		})
+	}
+	diskPool := func(id string) string { return ClusterLockPoolName(diskTransferLockName(id)) }
+	pools := &listingLockPools{fakeLockPools: newFakeLockPools()}
+	pools.pools[diskPool("old")] = encodeLockComment("crashed", base.Add(-time.Minute))
+	recent := encodeLockComment("crashed", base.Add(-sweepExpiredLockAge()))
+	pools.pools[diskPool("recent")] = recent
+
+	removed, err := SweepExpiredDiskTransferLocks(at(base), &parkerLockClient{pools: pools}, nil)
+	if err != nil || removed != 1 {
+		t.Fatalf("removed=%d err=%v, want only the long-expired sentinel removed", removed, err)
+	}
+	if pools.pools[diskPool("recent")] != recent {
+		t.Fatal("the sweep deleted a claim that expired inside the steal budget and grace")
+	}
+	removed, err = SweepExpiredDiskTransferLocks(at(base.Add(time.Second)), &parkerLockClient{pools: pools}, nil)
+	if err != nil || removed != 1 {
+		t.Fatalf("removed=%d err=%v, want the now-old claim removed", removed, err)
+	}
+	if _, ok := pools.pools[diskPool("recent")]; ok {
+		t.Fatal("the now-old claim is still there")
+	}
 }
 
 // TestTracedPoolService_ListPoolComments forwards the listing when the wrapped
