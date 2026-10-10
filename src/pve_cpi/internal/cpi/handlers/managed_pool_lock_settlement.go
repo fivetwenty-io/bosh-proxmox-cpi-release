@@ -47,7 +47,12 @@ import (
 
 // lockStepKinds are the step kinds a guard writes for a sentinel mutation. The
 // lifecycle and parker guards admit a Pool mutation only for a bosh-lock-
-// sentinel.
+// sentinel. Under a disk record that sentinel is a parker's or a VMID's
+// "vm-<vmid>" lock, or, for an operation that transfers the disk into a
+// parker, the disk's own per-disk transfer lock, "disk-<stable ID>", which the
+// transfer takes around its parker windows. A step doesn't record which of
+// them it meant, and its target names no VMID for the disk lock, so
+// lockStepSentinels lists them all.
 //
 // A VM record's pool steps are listed too, although a step does not record
 // which pool it meant. Its CreatePool is either the deployment pool's ensure or
@@ -73,11 +78,16 @@ func isLockStep(step aj.Step) bool {
 }
 
 // lockStepSentinels names every sentinel a lock step in record could have
-// meant. The disk guards only ever lock a parker's protection window or a
-// VMID, and both are keyed "vm-<vmid>", so the candidates are the sentinels of
-// every VM the active attempt's steps target. A VM record adds its instance
-// group's anti-affinity sentinel, rebuilt exactly as acquireAntiAffinityLock
-// names it, whenever the record froze a group.
+// meant. The disk guards lock a parker's protection window or a VMID, both
+// keyed "vm-<vmid>", and an operation that transfers the disk into a parker
+// also takes the disk's own per-disk transfer lock, keyed "disk-<stable ID>".
+// So the candidates are the sentinels of every VM the active attempt's steps
+// target, and for a disk record whose active attempt has a planned lock step
+// of such an operation (takesDiskTransferLock), the per-disk lock of the disk
+// the record's token names, which is the disk's stable ID. A lock step that
+// was already observed is never settled, so it adds no candidate. A VM record adds its
+// instance group's anti-affinity sentinel, rebuilt exactly as
+// acquireAntiAffinityLock names it, whenever the record froze a group.
 //
 // A VM record's pool step never touched its vm-<vmid> sentinel. That read is
 // kept as a probe that PVE is answering exactly, and for a record that froze
@@ -96,6 +106,15 @@ func lockStepSentinels(record aj.Record) []string {
 		seen[step.Target.VMID] = true
 		sentinels = append(sentinels, pve.ClusterLockPoolName(fmt.Sprintf("vm-%d", step.Target.VMID)))
 	}
+	if record.Kind == allocationKindDisk && record.DiskToken != "" {
+		for i := range record.Steps {
+			step := &record.Steps[i]
+			if step.Attempt == record.ActiveAttempt() && step.State == aj.Planned && isLockStep(*step) && takesDiskTransferLock(*step) {
+				sentinels = append(sentinels, pve.DiskTransferLockPoolName(record.DiskToken))
+				break
+			}
+		}
+	}
 	if record.Kind == "vm" {
 		plan, err := activeStorageAllocationPlan(record)
 		if err != nil {
@@ -111,6 +130,23 @@ func lockStepSentinels(record aj.Record) []string {
 	}
 	sort.Strings(sentinels)
 	return sentinels
+}
+
+// diskTransferLockOperations are the managed disk lifecycle operations that
+// transfer the disk into a parker under the journal, through
+// pve.TransferDiskToParker, and so take the disk's per-disk transfer lock.
+// Every other operation's lock steps can only have meant a vm-<vmid> sentinel.
+var diskTransferLockOperations = []string{"detach_disk"}
+
+// takesDiskTransferLock reports whether step is a lock step of an operation
+// in diskTransferLockOperations.
+func takesDiskTransferLock(step aj.Step) bool {
+	for _, operation := range diskTransferLockOperations {
+		if strings.HasPrefix(step.Kind, "lifecycle_"+operation+"_Pool_") {
+			return true
+		}
+	}
+	return false
 }
 
 // lockSettlementGap says why settlement left a lock step planned. Its text is
