@@ -16,12 +16,6 @@ if [ -n "$SKIP_CHECKS" ]; then
     exit 0
 fi
 
-if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-    echo "pre-push: Docker is not running, and make ci needs it to run CI's checks in CI's image." >&2
-    echo "pre-push: start Docker and push again, or bypass with SKIP_CHECKS=1 git push." >&2
-    exit 1
-fi
-
 ranges=
 while read -r _local_ref local_sha _remote_ref remote_sha; do
     [ -n "$local_sha" ] || continue
@@ -31,6 +25,12 @@ done
 
 if [ -z "$ranges" ]; then
     exit 0
+fi
+
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "pre-push: Docker is not running, and make ci needs it to run CI's checks in CI's image." >&2
+    echo "pre-push: start Docker and push again, or bypass with SKIP_CHECKS=1 git push." >&2
+    exit 1
 fi
 
 echo "pre-push: running make ci (SKIP_CHECKS=1 git push to bypass)" >&2
