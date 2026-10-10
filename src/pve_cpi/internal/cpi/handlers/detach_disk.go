@@ -400,6 +400,17 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay})
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerCfg, pctx)
 	if transferErr != nil {
+		if elsewhere, ok := pve.IsDiskAttachedElsewhere(transferErr); ok {
+			// The disk left this VM while the transfer waited for its lock,
+			// and another VM holds it now. That is the stale-Director case the
+			// resolve above answers with warn+nil, found later.
+			logger.Warn("detach_disk: disk attached to a different VM — treating as already detached from this one",
+				log.String("vm_cid", vmCID),
+				log.String("disk_cid", rd.diskCID),
+				log.Int("holder_vmid", elsewhere.VMID),
+			)
+			return nil
+		}
 		if pve.IsMoveDiskSnapshotRefusal(transferErr) {
 			// PVE refuses to reassign a snapshot-referenced volume, and the
 			// refusal comes from the reassignment step — after the source slot

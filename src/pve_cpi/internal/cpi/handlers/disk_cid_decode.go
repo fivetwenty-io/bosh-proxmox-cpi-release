@@ -42,3 +42,25 @@ func decodeDiskCID(ctx context.Context, deps Deps, method, diskCID string) (bare
 	}
 	return bareCID, meta, nil
 }
+
+// recordedDiskCID returns the disk CID the VM's description recorded for the
+// disk with stableID, keyed by the stable ID or by volid, when it decodes and
+// carries that stable ID. It returns "" otherwise. The transfer uses the CID
+// for the disk's birth volume when it has to re-resolve the disk, and without
+// one it uses the volid it started with and skips the birth-name check. It
+// decodes the CID itself rather than through decodeDiskCID, because a recorded
+// CID that doesn't decode only means the transfer goes on without one, not
+// that the disk is gone.
+func recordedDiskCID(desc, stableID, volid string) string {
+	cids := pve.GetAttachedDiskCIDs(desc)
+	for _, key := range []string{stableID, volid} {
+		cid := cids[key]
+		if cid == "" {
+			continue
+		}
+		if _, meta, err := pve.ParseEncodedDiskCID(cid); err == nil && meta != nil && meta.ID == stableID {
+			return cid
+		}
+	}
+	return ""
+}

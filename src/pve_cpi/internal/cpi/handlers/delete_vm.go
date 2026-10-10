@@ -1134,11 +1134,21 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 			logger.Warn("delete_vm: stable-ID persistent disk still attached on active slot -- transferring to a parker to preserve it before destroy",
 				log.String("slot", slot), log.String("volid", entry.Volid), log.String("stable_id", entry.StableID))
 			pctx := pve.ParkContext{
+				DiskCID:     recordedDiskCID(desc, entry.StableID, entry.Volid),
 				SourceVMCID: vmCID,
 				StableID:    entry.StableID,
 				Opts:        pve.DiskOptOverlayFromDesc(desc, entry.StableID, entry.Volid),
 			}
-			if _, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerCfg, pctx); transferErr != nil {
+			_, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, entry.Volid, parkerCfg, pctx)
+			if elsewhere, ok := pve.IsDiskAttachedElsewhere(transferErr); ok {
+				// The disk left this VM while the transfer waited for its
+				// lock, and another VM holds it now, so the destroy can't
+				// take it.
+				logger.Warn("delete_vm: persistent disk left this VM for another one before the transfer moved it -- nothing to preserve here",
+					log.String("slot", slot), log.String("stable_id", entry.StableID), log.Int("holder_vmid", elsewhere.VMID))
+				continue
+			}
+			if transferErr != nil {
 				return retriableUnlessPermanent(transferErr, fmt.Sprintf(
 					"delete_vm: refusing to destroy VM %s -- could not transfer persistent disk %s=%s to a parker to preserve it, so nothing was destroyed. "+
 						"A delete_vm retry transfers the disk again while it is still on its slot. If the slot was already deleted and this VM owns the volume, "+
