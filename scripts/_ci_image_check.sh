@@ -8,6 +8,10 @@
 # line. Workflows that run a different image, such as the certification
 # toolbox, are not build jobs and are left alone.
 #
+# The Concourse tasks in ci/tasks/*.yml pin the same golang digest in a
+# `digest:` line, and every staticcheck and golangci-lint pin must agree across
+# the workflows and the tasks.
+#
 # Usage:
 #   scripts/_ci_image_check.sh           # check, exit 1 on drift
 #   scripts/_ci_image_check.sh --print   # check, then print the pinned reference
@@ -15,6 +19,7 @@
 set -eu
 
 dir=${CI_WORKFLOW_DIR:-.github/workflows}
+tasks=${CI_TASK_DIR:-ci/tasks}
 
 images() {
 	sed -n "s/^[[:space:]-]*image:[[:space:]]*[\"']\{0,1\}\(golang:[^[:space:]#\"']*\).*/\1/p" "$@"
@@ -51,6 +56,46 @@ golang:*@sha256:*) ;;
 	exit 1
 	;;
 esac
+
+want_digest=${refs#*@}
+
+# task_digests FILE prints the digest: value of a task whose image_resource is
+# the golang repository. Tasks on other images, such as ubuntu, print nothing.
+task_digests() {
+	awk '
+		/^[[:space:]]*repository:[[:space:]]*["'"'"']?golang["'"'"']?[[:space:]]*$/ { g = 1; next }
+		g && /^[[:space:]]*digest:/ {
+			v = $0
+			sub(/^[[:space:]]*digest:[[:space:]]*["'"'"']?/, "", v)
+			sub(/["'"'"']?[[:space:]]*(#.*)?$/, "", v)
+			print v
+			g = 0
+		}
+	' "$1"
+}
+
+for f in "$tasks"/*.yml; do
+	[ -f "$f" ] || continue
+	if grep -Eq '^[[:space:]]*repository:[[:space:]]*["'"'"']?golang["'"'"']?[[:space:]]*$' "$f"; then
+		got=$(task_digests "$f")
+		if [ "$got" != "$want_digest" ]; then
+			echo "ci-image: $f pins golang digest '${got:-none}', but ci.yml pins '$want_digest'" >&2
+			exit 1
+		fi
+	fi
+done
+
+# Every staticcheck and golangci-lint version pin must match across the
+# workflows and the tasks.
+for tool in staticcheck golangci-lint; do
+	pins=$(grep -Eho "cmd/$tool@[^[:space:]\"']+" "$dir"/*.yml "$tasks"/*.yml 2>/dev/null | sort -u)
+	n=$(printf '%s\n' "$pins" | grep -c . || true)
+	if [ "$n" -gt 1 ]; then
+		echo "ci-image: $tool is pinned to $n different versions, want one:" >&2
+		grep -Hn "cmd/$tool@" "$dir"/*.yml "$tasks"/*.yml >&2
+		exit 1
+	fi
+done
 
 [ "${1:-}" = "--print" ] && printf '%s\n' "$refs"
 exit 0
