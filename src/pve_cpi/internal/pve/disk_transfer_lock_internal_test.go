@@ -17,6 +17,7 @@ import (
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 )
 
@@ -484,7 +485,12 @@ func TestWithDiskTransferLock(t *testing.T) {
 		}()
 		<-held
 		defer close(done)
-		ctx := WithClusterLockPollForTest(WithParkerLockWait(context.Background(), 50*time.Millisecond), 5*time.Millisecond)
+		// The disk lock waits out a whole holder's claim, so the contender's
+		// request deadline is what ends its wait here, the way the
+		// Director's request timeout ends it in the field.
+		reqCtx, cancel := context.WithTimeout(context.Background(), clusterLockContextMargin+200*time.Millisecond)
+		defer cancel()
+		ctx := WithClusterLockPollForTest(reqCtx, 5*time.Millisecond)
 		ran := false
 		err := withDiskTransferLock(ctx, &parkerLockClient{pools: pools}, nil, transferStableID, "contender", func(context.Context) error {
 			ran = true
@@ -497,4 +503,356 @@ func TestWithDiskTransferLock(t *testing.T) {
 			t.Fatalf("err = %v, want a timeout rather than a refused create", err)
 		}
 	})
+}
+
+// fakeLockClock is a lock clock whose sleeps advance its time at once, so a
+// test can spend a production-sized wait without waiting for it. Each sleep
+// runs onSleep with the time the clock has reached.
+type fakeLockClock struct {
+	base    time.Time
+	offset  atomic.Int64
+	onSleep func(elapsed time.Duration)
+}
+
+func (f *fakeLockClock) clock() lockClock {
+	return lockClock{
+		now: func() time.Time { return f.base.Add(time.Duration(f.offset.Load())) },
+		sleep: func(ctx context.Context, d time.Duration) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			elapsed := time.Duration(f.offset.Add(int64(d)))
+			if f.onSleep != nil {
+				f.onSleep(elapsed)
+			}
+			return nil
+		},
+	}
+}
+
+// TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait pins the per-disk
+// lock's wait against the parker lock's. A holder that keeps the disk lock for
+// longer than the parker lock's 15s wait is still waited out, because the disk
+// lock's wait covers its whole TTL, and that TTL covers a parker window that
+// waited its whole wait before it ran.
+func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
+	t.Parallel()
+	parkerTTL, parkerWait := parkerLockTimeoutsFrom(context.Background())
+	ttl, wait := diskTransferLockTimeouts(context.Background())
+	if ttl != parkerTTL+parkerWait || wait != ttl+clusterLockGrace() {
+		t.Fatalf("ttl=%s wait=%s, want ttl %s and wait %s", ttl, wait, parkerTTL+parkerWait, parkerTTL+parkerWait+clusterLockGrace())
+	}
+
+	key := ClusterLockPoolName(diskTransferLockName(transferStableID))
+	pools := newFakeLockPools()
+	clk := &fakeLockClock{base: time.Now()}
+	pools.pools[key] = encodeLockComment("holder", clk.base.Add(10*time.Minute))
+	const holdFor = parkerProtectionLockTimeout + 5*time.Second
+	clk.onSleep = func(elapsed time.Duration) {
+		if elapsed >= holdFor {
+			pools.mu.Lock()
+			if pools.pools[key] == encodeLockComment("holder", clk.base.Add(10*time.Minute)) {
+				delete(pools.pools, key)
+			}
+			pools.mu.Unlock()
+		}
+	}
+	ctx := withTestParkerLockClock(context.Background(), clk.clock())
+	ran := false
+	err := withDiskTransferLock(ctx, &parkerLockClient{pools: pools}, nil, transferStableID, "contender", func(context.Context) error {
+		ran = true
+		return nil
+	})
+	if err != nil || !ran {
+		t.Fatalf("err=%v ran=%v, want the contender to run once the holder let go", err, ran)
+	}
+	if elapsed := time.Duration(clk.offset.Load()); elapsed < holdFor {
+		t.Fatalf("the contender acquired after %s, before the holder let go at %s", elapsed, holdFor)
+	}
+}
+
+// TestWithDiskTransferLock_UnserializedFallbacksAreLoud covers the two
+// fallbacks that run a transfer without its per-disk lock. Each logs an error,
+// because a second transfer of the disk can overlap the first, and marks the
+// body's context so the transfer's own logs say it ran unserialized.
+func TestWithDiskTransferLock_UnserializedFallbacksAreLoud(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		client Client
+	}{
+		{"no pool service", &parkerLockClient{}},
+		{"create refused", &parkerLockClient{pools: &recordingPoolService{
+			createErr: sdkerrors.ParseAPIError(403, []byte(`{"message":"Permission check failed (/pool, Pool.Allocate)"}`)),
+		}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			logger, obs := log.NewObservedLogger(log.LevelWarn)
+			marked := false
+			err := withDiskTransferLock(context.Background(), tc.client, logger, transferStableID, "transfer_in", func(ctx context.Context) error {
+				marked = diskTransferLockUnserialized(ctx)
+				return nil
+			})
+			if err != nil || !marked {
+				t.Fatalf("err=%v marked=%v, want the body run and its context marked unserialized", err, marked)
+			}
+			entries := obs.All()
+			if len(entries) != 1 || entries[0].Level != log.LevelError || entries[0].Attrs["stable_id"] != transferStableID {
+				t.Fatalf("log = %+v, want one error naming the disk", entries)
+			}
+		})
+	}
+
+	t.Run("held lock is not marked", func(t *testing.T) {
+		t.Parallel()
+		err := withDiskTransferLock(context.Background(), &parkerLockClient{pools: &recordingPoolService{}}, nil, transferStableID, "transfer_in",
+			func(ctx context.Context) error {
+				if diskTransferLockUnserialized(ctx) {
+					t.Error("a transfer that holds the lock was marked unserialized")
+				}
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("withDiskTransferLock: %v", err)
+		}
+	})
+}
+
+// TestDiskTransferWindowContext covers the budget each parker window checks
+// under the per-disk lock. A window opens on a deadline a window's reserve
+// before the disk deadline, a window with too little of the lock left isn't
+// opened, and a transfer without a budget, or with a test-sized one, runs on
+// its context unchanged.
+func TestDiskTransferWindowContext(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	reserve := parkerWindowReserveNow()
+
+	t.Run("no budget", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		got, cancel, err := diskTransferWindowContext(ctx, transferStableID, now)
+		defer cancel()
+		if err != nil || got != ctx {
+			t.Fatalf("err=%v, want the context back unchanged", err)
+		}
+	})
+
+	t.Run("test-sized budget", func(t *testing.T) {
+		t.Parallel()
+		budget := diskTransferBudgetFor(time.Second, now.Add(time.Second))
+		if budget.reserve != 0 {
+			t.Fatalf("reserve = %s, want none for a TTL that can't hold one", budget.reserve)
+		}
+		ctx := context.WithValue(context.Background(), diskTransferBudgetKey{}, budget)
+		got, cancel, err := diskTransferWindowContext(ctx, transferStableID, now)
+		defer cancel()
+		if err != nil || got != ctx {
+			t.Fatalf("err=%v, want the context back unchanged", err)
+		}
+	})
+
+	t.Run("room for a window", func(t *testing.T) {
+		t.Parallel()
+		ttl, _ := diskTransferLockTimeouts(context.Background())
+		deadline := now.Add(reserve + diskTransferWindowNeed() + 10*time.Second)
+		budget := diskTransferBudgetFor(ttl, deadline)
+		if budget.reserve != reserve {
+			t.Fatalf("reserve = %s, want the window reserve %s for the production TTL", budget.reserve, reserve)
+		}
+		ctx := context.WithValue(context.Background(), diskTransferBudgetKey{}, budget)
+		got, cancel, err := diskTransferWindowContext(ctx, transferStableID, now)
+		if err != nil {
+			t.Fatalf("diskTransferWindowContext: %v", err)
+		}
+		defer cancel()
+		if d, ok := got.Deadline(); !ok || !d.Equal(deadline.Add(-reserve)) {
+			t.Fatalf("window deadline = %v (set %v), want %v", d, ok, deadline.Add(-reserve))
+		}
+	})
+
+	t.Run("too little left", func(t *testing.T) {
+		t.Parallel()
+		deadline := now.Add(reserve + diskTransferWindowNeed() - time.Second)
+		ctx := context.WithValue(context.Background(), diskTransferBudgetKey{}, diskTransferBudget{deadline: deadline, reserve: reserve})
+		_, _, err := diskTransferWindowContext(ctx, transferStableID, now)
+		var cpiErr *cpierrors.Error
+		if !errors.As(err, &cpiErr) || !cpiErr.OkToRetry() {
+			t.Fatalf("err = %v, want a retriable refusal", err)
+		}
+	})
+
+	t.Run("the lock hands its transfer the budget", func(t *testing.T) {
+		t.Parallel()
+		err := withDiskTransferLock(context.Background(), &parkerLockClient{pools: &recordingPoolService{}}, nil, transferStableID, "transfer_in",
+			func(ctx context.Context) error {
+				budget, ok := ctx.Value(diskTransferBudgetKey{}).(diskTransferBudget)
+				deadline, hasDeadline := ctx.Deadline()
+				if !ok || !hasDeadline || budget.reserve != reserve || !budget.deadline.Equal(deadline) {
+					t.Errorf("budget=%+v (set %v) deadline=%v, want the reserve and the lock's deadline", budget, ok, deadline)
+				}
+				return nil
+			})
+		if err != nil {
+			t.Fatalf("withDiskTransferLock: %v", err)
+		}
+	})
+}
+
+// listingLockPools is the in-memory lock pool store with the pool listing the
+// expired-lock sweep reads.
+type listingLockPools struct {
+	*fakeLockPools
+	listErr error
+}
+
+func (l *listingLockPools) ListPoolComments(context.Context) (map[string]string, error) {
+	if l.listErr != nil {
+		return nil, l.listErr
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]string, len(l.pools))
+	for id, comment := range l.pools {
+		out[id] = comment
+	}
+	return out, nil
+}
+
+// TestSweepExpiredDiskTransferLocks covers the sweep of per-disk lock
+// sentinels a crashed transfer left behind. It deletes only a per-disk
+// sentinel whose claim has expired and still reads the same, and it leaves a
+// live claim, a comment it can't parse, another lock's sentinel, a claim that
+// changed after the listing, and one whose re-read ran over the steal budget.
+func TestSweepExpiredDiskTransferLocks(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	expired := encodeLockComment("crashed", now.Add(-time.Minute))
+	live := encodeLockComment("holder", now.Add(time.Minute))
+	diskPool := func(id string) string { return ClusterLockPoolName(diskTransferLockName(id)) }
+	fixture := func() *listingLockPools {
+		pools := &listingLockPools{fakeLockPools: newFakeLockPools()}
+		pools.pools[diskPool("expired")] = expired
+		pools.pools[diskPool("live")] = live
+		pools.pools[diskPool("garbled")] = "owner=someone exp=soon"
+		pools.pools[ClusterLockPoolName("vm-90000")] = expired
+		pools.pools["bosh-parkers"] = ""
+		return pools
+	}
+	at := func(t time.Time) context.Context {
+		return withTestParkerLockClock(context.Background(), lockClock{
+			now:   func() time.Time { return t },
+			sleep: func(context.Context, time.Duration) error { return nil },
+		})
+	}
+
+	t.Run("deletes only the expired disk sentinel", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		logger, obs := log.NewObservedLogger(log.LevelInfo)
+		removed, err := SweepExpiredDiskTransferLocks(at(now), &parkerLockClient{pools: pools}, logger)
+		if err != nil || removed != 1 {
+			t.Fatalf("removed=%d err=%v, want one sentinel removed", removed, err)
+		}
+		if _, ok := pools.pools[diskPool("expired")]; ok {
+			t.Fatal("the expired sentinel is still there")
+		}
+		for _, id := range []string{diskPool("live"), diskPool("garbled"), ClusterLockPoolName("vm-90000"), "bosh-parkers"} {
+			if _, ok := pools.pools[id]; !ok {
+				t.Fatalf("the sweep deleted %s", id)
+			}
+		}
+		if obs.Len() != 1 {
+			t.Fatalf("log = %+v, want one line for the removed sentinel", obs.All())
+		}
+	})
+
+	t.Run("claim changed after the listing", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		pools.getFn = func(id string) (string, bool, error, bool) {
+			if id == diskPool("expired") {
+				return live, true, nil, true
+			}
+			return "", false, nil, false
+		}
+		removed, err := SweepExpiredDiskTransferLocks(at(now), &parkerLockClient{pools: pools}, nil)
+		if err != nil || removed != 0 || pools.deleteN != 0 {
+			t.Fatalf("removed=%d deletes=%d err=%v, want a fresh claim left alone", removed, pools.deleteN, err)
+		}
+	})
+
+	t.Run("re-read over the steal budget", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		var ticks atomic.Int64
+		ctx := withTestParkerLockClock(context.Background(), lockClock{
+			now: func() time.Time {
+				return now.Add(time.Duration(ticks.Add(1)) * (clusterLockStealBudget + time.Second))
+			},
+			sleep: func(context.Context, time.Duration) error { return nil },
+		})
+		removed, err := SweepExpiredDiskTransferLocks(ctx, &parkerLockClient{pools: pools}, nil)
+		if err != nil || pools.deleteN != 0 {
+			t.Fatalf("removed=%d deletes=%d err=%v, want no delete after a slow re-read", removed, pools.deleteN, err)
+		}
+	})
+
+	t.Run("a failed re-read is reported and the rest swept", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		pools.pools[diskPool("expired-2")] = expired
+		pools.getFn = func(id string) (string, bool, error, bool) {
+			if id == diskPool("expired") {
+				return "", false, errors.New("connection reset"), true
+			}
+			return "", false, nil, false
+		}
+		removed, err := SweepExpiredDiskTransferLocks(at(now), &parkerLockClient{pools: pools}, nil)
+		if err == nil || removed != 1 {
+			t.Fatalf("removed=%d err=%v, want the other sentinel removed and the failure returned", removed, err)
+		}
+		if _, ok := pools.pools[diskPool("expired")]; !ok {
+			t.Fatal("a sentinel whose re-read failed was deleted")
+		}
+	})
+
+	t.Run("no lister", func(t *testing.T) {
+		t.Parallel()
+		pools := newFakeLockPools()
+		pools.pools[diskPool("expired")] = expired
+		removed, err := SweepExpiredDiskTransferLocks(at(now), &parkerLockClient{pools: pools}, nil)
+		if err != nil || removed != 0 || len(pools.pools) != 1 {
+			t.Fatalf("removed=%d err=%v, want nothing done without a pool listing", removed, err)
+		}
+	})
+
+	t.Run("listing fails", func(t *testing.T) {
+		t.Parallel()
+		pools := fixture()
+		pools.listErr = errors.New("connection refused")
+		if _, err := SweepExpiredDiskTransferLocks(at(now), &parkerLockClient{pools: pools}, nil); err == nil {
+			t.Fatal("a failed listing was not reported")
+		}
+	})
+}
+
+// TestTracedPoolService_ListPoolComments forwards the listing when the wrapped
+// service offers one and fails it when it does not.
+func TestTracedPoolService_ListPoolComments(t *testing.T) {
+	t.Parallel()
+	tracer, _ := newTestTracer(t)
+	inner := &listingLockPools{fakeLockPools: newFakeLockPools()}
+	inner.pools["bosh-lock-disk-x"] = "owner=a exp=1"
+	traced := &tracedPoolService{PoolService: inner, tracer: tracer}
+	got, err := traced.ListPoolComments(context.Background())
+	if err != nil || got["bosh-lock-disk-x"] != "owner=a exp=1" {
+		t.Fatalf("listing was not forwarded: %v, %v", got, err)
+	}
+	plain := &tracedPoolService{PoolService: &fakePoolService{}, tracer: tracer}
+	if _, err := plain.ListPoolComments(context.Background()); err == nil {
+		t.Fatal("a wrapped service without a listing answered one")
+	}
 }

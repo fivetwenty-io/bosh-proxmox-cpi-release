@@ -738,16 +738,22 @@ func RemoveParkerProvenanceEntry(ctx context.Context, c Client, logger *log.Logg
 // returned as landed, and a disk its source no longer names comes back as
 // errDiskLeftSource. On that answer the transfer re-resolves the disk by its
 // serial. A disk that is now on a parker is a success with the name it landed
-// under, and a disk still on its source under a new name is transferred again
-// once under that name. Anything else is a retriable error, and the Director's
-// retry runs the full resolve and resume.
+// under, once that parker's record of it is finished, and a disk still on its
+// source under a new name is transferred again once under that name. A disk
+// that another VM now holds comes back as a *DiskAttachedElsewhereError.
+// Anything else is a retriable error, and the Director's retry runs the full
+// resolve and resume.
 //
-// A journal-managed disk (pctx.AllocationID or pctx.AllocationNamespace set)
-// takes no per-disk lock, because the allocation journal's lock already
-// serializes every operation on it. When the re-resolve finds such a disk
-// under a new name, a client that implements DiskRelocationObserver is told
-// before the transfer goes on, so the journal guard follows the volume the
-// way it follows a move it observed.
+// Every caller takes the per-disk lock, a journal-managed disk
+// (pctx.AllocationID or pctx.AllocationNamespace set) included. The journal's
+// lock serializes the operations that go through the journal, but delete_vm
+// and create_vm's rollback transfer the same volume without it, so only the
+// disk lock serializes them against a managed detach. A managed caller holds
+// its journal lock around the disk lock, so the order is journal, then disk,
+// then parker. When the re-resolve finds a disk under a new name, a client
+// that implements DiskRelocationObserver is told before the transfer goes on,
+// so the journal guard follows the volume the way it follows a move it
+// observed.
 //
 // Returns the volid the volume landed under on the parker.
 func TransferDiskToParker(
@@ -783,9 +789,6 @@ func TransferDiskToParker(
 		}
 	}
 
-	if pctx.AllocationID != "" || pctx.AllocationNamespace != "" {
-		return transferDiskToParkerOnce(ctx, c, logger, node, srcVMID, bareVolid, cfg, pctx)
-	}
 	var landed string
 	lockErr := withDiskTransferLock(ctx, c, logger, pctx.StableID, "transfer_in", func(lctx context.Context) error {
 		var innerErr error
@@ -908,31 +911,81 @@ type DiskRelocationObserver interface {
 	ObserveDiskRelocated(ctx context.Context, stableID, from, to string) error
 }
 
+// DiskAttachedElsewhereError is the answer of a transfer whose disk left its
+// source VM before the transfer moved it and is now attached to another,
+// non-parker VM. Nothing was moved, and the source no longer holds the disk.
+// It is retriable for a caller that needs the disk on a parker, while
+// detach_disk treats it as a disk that is already detached from its VM, the
+// way its own resolve does, and delete_vm treats it as a disk the doomed VM no
+// longer holds.
+type DiskAttachedElsewhereError struct {
+	StableID string
+	VMID     int
+	Node     string
+	Volid    string
+}
+
+func (e *DiskAttachedElsewhereError) Error() string {
+	return fmt.Sprintf("disk %s left its source VM before this transfer moved it and is attached to vm %d on node %s as %s",
+		e.StableID, e.VMID, e.Node, e.Volid)
+}
+
+// IsDiskAttachedElsewhere reports whether err carries a
+// *DiskAttachedElsewhereError and returns it.
+func IsDiskAttachedElsewhere(err error) (*DiskAttachedElsewhereError, bool) {
+	var elsewhere *DiskAttachedElsewhereError
+	if errors.As(err, &elsewhere) {
+		return elsewhere, true
+	}
+	return nil, false
+}
+
 // relocateDiskThatLeftSource re-resolves a disk a parker window reported as
 // gone from its source (cause), by its serial, across the cluster. It returns
 // the landed name when the disk is on a parker, the fresh name when it is
-// still on the source VM, or a retriable error naming what it found.
+// still on the source VM, a *DiskAttachedElsewhereError when another
+// non-parker VM holds it, or a retriable error naming what it found.
+//
+// A disk on a parker counts as parked only after that parker's own window has
+// read the serial on its slot and finished the parker's record of the disk
+// (finishAlreadyParked), so a disk the re-resolve found there has the same
+// record a transfer that moved it would have left.
+//
+// The resolve compares the disk's birth name, which the disk CID carries,
+// with the names on every guest. A caller that has no CID, such as delete_vm
+// on a VM whose notes lost it, can't name the birth volume, so the volid the
+// transfer started with stands in for it. A refusal by birth name then says
+// nothing about the disk, so it is turned into a plain retriable error, and
+// the Director's retry resolves the disk from its CID.
 func relocateDiskThatLeftSource(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, srcVMID int, volid string,
 	cfg ParkerConfig, pctx ParkContext, cause error,
 ) (parked, fresh string, err error) {
-	birth := volid
+	birth, birthKnown := volid, false
 	if pctx.DiskCID != "" {
 		if decoded, _, decodeErr := ParseEncodedDiskCID(pctx.DiskCID); decodeErr == nil && decoded != "" {
-			birth = decoded
+			birth, birthKnown = decoded, true
 		}
 	}
 	identity, resolveErr := ResolveDiskIdentity(ctx, c, logger, birth, pctx.StableID, cfg)
 	if resolveErr != nil {
+		var held *DiskBirthNameHeldError
+		if !birthKnown && errors.As(resolveErr, &held) {
+			return "", "", cpierrors.Retriable(
+				"TransferDiskToParker: disk %s left source vm %d before this transfer moved it, and without its CID the re-resolve "+
+					"can't tell its birth volume from %q, which another guest names; the Director's retry resolves it from its CID (%v)",
+				pctx.StableID, srcVMID, volid, cause)
+		}
 		return "", "", cpierrors.WrapAs(resolveErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 			"TransferDiskToParker: re-resolve disk %s after it left source vm %d (%v)", pctx.StableID, srcVMID, cause))
 	}
 	holder := identity.Holder
 	switch {
 	case identity.Intent == nil && holder.Found && holder.IsParker:
-		if err := observeDiskRelocation(ctx, c, pctx.StableID, volid, identity.Volid); err != nil {
-			return "", "", err
+		landed, finishErr := finishOnParkerHolding(ctx, c, logger, node, srcVMID, volid, holder, cfg, pctx)
+		if finishErr != nil {
+			return "", "", finishErr
 		}
 		if logger != nil {
 			logger.Info("transfer in: disk is already parked; another operation moved it, so this transfer moved nothing",
@@ -941,11 +994,12 @@ func relocateDiskThatLeftSource(
 				log.String("slot", holder.Slot),
 				log.String("stable_id", pctx.StableID),
 				log.String("volid_before", volid),
-				log.String("volid_after", identity.Volid),
+				log.String("volid_after", landed),
+				log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
 				log.Err(cause),
 			)
 		}
-		return identity.Volid, "", nil
+		return landed, "", nil
 	case identity.Intent == nil && holder.Found && holder.VMID == srcVMID && holder.Node == node:
 		if err := observeDiskRelocation(ctx, c, pctx.StableID, volid, identity.Volid); err != nil {
 			return "", "", err
@@ -956,10 +1010,28 @@ func relocateDiskThatLeftSource(
 				log.String("stable_id", pctx.StableID),
 				log.String("volid_before", volid),
 				log.String("volid_now", identity.Volid),
+				log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
 				log.Err(cause),
 			)
 		}
 		return "", identity.Volid, nil
+	case identity.Intent == nil && holder.Found && holder.VMID != srcVMID:
+		if logger != nil {
+			logger.Warn("transfer in: disk left its source VM and is attached to another VM; this transfer moved nothing",
+				log.Int("source_vmid", srcVMID),
+				log.Int("holder_vmid", holder.VMID),
+				log.String("holder_node", holder.Node),
+				log.String("stable_id", pctx.StableID),
+				log.String("volid_before", volid),
+				log.String("volid_now", identity.Volid),
+				log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
+				log.Err(cause),
+			)
+		}
+		return "", "", cpierrors.WrapAs(
+			&DiskAttachedElsewhereError{StableID: pctx.StableID, VMID: holder.VMID, Node: holder.Node, Volid: identity.Volid},
+			cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("TransferDiskToParker: disk %s left source vm %d before this transfer moved it", pctx.StableID, srcVMID))
 	}
 	where := "no guest carries its serial"
 	switch {
@@ -971,6 +1043,57 @@ func relocateDiskThatLeftSource(
 	return "", "", cpierrors.WrapAs(cause, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 		"TransferDiskToParker: disk %s left source vm %d before this transfer moved it, and %s; "+
 			"the Director's retry re-resolves and resumes it", pctx.StableID, srcVMID, where))
+}
+
+// finishOnParkerHolding finishes a transfer whose re-resolve found the disk's
+// serial on parker holder, inside that parker's protection window, the same
+// way a window that finds the serial on its own parker does
+// (finishAlreadyParked). The window reads the parker again, because the
+// resolve held no lock, and a parker that no longer carries the serial fails
+// retriably. A parker on another node than the source's is finished too, but
+// the parker pool sweep this request runs covers only the source's node, so
+// that parker's pool placement is left to the next sweep on its own node,
+// which is logged.
+func finishOnParkerHolding(
+	ctx context.Context, c Client, logger *log.Logger,
+	srcNode string, srcVMID int, volid string, holder DiskHolder,
+	cfg ParkerConfig, pctx ParkContext,
+) (string, error) {
+	if holder.Node != srcNode && logger != nil {
+		logger.Warn("transfer in: disk is parked on another node than its source; this request's parker pool sweep doesn't cover that parker",
+			log.Int("source_vmid", srcVMID),
+			log.String("source_node", srcNode),
+			log.Int("parker_vmid", holder.VMID),
+			log.String("parker_node", holder.Node),
+			log.String("stable_id", pctx.StableID),
+		)
+	}
+	budgetCtx, cancel, budgetErr := diskTransferWindowContext(ctx, pctx.StableID, time.Now())
+	if budgetErr != nil {
+		return "", budgetErr
+	}
+	defer cancel()
+	var landed string
+	lockErr := withParkerProtectionLock(budgetCtx, c, logger, holder.VMID, "transfer_in", func(wctx context.Context) error {
+		vmCfg, cfgErr := c.QEMU().Config(wctx, holder.Node, holder.VMID)
+		if cfgErr != nil {
+			return cpierrors.Wrap(WrapConfigReadError(cfgErr),
+				fmt.Sprintf("transfer in: config read for parker vmid %d that the re-resolve found holding disk %s", holder.VMID, pctx.StableID))
+		}
+		slot, parkedVolid, carried := parkerSlotCarryingSerial(vmCfg, pctx.StableID)
+		if !carried {
+			return cpierrors.Retriable(
+				"TransferDiskToParker: the re-resolve found disk %s on parker vmid %d, but its window no longer reads the serial there; "+
+					"the Director's retry re-resolves it", pctx.StableID, holder.VMID)
+		}
+		var finishErr error
+		landed, finishErr = finishAlreadyParked(wctx, c, logger, holder.Node, srcNode, holder.VMID, srcVMID, volid, slot, parkedVolid, vmCfg, cfg, pctx)
+		return finishErr
+	})
+	if lockErr != nil {
+		return "", lockErr
+	}
+	return landed, nil
 }
 
 // observeDiskRelocation tells a DiskRelocationObserver client that the disk
@@ -991,14 +1114,21 @@ func observeDiskRelocation(ctx context.Context, c Client, stableID, from, to str
 }
 
 // transferIntoParker runs one detach-side transfer attempt against a known
-// parker, inside its protection window.
+// parker, inside its protection window. Under the per-disk lock the window
+// opens only when enough of the disk claim is left for it to finish
+// (diskTransferWindowContext).
 func transferIntoParker(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID, srcVMID int, bareVolid string,
 	cfg ParkerConfig, pctx ParkContext,
 ) (string, error) {
+	budgetCtx, cancel, budgetErr := diskTransferWindowContext(ctx, pctx.StableID, time.Now())
+	if budgetErr != nil {
+		return "", budgetErr
+	}
+	defer cancel()
 	var landed string
-	lockErr := withParkerProtectionLock(ctx, c, logger, parkerVMID, "transfer_in", func(wctx context.Context) error {
+	lockErr := withParkerProtectionLock(budgetCtx, c, logger, parkerVMID, "transfer_in", func(wctx context.Context) error {
 		var innerErr error
 		landed, innerErr = transferIntoParkerLocked(wctx, c, logger, node, parkerVMID, srcVMID, bareVolid, cfg, pctx)
 		return innerErr
@@ -1023,7 +1153,30 @@ func transferIntoParkerLocked(
 	// already carries the disk's serial is where it landed, and the transfer
 	// is done without writing anything.
 	if parkedSlot, parkedVolid, parked := parkerSlotCarryingSerial(parkerCfg, pctx.StableID); parked {
-		return finishAlreadyParked(ctx, c, logger, node, parkerVMID, srcVMID, bareVolid, parkedSlot, parkedVolid, parkerCfg, cfg, pctx)
+		return finishAlreadyParked(ctx, c, logger, node, node, parkerVMID, srcVMID, bareVolid, parkedSlot, parkedVolid, parkerCfg, cfg, pctx)
+	}
+	// The source is read before anything is written, so a transfer whose disk
+	// has already left the source writes no intent at all. Both views count,
+	// because a slot whose delete is pending and an unused entry a crashed
+	// transfer left still hold the volume.
+	srcViews, srcErr := ReadQemuViews(ctx, c, node, srcVMID)
+	if srcErr != nil {
+		return "", cpierrors.Wrap(WrapConfigReadError(srcErr),
+			fmt.Sprintf("transfer in: config read for source vm %d", srcVMID))
+	}
+	if !srcViews.NamesVolume(bareVolid) {
+		return "", diskLeftSource("source vm %d names %q nowhere, so this transfer wrote no intent record", srcVMID, bareVolid)
+	}
+	// A record of the disk this parker already keeps is replaced only while
+	// its slot is empty. A slot that holds a volume is what a transfer that
+	// died after its move landed and before its serial write leaves, and the
+	// resume finds that volume only through the slot the record names. The
+	// intent write checks the same on its own fresh read (landedParkerRecord).
+	_, priorRecords, _ := parseParkerSentinel(DescriptionFromConfig(parkerCfg))
+	prior, hadRecord := priorRecords[pctx.StableID]
+	if held, occupied := parkerRecordSlotHolds(parkerCfg, prior); hadRecord && occupied {
+		return "", diskLeftSource("parker vmid %d keeps an unfinished transfer record for disk %s whose slot %s holds %s, "+
+			"so this transfer wrote no intent record", parkerVMID, pctx.StableID, prior.Slot, held)
 	}
 	// A slot another disk's unfinished record names is that disk's landing
 	// spot, so it stays out of the choice even while it's empty.
@@ -1031,38 +1184,63 @@ func transferIntoParkerLocked(
 	if slotErr != nil {
 		return "", slotErr // ErrNoSlots — caller tries the next parker
 	}
-	_, priorRecords, _ := parseParkerSentinel(DescriptionFromConfig(parkerCfg))
-	_, hadRecord := priorRecords[pctx.StableID]
 
 	// 2. Intent record, strict: from the moment the source slot is deleted
 	// until the serial lands on the parker, this record is the disk's only
 	// identity carrier, so the transfer must not proceed without it. The write
 	// refuses to replace a finished record of the disk, which would mean the
-	// disk landed here after the read above.
+	// disk landed here after the read above, and a record whose slot holds a
+	// volume.
 	intent := buildParkerProvEntry(ctx, node, bareVolid, slot, cfg, pctx)
 	if provErr := writeParkerTransferIntent(ctx, c, logger, node, parkerVMID, pctx.StableID, intent, cfg); provErr != nil {
 		return "", cpierrors.Wrap(provErr,
 			fmt.Sprintf("transfer in: write intent record on parker vmid %d (fail-closed: the record is the crash-window identity carrier)", parkerVMID))
 	}
-	// leftBeforeDelete answers a source that let the volume go before this
-	// transfer deleted anything. Nothing was moved, so the intent record
-	// this transfer just wrote is taken back when it is the only record of
-	// the disk here. A record it replaced is left as the intent now names
-	// it, because the transfer that wrote that one may still need it.
+	// leftBeforeDelete answers a source that let the volume go after the read
+	// above and before this transfer deleted anything. Nothing was moved, so
+	// the intent record this transfer just wrote is taken back when it is the
+	// only record of the disk here. A record it replaced had an empty slot
+	// and is left as the intent now names it, because the transfer that wrote
+	// that one may still need it. A take-back that doesn't land leaves an
+	// intent that names a volume this transfer never moved, so the transfer
+	// fails retriably instead of re-resolving the disk, and the Director's
+	// retry finds that record and resumes from it.
 	leftBeforeDelete := func(reason error) error {
-		if !hadRecord {
-			removeParkerProvenance(ctx, c, logger, node, parkerVMID, bareVolid, pctx.StableID, cfg)
+		if hadRecord {
+			return reason
 		}
-		return reason
+		stillHeld, removeErr := removeParkerProvenanceChecked(ctx, c, node, parkerVMID, bareVolid, pctx.StableID)
+		if removeErr == nil && !stillHeld {
+			return reason
+		}
+		if removeErr == nil {
+			removeErr = fmt.Errorf("parker vmid %d still names %q, so the record stays", parkerVMID, bareVolid)
+		}
+		if logger != nil {
+			logger.Error("transfer in: could not take back the intent record of a disk this transfer never moved",
+				log.Int("source_vmid", srcVMID),
+				log.Int("parker_vmid", parkerVMID),
+				log.String("stable_id", pctx.StableID),
+				log.String("volid", bareVolid),
+				log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
+				log.Err(removeErr),
+			)
+		}
+		return cpierrors.Retriable(
+			"transfer in: source vm %d let %q go before this transfer deleted its slot, and the intent record on parker vmid %d "+
+				"could not be taken back (%v); the Director's retry resumes from that record (%v)",
+			srcVMID, bareVolid, parkerVMID, removeErr, reason)
 	}
 
 	// 3. Delete the source slot — a raw config delete, NOT the SDK's
 	// DetachDisk: its unusedN sweep physically removes a volume its holder
 	// owns, which after a reassignment this volume is.
-	// Both views: a slot whose delete is pending still counts as attached, so
-	// the transfer sends the delete again rather than skipping it, and the
-	// helper proves the source let go before anything lands on the parker.
-	srcViews, srcErr := ReadQemuViews(ctx, c, node, srcVMID)
+	// The source is read again after the intent write, because it may have
+	// changed since the read above. Both views: a slot whose delete is
+	// pending still counts as attached, so the transfer sends the delete
+	// again rather than skipping it, and the helper proves the source let go
+	// before anything lands on the parker.
+	srcViews, srcErr = ReadQemuViews(ctx, c, node, srcVMID)
 	if srcErr != nil {
 		return "", cpierrors.Wrap(WrapConfigReadError(srcErr),
 			fmt.Sprintf("transfer in: config read for source vm %d", srcVMID))
@@ -1155,6 +1333,7 @@ func transferIntoParkerLocked(
 			log.String("slot", slot),
 			log.String("volid_before", bareVolid),
 			log.String("volid_after", landed),
+			log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
 		)
 	}
 	return landed, nil
@@ -1213,10 +1392,17 @@ func moveUnusedEntryToParker(
 // source, which is half of the proof that the volume was released rather than
 // taken. The other half is an unfiltered content listing of the volume's
 // storage, read from the source's node, that still shows the volume under
-// this name. A listing that doesn't show it, or can't be read, attaches
-// nothing and returns errDiskLeftSource, and so does an attach that PVE
-// refuses because the volume does not exist. File storage never answers a
-// missing volume with a 404, so only the listing can show it is there.
+// this name. A listing that doesn't show it attaches nothing and returns
+// errDiskLeftSource, and so does an attach that PVE refuses because the
+// volume does not exist. File storage never answers a missing volume with a
+// 404, so only the listing can show it is there.
+//
+// A listing that can't be read proves nothing either way, and by then the
+// volume is off the source and not yet on the parker, with the intent record
+// as its only carrier. So the read is retried within the window's deadline
+// (observeReleasedVolume), and when it still fails, the transfer returns a
+// plain retriable error rather than errDiskLeftSource. The intent record
+// stays as it is, and the Director's retry resumes the transfer from it.
 func attachReleasedSourceVolume(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID, srcVMID int, bareVolid, stableID string, srcViews QemuViews,
@@ -1229,10 +1415,12 @@ func attachReleasedSourceVolume(
 	if err := refuseSnapshotNamingVolume(ctx, c, node, srcVMID, bareVolid); err != nil {
 		return "", err
 	}
-	present, probeErr := ObserveStorageVolumePresence(ctx, c, node, bareVolid)
+	present, probeErr := observeReleasedVolume(ctx, c, logger, node, bareVolid)
 	if probeErr != nil {
-		return "", diskLeftSource("the storage listing that has to show %q before the parker attaches it could not be read: %v",
-			bareVolid, probeErr)
+		return "", cpierrors.WrapAs(probeErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"transfer in: the storage listing that has to show %q before parker vmid %d attaches it could not be read; "+
+				"the volume is off source vm %d, and the intent record stays for the Director's retry to resume from",
+			bareVolid, parkerVMID, srcVMID))
 	}
 	if !present {
 		return "", diskLeftSource("the storage listing on node %s no longer shows %q after this transfer's slot delete",
@@ -1245,16 +1433,62 @@ func attachReleasedSourceVolume(
 	return slot, err
 }
 
+// observeReleasedVolume reads whether the storage listing on node shows
+// bareVolid, for the config-edit attach of a released source volume. Any read
+// that fails is tried again, up to parkerWindowMaxAttempts reads in all, on
+// the transient backoff, and never past ctx's deadline. It returns the last
+// read's error when none of them answered.
+func observeReleasedVolume(ctx context.Context, c Client, logger *log.Logger, node, bareVolid string) (bool, error) {
+	var lastErr error
+	for attempt := range parkerWindowMaxAttempts {
+		present, err := ObserveStorageVolumePresence(ctx, c, node, bareVolid)
+		if err == nil {
+			return present, nil
+		}
+		lastErr = err
+		if attempt == parkerWindowMaxAttempts-1 {
+			break
+		}
+		wait := TransientBackoffFor(ctx, attempt)
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= wait {
+			break
+		}
+		if logger != nil {
+			logger.Warn("transfer in: storage listing read failed; reading it again before the parker attaches the volume",
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.Int("attempt", attempt+1),
+				log.Err(err),
+			)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return false, lastErr
+}
+
 // finishAlreadyParked ends a transfer whose parker already carries the disk's
 // serial on parkedSlot as parkedVolid, because another operation landed it
-// there after the caller resolved the disk. The transfer writes no intent and
-// touches no source. When the parker's record of the disk doesn't name the
-// landed slot and volume, which is the state a transfer that died between its
-// serial write and its finalize leaves, it finalizes the record the way the
-// resume does, keeping the record's option overrides.
+// there after the caller resolved the disk. The parker is on node, and the
+// source VM the transfer started from is on srcNode. The transfer writes no
+// intent and touches no source. When the parker's record of the disk doesn't
+// name the landed slot and volume, which is the state a transfer that died
+// between its serial write and its finalize leaves, it finalizes the record
+// the way the resume does, keeping the record's option overrides.
+//
+// A parker that keeps no record of the disk at all gets a new one, and its
+// option overrides come from the caller's context, or else from the source
+// VM's own record of them, so a landed disk doesn't lose an operator's
+// update_disk. A source read that fails fails the transfer retriably rather
+// than write a record that says the disk has no overrides.
 func finishAlreadyParked(
 	ctx context.Context, c Client, logger *log.Logger,
-	node string, parkerVMID, srcVMID int, bareVolid, parkedSlot, parkedVolid string,
+	node, srcNode string, parkerVMID, srcVMID int, bareVolid, parkedSlot, parkedVolid string,
 	parkerCfg map[string]any, cfg ParkerConfig, pctx ParkContext,
 ) (string, error) {
 	if err := observeDiskRelocation(ctx, c, pctx.StableID, bareVolid, parkedVolid); err != nil {
@@ -1263,24 +1497,58 @@ func finishAlreadyParked(
 	_, records, _ := parseParkerSentinel(DescriptionFromConfig(parkerCfg))
 	record, recorded := records[pctx.StableID]
 	if !recorded {
+		if len(pctx.Opts) == 0 {
+			opts, optsErr := GetVMDiskOptOverlay(ctx, c, srcNode, srcVMID, pctx.StableID, bareVolid)
+			if optsErr != nil {
+				return "", cpierrors.WrapAs(optsErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+					"transfer in: read the option overrides of disk %s from source vm %d before recording it on parker vmid %d",
+					pctx.StableID, srcVMID, parkerVMID))
+			}
+			pctx.Opts = opts
+		}
 		record = buildParkerProvEntry(ctx, node, parkedVolid, parkedSlot, cfg, pctx)
 	}
-	if !recorded || record.Volid != parkedVolid || record.Slot != parkedSlot {
+	// A transfer that carries no allocation, such as delete_vm's, can park a
+	// journal-managed disk first and leave a record without the allocation.
+	// The managed transfer that waited on the disk lock then stamps its own
+	// allocation onto that record, because the serial on the parker's slot
+	// already proves the record is this disk's. A record that names another
+	// allocation is left alone, and the readback below refuses it.
+	managed := pctx.AllocationID != "" || pctx.AllocationNamespace != ""
+	stamp := managed && recorded && record.AllocationID == "" && record.AllocationNamespace == ""
+	if stamp {
+		record.AllocationID = pctx.AllocationID
+		record.AllocationNamespace = pctx.AllocationNamespace
+		if record.AllocationBacking == "" {
+			record.AllocationBacking = pctx.AllocationBacking
+		}
+	}
+	if !recorded || stamp || record.Volid != parkedVolid || record.Slot != parkedSlot {
 		record.Volid = parkedVolid
 		record.Slot = parkedSlot
 		if provErr := rewriteParkerProvenance(ctx, c, logger, node, parkerVMID, pctx.StableID, record, cfg); provErr != nil {
+			if managed {
+				return "", cpierrors.Cloud("managed transfer provenance persistence requires reconciliation")
+			}
 			return "", cpierrors.Wrap(provErr,
 				fmt.Sprintf("transfer in: finalize the record of disk %s already parked on parker vmid %d", pctx.StableID, parkerVMID))
+		}
+	}
+	if managed {
+		if err := VerifyAllocationParked(ctx, c, logger, parkedVolid, pctx.StableID, pctx.AllocationNamespace, pctx.AllocationID, cfg); err != nil {
+			return "", cpierrors.Cloud("managed transfer provenance readback requires reconciliation")
 		}
 	}
 	if logger != nil {
 		logger.Info("transfer in: disk is already on this parker; another operation moved it, so this transfer moved nothing",
 			log.Int("source_vmid", srcVMID),
 			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
 			log.String("slot", parkedSlot),
 			log.String("stable_id", pctx.StableID),
 			log.String("volid_before", bareVolid),
 			log.String("volid_after", parkedVolid),
+			log.Bool("disk_lock_unserialized", diskTransferLockUnserialized(ctx)),
 		)
 	}
 	return parkedVolid, nil

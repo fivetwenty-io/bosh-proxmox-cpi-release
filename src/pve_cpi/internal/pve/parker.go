@@ -601,7 +601,9 @@ func writeParkerProvenance(
 // finished, which means one of the parker's disk slots already carries key as
 // its serial. That record belongs to a transfer that landed the disk here, and
 // an intent written over it would name a volume and a slot the disk no longer
-// has.
+// has. It also refuses, with an error that matches errDiskLeftSource, when the
+// record's own slot holds a volume (see landedParkerRecord). Both checks run
+// on the same digest-guarded read the write is built on.
 func writeParkerTransferIntent(
 	ctx context.Context, c Client, logger *log.Logger,
 	node string, parkerVMID int, key string, entry parkerProvEntry, cfg ParkerConfig,
@@ -704,6 +706,42 @@ func finishedParkerRecord(vmCfg map[string]any, parkerVMID int, key string) erro
 	return &ParkerRecordFinishedError{ParkerVMID: parkerVMID, StableID: key, Slot: slot, Volid: volid}
 }
 
+// landedParkerRecord reports the refusal an intent write under key gets from
+// vmCfg when vmCfg keeps a record under key whose slot holds a volume, and nil
+// otherwise. A transfer that died after its move landed and before its serial
+// write leaves exactly that, with the disk's volume on the recorded slot and
+// no serial to say so. An intent written over it would name another slot, and
+// the resume, which looks only at the slot the record names, would never find
+// the landed volume again. The refusal matches errDiskLeftSource, so the
+// transfer re-resolves the disk and leaves the record to the resume.
+func landedParkerRecord(vmCfg map[string]any, parkerVMID int, key string) error {
+	_, disks, _ := parseParkerSentinel(DescriptionFromConfig(vmCfg))
+	record, recorded := disks[key]
+	if !recorded {
+		return nil
+	}
+	held, occupied := parkerRecordSlotHolds(vmCfg, record)
+	if !occupied {
+		return nil
+	}
+	return diskLeftSource("parker vmid %d keeps an unfinished transfer record for disk %s whose slot %s holds %s, "+
+		"so the intent record was not written over it", parkerVMID, key, record.Slot, held)
+}
+
+// parkerRecordSlotHolds returns the volume on the bus slot record names in
+// vmCfg, and whether that slot holds one at all. A record without a slot, or
+// one that names an unused entry, holds nothing.
+func parkerRecordSlotHolds(vmCfg map[string]any, record parkerProvEntry) (string, bool) {
+	if record.Slot == "" || strings.HasPrefix(record.Slot, "unused") {
+		return "", false
+	}
+	held, ok := slotBareVolid(vmCfg, record.Slot)
+	if !ok || held == "" || held == "none" {
+		return "", false
+	}
+	return held, true
+}
+
 // withRecordedOpts returns entry with the option overrides vmCfg's record
 // under key carries, when that record belongs to the same transfer as entry.
 // A record belongs to the same transfer when it names the same source VM and
@@ -752,6 +790,9 @@ func writeParkerProvenanceCollecting(
 			case parkerProvIntent:
 				if finished := finishedParkerRecord(vmCfg, parkerVMID, key); finished != nil {
 					return "", false, finished
+				}
+				if landed := landedParkerRecord(vmCfg, parkerVMID, key); landed != nil {
+					return "", false, landed
 				}
 			case parkerProvReplace:
 			}
@@ -824,7 +865,48 @@ func writeParkerProvenanceCollecting(
 // Best-effort: the removal is cleanup, so every failure is logged and the
 // function returns nothing. A record left behind names a volume that is no
 // longer on this parker, and a later provenance write collects it as stale.
+// A caller that must know whether the record went uses
+// removeParkerProvenanceChecked instead.
 func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, node string, parkerVMID int, bareVolid, stableID string, _ ParkerConfig) {
+	stillHeld, err := removeParkerProvenanceChecked(ctx, c, node, parkerVMID, bareVolid, stableID)
+	if logger == nil {
+		return
+	}
+	if err == nil {
+		if stillHeld {
+			logger.Info("parker provenance: the parker still holds the volume, so its record stays",
+				log.Int("parker_vmid", parkerVMID),
+				log.String("node", node),
+				log.String("volid", bareVolid),
+				log.String("stable_id", stableID),
+			)
+		}
+		return
+	}
+	if errors.Is(err, ErrParkerDescriptionContended) {
+		logger.Info("parker provenance: config kept changing under the remove — provenance left for later collection",
+			log.Int("parker_vmid", parkerVMID),
+			log.String("node", node),
+			log.String("volid", bareVolid),
+			log.Int("attempts", parkerDescriptionWriteAttempts),
+		)
+		return
+	}
+	logger.Warn("parker provenance: provenance not removed",
+		log.Int("parker_vmid", parkerVMID),
+		log.String("node", node),
+		log.String("volid", bareVolid),
+		log.Err(err),
+	)
+}
+
+// removeParkerProvenanceChecked is the removal behind removeParkerProvenance,
+// for a caller that has to know how it ended. It returns stillHeld when the
+// parker's fresh read still names bareVolid in a way that keeps the record,
+// and the write's error when the removal couldn't land, which includes
+// ErrParkerDescriptionContended after every round was refused. A record that
+// is already gone is a nil error with stillHeld false.
+func removeParkerProvenanceChecked(ctx context.Context, c Client, node string, parkerVMID int, bareVolid, stableID string) (bool, error) {
 	// Detached and bounded: this runs after the volume has already left the
 	// parker, so a context stopped by the protection window's deadline would
 	// leave a provenance entry naming a volume that is no longer there -- the
@@ -870,35 +952,7 @@ func removeParkerProvenance(ctx context.Context, c Client, logger *log.Logger, n
 			return newDesc, true, nil
 		},
 	})
-	if logger == nil {
-		return
-	}
-	if err == nil {
-		if stillHeld {
-			logger.Info("parker provenance: the parker still holds the volume, so its record stays",
-				log.Int("parker_vmid", parkerVMID),
-				log.String("node", node),
-				log.String("volid", bareVolid),
-				log.String("stable_id", stableID),
-			)
-		}
-		return
-	}
-	if errors.Is(err, ErrParkerDescriptionContended) {
-		logger.Info("parker provenance: config kept changing under the remove — provenance left for later collection",
-			log.Int("parker_vmid", parkerVMID),
-			log.String("node", node),
-			log.String("volid", bareVolid),
-			log.Int("attempts", parkerDescriptionWriteAttempts),
-		)
-		return
-	}
-	logger.Warn("parker provenance: provenance not removed",
-		log.Int("parker_vmid", parkerVMID),
-		log.String("node", node),
-		log.String("volid", bareVolid),
-		log.Err(err),
-	)
+	return stillHeld, err
 }
 
 // parkerProvenanceRecordsOf returns the keys of the records in disks that
