@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -54,15 +55,62 @@ func init() {
 // managed detach and attach paths shadow their own deps with a guarded copy and
 // a funnel cannot tell which of the two it was handed, so it happens here once
 // on behalf of every one of them.
+//
+// The same pass deletes the per-disk transfer locks whose claims have expired
+// (sweepExpiredDiskLocks), so a disk that never transfers again doesn't keep
+// the sentinel a crashed transfer left.
 func sweepParkerPool(ctx context.Context, deps Deps, node string, cfg pve.ParkerConfig) {
 	logger := deps.Log(ctx)
-	if err := (*placeParkersInPoolImpl.Load())(ctx, unguardedPVE(deps.PVE), logger, node, cfg); err != nil {
+	client := unguardedPVE(deps.PVE)
+	if err := (*placeParkersInPoolImpl.Load())(ctx, client, logger, node, cfg); err != nil {
 		logger.Debug("the parker pool sweep reported failures; the parkers it could not place stay where they are",
 			log.String("pool", cfg.Pool),
 			log.String("node", node),
 			log.Err(err),
 		)
 	}
+	sweepExpiredDiskLocks(ctx, client, logger)
+}
+
+// sweepExpiredDiskLocksFunc is the shape of pve.SweepExpiredDiskTransferLocks,
+// named for the seam below.
+type sweepExpiredDiskLocksFunc func(ctx context.Context, c pve.Client, logger *log.Logger) (int, error)
+
+// sweepExpiredDiskLocksImpl holds the expired per-disk lock sweep, which is
+// pve.SweepExpiredDiskTransferLocks in every process that is not running a
+// test. It is held in an atomic.Pointer for the reason placeParkersInPoolImpl
+// is.
+var sweepExpiredDiskLocksImpl atomic.Pointer[sweepExpiredDiskLocksFunc]
+
+func init() {
+	production := sweepExpiredDiskLocksFunc(pve.SweepExpiredDiskTransferLocks)
+	sweepExpiredDiskLocksImpl.Store(&production)
+}
+
+// expiredDiskLockSweepTimeout bounds the expired per-disk lock sweep, so a
+// slow pool listing never holds up the request whose park has already landed.
+const expiredDiskLockSweepTimeout = 15 * time.Second
+
+// sweepExpiredDiskLocks runs the expired per-disk lock sweep on client, which
+// must be the unguarded client for the reason sweepParkerPool gives. It is
+// best-effort like the pool placement, so every failure is only logged.
+func sweepExpiredDiskLocks(ctx context.Context, client pve.Client, logger *log.Logger) {
+	sweepCtx, cancel := context.WithTimeout(ctx, expiredDiskLockSweepTimeout)
+	defer cancel()
+	if _, err := (*sweepExpiredDiskLocksImpl.Load())(sweepCtx, client, logger); err != nil {
+		logger.Debug("the expired per-disk lock sweep reported failures; the sentinels it could not delete stay until the next sweep",
+			log.Err(err),
+		)
+	}
+}
+
+// setSweepExpiredDiskLocksForTest replaces the expired per-disk lock sweep for
+// the duration of a test and returns a restore function. Like
+// setPlaceParkersInPoolForTest, the seam is process-wide, so tests using it
+// must not call t.Parallel.
+func setSweepExpiredDiskLocksForTest(fn sweepExpiredDiskLocksFunc) func() {
+	prev := sweepExpiredDiskLocksImpl.Swap(&fn)
+	return func() { sweepExpiredDiskLocksImpl.Store(prev) }
 }
 
 // setPlaceParkersInPoolForTest replaces the sweep for the duration of a test

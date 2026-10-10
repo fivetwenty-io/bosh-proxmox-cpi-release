@@ -1056,3 +1056,87 @@ func TestParkFreeFloatingCrossNodeDisk_PlacesThePoolOutsideTheLifecycleGuard(t *
 			parkerCfgPool, pools.members)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// expired per-disk lock sweep
+// ---------------------------------------------------------------------------
+
+// diskLockSweepCall is one recorded invocation of the expired per-disk lock
+// sweep.
+type diskLockSweepCall struct {
+	client      pve.Client
+	hasDeadline bool
+}
+
+// captureDiskLockSweep swaps the expired per-disk lock sweep for one that
+// records its arguments and returns err, and restores it when the test ends.
+func captureDiskLockSweep(t *testing.T, err error) *[]diskLockSweepCall {
+	t.Helper()
+	calls := &[]diskLockSweepCall{}
+	t.Cleanup(setSweepExpiredDiskLocksForTest(func(ctx context.Context, c pve.Client, _ *log.Logger) (int, error) {
+		_, hasDeadline := ctx.Deadline()
+		*calls = append(*calls, diskLockSweepCall{client: c, hasDeadline: hasDeadline})
+		return 0, err
+	}))
+	return calls
+}
+
+// TestSweepParkerPool_SweepsExpiredDiskLocks pins that the pass after a park
+// also deletes expired per-disk transfer locks, on the client from deps rather
+// than the guard wrapped around it, and under its own deadline, so the pool
+// listing never holds up a request whose park has landed.
+func TestSweepParkerPool_SweepsExpiredDiskLocks(t *testing.T) {
+	_ = captureParkerPoolSweep(t)
+	calls := captureDiskLockSweep(t, nil)
+
+	deps := parkedDeps()
+	guarded := deps
+	guarded.PVE = &managedAllocationClient{Client: deps.PVE}
+	sweepParkerPool(context.Background(), guarded, parkerCfgJobNode, pve.ParkerConfig{Pool: parkerCfgPool})
+
+	if len(*calls) != 1 {
+		t.Fatalf("expired per-disk lock sweeps = %d, want exactly 1", len(*calls))
+	}
+	if (*calls)[0].client != deps.PVE {
+		t.Error("the expired per-disk lock sweep must run on the unguarded client from deps")
+	}
+	if !(*calls)[0].hasDeadline {
+		t.Error("the expired per-disk lock sweep must run under its own deadline")
+	}
+}
+
+// TestSweepParkerPool_OnlyLogsAFailedDiskLockSweep pins that a failed expired
+// per-disk lock sweep is best-effort like the pool placement, so it is only
+// logged.
+func TestSweepParkerPool_OnlyLogsAFailedDiskLockSweep(t *testing.T) {
+	_ = captureParkerPoolSweep(t)
+	_ = captureDiskLockSweep(t, errors.New("simulated listing failure"))
+
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	deps := parkedDeps()
+	deps.Logger = logger
+	sweepParkerPool(context.Background(), deps, parkerCfgJobNode, pve.ParkerConfig{Pool: parkerCfgPool})
+
+	for _, entry := range obs.All() {
+		if strings.Contains(entry.Message, "expired per-disk lock sweep reported failures") {
+			return
+		}
+	}
+	t.Fatalf("a failed expired per-disk lock sweep was not logged: %+v", obs.All())
+}
+
+// TestParkFreshDisk_SweepsExpiredDiskLocksAfterThePark pins that a funnel
+// reaches the expired per-disk lock sweep through sweepParkerPool.
+func TestParkFreshDisk_SweepsExpiredDiskLocksAfterThePark(t *testing.T) {
+	_ = captureParkDisk(t, nil)
+	_ = captureParkerPoolSweep(t)
+	calls := captureDiskLockSweep(t, nil)
+
+	if err := parkFreshDisk(context.Background(), parkedDeps(), parkerCfgJobNode,
+		"pvd-abc", parkerCfgVolid, "stable-id"); err != nil {
+		t.Fatalf("parkFreshDisk: unexpected error: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expired per-disk lock sweeps = %d, want exactly 1", len(*calls))
+	}
+}
