@@ -1615,7 +1615,14 @@ func finishAlreadyParked(
 // Anything else is a state this code cannot safely converge; it returns a
 // permanent error naming what it found so an operator can look.
 //
-//nolint:gocognit,gocyclo // Case analysis over the transfer's crash windows; each branch is one window and the ordering between them is load-bearing.
+// The resume takes the disk's per-disk transfer lock (withDiskTransferLock)
+// before the parker's lock, the same order a fresh transfer takes them in, so
+// a resume and a fresh transfer of one disk into different parkers can't
+// overlap. The caller reads the intent before either lock, and the window
+// reads the parker again under both. A caller that already holds the disk's
+// lock runs inside it rather than waiting on its own claim. Under the lock
+// the parker window opens only when enough of the disk claim is left for it
+// to finish (diskTransferWindowContext).
 func ResumeDiskTransferToParker(
 	ctx context.Context, c Client, logger *log.Logger,
 	intent DiskTransferIntent, stableID string,
@@ -1633,6 +1640,32 @@ func ResumeDiskTransferToParker(
 		return "", contextErr
 	}
 
+	var landed string
+	lockErr := withDiskTransferLock(ctx, c, logger, stableID, "transfer_resume", func(dctx context.Context) error {
+		budgetCtx, cancel, budgetErr := diskTransferWindowContext(dctx, stableID, time.Now())
+		if budgetErr != nil {
+			return budgetErr
+		}
+		defer cancel()
+		var windowErr error
+		landed, windowErr = resumeDiskTransferWindow(budgetCtx, c, logger, intent, stableID, cfg, pctx)
+		return windowErr
+	})
+	if lockErr != nil {
+		return "", lockErr
+	}
+	return landed, nil
+}
+
+// resumeDiskTransferWindow runs the resume's windows inside the parker's
+// protection lock. Its caller holds the disk's per-disk transfer lock.
+//
+//nolint:gocognit,gocyclo // Case analysis over the transfer's crash windows; each branch is one window and the ordering between them is load-bearing.
+func resumeDiskTransferWindow(
+	ctx context.Context, c Client, logger *log.Logger,
+	intent DiskTransferIntent, stableID string,
+	cfg ParkerConfig, pctx ParkContext,
+) (string, error) {
 	var landed string
 	lockErr := withParkerProtectionLock(ctx, c, logger, intent.ParkerVMID, "transfer_resume", func(wctx context.Context) error {
 		parkerCfg, cfgErr := c.QEMU().Config(wctx, intent.ParkerNode, intent.ParkerVMID)

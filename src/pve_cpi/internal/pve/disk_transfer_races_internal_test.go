@@ -228,6 +228,118 @@ func TestTransferDiskToParker_RaceAcrossTwoParkers(t *testing.T) {
 	}
 }
 
+// TestResumeDiskTransferToParker_RacesAFreshTransferAcrossTwoParkers runs the
+// resume of a crashed transfer of one disk against a fresh transfer of the
+// same disk that picks a different parker, because the parker listing it
+// reads first doesn't show parker 90000. Without the per-disk lock in the
+// resume, the two would each move the disk toward their own parker. The lock
+// serializes them. The resume holds the disk lock while the fresh transfer
+// waits on it, moves the disk onto 90000, and the fresh transfer then finds
+// the source empty in its window on 90001 and the disk on 90000 through the
+// re-resolve.
+func TestResumeDiskTransferToParker_RacesAFreshTransferAcrossTwoParkers(t *testing.T) {
+	t.Parallel()
+	inner := newScanFakeClient(map[int]map[string]any{
+		700:   {"unused0": "data:vm-700-disk-1"},
+		90000: {cfgKeyTags: "bosh-cpi;bosh-parker", paramProtection: true},
+		90001: {cfgKeyTags: "bosh-cpi;bosh-parker", paramProtection: true},
+	})
+	inner.rows = []map[string]any{
+		clusterRow(700, ""),
+		clusterRow(90000, "bosh-cpi;bosh-parker"),
+		clusterRow(90001, "bosh-cpi;bosh-parker"),
+	}
+	c := &hookedScanClient{scanFakeClient: inner}
+	var hidOnce atomic.Bool
+	c.hideGuests = func(ctx context.Context) map[int]bool {
+		if ctx.Value(otherParkerKey{}) != nil && hidOnce.CompareAndSwap(false, true) {
+			return map[int]bool{90000: true}
+		}
+		return nil
+	}
+
+	// The resume's parker window waits until the fresh transfer has tried the
+	// disk lock, so the two really contend for it.
+	diskLock := ClusterLockPoolName(diskTransferLockName(transferStableID))
+	var diskCreates atomic.Int32
+	contended := make(chan struct{})
+	var contendedOnce sync.Once
+	var timedOut atomic.Bool
+	resumeWindow := ClusterLockPoolName("vm-90000")
+	var gated atomic.Bool
+	pools := &gatedLockPools{fakeLockPools: newFakeLockPools()}
+	pools.beforeCreate = func(poolID string) {
+		if poolID == diskLock {
+			if diskCreates.Add(1) >= 2 {
+				contendedOnce.Do(func() { close(contended) })
+			}
+			return
+		}
+		if poolID == resumeWindow && gated.CompareAndSwap(false, true) {
+			select {
+			case <-contended:
+			case <-time.After(10 * time.Second):
+				timedOut.Store(true)
+			}
+		}
+	}
+	inner.pools = pools
+
+	base := WithClusterLockPollForTest(context.Background(), 5*time.Millisecond)
+	intent := DiskTransferIntent{ParkerVMID: 90000, ParkerNode: "pve1", Slot: "scsi4", Volid: "data:vm-700-disk-1", SourceVMCID: "700"}
+	pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+	var resumed, transferred string
+	var resumeErr, transferErr error
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		resumed, resumeErr = ResumeDiskTransferToParker(base, c, nil, intent, transferStableID, transferTestCfg, ParkContext{})
+	})
+	wg.Go(func() {
+		// Start the fresh transfer once the resume holds the disk lock.
+		deadline := time.Now().Add(10 * time.Second)
+		for diskCreates.Load() < 1 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		transferred, transferErr = TransferDiskToParker(context.WithValue(base, otherParkerKey{}, true),
+			c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg, pctx)
+	})
+	wg.Wait()
+
+	if timedOut.Load() {
+		t.Fatal("the fresh transfer never tried the per-disk lock while the resume held it")
+	}
+	if resumeErr != nil {
+		t.Fatalf("resume: %v", resumeErr)
+	}
+	if transferErr != nil {
+		t.Fatalf("fresh transfer: %v", transferErr)
+	}
+	if !slices.Contains(pools.calls, "create:"+ClusterLockPoolName("vm-90001")) {
+		t.Fatalf("the fresh transfer never opened a window on parker 90001; pool calls=%v", pools.calls)
+	}
+	if !strings.HasPrefix(resumed, "data:vm-90000-disk-") || transferred != resumed {
+		t.Fatalf("resumed=%q transferred=%q, want both to report the one volume parked on 90000", resumed, transferred)
+	}
+	moves := 0
+	for _, e := range inner.events {
+		if strings.HasPrefix(e, "move:") {
+			moves++
+		}
+	}
+	if moves != 1 {
+		t.Fatalf("moves = %d, want exactly one; events=%v", moves, inner.events)
+	}
+	holders := 0
+	for _, vmid := range []int{90000, 90001} {
+		if _, _, carried := parkerSlotCarryingSerial(inner.configs[vmid], transferStableID); carried {
+			holders++
+		}
+	}
+	if holders != 1 {
+		t.Fatalf("%d parkers carry the disk, want one", holders)
+	}
+}
+
 // TestTransferDiskToParker_RestartsUnderTheNameTheDiskHasNow covers the
 // re-resolve of a disk that is still on its source under a name other than
 // the one the transfer started with. The window writes nothing for the old
