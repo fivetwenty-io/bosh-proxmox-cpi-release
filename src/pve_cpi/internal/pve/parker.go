@@ -720,7 +720,7 @@ func landedParkerRecord(vmCfg map[string]any, parkerVMID int, key string) error 
 	if !recorded {
 		return nil
 	}
-	held, occupied := parkerRecordSlotHolds(vmCfg, record)
+	held, occupied := parkerRecordSlotHolds(vmCfg, record, key)
 	if !occupied {
 		return nil
 	}
@@ -728,15 +728,21 @@ func landedParkerRecord(vmCfg map[string]any, parkerVMID int, key string) error 
 		"so the intent record was not written over it", parkerVMID, key, record.Slot, held)
 }
 
-// parkerRecordSlotHolds returns the volume on the bus slot record names in
-// vmCfg, and whether that slot holds one at all. A record without a slot, or
-// one that names an unused entry, holds nothing.
-func parkerRecordSlotHolds(vmCfg map[string]any, record parkerProvEntry) (string, bool) {
+// parkerRecordSlotHolds returns the volume on the bus slot that the record of
+// the disk with stableID names in vmCfg, and whether that slot holds a volume
+// that may be this disk's landing. A record without a slot, or one that names
+// an unused entry, holds nothing. A slot whose drive carries another disk's
+// stable-ID serial holds that disk, not this one's landing, so it doesn't
+// count either, and the record may be replaced.
+func parkerRecordSlotHolds(vmCfg map[string]any, record parkerProvEntry, stableID string) (string, bool) {
 	if record.Slot == "" || strings.HasPrefix(record.Slot, "unused") {
 		return "", false
 	}
 	held, ok := slotBareVolid(vmCfg, record.Slot)
 	if !ok || held == "" || held == "none" {
+		return "", false
+	}
+	if serial, has := StableIDFromDriveOptStr(qemu.ParseDisks(vmCfg)[record.Slot]); has && serial != stableID {
 		return "", false
 	}
 	return held, true

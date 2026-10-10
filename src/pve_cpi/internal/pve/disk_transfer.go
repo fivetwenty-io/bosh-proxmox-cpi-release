@@ -1168,13 +1168,14 @@ func transferIntoParkerLocked(
 		return "", diskLeftSource("source vm %d names %q nowhere, so this transfer wrote no intent record", srcVMID, bareVolid)
 	}
 	// A record of the disk this parker already keeps is replaced only while
-	// its slot is empty. A slot that holds a volume is what a transfer that
-	// died after its move landed and before its serial write leaves, and the
-	// resume finds that volume only through the slot the record names. The
-	// intent write checks the same on its own fresh read (landedParkerRecord).
+	// its slot is empty or holds a drive whose serial names another disk. A
+	// slot that holds any other volume is what a transfer that died after its
+	// move landed and before its serial write leaves, and the resume finds
+	// that volume only through the slot the record names. The intent write
+	// checks the same on its own fresh read (landedParkerRecord).
 	_, priorRecords, _ := parseParkerSentinel(DescriptionFromConfig(parkerCfg))
 	prior, hadRecord := priorRecords[pctx.StableID]
-	if held, occupied := parkerRecordSlotHolds(parkerCfg, prior); hadRecord && occupied {
+	if held, occupied := parkerRecordSlotHolds(parkerCfg, prior, pctx.StableID); hadRecord && occupied {
 		return "", diskLeftSource("parker vmid %d keeps an unfinished transfer record for disk %s whose slot %s holds %s, "+
 			"so this transfer wrote no intent record", parkerVMID, pctx.StableID, prior.Slot, held)
 	}
@@ -1199,8 +1200,8 @@ func transferIntoParkerLocked(
 	// leftBeforeDelete answers a source that let the volume go after the read
 	// above and before this transfer deleted anything. Nothing was moved, so
 	// the intent record this transfer just wrote is taken back when it is the
-	// only record of the disk here. A record it replaced had an empty slot
-	// and is left as the intent now names it, because the transfer that wrote
+	// only record of the disk here. A record it replaced held no landing of
+	// this disk on its slot and is left as the intent now names it, because the transfer that wrote
 	// that one may still need it. A take-back that doesn't land leaves an
 	// intent that names a volume this transfer never moved, so the transfer
 	// fails retriably instead of re-resolving the disk, and the Director's

@@ -429,6 +429,72 @@ func TestTransferDiskToParker_CrashAfterLandIsNeverOverwritten(t *testing.T) {
 	})
 }
 
+// TestTransferDiskToParker_RecordSlotHoldingAnotherDiskIsReplaced covers a
+// stale record of the disk whose slot now holds another disk, which its
+// stable-ID serial says. That volume is not this disk's landing, so the record
+// doesn't block the transfer. The transfer replaces the record, parks the
+// disk on another slot, and leaves the other disk's drive alone.
+func TestTransferDiskToParker_RecordSlotHoldingAnotherDiskIsReplaced(t *testing.T) {
+	t.Parallel()
+	const otherDrive = "data:vm-90000-disk-0,serial=bpd-99887766ffeeddcc,size=10G"
+	desc := recordDesc("data:vm-700-disk-1", "scsi0")
+
+	t.Run("the transfer parks the disk", func(t *testing.T) {
+		t.Parallel()
+		c := newScanFakeClient(map[int]map[string]any{
+			700: {"scsi1": "data:vm-700-disk-1,serial=" + transferStableID + ",size=10G"},
+			90000: {
+				cfgKeyTags:      "bosh-cpi;bosh-parker",
+				paramProtection: true,
+				"scsi0":         otherDrive,
+				"description":   desc,
+			},
+		})
+		pctx := ParkContext{DiskCID: "pvd-test", SourceVMCID: "700", StableID: transferStableID}
+		landed, err := TransferDiskToParker(context.Background(), c, nil, "pve1", 700, "data:vm-700-disk-1", transferTestCfg, pctx)
+		if err != nil {
+			t.Fatalf("TransferDiskToParker: %v", err)
+		}
+		slot, parked, carried := parkerSlotCarryingSerial(c.configs[90000], transferStableID)
+		if !carried || parked != landed || slot == "scsi0" {
+			t.Fatalf("slot=%q parked=%q carried=%v landed=%q, want the disk on a slot other than scsi0", slot, parked, carried, landed)
+		}
+		if got, _ := c.configs[90000]["scsi0"].(string); got != otherDrive {
+			t.Fatalf("scsi0 = %q, want the other disk's drive left alone", got)
+		}
+		if entry := c.parkedEntries(t)[transferStableID]; entry.Volid != landed || entry.Slot != slot {
+			t.Fatalf("record = %+v, want it to name %q on %s", entry, landed, slot)
+		}
+	})
+
+	t.Run("the intent write replaces the record", func(t *testing.T) {
+		t.Parallel()
+		c := newScanFakeClient(map[int]map[string]any{
+			90000: {cfgKeyTags: "bosh-cpi;bosh-parker", "scsi0": otherDrive, "description": desc},
+		})
+		intent := parkerProvEntry{DiskCID: "pvd-test", Node: "pve1", Volid: "data:vm-700-disk-1", Slot: "scsi1", SourceVMCID: "700"}
+		if err := writeParkerTransferIntent(context.Background(), c, nil, "pve1", 90000, transferStableID, intent, transferTestCfg); err != nil {
+			t.Fatalf("writeParkerTransferIntent: %v", err)
+		}
+		if entry := c.parkedEntries(t)[transferStableID]; entry.Slot != "scsi1" {
+			t.Fatalf("record = %+v, want the intent on scsi1", entry)
+		}
+	})
+
+	t.Run("a drive with no serial still blocks the record", func(t *testing.T) {
+		t.Parallel()
+		_, records, _ := parseParkerSentinel(desc)
+		cfg := map[string]any{"scsi0": "data:vm-90000-disk-0,size=10G"}
+		if held, occupied := parkerRecordSlotHolds(cfg, records[transferStableID], transferStableID); !occupied || held != "data:vm-90000-disk-0" {
+			t.Fatalf("held=%q occupied=%v, want a serial-less landing to hold the slot", held, occupied)
+		}
+		cfg["scsi0"] = "data:vm-90000-disk-0,serial=" + transferStableID + ",size=10G"
+		if _, occupied := parkerRecordSlotHolds(cfg, records[transferStableID], transferStableID); !occupied {
+			t.Fatal("a drive carrying this disk's own serial did not hold the slot")
+		}
+	})
+}
+
 // sourceLetsGoAfterIntent returns a client whose source VM 700 stops naming
 // its volume on the first source read after the transfer writes its intent,
 // as if another operation took the volume between the two reads. Every parker
