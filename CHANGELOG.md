@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-11
+
 ### Changed
 
 - The CPI now builds against newer Go modules, including aws-sdk-go-v2 v1.47.3 with service/s3 v1.114.3, OpenTelemetry v1.47.0, proxmox-apiclient-go v3.11.0, grpc v1.84.0, and golang.org/x/net v0.61.0. The OpenTelemetry log SDK moves from v0.22.0 to v1.47.0. The CPI's own code doesn't change.
@@ -718,7 +720,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.8.1...v0.9.0
