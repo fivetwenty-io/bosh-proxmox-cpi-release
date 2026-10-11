@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- A transfer of a disk into a parker now logs "disk transfer: took the per-disk lock" with the disk's stable ID, the caller's purpose, and `waited_ms`, the time it spent acquiring the lock. Every acquire waits about 2.5 seconds of create grace, so a wait well past that shows that another transfer of the same disk held the lock first.
+
+### Fixed
+
+- The `cpi` job wrapper failed with "pve_cpi binary not found" when a caller resolved symlinks before running it, as sudo-rs does on resolute stemcells for `sudo /var/vcap/jobs/pve_cpi/bin/cpi`. The wrapper then ran from `data/jobs/pve_cpi/<hash>` and looked for packages one level too deep. It now recognizes that layout and finds `/var/vcap/packages` either way, and the `pre-start` wrapper does the same. The Director's own calls weren't affected.
+
 ## [0.9.2] - 2026-10-10
 
 ### Changed
