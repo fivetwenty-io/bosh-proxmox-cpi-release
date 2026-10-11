@@ -135,3 +135,58 @@ func TestProvisionJournalPreStartLaunchResolution(t *testing.T) {
 		t.Fatal("per-invocation wrapper provisions journal")
 	}
 }
+
+// TestJobWrappersResolveTheRealJobDirectory runs both job wrappers from
+// data/jobs/<job>/<hash>, the path a caller that resolves symlinks hands them
+// (sudo-rs does), as well as from the jobs/<job> link. Each must find the
+// installation's packages either way.
+func TestJobWrappersResolveTheRealJobDirectory(t *testing.T) {
+	cases := []struct {
+		template string
+		bin      string
+		args     func(job string) string
+	}{
+		{"cpi.erb", "cpi", func(job string) string {
+			return "--config\n" + filepath.Join(job, "config", "cpi.json") + "\n"
+		}},
+		{"pre-start.erb", "pre-start", func(job string) string {
+			return "provision-journal\n--config\n" + filepath.Join(job, "config", "cpi.json") + "\n--owner\nvcap\n"
+		}},
+	}
+	for _, tc := range cases {
+		for _, layout := range []string{filepath.Join("data", "jobs", "pve_cpi", "0123abcd"), filepath.Join("jobs", "pve_cpi")} {
+			t.Run(tc.template+"/"+layout, func(t *testing.T) {
+				base := provisionTemp(t)
+				job := filepath.Join(base, layout)
+				pkg := filepath.Join(base, "packages", "pve_cpi", "bin")
+				for _, p := range []string{filepath.Join(job, "bin"), filepath.Join(job, "config"), pkg} {
+					if err := os.MkdirAll(p, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				template, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "jobs", "pve_cpi", "templates", tc.template))
+				if err != nil {
+					t.Fatal(err)
+				}
+				launch := filepath.Join(job, "bin", tc.bin)
+				if err := os.WriteFile(launch, template, 0700); err != nil {
+					t.Fatal(err)
+				}
+				fake := []byte("#!/bin/bash\nprintf '%s\\n' \"$@\"\n")
+				if err := os.WriteFile(filepath.Join(pkg, "cpi"), fake, 0700); err != nil {
+					t.Fatal(err)
+				}
+				command := exec.CommandContext(t.Context(), "bash", launch)
+				command.Dir = base
+				command.Env = append(os.Environ(), "BOSH_PACKAGES_DIR=")
+				out, err := command.CombinedOutput()
+				if err != nil {
+					t.Fatalf("%v: %s", err, out)
+				}
+				if want := tc.args(job); string(out) != want {
+					t.Fatalf("launch arguments = %q, want %q", out, want)
+				}
+			})
+		}
+	}
+}

@@ -9,6 +9,12 @@ JOB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Compute the installation parent lexically. Appending /../.. to a job
 # symlink would make the kernel resolve those parents inside data/jobs.
 INSTALL_DIR="$(dirname "$(dirname "${JOB_DIR}")")"
+# A caller that resolves symlinks before running us, such as sudo-rs, hands us
+# the job's real directory, data/jobs/<job>/<hash>, one level deeper than the
+# jobs/<job> link that names it.
+case "${JOB_DIR}" in
+  */data/jobs/*/*) INSTALL_DIR="${JOB_DIR%/data/jobs/*}" ;;
+esac
 PACKAGES_DIR="${BOSH_PACKAGES_DIR:-${INSTALL_DIR}/packages}"
 
 BIN="${PACKAGES_DIR}/pve_cpi/bin/cpi"
