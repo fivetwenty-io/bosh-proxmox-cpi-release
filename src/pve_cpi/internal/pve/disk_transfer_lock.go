@@ -233,8 +233,10 @@ func withDiskTransferLock(ctx context.Context, c Client, logger *log.Logger, sta
 	}
 	owner := ProcessLockOwner(fmt.Sprintf("%s/%s", purpose, stableID))
 	ttl, timeout := diskTransferLockTimeouts(ctx)
+	clk := parkerLockClockFrom(ctx)
+	acquireStart := clk.now()
 	handle, lockErr := acquireClusterLockWithClock(ctx, pools,
-		diskTransferLockName(stableID), owner, ttl, timeout, parkerLockClockFrom(ctx), diskTransferLockOptions(ttl)...)
+		diskTransferLockName(stableID), owner, ttl, timeout, clk, diskTransferLockOptions(ttl)...)
 	if lockErr != nil {
 		if !errors.Is(lockErr, ErrClusterLockCreateRefused) {
 			// A timeout means another transfer of this disk held the lock
@@ -252,6 +254,16 @@ func withDiskTransferLock(ctx context.Context, c Client, logger *log.Logger, sta
 			)
 		}
 		return fn(unserialized)
+	}
+	if logger != nil {
+		// The time includes the create grace every acquire pays, so a wait
+		// well past that grace means another transfer of this disk held the
+		// lock first.
+		logger.Info("disk transfer: took the per-disk lock",
+			log.String("stable_id", stableID),
+			log.String("purpose", purpose),
+			log.Int64("waited_ms", clk.now().Sub(acquireStart).Milliseconds()),
+		)
 	}
 	defer func() {
 		// Released on a detached context, so a request that has already ended

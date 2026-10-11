@@ -589,8 +589,9 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 		}
 	}
 	ctx := withTestParkerLockClock(context.Background(), clk.clock())
+	logger, obs := log.NewObservedLogger(log.LevelInfo)
 	ran := false
-	err := withDiskTransferLock(ctx, &parkerLockClient{pools: pools}, nil, transferStableID, "contender", func(context.Context) error {
+	err := withDiskTransferLock(ctx, &parkerLockClient{pools: pools}, logger, transferStableID, "contender", func(context.Context) error {
 		ran = true
 		return nil
 	})
@@ -599,6 +600,14 @@ func TestWithDiskTransferLock_WaitsOutAHolderPastTheParkerWait(t *testing.T) {
 	}
 	if elapsed := time.Duration(clk.offset.Load()); elapsed < holdFor {
 		t.Fatalf("the contender acquired after %s, before the holder let go at %s", elapsed, holdFor)
+	}
+	entries := obs.All()
+	if len(entries) != 1 || entries[0].Message != "disk transfer: took the per-disk lock" ||
+		entries[0].Attrs["stable_id"] != transferStableID || entries[0].Attrs["purpose"] != "contender" {
+		t.Fatalf("log = %+v, want one line saying the contender took the disk's lock", entries)
+	}
+	if waited, ok := entries[0].Attrs["waited_ms"].(int64); !ok || waited < holdFor.Milliseconds() {
+		t.Fatalf("waited_ms = %v, want at least the %s the holder kept the lock", entries[0].Attrs["waited_ms"], holdFor)
 	}
 }
 
