@@ -84,16 +84,16 @@ jobs:
           cache: false
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
       - name: Install trivy
         # SHA-pinned: upstream deletes old tags (v0.2.0 vanished and broke scheduled runs)
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
-          version: v0.74.0
+          version: v0.75.0
 
       - name: Run security scans
         # REQUIRE_TOOLS makes a missing scanner a failure rather than
