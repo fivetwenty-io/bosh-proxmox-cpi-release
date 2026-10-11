@@ -14,6 +14,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Changed
 
+- The CPI now builds against newer Go modules, including aws-sdk-go-v2 v1.47.3 with service/s3 v1.114.3, OpenTelemetry v1.47.0, proxmox-apiclient-go v3.11.0, grpc v1.84.0, and golang.org/x/net v0.61.0. The OpenTelemetry log SDK moves from v0.22.0 to v1.47.0. The CPI's own code doesn't change.
+
+- CI and the Concourse tasks now pin govulncheck v1.9.0, gosec v2.29.0, trivy v0.75.0, bosh-cli 7.11.0, gh 2.102.0, credhub-cli 2.9.62, and uv 0.13.0. The integration task also runs on the current `ubuntu:24.04` digest.
+
 - A transfer of a disk into a parker now logs "disk transfer: took the per-disk lock" with the disk's stable ID, the caller's purpose, and `waited_ms`, the time it spent acquiring the lock. Every acquire waits about 2.5 seconds of create grace, so a wait well past that shows that another transfer of the same disk held the lock first.
 
 ### Fixed
