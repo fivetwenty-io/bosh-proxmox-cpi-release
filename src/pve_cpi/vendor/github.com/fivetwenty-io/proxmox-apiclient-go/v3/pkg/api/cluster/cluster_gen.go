@@ -128,6 +128,12 @@ type Service interface {
 	// UpdateCephFlags2 PUT /cluster/ceph/flags/{flag}
 	// Set or clear (unset) a specific Ceph flag. Runs synchronously (unlike the bulk PUT /cluster/ceph/flags endpoint, which forks a worker task).
 	UpdateCephFlags2(ctx context.Context, flag string, params *UpdateCephFlags2Params) error
+	// ListCephHealthMute GET /cluster/ceph/health-mute
+	// Get the currently muted Ceph health checks.
+	ListCephHealthMute(ctx context.Context) (*ListCephHealthMuteResponse, error)
+	// UpdateCephHealthMute PUT /cluster/ceph/health-mute/{code}
+	// Mute or unmute a Ceph health check. A muted check no longer counts towards the cluster status, but stays visible and keeps being evaluated.
+	UpdateCephHealthMute(ctx context.Context, code string, params *UpdateCephHealthMuteParams) error
 	// ListCephMetadata GET /cluster/ceph/metadata
 	// Get ceph metadata.
 	ListCephMetadata(ctx context.Context, params *ListCephMetadataParams) (*ListCephMetadataResponse, error)
@@ -2485,6 +2491,79 @@ func (s *service) UpdateCephFlags2(ctx context.Context, flag string, params *Upd
 	return nil
 }
 
+// ListCephHealthMuteResponse mirrors the shape returned by GET /cluster/ceph/health-mute.
+type ListCephHealthMuteResponse []json.RawMessage
+
+// ListCephHealthMute implements Service.ListCephHealthMute. GET /cluster/ceph/health-mute.
+func (s *service) ListCephHealthMute(ctx context.Context) (*ListCephHealthMuteResponse, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("cluster.ListCephHealthMute: ctx must not be nil")
+	}
+	path := "/cluster/ceph/health-mute"
+	var body map[string]interface{}
+	resp, err := s.c.GetRawCtx(ctx, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListCephHealthMute: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("cluster.ListCephHealthMute: nil response from client")
+	}
+	if resp.Data == nil {
+		out := ListCephHealthMuteResponse{}
+		return &out, nil
+	}
+	raw, err := json.Marshal(resp.Data)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListCephHealthMute: re-marshal data: %w", err)
+	}
+	out := &ListCephHealthMuteResponse{}
+	err = json.Unmarshal(raw, out)
+	if err != nil {
+		return nil, fmt.Errorf("cluster.ListCephHealthMute: unmarshal data: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateCephHealthMuteParams is the request payload for UpdateCephHealthMute.
+type UpdateCephHealthMuteParams struct {
+	// Sticky Keep the mute even when the check gets worse. Without this a mute clears itself as soon as the number of affected items grows, which brings the check back to attention. Only used when muting.
+	Sticky *bool `json:"sticky,omitempty"`
+	// Ttl How long the mute lasts, for example '2h', '3d' or '1w'. Without it the mute has no expiry. Only used when muting.
+	Ttl *string `json:"ttl,omitempty"`
+	// Value Whether to mute (true) or unmute (false) the check.
+	Value bool `json:"value"`
+}
+
+// UpdateCephHealthMute implements Service.UpdateCephHealthMute. PUT /cluster/ceph/health-mute/{code}.
+func (s *service) UpdateCephHealthMute(ctx context.Context, code string, params *UpdateCephHealthMuteParams) error {
+	if ctx == nil {
+		return fmt.Errorf("cluster.UpdateCephHealthMute: ctx must not be nil")
+	}
+	path := fmt.Sprintf("/cluster/ceph/health-mute/%s", url.PathEscape(code))
+	var body map[string]interface{}
+	if params != nil {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateCephHealthMute: marshal params: %w", err)
+		}
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		err = dec.Decode(&body)
+		if err != nil {
+			return fmt.Errorf("cluster.UpdateCephHealthMute: decode params: %w", err)
+		}
+	}
+	resp, err := s.c.PutRawCtx(ctx, path, body)
+	if err != nil {
+		return fmt.Errorf("cluster.UpdateCephHealthMute: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("cluster.UpdateCephHealthMute: nil response from client")
+	}
+	_ = resp
+	return nil
+}
+
 // ListCephMetadataParams is the request payload for ListCephMetadata.
 type ListCephMetadataParams struct {
 	// Scope Which metadata facet to return: 'all' enriches the per-daemon metadata with the PVE-side service state (presence of unit, data directory), 'versions' collects only per-node Ceph binary version data.
@@ -2551,7 +2630,7 @@ func (s *service) ListCephMetadata(ctx context.Context, params *ListCephMetadata
 type CreateCephRestartBulkParams struct {
 	// DryRun Log the plan (which daemons would be restarted, in what order) without actually doing anything.
 	DryRun *bool `json:"dry-run,omitempty"`
-	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. HEALTH_ERR is always fatal regardless. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
+	// Force Proceed past a HEALTH_WARN with non-benign checks like PG_DEGRADED, SLOW_OPS, or MON_DOWN. A blocking HEALTH_ERR is fatal regardless of this flag. Checks that ceph reports as muted, and checks known to be harmless for a rolling restart, never block and are named in the task log. The cluster-wide OSD map flags are only ever evaluated for an OSD restart, since they govern nothing a mon, mgr or mds restart touches. The operator is responsible for confirming the cluster is stable enough to absorb a rolling restart.
 	Force *bool `json:"force,omitempty"`
 	// OnlyOutdated OSDs only: restart only OSDs whose running version differs from the locally-installed ceph-osd binary on their host. Forwarded to each per-node sub-task so the per-host installed version is used (a partial upgrade where one host is on a newer build is handled correctly).
 	OnlyOutdated *bool `json:"only-outdated,omitempty"`

@@ -1055,3 +1055,11 @@ func (s *panicClusterStub) UpdateQemuCustomCpuModels(_ context.Context, _ string
 func (s *panicClusterStub) DeleteQemuCustomCpuModels(_ context.Context, _ string) error {
 	panic("panicClusterStub.DeleteQemuCustomCpuModels: not configured for SDN test; opt in by setting DeleteQemuCustomCpuModelsFn")
 }
+
+func (s *panicClusterStub) ListCephHealthMute(_ context.Context) (*cluster.ListCephHealthMuteResponse, error) {
+	panic("panicClusterStub.ListCephHealthMute: not configured for SDN test; opt in by setting ListCephHealthMuteFn")
+}
+
+func (s *panicClusterStub) UpdateCephHealthMute(_ context.Context, _ string, _ *cluster.UpdateCephHealthMuteParams) error {
+	panic("panicClusterStub.UpdateCephHealthMute: not configured for SDN test; opt in by setting UpdateCephHealthMuteFn")
+}

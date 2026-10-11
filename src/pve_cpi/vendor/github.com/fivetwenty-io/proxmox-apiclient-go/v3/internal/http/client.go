@@ -1593,6 +1593,13 @@ func classifyTransportError(req *http.Request, doErr error, attempt, retries int
 		return newConnectionError(req, doErr)
 	}
 
+	// A certificate the client refuses is refused again on every retry, so
+	// the loop stops at once. The error keeps the retry loop's usual wrapping,
+	// so callers that match the verifier's text or sentinels still see them.
+	if isCertificateVerificationError(doErr) {
+		return fmt.Errorf("request failed after %d attempt(s): %w", attempt+1, doErr)
+	}
+
 	if attempt >= retries || !retryAllowed {
 		// A connection-lifecycle race (the server closed an idle keep-alive
 		// connection, or the pool handed out an already-closed connection)
@@ -1702,6 +1709,54 @@ func isTerminalTransportError(err error) bool {
 	}
 
 	return false
+}
+
+// isCertificateVerificationError reports whether err means the TLS handshake
+// reached the server and the client then refused its certificate: a pinned
+// fingerprint that does not match, an unknown fingerprint with no way to
+// approve it, or a chain or hostname that standard verification rejects.
+// These are deterministic, so a retry only repeats the handshake and the
+// backoff. A handshake that timed out or was cut off is not one of these,
+// and stays retryable.
+func isCertificateVerificationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// The fingerprint verifier's refusals. Each one means the server
+	// presented a certificate the client does not trust.
+	sentinels := []error{
+		issl.ErrCannotVerifyFingerprint,
+		issl.ErrCertificateFingerprintNotTrusted,
+		issl.ErrCertificateVerificationFailed,
+		issl.ErrUnknownCertificateFingerprint,
+		issl.ErrNoCertificatesProvided,
+	}
+
+	for _, sentinel := range sentinels {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+
+	var verifyErr *tls.CertificateVerificationError
+	if errors.As(err, &verifyErr) {
+		return true
+	}
+
+	var unknownAuthority x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return true
+	}
+
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return true
+	}
+
+	var invalidErr x509.CertificateInvalidError
+
+	return errors.As(err, &invalidErr)
 }
 
 // newConnectionError wraps a terminal transport failure in the typed
