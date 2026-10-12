@@ -75,6 +75,13 @@ type Deps struct {
 	// through every signature. Empty when the caller sent no context
 	// (hand-rolled CPI calls, some tests).
 	RequestDirectorUUID string
+	// RequestOverridden is true when WithRequestOverrides applied at least one
+	// supported pve_* override from the request context, meaning the request
+	// came through a cpi_config entry and may target a cluster other than the
+	// job's. It is false for every request that reaches the job-level cluster
+	// with no overrides, which is the only shape a single-cluster install
+	// sees. delete_stemcell reads it to keep a heavy qcow2 on shared storage.
+	RequestOverridden bool
 	// ReplicaInventory feeds the storage-set replica fan-out's discovery.
 	// Nil (production and every existing test literal) means
 	// inv.PVESource{Client: PVE}; tests that drive the fan-out set a

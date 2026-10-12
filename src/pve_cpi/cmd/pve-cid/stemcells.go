@@ -354,7 +354,8 @@ func classifyStemcellOrphan(entry StemcellInventoryEntry, sharedStorage bool) []
 			}
 		}
 	case len(entry.Templates) == 0 && len(entry.Files) > 0:
-		reasons = append(reasons, "qcow2 file has no correlated cache template; kind (light/heavy) cannot be determined")
+		reasons = append(reasons, "qcow2 file has no correlated cache template; kind (light/heavy) cannot be determined "+
+			"(a heavy file kept by delete_stemcell under cpi_config on shared storage looks like this; remove it with pvesm free once no cluster needs it)")
 	case len(entry.Templates) > 0:
 		filesByNode := make(map[string]bool, len(entry.Files))
 		haveAnyFile := len(entry.Files) > 0

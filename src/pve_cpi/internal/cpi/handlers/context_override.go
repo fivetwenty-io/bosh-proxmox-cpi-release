@@ -634,6 +634,7 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	}
 
 	d.Config = effCfg
+	d.RequestOverridden = true
 	d.PVE = bundle.client
 	d.Agent = bundle.agent
 	d.Resolver = bundle.resolver

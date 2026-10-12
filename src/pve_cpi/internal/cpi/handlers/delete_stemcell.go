@@ -432,6 +432,9 @@ func handleDeleteStemcellWithTemplate(
 	if kind == pve.StemcellKindLight {
 		logger.Info("delete_stemcell: light stemcell — operator-managed qcow2 left in place")
 	} else {
+		if keepHeavyQcow2OnSharedExport(ctx, deps, logger, storage, volumePath) {
+			return pruneAfterHeavyKeep(ctx, deps, cidStr, volumePath, directorUUID, destroyedVMIDs)
+		}
 		if delErr := deleteHeavyQcow2Primary(ctx, deps, logger, anchor.Node, storage, volumePath); delErr != nil {
 			return nil, delErr
 		}
@@ -505,6 +508,9 @@ func handleDeleteStemcellNoTemplate(
 	logger.Info("delete_stemcell: heavy stemcell — no cache template found; attempting idempotent qcow2 delete for retry convergence",
 		log.String("node", node),
 	)
+	if keepHeavyQcow2OnSharedExport(ctx, deps, logger, storage, volumePath) {
+		return pruneAfterHeavyKeep(ctx, deps, cidStr, volumePath, directorUUID, nil)
+	}
 	if delErr := deleteHeavyQcow2Primary(ctx, deps, logger, node, storage, volumePath); delErr != nil {
 		return nil, delErr
 	}
@@ -526,6 +532,47 @@ func handleDeleteStemcellNoTemplate(
 		pruneOrphanStemcellTemplates(ctx, deps, cidStr, deleteSHA8, directorUUID, nil)
 	}
 
+	return nil, nil
+}
+
+// keepHeavyQcow2OnSharedExport reports whether the heavy qcow2 must stay on
+// disk because this request came through a cpi_config entry and storage is
+// positively shared. A heavy CID names a file by path, and two entries on
+// different clusters can mount one export, so a delete through one entry would
+// remove a file the other cluster's templates still use. Reference counts live
+// on each cluster's own templates, so the CPI cannot count across clusters;
+// keeping the file leaks it instead of losing it. The template is already
+// gone, so `pve-cid stemcells --orphans` reports the file as having no
+// correlated cache template, and the operator removes it with `pvesm free`.
+//
+// A request with no applied override (every single-cluster install) and a
+// storage whose shared-ness is unknown or false keep today's delete.
+func keepHeavyQcow2OnSharedExport(ctx context.Context, deps Deps, logger *log.Logger, storage, volumePath string) bool {
+	if !deps.RequestOverridden {
+		return false
+	}
+	if shared, known := stemcellStorageIsShared(ctx, deps, storage); !known || !shared {
+		return false
+	}
+	logger.Warn("delete_stemcell: heavy qcow2 kept on shared storage because this request came through a cpi_config entry; "+
+		"another cluster that mounts the same export may still use the file. "+
+		"Find it with `pve-cid stemcells --orphans` and remove it with `pvesm free` once no cluster needs it",
+		log.String("storage", storage),
+		log.String("volume", volumePath),
+		log.String("free_command", "pvesm free "+storage+":"+volumePath),
+	)
+	return true
+}
+
+// pruneAfterHeavyKeep runs the opt-in orphan prune step for the branches that
+// returned early after keeping the heavy qcow2, so the keep does not skip it.
+func pruneAfterHeavyKeep(
+	ctx context.Context, deps Deps, cidStr, volumePath, directorUUID string, destroyed map[int64]bool,
+) (any, error) {
+	if deps.Config.StemcellOrphanPruneEnabled() {
+		deleteSHA8, _ := extractSHA8FromPathCIDVolume(volumePath)
+		pruneOrphanStemcellTemplates(ctx, deps, cidStr, deleteSHA8, directorUUID, destroyed)
+	}
 	return nil, nil
 }
 

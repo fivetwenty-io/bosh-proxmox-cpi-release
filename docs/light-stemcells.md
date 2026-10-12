@@ -323,17 +323,25 @@ Every mode registers the calling BOSH director's UUID as a live reference on the
 - **`create_stemcell`** (any mode, including a dedup hit that reuses an existing cache) always registers this director's reference before returning the CID.
 - **`delete_stemcell`** removes this director's reference. The cache template is destroyed only when that was the *last* remaining reference in the cluster — refs from other directors sharing the same cluster keep the cache alive.
 - **`:light:` files are never deleted**, regardless of reference count — only the cache template (the clone-source performance artifact) goes away at last reference; the operator-owned qcow2 is untouched.
-- **`:heavy:` files are deleted at last reference**, in the same `delete_stemcell` call that destroys the last-referencing cache template.
+- **`:heavy:` files are deleted at last reference**, in the same `delete_stemcell` call that destroys the last-referencing cache template. The one exception is a request that comes through a cpi-config entry on shared storage, where we keep the file, as described below.
 
 Multiple directors sharing one PVE cluster each hold independent references on the same cache template — see [Multi-cluster deployments — Stemcell registration across CPI entries](multi-cluster.md#stemcell-registration-across-cpi-entries) for the `--fix` re-registration workflow when one BOSH director targets multiple cpi-config entries.
 
 ### `:heavy:` and a cross-cluster shared export do not mix
 
-Reference counts are scoped to one cpi-config entry, because an entry can only see its own cluster's templates. That is harmless while each cluster owns its own copy of a file, and it is the whole reason `:light:` is safe on a shared export — nothing the CPI does can delete an operator-managed qcow2.
+Reference counts are scoped to one cpi-config entry, because an entry can only see its own cluster's templates. That is harmless while each cluster owns its own copy of a file, and it is the whole reason `:light:` is safe on a shared export, since nothing the CPI does can delete an operator-managed qcow2.
 
-For `:heavy:` it is a trap. Point two entries' `stemcell_storage` at one shared export and both write the same deterministic filename, so both end up referencing one file while counting references separately. The first cluster to release its last reference deletes that file, and the second cluster's templates keep pointing at a path that is no longer there. Nothing in the surviving cluster's own state records why: its reference count never reached zero, so from its side the deletion is unexplained, and the failure usually surfaces later as a `create_vm` that cannot find its image.
+For `:heavy:` it would be a trap. Point two entries' `stemcell_storage` at one shared export and both write the same deterministic filename, so both end up referencing one file while counting references separately. If the first cluster to release its last reference deleted that file, the second cluster's templates would keep pointing at a path that is no longer there, and the failure would surface later as a `create_vm` that cannot find its image.
 
-Put `:heavy:` stemcells on storage only one entry can reach, or use `:light:` on the shared pool.
+To prevent that, we keep the file. When a `delete_stemcell` request comes through a cpi-config entry and the stemcell's storage is shared, the CPI destroys the cache template, leaves the qcow2 in place, and logs a warning that names the volume and the `pvesm free` command. The Director normally deletes every entry's row in one task, so on shared storage a `:heavy:` file is kept on every multi-cluster delete, including the last one. We trade a leaked file for a lost one, because a leaked file can be removed later while a lost one needs a re-upload.
+
+Every entry in cpi_config, including the one for the job's own cluster, must carry its own `pve` block with at least `host`. The CPI recognizes a cpi-config request by the `pve` properties the entry sends, so an entry with empty properties looks the same as a Director with no cpi_config and still deletes the file.
+
+A request with no cpi-config overrides, which is every single-cluster install, deletes the file as before, and so does a request whose storage is node-local or whose shared flag cannot be read.
+
+To find a kept file, run `pve-cid stemcells --orphans --json --config <cpi.json>` against the entry. The file shows up as an entry with no templates and the reason "qcow2 file has no correlated cache template", and its `volid` field names the volume. Once no cluster that mounts the export still needs the stemcell, remove it from a PVE host shell with `pvesm free <storage>:import/<filename>`. The other clusters' own runs of the same command show the file as correlated while they still hold a template for it.
+
+Putting `:heavy:` stemcells on storage only one entry can reach, or using `:light:` on the shared pool, avoids the leak altogether.
 
 ## Operator caveats
 

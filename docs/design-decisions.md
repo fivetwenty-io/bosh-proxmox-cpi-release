@@ -17,7 +17,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D7 | `iso_storage` default | Follows `vm_storage` when eligible, instead of always defaulting to node-local `local` |
 | D8 | Copy-vs-move / storage identity | Full backing-identity normalization: two storage IDs pointing at the same export are recognized as the same storage at every point the CPI compares two storage identities |
 | D9 | Cross-cluster delete safety | `pve.destroy_unreferenced_disks` now defaults to `false` |
-| D10 | qcow2 deletion policy | `:light:` files are never deleted by the CPI; `:heavy:` files are deleted only at the last director reference within a cluster |
+| D10 | qcow2 deletion policy | `:light:` files are never deleted by the CPI; `:heavy:` files are deleted only at the last director reference within a cluster, except under a cpi-config entry on shared storage, where the file is kept |
 | D11 | HA versus the BOSH resurrector | An active, once-per-process warning plus a dedicated ownership doc; no change to `has_vm` behavior |
 | D12 | Per-request cloud-property overrides | BOSH's nested cpi-config context flattened into a closed `pve_*` override registry, with every overridable field in the client-bundle cache key |
 | D13 | Stable disk identity and ownership transfer | A drive `serial=` token becomes the disk's stable identity; ownership transfers by `move_disk` reassignment; the envelope volid becomes a birth record with legacy fallback forever |
@@ -217,6 +217,8 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 **Chosen: the split above.** A related legacy behavior is also gone: the CPI used to delete the just-uploaded qcow2 immediately after freezing it into a template, to save space during the upload — that "post-freeze reclaim" no longer happens. The qcow2 now persists as the CID's own identity for as long as any director in its cluster references it.
 
 **Operator-visible consequences.** A `:heavy:` stemcell's file lifetime tracks director references, not template-freeze timing. If an independent cluster is missing its own copy of a shared `:heavy:` stemcell's qcow2 (deleted, never uploaded there, or lost), it self-heals silently by re-uploading on its next `create_stemcell` dedup miss rather than erroring. `:light:` files are never touched by the CPI, at any reference count — cross-cluster sharing on shared storage is achieved entirely through `:light:` mode, by design.
+
+There is one exception to the `:heavy:` rule. When a `delete_stemcell` request comes through a cpi-config entry and the stemcell's storage is shared, the CPI destroys the cache template but keeps the qcow2, because another cluster may mount the same export and the CPI cannot count references across clusters. `pve-cid stemcells --orphans` reports the kept file, and the operator removes it with `pvesm free`. See [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix).
 
 **Migration.** Pre-cutover `:heavy:`-equivalent stemcells relied on post-freeze reclaim and had no director-reference tracking at all. Delete them and re-upload after the redeploy.
 
