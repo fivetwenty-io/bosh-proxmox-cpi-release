@@ -30,11 +30,42 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - Every VM handler now parses the VM CID once, at the start of the call, with a shared parser. The parser reads a bare VMID, and it also accepts a longer form that carries a cluster and token suffix. PVE calls, journal records, and parker provenance still carry the bare VMID, so behavior and stored state don't change and there is nothing to do on upgrade or downgrade.
 
+
+- `create_vm` now logs a warning that names the availability zone and each node's rejection reason when no node in the requested zone can host the VM, and it still places the VM on `pve.node`. The new `pve.placement.az_enforcement` key accepts `warn`, which is the default, or `strict`, which is opt-in and makes the create fail with the same detail instead. We plan to make `strict` the default in a later minor release.
+
+- Under `az_enforcement: strict`, the resurrector, cloud-check recreate, and any deploy that touches a zone whose nodes are down, in maintenance, or over the storage utilization ceiling will fail instead of placing the VM elsewhere. A zone mapped to a single node is the worst case, because routine maintenance on that node blocks every recreate in the zone. Keep `warn`, or map each zone to at least two nodes, before you opt in.
+
+- A `cpi_config` entry that points at another PVE endpoint now runs with `destroy_unreferenced_disks` off unless it sets `pve_destroy_unreferenced_disks` itself. On storage that two clusters share, the job-level setting could otherwise free the other cluster's live disks.
+
+- An entry that points at another PVE endpoint now fails the request when it inherits a job-level SDN zone, zone type, VXLAN peer list, VNI band, or zone MTU, as long as managed networks take the SDN path by default and `sdn_auto_manage_zone` is on. That is the case when `network_mode` is `sdn`, and also when it is `auto` and an `sdn_zone` is set, because that mode sends managed networks to SDN as soon as a zone resolves. Set each named property on the entry, or turn `pve_sdn_auto_manage_zone` off for it.
+
+- `create_network` now refuses to create a zone on another PVE endpoint from job-level VXLAN peers, zone type, VNI band, or zone MTU that the request's entry inherited, and the error is not retriable. It names the entry's host and each property to set. A zone that already exists, and every bridge network, behave as before.
+
+- An entry's `pve_vm_types` or `pve_disk_types` now replaces the job's whole map instead of merging into it, and `null` or `{}` clears it. An entry that changes `pve_sdn_zone_type` without naming a VNI band also gets the default band for its own zone type.
+
+- An entry that already carries any of the 17 newly overridable keys starts applying them after the upgrade, where 0.9.3 ignored them with a warning and used the job value. A value copied from the job counts as set, so an entry that copied `destroy_unreferenced_disks: true` or the job's `sdn_vxlan_peers` keeps them even when it targets another PVE endpoint.
+
 - Before you roll back to 0.9.3 or earlier, put `user` back on every entry, and on the job config, that authenticates with only `api_token`, because those releases reject a missing `user` with "user is required". Also check TLS on every entry that sets `ca_cert`, because those releases ignore the key and verify against the job-level CA.
+
+- Before you roll back to 0.9.3, remove `az_enforcement` from every `cpi_config` entry that carries a `pve_placement` block, because the 0.9.3 entry decoder rejects unknown fields and fails on it. The 0.9.3 job-level decoder ignores the key, and no stored state changes.
+
+- A 0.9.3 CPI treats the 17 newly overridable `pve_*` keys as unknown and quietly uses the job's SDN, pool, and disk-cleanup values for every entry. Before you roll back to 0.9.3, turn off `sdn_auto_manage_zone` and `destroy_unreferenced_disks` at the job level whenever any `cpi_config` entry points at another PVE endpoint.
+
+- A 0.9.3 CPI keeps the `bosh-owner--` tag on a VM and ignores it, so rolling back changes no stored state. It also lets a `cloud_properties.tags` key render a CPI-owned prefix again, as it did before.
 
 ### Added
 
 - A `cpi_config` entry can set its own `ca_cert`, as `pve.ca_cert` or `pve_ca_cert`, to verify its cluster's API certificate. An entry on a different host or port no longer falls back to the job-level CA. A malformed value fails with an error that names the key and never prints the PEM.
+
+- A `cpi_config` entry can now override the cluster-specific job properties with the `pve_` prefix. The new keys are `pve_network_mode`, `pve_sdn_zone`, `pve_sdn_zone_type`, `pve_sdn_auto_manage_zone`, `pve_sdn_vxlan_peers`, `pve_sdn_vni_range_start`, `pve_sdn_vni_range_end`, `pve_sdn_zone_mtu`, `pve_vm_pool`, `pve_stemcell_template_pool`, `pve_stemcell_strategy`, `pve_stemcell_template_node`, `pve_require_shared_iso_for_ha`, `pve_iso_storage_follow_vm_storage`, `pve_destroy_unreferenced_disks`, `pve_vm_types`, and `pve_disk_types`.
+
+- When an entry points at another PVE endpoint but still inherits the job's node, storage, bridge, or `az_map` node names, or the job's `vm_types` or `disk_types`, the CPI logs one warning per request that lists them, so a name that doesn't exist on the other cluster is easy to trace.
+
+- When an entry's `pve_vm_types` or `pve_disk_types` profile carries a field other than `cloud_properties`, the CPI ignores it and logs one warning that names the field and the profile.
+
+- Every VM that `create_vm` builds now carries a lowercased `bosh-owner--<director_uuid>` tag right after `bosh-cpi`, naming the Director that created it. On a VM from an earlier release, `set_vm_metadata` adds the tag only when the evidence matches, meaning the VM's recorded instance equals the instance the Director names, or the VM records no instance at all. It never adds the tag to a stemcell template or a disk parker. A request without a `director_uuid` gets no owner tag and a warning.
+
+- `scripts/bats` accepts an optional `bats.secondary` block in `ci/integration.yml` that repeats the acceptance run through a second `cpi_config` entry, `pve-az2` by default, with that entry's own network values, so we can show each entry working on its own. We also check the second entry's address bands when the config loads, so a typo fails before the first pass starts, and the run report now records the second pass. A run without the block behaves as before, and `--skip-secondary` returns a configured run to the primary entry alone.
 
 ### Fixed
 
@@ -44,9 +75,15 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - The `notes_audit` hook now writes a new VM's Notes through the PVE client that the `create_vm` request itself used. A VM created on an overridden cluster no longer causes the Notes of an unrelated VM with the same VMID on the job-level cluster to be rewritten.
 
+- `docs/best-practices.md` and the CPI comparison no longer claim that the `config.node` fallback is silent or that a strict pin never falls back. They now describe the warning and the `strict` opt-in. The operations guide also no longer says that a `bosh create-env` Director never calls `set_vm_metadata`, because it does, right after `create_vm`.
+
 ### Security
 
 - A `cpi_config` entry that points at a different PVE host or port no longer inherits the job-level user, password, API token, or CA certificate, so we never send the job's credentials to another cluster. Before, an entry that set only a new `host` sent the job's token to that cluster, and the client verified it against the job's private CA. An entry must now name its own `api_token`, or its own `user` and `password`, and a request fails non-retriably with an error that names the entry's host and the missing property keys if it does not.
+
+- A `cloud_properties.tags` key, or an instance group name, can no longer write a tag under a prefix the CPI owns, such as `bosh-owner--`, `bosh-cid--`, `bosh-cluster--`, or `stemcell--`, and the CPI logs a warning that names what it dropped.
+
+- `set_vm_metadata` now refuses a VM that records a different instance than the one the Director names. The error is not retriable, and nothing is renamed or retagged, which is what a VM CID pointing at the wrong VM looks like. When the CPI can't read the VM's config to make that comparison, the call fails as retriable and writes nothing, except when a storage allocation journal is configured, where that read failure was already a non-retriable error and still is.
 
 ## [0.9.3] - 2026-10-11
 
