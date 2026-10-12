@@ -23,6 +23,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -36,7 +37,7 @@ import (
 // still fires against the SAME unretried error and drives its
 // actionable-error / tagging path.
 func retryDestroyWithSkiplock(
-	ctx context.Context, deps Deps, node, vmCID string, vmid int,
+	ctx context.Context, deps Deps, node string, vmid int,
 	purge, destroyUnref bool, origErr error, logger *log.Logger,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	if !pve.IsRootPamIdentity(deps.Config) {
@@ -54,7 +55,7 @@ func retryDestroyWithSkiplock(
 	var resp *sdknodes.DeleteQemuResponse
 	var delErr error
 	_ = pve.RetryOnTransientOrLock(ctx, logger, "vm_lock_recovery.skiplock_destroy", rollbackDestroyMaxAttempts, func() error {
-		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyUnref,
 			Skiplock:                 &skiplock,
@@ -75,7 +76,7 @@ func retryDestroyWithSkiplock(
 // origErr unretried when identity does not qualify (not root@pam via
 // password — see retryDestroyWithSkiplock and pve.IsRootPamIdentity).
 func retryStopWithSkiplock(
-	ctx context.Context, deps Deps, node, vmCID string, vmid int, origErr error, logger *log.Logger,
+	ctx context.Context, deps Deps, node string, vmid int, origErr error, logger *log.Logger,
 ) (string, error) {
 	if !pve.IsRootPamIdentity(deps.Config) {
 		return "", origErr
@@ -84,7 +85,7 @@ func retryStopWithSkiplock(
 	logger.Warn("stop rejected -- VM config is locked; retrying with skiplock (root@pam)",
 		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("lock_type", lockType))
 	skiplock := true
-	resp, err := deps.PVE.Nodes().CreateQemuStatusStop(ctx, node, vmCID, &sdknodes.CreateQemuStatusStopParams{
+	resp, err := deps.PVE.Nodes().CreateQemuStatusStop(ctx, node, vmcid.PathOf(vmid), &sdknodes.CreateQemuStatusStopParams{
 		Skiplock: &skiplock,
 	})
 	if err != nil {
@@ -182,7 +183,7 @@ func SetVMLockClearBounds(interval, maxWait time.Duration) func() {
 // clears, origErr is returned unchanged so the caller's lock classification
 // still fires.
 func retryDestroyAfterLockClear(
-	ctx context.Context, deps Deps, node, vmCID string, vmid int,
+	ctx context.Context, deps Deps, node string, vmid int,
 	purge, destroyUnref bool, origErr error, logger *log.Logger,
 ) (*sdknodes.DeleteQemuResponse, error) {
 	logger.Info("create_vm: rollback delete blocked by a config lock; waiting for the in-flight task to release it",
@@ -200,7 +201,7 @@ func retryDestroyAfterLockClear(
 	var resp *sdknodes.DeleteQemuResponse
 	var delErr error
 	_ = pve.RetryOnTransientOrLock(ctx, logger, "vm_lock_recovery.lockclear_destroy", rollbackDestroyMaxAttempts, func() error {
-		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+		resp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyUnref,
 		})

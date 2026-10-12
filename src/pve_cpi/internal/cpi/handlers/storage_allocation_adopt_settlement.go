@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
@@ -468,7 +468,7 @@ func adoptConfigReadback(ctx context.Context, deps Deps, rd resolvedDisk, record
 // and settle the step (see settlePlannedTransferSourceWrite).
 func adoptTransferInFlightReason(intent pve.DiskTransferIntent, target aj.Target) string {
 	reason := fmt.Sprintf("; adopt read the disk back and found a transfer of it to parker %d still in flight", intent.ParkerVMID)
-	if intent.SourceVMCID != strconv.Itoa(target.VMID) {
+	if !vmcid.SameVM(intent.SourceVMCID, target.VMID) {
 		return reason
 	}
 	return reason + fmt.Sprintf(", and adopt writes nothing to PVE, so it leaves that transfer to the disk's next attach_disk, detach_disk, or delete_disk, or to a rerun of delete_vm on VM %d, each of which finishes the transfer under the disk's allocation lock and settles the step", target.VMID)

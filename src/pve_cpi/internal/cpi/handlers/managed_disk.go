@@ -8,7 +8,6 @@ import (
 	"math"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageplacement"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 type managedDiskRequest struct {
@@ -251,10 +251,11 @@ func managedDiskSize(sizeMB int) (uint64, int, error) {
 }
 
 func managedDiskHintNode(ctx context.Context, deps Deps, hint string) (string, error) {
-	vmid, err := strconv.Atoi(hint)
-	if err != nil || vmid <= 0 {
+	parsedHint, err := vmcid.Parse(hint)
+	if err != nil {
 		return "", cpierrors.Cloud("create_disk: vm_cid hint must identify an existing VM")
 	}
+	vmid := parsedHint.VMID
 	guests, err := pve.ListGuestsAuthoritative(ctx, deps.PVE, deps.Log(ctx))
 	if err != nil {
 		return "", cpierrors.Cloud("create_disk: current hinted VM location observation failed")

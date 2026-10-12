@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
@@ -16,6 +15,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	inv "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/storageinventory"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 func createManagedVM(ctx context.Context, deps Deps, args []json.RawMessage, parsed *createVMParsedArgs, selection *StoragePlacementSelection) (result any, retErr error) {
@@ -323,7 +323,7 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 	}
 	record := m.handle.Record()
 	record.State = aj.ReadyToReturn
-	record.CID = strconv.Itoa(m.vmid)
+	record.CID = vmcid.PathOf(m.vmid)
 	if err := m.handle.Save(record); err != nil {
 		return nil, err
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -14,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // systemDiskIDs is the set of disk slot names that are reserved for system use
@@ -81,10 +81,11 @@ func HandleGetDisks(deps Deps) Handler {
 			return nil, cpierrors.Cloud("get_disks: args[0] vm_cid must not be empty")
 		}
 
-		vmid, err := strconv.Atoi(vmCID)
-		if err != nil || vmid <= 0 {
+		parsedCID, parseErr := vmcid.Parse(vmCID)
+		if parseErr != nil {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		vmid := parsedCID.VMID
 
 		// ----------------------------------------------------------------
 		// 2. Locate VM authoritatively (cluster scan; per-node config

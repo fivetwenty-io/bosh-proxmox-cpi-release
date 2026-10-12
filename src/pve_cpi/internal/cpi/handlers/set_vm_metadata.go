@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -14,6 +13,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -45,7 +45,7 @@ func warnDroppedTags(logger *log.Logger, operation string, guest log.Field, maxB
 // HandleSetVMMetadata returns a handler for the set_vm_metadata CPI method.
 //
 // Arguments:
-//   - args[0]: vm_cid (string) — integer VMID as a string.
+//   - args[0]: vm_cid (string) — a VM CID (a bare VMID or a stamped CID).
 //   - args[1]: metadata (object) — arbitrary key/value map; BOSH typically sends
 //     director, deployment, job, index, id.
 //
@@ -88,13 +88,11 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("set_vm_metadata: vm_cid must not be empty")
 		}
 
-		vmid, err := strconv.Atoi(vmCID)
+		cid, err := parseVMCIDArg("set_vm_metadata", vmCID)
 		if err != nil {
-			return nil, cpierrors.Cloud("set_vm_metadata: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
+			return nil, err
 		}
-		if vmid <= 0 {
-			return nil, cpierrors.Cloud("set_vm_metadata: vm_cid %q must be a positive integer", vmCID)
-		}
+		vmid := cid.VMID
 
 		// Metadata argument: may be absent (treat as empty map) or null.
 		metadata := make(map[string]any)
@@ -263,7 +261,7 @@ func setVMMetadataRMW(
 		log.String("name", derefStr(vmName)),
 	)
 
-	updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID, &sdknodes.UpdateQemuConfigParams{
+	updateErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid), &sdknodes.UpdateQemuConfigParams{
 		Description: &description,
 		Tags:        &tags,
 		Name:        vmName,

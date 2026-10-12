@@ -3,12 +3,12 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // A managed disk's transfer to a parker writes the transfer record on the
@@ -99,8 +99,8 @@ func settlePlannedTransferSourceWrite(ctx context.Context, client pve.Client, ha
 // parker's record write. Closing that gap would need the step to record the
 // slot key it deletes.
 func transferSourceWriteCandidate(record aj.Record, intent pve.DiskTransferIntent) (int, bool) {
-	source, err := strconv.Atoi(intent.SourceVMCID)
-	if err != nil || source <= 0 || intent.ParkerVMID <= 0 || intent.ParkerVMID == source || intent.Volid == "" {
+	source, ok := vmcid.VMID(intent.SourceVMCID)
+	if !ok || intent.ParkerVMID <= 0 || intent.ParkerVMID == source || intent.Volid == "" {
 		return 0, false
 	}
 	if record.Kind != allocationKindDisk || len(record.Steps) == 0 {

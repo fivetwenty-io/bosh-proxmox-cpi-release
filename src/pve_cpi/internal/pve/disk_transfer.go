@@ -32,6 +32,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // ErrMoveDiskSnapshotRefused wraps PVE's immediate refusal to reassign a
@@ -1730,8 +1731,8 @@ func resumeDiskTransferWindow(
 
 		// Window: the move never ran — the source VM still holds the volume
 		// on an unusedN entry under its recorded (pre-move) name.
-		srcVMID, convErr := strconv.Atoi(intent.SourceVMCID)
-		if len(parker.landings) == 0 && convErr == nil && srcVMID > 0 && intent.Volid != "" {
+		srcVMID, srcOK := vmcid.VMID(intent.SourceVMCID)
+		if len(parker.landings) == 0 && srcOK && intent.Volid != "" {
 			moved, handled, moveErr := resumeMoveWindow(wctx, c, logger, intent, stableID, srcVMID, parker, disks, cfg, pctx)
 			if moveErr != nil || handled {
 				landed = moved
@@ -1774,7 +1775,7 @@ func resumeDiskTransferWindow(
 		// attach boundary a legacy park uses. PVE validates the volid on
 		// attach, so a volume that truly vanished fails the attach instead of
 		// parking a dangling reference.
-		if convErr == nil && srcVMID > 0 && intent.Volid != "" {
+		if srcOK && intent.Volid != "" {
 			srcViews, srcErr := ReadQemuViews(wctx, c, intent.ParkerNode, srcVMID)
 			sourceReleased := false
 			switch {
@@ -2174,8 +2175,8 @@ func claimOnlyPreconditions(ctx context.Context, parkerCfg map[string]any, inten
 // landingRecorded reports whether one of landings moved the transfer's
 // recorded volume off its source VM and landed it as bare.
 func landingRecorded(landings []RecordedLanding, intent DiskTransferIntent, bare string) bool {
-	source, err := strconv.Atoi(intent.SourceVMCID)
-	if err != nil || source <= 0 || intent.Volid == "" {
+	source, ok := vmcid.VMID(intent.SourceVMCID)
+	if !ok || intent.Volid == "" {
 		return false
 	}
 	for _, landing := range landings {

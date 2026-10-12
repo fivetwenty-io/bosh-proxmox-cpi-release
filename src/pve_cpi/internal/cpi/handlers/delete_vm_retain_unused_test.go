@@ -202,7 +202,7 @@ func TestLegacyRetentionRefusesForeignEphemeralOnUnusedSlot(t *testing.T) {
 	for _, volume := range []string{"a:vm-778-ephemeral-0", "a:778/vm-778-ephemeral-0.raw"} {
 		t.Run(volume, func(t *testing.T) {
 			deps, client, recorder, _ := legacyRetainVolumeFixture(t, volume, "unused0")
-			err := retainLegacyEphemeralVolume(context.Background(), deps, "n1", "777", 777, volume, log.NewNopLogger())
+			err := retainLegacyEphemeralVolume(context.Background(), deps, "n1", 777, volume, log.NewNopLogger())
 			assertLegacyUnusedRefused(t, err, client, recorder, volume)
 		})
 	}

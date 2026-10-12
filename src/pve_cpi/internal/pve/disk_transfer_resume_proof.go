@@ -15,10 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // parkerLanding is one value of a parker's disk key, current or pending, that
@@ -346,8 +346,8 @@ func (r *transferReader) classify(
 	ctx context.Context, id string, entry parkerProvEntry, whose string, own bool,
 ) (transferStatus, error) {
 	status := transferStatus{id: id, diskCID: entry.DiskCID, slot: entry.Slot, kind: transferUnknown}
-	srcVMID, convErr := strconv.Atoi(entry.SourceVMCID)
-	if convErr != nil || srcVMID <= 0 || entry.Volid == "" {
+	srcVMID, srcOK := vmcid.VMID(entry.SourceVMCID)
+	if !srcOK || entry.Volid == "" {
 		status.why = fmt.Sprintf("%s record names no source vm and volume", whose)
 		return status, nil
 	}
@@ -747,7 +747,7 @@ func proveRecordedLanding(ctx context.Context, c Client, intent DiskTransferInte
 		return "", resumeProofRefusal(intent, stableID,
 			fmt.Sprintf("%s of parker vmid %d has a pending change to volume %s", landing.Key, intent.ParkerVMID, landing.Volume))
 	}
-	if srcVMID, convErr := strconv.Atoi(intent.SourceVMCID); convErr == nil && srcVMID > 0 && intent.Volid != "" {
+	if srcVMID, srcOK := vmcid.VMID(intent.SourceVMCID); srcOK && intent.Volid != "" {
 		if owner, named := EmbeddedDiskVMID(intent.Volid); !named || owner != srcVMID {
 			return "", resumeProofRefusal(intent, stableID, fmt.Sprintf(
 				"%s on %s is named for the parker, while this disk's recorded volume %s isn't named for its source vm %d, "+

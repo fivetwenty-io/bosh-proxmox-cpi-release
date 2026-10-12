@@ -15,6 +15,7 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -1117,7 +1118,7 @@ func legacySweepJournalVMIDs(ctx context.Context, deps Deps) (protected map[int]
 		if record.Kind != "vm" {
 			continue
 		}
-		if vmid, e := strconv.Atoi(record.CID); e == nil && vmid > 0 {
+		if vmid, ok := vmcid.VMID(record.CID); ok {
 			protected[vmid] = true
 		}
 		for stepIndex := range record.Steps {

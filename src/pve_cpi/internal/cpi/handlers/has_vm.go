@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 
@@ -16,7 +15,7 @@ import (
 // HandleHasVM returns a handler for the has_vm CPI method.
 //
 // Arguments:
-//   - args[0]: vm_cid (string) — integer VMID as a string.
+//   - args[0]: vm_cid (string) — a VM CID (a bare VMID or a stamped CID).
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
@@ -48,13 +47,11 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("has_vm: vm_cid must not be empty")
 		}
 
-		vmid, err := strconv.Atoi(vmCID)
+		cid, err := parseVMCIDArg("has_vm", vmCID)
 		if err != nil {
-			return nil, cpierrors.Cloud("has_vm: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
+			return nil, err
 		}
-		if vmid <= 0 {
-			return nil, cpierrors.Cloud("has_vm: vm_cid %q must be a positive integer", vmCID)
-		}
+		vmid := cid.VMID
 
 		logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 

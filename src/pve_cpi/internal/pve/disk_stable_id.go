@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -24,6 +23,7 @@ import (
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // DiskStableIDPrefix marks a drive serial as a CPI stable disk identity. No
@@ -866,8 +866,8 @@ func (p *recordPresence) unfinishedRecordNodes(volume string) []string {
 // then its snapshots can't be read. A source that's gone by the time of the
 // read has none either.
 func (p *recordPresence) snapshotOfSource(ctx context.Context, intent *DiskTransferIntent, volume string) (string, error) {
-	vmid, err := strconv.Atoi(intent.SourceVMCID)
-	if err != nil || vmid <= 0 {
+	vmid, ok := vmcid.VMID(intent.SourceVMCID)
+	if !ok {
 		return "", nil
 	}
 	node, listed := p.hit.guestNodes[vmid]

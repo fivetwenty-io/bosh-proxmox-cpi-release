@@ -8,6 +8,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // guardUnusedVolumesResumingTransfers is guardUnusedVolumes for delete_vm's own
@@ -62,7 +63,7 @@ func resumeStrandedTransfers(
 	if deps.Config == nil {
 		return false, nil
 	}
-	records, err := pve.FindSourceTransferRecords(ctx, deps.PVE, vmCID, parkerReadConfigFor(deps))
+	records, err := pve.FindSourceTransferRecords(ctx, deps.PVE, vmcid.PathOf(vmid), parkerReadConfigFor(deps))
 	if err != nil {
 		return false, retriableUnlessPermanent(err, fmt.Sprintf(
 			"delete_vm: refusing to destroy VM %s -- could not read the parkers' transfer records before deciding about its unused volumes, so nothing was destroyed; retry delete_vm",

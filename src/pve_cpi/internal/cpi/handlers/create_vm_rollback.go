@@ -11,6 +11,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
@@ -346,7 +347,7 @@ func cleanupVMDetached(ctx context.Context, deps Deps, node string, vmid int, en
 // even an API token owned by root@pam qualifies, see pve.IsRootPamIdentity).
 // Otherwise the lock rejection stands, which is fine: Stop is best-effort
 // and the purge is where the orphan actually matters.
-func stopVMForRollback(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) {
+func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) {
 	var stopUPID string
 	stopErr := pve.RetryOnTransient(ctx, logger, "create_vm.cleanup.stop", 0, func() error {
 		var innerErr error
@@ -354,7 +355,7 @@ func stopVMForRollback(ctx context.Context, deps Deps, node, vmCID string, vmid 
 		return innerErr
 	})
 	if stopErr != nil && pve.IsVMConfigLocked(stopErr) {
-		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmCID, vmid, stopErr, logger)
+		stopUPID, stopErr = retryStopWithSkiplock(ctx, deps, node, vmid, stopErr, logger)
 	}
 	if stopErr == nil && stopUPID != "" {
 		if awaitErr := pve.AwaitTaskWithLogger(ctx, deps.PVE, node, stopUPID, logger); awaitErr != nil {
@@ -367,7 +368,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)
 
-	stopVMForRollback(ctx, deps, node, vmCID, vmid, logger)
+	stopVMForRollback(ctx, deps, node, vmid, logger)
 
 	// Protect persistent disks before the purge. The purge below destroys
 	// every disk the VM config references -- including a persistent disk
@@ -423,7 +424,7 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	var delResp *sdknodes.DeleteQemuResponse
 	var delErr error
 	_ = pve.RetryOnTransientOrLock(ctx, logger, "create_vm.cleanup.destroy", rollbackDestroyMaxAttempts, func() error {
-		delResp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+		delResp, delErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 			Purge:                    &purge,
 			DestroyUnreferencedDisks: &destroyUnref,
 		})
@@ -433,10 +434,10 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 		return delErr
 	})
 	if delErr != nil && pve.IsVMConfigLocked(delErr) {
-		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
+		delResp, delErr = retryDestroyWithSkiplock(ctx, deps, node, vmid, purge, destroyUnref, delErr, logger)
 	}
 	if delErr != nil && pve.IsVMConfigLocked(delErr) {
-		delResp, delErr = retryDestroyAfterLockClear(ctx, deps, node, vmCID, vmid, purge, destroyUnref, delErr, logger)
+		delResp, delErr = retryDestroyAfterLockClear(ctx, deps, node, vmid, purge, destroyUnref, delErr, logger)
 	}
 	if delErr != nil {
 		switch {

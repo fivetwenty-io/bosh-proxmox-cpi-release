@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 )
 
@@ -700,17 +701,18 @@ func attachDiskParseArgs(args []json.RawMessage) (vmCID, diskCID string, err err
 // Returns (node, vmid, err).
 //
 // Failures:
-//   - vmCID not a positive integer        → VMNotFound
+//   - vmCID not a valid VM CID (bare or stamped) → VMNotFound
 //   - diskCID not in "<storage>:<volid>"  → DiskNotFound
 //   - backend resolution error            → Wrap(Cloud)
 //   - NodeForExisting: not-found          → DiskNotFound
 //   - NodeForExisting: other error        → Wrap
 //   - local backend + node mismatch and no migration path → Cloud error
 func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stableID string) (node string, vmid int, err error) {
-	vmid, err = strconv.Atoi(vmCID)
-	if err != nil || vmid <= 0 {
+	parsedCID, parseErr := vmcid.Parse(vmCID)
+	if parseErr != nil {
 		return "", 0, cpierrors.VMNotFound(vmCID)
 	}
+	vmid = parsedCID.VMID
 
 	storage, _, err := pve.ParseDiskCID(diskCID)
 	if err != nil {

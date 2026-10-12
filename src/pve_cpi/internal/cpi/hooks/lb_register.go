@@ -11,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/lb"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // defaultLBTimeout bounds a Data Plane API call when TimeoutMS is unset.
@@ -185,15 +186,11 @@ func firstNetworkIP(raw json.RawMessage) string {
 	return ""
 }
 
-// vmidFromArg decodes a JSON string VM CID (strconv.Itoa(vmid)) to its int.
+// vmidFromArg decodes a JSON string VM CID (a bare VMID or a stamped CID) to its VMID.
 func vmidFromArg(raw json.RawMessage) (int, bool) {
 	var cid string
 	if err := json.Unmarshal(raw, &cid); err != nil {
 		return 0, false
 	}
-	vmid, err := strconv.Atoi(cid)
-	if err != nil {
-		return 0, false
-	}
-	return vmid, true
+	return vmcid.VMID(cid)
 }

@@ -126,7 +126,7 @@ func TestParkAfterDetach_SweepsThePoolAfterThePark(t *testing.T) {
 	calls := captureParkerPoolSweep(t)
 
 	deps := parkedDeps()
-	if err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
+	if err := parkAfterDetach(context.Background(), deps, 100, "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil); err != nil {
 		t.Fatalf("parkAfterDetach: unexpected error: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestParkAfterDetach_SkipsTheSweepWhenTheParkFails(t *testing.T) {
 	calls := captureParkerPoolSweep(t)
 
 	deps := parkedDeps()
-	if err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
+	if err := parkAfterDetach(context.Background(), deps, 100, "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil); err == nil {
 		t.Fatal("parkAfterDetach: want the park's failure, got nil")
 	}
@@ -554,7 +554,7 @@ func TestRetainLegacyEphemeralVolume_SweepsThePoolAfterTheTransfer(t *testing.T)
 	const volid = "data:vm-700-disk-1"
 	_, deps := retentionFixture(t, volid)
 
-	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", 700, volid,
 		deps.Log(context.Background())); err != nil {
 		t.Fatalf("retainLegacyEphemeralVolume: unexpected error: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestRetainLegacyEphemeralVolume_SkipsTheSweepWhenTheTransferFails(t *testin
 	c, deps := retentionFixture(t, volid)
 	c.moveErr = errors.New("API request failed: storage is busy")
 
-	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", 700, volid,
 		deps.Log(context.Background())); err == nil {
 		t.Fatal("retainLegacyEphemeralVolume: want the transfer's failure, got nil")
 	}
@@ -689,7 +689,7 @@ func TestRetainLegacyEphemeralVolume_SweepsThePoolAfterTheResume(t *testing.T) {
 	deps, converge := retentionResumeFixture(t, volid)
 	resumes := captureResumeDiskTransfer(t, nil, converge)
 
-	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", 700, volid,
 		deps.Log(context.Background())); err != nil {
 		t.Fatalf("retainLegacyEphemeralVolume: unexpected error: %v", err)
 	}
@@ -707,7 +707,7 @@ func TestRetainLegacyEphemeralVolume_SkipsTheSweepWhenTheResumeFails(t *testing.
 	deps, _ := retentionResumeFixture(t, volid)
 	resumes := captureResumeDiskTransfer(t, errors.New("simulated resume failure"), nil)
 
-	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", "700", 700, volid,
+	if err := retainLegacyEphemeralVolume(context.Background(), deps, "pve1", 700, volid,
 		deps.Log(context.Background())); err == nil {
 		t.Fatal("retainLegacyEphemeralVolume: want the resume's failure, got nil")
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // Preserve the existing optional VM tag attribution, with the same journal and
@@ -37,7 +38,7 @@ func (m *managedDiskRequest) applyTags(ctx context.Context, handle *aj.Handle, c
 			if err != nil {
 				return "", err
 			}
-			if n != node || fmt.Sprint(vmid) != m.hint {
+			if n != node || !vmcid.SameVM(m.hint, vmid) {
 				return "", fmt.Errorf("disk metadata targeted another VM")
 			}
 			return storageMutationIntent(handle, "persistent_vm_metadata", aj.Target{Node: n, VMID: vmid, Storage: m.plan.Targets[0].StorageID, Backing: m.plan.Targets[0].BackingKey, IntendedVolume: volume}, nil)

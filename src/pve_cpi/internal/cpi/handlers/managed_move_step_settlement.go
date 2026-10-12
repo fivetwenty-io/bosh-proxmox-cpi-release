@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // A managed disk's move goes out as one Nodes.CreateQemuMoveDisk POST, and the
@@ -385,7 +385,7 @@ func transferLandingEmpty(ctx context.Context, c pve.Client, source int, volume,
 		if record.UnclaimedLanding != "" {
 			return &moveSettlementGap{text: fmt.Sprintf("%s of parker %d, which keeps the disk's transfer record, holds a volume named for the parker with no serial", record.UnclaimedLanding, record.ParkerVMID)}
 		}
-		if record.Slot != "" && record.Volid == volume && record.SourceVMCID == strconv.Itoa(source) {
+		if record.Slot != "" && record.Volid == volume && vmcid.SameVM(record.SourceVMCID, source) {
 			kept = true
 		}
 	}

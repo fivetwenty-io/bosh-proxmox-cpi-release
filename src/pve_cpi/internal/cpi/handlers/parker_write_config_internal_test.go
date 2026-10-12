@@ -282,7 +282,7 @@ func TestParkAfterDetach_HandsDownPrefixPoolAndEmptyFallbackNode(t *testing.T) {
 	got := captureParkDisk(t, nil)
 
 	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
-	if err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
+	if err := parkAfterDetach(context.Background(), deps, 100, "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil); err != nil {
 		t.Fatalf("parkAfterDetach: unexpected error: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestParkAfterDetach_KeepsThePermanentClassTheParkChose(t *testing.T) {
 	_ = captureParkDisk(t, permanent)
 
 	deps := Deps{Config: parkerCfgTestConfig(), Logger: log.NewNopLogger()}
-	err := parkAfterDetach(context.Background(), deps, "100", "pvd-abc",
+	err := parkAfterDetach(context.Background(), deps, 100, "pvd-abc",
 		parkerCfgVolid, parkerCfgJobNode, nil)
 	if err == nil {
 		t.Fatal("parkAfterDetach: want an error when the park fails, got nil")

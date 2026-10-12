@@ -215,6 +215,26 @@ func TestDecodeCID_VM(t *testing.T) {
 	}
 }
 
+func TestDecodeCID_VM_Stamped(t *testing.T) {
+	d, err := DecodeCID("5042-0a1b2c3d-4e5f6a7b")
+	if err != nil {
+		t.Fatalf("DecodeCID error = %v", err)
+	}
+	if d.Family != FamilyVM || d.VMID != 5042 {
+		t.Errorf("got Family=%q VMID=%d, want vm 5042", d.Family, d.VMID)
+	}
+}
+
+func TestDecodeCID_Snapshot_StampedVM(t *testing.T) {
+	d, err := DecodeCID("5042-0a1b2c3d-4e5f6a7b:before-upgrade")
+	if err != nil {
+		t.Fatalf("DecodeCID error = %v", err)
+	}
+	if d.Family != FamilySnapshot || d.VMID != 5042 || d.VMCID != "5042-0a1b2c3d-4e5f6a7b" {
+		t.Errorf("got %+v, want snapshot of VM 5042", d)
+	}
+}
+
 func TestDecodeCID_VM_ZeroRejected(t *testing.T) {
 	if _, err := DecodeCID("0"); err == nil {
 		t.Fatal("expected error decoding VMID 0")

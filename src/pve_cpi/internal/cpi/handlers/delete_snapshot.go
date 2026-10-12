@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // HandleDeleteSnapshot returns a Handler for the BOSH CPI delete_snapshot method.
@@ -57,10 +57,11 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 			return nil, cpierrors.Wrap(err, "delete_snapshot: invalid snapshot_cid "+snapshotCID)
 		}
 
-		vmid, err := strconv.Atoi(vmCID)
-		if err != nil || vmid <= 0 {
+		parsedCID, parseErr := vmcid.Parse(vmCID)
+		if parseErr != nil {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		vmid := parsedCID.VMID
 
 		// ----------------------------------------------------------------
 		// 3. Locate VM authoritatively. The idempotent-success branch below

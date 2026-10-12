@@ -352,7 +352,22 @@ func (m *mockNodesService) ListQemu(ctx context.Context, node string, params *no
 	return &empty, nil
 }
 
+// requireDigitsVMID rejects a vmid path argument that is not all digits, the
+// way real PVE answers 400 for it. A handler that hands a stamped CID to PVE
+// instead of its bare VMID fails the test that drives it.
+func requireDigitsVMID(method, vmid string) {
+	if vmid == "" {
+		panic("mockNodesService." + method + ": empty vmid")
+	}
+	for i := 0; i < len(vmid); i++ {
+		if vmid[i] < '0' || vmid[i] > '9' {
+			panic("mockNodesService." + method + ": vmid " + strconv.Quote(vmid) + " is not all digits")
+		}
+	}
+}
+
 func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid string, params *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+	requireDigitsVMID("DeleteQemu", vmid)
 	if m.deleteQemuFn != nil {
 		return m.deleteQemuFn(ctx, node, vmid, params)
 	}
@@ -360,6 +375,7 @@ func (m *mockNodesService) DeleteQemu(ctx context.Context, node string, vmid str
 }
 
 func (m *mockNodesService) UpdateQemuConfig(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuConfigParams) error {
+	requireDigitsVMID("UpdateQemuConfig", vmid)
 	if m.updateQemuConfigFn != nil {
 		return m.updateQemuConfigFn(ctx, node, vmid, params)
 	}
@@ -367,6 +383,7 @@ func (m *mockNodesService) UpdateQemuConfig(ctx context.Context, node string, vm
 }
 
 func (m *mockNodesService) UpdateQemuUnlink(ctx context.Context, node string, vmid string, params *nodes.UpdateQemuUnlinkParams) error {
+	requireDigitsVMID("UpdateQemuUnlink", vmid)
 	if m.updateQemuUnlinkFn != nil {
 		return m.updateQemuUnlinkFn(ctx, node, vmid, params)
 	}
@@ -382,7 +399,15 @@ func (m *mockNodesService) ListStorageContent(ctx context.Context, node string, 
 	return &empty, nil
 }
 
+// CreateQemuStatusStop checks the vmid path argument, then defers to the
+// stub, which panics for a test that did not script it.
+func (m *mockNodesService) CreateQemuStatusStop(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusStopParams) (*nodes.CreateQemuStatusStopResponse, error) {
+	requireDigitsVMID("CreateQemuStatusStop", vmid)
+	return m.panicNodesStub.CreateQemuStatusStop(ctx, node, vmid, params)
+}
+
 func (m *mockNodesService) CreateQemuStatusReboot(ctx context.Context, node string, vmid string, params *nodes.CreateQemuStatusRebootParams) (*nodes.CreateQemuStatusRebootResponse, error) {
+	requireDigitsVMID("CreateQemuStatusReboot", vmid)
 	if m.createQemuStatusRebootFn != nil {
 		return m.createQemuStatusRebootFn(ctx, node, vmid, params)
 	}

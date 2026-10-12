@@ -16,6 +16,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -52,7 +53,7 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 			}
 		}
 		tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
-		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmCID,
+		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
 			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
 			logger.Warn("delete_vm: fast-path tag write failed (non-fatal; destroy will proceed)",
 				log.String("vmid", vmCID), log.Err(err))
@@ -355,7 +356,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	purge := true
 	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
 	skiplock := true
-	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+	_, delErr := deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 		Purge:                    &purge,
 		DestroyUnreferencedDisks: &destroyDisks,
 		Skiplock:                 &skiplock,
@@ -402,7 +403,7 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		if err != nil {
 			return nil, err
 		}
-		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmCID, vmid); handled || managedErr != nil {
+		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid); handled || managedErr != nil {
 			return nil, managedDeleteVMError(managedErr)
 		}
 
@@ -622,14 +623,11 @@ func parseDeleteVMArgs(args []json.RawMessage) (string, int, error) {
 	if vmCID == "" {
 		return "", 0, cpierrors.Cloud("delete_vm: vm_cid must not be empty")
 	}
-	vmid, err := strconv.Atoi(vmCID)
+	cid, err := parseVMCIDArg("delete_vm", vmCID)
 	if err != nil {
-		return "", 0, cpierrors.Cloud("delete_vm: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
+		return "", 0, err
 	}
-	if vmid <= 0 {
-		return "", 0, cpierrors.Cloud("delete_vm: vm_cid %q must be a positive integer", vmCID)
-	}
-	return vmCID, vmid, nil
+	return vmCID, cid.VMID, nil
 }
 
 // refuseIfParkerVM is the belt-and-braces PVE-level backstop against deleting
@@ -780,7 +778,7 @@ func destroyVMWithRecovery(
 	attemptDestroy := func() error {
 		return pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
 			var innerErr error
-			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmCID, &sdknodes.DeleteQemuParams{
+			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 				Purge:                    &purge,
 				DestroyUnreferencedDisks: &destroyDisks,
 			})
@@ -796,7 +794,7 @@ func destroyVMWithRecovery(
 		deleteErr = attemptDestroy()
 	}
 	if deleteErr != nil && pve.IsVMConfigLocked(deleteErr) {
-		deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmCID, vmid, purge, destroyDisks, deleteErr, logger)
+		deleteResp, deleteErr = retryDestroyWithSkiplock(ctx, deps, node, vmid, purge, destroyDisks, deleteErr, logger)
 	}
 	if deleteErr != nil {
 		if pve.IsNotFound(deleteErr) {
@@ -1135,7 +1133,7 @@ func detachForeignActiveDisks(ctx context.Context, deps Deps, node, vmCID string
 				log.String("slot", slot), log.String("volid", entry.Volid), log.String("stable_id", entry.StableID))
 			pctx := pve.ParkContext{
 				DiskCID:     recordedDiskCID(desc, entry.StableID, entry.Volid),
-				SourceVMCID: vmCID,
+				SourceVMCID: vmcid.PathOf(vmid),
 				StableID:    entry.StableID,
 				Opts:        pve.DiskOptOverlayFromDesc(desc, entry.StableID, entry.Volid),
 			}

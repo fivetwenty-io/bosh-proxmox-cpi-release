@@ -11,10 +11,10 @@ package pve
 
 import (
 	"context"
-	"strconv"
 	"strings"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // BackendKind distinguishes shared from local storage backends.
@@ -290,18 +290,11 @@ func formatNodeResolveError(kind BackendKind, op string, vmHint, cloudPropNode, 
 	)
 }
 
-// asInt parses s as a positive int VMID. Returns (0, false) on any failure,
-// including trailing garbage after the digits (e.g. "100abc", "100 200") —
-// strconv.Atoi requires the entire string to be consumed, unlike fmt.Sscanf's
-// %d verb which silently ignores anything after the matched digits.
-// Used by backends that accept a vmHint string from BOSH disk_cid arguments.
+// asInt parses s as a VM CID and returns its positive VMID. Returns (0, false)
+// on any failure, including trailing garbage after the digits (e.g. "100abc",
+// "100 200"). A stamped CID yields its VMID, so a stamped hint still finds the
+// VM's node. Used by backends that accept a vmHint string from BOSH disk_cid
+// arguments.
 func asInt(s string) (int, bool) {
-	if s == "" {
-		return 0, false
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n <= 0 {
-		return 0, false
-	}
-	return n, true
+	return vmcid.VMID(s)
 }

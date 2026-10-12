@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -14,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // detachDiskResolveSlot resolves the PVE node hosting diskCID and the disk's
@@ -172,10 +172,11 @@ func HandleDetachDisk(deps Deps) Handler {
 		// --------------------------------------------------------------------
 		// 2. Parse vm_cid → VMID; resolve node + disk slot via helper.
 		// --------------------------------------------------------------------
-		vmid, err := strconv.Atoi(vmCID)
-		if err != nil || vmid <= 0 {
+		parsedCID, parseErr := vmcid.Parse(vmCID)
+		if parseErr != nil {
 			return nil, cpierrors.VMNotFound(vmCID)
 		}
+		vmid := parsedCID.VMID
 
 		// Stable-ID disks detach by ownership transfer: the volume is
 		// reassigned onto a parker rather than config-edited off the VM. The
@@ -295,7 +296,7 @@ func HandleDetachDisk(deps Deps) Handler {
 		//    on retry the disk is free-floating so ParkDisk's idempotency check
 		//    skips the IsDiskParked scan and re-parks directly.
 		// --------------------------------------------------------------------
-		if err := parkAfterDetach(ctx, deps, vmCID, diskCID, bareDiskCID, node, overlay); err != nil {
+		if err := parkAfterDetach(ctx, deps, vmid, diskCID, bareDiskCID, node, overlay); err != nil {
 			return nil, err
 		}
 
@@ -397,7 +398,7 @@ func handleDetachStableID(ctx context.Context, deps Deps, vmCID string, vmid int
 		return err
 	}
 	parkerCfg := parkerWriteConfigFor(deps)
-	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmCID, StableID: rd.stableID, Opts: overlay})
+	pctx := managedDiskParkContext(rd, pve.ParkContext{DiskCID: rd.diskCID, SourceVMCID: vmcid.PathOf(vmid), StableID: rd.stableID, Opts: overlay})
 	landed, transferErr := pve.TransferDiskToParker(ctx, deps.PVE, logger, node, vmid, rd.volid, parkerCfg, pctx)
 	if transferErr != nil {
 		if elsewhere, ok := pve.IsDiskAttachedElsewhere(transferErr); ok {
@@ -743,7 +744,7 @@ func detachDriveSlot(ctx context.Context, deps Deps, node string, vmid int, slot
 // provenance write itself stays best-effort, so a park that succeeds while
 // its provenance write fails loses the overrides — narrow (one description
 // write after a successful attach) and logged by the provenance writer.
-func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID, node string, overlay map[string]string) error {
+func parkAfterDetach(ctx context.Context, deps Deps, vmid int, diskCID, bareDiskCID, node string, overlay map[string]string) error {
 	if !deps.Config.DetachedDiskParkedEnabled() {
 		return nil
 	}
@@ -753,7 +754,7 @@ func parkAfterDetach(ctx context.Context, deps Deps, vmCID, diskCID, bareDiskCID
 	// claimed by orphaned volumes on the disk storage is skipped. It leaves
 	// FallbackNode empty, and ParkDisk fills it with the disk's own node.
 	parkerCfg := parkerWriteConfigFor(deps)
-	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmCID, Opts: overlay}
+	pctx := pve.ParkContext{DiskCID: diskCID, SourceVMCID: vmcid.PathOf(vmid), Opts: overlay}
 	if parkErr := parkDisk(ctx, deps.PVE, deps.Log(ctx), node, bareDiskCID, parkerCfg, pctx); parkErr != nil {
 		// Same reasoning as the free-floating park above: the class the park
 		// chose is the one the Director should see.

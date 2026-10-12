@@ -6,12 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 type managedVMRecordReadback struct {
@@ -55,7 +55,7 @@ func (r *managedVMRecordReadback) readTarget() error {
 	if vmid <= 0 {
 		return r.fail("no durable VM target exists")
 	}
-	if record.CID != "" && record.CID != strconv.Itoa(vmid) {
+	if record.CID != "" && !vmcid.SameVM(record.CID, vmid) {
 		return r.fail("recorded CID and VM target disagree")
 	}
 

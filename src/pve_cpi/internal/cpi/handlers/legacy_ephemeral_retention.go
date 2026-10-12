@@ -9,6 +9,7 @@ import (
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID string, vmid int, logger *log.Logger) (bool, error) {
@@ -59,14 +60,14 @@ func retainLegacyEphemeralDisks(ctx context.Context, deps Deps, node, vmCID stri
 	}
 	sort.Strings(ordered)
 	for _, volume := range ordered {
-		if err := retainLegacyEphemeralVolume(ctx, deps, node, vmCID, vmid, volume, logger); err != nil {
+		if err := retainLegacyEphemeralVolume(ctx, deps, node, vmid, volume, logger); err != nil {
 			return false, err
 		}
 	}
 	return true, nil
 }
 
-func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID string, vmid int, volume string, logger *log.Logger) error {
+func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node string, vmid int, volume string, logger *log.Logger) error {
 	// We read both views, because the scan reports a slot whose delete is
 	// pending from the current view, and the own-slot check below has to find
 	// it there.
@@ -133,7 +134,7 @@ func retainLegacyEphemeralVolume(ctx context.Context, deps Deps, node, vmCID str
 	if err != nil {
 		return err
 	}
-	parkContext := pve.ParkContext{DiskCID: cid, SourceVMCID: vmCID, StableID: meta.ID}
+	parkContext := pve.ParkContext{DiskCID: cid, SourceVMCID: vmcid.PathOf(vmid), StableID: meta.ID}
 	switch {
 	case identity.intent != nil:
 		// The retention moves the volume off the VM it is destroying, so a

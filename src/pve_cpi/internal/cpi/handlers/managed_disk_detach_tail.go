@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // detachTailAttempts bounds how many times the detach tail reads the source VM
@@ -368,11 +368,7 @@ func intentSourceVMID(intent *pve.DiskTransferIntent) (int, bool) {
 	if intent == nil {
 		return 0, false
 	}
-	vmid, err := strconv.Atoi(intent.SourceVMCID)
-	if err != nil || vmid <= 0 {
-		return 0, false
-	}
-	return vmid, true
+	return vmcid.VMID(intent.SourceVMCID)
 }
 
 // callerSentDescriptionDigest reports whether fields, the parameters a

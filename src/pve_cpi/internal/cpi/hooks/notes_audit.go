@@ -3,12 +3,12 @@ package hooks
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // notesAuditKey is the unexported context key under which NotesAuditHook.Before
@@ -107,7 +107,7 @@ func boshAuditLine(env map[string]any) string {
 }
 
 // vmidFromResult extracts the integer VM CID from a create_vm result, which is
-// []any{vmCID string, networks}. vmCID is strconv.Itoa(vmid).
+// []any{vmCID string, networks}. vmCID is a bare VMID or a stamped CID.
 func vmidFromResult(result any) (int, bool) {
 	arr, ok := result.([]any)
 	if !ok || len(arr) == 0 {
@@ -117,9 +117,5 @@ func vmidFromResult(result any) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	vmid, err := strconv.Atoi(cid)
-	if err != nil {
-		return 0, false
-	}
-	return vmid, true
+	return vmcid.VMID(cid)
 }

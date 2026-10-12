@@ -452,6 +452,8 @@ func TestAsInt(t *testing.T) {
 		{"embedded space", "100 200", 0, false},
 		{"leading space", " 100", 0, false},
 		{"non-numeric", "abc", 0, false},
+		{"stamped CID", "100-0a1b2c3d-4e5f6a7b", 100, true},
+		{"malformed stamp", "100-xyz", 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

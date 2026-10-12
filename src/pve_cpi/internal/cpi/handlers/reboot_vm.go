@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -13,13 +12,14 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // HandleRebootVM returns a handler for the reboot_vm CPI method.
 //
 // Arguments:
-//   - args[0]: vm_cid (string) — integer VMID as a string.
+//   - args[0]: vm_cid (string) — a VM CID (a bare VMID or a stamped CID).
 //
 // Logic:
 //  1. Parse vm_cid → vmid int.
@@ -56,13 +56,11 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Cloud("reboot_vm: vm_cid must not be empty")
 		}
 
-		vmid, err := strconv.Atoi(vmCID)
+		cid, err := parseVMCIDArg("reboot_vm", vmCID)
 		if err != nil {
-			return nil, cpierrors.Cloud("reboot_vm: vm_cid %q is not a valid integer VMID: %s", vmCID, err.Error())
+			return nil, err
 		}
-		if vmid <= 0 {
-			return nil, cpierrors.Cloud("reboot_vm: vm_cid %q must be a positive integer", vmCID)
-		}
+		vmid := cid.VMID
 
 		logger := deps.Log(ctx).With(
 			log.String("vm_cid", vmCID),
@@ -251,7 +249,7 @@ func rebootVMHandleStopped(ctx context.Context, deps Deps, logger *log.Logger, n
 func rebootVMSoftWithFallback(ctx context.Context, deps Deps, logger *log.Logger, node string, vmid int, vmCID string, timeout int) (any, error) {
 	t := int64(timeout)
 	resp, rebootErr := deps.PVE.Nodes().CreateQemuStatusReboot(
-		ctx, node, vmCID,
+		ctx, node, vmcid.PathOf(vmid),
 		&sdknodes.CreateQemuStatusRebootParams{Timeout: &t},
 	)
 	if rebootErr != nil {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -12,6 +11,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // createDiskCloudProperties holds the recognized fields from the cloud_properties
@@ -604,15 +604,16 @@ func applyCreateDiskTags(ctx context.Context, deps Deps, node, vmCID, diskCID st
 		)
 		return
 	}
-	vmid, parseErr := strconv.Atoi(vmCID)
-	if parseErr != nil || vmid <= 0 {
+	parsedCID, parseErr := vmcid.Parse(vmCID)
+	if parseErr != nil {
 		deps.Log(ctx).Warn(
-			"create_disk: tags supplied but vm_cid is not a valid integer; tags deferred",
+			"create_disk: tags supplied but vm_cid is not a valid VM CID; tags deferred",
 			log.String("disk_cid", diskCID),
 			log.String("vm_cid", vmCID),
 		)
 		return
 	}
+	vmid := parsedCID.VMID
 	if applyErr := applyCustomTagsToVM(ctx, deps, node, vmid, tags, diskCID); applyErr != nil {
 		// Tagging is best-effort metadata; do not fail volume
 		// creation when only the tag write fails. The next

@@ -11,6 +11,7 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // cleanupManagedVMInfrastructure disposes only subnets whose creation has exact
@@ -109,7 +110,7 @@ func managedVMRouteOwnerMatches(record aj.Record, vmid int) bool {
 		return false
 	}
 	if record.CID != "" {
-		return record.CID == strconv.Itoa(vmid)
+		return vmcid.SameVM(record.CID, vmid)
 	}
 	for i := range record.Steps {
 		step := &record.Steps[i]

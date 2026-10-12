@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // Family discriminates the CID shapes pve-cid understands. Values mirror the
@@ -100,8 +100,8 @@ func isAllDigits(s string) bool {
 //
 //  1. leading ':' → stemcell path CID (":light:"/":heavy:")
 //  2. "pvd-"/"pvz-" prefix → disk envelope CID
-//  3. all-digits → VM CID (bare integer)
-//  4. "<digits>:<name>" → snapshot CID
+//  3. all-digits or "<digits>-<cluster>-<token>" → VM CID
+//  4. "<vm cid>:<name>" → snapshot CID
 //
 // Any other shape — including a bare, unenveloped PVE volid
 // ("storage:volume") — is a hard parse error: this package has no
@@ -117,15 +117,16 @@ func DecodeCID(raw string) (*DecodedCID, error) {
 		return decodeStemcellCID(raw)
 	case strings.HasPrefix(raw, "pvd-"), strings.HasPrefix(raw, "pvz-"):
 		return decodeDiskCID(raw)
-	case isAllDigits(raw):
+	case isAllDigits(raw), isStampedVMCID(raw):
 		return decodeVMCID(raw)
 	default:
-		if idx := strings.IndexByte(raw, ':'); idx > 0 && idx < len(raw)-1 && isAllDigits(raw[:idx]) {
+		if idx := strings.IndexByte(raw, ':'); idx > 0 && idx < len(raw)-1 &&
+			(isAllDigits(raw[:idx]) || isStampedVMCID(raw[:idx])) {
 			return decodeSnapshotCID(raw)
 		}
 		return nil, fmt.Errorf(
 			"pve-cid: unrecognized CID %q: expected a stemcell (\":light:\"/\":heavy:\"), "+
-				"disk (\"pvd-\"/\"pvz-\"), VM (bare integer), or snapshot (\"<vmid>:<name>\") CID",
+				"disk (\"pvd-\"/\"pvz-\"), VM (\"<vmid>\" or \"<vmid>-<cluster>-<token>\"), or snapshot (\"<vm cid>:<name>\") CID",
 			raw,
 		)
 	}
@@ -190,12 +191,19 @@ func decodeDiskCID(raw string) (*DecodedCID, error) {
 	return d, nil
 }
 
+// isStampedVMCID reports whether s is a stamped VM CID.
+func isStampedVMCID(s string) bool {
+	cid, err := vmcid.Parse(s)
+	return err == nil && cid.Stamped()
+}
+
 func decodeVMCID(raw string) (*DecodedCID, error) {
-	vmid, err := strconv.Atoi(raw)
-	if err != nil || vmid <= 0 {
-		return nil, fmt.Errorf("pve-cid: invalid VM CID %q: must be a positive integer", raw)
+	cid, err := vmcid.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("pve-cid: invalid VM CID %q: must be a positive integer VMID, optionally followed by "+
+			"-<cluster>-<token>", raw)
 	}
-	return &DecodedCID{Family: FamilyVM, Raw: raw, VMID: vmid}, nil
+	return &DecodedCID{Family: FamilyVM, Raw: raw, VMID: cid.VMID}, nil
 }
 
 func decodeSnapshotCID(raw string) (*DecodedCID, error) {
@@ -203,11 +211,11 @@ func decodeSnapshotCID(raw string) (*DecodedCID, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pve-cid: invalid snapshot CID %q: %w", raw, err)
 	}
-	// vmCID is guaranteed all-digits by the caller's dispatch check, so this
-	// Atoi cannot fail; vmid stays 0 (omitted from JSON) in the defensive
-	// error case rather than propagating a spurious failure for a CID that
-	// ParseSnapshotCID already accepted.
-	vmid, _ := strconv.Atoi(vmCID)
+	// vmCID passed the caller's dispatch check, so this parse cannot fail;
+	// vmid stays 0 (omitted from JSON) in the defensive error case rather
+	// than propagating a spurious failure for a CID that ParseSnapshotCID
+	// already accepted.
+	vmid, _ := vmcid.VMID(vmCID)
 	return &DecodedCID{
 		Family:       FamilySnapshot,
 		Raw:          raw,

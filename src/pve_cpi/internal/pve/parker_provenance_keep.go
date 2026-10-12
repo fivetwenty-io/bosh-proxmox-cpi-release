@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // provenanceClockKey carries the clock WithProvenanceClock installs.
@@ -47,11 +47,7 @@ func provenanceSourceVMID(entry parkerProvEntry) (int, bool) {
 	if entry.Volid == "" || entry.SourceVMCID == "" {
 		return 0, false
 	}
-	vmid, err := strconv.Atoi(entry.SourceVMCID)
-	if err != nil || vmid <= 0 {
-		return 0, false
-	}
-	return vmid, true
+	return vmcid.VMID(entry.SourceVMCID)
 }
 
 // parkerProvenanceSourceKeeps is the one keep rule both the capacity probe and
