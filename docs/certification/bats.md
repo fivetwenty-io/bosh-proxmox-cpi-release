@@ -14,11 +14,11 @@ We run BATS against a Proxmox VE lab with `./scripts/bats`, the same way `./scri
 
 2. Prepare
 
-   Copies our cloud-config template (`manifests/bats/cloud_config_pve.yml.erb`) into the checkout as `templates/cloud_config_pve.yml.erb`, appends `rspec_junit_formatter` to the checkout's Gemfile, patches the checkout's ssh helper so Net::SSH offers only the run's ephemeral key rather than every identity in the workstation's OpenSSH config and ssh-agent, runs `bundle install`, resolves the stemcell, generates an ephemeral ed25519 keypair, and renders `bat.yml` from the active env bundle plus the `bats:` config section.
+   Copies our cloud-config template (`manifests/bats/cloud_config_pve.yml.erb`) into the checkout as `templates/cloud_config_pve.yml.erb`, appends `rspec_junit_formatter` to the checkout's Gemfile, patches the checkout's ssh helper so Net::SSH offers only the run's ephemeral key rather than every identity in the workstation's OpenSSH config and ssh-agent, runs `bundle install`, resolves the stemcell, generates an ephemeral ed25519 keypair, and renders `bat.yml` from the active env bundle plus the `bats:` config section. When the config holds a `bats.secondary` block, it also renders `bat-secondary.yml` for the second pass.
 
 3. rspec
 
-   Runs `bundle exec rspec spec/system` in the checkout with the PVE tag exclusions, the four `BAT_*` variables, and the director credentials resolved through `bosh int` from the gitignored creds file. The full console stream is captured to the run directory with private key material scrubbed.
+   Runs `bundle exec rspec spec/system` in the checkout with the PVE tag exclusions, the four `BAT_*` variables, and the director credentials resolved through `bosh int` from the gitignored creds file. When `bats.secondary` is set, a second rspec pass follows the first one against `bat-secondary.yml`, as described under the second cpi-config entry below. The full console stream is captured to the run directory with private key material scrubbed.
 
 4. Finalize
 
@@ -155,13 +155,27 @@ Two constraints on the address bands:
 
 One gap remains on the IPv4 side. The `deploys multiple manual networks` example under `manual_networking` never turns IPv6 on, so the helper filters the IPv6 network out and the example expects more than one IPv4 address on the instance. Only the dual-stack pass carries its tag, and that pass deploys the IPv6 job, so the example runs in neither shape. Covering it needs a second IPv4 manual network in the lab, which the `bats:` section cannot express yet.
 
+## Second cpi-config entry
+
+When the Director has more than one `cpi_config` entry, one `bats:` block only proves the entry named by `bats.cpi_id`. Adding a `bats.secondary` block makes the run repeat the IPv4 pass through a second entry, `pve-az2` by default, using the network values in that block. That shows each entry works on its own. The proof that one deployment spans both entries belongs to the certification run.
+
+To run it, we uncomment the `secondary:` block in `ci/integration.yml` (the example file shows the shape, with values for the `lab-pve-cpi-az2` cluster), fill in its network keys, and run `./scripts/bats run` as usual. The harness renders a second spec, `bat-secondary.yml`, next to `bat.yml`, runs the same tag selection against it, and writes `junit-secondary.xml` beside `junit.xml`. The run report lists the second pass with its `cpi_id` and network, or says why it did not run, so a reader can tell a one-entry run from a two-entry run. The report merges both files, so one example count covers both passes, and a failure in either pass fails the run. Each pass gets the full `rspec_timeout_s` budget.
+
+The secondary block inherits nothing from the primary network, because those addresses live on the first cluster. Its cidr, gateway, reserved and static bands, and the two static IPs are required, and `cpi_id`, `network_bridge`, and `target_node` are optional. VM sizing, `exclude_tags`, and the timeout still come from the primary block, and the pass is IPv4 only. The harness rejects a secondary `cpi_id` equal to the primary one.
+
+Without the block, a run behaves exactly as before. The harness checks the block when it loads the config, so a typo in an address or range stops the run before the primary pass starts, and that check happens even under `--skip-secondary`. With it present, `--skip-secondary` returns a single run to the primary entry, and a run that selects the dual-stack pass with `--only ipv6` skips the secondary pass.
+
 ## Results and reports
 
 Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
 - `junit.xml`
 
-  Spec-level results from `rspec_junit_formatter`, one testcase per example. Every run makes exactly one rspec pass, so there is one file.
+  Spec-level results from `rspec_junit_formatter`, one testcase per example. A run without `bats.secondary` makes one rspec pass, so there is one file.
+
+- `junit-secondary.xml`
+
+  The same kind of results for the second pass. It exists only when the run included `bats.secondary`, and the report merges it with `junit.xml`.
 
 - `junit-steps.xml` and `results.json`
 
@@ -171,9 +185,9 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
   The complete rspec stream, with private key blocks scrubbed.
 
-- `bat.yml`, `bats_ssh`, and `bats_ssh.pub`
+- `bat.yml`, `bat-secondary.yml`, `bats_ssh`, and `bats_ssh.pub`
 
-  The rendered BAT deployment spec and the run's ephemeral keypair. These contain the ephemeral private key, which is why the whole directory stays gitignored.
+  The rendered BAT deployment specs (`bat-secondary.yml` exists only for a two-pass run) and the run's ephemeral keypair. These contain the ephemeral private key, which is why the whole directory stays gitignored.
 
 The committed record lives under `docs/certification/bats/`:
 

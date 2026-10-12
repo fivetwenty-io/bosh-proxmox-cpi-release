@@ -267,6 +267,30 @@ bats:
   exclude_tags:  []               # Extra rspec tag exclusions on top of the
                                   # built-in PVE set (see docs/certification/bats.md)
   rspec_timeout_s: 14400          # Wall-clock ceiling for the rspec run
+  # Second pass (optional). When this block is present, `./scripts/bats run`
+  # makes the usual IPv4 pass through cpi_id above and then repeats it through
+  # this second cpi-config entry with the network values below, so each entry
+  # is shown to work alone. The spanning proof (one deployment across both
+  # entries) belongs to the certification run, not here. Remove the block, or
+  # pass --skip-secondary, for a single-entry run. Every key marked required
+  # must describe the second cluster's network, because nothing is inherited
+  # from the values above. Sizing, exclude_tags, and rspec_timeout_s come from
+  # the keys above, and the pass is IPv4 only. Example values match the
+  # pve-cpi env's AZ2 cluster (lab-pve-cpi-az2, 10.255.0.0/16). Replace
+  # them with the addresses on your second cluster.
+  # secondary:
+  #   cpi_id:           pve-az2                       # Defaults to pve-az2
+  #   network_cidr:     10.255.0.0/16                 # Required
+  #   network_gateway:  10.255.0.1                    # Required
+  #   network_bridge:   ""                            # Defaults to bats.network_bridge
+  #   network_reserved:                               # Required
+  #   - 10.255.0.1-10.255.48.19
+  #   - 10.255.48.200-10.255.255.254
+  #   network_static:                                 # Required
+  #   - 10.255.48.190-10.255.48.199
+  #   static_ip:        10.255.48.190                 # Required
+  #   second_static_ip: 10.255.48.191                 # Required
+  #   target_node:      ""                            # Pin on the second cluster, if needed
 
 # BOSH Director Upgrade Test (scripts/certify).
 # Run with: make certify-upgrade  /  ./scripts/certify upgrade --env <env>

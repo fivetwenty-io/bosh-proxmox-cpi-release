@@ -40,6 +40,9 @@ Flags:
                         IPv4 and the IPv6 network. That pass is opt-in: the
                         agent cannot hold two static addresses on one NIC yet,
                         so a default run leaves it out.
+    --skip-secondary    Ignore the bats.secondary block and run only the
+                        primary cpi_id pass. Without that block a run never
+                        makes a second pass.
     --fail-fast         Stop rspec at the first failure.
     --keep              Set BAT_DEBUG_MODE: fail fast and leave the failed
                         deployment, stemcell, and release in place.
@@ -127,6 +130,9 @@ DEFAULT_RESULTS_DIR = ".e2e-results"
 CPI_NAME = "pve"
 CHECKOUT_NAME = "bosh-acceptance-tests"
 JUNIT_RSPEC = "junit.xml"        # spec-level results written by rspec
+JUNIT_SECONDARY = "junit-secondary.xml"  # the bats.secondary pass
+SECONDARY_CPI_ID = "pve-az2"     # cpi-config entry the secondary pass defaults to
+SECONDARY_SPEC = "bat-secondary.yml"
 JUNIT_STEPS = "junit-steps.xml"  # harness step results written by Reporter
 DEFAULT_RSPEC_TIMEOUT_S = 14400
 RUN_META_MARK = "bats-run-meta"
@@ -414,6 +420,7 @@ def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
                 f"{type(section.get(key)).__name__}: {section.get(key)!r}"
             )
 
+    primary_cpi_id = str(section.get("cpi_id", "") or "").strip()
     return {
         "network_cidr": _env_default("network_cidr", "/internal_cidr"),
         "network_gateway": _env_default("network_gateway", "/internal_gw"),
@@ -439,7 +446,140 @@ def bats_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
         "target_node": str(section.get("target_node", "") or "").strip(),
         "exclude_tags": [str(t) for t in (section.get("exclude_tags") or [])],
         "rspec_timeout_s": int(section.get("rspec_timeout_s", DEFAULT_RSPEC_TIMEOUT_S)),
+        "secondary": secondary_bats_config(section, primary_cpi_id),
     }
+
+
+# Keys the secondary block must spell out. Every one of them describes the
+# second cluster's network, and the env bundle's defaults and the primary
+# block's values describe the first cluster, so inheriting any of them would
+# deploy a pass whose addresses do not exist on the cluster it targets.
+_REQUIRED_SECONDARY_KEYS = (
+    "network_cidr",
+    "network_gateway",
+    "network_reserved",
+    "network_static",
+    "static_ip",
+    "second_static_ip",
+)
+
+# The secondary pass is IPv4 only, so the dual-stack and per-pass tuning keys
+# have no meaning there. Naming one is a mistake worth stopping on.
+_REJECTED_SECONDARY_KEYS = (
+    "network_cidr_ipv6",
+    "network_gateway_ipv6",
+    "network_reserved_ipv6",
+    "network_static_ipv6",
+    "static_ip_ipv6",
+    "nic_group",
+    "exclude_tags",
+    "rspec_timeout_s",
+    "vm_cores",
+    "vm_memory_mib",
+    "vm_disk_mib",
+)
+
+
+def secondary_bats_config(section: dict, primary_cpi_id: str) -> "dict | None":
+    """Resolve `bats.secondary`, the second pass through another cpi-config entry.
+
+    Returns None when the block is absent or empty, which leaves the run
+    exactly as a single-entry run. The block carries the second entry's own
+    cpi_id (default pve-az2), network values, and optional target_node. The
+    VM sizing, tag exclusions, and timeout come from the primary block.
+    """
+    raw = section.get("secondary")
+    if raw in (None, "", {}):
+        return None
+    if not isinstance(raw, dict):
+        sys.exit("config key `bats.secondary` must be a mapping (see ci/integration.yml.example)")
+    for key in _REJECTED_SECONDARY_KEYS:
+        if key in raw:
+            sys.exit(
+                f"bats.secondary.{key} is not supported: the secondary pass is "
+                "IPv4 only and takes its sizing, exclusions, and timeout from bats"
+            )
+    for key in _REQUIRED_SECONDARY_KEYS:
+        if not raw.get(key):
+            sys.exit(
+                f"missing required config key: bats.secondary.{key} "
+                "(see the bats.secondary block in ci/integration.yml.example)"
+            )
+    for key in ("network_reserved", "network_static"):
+        if not isinstance(raw[key], list):
+            sys.exit(
+                f"bats.secondary.{key} must be a list of ranges, got "
+                f"{type(raw[key]).__name__}: {raw[key]!r}"
+            )
+    cpi_id = str(raw.get("cpi_id", "") or "").strip() or SECONDARY_CPI_ID
+    if cpi_id == primary_cpi_id:
+        sys.exit(
+            f"bats.secondary.cpi_id {cpi_id!r} equals bats.cpi_id; the second "
+            "pass has to go through a different cpi-config entry"
+        )
+    static_ip = str(raw["static_ip"]).strip()
+    second_static_ip = str(raw["second_static_ip"]).strip()
+    if static_ip == second_static_ip:
+        sys.exit("bats.secondary.static_ip and second_static_ip must be two distinct addresses")
+    # Catch band mistakes now, before the primary pass spends its hour.
+    network_cidr = str(raw["network_cidr"]).strip()
+    network_gateway = str(raw["network_gateway"]).strip()
+    network_reserved = [str(r) for r in raw["network_reserved"]]
+    network_static = [str(r) for r in raw["network_static"]]
+    try:
+        _check_subnet_consistency(
+            cidr=network_cidr, gateway=network_gateway, reserved=network_reserved,
+            static=network_static, static_ip=static_ip,
+            prefix="bats.secondary", suffix="",
+        )
+        _check_subnet_consistency(
+            cidr=network_cidr, gateway="", reserved=[], static=network_static,
+            static_ip=second_static_ip, prefix="bats.secondary", suffix="",
+        )
+    except ValueError as exc:
+        sys.exit(f"bats.secondary holds an invalid address or range: {exc}")
+    return {
+        "cpi_id": cpi_id,
+        "network_cidr": network_cidr,
+        "network_gateway": network_gateway,
+        "network_bridge": str(raw.get("network_bridge", "") or "").strip(),
+        "network_reserved": network_reserved,
+        "network_static": network_static,
+        "static_ip": static_ip,
+        "second_static_ip": second_static_ip,
+        "target_node": str(raw.get("target_node", "") or "").strip(),
+    }
+
+
+def secondary_pass_config(bcfg: dict) -> "dict | None":
+    """The bcfg handed to build_bat_spec for the secondary pass, or None.
+
+    The primary block supplies sizing; the secondary block replaces every
+    network value, the cpi_id, and the node pin. IPv6 is dropped, so the
+    spec carries the single IPv4 network.
+    """
+    secondary = bcfg.get("secondary")
+    if not secondary:
+        return None
+    merged = dict(bcfg)
+    merged.update({
+        "cpi_id": secondary["cpi_id"],
+        "network_cidr": secondary["network_cidr"],
+        "network_gateway": secondary["network_gateway"],
+        "network_bridge": secondary["network_bridge"] or bcfg["network_bridge"],
+        "network_reserved": secondary["network_reserved"],
+        "network_static": secondary["network_static"],
+        "static_ip": secondary["static_ip"],
+        "second_static_ip": secondary["second_static_ip"],
+        "target_node": secondary["target_node"],
+        "network_cidr_ipv6": "",
+        "network_gateway_ipv6": "",
+        "network_reserved_ipv6": [],
+        "network_static_ipv6": [],
+        "static_ip_ipv6": "",
+        "secondary": None,
+    })
+    return merged
 
 
 def build_bat_spec(
@@ -646,7 +786,10 @@ def write_run_doc(
             "against a Proxmox VE lab. See [Running BATS](../../bats.md) for how we "
             "run the suite."
         ),
-        verdict_lines=[headline, ""] + _rundoc.run_meta_bullets(meta),
+        verdict_lines=[headline, ""] + _rundoc.run_meta_bullets(meta) + (
+            [f"- Second cpi-config pass: {meta['secondary_pass']}", ""]
+            if meta.get("secondary_pass") else []
+        ),
         timings_intro=[
             "The wall clock above covers the whole run. The tables below "
             "break it down by phase and by harness step; per-example "
@@ -776,6 +919,7 @@ class BATS:
         self.director_version = ""
         self.rspec_rc: "int | None" = None
         self.junit_paths: "list[Path]" = []
+        self.secondary_ran = False
         self.dual_stack_ran = False
         self.excluded: dict[str, str] = {}
 
@@ -1195,12 +1339,36 @@ class BATS:
             bat_yml = self.run_dir / "bat.yml"
             bat_yml.write_text(yaml.safe_dump(spec, default_flow_style=False, sort_keys=False))
             bat_yml.chmod(0o600)
+            secondary = secondary_pass_config(self.bcfg)
+            if secondary is not None and not self._skip_secondary():
+                secondary_yml = self.run_dir / SECONDARY_SPEC
+                secondary_yml.write_text(yaml.safe_dump(
+                    build_bat_spec(
+                        secondary, self.stemcell_name, self.stemcell_version,
+                        public_key, private_key,
+                    ),
+                    default_flow_style=False, sort_keys=False,
+                ))
+                secondary_yml.chmod(0o600)
         except (OSError, subprocess.CalledProcessError) as exc:
             return self._record_inline("bat.yml:render", False, t0, str(exc))
         return self._record_inline(
             "bat.yml:render", True, t0,
             f"{self.run_dir / 'bat.yml'} (static {self.bcfg['static_ip']}, "
-            f"second {self.bcfg['second_static_ip']})",
+            f"second {self.bcfg['second_static_ip']})"
+            + self._secondary_render_note(),
+        )
+
+    def _skip_secondary(self) -> bool:
+        return bool(getattr(self.args, "skip_secondary", False))
+
+    def _secondary_render_note(self) -> str:
+        secondary = self.bcfg.get("secondary")
+        if not secondary or self._skip_secondary():
+            return ""
+        return (
+            f"; {self.run_dir / SECONDARY_SPEC} (cpi_id {secondary['cpi_id']}, "
+            f"static {secondary['static_ip']}, second {secondary['second_static_ip']})"
         )
 
     # -- run ----------------------------------------------------------------- #
@@ -1256,6 +1424,17 @@ class BATS:
             return [("dual-stack" if dual else "ipv4", dual, only)]
         return [("ipv4", False, [])]
 
+    def secondary_pass_wanted(self, passes: "list[tuple[str, bool, list[str]]]") -> bool:
+        """True when bats.secondary adds a second pass to this run.
+
+        The secondary pass repeats the IPv4 pass through the other cpi-config
+        entry, so a run that selected the dual-stack pass has nothing to
+        repeat, and --skip-secondary opts out for a single-entry run.
+        """
+        if not self.bcfg.get("secondary") or self._skip_secondary():
+            return False
+        return not any(p[1] for p in passes)
+
     def run_rspec(self) -> bool:
         self.rep.section("bats (rspec)")
         assert self.checkout is not None
@@ -1277,8 +1456,9 @@ class BATS:
                 "bats section cannot express"
             )
         self.junit_paths = []
-        # rspec_passes returns exactly one pass, so the run budget is the
-        # pass budget and the junit name never needs a pass suffix.
+        # Each pass gets the full rspec_timeout_s budget. The primary pass
+        # keeps the unsuffixed junit name, so a run without bats.secondary
+        # writes exactly what it wrote before.
         self.pass_timeout_s = max(1, self.bcfg["rspec_timeout_s"])
         ok = True
         for name, dual_stack, only in passes:
@@ -1288,6 +1468,15 @@ class BATS:
                 ok = False
                 if self.args.fail_fast:
                     break
+        if self.secondary_pass_wanted(passes) and not (not ok and self.args.fail_fast):
+            junit = self.run_dir / JUNIT_SECONDARY
+            self.junit_paths.append(junit)
+            self.secondary_ran = True
+            if not self._run_rspec_pass(
+                "secondary", False, passes[0][2], junit,
+                spec_path=self.run_dir / SECONDARY_SPEC,
+            ):
+                ok = False
         if ok:
             merged = merge_rspec_junit(self.junit_paths)
             if merged is not None and merged["tests"] == 0:
@@ -1306,6 +1495,7 @@ class BATS:
 
     def _run_rspec_pass(
         self, name: str, dual_stack: bool, only: "list[str]", junit: Path,
+        spec_path: "Path | None" = None,
     ) -> bool:
         assert self.checkout is not None
         excluded = self.excluded_tags(dual_stack=dual_stack)
@@ -1332,7 +1522,7 @@ class BATS:
         env.update(self._director_env())
         env.update({
             "BAT_STEMCELL": str(self.stemcell_path),
-            "BAT_DEPLOYMENT_SPEC": str(self.run_dir / "bat.yml"),
+            "BAT_DEPLOYMENT_SPEC": str(spec_path or self.run_dir / "bat.yml"),
             "BAT_BOSH_CLI": shutil.which("bosh") or "bosh",
             "BAT_INFRASTRUCTURE": CPI_NAME,
         })
@@ -1470,6 +1660,8 @@ class BATS:
             flags.append(f"--exclude {tag}")
         if self.args.no_default_excludes:
             flags.append("--no-default-excludes")
+        if self._skip_secondary():
+            flags.append("--skip-secondary")
 
         return {
             "date": started.strftime("%Y-%m-%d"),
@@ -1502,9 +1694,24 @@ class BATS:
             "ruby_version": ruby_version,
             "env": self.env_name,
             "dual_stack": self._dual_stack_meta(),
+            "secondary_pass": self._secondary_meta(),
             "excluded_tags": sorted(self.excluded),
             "excluded_reasons": self.excluded,
         }
+
+    def _secondary_meta(self) -> str:
+        """One line for the report: what the second cpi-config pass did this run."""
+        secondary = self.bcfg.get("secondary")
+        if not secondary:
+            return ""
+        if self._skip_secondary():
+            return f"configured (cpi_id {secondary['cpi_id']}) but skipped by --skip-secondary"
+        if not getattr(self, "secondary_ran", False):
+            return (
+                f"configured (cpi_id {secondary['cpi_id']}) but not run; the "
+                "dual-stack pass was selected or the run stopped early"
+            )
+        return f"cpi_id {secondary['cpi_id']} on {secondary['network_cidr']}"
 
     def _dual_stack_meta(self) -> str:
         """One line for the report: what the dual-stack network did this run."""
@@ -1610,6 +1817,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=[], metavar="TAG")
     p.add_argument("--no-default-excludes", action="store_true")
     p.add_argument("--only", action="append", default=[], metavar="TAG")
+    p.add_argument("--skip-secondary", action="store_true",
+                   help="ignore bats.secondary and run the primary entry only")
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--keep", action="store_true",
                    help="BAT_DEBUG_MODE: fail fast, keep failed state for post-mortem")
