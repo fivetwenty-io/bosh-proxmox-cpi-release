@@ -422,7 +422,9 @@ func applyCustomTagsToVM(ctx context.Context, deps Deps, node string, vmid int, 
 		}
 	}
 
-	mergedTags, droppedTags := mergeTagListReporting(existing, newEntries, maxTagLength)
+	// The ownership record goes back to the head before the merge, because
+	// the merge truncates from the tail and PVE may return the tags sorted.
+	mergedTags, droppedTags := mergeTagListReporting(hoistHeadTags(existing), newEntries, maxTagLength)
 	warnDroppedTags(deps.Log(ctx), "set_disk_metadata", log.Int("vmid", vmid), maxTagLength, droppedTags)
 
 	currentDesc := ""

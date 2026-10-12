@@ -217,10 +217,33 @@ func setVMMetadataRMW(
 		if deps.Config != nil && (deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
 			return cpierrors.Cloud("set_vm_metadata: cannot verify existing allocation provenance")
 		}
+		// Without the config we cannot tell whether this VM belongs to the
+		// instance the metadata names, and the write below would rename and
+		// retag it anyway. Metadata that names no instance skips the identity
+		// check, so it keeps the old warn-and-continue behavior. The class is
+		// retriable whatever the read error was, because nothing about the VM
+		// has been judged yet and a later read may well succeed.
+		if incomingInstanceIdentity(metadata) != "" {
+			return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+				fmt.Sprintf("set_vm_metadata: read VM %s config to verify its instance identity", vmCID))
+		}
 		logger.Warn("set_vm_metadata: could not read current VM config; existing tags and description sentinel will not be preserved",
 			log.Err(cfgErr),
 		)
 	}
+
+	// Refuse before anything is written when the VM records a different
+	// instance than the metadata names, so a CID that reaches the wrong VM
+	// renames, retags, and rewrites nothing.
+	identity, identityErr := checkVMMetadataIdentity(vmCID, metadata, existingTags, existingDesc)
+	if identityErr != nil {
+		logger.Error("set_vm_metadata: refused, the VM records a different instance than the metadata names",
+			log.String("stored_instance", strings.Join(identity.compared, ",")),
+			log.String("metadata_instance", identity.incoming),
+		)
+		return identityErr
+	}
+	ownerBackfill := ownerTagBackfill(identity, existingTags, deps.RequestDirectorUUID, logger)
 
 	// This handler regenerates the human-readable text wholesale from the
 	// Director's metadata map, and that map never names the stemcell. Carry
@@ -250,8 +273,22 @@ func setVMMetadataRMW(
 		return markerErr
 	}
 
-	preserved := stripReservedBoshTags(existingTags)
-	boshEntries := buildBoshManagedTags(metadata, deps.Config.ParkerPrefixValue())
+	// The ownership record goes at the head of the preserved list, because
+	// the merge below truncates from the tail and PVE may hand the tags back
+	// in a different order than create_vm wrote them.
+	preserved := hoistHeadTags(stripReservedBoshTags(existingTags))
+	if ownerBackfill != "" {
+		preserved = withOwnerTag(preserved, ownerBackfill)
+		logger.Info("set_vm_metadata: stamping the owner tag on a VM created before owner tags existed",
+			log.String("owner_tag", ownerBackfill),
+		)
+	}
+	boshEntries, refusedName := buildBoshManagedTagsReporting(metadata, deps.Config.ParkerPrefixValue())
+	if refusedName != "" {
+		logger.Warn("set_vm_metadata: the instance name tag would claim a tag prefix the CPI owns, so it was not applied",
+			log.String("name_tag", refusedName),
+		)
+	}
 	tags, droppedTags := mergeTagListReporting(preserved, boshEntries, maxTagLength)
 	warnDroppedTags(logger, "set_vm_metadata", log.String("vm_cid", vmCID), maxTagLength, droppedTags)
 
@@ -362,6 +399,12 @@ func buildDescription(metadata map[string]any) string {
 //
 // Keys whose metadata value is missing, nil, or sanitizes to empty are skipped.
 //
+// An instance group may be named after a create-time prefix, such as
+// "bosh-owner" or "stemcell", and its name tag would then read as an owner or
+// stemcell record and survive every later sync, because those prefixes are
+// not rebuilt here. We leave that tag out. A caller that has to warn about it
+// should call buildBoshManagedTagsReporting instead.
+//
 // vmPrefix is the resolved prefix from cfg.ParkerPrefixValue(), and it becomes
 // the "vm-prefix--<value>" identity tag. An empty vmPrefix omits the tag, which
 // the accessor never produces and a direct call from a test can.
@@ -373,7 +416,17 @@ func buildDescription(metadata map[string]any) string {
 // deployment and job set long enough to overflow the cap loses the identity tag
 // and keeps every entry BOSH itself supplied.
 func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
+	parts, _ := buildBoshManagedTagsReporting(metadata, vmPrefix)
+	return parts
+}
+
+// buildBoshManagedTagsReporting builds the entries exactly the way
+// buildBoshManagedTags does, and it also returns the instance name tag it left
+// out because the tag would claim a create-time prefix, or "" when it left
+// nothing out.
+func buildBoshManagedTagsReporting(metadata map[string]any, vmPrefix string) ([]string, string) {
 	var parts []string
+	var refusedName string
 	for _, key := range []string{"director", "deployment", "instance_group", "job", "index"} {
 		v, ok := metadata[key]
 		if !ok || v == nil {
@@ -388,13 +441,17 @@ func buildBoshManagedTags(metadata map[string]any, vmPrefix string) []string {
 	if v, ok := metadata[metadataKeyName]; ok && v != nil {
 		raw := strings.ReplaceAll(fmt.Sprintf("%v", v), "/", "--")
 		if s := sanitizeTagValue(raw); s != "" {
-			parts = append(parts, s)
+			if hasCreateTimePrefix(s) {
+				refusedName = s
+			} else {
+				parts = append(parts, s)
+			}
 		}
 	}
 	if s := sanitizeTagValue(vmPrefix); s != "" {
 		parts = append(parts, pve.ParkerPrefixTagPrefix+s)
 	}
-	return parts
+	return parts, refusedName
 }
 
 // preserveVMAllocationMarker keeps allocation provenance ahead of the shared

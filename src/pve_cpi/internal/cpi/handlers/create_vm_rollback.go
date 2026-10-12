@@ -221,7 +221,9 @@ func tagFailedVM(ctx context.Context, deps Deps, node string, vmid int, env map[
 			}
 		}
 
-		tags := mergeTagList(existing, entries, maxTagLength)
+		// hoistHeadTags keeps the ownership record ahead of the tail the
+		// byte cap truncates, whatever order PVE returned the tags in.
+		tags := mergeTagList(hoistHeadTags(existing), entries, maxTagLength)
 		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, strconv.Itoa(vmid),
 			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
 			logger.Warn("create_vm: keep_failed_vms tag write failed (non-fatal)",

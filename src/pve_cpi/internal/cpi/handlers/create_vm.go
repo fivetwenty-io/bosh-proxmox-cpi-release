@@ -591,6 +591,10 @@ func createVM(
 		return existing, resumeErr
 	}
 
+	// Placement may build the VM's shape once per candidate node, so the
+	// missing-owner warning is logged here, once for the whole call.
+	warnMissingOwnerTag(deps, logger)
+
 	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 	if err != nil {
 		return nil, cpierrors.Cloud("create_vm: %s", err.Error())

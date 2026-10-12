@@ -52,7 +52,9 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 				existing = parseTagsField(s)
 			}
 		}
-		tags := mergeTagList(existing, []string{tagDeletingVM}, maxTagLength)
+		// hoistHeadTags keeps the ownership record ahead of the tail the
+		// byte cap truncates, whatever order PVE returned the tags in.
+		tags := mergeTagList(hoistHeadTags(existing), []string{tagDeletingVM}, maxTagLength)
 		if err := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmcid.PathOf(vmid),
 			&sdknodes.UpdateQemuConfigParams{Tags: &tags}); err != nil {
 			logger.Warn("delete_vm: fast-path tag write failed (non-fatal; destroy will proceed)",

@@ -20,6 +20,32 @@ import (
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
+// initialTagHead returns the tags that open a new VM's tag list: ownershipTag,
+// then the owner tag naming the requesting Director. They come ahead of every
+// stemcell, retention, route, and operator tag because mergeTagList truncates
+// from the tail, and the ownership record must be the last thing a long list
+// gives up. A request without a director_uuid gets no owner tag, and
+// warnMissingOwnerTag says so once per create_vm, because this runs once for
+// every placement candidate. set_vm_metadata stamps the tag later if a
+// Director with a UUID claims the VM with matching instance metadata.
+func initialTagHead(deps Deps) []string {
+	head := []string{ownershipTag}
+	if owner := ownerTagFor(deps.RequestDirectorUUID); owner != "" {
+		return append(head, owner)
+	}
+	return head
+}
+
+// warnMissingOwnerTag logs, once for the whole create_vm call, that the
+// request carries no director_uuid and the VM will get no owner tag.
+func warnMissingOwnerTag(deps Deps, logger *log.Logger) {
+	if ownerTagFor(deps.RequestDirectorUUID) != "" {
+		return
+	}
+	logger.Warn("create_vm: the request carries no director_uuid, so the VM gets no " +
+		ownerTagPrefix + " owner tag")
+}
+
 // buildVMShapeForNode constructs a createVMShape for a pre-resolved node.
 // All node selection (resolveTargetNode / resolveTargetNodeWithFallbacks) must
 // happen before calling this helper; the resulting node string is passed in.
@@ -66,11 +92,16 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// "bosh-cpi" is the fixed ownership marker stamped on every CPI-created VM.
 	// It lets operators filter PVE UI / scripts to CPI-managed guests only and
 	// is preserved across set_vm_metadata because it is not in
-	// reservedBoshTagPrefixes. Operator-supplied tags are appended after.
+	// reservedBoshTagPrefixes. The owner tag follows it (see initialTagHead),
+	// and operator-supplied tags are appended after both.
 	// Every tag in reservedBoshTagPrefixes, which covers the BOSH metadata keys
 	// and the vm-prefix-- identity tag, is added later by set_vm_metadata, and
 	// none of them is stamped here.
-	baseRetainTags := buildCustomTags(cp.Tags)
+	baseRetainTags, refusedTagKeys := buildCustomTagsReporting(cp.Tags)
+	for _, k := range refusedTagKeys {
+		deps.Log(ctx).Warn("create_vm: cloud_properties tag key is reserved by the CPI and was not applied",
+			log.String("tag_key", k))
+	}
 	if cp.RetainEphemeralOnDelete != nil && *cp.RetainEphemeralOnDelete {
 		baseRetainTags = append(baseRetainTags, tagRetainEphemeral)
 	}
@@ -90,7 +121,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if tag := stemcellIdentityTag(parsed); tag != "" {
 		stemcellTags = append(append([]string{}, baseRetainTags...), tag)
 	}
-	initialTags := mergeTagList([]string{ownershipTag}, stemcellTags, maxTagLength)
+	initialTags := mergeTagList(initialTagHead(deps), stemcellTags, maxTagLength)
 	for _, tag := range advrtTags {
 		if !strings.Contains(initialTags, tag) {
 			deps.Log(ctx).Warn("create_vm: advertised-route provenance tag dropped by tag-length cap — "+

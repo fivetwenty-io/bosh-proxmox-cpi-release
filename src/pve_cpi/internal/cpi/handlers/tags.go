@@ -48,17 +48,59 @@ var reservedBoshTagPrefixes = []string{
 //
 // Every entry is lowercase, because hasCPIOwnedPrefix lowercases before it
 // compares.
-var createTimeTagPrefixes = []string{stemcellTagPrefix}
+var createTimeTagPrefixes = []string{stemcellTagPrefix, ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix}
 
-// hasCPIOwnedPrefix reports whether entry claims a prefix the CPI owns. The
-// inherited reservedBoshTagPrefixes are matched exactly, which is the comparison
-// they have always had. The create-time prefixes are matched without regard to
-// case, because an operator key of "Stemcell" is plainly an attempt at the same
-// namespace and there is no reason to let a shift key through a guard.
-func hasCPIOwnedPrefix(entry string) bool {
-	if hasReservedBoshPrefix(entry) {
-		return true
+// ownerTagPrefix names the Director that created a VM. create_vm stamps
+// "bosh-owner--<sanitized director_uuid>" right after ownershipTag, and
+// set_vm_metadata stamps it on a VM that predates the tag once the VM's stored
+// instance identity agrees with the Director's metadata. We cannot reuse the
+// "director--" tag for this, because set_vm_metadata strips and rebuilds that
+// prefix from the Director's name on every sync.
+const ownerTagPrefix = "bosh-owner--"
+
+// cidStampTagPrefix and clusterStampTagPrefix are reserved for the tags that
+// tie a VM to the CID it was returned under and to the cluster that holds it.
+// No operator tag, cloud property, or instance name may write either one, so
+// they sit in createTimeTagPrefixes ahead of the code that stamps them.
+const (
+	cidStampTagPrefix     = "bosh-cid--"
+	clusterStampTagPrefix = "bosh-cluster--"
+)
+
+// headTagPrefixes are the create-time tags that ownership decisions read. We
+// keep them at the head of a VM's tag list, right behind ownershipTag, because
+// mergeTagList truncates from the tail and an ownership record that falls off
+// a long list cannot be told apart from one that was never written.
+var headTagPrefixes = []string{ownerTagPrefix, cidStampTagPrefix, clusterStampTagPrefix}
+
+// ownerTagFor renders the owner tag for a Director UUID, lowercased so every
+// writer and reader sees one canonical form whatever case the request used. It
+// returns "" when the UUID is empty or sanitizes to nothing, and callers then
+// stamp no owner tag.
+func ownerTagFor(directorUUID string) string {
+	s := strings.ToLower(sanitizeTagValue(directorUUID))
+	if s == "" {
+		return ""
 	}
+	return ownerTagPrefix + s
+}
+
+// hasOwnerTag reports whether entries already carry an owner tag of any value.
+// The prefix comparison ignores case, the same way hasCPIOwnedPrefix does.
+func hasOwnerTag(entries []string) bool {
+	for _, e := range entries {
+		if strings.HasPrefix(strings.ToLower(e), ownerTagPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCreateTimePrefix reports whether entry claims one of the
+// createTimeTagPrefixes, ignoring case. It is the narrower half of
+// hasCPIOwnedPrefix, for callers that write a reserved key themselves and only
+// need to keep the create-time namespace out of their output.
+func hasCreateTimePrefix(entry string) bool {
 	lowered := strings.ToLower(entry)
 	for _, p := range createTimeTagPrefixes {
 		if strings.HasPrefix(lowered, p) {
@@ -66,6 +108,53 @@ func hasCPIOwnedPrefix(entry string) bool {
 		}
 	}
 	return false
+}
+
+// hoistHeadTags returns entries with ownershipTag first and every
+// headTagPrefixes entry right behind it, in their original order, followed by
+// everything else in its original order. PVE may store tags sorted, so the
+// order we read back is not the order create_vm wrote, and this puts the
+// ownership record back where truncation cannot reach it.
+func hoistHeadTags(entries []string) []string {
+	if len(entries) == 0 {
+		return entries
+	}
+	head := make([]string, 0, 4)
+	stamps := make([]string, 0, 4)
+	rest := make([]string, 0, len(entries))
+	for _, e := range entries {
+		switch {
+		case e == ownershipTag:
+			head = append(head, e)
+		case hasHeadTagPrefix(e):
+			stamps = append(stamps, e)
+		default:
+			rest = append(rest, e)
+		}
+	}
+	out := make([]string, 0, len(entries))
+	out = append(out, head...)
+	out = append(out, stamps...)
+	return append(out, rest...)
+}
+
+func hasHeadTagPrefix(entry string) bool {
+	lowered := strings.ToLower(entry)
+	for _, p := range headTagPrefixes {
+		if strings.HasPrefix(lowered, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCPIOwnedPrefix reports whether entry claims a prefix the CPI owns. The
+// inherited reservedBoshTagPrefixes are matched exactly, which is the comparison
+// they have always had. The create-time prefixes are matched without regard to
+// case, because an operator key of "Stemcell" is plainly an attempt at the same
+// namespace and there is no reason to let a shift key through a guard.
+func hasCPIOwnedPrefix(entry string) bool {
+	return hasReservedBoshPrefix(entry) || hasCreateTimePrefix(entry)
 }
 
 // jsonKeyTags is the PVE "tags" field key in qemu config/create payloads and
@@ -100,10 +189,23 @@ func sanitizeTagValue(s string) string {
 
 // buildCustomTags converts a user-supplied tag map to sanitized "key--value"
 // entries, sorted by key for deterministic ordering. Empty values and keys
-// that sanitize to the empty string are skipped.
+// that sanitize to the empty string are skipped, and so is any key whose entry
+// would claim a CPI-owned prefix. A caller that has to tell the operator about
+// a refused key should call buildCustomTagsReporting instead.
 func buildCustomTags(custom map[string]string) []string {
+	entries, _ := buildCustomTagsReporting(custom)
+	return entries
+}
+
+// buildCustomTagsReporting builds the entries exactly the way buildCustomTags
+// does, and it also hands back the original keys it refused because their
+// entry would claim a CPI-owned prefix, sorted. Without the filter a cloud
+// property tag of {bosh-owner: x} would render "bosh-owner--x" and name a
+// Director that never created the VM, and {stemcell: x} would overwrite the
+// record of which stemcell the guest booted from.
+func buildCustomTagsReporting(custom map[string]string) ([]string, []string) {
 	if len(custom) == 0 {
-		return nil
+		return nil, nil
 	}
 	keys := make([]string, 0, len(custom))
 	for k := range custom {
@@ -111,15 +213,21 @@ func buildCustomTags(custom map[string]string) []string {
 	}
 	sort.Strings(keys)
 	out := make([]string, 0, len(custom))
+	var refused []string
 	for _, k := range keys {
 		sk := sanitizeTagValue(k)
 		sv := sanitizeTagValue(custom[k])
 		if sk == "" || sv == "" {
 			continue
 		}
-		out = append(out, sk+"--"+sv)
+		entry := sk + "--" + sv
+		if hasCPIOwnedPrefix(entry) {
+			refused = append(refused, k)
+			continue
+		}
+		out = append(out, entry)
 	}
-	return out
+	return out, refused
 }
 
 // mergeTagList concatenates existing and additions into a single PVE tag
