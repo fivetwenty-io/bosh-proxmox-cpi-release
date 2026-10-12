@@ -214,7 +214,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** PVE cannot clone across nodes when either side of the operation sits on node-local storage. Discovering that from PVE's own error mid-clone leaves a partially created VM to roll back.
 
-**CPI behavior.** When the cache template is on a different node than the VM's target, `create_vm` checks *both* sides before submitting the clone: the template's own storage must be shared, and so must the destination `vm_storage`. Either one failing is a clear, non-retriable rejection naming the pool, the two nodes, and the three ways out — enable `stemcell_replicate_local` so every node gets its own replica, pin the VM with `cloud_properties.target_node` set to the template's node (`create_vm` does not read a `node` key), or move the pool to shared storage.
+**CPI behavior.** When the cache template is on a different node than the VM's target, `create_vm` checks *both* sides before submitting the clone: the template's own storage must be shared, and so must the destination `vm_storage`. Either one failing is a clear, non-retriable rejection naming the pool, the two nodes, and the three ways out. Enable `stemcell_replicate_local` so every node gets its own replica, pin the VM with `cloud_properties.target_node` set to the template's node (`create_vm` does not read a `node` key), or move the pool to shared storage.
 
 **Status.** Meets — the check is unconditional and needs no configuration.
 

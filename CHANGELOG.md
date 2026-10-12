@@ -12,6 +12,42 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking change for multi-cluster deployments. A `cpi_config` entry that points at a different PVE host or port no longer inherits the job's `user`, `password`, `api_token`, or `ca_cert`. Before you upgrade, add to every such entry either its own `api_token`, or its own `user` and `password`, plus its own `ca_cert` if that cluster uses a private CA. An entry that still relies on inheritance fails on its first call with a non-retriable error that names the entry's host and the missing property keys. Set `realm` on the entry, or write the user as `user@realm`, because a bare entry `user` still takes the job's realm. The shipped `manifests/cpi-config.yml` already sets the host and every credential key on both entries, so it keeps working.
+
+- Once an entry names any credential key, even with an empty value or on the job's own host and port, it gets only the credentials it names and never borrows the rest from the job config. The realm still inherits unless the entry sets it. A password-only entry no longer keeps the inherited job token, and when an entry sets both a token and a password, the token wins and the password is cleared, as it is for the job config. The `user` property is no longer required whenever `api_token` is set, for entries and for the job config alike. An entry's `api_token` now loses a `PVEAPIToken=` prefix just as the job token does. The job's explicit `node_endpoints` map now follows an entry only when the entry stays on the job's host and port.
+
+- The CPI now logs a warning when an entry on another endpoint leaves the job's `ca_cert` behind while `verify_ssl` stays on, and another when an entry on the job's endpoint replaces the CA under the inherited job credentials. The warning we log when an entry turns off TLS verification now says whether the inherited job credentials or the entry's own credentials cross the unverified connection, through a `credential_group` attribute that reads `inherited` or `entry`.
+
+- `create_vm` and `create_stemcell` now check pool access at the start of each request, against the cluster that request targets, instead of once when the CPI process starts. A missing `Pool.Audit` grant fails that request with the same message and a non-retriable error. The `iso_storage_follow_vm_storage` lookup now runs the first time a request needs the ISO pool, and a failed lookup is retried on the next call instead of being remembered. A single-cluster deployment with a missing grant now fails on its first `create_vm` or `create_stemcell` and no longer on every call. A pre-uploaded light stemcell (`image_id`) skips the pool check, since it never touches a pool.
+
+- `delete_stemcell` now keeps a `:heavy:` qcow2 on shared storage when the request came through a `cpi_config` entry, and it still destroys the cache template. Two clusters can mount one export, and the CPI cannot count references across clusters, so the file stays until an operator removes it. Every multi-cluster heavy delete from shared storage therefore leaks the file, including the normal case where the Director deletes every entry's row in one task. `pve-cid stemcells --orphans` reports the file, and we remove it with `pvesm free`. Every `cpi_config` entry, including the one for the job's cluster, must set `pve.host` for this guard to see it. Single-cluster installs, and storage that isn't known to be shared, delete the file exactly as before.
+
+- When the storage placement plan cannot read a node's network interfaces, the CPI now logs a warning that names the node and the error before it leaves that node ineligible. Placement outcomes are the same as before.
+
+- `create_vm` now logs a warning when its cloud properties carry a top-level `node` key, which `create_vm` has always ignored. The warning fires once per call, so a deployment that followed the old docs sees it once per VM. It names `target_node` and `availability_zone` as the supported ways to place a VM.
+
+- Every VM handler now parses the VM CID once, at the start of the call, with a shared parser. The parser reads a bare VMID, and it also accepts a longer form that carries a cluster and token suffix. PVE calls, journal records, and parker provenance still carry the bare VMID, so behavior and stored state don't change and there is nothing to do on upgrade or downgrade.
+
+- Before you roll back to 0.9.3 or earlier, put `user` back on every entry, and on the job config, that authenticates with only `api_token`, because those releases reject a missing `user` with "user is required". Also check TLS on every entry that sets `ca_cert`, because those releases ignore the key and verify against the job-level CA.
+
+### Added
+
+- A `cpi_config` entry can set its own `ca_cert`, as `pve.ca_cert` or `pve_ca_cert`, to verify its cluster's API certificate. An entry on a different host or port no longer falls back to the job-level CA. A malformed value fails with an error that names the key and never prints the PEM.
+
+### Fixed
+
+- A request for one `cpi_config` entry no longer depends on the job-level cluster. Before, the CPI probed the job cluster's pools and storage before it read the request, so a down job cluster slowed every call, and a revoked job credential failed every call, including `info` and calls for healthy clusters. `info` now touches no PVE API at all.
+
+- The cross-node clone and legacy-disk attach errors now tell operators to pin with `cloud_properties.target_node`, or with an availability zone whose `az_map` entry includes the node, in place of the `cloud_properties.node` key that `create_vm` ignores. The best-practices, persistent-disks, and troubleshooting docs carry the same correction.
+
+- The `notes_audit` hook now writes a new VM's Notes through the PVE client that the `create_vm` request itself used. A VM created on an overridden cluster no longer causes the Notes of an unrelated VM with the same VMID on the job-level cluster to be rewritten.
+
+### Security
+
+- A `cpi_config` entry that points at a different PVE host or port no longer inherits the job-level user, password, API token, or CA certificate, so we never send the job's credentials to another cluster. Before, an entry that set only a new `host` sent the job's token to that cluster, and the client verified it against the job's private CA. An entry must now name its own `api_token`, or its own `user` and `password`, and a request fails non-retriably with an error that names the entry's host and the missing property keys if it does not.
+
 ## [0.9.3] - 2026-10-11
 
 ### Changed

@@ -39,12 +39,12 @@ properties:
 - Dedicated `bosh@pve` user + custom role — never root
 - Every grant documented against the path it acts on
 - Sharp edge: token needs **privilege separation off**
-- Pool access checked at the start of each create — missing grant fails loudly
+- Pool access checked at the start of each create, so a missing grant fails loudly
 
 <!--
 - The role grants exactly what the CPI's operations use: VM management, storage allocation on configured pools, pool membership. Compromise = bounded loss.
 - privsep trap: PVE tokens default to their own empty ACL; stemcell uploads fail confusingly until privsep=0. docs/pve-api-permissions.md has the exact commands in order.
-- The pool check runs at the start of create_vm and create_stemcell and fails that request on 403 — fail-at-the-door, not mid-deploy.
+- The pool check runs at the start of create_vm and create_stemcell and fails that request on 403, so the failure comes at the door and not mid-deploy.
 -->
 
 ---
