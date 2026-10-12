@@ -161,6 +161,16 @@ func resolveTargetNodeWithFallbacks(
 		return "", nil, dcErr
 	}
 
+	// The layered resolver is built before Branch 1 so the AZ order can see AZ
+	// keys that come from a vm_type profile. Its error is held until after
+	// Branch 1, which never needed the resolver, so an operator pin keeps
+	// working exactly as before.
+	var cpResolver *layeredResolver
+	var resolverErr error
+	if deps.Config != nil {
+		cpResolver, resolverErr = newLayeredResolver(cloudPropsMap, deps.Config)
+	}
+
 	// Branch 1: operator pin — no alternates.
 	if cp.TargetNode != "" {
 		if diskConstraints.requiredLocalNode != "" && diskConstraints.requiredLocalNode != cp.TargetNode {
@@ -176,13 +186,8 @@ func resolveTargetNodeWithFallbacks(
 		return cp.TargetNode, nil, nil
 	}
 
-	var cpResolver *layeredResolver
-	if deps.Config != nil {
-		var resolverErr error
-		cpResolver, resolverErr = newLayeredResolver(cloudPropsMap, deps.Config)
-		if resolverErr != nil {
-			return "", nil, resolverErr
-		}
+	if resolverErr != nil {
+		return "", nil, resolverErr
 	}
 
 	// Branch 2: live placement scoring — alternates available.
@@ -309,7 +314,18 @@ func resolveTargetNodeWithFallbacks(
 		// Storage-utilization ceiling gate (same computation as non-fallback path).
 		utilCeilingPctFB, utilAddBytesFB, warnUtilChosenFB := utilizationGateForRequest(deps.Config, cp, storageName, facts, logger)
 
-		allRejections := make(map[string]string)
+		// One record per AZ attempt, so a reason recorded while filtering one AZ
+		// never masks another AZ's own reason.
+		inCluster := make(map[string]struct{}, len(facts))
+		for i := range facts {
+			inCluster[facts[i].Node] = struct{}{}
+		}
+		var azRecords []azRejectionRecord
+		// legacyRejections is the first-wins merge across AZ attempts that
+		// earlier releases classified. It stays the source for the empty
+		// config.node error so the error class at warn matches 0.9.3 exactly;
+		// the per-AZ records drive only the strict error.
+		legacyRejections := make(map[string]string)
 
 		if len(azOrder) == 0 {
 			req := placement.Request{
@@ -321,7 +337,8 @@ func resolveTargetNodeWithFallbacks(
 				PlannedAddBytes:         utilAddBytesFB,
 			}
 			pass, rejections := placement.Filter(facts, req)
-			mergeRejections(allRejections, rejections)
+			azRecords = append(azRecords, newAZRejectionRecord("", nil, rejections, inCluster))
+			mergeRejections(legacyRejections, rejections)
 			logFilterRejections(logger, rejections, "")
 			if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, ""); chosen != "" {
 				warnUtilChosenFB(chosen)
@@ -344,7 +361,8 @@ func resolveTargetNodeWithFallbacks(
 					PlannedAddBytes:         utilAddBytesFB,
 				}
 				pass, rejections := placement.Filter(facts, req)
-				mergeRejections(allRejections, rejections)
+				azRecords = append(azRecords, newAZRejectionRecord(az, candidateSet, rejections, inCluster))
+				mergeRejections(legacyRejections, rejections)
 				logFilterRejections(logger, rejections, az)
 				if chosen, ranked := scoreAndPickWithRanked(pass, weights, logger, az); chosen != "" {
 					warnUtilChosenFB(chosen)
@@ -357,12 +375,23 @@ func resolveTargetNodeWithFallbacks(
 			}
 		}
 
-		// All AZs exhausted — fall back to config.node (no alternates).
+		// All AZs exhausted — fall back to config.node (no alternates). When
+		// the request named real AZs, the fallback is an AZ violation: strict
+		// fails, warn logs the per-AZ detail and falls back as before. A request
+		// with no AZ, or only the DLB sentinel, has no AZ to violate.
 		fallback := deps.Config.Node
-		logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
-			log.String("fallback", fallback),
-		)
+		if len(azOrder) > 0 && !onlyDLBSentinel(azOrder, deps.Config) {
+			if vErr := azViolation(deps.Config, logger, azExhaustionViolation(azRecords, fallback)); vErr != nil {
+				return "", nil, vErr
+			}
+		} else {
+			logger.Warn("create_vm: placement: no viable candidates; falling back to config.node",
+				log.String("fallback", fallback),
+				log.String("rejections", formatRejections(flattenAZRecords(azRecords))),
+			)
+		}
 		if fallback == "" {
+			allRejections := legacyRejections
 			if classifyFilterResult(allRejections) {
 				return "", nil, cpierrors.Retriable(
 					"create_vm: no viable placement candidates (transient); "+
@@ -392,6 +421,9 @@ func resolveTargetNodeWithFallbacks(
 		return "", nil, cpierrors.Cloud(
 			"create_vm: target node not set in cloud_properties.target_node or config.node",
 		)
+	}
+	if !deps.Config.PlacementEnabled() {
+		warnAZIgnoredPlacementDisabled(deps.Config, logger, buildAZOrder(cp, deps.Config, rng, cpResolver), node)
 	}
 	logger.Debug("create_vm: node selection: placement disabled, using config.node",
 		log.String("node", node),

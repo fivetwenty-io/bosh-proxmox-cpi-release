@@ -1509,6 +1509,14 @@ type PlacementConfig struct {
 	// failure. Use PinAZStrict().
 	PinAZStrict *bool `json:"pin_az_strict,omitempty"`
 
+	// AZEnforcement selects what create_vm does when no node in the requested
+	// availability zone can host the VM. "warn" (the compiled default, also
+	// the meaning of an empty value) logs a Warn naming the AZ and each node's
+	// rejection reason and falls back to config.node, which is the 0.9.3
+	// behavior. "strict" fails the create with an error naming the same
+	// detail. Validated only when set; use AZEnforcementStrict().
+	AZEnforcement string `json:"az_enforcement,omitempty"`
+
 	// FallbackMax controls post-selection fallback placement. When a clone or VM
 	// start fails transiently after node selection, the CPI cleans up the failed
 	// attempt and retries on the next-ranked candidate from the same scored set,
@@ -2830,6 +2838,27 @@ func (c *CPIConfig) PinAZStrict() bool {
 		return true
 	}
 	return *c.Placement.PinAZStrict
+}
+
+// azEnforcementDefault is the compiled default for placement.az_enforcement.
+// It is a constant so that flipping the default is a one-line change.
+const azEnforcementDefault = azEnforcementWarn
+
+const (
+	azEnforcementWarn   = "warn"
+	azEnforcementStrict = "strict"
+)
+
+// AZEnforcementStrict reports whether an exhausted availability zone fails
+// create_vm instead of falling back to config.node. True only when the
+// effective value is "strict"; an unset or empty value takes the compiled
+// default, which is "warn".
+func (c *CPIConfig) AZEnforcementStrict() bool {
+	mode := azEnforcementDefault
+	if c != nil && c.Placement != nil && c.Placement.AZEnforcement != "" {
+		mode = strings.ToLower(strings.TrimSpace(c.Placement.AZEnforcement))
+	}
+	return mode == azEnforcementStrict
 }
 
 // PlacementFallbackMaxValue returns the maximum number of alternate nodes to
@@ -4925,6 +4954,18 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 	c.validateDLB(errs)
 	// Node-affinity HA pin: cross-field rules.
 	c.validateHANodeAffinityPin(errs)
+	// AZEnforcement: validated only when set.
+	if c.Placement.AZEnforcement != "" {
+		switch strings.ToLower(strings.TrimSpace(c.Placement.AZEnforcement)) {
+		case azEnforcementWarn, azEnforcementStrict:
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.az_enforcement must be one of warn|strict (or unset for default %s), got %q",
+				azEnforcementDefault, c.Placement.AZEnforcement,
+			))
+		}
+	}
 	// FallbackMax: must be in [0, 5].
 	const placementFallbackMaxCap = 5
 	if c.Placement.FallbackMax != nil {

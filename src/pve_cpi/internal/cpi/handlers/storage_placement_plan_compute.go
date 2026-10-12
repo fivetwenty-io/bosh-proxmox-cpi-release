@@ -42,6 +42,7 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 	pin := cp.TargetNode
 	if pin == "" && !cfg.PlacementEnabled() {
 		pin = cfg.Node
+		warnAZIgnoredPlacementDisabled(cfg, deps.Log(ctx), azs, pin)
 	}
 	if constraints.requiredLocalNode != "" {
 		if pin != "" && pin != constraints.requiredLocalNode {

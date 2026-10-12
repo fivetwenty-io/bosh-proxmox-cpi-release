@@ -209,6 +209,26 @@ create_vm: target node not set in cloud_properties.target_node or config.node
 
 Set `pve.node` in the CPI config (the common case) or set `target_node` in `cloud_properties` for per-VM overrides. See [Configuration](configuration.md).
 
+### No node in the availability zone can host the VM
+
+**Symptom**
+
+With `az_enforcement: strict`, `create_vm` fails with an error such as the following.
+
+```text
+create_vm: no node in availability_zone "z1" (pve1, pve2) can host the VM (pve1: node offline; pve2: storage utilization ceiling exceeded). Free capacity in the availability zone, or set az_enforcement to warn in this placement block to allow placement on pve.node
+```
+
+With the default `warn`, the same detail appears in a Warn log line that reads `no viable candidates in the requested availability zones; falling back to config.node`, and the VM lands on `pve.node`, which may be outside the AZ.
+
+**Cause**
+
+Every node that `az_map` lists for the AZ was rejected. The reason after each node says why, for example `node offline`, `node in maintenance`, `insufficient free memory`, or `storage utilization ceiling exceeded`. A node reported as `node not found in the cluster` is usually a typo in `az_map`, and that error is not retriable.
+
+**Fix**
+
+Bring the listed nodes back, free capacity, or correct the `az_map` entry. A strict failure caused by transient reasons is retriable, so the Director retries it. If the AZ has only one node and that node is in maintenance, map the AZ to a second node or keep `az_enforcement` at `warn`. The key lives in the placement block, so a cpi-config entry that carries its own `pve_placement` block needs its own copy. See [Configuration](configuration.md).
+
 ### VMID range exhausted
 
 **Symptom**

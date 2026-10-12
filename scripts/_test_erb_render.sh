@@ -280,6 +280,24 @@ for key in storage_sets storage_capacity_domains ephemeral_storage_set \
   assert_json_lacks_key "legacy-placement" "$JSON_1" "$key" || FAILED=$((FAILED+1))
 done
 
+# placement.az_enforcement has no spec default: it renders only when the
+# operator sets it, and an unset config carries no placement block at all.
+echo "Case 6: placement.az_enforcement"
+props_with_az_enforcement() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+    h = eval(STDIN.read)
+    h["pve"]["placement"] = { "az_enforcement" => ARGV[0] }
+    print h.inspect
+  ' "$1"
+}
+JSON_6="$(render "$(props_with_az_enforcement strict)")"
+assert_json_valid "case6" "$JSON_6" || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_6" | ruby -rjson -e 'print JSON.parse(STDIN.read).fetch("placement", {}).fetch("az_enforcement", "<absent>")')" != "strict" ]; then
+  echo "FAIL [case6]: placement.az_enforcement did not render as strict" >&2
+  FAILED=$((FAILED+1))
+fi
+assert_json_lacks_key "case6-unset" "$JSON_1" placement || FAILED=$((FAILED+1))
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

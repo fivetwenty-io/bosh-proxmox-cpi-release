@@ -400,6 +400,12 @@
     end
   end
 
+  # placement.az_enforcement: emit only when the operator sets it. The spec has
+  # no default, so an unrelated config renders byte-identical and the compiled
+  # default in the Go accessor can change without a template edit.
+  az_enforcement = p("pve.placement.az_enforcement", "")
+  placement["az_enforcement"] = az_enforcement unless az_enforcement.to_s.empty?
+
   # placement.fallback_max: emit only when > 0. Zero (default) means the fallback
   # path is disabled — omitting the key preserves the Go nil *int -> 0 -> OFF
   # behavior, byte-identical to prior releases.

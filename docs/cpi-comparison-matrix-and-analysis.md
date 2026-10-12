@@ -913,8 +913,9 @@ model is structurally the OpenStack one but operates over node names, and it avo
 OpenStack's `ignore_server_availability_zone` caveat because §7.3 already pins disk-bearing
 VMs to a fault domain rather than trusting the shuffle to preserve disk-AZ coherence.
 **Limits.** The legacy singular form yields no AZ fallback (only the ultimate `config.node`
-fallback); the `config.node` fallback is silent (debug log) and steps outside the AZ
-topology; the transient-vs-permanent decision on an exhausted run is the §7.23 heuristic.
+fallback); the `config.node` fallback logs a Warn that names each AZ and its per-node
+rejection reasons, and still steps outside the AZ topology unless `placement.az_enforcement`
+is `strict`, which fails the create; the transient-vs-permanent decision on an exhausted run is the §7.23 heuristic.
 
 #### 7.11 SHIPPED — Retryability-flag boundary audit across all 22 handlers
 

@@ -1237,6 +1237,22 @@ properties:
       strict pin targets a single-node AZ, naming the AZ and node, so this
       condition is visible rather than silent.
     default: true
+  pve.placement.az_enforcement:
+    description: |
+      What create_vm does when no node in the requested availability zone can
+      host the VM (every node is offline, in maintenance, over the storage
+      utilization ceiling, or missing from the cluster). "warn" logs a Warn that
+      names the AZ and each node's rejection reason and then places the VM on
+      pve.node, as earlier releases did. "strict" fails the create with an error
+      that names the same detail. When unset, the CPI uses its compiled default,
+      which is "warn" in this release. Each cpi-config entry that carries its own
+      pve_placement block needs its own copy of this key, because the block is
+      replaced as a whole. Remove the key from every cpi-config entry before
+      rolling the CPI back to 0.9.3, whose entry decoder rejects it.
+
+      Under "strict", a one-node AZ in maintenance blocks every recreate in that
+      AZ, which is when the resurrector runs. Map each AZ to at least two nodes
+      before enabling it. No spec default: the key is emitted only when set.
   pve.placement.fallback_max:
     description: |
       Maximum number of alternate candidate nodes to try after a transient clone or
