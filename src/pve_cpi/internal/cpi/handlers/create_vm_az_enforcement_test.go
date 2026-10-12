@@ -348,7 +348,7 @@ func TestResolveTargetNodeWithRNG_OneNodeAZInMaintenanceTag_StrictRetriableWarnF
 	}
 }
 
-func observeWithPlacementDisabled(t *testing.T, cp createVMCloudProps) (nodes []string, planErr error, logs string) {
+func observeWithPlacementDisabled(t *testing.T, cp createVMCloudProps) (nodes []string, logs string, planErr error) {
 	t.Helper()
 	off := false
 	deps, buf := azEnforcementDeps(t, []map[string]any{onlineNode("pve1"), onlineNode("pve9")}, func(c *config.CPIConfig) {
@@ -362,12 +362,12 @@ func observeWithPlacementDisabled(t *testing.T, cp createVMCloudProps) (nodes []
 	for _, g := range groups {
 		nodes = append(nodes, g.Nodes...)
 	}
-	return nodes, err, buf.String()
+	return nodes, buf.String(), err
 }
 
 func TestObserveStoragePlanCompute_PlacementDisabled_WarnsAndPinsConfigNode(t *testing.T) {
 	t.Parallel()
-	nodes, err, logs := observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "z1"})
+	nodes, logs, err := observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "z1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -381,11 +381,11 @@ func TestObserveStoragePlanCompute_PlacementDisabled_WarnsAndPinsConfigNode(t *t
 
 func TestObserveStoragePlanCompute_PlacementDisabled_NoWarnWithoutMappedAZOrWithTargetNode(t *testing.T) {
 	t.Parallel()
-	_, _, logs := observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "unmapped"})
+	_, logs, _ := observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "unmapped"})
 	if strings.Contains(logs, "availability zone is ignored") {
 		t.Errorf("an AZ absent from az_map must not warn:\n%s", logs)
 	}
-	_, _, logs = observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "z1", TargetNode: "pve1"})
+	_, logs, _ = observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "z1", TargetNode: "pve1"})
 	if strings.Contains(logs, "availability zone is ignored") {
 		t.Errorf("an operator target_node pin must not warn:\n%s", logs)
 	}
