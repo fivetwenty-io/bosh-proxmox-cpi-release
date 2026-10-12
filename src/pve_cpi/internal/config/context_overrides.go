@@ -36,6 +36,17 @@ const contextOverridePrefix = "pve_"
 // create_vm on a non-job-level entry hard-fail against the job-level (empty)
 // az_map. See coerceOverridePlacement for the whole-block replace semantics.
 //
+// The SDN settings, the VM and template pools, the stemcell strategy and
+// template node, the two ISO layout flags, destroy_unreferenced_disks, and
+// the vm_types and disk_types profile maps are in scope because each one
+// names or depends on something that lives on one cluster: an SDN zone, its
+// VXLAN peers and VNI band, a pool a cluster-scoped token is granted, a node
+// name, or that cluster's storage layout. destroy_unreferenced_disks is reset
+// to false on an endpoint change unless the entry names it, and an entry that
+// changes the endpoint under auto-managed SDN must name the job's SDN
+// settings rather than inherit them (see resetEndpointScopedPolicy and
+// validateSDNContext).
+//
 // Every other pve.* config knob (hooks, otel, disk-performance policy, retry
 // curves, etc.) is process-wide operating policy rather than a property of
 // which cluster a request targets, and is deliberately NOT in this list — it
@@ -83,6 +94,23 @@ var contextOverrideFieldOrder = []string{
 	"pve_storage_status_max_age_seconds",
 	"pve_parker_prefix",
 	"pve_parker_pool",
+	"pve_network_mode",
+	"pve_sdn_zone",
+	"pve_sdn_zone_type",
+	"pve_sdn_auto_manage_zone",
+	"pve_sdn_vxlan_peers",
+	"pve_sdn_vni_range_start",
+	"pve_sdn_vni_range_end",
+	"pve_sdn_zone_mtu",
+	"pve_vm_pool",
+	"pve_stemcell_template_pool",
+	"pve_stemcell_strategy",
+	"pve_stemcell_template_node",
+	"pve_require_shared_iso_for_ha",
+	"pve_iso_storage_follow_vm_storage",
+	"pve_destroy_unreferenced_disks",
+	"pve_vm_types",
+	"pve_disk_types",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -394,9 +422,7 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 	},
 	// Parker VM names are cluster-facing identity rather than process
 	// policy, the same justification pve_vm_prefix carries above and the
-	// reason the parker VMID band is already overridable too. pve.vm_pool
-	// and pve.vm_pool_template stay job-level on purpose, so this is not an
-	// inconsistency.
+	// reason the parker VMID band is already overridable too.
 	"pve_parker_prefix": func(c *CPIConfig, v any) error {
 		s, err := coerceOverrideString(v)
 		if err != nil {
@@ -407,8 +433,8 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 	},
 	// The parker pool name is cluster-facing identity for the same reason
 	// the parker prefix above is, since it also names something on the
-	// target cluster. pve.vm_pool and pve.vm_pool_template still stay
-	// job-level on purpose.
+	// target cluster. pve.vm_pool_template stays job-level on purpose,
+	// because it is a naming pattern and pools are created on demand.
 	"pve_parker_pool": func(c *CPIConfig, v any) error {
 		s, err := coerceOverrideString(v)
 		if err != nil {
@@ -456,6 +482,176 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.AgentMBus = s
+		return nil
+	},
+	// SDN zones, their VXLAN peers, and their VNI bands are per cluster by
+	// nature, and with sdn_auto_manage_zone on, create_network writes them
+	// onto whichever cluster the request reaches. Enum and range checks are
+	// delegated to the eff.Validate() call at the end of
+	// ApplyContextOverrides, matching every other value-constrained key here.
+	"pve_network_mode": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.NetworkMode = s
+		return nil
+	},
+	"pve_sdn_zone": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.SDNZone = s
+		return nil
+	},
+	"pve_sdn_zone_type": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.SDNZoneType = s
+		return nil
+	},
+	"pve_sdn_auto_manage_zone": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		// A fresh pointer, never a write through base's, for the reason the
+		// pve_verify_ssl entry gives.
+		c.SDNAutoManageZone = &b
+		return nil
+	},
+	"pve_sdn_vxlan_peers": func(c *CPIConfig, v any) error {
+		peers, err := coerceOverrideStringList(v)
+		if err != nil {
+			return err
+		}
+		// Each peer must parse as an IP, which eff.Validate() checks. An
+		// empty list or null derives the peers from the target cluster's own
+		// membership, the same as an unset job-level list.
+		c.SDNVxlanPeers = peers
+		return nil
+	},
+	"pve_sdn_vni_range_start": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.SDNVNIRangeStart = n
+		return nil
+	},
+	"pve_sdn_vni_range_end": func(c *CPIConfig, v any) error {
+		n, err := coerceOverrideInt(v)
+		if err != nil {
+			return err
+		}
+		c.SDNVNIRangeEnd = n
+		return nil
+	},
+	"pve_sdn_zone_mtu": func(c *CPIConfig, v any) error {
+		mtu, err := coerceOverrideOptionalInt64(v)
+		if err != nil {
+			return err
+		}
+		// A fresh pointer or nil. Null and 0 both mean unset, which lets PVE
+		// derive the MTU from that cluster's underlay, because the job spec
+		// renders 0 as an absent key.
+		c.SDNZoneMTU = mtu
+		return nil
+	},
+	// A token scoped to one cluster's pool needs that cluster's pool name.
+	// An explicit empty string opts the entry out of pool assignment, the
+	// same as it does at job level. Charset and collision rules are
+	// delegated to eff.Validate().
+	"pve_vm_pool": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.VMPool = s
+		return nil
+	},
+	"pve_stemcell_template_pool": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellTemplatePool = s
+		return nil
+	},
+	// A standalone host, or a cluster without shared template storage, may
+	// need import while the job cluster clones templates. Enum validation is
+	// delegated to eff.Validate().
+	"pve_stemcell_strategy": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellStrategy = s
+		return nil
+	},
+	// It names a node, and node names differ per cluster.
+	"pve_stemcell_template_node": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.StemcellTemplateNode = s
+		return nil
+	},
+	// Both ISO flags describe the target cluster's storage layout, and a
+	// standalone host has no HA at all. Each gets a fresh pointer, so an
+	// entry that names the key states an explicit choice for its cluster.
+	"pve_require_shared_iso_for_ha": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		c.RequireSharedISOForHA = &b
+		return nil
+	},
+	"pve_iso_storage_follow_vm_storage": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		c.ISOStorageFollowVMStorage = &b
+		return nil
+	},
+	// The flag frees every unreferenced same-VMID volume on the storage a VM
+	// used, so its safety depends on whether that cluster shares storage
+	// with another one. An entry on another endpoint that does not name it
+	// gets false rather than the job's value (see resetEndpointScopedPolicy).
+	"pve_destroy_unreferenced_disks": func(c *CPIConfig, v any) error {
+		b, err := coerceOverrideBool(v)
+		if err != nil {
+			return err
+		}
+		c.DestroyUnreferencedDisks = b
+		return nil
+	},
+	// Profiles can name storages and nodes, and profile values sit below
+	// per-call cloud_properties, so an AZ could never clear a stale profile
+	// key through its own cloud_properties. Each map is therefore replaced
+	// whole, like placement (see coerceOverrideTypeProfiles).
+	"pve_vm_types": func(c *CPIConfig, v any) error {
+		profiles, ignored, err := coerceOverrideTypeProfiles(v)
+		if err != nil {
+			return err
+		}
+		c.VMTypes = profiles
+		c.recordIgnoredProfileFields("vm_types", ignored)
+		return nil
+	},
+	"pve_disk_types": func(c *CPIConfig, v any) error {
+		profiles, ignored, err := coerceOverrideTypeProfiles(v)
+		if err != nil {
+			return err
+		}
+		c.DiskTypes = profiles
+		c.recordIgnoredProfileFields("disk_types", ignored)
 		return nil
 	},
 }
@@ -800,10 +996,11 @@ func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) erro
 //     named in contextOverrideFieldOrder — including every pointer, slice,
 //     and map field other than storage-placement policy — is shared with base by the
 //     shallow copy: an overridden request inherits ALL other job-level
-//     policy (hooks, otel, retry curves, ...) unconditionally. VerifySSL and
-//     Placement are the pointer fields this function may itself write, and
-//     both always allocate a fresh value rather than writing through base's
-//     pointer (see the pve_verify_ssl and pve_placement entries in
+//     policy (hooks, otel, retry curves, ...) unconditionally. Every pointer,
+//     slice, and map field this function may itself write (VerifySSL,
+//     Placement, the SDN and ISO flags, the VXLAN peer list, the zone MTU,
+//     and the vm_types and disk_types maps) always gets a freshly allocated
+//     value rather than a write through base's (see their entries in
 //     contextOverrideFields), so base is never mutated by this call.
 //   - applied: the sorted list of context keys that were recognized AND
 //     successfully applied. Empty (nil) exactly when effective == base.
@@ -897,6 +1094,8 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 		if credErr := resolveOverrideCredentials(base, &eff, extra); credErr != nil {
 			return nil, nil, nil, credErr
 		}
+		resetEndpointScopedPolicy(base, &eff, extra)
+		reapplySDNVNIRangeDefaults(base, &eff, extra)
 	}
 
 	var unknownKeys []string
@@ -932,6 +1131,9 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 	eff.reevaluateParkedDefaultAfterOverrides()
 
 	if err := validateStoragePlacementContext(base, &eff, extra); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := validateSDNContext(base, &eff, extra); err != nil {
 		return nil, nil, nil, err
 	}
 

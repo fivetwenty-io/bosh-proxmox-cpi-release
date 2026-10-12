@@ -82,6 +82,13 @@ type Deps struct {
 	// with no overrides, which is the only shape a single-cluster install
 	// sees. delete_stemcell reads it to keep a heavy qcow2 on shared storage.
 	RequestOverridden bool
+	// InheritedSDNSettings lists, as "pve_"-prefixed override keys, the
+	// job-level SDN settings this request's cpi-config entry inherited
+	// without naming them while it targets another PVE endpoint (see
+	// config.InheritedSDNSettings). create_network refuses to auto-create a
+	// zone on that cluster from any of them that the zone would use. It is
+	// nil on the job endpoint and for every request with no overrides.
+	InheritedSDNSettings []string
 	// ReplicaInventory feeds the storage-set replica fan-out's discovery.
 	// Nil (production and every existing test literal) means
 	// inv.PVESource{Client: PVE}; tests that drive the fan-out set a

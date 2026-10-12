@@ -823,6 +823,13 @@ type CPIConfig struct {
 	// makes. Empty means no collision was detected.
 	parkedDefaultBandCollision string
 
+	// ignoredProfileFields lists the profile fields other than
+	// cloud_properties that a per-entry pve_vm_types or pve_disk_types
+	// override carried and ApplyContextOverrides ignored. Same
+	// unexported/untagged treatment as parkedDefaultBandCollision; it is only
+	// ever set on an effective config. See IgnoredProfileFields.
+	ignoredProfileFields []string
+
 	// parkerStartDefaulted and parkerEndDefaulted record, per bound, that
 	// ApplyDefaults rather than the operator put the value in the range field.
 	// Same unexported/untagged treatment as parkedDefaultBandCollision.
@@ -2424,7 +2431,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		c.NetworkMode = NetworkModeBridge
 	}
 	if c.SDNZoneType == "" {
-		c.SDNZoneType = "vxlan"
+		c.SDNZoneType = defaultSDNZoneType
 	}
 	if c.StemcellStrategy == "" {
 		// Clone-from-cache is the fast path: the per-cluster cache template is
@@ -2432,23 +2439,7 @@ func (c *CPIConfig) ApplyDefaults() {
 		// clone) instead of a full qcow2 import.
 		c.StemcellStrategy = StemcellStrategyTemplate
 	}
-	// VNI auto-allocation band. Filled unconditionally (unlike the parker band)
-	// because the band is always meaningful once a tagged zone type is in play.
-	// For 802.1Q-capped zone types (vlan, qinq) the default band must sit
-	// inside the 4094 VLAN ID cap — the VXLAN-oriented 5000..5999 default
-	// would make every auto-allocated tag fail at create_network time. An
-	// operator-set band always wins (and is cap-validated in
-	// validateSDNFields).
-	if c.SDNVNIRangeStart == 0 && c.SDNVNIRangeEnd == 0 && sdnZoneTypeIsVLANCapped(c.SDNZoneType) {
-		c.SDNVNIRangeStart = 2000
-		c.SDNVNIRangeEnd = 2999
-	}
-	if c.SDNVNIRangeStart == 0 {
-		c.SDNVNIRangeStart = 5000
-	}
-	if c.SDNVNIRangeEnd == 0 {
-		c.SDNVNIRangeEnd = 5999
-	}
+	c.applySDNVNIRangeDefaults()
 	c.applyPlacementDefaults()
 	c.applyOTelDefaults()
 	c.applyCredentialPrecedence()
@@ -4608,6 +4599,43 @@ func (c *CPIConfig) validateSDNFields(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"sdn_zone_mtu must be within 576..65520, got %d", *c.SDNZoneMTU,
 		))
+	}
+}
+
+// defaultSDNZoneType is the zone type ApplyDefaults gives an unset
+// pve.sdn_zone_type.
+const defaultSDNZoneType = "vxlan"
+
+// defaultSDNVNIRange returns the VNI auto-allocation band ApplyDefaults gives
+// a config of zoneType that sets neither bound: 2000..2999 for the 802.1Q
+// zone types, whose tags must fit the 4094 VLAN ID cap, and 5000..5999 for
+// every other type.
+func defaultSDNVNIRange(zoneType string) (start, end int) {
+	if sdnZoneTypeIsVLANCapped(zoneType) {
+		return 2000, 2999
+	}
+	return 5000, 5999
+}
+
+// applySDNVNIRangeDefaults fills the VNI auto-allocation band. It fills
+// unconditionally (unlike the parker band) because the band is always
+// meaningful once a tagged zone type is in play. For 802.1Q-capped zone
+// types (vlan, qinq) the default band must sit inside the 4094 VLAN ID cap,
+// because the VXLAN-oriented 5000..5999 default would make every
+// auto-allocated tag fail at create_network time. An operator-set band
+// always wins (and is cap-validated in validateSDNFields), and a band with
+// one bound set fills only the other bound, from the 5000..5999 default.
+func (c *CPIConfig) applySDNVNIRangeDefaults() {
+	if c.SDNVNIRangeStart == 0 && c.SDNVNIRangeEnd == 0 {
+		c.SDNVNIRangeStart, c.SDNVNIRangeEnd = defaultSDNVNIRange(c.SDNZoneType)
+		return
+	}
+	defaultStart, defaultEnd := defaultSDNVNIRange("")
+	if c.SDNVNIRangeStart == 0 {
+		c.SDNVNIRangeStart = defaultStart
+	}
+	if c.SDNVNIRangeEnd == 0 {
+		c.SDNVNIRangeEnd = defaultEnd
 	}
 }
 

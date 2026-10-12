@@ -134,6 +134,30 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 			"az_map":              map[string]any{"z3": []any{"pve-az2-1"}},
 			"pin_az_via_ha_rules": true,
 		},
+		"pve_network_mode":                  config.NetworkModeSDN,
+		"pve_sdn_zone":                      "zone-b",
+		"pve_sdn_zone_type":                 "evpn",
+		"pve_sdn_auto_manage_zone":          false,
+		"pve_sdn_vxlan_peers":               []any{"10.20.0.1", "10.20.0.2"},
+		"pve_sdn_vni_range_start":           float64(5500),
+		"pve_sdn_vni_range_end":             float64(5900),
+		"pve_sdn_zone_mtu":                  float64(1400),
+		"pve_vm_pool":                       "az2-vms",
+		"pve_stemcell_template_pool":        "az2-templates",
+		"pve_stemcell_strategy":             config.StemcellStrategyImport,
+		"pve_stemcell_template_node":        "pve2",
+		"pve_require_shared_iso_for_ha":     true,
+		"pve_iso_storage_follow_vm_storage": false,
+		"pve_destroy_unreferenced_disks":    true,
+		// The profile maps replace the job's whole map, and profiles can
+		// name storages and nodes, so two entries with different profiles
+		// must not share a cached bundle.
+		"pve_vm_types": map[string]any{
+			"small": map[string]any{"cloud_properties": map[string]any{"cpu": float64(2)}},
+		},
+		"pve_disk_types": map[string]any{
+			"fast": map[string]any{"cloud_properties": map[string]any{"vm_storage": "ssd-b"}},
+		},
 	}
 
 	// An explicit stemcell_replicate_storage_set validates against the

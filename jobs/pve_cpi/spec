@@ -116,6 +116,8 @@ properties:
       a storage pool that /storage does not report as shared. Default false:
       the hazard is only logged (see docs/configdrive.md), never blocks
       create_vm.
+
+      Overridable per cpi-config entry as pve_require_shared_iso_for_ha.
     default: false
   pve.iso_storage_follow_vm_storage:
     description: |
@@ -136,6 +138,9 @@ properties:
       (fail-open). Set explicitly to false to disable and always use
       iso_storage as configured. Leave unset (~) to get
       the default-true behavior; explicit true/false always overrides it.
+
+      Overridable per cpi-config entry as
+      pve_iso_storage_follow_vm_storage.
     default: ~
   pve.network_bridge:
     description: |
@@ -172,6 +177,8 @@ properties:
                auto-to-bridge fallback without naming a zone can also give
                each bridge network an explicit cloud_properties.bridge and
                keep the default mode.
+
+      Overridable per cpi-config entry as pve_network_mode.
     default: "bridge"
   pve.sdn_zone:
     description: |
@@ -179,6 +186,11 @@ properties:
       cloud_properties.zone is absent. When empty with auto-manage enabled,
       the CPI uses the turnkey zone "bosh"; when empty with auto-manage
       disabled, the zone must be supplied per-call in cloud_properties.
+
+      Overridable per cpi-config entry as pve_sdn_zone. An entry that
+      targets another PVE endpoint must set this itself when it differs
+      from the default and auto-managed SDN is in use there; see
+      docs/networks.md.
     default: ""
   pve.sdn_zone_type:
     description: |
@@ -199,6 +211,11 @@ properties:
       "evpn" is never CPI-created: pre-create the zone and its BGP
       controller in PVE, and the CPI manages only vnets and subnets
       inside it.
+
+      Overridable per cpi-config entry as pve_sdn_zone_type. An entry
+      that targets another PVE endpoint must set this itself when it
+      differs from the default and auto-managed SDN is in use there; see
+      docs/networks.md.
     default: "vxlan"
   pve.sdn_auto_manage_zone:
     description: |
@@ -211,6 +228,8 @@ properties:
       fabric, never CPI-deleted), and (4) the zone has zero remaining
       vnets after the vnet delete. Set false to keep zones operator-owned;
       the CPI then manages only vnets and subnets.
+
+      Overridable per cpi-config entry as pve_sdn_auto_manage_zone.
     default: true
   pve.sdn_vxlan_peers:
     description: |
@@ -219,6 +238,11 @@ properties:
       cluster nodes (/cluster/status). Set it when tunnel traffic must
       ride a dedicated underlay network whose addresses differ from the
       management IPs.
+
+      Overridable per cpi-config entry as pve_sdn_vxlan_peers. An entry
+      that targets another PVE endpoint must set this itself when it
+      differs from the default and auto-managed SDN is in use there; see
+      docs/networks.md.
     default: []
   pve.sdn_vni_range_start:
     description: |
@@ -228,11 +252,21 @@ properties:
       sdn_zone_type is vlan or qinq (the band must fit the 4094 VLAN ID
       cap; an explicit band beyond it fails validation). Per-network
       override via cloud_properties.vnet_tag.
+
+      Overridable per cpi-config entry as pve_sdn_vni_range_start. An
+      entry that targets another PVE endpoint must set this itself when
+      it differs from the default and auto-managed SDN is in use there;
+      see docs/networks.md.
     default: 0
   pve.sdn_vni_range_end:
     description: |
       End of the tag auto-allocation band. 0 uses the default band
       (5000-5999, or 2000-2999 for vlan/qinq zone types).
+
+      Overridable per cpi-config entry as pve_sdn_vni_range_end. An
+      entry that targets another PVE endpoint must set this itself when
+      it differs from the default and auto-managed SDN is in use there;
+      see docs/networks.md.
     default: 0
   pve.sdn_zone_mtu:
     description: |
@@ -240,6 +274,11 @@ properties:
       lets PVE derive the vnet MTU from the underlay (e.g. 1450 on a 1500
       underlay for vxlan). Set for unusual underlays (e.g. 8950 on a
       9000-MTU jumbo underlay).
+
+      Overridable per cpi-config entry as pve_sdn_zone_mtu. An entry
+      that targets another PVE endpoint must set this itself when it
+      differs from the default and auto-managed SDN is in use there; see
+      docs/networks.md.
     default: 0
   pve.verify_ssl:
     description: "Verify TLS certificate"
@@ -419,6 +458,8 @@ properties:
       (reserved for the cluster-lock sentinel pool namespace, see
       pve.cluster_lock_mode) and must be a flat PVE poolid (no "/"); the CPI
       never creates nested pools.
+
+      Overridable per cpi-config entry as pve_stemcell_template_pool.
     default: "bosh-templates"
   pve.vm_pool:
     description: |
@@ -457,6 +498,8 @@ properties:
       "bosh-lock-" (reserved for the cluster-lock sentinel pool namespace,
       see pve.cluster_lock_mode) — both are rejected at config load. Must be
       a flat PVE poolid (no "/"); the CPI never creates nested pools.
+
+      Overridable per cpi-config entry as pve_vm_pool.
     default: "bosh"
   pve.vm_pool_template:
     description: |
@@ -528,6 +571,12 @@ properties:
       disjoint per-CPI VMID banding instead -- orphaned own-cluster volumes
       then accumulate and are visible to scripts/disk-audit rather than
       being swept automatically.
+
+      Overridable per cpi-config entry as
+      pve_destroy_unreferenced_disks. An entry that targets another PVE
+      endpoint runs with this off unless it sets
+      pve_destroy_unreferenced_disks itself, because the job value
+      describes the job cluster's storage.
     default: false
   pve.stemcell_template_node:
     description: |
@@ -538,6 +587,8 @@ properties:
       lvm), this must equal the node where stemcell_storage is mounted; pointing
       to a different node causes create_stemcell to fail because the uploaded
       qcow2 is not visible from the other node.
+
+      Overridable per cpi-config entry as pve_stemcell_template_node.
     default: ""
   pve.clone_mode:
     description: |
@@ -1350,6 +1401,8 @@ properties:
                (full copy per VM; slower, but independent of the template
                cache — useful when clones must not share a base volume).
       Per-VM override: vm_type/resource_pool cloud_properties.stemcell_strategy.
+
+      Overridable per cpi-config entry as pve_stemcell_strategy.
     default: "template"
   pve.stemcell_replicate_local:
     description: |
@@ -1972,6 +2025,12 @@ properties:
       to lowest): per-call cloud_properties, disk_type profile, vm_type profile,
       global config. When unset (default {}), no profiles are defined and no
       behavior change occurs.
+
+      Overridable per cpi-config entry as pve_vm_types. An entry's map
+      replaces the whole job map. Profile fields other than
+      cloud_properties are ignored with a warning that names the field
+      and the profile, and a cloud_properties value that is not a map
+      fails the request.
     default: {}
 
   pve.disk_types:
@@ -1983,6 +2042,12 @@ properties:
       to the profile name at deploy time. Disk-type profiles take precedence over
       vm_type profiles when both define the same attribute. When unset
       (default {}), no profiles are defined and no behavior change occurs.
+
+      Overridable per cpi-config entry as pve_disk_types. An entry's map
+      replaces the whole job map. Profile fields other than
+      cloud_properties are ignored with a warning that names the field
+      and the profile, and a cloud_properties value that is not a map
+      fails the request.
     default: {}
 
   pve.storage_tiers:

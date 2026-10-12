@@ -456,6 +456,38 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
 		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))
 	}
+	// The per-cluster SDN, pool, stemcell, ISO, delete, and profile settings
+	// are folded in as one canonical JSON object. Every field is omitempty
+	// and pointers keep an explicit false apart from unset, so a config that
+	// sets none of them adds nothing and keys exactly as it did before they
+	// became overridable, the same way an empty CA adds nothing above.
+	clusterPolicy := struct {
+		NetworkMode               string                        `json:"network_mode,omitempty"`
+		SDNZone                   string                        `json:"sdn_zone,omitempty"`
+		SDNZoneType               string                        `json:"sdn_zone_type,omitempty"`
+		SDNAutoManageZone         *bool                         `json:"sdn_auto_manage_zone,omitempty"`
+		SDNVxlanPeers             []string                      `json:"sdn_vxlan_peers,omitempty"`
+		SDNVNIRangeStart          int                           `json:"sdn_vni_range_start,omitempty"`
+		SDNVNIRangeEnd            int                           `json:"sdn_vni_range_end,omitempty"`
+		SDNZoneMTU                *int64                        `json:"sdn_zone_mtu,omitempty"`
+		VMPool                    string                        `json:"vm_pool,omitempty"`
+		StemcellTemplatePool      string                        `json:"stemcell_template_pool,omitempty"`
+		StemcellStrategy          string                        `json:"stemcell_strategy,omitempty"`
+		StemcellTemplateNode      string                        `json:"stemcell_template_node,omitempty"`
+		RequireSharedISOForHA     *bool                         `json:"require_shared_iso_for_ha,omitempty"`
+		ISOStorageFollowVMStorage *bool                         `json:"iso_storage_follow_vm_storage,omitempty"`
+		DestroyUnreferencedDisks  bool                          `json:"destroy_unreferenced_disks,omitempty"`
+		VMTypes                   map[string]config.TypeProfile `json:"vm_types,omitempty"`
+		DiskTypes                 map[string]config.TypeProfile `json:"disk_types,omitempty"`
+	}{cfg.NetworkMode, cfg.SDNZone, cfg.SDNZoneType, cfg.SDNAutoManageZone, cfg.SDNVxlanPeers,
+		cfg.SDNVNIRangeStart, cfg.SDNVNIRangeEnd, cfg.SDNZoneMTU, cfg.VMPool, cfg.StemcellTemplatePool,
+		cfg.StemcellStrategy, cfg.StemcellTemplateNode, cfg.RequireSharedISOForHA, cfg.ISOStorageFollowVMStorage,
+		cfg.DestroyUnreferencedDisks, cfg.VMTypes, cfg.DiskTypes}
+	if clusterJSON, err := json.Marshal(clusterPolicy); err != nil {
+		_, _ = fmt.Fprintf(h, "cluster_policy_marshal_error=%s\x00", err.Error())
+	} else if string(clusterJSON) != "{}" {
+		_, _ = fmt.Fprintf(h, "cluster_policy=%s\x00", clusterJSON)
+	}
 	pwHash := sha256.Sum256([]byte(cfg.Password))
 	tokHash := sha256.Sum256([]byte(cfg.APIToken))
 	_, _ = fmt.Fprintf(h, "password_sha=%s\x00api_token_sha=%s",
@@ -636,7 +668,9 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	)
 
 	d.warnOverrideTrust(ctx, effCfg, applied, verifySSLOverrideApplied)
+	d.logOverrideClusterScope(ctx, effCfg, applied)
 
+	d.InheritedSDNSettings = config.InheritedSDNSettings(d.Config, effCfg, applied)
 	d.Config = effCfg
 	d.RequestOverridden = true
 	d.PVE = bundle.client
@@ -706,6 +740,41 @@ func (d Deps) warnOverrideTrust(ctx context.Context, effCfg *config.CPIConfig, a
 				"against the cpi-config entry's CA",
 			log.String("effective_pve_host", effCfg.Host),
 			log.String("credential_group", group),
+		)
+	}
+}
+
+// logOverrideClusterScope reports what an entry on another endpoint carries
+// over from the job config and what it loses, and names any profile fields
+// the entry carried that ApplyContextOverrides ignored. Inheriting a node, storage, or
+// bridge name is legitimate, because matching names across clusters are
+// common, so the names are listed in one warning rather than refused; a name
+// that does not exist on the other cluster then fails with a cause the
+// operator can see. The destroy_unreferenced_disks reset is logged at Info,
+// because it is the intended outcome rather than a hazard. Both lines name
+// properties, the effective host, and non-secret names only.
+func (d Deps) logOverrideClusterScope(ctx context.Context, effCfg *config.CPIConfig, applied []string) {
+	if names := config.InheritedClusterNames(d.Config, effCfg, applied); len(names) > 0 {
+		d.Log(ctx).Warn(
+			"cpi: request context override targets another PVE endpoint but inherits job-level node, storage, bridge, or profile names; "+
+				"each must exist on that cluster, so set it on the cpi-config entry if the name differs there",
+			log.String("effective_pve_host", effCfg.Host),
+			log.Any("inherited_names", names),
+		)
+	}
+	if config.DestroyUnreferencedDisksReset(d.Config, effCfg, applied) {
+		d.Log(ctx).Info(
+			"cpi: destroy_unreferenced_disks is off for this request because the cpi-config entry targets another PVE endpoint "+
+				"and does not set pve.destroy_unreferenced_disks itself",
+			log.String("effective_pve_host", effCfg.Host),
+		)
+	}
+	if ignored := effCfg.IgnoredProfileFields(); len(ignored) > 0 {
+		d.Log(ctx).Warn(
+			"cpi: request context override carries vm_types or disk_types profile fields other than cloud_properties; "+
+				"they are ignored, so move any setting they hold under the profile's cloud_properties",
+			log.String("effective_pve_host", effCfg.Host),
+			log.Any("ignored_profile_fields", ignored),
 		)
 	}
 }

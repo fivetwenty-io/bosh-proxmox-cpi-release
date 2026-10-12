@@ -171,9 +171,15 @@ func createNetwork(ctx context.Context, deps Deps, args []json.RawMessage) (any,
 }
 
 // sdnZoneArgs carries all parameters needed by resolveOrCreateSDNZone.
+// zoneTypeNamed is true when the network's cloud_properties or a profile
+// supplied zone_type, so config.SDNZoneType did not decide it. explicitTag is
+// cloud_properties.vnet_tag (0 = the vnet auto-allocates from the VNI band).
+// Both decide which inherited SDN settings a zone this call creates would use.
 type sdnZoneArgs struct {
 	zone              string
 	zoneType          string
+	zoneTypeNamed     bool
+	explicitTag       int
 	sdnAutoManageZone bool
 }
 
@@ -212,7 +218,9 @@ type sdnApplyArgs struct {
 // when this call creates the zone the configured type is authoritative. EVPN
 // zones are never auto-created — an EVPN fabric (controller, BGP peers) is
 // operator infrastructure, so an absent EVPN zone fails fast regardless of
-// sdnAutoManageZone.
+// sdnAutoManageZone. An absent zone that would be created from job-level SDN
+// settings a cpi-config entry on another endpoint inherited is refused with a
+// non-retriable error instead; see inheritedZoneCreateSettings.
 func resolveOrCreateSDNZone(
 	ctx context.Context,
 	deps Deps,
@@ -260,6 +268,19 @@ func resolveOrCreateSDNZone(
 			args.zone,
 		)
 	}
+	if inherited := inheritedZoneCreateSettings(deps, args, zoneType); len(inherited) > 0 {
+		specNames := make([]string, len(inherited))
+		for i, key := range inherited {
+			specNames[i] = "pve." + strings.TrimPrefix(key, "pve_")
+		}
+		return "", false, cpierrors.Cloud(
+			"create_network: SDN zone %q is absent on PVE host %q, which this request's cpi-config entry targets "+
+				"instead of the job-level endpoint, and creating it would use job-level SDN settings the entry "+
+				"does not set (%s); set each of them on the cpi-config entry, or create the zone on that cluster "+
+				"and set pve.sdn_auto_manage_zone: false on the entry",
+			args.zone, deps.Config.Host, strings.Join(specNames, ", "),
+		)
+	}
 	params, paramsErr := buildZoneCreateParams(ctx, deps, args.zone, zoneType)
 	if paramsErr != nil {
 		return "", false, paramsErr
@@ -271,6 +292,53 @@ func resolveOrCreateSDNZone(
 		)
 	}
 	return zoneType, true, nil
+}
+
+// inheritedZoneCreateSettings returns the job-level SDN settings, as
+// "pve_"-prefixed keys, that a zone of zoneType created by this call would
+// take from a cpi-config entry that targets another PVE endpoint without
+// naming them. Those settings describe the job cluster's fabric, so creating
+// the zone from them would write that fabric onto the other cluster. The
+// VXLAN peers count only for a vxlan zone, the zone type only when the
+// network did not name its own, and the VNI band only when the vnet will
+// auto-allocate a tag. The MTU always counts. The zone name never does,
+// because the name alone writes nothing about the job cluster. The result is
+// nil for a request that kept the job endpoint or named every setting.
+func inheritedZoneCreateSettings(deps Deps, args sdnZoneArgs, zoneType string) []string {
+	if !deps.RequestOverridden || len(deps.InheritedSDNSettings) == 0 {
+		return nil
+	}
+	var out []string
+	for _, key := range deps.InheritedSDNSettings {
+		use := false
+		switch key {
+		case "pve_sdn_zone_type":
+			use = !args.zoneTypeNamed
+		case "pve_sdn_vxlan_peers":
+			use = zoneType == zoneTypeVxlan
+		case "pve_sdn_zone_mtu":
+			use = true
+		case "pve_sdn_vni_range_start", "pve_sdn_vni_range_end":
+			use = args.explicitTag == 0 && zoneTypeRequiresTag(zoneType)
+		}
+		if use {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// networkNamesZoneType reports whether the network's cloud_properties or a
+// vm_type or disk_type profile supplies zone_type, so config.SDNZoneType does
+// not decide it. A resolver error reports false; the preflight has already
+// surfaced that error by the time this runs.
+func networkNamesZoneType(cfg *config.CPIConfig, cp map[string]any) bool {
+	r, err := newLayeredResolver(cp, cfg)
+	if err != nil {
+		return false
+	}
+	_, ok := r.String("zone_type")
+	return ok
 }
 
 // buildZoneCreateParams assembles the POST /cluster/sdn/zones payload for a
@@ -564,6 +632,8 @@ func createNetworkSDN(
 	effectiveZoneType, createdZone, err := resolveOrCreateSDNZone(ctx, deps, clusterSvc, sdnZoneArgs{
 		zone:              zone,
 		zoneType:          zoneType,
+		zoneTypeNamed:     networkNamesZoneType(cfg, cp),
+		explicitTag:       explicitTag,
 		sdnAutoManageZone: cfg.SDNAutoManageZoneEnabled(),
 	})
 	if err != nil {
