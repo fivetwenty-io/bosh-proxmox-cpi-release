@@ -136,7 +136,7 @@ func TestISOStorageOverrideResolvesOnFirstUseOnly(t *testing.T) {
 			}}
 			deps := handlers.Deps{Config: base, Logger: log.NewNopLogger(), Overrides: runtime}
 
-			effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_host": "cluster-b.example"}})
+			effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "cluster-b.example"}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -209,7 +209,7 @@ func TestISOStorageMemoIsPerCluster(t *testing.T) {
 
 	resolve := func(host string) handlers.Deps {
 		t.Helper()
-		effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_host": host}})
+		effective, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": host}})
 		if err != nil {
 			t.Fatal(err)
 		}

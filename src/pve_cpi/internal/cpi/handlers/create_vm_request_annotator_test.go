@@ -69,7 +69,7 @@ func TestHandleCreateVM_PublishesOverrideAnnotator_NotJobClient(t *testing.T) {
 		Logger:        log.NewNopLogger(),
 	}
 
-	annotateThroughCreateVM(t, deps, jsonrpc.Context{Extra: map[string]any{"pve_host": "az2.example"}}, vmid)
+	annotateThroughCreateVM(t, deps, jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az2.example"}}, vmid)
 
 	if got := overrideWrites.Load(); got != 1 {
 		t.Errorf("override client saw %d description write(s), want 1", got)

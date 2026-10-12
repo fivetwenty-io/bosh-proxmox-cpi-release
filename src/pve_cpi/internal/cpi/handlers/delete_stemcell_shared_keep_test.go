@@ -141,7 +141,7 @@ func TestDeleteStemcell_Heavy_ThroughRealOverride(t *testing.T) {
 		wantOnOverrideKeep   bool // override routed: template destroyed there, file kept
 		wantJobClientDeletes int
 	}{
-		{"pve_host override keeps file", map[string]any{"pve_host": "az1.example"}, true, 0},
+		{"pve_host override keeps file", map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"}, true, 0},
 		{"no context keys deletes file", nil, false, 1},
 		{"non-pve context keys delete file", map[string]any{"unrelated": "x"}, false, 1},
 	}
@@ -193,7 +193,7 @@ func TestWithRequestOverrides_RecordsWhetherAnOverrideApplied(t *testing.T) {
 		extra map[string]any
 		want  bool
 	}{
-		{"pve_host applied", map[string]any{"pve_host": "az1.example"}, true},
+		{"pve_host applied", map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"}, true},
 		{"no extra", nil, false},
 		{"non-pve extra", map[string]any{"unrelated": "x"}, false},
 	}
