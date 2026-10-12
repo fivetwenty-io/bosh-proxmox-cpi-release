@@ -1,10 +1,42 @@
 package handlers
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
+
+// selfSignedCAPEMForCacheKeyTest returns a freshly generated self-signed CA
+// certificate as PEM, so the pve_ca_cert row has a value that validates.
+func selfSignedCAPEMForCacheKeyTest(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "cache-key-test-ca"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
 
 // TestRequestOverrideCacheKey_CoversEveryOverridableField asserts that every
 // field ApplyContextOverrides can change also changes requestOverrideCacheKey.
@@ -63,6 +95,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_storage_placement_namespace":        "other-authority",
 		"pve_require_disjoint_storage_sets":      false,
 		"pve_storage_status_max_age_seconds":     12,
+		"pve_ca_cert":                            selfSignedCAPEMForCacheKeyTest(t),
 		"pve_host":                               "pve-b.example",
 		"pve_port":                               float64(9999), // JSON numbers decode as float64
 		"pve_user":                               "other",
@@ -109,6 +142,20 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 	// stay unbound, because an inherited binding makes ApplyContextOverrides
 	// refuse the pve_host and pve_port rows unless the entry also restates
 	// pve_storage_sets. This field therefore gets a bound base of its own.
+	// Credentials travel with the endpoint as a group, so a row that changes
+	// the endpoint or names one credential key needs the rest of a complete
+	// group beside it. Each companion restates the base's own value, so the
+	// row's field stays the only difference from the base that the cache key
+	// can see (the password row also clears nothing, because the base holds
+	// no token).
+	companions := map[string]map[string]any{
+		"pve_host":      {"pve_user": "cpi", "pve_password": "pw-one"},
+		"pve_port":      {"pve_user": "cpi", "pve_password": "pw-one"},
+		"pve_user":      {"pve_password": "pw-one"},
+		"pve_password":  {"pve_user": "cpi"},
+		"pve_api_token": {"pve_user": "cpi"},
+	}
+
 	boundBase := *base
 	boundBase.EphemeralStorageSet = "set-a"
 	boundBaseKey := requestOverrideCacheKey(&boundBase)
@@ -123,17 +170,43 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		if field == "pve_stemcell_replicate_storage_set" {
 			fieldBase, fieldBaseKey = &boundBase, boundBaseKey
 		}
-		eff, applied, unknown, err := config.ApplyContextOverrides(fieldBase, map[string]any{field: val})
+		extra := map[string]any{field: val}
+		for k, v := range companions[field] {
+			extra[k] = v
+		}
+		eff, applied, unknown, err := config.ApplyContextOverrides(fieldBase, extra)
 		if err != nil {
 			t.Errorf("ApplyContextOverrides(%q): %v", field, err)
 			continue
 		}
-		if len(unknown) != 0 || len(applied) != 1 {
-			t.Errorf("ApplyContextOverrides(%q): applied=%v unknown=%v; want exactly one applied", field, applied, unknown)
+		if len(unknown) != 0 || len(applied) != len(extra) || !slices.Contains(applied, field) {
+			t.Errorf("ApplyContextOverrides(%q): applied=%v unknown=%v; want the field and its companions applied",
+				field, applied, unknown)
 			continue
 		}
 		if key := requestOverrideCacheKey(eff); key == fieldBaseKey {
 			t.Errorf("overriding %q did not change requestOverrideCacheKey — two requests with different effective configs would share one cached bundle", field)
 		}
+	}
+}
+
+// TestRequestOverrideCacheKey_CACertSeparatesSameHost asserts that two
+// entries on one host with different trust roots never share a cached
+// client. TestRequestOverrideCacheKeyIsUnchangedWithoutAntiAffinity pins
+// that a config with no CA still keys exactly as it did before.
+func TestRequestOverrideCacheKey_CACertSeparatesSameHost(t *testing.T) {
+	t.Parallel()
+	a := &config.CPIConfig{Host: "pve-a.example", Port: 8006, User: "cpi", Password: "pw-one"}
+	b := *a
+	b.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
+	c := *a
+	c.PVECACertPEM = selfSignedCAPEMForCacheKeyTest(t)
+	keyA, keyB, keyC := requestOverrideCacheKey(a), requestOverrideCacheKey(&b), requestOverrideCacheKey(&c)
+	if keyA == keyB || keyB == keyC || keyA == keyC {
+		t.Error("configs that differ only in pve_ca_cert must key differently")
+	}
+	same := *a
+	if requestOverrideCacheKey(&same) != keyA {
+		t.Error("the cache key must be deterministic")
 	}
 }

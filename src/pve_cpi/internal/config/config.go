@@ -2283,16 +2283,22 @@ func (c *CPIConfig) SDNAutoManageZoneEnabled() bool {
 	return *c.SDNAutoManageZone
 }
 
+// normalizeAPIToken accepts the Authorization-header form of an API token
+// ("PVEAPIToken=user@realm!tokenid=secret") alongside the bare
+// "user@realm!tokenid=secret" form. PVE surfaces the prefixed form in its own
+// header examples, so operators paste both, and the SDK's ParseAPIToken
+// splits on the first '=' and would otherwise read the prefix as the token
+// ID. The job config (ApplyDefaults) and every cpi-config entry
+// (ApplyContextOverrides) share this one rule, so a value that works at the
+// job level works on an entry too.
+func normalizeAPIToken(s string) string {
+	return strings.TrimPrefix(s, "PVEAPIToken=")
+}
+
 // ApplyDefaults sets zero-value optional fields to their documented defaults.
 // Callers must invoke this before Validate when constructing a CPIConfig manually.
 func (c *CPIConfig) ApplyDefaults() {
-	// Accept the Authorization-header form of an API token
-	// ("PVEAPIToken=user@realm!tokenid=secret") alongside the bare
-	// "user@realm!tokenid=secret" form. PVE surfaces the prefixed form in its
-	// own header examples, so operators paste both; the SDK's ParseAPIToken
-	// splits on the first '=' and would otherwise read the prefix as the
-	// token ID.
-	c.APIToken = strings.TrimPrefix(c.APIToken, "PVEAPIToken=")
+	c.APIToken = normalizeAPIToken(c.APIToken)
 	if c.Port == 0 {
 		c.Port = 8006
 	}
@@ -2437,16 +2443,23 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	c.applyPlacementDefaults()
 	c.applyOTelDefaults()
-	// Authentication precedence: when both password and api_token are present
-	// (e.g. a kit renders a placeholder password alongside a real api_token
-	// because credhub entombment rejects empty values), the api_token wins —
-	// clear the password so downstream code uses tokens.
-	//
-	// This mutation lives in ApplyDefaults rather than Validate because
-	// Validate's contract is read-only: callers may invoke Validate repeatedly
-	// for diagnostics without side effects. Load() runs ApplyDefaults before
-	// Validate, so the merged-credential path is normalized before the
-	// validation pass observes it.
+	c.applyCredentialPrecedence()
+}
+
+// applyCredentialPrecedence applies the authentication precedence rule: when
+// both password and api_token are present (e.g. a kit renders a placeholder
+// password alongside a real api_token because credhub entombment rejects
+// empty values), the api_token wins, and the password is cleared so
+// downstream code uses tokens.
+//
+// This mutation lives outside Validate because Validate's contract is
+// read-only: callers may invoke Validate repeatedly for diagnostics without
+// side effects. Load() runs ApplyDefaults before Validate, so the
+// merged-credential path is normalized before the validation pass observes
+// it. ApplyContextOverrides never runs ApplyDefaults, so its credential
+// resolution calls this directly and an entry follows the same rule as the
+// job config.
+func (c *CPIConfig) applyCredentialPrecedence() {
 	if c.Password != "" && c.APIToken != "" {
 		c.Password = ""
 	}
@@ -4142,11 +4155,15 @@ func (c *CPIConfig) ValidateWithLogger(logger *log.Logger) error {
 
 // validateRequiredFields appends an error for each required scalar field that
 // is absent. Covers host, user, vm_storage, disk_storage, and network_bridge.
+// The user is required only for password authentication. An api_token
+// already names its user ("user@realm!token-id=secret"), and the PVE client
+// never reads the user field in token mode, so a token-only config is
+// complete.
 func (c *CPIConfig) validateRequiredFields(errs *[]string) {
 	if c.Host == "" {
 		*errs = append(*errs, "host is required")
 	}
-	if c.User == "" {
+	if c.User == "" && c.APIToken == "" {
 		*errs = append(*errs, "user is required")
 	}
 	if c.VMStorage == "" {

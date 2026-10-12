@@ -519,6 +519,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		},
 		Logger:   logger,
 		BaseHost: cfg.Host,
+		BasePort: cfg.Port,
 	}
 
 	storageMetrics, storageMetricsErr := handlers.NewStoragePlacementMetrics(meter)

@@ -223,7 +223,7 @@ func TestStoragePlacementContextIsolationAndReplacement(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			extra := map[string]any{"pve": map[string]any{
-				"host": name, "storage_sets": map[string]any{"e": map[string]any{"names": []string{name}, "strategy": map[string]any{"name": "spread", "version": 1}}},
+				"host": name, "api_token": "fake-entry@pve!cpi=fake-entry-token-value", "storage_sets": map[string]any{"e": map[string]any{"names": []string{name}, "strategy": map[string]any{"name": "spread", "version": 1}}},
 				"storage_capacity_domains": map[string]any{}, "storage_placement_namespace": name,
 			}}
 			eff, _, _, err := config.ApplyContextOverrides(base, extra)

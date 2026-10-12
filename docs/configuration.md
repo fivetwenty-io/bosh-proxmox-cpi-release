@@ -4,7 +4,7 @@ The CPI reads configuration from a BOSH deployment manifest. The job template re
 
 ## Minimal Configuration
 
-Config validation requires five properties: `host`, `user`, one of `password` or `api_token`, `vm_storage`, and `disk_storage` (`network_bridge` is also validated, but the job spec always renders its `vmbr0` default, so a manifest that omits it still passes). In practice, also set `node`: it is where `create_stemcell` builds cache templates by default and where `create_vm` falls back when placement scoring is disabled or a call does not resolve a target node.
+Config validation requires these properties: `host`, one of `password` or `api_token`, `vm_storage`, and `disk_storage`, plus `user` whenever the CPI authenticates with `password` (`network_bridge` is also validated, but the job spec always renders its `vmbr0` default, so a manifest that omits it still passes). In practice, also set `node`: it is where `create_stemcell` builds cache templates by default and where `create_vm` falls back when placement scoring is disabled or a call does not resolve a target node.
 
 ```yaml
 properties:
@@ -23,7 +23,7 @@ With just this manifest: `create_vm` attaches every NIC to the pre-existing `vmb
 |---|---|---|---|
 | `pve.host` | PVE host (IP or FQDN) | - | yes |
 | `pve.port` | PVE API port | `8006` | no |
-| `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`) | - | yes |
+| `pve.user` | PVE username (e.g. `root@pam` or `bosh@pve`). The key has no default, so the manifest must always include it. An API token already names its user, so the value may be `""` when `api_token` is set. | - | yes (the value may be `""` with `api_token`) |
 | `pve.password` | PVE password. Mutually exclusive with `api_token`. Must be credhub-managed in production via `((pve_password))`. | `""` | one of password or api_token |
 | `pve.api_token` | PVE API token (`<user>!<token-id>=<uuid>`). Mutually exclusive with `password`. Must be credhub-managed in production via `((pve_api_token))`. | `""` | one of password or api_token |
 | `pve.realm` | Authentication realm | `pam` | no |
@@ -44,7 +44,7 @@ With just this manifest: `create_vm` attaches every NIC to the pre-existing `vmb
 | `pve.sdn_vni_range_end` | Inclusive upper bound of the VNI/VLAN auto-allocation band. `0` applies the built-in default: `5999`, or `2999` for `vlan`/`qinq` zone types. Must be ≥ `sdn_vni_range_start`; for `vlan`/`qinq` an explicit band ending above 4094 fails validation at load time. | `0` (→ `5999`, vlan/qinq `2999`) | no |
 | `pve.sdn_zone_mtu` | Explicit MTU for CPI-created SDN zones. `0` (default) lets PVE derive it from the underlay (1500 → 1450 for vxlan). Set only for unusual underlays, e.g. jumbo frames. Valid range 576–65520 when set. | `0` (→ PVE-derived) | no |
 | `pve.verify_ssl` | Verify the PVE API TLS certificate | `true` | no |
-| `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. | `""` | no |
+| `pve.ca_cert` | Optional PEM-encoded CA certificate bundle for verifying the Proxmox VE API TLS certificate. When empty (default), the system trust pool is used — behavior is byte-identical to prior releases. When set, the PEM is parsed and the resulting cert pool is used for PVE API HTTPS verification. Ignored when `verify_ssl` is `false`. A cpi-config entry can set its own `ca_cert`. An entry that changes `host` or `port` never inherits this job-level CA, so an entry whose cluster sits behind a private CA sets `ca_cert` itself (see [Multi-Cluster Deployments](multi-cluster.md#per-entry-credentials-and-ca)). | `""` | no |
 | `pve.reject_tls_downgrade_overrides` | Hardens the per-request `pve_*` context override mechanism used for BOSH cpi-config multi-cluster routing. When `true`, a request whose context carries `pve_verify_ssl: false` against a job-level config that itself verifies (`verify_ssl: true`) is rejected with a non-retriable error instead of the default warn-and-proceed behavior. A job-level config that already has `verify_ssl: false` is never rejected by this knob. When `false` (default), the downgrade is still logged at Warn but the request proceeds — byte-identical to prior releases. | `false` | no |
 | `pve.agent_mode` | Agent bootstrap mode. `cloudinit` — cloud-init bootstrap (default). `noagent` — no agent bootstrap. `auto` — always selects configdrive (registry-less) bootstrap for all stemcells. | `cloudinit` | no |
 | `pve.vm_disk_format` | Disk image format (`qcow2`, `raw`, `vmdk`) for VM root disks, ephemeral disks, and persistent disks. Set `raw` when the target pool is block-native (`lvm`, `lvmthin`, `zfspool`, `rbd`), since those pools reject qcow2. A `vm_disk_format` or `disk_format` in a call's `cloud_properties`, or on a `vm_type` or `disk_type` profile, overrides this per disk. [Operations — Where the format comes from](operations.md) walks the full resolution order. | `qcow2` | no |

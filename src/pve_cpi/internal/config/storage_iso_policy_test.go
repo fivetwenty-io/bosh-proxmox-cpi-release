@@ -94,7 +94,9 @@ func TestISOStoragePolicyConcurrentOverridesRemainIsolated(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	inherited, _, _, err := config.ApplyContextOverrides(base, map[string]any{"pve_host": "alias.example"})
+	inherited, _, _, err := config.ApplyContextOverrides(base, map[string]any{
+		"pve_host": "alias.example", "pve_api_token": "fake-entry@pve!cpi=fake-entry-token-value",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

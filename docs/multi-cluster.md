@@ -84,6 +84,16 @@ An entry's `placement` block replaces the job-level one entirely rather than mer
 
 The three HA features (`placement.dlb`, `placement.anti_affinity.use_ha_rules`, `placement.pin_az_via_ha_rules`) are reachable only this way in a multi-cluster deployment. Enabling any of them also means disabling the BOSH resurrector for the affected deployment, and `pin_az_via_ha_rules` additionally requires `cloud_properties.availability_zone` on each `vm_type` — see [HA and Resurrection](ha-and-resurrection.md).
 
+### Per-entry credentials and CA
+
+Credentials travel with the endpoint as a group. When an entry changes `host` or `port`, the CPI never sends the job-level `user`, `password`, or `api_token` to that cluster, so the entry must name its own `api_token`, or its own `user` and `password`. An entry that names no credentials, or only part of a group such as a bare `password`, fails its first request with an error that names the entry's host and the property keys it is missing. The same rule holds for an entry that stays on the job-level host. Once an entry names any credential key, the CPI uses only the credentials that entry names and never borrows the rest from the job.
+
+The host comparison ignores letter case and a trailing dot, and an unset port counts as `8006`, so spelling the job's host differently does not drop its credentials. The `realm` keeps inheriting from the job unless the entry sets it, because it is not a secret and only qualifies a bare `user`. That means a bare `user` on another cluster signs in under the job's realm, which may not exist there, so on every entry for another cluster we set `realm` or write `user` as `user@realm`. An entry that authenticates with `api_token` does not need `user` at all, because the token already carries `user@realm`. The token may be pasted in the `PVEAPIToken=` header form, and the CPI strips that prefix on an entry just as it does in the job config.
+
+The CA follows the endpoint in the same way. An entry can set `ca_cert` to the PEM bundle that signs its cluster's API certificate. When an entry changes `host` or `port` and sets no `ca_cert`, the CPI verifies that cluster against the system trust pool rather than the job-level CA, so a cluster behind a private CA needs its own `ca_cert` on the entry. If the job config has a `ca_cert` that the entry leaves behind this way, the CPI logs a warning that names `pve.ca_cert` and the entry's host. An entry that stays on the job endpoint and sets only `ca_cert` keeps the job credentials and changes the root they are verified against, and the CPI logs that as a warning too. If an entry also turns off `verify_ssl`, the warning the CPI logs says whether the credentials crossing that unverified connection are the job's (`credential_group: inherited`) or the entry's own (`credential_group: entry`).
+
+Before we roll back to 0.9.3 or an earlier release, we put `user` back on every entry that authenticates with only `api_token`, because those releases reject such an entry with "user is required". We also check TLS on every entry that sets `ca_cert`, because those releases ignore the key and verify the entry's cluster against the job-level CA.
+
 ## AZ-to-CPI binding in cloud-config
 
 BOSH's `azs[].cpi` field binds an availability zone to a named cpi-config entry:

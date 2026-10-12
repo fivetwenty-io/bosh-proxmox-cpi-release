@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +55,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_iso_storage",
 	"pve_network_bridge",
 	"pve_verify_ssl",
+	"pve_ca_cert",
 	"pve_vmid_range_start",
 	"pve_vmid_range_end",
 	"pve_disk_vmid_range_start",
@@ -149,7 +151,9 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		if err != nil {
 			return err
 		}
-		c.APIToken = s
+		// An entry follows the job's token rule, which ApplyDefaults applies
+		// only to the job config.
+		c.APIToken = normalizeAPIToken(s)
 		return nil
 	},
 	"pve_realm": func(c *CPIConfig, v any) error {
@@ -219,6 +223,21 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		// base's own config out from under every other in-flight/future
 		// request that has not opted into this override.
 		c.VerifySSL = &b
+		return nil
+	},
+	// The CA is the trust root of one endpoint, so it travels with the host
+	// the same way the credential group does: an entry that names another
+	// host never inherits the job's private CA (see
+	// resolveOverrideCredentials), and this key is how it supplies its own.
+	// An explicit empty string selects the system trust pool. PEM parsing
+	// is delegated to the eff.Validate() call at the end of
+	// ApplyContextOverrides, matching the job-level pve.ca_cert check.
+	"pve_ca_cert": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.PVECACertPEM = s
 		return nil
 	},
 	"pve_vmid_range_start": func(c *CPIConfig, v any) error {
@@ -585,6 +604,163 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 	return merged
 }
 
+// overrideCredentialKeys is the credential group: the context keys that
+// authenticate a request to one PVE endpoint. They travel as a group, so an
+// effective config holds either all three exactly as the job config has
+// them, or exactly what the entry itself named, never a mix. The realm is
+// deliberately not in the group. It is not a secret, and an entry on the job
+// host that sets a user and password commonly relies on the job's realm
+// (for example "pve"), so it keeps inheriting unless the entry sets it.
+var overrideCredentialKeys = []string{"pve_user", "pve_password", "pve_api_token"}
+
+// Credential group sources reported by OverrideCredentialGroup.
+const (
+	// CredentialGroupInherited means the request authenticates with the
+	// job-level credentials, which only happens on the job-level endpoint.
+	CredentialGroupInherited = "inherited"
+	// CredentialGroupEntry means the request authenticates with only the
+	// credentials its cpi-config entry named.
+	CredentialGroupEntry = "entry"
+)
+
+// defaultPVEAPIPort is the port pveproxy listens on, and the value
+// ApplyDefaults gives an unset pve.port.
+const defaultPVEAPIPort = 8006
+
+// normalizedEndpoint returns c's PVE API endpoint in the form endpoint
+// comparison uses: the host trimmed of surrounding space, lowercased, and
+// without a trailing dot, and the port with 0 read as the default 8006.
+func normalizedEndpoint(c *CPIConfig) (host string, port int) {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Host)), ".")
+	port = c.Port
+	if port == 0 {
+		port = defaultPVEAPIPort
+	}
+	return host, port
+}
+
+// SameEndpoint reports whether a and b address the same PVE API endpoint.
+// Host case, a trailing dot on the host, and an unset port versus an
+// explicit 8006 do not count as differences, because each of those spellings
+// reaches the same pveproxy. Any other difference does, including a
+// different name for the same machine, because the CPI cannot prove two
+// names resolve to one host and must not send credentials on that guess.
+func SameEndpoint(a, b *CPIConfig) bool {
+	aHost, aPort := normalizedEndpoint(a)
+	bHost, bPort := normalizedEndpoint(b)
+	return aHost == bHost && aPort == bPort
+}
+
+// overrideCredentialKeysSet returns, in group order, the credential keys an
+// entry named. A key counts as named whenever it is present, including with
+// an empty value, because an entry that writes the key is stating its own
+// credentials rather than asking for the job's.
+func overrideCredentialKeysSet(present func(key string) bool) []string {
+	var set []string
+	for _, key := range overrideCredentialKeys {
+		if present(key) {
+			set = append(set, key)
+		}
+	}
+	return set
+}
+
+// OverrideCredentialGroup reports which credential group an effective config
+// built by ApplyContextOverrides authenticates with, given the job config
+// and the applied key list ApplyContextOverrides returned with it. The
+// answer is CredentialGroupEntry whenever the endpoint changed or the entry
+// named any credential key, and CredentialGroupInherited otherwise. It reads
+// key names and endpoints only, never a credential value, so callers may log
+// the result.
+func OverrideCredentialGroup(base, effective *CPIConfig, applied []string) string {
+	if base == nil || effective == nil {
+		// No caller passes nil. If one ever does, claim the safer label, so
+		// a warning never says the job credentials stayed on the job host.
+		return CredentialGroupEntry
+	}
+	named := overrideCredentialKeysSet(func(key string) bool { return slices.Contains(applied, key) })
+	if !SameEndpoint(base, effective) || len(named) > 0 {
+		return CredentialGroupEntry
+	}
+	return CredentialGroupInherited
+}
+
+// resolveOverrideCredentials makes the credential group and the CA travel
+// with the endpoint. It runs on eff after every field handler has applied the
+// entry's keys and before the effective config is validated, so it sees the
+// entry's final host and port.
+//
+// Without it, each credential key applied one at a time: an entry that set
+// only a new host inherited the job's api_token, and the PVE client prefers a
+// token whenever one is set, so the job's token went to the other cluster.
+// An entry that set only a password while the job held a token kept both,
+// and the job's token again won on the wire.
+//
+// The rules are these. When the endpoint changes, or the entry names any
+// credential key, every credential key the entry did not name is cleared, so
+// nothing from the job's group survives. When the endpoint changes, the job's
+// pve.ca_cert is cleared too unless the entry names pve_ca_cert, so an entry
+// that keeps verify_ssl on gets the system trust pool rather than a private
+// CA issued for another host. The job's token-over-password rule then
+// applies, and the result must hold an api_token, or a user together with a
+// password. Errors name property keys only, never a value.
+func resolveOverrideCredentials(base, eff *CPIConfig, extra map[string]any) error {
+	present := func(key string) bool {
+		_, ok := extra[key]
+		return ok
+	}
+	endpointChanged := !SameEndpoint(base, eff)
+	if endpointChanged && !present("pve_ca_cert") {
+		eff.PVECACertPEM = ""
+	}
+
+	named := overrideCredentialKeysSet(present)
+	if !endpointChanged && len(named) == 0 {
+		// Same endpoint and no credential key named: the request keeps the
+		// job's whole group, which already passed startup validation.
+		return nil
+	}
+
+	if !present("pve_user") {
+		eff.User = ""
+	}
+	if !present("pve_password") {
+		eff.Password = ""
+	}
+	if !present("pve_api_token") {
+		eff.APIToken = ""
+	}
+	eff.applyCredentialPrecedence()
+
+	if eff.APIToken != "" || (eff.User != "" && eff.Password != "") {
+		return nil
+	}
+	// The effective host is not a secret, and naming it tells an operator
+	// with several entries which one failed. A cluster that changed endpoint
+	// may also sit behind a private CA, which fails next on TLS.
+	remedy := "set pve.api_token, or pve.user and pve.password"
+	if endpointChanged {
+		remedy += ", and pve.ca_cert if that cluster uses a private CA"
+	}
+	if len(named) == 0 {
+		changed := "pve.host"
+		baseHost, _ := normalizedEndpoint(base)
+		if effHost, _ := normalizedEndpoint(eff); effHost == baseHost {
+			changed = "pve.port"
+		}
+		return fmt.Errorf("config: context entry for host %q changes %s but supplies no credentials; %s",
+			eff.Host, changed, remedy)
+	}
+	specNames := make([]string, len(named))
+	for i, key := range named {
+		specNames[i] = "pve." + strings.TrimPrefix(key, contextOverridePrefix)
+	}
+	return fmt.Errorf(
+		"config: context entry for host %q sets %s but its credential group is incomplete, and an entry never "+
+			"borrows job-level credentials to complete it; %s",
+		eff.Host, strings.Join(specNames, " and "), remedy)
+}
+
 // ApplyContextOverrides returns a per-request effective CPIConfig built by
 // overriding select fields of base with the "pve_"-prefixed keys present in
 // extra (the jsonrpc.Context.Extra map decoded from one dispatched JSON-RPC
@@ -604,6 +780,13 @@ func flattenNestedContextOverrides(extra map[string]any) map[string]any {
 // that slice's doc comment for exactly which pve.* properties are in scope
 // and why the rest (hooks, otel, retry curves, ...) are deliberately
 // excluded from per-request override.
+//
+// The credential keys (pve_user, pve_password, pve_api_token) and pve_ca_cert
+// do not apply one at a time. They travel with the endpoint as a group, so an
+// entry that names another host, or names any credential key, authenticates
+// with only what it named and never with the job's token or password. See
+// resolveOverrideCredentials for the rules and OverrideCredentialGroup for
+// how a caller learns which group a request uses.
 //
 // base must be non-nil. extra may be nil or empty; that is the ordinary case
 // (single-CPI deployments, or a cpi-config entry matching the job-level
@@ -705,6 +888,15 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 			return nil, nil, nil, fmt.Errorf("config: context override %q: %w", key, applyErr)
 		}
 		appliedKeys = append(appliedKeys, key)
+	}
+
+	// Credentials and the CA travel with the endpoint. This must run before
+	// any early return below that could hand back eff, and before
+	// validation, so an incomplete group fails with its own message.
+	if len(appliedKeys) > 0 {
+		if credErr := resolveOverrideCredentials(base, &eff, extra); credErr != nil {
+			return nil, nil, nil, credErr
+		}
 	}
 
 	var unknownKeys []string

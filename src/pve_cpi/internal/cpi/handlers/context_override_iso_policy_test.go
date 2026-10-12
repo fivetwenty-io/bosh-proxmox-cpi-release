@@ -70,7 +70,7 @@ func TestISOStoragePolicyOverrideAgentsAndOriginalChoicesAreIsolated(t *testing.
 		}
 	}
 	capture.mu.Unlock()
-	inherited, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_host": "alias.example"}})
+	inherited, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "alias.example"}})
 	if err != nil {
 		t.Fatal(err)
 	}

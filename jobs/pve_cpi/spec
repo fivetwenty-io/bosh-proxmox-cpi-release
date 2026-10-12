@@ -18,7 +18,9 @@ properties:
     description: "PVE API port"
     default: 8006
   pve.user:
-    description: "PVE username"
+    description: |
+      PVE username. Required with password. An API token already names its
+      user, so set this to the empty string when api_token is used instead.
   pve.password:
     description: |
       PVE password (mutually exclusive with api_token). Must be credhub-managed
@@ -248,7 +250,9 @@ properties:
       API TLS certificate. When empty (default), the system trust pool is used
       unmodified — behavior is byte-identical to prior releases. When set, the
       PEM is parsed and the resulting cert pool replaces the system pool for PVE
-      API HTTPS verification. Ignored when verify_ssl is false.
+      API HTTPS verification. Ignored when verify_ssl is false. A cpi-config
+      entry can set its own ca_cert, and an entry that changes host or port
+      never inherits this job-level CA.
     default: ""
   pve.reject_tls_downgrade_overrides:
     description: |

@@ -6,11 +6,19 @@ package handlers_test
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -19,6 +27,11 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
+
+// overrideTestEntryToken is the placeholder api_token test entries carry
+// whenever they change pve_host, because an entry on another host never
+// inherits the job-level credentials and must name its own.
+const overrideTestEntryToken = "fake-entry@pve!cpi=FAKE-ENTRY-TOKEN-PLACEHOLDER"
 
 // overrideTestBaseConfig returns a minimal, fully valid job-level CPIConfig
 // for WithRequestOverrides tests. agent_mode "noagent" keeps bundle
@@ -124,7 +137,7 @@ func TestWithRequestOverrides_NilOverridesRuntime_Disabled(t *testing.T) {
 	deps := handlers.Deps{Config: base, PVE: jobClient, Logger: log.NewNopLogger()}
 
 	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-		Extra: map[string]any{"pve_host": "should-be-ignored.example"},
+		Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "should-be-ignored.example"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -169,7 +182,7 @@ func TestWithRequestOverrides_DifferentHosts_GetDifferentClients(t *testing.T) {
 	// Request 2: overrides to cluster A.
 	depsA, errA := deps.WithRequestOverrides(ctx, jsonrpc.Context{
 		RequestID: "req-a",
-		Extra:     map[string]any{"pve_host": "az1.example"},
+		Extra:     map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"},
 	})
 	if errA != nil {
 		t.Fatalf("cluster A request: unexpected error: %v", errA)
@@ -184,7 +197,7 @@ func TestWithRequestOverrides_DifferentHosts_GetDifferentClients(t *testing.T) {
 	// Request 3: overrides to cluster B (a different host).
 	depsB, errB := deps.WithRequestOverrides(ctx, jsonrpc.Context{
 		RequestID: "req-b",
-		Extra:     map[string]any{"pve_host": "az2.example"},
+		Extra:     map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az2.example"},
 	})
 	if errB != nil {
 		t.Fatalf("cluster B request: unexpected error: %v", errB)
@@ -203,7 +216,7 @@ func TestWithRequestOverrides_DifferentHosts_GetDifferentClients(t *testing.T) {
 	// Request 4: overrides to cluster A again — must reuse depsA's cached client.
 	depsA2, errA2 := deps.WithRequestOverrides(ctx, jsonrpc.Context{
 		RequestID: "req-a-again",
-		Extra:     map[string]any{"pve_host": "az1.example"},
+		Extra:     map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"},
 	})
 	if errA2 != nil {
 		t.Fatalf("cluster A repeat request: unexpected error: %v", errA2)
@@ -274,7 +287,7 @@ func TestWithRequestOverrides_ClientBuildFailure_RetriableCloudError(t *testing.
 	}
 
 	_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-		Extra: map[string]any{"pve_host": "unreachable.example"},
+		Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "unreachable.example"},
 	})
 	if err == nil {
 		t.Fatal("expected an error when the overridden cluster's client cannot be built, got nil")
@@ -356,7 +369,8 @@ func TestWithRequestOverrides_MixedKnownAndUnknownPVEKeys_WarnsAndApplies(t *tes
 	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
 		Extra: map[string]any{
 			"pve_host":              "az1.example", // supported — applies
-			"pve_placement_enabled": true,          // unsupported — Warn only
+			"pve_api_token":         overrideTestEntryToken,
+			"pve_placement_enabled": true, // unsupported — Warn only
 		},
 	})
 	if err != nil {
@@ -443,7 +457,7 @@ func TestWithRequestOverrides_RejectTLSDowngradeOverrides_BaseAlreadyFalse_NotRe
 	}
 
 	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-		Extra: map[string]any{"pve_verify_ssl": false, "pve_host": "az1.example"},
+		Extra: map[string]any{"pve_verify_ssl": false, "pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"},
 	})
 	if err != nil {
 		t.Fatalf("a request that does not actually downgrade TLS verification (base already verify_ssl=false) must not be rejected, got error: %v", err)
@@ -476,7 +490,7 @@ func TestWithRequestOverrides_TLSDowngrade_KnobOff_WarnOnlyUnchanged(t *testing.
 	}
 
 	got, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-		Extra: map[string]any{"pve_verify_ssl": false, "pve_host": "az1.example"},
+		Extra: map[string]any{"pve_verify_ssl": false, "pve_api_token": overrideTestEntryToken, "pve_host": "az1.example"},
 	})
 	if err != nil {
 		t.Fatalf("knob-off TLS downgrade must proceed (warn-only), got error: %v", err)
@@ -555,7 +569,9 @@ func TestWithRequestOverrides_BundleCache_EvictsLeastRecentlyUsed(t *testing.T) 
 
 	override := func(host string) handlers.Deps {
 		t.Helper()
-		d, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{"pve_host": host}})
+		d, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{
+			"pve_api_token": overrideTestEntryToken, "pve_host": host,
+		}})
 		if err != nil {
 			t.Fatalf("override to %s: unexpected error: %v", host, err)
 		}
@@ -634,7 +650,9 @@ func TestWithRequestOverrides_BundleCache_DefaultCapApplied(t *testing.T) {
 	const distinctHosts = 20
 	for i := 0; i < distinctHosts; i++ {
 		host := fmt.Sprintf("az-%02d.example", i)
-		if _, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{"pve_host": host}}); err != nil {
+		if _, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{
+			"pve_api_token": overrideTestEntryToken, "pve_host": host,
+		}}); err != nil {
 			t.Fatalf("override to %s: unexpected error: %v", host, err)
 		}
 	}
@@ -647,7 +665,9 @@ func TestWithRequestOverrides_BundleCache_DefaultCapApplied(t *testing.T) {
 	if callsBefore != distinctHosts {
 		t.Fatalf("sanity check: expected %d factory calls after %d distinct hosts, got %d", distinctHosts, distinctHosts, callsBefore)
 	}
-	if _, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{"pve_host": "az-00.example"}}); err != nil {
+	if _, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{
+		"pve_api_token": overrideTestEntryToken, "pve_host": "az-00.example",
+	}}); err != nil {
 		t.Fatalf("re-request az-00.example: unexpected error: %v", err)
 	}
 	if got := len(tracker.calls); got != callsBefore+1 {
@@ -709,7 +729,7 @@ func TestWithRequestOverrides_Concurrent_SameIdentity_SingleBuild(t *testing.T) 
 			startWG.Done()
 			startWG.Wait() // best-effort: line every goroutine up before any resolve() call proceeds
 			d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-				Extra: map[string]any{"pve_host": "shared-az.example"},
+				Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "shared-az.example"},
 			})
 			errs[i] = err
 			if err == nil {
@@ -776,7 +796,7 @@ func TestWithRequestOverrides_Concurrent_MixedIdentities(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
-					Extra: map[string]any{"pve_host": host},
+					Extra: map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": host},
 				})
 				if err != nil {
 					t.Errorf("host %s: unexpected error: %v", host, err)
@@ -861,7 +881,8 @@ func TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ(t *testing.T) 
 		RequestID: "r-az2",
 		Extra: map[string]any{
 			"pve": map[string]any{
-				"host": "az2-cluster.example",
+				"host":      "az2-cluster.example",
+				"api_token": overrideTestEntryToken,
 				"placement": map[string]any{
 					"az_map": map[string]any{
 						"z3": []any{"pve-az2-1", "pve-az2-2", "pve-az2-3"},
@@ -1007,6 +1028,7 @@ func TestWithRequestOverrides_NodeEndpointsFollowBaseHost(t *testing.T) {
 			ClientFactory: tracker.Factory,
 			Logger:        log.NewNopLogger(),
 			BaseHost:      base.Host,
+			BasePort:      base.Port,
 		},
 	}
 	ctx := context.Background()
@@ -1028,12 +1050,570 @@ func TestWithRequestOverrides_NodeEndpointsFollowBaseHost(t *testing.T) {
 	// Discovery stays gated off here (verify_ssl is true in the base config).
 	otherHost, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{
 		RequestID: "req-other-host",
-		Extra:     map[string]any{"pve_host": "az2.example"},
+		Extra:     map[string]any{"pve_api_token": overrideTestEntryToken, "pve_host": "az2.example"},
 	})
 	if err != nil {
 		t.Fatalf("other-host override: unexpected error: %v", err)
 	}
 	if h, ok := otherHost.NodeEndpoints.HostFor(ctx, "pve2"); ok {
 		t.Errorf("other-host override HostFor(pve2) = %q; want no override (job-level map must not leak across clusters)", h)
+	}
+
+	// The endpoint is host and port, so a second cluster behind the job host
+	// at another port (one tunnel or load balancer in front of two clusters)
+	// must drop the map too.
+	otherPort, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{
+		RequestID: "req-other-port",
+		Extra:     map[string]any{"pve_api_token": overrideTestEntryToken, "pve_port": float64(8443)},
+	})
+	if err != nil {
+		t.Fatalf("other-port override: unexpected error: %v", err)
+	}
+	if h, ok := otherPort.NodeEndpoints.HostFor(ctx, "pve2"); ok {
+		t.Errorf("other-port override HostFor(pve2) = %q; want no override (same host, different endpoint)", h)
+	}
+}
+
+// TestWithRequestOverrides_NodeEndpoints_UnsetBasePortIsDefault asserts that
+// a runtime whose BasePort is zero treats the job endpoint as port 8006, so a
+// same-host override at 8006 keeps the job's node_endpoints map.
+func TestWithRequestOverrides_NodeEndpoints_UnsetBasePortIsDefault(t *testing.T) {
+	t.Parallel()
+	base := overrideTestBaseConfig()
+	base.NodeEndpoints = map[string]string{"pve2": "pve2-direct.example"}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: (&fakeTransportClientFactory{}).Factory,
+			Logger:        log.NewNopLogger(),
+			BaseHost:      base.Host,
+		},
+	}
+	ctx := context.Background()
+	d, err := deps.WithRequestOverrides(ctx, jsonrpc.Context{Extra: map[string]any{"pve_node": "pve9", "pve_port": float64(8006)}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h, ok := d.NodeEndpoints.HostFor(ctx, "pve2"); !ok || h != "pve2-direct.example" {
+		t.Errorf("HostFor(pve2) = %q, %v; want the job-level entry, because port 8006 is the job endpoint", h, ok)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Credentials travel with the endpoint: wire-level proof
+// -----------------------------------------------------------------------
+
+// Wire-test credential placeholders. Each is distinct, so the recorded
+// traffic shows exactly which group reached which server.
+const (
+	wireJobUser       = "fake-job-user"
+	wireJobRealm      = "fakejobrealm"
+	wireJobTokenValue = "FAKE-JOB-TOKEN-PLACEHOLDER"
+	wireJobToken      = wireJobUser + "@" + wireJobRealm + "!cpi=" + wireJobTokenValue
+	wireJobPassword   = "FAKE-JOB-PASSWORD-PLACEHOLDER"
+	wireEntryUser     = "fake-entry-user"
+	wireEntryRealm    = "pve"
+	wireEntryToken    = wireEntryUser + "@" + wireEntryRealm + "!cpi=FAKE-ENTRY-TOKEN-PLACEHOLDER"
+	wireEntryPassword = "FAKE-ENTRY-PASSWORD-PLACEHOLDER"
+)
+
+// credentialRecordingServer is a TLS PVE stub that records every credential-
+// bearing part of every request it receives: the Authorization header, the
+// cookie, and the request body, which carries the username and password of a
+// ticket login.
+type credentialRecordingServer struct {
+	server *httptest.Server
+	mu     sync.Mutex
+	seen   []string
+}
+
+func newCredentialRecordingServer(t *testing.T) *credentialRecordingServer {
+	t.Helper()
+	s := &credentialRecordingServer{}
+	s.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// Record the form-decoded body too, so an escaped "@" or "!" in a login
+		// cannot hide a credential from the searches below.
+		decoded, _ := url.QueryUnescape(string(body))
+		s.mu.Lock()
+		s.seen = append(s.seen, r.Method+" "+r.URL.Path+" auth="+r.Header.Get("Authorization")+
+			" cookie="+r.Header.Get("Cookie")+" body="+string(body)+" decoded="+decoded)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api2/json/access/ticket" {
+			_, _ = w.Write([]byte(`{"data":{"ticket":"PVE:fake-ticket-placeholder","CSRFPreventionToken":"fake-csrf-placeholder","username":"fake"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	t.Cleanup(s.server.Close)
+	return s
+}
+
+// traffic returns everything the server has recorded, joined for searching.
+func (s *credentialRecordingServer) traffic() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.seen, "\n")
+}
+
+// requests returns how many requests the server has received.
+func (s *credentialRecordingServer) requests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.seen)
+}
+
+// endpoint returns the server's host and port.
+func (s *credentialRecordingServer) endpoint(t *testing.T) (string, int) {
+	t.Helper()
+	u, err := url.Parse(s.server.URL)
+	if err != nil {
+		t.Fatalf("parse stub URL: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse stub port: %v", err)
+	}
+	return u.Hostname(), port
+}
+
+// caPEM returns the server's certificate as a PEM trust root.
+func (s *credentialRecordingServer) caPEM() string {
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.server.Certificate().Raw}))
+}
+
+// assertEntryCredentialsOnly asserts that an overridden request reached only
+// cluster B, that B saw the entry's own identity, and that none of the job's
+// credential parts appears anywhere in B's recorded traffic.
+func assertEntryCredentialsOnly(t *testing.T, clusterA, clusterB *credentialRecordingServer, jobLeaks []string) {
+	t.Helper()
+	if clusterB.requests() == 0 {
+		t.Fatal("cluster B received no request, so the entry did not route there")
+	}
+	traffic := clusterB.traffic()
+	for _, leak := range jobLeaks {
+		if strings.Contains(traffic, leak) {
+			t.Errorf("cluster B received a job-level credential part (the fixture value for one of user, realm, token, or password)")
+		}
+	}
+	if !strings.Contains(traffic, wireEntryUser+"@"+wireEntryRealm) {
+		t.Error("cluster B did not receive the entry's own identity")
+	}
+	if clusterA.requests() != 0 {
+		t.Error("an overridden request reached cluster A")
+	}
+}
+
+// TestWithRequestOverrides_SecondClusterNeverReceivesJobCredentials stands up
+// two PVE stubs, A for the job-level cluster and B for a cpi-config entry, and
+// drives real PVE clients at both through WithRequestOverrides. Cluster B must
+// never receive the job's token, the job's password, the job's user, or the
+// job's realm, whichever way the entry authenticates, and an entry that names
+// no CA must not trust B through the job's private CA.
+func TestWithRequestOverrides_SecondClusterNeverReceivesJobCredentials(t *testing.T) {
+	t.Parallel()
+
+	jobLeaks := []string{wireJobTokenValue, wireJobPassword, wireJobUser, wireJobRealm}
+
+	setup := func(t *testing.T) (handlers.Deps, *credentialRecordingServer, *credentialRecordingServer) {
+		t.Helper()
+		clusterA := newCredentialRecordingServer(t)
+		clusterB := newCredentialRecordingServer(t)
+		hostA, portA := clusterA.endpoint(t)
+
+		base := overrideTestBaseConfig()
+		base.Host, base.Port = hostA, portA
+		base.User, base.Realm = wireJobUser, wireJobRealm
+		base.Password, base.APIToken = "", wireJobToken
+		base.PVECACertPEM = clusterA.caPEM()
+
+		factory := func(cfg *config.CPIConfig, l *log.Logger) (pve.Client, error) {
+			return pve.NewClientWithTracer(cfg, l, nil)
+		}
+		jobClient, err := factory(base, log.NewNopLogger())
+		if err != nil {
+			t.Fatalf("build job client: %v", err)
+		}
+		deps := handlers.Deps{
+			Config: base,
+			PVE:    jobClient,
+			Logger: log.NewNopLogger(),
+			Overrides: &handlers.RequestOverrideRuntime{
+				ClientFactory: factory,
+				Logger:        log.NewNopLogger(),
+				BaseHost:      base.Host,
+			},
+		}
+		return deps, clusterA, clusterB
+	}
+
+	probe := func(t *testing.T, d handlers.Deps) error {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err := d.PVE.Nodes().ListNodes(ctx)
+		return err
+	}
+
+	t.Run("job request reaches cluster A with the job token", func(t *testing.T) {
+		t.Parallel()
+		deps, clusterA, clusterB := setup(t)
+		d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{})
+		if err != nil {
+			t.Fatalf("WithRequestOverrides: %v", err)
+		}
+		if err := probe(t, d); err != nil {
+			t.Fatalf("probe cluster A: %v", err)
+		}
+		if !strings.Contains(clusterA.traffic(), wireJobTokenValue) {
+			t.Error("cluster A did not receive the job token, so this fixture cannot prove anything about B")
+		}
+		if clusterB.requests() != 0 {
+			t.Error("a request with no overrides reached cluster B")
+		}
+	})
+
+	entries := map[string]map[string]any{
+		"token entry": {
+			"api_token": wireEntryToken,
+		},
+		"user and password entry": {
+			"user": wireEntryUser, "password": wireEntryPassword, "realm": wireEntryRealm,
+		},
+	}
+	for name, creds := range entries {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			deps, clusterA, clusterB := setup(t)
+			hostB, portB := clusterB.endpoint(t)
+			nested := map[string]any{"host": hostB, "port": float64(portB), "ca_cert": clusterB.caPEM()}
+			maps.Copy(nested, creds)
+
+			d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+				RequestID: "r-az2",
+				Extra:     map[string]any{"pve": nested},
+			})
+			if err != nil {
+				t.Fatalf("WithRequestOverrides: %v", err)
+			}
+			if err := probe(t, d); err != nil {
+				t.Fatalf("probe cluster B: %v", err)
+			}
+			assertEntryCredentialsOnly(t, clusterA, clusterB, jobLeaks)
+		})
+	}
+
+	// The realm is not part of the credential group and keeps inheriting, so
+	// an entry that writes a bare user authenticates on B as user@<job
+	// realm>. That leaks no secret, since B receives the entry's own user and
+	// password, but the job realm may not exist on B, which is why the docs
+	// tell operators to set realm on every entry for another cluster. This
+	// pins the accepted behavior so the promise and the test agree.
+	t.Run("bare user entry carries the job realm and nothing else", func(t *testing.T) {
+		t.Parallel()
+		deps, clusterA, clusterB := setup(t)
+		hostB, portB := clusterB.endpoint(t)
+		d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+			Extra: map[string]any{"pve": map[string]any{
+				"host": hostB, "port": float64(portB), "ca_cert": clusterB.caPEM(),
+				"user": wireEntryUser, "password": wireEntryPassword,
+			}},
+		})
+		if err != nil {
+			t.Fatalf("WithRequestOverrides: %v", err)
+		}
+		if err := probe(t, d); err != nil {
+			t.Fatalf("probe cluster B: %v", err)
+		}
+		traffic := clusterB.traffic()
+		if !strings.Contains(traffic, wireEntryUser+"@"+wireJobRealm) {
+			t.Error("a bare entry user did not arrive qualified by the inherited job realm")
+		}
+		for _, leak := range []string{wireJobTokenValue, wireJobPassword, wireJobUser + "@"} {
+			if strings.Contains(traffic, leak) {
+				t.Error("cluster B received a job-level credential part (the fixture value for one of user, token, or password)")
+			}
+		}
+		if clusterA.requests() != 0 {
+			t.Error("an overridden request reached cluster A")
+		}
+	})
+
+	t.Run("entry without ca_cert does not trust cluster B through the job CA", func(t *testing.T) {
+		t.Parallel()
+		deps, _, clusterB := setup(t)
+		hostB, portB := clusterB.endpoint(t)
+		d, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{
+			Extra: map[string]any{"pve": map[string]any{
+				"host": hostB, "port": float64(portB), "api_token": wireEntryToken,
+			}},
+		})
+		if err != nil {
+			t.Fatalf("WithRequestOverrides: %v", err)
+		}
+		if d.Config.PVECACertPEM != "" {
+			t.Error("the job's private CA followed the request to another endpoint")
+		}
+		// httptest serves one self-signed certificate for every server, so the
+		// job's CA would have verified B. With the system pool it must not.
+		if err := probe(t, d); err == nil {
+			t.Error("cluster B's private certificate verified without the entry naming a CA")
+		}
+		if strings.Contains(clusterB.traffic(), wireJobTokenValue) {
+			t.Error("cluster B received the job token")
+		}
+	})
+}
+
+// TestWithRequestOverrides_TLSDowngradeWarning_NamesCredentialGroup asserts
+// that the TLS-downgrade warning says which credential group crosses the
+// unverified connection, inherited or entry, and never prints a credential.
+func TestWithRequestOverrides_TLSDowngradeWarning_NamesCredentialGroup(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		extra     map[string]any
+		wantGroup string
+		wantText  string
+	}{
+		{
+			name:      "same endpoint keeps the inherited group",
+			extra:     map[string]any{"pve_verify_ssl": false},
+			wantGroup: config.CredentialGroupInherited,
+			wantText:  "the inherited job-level PVE credentials will be sent to the job-level host",
+		},
+		{
+			name:      "other host uses the entry group",
+			extra:     map[string]any{"pve_verify_ssl": false, "pve_host": "az1.example", "pve_api_token": overrideTestEntryToken},
+			wantGroup: config.CredentialGroupEntry,
+			wantText:  "the cpi-config entry's own PVE credentials will be sent to the effective host",
+		},
+		{
+			name: "same endpoint with entry credentials uses the entry group",
+			extra: map[string]any{
+				"pve_verify_ssl": false, "pve_user": wireEntryUser, "pve_password": wireEntryPassword,
+			},
+			wantGroup: config.CredentialGroupEntry,
+			wantText:  "the cpi-config entry's own PVE credentials will be sent to the effective host",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := overrideTestBaseConfig()
+			observedLogger, obs := log.NewObservedLogger(log.LevelDebug)
+			deps := handlers.Deps{
+				Config: base,
+				PVE:    &mockPVEClient{},
+				Logger: observedLogger,
+				Overrides: &handlers.RequestOverrideRuntime{
+					ClientFactory: (&fakeTransportClientFactory{}).Factory,
+					Logger:        log.NewNopLogger(),
+				},
+			}
+			if _, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra}); err != nil {
+				t.Fatalf("WithRequestOverrides: %v", err)
+			}
+			found := false
+			for _, e := range obs.All() {
+				rendered := fmt.Sprintf("%s %v", e.Message, e.Attrs)
+				for _, secret := range []string{base.Password, overrideTestEntryToken, wireEntryPassword} {
+					if strings.Contains(rendered, secret) {
+						t.Errorf("a log line carries a credential fixture value: %q", e.Message)
+					}
+				}
+				if e.Level != log.LevelWarn || !strings.Contains(e.Message, "disables TLS verification") {
+					continue
+				}
+				found = true
+				if strings.Contains(e.Message, "job-level PVE credentials will be sent to the overridden host") {
+					t.Error("the warning still claims job-level credentials go to the overridden host")
+				}
+				if !strings.Contains(e.Message, tc.wantText) {
+					t.Errorf("warning = %q, want it to contain %q", e.Message, tc.wantText)
+				}
+				if got := e.Attrs["credential_group"]; got != tc.wantGroup {
+					t.Errorf("credential_group = %v, want %q", got, tc.wantGroup)
+				}
+			}
+			if !found {
+				t.Fatal("expected a Warn log entry about the TLS-verification downgrade, found none")
+			}
+		})
+	}
+}
+
+// TestWithRequestOverrides_IncompleteCredentialGroup_NonRetriable asserts that
+// an entry on another host with no credentials is refused before any client
+// is built, as a non-retriable error that names property keys only.
+func TestWithRequestOverrides_IncompleteCredentialGroup_NonRetriable(t *testing.T) {
+	t.Parallel()
+	base := overrideTestBaseConfig()
+	// A loaded job config never holds a token and a password together, because
+	// ApplyDefaults clears the password, so the fixture holds the token alone.
+	base.APIToken = wireJobToken
+	base.Password = ""
+	tracker := &fakeTransportClientFactory{}
+	deps := handlers.Deps{
+		Config: base,
+		PVE:    &mockPVEClient{},
+		Logger: log.NewNopLogger(),
+		Overrides: &handlers.RequestOverrideRuntime{
+			ClientFactory: tracker.Factory,
+			Logger:        log.NewNopLogger(),
+		},
+	}
+	for name, extra := range map[string]map[string]any{
+		"host only":     {"pve_host": "az2.example"},
+		"password only": {"pve_host": "az2.example", "pve_password": wireEntryPassword},
+	} {
+		_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: extra})
+		if err == nil {
+			t.Fatalf("%s: expected the request to be refused", name)
+		}
+		var cpiErr *cpierrors.Error
+		if !errors.As(err, &cpiErr) || cpiErr.OkToRetry() {
+			t.Errorf("%s: error %v must be a non-retriable CloudError", name, err)
+		}
+		if !strings.Contains(err.Error(), "set pve.api_token, or pve.user and pve.password") {
+			t.Errorf("%s: error = %q, want the credential group remedy", name, err.Error())
+		}
+		for _, secret := range []string{wireJobTokenValue, wireEntryPassword} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: error text carries a credential fixture value", name)
+			}
+		}
+	}
+	if len(tracker.calls) != 0 {
+		t.Errorf("ClientFactory must not be invoked for a refused entry, got %d call(s)", len(tracker.calls))
+	}
+}
+
+// TestWithRequestOverrides_CATrustWarnings asserts the two trust-root lines.
+// An entry on another endpoint that drops the job's private CA says so, and a
+// CA-only entry on the job endpoint that swaps the root under the inherited
+// job credentials says so too. Neither line carries a certificate or a
+// credential value.
+func TestWithRequestOverrides_CATrustWarnings(t *testing.T) {
+	t.Parallel()
+	jobCA := handlers.SelfSignedCAPEMForTest(t)
+	entryCA := handlers.SelfSignedCAPEMForTest(t)
+	const dropText = "does not inherit the job-level pve.ca_cert"
+	const swapText = "replaces the job-level pve.ca_cert"
+
+	for _, tc := range []struct {
+		name      string
+		jobCA     string
+		extra     map[string]any
+		wantText  string // empty means neither trust line may fire
+		wantGroup string
+	}{
+		{
+			name:      "other host without ca_cert drops the job CA",
+			jobCA:     jobCA,
+			extra:     map[string]any{"pve_host": "az2.example", "pve_api_token": overrideTestEntryToken},
+			wantText:  dropText,
+			wantGroup: config.CredentialGroupEntry,
+		},
+		{
+			name:      "other port without ca_cert drops the job CA",
+			jobCA:     jobCA,
+			extra:     map[string]any{"pve_port": float64(8443), "pve_api_token": overrideTestEntryToken},
+			wantText:  dropText,
+			wantGroup: config.CredentialGroupEntry,
+		},
+		{
+			name:  "other host with its own ca_cert is quiet",
+			jobCA: jobCA,
+			extra: map[string]any{"pve_host": "az2.example", "pve_api_token": overrideTestEntryToken, "pve_ca_cert": entryCA},
+		},
+		{
+			name:  "other host with no job CA is quiet",
+			extra: map[string]any{"pve_host": "az2.example", "pve_api_token": overrideTestEntryToken},
+		},
+		{
+			name:  "other host with verify_ssl off is left to the downgrade warning",
+			jobCA: jobCA,
+			extra: map[string]any{"pve_host": "az2.example", "pve_api_token": overrideTestEntryToken, "pve_verify_ssl": false},
+		},
+		{
+			name:      "ca_cert alone on the job endpoint swaps the root under the job credentials",
+			jobCA:     jobCA,
+			extra:     map[string]any{"pve_ca_cert": entryCA},
+			wantText:  swapText,
+			wantGroup: config.CredentialGroupInherited,
+		},
+		{
+			name:  "ca_cert with the entry's own credentials on the job endpoint is quiet",
+			jobCA: jobCA,
+			extra: map[string]any{"pve_ca_cert": entryCA, "pve_api_token": overrideTestEntryToken},
+		},
+		{
+			name:  "ca_cert equal to the job CA is quiet",
+			jobCA: jobCA,
+			extra: map[string]any{"pve_ca_cert": jobCA},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := overrideTestBaseConfig()
+			base.PVECACertPEM = tc.jobCA
+			observedLogger, obs := log.NewObservedLogger(log.LevelDebug)
+			deps := handlers.Deps{
+				Config: base,
+				PVE:    &mockPVEClient{},
+				Logger: observedLogger,
+				Overrides: &handlers.RequestOverrideRuntime{
+					ClientFactory: (&fakeTransportClientFactory{}).Factory,
+					Logger:        log.NewNopLogger(),
+				},
+			}
+			if _, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra}); err != nil {
+				t.Fatalf("WithRequestOverrides: %v", err)
+			}
+			assertTrustWarning(t, obs.All(), tc.wantText, tc.wantGroup, []string{
+				base.Password, overrideTestEntryToken, jobCA, entryCA, "BEGIN CERTIFICATE",
+			})
+		})
+	}
+}
+
+// assertTrustWarning checks that exactly the wanted trust-root line fired,
+// with the wanted credential group, and that no log line carries a secret
+// or certificate fixture value.
+func assertTrustWarning(t *testing.T, entries []log.Entry, wantText, wantGroup string, secrets []string) {
+	t.Helper()
+	found := false
+	for _, e := range entries {
+		rendered := fmt.Sprintf("%s %v", e.Message, e.Attrs)
+		for _, secret := range secrets {
+			if secret != "" && strings.Contains(rendered, secret) {
+				t.Errorf("a log line carries a credential or certificate fixture value: %q", e.Message)
+			}
+		}
+		isTrustLine := strings.Contains(e.Message, "does not inherit the job-level pve.ca_cert") ||
+			strings.Contains(e.Message, "replaces the job-level pve.ca_cert")
+		if !isTrustLine {
+			continue
+		}
+		if wantText == "" || !strings.Contains(e.Message, wantText) {
+			t.Errorf("unexpected trust warning %q", e.Message)
+			continue
+		}
+		found = true
+		if e.Level != log.LevelWarn {
+			t.Errorf("trust warning level = %v, want Warn", e.Level)
+		}
+		if got := e.Attrs["credential_group"]; got != wantGroup {
+			t.Errorf("credential_group = %v, want %q", got, wantGroup)
+		}
+		if e.Attrs["effective_pve_host"] == nil {
+			t.Error("the trust warning must name the effective host")
+		}
+	}
+	if wantText != "" && !found {
+		t.Errorf("expected a Warn containing %q, found none", wantText)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -74,13 +75,20 @@ type RequestOverrideRuntime struct {
 	Logger *log.Logger
 
 	// BaseHost is the job-level pve.host. An override bundle inherits the
-	// job-level node_endpoints map only when its effective host equals this
-	// value: the map's node names belong to the job-level cluster, and an
+	// job-level node_endpoints map only when its effective endpoint equals
+	// this host and BasePort: the map's node names belong to the job-level cluster, and an
 	// override routed at a different cluster must not dial the job-level
 	// cluster's addresses for same-named nodes. Discovery (gated on the
 	// effective config's verify_ssl) still applies either way, since it asks
 	// the override's own cluster.
 	BaseHost string
+
+	// BasePort is the job-level pve.port. It joins BaseHost in the endpoint
+	// comparison (config.SameEndpoint), so an entry on the job host at another
+	// port, such as a second cluster behind the same tunnel or load balancer,
+	// does not inherit the job cluster's node_endpoints map. Zero means the
+	// PVE default, 8006.
+	BasePort int
 
 	// MaxCachedBundles caps the number of distinct override identities (see
 	// requestOverrideCacheKey) whose PVE client/agent/resolver bundle stays
@@ -345,9 +353,9 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 
 	// See RequestOverrideRuntime.BaseHost: the explicit node_endpoints map
 	// names nodes of the job-level cluster, so it applies only when this
-	// bundle targets that same host.
+	// bundle targets that same endpoint, host and port alike.
 	explicitEndpoints := cfg.NodeEndpoints
-	if cfg.Host != r.BaseHost {
+	if !config.SameEndpoint(&config.CPIConfig{Host: r.BaseHost, Port: r.BasePort}, cfg) {
 		explicitEndpoints = nil
 	}
 	nodeEndpoints := pve.NewNodeEndpointResolver(client, explicitEndpoints, cfg.Host, cfg.NodeEndpointsDiscoveryAllowed(), logger)
@@ -438,6 +446,15 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 		_, _ = fmt.Fprintf(h, "storage_policy=%s\x00", policyJSON)
 	} else {
 		_, _ = fmt.Fprintf(h, "storage_policy_marshal_error=%s\x00", err.Error())
+	}
+	// The CA is folded in as a digest because a PEM bundle is long, and
+	// because two entries with the same host but different trust roots must
+	// never share one client whose TLS config already baked in the first.
+	// An empty CA adds nothing, so a config without one keys exactly as it
+	// did before the CA became overridable.
+	if cfg.PVECACertPEM != "" {
+		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
+		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))
 	}
 	pwHash := sha256.Sum256([]byte(cfg.Password))
 	tokHash := sha256.Sum256([]byte(cfg.APIToken))
@@ -618,20 +635,7 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 		log.String("effective_pve_host", effCfg.Host),
 	)
 
-	// A per-request TLS-verification downgrade is a security-relevant event
-	// that must be attributable to the request that carried it: the client
-	// constructor's own warning goes to the runtime logger (no request_id or
-	// method) and fires once per cached bundle, not once per affected
-	// request. The inherited job-level credentials are sent to the overridden
-	// host over the unverified connection, so name the host explicitly. This
-	// only fires when reject_tls_downgrade_overrides did NOT already reject
-	// the request above (knob off, or base config already had verify_ssl=false).
-	if !effCfg.VerifySSLValue() && verifySSLOverrideApplied {
-		d.Log(ctx).Warn(
-			"cpi: request context override disables TLS verification for this request; job-level PVE credentials will be sent to the overridden host without certificate validation",
-			log.String("effective_pve_host", effCfg.Host),
-		)
-	}
+	d.warnOverrideTrust(ctx, effCfg, applied, verifySSLOverrideApplied)
 
 	d.Config = effCfg
 	d.RequestOverridden = true
@@ -641,4 +645,67 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	d.NodeEndpoints = bundle.nodeEndpoints
 	d.ISO = bundle.iso
 	return d, nil
+}
+
+// warnOverrideTrust logs the trust changes an override makes to the
+// connection its credentials cross. Each line names the credential group
+// (see config.OverrideCredentialGroup), the effective host, and property
+// keys, never a credential or certificate value. Credentials travel with the
+// endpoint, so the job-level group reaches only the job-level endpoint and
+// any other endpoint receives the entry's own group.
+//
+// A per-request TLS-verification downgrade is a security-relevant event that
+// must be attributable to the request that carried it: the client
+// constructor's own warning goes to the runtime logger (no request_id or
+// method) and fires once per cached bundle, not once per affected request.
+// The downgrade line only fires when reject_tls_downgrade_overrides did NOT
+// already reject the request (knob off, or base config already had
+// verify_ssl=false).
+func (d Deps) warnOverrideTrust(ctx context.Context, effCfg *config.CPIConfig, applied []string,
+	verifySSLOverrideApplied bool,
+) {
+	group := config.OverrideCredentialGroup(d.Config, effCfg, applied)
+	if !effCfg.VerifySSLValue() {
+		if !verifySSLOverrideApplied {
+			return
+		}
+		msg := "cpi: request context override disables TLS verification for this request; " +
+			"the cpi-config entry's own PVE credentials will be sent to the effective host without certificate validation"
+		if group == config.CredentialGroupInherited {
+			msg = "cpi: request context override disables TLS verification for this request; " +
+				"the inherited job-level PVE credentials will be sent to the job-level host without certificate validation"
+		}
+		d.Log(ctx).Warn(msg,
+			log.String("effective_pve_host", effCfg.Host),
+			log.String("credential_group", group),
+		)
+		return
+	}
+
+	caApplied := slices.Contains(applied, "pve_ca_cert")
+	switch {
+	case !caApplied && d.Config.PVECACertPEM != "" && effCfg.PVECACertPEM == "" &&
+		!config.SameEndpoint(d.Config, effCfg):
+		// The job's private CA never follows a request to another endpoint.
+		// Say so, because the first API call to a cluster behind a private CA
+		// otherwise fails with an x509 error that names the host but not the
+		// cause.
+		d.Log(ctx).Warn(
+			"cpi: request context override targets another PVE endpoint and does not inherit the job-level pve.ca_cert; "+
+				"the effective host is verified against the system trust pool unless the cpi-config entry sets pve.ca_cert",
+			log.String("effective_pve_host", effCfg.Host),
+			log.String("credential_group", group),
+		)
+	case caApplied && group == config.CredentialGroupInherited && effCfg.PVECACertPEM != d.Config.PVECACertPEM:
+		// A CA-only entry on the job endpoint keeps the job credentials and
+		// swaps the root they are verified against. That is allowed, but it
+		// is as security-relevant as a downgrade, so it is logged the same way.
+		d.Log(ctx).Warn(
+			"cpi: request context override replaces the job-level pve.ca_cert for this request; "+
+				"the inherited job-level PVE credentials will be sent to the job-level host over a connection verified "+
+				"against the cpi-config entry's CA",
+			log.String("effective_pve_host", effCfg.Host),
+			log.String("credential_group", group),
+		)
+	}
 }
