@@ -123,6 +123,9 @@ type overrideBundle struct {
 	agent         agent.Agent
 	resolver      pve.BackendResolver
 	nodeEndpoints *pve.NodeEndpointResolver
+	// iso defers this bundle's iso_storage_follow_vm_storage lookup to first
+	// use, so building the bundle issues no PVE call.
+	iso *agent.ISOStorageResolver
 }
 
 // overrideCacheEntry is the value stored in each lru list element, carrying
@@ -217,17 +220,13 @@ func (r *RequestOverrideRuntime) cachePutOrExisting(key string, bundle *override
 // DIFFERENT identities never block each other — only same-identity callers
 // share a buildCall, and the leader's build itself runs outside r.mu.
 //
-// ctx bounds the live PVE calls the build path makes (client construction
-// itself issues no API call — auth is lazy — but agent.ResolveISOStorage may
-// issue one /storage list call when pve.iso_storage_follow_vm_storage is
-// enabled) — it is the dispatched request's own ctx, so a build blocked on a
-// dead overridden cluster is bounded by whatever timeout/cancellation
-// already governs that request (the operation-timeout envelope when
-// enabled, process shutdown otherwise), not by an unbounded background
-// timer. Only the LEADER's ctx governs the actual build; a follower that is
-// itself canceled while waiting returns its own ctx error immediately — its
-// cancellation is not propagated into the leader's in-flight build, since
-// doing so would abort the build for every other waiting follower too.
+// ctx only bounds a follower's wait for the leader. The build itself issues
+// no PVE call: client construction is lazy (auth happens on first use), and
+// the iso_storage lookup is deferred to the first handler that needs the pool
+// (see agent.ISOStorageResolver). A follower that is itself canceled while
+// waiting returns its own ctx error immediately — its cancellation is not
+// propagated into the leader's in-flight build, since doing so would abort the
+// build for every other waiting follower too.
 //
 // Failure modes:
 //   - r is nil → returns an error rather than a nil-pointer panic. Guarded
@@ -292,7 +291,7 @@ func (r *RequestOverrideRuntime) resolve(ctx context.Context, cfg *config.CPICon
 				built, err = nil, fmt.Errorf("cpi: override bundle build panicked: %v", rec)
 			}
 		}()
-		built, err = r.buildBundle(ctx, cfg)
+		built, err = r.buildBundle(cfg)
 	}()
 	r.finishBuild(key, call, built, err)
 	return built, err
@@ -322,7 +321,7 @@ func (r *RequestOverrideRuntime) finishBuild(key string, call *buildCall, bundle
 // holds r.mu for the duration of this call, so a slow or unreachable
 // overridden cluster never blocks resolve() calls for OTHER identities —
 // only same-identity followers, who are waiting on this exact result anyway.
-func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CPIConfig) (*overrideBundle, error) {
+func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBundle, error) {
 	logger := r.Logger
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -334,15 +333,15 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	}
 
 	// Mirror main.go's boot-agent construction (see cmd/cpi/main.go's
-	// cfgForBoot) and its ISOStorage resolution (agent.ResolveISOStorage), so
-	// an overridden request's agent behaves identically to the job-level one,
+	// cfgForBoot) and its deferred ISOStorage resolution
+	// (agent.ISOStorageResolver), so an overridden request's agent behaves identically to the job-level one,
 	// modulo the overridden connection/storage/node identity itself. Both
 	// paths take the normalized mode from config.BootAgentMode.
 	cfgForBoot := *cfg
 	cfgForBoot.AgentMode = cfg.BootAgentMode()
 	// This copy preserves inherited operator policy without mutating shared cfg.
 	cfgForBoot.CaptureISOStoragePolicy()
-	cfgForBoot.ISOStorage = agent.ResolveISOStorage(ctx, &cfgForBoot, client, logger)
+	iso := agent.NewISOStorageResolver(&cfgForBoot, client, logger)
 
 	// See RequestOverrideRuntime.BaseHost: the explicit node_endpoints map
 	// names nodes of the job-level cluster, so it applies only when this
@@ -353,7 +352,7 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	}
 	nodeEndpoints := pve.NewNodeEndpointResolver(client, explicitEndpoints, cfg.Host, cfg.NodeEndpointsDiscoveryAllowed(), logger)
 
-	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
+	bootAgent, err := agent.NewAgentWithISOResolver(&cfgForBoot, client, nodeEndpoints, iso, logger)
 	if err != nil {
 		return nil, fmt.Errorf("build boot agent: %w", err)
 	}
@@ -370,7 +369,7 @@ func (r *RequestOverrideRuntime) buildBundle(ctx context.Context, cfg *config.CP
 	backendResolver := pve.NewBackendResolver(client, storageInfoCache, cfg.Node,
 		pve.WithEmptyListingCorroborators(BackendCorroborators(cfg, client)))
 
-	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver, nodeEndpoints: nodeEndpoints}, nil
+	return &overrideBundle{client: client, agent: bootAgent, resolver: backendResolver, nodeEndpoints: nodeEndpoints, iso: iso}, nil
 }
 
 // requestOverrideCacheKey derives a stable identity string from exactly the
@@ -639,5 +638,6 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	d.Agent = bundle.agent
 	d.Resolver = bundle.resolver
 	d.NodeEndpoints = bundle.nodeEndpoints
+	d.ISO = bundle.iso
 	return d, nil
 }

@@ -13,7 +13,7 @@ This is the operator-facing record of the design decisions behind the pre-releas
 | D3 | Stemcell refcounting | Per-director reference sets keyed by BOSH director UUID, stored in the cache template's provenance |
 | D4 | Disk CIDs | Kept the `pvd-`/`pvz-` envelope; shipped a first-class `pve-cid` operator tool; fixed a sentinel gap |
 | D5 | `network_mode` default | `bridge` (plain Linux bridges, zero SDN prerequisites); SDN is a one-line opt-in |
-| D6 | Resource pools | Kept default-on (`bosh`/`bosh-templates`); added a startup preflight that fails fast on a missing grant |
+| D6 | Resource pools | Kept default-on (`bosh`/`bosh-templates`); added a per-request pool check that fails `create_vm` and `create_stemcell` on a missing grant |
 | D7 | `iso_storage` default | Follows `vm_storage` when eligible, instead of always defaulting to node-local `local` |
 | D8 | Copy-vs-move / storage identity | Full backing-identity normalization: two storage IDs pointing at the same export are recognized as the same storage at every point the CPI compares two storage identities |
 | D9 | Cross-cluster delete safety | `pve.destroy_unreferenced_disks` now defaults to `false` |
@@ -150,15 +150,15 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 ---
 
-## D6 — Resource pools: default-on, with a startup preflight
+## D6 — Resource pools: default-on, with a per-request pool check
 
-**Context.** Resource pools (`bosh` for VMs, `bosh-templates` for stemcell cache templates) were already default-on as an ACL scoping mechanism, but nothing verified pool access before the CPI began serving requests. A missing `Pool.Allocate`/`Pool.Audit` grant only surfaced mid-deploy, on the first real `create_vm` or `create_stemcell`.
+**Context.** Resource pools (`bosh` for VMs, `bosh-templates` for stemcell cache templates) were already default-on as an ACL scoping mechanism, but nothing verified pool access before a request used a pool. A missing `Pool.Allocate`/`Pool.Audit` grant only surfaced mid-deploy, on the first real `create_vm` or `create_stemcell`.
 
-**Options considered.** Make pools opt-in only (loses the ACL-scoping benefit by default); make pools mandatory with hard startup validation (breaking for operators who deliberately opt out); keep default-on and add a cheap, read-only startup probe.
+**Options considered.** Make pools opt-in only (loses the ACL-scoping benefit by default); make pools mandatory with hard startup validation (breaking for operators who deliberately opt out); keep default-on and add a cheap, read-only probe at the start of the requests that need pools.
 
-**Chosen: default-on, unchanged, plus a startup preflight.** At boot, the CPI issues `GET /pools/{poolid}` (the cheapest side-effect-free call that exercises the `Pool.Audit` grant) against every configured pool. A pool that does not exist yet is not a failure — pools are created lazily on first use. Only a classified permission error (HTTP 401/403) fails the preflight, with a message naming the exact grant to add. Every other failure (pool genuinely absent, network fault, transient PVE error) is logged and treated as non-blocking, so a startup-time hiccup never prevents the CPI from booting.
+**Chosen: default-on, unchanged, plus a per-request pool check.** At the start of `create_vm` and `create_stemcell`, the CPI issues `GET /pools/{poolid}` (the cheapest side-effect-free call that exercises the `Pool.Audit` grant) against every configured pool on the cluster that request targets, so a request routed to a second cluster through `cpi_config` is checked against that cluster and never against the job-level one. A pool that does not exist yet is not a failure — pools are created lazily on first use. Only a classified permission error (HTTP 401/403) fails that request, as a non-retriable error naming the exact grant to add. Every other failure (pool genuinely absent, network fault, transient PVE error) is logged and treated as non-blocking, so a transient hiccup never blocks a request on its own.
 
-**Operator-visible consequences.** A genuinely missing grant now surfaces as a boot-time failure with a copy-pasteable fix, rather than failing the first real deploy partway through. Opt out of pool assignment entirely with `pve.vm_pool: ""` and `pve.stemcell_template_pool: ""` — the preflight is then skipped, since there is nothing to probe.
+**Operator-visible consequences.** A genuinely missing grant now surfaces as a failure of the first `create_vm` or `create_stemcell`, before anything is created, with a copy-pasteable fix. It fails only the requests that need the pool, so `info`, `has_vm`, and every call routed to a healthy cluster keep working. Opt out of pool assignment entirely with `pve.vm_pool: ""` and `pve.stemcell_template_pool: ""` — the check is then skipped, since there is nothing to probe.
 
 **Migration.** None — this is additive. It only fails startup for a configuration that was already broken.
 
@@ -170,7 +170,7 @@ Both were already anticipated in the pre-existing per-NIC design; the bridge-mod
 
 **Options considered.** Keep `local` as the default; require `iso_storage` to be set explicitly (a breaking change with no default); default to following `vm_storage` when it is eligible.
 
-**Chosen: follow `vm_storage` by default.** `pve.iso_storage_follow_vm_storage` defaults `true`: at CPI process startup, before any `create_vm` call, the CPI resolves the ISO pool to `vm_storage` instead of the spec's `local` default — provided `vm_storage` advertises PVE content type `iso` and is shared. An `iso_storage` pinned to any value *other than* the spec default `local` always wins over this behavior. Because BOSH renders the `local` default into the job config whether or not the operator set it, the CPI cannot distinguish "unset" from "explicitly `local`", so it treats the literal value `local` as the unset signal. Setting `iso_storage_follow_vm_storage: false` restores the old always-`local` default.
+**Chosen: follow `vm_storage` by default.** `pve.iso_storage_follow_vm_storage` defaults `true`: the first time a request needs the ISO pool, on the cluster that request targets, the CPI resolves the ISO pool to `vm_storage` instead of the spec's `local` default — provided `vm_storage` advertises PVE content type `iso` and is shared. An `iso_storage` pinned to any value *other than* the spec default `local` always wins over this behavior. Because BOSH renders the `local` default into the job config whether or not the operator set it, the CPI cannot distinguish "unset" from "explicitly `local`", so it treats the literal value `local` as the unset signal. Setting `iso_storage_follow_vm_storage: false` restores the old always-`local` default.
 
 **Operator-visible consequences.** HA/DLB-enabled deployments on a shared `vm_storage` pool that also serves `iso` content no longer need a separate `iso_storage` manifest edit to avoid the migration-safety warning. Genuinely single-node deployments cannot pin the node-local pool by writing `iso_storage: local` — that value reads as "unset" and gets `vm_storage`-following. Either set `iso_storage_follow_vm_storage: false`, or name the node-local pool under a distinct storage ID. When `vm_storage` is block-backed or non-shared the CPI falls back to `iso_storage` unchanged and logs a warning, so the practical outcome on a single-node lvmthin lab is still `local` — by fail-open, not by precedence.
 

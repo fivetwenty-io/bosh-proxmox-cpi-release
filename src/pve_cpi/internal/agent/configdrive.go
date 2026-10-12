@@ -67,8 +67,11 @@ type ConfigDrive struct {
 	managedExistingISO     string
 	managedPayloadCheck    func([]byte) error
 	storage                string
-	pveSvc                 pve.Client
-	logger                 *log.Logger
+	// isoResolver, when non-nil, defers the iso_storage_follow_vm_storage
+	// lookup to first use; storage then holds the configured fallback.
+	isoResolver *ISOStorageResolver
+	pveSvc      pve.Client
+	logger      *log.Logger
 	// nodeEndpoints resolves the direct pveproxy address for the upload's
 	// target node; nil (every test that does not care) means the upload takes
 	// the proxied path through the configured endpoint.
@@ -105,6 +108,18 @@ func newConfigDriveForTest(pveSvc pve.Client, storage string, logger *log.Logger
 	return &ConfigDrive{pveSvc: pveSvc, storage: storage, logger: logger}
 }
 
+// storageName returns the pool the ISO lives on. With a deferred resolver the
+// first call performs the follow-vm-storage lookup; an empty answer keeps the
+// configured fallback.
+func (a *ConfigDrive) storageName(ctx context.Context) string {
+	if a.isoResolver != nil {
+		if resolved := a.isoResolver.Resolve(ctx); resolved != "" {
+			return resolved
+		}
+	}
+	return a.storage
+}
+
 // Configure builds the ConfigDrive ISO, uploads it to PVE storage, and
 // attaches it to the VM as a CD-ROM on scsi30 (see configDriveSlot for
 // the SCSI-slot reservation map).
@@ -131,7 +146,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	// Warn once per process when iso_storage resolves to "local". Local storage
 	// ISOs are readable by anyone with access to the PVE node-local storage pool,
 	// which is not appropriate for multi-tenant environments.
-	if a.storage == isoStorageSpecDefault {
+	if a.storageName(ctx) == isoStorageSpecDefault {
 		localISOStorageWarnOnce.Do(func() {
 			a.logger.Warn("iso_storage=local; ConfigDrive ISOs are readable by anyone with access to the PVE node-local storage. Recommend dedicated pool. See docs/operations.md ISO storage section.")
 		})
@@ -160,7 +175,7 @@ func (a *ConfigDrive) Configure(ctx context.Context, node string, vmid int, cfg 
 	}
 	if a.managedExistingISO != "" {
 		filename := configDriveISOFilename(vmid)
-		if a.managedExistingISO != fmt.Sprintf("%s:iso/%s", a.storage, filename) {
+		if a.managedExistingISO != fmt.Sprintf("%s:iso/%s", a.storageName(ctx), filename) {
 			return cpierrors.Cloud("managed ISO identity differs from proven artifact")
 		}
 		found, err := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, a.managedExistingISO)
@@ -381,7 +396,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 			}
 			defer func() { _ = f.Close() }()
 
-			upid, err := a.pveSvc.Storage().Upload(upCtx, node, a.storage, "iso", filename, f)
+			upid, err := a.pveSvc.Storage().Upload(upCtx, node, a.storageName(ctx), "iso", filename, f)
 			if err != nil {
 				if pve.IsTransportConnectionDrop(err) {
 					sweepNeeded = true
@@ -438,7 +453,7 @@ func (a *ConfigDrive) uploadISO(ctx context.Context, node, localPath, filename s
 }
 
 func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, filename string) error {
-	value := fmt.Sprintf("%s:iso/%s,media=cdrom", a.storage, filename)
+	value := fmt.Sprintf("%s:iso/%s,media=cdrom", a.storageName(ctx), filename)
 	params := &sdknodes.UpdateQemuConfigParams{
 		Scsi: map[int]string{configDriveSlotIndex: value},
 	}
@@ -462,7 +477,7 @@ func (a *ConfigDrive) attachISO(ctx context.Context, node string, vmid int, file
 // imgdel ran, then PVE would fire imgdel during qmstart and remove the just-
 // uploaded ISO — causing qmstart to fail with "volume … does not exist".
 func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename string) (bool, error) {
-	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
+	volume := fmt.Sprintf("%s:iso/%s", a.storageName(ctx), filename)
 	if a.managedAllocationBytes > 0 {
 		exists, err := pve.ObserveStorageVolumePresence(ctx, a.pveSvc, node, volume)
 		if err != nil {
@@ -473,7 +488,7 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 		}
 		return false, nil
 	}
-	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storage, volume)
+	existed, upid, err := a.pveSvc.Storage().DeleteVolumeIfExistsAsync(ctx, node, a.storageName(ctx), volume)
 	if err != nil {
 		return false, pve.WrapError(err)
 	}
@@ -490,9 +505,9 @@ func (a *ConfigDrive) removeISOIfExists(ctx context.Context, node, filename stri
 // downstream operations (e.g. re-uploading to the same name on a recycled
 // VMID) cannot race a late-firing imgdel.
 func (a *ConfigDrive) removeISOFromStorage(ctx context.Context, node, filename string) error {
-	volume := fmt.Sprintf("%s:iso/%s", a.storage, filename)
+	volume := fmt.Sprintf("%s:iso/%s", a.storageName(ctx), filename)
 	delErr := pve.RetryOnTransientOrLock(ctx, a.logger, "configdrive_delete", 0, func() error {
-		upid, err := a.pveSvc.Storage().DeleteVolumeAsync(ctx, node, a.storage, volume)
+		upid, err := a.pveSvc.Storage().DeleteVolumeAsync(ctx, node, a.storageName(ctx), volume)
 		if err != nil {
 			return err
 		}

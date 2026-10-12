@@ -118,9 +118,10 @@ type CPIConfig struct {
 
 	// ISOStorageFollowVMStorage, when true, resolves the ConfigDrive ISO pool
 	// to VMStorage instead of the ISOStorage default, provided VMStorage
-	// advertises PVE content type `iso` and is shared. This is evaluated once
-	// at CPI process startup (see agent.ResolveISOStorage), before any create_vm
-	// call, because BOSH renders the "local" spec default for iso_storage into
+	// advertises PVE content type `iso` and is shared. This is evaluated the
+	// first time a request needs the ISO pool (see agent.ISOStorageResolver),
+	// against the cluster that request targets, because BOSH renders the
+	// "local" spec default for iso_storage into
 	// the config JSON whether or not the operator set it explicitly — the CPI
 	// cannot distinguish "unset" from "explicitly local" any other way. As a
 	// result this flag treats ISOStorage=="local" (the literal spec default) as

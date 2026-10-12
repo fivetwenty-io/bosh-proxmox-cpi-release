@@ -573,6 +573,17 @@ func createVM(
 		return nil, err
 	}
 
+	// Fail fast, on the cluster this request targets, when the configured
+	// pool layers are not readable by the CPI's identity, naming the grant to
+	// fix instead of surfacing an opaque permission error mid-create. It runs
+	// after the last purely local validation and before the first PVE call
+	// (the managed-VM resume lookup), so a malformed request never pays for a
+	// probe and no API call runs ahead of the check.
+	if poolErr := ensurePoolAccess(ctx, deps); poolErr != nil {
+		logger.Error("pools preflight failed", log.Err(poolErr))
+		return nil, poolErr
+	}
+
 	if existing, found, resumeErr := resumeExistingManagedVM(ctx, deps, args, parsed); found || resumeErr != nil {
 		return existing, resumeErr
 	}
@@ -1496,7 +1507,7 @@ func allocateVM(
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
-		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
+		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(ctx, deps, shape.vmStorage)),
 		pve.WithNodeImageStorageScan(shape.node),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),
@@ -1540,7 +1551,7 @@ func allocateVMForFallback(
 		shape.maxAttempts,
 		pve.WithRange(shape.rangeStart, deps.Config.VMIDRangeEnd),
 		pve.WithStorageScan(shape.node, shape.vmStorage),
-		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(deps, shape.vmStorage)),
+		pve.WithExtraStorageScan(shape.node, isoStorageScanTarget(ctx, deps, shape.vmStorage)),
 		pve.WithNodeImageStorageScan(shape.node),
 		pve.WithBackoffFunc(newCreateVMRetryBackoff(
 			deps.Config.RetryStorageImport(), deps.Config.RetryVMIDAlloc())),

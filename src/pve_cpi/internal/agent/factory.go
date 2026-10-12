@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	sdkclusterstorage "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 
@@ -29,6 +30,19 @@ import (
 // alongside the pve.Client so a per-request override bundle's agent routes
 // within its own cluster (see handlers.RequestOverrideRuntime.BaseHost).
 func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, nodeEndpoints *pve.NodeEndpointResolver, logger *log.Logger) (Agent, error) {
+	return NewAgentWithISOResolver(cfg, pveClient, nodeEndpoints, nil, logger)
+}
+
+// NewAgentWithISOResolver is NewAgent for a caller that defers the
+// iso_storage_follow_vm_storage lookup. When iso is non-nil the ConfigDrive
+// asks it for the effective pool on first use, so building the agent issues no
+// PVE call. cfg.ISOStorage is still the pool the agent falls back to and the
+// one that must be non-empty at construction. A nil iso behaves exactly like
+// NewAgent.
+func NewAgentWithISOResolver(
+	cfg *config.CPIConfig, pveClient pve.Client, nodeEndpoints *pve.NodeEndpointResolver,
+	iso *ISOStorageResolver, logger *log.Logger,
+) (Agent, error) {
 	if cfg == nil {
 		return nil, cpierrors.Cloud("agent.NewAgent: cfg must not be nil")
 	}
@@ -54,7 +68,9 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, nodeEndpoints *pve.No
 		if isoStorage == "" {
 			return nil, cpierrors.Cloud("agent.NewAgent: cloudinit mode requires ISOStorage, StemcellStorage, or VMStorage to be set")
 		}
-		return NewConfigDrive(pveClient, isoStorage, nodeEndpoints, logger), nil
+		drive := NewConfigDrive(pveClient, isoStorage, nodeEndpoints, logger)
+		drive.isoResolver = iso
+		return drive, nil
 
 	case config.AgentModeNoAgent:
 		if cfg.ISOStorage != "" {
@@ -81,11 +97,95 @@ func NewAgent(cfg *config.CPIConfig, pveClient pve.Client, nodeEndpoints *pve.No
 // config.CPIConfig.ISOStorageFollowVMStorage.
 const isoStorageSpecDefault = "local"
 
+// ISOStorageResolver resolves the effective iso_storage pool on first use and
+// remembers a conclusive answer. It exists so that building a boot agent, or
+// reading the job-level config at process start, issues no PVE call: the
+// iso_storage_follow_vm_storage lookup runs against the cluster a request
+// actually targets, when a handler first needs the pool.
+//
+// Only a conclusive answer is remembered: a /storage index that was read, or a
+// configuration that needs no lookup. A lookup that failed, or that ran under a
+// context that had already ended, returns the configured fallback for that one
+// call and is retried by the next, so a transient fault or a short request
+// deadline cannot pin a shared-storage cluster to a node-local ISO pool.
+//
+// It is held by pointer (in the job-level Deps and in each override bundle)
+// because Deps is copied by value on every request, and a mutex in a copied
+// struct would trip go vet's copylocks check. Concurrent callers share one
+// in-flight lookup, and no lock is held across the API call.
+type ISOStorageResolver struct {
+	mu       sync.Mutex
+	cfg      config.CPIConfig
+	client   pve.Client
+	logger   *log.Logger
+	armed    bool
+	done     bool
+	value    string
+	inflight chan struct{}
+}
+
+// NewISOStorageResolver snapshots cfg and returns a resolver that calls
+// ResolveISOStorage with it on first Resolve. The snapshot keeps later changes
+// to the caller's config from changing the answer.
+func NewISOStorageResolver(cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) *ISOStorageResolver {
+	r := &ISOStorageResolver{client: pveClient, logger: logger}
+	if cfg != nil {
+		r.cfg = *cfg
+		r.armed = true
+	}
+	if r.logger == nil {
+		r.logger = log.NewNopLogger()
+	}
+	return r
+}
+
+// Resolve returns the effective iso_storage pool, performing the lookup when no
+// conclusive answer is remembered yet. A nil receiver returns "" so callers fall
+// back to their configured value. ctx bounds the one /storage call the lookup
+// may make, and a caller waiting on another caller's lookup stops waiting when
+// its own ctx ends, returning the configured fallback.
+func (r *ISOStorageResolver) Resolve(ctx context.Context) string {
+	if r == nil || !r.armed {
+		return ""
+	}
+	for {
+		r.mu.Lock()
+		if r.done {
+			value := r.value
+			r.mu.Unlock()
+			return value
+		}
+		if wait := r.inflight; wait != nil {
+			r.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return r.cfg.ISOStorage
+			}
+		}
+		call := make(chan struct{})
+		r.inflight = call
+		r.mu.Unlock()
+
+		value, conclusive := resolveISOStorage(ctx, &r.cfg, r.client, r.logger)
+
+		r.mu.Lock()
+		if conclusive {
+			r.done, r.value = true, value
+		}
+		r.inflight = nil
+		r.mu.Unlock()
+		close(call)
+		return value
+	}
+}
+
 // ResolveISOStorage implements the opt-in pve.iso_storage_follow_vm_storage
-// resolution. Callers invoke this once at process startup, before NewAgent,
-// and use the returned value as the effective iso_storage for the lifetime of
-// the process (and for any HA migration-safety checks that also read
-// cfg.ISOStorage, so both stay consistent).
+// resolution. Handlers reach it through an ISOStorageResolver, which runs it
+// against the cluster a request targets on first use and remembers a
+// conclusive answer, so the boot agent and the HA migration-safety checks see
+// the same effective iso_storage.
 //
 // Resolution order:
 //  1. iso_storage_follow_vm_storage is false (default), or cfg is nil, or the
@@ -107,30 +207,41 @@ const isoStorageSpecDefault = "local"
 // "unavailable", falls back with a Warn) since callers may invoke this before
 // a client is fully wired in test harnesses.
 func ResolveISOStorage(ctx context.Context, cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) string {
+	value, _ := resolveISOStorage(ctx, cfg, pveClient, logger)
+	return value
+}
+
+// resolveISOStorage is ResolveISOStorage that also reports whether the answer
+// is conclusive. An answer is inconclusive when it is the fallback because the
+// lookup itself failed or because ctx had ended, since a later attempt could
+// answer differently. Every other outcome is conclusive: no lookup was needed,
+// or the /storage index was read and vm_storage was found eligible, absent, not
+// iso-capable, or not shared.
+func resolveISOStorage(ctx context.Context, cfg *config.CPIConfig, pveClient pve.Client, logger *log.Logger) (string, bool) {
 	if cfg == nil {
-		return ""
+		return "", true
 	}
 	fallback := cfg.ISOStorage
 
 	if !cfg.ISOStorageFollowVMStorageEnabled() {
-		return fallback
+		return fallback, true
 	}
 	if cfg.AgentMode != config.AgentModeCloudInit && cfg.AgentMode != config.AgentModeAuto {
-		return fallback
+		return fallback, true
 	}
 	if fallback != isoStorageSpecDefault {
 		// Operator explicitly pinned iso_storage to a non-default pool.
-		return fallback
+		return fallback, true
 	}
 	if cfg.VMStorage == "" {
 		logger.Warn("iso_storage_follow_vm_storage: pve.vm_storage is empty, falling back to iso_storage",
 			log.String("iso_storage", fallback))
-		return fallback
+		return fallback, true
 	}
 	if ctx == nil || pveClient == nil || pveClient.ClusterStorage() == nil {
 		logger.Warn("iso_storage_follow_vm_storage: cluster storage service unavailable, falling back to iso_storage",
 			log.String("iso_storage", fallback))
-		return fallback
+		return fallback, true
 	}
 
 	shared, hasISO, found, lookupErr := vmStorageISOEligibility(ctx, pveClient, cfg.VMStorage)
@@ -138,24 +249,26 @@ func ResolveISOStorage(ctx context.Context, cfg *config.CPIConfig, pveClient pve
 	case lookupErr != nil:
 		logger.Warn("iso_storage_follow_vm_storage: vm_storage lookup failed, falling back to iso_storage",
 			log.String("vm_storage", cfg.VMStorage), log.String("iso_storage", fallback), log.Err(lookupErr))
-		return fallback
+		return fallback, false
+	case ctx.Err() != nil:
+		return fallback, false
 	case !found:
 		logger.Warn("iso_storage_follow_vm_storage: vm_storage not found in PVE /storage index, falling back to iso_storage",
 			log.String("vm_storage", cfg.VMStorage), log.String("iso_storage", fallback))
-		return fallback
+		return fallback, true
 	case !hasISO:
 		logger.Warn("iso_storage_follow_vm_storage: vm_storage does not advertise content type \"iso\", falling back to iso_storage",
 			log.String("vm_storage", cfg.VMStorage), log.String("iso_storage", fallback))
-		return fallback
+		return fallback, true
 	case !shared:
 		logger.Warn("iso_storage_follow_vm_storage: vm_storage is not shared, falling back to iso_storage",
 			log.String("vm_storage", cfg.VMStorage), log.String("iso_storage", fallback))
-		return fallback
+		return fallback, true
 	}
 
 	logger.Info("iso_storage_follow_vm_storage: following vm_storage for ConfigDrive ISO",
 		log.String("vm_storage", cfg.VMStorage))
-	return cfg.VMStorage
+	return cfg.VMStorage, true
 }
 
 // vmStorageISOEligibility looks up storageName in /storage and reports

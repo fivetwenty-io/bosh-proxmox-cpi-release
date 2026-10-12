@@ -22,8 +22,8 @@ import (
 // user_cfg lock and a burst deploy contends there by design. That budget is
 // right for create_vm, where the pool is part of the outcome. It is wrong
 // here, where the pool is cosmetic and a detach is waiting, so the sweep
-// spends this instead. The name and the shape match the poolsPreflightTimeout
-// convention in cmd/cpi, so the number stays visible rather than buried.
+// spends this instead. The name and the shape match the poolAccessProbeTimeout
+// convention in internal/cpi/handlers, so the number stays visible rather than buried.
 const parkerPoolSweepTimeout = 10 * time.Second
 
 // PlaceParkersInPool puts cfg.Pool's missing parkers on node into it, creating
@@ -100,7 +100,7 @@ func PlaceParkersInPool(ctx context.Context, c Client, logger *log.Logger, node 
 	// pool mutation cluster-wide serializes on the single pmxcfs user_cfg lock,
 	// so an unconditional ensure would put one lock-serialized write on every
 	// park for a pool the first park already created. GetPoolComment is the
-	// same read the boot preflight makes, it needs only Pool.Audit, and it
+	// same read the per-request pool check makes, it needs only Pool.Audit, and it
 	// turns the steady state into one read per park.
 	//
 	// A read we could not make falls through to the ensure rather than

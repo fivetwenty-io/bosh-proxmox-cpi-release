@@ -61,6 +61,13 @@ type Deps struct {
 	// unset), so this field is opt-in and does not change behavior for any
 	// deployment or test that does not wire it.
 	Overrides *RequestOverrideRuntime
+	// ISO resolves the effective iso_storage pool on first use. The
+	// follow-vm-storage lookup it performs is a PVE call, so it runs against
+	// the cluster the request targets and only when a handler needs the pool,
+	// never at process start. WithRequestOverrides rebinds it to the override
+	// bundle's own resolver. Nil (every test Deps literal) means
+	// Config.ISOStorage is already the effective pool.
+	ISO *agent.ISOStorageResolver
 	// RequestDirectorUUID is the calling BOSH director's UUID from the
 	// JSON-RPC request context, stamped by WithRequestOverrides so helpers
 	// that only receive Deps (parker provenance, prune scoping) can attribute
@@ -80,6 +87,22 @@ type Deps struct {
 	// owner. Audit-gated refusals end with it. Empty (the CLI and every
 	// test Deps literal) makes them name the command generically instead.
 	StorageAuditCommand string
+}
+
+// EffectiveISOStorage returns the pool config-drive ISOs live on for this
+// request. With a resolver wired it performs the deferred
+// iso_storage_follow_vm_storage lookup on first call; otherwise, or when the
+// lookup yields nothing, it is Config.ISOStorage.
+func (d Deps) EffectiveISOStorage(ctx context.Context) string {
+	if d.ISO != nil {
+		if resolved := d.ISO.Resolve(ctx); resolved != "" {
+			return resolved
+		}
+	}
+	if d.Config == nil {
+		return ""
+	}
+	return d.Config.ISOStorage
 }
 
 // Log returns the per-request, span-correlated logger stored in ctx (attached

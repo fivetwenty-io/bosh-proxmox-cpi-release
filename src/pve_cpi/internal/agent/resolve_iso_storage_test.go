@@ -30,12 +30,19 @@ type fakeClusterStorageSvc struct {
 	entries   []fakeClusterStorageEntry
 	listErr   error
 	listCalls int
+	// failFirst makes the first failFirst ListStorage calls fail with a
+	// transport error before later calls answer from entries.
+	failFirst int
 }
 
 var _ sdkclusterstorage.Service = (*fakeClusterStorageSvc)(nil)
 
 func (f *fakeClusterStorageSvc) ListStorage(context.Context, *sdkclusterstorage.ListStorageParams) (*sdkclusterstorage.ListStorageResponse, error) {
 	f.listCalls++
+	if f.failFirst > 0 {
+		f.failFirst--
+		return nil, errors.New("scripted transport failure")
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}

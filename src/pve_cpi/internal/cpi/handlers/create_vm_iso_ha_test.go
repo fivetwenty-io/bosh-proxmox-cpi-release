@@ -307,7 +307,7 @@ func TestIsoStorageScanTarget(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			deps := Deps{Config: tc.cfg}
-			if got := isoStorageScanTarget(deps, tc.vmStorage); got != tc.wantStorage {
+			if got := isoStorageScanTarget(context.Background(), deps, tc.vmStorage); got != tc.wantStorage {
 				t.Errorf("isoStorageScanTarget() = %q; want %q", got, tc.wantStorage)
 			}
 		})

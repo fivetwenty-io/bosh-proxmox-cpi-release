@@ -135,7 +135,7 @@ func EnsurePoolExists(ctx context.Context, c Client, poolID, comment string, log
 // (PoolService.GetPoolComment already maps a not-found pool to
 // found=false with a nil error, so that case never reaches this classifier).
 //
-// Used by the CPI startup preflight (cmd/cpi/main.go) to fail fast with an
+// Used by the per-request pool check (handlers.ensurePoolAccess) to fail fast with an
 // actionable grant-naming message on a genuine permission problem, while
 // treating every other GetPoolComment error as transient (Warn-only, does
 // not block boot) -- a startup-time PVE API hiccup must not be

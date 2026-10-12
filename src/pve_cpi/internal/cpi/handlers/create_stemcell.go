@@ -489,6 +489,16 @@ func HandleCreateStemcell(deps Deps) cpi.Handler {
 		// or "fetch" when the operator supplied image_id or image_url; both
 		// bypass the local image_path upload pipeline entirely.
 		// ----------------------------------------------------------------
+		//
+		// Pool access is checked on the cluster this request targets before any
+		// pool-touching path. A pre-uploaded light stemcell only records an
+		// existing image id and never touches a pool, so it skips the probe.
+		if cp.LightMode() != "preuploaded" {
+			if poolErr := ensurePoolAccess(ctx, deps); poolErr != nil {
+				deps.Log(ctx).Error("pools preflight failed", log.Err(poolErr))
+				return nil, poolErr
+			}
+		}
 		switch cp.LightMode() {
 		case "preuploaded":
 			return handleLightStemcellPreUploaded(ctx, deps, cp, reqCtx.DirectorUUID)

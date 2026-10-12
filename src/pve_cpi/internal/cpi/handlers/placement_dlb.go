@@ -92,7 +92,7 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 	// undeterminable shared-ness is fail-open (proceed).
 	if deps.Config != nil && deps.Config.DLBRequireSharedStorage() {
 		checked := map[string]struct{}{}
-		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage, deps.Config.ISOStorage} {
+		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage, deps.EffectiveISOStorage(ctx)} {
 			if stg == "" {
 				continue
 			}

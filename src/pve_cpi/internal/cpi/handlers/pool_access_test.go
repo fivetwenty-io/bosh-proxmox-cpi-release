@@ -1,45 +1,50 @@
-package main
+package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
-// fakePreflightPoolService implements pve.PoolService with a scriptable
+// fakePoolAccessService implements pve.PoolService with a scriptable
 // GetPoolComment. AddVM/CreatePool/DeletePool panic on any call: the
 // preflight probe must never mutate PVE state.
-type fakePreflightPoolService struct {
+type fakePoolAccessService struct {
 	// getPoolCommentFn is called once per probed pool. Nil means "return
 	// (found=false, nil)" -- an always-visible-but-nonexistent pool.
 	getPoolCommentFn func(poolID string) (string, bool, error)
 	calls            []string
 }
 
-func (f *fakePreflightPoolService) AddVM(context.Context, string, int64) error {
-	panic("preflightPoolAccess must never call AddVM")
+func (f *fakePoolAccessService) AddVM(context.Context, string, int64) error {
+	panic("ensurePoolAccess must never call AddVM")
 }
 
-func (f *fakePreflightPoolService) MoveVMToPool(context.Context, string, int64) error {
-	panic("preflightPoolAccess must never call MoveVMToPool")
+func (f *fakePoolAccessService) MoveVMToPool(context.Context, string, int64) error {
+	panic("ensurePoolAccess must never call MoveVMToPool")
 }
 
-func (f *fakePreflightPoolService) CreatePool(context.Context, string, string) error {
-	panic("preflightPoolAccess must never call CreatePool")
+func (f *fakePoolAccessService) CreatePool(context.Context, string, string) error {
+	panic("ensurePoolAccess must never call CreatePool")
 }
 
-func (f *fakePreflightPoolService) DeletePool(context.Context, string) error {
-	panic("preflightPoolAccess must never call DeletePool")
+func (f *fakePoolAccessService) DeletePool(context.Context, string) error {
+	panic("ensurePoolAccess must never call DeletePool")
 }
 
-func (f *fakePreflightPoolService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
+func (f *fakePoolAccessService) GetPoolComment(_ context.Context, poolID string) (string, bool, error) {
 	f.calls = append(f.calls, poolID)
 	if f.getPoolCommentFn == nil {
 		return "", false, nil
@@ -47,25 +52,25 @@ func (f *fakePreflightPoolService) GetPoolComment(_ context.Context, poolID stri
 	return f.getPoolCommentFn(poolID)
 }
 
-var _ pve.PoolService = (*fakePreflightPoolService)(nil)
+var _ pve.PoolService = (*fakePoolAccessService)(nil)
 
-// preflightTestClient wraps nilPVEClient, overriding only Pools() so
-// preflightPoolAccess sees a configured pool service while every other
-// service stays nil (unused by the probe).
-type preflightTestClient struct {
-	nilPVEClient
+// poolAccessClient overrides only Pools() so ensurePoolAccess sees a
+// configured pool service while every other service stays nil (unused by the
+// probe).
+type poolAccessClient struct {
+	pve.Client
 	pools pve.PoolService
 }
 
-func (c preflightTestClient) Pools() pve.PoolService { return c.pools }
+func (c poolAccessClient) Pools() pve.PoolService { return c.pools }
 
-var _ pve.Client = preflightTestClient{}
+var _ pve.Client = poolAccessClient{}
 
-func TestPreflightPoolAccess_SkipsWhenBothPoolsEmpty(t *testing.T) {
+func TestEnsurePoolAccess_SkipsWhenBothPoolsEmpty(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{}
+	fake := &fakePoolAccessService{}
 	cfg := &config.CPIConfig{}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 0 {
@@ -73,21 +78,21 @@ func TestPreflightPoolAccess_SkipsWhenBothPoolsEmpty(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_OnlyParkerPoolSet_NotSkipped is the all-empty
+// TestEnsurePoolAccess_OnlyParkerPoolSet_NotSkipped is the all-empty
 // guard's other half. pve.vm_pool and pve.stemcell_template_pool are both
 // empty, so the two-pool guard alone would skip the probe entirely, but the
 // parked strategy is active and pve.parker_pool resolves to a name, so the
 // preflight must still run one probe rather than returning early.
-func TestPreflightPoolAccess_OnlyParkerPoolSet_NotSkipped(t *testing.T) {
+func TestEnsurePoolAccess_OnlyParkerPoolSet_NotSkipped(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", true, nil },
 	}
 	cfg := &config.CPIConfig{
 		DetachedDiskStrategy: config.DetachedDiskStrategyParked,
 		ParkerPool:           "bosh-parker",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 1 || fake.calls[0] != "bosh-parker" {
@@ -95,22 +100,19 @@ func TestPreflightPoolAccess_OnlyParkerPoolSet_NotSkipped(t *testing.T) {
 	}
 }
 
-func TestPreflightPoolAccess_NilCfgLoggerClientPoolsAreNoOps(t *testing.T) {
+func TestEnsurePoolAccess_NilCfgClientPoolsAreNoOps(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{}
+	fake := &fakePoolAccessService{}
 	cfg := &config.CPIConfig{VMPool: "bosh"}
 	logger := log.NewNopLogger()
 
-	if err := preflightPoolAccess(context.Background(), nil, preflightTestClient{pools: fake}, logger); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: nil, PVE: poolAccessClient{pools: fake}, Logger: logger}); err != nil {
 		t.Errorf("nil cfg: unexpected error: %v", err)
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, nil); err != nil {
-		t.Errorf("nil logger: unexpected error: %v", err)
-	}
-	if err := preflightPoolAccess(context.Background(), cfg, nil, logger); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: nil, Logger: logger}); err != nil {
 		t.Errorf("nil client: unexpected error: %v", err)
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: nil}, logger); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: nil}, Logger: logger}); err != nil {
 		t.Errorf("nil Pools(): unexpected error: %v", err)
 	}
 	if len(fake.calls) != 0 {
@@ -118,13 +120,97 @@ func TestPreflightPoolAccess_NilCfgLoggerClientPoolsAreNoOps(t *testing.T) {
 	}
 }
 
-func TestPreflightPoolAccess_VisiblePool_NoError(t *testing.T) {
+// A Deps without a logger still probes: Deps.Log falls back to a nop logger
+// rather than skipping the check.
+func TestEnsurePoolAccess_NilLoggerStillProbes(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{}
+	cfg := &config.CPIConfig{VMPool: "bosh"}
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fake.calls) != 1 {
+		t.Errorf("expected one probe, got %v", fake.calls)
+	}
+}
+
+func deniedPoolService(t *testing.T) *fakePoolAccessService {
+	t.Helper()
+	return &fakePoolAccessService{
+		getPoolCommentFn: func(string) (string, bool, error) {
+			return "", false, &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}
+		},
+	}
+}
+
+func assertNonRetriablePoolDenial(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a pool-denied error, got nil")
+	}
+	var cpiErr *cpierrors.Error
+	if !errors.As(err, &cpiErr) || cpiErr.OkToRetry() {
+		t.Fatalf("want a non-retriable CloudError, got %T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "Pool.Audit") {
+		t.Errorf("error should name the grant to fix, got %q", err.Error())
+	}
+}
+
+// A denied job credential used to exit the process before the request was
+// read. It now fails only the create_vm that needs the pool, as a
+// non-retriable CloudError, before any VM mutation.
+func TestCreateVM_PoolDenied_FailsRequestNonRetriable(t *testing.T) {
+	t.Parallel()
+	fake := deniedPoolService(t)
+	deps := Deps{
+		Config: &config.CPIConfig{VMPool: "bosh"},
+		PVE:    poolAccessClient{pools: fake},
+		Logger: log.NewNopLogger(),
+	}
+	args := []json.RawMessage{
+		json.RawMessage(`"agent-1"`),
+		json.RawMessage(`":heavy:local:import/stemcell.qcow2"`),
+		json.RawMessage(`{}`),
+		json.RawMessage(`{}`),
+		json.RawMessage(`[]`),
+		json.RawMessage(`{}`),
+	}
+	_, err := createVM(context.Background(), deps, args)
+	assertNonRetriablePoolDenial(t, err)
+	if len(fake.calls) != 1 || fake.calls[0] != "bosh" {
+		t.Errorf("expected one probe of the vm pool, got %v", fake.calls)
+	}
+}
+
+func TestCreateStemcell_PoolDenied_FailsRequestNonRetriable(t *testing.T) {
+	t.Parallel()
+	fake := deniedPoolService(t)
+	deps := Deps{
+		Config: &config.CPIConfig{StemcellTemplatePool: "bosh-templates"},
+		PVE:    poolAccessClient{pools: fake},
+		Logger: log.NewNopLogger(),
+	}
+	dir := t.TempDir()
+	image := filepath.Join(dir, "image.tgz")
+	if err := os.WriteFile(image, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := HandleCreateStemcell(deps)
+	imgArg, _ := json.Marshal(image)
+	_, err := h.Handle(context.Background(), []json.RawMessage{
+		imgArg, json.RawMessage(`{"name":"s","version":"1","image_id":"","image_url":"https://example.invalid/s.qcow2","sha256":"` + strings.Repeat("a", 64) + `"}`),
+	}, jsonrpc.Context{})
+	assertNonRetriablePoolDenial(t, err)
+}
+
+func TestEnsurePoolAccess_VisiblePool_NoError(t *testing.T) {
+	t.Parallel()
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "managed by bosh-proxmox-cpi", true, nil },
 	}
 	cfg := &config.CPIConfig{VMPool: "bosh", StemcellTemplatePool: "bosh-templates"}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 2 {
@@ -132,13 +218,13 @@ func TestPreflightPoolAccess_VisiblePool_NoError(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes is
-// TestPreflightPoolAccess_VisiblePool_NoError's sibling with the parked
+// TestEnsurePoolAccess_VisiblePoolWithParker_ThreeProbes is
+// TestEnsurePoolAccess_VisiblePool_NoError's sibling with the parked
 // strategy active and a distinct pve.parker_pool set. All three pools are
 // visible, so the preflight probes all three and returns no error.
-func TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes(t *testing.T) {
+func TestEnsurePoolAccess_VisiblePoolWithParker_ThreeProbes(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "managed by bosh-proxmox-cpi", true, nil },
 	}
 	cfg := &config.CPIConfig{
@@ -147,7 +233,7 @@ func TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes(t *testing.T) {
 		DetachedDiskStrategy: config.DetachedDiskStrategyParked,
 		ParkerPool:           "bosh-parker",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 3 {
@@ -155,27 +241,27 @@ func TestPreflightPoolAccess_VisiblePoolWithParker_ThreeProbes(t *testing.T) {
 	}
 }
 
-func TestPreflightPoolAccess_NotYetExistingPool_NoError(t *testing.T) {
+func TestEnsurePoolAccess_NotYetExistingPool_NoError(t *testing.T) {
 	t.Parallel()
 	// found=false, err=nil -- the pool does not exist yet; the CPI creates it
 	// lazily on first use. Must not fail the preflight.
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, nil },
 	}
 	cfg := &config.CPIConfig{VMPool: "bosh"}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error for a not-yet-existing pool: %v", err)
 	}
 }
 
-// TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug pins the log level
+// TestEnsurePoolAccess_NotYetExistingPool_LogsQuietDebug pins the log level
 // for the normal zero-config first boot, where neither shipped default pool
 // exists yet. That state must be reported at Debug and say lazy creation
 // handles it -- an operator seeing a Warn here cannot tell it apart from a real
 // API fault, which is exactly what the live run reported.
-func TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
+func TestEnsurePoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, nil },
 	}
 	cfg := &config.CPIConfig{
@@ -186,7 +272,7 @@ func TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
 	}
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
 
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, logger); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: logger}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -207,13 +293,13 @@ func TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug(t *testing.T) {
 	}
 }
 
-func TestPreflightPoolAccess_DuplicatePoolNames_ProbedOnce(t *testing.T) {
+func TestEnsurePoolAccess_DuplicatePoolNames_ProbedOnce(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", true, nil },
 	}
 	cfg := &config.CPIConfig{VMPool: "shared", StemcellTemplatePool: "shared"}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 1 {
@@ -221,15 +307,15 @@ func TestPreflightPoolAccess_DuplicatePoolNames_ProbedOnce(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce extends the
+// TestEnsurePoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce extends the
 // dedup coverage to the parker pool. An operator who sets pve.parker_pool to
 // the same name as pve.vm_pool gets one probe, not two, and that probe keeps
 // the fail-fast classification pve.vm_pool carries (the name is already
 // represented in the deduped list by the time the parker candidate is
 // considered).
-func TestPreflightPoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce(t *testing.T) {
+func TestEnsurePoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", true, nil },
 	}
 	cfg := &config.CPIConfig{
@@ -237,7 +323,7 @@ func TestPreflightPoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce(t *testing.T)
 		DetachedDiskStrategy: config.DetachedDiskStrategyParked,
 		ParkerPool:           "shared",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 1 {
@@ -245,14 +331,14 @@ func TestPreflightPoolAccess_ParkerPoolDuplicatesVMPool_ProbedOnce(t *testing.T)
 	}
 }
 
-func TestPreflightPoolAccess_PermissionDenied_FailsFastNamingGrant(t *testing.T) {
+func TestEnsurePoolAccess_PermissionDenied_FailsFastNamingGrant(t *testing.T) {
 	t.Parallel()
 	permErr := &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, permErr },
 	}
 	cfg := &config.CPIConfig{VMPool: "bosh"}
-	err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger())
+	err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()})
 	if err == nil {
 		t.Fatal("expected a fail-fast error for a permission-denied probe")
 	}
@@ -264,23 +350,23 @@ func TestPreflightPoolAccess_PermissionDenied_FailsFastNamingGrant(t *testing.T)
 	}
 }
 
-// TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails covers the
+// TestEnsurePoolAccess_ParkerPoolDenied_WarnsNotFails covers the
 // deliberate exception to the fail-fast rule above. A permission denial on
 // the parker pool alone must not fail boot. Parker-pool assignment is a
 // best-effort, cosmetic sweep, unlike pve.vm_pool, so treating this the same
 // as a workload-pool denial would stop the CPI from booting over something
 // that never fails a park.
-func TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails(t *testing.T) {
+func TestEnsurePoolAccess_ParkerPoolDenied_WarnsNotFails(t *testing.T) {
 	t.Parallel()
 	permErr := &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, permErr },
 	}
 	cfg := &config.CPIConfig{
 		DetachedDiskStrategy: config.DetachedDiskStrategyParked,
 		ParkerPool:           "bosh-parker",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("a denied parker pool must warn, not fail boot; got: %v", err)
 	}
 	if len(fake.calls) != 1 || fake.calls[0] != "bosh-parker" {
@@ -288,16 +374,16 @@ func TestPreflightPoolAccess_ParkerPoolDenied_WarnsNotFails(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn pins the log level and
+// TestEnsurePoolAccess_ParkerPoolDenied_LogsWarn pins the log level and
 // content for a denied parker pool, the same way
-// TestPreflightPoolAccess_NotYetExistingPool_LogsQuietDebug pins Debug for a
+// TestEnsurePoolAccess_NotYetExistingPool_LogsQuietDebug pins Debug for a
 // not-yet-existing pool. An operator must be able to tell this apart from
 // the fatal pve.vm_pool/pve.stemcell_template_pool denial, which returns an
 // error instead of logging.
-func TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
+func TestEnsurePoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
 	t.Parallel()
 	permErr := &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied", Code: 403}
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, permErr },
 	}
 	cfg := &config.CPIConfig{
@@ -305,7 +391,7 @@ func TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
 		ParkerPool:           "bosh-parker",
 	}
 	logger, obs := log.NewObservedLogger(log.LevelDebug)
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, logger); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: logger}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	entries := obs.All()
@@ -320,20 +406,20 @@ func TestPreflightPoolAccess_ParkerPoolDenied_LogsWarn(t *testing.T) {
 	}
 }
 
-// TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed
+// TestEnsurePoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed
 // covers the strategy gate on the parker-pool probe. When
 // pve.detached_disk_strategy is "free", no parker VM is ever created, so
 // pve.parker_pool, even though it resolves to a non-empty name, must not be
 // probed. A boot-time failure for a pool the CPI will never touch would
 // contradict the whole "free" opt-out.
-func TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed(t *testing.T) {
+func TestEnsurePoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{}
+	fake := &fakePoolAccessService{}
 	cfg := &config.CPIConfig{
 		DetachedDiskStrategy: config.DetachedDiskStrategyFree,
 		ParkerPool:           "bosh-parker",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 0 {
@@ -341,20 +427,20 @@ func TestPreflightPoolAccess_DetachedDiskStrategyFree_ParkerPoolNotProbed(t *tes
 	}
 }
 
-// TestPreflightPoolAccess_ParkerPoolOptedOut_NotProbed covers the operator
+// TestEnsurePoolAccess_ParkerPoolOptedOut_NotProbed covers the operator
 // who is running the parked strategy but has explicitly opted the parker
 // pool out (pve.parker_pool: ""), the documented ParkerPoolValue() opt-out.
 // vm_pool and stemcell_template_pool are also empty here, so this doubles as
 // the "an operator who emptied every pool property gets no new probe"
 // regression the parked-strategy gate exists to protect.
-func TestPreflightPoolAccess_ParkerPoolOptedOut_NotProbed(t *testing.T) {
+func TestEnsurePoolAccess_ParkerPoolOptedOut_NotProbed(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{}
+	fake := &fakePoolAccessService{}
 	cfg := &config.CPIConfig{
 		DetachedDiskStrategy: config.DetachedDiskStrategyParked,
 		ParkerPool:           "",
 	}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 0 {
@@ -362,25 +448,25 @@ func TestPreflightPoolAccess_ParkerPoolOptedOut_NotProbed(t *testing.T) {
 	}
 }
 
-func TestPreflightPoolAccess_TransientError_WarnsButDoesNotFail(t *testing.T) {
+func TestEnsurePoolAccess_TransientError_WarnsButDoesNotFail(t *testing.T) {
 	t.Parallel()
 	transientErr := errors.New("dial tcp: connection refused")
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", false, transientErr },
 	}
 	cfg := &config.CPIConfig{VMPool: "bosh"}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("transient error must not fail the preflight, got: %v", err)
 	}
 }
 
-func TestPreflightPoolAccess_StemcellTemplatePoolOnly_Probed(t *testing.T) {
+func TestEnsurePoolAccess_StemcellTemplatePoolOnly_Probed(t *testing.T) {
 	t.Parallel()
-	fake := &fakePreflightPoolService{
+	fake := &fakePoolAccessService{
 		getPoolCommentFn: func(string) (string, bool, error) { return "", true, nil },
 	}
 	cfg := &config.CPIConfig{StemcellTemplatePool: "bosh-templates"}
-	if err := preflightPoolAccess(context.Background(), cfg, preflightTestClient{pools: fake}, log.NewNopLogger()); err != nil {
+	if err := ensurePoolAccess(context.Background(), Deps{Config: cfg, PVE: poolAccessClient{pools: fake}, Logger: log.NewNopLogger()}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fake.calls) != 1 || fake.calls[0] != "bosh-templates" {
@@ -390,6 +476,33 @@ func TestPreflightPoolAccess_StemcellTemplatePoolOnly_Probed(t *testing.T) {
 
 // PoolHasVM reports no membership; tests that exercise the
 // disambiguation supply their own fake.
-func (f *fakePreflightPoolService) PoolHasVM(context.Context, string, int64) (bool, error) {
+func (f *fakePoolAccessService) PoolHasVM(context.Context, string, int64) (bool, error) {
 	return false, nil
+}
+
+// A pre-uploaded light stemcell only records an existing image id and never
+// touches a pool, so a denied pool grant must not fail it and no probe runs.
+func TestCreateStemcell_PreuploadedLight_SkipsPoolProbe(t *testing.T) {
+	t.Parallel()
+	fake := deniedPoolService(t)
+	deps := Deps{
+		Config: &config.CPIConfig{StemcellTemplatePool: "bosh-templates", VMPool: "bosh"},
+		PVE:    poolAccessClient{pools: fake},
+		Logger: log.NewNopLogger(),
+	}
+	imgArg, _ := json.Marshal("/dev/null")
+	cloudProps := `{"name":"s","version":"1","image_id":"local:import/s.qcow2","sha256":"` + strings.Repeat("a", 64) + `"}`
+	// The light handler may fail later on this bare fake, so only the absence
+	// of a probe and of a pool-denied error is asserted.
+	func() {
+		defer func() { _ = recover() }()
+		_, err := HandleCreateStemcell(deps).Handle(context.Background(),
+			[]json.RawMessage{imgArg, json.RawMessage(cloudProps)}, jsonrpc.Context{})
+		if err != nil && strings.Contains(err.Error(), "Pool.Audit") {
+			t.Errorf("pre-uploaded light stemcell was failed by the pool check: %v", err)
+		}
+	}()
+	if len(fake.calls) != 0 {
+		t.Errorf("expected no pool probe for a pre-uploaded light stemcell, got %v", fake.calls)
+	}
 }

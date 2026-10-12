@@ -120,8 +120,8 @@ properties:
       When true (the default), resolves the ConfigDrive ISO pool to
       pve.vm_storage instead of the pve.iso_storage default, provided
       vm_storage advertises PVE content type `iso` and is shared. Evaluated
-      once at CPI process startup, before pve.iso_storage is otherwise
-      applied. Because BOSH renders the "local" spec default for iso_storage
+      the first time a request needs the ISO pool, against the cluster that
+      request targets. Because BOSH renders the "local" spec default for iso_storage
       whether or not the operator set it in the manifest, the CPI cannot
       distinguish "unset" from "explicitly local" — this flag therefore
       treats iso_storage resolving to the literal value "local" as the

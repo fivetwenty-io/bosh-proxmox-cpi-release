@@ -49,12 +49,6 @@ import (
 // exitSignaled is the exit code returned when the process catches SIGINT or SIGTERM.
 const exitSignaled = 130
 
-// poolsPreflightTimeout bounds each pool-visibility probe issued by
-// preflightPoolAccess so a hung or slow PVE API call cannot stall CPI
-// startup indefinitely. A probe that does not return in time is classified
-// as transient (Warn-only, boot proceeds) rather than blocking forever.
-const poolsPreflightTimeout = 10 * time.Second
-
 // defaultMaxLineBytes is the maximum allowed size of a single JSON-RPC request line (64 MiB).
 // bufio.Scanner returns bufio.ErrTooLong if this limit is exceeded; the loop
 // treats that as a decode error, writes a CloudError, and continues.
@@ -241,140 +235,6 @@ func run() int {
 	return runWithArgs(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, runOptions{})
 }
 
-// preflightPoolAccess probes PVE resource-pool visibility for every
-// statically named pool layer (pve.vm_pool, pve.stemcell_template_pool)
-// before the CPI serves its first request. Both default on ("bosh" /
-// "bosh-templates" per jobs/pve_cpi/spec), so this runs for a zero-config
-// deployment unless the operator explicitly opts both out. The
-// pve.vm_pool_template layer (default on, "bosh-{director}-{deployment}")
-// cannot be probed here: its names are rendered per create_vm call and do
-// not exist until first use, so a missing /pool grant for those surfaces as
-// a named, non-retriable create_vm error (see ensureResolvedPool in
-// internal/cpi/handlers) rather than at boot.
-//
-// When the "parked" detached-disk strategy is active (DetachedDiskParkedEnabled)
-// and pve.parker_pool resolves to a non-empty name, that pool is probed too,
-// deduped against the other two so a parker pool that happens to equal
-// pve.vm_pool is only read once. Unlike the two pools above, a denial on the
-// parker pool only warns; it never fails boot. Parker-pool assignment is a
-// best-effort, cosmetic sweep (see internal/pve's parker pool sweep), so a
-// missing Pool.Audit grant there should not stop the CPI from serving
-// requests the way a denied pve.vm_pool -- which every create_vm needs --
-// correctly does. This also keeps the probe honest for an operator who has
-// deliberately opted out of pools by emptying pve.vm_pool,
-// pve.vm_pool_template, and pve.stemcell_template_pool. pve.parker_pool
-// carries a non-empty default of its own, and the only thing that should be
-// able to newly fail their boot is enabling the parked strategy, not merely
-// having a pool preflight in the binary.
-//
-// A per-entry pve_parker_pool or pve_parker_prefix override (see
-// internal/config's context-override registry) is invisible here. This
-// preflight only ever sees the process-wide job config, the same as every
-// other per-entry override.
-//
-// Design: the cheapest side-effect-free signal that proves the CPI's
-// identity can read a pool path is GET /pools/{poolid}
-// (pve.PoolService.GetPoolComment) issued against each configured pool
-// name -- it exercises exactly the Pool.Audit grant PVE checks per-pool,
-// without ever creating or mutating anything (pool creation is deferred to
-// pve.EnsurePoolExists at first real use, inside create_vm/create_stemcell).
-// There is no side-effect-free way to probe Pool.Allocate specifically --
-// PVE only enforces it on a mutating call -- so a clean probe here proves
-// read access only; the failure message below still names both grants so an
-// operator fixes both at once instead of discovering the Allocate gap
-// separately on the first real create_vm/create_stemcell call.
-//
-// A pool that does not exist yet is NOT a failure: GetPoolComment maps both
-// PVE not-found shapes -- a 404, and the 500-with-text "pool 'x' does not
-// exist" live PVE actually returns -- to (found=false, err=nil), and the CPI
-// creates the pool lazily on first use. That case is logged at Debug and says
-// so; it is the normal state of a zero-config first boot, where neither
-// default pool exists yet, and must never look like an API fault.
-// Only a classified permission error (pve.IsPoolPermissionDenied: HTTP
-// 401/403) fails this preflight. Every other error (network fault, PVE 5xx,
-// context deadline) is logged at Warn and treated as transient, so a
-// startup-time PVE hiccup never blocks the CPI from booting -- the same
-// fault simply resurfaces on the first real pool-touching request, where the
-// normal per-request retry/error path takes over.
-//
-// Skipped entirely (zero PVE calls) when both pve.vm_pool and
-// pve.stemcell_template_pool resolve to "" -- the operator has opted out of
-// pool assignment entirely, so there is nothing to probe. Also a no-op when
-// cfg, logger, client, or client.Pools() is nil (defensive: should never
-// happen once clientFactory has already succeeded, but a wiring gap must
-// never panic or block startup).
-func preflightPoolAccess(ctx context.Context, cfg *config.CPIConfig, client pve.Client, logger *log.Logger) error {
-	if cfg == nil || logger == nil || client == nil || client.Pools() == nil {
-		return nil
-	}
-
-	parkerPool := ""
-	if cfg.DetachedDiskParkedEnabled() {
-		parkerPool = cfg.ParkerPoolValue()
-	}
-	if cfg.VMPool == "" && cfg.StemcellTemplatePool == "" && parkerPool == "" {
-		return nil
-	}
-
-	// failFast marks pve.vm_pool and pve.stemcell_template_pool. Every
-	// create_vm/create_stemcell needs them, so a permission denial on either
-	// one fails boot. The parker pool is best-effort (see the doc comment
-	// above), so it carries failFast=false and only ever warns.
-	type poolProbe struct {
-		poolID   string
-		failFast bool
-	}
-	candidates := []poolProbe{
-		{cfg.VMPool, true},
-		{cfg.StemcellTemplatePool, true},
-		{parkerPool, false},
-	}
-
-	pools := make([]poolProbe, 0, 3)
-	seen := make(map[string]bool, 3)
-	for _, c := range candidates {
-		if c.poolID == "" || seen[c.poolID] {
-			continue
-		}
-		seen[c.poolID] = true
-		pools = append(pools, c)
-	}
-
-	for _, p := range pools {
-		probeCtx, cancel := context.WithTimeout(ctx, poolsPreflightTimeout)
-		_, found, err := client.Pools().GetPoolComment(probeCtx, p.poolID)
-		cancel()
-		if err == nil {
-			if !found {
-				logger.Debug("pools preflight: pool does not exist yet; it will be created on first use",
-					log.String("pool", p.poolID))
-				continue
-			}
-			logger.Debug("pools preflight: pool visible", log.String("pool", p.poolID))
-			continue
-		}
-		if pve.IsPoolPermissionDenied(err) {
-			if !p.failFast {
-				logger.Warn("pools preflight: PVE denied read access to the parker pool "+
-					"(non-fatal; parker-pool assignment is best effort, boot continuing)",
-					log.String("pool", p.poolID), log.Err(err))
-				continue
-			}
-			return cpierrors.Cloud(
-				"pools preflight: PVE denied read access to pool %q: %s -- grant the CPI's "+
-					"identity Pool.Audit AND Pool.Allocate on /pool/%s (Pool.Allocate cannot be "+
-					"probed here without a mutating call, but is required by create_vm and "+
-					"create_stemcell the first time either assigns a VM to this pool); "+
-					"alternatively, set pve.vm_pool: \"\" and pve.stemcell_template_pool: \"\" "+
-					"to disable pool assignment entirely",
-				p.poolID, err.Error(), p.poolID)
-		}
-		logger.Warn("pools preflight: could not confirm pool access (non-fatal; treating as transient, boot continuing)",
-			log.String("pool", p.poolID), log.Err(err))
-	}
-	return nil
-}
-
 // runWithArgs contains the full startup and event loop. Accepting args, stdin,
 // stdout, stderr, and opts as parameters makes every flag-parse, config-load,
 // and client-init path testable without spawning a subprocess or manipulating
@@ -485,28 +345,17 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		return 1
 	}
 
-	// Fail fast when the configured pool layers (pve.vm_pool,
-	// pve.stemcell_template_pool -- both default on) are not readable by the
-	// CPI's identity, naming the exact grant to fix, instead of surfacing an
-	// opaque permission error on the first create_vm/create_stemcell call.
-	// See preflightPoolAccess's doc comment for the probe design and the
-	// fail-fast (permission) vs Warn-only (transient) classification.
-	if pfErr := preflightPoolAccess(rootCtx, cfg, client, logger); pfErr != nil {
-		logger.Error("pools preflight failed", log.Err(pfErr))
-		return 1
-	}
-
-	// Resolve pve.iso_storage_follow_vm_storage (default ON; explicit
-	// false opts out) once, in place on cfg,
-	// before any Deps or agent are built downstream. Mutating cfg directly
-	// (not a copy) keeps every consumer — the boot agent, and deps.Config
-	// read by create_vm's HA migration-safety check — looking at the same
-	// effective iso_storage value. A no-op (zero PVE calls) when the operator
-	// explicitly disabled the flag, or when iso_storage was pinned to
-	// anything other than the spec default "local".
+	// Nothing between here and the first dispatched request touches PVE. The
+	// pool-visibility probe (pve.vm_pool, pve.stemcell_template_pool) runs at
+	// the start of create_vm and create_stemcell, and the
+	// pve.iso_storage_follow_vm_storage lookup (default ON; explicit false opts
+	// out) runs the first time a handler needs the ISO pool, both against the
+	// cluster the request actually targets. A revoked or unreachable job-level
+	// credential therefore fails only the requests that use it, and `info`
+	// dials nothing.
+	//
 	// Retain the operator pin/sentinel for later set-managed request planning.
 	cfg.CaptureISOStoragePolicy()
-	cfg.ISOStorage = agent.ResolveISOStorage(rootCtx, cfg, client, logger)
 
 	// When agent_mode="auto", the primary boot agent is always configdrive.
 	// Pass a synthetic cfg copy with the normalized boot mode so factory.go's
@@ -522,7 +371,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// that default either way). Shared by the boot agent (ConfigDrive ISO
 	// uploads) and Deps (stemcell image uploads).
 	nodeEndpoints := pve.NewNodeEndpointResolver(client, cfg.NodeEndpoints, cfg.Host, cfg.NodeEndpointsDiscoveryAllowed(), logger)
-	bootAgent, err := agent.NewAgent(&cfgForBoot, client, nodeEndpoints, logger)
+	isoResolver := agent.NewISOStorageResolver(&cfgForBoot, client, logger)
+	bootAgent, err := agent.NewAgentWithISOResolver(&cfgForBoot, client, nodeEndpoints, isoResolver, logger)
 	if err != nil {
 		logger.Error("agent init failed", log.Err(err))
 		return 1
@@ -680,6 +530,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 		Config:         cfg,
 		PVE:            client,
 		Agent:          bootAgent,
+		ISO:            isoResolver,
 		Logger:         logger,
 		Resolver:       backendResolver,
 		NodeEndpoints:  nodeEndpoints,

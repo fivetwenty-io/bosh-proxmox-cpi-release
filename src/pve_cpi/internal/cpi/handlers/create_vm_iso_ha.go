@@ -110,7 +110,7 @@ func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, l
 	})
 }
 
-// isoStorageScanTarget returns deps.Config.ISOStorage when it is a pool
+// isoStorageScanTarget returns the effective ISO pool when it is a pool
 // distinct from vmStorage and deps.Config.DiskStorage, or "" otherwise.
 //
 // Feeds pve.WithExtraStorageScan at the create_vm VMID-allocation call sites
@@ -127,11 +127,11 @@ func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, l
 // argument as a no-op, so a call site that always passes this helper's
 // result costs nothing extra when ISOStorage is unset, matches vmStorage, or
 // matches DiskStorage (already covered, or nothing to add).
-func isoStorageScanTarget(deps Deps, vmStorage string) string {
+func isoStorageScanTarget(ctx context.Context, deps Deps, vmStorage string) string {
 	if deps.Config == nil {
 		return ""
 	}
-	iso := deps.Config.ISOStorage
+	iso := deps.EffectiveISOStorage(ctx)
 	if iso == "" || iso == vmStorage || iso == deps.Config.DiskStorage {
 		return ""
 	}
@@ -140,7 +140,8 @@ func isoStorageScanTarget(deps Deps, vmStorage string) string {
 
 // checkISOStorageForHA is create_vm step 10b: the config-drive ISO migration-
 // safety check. The ConfigDrive ISO CD-ROM attached at scsi30 lives for the
-// VM's whole life on deps.Config.ISOStorage (see internal/agent/configdrive.go),
+// VM's whole life on the effective ISO pool (deps.EffectiveISOStorage, see
+// internal/agent/configdrive.go),
 // not only at boot. PVE refuses to live-migrate a VM whose CD-ROM volume sits
 // on non-shared storage, and HA recovery on another node fails at start
 // because the ISO file does not exist there — silently defeating DLB
@@ -150,7 +151,7 @@ func isoStorageScanTarget(deps Deps, vmStorage string) string {
 // feature: most deployments never register any VM as a PVE HA resource, so
 // this check costs nothing for them. When at least one feature is active, the
 // same fail-open shared-storage lookup the DLB guard uses (dlbStorageIsShared)
-// classifies deps.Config.ISOStorage:
+// classifies deps.EffectiveISOStorage:
 //
 //   - shared, or shared-ness undeterminable (lookup error) -> no-op, matching
 //     the DLB guard's fail-open-on-facts contract. A lookup failure is logged
@@ -173,7 +174,7 @@ func checkISOStorageForHA(
 	// HA-registration feature is active, regardless of iso_storage sharing.
 	warnHAResurrectorConflictOnce(vmid, features, logger)
 
-	isoPool := deps.Config.ISOStorage
+	isoPool := deps.EffectiveISOStorage(ctx)
 	if isoPool == "" {
 		// ApplyDefaults always fills ISOStorage ("local" when unset), so this
 		// is defensive only — never observed with a config that went through
