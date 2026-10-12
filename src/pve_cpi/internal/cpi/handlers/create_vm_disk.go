@@ -317,18 +317,18 @@ func enforceCrossNodeCloneTarget(
 		return cpierrors.Cloud(
 			"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q;"+
 				" storage %q is local (not shared) — PVE cannot cross-node clone local storage;"+
-				" set cloud_properties.node to match the template node (%q),"+
+				" pin the VM with cloud_properties.target_node=%q, or use an availability_zone whose az_map entry includes %q,"+
 				" or use shared storage",
-			templateNode, shape.node, checkStorage, templateNode)
+			templateNode, shape.node, checkStorage, templateNode, templateNode)
 	}
 	if needsReplicaCheck(ctx, deps, shape.vmStorage) {
 		return cpierrors.Cloud(
 			"create_vm: cross-node clone rejected: template is on node %q but VM is targeted to node %q,"+
 				" and destination storage %q is local (not shared) — PVE cannot write a cross-node clone's"+
 				" disks to local storage; enable stemcell_replicate_local so every node gets its own"+
-				" template replica, set cloud_properties.node to match the template node (%q),"+
-				" or use shared storage for vm_storage",
-			templateNode, shape.node, shape.vmStorage, templateNode)
+				" template replica, pin the VM with cloud_properties.target_node=%q, or use an availability_zone whose"+
+				" az_map entry includes %q, or use shared storage for vm_storage",
+			templateNode, shape.node, shape.vmStorage, templateNode, templateNode)
 	}
 	// Both sides shared: set Target so PVE lands the clone on shape.node.
 	targetNode := shape.node

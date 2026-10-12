@@ -94,9 +94,9 @@ behavior (no attachment lookup).
 
 **create_disk** (new volume):
 
-- Shared backend: `cloud_properties.node` → VM's current node (via `vm_cid`) → `config.node`.
+- Shared backend: the disk type's `cloud_properties.node` → VM's current node (via `vm_cid`) → `config.node`.
 
-- Local backend: VM's current node (via `vm_cid`) → `cloud_properties.node` → `config.node`. The `vm_cid` hint takes priority because a local-storage disk must live on the same node as its owner VM.
+- Local backend: VM's current node (via `vm_cid`) → the disk type's `cloud_properties.node` → `config.node`. The `vm_cid` hint takes priority because a local-storage disk must live on the same node as its owner VM.
 
 **delete_disk / has_disk / attach_disk / detach_disk / resize_disk / snapshot_disk / update_disk** (existing volume):
 
@@ -258,14 +258,16 @@ disk_pools:
     # node not required: config.node is the only node
 ```
 
-### Local ZFS on a multi-node cluster with availability zones
+### Local ZFS with availability zones
+
+On Proxmox, a BOSH availability zone is a separate PVE cluster or standalone host, reached through one `cpi_config` entry each. The AZ names its entry with `cpi`, and the `node` key does not belong on the AZ at all. `create_vm` reads `target_node` and ignores `node`, and `create_disk` reads `node` only from the disk type's own `cloud_properties`. We cover entries in [Multi-Cluster Deployments](multi-cluster.md).
 
 ```yaml
 azs:
 - name: z1
-  cloud_properties: {node: pve-01}
+  cpi: pve-az1
 - name: z2
-  cloud_properties: {node: pve-02}
+  cpi: pve-az2
 
 disk_pools:
 - name: disks
@@ -274,8 +276,8 @@ disk_pools:
     storage: local-zfs
     disk_format: raw
     # 'node' here is optional: when the AZ is wired through to vm_cid, the
-    # CPI co-locates the disk with the VM automatically. Set 'node' only
-    # when a disk must be pinned independently of any owner VM.
+    # CPI co-locates the disk with the VM automatically. Set 'node' on the
+    # disk type only when a disk must be pinned independently of any owner VM.
 ```
 
 ### High-performance disk with per-disk options

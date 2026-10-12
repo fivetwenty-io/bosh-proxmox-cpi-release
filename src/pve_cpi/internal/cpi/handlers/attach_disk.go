@@ -782,8 +782,9 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stabl
 					"attach_disk: local-backend disk %s lives on node %s but VM %s runs on node %s, and this is a "+
 						"legacy disk whose CID is its volume name — the migration PVE performs renames the volume, "+
 						"which would orphan the CID, so the CPI cannot migrate it automatically. Recreate the VM "+
-						"pinned to node %s (cloud_properties.node or an AZ on that node), or move the volume by hand",
-					diskCID, node, vmCID, vmNode, node,
+						"pinned to node %s (cloud_properties.target_node=%q or an availability_zone whose az_map entry includes %q), "+
+						"or move the volume by hand",
+					diskCID, node, vmCID, vmNode, node, node, node,
 				)
 			default:
 				// Migration is on and the disk carries a stable ID: target the

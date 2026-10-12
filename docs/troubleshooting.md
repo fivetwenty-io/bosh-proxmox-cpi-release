@@ -437,7 +437,7 @@ The storage carries a `nodes` restriction in `storage.cfg` that excludes the nod
 
 **Fix**
 
-Either widen the storage's `nodes` restriction in `storage.cfg` to include the node, or pin placement to an owning node (`pve.node`, an AZ `target_node`, or `cloud_properties.node`).
+Either widen the storage's `nodes` restriction in `storage.cfg` to include the node, or pin placement to an owning node (`cloud_properties.target_node` for `create_vm`, an AZ whose `az_map` entry names the node, or `pve.node`).
 
 ### Block storage rejects qcow2 upload
 

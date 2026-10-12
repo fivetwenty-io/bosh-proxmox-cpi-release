@@ -525,6 +525,26 @@ func HandleCreateVM(deps Deps) cpi.Handler {
 	})
 }
 
+// warnIgnoredNodeKey logs one Warn when the create_vm cloud_properties carry
+// a top-level "node" key. create_vm reads target_node and has no "node" field
+// (create_disk, create_network, and create_stemcell do read it), so the key
+// is inert here. The Director merges the AZ, VM type, and manifest layers
+// before the call, so the Warn names the key and not the layer that supplied
+// it. A nested "node" inside another map, such as network_defaults, is not
+// checked.
+func warnIgnoredNodeKey(logger *log.Logger, cloudPropsMap map[string]any) {
+	if logger == nil {
+		return
+	}
+	if _, ok := cloudPropsMap["node"]; !ok {
+		return
+	}
+	logger.Warn("create_vm: cloud_properties.node is ignored by create_vm; "+
+		"pin the VM with cloud_properties.target_node, or select an availability_zone "+
+		"whose cpi_config entry or az_map names the node",
+		log.String("key", "node"))
+}
+
 // createVM is the implementation body — separated for testability.
 func createVM(
 	ctx context.Context,
@@ -540,6 +560,7 @@ func createVM(
 	if err != nil {
 		return nil, err
 	}
+	warnIgnoredNodeKey(logger, parsed.cloudPropsMap)
 
 	// -----------------------------------------------------------------------
 	// 1b. Early VIP validation — fail-fast before any VM mutation.

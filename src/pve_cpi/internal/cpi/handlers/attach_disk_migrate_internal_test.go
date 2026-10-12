@@ -471,6 +471,7 @@ func TestAttachDiskResolveNode_CrossNodeLocalBackend(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "legacy disk") {
 			t.Fatalf("err = %v, want the legacy-disk refusal", err)
 		}
+		assertTargetNodeAdvice(t, err.Error(), "pve1")
 	})
 
 	t.Run("stable-ID disk retargets to the VM's node", func(t *testing.T) {

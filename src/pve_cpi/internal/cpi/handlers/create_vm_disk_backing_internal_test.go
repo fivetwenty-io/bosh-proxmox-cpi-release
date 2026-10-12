@@ -208,6 +208,7 @@ func TestCloneFromTemplate_K3_TemplateLocal_VMStorageShared_TargetRejected(t *te
 	if !strings.Contains(msg, "local") {
 		t.Errorf("K3: error must state the local-storage constraint: %v", err)
 	}
+	assertTargetNodeAdvice(t, msg, "pve01")
 }
 
 // TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_Rejected is the
@@ -241,5 +242,19 @@ func TestCloneFromTemplate_K3_TemplateShared_VMStorageLocal_Rejected(t *testing.
 	}
 	if !strings.Contains(msg, "stemcell_replicate_local") {
 		t.Errorf("K3 mirror: error must offer the replica remedy: %v", err)
+	}
+	assertTargetNodeAdvice(t, msg, "pve01")
+}
+
+// assertTargetNodeAdvice fails unless msg points operators at target_node for
+// the named node and no longer at the cloud_properties.node key, which
+// create_vm ignores.
+func assertTargetNodeAdvice(t *testing.T, msg, node string) {
+	t.Helper()
+	if strings.Contains(msg, "cloud_properties.node") {
+		t.Errorf("error must not advise cloud_properties.node (create_vm ignores it): %s", msg)
+	}
+	if want := "cloud_properties.target_node=\"" + node + "\""; !strings.Contains(msg, want) {
+		t.Errorf("error must contain %s: %s", want, msg)
 	}
 }
