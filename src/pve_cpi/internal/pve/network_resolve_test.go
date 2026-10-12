@@ -420,3 +420,66 @@ func TestResolveNodeBridgeOnNode_AnyBridgeFilterRejected_FallsBack(t *testing.T)
 		t.Errorf("filter rejected: want fallback success, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// NodeBridgePresence
+// ---------------------------------------------------------------------------
+
+func TestNodeBridgePresence_Present(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		return ifacesResp("vmbr0", "v1"), nil
+	}}
+	present, err := NodeBridgePresence(context.Background(), &nrFakeClient{nodes: fn}, "pve1", "v1")
+	if !present || err != nil {
+		t.Errorf("want (true, nil), got (%v, %v)", present, err)
+	}
+}
+
+func TestNodeBridgePresence_ProvenAbsent(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		return ifacesResp("vmbr0"), nil
+	}}
+	present, err := NodeBridgePresence(context.Background(), &nrFakeClient{nodes: fn}, "pve1", "v1")
+	if present || err != nil {
+		t.Errorf("want (false, nil), got (%v, %v)", present, err)
+	}
+}
+
+func TestNodeBridgePresence_LookupErrorIsNotAbsence(t *testing.T) {
+	boom := errors.New("node unreachable")
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		return nil, boom
+	}}
+	present, err := NodeBridgePresence(context.Background(), &nrFakeClient{nodes: fn}, "pve1", "v1")
+	if present {
+		t.Errorf("a failed lookup must not report presence")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("want the lookup error wrapped, got %v", err)
+	}
+	if fn.calls != 2 {
+		t.Errorf("want the any_bridge call then the plain fallback (2 calls), got %d", fn.calls)
+	}
+	if nodeHasBridge(context.Background(), fn, "pve1", "v1") {
+		t.Errorf("nodeHasBridge must keep returning false on a lookup error")
+	}
+}
+
+func TestNodeBridgePresence_FallsBackToPlainListing(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(call int, _ string) (*sdknodes.ListNetworkResponse, error) {
+		if call == 1 {
+			return nil, errors.New("type any_bridge rejected")
+		}
+		return ifacesResp("v1"), nil
+	}}
+	present, err := NodeBridgePresence(context.Background(), &nrFakeClient{nodes: fn}, "pve1", "v1")
+	if !present || err != nil {
+		t.Errorf("want (true, nil) via the fallback, got (%v, %v)", present, err)
+	}
+}
+
+func TestNodeBridgePresence_NilClient(t *testing.T) {
+	if present, err := NodeBridgePresence(context.Background(), nil, "pve1", "v1"); present || err == nil {
+		t.Errorf("nil client: want (false, error), got (%v, %v)", present, err)
+	}
+}

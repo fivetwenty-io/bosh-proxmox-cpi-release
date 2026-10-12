@@ -12,6 +12,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -363,11 +364,20 @@ func bridgeIsSDNVnet(ctx context.Context, c Client, bridge string) (bool, error)
 	return ok, nil
 }
 
-// nodeHasBridge reports whether bridge appears as an interface on node. A
-// node-network read failure is treated as "not yet present" (returns false, not
-// an error) so the bounded poll keeps retrying through a transient blip in the
-// very convergence window it is waiting on, rather than aborting the deploy.
-func nodeHasBridge(ctx context.Context, nodesSvc sdknodes.Service, node, bridge string) bool {
+// NodeBridgePresence reports whether bridge appears as an interface on node.
+// Unlike nodeHasBridge it keeps the lookup outcome apart from the answer. It
+// returns (true, nil) when the bridge is listed, (false, nil) when the node's
+// interface list was read and the bridge is not in it, and (false, err) when the
+// list could not be read, so a caller can tell proven absence from a failed
+// lookup.
+func NodeBridgePresence(ctx context.Context, c Client, node, bridge string) (bool, error) {
+	if c == nil || c.Nodes() == nil {
+		return false, fmt.Errorf("list network on node %q: no nodes client", node)
+	}
+	return nodeBridgePresence(ctx, c.Nodes(), node, bridge)
+}
+
+func nodeBridgePresence(ctx context.Context, nodesSvc sdknodes.Service, node, bridge string) (bool, error) {
 	// PVE 9.2's plain GET /nodes/<node>/network lists only
 	// /etc/network/interfaces entries — realized SDN vnet bridges (which live
 	// in interfaces.d/sdn) appear ONLY under type=any_bridge. Without the
@@ -379,15 +389,27 @@ func nodeHasBridge(ctx context.Context, nodesSvc sdknodes.Service, node, bridge 
 	if err != nil || resp == nil {
 		resp, err = nodesSvc.ListNetwork(ctx, node, nil)
 	}
-	if err != nil || resp == nil {
-		return false
+	if err != nil {
+		return false, fmt.Errorf("list network on node %q: %w", node, err)
+	}
+	if resp == nil {
+		return false, fmt.Errorf("list network on node %q: empty response", node)
 	}
 	for _, raw := range *resp {
 		if decodeIfaceName(raw) == bridge {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// nodeHasBridge reports whether bridge appears as an interface on node. A
+// node-network read failure is treated as "not yet present" (returns false, not
+// an error) so the bounded poll keeps retrying through a transient blip in the
+// very convergence window it is waiting on, rather than aborting the deploy.
+func nodeHasBridge(ctx context.Context, nodesSvc sdknodes.Service, node, bridge string) bool {
+	present, err := nodeBridgePresence(ctx, nodesSvc, node, bridge)
+	return present && err == nil
 }
 
 // decodeVnetName extracts the "vnet" field from a raw SDN vnet row; "" on any

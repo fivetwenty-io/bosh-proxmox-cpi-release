@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"slices"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -130,6 +131,11 @@ func storagePlanNodeBridges(ctx context.Context, deps Deps, node string, require
 		response, err = deps.PVE.Nodes().ListNetwork(ctx, node, nil)
 	}
 	if err != nil || response == nil {
+		fields := []log.Field{log.String("node", node)}
+		if err != nil {
+			fields = append(fields, log.Err(err))
+		}
+		deps.Log(ctx).Warn("storage plan: bridge lookup failed; node left ineligible", fields...)
 		return false, planError(StoragePlanObservation, "network observation failed on %s", node)
 	}
 	names := map[string]bool{}
