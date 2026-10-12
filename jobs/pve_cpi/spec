@@ -1252,7 +1252,7 @@ properties:
 
       Under "strict", a one-node AZ in maintenance blocks every recreate in that
       AZ, which is when the resurrector runs. Map each AZ to at least two nodes
-      before enabling it. No spec default: the key is emitted only when set.
+      before enabling it. The key has no spec default, so it is emitted only when set.
   pve.placement.fallback_max:
     description: |
       Maximum number of alternate candidate nodes to try after a transient clone or
