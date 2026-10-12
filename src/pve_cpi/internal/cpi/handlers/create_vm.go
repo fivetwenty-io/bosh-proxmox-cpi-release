@@ -521,6 +521,9 @@ func HandleCreateVM(deps Deps) cpi.Handler {
 		if err != nil {
 			return nil, err
 		}
+		// Hand the After hooks an annotator on this request's effective client,
+		// so notes_audit never writes through the job-level cluster.
+		cpi.PublishRequestAnnotator(ctx, NewVMAnnotator(deps))
 		return createVM(ctx, deps, args)
 	})
 }

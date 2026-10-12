@@ -24,7 +24,9 @@ type NotesAuditHook struct {
 	annotator VMAnnotator
 }
 
-// NewNotesAuditHook constructs a NotesAuditHook. A nil Deps.Annotator leaves the
+// NewNotesAuditHook constructs a NotesAuditHook. Deps.Annotator is the job-level
+// fallback; a create_vm handler publishes an annotator on its effective client
+// and After prefers that one. A nil fallback with nothing published leaves the
 // hook active but inert on the write path (it logs that no annotator is wired).
 func NewNotesAuditHook(d Deps) cpi.Hook {
 	return &NotesAuditHook{logger: d.Logger, annotator: d.Annotator}
@@ -66,11 +68,15 @@ func (h *NotesAuditHook) After(ctx context.Context, method string, result any, e
 	if !ok {
 		return result, err
 	}
-	if h.annotator == nil {
+	annotator := h.annotator
+	if published, ok := cpi.RequestAnnotator(ctx).(VMAnnotator); ok && published != nil {
+		annotator = published
+	}
+	if annotator == nil {
 		h.logger.Debug("notes_audit: no annotator wired; skipping Notes write", log.Int("vmid", vmid))
 		return result, err
 	}
-	if annErr := h.annotator.AnnotateNotes(ctx, vmid, line); annErr != nil {
+	if annErr := annotator.AnnotateNotes(ctx, vmid, line); annErr != nil {
 		h.logger.Warn("notes_audit: Notes write failed (non-fatal)", log.Int("vmid", vmid), log.Err(annErr))
 	}
 	return result, err

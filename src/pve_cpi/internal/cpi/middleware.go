@@ -76,6 +76,7 @@ func WrapHandler(method string, inner Handler, hooks []Hook) Handler {
 	}
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		ctx = withRollbackHolder(ctx)
+		ctx = withAnnotatorSlot(ctx)
 		for _, h := range hooks {
 			ctx = h.Before(ctx, method, args, reqCtx)
 		}
