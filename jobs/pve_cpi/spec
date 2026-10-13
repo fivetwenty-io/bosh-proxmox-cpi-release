@@ -1521,6 +1521,31 @@ properties:
       delete_disk will keep deferring; clear it with "qm unlock <vmid>" on
       that VM's node.
     default: ""
+  pve.vm_ownership_guard:
+    description: |
+      What the VM handlers do when a VM CID reaches a guest this Director does
+      not own. A guest is foreign when another Director's bosh-owner-- tag
+      claims it, when a stamped CID's cluster does not match it, or its VM
+      carries no token tag, when it is a parker, a stemcell template, or a
+      container, or when it carries no BOSH marker at all (no owner tag, no
+      bosh-cpi tag, and no Director metadata lines in its notes). A stamped
+      CID whose token does not match the VM answers VMNotFound, because the
+      CID's VM is gone. One of:
+        ""        Same as "enforce", and the default.
+        "enforce" Refuse. has_vm answers false and get_disks answers
+                  VMNotFound. delete_vm, reboot_vm, set_vm_metadata,
+                  attach_disk, detach_disk, and snapshot_disk fail with a
+                  non-retriable error that names the reason. delete_snapshot
+                  succeeds without touching the guest, and create_disk
+                  ignores the VM hint for placement and tags.
+        "warn"    has_vm and get_disks answer as if the guest were ours and
+                  log the verdict at error level. Every destroy and every
+                  mutation still refuses a foreign guest.
+      There is no "off". A VM created before owner tags existed passes as a
+      legacy BOSH VM when its CID is a bare VMID and it carries bosh-cpi or the
+      Director metadata lines. Overridable per cpi-config entry as
+      pve_vm_ownership_guard.
+    default: ""
   pve.detached_disk_strategy:
     description: |
       Lifecycle strategy for persistent disks in the detached state (between

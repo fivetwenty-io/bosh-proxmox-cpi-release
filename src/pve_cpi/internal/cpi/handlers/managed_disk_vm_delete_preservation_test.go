@@ -325,7 +325,7 @@ func retainDeleteFixture(t *testing.T, configure ...func(*lifecycleFlowPVE)) (De
 		t.Fatal(err)
 	}
 	client.state.configs[777]["description"] = marker
-	client.state.configs[777]["tags"] = tagRetainEphemeral
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral
 	return deps, client, journal, vmID, intent
 }
 

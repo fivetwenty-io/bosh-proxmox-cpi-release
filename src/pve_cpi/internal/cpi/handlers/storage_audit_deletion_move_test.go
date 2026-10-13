@@ -360,7 +360,7 @@ func TestDeleteOfMovedVMHealsItsAttachedPersistentDisk(t *testing.T) {
 	info := *client.state.volumes[persistent]
 	client.state.volumes[ephemeral] = &info
 	client.state.configs[777]["scsi2"] = ephemeral + ",size=5G"
-	client.state.configs[777]["tags"] = tagRetainEphemeral
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral
 	plan, err := activeStorageAllocationPlan(prior)
 	if err != nil {
 		t.Fatal(err)

@@ -160,12 +160,15 @@ func (q managedDiskTestQEMU) Config(_ context.Context, _ string, vmid int) (map[
 	for key, value := range q.state.configs[vmid] {
 		cloned[key] = value
 	}
+	if _, ok := cloned["tags"]; !ok && len(cloned) > 0 {
+		cloned["tags"] = fixtureGuestTags(cloned)
+	}
 	return cloned, nil
 }
 func (c managedDiskTestCluster) ListResources(context.Context, *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
 	r := make(cluster.ListResourcesResponse, 0, len(c.state.configs))
 	for vmid, vm := range c.state.configs {
-		raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "n1", "type": "qemu", "tags": vm["tags"]})
+		raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "n1", "type": "qemu", "tags": fixtureGuestTags(vm)})
 		r = append(r, raw)
 	}
 	return &r, nil

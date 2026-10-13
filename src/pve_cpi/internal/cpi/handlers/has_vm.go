@@ -22,7 +22,10 @@ import (
 //  2. Locate VM via cluster scan (FindVMNodeViaCluster → /cluster/resources).
 //  3. Not found in cluster → return false.
 //  4. Transport error → propagate as CPI error (caller may retry).
-//  5. Found → return true.
+//  5. Found → check ownership (see ownVM). A foreign VM returns false, or
+//     true with an error log under vm_ownership_guard: warn; a token
+//     mismatch returns false.
+//  6. Owned → return true.
 //
 // Using the cluster scan rather than Config(node, vmid) means the result is
 // correct after an HA failover: the VM may have migrated to a different node
@@ -69,6 +72,32 @@ func HandleHasVM(deps Deps) cpi.Handler {
 		}
 		if !loc.Found || loc.Node == "" {
 			logger.Debug("has_vm: VM absent from cluster index and every node's config probe — returning false")
+			return false, nil
+		}
+
+		// --- ownership guard ---
+		// A VM this Director does not own is not the VM the CID names, so the
+		// enforce answer is false. warn keeps today's true and logs the same
+		// error, for an operator who must see the answer before trusting it.
+		verdict, ownErr := checkVMOwnership(ctx, deps, "has_vm", cid, loc, nil)
+		if ownErr != nil {
+			return nil, ownErr
+		}
+		if verdict.Absent {
+			logger.Debug("has_vm: VM config gone from its node and every node's config probe — returning false")
+			return false, nil
+		}
+		if verdict.Gone {
+			logger.Info("has_vm: the VMID now holds a different VM than the CID names — returning false",
+				log.String("ownership_reason", verdict.Reason), log.String("ownership_detail", verdict.Detail))
+			return false, nil
+		}
+		if verdict.foreign() {
+			if vmOwnershipGuardWarns(deps) {
+				logForeignVM(logger, "has_vm: VM is not owned by this Director; vm_ownership_guard is warn, so returning true", verdict)
+				return true, nil
+			}
+			logForeignVM(logger, "has_vm: VM is not owned by this Director — returning false", verdict)
 			return false, nil
 		}
 

@@ -1032,7 +1032,7 @@ func TestHandleDeleteVM_FastPath_TagsVM(t *testing.T) {
 		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// Return existing tags so mergeTagList is exercised with a non-empty base.
-			return map[string]any{"tags": "existing-tag"}, nil
+			return map[string]any{"tags": "bosh-cpi;existing-tag"}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
@@ -1257,7 +1257,7 @@ func TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler(t *testing.T) {
 		"vmid": stragglerVMID,
 		"node": stragglerNode,
 		"type": "qemu",
-		"tags": "bosh-deleting",
+		"tags": "bosh-cpi;bosh-deleting",
 	})
 	currentRaw, _ := json.Marshal(map[string]any{
 		"vmid": currentVMID,
@@ -1280,7 +1280,7 @@ func TestHandleDeleteVM_FastPath_StaggerSweepReapsStraggler(t *testing.T) {
 			// config; the straggler must carry it there or it is (correctly)
 			// skipped as a stale index row.
 			if vmid == stragglerVMID {
-				return map[string]any{"tags": "bosh-deleting"}, nil
+				return map[string]any{"tags": "bosh-cpi;bosh-deleting"}, nil
 			}
 			return map[string]any{}, nil
 		},
@@ -1335,7 +1335,7 @@ func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
 		"vmid": stragglerVMID,
 		"node": vmNode,
 		"type": "qemu",
-		"tags": "bosh-deleting",
+		"tags": "bosh-cpi;bosh-deleting",
 	})
 	currentRaw, _ := json.Marshal(map[string]any{
 		"vmid": currentVMID,
@@ -1358,7 +1358,7 @@ func TestHandleDeleteVM_FastPath_SweepSkipsGoneStraggler(t *testing.T) {
 			// config; the straggler must carry it there to reach the destroy
 			// whose 404 this test pins.
 			if vmid == stragglerVMID {
-				return map[string]any{"tags": "bosh-deleting"}, nil
+				return map[string]any{"tags": "bosh-cpi;bosh-deleting"}, nil
 			}
 			return map[string]any{}, nil
 		},
@@ -1577,7 +1577,7 @@ func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
 		"vmid": stragglerVMID,
 		"node": vmNode,
 		"type": "qemu",
-		"tags": "bosh-deleting",
+		"tags": "bosh-cpi;bosh-deleting",
 	})
 	currentRaw, _ := json.Marshal(map[string]any{
 		"vmid": currentVMID,
@@ -1602,7 +1602,7 @@ func TestHandleDeleteVM_FastPath_SweepDestroyError(t *testing.T) {
 			// The straggler must carry the deleting tag in its authoritative
 			// config to reach the destroy whose failure this test pins.
 			if vmid == stragglerVMID {
-				return map[string]any{"tags": "bosh-deleting"}, nil
+				return map[string]any{"tags": "bosh-cpi;bosh-deleting"}, nil
 			}
 			return map[string]any{}, nil
 		},
@@ -1662,7 +1662,7 @@ func TestHandleDeleteVM_FastPath_SweepSkipsStaleIndexTag(t *testing.T) {
 		"vmid": reusedVMID,
 		"node": vmNode,
 		"type": "qemu",
-		"tags": "bosh-deleting",
+		"tags": "bosh-cpi;bosh-deleting",
 	})
 	currentRaw, _ := json.Marshal(map[string]any{
 		"vmid": currentVMID,
@@ -1875,7 +1875,7 @@ func TestHandleDeleteVM_FastPath_SweepCapsAtMax(t *testing.T) {
 			"vmid": 900 + i,
 			"node": vmNode,
 			"type": "qemu",
-			"tags": "bosh-deleting",
+			"tags": "bosh-cpi;bosh-deleting",
 		})
 		allEntries = append(allEntries, stragglerRaw)
 	}
@@ -1897,7 +1897,7 @@ func TestHandleDeleteVM_FastPath_SweepCapsAtMax(t *testing.T) {
 			// config; straggler VMIDs must carry it there or they are
 			// (correctly) skipped as stale index rows.
 			if vmid >= 900 {
-				return map[string]any{"tags": "bosh-deleting"}, nil
+				return map[string]any{"tags": "bosh-cpi;bosh-deleting"}, nil
 			}
 			return map[string]any{}, nil
 		},
@@ -2300,7 +2300,7 @@ func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 		},
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			// VM in parker range but NO bosh-parker tag.
-			return map[string]any{"tags": "some-other-tag"}, nil
+			return map[string]any{"tags": "bosh-cpi;some-other-tag"}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{

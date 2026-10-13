@@ -46,7 +46,7 @@ func TestLegacyStragglerSweepRetainsEphemeralInUnusedSlot(t *testing.T) {
 	for _, volume := range legacyEphemeralForms {
 		t.Run(volume, func(t *testing.T) {
 			deps, client, recorder, journal := legacyRetainVolumeFixture(t, volume, "unused0")
-			client.state.configs[777]["tags"] = tagRetainEphemeral + ";" + tagDeletingVM
+			client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral + ";" + tagDeletingVM
 			before := journalRecords(t, journal)
 			sweepFastDeleteStragglers(context.Background(), deps, deps.Logger)
 			assertLegacyRetained(t, deps, client, recorder, volume)

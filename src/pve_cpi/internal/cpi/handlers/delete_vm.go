@@ -83,6 +83,66 @@ func stampDeletingTag(ctx context.Context, deps Deps, node, vmCID string, vmid i
 // round-trips.
 const sweepStragglersMaxPerSweep = 5
 
+// stragglerRowForeign reports whether a straggler row's own tags already prove
+// the VM is not this Director's to reap: an owner tag naming another
+// Director, two different owners, a parker, or a stemcell template. A row
+// that proves none of these goes on to the full ownership check on the
+// authoritative config.
+func stragglerRowForeign(rowTags, requestUUID string) bool {
+	tags := lowerTags(parseTagsField(rowTags))
+	if contains(tags, pve.ParkerTag) || contains(tags, stemcellCacheTag) || contains(tags, stemcellMarkerTag) {
+		return true
+	}
+	return otherOwner(tagValues(tags, ownerTagPrefix), strings.ToLower(sanitizeTagValue(requestUUID)))
+}
+
+// stragglerRow is the part of a /cluster/resources row the straggler sweep
+// reads.
+type stragglerRow struct {
+	Type string           `json:"type"`
+	VMID sdkclient.PVEInt `json:"vmid"`
+	Node string           `json:"node"`
+	Tags string           `json:"tags"`
+}
+
+// candidate reports whether the row is a straggler the sweep may consider: a
+// QEMU guest with a VMID and a node, no journal history protecting it, and
+// the bosh-deleting tag. Another Director's mid-delete VM, a parker, or a
+// template is never ours to reap. The row's tags settle those before the row
+// counts against the per-sweep cap, so a foreign straggler cannot hold a slot
+// on every sweep.
+func (r stragglerRow) candidate(protected map[int]bool, requestUUID string) bool {
+	if r.Type != resourceTypeQemu || r.VMID.Int() == 0 || r.Node == "" {
+		return false
+	}
+	if protected[int(r.VMID.Int())] || !tagsContain(r.Tags, tagDeletingVM) {
+		return false
+	}
+	return !stragglerRowForeign(r.Tags, requestUUID)
+}
+
+// stragglerOwned runs the full ownership check on a straggler's
+// authoritative config and reports whether the sweep may reap it. A legacy
+// straggler, one with bosh-cpi or Director notes and no owner tag, stays in
+// scope, because nothing tells it apart from our own until it is stamped. Any
+// other foreign verdict is left alone, and a check that cannot finish defers
+// the straggler to the next sweep.
+func stragglerOwned(ctx context.Context, deps Deps, vmid int, loc pve.VMLocation, cfg map[string]any, sweepLogger *log.Logger) bool {
+	verdict, err := checkVMOwnership(ctx, deps, "delete_vm", vmcid.VMCID{VMID: vmid}, loc, cfg)
+	if err != nil {
+		sweepLogger.Warn("delete_vm: straggler sweep: could not check the straggler's ownership; deferring it to the next sweep (non-fatal)",
+			log.Err(err))
+		return false
+	}
+	if !verdict.Owned {
+		sweepLogger.Info("delete_vm: straggler sweep: the straggler is not owned by this Director; leaving it",
+			log.String("ownership_reason", verdict.Reason),
+			log.String("ownership_detail", verdict.Detail))
+		return false
+	}
+	return true
+}
+
 // sweepFastDeleteStragglers scans the cluster for VMs carrying tagDeletingVM
 // (bosh-deleting) and re-issues a skiplock+purge destroy for each one. This
 // makes fast-path deletes self-healing: a VM whose async destroy stalled is
@@ -112,29 +172,16 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		return
 	}
 
-	type clusterItem struct {
-		Type string           `json:"type"`
-		VMID sdkclient.PVEInt `json:"vmid"`
-		Node string           `json:"node"`
-		Tags string           `json:"tags"`
-	}
-
 	purge := true
 	skiplock := true
 	processed := 0
 	skipped := 0
 	for _, raw := range *resp {
-		var item clusterItem
+		var item stragglerRow
 		if json.Unmarshal(raw, &item) != nil {
 			continue
 		}
-		if item.Type != resourceTypeQemu || item.VMID.Int() == 0 || item.Node == "" {
-			continue
-		}
-		if protected[int(item.VMID.Int())] {
-			continue
-		}
-		if !tagsContain(item.Tags, tagDeletingVM) {
+		if !item.candidate(protected, deps.RequestDirectorUUID) {
 			continue
 		}
 		if processed >= sweepStragglersMaxPerSweep {
@@ -157,6 +204,10 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		// to reap; any other read failure defers the straggler (fail-closed).
 		strCfg, authTags, allowed := legacySweepConfig(ctx, deps, item.Node, int(item.VMID.Int()), sweepLogger)
 		if !allowed {
+			continue
+		}
+		sweepLoc := pve.VMLocation{Node: item.Node, Tags: authTags, Found: true, Type: item.Type}
+		if !stragglerOwned(ctx, deps, int(item.VMID.Int()), sweepLoc, strCfg, sweepLogger) {
 			continue
 		}
 		// A straggler holding a legacy persistent disk named for it would lose
@@ -401,15 +452,21 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 		if err != nil {
 			return nil, err
 		}
-		vmCID, vmid, err := parseDeleteVMArgs(args)
+		vmCID, cid, err := parseDeleteVMArgs(args)
 		if err != nil {
 			return nil, err
 		}
+		vmid := cid.VMID
+		// A VM the allocation journal records is judged by the journal: the
+		// managed delete refuses a live VM whose location or allocation
+		// marker differs from the record, and only this CPI writes that
+		// marker, so a foreign VM at the VMID never passes it. The ownership
+		// guard covers the legacy path below, which has no record to check.
 		if handled, managedErr := deleteManagedVMIfRecorded(ctx, deps, vmcid.PathOf(vmid), vmid); handled || managedErr != nil {
 			return nil, managedDeleteVMError(managedErr)
 		}
 
-		return deleteLegacyVM(ctx, deps, vmCID, vmid)
+		return deleteLegacyVM(ctx, deps, vmCID, cid)
 	})
 }
 
@@ -429,7 +486,8 @@ func managedDeleteVMError(err error) error {
 	return storageDecisionSourceError(err)
 }
 
-func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any, error) {
+func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) (any, error) {
+	vmid := cid.VMID
 	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 
 	// --- locate VM authoritatively ---
@@ -472,6 +530,18 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, vmid int) (any
 		return nil, cpierrors.Retriable("delete_vm: cannot verify allocation provenance for VM %s", vmCID)
 	}
 	liveConfig := holding.Config
+
+	// --- ownership guard ---
+	// Before anything that stops, tags, or destroys the VM. The config just
+	// read supplies the tags and notes, so the guard costs no extra call. A
+	// token mismatch answers VMNotFound with no side effects, not even the
+	// agent cleanup the proven-absence branch above runs, because the agent
+	// state for this VMID belongs to whatever VM holds it now. Every other
+	// foreign verdict is a refusal in both guard modes.
+	if ownErr := refuseUnownedVM(ctx, deps, "delete_vm", vmCID, cid, loc, liveConfig, logger); ownErr != nil {
+		return nil, ownErr
+	}
+
 	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(liveConfig)); markerErr != nil || managed {
 		return nil, cpierrors.Cloud("delete_vm: allocation provenance requires its original storage journal authority")
 	}
@@ -613,23 +683,23 @@ func deleteLegacyVMAndArtifacts(ctx context.Context, deps Deps, node, vmCID stri
 }
 
 // parseDeleteVMArgs extracts and validates the vm_cid argument, returning the
-// CID string and its integer VMID.
-func parseDeleteVMArgs(args []json.RawMessage) (string, int, error) {
+// CID string and its parsed form.
+func parseDeleteVMArgs(args []json.RawMessage) (string, vmcid.VMCID, error) {
 	if len(args) < 1 {
-		return "", 0, cpierrors.Cloud("delete_vm: missing required argument vm_cid")
+		return "", vmcid.VMCID{}, cpierrors.Cloud("delete_vm: missing required argument vm_cid")
 	}
 	var vmCID string
 	if err := json.Unmarshal(args[0], &vmCID); err != nil {
-		return "", 0, cpierrors.Cloud("delete_vm: vm_cid must be a string: %s", err.Error())
+		return "", vmcid.VMCID{}, cpierrors.Cloud("delete_vm: vm_cid must be a string: %s", err.Error())
 	}
 	if vmCID == "" {
-		return "", 0, cpierrors.Cloud("delete_vm: vm_cid must not be empty")
+		return "", vmcid.VMCID{}, cpierrors.Cloud("delete_vm: vm_cid must not be empty")
 	}
 	cid, err := parseVMCIDArg("delete_vm", vmCID)
 	if err != nil {
-		return "", 0, err
+		return "", vmcid.VMCID{}, err
 	}
-	return vmCID, cid.VMID, nil
+	return vmCID, cid, nil
 }
 
 // refuseIfParkerVM is the belt-and-braces PVE-level backstop against deleting

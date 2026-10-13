@@ -706,6 +706,24 @@ type CPIConfig struct {
 	// Use DetachedDiskParkedEnabled() to gate parker logic.
 	DetachedDiskStrategy string `json:"detached_disk_strategy,omitempty"`
 
+	// VMOwnershipGuard decides what the VM handlers do when a VM CID reaches a
+	// guest this Director does not own: one another Director's owner tag
+	// claims, one a stamped CID's cluster or token does not match, a parker,
+	// a stemcell template, a container, or a guest that carries no BOSH
+	// marker at all.
+	//   "enforce" — refuse. has_vm answers false and get_disks answers
+	//               VMNotFound; every other VM handler fails non-retriably.
+	//               Default.
+	//   "warn"    — has_vm and get_disks answer as if the VM were ours and
+	//               log a warning. Every destroy and every mutation still
+	//               refuses a foreign VM, so this mode never lets one Director
+	//               delete or change another's guest.
+	// There is deliberately no "off". Overridable per cpi-config entry as
+	// pve_vm_ownership_guard.
+	//
+	// Use VMOwnershipGuardValue() for the effective normalized value.
+	VMOwnershipGuard string `json:"vm_ownership_guard,omitempty"`
+
 	// ParkedAnchorStrict controls the anchor-missing invariant of the parked
 	// strategy. A disk whose CID envelope promises a parker anchor
 	// (created under "parked") should always be held by a parker VM while
@@ -3296,6 +3314,29 @@ func (c *CPIConfig) DiskDeleteStateGuardEnabled() bool {
 	return strings.ToLower(strings.TrimSpace(c.DiskDeleteStateGuard)) != enumValueOff
 }
 
+// VMOwnershipGuardEnforce and VMOwnershipGuardWarn are the two valid
+// vm_ownership_guard values. "enforce" is the default an empty setting
+// resolves to.
+const (
+	VMOwnershipGuardEnforce = "enforce"
+	VMOwnershipGuardWarn    = "warn"
+)
+
+// VMOwnershipGuardValue returns the effective VM ownership guard mode:
+// "warn" only when the setting says so, and "enforce" for an empty setting or
+// a nil config. Validate rejects any other value at load, so an unknown value
+// never reaches a handler; should one arrive anyway, it resolves to the
+// stricter "enforce".
+func (c *CPIConfig) VMOwnershipGuardValue() string {
+	if c == nil {
+		return VMOwnershipGuardEnforce
+	}
+	if strings.ToLower(strings.TrimSpace(c.VMOwnershipGuard)) == VMOwnershipGuardWarn {
+		return VMOwnershipGuardWarn
+	}
+	return VMOwnershipGuardEnforce
+}
+
 // DetachedDiskStrategyParked and DetachedDiskStrategyFree are the two valid
 // detached_disk_strategy values. "parked" is the default an empty setting
 // resolves to; "free" is the opt-out that restores free-floating volumes.
@@ -3541,6 +3582,24 @@ func (c *CPIConfig) validateEphemeralDiskMinModeEnum(errs *[]string) {
 		*errs = append(*errs, fmt.Sprintf(
 			"ephemeral_disk_min_mode must be one of enforce|warn (or empty for default enforce), got %q",
 			c.EphemeralDiskMinMode,
+		))
+	}
+}
+
+// validateVMOwnershipGuardEnum appends an error when vm_ownership_guard is set
+// to a value other than enforce|warn. Empty (the default) is valid and
+// resolves to "enforce".
+func (c *CPIConfig) validateVMOwnershipGuardEnum(errs *[]string) {
+	if c.VMOwnershipGuard == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.VMOwnershipGuard)) {
+	case VMOwnershipGuardEnforce, VMOwnershipGuardWarn:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_ownership_guard must be one of enforce|warn (or empty for default enforce), got %q",
+			c.VMOwnershipGuard,
 		))
 	}
 }
@@ -4271,6 +4330,9 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 
 	// DetachedDiskStrategy enum: validate only when non-empty.
 	c.validateDetachedDiskStrategyEnum(errs)
+
+	// VMOwnershipGuard enum: validate only when non-empty.
+	c.validateVMOwnershipGuardEnum(errs)
 
 	// DiskMigration enum: validate only when non-empty.
 	c.validateDiskMigrationEnum(errs)

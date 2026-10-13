@@ -62,3 +62,20 @@ func ConfigStringValue(v any) (string, bool) {
 		return "", false
 	}
 }
+
+// ConfigFlag reads a PVE boolean flag (template, protection, onboot) out of
+// a decoded config map. PVE renders these as the JSON number 1, but the
+// literal and string forms PVEBool tolerates are accepted too. An absent,
+// null, or unrecognized value reports false.
+func ConfigFlag(m map[string]any, key string) bool {
+	s, ok := ConfigString(m, key)
+	if !ok {
+		return false
+	}
+	switch s {
+	case "1", "true":
+		return true
+	default:
+		return false
+	}
+}

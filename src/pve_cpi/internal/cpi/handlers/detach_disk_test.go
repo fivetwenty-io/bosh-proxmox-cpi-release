@@ -27,6 +27,10 @@ type detachQEMUService struct {
 	// Config control — used by ResolveDiskID.
 	configCfg map[string]any
 	configErr error
+	// configCalls counts config reads, and configCallsAtDetach is its value
+	// when the slot was deleted.
+	configCalls         int
+	configCallsAtDetach int
 
 	// DetachDisk control.
 	detachErr      error
@@ -38,10 +42,12 @@ type detachQEMUService struct {
 }
 
 func (m *detachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
+	m.configCalls++
 	return m.configCfg, m.configErr
 }
 
 func (m *detachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskID string) error {
+	m.configCallsAtDetach = m.configCalls
 	m.detachCalled = true
 	m.detachedDiskID = diskID
 	return m.detachErr
@@ -51,6 +57,7 @@ func (m *detachQEMUService) DetachDisk(_ context.Context, _ string, _ int, diskI
 // bus slot. It records into the same fields as DetachDisk, which the unused
 // sweep still calls, and removes the key the way PVE does.
 func (m *detachQEMUService) deleteConfigKey(_ string, _ int, key string) error {
+	m.configCallsAtDetach = m.configCalls
 	m.detachCalled = true
 	m.detachedDiskID = key
 	if m.detachErr != nil {
@@ -381,8 +388,10 @@ func TestHandleDetachDisk_ConfigFetchError(t *testing.T) {
 // (no disks attached at all) is treated as "not attached" and returns nil.
 func TestHandleDetachDisk_EmptyConfigIdempotent(t *testing.T) {
 	t.Parallel()
+	// A live config is never truly empty; it keeps at least the tag every VM
+	// this CPI creates carries, and here no disk slot at all.
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]any{},
+		configCfg: map[string]any{"tags": "bosh-cpi"},
 	}
 	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
 
@@ -1531,8 +1540,9 @@ func TestHandleDetachDisk_StrategyFree_AlreadyDetached_NoClusterCalls(t *testing
 	t.Parallel()
 
 	// The VM's config carries no disk slots: the disk is already detached.
+	// It keeps the tag every VM this CPI creates carries.
 	qemuSvc := &detachQEMUService{
-		configCfg: map[string]any{},
+		configCfg: map[string]any{"tags": "bosh-cpi"},
 	}
 	h := handlers.HandleDetachDisk(detachDepsStrategyFree(qemuSvc))
 

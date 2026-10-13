@@ -16,6 +16,17 @@ import (
 // argument that is not all digits, so a handler that leaks the raw CID fails.
 const stampedCID101 = "101-0a1b2c3d-4e5f6a7b"
 
+// stampedVMTags carries the cluster and token stamp that match the stamped
+// CIDs below. The ownership guard refuses a stamped CID whose VM lacks its
+// stamp, so the fixture VM must carry the tags a stamped create would write.
+const stampedVMTags = "bosh-cpi;bosh-cluster--0a1b2c3d;bosh-cid--4e5f6a7b"
+
+// stamped serves the fixture VM in deps with stampedVMTags, both on its
+// config and on the cluster row that places vmid on node.
+func stamped(deps handlers.Deps, vmid int, node string) handlers.Deps {
+	return withVMTags(deps, vmid, node, stampedVMTags)
+}
+
 func TestMockNodesServiceRejectsNonDigitVMID(t *testing.T) {
 	t.Parallel()
 
@@ -40,7 +51,7 @@ func TestMockNodesServiceRejectsNonDigitVMID(t *testing.T) {
 func TestHandleHasVM_StampedCID(t *testing.T) {
 	t.Parallel()
 
-	h := handlers.HandleHasVM(testDepsFoundVM(101, nil, nil, nil, &mockAgentService{}))
+	h := handlers.HandleHasVM(stamped(testDepsFoundVM(101, nil, nil, nil, &mockAgentService{}), 101, "pve-node1"))
 	result, err := h.Handle(context.Background(), marshalArgs(stampedCID101), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -60,7 +71,7 @@ func TestHandleSetVMMetadata_StampedCID(t *testing.T) {
 			return nil
 		},
 	}
-	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
+	h := handlers.HandleSetVMMetadata(stamped(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}), 101, "pve-node1"))
 	metadata := map[string]any{"director": "bosh-director", "deployment": "cf", "job": "cell", "index": "0", "id": "abc"}
 	if _, err := h.Handle(context.Background(), marshalArgs(stampedCID101, metadata), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -90,7 +101,7 @@ func TestHandleRebootVM_StampedCID(t *testing.T) {
 			return &tasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
-	h := handlers.HandleRebootVM(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"))
+	h := handlers.HandleRebootVM(stamped(testDepsReboot(qemuSvc, nodesSvc, tasksSvc, "soft"), 101, "pve-node1"))
 	if _, err := h.Handle(context.Background(), marshalArgs(stampedCID101), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -121,9 +132,9 @@ func TestHandleDeleteVM_StampedCID(t *testing.T) {
 			return &tasks.Status{ExitStatus: "OK"}, nil
 		},
 	}
-	h := handlers.HandleDeleteVM(testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, &mockAgentService{
+	h := handlers.HandleDeleteVM(stamped(testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, &mockAgentService{
 		removeFn: func(context.Context, string, int) error { return nil },
-	}))
+	}), 101, "pve-node1"))
 	if _, err := h.Handle(context.Background(), marshalArgs(stampedCID101), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -148,7 +159,7 @@ func TestHandleAttachDisk_StampedCID(t *testing.T) {
 			diskSlot: volid,
 		},
 	}
-	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
+	h := handlers.HandleAttachDisk(stamped(attachDeps(qemuSvc, &captureAgent{}), 100, testNode))
 	result, err := h.Handle(context.Background(), attachArgs(t, stampedCID100, diskCID), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -172,7 +183,7 @@ func TestHandleDetachDisk_StampedCID(t *testing.T) {
 			diskSlot: volid,
 		},
 	}
-	h := handlers.HandleDetachDisk(detachDeps(qemuSvc))
+	h := handlers.HandleDetachDisk(stamped(detachDeps(qemuSvc), 100, testNode))
 	if _, err := h.Handle(context.Background(), detachArgs(t, stampedCID100, diskCID), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +205,7 @@ func TestHandleGetDisks_StampedCID(t *testing.T) {
 			}, nil
 		},
 	}
-	h := handlers.HandleGetDisks(getDisksDeps(qemuSvc))
+	h := handlers.HandleGetDisks(stamped(getDisksDeps(qemuSvc), 100, "pve-node1"))
 	result, err := h.Handle(context.Background(), marshalArgs(stampedCID100), jsonrpc.Context{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -214,7 +225,7 @@ func TestHandleDeleteSnapshot_StampedCID(t *testing.T) {
 			return nil
 		},
 	}
-	h := handlers.HandleDeleteSnapshot(delSnapDeps(qemuSvc))
+	h := handlers.HandleDeleteSnapshot(stamped(delSnapDeps(qemuSvc), 100, testNode))
 	if _, err := h.Handle(context.Background(), marshalArgs(stampedCID100+":bosh-1234567890-abcd1234"), jsonrpc.Context{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

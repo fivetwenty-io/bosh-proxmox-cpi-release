@@ -23,6 +23,8 @@ import (
 type delSnapQEMUService struct {
 	deleteSnapshotFn func(ctx context.Context, node string, vmid int, name string) error
 	listSnapshotsFn  func(ctx context.Context, node string, vmid int) ([]map[string]any, error)
+	// configErr, when set, fails every config read with it.
+	configErr error
 }
 
 func (m *delSnapQEMUService) DeleteSnapshot(ctx context.Context, node string, vmid int, name string) error {
@@ -36,8 +38,15 @@ func (m *delSnapQEMUService) DeleteSnapshot(ctx context.Context, node string, vm
 func (m *delSnapQEMUService) Create(_ context.Context, _ string, _ map[string]any) (string, error) {
 	panic("delSnapQEMUService.Create: not expected")
 }
+
+// Config answers an empty config, which the shared shim serves with the
+// fixture's tags, so the ownership guard can judge a VM whose row says it is
+// not ours.
 func (m *delSnapQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
-	panic("delSnapQEMUService.Config: not expected")
+	if m.configErr != nil {
+		return nil, m.configErr
+	}
+	return map[string]any{}, nil
 }
 func (m *delSnapQEMUService) Status(_ context.Context, _ string, _ int) (map[string]any, error) {
 	panic("delSnapQEMUService.Status: not expected")

@@ -291,6 +291,13 @@ func TestHandleCreateDisk_VMCIDIgnoredForNaming(t *testing.T) {
 		},
 	}
 	deps := baseDepsForCreate(t, storageSvc, nil) // NextDiskVMID → 9000
+	// The hinted VM is absent: the ownership check on the hint probes its
+	// config and finds nothing, so the hint passes through unchanged.
+	deps.PVE.(*mockPVEClient).qemuSvc = &mockQEMUService{
+		configFn: func(context.Context, string, int) (map[string]any, error) {
+			return nil, makeAPIErr(404, "Configuration file 'nodes/pve/qemu-server/200.conf' does not exist")
+		},
+	}
 
 	h := handlers.HandleCreateDisk(deps)
 	_, err := h.Handle(context.Background(), []json.RawMessage{

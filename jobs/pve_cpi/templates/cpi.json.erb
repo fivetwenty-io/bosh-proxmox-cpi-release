@@ -498,6 +498,11 @@
   detached_disk_strategy = p("pve.detached_disk_strategy", "")
   config["detached_disk_strategy"] = detached_disk_strategy unless detached_disk_strategy.to_s.empty?
 
+  # Emit vm_ownership_guard only when set. The Go accessor defaults an empty
+  # string to "enforce"; omitting the key hands the decision to that default.
+  vm_ownership_guard = p("pve.vm_ownership_guard", "")
+  config["vm_ownership_guard"] = vm_ownership_guard unless vm_ownership_guard.to_s.empty?
+
   # Emit parked_anchor_strict only when the operator set it. The property
   # carries no spec default, so if_p fires only on an operator-provided value;
   # the Go accessor treats an absent key as strict (true).

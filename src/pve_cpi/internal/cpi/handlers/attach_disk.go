@@ -168,6 +168,11 @@ func HandleAttachDisk(deps Deps) Handler {
 		if err != nil {
 			return nil, err
 		}
+		// The ownership guard above judged the VM before the holder guard ran,
+		// and the holder guard can take minutes when it migrates the disk. So
+		// the slot choice judges the config it reads once more before the
+		// first write, which costs no extra call.
+		plan.judgeTarget = attachDiskTargetJudge(ctx, deps, vmCID, node, vmid)
 
 		// --------------------------------------------------------------------
 		// 4. Snapshot pre-flight guard.
@@ -273,7 +278,12 @@ func attachDiskCore(
 ) (diskID, devicePath string, err error) {
 	const bus = "scsi"
 
-	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, rd.volid)
+	desiredDiskID, prepErr := chooseSCSISlotSkippingZero(ctx, deps, op, node, vmid, rd.volid, plan.judgeTarget)
+	var refusal attachTargetRefusal
+	if errors.As(prepErr, &refusal) {
+		// The guard's own answer, unchanged.
+		return "", "", refusal.err
+	}
 	if _, pending := pve.IsDriveDeletePending(prepErr); pending {
 		// Already classed by the slot choice.
 		return "", "", prepErr
@@ -768,6 +778,20 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stabl
 		return "", 0, cpierrors.Wrap(lookupErr, fmt.Sprintf("attach_disk: lookup VM %s node failed", vmCID))
 	}
 	vmNode, found := loc.Node, loc.Found
+	// Every step after this one edits the VM's config, and the holder guard
+	// may unpark or migrate the disk toward it, so a VM this Director does
+	// not own is refused before any of them. The VM's config decides rather
+	// than the scan row, because create_vm then attach_disk runs inside the
+	// index's lag window, where a reused VMID can still show the tags of the
+	// VM it held before. A location the lookup's config probe found already
+	// carries that config, so it is judged with no second read. The slot
+	// choice judges the VM again on the config it reads before the write.
+	if found && vmNode != "" {
+		if ownErr := refuseUnownedVMByConfig(ctx, deps, "attach_disk", vmCID, parsedCID, loc,
+			deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))); ownErr != nil {
+			return "", 0, ownErr
+		}
+	}
 	if backend.Kind() == pve.BackendLocal {
 		if found && vmNode != "" && vmNode != node {
 			switch {
@@ -933,6 +957,9 @@ func attachDiskConfirmAndPath(ctx context.Context, deps Deps, vmCID, node string
 //     so detaching them loses no data.
 //   - Otherwise the lowest scsi index >= 1 that no key occupies in either view
 //     is returned.
+//
+// judge, when it is not nil, runs on the applied view of the first read before
+// anything is written, and its error comes back as an attachTargetRefusal.
 func chooseSCSISlotSkippingZero(
 	ctx context.Context,
 	deps Deps,
@@ -940,10 +967,16 @@ func chooseSCSISlotSkippingZero(
 	node string,
 	vmid int,
 	volid string,
+	judge func(cfg map[string]any) error,
 ) (string, error) {
 	views, err := pve.ReadQemuViews(ctx, deps.PVE, node, vmid)
 	if err != nil {
 		return "", err
+	}
+	if judge != nil {
+		if refused := judge(views.Applied()); refused != nil {
+			return "", attachTargetRefusal{err: refused}
+		}
 	}
 
 	if existing, ok := views.BusSlotNaming(volid); ok {
@@ -1036,6 +1069,33 @@ type attachPlan struct {
 	// protection restore was cut off or a guard won't delete a mover this
 	// request didn't create. Meaningful only when viaTransfer is true.
 	destroyMover bool
+	// judgeTarget is attach_disk's ownership judgment of the target VM's
+	// config, which the slot choice runs on the config it reads before the
+	// first write. nil skips it, which is right for create_vm's own attaches
+	// to the VM it just created.
+	judgeTarget func(cfg map[string]any) error
+}
+
+// attachTargetRefusal carries judgeTarget's answer out of the slot choice, so
+// attachDiskCore returns it unchanged rather than as a slot-selection failure.
+type attachTargetRefusal struct{ err error }
+
+func (r attachTargetRefusal) Error() string { return r.err.Error() }
+func (r attachTargetRefusal) Unwrap() error { return r.err }
+
+// attachDiskTargetJudge returns attach_disk's judgeTarget. It judges the
+// config it is handed as node-local truth, so it never reads, and its answers
+// are refuseUnownedVM's.
+func attachDiskTargetJudge(ctx context.Context, deps Deps, vmCID, node string, vmid int) func(cfg map[string]any) error {
+	cid, err := vmcid.Parse(vmCID)
+	if err != nil {
+		cid = vmcid.VMCID{VMID: vmid}
+	}
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+	loc := pve.VMLocation{Node: node, Found: true, Type: resourceTypeQemu}
+	return func(cfg map[string]any) error {
+		return refuseUnownedVM(ctx, deps, "attach_disk", vmCID, cid, loc, cfg, logger)
+	}
 }
 
 // guardAndUnparkBeforeAttach settles who currently holds the volume, then

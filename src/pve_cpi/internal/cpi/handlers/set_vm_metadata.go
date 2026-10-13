@@ -125,6 +125,19 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		node := loc.Node
 		logger.Debug("set_vm_metadata: VM located", log.String("node", node))
 
+		// --- ownership guard ---
+		// Before the lock and the read-modify-write, so a CID that reaches
+		// another Director's VM, a parker, a template, or a hand-made VM
+		// renames and retags nothing. A row that says the VM is not ours is
+		// checked against the VM's config before anything is refused, because
+		// a VMID create_vm just took can still show the tags of the VM it held
+		// before. The read-modify-write runs the guard again on the config it
+		// reads under the lock, and the instance-identity check there still
+		// runs for owned and legacy VMs.
+		if ownErr := refuseUnownedVM(ctx, deps, "set_vm_metadata", vmCID, cid, loc, nil, logger); ownErr != nil {
+			return nil, ownErr
+		}
+
 		// --- build description ---
 		// Sorted "key: value\n" lines matching Perl reference behavior.
 		description := buildDescription(metadata)
@@ -155,7 +168,12 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 		// Pool service absent (nil) → retriable error so the director re-drives.
 		lockOwner := fmt.Sprintf("set_vm_metadata/%d", vmid)
 		lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmid, lockOwner, logger, func() error {
-			if rmwErr := setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, logger); rmwErr != nil {
+			// The scan row the guard above judged can be stale, so the
+			// config read under the lock is judged again before the write.
+			recheckOwnership := func(cfg map[string]any) error {
+				return refuseUnownedVM(ctx, deps, "set_vm_metadata", vmCID, cid, loc, cfg, logger)
+			}
+			if rmwErr := setVMMetadataRMW(ctx, deps, node, vmid, vmCID, description, metadata, vmName, recheckOwnership, logger); rmwErr != nil {
 				return rmwErr
 			}
 			// Reconcile the VM's resource-pool membership against the
@@ -180,6 +198,13 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 // tags), merges BOSH-managed tags from metadata, and writes description + tags +
 // name in a single UpdateQemuConfig call.
 //
+// recheckOwnership runs the ownership guard again on the config read here,
+// which is node-local truth where the guard before the lock judged the scan
+// row, so a VMID that changed hands since the scan is refused before the
+// write. When that read fails, nothing is written and the error is retriable,
+// because a write on a VM nobody judged by its config is the one this guard
+// exists to prevent.
+//
 // Separated from HandleSetVMMetadata to keep cognitive complexity below the
 // lint threshold; the caller (withVMIDLock closure) provides serialization.
 func setVMMetadataRMW(
@@ -191,6 +216,7 @@ func setVMMetadataRMW(
 	description string,
 	metadata map[string]any,
 	vmName *string,
+	recheckOwnership func(cfg map[string]any) error,
 	logger *log.Logger,
 ) error {
 	// Read existing tags inside the lock so no concurrent writer can interleave
@@ -203,6 +229,9 @@ func setVMMetadataRMW(
 	var existingTags []string
 	var existingDesc string
 	if cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid); cfgErr == nil {
+		if ownErr := recheckOwnership(cfg); ownErr != nil {
+			return ownErr
+		}
 		if s, ok := pve.ConfigString(cfg, jsonKeyTags); ok {
 			existingTags = parseTagsField(s)
 		}
@@ -217,19 +246,12 @@ func setVMMetadataRMW(
 		if deps.Config != nil && (deps.Config.StoragePlacementNamespace != "" || deps.Config.StorageAllocationJournalDir != "") {
 			return cpierrors.Cloud("set_vm_metadata: cannot verify existing allocation provenance")
 		}
-		// Without the config we cannot tell whether this VM belongs to the
-		// instance the metadata names, and the write below would rename and
-		// retag it anyway. Metadata that names no instance skips the identity
-		// check, so it keeps the old warn-and-continue behavior. The class is
-		// retriable whatever the read error was, because nothing about the VM
-		// has been judged yet and a later read may well succeed.
-		if incomingInstanceIdentity(metadata) != "" {
-			return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
-				fmt.Sprintf("set_vm_metadata: read VM %s config to verify its instance identity", vmCID))
-		}
-		logger.Warn("set_vm_metadata: could not read current VM config; existing tags and description sentinel will not be preserved",
-			log.Err(cfgErr),
-		)
+		// Without the config the ownership recheck cannot run, and neither
+		// can the identity check, so we write nothing. The class is retriable
+		// whatever the read error was, because nothing about the VM has been
+		// judged yet and a later read may well succeed.
+		return cpierrors.WrapAs(cfgErr, cpierrors.TypeRetriableCloud,
+			fmt.Sprintf("set_vm_metadata: read VM %s config to check its ownership and instance identity", vmCID))
 	}
 
 	// Refuse before anything is written when the VM records a different

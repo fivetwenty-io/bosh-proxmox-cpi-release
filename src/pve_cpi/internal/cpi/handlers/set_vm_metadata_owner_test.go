@@ -365,9 +365,10 @@ func TestSetVMMetadata_NoDirectorUUIDBackfillsNothing(t *testing.T) {
 	}
 }
 
-// Only a VM with bosh-cpi is legacy. A VM without it gets no owner tag from
-// set_vm_metadata, and a VM that already names a different owner keeps that
-// tag alone, because judging it is not this handler's job.
+// Only a VM with bosh-cpi is legacy. A VM without it, and a VM that already
+// names a different owner, never get an owner tag from set_vm_metadata,
+// because the ownership guard refuses both on the config it reads under the
+// lock, before anything is written.
 func TestSetVMMetadata_BackfillOnlyOnLegacyVMs(t *testing.T) {
 	t.Parallel()
 
@@ -386,17 +387,35 @@ func TestSetVMMetadata_BackfillOnlyOnLegacyVMs(t *testing.T) {
 				directorUUID: ownerTestDirectorUUID,
 				metadata:     ownerTestMetadata(),
 			}.do(t)
-			if res.err != nil {
-				t.Fatalf("unexpected error: %v", res.err)
-			}
-			if strings.Contains(res.tags, ownerTestOwnerTag) {
-				t.Errorf("owner tag stamped on a VM that is not legacy: %q", res.tags)
-			}
-			if strings.Contains(tc.tags, otherOwner) && tagIndex(res.tags, otherOwner) != 1 {
-				t.Errorf("the other Director's owner tag did not survive at position 1: %q", res.tags)
-			}
+			assertRefusedUntouched(t, res)
 		})
 	}
+
+	// A VM without bosh-cpi whose notes carry the Director's lines passes the
+	// guard as ours, so it reaches the backfill. Only bosh-cpi marks a VM as
+	// one this CPI made, so it must not be claimed with an owner tag, even
+	// when its recorded instance matches.
+	t.Run("no bosh-cpi tag, Director notes", func(t *testing.T) {
+		t.Parallel()
+		res := ownerTestRun{
+			tags:         "env--prod",
+			description:  ownerTestDescription(ownerTestInstanceUUID),
+			directorUUID: ownerTestDirectorUUID,
+			metadata:     ownerTestMetadata(),
+		}.do(t)
+		if res.err != nil {
+			t.Fatalf("set_vm_metadata refused a VM whose notes carry the Director's lines: %v", res.err)
+		}
+		if !res.updated {
+			t.Fatal("UpdateQemuConfig was not called")
+		}
+		if strings.Contains(res.tags, "bosh-owner--") {
+			t.Errorf("an owner tag was backfilled onto a VM without bosh-cpi: %q", res.tags)
+		}
+		if tagIndex(res.tags, "env--prod") < 0 {
+			t.Errorf("the operator tag env--prod was dropped: %q", res.tags)
+		}
+	})
 }
 
 // An operator tag that shares the job's name is not identity evidence unless
@@ -418,9 +437,10 @@ func TestSetVMMetadata_OperatorTagNamedLikeTheJobIsNotEvidence(t *testing.T) {
 	}
 }
 
-// When the VM config cannot be read, the identity check cannot run, so
-// metadata that names an instance is refused retriably and nothing is
-// written. Metadata that names no instance keeps the old warn-and-continue.
+// When the VM config cannot be read under the lock, neither the ownership
+// recheck nor the identity check can run, so set_vm_metadata refuses
+// retriably and writes nothing, whether or not the metadata names an
+// instance.
 func TestSetVMMetadata_UnreadableConfig(t *testing.T) {
 	t.Parallel()
 
@@ -446,16 +466,21 @@ func TestSetVMMetadata_UnreadableConfig(t *testing.T) {
 		t.Errorf("UpdateQemuConfig was called on a VM whose identity was never read (tags %q)", res.tags)
 	}
 
+	// Metadata that names no instance is refused the same way, because the
+	// ownership recheck under the lock never ran on this VM's config.
 	res = ownerTestRun{
 		configErr:    readErr,
 		directorUUID: ownerTestDirectorUUID,
 		metadata:     map[string]any{"director": "bosh", "deployment": "cf"},
 	}.do(t)
-	if res.err != nil {
-		t.Fatalf("metadata without an identity must keep the warn-and-continue path: %v", res.err)
+	if res.err == nil {
+		t.Fatal("set_vm_metadata wrote to a VM whose ownership was never checked against its config")
 	}
-	if !res.updated {
-		t.Error("UpdateQemuConfig was not called")
+	if !errors.As(res.err, &cerr) || cerr.Type() != cpierrors.TypeRetriableCloud || !cerr.OkToRetry() {
+		t.Errorf("error = %v, want a retriable %s", res.err, cpierrors.TypeRetriableCloud)
+	}
+	if res.updated {
+		t.Error("UpdateQemuConfig was called on a VM whose ownership was never checked")
 	}
 }
 
@@ -504,7 +529,7 @@ func TestSetVMMetadata_NameTagCannotClaimOwnerPrefix(t *testing.T) {
 	metadata["job"], metadata["instance_group"], metadata["name"] = "bosh-owner", "bosh-owner", "bosh-owner/"+ownerTestOtherUUID
 	delete(metadata, "id")
 	res := ownerTestRun{
-		tags:     "env--prod",
+		tags:     "bosh-cpi;env--prod",
 		metadata: metadata,
 	}.do(t)
 	if res.err != nil {
@@ -575,7 +600,8 @@ func TestSetVMMetadata_UntiedUUIDTagBlocksBackfill(t *testing.T) {
 }
 
 // Stemcell templates and disk parkers carry bosh-cpi and record no instance,
-// and several Directors may share them, so they never get an owner tag.
+// and several Directors may share them, so they never get an owner tag. The
+// ownership guard refuses them outright, so nothing is written at all.
 func TestSetVMMetadata_NoBackfillOnTemplatesOrParkers(t *testing.T) {
 	t.Parallel()
 
@@ -587,12 +613,7 @@ func TestSetVMMetadata_NoBackfillOnTemplatesOrParkers(t *testing.T) {
 				directorUUID: ownerTestDirectorUUID,
 				metadata:     ownerTestMetadata(),
 			}.do(t)
-			if res.err != nil {
-				t.Fatalf("unexpected error: %v", res.err)
-			}
-			if strings.Contains(res.tags, ownerTestOwnerTag) {
-				t.Errorf("owner tag backfilled onto a %s VM: %q", marker, res.tags)
-			}
+			assertRefusedUntouched(t, res)
 		})
 	}
 }

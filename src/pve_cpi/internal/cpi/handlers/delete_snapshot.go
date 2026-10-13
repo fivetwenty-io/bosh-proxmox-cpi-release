@@ -91,6 +91,36 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		)
 
 		// ----------------------------------------------------------------
+		// 3a. Ownership guard. Deleting a snapshot is a mutation, so warn
+		//     does not relax it: a VM this Director does not own keeps its
+		//     snapshots in both modes. The answer is success, because the
+		//     snapshot the CID named is not on this VM, and the Director
+		//     drops a record it could never act on. A snapshot that really
+		//     lives on another cluster leaks there and goes when its VM
+		//     does.
+		// ----------------------------------------------------------------
+		verdict, ownErr := checkVMOwnership(ctx, deps, "delete_snapshot", parsedCID, loc, nil)
+		if ownErr != nil {
+			return nil, ownErr
+		}
+		if verdict.Absent {
+			deps.Log(ctx).Info("delete_snapshot: VM is gone from every cluster member -- answering success",
+				log.String("snapshot_cid", snapshotCID),
+				log.Int("vmid", vmid),
+			)
+			return nil, nil
+		}
+		if !verdict.Owned {
+			deps.Log(ctx).Warn("delete_snapshot: VM is not owned by this Director -- leaving it untouched and answering success",
+				log.String("snapshot_cid", snapshotCID),
+				log.Int("vmid", vmid),
+				log.String("ownership_reason", verdict.Reason),
+				log.String("ownership_detail", verdict.Detail),
+			)
+			return nil, nil
+		}
+
+		// ----------------------------------------------------------------
 		// 4. Delete snapshot via SDK. 404 -> idempotent success.
 		// ----------------------------------------------------------------
 		delErr := pve.RetryOnTransientOrLock(ctx, deps.Log(ctx), "delete_snapshot", 0, func() error {

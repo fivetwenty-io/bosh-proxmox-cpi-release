@@ -1342,11 +1342,23 @@ func FindVMNodeViaCluster(ctx context.Context, c Client, vmid int) (string, bool
 // variant; the tag string is PVE's semicolon-separated encoding, "" when the
 // VM has no tags or the row omits the field.
 func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags string, found bool, err error) {
+	row, err := findVMRowViaCluster(ctx, c, vmid)
+	if err != nil {
+		return "", "", false, err
+	}
+	return row.Node, row.Tags, row.Found, nil
+}
+
+// findVMRowViaCluster is FindVMViaCluster's scan, returning the whole row the
+// VM ownership guard reads: node, tags, the resource type ("qemu" or "lxc"),
+// and the template flag. The listing is the same single
+// /cluster/resources?type=vm call, so the extra fields cost nothing.
+func findVMRowViaCluster(ctx context.Context, c Client, vmid int) (VMLocation, error) {
 	// A nil Cluster service is the expected case in unit-test mocks that
 	// don't wire one (mirrors lookupVMStorageType's ClusterStorage guard):
 	// report not-found so callers keep their fallback behavior.
 	if c == nil || c.Cluster() == nil || vmid <= 0 {
-		return "", "", false, nil
+		return VMLocation{}, nil
 	}
 	typ := "vm"
 	var resp *sdkcluster.ListResourcesResponse
@@ -1359,25 +1371,33 @@ func FindVMViaCluster(ctx context.Context, c Client, vmid int) (node, tags strin
 		// WrapError first — see FindVMByDiskVolidTagged. This leg feeds
 		// delete_vm's VM lookup, so a permanent label here strands a delete
 		// the Director would otherwise retry.
-		return "", "", false, cpierrors.Wrap(WrapError(listErr), "findVMNodeViaCluster: list cluster vms")
+		return VMLocation{}, cpierrors.Wrap(WrapError(listErr), "findVMNodeViaCluster: list cluster vms")
 	}
 	if resp == nil {
-		return "", "", false, nil
+		return VMLocation{}, nil
 	}
 	for _, raw := range *resp {
 		var entry struct {
-			VMID sdkclient.PVEInt `json:"vmid"`
-			Node string           `json:"node"`
-			Tags string           `json:"tags"`
+			VMID     sdkclient.PVEInt  `json:"vmid"`
+			Node     string            `json:"node"`
+			Tags     string            `json:"tags"`
+			Type     string            `json:"type"`
+			Template sdkclient.PVEBool `json:"template"`
 		}
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
 		if int(entry.VMID.Int()) == vmid && entry.Node != "" {
-			return entry.Node, entry.Tags, true, nil
+			return VMLocation{
+				Node:     entry.Node,
+				Tags:     entry.Tags,
+				Found:    true,
+				Template: entry.Template.Bool(),
+				Type:     entry.Type,
+			}, nil
 		}
 	}
-	return "", "", false, nil
+	return VMLocation{}, nil
 }
 
 // FindVMPoolViaCluster returns the resource-pool membership of vmid from the

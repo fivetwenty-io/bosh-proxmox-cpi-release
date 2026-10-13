@@ -328,6 +328,20 @@ if [ "$(printf '%s' "$JSON_7B" | ruby -rjson -e 'print JSON.parse(STDIN.read).fe
   echo "FAIL [case7]: placement.bridge_check was emitted although it was unset" >&2
   FAILED=$((FAILED+1))
 fi
+# vm_ownership_guard renders only when set, so the Go default ("enforce")
+# decides for a manifest that says nothing.
+echo "Case 8: vm_ownership_guard"
+props_with_ownership_guard() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+    h = eval(STDIN.read)
+    h["pve"]["vm_ownership_guard"] = ARGV[0]
+    print h.inspect
+  ' "$1"
+}
+JSON_8="$(render "$(props_with_ownership_guard warn)")"
+assert_json_valid      "case8" "$JSON_8"                         || FAILED=$((FAILED+1))
+assert_json_key_equals "case8" "$JSON_8" vm_ownership_guard warn || FAILED=$((FAILED+1))
+assert_json_lacks_key  "case8-unset" "$JSON_1" vm_ownership_guard || FAILED=$((FAILED+1))
 
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2

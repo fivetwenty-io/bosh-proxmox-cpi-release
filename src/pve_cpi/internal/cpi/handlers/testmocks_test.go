@@ -56,9 +56,54 @@ type mockPVEClient struct {
 	// storageStatusCalls counts those reads, so a test can pin that the
 	// corroboration stopped at a cheaper source.
 	storageStatusCalls int
+	// fixtureTags replaces bosh-cpi as the tags cpiTaggedCluster and
+	// cpiTaggedQEMU give an untagged fixture VM, so a suite can model a VM
+	// with a stamp or an owner tag without rewriting every row.
+	fixtureTags string
 }
 
-func (m *mockPVEClient) QEMU() qemu.Service { return m.qemuSvc }
+// defaultGuestTags is the tags value an untagged fixture VM is served with.
+func (m *mockPVEClient) defaultGuestTags() string {
+	if m.fixtureTags != "" {
+		return m.fixtureTags
+	}
+	return "bosh-cpi"
+}
+
+// QEMU serves a wired QEMU fake through cpiTaggedQEMU.
+func (m *mockPVEClient) QEMU() qemu.Service {
+	if m.qemuSvc == nil {
+		return nil
+	}
+	return cpiTaggedQEMU{Service: m.qemuSvc, tags: m.defaultGuestTags()}
+}
+
+// cpiTaggedQEMU gives a fixture VM config the tag every VM this CPI creates
+// carries, for the same reason as cpiTaggedCluster. A config that leaves the
+// tags key out, including an empty one, is served as a copy tagged bosh-cpi,
+// because the ownership guard judges a VM by the config a handler read and a
+// real VM config is never empty. A nil config and one that sets tags, even to
+// "", are served verbatim.
+type cpiTaggedQEMU struct {
+	qemu.Service
+	tags string
+}
+
+func (q cpiTaggedQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	cfg, err := q.Service.Config(ctx, node, vmid)
+	if err != nil || cfg == nil {
+		return cfg, err
+	}
+	if _, ok := cfg["tags"]; ok {
+		return cfg, nil
+	}
+	tagged := make(map[string]any, len(cfg)+1)
+	for key, value := range cfg {
+		tagged[key] = value
+	}
+	tagged["tags"] = q.tags
+	return tagged, nil
+}
 
 // Nodes serves the authoritative per-node listing surface
 // (pve.ListGuestsAuthoritative) by deriving ListQemu rows from the wired
@@ -152,11 +197,58 @@ func (m *mockPVEClient) CloudInit() cloudinit.Service { return m.cloudInitSvc }
 // service. The parked detached-disk strategy is the default, so handlers scan
 // cluster resources for parker VMs on paths that never touched the cluster
 // before; an empty listing is what production sees when no parker exists.
+// A wired service is served through cpiTaggedCluster.
 func (m *mockPVEClient) Cluster() cluster.Service {
 	if m.clusterSvc == nil {
 		return &mockClusterSvc{}
 	}
-	return m.clusterSvc
+	return cpiTaggedCluster{Service: m.clusterSvc, tags: m.defaultGuestTags()}
+}
+
+// cpiTaggedCluster gives fixture VM rows the tag every VM this CPI creates
+// carries. The VM ownership guard refuses a VM with no BOSH marker at all, and
+// the suites written before it build their rows without tags. A QEMU row that
+// leaves the tags key out is served as a CPI-created VM tagged bosh-cpi. A
+// row that sets tags, even to "", is served verbatim, which is how a suite
+// models a hand-made, foreign, parker, or template VM.
+type cpiTaggedCluster struct {
+	cluster.Service
+	tags string
+}
+
+func (c cpiTaggedCluster) ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+	resp, err := c.Service.ListResources(ctx, params)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	out := make(cluster.ListResourcesResponse, len(*resp))
+	for i, raw := range *resp {
+		out[i] = withGuestTags(raw, c.tags)
+	}
+	return &out, nil
+}
+
+// withGuestTags adds tags to a QEMU guest row that has no tags key.
+func withGuestTags(raw json.RawMessage, tags string) json.RawMessage {
+	var row map[string]any
+	if json.Unmarshal(raw, &row) != nil {
+		return raw
+	}
+	if _, ok := row["vmid"]; !ok {
+		return raw
+	}
+	if _, ok := row["tags"]; ok {
+		return raw
+	}
+	if typ, _ := row["type"].(string); typ != "" && typ != "qemu" {
+		return raw
+	}
+	row["tags"] = tags
+	tagged, err := json.Marshal(row)
+	if err != nil {
+		return raw
+	}
+	return tagged
 }
 func (m *mockPVEClient) ClusterStorage() clusterstorage.Service { return m.clusterStorageSvc }
 

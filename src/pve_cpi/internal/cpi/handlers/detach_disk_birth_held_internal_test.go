@@ -120,6 +120,7 @@ func birthHeldClient(t *testing.T, legacy *birthHeldPlacement) *idFakeClient {
 func birthHeldClientFor(t *testing.T, birth string, legacy *birthHeldPlacement) *idFakeClient {
 	t.Helper()
 	source := map[string]any{
+		"tags":        ownershipTag,
 		"scsi1":       birthHeldAttached + ",serial=" + idTestToken + ",size=10G",
 		"description": birthHeldDescription(t, idTestToken, birthHeldAttached, birth),
 	}

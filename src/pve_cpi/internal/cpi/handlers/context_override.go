@@ -452,6 +452,13 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	// never share one client whose TLS config already baked in the first.
 	// An empty CA adds nothing, so a config without one keys exactly as it
 	// did before the CA became overridable.
+	// The ownership guard mode never changes what the bundle holds, but every
+	// overridable field reaches this key so two entries never share a bundle
+	// on a difference the key cannot see. An unset mode adds nothing, so a
+	// config without one keys exactly as it did before the guard existed.
+	if cfg.VMOwnershipGuard != "" {
+		_, _ = fmt.Fprintf(h, "vm_ownership_guard=%s\x00", cfg.VMOwnershipGuardValue())
+	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))
 		_, _ = fmt.Fprintf(h, "ca_cert_sha=%s\x00", hex.EncodeToString(caHash[:]))

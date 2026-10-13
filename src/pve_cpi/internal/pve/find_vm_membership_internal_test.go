@@ -265,6 +265,216 @@ func TestFindVMAuthoritative_AllMembersOffline_Retriable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// FindVMByConfigProbe absence proof
+// ---------------------------------------------------------------------------
+
+// TestFindVMByConfigProbe_OfflineMemberLeavesAbsenceUnproven is the fixture
+// where FindVMAuthoritative excludes the offline member and proves absence.
+// FindVMByConfigProbe has no index row to cover that member's guests, so the
+// same answers leave absence unproven, and the error names the member.
+func TestFindVMByConfigProbe_OfflineMemberLeavesAbsenceUnproven(t *testing.T) {
+	t.Parallel()
+	q := &mnQEMU{configFn: func(node string, _ int) (map[string]any, error) {
+		if node == "pve2" {
+			return nil, errors.New("offline member must not be probed")
+		}
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}}
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes:    []string{"pve1", "pve2"},
+			statusFn: lgStatus(map[string]bool{"pve1": true, "pve2": false}),
+		},
+		nodes: &lgNodes{},
+		qemu:  q,
+	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4113)
+	if err == nil {
+		t.Fatalf("an offline member proves nothing on the probe path; want an error, got loc=%+v", loc)
+	}
+	if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("error = %v; want retriable", err)
+	}
+	if !strings.Contains(err.Error(), "pve2") || !strings.Contains(err.Error(), "FindVMByConfigProbe") {
+		t.Fatalf("the error must name the offline member and the function, got: %v", err)
+	}
+	for _, n := range q.probed {
+		if n == "pve2" {
+			t.Fatalf("probed %v; an offline member's config endpoint cannot answer and must not be probed", q.probed)
+		}
+	}
+}
+
+// TestFindVMByConfigProbe_OfflineMemberDoesNotHideAHit pins that the strict
+// rule only withholds absence. A config on an online member is still a hit,
+// because VMIDs are cluster-unique.
+func TestFindVMByConfigProbe_OfflineMemberDoesNotHideAHit(t *testing.T) {
+	t.Parallel()
+	q := &mnQEMU{configFn: func(node string, _ int) (map[string]any, error) {
+		if node == "pve2" {
+			return map[string]any{"tags": "bosh-cpi"}, nil
+		}
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}}
+	c := &lgClient{
+		cluster: &lgCluster{
+			nodes:    []string{"pve1", "pve2", "pve3"},
+			statusFn: lgStatus(map[string]bool{"pve1": false, "pve2": true, "pve3": true}),
+		},
+		nodes: &lgNodes{},
+		qemu:  q,
+	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4114)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !loc.Found || loc.Node != "pve2" || !loc.FromConfig || loc.Tags != "bosh-cpi" {
+		t.Fatalf("loc = %+v; want a FromConfig hit on pve2", loc)
+	}
+}
+
+// TestFindVMByConfigProbe_SecondSweepFindsAMigratedVM covers a migration
+// whose config rename lands inside the first sweep: the first sweep sees the
+// VM on no member, and the second finds it on the target, whose location is
+// the answer.
+func TestFindVMByConfigProbe_SecondSweepFindsAMigratedVM(t *testing.T) {
+	t.Parallel()
+	q := &mnQEMU{}
+	q.configFn = func(node string, _ int) (map[string]any, error) {
+		// The first sweep probes pve1 and pve2; the config lands on pve1
+		// after the first sweep has passed it.
+		if node == "pve1" && len(q.probed) > 2 {
+			return map[string]any{"tags": "bosh-cpi"}, nil
+		}
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}
+	c := &lgClient{
+		cluster: &lgCluster{nodes: []string{"pve1", "pve2"}},
+		nodes:   &lgNodes{},
+		qemu:    q,
+	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4115)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !loc.Found || loc.Node != "pve1" || !loc.FromConfig {
+		t.Fatalf("loc = %+v; want the second sweep's hit on pve1", loc)
+	}
+	if got := strings.Join(q.probed, ","); got != "pve1,pve2,pve1" {
+		t.Fatalf("probed %s; want a full first sweep and a second sweep that stops at the hit", got)
+	}
+}
+
+// TestFindVMByConfigProbe_AbsenceTakesTwoSweeps pins the cost of the second
+// sweep: it runs only when the first proves absence, and absence is answered
+// only after both sweeps found every member not-found.
+func TestFindVMByConfigProbe_AbsenceTakesTwoSweeps(t *testing.T) {
+	t.Parallel()
+	q := &mnQEMU{configFn: func(string, int) (map[string]any, error) {
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}}
+	c := &lgClient{
+		cluster: &lgCluster{nodes: []string{"pve1", "pve2"}},
+		nodes:   &lgNodes{},
+		qemu:    q,
+	}
+	loc, err := FindVMByConfigProbe(lgCtx(), c, 4116)
+	if err != nil || loc.Found {
+		t.Fatalf("loc=%+v err=%v; want proven absence", loc, err)
+	}
+	if got := strings.Join(q.probed, ","); got != "pve1,pve2,pve1,pve2" {
+		t.Fatalf("probed %s; want two complete sweeps", got)
+	}
+
+	hit := &mnQEMU{configFn: func(string, int) (map[string]any, error) {
+		return map[string]any{"tags": "bosh-cpi"}, nil
+	}}
+	c.qemu = hit
+	if loc, err := FindVMByConfigProbe(lgCtx(), c, 4116); err != nil || !loc.Found {
+		t.Fatalf("loc=%+v err=%v; want a hit", loc, err)
+	}
+	if len(hit.probed) != 1 {
+		t.Fatalf("probed %v; a first-sweep hit must not run a second sweep", hit.probed)
+	}
+}
+
+// TestFindVMByConfigProbe_SecondSweepFailureIsRetriable pins that the second
+// sweep is held to the same rules as the first. Every member answers 404 in
+// the first sweep, and the second sweep cannot finish: in one case pve2's
+// probe fails, and in the other the quorate cluster now reports pve2
+// offline. Neither may be answered as absence, because the second sweep is
+// the one that would see a migration that landed during the first.
+func TestFindVMByConfigProbe_SecondSweepFailureIsRetriable(t *testing.T) {
+	t.Parallel()
+	notFound := &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+
+	t.Run("a probe error", func(t *testing.T) {
+		t.Parallel()
+		q := &mnQEMU{}
+		q.configFn = func(node string, _ int) (map[string]any, error) {
+			// The first sweep is the first two probes.
+			if node == "pve2" && len(q.probed) > 2 {
+				return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "pvedaemon worker cycling"}
+			}
+			return nil, notFound
+		}
+		c := &lgClient{
+			cluster: &lgCluster{nodes: []string{"pve1", "pve2"}},
+			nodes:   &lgNodes{},
+			qemu:    q,
+		}
+		loc, err := FindVMByConfigProbe(lgCtx(), c, 4117)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || loc.Found {
+			t.Fatalf("loc=%+v err=%v; want a retriable error and Found=false", loc, err)
+		}
+		if !strings.Contains(err.Error(), "pve2") {
+			t.Fatalf("the error must name the failing member, got: %v", err)
+		}
+		if len(q.probed) < 4 {
+			t.Fatalf("probed %v; want the failure to come from the second sweep", q.probed)
+		}
+	})
+
+	t.Run("a member goes offline", func(t *testing.T) {
+		t.Parallel()
+		statusCalls := 0
+		online := lgStatus(map[string]bool{"pve1": true, "pve2": true})
+		offline := lgStatus(map[string]bool{"pve1": true, "pve2": false})
+		probes := &mnQEMU{}
+		probes.configFn = func(node string, _ int) (map[string]any, error) {
+			if node == "pve2" && statusCalls > 1 {
+				return nil, errors.New("an offline member must not be probed")
+			}
+			return nil, notFound
+		}
+		c := &lgClient{
+			cluster: &lgCluster{
+				nodes: []string{"pve1", "pve2"},
+				statusFn: func() (*sdkcluster.ListStatusResponse, error) {
+					statusCalls++
+					if statusCalls == 1 {
+						return online()
+					}
+					return offline()
+				},
+			},
+			nodes: &lgNodes{},
+			qemu:  probes,
+		}
+		loc, err := FindVMByConfigProbe(lgCtx(), c, 4118)
+		if !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) || loc.Found {
+			t.Fatalf("loc=%+v err=%v; want a retriable error and Found=false", loc, err)
+		}
+		if !strings.Contains(err.Error(), "offline") || !strings.Contains(err.Error(), "pve2") {
+			t.Fatalf("the error must name the offline member, got: %v", err)
+		}
+		if statusCalls < 2 {
+			t.Fatalf("status read %d time(s); want each sweep to read it", statusCalls)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // FindTemplatesBySHATagClusterTolerant
 // ---------------------------------------------------------------------------
 

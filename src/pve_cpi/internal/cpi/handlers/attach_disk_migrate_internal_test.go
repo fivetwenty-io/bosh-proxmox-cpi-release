@@ -447,7 +447,7 @@ func TestAttachDiskResolveNode_CrossNodeLocalBackend(t *testing.T) {
 
 	// VM 700 runs on pve2; the local backend reports the disk on pve1.
 	newDeps := func() Deps {
-		c := newMigFakeClient(map[int]map[string]any{700: {}}, map[int]string{700: "pve2"})
+		c := newMigFakeClient(map[int]map[string]any{700: {"tags": ownershipTag}}, map[int]string{700: "pve2"})
 		deps := migTestDeps(c)
 		deps.Resolver = &migFakeBackendResolver{kind: pve.BackendLocal, node: "pve1"}
 		return deps

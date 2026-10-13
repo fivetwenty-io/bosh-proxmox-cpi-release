@@ -1015,7 +1015,7 @@ func (n lifecycleFlowNodes) ListQemu(_ context.Context, node string, _ *nodes.Li
 		if n.c.vmNode(id) != node || n.c.unlisted[id] {
 			continue
 		}
-		raw, _ := json.Marshal(map[string]any{"vmid": id, "tags": cfg["tags"], "name": cfg["name"]})
+		raw, _ := json.Marshal(map[string]any{"vmid": id, "tags": fixtureGuestTags(cfg), "name": cfg["name"]})
 		rows = append(rows, raw)
 	}
 	return &rows, nil
@@ -1033,6 +1033,19 @@ func (n lifecycleFlowNodes) ListQemuPending(ctx context.Context, node, vmid stri
 func (n lifecycleFlowNodes) ListNodes(context.Context) (*nodes.ListNodesResponse, error) {
 	rows := nodes.ListNodesResponse{json.RawMessage(`{"node":"n1","status":"online"}`), json.RawMessage(`{"node":"n2","status":"online"}`)}
 	return &rows, nil
+}
+
+// fixtureGuestTags is the tags value the flow fake serves in its scan rows:
+// the config's own tags when it sets the key, and bosh-cpi when it leaves the
+// key out. Every VM this CPI creates carries that tag, and the VM ownership
+// guard refuses a VM with no BOSH marker at all, so a fixture VM written
+// without tags stands for a CPI-created one. A config that sets tags, even to
+// "", is served verbatim, which is how a row models a hand-made VM.
+func fixtureGuestTags(cfg map[string]any) any {
+	if tags, ok := cfg["tags"]; ok {
+		return tags
+	}
+	return "bosh-cpi"
 }
 func (c *lifecycleFlowPVE) Cluster() cluster.Service {
 	return lifecycleFlowCluster{managedDiskTestCluster: managedDiskTestCluster{state: c.state}, c: c}
@@ -1065,7 +1078,7 @@ func (c lifecycleFlowCluster) ListResources(context.Context, *cluster.ListResour
 		if c.c.unlisted[id] {
 			continue
 		}
-		raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": id, "node": c.c.vmNode(id), "tags": cfg["tags"]})
+		raw, _ := json.Marshal(map[string]any{"type": "qemu", "vmid": id, "node": c.c.vmNode(id), "tags": fixtureGuestTags(cfg)})
 		r = append(r, raw)
 	}
 	return &r, nil

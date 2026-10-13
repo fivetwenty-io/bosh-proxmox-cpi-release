@@ -35,9 +35,10 @@ func detachDiskResolveSlot(
 	ctx context.Context,
 	deps Deps,
 	vmCID string,
-	vmid int,
+	cid vmcid.VMCID,
 	diskCID string,
 ) (node, diskID string, alreadyDetached bool, err error) {
+	vmid := cid.VMID
 	storage, _, err := pve.ParseDiskCID(diskCID)
 	if err != nil {
 		return "", "", false, cpierrors.DiskNotFound(diskCID)
@@ -74,16 +75,46 @@ func detachDiskResolveSlot(
 	// real node; only a PROVEN absence keeps the backend-derived node,
 	// where the config read's 404 and the existing VM-gone →
 	// already-detached semantics are then genuinely correct.
-	if loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid); lookupErr != nil {
+	loc, lookupErr := pve.FindVMAuthoritative(ctx, deps.PVE, vmid)
+	if lookupErr != nil {
 		return "", "", false, cpierrors.Wrap(lookupErr, fmt.Sprintf("detach_disk: lookup VM %s node failed", vmCID))
-	} else if backend.Kind() != pve.BackendLocal && loc.Found && loc.Node != "" {
-		node = loc.Node
+	}
+	var views pve.QemuViews
+	viewsNode := ""
+	if loc.Found && loc.Node != "" {
+		// The slot read, the detach, and the unused sweep below all edit
+		// this VM, so a VM this Director does not own is refused first.
+		views, viewsNode, err = detachDiskJudgeVM(ctx, deps, vmCID, cid, loc)
+		if errors.Is(err, errVMAbsent) {
+			deps.Log(ctx).Warn("detach_disk: VM is gone from every cluster member, treating the disk as already detached",
+				log.String("vm_cid", vmCID),
+				log.String("disk_cid", diskCID),
+			)
+			return "", "", true, nil
+		}
+		if err != nil {
+			return "", "", false, err
+		}
+		if backend.Kind() != pve.BackendLocal {
+			node = viewsNode
+		}
 	}
 
 	// Resolve the active bus slot for diskCID in the VM config.
 	// Both views: a slot whose delete is pending is still attached, so a retry
 	// after a delete PVE left pending never takes the already-detached branch.
-	diskID, err = pve.ResolveAttachedSlot(ctx, deps.PVE, node, vmid, diskCID)
+	// The guard's read already holds both views of this VM, so the slot comes
+	// from the same snapshot the guard judged whenever it was read on the
+	// node the detach targets.
+	if viewsNode != "" && viewsNode == node {
+		if slot, ok := views.BusSlotNaming(diskCID); ok {
+			diskID = slot
+		} else {
+			err = fmt.Errorf("resolve disk %q on VM %d (node %q): %w", diskCID, vmid, node, pve.ErrDiskNotAttached)
+		}
+	} else {
+		diskID, err = pve.ResolveAttachedSlot(ctx, deps.PVE, node, vmid, diskCID)
+	}
 	if err != nil {
 		if errors.Is(err, pve.ErrDiskNotAttached) || pve.IsNotFound(err) {
 			// Disk is not on an active bus. It may still linger as an unusedN
@@ -119,6 +150,33 @@ func detachDiskResolveSlot(
 	}
 
 	return node, diskID, false, nil
+}
+
+// detachDiskJudgeVM is detach_disk's ownership guard on the legacy path. It
+// reads the VM's config views once, on the node FindVMAuthoritative located
+// it on, and judges the applied view, which is the config the detach then
+// edits. The scan row never decides, because it can still show the tags of the
+// VM a reused VMID held before. It returns the views and the node they came
+// from, so the slot is resolved from the snapshot that was judged. A not-found
+// read locates the VM again, as checkVMOwnership does, and proven absence
+// returns errVMAbsent. A container keeps its row verdict, because the QEMU
+// config endpoint cannot answer for it, and then returns no views.
+func detachDiskJudgeVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID, loc pve.VMLocation) (pve.QemuViews, string, error) {
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
+	if loc.Type != "" && loc.Type != resourceTypeQemu {
+		return pve.QemuViews{}, "", refuseUnownedVM(ctx, deps, "detach_disk", vmCID, cid, loc, nil, logger)
+	}
+	views, at, err := readAtVMNode(ctx, deps, "detach_disk", cid.VMID, loc.Node, func(node string) (pve.QemuViews, error) {
+		return pve.ReadQemuViews(ctx, deps.PVE, node, cid.VMID)
+	})
+	if err != nil {
+		return pve.QemuViews{}, "", err
+	}
+	judged := pve.VMLocation{Node: at, Found: true, Type: resourceTypeQemu}
+	if ownErr := refuseUnownedVM(ctx, deps, "detach_disk", vmCID, cid, judged, views.Applied(), logger); ownErr != nil {
+		return pve.QemuViews{}, "", ownErr
+	}
+	return views, at, nil
 }
 
 // HandleDetachDisk returns a Handler for the BOSH CPI detach_disk method.
@@ -203,10 +261,13 @@ func HandleDetachDisk(deps Deps) Handler {
 			defer func() { operationErr = lifecycle.finish(ctx, operationErr, false) }()
 		}
 		if rd.stableID != "" {
+			if err := refuseUnownedStableIDDetach(ctx, deps, vmCID, parsedCID, rd); err != nil {
+				return nil, err
+			}
 			return nil, handleDetachStableID(ctx, deps, vmCID, vmid, rd)
 		}
 
-		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, vmid, bareDiskCID)
+		node, diskID, alreadyDetached, err := detachDiskResolveSlot(ctx, deps, vmCID, parsedCID, bareDiskCID)
 		if err != nil {
 			return nil, err
 		}
@@ -310,6 +371,47 @@ func HandleDetachDisk(deps Deps) Handler {
 
 		return nil, nil
 	})
+}
+
+// refuseUnownedStableIDDetach runs the ownership guard for a stable-ID detach
+// before handleDetachStableID edits the VM the CID names. Only the two cases
+// that edit that VM need it: the VM holds the disk on a slot, and the VM holds
+// it only as an unused entry. A disk that is parked, free-floating, or held by
+// another VM never touches the named VM, so those keep their answers.
+//
+// handleDetachStableID is also the step the CPI's own journal-driven VM
+// deletes use to preserve a disk, and the journal already proved that VM is
+// ours, so the guard sits here in the Director-facing handler rather than
+// inside it.
+func refuseUnownedStableIDDetach(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID, rd resolvedDisk) error {
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
+	switch {
+	case rd.holder != nil && rd.holder.VMID == cid.VMID && !rd.holder.IsParker:
+		// The holder scan read this VM's config to find the disk, so its tags
+		// are the VM's own and the guard needs no lookup of its own.
+		loc := pve.VMLocation{Node: rd.holder.Node, Tags: rd.holder.Tags, Found: true}
+		return refuseUnownedVM(ctx, deps, "detach_disk", vmCID, cid, loc, nil, logger)
+	case rd.holder == nil && len(rd.unused) > 0:
+		loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+		if err != nil {
+			return cpierrors.Wrap(err, fmt.Sprintf("detach_disk: locate VM %s", vmCID))
+		}
+		if !loc.Found || loc.Node == "" {
+			return nil
+		}
+		verdict, err := checkVMOwnershipByConfig(ctx, deps, "detach_disk", cid, loc)
+		if err != nil {
+			return err
+		}
+		if verdict.Absent {
+			// No VM holds the unused entry any more, so there is nothing to
+			// edit, which is the answer an absent VM gets above.
+			return nil
+		}
+		return refuseVerdict("detach_disk", vmCID, cid, verdict, logger)
+	default:
+		return nil
+	}
 }
 
 // handleDetachStableID is the whole detach flow for a stable-ID disk. The

@@ -45,6 +45,11 @@ type attachQEMUService struct {
 	configErr      error
 	configErrAfter int
 	configCalls    int
+	// configErrOnCall, when it names a call number (1-based), fails that
+	// call alone with the given error, whichever mode serves the others.
+	configErrOnCall map[int]error
+	// configCallsAtAttach is configCalls when AttachDisk ran.
+	configCallsAtAttach int
 
 	// DetachDisk control — records calls and may inject error.
 	detachCalls []string
@@ -58,11 +63,15 @@ type attachQEMUService struct {
 
 func (m *attachQEMUService) AttachDisk(_ context.Context, _ string, _ int, volid string, _ string, _ *qemu.AttachOpts) (string, error) {
 	m.attachLastVolid = volid
+	m.configCallsAtAttach = m.configCalls
 	return m.attachReturnDiskID, m.attachErr
 }
 
 func (m *attachQEMUService) Config(_ context.Context, _ string, _ int) (map[string]any, error) {
 	m.configCalls++
+	if err, ok := m.configErrOnCall[m.configCalls]; ok {
+		return nil, err
+	}
 	if len(m.configCfgs) > 0 {
 		idx := m.configCalls - 1
 		if idx >= len(m.configCfgs) {
@@ -323,7 +332,10 @@ func TestHandleAttachDisk_AlreadyAttached(t *testing.T) {
 // TestHandleAttachDisk_VMNotFound verifies that a 404 from AttachDisk maps to VMNotFound.
 func TestHandleAttachDisk_VMNotFound(t *testing.T) {
 	t.Parallel()
+	// The VM is still found when the handler looks it up, carrying the tag
+	// every VM this CPI creates carries, and is gone by the attach.
 	qemuSvc := &attachQEMUService{
+		configCfg: map[string]any{"tags": "bosh-cpi"},
 		attachErr: &sdkerrors.APIError{Code: 404, Message: "not found"},
 	}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, &captureAgent{}))
@@ -412,16 +424,16 @@ func TestHandleAttachDisk_EmptyDiskCID(t *testing.T) {
 // the diskID returned by AttachDisk and still returns valid disk_hints
 // (logs a warning).
 //
-// The first two Config calls (holder scan on the listed VM, then slot
-// selection) must succeed; the third (resolve) must fail. configErrAfter=2
-// implements that behavior.
+// The first three Config calls (the ownership guard on the target VM, the
+// holder scan on the listed VM, then slot selection) must succeed; the fourth
+// (resolve) must fail. configErrAfter=3 implements that behavior.
 func TestHandleAttachDisk_ResolveFallback(t *testing.T) {
 	t.Parallel()
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi3",
 		configCfg:          map[string]any{},
 		configErr:          errors.New("transient config error"),
-		configErrAfter:     2,
+		configErrAfter:     3,
 	}
 	ag := &captureAgent{}
 	h := handlers.HandleAttachDisk(attachDeps(qemuSvc, ag))
@@ -1671,6 +1683,7 @@ func TestHandleAttachDisk_Parked_UnparksBeforeAttach(t *testing.T) {
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
+			targetVMCfgEmpty,    // call 0: the ownership guard reads the target VM
 			parkerVMCfg,         // call 1: FindVMByDiskVolid config scan on parker VMID
 			parkerVMCfg,         // call 2: resolveDiskHolder in-band tags + slot read
 			parkerVMCfg,         // call 3: option-override read on the parker
@@ -1770,7 +1783,9 @@ func TestHandleAttachDisk_Parked_UnparkFailRetriable(t *testing.T) {
 
 	qemuSvc := &attachQEMUService{
 		attachErr: errors.New("AttachDisk must not be called on unpark failure"),
-		configCfg: parkerVMCfg,
+		// The ownership guard reads the target VM first, then every later
+		// read is of the parker.
+		configCfgs: []map[string]any{{}, parkerVMCfg},
 		// DetachDisk returns a transient error to simulate unpark failure.
 		detachErr: errors.New("PVE 500: internal error during detach"),
 	}

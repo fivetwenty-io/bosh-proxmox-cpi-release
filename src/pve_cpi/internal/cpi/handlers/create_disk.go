@@ -265,12 +265,13 @@ func HandleCreateDisk(deps Deps) Handler {
 			_ = json.Unmarshal(args[1], &callCP)
 		}
 
-		// args[2] (vm_cid) is optional; an absent or null third argument is fine.
-		var vmCID string
-		if len(args) >= 3 && args[2] != nil {
-			// Accept both JSON string "\"100\"" and JSON null.
-			// Ignore unmarshal errors for null/missing.
-			_ = json.Unmarshal(args[2], &vmCID)
+		// args[2] (vm_cid) is optional; an absent or null third argument is
+		// fine. The hint steers placement and receives the disk's tags, so a
+		// hint that names a VM this Director does not own is dropped here,
+		// before either path reads it.
+		vmCID, err := createDiskHintArg(ctx, deps, args)
+		if err != nil {
+			return nil, err
 		}
 
 		// ----------------------------------------------------------------
@@ -585,6 +586,65 @@ func stableIDForNewDisk(deps Deps) (string, error) {
 		return "", cpierrors.Wrap(err, "create_disk: generate stable disk ID")
 	}
 	return stableID, nil
+}
+
+// createDiskHintArg decodes create_disk's optional vm_cid argument and returns
+// the hint ownedCreateDiskHint allows. An absent or null third argument, or
+// one that does not decode as a string, is no hint.
+func createDiskHintArg(ctx context.Context, deps Deps, args []json.RawMessage) (string, error) {
+	var vmCID string
+	if len(args) >= 3 && args[2] != nil {
+		// Accept both JSON string "\"100\"" and JSON null.
+		// Ignore unmarshal errors for null/missing.
+		_ = json.Unmarshal(args[2], &vmCID)
+	}
+	return ownedCreateDiskHint(ctx, deps, vmCID)
+}
+
+// ownedCreateDiskHint returns the vm_cid hint create_disk may use, or "" when
+// the hint names a VM this Director must not place a disk beside or tag: one
+// that is foreign, or one whose token says the CID's VM is gone. The guard
+// mode does not matter, because both placement and tagging act on the hinted
+// VM. A hint that does not parse, or that names no VM, is returned as is,
+// because both paths already answer those cases themselves. A lookup or
+// ownership check that cannot finish is retriable, because dropping the hint
+// on partial evidence could place the disk on a node the VM cannot reach.
+func ownedCreateDiskHint(ctx context.Context, deps Deps, vmCID string) (string, error) {
+	if vmCID == "" {
+		return "", nil
+	}
+	cid, parseErr := vmcid.Parse(vmCID)
+	if parseErr != nil {
+		return vmCID, nil
+	}
+	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	if err != nil {
+		return "", cpierrors.Wrap(err, "create_disk: locate hinted VM "+vmCID)
+	}
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
+	if !loc.Found || loc.Node == "" {
+		// An absent VM is left to each path, which already answers it: the
+		// legacy path places the disk without it, and the managed path
+		// refuses a hint that names no VM.
+		return vmCID, nil
+	}
+	verdict, err := checkVMOwnership(ctx, deps, "create_disk", cid, loc, nil)
+	if err != nil {
+		return "", err
+	}
+	if verdict.Absent {
+		// The VM went between the scan and the config read, which is the
+		// absent case above.
+		return vmCID, nil
+	}
+	if !verdict.Owned {
+		logger.Warn("create_disk: hinted VM is not owned by this Director; ignoring the hint for placement and tags",
+			log.String("ownership_reason", verdict.Reason),
+			log.String("ownership_detail", verdict.Detail),
+		)
+		return "", nil
+	}
+	return vmCID, nil
 }
 
 // applyCreateDiskTags applies cloud_properties.tags to the VM the new disk

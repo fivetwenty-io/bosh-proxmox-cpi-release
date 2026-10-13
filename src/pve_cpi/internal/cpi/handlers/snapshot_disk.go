@@ -13,6 +13,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // HandleSnapshotDisk returns a Handler for the BOSH CPI snapshot_disk method.
@@ -130,6 +131,19 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// the holder scan above, so this costs no API call.
 		// ----------------------------------------------------------------
 		if err := guardSnapshotParked(diskCID, vmid, holderTags); err != nil {
+			return nil, err
+		}
+
+		// ----------------------------------------------------------------
+		// 3a'. Ownership guard on the holder. The snapshot lands on the
+		// whole holder VM, so a disk that sits on another Director's VM, a
+		// template, or a hand-made VM is refused in both guard modes. The
+		// holder is found by its disk rather than by a CID, so it is judged
+		// as a bare VMID.
+		// ----------------------------------------------------------------
+		holderLoc := pve.VMLocation{Node: node, Tags: holderTags, Found: true}
+		if err := refuseUnownedVM(ctx, deps, "snapshot_disk", vmcid.PathOf(vmid), vmcid.VMCID{VMID: vmid}, holderLoc, nil,
+			deps.Log(ctx).With(log.String("disk_cid", diskCID), log.Int("vmid", vmid))); err != nil {
 			return nil, err
 		}
 

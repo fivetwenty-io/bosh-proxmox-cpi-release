@@ -208,7 +208,7 @@ func legacyRetainVolumeFixture(t *testing.T, volume, slot string) (Deps, *lifecy
 	if !strings.HasPrefix(slot, "unused") {
 		client.state.configs[777][slot] = volume + ",size=5G"
 	}
-	client.state.configs[777]["tags"] = tagRetainEphemeral
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral
 	deps.Config.StoragePlacementNamespace = ""
 	deps.Config.StorageAllocationJournalDir = ""
 	recorder := &legacyDestroyRecorder{}
@@ -328,7 +328,7 @@ func TestLegacyFastPathDeleteVMRetainsFileBackedEphemeral(t *testing.T) {
 
 func TestLegacyStragglerSweepRetainsFileBackedEphemeral(t *testing.T) {
 	deps, client, recorder, journal := legacyRetainFileFixture(t)
-	client.state.configs[777]["tags"] = tagRetainEphemeral + ";" + tagDeletingVM
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral + ";" + tagDeletingVM
 	before := journalRecords(t, journal)
 	sweepFastDeleteStragglers(context.Background(), deps, deps.Logger)
 	assertLegacyFileRetained(t, deps, client, recorder)

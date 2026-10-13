@@ -239,6 +239,12 @@ bosh create-env ~/w/cloudfoundry/bosh-deployment/bosh.yml \
 
 When the only change is the rendered CPI config — for example, after editing `pve_host` or rebuilding the release tarball — `create-env` still drains and recreates the Director VM. It does not hot-reload `cpi.json` in place; expect brief downtime even on config-only updates.
 
+### A lost state file and the ownership guard
+
+The CLI sends the state file's `director_id` with every CPI call, and the CPI tags each VM it creates with that ID as its owner. The state file is the only record of that ID, of the Director VM's CID, and of its persistent disk's CID, so losing the file loses all three. The next `create-env` then builds a new Director VM with a new `director_id` and a new empty persistent disk, while the old VM keeps running under the old owner tag. The ownership guard reads the old VM as another Director's, so no call made from the new state can stop it, detach its disk, or delete it.
+
+We recover by restoring the state file from a backup and rerunning `create-env`. The restored file brings back the original `director_id`, so the CPI treats the old VM as ours again and `create-env` manages it as before. That's why we back up the state file alongside the creds file. If a `create-env` already ran from the lost state, we first run `bosh delete-env` with the state file that run wrote, which removes the VM and the empty disk it built, because that state owns them. Only then do we restore the backup and rerun `create-env`, so the leftover VM never claims the restored Director's IP. Without a backup, the old VM can't be handed back to `create-env`. Once we've confirmed in PVE that it is the VM the lost state created, and that we no longer need its persistent disk, we remove it with `qm stop <vmid>` and `qm destroy <vmid>` on its node, because no CPI call will act on it. If the new Director reuses the old one's IP, we stop the old VM before the next `create-env`.
+
 ## 9. Tearing down
 
 ```bash

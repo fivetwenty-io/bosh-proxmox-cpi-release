@@ -44,7 +44,9 @@ var systemDiskSlots = map[string]bool{
 //  1. Parse vm_cid to VMID int.
 //  2. Locate VM via cluster scan (FindVMNodeViaCluster) to get authoritative node.
 //     Not-found -> VMNotFound. Transport error -> propagate.
-//  3. Fetch VM config via SDK qemu.Config.
+//  3. Fetch VM config via SDK qemu.Config, then check ownership (see ownVM).
+//     A foreign VM answers VMNotFound, or is listed with an error log under
+//     vm_ownership_guard: warn.
 //  4. Parse all disk entries from config using SDK qemu.ParseDisks.
 //  5. Filter out system disks (scsi0/virtio0) and cloudinit drives (ide2 or
 //     any disk whose option string contains "media=cdrom").
@@ -123,6 +125,18 @@ func HandleGetDisks(deps Deps) Handler {
 			return nil, cpierrors.Wrap(pve.WrapError(err), "get_disks: fetch config for VM "+vmCID)
 		}
 		cfg := views.Applied()
+
+		// ----------------------------------------------------------------
+		// 3a. Ownership guard. A VM this Director does not own is not the
+		//     VM the CID names, so enforce answers VMNotFound, which fails
+		//     cloud check's disk comparison without listing another
+		//     Director's disks. warn lists them and logs the error. The
+		//     config just read supplies the tags and notes, so the guard
+		//     costs no extra call.
+		// ----------------------------------------------------------------
+		if ownErr := getDisksOwnershipGuard(ctx, deps, vmCID, parsedCID, loc, cfg); ownErr != nil {
+			return nil, ownErr
+		}
 
 		// ----------------------------------------------------------------
 		// 4. Parse disk entries from config and filter to persistent disks.
@@ -256,4 +270,29 @@ func bareVolidFromOptStr(optStr string) string {
 		return optStr[:idx]
 	}
 	return optStr
+}
+
+// getDisksOwnershipGuard judges the VM get_disks located, from the config it
+// just read. It returns nil when the disks may be listed: the VM is ours, or
+// it is foreign and vm_ownership_guard is warn, which logs the error. A token
+// mismatch on a proven cluster, or a foreign VM under enforce, answers
+// VMNotFound, and a check that cannot finish returns its error.
+func getDisksOwnershipGuard(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID, loc pve.VMLocation, cfg map[string]any) error {
+	verdict, err := checkVMOwnership(ctx, deps, "get_disks", cid, loc, cfg)
+	if err != nil {
+		return err
+	}
+	if verdict.Gone {
+		return cpierrors.VMNotFound(vmCID)
+	}
+	if !verdict.foreign() {
+		return nil
+	}
+	ownLogger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
+	if !vmOwnershipGuardWarns(deps) {
+		logForeignVM(ownLogger, "get_disks: VM is not owned by this Director — answering VMNotFound", verdict)
+		return cpierrors.VMNotFound(vmCID)
+	}
+	logForeignVM(ownLogger, "get_disks: VM is not owned by this Director; vm_ownership_guard is warn, so listing its disks", verdict)
+	return nil
 }

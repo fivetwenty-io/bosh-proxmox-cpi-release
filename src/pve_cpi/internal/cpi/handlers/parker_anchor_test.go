@@ -30,7 +30,7 @@ func TestHandleAttachDisk_AnchorPromise_NoHolder_Refused(t *testing.T) {
 	const bareCID = "local-lvm:vm-9001-disk-0"
 	diskCID := mustEncodeDiskCID(t, bareCID, &pve.DiskCIDMeta{Anchor: true})
 
-	qemuSvc := &attachQEMUService{}
+	qemuSvc := &attachQEMUService{configCfg: cpiVMConfig()}
 	deps := handlers.Deps{
 		Config: parkedCfg(),
 		PVE: &mockPVEClient{
@@ -111,6 +111,7 @@ func TestHandleAttachDisk_AnchorPromise_HolderPresent_Unparks(t *testing.T) {
 	qemuSvc := &attachQEMUService{
 		attachReturnDiskID: "scsi1",
 		configCfgs: []map[string]any{
+			{},                 // the ownership guard reads the target VM
 			parkerVMCfg,        // FindVMByDiskVolid scan
 			parkerVMCfg,        // holder resolution (tags + slot)
 			parkerVMCfg,        // option-override read on the parker
@@ -201,7 +202,7 @@ func TestHandleAttachDisk_AnchorPromise_VolumeProvenGone_SaysDataIsGone(t *testi
 	t.Parallel()
 	diskCID := mustEncodeDiskCID(t, anchorNFSVolid, &pve.DiskCIDMeta{Anchor: true})
 
-	qemuSvc := &attachQEMUService{}
+	qemuSvc := &attachQEMUService{configCfg: cpiVMConfig()}
 	deps := anchorFileStorageDeps(qemuSvc, func() (*sdknodes.ListStorageContentResponse, error) {
 		return storageContentListing(), nil
 	})
@@ -232,7 +233,7 @@ func TestHandleAttachDisk_AnchorPromise_AbsenceUnproven_KeepsRefusal(t *testing.
 	t.Parallel()
 	diskCID := mustEncodeDiskCID(t, anchorNFSVolid, &pve.DiskCIDMeta{Anchor: true})
 
-	qemuSvc := &attachQEMUService{}
+	qemuSvc := &attachQEMUService{configCfg: cpiVMConfig()}
 	deps := anchorFileStorageDeps(qemuSvc, func() (*sdknodes.ListStorageContentResponse, error) {
 		return nil, errors.New("storage 'nfs-images' is not online")
 	})
@@ -329,7 +330,7 @@ func TestHandleAttachDisk_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testin
 	diskCID := mustEncodeDiskCID(t, crossNodeVolid,
 		&pve.DiskCIDMeta{ID: crossNodeStableID, Anchor: true})
 
-	qemuSvc := &attachQEMUService{}
+	qemuSvc := &attachQEMUService{configCfg: cpiVMConfig()}
 	client := crossNodeAnchorClient(qemuSvc, 100)
 	deps := handlers.Deps{
 		Config:   crossNodeAnchorConfig(),
@@ -354,4 +355,11 @@ func TestHandleAttachDisk_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testin
 	if qemuSvc.attachLastVolid != "" {
 		t.Errorf("AttachDisk must not run after the refusal; attached %q", qemuSvc.attachLastVolid)
 	}
+}
+
+// cpiVMConfig is the config of a VM this CPI created that holds no disk. The
+// only key it needs is the tag every such VM carries, which the VM ownership
+// guard reads before the handler acts.
+func cpiVMConfig() map[string]any {
+	return map[string]any{"tags": "bosh-cpi"}
 }

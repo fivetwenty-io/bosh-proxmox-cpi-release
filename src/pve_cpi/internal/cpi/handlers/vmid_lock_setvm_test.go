@@ -113,7 +113,7 @@ func TestHandleSetVMMetadata_LockAcquiredBeforeRead(t *testing.T) {
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			events = append(events, "qemu-config")
-			return map[string]any{"tags": "existing-tag"}, nil
+			return map[string]any{"tags": "bosh-cpi;existing-tag"}, nil
 		},
 	}
 
@@ -263,7 +263,7 @@ func TestHandleSetVMMetadata_ExistingTagsPreservedUnderLock(t *testing.T) {
 	}
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"tags": "env--prod;owner--cpi-test"}, nil
+			return map[string]any{"tags": "bosh-cpi;env--prod;owner--cpi-test"}, nil
 		},
 	}
 

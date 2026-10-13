@@ -215,6 +215,7 @@ var jobSpecPropertyNames = []string{
 	"pve.verify_ssl",
 	"pve.vm_disk_format",
 	"pve.vm_firewall",
+	"pve.vm_ownership_guard",
 	"pve.vm_pool",
 	"pve.vm_pool_template",
 	"pve.vm_prefix",

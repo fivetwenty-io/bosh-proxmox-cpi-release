@@ -43,7 +43,9 @@ func newReconcileFixture(t *testing.T, desc, clusterPool string) *reconcileFixtu
 
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"description": desc, "tags": ""}, nil
+			// bosh-cpi, as on every VM this CPI creates, so the ownership
+			// guard's recheck under the lock reads the VM as ours.
+			return map[string]any{"description": desc, "tags": "bosh-cpi"}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{

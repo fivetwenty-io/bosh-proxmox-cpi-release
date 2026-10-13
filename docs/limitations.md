@@ -28,6 +28,11 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - Stable-ID disks always park on detach
   A volume renamed by a reassignment cannot safely be left free-floating (PVE deallocates an owner-named volume when its last config reference is swept), so a stable-ID disk's detached state is parked even under `detached_disk_strategy: free`. Legacy disks keep the configured strategy's behavior. See [Stable disk identity and ownership transfer](persistent-disk-strategy.md#stable-disk-identity-and-ownership-transfer).
 
+## VM ownership
+
+- A bare CID can still destroy another Director's legacy VM
+  A VM created before the owner tag existed passes the ownership guard on its `bosh-cpi` tag, whichever Director created it. `set_vm_metadata` compares the instance the Director names with the one the VM records, but `delete_vm` receives no metadata to compare, so a stale bare CID can destroy another Director's legacy VM. The gap closes for a VM only when a deploy that updates its instance, or a `bosh recreate`, writes the owner tag. Until then the VM stays exposed. See [Operations](operations.md#which-director-owns-a-vm).
+
 ## Storage and stemcells
 
 - `:heavy:` files on a shared export are kept, not deleted, under cpi-config

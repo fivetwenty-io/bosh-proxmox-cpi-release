@@ -111,6 +111,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_destroy_unreferenced_disks",
 	"pve_vm_types",
 	"pve_disk_types",
+	"pve_vm_ownership_guard",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -349,6 +350,18 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.ParkedDiskVMIDRangeEnd = n
+		return nil
+	},
+	// The ownership guard is per entry because whether a cluster is shared
+	// with another Director, and so whether its foreign guests should merely
+	// be reported, is a statement about the TARGET cluster. Enum validation
+	// is delegated to eff.Validate(), like the strategy key that follows.
+	"pve_vm_ownership_guard": func(c *CPIConfig, v any) error {
+		s, err := coerceOverrideString(v)
+		if err != nil {
+			return err
+		}
+		c.VMOwnershipGuard = s
 		return nil
 	},
 	// The detached-disk strategy belongs here for the same reason the parker

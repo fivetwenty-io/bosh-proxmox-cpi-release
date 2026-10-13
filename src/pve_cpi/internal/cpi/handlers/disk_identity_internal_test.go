@@ -76,6 +76,10 @@ type idFakeClient struct {
 	// The storage content listing serves them alongside every volume a config
 	// names.
 	released map[string]bool
+	// rowTags, when set for a VMID, replaces the tags its cluster index row
+	// shows, the way a stale index row still shows the tags of the VM a
+	// reused VMID held before. The config keeps its own tags.
+	rowTags map[int]string
 }
 
 // idDescWrite is one recorded description write: which VM, and the full
@@ -343,6 +347,9 @@ func (cl *idFakeCluster) ListResources(context.Context, *sdkcluster.ListResource
 			continue
 		}
 		tags, _ := cfg["tags"].(string)
+		if row, stale := cl.c.rowTags[vmid]; stale {
+			tags = row
+		}
 		b, err := json.Marshal(map[string]any{"vmid": vmid, "node": "pve1", "type": "qemu", "tags": tags})
 		if err != nil {
 			return nil, err

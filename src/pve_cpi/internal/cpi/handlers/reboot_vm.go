@@ -84,6 +84,11 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 		node := loc.Node
 		logger.Debug("reboot_vm: VM located", log.String("node", node))
 
+		// --- ownership guard: never power-cycle another Director's VM ---
+		if ownErr := refuseUnownedVM(ctx, deps, "reboot_vm", vmCID, cid, loc, nil, logger); ownErr != nil {
+			return nil, ownErr
+		}
+
 		mode := deps.Config.RebootModeValue()
 		timeout := deps.Config.RebootTimeoutValue()
 

@@ -124,6 +124,7 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		"pve_vm_prefix":                          "az2",
 		"pve_parker_prefix":                      "az2",
 		"pve_parker_pool":                        "az2-parker",
+		"pve_vm_ownership_guard":                 "warn",
 		"pve_agent_mode":                         config.AgentModeNoAgent,
 		"pve_vm_disk_format":                     "vmdk",
 		"pve_agent_mbus":                         "nats://mbus-b",

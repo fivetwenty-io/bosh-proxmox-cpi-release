@@ -128,8 +128,10 @@ func TestHandleSetVMMetadata_EmptyMetadata(t *testing.T) {
 	if gotDescription != "" {
 		t.Errorf("expected empty description for empty metadata, got: %q", gotDescription)
 	}
-	if gotTags != "vm-prefix--bosh" {
-		t.Errorf("expected only the identity tag for empty metadata, got: %q", gotTags)
+	// bosh-cpi is the fixture VM's own tag, which every VM this CPI creates
+	// carries and set_vm_metadata preserves.
+	if gotTags != "bosh-cpi;vm-prefix--bosh" {
+		t.Errorf("expected only bosh-cpi and the identity tag for empty metadata, got: %q", gotTags)
 	}
 }
 
@@ -143,7 +145,14 @@ func TestHandleSetVMMetadata_NotFound(t *testing.T) {
 		},
 	}
 
-	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, nil, nodesSvc, nil, &mockAgentService{}))
+	// VM 999 misses the index, and the per-node probe still finds it carrying
+	// the tag every VM this CPI creates carries; it is gone by the write.
+	qemuSvc := &mockQEMUService{
+		configFn: func(context.Context, string, int) (map[string]any, error) {
+			return map[string]any{"tags": "bosh-cpi"}, nil
+		},
+	}
+	h := handlers.HandleSetVMMetadata(testDepsFoundVM(101, qemuSvc, nodesSvc, nil, &mockAgentService{}))
 	_, err := h.Handle(context.Background(), marshalArgs("999", map[string]any{"director": "bosh"}), jsonrpc.Context{})
 
 	if err == nil {
@@ -252,8 +261,9 @@ func TestHandleSetVMMetadata_TagTruncation(t *testing.T) {
 		t.Errorf("tags length %d exceeds 350; got: %q", len(gotTags), gotTags)
 	}
 	// Truncation must occur at a ";" boundary — no partial "<key>--<value>".
+	// bosh-cpi is the fixture VM's own tag, which is preserved verbatim.
 	for part := range strings.SplitSeq(gotTags, ";") {
-		if part == "" || !strings.Contains(part, "--") {
+		if part == "" || (part != "bosh-cpi" && !strings.Contains(part, "--")) {
 			t.Errorf("malformed tag %q in %q", part, gotTags)
 		}
 	}
@@ -347,7 +357,7 @@ func TestHandleSetVMMetadata_PreservesCustomTags(t *testing.T) {
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"tags": "env--prod;owner--alice",
+				"tags": "bosh-cpi;env--prod;owner--alice",
 			}, nil
 		},
 	}
@@ -388,7 +398,7 @@ func TestHandleSetVMMetadata_ReplacesStaleBoshTags(t *testing.T) {
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"tags": "director--old-uuid;deployment--old;job--old;env--prod",
+				"tags": "bosh-cpi;director--old-uuid;deployment--old;job--old;env--prod",
 			}, nil
 		},
 	}
@@ -438,7 +448,7 @@ func TestHandleSetVMMetadata_PrefixTagReplacedNotAccumulated(t *testing.T) {
 
 	// storedTags is the VM's PVE tag field, read by every call and rewritten
 	// by every update, so the second call sees what the first one wrote.
-	storedTags := ""
+	storedTags := "bosh-cpi"
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{"tags": storedTags}, nil
@@ -832,7 +842,7 @@ func TestHandleSetVMMetadata_EmitsIndexTag(t *testing.T) {
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 			return map[string]any{
-				"tags": "index--7;instance-group--old-group;env--prod",
+				"tags": "bosh-cpi;index--7;instance-group--old-group;env--prod",
 			}, nil
 		},
 	}
@@ -923,7 +933,7 @@ func TestHandleSetVMMetadata_PreservesSentinelBlock(t *testing.T) {
 	existingDesc := "deployment: old\n<!--BOSH:{\"bosh_attached_disks\":{\"local-lvm:vm-101-disk-0\":\"pvd-recordedCID\"},\"bosh_disk_metadata\":{\"local-lvm:vm-101-disk-0\":{\"deployment\":\"cf\"}}}-->"
 	qemuSvc := &mockQEMUService{
 		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-			return map[string]any{"description": existingDesc, "tags": "env--prod"}, nil
+			return map[string]any{"description": existingDesc, "tags": "bosh-cpi;env--prod"}, nil
 		},
 	}
 

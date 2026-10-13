@@ -341,9 +341,9 @@ func TestDeleteVM_StampDeletingTag_LockAcquiredBeforeRead(t *testing.T) {
 			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
 				events = append(events, "qemu-config")
 				if slices.Contains(events, "create:"+expectedPool) {
-					return map[string]any{"tags": "fresh-under-lock"}, nil
+					return map[string]any{"tags": "bosh-cpi;fresh-under-lock"}, nil
 				}
-				return map[string]any{"tags": "preflight-tag"}, nil
+				return map[string]any{"tags": "bosh-cpi;preflight-tag"}, nil
 			},
 			stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 				return "upid-stop", nil
@@ -405,7 +405,7 @@ func TestDeleteVM_StampDeletingTag_NilPoolsFallback(t *testing.T) {
 		vmid,
 		&mockQEMUService{
 			configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
-				return map[string]any{"tags": "existing-tag"}, nil
+				return map[string]any{"tags": "bosh-cpi;existing-tag"}, nil
 			},
 			stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 				return "upid-stop", nil

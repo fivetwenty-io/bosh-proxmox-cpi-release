@@ -479,6 +479,51 @@ A timeout confirms the block; `200` means the API is reachable and the fault is 
 
 Permit the isolated subnet to reach the API. `BOSH_PVE_ENV=<env> ./scripts/bosh net-up` does this automatically (idempotent rules in `/etc/pve/nodes/<node>/host.fw` for the configured subnet → `8006` + ICMP, then a firewall reload); `net-status` shows them and `net-down` removes them. See [Networks — Host firewall: API access from the isolated subnet](networks.md#isolated-test-network-sdn).
 
+## VM ownership refusals
+
+### A call refuses a VM this Director does not own
+
+**Symptom**
+
+```text
+delete_vm: refusing to act on VM 101 for CID 101, which this Director does not own (other-director): the VM is owned by Director <uuid>, and this request comes from Director <uuid>. If the Director's record is stale, drop it with cloud-check's "Delete VM reference" or bosh delete-deployment --force
+```
+
+The same refusal can come from `reboot_vm`, `set_vm_metadata`, `attach_disk`, `detach_disk`, or `snapshot_disk`. A VM that we can see in PVE has the same cause when `has_vm` answers `false` for it, or when `get_disks` answers `VMNotFound`. In every case the CPI log carries the verdict at error level, with `ownership_reason` and `ownership_detail` fields.
+
+**Diagnosis**
+
+The reason in parentheses says which check failed.
+
+| Reason | What the CPI found |
+|---|---|
+| `other-director` | The VM's `bosh-owner--` tag names another Director, or the VM carries two different owner tags. |
+| `parker` | The CID reached a disk parker. |
+| `template` | The CID reached a stemcell template. |
+| `not-bosh` | The VM carries no owner tag, no `bosh-cpi` tag, and no Director metadata lines in its Notes, or the VMID names a container. |
+| `cluster-mismatch` | A stamped CID names a different cluster than the VM records, or the VM records no cluster. |
+| `token-missing` | A stamped CID carries a token, and the VM carries no `bosh-cid--` tag. |
+| `token-conflict` | The VM carries several `bosh-cid--` tags, and only some of them match the CID. |
+
+A token mismatch never shows up as a refusal. When a stamped CID's cluster matches and its token doesn't, the VM it named is gone and another VM holds the VMID, so the CPI answers `VMNotFound` and leaves that VM alone.
+
+We read the VM's tags and Notes with `qm config <vmid>` on its node, and we compare the owner tag with the Director UUID that `bosh env` prints.
+
+**Fix**
+
+The fix depends on why the CID reaches a VM we don't own.
+
+- The Director's record is stale
+  The VM the Director recorded is gone, and its VMID now holds another VM. We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away. Neither escape touches the VM.
+
+- An operator removed the `bosh-cpi` tag from one of our VMs
+  A VM created before the owner tag existed passes on its `bosh-cpi` tag or on the `director:`, `deployment:`, and `name:` lines in its Notes. When both are gone, we add `bosh-cpi` back with `qm set <vmid> --tags`, keeping the tags the VM already has.
+
+- A `bosh create-env` state file was lost
+  The state file is the only record of the Director's `director_id`, so the old Director VM's owner tag names a Director that no longer exists. See [Deploying with bosh create-env](bosh-create-env.md#a-lost-state-file-and-the-ownership-guard).
+
+Setting `pve.vm_ownership_guard: warn` lets `has_vm` and `get_disks` answer for the VM while we investigate. It never lets a call change the VM.
+
 ## Stemcell upload and import failures
 
 ### Stemcell storage is local-only on a multi-node cluster

@@ -380,7 +380,7 @@ func legacyRetainFlowFixture(t *testing.T) (Deps, *lifecycleFlowPVE, string) {
 	client.state.volumes[volume] = client.state.volumes[original]
 	delete(client.state.volumes, original)
 	client.state.configs[777]["scsi1"] = volume + ",size=5G"
-	client.state.configs[777]["tags"] = tagRetainEphemeral
+	client.state.configs[777]["tags"] = ownershipTag + ";" + tagRetainEphemeral
 	deps.Config.StoragePlacementNamespace = ""
 	deps.Config.StorageAllocationJournalDir = ""
 	return deps, client, volume
