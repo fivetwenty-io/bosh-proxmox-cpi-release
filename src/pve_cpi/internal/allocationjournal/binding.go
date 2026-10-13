@@ -61,8 +61,9 @@ var ErrEntryBindingWaitAbandoned = errors.New("journal: entry binding lock wait 
 // ErrEntryBindingUnlock means the sidecar lock could not be released cleanly
 // after the update ran. The update's own outcome is reported beside it, so a
 // caller that sees only this error knows the sidecar was handled and only the
-// release failed. The kernel drops the flock when the descriptor finally
-// closes or the process exits, so the lock can't outlive the CPI call.
+// release failed. The release closes the lock file even when the unlock call
+// fails, and closing the descriptor drops the flock with it, so the lock
+// can't outlive the CPI call.
 var ErrEntryBindingUnlock = errors.New("journal: entry binding lock could not be released")
 
 // entryBindingTuning lets tests stretch the lock wait or fail the release

@@ -73,7 +73,9 @@ func noteJournalEntryBinding(ctx context.Context, deps Deps, journal *aj.Journal
 // logEntryBindingNote turns one NoteEntryBinding result into log lines. The
 // note and the error are independent. A binding can be added and then fail to
 // release its lock, so the warning about the new binding and the line about
-// the release both appear. Each error class gets a message that says what
+// the release both appear. A release failure joined with a read, write, or
+// version error logs the specific message for that error first and the
+// release line after it. Each error class gets a message that says what
 // actually happened, and none of them fails the call.
 func logEntryBindingNote(logger *log.Logger, namespace string, current aj.EntryBinding, note aj.EntryBindingNote, err error) {
 	if note.Replaced != nil {
@@ -99,29 +101,55 @@ func logEntryBindingNote(logger *log.Logger, namespace string, current aj.EntryB
 			"matching prefixes and bands. This warning appears once for each new binding, and storage-journal audit lists them all",
 			fields...)
 	}
+	outcome, release := splitEntryBindingRelease(err)
 	var durability *aj.DurabilityError
 	switch {
-	case err == nil:
-	case errors.As(err, &durability):
-		// A failed write is reported even when the release failed as well,
-		// because the lost write is what the operator needs to know about.
+	case outcome == nil:
+	case errors.As(outcome, &durability):
 		logger.Warn("allocation journal entry binding could not be recorded; allocation continues",
-			log.String("namespace", namespace), log.ErrScrubbed(err))
-	case errors.Is(err, aj.ErrEntryBindingUnlock):
-		logger.Warn("allocation journal entry binding lock could not be released cleanly after the update; the sidecar is intact, "+
-			"the lock is freed when this CPI process exits, and allocation continues",
-			log.String("namespace", namespace), log.Bool("binding_added", note.Added), log.ErrScrubbed(err))
-	case errors.Is(err, aj.ErrEntryBindingWaitAbandoned):
+			log.String("namespace", namespace), log.ErrScrubbed(outcome))
+	case errors.Is(outcome, aj.ErrEntryBindingWaitAbandoned):
 		logger.Debug("the CPI call ended while waiting for the allocation journal entry binding lock; a later create records this entry's binding",
-			log.String("namespace", namespace), log.String("current_binding", current.String()), log.ErrScrubbed(err))
-	case errors.Is(err, aj.ErrUnsupportedEntryBinding):
+			log.String("namespace", namespace), log.String("current_binding", current.String()), log.ErrScrubbed(outcome))
+	case errors.Is(outcome, aj.ErrUnsupportedEntryBinding):
 		logger.Warn("allocation journal entry binding was written by a newer CPI release; it is left untouched and the shared-namespace check is skipped",
-			log.String("namespace", namespace), log.ErrScrubbed(err))
-	case errors.Is(err, aj.ErrEntryBindingBusy):
+			log.String("namespace", namespace), log.ErrScrubbed(outcome))
+	case errors.Is(outcome, aj.ErrEntryBindingBusy):
 		logger.Debug("allocation journal entry binding lock is busy; a later create records this entry's binding",
 			log.String("namespace", namespace), log.String("current_binding", current.String()))
 	default:
 		logger.Warn("allocation journal entry binding could not be read; the shared-namespace check is skipped for this call",
-			log.String("namespace", namespace), log.ErrScrubbed(err))
+			log.String("namespace", namespace), log.ErrScrubbed(outcome))
 	}
+	if release != nil {
+		// Closing the lock file releases the flock with the descriptor, so a
+		// failed unlock call leaves no lock behind for later creates.
+		logger.Warn("allocation journal entry binding lock release reported an error after the update; the CPI closed the lock file, "+
+			"which releases the lock, so later creates are not blocked, and allocation continues",
+			log.String("namespace", namespace), log.Bool("binding_added", note.Added),
+			log.Bool("update_failed", outcome != nil), log.ErrScrubbed(release))
+	}
+}
+
+// splitEntryBindingRelease separates a lock-release failure from the outcome
+// of the update it followed. NoteEntryBinding joins the two, and each needs
+// its own log line, so a read, write, or version error is never hidden behind
+// the release. Either result may be nil.
+func splitEntryBindingRelease(err error) (outcome, release error) {
+	if !errors.Is(err, aj.ErrEntryBindingUnlock) {
+		return err, nil
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return nil, err
+	}
+	var outcomes, releases []error
+	for _, part := range joined.Unwrap() {
+		if errors.Is(part, aj.ErrEntryBindingUnlock) {
+			releases = append(releases, part)
+		} else {
+			outcomes = append(outcomes, part)
+		}
+	}
+	return errors.Join(outcomes...), errors.Join(releases...)
 }

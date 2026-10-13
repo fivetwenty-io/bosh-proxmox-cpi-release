@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -398,14 +399,82 @@ func TestEntryBindingFailedReleaseHasItsOwnMessage(t *testing.T) {
 		t.Fatalf("first warning = %q", entries[0].Message)
 	}
 	release := entries[1]
-	if release.Level != log.LevelWarn || !strings.Contains(release.Message, "lock could not be released cleanly after the update") ||
-		release.Attrs["binding_added"] != true {
+	if release.Level != log.LevelWarn || !strings.Contains(release.Message, "lock release reported an error after the update") ||
+		release.Attrs["binding_added"] != true || release.Attrs["update_failed"] != false {
 		t.Fatalf("release warning = %+v", release)
 	}
+	assertReleaseMessageIsAccurate(t, release.Message)
 	for _, e := range entries {
 		if strings.Contains(e.Message, "could not be read") || strings.Contains(e.Message, "could not be recorded") {
 			t.Fatalf("a release failure was reported as %q", e.Message)
 		}
+	}
+}
+
+// assertReleaseMessageIsAccurate pins what the release warning claims. The
+// production release closes the lock file whatever the unlock call returns,
+// and closing the descriptor drops the flock, so the lock is already free
+// when the warning is logged. Nothing waits for the process to exit.
+func assertReleaseMessageIsAccurate(t *testing.T, message string) {
+	t.Helper()
+	if !strings.Contains(message, "the CPI closed the lock file, which releases the lock") {
+		t.Fatalf("release warning does not say the closed lock file released the lock: %q", message)
+	}
+	if strings.Contains(message, "process exits") {
+		t.Fatalf("release warning still waits on the process exiting: %q", message)
+	}
+}
+
+// TestEntryBindingReleaseFailureKeepsTheUpdateMessage covers a lock release
+// that fails after the update itself failed. NoteEntryBinding joins the two
+// errors, and each must reach the log: the specific message for the update's
+// error first, then the release warning, which says the update failed too.
+func TestEntryBindingReleaseFailureKeepsTheUpdateMessage(t *testing.T) {
+	releaseErr := fmt.Errorf("%w: %w", aj.ErrEntryBindingUnlock, errors.New("bad file descriptor"))
+	cases := []struct {
+		name   string
+		update error
+		want   string
+	}{
+		{
+			name:   "read",
+			update: &fs.PathError{Op: "open", Path: "entry-binding.json", Err: syscall.EACCES},
+			want:   "could not be read; the shared-namespace check is skipped",
+		},
+		{
+			name:   "newer release",
+			update: fmt.Errorf("%w: version 9", aj.ErrUnsupportedEntryBinding),
+			want:   "written by a newer CPI release",
+		},
+		{
+			name:   "write",
+			update: &aj.DurabilityError{Err: &fs.PathError{Op: "rename", Path: "entry-binding.json", Err: syscall.ENOSPC}},
+			want:   "could not be recorded",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, obs := log.NewObservedLogger(log.LevelDebug)
+			current := JournalEntryBinding(&config.CPIConfig{VMPrefix: "az2"})
+			logEntryBindingNote(logger, "director", current, aj.EntryBindingNote{}, errors.Join(tc.update, releaseErr))
+
+			entries := bindingWarnings(obs)
+			if len(entries) != 2 {
+				t.Fatalf("want the update's message and the release warning, got %+v", entries)
+			}
+			first, release := entries[0], entries[1]
+			if first.Level != log.LevelWarn || !strings.Contains(first.Message, tc.want) {
+				t.Fatalf("first message = %+v, want one containing %q", first, tc.want)
+			}
+			if msg, _ := first.Attrs["error"].(string); strings.Contains(msg, "could not be released") {
+				t.Fatalf("the update's message carries the release error: %+v", first)
+			}
+			if !strings.Contains(release.Message, "lock release reported an error") ||
+				release.Attrs["update_failed"] != true || release.Attrs["binding_added"] != false {
+				t.Fatalf("release warning = %+v", release)
+			}
+			assertReleaseMessageIsAccurate(t, release.Message)
+		})
 	}
 }
 
