@@ -261,3 +261,121 @@ func TestWithRequestOverrides_IgnoredProfileFieldsWarning(t *testing.T) {
 		})
 	}
 }
+
+// TestWithRequestOverrides_ContextKeyRules covers the context-key checks:
+// the misnested credential set fails, a lone misnested key warns, a Director
+// style key passes quietly, a spec key with no override only warns, and a
+// typo under pve or agent fails.
+func TestWithRequestOverrides_ContextKeyRules(t *testing.T) {
+	t.Parallel()
+	const misnestHint = "cpi_config properties must sit under pve: and agent:"
+	for _, tc := range []struct {
+		name      string
+		extra     map[string]any
+		wantErr   []string
+		wantWarn  string // message fragment of the one expected warning
+		wantAttr  string
+		wantNames any
+		wantDebug bool
+	}{
+		{name: "misnested credential set fails",
+			extra:   map[string]any{"host": "az2.example", "user": "u", "password": "secret-value"},
+			wantErr: []string{`"host"`, `"password"`, `"user"`, misnestHint}},
+		{name: "a lone misnested host warns",
+			extra:    map[string]any{"host": "az2.example", "pve": map[string]any{"node": "pve-a-1"}},
+			wantWarn: "job spec names without their prefix", wantAttr: "misnested_keys", wantNames: []string{"host"}},
+		{name: "a Director style key passes and logs at debug",
+			extra:     map[string]any{"future_director_key": 1.0},
+			wantDebug: true},
+		{name: "a spec key with no override only warns",
+			extra:    map[string]any{"pve": map[string]any{"node": "pve-a-1", "hooks": map[string]any{}}},
+			wantWarn: "does not support overriding per-request", wantAttr: "unsupported_keys", wantNames: []string{"pve_hooks"}},
+		{name: "a flat pve_ typo fails",
+			extra:   map[string]any{"pve_node": "pve-a-1", "pve_vmid_rang_start": 4000.0},
+			wantErr: []string{`"pve_vmid_rang_start"`}},
+		{name: "pve null with credentials fails",
+			extra:   map[string]any{"pve": nil, "host": "az2.example", "user": "u", "api_token": "secret-value"},
+			wantErr: []string{`"api_token"`, `"host"`, `"user"`, misnestHint}},
+		{name: "a typo under pve fails",
+			extra:   map[string]any{"pve": map[string]any{"node": "pve-a-1", "vmid_rang_start": 4000.0}},
+			wantErr: []string{`"pve.vmid_rang_start"`}},
+		{name: "a typo under agent fails",
+			extra:   map[string]any{"pve": map[string]any{"node": "pve-a-1"}, "agent": map[string]any{"mbsu": "https://x"}},
+			wantErr: []string{`"agent.mbsu"`}},
+		{name: "an unsupported agent key warns",
+			extra:    map[string]any{"pve": map[string]any{"node": "pve-a-1"}, "agent": map[string]any{"blobstore": map[string]any{}}},
+			wantWarn: "agent properties that cannot be overridden", wantAttr: "unsupported_keys", wantNames: []string{"agent.blobstore"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			deps, obs, _ := clusterScopeDeps(overrideTestBaseConfig())
+			_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra})
+			if tc.wantErr != nil {
+				var ce *cpierrors.Error
+				if !errors.As(err, &ce) || ce.OkToRetry() {
+					t.Fatalf("want a non-retriable CloudError, got %v", err)
+				}
+				for _, s := range tc.wantErr {
+					if !strings.Contains(err.Error(), s) {
+						t.Errorf("error %q lacks %q", err, s)
+					}
+				}
+				for _, secret := range []string{"secret-value", "https://x"} {
+					if strings.Contains(err.Error(), secret) {
+						t.Errorf("error leaks a value: %q", err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WithRequestOverrides: %v", err)
+			}
+			if tc.wantWarn != "" {
+				lines := entriesContaining(obs, tc.wantWarn)
+				if len(lines) != 1 || lines[0].Level != log.LevelWarn {
+					t.Fatalf("want exactly one Warn containing %q, got %d", tc.wantWarn, len(lines))
+				}
+				if got := lines[0].Attrs[tc.wantAttr]; !reflect.DeepEqual(got, tc.wantNames) {
+					t.Errorf("%s = %#v, want %#v", tc.wantAttr, got, tc.wantNames)
+				}
+			}
+			debugs := entriesContaining(obs, "top-level keys the CPI does not read")
+			if tc.wantDebug != (len(debugs) == 1) {
+				t.Errorf("debug lines = %d, want present=%v", len(debugs), tc.wantDebug)
+			}
+			for _, e := range obs.All() {
+				if e.Level >= log.LevelError {
+					t.Errorf("unexpected error-level line: %s", e.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestWithRequestOverrides_DirectorKeyClashLogged asserts that a vm or
+// stemcell property which clashes with the Director's key is logged at Error
+// naming the clash, never fails the request, and is logged even when no
+// pve_* override applies.
+func TestWithRequestOverrides_DirectorKeyClashLogged(t *testing.T) {
+	t.Parallel()
+	deps, obs, _ := clusterScopeDeps(overrideTestBaseConfig())
+	clash := []string{"vm.size"}
+	if _, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{ClashingKeys: clash}); err != nil {
+		t.Fatalf("WithRequestOverrides: %v", err)
+	}
+	lines := entriesContaining(obs, "overwrote a Director-owned context key")
+	if len(lines) != 1 || lines[0].Level != log.LevelError {
+		t.Fatalf("want exactly one Error line, got %d", len(lines))
+	}
+	if got := lines[0].Attrs["clashing_keys"]; !reflect.DeepEqual(got, clash) {
+		t.Errorf("clashing_keys = %#v, want %#v", got, clash)
+	}
+
+	quietDeps, quietObs, _ := clusterScopeDeps(overrideTestBaseConfig())
+	if _, err := quietDeps.WithRequestOverrides(context.Background(), jsonrpc.Context{}); err != nil {
+		t.Fatalf("WithRequestOverrides: %v", err)
+	}
+	if len(entriesContaining(quietObs, "Director-owned")) != 0 {
+		t.Error("a request without a clash must not log one")
+	}
+}

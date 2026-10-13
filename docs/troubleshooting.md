@@ -159,6 +159,56 @@ The CPI uses `DisallowUnknownFields` when parsing `cpi.json`. A typo in a proper
 
 Compare the failing `cpi.json` against the property list in [Configuration](configuration.md). Correct the misspelled field name and redeploy.
 
+### A cpi-config entry has its properties at the wrong level
+
+**Symptom**
+
+```text
+cpi: context override rejected: context carries "host", "password", "user" at the top level; cpi_config properties must sit under pve: and agent:
+```
+
+or
+
+```text
+cpi: context override rejected: context carries "pve.vmid_rang_start", which the pve_cpi job spec does not define; check the spelling
+```
+
+**Diagnosis**
+
+The Director merges a cpi-config entry's `properties:` into the request context exactly as written. The CPI reads only the `pve:` and `agent:` maps, so a `host` and `user` written at the top level never reach it. Before this check, such an entry ran against the job-level cluster without a word. The CPI now refuses an entry that has `host` together with `user`, `password`, or `api_token` at the top level and no `pve:` map. It also refuses a key under `pve:` or `agent:` that is not a property of the job spec, which is almost always a typo.
+
+A single warning is logged instead of a failure when a top-level key matches a spec name without its prefix, such as a lone `node`, or when an `agent:` map carries `blobstore`, which cannot be overridden per request. A top-level key the CPI does not recognize at all is logged at debug level, because a Director may add keys of its own. An entry with empty properties sends the same context as a Director without cpi-config, so it stays on the job-level cluster.
+
+A property named `vm` replaces the Director's own `vm` key. The CPI logs an error that names the clash and ignores the extra keys, so rename the property.
+
+A property named `stemcell` that is not a map is ignored and logged the same way, so it never fails the request.
+
+The spelling rule covers flat `pve_*` keys as well as keys under `pve:`, so `pve_vmid_rang_start` fails the same way `vmid_rang_start` under `pve:` does.
+
+**Fix**
+
+Move the properties under `pve:` and `agent:`, and correct any misspelled name. Before:
+
+```yaml
+- name: az2
+  type: pve
+  properties:
+    host: pve2.example.com
+    user: bosh@pve
+    api_token: ((az2_token))
+```
+
+After:
+
+```yaml
+- name: az2
+  type: pve
+  properties:
+    pve:
+      host: pve2.example.com
+      api_token: ((az2_token))
+```
+
 ### Stemcell path outside staging directory
 
 **Symptom**

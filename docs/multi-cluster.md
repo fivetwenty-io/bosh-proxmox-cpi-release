@@ -84,6 +84,8 @@ An entry's `placement` block replaces the job-level one entirely rather than mer
 
 The three HA features (`placement.dlb`, `placement.anti_affinity.use_ha_rules`, `placement.pin_az_via_ha_rules`) are reachable only this way in a multi-cluster deployment. Enabling any of them also means disabling the BOSH resurrector for the affected deployment, and `pin_az_via_ha_rules` additionally requires `cloud_properties.availability_zone` on each `vm_type` — see [HA and Resurrection](ha-and-resurrection.md).
 
+Every property of an entry must sit under `pve:` or `agent:`. An entry with `host` and credentials at the top level, or with a misspelled key, fails the request, and [A cpi-config entry has its properties at the wrong level](troubleshooting.md#a-cpi-config-entry-has-its-properties-at-the-wrong-level) shows the fix.
+
 ### Per-entry credentials and CA
 
 Credentials travel with the endpoint as a group. When an entry changes `host` or `port`, the CPI never sends the job-level `user`, `password`, or `api_token` to that cluster, so the entry must name its own `api_token`, or its own `user` and `password`. An entry that names no credentials, or only part of a group such as a bare `password`, fails its first request with an error that names the entry's host and the property keys it is missing. The same rule holds for an entry that stays on the job-level host. Once an entry names any credential key, the CPI uses only the credentials that entry names and never borrows the rest from the job.

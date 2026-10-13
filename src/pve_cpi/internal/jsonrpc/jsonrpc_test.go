@@ -487,3 +487,51 @@ func TestOutputIsSingleLine(t *testing.T) {
 		}
 	})
 }
+
+// TestContext_UnmarshalJSON_DirectorKeyClashes covers a cpi_config property
+// named vm or stemcell, which overwrites the Director's own key. The value is
+// ignored and named instead of failing the request.
+func TestContext_UnmarshalJSON_DirectorKeyClashes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		input     string
+		wantClash []string
+		wantVM    map[string]any
+	}{
+		{"vm string", `{"vm":"oops","request_id":"r"}`, []string{"vm"}, nil},
+		{"stemcell list", `{"stemcell":["a"]}`, []string{"stemcell"}, nil},
+		{"vm with extra keys", `{"vm":{"stemcell":{"api_version":2},"size":"big","extra":1}}`,
+			[]string{"vm.extra", "vm.size"}, map[string]any{"stemcell": map[string]any{"api_version": 2.0}}},
+		{"clean Director vm", `{"vm":{"stemcell":{"api_version":2}}}`, nil,
+			map[string]any{"stemcell": map[string]any{"api_version": 2.0}}},
+		{"null vm", `{"vm":null}`, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var ctx Context
+			if err := json.Unmarshal([]byte(tc.input), &ctx); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if strings.Join(ctx.ClashingKeys, ",") != strings.Join(tc.wantClash, ",") {
+				t.Errorf("ClashingKeys = %v, want %v", ctx.ClashingKeys, tc.wantClash)
+			}
+			if len(ctx.VM) != len(tc.wantVM) {
+				t.Errorf("VM = %v, want %v", ctx.VM, tc.wantVM)
+			}
+			if _, ok := ctx.VM["stemcell"]; ok != (tc.wantVM != nil) {
+				t.Errorf("VM[stemcell] presence = %v, want %v", ok, tc.wantVM != nil)
+			}
+		})
+	}
+}
+
+// TestContext_UnmarshalJSON_WrongScalarTypeStillFails keeps the decode error
+// for a Director scalar of the wrong type.
+func TestContext_UnmarshalJSON_WrongScalarTypeStillFails(t *testing.T) {
+	t.Parallel()
+	var ctx Context
+	if err := json.Unmarshal([]byte(`{"request_id":7}`), &ctx); err == nil {
+		t.Fatal("want a decode error for a numeric request_id")
+	}
+}

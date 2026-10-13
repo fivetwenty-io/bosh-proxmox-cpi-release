@@ -552,9 +552,21 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	// Stamp the caller's director UUID before any early return so every
 	// handler path (override or not) carries it — see Deps.RequestDirectorUUID.
 	d.RequestDirectorUUID = reqCtx.DirectorUUID
+	if len(reqCtx.ClashingKeys) > 0 {
+		d.Log(ctx).Error(
+			"cpi: a cpi-config property overwrote a Director-owned context key; the CPI ignores the clashing value, so rename the property",
+			log.Any("clashing_keys", reqCtx.ClashingKeys),
+		)
+	}
 	if d.Overrides == nil || len(reqCtx.Extra) == 0 {
 		return d, nil
 	}
+
+	keyFindings, keyErr := config.InspectContextKeys(reqCtx.Extra)
+	if keyErr != nil {
+		return Deps{}, cpierrors.Cloud("cpi: context override rejected: %s", log.ScrubMessage(keyErr.Error()))
+	}
+	d.logContextKeyFindings(ctx, keyFindings)
 
 	effCfg, applied, unknown, err := config.ApplyContextOverrides(d.Config, reqCtx.Extra)
 	if err != nil {
@@ -679,6 +691,33 @@ func (d Deps) WithRequestOverrides(ctx context.Context, reqCtx jsonrpc.Context) 
 	d.NodeEndpoints = bundle.nodeEndpoints
 	d.ISO = bundle.iso
 	return d, nil
+}
+
+// logContextKeyFindings reports the context keys the CPI ignores. A top-level
+// key that is a spec name without its pve. or agent. prefix, or an agent key
+// no override covers, is almost certainly an authoring mistake and gets a
+// warning. Any other key may be one a newer Director added, so it is logged
+// at debug level only. Names only, never values.
+func (d Deps) logContextKeyFindings(ctx context.Context, f config.ContextKeyFindings) {
+	if len(f.MisnestedSpecKeys) > 0 {
+		d.Log(ctx).Warn(
+			"cpi: request context carries top-level keys that are job spec names without their prefix, so the CPI ignores them; "+
+				config.ContextMisnestHint,
+			log.Any("misnested_keys", f.MisnestedSpecKeys),
+		)
+	}
+	if len(f.UnsupportedAgentKeys) > 0 {
+		d.Log(ctx).Warn(
+			"cpi: request context carries agent properties that cannot be overridden per request; job-level config is used for them",
+			log.Any("unsupported_keys", f.UnsupportedAgentKeys),
+		)
+	}
+	if len(f.OtherTopLevelKeys) > 0 {
+		d.Log(ctx).Debug(
+			"cpi: request context carries top-level keys the CPI does not read",
+			log.Any("ignored_keys", f.OtherTopLevelKeys),
+		)
+	}
 }
 
 // warnOverrideTrust logs the trust changes an override makes to the

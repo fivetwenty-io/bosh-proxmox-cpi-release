@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // -----------------------------------------------------------------------
@@ -52,6 +53,14 @@ type Context struct {
 	// machinery from separately trying to (un)marshal a field named "Extra"
 	// literally — UnmarshalJSON fills it directly from the raw object.
 	Extra map[string]any `json:"-"`
+
+	// ClashingKeys names the Director-owned context keys a cpi_config
+	// property overwrote with a value the CPI cannot use: "vm" or "stemcell"
+	// when the value is not an object, and "vm.<key>" for each key of a vm
+	// object other than "stemcell". The CPI ignores those values. The
+	// handlers log the names so the clash is visible. Populated by
+	// UnmarshalJSON.
+	ClashingKeys []string `json:"-"`
 }
 
 // knownContextFields lists the Context JSON keys decoded into typed fields
@@ -62,6 +71,21 @@ var knownContextFields = map[string]struct{}{
 	"request_id":    {},
 	"vm":            {},
 	"stemcell":      {},
+}
+
+// decodeDirectorMap decodes the value of a Director-owned object key. A value
+// that is not an object is ignored and recorded in c.ClashingKeys, because it
+// can only have come from a cpi_config property of the same name.
+func (c *Context) decodeDirectorMap(name string, raw json.RawMessage) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		c.ClashingKeys = append(c.ClashingKeys, name)
+		return nil
+	}
+	return m
 }
 
 // UnmarshalJSON decodes a Context, populating the typed fields exactly as
@@ -81,8 +105,12 @@ var knownContextFields = map[string]struct{}{
 //
 // Failure modes:
 //   - data is not a JSON object (or is malformed JSON) → wrapped decode error.
-//   - A known field's value has the wrong JSON type (e.g. "vm" is a string,
-//     not an object) → wrapped decode error, matching plain struct decoding.
+//   - A scalar field's value has the wrong JSON type (e.g. "request_id" is a
+//     number) → wrapped decode error, matching plain struct decoding.
+//   - "vm" or "stemcell" is not an object, or "vm" holds a key other than
+//     "stemcell" → the value is ignored and its name recorded in
+//     ClashingKeys, since only a cpi_config property of that name can cause
+//     it and failing the request would punish a harmless entry.
 //   - An extra key's raw value itself is malformed JSON → that single key is
 //     skipped from Extra rather than failing the whole Context decode; this
 //     can only happen if the outer json.Unmarshal already partially decoded
@@ -92,26 +120,36 @@ var knownContextFields = map[string]struct{}{
 //
 // data may be nil or the literal "null"; both decode to a zero Context.
 func (c *Context) UnmarshalJSON(data []byte) error {
-	// contextAlias has the same fields/tags as Context but not Context's own
-	// UnmarshalJSON, so decoding into it uses plain reflection-based decoding
-	// (avoiding infinite recursion) while still filling DirectorUUID/
-	// RequestID/VM/Stemcell exactly as before this method existed.
-	type contextAlias Context
-	var a contextAlias
-	if err := json.Unmarshal(data, &a); err != nil {
-		return fmt.Errorf("jsonrpc: decode context: %w", err)
-	}
-	*c = Context(a)
-	c.Extra = nil
-
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		// data was valid JSON (the decode above succeeded) but not an object
-		// (e.g. context: null decodes raw as a nil map with no error, but
-		// context: "oops" would fail here); mirror the same error the typed
-		// decode above would already have produced for a non-object context.
+		// data is not a JSON object (for example context: "oops"), or is
+		// malformed JSON.
 		return fmt.Errorf("jsonrpc: decode context: %w", err)
 	}
+	// The scalar fields decode through an alias holding only them. The vm and
+	// stemcell fields decode separately below, because a cpi_config property
+	// named vm or stemcell replaces the Director's own key with whatever the
+	// operator wrote.
+	var scalars struct {
+		DirectorUUID string `json:"director_uuid,omitempty"`
+		RequestID    string `json:"request_id,omitempty"`
+	}
+	if err := json.Unmarshal(data, &scalars); err != nil {
+		return fmt.Errorf("jsonrpc: decode context: %w", err)
+	}
+	*c = Context{DirectorUUID: scalars.DirectorUUID, RequestID: scalars.RequestID}
+	c.VM = c.decodeDirectorMap("vm", raw["vm"])
+	c.Stemcell = c.decodeDirectorMap("stemcell", raw["stemcell"])
+	for key := range c.VM {
+		if key != "stemcell" {
+			// Only vm.stemcell is a Director field. Another key came from a
+			// property named vm, and nothing reads it.
+			c.ClashingKeys = append(c.ClashingKeys, "vm."+key)
+			delete(c.VM, key)
+		}
+	}
+	sort.Strings(c.ClashingKeys)
+
 	for key, val := range raw {
 		if _, known := knownContextFields[key]; known {
 			continue
