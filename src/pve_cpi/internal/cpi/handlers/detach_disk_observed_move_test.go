@@ -258,6 +258,9 @@ func parkerMovedOnSharedStorageStaysUsable(t *testing.T, renamed bool) {
 	// it unchanged and must write nothing at all.
 	noteJournalEntryBinding(context.Background(), deps, journal)
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
+	if _, ok := files[entryBindingSidecar(deps)]; !ok {
+		t.Fatal("the seed did not record the entry binding, so the snapshot cannot show admission leaves it alone")
+	}
 	report, err := admitStorageAllocation(context.Background(), deps, journal, []string{"n1", "n2"})
 	if err != nil {
 		t.Fatalf("admission refused a parker moved on shared storage: %v", err)

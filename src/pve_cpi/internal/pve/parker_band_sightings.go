@@ -30,9 +30,12 @@ const parkerSightingSampleLimit = 20
 // parker outside the band could belong to anyone.
 //
 // A parker inside our band that carries another prefix belongs to an entry
-// that shares our band. The two entries never adopt each other's parkers, but
-// they allocate parker VMIDs from the same range and each one's parker
-// accounting treats the other's guests as foreign occupants.
+// that shares our band, or it is a leftover from a parker prefix change, and
+// the two look the same from here. The entries never adopt each other's
+// parkers, but they allocate parker VMIDs from the same range and each one's
+// parker accounting treats the other's guests as foreign occupants. Either
+// entry can still unpark the other's disks, because unparking is keyed on the
+// tag and the band and ignores the prefix.
 //
 // A row counts only when its prefix is evidenced, by a "vm-prefix--" tag or a
 // "<prefix>-parker-<vmid>" name. A parker with neither falls back to the
@@ -92,6 +95,17 @@ func (s *parkerBandSightings) attributedToUs(tags string) bool {
 
 // report logs one warning per shape that was seen. listing names the caller,
 // so an operator can tell a detach-path listing from the provenance scan.
+//
+// The out-of-band rows got no config read, so the warning can't tell whether
+// a parker still holds disks. Its advice is therefore conditional: covering
+// the parkers with the band again comes first, and removal is only for a
+// parker the operator has proved empty.
+//
+// The warnings come from the per-node listing behind parking, disk transfer,
+// and the pool sweep, and from the cluster listing behind the provenance scan.
+// FindDiskTransferRecords and FindDiskKeyHolders also read parker tags but
+// have no ParkerConfig in scope, so they raise neither warning; threading the
+// config through would add nothing those listings don't already report.
 func (s *parkerBandSightings) report(ctx context.Context, listing string) {
 	if s == nil || (len(s.outside) == 0 && len(s.otherPrefix) == 0) {
 		return
@@ -102,7 +116,10 @@ func (s *parkerBandSightings) report(ctx context.Context, listing string) {
 	if len(s.outside) > 0 {
 		logger.Warn("parkers carrying this director's tag and parker prefix sit outside the configured parker band; "+
 			"another cpi_config entry for this director may use a different parked_disk_vmid_range with the same prefix, "+
-			"or the band was moved while disks were parked",
+			"or the band was moved while disks were parked. This entry refuses to attach, update, or delete a disk parked "+
+			"on one of them, so while they hold disks set parked_disk_vmid_range_start/end to cover them again instead of "+
+			"removing them. Remove a parker only after confirming it holds no disks, as Recovering empty parker VMs in "+
+			"operations.md describes",
 			log.String("listing", listing),
 			log.String("parker_band", band),
 			log.String("parker_prefix", prefix),
@@ -111,7 +128,10 @@ func (s *parkerBandSightings) report(ctx context.Context, listing string) {
 	}
 	if len(s.otherPrefix) > 0 {
 		logger.Warn("parkers with another parker prefix sit inside this entry's parker band; "+
-			"two cpi_config entries on this cluster share parked_disk_vmid_range, so give each entry its own band",
+			"either two cpi_config entries on this cluster share parked_disk_vmid_range and its VMIDs, or these are "+
+			"leftovers from a parker prefix change, and the two look the same from inside one entry. Leftover parkers "+
+			"drain as the Director attaches or deletes their disks. Never move a band away from parkers that still hold "+
+			"disks, because the CPI refuses to attach, update, or delete a disk parked outside the band",
 			log.String("listing", listing),
 			log.String("parker_band", band),
 			log.String("parker_prefix", prefix),

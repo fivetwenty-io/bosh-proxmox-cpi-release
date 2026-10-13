@@ -36,7 +36,7 @@ func runStorageJournal(args []string, stdout, stderr io.Writer, opts runOptions)
 	}
 	fs := flag.NewFlagSet("cpi storage-journal "+action, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	configPath := fs.String("config", "", "CPI JSON configuration")
+	configPath := fs.String("config", "", "CPI JSON configuration; audit compares the recorded entry bindings against its job-level values only, never against a cpi_config entry")
 	authority := fs.String("authority-id", "", "stable operator identifier for this journal writer")
 	remoteTasksSettled := fs.Bool("remote-tasks-settled", false, "attest that every request and task the previous writer sent to PVE, including synchronous config writes that start no task and unknown-response submissions, finished before this audit")
 	recoveredTaskEvidence := fs.String("recovered-task-evidence", "", "private retained original request/response receipt for this exact step")
@@ -570,10 +570,11 @@ type storageJournalAuditReport struct {
 	IndexFinding      string                          `json:"generation_index_finding,omitempty"`
 	ClusterContinuity bool                            `json:"cluster_continuity"`
 	Audit             handlers.StorageAllocationAudit `json:"audit"`
-	// EntryBinding is the namespace's recorded entry binding, and
-	// EntryBindingFinding says when it differs from this configuration, was
-	// recently replaced, or could not be read. Neither changes the exit code.
-	EntryBinding        *aj.EntryBindingState `json:"entry_binding,omitempty"`
+	// EntryBindings is every entry binding the namespace has recorded, and
+	// EntryBindingFinding says when the set holds more than one binding,
+	// differs from the job-level configuration, or could not be read. Neither
+	// changes the exit code.
+	EntryBindings       *aj.EntryBindingState `json:"entry_bindings,omitempty"`
 	EntryBindingFinding string                `json:"entry_binding_finding,omitempty"`
 	// Attention lists the records the text summary prints in full. The JSON
 	// output already carries every record, so it leaves this out.

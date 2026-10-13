@@ -311,6 +311,9 @@ func TestAdmitStorageVMAllocationLeavesJournalUnchangedForMovedVM(t *testing.T) 
 	// it unchanged and must write nothing at all.
 	noteJournalEntryBinding(t.Context(), deps, j)
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
+	if _, ok := files[entryBindingSidecar(deps)]; !ok {
+		t.Fatal("the seed did not record the entry binding, so the snapshot cannot show admission leaves it alone")
+	}
 	if err := admitStorageVMAllocation(t.Context(), deps, j, []string{"pve1", "pve2"}, "another-agent"); err != nil {
 		t.Fatalf("create_vm admission refused a VM moved on shared storage: %v", err)
 	}

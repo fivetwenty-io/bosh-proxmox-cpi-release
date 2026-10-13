@@ -33,12 +33,13 @@ func writeStorageJournalEnrollment(stdout, stderr io.Writer, report handlers.Sto
 }
 
 // writeStorageJournalAuditText prints the audit for a Director that has no
-// jq: an overview line, the generation index and entry-binding findings when
-// there are any, one line per audit finding, the runbook pointer when the
-// audit raised a conflict or an issue, one record line for each record that
-// needs an operator with its evidence lines under it, the charging summary,
-// and the skipped disabled storages. Every line is flattened, so a finding
-// that carries a line break or a terminal escape still prints as one line.
+// jq: an overview line, the generation index finding when there is one, one
+// line for each recorded entry binding followed by the entry-binding finding,
+// one line per audit finding, the runbook pointer when the audit raised a
+// conflict or an issue, one record line for each record that needs an operator
+// with its evidence lines under it, the charging summary, and the skipped
+// disabled storages. Every line is flattened, so a finding that carries a
+// line break or a terminal escape still prints as one line.
 func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport) error {
 	audit := output.Audit
 	lines := []string{fmt.Sprintf("audit: complete=%t vm_scan_complete=%t generation_index_healthy=%t cluster_continuity=%t records=%d",
@@ -46,9 +47,7 @@ func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport)
 	if output.IndexFinding != "" {
 		lines = append(lines, "generation index: "+output.IndexFinding)
 	}
-	if output.EntryBindingFinding != "" {
-		lines = append(lines, "entry binding: "+output.EntryBindingFinding)
-	}
+	lines = append(lines, storageJournalBindingLines(output.EntryBindings, output.EntryBindingFinding)...)
 	lines = append(lines, storageJournalFindingLines(audit)...)
 	if len(audit.Conflicts) > 0 || len(audit.Issues) > 0 {
 		lines = append(lines, "runbook: "+handlers.StorageAuditRunbook)

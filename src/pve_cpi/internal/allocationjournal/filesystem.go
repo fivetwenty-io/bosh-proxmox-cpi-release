@@ -275,35 +275,61 @@ func strictDecode(data []byte, out any) error {
 const readRetries = 3
 
 func readJSON(r *os.Root, name string, out any) error {
+	env, err := readEnvelope(r, name)
+	if err != nil {
+		return err
+	}
+	return decodeEnvelope(env, Version, out)
+}
+
+// readEnvelope opens name under the private-file rules, reads it within the
+// record size limit, and decodes the outer envelope without judging its
+// version, so a caller whose file versions on its own schedule can tell a
+// newer file from a damaged one before it decides what to do.
+func readEnvelope(r *os.Root, name string) (diskEnvelope, error) {
 	f, err := openPrivate(r, name, os.O_RDONLY)
 	for attempt := 0; attempt < readRetries && errors.Is(err, ErrReconciliationRequired); attempt++ {
 		f, err = openPrivate(r, name, os.O_RDONLY)
 	}
 	if err != nil {
-		return err
+		return diskEnvelope{}, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
 	closeErr := f.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
-		return err
+		return diskEnvelope{}, err
 	}
 	if len(data) > maxRecordBytes {
-		return fmt.Errorf("%w: oversized file", ErrCorrupt)
+		return diskEnvelope{}, fmt.Errorf("%w: oversized file", ErrCorrupt)
 	}
 	var env diskEnvelope
 	if err = strictDecode(data, &env); err != nil {
-		return fmt.Errorf("%w: malformed envelope: %w", ErrCorrupt, err)
+		return diskEnvelope{}, fmt.Errorf("%w: malformed envelope: %w", ErrCorrupt, err)
 	}
+	return env, nil
+}
+
+// decodeEnvelope checks env against the expected version and its checksum and
+// strictly decodes the payload into out.
+func decodeEnvelope(env diskEnvelope, version int, out any) error {
 	sum := sha256.Sum256(env.Payload)
-	if env.Version != Version || env.SHA256 != hex.EncodeToString(sum[:]) {
+	if env.Version != version || env.SHA256 != hex.EncodeToString(sum[:]) {
 		return fmt.Errorf("%w: envelope version/checksum", ErrCorrupt)
 	}
-	if err = strictDecode(env.Payload, out); err != nil {
+	if err := strictDecode(env.Payload, out); err != nil {
 		return fmt.Errorf("%w: malformed payload: %w", ErrCorrupt, err)
 	}
 	return nil
 }
-func atomicJSON(r *os.Root, name string, value any, ops fileOps) (retErr error) {
+
+func atomicJSON(r *os.Root, name string, value any, ops fileOps) error {
+	return atomicEnvelope(r, name, Version, value, ops)
+}
+
+// atomicEnvelope is atomicJSON with the envelope version chosen by the caller.
+// Journal records, the index, and the authority always use Version; the entry
+// binding sidecar uses its own schema version.
+func atomicEnvelope(r *os.Root, name string, version int, value any, ops fileOps) (retErr error) {
 	defer func() {
 		if retErr != nil {
 			retErr = &DurabilityError{Err: retErr}
@@ -314,7 +340,7 @@ func atomicJSON(r *os.Root, name string, value any, ops fileOps) (retErr error) 
 		return err
 	}
 	sum := sha256.Sum256(payload)
-	data, err := json.Marshal(diskEnvelope{Version: Version, SHA256: hex.EncodeToString(sum[:]), Payload: payload})
+	data, err := json.Marshal(diskEnvelope{Version: version, SHA256: hex.EncodeToString(sum[:]), Payload: payload})
 	if err != nil {
 		return err
 	}

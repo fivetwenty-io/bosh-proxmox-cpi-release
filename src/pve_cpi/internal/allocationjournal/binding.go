@@ -1,6 +1,7 @@
 package allocationjournal
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,20 +9,49 @@ import (
 	"time"
 )
 
-// entryBindingFile is the sidecar that remembers which cpi_config entry last
-// created a record in this namespace. The name is chosen against every reader
-// of the namespace directory: List, lookupRecords, and InspectDiskToken only
-// decode names carrying the "allocation-" prefix and ".json" suffix, the
-// fixed names authority.json and index.json are read by exact name, lock files
-// end in ".lock", and atomicJSON's scratch files start with ".tmp-". The
-// sidecar matches none of those, so no reader in this release or in releases
-// that predate the sidecar decodes it as a record, counts it, or removes it.
+// entryBindingFile is the sidecar that remembers every cpi_config entry
+// binding that has admitted a create in this namespace. The name is chosen
+// against every reader of the namespace directory: List, lookupRecords, and
+// InspectDiskToken only decode names carrying the "allocation-" prefix and
+// ".json" suffix, the fixed names authority.json and index.json are read by
+// exact name, lock files end in ".lock", and atomicJSON's scratch files start
+// with ".tmp-". The sidecar matches none of those, so no reader in this
+// release or in releases that predate the sidecar decodes it as a record,
+// counts it, or removes it.
 const entryBindingFile = "entry-binding.json"
 
-// entryBindingVersion is the sidecar payload schema. It is separate from the
-// record schema Version because the sidecar is advisory and evolves on its
-// own.
+// entryBindingLockFile serializes the sidecar's read-modify-write between CPI
+// processes. It is a lock of its own rather than index.lock, because
+// AcquireVM holds index.lock across planning and the binding note must never
+// wait on that. Like every other lock name it ends in ".lock" and carries no
+// record prefix, so the record scans skip it on this release and earlier ones.
+const entryBindingLockFile = "entry-binding.lock"
+
+// entryBindingVersion is the sidecar's envelope schema. It is independent of
+// the record schema Version, because the sidecar is advisory and evolves on
+// its own. A reader that meets a higher version leaves the file alone.
 const entryBindingVersion = 1
+
+// maxEntryBindings bounds the sidecar. A namespace gains a binding only when a
+// new combination of prefixes and bands admits a create, so a real namespace
+// holds a handful; past the bound the oldest bindings are dropped and the
+// caller is told which.
+const maxEntryBindings = 32
+
+// entryBindingLockWait bounds how long a create waits for another process's
+// binding update. The update is one small read and one atomic write, so the
+// wait only runs out when the filesystem is badly stalled, and then the
+// binding is left for a later create rather than delaying this one further.
+const entryBindingLockWait = time.Second
+
+// ErrUnsupportedEntryBinding means the sidecar was written with a newer schema
+// than this release reads. The file is left untouched, so a downgrade never
+// erases what a newer release recorded.
+var ErrUnsupportedEntryBinding = errors.New("journal: entry binding written by a newer release")
+
+// ErrEntryBindingBusy means another process held the sidecar lock for longer
+// than entryBindingLockWait. Nothing was read or written.
+var ErrEntryBindingBusy = errors.New("journal: entry binding lock is busy")
 
 // EntryBinding is the identity of the cpi_config entry that writes into a
 // journal namespace: the VM name prefix, the resolved parker prefix, and the
@@ -97,83 +127,188 @@ func validateEntryBinding(b EntryBinding) error {
 	return nil
 }
 
-// EntryBindingState is the sidecar payload. RecordedAt is when Binding was
-// first written; an unchanged binding is never rewritten. Previous and
-// PreviousRecordedAt carry the binding this one replaced, so an audit can name
-// both sides of a change after the warning has scrolled out of the logs.
+// EntryBindingSighting is one binding in the set and the time a create under
+// it was first admitted into the namespace.
+type EntryBindingSighting struct {
+	Binding   EntryBinding `json:"binding"`
+	FirstSeen time.Time    `json:"first_seen"`
+}
+
+// EntryBindingState is the sidecar payload: every binding that has admitted a
+// create into the namespace, oldest first. A binding already in the set is
+// never rewritten, so the steady state writes nothing.
 type EntryBindingState struct {
-	Version            int           `json:"version"`
-	Namespace          string        `json:"namespace"`
-	Binding            EntryBinding  `json:"binding"`
-	RecordedAt         time.Time     `json:"recorded_at"`
-	Previous           *EntryBinding `json:"previous,omitempty"`
-	PreviousRecordedAt *time.Time    `json:"previous_recorded_at,omitempty"`
+	Namespace string                 `json:"namespace"`
+	Bindings  []EntryBindingSighting `json:"bindings"`
+}
+
+// Index returns the position of b in the set, or -1.
+func (s EntryBindingState) Index(b EntryBinding) int {
+	for i, seen := range s.Bindings {
+		if seen.Binding == b {
+			return i
+		}
+	}
+	return -1
+}
+
+func (j *Journal) validateEntryBindingState(s EntryBindingState) error {
+	if s.Namespace != j.auth.Namespace {
+		return errors.New("misplaced entry binding")
+	}
+	if len(s.Bindings) == 0 || len(s.Bindings) > maxEntryBindings {
+		return fmt.Errorf("entry binding set holds %d bindings", len(s.Bindings))
+	}
+	for i, seen := range s.Bindings {
+		if err := validateEntryBinding(seen.Binding); err != nil {
+			return err
+		}
+		if seen.FirstSeen.IsZero() {
+			return errors.New("entry binding has no first-seen time")
+		}
+		if (EntryBindingState{Bindings: s.Bindings[:i]}).Index(seen.Binding) >= 0 {
+			return errors.New("entry binding set repeats a binding")
+		}
+	}
+	return nil
 }
 
 // EntryBinding reads the namespace's entry-binding sidecar. found is false
-// with a nil error when no sidecar has been written. A sidecar that fails the
-// envelope checks, names another namespace, or carries an unusable binding
-// returns an error wrapping ErrCorrupt; any other error is an I/O or
-// permission failure. The sidecar is advisory, so callers report these errors
-// and carry on rather than failing a CPI call on them.
-func (j *Journal) EntryBinding() (state EntryBindingState, found bool, err error) {
+// with a nil error when no sidecar has been written. A sidecar from a newer
+// schema returns ErrUnsupportedEntryBinding. A sidecar that fails the envelope
+// checks, names another namespace, or holds an unusable set returns an error
+// wrapping ErrCorrupt. Any other error is an I/O or permission failure. The
+// sidecar is advisory, so callers report these errors and carry on rather
+// than failing a CPI call on them.
+func (j *Journal) EntryBinding() (EntryBindingState, bool, error) {
 	if j == nil || j.root == nil {
-		return state, false, ErrClosed
+		return EntryBindingState{}, false, ErrClosed
 	}
-	if err := readJSON(j.root, entryBindingFile, &state); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return EntryBindingState{}, false, nil
-		}
+	env, err := readEnvelope(j.root, entryBindingFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return EntryBindingState{}, false, nil
+	}
+	if err != nil {
 		return EntryBindingState{}, false, err
 	}
-	if state.Version != entryBindingVersion {
-		return EntryBindingState{}, false, fmt.Errorf("%w: entry binding version %d", ErrCorrupt, state.Version)
+	if env.Version > entryBindingVersion {
+		return EntryBindingState{}, false, fmt.Errorf("%w: version %d, this release reads %d",
+			ErrUnsupportedEntryBinding, env.Version, entryBindingVersion)
 	}
-	if state.Namespace != j.auth.Namespace {
-		return EntryBindingState{}, false, fmt.Errorf("%w: misplaced entry binding", ErrCorrupt)
+	var state EntryBindingState
+	if err := decodeEnvelope(env, entryBindingVersion, &state); err != nil {
+		return EntryBindingState{}, false, err
 	}
-	if err := validateEntryBinding(state.Binding); err != nil {
+	if err := j.validateEntryBindingState(state); err != nil {
 		return EntryBindingState{}, false, fmt.Errorf("%w: %w", ErrCorrupt, err)
-	}
-	if state.Previous != nil {
-		if err := validateEntryBinding(*state.Previous); err != nil {
-			return EntryBindingState{}, false, fmt.Errorf("%w: previous %w", ErrCorrupt, err)
-		}
 	}
 	return state, true, nil
 }
 
-// RecordEntryBinding replaces the sidecar with binding, recorded at now. When
-// replaced is non-nil its binding and timestamp become the new state's
-// Previous fields. The write uses the same temp-file, fsync, rename, and
-// directory-fsync sequence as every journal record, so a crash leaves either
-// the old sidecar or the new one and never a torn file.
+// EntryBindingNote reports what NoteEntryBinding did.
+type EntryBindingNote struct {
+	// Added is true when the binding was new to the namespace and was
+	// written, or would have been had the write not failed.
+	Added bool
+	// Others holds the bindings the namespace had already recorded when an
+	// added binding first appeared, oldest first. It is empty for the first
+	// binding a namespace ever records.
+	Others []EntryBindingSighting
+	// Dropped holds the oldest bindings removed to keep the set within
+	// maxEntryBindings.
+	Dropped []EntryBindingSighting
+	// Replaced is the error that made an existing sidecar unreadable as
+	// journal evidence, when the note replaced it. It is nil otherwise.
+	Replaced error
+}
+
+// NoteEntryBinding adds binding to the namespace's set of bindings when it is
+// not already there. A binding already in the set costs one read and no lock
+// or write. A new binding is added under entry-binding.lock after a second
+// read, so two processes adding different bindings at once both land in the
+// set and neither overwrites the other.
 //
-// The write takes no journal lock. Two entries racing to record different
-// bindings each land a complete file and the last rename wins; the loser's
-// binding is the one a later admission compares against and warns about, so
-// nothing a lock would protect is lost.
-func (j *Journal) RecordEntryBinding(binding EntryBinding, replaced *EntryBindingState, now time.Time) error {
+// It never touches a sidecar from a newer schema (ErrUnsupportedEntryBinding)
+// or one it can't read for a reason other than corruption, such as an unsafe
+// mode or owner. A corrupt sidecar is replaced and the reason is returned in
+// Replaced. When the lock stays busy past entryBindingLockWait it returns
+// ErrEntryBindingBusy and changes nothing. A failed write returns the
+// journal's DurabilityError with Added set.
+func (j *Journal) NoteEntryBinding(ctx context.Context, binding EntryBinding, now time.Time) (EntryBindingNote, error) {
 	if j == nil || j.root == nil {
-		return ErrClosed
+		return EntryBindingNote{}, ErrClosed
 	}
 	if err := validateEntryBinding(binding); err != nil {
-		return err
+		return EntryBindingNote{}, err
 	}
 	if now.IsZero() {
-		return errors.New("journal: entry binding needs a recording time")
+		return EntryBindingNote{}, errors.New("journal: entry binding needs a recording time")
 	}
-	state := EntryBindingState{
-		Version:    entryBindingVersion,
-		Namespace:  j.auth.Namespace,
-		Binding:    binding,
-		RecordedAt: now.UTC(),
+	state, found, err := j.EntryBinding()
+	if err != nil && !errors.Is(err, ErrCorrupt) {
+		return EntryBindingNote{}, err
 	}
-	if replaced != nil {
-		previous := replaced.Binding
-		recordedAt := replaced.RecordedAt.UTC()
-		state.Previous = &previous
-		state.PreviousRecordedAt = &recordedAt
+	if err == nil && found && state.Index(binding) >= 0 {
+		return EntryBindingNote{}, nil
 	}
-	return atomicJSON(j.root, entryBindingFile, state, j.ops)
+
+	waitCtx, cancel := context.WithTimeout(ctx, entryBindingLockWait)
+	defer cancel()
+	lock, lockErr := j.waitEntryBindingLock(waitCtx)
+	if errors.Is(lockErr, context.DeadlineExceeded) && ctx.Err() == nil {
+		return EntryBindingNote{}, ErrEntryBindingBusy
+	}
+	if lockErr != nil {
+		return EntryBindingNote{}, lockErr
+	}
+	note, addErr := j.addEntryBindingLocked(binding, now)
+	return note, errors.Join(addErr, lock.close())
+}
+
+func (j *Journal) addEntryBindingLocked(binding EntryBinding, now time.Time) (EntryBindingNote, error) {
+	var note EntryBindingNote
+	state, found, err := j.EntryBinding()
+	switch {
+	case errors.Is(err, ErrCorrupt):
+		note.Replaced = err
+		state, found = EntryBindingState{}, false
+	case err != nil:
+		return EntryBindingNote{}, err
+	case found && state.Index(binding) >= 0:
+		return EntryBindingNote{}, nil
+	}
+	if !found {
+		state = EntryBindingState{Namespace: j.auth.Namespace}
+	}
+	note.Added = true
+	note.Others = append([]EntryBindingSighting(nil), state.Bindings...)
+	bindings := make([]EntryBindingSighting, 0, len(state.Bindings)+1)
+	bindings = append(bindings, state.Bindings...)
+	bindings = append(bindings, EntryBindingSighting{Binding: binding, FirstSeen: now.UTC()})
+	if excess := len(bindings) - maxEntryBindings; excess > 0 {
+		note.Dropped = append([]EntryBindingSighting(nil), bindings[:excess]...)
+		bindings = bindings[excess:]
+	}
+	state.Bindings = bindings
+	return note, atomicEnvelope(j.root, entryBindingFile, entryBindingVersion, state, j.ops)
+}
+
+// waitEntryBindingLock waits for entry-binding.lock. Unlike index.lock, which
+// Initialize creates once, this lock file is created by whichever process
+// first needs it, so several creates can race to create it. macOS can fail
+// the loser's O_CREATE open with ENOENT while the winner's create is in
+// flight; the file exists a moment later, so that error is retried a few
+// times within the same deadline. A namespace directory that is really gone
+// keeps failing and the error is returned.
+func (j *Journal) waitEntryBindingLock(ctx context.Context) (*fileLock, error) {
+	const createRaceRetries = 5
+	for attempt := 0; ; attempt++ {
+		lock, err := waitLock(ctx, j.root, entryBindingLockFile)
+		if !errors.Is(err, os.ErrNotExist) || attempt == createRaceRetries {
+			return lock, err
+		}
+		if err := pause(ctx); err != nil {
+			return nil, err
+		}
+	}
 }

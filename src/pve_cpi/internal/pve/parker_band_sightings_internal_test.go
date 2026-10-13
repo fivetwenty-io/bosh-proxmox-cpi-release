@@ -112,6 +112,19 @@ func TestParkerBandSightingsReportOneWarningPerShape(t *testing.T) {
 	if outside.Attrs["parkers"] != "pve2/95000" || outside.Attrs["count"] != int64(1) || outside.Attrs["listing"] != "test_listing" {
 		t.Fatalf("outside warning = %+v", outside.Attrs)
 	}
+	// The out-of-band warning can't see whether a parker holds disks, so its
+	// advice must put covering the parkers first and condition removal on
+	// proof that the parker is empty.
+	for _, want := range []string{"refuses to attach, update, or delete", "cover them again instead of removing them", "only after confirming it holds no disks", "Recovering empty parker VMs"} {
+		if !strings.Contains(outside.Message, want) {
+			t.Fatalf("outside warning %q lacks %q", outside.Message, want)
+		}
+	}
+	for _, want := range []string{"leftovers from a parker prefix change", "Never move a band away from parkers that still hold disks"} {
+		if !strings.Contains(other.Message, want) {
+			t.Fatalf("other-prefix warning %q lacks %q", other.Message, want)
+		}
+	}
 	if other.Attrs["count"] != int64(parkerSightingSampleLimit+5) || other.Attrs["parker_band"] != "90000-90999" || other.Attrs["parker_prefix"] != "az1" {
 		t.Fatalf("other-prefix warning = %+v", other.Attrs)
 	}
