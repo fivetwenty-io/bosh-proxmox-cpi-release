@@ -14,7 +14,7 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
-- The BATS secondary pass no longer runs `cck unresponsive agent delete_vm_reference should delete vm reference`. After `bosh cck` drops the VM reference, `bosh delete-vm` has no instance to name a cpi-config entry, so the Director sends it to its default CPI, which correctly refuses a CID stamped for the secondary cluster. The primary pass still runs the example, and the run report lists the exclusion with its reason.
+- The BATS secondary pass no longer runs `cck unresponsive agent delete_vm_reference should delete vm reference`. After `bosh cck` drops the VM reference, `bosh delete-vm` has no instance to name a cpi-config entry, so the Director sends it to its default CPI, which correctly refuses a CID stamped for the secondary cluster. The refused delete left the VM running with its address, so every later example that deployed onto that address failed with the CPI's IP conflict refusal, which turned one failure into seven. The primary pass still runs the example, and the run report lists the exclusion with its reason.
 
 ### Added
 
