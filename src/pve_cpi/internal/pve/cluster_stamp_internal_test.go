@@ -309,8 +309,8 @@ func TestReadClusterStamp_MembershipFailureIsRetriable(t *testing.T) {
 
 func TestReadClusterStamp_InvalidInputs(t *testing.T) {
 	t.Parallel()
-	//nolint:staticcheck // A nil context is the input under test.
-	if _, err := ReadClusterStamp(nil, &csClient{}, "pve1"); err == nil {
+	//lint:ignore SA1012 a nil context is the input under test
+	if _, err := ReadClusterStamp(nil, &csClient{}, "pve1"); err == nil { //nolint:staticcheck // SA1012: a nil context is the input under test
 		t.Fatal("nil context: want an error")
 	}
 	if _, err := ReadClusterStamp(lgCtx(), nil, "pve1"); err == nil {
