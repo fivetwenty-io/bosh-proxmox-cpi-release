@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -256,5 +257,89 @@ func TestHandleDeleteVM_ParkerCheck_ProvenAbsenceSucceeds(t *testing.T) {
 	}
 	if got := f.deleted(); len(got) != 0 {
 		t.Fatalf("destroy ran on %v for an absent VM", got)
+	}
+}
+
+// pmxcfsConfigMissingErr is the 500 PVE answers when pmxcfs has no config file
+// for the VM on that node, which counts as not-found everywhere the CPI proves
+// absence.
+func pmxcfsConfigMissingErr(node string, vmid int) error {
+	return makeAPIErr(500, "Configuration file 'nodes/"+node+"/qemu-server/"+strconv.Itoa(vmid)+".conf' does not exist")
+}
+
+// A pmxcfs config-missing answer on the scan node is no more proof of absence
+// than a 404, so it must start the same two-sweep probe. Each case drives that
+// answer into the parker check and asserts what the probe decides: a VM found
+// on another member is deleted there, two clean sweeps prove absence, and an
+// error in the second sweep is retriable.
+func TestHandleDeleteVM_ParkerCheck_PmxcfsConfigMissingStartsProbe(t *testing.T) {
+	t.Parallel()
+	denied := &sdkerrors.APIError{HTTPCode: 403}
+	for _, tc := range []struct {
+		name string
+		vmid int
+		// node2 answers pve-node2's config reads by call count.
+		node2 func(vmid, call int) (map[string]any, error)
+		// wantErr is empty for success, or text the retriable error carries.
+		wantErr     string
+		wantDeletes []string
+		wantReads1  int
+		wantReads2  int
+	}{
+		{
+			name: "moved after the scan is deleted on the new node",
+			vmid: 90066,
+			node2: func(int, int) (map[string]any, error) {
+				return map[string]any{"tags": "bosh-cpi"}, nil
+			},
+			wantDeletes: []string{"pve-node2"},
+		},
+		{
+			name: "two clean sweeps prove absence",
+			vmid: 90067,
+			node2: func(vmid, _ int) (map[string]any, error) {
+				return nil, pmxcfsConfigMissingErr("pve-node2", vmid)
+			},
+			wantReads1: 3,
+			wantReads2: 2,
+		},
+		{
+			name: "an error in the second sweep is retriable",
+			vmid: 90068,
+			node2: func(vmid, call int) (map[string]any, error) {
+				if call >= 1 {
+					return nil, denied
+				}
+				return nil, pmxcfsConfigMissingErr("pve-node2", vmid)
+			},
+			wantErr:    "cannot prove absence",
+			wantReads2: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newParkerProbeFixture(func(node string, call int) (map[string]any, error) {
+				if node == "pve-node1" {
+					return nil, pmxcfsConfigMissingErr(node, tc.vmid)
+				}
+				return tc.node2(tc.vmid, call)
+			})
+
+			err := runParkerProbeDelete(t, f, tc.vmid)
+			if tc.wantErr != "" {
+				requireParkerProbeRetriable(t, err, tc.wantErr)
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := f.deleted(); !slices.Equal(got, tc.wantDeletes) {
+				t.Fatalf("destroy calls = %v, want %v", got, tc.wantDeletes)
+			}
+			if tc.wantReads1 != 0 && f.readsOn("pve-node1") != tc.wantReads1 {
+				t.Fatalf("pve-node1 served %d config reads, want %d", f.readsOn("pve-node1"), tc.wantReads1)
+			}
+			if tc.wantReads2 != 0 && f.readsOn("pve-node2") < tc.wantReads2 {
+				t.Fatalf("pve-node2 served %d config reads, want at least %d", f.readsOn("pve-node2"), tc.wantReads2)
+			}
+		})
 	}
 }

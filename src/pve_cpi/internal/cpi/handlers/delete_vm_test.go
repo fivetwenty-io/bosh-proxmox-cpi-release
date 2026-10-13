@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -2284,47 +2285,91 @@ func TestHandleDeleteVM_InBandVMID_ConfigReadError_Retriable(t *testing.T) {
 		if deleteCalled {
 			t.Errorf("%s: DeleteQemu must NOT be called when parker config read fails", label)
 		}
+		// The parker check's own config read is the one that fails. A later
+		// read would also answer retriable, so the message pins which one.
+		if !strings.Contains(err.Error(), "to verify parker status") {
+			t.Errorf("%s: error %q does not come from the parker check's config read", label, err.Error())
+		}
 	}
 }
 
 // TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds verifies that a VM whose
 // VMID happens to fall in the parker range but does NOT carry the bosh-parker
-// tag is not refused — it proceeds to normal deletion.
+// tag is not refused — it proceeds to normal deletion. The row carries no
+// tags, so the parker check must read the config on the scan node to learn
+// that. The test pins that read by comparing against the same delete with a
+// tagged row, which settles the parker check without a read.
 func TestHandleDeleteVM_VMInRange_NoParkerTag_Proceeds(t *testing.T) {
 	t.Parallel()
 
 	const vmid = 90050
+	tagged := runInBandNonParkerDelete(t, vmid, "bosh-cpi;some-other-tag")
+	untagged := runInBandNonParkerDelete(t, vmid, "")
+	if untagged != tagged+1 {
+		t.Fatalf("untagged row: %d config reads on the scan node, want %d (the %d a tagged row takes, plus the "+
+			"parker check's fallback read)", untagged, tagged+1, tagged)
+	}
+}
+
+// runInBandNonParkerDelete deletes an in-band VM whose config carries no
+// bosh-parker tag, serving rowTags verbatim on its cluster row, and returns
+// how many config reads of the VM the scan node pve-node1 served.
+func runInBandNonParkerDelete(t *testing.T, vmid int, rowTags string) int {
+	t.Helper()
+	var mu sync.Mutex
+	scanNodeReads := 0
 	deleteCalled := false
 
 	qemuSvc := &mockQEMUService{
 		stopFn: func(_ context.Context, _ string, _ int) (string, error) {
 			return "", nil
 		},
-		configFn: func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		configFn: func(_ context.Context, node string, id int) (map[string]any, error) {
+			if id == vmid && node == "pve-node1" {
+				mu.Lock()
+				scanNodeReads++
+				mu.Unlock()
+			}
 			// VM in parker range but NO bosh-parker tag.
 			return map[string]any{"tags": "bosh-cpi;some-other-tag"}, nil
 		},
 	}
 	nodesSvc := &mockNodesService{
 		deleteQemuFn: func(_ context.Context, _ string, _ string, _ *nodes.DeleteQemuParams) (*nodes.DeleteQemuResponse, error) {
+			mu.Lock()
 			deleteCalled = true
+			mu.Unlock()
 			raw := nodes.DeleteQemuResponse{}
 			return &raw, nil
 		},
 	}
 
-	// No row tags, so the guard falls back to the config -- which says this is
-	// an ordinary VM that merely happens to sit in the band.
+	// An empty rowTags is the untagged row, so the guard falls back to the
+	// config, which says this is an ordinary VM that merely sits in the band.
 	deps := parkerDepsUntaggedRow(vmid, qemuSvc, nodesSvc)
-	h := handlers.HandleDeleteVM(deps)
-	_, err := h.Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
-
+	if rowTags != "" {
+		mc, ok := deps.PVE.(*mockPVEClient)
+		if !ok {
+			t.Fatal("parkerDepsUntaggedRow no longer returns a *mockPVEClient")
+		}
+		mc.clusterSvc = &mockClusterSvc{
+			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
+				raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "pve-node1", "type": "qemu", "tags": rowTags})
+				resp := cluster.ListResourcesResponse{raw}
+				return &resp, nil
+			},
+		}
+	}
+	_, err := handlers.HandleDeleteVM(deps).Handle(context.Background(), marshalArgs(strconv.Itoa(vmid)), jsonrpc.Context{})
 	if err != nil {
-		t.Fatalf("VM in range without parker tag: unexpected error: %v", err)
+		t.Fatalf("VM in range without parker tag (row tags %q): unexpected error: %v", rowTags, err)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if !deleteCalled {
-		t.Error("VM in range without parker tag: DeleteQemu must be called")
+		t.Errorf("VM in range without parker tag (row tags %q): DeleteQemu must be called", rowTags)
 	}
+	return scanNodeReads
 }
 
 // ---------------------------------------------------------------------------
