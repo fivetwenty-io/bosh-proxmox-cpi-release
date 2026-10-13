@@ -12,9 +12,10 @@ import (
 )
 
 // TestListParkersForNode_WarnsAboutBandAndPrefixStrays lists a node holding
-// our own parker, a parker of another prefix inside our band, and a parker
-// with our director tag and prefix outside it. The park-target answer is
-// unchanged, both warnings are logged once, and the only config read is the
+// our own parker, a parker of another prefix inside our band, another
+// Director's parker inside our band, and a parker with our director tag and
+// prefix outside it. The park-target answer is unchanged, each of the three
+// warnings is logged once, and the only config read is the
 // one the existing evidence rule already makes for an untagged in-band row.
 func TestListParkersForNode_WarnsAboutBandAndPrefixStrays(t *testing.T) {
 	t.Parallel()
@@ -40,6 +41,9 @@ func TestListParkersForNode_WarnsAboutBandAndPrefixStrays(t *testing.T) {
 			// as it did before the warnings existed.
 			map[string]any{"vmid": int64(90003), "node": node, "type": "qemu"},
 			map[string]any{"vmid": int64(91500), "node": node, "type": "qemu", "name": "az1-parker-91500", "tags": ours},
+			// Another Director's parker in the shared default band.
+			map[string]any{"vmid": int64(90004), "node": node, "type": "qemu", "name": "bosh-parker-90004",
+				"tags": "bosh-cpi;bosh-parker;" + parkerPrefixTagFor("bosh") + ";director--other-director"},
 			// Out-of-band rows with no tags are never read for evidence.
 			map[string]any{"vmid": int64(101), "node": node, "type": "qemu"},
 		), nil
@@ -59,13 +63,15 @@ func TestListParkersForNode_WarnsAboutBandAndPrefixStrays(t *testing.T) {
 	if configReads != 1 {
 		t.Fatalf("config reads = %d, want only the untagged in-band row's", configReads)
 	}
-	var outside, other []log.Entry
+	var outside, other, foreign []log.Entry
 	for _, e := range obs.All() {
 		switch {
 		case strings.Contains(e.Message, "outside the configured parker band"):
 			outside = append(outside, e)
 		case strings.Contains(e.Message, "inside this entry's parker band"):
 			other = append(other, e)
+		case strings.Contains(e.Message, "share this entry's parker band"):
+			foreign = append(foreign, e)
 		default:
 			t.Errorf("unexpected warning %q", e.Message)
 		}
@@ -75,6 +81,9 @@ func TestListParkersForNode_WarnsAboutBandAndPrefixStrays(t *testing.T) {
 	}
 	if len(other) != 1 || other[0].Attrs["parkers"] != "pve1/90002(az2)" {
 		t.Fatalf("other-prefix warnings = %+v", other)
+	}
+	if len(foreign) != 1 || foreign[0].Attrs["parkers"] != "pve1/90004(bosh)" {
+		t.Fatalf("other-director warnings = %+v", foreign)
 	}
 }
 

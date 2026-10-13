@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -374,5 +376,68 @@ func TestNoteJournalEntryBindingToleratesMissingInputs(t *testing.T) {
 	}
 	if got, want := JournalEntryBinding(nil), JournalEntryBinding(&config.CPIConfig{}); got != want || got.ParkerPrefix != "bosh" {
 		t.Fatalf("nil config binding = %+v, want the empty configuration's %+v", got, want)
+	}
+}
+
+// TestEntryBindingFailedReleaseHasItsOwnMessage covers a lock release that
+// fails after the binding was written. The new-binding warning still fires,
+// the release gets its own warning, and nothing claims the sidecar could not
+// be read or recorded.
+func TestEntryBindingFailedReleaseHasItsOwnMessage(t *testing.T) {
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	current := JournalEntryBinding(&config.CPIConfig{VMPrefix: "az2"})
+	note := aj.EntryBindingNote{Added: true, Others: []aj.EntryBindingSighting{{Binding: otherEntryBinding(), FirstSeen: time.Unix(1_700_000_000, 0)}}}
+	err := errors.Join(nil, fmt.Errorf("%w: %w", aj.ErrEntryBindingUnlock, errors.New("bad file descriptor")))
+	logEntryBindingNote(logger, "director", current, note, err)
+
+	entries := bindingWarnings(obs)
+	if len(entries) != 2 {
+		t.Fatalf("want the new-binding warning and the release warning, got %+v", entries)
+	}
+	if !strings.Contains(entries[0].Message, "new to this namespace") {
+		t.Fatalf("first warning = %q", entries[0].Message)
+	}
+	release := entries[1]
+	if release.Level != log.LevelWarn || !strings.Contains(release.Message, "lock could not be released cleanly after the update") ||
+		release.Attrs["binding_added"] != true {
+		t.Fatalf("release warning = %+v", release)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Message, "could not be read") || strings.Contains(e.Message, "could not be recorded") {
+			t.Fatalf("a release failure was reported as %q", e.Message)
+		}
+	}
+}
+
+// TestEntryBindingAbandonedWaitHasItsOwnMessage drives admission's note with a
+// context that ends while another process holds entry-binding.lock. The note
+// logs that the call ended during the wait, at Debug, and never that the
+// sidecar could not be read.
+func TestEntryBindingAbandonedWaitHasItsOwnMessage(t *testing.T) {
+	deps, j, _ := auditFixture(t)
+	lockPath := filepath.Join(filepath.Dir(entryBindingSidecar(deps)), "entry-binding.lock")
+	held, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	logger, obs := log.NewObservedLogger(log.LevelDebug)
+	deps.Logger = logger
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	noteJournalEntryBinding(ctx, deps, j)
+
+	entries := bindingWarnings(obs)
+	if len(entries) != 1 || entries[0].Level != log.LevelDebug || !strings.Contains(entries[0].Message, "ended while waiting") {
+		t.Fatalf("abandoned wait logged %+v", entries)
+	}
+	if _, err := os.Stat(entryBindingSidecar(deps)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an abandoned wait wrote the sidecar: %v", err)
 	}
 }

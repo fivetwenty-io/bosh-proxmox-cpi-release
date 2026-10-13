@@ -53,6 +53,40 @@ var ErrUnsupportedEntryBinding = errors.New("journal: entry binding written by a
 // than entryBindingLockWait. Nothing was read or written.
 var ErrEntryBindingBusy = errors.New("journal: entry binding lock is busy")
 
+// ErrEntryBindingWaitAbandoned means the caller's context ended while the note
+// waited for the sidecar lock. Nothing was read under the lock or written. The
+// returned error also wraps the context's own error.
+var ErrEntryBindingWaitAbandoned = errors.New("journal: entry binding lock wait ended with the caller's context")
+
+// ErrEntryBindingUnlock means the sidecar lock could not be released cleanly
+// after the update ran. The update's own outcome is reported beside it, so a
+// caller that sees only this error knows the sidecar was handled and only the
+// release failed. The kernel drops the flock when the descriptor finally
+// closes or the process exits, so the lock can't outlive the CPI call.
+var ErrEntryBindingUnlock = errors.New("journal: entry binding lock could not be released")
+
+// entryBindingTuning lets tests stretch the lock wait or fail the release
+// without touching the production values. Its zero value is production
+// behavior: an entryBindingLockWait budget and fileLock.close.
+type entryBindingTuning struct {
+	lockWait time.Duration
+	release  func(*fileLock) error
+}
+
+func (t entryBindingTuning) wait() time.Duration {
+	if t.lockWait > 0 {
+		return t.lockWait
+	}
+	return entryBindingLockWait
+}
+
+func (t entryBindingTuning) unlock(l *fileLock) error {
+	if t.release != nil {
+		return t.release(l)
+	}
+	return l.close()
+}
+
 // EntryBinding is the identity of the cpi_config entry that writes into a
 // journal namespace: the VM name prefix, the resolved parker prefix, and the
 // three VMID bands the entry allocates from. Two entries that share a
@@ -232,8 +266,11 @@ type EntryBindingNote struct {
 // or one it can't read for a reason other than corruption, such as an unsafe
 // mode or owner. A corrupt sidecar is replaced and the reason is returned in
 // Replaced. When the lock stays busy past entryBindingLockWait it returns
-// ErrEntryBindingBusy and changes nothing. A failed write returns the
-// journal's DurabilityError with Added set.
+// ErrEntryBindingBusy and changes nothing, and when ctx ends during the wait
+// it returns ErrEntryBindingWaitAbandoned with the context's error. A failed
+// write returns the journal's DurabilityError with Added set. A failed lock
+// release returns ErrEntryBindingUnlock, joined with the write's error when
+// that failed too, and the note still describes what the update did.
 func (j *Journal) NoteEntryBinding(ctx context.Context, binding EntryBinding, now time.Time) (EntryBindingNote, error) {
 	if j == nil || j.root == nil {
 		return EntryBindingNote{}, ErrClosed
@@ -252,17 +289,25 @@ func (j *Journal) NoteEntryBinding(ctx context.Context, binding EntryBinding, no
 		return EntryBindingNote{}, nil
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, entryBindingLockWait)
+	waitCtx, cancel := context.WithTimeout(ctx, j.binding.wait())
 	defer cancel()
 	lock, lockErr := j.waitEntryBindingLock(waitCtx)
-	if errors.Is(lockErr, context.DeadlineExceeded) && ctx.Err() == nil {
-		return EntryBindingNote{}, ErrEntryBindingBusy
-	}
 	if lockErr != nil {
-		return EntryBindingNote{}, lockErr
+		waitEnded := errors.Is(lockErr, context.Canceled) || errors.Is(lockErr, context.DeadlineExceeded)
+		switch parentErr := ctx.Err(); {
+		case waitEnded && parentErr != nil:
+			return EntryBindingNote{}, fmt.Errorf("%w: %w", ErrEntryBindingWaitAbandoned, parentErr)
+		case waitEnded:
+			return EntryBindingNote{}, ErrEntryBindingBusy
+		default:
+			return EntryBindingNote{}, lockErr
+		}
 	}
 	note, addErr := j.addEntryBindingLocked(binding, now)
-	return note, errors.Join(addErr, lock.close())
+	if releaseErr := j.binding.unlock(lock); releaseErr != nil {
+		return note, errors.Join(addErr, fmt.Errorf("%w: %w", ErrEntryBindingUnlock, releaseErr))
+	}
+	return note, addErr
 }
 
 func (j *Journal) addEntryBindingLocked(binding EntryBinding, now time.Time) (EntryBindingNote, error) {

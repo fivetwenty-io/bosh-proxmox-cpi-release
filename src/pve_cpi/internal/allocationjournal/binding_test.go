@@ -277,6 +277,11 @@ func TestNoteEntryBindingConcurrentWritersKeepEachOther(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = h.Close() })
+		// The eight writes serialize on the lock, each with a file and a
+		// directory fsync. A loaded shared runner can stretch that past the
+		// production one-second budget, which would turn a correct lock into
+		// a flaky ErrEntryBindingBusy, so these handles wait longer.
+		h.binding.lockWait = testEntryBindingLockWait
 		handles[i] = h
 	}
 	start := make(chan struct{})
@@ -329,6 +334,9 @@ func TestNoteEntryBindingRereadsUnderTheLock(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("tryLock = %v, %v", ok, err)
 	}
+	// The note must outwait the 100 ms hold and the fsynced write under it,
+	// however loaded the runner is.
+	j.binding.lockWait = testEntryBindingLockWait
 	done := make(chan error, 1)
 	go func() {
 		_, err := j.NoteEntryBinding(ctx, otherBinding("az2"), time.Unix(1_700_000_100, 0))
@@ -375,11 +383,14 @@ func TestNoteEntryBindingGivesUpOnABusyLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = other.Close() })
+	other.binding.lockWait = 100 * time.Millisecond
 	begin := time.Now()
 	if _, err := other.NoteEntryBinding(context.Background(), testBinding(), time.Unix(1_700_000_000, 0)); !errors.Is(err, ErrEntryBindingBusy) {
 		t.Fatalf("busy lock = %v, want ErrEntryBindingBusy", err)
 	}
-	if waited := time.Since(begin); waited > entryBindingLockWait+time.Second {
+	// The bound only proves the wait ends; a loaded runner gets generous
+	// slack over the 100 ms budget.
+	if waited := time.Since(begin); waited > 10*time.Second {
 		t.Fatalf("waited %v on a busy lock", waited)
 	}
 	if _, err := os.Stat(sidecarPath(dir)); !errors.Is(err, os.ErrNotExist) {
@@ -519,5 +530,86 @@ func TestNoteEntryBindingFailedWriteKeepsOldSidecar(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Fatalf("failed write left scratch file %s", e.Name())
 		}
+	}
+}
+
+// testEntryBindingLockWait is the lock budget the lock tests give themselves
+// so that runner load can't masquerade as a busy lock.
+const testEntryBindingLockWait = 30 * time.Second
+
+// TestEntryBindingLockWaitDefaultsToOneSecond pins the production budget, so
+// the test-only override can't drift into the shipped behavior.
+func TestEntryBindingLockWaitDefaultsToOneSecond(t *testing.T) {
+	if got := (entryBindingTuning{}).wait(); got != time.Second {
+		t.Fatalf("default entry binding lock wait = %v, want 1s", got)
+	}
+	if got := (entryBindingTuning{lockWait: time.Minute}).wait(); got != time.Minute {
+		t.Fatalf("override = %v", got)
+	}
+}
+
+// TestNoteEntryBindingReportsAFailedReleaseApart covers a release that fails
+// after a good write. The error is ErrEntryBindingUnlock and not a
+// DurabilityError, the note still says the binding was added, the sidecar
+// holds it, and the lock is free afterwards.
+func TestNoteEntryBindingReportsAFailedReleaseApart(t *testing.T) {
+	j, _ := fixture(t)
+	injected := errors.New("injected release failure")
+	j.binding.release = func(l *fileLock) error { return errors.Join(injected, l.close()) }
+	note, err := j.NoteEntryBinding(context.Background(), testBinding(), time.Unix(1_700_000_000, 0))
+	if !errors.Is(err, ErrEntryBindingUnlock) || !errors.Is(err, injected) {
+		t.Fatalf("release failure = %v, want ErrEntryBindingUnlock wrapping the cause", err)
+	}
+	var durability *DurabilityError
+	if errors.As(err, &durability) {
+		t.Fatalf("a release failure after a good write reads as a lost write: %v", err)
+	}
+	if !note.Added {
+		t.Fatalf("note = %+v, want Added", note)
+	}
+	if got := bindingsOf(readSidecar(t, j)); fmt.Sprint(got) != fmt.Sprint([]EntryBinding{testBinding()}) {
+		t.Fatalf("bindings = %v", got)
+	}
+	held, ok, lockErr := tryLock(j.root, entryBindingLockFile)
+	if lockErr != nil || !ok {
+		t.Fatalf("lock after a failed release = %v, %v", ok, lockErr)
+	}
+	if err := held.close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestNoteEntryBindingReportsAnAbandonedWait covers a caller whose context
+// ends while another process holds the lock. The error says the wait was
+// abandoned and wraps the context's error, it is not ErrEntryBindingBusy, and
+// nothing is written.
+func TestNoteEntryBindingReportsAnAbandonedWait(t *testing.T) {
+	j, dir := fixture(t)
+	held, ok, err := tryLock(j.root, entryBindingLockFile)
+	if err != nil || !ok {
+		t.Fatalf("tryLock = %v, %v", ok, err)
+	}
+	defer func() {
+		if err := held.close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	other, err := Open(dir, "namespace", "cluster-identity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	other.binding.lockWait = testEntryBindingLockWait
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	_, err = other.NoteEntryBinding(ctx, testBinding(), time.Unix(1_700_000_000, 0))
+	if !errors.Is(err, ErrEntryBindingWaitAbandoned) || !errors.Is(err, context.Canceled) || errors.Is(err, ErrEntryBindingBusy) {
+		t.Fatalf("abandoned wait = %v, want ErrEntryBindingWaitAbandoned wrapping context.Canceled", err)
+	}
+	if _, err := os.Stat(sidecarPath(dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an abandoned wait wrote the sidecar: %v", err)
 	}
 }

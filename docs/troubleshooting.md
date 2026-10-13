@@ -2814,13 +2814,15 @@ Every fix below that touches a parker band follows one rule. We never move a ban
 
 Widening a band so that it still covers every parker is safe. Changing a band to one that leaves out a parker is safe only when that parker holds no disks. When we need to move an entry's band, we follow these steps in order.
 
-1. We run `python3 scripts/disk-audit --config /path/to/audit-config.json` with `parked_disk_vmid_range_start` and `parked_disk_vmid_range_end` in the audit config set to the band we are leaving. The `PARKER VMs` table lists every parker in that band, its `NAME` carries the prefix, and `EMPTY` reads `YES` for a parker that holds nothing.
+1. We run `python3 scripts/disk-audit --config /path/to/audit-config.json` with `parked_disk_vmid_range_start` and `parked_disk_vmid_range_end` in the audit config set to the band we are leaving. The `PARKER VMs` table lists every parker in that band with its `NODE`, and `EMPTY` reads `YES` for a parker that holds nothing.
 
-2. While any parker of the entry's prefix holds a disk, we leave the band where it is. Those disks drain as the Director attaches or deletes them, or we choose a fix that keeps the band, such as a shared parker prefix.
+2. We find every parker in that table that this Director owns, whatever its prefix. For each one, we read its tags with `pvesh get /nodes/<node>/qemu/<vmid>/config --output-format json | jq -r '.tags'`. A parker is ours when its tags include `director--<uuid>` with the UUID that `bosh env` prints for this Director. We also count a parker with no `director--` tag at all as ours, because a park adopts unattributed parkers too. The prefix doesn't narrow this list. A parker left behind by an earlier prefix change still carries our tag and can still hold our disks, and the CPI unparks by tag and band alone, so once the band moves this entry can't unpark a disk from any of them.
 
-3. When every parker of the entry's prefix is empty, we run the audit once more with no deploy running against that entry, change `pve_parked_disk_vmid_range_start` and `pve_parked_disk_vmid_range_end`, and deploy. A detach between the audit and the deploy could park a disk in the old band, which is why the second audit runs with deploys stopped.
+3. While any parker on that list holds a disk, we leave the band where it is. The list includes the parkers of any other cpi-config entry for this Director that shares the band, for the same reason. Those disks drain as the Director attaches or deletes them. If they don't drain, we choose a fix that keeps the band, such as a shared parker prefix.
 
-4. The entry's old parkers now sit outside its band, and the warnings below keep naming them. We confirm each one is still empty and remove it by following [Recovering empty parker VMs](operations.md#recovering-empty-parker-vms).
+4. When every parker on the list is empty, we run the audit and the tag check once more with no deploy running for this Director, change `pve_parked_disk_vmid_range_start` and `pve_parked_disk_vmid_range_end`, and deploy. A detach between the audit and the deploy could park a disk in the old band, which is why the second check runs with deploys stopped.
+
+5. The parkers we emptied now sit outside the entry's band, and the warnings below keep naming them. We remove only the ones that no cpi-config entry of this Director still parks in. We confirm each one is still empty and remove it by following [Recovering empty parker VMs](operations.md#recovering-empty-parker-vms). We never remove a parker whose `director--` tag names another Director.
 
 If a band already moved while disks were parked, the refusal names the parker VM, and we set the band back to one that covers it, as the refusal says. Then we follow the steps above. We never remove a parker to get rid of the refusal, because destroying a parker that holds disks deletes those disks.
 
@@ -2838,18 +2840,36 @@ The CPI read this from a parker listing it was already making. That is either a 
 
 Two configurations produce this warning. In the first, two entries share the band with different parker prefixes. A park matches on the prefix, so the entries never fill each other's parkers, and unparking goes by the tag and the band, so either entry can still reach the other's parked disks. The CPI warns about that configuration anyway, for two reasons. The entries allocate parker VMIDs from one range, so each one uses up the other's capacity and counts the other's parkers as foreign guests in its band. And from inside one entry, a sibling's parkers look exactly like the parkers a prefix change leaves behind, so the CPI can't tell a deliberate share from a stale one. In the second configuration, this entry's parker prefix changed, and the parkers created under the old prefix are still standing, as [Retiring parkers after a parker prefix change](operations.md#retiring-parkers-after-a-parker-prefix-change) describes.
 
+A third cause is another BOSH Director on the same cluster. Every Director defaults to the same parker band, so two Directors share it unless one of them changes it. This warning covers only parkers with our Director's `director--` tag or with no `director--` tag. A parker whose tag names another Director, or any tagged parker when the call carries no Director UUID to compare with, gets its own warning, which [Parkers of another Director share the parker band](#parkers-of-another-director-share-the-parker-band) covers.
+
 **Fix**
 
-We look up which cpi-config entry, if any, uses the prefix in parentheses.
+We look up which cpi-config entry, if any, uses the prefix in parentheses. Before we treat any parker as a leftover, we read its tags as step 2 of [Moving a parker band while parkers hold disks](#moving-a-parker-band-while-parkers-hold-disks) shows. A parker whose `director--` tag names another Director is never ours to remove.
 
 - No entry uses it
-  The parkers are leftovers from a prefix change. We change no configuration. They drain as the Director attaches or deletes their disks, and we remove each one once the audit shows it empty, by following [Recovering empty parker VMs](operations.md#recovering-empty-parker-vms). The warning stops when none is left.
+  A parker with our `director--` tag, or with none, is a leftover from a prefix change. We change no configuration. They drain as the Director attaches or deletes their disks, and we remove each one once the audit shows it empty, by following [Recovering empty parker VMs](operations.md#recovering-empty-parker-vms). The warning stops when none is left.
 
 - The two entries should share parkers
   We give them the same `pve_parker_prefix`. That is safe at any time, because no parker leaves the band. The renamed entry's old parkers become leftovers, and they keep the warning going until they drain and we remove them as above.
 
 - The two entries should stay apart
-  We give one entry its own `pve_parked_disk_vmid_range_start` and `pve_parked_disk_vmid_range_end`, as [Multi-Cluster Deployments](multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern) describes. We do that only when none of that entry's parkers holds a disk, and in the order [Moving a parker band while parkers hold disks](#moving-a-parker-band-while-parkers-hold-disks) gives.
+  We give one entry its own `pve_parked_disk_vmid_range_start` and `pve_parked_disk_vmid_range_end`, as [Multi-Cluster Deployments](multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern) describes. We do that only when no parker this Director owns in the old band holds a disk, whatever its prefix, and in the order [Moving a parker band while parkers hold disks](#moving-a-parker-band-while-parkers-hold-disks) gives.
+
+### Parkers of another Director share the parker band
+
+**Symptom**
+
+```text
+WARN parkers with another parker prefix and a director tag this call can't match to its own director share this entry's parker band; another BOSH Director on this cluster may own them and can park disks on them at any time, so never remove them. Give each Director its own parked_disk_vmid_range  listing=provenance_scan parker_band=90000-90999 parker_prefix=az1 director_known=true count=1 parkers=pve1/90004(bosh)
+```
+
+**Diagnosis**
+
+Each guest in `parkers` carries the `bosh-parker` tag, another parker prefix, and a `director--` tag that doesn't name the Director making this call. That is usually a second BOSH Director on the same cluster that kept the default band. The CPI reads the tags from the listing it already made, so the check adds no PVE call. When `director_known=false`, the call carried no Director UUID, so the CPI couldn't compare and reports every director-tagged parker of another prefix here, including parkers of our own other entries. Our CPI never parks a disk on these parkers, because a park matches on the prefix and the Director attribution. The other Director's CPI does park on them, and it can do so at any moment.
+
+**Fix**
+
+We never remove or edit these parkers. The other Director can park a disk on one between our audit and a destroy, and `qm destroy --purge` would then delete that disk. We confirm the owner by comparing the UUID in each parker's `director--` tag with the UUID `bosh env` prints for each Director. To stop the warning, we give one Director its own `pve.parked_disk_vmid_range_start` and `pve.parked_disk_vmid_range_end`, following [Moving a parker band while parkers hold disks](#moving-a-parker-band-while-parkers-hold-disks) from that Director's side. When `director_known=false` and the UUID turns out to be ours, the parkers belong to another cpi-config entry of this Director, and [Parkers of another prefix sit inside the parker band](#parkers-of-another-prefix-sit-inside-the-parker-band) applies.
 
 ### Parkers with our director tag sit outside the parker band
 

@@ -65,10 +65,17 @@ func noteJournalEntryBinding(ctx context.Context, deps Deps, journal *aj.Journal
 	if journal == nil || deps.Config == nil {
 		return
 	}
-	logger := deps.Log(ctx)
-	namespace := deps.Config.StoragePlacementNamespace
 	current := JournalEntryBinding(deps.Config)
 	note, err := journal.NoteEntryBinding(ctx, current, time.Now())
+	logEntryBindingNote(deps.Log(ctx), deps.Config.StoragePlacementNamespace, current, note, err)
+}
+
+// logEntryBindingNote turns one NoteEntryBinding result into log lines. The
+// note and the error are independent. A binding can be added and then fail to
+// release its lock, so the warning about the new binding and the line about
+// the release both appear. Each error class gets a message that says what
+// actually happened, and none of them fails the call.
+func logEntryBindingNote(logger *log.Logger, namespace string, current aj.EntryBinding, note aj.EntryBindingNote, err error) {
 	if note.Replaced != nil {
 		logger.Warn("allocation journal entry binding is unreadable; recording the current entry's binding in a fresh set",
 			log.String("namespace", namespace), log.ErrScrubbed(note.Replaced),
@@ -95,15 +102,24 @@ func noteJournalEntryBinding(ctx context.Context, deps Deps, journal *aj.Journal
 	var durability *aj.DurabilityError
 	switch {
 	case err == nil:
+	case errors.As(err, &durability):
+		// A failed write is reported even when the release failed as well,
+		// because the lost write is what the operator needs to know about.
+		logger.Warn("allocation journal entry binding could not be recorded; allocation continues",
+			log.String("namespace", namespace), log.ErrScrubbed(err))
+	case errors.Is(err, aj.ErrEntryBindingUnlock):
+		logger.Warn("allocation journal entry binding lock could not be released cleanly after the update; the sidecar is intact, "+
+			"the lock is freed when this CPI process exits, and allocation continues",
+			log.String("namespace", namespace), log.Bool("binding_added", note.Added), log.ErrScrubbed(err))
+	case errors.Is(err, aj.ErrEntryBindingWaitAbandoned):
+		logger.Debug("the CPI call ended while waiting for the allocation journal entry binding lock; a later create records this entry's binding",
+			log.String("namespace", namespace), log.String("current_binding", current.String()), log.ErrScrubbed(err))
 	case errors.Is(err, aj.ErrUnsupportedEntryBinding):
 		logger.Warn("allocation journal entry binding was written by a newer CPI release; it is left untouched and the shared-namespace check is skipped",
 			log.String("namespace", namespace), log.ErrScrubbed(err))
 	case errors.Is(err, aj.ErrEntryBindingBusy):
 		logger.Debug("allocation journal entry binding lock is busy; a later create records this entry's binding",
 			log.String("namespace", namespace), log.String("current_binding", current.String()))
-	case errors.As(err, &durability):
-		logger.Warn("allocation journal entry binding could not be recorded; allocation continues",
-			log.String("namespace", namespace), log.ErrScrubbed(err))
 	default:
 		logger.Warn("allocation journal entry binding could not be read; the shared-namespace check is skipped for this call",
 			log.String("namespace", namespace), log.ErrScrubbed(err))

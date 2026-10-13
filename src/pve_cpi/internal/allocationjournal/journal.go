@@ -22,9 +22,10 @@ const authorityFile = "authority.json"
 // Journal is a namespace-scoped authority. Close only after all Handles close.
 // Opening/inspection does not initialize state or claim remote writer ownership.
 type Journal struct {
-	root *os.Root
-	auth authority
-	ops  fileOps
+	root    *os.Root
+	auth    authority
+	ops     fileOps
+	binding entryBindingTuning
 }
 
 // EnrollmentStatus is the persisted authority, available without a write lock.

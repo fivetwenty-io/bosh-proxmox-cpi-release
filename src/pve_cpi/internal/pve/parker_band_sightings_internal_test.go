@@ -29,16 +29,20 @@ func sightingTags(prefix string, director string, extra ...string) string {
 func TestParkerBandSightingsClassifiesRows(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name        string
-		vmid        int
-		tags, guest string
-		outside     bool
-		otherPrefix bool
+		name          string
+		vmid          int
+		tags, guest   string
+		outside       bool
+		otherPrefix   bool
+		otherDirector bool
 	}{
 		{name: "our parker in band", vmid: 90001, tags: sightingTags("az1", sightingDirector)},
 		{name: "other prefix in band", vmid: 90002, tags: sightingTags("az2", sightingDirector), otherPrefix: true},
 		{name: "other prefix in band by name only", vmid: 90003, tags: sightingTags("", ""), guest: "az2-parker-90003", otherPrefix: true},
-		{name: "other director other prefix in band", vmid: 90004, tags: sightingTags("az2", "99999999-0000-0000-0000-000000000000"), otherPrefix: true},
+		{name: "other director other prefix in band", vmid: 90004, tags: sightingTags("az2", "99999999-0000-0000-0000-000000000000"), otherDirector: true},
+		{name: "other prefix in band tagged by us and another director", vmid: 90009, tags: sightingTags("az2", sightingDirector, parkerDirectorTag("99999999-0000-0000-0000-000000000000")), otherPrefix: true},
+		{name: "other prefix in band with our tag in another case", vmid: 90010, tags: sightingTags("az2", "", strings.ToUpper(parkerDirectorTag(sightingDirector))), otherPrefix: true},
+		{name: "other director same prefix in band", vmid: 90011, tags: sightingTags("az1", "99999999-0000-0000-0000-000000000000")},
 		{name: "mover of another prefix in band", vmid: 90005, tags: sightingTags("az2", sightingDirector, DiskMoverTag), otherPrefix: true},
 		{name: "unevidenced prefix in band", vmid: 90006, tags: sightingTags("", "")},
 		{name: "our parker outside band", vmid: 91001, tags: sightingTags("az1", sightingDirector), outside: true},
@@ -60,6 +64,9 @@ func TestParkerBandSightingsClassifiesRows(t *testing.T) {
 			if got := len(s.otherPrefix) == 1; got != tc.otherPrefix {
 				t.Errorf("otherPrefix = %v, want %v", s.otherPrefix, tc.otherPrefix)
 			}
+			if got := len(s.otherDirector) == 1; got != tc.otherDirector {
+				t.Errorf("otherDirector = %v, want %v", s.otherDirector, tc.otherDirector)
+			}
 		})
 	}
 }
@@ -72,6 +79,57 @@ func TestParkerBandSightingsNeedsADirectorForOutsideBand(t *testing.T) {
 	s.observe("pve1", 91001, sightingTags("az1", sightingDirector), "")
 	if len(s.outside) != 0 {
 		t.Fatalf("outside-band sighting without a director ID: %v", s.outside)
+	}
+}
+
+// TestParkerBandSightingsWithoutADirectorTreatsEveryTagAsForeign covers a
+// call that has no director ID. It can't prove a director-tagged parker of
+// another prefix is ours, so that parker gets the warning that never advises
+// removal, while an untagged one keeps the ordinary other-prefix warning.
+func TestParkerBandSightingsWithoutADirectorTreatsEveryTagAsForeign(t *testing.T) {
+	t.Parallel()
+	cfg := sightingCfg()
+	cfg.DirectorID = ""
+	s := newParkerBandSightings(cfg)
+	s.observe("pve1", 90002, sightingTags("az2", sightingDirector), "")
+	s.observe("pve1", 90003, sightingTags("az2", ""), "")
+	if fmt.Sprint(s.otherDirector) != "[pve1/90002(az2)]" || fmt.Sprint(s.otherPrefix) != "[pve1/90003(az2)]" {
+		t.Fatalf("otherDirector = %v, otherPrefix = %v", s.otherDirector, s.otherPrefix)
+	}
+}
+
+// TestParkerBandSightingsAnotherDirectorWarningNeverAdvisesRemoval checks the
+// third warning. A parker another Director may own must never be presented
+// as a leftover we can remove, because that Director can park a disk on it
+// between our audit and our destroy.
+func TestParkerBandSightingsAnotherDirectorWarningNeverAdvisesRemoval(t *testing.T) {
+	t.Parallel()
+	for _, directorID := range []string{sightingDirector, ""} {
+		logger, obs := log.NewObservedLogger(log.LevelWarn)
+		ctx := log.IntoContext(context.Background(), logger)
+		cfg := sightingCfg()
+		cfg.DirectorID = directorID
+		s := newParkerBandSightings(cfg)
+		s.observe("pve2", 90004, sightingTags("bosh", "99999999-0000-0000-0000-000000000000"), "")
+		s.report(ctx, "test_listing")
+		entries := obs.All()
+		if len(entries) != 1 {
+			t.Fatalf("director %q: want one warning, got %+v", directorID, entries)
+		}
+		e := entries[0]
+		for _, want := range []string{"another BOSH Director on this cluster may own them", "never remove them", "its own parked_disk_vmid_range"} {
+			if !strings.Contains(e.Message, want) {
+				t.Fatalf("director %q: warning %q lacks %q", directorID, e.Message, want)
+			}
+		}
+		for _, banned := range []string{"leftovers", "Remove a parker", "drain"} {
+			if strings.Contains(e.Message, banned) {
+				t.Fatalf("director %q: warning %q suggests %q", directorID, e.Message, banned)
+			}
+		}
+		if e.Attrs["parkers"] != "pve2/90004(bosh)" || e.Attrs["count"] != int64(1) || e.Attrs["director_known"] != (directorID != "") {
+			t.Fatalf("director %q: attrs = %+v", directorID, e.Attrs)
+		}
 	}
 }
 
