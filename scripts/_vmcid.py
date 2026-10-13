@@ -39,6 +39,27 @@ class VMCID(NamedTuple):
         """The bare VMID string PVE accepts as a vmid path segment."""
         return str(self.vmid)
 
+    @property
+    def known_cluster(self) -> bool:
+        """True for a stamped CID whose stamp names a cluster.
+
+        The all-zero stamp is what create_vm writes when it could not read the
+        cluster identity, and it names no cluster, like a bare CID.
+        """
+        return self.stamped and self.cluster != UNKNOWN_CLUSTER
+
+    def with_token(self, token: str) -> "VMCID":
+        """Return this CID with another token, keeping the VMID and the stamp.
+
+        Only a stamped CID has a token, so a bare CID raises ValueError, as does
+        a token that is not eight lowercase hex characters.
+        """
+        if not self.stamped:
+            raise ValueError("a bare CID has no token to replace")
+        if not is_stamp(token):
+            raise ValueError(f"token must be {STAMP_LEN} lowercase hex characters")
+        return VMCID(self.vmid, self.cluster, token)
+
     def __str__(self) -> str:
         if not self.stamped:
             return self.path_id

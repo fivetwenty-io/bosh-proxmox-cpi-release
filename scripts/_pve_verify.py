@@ -22,7 +22,9 @@ module, so it must not pull anything in.
 Auth mirrors src/pve_cpi/internal/pve/client.go:
     api_token present -> header  Authorization: PVEAPIToken=<token>
     else password     -> POST /access/ticket, then  Cookie: PVEAuthCookie=<ticket>
-Read-only GETs need no CSRFPreventionToken.
+Read-only GETs need no CSRFPreventionToken. The few writes the lifecycle
+harness makes for its own throwaway VM (create_empty_vm, destroy_vm) send the
+CSRFPreventionToken the ticket login returned when they authenticate by ticket.
 
 All existence predicates query *list* endpoints and test membership, which
 return a 200 array uniformly and sidestep the 404-vs-500 ambiguity of PVE's
@@ -47,6 +49,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 import urllib.error
 import urllib.parse
@@ -418,7 +421,12 @@ def parse_stemcell_path_cid(cid: str) -> "tuple[str, str, str]":
 
 
 class PVEVerifier:
-    """Minimal read-only PVE REST API client built from a CPI config dict."""
+    """Minimal PVE REST API client built from a CPI config dict.
+
+    Everything it does is a read except create_empty_vm and destroy_vm, which
+    the lifecycle harness uses for the one throwaway VM its collision step
+    needs, and the task polling those two use.
+    """
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._transport = os.environ.get("PVE_VERIFY_TRANSPORT", "urllib")
@@ -456,6 +464,7 @@ class PVEVerifier:
         self._user = str(config.get("user", "") or "").strip()
         self._realm = str(config.get("realm", "") or "").strip() or "pam"
         self._ticket = ""  # populated lazily for password auth
+        self._csrf = ""  # populated with the ticket; writes by ticket send it
 
         if not self._token and not self._password:
             raise PVEVerifyError("cpi config has neither 'api_token' nor 'password'")
@@ -499,10 +508,12 @@ class PVEVerifier:
             ) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise PVEVerifyError(f"PVE ticket auth failed: {exc}") from exc
-        ticket = (payload.get("data") or {}).get("ticket")
+        data = payload.get("data") or {}
+        ticket = data.get("ticket")
         if not ticket:
             raise PVEVerifyError("PVE ticket auth returned no ticket")
         self._ticket = ticket
+        self._csrf = str(data.get("CSRFPreventionToken") or "")
 
     # -- transport ------------------------------------------------------------
 
@@ -510,22 +521,41 @@ class PVEVerifier:
         """GET <base><path>; return the parsed 'data' field. Raise on any error."""
         if self._transport == "pmx":
             return self._pmx_get(path)
+        return self._request("GET", path)
+
+    def _write(self, method: str, path: str, data: "dict[str, Any] | None" = None) -> Any:
+        """POST or DELETE <base><path> with a form body; return the parsed 'data' field.
+
+        Writes always go over urllib, because the pmx transport only inspects.
+        """
+        if method not in ("POST", "DELETE"):
+            raise PVEVerifyError(f"unsupported write method {method!r}")
+        if self._transport == "pmx":
+            raise PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only; writes need the urllib transport")
+        return self._request(method, path, data)
+
+    def _request(self, method: str, path: str, data: "dict[str, Any] | None" = None) -> Any:
         self._ensure_ticket()
-        req = urllib.request.Request(f"{self.base}{path}", method="GET")
+        body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(f"{self.base}{path}", data=body, method=method)
+        if body is not None:
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
         if self._token:
             req.add_header("Authorization", f"PVEAPIToken={self._token}")
         else:
             req.add_header("Cookie", f"PVEAuthCookie={self._ticket}")
+            if method != "GET":
+                req.add_header("CSRFPreventionToken", self._csrf)
         try:
             with urllib.request.urlopen(req, context=self._ssl, timeout=30) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             exc.close()
             raise PVEVerifyError(
-                f"GET {path} failed: HTTP {exc.code} {exc.reason}"
+                f"{method} {path} failed: HTTP {exc.code} {exc.reason}"
             ) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise PVEVerifyError(f"GET {path} failed: {exc}") from exc
+            raise PVEVerifyError(f"{method} {path} failed: {exc}") from exc
         return payload.get("data")
 
     def _pmx_get(self, path: str) -> Any:
@@ -1156,6 +1186,89 @@ class PVEVerifier:
             if isinstance(entry, dict):
                 return entry
         return {}
+
+    # -- guest presence and the lifecycle harness's throwaway VM ---------------
+
+    def vmid_in_use(self, vmid: "int | str") -> bool:
+        """True when any guest, QEMU or container, holds vmid anywhere in the cluster.
+
+        /cluster/resources lags the live cluster by minutes, so a miss there is
+        not an absence. This reads the index first and then every node's own
+        QEMU and container listings, which are live. A node that is not online
+        cannot be read, so it leaves absence unproven and raises instead of
+        answering False.
+        """
+        want = _vmcid.as_path_id(vmid)
+        for entry in self._as_list(self._get("/cluster/resources?type=vm")):
+            if str(entry.get("vmid", "")).strip() == want:
+                return True
+        nodes = self._as_list(self._get("/nodes"))
+        if not nodes:
+            raise PVEVerifyError("GET /nodes returned no nodes, so the absence of a VMID cannot be proven")
+        for entry in nodes:
+            name = str(entry.get("node", "") or "").strip()
+            status = str(entry.get("status", "") or "").strip()
+            if not name:
+                continue
+            if status != "online":
+                raise PVEVerifyError(
+                    f"node {name} is {status or 'of unknown status'}, so the absence of VMID {want} cannot be proven"
+                )
+            quoted = urllib.parse.quote(name)
+            for kind in ("qemu", "lxc"):
+                for guest in self._as_list(self._get(f"/nodes/{quoted}/{kind}")):
+                    if str(guest.get("vmid", "")).strip() == want:
+                        return True
+        return False
+
+    def create_empty_vm(self, node: str, vmid: "int | str", name: str) -> str:
+        """Create a stopped QEMU VM with no disks, no network, and no tags; return its task UPID.
+
+        It is the hand-made VM of the lifecycle harness's collision step: it
+        carries nothing a BOSH CPI writes, so it looks like a guest an operator
+        made by hand. The caller must have shown that vmid is free.
+        """
+        if not node:
+            raise PVEVerifyError("create_empty_vm needs a node")
+        upid = self._write(
+            "POST",
+            f"/nodes/{urllib.parse.quote(node)}/qemu",
+            {"vmid": _vmcid.as_path_id(vmid), "name": name, "memory": 16, "cores": 1, "ostype": "l26",
+             "onboot": 0, "start": 0},
+        )
+        if not isinstance(upid, str) or not upid:
+            raise PVEVerifyError(f"creating VM {vmid} on {node} returned no task")
+        return upid
+
+    def destroy_vm(self, node: str, vmid: "int | str") -> str:
+        """Destroy a QEMU VM and purge it from job configs; return its task UPID."""
+        if not node:
+            raise PVEVerifyError("destroy_vm needs a node")
+        upid = self._write(
+            "DELETE",
+            f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(_vmcid.as_path_id(vmid))}"
+            "?purge=1&destroy-unreferenced-disks=1",
+        )
+        if not isinstance(upid, str) or not upid:
+            raise PVEVerifyError(f"destroying VM {vmid} on {node} returned no task")
+        return upid
+
+    def await_task(self, node: str, upid: str, timeout: float = 120.0, poll: float = 1.0) -> None:
+        """Wait for a task on node to stop, and raise unless it ended with exit status OK."""
+        deadline = time.monotonic() + timeout
+        path = f"/nodes/{urllib.parse.quote(node)}/tasks/{urllib.parse.quote(upid, safe='')}/status"
+        while True:
+            status = self._get(path)
+            if not isinstance(status, dict):
+                raise PVEVerifyError(f"task {upid} status is not an object")
+            if status.get("status") == "stopped":
+                exit_status = str(status.get("exitstatus", ""))
+                if exit_status != "OK":
+                    raise PVEVerifyError(f"task {upid} ended with {exit_status!r}")
+                return
+            if time.monotonic() >= deadline:
+                raise PVEVerifyError(f"task {upid} still running after {timeout:g}s")
+            time.sleep(poll)
 
     # -- assertion helpers ----------------------------------------------------
 

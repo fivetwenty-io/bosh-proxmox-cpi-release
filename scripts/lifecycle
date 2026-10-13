@@ -34,6 +34,9 @@ Sequence (mirrors the BOSH-CPI Director call order):
    12a. has_disk                (post-delete assertion, expect false)
    13.  reboot_vm               (soft graceful reboot, default config)
    14.  reboot_vm               (hard reset, reboot_mode=hard)
+   14a-14c. repoint pass        (only when FOREIGN_VM_TEST=on: the VM's CID reaches
+                                 another cluster where its VMID is absent, then where
+                                 a hand-made VM holds it, then with a wrong token)
    15.  delete_vm
    16.  delete_stemcell
    2b, 3b, 16b. storage-set replica pass (only when STORAGE_SET_REPLICAS_TEST=on)
@@ -70,6 +73,31 @@ Optional environment:
     STEMCELL_NAME    override stemcell name       (default: from stemcell.MF)
     STEMCELL_VERSION override stemcell version    (default: from stemcell.MF)
     TRACE            non-empty enables tracing    (default: unset)
+    CPI_CONTEXT_FILE path to a JSON object merged into the context of every call
+                     (default: unset, so each request carries only request_id).
+                     It holds what a Director merges in from a cpi_config entry,
+                     for example {"director_uuid": "...", "pve": {"host": "..."}}.
+                     The out-of-band PVE checks follow the cluster it names.
+
+Repoint and absent-VMID scenarios (exercises the stamped VM CID end to end):
+    FOREIGN_VM_TEST  on | off                      (default: off)
+                     Runs steps 14a-14c after step 14, against the VM the run
+                     already created through CPI_CONTEXT_FILE (the az1 context).
+                     Step 14a sends its CID to the FOREIGN_CONTEXT_FILE cluster (az2),
+                     where its VMID does not exist, and asserts delete_vm refuses a
+                     stamped CID, has_vm answers false, and the az1 VM is untouched;
+                     a bare-CID twin asserts today's answers. Step 14b makes a
+                     hand-made, untagged VM on az2 at the same VMID, asserts the
+                     refusals the answers table in docs/multi-cluster.md gives, checks
+                     the VM is unchanged, and removes it. Step 14c sends the CID's
+                     cluster with a wrong token and asserts VMNotFound. The pass
+                     never sends a VMID to a cluster before proving that no guest
+                     it did not create holds it there.
+    FOREIGN_CONTEXT_FILE  path to the az2 context file (required when
+                     FOREIGN_VM_TEST=on). Its pve map must name a different
+                     endpoint than the az1 context, with that cluster's
+                     credentials. The hand-made VM is made and removed through
+                     the PVE REST API with those credentials.
 
 Network-test environment (exercises create_network / delete_network):
     NETWORK_TEST_MODE  off | sdn | bridge          (default: off)
@@ -165,6 +193,7 @@ from typing import Any
 
 # Import the sibling out-of-band PVE verifier (scripts/_pve_verify.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _lifecycle_foreign  # noqa: E402
 import _pve_verify  # noqa: E402
 import _vmcid  # noqa: E402
 from _storage_placement_verify import PlacementVerification  # noqa: E402
@@ -277,6 +306,39 @@ except (OSError, ValueError) as _cfg_exc:
     sys.exit(f"CPI_CONFIG is not readable JSON: {_cfg_exc}")
 if not isinstance(_base_cfg, dict):
     sys.exit(f"CPI_CONFIG must contain a JSON object, got {type(_base_cfg).__name__}")
+
+# Optional request context. Without CPI_CONTEXT_FILE every request carries only
+# request_id, exactly as it always has. With it, the file's keys ride along on
+# every call, the way a Director merges a cpi_config entry's properties in.
+CPI_CONTEXT_FILE = env("CPI_CONTEXT_FILE", "").strip()
+try:
+    DEFAULT_CONTEXT: dict[str, Any] = (
+        _lifecycle_foreign.load_context_file(CPI_CONTEXT_FILE, "CPI_CONTEXT_FILE") if CPI_CONTEXT_FILE else {}
+    )
+except _lifecycle_foreign.ContextFileError as _ctx_exc:
+    sys.exit(str(_ctx_exc))
+
+# The repoint pass sends the VM's CID to a second cluster, the az2 context.
+FOREIGN_VM_TEST = env("FOREIGN_VM_TEST", "off").strip().lower()
+if FOREIGN_VM_TEST not in ("on", "off"):
+    sys.exit(f"FOREIGN_VM_TEST must be on|off, got {FOREIGN_VM_TEST!r}")
+FOREIGN_CONTEXT_FILE = env("FOREIGN_CONTEXT_FILE", "").strip()
+FOREIGN_CONTEXT: dict[str, Any] = {}
+if FOREIGN_VM_TEST == "on":
+    if not FOREIGN_CONTEXT_FILE:
+        sys.exit("FOREIGN_VM_TEST=on requires FOREIGN_CONTEXT_FILE, the az2 context the VM's CID is sent to")
+    try:
+        FOREIGN_CONTEXT = _lifecycle_foreign.load_context_file(FOREIGN_CONTEXT_FILE, "FOREIGN_CONTEXT_FILE")
+    except _lifecycle_foreign.ContextFileError as _ctx_exc:
+        sys.exit(str(_ctx_exc))
+    if _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT)) == \
+            _lifecycle_foreign.endpoint(_lifecycle_foreign.verifier_config(_base_cfg, FOREIGN_CONTEXT)):
+        sys.exit(
+            "FOREIGN_CONTEXT_FILE must name a different PVE endpoint than the az1 context "
+            "(CPI_CONFIG plus CPI_CONTEXT_FILE); set pve.host there, with that cluster's credentials"
+        )
+elif FOREIGN_CONTEXT_FILE:
+    print("note: FOREIGN_CONTEXT_FILE is set and FOREIGN_VM_TEST is off, so it is ignored", file=sys.stderr)
 
 _CFG_PARKER_START = int(_base_cfg.get("parked_disk_vmid_range_start") or 90000)
 _CFG_PARKER_END = int(_base_cfg.get("parked_disk_vmid_range_end") or 90999)
@@ -509,10 +571,10 @@ RETRIABLE_ATTEMPTS = 4
 RETRIABLE_DELAY_SEC = 15
 
 
-def call(method: str, args: list[Any], config_path: str = "") -> Any:
+def call(method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None) -> Any:
     for attempt in range(1, RETRIABLE_ATTEMPTS + 1):
         try:
-            return _call_once(method, args, config_path)
+            return _call_once(method, args, config_path, context)
         except RetriableCPIError as exc:
             if attempt == RETRIABLE_ATTEMPTS:
                 raise RuntimeError(str(exc)) from exc
@@ -529,14 +591,19 @@ class RetriableCPIError(RuntimeError):
     """A CPI error envelope with ok_to_retry=true."""
 
 
-def _call_once(method: str, args: list[Any], config_path: str = "") -> Any:
+def _send(
+    method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None
+) -> dict[str, Any]:
+    """Send one request to the CPI binary and return its parsed response envelope.
+
+    context is the extra request context for this call. None means the
+    harness's own (CPI_CONTEXT_FILE, or nothing), and a dict, even an empty
+    one, replaces it, which is how a call reaches the other cluster.
+    """
     req_id = f"{time.time_ns()}-{random.randint(0, 1 << 32)}"
-    req = {
-        "method": method,
-        "arguments": args,
-        "context": {"request_id": req_id},
-        "api_version": 2,
-    }
+    req = _lifecycle_foreign.build_request(
+        method, args, req_id, DEFAULT_CONTEXT if context is None else context
+    )
     if TRACE:
         print(f"  -> {json.dumps(req)}", file=sys.stderr)
 
@@ -560,6 +627,13 @@ def _call_once(method: str, args: list[Any], config_path: str = "") -> Any:
     resp = json.loads(proc.stdout)
     if TRACE:
         print(f"  <- {json.dumps(resp)}", file=sys.stderr)
+    return resp
+
+
+def _call_once(
+    method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None
+) -> Any:
+    resp = _send(method, args, config_path, context)
 
     if resp.get("error") is not None:
         print(f"call {method} failed:", file=sys.stderr)
@@ -575,6 +649,30 @@ def _call_once(method: str, args: list[Any], config_path: str = "") -> Any:
         raise RuntimeError(full_msg)
 
     return resp.get("result")
+
+
+def call_error(
+    method: str, args: list[Any], config_path: str = "", context: "dict[str, Any] | None" = None
+) -> dict[str, Any]:
+    """Send one request that must fail, and return its error body.
+
+    Unlike call, it makes a single attempt and does not retry an ok_to_retry
+    error, because the error itself is the answer under test. A request that
+    comes back with a result raises UnexpectedSuccess.
+    """
+    resp = _send(method, args, config_path, context)
+    err = resp.get("error")
+    if err is None:
+        raise _lifecycle_foreign.UnexpectedSuccess(
+            f"{method} returned a result ({json.dumps(resp.get('result'))[:200]})"
+        )
+    if not isinstance(err, dict):
+        raise RuntimeError(f"call {method}: error envelope is not an object: {json.dumps(err)[:200]}")
+    return {
+        "type": str(err.get("type", "")),
+        "message": str(err.get("message", "")),
+        "ok_to_retry": err.get("ok_to_retry") is True,
+    }
 
 
 # Temp CPI configs derived from CPI_CONFIG, removed once teardown is done.
@@ -1481,6 +1579,17 @@ def main() -> int:
         # Out-of-band PVE verifier (same host+auth as the CPI binary). A run
         # that cannot reach PVE to verify must not be able to report success.
         verifier = _pve_verify.PVEVerifier.from_config_file(CPI_CONFIG)
+        if DEFAULT_CONTEXT:
+            # A context file can point the run at another cluster, and the
+            # out-of-band checks must read the cluster the CPI is writing to.
+            verifier = _pve_verify.PVEVerifier(_lifecycle_foreign.verifier_config(_base_cfg, DEFAULT_CONTEXT))
+        foreign_verifier = None
+        if FOREIGN_VM_TEST == "on":
+            # Built before anything is created, so a context that cannot reach
+            # the second cluster fails the run before it touches either one.
+            foreign_verifier = _pve_verify.PVEVerifier(
+                _lifecycle_foreign.verifier_config(_base_cfg, FOREIGN_CONTEXT)
+            )
         placement = None
         if MULTI_STORAGE_PLACEMENT_TEST == "on":
             placement = PlacementVerification(CPI_CONFIG, CPI_BIN, env("STORAGE_PLACEMENT_REPORT", "tmp/storage-placement-lifecycle.json"))
@@ -1831,6 +1940,21 @@ def main() -> int:
         if call("has_vm", [state["vm_cid"]]) is not True:
             raise RuntimeError("has_vm returned false after hard reboot_vm")
         print("reboot_vm(hard)=ok")
+
+        if FOREIGN_VM_TEST == "on":
+            # Steps 14a-14c run while the VM is up and before step 15 deletes
+            # it, so every scenario reuses the VM the run already made through
+            # the az1 context instead of costing a second one and a second IP.
+            _lifecycle_foreign.ForeignVMPass(
+                vm_cid=state["vm_cid"],
+                az2_context=FOREIGN_CONTEXT,
+                guard=_lifecycle_foreign.effective_guard(_base_cfg, FOREIGN_CONTEXT),
+                az1=verifier,
+                az2=foreign_verifier,
+                call=lambda method, args, context: call(method, args, context=context),
+                call_error=lambda method, args, context: call_error(method, args, context=context),
+                step=step,
+            ).run()
 
         step("15. delete_vm")
         deleted_vm_cid = state["vm_cid"]

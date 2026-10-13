@@ -31,6 +31,7 @@ import tempfile
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -1958,6 +1959,168 @@ class TestPMXTransport(unittest.TestCase):
                 with self.assertRaises(PVEVerifyError):
                     PVEVerifier(_token_config())._get(path)
             run.assert_not_called()
+
+
+class TestThrowawayVMWrites(unittest.TestCase):
+    """The writes the lifecycle collision step makes for its own hand-made VM."""
+
+    @staticmethod
+    def _requests(urlopen: unittest.mock.MagicMock) -> list:
+        return [call.args[0] for call in urlopen.call_args_list]
+
+    def test_create_empty_vm_posts_a_tagless_vm_with_token_auth(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 return_value=_make_response({"data": "UPID:pve1:1"})) as urlopen:
+            upid = v.create_empty_vm("pve1", 4321, "lifecycle-handmade-4321")
+        self.assertEqual(upid, "UPID:pve1:1")
+        (req,) = self._requests(urlopen)
+        self.assertEqual(req.get_method(), "POST")
+        self.assertTrue(req.full_url.endswith("/api2/json/nodes/pve1/qemu"))
+        self.assertEqual(req.get_header("Authorization"), "PVEAPIToken=root@pam!mytoken=secret")
+        self.assertIsNone(req.get_header("Csrfpreventiontoken"))
+        fields = urllib.parse.parse_qs(req.data.decode("utf-8"))
+        self.assertEqual(fields["vmid"], ["4321"])
+        self.assertEqual(fields["name"], ["lifecycle-handmade-4321"])
+        # Nothing a BOSH CPI writes: no tags, no description, no disks.
+        for key in ("tags", "description", "scsi0", "virtio0", "net0"):
+            self.assertNotIn(key, fields)
+
+    def test_ticket_auth_write_sends_the_csrf_token(self) -> None:
+        v = PVEVerifier(_password_config())
+        ticket = _make_response({"data": {"ticket": "T", "CSRFPreventionToken": "C"}})
+        created = _make_response({"data": "UPID:pve1:2"})
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=[ticket, created]) as urlopen:
+            v.create_empty_vm("pve1", 4321, "n")
+        login, write = self._requests(urlopen)
+        self.assertTrue(login.full_url.endswith("/access/ticket"))
+        self.assertEqual(write.get_header("Csrfpreventiontoken"), "C")
+        self.assertEqual(write.get_header("Cookie"), "PVEAuthCookie=T")
+
+    def test_ticket_auth_read_sends_no_csrf_token(self) -> None:
+        v = PVEVerifier(_password_config())
+        ticket = _make_response({"data": {"ticket": "T", "CSRFPreventionToken": "C"}})
+        listing = _make_response({"data": []})
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=[ticket, listing]) as urlopen:
+            v._get("/nodes")
+        self.assertIsNone(self._requests(urlopen)[1].get_header("Csrfpreventiontoken"))
+
+    def test_destroy_vm_deletes_with_purge(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 return_value=_make_response({"data": "UPID:pve1:3"})) as urlopen:
+            self.assertEqual(v.destroy_vm("pve1", "4321"), "UPID:pve1:3")
+        (req,) = self._requests(urlopen)
+        self.assertEqual(req.get_method(), "DELETE")
+        self.assertTrue(req.full_url.endswith("/nodes/pve1/qemu/4321?purge=1&destroy-unreferenced-disks=1"))
+        self.assertIsNone(req.data)
+
+    def test_writes_refuse_a_missing_node_and_an_empty_task(self) -> None:
+        v = PVEVerifier(_token_config())
+        with self.assertRaises(PVEVerifyError):
+            v.create_empty_vm("", 4321, "n")
+        with self.assertRaises(PVEVerifyError):
+            v.destroy_vm("", 4321)
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": None})):
+            with self.assertRaises(PVEVerifyError):
+                v.create_empty_vm("pve1", 4321, "n")
+            with self.assertRaises(PVEVerifyError):
+                v.destroy_vm("pve1", 4321)
+
+    def test_writes_refuse_the_pmx_transport(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT": "pmx"}):
+            v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen") as urlopen:
+            with self.assertRaises(PVEVerifyError):
+                v.create_empty_vm("pve1", 4321, "n")
+        urlopen.assert_not_called()
+
+    def test_a_failed_write_names_the_method(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=_make_http_error(403, "Forbidden")):
+            with self.assertRaisesRegex(PVEVerifyError, "POST /nodes/pve1/qemu failed: HTTP 403"):
+                v.create_empty_vm("pve1", 4321, "n")
+
+    def test_await_task_succeeds_when_the_task_stops_ok(self) -> None:
+        v = PVEVerifier(_token_config())
+        answers = [{"status": "running"}, {"status": "stopped", "exitstatus": "OK"}]
+        slept: list[float] = []
+        with unittest.mock.patch.object(v, "_get", side_effect=answers) as get, \
+                unittest.mock.patch("time.sleep", side_effect=slept.append):
+            v.await_task("pve1", "UPID:pve1:1:x", timeout=30, poll=0.5)
+        self.assertEqual(slept, [0.5])
+        self.assertEqual(get.call_args.args[0], "/nodes/pve1/tasks/UPID%3Apve1%3A1%3Ax/status")
+
+    def test_await_task_raises_on_a_failed_or_stuck_task(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch.object(v, "_get", return_value={"status": "stopped", "exitstatus": "boom"}):
+            with self.assertRaisesRegex(PVEVerifyError, "boom"):
+                v.await_task("pve1", "UPID:x")
+        with unittest.mock.patch.object(v, "_get", return_value={"status": "running"}), \
+                unittest.mock.patch("time.sleep"), \
+                unittest.mock.patch("time.monotonic", side_effect=[0.0, 5.0]):
+            with self.assertRaisesRegex(PVEVerifyError, "still running"):
+                v.await_task("pve1", "UPID:x", timeout=1)
+        with unittest.mock.patch.object(v, "_get", return_value="oops"):
+            with self.assertRaises(PVEVerifyError):
+                v.await_task("pve1", "UPID:x")
+
+
+class TestVMIDInUse(unittest.TestCase):
+    """vmid_in_use proves a VMID absent from live node listings, not only the lagging index."""
+
+    def _verifier_with(self, pages: dict) -> PVEVerifier:
+        v = PVEVerifier(_token_config())
+
+        def fake_get(path: str):
+            if path not in pages:
+                raise AssertionError(f"unexpected GET {path}")
+            return pages[path]
+
+        patcher = unittest.mock.patch.object(v, "_get", side_effect=fake_get)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return v
+
+    def _pages(self, **overrides) -> dict:
+        pages = {
+            "/cluster/resources?type=vm": [],
+            "/nodes": [{"node": "pve1", "status": "online"}, {"node": "pve2", "status": "online"}],
+            "/nodes/pve1/qemu": [],
+            "/nodes/pve1/lxc": [],
+            "/nodes/pve2/qemu": [],
+            "/nodes/pve2/lxc": [],
+        }
+        pages.update(overrides)
+        return pages
+
+    def test_absent_everywhere_is_false(self) -> None:
+        self.assertFalse(self._verifier_with(self._pages()).vmid_in_use(4321))
+
+    def test_index_hit_is_true(self) -> None:
+        pages = self._pages(**{"/cluster/resources?type=vm": [{"vmid": 4321, "type": "lxc"}]})
+        self.assertTrue(self._verifier_with(pages).vmid_in_use("4321"))
+
+    def test_live_node_listing_hit_is_true_when_the_index_lags(self) -> None:
+        pages = self._pages(**{"/nodes/pve2/qemu": [{"vmid": 4321}]})
+        self.assertTrue(self._verifier_with(pages).vmid_in_use(4321))
+
+    def test_container_on_a_node_is_true(self) -> None:
+        pages = self._pages(**{"/nodes/pve1/lxc": [{"vmid": "4321"}]})
+        self.assertTrue(self._verifier_with(pages).vmid_in_use(4321))
+
+    def test_stamped_cid_reads_its_vmid(self) -> None:
+        pages = self._pages(**{"/nodes/pve1/qemu": [{"vmid": 4321}]})
+        self.assertTrue(self._verifier_with(pages).vmid_in_use("4321-0a1b2c3d-4e5f6a7b"))
+
+    def test_an_offline_node_leaves_absence_unproven(self) -> None:
+        pages = self._pages(**{"/nodes": [{"node": "pve1", "status": "online"}, {"node": "pve2", "status": "offline"}]})
+        with self.assertRaisesRegex(PVEVerifyError, "pve2 is offline"):
+            self._verifier_with(pages).vmid_in_use(4321)
+
+    def test_no_nodes_leaves_absence_unproven(self) -> None:
+        with self.assertRaises(PVEVerifyError):
+            self._verifier_with(self._pages(**{"/nodes": []})).vmid_in_use(4321)
 
 
 if __name__ == "__main__":

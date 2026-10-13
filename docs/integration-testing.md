@@ -317,8 +317,26 @@ Verified steps: `create_network` → vnet+subnet (SDN) or bridge present; `creat
 | `PARKER_RANGE_END` | from `CPI_CONFIG` | Last parker VMID, under the same restriction |
 | `PARKER_PREFIX` | from `CPI_CONFIG` | Names parker VMs and, through `{prefix}`, their pool. Applied to every derived config, so a non-default value reaches every step of the pass, not just the ones reading `CPI_CONFIG` directly |
 | `PARKER_POOL` | from `CPI_CONFIG` | The pool parker VMs join, under the same restriction as `PARKER_PREFIX` |
+| `CPI_CONTEXT_FILE` | *(unset)* | Path to a JSON object the script sends as the request context on every call, the way a Director with a `cpi_config` entry does. It may hold `director_uuid`, a nested `pve` map, and a nested `agent` map. Unset, the script sends exactly the requests it always has |
+| `FOREIGN_VM_TEST` | `off` | `on` \| `off`. Run the repoint scenarios (steps 14a through 14c) after the base pass. Needs `FOREIGN_CONTEXT_FILE` |
+| `FOREIGN_CONTEXT_FILE` | *(unset)* | Path to a context file, in the same shape as `CPI_CONTEXT_FILE`, that points at a second PVE endpoint (a different cluster or standalone host) the CPI credentials can reach. Read only when `FOREIGN_VM_TEST` is `on` |
 
 When invoked via `./scripts/test integration lifecycle`, `NETWORK_TEST_MODE` is set per pass from `tier1.network_test.modes`; the `SDN_*`/`BRIDGE_TEST_IFACE` values come from `tier1.network_test`, and the `PARKED_*`/`PARKER_*` values from `tier1.parked_disk`. The parker band belongs in the CPI config rather than here: the pass reads it from there and refuses a `PARKER_RANGE_*` that disagrees, because looking for parkers outside the band the CPI parks into would read a real parker as an ordinary VM.
+
+
+#### Repoint scenarios
+
+A Director can repoint a deployment at a different cluster by changing the `cpi_config` entry its VMs are managed through. After that, the CPI receives VM CIDs whose VMID either does not exist on the new cluster or belongs to an unrelated VM there. `FOREIGN_VM_TEST=on` runs three steps that send the base pass's VM CID to a second endpoint and check that the CPI refuses to answer for a VM it does not own. We run them with a `FOREIGN_CONTEXT_FILE` that names a second endpoint, and they are off by default because they need two clusters.
+
+Step 14a sends the CID to the second endpoint while its VMID is absent there. The stamped CID must get a `has_vm` answer of `false` and a non-retriable `CloudError` from `delete_vm` that names a cluster mismatch, so the Director keeps its record of the VM. The step then sends the bare VMID and expects the answers the CPI has always given for a CID it cannot attribute, which are `false` from `has_vm` and success from `delete_vm`. Before and after, the step checks that the original VM on the first endpoint is unchanged.
+
+Step 14b creates an empty, untagged VM on the second endpoint under the same VMID, through the same PVE API path the verifier already uses. It then sends the CID to each of `has_vm`, `get_disks`, `delete_vm`, `reboot_vm`, and `set_vm_metadata`, and expects a refusal that names a reason the CID can produce. Under `vm_ownership_guard: warn`, only `has_vm` and `get_disks` are relaxed, and the step expects that. The step checks the hand-made VM is unchanged before it removes it, and it removes only a VM it created in the same run, identified by VMID and name. If the VMID is already in use on the second endpoint, or the VM is not as the step left it, the step stops and leaves the VM in place.
+
+Step 14c sends the CID back to the first endpoint with its token replaced by a different one. The CPI must answer `has_vm` with `false` and fail `delete_vm` with `VMNotFound`, and the VM must be unchanged.
+
+A stamped CID gives the strongest checks. With a bare CID, or one whose cluster stamp is unknown (`00000000`), the steps that depend on the stamp are skipped with a note and the collision step expects a `not-bosh` or `cluster-mismatch` refusal instead. Two clusters that share a root CA also share a cluster stamp, so step 14a cannot tell them apart and reports that as a likely cause when its assertion fails.
+
+We prove the scenarios offline with `python3 scripts/_lifecycle_test.py`, which runs `scripts/lifecycle` against a fake CPI binary and the foreign VM pass against in-memory clusters.
 
 ---
 
