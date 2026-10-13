@@ -954,11 +954,13 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         # use-compiled-releases.yml (that targets a different stemcell version).
         # Layered after use-haproxy.yml so the compiled haproxy pin wins.
         "-o", str(cfd / "operations/use-haproxy.yml"),
-        # CF system database (CF_DATABASE): postgres (default) drops pxc/Galera
-        # for one internal postgres node; layered before the release-sourcing
-        # and resize ops that reference the database instance group.
-        *_cf_db_ops(),
-        *_cf_release_ops(),
+        # CF system database (CF_DATABASE) and release sourcing, in the order
+        # _cf_db_and_release_ops() documents. The postgres database ops remove
+        # the pxc release, so cf-deployment's stock use-compiled-releases.yml
+        # fallback must come before them or it fails on the missing pxc item,
+        # while the generated compiled-releases.yml must come after them. Both
+        # are layered before the resize ops that reference the database group.
+        *_cf_db_and_release_ops(),
         # cf-deployment stock ops file: removes policy-server-asg-syncer
         # from the api instance group. The job had been flapping every
         # ~90s (HTTP retries against CC during ccdb churn) which made
@@ -991,6 +993,10 @@ def cmd_bosh_deploy(extra: list[str]) -> None:
         *_env_vars_layer(),
         *extra,
     ]
+
+    # Preflight: a manifest that does not evaluate fails the same way on every
+    # attempt, so we check it once, offline, before the retry loop starts.
+    _preflight_manifest(deploy_cmd)
 
     # Retry loop. Director<->agent "unresponsive agent" / get_state timeouts
     # (see manifests/bosh/nats-tuning.yml header) typically self-resolve within
@@ -1491,13 +1497,80 @@ def cmd_precompile_releases(_extra: list[str]) -> None:
         print(f"    wrote {COMPILED_OPS_CF.relative_to(REPO_ROOT)} (director-cache marker)")
 
 
-def _cf_release_ops() -> list[str]:
-    """Return the -o ops controlling CF release sourcing, per precompile state.
+def _cf_db_and_release_ops() -> list[str]:
+    """Return the database and release-sourcing ops in the order they must layer.
+
+    The two sets interact, so the order depends on the sourcing mode.
+      stock fallback → use-compiled-releases.yml first, then the database ops.
+                       The stock file pins every release in cf-deployment,
+                       including pxc, so the postgres ops (which remove pxc)
+                       must run after it or the pin fails on the missing item.
+      store-ops      → the database ops first, then compiled-releases.yml. That
+                       file is generated from the release set with the database
+                       ops already applied, so it must come last.
+      director-cache → the database ops only.
+    """
+    before, after = _cf_release_ops()
+    return [*before, *_cf_db_ops(), *after]
+
+
+_PREFLIGHT_VALUE_FLAGS = ("-o", "--ops-file", "-v", "--var", "-l", "--vars-file", "--var-file")
+
+
+def _manifest_eval_args(deploy_cmd: list[str]) -> list[str]:
+    """Pick the manifest and the evaluation inputs out of a `bosh deploy` command.
+
+    Everything after the `deploy` word is scanned. The manifest path is the
+    first positional argument, and only the ops, variable, and vars-file flags
+    are kept, in both the `-o x` and `-o=x` spellings. Deploy-only flags such as
+    --recreate, --fix, and --skip-drain are dropped because `bosh int` rejects them.
+    """
+    args = deploy_cmd[deploy_cmd.index("deploy") + 1:]
+    keep: list[str] = []
+    manifest = ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _PREFLIGHT_VALUE_FLAGS:
+            keep.extend(args[i:i + 2])
+            i += 2
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _PREFLIGHT_VALUE_FLAGS):
+            keep.append(arg)
+        elif not manifest and not arg.startswith("-"):
+            manifest = arg
+        i += 1
+    return [manifest, *keep]
+
+
+def _preflight_manifest(deploy_cmd: list[str]) -> None:
+    """Exit with the evaluation error when the deploy manifest does not resolve.
+
+    `bosh int` evaluates offline and never contacts the Director. We leave out
+    --var-errs because the Director supplies some variables at deploy time.
+    """
+    argv = ["bosh", "int", *_manifest_eval_args(deploy_cmd)]
+    res = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        sys.exit(
+            "cf deploy: the manifest and its ops files do not evaluate, so we are not "
+            "retrying (the same error would repeat on every attempt).\n" + detail
+        )
+    print("    manifest preflight: cf-deployment.yml and its ops files evaluate")
+
+
+def _cf_release_ops() -> "tuple[list[str], list[str]]":
+    """Return the -o ops controlling CF release sourcing as (before_db, after_db).
+
+    The first list layers before the database ops and the second after them;
+    _cf_db_and_release_ops() joins them in that order.
 
     Replaces the hardcoded use-compiled-releases.yml (pinned to a different
     stemcell version): the precompiled-for-this-stemcell set is authoritative.
-      store-ops      → layer manifests/cf/compiled-releases.yml.
-      director-cache → [] (use-compiled-releases.yml dropped; reuse the cache).
+      store-ops      → ([], manifests/cf/compiled-releases.yml), after the
+                       database ops because it is generated with them applied.
+      director-cache → ([], []) (use-compiled-releases.yml dropped; reuse the cache).
       absent/mismatch → behaviour controlled by CF_REQUIRE_PRECOMPILE:
                         default ("1"/unset) fails fast with guidance (no silent
                         fallback to a version-mismatched compiled set or a
@@ -1505,17 +1578,18 @@ def _cf_release_ops() -> list[str]:
                         cf-deployment's operations/use-compiled-releases.yml
                         (which targets a different stemcell version — BOSH then
                         compiles whatever does not match, so the deploy can be
-                        slow, but it does not hard-stop).
+                        slow, but it does not hard-stop). That stock file pins
+                        pxc, so it goes before the database ops.
     """
     want = "{}/{}".format(*stemcell_os_version())
     text = COMPILED_OPS_CF.read_text() if COMPILED_OPS_CF.exists() else ""
     state = _cfcompile.precompile_state(text, want)
     if state == _cfcompile.STORE_OPS_MODE:
         print(f"    using precompiled CF releases ({want}) from {COMPILED_OPS_CF.name}")
-        return ["-o", str(COMPILED_OPS_CF)]
+        return [], ["-o", str(COMPILED_OPS_CF)]
     if state == _cfcompile.CACHE_MODE:
         print(f"    using Director compiled-package cache ({want}); use-compiled-releases.yml dropped")
-        return []
+        return [], []
     require = os.environ.get("CF_REQUIRE_PRECOMPILE", "1").strip().lower() not in ("0", "false", "no")
     if require:
         sys.exit(
@@ -1529,7 +1603,7 @@ def _cf_release_ops() -> list[str]:
         f"    CF_REQUIRE_PRECOMPILE=0: precompile {state} for {want}; "
         f"falling back to {ucr.name} (targets a different stemcell — BOSH may recompile mismatches)"
     )
-    return ["-o", str(ucr)]
+    return ["-o", str(ucr)], []
 
 
 def cmd_deploy(extra: list[str]) -> None:
