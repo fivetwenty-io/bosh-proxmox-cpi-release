@@ -125,6 +125,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ### Fixed
 
+- `scripts/bosh ucc` now binds the Director cloud-config's `z1` to `pve-az1` when a cpi-config is active, through the new `manifests/bosh/multi-cpi-azs.yml`, so deploys like `scripts/bosh emptyvm` no longer fail with "AZ 'z1' must specify a CPI when CPI config is defined". The `update-cpi-config` command now reminds us to re-apply the cloud-config after it applies the cpi-config.
+
 - The two-entry `manifests/cpi-config.yml` and the spanning certification now take the second cluster's credentials from its own variables, `pve_az2_user`, `pve_az2_password`, and `pve_az2_api_token`, instead of reusing the first cluster's. The `pve-az1` entry keeps the base `pve_user`, `pve_password`, and `pve_api_token`, so single-cluster setups need no change, and `manifests/bosh/vars.yml.example` lists the three new variables. Anyone who applies `manifests/cpi-config.yml` must now set `pve_az2_user` and either `pve_az2_password` or `pve_az2_api_token`, because `update-cpi-config` and the spanning preflight fail and name the missing variables until they do.
 
 - A request for one `cpi_config` entry no longer depends on the job-level cluster. Before, the CPI probed the job cluster's pools and storage before it read the request, so a down job cluster slowed every call, and a revoked job credential failed every call, including `info` and calls for healthy clusters. `info` now touches no PVE API at all.

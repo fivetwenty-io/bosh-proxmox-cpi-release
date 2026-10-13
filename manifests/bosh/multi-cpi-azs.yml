@@ -1,0 +1,15 @@
+# ============================================================================
+# Ops layer: bind the Director cloud-config's AZ to a named cpi-config entry.
+#
+# `scripts/bosh ucc` layers this file onto manifests/bosh/cloud-config.yml only
+# when the Director has an active cpi-config (`scripts/bosh update-cpi-config`).
+# Once a cpi-config exists, every AZ must name a CPI, or each deploy fails with
+# "AZ 'z1' must specify a CPI when CPI config is defined".
+#
+# Binding: the Director cloud-config has a single AZ, z1, and we bind it to the
+# first shipped entry in manifests/cpi-config.yml, pve-az1. The CF cloud-config
+# has its own layer in manifests/cf/multi-cpi-azs.yml.
+# ============================================================================
+- type: replace
+  path: /azs/name=z1/cpi?
+  value: pve-az1

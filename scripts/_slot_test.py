@@ -2014,6 +2014,7 @@ class CloudConfigRenderTest(unittest.TestCase):
         captured: list[list[str]] = []
         mod.run = lambda *argv, **_kw: captured.append(list(argv)) or 0
         mod.director_env = lambda: {}
+        mod.multi_cpi_azs_ops = lambda: []
         mod.VARS = self.vars
         with mock.patch.dict(os.environ, {"BOSH_PVE_ENV": "cpitest"}):
             self.assertEqual(mod.cmd_ucc([]), 0)

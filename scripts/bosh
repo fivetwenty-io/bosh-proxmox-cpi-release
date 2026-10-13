@@ -16,8 +16,11 @@ Subcommands:
                            upload manifests/bosh/cloud-config.yml
     runtime-config         upload manifests/runtime-configs/pve-guest-agent.yml
                            (named runtime-config "pve-guest-agent")
-    upload-stemcell        upload $STEMCELL_PATH to the director (needed before
-                           emptyvm; idempotent for an already-present version)
+    upload-stemcell        build and register the light stemcell from vars.yml
+                           stemcell_url with --fix (needed before emptyvm;
+                           idempotent). STEMCELL_PATH is no longer read. A heavy
+                           tarball goes through the passthrough:
+                           scripts/bosh -n upload-stemcell <tarball>
     update-cpi-config      apply manifests/cpi-config.yml (one named type: pve
                            entry per PVE cluster; docs/multi-cluster.md), then
                            re-register the active light stemcell against every
@@ -310,6 +313,26 @@ def bosh_int(path: Path, json_path: str) -> str:
 
 def run(*cmd: str, env: dict[str, str] | None = None) -> int:
     return subprocess.run(list(cmd), env=env, cwd=REPO_ROOT).returncode
+
+
+def multi_cpi_azs_ops() -> list[str]:
+    """Return -o for the AZ to CPI binding layer when a cpi-config is active.
+
+    Once the Director has a cpi-config, every cloud-config AZ must name a CPI.
+    We layer manifests/bosh/multi-cpi-azs.yml only when `bosh cpi-config`
+    reports a config with `cpis`, because naming an entry the Director does not
+    have fails the cloud-config update. Any error reading it means no
+    cpi-config.
+    """
+    res = subprocess.run(
+        ["bosh", "-e", BOSH_ALIAS, "cpi-config"],
+        cwd=REPO_ROOT, env=director_env(), capture_output=True, text=True,
+    )
+    if res.returncode != 0 or "cpis" not in res.stdout:
+        return []
+    layer = BOSH_DIR / "multi-cpi-azs.yml"
+    print("ucc: cpi-config active, layering AZ to CPI binding (multi-cpi-azs.yml)")
+    return ["-o", str(layer)]
 
 
 def internal_ip() -> str:
@@ -758,6 +781,7 @@ def cmd_ucc(args: list[str]) -> int:
         str(CLOUD_CONFIG),
         *env_network_ops(),
         *env_cc_reserved_ops(),
+        *multi_cpi_azs_ops(),
         "-l", str(VARS),
         *env_vars_layer(),
         *SLOT.vars_layer(),
@@ -866,6 +890,10 @@ def cmd_update_cpi_config(args: list[str]) -> int:
     )
     if rc != 0:
         return rc
+    print(
+        "update-cpi-config: re-apply the cloud-config so its AZs name a CPI entry "
+        "(scripts/bosh ucc, or scripts/cf cloud-config for a CF cloud-config)"
+    )
     # A stemcell upload binds to a specific cpi-config entry; entries added
     # after the upload have no registration and no per-cluster cache template.
     # upload-stemcell already passes --fix, which re-registers the same light
