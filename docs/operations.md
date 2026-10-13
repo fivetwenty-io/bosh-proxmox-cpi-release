@@ -601,6 +601,32 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ---
 
+## Applying or changing a cpi-config on a live Director
+
+A cpi-config gives a Director several named CPI entries, and each entry reaches one cluster or host. Once it is active, the Director refuses every deploy against a cloud-config whose AZs don't name an entry. We apply a new or changed cpi-config in this order, and [Multi-Cluster Deployments](multi-cluster.md#applying-a-cpi-config-on-a-live-director) explains the model behind it.
+
+We never change the `host` or the `node` of an entry that serves live instances, and we never repoint a live AZ at another entry. For a move to another cluster we add a new entry and bind a new AZ to it. [What we see if an entry is repointed anyway](multi-cluster.md#what-we-see-if-an-entry-is-repointed-anyway) shows the failure we'd get otherwise.
+
+1. Set each entry's credential group in the vars that `manifests/cpi-config.yml` reads.
+   In the shipped file, `pve-az1` reads `pve_user`, `pve_password`, and `pve_api_token`, and `pve-az2` reads `pve_az2_user`, `pve_az2_password`, and `pve_az2_api_token`. A group is either an API token or a user with a password, and we never complete one entry's group with another entry's user, password, or token.
+
+2. Run `scripts/bosh update-cpi-config`.
+   We should see the Director accept the cpi-config, a reminder to re-apply the cloud-config, and then a light stemcell upload with `--fix`, which registers the stemcell with every entry and builds each cluster's cache template.
+
+3. Re-apply the cloud-config with `scripts/bosh ucc`, or with `scripts/cf cloud-config` for CF.
+   We should see a line saying that the cpi-config is active and that the AZ-to-CPI binding is layered. If a deploy fails before this step with "AZ 'z1' must specify a CPI when CPI config is defined", [the troubleshooting entry](troubleshooting.md#the-director-rejects-a-deploy-with-must-specify-a-cpi) covers it.
+
+4. Run `bosh cpi-config`.
+   We should see every entry we expect, under the names the cloud-config uses.
+
+5. Run `bosh stemcells`.
+   We should see the stemcell registered once for each entry, shown as separate rows with each entry's name in the CPI column. A heavy stemcell needs `scripts/bosh -n upload-stemcell <tarball>`, because the wrapper's own `upload-stemcell` builds only the light one. [Light and heavy uploads through the wrapper](multi-cluster.md#light-and-heavy-uploads-through-the-wrapper) covers what that does to the shared export.
+
+6. Run a deploy that uses an AZ on each entry, or `bosh -d <deployment> instances`.
+   We should see each VM come up in the cluster that its AZ's entry reaches.
+
+We know the change worked when the cloud-config update and the deploy both pass, `bosh stemcells` lists every entry, and each entry has its own cache template on its own cluster. When `bosh clean-up --all` later fails on the stemcell rows, [the troubleshooting entry](troubleshooting.md#the-first-bosh-clean-up---all-fails-on-stemcell-rows) says to run it again.
+
 ## Stemcell lifecycle across directors
 
 When two or more BOSH directors share one PVE cluster — a management director and one or more environment directors, or several environment directors side by side — they can all depend on the same stemcell. This section covers what happens to a stemcell's cache template and backing qcow2 file as each director independently uploads and cleans it up. See [Design Decisions, D3](design-decisions.md#d3-stemcell-refcounting-per-director-reference-sets) for the reference-tracking design behind this.
@@ -713,7 +739,7 @@ Setting `bare` before the first upgrade to a stamping release skips steps 2 thro
 
 Each cache template records the set of director UUIDs currently depending on it. Running `bosh clean-up` (or `bosh clean-up --all`) on one director only removes *that* director's own reference — it never touches another director's reference to the same template, even though both directors may be looking at the same PVE cluster. The cache template, and for a CPI-uploaded (`:heavy:`) stemcell its qcow2 file, survive until the last director referencing them releases its reference. An operator-managed (`:light:`) qcow2 is never removed by the CPI regardless of reference count.
 
-Practically: cleaning up one director's unused stemcells is always safe to run on its own schedule, independent of what any other director sharing the cluster is doing.
+In practice, cleaning up one director's unused stemcells is always safe to run on its own schedule, independent of what any other director sharing the cluster is doing. On a Director with several cpi-config entries, the first `bosh clean-up --all` can still fail on the stemcell rows because of a Director-side race, and a rerun succeeds. See [The first bosh clean-up --all fails on stemcell rows](troubleshooting.md#the-first-bosh-clean-up---all-fails-on-stemcell-rows).
 
 ### `bosh-destroy-pending` retry semantics
 

@@ -157,7 +157,7 @@ One gap remains on the IPv4 side. The `deploys multiple manual networks` example
 
 ## Second cpi-config entry
 
-When the Director has more than one `cpi_config` entry, one `bats:` block only proves the entry named by `bats.cpi_id`. Adding a `bats.secondary` block makes the run repeat the IPv4 pass through a second entry, `pve-az2` by default, using the network values in that block. That shows each entry works on its own. The proof that one deployment spans both entries belongs to the certification run.
+When the Director has more than one `cpi_config` entry, one `bats:` block only proves the entry named by `bats.cpi_id`. Adding a `bats.secondary` block makes the run repeat the IPv4 pass through a second entry, `pve-az2` by default, using the network values in that block. That shows each entry works on its own. The proof that one deployment spans both entries belongs to the certification run, which [Spanning two clusters](upgrade.md#spanning-two-clusters) describes.
 
 To run it, we uncomment the `secondary:` block in `ci/integration.yml` (the example file shows the shape, with values for the `lab-pve-cpi-az2` cluster), fill in its network keys, and run `./scripts/bats run` as usual. The harness renders a second spec, `bat-secondary.yml`, next to `bat.yml`, runs the same tag selection against it, and writes `junit-secondary.xml` beside `junit.xml`. The run report lists the second pass with its `cpi_id` and network, or says why it did not run, so a reader can tell a one-entry run from a two-entry run. The report merges both files, so one example count covers both passes, and a failure in either pass fails the run. Each pass gets the full `rspec_timeout_s` budget.
 

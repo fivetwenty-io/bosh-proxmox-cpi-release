@@ -41,7 +41,7 @@ cpis:
     pve:
       host: pve-az1.example.com
       user: bosh@pve
-      api_token: ((pve_az1_api_token))
+      api_token: ((pve_api_token))
       node: pve-az1-n1
       vm_storage: data
       disk_storage: data
@@ -82,6 +82,8 @@ cpis:
 
 Each entry names its own `host`, and the first entry does so even though its cluster is the same one the job-level configuration points at. A request with no `pve_*` context keys resolves to the job-level configuration unchanged, so an entry that carries no `host` is indistinguishable from a Director with no cpi-config at all.
 
+The example is a trimmed illustration. The credential variable names in it match the shipped `manifests/cpi-config.yml`, where each entry carries a whole credential group of its own, which is either an API token or a user with a password. We never complete one entry's group with another entry's user, password, or token.
+
 Apply it the same way as any other cpi-config:
 
 ```bash
@@ -89,6 +91,27 @@ bosh update-cpi-config cpi-config.yml
 ```
 
 The repository ships a parameterized version of this manifest at `manifests/cpi-config.yml`. We apply it with `scripts/bosh update-cpi-config`, which layers the active env's vars (`BOSH_PVE_ENV`) and then re-registers the active light stemcell against every entry with `--fix`. An AZ binding of this shape ships as the ops layer `manifests/cf/multi-cpi-azs.yml`, which `scripts/cf cloud-config` applies automatically whenever the Director reports an active cpi-config. That layer binds three AZs against the two shipped entries, with `z1` and `z2` on `pve-az1` and `z3` on `pve-az2`, so the CF deployment keeps three AZs while the second cluster carries one of them. `scripts/bosh ucc` does the same job for the Director cloud-config, binding `z1` to `pve-az1` through `manifests/bosh/multi-cpi-azs.yml`. The `pve-az1` entry reads the base credential variables `pve_user`, `pve_password`, and `pve_api_token`, and the `pve-az2` entry reads its own `pve_az2_user`, `pve_az2_password`, and `pve_az2_api_token`, so we set those three in `manifests/bosh/vars.yml` or the env's vars before we apply the manifest. The second entry needs an API token, or a user together with a password.
+
+### Applying a cpi-config on a live Director
+
+Once a Director has an active cpi-config, it rejects every deploy against a cloud-config whose AZs do not name a CPI. The error reads like this.
+
+> `AZ 'z1' must specify a CPI when CPI config is defined`
+
+That is why the order matters, and why the cpi-config goes in before the cloud-config is re-applied. We follow these steps.
+
+1. Set the credential group for each entry in the vars the manifest reads, as described above.
+
+2. Run `scripts/bosh update-cpi-config`.
+   We should see the Director accept the cpi-config, then a reminder that we need to re-apply the cloud-config, then the light stemcell upload with `--fix` described in [Stemcell registration across CPI entries](#stemcell-registration-across-cpi-entries).
+
+3. Re-apply the cloud-config. For the Director's own cloud-config we run `scripts/bosh ucc`, and for CF we run `scripts/cf cloud-config`.
+   Both scripts ask the Director for its cpi-config and, when one is active, layer the AZ binding for us. We should see a line saying that the cpi-config is active and that the binding layer is being applied. The binding layers are covered in [AZ-to-CPI binding in cloud-config](#az-to-cpi-binding-in-cloud-config).
+
+4. Run `bosh stemcells` and `bosh cpi-config`.
+   We should see the light stemcell registered and the cpi-config listing every entry.
+
+We know it worked when a deploy no longer fails with the "must specify a CPI" error and each entry has its own cache template on its cluster. If the error still appears, an AZ in the cloud-config is missing its `cpi:` key, and we add it before we deploy again.
 
 The two entries above share `stemcell_storage: nfs-shared`, a shared NFS export that both clusters can reach, while every VMID band is disjoint between the two entries. That combination is the multi-cluster safety pattern this document exists to explain, and we cover it in [Disjoint VMID banding](#disjoint-vmid-banding-the-multi-cluster-safety-pattern) below.
 
@@ -185,9 +208,45 @@ The reason is that a legacy bare CID, which is a bare VMID, carries no cluster i
 
 Stamped CIDs, which are the default for VMs created by this release, name their cluster and catch most of these cases, but they are a backstop and never a license to repoint. The protection is absent for a VM created before the upgrade or under `pve.vm_cid_format: bare`, for two clusters that share a root CA and therefore a stamp, and for a CID stamped `00000000` because the identity read failed at create. [Known Limitations](limitations.md#vm-ownership) lists each case, and [Which cluster does a VM CID name?](operations.md#which-cluster-does-a-vm-cid-name) shows how to read a stamp.
 
+#### What we see if an entry is repointed anyway
+
+We tested this on purpose in a throwaway deployment, and it confirms the rule above instead of relaxing it. We edited the `pve-az1` entry to point at the second cluster while a VM with a stamped CID was running on the first one. Here is what an operator sees.
+
+- The repoint must move the whole credential group
+  The entry has to change its credentials together with `host` and `node`, because a token from the first cluster fails authentication against the second before any VM call is made.
+
+- `bosh cck` finds nothing to resolve
+  The agent on the VM stays responsive, so the Director never asks the CPI anything. Cloud-check offers "Delete VM reference" only when the agent is unresponsive.
+
+- `bosh recreate` stops the jobs and then fails at `delete_vm`
+  The CPI refuses once without retrying. The message begins like this and goes on to name the escapes.
+
+  > `delete_vm: refusing to answer for CID <cid>, because VM <vmid> does not exist on this cluster and the CID names another cluster (cluster-mismatch): the CID names cluster <old stamp>, this cluster's stamp is <new stamp>, and no cluster_stamp_aliases entry lists <old stamp>.`
+
+- Nothing changes on the original cluster
+  The VM's configuration is untouched and the VM keeps running.
+
+To recover, we follow these steps.
+
+1. Restore the cpi-config entry to its previous `host`, `node`, and credential group, and apply it with `scripts/bosh update-cpi-config`.
+   We should see the Director accept the update, and the refusals should stop.
+
+2. Run `bosh start` or `bosh recreate` for the affected instance.
+   The instance's jobs stay stopped until one of these runs, because the failed recreate had already stopped them. We should see the instance return to the running state.
+
+We confirm success with `bosh instances`, which should show the instance running, and by checking that the VM still exists on its original cluster. [Troubleshooting](troubleshooting.md) covers the refusal text in more detail.
+
 ## AZ-to-CPI binding in cloud-config
 
-BOSH's `azs[].cpi` field binds an availability zone to a named cpi-config entry. The AZ's `cloud_properties` can carry `availability_zone` too, which is where that property belongs when `az_map` spreads VMs inside the AZ.
+BOSH's `azs[].cpi` field binds an availability zone to a named cpi-config entry. The repository ships two binding layers, and the wrapper scripts apply them for us. Each script asks the Director for its cpi-config, and it layers the binding only when one is active, because naming an entry the Director does not have would fail the cloud-config update.
+
+- `scripts/bosh ucc`
+  This layers `manifests/bosh/multi-cpi-azs.yml` onto the Director cloud-config, which binds its single AZ, `z1`, to `pve-az1`.
+
+- `scripts/cf cloud-config`
+  This layers `manifests/cf/multi-cpi-azs.yml` onto the CF cloud-config, which binds `z1` and `z2` to `pve-az1` and `z3` to `pve-az2`.
+
+Without an active cpi-config the scripts apply the cloud-config unchanged. If we run the BOSH CLI directly instead of the scripts, we pass the matching layer with `-o` ourselves. The AZ's `cloud_properties` can carry `availability_zone` too, which is where that property belongs when `az_map` spreads VMs inside the AZ.
 
 ```yaml
 azs:
@@ -203,7 +262,7 @@ Every operation BOSH performs against an instance in a given AZ, including creat
 
 ## Stemcell registration across CPI entries
 
-A stemcell upload binds to a specific cpi-config entry, so uploading it once does **not** automatically register it against every entry. We upload normally against the first entry and then re-register the same content against each additional entry with `--fix`:
+A stemcell upload binds to a specific cpi-config entry, so uploading it once does **not** automatically register it against every entry. We upload normally against the first entry and then re-register the same content against each additional entry with `--fix`. The wrapper does this for us. `scripts/bosh update-cpi-config` follows the apply with `upload-stemcell --fix`, which registers the light stemcell with every entry and builds each cluster's cache template. The raw commands behind that look like this:
 
 ```bash
 bosh -e <alias> upload-stemcell <stemcell>.tgz          # registers against the first-seen entry
@@ -211,6 +270,12 @@ bosh -e <alias> upload-stemcell <stemcell>.tgz --fix    # re-registers against e
 ```
 
 Each `--fix` invocation runs `create_stemcell` against that entry's own cluster. Under the eager-cache design in [Design Decisions, D1](design-decisions.md#the-refs-anchor-rule), that call builds the cluster's own cache template immediately, tags it `bosh-stemcell-cache`, and registers the entry's Director UUID as a reference on it.
+
+### Light and heavy uploads through the wrapper
+
+`scripts/bosh upload-stemcell` builds and registers only the light stemcell. It takes the source from `stemcell_url` in `vars.yml`, it always passes `--fix`, and it no longer reads `STEMCELL_PATH`. A heavy tarball goes through the passthrough instead, as `scripts/bosh -n upload-stemcell <tarball>`.
+
+On a multi-CPI Director, each entry registers the heavy stemcell and writes the same deterministic qcow2 name to the shared stemcell export. Later, `bosh delete-stemcell` destroys each cluster's cache template and keeps that qcow2, because the export is shared. `pve-cid stemcells --orphans --config <cpi.json>` then reports the qcow2 as an orphan on every cluster that sees the export. We remove it once, after we confirm that nothing references it. The `delete-stemcell` command itself is serial, so it is safe to run. [Light Stemcells](light-stemcells.md#heavy-and-a-cross-cluster-shared-export-do-not-mix) explains the mechanism.
 
 ### The AZ-reassignment trap
 

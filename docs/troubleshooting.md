@@ -231,6 +231,36 @@ Credentials travel with the endpoint as a group of `user`, `password`, and `api_
 
 Set `api_token` on the entry, or set both `user` and `password`. If the cluster sits behind a private CA, set `ca_cert` on the entry too, because the job-level CA does not follow the request to another endpoint. When the entry uses `user` and the cluster's realm differs from the job's, set `realm` or write `user` as `user@realm`. [Multi-Cluster Deployments](multi-cluster.md#per-entry-credentials-and-ca) covers the full rules.
 
+### The Director rejects a deploy with "must specify a CPI"
+
+**Symptom**
+
+```text
+AZ 'z1' must specify a CPI when CPI config is defined
+```
+
+The Director prints this when a deploy runs against a cloud-config whose AZs don't all name a CPI.
+
+**Diagnosis**
+
+Once a Director has an active cpi-config, it requires every AZ in the cloud-config to carry a `cpi:` key that names one of the cpi-config entries. This is a Director check, not a CPI check, so no CPI call ever starts. The usual cause is that we applied the cpi-config with `scripts/bosh update-cpi-config` and haven't yet re-applied the cloud-config, so the old one still has AZs with no `cpi:`. We run `bosh cpi-config` to see the entry names and `bosh cloud-config` to see which AZs lack a binding.
+
+**Fix**
+
+1. Run `bosh cpi-config`.
+   We should see one entry per cluster, such as `pve-az1` and `pve-az2`.
+
+2. Re-apply the cloud-config through the wrapper. For the Director's own cloud-config we run `scripts/bosh ucc`, and for CF we run `scripts/cf cloud-config`.
+   We should see a line saying that the cpi-config is active and that the AZ-to-CPI binding layer is applied. `scripts/bosh ucc` binds `z1` to `pve-az1`, and `scripts/cf cloud-config` binds `z1` and `z2` to `pve-az1` and `z3` to `pve-az2`.
+
+3. If we apply the cloud-config with the BOSH CLI directly, we add `cpi: <entry name>` to every AZ ourselves, or we pass the matching `-o manifests/bosh/multi-cpi-azs.yml` or `-o manifests/cf/multi-cpi-azs.yml` layer.
+   We should see the update accepted.
+
+4. Run the deploy again.
+   We should see it get past the error. We know it worked when the deploy no longer prints "must specify a CPI".
+
+If the Director rejects the cloud-config update itself because an AZ names an entry that doesn't exist, the entry's name in `cpi:` doesn't match the cpi-config, and we correct the spelling. [Applying a cpi-config on a live Director](multi-cluster.md#applying-a-cpi-config-on-a-live-director) has the full order of steps.
+
 ### Stemcell path outside staging directory
 
 **Symptom**
@@ -359,6 +389,36 @@ pvesh get /nodes/<node>/network | jq '.[] | select(.iface == "<bridge>")'
 **Fix**
 
 Set `pve.network_bridge` to an existing Linux bridge name (e.g., `vmbr0`). See [Configuration](configuration.md).
+
+### create_vm refuses a static IP that a VM already holds
+
+**Symptom**
+
+```text
+create_vm: IP conflict detected — address 10.254.48.10 is already statically assigned to VM 3343 (old-director) on bridge/vnet "vmbr0"; choose a different IP or remove the conflicting assignment before retrying
+```
+
+The address, VMID, and VM name here are examples, and ours will differ. `bosh create-env` prints the same text when the Director's own VM is the one being created. When the network carries a VLAN tag, the message adds `vlan <tag>` after the bridge name.
+
+**Diagnosis**
+
+Before it creates a VM, the CPI scans every guest on the cluster for a static `ipconfigN` entry that holds the requested address on the same bridge or vnet. The scan counts stopped VMs on purpose, because a stopped VM gets its address back when it starts, and two guests would then fight over it. The scan can't see DHCP leases, devices outside PVE, or the guests of a cluster member that is offline, so a clean scan isn't proof that the address is free. We read the named VM with `qm config <vmid>` on its node and check its `ipconfig` and `net` lines.
+
+**Fix**
+
+1. Decide whether the VM named in the message still matters.
+   We should be able to tell from its name, its tags, and its Notes.
+
+2. If it still matters, choose a free address. For a Director, we set a free `internal_ip` in `manifests/bosh/vars.yml` (or in the slot's `slot.yml`), and for a deployment we change the static IP in the network or the instance group.
+   We should see the next create succeed with no conflict message.
+
+3. If the VM is abandoned, we remove it, or we remove just its static address with `qm set <vmid> --delete ipconfig0`, using the index the config shows.
+   We should see `qm config <vmid>` no longer list the address.
+
+4. Run the create again.
+   We know it worked when `create_vm` passes the guard and the new VM comes up on the address we chose.
+
+[Deploying with bosh create-env](bosh-create-env.md#choosing-internal_ip) covers the choice of the Director's address.
 
 ### VM will not start
 
@@ -536,7 +596,7 @@ We read the VM's tags and Notes with `qm config <vmid>` on its node, and we comp
 The fix depends on why the CID reaches a VM we don't own.
 
 - The Director's record is stale
-  The VM the Director recorded is gone, and its VMID now holds another VM. We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away. Neither escape touches the VM.
+  The VM the Director recorded is gone, and its VMID now holds another VM. We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away. Cloud-check offers "Delete VM reference" only when the agent on the VM is unresponsive, and it finds nothing to resolve while the agent still answers. Neither escape touches the VM.
 
 - An operator removed the `bosh-cpi` tag from one of our VMs
   A VM created before the owner tag existed passes on its `bosh-cpi` tag or on the `director:`, `deployment:`, and `name:` lines in its Notes. When both are gone, we add `bosh-cpi` back with `qm set <vmid> --tags`, keeping the tags the VM already has.
@@ -567,18 +627,20 @@ pvesh get /nodes/$(hostname)/certificates/info --output-format json \
   | tr -d ':' | tr 'A-F' 'a-f' | cut -c1-8
 ```
 
+When an entry was repointed while a VM ran on the old cluster, the Director shows a particular pattern. `bosh cck` reports nothing to resolve, because the agent on the VM stays responsive and the Director never asks the CPI. `bosh recreate` stops the instance's jobs and then fails at `delete_vm` with the refusal above. The CPI refuses once and doesn't retry, the VM's configuration on the original cluster is unchanged, and the VM keeps running. The instance's jobs stay stopped until the next `bosh start` or `bosh recreate`. A repoint also has to move the whole credential group together with `host` and `node`, because a token for the old cluster fails authentication against the new one before any VM call is made. [What we see if an entry is repointed anyway](multi-cluster.md#what-we-see-if-an-entry-is-repointed-anyway) walks through the whole sequence.
+
 **Fix**
 
 The fix depends on which cluster the stamp names.
 
 - The stamp names another cluster we still run
-  The request's `cpi_config` entry or AZ was pointed at a different cluster after the VM was created. We point the entry back at the cluster the stamp names, or we give that cluster an entry of its own, and the call then reaches the VM.
+  The request's `cpi_config` entry or AZ was pointed at a different cluster after the VM was created. We point the entry back at the cluster the stamp names, together with its `node` and its whole credential group, or we give that cluster an entry of its own, and we apply the change with `scripts/bosh update-cpi-config`. The refusals stop and the call reaches the VM. If a recreate had already stopped the instance's jobs, we run `bosh start` or `bosh recreate` for that instance afterwards. We never fix this by repointing the entry at the other cluster for good, because [the hard rule against editing a live entry](multi-cluster.md#never-edit-a-live-entrys-host-or-repoint-a-live-az) still holds.
 
 - The stamp is this cluster's own, from before a root CA rotation
   We add the old stamp to `pve.cluster_stamp_aliases`, at the job level or in the entry for this cluster, and redeploy the CPI. [Rotating a cluster's root CA](operations.md#rotating-a-clusters-root-ca) walks through it.
 
 - The VM is really gone
-  We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away.
+  We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away. Cloud-check offers "Delete VM reference" only when the agent on the VM is unresponsive. A VM that still runs on the cluster the stamp names has a responsive agent, so `bosh cck` shows no problem and no such choice, and the first fix above applies instead.
 
 `pve.vm_ownership_guard: warn` doesn't relax this refusal, and `has_vm` answers `false` in both modes, because no reading of an absent VMID tells us the CID's VM is gone.
 
@@ -676,6 +738,30 @@ create_stemcell: cloud_properties.name is required for direct-qcow stemcell uplo
 **Fix**
 
 Ensure the stemcell manifest's `cloud_properties` block contains a `name` field. Official BOSH stemcells include this; custom stemcells may omit it. Add it to the stemcell metadata before upload.
+
+### The first bosh clean-up --all fails on stemcell rows
+
+**Symptom**
+
+```text
+Error: Attempt to delete object did not result in a single row modification (Rows Deleted: 0, SQL: DELETE FROM "stemcells" WHERE ("id" = 1))
+```
+
+The error appears on a Director that has a cpi-config with more than one entry, during the "Deleting stemcells" part of the first `bosh clean-up --all`.
+
+**Diagnosis**
+
+This is a race inside the Director, not a CPI failure. The Director runs one thread for each stemcell row, and a stemcell registered with several entries has several rows. Two threads then delete the same rows, so the second delete matches nothing. Every CPI `delete_stemcell` call in the same task succeeds. `bosh delete-stemcell` is serial and doesn't hit the race. [`bosh clean-up --all` fails the first time, then succeeds](multi-cluster.md#bosh-clean-up---all-fails-the-first-time-then-succeeds) explains it in full.
+
+**Fix**
+
+1. Run `bosh clean-up --all` again.
+   We should see the task finish, because the first run already removed the rows.
+
+2. Run `bosh stemcells`.
+   We should see that the stemcells we removed are gone and nothing is left half registered. We know it worked when the second run ends with no error.
+
+If the second run fails the same way, or fails on something other than the stemcell rows, the cause is something else, and the task's CPI log shows which call failed. See [Reading CPI errors](#reading-cpi-errors).
 
 ## Disk operation failures
 

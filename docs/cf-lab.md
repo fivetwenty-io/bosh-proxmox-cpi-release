@@ -14,6 +14,47 @@ Cloudflare Tunnel to HAProxy 192.168.1.50 to the lab's gorouter VM. Both the
 api FQDN (`api.cf.wayne.pve.lab.fivetwenty.io`) and pushed-app FQDNs flow
 through the same chain.
 
+## Running CF across two clusters
+
+The `pve-cpi` env bundle gives us two Proxmox clusters, with the Director and most of CF on the first. `manifests/cf/multi-cpi-azs.yml` binds `z1` and `z2` to the `pve-az1` entry and `z3` to the `pve-az2` entry, but stock cf-deployment puts every instance group in `z1` and `z2`, so nothing would ever dispatch through the second entry. The layer `manifests/envs/pve-cpi/cf-az2.yml` moves three groups to `z3`, which puts one CF deployment on both clusters.
+
+| Group | Why it moves |
+|---|---|
+| `doppler` | A stateless singleton with no persistent disk |
+| `tcp-router` | A stateless singleton with no persistent disk |
+| `diego-cell` | The heaviest group. `manifests/cf/ops-resize-cf.yml` sizes each cell at 4 cores and 16 GiB, and there are two. Moving them also takes load off the first cluster |
+
+All three are diskless on purpose. A group with a persistent disk stays in `z1` and `z2`, because moving one across entries later recreates it with an empty disk and leaves the old disk orphaned on the original cluster. The warning in `manifests/cf/multi-cpi-azs.yml` and [the multi-cluster guide](multi-cluster.md) explains that trap.
+
+To run it, we work through these steps.
+
+1. Apply the cpi-config and re-apply the cloud-config.
+
+   ```bash
+   BOSH_PVE_ENV=pve-cpi ./scripts/bosh update-cpi-config
+   BOSH_PVE_ENV=pve-cpi ./scripts/cf cloud-config
+   ```
+
+   The first command should finish with the light stemcell registered with both entries. The second layers `manifests/envs/pve-cpi/cf-cloud-config.yml`, which adds the second cluster's subnet for `z3`, and then `manifests/cf/multi-cpi-azs.yml`, because the Director reports an active cpi-config. Without the cpi-config, a `z3` instance would draw an address from the second cluster's range but be created on the first cluster.
+
+2. Check the memory on the first cluster before deploying.
+
+   The first cluster is the one that still holds the Director and every group that stays in `z1` and `z2`. We read the free memory of its nodes from the PVE web UI, or with `pvesh get /cluster/resources --type node` on one of its nodes. We then add up the memory of the vm_types for the groups that stay behind, using `manifests/cf/ops-resize-cf.yml` and `manifests/cf/cloud-config.yml`, plus any other VMs the cluster hosts. The free memory has to cover that total with room to spare. The three moved groups no longer count against it, so the check is about the groups that remain, and about anything else sharing the cluster.
+
+3. Deploy with the layer.
+
+   ```bash
+   BOSH_PVE_ENV=pve-cpi ./scripts/cf deploy -o manifests/envs/pve-cpi/cf-az2.yml
+   ```
+
+   The extra `-o` flag passes through to `bosh deploy`, after the lab's own ops files.
+
+4. Confirm the placement.
+
+   `bosh -d cf vms` should list `doppler`, `tcp-router`, and `diego-cell` in `z3` with addresses from the second cluster's range, and every other group in `z1` or `z2`. On the second cluster, the PVE node list should show those VMs, and the first cluster should show none of them.
+
+The run succeeds when `bosh -d cf vms` shows every instance running and the three moved groups sitting in `z3`.
+
 ## NATS-storm remediation bundle
 
 cf-deployment on this director suffered from a recreate-loop pattern: a

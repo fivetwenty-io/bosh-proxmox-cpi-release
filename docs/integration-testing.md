@@ -339,6 +339,34 @@ A run that dies in step 14b can leave a VM named `lifecycle-handmade-<vmid>` on 
 
 Step 14c sends the CID back to the first endpoint with its token replaced by a different one. The CPI must answer `has_vm` with `false` and fail `delete_vm` with `VMNotFound`, and the VM must be unchanged.
 
+The Director-level twin of these steps shows what an operator sees when a repoint happens for real. We ran it once in a throwaway deployment, on a Director we could afford to break, with the `emptyvm` deployment from [emptyvm.md](emptyvm.md) running one VM through the `pve-az1` entry. It is a manual procedure, and the lifecycle script does not drive it.
+
+1. Deploy `emptyvm` and note the VM's CID with `bosh -d emptyvm vms --details`.
+
+   We should see a stamped CID of the form `<vmid>-<stamp>-<token>`, and the VM running on the first cluster.
+
+2. Edit the `pve-az1` entry in the cpi-config to point at the second cluster, then run `scripts/bosh update-cpi-config`.
+
+   The edit has to move the whole credential group together with `host` and `node`. The first cluster's token against the second cluster fails authentication before any VM call, and that would test the credentials rather than the ownership guard.
+
+3. Run `bosh -d emptyvm cck`.
+
+   We should see nothing to resolve. The agent is still responsive, so the Director never asks the CPI about the VM. "Delete VM reference" is offered only when the agent is unresponsive.
+
+4. Run `bosh -d emptyvm recreate`.
+
+   The jobs stop, and then the task fails at `delete_vm` with a `cluster-mismatch` refusal. The message says the CID names one cluster and this cluster's stamp is another, and that no `cluster_stamp_aliases` entry lists the CID's stamp. The CPI refuses once and does not retry.
+
+5. Check the original VM on the first cluster.
+
+   Its config is unchanged and it is still running. Step 14a asserts the same thing from the CPI side.
+
+6. Restore the cpi-config entry and run `scripts/bosh update-cpi-config` again.
+
+   The refusals stop. The instance's jobs stay stopped until the next `bosh start` or `bosh recreate`.
+
+We confirm success when step 4 fails with the refusal, step 5 finds the first VM untouched, and a `bosh recreate` after step 6 completes. This confirms the rule in the [multi-cluster guide](multi-cluster.md) that we never repoint a live entry. It does not relax it.
+
 A stamped CID gives the strongest checks. With a bare CID, or one whose cluster stamp is unknown (`00000000`), the steps that depend on the stamp are skipped with a note and the collision step expects a `not-bosh` or `cluster-mismatch` refusal instead. Two clusters that share a root CA also share a cluster stamp, so step 14a cannot tell them apart and reports that as a likely cause when its assertion fails.
 
 The context files hold credentials, so `TRACE=1` masks any value whose key names a password, token, secret, CA certificate, or `mbus` URL before it prints a request. The CPI still receives the real values.

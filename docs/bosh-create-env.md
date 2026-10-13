@@ -89,6 +89,16 @@ When `pve.agent_mode = cloudinit` (the default), the CPI delivers settings via a
 
 Keep `vars.yml` out of git — it contains the PVE password.
 
+### Choosing `internal_ip`
+
+The Director's `internal_ip` has to be an address that nothing else on the network already holds. Before `create_vm` builds the Director VM, the CPI scans every guest on the cluster for a static `ipconfigN` entry on the same bridge or vnet that holds the address. It counts stopped VMs too, because a stopped VM gets its address back when it starts. When it finds a holder, `create-env` stops with an error like this one, where the address, VMID, and VM name will be our own.
+
+```text
+create_vm: IP conflict detected — address 10.254.48.10 is already statically assigned to VM 3343 (old-director) on bridge/vnet "vmbr0"; choose a different IP or remove the conflicting assignment before retrying
+```
+
+The fix is to pick a free `internal_ip`, or to remove the stopped VM, or just its static address configuration, if it's truly abandoned. The guard sees only static configuration in PVE, so it can't catch a DHCP lease, a device outside PVE, or a guest on an offline cluster member, and we still check the address ourselves. [create_vm refuses a static IP that a VM already holds](troubleshooting.md#create_vm-refuses-a-static-ip-that-a-vm-already-holds) has the steps.
+
 ### `pve_host` must be reachable from the Director VM
 
 `pve_host` is written into the rendered `cpi.json` on the Director VM. The Director's CPI invocations resolve and dial this address from inside that VM, not from the workstation running `bosh create-env`.
@@ -196,6 +206,35 @@ EOF
 # source ~/.bosh-pve.env
 ```
 
+### Standing up a second Director next to a live one
+
+We sometimes need a second Director on the same cluster while the first keeps running, for an upgrade test or a certification run. The two Directors must not share state, an address, a VM name segment, or a CLI alias. `scripts/bosh` handles this through a Director slot, which is a directory that holds one Director's `state.json` and `creds.yml`.
+
+1. Create a slot directory outside `manifests/bosh/`, and give it a `slot.yml` with the values that must differ from the first Director.
+   The file needs `internal_ip` (a free address inside the env's reserved band that isn't the first Director's, the gateway's, or the artifacts VM's) and `pve_create_env_deployment` (a VM name segment of its own, such as `create-env-second`). It may also set `bosh_alias` and `director_name`. We should see no complaint when the next step runs. [Choosing `internal_ip`](#choosing-internal_ip) covers the static address guard.
+
+2. Point `scripts/bosh` at the slot, and give the shell its own CLI config file, before anything else.
+   ```bash
+   export BOSH_STATE_DIR=$HOME/directors/second
+   export BOSH_CONFIG=$HOME/directors/second/bosh-cli-config.yml
+   ```
+   The CLI keeps its aliases in `~/.bosh/config` unless `BOSH_CONFIG` says otherwise, so this keeps the second Director's alias out of the first one's file.
+
+3. Run `scripts/bosh create-env`.
+   We should see the second Director come up on its own address, with its own state and creds files in the slot. The first Director keeps running untouched.
+
+4. Run `scripts/bosh alias-env`.
+   The script aliases the slot's Director under the slot's alias, which is `bosh_alias` from `slot.yml` or `pve-` followed by the slot directory's name. It never uses `pve`, and a `slot.yml` that sets `bosh_alias: pve` is refused. We should see `bosh -e <that alias> env` answer with the second Director.
+
+5. Use `scripts/bosh` for the second Director's commands while `BOSH_STATE_DIR` is set.
+   Its passthrough runs `bosh -e <slot alias>`, and `scripts/bosh ucc` and `scripts/bosh update-cpi-config` read the slot's creds. `scripts/cf` talks to the alias `pve` by default and is written for the default slot, so we don't use it for the second Director.
+
+If we run the raw `bosh` CLI instead of the wrapper, we have to do what the wrapper does. We run `bosh alias-env <new alias> -e <new Director IP> --ca-cert <its CA>` with `BOSH_CONFIG` pointed at a file of its own, and we pick an alias other than `pve`. Aliasing the new Director as `pve` in the shared `~/.bosh/config` repoints the first Director's alias, and `bosh -e pve` then talks to the other Director without any warning.
+
+The same collision happens when a second checkout of this repo runs its own default slot, for example a worktree that stands up a Director on another cluster. Every default slot uses the alias `pve`, and `scripts/bosh alias-env` drops and recreates that alias in whichever CLI config file is active. So before we run `scripts/bosh alias-env` from the second checkout, we export `BOSH_CONFIG` to a file of its own in every shell that works with that checkout. The first Director's alias in `~/.bosh/config` then stays where it was.
+
+We know it worked when `bosh -e pve env` still names the first Director in a shell that has neither variable set, and `bosh -e <second alias> env` names the second one in the shell that has them. The two `state.json` files should list different Director VM CIDs.
+
 ## 7. SSH into the Director VM
 
 If you deployed with `jumpbox-user.yml` (step 5), pull the private key from `creds.yml` and connect:
@@ -293,6 +332,10 @@ Add `manifests/bosh/vars.yml`, `manifests/bosh/state.json`, `manifests/bosh/cred
 - **PVE returns 401 / token errors**
 
   Verify `pve_user` includes the realm suffix (`root@pam`) and that the password or token is correct. Set exactly one of `pve_password` or `pve_api_token` in `vars.yml` and leave the other as `""`. See [Authentication](#authentication).
+
+- **`create-env` fails with `IP conflict detected — address ... is already statically assigned to VM ...`**
+
+  A VM on the cluster, running or stopped, already holds the Director's `internal_ip` in its static `ipconfigN` configuration. Choose a free `internal_ip`, or remove the abandoned VM or its static address. See [Choosing `internal_ip`](#choosing-internal_ip).
 
 - **`create-env` fails with `Expected to find variables: pve_api_token` (or `pve_password`)**
 

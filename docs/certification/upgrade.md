@@ -236,8 +236,94 @@ The `certification:` section of `ci/integration.yml` declares the deployment sha
 | `old_cpi_version` | no | Pin the before side; empty resolves to N-1 |
 | `new_cpi_version` | no | Pin the after side; empty resolves to N |
 | `timeout_s` | no | Wall-clock ceiling for the whole run (default 7200) |
+| `azs` | no | A list of two entries that makes one deployment span two clusters. See [Spanning two clusters](#spanning-two-clusters) |
 
 `ci/integration.yml.example` carries a commented example block.
+
+## Spanning two clusters
+
+BATS can run a second pass through the second cpi-config entry, and that shows each entry works on its own (see [Second cpi-config entry](bats.md#second-cpi-config-entry)). It cannot show that one deployment works across both entries. The spanning run proves that. It deploys one certification deployment with one instance in `z1` on the first cluster and one in `z2` on the second cluster, each with its own persistent disk. It then checks where every VM and disk landed before the upgrade and again after the Director is replaced and the deployment is recreated.
+
+Without `certification.azs`, the run uses the single AZ named by `az` and `cpi_id`, exactly as before. Adding `certification.azs` with two entries turns the spanning run on.
+
+```yaml
+certification:
+  azs:
+    - az:     z1
+      cpi_id: pve-az1
+    - az:     z2
+      cpi_id: pve-az2
+      network:
+        cidr:    <second cluster network>
+        gateway: <second cluster gateway>
+        reserved:
+        - <addresses the second network must not hand out>
+      bridge:  ""   # optional
+      storage: ""   # optional
+```
+
+`ci/integration.yml.example` carries the same block with the lab's values. The keys follow these rules.
+
+| Key | Rule |
+|---|---|
+| `azs[0]` | Takes only `az` and `cpi_id`. It is the AZ the Director's base cloud-config already defines, so it uses the job's bridge and storage. When `az` and `cpi_id` are also set above, they must agree with this entry, or the run stops before it starts |
+| `azs[1].az` | Must be `z2`, the AZ that `manifests/certification/cloud-config-cpi2-ops.yml` adds |
+| `azs[*].cpi_id` | Required on both entries, and the two must differ. A Director with a cpi-config rejects an AZ that names no entry, and a run that binds both AZs to one entry is not spanning anything |
+| `azs[1].network` | Required. It describes the second cluster's subnet, because nothing is inherited from the first. The lab's value is the range the `pve-cpi` env bundle reserves for `z3` in `manifests/envs/pve-cpi/vars.yml` |
+| `azs[1].bridge` | Optional. A bridge that exists on the second cluster and differs from the first cluster's. The run sets it on the `z2` subnet and fails when any NIC in `z2` is on another bridge |
+| `azs[1].storage` | Optional. A storage ID that exists on the second cluster and differs from the first cluster's. The run sets it on the `z2` AZ and fails when a boot drive lands anywhere else |
+
+We set `bridge` and `storage` to values that differ between the clusters on purpose. When both clusters use the same names, a run that silently fell back to the job's defaults would pass by coincidence.
+
+Both entries must exist in `manifests/cpi-config.yml`. The run reads each entry's host, VMID bands, and VM prefix from there, so none of those go in the certification config.
+
+### Credentials
+
+Each entry reads its own credential group, and the run uses the same group the Director's CPI uses. The first entry reads `pve_user`, `pve_password`, and `pve_api_token`. The second reads `pve_az2_user`, `pve_az2_password`, and `pve_az2_api_token`. A group is either an API token or a user with a password, and a token wins when both are set. The run never pairs one entry's user with another entry's token. The variables come from the layered vars files (the base `manifests/bosh/vars.yml`, then the env bundle's `vars.yml`, then the slot's `slot.yml`), so no secret enters `ci/integration.yml`.
+
+When a group does not resolve, preflight fails in seconds and names the variables, never their values.
+
+### What the run adds
+
+Beyond the single-AZ steps, a spanning run adds these.
+
+1. Offline preflight (`spanning:cpi-config`)
+
+   The run reads both entries and fails when an entry is missing, lacks a VMID band, has no resolvable credential group, or names the same PVE host as the other entry. The step detail lists each AZ with its entry, host, and bands.
+
+2. Reachability probe (`precheck:z2-reachability`, `precheck:z2-probe-delete`)
+
+   Before the real deploy, the run builds one throwaway instance in `z2` through the second entry. Its agent has to reach the Director's NATS and pull its job from the Director's blobstore, so a probe that comes up proves both routes. When the probe fails, `precheck:z2-diagnosis` says whether the failure looks like a routing gap, so a network problem on the second cluster does not read as a CPI failure. The probe is deleted either way.
+
+3. Placement checks (`verify:placement-pre-*` and `verify:placement-post-*`)
+
+   After the first deploy, and again after the upgrade and recreate, the run reads `/cluster/resources` from both clusters. It asserts that each instance's VM and disk sit on the cluster its AZ names and nowhere else, inside that entry's VMID bands and VM prefix, with the `bosh-owner--` and `bosh-cluster--` tags matching the stamped CID. It also asserts that no other VM on either cluster carries the Director's owner tag, and that the bridge and storage overrides held when they were set. The disk check reads the instance VMs' configs only, so a disk attached to an unrelated VM is not seen.
+
+4. Old VMs gone (`verify:placement-old-vms-deleted`)
+
+   After the recreate, the first release's VMs must be gone from both clusters.
+
+### Clean-up and the retry
+
+At teardown the run deletes the deployment, runs `bosh clean-up --all`, and deletes the Director VM. On a multi-CPI Director the first `bosh clean-up --all` can fail on the stemcell rows with "Attempt to delete object did not result in a single row modification". That is an upstream Director race, and a rerun succeeds. See [the clean-up failure](../multi-cluster.md#bosh-clean-up---all-fails-the-first-time-then-succeeds) in the multi-cluster guide for the cause. The run retries `director:clean-up` once. When the retry passes, the step is a PASS whose detail says the first attempt failed, so the race stays visible without failing the run. A dry run never retries.
+
+### Reading the report
+
+The run report under `docs/certification/upgrade/runs/` has the same shape as a single-AZ report. A spanning report differs in three places, and the [2026-10-13 run](upgrade/runs/2026-10-13-100004.md) shows all three.
+
+- The step table
+
+  It carries `spanning:cpi-config`, `lab:reachable-secondary`, the two `precheck:z2-*` steps, and a `verify:placement-pre-*` and `verify:placement-post-*` step for each check. The bridge and storage steps pass with a note when no override is set.
+
+- The invariant table
+
+  The "Disk serials" row lists each disk by the AZ and VMID it sits on, so a reader can see one disk on `z2` before and after. The "Placement across both clusters" row counts the placement checks that held after the first release and after the recreate, and those two counts should match.
+
+- The Director and disk rows
+
+  The Director VM CID changes and the persistent disk CIDs do not, as in a single-AZ run. A CID such as `161-a0b9aaca-8efe40a9` carries the cluster stamp, which is how the placement check ties a VM to a cluster.
+
+A passing spanning run therefore says four things. The Director was replaced, every disk kept its identity across the upgrade, each instance sat on its own cluster both times, and nothing from the first release was left behind.
 
 ## Invocation
 

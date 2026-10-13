@@ -103,6 +103,10 @@ bosh update-cloud-config manifests/bosh/cloud-config.yml -l manifests/bosh/vars.
 bosh -d emptyvm deploy manifests/bosh/emptyvm.yml -l manifests/bosh/vars.yml
 ```
 
+#### On a multi-CPI Director
+
+Once a cpi-config is active, the Director rejects any cloud-config whose AZs don't name a CPI, with "AZ 'z1' must specify a CPI when CPI config is defined". The `emptyvm` deployment uses `z1`, so the cloud-config must bind `z1` to an entry. `./scripts/bosh ucc` does this by itself. When the Director reports an active cpi-config, it layers `manifests/bosh/multi-cpi-azs.yml`, which binds `z1` to `pve-az1`. The raw `bosh update-cloud-config` command in step 3b doesn't add that layer, so on a multi-CPI Director we use `./scripts/bosh ucc` instead, or add `-o manifests/bosh/multi-cpi-azs.yml` ourselves. After a `./scripts/bosh update-cpi-config`, we re-apply the cloud-config the same way. See [Multi-Cluster Deployments](multi-cluster.md) for the full order.
+
 Watch the task output. A clean run takes roughly one to two minutes and proceeds through:
 
 1. `create_stemcell` — uploads the qcow2 image directly to `pve_stemcell_storage` (file-based PVE storage with `import` content enabled).
