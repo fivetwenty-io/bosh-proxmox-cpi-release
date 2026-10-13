@@ -72,6 +72,12 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - No cross-cluster VMID coordination
   The allocation-time storage scan and the pool-comment lock both stop at cluster boundaries, so disjoint VMID banding across cpi-config entries that share storage is an operator obligation, not something the CPI can enforce. See [Multi-Cluster Deployments](multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern).
 
+- Two entries on one cluster share one stemcell reference
+  A stemcell cache template counts its references by Director UUID, so two cpi-config entries that point at the same PVE cluster hold one reference between them on a template they both use. The Director deletes every entry's copy of a stemcell in one task, so an ordinary delete removes the template once, and that is correct. The hazard needs a delete task that removes the stemcell through one entry and then fails before it reaches the other. The template is then gone while the Director still records the stemcell against the second entry, and the next `create_vm` through that entry can fail on the missing stemcell. We recover by running `bosh upload-stemcell --fix` with the same stemcell. See [Stemcell registration across CPI entries](multi-cluster.md#stemcell-registration-across-cpi-entries).
+
+- Two entries on one cluster share a journal namespace and can share a parker band
+  The CPI warns about these shapes and does not refuse them. It records the VM prefix, parker prefix, and VMID bands of the entry that last admitted a create into the namespace, warns when a create comes from an entry with different values, and reports the mismatch in `storage-journal audit`. When it lists parkers, it warns about parkers of another prefix inside its parker band and about parkers with its own director tag and prefix outside the band. See [Two cpi-config entries on one cluster](troubleshooting.md#two-cpi-config-entries-on-one-cluster).
+
 ## Permissions
 
 - Pool-scoped tokens do not cover pre-existing VMs

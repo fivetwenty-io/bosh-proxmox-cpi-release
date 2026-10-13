@@ -307,6 +307,9 @@ func TestAllocationDecisionAdoptsVMMovedOnSharedStorage(t *testing.T) {
 func TestAdmitStorageVMAllocationLeavesJournalUnchangedForMovedVM(t *testing.T) {
 	deps, j, c, _, _ := resumeVMFixture(t)
 	moveResumeVM(c)
+	// Record this entry's binding before the snapshot. Admission then finds
+	// it unchanged and must write nothing at all.
+	noteJournalEntryBinding(t.Context(), deps, j)
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
 	if err := admitStorageVMAllocation(t.Context(), deps, j, []string{"pve1", "pve2"}, "another-agent"); err != nil {
 		t.Fatalf("create_vm admission refused a VM moved on shared storage: %v", err)

@@ -1442,15 +1442,16 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 	}
 
 	var result []int
+	// The sightings read the rows this loop already decodes, so the band and
+	// prefix warnings cost no request. Out-of-band rows are judged on the
+	// listing's own tags and name, and in-band rows on the evidence below.
+	sightings := newParkerBandSightings(cfg)
 	for _, raw := range raws {
 		var entry qemuListItem
 		if jsonErr := json.Unmarshal(raw, &entry); jsonErr != nil {
 			continue
 		}
 		vmid := int(entry.Vmid.Int())
-		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
-			continue
-		}
 		rowTags := ""
 		if entry.Tags != nil {
 			rowTags = *entry.Tags
@@ -1459,6 +1460,10 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		if entry.Name != nil {
 			rowName = *entry.Name
 		}
+		if vmid < cfg.VMIDRangeStart || vmid > cfg.VMIDRangeEnd {
+			sightings.observe(node, vmid, rowTags, rowName)
+			continue
+		}
 		tags, name, gone, evidenceErr := parkerRowEvidence(ctx, c, node, vmid, rowTags, rowName, cfg)
 		if evidenceErr != nil {
 			return nil, evidenceErr
@@ -1466,6 +1471,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 		if gone {
 			continue
 		}
+		sightings.observe(node, vmid, tags, name)
 		// A mover carries the parker tag too (every parker guard must fire
 		// for it), but it is a single-purpose migration vehicle: parking an
 		// unrelated disk onto one would carry that disk along with the next
@@ -1479,6 +1485,7 @@ func ListParkersForNode(ctx context.Context, c Client, node string, cfg ParkerCo
 			result = append(result, vmid)
 		}
 	}
+	sightings.report(ctx, "list_parkers_for_node")
 	sort.Ints(result)
 	return result, nil
 }

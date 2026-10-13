@@ -645,7 +645,7 @@ func TestStorageJournalAuditRecordSummaryChargingMatchesPredicateForEveryState(t
 				Records: []aj.Record{storageJournalAuditTestRecord("record-"+string(state), state, created, created)},
 			}
 			var out, stderr bytes.Buffer
-			writeStorageJournalAudit(&out, &stderr, report, nil, true, false)
+			writeStorageJournalAudit(&out, &stderr, report, nil, true, false, storageJournalBindingAudit{})
 			output := decodeStorageJournalAuditOutput(t, out.Bytes())
 			if len(output.Records) != 1 {
 				t.Fatalf("expected one record summary, got %d", len(output.Records))
@@ -666,7 +666,7 @@ func TestStorageJournalAuditPlannedRecordChargesWithTimestamps(t *testing.T) {
 		Records: []aj.Record{storageJournalAuditTestRecord("planned-1", aj.Planned, created, updated)},
 	}
 	var out, stderr bytes.Buffer
-	writeStorageJournalAudit(&out, &stderr, report, nil, true, false)
+	writeStorageJournalAudit(&out, &stderr, report, nil, true, false, storageJournalBindingAudit{})
 	output := decodeStorageJournalAuditOutput(t, out.Bytes())
 	if len(output.Records) != 1 {
 		t.Fatalf("expected one record summary, got %d", len(output.Records))
@@ -691,7 +691,7 @@ func TestStorageJournalAuditReadyToReturnRecordDoesNotCharge(t *testing.T) {
 		Records: []aj.Record{storageJournalAuditTestRecord("returned-1", aj.ReadyToReturn, created, created)},
 	}
 	var out, stderr bytes.Buffer
-	writeStorageJournalAudit(&out, &stderr, report, nil, true, false)
+	writeStorageJournalAudit(&out, &stderr, report, nil, true, false, storageJournalBindingAudit{})
 	output := decodeStorageJournalAuditOutput(t, out.Bytes())
 	if len(output.Records) != 1 || output.Records[0].Charging {
 		t.Fatalf("ready_to_return record must not charge: %+v", output.Records)
@@ -710,7 +710,7 @@ func TestStorageJournalAuditTerminalRecordsDoNotCharge(t *testing.T) {
 				Records: []aj.Record{storageJournalAuditTestRecord("terminal-"+string(state), state, created, created)},
 			}
 			var out, stderr bytes.Buffer
-			writeStorageJournalAudit(&out, &stderr, report, nil, true, false)
+			writeStorageJournalAudit(&out, &stderr, report, nil, true, false, storageJournalBindingAudit{})
 			output := decodeStorageJournalAuditOutput(t, out.Bytes())
 			if len(output.Records) != 1 || output.Records[0].Charging {
 				t.Fatalf("%s record must not charge: %+v", state, output.Records)
@@ -732,7 +732,7 @@ func TestStorageJournalAuditChargingSummaryCountsAndNamesOldest(t *testing.T) {
 		},
 	}
 	var out, stderr bytes.Buffer
-	writeStorageJournalAudit(&out, &stderr, report, nil, true, false)
+	writeStorageJournalAudit(&out, &stderr, report, nil, true, false, storageJournalBindingAudit{})
 	output := decodeStorageJournalAuditOutput(t, out.Bytes())
 	if output.ChargingSummary.Count != 2 {
 		t.Fatalf("expected 2 charging records, got %d: %+v", output.ChargingSummary.Count, output.ChargingSummary)

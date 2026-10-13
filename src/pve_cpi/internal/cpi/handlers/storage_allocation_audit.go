@@ -622,6 +622,8 @@ func auditStorageAllocationRecords(ctx context.Context, deps Deps, records []aj.
 // The returned audit carries the same scan (including Records) that sibling
 // accounting reads, so a caller never needs a second List. On any error the
 // zero audit is returned alongside it, so a failed scan can never be used.
+// Once the create is admitted it notes the entry binding, which only ever
+// logs, so the note can never refuse a create the audit admitted.
 func admitStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journal, nodes []string) (StorageAllocationAudit, error) {
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {
@@ -633,6 +635,7 @@ func admitStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journal,
 	if !report.Complete {
 		deps.Log(ctx).Warn("storage provenance inspection incomplete; no historical absence is certified", log.Int("unavailable_observations", len(report.Issues)), log.String("issues", log.ScrubMessage(strings.Join(report.Issues, " | "))))
 	}
+	noteJournalEntryBinding(ctx, deps, journal)
 	return report, nil
 }
 
@@ -640,6 +643,7 @@ func admitStorageAllocation(ctx context.Context, deps Deps, journal *aj.Journal,
 // for a VM allocation. It returns no audit on purpose: the VM path reads its
 // siblings under the journal index lock, which is fresher than this scan, so
 // nothing downstream may rank from the audit's records.
+// Like the disk path, it notes the entry binding after admitting the create.
 func admitStorageVMAllocation(ctx context.Context, deps Deps, journal *aj.Journal, nodes []string, agentID string) error {
 	report, err := AuditStorageAllocations(ctx, deps, journal, nodes)
 	if err != nil {
@@ -655,6 +659,7 @@ func admitStorageVMAllocation(ctx context.Context, deps Deps, journal *aj.Journa
 			return cpierrors.Cloud("agent allocation %s already has remote VM provenance; resume or audit it before creating another generation", evidence.AllocationID)
 		}
 	}
+	noteJournalEntryBinding(ctx, deps, journal)
 	return nil
 }
 

@@ -254,6 +254,9 @@ func parkerMovedOnSharedStorageStaysUsable(t *testing.T, renamed bool) {
 	deps, client, journal, id, cid := lifecycleFlowFixture(t)
 	parker := parkThenMoveParker(t, deps, client, cid, renamed)
 
+	// Record this entry's binding before the snapshot. Admission then finds
+	// it unchanged and must write nothing at all.
+	noteJournalEntryBinding(context.Background(), deps, journal)
 	files := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
 	report, err := admitStorageAllocation(context.Background(), deps, journal, []string{"n1", "n2"})
 	if err != nil {

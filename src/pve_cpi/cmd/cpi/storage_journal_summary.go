@@ -33,7 +33,8 @@ func writeStorageJournalEnrollment(stdout, stderr io.Writer, report handlers.Sto
 }
 
 // writeStorageJournalAuditText prints the audit for a Director that has no
-// jq: an overview line, one line per finding, the runbook pointer when the
+// jq: an overview line, the generation index and entry-binding findings when
+// there are any, one line per audit finding, the runbook pointer when the
 // audit raised a conflict or an issue, one record line for each record that
 // needs an operator with its evidence lines under it, the charging summary,
 // and the skipped disabled storages. Every line is flattened, so a finding
@@ -44,6 +45,9 @@ func writeStorageJournalAuditText(w io.Writer, output storageJournalAuditReport)
 		audit.Complete, audit.VMScanComplete, output.IndexHealthy, output.ClusterContinuity, len(output.Records))}
 	if output.IndexFinding != "" {
 		lines = append(lines, "generation index: "+output.IndexFinding)
+	}
+	if output.EntryBindingFinding != "" {
+		lines = append(lines, "entry binding: "+output.EntryBindingFinding)
 	}
 	lines = append(lines, storageJournalFindingLines(audit)...)
 	if len(audit.Conflicts) > 0 || len(audit.Issues) > 0 {

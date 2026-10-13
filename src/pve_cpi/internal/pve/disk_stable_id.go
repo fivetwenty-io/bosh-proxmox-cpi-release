@@ -1121,6 +1121,11 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 		return nil, cpierrors.Retriable("provenance scan: nil response from cluster resources")
 	}
 	var out []parkerCandidate
+	// The sightings read the tags and name this listing already carries, so the
+	// band and prefix warnings cost no request. They are decoded separately
+	// and best effort, so a row whose tags or name fail to decode is still
+	// scanned exactly as before.
+	sightings := newParkerBandSightings(cfg)
 	for _, raw := range *resp {
 		var entry struct {
 			VMID sdkclient.PVEInt `json:"vmid"`
@@ -1135,7 +1140,16 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 		if entry.Type != "" && entry.Type != clusterResourceTypeQemu {
 			continue
 		}
-		if entry.VMID.Int() < int64(cfg.VMIDRangeStart) || entry.VMID.Int() > int64(cfg.VMIDRangeEnd) {
+		var labels struct {
+			Tags string `json:"tags"`
+			Name string `json:"name"`
+		}
+		if labelErr := json.Unmarshal(raw, &labels); labelErr != nil {
+			labels.Tags, labels.Name = "", ""
+		}
+		inBand := entry.VMID.Int() >= int64(cfg.VMIDRangeStart) && entry.VMID.Int() <= int64(cfg.VMIDRangeEnd)
+		sightings.observe(entry.Node, int(entry.VMID.Int()), labels.Tags, labels.Name)
+		if !inBand {
 			continue
 		}
 		node := entry.Node
@@ -1147,5 +1161,6 @@ func listParkersCluster(ctx context.Context, c Client, cfg ParkerConfig) ([]park
 		}
 		out = append(out, parkerCandidate{vmid: int(entry.VMID.Int()), node: node})
 	}
+	sightings.report(ctx, "provenance_scan")
 	return out, nil
 }

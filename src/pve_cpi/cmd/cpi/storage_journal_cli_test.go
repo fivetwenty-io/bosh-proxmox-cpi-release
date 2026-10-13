@@ -173,7 +173,7 @@ func TestStorageJournalEnrollmentFailuresAreNamed(t *testing.T) {
 func TestStorageJournalOutputFailuresAreReported(t *testing.T) {
 	var stderr bytes.Buffer
 	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true}
-	if code := writeStorageJournalAudit(brokenPipe{}, &stderr, report, nil, true, false); code != 1 || stderr.String() != "audit output could not be written: write /dev/stdout: broken pipe\n" {
+	if code := writeStorageJournalAudit(brokenPipe{}, &stderr, report, nil, true, false, storageJournalBindingAudit{}); code != 1 || stderr.String() != "audit output could not be written: write /dev/stdout: broken pipe\n" {
 		t.Fatalf("broken audit output reported as %d %q", code, stderr.String())
 	}
 	f := newStorageJournalFixture(t)

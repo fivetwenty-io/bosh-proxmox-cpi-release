@@ -248,7 +248,8 @@ func runStorageJournalRecovery(ctx context.Context, action string, cfg *config.C
 		return resolveStorageJournalMissingVM(ctx, cfg, journal, clusterID, enrolled.Enrollment.ClusterID, report, request, authority, fenced, stdout, stderr)
 	}
 	if action == "audit" {
-		return writeStorageJournalAudit(stdout, stderr, report, indexErr, clusterID == enrolled.Enrollment.ClusterID, request.Summary)
+		return writeStorageJournalAudit(stdout, stderr, report, indexErr, clusterID == enrolled.Enrollment.ClusterID, request.Summary,
+			auditStorageJournalEntryBinding(journal, cfg))
 	}
 	if action == "recover-index" && !request.RemoteTasksSettled {
 		fmt.Fprintln(stderr, "index recovery requires independent attestation that all previous remote tasks settled before audit")
@@ -569,6 +570,11 @@ type storageJournalAuditReport struct {
 	IndexFinding      string                          `json:"generation_index_finding,omitempty"`
 	ClusterContinuity bool                            `json:"cluster_continuity"`
 	Audit             handlers.StorageAllocationAudit `json:"audit"`
+	// EntryBinding is the namespace's recorded entry binding, and
+	// EntryBindingFinding says when it differs from this configuration, was
+	// recently replaced, or could not be read. Neither changes the exit code.
+	EntryBinding        *aj.EntryBindingState `json:"entry_binding,omitempty"`
+	EntryBindingFinding string                `json:"entry_binding_finding,omitempty"`
 	// Attention lists the records the text summary prints in full. The JSON
 	// output already carries every record, so it leaves this out.
 	Attention []storageJournalAttention `json:"-"`
@@ -581,8 +587,9 @@ type storageJournalAuditReport struct {
 // writeStorageJournalAudit prints the audit as JSON, or as a text summary
 // when textSummary is set. The exit code is the same in both modes: 1 when
 // the index is unhealthy, cluster continuity is lost, or the audit or its VM
-// scan is incomplete, and 0 otherwise.
-func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageAllocationAudit, indexErr error, continuity, textSummary bool) int {
+// scan is incomplete, and 0 otherwise. binding carries the entry-binding
+// check, which is advisory and never changes the exit code.
+func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageAllocationAudit, indexErr error, continuity, textSummary bool, binding storageJournalBindingAudit) int {
 	concise, err := conciseStorageJournalAudit(report)
 	if err != nil {
 		storageJournalFail(stderr, "audit record summary unavailable", err)
@@ -604,7 +611,7 @@ func writeStorageJournalAudit(stdout, stderr io.Writer, report handlers.StorageA
 			Charging:  handlers.StorageAllocationCharging(r.State),
 		})
 	}
-	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport, storageJournalAttentionRecords(report), storageJournalPlannedSteps(report)}
+	output := storageJournalAuditReport{summaries, storageJournalChargingRecords(summaries, time.Now().UTC()), indexErr == nil, "", continuity, outputReport, binding.State, binding.Finding, storageJournalAttentionRecords(report), storageJournalPlannedSteps(report)}
 	if indexErr != nil {
 		output.IndexFinding = "generation index invalid or unavailable; record listing does not establish healthy authority"
 	}

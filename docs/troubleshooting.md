@@ -2803,3 +2803,63 @@ VM <vmid> has malformed disk provenance on <node>: <parse error>
 ```
 
 The first is a VM-scan issue about the `[bosh_storage_allocation]` block in the VM's Notes, and it refuses `create_vm`. The second is about the `bosh_disk_allocations` or `bosh_parked_disks` provenance, and it names the carrier or key that failed. It refuses `delete_vm`, `delete_disk`, the `create_vm` and `create_disk` retries that plan a new attempt, and the `storage-journal` decisions. It does not refuse `create_vm` admission, `create_disk` admission, or a Director retry that reads back an existing allocation. The parse error is one of the CPI's fixed texts, such as `ambiguous storage allocation provenance` or `malformed JSON provenance`. Both usually mean somebody edited the VM's Notes by hand. We read them with `pmx pve qemu config get <vmid> --node <node>` and restore the block exactly as the CPI wrote it, from a backup of the VM configuration if we have one. We should not delete the block to clear the refusal, because the marker is how the CPI recognizes its own VM.
+
+## Two cpi-config entries on one cluster
+
+Two cpi-config entries can point at the same PVE cluster, usually to map two AZs onto different nodes of it. PVE refuses a create for a VMID that already exists, so the entries can't collide on a VMID. What they can share is the cluster's parker band and its allocation journal namespace. The CPI warns about both and refuses neither, so the warnings below are prompts to review the entries rather than failures.
+
+### Parkers of another prefix sit inside the parker band
+
+**Symptom**
+
+```text
+WARN parkers with another parker prefix sit inside this entry's parker band; two cpi_config entries on this cluster share parked_disk_vmid_range, so give each entry its own band  listing=list_parkers_for_node parker_band=90000-90999 parker_prefix=az1 count=2 parkers=pve1/90002(az2),pve2/90007(az2)
+```
+
+**Diagnosis**
+
+The CPI read this from a parker listing it was already making, either a per-node listing that parking, a disk move, or the pool sweep makes (`listing=list_parkers_for_node`) or the cluster listing behind the provenance scan (`listing=provenance_scan`). Each guest in `parkers` carries the `bosh-parker` tag and names another prefix by its `vm-prefix--` tag or by its `<prefix>-parker-<vmid>` name, and the prefix appears in parentheses. The sample stops at 20 guests, and `count` gives the full number. The two entries never adopt each other's parkers, because a park matches on the prefix, but they allocate parker VMIDs from one range and each one counts the other's parkers as foreign guests in its band. A parker that carries neither a prefix tag nor a parker-shaped name is left out, since its prefix would only be a guess.
+
+**Fix**
+
+We look up which cpi-config entry uses the prefix in parentheses. When the two entries should share parkers, we give them the same `pve_parker_prefix`. When they should stay apart, we give one of them its own `pve_parked_disk_vmid_range_start` and `pve_parked_disk_vmid_range_end`, as [Multi-Cluster Deployments](multi-cluster.md#disjoint-vmid-banding-the-multi-cluster-safety-pattern) describes. Existing parkers keep holding their disks after either change, and nothing has to be moved.
+
+### Parkers with our director tag sit outside the parker band
+
+**Symptom**
+
+```text
+WARN parkers carrying this director's tag and parker prefix sit outside the configured parker band; another cpi_config entry for this director may use a different parked_disk_vmid_range with the same prefix, or the band was moved while disks were parked  listing=provenance_scan parker_band=90000-90999 parker_prefix=az1 count=1 parkers=pve2/91500
+```
+
+**Diagnosis**
+
+Each guest in `parkers` carries the `bosh-parker` tag, a `director--<uuid>` tag naming the Director that made the call, and the entry's own parker prefix, yet its VMID falls outside the band in `parker_band`. Either a second entry for the same Director uses the same parker prefix with a different band, or somebody moved this entry's band while disks were still parked. An unattributed parker outside the band is left out, because it could belong to anyone.
+
+**Fix**
+
+When a second entry uses the same prefix, we give the two entries the same parker band, or we give one of them its own `pve_parker_prefix`. When the band moved, the parkers outside it still hold their disks, and every lookup that finds a disk where it sits still reaches them. We move the band back, or we leave the band where it is. In that case the next attach of each of those disks takes it out of its old parker, the next detach parks it inside the new band. The CPI never deletes a parker, so each old parker stays standing once it is empty and keeps the warning going. We remove the empty ones by following [Recovering empty parker VMs](operations.md#recovering-empty-parker-vms), and the warning stops once no parker of ours sits outside the band.
+
+### The journal namespace has a different entry binding
+
+**Symptom**
+
+```text
+WARN allocation journal entry binding differs from the one this namespace last recorded; two cpi_config entries on one cluster may share this storage_placement_namespace, or a prefix or VMID band was edited. Give each entry its own namespace, prefixes, and bands, or disregard this once after an intended edit  namespace=director changed_fields=vm_prefix,parker_prefix recorded_binding=... recorded_at=... current_binding=...
+```
+
+`cpi storage-journal audit --summary` reports the same thing.
+
+```text
+entry binding: recorded binding differs from this configuration in vm_prefix,parker_prefix; recorded vm_prefix=az2 parker_prefix=az2 ... at 2026-10-01T00:00:00Z, configured vm_prefix=az1 parker_prefix=az1 .... Another cpi_config entry on this cluster may share storage_placement_namespace
+```
+
+**Diagnosis**
+
+The CPI keeps an `entry-binding.json` file in each journal namespace. It holds the VM prefix, the resolved parker prefix, and the VM, disk, and parked-disk VMID bands of the entry that last admitted a `create_vm` or `create_disk` there. Admission compares that with the entry making the call, logs this warning when they differ, and records the caller's values. `changed_fields` names what differs. When the warning shows up once after we edited an entry's prefix or a band, it records that edit and the next create is quiet. When it keeps coming back, two entries that point at one cluster share the namespace and disagree, and each create from one of them overwrites what the other recorded. The audit's finding compares the file with the job-level configuration the command loaded. When the file matches but replaced a different binding, the finding says so and names the previous values, since that is how alternating entries look from the job's side.
+
+Two related warnings can appear. `allocation journal entry binding is unreadable` means the file failed the journal's checks, and the CPI records the current values in its place. `allocation journal entry binding could not be read` or `could not be recorded` means a permission or filesystem problem, and the CPI leaves the file alone and carries on with the create. The file is advisory, so none of these ever fails a CPI call, and no journal record, scan, or recovery reads it.
+
+**Fix**
+
+For an intended edit, we do nothing, since the warning has already recorded the new values. For two entries that share the namespace, we have two quiet configurations. The first gives the entries the same prefixes and bands. The second gives one entry its own `pve_storage_placement_namespace`, as [Storage-set authorities across clusters](multi-cluster.md#storage-set-authorities-across-clusters) describes. If the entries keep different parker prefixes, we also give them separate parker bands, as the first section above describes.

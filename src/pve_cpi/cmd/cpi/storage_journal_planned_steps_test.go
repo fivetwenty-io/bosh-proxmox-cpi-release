@@ -28,7 +28,7 @@ func plannedStepTestRecord(id string, state aj.State, steps ...aj.Step) aj.Recor
 func writePlannedStepAudit(t *testing.T, report handlers.StorageAllocationAudit, summary bool) (int, string) {
 	t.Helper()
 	var out, stderr bytes.Buffer
-	code := writeStorageJournalAudit(&out, &stderr, report, nil, true, summary)
+	code := writeStorageJournalAudit(&out, &stderr, report, nil, true, summary, storageJournalBindingAudit{})
 	return code, out.String()
 }
 
@@ -131,8 +131,8 @@ func TestStorageJournalAuditSummaryPlannedStepsKeepTheExitCode(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var summary, jsonOut, stderr bytes.Buffer
-			textCode := writeStorageJournalAudit(&summary, &stderr, test.report, test.indexErr, test.continuity, true)
-			jsonCode := writeStorageJournalAudit(&jsonOut, &stderr, test.report, test.indexErr, test.continuity, false)
+			textCode := writeStorageJournalAudit(&summary, &stderr, test.report, test.indexErr, test.continuity, true, storageJournalBindingAudit{})
+			jsonCode := writeStorageJournalAudit(&jsonOut, &stderr, test.report, test.indexErr, test.continuity, false, storageJournalBindingAudit{})
 			if textCode != test.wantExitStatus || jsonCode != test.wantExitStatus {
 				t.Fatalf("summary exited %d, JSON exited %d, want %d", textCode, jsonCode, test.wantExitStatus)
 			}

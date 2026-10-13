@@ -51,7 +51,7 @@ func TestStorageJournalAuditSummaryCleanAudit(t *testing.T) {
 		Records: []aj.Record{storageJournalAuditTestRecord("returned-1", aj.ReadyToReturn, created, created)},
 	}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 0 {
 		t.Fatalf("clean audit exited %d: %s", code, stderr.String())
 	}
 	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=1\n" +
@@ -80,7 +80,7 @@ func TestStorageJournalAuditSummaryFieldCase(t *testing.T) {
 		},
 	}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 1 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 1 {
 		t.Fatalf("incomplete audit exited %d", code)
 	}
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
@@ -113,7 +113,7 @@ func TestStorageJournalAuditSummaryFieldCase(t *testing.T) {
 func TestStorageJournalAuditSummaryNamesAnUnhealthyIndex(t *testing.T) {
 	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, aj.ErrCorrupt, false, true); code != 1 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, aj.ErrCorrupt, false, true, storageJournalBindingAudit{}); code != 1 {
 		t.Fatalf("unhealthy index exited %d", code)
 	}
 	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=false cluster_continuity=false records=0\n" +
@@ -221,7 +221,7 @@ func TestStorageJournalAuditSummaryOmitsHealthyRecords(t *testing.T) {
 		Evidence: []handlers.StorageAllocationEvidence{{AllocationID: "adopted-1", Kind: "disk", Node: "n1", VMID: 90372, VolumeID: "nas:24192/vm-24192-disk.qcow2"}},
 	}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 0 {
 		t.Fatalf("healthy audit exited %d: %s", code, stderr.String())
 	}
 	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=4\n" +
@@ -249,7 +249,7 @@ func TestStorageJournalAuditSummaryNamesARecordNeedingReconciliation(t *testing.
 		},
 	}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 0 {
 		t.Fatalf("audit exited %d: %s", code, stderr.String())
 	}
 	want := "audit: complete=true vm_scan_complete=true generation_index_healthy=true cluster_continuity=true records=2\n" +
@@ -277,7 +277,7 @@ func TestStorageJournalAuditSummaryNamesChargingRecords(t *testing.T) {
 		},
 	}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 0 {
 		t.Fatalf("audit exited %d: %s", code, stderr.String())
 	}
 	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
@@ -343,7 +343,7 @@ func TestStorageJournalAuditSummaryNamesAListingStop(t *testing.T) {
 	}
 	report := handlers.StorageAllocationAudit{Complete: true, VMScanComplete: true, Records: []aj.Record{vm}}
 	var out, stderr bytes.Buffer
-	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true); code != 0 {
+	if code := writeStorageJournalAudit(&out, &stderr, report, nil, true, true, storageJournalBindingAudit{}); code != 0 {
 		t.Fatalf("audit exited %d: %s", code, stderr.String())
 	}
 	reason := "VM cleanup stopped because storage nfs-images on node lab-pmx-0 could not be listed (listing_http_500); rerun delete_vm or storage-journal cleanup once that storage lists"

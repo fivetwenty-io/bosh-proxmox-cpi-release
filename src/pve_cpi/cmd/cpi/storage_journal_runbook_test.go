@@ -33,7 +33,7 @@ func TestStorageJournalAuditSummaryNamesTheRunbook(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, stderr bytes.Buffer
-			writeStorageJournalAudit(&out, &stderr, tc.report, nil, true, true)
+			writeStorageJournalAudit(&out, &stderr, tc.report, nil, true, true, storageJournalBindingAudit{})
 			lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
 			if tc.after == "" {
 				if strings.Contains(out.String(), "runbook:") {
