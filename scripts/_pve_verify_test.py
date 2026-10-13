@@ -2036,21 +2036,37 @@ class TestThrowawayVMWrites(unittest.TestCase):
             with self.assertRaises(PVEVerifyError):
                 v.qemu_status(4321, node="pve1")
 
-    def test_missing_vm_privileges_names_what_the_credentials_lack(self) -> None:
+    def _privileges(self, payload: object) -> "list[str] | None":
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 return_value=_make_response({"data": payload})):
+            return v.missing_vm_privileges()
+
+    def test_missing_vm_privileges_names_what_the_credentials_provably_lack(self) -> None:
         v = PVEVerifier(_token_config())
         granted = {"data": {"/vms": {"VM.Audit": 1}}}
         with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(granted)) as urlopen:
             self.assertEqual(v.missing_vm_privileges(), ["VM.Allocate"])
         (req,) = self._requests(urlopen)
         self.assertIn("/access/permissions?path=%2Fvms", req.full_url)
-        full = {"data": {"/vms": {"VM.Audit": 1, "VM.Allocate": 1}}}
-        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(full)):
-            self.assertEqual(v.missing_vm_privileges(), [])
-        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": {}})):
-            self.assertEqual(v.missing_vm_privileges(), ["VM.Audit", "VM.Allocate"])
-        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": []})):
-            with self.assertRaises(PVEVerifyError):
-                v.missing_vm_privileges()
+        self.assertEqual(self._privileges({"/vms": {"VM.Audit": 1, "VM.Allocate": 1}}), [])
+        self.assertEqual(self._privileges({"/vms": {"VM.Audit": 1, "VM.Allocate": 0}}), ["VM.Allocate"])
+
+    def test_missing_vm_privileges_is_unknown_for_every_shape_it_cannot_judge(self) -> None:
+        shapes = {
+            "not an object": [],
+            "null": None,
+            "no entry for /vms": {},
+            "empty /vms": {"/vms": {}},
+            "/vms is not an object": {"/vms": 1},
+            "another key": {"vms": {"VM.Audit": 1}},
+            "granted on a single VM only": {"/vms/4321": {"VM.Audit": 1, "VM.Allocate": 1}},
+            "granted on a pool only": {"/pool/lab": {"VM.Audit": 1, "VM.Allocate": 1}},
+            "some at /vms, the rest on a pool": {"/vms": {"VM.Audit": 1}, "/pool/lab": {"VM.Allocate": 1}},
+        }
+        for name, payload in shapes.items():
+            with self.subTest(name):
+                self.assertIsNone(self._privileges(payload))
 
     def test_require_writes_refuses_the_pmx_transport(self) -> None:
         with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT": "pmx"}):

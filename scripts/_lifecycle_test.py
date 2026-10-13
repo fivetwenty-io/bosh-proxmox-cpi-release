@@ -525,7 +525,7 @@ class FakeCluster:
         self.destroyed_by_cpi: list[int] = []
         self.destroy_calls: list[tuple[str, int, dict]] = []
         self.runtime: dict[int, dict] = {}
-        self.privileges: "list[str]" = []
+        self.privileges: "list[str] | None" = []
         self.writes_allowed = True
         self.in_use_probes = 0
         self.appear_after_probes: "tuple[int, int] | None" = None
@@ -564,8 +564,8 @@ class FakeCluster:
         if not self.writes_allowed:
             raise _pve_verify.PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only")
 
-    def missing_vm_privileges(self) -> list[str]:
-        return list(self.privileges)
+    def missing_vm_privileges(self) -> "list[str] | None":
+        return None if self.privileges is None else list(self.privileges)
 
     def create_empty_vm(self, node: str, vmid, name: str) -> str:
         self.created.append(int(vmid))
@@ -1154,6 +1154,12 @@ class TestPreflight(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "lack VM.Allocate on /vms"):
             foreign.preflight(self.az2, self.said.append)
 
+    def test_an_unknown_answer_warns_and_continues(self) -> None:
+        self.az2.privileges = None
+        foreign.preflight(self.az2, self.said.append)
+        self.assertEqual(len(self.said), 1)
+        self.assertIn("pool or a single VM", self.said[0])
+
     def test_an_unreadable_permission_listing_warns_and_continues(self) -> None:
         def broken() -> list:
             raise _pve_verify.PVEVerifyError("GET /access/permissions failed: HTTP 403")
@@ -1161,6 +1167,56 @@ class TestPreflight(unittest.TestCase):
         self.az2.missing_vm_privileges = broken  # type: ignore[method-assign]
         foreign.preflight(self.az2, self.said.append)
         self.assertTrue(any("could not read" in line for line in self.said))
+
+
+class TestPreflightOnCannedPermissionAnswers(unittest.TestCase):
+    """The real verifier against canned /access/permissions answers, one per shape."""
+
+    CONFIG = {"host": "pve2.example", "port": 8006, "node": "pve2", "api_token": "svc@pve!t=s", "verify_ssl": False}
+
+    def _preflight(self, payload: object) -> "tuple[list[str], BaseException | None]":
+        said: list[str] = []
+        body = json.dumps({"data": payload}).encode("utf-8")
+        response = unittest.mock.MagicMock()
+        response.read.return_value = body
+        response.__enter__ = lambda r: r
+        response.__exit__ = unittest.mock.MagicMock(return_value=False)
+        verifier = _pve_verify.PVEVerifier(dict(self.CONFIG))
+        error: "BaseException | None" = None
+        with unittest.mock.patch("urllib.request.urlopen", return_value=response):
+            try:
+                foreign.preflight(verifier, said.append)
+            except RuntimeError as exc:
+                error = exc
+        return said, error
+
+    def test_every_answer_that_does_not_prove_a_lack_warns_and_lets_the_run_continue(self) -> None:
+        shapes = {
+            "a list": [],
+            "no /vms entry": {},
+            "an empty /vms entry": {"/vms": {}},
+            "a /vms entry that is not an object": {"/vms": "all"},
+            "privileges on a single VM": {"/vms/4321": {"VM.Audit": 1, "VM.Allocate": 1}},
+            "privileges on a pool": {"/pool/lab": {"VM.Audit": 1, "VM.Allocate": 1}},
+            "some at /vms and the rest on a pool": {"/vms": {"VM.Audit": 1}, "/pool/lab": {"VM.Allocate": 1}},
+        }
+        for name, payload in shapes.items():
+            with self.subTest(name):
+                said, error = self._preflight(payload)
+                self.assertIsNone(error)
+                self.assertEqual(len(said), 1)
+                self.assertTrue(said[0].startswith("note:"))
+
+    def test_an_answer_that_shows_the_privileges_granted_is_silent(self) -> None:
+        said, error = self._preflight({"/vms": {"VM.Audit": 1, "VM.Allocate": 1}})
+        self.assertIsNone(error)
+        self.assertEqual(said, [])
+
+    def test_only_a_positive_lack_at_vms_stops_the_run(self) -> None:
+        said, error = self._preflight({"/vms": {"VM.Audit": 1}})
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("lack VM.Allocate on /vms", str(error))
+        self.assertEqual(said, [])
 
 
 class TestPassMatchesTheHandlers(unittest.TestCase):

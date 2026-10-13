@@ -26,7 +26,8 @@ and the Go handler tests, because each needs a disk on the second cluster.
 
 The pass never acts on a VMID it did not create. The VM it hands to the CPI as
 the "foreign" guest is one it made itself. No real delete_vm for a VMID the
-pass did not make ever reaches the second cluster, because a CPI delete for a
+pass did not make ever reaches the second cluster (step 14b's delete_vm, bare
+or stamped, targets only the VM the pass made itself), because a CPI delete for a
 bare VMID destroys any VM its Director owns, and a guest could take the VMID
 between any check and the call. The stamped delete_vm calls are safe, since a
 stamped CID for another cluster or token is refused, and the bare CID gets only
@@ -278,17 +279,25 @@ def config_differences(before: dict[str, Any], after: dict[str, Any]) -> list[st
 def preflight(az2: Any, say: Callable[[str], None] = print) -> None:
     """Fail before anything runs if the pass cannot make and remove a VM on az2.
 
-    It needs the urllib transport, because the pmx transport only inspects, and
-    credentials that hold VM.Allocate on /vms. A permissions read that fails is
-    reported and does not stop the run, since PVE versions differ in what that
-    endpoint allows, and the create in step 14b still fails loudly if the token
-    cannot write.
+    It needs the urllib transport, because the pmx transport only inspects. It
+    also needs credentials that hold VM.Allocate, but the permissions read can
+    only warn. A read that fails, an answer of an unexpected shape, no entry
+    for /vms, and privileges granted on a pool or a single VM all leave the
+    question open, since PVE versions and least-privilege layouts differ, and
+    the create in step 14b still fails loudly if the credentials cannot write.
+    The run stops only when /vms is answered and positively lacks a privilege.
     """
     az2.require_writes()
     try:
         missing = az2.missing_vm_privileges()
     except Exception as exc:
         say(f"note: could not read the az2 credentials' privileges ({exc}); step 14b will find out when it writes")
+        return
+    if missing is None:
+        say(
+            "note: the az2 permissions answer does not show the credentials' privileges on /vms "
+            "(they may be granted on a pool or a single VM); step 14b will find out when it writes"
+        )
         return
     if missing:
         raise RuntimeError(

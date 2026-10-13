@@ -1265,19 +1265,36 @@ class PVEVerifier:
         if self._transport == "pmx":
             raise PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only; writes need the urllib transport")
 
-    def missing_vm_privileges(self, required: "tuple[str, ...]" = ("VM.Audit", "VM.Allocate")) -> list[str]:
-        """Return the privileges in required that the credentials lack on /vms.
+    def missing_vm_privileges(
+        self, required: "tuple[str, ...]" = ("VM.Audit", "VM.Allocate")
+    ) -> "list[str] | None":
+        """Return the privileges in required that the credentials provably lack on /vms.
 
-        VM.Allocate is what creating and destroying a VM needs. PVE answers the
-        effective permissions of the authenticated user or token, keyed by path.
+        PVE answers the effective permissions of the authenticated user or
+        token, keyed by path, and VM.Allocate is what creating and destroying a
+        VM needs. The answer is positive evidence of a lack only when /vms comes
+        back as a non-empty object that omits the privilege and no other path in
+        the answer grants it. Anything else returns None, meaning unknown: a
+        response of another shape, no /vms entry, an empty one, or privileges
+        granted on a pool or a single VM instead, which a least-privilege
+        layout uses and which this read cannot judge. An empty list means every
+        privilege is granted at /vms.
         """
         data = self._get("/access/permissions?path=%2Fvms")
         if not isinstance(data, dict):
-            raise PVEVerifyError("PVE permissions for /vms are not an object")
+            return None
         granted = data.get("/vms")
-        if not isinstance(granted, dict):
-            granted = {}
-        return [priv for priv in required if not granted.get(priv)]
+        if not isinstance(granted, dict) or not granted:
+            return None
+        missing = [priv for priv in required if not granted.get(priv)]
+        elsewhere = [
+            priv
+            for priv in missing
+            if any(path != "/vms" and isinstance(perms, dict) and perms.get(priv) for path, perms in data.items())
+        ]
+        if elsewhere:
+            return None
+        return missing
 
     def qemu_status(self, vmid: "int | str", node: str | None = None) -> dict[str, Any]:
         """Return the current runtime status of vmid (power state, lock), on its own node unless told otherwise."""
