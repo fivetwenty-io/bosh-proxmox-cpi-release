@@ -41,7 +41,7 @@ To run it, we work through these steps.
 
    The first cluster is the one that still holds the Director and every group that stays in `z1` and `z2`. We read the free memory of its nodes from the PVE web UI, or with `pvesh get /cluster/resources --type node` on one of its nodes. We then add up the memory of the vm_types for the groups that stay behind, using `manifests/cf/ops-resize-cf.yml` and `manifests/cf/cloud-config.yml`, plus any other VMs the cluster hosts. The free memory has to cover that total with room to spare. The three moved groups no longer count against it, so the check is about the groups that remain, and about anything else sharing the cluster.
 
-   The compile workers count too. The cloud-config puts compilation in `z1`, so on a Director that has no compiled packages for the stemcell yet, the first deploy runs four `compilation` VMs of 12 GiB each on the first cluster before it creates any instance VM. That 48 GiB peak can be larger than the steady state. Each worker also needs a single node with 12 GiB free, so we check the per-node figures as well as the total.
+   The compile workers count too. The cloud-config puts compilation in `z1`, so on a Director that has no compiled packages for the stemcell yet, the first deploy runs four `compilation` VMs of 12 GiB each on the first cluster before it creates any instance VM. That 48 GiB peak can be larger than the steady state. Each worker also needs a single node with 12 GiB free, so we check the per-node figures as well as the total. If the first cluster can't hold that peak, we move compilation to the second cluster. We add a `replace` operation to `manifests/envs/pve-cpi/cf-cloud-config.yml` that sets `/compilation/az` to `z3`, and then we re-run `./scripts/cf cloud-config`.
 
 3. Deploy with the layer.
 
@@ -49,7 +49,7 @@ To run it, we work through these steps.
    BOSH_PVE_ENV=pve-cpi ./scripts/cf deploy -o manifests/envs/pve-cpi/cf-az2.yml
    ```
 
-   The extra `-o` flag passes through to `bosh deploy`, after the lab's own ops files.
+   The extra `-o` flag passes through to `bosh deploy`, after the lab's own ops files. On a Director that has no CF releases compiled for the lab stemcell, the deploy stops and asks us to run `./scripts/cf precompile-releases` first. We can instead set `CF_REQUIRE_PRECOMPILE=0`. The deploy then falls back to cf-deployment's `use-compiled-releases.yml`, and the Director compiles each package whose compiled build targets a different stemcell version.
 
 4. Confirm the placement.
 
