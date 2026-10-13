@@ -20,7 +20,7 @@ func bridgeArgs(cp map[string]any) []json.RawMessage {
 }
 
 func ifaceList(names ...string) *sdknodes.ListNetworkResponse {
-	out := sdknodes.ListNetworkResponse{}
+	out := make(sdknodes.ListNetworkResponse, 0, len(names))
 	for _, n := range names {
 		out = append(out, json.RawMessage(`{"iface":"`+n+`","type":"bridge"}`))
 	}

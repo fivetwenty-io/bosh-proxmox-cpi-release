@@ -266,18 +266,21 @@ func TestWithRequestOverrides_IgnoredProfileFieldsWarning(t *testing.T) {
 // the misnested credential set fails, a lone misnested key warns, a Director
 // style key passes quietly, a spec key with no override only warns, and a
 // typo under pve or agent fails.
+// contextKeyRuleCase is one row of TestWithRequestOverrides_ContextKeyRules.
+type contextKeyRuleCase struct {
+	name      string
+	extra     map[string]any
+	wantErr   []string
+	wantWarn  string // message fragment of the one expected warning
+	wantAttr  string
+	wantNames any
+	wantDebug bool
+}
+
 func TestWithRequestOverrides_ContextKeyRules(t *testing.T) {
 	t.Parallel()
 	const misnestHint = "cpi_config properties must sit under pve: and agent:"
-	for _, tc := range []struct {
-		name      string
-		extra     map[string]any
-		wantErr   []string
-		wantWarn  string // message fragment of the one expected warning
-		wantAttr  string
-		wantNames any
-		wantDebug bool
-	}{
+	for _, tc := range []contextKeyRuleCase{
 		{name: "misnested credential set fails",
 			extra:   map[string]any{"host": "az2.example", "user": "u", "password": "secret-value"},
 			wantErr: []string{`"host"`, `"password"`, `"user"`, misnestHint}},
@@ -308,47 +311,53 @@ func TestWithRequestOverrides_ContextKeyRules(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			deps, obs, _ := clusterScopeDeps(overrideTestBaseConfig())
-			_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra})
-			if tc.wantErr != nil {
-				var ce *cpierrors.Error
-				if !errors.As(err, &ce) || ce.OkToRetry() {
-					t.Fatalf("want a non-retriable CloudError, got %v", err)
-				}
-				for _, s := range tc.wantErr {
-					if !strings.Contains(err.Error(), s) {
-						t.Errorf("error %q lacks %q", err, s)
-					}
-				}
-				for _, secret := range []string{"secret-value", "https://x"} {
-					if strings.Contains(err.Error(), secret) {
-						t.Errorf("error leaks a value: %q", err)
-					}
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("WithRequestOverrides: %v", err)
-			}
-			if tc.wantWarn != "" {
-				lines := entriesContaining(obs, tc.wantWarn)
-				if len(lines) != 1 || lines[0].Level != log.LevelWarn {
-					t.Fatalf("want exactly one Warn containing %q, got %d", tc.wantWarn, len(lines))
-				}
-				if got := lines[0].Attrs[tc.wantAttr]; !reflect.DeepEqual(got, tc.wantNames) {
-					t.Errorf("%s = %#v, want %#v", tc.wantAttr, got, tc.wantNames)
-				}
-			}
-			debugs := entriesContaining(obs, "top-level keys the CPI does not read")
-			if tc.wantDebug != (len(debugs) == 1) {
-				t.Errorf("debug lines = %d, want present=%v", len(debugs), tc.wantDebug)
-			}
-			for _, e := range obs.All() {
-				if e.Level >= log.LevelError {
-					t.Errorf("unexpected error-level line: %s", e.Message)
-				}
-			}
+			checkContextKeyRule(t, tc)
 		})
+	}
+}
+
+// checkContextKeyRule runs one contextKeyRuleCase and checks its outcome.
+func checkContextKeyRule(t *testing.T, tc contextKeyRuleCase) {
+	t.Helper()
+	deps, obs, _ := clusterScopeDeps(overrideTestBaseConfig())
+	_, err := deps.WithRequestOverrides(context.Background(), jsonrpc.Context{Extra: tc.extra})
+	if tc.wantErr != nil {
+		var ce *cpierrors.Error
+		if !errors.As(err, &ce) || ce.OkToRetry() {
+			t.Fatalf("want a non-retriable CloudError, got %v", err)
+		}
+		for _, s := range tc.wantErr {
+			if !strings.Contains(err.Error(), s) {
+				t.Errorf("error %q lacks %q", err, s)
+			}
+		}
+		for _, secret := range []string{"secret-value", "https://x"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("error leaks a value: %q", err)
+			}
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("WithRequestOverrides: %v", err)
+	}
+	if tc.wantWarn != "" {
+		lines := entriesContaining(obs, tc.wantWarn)
+		if len(lines) != 1 || lines[0].Level != log.LevelWarn {
+			t.Fatalf("want exactly one Warn containing %q, got %d", tc.wantWarn, len(lines))
+		}
+		if got := lines[0].Attrs[tc.wantAttr]; !reflect.DeepEqual(got, tc.wantNames) {
+			t.Errorf("%s = %#v, want %#v", tc.wantAttr, got, tc.wantNames)
+		}
+	}
+	debugs := entriesContaining(obs, "top-level keys the CPI does not read")
+	if tc.wantDebug != (len(debugs) == 1) {
+		t.Errorf("debug lines = %d, want present=%v", len(debugs), tc.wantDebug)
+	}
+	for _, e := range obs.All() {
+		if e.Level >= log.LevelError {
+			t.Errorf("unexpected error-level line: %s", e.Message)
+		}
 	}
 }
 

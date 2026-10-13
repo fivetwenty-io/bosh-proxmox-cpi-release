@@ -195,7 +195,7 @@ func TestPlainCheckRefs_SkipsVIPAndSDNVnets(t *testing.T) {
 	deps, client, _ := bridgeDeps(t, nil, nil, "enforce", nil)
 	client.cluster.vnets = []string{"vmbr2"}
 	refs := plainCheckRefs(context.Background(), deps, collectorSpec())
-	var got []string
+	got := make([]string, 0, len(refs))
 	for _, r := range refs {
 		got = append(got, r.bridge)
 	}

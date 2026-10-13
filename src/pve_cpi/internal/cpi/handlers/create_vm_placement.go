@@ -87,12 +87,11 @@ func resolveTargetNodeWithRNG(
 	ctx context.Context,
 	deps Deps,
 	cp createVMCloudProps,
-	groupTag string,
 	diskCIDs []string,
 	rng *rand.Rand,
 	cloudPropsMap map[string]any,
 ) (string, error) {
-	node, _, err := resolveTargetNodeWithFallbacks(ctx, deps, cp, groupTag, diskCIDs, rng, cloudPropsMap, 0)
+	node, _, err := resolveTargetNodeWithFallbacks(ctx, deps, cp, diskCIDs, rng, cloudPropsMap, 0)
 	return node, err
 }
 
@@ -122,7 +121,8 @@ func resolveTargetNodeWithRNG(
 //   - shared-storage disks with an AZ label constrain the AZ order.
 //   - bare legacy CIDs (no metadata) impose no constraint.
 //
-// groupTag, when non-empty, is the anti-affinity tag (e.g. "job--diego-cell")
+// It applies no anti-affinity group tag. The production create_vm paths call
+// resolveTargetNodeWithBridges directly with the tag (e.g. "job--diego-cell")
 // that activates scheduler-soft same-group spreading. rng is injected for
 // deterministic shuffle in tests; pass nil for production.
 //
@@ -137,13 +137,12 @@ func resolveTargetNodeWithFallbacks(
 	ctx context.Context,
 	deps Deps,
 	cp createVMCloudProps,
-	groupTag string,
 	diskCIDs []string,
 	rng *rand.Rand,
 	cloudPropsMap map[string]any,
 	fallbackMax int,
 ) (winner string, alternates []string, err error) {
-	return resolveTargetNodeWithBridges(ctx, deps, cp, groupTag, diskCIDs, rng, cloudPropsMap, fallbackMax, bridgePlan{})
+	return resolveTargetNodeWithBridges(ctx, deps, cp, "", diskCIDs, rng, cloudPropsMap, fallbackMax, bridgePlan{})
 }
 
 // resolveTargetNodeWithBridges is resolveTargetNodeWithFallbacks plus the plain

@@ -12,7 +12,7 @@ import (
 // specPropertyLine matches a property name line of jobs/pve_cpi/spec: two
 // spaces of indent, a pve. or agent. name, and a colon. Description text is
 // indented further, so it never matches.
-var specPropertyLine = regexp.MustCompile(`^  ((?:pve|agent)\.[A-Za-z0-9_.-]+):`)
+var specPropertyLine = regexp.MustCompile(`^ {2}((?:pve|agent)\.[A-Za-z0-9_.-]+):`)
 
 // TestJobSpecPropertyNamesMatchSpec keeps the generated name list equal to
 // the job spec, so a property added to the spec cannot be rejected as a typo

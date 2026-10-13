@@ -62,7 +62,7 @@ func TestResolveTargetNodeWithRNG_AZExhausted_StrictFailsNamingAZAndReasons(t *t
 		[]map[string]any{offlineNodeFact("pve1"), offlineNodeFact("pve2"), onlineNode("pve9")},
 		strictPlacement(map[string][]string{"z1": {"pve1", "pve2"}}))
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil {
 		t.Fatalf("strict must fail instead of placing on config.node; got node %q", node)
 	}
@@ -82,7 +82,7 @@ func TestResolveTargetNodeWithRNG_AZExhausted_DefaultWarnFallsBackToConfigNode(t
 		[]map[string]any{offlineNodeFact("pve1"), onlineNode("pve9")},
 		warnPlacement(map[string][]string{"z1": {"pve1"}}))
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
-	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", nil, nil, nil, 2)
+	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, nil, nil, nil, 2)
 	if err != nil {
 		t.Fatalf("default must keep the 0.9.3 fallback: %v", err)
 	}
@@ -104,13 +104,13 @@ func TestResolveTargetNodeWithRNG_OneNodeAZInMaintenance_StrictRetriableWarnFall
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 
 	strict, _ := azEnforcementDeps(t, nodes, strictPlacement(az))
-	_, err := resolveTargetNodeWithRNG(context.Background(), strict, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), strict, cp, nil, nil, nil)
 	if err == nil || !asCPIError(t, err).OkToRetry() {
 		t.Fatalf("strict one-node AZ down: want retriable error, got %v", err)
 	}
 
 	warn, _ := azEnforcementDeps(t, nodes, warnPlacement(az))
-	node, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, nil, nil, nil)
 	if err != nil || node != "pve9" {
 		t.Fatalf("warn one-node AZ down: node=%q err=%v, want pve9 and no error", node, err)
 	}
@@ -121,7 +121,7 @@ func TestResolveTargetNodeWithRNG_AZMapTypoNode_ReasonNamesMissingNode(t *testin
 	deps, _ := azEnforcementDeps(t,
 		[]map[string]any{offlineNodeFact("pve1"), onlineNode("pve9")},
 		strictPlacement(map[string][]string{"z1": {"pve1", "pve-typo"}}))
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{AvailabilityZone: "z1"}, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{AvailabilityZone: "z1"}, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected strict failure")
 	}
@@ -139,7 +139,7 @@ func TestResolveTargetNodeWithRNG_PerAZReasonsNotMaskedByFirstWins(t *testing.T)
 		[]map[string]any{offlineNodeFact("pve1"), offlineNodeFact("pve2"), onlineNode("pve9")},
 		strictPlacement(map[string][]string{"z1": {"pve1"}, "z2": {"pve2"}}))
 	cp := createVMCloudProps{AvailabilityZones: []string{"z1", "z2"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected strict failure")
 	}
@@ -172,7 +172,7 @@ func TestResolveTargetNodeWithRNG_NoAZ_KeepsConfigNodeFallback(t *testing.T) {
 	deps, buf := azEnforcementDeps(t,
 		[]map[string]any{offlineNodeFact("pve1")},
 		strictPlacement(map[string][]string{"z1": {"pve1"}}))
-	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{}, "", nil, nil, nil, 2)
+	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{}, nil, nil, nil, 2)
 	if err != nil || node != "pve9" || alts != nil {
 		t.Fatalf("no AZ requested: node=%q alternates=%v err=%v, want config.node pve9 even under strict", node, alts, err)
 	}
@@ -186,7 +186,7 @@ func TestResolveTargetNodeWithRNG_OnlyDLBSentinel_KeepsConfigNodeFallback(t *tes
 	deps, buf := azEnforcementDeps(t,
 		[]map[string]any{offlineNodeFact("pve1")},
 		strictPlacement(map[string][]string{"z1": {"pve1"}}))
-	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{AvailabilityZone: "dlb"}, "", nil, nil, nil, 2)
+	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{AvailabilityZone: "dlb"}, nil, nil, nil, 2)
 	if err != nil || node != "pve9" || alts != nil {
 		t.Fatalf("DLB sentinel only: node=%q alternates=%v err=%v, want config.node pve9 even under strict", node, alts, err)
 	}
@@ -201,7 +201,7 @@ func TestResolveTargetNodeWithRNG_MixedSentinelAndRealAZ_EnforcesRealAZ(t *testi
 		[]map[string]any{offlineNodeFact("pve1")},
 		strictPlacement(map[string][]string{"z1": {"pve1"}}))
 	cp := createVMCloudProps{AvailabilityZones: []string{"dlb", "z1"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), `availability_zone "z1"`) {
 		t.Fatalf("mixed order must enforce the real AZ; got %v", err)
 	}
@@ -237,7 +237,7 @@ func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_ResolvedBeforeBranch1(t *t
 				"small": {CloudProperties: map[string]any{"availability_zone": "z1"}},
 			}
 		})
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil, nil,
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, nil, nil,
 		map[string]any{"vm_type": "small"})
 	if err == nil || !strings.Contains(err.Error(), `availability_zone "z1"`) {
 		t.Fatalf("an AZ from the vm_type profile must be enforced; got %v", err)
@@ -251,7 +251,7 @@ func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_ResolvedBeforeBranch1(t *t
 				"small": {CloudProperties: map[string]any{"availability_zone": "z1"}},
 			}
 		})
-	node, err := resolveTargetNodeWithRNG(context.Background(), warn, createVMCloudProps{}, "", nil, nil,
+	node, err := resolveTargetNodeWithRNG(context.Background(), warn, createVMCloudProps{}, nil, nil,
 		map[string]any{"vm_type": "small"})
 	if err != nil || node != "pve9" || !strings.Contains(buf.String(), "pve1: node offline") {
 		t.Fatalf("warn with a profile AZ: node=%q err=%v, want pve9 and a Warn naming pve1", node, err)
@@ -261,7 +261,7 @@ func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_ResolvedBeforeBranch1(t *t
 func TestResolveTargetNodeWithRNG_TargetNodeIgnoresBadVMType(t *testing.T) {
 	t.Parallel()
 	deps, _ := azEnforcementDeps(t, []map[string]any{onlineNode("pve1")}, warnPlacement(map[string][]string{"z1": {"pve1"}}))
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{TargetNode: "pve1"}, "", nil, nil,
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{TargetNode: "pve1"}, nil, nil,
 		map[string]any{"vm_type": "no-such-profile"})
 	if err != nil || node != "pve1" {
 		t.Fatalf("an operator pin never needed the resolver; node=%q err=%v", node, err)
@@ -275,7 +275,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_WarnsWhenAZRequested(t *test
 		c.Node = "pve9"
 		c.Placement = &config.PlacementConfig{Enabled: &off, AZMap: map[string][]string{"z1": {"pve1"}}, AZEnforcement: "strict"}
 	})
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{AvailabilityZone: "z1"}, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{AvailabilityZone: "z1"}, nil, nil, nil)
 	if err != nil || node != "pve9" {
 		t.Fatalf("disabled placement must not fail: node=%q err=%v", node, err)
 	}
@@ -287,7 +287,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_WarnsWhenAZRequested(t *test
 		c.Node = "pve9"
 		c.Placement = &config.PlacementConfig{Enabled: &off, AZMap: map[string][]string{"z1": {"pve1"}}}
 	})
-	if _, err := resolveTargetNodeWithRNG(context.Background(), quiet, createVMCloudProps{}, "", nil, nil, nil); err != nil {
+	if _, err := resolveTargetNodeWithRNG(context.Background(), quiet, createVMCloudProps{}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(quietBuf.String(), "ignored") {
@@ -308,7 +308,7 @@ func TestResolveTargetNodeWithRNG_EmptyConfigNode_WarnKeepsFirstWinsClass(t *tes
 		warnPlacement(az)(c)
 		c.Node = ""
 	})
-	_, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, nil, nil, nil)
 	if err == nil || !asCPIError(t, err).OkToRetry() {
 		t.Fatalf("warn with empty config.node must keep the 0.9.3 Retriable class; got %v", err)
 	}
@@ -317,7 +317,7 @@ func TestResolveTargetNodeWithRNG_EmptyConfigNode_WarnKeepsFirstWinsClass(t *tes
 		strictPlacement(az)(c)
 		c.Node = ""
 	})
-	_, err = resolveTargetNodeWithRNG(context.Background(), strict, cp, "", nil, nil, nil)
+	_, err = resolveTargetNodeWithRNG(context.Background(), strict, cp, nil, nil, nil)
 	if err == nil || asCPIError(t, err).OkToRetry() {
 		t.Fatalf("strict with a typo node must be non-retriable; got %v", err)
 	}
@@ -337,12 +337,12 @@ func TestResolveTargetNodeWithRNG_OneNodeAZInMaintenanceTag_StrictRetriableWarnF
 	tagged[0]["tags"] = "maint"
 
 	strict, _ := azEnforcementDeps(t, tagged, withTag(strictPlacement))
-	_, err := resolveTargetNodeWithRNG(context.Background(), strict, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), strict, cp, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "pve1: node in maintenance") || !asCPIError(t, err).OkToRetry() {
 		t.Fatalf("strict: want retriable maintenance error, got %v", err)
 	}
 	warn, _ := azEnforcementDeps(t, tagged, withTag(warnPlacement))
-	node, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), warn, cp, nil, nil, nil)
 	if err != nil || node != "pve9" {
 		t.Fatalf("warn: node=%q err=%v, want pve9", node, err)
 	}

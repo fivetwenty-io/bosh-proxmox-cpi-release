@@ -987,7 +987,7 @@ func TestResolveTargetNodeWithRNG_SingleAZ_BackwardCompat(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1007,7 +1007,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstAZViable(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1031,7 +1031,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_FirstExhausted_FallsToSecond(t *testin
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1056,7 +1056,7 @@ func TestResolveTargetNodeWithRNG_MultiAZ_AllExhausted_RetriableError(t *testing
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for all-AZs-exhausted")
 	}
@@ -1087,7 +1087,7 @@ func TestResolveTargetNodeWithRNG_InAZOffline_OutAZOnline_Retriable(t *testing.T
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a"}}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when all in-AZ candidates are offline")
 	}
@@ -1108,7 +1108,7 @@ func TestResolveTargetNodeWithRNG_UnknownAZ_PermanentError(t *testing.T) {
 		}
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-unknown"}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown AZ")
 	}
@@ -1151,21 +1151,21 @@ func TestResolveTargetNodeWithRNG_AZShuffle_SeedControlsOrder(t *testing.T) {
 
 	// seed 0: shuffle keeps [zone-a, zone-b] → zone-a first → pve1 wins.
 	rngA := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA, nil)
+	nodeA, errA := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, rngA, nil)
 	if errA != nil {
 		t.Fatalf("seed=0 error: %v", errA)
 	}
 
 	// seed 2: shuffle produces [zone-b, zone-a] → zone-b first → pve2 wins.
 	rngB := rand.New(rand.NewSource(2)) //nolint:gosec // fixed seed — deterministic test
-	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngB, nil)
+	nodeB, errB := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, rngB, nil)
 	if errB != nil {
 		t.Fatalf("seed=2 error: %v", errB)
 	}
 
 	// Same seed must be deterministic.
 	rngA2 := rand.New(rand.NewSource(0)) //nolint:gosec // fixed seed — deterministic test
-	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, rngA2, nil)
+	nodeA2, _ := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, rngA2, nil)
 	if nodeA != nodeA2 {
 		t.Errorf("same seed must be deterministic; seed=0 got %q then %q", nodeA, nodeA2)
 	}
@@ -1216,7 +1216,7 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 		PVE:    &rawNodeTestPVE{cluster},
 		Logger: log.NewNopLogger(),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", nil, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2149,7 +2149,7 @@ func TestResolveTargetNodeWithRNG_LocalDisk_PinsNode(t *testing.T) {
 		},
 	)
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2175,7 +2175,7 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_SameNode_OK(t *testing.T) {
 		encodeLocalCID(t, "pve1"),
 		encodeLocalCID(t, "pve1"),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2205,7 +2205,7 @@ func TestResolveTargetNodeWithRNG_TwoLocalDisks_DifferentNodes_Error(t *testing.
 		encodeLocalCID(t, "pve1"),
 		encodeLocalCID(t, "pve2"),
 	}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for disks on different nodes; got nil")
 	}
@@ -2237,7 +2237,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConstrains_Compatible(t *testing.
 	)
 	diskCIDs := []string{encodeSharedCID(t, "ceph-pool", "zone-a")}
 	cp := createVMCloudProps{AvailabilityZones: []string{"zone-a", "zone-b"}}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2266,7 +2266,7 @@ func TestResolveTargetNodeWithRNG_SharedDisk_AZConflicts_Error(t *testing.T) {
 	)
 	diskCIDs := []string{encodeSharedCID(t, "ceph-pool", "zone-b")}
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"} // singular AZ — zone-a only
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for AZ conflict; got nil")
 	}
@@ -2295,7 +2295,7 @@ func TestResolveTargetNodeWithRNG_LocalDiskPinnedNodeOffline_Error(t *testing.T)
 		},
 	)
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when disk's home node is offline; got nil")
 	}
@@ -2323,7 +2323,7 @@ func TestResolveTargetNodeWithRNG_BareLocalCID_Inert(t *testing.T) {
 		},
 	)
 	diskCIDs := []string{"local-lvm:vm-100-disk-0"} // bare legacy — no constraint
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("bare CID must impose no constraint; got error: %v", err)
 	}
@@ -2347,7 +2347,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_LocalDiskPinsNode(t *testing
 		Resolver: &staticKindResolver{sharedPools: nil}, // all pools are local
 	}
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, "", diskCIDs, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2375,7 +2375,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeConflictsLocalDisk_Error(t *testing.
 	}
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, diskCIDs, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for target_node/disk conflict; got nil")
 	}
@@ -2406,7 +2406,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeMatchesLocalDisk_OK(t *testing.T) {
 	}
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve1"} // consistent with disk
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", diskCIDs, nil, nil)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, diskCIDs, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error when target_node matches disk node: %v", err)
 	}
@@ -2436,7 +2436,7 @@ func TestResolveTargetNodeWithFallbacks_TargetNodeConflictsLocalDisk_Error(t *te
 	}
 	diskCIDs := []string{encodeLocalCID(t, "pve1")}
 	cp := createVMCloudProps{TargetNode: "pve2"} // conflicts with disk on pve1
-	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", diskCIDs, nil, nil, 3)
+	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, diskCIDs, nil, nil, 3)
 	if err == nil {
 		t.Fatal("expected error for target_node/disk conflict; got nil")
 	}
@@ -2468,7 +2468,7 @@ func TestResolveTargetNodeWithFallbacks_UnknownAZ_Error(t *testing.T) {
 		},
 	)
 	cp := createVMCloudProps{AvailabilityZone: "zone-nope"}
-	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, "", nil, nil, nil, 3)
+	_, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, cp, nil, nil, nil, 3)
 	if err == nil {
 		t.Fatal("expected error for AZ missing from placement.az_map; got nil")
 	}
@@ -2620,7 +2620,7 @@ func TestResolveTargetNodeWithRNG_WeightOverride_NoProfile_NoOp(t *testing.T) {
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
 	// No weight keys in cloudPropsMap → must succeed with config defaults.
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, map[string]any{})
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, map[string]any{})
 	if err != nil {
 		t.Fatalf("no-override: unexpected error: %v", err)
 	}
@@ -2646,7 +2646,7 @@ func TestResolveTargetNodeWithRNG_WeightOverride_PerCall_MemAxis(t *testing.T) {
 	// Set a heavy placement_weight_mem; first viable AZ (zone-a → pve1) should win.
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
 	cpMap := map[string]any{"placement_weight_mem": float64(2.0)}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("weight override mem: unexpected error: %v", err)
 	}
@@ -2670,7 +2670,7 @@ func TestResolveTargetNodeWithRNG_WeightOverride_VMTypeProfile(t *testing.T) {
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
 	cpMap := map[string]any{"vm_type": "heavy"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("vm_type weight profile: unexpected error: %v", err)
 	}
@@ -2698,7 +2698,7 @@ func TestResolveTargetNodeWithRNG_WeightOverride_PerCallBeatsProfile(t *testing.
 		"vm_type":              "heavy",
 		"placement_weight_mem": float64(2.0),
 	}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("per-call beats profile: unexpected error: %v", err)
 	}
@@ -2722,7 +2722,7 @@ func TestResolveTargetNodeWithRNG_UnknownVMTypeSelector_CloudError(t *testing.T)
 	})
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
 	cpMap := map[string]any{"vm_type": "unknown-profile"}
-	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	_, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err == nil {
 		t.Fatal("expected CloudError for unknown vm_type selector; got nil")
 	}
@@ -2754,7 +2754,7 @@ func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_SingularUsed(t *testing.T)
 	})
 	cp := createVMCloudProps{} // no per-call AZ
 	cpMap := map[string]any{"vm_type": "zoned"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("profile singular AZ: unexpected error: %v", err)
 	}
@@ -2787,7 +2787,7 @@ func TestResolveTargetNodeWithRNG_AZFromVMTypeProfile_PluralUsed(t *testing.T) {
 	})
 	cp := createVMCloudProps{} // no per-call AZ
 	cpMap := map[string]any{"vm_type": "multi"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("profile plural AZs: unexpected error: %v", err)
 	}
@@ -2815,7 +2815,7 @@ func TestResolveTargetNodeWithRNG_AZCallBeatsProfile(t *testing.T) {
 	// Per-call says zone-a → pve1; profile says zone-b → pve2.
 	cp := createVMCloudProps{AvailabilityZone: "zone-a"}
 	cpMap := map[string]any{"vm_type": "zoned"}
-	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, "", nil, nil, cpMap)
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, cp, nil, nil, cpMap)
 	if err != nil {
 		t.Fatalf("call AZ beats profile: unexpected error: %v", err)
 	}
