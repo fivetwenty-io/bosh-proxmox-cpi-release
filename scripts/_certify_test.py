@@ -1730,8 +1730,20 @@ class PlacementStraysAndStampsTest(unittest.TestCase):
             {"vmid": 4000, "node": "n", "name": "someone-else", "tags": _tags(STAMP_Z1, "55555555", owner="other")},
         ]))
         self.assertFalse(_held(self.check(obs))["placement:strays"])
-        obs["exempt_vmids"] = ["100"]
+        obs["exempt_vmids"] = {"z1": ["100"]}
         self.assertTrue(_held(self.check(obs))["placement:strays"])
+
+    def test_the_directors_vmid_is_exempt_on_its_own_cluster_only(self) -> None:
+        obs = _canned_observation()
+        obs["exempt_vmids"] = {"z1": ["100"]}
+        obs["clusters"]["z2"]["resources"].extend(_spanning.thin_resources(
+            [{"vmid": 100, "node": "n", "name": "cpi-stray", "tags": _tags(STAMP_Z2, "66666666")}]))
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:strays"])
+        self.assertIn("VM 100 on the z2 cluster", _why(findings, "placement:strays"))
+        obs["clusters"]["z1"]["resources"].extend(_spanning.thin_resources(
+            [{"vmid": 100, "node": "n", "name": "cpi-director", "tags": _tags(STAMP_Z1, "44444444")}]))
+        self.assertNotIn("on the z1 cluster", _why(self.check(obs), "placement:strays"))
 
     def test_an_unknown_owner_leaves_nothing_to_look_for(self) -> None:
         obs = _canned_observation(stamped=False)
@@ -1921,6 +1933,35 @@ class MarkerAzTest(_CertifyModule):
             self.assertEqual("cert:write-marker-az" in [r[0] for r in c.rep.rows], expect)
 
 
+class CaptureExemptionTest(_CertifyModule):
+    """The capture exempts the Director VM on the first AZ's cluster only."""
+
+    def _capture(self, section: dict, director_cid: str) -> dict:
+        c = self._certify(section)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        c.rep = _Rep()
+        c.dry_run = False
+        c.pre, c.post = {}, {}
+        c.run_dir = Path(tmp.name)
+        c.director_version = "280"
+        c.old_cpi_label = c.new_cpi_label = "cpi"
+        c._director_identity = lambda: {"vm_cid": director_cid, "disk_cids": []}
+        c._deployment_identity = lambda: {"vm_cids": [], "disk_cids": []}
+        c._orphaned_disk_count = lambda: 0
+        c._disk_serials = lambda _target: {}
+        c._placement_observation = lambda: {"director_uuid": DIRECTOR_UUID, "instances": [], "clusters": {}}
+        self.assertTrue(c.capture("pre"))
+        return c.pre["placement"]
+
+    def test_the_directors_vmid_is_exempt_on_the_first_azs_cluster(self) -> None:
+        obs = self._capture(_spanning_section(), f"100-{STAMP_Z1}-77777777")
+        self.assertEqual(obs["exempt_vmids"], {"z1": ["100"]})
+
+    def test_an_unknown_director_vm_exempts_nothing(self) -> None:
+        self.assertEqual(self._capture(_spanning_section(), "")["exempt_vmids"], {})
+
+
 class ClassifierAndExampleTest(_CertifyModule):
     def test_bare_nats_or_blobstore_mentions_are_not_routing(self) -> None:
         for line in ("CPI error: cannot store blobstore id", "nats: stale subject", "failed to download stemcell"):
@@ -1935,7 +1976,7 @@ class ClassifierAndExampleTest(_CertifyModule):
         for line in lines[start:]:
             if not line.startswith("  # "):
                 break
-            block.append(line[4:] if line.startswith("  #   ") is False else line[4:])
+            block.append(line[4:])
         cfg = yaml.safe_load("certification:\n  " + "\n  ".join(b.rstrip() for b in block).replace("  \n", "\n"))
         ccfg = self.mod.certification_config(cfg, "cpitest", True)
         self.assertTrue(self.mod.is_spanning(ccfg))

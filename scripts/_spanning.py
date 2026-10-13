@@ -276,8 +276,9 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
     obs is the observation scripts/certify gathers: director_uuid, instances
     (parse_instances rows), and clusters, keyed by AZ, each with the thinned
     /cluster/resources rows, the thinned config of every instance VM on that
-    cluster, and any read error, plus exempt_vmids, the VMIDs the run owns
-    that are not instances (the Director VM). entries maps each AZ to its cpi-config
+    cluster, and any read error, plus exempt_vmids, which maps an AZ to the
+    VMIDs the run owns on that AZ's cluster that are not instances (the
+    Director VM, on the first AZ's cluster). entries maps each AZ to its cpi-config
     facts (cpi_entry_facts) plus the optional bridge and storage overrides.
 
     With expect_stamped the VM CIDs must be stamped, which is what the new
@@ -398,6 +399,11 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
                 problems["disk-cluster"].append(f"{label} VM {vmid}: its config was not read, so disk {disk[:20]} is unplaced")
             elif not _disk_on_vm(disk, config):
                 problems["disk-cluster"].append(f"{label} disk {disk[:20]} is not a drive of VM {vmid} on the {az} cluster")
+            # The observation holds the configs of the instance VMs only, so
+            # this finds a disk attached to another instance's VM on the other
+            # cluster. A disk attached to an unrelated VM is not seen: reading
+            # every VM's config on a shared cluster costs one API call per VM,
+            # and those VMs are not this run's to inspect.
             for other_az, other in sorted(clusters.items()):
                 if other_az == az:
                     continue
@@ -426,8 +432,9 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
     stray: list[str] = []
     if owner:
         owner_value = owner[len(OWNER_TAG_PREFIX):]
-        exempt = {str(v) for v in obs.get("exempt_vmids") or []}
+        exempt_by_az = obs.get("exempt_vmids") or {}
         for az, cluster in sorted(clusters.items()):
+            exempt = {str(v) for v in exempt_by_az.get(az) or []}
             for row in cluster.get("resources") or []:
                 vmid = row.get("vmid", "")
                 if vmid in instance_vmids or vmid in exempt:

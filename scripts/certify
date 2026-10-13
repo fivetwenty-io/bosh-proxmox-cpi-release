@@ -1729,7 +1729,10 @@ class Certify:
         if is_spanning(self.ccfg):
             target["placement"] = self._placement_observation()
             director_vm = target["director"]["vm_cid"]
-            target["placement"]["exempt_vmids"] = [_vmcid.as_path_id(director_vm)] if director_vm else []
+            # The Director VM runs on the first AZ's cluster and nowhere else.
+            target["placement"]["exempt_vmids"] = (
+                {self.ccfg["azs"][0]["az"]: [_vmcid.as_path_id(director_vm)]} if director_vm else {}
+            )
         (self.run_dir / f"capture-{when}.json").write_text(
             json.dumps(target, indent=2, sort_keys=True) + "\n"
         )

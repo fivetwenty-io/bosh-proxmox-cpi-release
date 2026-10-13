@@ -321,15 +321,17 @@ certification:
   # One deployment across two clusters (optional). Left unset, the run uses the
   # single AZ named by `az` and `cpi_id` above, exactly as before. With two
   # entries, the `simple` group runs two instances across z1 and z2, each with
-  # a persistent disk, and the run adds a probe and a placement check. A probe deployment proves
+  # a persistent disk, and the run adds two checks. A probe deployment proves
   # the z2 network reaches the Director's NATS and blobstore before the real
   # deploy. After the first release deploys, and again after the upgrade and
   # recreate, the placement check reads /cluster/resources from both clusters
   # and asserts that each instance's VM and disk sit on the cluster its AZ
   # names and nowhere else, inside that entry's VMID bands and vm_prefix, with
   # the bosh-owner-- and bosh-cluster-- tags matching the stamped CID, and that
-  # no other VM on either cluster carries the Director's owner tag. Finally it
-  # asserts the first release's VMs are gone from both clusters.
+  # no other VM on either cluster carries the Director's owner tag. The disk
+  # check reads the instance VMs' configs only, so a disk attached to an
+  # unrelated VM is not seen. Finally it asserts the first release's VMs are
+  # gone from both clusters.
   #
   # The first entry is the AZ the Director's base cloud config already defines,
   # so it takes only `az` and `cpi_id`. The second must be z2 and must carry
