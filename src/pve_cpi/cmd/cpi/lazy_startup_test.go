@@ -100,7 +100,17 @@ func TestRoutedRequestIgnoresJobCluster(t *testing.T) {
 		bRequests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/cluster/resources") {
-			_, _ = w.Write([]byte(`{"data":[{"id":"qemu/100","type":"qemu","vmid":100,"node":"pve-b","status":"running"}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"id":"qemu/100","type":"qemu","vmid":100,"node":"pve-b","status":"running","tags":"bosh-cpi"}]}`))
+			return
+		}
+		// The VM carries the bosh-cpi tag, so the ownership guard reads it as
+		// one this CPI created.
+		if strings.HasSuffix(r.URL.Path, "/qemu/100/config") || strings.HasSuffix(r.URL.Path, "/qemu/100/pending") {
+			if strings.HasSuffix(r.URL.Path, "/pending") {
+				_, _ = w.Write([]byte(`{"data":[{"key":"tags","value":"bosh-cpi"}]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"data":{"tags":"bosh-cpi"}}`))
+			}
 			return
 		}
 		_, _ = w.Write([]byte(`{"data":[]}`))

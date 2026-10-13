@@ -21,6 +21,11 @@ import (
 // any CID changes format.
 const stampedCIDFixture = "101-0a1b2c3d-4e5f6a7b"
 
+// stampedFixtureTags are the tags a VM carries when the CPI stamped its CID.
+// They hold the cluster and token from stampedCIDFixture, so the ownership
+// guard can prove that the CID names this VM.
+const stampedFixtureTags = "bosh-cpi;bosh-cluster--0a1b2c3d;bosh-cid--4e5f6a7b"
+
 var vmidPathSegment = regexp.MustCompile(`^/nodes/[^/]+/(?:qemu|lxc)/([^/]+)`)
 
 // strictVMIDPVE is an httptest PVE that answers 400 for any request whose vmid
@@ -84,7 +89,7 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 	case path == "/cluster/resources":
 		data = []any{map[string]any{
 			"id": "qemu/101", "type": "qemu", "vmid": 101, "node": "pve1", "status": "running",
-			"name": "vm-101", "tags": "bosh-cpi",
+			"name": "vm-101", "tags": stampedFixtureTags,
 		}}
 	case path == "/cluster/status":
 		data = []any{map[string]any{"type": "node", "name": "pve1", "online": 1}}
@@ -92,10 +97,15 @@ func (f *strictVMIDPVE) serve(w http.ResponseWriter, r *http.Request) {
 		data = []any{map[string]any{"name": "pve1"}}
 	case strings.HasSuffix(path, "/status/current"):
 		data = map[string]any{"status": "running", "vmid": 101}
+	case strings.HasSuffix(path, "/pending") && r.Method == http.MethodGet:
+		data = []any{
+			map[string]any{"key": "name", "value": "vm-101"},
+			map[string]any{"key": "tags", "value": stampedFixtureTags},
+		}
 	case strings.HasSuffix(path, "/config") && r.Method == http.MethodGet:
-		data = map[string]any{"name": "vm-101", "tags": "bosh-cpi", "description": ""}
+		data = map[string]any{"name": "vm-101", "tags": stampedFixtureTags, "description": ""}
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/qemu"):
-		data = []any{map[string]any{"vmid": 101, "status": "running", "name": "vm-101", "tags": "bosh-cpi"}}
+		data = []any{map[string]any{"vmid": 101, "status": "running", "name": "vm-101", "tags": stampedFixtureTags}}
 	case strings.Contains(path, "/tasks/"):
 		data = map[string]any{"status": "stopped", "exitstatus": "OK"}
 	case r.Method == http.MethodGet:
