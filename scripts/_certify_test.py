@@ -910,6 +910,7 @@ class DefaultAzsUnchangedTest(_CertifyModule):
                                         default_flow_style=False, sort_keys=False),
                          GOLDEN_SINGLE_AZ_OPS)
 
+    @unittest.skipUnless(shutil.which("bosh"), "the dry run past the slot guard needs bosh on PATH")
     def test_a_default_dry_run_is_the_output_it_always_was(self) -> None:
         repo = SyntheticRepo()
         self.addCleanup(repo.close)
@@ -1035,6 +1036,7 @@ class SpanningOpsTest(_CertifyModule):
         self.assertEqual(group["instances"], 1)
         self.assertNotIn("persistent_disk_type", group)
 
+    @unittest.skipUnless(shutil.which("bosh"), "the dry run past the slot guard needs bosh on PATH")
     def test_a_dry_run_lists_the_spanning_steps(self) -> None:
         repo = SyntheticRepo()
         self.addCleanup(repo.close)
