@@ -19,7 +19,7 @@ behavior** when no level is set — no migration required.
 Level 1 is the per-call override. Levels 2 and 3 are the `vm_type`/`disk_type`
 profile layers managed by `layeredResolver`. Level 4 rewrites the effective
 `CPIConfig` for one dispatched request from the cpi-config entry's properties —
-see [Design Decisions — D12](design-decisions.md#d12--per-request-cloud-property-overrides-from-cpi-config).
+see [Design Decisions, D12](design-decisions.md#d12-per-request-cloud-property-overrides-from-cpi-config).
 The override set is closed (`contextOverrideFieldOrder` in
 `internal/config/context_overrides.go`); for booleans it covers
 `pve_verify_ssl` and `pve_stemcell_replicate_local`. Level 5 is a `*bool` field on

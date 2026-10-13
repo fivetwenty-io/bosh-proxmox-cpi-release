@@ -43,7 +43,7 @@ flowchart LR
 
 <!--
 - The central fact of the hour: PVE is a very good hypervisor manager, but the cloud abstractions BOSH assumes simply don't exist on it.
-- So this CPI builds a scheduler from live cluster reads, invents fault domains from an operator-written map, and synthesizes durable disks from what PVE does offer.
+- So this CPI builds a scheduler from live cluster reads, treats each AZ as a separate cluster or host and spreads machines across its nodes, and synthesizes durable disks from what PVE does offer.
 - The factory image recurs all hour — each of chapters 4–7 is one manufactured primitive.
 - Q&A bait: "why not just use the vSphere/OpenStack CPI?" — different APIs, and PVE lacks the primitives those CPIs assume exist.
 -->

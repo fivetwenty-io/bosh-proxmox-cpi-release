@@ -6,7 +6,7 @@ This is a symptom-first triage runbook. Start from the failure you see, follow t
 
 The CPI surfaces three error shapes in BOSH task output:
 
-- **`Bosh::Clouds::CloudError`** (`ok_to_retry: false`) — terminal failure; the Director will not retry. Operator action required.
+- **`Bosh::Clouds::CloudError`** (`ok_to_retry: false`), which is a terminal failure. The Director will not retry, and operator action is required.
 
 - **`Bosh::Clouds::VMCreationFailed`** (`ok_to_retry: true`): transient `create_vm` failure. The Director retries the create with identical arguments, up to its `max_vm_create_tries` budget (default 5). If those retries also exhaust, the error escalates to the task log as a permanent failure.
 
@@ -129,7 +129,7 @@ config validation failed: config key "registry_endpoint" is no longer supported 
 
 **Fix**
 
-The BOSH registry agent mode has been removed in line with the upstream BOSH deprecation. Remove `pve.agent_mode: registry` and all `registry.*` properties from the CPI config. Set `pve.agent_mode: cloudinit` (or omit it — `cloudinit` is the default). See [Configuration](configuration.md#removed-bosh-registry).
+The BOSH registry agent mode has been removed in line with the upstream BOSH deprecation. Remove `pve.agent_mode: registry` and all `registry.*` properties from the CPI config. Set `pve.agent_mode: cloudinit` (or omit it, since `cloudinit` is the default). See [Configuration](configuration.md#removed-bosh-registry).
 
 ### VMID range too low
 
@@ -208,6 +208,28 @@ After:
       host: pve2.example.com
       api_token: ((az2_token))
 ```
+
+### An entry fails with no credentials or an incomplete credential group
+
+**Symptom**
+
+```text
+config: context entry for host "pve2.example.com" changes pve.host but supplies no credentials; set pve.api_token, or pve.user and pve.password, and pve.ca_cert if that cluster uses a private CA
+```
+
+or
+
+```text
+config: context entry for host "pve2.example.com" sets pve.password but its credential group is incomplete, and an entry never borrows job-level credentials to complete it; set pve.api_token, or pve.user and pve.password
+```
+
+**Diagnosis**
+
+Credentials travel with the endpoint as a group of `user`, `password`, and `api_token`. An entry that changes `host` or `port` inherits none of the job-level group, and an entry that names any credential key gets only the credentials it names. The effective group must hold an `api_token`, or a `user` together with a `password`, so a bare `password` or a bare `user` fails. The message names the entry's host and the property keys, and never a credential value. The CPI does this on purpose, because an entry that inherited the job token would send it to the other cluster.
+
+**Fix**
+
+Set `api_token` on the entry, or set both `user` and `password`. If the cluster sits behind a private CA, set `ca_cert` on the entry too, because the job-level CA does not follow the request to another endpoint. When the entry uses `user` and the cluster's realm differs from the job's, set `realm` or write `user` as `user@realm`. [Multi-Cluster Deployments](multi-cluster.md#per-entry-credentials-and-ca) covers the full rules.
 
 ### Stemcell path outside staging directory
 
@@ -387,11 +409,11 @@ See the [Operations Runbook](operations.md) for orphan cleanup procedures. The C
 PVE VM 106 on node "pve01" is locked (clone); recover with `qm unlock 106` on node "pve01", then retry: ...
 ```
 
-Because this error is retriable, the BOSH Director keeps re-driving the same failing call — `bosh task <id> --debug` shows the identical error repeating across retries without ever succeeding.
+Because this error is retriable, the BOSH Director keeps re-driving the same failing call, and `bosh task <id> --debug` shows the identical error repeating across retries without ever succeeding.
 
 **Diagnosis**
 
-A worker process (`pvedaemon` or a `qm` child) was killed, or the PVE node rebooted, while a `clone`, `create`, `backup`, `migrate`, `snapshot`, or `rollback` task was in flight against the VM. PVE writes the operation's name into the guest config's `lock:` attribute before starting the task and only clears it on that task's normal completion; a task that dies mid-flight leaves the lock behind permanently. Every subsequent stop/destroy call against that VMID is rejected by PVE's own guest-config lock check until the lock is cleared — PVE's HTTP API has no unlock endpoint, so nothing the CPI does over the API can clear it unilaterally.
+A worker process (`pvedaemon` or a `qm` child) was killed, or the PVE node rebooted, while a `clone`, `create`, `backup`, `migrate`, `snapshot`, or `rollback` task was in flight against the VM. PVE writes the operation's name into the guest config's `lock:` attribute before starting the task and only clears it on that task's normal completion; a task that dies mid-flight leaves the lock behind permanently. Every subsequent stop/destroy call against that VMID is rejected by PVE's own guest-config lock check until the lock is cleared. PVE's HTTP API has no unlock endpoint, so nothing the CPI does over the API can clear it unilaterally.
 
 Confirm the lock directly:
 
@@ -401,19 +423,19 @@ qm config <vmid> | grep ^lock:
 
 **Fix**
 
-The CPI attempts an automatic recovery first: if it is authenticated as the `root@pam` superuser via **password** — `pve.user: root`, `pve.realm: pam` (or `pve.user: root@pam`) and a password — it retries the failing stop/destroy call once with PVE's `skiplock` parameter, which bypasses the guest-config lock check. PVE honors `skiplock` **only** for that exact identity; it rejects the parameter for every other identity, including an API token owned by `root@pam` (`pve.api_token: root@pam!<token-id>=<secret>`) and a least-privilege token issued to any other user, regardless of the ACL roles or privileges granted to that user — a token's authenticated identity always carries a `!<token-id>` suffix, which never equals the bare `root@pam` PVE's check requires. When the CPI is *not* authenticated as `root@pam` via password, or the `skiplock` retry itself fails, the error above is the final, actionable outcome and manual recovery is required:
+The CPI attempts an automatic recovery first: if it is authenticated as the `root@pam` superuser via **password** (`pve.user: root`, `pve.realm: pam` or `pve.user: root@pam`, and a password), it retries the failing stop/destroy call once with PVE's `skiplock` parameter, which bypasses the guest-config lock check. PVE honors `skiplock` **only** for that exact identity; it rejects the parameter for every other identity, including an API token owned by `root@pam` (`pve.api_token: root@pam!<token-id>=<secret>`) and a least-privilege token issued to any other user, regardless of the ACL roles or privileges granted to that user, because a token's authenticated identity always carries a `!<token-id>` suffix, which never equals the bare `root@pam` PVE's check requires. When the CPI is *not* authenticated as `root@pam` via password, or the `skiplock` retry itself fails, the error above is the final, actionable outcome and manual recovery is required:
 
 ```bash
 qm unlock <vmid>
 ```
 
-Run this on the PVE node that hosts the VM (the node named in the error message). Once unlocked, the BOSH Director's next retry of `delete_vm` (or the original `create_vm`, if the lock was hit during a rollback) succeeds normally — no CPI restart or manifest change is needed.
+Run this on the PVE node that hosts the VM (the node named in the error message). Once unlocked, the BOSH Director's next retry of `delete_vm` (or the original `create_vm`, if the lock was hit during a rollback) succeeds normally, and no CPI restart or manifest change is needed.
 
 **`pve.fast_path_delete` and this same `skiplock` dependency:** `fast_path_delete`'s destroy calls also rely on `skiplock=true` to reclaim a locked or still-running VM without a separate unlock/stop step. If `fast_path_delete: true` is set under an identity `skiplock` is not honored for, the CPI logs a startup Warn naming the configured identity (see [Configuration Reference](configuration.md) for `pve.fast_path_delete`); check the CPI process log for that Warn before assuming a manual `qm unlock` is the only path forward.
 
 **Interaction with `debug.keep_failed_vms` and the `bosh-create-failed` tag**
 
-When a `create_vm` rollback (`cleanupVM`) hits this condition and cannot clear the lock (not `root@pam`, or the `skiplock` retry also failed), the VM is left running and orphaned — it was never meant to be preserved, but ended up stuck regardless of the `pve.debug.keep_failed_vms` setting (see [CPI Methods — `create_vm`](cpi_methods.md#create_vm) for that flag's normal, opt-in preserve-for-inspection behavior). The CPI tags it `bosh-create-failed` on a best-effort basis (when the failing rollback has a BOSH deploy identity to tag with) so an operator can find it the same way:
+When a `create_vm` rollback (`cleanupVM`) hits this condition and cannot clear the lock (not `root@pam`, or the `skiplock` retry also failed), the VM is left running and orphaned. It was never meant to be preserved, but it ended up stuck regardless of the `pve.debug.keep_failed_vms` setting (see [CPI Methods, `create_vm`](cpi_methods.md#create_vm) for that flag's normal, opt-in preserve-for-inspection behavior). The CPI tags it `bosh-create-failed` on a best-effort basis (when the failing rollback has a BOSH deploy identity to tag with) so an operator can find it the same way:
 
 ```bash
 pvesh get /cluster/resources --type vm | jq '.[] | select(.tags != null and (.tags | contains("bosh-create-failed"))) | {vmid:.vmid, node:.node, tags:.tags}'
@@ -464,7 +486,7 @@ dial tcp <pve_host>:8006: connect: connection timed out
 
 **Diagnosis**
 
-`create-env`'s CPI runs on the workstation, which can reach the PVE API; the **in-VM CPI** runs on the Director, so this only appears once a deploy drives the Director's CPI. It means the Director cannot reach `https://<pve_host>:8006`. The usual cause is the **host firewall**: with `pve-firewall` enabled, `8006` is allowed only from a management source set, and a Director on an isolated SDN subnet is not in it. A `connect: connection timed out` (no RST) is the signature of a DROP, not a routing black hole — the packet reaches the host and is dropped.
+`create-env`'s CPI runs on the workstation, which can reach the PVE API; the **in-VM CPI** runs on the Director, so this only appears once a deploy drives the Director's CPI. It means the Director cannot reach `https://<pve_host>:8006`. The usual cause is the **host firewall**: with `pve-firewall` enabled, `8006` is allowed only from a management source set, and a Director on an isolated SDN subnet is not in it. A `connect: connection timed out` (no RST) is the signature of a DROP, not a routing black hole, because the packet reaches the host and is dropped.
 
 Confirm from inside the Director (jumpbox user, key in `creds.yml:/jumpbox_ssh/private_key`):
 
@@ -477,7 +499,7 @@ A timeout confirms the block; `200` means the API is reachable and the fault is 
 
 **Fix**
 
-Permit the isolated subnet to reach the API. `BOSH_PVE_ENV=<env> ./scripts/bosh net-up` does this automatically (idempotent rules in `/etc/pve/nodes/<node>/host.fw` for the configured subnet → `8006` + ICMP, then a firewall reload); `net-status` shows them and `net-down` removes them. See [Networks — Host firewall: API access from the isolated subnet](networks.md#isolated-test-network-sdn).
+Permit the isolated subnet to reach the API. `BOSH_PVE_ENV=<env> ./scripts/bosh net-up` does this automatically (idempotent rules in `/etc/pve/nodes/<node>/host.fw` for the configured subnet → `8006` + ICMP, then a firewall reload); `net-status` shows them and `net-down` removes them. See [Networks, Host firewall for API access from the isolated subnet](networks.md#isolated-test-network-sdn).
 
 ## VM ownership refusals
 
@@ -715,7 +737,7 @@ The resize operation returns a PVE error indicating the new size is smaller than
 
 **Fix**
 
-PVE does not support disk shrink. You can only increase disk size. See [Persistent Disks — Known Limitations](persistent-disks.md#known-limitations).
+PVE does not support disk shrink. You can only increase disk size. See [Persistent Disks, Known Limitations](persistent-disks.md#known-limitations).
 
 ### Parker anchor missing (parked disk with no holder)
 
@@ -1786,7 +1808,7 @@ The Director retries and the error persists past the retry/timeout budget (defau
 
 **Diagnosis**
 
-SDN state propagates from the node that ran `UpdateSdn` to every other cluster node over inter-node SSH (root-to-root, keyed by the pmxcfs cluster trust). If that SSH path is broken to one node, the commit succeeds locally but never reaches that node — `create_network` reports success while the vnet stays permanently unrealized there, and every `create_vm` that lands a NIC on it fails this gate. This is node-trust breakage, not a CPI or PVE API fault; the CPI's own polling cannot fix it, only surface it.
+SDN state propagates from the node that ran `UpdateSdn` to every other cluster node over inter-node SSH (root-to-root, keyed by the pmxcfs cluster trust). If that SSH path is broken to one node, the commit succeeds locally but never reaches that node. In that state `create_network` reports success while the vnet stays permanently unrealized there, and every `create_vm` that lands a NIC on it fails this gate. This is node-trust breakage, not a CPI or PVE API fault; the CPI's own polling cannot fix it, only surface it.
 
 On the node named in the error:
 
@@ -1808,7 +1830,7 @@ Verify root SSH trust between the node that committed the change and the node wh
 ssh root@<other-node> hostname
 ```
 
-An interactive password prompt, a host-key mismatch, or a connection refusal — rather than an immediate, unattended success — is the signature of broken cluster SSH trust.
+An interactive password prompt, a host-key mismatch, or a connection refusal, rather than an immediate, unattended success, is the signature of broken cluster SSH trust.
 
 **Fix**
 
@@ -1818,9 +1840,9 @@ Repair root SSH trust between the affected nodes (regenerate/re-distribute `/etc
 pvesh set /cluster/sdn
 ```
 
-Once the vnet is confirmed present (`ip -d link show <vnet>` on every node, `pending` clears in `pvesh get /cluster/sdn`), retry the failed `create_vm`/`create_network` call — the Director re-drives automatically since the error is retriable, or trigger a fresh deploy attempt.
+Once the vnet is confirmed present (`ip -d link show <vnet>` on every node, `pending` clears in `pvesh get /cluster/sdn`), retry the failed `create_vm`/`create_network` call. The Director re-drives automatically since the error is retriable, or we can trigger a fresh deploy attempt.
 
-If this happens repeatedly across a cluster, treat it as a standing infrastructure issue (node join/rejoin, certificate rotation, or a firewall change breaking inter-node SSH) rather than a one-off — the CPI's `pve.network_resolve_retries` gate (see [Configuration — SDN network management](configuration.md#sdn-network-management)) only bounds how long a *transient* propagation delay is tolerated before failing loudly; it cannot resolve a persistently broken trust relationship.
+If this happens repeatedly across a cluster, treat it as a standing infrastructure issue (node join/rejoin, certificate rotation, or a firewall change breaking inter-node SSH) rather than a one-off. The CPI's `pve.network_resolve_retries` gate (see [Configuration, SDN network management](configuration.md#sdn-network-management)) only bounds how long a *transient* propagation delay is tolerated before failing loudly; it cannot resolve a persistently broken trust relationship.
 
 ### SDN zone or vnet not found
 
@@ -1841,11 +1863,11 @@ With defaults the CPI creates zones itself (the turnkey vxlan zone `bosh` when n
 
 1. Zone auto-management was disabled (`pve.sdn_auto_manage_zone: false`) and the zone named by `pve.sdn_zone` or `cloud_properties.zone` was never created. Create it in the PVE web UI, or re-enable auto-management.
 
-2. `sdn_zone_type: evpn` is in use and the EVPN zone is missing. The CPI never creates EVPN zones — the operator creates the zone and its controller (BGP peering, route reflectors) in PVE first; the CPI then manages only vnets and subnets inside it.
+2. `sdn_zone_type: evpn` is in use and the EVPN zone is missing. The CPI never creates EVPN zones, so the operator creates the zone and its controller (BGP peering, route reflectors) in PVE first; the CPI then manages only vnets and subnets inside it.
 
-3. SDN itself is unavailable: `libpve-network-perl` is not installed on every cluster node, or the token lacks `SDN.Allocate` on `/sdn` — required by default now that SDN is the default network mode.
+3. SDN itself is unavailable, either because `libpve-network-perl` is not installed on every cluster node or because the token lacks `SDN.Allocate` on `/sdn`, which the CPI requires by default now that SDN is the default network mode.
 
-See [Configuration — SDN network management](configuration.md#sdn-network-management) and [create_network](cpi_methods.md#create_network).
+See [Configuration, SDN network management](configuration.md#sdn-network-management) and [create_network](cpi_methods.md#create_network).
 
 ### Small packets pass, large packets hang (SDN MTU)
 
@@ -1873,23 +1895,23 @@ ip link show eth0                 # in each guest — must match the vnet MTU
 
 **Fix**
 
-VXLAN encapsulation spends roughly 50 bytes per frame, so the overlay MTU must be the smallest underlay MTU minus that tax — everywhere. The usual causes:
+VXLAN encapsulation spends roughly 50 bytes per frame, so the overlay MTU must be the smallest underlay MTU minus that tax, on every hop. The usual causes are these.
 
 1. Mixed underlay MTUs across nodes: one node's physical path runs 1500 while another runs 9000, or a switch in between clamps lower. The overlay must fit the smallest underlay on every node-to-node path.
 
 2. A manual MTU override: `pve.sdn_zone_mtu` (or a hand-edited zone) set higher than the underlay affords. Unset it and let PVE derive the value, or set it to smallest-underlay − 50.
 
-3. A guest that does not inherit the bridge MTU: the CPI sets `mtu=1` on virtio NICs so guests inherit automatically, but non-virtio NIC models and hand-configured guests keep 1500. Use virtio NICs or set the guest interface MTU to match the vnet. `create_vm` logs a Warn at create time naming the NIC, model, and vnet whenever `cloud_properties.network_model` (or a `network_defaults`/`disk_type`/`vm_type` profile) overrides the virtio default on an SDN vnet — check the create_vm log for `non-virtio NIC model on an SDN vnet` if this is a newly deployed VM rather than a pre-existing one.
+3. A guest that does not inherit the bridge MTU. The CPI sets `mtu=1` on virtio NICs so guests inherit automatically, but non-virtio NIC models and hand-configured guests keep 1500. Use virtio NICs or set the guest interface MTU to match the vnet. `create_vm` logs a Warn at create time naming the NIC, model, and vnet whenever `cloud_properties.network_model` (or a `network_defaults`/`disk_type`/`vm_type` profile) overrides the virtio default on an SDN vnet. If this is a newly deployed VM rather than a pre-existing one, check the create_vm log for `non-virtio NIC model on an SDN vnet`.
 
 4. A middlebox dropping fragments or ICMP "fragmentation needed" between nodes, which turns a recoverable mismatch into a silent blackhole.
 
-See [Networks — VXLAN overlay defaults](networks.md#vxlan-overlay-defaults-peers-vnis-and-mtu) for the MTU model and [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations) for the verification commands.
+See [Networks, VXLAN overlay defaults](networks.md#vxlan-overlay-defaults-peers-vnis-and-mtu) for the MTU model and [Operations, SDN VXLAN operations](operations.md#sdn-vxlan-operations) for the verification commands.
 
 ### Cross-node VM traffic dead, same-node fine (VXLAN)
 
 **Symptom**
 
-Two VMs on the same PVE node communicate normally over a CPI-created vnet; the same pair split across nodes cannot pass any traffic at all — not even ARP or small pings (which distinguishes this from the MTU entry above, where small packets pass).
+Two VMs on the same PVE node communicate normally over a CPI-created vnet; the same pair split across nodes cannot pass any traffic at all, not even ARP or small pings (which distinguishes this from the MTU entry above, where small packets pass).
 
 **Diagnosis**
 
@@ -1905,17 +1927,17 @@ pvesh get /cluster/sdn/zones --pending 1
 
 **Fix**
 
-Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale — for example a node was offline when the CPI created the zone — set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations — SDN VXLAN operations](operations.md#sdn-vxlan-operations).
+Open UDP 4789 between all cluster nodes in every firewall on the path (PVE host firewall, switch ACLs, external firewalls). If the zone's peer list is stale, for example because a node was offline when the CPI created the zone, set `pve.sdn_vxlan_peers` explicitly and recreate the network, or edit the zone's peer list in PVE and re-apply. See [Operations, SDN VXLAN operations](operations.md#sdn-vxlan-operations).
 
 ### VM on a VLAN vnet has no connectivity
 
 **Symptom**
 
-A VM attached to a VLAN vnet (`bridge: vlan59`-style, zone type `vlan`) cannot reach its gateway or peers on other nodes. Same-node VM-to-VM traffic on the vnet may still work — the tag never has to leave the node in that case.
+A VM attached to a VLAN vnet (`bridge: vlan59`-style, zone type `vlan`) cannot reach its gateway or peers on other nodes. Same-node VM-to-VM traffic on the vnet may still work, because the tag never has to leave the node in that case.
 
 **Diagnosis**
 
-Work outward from the vnet, in this order — the CPI configures only the first item; the rest is fabric:
+Work outward from the vnet, in the order below. The CPI configures only the first item, and the rest is fabric.
 
 ```bash
 # 1. The vnet exists, carries the expected VLAN ID, and is applied (not pending).
@@ -1931,11 +1953,11 @@ tcpdump -ni <underlay-uplink> -e vlan <id>
 # 4. The switch port trunks the VLAN (check the switch config, not the node).
 ```
 
-Also confirm the VLAN ID matches the fabric's plan — a vnet tagged with an auto-allocated ID (band 2000–2999) only works if the fabric trunks that range; explicit `cloud_properties.vnet_tag` values from the network team's VLAN plan are the recommended path.
+Also confirm the VLAN ID matches the fabric's plan, because a vnet tagged with an auto-allocated ID (band 2000–2999) only works if the fabric trunks that range; explicit `cloud_properties.vnet_tag` values from the network team's VLAN plan are the recommended path.
 
 **Fix**
 
-Fix the first failing layer: apply pending SDN changes (`pvesh set /cluster/sdn`), set `bridge-vlan-aware yes` plus a covering `bridge-vids` on the underlay bridge of every node and reload networking, or trunk the VLAN on the switch ports. If the tag itself is wrong, recreate the network with the correct `vnet_tag`. See [Operations — SDN VLAN operations](operations.md#sdn-vlan-operations) for the pre-flight checklist.
+Fix the first failing layer by applying pending SDN changes (`pvesh set /cluster/sdn`), setting `bridge-vlan-aware yes` plus a covering `bridge-vids` on the underlay bridge of every node and reloading networking, or trunking the VLAN on the switch ports. If the tag itself is wrong, recreate the network with the correct `vnet_tag`. See [Operations, SDN VLAN operations](operations.md#sdn-vlan-operations) for the pre-flight checklist.
 
 ## Memory pressure and ballooning
 
@@ -1960,7 +1982,7 @@ The CPI writes `balloon: 0` by default, so a non-zero or absent value means some
 
 **Fix**
 
-Remove the enabling value (or set `pve.balloon: "0"` explicitly) and recreate the affected VMs — the setting applies on VM creation, not in place. If ballooning is intentional, size job memory expectations to the balloon floor rather than the manifest `memory` value. See [Configuration](configuration.md) for the full `pve.balloon` reference.
+Remove the enabling value (or set `pve.balloon: "0"` explicitly) and recreate the affected VMs, because the setting applies on VM creation and not in place. If ballooning is intentional, size job memory expectations to the balloon floor rather than the manifest `memory` value. See [Configuration](configuration.md) for the full `pve.balloon` reference.
 
 ## Live migration failures
 
@@ -2000,7 +2022,7 @@ Per instance group, `cloud_properties.cpu_type` overrides the global value. The 
 
 `bosh vms` shows `unresponsive agent` or the deploy hangs on `Waiting for the agent on VM '<vmid>'`.
 
-**Diagnosis — ConfigDrive ISO missing**
+**Diagnosis (ConfigDrive ISO missing)**
 
 The agent gets its BOSH settings from the ConfigDrive ISO on `scsi30`. If it is absent, the agent starts but has no config and never reports.
 
@@ -2011,13 +2033,13 @@ pvesm list local --content iso | grep vm-<vmid>-config.iso
 
 If the ISO is missing, see the [Operations Runbook](operations.md) for ISO verification and recovery steps.
 
-**Diagnosis — pve_host not reachable from Director VM**
+**Diagnosis (pve_host not reachable from Director VM)**
 
 `pve.host` is written into the rendered `cpi.json` on the Director. The Director's own CPI calls dial that address from inside the Director VM, not from your workstation.
 
 Use the PVE node's LAN IP (e.g., `192.168.1.180`), not a Tailscale or VPN hostname. See [Deploying a Director](bosh-create-env.md#pve_host-must-be-reachable-from-the-director-vm).
 
-**Diagnosis — NATS / mbus unreachable from new VM**
+**Diagnosis (NATS / mbus unreachable from new VM)**
 
 The new VM must be able to connect back to the Director's mbus address over port 6868. Verify the Director address in the rendered config:
 
@@ -2027,7 +2049,7 @@ sudo cat /var/vcap/jobs/pve_cpi/config/cpi.json | jq '.agent_mbus'
 
 Confirm the bridge, gateway, and DNS in `vars.yml` place the VM on a subnet that can reach the Director IP. See [Deploying a Director](bosh-create-env.md) and [ConfigDrive](configdrive.md).
 
-**Diagnosis — TCP keepalive idle drops**
+**Diagnosis (TCP keepalive idle drops)**
 
 If the agent was reachable but disconnects after an idle period, TCP keepalive settings on the PVE node may be too aggressive. Apply these sysctl values:
 
@@ -2039,11 +2061,11 @@ sysctl -w net.ipv4.tcp_keepalive_probes=4
 
 See [PVE Host Tuning](pve-host-tuning.md) for persistent configuration.
 
-**Diagnosis — duplicate IP on a shared LAN (ARP ambiguity)**
+**Diagnosis (duplicate IP on a shared LAN, ARP ambiguity)**
 
-This is the root cause of the most confusing variant: an agent that connects, runs fine for ~15 seconds, then drops with `connection reset by peer`, reconnects, and repeats — while every resource, NATS, firewall, and the agent process itself measure healthy. It surfaces during large deploys (cf-deployment) as random instances failing `Timed out sending 'get_state'` even though nothing is wrong inside the VM.
+This is the root cause of the most confusing variant, where an agent connects, runs fine for ~15 seconds, then drops with `connection reset by peer`, reconnects, and repeats, while every resource, NATS, firewall, and the agent process itself measure healthy. It surfaces during large deploys (cf-deployment) as random instances failing `Timed out sending 'get_state'` even though nothing is wrong inside the VM.
 
-The trigger is a second device on the same L2 segment answering ARP for an address BOSH assigned to a VM. When the deployment subnet overlaps a physical office/lab LAN (e.g. CF VMs placed directly on `192.168.1.0/24`), an address handed to a VM can collide with a printer, laptop, or appliance already using it. Two MACs then answer `who-has`, the Director's ARP cache flaps between them, and mbus packets are periodically delivered to the wrong host, which RSTs them. An idle connection (mbus between RPCs) drifts onto the wrong MAC on the next ARP refresh — hence the ~15 s reachable-then-break cadence that mimics a keepalive problem.
+The trigger is a second device on the same L2 segment answering ARP for an address BOSH assigned to a VM. When the deployment subnet overlaps a physical office/lab LAN (e.g. CF VMs placed directly on `192.168.1.0/24`), an address handed to a VM can collide with a printer, laptop, or appliance already using it. Two MACs then answer `who-has`, the Director's ARP cache flaps between them, and mbus packets are periodically delivered to the wrong host, which RSTs them. An idle connection (mbus between RPCs) drifts onto the wrong MAC on the next ARP refresh, which explains the ~15 s reachable-then-break cadence that mimics a keepalive problem.
 
 Confirm it from the PVE node by watching who replies to ARP while sweeping the range:
 
@@ -2061,7 +2083,7 @@ In the capture, any IP that shows two distinct `is-at <mac>` answers is a duplic
 
 Stop sharing an L2 segment with unmanaged devices. Put the Director and the deployment on a dedicated, isolated network the CPI controls, so BOSH owns the entire address range and no foreign device can claim an address. This repo ships a turnkey isolated network on a private `172.x` range backed by a PVE SDN vnet (`cpitest0` by default), created by `./scripts/bosh net-up` and selected with `BOSH_PVE_ENV=cpitest`. The vnet name, zone, CIDR, gateway, reserved bands, and static IPs are all operator-configurable. See [Isolated test network (SDN)](networks.md#isolated-test-network-sdn) for the full procedure.
 
-If an isolated network is not an option, reserve every colliding address in the deployment's cloud-config `reserved:` list so BOSH never assigns it — but re-scan whenever the physical LAN changes, since any new device can introduce a fresh collision.
+If an isolated network is not an option, we reserve every colliding address in the deployment's cloud-config `reserved:` list so BOSH never assigns it, and we re-scan whenever the physical LAN changes, since any new device can introduce a fresh collision.
 
 ## Storage lock contention and transient transport faults
 
@@ -2119,7 +2141,7 @@ If these appear frequently, raise `MAX_WORKERS` in `/etc/default/pvedaemon` and 
 
 **Symptom**
 
-Every GET-style read (`qm status`, `qm config`, `pvesh get ...`) keeps working normally, but every mutating call — `create_vm`, `create_disk`, `attach_disk`, `resize_disk`, `delete_vm`, and any other operation that writes to a VM or storage config — fails with a 5xx error containing one of two phrases:
+Every GET-style read (`qm status`, `qm config`, `pvesh get ...`) keeps working normally, but every mutating call fails with a 5xx error containing one of two phrases. The mutating calls are `create_vm`, `create_disk`, `attach_disk`, `resize_disk`, `delete_vm`, and any other operation that writes to a VM or storage config.
 
 ```text
 error writing config, cfs-lock failed - not quorate
@@ -2133,15 +2155,17 @@ no quorum
 
 **Cause**
 
-PVE's cluster filesystem (`/etc/pve`, backed by pmxcfs) requires a quorate corosync cluster — a strict majority of configured nodes reachable and agreeing on cluster state — before it will accept writes. When quorum is lost, `/etc/pve` becomes read-only cluster-wide. Two causes account for nearly all occurrences:
+PVE's cluster filesystem (`/etc/pve`, backed by pmxcfs) requires a quorate corosync cluster, meaning a strict majority of configured nodes that are reachable and agree on cluster state, before it will accept writes. When quorum is lost, `/etc/pve` becomes read-only cluster-wide. Two causes account for nearly all occurrences:
 
-- **Node loss below majority** — enough nodes are powered off, rebooting, or network-partitioned that the surviving set no longer has more than half the configured votes. A 3-node cluster loses quorum the moment 2 nodes are unreachable; a 5-node cluster tolerates 2 node losses but not 3.
+- **Node loss below majority**
+  Enough nodes are powered off, rebooting, or network-partitioned that the surviving set no longer has more than half the configured votes. A 3-node cluster loses quorum the moment 2 nodes are unreachable; a 5-node cluster tolerates 2 node losses but not 3.
 
-- **Corosync network trouble** — the corosync ring network (a separate link from the PVE management network on well-configured clusters, but sometimes shared) is dropping packets, partitioned, or saturated, so nodes that are otherwise up cannot agree on membership.
+- **Corosync network trouble**
+  The corosync ring network (a separate link from the PVE management network on well-configured clusters, but sometimes shared) is dropping packets, partitioned, or saturated, so nodes that are otherwise up cannot agree on membership.
 
 **Diagnosis**
 
-Run on any reachable node — quorum status is cluster-wide, so any node's view is representative:
+Quorum status is cluster-wide, so we can run this on any reachable node and read the same answer:
 
 ```bash
 pvecm status
@@ -2151,11 +2175,11 @@ Look at the `Quorate` line (`Yes`/`No`) and the `Votequorum information` block: 
 
 **Behavior**
 
-The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Because quorum loss is a minutes-scale condition — waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup — the CPI retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a retriable failure (`Bosh::Clouds::VMCreationFailed` from `create_vm`, `Bosh::Clouds::CloudError` with `ok_to_retry: true` elsewhere) and recovery happens on the next deploy or task retry.
+The CPI classifies this condition as retriable and injects an operator hint into the error message (`` cluster has lost quorum; mutations are blocked until quorum returns — check `pvecm status` ``) so the raw 5xx is not left anonymous in task output. Quorum loss is a minutes-scale condition, since waiting for a node to reboot or a network partition to heal takes far longer than a worker-pool hiccup. The CPI therefore retries it on the storage-lock backoff curve (2 seconds → 30 seconds, 10 attempts, ±30% jitter) rather than the shorter transient-transport curve (1 second → 15 seconds, 8 attempts) used for ordinary 5xx errors. If quorum returns within that window, the retry succeeds transparently and the BOSH task shows no visible interruption beyond the added latency; if quorum does not return in time, the error escalates to the task log as a retriable failure (`Bosh::Clouds::VMCreationFailed` from `create_vm`, `Bosh::Clouds::CloudError` with `ok_to_retry: true` elsewhere) and recovery happens on the next deploy or task retry.
 
 **Fix**
 
-Restore quorum: bring the missing node(s) back online, or resolve the corosync network partition. No CPI-side action is needed or possible — the CPI cannot restore cluster membership; it can only wait for `/etc/pve` to become writable again. Once `pvecm status` reports `Quorate: Yes`, mutating operations resume automatically on the next CPI retry.
+To restore quorum, bring the missing node(s) back online or resolve the corosync network partition. No CPI-side action is needed or possible, because the CPI cannot restore cluster membership and can only wait for `/etc/pve` to become writable again. Once `pvecm status` reports `Quorate: Yes`, mutating operations resume automatically on the next CPI retry.
 
 ## Task timeouts
 
@@ -2806,7 +2830,7 @@ The first is a VM-scan issue about the `[bosh_storage_allocation]` block in the 
 
 ## Two cpi-config entries on one cluster
 
-Two cpi-config entries can point at the same PVE cluster, usually to map two AZs onto different nodes of it. PVE refuses a create for a VMID that already exists, so the entries can't collide on a VMID. What they can share is the cluster's parker band and its allocation journal namespace. The CPI warns about both and refuses neither, so the warnings below are prompts to review the entries rather than failures.
+Two cpi-config entries can point at the same PVE cluster, although that is not the multi-AZ shape, because each AZ is a separate cluster or standalone host. To spread VMs across the nodes of one cluster we use `placement.az_map` inside a single entry instead, as [Multi-Cluster Deployments](multi-cluster.md#per-entry-placement-and-node-spreading) describes. Entries that do share a cluster also share its VMID space, so the parker warnings in [Multi-Cluster Deployments](multi-cluster.md#parker-bands) apply to them. When two entries do share a cluster, PVE refuses a create for a VMID that already exists, so the entries can't collide on a VMID. What they can share is the cluster's parker band and its allocation journal namespace. The CPI warns about both and refuses neither, so the warnings below are prompts to review the entries rather than failures.
 
 ### Moving a parker band while parkers hold disks
 

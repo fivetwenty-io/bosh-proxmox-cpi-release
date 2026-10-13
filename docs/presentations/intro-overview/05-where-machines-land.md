@@ -35,21 +35,20 @@ flowchart LR
 
 ---
 
-## Availability zones are a map we write
+## Availability zones and node groups
 
 ```yaml
 placement:
   az_map:
-    z1: [pve01, pve02]
-    z2: [pve03, pve04]
+    z1: [pve01, pve02, pve03]
 ```
 
-- PVE has no AZs — we invent them as named node groups
-- **The trap:** each `vm_type` must also set `availability_zone`
+- A PVE AZ is a separate cluster or host; the node map spreads machines inside one AZ
+- **The trap:** the AZ must also set `cloud_properties.availability_zone`
 
 <!--
-- Cloud-config AZs now mean genuinely separate hardware — a VM asking for z1 is confined to those nodes before scoring runs.
-- The trap deserves the full minute: BOSH does not pass the cloud-config AZ name to the CPI. Without cloud_properties.availability_zone on every vm_type, the zone features are silently inert — VMs create fine, nothing is pinned, and no warning fires in the plain case (only the HA-pinning opt-in logs one per unpinned VM; docs/ha-and-resurrection.md has the wiring). An unknown zone name is a hard error, never a silent fall-through.
+- Each AZ is its own cluster or host through its own cpi-config entry; inside one AZ, a VM asking for z1 is confined to those nodes before scoring runs.
+- The trap deserves the full minute: BOSH does not pass the cloud-config AZ name to the CPI. Without cloud_properties.availability_zone on the AZ, the zone features are silently inert — VMs create fine, nothing is pinned, and no warning fires in the plain case (only the HA-pinning opt-in logs one per unpinned VM; docs/ha-and-resurrection.md has the wiring). An unknown zone name is a hard error, never a silent fall-through.
 -->
 
 ---

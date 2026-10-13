@@ -23,20 +23,19 @@ flowchart TD
 ```
 *Placement is a funnel: filter by zone if one was asked for, score the survivors, pick a winner.*
 
-## Availability zones are a map we write
+## Availability zones and node groups
 
-Spreading load is not the same as surviving a failure. Real resilience needs fault domains — groups of nodes that fail separately, on different racks or power feeds. Proxmox has no concept of an availability zone, so the CPI lets us invent them: a simple mapping in configuration from zone names to node lists.
+Spreading load is not the same as surviving a failure. Real resilience needs fault domains — groups of nodes that fail separately, on different racks or power feeds. On Proxmox an availability zone is a separate cluster or a standalone host, and each one is reached through its own cpi-config entry. Inside one zone's cluster, the CPI can still spread machines across nodes with a simple mapping in configuration from zone names to node lists.
 
 ```yaml
 placement:
   az_map:
-    z1: [pve01, pve02]
-    z2: [pve03, pve04]
+    z1: [pve01, pve02, pve03]
 ```
 
-A VM that asks for `z1` is confined to those nodes before scoring even begins. The cloud config we already write for BOSH — jobs spread across `z1` and `z2` — now translates into machines genuinely spread across different hardware.
+A VM that asks for `z1` is confined to those nodes before scoring even begins. The mapping spreads machines across different hardware inside one zone, and the [multi-cluster guide](../multi-cluster.md#per-entry-placement-and-node-spreading) explains how it relates to the zone-to-entry binding.
 
-One honest trap deserves a spotlight, because it is invisible until the day a node dies: BOSH does not pass the cloud-config zone name down to the CPI on its own. The zone must also appear in each `vm_type`'s `cloud_properties` as `availability_zone`. Leave that out, and the zone features are silently inert — every VM is created, everything looks fine, and nothing is actually pinned anywhere. Only the HA-pinning opt-in in the next section even logs a warning per unpinned VM; the plain case stays silent. The HA and resurrection guide walks through the full wiring.
+One honest trap deserves a spotlight, because it is invisible until the day a node dies: BOSH does not pass the cloud-config zone name down to the CPI on its own. The zone name must also appear in `cloud_properties` as `availability_zone`, which we set on the zone itself so every machine in it receives it. Leave that out, and the zone features are silently inert — every VM is created, everything looks fine, and nothing is actually pinned anywhere. Only the HA-pinning opt-in in the next section even logs a warning per unpinned VM; the plain case stays silent. The HA and resurrection guide walks through the full wiring.
 
 ## Making the decision stick
 

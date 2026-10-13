@@ -266,7 +266,7 @@ On Proxmox, a BOSH availability zone is a separate PVE cluster or standalone hos
 azs:
 - name: z1
   cpi: pve-az1
-- name: z2
+- name: z3
   cpi: pve-az2
 
 disk_pools:

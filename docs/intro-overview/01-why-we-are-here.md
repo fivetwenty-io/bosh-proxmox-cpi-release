@@ -29,7 +29,7 @@ Because the contract is the same everywhere, swapping the cloud under a deployme
 
 Here is the fact that shapes everything else we will see today: Proxmox VE is not a cloud. It is a very good hypervisor manager, but it was never designed around the abstractions a cloud takes for granted. It has no scheduler that picks the best node for a new VM. It has no concept of an availability zone. It has no durable volume that outlives the machine it is attached to. It has no portable, cluster-wide network identity.
 
-A CPI for AWS mostly translates, because AWS already has all of those things. This CPI has to *manufacture* them. It builds a scheduler out of live cluster reads. It invents fault domains from a mapping we write down. It synthesizes durable disks out of the one durable thing Proxmox does offer. Think of it as a small factory standing between BOSH and the hypervisor, stamping out the cloud primitives Proxmox lacks. That factory image will come back again and again this hour.
+A CPI for AWS mostly translates, because AWS already has all of those things. This CPI has to *manufacture* them. It builds a scheduler out of live cluster reads. It treats each availability zone as a separate cluster or host and spreads machines across the nodes inside it. It synthesizes durable disks out of the one durable thing Proxmox does offer. Think of it as a small factory standing between BOSH and the hypervisor, stamping out the cloud primitives Proxmox lacks. That factory image will come back again and again this hour.
 
 ## What we will leave with
 

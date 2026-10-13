@@ -603,7 +603,7 @@ See [PVE Storage Locking](pve-storage-locking.md) for full lock mechanics.
 
 ## Stemcell lifecycle across directors
 
-When two or more BOSH directors share one PVE cluster — a management director and one or more environment directors, or several environment directors side by side — they can all depend on the same stemcell. This section covers what happens to a stemcell's cache template and backing qcow2 file as each director independently uploads and cleans it up. See [Design Decisions — D3](design-decisions.md#d3--stemcell-refcounting-per-director-reference-sets) for the reference-tracking design behind this.
+When two or more BOSH directors share one PVE cluster — a management director and one or more environment directors, or several environment directors side by side — they can all depend on the same stemcell. This section covers what happens to a stemcell's cache template and backing qcow2 file as each director independently uploads and cleans it up. See [Design Decisions, D3](design-decisions.md#d3-stemcell-refcounting-per-director-reference-sets) for the reference-tracking design behind this.
 
 A template tagged `bosh-stemcell-node-<node>` or `bosh-stemcell-storage-<storage-id>` is a replica. Replicas hold no reference of their own. From this release, `delete_stemcell` sweeps every replica of the stemcell whose last reference just dropped, whichever director built it. Earlier releases preserved a replica whose provenance named another director, and left it behind. A replica that still backs a linked clone makes `delete_stemcell` fail with the replica's VMID and node, and the retry resumes once those VMs are gone.
 
