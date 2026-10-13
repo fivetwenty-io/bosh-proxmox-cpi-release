@@ -73,6 +73,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - A 0.9.3 CPI keeps the `bosh-owner--` tag on a VM and ignores it, so rolling back changes no stored state. It also lets a `cloud_properties.tags` key render a CPI-owned prefix again, as it did before. It also stops running the VM ownership guard, so `vm_ownership_guard` and `pve_vm_ownership_guard` have no effect, and no stored state changes. The misnested and misspelled cpi-config keys that this release rejects are ignored again, so a corrected entry keeps working after a rollback.
 
+- **Upgrade note. Roll back below this release only after you follow the downgrade steps.** Every release before this one, including 0.9.3, cannot parse a stamped CID, so each call on a stamped VM fails, and so does deleting a stamped snapshot or a `bosh create-env` Director VM whose state file holds a stamped CID. Before you roll back, follow the steps in [Downgrading below stamped CIDs](docs/operations.md#downgrading-below-stamped-cids). Those steps set `pve.vm_cid_format` to `bare`, recreate every deployment and Director, and delete the stamped snapshots and orphaned VMs. Setting `bare` before the first upgrade to this release avoids the problem.
+
 ### Added
 
 - A `cpi_config` entry can set its own `ca_cert`, as `pve.ca_cert` or `pve_ca_cert`, to verify its cluster's API certificate. An entry on a different host or port no longer falls back to the job-level CA. A malformed value fails with an error that names the key and never prints the PEM.
@@ -91,6 +93,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `scripts/bats` accepts an optional `bats.secondary` block in `ci/integration.yml` that repeats the acceptance run through a second `cpi_config` entry, `pve-az2` by default, with that entry's own network values, so we can show each entry working on its own. We also check the second entry's address bands when the config loads, so a typo fails before the first pass starts, and the run report now records the second pass. A run without the block behaves as before, and `--skip-secondary` returns a configured run to the primary entry alone.
 
+- `create_vm` now returns a stamped VM CID in the form `<vmid>-<cluster8>-<token8>`, such as `101-0a1b2c3d-4e5f6a7b`, and tags the VM with matching `bosh-cluster--` and `bosh-cid--` tags. The cluster stamp is the first eight hex characters of the SHA-256 of the cluster's root CA, and the token is new for every VM. Snapshot CIDs carry the stamp too, so a stamped VM's snapshots get CIDs such as `101-0a1b2c3d-4e5f6a7b:<snapshot>`. VMs created before the upgrade keep their bare CIDs and their old answers.
+
+- Every VM handler now refuses a stamped CID that names another cluster, and it answers `VMNotFound` for a CID whose token differs from the VM at that VMID. When a stamped CID's VM is absent from this cluster and its stamp names another cluster, the answer depends on the call. `delete_vm`, `reboot_vm`, `set_vm_metadata`, `attach_disk`, and `detach_disk` refuse with a non-retriable error, while `has_vm` answers `false` and logs the verdict, and `delete_snapshot` answers success with a warning. Bare CIDs, and CIDs whose stamp is `00000000`, keep the answers they had.
+
+- The new `pve.vm_cid_format` property takes `stamped`, which is the default, or `bare`. Under `bare`, `create_vm` and `snapshot_disk` return bare VMIDs while the CPI still writes both tags. The property is job-level only, so a `pve_vm_cid_format` key in a `cpi_config` entry never changes the CID form. It fails the request with the unknown-key error when it is the entry's only `pve_` key, and otherwise the CPI ignores it and logs a warning. The CPI never rewrites a CID the Director already holds, so `bare` protects a rollback only when we set it before the first stamped CID exists.
+
+- The new `pve.cluster_stamp_aliases` property lists a cluster's earlier stamps, each as eight lowercase hex characters. Replacing the cluster's root CA changes its stamp, and a stamped CID whose VM is absent would then look like it names another cluster, so we list the old stamp here, and those CIDs count as this cluster's again. A `cpi_config` entry can override the list as `pve_cluster_stamp_aliases`, and an entry that points at another PVE endpoint gets no aliases unless it sets the key itself. The CPI refuses `00000000` and any duplicate entry.
+
 ### Fixed
 
 - A request for one `cpi_config` entry no longer depends on the job-level cluster. Before, the CPI probed the job cluster's pools and storage before it read the request, so a down job cluster slowed every call, and a revoked job credential failed every call, including `info` and calls for healthy clusters. `info` now touches no PVE API at all.
@@ -100,6 +110,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 - The `notes_audit` hook now writes a new VM's Notes through the PVE client that the `create_vm` request itself used. A VM created on an overridden cluster no longer causes the Notes of an unrelated VM with the same VMID on the job-level cluster to be rewritten.
 
 - `docs/best-practices.md` and the CPI comparison no longer claim that the `config.node` fallback is silent or that a strict pin never falls back. They now describe the warning and the `strict` opt-in. The operations guide also no longer says that a `bosh create-env` Director never calls `set_vm_metadata`, because it does, right after `create_vm`.
+
+- The parker check in `delete_vm` no longer answers success after a single 404 from the node the cluster index named. The CPI now looks for the VM across every member, deletes it where it now runs, and answers success only after the two-sweep absence proof comes back clean. An offline member or a failed sweep gives a retriable error.
+
+- A managed `create_vm` retry after a closed attempt now stamps the VM it builds. The replacement carries the cluster and CID tags and returns a stamped CID, which honors `pve.vm_cid_format`.
 
 ### Security
 
