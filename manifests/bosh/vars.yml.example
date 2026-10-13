@@ -10,6 +10,13 @@ pve_password:        REPLACE_ME
 # pve_password or pve_api_token; leave the other empty string.
 # Format: <user>!<token-id>=<uuid>  e.g. root@pam!bosh-cpi=8b452463-0990-409a-9b24-3920cb778ef3
 pve_api_token:       ""
+# The second cluster's own credentials. They are needed only when the
+# two-entry manifests/cpi-config.yml is applied, where the pve-az2 entry reads
+# them in place of the three keys above. Give a user plus either a password or
+# an api_token, and leave the other empty string.
+pve_az2_user:        root@pam
+pve_az2_password:    REPLACE_ME
+pve_az2_api_token:   ""
 pve_node:            pve1
 pve_vm_storage:      local-lvm
 pve_disk_storage:    local-lvm

@@ -340,8 +340,10 @@ certification:
   # cpi_id, and manifests/cpi-config.yml must define both. When `az` and
   # `cpi_id` are also set above, they must agree with the first entry, or the
   # run stops before it starts. The PVE host, VMID
-  # bands, and VM prefix come from those entries, and the credentials come from
-  # the variables they already use, so no new secret enters this file.
+  # bands, and VM prefix come from those entries. The credentials come from
+  # the variables each entry names, which are pve_user, pve_password, and
+  # pve_api_token for the first entry and pve_az2_user, pve_az2_password, and
+  # pve_az2_api_token for the second, so no secret enters this file.
   #
   # `bridge` and `storage` are optional and apply to the second entry only.
   # Both clusters in the lab use vmbr0 and the same storage ID, so a run that

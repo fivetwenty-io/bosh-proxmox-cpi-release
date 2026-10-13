@@ -157,6 +157,15 @@ def _resolve(value: object, reader: Callable[[str], "str | None"], what: str) ->
     return str(value)
 
 
+_CREDENTIAL_KEYS = ("user", "password", "api_token")
+
+
+def _var_name(value: object) -> "str | None":
+    """The variable a single ((var)) reference names, or None."""
+    match = _VAR_REF.match(value.strip()) if isinstance(value, str) else None
+    return match.group(1) if match else None
+
+
 def _band(pve: dict, start_key: str, end_key: str, entry: str) -> tuple[int, int]:
     try:
         lo, hi = int(pve[start_key]), int(pve[end_key])
@@ -170,14 +179,35 @@ def _band(pve: dict, start_key: str, end_key: str, entry: str) -> tuple[int, int
     return lo, hi
 
 
+def cpi_entry_literal(path: Path, cpi_id: str, key: str) -> str:
+    """The literal value one entry writes for a credential key, or "".
+
+    Only the code that builds the PVE config calls this, and the value must
+    never go into a facts dict, a report row, or a message.
+    """
+    try:
+        doc = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    entries = doc.get("cpis") if isinstance(doc, dict) else None
+    entry = next((e for e in entries or [] if isinstance(e, dict) and e.get("name") == cpi_id), None)
+    value = ((entry or {}).get("properties") or {}).get("pve", {}).get(key)
+    return "" if value is None or _var_name(value) else str(value)
+
+
 def cpi_entry_facts(path: Path, cpi_id: str, reader: Callable[[str], "str | None"]) -> dict:
     """What the placement check needs to know about one cpi-config entry.
 
     Reads the host, port, VM prefix, and the VM and disk bands from the
     entry in manifests/cpi-config.yml. ((var)) references resolve through
-    reader, the layered vars lookup, and the credential variables are not
-    read here at all. Raises ValueError, naming the entry, when it is
-    missing or lacks a field.
+    reader, the layered vars lookup. The credential variables are not read
+    here. Their names come back under credential_vars, keyed user,
+    password, and api_token, with None for a key the entry leaves out or
+    sets to a literal. The keys written as literals come back, sorted, under
+    credential_literal_keys. No credential value is ever returned, so the
+    facts are safe to carry around and report; cpi_entry_literal reads a
+    literal's value from the entry at the point of use. Raises
+    ValueError, naming the entry, when it is missing or lacks a field.
     """
     try:
         doc = yaml.safe_load(path.read_text()) or {}
@@ -196,6 +226,11 @@ def cpi_entry_facts(path: Path, cpi_id: str, reader: Callable[[str], "str | None
         "vm_prefix": "",
         "vm_range": _band(pve, "vmid_range_start", "vmid_range_end", cpi_id),
         "disk_range": _band(pve, "disk_vmid_range_start", "disk_vmid_range_end", cpi_id),
+        "credential_vars": {key: _var_name(pve.get(key)) for key in _CREDENTIAL_KEYS},
+        "credential_literal_keys": sorted(
+            key for key in _CREDENTIAL_KEYS
+            if pve.get(key) not in (None, "") and _var_name(pve.get(key)) is None
+        ),
     }
     if pve.get("port") is not None:
         raw_port = _resolve(pve["port"], reader, f"cpi-config entry {cpi_id} pve.port")

@@ -1032,7 +1032,7 @@ class Certify:
 
     def _pve_cfg(self) -> dict:
         def _reader(path: str) -> "str | None":
-            return layered_var(self.env_name, path)
+            return self._layered(path)
         return _lightstemcell.pve_cfg_from_bosh_vars(BOSH_VARS, reader=_reader)
 
     # -- preflight ----------------------------------------------------------- #
@@ -1142,8 +1142,10 @@ class Certify:
         The placement check asserts each instance against its entry's host,
         VMID bands, and VM prefix, so a missing entry or band fails here, in
         seconds, rather than after the deployment is up. Only the entry's
-        non-secret fields are read. The PVE credentials are read later, from
-        the variables the first entry already uses, and never printed.
+        non-secret fields are read here. Each later entry's credential
+        variables must resolve, so a missing one fails now and is named
+        without its value. The credentials themselves are read later and
+        never printed.
         """
         if self.dry_run:
             self.rep.record("spanning:cpi-config", PASS, 0.0, "dry-run")
@@ -1151,7 +1153,7 @@ class Certify:
         t0 = time.monotonic()
 
         def _reader(path: str) -> "str | None":
-            return layered_var(self.env_name, path)
+            return self._layered(path)
 
         facts: dict[str, dict] = {}
         try:
@@ -1166,6 +1168,13 @@ class Certify:
                 "both cpi-config entries name the same PVE host, so they are not two clusters",
             )
         self.az_facts = facts
+        try:
+            # The first entry reads the base variables that the vars preflight
+            # already checks, so only the later entries are resolved here.
+            for az in list(facts)[1:]:
+                self._pve_creds_for(az)
+        except ValueError as exc:
+            return self._record_inline("spanning:cpi-config", False, t0, str(exc))
         return self._record_inline(
             "spanning:cpi-config", True, t0,
             "; ".join(
@@ -1175,15 +1184,79 @@ class Certify:
             ),
         )
 
+    def _layered(self, path: str) -> "str | None":
+        """A vars key through the layers update-cpi-config applies.
+
+        The base vars come first, then the env's, then the slot's slot.yml
+        when the slot carries one, and the later layer wins.
+        """
+        slot_vars = Path(self.slot.config) if self.slot.vars_layer() else None
+        return layered_var(self.env_name, path, slot_vars=slot_vars)
+
+    def _pve_creds_for(self, az: str) -> dict:
+        """The user and the password or token for one AZ's cluster.
+
+        The first entry reads the base variables, the same ones _pve_cfg
+        reads. Every other entry reads the credential values its own
+        cpi-config entry names, either a ((variable)) looked up through the
+        layered vars or a literal written in the entry, and the group always
+        comes from that one entry so one cluster's user is never paired with
+        another's token. Like the CPI, a group is valid with an api_token
+        alone, which wins over a password, or with a user and a password.
+        Raises ValueError naming the variables, never their values, when the
+        group does not resolve.
+        """
+        if az == self.ccfg["azs"][0]["az"]:
+            base = self._pve_cfg()
+            return {k: base[k] for k in ("user", "password", "api_token") if k in base}
+        facts = self.az_facts[az]
+        names = facts["credential_vars"]
+        literal_keys = facts.get("credential_literal_keys", [])
+
+        def _get(key: str) -> str:
+            name = names.get(key)
+            if name:
+                return self._layered("/" + name) or ""
+            if key in literal_keys:
+                # The value is read from the entry here and nowhere else, so
+                # no facts dict or report row ever holds it.
+                return _spanning.cpi_entry_literal(CPI_CONFIG, facts["cpi_id"], key)
+            return ""
+
+        def _source(key: str) -> str:
+            if names.get(key):
+                return f"{key} (variable {names[key]})"
+            return f"{key} (a literal in the entry)" if key in literal_keys else f"{key} (not set in the entry)"
+
+        user, password, token = _get("user"), _get("password"), _get("api_token")
+        if not token and not (user and password):
+            raise ValueError(
+                f"cpi-config entry {facts['cpi_id']} needs an api_token, or a user and a password, "
+                f"and these resolve to nothing: {', '.join(_source(k) for k in ('user', 'password', 'api_token') if not _get(k))}. "
+                "Set the variables in the env vars file or manifests/bosh/vars.yml"
+            )
+        creds = {}
+        if user:
+            creds["user"] = user
+        if token:
+            creds["api_token"] = token
+        else:
+            creds["password"] = password
+        return creds
+
     def _pve_cfg_for(self, az: str) -> dict:
         """The PVE API settings for one AZ's cluster.
 
-        The user, password or token, and port come from the variables the
-        first cpi-config entry already uses, because every entry reads the
-        same ones. Only the host differs.
+        The host and port come from the AZ's own cpi-config entry. The user
+        and the password or token come from the first entry's variables for
+        the first AZ, and from that entry's own credential variables for any
+        other, because each cluster has its own credentials.
         """
         facts = self.az_facts[az]
         cfg = dict(self._pve_cfg())
+        for key in ("user", "password", "api_token"):
+            cfg.pop(key, None)
+        cfg.update(self._pve_creds_for(az))
         cfg["host"] = facts["host"]
         if "port" in facts:
             cfg["port"] = facts["port"]
@@ -1346,7 +1419,7 @@ class Certify:
             )
         try:
             data = _integration.pve_api_get(self._pve_cfg_for(az), "/version")
-        except (RuntimeError, OSError) as exc:
+        except (RuntimeError, OSError, ValueError) as exc:
             return self._record_inline("lab:reachable-secondary", False, t0, str(exc))
         return self._record_inline(
             "lab:reachable-secondary", True, t0,
@@ -1781,7 +1854,7 @@ class Certify:
                     if node:
                         cluster["configs"][vmid] = _spanning.thin_config(
                             _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config"))
-            except (RuntimeError, OSError, KeyError) as exc:
+            except (RuntimeError, OSError, KeyError, ValueError) as exc:
                 cluster["error"] = f"PVE API read failed: {exc}"
             clusters[az] = cluster
         return {
@@ -1826,7 +1899,7 @@ class Certify:
         errors: list[str] = []
         try:
             clusters = self._serial_clusters()
-        except (RuntimeError, OSError, KeyError) as exc:
+        except (RuntimeError, OSError, KeyError, ValueError) as exc:
             clusters = []
             errors.append(f"PVE API read failed: {exc}")
         spanning = len(clusters) > 1
@@ -1854,7 +1927,7 @@ class Certify:
                     serials[key] = _upgrade_checks.drive_serials(config or {})
                     for serial in serials[key].values():
                         found_on.setdefault(serial, set()).add(az)
-            except (RuntimeError, OSError, KeyError) as exc:
+            except (RuntimeError, OSError, KeyError, ValueError) as exc:
                 where = f" on the {az} cluster" if spanning else ""
                 errors.append(f"PVE API read failed{where}: {exc}")
         if spanning:

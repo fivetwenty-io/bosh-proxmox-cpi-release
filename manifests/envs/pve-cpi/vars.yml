@@ -59,9 +59,11 @@
 #
 # Tracked in git (force-added past the global vars.yml ignore) because it is
 # pure network/topology configuration. KEEP IT SECRET-FREE — credentials
-# belong in manifests/bosh/vars.yml (gitignored), not here. Both clusters
-# accept the same credentials, so the single pve_user/pve_password pair from
-# the base vars file serves the default CPI and both cpi-config entries.
+# belong in manifests/bosh/vars.yml (gitignored), not here. Each cluster has
+# its own credentials. The pve_user, pve_password, and pve_api_token keys
+# from the base vars file serve the default CPI and the pve-az1 entry, and
+# the pve-az2 entry reads pve_az2_user, pve_az2_password, and
+# pve_az2_api_token from the same file.
 # ============================================================================
 
 # --- Target PVE (overrides manifests/bosh/vars.yml; AZ1 cluster) -----------

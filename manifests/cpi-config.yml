@@ -11,6 +11,13 @@
 # the --fix re-registration to build its own per-cluster cache template.
 # See docs/multi-cluster.md for the full walkthrough.
 #
+# Each entry carries its own credential group, which is an api_token or a
+# user together with a password, because each cluster has its own API
+# tokens. The pve-az1 entry reads the base variables pve_user, pve_password,
+# and pve_api_token, so single-cluster setups keep working. The pve-az2
+# entry reads pve_az2_user, pve_az2_password, and pve_az2_api_token, which
+# hold the second cluster's own credentials.
+#
 # AZ binding lives in manifests/cf/multi-cpi-azs.yml (layered by
 # `scripts/cf cloud-config` when this cpi-config is active): z1/z2 →
 # pve-az1, z3 → pve-az2.
@@ -80,9 +87,9 @@ cpis:
     pve:
       host: ((pve_az2_host))
       port: ((pve_port))
-      user: ((pve_user))
-      password: ((pve_password))
-      api_token: ((pve_api_token))
+      user: ((pve_az2_user))
+      password: ((pve_az2_password))
+      api_token: ((pve_az2_api_token))
       node: ((pve_az2_node))
       vm_storage: ((pve_az2_vm_storage))
       disk_storage: ((pve_az2_disk_storage))

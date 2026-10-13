@@ -60,9 +60,14 @@ def env_vars_file(env_name: str) -> "Path | None":
     return f if f.exists() else None
 
 
-def layered_var(env_name: str, json_path: str) -> "str | None":
+def layered_var(env_name: str, json_path: str, slot_vars: "Path | None" = None) -> "str | None":
     """Read a vars key with env-bundle layering: env vars.yml wins, base
-    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh)."""
+    manifests/bosh/vars.yml fills the rest (mirrors scripts/bosh). A slot's
+    slot.yml, when given, wins over both, the order update-cpi-config layers."""
+    if slot_vars is not None:
+        v = _bosh_int_opt(slot_vars, json_path)
+        if v is not None:
+            return v
     env_f = env_vars_file(env_name)
     if env_f is not None:
         v = _bosh_int_opt(env_f, json_path)

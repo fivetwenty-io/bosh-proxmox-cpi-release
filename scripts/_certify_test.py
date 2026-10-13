@@ -1356,6 +1356,22 @@ class OldVmsGoneTest(unittest.TestCase):
         self.assertFalse(_spanning.check_old_vms_gone({"instances": []}, post).ok)
 
 
+class CpiConfigCredentialsTest(unittest.TestCase):
+    """The shipped cpi-config gives each entry its own credential group."""
+
+    def _creds(self) -> dict:
+        doc = yaml.safe_load((REPO_ROOT / "manifests" / "cpi-config.yml").read_text())
+        return {e["name"]: {k: e["properties"]["pve"][k] for k in ("user", "password", "api_token")}
+                for e in doc["cpis"]}
+
+    def test_the_two_entries_use_disjoint_credential_variables(self) -> None:
+        creds = self._creds()
+        one, two = set(creds["pve-az1"].values()), set(creds["pve-az2"].values())
+        self.assertEqual(one, {"((pve_user))", "((pve_password))", "((pve_api_token))"})
+        self.assertEqual(two, {"((pve_az2_user))", "((pve_az2_password))", "((pve_az2_api_token))"})
+        self.assertFalse(one & two)
+
+
 class CpiEntryFactsTest(unittest.TestCase):
     """The real manifests/cpi-config.yml supplies the hosts, bands, and prefix."""
 
@@ -1383,6 +1399,15 @@ class CpiEntryFactsTest(unittest.TestCase):
         self.assertEqual(one["vm_prefix"], "cpi")
         self.assertLess(one["vm_range"][1], two["vm_range"][0])
         self.assertLess(one["disk_range"][1], two["disk_range"][0])
+
+    def test_the_credential_variable_names_come_back_and_are_disjoint(self) -> None:
+        one, two = self._facts("pve-az1"), self._facts("pve-az2")
+        self.assertEqual(one["credential_vars"],
+                         {"user": "pve_user", "password": "pve_password", "api_token": "pve_api_token"})
+        self.assertEqual(two["credential_vars"],
+                         {"user": "pve_az2_user", "password": "pve_az2_password",
+                          "api_token": "pve_az2_api_token"})
+        self.assertFalse(set(one["credential_vars"].values()) & set(two["credential_vars"].values()))
 
     def test_only_non_secret_variables_are_read(self) -> None:
         self._facts("pve-az2")
@@ -1462,11 +1487,37 @@ class SpanningSecretsTest(_CertifyModule):
     """The PVE reads use the existing variables and print none of them."""
 
     PASSWORD, TOKEN = "hunter2-sentinel", "root@pam!sentinel=00000000-0000-4000-8000-000000000000"
+    AZ2_PASSWORD = "az2-hunter2-sentinel"
+    CRED_VARS = {
+        "z1": {"user": "pve_user", "password": "pve_password", "api_token": "pve_api_token"},
+        "z2": {"user": "pve_az2_user", "password": "pve_az2_password", "api_token": "pve_az2_api_token"},
+    }
+    AZ2_VARS = {"/pve_az2_user": "az2@pve", "/pve_az2_password": AZ2_PASSWORD}
+
+    def _literal_user_config(self, user: str) -> Path:
+        """A cpi-config whose pve-az2 entry writes its user as a literal."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "cpi-config.yml"
+        path.write_text(yaml.safe_dump({"cpis": [{"name": "pve-az2", "properties": {"pve": {
+            "host": "10.255.0.10", "vmid_range_start": 5000, "vmid_range_end": 8999,
+            "disk_vmid_range_start": 20000, "disk_vmid_range_end": 29999,
+            "user": user, "password": "((pve_az2_password))", "api_token": "((pve_az2_api_token))"}}}]}))
+        patcher = mock.patch.object(self.mod, "CPI_CONFIG", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
 
     def _certify_for_reads(self) -> object:
         c = self._certify(_spanning_section())
         c.rep = _Rep()
-        c.az_facts = {az: {"host": e["host"], "cpi_id": e["cpi_id"]} for az, e in ENTRIES.items()}
+        c.env_name = "pve-cpi"
+        c.slot = types.SimpleNamespace(vars_layer=lambda: [], config=Path("/nonexistent/slot.yml"))
+        c.az_facts = {az: {"host": e["host"], "cpi_id": e["cpi_id"], "credential_vars": self.CRED_VARS[az]}
+                      for az, e in ENTRIES.items()}
+        patcher = mock.patch.object(self.mod, "layered_var", lambda _e, p, **_kw: self.AZ2_VARS.get(p))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         c._pve_cfg = lambda: {"host": "10.254.0.10", "port": 8006, "user": "root@pam",
                               "password": self.PASSWORD, "api_token": self.TOKEN,
                               "verify_ssl": False}
@@ -1477,7 +1528,7 @@ class SpanningSecretsTest(_CertifyModule):
                 {"instance": "simple/b", "az": "z2", "vm_cid": CID_Z2, "disk_cids": DISK_Z2}]}]})
         return c
 
-    def test_each_cluster_is_read_with_its_own_host_and_the_same_credentials(self) -> None:
+    def test_each_cluster_is_read_with_its_own_host_and_its_own_credentials(self) -> None:
         c = self._certify_for_reads()
         seen: list[tuple[str, str, str]] = []
 
@@ -1495,10 +1546,11 @@ class SpanningSecretsTest(_CertifyModule):
         self.assertIn(("10.255.0.10", "/cluster/resources?type=vm"), hosts)
         self.assertIn(("10.254.0.10", "/nodes/n1/qemu/301/config"), hosts)
         self.assertIn(("10.255.0.10", "/nodes/n2/qemu/5101/config"), hosts)
-        self.assertEqual({pw for _, _, pw in seen}, {self.PASSWORD})
+        self.assertEqual({(h, pw) for h, _, pw in seen},
+                         {("10.254.0.10", self.PASSWORD), ("10.255.0.10", self.AZ2_PASSWORD)})
         self.assertEqual(obs["director_uuid"], DIRECTOR_UUID)
         text = json.dumps(obs)
-        for secret in (self.PASSWORD, self.TOKEN, "kept-out"):
+        for secret in (self.PASSWORD, self.AZ2_PASSWORD, self.TOKEN, "kept-out"):
             self.assertNotIn(secret, text)
 
     def test_a_failed_read_is_kept_without_a_secret(self) -> None:
@@ -1537,29 +1589,156 @@ class SpanningSecretsTest(_CertifyModule):
         for secret in (self.PASSWORD, self.TOKEN):
             self.assertNotIn(secret, blob)
 
-    def test_the_real_preflight_reads_only_non_secret_variables(self) -> None:
+    def test_pve_cfg_for_uses_the_second_entrys_own_credentials(self) -> None:
+        c = self._certify_for_reads()
+        first, second = c._pve_cfg_for("z1"), c._pve_cfg_for("z2")
+        self.assertEqual((first["host"], first["user"], first["password"]),
+                         ("10.254.0.10", "root@pam", self.PASSWORD))
+        self.assertEqual((second["host"], second["user"], second["password"]),
+                         ("10.255.0.10", "az2@pve", self.AZ2_PASSWORD))
+        self.assertNotIn("api_token", second)
+
+    def test_pve_cfg_for_never_mixes_one_entrys_user_with_anothers_token(self) -> None:
+        c = self._certify_for_reads()
+        # The base config carries a user and a token. A second entry on a
+        # password must come back with neither of them.
+        second = c._pve_cfg_for("z2")
+        self.assertEqual((second["user"], second["password"]), ("az2@pve", self.AZ2_PASSWORD))
+        self.assertNotIn("api_token", second)
+        self.assertNotEqual(second["user"], c._pve_cfg()["user"])
+
+    def test_pve_cfg_for_lets_the_second_entrys_token_win_over_its_password(self) -> None:
+        c = self._certify_for_reads()
+        self.AZ2_VARS = {"/pve_az2_user": "az2@pve", "/pve_az2_password": "pw",
+                         "/pve_az2_api_token": "az2tok"}
+        second = c._pve_cfg_for("z2")
+        self.assertEqual((second["user"], second["api_token"]), ("az2@pve", "az2tok"))
+        self.assertNotIn("password", second)
+
+    def test_pve_cfg_for_accepts_a_token_with_no_user(self) -> None:
+        c = self._certify_for_reads()
+        self.AZ2_VARS = {"/pve_az2_user": "", "/pve_az2_api_token": "az2tok"}
+        second = c._pve_cfg_for("z2")
+        self.assertEqual(second["api_token"], "az2tok")
+        self.assertNotIn("user", second)
+
+    def test_pve_cfg_for_accepts_a_literal_user_beside_a_token_variable(self) -> None:
+        c = self._certify_for_reads()
+        c.az_facts["z2"]["credential_vars"] = {"user": None, "password": None, "api_token": "pve_az2_api_token"}
+        c.az_facts["z2"]["credential_literal_keys"] = ["user"]
+        self._literal_user_config("bosh@pve")
+        self.AZ2_VARS = {"/pve_az2_api_token": "az2tok"}
+        second = c._pve_cfg_for("z2")
+        self.assertEqual((second["user"], second["api_token"]), ("bosh@pve", "az2tok"))
+
+    def test_a_password_without_a_user_is_refused_naming_variables_only(self) -> None:
+        c = self._certify_for_reads()
+        self.AZ2_VARS = {"/pve_az2_password": "pw-sentinel"}
+        with self.assertRaises(ValueError) as ctx:
+            c._pve_cfg_for("z2")
+        self.assertIn("user (variable pve_az2_user)", str(ctx.exception))
+        self.assertNotIn("pw-sentinel", str(ctx.exception))
+
+    def test_an_unset_literal_is_named_as_a_literal_without_its_value(self) -> None:
+        c = self._certify_for_reads()
+        c.az_facts["z2"]["credential_vars"] = {"user": None, "password": "pve_az2_password", "api_token": None}
+        c.az_facts["z2"]["credential_literal_keys"] = ["user"]
+        self._literal_user_config("lit-user-sentinel")
+        self.AZ2_VARS = {}
+        with self.assertRaises(ValueError) as ctx:
+            c._pve_cfg_for("z2")
+        self.assertIn("password (variable pve_az2_password)", str(ctx.exception))
+        self.assertNotIn("lit-user-sentinel", str(ctx.exception))
+        self.AZ2_VARS = {"/pve_az2_password": "pw"}
+        self.assertEqual(c._pve_cfg_for("z2")["user"], "lit-user-sentinel")
+
+    def test_no_facts_dict_or_placement_entry_holds_a_literal_credential(self) -> None:
+        c = self._certify_for_reads()
+        c.ccfg["azs"] = [dict(a, bridge="", storage="") for a in c.ccfg["azs"]]
+        path = self._literal_user_config("lit-user-sentinel")
+        facts = _spanning.cpi_entry_facts(path, "pve-az2", lambda _p: "x")
+        self.assertEqual(facts["credential_literal_keys"], ["user"])
+        c.az_facts["z2"] = {**c.az_facts["z2"], **facts}
+        self.AZ2_VARS = {"/pve_az2_password": "pw"}
+        self.assertEqual(c._pve_cfg_for("z2")["user"], "lit-user-sentinel")
+        blob = json.dumps(facts) + json.dumps(c.az_facts) + json.dumps(c._placement_entries(), default=str)
+        self.assertNotIn("lit-user-sentinel", blob)
+
+    def test_slot_vars_are_layered_last_the_way_update_cpi_config_does(self) -> None:
+        c = self._certify_for_reads()
+        slot_yml = Path("/nowhere/slot.yml")
+        c.slot = types.SimpleNamespace(vars_layer=lambda: ["-l", str(slot_yml)], config=slot_yml)
+        seen: list = []
+
+        def layered(_env, path, **kw):
+            seen.append(kw.get("slot_vars"))
+            return "x"
+
+        with mock.patch.object(self.mod, "layered_var", layered):
+            c._layered("/pve_az2_user")
+        self.assertEqual(seen, [slot_yml])
+
+    def test_a_failed_credential_lookup_is_recorded_not_raised_by_the_callers(self) -> None:
+        c = self._certify_for_reads()
+        self.AZ2_VARS = {}
+        c.ccfg["azs"] = [{"az": "z1"}, {"az": "z2"}]
+        self.assertFalse(c._preflight_lab_secondary())
+        self.assertIn("pve_az2_password", c.rep.rows[-1][2])
+        obs = c._placement_observation()
+        self.assertIn("pve_az2_password", obs["clusters"]["z2"]["error"])
+
+    def test_pve_cfg_for_names_the_unset_variables_and_no_values(self) -> None:
+        c = self._certify_for_reads()
+        self.AZ2_VARS = {"/pve_az2_user": "az2@pve"}
+        with self.assertRaises(ValueError) as ctx:
+            c._pve_cfg_for("z2")
+        for name in ("pve_az2_password", "pve_az2_api_token"):
+            self.assertIn(name, str(ctx.exception))
+        self.assertNotIn("az2@pve", str(ctx.exception))
+
+    def test_the_preflight_fails_naming_unset_credential_variables(self) -> None:
+        c = self._certify_for_reads()
+        c.dry_run = False
+        c.env_name = "pve-cpi"
+        base = {"/pve_az1_host": "10.254.0.10", "/pve_az2_host": "10.255.0.10",
+                "/pve_port": "8006", "/pve_vm_prefix": "cpi"}
+        with mock.patch.object(self.mod, "layered_var", lambda _e, p, **_kw: base.get(p)):
+            self.assertFalse(c._preflight_spanning())
+        self.assertIn("pve_az2_password", c.rep.rows[-1][2])
+
+    def test_the_real_preflight_resolves_only_the_second_entrys_secrets_and_reports_none(self) -> None:
         c = self._certify_for_reads()
         c.dry_run = False
         c.env_name = "pve-cpi"
         reads: list[str] = []
 
-        def layered(_env, path):
+        def _never_called():
+            raise AssertionError("the preflight read the first entry's credentials")
+
+        c._pve_cfg = _never_called
+
+        def layered(_env, path, **_kw):
             reads.append(path)
             return {"/pve_az1_host": "10.254.0.10", "/pve_az2_host": "10.255.0.10",
-                    "/pve_port": "8006", "/pve_vm_prefix": "cpi"}.get(path)
+                    "/pve_port": "8006", "/pve_vm_prefix": "cpi",
+                    **self.AZ2_VARS}.get(path)
 
         with mock.patch.object(self.mod, "layered_var", layered):
             self.assertTrue(c._preflight_spanning())
         self.assertTrue(reads)
+        # Only the second entry's own credential variables are looked up,
+        # never the first entry's, and none of their values are reported.
         for path in reads:
-            self.assertNotRegex(path, r"password|token|secret")
+            if re.search(r"password|token|secret", path):
+                self.assertTrue(path.startswith("/pve_az2_"), path)
+        self.assertNotIn(self.AZ2_PASSWORD, json.dumps(c.rep.rows))
         self.assertEqual(c.rep.status("spanning:cpi-config"), ["PASS"])
 
     def test_two_entries_on_one_host_are_refused(self) -> None:
         c = self._certify_for_reads()
         c.dry_run = False
         c.env_name = "pve-cpi"
-        with mock.patch.object(self.mod, "layered_var", lambda _e, p: {"/pve_port": "8006", "/pve_vm_prefix": "cpi"}.get(p, "10.0.0.1")):
+        with mock.patch.object(self.mod, "layered_var", lambda _e, p, **_kw: {"/pve_port": "8006", "/pve_vm_prefix": "cpi"}.get(p, "10.0.0.1")):
             self.assertFalse(c._preflight_spanning())
         self.assertIn("same PVE host", c.rep.rows[-1][2])
 
@@ -1625,8 +1804,15 @@ class DiskSerialsAcrossClustersTest(_CertifyModule):
         c = self._certify(section)
         c.rep = _Rep()
         c.invariants = []
-        c.az_facts = {az: {"host": e["host"], "cpi_id": e["cpi_id"]} for az, e in ENTRIES.items()}
+        c.env_name = "pve-cpi"
+        c.slot = types.SimpleNamespace(vars_layer=lambda: [], config=Path("/nonexistent/slot.yml"))
+        c.az_facts = {az: {"host": e["host"], "cpi_id": e["cpi_id"],
+                           "credential_vars": SpanningSecretsTest.CRED_VARS[az]}
+                      for az, e in ENTRIES.items()}
         c._pve_cfg = lambda: {"host": HOST_Z1, "port": 8006, "user": "root@pam", "password": "x"}
+        patcher = mock.patch.object(self.mod, "layered_var", lambda _e, p, **_kw: SpanningSecretsTest.AZ2_VARS.get(p))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return c
 
     def _capture(self, c: object, tables: dict) -> dict:
