@@ -52,17 +52,18 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 		//
 		// Warn, not Debug: reaching here means pin_az_via_ha_rules is ON, so
 		// the operator asked for every VM to be pinned and this one is not.
-		// BOSH never passes the cloud-config AZ name to create_vm — the AZ
-		// only selects the CPI and the subnet — so the CPI learns it solely
-		// from cloud_properties.availability_zone. An operator who sets
+		// BOSH never passes the cloud-config AZ name to create_vm (the AZ only
+		// selects the CPI and the subnet), so the CPI learns it solely from
+		// cloud_properties.availability_zone. An operator who sets
 		// pin_az_via_ha_rules and az_map but omits availability_zone from the
-		// vm_type gets a wholly inert feature, and at Debug the only evidence
-		// was a line nobody sees at the default log level. The message names
-		// the cloud-config prerequisite because that is the fix in the common
-		// case.
+		// AZ's cloud_properties gets a wholly inert feature, and at Debug the
+		// only evidence was a line nobody sees at the default log level. The
+		// message names the cloud-config prerequisite because that is the fix
+		// in the common case.
 		logger.Warn("create_vm: HA node-affinity pin is enabled but this VM was not pinned — no availability_zone "+
-			"resolved for the placed node; BOSH does not pass the cloud-config AZ name to the CPI, so each vm_type "+
-			"needs cloud_properties.availability_zone set to an AZ named in placement.az_map (a VM pinned to a node "+
+			"resolved for the placed node; BOSH does not pass the cloud-config AZ name to the CPI, so each cloud-config AZ needs "+
+			"cloud_properties.availability_zone naming a key of placement.az_map, and BOSH merges an AZ's cloud_properties "+
+			"into every VM in that AZ (a VM pinned to a node "+
 			"outside its requested AZ by target_node, a local-disk pin, or the config.node fallback reaches here too)",
 			log.Int(metadataKeyVMID, vmid), log.String("node", node))
 		return nil
