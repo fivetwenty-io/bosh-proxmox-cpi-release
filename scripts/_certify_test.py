@@ -16,12 +16,14 @@ against a stand-in bosh in a temporary directory.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import importlib.machinery as _ilm
 import importlib.util as _ilu
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -30,6 +32,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import yaml
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS.parent
@@ -40,6 +44,7 @@ import _checkouts  # noqa: E402
 import _integration  # noqa: E402
 import _rundoc  # noqa: E402
 import _slot  # noqa: E402
+import _spanning  # noqa: E402
 import _upgrade_checks as uc  # noqa: E402
 from _synthetic_repo import SyntheticRepo, install_read_guard  # noqa: E402
 
@@ -81,13 +86,13 @@ def _guard_environ(environ: dict):
 
 
 def _dry_run(repo: SyntheticRepo, state_dir: str, results: str,
-             extra: "dict | None" = None) -> "tuple[int, str]":
+             extra: "dict | None" = None, config: str = CONFIG) -> "tuple[int, str]":
     """Run `certify upgrade --dry-run` in-process on repo; return (rc, output)."""
     environ = {"BOSH_STATE_DIR": state_dir, **(DENY if extra is None else extra)}
     mod = _load_certify(environ, repo)
     out = io.StringIO()
     argv = ["upgrade", "--dry-run", "--no-color", "--skip-doc",
-            "--config", str(repo.root / CONFIG), "--results-dir", results]
+            "--config", str(repo.root / config), "--results-dir", results]
     with _guard_environ(environ), repo.rebase_shared(_integration, _rundoc, _checkouts), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         try:
@@ -715,6 +720,831 @@ class VerifyDiskChecksTest(unittest.TestCase):
         c.post = {"disks": post}
         self.assertFalse(c._verify_disk_serials())
         self.assertIn("VM 202 is not in /cluster/resources", c.rep.rows[-1][2])
+
+
+# --------------------------------------------------------------------------- #
+# One deployment that spans two clusters
+# --------------------------------------------------------------------------- #
+
+# What build_deployment_ops and _cloud_config_args produced for a one-entry run
+# before certification.azs existed. A default run has to keep producing exactly
+# this.
+GOLDEN_SINGLE_AZ_OPS = """\
+- type: replace
+  path: /instance_groups/name=simple/azs
+  value:
+  - z1
+- type: replace
+  path: /instance_groups/name=simple/vm_type
+  value: certification
+- type: replace
+  path: /instance_groups/name=simple/networks/name=default/name
+  value: default
+- type: replace
+  path: /instance_groups/name=simple/persistent_disk_type?
+  value: default
+"""
+GOLDEN_CC_ARGS = [
+    "-o", "<ROOT>/manifests/certification/cloud-config-ops.yml",
+    "-v", "certification_vm_cores=2",
+    "-v", "certification_vm_memory_mib=2048",
+    "-v", "certification_vm_disk_mib=8192",
+]
+GOLDEN_CC_CPI_ARGS = GOLDEN_CC_ARGS + [
+    "-o", "<ROOT>/manifests/certification/cloud-config-cpi-ops.yml",
+    "-v", "certification_cpi_id=pve-az1",
+]
+# The certification release's manifest, as upstream ships it.
+UPSTREAM_CERTIFICATION_YML = """\
+---
+name: ((deployment_name))
+instance_groups:
+  - name: simple
+    instances: 1
+    vm_type: default
+    stemcell: default
+    azs: [z1, z2, z3]
+    networks:
+      - name: default
+        default: [dns, gateway]
+    jobs:
+      - name: simple
+        release: ((release_name))
+"""
+
+AZ2_NETWORK = {
+    "cidr": "10.255.0.0/16",
+    "gateway": "10.255.0.1",
+    "reserved": ["10.255.0.1-10.255.48.19", "10.255.48.200-10.255.255.254"],
+}
+
+
+def _spanning_section(**second: object) -> dict:
+    """A `certification:` section that spans pve-az1 and pve-az2."""
+    entry = {"az": "z2", "cpi_id": "pve-az2", "network": dict(AZ2_NETWORK), **second}
+    return {"network_bridge": "vmbr0",
+            "azs": [{"az": "z1", "cpi_id": "pve-az1"}, entry]}
+
+
+def _apply_ops(doc: dict, ops: list, variables: dict) -> dict:
+    """The part of go-patch that the certification ops files use.
+
+    It handles `replace` with name= selectors, `/-` appends, and a trailing
+    `?`, and it fills ((var)) values the way `bosh int -v` does. It exists so
+    the tests can see the document an ops file produces without running bosh.
+    """
+    def fill(value):
+        if isinstance(value, str):
+            match = re.fullmatch(r"\(\((\w+)\)\)", value)
+            return variables.get(match.group(1), value) if match else value
+        if isinstance(value, list):
+            return [fill(v) for v in value]
+        if isinstance(value, dict):
+            return {k: fill(v) for k, v in value.items()}
+        return value
+
+    for op in ops:
+        assert op["type"] == "replace", op
+        tokens = op["path"].split("/")[1:]
+        node = doc
+        for tok in tokens[:-1]:
+            tok = tok.rstrip("?")
+            if tok.startswith("name="):
+                node = next(i for i in node if i.get("name") == tok[5:])
+            else:
+                node = node[tok]
+        last = tokens[-1].rstrip("?")
+        value = fill(op["value"])
+        if last == "-":
+            node.append(value)
+        elif last.startswith("name="):
+            names = [i.get("name") for i in node]
+            if last[5:] in names:
+                node[names.index(last[5:])] = value
+            else:
+                node.append(value)
+        else:
+            node[last] = value
+    return doc
+
+
+def _flag_vars(args: list) -> "tuple[list[str], dict]":
+    """Split a -o/-v argument list into ops file paths and parsed variables."""
+    files, variables = [], {}
+    it = iter(args)
+    for flag in it:
+        value = next(it)
+        if flag == "-o":
+            files.append(value)
+        else:
+            name, _, raw = value.partition("=")
+            variables[name] = yaml.safe_load(raw)
+    return files, variables
+
+
+class _CertifyModule(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load_certify()
+
+    def _config(self, section: dict) -> dict:
+        return self.mod.certification_config({"certification": section}, "cpitest", True)
+
+    def _certify(self, section: dict) -> object:
+        c = object.__new__(self.mod.Certify)
+        c.ccfg = self._config(section)
+        return c
+
+    def _args(self, section: dict) -> list:
+        root = str(self.mod.REPO_ROOT)
+        return [a.replace(root, "<ROOT>") for a in self._certify(section)._cloud_config_args()]
+
+
+class DefaultAzsUnchangedTest(_CertifyModule):
+    """A run that does not set certification.azs generates what it always did."""
+
+    def test_the_default_is_the_single_entry(self) -> None:
+        ccfg = self._config({"network_bridge": "vmbr0"})
+        self.assertEqual(ccfg["azs"], [{"az": "z1", "cpi_id": "", "network": None,
+                                        "bridge": "", "storage": ""}])
+        ccfg = self._config({"network_bridge": "vmbr0", "az": "z9", "cpi_id": "pve-az1"})
+        self.assertEqual(ccfg["azs"][0]["az"], "z9")
+        self.assertEqual(ccfg["azs"][0]["cpi_id"], "pve-az1")
+        self.assertEqual((ccfg["az"], ccfg["cpi_id"]), ("z9", "pve-az1"))
+
+    def test_deployment_ops_are_byte_identical(self) -> None:
+        ccfg = self._config({"network_bridge": "vmbr0", "cpi_id": "pve-az1"})
+        text = yaml.safe_dump(self.mod.build_deployment_ops(ccfg),
+                              default_flow_style=False, sort_keys=False)
+        self.assertEqual(text, GOLDEN_SINGLE_AZ_OPS)
+
+    def test_cloud_config_flags_are_identical(self) -> None:
+        self.assertEqual(self._args({"network_bridge": "vmbr0"}), GOLDEN_CC_ARGS)
+        self.assertEqual(self._args({"network_bridge": "vmbr0", "cpi_id": "pve-az1"}),
+                         GOLDEN_CC_CPI_ARGS)
+
+    def test_an_explicit_single_entry_matches_the_default(self) -> None:
+        single = {"network_bridge": "vmbr0",
+                  "azs": [{"az": "z1", "cpi_id": "pve-az1"}]}
+        self.assertEqual(self._args(single), GOLDEN_CC_CPI_ARGS)
+        ccfg = self._config(single)
+        self.assertEqual(yaml.safe_dump(self.mod.build_deployment_ops(ccfg),
+                                        default_flow_style=False, sort_keys=False),
+                         GOLDEN_SINGLE_AZ_OPS)
+
+    def test_a_default_dry_run_adds_no_spanning_step(self) -> None:
+        repo = SyntheticRepo()
+        self.addCleanup(repo.close)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        slot = Path(tmp.name) / "certification"
+        slot.mkdir()
+        (slot / "slot.yml").write_text(SLOT_YML)
+        rc, out = _dry_run(repo, str(slot), tmp.name)
+        self.assertEqual(rc, 0, out)
+        for fragment in ("cpi2", "secondary", "probe", "placement", "z2"):
+            self.assertNotIn(fragment, out)
+        self.assertIn("cert:manifest", out)
+
+
+class SpanningConfigTest(_CertifyModule):
+    def test_two_entries_resolve(self) -> None:
+        ccfg = self._config(_spanning_section())
+        self.assertTrue(self.mod.is_spanning(ccfg))
+        first, second = ccfg["azs"]
+        self.assertEqual((first["az"], first["cpi_id"], first["network"]), ("z1", "pve-az1", None))
+        self.assertEqual((second["az"], second["cpi_id"]), ("z2", "pve-az2"))
+        self.assertEqual(second["network"], AZ2_NETWORK)
+        self.assertEqual((second["bridge"], second["storage"]), ("", ""))
+        self.assertEqual((ccfg["az"], ccfg["cpi_id"]), ("z1", "pve-az1"))
+
+    def _refused(self, section: dict, fragment: str) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self._config(section)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_bad_lists_are_refused(self) -> None:
+        good = _spanning_section()
+        self._refused({"azs": "z1"}, "must be a list of mappings")
+        self._refused({"azs": [{"az": "z1"}, {"az": "z1"}, {"az": "z1"}]}, "one or two clusters")
+        self._refused({"azs": [{"cpi_id": "pve-az1"}]}, "azs[0].az is required")
+        self._refused({"azs": [{"az": "z1", "cpi_id": "a", "surprise": 1}]}, "unknown keys: surprise")
+        self._refused({**good, "cpi_id": "pve-az9"}, "disagrees with certification.azs[0].cpi_id")
+        self._refused({**good, "az": "z7"}, "disagrees with certification.azs[0].az")
+
+    def test_the_first_entry_takes_no_network_or_overrides(self) -> None:
+        for key, value in (("network", AZ2_NETWORK), ("bridge", "vmbr9"), ("storage", "s")):
+            section = _spanning_section()
+            section["azs"][0][key] = value
+            self._refused(section, f"certification.azs[0].{key} is not supported")
+
+    def test_the_second_entry_is_checked(self) -> None:
+        self._refused(_spanning_section(az="z3"), "azs[1].az must be z2")
+        self._refused(_spanning_section(cpi_id="pve-az1"), "binds both AZs to one")
+        self._refused(_spanning_section(cpi_id=""), "needs a cpi_id on both entries")
+        self._refused(_spanning_section(network=None), "network is required")
+        self._refused(_spanning_section(network={**AZ2_NETWORK, "gateway": "10.254.0.1"}),
+                      "is outside 10.255.0.0/16")
+        self._refused(_spanning_section(network={**AZ2_NETWORK, "cidr": "nope"}),
+                      "invalid address")
+        self._refused(_spanning_section(network={**AZ2_NETWORK, "reserved": "10.0.0.1"}),
+                      "list of addresses or ranges")
+        self._refused(_spanning_section(network={"cidr": "10.255.0.0/16", "gateway": "10.255.0.1"}),
+                      "network.reserved")
+        self._refused(_spanning_section(network={**AZ2_NETWORK, "extra": 1}), "unknown keys: extra")
+        self._refused(_spanning_section(bridge="vmbr 1;"), "not a valid name")
+        self._refused(_spanning_section(storage="9"), "not a valid name")
+
+
+class SpanningOpsTest(_CertifyModule):
+    """The generated ops describe one deployment across two AZs."""
+
+    def _cloud_config(self, section: dict) -> dict:
+        files, variables = _flag_vars(self._certify(section)._cloud_config_args())
+        doc = yaml.safe_load((self.mod.REPO_ROOT / "manifests/bosh/cloud-config.yml").read_text())
+        for path in files:
+            _apply_ops(doc, yaml.safe_load(Path(path).read_text()), variables)
+        return doc
+
+    def test_the_deployment_spans_both_azs_with_a_disk_on_each(self) -> None:
+        ccfg = self._config(_spanning_section())
+        manifest = yaml.safe_load(UPSTREAM_CERTIFICATION_YML)
+        _apply_ops(manifest, self.mod.build_deployment_ops(ccfg), {})
+        group = manifest["instance_groups"][0]
+        self.assertEqual(group["azs"], ["z1", "z2"])
+        self.assertEqual(group["instances"], 2)
+        self.assertEqual(group["persistent_disk_type"], "default")
+        self.assertEqual(group["vm_type"], "certification")
+
+    def test_cloud_config_binds_each_az_to_its_entry_and_names_every_subnet_az(self) -> None:
+        doc = self._cloud_config(_spanning_section())
+        azs = {a["name"]: a for a in doc["azs"]}
+        self.assertEqual(azs["z1"]["cpi"], "pve-az1")
+        self.assertEqual(azs["z2"]["cpi"], "pve-az2")
+        first, second = doc["networks"][0]["subnets"]
+        self.assertEqual(first["az"], "z1")
+        self.assertNotIn("azs", first)
+        self.assertEqual(second["az"], "z2")
+        self.assertEqual(second["range"], "10.255.0.0/16")
+        self.assertEqual(second["gateway"], "10.255.0.1")
+        self.assertEqual(second["reserved"], AZ2_NETWORK["reserved"])
+        for subnet in doc["networks"][0]["subnets"]:
+            self.assertTrue(subnet.get("az") or subnet.get("azs"), subnet)
+
+    def test_the_bridge_defaults_to_the_jobs_and_an_override_wins(self) -> None:
+        doc = self._cloud_config(_spanning_section())
+        self.assertEqual(doc["networks"][0]["subnets"][1]["cloud_properties"]["bridge"], "vmbr0")
+        self.assertNotIn("storage_pool", {a["name"]: a for a in doc["azs"]}["z2"]["cloud_properties"])
+        doc = self._cloud_config(_spanning_section(bridge="vmbr7", storage="az2-fast"))
+        self.assertEqual(doc["networks"][0]["subnets"][1]["cloud_properties"]["bridge"], "vmbr7")
+        z2 = {a["name"]: a for a in doc["azs"]}["z2"]
+        self.assertEqual(z2["cloud_properties"]["storage_pool"], "az2-fast")
+        # z1 keeps the Director's pin and gains nothing.
+        z1 = {a["name"]: a for a in doc["azs"]}["z1"]
+        self.assertNotIn("storage_pool", z1["cloud_properties"])
+
+    def test_string_flags_stay_strings(self) -> None:
+        _, variables = _flag_vars(self._certify(
+            _spanning_section(bridge="on", storage="no"))._cloud_config_args())
+        self.assertEqual(variables["certification_secondary_bridge"], "on")
+        self.assertEqual(variables["certification_secondary_storage"], "no")
+        self.assertEqual(variables["certification_secondary_reserved"], AZ2_NETWORK["reserved"])
+
+    def test_the_probe_runs_one_diskless_instance_in_the_second_az(self) -> None:
+        ccfg = self._config(_spanning_section())
+        manifest = yaml.safe_load(UPSTREAM_CERTIFICATION_YML)
+        _apply_ops(manifest, self.mod.build_probe_ops(ccfg), {})
+        group = manifest["instance_groups"][0]
+        self.assertEqual(group["azs"], ["z2"])
+        self.assertEqual(group["instances"], 1)
+        self.assertNotIn("persistent_disk_type", group)
+
+    def test_a_dry_run_lists_the_spanning_steps(self) -> None:
+        repo = SyntheticRepo()
+        self.addCleanup(repo.close)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        slot = Path(tmp.name) / "certification"
+        slot.mkdir()
+        (slot / "slot.yml").write_text(SLOT_YML)
+        cfg = yaml.safe_load((repo.root / CONFIG).read_text())
+        cfg["certification"] = {**cfg["certification"], "azs": _spanning_section(
+            bridge="vmbr7", storage="az2-fast")["azs"]}
+        cfg["certification"].pop("cpi_id", None)
+        (repo.root / "ci").mkdir(exist_ok=True)
+        (repo.root / "ci" / "spanning.yml").write_text(yaml.safe_dump(cfg))
+        rc, out = _dry_run(repo, str(slot), tmp.name, config="ci/spanning.yml")
+        self.assertEqual(rc, 0, out)
+        for fragment in ("cloud-config-cpi2-ops.yml", "cloud-config-cpi2-storage-ops.yml",
+                         "certification_secondary_cpi_id=", "precheck:z2-reachability",
+                         "precheck:z2-probe-delete", "verify:placement", "cert:delete-probe",
+                         "lab:reachable-secondary", "spanning:cpi-config"):
+            self.assertIn(fragment, out)
+        lines = out.splitlines()
+        first = lambda frag: next(i for i, line in enumerate(lines) if frag in line)  # noqa: E731
+        self.assertLess(first("precheck:z2-reachability"), first("cert:deploy"))
+        self.assertLess(first("precheck:z2-probe-delete"), first("cert:deploy"))
+
+
+# A disk CID is a pvd- envelope; the CPI records the volume it was born as and
+# the stable id the guest sees as the drive serial.
+def _disk_cid(volid: str, stable: str) -> str:
+    raw = json.dumps({"v": volid, "m": {"id": stable}}).encode()
+    return "pvd-" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+DIRECTOR_UUID = "7a6d4f2e-1111-4222-8333-444455556666"
+STAMP_Z1, STAMP_Z2 = "0a1b2c3d", "4e5f6a7b"
+CID_Z1 = f"301-{STAMP_Z1}-11111111"
+CID_Z2 = f"5101-{STAMP_Z2}-22222222"
+DISK_Z1 = _disk_cid("local-lvm-data:vm-9001-disk-0", "bpd-aaaaaaaaaaaaaaaa")
+DISK_Z2 = _disk_cid("local-lvm-data:vm-20001-disk-0", "bpd-bbbbbbbbbbbbbbbb")
+ENTRIES = {
+    "z1": {"cpi_id": "pve-az1", "host": "10.254.0.10", "vm_prefix": "cpi",
+           "vm_range": (200, 4999), "disk_range": (9000, 19999),
+           "bridge": "", "storage": ""},
+    "z2": {"cpi_id": "pve-az2", "host": "10.255.0.10", "vm_prefix": "cpi",
+           "vm_range": (5000, 8999), "disk_range": (20000, 29999),
+           "bridge": "", "storage": ""},
+}
+
+
+def _tags(stamp: str, token: str, owner: str = DIRECTOR_UUID) -> str:
+    return f"bosh-cpi;bosh-owner--{owner};bosh-cluster--{stamp};bosh-cid--{token}"
+
+
+def _canned_observation(*, stamped: bool = True) -> dict:
+    """Both clusters' /cluster/resources JSON, as PVE returns it, thinned the way certify does."""
+    z1 = [
+        {"id": "qemu/301", "type": "qemu", "vmid": 301, "node": "lab-pve-cpi-0", "status": "running",
+         "name": "cpi-certification-simple-0",
+         "tags": _tags(STAMP_Z1, "11111111") if stamped else "bosh-cpi"},
+        {"id": "qemu/200", "type": "qemu", "vmid": 200, "node": "lab-pve-cpi-1", "status": "running",
+         "name": "unrelated", "tags": ""},
+        {"id": "lxc/150", "type": "lxc", "vmid": 150, "node": "lab-pve-cpi-1", "name": "a-container"},
+    ]
+    z2 = [
+        {"id": "qemu/5101", "type": "qemu", "vmid": 5101, "node": "lab-pve-cpi-az2-0",
+         "status": "running", "name": "cpi-certification-simple-1",
+         "tags": _tags(STAMP_Z2, "22222222") if stamped else "bosh-cpi"},
+    ]
+    return {
+        "director_uuid": DIRECTOR_UUID,
+        "instances": _spanning.parse_instances([
+            {"instance": "simple/aaaa", "az": "z1", "vm_cid": CID_Z1 if stamped else "301",
+             "disk_cids": DISK_Z1},
+            {"instance": "simple/bbbb", "az": "z2", "vm_cid": CID_Z2 if stamped else "5101",
+             "disk_cids": DISK_Z2},
+        ]),
+        "clusters": {
+            "z1": {"resources": _spanning.thin_resources(z1), "error": "", "configs": {"301": _spanning.thin_config({
+                "net0": "virtio=BC:24:11:00:00:01,bridge=vmbr0",
+                "scsi0": "local-lvm-data:vm-301-disk-0,size=8G",
+                "scsi1": "local-lvm-data:vm-9001-disk-0,serial=bpd-aaaaaaaaaaaaaaaa",
+                "ide2": "local:iso/vm-301-config.iso,media=cdrom",
+                "cipassword": "not-kept"})}},
+            "z2": {"resources": _spanning.thin_resources(z2), "error": "", "configs": {"5101": _spanning.thin_config({
+                "net0": "virtio=BC:24:11:00:00:02,bridge=vmbr7",
+                "scsi0": "az2-fast:vm-5101-disk-0,size=8G",
+                "scsi1": "local-lvm-data:vm-20001-disk-0,serial=bpd-bbbbbbbbbbbbbbbb"})}},
+        },
+    }
+
+
+def _held(findings: list) -> dict:
+    return {f.name: f.ok for f in findings}
+
+
+def _why(findings: list, name: str) -> str:
+    return next(f.detail for f in findings if f.name == name)
+
+
+class PlacementCheckTest(unittest.TestCase):
+    def check(self, obs: dict, entries: "dict | None" = None, stamped: bool = True) -> list:
+        return _spanning.check_placement(obs, entries or ENTRIES, stamped)
+
+    def test_the_canned_resources_are_thinned_to_qemu_rows(self) -> None:
+        obs = _canned_observation()
+        self.assertEqual([r["vmid"] for r in obs["clusters"]["z1"]["resources"]], ["301", "200"])
+        self.assertNotIn("cipassword", obs["clusters"]["z1"]["configs"]["301"])
+        self.assertIn("ide2", obs["clusters"]["z1"]["configs"]["301"])
+
+    def test_a_correct_stamped_deployment_holds_every_check(self) -> None:
+        findings = self.check(_canned_observation())
+        self.assertTrue(all(f.ok for f in findings), [f for f in findings if not f.ok])
+        self.assertEqual(
+            [f.name for f in findings],
+            ["placement:spans-azs", "placement:vm-cluster", "placement:vm-band",
+             "placement:vm-prefix", "placement:tags", "placement:cluster-stamps",
+             "placement:disk-cluster", "placement:disk-band", "placement:bridge-override",
+             "placement:storage-override"],
+        )
+
+    def test_bare_cids_from_the_old_release_pass_before_the_upgrade_only(self) -> None:
+        obs = _canned_observation(stamped=False)
+        self.assertTrue(all(f.ok for f in self.check(obs, stamped=False)))
+        findings = self.check(obs, stamped=True)
+        self.assertFalse(_held(findings)["placement:tags"])
+        self.assertIn("bare CID", _why(findings, "placement:tags"))
+        self.assertFalse(_held(findings)["placement:cluster-stamps"])
+
+    def test_a_vm_on_the_wrong_cluster_fails(self) -> None:
+        obs = _canned_observation()
+        z2 = obs["clusters"]["z2"]
+        z1 = obs["clusters"]["z1"]
+        z1["resources"], z2["resources"] = z2["resources"], z1["resources"]
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:vm-cluster"])
+        self.assertIn("is not on the z1 cluster", _why(findings, "placement:vm-cluster"))
+
+    def test_a_vm_that_also_exists_on_the_other_cluster_fails(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z1"]["resources"].append(
+            {"vmid": "5101", "node": "lab-pve-cpi-2", "name": "stray", "tags": ""})
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:vm-cluster"])
+        self.assertIn("also exists on the z1 cluster", _why(findings, "placement:vm-cluster"))
+
+    def test_a_vmid_outside_its_entrys_band_fails(self) -> None:
+        entries = {**ENTRIES, "z2": {**ENTRIES["z2"], "vm_range": (6000, 8999)}}
+        findings = self.check(_canned_observation(), entries)
+        self.assertFalse(_held(findings)["placement:vm-band"])
+        self.assertIn("5101", _why(findings, "placement:vm-band"))
+
+    def test_the_vm_name_must_carry_the_entrys_prefix(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["resources"][0]["name"] = "certification-simple-1"
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:vm-prefix"])
+        entries = {az: {**e, "vm_prefix": ""} for az, e in ENTRIES.items()}
+        self.assertTrue(_held(self.check(obs, entries))["placement:vm-prefix"])
+
+    def test_the_owner_tag_must_name_this_director(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z1"]["resources"][0]["tags"] = _tags(STAMP_Z1, "11111111", owner="someone-else")
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:tags"])
+        self.assertIn(f"want bosh-owner--{DIRECTOR_UUID}", _why(findings, "placement:tags"))
+
+    def test_a_missing_owner_tag_fails(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z1"]["resources"][0]["tags"] = f"bosh-cpi;bosh-cluster--{STAMP_Z1};bosh-cid--11111111"
+        self.assertFalse(_held(self.check(obs))["placement:tags"])
+
+    def test_the_owner_tag_is_compared_the_way_the_cpi_writes_it(self) -> None:
+        # The CPI lowercases the UUID and turns every other byte into "-".
+        self.assertEqual(_spanning.owner_tag("ABC_def.01"), "bosh-owner--abc-def-01")
+        self.assertEqual(_spanning.owner_tag(""), "")
+        obs = _canned_observation()
+        obs["director_uuid"] = DIRECTOR_UUID.upper()
+        self.assertTrue(_held(self.check(obs))["placement:tags"])
+        obs["director_uuid"] = ""
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:tags"])
+        self.assertIn("Director UUID is unknown", _why(findings, "placement:tags"))
+
+    def test_the_cluster_tag_must_match_the_cids_stamp(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["resources"][0]["tags"] = _tags(STAMP_Z1, "22222222")
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:tags"])
+        self.assertIn(f"want bosh-cluster--{STAMP_Z2}", _why(findings, "placement:tags"))
+
+    def test_the_token_tag_must_match_the_cids_token(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["resources"][0]["tags"] = _tags(STAMP_Z2, "99999999")
+        self.assertFalse(_held(self.check(obs))["placement:tags"])
+
+    def test_two_clusters_with_one_stamp_fail(self) -> None:
+        obs = _canned_observation()
+        obs["instances"][1]["vm_cid"] = f"5101-{STAMP_Z1}-22222222"
+        obs["clusters"]["z2"]["resources"][0]["tags"] = _tags(STAMP_Z1, "22222222")
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:cluster-stamps"])
+        self.assertIn("same cluster stamp", _why(findings, "placement:cluster-stamps"))
+
+    def test_an_instance_in_each_az_is_required(self) -> None:
+        obs = _canned_observation()
+        obs["instances"][1]["az"] = "z1"
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:spans-azs"])
+        self.assertIn("no instance in z2", _why(findings, "placement:spans-azs"))
+
+    def test_an_instance_in_an_unconfigured_az_fails(self) -> None:
+        obs = _canned_observation()
+        obs["instances"][1]["az"] = "z3"
+        self.assertFalse(_held(self.check(obs))["placement:vm-cluster"])
+
+    def test_a_disk_must_be_a_drive_of_its_instances_vm(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["configs"]["5101"].pop("scsi1")
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:disk-cluster"])
+        obs = _canned_observation()
+        obs["instances"][0]["disk_cids"] = []
+        self.assertIn("no persistent disk", _why(self.check(obs), "placement:disk-cluster"))
+
+    def test_a_disk_is_found_by_its_volume_when_it_has_no_serial(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z1"]["configs"]["301"]["scsi1"] = "local-lvm-data:vm-9001-disk-0,size=1G"
+        self.assertTrue(_held(self.check(obs))["placement:disk-cluster"])
+
+    def test_a_disk_born_outside_the_entrys_disk_band_fails(self) -> None:
+        entries = {**ENTRIES, "z1": {**ENTRIES["z1"], "disk_range": (9500, 19999)}}
+        findings = self.check(_canned_observation(), entries)
+        self.assertFalse(_held(findings)["placement:disk-band"])
+        self.assertIn("9001", _why(findings, "placement:disk-band"))
+
+    def test_a_distinct_bridge_must_reach_every_nic(self) -> None:
+        entries = {**ENTRIES, "z2": {**ENTRIES["z2"], "bridge": "vmbr7"}}
+        self.assertTrue(_held(self.check(_canned_observation(), entries))["placement:bridge-override"])
+        entries = {**ENTRIES, "z2": {**ENTRIES["z2"], "bridge": "vmbr8"}}
+        findings = self.check(_canned_observation(), entries)
+        self.assertFalse(_held(findings)["placement:bridge-override"])
+        self.assertIn("not on bridge vmbr8", _why(findings, "placement:bridge-override"))
+
+    def test_a_fallback_to_the_jobs_bridge_fails(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["configs"]["5101"]["net0"] = "virtio=BC:24:11:00:00:02,bridge=vmbr0"
+        entries = {**ENTRIES, "z2": {**ENTRIES["z2"], "bridge": "vmbr7"}}
+        self.assertFalse(_held(self.check(obs, entries))["placement:bridge-override"])
+
+    def test_a_distinct_storage_must_hold_the_boot_drive(self) -> None:
+        entries = {**ENTRIES, "z2": {**ENTRIES["z2"], "storage": "az2-fast"}}
+        self.assertTrue(_held(self.check(_canned_observation(), entries))["placement:storage-override"])
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["configs"]["5101"]["scsi0"] = "local-lvm-data:vm-5101-disk-0,size=8G"
+        findings = self.check(obs, entries)
+        self.assertFalse(_held(findings)["placement:storage-override"])
+        self.assertIn("not az2-fast", _why(findings, "placement:storage-override"))
+
+    def test_an_unreadable_cluster_is_one_clear_finding(self) -> None:
+        obs = _canned_observation()
+        obs["clusters"]["z2"]["error"] = "PVE API read failed: HTTP 401 Unauthorized"
+        findings = self.check(obs)
+        self.assertEqual([f.name for f in findings], ["placement:cluster-resources"])
+        self.assertFalse(findings[0].ok)
+        self.assertIn("z2: PVE API read failed", findings[0].detail)
+
+    def test_no_instances_fails(self) -> None:
+        obs = _canned_observation()
+        obs["instances"] = []
+        self.assertFalse(self.check(obs)[0].ok)
+
+    def test_an_unparseable_cid_is_named(self) -> None:
+        obs = _canned_observation()
+        obs["instances"][0]["vm_cid"] = "not-a-cid"
+        findings = self.check(obs)
+        self.assertFalse(_held(findings)["placement:vm-cluster"])
+        self.assertIn("'not-a-cid'", _why(findings, "placement:vm-cluster"))
+
+    def test_instances_parse_from_either_key_spelling(self) -> None:
+        rows = [{"Instance": "simple/x", "AZ": "z1", "VM CID": "301", "Disk CIDs": "d1, d2"},
+                {"instance": "simple/y", "az": "z2", "vm_cid": "", "disk_cids": ""}]
+        parsed = _spanning.parse_instances(rows)
+        self.assertEqual(parsed[0], {"instance": "simple/x", "az": "z1", "vm_cid": "301",
+                                     "disk_cids": ["d1", "d2"]})
+        self.assertEqual(parsed[1]["vm_cid"], "")
+        self.assertEqual(parsed[1]["disk_cids"], [])
+
+
+class OldVmsGoneTest(unittest.TestCase):
+    def test_the_first_releases_vms_must_be_gone_from_both_clusters(self) -> None:
+        pre = _canned_observation(stamped=False)
+        post = _canned_observation()
+        # The recreate built new VMs under new VMIDs.
+        post["clusters"]["z1"]["resources"] = _spanning.thin_resources(
+            [{"vmid": 302, "node": "n", "name": "cpi-new", "tags": ""}])
+        post["clusters"]["z2"]["resources"] = _spanning.thin_resources(
+            [{"vmid": 5102, "node": "n", "name": "cpi-new", "tags": ""}])
+        finding = _spanning.check_old_vms_gone(pre, post)
+        self.assertTrue(finding.ok, finding.detail)
+        self.assertEqual(finding.name, "placement:old-vms-deleted")
+
+    def test_a_leftover_vm_names_its_cluster(self) -> None:
+        pre = _canned_observation(stamped=False)
+        post = _canned_observation()
+        post["clusters"]["z2"]["resources"] = _spanning.thin_resources(
+            [{"vmid": 5101, "node": "n", "name": "cpi-old", "tags": ""}])
+        finding = _spanning.check_old_vms_gone(pre, post)
+        self.assertFalse(finding.ok)
+        self.assertIn("VM 5101 is still on the z2 cluster", finding.detail)
+
+    def test_an_unreadable_cluster_cannot_prove_absence(self) -> None:
+        pre = _canned_observation(stamped=False)
+        post = _canned_observation()
+        post["clusters"]["z1"]["error"] = "timeout"
+        self.assertFalse(_spanning.check_old_vms_gone(pre, post).ok)
+        self.assertFalse(_spanning.check_old_vms_gone({"instances": []}, post).ok)
+
+
+class CpiEntryFactsTest(unittest.TestCase):
+    """The real manifests/cpi-config.yml supplies the hosts, bands, and prefix."""
+
+    VARS = {"/pve_az1_host": "10.254.0.10", "/pve_az2_host": "10.255.0.10",
+            "/pve_port": "8006", "/pve_vm_prefix": "cpi"}
+
+    def _facts(self, cpi_id: str, variables: "dict | None" = None) -> dict:
+        reads: list[str] = []
+        table = self.VARS if variables is None else variables
+
+        def reader(path: str) -> "str | None":
+            reads.append(path)
+            return table.get(path)
+
+        self.reads = reads
+        return _spanning.cpi_entry_facts(REPO_ROOT / "manifests" / "cpi-config.yml", cpi_id, reader)
+
+    def test_the_two_lab_entries_have_disjoint_bands(self) -> None:
+        one, two = self._facts("pve-az1"), self._facts("pve-az2")
+        self.assertEqual((one["host"], two["host"]), ("10.254.0.10", "10.255.0.10"))
+        self.assertEqual(one["vm_range"], (200, 4999))
+        self.assertEqual(two["vm_range"], (5000, 8999))
+        self.assertEqual(one["disk_range"], (9000, 19999))
+        self.assertEqual(two["disk_range"], (20000, 29999))
+        self.assertEqual(one["vm_prefix"], "cpi")
+        self.assertLess(one["vm_range"][1], two["vm_range"][0])
+        self.assertLess(one["disk_range"][1], two["disk_range"][0])
+
+    def test_only_non_secret_variables_are_read(self) -> None:
+        self._facts("pve-az2")
+        self.assertTrue(set(self.reads) <= set(self.VARS), self.reads)
+        for path in self.reads:
+            self.assertNotRegex(path, r"password|token|secret")
+
+    def test_a_missing_entry_or_variable_is_named(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no cpi-config entry named pve-az9"):
+            self._facts("pve-az9")
+        with self.assertRaisesRegex(ValueError, "pve_az2_host"):
+            self._facts("pve-az2", {"/pve_port": "8006"})
+
+    def test_a_missing_band_is_named(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cpi-config.yml"
+            path.write_text(yaml.safe_dump({"cpis": [{"name": "e", "properties": {"pve": {
+                "host": "h", "vmid_range_start": 200, "vmid_range_end": 4999}}}]}))
+            with self.assertRaisesRegex(ValueError, "disk_vmid_range_start"):
+                _spanning.cpi_entry_facts(path, "e", lambda _p: None)
+
+    def test_an_unset_prefix_variable_means_no_prefix(self) -> None:
+        facts = self._facts("pve-az1", {k: v for k, v in self.VARS.items() if k != "/pve_vm_prefix"})
+        self.assertEqual(facts["vm_prefix"], "")
+
+
+class ProbeTest(_CertifyModule):
+    def test_routing_failures_are_told_from_cpi_failures(self) -> None:
+        routing = ["Task 12 | Timed out pinging VM 'vm-1' with agent 'x' after 600 seconds"]
+        other = ["Task 12 | CPI error 'Bosh::Clouds::CloudError' with message 'storage nope not found'"]
+        self.assertEqual(_spanning.classify_probe_failure(routing), "routing")
+        self.assertEqual(_spanning.classify_probe_failure(other), "other")
+        self.assertEqual(_spanning.classify_probe_failure([]), "other")
+
+    def _certify_with(self, deploy_ok: bool, tail: list) -> object:
+        c = self._certify(_spanning_section())
+        c.ccfg["deployment_name"] = "certification"
+        c.rep = _Rep()
+        c.dry_run = True
+        c.checkout = Path("/nowhere")
+        c.old_stemcell = (Path("/nowhere"), "stemcell", "1", "x")
+        c.run_dir = Path("/nowhere/run")
+        c._director_env = lambda: {}
+        c.calls = []
+
+        def bosh(name, argv, timeout):
+            c.calls.append((name, argv))
+            return (deploy_ok or name != "precheck:z2-reachability"), (tail if not deploy_ok else [])
+
+        c._bosh = bosh
+        return c
+
+    def test_a_good_probe_deploys_then_deletes(self) -> None:
+        c = self._certify_with(True, [])
+        self.assertTrue(c._probe_secondary_network())
+        self.assertEqual([n for n, _ in c.calls], ["precheck:z2-reachability", "precheck:z2-probe-delete"])
+        self.assertEqual(c.calls[0][1][:4], ["bosh", "-n", "-d", "certification-z2-probe"])
+        self.assertIn("delete-deployment", c.calls[1][1])
+        self.assertFalse(c.probe_deployed)
+
+    def test_a_routing_gap_is_reported_as_one_and_the_probe_is_still_deleted(self) -> None:
+        c = self._certify_with(False, ["Timed out pinging VM 'v' with agent 'a' after 600 seconds"])
+        self.assertFalse(c._probe_secondary_network())
+        self.assertEqual([n for n, _ in c.calls], ["precheck:z2-reachability", "precheck:z2-probe-delete"])
+        diagnosis = [row for row in c.rep.rows if row[0] == "precheck:z2-diagnosis"]
+        self.assertEqual(len(diagnosis), 1)
+        self.assertIn("routing gap", diagnosis[0][2])
+
+    def test_another_failure_is_not_blamed_on_routing(self) -> None:
+        c = self._certify_with(False, ["CPI error: storage not found"])
+        self.assertFalse(c._probe_secondary_network())
+        diagnosis = [row for row in c.rep.rows if row[0] == "precheck:z2-diagnosis"]
+        self.assertNotIn("routing gap", diagnosis[0][2])
+
+
+class SpanningSecretsTest(_CertifyModule):
+    """The PVE reads use the existing variables and print none of them."""
+
+    PASSWORD, TOKEN = "hunter2-sentinel", "root@pam!sentinel=00000000-0000-4000-8000-000000000000"
+
+    def _certify_for_reads(self) -> object:
+        c = self._certify(_spanning_section())
+        c.rep = _Rep()
+        c.az_facts = {az: {"host": e["host"], "cpi_id": e["cpi_id"]} for az, e in ENTRIES.items()}
+        c._pve_cfg = lambda: {"host": "10.254.0.10", "port": 8006, "user": "root@pam",
+                              "password": self.PASSWORD, "api_token": self.TOKEN,
+                              "verify_ssl": False}
+        c._capture_json = lambda argv, **_kw: (
+            {"Tables": [{"Rows": [{"uuid": DIRECTOR_UUID}]}]} if argv[:2] == ["bosh", "env"] else
+            {"Tables": [{"Rows": [
+                {"instance": "simple/a", "az": "z1", "vm_cid": CID_Z1, "disk_cids": DISK_Z1},
+                {"instance": "simple/b", "az": "z2", "vm_cid": CID_Z2, "disk_cids": DISK_Z2}]}]})
+        return c
+
+    def test_each_cluster_is_read_with_its_own_host_and_the_same_credentials(self) -> None:
+        c = self._certify_for_reads()
+        seen: list[tuple[str, str, str]] = []
+
+        def api(cfg, path, **_kw):
+            seen.append((cfg["host"], path, cfg.get("password", "")))
+            if path.startswith("/cluster/resources"):
+                return [{"vmid": 301, "node": "n1", "name": "x", "tags": "", "type": "qemu"},
+                        {"vmid": 5101, "node": "n2", "name": "y", "tags": "", "type": "qemu"}]
+            return {"scsi0": "s:vm-1-disk-0", "cipassword": "kept-out"}
+
+        with mock.patch.object(_integration, "pve_api_get", api):
+            obs = c._placement_observation()
+        hosts = {(host, path) for host, path, _ in seen}
+        self.assertIn(("10.254.0.10", "/cluster/resources?type=vm"), hosts)
+        self.assertIn(("10.255.0.10", "/cluster/resources?type=vm"), hosts)
+        self.assertIn(("10.254.0.10", "/nodes/n1/qemu/301/config"), hosts)
+        self.assertIn(("10.255.0.10", "/nodes/n2/qemu/5101/config"), hosts)
+        self.assertEqual({pw for _, _, pw in seen}, {self.PASSWORD})
+        self.assertEqual(obs["director_uuid"], DIRECTOR_UUID)
+        text = json.dumps(obs)
+        for secret in (self.PASSWORD, self.TOKEN, "kept-out"):
+            self.assertNotIn(secret, text)
+
+    def test_a_failed_read_is_kept_without_a_secret(self) -> None:
+        c = self._certify_for_reads()
+
+        def api(cfg, path, **_kw):
+            raise RuntimeError(f"PVE GET {path} on {cfg['host']}:8006 failed: HTTP 401 Unauthorized")
+
+        with mock.patch.object(_integration, "pve_api_get", api):
+            obs = c._placement_observation()
+        self.assertIn("HTTP 401", obs["clusters"]["z2"]["error"])
+        text = json.dumps(obs)
+        self.assertNotIn(self.PASSWORD, text)
+        self.assertNotIn(self.TOKEN, text)
+
+    def test_verify_records_findings_without_a_secret(self) -> None:
+        c = self._certify_for_reads()
+        c.invariants = []
+        c.az_facts = {az: {**{k: v for k, v in e.items() if k not in ("bridge", "storage")}}
+                      for az, e in ENTRIES.items()}
+        c.pre = {"placement": _canned_observation(stamped=False)}
+        post = _canned_observation()
+        post["clusters"]["z1"]["resources"] = _spanning.thin_resources(
+            [{"vmid": 302, "node": "n", "name": "cpi-new", "tags": _tags(STAMP_Z1, "11111111")}])
+        post["clusters"]["z2"]["resources"] = _spanning.thin_resources(
+            [{"vmid": 5101, "node": "n", "name": "cpi-new", "tags": _tags(STAMP_Z2, "22222222")}])
+        c.post = {"placement": post}
+        self.assertFalse(c._verify_placement())
+        names = [r[0] for r in c.rep.rows]
+        self.assertIn("verify:placement-pre-vm-cluster", names)
+        self.assertIn("verify:placement-post-vm-cluster", names)
+        self.assertIn("verify:placement-old-vms-deleted", names)
+        self.assertEqual(c.rep.status("verify:placement-old-vms-deleted"), ["FAIL"])
+        self.assertFalse(c.invariants[-1]["held"])
+        blob = json.dumps(c.rep.rows) + json.dumps(c.invariants)
+        for secret in (self.PASSWORD, self.TOKEN):
+            self.assertNotIn(secret, blob)
+
+    def test_the_real_preflight_reads_only_non_secret_variables(self) -> None:
+        c = self._certify_for_reads()
+        c.dry_run = False
+        c.env_name = "pve-cpi"
+        reads: list[str] = []
+
+        def layered(_env, path):
+            reads.append(path)
+            return {"/pve_az1_host": "10.254.0.10", "/pve_az2_host": "10.255.0.10",
+                    "/pve_port": "8006", "/pve_vm_prefix": "cpi"}.get(path)
+
+        with mock.patch.object(self.mod, "layered_var", layered):
+            self.assertTrue(c._preflight_spanning())
+        self.assertTrue(reads)
+        for path in reads:
+            self.assertNotRegex(path, r"password|token|secret")
+        self.assertEqual(c.rep.status("spanning:cpi-config"), ["PASS"])
+        self.assertNotIn(self.PASSWORD, json.dumps(c.rep.rows))
+
+    def test_two_entries_on_one_host_are_refused(self) -> None:
+        c = self._certify_for_reads()
+        c.dry_run = False
+        c.env_name = "pve-cpi"
+        with mock.patch.object(self.mod, "layered_var", lambda _e, p: {"/pve_port": "8006", "/pve_vm_prefix": "cpi"}.get(p, "10.0.0.1")):
+            self.assertFalse(c._preflight_spanning())
+        self.assertIn("same PVE host", c.rep.rows[-1][2])
 
 
 if __name__ == "__main__":

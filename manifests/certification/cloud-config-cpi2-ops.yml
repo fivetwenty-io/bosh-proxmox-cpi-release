@@ -1,0 +1,37 @@
+# Ops file: add a second AZ, z2, bound to a second cpi-config entry, with a
+# subnet on that cluster's network.
+#
+# `scripts/certify` layers this on top of cloud-config-cpi-ops.yml, which binds
+# z1 to the first entry, when certification.azs in ci/integration.yml lists two
+# entries, so one deployment spans two clusters. A run with the default single
+# entry never applies it. See docs/multi-cluster.md.
+#
+# The base cloud config already names z1 on its only subnet, and a manual
+# network whose subnets name AZs needs every subnet to name one, so this file
+# adds the z2 subnet beside it and leaves the z1 subnet as it is.
+#
+# Vars come from the second certification.azs entry:
+#   certification_secondary_cpi_id    the cpi-config entry z2 is bound to
+#   certification_secondary_range     the z2 subnet's CIDR
+#   certification_secondary_gateway   the z2 subnet's gateway
+#   certification_secondary_reserved  a list of reserved ranges for the z2 subnet
+#   certification_secondary_bridge    the bridge on the second cluster; the
+#                                     entry's bridge when set, and the job's
+#                                     pve_network_bridge otherwise
+- type: replace
+  path: /azs/-
+  value:
+    name: z2
+    cpi: ((certification_secondary_cpi_id))
+    cloud_properties: {}
+
+- type: replace
+  path: /networks/name=default/subnets/-
+  value:
+    range: ((certification_secondary_range))
+    gateway: ((certification_secondary_gateway))
+    dns: [ 1.1.1.1, 8.8.8.8 ]
+    reserved: ((certification_secondary_reserved))
+    az: z2
+    cloud_properties:
+      bridge: ((certification_secondary_bridge))

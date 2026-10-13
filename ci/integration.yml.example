@@ -318,6 +318,47 @@ certification:
   old_cpi_version: ""             # Empty = N-1 of the published GitHub releases
   new_cpi_version: ""             # Empty = N, the latest published release
   timeout_s: 7200                 # Wall-clock ceiling for the whole run
+  # One deployment across two clusters (optional). Left unset, the run uses the
+  # single AZ named by `az` and `cpi_id` above, exactly as before. With two
+  # entries, the `simple` group runs two instances across z1 and z2, each with
+  # a persistent disk, and the run adds three checks. A probe deployment proves
+  # the z2 network reaches the Director's NATS and blobstore before the real
+  # deploy. After the first release deploys, and again after the upgrade and
+  # recreate, the placement check reads /cluster/resources from both clusters
+  # and asserts that each instance's VM and disk sit on the cluster its AZ
+  # names and nowhere else, inside that entry's VMID bands and vm_prefix, with
+  # the bosh-owner-- and bosh-cluster-- tags matching the stamped CID. Finally
+  # it asserts the first release's VMs are gone from both clusters.
+  #
+  # The first entry is the AZ the Director's base cloud config already defines,
+  # so it takes only `az` and `cpi_id`. The second must be z2 and must carry
+  # the subnet on its cluster, which is the AZ2 range the pve-cpi env bundle
+  # reserves for z3 (see manifests/envs/pve-cpi/vars.yml). Both entries need a
+  # cpi_id, and manifests/cpi-config.yml must define both. The PVE host, VMID
+  # bands, and VM prefix come from those entries, and the credentials come from
+  # the variables they already use, so no new secret enters this file.
+  #
+  # `bridge` and `storage` are optional and apply to the second entry only.
+  # Both clusters in the lab use vmbr0 and the same storage ID, so a run that
+  # silently fell back to the job's names would pass by coincidence. Name a
+  # bridge and a storage ID that exist on the second cluster and differ from
+  # the first cluster's, and the run fails if a VM in z2 lands anywhere else:
+  # `bridge` is set on the z2 subnet and checked on every NIC, and `storage` is
+  # set on the z2 AZ and checked on the boot drive. Leave them empty to use the
+  # job's names.
+  # azs:
+  #   - az:     z1
+  #     cpi_id: pve-az1
+  #   - az:     z2
+  #     cpi_id: pve-az2
+  #     network:
+  #       cidr:    10.255.0.0/16
+  #       gateway: 10.255.0.1
+  #       reserved:
+  #       - 10.255.0.1-10.255.48.19
+  #       - 10.255.48.200-10.255.255.254
+  #     bridge:  ""                  # Optional; a bridge on the second cluster
+  #     storage: ""                  # Optional; a storage ID on the second cluster
 
 # Tier 4: Light stemcell upload + delete assertions.
 # Run with: ./scripts/test integration light

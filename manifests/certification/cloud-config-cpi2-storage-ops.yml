@@ -1,0 +1,15 @@
+# Ops file: pin the VMs in z2 to a named storage ID on the second cluster.
+#
+# `scripts/certify` layers this on top of cloud-config-cpi2-ops.yml only when
+# the second certification.azs entry sets `storage`. BOSH merges an AZ's
+# cloud_properties into every VM created in it, and the CPI reads storage_pool
+# as the pool for the VM's boot disk, so a VM in z2 boots from this ID instead
+# of the second cpi-config entry's vm_storage. Using an ID that differs from the
+# first cluster's makes a run that fell back to the job's name fail, where the
+# same name on both clusters would pass by coincidence.
+#
+# Var:
+#   certification_secondary_storage   the storage ID on the second cluster
+- type: replace
+  path: /azs/name=z2/cloud_properties/storage_pool?
+  value: ((certification_secondary_storage))

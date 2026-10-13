@@ -40,6 +40,9 @@ COPIED_FILES = (
     "manifests/envs/cpitest/cc-reserved.yml",
     "manifests/certification/cloud-config-ops.yml",
     "manifests/certification/cloud-config-cpi-ops.yml",
+    "manifests/certification/cloud-config-cpi2-ops.yml",
+    "manifests/certification/cloud-config-cpi2-storage-ops.yml",
+    "manifests/cpi-config.yml",
     "manifests/bosh/cloud-config.yml",
 )
 # The synthetic manifests/bosh/vars.yml. The env bundle's vars.yml, copied

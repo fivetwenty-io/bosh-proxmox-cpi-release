@@ -26,6 +26,14 @@ a Director and the deployment it manages survive a CPI version change: the VM
 and disk CIDs the old CPI wrote must still decode under the new one, and the
 Director VM must be upgraded rather than recreated.
 
+Spanning two clusters: when certification.azs in ci/integration.yml lists two
+entries (see ci/integration.yml.example), the same scenario runs one deployment
+across both clusters. The `simple` group gets an instance and a persistent disk
+in each AZ, a throwaway probe deployment first proves the second network
+reaches the Director's NATS and blobstore, and the run adds placement checks
+that read /cluster/resources from both clusters, before and after the upgrade.
+Left unset, nothing changes.
+
 Usage:
     ./scripts/certify [command] [flags]
 
@@ -99,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -124,6 +133,7 @@ import _lightstemcell  # noqa: E402
 import _pve_verify  # noqa: E402
 import _rundoc  # noqa: E402
 import _slot  # noqa: E402
+import _spanning  # noqa: E402
 import _upgrade_checks  # noqa: E402
 import _vmcid  # noqa: E402
 from _rundoc import (  # noqa: E402
@@ -157,6 +167,11 @@ ENVS_DIR = REPO_ROOT / "manifests" / "envs"
 CERT_MANIFESTS = REPO_ROOT / "manifests" / "certification"
 CC_OPS = CERT_MANIFESTS / "cloud-config-ops.yml"
 CC_CPI_OPS = CERT_MANIFESTS / "cloud-config-cpi-ops.yml"
+# Applied only when certification.azs lists two entries; the second adds the
+# storage ID layer when the entry sets one.
+CC_CPI2_OPS = CERT_MANIFESTS / "cloud-config-cpi2-ops.yml"
+CC_CPI2_STORAGE_OPS = CERT_MANIFESTS / "cloud-config-cpi2-storage-ops.yml"
+CPI_CONFIG = REPO_ROOT / "manifests" / "cpi-config.yml"
 CLOUD_CONFIG = BOSH_DIR / "cloud-config.yml"
 STEMCELL_CACHE = REPO_ROOT / "dev_releases" / "stemcell-cache"
 RELEASES_DIR = REPO_ROOT / "releases" / "bosh-proxmox-cpi"
@@ -263,6 +278,109 @@ def resolve_version_matrix(old_spec: str, new_spec: str) -> "tuple[str, str, boo
     return (old_spec or versions[1]), (new_spec or versions[0]), True
 
 
+_AZ_ENTRY_KEYS = frozenset({"az", "cpi_id", "network", "bridge", "storage"})
+_NETWORK_KEYS = frozenset({"cidr", "gateway", "reserved"})
+# A bridge name or a storage ID: it starts with a letter, so `bosh -v` can
+# never read it as a number, and it holds nothing a shell or YAML would act on.
+_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+
+
+def certification_azs(section: dict, primary_az: str, primary_cpi_id: str) -> list[dict]:
+    """Resolve `certification.azs`, the AZs the certification deployment spans.
+
+    Left unset, it is today's single entry: the `az` and `cpi_id` keys, no
+    network of its own, because the base cloud config supplies the subnet.
+    Every output of a one-entry run is then what it was before the key existed.
+
+    A two-entry list makes one deployment span two clusters. The first entry is
+    the primary AZ the base cloud config already defines. The second must be
+    z2, the name cloud-config-cpi2-ops.yml adds, and carries the subnet on the
+    other cluster plus two optional overrides, `bridge` and `storage`, that let
+    a run use names that differ from the first cluster's.
+    """
+    raw = section.get("azs")
+    if raw is None or raw == []:
+        return [{"az": primary_az, "cpi_id": primary_cpi_id, "network": None,
+                 "bridge": "", "storage": ""}]
+    if not isinstance(raw, list) or not all(isinstance(e, dict) for e in raw):
+        sys.exit("config key `certification.azs` must be a list of mappings "
+                 "(see ci/integration.yml.example)")
+    if len(raw) > 2:
+        sys.exit("certification.azs lists %d entries; the run spans one or two clusters" % len(raw))
+
+    entries: list[dict] = []
+    for i, item in enumerate(raw):
+        where = f"certification.azs[{i}]"
+        unknown = sorted(set(item) - _AZ_ENTRY_KEYS)
+        if unknown:
+            sys.exit(f"{where} has unknown keys: {', '.join(unknown)}")
+        az = str(item.get("az") or "").strip()
+        if not az:
+            sys.exit(f"{where}.az is required")
+        entries.append({
+            "az": az,
+            "cpi_id": str(item.get("cpi_id") or "").strip(),
+            "network": item.get("network"),
+            "bridge": str(item.get("bridge") or "").strip(),
+            "storage": str(item.get("storage") or "").strip(),
+        })
+
+    first = entries[0]
+    if section.get("az") and str(section["az"]) != first["az"]:
+        sys.exit(f"certification.az {section['az']!r} disagrees with certification.azs[0].az "
+                 f"{first['az']!r}; set only one of them")
+    if section.get("cpi_id") and str(section["cpi_id"]).strip() != first["cpi_id"]:
+        sys.exit(f"certification.cpi_id {section['cpi_id']!r} disagrees with certification.azs[0].cpi_id "
+                 f"{first['cpi_id']!r}; set only one of them")
+    for key in ("network", "bridge", "storage"):
+        if first[key]:
+            sys.exit(f"certification.azs[0].{key} is not supported: the first AZ comes from the "
+                     "Director's base cloud config, which uses the job's bridge and storage")
+    first["network"] = None
+    if len(entries) == 1:
+        return entries
+
+    second = entries[1]
+    if second["az"] != _spanning.SECONDARY_AZ:
+        sys.exit(f"certification.azs[1].az must be {_spanning.SECONDARY_AZ}, the AZ "
+                 "manifests/certification/cloud-config-cpi2-ops.yml adds")
+    if second["az"] == first["az"]:
+        sys.exit("certification.azs names the same AZ twice")
+    if not first["cpi_id"] or not second["cpi_id"]:
+        sys.exit("certification.azs needs a cpi_id on both entries: a Director with a cpi-config "
+                 "rejects an AZ that names no entry")
+    if first["cpi_id"] == second["cpi_id"]:
+        sys.exit("certification.azs binds both AZs to one cpi-config entry; a spanning run needs two")
+    second["network"] = _certification_network(second["network"])
+    for key in ("bridge", "storage"):
+        if second[key] and not _NAME_RE.match(second[key]):
+            sys.exit(f"certification.azs[1].{key} {second[key]!r} is not a valid name")
+    return entries
+
+
+def _certification_network(raw: object) -> dict:
+    """Validate the second entry's subnet and return it as cidr, gateway, reserved."""
+    if not isinstance(raw, dict):
+        sys.exit("certification.azs[1].network is required: a mapping with cidr, gateway, and reserved")
+    unknown = sorted(set(raw) - _NETWORK_KEYS)
+    if unknown:
+        sys.exit(f"certification.azs[1].network has unknown keys: {', '.join(unknown)}")
+    missing = sorted(k for k in _NETWORK_KEYS if not raw.get(k))
+    if missing:
+        sys.exit(f"missing required config key: certification.azs[1].network.{missing[0]}")
+    try:
+        network = ipaddress.ip_network(str(raw["cidr"]), strict=True)
+        gateway = ipaddress.ip_address(str(raw["gateway"]))
+    except ValueError as exc:
+        sys.exit(f"certification.azs[1].network holds an invalid address: {exc}")
+    if gateway not in network:
+        sys.exit(f"certification.azs[1].network.gateway {gateway} is outside {network}")
+    reserved = raw["reserved"]
+    if not isinstance(reserved, list) or not all(isinstance(r, str) and r.strip() for r in reserved):
+        sys.exit("certification.azs[1].network.reserved must be a list of addresses or ranges")
+    return {"cidr": str(network), "gateway": str(gateway), "reserved": [r.strip() for r in reserved]}
+
+
 def certification_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
     """Resolve the `certification:` section of ci/integration.yml.
 
@@ -293,14 +411,18 @@ def certification_config(cfg: dict, env_name: str, dry_run: bool) -> dict:
             )
         return resolved
 
+    azs = certification_azs(
+        section, str(section.get("az") or "z1"), str(section.get("cpi_id", "") or "").strip(),
+    )
     return {
         "deployment_name": str(section.get("deployment_name") or "certification"),
         "release_name": str(section.get("release_name") or "certification"),
-        "az": str(section.get("az") or "z1"),
+        "az": azs[0]["az"],
+        "azs": azs,
         "network_name": str(section.get("network_name") or "default"),
         "disk_type": str(section.get("disk_type") or "default"),
         "network_bridge": _env_default("network_bridge", "/pve_network_bridge"),
-        "cpi_id": str(section.get("cpi_id", "") or "").strip(),
+        "cpi_id": azs[0]["cpi_id"],
         "vm_cores": int(section.get("vm_cores", 2)),
         "vm_memory_mib": int(section.get("vm_memory_mib", 2048)),
         "vm_disk_mib": int(section.get("vm_disk_mib", 8192)),
@@ -506,6 +628,11 @@ def _ensure_light_stemcell(env_name: str) -> "_lightstemcell.LightStemcell":
 # Deployment manifest ops
 # --------------------------------------------------------------------------- #
 
+def is_spanning(ccfg: dict) -> bool:
+    """True when certification.azs lists two entries, so one deployment spans two clusters."""
+    return len(ccfg.get("azs") or []) > 1
+
+
 def build_deployment_ops(ccfg: dict) -> list:
     """Ops reshaping upstream's certification.yml for this lab.
 
@@ -516,11 +643,24 @@ def build_deployment_ops(ccfg: dict) -> list:
     reattaches a disk CID the old CPI wrote. That is the single most valuable
     assertion in the whole scenario for a CPI whose disk CIDs are versioned
     envelopes.
+
+    When certification.azs lists two entries, the `simple` group spans both AZs
+    with one instance in each, and each instance keeps its own persistent disk.
     """
-    return [
+    if is_spanning(ccfg):
+        azs = [entry["az"] for entry in ccfg["azs"]]
+    else:
+        azs = [ccfg["az"]]
+    ops = [
         {"type": "replace",
          "path": "/instance_groups/name=simple/azs",
-         "value": [ccfg["az"]]},
+         "value": azs},
+    ]
+    if is_spanning(ccfg):
+        ops.append({"type": "replace",
+                    "path": "/instance_groups/name=simple/instances",
+                    "value": len(azs)})
+    ops += [
         {"type": "replace",
          "path": "/instance_groups/name=simple/vm_type",
          "value": "certification"},
@@ -530,6 +670,28 @@ def build_deployment_ops(ccfg: dict) -> list:
         {"type": "replace",
          "path": "/instance_groups/name=simple/persistent_disk_type?",
          "value": ccfg["disk_type"]},
+    ]
+    return ops
+
+
+def build_probe_ops(ccfg: dict) -> list:
+    """Ops for the throwaway deployment that proves the second AZ's network works.
+
+    One diskless instance in the second AZ, built by the second cpi-config
+    entry. It deploys only if its agent reaches the Director's NATS and pulls
+    its job and packages from the blobstore, which are the two routes from the
+    second network that a spanning deployment depends on.
+    """
+    return [
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/azs",
+         "value": [ccfg["azs"][1]["az"]]},
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/vm_type",
+         "value": "certification"},
+        {"type": "replace",
+         "path": "/instance_groups/name=simple/networks/name=default/name",
+         "value": ccfg["network_name"]},
     ]
 
 
@@ -692,6 +854,10 @@ def write_summary_doc(headline_pass_fail_only: bool = False) -> Path:
 # --------------------------------------------------------------------------- #
 
 class Certify:
+    # True from the moment the throwaway probe deployment starts until it is
+    # deleted, so teardown knows whether to look for it.
+    probe_deployed = False
+
     def __init__(self, args: argparse.Namespace, rep: Reporter) -> None:
         self.args = args
         self.rep = rep
@@ -763,6 +929,9 @@ class Certify:
         self.marker_written: "tuple[str, str] | None" = None
         self.marker_read: "tuple[str, str] | None" = None
         self.marker_problem = "the run never reached the marker write"
+        # The spanning run's cpi-config facts, keyed by AZ, and the throwaway
+        # probe deployment's state. Empty and False in a single-AZ run.
+        self.az_facts: dict[str, dict] = {}
 
     # -- env helpers -------------------------------------------------------- #
 
@@ -906,6 +1075,22 @@ class Certify:
             )
             ok = ok and present
 
+        if is_spanning(self.ccfg):
+            for label, path in (
+                ("manifests/certification/cloud-config-cpi2-ops.yml", CC_CPI2_OPS),
+                ("manifests/certification/cloud-config-cpi2-storage-ops.yml", CC_CPI2_STORAGE_OPS),
+                ("manifests/cpi-config.yml", CPI_CONFIG),
+            ):
+                if path is CC_CPI2_STORAGE_OPS and not self.ccfg["azs"][1]["storage"]:
+                    continue
+                present = path.exists() or self.dry_run
+                self.rep.record(
+                    f"file:{label}", PASS if present else FAIL, 0.0,
+                    "present" if present else "MISSING",
+                )
+                ok = ok and present
+            ok = self._preflight_spanning() and ok
+
         if self.dry_run:
             env_var, _ = _checkouts.UPSTREAMS[CHECKOUT_NAME]
             override = os.environ.get(env_var, "").strip()
@@ -950,6 +1135,59 @@ class Certify:
         ok = self._preflight_slot() and ok
         ok = self._preflight_lab() and ok
         return ok
+
+    def _preflight_spanning(self) -> bool:
+        """Read both cpi-config entries the run spans, offline.
+
+        The placement check asserts each instance against its entry's host,
+        VMID bands, and VM prefix, so a missing entry or band fails here, in
+        seconds, rather than after the deployment is up. Only the entry's
+        non-secret fields are read. The PVE credentials are read later, from
+        the variables the first entry already uses, and never printed.
+        """
+        if self.dry_run:
+            self.rep.record("spanning:cpi-config", PASS, 0.0, "dry-run")
+            return True
+        t0 = time.monotonic()
+
+        def _reader(path: str) -> "str | None":
+            return layered_var(self.env_name, path)
+
+        facts: dict[str, dict] = {}
+        try:
+            for entry in self.ccfg["azs"]:
+                facts[entry["az"]] = _spanning.cpi_entry_facts(CPI_CONFIG, entry["cpi_id"], _reader)
+        except ValueError as exc:
+            return self._record_inline("spanning:cpi-config", False, t0, str(exc))
+        hosts = {f["host"] for f in facts.values()}
+        if len(hosts) < len(facts):
+            return self._record_inline(
+                "spanning:cpi-config", False, t0,
+                "both cpi-config entries name the same PVE host, so they are not two clusters",
+            )
+        self.az_facts = facts
+        return self._record_inline(
+            "spanning:cpi-config", True, t0,
+            "; ".join(
+                f"{az} {f['cpi_id']} on {f['host']} (VMs {f['vm_range'][0]}-{f['vm_range'][1]}, "
+                f"disks {f['disk_range'][0]}-{f['disk_range'][1]})"
+                for az, f in facts.items()
+            ),
+        )
+
+    def _pve_cfg_for(self, az: str) -> dict:
+        """The PVE API settings for one AZ's cluster.
+
+        The user, password or token, and port come from the variables the
+        first cpi-config entry already uses, because every entry reads the
+        same ones. Only the host differs.
+        """
+        facts = self.az_facts[az]
+        cfg = dict(self._pve_cfg())
+        cfg["host"] = facts["host"]
+        if "port" in facts:
+            cfg["port"] = facts["port"]
+        return cfg
 
     def _slot_refusal(self, action: str) -> str:
         """Why this run must not touch its slot's Director, or "".
@@ -1003,6 +1241,25 @@ class Certify:
                 "-o", str(CC_CPI_OPS),
                 "-v", f"certification_cpi_id={self.ccfg['cpi_id']}",
             ]
+        if is_spanning(self.ccfg):
+            second = self.ccfg["azs"][1]
+            network = second["network"]
+            # JSON strings are YAML strings, so `bosh -v` never reads a name
+            # such as "on" or "no" as a boolean.
+            args += [
+                "-o", str(CC_CPI2_OPS),
+                "-v", f"certification_secondary_cpi_id={json.dumps(second['cpi_id'])}",
+                "-v", f"certification_secondary_range={json.dumps(network['cidr'])}",
+                "-v", f"certification_secondary_gateway={json.dumps(network['gateway'])}",
+                "-v", f"certification_secondary_reserved={json.dumps(network['reserved'])}",
+                "-v", "certification_secondary_bridge="
+                      + json.dumps(second["bridge"] or self.ccfg["network_bridge"]),
+            ]
+            if second["storage"]:
+                args += [
+                    "-o", str(CC_CPI2_STORAGE_OPS),
+                    "-v", f"certification_secondary_storage={json.dumps(second['storage'])}",
+                ]
         return args
 
     def _preflight_vars(self) -> bool:
@@ -1062,6 +1319,8 @@ class Certify:
         """The PVE API must answer before we spend 20 minutes finding out."""
         if self.dry_run:
             self.rep.record("lab:reachable", PASS, 0.0, "dry-run")
+            if is_spanning(self.ccfg):
+                self.rep.record("lab:reachable-secondary", PASS, 0.0, "dry-run")
             return True
         t0 = time.monotonic()
         try:
@@ -1069,8 +1328,29 @@ class Certify:
             self.pve_version = str((data or {}).get("version", "")) or "unknown"
         except (RuntimeError, OSError) as exc:
             return self._record_inline("lab:reachable", False, t0, str(exc))
-        return self._record_inline(
+        ok = self._record_inline(
             "lab:reachable", True, t0, f"PVE {self.pve_version}",
+        )
+        if is_spanning(self.ccfg):
+            ok = self._preflight_lab_secondary() and ok
+        return ok
+
+    def _preflight_lab_secondary(self) -> bool:
+        """The second cluster's PVE API must answer too, since the placement check reads it."""
+        t0 = time.monotonic()
+        az = self.ccfg["azs"][1]["az"]
+        if az not in self.az_facts:
+            return self._record_inline(
+                "lab:reachable-secondary", False, t0,
+                "the second cpi-config entry was not read, so its host is unknown",
+            )
+        try:
+            data = _integration.pve_api_get(self._pve_cfg_for(az), "/version")
+        except (RuntimeError, OSError) as exc:
+            return self._record_inline("lab:reachable-secondary", False, t0, str(exc))
+        return self._record_inline(
+            "lab:reachable-secondary", True, t0,
+            f"PVE {str((data or {}).get('version', '')) or 'unknown'} on the {az} cluster",
         )
 
     # -- resolve ------------------------------------------------------------- #
@@ -1311,6 +1591,9 @@ class Certify:
         if not ok:
             return False
 
+        if is_spanning(self.ccfg) and not self._probe_secondary_network():
+            return False
+
         manifest = self._render_deployment_manifest()
         if manifest is None:
             return False
@@ -1323,43 +1606,99 @@ class Certify:
         self.deployed = ok
         return ok
 
-    def _render_deployment_manifest(self) -> "Path | None":
-        """Interpolate upstream's certification.yml for this lab."""
-        self.rep.begin("cert:manifest")
+    def _probe_deployment_name(self) -> str:
+        return f"{self.ccfg['deployment_name']}-z2-probe"
+
+    def _probe_secondary_network(self) -> bool:
+        """Prove the second AZ's network reaches the Director before the real deploy.
+
+        Builds one throwaway instance in the second AZ through the second
+        cpi-config entry. Its agent has to reach the Director's NATS to answer,
+        and has to pull its job and packages from the Director's blobstore, so
+        a deploy that succeeds proves both routes. A routing gap then fails
+        here, under a name that says so, and does not read as a CPI failure in
+        the deployment under test. The probe is deleted either way.
+        """
+        probe = self._probe_deployment_name()
+        manifest = self._render_deployment_manifest(
+            step="cert:probe-manifest", ops=build_probe_ops(self.ccfg),
+            deployment_name=probe, stem="certification-probe",
+        )
+        if manifest is None:
+            return False
+        # Set before the deploy: a deploy that fails partway can still leave a VM.
+        self.probe_deployed = True
+        ok, tail = self._bosh(
+            "precheck:z2-reachability",
+            ["bosh", "-n", "-d", probe, "deploy", str(manifest)],
+            timeout=DEPLOY_TIMEOUT_S,
+        )
+        if not ok:
+            second = self.ccfg["azs"][1]
+            kind = _spanning.classify_probe_failure(tail)
+            self.rep.record(
+                "precheck:z2-diagnosis", FAIL, 0.0,
+                (f"the probe in {second['az']} ({second['cpi_id']}) looks like a routing gap: its agent "
+                 "did not reach the Director's NATS or blobstore. Check the route from the "
+                 "second network to the Director before blaming the CPI."
+                 if kind == "routing" else
+                 f"the probe in {second['az']} ({second['cpi_id']}) failed for a reason that does not "
+                 "look like routing, so read the task output for the CPI's own error"),
+                tail,
+            )
+        cleaned, _ = self._bosh(
+            "precheck:z2-probe-delete",
+            ["bosh", "-n", "-d", probe, "delete-deployment", "--force"],
+            timeout=DEPLOY_TIMEOUT_S,
+        )
+        if cleaned:
+            self.probe_deployed = False
+        return ok and cleaned
+
+    def _render_deployment_manifest(
+        self, *, step: str = "cert:manifest", ops: "list | None" = None,
+        deployment_name: "str | None" = None, stem: str = "certification",
+    ) -> "Path | None":
+        """Interpolate upstream's certification.yml for this lab.
+
+        The keyword arguments render the probe deployment from the same
+        source; the defaults render the deployment under test.
+        """
+        self.rep.begin(step)
         t0 = time.monotonic()
         assert self.checkout is not None
         assert self.old_stemcell is not None
         src = self.checkout / CERT_RELEASE_SUBPATH / "certification.yml"
-        ops_file = self.run_dir / "certification-ops.yml"
-        out = self.run_dir / "certification.yml"
+        ops_file = self.run_dir / f"{stem}-ops.yml"
+        out = self.run_dir / f"{stem}.yml"
         if self.dry_run:
             print(f"    DRY-RUN: bosh int {src} -o <generated ops> > {out}")
-            self.rep.record("cert:manifest", PASS, 0.0, "dry-run")
+            self.rep.record(step, PASS, 0.0, "dry-run")
             return out
         try:
             ops_file.write_text(yaml.safe_dump(
-                build_deployment_ops(self.ccfg),
+                ops if ops is not None else build_deployment_ops(self.ccfg),
                 default_flow_style=False, sort_keys=False,
             ))
             proc = subprocess.run(
                 ["bosh", "int", str(src),
                  "-o", str(ops_file),
-                 "-v", f"deployment_name={self.ccfg['deployment_name']}",
+                 "-v", f"deployment_name={deployment_name or self.ccfg['deployment_name']}",
                  "-v", f"release_name={self.ccfg['release_name']}",
                  "-v", f"stemcell_name={self.old_stemcell[1]}"],
                 capture_output=True, text=True, cwd=str(REPO_ROOT),
             )
             if proc.returncode != 0:
                 self._record_inline(
-                    "cert:manifest", False, t0, "bosh int failed",
+                    step, False, t0, "bosh int failed",
                     proc.stderr.splitlines()[-20:],
                 )
                 return None
             out.write_text(proc.stdout)
         except OSError as exc:
-            self._record_inline("cert:manifest", False, t0, str(exc))
+            self._record_inline(step, False, t0, str(exc))
             return None
-        self._record_inline("cert:manifest", True, t0, str(out))
+        self._record_inline(step, True, t0, str(out))
         return out
 
     # -- capture / upgrade / recreate ---------------------------------------- #
@@ -1383,6 +1722,8 @@ class Certify:
             "orphaned_disks": self._orphaned_disk_count(),
         })
         target["disks"] = self._disk_serials(target)
+        if is_spanning(self.ccfg):
+            target["placement"] = self._placement_observation()
         (self.run_dir / f"capture-{when}.json").write_text(
             json.dumps(target, indent=2, sort_keys=True) + "\n"
         )
@@ -1392,6 +1733,53 @@ class Certify:
             f"cpi {target['cpi_release'] or '?'}, "
             f"disks {len(target['deployment']['disk_cids'])}",
         )
+
+    def _probe_director_uuid(self) -> str:
+        """The Director's UUID, which the CPI turns into the owner tag on every VM it creates."""
+        for row in self._rows(self._capture_json(["bosh", "env", "--json"])):
+            for key, value in row.items():
+                if key.lower() == "uuid" and value:
+                    return str(value)
+        return ""
+
+    def _placement_observation(self) -> dict:
+        """Where the Director says each instance is, and what each cluster says it holds.
+
+        Reads the instance table, then /cluster/resources?type=vm from the
+        cluster each AZ names, then the NIC and drive keys of each instance's
+        VM on its own cluster. A read error is kept under that cluster rather
+        than raised, so the placement check can name it. The observation holds
+        no credential: the API settings are used for the reads and not stored.
+        """
+        dep = self.ccfg["deployment_name"]
+        instances = _spanning.parse_instances(self._rows(self._capture_json(
+            ["bosh", "-d", dep, "instances", "--details", "--json"],
+        )))
+        clusters: dict[str, dict] = {}
+        for entry in self.ccfg["azs"]:
+            az = entry["az"]
+            cluster: dict = {"resources": [], "configs": {}, "error": ""}
+            try:
+                cfg = self._pve_cfg_for(az)
+                cluster["resources"] = _spanning.thin_resources(
+                    _integration.pve_api_get(cfg, "/cluster/resources?type=vm"))
+                node_of = {r["vmid"]: r["node"] for r in cluster["resources"]}
+                for inst in instances:
+                    if inst["az"] != az or not inst["vm_cid"]:
+                        continue
+                    vmid = _vmcid.as_path_id(inst["vm_cid"])
+                    node = node_of.get(vmid)
+                    if node:
+                        cluster["configs"][vmid] = _spanning.thin_config(
+                            _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config"))
+            except (RuntimeError, OSError, KeyError) as exc:
+                cluster["error"] = f"PVE API read failed: {exc}"
+            clusters[az] = cluster
+        return {
+            "director_uuid": self._probe_director_uuid(),
+            "instances": instances,
+            "clusters": clusters,
+        }
 
     def _disk_serials(self, target: dict) -> dict:
         """Each persistent disk's stable id and the drive carrying it as serial=.
@@ -1537,6 +1925,8 @@ class Certify:
                          "verify:instance-running", "verify:no-new-orphans",
                          "verify:cloud-check"):
                 self.rep.record(name, PASS, 0.0, "dry-run")
+            if is_spanning(self.ccfg):
+                self.rep.record("verify:placement", PASS, 0.0, "dry-run")
             return True
 
         ok = True
@@ -1583,6 +1973,8 @@ class Certify:
 
         ok = self._verify_disk_data() and ok
         ok = self._verify_disk_serials() and ok
+        if is_spanning(self.ccfg):
+            ok = self._verify_placement() and ok
 
         states = post_dep.get("process_states", [])
         running = bool(states) and all(s == "running" for s in states)
@@ -1613,6 +2005,59 @@ class Certify:
         )
         ok = ok and cc_ok
 
+        return ok
+
+    def _placement_entries(self) -> dict:
+        """Each AZ's cpi-config facts plus its bridge and storage overrides."""
+        return {
+            entry["az"]: {**self.az_facts[entry["az"]],
+                          "bridge": entry["bridge"], "storage": entry["storage"]}
+            for entry in self.ccfg["azs"]
+        }
+
+    def _verify_placement(self) -> bool:
+        """One deployment on two clusters: each instance sits where its AZ says.
+
+        Judges the observation taken once the first release had deployed, where
+        the VM CIDs may be bare, and the one taken after the recreate under the
+        new release, where they must be stamped. Then it looks for the first
+        release's VMs on both clusters, because the recreate has to delete them
+        through the legacy path.
+        """
+        if not all(entry["az"] in self.az_facts for entry in self.ccfg["azs"]):
+            self.rep.record("verify:placement", FAIL, 0.0,
+                            "the cpi-config entries were not read, so there is nothing to judge against")
+            return False
+        entries = self._placement_entries()
+        ok = True
+        held: dict[str, int] = {}
+        for when, expect_stamped in (("pre", False), ("post", True)):
+            obs = (self.pre if when == "pre" else self.post).get("placement")
+            if not obs:
+                self.rep.record(f"verify:placement-{when}", FAIL, 0.0,
+                                "no placement observation was captured")
+                ok = False
+                continue
+            for finding in _spanning.check_placement(obs, entries, expect_stamped):
+                self.rep.record(
+                    "verify:" + finding.name.replace(":", f"-{when}-", 1),
+                    PASS if finding.ok else FAIL, 0.0, finding.detail,
+                )
+                held[when] = held.get(when, 0) + (1 if finding.ok else 0)
+                ok = ok and finding.ok
+        pre_obs = self.pre.get("placement")
+        post_obs = self.post.get("placement")
+        if pre_obs and post_obs:
+            gone = _spanning.check_old_vms_gone(pre_obs, post_obs)
+            self.rep.record("verify:" + gone.name.replace(":", "-", 1),
+                            PASS if gone.ok else FAIL, 0.0, gone.detail)
+            ok = ok and gone.ok
+        self.invariants.append({
+            "name": "Placement across both clusters",
+            "before": f"{held.get('pre', 0)} placement checks held after the first release",
+            "after": f"{held.get('post', 0)} placement checks held after the recreate",
+            "held": ok,
+        })
         return ok
 
     def _verify_disk_data(self) -> bool:
@@ -1783,6 +2228,12 @@ class Certify:
                 self.rep.skip(name, refusal)
             return
         dep = self.ccfg["deployment_name"]
+        if self.probe_deployed or (self.dry_run and is_spanning(self.ccfg)):
+            self._cleanup_step(
+                "cert:delete-probe",
+                ["bosh", "-n", "-d", self._probe_deployment_name(), "delete-deployment", "--force"],
+                DEPLOY_TIMEOUT_S, env=self._director_env(),
+            )
         if self.deployed or self.dry_run:
             self._cleanup_step(
                 "cert:delete-deployment",
