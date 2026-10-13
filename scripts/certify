@@ -2403,7 +2403,7 @@ class Certify:
             )
             self._cleanup_step(
                 "director:clean-up", ["bosh", "-n", "clean-up", "--all"],
-                DEPLOY_TIMEOUT_S, env=self._director_env(),
+                DEPLOY_TIMEOUT_S, env=self._director_env(), retries=1,
             )
         if self.director_up or self.dry_run:
             self._cleanup_step(
@@ -2421,7 +2421,7 @@ class Certify:
                 self.rep.skip("net:down", self._sdn_skip_reason())
 
     def _cleanup_step(self, name: str, argv: list[str], timeout: int,
-                      env: "dict[str, str] | None" = None) -> bool:
+                      env: "dict[str, str] | None" = None, retries: int = 0) -> bool:
         """Run a teardown command whose failure must not fail the run.
 
         Teardown happens after every invariant has been checked, so an error
@@ -2429,17 +2429,39 @@ class Certify:
         One known case is the Director's own clean-up double-delete on
         stemcell rows. The step still appears in the report, as a skip
         carrying the exit code, so a failed sweep is never silent.
+
+        With `retries` above zero, we re-run a failed command that many times
+        before we give up. The Director's first `clean-up --all` always fails
+        on a multi-CPI Director, and the second succeeds, so `director:clean-up`
+        retries once. A pass after a failed attempt is recorded as a PASS whose
+        detail names the failed attempt. A dry run never retries, so each
+        command prints one DRY-RUN line.
         """
         self.rep.begin(name)
         merged = dict(self.runner.base_env)
         if env:
             merged.update(env)
-        rc, _tail = exec_stream(
-            argv, env=merged, cwd=REPO_ROOT, timeout=timeout,
-            dry_run=self.dry_run, logfile=self.runner.logfile,
-        )
+        attempts = 1 if self.dry_run else 1 + max(retries, 0)
+        first_rc = 0
+        rc = 0
+        for attempt in range(attempts):
+            rc, _tail = exec_stream(
+                argv, env=merged, cwd=REPO_ROOT, timeout=timeout,
+                dry_run=self.dry_run, logfile=self.runner.logfile,
+            )
+            if rc == 0:
+                break
+            if attempt == 0:
+                first_rc = rc
         if rc == 0:
-            self.rep.record(name, PASS, 0.0)
+            if first_rc:
+                self.rep.record(
+                    name, PASS, 0.0,
+                    detail=(f"first attempt exited {first_rc}; the retry passed "
+                            "(the Director's multi-CPI stemcell double-delete)"),
+                )
+            else:
+                self.rep.record(name, PASS, 0.0)
             return True
         self.rep.skip(name, f"best-effort cleanup exited {rc}; sweep the lab by hand")
         return False

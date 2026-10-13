@@ -139,6 +139,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - A managed `create_vm` retry after a closed attempt now stamps the VM it builds. The replacement carries the cluster and CID tags and returns a stamped CID, which honors `pve.vm_cid_format`.
 
+- The upgrade certification's teardown now re-runs `bosh clean-up --all` once when the first run fails. A multi-CPI Director's first clean-up always fails on the stemcell rows, and that left orphaned persistent disks behind after delete-env.
+
 ### Security
 
 - A `cpi_config` entry that points at a different PVE host or port no longer inherits the job-level user, password, API token, or CA certificate, so we never send the job's credentials to another cluster. Before, an entry that set only a new `host` sent the job's token to that cluster, and the client verified it against the job's private CA. An entry must now name its own `api_token`, or its own `user` and `password`, and a request fails non-retriably with an error that names the entry's host and the missing property keys if it does not.

@@ -442,7 +442,7 @@ class TeardownCpiTest(_SyntheticRoot):
         c._sdn_skip_reason = lambda: "the env has no SDN"
         calls = []
 
-        def record(name, argv, timeout, env=None):
+        def record(name, argv, timeout, env=None, retries=0):
             calls.append((name, env))
             return True
 
@@ -1996,6 +1996,50 @@ class ProbeCleanupTest(_CertifyModule):
         self.assertFalse(c.probe_deployed)
 
 
+class CleanupStepRetryTest(_CertifyModule):
+    def _step(self, rcs: list, *, retries: int = 0, dry_run: bool = False) -> tuple:
+        c = object.__new__(self.mod.Certify)
+        c.rep = _Rep()
+        c.runner = _RecordingRunner()
+        c.runner.base_env = {}
+        c.runner.logfile = None
+        c.dry_run = dry_run
+        queue = list(rcs)
+        runs = []
+
+        def fake(argv, **_kw):
+            runs.append(argv)
+            return queue.pop(0), ""
+
+        with mock.patch.object(self.mod, "exec_stream", side_effect=fake):
+            ok = c._cleanup_step("director:clean-up", ["bosh", "-n", "clean-up", "--all"], 5, retries=retries)
+        return ok, c.rep.rows, runs
+
+    def test_a_failed_first_attempt_and_a_passing_retry_records_pass(self) -> None:
+        ok, rows, runs = self._step([1, 0], retries=1)
+        self.assertTrue(ok)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(rows[0][:2], ("director:clean-up", self.mod.PASS))
+        self.assertIn("first attempt exited 1", rows[0][2])
+
+    def test_two_failed_attempts_skip_with_the_second_exit_code(self) -> None:
+        ok, rows, runs = self._step([1, 7], retries=1)
+        self.assertFalse(ok)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(rows[0][1], "SKIP")
+        self.assertIn("exited 7", rows[0][2])
+
+    def test_a_step_without_retries_runs_once(self) -> None:
+        ok, rows, runs = self._step([1])
+        self.assertFalse(ok)
+        self.assertEqual(len(runs), 1)
+        self.assertIn("exited 1", rows[0][2])
+
+    def test_a_dry_run_runs_once_even_with_retries(self) -> None:
+        ok, rows, runs = self._step([1], retries=1, dry_run=True)
+        self.assertEqual(len(runs), 1)
+
+
 class SpanningTeardownTest(_CertifyModule):
     def _certify_for_teardown(self, section: dict, *, keep: bool = False, probe: bool = False,
                               deployed: bool = False) -> object:
@@ -2015,7 +2059,7 @@ class SpanningTeardownTest(_CertifyModule):
         c._director_env = lambda: {}
         c.calls = []
 
-        def record(name, argv, timeout, env=None):
+        def record(name, argv, timeout, env=None, retries=0):
             c.calls.append((name, argv))
             return True
 
