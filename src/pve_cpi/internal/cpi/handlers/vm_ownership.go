@@ -177,8 +177,12 @@ func ownVM(cid vmcid.VMCID, requestUUID string, vm vmOwnershipView) (vmOwnership
 func ownVMStamp(cid vmcid.VMCID, clusterTags, tokenTags []string, clusterMatches func(string) (bool, error)) (vmOwnershipVerdict, bool, error) {
 	if len(clusterTags) > 0 {
 		if !allEqual(clusterTags, cid.Cluster) {
+			// pve.cluster_stamp_aliases plays no part here. The VM's own tag
+			// records the cluster it was created on, and a stamp never
+			// changes after create, so an alias can't make the two agree.
 			return foreignVerdict(ownershipReasonClusterMismatch, fmt.Sprintf(
-				"the CID names cluster %s, and the VM records cluster %s",
+				"the CID names cluster %s, and the VM records cluster %s. pve.cluster_stamp_aliases doesn't change "+
+					"this answer, because the VM's own tag records its cluster",
 				cid.Cluster, strings.Join(clusterTags, " and "))), true, nil
 		}
 	} else {

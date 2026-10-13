@@ -166,15 +166,16 @@ func (c *CPIConfig) IgnoredProfileFields() []string {
 }
 
 // resetEndpointScopedPolicy clears the job-level policy that must never
-// follow a request to another PVE endpoint unless the entry names it. Today
-// that is destroy_unreferenced_disks and cluster_stamp_aliases.
+// follow a request to another PVE endpoint unless the entry names it. Two
+// items qualify, destroy_unreferenced_disks and cluster_stamp_aliases, and
+// each is judged on its own.
 //
-// That flag makes every non-retain delete_vm ask PVE to free each volume that
-// carries the VM's VMID and is not referenced by its config. On storage that
-// two clusters share, the other cluster's live disks match that description,
-// so a job-level true inherited by an entry on another cluster is cross-cluster
-// data loss. An entry that knows its cluster's storage is its own sets the key
-// itself.
+// destroy_unreferenced_disks makes every non-retain delete_vm ask PVE to free
+// each volume that carries the VM's VMID and is not referenced by its config.
+// On storage that two clusters share, the other cluster's live disks match
+// that description, so a job-level true inherited by an entry on another
+// cluster is cross-cluster data loss. An entry that knows its cluster's
+// storage is its own sets the key itself.
 //
 // cluster_stamp_aliases records one cluster's root CA history, so it is
 // meaningless, and unsafe, on any other cluster.

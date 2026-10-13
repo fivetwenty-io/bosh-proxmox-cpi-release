@@ -123,6 +123,19 @@ func TestCheckVMOwnership_StampedCIDWithoutClusterTag(t *testing.T) {
 			tags: ownTags + ";" + clusterStampTagPrefix + stampTestLive, wantReads: 0, want: vmOwnershipVerdict{Owned: true}},
 		{name: "failed read is retriable", cid: "101-" + stampTestLive + "-4e5f6a7b", tags: ownTags,
 			readErr: errors.New("connection refused"), wantReads: 1, wantErr: true},
+		// An alias never overrides the VM's own cluster tag, and the detail
+		// says so, so an operator doesn't add one expecting a change.
+		{name: "cluster tag differs and an alias doesn't help", cid: "101-99aabbcc-4e5f6a7b",
+			tags: ownTags + ";" + clusterStampTagPrefix + stampTestLive, aliases: []string{"99aabbcc"},
+			wantReads: 0, want: vmOwnershipVerdict{Reason: ownershipReasonClusterMismatch},
+			wantDetail: "pve.cluster_stamp_aliases doesn't change this answer"},
+		// The unknown stamp can't name a cluster, but the token still tells
+		// another VM at the VMID apart, so a different token answers Gone
+		// rather than judging the VM by its owner tag.
+		{name: "unknown stamp on both with another token is gone", cid: "101-00000000-11112222",
+			tags:      ownTags + ";" + clusterStampTagPrefix + vmcid.UnknownCluster,
+			wantReads: 0, want: vmOwnershipVerdict{Gone: true, Reason: ownershipReasonTokenMismatch},
+			wantDetail: "the VM at this VMID carries token 4e5f6a7b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,7 +157,7 @@ func TestCheckVMOwnership_StampedCIDWithoutClusterTag(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got.Owned != tc.want.Owned || got.Reason != tc.want.Reason {
+			if got.Owned != tc.want.Owned || got.Gone != tc.want.Gone || got.Reason != tc.want.Reason {
 				t.Errorf("verdict = %+v, want %+v", got, tc.want)
 			}
 			if !strings.Contains(got.Detail, tc.wantDetail) {
@@ -424,6 +437,75 @@ func TestRefuseUnownedStableIDDetach_UnusedEntryOnAbsentVM(t *testing.T) {
 			case !tc.refused && err != nil:
 				t.Errorf("listed=%v cid %s: unexpected error: %v", listed, tc.cid, err)
 			}
+		}
+	}
+}
+
+// TestRefuseUnownedStableIDDetach_SuccessBranchesRefuseAnotherCluster pins the
+// stable-ID detach answers that never edit the VM the CID names: a parked
+// disk, a disk another VM holds, and a free-floating disk. A bare CID keeps
+// the branch's answer with no lookup. A stamped CID that names another
+// cluster is refused whether its VMID is absent or holds a VM tagged with
+// this cluster, and every other verdict keeps the branch's answer.
+func TestRefuseUnownedStableIDDetach_SuccessBranchesRefuseAnotherCluster(t *testing.T) {
+	t.Parallel()
+	const token = "4e5f6a7b"
+	presentTags := ownershipTag + ";" + clusterStampTagPrefix + stampTestLive + ";" + cidStampTagPrefix + token
+	branches := map[string]resolvedDisk{
+		"parked":        {holder: &pve.DiskHolder{VMID: 900, Node: "n1", IsParker: true}},
+		"other holder":  {holder: &pve.DiskHolder{VMID: 202, Node: "n1"}},
+		"free-floating": {},
+	}
+	for name, rd := range branches {
+		for _, tc := range []struct {
+			name    string
+			cid     string
+			present bool
+			readErr error
+			// wantErr is the error type, or empty for the branch's own answer.
+			wantErr   cpierrors.Type
+			wantText  string
+			wantReads int
+		}{
+			{name: "bare CID needs no lookup", cid: "101", wantReads: 0},
+			{name: "absent VMID, another cluster", cid: "101-99aabbcc-" + token,
+				wantErr: cpierrors.TypeCloud, wantText: "does not exist on this cluster", wantReads: 1},
+			{name: "absent VMID, this cluster", cid: "101-" + stampTestLive + "-" + token, wantReads: 1},
+			{name: "present VM, another cluster", cid: "101-99aabbcc-" + token, present: true,
+				wantErr: cpierrors.TypeCloud, wantText: "cluster-mismatch", wantReads: 1},
+			{name: "present VM, another token", cid: "101-" + stampTestLive + "-11112222", present: true, wantReads: 1},
+			{name: "present VM, its own CID", cid: "101-" + stampTestLive + "-" + token, present: true, wantReads: 1},
+			{name: "failed lookup is retriable", cid: "101-99aabbcc-" + token,
+				readErr: errors.New("connection refused"), wantErr: cpierrors.TypeRetriableCloud, wantReads: -1},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				q := &ownTestQEMU{err: sdkerrors.ErrNotFound}
+				if tc.readErr != nil {
+					q.err = tc.readErr
+				}
+				deps, _ := stampTestDeps(q, nil)
+				if tc.present {
+					q.err, q.cfg = nil, map[string]any{"tags": presentTags}
+					client := deps.PVE.(stampTestClient)
+					client.cluster = stampTestCluster{
+						ownTestCluster: ownTestCluster{nodes: []string{"n1"}},
+						rows:           []map[string]any{{"vmid": 101, "type": "qemu", "node": "n1", "tags": presentTags}},
+					}
+					deps.PVE = client
+				}
+				err := refuseUnownedStableIDDetach(context.Background(), deps, tc.cid, mustParseCID(t, tc.cid), rd)
+				if tc.wantErr == "" {
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+				} else if !cpierrors.IsType(err, tc.wantErr) || !strings.Contains(err.Error(), tc.wantText) {
+					t.Fatalf("err = %v, want a %s error containing %q", err, tc.wantErr, tc.wantText)
+				}
+				if tc.wantReads >= 0 && q.reads != tc.wantReads {
+					t.Errorf("config reads = %d, want %d", q.reads, tc.wantReads)
+				}
+			})
 		}
 	}
 }

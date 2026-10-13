@@ -656,7 +656,7 @@ Every call that acts on a VM checks this tag first. A call from one Director nev
 
 ### Which cluster does a VM CID name?
 
-A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle part is the cluster stamp, which is the first eight hex characters of the SHA-256 of the cluster's root CA. The last part is a token that's new for every VM. The VM carries both as tags, `bosh-cluster--0a1b2c3d` and `bosh-cid--4e5f6a7b`, right after its owner tag. A call whose CID names a different cluster than the VM records is refused. So is a call whose VMID is absent from this cluster when the CID's stamp names another cluster, because the VM may still be running there. A VM that carries a different token took over the VMID after the CID's VM was deleted, so the call answers `VMNotFound` and leaves it alone. A VM created before the upgrade keeps its bare CID until a `bosh recreate` gives it a stamped one. A CID with the stamp `00000000` comes from a create that couldn't read the root CA, and when its VM is gone it gets the same answers a bare CID gets.
+A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle part is the cluster stamp, which is the first eight hex characters of the SHA-256 of the cluster's root CA. The last part is a token that's new for every VM. The VM carries both as tags, `bosh-cluster--0a1b2c3d` and `bosh-cid--4e5f6a7b`, right after its owner tag. A call whose CID names a different cluster than the VM records is refused. So is a call whose VMID is absent from this cluster when the CID's stamp names another cluster, because the VM may still be running there. A VM that carries a different token took over the VMID after the CID's VM was deleted, so the call answers `VMNotFound` and leaves it alone. A VM created before the upgrade keeps its bare CID until a `bosh recreate` gives it a stamped one. A CID with the stamp `00000000` comes from a create that couldn't read the root CA, and when its VM is gone it gets the same answers a bare CID gets. Its token still counts, though. When a VM with a different token holds its VMID, the call answers `VMNotFound` and leaves that VM alone, even on a cluster other than the one that created the CID's VM, because the stamp can't say which cluster that was.
 
 ```bash
 # Decode a CID, then find the VM that carries its token
@@ -695,15 +695,19 @@ An alias can stay as long as any CID created before the rotation is still in a D
 
 1. Set `pve.vm_cid_format: bare` and redeploy the CPI, so no new stamped CID is created.
 
-2. Run `bosh recreate` on every deployment, so every VM gets a bare CID.
+2. Run `bosh unignore` on every instance that `bosh instances` shows as ignored, because `bosh recreate` skips ignored instances and their CIDs would stay stamped. We can ignore them again once step 3 is done.
 
-3. Run `bosh create-env --recreate` for each Director that `bosh create-env` manages, so its state file holds a bare CID.
+3. Run `bosh recreate` on every deployment, so every VM gets a bare CID.
 
-4. Delete every snapshot whose CID is stamped, with `bosh delete-snapshot`, because the older release can't.
+4. Run `bosh create-env --recreate` for each Director that `bosh create-env` manages, so its state file holds a bare CID.
 
-5. Roll back the CPI release.
+5. Delete every snapshot whose CID is stamped, with `bosh delete-snapshot`, because the older release can't.
 
-Setting `bare` before the first upgrade to a stamping release skips steps 2 through 4, because no stamped CID ever exists.
+6. Check `bosh orphaned-vms` for stamped CIDs. A recreate that uses create-swap-delete orphans the old VM, so step 3 can leave stamped CIDs there. We delete each one with `bosh delete-vm <cid>`, or we wait until the Director's orphaned-VM cleanup removes it, because the older release can't delete them. [`bosh delete-vm` on a VM with no instance goes to the default CPI](#bosh-delete-vm-on-a-vm-with-no-instance-goes-to-the-default-cpi) applies to these VMs too.
+
+7. Roll back the CPI release.
+
+Setting `bare` before the first upgrade to a stamping release skips steps 2 through 6, because no stamped CID ever exists.
 
 ### `bosh clean-up` is safe across directors
 

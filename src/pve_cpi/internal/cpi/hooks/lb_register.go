@@ -167,11 +167,18 @@ func (h *LBRegisterHook) handleDelete(ctx context.Context) {
 // lbServerName is the stable HAProxy server label for a VM CID. A bare CID
 // keeps vm-<vmid>. A stamped CID adds its cluster stamp, vm-<vmid>-<cluster8>,
 // so two clusters that reuse a VMID behind one backend get two servers, and
-// delete_vm derives from the same CID the name create_vm registered.
+// delete_vm derives from the same CID the name create_vm registered. The
+// unknown stamp names no cluster, so two clusters whose identity reads both
+// failed would share it. A CID carrying it adds its token as well,
+// vm-<vmid>-00000000-<token8>, so deregistering one VM never removes the
+// other's server.
 func lbServerName(cid vmcid.VMCID) string {
 	name := "vm-" + strconv.Itoa(cid.VMID)
 	if cid.Stamped() {
 		name += "-" + cid.Cluster
+		if !cid.KnownCluster() {
+			name += "-" + cid.Token
+		}
 	}
 	return name
 }

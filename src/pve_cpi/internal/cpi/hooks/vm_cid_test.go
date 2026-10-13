@@ -27,7 +27,8 @@ func TestHooksReadStampedCIDs(t *testing.T) {
 
 // TestLBServerName pins the server label. A bare CID keeps the label earlier
 // releases registered, and a stamped CID adds its cluster stamp, so a VMID two
-// clusters both use behind one backend names two servers.
+// clusters both use behind one backend names two servers. A CID with the
+// unknown stamp adds its token too.
 func TestLBServerName(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -38,6 +39,10 @@ func TestLBServerName(t *testing.T) {
 		{"101-0a1b2c3d-4e5f6a7b", "vm-101-0a1b2c3d"},
 		{"101-99aabbcc-4e5f6a7b", "vm-101-99aabbcc"},
 		{"101-0a1b2c3d-deadbeef", "vm-101-0a1b2c3d"},
+		// The unknown stamp names no cluster, so the token keeps two
+		// clusters' VMs at one VMID apart.
+		{"101-00000000-4e5f6a7b", "vm-101-00000000-4e5f6a7b"},
+		{"101-00000000-deadbeef", "vm-101-00000000-deadbeef"},
 	}
 	for _, tc := range cases {
 		cid, err := vmcid.Parse(tc.raw)

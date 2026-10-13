@@ -1977,7 +1977,9 @@ func parkerDepsUntaggedRow(vmid int, qemuSvc *mockQEMUService, nodesSvc *mockNod
 	if mc, ok := deps.PVE.(*mockPVEClient); ok {
 		mc.clusterSvc = &mockClusterSvc{
 			listResourcesFn: func(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
-				raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "pve-node1", "type": "qemu"})
+				// An empty tags value is served verbatim; leaving the key out
+				// would have the fixture client tag the row bosh-cpi.
+				raw, _ := json.Marshal(map[string]any{"vmid": vmid, "node": "pve-node1", "type": "qemu", "tags": ""})
 				resp := cluster.ListResourcesResponse{raw}
 				return &resp, nil
 			},

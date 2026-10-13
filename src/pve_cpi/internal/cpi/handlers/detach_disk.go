@@ -387,9 +387,11 @@ func HandleDetachDisk(deps Deps) Handler {
 
 // refuseUnownedStableIDDetach runs the ownership guard for a stable-ID detach
 // before handleDetachStableID edits the VM the CID names. Only the two cases
-// that edit that VM need it: the VM holds the disk on a slot, and the VM holds
-// it only as an unused entry. A disk that is parked, free-floating, or held by
-// another VM never touches the named VM, so those keep their answers.
+// that edit that VM need the full guard: the VM holds the disk on a slot, and
+// the VM holds it only as an unused entry. A disk that is parked,
+// free-floating, or held by another VM never touches the named VM, so those
+// keep their answers, except that a stamped CID naming another cluster is
+// refused (see refuseStableIDDetachElsewhere).
 //
 // handleDetachStableID is also the step the CPI's own journal-driven VM
 // deletes use to preserve a disk, and the journal already proved that VM is
@@ -423,8 +425,41 @@ func refuseUnownedStableIDDetach(ctx context.Context, deps Deps, vmCID string, c
 		}
 		return refuseVerdict("detach_disk", vmCID, cid, verdict, logger)
 	default:
+		return refuseStableIDDetachElsewhere(ctx, deps, vmCID, cid, logger)
+	}
+}
+
+// refuseStableIDDetachElsewhere covers the stable-ID detach answers that
+// never edit the VM the CID names: a parked disk, a free-floating disk, and a
+// disk another VM holds. They keep their answers for a bare CID, which costs
+// no lookup. A stamped CID that names another cluster is refused anyway,
+// because no VM handler answers for a CID whose VM may run on another
+// cluster. So the VM is located, an absent VMID gets refuseAbsentElsewhere's
+// answer, and a present VM is refused only for a cluster mismatch. Every
+// other verdict keeps the branch's answer, because the branch doesn't touch
+// that VM. A failed lookup or identity read is retriable.
+func refuseStableIDDetachElsewhere(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID, logger *log.Logger) error {
+	if !cid.Stamped() {
 		return nil
 	}
+	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("detach_disk: locate VM %s", vmCID))
+	}
+	if !loc.Found || loc.Node == "" {
+		return refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, logger)
+	}
+	verdict, err := checkVMOwnershipByConfig(ctx, deps, "detach_disk", cid, loc)
+	if err != nil {
+		return err
+	}
+	if verdict.Absent {
+		return refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, logger)
+	}
+	if verdict.foreign() && verdict.Reason == ownershipReasonClusterMismatch {
+		return refuseVerdict("detach_disk", vmCID, cid, verdict, logger)
+	}
+	return nil
 }
 
 // handleDetachStableID is the whole detach flow for a stable-ID disk. The

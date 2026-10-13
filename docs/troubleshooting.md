@@ -501,7 +501,7 @@ The reason in parentheses says which check failed.
 | `parker` | The CID reached a disk parker. |
 | `template` | The CID reached a stemcell template. |
 | `not-bosh` | The VM carries no owner tag, no `bosh-cpi` tag, and no Director metadata lines in its Notes, or the VMID names a container. |
-| `cluster-mismatch` | A stamped CID names a different cluster than the VM's `bosh-cluster--` tag records. When the VM carries no cluster tag, the CID's stamp differs from this cluster's own stamp and from every `pve.cluster_stamp_aliases` entry, or it's `00000000`. [A call refuses a CID that names another cluster](#a-call-refuses-a-cid-that-names-another-cluster) covers the same reason for a VMID that is absent. |
+| `cluster-mismatch` | A stamped CID names a different cluster than the VM's `bosh-cluster--` tag records, and `pve.cluster_stamp_aliases` doesn't change that answer, because the tag is the VM's own record of its cluster. When the VM carries no cluster tag, the CID's stamp differs from this cluster's own stamp and from every `pve.cluster_stamp_aliases` entry, or it's `00000000`. [A call refuses a CID that names another cluster](#a-call-refuses-a-cid-that-names-another-cluster) covers the same reason for a VMID that is absent. |
 | `token-missing` | A stamped CID carries a token, and the VM carries no `bosh-cid--` tag. |
 | `token-conflict` | The VM carries several `bosh-cid--` tags, and only some of them match the CID. |
 

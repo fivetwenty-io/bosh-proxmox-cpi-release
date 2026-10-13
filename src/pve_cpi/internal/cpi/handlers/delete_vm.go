@@ -545,7 +545,7 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	if lookupErr != nil {
 		return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
 	}
-	node, vmTags := loc.Node, loc.Tags
+	node := loc.Node
 	if !loc.Found || node == "" {
 		// A stamped CID whose cluster stamp names another cluster is refused
 		// here. Its VM may still run there, so answering success would drop
@@ -563,17 +563,30 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	logger.Debug("delete_vm: VM located", log.String("node", node))
 
 	// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
-	if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid, vmTags); parkerErr != nil {
+	parkerLoc, alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, loc, vmid)
+	if parkerErr != nil {
 		return nil, parkerErr
-	} else if alreadyGone {
-		// The VM's config is gone from the node the scan named. A stamped
-		// CID that names another cluster is refused here too, because the
-		// CID's VM was never this one and may still run there.
+	}
+	if alreadyGone {
+		// The VM's config is gone from the node the scan named, and two
+		// sweeps of every member's config found it nowhere. A stamped CID
+		// that names another cluster is refused here too, because the CID's
+		// VM was never this one and may still run there.
 		if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
 			return nil, err
 		}
+		logger.Info("delete_vm: VM config gone from its node and absent from every member's config probe — already deleted, returning success")
 		return nil, nil
 	}
+	if parkerLoc.Node != node {
+		// The VM moved between the scan and the config read. The rest of
+		// the delete runs against the node that holds it now.
+		logger.Info("delete_vm: VM moved after the cluster scan, continuing on its current node",
+			log.String("scan_node", node), log.String("node", parkerLoc.Node))
+	}
+	loc = parkerLoc
+	node = loc.Node
+	vmTags := loc.Tags
 
 	// A removed placement configuration cannot turn an allocated VM into a
 	// legacy guest and bypass its durable cleanup authority. Both views count,
@@ -776,18 +789,27 @@ func parseDeleteVMArgs(args []json.RawMessage) (string, vmcid.VMCID, error) {
 // reading the config. Every parker the CPI creates is tagged, so on a
 // CPI-managed cluster that fallback never fires.
 //
-// Returns alreadyGone=true when the VM vanished during the fallback config
-// read (the caller should treat delete_vm as already complete).
-func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int, vmTags string) (alreadyGone bool, err error) {
+// The fallback read happens at the node the scan named. A not-found or
+// pmxcfs config-missing answer there does not prove the VM is gone, because
+// it may have migrated since the scan. So the VM is located again with
+// pve.FindVMByConfigProbe, which skips the contradicted index row and needs
+// two clean sweeps of every member before it reports absence.
+//
+// It returns the location the rest of the delete must use, which is loc
+// unless the VM moved, and alreadyGone=true only when the probe proved the VM
+// absent. A probe failure, including a member the cluster reports offline,
+// is retriable, because a success answer on partial evidence would drop the
+// Director's record of a VM that may still run.
+func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid int) (pve.VMLocation, bool, error) {
 	if deps.Config == nil {
-		return false, nil
+		return loc, false, nil
 	}
-	if pve.TagsMarkParker(vmTags) {
-		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+	if pve.TagsMarkParker(loc.Tags) {
+		return loc, false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 	}
-	if strings.TrimSpace(vmTags) != "" {
+	if strings.TrimSpace(loc.Tags) != "" {
 		// The row carried tags and they do not mark a parker: authoritative.
-		return false, nil
+		return loc, false, nil
 	}
 	// No tags on the row. That is either a VM with no tags -- which no parker
 	// ever is, since the CPI stamps bosh-cpi and bosh-parker at creation -- or a
@@ -798,21 +820,34 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, node string, vmid int, vmT
 	// the operator who dropped the band while parkers were still standing.
 	// Fail-closed: a transient config read error must NOT proceed to a purge.
 	// Any doubt is retriable so the Director retries when PVE recovers.
-	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmid)
+	vmCfg, cfgErr := deps.PVE.QEMU().Config(ctx, loc.Node, vmid)
 	if cfgErr != nil {
-		if pve.IsNotFound(cfgErr) {
-			// VM gone during the read -- treat as already deleted.
-			return true, nil
+		if !pve.IsNotFound(cfgErr) && !pve.IsPmxcfsConfigMissing(cfgErr) {
+			return loc, false, cpierrors.Retriable(
+				"delete_vm: could not read config for VMID %d to verify parker status: %s (retry when PVE recovers)",
+				vmid, cfgErr.Error())
 		}
-		return false, cpierrors.Retriable(
-			"delete_vm: could not read config for VMID %d to verify parker status: %s (retry when PVE recovers)",
-			vmid, cfgErr.Error())
+		moved, lookErr := pve.FindVMByConfigProbe(ctx, deps.PVE, vmid)
+		if lookErr != nil {
+			return loc, false, cpierrors.WrapAs(lookErr, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+				"delete_vm: VM %d config is gone from node %s, and locating the VM again to verify parker status failed",
+				vmid, loc.Node))
+		}
+		if !moved.Found || moved.Node == "" {
+			return loc, true, nil
+		}
+		// The probe read the whole config on the node that holds the VM now,
+		// so its tags are the config's tags.
+		if pve.TagsMarkParker(moved.Tags) {
+			return moved, false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+		}
+		return moved, false, nil
 	}
 	tagsRaw, _ := pve.ConfigString(vmCfg, jsonKeyTags)
 	if pve.TagsMarkParker(tagsRaw) {
-		return false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+		return loc, false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
 	}
-	return false, nil
+	return loc, false, nil
 }
 
 // cleanupHAMembership removes the VM's CPI-managed HA state before the stop:

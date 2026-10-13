@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -118,12 +120,15 @@ func (q *managedVMEntryQEMU) Start(context.Context, string, int) (string, error)
 }
 
 func TestManagedVMEntryJournalsBeforeCreateAndResumesWithoutCurrentSets(t *testing.T) {
-	for _, tc := range []struct{ retry, pause bool }{{}, {retry: true}, {retry: true, pause: true}} {
-		t.Run(fmt.Sprintf("retry=%t,pause=%t", tc.retry, tc.pause), func(t *testing.T) { runManagedVMEntryCase(t, tc.retry, tc.pause) })
+	// pause closes the first attempt, so the second create_vm reaches the
+	// closed-attempt retry through the journal resume. bare runs that retry
+	// under vm_cid_format: bare.
+	for _, tc := range []struct{ retry, pause, bare bool }{{}, {retry: true}, {retry: true, pause: true}, {retry: true, pause: true, bare: true}} {
+		t.Run(fmt.Sprintf("retry=%t,pause=%t,bare=%t", tc.retry, tc.pause, tc.bare), func(t *testing.T) { runManagedVMEntryCase(t, tc.retry, tc.pause, tc.bare) })
 	}
 }
 
-func runManagedVMEntryCase(t *testing.T, retry, pause bool) {
+func runManagedVMEntryCase(t *testing.T, retry, pause, bare bool) {
 	t.Helper()
 	no := false
 	directory := t.TempDir()
@@ -134,6 +139,9 @@ func runManagedVMEntryCase(t *testing.T, retry, pause bool) {
 	if retry {
 		limit := 1
 		cfg.Placement.FallbackMax = &limit
+	}
+	if bare {
+		cfg.VMCIDFormat = config.VMCIDFormatBare
 	}
 	journal, err := aj.Initialize(t.Context(), directory, cfg.StoragePlacementNamespace, aj.Enrollment{ClusterID: "pve-root-ca-sha256:" + strings.Repeat("ab", 32), AuthorityID: "authority", AuditID: "audit", CompleteHistoricalAudit: true, PreviousWriterFenced: true})
 	if err != nil {
@@ -181,6 +189,7 @@ func runManagedVMEntryCase(t *testing.T, retry, pause bool) {
 	if client.creates != expectedCreates || len(state.configs) != 1 || state.configs[vmid] == nil {
 		t.Fatal("fresh managed request did not create exactly one VM")
 	}
+	assertManagedVMEntryStamped(t, cid, state.configs[vmid], bare)
 	record, found, err := journal.InspectVM("entry-agent")
 	if err != nil || !found || record.State != aj.ReadyToReturn {
 		t.Fatalf("ready generation not durable: %+v %v", record, err)
@@ -249,4 +258,39 @@ func (n *managedVMEntryNodes) GetStorageContent(ctx context.Context, node, pool,
 func (c *managedVMEntryCluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
 	rows := cluster.ListHaResourcesResponse{}
 	return &rows, nil
+}
+
+// assertManagedVMEntryStamped checks that the VM create_vm built carries the
+// cluster tag for the fixture's root CA and one token tag, and that the CID it
+// returned names both, or is bare under vm_cid_format: bare.
+func assertManagedVMEntryStamped(t *testing.T, cid string, vmConfig map[string]any, bare bool) {
+	t.Helper()
+	const stamp = "abababab"
+	raw, _ := vmConfig["tags"].(string)
+	tags := parseTagsField(raw)
+	if !slices.Contains(tags, clusterStampTagPrefix+stamp) {
+		t.Fatalf("the VM's tags %q lack the cluster tag %s", raw, clusterStampTagPrefix+stamp)
+	}
+	var tokens []string
+	for _, tag := range tags {
+		if token, ok := strings.CutPrefix(tag, cidStampTagPrefix); ok {
+			tokens = append(tokens, token)
+		}
+	}
+	if len(tokens) != 1 || !vmcid.IsStamp(tokens[0]) {
+		t.Fatalf("the VM's tags %q carry token tags %v, want exactly one", raw, tokens)
+	}
+	parsed, err := vmcid.Parse(cid)
+	if err != nil {
+		t.Fatalf("create_vm returned an unparsable CID %q: %v", cid, err)
+	}
+	if bare {
+		if parsed.Stamped() {
+			t.Fatalf("create_vm returned %q under vm_cid_format: bare, want a bare CID", cid)
+		}
+		return
+	}
+	if parsed.Cluster != stamp || parsed.Token != tokens[0] {
+		t.Fatalf("create_vm returned %q, want the CID to name cluster %s and token %s", cid, stamp, tokens[0])
+	}
 }
