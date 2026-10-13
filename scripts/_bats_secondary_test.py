@@ -1,4 +1,4 @@
-import pathlib, runpy, tempfile, types, unittest
+import io, pathlib, runpy, tempfile, types, unittest, unittest.mock
 import yaml
 from unittest.mock import Mock
 
@@ -209,6 +209,140 @@ class SecondaryRenderTests(unittest.TestCase):
 
     def test_skip_secondary_writes_no_secondary_spec(self):
         self.assertFalse((self.render(skip=True) / 'bat-secondary.yml').exists())
+
+
+class ExcludeHelperTests(unittest.TestCase):
+    def test_helper_anchors_and_escapes_each_description(self):
+        text = G['render_exclude_helper'](["a.b (c) [d] it's \\ #{x}"])
+        self.assertIn("RSpec.configure do |c|", text)
+        self.assertIn("filter_run_excluding full_description:", text)
+        self.assertIn("Regexp.escape('a.b (c) [d] it\\'s \\\\ #{x}')", text)
+        self.assertIn("'\\A' + Regexp.escape(", text)
+        self.assertIn("+ '\\z')", text)
+
+    def test_helper_unions_several_descriptions_in_one_call(self):
+        text = G['render_exclude_helper'](['one', 'two'])
+        self.assertEqual(text.count('filter_run_excluding'), 1)
+        self.assertIn('Regexp.union(', text)
+        self.assertIn("Regexp.escape('one')", text)
+        self.assertIn("Regexp.escape('two')", text)
+
+    def test_table_names_the_delete_vm_reference_example(self):
+        table = G['SECONDARY_EXCLUDED_EXAMPLES']
+        desc = 'cck unresponsive agent delete_vm_reference should delete vm reference'
+        self.assertIn(desc, table)
+        self.assertIn('default CPI', table[desc])
+        self.assertIn('primary pass runs this example', table[desc])
+        self.assertIn('docs/operations.md', table[desc])
+
+
+class SecondaryCommandTests(unittest.TestCase):
+    """_run_rspec_pass builds the argv; the subprocess layer is a mock."""
+
+    def pass_argv(self, name, spec_path=None):
+        run = SecondaryPassTests().runner(True)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        run.run_dir = pathlib.Path(tmp.name)
+        run.dry_run = False
+        run.stemcell_path = pathlib.Path('/stemcell.tgz')
+        run.args.keep = False
+        run._bundle_env = lambda: {}
+        run._director_env = lambda: {}
+        run.pass_timeout_s = 60
+        run.runner = Mock()
+        run.runner.step.return_value = (True, '')
+        del run.__dict__['_run_rspec_pass']
+        self.assertTrue(run._run_rspec_pass(name, False, [], run.run_dir / 'junit.xml', spec_path=spec_path))
+        return run, run.runner.step.call_args[0][1]
+
+    def test_secondary_pass_requires_the_helper_and_writes_it(self):
+        run, argv = self.pass_argv('secondary', pathlib.Path('/x/bat-secondary.yml'))
+        helper = run.run_dir / 'rspec-exclude-secondary.rb'
+        self.assertEqual(argv[argv.index(str(helper)) - 1], '--require')
+        self.assertIn('delete_vm_reference', helper.read_text())
+
+    def test_primary_pass_does_not_require_the_helper(self):
+        run, argv = self.pass_argv('ipv4')
+        self.assertFalse(any('rspec-exclude-secondary' in a for a in argv))
+        self.assertFalse((run.run_dir / 'rspec-exclude-secondary.rb').exists())
+
+    def test_report_lists_excluded_example_with_reason(self):
+        run = SecondaryPassTests().runner(True)
+        run.run_rspec()
+        self.assertEqual(run.excluded_examples, G['SECONDARY_EXCLUDED_EXAMPLES'])
+        meta = {'excluded_examples': run.excluded_examples}
+        self.assertIn('delete_vm_reference', ' '.join(meta['excluded_examples']))
+        run = SecondaryPassTests().runner(True, skip=True)
+        run.excluded_examples = {}
+        run.run_rspec()
+        self.assertEqual(run.excluded_examples, {})
+
+    def test_run_doc_has_example_exclusions_section(self):
+        captured = {}
+        desc = 'cck unresponsive agent delete_vm_reference should delete vm reference'
+        meta = {
+            'date': '2026-10-13', 'verdict': 'PASSED', 'excluded_tags': [], 'excluded_reasons': {},
+            'excluded_examples': {desc: 'because | reason'}, 'wall_hms': '0', 'started': 's',
+            'finished': 'f', 'command_line': 'c', 'exit_code': 0, 'secondary_pass': 'x',
+            'primary_pass': 'skipped on request (--secondary-only)',
+        }
+        with unittest.mock.patch.object(
+                G['_rundoc'], 'write_run_doc',
+                lambda **kw: captured.update(kw) or pathlib.Path('/doc')):
+            G['write_run_doc'](meta, None)
+        sections = '\n'.join(captured['extra_sections'])
+        self.assertIn('## Example exclusions', sections)
+        self.assertIn(desc, sections)
+        self.assertIn('because \\| reason', sections)
+        verdict = '\n'.join(captured['verdict_lines'])
+        self.assertIn('Primary pass: skipped on request', verdict)
+
+
+class SecondaryOnlyTests(unittest.TestCase):
+    def runner(self, **kw):
+        run = SecondaryPassTests().runner(True, **kw)
+        run.args.secondary_only = True
+        return run
+
+    def test_runs_only_the_secondary_pass(self):
+        run = self.runner()
+        self.assertTrue(run.run_rspec())
+        self.assertEqual(run.calls, [('secondary', 'junit-secondary.xml', 'bat-secondary.yml')])
+        self.assertEqual([p.name for p in run.junit_paths], ['junit-secondary.xml'])
+
+    def test_failure_in_the_secondary_pass_fails_the_run(self):
+        run = self.runner()
+        run._run_rspec_pass = lambda *a, **k: False
+        self.assertFalse(run.run_rspec())
+
+    def test_report_meta_says_primary_was_skipped(self):
+        run = self.runner()
+        run.run_rspec()
+        self.assertTrue(run._secondary_only())
+        self.assertIn('pve-az2', run._secondary_meta())
+
+    def test_missing_block_is_a_usage_error(self):
+        args = types.SimpleNamespace(
+            secondary_only=True, config='c', env='e', results_dir=tempfile.gettempdir(),
+            dry_run=True, skip_doc=True,
+        )
+        with unittest.mock.patch.dict(G['BATS'].__init__.__globals__['_integration'].__dict__, {
+            'load_config': lambda *a, **k: {},
+        }), unittest.mock.patch.dict(G['BATS'].__init__.__globals__, {
+            'bats_config': lambda *a, **k: primary(),
+        }):
+            with self.assertRaises(SystemExit) as ctx:
+                G['BATS'](args, Mock(run_dir=lambda d: pathlib.Path(d)))
+        self.assertIn('--secondary-only needs a bats.secondary block', str(ctx.exception))
+
+    def test_flag_combinations_are_usage_errors(self):
+        main = G['main']
+        for extra in (['--skip-secondary'], ['--only', 'ipv6'], ['--only', 'dual_stack']):
+            with self.assertRaises(SystemExit) as ctx, \
+                    unittest.mock.patch('sys.stderr', new=io.StringIO()):
+                main(['run', '--secondary-only'] + extra)
+            self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == '__main__':

@@ -43,6 +43,9 @@ Flags:
     --skip-secondary    Ignore the bats.secondary block and run only the
                         primary cpi_id pass. Without that block a run never
                         makes a second pass.
+    --secondary-only    Skip the primary pass and run only the bats.secondary
+                        pass. Needs a bats.secondary block and cannot be
+                        combined with --skip-secondary or a dual-stack --only.
     --fail-fast         Stop rspec at the first failure.
     --keep              Set BAT_DEBUG_MODE: fail fast and leave the failed
                         deployment, stemcell, and release in place.
@@ -133,6 +136,7 @@ JUNIT_RSPEC = "junit.xml"        # spec-level results written by rspec
 JUNIT_SECONDARY = "junit-secondary.xml"  # the bats.secondary pass
 SECONDARY_CPI_ID = "pve-az2"     # cpi-config entry the secondary pass defaults to
 SECONDARY_SPEC = "bat-secondary.yml"
+SECONDARY_EXCLUDE_HELPER = "rspec-exclude-secondary.rb"  # --require file for the secondary pass
 JUNIT_STEPS = "junit-steps.xml"  # harness step results written by Reporter
 DEFAULT_RSPEC_TIMEOUT_S = 14400
 RUN_META_MARK = "bats-run-meta"
@@ -154,6 +158,49 @@ DEFAULT_EXCLUDED_TAGS: dict[str, str] = {
         "PVE has no prefix-delegation API for the CPI to call"
     ),
 }
+
+# Examples the secondary pass leaves out, keyed by full rspec description. The
+# primary pass runs them. The reasons are reproduced verbatim in the run report.
+SECONDARY_EXCLUDED_EXAMPLES: dict[str, str] = {
+    "cck unresponsive agent delete_vm_reference should delete vm reference": (
+        "after `bosh cck` drops the VM reference, the example runs "
+        "`bosh delete-vm <cid>`, and with no instance left there is no "
+        "cpi-config entry to name, so the Director sends the call to its "
+        "default CPI on the job-level cluster; that CPI correctly refuses a "
+        "CID stamped for the secondary entry's cluster. The primary pass runs "
+        "this example. See docs/operations.md, section \"`bosh delete-vm` on "
+        "a VM with no instance goes to the default CPI\""
+    ),
+}
+
+
+def render_exclude_helper(descriptions: "list[str]") -> str:
+    """Ruby source for the rspec helper that excludes whole examples.
+
+    Each description becomes an anchored regexp built with Regexp.escape, the
+    Ruby counterpart of re.escape, so metacharacters in a description match
+    themselves. The descriptions travel as single-quoted Ruby strings, which
+    interpolate nothing.
+    """
+    def quote(text: str) -> str:
+        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    patterns = ",\n    ".join(
+        f"Regexp.new('\\A' + Regexp.escape({quote(text)}) + '\\z')"
+        for text in sorted(descriptions)
+    )
+    # One call with one union: a second filter_run_excluding on the same key
+    # would replace the first.
+    lines = [
+        "# Written by scripts/bats. Excludes examples by full description.",
+        "RSpec.configure do |c|",
+        "  c.filter_run_excluding full_description: Regexp.union(",
+        f"    {patterns}",
+        "  )",
+        "end",
+    ]
+    return "\n".join(lines) + "\n"
+
 
 # The upstream nic_groups example never turns IPv6 on, so its job keeps the
 # single IPv4 network and the "same nic_group, same interface" assertion holds
@@ -761,6 +808,20 @@ def write_run_doc(
     else:
         extra.append("No tags were excluded.")
     extra.append("")
+    excluded_examples = meta.get("excluded_examples") or {}
+    if excluded_examples:
+        extra.append("## Example exclusions")
+        extra.append("")
+        extra.append(
+            "The secondary cpi-config pass left out the following examples by "
+            "full description. The primary pass runs them."
+        )
+        extra.append("")
+        extra.append("| Example | Reason |")
+        extra.append("|---|---|")
+        for desc in sorted(excluded_examples):
+            extra.append(f"| {_md_escape(desc)} | {_md_escape(excluded_examples[desc])} |")
+        extra.append("")
     extra.append("## Examples")
     extra.append("")
     if rspec and rspec["cases"]:
@@ -787,6 +848,9 @@ def write_run_doc(
             "run the suite."
         ),
         verdict_lines=[headline, ""] + _rundoc.run_meta_bullets(meta) + (
+            [f"- Primary pass: {meta['primary_pass']}", ""]
+            if meta.get("primary_pass") else []
+        ) + (
             [f"- Second cpi-config pass: {meta['secondary_pass']}", ""]
             if meta.get("secondary_pass") else []
         ),
@@ -853,7 +917,9 @@ def write_summary_doc(headline_pass_fail_only: bool = False) -> Path:
             f"{latest.get('failures', '?')} failures, "
             f"{latest.get('skipped', '?')} skipped, in "
             f"{latest.get('wall_hms', '?')}. "
-            f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
+            + ("The primary pass was skipped on request, so the counts cover "
+               "the secondary pass alone. " if latest.get("primary_pass") else "")
+            + f"Full report: [runs/{latest['_doc']}](runs/{latest['_doc']})."
         ),
         latest_table=[
             ("CPI release", "cpi_version"),
@@ -910,6 +976,11 @@ class BATS:
 
         self.cfg = _integration.load_config(args.config, dry_run=self.dry_run)
         self.bcfg = bats_config(self.cfg, self.env_name, self.dry_run)
+        if getattr(args, "secondary_only", False) and not self.bcfg.get("secondary"):
+            sys.exit(
+                "--secondary-only needs a bats.secondary block in the config "
+                "(see ci/integration.yml.example)"
+            )
 
         self.checkout: "Path | None" = None
         self.stemcell_path: "Path | None" = None
@@ -920,6 +991,7 @@ class BATS:
         self.rspec_rc: "int | None" = None
         self.junit_paths: "list[Path]" = []
         self.secondary_ran = False
+        self.excluded_examples: dict[str, str] = {}
         self.dual_stack_ran = False
         self.excluded: dict[str, str] = {}
 
@@ -1362,6 +1434,9 @@ class BATS:
     def _skip_secondary(self) -> bool:
         return bool(getattr(self.args, "skip_secondary", False))
 
+    def _secondary_only(self) -> bool:
+        return bool(getattr(self.args, "secondary_only", False))
+
     def _secondary_render_note(self) -> str:
         secondary = self.bcfg.get("secondary")
         if not secondary or self._skip_secondary():
@@ -1461,7 +1536,9 @@ class BATS:
         # writes exactly what it wrote before.
         self.pass_timeout_s = max(1, self.bcfg["rspec_timeout_s"])
         ok = True
-        for name, dual_stack, only in passes:
+        # --secondary-only leaves the primary pass out, so the run holds just
+        # the secondary junit file.
+        for name, dual_stack, only in ([] if self._secondary_only() else passes):
             junit = self.run_dir / JUNIT_RSPEC
             self.junit_paths.append(junit)
             if not self._run_rspec_pass(name, dual_stack, only, junit):
@@ -1472,6 +1549,7 @@ class BATS:
             junit = self.run_dir / JUNIT_SECONDARY
             self.junit_paths.append(junit)
             self.secondary_ran = True
+            self.excluded_examples = dict(SECONDARY_EXCLUDED_EXAMPLES)
             if not self._run_rspec_pass(
                 "secondary", False, passes[0][2], junit,
                 spec_path=self.run_dir / SECONDARY_SPEC,
@@ -1511,6 +1589,11 @@ class BATS:
             "--format", "RspecJunitFormatter",
             "--out", str(junit),
         ]
+        if name == "secondary" and SECONDARY_EXCLUDED_EXAMPLES:
+            helper = self.run_dir / SECONDARY_EXCLUDE_HELPER
+            if not getattr(self, "dry_run", False):
+                helper.write_text(render_exclude_helper(list(SECONDARY_EXCLUDED_EXAMPLES)))
+            argv += ["--require", str(helper)]
         for tag in sorted(excluded):
             argv += ["--tag", f"~{tag}"]
         for tag in only:
@@ -1662,6 +1745,8 @@ class BATS:
             flags.append("--no-default-excludes")
         if self._skip_secondary():
             flags.append("--skip-secondary")
+        if self._secondary_only():
+            flags.append("--secondary-only")
 
         return {
             "date": started.strftime("%Y-%m-%d"),
@@ -1675,7 +1760,7 @@ class BATS:
                     for tag in self.args.only
                 )
                 if self.args.only else ""
-            ),
+            ) + ("-secondary-only" if self._secondary_only() else ""),
             "exit_code": self.rspec_rc if self.rspec_rc is not None else 1,
             "verdict": verdict,
             "examples": rspec["tests"] if rspec else None,
@@ -1695,6 +1780,12 @@ class BATS:
             "env": self.env_name,
             "dual_stack": self._dual_stack_meta(),
             "secondary_pass": self._secondary_meta(),
+            "primary_pass": (
+                "skipped on request (--secondary-only); the counts below cover "
+                "the secondary pass alone"
+                if self._secondary_only() else ""
+            ),
+            "excluded_examples": self.excluded_examples,
             "excluded_tags": sorted(self.excluded),
             "excluded_reasons": self.excluded,
         }
@@ -1819,6 +1910,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", action="append", default=[], metavar="TAG")
     p.add_argument("--skip-secondary", action="store_true",
                    help="ignore bats.secondary and run the primary entry only")
+    p.add_argument("--secondary-only", action="store_true",
+                   help="skip the primary pass and run only the bats.secondary pass")
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--keep", action="store_true",
                    help="BAT_DEBUG_MODE: fail fast, keep failed state for post-mortem")
@@ -1836,6 +1929,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.secondary_only:
+        if args.skip_secondary:
+            parser.error("--secondary-only cannot be combined with --skip-secondary")
+        if any(tag in DUAL_STACK_TAGS for tag in args.only):
+            parser.error(
+                "--secondary-only cannot be combined with --only naming a "
+                "dual-stack tag; the secondary pass is IPv4 only"
+            )
 
     color_enabled = (
         not args.no_color

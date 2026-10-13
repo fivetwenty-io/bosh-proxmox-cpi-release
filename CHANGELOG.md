@@ -12,6 +12,14 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Fixed
+
+- The BATS secondary pass no longer runs `cck unresponsive agent delete_vm_reference should delete vm reference`. After `bosh cck` drops the VM reference, `bosh delete-vm` has no instance to name a cpi-config entry, so the Director sends it to its default CPI, which correctly refuses a CID stamped for the secondary cluster. The primary pass still runs the example, and the run report lists the exclusion with its reason.
+
+### Added
+
+- `scripts/bats` takes `--secondary-only`, which skips the primary pass and runs only the `bats.secondary` pass. The run report says the primary pass was skipped on request.
+
 ### Changed
 
 - The warning `create_vm` logs when HA node-affinity pinning finds no availability zone for a VM now tells us to set `cloud_properties.availability_zone` on each cloud-config AZ, because the Director merges an AZ's `cloud_properties` into every VM in that AZ. It used to say each `vm_type` needed the key, which still works but repeats the setting on every type.

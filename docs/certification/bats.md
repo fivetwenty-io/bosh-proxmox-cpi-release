@@ -165,6 +165,10 @@ The secondary block inherits nothing from the primary network, because those add
 
 Without the block, a run behaves exactly as before. The harness checks the block when it loads the config, so a typo in an address or range stops the run before the primary pass starts, and that check happens even under `--skip-secondary`. With it present, `--skip-secondary` returns a single run to the primary entry, and a run that selects the dual-stack pass with `--only ipv6` skips the secondary pass.
 
+The secondary pass leaves out one example, `cck unresponsive agent delete_vm_reference should delete vm reference`. After `bosh cck` drops the VM reference, that example runs `bosh delete-vm` on the old CID, and with no instance left there is no cpi-config entry for the Director to name, so it sends the call to its default CPI on the job-level cluster. That CPI correctly refuses a CID stamped for the secondary entry's cluster. The primary pass still runs the example, and the run report lists the exclusion with this reason. [Operations](../operations.md) explains the Director behavior in the section on `bosh delete-vm` for a VM with no instance.
+
+To prove only the second entry, for instance after fixing something on that cluster, we pass `--secondary-only`. The run still does its preflight, prepare, and finalize steps and writes the report, but it skips the primary pass, so only `junit-secondary.xml` exists and the example count covers the secondary pass alone. The report says the primary pass was skipped on request, and its file name ends in `-secondary-only` so it never replaces the full certification report. The flag needs a `bats.secondary` block, and it cannot be combined with `--skip-secondary` or with a dual-stack `--only` tag.
+
 ## Results and reports
 
 Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
@@ -175,7 +179,7 @@ Machine artifacts land in the gitignored `.e2e-results/<timestamp>/` directory:
 
 - `junit-secondary.xml`
 
-  The same kind of results for the second pass. It exists only when the run included `bats.secondary`, and the report merges it with `junit.xml`.
+  The same kind of results for the second pass. It exists only when the run included `bats.secondary`, and the report merges it with `junit.xml`. A `--secondary-only` run writes this file alone.
 
 - `junit-steps.xml` and `results.json`
 
