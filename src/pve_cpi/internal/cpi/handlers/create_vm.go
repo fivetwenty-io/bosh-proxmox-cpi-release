@@ -352,6 +352,12 @@ func (v *jsonScalarString) UnmarshalJSON(data []byte) error {
 
 // createVMParsedArgs holds the validated, unmarshalled create_vm arguments.
 type createVMParsedArgs struct {
+	// nodeBridgeCheck is the call-scoped bridge checker the placement filter and
+	// the pre-clone guard share (see sharedBridgeChecker). Nil until first use.
+	nodeBridgeCheck *nodeBridgeChecker
+	// sdnSkipWarned records the bridges whose "SDN membership could not be read"
+	// Warn this call already logged.
+	sdnSkipWarned    map[string]bool
 	storageRuntime   *managedVMAllocation
 	storagePlan      *StorageAllocationPlan
 	storageSelection *StoragePlacementSelection
@@ -640,6 +646,12 @@ func createVM(
 	shape, err := resolveVMShape(ctx, deps, parsed)
 	if err != nil {
 		return nil, err
+	}
+
+	// Pre-clone bridge guard: covers the node choices the placement filter
+	// never vetted (target_node pin, local-disk pin, placement disabled).
+	if bridgeErr := verifyBridgesOnNode(ctx, deps, logger, parsed, shape.node); bridgeErr != nil {
+		return nil, bridgeErr
 	}
 
 	// -----------------------------------------------------------------------
@@ -1000,6 +1012,19 @@ func createVMWithFallback(
 	var lastErr error
 	for attemptIdx, candidateNode := range candidates {
 		isLast := attemptIdx == len(candidates)-1
+
+		// Pre-clone bridge guard for this candidate. A candidate that fails it
+		// has no VM to clean up, so the loop moves to the next one, or surfaces
+		// the error when none remain.
+		if bridgeErr := verifyBridgesOnNode(ctx, deps, logger, parsed, candidateNode); bridgeErr != nil {
+			lastErr = keepEarlierAttemptError(lastErr, bridgeErr)
+			if isLast {
+				break
+			}
+			logger.Warn("create_vm: fallback: candidate failed the bridge check, trying next",
+				log.String("node", candidateNode), log.Err(bridgeErr))
+			continue
+		}
 
 		vmid, responseNetworks, allocErr, startErr, otherErr := buildAndStartVMAttempt(
 			ctx, deps, logger, parsed, shape, candidateNode)
@@ -2235,4 +2260,15 @@ func startVMAndReadConfig(
 	}
 
 	return buildResponseNetworks(parsed.networks, nicPlan, vmCfg), nil
+}
+
+// keepEarlierAttemptError chooses the error the fallback loop surfaces when a
+// candidate fails the bridge guard. A real attempt error from an earlier
+// candidate wins, so a guard failure on the last candidate cannot turn a
+// retriable clone error into a permanent one.
+func keepEarlierAttemptError(earlier, guard error) error {
+	if earlier != nil {
+		return earlier
+	}
+	return guard
 }

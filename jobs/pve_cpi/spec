@@ -1304,6 +1304,29 @@ properties:
       Under "strict", a one-node AZ in maintenance blocks every recreate in that
       AZ, which is when the resurrector runs. Map each AZ to at least two nodes
       before enabling it. The key has no spec default, so it is emitted only when set.
+  pve.placement.bridge_check:
+    description: |
+      What create_vm does when a plain Linux bridge (such as vmbr0) that a NIC
+      needs is missing from the node the VM would land on. "off" skips the
+      check. "warn" logs a Warn that names the node, the bridge, and the NIC and
+      lets the create continue, so nothing new is rejected, and it also logs, for
+      each candidate node that enforce would have skipped, a Warn naming that
+      node and bridge. "enforce" skips
+      nodes that lack the bridge during placement and fails the create before
+      the clone when the chosen node lacks it, with a lookup failure reported as
+      retriable. SDN vnets are never checked here, because the existing SDN
+      gate owns them. Storage-plan placement always enforces. When unset, the
+      CPI uses its compiled default, which is "warn" in this release. Each
+      cpi-config entry that carries its own pve_placement block needs its own
+      copy of this key, because the block is replaced as a whole. Remove the key
+      from every cpi-config entry before rolling the CPI back to 0.9.3, whose
+      entry decoder rejects it.
+
+      The spec carries no default for this key, so the template emits it only
+      when it is set. Setting "enforce" while az_enforcement is "warn" can let a
+      VM leave its AZ. If every node of an AZ lacks the bridge, the AZ counts as
+      exhausted, and the warn path then places the VM on the node named by
+      pve.node. Use "strict" for az_enforcement before turning on "enforce".
   pve.placement.fallback_max:
     description: |
       Maximum number of alternate candidate nodes to try after a transient clone or

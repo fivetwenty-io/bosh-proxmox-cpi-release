@@ -1664,6 +1664,26 @@ pvesh get /nodes/<node>/network | jq '.[] | select(.type == "bridge")'
 
 `pve.network_bridge` must match an existing Linux bridge on the PVE node. The bridge must be UP. Create it in the PVE web UI under Node → Network if absent. See [Configuration](configuration.md).
 
+### Bridge missing on the chosen node
+
+**Symptom**
+
+With `bridge_check: enforce`, `create_vm` fails before the clone with an error such as the following.
+
+```text
+create_vm: bridge "vmbr7" for network "default" does not exist on node "pve2" (availability_zone "z2"); create the bridge on every node of the AZ, or use an SDN vnet
+```
+
+When every node of the AZ lacks the bridge, the placement error lists `missing bridge vmbr7` after each node. A node whose network list could not be read shows `network lookup failed` instead, and that error is retriable. With the default `warn`, nothing fails. The CPI logs a Warn line that reads `bridge is missing on the chosen node` and carries the `node`, `bridge`, and `nic` fields.
+
+**Cause**
+
+The bridge a NIC resolves to (from `network_bridge`, `network_defaults`, or the network's own `cloud_properties.bridge`) does not exist on that node. This is common when a cpi-config entry inherits the job's bridge name but its cluster names the bridge differently.
+
+**Fix**
+
+Create the bridge on every node of the AZ, set the entry's own bridge name, or attach the network to an SDN vnet. Run `pvesh get /nodes/<node>/network` to see what the node reports. See [Configuration](configuration.md).
+
 ### vnet bridge missing on some nodes / SDN state stuck pending
 
 **Symptom**

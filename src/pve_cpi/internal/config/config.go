@@ -1524,6 +1524,16 @@ type PlacementConfig struct {
 	// detail. Validated only when set; use AZEnforcementStrict().
 	AZEnforcement string `json:"az_enforcement,omitempty"`
 
+	// BridgeCheck selects what create_vm does when a plain Linux bridge a NIC
+	// needs is missing from the chosen node. "off" skips the check. "warn"
+	// (the compiled default, also the meaning of an empty value) logs a Warn
+	// naming the node, the bridge, and the NIC and lets the create continue,
+	// so no new rejection appears. "enforce" rejects such a node during
+	// placement and fails the create before the clone when the chosen node
+	// lacks the bridge. SDN vnets are never checked here. The storage-plan
+	// path always enforces. Validated only when set; use BridgeCheckMode().
+	BridgeCheck string `json:"bridge_check,omitempty"`
+
 	// FallbackMax controls post-selection fallback placement. When a clone or VM
 	// start fails transiently after node selection, the CPI cleans up the failed
 	// attempt and retries on the next-ranked candidate from the same scored set,
@@ -2850,6 +2860,28 @@ func (c *CPIConfig) AZEnforcementStrict() bool {
 		mode = strings.ToLower(strings.TrimSpace(c.Placement.AZEnforcement))
 	}
 	return mode == azEnforcementStrict
+}
+
+// bridgeCheckDefault is the compiled default for placement.bridge_check. It is
+// a constant so that flipping the default is a one-line change.
+const bridgeCheckDefault = BridgeCheckWarn
+
+// Values accepted by placement.bridge_check.
+const (
+	BridgeCheckOff     = "off"
+	BridgeCheckWarn    = "warn"
+	BridgeCheckEnforce = "enforce"
+)
+
+// BridgeCheckMode returns the effective placement.bridge_check value, one of
+// BridgeCheckOff, BridgeCheckWarn, or BridgeCheckEnforce. An unset or empty
+// value takes the compiled default, which is "warn". The value is matched
+// case-insensitively, as az_enforcement is.
+func (c *CPIConfig) BridgeCheckMode() string {
+	if c != nil && c.Placement != nil && c.Placement.BridgeCheck != "" {
+		return strings.ToLower(strings.TrimSpace(c.Placement.BridgeCheck))
+	}
+	return bridgeCheckDefault
 }
 
 // PlacementFallbackMaxValue returns the maximum number of alternate nodes to
@@ -4991,6 +5023,18 @@ func (c *CPIConfig) validatePlacement(errs *[]string) {
 			*errs = append(*errs, fmt.Sprintf(
 				"placement.az_enforcement must be one of warn|strict (or unset for default %s), got %q",
 				azEnforcementDefault, c.Placement.AZEnforcement,
+			))
+		}
+	}
+	// BridgeCheck: validated only when set.
+	if c.Placement.BridgeCheck != "" {
+		switch strings.ToLower(strings.TrimSpace(c.Placement.BridgeCheck)) {
+		case BridgeCheckOff, BridgeCheckWarn, BridgeCheckEnforce:
+			// valid
+		default:
+			*errs = append(*errs, fmt.Sprintf(
+				"placement.bridge_check must be one of off|warn|enforce (or unset for default %s), got %q",
+				bridgeCheckDefault, c.Placement.BridgeCheck,
 			))
 		}
 	}

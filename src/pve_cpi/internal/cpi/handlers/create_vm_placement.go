@@ -31,7 +31,8 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// and behavior is identical to Tier 1.
 	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
 
-	node, err := resolveTargetNode(ctx, deps, cp, groupTag, parsed.diskCIDs, parsed.cloudPropsMap)
+	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
+		placementBridgePlan(ctx, deps, parsed))
 	if err != nil {
 		return nil, err
 	}
@@ -55,8 +56,9 @@ func resolveVMShapeWithAlternates(
 	cp := parsed.cloudProps
 	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
 
-	winner, alts, nodeErr := resolveTargetNodeWithFallbacks(
-		ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax)
+	winner, alts, nodeErr := resolveTargetNodeWithBridges(
+		ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
+		placementBridgePlan(ctx, deps, parsed))
 	if nodeErr != nil {
 		return nil, nil, nodeErr
 	}
@@ -68,15 +70,7 @@ func resolveVMShapeWithAlternates(
 	return s, alts, nil
 }
 
-// resolveTargetNode determines which PVE node the new VM will land on. See
-// resolveTargetNodeWithFallbacks — the single implementation of the placement
-// decision tree — for the full algorithm; this wrapper is the
-// production-default entry (non-deterministic shuffle, no alternates).
-func resolveTargetNode(ctx context.Context, deps Deps, cp createVMCloudProps, groupTag string, diskCIDs []string, cloudPropsMap map[string]any) (string, error) {
-	return resolveTargetNodeWithRNG(ctx, deps, cp, groupTag, diskCIDs, nil, cloudPropsMap)
-}
-
-// resolveTargetNodeWithRNG is the testable implementation of resolveTargetNode.
+// resolveTargetNodeWithRNG is the testable implementation of the placement decision.
 // rng controls AZ shuffle order; pass nil for production (non-deterministic).
 // cloudPropsMap is the raw cloud_properties map used to build the layered resolver
 // for per-call placement weight overrides and AZ resolution via vm_type profiles.
@@ -139,8 +133,6 @@ func resolveTargetNodeWithRNG(
 // Branch 1 (operator target_node), Branch 3 (static config.node), or the
 // config.node fallback inside Branch 2, no ranked alternates are available
 // and alternates is nil — callers must treat nil as "no fallback candidates".
-//
-//nolint:gocognit,gocyclo // Single home of the multi-AZ placement loop; inherent complexity.
 func resolveTargetNodeWithFallbacks(
 	ctx context.Context,
 	deps Deps,
@@ -150,6 +142,26 @@ func resolveTargetNodeWithFallbacks(
 	rng *rand.Rand,
 	cloudPropsMap map[string]any,
 	fallbackMax int,
+) (winner string, alternates []string, err error) {
+	return resolveTargetNodeWithBridges(ctx, deps, cp, groupTag, diskCIDs, rng, cloudPropsMap, fallbackMax, bridgePlan{})
+}
+
+// resolveTargetNodeWithBridges is resolveTargetNodeWithFallbacks plus the plain
+// bridges the VM's NICs need (see placementBridgePlan). At bridge_check enforce
+// the live placement filter rejects a node that lacks one of them. At warn it
+// rejects nothing and logs what enforce would have rejected.
+//
+//nolint:gocognit,gocyclo // Single home of the multi-AZ placement loop; inherent complexity.
+func resolveTargetNodeWithBridges(
+	ctx context.Context,
+	deps Deps,
+	cp createVMCloudProps,
+	groupTag string,
+	diskCIDs []string,
+	rng *rand.Rand,
+	cloudPropsMap map[string]any,
+	fallbackMax int,
+	bridges bridgePlan,
 ) (winner string, alternates []string, err error) {
 	// deps.Log(ctx) is nil-Logger-safe and prefers ctx's per-request
 	// span-correlated logger over deps.Logger when present (see
@@ -336,7 +348,9 @@ func resolveTargetNodeWithFallbacks(
 				MaxUtilizationPct:       utilCeilingPctFB,
 				PlannedAddBytes:         utilAddBytesFB,
 			}
+			bridges.apply(&req)
 			pass, rejections := placement.Filter(facts, req)
+			bridges.warnGaps(logger, pass, "")
 			azRecords = append(azRecords, newAZRejectionRecord("", nil, rejections, inCluster))
 			mergeRejections(legacyRejections, rejections)
 			logFilterRejections(logger, rejections, "")
@@ -360,7 +374,9 @@ func resolveTargetNodeWithFallbacks(
 					MaxUtilizationPct:       utilCeilingPctFB,
 					PlannedAddBytes:         utilAddBytesFB,
 				}
+				bridges.apply(&req)
 				pass, rejections := placement.Filter(facts, req)
+				bridges.warnGaps(logger, pass, az)
 				azRecords = append(azRecords, newAZRejectionRecord(az, candidateSet, rejections, inCluster))
 				mergeRejections(legacyRejections, rejections)
 				logFilterRejections(logger, rejections, az)
@@ -730,9 +746,18 @@ func scoreAndPickWithRanked(pass []placement.NodeFacts, weights placement.Weight
 	return chosen, nodes
 }
 
-// logFilterRejections emits a Debug entry for each rejection.
+// logFilterRejections emits a Debug entry for each rejection. A bridge rejection
+// is an operator-actionable problem, so it logs at Warn instead.
 func logFilterRejections(logger *log.Logger, rejections map[string]string, az string) {
 	for n, reason := range rejections {
+		if strings.HasPrefix(reason, "missing bridge ") || strings.HasPrefix(reason, "network lookup failed: ") {
+			logger.Warn("create_vm: placement: node filtered",
+				log.String("node", n),
+				log.String("reason", reason),
+				log.String("az", az),
+			)
+			continue
+		}
 		logger.Debug("create_vm: placement: node filtered",
 			log.String("node", n),
 			log.String("reason", reason),
@@ -803,7 +828,10 @@ func isTransientRejectionReason(reason string) bool {
 	if strings.HasPrefix(reason, "PCI device check error: ") {
 		return true
 	}
-	return false
+	// A failed network listing is transient in the same way. "missing bridge
+	// <name>" stays permanent, because the node answered and the bridge is not
+	// there.
+	return strings.HasPrefix(reason, "network lookup failed: ")
 }
 
 // formatRejections returns a compact human-readable summary of a rejection map.

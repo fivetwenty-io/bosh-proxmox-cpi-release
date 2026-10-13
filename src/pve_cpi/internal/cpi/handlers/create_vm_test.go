@@ -214,6 +214,10 @@ type vmMockNodes struct {
 	// scoring via GatherNodeFacts). When nil, returns an empty active storage
 	// response so placement scoring degrades gracefully (storage axis = 0).
 	listStorageFn func(ctx context.Context, node string, params *sdknodes.ListStorageParams) (*sdknodes.ListStorageResponse, error)
+	// listNetworkFn, when non-nil, is called by ListNetwork (the per-node
+	// bridge check). When nil, ListNetwork reports no interfaces, so a test
+	// that does not care about bridges sees the default bridge_check warn.
+	listNetworkFn func(ctx context.Context, node string, params *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error)
 	// listStorageContentFn, when non-nil, is called by ListStorageContent
 	// (invoked by allocateVM's pve.WithStorageScan wiring — see NextVMID).
 	// When nil, returns an empty content response so the storage scan degrades
@@ -272,6 +276,15 @@ func (m *vmMockNodes) ListQemu(ctx context.Context, node string, params *sdknode
 		return m.listQemuFn(ctx, node, params)
 	}
 	empty := sdknodes.ListQemuResponse{}
+	return &empty, nil
+}
+
+// ListNetwork returns an empty interface list when listNetworkFn is nil.
+func (m *vmMockNodes) ListNetwork(ctx context.Context, node string, params *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error) {
+	if m.listNetworkFn != nil {
+		return m.listNetworkFn(ctx, node, params)
+	}
+	empty := sdknodes.ListNetworkResponse{}
 	return &empty, nil
 }
 

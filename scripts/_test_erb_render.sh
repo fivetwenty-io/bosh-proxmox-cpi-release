@@ -298,6 +298,37 @@ if [ "$(printf '%s' "$JSON_6" | ruby -rjson -e 'print JSON.parse(STDIN.read).fet
 fi
 assert_json_lacks_key "case6-unset" "$JSON_1" placement || FAILED=$((FAILED+1))
 
+echo "Case 7: placement.bridge_check"
+props_with_bridge_check() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+    h = eval(STDIN.read)
+    h["pve"]["placement"] = { "bridge_check" => ARGV[0] }
+    print h.inspect
+  ' "$1"
+}
+JSON_7="$(render "$(props_with_bridge_check enforce)")"
+assert_json_valid "case7" "$JSON_7" || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_7" | ruby -rjson -e 'print JSON.parse(STDIN.read).fetch("placement", {}).fetch("bridge_check", "<absent>")')" != "enforce" ]; then
+  echo "FAIL [case7]: placement.bridge_check did not render as enforce" >&2
+  FAILED=$((FAILED+1))
+fi
+assert_json_lacks_key "case7-unset" "$JSON_1" placement || FAILED=$((FAILED+1))
+# With other placement keys set and bridge_check unset, the template must not
+# emit bridge_check next to them.
+props_with_other_placement() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+    h = eval(STDIN.read)
+    h["pve"]["placement"] = { "fallback_max" => 1 }
+    print h.inspect
+  '
+}
+JSON_7B="$(render "$(props_with_other_placement)")"
+assert_json_valid "case7-other" "$JSON_7B" || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_7B" | ruby -rjson -e 'print JSON.parse(STDIN.read).fetch("placement", {}).fetch("bridge_check", "<absent>")')" != "<absent>" ]; then
+  echo "FAIL [case7]: placement.bridge_check was emitted although it was unset" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

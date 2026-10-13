@@ -238,7 +238,14 @@ func configureNICs(
 	// bridgeSet collects the finalized bridge for each NIC so the optional SDN
 	// eventual-consistency gate can resolve them all on the target node before
 	// any config write (no partial netN= on a not-yet-realized bridge).
-	bridgeSet := make(map[string]struct{}, len(netNames))
+	nicBridges, bridgeErr := collectNICBridges(parsed, defaultBridge)
+	if bridgeErr != nil {
+		return nil, bridgeErr
+	}
+	bridgeSet := make(map[string]struct{}, len(nicBridges))
+	for _, bridge := range nicBridges {
+		bridgeSet[bridge] = struct{}{}
+	}
 	// VM-global ordered union of every network's resolvers; rationale in
 	// appendGroupNameservers.
 	var nameservers []string
@@ -255,9 +262,6 @@ func configureNICs(
 		netMap[i] = buildNICNetValue(logger, entry.primary(), attrs, vnetNames)
 		if parsed.storageRuntime != nil {
 			netMap[i] = managedVMNICValue(parsed.storageRuntime.handle.Record().ID, i, netMap[i])
-		}
-		if attrs.bridge != "" {
-			bridgeSet[attrs.bridge] = struct{}{}
 		}
 
 		// ipconfig: dynamic → dhcp; manual → ip=<cidr>,gw=<gw>. A NIC shared

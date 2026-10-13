@@ -208,6 +208,18 @@ type Request struct {
 	// rejected (fail-safe). Nil checker with non-empty RequiredPCIAddresses is a
 	// no-op: the node passes (callers that do not provide I/O skip the check).
 	PCIChecker func(node string) (bool, error)
+
+	// RequiredBridges lists the plain Linux bridges (such as vmbr0) the VM's
+	// NICs need on the target node. When non-empty and BridgeChecker is set,
+	// Filter calls BridgeChecker for each bridge on each candidate node. A node
+	// that answers (false, nil) is rejected as "missing bridge <name>", which
+	// is permanent. A node whose check returns an error is rejected as
+	// "network lookup failed: <err>", which is transient. A nil BridgeChecker
+	// is a no-op: the node passes.
+	RequiredBridges []string
+
+	// BridgeChecker reports whether the named node has the named bridge.
+	BridgeChecker func(node, bridge string) (bool, error)
 }
 
 // ScoredNode is a node with its computed score.
@@ -231,6 +243,8 @@ type ScoredNode struct {
 //     RequiredStorageBytes above.
 //   - When req.RequiredPCIAddresses is non-empty and req.PCIChecker is set, the
 //     node must pass the PCI device check (fail-safe: error → reject).
+//   - When req.RequiredBridges is non-empty and req.BridgeChecker is set, the
+//     node must have every bridge (a failed lookup is a transient rejection).
 //
 // Each excluded node is accompanied by a human-readable rejection reason.
 // Filter returns (nil, nil) when facts is empty.
@@ -305,6 +319,11 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 			}
 		}
 
+		if reason := bridgeRejection(f.Node, req); reason != "" {
+			rejections[f.Node] = reason
+			continue
+		}
+
 		pass = append(pass, f)
 	}
 
@@ -312,6 +331,25 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 		rejections = nil
 	}
 	return pass, rejections
+}
+
+// bridgeRejection returns the rejection reason for node when req.BridgeChecker
+// shows a required bridge missing or cannot read the node's network list, and
+// "" when the node passes or the check is not in play.
+func bridgeRejection(node string, req Request) string {
+	if len(req.RequiredBridges) == 0 || req.BridgeChecker == nil {
+		return ""
+	}
+	for _, bridge := range req.RequiredBridges {
+		present, err := req.BridgeChecker(node, bridge)
+		if err != nil {
+			return "network lookup failed: " + err.Error()
+		}
+		if !present {
+			return "missing bridge " + bridge
+		}
+	}
+	return ""
 }
 
 // exceedsUtilizationCeiling reports whether f's projected utilization —

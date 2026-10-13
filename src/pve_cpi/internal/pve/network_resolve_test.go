@@ -483,3 +483,65 @@ func TestNodeBridgePresence_NilClient(t *testing.T) {
 		t.Errorf("nil client: want (false, error), got (%v, %v)", present, err)
 	}
 }
+
+func TestNodeBridgeNames_OneListingServesEveryBridge(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		return ifacesResp("vmbr0", "vmbr1"), nil
+	}}
+	names, err := NodeBridgeNames(context.Background(), &nrFakeClient{nodes: fn}, "pve1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := names["vmbr0"]; !ok {
+		t.Errorf("vmbr0 missing from %v", names)
+	}
+	if _, ok := names["vmbr1"]; !ok {
+		t.Errorf("vmbr1 missing from %v", names)
+	}
+	if _, ok := names["vmbr2"]; ok {
+		t.Errorf("vmbr2 must be absent from %v", names)
+	}
+	if fn.calls != 1 {
+		t.Errorf("want one listing, got %d", fn.calls)
+	}
+}
+
+func TestNodeBridgeNames_LookupErrorIsAnErrorNotAnEmptySet(t *testing.T) {
+	boom := errors.New("node unreachable")
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) { return nil, boom }}
+	names, err := NodeBridgeNames(context.Background(), &nrFakeClient{nodes: fn}, "pve1")
+	if names != nil || !errors.Is(err, boom) {
+		t.Errorf("want (nil, wrapped lookup error), got (%v, %v)", names, err)
+	}
+	if names, err := NodeBridgeNames(context.Background(), nil, "pve1"); names != nil || err == nil {
+		t.Errorf("nil client: want (nil, error), got (%v, %v)", names, err)
+	}
+}
+
+func TestNodeBridgeNames_MalformedRowIsAnErrorNotAnAbsence(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		resp := ifacesResp("vmbr0")
+		*resp = append(*resp, json.RawMessage(`{"type":"bridge"}`))
+		return resp, nil
+	}}
+	names, err := NodeBridgeNames(context.Background(), &nrFakeClient{nodes: fn}, "pve1")
+	if names != nil || err == nil {
+		t.Fatalf("an unreadable row may hide the bridge, so the listing must be an error; got (%v, %v)", names, err)
+	}
+}
+
+// The SDN gate keeps its lenient reading. A row it cannot read must not hide a
+// vnet row that is present.
+func TestNodeHasBridge_MalformedRowBesideValidVnetRow_StillPresent(t *testing.T) {
+	fn := &nrFakeNodes{listNet: func(int, string) (*sdknodes.ListNetworkResponse, error) {
+		resp := sdknodes.ListNetworkResponse{json.RawMessage(`{"type":"bridge"}`), json.RawMessage(`{"iface":"vnet1"}`)}
+		return &resp, nil
+	}}
+	if !nodeHasBridge(context.Background(), fn, "pve1", "vnet1") {
+		t.Fatal("a malformed row must not make a present vnet look absent to the SDN gate")
+	}
+	present, err := NodeBridgePresence(context.Background(), &nrFakeClient{nodes: fn}, "pve1", "vnet1")
+	if err != nil || !present {
+		t.Fatalf("NodeBridgePresence: present=%v err=%v, want true,nil", present, err)
+	}
+}

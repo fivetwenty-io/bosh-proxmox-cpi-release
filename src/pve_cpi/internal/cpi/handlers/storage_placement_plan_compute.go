@@ -2,14 +2,13 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"math"
 	"math/rand"
 	"slices"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/placement"
-	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // ObserveStoragePlanCompute preserves existing AZ and compute scoring while
@@ -87,20 +86,14 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 	if err != nil {
 		return nil, err
 	}
-	defaults := cp.NetworkDefaults
-	var bridges []string
-	for name := range parsed.networks {
-		if parsed.networks[name].Type == "vip" {
-			continue
-		}
-		resolved, _, err := resolveNICBridgeAndVLAN(defaults, parsed.networks[name].CloudProperties, bridge, name)
-		if err != nil {
-			return nil, err
-		}
-		bridges = append(bridges, resolved)
+	// The plan checks plain bridges only; an SDN vnet, or a bridge whose SDN
+	// membership cannot be read, is left to the NIC-time gate so a converging
+	// vnet never excludes a node here.
+	refs, err := collectNICBridgeRefs(parsed, bridge)
+	if err != nil {
+		return nil, err
 	}
-	slices.Sort(bridges)
-	bridges = slices.Compact(bridges)
+	bridges := distinctBridges(plainBridgeRefs(ctx, deps, parsed, refs))
 	networkEligible := map[string]bool{}
 	for _, fact := range facts {
 		if !fact.Online {
@@ -108,6 +101,9 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 		}
 		ok, err := storagePlanNodeBridges(ctx, deps, fact.Node, bridges)
 		if err != nil {
+			// A failed lookup is not a proven absence. The node stays out of
+			// networkEligible, so it is left ineligible. storagePlanNodeBridges
+			// has already logged the reason.
 			continue
 		}
 		networkEligible[fact.Node] = ok
@@ -126,31 +122,14 @@ func storagePlanNodeBridges(ctx context.Context, deps Deps, node string, require
 	if len(required) == 0 {
 		return true, nil
 	}
-	typ := "any_bridge"
-	response, err := deps.PVE.Nodes().ListNetwork(ctx, node, &sdknodes.ListNetworkParams{Type: &typ})
-	if err != nil || response == nil {
-		response, err = deps.PVE.Nodes().ListNetwork(ctx, node, nil)
-	}
-	if err != nil || response == nil {
-		fields := []log.Field{log.String("node", node)}
-		if err != nil {
-			fields = append(fields, log.Err(err))
-		}
-		deps.Log(ctx).Warn("storage plan: bridge lookup failed; node left ineligible", fields...)
+	names, err := pve.NodeBridgeNames(ctx, deps.PVE, node)
+	if err != nil {
+		deps.Log(ctx).Warn("storage plan: bridge lookup failed; node left ineligible",
+			log.String("node", node), log.Err(err))
 		return false, planError(StoragePlanObservation, "network observation failed on %s", node)
 	}
-	names := map[string]bool{}
-	for _, raw := range *response {
-		var row struct {
-			Iface string `json:"iface"`
-		}
-		if err = json.Unmarshal(raw, &row); err != nil || row.Iface == "" {
-			return false, planError(StoragePlanObservation, "malformed network observation on %s", node)
-		}
-		names[row.Iface] = true
-	}
 	for _, bridge := range required {
-		if !names[bridge] {
+		if _, ok := names[bridge]; !ok {
 			return false, nil
 		}
 	}

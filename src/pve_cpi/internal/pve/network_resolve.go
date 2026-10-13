@@ -378,6 +378,33 @@ func NodeBridgePresence(ctx context.Context, c Client, node, bridge string) (boo
 }
 
 func nodeBridgePresence(ctx context.Context, nodesSvc sdknodes.Service, node, bridge string) (bool, error) {
+	// Lenient: the SDN gate has always skipped a row it cannot read, so it keeps
+	// doing that at every bridge_check value.
+	names, err := nodeBridgeNames(ctx, nodesSvc, node, false)
+	if err != nil {
+		return false, err
+	}
+	_, ok := names[bridge]
+	return ok, nil
+}
+
+// NodeBridgeNames returns the interface names node reports, read with one
+// listing. A caller that checks several bridges on one node reads the list once
+// and looks each name up, instead of paying a listing per bridge. A read
+// failure is returned as an error, never as an empty set, so a caller cannot
+// mistake a failed lookup for a proven absence.
+func NodeBridgeNames(ctx context.Context, c Client, node string) (map[string]struct{}, error) {
+	if c == nil || c.Nodes() == nil {
+		return nil, fmt.Errorf("list network on node %q: no nodes client", node)
+	}
+	return nodeBridgeNames(ctx, c.Nodes(), node, true)
+}
+
+// nodeBridgeNames lists node's interface names. When strict is set, a row that
+// cannot be read makes the whole listing an error, because that row might be
+// the bridge being looked for. The SDN gate passes false and skips such a row,
+// as it always has.
+func nodeBridgeNames(ctx context.Context, nodesSvc sdknodes.Service, node string, strict bool) (map[string]struct{}, error) {
 	// PVE 9.2's plain GET /nodes/<node>/network lists only
 	// /etc/network/interfaces entries — realized SDN vnet bridges (which live
 	// in interfaces.d/sdn) appear ONLY under type=any_bridge. Without the
@@ -390,17 +417,31 @@ func nodeBridgePresence(ctx context.Context, nodesSvc sdknodes.Service, node, br
 		resp, err = nodesSvc.ListNetwork(ctx, node, nil)
 	}
 	if err != nil {
-		return false, fmt.Errorf("list network on node %q: %w", node, err)
+		return nil, fmt.Errorf("list network on node %q: %w", node, err)
 	}
 	if resp == nil {
-		return false, fmt.Errorf("list network on node %q: empty response", node)
+		return nil, fmt.Errorf("list network on node %q: empty response", node)
 	}
+	names := make(map[string]struct{}, len(*resp))
 	for _, raw := range *resp {
-		if decodeIfaceName(raw) == bridge {
-			return true, nil
+		name := decodeIfaceName(raw)
+		if name == "" {
+			if strict {
+				// Report a failed read instead of letting the bridge look absent.
+				return nil, fmt.Errorf("list network on node %q: malformed interface row", node)
+			}
+			continue
 		}
+		names[name] = struct{}{}
 	}
-	return false, nil
+	return names, nil
+}
+
+// IsSDNVnet reports whether bridge names a known SDN vnet. An error means the
+// membership could not be determined, which callers that only check plain
+// bridges treat as "skip", leaving vnets to ResolveNodeBridgeOnNode.
+func IsSDNVnet(ctx context.Context, c Client, bridge string) (bool, error) {
+	return bridgeIsSDNVnet(ctx, c, bridge)
 }
 
 // nodeHasBridge reports whether bridge appears as an interface on node. A

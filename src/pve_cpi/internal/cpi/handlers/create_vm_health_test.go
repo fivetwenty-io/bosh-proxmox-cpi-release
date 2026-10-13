@@ -847,3 +847,10 @@ func (h *healthNodes) ListNodes(context.Context) (*sdknodes.ListNodesResponse, e
 	empty := sdknodes.ListNodesResponse{}
 	return &empty, nil
 }
+
+// ListNetwork reports no interfaces. The default-warn bridge guard in createVM
+// lists the chosen node's network, and health-gate tests need no configuration
+// for it.
+func (h *healthNodes) ListNetwork(context.Context, string, *sdknodes.ListNetworkParams) (*sdknodes.ListNetworkResponse, error) {
+	return &sdknodes.ListNetworkResponse{}, nil
+}

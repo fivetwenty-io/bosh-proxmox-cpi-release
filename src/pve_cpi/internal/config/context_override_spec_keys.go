@@ -123,6 +123,7 @@ var jobSpecPropertyNames = []string{
 	"pve.placement.az_fallback_order",
 	"pve.placement.az_map",
 	"pve.placement.az_shuffle",
+	"pve.placement.bridge_check",
 	"pve.placement.dlb.az_name",
 	"pve.placement.dlb.enabled",
 	"pve.placement.dlb.manage_cluster_crs",
