@@ -340,11 +340,14 @@ A third guardrail keeps credentials with their endpoint. The registry once appli
 
 Every check that judges a VM compares a stamped CID with those tags first. A VM that records another cluster is refused. A VM on the right cluster that carries another token holds a VMID that the CID's VM gave up, so the call answers `VMNotFound` and leaves that VM alone. When the VMID is absent from every member, the CPI reads this cluster's stamp once and compares it with the CID's. A CID that names another cluster then gets an answer that keeps the Director's record:
 
-- `delete_vm`, `reboot_vm`, `set_vm_metadata`, `attach_disk`, and `detach_disk` refuse with a non-retriable `cluster-mismatch` error.
+- `delete_vm`, `reboot_vm`, `set_vm_metadata`, `attach_disk`, and `detach_disk`
+  refuse with a non-retriable `cluster-mismatch` error.
 
-- `has_vm` answers `false` and logs the verdict at error level, in both guard modes.
+- `has_vm`
+  answers `false` and logs the verdict at error level, in both guard modes.
 
-- `delete_snapshot` answers success and logs a warning, because the snapshot goes away with its VM on the other cluster.
+- `delete_snapshot`
+  answers success and logs a warning, because the snapshot goes away with its VM on the other cluster.
 
 A bare CID, and a CID with the stamp `00000000`, keep the answer an absent VM always got. A failed read of this cluster's stamp is a retriable error, because nothing has been decided yet, except in `delete_snapshot`, which logs a warning and answers success. The managed `delete_vm` path runs the same check for a stamped CID before it consults the storage journal.
 

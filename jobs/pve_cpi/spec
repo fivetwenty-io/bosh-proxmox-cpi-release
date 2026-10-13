@@ -1575,7 +1575,7 @@ properties:
       error a mismatch returns names both stamps. 00000000 is not accepted,
       because it marks a create that could not read the cluster identity.
 
-      Overridable per cpi-config entry as pve_cluster_stamp_aliases. An entry
+      It can be overridden per cpi-config entry as pve_cluster_stamp_aliases. An entry
       that targets another PVE endpoint gets no aliases unless it sets this
       itself, because one cluster's rotation history is not another's.
     default: []
