@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -83,7 +82,7 @@ func testManagedVMRange(t *testing.T, override, exhausted, defaultEnd bool) {
 		expectedEnd = 8999
 	}
 	values, ok := result.([]any)
-	if !ok || len(values) == 0 || values[0] != strconv.Itoa(expectedEnd) {
+	if !ok || len(values) == 0 || !returnedNamesVM(values[0], expectedEnd) {
 		t.Fatalf("VM escaped configured last free ID: %v", result)
 	}
 }

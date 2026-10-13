@@ -12,6 +12,8 @@ import (
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 type managedVMObservation struct {
@@ -215,7 +217,11 @@ func resumeManagedVM(ctx context.Context, deps Deps, parsed *createVMParsedArgs,
 			return nil, err
 		}
 		if record.State == aj.ReadyToReturn || record.State == aj.Adopted {
-			return []any{record.CID, buildResponseNetworks(parsed.networks, planNICs(parsed.networks), observed.Config)}, nil
+			// The journal keeps the bare VMID, which an earlier release can
+			// still read. The CID returned to the Director is rebuilt from the
+			// VM's own stamp tags, which is the CID the first attempt returned
+			// or would have returned.
+			return []any{resumedVMCID(deps, record.CID, observed.Config), buildResponseNetworks(parsed.networks, planNICs(parsed.networks), observed.Config)}, nil
 		}
 	}
 	if continuation == nil {
@@ -255,4 +261,18 @@ func resumeExistingManagedVM(ctx context.Context, deps Deps, args []json.RawMess
 	}
 	result, err = resumeManagedVM(ctx, deps, parsed, nil, journal, record, args, continuation)
 	return result, true, err
+}
+
+// resumedVMCID is the CID a resumed create_vm returns for the VM its journal
+// record names. A record whose CID is not a VMID is returned as it stands,
+// because there is no VMID to rebuild a CID for. Otherwise the CID is rebuilt
+// from the observed config's tags, which gives the bare CID under
+// vm_cid_format: bare or when the VM carries no stamp tags.
+func resumedVMCID(deps Deps, recordCID string, observed map[string]any) string {
+	vmid, ok := vmcid.VMID(recordCID)
+	if !ok {
+		return recordCID
+	}
+	tags, _ := pve.ConfigString(observed, jsonKeyTags)
+	return directorVMCID(deps.Config, vmid, tags)
 }

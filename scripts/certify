@@ -125,6 +125,7 @@ import _pve_verify  # noqa: E402
 import _rundoc  # noqa: E402
 import _slot  # noqa: E402
 import _upgrade_checks  # noqa: E402
+import _vmcid  # noqa: E402
 from _rundoc import (  # noqa: E402
     ScrubbedLog,
     _bosh_int_opt,
@@ -1414,15 +1415,18 @@ class Certify:
                 for row in (_integration.pve_api_get(cfg, "/cluster/resources?type=vm") or [])
                 if row.get("vmid") is not None and row.get("node")
             }
-            for vmid in vm_cids:
-                if not vmid:
+            for vm_cid in vm_cids:
+                if not vm_cid:
                     continue
-                node = nodes.get(str(vmid))
+                # The Director holds the CID create_vm returned, which can
+                # carry a cluster stamp and token. PVE knows only the VMID.
+                vmid = _vmcid.as_path_id(vm_cid)
+                node = nodes.get(vmid)
                 if node is None:
-                    errors.append(f"VM {vmid} is not in /cluster/resources")
+                    errors.append(f"VM {vm_cid} is not in /cluster/resources")
                     continue
                 config = _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config")
-                serials[str(vmid)] = _upgrade_checks.drive_serials(config or {})
+                serials[vmid] = _upgrade_checks.drive_serials(config or {})
         except (RuntimeError, OSError, KeyError) as exc:
             errors.append(f"PVE API read failed: {exc}")
         return {

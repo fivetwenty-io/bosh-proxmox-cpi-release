@@ -15,6 +15,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/clusterstorage"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -389,12 +390,14 @@ func TestCreateVMLockTimeoutRollsBackTheAttempt(t *testing.T) {
 	if !ok {
 		t.Fatalf("create_vm returned no CID: %v", values)
 	}
-	vmid, err := strconv.Atoi(cid)
+	vmid, err := returnedVMID(cid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fresh := flow.generation(t)
-	if fresh.ID == old.ID || fresh.State != aj.ReadyToReturn || fresh.CID != cid {
+	// The journal keeps the bare VMID, which an earlier release can read, and
+	// the Director gets the stamped CID.
+	if fresh.ID == old.ID || fresh.State != aj.ReadyToReturn || fresh.CID != vmcid.PathOf(vmid) {
 		t.Fatalf("the retry did not build a fresh generation: old=%s new=%s state=%s cid=%s", old.ID, fresh.ID, fresh.State, fresh.CID)
 	}
 	if vmid == first || len(flow.created(t)) != 2 {
@@ -480,7 +483,7 @@ func (f *rollbackFlow) resumeAfterTimeout(t *testing.T, generation aj.Record, vm
 	if !ok || len(values) == 0 {
 		t.Fatalf("unexpected create_vm result %v", result)
 	}
-	if cid, _ := values[0].(string); cid != strconv.Itoa(vmid) {
+	if !returnedNamesVM(values[0], vmid) {
 		t.Fatalf("the next try returned VM %v, want the kept VM %d", values[0], vmid)
 	}
 	if created := f.created(t); len(created) != 1 || len(f.vms.destroyed) != 0 {

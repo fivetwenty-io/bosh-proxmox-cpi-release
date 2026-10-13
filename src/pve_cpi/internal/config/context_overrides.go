@@ -112,6 +112,7 @@ var contextOverrideFieldOrder = []string{
 	"pve_vm_types",
 	"pve_disk_types",
 	"pve_vm_ownership_guard",
+	"pve_cluster_stamp_aliases",
 }
 
 // contextOverrideFields maps each supported context key to the function that
@@ -362,6 +363,19 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 			return err
 		}
 		c.VMOwnershipGuard = s
+		return nil
+	},
+	// The stamp aliases are per entry because they record the root CA
+	// rotations of the TARGET cluster. Each entry must be a cluster stamp,
+	// which eff.Validate() checks. An empty list or null declares no
+	// rotation. An entry on another endpoint that does not name the key gets
+	// no aliases rather than the job's (see resetEndpointScopedPolicy).
+	"pve_cluster_stamp_aliases": func(c *CPIConfig, v any) error {
+		aliases, err := coerceOverrideStringList(v)
+		if err != nil {
+			return err
+		}
+		c.ClusterStampAliases = aliases
 		return nil
 	},
 	// The detached-disk strategy belongs here for the same reason the parker

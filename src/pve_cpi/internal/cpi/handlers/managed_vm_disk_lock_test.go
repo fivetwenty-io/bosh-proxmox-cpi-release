@@ -278,7 +278,7 @@ func retryCreateVMAfterDiskLockTimeout(t *testing.T, deps Deps, client *createVM
 	if !ok || len(values) == 0 {
 		t.Fatalf("unexpected create_vm result %v", result)
 	}
-	vmid, err := strconv.Atoi(fmt.Sprint(values[0]))
+	vmid, err := returnedVMID(values[0])
 	if err != nil {
 		t.Fatal(err)
 	}

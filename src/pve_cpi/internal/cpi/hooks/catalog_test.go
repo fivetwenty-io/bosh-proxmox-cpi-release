@@ -40,14 +40,14 @@ func raw(t *testing.T, v any) json.RawMessage {
 
 type fakeAnnotator struct {
 	calls  int
-	vmid   int
+	vmCID  string
 	notes  string
 	failed bool
 }
 
-func (f *fakeAnnotator) AnnotateNotes(_ context.Context, vmid int, notes string) error {
+func (f *fakeAnnotator) AnnotateNotes(_ context.Context, vmCID string, notes string) error {
 	f.calls++
-	f.vmid = vmid
+	f.vmCID = vmCID
 	f.notes = notes
 	if f.failed {
 		return errors.New("boom")
@@ -75,8 +75,8 @@ func TestNotesAudit_WritesNotesOnSuccess(t *testing.T) {
 	if _, ok := res.([]any); !ok {
 		t.Fatalf("result mutated: %#v", res)
 	}
-	if ann.calls != 1 || ann.vmid != 100 {
-		t.Fatalf("annotator calls=%d vmid=%d; want 1/100", ann.calls, ann.vmid)
+	if ann.calls != 1 || ann.vmCID != "100" {
+		t.Fatalf("annotator calls=%d vmCID=%q; want 1/100", ann.calls, ann.vmCID)
 	}
 	if !strings.Contains(ann.notes, "group=d-dep-router") || !strings.Contains(ann.notes, "id=abc") {
 		t.Errorf("notes %q missing bosh identity", ann.notes)

@@ -76,10 +76,8 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 		}
 		if !loc.Found || loc.Node == "" {
 			// VM absent -> snapshot is necessarily absent. Idempotent success.
-			deps.Log(ctx).Info("delete_snapshot: VM absent from cluster index and every node's config probe -- snapshot already absent",
-				log.String("snapshot_cid", snapshotCID),
-				log.Int("vmid", vmid),
-			)
+			logDeleteSnapshotAbsent(ctx, deps, snapshotCID, parsedCID,
+				"delete_snapshot: VM absent from cluster index and every node's config probe -- snapshot already absent")
 			return nil, nil
 		}
 		node := loc.Node
@@ -104,10 +102,8 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 			return nil, ownErr
 		}
 		if verdict.Absent {
-			deps.Log(ctx).Info("delete_snapshot: VM is gone from every cluster member -- answering success",
-				log.String("snapshot_cid", snapshotCID),
-				log.Int("vmid", vmid),
-			)
+			logDeleteSnapshotAbsent(ctx, deps, snapshotCID, parsedCID,
+				"delete_snapshot: VM is gone from every cluster member -- answering success")
 			return nil, nil
 		}
 		if !verdict.Owned {
@@ -157,4 +153,28 @@ func HandleDeleteSnapshot(deps Deps) Handler {
 
 		return nil, nil
 	})
+}
+
+// logDeleteSnapshotAbsent records delete_snapshot's success answer for a VM
+// absent from every member of this cluster. The answer is success in every
+// case, because the snapshot is not on this cluster and the Director drops a
+// record it could never act on. A stamped CID whose cluster stamp names
+// another cluster is logged as a warning, because its snapshot may still live
+// there and leaks until its VM is deleted. A failed read of the cluster
+// identity is logged as a warning too, rather than failing a delete that has
+// nothing to remove here.
+func logDeleteSnapshotAbsent(ctx context.Context, deps Deps, snapshotCID string, cid vmcid.VMCID, msg string) {
+	logger := deps.Log(ctx).With(log.String("snapshot_cid", snapshotCID), log.Int("vmid", cid.VMID))
+	verdict, err := absentVMVerdict(ctx, deps, "delete_snapshot", cid)
+	switch {
+	case err != nil:
+		logger.Warn("delete_snapshot: the VM is absent from this cluster, and the cluster identity could not be read "+
+			"to tell whether the snapshot CID names this cluster -- answering success", log.Err(err))
+	case verdict.Elsewhere:
+		logger.Warn("delete_snapshot: the VM is absent from this cluster, and the snapshot CID names another cluster, "+
+			"where the snapshot may remain until its VM is deleted -- answering success",
+			log.String("ownership_reason", verdict.Reason), log.String("ownership_detail", verdict.Detail))
+	default:
+		logger.Info(msg)
+	}
 }

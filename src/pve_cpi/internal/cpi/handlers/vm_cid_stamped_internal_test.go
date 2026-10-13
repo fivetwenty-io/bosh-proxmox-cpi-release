@@ -15,11 +15,16 @@ import (
 
 // TestHandleDeleteVMStampedCIDFindsManagedRecord checks that delete_vm matches
 // a stamped CID to the journal record, which stores the bare VMID. Without the
-// match the lookup finds no record and refuses on the allocation marker.
+// match the lookup finds no record and refuses on the allocation marker. The
+// VM carries bosh-cpi and the CID's cluster and token tags, as every VM a
+// stamping create builds does, because the ownership check reads them before
+// the journal decides.
 func TestHandleDeleteVMStampedCIDFindsManagedRecord(t *testing.T) {
 	deps, j, c, record := deleteManagedFixture(t)
 	deps.Config.StorageSets = nil
 	deps.Config.EphemeralStorageSet = "removed"
+	tags, _ := c.configs[123]["tags"].(string)
+	c.configs[123]["tags"] = strings.TrimPrefix(tags+";"+ownershipTag+";"+clusterStampTagPrefix+"0a1b2c3d;"+cidStampTagPrefix+"4e5f6a7b", ";")
 
 	arg, err := json.Marshal("123-0a1b2c3d-4e5f6a7b")
 	if err != nil {

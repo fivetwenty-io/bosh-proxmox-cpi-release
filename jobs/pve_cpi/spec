@@ -1546,6 +1546,39 @@ properties:
       Director metadata lines. Overridable per cpi-config entry as
       pve_vm_ownership_guard.
     default: ""
+  pve.vm_cid_format:
+    description: |
+      The form of the VM and snapshot CIDs that create_vm and snapshot_disk
+      return to the Director. One of:
+        ""        Same as "stamped", and the default.
+        "stamped" <vmid>-<cluster8>-<token8>, where cluster8 is the first
+                  eight hex characters of the SHA-256 of the cluster's
+                  pve-root-ca.pem and token8 is a random per-VM token. The VM
+                  handlers use both to refuse a CID that names another
+                  cluster's VM, or a VM that reused the CID's VMID after the
+                  original was deleted outside BOSH.
+        "bare"    The bare VMID, as every release before stamping returned.
+                  The CPI still writes the bosh-cluster-- and bosh-cid-- tags.
+      The setting never rewrites a CID the Director already holds, so "bare"
+      helps a rollback to a release that cannot read stamped CIDs only when it
+      is set before the first stamped CID exists. VMs created earlier keep
+      their bare CIDs on upgrade. This property is job-level only.
+    default: ""
+  pve.cluster_stamp_aliases:
+    description: |
+      Optional list of earlier cluster stamps for this cluster, each eight
+      lowercase hex characters. A stamped CID carries the first eight hex
+      characters of the SHA-256 of pve-root-ca.pem, so replacing the cluster's
+      root CA changes the stamp, and a stamped CID whose VM is absent then
+      looks like it names another cluster. List the stamp from before the
+      rotation here, and those CIDs count as naming this cluster again. The
+      error a mismatch returns names both stamps. 00000000 is not accepted,
+      because it marks a create that could not read the cluster identity.
+
+      Overridable per cpi-config entry as pve_cluster_stamp_aliases. An entry
+      that targets another PVE endpoint gets no aliases unless it sets this
+      itself, because one cluster's rotation history is not another's.
+    default: []
   pve.detached_disk_strategy:
     description: |
       Lifecycle strategy for persistent disks in the detached state (between

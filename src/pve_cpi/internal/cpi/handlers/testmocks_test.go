@@ -426,6 +426,9 @@ type mockNodesService struct {
 	listHardwarePciFn        func(ctx context.Context, node string, params *nodes.ListHardwarePciParams) (*nodes.ListHardwarePciResponse, error)
 	listQemuFn               func(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error)
 	listNodesFn              func(ctx context.Context) (*nodes.ListNodesResponse, error)
+	// certificatesInfoFn, when non-nil, answers the cluster stamp read. Nil
+	// answers with testCertificatesInfo.
+	certificatesInfoFn func(ctx context.Context, node string) (*nodes.ListCertificatesInfoResponse, error)
 }
 
 // ListQemu backs the authoritative per-node listing

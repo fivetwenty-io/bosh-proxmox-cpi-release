@@ -64,7 +64,7 @@ func (h *NotesAuditHook) After(ctx context.Context, method string, result any, e
 	if !ok || line == "" {
 		return result, err
 	}
-	vmid, ok := vmidFromResult(result)
+	vmCID, vmid, ok := vmCIDFromResult(result)
 	if !ok {
 		return result, err
 	}
@@ -76,7 +76,7 @@ func (h *NotesAuditHook) After(ctx context.Context, method string, result any, e
 		h.logger.Debug("notes_audit: no annotator wired; skipping Notes write", log.Int("vmid", vmid))
 		return result, err
 	}
-	if annErr := annotator.AnnotateNotes(ctx, vmid, line); annErr != nil {
+	if annErr := annotator.AnnotateNotes(ctx, vmCID, line); annErr != nil {
 		h.logger.Warn("notes_audit: Notes write failed (non-fatal)", log.Int("vmid", vmid), log.Err(annErr))
 	}
 	return result, err
@@ -106,16 +106,28 @@ func boshAuditLine(env map[string]any) string {
 	return "bosh-audit: " + strings.Join(parts, " ")
 }
 
-// vmidFromResult extracts the integer VM CID from a create_vm result, which is
+// vmidFromResult extracts the integer VMID from a create_vm result, which is
 // []any{vmCID string, networks}. vmCID is a bare VMID or a stamped CID.
 func vmidFromResult(result any) (int, bool) {
+	_, vmid, ok := vmCIDFromResult(result)
+	return vmid, ok
+}
+
+// vmCIDFromResult returns a create_vm result's VM CID as returned, with the
+// VMID it names. ok is false when the result carries no CID the parser
+// accepts.
+func vmCIDFromResult(result any) (string, int, bool) {
 	arr, ok := result.([]any)
 	if !ok || len(arr) == 0 {
-		return 0, false
+		return "", 0, false
 	}
 	cid, ok := arr[0].(string)
 	if !ok {
-		return 0, false
+		return "", 0, false
 	}
-	return vmcid.VMID(cid)
+	vmid, ok := vmcid.VMID(cid)
+	if !ok {
+		return "", 0, false
+	}
+	return cid, vmid, true
 }

@@ -10,8 +10,8 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/tasks"
 )
 
-// stampedCID101 is the stamped form of VMID 101. Production still emits bare
-// CIDs, so these tests prove each VM handler parses its CID at entry and hands
+// stampedCID101 is the stamped form of VMID 101, the form create_vm returns by
+// default. These tests prove each VM handler parses its CID at entry and hands
 // PVE only the bare VMID. The shared mockNodesService rejects any vmid path
 // argument that is not all digits, so a handler that leaks the raw CID fails.
 const stampedCID101 = "101-0a1b2c3d-4e5f6a7b"

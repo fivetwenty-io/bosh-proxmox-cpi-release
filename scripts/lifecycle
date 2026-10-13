@@ -166,6 +166,7 @@ from typing import Any
 # Import the sibling out-of-band PVE verifier (scripts/_pve_verify.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _pve_verify  # noqa: E402
+import _vmcid  # noqa: E402
 from _storage_placement_verify import PlacementVerification  # noqa: E402
 
 
@@ -1054,7 +1055,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     call("attach_disk", [vm_cid, disk_cid], config_path=parked_cfg)
     state["disk_attached"] = True
     holders = verifier.disk_holders(disk_cid)
-    if [str(h[0]) for h in holders] != [str(vm_cid).strip()]:
+    if [str(h[0]) for h in holders] != [_vmcid.as_path_id(vm_cid)]:
         raise RuntimeError(
             f"after unpark the disk should be held only by VM {vm_cid}, got {holders}"
         )
@@ -1106,7 +1107,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
     state["disk_attached"] = True
     verifier.assert_true(
         f"VM {vm_cid} is the sole holder after the free re-attach",
-        [str(h[0]) for h in verifier.disk_holders(disk_cid)] == [str(vm_cid).strip()],
+        [str(h[0]) for h in verifier.disk_holders(disk_cid)] == [_vmcid.as_path_id(vm_cid)],
     )
 
     step("11l. detach_disk (strategy=parked: the existing parker is reused)")
@@ -1147,7 +1148,7 @@ def run_parked_disk_pass(verifier: "_pve_verify.PVEVerifier") -> int:
         ) from exc
     state["disk_attached"] = True
     holders = verifier.disk_holders(disk_cid)
-    if [str(h[0]) for h in holders] != [str(vm_cid).strip()]:
+    if [str(h[0]) for h in holders] != [_vmcid.as_path_id(vm_cid)]:
         raise RuntimeError(
             f"after the unset-band drain the disk should be held only by VM {vm_cid}, got {holders}"
         )
@@ -1239,7 +1240,7 @@ def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier") -> None:
     vm_cid = state["vm_cid"]
 
     def node_of(vmid: "int | str") -> str:
-        wanted = int(str(vmid).strip())
+        wanted = int(_vmcid.as_path_id(vmid))
         for candidate, node in verifier.cluster_vms():
             if candidate == wanted:
                 return node
@@ -1304,7 +1305,7 @@ def run_disk_migration_pass(verifier: "_pve_verify.PVEVerifier") -> None:
     state["mig_disk_attached"] = True
     print("attach_disk=ok")
     attached = verifier.disk_holders(mig_cid)
-    if [h[0] for h in attached] != [int(vm_cid)]:
+    if [h[0] for h in attached] != [int(_vmcid.as_path_id(vm_cid))]:
         raise RuntimeError(
             f"the migrated disk should be held only by VM {vm_cid}, got {attached}"
         )

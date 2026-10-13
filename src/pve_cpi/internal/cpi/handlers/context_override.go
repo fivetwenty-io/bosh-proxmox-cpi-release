@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -458,6 +459,12 @@ func requestOverrideCacheKey(cfg *config.CPIConfig) string {
 	// config without one keys exactly as it did before the guard existed.
 	if cfg.VMOwnershipGuard != "" {
 		_, _ = fmt.Fprintf(h, "vm_ownership_guard=%s\x00", cfg.VMOwnershipGuardValue())
+	}
+	// The stamp aliases follow the same rule. Each alias is eight hex
+	// characters, so a comma cannot occur inside one, and an empty list adds
+	// nothing.
+	if len(cfg.ClusterStampAliases) > 0 {
+		_, _ = fmt.Fprintf(h, "cluster_stamp_aliases=%s\x00", strings.Join(cfg.ClusterStampAliases, ","))
 	}
 	if cfg.PVECACertPEM != "" {
 		caHash := sha256.Sum256([]byte(cfg.PVECACertPEM))

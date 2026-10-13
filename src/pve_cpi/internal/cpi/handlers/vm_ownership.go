@@ -58,9 +58,16 @@ type vmOwnershipVerdict struct {
 	// Absent is true when the config read on the located node answered
 	// not-found and two sweeps of every member's config then proved the VM
 	// exists nowhere. A member the cluster reports offline leaves absence
-	// unproven. Only checkVMOwnership sets it, never ownVM, and each handler
-	// gives it the answer it already gives a VM it could not locate.
+	// unproven. Only checkVMOwnership and absentVMVerdict set it, never ownVM,
+	// and each handler gives it the answer it already gives a VM it could not
+	// locate.
 	Absent bool
+	// Elsewhere is true for a foreign verdict on a VMID that is absent from
+	// this cluster, when the CID carries a cluster stamp that is neither this
+	// cluster's live stamp nor one of its declared aliases. The CID's VM may
+	// still run on the cluster the stamp names, so no handler may answer that
+	// it is gone. Only absentVMVerdict sets it.
+	Elsewhere bool
 	// Reason is one of the ownershipReason constants.
 	Reason string
 	// Detail names both identities in one clause, for refusals and logs. It
@@ -87,10 +94,12 @@ type vmOwnershipView struct {
 	// verdict depends on them, so a VM with an owner or bosh-cpi tag never
 	// costs a read.
 	description func() (string, error)
-	// clusterMatches reports whether the live cluster identity matches a CID's
-	// cluster stamp, for a VM that carries no cluster tag. nil means no live
-	// identity is available, and a stamp that cannot be proven is treated as
-	// a mismatch.
+	// clusterMatches reports whether a CID's cluster stamp names the cluster
+	// this request talks to, for a VM that carries no cluster tag.
+	// checkVMOwnership sets it to a clusterStampProbe, which reads the live
+	// identity at most once per check. A failed read is an error, never a
+	// verdict. nil means no live identity is available, and the stamp is then
+	// treated as a mismatch.
 	clusterMatches func(stamp string) (bool, error)
 }
 
@@ -181,6 +190,11 @@ func ownVMStamp(cid vmcid.VMCID, clusterTags, tokenTags []string, clusterMatches
 		if err != nil {
 			return vmOwnershipVerdict{}, true, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud,
 				fmt.Sprintf("prove the identity of cluster %s for VM %d", cid.Cluster, cid.VMID))
+		}
+		if !same && cid.Cluster == vmcid.UnknownCluster {
+			return foreignVerdict(ownershipReasonClusterMismatch, fmt.Sprintf(
+				"the CID carries the unknown cluster stamp %s, and the VM records no cluster, so the cluster cannot be proven",
+				cid.Cluster)), true, nil
 		}
 		if !same {
 			return foreignVerdict(ownershipReasonClusterMismatch, fmt.Sprintf(
@@ -346,11 +360,15 @@ func checkVMOwnership(ctx context.Context, deps Deps, op string, cid vmcid.VMCID
 	}
 
 	qemu := loc.Type == "" || loc.Type == resourceTypeQemu
+	// A stamped CID that reaches a VM with no cluster tag is judged against
+	// the live cluster identity, read at most once per check and only then.
+	stamps := newClusterStampProbe(ctx, deps, loc.Node)
 	judge := func(tagsRaw string, template bool) (vmOwnershipVerdict, error) {
 		view := vmOwnershipView{
-			Tags:     lowerTags(parseTagsField(tagsRaw)),
-			Template: template,
-			Type:     loc.Type,
+			Tags:           lowerTags(parseTagsField(tagsRaw)),
+			Template:       template,
+			Type:           loc.Type,
+			clusterMatches: stamps.matches,
 			description: func() (string, error) {
 				if !qemu {
 					return "", nil
@@ -465,6 +483,15 @@ func lowerTags(tags []string) []string {
 // for a VM this Director does not own. It names the reason and both
 // identities, and the escapes for a record that can never be acted on.
 func foreignVMError(op, vmCID string, vmid int, v vmOwnershipVerdict) error {
+	if v.Elsewhere {
+		return cpierrors.Cloud(
+			"%s: refusing to answer for CID %s, because VM %d does not exist on this cluster and the CID names another "+
+				"cluster (%s): %s. The VM may still run on the cluster the CID names, for example after the request's "+
+				"cpi_config entry was pointed at a different cluster. Point the entry back at that cluster, or, if this "+
+				"cluster's root CA was replaced, list the old stamp in pve.cluster_stamp_aliases. If the VM is really gone, "+
+				"drop the record with cloud-check's \"Delete VM reference\" or bosh delete-deployment --force",
+			op, vmCID, vmid, v.Reason, v.Detail)
+	}
 	return cpierrors.Cloud(
 		"%s: refusing to act on VM %d for CID %s, which this Director does not own (%s): %s. "+
 			"If the Director's record is stale, drop it with cloud-check's \"Delete VM reference\" or bosh delete-deployment --force",
@@ -483,9 +510,14 @@ func logForeignVM(logger *log.Logger, msg string, v vmOwnershipVerdict) {
 // refuseUnownedVM is the guard for the handlers that act on a VM:
 // delete_vm's legacy path, reboot_vm, set_vm_metadata, attach_disk,
 // detach_disk, and snapshot_disk. nil means the VM is ours, legacy or not, and
-// the caller proceeds. See refuseVerdict for the other answers.
+// the caller proceeds. A VM the check found absent is judged once more by
+// absentVMVerdict, so a stamped CID that names another cluster is refused
+// rather than answered as gone. See refuseVerdict for the other answers.
 func refuseUnownedVM(ctx context.Context, deps Deps, op, vmCID string, cid vmcid.VMCID, loc pve.VMLocation, cfg map[string]any, logger *log.Logger) error {
 	verdict, err := checkVMOwnership(ctx, deps, op, cid, loc, cfg)
+	if err == nil && verdict.Absent {
+		verdict, err = absentVMVerdict(ctx, deps, op, cid)
+	}
 	if err != nil {
 		return err
 	}
@@ -548,8 +580,142 @@ func checkVMOwnershipByConfig(ctx context.Context, deps Deps, op string, cid vmc
 // config yet, which is attach_disk. See checkVMOwnershipByConfig.
 func refuseUnownedVMByConfig(ctx context.Context, deps Deps, op, vmCID string, cid vmcid.VMCID, loc pve.VMLocation, logger *log.Logger) error {
 	verdict, err := checkVMOwnershipByConfig(ctx, deps, op, cid, loc)
+	if err == nil && verdict.Absent {
+		verdict, err = absentVMVerdict(ctx, deps, op, cid)
+	}
 	if err != nil {
 		return err
+	}
+	return refuseVerdict(op, vmCID, cid, verdict, logger)
+}
+
+// clusterStampProbe answers whether a cluster stamp names the cluster this
+// request talks to. It reads the live stamp at most once, and only when a
+// stamp is neither the unknown stamp nor a declared alias, so a check whose
+// verdict the VM's own tags settle costs no read.
+type clusterStampProbe struct {
+	ctx  context.Context
+	deps Deps
+	node string
+
+	read bool
+	live string
+	err  error
+}
+
+// newClusterStampProbe returns a probe that reads the live stamp from node
+// first, which is the node the handler located the VM on or the configured
+// node, and from the other online members after it.
+func newClusterStampProbe(ctx context.Context, deps Deps, node string) *clusterStampProbe {
+	return &clusterStampProbe{ctx: ctx, deps: deps, node: node}
+}
+
+// liveStamp returns this cluster's stamp, reading it on the first call.
+func (p *clusterStampProbe) liveStamp() (string, error) {
+	if !p.read {
+		p.read = true
+		if p.deps.PVE == nil {
+			p.err = cpierrors.Retriable("no PVE client is available to read the cluster identity")
+		} else {
+			p.live, p.err = pve.ReadClusterStamp(p.ctx, p.deps.PVE, p.node)
+		}
+	}
+	return p.live, p.err
+}
+
+// matches reports whether stamp names this cluster, which holds when it equals
+// the live stamp or a declared cluster_stamp_aliases entry. The unknown stamp a create writes
+// when it could not read the identity names no cluster, so it never matches,
+// and it costs no read. A failed read is returned as is, and the caller
+// classes it.
+func (p *clusterStampProbe) matches(stamp string) (bool, error) {
+	if stamp == "" || stamp == vmcid.UnknownCluster {
+		return false, nil
+	}
+	if p.deps.Config.ClusterStampKnown(stamp, "") {
+		return true, nil
+	}
+	live, err := p.liveStamp()
+	if err != nil {
+		return false, err
+	}
+	return stamp == live, nil
+}
+
+// absentVMVerdict judges a CID whose VMID FindVMAuthoritative or the guard
+// proved absent from every member of this cluster. A bare CID, and a CID
+// carrying the unknown stamp, prove nothing about which cluster they name, so
+// they get Absent and the answer each handler already gives a missing VM. A
+// stamped CID reads the live cluster identity once. A stamp that matches it,
+// or one of the declared aliases, is a proven absence, and anything else is
+// a cluster-mismatch verdict with Elsewhere set, because the CID's VM may
+// still run on the cluster the stamp names. A failed read is retriable,
+// because nothing has been decided.
+//
+// Only on a mismatch does the verdict cost one more call, a scan for guests on
+// this cluster that carry the CID's stamp. Such guests are what a root CA
+// rotation leaves behind, so the detail suggests the alias key. They are only
+// a hint, never a match, because a remote migration and a backup restore both
+// copy the tag from another cluster.
+func absentVMVerdict(ctx context.Context, deps Deps, op string, cid vmcid.VMCID) (vmOwnershipVerdict, error) {
+	if !cid.KnownCluster() {
+		return vmOwnershipVerdict{Absent: true}, nil
+	}
+	node := ""
+	if deps.Config != nil {
+		node = deps.Config.Node
+	}
+	probe := newClusterStampProbe(ctx, deps, node)
+	same, err := probe.matches(cid.Cluster)
+	if err != nil {
+		return vmOwnershipVerdict{}, cpierrors.WrapAs(err, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"%s: VM %d is absent from this cluster, and the cluster identity could not be read to tell whether CID "+
+				"stamp %s names this cluster", op, cid.VMID, cid.Cluster))
+	}
+	if same {
+		return vmOwnershipVerdict{Absent: true}, nil
+	}
+	detail := fmt.Sprintf("the CID names cluster %s, this cluster's stamp is %s, and no cluster_stamp_aliases entry "+
+		"lists %s", cid.Cluster, probe.live, cid.Cluster)
+	tag := clusterStampTagPrefix + cid.Cluster
+	if count, countErr := pve.CountGuestsTagged(ctx, deps.PVE, tag); countErr != nil {
+		deps.Log(ctx).Debug(op+": could not count the guests that carry the CID's cluster tag",
+			log.String("tag", tag), log.Err(countErr))
+	} else if count > 0 {
+		detail += fmt.Sprintf(". %d guests on this cluster carry the tag %s, which a root CA rotation leaves behind "+
+			"but a remote migration or a backup restore also copies. If this cluster's root CA was replaced, add %s "+
+			"to pve.cluster_stamp_aliases", count, tag, cid.Cluster)
+	}
+	return vmOwnershipVerdict{Reason: ownershipReasonClusterMismatch, Detail: detail, Elsewhere: true}, nil
+}
+
+// refuseAbsentVM is the answer a mutating handler gives a VMID it proved
+// absent, which is VMNotFound for a proven absence and the cluster-mismatch
+// refusal when a stamped CID names another cluster. It always returns an
+// error, and a failed identity read is retriable.
+func refuseAbsentVM(ctx context.Context, deps Deps, op, vmCID string, cid vmcid.VMCID, logger *log.Logger) error {
+	verdict, err := absentVMVerdict(ctx, deps, op, cid)
+	if err != nil {
+		return err
+	}
+	if verdict.Absent {
+		return cpierrors.VMNotFound(vmCID)
+	}
+	return refuseVerdict(op, vmCID, cid, verdict, logger)
+}
+
+// refuseAbsentElsewhere is for a handler that keeps its own answer to a
+// proven absence. It returns nil when the VMID is absent and the CID names
+// this cluster or no cluster, the cluster-mismatch refusal when a stamped CID
+// names another cluster, and the retriable error when the identity read
+// failed.
+func refuseAbsentElsewhere(ctx context.Context, deps Deps, op, vmCID string, cid vmcid.VMCID, logger *log.Logger) error {
+	verdict, err := absentVMVerdict(ctx, deps, op, cid)
+	if err != nil {
+		return err
+	}
+	if verdict.Absent {
+		return nil
 	}
 	return refuseVerdict(op, vmCID, cid, verdict, logger)
 }

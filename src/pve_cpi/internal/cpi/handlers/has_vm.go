@@ -10,6 +10,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // HandleHasVM returns a handler for the has_vm CPI method.
@@ -20,7 +21,8 @@ import (
 // Logic:
 //  1. Parse vm_cid → vmid int.
 //  2. Locate VM via cluster scan (FindVMNodeViaCluster → /cluster/resources).
-//  3. Not found in cluster → return false.
+//  3. Not found in cluster → return false, unless a stamped CID names
+//     another cluster or that cannot be decided (see hasVMAbsentAnswer).
 //  4. Transport error → propagate as CPI error (caller may retry).
 //  5. Found → check ownership (see ownVM). A foreign VM returns false, or
 //     true with an error log under vm_ownership_guard: warn; a token
@@ -71,8 +73,7 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Wrap(lookupErr, "has_vm: locate VM")
 		}
 		if !loc.Found || loc.Node == "" {
-			logger.Debug("has_vm: VM absent from cluster index and every node's config probe — returning false")
-			return false, nil
+			return hasVMAbsentAnswer(ctx, deps, cid, logger)
 		}
 
 		// --- ownership guard ---
@@ -84,8 +85,7 @@ func HandleHasVM(deps Deps) cpi.Handler {
 			return nil, ownErr
 		}
 		if verdict.Absent {
-			logger.Debug("has_vm: VM config gone from its node and every node's config probe — returning false")
-			return false, nil
+			return hasVMAbsentAnswer(ctx, deps, cid, logger)
 		}
 		if verdict.Gone {
 			logger.Info("has_vm: the VMID now holds a different VM than the CID names — returning false",
@@ -104,4 +104,24 @@ func HandleHasVM(deps Deps) cpi.Handler {
 		logger.Debug("has_vm: VM found — returning true", log.String("node", loc.Node))
 		return true, nil
 	})
+}
+
+// hasVMAbsentAnswer is has_vm's answer for a VMID absent from every member of
+// this cluster. It is false in every case that is decided. A stamped CID whose
+// cluster stamp names another cluster also logs at error level, in both guard
+// modes, because the CID's VM may still run on the cluster it names and
+// nothing here is a VM warn could answer for. A failed read of the cluster
+// identity is retriable, so has_vm never answers false on a guess.
+func hasVMAbsentAnswer(ctx context.Context, deps Deps, cid vmcid.VMCID, logger *log.Logger) (any, error) {
+	verdict, err := absentVMVerdict(ctx, deps, "has_vm", cid)
+	if err != nil {
+		return nil, err
+	}
+	if verdict.Elsewhere {
+		logForeignVM(logger, "has_vm: the VMID is absent from this cluster, and the CID names another cluster — returning false",
+			verdict)
+		return false, nil
+	}
+	logger.Debug("has_vm: VM absent from cluster index and every node's config probe — returning false")
+	return false, nil
 }

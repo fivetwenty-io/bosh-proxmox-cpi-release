@@ -167,7 +167,7 @@ func (c *CPIConfig) IgnoredProfileFields() []string {
 
 // resetEndpointScopedPolicy clears the job-level policy that must never
 // follow a request to another PVE endpoint unless the entry names it. Today
-// that is destroy_unreferenced_disks alone.
+// that is destroy_unreferenced_disks and cluster_stamp_aliases.
 //
 // That flag makes every non-retain delete_vm ask PVE to free each volume that
 // carries the VM's VMID and is not referenced by its config. On storage that
@@ -175,12 +175,23 @@ func (c *CPIConfig) IgnoredProfileFields() []string {
 // so a job-level true inherited by an entry on another cluster is cross-cluster
 // data loss. An entry that knows its cluster's storage is its own sets the key
 // itself.
+//
+// cluster_stamp_aliases records one cluster's root CA history, so it is
+// meaningless, and unsafe, on any other cluster.
 func resetEndpointScopedPolicy(base, eff *CPIConfig, extra map[string]any) {
 	if SameEndpoint(base, eff) {
 		return
 	}
 	if _, named := extra["pve_destroy_unreferenced_disks"]; !named {
 		eff.DestroyUnreferencedDisks = false
+	}
+	// The aliases name the job cluster's earlier root CAs. Inherited by an
+	// entry on another cluster, a job-level alias that happens to equal the
+	// stamp a CID carries would turn a repointed CID into a proven absence on
+	// the wrong cluster, and delete_vm would answer success for a VM that
+	// still exists elsewhere.
+	if _, named := extra["pve_cluster_stamp_aliases"]; !named {
+		eff.ClusterStampAliases = nil
 	}
 }
 

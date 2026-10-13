@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +18,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkqemu "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -182,6 +182,10 @@ func (m *vmMockQEMU) RollbackSnapshot(_ context.Context, _ string, _ int, _ stri
 // vmMockNodes embeds panicNodesStub and overrides the methods create_vm uses.
 type vmMockNodes struct {
 	panicNodesStub
+
+	// certificatesInfoFn, when non-nil, answers the cluster stamp read. Nil
+	// answers with testCertificatesInfo.
+	certificatesInfoFn func(ctx context.Context, node string) (*sdknodes.ListCertificatesInfoResponse, error)
 
 	updateConfigCalls    []vmUpdateConfigCall
 	deleteQemuCalls      []vmDeleteQemuCall
@@ -645,9 +649,12 @@ func TestHandleCreateVM_HappyPath(t *testing.T) {
 	if !ok || vmCID == "" {
 		t.Fatalf("vm_cid must be non-empty string, got %v", tuple[0])
 	}
-	vmidInt, parseErr := strconv.Atoi(vmCID)
-	if parseErr != nil || vmidInt < 100 {
-		t.Errorf("vm_cid %q must be numeric VMID >= 100", vmCID)
+	parsedCID, parseErr := vmcid.Parse(vmCID)
+	if parseErr != nil || parsedCID.VMID < 100 {
+		t.Errorf("vm_cid %q must name a VMID >= 100", vmCID)
+	}
+	if parsedCID.Cluster != testClusterStamp || !vmcid.IsStamp(parsedCID.Token) {
+		t.Errorf("vm_cid %q must carry this cluster's stamp %s and a token", vmCID, testClusterStamp)
 	}
 
 	// Verify QEMU.Create was called (not Clone) with the import-from directive.
@@ -780,9 +787,9 @@ func TestHandleCreateVM_SkipsVMIDOwnedByStorageContent(t *testing.T) {
 	if !ok || vmCID == "" {
 		t.Fatalf("vm_cid must be non-empty string, got %v", tuple[0])
 	}
-	vmidInt, parseErr := strconv.Atoi(vmCID)
-	if parseErr != nil || vmidInt < 100 {
-		t.Fatalf("vm_cid %q must be numeric VMID >= 100", vmCID)
+	vmidInt, parsed := vmcid.VMID(vmCID)
+	if !parsed || vmidInt < 100 {
+		t.Fatalf("vm_cid %q must name a VMID >= 100", vmCID)
 	}
 	if vmidInt == peerOwnedVMID {
 		t.Errorf("allocated VMID %d collides with peer-cluster volume vm-%d-disk-0 on shared storage — "+

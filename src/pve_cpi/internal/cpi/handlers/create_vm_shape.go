@@ -20,20 +20,22 @@ import (
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
-// initialTagHead returns the tags that open a new VM's tag list: ownershipTag,
-// then the owner tag naming the requesting Director. They come ahead of every
-// stemcell, retention, route, and operator tag because mergeTagList truncates
-// from the tail, and the ownership record must be the last thing a long list
-// gives up. A request without a director_uuid gets no owner tag, and
-// warnMissingOwnerTag says so once per create_vm, because this runs once for
-// every placement candidate. set_vm_metadata stamps the tag later if a
-// Director with a UUID claims the VM with matching instance metadata.
-func initialTagHead(deps Deps) []string {
+// initialTagHead returns the tags that open a new VM's tag list. ownershipTag
+// comes first, then the owner tag naming the requesting Director, then the
+// cluster stamp and CID token tags. They come ahead of every stemcell,
+// retention, route, and operator tag because mergeTagList truncates from the
+// tail, and the ownership record must be the last thing a long list gives up.
+// buildVMShapeForNode fails a create whose list would lose a stamp tag. A
+// request without a director_uuid gets no owner tag, and warnMissingOwnerTag
+// says so once per create_vm, because this runs once for every placement
+// candidate. set_vm_metadata stamps the tag later if a Director with a UUID
+// claims the VM with matching instance metadata.
+func initialTagHead(deps Deps, parsed *createVMParsedArgs) []string {
 	head := []string{ownershipTag}
 	if owner := ownerTagFor(deps.RequestDirectorUUID); owner != "" {
-		return append(head, owner)
+		head = append(head, owner)
 	}
-	return head
+	return append(head, stampTags(parsed)...)
 }
 
 // warnMissingOwnerTag logs, once for the whole create_vm call, that the
@@ -121,7 +123,10 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	if tag := stemcellIdentityTag(parsed); tag != "" {
 		stemcellTags = append(append([]string{}, baseRetainTags...), tag)
 	}
-	initialTags := mergeTagList(initialTagHead(deps), stemcellTags, maxTagLength)
+	initialTags := mergeTagList(initialTagHead(deps, parsed), stemcellTags, maxTagLength)
+	if err := requireStampTags(parsed, initialTags); err != nil {
+		return nil, err
+	}
 	for _, tag := range advrtTags {
 		if !strings.Contains(initialTags, tag) {
 			deps.Log(ctx).Warn("create_vm: advertised-route provenance tag dropped by tag-length cap — "+

@@ -81,11 +81,23 @@ func detachDiskResolveSlot(
 	}
 	var views pve.QemuViews
 	viewsNode := ""
+	ownLogger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
+	if !loc.Found || loc.Node == "" {
+		// A proven absence keeps the backend-derived node and the
+		// already-detached answer below. A stamped CID that names another
+		// cluster is refused, because the disk may be attached to its VM there.
+		if ownErr := refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, ownLogger); ownErr != nil {
+			return "", "", false, ownErr
+		}
+	}
 	if loc.Found && loc.Node != "" {
 		// The slot read, the detach, and the unused sweep below all edit
 		// this VM, so a VM this Director does not own is refused first.
 		views, viewsNode, err = detachDiskJudgeVM(ctx, deps, vmCID, cid, loc)
 		if errors.Is(err, errVMAbsent) {
+			if ownErr := refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, ownLogger); ownErr != nil {
+				return "", "", false, ownErr
+			}
 			deps.Log(ctx).Warn("detach_disk: VM is gone from every cluster member, treating the disk as already detached",
 				log.String("vm_cid", vmCID),
 				log.String("disk_cid", diskCID),
@@ -397,7 +409,7 @@ func refuseUnownedStableIDDetach(ctx context.Context, deps Deps, vmCID string, c
 			return cpierrors.Wrap(err, fmt.Sprintf("detach_disk: locate VM %s", vmCID))
 		}
 		if !loc.Found || loc.Node == "" {
-			return nil
+			return refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, logger)
 		}
 		verdict, err := checkVMOwnershipByConfig(ctx, deps, "detach_disk", cid, loc)
 		if err != nil {
@@ -405,8 +417,9 @@ func refuseUnownedStableIDDetach(ctx context.Context, deps Deps, vmCID string, c
 		}
 		if verdict.Absent {
 			// No VM holds the unused entry any more, so there is nothing to
-			// edit, which is the answer an absent VM gets above.
-			return nil
+			// edit, which is the answer an absent VM gets above, unless a
+			// stamped CID names another cluster.
+			return refuseAbsentElsewhere(ctx, deps, "detach_disk", vmCID, cid, logger)
 		}
 		return refuseVerdict("detach_disk", vmCID, cid, verdict, logger)
 	default:

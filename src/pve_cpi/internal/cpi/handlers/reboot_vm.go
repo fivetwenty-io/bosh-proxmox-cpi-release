@@ -79,7 +79,7 @@ func HandleRebootVM(deps Deps) cpi.Handler {
 			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("reboot_vm: locate VM %s", vmCID))
 		}
 		if !loc.Found || loc.Node == "" {
-			return nil, cpierrors.VMNotFound(vmCID)
+			return nil, refuseAbsentVM(ctx, deps, "reboot_vm", vmCID, cid, logger)
 		}
 		node := loc.Node
 		logger.Debug("reboot_vm: VM located", log.String("node", node))

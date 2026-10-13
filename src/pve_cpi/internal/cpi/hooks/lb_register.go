@@ -83,8 +83,8 @@ func (h *LBRegisterHook) Before(
 		}
 	case "delete_vm":
 		if len(args) >= 1 {
-			if vmid, ok := vmidFromArg(args[0]); ok {
-				ctx = context.WithValue(ctx, lbVMIDKey{}, vmid)
+			if cid, ok := cidFromArg(args[0]); ok {
+				ctx = context.WithValue(ctx, lbVMIDKey{}, cid)
 			}
 		}
 	}
@@ -112,8 +112,12 @@ func (h *LBRegisterHook) After(ctx context.Context, method string, result any, e
 }
 
 func (h *LBRegisterHook) handleCreate(ctx context.Context, result any) {
-	vmid, ok := vmidFromResult(result)
+	vmCID, vmid, ok := vmCIDFromResult(result)
 	if !ok {
+		return
+	}
+	cid, parseErr := vmcid.Parse(vmCID)
+	if parseErr != nil {
 		return
 	}
 	addr, _ := ctx.Value(lbAddrKey{}).(string)
@@ -121,7 +125,7 @@ func (h *LBRegisterHook) handleCreate(ctx context.Context, result any) {
 		h.logger.Debug("lb_register: no static IP to register; skipping", log.Int("vmid", vmid))
 		return
 	}
-	srv := lb.Server{Name: lbServerName(vmid), Address: addr, Port: h.port}
+	srv := lb.Server{Name: lbServerName(cid), Address: addr, Port: h.port}
 	if regErr := h.registrar.Register(ctx, h.backend, srv); regErr != nil {
 		h.logger.Warn("lb_register: register failed (non-fatal)",
 			log.Int("vmid", vmid), log.String("backend", h.backend), log.Err(regErr))
@@ -133,7 +137,7 @@ func (h *LBRegisterHook) handleCreate(ctx context.Context, result any) {
 	// Register a rollback so that if a later post-hook fails and the dispatch
 	// rolls the create back, this VM is removed from the backend rather than
 	// left routing traffic to a destroyed (or keep-failed, agent-dead) VM.
-	backend, serverName := h.backend, lbServerName(vmid)
+	backend, serverName := h.backend, lbServerName(cid)
 	cpi.RegisterRollback(ctx, func(c context.Context) {
 		if derr := h.registrar.Deregister(c, backend, serverName); derr != nil {
 			h.logger.Warn("lb_register: rollback deregister failed (non-fatal)",
@@ -146,11 +150,12 @@ func (h *LBRegisterHook) handleCreate(ctx context.Context, result any) {
 }
 
 func (h *LBRegisterHook) handleDelete(ctx context.Context) {
-	vmid, ok := ctx.Value(lbVMIDKey{}).(int)
+	cid, ok := ctx.Value(lbVMIDKey{}).(vmcid.VMCID)
 	if !ok {
 		return
 	}
-	if regErr := h.registrar.Deregister(ctx, h.backend, lbServerName(vmid)); regErr != nil {
+	vmid := cid.VMID
+	if regErr := h.registrar.Deregister(ctx, h.backend, lbServerName(cid)); regErr != nil {
 		h.logger.Warn("lb_register: deregister failed (non-fatal)",
 			log.Int("vmid", vmid), log.String("backend", h.backend), log.Err(regErr))
 		return
@@ -159,8 +164,17 @@ func (h *LBRegisterHook) handleDelete(ctx context.Context) {
 		log.Int("vmid", vmid), log.String("backend", h.backend))
 }
 
-// lbServerName is the stable HAProxy server label for a VM CID.
-func lbServerName(vmid int) string { return "vm-" + strconv.Itoa(vmid) }
+// lbServerName is the stable HAProxy server label for a VM CID. A bare CID
+// keeps vm-<vmid>. A stamped CID adds its cluster stamp, vm-<vmid>-<cluster8>,
+// so two clusters that reuse a VMID behind one backend get two servers, and
+// delete_vm derives from the same CID the name create_vm registered.
+func lbServerName(cid vmcid.VMCID) string {
+	name := "vm-" + strconv.Itoa(cid.VMID)
+	if cid.Stamped() {
+		name += "-" + cid.Cluster
+	}
+	return name
+}
 
 // firstNetworkIP returns the "ip" of a network in a create_vm networks arg (map
 // of name -> {ip,...}). It iterates network names in sorted order so a multi-NIC
@@ -188,9 +202,20 @@ func firstNetworkIP(raw json.RawMessage) string {
 
 // vmidFromArg decodes a JSON string VM CID (a bare VMID or a stamped CID) to its VMID.
 func vmidFromArg(raw json.RawMessage) (int, bool) {
-	var cid string
-	if err := json.Unmarshal(raw, &cid); err != nil {
-		return 0, false
+	cid, ok := cidFromArg(raw)
+	return cid.VMID, ok
+}
+
+// cidFromArg decodes a JSON string VM CID, a bare VMID or a stamped CID. ok is
+// false when the argument is not a string or the parser rejects it.
+func cidFromArg(raw json.RawMessage) (vmcid.VMCID, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return vmcid.VMCID{}, false
 	}
-	return vmcid.VMID(cid)
+	cid, err := vmcid.Parse(s)
+	if err != nil {
+		return vmcid.VMCID{}, false
+	}
+	return cid, true
 }

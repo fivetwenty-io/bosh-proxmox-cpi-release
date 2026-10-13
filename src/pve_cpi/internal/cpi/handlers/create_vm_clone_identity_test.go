@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
@@ -208,7 +209,7 @@ func resourceShapeParams(t *testing.T, n *vmMockNodes) *sdknodes.UpdateQemuConfi
 	return nil
 }
 
-// TestCreateVM_ClonePath_ReplacesInheritedStemcellIdentity is defect D-3: PVE
+// TestCreateVM_ClonePath_ReplacesInheritedStemcellIdentity pins a fixed defect. PVE
 // copies tags and description from the clone source, so a workload VM cloned
 // from a cache template came up advertising the template's identity —
 // bosh-stemcell-cache, the content sha tag, the template's director-- ref tag,
@@ -245,9 +246,11 @@ func TestCreateVM_ClonePath_ReplacesInheritedStemcellIdentity(t *testing.T) {
 	// booted from, which is derived from testTemplateCID's filename
 	// ("bosh-stemcell-ubuntu-jammy-1.0-<sha8>.qcow2") with the tag alphabet's
 	// dash in place of the version's dot.
-	wantTags := "bosh-cpi;stemcell--ubuntu-jammy-1-0"
-	if *params.Tags != wantTags {
-		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q", *params.Tags, wantTags)
+	// The cluster stamp and the per-VM token follow bosh-cpi. The token is
+	// random, so it is checked for its form and then left out of the compare.
+	wantTags := "bosh-cpi;bosh-cluster--" + testClusterStamp + ";stemcell--ubuntu-jammy-1-0"
+	if got, token := withoutTokenTag(*params.Tags); got != wantTags || !vmcid.IsStamp(token) {
+		t.Errorf("post-clone params.Tags = %q; want the workload tag set %q with one token tag", *params.Tags, wantTags)
 	}
 	if params.Description == nil {
 		t.Fatal("post-clone params.Description is nil; the clone keeps the template's provenance JSON")
@@ -302,8 +305,11 @@ func TestCreateVM_CloneAndImportPaths_AgreeOnVMIdentity(t *testing.T) {
 	// The stemcell tag names each fixture's own stemcell, and the two fixtures
 	// deliberately use different ones (jammy 1.0 for the template, jammy 1.438
 	// for the import), so it is compared separately from the rest of the set.
-	cloneRest, cloneStemcell := splitStemcellTag(*cloneParams.Tags)
-	importRest, importStemcell := splitStemcellTag(importTags)
+	// Each create draws its own token, so the token tag is left out too.
+	cloneTags, _ := withoutTokenTag(*cloneParams.Tags)
+	importTagsNoToken, _ := withoutTokenTag(importTags)
+	cloneRest, cloneStemcell := splitStemcellTag(cloneTags)
+	importRest, importStemcell := splitStemcellTag(importTagsNoToken)
 	if cloneRest != importRest {
 		t.Errorf("clone-path tags = %q; want the import path's %q — both paths must produce one VM identity", cloneRest, importRest)
 	}

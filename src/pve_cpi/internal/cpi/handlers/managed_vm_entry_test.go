@@ -170,7 +170,7 @@ func runManagedVMEntryCase(t *testing.T, retry, pause bool) {
 	if !ok {
 		t.Fatal("missing CID")
 	}
-	vmid, err := strconv.Atoi(cid)
+	vmid, err := returnedVMID(cid)
 	if err != nil {
 		t.Fatal(err)
 	}

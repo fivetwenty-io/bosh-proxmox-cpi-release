@@ -503,6 +503,16 @@
   vm_ownership_guard = p("pve.vm_ownership_guard", "")
   config["vm_ownership_guard"] = vm_ownership_guard unless vm_ownership_guard.to_s.empty?
 
+  # Emit vm_cid_format only when set. The Go accessor defaults an empty
+  # string to "stamped"; omitting the key hands the decision to that default.
+  vm_cid_format = p("pve.vm_cid_format", "")
+  config["vm_cid_format"] = vm_cid_format unless vm_cid_format.to_s.empty?
+
+  # Emit cluster_stamp_aliases only when the operator listed a stamp. An
+  # empty list declares no root CA rotation, the same as an absent key.
+  cluster_stamp_aliases = p("pve.cluster_stamp_aliases", [])
+  config["cluster_stamp_aliases"] = cluster_stamp_aliases unless cluster_stamp_aliases.empty?
+
   # Emit parked_anchor_strict only when the operator set it. The property
   # carries no spec default, so if_p fires only on an operator-provided value;
   # the Go accessor treats an absent key as strict (true).

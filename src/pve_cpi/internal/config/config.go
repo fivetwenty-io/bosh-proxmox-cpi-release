@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/hooks"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
 )
 
 // CPIConfig holds all configuration loaded from the JSON config file.
@@ -723,6 +725,34 @@ type CPIConfig struct {
 	//
 	// Use VMOwnershipGuardValue() for the effective normalized value.
 	VMOwnershipGuard string `json:"vm_ownership_guard,omitempty"`
+
+	// VMCIDFormat decides the form of the VM and snapshot CIDs create_vm and
+	// snapshot_disk return to the Director.
+	//   "stamped" — "<vmid>-<cluster8>-<token8>", where cluster8 is the
+	//               first eight hex characters of the SHA-256 of the
+	//               cluster's pve-root-ca.pem and token8 is a random per-VM
+	//               token. The VM handlers use both to refuse a CID that names
+	//               another cluster's VMID or a VM that reused the VMID.
+	//               Default.
+	//   "bare"    — the bare VMID, as every release before stamping. The
+	//               stamp tags are still written, so a later switch back to
+	//               "stamped" protects the VMs created meanwhile on resume.
+	// The switch never rewrites a CID the Director already holds, so it is a
+	// rollback path only when set before the first stamped CID exists. It is
+	// job-level only: a CPI release either can or cannot read stamped CIDs.
+	//
+	// Use VMCIDFormatValue() for the effective normalized value.
+	VMCIDFormat string `json:"vm_cid_format,omitempty"`
+
+	// ClusterStampAliases lists earlier cluster stamps of this cluster, each
+	// the eight lowercase hex characters a stamped CID carried before the
+	// operator rotated the cluster's root CA. A stamped CID whose VMID is
+	// absent counts as naming this cluster when its stamp equals the live
+	// stamp or one of these. Overridable per cpi-config entry as
+	// pve_cluster_stamp_aliases, and cleared when an entry moves a request to
+	// another endpoint without naming the key, because another cluster's
+	// rotation history is not this one's.
+	ClusterStampAliases []string `json:"cluster_stamp_aliases,omitempty"`
 
 	// ParkedAnchorStrict controls the anchor-missing invariant of the parked
 	// strategy. A disk whose CID envelope promises a parker anchor
@@ -3337,6 +3367,43 @@ func (c *CPIConfig) VMOwnershipGuardValue() string {
 	return VMOwnershipGuardEnforce
 }
 
+// VMCIDFormatStamped and VMCIDFormatBare are the two valid vm_cid_format
+// values. "stamped" is the default an empty setting resolves to.
+const (
+	VMCIDFormatStamped = "stamped"
+	VMCIDFormatBare    = "bare"
+)
+
+// VMCIDFormatValue returns the effective CID format: "bare" only when the
+// setting says so, and "stamped" for an empty setting or a nil config.
+// Validate rejects any other value at load, so an unknown value never reaches
+// a handler.
+func (c *CPIConfig) VMCIDFormatValue() string {
+	if c == nil {
+		return VMCIDFormatStamped
+	}
+	if strings.ToLower(strings.TrimSpace(c.VMCIDFormat)) == VMCIDFormatBare {
+		return VMCIDFormatBare
+	}
+	return VMCIDFormatStamped
+}
+
+// ClusterStampKnown reports whether stamp names this cluster, which holds when
+// it equals live, the stamp read from the cluster now, or one of the declared
+// cluster_stamp_aliases. An empty stamp never matches.
+func (c *CPIConfig) ClusterStampKnown(stamp, live string) bool {
+	if stamp == "" {
+		return false
+	}
+	if stamp == live {
+		return true
+	}
+	if c == nil {
+		return false
+	}
+	return slices.Contains(c.ClusterStampAliases, stamp)
+}
+
 // DetachedDiskStrategyParked and DetachedDiskStrategyFree are the two valid
 // detached_disk_strategy values. "parked" is the default an empty setting
 // resolves to; "free" is the opt-out that restores free-floating volumes.
@@ -3601,6 +3668,48 @@ func (c *CPIConfig) validateVMOwnershipGuardEnum(errs *[]string) {
 			"vm_ownership_guard must be one of enforce|warn (or empty for default enforce), got %q",
 			c.VMOwnershipGuard,
 		))
+	}
+}
+
+// validateVMCIDFormatEnum appends an error when vm_cid_format is set to a
+// value other than stamped|bare. Empty (the default) is valid and resolves to
+// "stamped".
+func (c *CPIConfig) validateVMCIDFormatEnum(errs *[]string) {
+	if c.VMCIDFormat == "" {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(c.VMCIDFormat)) {
+	case VMCIDFormatStamped, VMCIDFormatBare:
+		// valid
+	default:
+		*errs = append(*errs, fmt.Sprintf(
+			"vm_cid_format must be one of stamped|bare (or empty for default stamped), got %q",
+			c.VMCIDFormat,
+		))
+	}
+}
+
+// validateClusterStampAliases appends an error for each cluster_stamp_aliases
+// entry that is not a cluster stamp. A stamp is eight lowercase hex characters
+// and is never the 00000000 stamp a create writes when it could not read the cluster's
+// identity, because that stamp names no cluster and must never count as a
+// match. A duplicate entry is rejected as a manifest mistake. An empty list
+// (the default) is valid.
+func (c *CPIConfig) validateClusterStampAliases(errs *[]string) {
+	seen := make(map[string]bool, len(c.ClusterStampAliases))
+	for _, alias := range c.ClusterStampAliases {
+		switch {
+		case !vmcid.IsStamp(alias):
+			*errs = append(*errs, fmt.Sprintf(
+				"cluster_stamp_aliases entry %q must be eight lowercase hex characters", alias))
+		case alias == vmcid.UnknownCluster:
+			*errs = append(*errs, fmt.Sprintf(
+				"cluster_stamp_aliases entry %q is the stamp of a create that could not read the cluster identity, "+
+					"and names no cluster", alias))
+		case seen[alias]:
+			*errs = append(*errs, fmt.Sprintf("cluster_stamp_aliases entry %q is listed twice", alias))
+		}
+		seen[alias] = true
 	}
 }
 
@@ -4333,6 +4442,12 @@ func (c *CPIConfig) validateEnumFields(errs *[]string) {
 
 	// VMOwnershipGuard enum: validate only when non-empty.
 	c.validateVMOwnershipGuardEnum(errs)
+
+	// VMCIDFormat enum: validate only when non-empty.
+	c.validateVMCIDFormatEnum(errs)
+
+	// ClusterStampAliases: validate each entry only when the list is set.
+	c.validateClusterStampAliases(errs)
 
 	// DiskMigration enum: validate only when non-empty.
 	c.validateDiskMigrationEnum(errs)

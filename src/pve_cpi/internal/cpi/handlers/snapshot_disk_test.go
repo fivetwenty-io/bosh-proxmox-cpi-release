@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
@@ -864,4 +865,54 @@ func TestHandleSnapshotDisk_InRangeNoParkerTag_Proceeds(t *testing.T) {
 func (m *snapClusterService) ListStatus(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
 	empty := sdkclusterapi.ListStatusResponse{}
 	return &empty, nil
+}
+
+// TestHandleSnapshotDisk_SnapshotCIDNamesTheHolderCID pins the snapshot CID's
+// VM half. It is the holder's stamped CID, rebuilt from the holder's cluster
+// and token tags, so delete_snapshot can judge it the way the VM handlers
+// judge a VM CID. A holder without stamp tags, and vm_cid_format: bare, keep
+// the bare VMID.
+func TestHandleSnapshotDisk_SnapshotCIDNamesTheHolderCID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		tags   string
+		format string
+		want   string
+	}{
+		{name: "stamped holder", tags: stampedVMTags, want: stampedCID100 + ":"},
+		{name: "stamped holder under bare", tags: stampedVMTags, format: config.VMCIDFormatBare, want: "100:"},
+		{name: "unstamped holder", tags: "bosh-cpi", want: "100:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qemuSvc := &snapQEMUService{
+				configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
+					if vmid == 100 {
+						return map[string]any{diskSlot: diskCID}, nil
+					}
+					return map[string]any{}, nil
+				},
+				snapshotFn: func(context.Context, string, int, string, map[string]any) (string, error) { return "", nil },
+			}
+			clusterSvc := &snapClusterService{
+				listFn: func(context.Context, *sdkclusterapi.ListResourcesParams) (*sdkclusterapi.ListResourcesResponse, error) {
+					return clusterRespWith(100, testNode), nil
+				},
+			}
+			deps := snapDeps(qemuSvc, clusterSvc, nil)
+			deps.PVE.(*mockPVEClient).fixtureTags = tc.tags
+			deps.Config.VMCIDFormat = tc.format
+			result, err := handlers.HandleSnapshotDisk(deps).Handle(context.Background(),
+				marshalArgs(mustEncodeDiskCID(t, diskCID, nil)), jsonrpc.Context{})
+			if err != nil {
+				t.Fatalf("snapshot_disk: %v", err)
+			}
+			sid, _ := result.(string)
+			if !strings.HasPrefix(sid, tc.want) || len(sid) == len(tc.want) {
+				t.Errorf("snapshot_cid = %q, want %q followed by the snapshot name", sid, tc.want)
+			}
+		})
+	}
 }

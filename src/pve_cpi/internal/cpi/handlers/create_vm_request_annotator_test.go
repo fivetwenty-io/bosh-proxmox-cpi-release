@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -37,13 +38,13 @@ func annotateThroughCreateVM(t *testing.T, deps handlers.Deps, reqCtx jsonrpc.Co
 	hook := cpi.HookFunc{
 		AfterFn: func(ctx context.Context, _ string, r any, e error) (any, error) {
 			a, ok := cpi.RequestAnnotator(ctx).(interface {
-				AnnotateNotes(context.Context, int, string) error
+				AnnotateNotes(context.Context, string, string) error
 			})
 			if !ok {
 				t.Error("create_vm published no annotator for the After hooks")
 				return r, e
 			}
-			if err := a.AnnotateNotes(ctx, vmid, "bosh-audit: group=g"); err != nil {
+			if err := a.AnnotateNotes(ctx, strconv.Itoa(vmid), "bosh-audit: group=g"); err != nil {
 				t.Errorf("AnnotateNotes: %v", err)
 			}
 			annotated = true

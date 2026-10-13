@@ -567,7 +567,7 @@ func TestCreateVMRetryCompletesOnceTheParkerIsGone(t *testing.T) {
 		t.Fatalf("the Director's retry after the parker was destroyed: %v", err)
 	}
 	values, ok := result.([]any)
-	if !ok || len(values) == 0 || values[0] != strconv.Itoa(vmid) {
+	if !ok || len(values) == 0 || !returnedNamesVM(values[0], vmid) {
 		t.Fatalf("the retry returned %v, want the kept VM %d", result, vmid)
 	}
 	if created := flow.created(t); len(created) != 1 || len(flow.vms.destroyed) != 0 {

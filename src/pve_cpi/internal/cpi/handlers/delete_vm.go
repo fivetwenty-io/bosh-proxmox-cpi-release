@@ -431,6 +431,42 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	return nil
 }
 
+// refuseStampedManagedDelete runs the ownership check for a stamped CID
+// before the managed delete, which judges a VM by its VMID, its location, and
+// its allocation marker. Every VM this CPI allocated passes those, so without
+// this check a stamped CID that names another cluster, or an older VM whose
+// VMID was reused, would reach this cluster's journaled VM and destroy it.
+//
+// It runs only when the allocation journal is configured, because the legacy
+// path makes the same check itself. A bare CID is left to the journal, as it
+// was before CIDs carried a stamp. A VMID proven absent is answered by
+// refuseAbsentElsewhere, so a CID naming another cluster is refused and any
+// other CID goes on to the managed delete, which closes its record. A present
+// VM gets refuseVerdict's answers, which are VMNotFound for a token mismatch
+// and a non-retriable refusal for a foreign VM. A failed read is retriable.
+func refuseStampedManagedDelete(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID) error {
+	if !cid.Stamped() || deps.Config == nil ||
+		deps.Config.StoragePlacementNamespace == "" && deps.Config.StorageAllocationJournalDir == "" {
+		return nil
+	}
+	logger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", cid.VMID))
+	loc, err := pve.FindVMAuthoritative(ctx, deps.PVE, cid.VMID)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("delete_vm: locate VM %s", vmCID))
+	}
+	if !loc.Found || loc.Node == "" {
+		return refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger)
+	}
+	verdict, err := checkVMOwnershipByConfig(ctx, deps, "delete_vm", cid, loc)
+	if err != nil {
+		return err
+	}
+	if verdict.Absent {
+		return refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger)
+	}
+	return refuseVerdict("delete_vm", vmCID, cid, verdict, logger)
+}
+
 // HandleDeleteVM returns a handler for the delete_vm CPI method.
 //
 // Arguments:
@@ -457,6 +493,11 @@ func HandleDeleteVM(deps Deps) cpi.Handler {
 			return nil, err
 		}
 		vmid := cid.VMID
+		// The journal names a VM by its VMID alone, so a stamped CID's
+		// cluster and token are checked before the journal is consulted.
+		if err := refuseStampedManagedDelete(ctx, deps, vmCID, cid); err != nil {
+			return nil, err
+		}
 		// A VM the allocation journal records is judged by the journal: the
 		// managed delete refuses a live VM whose location or allocation
 		// marker differs from the record, and only this CPI writes that
@@ -506,6 +547,12 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	}
 	node, vmTags := loc.Node, loc.Tags
 	if !loc.Found || node == "" {
+		// A stamped CID whose cluster stamp names another cluster is refused
+		// here. Its VM may still run there, so answering success would drop
+		// the Director's only record of it.
+		if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
+			return nil, err
+		}
 		logger.Info("delete_vm: VM absent from cluster index and every node's config probe — already deleted, returning success")
 		// Best-effort agent cleanup: registry/cloud-init state may still exist.
 		if agentErr := deps.Agent.Remove(ctx, deps.Config.Node, vmid); agentErr != nil {
@@ -519,6 +566,12 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	if alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, node, vmid, vmTags); parkerErr != nil {
 		return nil, parkerErr
 	} else if alreadyGone {
+		// The VM's config is gone from the node the scan named. A stamped
+		// CID that names another cluster is refused here too, because the
+		// CID's VM was never this one and may still run there.
+		if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 

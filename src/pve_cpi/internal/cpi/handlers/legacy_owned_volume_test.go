@@ -820,7 +820,7 @@ func TestCreateVM_RecreateDrawsVMIDThatNamesNoVolume(t *testing.T) {
 		if err != nil {
 			t.Fatalf("draw %d: %v", i, err)
 		}
-		if got := result.([]any)[0]; got != "9006" {
+		if got := result.([]any)[0]; !returnedNames(got, 9006) {
 			t.Fatalf("draw %d = %v, want 9006: VMID 9005 names %s", i, got, ownedLegacyVolume)
 		}
 	}
@@ -1019,7 +1019,7 @@ func TestCreateVM_RetryAfterStorageActivationDrawsAnotherVMID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry after activation: %v", err)
 	}
-	if got := result.([]any)[0]; got != "9007" {
+	if got := result.([]any)[0]; !returnedNames(got, 9007) {
 		t.Fatalf("retry after activation drew %v, want 9007", got)
 	}
 	mu.Lock()

@@ -120,7 +120,7 @@ func HandleSetVMMetadata(deps Deps) cpi.Handler {
 			return nil, cpierrors.Wrap(lookupErr, fmt.Sprintf("set_vm_metadata: locate VM %s", vmCID))
 		}
 		if !loc.Found || loc.Node == "" {
-			return nil, cpierrors.VMNotFound(vmCID)
+			return nil, refuseAbsentVM(ctx, deps, "set_vm_metadata", vmCID, cid, logger)
 		}
 		node := loc.Node
 		logger.Debug("set_vm_metadata: VM located", log.String("node", node))

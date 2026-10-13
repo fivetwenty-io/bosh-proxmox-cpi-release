@@ -194,7 +194,7 @@ func resumeLandedDisk(t *testing.T, flow *protectionPendingFlow) {
 	if !ok || len(values) == 0 {
 		t.Fatalf("unexpected create_vm result %v", result)
 	}
-	if cid, _ := values[0].(string); cid != strconv.Itoa(vmid) {
+	if !returnedNamesVM(values[0], vmid) {
 		t.Fatalf("the retry returned VM %v, want the kept VM %d", values[0], vmid)
 	}
 	if created := flow.created(t); len(created) != 1 || len(flow.vms.destroyed) != 0 {
@@ -258,7 +258,7 @@ func keepVMWhileProtectionIsOff(t *testing.T, flow *protectionPendingFlow) {
 	if err != nil {
 		t.Fatalf("the retry after protection was put back failed: %v", err)
 	}
-	if values, ok := result.([]any); !ok || len(values) == 0 || values[0] != strconv.Itoa(vmid) {
+	if values, ok := result.([]any); !ok || len(values) == 0 || !returnedNamesVM(values[0], vmid) {
 		t.Fatalf("the retry returned %v, want the kept VM %d", result, vmid)
 	}
 	if resumed := flow.generation(t); resumed.ID != generation.ID || resumed.State != aj.ReadyToReturn {

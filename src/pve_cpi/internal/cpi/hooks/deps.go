@@ -82,7 +82,9 @@ type ExternalCommandConfig struct {
 
 // VMAnnotator writes operator-facing Notes onto a created VM. Implemented by an
 // adapter in internal/cpi/handlers (structural satisfaction — that package does
-// not import this one). vmid is the integer VM CID.
+// not import this one). vmCID is the VM CID create_vm returned, a bare VMID or
+// a stamped CID, so the adapter can check a stamped CID's token against the VM
+// before it writes.
 type VMAnnotator interface {
-	AnnotateNotes(ctx context.Context, vmid int, notes string) error
+	AnnotateNotes(ctx context.Context, vmCID string, notes string) error
 }

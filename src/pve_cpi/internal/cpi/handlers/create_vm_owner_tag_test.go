@@ -92,7 +92,9 @@ func TestCreateVM_CloudPropertyTagsCannotClaimCPIPrefixes(t *testing.T) {
 	if n := strings.Count(tags, "bosh-owner--"); n != 1 || tagIndex(tags, ownerTestOwnerTag) != 1 {
 		t.Errorf("tags = %q; want exactly the requesting Director's owner tag", tags)
 	}
-	for _, bad := range []string{"bosh-owner--0a0b0c0d", "Bosh-Cid--", "bosh-cid--", "bosh-cluster--", "stemcell--fake"} {
+	// The CPI writes its own cluster and token tags, so only the operator's
+	// values are checked here.
+	for _, bad := range []string{"bosh-owner--0a0b0c0d", "Bosh-Cid--", "bosh-cid--pve-1-101", "bosh-cluster--deadbeef", "stemcell--fake"} {
 		if strings.Contains(tags, bad) {
 			t.Errorf("tags = %q; operator tag claimed %q", tags, bad)
 		}

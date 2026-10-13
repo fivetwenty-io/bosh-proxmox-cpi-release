@@ -52,8 +52,12 @@ type DecodedCID struct {
 	LengthTarget  int               `json:"length_target,omitempty"`
 	OverTarget    bool              `json:"over_target,omitempty"`
 
-	// VM field (Family == vm).
-	VMID int `json:"vmid,omitempty"`
+	// VM fields (Family == vm, and the VM part of Family == snapshot). A
+	// stamped CID also reports the cluster stamp and the per-VM token it
+	// carries, and a bare CID leaves both empty.
+	VMID         int    `json:"vmid,omitempty"`
+	ClusterStamp string `json:"cluster_stamp,omitempty"`
+	Token        string `json:"token,omitempty"`
 
 	// Snapshot fields (Family == snapshot).
 	VMCID        string `json:"vm_cid,omitempty"`
@@ -203,7 +207,7 @@ func decodeVMCID(raw string) (*DecodedCID, error) {
 		return nil, fmt.Errorf("pve-cid: invalid VM CID %q: must be a positive integer VMID, optionally followed by "+
 			"-<cluster>-<token>", raw)
 	}
-	return &DecodedCID{Family: FamilyVM, Raw: raw, VMID: cid.VMID}, nil
+	return &DecodedCID{Family: FamilyVM, Raw: raw, VMID: cid.VMID, ClusterStamp: cid.Cluster, Token: cid.Token}, nil
 }
 
 func decodeSnapshotCID(raw string) (*DecodedCID, error) {
@@ -215,12 +219,14 @@ func decodeSnapshotCID(raw string) (*DecodedCID, error) {
 	// vmid stays 0 (omitted from JSON) in the defensive error case rather
 	// than propagating a spurious failure for a CID that ParseSnapshotCID
 	// already accepted.
-	vmid, _ := vmcid.VMID(vmCID)
+	cid, _ := vmcid.Parse(vmCID)
 	return &DecodedCID{
 		Family:       FamilySnapshot,
 		Raw:          raw,
 		VMCID:        vmCID,
 		SnapshotName: snapName,
-		VMID:         vmid,
+		VMID:         cid.VMID,
+		ClusterStamp: cid.Cluster,
+		Token:        cid.Token,
 	}, nil
 }

@@ -501,7 +501,7 @@ The reason in parentheses says which check failed.
 | `parker` | The CID reached a disk parker. |
 | `template` | The CID reached a stemcell template. |
 | `not-bosh` | The VM carries no owner tag, no `bosh-cpi` tag, and no Director metadata lines in its Notes, or the VMID names a container. |
-| `cluster-mismatch` | A stamped CID names a different cluster than the VM records, or the VM records no cluster. |
+| `cluster-mismatch` | A stamped CID names a different cluster than the VM's `bosh-cluster--` tag records. When the VM carries no cluster tag, the CID's stamp differs from this cluster's own stamp and from every `pve.cluster_stamp_aliases` entry, or it's `00000000`. [A call refuses a CID that names another cluster](#a-call-refuses-a-cid-that-names-another-cluster) covers the same reason for a VMID that is absent. |
 | `token-missing` | A stamped CID carries a token, and the VM carries no `bosh-cid--` tag. |
 | `token-conflict` | The VM carries several `bosh-cid--` tags, and only some of them match the CID. |
 
@@ -523,6 +523,42 @@ The fix depends on why the CID reaches a VM we don't own.
   The state file is the only record of the Director's `director_id`, so the old Director VM's owner tag names a Director that no longer exists. See [Deploying with bosh create-env](bosh-create-env.md#a-lost-state-file-and-the-ownership-guard).
 
 Setting `pve.vm_ownership_guard: warn` lets `has_vm` and `get_disks` answer for the VM while we investigate. It never lets a call change the VM.
+
+### A call refuses a CID that names another cluster
+
+**Symptom**
+
+```text
+delete_vm: refusing to answer for CID 101-99aabbcc-4e5f6a7b, because VM 101 does not exist on this cluster and the CID names another cluster (cluster-mismatch): the CID names cluster 99aabbcc, this cluster's stamp is 0a1b2c3d, and no cluster_stamp_aliases entry lists 99aabbcc. The VM may still run on the cluster the CID names, for example after the request's cpi_config entry was pointed at a different cluster. Point the entry back at that cluster, or, if this cluster's root CA was replaced, list the old stamp in pve.cluster_stamp_aliases. If the VM is really gone, drop the record with cloud-check's "Delete VM reference" or bosh delete-deployment --force
+```
+
+The same refusal can come from `reboot_vm`, `set_vm_metadata`, `attach_disk`, or `detach_disk`. `has_vm` answers `false` for such a CID and logs the verdict at error level, and `delete_snapshot` answers success with a warning. When guests on this cluster carry the CID's `bosh-cluster--` tag, the detail counts them and suggests the alias key, because a root CA rotation leaves such guests behind. They're only a hint, because a remote migration or a backup restore copies the tag too.
+
+**Diagnosis**
+
+The CPI found no VM with the CID's VMID on any member of the cluster this request reached, and the CID's stamp doesn't name that cluster. The VM the CID named may still be running on the cluster that the stamp does name. We decode the CID with `pve-cid decode <cid>`, which prints its `cluster_stamp` and `token`, and we read each cluster's own stamp on any of its nodes:
+
+```bash
+# The first eight hex characters of the root CA's SHA-256 fingerprint
+pvesh get /nodes/$(hostname)/certificates/info --output-format json \
+  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' \
+  | tr -d ':' | tr 'A-F' 'a-f' | cut -c1-8
+```
+
+**Fix**
+
+The fix depends on which cluster the stamp names.
+
+- The stamp names another cluster we still run
+  The request's `cpi_config` entry or AZ was pointed at a different cluster after the VM was created. We point the entry back at the cluster the stamp names, or we give that cluster an entry of its own, and the call then reaches the VM.
+
+- The stamp is this cluster's own, from before a root CA rotation
+  We add the old stamp to `pve.cluster_stamp_aliases`, at the job level or in the entry for this cluster, and redeploy the CPI. [Rotating a cluster's root CA](operations.md#rotating-a-clusters-root-ca) walks through it.
+
+- The VM is really gone
+  We drop the record with cloud-check's "Delete VM reference" in `bosh cck`, or with `bosh delete-deployment --force` when the whole deployment is going away.
+
+`pve.vm_ownership_guard: warn` doesn't relax this refusal, and `has_vm` answers `false` in both modes, because no reading of an absent VMID tells us the CID's VM is gone.
 
 ## Stemcell upload and import failures
 

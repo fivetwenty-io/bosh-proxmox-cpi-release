@@ -9,6 +9,8 @@
 package vmcid
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -17,6 +19,11 @@ import (
 
 // stampLen is the length of both the cluster stamp and the per-VM token.
 const stampLen = 8
+
+// UnknownCluster is the cluster stamp create_vm writes when it could not read
+// the cluster's identity. It names no cluster, so a CID that carries it gets
+// the answers a bare CID gets when its VMID is absent.
+const UnknownCluster = "00000000"
 
 // VMCID is a parsed VM CID. Cluster and Token are empty for a bare CID.
 type VMCID struct {
@@ -49,7 +56,7 @@ func Parse(raw string) (VMCID, error) {
 		if err != nil {
 			return VMCID{}, err
 		}
-		if !isStamp(parts[1]) || !isStamp(parts[2]) {
+		if !IsStamp(parts[1]) || !IsStamp(parts[2]) {
 			return VMCID{}, fmt.Errorf("stamp and token must each be %d lowercase hex characters", stampLen)
 		}
 		return VMCID{VMID: vmid, Cluster: parts[1], Token: parts[2]}, nil
@@ -69,12 +76,40 @@ func (c VMCID) Stamped() bool {
 	return c.Cluster != "" || c.Token != ""
 }
 
+// KnownCluster reports whether the CID carries a cluster stamp that names a
+// cluster, which excludes a bare CID and the UnknownCluster stamp.
+func (c VMCID) KnownCluster() bool {
+	return c.Cluster != "" && c.Cluster != UnknownCluster
+}
+
 // String returns the CID in the form it was parsed from.
 func (c VMCID) String() string {
 	if !c.Stamped() {
 		return c.PathID()
 	}
 	return c.PathID() + "-" + c.Cluster + "-" + c.Token
+}
+
+// Stamp returns the stamped CID for vmid, cluster, and token, or an error when
+// any of the three does not have the form Parse accepts.
+func Stamp(vmid int, cluster, token string) (VMCID, error) {
+	if vmid <= 0 {
+		return VMCID{}, errors.New("vmid must be a positive integer")
+	}
+	if !IsStamp(cluster) || !IsStamp(token) {
+		return VMCID{}, fmt.Errorf("stamp and token must each be %d lowercase hex characters", stampLen)
+	}
+	return VMCID{VMID: vmid, Cluster: cluster, Token: token}, nil
+}
+
+// NewToken returns a random per-VM token of eight lowercase hex characters.
+// It fails only when the system's random source fails.
+func NewToken() (string, error) {
+	var b [stampLen / 2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("read random token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // VMID returns the VMID of a CID string, or false when raw is not a valid CID.
@@ -116,7 +151,9 @@ func parseVMID(s string) (int, error) {
 	return n, nil
 }
 
-func isStamp(s string) bool {
+// IsStamp reports whether s has the form of a cluster stamp or a per-VM token,
+// which is exactly eight lowercase hexadecimal characters.
+func IsStamp(s string) bool {
 	if len(s) != stampLen {
 		return false
 	}

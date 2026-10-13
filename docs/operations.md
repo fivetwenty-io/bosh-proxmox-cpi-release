@@ -654,6 +654,57 @@ pvesh get /cluster/resources --type vm \
 
 Every call that acts on a VM checks this tag first. A call from one Director never stops, reboots, retags, attaches to, detaches from, snapshots, or destroys a VM whose owner tag names another Director. The same holds for disk parkers, stemcell templates, containers, and VMs that carry no BOSH marker at all. `has_vm` answers `false` for such a VM, so the Director never adopts another Director's VM. A recreate that follows stops at the `delete_vm` refusal until we drop the stale record with cloud-check's "Delete VM reference" or `bosh delete-deployment --force`. The fast-path `delete_vm` sweep reaps the stalled deletes that carry this Director's owner tag, plus legacy stragglers that carry no owner tag, and it leaves another Director's for that Director to finish. [Configuration](configuration.md#vm-ownership-guard) describes `pve.vm_ownership_guard`, and [Troubleshooting](troubleshooting.md#a-call-refuses-a-vm-this-director-does-not-own) covers the refusal and its escapes.
 
+### Which cluster does a VM CID name?
+
+A VM this release creates gets a CID such as `101-0a1b2c3d-4e5f6a7b`. The middle part is the cluster stamp, which is the first eight hex characters of the SHA-256 of the cluster's root CA. The last part is a token that's new for every VM. The VM carries both as tags, `bosh-cluster--0a1b2c3d` and `bosh-cid--4e5f6a7b`, right after its owner tag. A call whose CID names a different cluster than the VM records is refused. So is a call whose VMID is absent from this cluster when the CID's stamp names another cluster, because the VM may still be running there. A VM that carries a different token took over the VMID after the CID's VM was deleted, so the call answers `VMNotFound` and leaves it alone. A VM created before the upgrade keeps its bare CID until a `bosh recreate` gives it a stamped one. A CID with the stamp `00000000` comes from a create that couldn't read the root CA, and when its VM is gone it gets the same answers a bare CID gets.
+
+```bash
+# Decode a CID, then find the VM that carries its token
+pve-cid decode 101-0a1b2c3d-4e5f6a7b
+pvesh get /cluster/resources --type vm \
+  | jq -r --arg want bosh-cid--4e5f6a7b \
+      '.[] | select(.tags != null) | select(.tags | gsub(","; ";") | split(";") | index($want)) | "\(.vmid) \(.node) \(.name)"'
+
+# This cluster's own stamp, read on any of its nodes
+pvesh get /nodes/$(hostname)/certificates/info --output-format json \
+  | jq -r '.[] | select(.filename == "pve-root-ca.pem") | .fingerprint' \
+  | tr -d ':' | tr 'A-F' 'a-f' | cut -c1-8
+```
+
+`pve.vm_cid_format: bare` makes the CPI return bare CIDs again while it keeps writing both tags. [Configuration](configuration.md#vm-ownership-guard) describes it, and [Troubleshooting](troubleshooting.md#a-call-refuses-a-cid-that-names-another-cluster) covers the refusal.
+
+### Rotating a cluster's root CA
+
+Replacing a cluster's root CA, for example after the old one expired or leaked, changes the cluster's stamp. Every stamped CID created before the rotation then names a stamp this cluster no longer reports. Calls on those VMs keep working while the VMs exist, because each VM's `bosh-cluster--` tag still matches its CID. Once one of those VMs is gone, though, its CID looks like it names another cluster, so `delete_vm` refuses it rather than answering success. We record the old stamp before rotating, so nothing waits on the refusal:
+
+1. Read the current stamp with the `pvesh` command in [Which cluster does a VM CID name?](#which-cluster-does-a-vm-cid-name) and note it.
+
+2. Add it to `pve.cluster_stamp_aliases` at the job level, or as `pve_cluster_stamp_aliases` in the `cpi_config` entry for this cluster, and redeploy the CPI.
+
+3. Rotate the CA, then read the stamp again to confirm it changed.
+
+An alias can stay as long as any CID created before the rotation is still in a Director's records. A `bosh recreate` gives a VM a CID with the new stamp. When the refusal already happened, its message names both stamps, and we add the CID's stamp the same way. We never add a stamp that belongs to another cluster we run, because its CIDs would then count as this cluster's, and `delete_vm` would answer success for a VM that may still be running there.
+
+### `bosh delete-vm` on a VM with no instance goes to the default CPI
+
+`bosh delete-vm <cid>` for a VM that no instance references can't tell the Director which `cpi_config` entry the VM came from. The Director sends the call to its default CPI with no entry properties, so the job-level cluster receives it. A stamped CID from another cluster is refused there, because of its stamp. A bare CID isn't, and the job cluster destroys whatever VM of ours holds that VMID, so we run `bosh delete-vm` with a bare CID only when we know the VM lives on the job cluster. We delete a VM on another cluster in PVE ourselves.
+
+### Downgrading below stamped CIDs
+
+0.9.3 and every earlier release can't parse a stamped CID. They fail every call on a stamped VM and can't delete a stamped snapshot, and `bosh create-env` can't delete a Director VM whose state file holds a stamped CID. Nothing is dropped silently, but nothing on a stamped VM works either. Journal records and parker provenance hold bare VMIDs, so they stay readable. Before rolling back, we replace every stamped CID in this order:
+
+1. Set `pve.vm_cid_format: bare` and redeploy the CPI, so no new stamped CID is created.
+
+2. Run `bosh recreate` on every deployment, so every VM gets a bare CID.
+
+3. Run `bosh create-env --recreate` for each Director that `bosh create-env` manages, so its state file holds a bare CID.
+
+4. Delete every snapshot whose CID is stamped, with `bosh delete-snapshot`, because the older release can't.
+
+5. Roll back the CPI release.
+
+Setting `bare` before the first upgrade to a stamping release skips steps 2 through 4, because no stamped CID ever exists.
+
 ### `bosh clean-up` is safe across directors
 
 Each cache template records the set of director UUIDs currently depending on it. Running `bosh clean-up` (or `bosh clean-up --all`) on one director only removes *that* director's own reference — it never touches another director's reference to the same template, even though both directors may be looking at the same PVE cluster. The cache template, and for a CPI-uploaded (`:heavy:`) stemcell its qcow2 file, survive until the last director referencing them releases its reference. An operator-managed (`:light:`) qcow2 is never removed by the CPI regardless of reference count.

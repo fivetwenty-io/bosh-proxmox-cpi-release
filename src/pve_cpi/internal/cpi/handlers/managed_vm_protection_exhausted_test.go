@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -147,7 +146,7 @@ func TestExhaustedTriesRecoverWithPlainCleanup(t *testing.T) {
 	if !ok || len(values) == 0 {
 		t.Fatalf("unexpected create_vm result %v", result)
 	}
-	fresh, err := strconv.Atoi(fmt.Sprint(values[0]))
+	fresh, err := returnedVMID(values[0])
 	if err != nil || fresh == vmid {
 		t.Fatalf("create_vm under a new agent ID returned %v, want a fresh VM", values[0])
 	}

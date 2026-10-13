@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -223,6 +225,30 @@ func TestDecodeCID_VM_Stamped(t *testing.T) {
 	if d.Family != FamilyVM || d.VMID != 5042 {
 		t.Errorf("got Family=%q VMID=%d, want vm 5042", d.Family, d.VMID)
 	}
+	if d.ClusterStamp != "0a1b2c3d" || d.Token != "4e5f6a7b" {
+		t.Errorf("got ClusterStamp=%q Token=%q, want 0a1b2c3d and 4e5f6a7b", d.ClusterStamp, d.Token)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"cluster_stamp":"0a1b2c3d"`, `"token":"4e5f6a7b"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("JSON %s does not contain %s", raw, want)
+		}
+	}
+
+	bare, err := DecodeCID("5042")
+	if err != nil {
+		t.Fatalf("DecodeCID error = %v", err)
+	}
+	raw, err = json.Marshal(bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "cluster_stamp") || strings.Contains(string(raw), "token") {
+		t.Errorf("bare CID JSON %s must leave out the stamp fields", raw)
+	}
 }
 
 func TestDecodeCID_Snapshot_StampedVM(t *testing.T) {
@@ -232,6 +258,9 @@ func TestDecodeCID_Snapshot_StampedVM(t *testing.T) {
 	}
 	if d.Family != FamilySnapshot || d.VMID != 5042 || d.VMCID != "5042-0a1b2c3d-4e5f6a7b" {
 		t.Errorf("got %+v, want snapshot of VM 5042", d)
+	}
+	if d.ClusterStamp != "0a1b2c3d" || d.Token != "4e5f6a7b" {
+		t.Errorf("got ClusterStamp=%q Token=%q, want 0a1b2c3d and 4e5f6a7b", d.ClusterStamp, d.Token)
 	}
 }
 

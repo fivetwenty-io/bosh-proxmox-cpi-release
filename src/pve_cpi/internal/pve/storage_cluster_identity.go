@@ -192,59 +192,12 @@ func validStorageIdentityNode(name string) bool {
 
 func storageClusterRootDigest(response *nodes.ListCertificatesInfoResponse) ([sha256.Size]byte, error) {
 	var zero [sha256.Size]byte
-	if response == nil {
-		return zero, errors.New("nil certificate response")
-	}
-	var root map[string]json.RawMessage
-	for _, raw := range *response {
-		fields, err := storageCertificateFields(raw)
-		if err != nil {
-			return zero, err
-		}
-		filename, present, err := storageCertificateString(fields, "filename")
-		if err != nil || !present || filename == "" {
-			return zero, errors.New("missing or malformed certificate filename")
-		}
-		if filename != storageClusterRootFilename {
-			continue
-		}
-		if root != nil {
-			return zero, errors.New("multiple cluster root certificates")
-		}
-		root = fields
-	}
-	if root == nil {
-		return zero, errors.New("cluster root certificate missing")
-	}
-	encoded, hasPEM, err := storageCertificateString(root, "pem")
+	block, fingerprint, hasFingerprint, err := storageClusterRootObservation(response)
 	if err != nil {
 		return zero, err
 	}
-	reported, hasFingerprint, err := storageCertificateString(root, "fingerprint")
-	if err != nil {
-		return zero, err
-	}
-	var fingerprint [sha256.Size]byte
-	if hasFingerprint {
-		fingerprint, err = storageRootFingerprint(reported)
-		if err != nil {
-			return zero, err
-		}
-	}
-	if !hasPEM {
-		if !hasFingerprint {
-			return zero, errors.New("cluster root has no PEM or SHA256 fingerprint")
-		}
+	if block == nil {
 		return fingerprint, nil
-	}
-	// A single PEM CERTIFICATE, not a chain, private key, or arbitrary text.
-	trimmed := bytes.TrimSpace([]byte(encoded))
-	if !bytes.HasPrefix(trimmed, []byte("-----BEGIN CERTIFICATE-----")) {
-		return zero, errors.New("invalid cluster root PEM")
-	}
-	block, rest := pem.Decode(trimmed)
-	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 || len(bytes.TrimSpace(rest)) != 0 {
-		return zero, errors.New("invalid or multiple cluster root PEM blocks")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
@@ -261,6 +214,73 @@ func storageClusterRootDigest(response *nodes.ListCertificatesInfoResponse) ([sh
 		return zero, errors.New("cluster root PEM and SHA256 fingerprint disagree")
 	}
 	return digest, nil
+}
+
+// storageClusterRootObservation finds the single pve-root-ca.pem entry in a
+// certificates/info answer and returns its PEM block and its reported SHA256
+// fingerprint. The block is nil when the entry carries no PEM, and then the
+// fingerprint is always present. It applies no rule to the certificate
+// itself, so the strict continuity reader and the lenient cluster stamp
+// reader share one parse and differ only in what they require of the root.
+func storageClusterRootObservation(
+	response *nodes.ListCertificatesInfoResponse,
+) (*pem.Block, [sha256.Size]byte, bool, error) {
+	var zero [sha256.Size]byte
+	if response == nil {
+		return nil, zero, false, errors.New("nil certificate response")
+	}
+	var root map[string]json.RawMessage
+	for _, raw := range *response {
+		fields, err := storageCertificateFields(raw)
+		if err != nil {
+			return nil, zero, false, err
+		}
+		filename, present, err := storageCertificateString(fields, "filename")
+		if err != nil || !present || filename == "" {
+			return nil, zero, false, errors.New("missing or malformed certificate filename")
+		}
+		if filename != storageClusterRootFilename {
+			continue
+		}
+		if root != nil {
+			return nil, zero, false, errors.New("multiple cluster root certificates")
+		}
+		root = fields
+	}
+	if root == nil {
+		return nil, zero, false, errors.New("cluster root certificate missing")
+	}
+	encoded, hasPEM, err := storageCertificateString(root, "pem")
+	if err != nil {
+		return nil, zero, false, err
+	}
+	reported, hasFingerprint, err := storageCertificateString(root, "fingerprint")
+	if err != nil {
+		return nil, zero, false, err
+	}
+	var fingerprint [sha256.Size]byte
+	if hasFingerprint {
+		fingerprint, err = storageRootFingerprint(reported)
+		if err != nil {
+			return nil, zero, false, err
+		}
+	}
+	if !hasPEM {
+		if !hasFingerprint {
+			return nil, zero, false, errors.New("cluster root has no PEM or SHA256 fingerprint")
+		}
+		return nil, fingerprint, true, nil
+	}
+	// A single PEM CERTIFICATE, not a chain, private key, or arbitrary text.
+	trimmed := bytes.TrimSpace([]byte(encoded))
+	if !bytes.HasPrefix(trimmed, []byte("-----BEGIN CERTIFICATE-----")) {
+		return nil, zero, false, errors.New("invalid cluster root PEM")
+	}
+	block, rest := pem.Decode(trimmed)
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 || len(bytes.TrimSpace(rest)) != 0 {
+		return nil, zero, false, errors.New("invalid or multiple cluster root PEM blocks")
+	}
+	return block, fingerprint, hasFingerprint, nil
 }
 
 // Reject duplicate JSON keys, including duplicate filename/fingerprint, instead

@@ -343,6 +343,32 @@ assert_json_valid      "case8" "$JSON_8"                         || FAILED=$((FA
 assert_json_key_equals "case8" "$JSON_8" vm_ownership_guard warn || FAILED=$((FAILED+1))
 assert_json_lacks_key  "case8-unset" "$JSON_1" vm_ownership_guard || FAILED=$((FAILED+1))
 
+# vm_cid_format renders only when set, so the Go default ("stamped") decides
+# for a manifest that says nothing. cluster_stamp_aliases renders only when
+# the list names a stamp, and it renders as a JSON list, not a string.
+echo "Case 9: vm_cid_format and cluster_stamp_aliases"
+props_with_cid_settings() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    h["pve"]["vm_cid_format"] = ARGV[0]
+    h["pve"]["cluster_stamp_aliases"] = JSON.parse(ARGV[1])
+    print h.inspect
+  ' "$1" "$2"
+}
+JSON_9="$(render "$(props_with_cid_settings bare '["0a1b2c3d","4e5f6a7b"]')")"
+assert_json_valid      "case9" "$JSON_9"                    || FAILED=$((FAILED+1))
+assert_json_key_equals "case9" "$JSON_9" vm_cid_format bare || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_9" | ruby -rjson -e 'print JSON.generate(JSON.parse(STDIN.read).fetch("cluster_stamp_aliases", nil))')" != '["0a1b2c3d","4e5f6a7b"]' ]; then
+  echo "FAIL [case9]: cluster_stamp_aliases did not render as the two-stamp list" >&2
+  FAILED=$((FAILED+1))
+fi
+JSON_9E="$(render "$(props_with_cid_settings '' '[]')")"
+assert_json_valid     "case9-empty" "$JSON_9E"                       || FAILED=$((FAILED+1))
+assert_json_lacks_key "case9-empty" "$JSON_9E" vm_cid_format         || FAILED=$((FAILED+1))
+assert_json_lacks_key "case9-empty" "$JSON_9E" cluster_stamp_aliases || FAILED=$((FAILED+1))
+assert_json_lacks_key "case9-unset" "$JSON_1" vm_cid_format          || FAILED=$((FAILED+1))
+assert_json_lacks_key "case9-unset" "$JSON_1" cluster_stamp_aliases  || FAILED=$((FAILED+1))
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

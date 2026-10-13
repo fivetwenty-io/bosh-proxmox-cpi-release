@@ -33,6 +33,18 @@ This page collects every known limitation of the CPI in one place. Each entry is
 - A bare CID can still destroy another Director's legacy VM
   A VM created before the owner tag existed passes the ownership guard on its `bosh-cpi` tag, whichever Director created it. `set_vm_metadata` compares the instance the Director names with the one the VM records, but `delete_vm` receives no metadata to compare, so a stale bare CID can destroy another Director's legacy VM. The gap closes for a VM only when a deploy that updates its instance, or a `bosh recreate`, writes the owner tag. Until then the VM stays exposed. See [Operations](operations.md#which-director-owns-a-vm).
 
+- A bare CID can't tell which cluster it came from
+  A VM created before stamped CIDs keeps its bare CID until a `bosh recreate`. When its VMID is absent, every call answers as if the VM were gone, so a `delete_vm` that reaches the wrong cluster drops the Director's record of a VM that may still be running elsewhere. `pve.vm_cid_format: bare` keeps every new VM in that position too. See [Operations](operations.md#which-cluster-does-a-vm-cid-name).
+
+- Two clusters that share a root CA share a stamp
+  The stamp is derived from the root CA, so a cluster built from another cluster's CA backup gets the same stamp. Between those two clusters, a CID whose VMID is absent reads as a proven absence, and only the token still tells a reused VMID apart. A CID with the stamp `00000000`, which a create writes when it can't read the CA, names no cluster and gets the same unprotected answers. See [Design Decisions](design-decisions.md#d17-stamped-vm-cids-that-name-their-cluster-and-their-vm).
+
+- `bosh delete-vm` on a VM with no instance goes to the default CPI
+  The Director sends it to the job-level cluster with no `cpi_config` entry properties. A stamped CID from another cluster is refused there, but a bare CID destroys whatever VM of ours holds that VMID on the job cluster. See [Operations](operations.md#bosh-delete-vm-on-a-vm-with-no-instance-goes-to-the-default-cpi).
+
+- `lb_register` names a bare-CID VM by its VMID alone
+  A stamped VM's HAProxy server is `vm-<vmid>-<cluster>`, but a VM with a bare CID keeps `vm-<vmid>`, so two clusters that reuse a VMID behind one backend still collide on those VMs. See [Configuration](configuration.md#lb_register).
+
 ## Storage and stemcells
 
 - `:heavy:` files on a shared export are kept, not deleted, under cpi-config

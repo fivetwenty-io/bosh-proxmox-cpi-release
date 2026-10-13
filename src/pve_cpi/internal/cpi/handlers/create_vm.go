@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	mrand "math/rand/v2"
-	"strconv"
 	"strings"
 	"time"
 
@@ -394,6 +393,12 @@ type createVMParsedArgs struct {
 	networks      map[string]createVMNetworkSpec
 	diskCIDs      []string
 	env           map[string]any
+	// clusterStamp and cidToken are the cluster stamp and per-VM token that
+	// resolveCreateStamp settles once per call. Every candidate shape stamps
+	// them as head tags, and the returned CID names them. Both are empty
+	// until resolveCreateStamp runs.
+	clusterStamp string
+	cidToken     string
 }
 
 // createVMShape holds the resolved VM-shape parameters derived from
@@ -465,7 +470,7 @@ type createVMShape struct {
 	balloonMiB *int
 	// vmPool is the resolved PVE resource pool name assigned to this VM at
 	// create/clone time. Resolved once in buildVMShapeForNode via
-	// resolvePoolName, applying the full precedence pipeline (plan §0/D-04):
+	// resolvePoolName, applying the full precedence pipeline:
 	//
 	//  1. call-level cloud_properties.pool (highest)
 	//  2. vm_type profile cloud_properties.pool
@@ -600,6 +605,11 @@ func createVM(
 	// Placement may build the VM's shape once per candidate node, so the
 	// missing-owner warning is logged here, once for the whole call.
 	warnMissingOwnerTag(deps, logger)
+	// The cluster stamp and token are settled once, ahead of placement, for
+	// the same reason.
+	if err := resolveCreateStamp(ctx, deps, parsed, logger); err != nil {
+		return nil, err
+	}
 
 	selection, err := ResolveStoragePlacementSelectors(deps.Config, "create_vm", parsed.cloudPropsMap, parsed.cloudProps.EphemeralDiskSizeMB > 0)
 	if err != nil {
@@ -964,7 +974,7 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 		}
 	}
 
-	vmCID := strconv.Itoa(vmid)
+	vmCID := directorVMCID(deps.Config, vmid, shape.initialTags)
 	return []any{vmCID, responseNetworks}, nil
 }
 
@@ -1189,7 +1199,7 @@ func createVMWithFallback(
 			}
 		}
 
-		vmCID := strconv.Itoa(winningVMID)
+		vmCID := directorVMCID(deps.Config, winningVMID, winShape.initialTags)
 		return []any{vmCID, responseNetworks}, nil
 	}
 

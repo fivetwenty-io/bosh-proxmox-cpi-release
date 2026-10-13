@@ -786,11 +786,17 @@ func attachDiskResolveNode(ctx context.Context, deps Deps, vmCID, diskCID, stabl
 	// VM it held before. A location the lookup's config probe found already
 	// carries that config, so it is judged with no second read. The slot
 	// choice judges the VM again on the config it reads before the write.
+	ownLogger := deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))
 	if found && vmNode != "" {
-		if ownErr := refuseUnownedVMByConfig(ctx, deps, "attach_disk", vmCID, parsedCID, loc,
-			deps.Log(ctx).With(log.String("vm_cid", vmCID), log.Int("vmid", vmid))); ownErr != nil {
+		if ownErr := refuseUnownedVMByConfig(ctx, deps, "attach_disk", vmCID, parsedCID, loc, ownLogger); ownErr != nil {
 			return "", 0, ownErr
 		}
+	} else if ownErr := refuseAbsentElsewhere(ctx, deps, "attach_disk", vmCID, parsedCID, ownLogger); ownErr != nil {
+		// A proven absence keeps its answer, which the attach itself gives
+		// when it cannot reach the VM. A stamped CID that names another
+		// cluster is refused before any disk moves toward a VM that is not
+		// here.
+		return "", 0, ownErr
 	}
 	if backend.Kind() == pve.BackendLocal {
 		if found && vmNode != "" && vmNode != node {

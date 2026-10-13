@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -191,7 +190,7 @@ func HandleSnapshotDisk(deps Deps) Handler {
 		// ----------------------------------------------------------------
 		// 8. Return snapshot_cid = "<vmid>:<snap_name>".
 		// ----------------------------------------------------------------
-		snapshotCID := pve.FormatSnapshotCID(strconv.Itoa(vmid), snapName)
+		snapshotCID := pve.FormatSnapshotCID(directorVMCID(deps.Config, vmid, holderTags), snapName)
 
 		deps.Log(ctx).Info("snapshot_disk",
 			log.String("disk_cid", diskCID),

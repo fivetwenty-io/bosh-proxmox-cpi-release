@@ -54,6 +54,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _vmcid  # noqa: E402
+
 
 class PVEVerifyError(RuntimeError):
     """Raised on transport, auth, or assertion failure (not on a clean absent)."""
@@ -604,7 +607,7 @@ class PVEVerifier:
         assertion built on it reports that the parker was destroyed, which is the
         most alarming way to be wrong about it.
         """
-        want = str(vmid).strip()
+        want = _vmcid.as_path_id(vmid)
         # cluster_vms already falls back to the configured node's own listing
         # when /cluster/resources cannot be read, so there is no second fallback
         # to write here -- and an empty result means an empty cluster, which is a
@@ -828,7 +831,7 @@ class PVEVerifier:
         node would 404 on a VM that is plainly there.
         """
         try:
-            wanted = int(str(vmid).strip())
+            wanted = int(_vmcid.as_path_id(vmid))
         except ValueError:
             return self._require_node()
         try:
@@ -849,7 +852,7 @@ class PVEVerifier:
         a VM to be there get a failure rather than an empty dict.
         """
         node = node or self._node_hosting(vmid)
-        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(str(vmid))}/config"
+        path = f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(_vmcid.as_path_id(vmid))}/config"
         data = self._get(path)
         if not isinstance(data, dict):
             raise PVEVerifyError(f"qemu config for vmid {vmid} is not an object")

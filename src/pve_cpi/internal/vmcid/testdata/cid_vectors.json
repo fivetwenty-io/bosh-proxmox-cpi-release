@@ -1,0 +1,43 @@
+{
+  "comment": "VM CID parser vectors shared by internal/vmcid (Go) and scripts/_vmcid.py (Python). Each valid entry gives the parsed VMID, cluster stamp, and token, with empty stamps for a bare CID.",
+  "valid": [
+    {"raw": "1", "vmid": 1, "cluster": "", "token": ""},
+    {"raw": "101", "vmid": 101, "cluster": "", "token": ""},
+    {"raw": "999999999", "vmid": 999999999, "cluster": "", "token": ""},
+    {"raw": "9223372036854775807", "vmid": 9223372036854775807, "cluster": "", "token": ""},
+    {"raw": "101-0a1b2c3d-4e5f6a7b", "vmid": 101, "cluster": "0a1b2c3d", "token": "4e5f6a7b"},
+    {"raw": "5042-ffffffff-00000000", "vmid": 5042, "cluster": "ffffffff", "token": "00000000"},
+    {"raw": "101-00000000-4e5f6a7b", "vmid": 101, "cluster": "00000000", "token": "4e5f6a7b"}
+  ],
+  "invalid": [
+    "",
+    "0",
+    "007",
+    "-1",
+    "+1",
+    " 1",
+    "1 ",
+    "1.0",
+    "1e3",
+    "abc",
+    "9223372036854775808",
+    "99999999999999999999",
+    "1-0a1b2c3d",
+    "1-0a1b2c3d-4e5f6a7b-00000000",
+    "1--4e5f6a7b",
+    "1-0a1b2c3d-",
+    "-0a1b2c3d-4e5f6a7b",
+    "0-0a1b2c3d-4e5f6a7b",
+    "01-0a1b2c3d-4e5f6a7b",
+    "1-0A1B2C3D-4e5f6a7b",
+    "1-0a1b2c3d-4E5F6A7B",
+    "1-0a1b2c3-4e5f6a7b",
+    "1-0a1b2c3d0-4e5f6a7b",
+    "1-0a1b2c3g-4e5f6a7b",
+    "1-0a1b2c3d-4e5f6a7b ",
+    "1_0a1b2c3d_4e5f6a7b",
+    "101:bosh-snap",
+    "١٢",
+    "1-٠a1b2c3d-4e5f6a7b"
+  ]
+}

@@ -11,10 +11,10 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
-type recordingAnnotator struct{ calls []int }
+type recordingAnnotator struct{ calls []string }
 
-func (r *recordingAnnotator) AnnotateNotes(_ context.Context, vmid int, _ string) error {
-	r.calls = append(r.calls, vmid)
+func (r *recordingAnnotator) AnnotateNotes(_ context.Context, vmCID string, _ string) error {
+	r.calls = append(r.calls, vmCID)
 	return nil
 }
 
