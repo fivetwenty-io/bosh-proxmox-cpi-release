@@ -321,20 +321,23 @@ certification:
   # One deployment across two clusters (optional). Left unset, the run uses the
   # single AZ named by `az` and `cpi_id` above, exactly as before. With two
   # entries, the `simple` group runs two instances across z1 and z2, each with
-  # a persistent disk, and the run adds three checks. A probe deployment proves
+  # a persistent disk, and the run adds a probe and a placement check. A probe deployment proves
   # the z2 network reaches the Director's NATS and blobstore before the real
   # deploy. After the first release deploys, and again after the upgrade and
   # recreate, the placement check reads /cluster/resources from both clusters
   # and asserts that each instance's VM and disk sit on the cluster its AZ
   # names and nowhere else, inside that entry's VMID bands and vm_prefix, with
-  # the bosh-owner-- and bosh-cluster-- tags matching the stamped CID. Finally
-  # it asserts the first release's VMs are gone from both clusters.
+  # the bosh-owner-- and bosh-cluster-- tags matching the stamped CID, and that
+  # no other VM on either cluster carries the Director's owner tag. Finally it
+  # asserts the first release's VMs are gone from both clusters.
   #
   # The first entry is the AZ the Director's base cloud config already defines,
   # so it takes only `az` and `cpi_id`. The second must be z2 and must carry
   # the subnet on its cluster, which is the AZ2 range the pve-cpi env bundle
   # reserves for z3 (see manifests/envs/pve-cpi/vars.yml). Both entries need a
-  # cpi_id, and manifests/cpi-config.yml must define both. The PVE host, VMID
+  # cpi_id, and manifests/cpi-config.yml must define both. When `az` and
+  # `cpi_id` are also set above, they must agree with the first entry, or the
+  # run stops before it starts. The PVE host, VMID
   # bands, and VM prefix come from those entries, and the credentials come from
   # the variables they already use, so no new secret enters this file.
   #

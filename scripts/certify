@@ -1598,12 +1598,16 @@ class Certify:
         if manifest is None:
             return False
 
+        if is_spanning(self.ccfg):
+            # A deploy that fails partway can leave a VM and a disk on each
+            # cluster, so teardown deletes the deployment either way.
+            self.deployed = True
         ok, _ = self._bosh(
             "cert:deploy",
             ["bosh", "-n", "-d", dep, "deploy", str(manifest)],
             timeout=DEPLOY_TIMEOUT_S,
         )
-        self.deployed = ok
+        self.deployed = ok or self.deployed
         return ok
 
     def _probe_deployment_name(self) -> str:
@@ -1724,6 +1728,8 @@ class Certify:
         target["disks"] = self._disk_serials(target)
         if is_spanning(self.ccfg):
             target["placement"] = self._placement_observation()
+            director_vm = target["director"]["vm_cid"]
+            target["placement"]["exempt_vmids"] = [_vmcid.as_path_id(director_vm)] if director_vm else []
         (self.run_dir / f"capture-{when}.json").write_text(
             json.dumps(target, indent=2, sort_keys=True) + "\n"
         )
@@ -1781,6 +1787,17 @@ class Certify:
             "clusters": clusters,
         }
 
+    def _serial_clusters(self) -> "list[tuple[str, dict]]":
+        """The clusters whose VMs _disk_serials reads, as (AZ, PVE API settings).
+
+        A run on one cluster has one entry with an empty AZ and the settings
+        the run already uses. A spanning run has one per AZ, in config order,
+        so the first is the Director's cluster.
+        """
+        if is_spanning(self.ccfg):
+            return [(entry["az"], self._pve_cfg_for(entry["az"])) for entry in self.ccfg["azs"]]
+        return [("", self._pve_cfg())]
+
     def _disk_serials(self, target: dict) -> dict:
         """Each persistent disk's stable id and the drive carrying it as serial=.
 
@@ -1788,41 +1805,80 @@ class Certify:
         VMs through the PVE API, and decodes each disk CID's bpd- stable id
         from its envelope. A read error is kept in the capture rather than
         failing it, so verify:disk-serial-stable can say what went wrong.
+
+        A spanning run reads /cluster/resources from every AZ's cluster. The
+        Director VM is looked for on the first cluster only, and a deployment
+        VM on whichever cluster lists it. Drive serials are keyed by
+        "<az>:<vmid>" there, so a location names the cluster that holds the
+        disk. A disk whose serial is on drives of more than one cluster is
+        an error and has no location, because one disk cannot sit on two.
         """
         disk_cids = list(target["director"]["disk_cids"]) + list(
             target["deployment"]["disk_cids"]
         )
-        vm_cids = [target["director"]["vm_cid"], *target["deployment"]["vm_cids"]]
+        director_cid = target["director"]["vm_cid"]
+        vm_cids = [director_cid, *target["deployment"]["vm_cids"]]
         stable_ids = {cid: _pve_verify.disk_stable_id(cid) for cid in disk_cids}
         serials: dict[str, dict[str, str]] = {}
         errors: list[str] = []
         try:
-            cfg = self._pve_cfg()
-            nodes = {
-                str(row.get("vmid")): str(row.get("node"))
-                for row in (_integration.pve_api_get(cfg, "/cluster/resources?type=vm") or [])
-                if row.get("vmid") is not None and row.get("node")
-            }
-            for vm_cid in vm_cids:
-                if not vm_cid:
-                    continue
-                # The Director holds the CID create_vm returned, which can
-                # carry a cluster stamp and token. PVE knows only the VMID.
-                vmid = _vmcid.as_path_id(vm_cid)
-                node = nodes.get(vmid)
-                if node is None:
-                    errors.append(f"VM {vm_cid} is not in /cluster/resources")
-                    continue
-                config = _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config")
-                serials[vmid] = _upgrade_checks.drive_serials(config or {})
+            clusters = self._serial_clusters()
         except (RuntimeError, OSError, KeyError) as exc:
+            clusters = []
             errors.append(f"PVE API read failed: {exc}")
+        spanning = len(clusters) > 1
+        found_on: dict[str, set[str]] = {}
+        for index, (az, cfg) in enumerate(clusters):
+            try:
+                nodes = {
+                    str(row.get("vmid")): str(row.get("node"))
+                    for row in (_integration.pve_api_get(cfg, "/cluster/resources?type=vm") or [])
+                    if row.get("vmid") is not None and row.get("node")
+                }
+                for vm_cid in vm_cids:
+                    if not vm_cid or (vm_cid == director_cid and index > 0):
+                        continue
+                    # The Director holds the CID create_vm returned, which can
+                    # carry a cluster stamp and token. PVE knows only the VMID.
+                    vmid = _vmcid.as_path_id(vm_cid)
+                    node = nodes.get(vmid)
+                    if node is None:
+                        if not spanning:
+                            errors.append(f"VM {vm_cid} is not in /cluster/resources")
+                        continue
+                    config = _integration.pve_api_get(cfg, f"/nodes/{node}/qemu/{vmid}/config")
+                    key = f"{az}:{vmid}" if spanning else vmid
+                    serials[key] = _upgrade_checks.drive_serials(config or {})
+                    for serial in serials[key].values():
+                        found_on.setdefault(serial, set()).add(az)
+            except (RuntimeError, OSError, KeyError) as exc:
+                where = f" on the {az} cluster" if spanning else ""
+                errors.append(f"PVE API read failed{where}: {exc}")
+        if spanning:
+            errors.extend(self._unplaced_serial_vms(vm_cids, serials))
+        locations = _upgrade_checks.serial_locations(stable_ids, serials)
+        for cid, sid in stable_ids.items():
+            holders = sorted(found_on.get(sid, ())) if sid else []
+            if len(holders) > 1:
+                errors.append(f"disk {cid[:24]}... carries serial={sid} on drives of more than one "
+                              f"cluster ({', '.join(holders)})")
+                locations[cid] = ""
         return {
             "stable_ids": stable_ids,
             "drive_serials": serials,
-            "locations": _upgrade_checks.serial_locations(stable_ids, serials),
+            "locations": locations,
             "errors": errors,
         }
+
+    @staticmethod
+    def _unplaced_serial_vms(vm_cids: list, serials: dict) -> list:
+        """A spanning run's VMs that no cluster listed, one error each."""
+        read = {key.split(":", 1)[1] for key in serials}
+        return [
+            f"VM {vm_cid} is not in /cluster/resources on any cluster"
+            for vm_cid in vm_cids
+            if vm_cid and _vmcid.as_path_id(vm_cid) not in read
+        ]
 
     # -- persistent-disk marker ---------------------------------------------- #
 
@@ -1867,7 +1923,29 @@ class Certify:
             return False
         self.marker_written = parsed
         self.marker_problem = ""
+        if is_spanning(self.ccfg):
+            self._record_marker_az()
         return True
+
+    def _record_marker_az(self) -> None:
+        """Say which AZ's disk the data proof covers.
+
+        The marker goes to one instance. The other AZ's disk is covered by
+        the serial and placement checks, which read every instance.
+        """
+        dep = self.ccfg["deployment_name"]
+        index = CERT_INSTANCE.split("/", 1)[1]
+        rows = _spanning.parse_instances(self._rows(self._capture_json(
+            ["bosh", "-d", dep, "instances", "--details", "--json"],
+        )))
+        az = next((r["az"] for r in rows if r["index"] == index and r["az"]), "")
+        cpi_ids = {entry["az"]: entry["cpi_id"] for entry in self.ccfg["azs"]}
+        where = (f"AZ {az} ({cpi_ids.get(az, '?')})" if az else "an AZ the instance table did not name")
+        self.rep.record(
+            "cert:write-marker-az", PASS, 0.0,
+            f"the marker is on {CERT_INSTANCE}, in {where}; the other AZ's disk is covered by "
+            "the serial and placement checks",
+        )
 
     def read_marker(self) -> bool:
         """Read the marker back after the upgrade and recreate."""
@@ -2213,6 +2291,13 @@ class Certify:
             self.rep.section("teardown")
             self.rep.skip("cert:delete-deployment", "--keep")
             self.rep.skip("director:delete-env", "--keep")
+            if self.probe_deployed:
+                self.rep.skip(
+                    "cert:delete-probe",
+                    f"--keep, but the probe deployment {self._probe_deployment_name()} is still on the "
+                    "Director because its delete failed; delete it with `bosh -d "
+                    f"{self._probe_deployment_name()} delete-deployment --force`",
+                )
             print(self.rep.color.yellow(
                 "    --keep: the upgraded Director and the certification "
                 "deployment are still running. Tear them down with "

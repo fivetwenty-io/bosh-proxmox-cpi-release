@@ -93,7 +93,7 @@ def _norm_key(key: object) -> str:
 def parse_instances(rows: list[dict]) -> list[dict]:
     """Normalise `bosh instances --details --json` rows for the placement check.
 
-    Each result carries instance, az, vm_cid, and disk_cids. The Director's
+    Each result carries instance, index, az, vm_cid, and disk_cids. The Director's
     JSON keys are lowercase with underscores, and older CLIs print the column
     titles, so both spellings are read. A row with no VM CID (an instance that
     has no VM yet) is kept with an empty vm_cid so the check can name it.
@@ -104,6 +104,7 @@ def parse_instances(rows: list[dict]) -> list[dict]:
         disks = [p.strip() for p in str(norm.get("disk_cids") or norm.get("disk_cid") or "").split(",") if p.strip()]
         out.append({
             "instance": str(norm.get("instance") or ""),
+            "index": str(norm.get("index") if norm.get("index") is not None else ""),
             "az": str(norm.get("az") or ""),
             "vm_cid": str(norm.get("vm_cid") or ""),
             "disk_cids": disks,
@@ -197,10 +198,11 @@ def cpi_entry_facts(path: Path, cpi_id: str, reader: Callable[[str], "str | None
         "disk_range": _band(pve, "disk_vmid_range_start", "disk_vmid_range_end", cpi_id),
     }
     if pve.get("port") is not None:
+        raw_port = _resolve(pve["port"], reader, f"cpi-config entry {cpi_id} pve.port")
         try:
-            facts["port"] = int(_resolve(pve["port"], reader, f"cpi-config entry {cpi_id} pve.port"))
+            facts["port"] = int(raw_port)
         except ValueError as exc:
-            raise ValueError(f"cpi-config entry {cpi_id} pve.port is not a number") from exc
+            raise ValueError(f"cpi-config entry {cpi_id} pve.port is {raw_port!r}, not a number") from exc
     if pve.get("vm_prefix") is not None:
         raw = pve["vm_prefix"]
         match = _VAR_REF.match(str(raw).strip())
@@ -274,7 +276,8 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
     obs is the observation scripts/certify gathers: director_uuid, instances
     (parse_instances rows), and clusters, keyed by AZ, each with the thinned
     /cluster/resources rows, the thinned config of every instance VM on that
-    cluster, and any read error. entries maps each AZ to its cpi-config
+    cluster, and any read error, plus exempt_vmids, the VMIDs the run owns
+    that are not instances (the Director VM). entries maps each AZ to its cpi-config
     facts (cpi_entry_facts) plus the optional bridge and storage overrides.
 
     With expect_stamped the VM CIDs must be stamped, which is what the new
@@ -300,6 +303,8 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
                         "bridge", "storage")
     }
     stamps: dict[str, set[str]] = {az: set() for az in entries}
+    unknown_stamps: list[str] = []
+    instance_vmids: set[str] = set()
     unchecked_disks = 0
     owner = owner_tag(obs.get("director_uuid", ""))
 
@@ -318,6 +323,7 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
             problems["vm-cluster"].append(f"{label} has VM CID {inst.get('vm_cid')!r} ({exc})")
             continue
         vmid = cid.path_id
+        instance_vmids.add(vmid)
 
         # Location: the VM sits on its AZ's cluster and on no other.
         if vmid not in _vmids(cluster):
@@ -340,6 +346,8 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
         # Tags: a stamped CID must match the VM's tags exactly.
         if cid.stamped:
             stamps[az].add(cid.cluster)
+            if cid.cluster == _vmcid.UNKNOWN_CLUSTER:
+                unknown_stamps.append(f"{label} VM {vmid} is stamped {cid.cluster}, the unknown cluster")
             if row is not None:
                 tags = tag_list(row.get("tags"))
                 if not owner:
@@ -390,6 +398,14 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
                 problems["disk-cluster"].append(f"{label} VM {vmid}: its config was not read, so disk {disk[:20]} is unplaced")
             elif not _disk_on_vm(disk, config):
                 problems["disk-cluster"].append(f"{label} disk {disk[:20]} is not a drive of VM {vmid} on the {az} cluster")
+            for other_az, other in sorted(clusters.items()):
+                if other_az == az:
+                    continue
+                for other_vmid, other_config in sorted((other.get("configs") or {}).items()):
+                    if _disk_on_vm(disk, other_config):
+                        problems["disk-cluster"].append(
+                            f"{label} disk {disk[:20]} is also a drive of VM {other_vmid} on the {other_az} cluster"
+                        )
             born = _disk_birth_vmid(disk)
             if born is None:
                 unchecked_disks += 1
@@ -407,6 +423,21 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
 
     ok, detail = _summary(problems["vm-cluster"], f"{len(instances)} VMs, each on its AZ's cluster and on no other")
     findings.append(Finding("placement:vm-cluster", ok, detail))
+    stray: list[str] = []
+    if owner:
+        owner_value = owner[len(OWNER_TAG_PREFIX):]
+        exempt = {str(v) for v in obs.get("exempt_vmids") or []}
+        for az, cluster in sorted(clusters.items()):
+            for row in cluster.get("resources") or []:
+                vmid = row.get("vmid", "")
+                if vmid in instance_vmids or vmid in exempt:
+                    continue
+                if owner_value in tag_values(tag_list(row.get("tags")), OWNER_TAG_PREFIX):
+                    stray.append(f"VM {vmid} on the {az} cluster carries this Director's owner tag, "
+                                 "but no instance owns it")
+    ok, detail = _summary(stray, "no VM on either cluster carries this Director's owner tag without an instance"
+                          if owner else "the Director UUID is unknown, so there is no owner tag to look for")
+    findings.append(Finding("placement:strays", ok, detail))
     ok, detail = _summary(problems["vm-band"], "every VMID sits in its entry's band")
     findings.append(Finding("placement:vm-band", ok, detail))
     if any(e.get("vm_prefix") for e in entries.values()):
@@ -418,7 +449,7 @@ def check_placement(obs: dict, entries: dict, expect_stamped: bool) -> list[Find
     findings.append(Finding("placement:tags", ok, detail))
 
     # One stamp per cluster, and a different stamp on each.
-    stamp_problems: list[str] = []
+    stamp_problems: list[str] = list(unknown_stamps)
     for az, seen in sorted(stamps.items()):
         if len(seen) > 1:
             stamp_problems.append(f"AZ {az} holds VMs with {len(seen)} cluster stamps")
@@ -491,10 +522,11 @@ def check_old_vms_gone(pre: dict, post: dict) -> Finding:
 # Reachability probe
 # --------------------------------------------------------------------------- #
 
+# Task phrases only. A bare "nats" or "blobstore" appears in unrelated CPI
+# errors, and calling those a routing gap would send the reader to the wrong place.
 _ROUTING_MARKERS = (
     "timed out pinging", "unresponsive agent", "timed out sending", "agent is not responding",
     "no route to host", "network is unreachable", "connection refused", "i/o timeout",
-    "failed to download", "unable to download", "blobstore", "nats",
 )
 
 
@@ -502,9 +534,8 @@ def classify_probe_failure(lines: list[str]) -> str:
     """Whether a failed probe deploy reads as a routing gap or as something else.
 
     The probe VM builds through the secondary entry's CPI, so a failure there
-    can be the CPI or the network. An agent that never answers, or never
-    reaches the blobstore, points at the route between the networks. Anything
-    else is the CPI's or the lab's own error.
+    can be the CPI or the network. An agent that never answers, or a
+    connection that has no route, points at the route between the networks. Anything else is the CPI's or the lab's own error.
     """
     text = "\n".join(lines).lower()
     return "routing" if any(m in text for m in _ROUTING_MARKERS) else "other"
