@@ -520,7 +520,13 @@ class FakeCluster:
         self.node = node
         self.guests: dict[int, dict] = {}
         self.created: list[int] = []
+        self.created_on: list[str] = []
         self.destroyed: list[int] = []
+        self.destroyed_by_cpi: list[int] = []
+        self.destroy_calls: list[tuple[str, int, dict]] = []
+        self.runtime: dict[int, dict] = {}
+        self.privileges: "list[str]" = []
+        self.writes_allowed = True
         self.in_use_probes = 0
         self.appear_after_probes: "tuple[int, int] | None" = None
         self.created_extra: dict = {}
@@ -547,14 +553,28 @@ class FakeCluster:
         return dict(self.guests[int(vmid)])
 
     def cluster_nodes(self) -> list[str]:
-        return [self.node, "n2"]
+        return ["n1", "n2"]
+
+    def qemu_status(self, vmid, node=None) -> dict:
+        if int(vmid) not in self.guests:
+            raise _pve_verify.PVEVerifyError(f"no VM {vmid}")
+        return dict(self.runtime.get(int(vmid), {"status": "stopped"}))
+
+    def require_writes(self) -> None:
+        if not self.writes_allowed:
+            raise _pve_verify.PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only")
+
+    def missing_vm_privileges(self) -> list[str]:
+        return list(self.privileges)
 
     def create_empty_vm(self, node: str, vmid, name: str) -> str:
         self.created.append(int(vmid))
+        self.created_on.append(node)
         self.guests[int(vmid)] = {"name": name, "digest": "h0", "memory": 16, **self.created_extra}
         return "UPID:create"
 
-    def destroy_vm(self, node: str, vmid) -> str:
+    def destroy_vm(self, node: str, vmid, **kwargs) -> str:
+        self.destroy_calls.append((node, int(vmid), kwargs))
         self.destroyed.append(int(vmid))
         self.guests.pop(int(vmid), None)
         return "UPID:destroy"
@@ -616,6 +636,9 @@ class FakeCPI:
                 return "ok", None
             return "err", _err("Bosh::Clouds::VMNotFound", f"VM not found: {cid}")
         if verdict == "owned":
+            if method == "delete_vm":
+                cluster.guests.pop(cid.vmid, None)
+                cluster.destroyed_by_cpi.append(cid.vmid)
             return "ok", (True if method == "has_vm" else None)
         if verdict == "gone":
             if method == "has_vm":
@@ -682,7 +705,7 @@ class ForeignPassCase(unittest.TestCase):
         kwargs = dict(
             vm_cid=cid or self.cid, az2_context=self.az2_context, guard=self.guard, az1=self.az1, az2=self.az2,
             call=self.cpi.call, call_error=self.cpi.call_error, step=self.steps.append, say=self.said.append,
-            token_source=lambda: next(self.tokens),
+            token_source=lambda: next(self.tokens), sleep=lambda _s: None,
         )
         kwargs.update(overrides)
         return foreign.ForeignVMPass(**kwargs)
@@ -712,13 +735,43 @@ class TestForeignPassStamped(ForeignPassCase):
         self.assertTrue(wrong.startswith(f"{VMID}-{AZ1_STAMP}-"))
         self.assertEqual(sent[1][1], wrong)
 
-    def test_the_absent_step_sends_the_stamped_cid_then_a_bare_twin_to_az2(self) -> None:
+    def test_the_absent_step_sends_the_stamped_cid_then_only_has_vm_for_the_bare_twin(self) -> None:
         self.make().absent_vmid(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
         self.assertEqual(
             [(m, a) for m, a, where in self.cpi.calls if where == "az2"],
-            [("has_vm", [CID]), ("delete_vm", [CID]), ("has_vm", [str(VMID)]), ("delete_vm", [str(VMID)])],
+            [("has_vm", [CID]), ("delete_vm", [CID]), ("has_vm", [str(VMID)])],
         )
         self.assertEqual(self.az2.created, [])
+
+    def test_no_bare_delete_vm_ever_reaches_az2_in_a_whole_run(self) -> None:
+        self.make().run()
+        for method, args, where in self.cpi.calls:
+            if method == "delete_vm" and where == "az2":
+                self.assertTrue(_vmcid.parse(args[0]).stamped, f"a bare delete_vm reached az2: {args}")
+
+    def test_a_vm_that_takes_the_vmid_right_after_the_proof_is_never_sent_a_delete(self) -> None:
+        # The az2 Director creates a VM in the window after the last absence
+        # proof and before the CPI reads the cluster. The twin must not hand it
+        # a delete_vm it could resolve to that VM.
+        original = self.cpi._answer
+
+        def racing(method, args, context):
+            outcome = original(method, args, context)
+            if method == "has_vm" and args[0] == str(VMID):
+                # has_vm has just answered false, and the az2 Director's VM lands now.
+                self.az2.guests[VMID] = {"name": "the-az2-directors-vm", "digest": "z", "tags": "bosh-cpi"}
+            return outcome
+
+        self.cpi._answer = racing  # type: ignore[method-assign]
+        self.make().absent_vmid(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+        self.assertEqual(self.az2.destroyed_by_cpi, [])
+        self.assertEqual(self.az2.destroyed, [])
+        self.assertIn(VMID, self.az2.guests)
+        self.assertNotIn(("delete_vm", [str(VMID)], "az2"), self.cpi.calls)
+
+    def test_the_hand_made_vm_is_destroyed_without_its_unreferenced_disks(self) -> None:
+        self.make().run()
+        self.assertEqual(self.az2.destroy_calls, [("n1", VMID, {"destroy_unreferenced_disks": False})])
 
     def test_the_collision_step_asserts_every_refusal(self) -> None:
         self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
@@ -921,7 +974,7 @@ class TestCollisionStepFailures(ForeignPassCase):
         self.assertEqual(self.cpi.calls, [])
 
     def test_a_removal_that_does_not_take_is_reported(self) -> None:
-        self.az2.destroy_vm = lambda node, vmid: "UPID:noop"  # type: ignore[method-assign]
+        self.az2.destroy_vm = lambda node, vmid, **kw: "UPID:noop"  # type: ignore[method-assign]
         with self.assertRaisesRegex(RuntimeError, "still on az2"):
             self._collide()
 
@@ -939,6 +992,14 @@ class TestCollisionStepFailures(ForeignPassCase):
         self.az2.node = ""
         self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
         self.assertEqual(self.az2.destroyed, [VMID])
+        self.assertEqual(self.az2.created_on, ["n1"])
+        self.assertEqual(self.az2.destroy_calls[0][0], "n1")
+
+    def test_a_set_node_is_the_node_the_vm_is_made_and_destroyed_on(self) -> None:
+        self.az2.node = "pve9"
+        self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+        self.assertEqual(self.az2.created_on, ["pve9"])
+        self.assertEqual(self.az2.destroy_calls[0][0], "pve9")
 
 
 class TestTokenMismatchStep(ForeignPassCase):
@@ -1015,6 +1076,342 @@ class TestForeignPassUnknownStamp(ForeignPassCase):
         self.assertEqual(self.az2.destroyed, [VMID])
         # The token step still runs: the VM carries a cluster tag, so the wrong token is judged on a proven cluster.
         self.assertEqual(self.methods("az1"), ["has_vm", "delete_vm"])
+
+
+# ---------------------------------------------------------------------------
+# Secrets, preflight, and the link to the handlers' text
+# ---------------------------------------------------------------------------
+
+SECRET_CONTEXT = {
+    "director_uuid": "d-2",
+    "pve": {
+        "host": "pve2.example", "user": "svc@pve", "password": "hunter2", "api_token": "svc!t=sekrit",
+        "ca_cert": "-----BEGIN CERTIFICATE-----", "vm_prefix": "az2",
+    },
+    "agent": {"mbus": "https://user:mbus-pass@10.0.0.6:6868", "ntp": ["pool.ntp.org"]},
+    "pve_password": "flat-secret", "pve_api_token": "flat-token", "pve_agent_mbus": "nats://u:p@h",
+}
+
+
+class TestRedactRequest(unittest.TestCase):
+    def test_masks_every_secret_in_the_context_and_leaves_the_rest(self) -> None:
+        req = foreign.build_request("info", ["a"], "rid", SECRET_CONTEXT)
+        text = json.dumps(foreign.redact_request(req))
+        for secret in ("hunter2", "sekrit", "mbus-pass", "flat-secret", "flat-token", "BEGIN CERTIFICATE", "nats://u:p@h"):
+            self.assertNotIn(secret, text)
+        shown = foreign.redact_request(req)
+        self.assertEqual(shown["context"]["pve"]["host"], "pve2.example")
+        self.assertEqual(shown["context"]["pve"]["user"], "svc@pve")
+        self.assertEqual(shown["context"]["pve"]["vm_prefix"], "az2")
+        self.assertEqual(shown["context"]["agent"]["ntp"], ["pool.ntp.org"])
+        self.assertEqual(shown["context"]["director_uuid"], "d-2")
+        self.assertEqual(shown["context"]["request_id"], "rid")
+        self.assertEqual(shown["arguments"], ["a"])
+        self.assertEqual(shown["method"], "info")
+
+    def test_the_request_that_is_sent_is_not_changed(self) -> None:
+        req = foreign.build_request("info", [], "rid", SECRET_CONTEXT)
+        foreign.redact_request(req)
+        self.assertEqual(req["context"]["pve"]["password"], "hunter2")
+
+    def test_a_default_request_prints_as_it_always_did(self) -> None:
+        req = foreign.build_request("info", [], "rid")
+        self.assertEqual(json.dumps(foreign.redact_request(req)), json.dumps(req))
+
+
+class TestLifecycleTrace(LifecycleScriptCase):
+    def test_trace_prints_no_context_secret_and_the_cpi_still_receives_it(self) -> None:
+        path = self.write_json("az1.json", SECRET_CONTEXT)
+        lifecycle = self.load(CPI_CONTEXT_FILE=path, TRACE="1")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            lifecycle.call("info", [])
+        printed = stderr.getvalue()
+        self.assertIn("->", printed)
+        for secret in ("hunter2", "sekrit", "mbus-pass", "flat-secret"):
+            self.assertNotIn(secret, printed)
+        (sent,) = self.sent()
+        self.assertEqual(sent["context"]["pve"]["api_token"], "svc!t=sekrit")
+        self.assertEqual(sent["context"]["agent"]["mbus"], "https://user:mbus-pass@10.0.0.6:6868")
+
+
+class TestPreflight(unittest.TestCase):
+    def setUp(self) -> None:
+        self.az2 = FakeCluster("az2", AZ2_STAMP)
+        self.said: list[str] = []
+
+    def test_passes_when_the_credentials_can_write(self) -> None:
+        foreign.preflight(self.az2, self.said.append)
+        self.assertEqual(self.said, [])
+
+    def test_a_transport_that_cannot_write_stops_the_run(self) -> None:
+        self.az2.writes_allowed = False
+        with self.assertRaisesRegex(_pve_verify.PVEVerifyError, "inspects only"):
+            foreign.preflight(self.az2, self.said.append)
+
+    def test_missing_privileges_are_named(self) -> None:
+        self.az2.privileges = ["VM.Allocate"]
+        with self.assertRaisesRegex(RuntimeError, "lack VM.Allocate on /vms"):
+            foreign.preflight(self.az2, self.said.append)
+
+    def test_an_unreadable_permission_listing_warns_and_continues(self) -> None:
+        def broken() -> list:
+            raise _pve_verify.PVEVerifyError("GET /access/permissions failed: HTTP 403")
+
+        self.az2.missing_vm_privileges = broken  # type: ignore[method-assign]
+        foreign.preflight(self.az2, self.said.append)
+        self.assertTrue(any("could not read" in line for line in self.said))
+
+
+class TestPassMatchesTheHandlers(unittest.TestCase):
+    """The text the pass asserts must still appear in the Go source that produces it."""
+
+    ROOT = SCRIPTS_DIR.parent / "src" / "pve_cpi" / "internal"
+
+    def _source(self, *parts: str) -> str:
+        path = self.ROOT.joinpath(*parts)
+        self.assertTrue(path.is_file(), f"{path} is missing, so the asserted answers cannot be checked against it")
+        return path.read_text(encoding="utf-8")
+
+    def test_refusal_text(self) -> None:
+        source = self._source("cpi", "handlers", "vm_ownership.go")
+        for fragment in (
+            "%s: refusing to answer for CID %s, because VM %d does not exist on this cluster",
+            "and the CID names another ",
+            "cluster (%s)",
+            "%s: refusing to act on VM %d for CID %s, which this Director does not own (%s)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, source)
+
+    def test_reasons(self) -> None:
+        source = self._source("cpi", "handlers", "vm_ownership.go")
+        for reason in ("cluster-mismatch", "token-missing", "not-bosh", "token-mismatch"):
+            with self.subTest(reason=reason):
+                self.assertIn(f'= "{reason}"', source)
+
+    def test_vm_not_found(self) -> None:
+        source = self._source("errors", "errors.go")
+        self.assertIn('fmt.Sprintf("VM not found: %s", vmCID)', source)
+        self.assertIn('TypeVMNotFound Type = "Bosh::Clouds::VMNotFound"', source)
+        self.assertIn('TypeCloud', source)
+
+    def test_the_pass_asserts_the_same_words(self) -> None:
+        pass_source = (SCRIPTS_DIR / "_lifecycle_foreign.py").read_text(encoding="utf-8")
+        for fragment in (
+            "refusing to answer for CID", "does not exist on this cluster", "(cluster-mismatch)",
+            "refusing to act on VM", "does not own (",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, pass_source)
+
+
+class TestRuntimeStateOfTheHandMadeVM(ForeignPassCase):
+    def _collide(self) -> None:
+        self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+
+    def test_a_vm_that_comes_up_running_is_refused(self) -> None:
+        self.az2.runtime[VMID] = {"status": "running"}
+        # created_extra cannot set runtime, so make the create land it
+        original = self.az2.create_empty_vm
+
+        def create(node, vmid, name):
+            upid = original(node, vmid, name)
+            self.az2.runtime[int(vmid)] = {"status": "running"}
+            return upid
+
+        self.az2.create_empty_vm = create  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "came up 'running'"):
+            self._collide()
+
+    def test_a_started_vm_fails_the_step_and_is_left_in_place(self) -> None:
+        original = self.cpi._answer
+
+        def starting(method, args, context):
+            if method == "reboot_vm":
+                self.az2.runtime[VMID] = {"status": "running"}
+            return original(method, args, context)
+
+        self.cpi._answer = starting  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "changed after reboot_vm .*status and lock"):
+            self._collide()
+        self.assertEqual(self.az2.destroyed, [])
+        self.assertIn(VMID, self.az2.guests)
+
+    def test_a_lock_fails_the_step(self) -> None:
+        original = self.cpi._answer
+
+        def locking(method, args, context):
+            if method == "delete_vm":
+                self.az2.runtime[VMID] = {"status": "stopped", "lock": "backup"}
+            return original(method, args, context)
+
+        self.cpi._answer = locking  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "status and lock"):
+            self._collide()
+        self.assertEqual(self.az2.destroyed, [])
+
+    def test_a_change_between_the_last_check_and_the_removal_is_not_destroyed(self) -> None:
+        original = self.az2.vmid_in_use
+        seen = {"n": 0}
+
+        def in_use(vmid):
+            seen["n"] += 1
+            return original(vmid)
+
+        self.az2.vmid_in_use = in_use  # type: ignore[method-assign]
+        handmade = self.make()
+        handmade._create_handmade(VMID)
+        self.az2.runtime[VMID] = {"status": "running"}
+        with self.assertRaisesRegex(RuntimeError, "leaving it in place"):
+            handmade._remove_handmade()
+        self.assertEqual(self.az2.destroyed, [])
+
+
+class TestSlowCreate(ForeignPassCase):
+    def _slow_create(self) -> "list[float]":
+        sleeps: list[float] = []
+        original = self.az2.create_empty_vm
+        self.landed_after: "int | None" = None
+
+        def create(node, vmid, name):
+            upid = original(node, vmid, name)
+            late = self.az2.guests.pop(int(vmid))
+            self.late = late
+            return upid
+
+        self.az2.create_empty_vm = create  # type: ignore[method-assign]
+
+        def await_task(node, upid, timeout=120.0, poll=1.0):
+            raise _pve_verify.PVEVerifyError(f"task {upid} still running after {timeout:g}s")
+
+        self.az2.await_task = await_task  # type: ignore[method-assign]
+        self.sleeps = sleeps
+        return sleeps
+
+    def test_a_create_task_that_times_out_names_the_vm_in_the_failure(self) -> None:
+        self._slow_create()
+        with self.assertRaisesRegex(RuntimeError, "lifecycle-handmade-4321 on az2 node n1 did not finish.*removed by hand"):
+            self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+
+    def test_a_vm_that_lands_after_the_wait_is_found_and_removed(self) -> None:
+        self._slow_create()
+        probes = {"n": 0}
+        original = self.az2.vmid_in_use
+
+        def in_use(vmid):
+            probes["n"] += 1
+            if probes["n"] == 4:  # the free proof, then the cleanup's first, second, and third look
+                self.az2.guests[VMID] = dict(self.late)
+            return original(vmid)
+
+        self.az2.vmid_in_use = in_use  # type: ignore[method-assign]
+        # The await_task stub still raises while the cleanup destroys, so let the destroy task pass.
+        passes = {"fail": True}
+
+        def await_task(node, upid, timeout=120.0, poll=1.0):
+            if passes["fail"] and upid == "UPID:create":
+                raise _pve_verify.PVEVerifyError("still running")
+
+        self.az2.await_task = await_task  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "did not finish"):
+            self.make(sleep=self.sleeps.append).collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+        self.assertEqual(self.az2.destroyed, [VMID])
+        self.assertTrue(self.sleeps)
+
+    def test_a_vm_that_never_lands_is_reported_after_a_bounded_wait(self) -> None:
+        self._slow_create()
+        with self.assertRaisesRegex(RuntimeError, "did not finish"):
+            self.make(sleep=self.sleeps.append, settle_attempts=3, settle_poll=0.5).collision(
+                _vmcid.parse(CID), dict(self.az1.guests[VMID])
+            )
+        self.assertEqual(self.sleeps, [0.5, 0.5, 0.5])
+        self.assertTrue(any("did not appear" in line and "lifecycle-handmade-4321" in line for line in self.said))
+        self.assertEqual(self.az2.destroyed, [])
+
+
+class TestSurvivingMutants(ForeignPassCase):
+    def _az1_touch_on(self, method: str, cluster: str, absent_cid: bool = False) -> None:
+        original = self.cpi._answer
+
+        def touching(m, args, context):
+            if m == method and self.cpi._cluster(context).label == cluster:
+                self.az1.guests[VMID]["tags"] += ";bosh-deleting"
+            return original(m, args, context)
+
+        self.cpi._answer = touching  # type: ignore[method-assign]
+
+    def test_an_az1_change_during_the_bare_twin_fails_the_absent_step(self) -> None:
+        original = self.cpi._answer
+
+        def touching(m, args, context):
+            if m == "has_vm" and args[0] == str(VMID):
+                self.az1.guests[VMID]["tags"] += ";bosh-deleting"
+            return original(m, args, context)
+
+        self.cpi._answer = touching  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "changed after the bare CID reached az2"):
+            self.make().absent_vmid(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+
+    def test_an_az1_change_during_the_collision_step_fails_it(self) -> None:
+        self._az1_touch_on("reboot_vm", "az2")
+        with self.assertRaisesRegex(RuntimeError, "changed after the collision step"):
+            self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+        self.assertEqual(self.az2.guests, {})
+
+    def test_get_disks_under_warn_must_answer_a_list(self) -> None:
+        self.cpi.guard = "warn"
+        self.cpi.overrides[("get_disks", "az2")] = ("ok", None)
+        with self.assertRaisesRegex(RuntimeError, "get_disks answered None under warn, want a list"):
+            self.make(guard="warn").collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+
+    def test_a_create_that_died_before_a_snapshot_leaves_a_vm_with_another_name_alone(self) -> None:
+        def dying(node, vmid, name):
+            self.az2.guests[int(vmid)] = {"name": "an-operators-vm", "digest": "x"}
+            raise _pve_verify.PVEVerifyError("POST failed")
+
+        self.az2.create_empty_vm = dying  # type: ignore[method-assign]
+        with self.assertRaisesRegex(_pve_verify.PVEVerifyError, "POST failed"):
+            self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+        self.assertEqual(self.az2.destroyed, [])
+        self.assertEqual(self.az2.guests[VMID]["name"], "an-operators-vm")
+        self.assertTrue(any("WARNING: could not remove" in line for line in self.said))
+
+    def test_the_unknown_stamp_accepts_only_cluster_mismatch(self) -> None:
+        pass_ = self.make(cid=f"{VMID}-00000000-{TOKEN}")
+        self.az1.guests[VMID]["tags"] = f"bosh-cpi;bosh-cluster--{AZ1_STAMP};bosh-cid--{TOKEN}"
+        original = self.cpi._answer
+
+        def token_missing(m, args, context):
+            outcome = original(m, args, context)
+            if outcome[0] == "err" and "(cluster-mismatch)" in outcome[1]["message"] and m in ("delete_vm", "reboot_vm"):
+                outcome = ("err", dict(outcome[1], message=outcome[1]["message"].replace("(cluster-mismatch)", "(token-missing)")))
+            return outcome
+
+        self.cpi._answer = token_missing  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, r"names none of \['does not own \(cluster-mismatch\)'\]"):
+            pass_.collision(_vmcid.parse(f"{VMID}-00000000-{TOKEN}"), dict(self.az1.guests[VMID]))
+
+    def test_the_known_stamp_accepts_token_missing_as_well(self) -> None:
+        original = self.cpi._answer
+
+        def token_missing(m, args, context):
+            outcome = original(m, args, context)
+            if outcome[0] == "err" and "does not own (cluster-mismatch)" in outcome[1]["message"]:
+                outcome = ("err", dict(outcome[1], message=outcome[1]["message"].replace("(cluster-mismatch)", "(token-missing)")))
+            return outcome
+
+        self.cpi._answer = token_missing  # type: ignore[method-assign]
+        self.make().collision(_vmcid.parse(CID), dict(self.az1.guests[VMID]))
+
+    def test_removing_the_identity_check_alone_would_be_caught_by_the_name(self) -> None:
+        handmade = self.make()
+        handmade._handmade = {"node": "n1", "vmid": VMID, "name": "lifecycle-handmade-4321", "snapshot": None,
+                              "unconfirmed": False}
+        self.az2.guests[VMID] = {"name": "someone-elses", "digest": "x"}
+        with self.assertRaisesRegex(RuntimeError, "not the .*lifecycle-handmade-4321.* this run made"):
+            handmade._remove_handmade()
+        self.assertEqual(self.az2.destroyed, [])
 
 
 if __name__ == "__main__":

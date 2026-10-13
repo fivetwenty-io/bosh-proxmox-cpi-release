@@ -2005,15 +2005,59 @@ class TestThrowawayVMWrites(unittest.TestCase):
             v._get("/nodes")
         self.assertIsNone(self._requests(urlopen)[1].get_header("Csrfpreventiontoken"))
 
-    def test_destroy_vm_deletes_with_purge(self) -> None:
+    def test_destroy_vm_deletes_with_purge_and_never_takes_unreferenced_disks_by_default(self) -> None:
         v = PVEVerifier(_token_config())
         with unittest.mock.patch("urllib.request.urlopen",
                                  return_value=_make_response({"data": "UPID:pve1:3"})) as urlopen:
             self.assertEqual(v.destroy_vm("pve1", "4321"), "UPID:pve1:3")
         (req,) = self._requests(urlopen)
         self.assertEqual(req.get_method(), "DELETE")
-        self.assertTrue(req.full_url.endswith("/nodes/pve1/qemu/4321?purge=1&destroy-unreferenced-disks=1"))
+        self.assertTrue(req.full_url.endswith("/nodes/pve1/qemu/4321?purge=1&destroy-unreferenced-disks=0"))
         self.assertIsNone(req.data)
+
+    def test_destroy_vm_sends_the_unreferenced_disks_flag_only_when_asked(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 return_value=_make_response({"data": "UPID:pve1:3"})) as urlopen:
+            v.destroy_vm("pve1", "4321", destroy_unreferenced_disks=False)
+            v.destroy_vm("pve1", "4321", destroy_unreferenced_disks=True)
+        off, on = self._requests(urlopen)
+        self.assertTrue(off.full_url.endswith("destroy-unreferenced-disks=0"))
+        self.assertTrue(on.full_url.endswith("destroy-unreferenced-disks=1"))
+
+    def test_qemu_status_reads_the_current_status_path(self) -> None:
+        v = PVEVerifier(_token_config())
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 return_value=_make_response({"data": {"status": "stopped"}})) as urlopen:
+            self.assertEqual(v.qemu_status(4321, node="pve1"), {"status": "stopped"})
+        (req,) = self._requests(urlopen)
+        self.assertTrue(req.full_url.endswith("/nodes/pve1/qemu/4321/status/current"))
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": []})):
+            with self.assertRaises(PVEVerifyError):
+                v.qemu_status(4321, node="pve1")
+
+    def test_missing_vm_privileges_names_what_the_credentials_lack(self) -> None:
+        v = PVEVerifier(_token_config())
+        granted = {"data": {"/vms": {"VM.Audit": 1}}}
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(granted)) as urlopen:
+            self.assertEqual(v.missing_vm_privileges(), ["VM.Allocate"])
+        (req,) = self._requests(urlopen)
+        self.assertIn("/access/permissions?path=%2Fvms", req.full_url)
+        full = {"data": {"/vms": {"VM.Audit": 1, "VM.Allocate": 1}}}
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response(full)):
+            self.assertEqual(v.missing_vm_privileges(), [])
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": {}})):
+            self.assertEqual(v.missing_vm_privileges(), ["VM.Audit", "VM.Allocate"])
+        with unittest.mock.patch("urllib.request.urlopen", return_value=_make_response({"data": []})):
+            with self.assertRaises(PVEVerifyError):
+                v.missing_vm_privileges()
+
+    def test_require_writes_refuses_the_pmx_transport(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"PVE_VERIFY_TRANSPORT": "pmx"}):
+            v = PVEVerifier(_token_config())
+        with self.assertRaisesRegex(PVEVerifyError, "writes need the urllib transport"):
+            v.require_writes()
+        PVEVerifier(_token_config()).require_writes()
 
     def test_writes_refuse_a_missing_node_and_an_empty_task(self) -> None:
         v = PVEVerifier(_token_config())

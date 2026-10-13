@@ -86,13 +86,20 @@ Repoint and absent-VMID scenarios (exercises the stamped VM CID end to end):
                      Step 14a sends its CID to the FOREIGN_CONTEXT_FILE cluster (az2),
                      where its VMID does not exist, and asserts delete_vm refuses a
                      stamped CID, has_vm answers false, and the az1 VM is untouched;
-                     a bare-CID twin asserts today's answers. Step 14b makes a
-                     hand-made, untagged VM on az2 at the same VMID, asserts the
-                     refusals the answers table in docs/multi-cluster.md gives, checks
-                     the VM is unchanged, and removes it. Step 14c sends the CID's
-                     cluster with a wrong token and asserts VMNotFound. The pass
-                     never sends a VMID to a cluster before proving that no guest
-                     it did not create holds it there.
+                     a bare-CID twin asserts only has_vm (false), because a bare
+                     delete_vm could destroy a VM that took the VMID after the check.
+                     Step 14b makes a hand-made, untagged VM on az2 at the same VMID,
+                     asserts the refusals the handlers give (see docs/limitations.md and
+                     vm_ownership.go) for has_vm, get_disks, delete_vm, reboot_vm, and
+                     set_vm_metadata, checks the VM's config, power state, and lock are
+                     unchanged, and removes it without touching any volume. The disk
+                     methods (attach_disk, detach_disk, snapshot_disk, delete_snapshot,
+                     create_disk) need a disk on az2, so the spanning certification and
+                     the Go handler tests cover them. Step 14c sends the CID's cluster
+                     with a wrong token and asserts VMNotFound. The pass never sends a
+                     VMID to a cluster before proving that no guest it did not create
+                     holds it there. TRACE masks passwords, tokens, CA certificates, and
+                     mbus URLs from the context files.
     FOREIGN_CONTEXT_FILE  path to the az2 context file (required when
                      FOREIGN_VM_TEST=on). Its pve map must name a different
                      endpoint than the az1 context, with that cluster's
@@ -605,7 +612,7 @@ def _send(
         method, args, req_id, DEFAULT_CONTEXT if context is None else context
     )
     if TRACE:
-        print(f"  -> {json.dumps(req)}", file=sys.stderr)
+        print(f"  -> {json.dumps(_lifecycle_foreign.redact_request(req))}", file=sys.stderr)
 
     proc = subprocess.run(
         [CPI_BIN, "--config", config_path or CPI_CONFIG],
@@ -1590,6 +1597,7 @@ def main() -> int:
             foreign_verifier = _pve_verify.PVEVerifier(
                 _lifecycle_foreign.verifier_config(_base_cfg, FOREIGN_CONTEXT)
             )
+            _lifecycle_foreign.preflight(foreign_verifier)
         placement = None
         if MULTI_STORAGE_PLACEMENT_TEST == "on":
             placement = PlacementVerification(CPI_CONFIG, CPI_BIN, env("STORAGE_PLACEMENT_REPORT", "tmp/storage-placement-lifecycle.json"))

@@ -18,10 +18,19 @@ it does after an operator repoints an availability zone:
   token mismatch the CID has the right cluster and a wrong token
 
 The expected answers come from the handlers (vm_ownership.go, has_vm.go,
-delete_vm.go, get_disks.go) and from the answers table in docs/multi-cluster.md.
-The pass never acts on a VMID it did not create: the VM it hands to the CPI as
-the "foreign" guest is one it made itself, and it proves a VMID absent before
-it sends anything that could destroy it.
+delete_vm.go, get_disks.go, reboot_vm.go, set_vm_metadata.go) and are described
+in docs/limitations.md. The pass covers has_vm, get_disks, delete_vm,
+reboot_vm, and set_vm_metadata. It leaves attach_disk, detach_disk,
+snapshot_disk, delete_snapshot, and create_disk to the spanning certification
+and the Go handler tests, because each needs a disk on the second cluster.
+
+The pass never acts on a VMID it did not create. The VM it hands to the CPI as
+the "foreign" guest is one it made itself. No real delete_vm for a VMID the
+pass did not make ever reaches the second cluster, because a CPI delete for a
+bare VMID destroys any VM its Director owns, and a guest could take the VMID
+between any check and the call. The stamped delete_vm calls are safe, since a
+stamped CID for another cluster or token is refused, and the bare CID gets only
+the read-only has_vm.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from __future__ import annotations
 import copy
 import json
 import secrets
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,6 +88,38 @@ def load_context_file(path: "str | Path", label: str) -> dict[str, Any]:
         if key in raw and not isinstance(raw[key], dict):
             raise ContextFileError(f"{label} {p}: {key} must be an object, got {type(raw[key]).__name__}")
     return raw
+
+
+_SECRET_KEY_FRAGMENTS = ("password", "token", "secret", "mbus", "ca_cert")
+REDACTED = "***"
+
+
+def redact_request(req: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of req that is safe to print, with the context's secrets masked.
+
+    A context file holds what a Director merges in from a cpi_config entry,
+    which includes pve.password, pve.api_token, the CA certificate, and the
+    agent's mbus URL, whose userinfo is a password. Any key in the context, at
+    any depth, whose name contains password, token, secret, mbus, or ca_cert
+    has its value replaced. Arguments and the rest of the request are left
+    alone, as tracing has always printed them.
+    """
+
+    def mask(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: REDACTED if any(f in str(key).lower() for f in _SECRET_KEY_FRAGMENTS) else mask(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [mask(item) for item in value]
+        return value
+
+    out = dict(req)
+    context = req.get("context")
+    if isinstance(context, dict):
+        out["context"] = mask(context)
+    return out
 
 
 def build_request(
@@ -233,6 +275,28 @@ def config_differences(before: dict[str, Any], after: dict[str, Any]) -> list[st
     return sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
 
 
+def preflight(az2: Any, say: Callable[[str], None] = print) -> None:
+    """Fail before anything runs if the pass cannot make and remove a VM on az2.
+
+    It needs the urllib transport, because the pmx transport only inspects, and
+    credentials that hold VM.Allocate on /vms. A permissions read that fails is
+    reported and does not stop the run, since PVE versions differ in what that
+    endpoint allows, and the create in step 14b still fails loudly if the token
+    cannot write.
+    """
+    az2.require_writes()
+    try:
+        missing = az2.missing_vm_privileges()
+    except Exception as exc:
+        say(f"note: could not read the az2 credentials' privileges ({exc}); step 14b will find out when it writes")
+        return
+    if missing:
+        raise RuntimeError(
+            f"the FOREIGN_CONTEXT_FILE credentials lack {', '.join(missing)} on /vms, "
+            "so step 14b could not make and remove its hand-made VM on az2"
+        )
+
+
 # ---------------------------------------------------------------------------
 # The foreign VM pass
 # ---------------------------------------------------------------------------
@@ -264,6 +328,9 @@ class ForeignVMPass:
         step: Callable[[str], None],
         say: Callable[[str], None] = print,
         token_source: Callable[[], str] = lambda: secrets.token_hex(4),
+        sleep: Callable[[float], None] = time.sleep,
+        settle_attempts: int = 15,
+        settle_poll: float = 2.0,
     ) -> None:
         if guard not in (GUARD_ENFORCE, GUARD_WARN):
             raise ValueError(f"guard must be enforce or warn, got {guard!r}")
@@ -277,6 +344,9 @@ class ForeignVMPass:
         self._step = step
         self._say = say
         self._token_source = token_source
+        self._sleep = sleep
+        self._settle_attempts = settle_attempts
+        self._settle_poll = settle_poll
         self._handmade: "dict[str, Any] | None" = None
 
     # -- entry point ---------------------------------------------------------
@@ -297,9 +367,9 @@ class ForeignVMPass:
         A stamped CID naming another cluster is refused by delete_vm and
         answered false by has_vm, because the VM may still run on the cluster
         the stamp names. A bare CID and the all-zero stamp name no cluster, so
-        they get today's answers: false from has_vm and success from
-        delete_vm, which is why the bare twin runs only after the VMID is
-        proven absent.
+        has_vm still answers false for them. Their delete_vm answer, success,
+        is not asserted here, because a delete that could reach a guest this
+        run did not make is never sent.
         """
         self._step("14a. absent VMID after a repoint (the az1 CID reaches az2, where its VMID does not exist)")
         self._require_free_vmid(cid.vmid, "the absent-VMID step")
@@ -326,16 +396,16 @@ class ForeignVMPass:
                 "so it cannot name a cluster the CPI could tell apart"
             )
 
+        # The bare twin sends only has_vm. A bare delete_vm would answer success
+        # for an absent VMID and destroy a VM its Director owns if one took the
+        # VMID after the check, so it never leaves this harness. The handler
+        # tests pin that answer, where no live VM can race it.
         bare = cid.path_id
-        # The twin deletes by bare VMID, which the CPI answers with success when
-        # the VMID is absent and with a destroy when it is not. Prove the
-        # absence again right before it, so nothing created in the meantime is hit.
         self._require_free_vmid(cid.vmid, "the bare-CID twin")
         has = self._call("has_vm", [bare], self.az2_context)
         if has is not False:
             raise RuntimeError(f"has_vm answered {has!r} for bare CID {bare} on az2, want false")
-        self._call("delete_vm", [bare], self.az2_context)
-        self._say("    bare CID answered as before: has_vm false, delete_vm success")
+        self._say("    bare CID answered as before by has_vm (false); no bare delete_vm is sent to a live cluster")
         self._assert_az1_untouched(cid, before, "after the bare CID reached az2")
 
     def collision(self, cid: _vmcid.VMCID, before: dict[str, Any]) -> None:
@@ -443,15 +513,37 @@ class ForeignVMPass:
         name = f"lifecycle-handmade-{vmid}"
         # Recorded before the create returns, so a create that dies midway is
         # still looked for. _remove_handmade checks the name before it destroys.
-        self._handmade = {"node": node, "vmid": vmid, "name": name, "snapshot": None}
+        # The create is unconfirmed until its task has finished, because a task
+        # that outlives the wait can still land the VM afterwards.
+        self._handmade = {"node": node, "vmid": vmid, "name": name, "snapshot": None, "unconfirmed": True}
         upid = self.az2.create_empty_vm(node, vmid, name)
-        self.az2.await_task(node, upid)
+        try:
+            self.az2.await_task(node, upid)
+        except Exception as exc:
+            raise RuntimeError(
+                f"the task that creates hand-made VM {name} on az2 node {node} did not finish cleanly ({exc}); "
+                f"if a VM named {name} appears there, it is this run's and can be removed by hand"
+            ) from exc
+        self._handmade["unconfirmed"] = False
         config = self.az2.qemu_config(vmid, node=node)
         self._require_handmade_identity(config)
         if str(config.get("tags", "") or "").strip():
             raise RuntimeError(f"the hand-made VM {vmid} came up with tags {config.get('tags')!r}, want none")
+        state = self._runtime_state()
+        if state["status"] != "stopped" or state["lock"]:
+            raise RuntimeError(
+                f"the hand-made VM {vmid} came up {state['status']!r} with lock {state['lock']!r}, "
+                "want stopped with no lock"
+            )
         self._handmade["snapshot"] = config
+        self._handmade["state"] = state
         self._say(f"    made hand-made VM {vmid} ({name}) on az2 node {node}")
+
+    def _runtime_state(self) -> dict[str, str]:
+        """The hand-made VM's power state and lock, which its config does not show."""
+        assert self._handmade is not None
+        status = self.az2.qemu_status(self._handmade["vmid"], node=self._handmade["node"])
+        return {"status": str(status.get("status", "") or ""), "lock": str(status.get("lock", "") or "")}
 
     def _require_handmade_identity(self, config: dict[str, Any]) -> None:
         assert self._handmade is not None
@@ -470,6 +562,12 @@ class ForeignVMPass:
             raise RuntimeError(
                 f"the hand-made VM {self._handmade['vmid']} changed {when} (config keys {differing})"
             )
+        state = self._runtime_state()
+        if state != self._handmade["state"]:
+            raise RuntimeError(
+                f"the hand-made VM {self._handmade['vmid']} changed {when} "
+                f"(status and lock were {self._handmade['state']}, now {state})"
+            )
         self._say(f"    verify: hand-made VM {self._handmade['vmid']} untouched {when} = ok")
 
     def _remove_handmade(self) -> None:
@@ -478,8 +576,13 @@ class ForeignVMPass:
         if handmade is None:
             return
         vmid, node = handmade["vmid"], handmade["node"]
-        if not self.az2.vmid_in_use(vmid):
+        if not self._holds_vmid(handmade):
             self._handmade = None
+            if handmade["unconfirmed"]:
+                self._say(
+                    f"    WARNING: hand-made VM {handmade['name']} did not appear on az2 node {node}; "
+                    "if its create task lands later, remove that VM by hand"
+                )
             return
         config = self.az2.qemu_config(vmid, node=node)
         self._require_handmade_identity(config)
@@ -490,13 +593,32 @@ class ForeignVMPass:
                     f"hand-made VM {vmid} on az2 changed (config keys {differing}); leaving it in place "
                     "for inspection instead of destroying it"
                 )
+            state = self._runtime_state()
+            if state != handmade["state"]:
+                raise RuntimeError(
+                    f"hand-made VM {vmid} on az2 changed (status and lock were {handmade['state']}, now {state}); "
+                    "leaving it in place for inspection instead of destroying it"
+                )
         elif str(config.get("tags", "") or "").strip():
             raise RuntimeError(f"hand-made VM {vmid} on az2 carries tags; leaving it in place for inspection")
-        self.az2.await_task(node, self.az2.destroy_vm(node, vmid))
+        # Never ask PVE to take volumes the VM does not reference: they are not ours.
+        self.az2.await_task(node, self.az2.destroy_vm(node, vmid, destroy_unreferenced_disks=False))
         if self.az2.vmid_in_use(vmid):
             raise RuntimeError(f"hand-made VM {vmid} is still on az2 after its destroy task finished")
         self._handmade = None
         self._say(f"    verify: hand-made VM {vmid} removed from az2 = ok")
+
+    def _holds_vmid(self, handmade: dict[str, Any]) -> bool:
+        """True when a guest holds the VMID. After an unconfirmed create, wait a bounded time for the VM to land."""
+        if self.az2.vmid_in_use(handmade["vmid"]):
+            return True
+        if not handmade["unconfirmed"]:
+            return False
+        for _ in range(self._settle_attempts):
+            self._sleep(self._settle_poll)
+            if self.az2.vmid_in_use(handmade["vmid"]):
+                return True
+        return False
 
     def _remove_handmade_after_failure(self) -> None:
         """Best-effort removal while an error is already in flight; say so if it fails."""

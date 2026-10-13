@@ -530,8 +530,7 @@ class PVEVerifier:
         """
         if method not in ("POST", "DELETE"):
             raise PVEVerifyError(f"unsupported write method {method!r}")
-        if self._transport == "pmx":
-            raise PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only; writes need the urllib transport")
+        self.require_writes()
         return self._request(method, path, data)
 
     def _request(self, method: str, path: str, data: "dict[str, Any] | None" = None) -> Any:
@@ -1240,18 +1239,56 @@ class PVEVerifier:
             raise PVEVerifyError(f"creating VM {vmid} on {node} returned no task")
         return upid
 
-    def destroy_vm(self, node: str, vmid: "int | str") -> str:
-        """Destroy a QEMU VM and purge it from job configs; return its task UPID."""
+    def destroy_vm(self, node: str, vmid: "int | str", destroy_unreferenced_disks: bool = False) -> str:
+        """Destroy a QEMU VM and purge it from job configs; return its task UPID.
+
+        destroy-unreferenced-disks is always sent, and it is 0 unless the caller
+        asks otherwise. With 1 PVE also deletes every volume named for the VMID
+        that the VM's config does not reference, on every storage the node can
+        see, which is how a destroy takes a detached disk or an orphan the
+        caller never made. The lifecycle harness only destroys a VM it made
+        itself, with no disks, so it never asks for that.
+        """
         if not node:
             raise PVEVerifyError("destroy_vm needs a node")
         upid = self._write(
             "DELETE",
             f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(_vmcid.as_path_id(vmid))}"
-            "?purge=1&destroy-unreferenced-disks=1",
+            f"?purge=1&destroy-unreferenced-disks={1 if destroy_unreferenced_disks else 0}",
         )
         if not isinstance(upid, str) or not upid:
             raise PVEVerifyError(f"destroying VM {vmid} on {node} returned no task")
         return upid
+
+    def require_writes(self) -> None:
+        """Raise unless this verifier can write, which needs the urllib transport."""
+        if self._transport == "pmx":
+            raise PVEVerifyError("PVE_VERIFY_TRANSPORT=pmx inspects only; writes need the urllib transport")
+
+    def missing_vm_privileges(self, required: "tuple[str, ...]" = ("VM.Audit", "VM.Allocate")) -> list[str]:
+        """Return the privileges in required that the credentials lack on /vms.
+
+        VM.Allocate is what creating and destroying a VM needs. PVE answers the
+        effective permissions of the authenticated user or token, keyed by path.
+        """
+        data = self._get("/access/permissions?path=%2Fvms")
+        if not isinstance(data, dict):
+            raise PVEVerifyError("PVE permissions for /vms are not an object")
+        granted = data.get("/vms")
+        if not isinstance(granted, dict):
+            granted = {}
+        return [priv for priv in required if not granted.get(priv)]
+
+    def qemu_status(self, vmid: "int | str", node: str | None = None) -> dict[str, Any]:
+        """Return the current runtime status of vmid (power state, lock), on its own node unless told otherwise."""
+        node = node or self._node_hosting(vmid)
+        path = (
+            f"/nodes/{urllib.parse.quote(node)}/qemu/{urllib.parse.quote(_vmcid.as_path_id(vmid))}/status/current"
+        )
+        data = self._get(path)
+        if not isinstance(data, dict):
+            raise PVEVerifyError(f"qemu status for vmid {vmid} is not an object")
+        return data
 
     def await_task(self, node: str, upid: str, timeout: float = 120.0, poll: float = 1.0) -> None:
         """Wait for a task on node to stop, and raise unless it ended with exit status OK."""
