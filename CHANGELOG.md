@@ -45,13 +45,33 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - An entry that already carries any of the 17 newly overridable keys starts applying them after the upgrade, where 0.9.3 ignored them with a warning and used the job value. A value copied from the job counts as set, so an entry that copied `destroy_unreferenced_disks: true` or the job's `sdn_vxlan_peers` keeps them even when it targets another PVE endpoint.
 
+- A cpi-config entry whose `host` and a `user`, `password`, or `api_token` sit at the top level of `properties:`, with no `pve:` map, now fails the request and names those keys. In 0.9.3 the entry ran against the job-level cluster without a word. Move the properties under `pve:` and `agent:`.
+
+- A cpi-config entry with a key under `pve:` or `agent:`, or a flat `pve_*` key, that is not a property of the `pve_cpi` job spec, such as `vmid_rang_start`, `pve_vmid_rang_start`, or `mbsu`, now fails the request and names the key. In 0.9.3 a misspelled key was silently ignored.
+
+- A cpi-config property named `vm` or `stemcell` that is not a map no longer fails the whole request. The CPI ignores it and logs an error that names the clash, and a `vm` property also loses any key other than `stemcell`.
+
+- Storage-plan placement now checks plain bridges only, so a node is no longer excluded while an SDN vnet is still converging on it, and a failed network lookup on a node is logged with the node name instead of dropping the node silently. A node that is proven to lack a plain bridge is still excluded at every `bridge_check` value, as before.
+
+- `create_vm` now reads the chosen node's network list once before the clone, unless `bridge_check` is `off`. Each node listing runs under a 20 second budget, and the placement checks share one budget across all nodes, so a stalled cluster costs at most 20 seconds in total. The check before the clone gets a fresh budget for a node that is not yet listed, and it lists a node again, once, when the shared budget ran out before that node was listed. A listing that fails or times out is a lookup failure and never counts as a missing bridge.
+
+- The new `vm_ownership_guard` property defaults to `enforce`, and it can be set to `warn` globally or per CPI config entry as `pve_vm_ownership_guard`. There is no `off`. Under `warn`, `has_vm` and `get_disks` answer as before and log the verdict at error level, while mutations and destroys are refused in both modes.
+
+- Because the default is `enforce`, some calls that succeed today will be refused. On upgrade, a VM whose `bosh-cpi` tag was removed by hand and whose notes lack the Director lines reads as not-bosh, and a create-env Director whose state file was lost comes back with a new `director_id`, so the old Director VM reads as another Director's. Restoring the state file from a backup brings the old `director_id` back.
+
+- When a VM has a node-local config, the guard judges that config and not the cluster scan row, so a row that still shows our tags after another Director reused the VMID no longer lets a call act on that VM. A row that does not show the VM as ours is checked against the config before the CPI refuses, so a stale foreign row no longer refuses our own VM. `attach_disk` and `detach_disk` read the VM's config before their first write and judge the config they write against, which costs one extra config read per call. `set_vm_metadata` checks again under its lock and never writes to a VM it could not judge.
+
+- A failed config read during the check is retriable, so a transient PVE error never becomes a permanent refusal. When the read finds nothing, the CPI reads the VM's config on every cluster member in two complete rounds, so it still finds a VM that was migrating, and only a VM that both rounds prove gone gets the handler's usual answer, such as a false answer from `has_vm`, instead of a refusal. A member that the cluster reports offline leaves the answer unproven, so `has_vm`, `detach_disk`, and the other guarded calls return a retriable error rather than answer that a VM on that dark node is gone.
+
+- `has_vm` now answers false and `get_disks` answers VMNotFound for a VM this Director does not own, and `delete_snapshot` returns success without touching such a VM.
+
 - Before you roll back to 0.9.3 or earlier, put `user` back on every entry, and on the job config, that authenticates with only `api_token`, because those releases reject a missing `user` with "user is required". Also check TLS on every entry that sets `ca_cert`, because those releases ignore the key and verify against the job-level CA.
 
-- Before you roll back to 0.9.3, remove `az_enforcement` from every `cpi_config` entry that carries a `pve_placement` block, because the 0.9.3 entry decoder rejects unknown fields and fails on it. The 0.9.3 job-level decoder ignores the key, and no stored state changes.
+- Before you roll back to 0.9.3, remove `az_enforcement` and `bridge_check` from every `cpi_config` entry that carries a `pve_placement` block, because the 0.9.3 entry decoder rejects unknown fields and fails on it. The 0.9.3 job-level decoder ignores both keys, and no stored state changes.
 
 - A 0.9.3 CPI treats the 17 newly overridable `pve_*` keys as unknown and quietly uses the job's SDN, pool, and disk-cleanup values for every entry. Before you roll back to 0.9.3, turn off `sdn_auto_manage_zone` and `destroy_unreferenced_disks` at the job level whenever any `cpi_config` entry points at another PVE endpoint.
 
-- A 0.9.3 CPI keeps the `bosh-owner--` tag on a VM and ignores it, so rolling back changes no stored state. It also lets a `cloud_properties.tags` key render a CPI-owned prefix again, as it did before.
+- A 0.9.3 CPI keeps the `bosh-owner--` tag on a VM and ignores it, so rolling back changes no stored state. It also lets a `cloud_properties.tags` key render a CPI-owned prefix again, as it did before. It also stops running the VM ownership guard, so `vm_ownership_guard` and `pve_vm_ownership_guard` have no effect, and no stored state changes. The misnested and misspelled cpi-config keys that this release rejects are ignored again, so a corrected entry keeps working after a rollback.
 
 ### Added
 
@@ -64,6 +84,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 - When an entry's `pve_vm_types` or `pve_disk_types` profile carries a field other than `cloud_properties`, the CPI ignores it and logs one warning that names the field and the profile.
 
 - Every VM that `create_vm` builds now carries a lowercased `bosh-owner--<director_uuid>` tag right after `bosh-cpi`, naming the Director that created it. On a VM from an earlier release, `set_vm_metadata` adds the tag only when the evidence matches, meaning the VM's recorded instance equals the instance the Director names, or the VM records no instance at all. It never adds the tag to a stemcell template or a disk parker. A request without a `director_uuid` gets no owner tag and a warning.
+
+- The new `pve.placement.bridge_check` key (`off`, `warn`, or `enforce`, default `warn`) checks that the plain Linux bridges a VM's NICs need exist on the node the VM lands on. At the default, nothing new is rejected, and a Warn names each candidate node that `enforce` would skip, plus the chosen node, the bridge, and the NIC. With `enforce`, placement skips nodes that lack the bridge, and `create_vm` fails before the clone when a pinned node lacks it, with a lookup failure reported as retriable. SDN vnets are never checked by this key. Setting `enforce` while `az_enforcement` is `warn` can let a VM leave its AZ, so set `az_enforcement` to `strict` first. We plan to make `enforce` the default in the release that flips `az_enforcement`.
+
+- The CPI now warns when a cpi-config entry has a top-level key that is a job spec name without its `pve.` or `agent.` prefix, such as a lone `host`, or an `agent.blobstore` property that cannot be overridden per request. A top-level key it does not recognize at all is logged at debug level and never fails a request.
 
 - `scripts/bats` accepts an optional `bats.secondary` block in `ci/integration.yml` that repeats the acceptance run through a second `cpi_config` entry, `pve-az2` by default, with that entry's own network values, so we can show each entry working on its own. We also check the second entry's address bands when the config loads, so a typo fails before the first pass starts, and the run report now records the second pass. A run without the block behaves as before, and `--skip-secondary` returns a configured run to the primary entry alone.
 
@@ -84,6 +108,12 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 - A `cloud_properties.tags` key, or an instance group name, can no longer write a tag under a prefix the CPI owns, such as `bosh-owner--`, `bosh-cid--`, `bosh-cluster--`, or `stemcell--`, and the CPI logs a warning that names what it dropped.
 
 - `set_vm_metadata` now refuses a VM that records a different instance than the one the Director names. The error is not retriable, and nothing is renamed or retagged, which is what a VM CID pointing at the wrong VM looks like. When the CPI can't read the VM's config to make that comparison, the call fails as retriable and writes nothing, except when a storage allocation journal is configured, where that read failure was already a non-retriable error and still is.
+
+- The CPI now checks that a VM belongs to the requesting Director before it reboots, rewrites, attaches to, detaches from, snapshots, or destroys it, and it refuses with a non-retriable cloud error that names the reason when the VM belongs to another Director, is a parker or stemcell template, is a container, or carries no BOSH marker.
+
+- The `delete_vm` straggler sweep no longer destroys another Director's `bosh-deleting` VMs, and it checks each straggler's ownership again before it destroys it.
+
+- VMs created after the upgrade get the full protection. VMs created by 0.9.3 or earlier are protected against hand-made VMs, parkers, and templates, but only `set_vm_metadata` can catch a legacy VM that records a different instance than the one the Director names. `delete_vm` receives no metadata, so a bare CID that reaches another Director's 0.9.3 VM can still destroy it until a deploy that updates its instance, or a recreate, writes the owner tag.
 
 ## [0.9.3] - 2026-10-11
 
