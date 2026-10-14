@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-14
+
 ### Added
 
 - `scripts/bats` takes `--secondary-only`, which skips the primary pass and runs only the `bats.secondary` pass. The run report says the primary pass was skipped on request.
@@ -872,7 +874,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.0...v0.9.1
