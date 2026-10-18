@@ -253,6 +253,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	if len(args) > 0 && args[0] == "provision-journal" {
 		return runProvisionJournal(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "stemcell-refs" {
+		return runStemcellRefs(args[1:], stdout, stderr, opts)
+	}
 	fs := flag.NewFlagSet("cpi", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to CPI JSON config file (required)")

@@ -209,17 +209,60 @@ func deregisterStemcellDirectorRef(
 	directorUUID string,
 	destroy func(context.Context) error,
 ) (destroyed bool, remaining []string, err error) {
+	out, err := deregisterStemcellDirectorRefWith(ctx, deps, logger, node, vmid, directorUUID, destroy, deregisterOptions{})
+	return out.destroyed, out.remaining, err
+}
+
+// deregisterOptions carries the optional extras the operator prune
+// (stemcell_refs_prune.go) layers onto deregisterStemcellDirectorRef. The
+// zero value adds nothing, so delete_stemcell's path through the wrapper
+// above is unchanged.
+type deregisterOptions struct {
+	// verify, when set, runs inside the lock right after the fresh config
+	// read and before any branch decides anything. A non-nil return aborts
+	// the call with that error and no write, which is how the prune skips a
+	// template that changed between its plan and its apply.
+	verify func(description string, tags []string) error
+	// dropTag, when set, names a director tag to remove in branch (d), in
+	// the same write that persists the remaining refs. The tag stays when a
+	// remaining ref maps to the same tag or when removing it would leave the
+	// template without a generation marker (see dropDirectorTag).
+	dropTag string
+}
+
+// deregisterOutcome is deregisterStemcellDirectorRefWith's result.
+type deregisterOutcome struct {
+	destroyed  bool
+	remaining  []string
+	tagDropped bool
+}
+
+// deregisterStemcellDirectorRefWith is deregisterStemcellDirectorRef with
+// deregisterOptions. Every branch and error is the wrapper's; opts only adds
+// the verify gate and the branch (d) tag removal.
+func deregisterStemcellDirectorRefWith(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	vmid int64,
+	directorUUID string,
+	destroy func(context.Context) error,
+	opts deregisterOptions,
+) (deregisterOutcome, error) {
+	var destroyed, tagDropped bool
+	var remaining []string
 	if deps.PVE == nil || deps.PVE.QEMU() == nil {
-		return false, nil, cpierrors.Cloud("deregisterStemcellDirectorRef: PVE client unavailable")
+		return deregisterOutcome{}, cpierrors.Cloud("deregisterStemcellDirectorRef: PVE client unavailable")
 	}
 	if node == "" {
-		return false, nil, cpierrors.Cloud("deregisterStemcellDirectorRef: node must not be empty")
+		return deregisterOutcome{}, cpierrors.Cloud("deregisterStemcellDirectorRef: node must not be empty")
 	}
 	if vmid <= 0 {
-		return false, nil, cpierrors.Cloud("deregisterStemcellDirectorRef: vmid must be a positive integer, got %d", vmid)
+		return deregisterOutcome{}, cpierrors.Cloud("deregisterStemcellDirectorRef: vmid must be a positive integer, got %d", vmid)
 	}
 	if destroy == nil {
-		return false, nil, cpierrors.Cloud("deregisterStemcellDirectorRef: destroy callback must not be nil")
+		return deregisterOutcome{}, cpierrors.Cloud("deregisterStemcellDirectorRef: destroy callback must not be nil")
 	}
 
 	ref := resolveDirectorRef(directorUUID, logger, "deregisterStemcellDirectorRef", vmid, node)
@@ -248,6 +291,12 @@ func deregisterStemcellDirectorRef(
 		description := stringConfigField(cfg, "description")
 		currentTags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
 
+		if opts.verify != nil {
+			if verifyErr := opts.verify(description, currentTags); verifyErr != nil {
+				return verifyErr
+			}
+		}
+
 		if stringSliceContains(currentTags, stemcellDestroyPendingTag) {
 			// (b) A previous call already stamped the pending marker before
 			// destroy ran (or completed). The ref set on a template already
@@ -271,11 +320,19 @@ func deregisterStemcellDirectorRef(
 
 		if len(updatedRefs) > 0 {
 			// (d) Other refs remain — persist the updated set, do not destroy.
-			writeErr := persistRemainingDirectorRefs(ctx, deps, node, vmid, description, prov, updatedRefs)
+			var newTags *string
+			if opts.dropTag != "" {
+				if kept, dropped := dropDirectorTag(currentTags, opts.dropTag, updatedRefs); dropped {
+					joined := strings.Join(kept, pveTagJoinSep)
+					newTags = &joined
+				}
+			}
+			writeErr := persistRemainingDirectorRefs(ctx, deps, node, vmid, description, prov, updatedRefs, newTags)
 			if writeErr != nil {
 				return writeErr
 			}
 			remaining = updatedRefs
+			tagDropped = newTags != nil
 			return nil
 		}
 
@@ -294,10 +351,10 @@ func deregisterStemcellDirectorRef(
 	})
 
 	if lockErr != nil {
-		return false, nil, lockErr
+		return deregisterOutcome{}, lockErr
 	}
 	if !needDestroy {
-		return destroyed, remaining, nil
+		return deregisterOutcome{destroyed: destroyed, remaining: remaining, tagDropped: tagDropped}, nil
 	}
 
 	// Destroy runs OUTSIDE the per-VMID lock — see the lock-envelope doc
@@ -308,10 +365,10 @@ func deregisterStemcellDirectorRef(
 		if resumed {
 			label = "resume pending destroy"
 		}
-		return false, nil, cpierrors.Wrap(pve.WrapError(destroyErr),
+		return deregisterOutcome{}, cpierrors.Wrap(pve.WrapError(destroyErr),
 			fmt.Sprintf("deregisterStemcellDirectorRef: %s vmid %d node %q", label, vmid, node))
 	}
-	return true, nil, nil
+	return deregisterOutcome{destroyed: true}, nil
 }
 
 // directorRefOrSentinel returns directorUUID unchanged when non-empty, or the
@@ -374,7 +431,9 @@ func removeStringFromSlice(s []string, want string) []string {
 // persistRemainingDirectorRefs writes prov (with DirectorRefs set to
 // updatedRefs) back to the template's description via the merge-preserving
 // codec. Used by deregisterStemcellDirectorRef's (d) branch: other refs
-// remain, so the template survives with an updated ref set.
+// remain, so the template survives with an updated ref set. newTags, when
+// non-nil, is written in the same UpdateQemuConfig call (the operator prune's
+// director tag removal); delete_stemcell passes nil.
 func persistRemainingDirectorRefs(
 	ctx context.Context,
 	deps Deps,
@@ -383,6 +442,7 @@ func persistRemainingDirectorRefs(
 	description string,
 	prov stemcellProvenance,
 	updatedRefs []string,
+	newTags *string,
 ) error {
 	prov.DirectorRefs = updatedRefs
 	newDesc, mergeErr := mergeProvenanceIntoDescription(description, prov)
@@ -391,8 +451,11 @@ func persistRemainingDirectorRefs(
 			fmt.Sprintf("deregisterStemcellDirectorRef: merge description vmid %d node %q", vmid, node))
 	}
 	vmidStr := strconv.FormatInt(vmid, 10)
-	if updErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr,
-		&sdknodes.UpdateQemuConfigParams{Description: &newDesc}); updErr != nil {
+	params := &sdknodes.UpdateQemuConfigParams{Description: &newDesc}
+	if newTags != nil {
+		params.Tags = newTags
+	}
+	if updErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, params); updErr != nil {
 		return cpierrors.Wrap(pve.WrapError(updErr),
 			fmt.Sprintf("deregisterStemcellDirectorRef: write description vmid %d node %q", vmid, node))
 	}
@@ -481,6 +544,44 @@ func stringSliceRemove(tags []string, tag string) (result []string, removed bool
 		out = append(out, t)
 	}
 	return out, removed
+}
+
+// dropDirectorTag removes the director tag dropTag (matched without regard
+// to case, since PVE may fold tag case) from tags and reports whether it did.
+// It keeps the tag, reporting false, in two cases. The first is when a ref in
+// remainingRefs maps to the same tag, because two refs can sanitize to one
+// tag value. The second is when the removal would leave a template that
+// still holds refs without a generation marker
+// (pve.HasStemcellGenerationMarker), because such a template is invisible to
+// delete_stemcell's lookups and could then never be freed by the director
+// that still references it.
+func dropDirectorTag(tags []string, dropTag string, remainingRefs []string) (kept []string, dropped bool) {
+	for _, ref := range remainingRefs {
+		if strings.EqualFold(directorTagFor(ref), dropTag) {
+			return tags, false
+		}
+	}
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if strings.EqualFold(t, dropTag) {
+			dropped = true
+			continue
+		}
+		out = append(out, t)
+	}
+	if !dropped {
+		return tags, false
+	}
+	if len(remainingRefs) > 0 && !pve.HasStemcellGenerationMarker(out) {
+		return tags, false
+	}
+	return out, true
+}
+
+// directorTagFor is the "director--<sanitized ref>" tag
+// registerStemcellDirectorRef stamps for ref.
+func directorTagFor(ref string) string {
+	return directorTagPrefix + sanitizeTagValue(ref)
 }
 
 // provenanceOwnedJSONKeys lists every top-level JSON key the stemcellProvenance
