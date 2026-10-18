@@ -12,6 +12,10 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+### Added
+
+- The new `cpi stemcell-refs` operator command clears the director refs that a rebuilt Director leaves on stemcell cache templates. `cpi stemcell-refs report --config <cpi.json>` lists every cache template with its description refs, `director--` tags, and linked clones, and for every ref it shows how many VMs still carry that ref's owner tag and which templates a prune would free. `cpi stemcell-refs prune --director <ref>` removes one ref from every template under the per-VMID lock and destroys a template once no ref remains, along with that stemcell's replicas. `cpi stemcell-refs prune --vmid <n>` frees one unreferenced template, including one from before 0.9.2. A prune is a dry run until we pass `--apply`. It refuses while any VM still carries the ref's owner tag unless we pass `--allow-owned-vms`, and it never changes a template whose description isn't provenance JSON, a template that backs a linked clone, or a template that changed after the plan. [Clearing a stale director ref](docs/operations.md#clearing-a-stale-director-ref) has the procedure.
+
 ## [0.9.4] - 2026-10-14
 
 ### Added

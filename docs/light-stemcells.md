@@ -301,7 +301,7 @@ The sha8 tag records *content*, not ownership. Any CPI generation that ever cach
 
 Every sha8-keyed lookup and sweep therefore requires a second marker before a template is eligible at all: either `bosh-stemcell-cache` (stamped on every cache template this CPI builds) or a `director--<uuid>` reference tag (stamped when a director registers a reference, which keeps an already-adopted template visible for refcounting and eventual cleanup). A template carrying neither is invisible — never adopted, never swept, never destroyed.
 
-The practical consequence on a cluster mid-upgrade: the CPI builds its own cache template alongside the older generation's rather than reusing it, so both exist for a while and the same stemcell occupies template VMIDs twice. That is deliberate — a duplicated template costs disk, while a wrongly adopted one costs a running foundation. Once no director depends on the older templates, delete them manually; the CPI will never do it.
+The practical consequence on a cluster mid-upgrade: the CPI builds its own cache template alongside the older generation's rather than reusing it, so both exist for a while and the same stemcell occupies template VMIDs twice. That is deliberate — a duplicated template costs disk, while a wrongly adopted one costs a running foundation. The CPI's own calls never free the older templates. Once no director depends on them, we free each one with `cpi stemcell-refs prune --vmid <vmid> --apply`, which recognizes a legacy template by its name and refuses one that still backs a linked clone. [Clearing a stale director ref](operations.md#clearing-a-stale-director-ref) covers the command.
 
 ### VMID range
 
@@ -323,6 +323,7 @@ Every mode registers the calling BOSH director's UUID as a live reference on the
 - **`create_stemcell`** (any mode, including a dedup hit that reuses an existing cache) always registers this director's reference before returning the CID.
 - **`delete_stemcell`** removes this director's reference. The cache template is destroyed only when that was the *last* remaining reference in the cluster — refs from other directors sharing the same cluster keep the cache alive.
 - **`:light:` files are never deleted**, regardless of reference count — only the cache template (the clone-source performance artifact) goes away at last reference; the operator-owned qcow2 is untouched.
+- **`cpi stemcell-refs prune`** removes a reference that no director will ever release, such as the old UUID of a rebuilt director. It is an operator command, never part of a CPI call, and it destroys the cache template when that reference was the last one. It leaves a `:heavy:` file in place.
 - **`:heavy:` files are deleted at last reference**, in the same `delete_stemcell` call that destroys the last-referencing cache template. The one exception is a request that comes through a cpi-config entry on shared storage, where we keep the file, as described below.
 
 Multiple directors sharing one PVE cluster each hold independent references on the same cache template — see [Multi-cluster deployments — Stemcell registration across CPI entries](multi-cluster.md#stemcell-registration-across-cpi-entries) for the `--fix` re-registration workflow when one BOSH director targets multiple cpi-config entries.
@@ -346,6 +347,8 @@ Putting `:heavy:` stemcells on storage only one entry can reach, or using `:ligh
 ## Operator caveats
 
 `bosh delete-stemcell` on a stemcell whose only remaining director reference is this director's destroys the cache template (and, for `:heavy:`, the qcow2). No manual `pvesm free` step is needed in that case. Verify with `bosh stemcells` before and after; the CID disappears once every director has released it.
+
+A rebuilt director leaves its old UUID behind as a reference that nothing will release, and `bosh delete-stemcell` then keeps the cache template. `cpi stemcell-refs report` shows those references, and `cpi stemcell-refs prune --director <old-uuid>` removes one. [Clearing a stale director ref](operations.md#clearing-a-stale-director-ref) walks through it.
 
 For a `:light:` file, `pvesm free` (or the PVE UI's storage **Content** tab) is the *only* way to remove the qcow2 itself — the CPI will never do it:
 
@@ -373,6 +376,8 @@ pve-cid decode ':heavy:local:import/bosh-stemcell-ubuntu-jammy-1.438-a1b2c3d4.qc
 ```bash
 pve-cid stemcells --config /path/to/cpi.json --orphans
 ```
+
+A template whose only reference belongs to a director that no longer exists doesn't show up as an orphan candidate here, because that reference still counts. `cpi stemcell-refs report` lists every reference with the number of VMs that still carry its owner tag, which is how we spot a stale one.
 
 ## Troubleshooting
 
