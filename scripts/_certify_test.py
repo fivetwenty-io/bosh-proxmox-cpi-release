@@ -41,7 +41,8 @@ REPO_ROOT = SCRIPTS.parent
 CERTIFY = SCRIPTS / "certify"
 CONFIG = "ci/integration.scheduled.yml"
 sys.path.insert(0, str(SCRIPTS))
-import _checkouts  # noqa: E402
+import _checkouts
+import _directorrefs  # noqa: E402
 import _integration  # noqa: E402
 import _rundoc  # noqa: E402
 import _slot  # noqa: E402
@@ -2242,6 +2243,143 @@ class VerifyPlacementPassesTest(_CertifyModule):
         self.assertIn("verify:placement-pre-strays", [r[0] for r in c.rep.rows])
         self.assertIn("verify:placement-post-spans-azs", [r[0] for r in c.rep.rows])
         self.assertIn("verify:placement-old-vms-deleted", [r[0] for r in c.rep.rows])
+
+
+UUID_GONE = "11111111-2222-3333-4444-555555555555"
+UUID_LIVE = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+UUID_BAD = "99999999-8888-7777-6666-555555555555"
+
+
+class CleanupRefsTest(_SyntheticRoot):
+    """cleanup-refs prunes what the slot recorded and keeps what it could not."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mod = _load_certify(None, self.repo)
+        self.slot_dir = Path(self.tmp.name) / "certification"
+        self.slot_dir.mkdir()
+        (self.slot_dir / "slot.yml").write_text(SLOT_YML)
+        self.slot = _slot.resolve(self.repo.root, {"BOSH_STATE_DIR": str(self.slot_dir)})
+
+    def _certify(self, live: str, failing: "set[str]" = frozenset(), dry_run: bool = False) -> object:
+        c = object.__new__(self.mod.Certify)
+        c.rep = _Rep()
+        c.args = argparse.Namespace(force=False, keep=False)
+        c.dry_run = dry_run
+        c.slot = self.slot
+        c.cfg = {}
+        c.calls = []
+        c._slot_refusal = lambda _action: ""
+        c._probe_director_uuid = lambda: live
+        c._director_env = lambda: {}
+        c._cpi_binary = lambda: "/fake/cpi"
+
+        def step(name, argv, timeout, env=None, retries=0):
+            c.calls.append([str(a) for a in argv])
+            return not any(u in argv for u in failing)
+
+        c._cleanup_step = step
+        return c
+
+    def _record(self, *uuids: str) -> None:
+        for uuid in uuids:
+            _directorrefs.add(self.slot_dir, uuid)
+
+    def _run(self, c: object) -> bool:
+        built = {"host": "h", "password": "never-printed"}
+        with mock.patch.object(self.mod._integration, "build_cpi_config", return_value=built):
+            return c.cleanup_refs()
+
+    def test_a_gone_director_is_pruned_and_dropped(self) -> None:
+        self._record(UUID_GONE)
+        c = self._certify(live="")
+        self.assertTrue(self._run(c))
+        self.assertEqual(len(c.calls), 1)
+        argv = c.calls[0]
+        self.assertEqual(argv[:3], ["/fake/cpi", "stemcell-refs", "prune"])
+        self.assertEqual(argv[argv.index("--director") + 1], UUID_GONE)
+        self.assertIn("--apply", argv)
+        self.assertNotIn("--allow-owned-vms", argv)
+        self.assertEqual(_directorrefs.load(self.slot_dir), [])
+
+    def test_a_live_director_is_cleaned_up_and_kept(self) -> None:
+        self._record(UUID_LIVE)
+        c = self._certify(live=UUID_LIVE)
+        self.assertTrue(self._run(c))
+        self.assertEqual(c.calls, [["bosh", "-n", "clean-up", "--all"]])
+        self.assertEqual(_directorrefs.load(self.slot_dir), [UUID_LIVE])
+
+    def test_one_failure_is_kept_the_loop_continues_and_the_status_fails(self) -> None:
+        self._record(UUID_BAD, UUID_GONE)
+        c = self._certify(live="", failing={UUID_BAD})
+        self.assertFalse(self._run(c))
+        self.assertEqual(len(c.calls), 2)
+        self.assertEqual(_directorrefs.load(self.slot_dir), [UUID_BAD])
+
+    def test_no_record_is_a_pass_that_runs_nothing(self) -> None:
+        c = self._certify(live="")
+        self.assertTrue(self._run(c))
+        self.assertEqual(c.calls, [])
+
+    def test_a_dry_run_prints_the_plan_and_runs_nothing(self) -> None:
+        self._record(UUID_GONE, UUID_LIVE)
+        c = self._certify(live="", dry_run=True)
+        c._probe_director_uuid = _never
+        c._cpi_binary = _never
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch.object(self.mod._integration, "build_cpi_config", side_effect=_never):
+            self.assertTrue(c.cleanup_refs())
+        self.assertEqual(c.calls, [])
+        self.assertIn(f"stemcell-refs prune --director {UUID_GONE} --apply", out.getvalue())
+        self.assertEqual(_directorrefs.load(self.slot_dir), [UUID_GONE, UUID_LIVE])
+
+    def test_a_refused_slot_runs_nothing(self) -> None:
+        self._record(UUID_GONE)
+        c = self._certify(live="")
+        c._slot_refusal = lambda _action: "refused"
+        self.assertFalse(c.cleanup_refs())
+        self.assertEqual(c.calls, [])
+        self.assertEqual(c.rep.status("refs:slot-guard"), ["FAIL"])
+
+    def test_the_cli_dry_run_reads_the_slot_record(self) -> None:
+        self._record(UUID_GONE)
+        environ = {"BOSH_STATE_DIR": str(self.slot_dir), **DENY}
+        mod = _load_certify(environ, self.repo)
+        out = io.StringIO()
+        argv = ["cleanup-refs", "--dry-run", "--no-color",
+                "--config", str(self.repo.root / CONFIG), "--results-dir", self.tmp.name]
+        with _guard_environ(environ), self.repo.rebase_shared(_integration, _rundoc, _checkouts), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = mod.main(argv)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertIn(f"PLAN {UUID_GONE}", out.getvalue())
+        self.assertNotIn("DRY-RUN: ", out.getvalue())
+
+
+class CleanupRefsWorkflowTest(unittest.TestCase):
+    """The workflow tears the bootstrap Director down before it prunes."""
+
+    def test_cleanup_runs_after_teardown_and_before_the_secrets_removal(self) -> None:
+        steps = _workflow()["jobs"]["certification"]["steps"]
+        names = [s.get("name", "") for s in steps]
+
+        def at(fragment: str) -> int:
+            return next(i for i, n in enumerate(names) if fragment in n)
+
+        cleanup, teardown = at("cleanup-refs"), at("Tear down bootstrap director")
+        self.assertEqual(steps[cleanup]["if"], "always()")
+        self.assertEqual(steps[teardown]["if"], "always()")
+        self.assertGreater(teardown, at("BATS"))
+        self.assertGreater(cleanup, teardown)
+        self.assertLess(cleanup, at("Remove materialized secrets"))
+        self.assertNotIn("--allow-owned-vms", steps[cleanup]["run"])
+
+    def test_the_bootstrap_director_is_recorded(self) -> None:
+        steps = _workflow()["jobs"]["certification"]["steps"]
+        boot = next(s for s in steps if s.get("name", "").startswith("Bootstrap director"))
+        self.assertIn("certify record-director", boot["run"])
+        self.assertLess(boot["run"].index("bosh login"), boot["run"].index("record-director"))
 
 
 if __name__ == "__main__":

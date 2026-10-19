@@ -43,6 +43,19 @@ Commands:
                  recreate -> capture-post -> read-marker -> verify ->
                  finalize -> teardown.
     report       Re-print the summary table from the most recent run.
+    record-director
+                 Record the UUID of the Director now up in the slot, in the
+                 slot's director-uuids file. `upgrade` does this itself after
+                 each create-env; the workflow calls it for the bootstrap
+                 Director that scripts/bats runs against.
+    cleanup-refs For each recorded Director UUID, run `bosh clean-up --all`
+                 when that Director is still reachable, and once it is gone
+                 run `cpi stemcell-refs prune --director <uuid> --apply`
+                 against a CPI config rendered from ci/integration.yml. A UUID
+                 whose prune succeeds leaves the record. Best-effort: a failure
+                 is logged, the loop continues, and the exit status is 1 if
+                 anything failed. With --dry-run it prints the plan and runs
+                 nothing against the lab. `upgrade --force` runs it first.
     help         Show this message.
 
 DESTRUCTIVE: the run takes over a Director slot, the directory BOSH_STATE_DIR
@@ -115,6 +128,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -127,6 +141,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 import _checkouts  # noqa: E402
+import _directorrefs  # noqa: E402
 import _release_artifact
 import _integration  # noqa: E402
 import _lightstemcell  # noqa: E402
@@ -1549,12 +1564,17 @@ class Certify:
             if not self._guard_step("tear down the standing Director",
                                     "director:teardown-existing"):
                 return False
+            # A previous run may have died before its own cleanup. Prune what
+            # it recorded first, while its Director can still clean up, then
+            # again once the teardown has removed the Director and its VMs.
+            self.cleanup_refs()
             ok, _ = self.runner.step(
                 "director:teardown-existing", [BOSH_SCRIPT, "teardown"],
                 timeout=CREATE_ENV_TIMEOUT_S,
             )
             if not ok:
                 return False
+            self.cleanup_refs()
 
         self._backup_state("pre-upgrade-test")
 
@@ -1583,6 +1603,7 @@ class Certify:
         )
         if not ok:
             return False
+        self._record_director_uuid()
 
         if self.ccfg["cpi_id"]:
             ok, _ = self.runner.step(
@@ -1824,6 +1845,113 @@ class Certify:
                     return str(value)
         return ""
 
+    # -- Director UUID record and stemcell ref cleanup ----------------------- #
+
+    def _record_director_uuid(self) -> bool:
+        """Append the running Director's UUID to the slot's record.
+
+        Called as soon as a create-env leg has the Director up, so a run that
+        dies later still leaves the UUID for cleanup-refs. A dry run records
+        nothing, and a Director that can't be probed is a warning, because the
+        run itself doesn't depend on the record.
+        """
+        if self.dry_run:
+            return True
+        uuid = self._probe_director_uuid()
+        if not uuid or not _directorrefs.is_uuid(uuid):
+            print(self.rep.color.yellow(
+                "    warning: could not read the Director's UUID, so its stemcell "
+                "refs will not be cleaned up automatically"
+            ), file=sys.stderr)
+            return False
+        if _directorrefs.add(self.slot.dir, uuid):
+            print(f"    recorded Director {uuid} in {_directorrefs.record_path(self.slot.dir)}")
+        return True
+
+    def _cpi_binary(self) -> str:
+        """The cpi binary for stemcell-refs, built from the checkout when absent.
+
+        CPI_BIN wins, as it does for scripts/lifecycle. Otherwise it is bin/cpi
+        in the checkout, which `make bin/cpi` builds.
+        """
+        path = os.environ.get("CPI_BIN") or str(REPO_ROOT / "bin" / "cpi")
+        if not os.access(path, os.X_OK):
+            built = self._cleanup_step("refs:build-cpi", ["make", "bin/cpi"], 900)
+            if not built or not os.access(path, os.X_OK):
+                raise RuntimeError(f"no executable cpi binary at {path}")
+        return path
+
+    def cleanup_refs(self) -> bool:
+        """Clean up the stemcell refs of every Director the slot has recorded.
+
+        A recorded Director that is still reachable gets `bosh clean-up --all`
+        and keeps its record, because pruning a running Director's refs would
+        strip templates it still uses. Once the Director is gone, the CPI's
+        `stemcell-refs prune --director <uuid> --apply` removes its ref, and a
+        successful prune drops the UUID from the record. The prune keeps its
+        owned-VM guard, so a Director whose VMs are still there is refused, and
+        the UUID stays for the next run. One failure never stops the loop.
+        """
+        self.rep.section("cleanup-refs")
+        refusal = self._slot_refusal("clean up stemcell refs")
+        if refusal:
+            self.rep.record("refs:slot-guard", FAIL, 0.0, refusal)
+            return False
+        uuids = _directorrefs.load(self.slot.dir)
+        if not uuids:
+            self.rep.skip("refs:none", f"no Director UUIDs recorded in {_directorrefs.record_path(self.slot.dir)}")
+            return True
+        if self.dry_run:
+            for uuid in uuids:
+                print(f"    PLAN {uuid}: if reachable, bosh -n clean-up --all and keep the record")
+                print(f"    PLAN {uuid}: once gone, cpi stemcell-refs prune --director {uuid} --apply, "
+                      "then drop it from the record")
+            self.rep.skip("refs:dry-run", f"{len(uuids)} recorded Director(s); nothing was run")
+            return True
+
+        live = self._probe_director_uuid()
+        ok = True
+        config_dir: "Path | None" = None
+        cpi: "tuple[str, str] | None" = None
+        try:
+            for uuid in uuids:
+                short = uuid[:8]
+                if live and live.lower() == uuid:
+                    if not self._cleanup_step(
+                        f"refs:clean-up:{short}", ["bosh", "-n", "clean-up", "--all"],
+                        DEPLOY_TIMEOUT_S, env=self._director_env(), retries=1,
+                    ):
+                        ok = False
+                    self.rep.skip(f"refs:prune:{short}",
+                                  "the Director is still running; tear it down, then run cleanup-refs again")
+                    continue
+                try:
+                    if cpi is None:
+                        config_dir = Path(tempfile.mkdtemp(prefix="certify-cpi-"))
+                        config = config_dir / "cpi.json"
+                        fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                            json.dump(_integration.build_cpi_config(self.cfg), fh)
+                        cpi = (self._cpi_binary(), str(config))
+                except (RuntimeError, ValueError, OSError, SystemExit) as exc:
+                    self.rep.skip(f"refs:prune:{short}", f"no CPI config or binary: {exc}")
+                    ok = False
+                    continue
+                pruned = self._cleanup_step(
+                    f"refs:prune:{short}",
+                    [cpi[0], "stemcell-refs", "prune", "--config", cpi[1],
+                     "--director", uuid, "--apply"],
+                    900,
+                )
+                if pruned:
+                    _directorrefs.remove(self.slot.dir, uuid)
+                else:
+                    ok = False
+        finally:
+            if config_dir is not None:
+                shutil.rmtree(config_dir, ignore_errors=True)
+        return ok
+
     def _placement_observation(self) -> dict:
         """Where the Director says each instance is, and what each cluster says it holds.
 
@@ -2057,6 +2185,7 @@ class Certify:
         )
         if ok:
             self._backup_state("post-upgrade")
+            self._record_director_uuid()
         return ok
 
     def recreate(self) -> bool:
@@ -2541,7 +2670,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("command", nargs="?", default="upgrade",
-                   choices=["upgrade", "run", "report", "help"])
+                   choices=["upgrade", "run", "report", "record-director",
+                            "cleanup-refs", "help"])
     p.add_argument("--config", default=DEFAULT_CONFIG)
     p.add_argument("--env", default=os.environ.get("BOSH_PVE_ENV") or "cpitest")
     p.add_argument("--old-cpi", default="")
@@ -2575,6 +2705,20 @@ def main(argv: list[str]) -> int:
 
     command = "./scripts/certify " + " ".join(argv or ["upgrade"])
     rep = Reporter(color, command, args.dry_run, label="CERTIFY")
+
+    if args.command in ("cleanup-refs", "record-director"):
+        # These touch the slot's Director record and nothing else, so they skip
+        # the version matrix, which needs the network.
+        runner = Certify(args, rep)
+        try:
+            if args.command == "record-director":
+                ok = runner._record_director_uuid()
+            else:
+                ok = runner.cleanup_refs()
+        finally:
+            runner.close()
+        rep.summary()
+        return 0 if ok else 1
 
     # Resolve the version matrix before anything else: an explicit flag wins,
     # then ci/integration.yml, then the published releases (new = N,
