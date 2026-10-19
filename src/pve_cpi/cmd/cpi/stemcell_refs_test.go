@@ -156,7 +156,8 @@ func (q refsCLIQEMU) Config(_ context.Context, _ string, vmid int) (map[string]a
 		if g.template {
 			tmpl = 1
 		}
-		cfg := map[string]any{"description": g.desc, "tags": g.tags, "name": g.name, "template": tmpl}
+		cfg := map[string]any{"description": g.desc, "tags": g.tags, "name": g.name, "template": tmpl,
+			"digest": "cli-digest"}
 		for k, v := range g.disks {
 			cfg[k] = v
 		}

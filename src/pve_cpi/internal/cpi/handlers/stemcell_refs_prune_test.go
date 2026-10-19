@@ -15,6 +15,7 @@ import (
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 // pruneFakeGuest is one guest in pruneFake's cluster.
@@ -23,6 +24,10 @@ type pruneFakeGuest struct {
 	name     string
 	template bool
 	cfg      map[string]any
+	// gen is the config generation. A config read reports it as the digest,
+	// a write that carries a different digest is refused as stale, and each
+	// accepted write bumps it.
+	gen int
 }
 
 // pruneFake is a small stateful cluster for the stemcell-refs tests: the
@@ -48,6 +53,14 @@ type pruneFake struct {
 	// onWrite, when set, runs after each UpdateQemuConfig with f.mu held, so
 	// a test can change a guest the way a concurrent caller would.
 	onWrite func(vmid int64, g *pruneFakeGuest)
+	// onRead, when set, runs before each config read with f.mu held, so a
+	// test can change a guest between a plan and the apply's locked read.
+	onRead func(vmid int64, g *pruneFakeGuest)
+	// staleWrites makes the next N digest-guarded writes to a guest fail as
+	// stale, the way a writer that slipped in after the read would.
+	staleWrites map[int64]int
+	// noDigest leaves the digest out of a guest's config reads.
+	noDigest map[int64]bool
 }
 
 func newPruneFake() *pruneFake {
@@ -57,6 +70,8 @@ func newPruneFake() *pruneFake {
 		deleteErr:    map[int64]error{},
 		tagsAtDelete: map[int64]string{},
 		pools:        &noopPoolService{},
+		staleWrites:  map[int64]int{},
+		noDigest:     map[int64]bool{},
 	}
 }
 
@@ -98,12 +113,19 @@ func (f *pruneFake) deps() handlers.Deps {
 			return nil, err
 		}
 		g, ok := f.guests[int64(vmid)]
+		if ok && f.onRead != nil {
+			f.onRead(int64(vmid), g)
+			g, ok = f.guests[int64(vmid)]
+		}
 		if !ok {
 			return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
 		}
 		out := map[string]any{}
 		for k, v := range g.cfg {
 			out[k] = v
+		}
+		if !f.noDigest[int64(vmid)] {
+			out["digest"] = "gen-" + strconv.Itoa(g.gen)
 		}
 		return out, nil
 	}}
@@ -119,6 +141,17 @@ func (f *pruneFake) deps() handlers.Deps {
 			if _, held, _ := f.pools.get("bosh-lock-vm-" + vmidStr); !held {
 				f.unlockedWrites = append(f.unlockedWrites, vmidStr)
 			}
+			if p.Digest != nil {
+				if f.staleWrites[id] > 0 {
+					f.staleWrites[id]--
+					g.gen++
+					return pve.ErrConfigDigestStale
+				}
+				if *p.Digest != "gen-"+strconv.Itoa(g.gen) {
+					return pve.ErrConfigDigestStale
+				}
+			}
+			g.gen++
 			if p.Description != nil {
 				g.cfg["description"] = *p.Description
 				f.writes = append(f.writes, vmidStr+":description")

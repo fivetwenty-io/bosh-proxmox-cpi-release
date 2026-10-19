@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -19,7 +20,9 @@ import (
 
 const stemcellRefsUsage = "usage: cpi stemcell-refs report --config PATH [--json]\n" +
 	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N | --reconcile-tags) " +
-	"[--apply] [--json]"
+	"[--apply] [--json]\n" +
+	"       cpi stemcell-refs adopt-owners --config PATH --director-uuid UUID --director-name NAME " +
+	"[--deployment NAME] [--vmid N]... [--apply] [--json]"
 
 // stemcellRefsTimeout bounds one run. A scan reads every guest's config and
 // an apply can destroy several templates, each awaited, so the budget is
@@ -38,6 +41,9 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 2
 	}
 	action := args[0]
+	if action == "adopt-owners" {
+		return runStemcellRefsAdopt(args[1:], stdout, stderr, opts)
+	}
 	if action != "report" && action != "prune" {
 		fmt.Fprintf(stderr, "unknown stemcell-refs action %q\n", action)
 		fmt.Fprintln(stderr, stemcellRefsUsage)
@@ -56,7 +62,7 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		reconcile = fs.Bool("reconcile-tags", false,
 			"remove every director-- tag that no description ref backs, on every stemcell cache template")
 		apply = fs.Bool("apply", false, "make the changes; without it the command prints the plan and changes nothing")
-		allowOwned = fs.Bool("allow-owned-vms", false, "prune the ref even though non-template VMs still carry its owner tag")
+		allowOwned = fs.Bool("allow-owned-vms", false, "prune the ref even though VMs it owns still exist; never overrides unknown ownership")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -75,30 +81,10 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 2
 	}
 
-	cfg, err := config.LoadFile(*configPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "stemcell-refs: config load failed: %s\n", err)
-		return 1
-	}
-	// The retry curves set the per-VMID lock's TTL and wait.
-	applyRetryCurves(cfg)
-	logger := log.NewNopLogger()
-	factory := opts.ClientFactory
-	if factory == nil {
-		factory = pve.NewClientWithTracer
-	}
-	client, err := factory(cfg, logger, nil)
-	if err != nil || client == nil {
-		fmt.Fprintf(stderr, "stemcell-refs: PVE client unavailable: %v\n", err)
-		return 1
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), stemcellRefsTimeout)
 	defer cancel()
-	deps := handlers.Deps{Config: cfg, PVE: client, Logger: logger}
-
-	scan, err := handlers.ScanStemcellRefs(ctx, deps)
-	if err != nil {
-		fmt.Fprintf(stderr, "stemcell-refs: cluster scan failed: %s\n", err)
+	deps, scan, ok := openStemcellRefs(ctx, *configPath, stderr, opts)
+	if !ok {
 		return 1
 	}
 	if action == "report" {
@@ -135,6 +121,38 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 1
 	}
 	return writeStemcellRefsApply(stdout, stderr, result, *jsonOut)
+}
+
+// openStemcellRefs loads the CPI config, builds the PVE client, and scans the
+// cluster, which every stemcell-refs action starts with. It prints the reason
+// on stderr and returns false when any step fails, so the caller exits 1.
+func openStemcellRefs(
+	ctx context.Context, configPath string, stderr io.Writer, opts runOptions,
+) (handlers.Deps, handlers.StemcellRefsScan, bool) {
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "stemcell-refs: config load failed: %s\n", err)
+		return handlers.Deps{}, handlers.StemcellRefsScan{}, false
+	}
+	// The retry curves set the per-VMID lock's TTL and wait.
+	applyRetryCurves(cfg)
+	logger := log.NewNopLogger()
+	factory := opts.ClientFactory
+	if factory == nil {
+		factory = pve.NewClientWithTracer
+	}
+	client, err := factory(cfg, logger, nil)
+	if err != nil || client == nil {
+		fmt.Fprintf(stderr, "stemcell-refs: PVE client unavailable: %v\n", err)
+		return handlers.Deps{}, handlers.StemcellRefsScan{}, false
+	}
+	deps := handlers.Deps{Config: cfg, PVE: client, Logger: logger}
+	scan, err := handlers.ScanStemcellRefs(ctx, deps)
+	if err != nil {
+		fmt.Fprintf(stderr, "stemcell-refs: cluster scan failed: %s\n", err)
+		return handlers.Deps{}, handlers.StemcellRefsScan{}, false
+	}
+	return deps, scan, true
 }
 
 // warnStemcellRefsNoMatch warns on stderr when a --director prune matches no
@@ -233,16 +251,26 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 			kept = append(kept, k.VMID)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", refLabel(r.Ref), dashIDs(r.DescriptionTemplates),
-			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), dashIDs(r.WouldFree), dashIDs(r.Blocked),
+			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), wouldFree(r), dashIDs(r.Blocked),
 			dashIDs(kept), dash(r.Note))
 	}
-	fmt.Fprintln(tw, "WOULD FREE assumes --allow-owned-vms; without it a prune refuses while OWNED VMS is non-zero or unknown.")
+	if rep.OwnershipUnknown {
+		fmt.Fprintln(tw, "WOULD FREE reads blocked because ownership is unknown; every --director prune refuses, "+
+			"with or without --allow-owned-vms, until every guest under OWNERSHIP UNKNOWN carries an owner tag.")
+	} else {
+		fmt.Fprintln(tw, "WOULD FREE assumes --allow-owned-vms; without it a prune refuses while OWNED VMS is non-zero or unknown.")
+	}
 	for i := range rep.Refs {
 		for _, k := range rep.Refs[i].KeptReplicas {
 			fmt.Fprintf(tw, "a prune of %s %s\n", refLabel(rep.Refs[i].Ref), keptReplicaText(k))
 		}
 	}
 	fmt.Fprintln(tw)
+	if err := tw.Flush(); err != nil {
+		fmt.Fprintf(stderr, "stemcell-refs: output could not be written: %s\n", err)
+		return 1
+	}
+	writeStemcellRefsUncovered(stdout, rep)
 	fmt.Fprintln(tw, "UNREFERENCED (prune --vmid)")
 	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tNOTES")
 	for _, u := range rep.Unreferenced {
@@ -310,7 +338,12 @@ func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellR
 		}
 		fmt.Fprintf(stdout, "  owned VMs carrying %s: %s\n", plan.OwnerTag, dashIDs(ids))
 	}
-	if plan.OwnershipUnknown {
+	switch {
+	case plan.CoverageIncomplete:
+		ids := uncoveredIDs(plan.Uncovered)
+		fmt.Fprintf(stdout, "  owned VMs: unknown, because %d BOSH guest(s) carry no owner tag (%s); "+
+			"the report lists the adopt-owners commands that cover them\n", len(ids), dashIDs(ids))
+	case plan.OwnershipUnknown:
 		fmt.Fprintf(stdout, "  owned VMs: unknown, because no owner tag exists for %s\n", plan.DirectorRef)
 	}
 	writeStemcellRefsActions(stdout, plan.Actions)
@@ -466,6 +499,46 @@ func templateNotes(t *handlers.StemcellRefsTemplate) string {
 		notes = append(notes, fmt.Sprintf("description %d bytes, near the 8192-byte limit", t.DescriptionBytes))
 	}
 	return dashList(notes)
+}
+
+// wouldFree renders a ref's WOULD FREE column, which reads blocked while
+// ownership is unknown across the cluster.
+func wouldFree(r *handlers.StemcellRefsRefSummary) string {
+	if r.PruneBlocked {
+		return "blocked"
+	}
+	return dashIDs(r.WouldFree)
+}
+
+// uncoveredIDs returns every VMID in groups, sorted.
+func uncoveredIDs(groups []handlers.StemcellRefsUncoveredGroup) []int64 {
+	var ids []int64
+	for _, g := range groups {
+		ids = append(ids, g.VMIDs...)
+	}
+	sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+	return ids
+}
+
+// writeStemcellRefsUncovered prints the OWNERSHIP UNKNOWN section of the text
+// report: why ownership is unknown, then each group of BOSH guests without an
+// owner tag, with the adopt-owners commands that cover it and where the
+// director UUID comes from. It prints nothing while every guest is covered.
+func writeStemcellRefsUncovered(w io.Writer, rep handlers.StemcellRefsReport) {
+	if len(rep.Uncovered) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "OWNERSHIP UNKNOWN")
+	fmt.Fprintln(w, rep.OwnershipUnknownReason)
+	for _, g := range rep.Uncovered {
+		fmt.Fprintf(w, "  director %s, deployment %s: vmids %s\n", refLabel(g.DirectorName), refLabel(g.Deployment),
+			dashIDs(g.VMIDs))
+		for _, c := range g.Commands {
+			fmt.Fprintln(w, "    "+c)
+		}
+		fmt.Fprintln(w, "    "+g.UUIDSource)
+	}
+	fmt.Fprintln(w)
 }
 
 // refLabel shows a blank ref visibly in the text report.

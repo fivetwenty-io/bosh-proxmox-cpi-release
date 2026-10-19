@@ -1088,6 +1088,14 @@ func parkerDirectorTag(directorID string) string {
 	return parkerDirectorTagPrefix + sd
 }
 
+// ParkerDirectorTag returns the "director--<id>" tag a parker created for
+// directorID carries, or "" when the ID is empty or sanitizes to nothing. The
+// stemcell-refs scan uses it to attribute a parker to a director ref, so it
+// must render the tag exactly the way buildParkerTags does.
+func ParkerDirectorTag(directorID string) string {
+	return parkerDirectorTag(directorID)
+}
+
 // ParkerPrefixTagPrefix marks the tag that carries a guest's resolved name
 // prefix. The tag reads "vm-prefix--<prefix>".
 //

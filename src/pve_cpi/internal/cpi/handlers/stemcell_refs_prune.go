@@ -178,13 +178,27 @@ type StemcellRefsTemplate struct {
 	cfgName string
 }
 
-// StemcellRefsGuest is one non-template guest and its owner tags.
+// StemcellRefsGuest is one non-template guest, its kind, and the tags the
+// owned-VM guard reads.
 type StemcellRefsGuest struct {
 	VMID int64  `json:"vmid"`
 	Node string `json:"node"`
 	Name string `json:"name"`
+	// Kind is parker, bosh, or other (the StemcellRefsGuest* constants).
+	Kind string `json:"kind,omitempty"`
 	// OwnerTags holds the guest's bosh-owner-- tags, lowercased.
 	OwnerTags []string `json:"owner_tags,omitempty"`
+	// DirectorTags and DeploymentTags hold the guest's director-- and
+	// deployment-- tags as stored.
+	DirectorTags   []string `json:"director_tags,omitempty"`
+	DeploymentTags []string `json:"deployment_tags,omitempty"`
+	// Uncovered is true for a BOSH guest that carries no owner tag, which
+	// makes ownership unknown for every ref.
+	Uncovered bool `json:"uncovered,omitempty"`
+
+	// tags is every tag token the scan read, from the guest's config when it
+	// could be read and from the listing otherwise.
+	tags []string
 }
 
 // StemcellRefsScan is one read of the cluster.
@@ -196,6 +210,10 @@ type StemcellRefsScan struct {
 	// blocked.
 	CloneScanComplete bool     `json:"clone_scan_complete"`
 	ScanErrors        []string `json:"scan_errors,omitempty"`
+	// Uncovered groups the BOSH guests that carry no owner tag. While it is
+	// not empty, ownership is unknown for every ref and every director prune
+	// is refused.
+	Uncovered []StemcellRefsUncoveredGroup `json:"uncovered,omitempty"`
 
 	// otherTemplates holds templates that are not recognizably stemcell
 	// cache templates (base images, for example), so --vmid can say why it
@@ -209,7 +227,9 @@ type StemcellRefsScan struct {
 // once, for the template descriptions and the disk volids. An enumeration
 // failure is returned as an error. A config read that fails on one guest is
 // recorded in ScanErrors and clears CloneScanComplete, and a template whose
-// own config could not be read is kept with ReadError set.
+// own config could not be read is kept with ReadError set. Every non-template
+// guest is sorted into a kind (parker, BOSH guest, or other), and the BOSH
+// guests that carry no owner tag are grouped in Uncovered.
 func ScanStemcellRefs(ctx context.Context, deps Deps) (StemcellRefsScan, error) {
 	scan := StemcellRefsScan{CloneScanComplete: true, otherTemplates: map[int64]string{}}
 	if deps.PVE == nil || deps.PVE.QEMU() == nil {
@@ -242,9 +262,13 @@ func ScanStemcellRefs(ctx context.Context, deps Deps) (StemcellRefsScan, error) 
 			clones[base] = append(clones[base], int64(g.VMID))
 		}
 		if !g.Template {
-			scan.Guests = append(scan.Guests, StemcellRefsGuest{
-				VMID: int64(g.VMID), Node: g.Node, Name: g.Name, OwnerTags: ownerTagsOf(g.SplitTags()),
-			})
+			// The config is the guest's own record; the listing's tags stand
+			// in only when the config could not be read.
+			tags := g.SplitTags()
+			if cfg != nil {
+				tags = parseTagsField(stringConfigField(cfg, jsonKeyTags))
+			}
+			scan.Guests = append(scan.Guests, newStemcellRefsGuest(int64(g.VMID), g.Node, g.Name, tags))
 			continue
 		}
 		t, recognized := scanStemcellTemplate(g, cfg, cfgErr)
@@ -259,6 +283,7 @@ func ScanStemcellRefs(ctx context.Context, deps Deps) (StemcellRefsScan, error) 
 		sort.Slice(list, func(a, b int) bool { return list[a] < list[b] })
 		scan.Templates[i].LinkedClones = list
 	}
+	scan.Uncovered = groupUncoveredGuests(scan.Guests)
 	return scan, nil
 }
 
@@ -434,9 +459,10 @@ type StemcellRefsPruneRequest struct {
 	DirectorRef string
 	// VMID names one unreferenced template to free.
 	VMID int64
-	// AllowOwnedVMs lets a DirectorRef prune proceed while non-template
-	// guests still carry the ref's owner tag, or when ownership cannot be
-	// determined at all, as for the unknown-director sentinel.
+	// AllowOwnedVMs lets a DirectorRef prune proceed while guests the ref
+	// owns still exist, or when no owner tag can exist for the ref, as for
+	// the unknown-director sentinel. It never overrides a scan in which some
+	// BOSH guest carries no owner tag at all.
 	AllowOwnedVMs bool
 }
 
@@ -542,12 +568,24 @@ type StemcellRefsPlan struct {
 	DirectorTag string `json:"director_tag,omitempty"`
 	OwnerTag    string `json:"owner_tag,omitempty"`
 	VMID        int64  `json:"vmid,omitempty"`
-	// OwnedVMs lists the non-template guests carrying the ref's owner tag.
+	// OwnedVMs lists the BOSH guests carrying the ref's owner tag and the
+	// parkers carrying its director tag.
 	OwnedVMs []StemcellRefsGuest `json:"owned_vms,omitempty"`
-	// OwnershipUnknown is true when no owner tag can exist for the ref, as
-	// for the unknown-director sentinel: create_vm stamps no owner tag on a
-	// VM made without a director UUID, so OwnedVMs cannot see those VMs.
+	// OwnershipUnknown is true when OwnedVMs can't be trusted to be complete.
+	// That happens when no owner tag can exist for the ref, as for the
+	// unknown-director sentinel, because create_vm stamps no owner tag on a
+	// VM made without a director UUID. It also happens when CoverageIncomplete
+	// is set.
 	OwnershipUnknown bool `json:"ownership_unknown"`
+	// CoverageIncomplete is true when some BOSH guest carries no owner tag,
+	// so it could belong to this ref's director. The plan is then refused
+	// whatever AllowOwnedVMs says.
+	CoverageIncomplete bool `json:"coverage_incomplete"`
+	// OwnershipUnknownReason explains OwnershipUnknown.
+	OwnershipUnknownReason string `json:"ownership_unknown_reason,omitempty"`
+	// Uncovered is carried from the scan, so the dry run can name the guests
+	// to adopt.
+	Uncovered []StemcellRefsUncoveredGroup `json:"uncovered,omitempty"`
 	// Refused is true when the plan must not be applied at all.
 	Refused       bool                 `json:"refused"`
 	RefusalReason string               `json:"refusal_reason,omitempty"`
@@ -756,30 +794,47 @@ func planDirectorPrune(scan StemcellRefsScan, ref string, allowOwned bool, plan 
 	}
 }
 
-// planDirectorOwnership fills the owned-VM guard. It refuses the plan, unless
-// allowOwned is set, when non-template guests carry the ref's owner tag, or
-// when no owner tag can exist for the ref at all. The second case covers the
-// unknown-director sentinel: create_vm stamps no owner tag on a VM made
-// without a director UUID, so an owned count of zero would prove nothing.
+// planDirectorOwnership fills the owned-VM guard. A BOSH guest counts as owned
+// when it carries the ref's owner tag, and a parker when it carries the ref's
+// director tag. The plan is refused in three cases:
+//
+//   - Some BOSH guest carries no owner tag. That guest could belong to the
+//     ref's director, so a count of zero proves nothing for any ref, and
+//     allowOwned does not override the refusal.
+//   - No owner tag can exist for the ref, as for the unknown-director
+//     sentinel, because create_vm stamps no owner tag on a VM made without a
+//     director UUID. allowOwned overrides this one.
+//   - Guests the ref owns still exist. allowOwned overrides this one too.
 func planDirectorOwnership(scan StemcellRefsScan, ref string, allowOwned bool, plan *StemcellRefsPlan) {
-	if plan.OwnerTag != "" {
-		for _, g := range scan.Guests {
-			if stringSliceContains(g.OwnerTags, plan.OwnerTag) {
-				plan.OwnedVMs = append(plan.OwnedVMs, g)
-			}
+	for i := range scan.Guests {
+		if stemcellRefsGuestOwnedBy(&scan.Guests[i], ref, plan.OwnerTag, plan.DirectorTag) {
+			plan.OwnedVMs = append(plan.OwnedVMs, scan.Guests[i])
 		}
 	}
-	plan.OwnershipUnknown = ref == unknownDirectorRef || plan.OwnerTag == ""
+	sentinel := ref == unknownDirectorRef || plan.OwnerTag == ""
+	plan.CoverageIncomplete = len(scan.Uncovered) > 0
+	plan.Uncovered = scan.Uncovered
+	plan.OwnershipUnknown = sentinel || plan.CoverageIncomplete
+	sentinelReason := fmt.Sprintf(
+		"ownership cannot be determined for %s: VMs created without a director UUID carry no owner tag, "+
+			"so the owned-VM check cannot see the callers that use this ref. Pass --allow-owned-vms only "+
+			"when we know no such caller still deploys from these templates", ref)
+	switch {
+	case plan.CoverageIncomplete:
+		plan.OwnershipUnknownReason = stemcellRefsCoverageReason(scan.Uncovered)
+		plan.Refused = true
+		plan.RefusalReason = plan.OwnershipUnknownReason
+		return
+	case sentinel:
+		plan.OwnershipUnknownReason = sentinelReason
+	}
 	if allowOwned {
 		return
 	}
 	switch {
 	case plan.OwnershipUnknown:
 		plan.Refused = true
-		plan.RefusalReason = fmt.Sprintf(
-			"ownership cannot be determined for %s: VMs created without a director UUID carry no owner tag, "+
-				"so the owned-VM check cannot see the callers that use this ref. Pass --allow-owned-vms only "+
-				"when we know no such caller still deploys from these templates", ref)
+		plan.RefusalReason = sentinelReason
 	case len(plan.OwnedVMs) > 0:
 		ids := make([]int64, 0, len(plan.OwnedVMs))
 		for _, g := range plan.OwnedVMs {
@@ -787,9 +842,10 @@ func planDirectorOwnership(scan StemcellRefsScan, ref string, allowOwned bool, p
 		}
 		plan.Refused = true
 		plan.RefusalReason = fmt.Sprintf(
-			"%d non-template VM(s) still carry the owner tag %s (%s); the director may still be alive. "+
+			"%d non-template VM(s) the ref owns still exist (%s): BOSH guests that carry the owner tag %s, "+
+				"or parkers that carry the director tag %s; the director may still be alive. "+
 				"Pass --allow-owned-vms only when we know those VMs are orphans",
-			len(ids), plan.OwnerTag, joinVMIDs(ids))
+			len(ids), joinVMIDs(ids), plan.OwnerTag, plan.DirectorTag)
 	}
 }
 
@@ -1665,13 +1721,19 @@ type StemcellRefsRefSummary struct {
 	// TagOnlyTemplates carry the ref's tag without holding the ref.
 	TagOnlyTemplates []int64 `json:"tag_only_templates"`
 	// OwnedVMCount is null when ownership cannot be determined for the ref,
-	// as for the unknown-director sentinel, whose VMs carry no owner tag.
+	// as for the unknown-director sentinel, whose VMs carry no owner tag, or
+	// for any ref while some BOSH guest carries no owner tag.
 	OwnedVMCount     *int    `json:"owned_vm_count"`
 	OwnershipUnknown bool    `json:"ownership_unknown"`
 	OwnedVMs         []int64 `json:"owned_vms"`
+	// OwnershipUnknownReason explains OwnershipUnknown.
+	OwnershipUnknownReason string `json:"ownership_unknown_reason,omitempty"`
 	// WouldFree lists the templates a prune of this ref would destroy, as
-	// if --allow-owned-vms were passed.
+	// if --allow-owned-vms were passed. It is empty when PruneBlocked is set.
 	WouldFree []int64 `json:"would_free"`
+	// PruneBlocked is true when a prune of this ref is refused even with
+	// --allow-owned-vms, because some BOSH guest carries no owner tag.
+	PruneBlocked bool `json:"prune_blocked"`
 	// Blocked lists the templates a prune would leave because of a safety
 	// rule.
 	Blocked []int64 `json:"blocked"`
@@ -1707,6 +1769,13 @@ type StemcellRefsReport struct {
 	DescriptionsNearLimit int      `json:"descriptions_near_limit"`
 	CloneScanComplete     bool     `json:"clone_scan_complete"`
 	ScanErrors            []string `json:"scan_errors,omitempty"`
+	// OwnershipUnknown is true when some BOSH guest carries no owner tag, so
+	// ownership is unknown for every ref and every director prune is refused.
+	OwnershipUnknown       bool   `json:"ownership_unknown"`
+	OwnershipUnknownReason string `json:"ownership_unknown_reason,omitempty"`
+	// Uncovered groups those guests by director name and deployment, with
+	// the adopt-owners commands that cover each group.
+	Uncovered []StemcellRefsUncoveredGroup `json:"uncovered"`
 }
 
 // BuildStemcellRefsReport summarizes scan. Each ref's WouldFree and Blocked
@@ -1720,9 +1789,15 @@ func BuildStemcellRefsReport(scan StemcellRefsScan) StemcellRefsReport {
 		Unreferenced:      []StemcellRefsUnreferenced{},
 		CloneScanComplete: scan.CloneScanComplete,
 		ScanErrors:        scan.ScanErrors,
+		Uncovered:         []StemcellRefsUncoveredGroup{},
 	}
 	if rep.Templates == nil {
 		rep.Templates = []StemcellRefsTemplate{}
+	}
+	if len(scan.Uncovered) > 0 {
+		rep.OwnershipUnknown = true
+		rep.OwnershipUnknownReason = stemcellRefsCoverageReason(scan.Uncovered)
+		rep.Uncovered = scan.Uncovered
 	}
 	for _, ref := range stemcellRefNames(scan) {
 		rep.Refs = append(rep.Refs, summarizeStemcellRef(scan, ref))
@@ -1799,6 +1874,18 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 	for _, g := range plan.OwnedVMs {
 		s.OwnedVMs = append(s.OwnedVMs, g.VMID)
 	}
+	s.OwnershipUnknown = plan.OwnershipUnknown
+	s.OwnershipUnknownReason = plan.OwnershipUnknownReason
+	if !s.OwnershipUnknown {
+		n := len(s.OwnedVMs)
+		s.OwnedVMCount = &n
+	}
+	// A prune that is refused even with --allow-owned-vms changes nothing,
+	// so the report lists no template as freed, blocked, or kept by it.
+	s.PruneBlocked = plan.CoverageIncomplete
+	if s.PruneBlocked {
+		return s
+	}
 	for i := range plan.Actions {
 		a := &plan.Actions[i]
 		switch {
@@ -1814,11 +1901,6 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 				StemcellRefsKeptReplica{VMID: a.VMID, Node: a.Node, Name: a.Name, Reason: a.Reason})
 		}
 		s.KeptReplicas = append(s.KeptReplicas, a.KeptReplicas...)
-	}
-	s.OwnershipUnknown = plan.OwnershipUnknown
-	if !s.OwnershipUnknown {
-		n := len(s.OwnedVMs)
-		s.OwnedVMCount = &n
 	}
 	return s
 }
