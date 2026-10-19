@@ -2060,6 +2060,18 @@ class CleanupStepRetryTest(_CertifyModule):
         self.assertEqual(rows[0][1], "SKIP")
         self.assertIn("exited 7", rows[0][2])
 
+    def test_the_last_attempt_tail_is_kept(self) -> None:
+        c = object.__new__(self.mod.Certify)
+        c.rep = _Rep()
+        c.runner = _RecordingRunner()
+        c.runner.base_env = {}
+        c.runner.logfile = None
+        c.dry_run = False
+        tails = [["first", "refused: old"], ["second", "refused: new"]]
+        with mock.patch.object(self.mod, "exec_stream", side_effect=lambda argv, **_kw: (1, tails.pop(0))):
+            self.assertFalse(c._cleanup_step("refs:prune:x", ["cpi"], 5, retries=1))
+        self.assertEqual(c.last_step_tail, ["second", "refused: new"])
+
     def test_a_step_without_retries_runs_once(self) -> None:
         ok, rows, runs = self._step([1])
         self.assertFalse(ok)
@@ -2348,6 +2360,40 @@ class CleanupRefsTest(_SyntheticRoot):
         self.assertFalse(self._run(c))
         self.assertEqual(len(c.calls), 2)
         self.assertEqual(_directorrefs.load(self.slot_dir), [UUID_BAD])
+
+    def test_a_refused_prune_prints_the_reason_the_cpi_gave(self) -> None:
+        self._record(UUID_BAD, UUID_GONE)
+        c = self._certify(live="")
+        reason = ("ownership is unknown for every ref: 2 guest(s) are BOSH guests with no "
+                  "bosh-owner--<uuid> tag (300, 301)")
+
+        def step(name, argv, timeout, env=None, retries=0):
+            c.calls.append([str(a) for a in argv])
+            if UUID_BAD in argv:
+                c.last_step_tail = ["plan (dry run unless --apply):", "refused: " + reason]
+                return False
+            c.last_step_tail = ["plan (dry run unless --apply):"]
+            return False
+
+        c._cleanup_step = step
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(self._run(c))
+        printed = out.getvalue().splitlines()
+        self.assertIn(f"cleanup-refs refusal: {UUID_BAD[:8]}: {reason}", printed)
+        self.assertFalse([line for line in printed if UUID_GONE[:8] in line and "refusal" in line])
+        kept = {row[0]: row[2] for row in c.rep.rows}
+        self.assertIn(reason, kept[f"refs:kept:{UUID_BAD[:8]}"])
+        self.assertEqual(kept[f"refs:kept:{UUID_GONE[:8]}"],
+                         "the prune failed, so the UUID stays recorded for the next run")
+        self.assertEqual(_directorrefs.load(self.slot_dir), [UUID_BAD, UUID_GONE])
+
+    def test_prune_refusal_reason_reads_the_last_refused_line(self) -> None:
+        find = self.mod.prune_refusal_reason
+        self.assertEqual(find([]), "")
+        self.assertEqual(find(["stemcell-refs: list guests: timeout"]), "")
+        self.assertEqual(find(["refused: first", "  owned VMs: 1", "refused:  the  last\t one "]), "the last one")
+        self.assertEqual(find(["warning: refused: not at the start"]), "")
 
     def test_a_failed_probe_while_state_shows_a_vm_keeps_every_record(self) -> None:
         self._record(UUID_GONE, UUID_LIVE)
@@ -2647,6 +2693,7 @@ class CleanupRefsWorkflowTest(unittest.TestCase):
         step = next(s for s in steps if "cleanup-refs" in s.get("name", ""))
         self.assertTrue(step.get("continue-on-error"))
         self.assertIn("::warning", step["run"])
+        self.assertIn("s/^cleanup-refs refusal: //p", step["run"])
         self.assertTrue(step["run"].rstrip().endswith("exit 0"))
         self.assertNotIn("set -e", step["run"])
         last = steps[-1]

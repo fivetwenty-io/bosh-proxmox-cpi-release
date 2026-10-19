@@ -428,7 +428,11 @@ jobs:
           ./scripts/certify cleanup-refs --env cpitest --no-color 2>&1 | tee "${log}" || rc=$?
           if [ "${rc}" -ne 0 ]; then
             failed="$(sed -n 's/^cleanup-refs failures: //p' "${log}" | tail -1)"
-            echo "::warning title=Stemcell ref cleanup::cleanup-refs exited ${rc}; failed: ${failed:-unknown}. The affected UUIDs stay recorded and the next run retries them."
+            # A prune that refused prints its reason on a
+            # `cleanup-refs refusal: <uuid8>: <reason>` line, and the warning
+            # repeats each one so the operator sees why without the log.
+            refusals="$(sed -n 's/^cleanup-refs refusal: //p' "${log}" | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+            echo "::warning title=Stemcell ref cleanup::cleanup-refs exited ${rc}; failed: ${failed:-unknown}.${refusals:+ Refused: ${refusals}.} The affected UUIDs stay recorded and the next run retries them."
           fi
           exit 0
 

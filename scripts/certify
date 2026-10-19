@@ -239,6 +239,22 @@ BOSH_IO_RELEASE = "https://bosh.io/d/github.com/cloudfoundry/bosh?v={version}"
 # Small helpers
 # --------------------------------------------------------------------------- #
 
+def prune_refusal_reason(lines: "list[str]") -> str:
+    """Return the reason from the last `refused: ` line a prune printed, or "".
+
+    `cpi stemcell-refs prune --apply` prints the reason it refused on one
+    stderr line that starts with `refused: `, after the plan. The step's
+    output tail holds the combined stdout and stderr, so the last such line
+    is the one the refusal wrote. Any other failure, such as a timeout or a
+    failed PVE call, leaves no such line and returns "".
+    """
+    for line in reversed(lines):
+        text = line.strip()
+        if text.startswith("refused: "):
+            return " ".join(text[len("refused: "):].split())
+    return ""
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -919,6 +935,8 @@ class Certify:
         self.results_dir = results_dir
         self.run_dir = rep.run_dir(results_dir)
 
+        # The output tail of the last _cleanup_step attempt.
+        self.last_step_tail: "list[str]" = []
         self.console_fh: "IO[str] | None" = None
         self.console_log: "ScrubbedLog | None" = None
         if not self.dry_run:
@@ -1938,10 +1956,17 @@ class Certify:
         live Director reports a different UUID. While the state shows a VM and
         the probe fails, the record stays and the log says why. A prune goes
         through the CPI's `stemcell-refs prune --director <uuid> --apply`, and
-        a successful one drops the UUID. The prune keeps its owned-VM guard, so
-        a Director whose VMs remain is refused and the UUID stays. The Directors
-        that are gone are handled first, and `bosh clean-up --all` on the live
-        Director runs last. One failure never stops the loop.
+        a successful one drops the UUID. The prune keeps its guards, so the UUID
+        stays recorded when the prune refuses. It refuses while VMs that carry
+        the Director's owner tag remain, and it refuses for every Director
+        while any BOSH guest in the cluster carries no owner tag, or has a
+        config the scan could not read, because the owned count is then
+        unknown. `cpi stemcell-refs adopt-owners` stamps the missing tags, and
+        `cpi stemcell-refs report` says how to deal with each such guest. A
+        refused prune prints `cleanup-refs refusal: <uuid8>: <reason>` with the
+        reason the CPI gave, so the workflow's warning can name it. The
+        Directors that are gone are handled first, and `bosh clean-up --all` on
+        the live Director runs last. One failure never stops the loop.
         """
         self.refs_failures: list[str] = []
         self.rep.section("cleanup-refs")
@@ -2004,6 +2029,7 @@ class Certify:
                     self.refs_failures.append(f"prune:{short}")
                     ok = False
                     continue
+                self.last_step_tail = []
                 pruned = self._cleanup_step(
                     f"refs:prune:{short}",
                     [cpi[0], "stemcell-refs", "prune", "--config", cpi[1],
@@ -2019,7 +2045,13 @@ class Certify:
                             "the next run prunes it again"
                         ), file=sys.stderr)
                 else:
-                    self.rep.skip(f"refs:kept:{short}", "the prune failed, so the UUID stays recorded for the next run")
+                    reason = prune_refusal_reason(self.last_step_tail)
+                    if reason:
+                        print(f"cleanup-refs refusal: {short}: {reason}")
+                        detail = f"the prune refused ({reason}), so the UUID stays recorded for the next run"
+                    else:
+                        detail = "the prune failed, so the UUID stays recorded for the next run"
+                    self.rep.skip(f"refs:kept:{short}", detail)
                     self.refs_failures.append(f"prune:{short}")
                     ok = False
             for uuid in live_uuids:
@@ -2652,6 +2684,9 @@ class Certify:
         retries once. A pass after a failed attempt is recorded as a PASS whose
         detail names the failed attempt. A dry run never retries, so each
         command prints one DRY-RUN line.
+
+        The output tail of the last attempt is kept in `last_step_tail`, so a
+        caller can read the reason a command gave for failing.
         """
         self.rep.begin(name)
         merged = dict(self.runner.base_env)
@@ -2661,10 +2696,11 @@ class Certify:
         first_rc = 0
         rc = 0
         for attempt in range(attempts):
-            rc, _tail = exec_stream(
+            rc, tail = exec_stream(
                 argv, env=merged, cwd=REPO_ROOT, timeout=timeout,
                 dry_run=self.dry_run, logfile=self.runner.logfile,
             )
+            self.last_step_tail = list(tail)
             if rc == 0:
                 break
             if attempt == 0:
