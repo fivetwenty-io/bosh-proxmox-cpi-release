@@ -405,12 +405,13 @@ jobs:
         # Hygiene must never turn a certification result red, so a failure
         # here becomes a warning annotation and the step exits 0.
         continue-on-error: true
-        # The step bound covers the worst case of scripts/certify's own
-        # limits (REFS_WORST_CASE_S). With up to four recorded Directors that
-        # is 300 s for one liveness probe, 900 s for `make bin/cpi`, 4 x 900 s
-        # for prunes, and 2 x 1800 s for `bosh clean-up --all` with its one
-        # retry. That sums to 8400 s, which is 140 minutes, so we allow 150.
-        timeout-minutes: 150
+        # The step bound is deliberately below the worst case of
+        # scripts/certify's own limits (REFS_WORST_CASE_S, 140 minutes with
+        # four recorded Directors), because the job's 360-minute limit has to
+        # leave room for the secrets removal below. A run cut short here is
+        # safe, because the Directors that are gone are pruned first and any UUID
+        # still recorded when the step stops is retried by the next run.
+        timeout-minutes: 30
         # Runs after BATS and before the secrets removal below, because it
         # still needs the lab credentials in vars.yml and ci/integration.yml.
         # The bootstrap Director is still standing, so it gets `bosh clean-up

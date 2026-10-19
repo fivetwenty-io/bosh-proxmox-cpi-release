@@ -2487,10 +2487,14 @@ class CleanupRefsTest(_SyntheticRoot):
         c.cleanup_refs()
         self.assertEqual(c.refs_failures, ["slot-guard"])
 
-    def test_the_step_timeout_covers_the_worst_case(self) -> None:
-        steps = _workflow()["jobs"]["certification"]["steps"]
-        step = next(s for s in steps if "cleanup-refs" in s.get("name", ""))
-        self.assertGreaterEqual(step["timeout-minutes"] * 60, self.mod.REFS_WORST_CASE_S)
+    def test_the_step_timeout_leaves_room_for_the_secrets_removal(self) -> None:
+        # The step is bounded well below the job limit rather than at the
+        # worst case, because a cut-short cleanup keeps its UUIDs recorded
+        # for the next run, while the secrets removal after it must still run.
+        job = _workflow()["jobs"]["certification"]
+        step = next(s for s in job["steps"] if "cleanup-refs" in s.get("name", ""))
+        self.assertLessEqual(step["timeout-minutes"], 30)
+        self.assertLess(step["timeout-minutes"] * 60, self.mod.REFS_WORST_CASE_S)
         self.assertEqual(
             self.mod.REFS_WORST_CASE_S,
             self.mod.SHORT_TIMEOUT_S + self.mod.REFS_BUILD_TIMEOUT_S
