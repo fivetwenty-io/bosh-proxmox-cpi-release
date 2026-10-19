@@ -400,26 +400,17 @@ jobs:
           fi
           exit "${rc}"
 
-      - name: Tear down bootstrap director
-        if: always()
-        timeout-minutes: 60
-        # Delete the bootstrap Director and its deployments, the VMs BATS
-        # created included, before cleanup-refs prunes its UUID. The prune
-        # refuses a Director whose VMs still carry its owner tag, and we never
-        # pass --allow-owned-vms. With no state in the slot this is a no-op.
-        run: |
-          set -euo pipefail
-          ./scripts/bosh teardown
-
       - name: Clean up stemcell refs (scripts/certify cleanup-refs)
         if: always()
         timeout-minutes: 45
-        # Runs after the bootstrap teardown and before the secrets removal
-        # below, because it still needs the lab credentials in vars.yml and
-        # ci/integration.yml. It prunes every Director UUID the slot recorded
-        # (the certify Director and the bootstrap Director) and keeps the
-        # UUID of any prune that failed, so the next run's `certify upgrade
-        # --force` tries again.
+        # Runs after BATS and before the secrets removal below, because it
+        # still needs the lab credentials in vars.yml and ci/integration.yml.
+        # The bootstrap Director is still standing, so it gets `bosh clean-up
+        # --all`, which frees the BATS stemcell through delete_stemcell, and
+        # its UUID stays in the slot's record. The next run's `certify upgrade
+        # --force` tears it down and prunes its UUID. The certify Director is
+        # already gone, so its UUID is pruned here. A UUID whose prune failed
+        # also stays recorded for the next run.
         run: |
           set -euo pipefail
           ./scripts/certify cleanup-refs --env cpitest --no-color

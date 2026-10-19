@@ -53,15 +53,13 @@ At the start of each run the workflow renders `slot.yml` into the slot from the 
 
 ## Stemcell refs after the run
 
-The job creates two Directors, the certification Director in `scripts/certify upgrade` and the bootstrap Director that BATS runs against. Each one leaves its UUID in the `director_refs` of the stemcell templates it used. The slot's `director-uuids` file records both, and three steps keep the lab clean.
+The job creates two Directors, the certification Director in `scripts/certify upgrade` and the bootstrap Director that BATS runs against. Each one leaves its UUID in the `director_refs` of the stemcell templates it used. The slot's `director-uuids` file records both, and two steps keep the lab clean.
 
 - The bootstrap step runs `./scripts/certify record-director` once the Director answers, so a later failure in that step doesn't lose the UUID.
 
-- The `Tear down bootstrap director` step runs under `if: always()` after BATS and deletes the bootstrap Director and its deployments. The prune refuses a Director whose VMs still exist, so this has to happen first.
+- The `Clean up stemcell refs` step runs under `if: always()` after BATS and before the secrets removal, because it still needs the lab credentials. It runs `./scripts/certify cleanup-refs`. The certify Director is already gone, so that command prunes its UUID. The bootstrap Director is still standing, so the command runs `bosh clean-up --all` against it, which deletes the BATS stemcell, and keeps its UUID in the record.
 
-- The `Clean up stemcell refs` step runs under `if: always()` right after the teardown and before the secrets removal, because it still needs the lab credentials. It runs `./scripts/certify cleanup-refs`, which prunes each recorded UUID and keeps the ones that failed.
-
-A runner that died before those steps leaves its UUIDs in the slot, and the next run's `certify upgrade --force` prunes them first. [Stemcell refs left by the Directors](upgrade.md#stemcell-refs-left-by-the-directors) describes the command.
+The run still ends with the bootstrap Director standing. The next run's `certify upgrade --force` tears it down and then prunes its UUID, and it also prunes the UUIDs of a runner that died before these steps. [Stemcell refs left by the Directors](upgrade.md#stemcell-refs-left-by-the-directors) describes the command.
 
 ## The certification Director's address
 

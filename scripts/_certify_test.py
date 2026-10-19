@@ -2358,22 +2358,21 @@ class CleanupRefsTest(_SyntheticRoot):
 
 
 class CleanupRefsWorkflowTest(unittest.TestCase):
-    """The workflow tears the bootstrap Director down before it prunes."""
+    """The workflow cleans up refs after BATS and leaves the bootstrap Director standing."""
 
-    def test_cleanup_runs_after_teardown_and_before_the_secrets_removal(self) -> None:
+    def test_cleanup_runs_after_bats_and_before_the_secrets_removal(self) -> None:
         steps = _workflow()["jobs"]["certification"]["steps"]
         names = [s.get("name", "") for s in steps]
 
         def at(fragment: str) -> int:
             return next(i for i, n in enumerate(names) if fragment in n)
 
-        cleanup, teardown = at("cleanup-refs"), at("Tear down bootstrap director")
+        cleanup = at("cleanup-refs")
         self.assertEqual(steps[cleanup]["if"], "always()")
-        self.assertEqual(steps[teardown]["if"], "always()")
-        self.assertGreater(teardown, at("BATS"))
-        self.assertGreater(cleanup, teardown)
+        self.assertGreater(cleanup, at("BATS"))
         self.assertLess(cleanup, at("Remove materialized secrets"))
         self.assertNotIn("--allow-owned-vms", steps[cleanup]["run"])
+        self.assertFalse([n for n in names if "Tear down bootstrap" in n])
 
     def test_the_bootstrap_director_is_recorded(self) -> None:
         steps = _workflow()["jobs"]["certification"]["steps"]
