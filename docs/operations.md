@@ -765,15 +765,17 @@ grep -rl 'base-<template_vmid>-disk-0' /etc/pve/nodes/*/qemu-server/*.conf
 
 When we rebuild a Director, it comes back with a new UUID. Its old UUID stays in `director_refs` on every stemcell cache template it registered, and no CPI call ever removes it, so `bosh delete-stemcell` and `bosh clean-up` can never free those templates. The `cpi stemcell-refs` command reports the refs on every cache template and removes one we name. It runs on the Director VM with the same `cpi.json` the CPI job uses, and it changes nothing until we pass `--apply`.
 
+The command acts on the one cluster that the `cpi.json` we give it names. It can't see templates or VMs on another cluster, such as a second AZ that a `cpi_config` entry adds, and it can't see the owner tags on that cluster's VMs either. On a multi-cluster foundation we run the report and the prune once per cluster, each time with a `cpi.json` aimed at that cluster, and we check the owned VM count on every cluster before we prune.
+
 We start with the report, which only reads:
 
 ```bash
 sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi stemcell-refs report --config /var/vcap/jobs/pve_cpi/config/cpi.json
 ```
 
-The report has three tables. The first lists every stemcell cache template with its node, VMID, name, and sha8, the refs in its description, its `director--` tags, whether the refs and tags disagree, and the linked clones we found. The description's refs decide whether a template stays, and the tags are only history, so a disagreement is normal after a `delete_stemcell` and isn't an error. The second table lists every distinct ref with the templates that hold it, how many VMs still carry that ref's `bosh-owner--` tag, and which templates a prune of that ref would free or leave blocked. The third lists the templates a `--vmid` prune could free, which includes templates from before 0.9.2 that have a blank description and no tags. With `--json` we get the same data as JSON. The report exits 1 when some guest's config couldn't be read, because the linked-clone column can't be trusted then.
+The report has three tables. The first lists every stemcell cache template with its node, VMID, name, and sha8, the refs in its description, its `director--` tags, whether the refs and tags disagree, and the linked clones we found. The description's refs decide whether a template stays, and the tags are only history, so a disagreement is normal after a `delete_stemcell` and isn't an error. The second table lists every distinct ref with the templates that hold it, how many VMs still carry that ref's `bosh-owner--` tag, and which templates a prune of that ref would free or leave blocked. Its free and blocked columns assume `--allow-owned-vms`, so they show what a prune would do once the owner check passes. A blank ref gets its own row with a note, because the prune can't name it. The third table lists the templates a `--vmid` prune could free, with the reason for each one it would refuse. A legacy template from before 0.9.2, which has a blank description and no tags, is freeable there. A template with a blank description that does carry a `director--` or `bosh-stemcell-cache` tag is marked "refs unknown" and is never freeable, because its ref record was lost and we can't tell who uses it. A template marked "untracked" has provenance JSON but no generation marker. It comes from a CPI generation that never recorded refs, so its empty ref set doesn't prove that nobody uses it. With `--json` we get the same data as JSON. The report exits 1 when some guest's config couldn't be read, because the linked-clone column can't be trusted then.
 
-Before we prune a ref, we make sure its Director is really gone. The owned VM count is the first check, because a live Director's VMs carry its owner tag. A VM created before 0.9.4 gets the owner tag only after the Director next sets its metadata, so on an older foundation a count of zero proves nothing, and we also compare the ref with `bosh -e <env> status` on every Director that shares the cluster.
+Before we prune a ref, we make sure its Director is gone. The owned VM count is the first check, because a live Director's VMs carry its owner tag. For the `unknown-director` ref the report shows that count as unknown, because a VM created without a Director UUID carries no owner tag, so no count can prove that such a caller has stopped. A VM created before 0.9.4 gets the owner tag only after the Director next sets its metadata, so on an older foundation a count of zero proves nothing, and we also compare the ref with `bosh -e <env> status` on every Director that shares the cluster.
 
 The prune is a dry run until we pass `--apply`:
 
@@ -782,19 +784,21 @@ cpi stemcell-refs prune --config /path/to/cpi.json --director <old-uuid>
 cpi stemcell-refs prune --config /path/to/cpi.json --director <old-uuid> --apply
 ```
 
-The ref can be any non-empty string, so `unknown-director` and test refs such as `debug-repro` work too. The command matches the ref exactly in each template's description, and it matches the tag as `director--` plus the sanitized ref. For each template that holds the ref, the apply takes the same per-VMID lock `delete_stemcell` uses, reads the template again, and removes the ref and its tag. When no ref remains, it destroys the template the way `delete_stemcell` does. If no other template of that stemcell survives, it also destroys the stemcell's per-node and per-storage replicas. A template that carries only the tag, without the ref in its description, gets the tag removed and is never destroyed.
+The ref can be any non-empty string, so test refs such as `debug-repro` work too, and so does `unknown-director` with the extra flag the rules below describe. The command trims the ref, compares it with each template's description refs after trimming them as well, and removes the ref as the description spells it. It matches the tag as `director--` plus the sanitized ref. For each template that holds the ref, the apply takes the same per-VMID lock `delete_stemcell` uses, reads the template again, and removes the ref and its tag. When no ref remains, it destroys the template the way `delete_stemcell` does. If no other template of that stemcell survives, it also destroys those of the stemcell's per-node and per-storage replicas that hold no ref of their own and back no linked clone. The plan lists every replica it will destroy and every replica it keeps, with the reason. A template that carries only the tag, without the ref in its description, gets the tag removed and is never destroyed.
 
 These rules keep the prune safe:
 
 - If any VM still carries the ref's owner tag, the command refuses and exits 1. We pass `--allow-owned-vms` only when we know those VMs are orphans.
 
-- A template whose description isn't provenance JSON is reported and never changed.
+- The command can't tell who still uses the `unknown-director` ref, because VMs created without a Director UUID carry no owner tag. It refuses to prune that ref unless we pass `--allow-owned-vms`, which we do only when we know no such caller still deploys from those templates.
 
-- A template that backs a linked clone isn't changed, and neither is a template whose replica backs one. We delete or migrate the clone first. If the scan couldn't read some guest's config, every destroy is blocked, because we can't prove that no clone exists.
+- A template whose description doesn't parse as provenance JSON is reported and never changed. A blank description counts as zero refs only on a legacy template, which has a legacy cache name and neither a `director--` tag nor the `bosh-stemcell-cache` tag. On any other template a blank description means the refs are unknown, so the prune reports that template and never changes it.
 
-- If a template changed between the plan and the apply, for example because a Director registered against it, the apply skips it.
+- A template that backs a linked clone is never destroyed, and it keeps its last ref. The prune still removes a ref that isn't the last one, or a stale tag, from such a template, because that write doesn't touch its disks. We delete or migrate the clone before the last ref can go. If the scan couldn't read some guest's config, every destroy is blocked, because we can't prove that no clone exists.
 
-- A replica's refs are a fossil of its creation, so the prune never edits a replica. Replicas go with the last template of their stemcell, as they do in `delete_stemcell`.
+- Inside the lock, the apply checks that the guest is still a template with the name, description, and tags the plan saw. If anything changed, for example because a Director registered against it, the apply skips it. The apply scans the cluster again instead of reusing an earlier dry run's plan, so it acts on what the cluster holds at that moment.
+
+- The prune never edits a replica, and it never destroys a replica that holds refs of its own. It reports such a replica and leaves it in place, even after the last template of its stemcell goes, so we remove it by hand once we know nothing uses it.
 
 - When one template fails, the command reports it, carries on with the others, and exits 1.
 
@@ -806,11 +810,11 @@ To free one template that holds no ref, such as a legacy template the report lis
 cpi stemcell-refs prune --config /path/to/cpi.json --vmid 30012 --apply
 ```
 
-The command acts only when the guest is a template, is recognizably a stemcell cache template, holds no ref, and backs no linked clone. It recognizes a cache template by its provenance JSON, by its cache tags, or by the `bosh-stemcell-` name prefix that legacy templates use, so it refuses a hand-built base image with any other name. It also refuses a replica whose stemcell still has a live template.
+The command acts only when the guest is a template, is recognizably a stemcell cache template, provably holds no ref, and backs no linked clone. It recognizes a cache template by its provenance JSON, by its cache tags, or by the `bosh-stemcell-` name prefix that legacy templates use, so it refuses a hand-built base image with any other name. It refuses a replica that holds refs of its own, a replica whose sha8 is unknown, and a replica whose stemcell still has a live template. When the template we name is the last one of its stemcell, the command also destroys that stemcell's replicas that would each pass these same checks on their own. The dry run lists those replicas, and it lists the ones it keeps with the reason.
 
-The prune frees templates, not files. For a `:heavy:` stemcell the qcow2 under `import/` stays, because a Director that still lists the stemcell could build a new template from it. Once no Director lists the stemcell, `pve-cid stemcells --orphans` shows the file with no correlated template, and we remove it with `pvesm free`, as [Post-teardown verification](#post-teardown-verification) describes.
+The prune frees templates, not files. For a `:heavy:` stemcell the qcow2 under `import/` stays, because a Director that still lists the stemcell could build a new template from it. Once no Director lists the stemcell, `pve-cid stemcells --orphans` shows the file with no correlated template, and we remove it with `pvesm free`, as the example in [Operator caveats](light-stemcells.md#operator-caveats) shows.
 
-The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any template that failed, and 2 for a usage error. We can pass `--director` or `--vmid`, but not both.
+The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any template that failed, and 2 for a usage error. We can pass `--director` or `--vmid`, but not both. With `--json`, an `--apply` run always prints the apply result, and when the plan is refused that result has `refused` set and an empty `results` list.
 
 ## Safe teardown ordering
 
