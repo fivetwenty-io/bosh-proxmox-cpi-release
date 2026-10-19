@@ -442,6 +442,9 @@ type StemcellRefsAction struct {
 	Node string `json:"node"`
 	Name string `json:"name"`
 	SHA8 string `json:"sha8,omitempty"`
+	// Replica is true when the action's template is a per-node or
+	// per-storage replica.
+	Replica bool `json:"replica,omitempty"`
 	// Reason explains a blocked or skipped action, or a tag the plan keeps.
 	Reason string `json:"reason,omitempty"`
 	// MatchedRef is the ref exactly as the description stores it, which can
@@ -555,7 +558,7 @@ func PlanStemcellRefsPrune(scan StemcellRefsScan, req StemcellRefsPruneRequest) 
 // newStemcellRefsAction starts an action for template t.
 func newStemcellRefsAction(kind string, t *StemcellRefsTemplate) StemcellRefsAction {
 	return StemcellRefsAction{
-		Kind: kind, VMID: t.VMID, Node: t.Node, Name: t.Name, SHA8: t.SHA8,
+		Kind: kind, VMID: t.VMID, Node: t.Node, Name: t.Name, SHA8: t.SHA8, Replica: t.Replica,
 		description: t.description, tags: append([]string(nil), t.Tags...), planned: true,
 	}
 }
@@ -604,9 +607,27 @@ func planDirectorPrune(scan StemcellRefsScan, ref string, allowOwned bool, plan 
 	plan.DirectorTag = directorTagFor(ref)
 	plan.OwnerTag = ownerTagFor(ref)
 	planDirectorOwnership(scan, ref, allowOwned, plan)
+	// Non-replica templates are planned first, so each replica's plan can
+	// see which templates of its sha8 survive, and so the apply reaches a
+	// replica only after every template it depends on.
 	for i := range scan.Templates {
-		if act, ok := planDirectorTemplate(scan, &scan.Templates[i], ref, plan.DirectorTag); ok {
-			plan.Actions = append(plan.Actions, act)
+		if t := &scan.Templates[i]; !t.Replica {
+			if act, ok := planDirectorTemplate(scan, t, ref, plan.DirectorTag, nil); ok {
+				plan.Actions = append(plan.Actions, act)
+			}
+		}
+	}
+	destroying := map[int64]bool{}
+	for i := range plan.Actions {
+		if plan.Actions[i].destroys() {
+			destroying[plan.Actions[i].VMID] = true
+		}
+	}
+	for i := range scan.Templates {
+		if t := &scan.Templates[i]; t.Replica {
+			if act, ok := planDirectorTemplate(scan, t, ref, plan.DirectorTag, destroying); ok {
+				plan.Actions = append(plan.Actions, act)
+			}
 		}
 	}
 }
@@ -660,8 +681,13 @@ func skipStemcellRefsAction(t *StemcellRefsTemplate, reason string, failure bool
 }
 
 // planDirectorTemplate plans one template for a director prune, or reports
-// false when the template neither holds the ref nor carries its tag.
-func planDirectorTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate, ref, dirTag string) (StemcellRefsAction, bool) {
+// false when the template neither holds the ref nor carries its tag. Replicas
+// are planned like any other template, except that their destroys follow
+// replicaDestroyBlock; destroying names the non-replica templates the plan
+// destroys, and is nil while those are being planned.
+func planDirectorTemplate(
+	scan StemcellRefsScan, t *StemcellRefsTemplate, ref, dirTag string, destroying map[int64]bool,
+) (StemcellRefsAction, bool) {
 	var spellings []string
 	if t.DescriptionState == stemcellRefsDescProvenance {
 		spellings = storedRefSpellings(t.DescriptionRefs, ref)
@@ -672,12 +698,6 @@ func planDirectorTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate, ref, d
 	case t.DescriptionState == stemcellRefsDescUnread:
 		return skipStemcellRefsAction(t,
 			"config could not be read, so we cannot tell whether it holds the ref: "+t.ReadError, true), true
-	case t.Replica:
-		if !inDesc && tagTok == "" {
-			return StemcellRefsAction{}, false
-		}
-		return skipStemcellRefsAction(t, "replica that holds the ref or its tag; the prune never edits a replica, "+
-			"and never destroys a replica that holds refs of its own", false), true
 	case t.DescriptionState == stemcellRefsDescUnparseable:
 		if tagTok == "" && !strings.Contains(t.description, ref) {
 			return StemcellRefsAction{}, false
@@ -695,7 +715,9 @@ func planDirectorTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate, ref, d
 		return skipStemcellRefsAction(t, fmt.Sprintf(
 			"the description holds the ref under %d spellings (%q); fix it by hand", len(spellings), spellings), true), true
 	case t.DestroyPending:
-		return planDirectorPending(scan, t, spellings, tagTok)
+		return planDirectorPending(scan, t, spellings, tagTok, destroying)
+	case inDesc && t.Replica:
+		return planDirectorReplicaRemoveRef(scan, t, spellings[0], tagTok, destroying), true
 	case inDesc:
 		return planDirectorRemoveRef(scan, t, spellings[0], tagTok), true
 	case tagTok != "":
@@ -710,11 +732,21 @@ func planDirectorTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate, ref, d
 }
 
 // planDirectorPending plans a template already marked bosh-destroy-pending.
-func planDirectorPending(scan StemcellRefsScan, t *StemcellRefsTemplate, spellings []string, tagTok string) (StemcellRefsAction, bool) {
+func planDirectorPending(
+	scan StemcellRefsScan, t *StemcellRefsTemplate, spellings []string, tagTok string, destroying map[int64]bool,
+) (StemcellRefsAction, bool) {
 	switch {
 	case len(spellings) == 1 && len(removeStringFromSlice(t.DescriptionRefs, spellings[0])) == 0:
 		act := planDestroy(scan, StemcellRefsActionResumeDestroy, t)
 		act.MatchedRef = spellings[0]
+		if !t.Replica || !act.destroys() {
+			return act, true
+		}
+		if reason := replicaDestroyBlock(scan, t, destroying); reason != "" {
+			act.Kind = StemcellRefsActionBlocked
+			act.Reason = reason
+			act.Failure = true
+		}
 		return act, true
 	case len(spellings) > 0:
 		return skipStemcellRefsAction(t,
@@ -747,6 +779,62 @@ func planDirectorRemoveRef(scan StemcellRefsScan, t *StemcellRefsTemplate, match
 		}
 	}
 	return act
+}
+
+// planDirectorReplicaRemoveRef plans the removal of matched from replica t.
+// The ref goes even when it is the replica's last one, because a replica's
+// refs only record the calls that seeded it. A replica left with no ref is
+// destroyed only when replicaDestroyBlock allows it; otherwise it stays with
+// an empty ref set, and the action says why.
+func planDirectorReplicaRemoveRef(
+	scan StemcellRefsScan, t *StemcellRefsTemplate, matched, tagTok string, destroying map[int64]bool,
+) StemcellRefsAction {
+	if len(removeStringFromSlice(t.DescriptionRefs, matched)) > 0 {
+		return planDirectorRemoveRef(scan, t, matched, tagTok)
+	}
+	reason := replicaDestroyBlock(scan, t, destroying)
+	kind := StemcellRefsActionRemoveRefAndDestroy
+	if reason != "" {
+		kind = StemcellRefsActionRemoveRef
+	}
+	act := newStemcellRefsAction(kind, t)
+	act.MatchedRef = matched
+	var notes []string
+	if reason != "" {
+		notes = append(notes, "the replica stays with no refs: "+reason)
+	}
+	if tagTok != "" {
+		// DropTag also serves a destroy that the apply turns into a keep.
+		if _, dropped := dropDirectorTag(t.Tags, tagTok, nil); dropped {
+			act.DropTag = tagTok
+		} else if reason != "" {
+			notes = append(notes, "tag "+tagTok+" "+stemcellRefsTagKept)
+		}
+	}
+	act.Reason = strings.Join(notes, "; ")
+	return act
+}
+
+// replicaDestroyBlock returns why a director prune must keep replica t once
+// it holds no ref, or "". These are the --vmid preconditions for a replica:
+// a known sha8, no linked clone, and no non-replica template of its sha8
+// that survives the plan. A linked clone of the replica blocks only the
+// replica, because the clone depends on the replica's base volume and not on
+// its anchor's. The template flag is checked under the lock at apply time.
+func replicaDestroyBlock(scan StemcellRefsScan, t *StemcellRefsTemplate, destroying map[int64]bool) string {
+	if t.SHA8 == "" {
+		return "replica with no known sha8, so we cannot prove its anchor is gone"
+	}
+	if reason := cloneBlock(scan, t); reason != "" {
+		return reason
+	}
+	for i := range scan.Templates {
+		a := &scan.Templates[i]
+		if !a.Replica && a.SHA8 == t.SHA8 && !destroying[a.VMID] {
+			return fmt.Sprintf("replica of template %d, which this prune keeps; it is freed with that template", a.VMID)
+		}
+	}
+	return ""
 }
 
 // liveAnchorFor returns a non-replica template other than self with sha8,
@@ -844,14 +932,17 @@ func guestByVMID(scan StemcellRefsScan, vmid int64) *StemcellRefsGuest {
 
 // attachReplicaSweeps decides what happens to a sha8's replicas when a plan
 // destroys every non-replica template of that sha8. The last of those
-// destroys carries the sweep. A replica is swept only when it passes the
+// destroys carries the sweep. A replica with an action of its own in the plan
+// is left to that action. Any other replica is swept only when it passes the
 // --vmid preconditions on its own (zeroRefBlock): it holds no ref, its
 // description can be read and parsed, and it backs no linked clone. Every
 // other replica is listed in KeptReplicas with its reason and left alone.
 func attachReplicaSweeps(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 	destroying := map[int64]bool{}
+	planned := map[int64]bool{}
 	carrier := map[string]int{}
 	for i := range plan.Actions {
+		planned[plan.Actions[i].VMID] = true
 		if plan.Actions[i].destroys() {
 			destroying[plan.Actions[i].VMID] = true
 		}
@@ -864,7 +955,7 @@ func attachReplicaSweeps(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 		carrier[a.SHA8] = i
 	}
 	for sha8, idx := range carrier {
-		replicas, survivor := orphanedReplicas(scan, sha8, destroying)
+		replicas, survivor := orphanedReplicas(scan, sha8, destroying, planned)
 		if survivor {
 			continue
 		}
@@ -882,19 +973,20 @@ func attachReplicaSweeps(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 	}
 }
 
-// orphanedReplicas returns the replicas of sha8 that the plan does not
-// already destroy, and whether a non-replica template of sha8 survives it.
-func orphanedReplicas(scan StemcellRefsScan, sha8 string, destroying map[int64]bool) ([]*StemcellRefsTemplate, bool) {
+// orphanedReplicas returns the replicas of sha8 that have no action of their
+// own in the plan, and whether a non-replica template of sha8 survives it.
+func orphanedReplicas(
+	scan StemcellRefsScan, sha8 string, destroying, planned map[int64]bool,
+) ([]*StemcellRefsTemplate, bool) {
 	var replicas []*StemcellRefsTemplate
 	survivor := false
 	for i := range scan.Templates {
 		t := &scan.Templates[i]
-		if t.SHA8 != sha8 || destroying[t.VMID] {
-			continue
-		}
-		if t.Replica {
+		switch {
+		case t.SHA8 != sha8:
+		case t.Replica && !planned[t.VMID]:
 			replicas = append(replicas, t)
-		} else {
+		case !t.Replica && !destroying[t.VMID]:
 			survivor = true
 		}
 	}
@@ -964,7 +1056,8 @@ func ApplyStemcellRefsPrune(ctx context.Context, deps Deps, plan StemcellRefsPla
 	for i := range plan.Actions {
 		act := &plan.Actions[i]
 		r := applyStemcellRefsAction(ctx, deps, logger, plan, *act, sha8Unfinished)
-		if act.destroys() && act.SHA8 != "" && len(r.Destroyed) == 0 && r.Outcome != StemcellRefsOutcomeGone {
+		if act.destroys() && !act.Replica && act.SHA8 != "" && len(r.Destroyed) == 0 &&
+			r.Outcome != StemcellRefsOutcomeGone {
 			sha8Unfinished[act.SHA8] = true
 		}
 		if r.Failure {
@@ -1041,7 +1134,11 @@ func applyStemcellRefsAction(
 		r.Failure = true
 		return r
 	}
-	alog := logger.With(log.String("node", act.Node), log.Int64("vmid", act.VMID), log.String("kind", act.Kind))
+	kind, skip := replicaApplyKind(act, sha8Unfinished, &r)
+	if skip {
+		return r
+	}
+	alog := logger.With(log.String("node", act.Node), log.Int64("vmid", act.VMID), log.String("kind", kind))
 	verify := stemcellRefsVerifier(act.Name, act.description, act.tags)
 	ranDestroy := false
 	destroy := func(ctx context.Context) error {
@@ -1060,12 +1157,15 @@ func applyStemcellRefsAction(
 	opts := deregisterOptions{verify: verify, goneOnConfigMissing: true}
 
 	var err error
-	switch act.Kind {
+	switch kind {
 	case StemcellRefsActionRemoveRef:
 		refuseDestroy := func(context.Context) error {
 			return cpierrors.Cloud("stemcell-refs: the plan keeps template %d, so it is not destroyed", act.VMID)
 		}
 		opts.dropTag = act.DropTag
+		// A replica may be kept with no refs; any other template keeps at
+		// least one, which the verifier's description check guarantees.
+		opts.keepWhenEmpty = act.Replica
 		var out deregisterOutcome
 		out, err = deregisterStemcellDirectorRefWith(ctx, deps, alog, act.Node, act.VMID, ref, refuseDestroy, opts)
 		if err == nil {
@@ -1125,6 +1225,25 @@ func applyStemcellRefsAction(
 		}
 	}
 	return r
+}
+
+// replicaApplyKind returns the kind the apply runs for act. A replica's
+// destroy depends on every non-replica template of its sha8 going first, so
+// when one of those destroys did not finish, a remove-ref-and-destroy only
+// removes the ref and a resumed destroy is skipped; both are noted in r. skip
+// reports that r is final.
+func replicaApplyKind(act StemcellRefsAction, sha8Unfinished map[string]bool, r *StemcellRefsActionResult) (string, bool) {
+	if !act.Replica || !act.destroys() || !sha8Unfinished[act.SHA8] {
+		return act.Kind, false
+	}
+	r.Notes = append(r.Notes, fmt.Sprintf("replica %d not destroyed: another template of sha8 %s was not destroyed",
+		act.VMID, act.SHA8))
+	if act.Kind != StemcellRefsActionRemoveRefAndDestroy {
+		r.Outcome = StemcellRefsOutcomeSkipped
+		r.Failure = true
+		return act.Kind, true
+	}
+	return StemcellRefsActionRemoveRef, false
 }
 
 // sweepStemcellRefsReplicas destroys the replicas planned to go with act's

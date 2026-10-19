@@ -295,6 +295,39 @@ func TestStemcellRefsPruneDryRunRefusesOwnedVMs(t *testing.T) {
 	}
 }
 
+func TestStemcellRefsPruneDryRunListsReplicas(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	desc := func(refs string) string {
+		return `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy","director_refs":` + refs + `}`
+	}
+	rtags := "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;bosh-stemcell-node-pve-node2;director--old-uuid"
+	client := &refsCLIClient{guests: []refsCLIGuest{
+		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--old-uuid", desc: desc(`["old-uuid"]`)},
+		{vmid: 150, name: "bosh-stemcell-a-1-aaaa1111", template: true, tags: rtags, desc: desc(`["old-uuid"]`)},
+		{vmid: 152, name: "bosh-stemcell-a-1-aaaa1111", template: true, tags: rtags + ";director--new-uuid",
+			desc: desc(`["old-uuid","new-uuid"]`)},
+		{vmid: 153, name: "bosh-stemcell-a-1-aaaa1111", template: true, tags: rtags, desc: desc(`["old-uuid"]`)},
+		{vmid: 200, name: "clone", disks: map[string]string{"scsi0": "local-lvm:base-153-disk-0/vm-200-disk-0"}},
+	}}
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--director", "old-uuid")
+	if code != 0 {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"remove-ref-and-destroy vmid 101",
+		"remove-ref-and-destroy vmid 150 (bosh-stemcell-a-1-aaaa1111 on pve), replica",
+		"remove-ref vmid 152 (bosh-stemcell-a-1-aaaa1111 on pve), replica, removes tag director--old-uuid, " +
+			"leaves refs new-uuid",
+		"remove-ref vmid 153 (bosh-stemcell-a-1-aaaa1111 on pve), replica, removes tag director--old-uuid: " +
+			"the replica stays with no refs: template backs 1 linked clone(s) (200)",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, stdout)
+		}
+	}
+}
+
 func TestStemcellRefsPruneApplyRefusedChangesNothing(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
 	// The fake has no pool service and panics on any other write, so exit 1

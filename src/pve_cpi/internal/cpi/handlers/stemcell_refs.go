@@ -232,6 +232,11 @@ type deregisterOptions struct {
 	// remaining ref maps to the same tag or when removing it would leave the
 	// template without a generation marker (see dropDirectorTag).
 	dropTag string
+	// keepWhenEmpty, when set, turns branch (e) into a branch (d) write: the
+	// last ref is removed, the empty ref set and the dropTag removal are
+	// persisted, and nothing is destroyed. The prune uses it for a replica
+	// it keeps after removing the replica's last ref.
+	keepWhenEmpty bool
 }
 
 // deregisterOutcome is deregisterStemcellDirectorRefWith's result.
@@ -322,21 +327,16 @@ func deregisterStemcellDirectorRefWith(
 		// (d)/(e) Remove ref from the set.
 		updatedRefs := removeStringFromSlice(prov.DirectorRefs, ref)
 
-		if len(updatedRefs) > 0 {
-			// (d) Other refs remain — persist the updated set, do not destroy.
-			var newTags *string
-			if opts.dropTag != "" {
-				if kept, dropped := dropDirectorTag(currentTags, opts.dropTag, updatedRefs); dropped {
-					joined := strings.Join(kept, pveTagJoinSep)
-					newTags = &joined
-				}
-			}
-			writeErr := persistRemainingDirectorRefs(ctx, deps, node, vmid, description, prov, updatedRefs, newTags)
+		if len(updatedRefs) > 0 || opts.keepWhenEmpty {
+			// (d) Other refs remain, or the caller keeps the template with
+			// none — persist the updated set, do not destroy.
+			dropped, writeErr := persistRefsDroppingTag(ctx, deps, node, vmid, description, prov, updatedRefs,
+				currentTags, opts.dropTag)
 			if writeErr != nil {
 				return writeErr
 			}
 			remaining = updatedRefs
-			tagDropped = newTags != nil
+			tagDropped = dropped
 			return nil
 		}
 
@@ -438,6 +438,32 @@ func removeStringFromSlice(s []string, want string) []string {
 // remain, so the template survives with an updated ref set. newTags, when
 // non-nil, is written in the same UpdateQemuConfig call (the operator prune's
 // director tag removal); delete_stemcell passes nil.
+// persistRefsDroppingTag is branch (d)'s write: it persists updatedRefs and,
+// when dropTag is set and dropDirectorTag allows it, removes that tag in the
+// same write. It reports whether the tag was removed.
+func persistRefsDroppingTag(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int64,
+	description string,
+	prov stemcellProvenance,
+	updatedRefs, currentTags []string,
+	dropTag string,
+) (bool, error) {
+	var newTags *string
+	if dropTag != "" {
+		if kept, dropped := dropDirectorTag(currentTags, dropTag, updatedRefs); dropped {
+			joined := strings.Join(kept, pveTagJoinSep)
+			newTags = &joined
+		}
+	}
+	if err := persistRemainingDirectorRefs(ctx, deps, node, vmid, description, prov, updatedRefs, newTags); err != nil {
+		return false, err
+	}
+	return newTags != nil, nil
+}
+
 func persistRemainingDirectorRefs(
 	ctx context.Context,
 	deps Deps,

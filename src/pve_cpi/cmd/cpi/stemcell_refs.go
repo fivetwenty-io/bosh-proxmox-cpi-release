@@ -285,6 +285,9 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 	for i := range actions {
 		a := &actions[i]
 		line := fmt.Sprintf("  %s vmid %d (%s on %s)", a.Kind, a.VMID, a.Name, a.Node)
+		if a.Replica {
+			line += ", replica"
+		}
 		if a.DropTag != "" {
 			line += ", removes tag " + a.DropTag
 		}
