@@ -471,6 +471,9 @@ func stemcellDescriptionNearLimit(n int) bool {
 // way. A description within stemcellDescriptionWarnMargin of the limit logs a
 // Warn and is written.
 func checkStemcellDescriptionSize(logger *log.Logger, desc, ref string, vmid int64, node string) error {
+	// Counting bytes is deliberately conservative. PVE's limit applies to
+	// characters, so a description with non-ASCII text can be rejected here
+	// that PVE would accept, but this guard never accepts one PVE rejects.
 	n := len(desc)
 	if n > pveDescriptionMaxBytes {
 		return cpierrors.Cloud("registerStemcellDirectorRef: adding director ref %q to cache template vmid %d node %q "+

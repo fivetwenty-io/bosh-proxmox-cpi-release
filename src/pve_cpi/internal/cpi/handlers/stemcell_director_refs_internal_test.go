@@ -292,6 +292,46 @@ func TestRegisterStemcellDirectorRef_DescriptionOverLimit_ErrorsWithoutWrite(t *
 	}
 }
 
+// TestCheckStemcellDescriptionSize_Boundaries pins the byte thresholds. The
+// guard counts bytes on purpose, which is conservative against PVE's
+// character limit, so non-ASCII text is measured by its UTF-8 size.
+func TestCheckStemcellDescriptionSize_Boundaries(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		desc     string
+		wantErr  bool
+		wantWarn bool
+	}{
+		{"below warn margin", strings.Repeat("x", 7167), false, false},
+		{"exactly at warn margin", strings.Repeat("x", 7168), false, true},
+		{"exactly at limit", strings.Repeat("x", pveDescriptionMaxBytes), false, true},
+		{"one byte over limit", strings.Repeat("x", pveDescriptionMaxBytes+1), true, false},
+		// 4100 two-byte characters are 8200 bytes but only 4100 characters.
+		{"non-ASCII counted in bytes", strings.Repeat("é", 4100), true, false},
+		// 3000 two-byte characters are 6000 bytes, below the warn margin.
+		{"non-ASCII below margin", strings.Repeat("é", 3000), false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			logger, err := log.NewLogger("warn", &buf)
+			if err != nil {
+				t.Fatalf("log.NewLogger: %v", err)
+			}
+			err = checkStemcellDescriptionSize(logger, tc.desc, "director-a", 6042, "pve-node1")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %v", err, tc.wantErr)
+			}
+			if warned := strings.Contains(buf.String(), "description_bytes"); warned != tc.wantWarn {
+				t.Errorf("warned = %v, want %v: %s", warned, tc.wantWarn, buf.String())
+			}
+		})
+	}
+}
+
 func TestRegisterStemcellDirectorRef_RefAlreadyPresent_NoSizeCheck(t *testing.T) {
 	t.Parallel()
 
@@ -465,6 +505,18 @@ func TestDeregisterStemcellDirectorRef_RefsRemain_TagSharedByRemainingRef_Kept(t
 		"bosh-stemcell-cache;director--director-a", "director.a")
 	if got.tags != nil {
 		t.Errorf("expected no tags write while director_a still maps to the tag, got %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_TagSharedByCaseVariant_Kept
+// pins that a tag a remaining ref backs only through case folding stays.
+func TestDeregisterStemcellDirectorRef_RefsRemain_TagSharedByCaseVariant_Kept(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"abc", "ABC"},
+		"bosh-stemcell-cache;director--ABC", "abc")
+	if got.tags != nil {
+		t.Errorf("expected no tags write while ABC still maps to the tag, got %q", *got.tags)
 	}
 }
 

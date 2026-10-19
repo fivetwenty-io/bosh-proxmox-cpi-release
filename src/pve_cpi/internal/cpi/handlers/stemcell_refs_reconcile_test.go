@@ -19,7 +19,7 @@ import (
 //   - 104 has a description that does not parse.
 //   - 105 has a blank description, so its refs are unknown.
 //   - 106 holds newRef, carries a stale tag, and is already pending destroy.
-//   - 107 holds no ref and carries a tag for oldRef.
+//   - 107 holds no ref and carries a tag for oldRef, so reconcile skips it.
 //   - 108 has a config that cannot be read.
 func addReconcileFixture(f *pruneFake) {
 	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, newRef),
@@ -58,9 +58,9 @@ func TestStemcellRefsPrune_ReconcileTagsPlan(t *testing.T) {
 	if b := actionFor(t, plan, 102); b.Kind != handlers.StemcellRefsActionRemoveTags || !b.AddsCacheMarker {
 		t.Errorf("102 action = %+v; want a drop that adds the cache marker", b)
 	}
-	if g := actionFor(t, plan, 107); g.Kind != handlers.StemcellRefsActionRemoveTags ||
-		!slices.Equal(g.DropTags, []string{"director--" + oldRef}) {
-		t.Errorf("107 action = %+v; want the tag no ref backs dropped", g)
+	if g := actionFor(t, plan, 107); g.Kind != handlers.StemcellRefsActionSkip || g.Failure ||
+		!strings.Contains(g.Reason, "holds no ref") {
+		t.Errorf("107 action = %+v; want a non-failing skip because the template holds no ref", g)
 	}
 	for _, vmid := range []int64{104, 105, 106, 108} {
 		if s := actionFor(t, plan, vmid); s.Kind != handlers.StemcellRefsActionSkip || s.Failure {
@@ -98,7 +98,7 @@ func TestStemcellRefsPrune_ReconcileTagsApply(t *testing.T) {
 		descBefore[vmid] = f.cfgString(vmid, "description")
 	}
 	tagsBefore := map[int64]string{}
-	for _, vmid := range []int64{103, 104, 105, 106, 108} {
+	for _, vmid := range []int64{103, 104, 105, 106, 107, 108} {
 		tagsBefore[vmid] = f.cfgString(vmid, "tags")
 	}
 
@@ -126,9 +126,6 @@ func TestStemcellRefsPrune_ReconcileTagsApply(t *testing.T) {
 	if tags := f.cfgString(102, "tags"); strings.Contains(tags, "director--"+oldRef) ||
 		!strings.Contains(tags, "bosh-stemcell-cache") {
 		t.Errorf("102 tags = %q; want the stale tag gone and the cache marker added", tags)
-	}
-	if tags := f.cfgString(107, "tags"); strings.Contains(tags, "director--") {
-		t.Errorf("107 tags = %q; want no director tag", tags)
 	}
 	for vmid, want := range tagsBefore {
 		if got := f.cfgString(vmid, "tags"); got != want {
@@ -158,6 +155,35 @@ func TestStemcellRefsPrune_ReconcileTagsApply(t *testing.T) {
 		if act.Kind == handlers.StemcellRefsActionRemoveTags {
 			t.Errorf("rerun still plans %+v", act)
 		}
+	}
+}
+
+// TestStemcellRefsPrune_ReconcileTagsMatchesCaseAndSanitize pins that a tag a
+// ref backs only through case folding or sanitizing is kept, and that a
+// replica gets the same treatment as a main template.
+func TestStemcellRefsPrune_ReconcileTagsMatchesCaseAndSanitize(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, "a.b"), "bosh-stemcell-sha-"+shaA+";director--a-b")
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, "abc"), "bosh-stemcell-sha-"+shaB+";director--ABC")
+	f.addTemplate(103, "bosh-stemcell-c-1-cccc3333", provDesc("cccc3333", "a.b"),
+		cacheTemplateTags("cccc3333")+";director--a-b;director--"+oldRef)
+
+	_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{ReconcileTags: true})
+	for _, act := range plan.Actions {
+		switch act.VMID {
+		case 101, 102:
+			t.Errorf("%d is backed through sanitize or case but got an action: %+v", act.VMID, act)
+		case 103:
+			if act.Kind != handlers.StemcellRefsActionRemoveTags ||
+				!slices.Equal(act.DropTags, []string{"director--" + oldRef}) ||
+				!slices.Equal(act.KeptTags, []string{"director--a-b"}) {
+				t.Errorf("103 action = %+v; want only the unbacked tag dropped", act)
+			}
+		}
+	}
+	if len(plan.Actions) != 1 {
+		t.Errorf("plan = %+v; want one action for 103", plan.Actions)
 	}
 }
 

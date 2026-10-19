@@ -613,7 +613,9 @@ func PlanStemcellRefsPrune(scan StemcellRefsScan, req StemcellRefsPruneRequest) 
 // generation marker. A template whose refs are unknown (unread, unparseable,
 // or a blank description that is not legacy) and that carries a director tag
 // gets a non-failing skip, and so does a template already marked
-// bosh-destroy-pending, whose tags the destroy is about to make moot.
+// bosh-destroy-pending, whose tags the destroy is about to make moot, and a
+// template whose ref set is empty, because its director tags are what keep it
+// reachable by its director's orphan prune.
 // Nothing here removes a ref or destroys a template, because the description
 // refs alone decide whether a template stays.
 func planReconcileTags(scan StemcellRefsScan, plan *StemcellRefsPlan) {
@@ -640,6 +642,10 @@ func planReconcileTags(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 		case t.DestroyPending:
 			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
 				"destroy already pending; its tags stay until the destroy finishes", false))
+			continue
+		case len(t.DescriptionRefs) == 0:
+			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
+				"holds no ref, so its tags stay for the last holder's orphan prune", false))
 			continue
 		}
 		kept, dropped, added := reconcileDirectorTags(t.Tags, t.DescriptionRefs)
@@ -1539,10 +1545,11 @@ func reconcileStemcellDirectorTagsLocked(
 	owner := fmt.Sprintf("stemcell/director_ref/reconcile_tags/%d", vmid)
 	return rewriteStemcellTagsLocked(ctx, deps, logger, node, vmid, owner, verify,
 		func(tags, refs []string, refsKnown bool) ([]string, bool, bool) {
-			if !refsKnown {
+			if !refsKnown || len(refs) == 0 {
 				// The verifier already proved the description is the one
 				// the plan parsed; this keeps a description that does not
-				// parse from ever reading as an empty ref set.
+				// parse from ever reading as an empty ref set. A template
+				// with no refs keeps its tags, as the plan does.
 				return tags, false, false
 			}
 			kept, dropped, added := reconcileDirectorTags(tags, refs)
