@@ -76,5 +76,31 @@ class WrapperContract(unittest.TestCase):
                 self.assertEqual(result.stdout, "--config\n" + str(job / "config/cpi.json") + "\n" + request)
 
 
+    def test_version_flag_forwards_the_job_config(self):
+        with tempfile.TemporaryDirectory(prefix="CPI wrapper version ") as tmp:
+            base = pathlib.Path(tmp)
+            job = base / "install/jobs/pve_cpi"
+            (job / "bin").mkdir(parents=True)
+            (job / "config").mkdir()
+            launch = job / "bin/cpi"
+            launch.write_bytes(TEMPLATE.read_bytes())
+            (base / "install/packages/pve_cpi/bin").mkdir(parents=True)
+            binary = base / "install/packages/pve_cpi/bin/cpi"
+            binary.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+            binary.chmod(0o700)
+            env = dict(os.environ)
+            env.pop("BOSH_PACKAGES_DIR", None)
+            result = subprocess.run(["bash", str(launch), "--version"], input="", text=True,
+                                    capture_output=True, env=env, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "--version\n--config\n" + str(job / "config/cpi.json") + "\n")
+
+            # Any other argument list is ignored, as before.
+            result = subprocess.run(["bash", str(launch), "--version", "extra"], input="", text=True,
+                                    capture_output=True, env=env, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "--config\n" + str(job / "config/cpi.json") + "\n")
+
+
 if __name__ == "__main__":
     unittest.main()

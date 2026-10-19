@@ -38,15 +38,47 @@ fi
 # Render the template under a synthetic property-map. The BOSH job DSL exposes
 # `p(name, default=nil)` and `if_p(name) { |v| ... }`. We re-implement that
 # minimal surface here so the same .erb file can be rendered standalone.
+#
+# An optional second argument is the job spec as JSON. When it is given, the
+# template sees `spec` the way a BOSH renderer exposes it: nested objects whose
+# attributes read as methods and whose missing attributes read as nil. When it
+# is absent, `spec` is undefined, which is the harshest case a renderer could
+# hand the template.
 render() {
   local props_ruby="$1"
-  ruby - "$ERB_PATH" "$props_ruby" <<'RUBY'
+  local spec_json="${2:-}"
+  ruby - "$ERB_PATH" "$props_ruby" "$spec_json" <<'RUBY'
 require 'erb'
 require 'json'
 
 erb_path  = ARGV[0]
 props_src = ARGV[1]
+spec_src  = ARGV[2].to_s
 $props    = eval(props_src) # operator-controlled in this test only
+
+# SpecNode mirrors the OpenStruct a BOSH renderer wraps the spec in.
+class SpecNode
+  def initialize(hash)
+    @hash = hash
+  end
+
+  def method_missing(name, *args)
+    return super unless args.empty?
+    v = @hash[name.to_s]
+    v.is_a?(Hash) ? SpecNode.new(v) : v
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    @hash.key?(name.to_s) || super
+  end
+end
+
+unless spec_src.empty?
+  $spec = SpecNode.new(JSON.parse(spec_src))
+  def spec
+    $spec
+  end
+end
 
 def lookup(key)
   parts = key.split('.')
@@ -368,6 +400,21 @@ assert_json_lacks_key "case9-empty" "$JSON_9E" vm_cid_format         || FAILED=$
 assert_json_lacks_key "case9-empty" "$JSON_9E" cluster_stamp_aliases || FAILED=$((FAILED+1))
 assert_json_lacks_key "case9-unset" "$JSON_1" vm_cid_format          || FAILED=$((FAILED+1))
 assert_json_lacks_key "case9-unset" "$JSON_1" cluster_stamp_aliases  || FAILED=$((FAILED+1))
+
+# release_version renders from spec.release.version, which a director supplies.
+# A renderer that supplies no release, or no spec at all, leaves the key out, so
+# `cpi --version` falls back to the package version.
+echo "Case 10: release_version"
+JSON_10="$(render "$PROPS_1" '{"name":"pve_cpi","release":{"name":"bosh-proxmox-cpi","version":"0.9.5"}}')"
+assert_json_valid      "case10" "$JSON_10"                        || FAILED=$((FAILED+1))
+assert_json_key_equals "case10" "$JSON_10" release_version 0.9.5  || FAILED=$((FAILED+1))
+JSON_10N="$(render "$PROPS_1" '{"name":"pve_cpi"}')"
+assert_json_valid     "case10-no-release" "$JSON_10N"                 || FAILED=$((FAILED+1))
+assert_json_lacks_key "case10-no-release" "$JSON_10N" release_version || FAILED=$((FAILED+1))
+JSON_10E="$(render "$PROPS_1" '{"name":"pve_cpi","release":{"name":"bosh-proxmox-cpi","version":""}}')"
+assert_json_valid     "case10-empty" "$JSON_10E"                 || FAILED=$((FAILED+1))
+assert_json_lacks_key "case10-empty" "$JSON_10E" release_version || FAILED=$((FAILED+1))
+assert_json_lacks_key "case10-no-spec" "$JSON_1" release_version || FAILED=$((FAILED+1))
 
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2

@@ -49,3 +49,30 @@ func TestStringWithOverride(t *testing.T) {
 		t.Errorf("String() = %q, want %q", s, want)
 	}
 }
+
+// no t.Parallel: mutates package-level Version/BuildDate
+func TestStringWithRelease(t *testing.T) {
+	origVersion, origDate := Version, BuildDate
+	defer func() { Version, BuildDate = origVersion, origDate }()
+	Version = "3f2a9c1e"
+	BuildDate = "2026-10-19T00:00:00Z"
+
+	cases := []struct {
+		release, want string
+	}{
+		{"0.9.5", "bosh-proxmox-cpi 0.9.5 (package 3f2a9c1e, built 2026-10-19T00:00:00Z)"},
+		{"0.9.5+dev.3", "bosh-proxmox-cpi 0.9.5+dev.3 (package 3f2a9c1e, built 2026-10-19T00:00:00Z)"},
+		{"", String()},
+		{"0.9.5 beta", String()},
+		{"0.9.5\nforged line", String()},
+		{strings.Repeat("9", maxReleaseVersionLen+1), String()},
+	}
+	for _, tc := range cases {
+		if got := StringWithRelease(tc.release); got != tc.want {
+			t.Errorf("StringWithRelease(%q) = %q, want %q", tc.release, got, tc.want)
+		}
+	}
+	if got := ReleaseVersion(strings.Repeat("9", maxReleaseVersionLen)); len(got) != maxReleaseVersionLen {
+		t.Errorf("a %d-character release was dropped", maxReleaseVersionLen)
+	}
+}

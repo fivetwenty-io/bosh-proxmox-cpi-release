@@ -26,4 +26,11 @@ fi
 
 cd "${JOB_DIR}" || exit 1
 
+# An operator who runs bin/cpi --version gets the release version that the job
+# config records, which the binary alone can't know. Every other invocation
+# ignores its arguments, as BOSH passes none.
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+  exec "${BIN}" --version --config "${JOB_DIR}/config/cpi.json"
+fi
+
 exec "${BIN}" --config "${JOB_DIR}/config/cpi.json"

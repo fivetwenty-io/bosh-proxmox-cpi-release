@@ -907,5 +907,18 @@
   # operator clarity).
   if_p("pve.iso_storage_follow_vm_storage") { |v| config["iso_storage_follow_vm_storage"] = v }
 
+  # Emit release_version so `cpi --version` and the startup log can name the
+  # release. The package compiles before a release version exists, so the
+  # binary itself only knows its package fingerprint. A renderer that supplies
+  # no spec.release, or no spec at all, leaves the key out, and the CPI then
+  # prints its package version as before.
+  release_version = begin
+    rel = spec.release
+    rel.nil? ? "" : rel.version.to_s.strip
+  rescue NameError
+    ""
+  end
+  config["release_version"] = release_version unless release_version.empty?
+
   JSON.dump(config)
 %>

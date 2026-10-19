@@ -233,6 +233,14 @@ type CPIConfig struct {
 	// with no suffix — byte-identical to prior releases.
 	OperatorID string `json:"operator_id,omitempty"`
 
+	// ReleaseVersion is the BOSH release version the job template renders
+	// from spec.release.version. The package compiles before a release
+	// version exists, so the binary only knows its package fingerprint; this
+	// lets `cpi --version` and the startup log name the release. Empty when
+	// the renderer supplies no release, and then both fall back to the
+	// package version. It is informational and never validated.
+	ReleaseVersion string `json:"release_version,omitempty"`
+
 	// Agent
 	AgentMode    string `json:"agent_mode"`
 	VMDiskFormat string `json:"vm_disk_format,omitempty"`

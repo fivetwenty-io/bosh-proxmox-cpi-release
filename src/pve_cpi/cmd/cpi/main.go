@@ -274,7 +274,17 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	}
 
 	if *showVersion {
-		fmt.Fprintln(stdout, version.String())
+		// With --config, name the release the job template recorded. A
+		// config that can't be read still answers, with the package version.
+		release := ""
+		if *configPath != "" {
+			rel, err := releaseVersionFromConfig(*configPath)
+			if err != nil {
+				fmt.Fprintf(stderr, "cpi: release version unavailable: %s\n", err)
+			}
+			release = rel
+		}
+		fmt.Fprintln(stdout, version.StringWithRelease(release))
 		return 0
 	}
 
@@ -329,6 +339,9 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// changes the process's exit code: every deadline is bounded, and an
 	// export failure must never fail a CPI action.
 	defer shutdownOTelSignals(cfg, logger, otelShutdown, logsShutdown, metricsShutdown)
+
+	logger.Info("cpi: starting", log.String("release_version", releaseVersionLabel(cfg.ReleaseVersion)),
+		log.String("package_version", version.Version), log.String("build_date", version.BuildDate))
 
 	clientFactory := opts.ClientFactory
 	if clientFactory == nil {
