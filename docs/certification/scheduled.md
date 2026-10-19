@@ -51,6 +51,18 @@ The main Director's state directory, `/home/runner/gha-lab-state`, is not mounte
 
 At the start of each run the workflow renders `slot.yml` into the slot from the committed template `ci/certification-slot.yml` and the vars secret. It gives the certification Director its own `internal_ip`, the alias `pve-certification`, the name `certification`, and the VM name segment `create-env-certification`.
 
+## Stemcell refs after the run
+
+The job creates two Directors, the certification Director in `scripts/certify upgrade` and the bootstrap Director that BATS runs against. Each one leaves its UUID in the `director_refs` of the stemcell templates it used. The slot's `director-uuids` file records both, and three steps keep the lab clean.
+
+- The bootstrap step runs `./scripts/certify record-director` once the Director answers, so a later failure in that step doesn't lose the UUID.
+
+- The `Tear down bootstrap director` step runs under `if: always()` after BATS and deletes the bootstrap Director and its deployments. The prune refuses a Director whose VMs still exist, so this has to happen first.
+
+- The `Clean up stemcell refs` step runs under `if: always()` right after the teardown and before the secrets removal, because it still needs the lab credentials. It runs `./scripts/certify cleanup-refs`, which prunes each recorded UUID and keeps the ones that failed.
+
+A runner that died before those steps leaves its UUIDs in the slot, and the next run's `certify upgrade --force` prunes them first. [Stemcell refs left by the Directors](upgrade.md#stemcell-refs-left-by-the-directors) describes the command.
+
 ## The certification Director's address
 
 The certification Director sits on the same cpitest network as the main Director (172.31.0.0/24), so it needs an address that nothing else claims. These are the addresses the tracked files claim on that network.
