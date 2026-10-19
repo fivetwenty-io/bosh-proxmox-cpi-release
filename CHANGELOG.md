@@ -24,6 +24,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - `delete_stemcell` now removes the departing director's `director--` tag from a stemcell cache template that other directors still hold, in the same write that removes its ref, and adds the `bosh-stemcell-cache` tag when the template would otherwise be left with no generation marker. The tags on a template therefore name the directors that hold it now, instead of every director that ever did. The last holder's tag still stays when its ref goes, so a template whose destroy fails stays visible to the orphan prune, and that director's next `delete_stemcell` still finds it by its sha8 and generation marker. A request without a director UUID drops the `director--unknown-director` tag by the same rule. `cpi stemcell-refs prune --director` follows the same rule, so a stale tag that was a template's only generation marker is now dropped and replaced by `bosh-stemcell-cache`, where the prune used to keep the tag and skip that template.
 
+- Every Go module is at its latest release, and so are the CI pins. That covers the golang:1.27 image digest, golangci-lint v2.15.0, staticcheck v0.8.2, trivy v0.76.0, the bosh CLI 7.11.1, and uv 0.13.1. The default RustFS version for the lab artifacts server moves from 1.0.0-beta.3 to the 1.0.3 stable release.
+
 ## [0.9.4] - 2026-10-14
 
 ### Added
