@@ -113,6 +113,7 @@ func newStemcellRefsGuest(vmid int64, node, name string, tags []string, desc, re
 			g.DeploymentTags = append(g.DeploymentTags, tok)
 		}
 	}
+	g.Instance = instanceOf(tags, desc)
 	g.NotesMetadata = hasDirectorMetadataLines(desc)
 	g.notesDirector, g.notesDeployment, _ = directorMetadataValues(desc)
 	switch {
@@ -126,6 +127,51 @@ func newStemcellRefsGuest(vmid int64, node, name string, tags []string, desc, re
 	}
 	g.Uncovered = readErr != "" || (g.Kind == StemcellRefsGuestBOSH && len(g.OwnerTags) == 0)
 	return g
+}
+
+// instanceOf returns the BOSH instance a guest records as <instance
+// group>/<index>, the group alone when the index is unknown, or "" when the
+// group is unknown. Each part comes from the guest's tags when they hold
+// exactly one value for it: instance-group--, or job-- when that is missing,
+// and index--. Otherwise it comes from the instance_group (or job) and index
+// lines set_vm_metadata writes into the notes, sanitized the way the tags
+// are. A part with several different values is unknown, because the guest
+// then doesn't say which instance it is.
+func instanceOf(tags []string, desc string) string {
+	notes := map[string]string{}
+	for _, line := range strings.Split(desc, "\n") {
+		key, value, ok := strings.Cut(strings.TrimRight(line, "\r"), ": ")
+		if value = sanitizeTagValue(strings.TrimSpace(value)); ok && value != "" {
+			notes[key] = value
+		}
+	}
+	part := func(tagPrefixes []string, noteKeys []string) string {
+		for _, prefix := range tagPrefixes {
+			switch vals := tagValues(tags, prefix); len(vals) {
+			case 0:
+				continue
+			case 1:
+				return vals[0]
+			default:
+				return ""
+			}
+		}
+		for _, k := range noteKeys {
+			if v := notes[k]; v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	group := part([]string{"instance-group--", "job--"}, []string{"instance_group", "job"})
+	index := part([]string{"index--"}, []string{"index"})
+	switch {
+	case group == "":
+		return ""
+	case index == "":
+		return group
+	}
+	return group + "/" + index
 }
 
 // tagsContainFold reports whether tags hold want, ignoring case.
@@ -375,13 +421,19 @@ func groupUncoveredGuests(guests []StemcellRefsGuest) []StemcellRefsUncoveredGro
 // commands returns the adopt-owners commands that cover an adoptable group,
 // and where the director UUID comes from.
 //
+// No command ever carries a UUID. An owner tag on some of the name's guests
+// doesn't prove whose the uncovered ones are, because two directors can share
+// a name, so the command prints the placeholder and the note says where the
+// operator reads the value.
+//
 // A named director gets one command, the same on each of its groups, because
 // the pairing check refuses a UUID that already sits on a deployment the run
 // doesn't name. When the name's guests carry no owner tag yet, the command
 // names every deployment of the name's adoptable guests. When they carry one
-// owner tag, the command uses that UUID and names every deployment of the
-// name. When they carry several, two directors share the name, and the
-// command names only the group's deployment.
+// owner tag, the command names every deployment of the name, and the note
+// says which deployments carry that tag without claiming the uncovered guests
+// belong to it. When they carry several, two directors share the name, and
+// the command names only the group's deployment.
 //
 // A create-env Director VM gets one command per VM, with --vmid and
 // --deployment, because every create-env VM carries director--bosh-init and
@@ -419,12 +471,21 @@ func (idx *adoptIndex) commands(grp *StemcellRefsUncoveredGroup) ([]string, stri
 				"The command names every deployment whose uncovered VMs carry that tag. Compare them with "+
 				"`bosh -e <env> deployments` on that director, drop any it doesn't list, and add any it lists that "+
 				"are missing, because two directors can share a name.", tag)
-	case len(owners) == 1 && directorUUIDValue.MatchString(owners[0]):
-		return []string{cmd(owners[0], sortedKeys(info.deployments))}, fmt.Sprintf(
-			"VMs tagged %s already carry %s%s, so that is the UUID of the director they belong to; confirm it "+
-				"with `bosh -e <env> env`. The command names every deployment whose VMs carry %s. Compare them "+
-				"with `bosh -e <env> deployments` on that director and drop any it doesn't list.",
-			tag, ownerTagPrefix, owners[0], tag)
+	case len(owners) == 1:
+		var owned []string
+		for _, dep := range sortedKeys(info.deployments) {
+			if info.ownersByDeployment[dep][owners[0]] {
+				owned = append(owned, dep)
+			}
+		}
+		return []string{cmd("<director-uuid>", sortedKeys(info.deployments))}, fmt.Sprintf(
+			"<director-uuid> is the UUID that `bosh -e <env> env` prints for the director whose "+
+				"`bosh -e <env> deployments` lists these deployments. The command names every deployment whose VMs "+
+				"carry %s. VMs in deployment(s) %s already carry %s%s, which doesn't prove whose the uncovered VMs "+
+				"are, because two directors can share a name. Compare the deployments with `bosh -e <env> "+
+				"deployments` on the director you adopt for and drop any it doesn't list; adopt-owners refuses a "+
+				"UUID that contradicts an owner tag on any of them.",
+			tag, strings.Join(owned, ", "), ownerTagPrefix, owners[0])
 	}
 	return []string{cmd("<director-uuid>", []string{grp.Deployment})}, fmt.Sprintf(
 		"VMs tagged %s carry the owner tags of %d directors (%s), so more than one director uses the name. Use "+

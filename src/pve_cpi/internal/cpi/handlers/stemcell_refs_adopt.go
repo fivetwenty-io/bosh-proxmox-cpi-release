@@ -91,8 +91,12 @@ type StemcellRefsAdoptGuest struct {
 	// carries none, or several values joined by "," when it carries more.
 	Deployment     string   `json:"deployment"`
 	DeploymentTags []string `json:"deployment_tags,omitempty"`
-	OwnerTags      []string `json:"owner_tags,omitempty"`
-	DirectorTags   []string `json:"director_tags,omitempty"`
+	// Instance is the BOSH instance the guest records, as <instance
+	// group>/<index>, so the operator can compare the plan with
+	// `bosh -d <deployment> vms`. It is "" when the guest doesn't say.
+	Instance     string   `json:"instance,omitempty"`
+	OwnerTags    []string `json:"owner_tags,omitempty"`
+	DirectorTags []string `json:"director_tags,omitempty"`
 	// Reason says why a guest is skipped or conflicts.
 	Reason string `json:"reason,omitempty"`
 }
@@ -112,7 +116,12 @@ type StemcellRefsAdoptPlan struct {
 	// tag that the run doesn't name. Their guests are left alone. When two
 	// directors share a name, they belong to the other one.
 	OtherDeployments []string `json:"other_deployments"`
-	VMIDs            []int64  `json:"vmids,omitempty"`
+	// UnmatchedDeployments are requested deployments that no guest with the
+	// director tag carries on this cluster, such as a deployment whose VMs
+	// all run in another AZ's cluster. The run warns about them and goes on,
+	// and it refuses only when no requested deployment matches.
+	UnmatchedDeployments []string `json:"unmatched_deployments"`
+	VMIDs                []int64  `json:"vmids,omitempty"`
 	// Targets are the guests the apply stamps, sorted by deployment and
 	// VMID.
 	Targets []StemcellRefsAdoptGuest `json:"targets"`
@@ -204,6 +213,7 @@ func adoptGuestFrom(g *StemcellRefsGuest, reason string) StemcellRefsAdoptGuest 
 		VMID: g.VMID, Node: g.Node, Name: g.Name,
 		Deployment:     strings.Join(tagSuffixes(g.DeploymentTags, deploymentTagPrefix), ","),
 		DeploymentTags: g.DeploymentTags,
+		Instance:       g.Instance,
 		OwnerTags:      g.OwnerTags,
 		DirectorTags:   g.DirectorTags,
 		Reason:         reason,
@@ -257,7 +267,13 @@ func adoptWithinRequest(g *StemcellRefsGuest, dirTag string, deps map[string]boo
 // may carry another owner tag. That is how two directors share a name.
 func adoptPairConflict(g *StemcellRefsGuest, plan *StemcellRefsAdoptPlan, deps map[string]bool) string {
 	var reasons []string
-	if stringSliceContains(g.OwnerTags, plan.OwnerTag) && !adoptWithinRequest(g, plan.DirectorTag, deps) {
+	switch {
+	case !stringSliceContains(g.OwnerTags, plan.OwnerTag) || adoptWithinRequest(g, plan.DirectorTag, deps):
+	case len(g.DirectorTags) == 0 && len(g.DeploymentTags) == 0:
+		reasons = append(reasons, fmt.Sprintf("it carries %s but no director-- or deployment-- tag yet, which is "+
+			"how a VM looks while a deploy is creating it, so the run can't tell which deployment it is in; run "+
+			"adopt-owners again once the deploy finishes", plan.OwnerTag))
+	default:
 		reasons = append(reasons, fmt.Sprintf("it carries %s with director tags [%s] and deployment tags [%s], "+
 			"outside the director name and deployments this run names, so that UUID already belongs to another "+
 			"director or deployment", plan.OwnerTag, strings.Join(g.DirectorTags, ", "),
@@ -287,7 +303,8 @@ func newAdoptPlan(scan StemcellRefsScan, req StemcellRefsAdoptRequest) StemcellR
 		DirectorName: req.DirectorName,
 		DirectorTag:  directorTagPrefix + sanitizeTagValue(req.DirectorName),
 		Deployments:  []string{}, DeploymentTags: []string{}, OtherDeployments: []string{},
-		Targets: []StemcellRefsAdoptGuest{}, AlreadyOwned: []StemcellRefsAdoptGuest{},
+		UnmatchedDeployments: []string{},
+		Targets:              []StemcellRefsAdoptGuest{}, AlreadyOwned: []StemcellRefsAdoptGuest{},
 		Skipped: []StemcellRefsAdoptGuest{}, Conflicts: []StemcellRefsAdoptGuest{},
 		ScanErrors: scan.ScanErrors,
 		planned:    true,
@@ -330,9 +347,12 @@ func newAdoptPlan(scan StemcellRefsScan, req StemcellRefsAdoptRequest) StemcellR
 // otherwise. The pairing checks in adoptPairConflict run on every guest in
 // the cluster, selected or not, and any conflict refuses the plan.
 //
-// The plan is also refused when the scan could not read every guest, when a
-// requested deployment matches no guest with the director name, and when a
-// requested VMID is not a selected guest. For the create-env name, bosh-init,
+// The plan is also refused when the scan could not read every guest, when no
+// requested deployment matches a guest with the director name, when a
+// requested VMID is not a selected guest, and when two selected guests in one
+// deployment record the same instance group and index. A requested
+// deployment that matches no guest while others do is listed in
+// UnmatchedDeployments and doesn't refuse the plan. For the create-env name, bosh-init,
 // the selection must hold exactly one guest, the owner tag may sit on no
 // other guest, and every guest without director--bosh-init must already be
 // covered, so the deployed directors are adopted first and a UUID copied from
@@ -394,8 +414,9 @@ func PlanStemcellRefsAdopt(scan StemcellRefsScan, req StemcellRefsAdoptRequest) 
 	problems := adoptScanProblems(scan)
 	problems = append(problems, adoptDeploymentProblems(&plan, matched)...)
 	problems = append(problems, adoptVMIDProblems(scan, &plan, deps)...)
+	problems = append(problems, adoptInstanceProblems(&plan)...)
 	if plan.createEnv() {
-		problems = append(problems, adoptCreateEnvProblems(scan, &plan, selected, len(matched) == len(deps))...)
+		problems = append(problems, adoptCreateEnvProblems(scan, &plan, selected, len(matched) > 0)...)
 	}
 	if len(plan.Conflicts) > 0 {
 		ids := make([]int64, 0, len(plan.Conflicts))
@@ -439,28 +460,86 @@ func adoptScanProblems(scan StemcellRefsScan) []string {
 		"every guest; fix the reads the scan errors name and run adopt-owners again", len(scan.ScanErrors))}
 }
 
-// adoptDeploymentProblems returns one problem for each requested deployment
-// that no guest with the director name carries.
+// adoptDeploymentProblems records each requested deployment that no guest
+// with the director name carries in plan.UnmatchedDeployments. A deployment
+// can have no VMs on this cluster, for example when they all run in another
+// AZ's cluster, so that alone is a warning. When no requested deployment
+// matches at all, the request names nothing here, and it returns the problem
+// that refuses the plan.
 func adoptDeploymentProblems(plan *StemcellRefsAdoptPlan, matched map[string]bool) []string {
-	var problems []string
 	for i, tag := range plan.DeploymentTags {
 		if !matched[strings.ToLower(tag)] {
-			problems = append(problems, fmt.Sprintf("no guest tagged %s carries %s, so --deployment %q matches "+
-				"nothing; check it against `bosh -e <env> deployments`", plan.DirectorTag, tag, plan.Deployments[i]))
+			plan.UnmatchedDeployments = append(plan.UnmatchedDeployments, plan.Deployments[i])
 		}
+	}
+	if len(matched) > 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("no guest tagged %s carries any of %s, so --deployment matches nothing on this "+
+		"cluster; check the director name and the deployments against `bosh -e <env> env` and "+
+		"`bosh -e <env> deployments`", plan.DirectorTag, strings.Join(plan.DeploymentTags, ", "))}
+}
+
+// adoptInstanceProblems refuses a plan in which two selected guests in one
+// deployment record the same instance group and index, when at least one of
+// them is a target. A BOSH deployment holds one instance per group and
+// index, so two such guests mean two directors share both the name and the
+// deployment name, and the director tag and deployment tag can't tell their
+// VMs apart. A guest whose instance is unknown, or names no index, takes no
+// part in the check.
+func adoptInstanceProblems(plan *StemcellRefsAdoptPlan) []string {
+	type entry struct {
+		vmid   int64
+		target bool
+	}
+	byInstance := map[string][]entry{}
+	add := func(gs []StemcellRefsAdoptGuest, target bool) {
+		for i := range gs {
+			g := &gs[i]
+			if !strings.Contains(g.Instance, "/") {
+				continue
+			}
+			k := strings.ToLower(g.Deployment) + " " + strings.ToLower(g.Instance)
+			byInstance[k] = append(byInstance[k], entry{vmid: g.VMID, target: target})
+		}
+	}
+	add(plan.Targets, true)
+	add(plan.AlreadyOwned, false)
+	keys := make([]string, 0, len(byInstance))
+	for k := range byInstance {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var problems []string
+	for _, k := range keys {
+		entries := byInstance[k]
+		hasTarget := false
+		ids := make([]int64, 0, len(entries))
+		for _, e := range entries {
+			hasTarget = hasTarget || e.target
+			ids = append(ids, e.vmid)
+		}
+		if len(ids) < 2 || !hasTarget {
+			continue
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		deployment, instance, _ := strings.Cut(k, " ")
+		problems = append(problems, fmt.Sprintf("guests %s in deployment %s each record instance %s, and a "+
+			"deployment holds one instance per group and index, so two directors tagged %s run a deployment "+
+			"named %s; compare the VMs with `bosh -e <env> -d %s vms` on this director and narrow the run to "+
+			"its VMs with --vmid", capVMIDs(ids), deployment, instance, plan.DirectorTag, deployment, deployment))
 	}
 	return problems
 }
 
 // adoptCreateEnvProblems returns the problems particular to the create-env
 // name: a selection that is not exactly one guest, and any uncovered guest
-// that doesn't carry director--bosh-init. allMatched is false when a
-// requested deployment already failed to match, which reports that problem
-// on its own.
+// that doesn't carry director--bosh-init. anyMatched is false when no
+// requested deployment matched, which reports that problem on its own.
 func adoptCreateEnvProblems(scan StemcellRefsScan, plan *StemcellRefsAdoptPlan, selected []int64,
-	allMatched bool) []string {
+	anyMatched bool) []string {
 	var problems []string
-	if allMatched && len(selected) != 1 {
+	if anyMatched && len(selected) != 1 {
 		problems = append(problems, fmt.Sprintf("the selection holds %d guest(s) tagged %s in deployment(s) %s "+
 			"(%s), and a bosh create-env deployment has exactly one VM; narrow it with --vmid", len(selected),
 			plan.DirectorTag, strings.Join(plan.Deployments, ", "), dashOrVMIDs(selected)))

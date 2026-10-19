@@ -192,6 +192,11 @@ type StemcellRefsGuest struct {
 	// deployment-- tags as stored.
 	DirectorTags   []string `json:"director_tags,omitempty"`
 	DeploymentTags []string `json:"deployment_tags,omitempty"`
+	// Instance is the BOSH instance the guest records, as <instance
+	// group>/<index>, from its instance-group-- (or job--) and index-- tags,
+	// or from its notes when it carries no such tags. It is the instance
+	// group alone when the index is unknown, and "" when the group is.
+	Instance string `json:"instance,omitempty"`
 	// NotesMetadata is true when the guest's notes hold the Director
 	// metadata lines the ownership guard reads (hasDirectorMetadataLines).
 	NotesMetadata bool `json:"notes_metadata,omitempty"`

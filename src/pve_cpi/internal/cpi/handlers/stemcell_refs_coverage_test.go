@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -398,7 +399,7 @@ func TestStemcellRefsCoverage_ReportGroupsCreateEnvDirectors(t *testing.T) {
 // commands the report prints are ones adopt-owners accepts.
 func TestStemcellRefsCoverage_SuggestedCommandsAreAccepted(t *testing.T) {
 	t.Parallel()
-	t.Run("a partly covered director reuses its UUID and names every deployment", func(t *testing.T) {
+	t.Run("a partly covered director names every deployment and no UUID", func(t *testing.T) {
 		t.Parallel()
 		f := newPruneFake()
 		twoRefTemplates(f)
@@ -406,15 +407,54 @@ func TestStemcellRefsCoverage_SuggestedCommandsAreAccepted(t *testing.T) {
 		f.addVM(301, "cf-new", "bosh-cpi;"+liveOwner+";director--bosh;deployment--cf", nil)
 		f.addVM(302, "redis-new", "bosh-cpi;"+liveOwner+";director--bosh;deployment--redis", nil)
 		rep := handlers.BuildStemcellRefsReport(scanOnly(t, f))
-		want := adoptBase + strings.ToLower(liveUUID) + " --director-name bosh --deployment cf --deployment redis"
+		want := adoptBase + "<director-uuid> --director-name bosh --deployment cf --deployment redis"
 		if len(rep.Uncovered) != 1 || !slices.Equal(rep.Uncovered[0].Commands, []string{want}) {
 			t.Fatalf("groups = %+v, want the command %q", rep.Uncovered, want)
+		}
+		assertNoUUIDInCommands(t, rep.Uncovered)
+		if src := rep.Uncovered[0].UUIDSource; !strings.Contains(src, "`bosh -e <env> env`") ||
+			!strings.Contains(src, "deployment(s) cf, redis already carry "+liveOwner) ||
+			strings.Contains(src, "belong to") {
+			t.Errorf("uuid source = %q", src)
 		}
 		_, plan := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
 			DirectorUUID: strings.ToLower(liveUUID), DirectorName: "bosh", Deployments: []string{"cf", "redis"},
 		})
 		if plan.Refused || !slices.Equal(adoptIDs(plan.Targets), []int64{300}) {
 			t.Errorf("suggested command refused %v (%s) targets %v", plan.Refused, plan.RefusalReason, adoptIDs(plan.Targets))
+		}
+	})
+	t.Run("another director's UUID on a shared name is never filled in", func(t *testing.T) {
+		t.Parallel()
+		f := newPruneFake()
+		twoRefTemplates(f)
+		// Director B, named bosh, is on 0.9.4 and owns redis. Director A, also
+		// named bosh, has cf VMs that predate owner tags.
+		f.addVM(310, "b-redis", "bosh-cpi;"+otherOwn+";director--bosh;deployment--redis", nil)
+		f.addVM(300, "a-router", "bosh-cpi;director--bosh;deployment--cf", nil)
+		f.addVM(301, "a-api", "bosh-cpi;director--bosh;deployment--cf", nil)
+		rep := handlers.BuildStemcellRefsReport(scanOnly(t, f))
+		want := adoptBase + "<director-uuid> --director-name bosh --deployment cf --deployment redis"
+		if len(rep.Uncovered) != 1 || !slices.Equal(rep.Uncovered[0].Commands, []string{want}) {
+			t.Fatalf("groups = %+v, want the command %q", rep.Uncovered, want)
+		}
+		assertNoUUIDInCommands(t, rep.Uncovered)
+		if strings.Contains(rep.Uncovered[0].UUIDSource, "belong to") {
+			t.Errorf("uuid source vouches for an owner: %q", rep.Uncovered[0].UUIDSource)
+		}
+		// A's UUID with the deployment A's director lists goes ahead, and
+		// keeping B's redis in the command refuses it.
+		_, a := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+			DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf"},
+		})
+		if a.Refused || !slices.Equal(adoptIDs(a.Targets), []int64{300, 301}) {
+			t.Errorf("director A: refused %v (%s) targets %v", a.Refused, a.RefusalReason, adoptIDs(a.Targets))
+		}
+		_, both := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+			DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf", "redis"},
+		})
+		if !both.Refused || !slices.Equal(adoptIDs(both.Conflicts), []int64{310}) {
+			t.Errorf("A with B's redis: refused %v conflicts %v", both.Refused, adoptIDs(both.Conflicts))
 		}
 	})
 	t.Run("a create-env VM gets --deployment and --vmid", func(t *testing.T) {
@@ -571,17 +611,32 @@ func TestStemcellRefsAdopt_DeploymentSelection(t *testing.T) {
 		!slices.Equal(plan.DeploymentTags, []string{"deployment--redis"}) || !slices.Equal(plan.OtherDeployments, []string{"cf"}) {
 		t.Fatalf("plan = %+v", plan)
 	}
-	_, none := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+	// A deployment with no guests on this cluster, such as one whose VMs all
+	// run in another AZ's cluster, is a warning while another one matches.
+	_, partial := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
 		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"redis", "missing"},
 	})
-	if !none.Refused || !strings.Contains(none.RefusalReason, `no guest tagged director--bosh carries deployment--missing, so --deployment "missing" matches nothing`) {
-		t.Errorf("unmatched deployment: refused %v reason %q", none.Refused, none.RefusalReason)
+	if partial.Refused || !slices.Equal(adoptIDs(partial.Targets), []int64{302}) ||
+		!slices.Equal(partial.UnmatchedDeployments, []string{"missing"}) {
+		t.Errorf("partly unmatched: refused %v (%s) targets %v unmatched %v", partial.Refused,
+			partial.RefusalReason, adoptIDs(partial.Targets), partial.UnmatchedDeployments)
+	}
+	if len(plan.UnmatchedDeployments) != 0 || plan.UnmatchedDeployments == nil {
+		t.Errorf("matched plan unmatched = %#v, want an empty list", plan.UnmatchedDeployments)
+	}
+	// When no requested deployment matches, the run refuses.
+	_, none := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"missing", "absent"},
+	})
+	if !none.Refused || !strings.Contains(none.RefusalReason,
+		"no guest tagged director--bosh carries any of deployment--absent, deployment--missing, so --deployment matches nothing on this cluster") {
+		t.Errorf("nothing matched: refused %v reason %q", none.Refused, none.RefusalReason)
 	}
 	// A deployment another director's guests carry doesn't match the name.
 	_, foreign := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
 		DirectorUUID: liveUUID, DirectorName: "other", Deployments: []string{"redis"},
 	})
-	if !foreign.Refused || !strings.Contains(foreign.RefusalReason, `--deployment "redis" matches nothing`) {
+	if !foreign.Refused || !strings.Contains(foreign.RefusalReason, "--deployment matches nothing on this cluster") {
 		t.Errorf("deployment of another name: refused %v reason %q", foreign.Refused, foreign.RefusalReason)
 	}
 }
@@ -986,5 +1041,116 @@ func TestStemcellRefsAdopt_UnplannedOrRefusedPlanIsNotApplied(t *testing.T) {
 	}
 	if f.writeCount() != 0 {
 		t.Fatalf("writes = %v", f.writes)
+	}
+}
+
+// assertNoUUIDInCommands fails when any suggested command carries a UUID.
+// The report never fills one in, because an owner tag on some of a name's
+// guests doesn't prove whose the uncovered ones are.
+func assertNoUUIDInCommands(t *testing.T, groups []handlers.StemcellRefsUncoveredGroup) {
+	t.Helper()
+	uuid := regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	for _, g := range groups {
+		for _, c := range g.Commands {
+			if uuid.MatchString(c) {
+				t.Errorf("suggested command carries a UUID: %q", c)
+			}
+		}
+	}
+}
+
+// TestStemcellRefsAdopt_SharedNameAndDeploymentRefuses is two directors that
+// share both the name bosh and a deployment named cf, with VMs that predate
+// owner tags. Their guests carry the same instance group and index, which
+// one deployment can't hold twice, so the run refuses until --vmid narrows
+// it to one director's VMs.
+func TestStemcellRefsAdopt_SharedNameAndDeploymentRefuses(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	twoRefTemplates(f)
+	f.addVM(300, "a-router", "bosh-cpi;director--bosh;deployment--cf;instance-group--router;index--0", nil)
+	f.addVM(301, "a-api", "bosh-cpi;director--bosh;deployment--cf;instance-group--api;index--0", nil)
+	f.addVM(310, "b-router", "bosh-cpi;director--bosh;deployment--cf;instance-group--router;index--0", nil)
+	deps, plan := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf"},
+	})
+	if !plan.Refused || !strings.Contains(plan.RefusalReason,
+		"guests 300, 310 in deployment cf each record instance router/0") ||
+		!strings.Contains(plan.RefusalReason, "--vmid") || strings.Contains(plan.RefusalReason, "301") {
+		t.Fatalf("refused %v reason %q", plan.Refused, plan.RefusalReason)
+	}
+	if plan.Targets[0].Instance != "router/0" || plan.Targets[1].Instance != "api/0" {
+		t.Errorf("instances = %q, %q", plan.Targets[0].Instance, plan.Targets[1].Instance)
+	}
+	if _, err := handlers.ApplyStemcellRefsAdopt(context.Background(), deps, plan); !errors.Is(err, handlers.ErrStemcellRefsAdoptRefused) {
+		t.Fatalf("apply err = %v, want refusal", err)
+	}
+	if f.writeCount() != 0 {
+		t.Fatalf("refused apply wrote: %v", f.writes)
+	}
+	_, narrowed := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf"}, VMIDs: []int64{300, 301},
+	})
+	if narrowed.Refused || !slices.Equal(adoptIDs(narrowed.Targets), []int64{300, 301}) {
+		t.Errorf("narrowed: refused %v (%s) targets %v", narrowed.Refused, narrowed.RefusalReason,
+			adoptIDs(narrowed.Targets))
+	}
+
+	// Once A's router carries A's owner tag, B's router still collides with
+	// it, so a run that would stamp B's router refuses.
+	g := newPruneFake()
+	twoRefTemplates(g)
+	g.addVM(300, "a-router", "bosh-cpi;"+liveOwner+";director--bosh;deployment--cf;instance-group--router;index--0", nil)
+	g.addVM(310, "b-router", "bosh-cpi;director--bosh;deployment--cf;instance-group--router;index--0", nil)
+	_, owned := planAdopt(t, g, handlers.StemcellRefsAdoptRequest{
+		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf"},
+	})
+	if !owned.Refused || !strings.Contains(owned.RefusalReason, "guests 300, 310 in deployment cf") {
+		t.Errorf("collision with an owned guest: refused %v reason %q", owned.Refused, owned.RefusalReason)
+	}
+}
+
+func TestStemcellRefsAdopt_InstanceComesFromTagsOrNotes(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	twoRefTemplates(f)
+	f.addVM(300, "tags", "bosh-cpi;director--bosh;deployment--cf;instance-group--router;index--1", nil)
+	f.addVM(301, "job-only", "bosh-cpi;director--bosh;deployment--cf;job--api;index--2", nil)
+	f.addVM(302, "notes", "bosh-cpi;director--bosh;deployment--cf", nil)
+	f.setCfg(302, "description", "deployment: cf\ndirector: bosh\nindex: 3\ninstance_group: doppler\nname: doppler/abc\n")
+	f.addVM(303, "no-index", "bosh-cpi;director--bosh;deployment--cf;instance-group--router", nil)
+	f.addVM(304, "two-groups", "bosh-cpi;director--bosh;deployment--cf;instance-group--a;instance-group--b;index--0", nil)
+	f.addVM(305, "same-group-no-index", "bosh-cpi;director--bosh;deployment--cf;instance-group--router", nil)
+	_, plan := planAdopt(t, f, handlers.StemcellRefsAdoptRequest{
+		DirectorUUID: liveUUID, DirectorName: "bosh", Deployments: []string{"cf"},
+	})
+	if plan.Refused {
+		t.Fatalf("refused: %s", plan.RefusalReason)
+	}
+	got := map[int64]string{}
+	for i := range plan.Targets {
+		got[plan.Targets[i].VMID] = plan.Targets[i].Instance
+	}
+	want := map[int64]string{300: "router/1", 301: "api/2", 302: "doppler/3", 303: "router", 304: "", 305: "router"}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("vmid %d instance %q, want %q", id, got[id], w)
+		}
+	}
+}
+
+// TestStemcellRefsAdopt_OwnerTagOnAVMBeingDeployed is a VM a 0.9.4 create_vm
+// has just built, which carries the owner tag before set_vm_metadata writes
+// its director and deployment tags. The run still refuses, and the reason
+// says the VM may still be deploying.
+func TestStemcellRefsAdopt_OwnerTagOnAVMBeingDeployed(t *testing.T) {
+	t.Parallel()
+	f := adoptFixture()
+	f.addVM(310, "creating", "bosh-cpi;"+liveOwner, nil)
+	_, plan := planAdopt(t, f, boshRequest())
+	if !plan.Refused || !slices.Equal(adoptIDs(plan.Conflicts), []int64{310}) ||
+		!strings.Contains(plan.Conflicts[0].Reason, "while a deploy is creating it") ||
+		strings.Contains(plan.Conflicts[0].Reason, "already belongs to another director") {
+		t.Fatalf("refused %v conflicts %+v", plan.Refused, plan.Conflicts)
 	}
 }

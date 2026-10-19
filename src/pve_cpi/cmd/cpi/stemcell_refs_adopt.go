@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -144,14 +145,33 @@ func runStemcellRefsAdopt(args []string, stdout, stderr io.Writer, opts runOptio
 	return writeStemcellRefsAdoptApply(stdout, stderr, &result, *jsonOut)
 }
 
-// warnStemcellRefsAdopt warns on stderr when selected guests are skipped,
+// warnStemcellRefsAdopt warns on stderr about each requested deployment
+// that has no guests on this cluster, and when selected guests are skipped,
 // because those keep ownership unknown.
 func warnStemcellRefsAdopt(stderr io.Writer, plan *handlers.StemcellRefsAdoptPlan) {
-	if plan.Refused || len(plan.Skipped) == 0 {
+	if plan.Refused {
 		return
 	}
-	fmt.Fprintf(stderr, "warning: %d guest(s) tagged %s are skipped and keep ownership unknown until they carry "+
-		"an owner tag or are removed; the report says how to deal with each\n", len(plan.Skipped), plan.DirectorTag)
+	for _, d := range plan.UnmatchedDeployments {
+		fmt.Fprintf(stderr, "warning: deployment %s has no guests tagged %s on this cluster, so the run stamps "+
+			"nothing in it; that is expected when its VMs run in another cluster, and otherwise check the name "+
+			"against `bosh -e <env> deployments`\n", d, plan.DirectorTag)
+	}
+	if len(plan.Skipped) > 0 {
+		fmt.Fprintf(stderr, "warning: %d guest(s) tagged %s are skipped and keep ownership unknown until they "+
+			"carry an owner tag or are removed; the report says how to deal with each\n", len(plan.Skipped),
+			plan.DirectorTag)
+	}
+}
+
+// adoptGuestLabel is how the plan names a guest: its VMID, then its BOSH
+// instance when it records one, so the operator can compare the list with
+// `bosh -d <deployment> vms`, then its PVE name and node.
+func adoptGuestLabel(g *handlers.StemcellRefsAdoptGuest) string {
+	if g.Instance == "" {
+		return fmt.Sprintf("vmid %d (%s on %s)", g.VMID, g.Name, g.Node)
+	}
+	return fmt.Sprintf("vmid %d instance %s (%s on %s)", g.VMID, g.Instance, g.Name, g.Node)
 }
 
 func writeStemcellRefsAdoptPlan(stdout, stderr io.Writer, plan *handlers.StemcellRefsAdoptPlan, jsonOut bool) int {
@@ -202,18 +222,22 @@ func writeStemcellRefsAdoptPlanBody(stdout, stderr io.Writer, plan *handlers.Ste
 	fmt.Fprintln(stdout)
 	for i, tag := range plan.DeploymentTags {
 		fmt.Fprintf(stdout, "  deployment %s:\n", plan.Deployments[i])
+		if slices.Contains(plan.UnmatchedDeployments, plan.Deployments[i]) {
+			fmt.Fprintf(stdout, "    warning: no guests on this cluster carry %s\n", plan.DirectorTag)
+			continue
+		}
 		targets := adoptGuestsIn(plan.Targets, tag)
 		if len(targets) == 0 {
 			fmt.Fprintln(stdout, "    nothing to stamp")
 		}
 		for _, g := range targets {
-			fmt.Fprintf(stdout, "    stamp vmid %d (%s on %s)\n", g.VMID, g.Name, g.Node)
+			fmt.Fprintf(stdout, "    stamp %s\n", adoptGuestLabel(g))
 		}
 		for _, g := range adoptGuestsIn(plan.AlreadyOwned, tag) {
-			fmt.Fprintf(stdout, "    already owned: vmid %d (%s on %s)\n", g.VMID, g.Name, g.Node)
+			fmt.Fprintf(stdout, "    already owned: %s\n", adoptGuestLabel(g))
 		}
 		for _, g := range adoptGuestsIn(plan.Skipped, tag) {
-			fmt.Fprintf(stdout, "    skipped: vmid %d (%s on %s): %s\n", g.VMID, g.Name, g.Node, g.Reason)
+			fmt.Fprintf(stdout, "    skipped: %s: %s\n", adoptGuestLabel(g), g.Reason)
 		}
 	}
 	for i := range plan.Conflicts {

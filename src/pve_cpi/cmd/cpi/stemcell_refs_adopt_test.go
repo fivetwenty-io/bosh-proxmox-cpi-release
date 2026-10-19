@@ -149,16 +149,42 @@ func TestStemcellRefsAdoptRefusalExitsOne(t *testing.T) {
 
 func TestStemcellRefsAdoptRefusesWhenDeploymentMatchesNothing(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
-	for _, tc := range []struct{ name, deployments, want string }{
-		{"boshh", "cf", `--deployment "cf" matches nothing`},
-		{"bosh", "cf,rediss", `no guest tagged director--bosh carries deployment--rediss, so --deployment "rediss" matches nothing`},
-	} {
+	for _, tc := range []struct{ name, deployments string }{{"boshh", "cf"}, {"bosh", "rediss,mysql"}} {
 		client := uncoveredCLIClient()
 		code, _, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
 			"--director-uuid", cliLiveUUID, "--director-name", tc.name, "--deployment", tc.deployments, "--apply")
-		if code != 1 || !strings.Contains(stderr, "refused: ") || !strings.Contains(stderr, tc.want) || client.writes != 0 {
+		if code != 1 || !strings.Contains(stderr, "refused: ") ||
+			!strings.Contains(stderr, "--deployment matches nothing on this cluster") || client.writes != 0 {
 			t.Errorf("%s %s: exit %d stderr %q writes %d", tc.name, tc.deployments, code, stderr, client.writes)
 		}
+	}
+}
+
+func TestStemcellRefsAdoptWarnsWhenADeploymentHasNoGuestsHere(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	client := uncoveredCLIClient()
+	code, stdout, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
+		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--deployment", "cf,redis,mysql")
+	if code != 0 || client.writes != 0 {
+		t.Fatalf("exit %d writes %d stderr %q", code, client.writes, stderr)
+	}
+	if !strings.Contains(stdout, "  deployment mysql:\n    warning: no guests on this cluster carry director--bosh\n") ||
+		!strings.Contains(stdout, "  deployment cf:\n    stamp vmid 300 (cf-router on pve)") {
+		t.Errorf("dry run lacks the per-deployment lines:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "warning: deployment mysql has no guests tagged director--bosh on this cluster") {
+		t.Errorf("stderr lacks the warning: %q", stderr)
+	}
+}
+
+func TestStemcellRefsAdoptDryRunShowsInstances(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	client := uncoveredCLIClient()
+	client.guests[1].tags = "bosh-cpi;director--bosh;deployment--cf;instance-group--router;index--0"
+	code, stdout, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
+		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--deployment", "cf,redis")
+	if code != 0 || !strings.Contains(stdout, "    stamp vmid 300 instance router/0 (cf-router on pve)\n") {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
 }
 
