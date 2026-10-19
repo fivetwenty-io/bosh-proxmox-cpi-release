@@ -105,69 +105,83 @@ func (f *pruneFake) setCfg(vmid int64, key, value string) {
 	f.guests[vmid].cfg[key] = value
 }
 
+// readConfig serves a guest config read. It runs onRead first, so a test can
+// change the guest between the scan and the write, and it reports the
+// guest's generation as the config digest unless noDigest says otherwise.
+func (f *pruneFake) readConfig(vmid int64) (map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.configErr[vmid]; err != nil {
+		return nil, err
+	}
+	g, ok := f.guests[vmid]
+	if ok && f.onRead != nil {
+		f.onRead(vmid, g)
+		g, ok = f.guests[vmid]
+	}
+	if !ok {
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}
+	out := map[string]any{}
+	for k, v := range g.cfg {
+		out[k] = v
+	}
+	if !f.noDigest[vmid] {
+		out["digest"] = "gen-" + strconv.Itoa(g.gen)
+	}
+	return out, nil
+}
+
+// updateConfig serves a guest config write. It records writes made without
+// the per-VMID lock, refuses a stale digest the way PVE does, and bumps the
+// guest's generation on every accepted write.
+func (f *pruneFake) updateConfig(vmidStr string, p *sdknodes.UpdateQemuConfigParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, _ := strconv.ParseInt(vmidStr, 10, 64)
+	g, ok := f.guests[id]
+	if !ok {
+		return &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}
+	if _, held, _ := f.pools.get("bosh-lock-vm-" + vmidStr); !held {
+		f.unlockedWrites = append(f.unlockedWrites, vmidStr)
+	}
+	if p.Digest != nil {
+		if f.staleWrites[id] > 0 {
+			f.staleWrites[id]--
+			g.gen++
+			return pve.ErrConfigDigestStale
+		}
+		if *p.Digest != "gen-"+strconv.Itoa(g.gen) {
+			return pve.ErrConfigDigestStale
+		}
+	}
+	g.gen++
+	if p.Description != nil {
+		g.cfg["description"] = *p.Description
+		f.writes = append(f.writes, vmidStr+":description")
+	}
+	if p.Tags != nil {
+		g.cfg["tags"] = *p.Tags
+		f.writes = append(f.writes, vmidStr+":tags")
+	}
+	if p.Delete != nil && *p.Delete == "tags" {
+		delete(g.cfg, "tags")
+		f.writes = append(f.writes, vmidStr+":tags")
+	}
+	if f.onWrite != nil {
+		f.onWrite(id, g)
+	}
+	return nil
+}
+
 func (f *pruneFake) deps() handlers.Deps {
 	qemu := &stemcellMockQEMU{configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if err := f.configErr[int64(vmid)]; err != nil {
-			return nil, err
-		}
-		g, ok := f.guests[int64(vmid)]
-		if ok && f.onRead != nil {
-			f.onRead(int64(vmid), g)
-			g, ok = f.guests[int64(vmid)]
-		}
-		if !ok {
-			return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
-		}
-		out := map[string]any{}
-		for k, v := range g.cfg {
-			out[k] = v
-		}
-		if !f.noDigest[int64(vmid)] {
-			out["digest"] = "gen-" + strconv.Itoa(g.gen)
-		}
-		return out, nil
+		return f.readConfig(int64(vmid))
 	}}
 	nodes := &stemcellMockNodes{
 		updateConfigFn: func(_ context.Context, _, vmidStr string, p *sdknodes.UpdateQemuConfigParams) error {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			id, _ := strconv.ParseInt(vmidStr, 10, 64)
-			g, ok := f.guests[id]
-			if !ok {
-				return &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
-			}
-			if _, held, _ := f.pools.get("bosh-lock-vm-" + vmidStr); !held {
-				f.unlockedWrites = append(f.unlockedWrites, vmidStr)
-			}
-			if p.Digest != nil {
-				if f.staleWrites[id] > 0 {
-					f.staleWrites[id]--
-					g.gen++
-					return pve.ErrConfigDigestStale
-				}
-				if *p.Digest != "gen-"+strconv.Itoa(g.gen) {
-					return pve.ErrConfigDigestStale
-				}
-			}
-			g.gen++
-			if p.Description != nil {
-				g.cfg["description"] = *p.Description
-				f.writes = append(f.writes, vmidStr+":description")
-			}
-			if p.Tags != nil {
-				g.cfg["tags"] = *p.Tags
-				f.writes = append(f.writes, vmidStr+":tags")
-			}
-			if p.Delete != nil && *p.Delete == "tags" {
-				delete(g.cfg, "tags")
-				f.writes = append(f.writes, vmidStr+":tags")
-			}
-			if f.onWrite != nil {
-				f.onWrite(id, g)
-			}
-			return nil
+			return f.updateConfig(vmidStr, p)
 		},
 		deleteQemuFn: func(_ context.Context, _, vmidStr string, _ *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {
 			f.mu.Lock()

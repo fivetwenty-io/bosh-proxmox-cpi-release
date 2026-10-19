@@ -210,7 +210,8 @@ func writeStemcellRefsAdoptApply(stdout, stderr io.Writer, result handlers.Stemc
 	if len(result.Results) == 0 {
 		fmt.Fprintln(stdout, "  nothing to do")
 	}
-	for _, r := range result.Results {
+	for i := range result.Results {
+		r := &result.Results[i]
 		line := fmt.Sprintf("  vmid %d (%s on %s): %s", r.Guest.VMID, r.Guest.Name, r.Guest.Node, r.Outcome)
 		if r.Error != "" {
 			line += ": " + r.Error

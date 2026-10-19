@@ -837,8 +837,8 @@ func planDirectorOwnership(scan StemcellRefsScan, ref string, allowOwned bool, p
 		plan.RefusalReason = sentinelReason
 	case len(plan.OwnedVMs) > 0:
 		ids := make([]int64, 0, len(plan.OwnedVMs))
-		for _, g := range plan.OwnedVMs {
-			ids = append(ids, g.VMID)
+		for i := range plan.OwnedVMs {
+			ids = append(ids, plan.OwnedVMs[i].VMID)
 		}
 		plan.Refused = true
 		plan.RefusalReason = fmt.Sprintf(
@@ -1871,8 +1871,8 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 	if err != nil {
 		return s
 	}
-	for _, g := range plan.OwnedVMs {
-		s.OwnedVMs = append(s.OwnedVMs, g.VMID)
+	for i := range plan.OwnedVMs {
+		s.OwnedVMs = append(s.OwnedVMs, plan.OwnedVMs[i].VMID)
 	}
 	s.OwnershipUnknown = plan.OwnershipUnknown
 	s.OwnershipUnknownReason = plan.OwnershipUnknownReason

@@ -274,17 +274,7 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	}
 
 	if *showVersion {
-		// With --config, name the release the job template recorded. A
-		// config that can't be read still answers, with the package version.
-		release := ""
-		if *configPath != "" {
-			rel, err := releaseVersionFromConfig(*configPath)
-			if err != nil {
-				fmt.Fprintf(stderr, "cpi: release version unavailable: %s\n", err)
-			}
-			release = rel
-		}
-		fmt.Fprintln(stdout, version.StringWithRelease(release))
+		printVersion(*configPath, stdout, stderr)
 		return 0
 	}
 

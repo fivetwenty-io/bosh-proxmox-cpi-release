@@ -350,10 +350,10 @@ func isTemplateVMID(scan StemcellRefsScan, vmid int64) bool {
 	return false
 }
 
-// dashOrVMIDs renders ids, or "none" when there are none.
+// dashOrVMIDs renders ids, or "no VMIDs" when there are none.
 func dashOrVMIDs(ids []int64) string {
 	if len(ids) == 0 {
-		return "none"
+		return "no VMIDs"
 	}
 	return joinVMIDs(ids)
 }

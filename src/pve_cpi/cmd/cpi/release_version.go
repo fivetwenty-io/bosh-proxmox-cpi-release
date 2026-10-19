@@ -14,6 +14,21 @@ import (
 // one, and the version falls back to the package version.
 const maxVersionConfigBytes = 4 << 20
 
+// printVersion answers `cpi --version`. With a config path it names the
+// release the job template recorded there; a config that can't be read
+// still answers, with the package version and a warning on stderr.
+func printVersion(configPath string, stdout, stderr io.Writer) {
+	release := ""
+	if configPath != "" {
+		rel, err := releaseVersionFromConfig(configPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "cpi: release version unavailable: %s\n", err)
+		}
+		release = rel
+	}
+	fmt.Fprintln(stdout, version.StringWithRelease(release))
+}
+
 // releaseVersionLabel renders the release version for the startup log, which
 // reads "unknown" when the config names no plausible release.
 func releaseVersionLabel(release string) string {

@@ -333,8 +333,8 @@ func writeStemcellRefsPlan(stdout, stderr io.Writer, plan handlers.StemcellRefsP
 func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellRefsPlan) {
 	if len(plan.OwnedVMs) > 0 {
 		ids := make([]int64, 0, len(plan.OwnedVMs))
-		for _, g := range plan.OwnedVMs {
-			ids = append(ids, g.VMID)
+		for i := range plan.OwnedVMs {
+			ids = append(ids, plan.OwnedVMs[i].VMID)
 		}
 		fmt.Fprintf(stdout, "  owned VMs carrying %s: %s\n", plan.OwnerTag, dashIDs(ids))
 	}

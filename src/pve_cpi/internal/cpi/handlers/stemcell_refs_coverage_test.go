@@ -290,8 +290,8 @@ func adoptIDs(gs []handlers.StemcellRefsAdoptGuest) []int64 {
 
 func outcomes(res handlers.StemcellRefsAdoptResult) map[int64]string {
 	out := map[int64]string{}
-	for _, r := range res.Results {
-		out[r.Guest.VMID] = r.Outcome
+	for i := range res.Results {
+		out[res.Results[i].Guest.VMID] = res.Results[i].Outcome
 	}
 	return out
 }
