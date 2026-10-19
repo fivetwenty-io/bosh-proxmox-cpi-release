@@ -424,8 +424,8 @@ func PlanStemcellRefsAdopt(scan StemcellRefsScan, req StemcellRefsAdoptRequest) 
 			ids = append(ids, plan.Conflicts[i].VMID)
 		}
 		problems = append(problems, fmt.Sprintf("%d guest(s) (%s) contradict pairing %s with %s in deployment(s) "+
-			"%s; check the UUID, the name, and the deployments against `bosh -e <env> env` and "+
-			"`bosh -e <env> deployments`", len(ids), capVMIDs(ids), plan.OwnerTag, plan.DirectorTag,
+			"%s, or are still being deployed; each guest's reason says which, so check the UUID, the name, and "+
+			"the deployments against `bosh -e <env> env` and `bosh -e <env> deployments`", len(ids), capVMIDs(ids), plan.OwnerTag, plan.DirectorTag,
 			strings.Join(plan.Deployments, ", ")))
 	}
 	if len(problems) > 0 {
@@ -525,9 +525,10 @@ func adoptInstanceProblems(plan *StemcellRefsAdoptPlan) []string {
 		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
 		deployment, instance, _ := strings.Cut(k, " ")
 		problems = append(problems, fmt.Sprintf("guests %s in deployment %s each record instance %s, and a "+
-			"deployment holds one instance per group and index, so two directors tagged %s run a deployment "+
-			"named %s; compare the VMs with `bosh -e <env> -d %s vms` on this director and narrow the run to "+
-			"its VMs with --vmid", capVMIDs(ids), deployment, instance, plan.DirectorTag, deployment, deployment))
+			"deployment holds one instance per group and index, so either two directors tagged %s run a "+
+			"deployment named %s, or one of these is an orphaned or leftover VM; compare the VMs with "+
+			"`bosh -e <env> -d %s vms` and `bosh -e <env> orphaned-vms` on this director and narrow the run to "+
+			"its live VMs with --vmid", capVMIDs(ids), deployment, instance, plan.DirectorTag, deployment, deployment))
 	}
 	return problems
 }
