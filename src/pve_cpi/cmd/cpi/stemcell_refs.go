@@ -22,7 +22,7 @@ const stemcellRefsUsage = "usage: cpi stemcell-refs report --config PATH [--json
 	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N | --reconcile-tags) " +
 	"[--apply] [--json]\n" +
 	"       cpi stemcell-refs adopt-owners --config PATH --director-uuid UUID --director-name NAME " +
-	"[--deployment NAME] [--vmid N]... [--apply] [--json]"
+	"--deployment NAME[,NAME]... [--vmid N]... [--apply] [--json]"
 
 // stemcellRefsTimeout bounds one run. A scan reads every guest's config and
 // an apply can destroy several templates, each awaited, so the budget is
@@ -341,8 +341,8 @@ func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellR
 	switch {
 	case plan.CoverageIncomplete:
 		ids := uncoveredIDs(plan.Uncovered)
-		fmt.Fprintf(stdout, "  owned VMs: unknown, because %d BOSH guest(s) carry no owner tag (%s); "+
-			"the report lists the adopt-owners commands that cover them\n", len(ids), dashIDs(ids))
+		fmt.Fprintf(stdout, "  owned VMs: unknown, because %d guest(s) carry no owner tag or could not be read "+
+			"(%s); the report says how to deal with each\n", len(ids), dashIDs(ids))
 	case plan.OwnershipUnknown:
 		fmt.Fprintf(stdout, "  owned VMs: unknown, because no owner tag exists for %s\n", plan.DirectorRef)
 	}

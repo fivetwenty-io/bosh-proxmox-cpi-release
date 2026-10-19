@@ -3,16 +3,16 @@ package handlers
 // stemcell_refs_adopt.go: `cpi stemcell-refs adopt-owners`.
 //
 // A director prune refuses while any BOSH guest carries no owner tag, and
-// every VM a CPI before 0.9.4 created is such a guest until a later
-// set_vm_metadata backfills the tag. adopt-owners stamps
-// bosh-owner--<director uuid> on the guests of one live director, which the
-// operator names by its UUID and its name, so the guard can count them.
+// every VM a CPI before 0.9.4 created is such a guest until something stamps
+// the tag. adopt-owners stamps bosh-owner--<director uuid> on the guests of
+// one live director, which the operator names by its UUID, its name, and the
+// deployments `bosh deployments` lists for it, so the guard can count them.
 //
 // The pieces mirror the prune. PlanStemcellRefsAdopt is the only planner, and
 // the dry run prints its result. ApplyStemcellRefsAdopt executes that same
 // value: each guest is written under the per-VMID lock after a fresh read
-// that rechecks every condition, with the config digest of that read, and a
-// guest that fails is reported while the rest carry on.
+// that rechecks the guest's own conditions, with the config digest of that
+// read, and a guest that fails is reported while the rest carry on.
 
 import (
 	"context"
@@ -63,7 +63,7 @@ var errAdoptGuestChanged = errors.New("stemcell-refs: guest changed since the pl
 var errAdoptGuestNotFound = errors.New("stemcell-refs: guest not found")
 
 // StemcellRefsAdoptRequest names the director whose guests adopt-owners
-// stamps, and optionally narrows the guests it considers.
+// stamps, and the deployments it stamps them in.
 type StemcellRefsAdoptRequest struct {
 	// DirectorUUID is the director's UUID, or the director_id of a
 	// create-env state file. It becomes the owner tag.
@@ -71,11 +71,14 @@ type StemcellRefsAdoptRequest struct {
 	// DirectorName is the director's raw name. Guests are matched by
 	// director-- plus sanitizeTagValue of it, the tag set_vm_metadata writes.
 	DirectorName string
-	// Deployment, when set, keeps only the guests whose deployment-- tag
-	// matches deployment-- plus sanitizeTagValue of it.
-	Deployment string
-	// VMIDs, when set, keeps only these guests. Each one must be a
-	// non-template guest that carries the director tag.
+	// Deployments names the director's deployments, as `bosh deployments`
+	// on that director prints them. At least one is required. Guests are
+	// matched by deployment-- plus sanitizeTagValue of each, and each one
+	// must match a guest that carries the director tag.
+	Deployments []string
+	// VMIDs, when set, narrows the guests further. Each one must be a
+	// non-template guest that carries the director tag and one of the
+	// deployment tags.
 	VMIDs []int64
 }
 
@@ -85,10 +88,11 @@ type StemcellRefsAdoptGuest struct {
 	Node string `json:"node"`
 	Name string `json:"name"`
 	// Deployment is the value of the guest's deployment-- tag, "" when it
-	// carries none.
-	Deployment   string   `json:"deployment"`
-	OwnerTags    []string `json:"owner_tags,omitempty"`
-	DirectorTags []string `json:"director_tags,omitempty"`
+	// carries none, or several values joined by "," when it carries more.
+	Deployment     string   `json:"deployment"`
+	DeploymentTags []string `json:"deployment_tags,omitempty"`
+	OwnerTags      []string `json:"owner_tags,omitempty"`
+	DirectorTags   []string `json:"director_tags,omitempty"`
 	// Reason says why a guest is skipped or conflicts.
 	Reason string `json:"reason,omitempty"`
 }
@@ -96,24 +100,30 @@ type StemcellRefsAdoptGuest struct {
 // StemcellRefsAdoptPlan is what adopt-owners will do. The dry run prints it
 // and the apply executes it unchanged.
 type StemcellRefsAdoptPlan struct {
-	DirectorUUID  string  `json:"director_uuid"`
-	DirectorName  string  `json:"director_name"`
-	DirectorTag   string  `json:"director_tag"`
-	OwnerTag      string  `json:"owner_tag"`
-	Deployment    string  `json:"deployment,omitempty"`
-	DeploymentTag string  `json:"deployment_tag,omitempty"`
-	VMIDs         []int64 `json:"vmids,omitempty"`
+	DirectorUUID string `json:"director_uuid"`
+	DirectorName string `json:"director_name"`
+	DirectorTag  string `json:"director_tag"`
+	OwnerTag     string `json:"owner_tag"`
+	// Deployments are the requested deployments, one per distinct tag and
+	// sorted by tag, and DeploymentTags[i] is the tag of Deployments[i].
+	Deployments    []string `json:"deployments"`
+	DeploymentTags []string `json:"deployment_tags"`
+	// OtherDeployments are the deployments of guests that carry the director
+	// tag that the run doesn't name. Their guests are left alone. When two
+	// directors share a name, they belong to the other one.
+	OtherDeployments []string `json:"other_deployments"`
+	VMIDs            []int64  `json:"vmids,omitempty"`
 	// Targets are the guests the apply stamps, sorted by deployment and
 	// VMID.
 	Targets []StemcellRefsAdoptGuest `json:"targets"`
 	// AlreadyOwned carry the owner tag already.
 	AlreadyOwned []StemcellRefsAdoptGuest `json:"already_owned"`
-	// Skipped carry the director tag and no owner tag, but adopt-owners
+	// Skipped are selected guests that carry no owner tag, but adopt-owners
 	// never stamps them, such as a guest with a stemcell marker. They keep
 	// ownership unknown until an operator deals with them.
 	Skipped []StemcellRefsAdoptGuest `json:"skipped"`
-	// Conflicts pair the director name with another owner tag, or the owner
-	// tag with another director name. Any conflict refuses the plan.
+	// Conflicts are guests anywhere in the cluster that contradict the
+	// request. Any conflict refuses the plan.
 	Conflicts     []StemcellRefsAdoptGuest `json:"conflicts"`
 	Refused       bool                     `json:"refused"`
 	RefusalReason string                   `json:"refusal_reason,omitempty"`
@@ -122,6 +132,20 @@ type StemcellRefsAdoptPlan struct {
 	// planned is set by the planner, so the apply refuses a plan it did not
 	// produce, such as one decoded from JSON.
 	planned bool
+}
+
+// createEnv reports whether the plan names the create-env director name.
+func (p *StemcellRefsAdoptPlan) createEnv() bool {
+	return strings.EqualFold(p.DirectorTag, directorTagPrefix+createEnvDirectorName)
+}
+
+// deploymentSet returns the plan's deployment tags, lowercased, as a set.
+func (p *StemcellRefsAdoptPlan) deploymentSet() map[string]bool {
+	set := make(map[string]bool, len(p.DeploymentTags))
+	for _, t := range p.DeploymentTags {
+		set[strings.ToLower(t)] = true
+	}
+	return set
 }
 
 // StemcellRefsAdoptGuestResult is what applying the plan did to one guest.
@@ -156,17 +180,20 @@ func ValidateStemcellRefsAdoptRequest(req StemcellRefsAdoptRequest) error {
 	case directorUUIDValue.MatchString(name):
 		return cpierrors.Cloud("stemcell-refs: the director name %q is a UUID; pass the director's name, "+
 			"which `bosh env` prints as Name, and its UUID separately", req.DirectorName)
-	case req.Deployment != "" && sanitizeTagValue(req.Deployment) == "":
-		return cpierrors.Cloud("stemcell-refs: the deployment %q has no characters a tag can hold", req.Deployment)
+	case len(req.Deployments) == 0:
+		return cpierrors.Cloud("stemcell-refs: name the director's deployments with --deployment, as " +
+			"`bosh -e <env> deployments` on that director lists them; for a create-env Director, use the " +
+			"deployment name in its create-env manifest")
+	}
+	for _, d := range req.Deployments {
+		if sanitizeTagValue(d) == "" {
+			return cpierrors.Cloud("stemcell-refs: the deployment %q has no characters a tag can hold", d)
+		}
 	}
 	for _, id := range req.VMIDs {
 		if id <= 0 {
 			return cpierrors.Cloud("stemcell-refs: VMID %d is not a positive integer", id)
 		}
-	}
-	if strings.EqualFold(name, createEnvDirectorName) && req.Deployment == "" && len(req.VMIDs) == 0 {
-		return cpierrors.Cloud("stemcell-refs: every bosh create-env Director VM is tagged director--%s, so name "+
-			"the one to adopt with --deployment or --vmid", createEnvDirectorName)
 	}
 	return nil
 }
@@ -175,41 +202,120 @@ func ValidateStemcellRefsAdoptRequest(req StemcellRefsAdoptRequest) error {
 func adoptGuestFrom(g *StemcellRefsGuest, reason string) StemcellRefsAdoptGuest {
 	return StemcellRefsAdoptGuest{
 		VMID: g.VMID, Node: g.Node, Name: g.Name,
-		Deployment:   strings.Join(tagSuffixes(g.DeploymentTags, deploymentTagPrefix), ","),
-		OwnerTags:    g.OwnerTags,
-		DirectorTags: g.DirectorTags,
-		Reason:       reason,
+		Deployment:     strings.Join(tagSuffixes(g.DeploymentTags, deploymentTagPrefix), ","),
+		DeploymentTags: g.DeploymentTags,
+		OwnerTags:      g.OwnerTags,
+		DirectorTags:   g.DirectorTags,
+		Reason:         reason,
 	}
 }
 
-// adoptConflict returns why g pairs the director tag with another owner tag,
-// or the owner tag with another director tag, or "".
-func adoptConflict(g *StemcellRefsGuest, dirTag, ownerTag string) string {
-	carriesName := tagsContainFold(g.DirectorTags, dirTag)
-	var otherOwners []string
-	ownsTag := false
-	for _, o := range g.OwnerTags {
-		if o == ownerTag {
-			ownsTag = true
-		} else {
-			otherOwners = append(otherOwners, o)
+// adoptInRequest reports whether g carries the director tag and at least one
+// of the requested deployment tags.
+func adoptInRequest(g *StemcellRefsGuest, dirTag string, deps map[string]bool) bool {
+	if !tagsContainFold(g.DirectorTags, dirTag) {
+		return false
+	}
+	for _, d := range g.DeploymentTags {
+		if deps[strings.ToLower(d)] {
+			return true
 		}
 	}
-	var otherNames []string
+	return false
+}
+
+// adoptWithinRequest reports whether every director-- and deployment-- tag
+// g carries is one the request names, and it carries at least one of each.
+func adoptWithinRequest(g *StemcellRefsGuest, dirTag string, deps map[string]bool) bool {
+	if len(g.DirectorTags) == 0 || len(g.DeploymentTags) == 0 {
+		return false
+	}
 	for _, d := range g.DirectorTags {
 		if !strings.EqualFold(d, dirTag) {
-			otherNames = append(otherNames, d)
+			return false
 		}
 	}
-	switch {
-	case carriesName && len(otherOwners) > 0:
-		return fmt.Sprintf("it carries %s with the owner tag %s, so that director name already belongs to "+
-			"another UUID", dirTag, strings.Join(otherOwners, ", "))
-	case ownsTag && len(otherNames) > 0:
-		return fmt.Sprintf("it carries %s with %s, so that UUID already belongs to another director name",
-			ownerTag, strings.Join(otherNames, ", "))
+	for _, d := range g.DeploymentTags {
+		if !deps[strings.ToLower(d)] {
+			return false
+		}
 	}
-	return ""
+	return true
+}
+
+// adoptPairConflict returns why g, any guest in the cluster, contradicts the
+// plan's pair, or "". Two checks run on every guest:
+//
+//   - A guest that carries the plan's owner tag must carry only the
+//     director tag and deployment tags the request names. Otherwise that UUID
+//     already belongs to another director or deployment.
+//   - A guest that carries the director tag in a requested deployment must
+//     carry no owner tag but the plan's, because a deployment belongs to one
+//     director.
+//
+// A guest with the director name in a deployment the request doesn't name
+// may carry another owner tag. That is how two directors share a name.
+func adoptPairConflict(g *StemcellRefsGuest, plan *StemcellRefsAdoptPlan, deps map[string]bool) string {
+	var reasons []string
+	if stringSliceContains(g.OwnerTags, plan.OwnerTag) && !adoptWithinRequest(g, plan.DirectorTag, deps) {
+		reasons = append(reasons, fmt.Sprintf("it carries %s with director tags [%s] and deployment tags [%s], "+
+			"outside the director name and deployments this run names, so that UUID already belongs to another "+
+			"director or deployment", plan.OwnerTag, strings.Join(g.DirectorTags, ", "),
+			strings.Join(g.DeploymentTags, ", ")))
+	}
+	if adoptInRequest(g, plan.DirectorTag, deps) {
+		var others []string
+		for _, o := range g.OwnerTags {
+			if o != plan.OwnerTag {
+				others = append(others, o)
+			}
+		}
+		if len(others) > 0 {
+			reasons = append(reasons, fmt.Sprintf("it carries %s in a deployment this run names, with the owner "+
+				"tag %s, and a deployment belongs to one director", plan.DirectorTag, strings.Join(others, ", ")))
+		}
+	}
+	return strings.Join(reasons, "; ")
+}
+
+// newAdoptPlan builds the plan's request fields: the tags, the requested
+// deployments with one entry per distinct tag sorted by tag, and the
+// requested VMIDs deduplicated and sorted.
+func newAdoptPlan(scan StemcellRefsScan, req StemcellRefsAdoptRequest) StemcellRefsAdoptPlan {
+	plan := StemcellRefsAdoptPlan{
+		DirectorUUID: strings.TrimSpace(req.DirectorUUID),
+		DirectorName: req.DirectorName,
+		DirectorTag:  directorTagPrefix + sanitizeTagValue(req.DirectorName),
+		Deployments:  []string{}, DeploymentTags: []string{}, OtherDeployments: []string{},
+		Targets: []StemcellRefsAdoptGuest{}, AlreadyOwned: []StemcellRefsAdoptGuest{},
+		Skipped: []StemcellRefsAdoptGuest{}, Conflicts: []StemcellRefsAdoptGuest{},
+		ScanErrors: scan.ScanErrors,
+		planned:    true,
+	}
+	plan.OwnerTag = ownerTagFor(plan.DirectorUUID)
+	byTag := map[string]string{}
+	for _, d := range req.Deployments {
+		tag := deploymentTagPrefix + sanitizeTagValue(d)
+		if _, seen := byTag[strings.ToLower(tag)]; !seen {
+			byTag[strings.ToLower(tag)] = strings.TrimSpace(d)
+			plan.DeploymentTags = append(plan.DeploymentTags, tag)
+		}
+	}
+	sort.Slice(plan.DeploymentTags, func(a, b int) bool {
+		return strings.ToLower(plan.DeploymentTags[a]) < strings.ToLower(plan.DeploymentTags[b])
+	})
+	for _, tag := range plan.DeploymentTags {
+		plan.Deployments = append(plan.Deployments, byTag[strings.ToLower(tag)])
+	}
+	seen := map[int64]bool{}
+	for _, id := range req.VMIDs {
+		if !seen[id] {
+			seen[id] = true
+			plan.VMIDs = append(plan.VMIDs, id)
+		}
+	}
+	sort.Slice(plan.VMIDs, func(a, b int) bool { return plan.VMIDs[a] < plan.VMIDs[b] })
+	return plan
 }
 
 // PlanStemcellRefsAdopt is the single planner behind the adopt-owners dry run
@@ -217,82 +323,89 @@ func adoptConflict(g *StemcellRefsGuest, dirTag, ownerTag string) string {
 // request; a request the cluster's state rules out comes back as a refused
 // plan.
 //
-// It considers the non-template guests the selectors keep, or every one when
-// none is set. Parkers are left out, because a parker's director-- tag holds a
-// UUID and adopt-owners never stamps one. A guest that pairs the director
-// name with another owner tag, or the owner tag with another director name,
-// refuses the plan. A guest that carries the director tag is a target when it
-// has no owner tag and adoptableGuest accepts it, already owned when it
-// carries the owner tag, and skipped otherwise.
+// The selected guests carry the director tag and one of the requested
+// deployment tags, and are among the requested VMIDs when any are named. A
+// selected guest is a target when it has no owner tag and adoptableGuest
+// accepts it, already owned when it carries the plan's owner tag, and skipped
+// otherwise. The pairing checks in adoptPairConflict run on every guest in
+// the cluster, selected or not, and any conflict refuses the plan.
+//
+// The plan is also refused when the scan could not read every guest, when a
+// requested deployment matches no guest with the director name, and when a
+// requested VMID is not a selected guest. For the create-env name, bosh-init,
+// the selection must hold exactly one guest, the owner tag may sit on no
+// other guest, and every guest without director--bosh-init must already be
+// covered, so the deployed directors are adopted first and a UUID copied from
+// `bosh env` by mistake shows up as a conflict.
 func PlanStemcellRefsAdopt(scan StemcellRefsScan, req StemcellRefsAdoptRequest) (StemcellRefsAdoptPlan, error) {
 	if err := ValidateStemcellRefsAdoptRequest(req); err != nil {
 		return StemcellRefsAdoptPlan{}, err
 	}
-	plan := StemcellRefsAdoptPlan{
-		DirectorUUID: strings.TrimSpace(req.DirectorUUID),
-		DirectorName: req.DirectorName,
-		DirectorTag:  directorTagPrefix + sanitizeTagValue(req.DirectorName),
-		Deployment:   req.Deployment,
-		Targets:      []StemcellRefsAdoptGuest{}, AlreadyOwned: []StemcellRefsAdoptGuest{},
-		Skipped: []StemcellRefsAdoptGuest{}, Conflicts: []StemcellRefsAdoptGuest{},
-		ScanErrors: scan.ScanErrors,
-		planned:    true,
-	}
-	plan.OwnerTag = ownerTagFor(plan.DirectorUUID)
-	if req.Deployment != "" {
-		plan.DeploymentTag = deploymentTagPrefix + sanitizeTagValue(req.Deployment)
-	}
+	plan := newAdoptPlan(scan, req)
+	deps := plan.deploymentSet()
 	vmidSet := map[int64]bool{}
-	for _, id := range req.VMIDs {
-		if !vmidSet[id] {
-			vmidSet[id] = true
-			plan.VMIDs = append(plan.VMIDs, id)
-		}
+	for _, id := range plan.VMIDs {
+		vmidSet[id] = true
 	}
-	sort.Slice(plan.VMIDs, func(a, b int) bool { return plan.VMIDs[a] < plan.VMIDs[b] })
 
-	var problems []string
-	var selectedNamed []int64
+	matched := map[string]bool{}
+	others := map[string]bool{}
+	var selected []int64
 	for i := range scan.Guests {
 		g := &scan.Guests[i]
-		if g.Kind == StemcellRefsGuestParker || !adoptSelected(g, plan.DeploymentTag, vmidSet) {
-			continue
+		named := tagsContainFold(g.DirectorTags, plan.DirectorTag)
+		if named {
+			for _, d := range g.DeploymentTags {
+				if deps[strings.ToLower(d)] {
+					matched[strings.ToLower(d)] = true
+				} else {
+					others[tagValueKey(d, deploymentTagPrefix)] = true
+				}
+			}
 		}
-		if reason := adoptConflict(g, plan.DirectorTag, plan.OwnerTag); reason != "" {
+		isSelected := g.Kind != StemcellRefsGuestParker && adoptInRequest(g, plan.DirectorTag, deps) &&
+			(len(vmidSet) == 0 || vmidSet[g.VMID])
+		reason := adoptPairConflict(g, &plan, deps)
+		if plan.createEnv() && !isSelected && stringSliceContains(g.OwnerTags, plan.OwnerTag) {
+			reason = joinReasons(reason, fmt.Sprintf("it carries %s too, and a create-env director_id owns "+
+				"exactly one VM", plan.OwnerTag))
+		}
+		if reason != "" {
 			plan.Conflicts = append(plan.Conflicts, adoptGuestFrom(g, reason))
 		}
-		if !tagsContainFold(g.DirectorTags, plan.DirectorTag) {
+		if !isSelected {
 			continue
 		}
-		selectedNamed = append(selectedNamed, g.VMID)
-		switch ok, reason := adoptableGuest(g); {
-		case adoptConflict(g, plan.DirectorTag, plan.OwnerTag) != "":
+		selected = append(selected, g.VMID)
+		switch ok, why, _ := adoptableGuest(g); {
+		case reason != "":
 		case len(g.OwnerTags) > 0:
 			plan.AlreadyOwned = append(plan.AlreadyOwned, adoptGuestFrom(g, ""))
 		case !ok:
-			plan.Skipped = append(plan.Skipped, adoptGuestFrom(g, reason))
+			plan.Skipped = append(plan.Skipped, adoptGuestFrom(g, why))
 		default:
 			plan.Targets = append(plan.Targets, adoptGuestFrom(g, ""))
 		}
 	}
-	problems = append(problems, adoptVMIDProblems(scan, plan, vmidSet)...)
-	selector := plan.DeploymentTag != "" || len(vmidSet) > 0
-	switch {
-	case strings.EqualFold(sanitizeTagValue(req.DirectorName), createEnvDirectorName) && len(selectedNamed) != 1:
-		problems = append(problems, fmt.Sprintf("the selection holds %d guest(s) tagged %s (%s), and a bosh "+
-			"create-env deployment has exactly one VM; narrow it with --vmid", len(selectedNamed), plan.DirectorTag,
-			dashOrVMIDs(selectedNamed)))
-	case selector && len(selectedNamed) == 0:
-		problems = append(problems, fmt.Sprintf("no guest the selectors keep carries %s", plan.DirectorTag))
+	if len(others) > 0 {
+		plan.OtherDeployments = sortedKeys(others)
+	}
+
+	problems := adoptScanProblems(scan)
+	problems = append(problems, adoptDeploymentProblems(&plan, matched)...)
+	problems = append(problems, adoptVMIDProblems(scan, &plan, deps)...)
+	if plan.createEnv() {
+		problems = append(problems, adoptCreateEnvProblems(scan, &plan, selected, len(matched) == len(deps))...)
 	}
 	if len(plan.Conflicts) > 0 {
 		ids := make([]int64, 0, len(plan.Conflicts))
-		for _, c := range plan.Conflicts {
-			ids = append(ids, c.VMID)
+		for i := range plan.Conflicts {
+			ids = append(ids, plan.Conflicts[i].VMID)
 		}
-		problems = append(problems, fmt.Sprintf("%d guest(s) (%s) already pair %s or %s with a different "+
-			"partner, so this pair would contradict them; check both values against `bosh env`",
-			len(ids), joinVMIDs(ids), plan.DirectorTag, plan.OwnerTag))
+		problems = append(problems, fmt.Sprintf("%d guest(s) (%s) contradict pairing %s with %s in deployment(s) "+
+			"%s; check the UUID, the name, and the deployments against `bosh -e <env> env` and "+
+			"`bosh -e <env> deployments`", len(ids), capVMIDs(ids), plan.OwnerTag, plan.DirectorTag,
+			strings.Join(plan.Deployments, ", ")))
 	}
 	if len(problems) > 0 {
 		plan.Refused = true
@@ -305,24 +418,78 @@ func PlanStemcellRefsAdopt(scan StemcellRefsScan, req StemcellRefsAdoptRequest) 
 	return plan, nil
 }
 
-// adoptSelected reports whether the selectors keep g. An empty deploymentTag
-// and an empty vmidSet keep everything.
-func adoptSelected(g *StemcellRefsGuest, deploymentTag string, vmidSet map[int64]bool) bool {
-	if deploymentTag != "" && !tagsContainFold(g.DeploymentTags, deploymentTag) {
-		return false
+// joinReasons joins two conflict reasons, either of which may be "".
+func joinReasons(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
 	}
-	return len(vmidSet) == 0 || vmidSet[g.VMID]
+	return a + "; " + b
+}
+
+// adoptScanProblems refuses a plan built on a scan that could not read every
+// guest, because the pairing checks must see every guest's tags.
+func adoptScanProblems(scan StemcellRefsScan) []string {
+	if len(scan.ScanErrors) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("the scan could not read %d guest config(s), so the pairing checks can't see "+
+		"every guest; fix the reads the scan errors name and run adopt-owners again", len(scan.ScanErrors))}
+}
+
+// adoptDeploymentProblems returns one problem for each requested deployment
+// that no guest with the director name carries.
+func adoptDeploymentProblems(plan *StemcellRefsAdoptPlan, matched map[string]bool) []string {
+	var problems []string
+	for i, tag := range plan.DeploymentTags {
+		if !matched[strings.ToLower(tag)] {
+			problems = append(problems, fmt.Sprintf("no guest tagged %s carries %s, so --deployment %q matches "+
+				"nothing; check it against `bosh -e <env> deployments`", plan.DirectorTag, tag, plan.Deployments[i]))
+		}
+	}
+	return problems
+}
+
+// adoptCreateEnvProblems returns the problems particular to the create-env
+// name: a selection that is not exactly one guest, and any uncovered guest
+// that doesn't carry director--bosh-init. allMatched is false when a
+// requested deployment already failed to match, which reports that problem
+// on its own.
+func adoptCreateEnvProblems(scan StemcellRefsScan, plan *StemcellRefsAdoptPlan, selected []int64,
+	allMatched bool) []string {
+	var problems []string
+	if allMatched && len(selected) != 1 {
+		problems = append(problems, fmt.Sprintf("the selection holds %d guest(s) tagged %s in deployment(s) %s "+
+			"(%s), and a bosh create-env deployment has exactly one VM; narrow it with --vmid", len(selected),
+			plan.DirectorTag, strings.Join(plan.Deployments, ", "), dashOrVMIDs(selected)))
+	}
+	var blocking []int64
+	for i := range scan.Guests {
+		g := &scan.Guests[i]
+		if g.Uncovered && !tagsContainFold(g.DirectorTags, plan.DirectorTag) {
+			blocking = append(blocking, g.VMID)
+		}
+	}
+	if len(blocking) > 0 {
+		problems = append(problems, fmt.Sprintf("adopt-owners refuses %s while %d other guest(s) leave ownership "+
+			"unknown (%s). Adopt the deployed directors first, because once their VMs carry their owner tags, a "+
+			"UUID copied from `bosh env` by mistake shows up here as a conflict", createEnvDirectorName,
+			len(blocking), capVMIDs(blocking)))
+	}
+	return problems
 }
 
 // adoptVMIDProblems returns one problem for each requested VMID that does not
-// name a non-template guest carrying the director tag and, when a deployment
-// is named, the deployment tag.
-func adoptVMIDProblems(scan StemcellRefsScan, plan StemcellRefsAdoptPlan, vmidSet map[int64]bool) []string {
+// name a non-template guest carrying the director tag and one of the
+// requested deployment tags.
+func adoptVMIDProblems(scan StemcellRefsScan, plan *StemcellRefsAdoptPlan, deps map[string]bool) []string {
 	var problems []string
 	for _, id := range plan.VMIDs {
 		g := guestByVMID(scan, id)
 		switch {
-		case g == nil && vmidSet[id] && isTemplateVMID(scan, id):
+		case g == nil && isTemplateVMID(scan, id):
 			problems = append(problems, fmt.Sprintf("VMID %d is a template", id))
 		case g == nil:
 			problems = append(problems, fmt.Sprintf("no non-template guest with VMID %d was found in the cluster", id))
@@ -330,8 +497,9 @@ func adoptVMIDProblems(scan StemcellRefsScan, plan StemcellRefsAdoptPlan, vmidSe
 			problems = append(problems, fmt.Sprintf("VMID %d is a parker", id))
 		case !tagsContainFold(g.DirectorTags, plan.DirectorTag):
 			problems = append(problems, fmt.Sprintf("VMID %d does not carry %s", id, plan.DirectorTag))
-		case plan.DeploymentTag != "" && !tagsContainFold(g.DeploymentTags, plan.DeploymentTag):
-			problems = append(problems, fmt.Sprintf("VMID %d does not carry %s", id, plan.DeploymentTag))
+		case !adoptInRequest(g, plan.DirectorTag, deps):
+			problems = append(problems, fmt.Sprintf("VMID %d carries none of %s", id,
+				strings.Join(plan.DeploymentTags, ", ")))
 		}
 	}
 	return problems
@@ -355,7 +523,7 @@ func dashOrVMIDs(ids []int64) string {
 	if len(ids) == 0 {
 		return "no VMIDs"
 	}
-	return joinVMIDs(ids)
+	return capVMIDs(ids)
 }
 
 // sortAdoptGuests orders guests by deployment, then VMID, so the dry run can
@@ -388,10 +556,11 @@ func ApplyStemcellRefsAdopt(ctx context.Context, deps Deps, plan StemcellRefsAdo
 	}
 	logger := deps.Log(ctx).With(log.String("operation", "stemcell_refs.adopt_owners"),
 		log.String("owner_tag", plan.OwnerTag), log.String("director_tag", plan.DirectorTag))
-	for _, target := range plan.Targets {
+	for i := range plan.Targets {
+		target := plan.Targets[i]
 		r := StemcellRefsAdoptGuestResult{Guest: target}
 		alog := logger.With(log.String("node", target.Node), log.Int64("vmid", target.VMID))
-		outcome, err := adoptOwnerLocked(ctx, deps, alog, plan, target)
+		outcome, err := adoptOwnerLocked(ctx, deps, alog, &plan, &target)
 		switch {
 		case errors.Is(err, errAdoptGuestChanged):
 			r.Outcome = StemcellRefsOutcomeChanged
@@ -419,7 +588,7 @@ func ApplyStemcellRefsAdopt(ctx context.Context, deps Deps, plan StemcellRefsAdo
 // list, guarded by the digest of that read. A digest refusal starts another
 // round, up to adoptOwnerWriteAttempts. It returns the outcome on success.
 func adoptOwnerLocked(
-	ctx context.Context, deps Deps, logger *log.Logger, plan StemcellRefsAdoptPlan, target StemcellRefsAdoptGuest,
+	ctx context.Context, deps Deps, logger *log.Logger, plan *StemcellRefsAdoptPlan, target *StemcellRefsAdoptGuest,
 ) (string, error) {
 	vmidInt := int(target.VMID) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
 	owner := fmt.Sprintf("stemcell/adopt_owner/%d", target.VMID)
@@ -475,10 +644,11 @@ func adoptOwnerLocked(
 }
 
 // adoptRecheck holds a fresh config read to every condition the plan chose
-// target on. It reports owned when the guest already carries exactly the
-// plan's owner tag, and returns errAdoptGuestChanged when any condition no
-// longer holds.
-func adoptRecheck(plan StemcellRefsAdoptPlan, target StemcellRefsAdoptGuest, cfg map[string]any,
+// target on that the guest itself decides. It reports owned when the guest
+// already carries the plan's owner tag, and returns errAdoptGuestChanged when
+// any condition no longer holds. The cluster-wide checks ran when the plan
+// was made and are not repeated here.
+func adoptRecheck(plan *StemcellRefsAdoptPlan, target *StemcellRefsAdoptGuest, cfg map[string]any,
 	tags []string) (bool, error) {
 	changed := func(why string) (bool, error) {
 		return false, fmt.Errorf("%w: vmid %d %s", errAdoptGuestChanged, target.VMID, why)
@@ -486,21 +656,22 @@ func adoptRecheck(plan StemcellRefsAdoptPlan, target StemcellRefsAdoptGuest, cfg
 	if pve.ConfigFlag(cfg, pveConfigKeyTemplate) {
 		return changed("is now a template")
 	}
-	g := newStemcellRefsGuest(target.VMID, target.Node, target.Name, tags)
-	if reason := adoptConflict(&g, plan.DirectorTag, plan.OwnerTag); reason != "" {
+	g := newStemcellRefsGuest(target.VMID, target.Node, target.Name, tags, stringConfigField(cfg, "description"), "")
+	deps := plan.deploymentSet()
+	if reason := adoptPairConflict(&g, plan, deps); reason != "" {
 		return changed("now conflicts: " + reason)
 	}
 	if !tagsContainFold(g.DirectorTags, plan.DirectorTag) {
 		return changed("no longer carries " + plan.DirectorTag)
 	}
-	if plan.DeploymentTag != "" && !tagsContainFold(g.DeploymentTags, plan.DeploymentTag) {
-		return changed("no longer carries " + plan.DeploymentTag)
+	if !adoptInRequest(&g, plan.DirectorTag, deps) {
+		return changed("no longer carries any of " + strings.Join(plan.DeploymentTags, ", "))
 	}
 	if len(g.OwnerTags) > 0 {
-		// adoptConflict already ruled out any owner tag but the plan's.
+		// adoptPairConflict already ruled out any owner tag but the plan's.
 		return true, nil
 	}
-	if ok, reason := adoptableGuest(&g); !ok {
+	if ok, reason, _ := adoptableGuest(&g); !ok {
 		return changed("can no longer be adopted: " + reason)
 	}
 	return false, nil

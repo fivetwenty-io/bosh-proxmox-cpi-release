@@ -192,13 +192,23 @@ type StemcellRefsGuest struct {
 	// deployment-- tags as stored.
 	DirectorTags   []string `json:"director_tags,omitempty"`
 	DeploymentTags []string `json:"deployment_tags,omitempty"`
-	// Uncovered is true for a BOSH guest that carries no owner tag, which
-	// makes ownership unknown for every ref.
+	// NotesMetadata is true when the guest's notes hold the Director
+	// metadata lines the ownership guard reads (hasDirectorMetadataLines).
+	NotesMetadata bool `json:"notes_metadata,omitempty"`
+	// ReadError is the config read failure for a guest the scan could only
+	// see in the listing, "" when the read succeeded.
+	ReadError string `json:"read_error,omitempty"`
+	// Uncovered is true for a BOSH guest that carries no owner tag, and for
+	// any guest whose config could not be read. Either makes ownership
+	// unknown for every ref.
 	Uncovered bool `json:"uncovered,omitempty"`
 
 	// tags is every tag token the scan read, from the guest's config when it
 	// could be read and from the listing otherwise.
 	tags []string
+	// notesDirector and notesDeployment are the values of the Director
+	// metadata lines in the guest's notes, for the report's advice.
+	notesDirector, notesDeployment string
 }
 
 // StemcellRefsScan is one read of the cluster.
@@ -228,8 +238,10 @@ type StemcellRefsScan struct {
 // failure is returned as an error. A config read that fails on one guest is
 // recorded in ScanErrors and clears CloneScanComplete, and a template whose
 // own config could not be read is kept with ReadError set. Every non-template
-// guest is sorted into a kind (parker, BOSH guest, or other), and the BOSH
-// guests that carry no owner tag are grouped in Uncovered.
+// guest is sorted into a kind (parker, BOSH guest, or other) by the same
+// evidence the ownership guard accepts, tags or the Director lines in its
+// notes. The BOSH guests that carry no owner tag, and every non-template
+// guest whose config could not be read, are grouped in Uncovered.
 func ScanStemcellRefs(ctx context.Context, deps Deps) (StemcellRefsScan, error) {
 	scan := StemcellRefsScan{CloneScanComplete: true, otherTemplates: map[int64]string{}}
 	if deps.PVE == nil || deps.PVE.QEMU() == nil {
@@ -264,11 +276,18 @@ func ScanStemcellRefs(ctx context.Context, deps Deps) (StemcellRefsScan, error) 
 		if !g.Template {
 			// The config is the guest's own record; the listing's tags stand
 			// in only when the config could not be read.
+			// A guest whose config could not be read is uncovered whatever
+			// its listing says, because neither its current tags nor its
+			// notes are known.
 			tags := g.SplitTags()
+			desc, readErr := "", ""
 			if cfg != nil {
 				tags = parseTagsField(stringConfigField(cfg, jsonKeyTags))
+				desc = stringConfigField(cfg, "description")
+			} else {
+				readErr = cfgErr.Error()
 			}
-			scan.Guests = append(scan.Guests, newStemcellRefsGuest(int64(g.VMID), g.Node, g.Name, tags))
+			scan.Guests = append(scan.Guests, newStemcellRefsGuest(int64(g.VMID), g.Node, g.Name, tags, desc, readErr))
 			continue
 		}
 		t, recognized := scanStemcellTemplate(g, cfg, cfgErr)
@@ -407,13 +426,19 @@ func refsAndTagsDisagree(refs, directorTags []string) bool {
 	return false
 }
 
-// ownerTagsOf returns the bosh-owner-- tags among tokens, lowercased.
+// ownerTagsOf returns the distinct bosh-owner-- tags among tokens, sorted and
+// as stored. It reads them the way ownVM does, through tagValues: the prefix
+// must match exactly and the value must not be empty, so a hand-edited
+// Bosh-Owner--x counts here only when it would count for the ownership guard,
+// which is never.
 func ownerTagsOf(tokens []string) []string {
-	var out []string
-	for _, tok := range tokens {
-		if strings.HasPrefix(strings.ToLower(tok), ownerTagPrefix) {
-			out = append(out, strings.ToLower(tok))
-		}
+	values := tagValues(tokens, ownerTagPrefix)
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, ownerTagPrefix+v)
 	}
 	return out
 }

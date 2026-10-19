@@ -295,23 +295,32 @@ func orNone(s string) string {
 // "key: value" lines. The <!--BOSH: sentinel does not count, because parkers
 // and templates carry it too.
 func hasDirectorMetadataLines(desc string) bool {
-	var director, deployment, name bool
+	director, deployment, named := directorMetadataValues(desc)
+	return director != "" && deployment != "" && named
+}
+
+// directorMetadataValues reads the Director metadata lines in a VM's notes,
+// the same lines hasDirectorMetadataLines checks. It returns the value of the
+// last "director:" and "deployment:" line that has one, and whether the last
+// "name:" line with a value has the <job>/<id> shape.
+func directorMetadataValues(desc string) (director, deployment string, named bool) {
 	for _, line := range strings.Split(desc, "\n") {
 		key, value, ok := strings.Cut(strings.TrimRight(line, "\r"), ": ")
-		if !ok || strings.TrimSpace(value) == "" {
+		value = strings.TrimSpace(value)
+		if !ok || value == "" {
 			continue
 		}
 		switch key {
 		case "director":
-			director = true
+			director = value
 		case "deployment":
-			deployment = true
+			deployment = value
 		case "name":
-			job, id, slash := strings.Cut(strings.TrimSpace(value), "/")
-			name = slash && job != "" && id != ""
+			job, id, slash := strings.Cut(value, "/")
+			named = slash && job != "" && id != ""
 		}
 	}
-	return director && deployment && name
+	return director, deployment, named
 }
 
 // vmOwnershipGuardWarns reports whether this request's ownership guard runs in

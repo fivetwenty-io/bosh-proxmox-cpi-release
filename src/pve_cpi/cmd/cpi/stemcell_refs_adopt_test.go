@@ -47,12 +47,12 @@ func TestStemcellRefsAdoptDryRunText(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
 	client := uncoveredCLIClient()
 	code, stdout, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
-		"--director-uuid", cliLiveUUID, "--director-name", "bosh")
+		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--deployment", "cf,redis")
 	if code != 0 {
 		t.Fatalf("exit %d stderr %q", code, stderr)
 	}
 	for _, want := range []string{
-		"stamps bosh-owner--" + cliLiveUUID + " on guests tagged director--bosh",
+		"stamps bosh-owner--" + cliLiveUUID + " on guests tagged director--bosh in deployment(s) cf, redis",
 		"  deployment cf:\n    stamp vmid 300 (cf-router on pve)",
 		"  deployment redis:\n    stamp vmid 301 (redis on pve)",
 	} {
@@ -70,23 +70,44 @@ func TestStemcellRefsAdoptApplyThenPrune(t *testing.T) {
 	client := uncoveredCLIClient()
 
 	// The prune refuses while guests lack owner tags, override or not.
-	for _, extra := range [][]string{nil, {"--allow-owned-vms"}} {
+	for _, extra := range [][]string{nil, {"--allow-owned-vms"}, {"--allow-owned-vms", "--apply"}} {
 		args := append([]string{"prune", "--config", cfgPath, "--director", "old-uuid"}, extra...)
 		code, stdout, stderr := runStemcellRefsTest(t, client, args...)
 		if code != 1 || !strings.Contains(stderr, "--allow-owned-vms does not override this") ||
-			!strings.Contains(stdout, "owned VMs: unknown, because 3 BOSH guest(s) carry no owner tag (300,301,400)") {
+			!strings.Contains(stdout, "owned VMs: unknown, because 3 guest(s) carry no owner tag or could not be read (300,301,400)") {
 			t.Fatalf("%v: exit %d stdout %q stderr %q", extra, code, stdout, stderr)
 		}
 	}
+	// The JSON apply with the override refuses too, and prints the refused plan.
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--director", "old-uuid",
+		"--apply", "--json", "--allow-owned-vms")
+	if code != 1 || !strings.Contains(stderr, "refused: ownership is unknown for every ref") {
+		t.Fatalf("json apply: exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	var refused handlers.StemcellRefsApplyResult
+	if err := json.Unmarshal([]byte(stdout), &refused); err != nil || !refused.Refused || !refused.Plan.Refused ||
+		!refused.Plan.CoverageIncomplete || len(refused.Results) != 0 {
+		t.Fatalf("json apply result %+v (%v)", refused, err)
+	}
+	if client.writes != 0 {
+		t.Fatalf("refused prunes wrote %d times", client.writes)
+	}
 
-	code, stdout, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
-		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--apply")
+	// The create-env Director waits until the deployed director is adopted.
+	createEnv := []string{"adopt-owners", "--config", cfgPath,
+		"--director-uuid", "bbbbbbbb-0000-4000-8000-000000000002", "--director-name", "bosh-init",
+		"--deployment", "lab-bosh", "--apply", "--json"}
+	code, _, stderr = runStemcellRefsTest(t, client, createEnv...)
+	if code != 1 || !strings.Contains(stderr, "Adopt the deployed directors first") || client.writes != 0 {
+		t.Fatalf("early bosh-init apply: exit %d stderr %q writes %d", code, stderr, client.writes)
+	}
+
+	code, stdout, stderr = runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
+		"--director-uuid", cliLiveUUID, "--director-name", "bosh", "--deployment", "cf", "--deployment", "redis", "--apply")
 	if code != 0 || !strings.Contains(stdout, "vmid 300 (cf-router on pve): applied") {
 		t.Fatalf("bosh apply: exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
-	code, stdout, stderr = runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
-		"--director-uuid", "bbbbbbbb-0000-4000-8000-000000000002", "--director-name", "bosh-init",
-		"--deployment", "lab-bosh", "--apply", "--json")
+	code, stdout, stderr = runStemcellRefsTest(t, client, createEnv...)
 	if code != 0 {
 		t.Fatalf("bosh-init apply: exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
@@ -112,7 +133,7 @@ func TestStemcellRefsAdoptRefusalExitsOne(t *testing.T) {
 		tags: "bosh-cpi;bosh-owner--7b1b2c3d-0000-4000-8000-00000000000b;director--bosh;deployment--cf"})
 	for _, extra := range [][]string{nil, {"--apply"}, {"--apply", "--json"}} {
 		args := append([]string{"adopt-owners", "--config", cfgPath, "--director-uuid", cliLiveUUID,
-			"--director-name", "bosh"}, extra...)
+			"--director-name", "bosh", "--deployment", "cf,redis"}, extra...)
 		code, stdout, stderr := runStemcellRefsTest(t, client, args...)
 		if code != 1 || !strings.Contains(stderr, "refused: ") {
 			t.Errorf("%v: exit %d stderr %q", extra, code, stderr)
@@ -126,12 +147,18 @@ func TestStemcellRefsAdoptRefusalExitsOne(t *testing.T) {
 	}
 }
 
-func TestStemcellRefsAdoptWarnsWhenNameMatchesNothing(t *testing.T) {
+func TestStemcellRefsAdoptRefusesWhenDeploymentMatchesNothing(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
-	code, _, stderr := runStemcellRefsTest(t, uncoveredCLIClient(), "adopt-owners", "--config", cfgPath,
-		"--director-uuid", cliLiveUUID, "--director-name", "boshh")
-	if code != 0 || !strings.Contains(stderr, "warning: no guest carries director--boshh") {
-		t.Fatalf("exit %d stderr %q", code, stderr)
+	for _, tc := range []struct{ name, deployments, want string }{
+		{"boshh", "cf", `--deployment "cf" matches nothing`},
+		{"bosh", "cf,rediss", `no guest tagged director--bosh carries deployment--rediss, so --deployment "rediss" matches nothing`},
+	} {
+		client := uncoveredCLIClient()
+		code, _, stderr := runStemcellRefsTest(t, client, "adopt-owners", "--config", cfgPath,
+			"--director-uuid", cliLiveUUID, "--director-name", tc.name, "--deployment", tc.deployments, "--apply")
+		if code != 1 || !strings.Contains(stderr, "refused: ") || !strings.Contains(stderr, tc.want) || client.writes != 0 {
+			t.Errorf("%s %s: exit %d stderr %q writes %d", tc.name, tc.deployments, code, stderr, client.writes)
+		}
 	}
 }
 
@@ -141,14 +168,14 @@ func TestStemcellRefsReportTextShowsUncoveredGroups(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d stderr %q", code, stderr)
 	}
-	base := "cpi stemcell-refs adopt-owners --config <cpi.json> --director-uuid <director-uuid> --director-name "
+	base := "cpi stemcell-refs adopt-owners --config <cpi.json> --director-uuid "
 	for _, want := range []string{
 		"OWNERSHIP UNKNOWN",
-		"ownership is unknown for every ref: 3 BOSH guest(s)",
+		"ownership is unknown for every ref: 3 guest(s)",
 		"director bosh, deployment cf: vmids 300",
-		"    " + base + "bosh\n",
+		"    " + base + "<director-uuid> --director-name bosh --deployment cf --deployment redis\n",
 		"director bosh-init, deployment lab-bosh: vmids 400",
-		"    " + base + "bosh-init --deployment lab-bosh\n",
+		"    " + base + "<director_id> --director-name bosh-init --deployment lab-bosh --vmid 400\n",
 		"director_id in the create-env state file",
 		"WOULD FREE reads blocked",
 	} {
