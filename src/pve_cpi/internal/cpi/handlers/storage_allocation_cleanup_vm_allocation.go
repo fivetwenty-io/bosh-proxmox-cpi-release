@@ -104,6 +104,8 @@ func pendingVMAllocationMoved(record aj.Record, step aj.Step, node string, vmid 
 // The task identifies submission completion; a fresh full VM marker and concrete
 // storage/device readback establish ownership separately. A filename or task ID
 // alone never grants cleanup authority.
+//
+//nolint:gocognit // Each ownership proof (marker, storage readback, device readback) must hold before cleanup, and the checks stay together so none can be skipped. golangci-lint v2.15.0 scores it 46.
 func observeCleanupVMAllocation(ctx context.Context, deps Deps, journal *aj.Journal, record aj.Record, step aj.Step) (aj.Verification, []string, error) {
 	nodes, err := clusterNodeNames(ctx, deps)
 	if err != nil {

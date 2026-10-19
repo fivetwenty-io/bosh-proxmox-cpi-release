@@ -62,6 +62,8 @@ var systemDiskSlots = map[string]bool{
 //
 // VMNotFound: if the cluster scan does not find the VMID, or the Config API
 // returns a 404, the handler returns a VMNotFound error.
+//
+//nolint:gocognit // Cluster scan, config read, and per-slot disk filtering in one handler. golangci-lint v2.15.0 scores it 41.
 func HandleGetDisks(deps Deps) Handler {
 	return HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)

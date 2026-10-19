@@ -550,6 +550,8 @@ func TestDeleteDiskReattachedCrashBeforeAudit(t *testing.T) {
 // third is after our removal lands. Wherever the second disk's removal lands,
 // it must survive. When it lands before our removal reaches PVE, PVE refuses
 // our removal's digest, so the call fails retriable and a rerun ends Deleted.
+//
+//nolint:gocognit // Keep the three race interleavings and their shared assertions in one test.
 func TestDeleteDiskReattachedRaceKeepsOtherRemoval(t *testing.T) {
 	var events []tailEvent
 	recording := buildReattached(t, true)

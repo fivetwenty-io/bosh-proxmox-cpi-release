@@ -995,7 +995,7 @@ func TestHasDiskWaitsForAnUnmarkedDiskInFlight(t *testing.T) {
 		result <- hasDiskResult{present, err}
 	}()
 	select {
-	case <-waiting:
+	case <-waiting: //nolint:errcheck // This case only proves has_disk began waiting; the refusal it carries is checked by the other wait tests.
 	case r := <-result:
 		f.client.state.configs[777]["scsi1"] = slot
 		finish()

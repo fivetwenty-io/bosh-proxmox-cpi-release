@@ -68,8 +68,8 @@ func TestInflightLimitedSemaphore(t *testing.T) {
 
 	// Assert not done after a brief wait.
 	select {
-	case <-acquired:
-		t.Fatal("3rd acquire returned immediately; expected blocking")
+	case err := <-acquired:
+		t.Fatalf("3rd acquire returned immediately with %v; expected blocking", err)
 	case <-time.After(80 * time.Millisecond):
 	}
 

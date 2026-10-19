@@ -19,6 +19,8 @@ func TestManagedVMDeleteAbsenceConvergencePreservesMutationHistory(t *testing.T)
 		t.Run(mode, func(t *testing.T) { testVMDeleteConvergence(t, mode) })
 	}
 }
+
+//nolint:gocognit // One driver for every convergence mode keeps the modes comparable side by side.
 func testVMDeleteConvergence(t *testing.T, mode string) {
 	t.Helper()
 	deps, j, _, record := deleteManagedFixture(t)

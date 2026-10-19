@@ -366,6 +366,7 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 	}
 }
 
+//nolint:gocognit // Best-effort rollback chain: stop, purge, and per-step logging for each failure path. golangci-lint v2.15.0 scores it 43.
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)
