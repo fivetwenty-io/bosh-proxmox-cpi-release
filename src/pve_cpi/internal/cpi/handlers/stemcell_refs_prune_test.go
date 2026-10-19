@@ -39,6 +39,12 @@ type pruneFake struct {
 	deleted []int64
 	// tagsAtDelete records each destroyed guest's tags at destroy time.
 	tagsAtDelete map[int64]string
+	// pools is the lock store every deps() client shares, so a write can
+	// check whether its guest's per-VMID lock is held.
+	pools *noopPoolService
+	// unlockedWrites records each UpdateQemuConfig made while the guest's
+	// per-VMID lock was not held.
+	unlockedWrites []string
 }
 
 func newPruneFake() *pruneFake {
@@ -47,12 +53,13 @@ func newPruneFake() *pruneFake {
 		configErr:    map[int64]error{},
 		deleteErr:    map[int64]error{},
 		tagsAtDelete: map[int64]string{},
+		pools:        &noopPoolService{},
 	}
 }
 
 func (f *pruneFake) addTemplate(vmid int64, name, desc, tags string) {
 	f.guests[vmid] = &pruneFakeGuest{node: vmNode, name: name, template: true,
-		cfg: map[string]any{"description": desc, "tags": tags}}
+		cfg: map[string]any{"description": desc, "tags": tags, "name": name, "template": float64(1)}}
 }
 
 func (f *pruneFake) addVM(vmid int64, name, tags string, disks map[string]string) {
@@ -106,6 +113,9 @@ func (f *pruneFake) deps() handlers.Deps {
 			if !ok {
 				return &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
 			}
+			if _, held, _ := f.pools.get("bosh-lock-vm-" + vmidStr); !held {
+				f.unlockedWrites = append(f.unlockedWrites, vmidStr)
+			}
 			if p.Description != nil {
 				g.cfg["description"] = *p.Description
 				f.writes = append(f.writes, vmidStr+":description")
@@ -153,7 +163,9 @@ func (f *pruneFake) deps() handlers.Deps {
 		}
 		return &out, nil
 	}}
-	return buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemu, nodesSvc: nodes, clusterSvc: cluster})
+	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemu, nodesSvc: nodes, clusterSvc: cluster})
+	deps.PVE.(*stemcellMockClient).poolsSvc = f.pools
+	return deps
 }
 
 func (f *pruneFake) writeCount() int {
@@ -254,8 +266,8 @@ func TestStemcellRefsReport(t *testing.T) {
 	if len(old.WouldFree) != 0 || !slices.Equal(old.Blocked, []int64{102}) {
 		t.Errorf("old ref would free %v blocked %v; want none freed and 102 blocked by its clone", old.WouldFree, old.Blocked)
 	}
-	if refs[newRef].OwnedVMCount != 1 {
-		t.Errorf("new ref owned VMs = %d, want 1", refs[newRef].OwnedVMCount)
+	if n := refs[newRef].OwnedVMCount; n == nil || *n != 1 {
+		t.Errorf("new ref owned VMs = %v, want 1", n)
 	}
 	if !slices.Equal(refs["debug-repro"].WouldFree, []int64{104}) {
 		t.Errorf("debug-repro would free %v, want [104]", refs["debug-repro"].WouldFree)
@@ -400,18 +412,29 @@ func TestStemcellRefsPrune_UnparseableDescription(t *testing.T) {
 	}
 }
 
-func TestStemcellRefsPrune_LastRefDestroySweepsReplicas(t *testing.T) {
+// replicaTags is a per-node replica's tag set for sha8 on node2.
+func replicaTags(sha8 string) string {
+	return cacheTemplateTags(sha8) + ";bosh-stemcell-node-pve-node2"
+}
+
+func TestStemcellRefsPrune_LastRefDestroySweepsOnlyZeroRefReplicas(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
 	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), cacheTemplateTags(shaA)+";director--"+oldRef)
-	f.addTemplate(150, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef),
-		cacheTemplateTags(shaA)+";director--"+oldRef+";bosh-stemcell-node-pve-node2")
+	// 150 holds a ref of its own, so no path destroys it.
+	f.addTemplate(150, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), replicaTags(shaA)+";director--"+oldRef)
 	f.guests[150].node = "pve-node2"
+	// 151 holds no ref and backs no clone, so it passes --vmid on its own.
+	f.addTemplate(151, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+	f.guests[151].node = "pve-node2"
 
 	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
 	a := actionFor(t, plan, 101)
-	if a.Kind != handlers.StemcellRefsActionRemoveRefAndDestroy || len(a.SweepReplicas) != 1 || a.SweepReplicas[0].VMID != 150 {
-		t.Fatalf("101 action = %+v; want destroy with replica 150 swept", a)
+	if a.Kind != handlers.StemcellRefsActionRemoveRefAndDestroy || len(a.SweepReplicas) != 1 || a.SweepReplicas[0].VMID != 151 {
+		t.Fatalf("101 action = %+v; want destroy that sweeps only replica 151", a)
+	}
+	if len(a.KeptReplicas) != 1 || a.KeptReplicas[0].VMID != 150 || !strings.Contains(a.KeptReplicas[0].Reason, "holds refs") {
+		t.Fatalf("101 kept replicas = %+v; want 150 kept for its refs", a.KeptReplicas)
 	}
 	if r := actionFor(t, plan, 150); r.Kind != handlers.StemcellRefsActionSkip || r.Failure {
 		t.Fatalf("replica action = %+v; want a non-failing skip", r)
@@ -420,8 +443,77 @@ func TestStemcellRefsPrune_LastRefDestroySweepsReplicas(t *testing.T) {
 	if err != nil || res.Failures != 0 {
 		t.Fatalf("apply: err %v failures %d %+v", err, res.Failures, res.Results)
 	}
-	if !slices.Equal(f.deleted, []int64{101, 150}) {
-		t.Fatalf("deleted = %v, want [101 150]", f.deleted)
+	if !slices.Equal(f.deleted, []int64{101, 151}) {
+		t.Fatalf("deleted = %v, want [101 151]", f.deleted)
+	}
+	if got := descRefs(t, f.cfgString(150, "description")); !slices.Equal(got, []string{oldRef}) {
+		t.Errorf("replica 150 refs = %v; the prune must never edit a replica", got)
+	}
+	if !strings.Contains(f.tagsAtDelete[151], "bosh-destroy-pending") {
+		t.Errorf("replica 151 destroyed without the pending stamp; tags %q", f.tagsAtDelete[151])
+	}
+}
+
+func TestStemcellRefsPrune_VMIDSweepsOnlyEligibleReplicas(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
+	f.addTemplate(150, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), replicaTags(shaA))
+	f.addTemplate(151, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+	f.addTemplate(152, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+	f.addVM(200, "clone", "", map[string]string{"scsi0": "local-lvm:base-152-disk-0/vm-200-disk-0"})
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 101})
+	if plan.Refused || len(plan.Actions) != 1 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	a := plan.Actions[0]
+	if a.Kind != handlers.StemcellRefsActionDestroy || len(a.SweepReplicas) != 1 || a.SweepReplicas[0].VMID != 151 {
+		t.Fatalf("action = %+v; want destroy of 101 that sweeps only 151", a)
+	}
+	kept := map[int64]string{}
+	for _, k := range a.KeptReplicas {
+		kept[k.VMID] = k.Reason
+	}
+	if !strings.Contains(kept[150], "holds refs") || !strings.Contains(kept[152], "linked clone") || len(kept) != 2 {
+		t.Fatalf("kept replicas = %+v; want 150 for its refs and 152 for its clone", a.KeptReplicas)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v failures %d %+v", err, res.Failures, res.Results)
+	}
+	if !slices.Equal(f.deleted, []int64{101, 151}) || !slices.Equal(res.Results[0].Destroyed, []int64{101, 151}) {
+		t.Fatalf("deleted = %v destroyed = %v, want [101 151]", f.deleted, res.Results[0].Destroyed)
+	}
+}
+
+func TestStemcellRefsPrune_VMIDReplicaRules(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	// No anchor of shaB survives, but 160 holds a ref of its own.
+	f.addTemplate(160, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, oldRef), replicaTags(shaB))
+	// 161 has no sha8 anywhere, so its anchor cannot be proven gone.
+	f.addTemplate(161, "bosh-stemcell-c-1", `{"name":"c","version":"1","director_refs":[]}`,
+		"bosh-stemcell-cache;bosh-stemcell-node-pve-node2")
+	// 162 holds no ref and has no live anchor, so --vmid frees it.
+	f.addTemplate(162, "bosh-stemcell-d-1-dddd4444", provDesc("dddd4444"), replicaTags("dddd4444"))
+
+	cases := map[int64]string{160: "holds refs of its own", 161: "no known sha8"}
+	for vmid, want := range cases {
+		_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: vmid})
+		if !plan.Refused || !strings.Contains(plan.RefusalReason, want) {
+			t.Errorf("vmid %d: refused=%v reason %q; want %q", vmid, plan.Refused, plan.RefusalReason, want)
+		}
+	}
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 162})
+	if plan.Refused {
+		t.Fatalf("zero-ref replica without a live anchor refused: %s", plan.RefusalReason)
+	}
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v %+v", err, res.Results)
+	}
+	if !slices.Equal(f.deleted, []int64{162}) {
+		t.Fatalf("deleted = %v, want [162]", f.deleted)
 	}
 }
 
@@ -570,7 +662,7 @@ func TestStemcellRefsPrune_VMIDRefusals(t *testing.T) {
 		9000: "not a recognizable stemcell cache template",
 		201:  "not a template",
 		777:  "no guest",
-		105:  "not provenance JSON",
+		105:  "does not parse as provenance JSON",
 	}
 	for vmid, want := range cases {
 		deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: vmid})
@@ -606,7 +698,7 @@ func TestStemcellRefsPrune_SentinelRefs(t *testing.T) {
 	for _, ref := range []string{"unknown-director", "debug-repro"} {
 		f := newPruneFake()
 		f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, ref), cacheTemplateTags(shaA)+";director--"+ref)
-		deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: ref})
+		deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: ref, AllowOwnedVMs: true})
 		if a := actionFor(t, plan, 101); a.Kind != handlers.StemcellRefsActionRemoveRefAndDestroy {
 			t.Fatalf("%s: action = %+v", ref, a)
 		}
@@ -614,6 +706,320 @@ func TestStemcellRefsPrune_SentinelRefs(t *testing.T) {
 		if err != nil || res.Failures != 0 || !slices.Equal(f.deleted, []int64{101}) {
 			t.Fatalf("%s: err %v failures %d deleted %v", ref, err, res.Failures, f.deleted)
 		}
+	}
+}
+
+func TestStemcellRefsPrune_SentinelOwnershipUnknown(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, "unknown-director"),
+		cacheTemplateTags(shaA)+";director--unknown-director")
+	// A UUID-less caller's VM carries no owner tag at all.
+	f.addVM(300, "uuidless-vm", "", nil)
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: "unknown-director"})
+	if !plan.Refused || !plan.OwnershipUnknown || !strings.Contains(plan.RefusalReason, "ownership cannot be determined") {
+		t.Fatalf("plan = %+v; want a refusal saying ownership cannot be determined", plan)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if !errors.Is(err, handlers.ErrStemcellRefsPruneRefused) || !res.Refused {
+		t.Fatalf("apply err = %v refused = %v", err, res.Refused)
+	}
+	if f.writeCount() != 0 || len(f.deleted) != 0 {
+		t.Fatalf("refused sentinel prune changed PVE: writes %v deleted %v", f.writes, f.deleted)
+	}
+
+	scan, err := handlers.ScanStemcellRefs(context.Background(), f.deps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range handlers.BuildStemcellRefsReport(scan).Refs {
+		if r.Ref == "unknown-director" && (r.OwnedVMCount != nil || !r.OwnershipUnknown) {
+			t.Errorf("report owned count = %v unknown = %v; want unknown, not 0", r.OwnedVMCount, r.OwnershipUnknown)
+		}
+	}
+}
+
+func TestStemcellRefsPrune_BlankDescriptionRefsUnknown(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	// A director registered on 101, then its description was blanked.
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, "", cacheTemplateTags(shaA)+";director--"+oldRef)
+	// 102 has only the cache marker and a blank description.
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, "", "bosh-stemcell-cache")
+	// 103 is a true legacy template.
+	f.addTemplate(103, "bosh-stemcell-legacy-1-2", "", "")
+
+	for _, vmid := range []int64{101, 102} {
+		_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: vmid})
+		if !plan.Refused || !strings.Contains(plan.RefusalReason, "refs are unknown") {
+			t.Errorf("vmid %d: refused=%v reason %q; want refs unknown", vmid, plan.Refused, plan.RefusalReason)
+		}
+	}
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	if a := actionFor(t, plan, 101); a.Kind != handlers.StemcellRefsActionSkip || !a.Failure ||
+		!strings.Contains(a.Reason, "refs are unknown") {
+		t.Fatalf("director mode on 101 = %+v; want a failing skip, not remove-tag", a)
+	}
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 1 {
+		t.Fatalf("apply: err %v %+v", err, res.Results)
+	}
+	if f.writeCount() != 0 || len(f.deleted) != 0 {
+		t.Fatalf("blank-description templates were touched: writes %v deleted %v", f.writes, f.deleted)
+	}
+
+	scan, err := handlers.ScanStemcellRefs(context.Background(), f.deps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unref := map[int64]handlers.StemcellRefsUnreferenced{}
+	for _, u := range handlers.BuildStemcellRefsReport(scan).Unreferenced {
+		unref[u.VMID] = u
+	}
+	for _, vmid := range []int64{101, 102} {
+		if u, ok := unref[vmid]; !ok || u.Freeable || !u.RefsUnknown {
+			t.Errorf("report row for %d = %+v (present %v); want refs unknown, not freeable", vmid, u, ok)
+		}
+	}
+	if u := unref[103]; !u.Freeable || !u.Legacy || u.RefsUnknown {
+		t.Errorf("report row for legacy 103 = %+v; want freeable", u)
+	}
+}
+
+func TestStemcellRefsPrune_WritesHappenInsideTheLock(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef, newRef),
+		cacheTemplateTags(shaA)+";director--"+oldRef+";director--"+newRef)
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, oldRef), cacheTemplateTags(shaB)+";director--"+oldRef)
+	f.addTemplate(104, "bosh-stemcell-c-1-cccc3333", provDesc("cccc3333", newRef),
+		cacheTemplateTags("cccc3333")+";director--"+oldRef+";director--"+newRef)
+	f.addTemplate(105, "bosh-stemcell-legacy-1-2", "", "")
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 0 {
+		t.Fatalf("director apply: err %v %+v", err, res.Results)
+	}
+	deps, plan = scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 105})
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 0 {
+		t.Fatalf("vmid apply: err %v %+v", err, res.Results)
+	}
+	// 101 gets a ref and tag write, 102 a pending stamp, 104 a tag write,
+	// and 105 a pending stamp.
+	if f.writeCount() < 4 {
+		t.Fatalf("writes = %v; expected one per template", f.writes)
+	}
+	if len(f.unlockedWrites) != 0 {
+		t.Fatalf("writes made without the per-VMID lock: %v", f.unlockedWrites)
+	}
+}
+
+func TestStemcellRefsPrune_SanitizedRefs(t *testing.T) {
+	t.Parallel()
+	const odd = "Old.Dir_1"
+	const oddTag = "director--Old-Dir-1"
+	f := newPruneFake()
+	// 101 holds odd and newRef; its odd tag goes.
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, odd, newRef),
+		cacheTemplateTags(shaA)+";"+oddTag+";director--"+newRef)
+	// 102 holds odd and a second ref that sanitizes to the same tag, which
+	// therefore stays.
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, odd, "Old_Dir.1"), cacheTemplateTags(shaB)+";"+oddTag)
+	f.addVM(300, "live-vm", "bosh-owner--old-dir-1", nil)
+
+	_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: odd})
+	if !plan.Refused || len(plan.OwnedVMs) != 1 || plan.OwnerTag != "bosh-owner--old-dir-1" {
+		t.Fatalf("plan = %+v; want the owner guard to find VM 300 through the sanitized tag", plan)
+	}
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: odd, AllowOwnedVMs: true})
+	a := actionFor(t, plan, 101)
+	if a.Kind != handlers.StemcellRefsActionRemoveRef || a.DropTag != oddTag {
+		t.Fatalf("101 action = %+v; want remove-ref dropping %s", a, oddTag)
+	}
+	b := actionFor(t, plan, 102)
+	if b.Kind != handlers.StemcellRefsActionRemoveRef || b.DropTag != "" || !strings.Contains(b.Reason, "kept") {
+		t.Fatalf("102 action = %+v; want remove-ref that keeps the shared tag", b)
+	}
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v %+v", err, res.Results)
+	}
+	if tags := f.cfgString(101, "tags"); strings.Contains(tags, oddTag) {
+		t.Errorf("101 tags = %q; %s should be gone", tags, oddTag)
+	}
+	if got := descRefs(t, f.cfgString(102, "description")); !slices.Equal(got, []string{"Old_Dir.1"}) {
+		t.Errorf("102 refs = %v", got)
+	}
+	if tags := f.cfgString(102, "tags"); !strings.Contains(tags, oddTag) {
+		t.Errorf("102 tags = %q; the shared tag must stay", tags)
+	}
+}
+
+func TestStemcellRefsPrune_TrimmedRefMatch(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, " "+oldRef+" ", newRef),
+		cacheTemplateTags(shaA)+";director--"+oldRef+";director--"+newRef)
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	a := actionFor(t, plan, 101)
+	if a.Kind != handlers.StemcellRefsActionRemoveRef || a.MatchedRef != " "+oldRef+" " {
+		t.Fatalf("action = %+v; want remove-ref of the stored spelling", a)
+	}
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v %+v", err, res.Results)
+	}
+	if got := descRefs(t, f.cfgString(101, "description")); !slices.Equal(got, []string{newRef}) {
+		t.Errorf("refs = %v, want [%s]", got, newRef)
+	}
+}
+
+func TestStemcellRefsPrune_ResumeDestroyApplies(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, oldRef),
+		cacheTemplateTags(shaB)+";director--"+oldRef+";bosh-destroy-pending")
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	if a := actionFor(t, plan, 102); a.Kind != handlers.StemcellRefsActionResumeDestroy {
+		t.Fatalf("action = %+v; want resume-destroy", a)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v %+v", err, res.Results)
+	}
+	if res.Results[0].Outcome != handlers.StemcellRefsOutcomeApplied || !slices.Equal(res.Results[0].Destroyed, []int64{102}) {
+		t.Fatalf("result = %+v", res.Results[0])
+	}
+	if !slices.Equal(f.deleted, []int64{102}) {
+		t.Fatalf("deleted = %v", f.deleted)
+	}
+}
+
+func TestStemcellRefsPrune_UnfinishedSha8KeepsReplicas(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), cacheTemplateTags(shaA)+";director--"+oldRef)
+	f.addTemplate(102, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), cacheTemplateTags(shaA)+";director--"+oldRef)
+	f.addTemplate(150, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+	f.deleteErr[101] = &sdkerrors.APIError{HTTPCode: 400, Message: "storage busy"}
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	if b := actionFor(t, plan, 102); len(b.SweepReplicas) != 1 || b.SweepReplicas[0].VMID != 150 {
+		t.Fatalf("102 action = %+v; want it to carry the sweep of 150", b)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !slices.Equal(f.deleted, []int64{102}) {
+		t.Fatalf("deleted = %v; want 102 only, with replica 150 kept while 101 survives", f.deleted)
+	}
+	notes := strings.Join(res.Results[1].Notes, " ")
+	if !strings.Contains(notes, "replicas kept") {
+		t.Errorf("102 notes = %q; want the kept replicas reported", notes)
+	}
+}
+
+func TestStemcellRefsPrune_ConfigMissingCountsAsGone(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, newRef),
+		cacheTemplateTags(shaA)+";director--"+oldRef+";director--"+newRef)
+	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, oldRef), cacheTemplateTags(shaB)+";director--"+oldRef)
+	f.addTemplate(150, "bosh-stemcell-b-1-"+shaB, provDesc(shaB), replicaTags(shaB))
+	f.addTemplate(105, "bosh-stemcell-legacy-1-2", "", "")
+
+	missing := &sdkerrors.APIError{HTTPCode: 500, Message: "Configuration file 'nodes/pve/qemu-server/1.conf' does not exist"}
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
+	vdeps, vplan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 105})
+	f.configErr[101] = missing
+	f.configErr[102] = missing
+	f.configErr[105] = missing
+
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 {
+		t.Fatalf("director apply: err %v %+v", err, res.Results)
+	}
+	for _, r := range res.Results {
+		if r.Outcome != handlers.StemcellRefsOutcomeGone {
+			t.Errorf("vmid %d outcome %s; want already-gone", r.Action.VMID, r.Outcome)
+		}
+	}
+	// 102 carried the sweep of 150; the already-gone carrier says so.
+	if notes := strings.Join(res.Results[1].Notes, " "); !strings.Contains(notes, "replicas 150 kept") {
+		t.Errorf("102 notes = %q; want replica 150 reported as kept", notes)
+	}
+	vres, err := handlers.ApplyStemcellRefsPrune(context.Background(), vdeps, vplan)
+	if err != nil || vres.Failures != 0 || vres.Results[0].Outcome != handlers.StemcellRefsOutcomeGone {
+		t.Fatalf("vmid apply: err %v %+v", err, vres.Results)
+	}
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("gone templates were touched: writes %v deleted %v", f.writes, f.deleted)
+	}
+}
+
+func TestStemcellRefsPrune_VerifyChecksTemplateAndName(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(105, "bosh-stemcell-legacy-1-2", "", "")
+	f.addTemplate(106, "bosh-stemcell-legacy-1-3", "", "")
+
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 105})
+	_, plan2 := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 106})
+	// 105 became an ordinary VM and 106 was renamed after the plan.
+	f.guests[105].cfg["template"] = float64(0)
+	f.setCfg(106, "name", "someone-else")
+
+	for _, p := range []handlers.StemcellRefsPlan{plan, plan2} {
+		res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, p)
+		if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeChanged {
+			t.Errorf("vmid %d: err %v %+v; want changed-since-plan", p.VMID, err, res.Results)
+		}
+	}
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("changed guests were touched: writes %v deleted %v", f.writes, f.deleted)
+	}
+}
+
+func TestStemcellRefsPrune_UnplannedActionIsNotApplied(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(105, "bosh-stemcell-legacy-1-2", "", "")
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 105})
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded handlers.StemcellRefsPlan
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, decoded)
+	if err != nil || res.Failures != 1 || !strings.Contains(res.Results[0].Error, "planner") {
+		t.Fatalf("decoded plan apply: err %v %+v; want the action rejected", err, res.Results)
+	}
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("decoded plan changed PVE: writes %v deleted %v", f.writes, f.deleted)
+	}
+}
+
+func TestStemcellRefsReport_FlagsBlankRefs(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, "", newRef), cacheTemplateTags(shaA)+";director--"+newRef)
+	scan, err := handlers.ScanStemcellRefs(context.Background(), f.deps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blank *handlers.StemcellRefsRefSummary
+	rep := handlers.BuildStemcellRefsReport(scan)
+	for i := range rep.Refs {
+		if rep.Refs[i].Ref == "" {
+			blank = &rep.Refs[i]
+		}
+	}
+	if blank == nil || blank.Note == "" || !slices.Equal(blank.DescriptionTemplates, []int64{101}) {
+		t.Fatalf("refs = %+v; want a flagged blank-ref row naming 101", rep.Refs)
 	}
 }
 

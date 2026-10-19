@@ -17,7 +17,8 @@ package handlers
 //     same value, and the report's "would free" column comes from it too.
 //   - ApplyStemcellRefsPrune executes a plan. Every mutation takes the
 //     per-VMID lock, re-reads the template inside it, and skips the template
-//     when its description or tags no longer match the scan.
+//     when it is no longer a template, or its name, description, or tags no
+//     longer match the scan.
 //   - BuildStemcellRefsReport summarizes a scan for the read-only report.
 //
 // Ref removal goes through deregisterStemcellDirectorRefWith, the same
@@ -79,6 +80,12 @@ const (
 // log fields, because the operator prune works from VMIDs, not CIDs.
 const stemcellRefsCIDLabel = "stemcell-refs-prune"
 
+// PVE config keys the prune reads besides the description and tags.
+const (
+	pveConfigKeyName     = "name"
+	pveConfigKeyTemplate = "template"
+)
+
 // ErrStemcellRefsChanged marks a template whose description or tags changed
 // between the plan and the locked re-read at apply time. The template is left
 // as it is and the action is reported as skipped.
@@ -131,8 +138,17 @@ type StemcellRefsTemplate struct {
 	Replica        bool `json:"replica"`
 	DestroyPending bool `json:"destroy_pending"`
 	// Legacy marks a template from before 0.9.2: the cache naming pattern, a
-	// blank description, and no generation marker.
+	// blank description, and no generation marker. Only a legacy template's
+	// blank description counts as zero refs.
 	Legacy bool `json:"legacy"`
+	// RefsUnknown is true when the description cannot tell us the ref set:
+	// it was unread, it does not parse, or it is blank on a template that is
+	// not legacy. Such a template is never changed.
+	RefsUnknown bool `json:"refs_unknown"`
+	// Untracked marks a provenance template with no generation marker. It
+	// comes from a CPI generation that never recorded refs, so an empty ref
+	// set on it proves nothing about who uses it.
+	Untracked bool `json:"untracked"`
 	// LinkedClones lists the guests whose disks name this template's base
 	// volume as their parent.
 	LinkedClones []int64 `json:"linked_clones"`
@@ -240,6 +256,9 @@ func scanStemcellTemplate(g pve.GuestRef, cfg map[string]any, cfgErr error) (Ste
 	} else {
 		t.Tags = parseTagsField(stringConfigField(cfg, jsonKeyTags))
 		t.description = stringConfigField(cfg, pveConfigKeyDescription)
+		if name := stringConfigField(cfg, pveConfigKeyName); name != "" {
+			t.Name = name
+		}
 		switch {
 		case strings.TrimSpace(t.description) == "":
 			t.DescriptionState = stemcellRefsDescBlank
@@ -274,13 +293,17 @@ func scanStemcellTemplate(g pve.GuestRef, cfg map[string]any, cfgErr error) (Ste
 	t.Replica = pve.TemplateRef{Tags: strings.Join(t.Tags, pveTagJoinSep)}.IsReplica()
 	t.DestroyPending = stringSliceContains(t.Tags, stemcellDestroyPendingTag)
 	nameMatches := legacyStemcellTemplateName.MatchString(t.Name)
-	t.Legacy = nameMatches && t.DescriptionState == stemcellRefsDescBlank && !pve.HasStemcellGenerationMarker(t.Tags)
+	marker := pve.HasStemcellGenerationMarker(t.Tags)
+	t.Legacy = nameMatches && t.DescriptionState == stemcellRefsDescBlank && !marker
+	t.RefsUnknown = t.DescriptionState == stemcellRefsDescUnread || t.DescriptionState == stemcellRefsDescUnparseable ||
+		(t.DescriptionState == stemcellRefsDescBlank && !t.Legacy)
+	t.Untracked = t.DescriptionState == stemcellRefsDescProvenance && !marker
 	if t.DescriptionState == stemcellRefsDescProvenance || t.DescriptionState == stemcellRefsDescBlank {
 		t.RefsTagsDisagree = refsAndTagsDisagree(t.DescriptionRefs, t.DirectorTags)
 	}
 	t.LinkedClones = []int64{}
 
-	recognized := nameMatches || pve.HasStemcellGenerationMarker(t.Tags) || t.Replica ||
+	recognized := nameMatches || marker || t.Replica ||
 		(provOK && (prov.SHA8 != "" || prov.CID != "" || prov.Kind != "" || len(prov.DirectorRefs) > 0))
 	for _, tok := range t.Tags {
 		if tok == stemcellMarkerTag || tok == stemcellCacheTag || strings.HasPrefix(tok, stemcellSHATagPrefix) {
@@ -288,6 +311,27 @@ func scanStemcellTemplate(g pve.GuestRef, cfg map[string]any, cfgErr error) (Ste
 		}
 	}
 	return t, recognized
+}
+
+// refsKnownZero reports whether t provably holds no ref: a provenance
+// description with an empty ref set, or a legacy template's blank one.
+func refsKnownZero(t *StemcellRefsTemplate) bool {
+	if t.Legacy {
+		return true
+	}
+	return t.DescriptionState == stemcellRefsDescProvenance && len(t.DescriptionRefs) == 0
+}
+
+// storedRefSpellings returns the distinct entries of refs that equal ref once
+// surrounding space is trimmed, in the order they appear.
+func storedRefSpellings(refs []string, ref string) []string {
+	var out []string
+	for _, r := range refs {
+		if strings.TrimSpace(r) == ref && !stringSliceContains(out, r) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // refsAndTagsDisagree compares the sanitized description refs with the
@@ -359,13 +403,14 @@ func linkedCloneBases(cfg map[string]any, self int64) []int64 {
 // StemcellRefsPruneRequest names what a prune acts on. Exactly one of
 // DirectorRef and VMID is set.
 type StemcellRefsPruneRequest struct {
-	// DirectorRef is matched exactly against description refs, and through
-	// directorTagFor against tags. Surrounding space is trimmed.
+	// DirectorRef is trimmed, then matched against description refs by
+	// trimmed equality, and through directorTagFor against tags.
 	DirectorRef string
 	// VMID names one unreferenced template to free.
 	VMID int64
 	// AllowOwnedVMs lets a DirectorRef prune proceed while non-template
-	// guests still carry the ref's owner tag.
+	// guests still carry the ref's owner tag, or when ownership cannot be
+	// determined at all, as for the unknown-director sentinel.
 	AllowOwnedVMs bool
 }
 
@@ -375,6 +420,19 @@ type StemcellRefsTemplateRef struct {
 	Node string   `json:"node"`
 	Name string   `json:"name"`
 	Tags []string `json:"-"`
+
+	// description is the scanned description, so the sweep can prove the
+	// replica still holds no ref when it destroys it.
+	description string
+}
+
+// StemcellRefsKeptReplica is a replica a destroy leaves in place, with the
+// reason it is not swept.
+type StemcellRefsKeptReplica struct {
+	VMID   int64  `json:"vmid"`
+	Node   string `json:"node"`
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // StemcellRefsAction is one planned step on one template.
@@ -386,20 +444,30 @@ type StemcellRefsAction struct {
 	SHA8 string `json:"sha8,omitempty"`
 	// Reason explains a blocked or skipped action, or a tag the plan keeps.
 	Reason string `json:"reason,omitempty"`
+	// MatchedRef is the ref exactly as the description stores it, which can
+	// differ from the requested ref by surrounding space.
+	MatchedRef string `json:"matched_ref,omitempty"`
 	// RemainingRefs is the ref set a remove-ref leaves behind.
 	RemainingRefs []string `json:"remaining_refs,omitempty"`
 	// DropTag is the director tag the action removes.
 	DropTag string `json:"drop_tag,omitempty"`
 	// SweepReplicas lists the replicas destroyed after this template, when
-	// it is the last non-replica template of its sha8.
+	// it is the last non-replica template of its sha8. Each one passes the
+	// --vmid preconditions on its own: zero refs, no linked clones.
 	SweepReplicas []StemcellRefsTemplateRef `json:"sweep_replicas,omitempty"`
-	LinkedClones  []int64                   `json:"linked_clones,omitempty"`
+	// KeptReplicas lists the replicas of that sha8 the destroy leaves in
+	// place, such as a replica that holds refs of its own.
+	KeptReplicas []StemcellRefsKeptReplica `json:"kept_replicas,omitempty"`
+	LinkedClones []int64                   `json:"linked_clones,omitempty"`
 	// Failure is true for a blocked or skipped action that makes the
 	// command exit 1.
 	Failure bool `json:"failure"`
 
 	description string
 	tags        []string
+	// planned is set by the planner, so the apply refuses a mutating action
+	// it did not produce, such as one decoded from JSON.
+	planned bool
 }
 
 // Mutating reports whether applying the action changes PVE.
@@ -432,6 +500,10 @@ type StemcellRefsPlan struct {
 	VMID        int64  `json:"vmid,omitempty"`
 	// OwnedVMs lists the non-template guests carrying the ref's owner tag.
 	OwnedVMs []StemcellRefsGuest `json:"owned_vms,omitempty"`
+	// OwnershipUnknown is true when no owner tag can exist for the ref, as
+	// for the unknown-director sentinel: create_vm stamps no owner tag on a
+	// VM made without a director UUID, so OwnedVMs cannot see those VMs.
+	OwnershipUnknown bool `json:"ownership_unknown"`
 	// Refused is true when the plan must not be applied at all.
 	Refused       bool                 `json:"refused"`
 	RefusalReason string               `json:"refusal_reason,omitempty"`
@@ -484,7 +556,7 @@ func PlanStemcellRefsPrune(scan StemcellRefsScan, req StemcellRefsPruneRequest) 
 func newStemcellRefsAction(kind string, t *StemcellRefsTemplate) StemcellRefsAction {
 	return StemcellRefsAction{
 		Kind: kind, VMID: t.VMID, Node: t.Node, Name: t.Name, SHA8: t.SHA8,
-		description: t.description, tags: append([]string(nil), t.Tags...),
+		description: t.description, tags: append([]string(nil), t.Tags...), planned: true,
 	}
 }
 
@@ -531,6 +603,20 @@ func planDirectorPrune(scan StemcellRefsScan, ref string, allowOwned bool, plan 
 	plan.DirectorRef = ref
 	plan.DirectorTag = directorTagFor(ref)
 	plan.OwnerTag = ownerTagFor(ref)
+	planDirectorOwnership(scan, ref, allowOwned, plan)
+	for i := range scan.Templates {
+		if act, ok := planDirectorTemplate(scan, &scan.Templates[i], ref, plan.DirectorTag); ok {
+			plan.Actions = append(plan.Actions, act)
+		}
+	}
+}
+
+// planDirectorOwnership fills the owned-VM guard. It refuses the plan, unless
+// allowOwned is set, when non-template guests carry the ref's owner tag, or
+// when no owner tag can exist for the ref at all. The second case covers the
+// unknown-director sentinel: create_vm stamps no owner tag on a VM made
+// without a director UUID, so an owned count of zero would prove nothing.
+func planDirectorOwnership(scan StemcellRefsScan, ref string, allowOwned bool, plan *StemcellRefsPlan) {
 	if plan.OwnerTag != "" {
 		for _, g := range scan.Guests {
 			if stringSliceContains(g.OwnerTags, plan.OwnerTag) {
@@ -538,7 +624,18 @@ func planDirectorPrune(scan StemcellRefsScan, ref string, allowOwned bool, plan 
 			}
 		}
 	}
-	if len(plan.OwnedVMs) > 0 && !allowOwned {
+	plan.OwnershipUnknown = ref == unknownDirectorRef || plan.OwnerTag == ""
+	if allowOwned {
+		return
+	}
+	switch {
+	case plan.OwnershipUnknown:
+		plan.Refused = true
+		plan.RefusalReason = fmt.Sprintf(
+			"ownership cannot be determined for %s: VMs created without a director UUID carry no owner tag, "+
+				"so the owned-VM check cannot see the callers that use this ref. Pass --allow-owned-vms only "+
+				"when we know no such caller still deploys from these templates", ref)
+	case len(plan.OwnedVMs) > 0:
 		ids := make([]int64, 0, len(plan.OwnedVMs))
 		for _, g := range plan.OwnedVMs {
 			ids = append(ids, g.VMID)
@@ -549,73 +646,107 @@ func planDirectorPrune(scan StemcellRefsScan, ref string, allowOwned bool, plan 
 				"Pass --allow-owned-vms only when we know those VMs are orphans",
 			len(ids), plan.OwnerTag, joinVMIDs(ids))
 	}
+}
 
-	for i := range scan.Templates {
-		t := &scan.Templates[i]
-		inDesc := t.DescriptionState == stemcellRefsDescProvenance && stringSliceContains(t.DescriptionRefs, ref)
-		tagTok := matchingDirectorTag(t.Tags, plan.DirectorTag)
-		switch {
-		case t.DescriptionState == stemcellRefsDescUnread:
-			act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-			act.Reason = "config could not be read, so we cannot tell whether it holds the ref: " + t.ReadError
-			act.Failure = true
-			plan.Actions = append(plan.Actions, act)
-		case t.Replica:
-			if inDesc || tagTok != "" {
-				act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-				act.Reason = "replica: its refs are a fossil of its creation, and it is swept when the last " +
-					"non-replica template of its sha8 is destroyed"
-				plan.Actions = append(plan.Actions, act)
-			}
-		case t.DescriptionState == stemcellRefsDescUnparseable:
-			if tagTok != "" || strings.Contains(t.description, ref) {
-				act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-				act.Reason = "description is not provenance JSON, so the template is never changed"
-				act.Failure = true
-				plan.Actions = append(plan.Actions, act)
-			}
-		case t.DestroyPending:
-			switch {
-			case inDesc && len(t.DescriptionRefs) == 1:
-				plan.Actions = append(plan.Actions, planDestroy(scan, StemcellRefsActionResumeDestroy, t))
-			case inDesc:
-				act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-				act.Reason = "destroy is pending but other refs remain, which no CPI path leaves behind; inspect it by hand"
-				act.Failure = true
-				plan.Actions = append(plan.Actions, act)
-			case tagTok != "":
-				act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-				act.Reason = "destroy already pending; the ref is only in its tags, so the prune leaves it"
-				plan.Actions = append(plan.Actions, act)
-			}
-		case inDesc:
-			remaining := removeStringFromSlice(t.DescriptionRefs, ref)
-			if len(remaining) == 0 {
-				plan.Actions = append(plan.Actions, planDestroy(scan, StemcellRefsActionRemoveRefAndDestroy, t))
-				continue
-			}
-			act := newStemcellRefsAction(StemcellRefsActionRemoveRef, t)
-			act.RemainingRefs = remaining
-			if tagTok != "" {
-				if _, dropped := dropDirectorTag(t.Tags, tagTok, remaining); dropped {
-					act.DropTag = tagTok
-				} else {
-					act.Reason = "tag " + tagTok + " kept: another ref maps to it, or it is the template's only generation marker"
-				}
-			}
-			plan.Actions = append(plan.Actions, act)
-		case tagTok != "":
-			if _, dropped := dropDirectorTag(t.Tags, tagTok, t.DescriptionRefs); dropped {
-				act := newStemcellRefsAction(StemcellRefsActionRemoveTag, t)
-				act.DropTag = tagTok
-				plan.Actions = append(plan.Actions, act)
-				continue
-			}
-			act := newStemcellRefsAction(StemcellRefsActionSkip, t)
-			act.Reason = "tag " + tagTok + " kept: another ref maps to it, or it is the template's only generation marker"
-			plan.Actions = append(plan.Actions, act)
+// stemcellRefsTagKept explains a director tag the plan keeps.
+const stemcellRefsTagKept = "kept: another ref maps to it, or it is the template's only generation marker"
+
+// skipStemcellRefsAction is a skip on t with reason.
+func skipStemcellRefsAction(t *StemcellRefsTemplate, reason string, failure bool) StemcellRefsAction {
+	act := newStemcellRefsAction(StemcellRefsActionSkip, t)
+	act.Reason = reason
+	act.Failure = failure
+	return act
+}
+
+// planDirectorTemplate plans one template for a director prune, or reports
+// false when the template neither holds the ref nor carries its tag.
+func planDirectorTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate, ref, dirTag string) (StemcellRefsAction, bool) {
+	var spellings []string
+	if t.DescriptionState == stemcellRefsDescProvenance {
+		spellings = storedRefSpellings(t.DescriptionRefs, ref)
+	}
+	inDesc := len(spellings) > 0
+	tagTok := matchingDirectorTag(t.Tags, dirTag)
+	switch {
+	case t.DescriptionState == stemcellRefsDescUnread:
+		return skipStemcellRefsAction(t,
+			"config could not be read, so we cannot tell whether it holds the ref: "+t.ReadError, true), true
+	case t.Replica:
+		if !inDesc && tagTok == "" {
+			return StemcellRefsAction{}, false
+		}
+		return skipStemcellRefsAction(t, "replica that holds the ref or its tag; the prune never edits a replica, "+
+			"and never destroys a replica that holds refs of its own", false), true
+	case t.DescriptionState == stemcellRefsDescUnparseable:
+		if tagTok == "" && !strings.Contains(t.description, ref) {
+			return StemcellRefsAction{}, false
+		}
+		return skipStemcellRefsAction(t,
+			"description does not parse as provenance JSON, so the template is never changed", true), true
+	case t.RefsUnknown:
+		// A blank description on a template that is not legacy.
+		if tagTok == "" {
+			return StemcellRefsAction{}, false
+		}
+		return skipStemcellRefsAction(t, "blank description on a template that carries director or cache tags, "+
+			"so its refs are unknown and the template is never changed", true), true
+	case len(spellings) > 1:
+		return skipStemcellRefsAction(t, fmt.Sprintf(
+			"the description holds the ref under %d spellings (%q); fix it by hand", len(spellings), spellings), true), true
+	case t.DestroyPending:
+		return planDirectorPending(scan, t, spellings, tagTok)
+	case inDesc:
+		return planDirectorRemoveRef(scan, t, spellings[0], tagTok), true
+	case tagTok != "":
+		if _, dropped := dropDirectorTag(t.Tags, tagTok, t.DescriptionRefs); dropped {
+			act := newStemcellRefsAction(StemcellRefsActionRemoveTag, t)
+			act.DropTag = tagTok
+			return act, true
+		}
+		return skipStemcellRefsAction(t, "tag "+tagTok+" "+stemcellRefsTagKept, false), true
+	}
+	return StemcellRefsAction{}, false
+}
+
+// planDirectorPending plans a template already marked bosh-destroy-pending.
+func planDirectorPending(scan StemcellRefsScan, t *StemcellRefsTemplate, spellings []string, tagTok string) (StemcellRefsAction, bool) {
+	switch {
+	case len(spellings) == 1 && len(removeStringFromSlice(t.DescriptionRefs, spellings[0])) == 0:
+		act := planDestroy(scan, StemcellRefsActionResumeDestroy, t)
+		act.MatchedRef = spellings[0]
+		return act, true
+	case len(spellings) > 0:
+		return skipStemcellRefsAction(t,
+			"destroy is pending but other refs remain, which no CPI path leaves behind; inspect it by hand", true), true
+	case tagTok != "":
+		return skipStemcellRefsAction(t,
+			"destroy already pending; the ref is only in its tags, so the prune leaves it", false), true
+	}
+	return StemcellRefsAction{}, false
+}
+
+// planDirectorRemoveRef plans the removal of matched, the stored spelling of
+// the ref, from t's description. The last ref goes with a destroy, which the
+// clone check can block; a template that is blocked keeps its last ref.
+func planDirectorRemoveRef(scan StemcellRefsScan, t *StemcellRefsTemplate, matched, tagTok string) StemcellRefsAction {
+	remaining := removeStringFromSlice(t.DescriptionRefs, matched)
+	if len(remaining) == 0 {
+		act := planDestroy(scan, StemcellRefsActionRemoveRefAndDestroy, t)
+		act.MatchedRef = matched
+		return act
+	}
+	act := newStemcellRefsAction(StemcellRefsActionRemoveRef, t)
+	act.MatchedRef = matched
+	act.RemainingRefs = remaining
+	if tagTok != "" {
+		if _, dropped := dropDirectorTag(t.Tags, tagTok, remaining); dropped {
+			act.DropTag = tagTok
+		} else {
+			act.Reason = "tag " + tagTok + " " + stemcellRefsTagKept
 		}
 	}
+	return act
 }
 
 // liveAnchorFor returns a non-replica template other than self with sha8,
@@ -632,17 +763,35 @@ func liveAnchorFor(scan StemcellRefsScan, sha8 string, self int64) (StemcellRefs
 	return StemcellRefsTemplate{}, false
 }
 
+// zeroRefBlock returns why t fails the --vmid preconditions that concern t
+// alone, or "". Those preconditions are that t provably holds no ref (a
+// blank description counts only on a legacy template), that a replica has a
+// known sha8, and that t backs no linked clone. A replica swept with its
+// anchor must pass the same check.
+func zeroRefBlock(scan StemcellRefsScan, t *StemcellRefsTemplate) string {
+	switch {
+	case t.DescriptionState == stemcellRefsDescUnread:
+		return "config could not be read: " + t.ReadError
+	case t.DescriptionState == stemcellRefsDescUnparseable:
+		return "description does not parse as provenance JSON, so the template is never changed"
+	case t.RefsUnknown:
+		return "blank description on a template that is not a legacy cache template (it carries a director or " +
+			"cache tag, or its name does not follow legacy cache naming), so its refs are unknown"
+	case t.Replica && len(t.DescriptionRefs) > 0:
+		return fmt.Sprintf("replica that holds refs of its own (%s); a replica that holds refs is never destroyed",
+			strings.Join(t.DescriptionRefs, ", "))
+	case len(t.DescriptionRefs) > 0:
+		return fmt.Sprintf("still referenced by %s; prune those refs with --director first",
+			strings.Join(t.DescriptionRefs, ", "))
+	case t.Replica && t.SHA8 == "":
+		return "replica with no known sha8, so we cannot prove its anchor is gone"
+	}
+	return cloneBlock(scan, t)
+}
+
 func planVMIDPrune(scan StemcellRefsScan, vmid int64, plan *StemcellRefsPlan) {
 	plan.Mode = "vmid"
 	plan.VMID = vmid
-	refuse := func(act StemcellRefsAction, reason string) {
-		act.Kind = StemcellRefsActionBlocked
-		act.Reason = reason
-		act.Failure = true
-		plan.Refused = true
-		plan.RefusalReason = reason
-		plan.Actions = append(plan.Actions, act)
-	}
 	var target *StemcellRefsTemplate
 	for i := range scan.Templates {
 		if scan.Templates[i].VMID == vmid {
@@ -664,31 +813,21 @@ func planVMIDPrune(scan StemcellRefsScan, vmid int64, plan *StemcellRefsPlan) {
 	}
 	t := target
 	act := newStemcellRefsAction(StemcellRefsActionDestroy, t)
-	switch {
-	case t.DescriptionState == stemcellRefsDescUnread:
-		refuse(act, "config could not be read: "+t.ReadError)
-		return
-	case t.DescriptionState == stemcellRefsDescUnparseable:
-		refuse(act, "description is not provenance JSON, so the template is never changed")
-		return
-	case t.Replica:
+	reason := zeroRefBlock(scan, t)
+	if reason == "" && t.Replica {
 		if anchor, ok := liveAnchorFor(scan, t.SHA8, t.VMID); ok {
-			refuse(act, fmt.Sprintf("replica of live template %d; it is freed with that template", anchor.VMID))
-			return
+			reason = fmt.Sprintf("replica of live template %d; it is freed with that template", anchor.VMID)
 		}
-		if t.SHA8 == "" && len(t.DescriptionRefs) > 0 {
-			refuse(act, "replica with no known sha8 and a non-empty ref set; we cannot prove its anchor is gone")
-			return
-		}
-	case len(t.DescriptionRefs) > 0:
-		refuse(act, fmt.Sprintf("still referenced by %s; prune those refs with --director first",
-			strings.Join(t.DescriptionRefs, ", ")))
-		return
 	}
-	if reason := cloneBlock(scan, t); reason != "" {
-		act.LinkedClones = t.LinkedClones
-		refuse(act, reason)
-		return
+	if reason != "" {
+		act.Kind = StemcellRefsActionBlocked
+		act.Reason = reason
+		act.Failure = true
+		if len(t.LinkedClones) > 0 {
+			act.LinkedClones = t.LinkedClones
+		}
+		plan.Refused = true
+		plan.RefusalReason = reason
 	}
 	plan.Actions = append(plan.Actions, act)
 }
@@ -703,11 +842,12 @@ func guestByVMID(scan StemcellRefsScan, vmid int64) *StemcellRefsGuest {
 	return nil
 }
 
-// attachReplicaSweeps follows delete_stemcell's replica semantics. When a
-// plan destroys every non-replica template of a sha8, that sha8's replicas
-// go with the last of them, as delete_stemcell's anchor destroy sweeps them.
-// A replica that backs linked clones blocks every destroy of its sha8, so no
-// anchor goes while a replica it would orphan stays behind.
+// attachReplicaSweeps decides what happens to a sha8's replicas when a plan
+// destroys every non-replica template of that sha8. The last of those
+// destroys carries the sweep. A replica is swept only when it passes the
+// --vmid preconditions on its own (zeroRefBlock): it holds no ref, its
+// description can be read and parsed, and it backs no linked clone. Every
+// other replica is listed in KeptReplicas with its reason and left alone.
 func attachReplicaSweeps(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 	destroying := map[int64]bool{}
 	carrier := map[string]int{}
@@ -725,26 +865,19 @@ func attachReplicaSweeps(scan StemcellRefsScan, plan *StemcellRefsPlan) {
 	}
 	for sha8, idx := range carrier {
 		replicas, survivor := orphanedReplicas(scan, sha8, destroying)
-		if survivor || len(replicas) == 0 {
+		if survivor {
 			continue
 		}
-		if block := replicaCloneBlock(scan, sha8, replicas); block != "" {
-			for i := range plan.Actions {
-				if plan.Actions[i].destroys() && plan.Actions[i].SHA8 == sha8 {
-					plan.Actions[i].Kind = StemcellRefsActionBlocked
-					plan.Actions[i].Reason = block
-					plan.Actions[i].Failure = true
-				}
-			}
-			if plan.Mode == "vmid" {
-				plan.Refused = true
-				plan.RefusalReason = block
-			}
-			continue
-		}
+		a := &plan.Actions[idx]
 		for _, r := range replicas {
-			plan.Actions[idx].SweepReplicas = append(plan.Actions[idx].SweepReplicas,
-				StemcellRefsTemplateRef{VMID: r.VMID, Node: r.Node, Name: r.Name, Tags: r.Tags})
+			if reason := zeroRefBlock(scan, r); reason != "" {
+				a.KeptReplicas = append(a.KeptReplicas,
+					StemcellRefsKeptReplica{VMID: r.VMID, Node: r.Node, Name: r.Name, Reason: reason})
+				continue
+			}
+			a.SweepReplicas = append(a.SweepReplicas, StemcellRefsTemplateRef{
+				VMID: r.VMID, Node: r.Node, Name: r.Name, Tags: append([]string(nil), r.Tags...), description: r.description,
+			})
 		}
 	}
 }
@@ -766,17 +899,6 @@ func orphanedReplicas(scan StemcellRefsScan, sha8 string, destroying map[int64]b
 		}
 	}
 	return replicas, survivor
-}
-
-// replicaCloneBlock returns why sha8's anchor destroys must be blocked
-// because one of its replicas backs linked clones, or "".
-func replicaCloneBlock(scan StemcellRefsScan, sha8 string, replicas []*StemcellRefsTemplate) string {
-	for _, r := range replicas {
-		if reason := cloneBlock(scan, r); reason != "" {
-			return fmt.Sprintf("replica %d of sha8 %s: %s", r.VMID, sha8, reason)
-		}
-	}
-	return ""
 }
 
 // isReplicaVMID reports whether the scanned template vmid is a replica.
@@ -814,21 +936,24 @@ type StemcellRefsActionResult struct {
 	Failure bool `json:"failure"`
 }
 
-// StemcellRefsApplyResult is the whole apply.
+// StemcellRefsApplyResult is the whole apply. A refused plan yields the same
+// shape with Refused set and no results, so a JSON consumer reads one shape.
 type StemcellRefsApplyResult struct {
 	Plan    StemcellRefsPlan           `json:"plan"`
+	Refused bool                       `json:"refused"`
 	Results []StemcellRefsActionResult `json:"results"`
 	// Failures counts the results with Failure set.
 	Failures int `json:"failures"`
 }
 
 // ApplyStemcellRefsPrune executes plan. A refused plan changes nothing and
-// returns ErrStemcellRefsPruneRefused. Each action runs on its own: a failure
-// is recorded in its result and the apply moves on, so the caller exits 1
-// when Failures is non-zero.
+// returns ErrStemcellRefsPruneRefused with a result whose Refused flag is set.
+// Each action runs on its own: a failure is recorded in its result and the
+// apply moves on, so the caller exits 1 when Failures is non-zero.
 func ApplyStemcellRefsPrune(ctx context.Context, deps Deps, plan StemcellRefsPlan) (StemcellRefsApplyResult, error) {
 	res := StemcellRefsApplyResult{Plan: plan, Results: []StemcellRefsActionResult{}}
 	if plan.Refused {
+		res.Refused = true
 		return res, ErrStemcellRefsPruneRefused
 	}
 	if deps.PVE == nil || deps.PVE.QEMU() == nil {
@@ -850,6 +975,52 @@ func ApplyStemcellRefsPrune(ctx context.Context, deps Deps, plan StemcellRefsPla
 	return res, nil
 }
 
+// pveFlagSet reads a PVE boolean config value, which arrives as a JSON
+// number, a bool, or a string depending on the endpoint.
+func pveFlagSet(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case float64:
+		return x == 1
+	case int:
+		return x == 1
+	case int64:
+		return x == 1
+	case string:
+		return x == "1" || x == "true"
+	}
+	return false
+}
+
+// stemcellRefsVerifier returns the check every locked apply step runs on its
+// fresh config read. The guest must still be a template, keep the scanned
+// name, and keep the scanned description and tag set; anything else is
+// ErrStemcellRefsChanged and the step writes nothing.
+func stemcellRefsVerifier(name, description string, tags []string) func(cfg map[string]any) error {
+	return func(cfg map[string]any) error {
+		cfgName := stringConfigField(cfg, pveConfigKeyName)
+		switch {
+		case !pveFlagSet(cfg[pveConfigKeyTemplate]):
+			return fmt.Errorf("%w: the guest is no longer a template", ErrStemcellRefsChanged)
+		case cfgName != "" && cfgName != name:
+			return fmt.Errorf("%w: the guest is now named %q", ErrStemcellRefsChanged, cfgName)
+		case stringConfigField(cfg, pveConfigKeyDescription) != description:
+			return fmt.Errorf("%w: its description changed", ErrStemcellRefsChanged)
+		case !sameTagSet(parseTagsField(stringConfigField(cfg, jsonKeyTags)), tags):
+			return fmt.Errorf("%w: its tags changed", ErrStemcellRefsChanged)
+		}
+		return nil
+	}
+}
+
+// stemcellRefsGone reports whether a config read says the guest no longer
+// exists: a 404, or the pmxcfs "configuration file does not exist" answer
+// that destroyTemplateVM also treats as gone.
+func stemcellRefsGone(err error) bool {
+	return pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err)
+}
+
 func applyStemcellRefsAction(
 	ctx context.Context,
 	deps Deps,
@@ -864,13 +1035,14 @@ func applyStemcellRefsAction(
 		r.Failure = act.Failure
 		return r
 	}
-	alog := logger.With(log.String("node", act.Node), log.Int64("vmid", act.VMID), log.String("kind", act.Kind))
-	verify := func(description string, tags []string) error {
-		if description != act.description || !sameTagSet(tags, act.tags) {
-			return ErrStemcellRefsChanged
-		}
-		return nil
+	if !act.planned {
+		r.Outcome = StemcellRefsOutcomeFailed
+		r.Error = "stemcell-refs: the action did not come from the planner, so it is not applied"
+		r.Failure = true
+		return r
 	}
+	alog := logger.With(log.String("node", act.Node), log.Int64("vmid", act.VMID), log.String("kind", act.Kind))
+	verify := stemcellRefsVerifier(act.Name, act.description, act.tags)
 	ranDestroy := false
 	destroy := func(ctx context.Context) error {
 		ranDestroy = true
@@ -878,9 +1050,14 @@ func applyStemcellRefsAction(
 			return err
 		}
 		r.Destroyed = append(r.Destroyed, act.VMID)
-		sweepStemcellRefsReplicas(ctx, deps, alog, plan.DirectorRef, act, sha8Unfinished, &r)
+		sweepStemcellRefsReplicas(ctx, deps, alog, act, sha8Unfinished, &r)
 		return nil
 	}
+	ref := act.MatchedRef
+	if ref == "" {
+		ref = plan.DirectorRef
+	}
+	opts := deregisterOptions{verify: verify, goneOnConfigMissing: true}
 
 	var err error
 	switch act.Kind {
@@ -888,9 +1065,9 @@ func applyStemcellRefsAction(
 		refuseDestroy := func(context.Context) error {
 			return cpierrors.Cloud("stemcell-refs: the plan keeps template %d, so it is not destroyed", act.VMID)
 		}
+		opts.dropTag = act.DropTag
 		var out deregisterOutcome
-		out, err = deregisterStemcellDirectorRefWith(ctx, deps, alog, act.Node, act.VMID, plan.DirectorRef,
-			refuseDestroy, deregisterOptions{verify: verify, dropTag: act.DropTag})
+		out, err = deregisterStemcellDirectorRefWith(ctx, deps, alog, act.Node, act.VMID, ref, refuseDestroy, opts)
 		if err == nil {
 			r.RemainingRefs = out.remaining
 			r.TagRemoved = out.tagDropped
@@ -900,8 +1077,7 @@ func applyStemcellRefsAction(
 		}
 	case StemcellRefsActionRemoveRefAndDestroy, StemcellRefsActionResumeDestroy:
 		var out deregisterOutcome
-		out, err = deregisterStemcellDirectorRefWith(ctx, deps, alog, act.Node, act.VMID, plan.DirectorRef,
-			destroy, deregisterOptions{verify: verify})
+		out, err = deregisterStemcellDirectorRefWith(ctx, deps, alog, act.Node, act.VMID, ref, destroy, opts)
 		if err == nil && out.destroyed && !ranDestroy {
 			r.Outcome = StemcellRefsOutcomeGone
 		}
@@ -918,13 +1094,21 @@ func applyStemcellRefsAction(
 			r.Outcome = StemcellRefsOutcomeGone
 		}
 	}
+	if err == nil && r.Outcome == StemcellRefsOutcomeGone && len(act.SweepReplicas) > 0 {
+		ids := make([]int64, 0, len(act.SweepReplicas))
+		for _, rep := range act.SweepReplicas {
+			ids = append(ids, rep.VMID)
+		}
+		r.Notes = append(r.Notes, fmt.Sprintf("replicas %s kept: template %d was already gone, so no sweep ran; "+
+			"run the report again and free them with --vmid", joinVMIDs(ids), act.VMID))
+	}
 
 	switch {
 	case errors.Is(err, ErrStemcellRefsChanged):
 		r.Outcome = StemcellRefsOutcomeChanged
 		r.Error = err.Error()
 		r.Failure = true
-		alog.Warn("stemcell-refs: template changed since the plan; skipped")
+		alog.Warn("stemcell-refs: template changed since the plan; skipped", log.Err(err))
 	case err != nil:
 		r.Outcome = StemcellRefsOutcomeFailed
 		r.Error = err.Error()
@@ -944,14 +1128,15 @@ func applyStemcellRefsAction(
 }
 
 // sweepStemcellRefsReplicas destroys the replicas planned to go with act's
-// template, using delete_stemcell's coMatchSafeToSweep re-check on each. It
-// sweeps nothing when an earlier destroy of the same sha8 did not finish,
-// because a non-replica template of that sha8 then survives.
+// template. Each one goes through destroyUnreferencedTemplateLocked with its
+// own scanned name, description, and tags, so a replica that gained a ref,
+// changed, or stopped being a template since the plan is kept. It sweeps
+// nothing when an earlier destroy of the same sha8 did not finish, because a
+// non-replica template of that sha8 then survives.
 func sweepStemcellRefsReplicas(
 	ctx context.Context,
 	deps Deps,
 	logger *log.Logger,
-	directorRef string,
 	act StemcellRefsAction,
 	sha8Unfinished map[string]bool,
 	r *StemcellRefsActionResult,
@@ -964,21 +1149,31 @@ func sweepStemcellRefsReplicas(
 		return
 	}
 	for _, rep := range act.SweepReplicas {
-		tref := pve.TemplateRef{VMID: rep.VMID, Node: rep.Node, Name: rep.Name, Tags: strings.Join(rep.Tags, pveTagJoinSep)}
-		if !coMatchSafeToSweep(ctx, deps, tref, directorRef, act.SHA8, logger) {
-			r.Notes = append(r.Notes, fmt.Sprintf("replica %d preserved: gone, unreadable, or a different stemcell", rep.VMID))
-			continue
-		}
-		if err := destroyTemplateVM(ctx, deps, rep.Node, rep.VMID, stemcellRefsCIDLabel); err != nil {
-			r.Failure = true
-			if pve.IsBaseVolumeInUse(err) {
-				r.Notes = append(r.Notes, fmt.Sprintf("replica %d still backs linked-clone VMs: %v", rep.VMID, err))
-			} else {
-				r.Notes = append(r.Notes, fmt.Sprintf("replica %d destroy failed: %v", rep.VMID, err))
+		destroyed := false
+		destroyReplica := func(ctx context.Context) error {
+			if err := destroyTemplateVM(ctx, deps, rep.Node, rep.VMID, stemcellRefsCIDLabel); err != nil {
+				return err
 			}
-			continue
+			destroyed = true
+			return nil
 		}
-		r.Destroyed = append(r.Destroyed, rep.VMID)
+		verify := stemcellRefsVerifier(rep.Name, rep.description, rep.Tags)
+		gone, err := destroyUnreferencedTemplateLocked(ctx, deps, logger, rep.Node, rep.VMID, verify, destroyReplica)
+		switch {
+		case errors.Is(err, ErrStemcellRefsChanged):
+			r.Failure = true
+			r.Notes = append(r.Notes, fmt.Sprintf("replica %d kept: %v", rep.VMID, err))
+		case err != nil && pve.IsBaseVolumeInUse(err):
+			r.Failure = true
+			r.Notes = append(r.Notes, fmt.Sprintf("replica %d still backs linked-clone VMs: %v", rep.VMID, err))
+		case err != nil:
+			r.Failure = true
+			r.Notes = append(r.Notes, fmt.Sprintf("replica %d destroy failed: %v", rep.VMID, err))
+		case gone:
+			r.Notes = append(r.Notes, fmt.Sprintf("replica %d was already gone", rep.VMID))
+		case destroyed:
+			r.Destroyed = append(r.Destroyed, rep.VMID)
+		}
 	}
 }
 
@@ -1009,25 +1204,25 @@ func removeStemcellDirectorTagLocked(
 	node string,
 	vmid int64,
 	dropTag string,
-	verify func(description string, tags []string) error,
+	verify func(cfg map[string]any) error,
 ) (gone, removed bool, err error) {
 	vmidInt := int(vmid) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
 	owner := fmt.Sprintf("stemcell/director_ref/prune_tag/%d", vmid)
 	err = withVMIDLock(ctx, deps.PVE.Pools(), vmidInt, owner, logger, func() error {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmidInt)
 		if cfgErr != nil {
-			if pve.IsNotFound(cfgErr) {
+			if stemcellRefsGone(cfgErr) {
 				gone = true
 				return nil
 			}
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("stemcell-refs: read config vmid %d node %q", vmid, node))
 		}
-		description := stringConfigField(cfg, pveConfigKeyDescription)
-		tags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
-		if verifyErr := verify(description, tags); verifyErr != nil {
+		if verifyErr := verify(cfg); verifyErr != nil {
 			return verifyErr
 		}
+		description := stringConfigField(cfg, pveConfigKeyDescription)
+		tags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
 		prov, _ := parseStemcellProvenanceFromDescription(description)
 		kept, dropped := dropDirectorTag(tags, dropTag, prov.DirectorRefs)
 		if !dropped {
@@ -1062,7 +1257,7 @@ func destroyUnreferencedTemplateLocked(
 	logger *log.Logger,
 	node string,
 	vmid int64,
-	verify func(description string, tags []string) error,
+	verify func(cfg map[string]any) error,
 	destroy func(context.Context) error,
 ) (gone bool, err error) {
 	vmidInt := int(vmid) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
@@ -1070,19 +1265,17 @@ func destroyUnreferencedTemplateLocked(
 	lockErr := withVMIDLock(ctx, deps.PVE.Pools(), vmidInt, owner, logger, func() error {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmidInt)
 		if cfgErr != nil {
-			if pve.IsNotFound(cfgErr) {
+			if stemcellRefsGone(cfgErr) {
 				gone = true
 				return nil
 			}
 			return cpierrors.Wrap(pve.WrapError(cfgErr),
 				fmt.Sprintf("stemcell-refs: read config vmid %d node %q", vmid, node))
 		}
-		description := stringConfigField(cfg, pveConfigKeyDescription)
-		tags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
-		if verifyErr := verify(description, tags); verifyErr != nil {
+		if verifyErr := verify(cfg); verifyErr != nil {
 			return verifyErr
 		}
-		return stampDestroyPendingTagLocked(ctx, deps, node, vmid, tags)
+		return stampDestroyPendingTagLocked(ctx, deps, node, vmid, parseTagsField(stringConfigField(cfg, jsonKeyTags)))
 	})
 	if lockErr != nil || gone {
 		return gone, lockErr
@@ -1099,29 +1292,39 @@ type StemcellRefsRefSummary struct {
 	Ref         string `json:"ref"`
 	DirectorTag string `json:"director_tag"`
 	OwnerTag    string `json:"owner_tag"`
-	// DescriptionTemplates hold the ref in their description.
+	// DescriptionTemplates hold the ref in their description, matched by
+	// trimmed equality.
 	DescriptionTemplates []int64 `json:"description_templates"`
 	// TagOnlyTemplates carry the ref's tag without holding the ref.
 	TagOnlyTemplates []int64 `json:"tag_only_templates"`
-	OwnedVMCount     int     `json:"owned_vm_count"`
+	// OwnedVMCount is null when ownership cannot be determined for the ref,
+	// as for the unknown-director sentinel, whose VMs carry no owner tag.
+	OwnedVMCount     *int    `json:"owned_vm_count"`
+	OwnershipUnknown bool    `json:"ownership_unknown"`
 	OwnedVMs         []int64 `json:"owned_vms"`
-	// WouldFree lists the templates a prune of this ref would destroy.
+	// WouldFree lists the templates a prune of this ref would destroy, as
+	// if --allow-owned-vms were passed.
 	WouldFree []int64 `json:"would_free"`
 	// Blocked lists the templates a prune would leave because of a safety
 	// rule.
 	Blocked []int64 `json:"blocked"`
+	// Note flags a ref the prune cannot address, such as a blank one.
+	Note string `json:"note,omitempty"`
 }
 
 // StemcellRefsUnreferenced is a template a --vmid prune could free, or a
-// zero-ref template it would refuse, with the planner's reason.
+// zero-ref or refs-unknown template it would refuse, with the planner's
+// reason.
 type StemcellRefsUnreferenced struct {
-	VMID     int64  `json:"vmid"`
-	Node     string `json:"node"`
-	Name     string `json:"name"`
-	Legacy   bool   `json:"legacy"`
-	Replica  bool   `json:"replica"`
-	Freeable bool   `json:"freeable"`
-	Reason   string `json:"reason,omitempty"`
+	VMID        int64  `json:"vmid"`
+	Node        string `json:"node"`
+	Name        string `json:"name"`
+	Legacy      bool   `json:"legacy"`
+	Replica     bool   `json:"replica"`
+	RefsUnknown bool   `json:"refs_unknown"`
+	Untracked   bool   `json:"untracked"`
+	Freeable    bool   `json:"freeable"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 // StemcellRefsReport is the read-only report.
@@ -1159,14 +1362,15 @@ func BuildStemcellRefsReport(scan StemcellRefsScan) StemcellRefsReport {
 	return rep
 }
 
-// stemcellRefNames returns every distinct ref in scan, sorted. A tag-only
-// ref is listed by its tag value unless some description ref maps to the
-// same tag.
+// stemcellRefNames returns every distinct ref in scan, trimmed and sorted. A
+// blank ref is listed as "" so the report can flag it. A tag-only ref is
+// listed by its tag value unless some description ref maps to the same tag.
 func stemcellRefNames(scan StemcellRefsScan) []string {
 	refs := map[string]bool{}
 	descTagValues := map[string]bool{}
 	for i := range scan.Templates {
 		for _, r := range scan.Templates[i].DescriptionRefs {
+			r = strings.TrimSpace(r)
 			refs[r] = true
 			descTagValues[strings.ToLower(sanitizeTagValue(r))] = true
 		}
@@ -1191,56 +1395,71 @@ func stemcellRefNames(scan StemcellRefsScan) []string {
 // the prune uses.
 func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSummary {
 	s := StemcellRefsRefSummary{
-		Ref: ref, DirectorTag: directorTagFor(ref), OwnerTag: ownerTagFor(ref),
-		DescriptionTemplates: []int64{}, TagOnlyTemplates: []int64{},
+		Ref: ref, DescriptionTemplates: []int64{}, TagOnlyTemplates: []int64{},
 		OwnedVMs: []int64{}, WouldFree: []int64{}, Blocked: []int64{},
+	}
+	if ref != "" {
+		s.DirectorTag = directorTagFor(ref)
+		s.OwnerTag = ownerTagFor(ref)
 	}
 	for i := range scan.Templates {
 		t := &scan.Templates[i]
 		switch {
-		case stringSliceContains(t.DescriptionRefs, ref):
+		case len(storedRefSpellings(t.DescriptionRefs, ref)) > 0:
 			s.DescriptionTemplates = append(s.DescriptionTemplates, t.VMID)
-		case matchingDirectorTag(t.Tags, s.DirectorTag) != "":
+		case s.DirectorTag != "" && matchingDirectorTag(t.Tags, s.DirectorTag) != "":
 			s.TagOnlyTemplates = append(s.TagOnlyTemplates, t.VMID)
 		}
 	}
+	if ref == "" {
+		s.OwnershipUnknown = true
+		s.Note = "blank ref: the prune cannot address it, so these templates stay until it is removed by hand"
+		return s
+	}
 	plan, err := PlanStemcellRefsPrune(scan, StemcellRefsPruneRequest{DirectorRef: ref, AllowOwnedVMs: true})
-	if err == nil {
-		for _, g := range plan.OwnedVMs {
-			s.OwnedVMs = append(s.OwnedVMs, g.VMID)
-		}
-		for i := range plan.Actions {
-			a := &plan.Actions[i]
-			switch {
-			case a.destroys():
-				s.WouldFree = append(s.WouldFree, a.VMID)
-				for _, r := range a.SweepReplicas {
-					s.WouldFree = append(s.WouldFree, r.VMID)
-				}
-			case a.Failure:
-				s.Blocked = append(s.Blocked, a.VMID)
+	if err != nil {
+		return s
+	}
+	for _, g := range plan.OwnedVMs {
+		s.OwnedVMs = append(s.OwnedVMs, g.VMID)
+	}
+	for i := range plan.Actions {
+		a := &plan.Actions[i]
+		switch {
+		case a.destroys():
+			s.WouldFree = append(s.WouldFree, a.VMID)
+			for _, r := range a.SweepReplicas {
+				s.WouldFree = append(s.WouldFree, r.VMID)
 			}
+		case a.Failure:
+			s.Blocked = append(s.Blocked, a.VMID)
 		}
 	}
-	s.OwnedVMCount = len(s.OwnedVMs)
+	s.OwnershipUnknown = plan.OwnershipUnknown
+	if !s.OwnershipUnknown {
+		n := len(s.OwnedVMs)
+		s.OwnedVMCount = &n
+	}
 	return s
 }
 
-// unreferencedStemcellTemplate returns t's unreferenced-table row, with the
-// --vmid planner's verdict, or false when t holds refs and is not freeable.
+// unreferencedStemcellTemplate returns t's unreferenced-table row with the
+// --vmid planner's verdict. A template appears when it provably holds no ref,
+// when its blank description leaves its refs unknown (never freeable), or
+// when the planner would free it.
 func unreferencedStemcellTemplate(scan StemcellRefsScan, t *StemcellRefsTemplate) (StemcellRefsUnreferenced, bool) {
-	zeroRefs := (t.DescriptionState == stemcellRefsDescBlank || t.DescriptionState == stemcellRefsDescProvenance) &&
-		len(t.DescriptionRefs) == 0
+	candidate := refsKnownZero(t) || (t.RefsUnknown && t.DescriptionState == stemcellRefsDescBlank)
 	plan, err := PlanStemcellRefsPrune(scan, StemcellRefsPruneRequest{VMID: t.VMID})
 	if err != nil {
 		return StemcellRefsUnreferenced{}, false
 	}
 	freeable := !plan.Refused && len(plan.Actions) == 1 && plan.Actions[0].Kind == StemcellRefsActionDestroy
-	if !zeroRefs && !freeable {
+	if !candidate && !freeable {
 		return StemcellRefsUnreferenced{}, false
 	}
 	u := StemcellRefsUnreferenced{
-		VMID: t.VMID, Node: t.Node, Name: t.Name, Legacy: t.Legacy, Replica: t.Replica, Freeable: freeable,
+		VMID: t.VMID, Node: t.Node, Name: t.Name, Legacy: t.Legacy, Replica: t.Replica,
+		RefsUnknown: t.RefsUnknown, Untracked: t.Untracked, Freeable: freeable,
 	}
 	if !freeable {
 		u.Reason = plan.RefusalReason

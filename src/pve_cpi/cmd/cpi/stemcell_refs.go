@@ -113,13 +113,19 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 	if !*apply {
 		return writeStemcellRefsPlan(stdout, stderr, plan, *jsonOut)
 	}
-	if plan.Refused {
-		// A refused plan is printed so the operator sees why, and nothing
-		// is applied.
-		writeStemcellRefsPlan(stdout, stderr, plan, *jsonOut)
+	result, err := handlers.ApplyStemcellRefsPrune(ctx, deps, plan)
+	if errors.Is(err, handlers.ErrStemcellRefsPruneRefused) {
+		// A refused plan changes nothing. JSON output keeps the apply
+		// result's shape, with refused set; text output prints the plan so
+		// the operator sees why.
+		if *jsonOut {
+			encodeStemcellRefsJSON(stdout, stderr, result)
+			fmt.Fprintln(stderr, "refused: "+plan.RefusalReason)
+			return 1
+		}
+		writeStemcellRefsPlan(stdout, stderr, plan, false)
 		return 1
 	}
-	result, err := handlers.ApplyStemcellRefsPrune(ctx, deps, plan)
 	if err != nil {
 		fmt.Fprintf(stderr, "stemcell-refs: %s\n", err)
 		return 1
@@ -194,24 +200,34 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 	}
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "REFS")
-	fmt.Fprintln(tw, "REF\tTEMPLATES\tTAG ONLY\tOWNED VMS\tWOULD FREE\tBLOCKED")
+	fmt.Fprintln(tw, "REF\tTEMPLATES\tTAG ONLY\tOWNED VMS\tWOULD FREE\tBLOCKED\tNOTES")
 	for i := range rep.Refs {
 		r := &rep.Refs[i]
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.Ref, dashIDs(r.DescriptionTemplates), dashIDs(r.TagOnlyTemplates),
-			r.OwnedVMCount, dashIDs(r.WouldFree), dashIDs(r.Blocked))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", refLabel(r.Ref), dashIDs(r.DescriptionTemplates),
+			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), dashIDs(r.WouldFree), dashIDs(r.Blocked), dash(r.Note))
 	}
+	fmt.Fprintln(tw, "WOULD FREE assumes --allow-owned-vms; without it a prune refuses while OWNED VMS is non-zero or unknown.")
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "UNREFERENCED (prune --vmid)")
 	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tNOTES")
 	for _, u := range rep.Unreferenced {
-		notes := u.Reason
-		if u.Legacy {
-			notes = strings.TrimSpace("legacy " + notes)
-		}
+		var notes []string
 		if u.Replica {
-			notes = strings.TrimSpace("replica " + notes)
+			notes = append(notes, "replica")
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", u.Node, u.VMID, u.Name, yesNo(u.Freeable), dash(notes))
+		if u.Legacy {
+			notes = append(notes, "legacy")
+		}
+		if u.RefsUnknown {
+			notes = append(notes, "refs unknown")
+		}
+		if u.Untracked {
+			notes = append(notes, "untracked")
+		}
+		if u.Reason != "" {
+			notes = append(notes, u.Reason)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", u.Node, u.VMID, u.Name, yesNo(u.Freeable), dash(strings.Join(notes, " ")))
 	}
 	if err := tw.Flush(); err != nil {
 		fmt.Fprintf(stderr, "stemcell-refs: output could not be written: %s\n", err)
@@ -241,6 +257,16 @@ func writeStemcellRefsPlan(stdout, stderr io.Writer, plan handlers.StemcellRefsP
 		return code
 	}
 	fmt.Fprintln(stdout, "plan (dry run unless --apply):")
+	if len(plan.OwnedVMs) > 0 {
+		ids := make([]int64, 0, len(plan.OwnedVMs))
+		for _, g := range plan.OwnedVMs {
+			ids = append(ids, g.VMID)
+		}
+		fmt.Fprintf(stdout, "  owned VMs carrying %s: %s\n", plan.OwnerTag, dashIDs(ids))
+	}
+	if plan.OwnershipUnknown {
+		fmt.Fprintf(stdout, "  owned VMs: unknown, because no owner tag exists for %s\n", plan.DirectorRef)
+	}
 	writeStemcellRefsActions(stdout, plan.Actions)
 	for _, e := range plan.ScanErrors {
 		fmt.Fprintln(stderr, "scan error: "+e)
@@ -276,6 +302,9 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 			line += ": " + a.Reason
 		}
 		fmt.Fprintln(w, line)
+		for _, k := range a.KeptReplicas {
+			fmt.Fprintf(w, "    keeps replica %d (%s on %s): %s\n", k.VMID, k.Name, k.Node, k.Reason)
+		}
 	}
 }
 
@@ -334,7 +363,29 @@ func templateNotes(t *handlers.StemcellRefsTemplate) string {
 	if t.DescriptionState != "provenance" {
 		notes = append(notes, "description "+t.DescriptionState)
 	}
+	if t.RefsUnknown {
+		notes = append(notes, "refs unknown")
+	}
+	if t.Untracked {
+		notes = append(notes, "untracked")
+	}
 	return dashList(notes)
+}
+
+// refLabel shows a blank ref visibly in the text report.
+func refLabel(ref string) string {
+	if ref == "" {
+		return `""`
+	}
+	return ref
+}
+
+// ownedCount renders an owned VM count, which is nil when it is unknown.
+func ownedCount(n *int) string {
+	if n == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", *n)
 }
 
 func dash(s string) string {

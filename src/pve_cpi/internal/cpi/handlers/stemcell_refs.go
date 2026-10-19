@@ -218,11 +218,15 @@ func deregisterStemcellDirectorRef(
 // zero value adds nothing, so delete_stemcell's path through the wrapper
 // above is unchanged.
 type deregisterOptions struct {
-	// verify, when set, runs inside the lock right after the fresh config
-	// read and before any branch decides anything. A non-nil return aborts
-	// the call with that error and no write, which is how the prune skips a
-	// template that changed between its plan and its apply.
-	verify func(description string, tags []string) error
+	// verify, when set, runs inside the lock on the fresh config read,
+	// before any branch decides anything. A non-nil return aborts the call
+	// with that error and no write, which is how the prune skips a template
+	// that changed between its plan and its apply.
+	verify func(cfg map[string]any) error
+	// goneOnConfigMissing, when set, treats the pmxcfs "configuration file
+	// does not exist" answer like a 404 in branch (a), the way
+	// destroyTemplateVM does. delete_stemcell leaves it unset.
+	goneOnConfigMissing bool
 	// dropTag, when set, names a director tag to remove in branch (d), in
 	// the same write that persists the remaining refs. The tag stays when a
 	// remaining ref maps to the same tag or when removing it would leave the
@@ -279,7 +283,7 @@ func deregisterStemcellDirectorRefWith(
 	lockErr := withVMIDLock(ctx, pools, vmidInt, lockOwner, logger, func() error {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmidInt)
 		if cfgErr != nil {
-			if pve.IsNotFound(cfgErr) {
+			if pve.IsNotFound(cfgErr) || (opts.goneOnConfigMissing && pve.IsPmxcfsConfigMissing(cfgErr)) {
 				// (a) Template already gone — idempotent success.
 				destroyed = true
 				return nil
@@ -292,7 +296,7 @@ func deregisterStemcellDirectorRefWith(
 		currentTags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
 
 		if opts.verify != nil {
-			if verifyErr := opts.verify(description, currentTags); verifyErr != nil {
+			if verifyErr := opts.verify(cfg); verifyErr != nil {
 				return verifyErr
 			}
 		}
