@@ -91,12 +91,12 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 1
 	}
 	if action == "report" {
-		return writeStemcellRefsReport(stdout, stderr, handlers.BuildStemcellRefsReport(scan), *jsonOut)
+		return writeStemcellRefsReport(stdout, stderr, handlers.BuildStemcellRefsReportFor(scan, *configPath), *jsonOut)
 	}
 
 	req := handlers.StemcellRefsPruneRequest{
 		DirectorRef: strings.TrimSpace(*director), VMIDs: vmids, AllowOwnedVMs: *allowOwned, ReconcileTags: *reconcile,
-		Untracked: *untracked,
+		Untracked: *untracked, ConfigPath: *configPath,
 	}
 	plan, err := handlers.PlanStemcellRefsPrune(scan, req)
 	if err != nil {
@@ -286,7 +286,7 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 		return 1
 	}
 	writeStemcellRefsUncovered(stdout, rep)
-	fmt.Fprintln(tw, "UNREFERENCED (prune --vmid)")
+	fmt.Fprintln(tw, "PRUNE --vmid CANDIDATES (untracked ones need --untracked)")
 	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tFREE WITH\tNOTES")
 	for _, u := range rep.Unreferenced {
 		var notes []string
@@ -368,7 +368,7 @@ func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellR
 	}
 	writeStemcellRefsActions(stdout, plan.Actions)
 	if plan.Mode == "untracked" {
-		fmt.Fprintf(stdout, "  total freed: %s\n", stemcellRefsTotal(plan.TotalBytes, plan.SizesUnknown))
+		fmt.Fprintf(stdout, "  total provisioned size: %s\n", stemcellRefsTotal(plan.TotalBytes, plan.SizesUnknown))
 	}
 	for _, e := range plan.ScanErrors {
 		fmt.Fprintln(stderr, "scan error: "+e)
@@ -385,9 +385,12 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 	}
 	for i := range actions {
 		a := &actions[i]
-		line := fmt.Sprintf("  %s vmid %d (%s on %s)", a.Kind, a.VMID, a.Name, a.Node)
+		line := "  " + a.Kind + " " + stemcellRefsTarget(a.VMID, a.Name, a.Node)
 		if a.Replica {
 			line += ", replica"
+		}
+		if a.ResumesPending {
+			line += ", resumes the pending destroy"
 		}
 		if a.DropTag != "" {
 			line += ", removes tag " + a.DropTag
@@ -420,22 +423,40 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		}
 		if a.Frees != nil {
 			for _, v := range a.Frees.Volumes {
-				size := "size unknown"
+				size := "provisioned size unknown"
 				switch {
 				case v.SizeBytes != nil:
-					size = humanBytes(*v.SizeBytes)
+					size = "provisioned size " + humanBytes(*v.SizeBytes)
 				case v.SizeError != "":
-					size = "size unknown: " + v.SizeError
+					size = "provisioned size unknown: " + v.SizeError
 				}
 				fmt.Fprintf(w, "    frees %s %s on %s, %s\n", v.Slot, v.Volume, v.Storage, size)
 			}
-			fmt.Fprintf(w, "    frees %s in all\n", stemcellRefsTotal(a.Frees.TotalBytes, a.Frees.SizesUnknown))
+			fmt.Fprintf(w, "    provisioned size in all: %s\n",
+				stemcellRefsTotal(a.Frees.TotalBytes, a.Frees.SizesUnknown))
 		}
 	}
 }
 
-// stemcellRefsTotal renders a freed total, noting the volumes whose size
-// could not be read.
+// stemcellRefsTarget renders "vmid N (name on node)", leaving out whichever of
+// name and node is empty, and the parenthetical when both are, as for a VMID
+// that names no guest.
+func stemcellRefsTarget(vmid int64, name, node string) string {
+	target := fmt.Sprintf("vmid %d", vmid)
+	switch {
+	case name != "" && node != "":
+		target += fmt.Sprintf(" (%s on %s)", name, node)
+	case name != "":
+		target += " (" + name + ")"
+	case node != "":
+		target += " (on " + node + ")"
+	}
+	return target
+}
+
+// stemcellRefsTotal renders a total of provisioned sizes, noting the volumes
+// whose size could not be read. A destroy can give back less than this on
+// thin or copy-on-write storage, where a volume uses less than its size.
 func stemcellRefsTotal(total int64, unknown int) string {
 	if unknown > 0 {
 		return fmt.Sprintf("at least %s (%d volume size(s) unknown)", humanBytes(total), unknown)
@@ -502,9 +523,12 @@ func stemcellRefsResultLine(r *handlers.StemcellRefsActionResult) string {
 	if kind == "" {
 		kind = r.Action.Kind
 	}
-	line := fmt.Sprintf("  %s vmid %d (%s on %s)", kind, r.Action.VMID, r.Action.Name, r.Action.Node)
+	line := "  " + kind + " " + stemcellRefsTarget(r.Action.VMID, r.Action.Name, r.Action.Node)
 	if r.Action.Replica {
 		line += ", replica"
+	}
+	if r.Action.ResumesPending {
+		line += ", resumes the pending destroy"
 	}
 	line += ": " + r.Outcome
 	if kind != r.Action.Kind {

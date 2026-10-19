@@ -120,3 +120,20 @@ func TestWithVMIDLockClaimsTheFullTTL(t *testing.T) {
 		t.Fatalf("claim expires %s after acquisition, want the full TTL %s", held, vmidLockTTL)
 	}
 }
+
+// TestVMIDLockBodiesListTheUntrackedDestroy checks that the untracked destroy's
+// lock body, a config read, a status read, the linked-clone rescan, and the
+// stamp, is in the table with the rescan counted at its own deadline.
+func TestVMIDLockBodiesListTheUntrackedDestroy(t *testing.T) {
+	for _, body := range vmidLockBodies() {
+		if body.operation != "stemcell-refs untracked destroy" {
+			continue
+		}
+		want := 3*vmidLockCallAllowance + untrackedCloneRescanTimeout
+		if got := body.budget(); got != want {
+			t.Fatalf("untracked destroy budget = %s, want %s", got, want)
+		}
+		return
+	}
+	t.Fatal("the stemcell-refs untracked destroy body is missing from vmidLockBodies")
+}

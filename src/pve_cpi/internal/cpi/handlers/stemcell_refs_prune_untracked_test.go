@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	untrackedSha  = "uuuu1111"
+	untrackedSha  = "abcd1111"
 	untrackedName = "bosh-stemcell-u-1-" + untrackedSha
 	gib           = int64(1) << 30
 	mib           = int64(1) << 20
@@ -234,21 +235,14 @@ func TestStemcellRefsPruneUntracked_LinkedCloneAndIncompleteScanBlock(t *testing
 	}
 }
 
-func TestStemcellRefsPruneUntracked_RunningAndDestroyPendingRefuse(t *testing.T) {
+func TestStemcellRefsPruneUntracked_RunningRefuses(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
 	addUntracked(f, 110, untrackedSha)
 	f.running[110] = true
-	addUntracked(f, 111, "vvvv2222")
-	f.guests[111].cfg["tags"] = untrackedTags("vvvv2222", false) + ";bosh-destroy-pending"
 
 	if _, plan := untrackedPlan(t, f, 110); !plan.Refused || !strings.Contains(plan.RefusalReason, "running") {
 		t.Errorf("--untracked 110: refused %v reason %q; want a running refusal", plan.Refused, plan.RefusalReason)
-	}
-	if _, plan := untrackedPlan(t, f, 111); !plan.Refused ||
-		!strings.Contains(plan.RefusalReason, "bosh-destroy-pending") {
-		t.Errorf("--untracked 111: refused %v reason %q; want a destroy-pending refusal", plan.Refused,
-			plan.RefusalReason)
 	}
 
 	// A template the listing showed stopped but PVE reports running under
@@ -282,7 +276,16 @@ func TestStemcellRefsPruneUntracked_LockedRecheck(t *testing.T) {
 		}, "holds director_refs (" + newRef + ")"},
 		{"pending", func(_ *pruneFake, g *pruneFakeGuest) {
 			g.cfg["tags"] = untrackedTags(untrackedSha, false) + ";bosh-destroy-pending"
-		}, "bosh-destroy-pending is already set"},
+		}, "its tags changed"},
+		{"renamed", func(_ *pruneFake, g *pruneFakeGuest) {
+			g.cfg["name"] = "bosh-stemcell-u-2-" + untrackedSha
+		}, "its name changed"},
+		{"other zero-ref provenance", func(_ *pruneFake, g *pruneFakeGuest) {
+			g.cfg["description"] = strings.Replace(provDesc(untrackedSha), `"version":"1.0"`, `"version":"1.1"`, 1)
+		}, "its description changed"},
+		{"extra tag", func(_ *pruneFake, g *pruneFakeGuest) {
+			g.cfg["tags"] = untrackedTags(untrackedSha, false) + ";keep-me"
+		}, "its tags changed"},
 		{"not a template", func(_ *pruneFake, g *pruneFakeGuest) {
 			delete(g.cfg, "template")
 		}, "no longer a template"},
@@ -334,14 +337,79 @@ func TestStemcellRefsPruneUntracked_GoneBeforeApply(t *testing.T) {
 	}
 }
 
+func TestStemcellRefsPruneUntracked_MovedBeforeApplyIsNotGone(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.checkNode = true
+	addUntracked(f, 110, untrackedSha)
+	deps, plan := untrackedPlan(t, f, 110)
+	f.guests[110].node = "pve-node3"
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeChanged {
+		t.Fatalf("apply: err %v %+v; want changed-since-plan for a moved template", err, res.Results)
+	}
+	if e := res.Results[0].Error; !strings.Contains(e, "pve-node3") || !strings.Contains(e, "rerun") {
+		t.Errorf("error = %q; want the new node and a rerun instruction", e)
+	}
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("deleted %v writes %v; a moved template must be left alone", f.deleted, f.writes)
+	}
+
+	// When absence cannot be proven, the template is not reported as gone.
+	g := newPruneFake()
+	addUntracked(g, 110, untrackedSha)
+	deps, plan = untrackedPlan(t, g, 110)
+	delete(g.guests, 110)
+	g.listErr = &sdkerrors.APIError{HTTPCode: 500, Message: "cluster resources unavailable"}
+	res, err = handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeFailed {
+		t.Fatalf("apply: err %v %+v; want a failure when the listing cannot confirm absence", err, res.Results)
+	}
+}
+
+func TestStemcellRefsPruneUntracked_CloneRescanHasADeadline(t *testing.T) {
+	// Not parallel: it shortens the package's rescan limit.
+	restore := handlers.SetUntrackedCloneRescanTimeoutForTest(50 * time.Millisecond)
+	defer restore()
+	f := newPruneFake()
+	addUntracked(f, 110, untrackedSha)
+	f.addVM(200, "vm", "", map[string]string{"scsi0": "local-lvm:vm-200-disk-0,size=4G"})
+	deps, plan := untrackedPlan(t, f, 110)
+	f.mu.Lock()
+	f.blockRead[200] = true
+	f.mu.Unlock()
+
+	type outcome struct {
+		res handlers.StemcellRefsApplyResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+		done <- outcome{res, err}
+	}()
+	var out outcome
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("apply still running after 10s; want the rescan limit to end it")
+	}
+	if out.err != nil || out.res.Failures != 1 || !strings.Contains(out.res.Results[0].Error, "did not finish within") {
+		t.Fatalf("apply: err %v %+v; want the rescan cut off by its own limit", out.err, out.res.Results)
+	}
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("deleted %v writes %v; an unfinished rescan must leave the template alone", f.deleted, f.writes)
+	}
+}
+
 func TestStemcellRefsPruneUntracked_RepeatedVMIDsJudgedPerTemplate(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
 	addUntracked(f, 110, untrackedSha)
 	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
-	addUntracked(f, 111, "vvvv2222")
+	addUntracked(f, 111, "abcd2222")
 	f.running[111] = true
-	addUntracked(f, 112, "wwww3333")
+	addUntracked(f, 112, "abcd3333")
 	// 155 is an untracked replica of live anchor 102. --untracked judges it
 	// on its own, because 102's destroy would never sweep it.
 	f.addTemplate(102, "bosh-stemcell-a-1-"+shaB, provDesc(shaB, oldRef), cacheTemplateTags(shaB)+";director--"+oldRef)
@@ -413,7 +481,7 @@ func TestStemcellRefsPruneUntracked_ReportNamesCommandOrBlockers(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
 	addUntracked(f, 110, untrackedSha)
-	addUntracked(f, 111, "vvvv2222")
+	addUntracked(f, 111, "abcd2222")
 	f.addVM(200, "clone", "", map[string]string{"scsi0": "local-lvm:base-111-disk-0/vm-200-disk-0"})
 	f.addTemplate(103, "bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364", "", "")
 
@@ -421,17 +489,168 @@ func TestStemcellRefsPruneUntracked_ReportNamesCommandOrBlockers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows := map[int64]handlers.StemcellRefsUnreferenced{}
-	for _, u := range handlers.BuildStemcellRefsReport(scan).Unreferenced {
-		rows[u.VMID] = u
+	rowsFor := func(rep handlers.StemcellRefsReport) map[int64]handlers.StemcellRefsUnreferenced {
+		rows := map[int64]handlers.StemcellRefsUnreferenced{}
+		for _, u := range rep.Unreferenced {
+			rows[u.VMID] = u
+		}
+		return rows
 	}
-	if u := rows[110]; !u.Freeable || u.FreeCommand != "cpi stemcell-refs prune --vmid 110 --untracked" {
-		t.Errorf("110 row = %+v; want the --untracked command", u)
+	rows := rowsFor(handlers.BuildStemcellRefsReportFor(scan, "/var/vcap/jobs/pve_cpi/config/cpi.json"))
+	if u := rows[110]; !u.Freeable ||
+		u.FreeCommand != "cpi stemcell-refs prune --config /var/vcap/jobs/pve_cpi/config/cpi.json --vmid 110 --untracked" {
+		t.Errorf("110 row = %+v; want the --untracked command with the config path", u)
 	}
 	if u := rows[111]; u.Freeable || u.FreeCommand != "" || !slices.Equal(u.BlockingClones, []int64{200}) {
 		t.Errorf("111 row = %+v; want clone 200 named as the blocker", u)
 	}
-	if u := rows[103]; !u.Freeable || u.FreeCommand != "cpi stemcell-refs prune --vmid 103" {
-		t.Errorf("103 row = %+v; want the plain --vmid command", u)
+	if u := rows[103]; !u.Freeable ||
+		u.FreeCommand != "cpi stemcell-refs prune --config /var/vcap/jobs/pve_cpi/config/cpi.json --vmid 103" {
+		t.Errorf("103 row = %+v; want the plain --vmid command with the config path", u)
+	}
+
+	// A path the shell would split is quoted, and a report built without a
+	// path prints the placeholder the adopt-owners commands use.
+	rows = rowsFor(handlers.BuildStemcellRefsReportFor(scan, "/tmp/my cpi's.json"))
+	if u := rows[103]; u.FreeCommand != `cpi stemcell-refs prune --config '/tmp/my cpi'\''s.json' --vmid 103` {
+		t.Errorf("103 row = %+v; want the config path shell-quoted", u)
+	}
+	rows = rowsFor(handlers.BuildStemcellRefsReport(scan))
+	if u := rows[103]; u.FreeCommand != "cpi stemcell-refs prune --config <cpi.json> --vmid 103" {
+		t.Errorf("103 row = %+v; want the <cpi.json> placeholder", u)
+	}
+}
+
+// legacyMinimalDesc is the description a CPI that predates path-identity
+// stemcells wrote when stemcell provenance was off: every provenance string
+// field empty, and the retired stemcell_refs count naming the template.
+func legacyMinimalDesc(vmid int64) string {
+	return `{"name":"","version":"","sha8":"","created":"","stemcell_refs":"template:` +
+		strconv.FormatInt(vmid, 10) + `"}`
+}
+
+func TestStemcellRefsPruneUntracked_LegacyMinimalProvenanceQualifies(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	// The fields a real legacy template carries: a name with no sha suffix,
+	// minimal notes, and the sha8 only in its tag.
+	f.addTemplate(30430, "bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364", legacyMinimalDesc(30430),
+		"bosh-cpi;bosh-stemcell-sha-891b3b74")
+	f.guests[30430].cfg["virtio0"] = "local-lvm-data:base-30430-disk-0,size=5G"
+	f.sizes["local-lvm-data:base-30430-disk-0"] = 5 * gib
+
+	deps, plan := untrackedPlan(t, f, 30430)
+	if plan.Refused || len(plan.Actions) != 1 || plan.Actions[0].Kind != handlers.StemcellRefsActionDestroyUntracked ||
+		plan.Actions[0].SHA8 != "891b3b74" {
+		t.Fatalf("plan = %+v; want one destroy-untracked action for sha8 891b3b74", plan)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 || !slices.Equal(f.deleted, []int64{30430}) {
+		t.Fatalf("apply: err %v deleted %v %+v; want 30430 destroyed", err, f.deleted, res.Results)
+	}
+}
+
+func TestStemcellRefsPruneUntracked_IdentityNeedsNameAndProvenance(t *testing.T) {
+	t.Parallel()
+	const (
+		hexA = "a1b2c3d4"
+		hexB = "0dcd8626"
+	)
+	cases := []struct {
+		label, name, desc, tags, want string
+	}{
+		{"golden image", "ubuntu-golden-image", `{"kind":"golden","owner":"team-x"}`, "",
+			`name "ubuntu-golden-image" does not follow stemcell cache naming`},
+		{"null description", "bosh-stemcell-u-1-" + hexA, "null", untrackedTags(hexA, false),
+			"lacks the string field(s) name, version, sha8, created"},
+		{"empty object", "bosh-stemcell-u-1-" + hexA, "{}", untrackedTags(hexA, false),
+			"lacks the string field(s) name, version, sha8, created"},
+		{"golden kind under a cache name", "bosh-stemcell-u-1-" + hexA, `{"kind":"golden"}`, untrackedTags(hexA, false),
+			"is not stemcell provenance"},
+		{"description sha8 differs from the tag", "bosh-stemcell-u-1-" + hexA, provDesc(hexA), untrackedTags(hexB, false),
+			"description sha8 " + hexA + " does not match its bosh-stemcell-sha-" + hexB + " tag"},
+		{"name suffix differs from the sha8", "bosh-stemcell-u-1-" + hexB, provDesc(hexA), untrackedTags(hexA, false),
+			"name suffix " + hexB + " does not match sha8 " + hexA},
+		{"minimal notes name suffix differs from the tag", "bosh-stemcell-u-1-" + hexB, legacyMinimalDesc(140),
+			"bosh-cpi;bosh-stemcell-sha-" + hexA, "name suffix " + hexB + " does not match sha8 " + hexA},
+		{"two sha tags disagree", "bosh-stemcell-u-1-" + hexA, provDesc(hexA),
+			untrackedTags(hexA, false) + ";bosh-stemcell-sha-" + hexB, "conflicting bosh-stemcell-sha- tags"},
+		{"provenance without a sha8", "bosh-stemcell-u-1",
+			`{"name":"u","version":"1","sha8":"","created":"2026-08-03T00:00:00Z"}`, "bosh-cpi",
+			"provenance records no sha8"},
+		{"minimal notes without a sha tag", "bosh-stemcell-u-1", legacyMinimalDesc(140), "bosh-cpi",
+			"no bosh-stemcell-sha- tag"},
+		{"minimal notes without stemcell_refs", "bosh-stemcell-u-1",
+			`{"name":"","version":"","sha8":"","created":""}`, "bosh-cpi;bosh-stemcell-sha-" + hexA,
+			"provenance records no sha8"},
+		{"path identity without a name suffix", "bosh-stemcell-u-1", provDesc(hexA), untrackedTags(hexA, false),
+			"has no sha8 suffix"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+			f := newPruneFake()
+			f.addTemplate(140, tc.name, tc.desc, tc.tags)
+			_, plan := untrackedPlan(t, f, 140)
+			if !plan.Refused || !strings.Contains(plan.RefusalReason, tc.want) {
+				t.Fatalf("refused %v reason %q; want a refusal naming %q", plan.Refused, plan.RefusalReason, tc.want)
+			}
+			if len(f.deleted) != 0 || f.writeCount() != 0 {
+				t.Fatalf("a refused plan changed PVE: writes %v deleted %v", f.writes, f.deleted)
+			}
+		})
+	}
+
+	// A provenance write from before the sha suffix keeps an older name, and
+	// its sha8 tag agrees, so it qualifies.
+	f := newPruneFake()
+	f.addTemplate(141, "bosh-stemcell-u-1-2",
+		`{"name":"u","version":"1.2","sha8":"`+hexA+`","created":"2026-05-01T00:00:00Z"}`,
+		"bosh-cpi;bosh-stemcell-sha-"+hexA+";bosh-stemcell")
+	if _, plan := untrackedPlan(t, f, 141); plan.Refused {
+		t.Fatalf("older provenance refused: %s", plan.RefusalReason)
+	}
+}
+
+func TestStemcellRefsPruneUntracked_ResumesPendingDestroy(t *testing.T) {
+	t.Parallel()
+	const cfgPath = "/var/vcap/jobs/pve_cpi/config/cpi.json"
+	f := newPruneFake()
+	addUntracked(f, 110, untrackedSha)
+	f.deleteErr[110] = &sdkerrors.APIError{HTTPCode: 500, Message: "storage busy"}
+	req := handlers.StemcellRefsPruneRequest{VMID: 110, Untracked: true, ConfigPath: cfgPath}
+
+	// The first apply stamps bosh-destroy-pending, then the destroy fails.
+	deps, plan := scanAndPlan(t, f, req)
+	if plan.Refused || plan.Actions[0].ResumesPending {
+		t.Fatalf("plan = %+v; want a fresh destroy", plan)
+	}
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeFailed {
+		t.Fatalf("apply: err %v %+v; want a failed destroy", err, res.Results)
+	}
+	wantCmd := "cpi stemcell-refs prune --config " + cfgPath + " --vmid 110 --untracked --apply"
+	if e := res.Results[0].Error; !strings.Contains(e, "bosh-destroy-pending") || !strings.Contains(e, wantCmd) {
+		t.Fatalf("error = %q; want it to say the template is marked pending and to name %q", e, wantCmd)
+	}
+	if !strings.Contains(f.cfgString(110, "tags"), "bosh-destroy-pending") || len(f.deleted) != 0 {
+		t.Fatalf("tags %q deleted %v; want the stamp kept and the template in place", f.cfgString(110, "tags"),
+			f.deleted)
+	}
+
+	// The rerun the error names resumes the destroy.
+	delete(f.deleteErr, 110)
+	deps, plan = scanAndPlan(t, f, req)
+	if plan.Refused || len(plan.Actions) != 1 || !plan.Actions[0].ResumesPending ||
+		plan.Actions[0].Kind != handlers.StemcellRefsActionDestroyUntracked {
+		t.Fatalf("rerun plan = %+v; want a destroy-untracked that resumes the pending destroy", plan)
+	}
+	writes := f.writeCount()
+	res, err = handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeApplied {
+		t.Fatalf("rerun apply: err %v %+v; want applied", err, res.Results)
+	}
+	if !slices.Equal(f.deleted, []int64{110}) || f.writeCount() != writes {
+		t.Fatalf("deleted %v writes %v; want 110 destroyed with no second stamp", f.deleted, f.writes)
 	}
 }

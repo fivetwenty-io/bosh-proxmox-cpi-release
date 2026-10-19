@@ -30,16 +30,21 @@ type vmidLockRetryLoop struct {
 
 // vmidLockBody is the PVE traffic of one operation that runs under the VMID
 // lock. singleCalls counts the calls made once, without a retry loop.
+// bounded is the total deadline of the steps whose call count depends on the
+// cluster, such as one config read per guest; each such step runs under a
+// context with that deadline and fails closed when it expires.
 type vmidLockBody struct {
 	operation   string
 	singleCalls int
 	loops       []vmidLockRetryLoop
+	bounded     time.Duration
 }
 
 // budget is the longest the body can run: every call, single or retried,
-// takes its full allowance, and every retry loop sleeps its longest backoff.
+// takes its full allowance, every retry loop sleeps its longest backoff, and
+// every bounded step runs to its deadline.
 func (b vmidLockBody) budget() time.Duration {
-	total := time.Duration(b.singleCalls) * vmidLockCallAllowance
+	total := time.Duration(b.singleCalls)*vmidLockCallAllowance + b.bounded
 	for _, loop := range b.loops {
 		total += time.Duration(loop.attempts)*vmidLockCallAllowance + loop.sleep(loop.attempts)
 	}
@@ -66,6 +71,12 @@ func (b vmidLockBody) budget() time.Duration {
 // deleting tag, and create_vm's failure tag each read and write it once. The
 // stemcell template destroy runs after the lock is released, so it is not
 // counted.
+//
+// The stemcell-refs untracked destroy reads the config and the status, runs
+// the linked-clone rescan, and writes the destroy-pending stamp. The rescan
+// lists every guest and reads each config, so its call count grows with the
+// cluster; untrackedCloneRecheck runs it under untrackedCloneRescanTimeout,
+// which is counted as a bounded step.
 func vmidLockBodies() []vmidLockBody {
 	return []vmidLockBody{
 		{
@@ -81,6 +92,7 @@ func vmidLockBodies() []vmidLockBody {
 		{operation: "stemcell director reference", singleCalls: 2},
 		{operation: "delete_vm deleting tag", singleCalls: 2},
 		{operation: "create_vm failure tag", singleCalls: 2},
+		{operation: "stemcell-refs untracked destroy", singleCalls: 3, bounded: untrackedCloneRescanTimeout},
 	}
 }
 

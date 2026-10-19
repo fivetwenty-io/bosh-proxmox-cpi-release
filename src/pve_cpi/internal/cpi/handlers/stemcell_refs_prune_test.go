@@ -72,6 +72,13 @@ type pruneFake struct {
 	// and sizeErr the error it returns instead.
 	sizes   map[string]int64
 	sizeErr map[string]error
+	// checkNode makes a config read on a node other than the guest's fail
+	// the way PVE does, with the pmxcfs "does not exist" answer.
+	checkNode bool
+	// blockRead makes a config read of a guest wait for its context to end.
+	blockRead map[int64]bool
+	// listErr, when set, fails the guest listing.
+	listErr error
 }
 
 func newPruneFake() *pruneFake {
@@ -87,6 +94,7 @@ func newPruneFake() *pruneFake {
 		statusOverride: map[int64]string{},
 		sizes:          map[string]int64{},
 		sizeErr:        map[string]error{},
+		blockRead:      map[int64]bool{},
 	}
 }
 
@@ -123,7 +131,14 @@ func (f *pruneFake) setCfg(vmid int64, key, value string) {
 // readConfig serves a guest config read. It runs onRead first, so a test can
 // change the guest between the scan and the write, and it reports the
 // guest's generation as the config digest unless noDigest says otherwise.
-func (f *pruneFake) readConfig(vmid int64) (map[string]any, error) {
+func (f *pruneFake) readConfig(ctx context.Context, node string, vmid int64) (map[string]any, error) {
+	f.mu.Lock()
+	blocked := f.blockRead[vmid]
+	f.mu.Unlock()
+	if blocked {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.configErr[vmid]; err != nil {
@@ -136,6 +151,10 @@ func (f *pruneFake) readConfig(vmid int64) (map[string]any, error) {
 	}
 	if !ok {
 		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}
+	if f.checkNode && g.node != node {
+		return nil, &sdkerrors.APIError{HTTPCode: 500, Message: "Configuration file 'nodes/" + node +
+			"/qemu-server/" + strconv.FormatInt(vmid, 10) + ".conf' does not exist"}
 	}
 	out := map[string]any{}
 	for k, v := range g.cfg {
@@ -191,8 +210,8 @@ func (f *pruneFake) updateConfig(vmidStr string, p *sdknodes.UpdateQemuConfigPar
 }
 
 func (f *pruneFake) deps() handlers.Deps {
-	qemu := &stemcellMockQEMU{configFn: func(_ context.Context, _ string, vmid int) (map[string]any, error) {
-		return f.readConfig(int64(vmid))
+	qemu := &stemcellMockQEMU{configFn: func(ctx context.Context, node string, vmid int) (map[string]any, error) {
+		return f.readConfig(ctx, node, int64(vmid))
 	}}
 	nodes := &stemcellMockNodes{
 		updateConfigFn: func(_ context.Context, _, vmidStr string, p *sdknodes.UpdateQemuConfigParams) error {
@@ -217,6 +236,9 @@ func (f *pruneFake) deps() handlers.Deps {
 	cluster := &stemcellMockCluster{listResourcesFn: func(context.Context, *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if f.listErr != nil {
+			return nil, f.listErr
+		}
 		out := make(sdkcluster.ListResourcesResponse, 0, len(f.guests))
 		for vmid, g := range f.guests {
 			tmpl := 0
@@ -1294,7 +1316,7 @@ func TestStemcellRefsPrune_UntrackedIsNeverDestroyed(t *testing.T) {
 	f.addTemplate(155, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), untrackedTags(shaA, true))
 	f.addTemplate(156, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), untrackedTags(shaA, true))
 	// 110 is an untracked zero-ref main template.
-	f.addTemplate(110, "bosh-stemcell-u-1-uuuu1111", provDesc("uuuu1111"), untrackedTags("uuuu1111", false))
+	f.addTemplate(110, "bosh-stemcell-u-1-abcd1111", provDesc("abcd1111"), untrackedTags("abcd1111", false))
 	// 120 is an untracked main template that holds only oldRef, and 121 one
 	// whose last-ref destroy is already pending.
 	f.addTemplate(120, "bosh-stemcell-c-1-cccc3333", provDesc("cccc3333", oldRef), untrackedTags("cccc3333", false))
@@ -1361,7 +1383,7 @@ func TestStemcellRefsPrune_UntrackedIsNeverDestroyed(t *testing.T) {
 	// names that command for each one that holds no ref, and the reason for
 	// each one it refuses.
 	for _, vmid := range []int64{110, 155, 156} {
-		want := fmt.Sprintf("cpi stemcell-refs prune --vmid %d --untracked", vmid)
+		want := fmt.Sprintf("cpi stemcell-refs prune --config <cpi.json> --vmid %d --untracked", vmid)
 		if u, ok := unref[vmid]; !ok || !u.Untracked || !u.Freeable || u.FreeCommand != want {
 			t.Errorf("report row for %d = %+v (present %v); want untracked and freeable with %q", vmid, u, ok, want)
 		}
@@ -1582,5 +1604,45 @@ func TestStemcellRefsPrune_DestroyAbortsWhenPendingStampIsGone(t *testing.T) {
 	}
 	if len(f.deleted) != 0 {
 		t.Fatalf("deleted = %v; a re-registered template must not be destroyed", f.deleted)
+	}
+}
+
+func TestStemcellRefsPrune_VMIDAnchorAndReplicaTogether(t *testing.T) {
+	t.Parallel()
+	for _, order := range [][]int64{{130, 131}, {131, 130}} {
+		f := newPruneFake()
+		f.addTemplate(130, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
+		f.addTemplate(131, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+
+		deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMIDs: order})
+		if plan.Refused || plan.HasFailures() {
+			t.Fatalf("order %v: plan = %+v; want no refusal and no failing action", order, plan)
+		}
+		anchor, replica := actionFor(t, plan, 130), actionFor(t, plan, 131)
+		if anchor.Kind != handlers.StemcellRefsActionDestroy || len(anchor.SweepReplicas) != 1 ||
+			anchor.SweepReplicas[0].VMID != 131 || len(anchor.KeptReplicas) != 0 {
+			t.Fatalf("order %v: 130 action = %+v; want a destroy that sweeps 131", order, anchor)
+		}
+		if replica.Kind != handlers.StemcellRefsActionSkip || replica.Failure ||
+			!strings.Contains(replica.Reason, "freed with template 130") {
+			t.Fatalf("order %v: 131 action = %+v; want a non-failing skip freed with template 130", order, replica)
+		}
+		res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+		if err != nil || res.Failures != 0 {
+			t.Fatalf("order %v: apply: err %v %+v", order, err, res.Results)
+		}
+		if !slices.Equal(f.deleted, []int64{130, 131}) {
+			t.Fatalf("order %v: deleted = %v; want [130 131]", order, f.deleted)
+		}
+	}
+
+	// An anchor the plan keeps still blocks its replica.
+	f := newPruneFake()
+	f.addTemplate(132, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, oldRef), cacheTemplateTags(shaB)+";director--"+oldRef)
+	f.addTemplate(133, "bosh-stemcell-b-1-"+shaB, provDesc(shaB), replicaTags(shaB))
+	_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMIDs: []int64{132, 133}})
+	if r := actionFor(t, plan, 133); r.Kind != handlers.StemcellRefsActionBlocked || !r.Failure ||
+		!strings.Contains(r.Reason, "replica of live template 132") {
+		t.Fatalf("133 action = %+v; want blocked while its anchor 132 is kept", r)
 	}
 }

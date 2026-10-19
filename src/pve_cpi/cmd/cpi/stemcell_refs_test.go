@@ -16,6 +16,7 @@ import (
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -48,6 +49,8 @@ type refsCLIClient struct {
 	// sizes holds the size a storage content read reports for each volid;
 	// a volid it lacks fails the read.
 	sizes map[string]int64
+	// deleteErr is what a guest destroy returns; nil destroys the guest.
+	deleteErr error
 }
 
 // refsCLIPools is a pool store that answers the cluster lock's create, read
@@ -156,9 +159,33 @@ func (n refsCLINodes) GetStorageContent(
 	return &nodes.GetStorageContentResponse{Size: sdkclient.PVEInt(size)}, nil
 }
 
+func (n refsCLINodes) DeleteQemu(
+	_ context.Context, _, vmid string, _ *nodes.DeleteQemuParams,
+) (*nodes.DeleteQemuResponse, error) {
+	n.c.mu.Lock()
+	defer n.c.mu.Unlock()
+	if n.c.deleteErr != nil {
+		return nil, n.c.deleteErr
+	}
+	id, _ := strconv.Atoi(vmid)
+	for i := range n.c.guests {
+		if n.c.guests[i].vmid == id {
+			n.c.guests = append(n.c.guests[:i], n.c.guests[i+1:]...)
+			raw := nodes.DeleteQemuResponse(`""`)
+			return &raw, nil
+		}
+	}
+	return nil, errors.New("unexpected destroy")
+}
+
 type refsCLIQEMU struct {
 	qemu.Service
 	c *refsCLIClient
+}
+
+// Status reports every guest as stopped, as the listing does.
+func (q refsCLIQEMU) Status(context.Context, string, int) (map[string]any, error) {
+	return map[string]any{"status": "stopped"}, nil
 }
 
 func (q refsCLIQEMU) Config(_ context.Context, _ string, vmid int) (map[string]any, error) {
@@ -293,7 +320,7 @@ func TestStemcellRefsReportText(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d stderr %q", code, stderr)
 	}
-	for _, want := range []string{"TEMPLATES", "REFS", "UNREFERENCED", "old-uuid", "legacy"} {
+	for _, want := range []string{"TEMPLATES", "REFS", "PRUNE --vmid CANDIDATES", "old-uuid", "legacy"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("text report lacks %q:\n%s", want, stdout)
 		}
@@ -602,9 +629,9 @@ func TestStemcellRefsReportTextFlagsDescriptionNearLimit(t *testing.T) {
 // to refsCLIFixture.
 func refsCLIUntrackedFixture() *refsCLIClient {
 	c := refsCLIFixture()
-	c.guests = append(c.guests, refsCLIGuest{vmid: 110, name: "bosh-stemcell-u-1-uuuu1111", template: true,
-		tags: "bosh-stemcell;bosh-stemcell-sha-uuuu1111",
-		desc: `{"name":"u","version":"1","sha8":"uuuu1111","kind":"heavy","director_refs":[]}`,
+	c.guests = append(c.guests, refsCLIGuest{vmid: 110, name: "bosh-stemcell-u-1-abcd1111", template: true,
+		tags: "bosh-stemcell;bosh-stemcell-sha-abcd1111",
+		desc: `{"name":"u","version":"1","sha8":"abcd1111","created":"2026-08-03T00:00:00Z","kind":"heavy","director_refs":[]}`,
 		disks: map[string]string{
 			"scsi0":    "local-lvm:base-110-disk-0,size=4G",
 			"efidisk0": "local-lvm:base-110-disk-1,size=4M",
@@ -621,11 +648,11 @@ func TestStemcellRefsPruneUntrackedDryRunText(t *testing.T) {
 		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
 	for _, want := range []string{
-		"destroy-untracked vmid 110 (bosh-stemcell-u-1-uuuu1111 on pve)",
-		"frees efidisk0 local-lvm:base-110-disk-1 on local-lvm, size unknown: ",
-		"frees scsi0 local-lvm:base-110-disk-0 on local-lvm, 4.0 GiB (4294967296 bytes)",
-		"frees at least 4.0 GiB (4294967296 bytes) (1 volume size(s) unknown) in all",
-		"total freed: at least 4.0 GiB",
+		"destroy-untracked vmid 110 (bosh-stemcell-u-1-abcd1111 on pve)",
+		"frees efidisk0 local-lvm:base-110-disk-1 on local-lvm, provisioned size unknown: ",
+		"frees scsi0 local-lvm:base-110-disk-0 on local-lvm, provisioned size 4.0 GiB (4294967296 bytes)",
+		"provisioned size in all: at least 4.0 GiB (4294967296 bytes) (1 volume size(s) unknown)",
+		"total provisioned size: at least 4.0 GiB",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("dry run lacks %q:\n%s", want, stdout)
@@ -641,10 +668,48 @@ func TestStemcellRefsPruneUntrackedDryRunText(t *testing.T) {
 		t.Fatalf("repeated vmid: exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
 
+	// A VMID that names no guest prints without an empty name and node.
+	code, stdout, stderr = runStemcellRefsTest(t, refsCLIUntrackedFixture(), "prune", "--config", cfgPath,
+		"--vmid", "110", "--vmid", "999", "--untracked")
+	if code != 1 || !strings.Contains(stdout, "blocked vmid 999: no guest with VMID 999") ||
+		strings.Contains(stdout, "( on )") {
+		t.Fatalf("missing vmid: exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+
 	// Without --untracked, the refusal names the flag.
 	code, _, stderr = runStemcellRefsTest(t, refsCLIUntrackedFixture(), "prune", "--config", cfgPath, "--vmid", "110")
 	if code != 1 || !strings.Contains(stderr, "prune --vmid 110 --untracked") {
 		t.Fatalf("plain vmid: exit %d stderr %q", code, stderr)
+	}
+}
+
+func TestStemcellRefsPruneUntrackedResumesPendingDestroy(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	c := refsCLIUntrackedFixture()
+	c.pools = &refsCLIPools{claims: map[string]string{}}
+	c.deleteErr = &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied"}
+	code, stdout, stderr := runStemcellRefsTest(t, c, "prune", "--config", cfgPath, "--vmid", "110", "--untracked",
+		"--apply")
+	wantCmd := "cpi stemcell-refs prune --config " + cfgPath + " --vmid 110 --untracked --apply"
+	if code != 1 || !strings.Contains(stdout, "bosh-destroy-pending") || !strings.Contains(stdout, wantCmd) {
+		t.Fatalf("failed apply: exit %d stdout %q stderr %q; want the rerun %q", code, stdout, stderr, wantCmd)
+	}
+
+	// The dry run of that rerun says it resumes the pending destroy, and
+	// the rerun frees the template, and the second missing VMID is printed
+	// without an empty name and node.
+	code, stdout, stderr = runStemcellRefsTest(t, c, "prune", "--config", cfgPath, "--vmid", "110", "--untracked")
+	if code != 0 || !strings.Contains(stdout, "destroy-untracked vmid 110 (bosh-stemcell-u-1-abcd1111 on pve), "+
+		"resumes the pending destroy") {
+		t.Fatalf("resume dry run: exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	c.deleteErr = nil
+	code, stdout, stderr = runStemcellRefsTest(t, c, "prune", "--config", cfgPath, "--vmid", "110", "--vmid", "999",
+		"--untracked", "--apply")
+	if code != 1 || !strings.Contains(stdout, "destroy-untracked vmid 110 (bosh-stemcell-u-1-abcd1111 on pve), "+
+		"resumes the pending destroy: applied") || !strings.Contains(stdout, "blocked vmid 999: skipped") ||
+		strings.Contains(stdout, "( on )") {
+		t.Fatalf("resume apply: exit %d stdout %q stderr %q", code, stdout, stderr)
 	}
 }
 
@@ -672,9 +737,9 @@ func TestStemcellRefsPruneUntrackedDryRunJSON(t *testing.T) {
 func TestStemcellRefsReportTextNamesUntrackedCommand(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
 	c := refsCLIUntrackedFixture()
-	c.guests = append(c.guests, refsCLIGuest{vmid: 111, name: "bosh-stemcell-v-1-vvvv2222", template: true,
-		tags:  "bosh-stemcell;bosh-stemcell-sha-vvvv2222",
-		desc:  `{"name":"v","version":"1","sha8":"vvvv2222","kind":"heavy","director_refs":[]}`,
+	c.guests = append(c.guests, refsCLIGuest{vmid: 111, name: "bosh-stemcell-v-1-abcd2222", template: true,
+		tags:  "bosh-stemcell;bosh-stemcell-sha-abcd2222",
+		desc:  `{"name":"v","version":"1","sha8":"abcd2222","created":"2026-08-03T00:00:00Z","kind":"heavy","director_refs":[]}`,
 		disks: map[string]string{"scsi0": "local-lvm:base-111-disk-0"}},
 		refsCLIGuest{vmid: 201, name: "clone",
 			disks: map[string]string{"scsi0": "local-lvm:base-111-disk-0/vm-201-disk-0"}})
@@ -682,8 +747,9 @@ func TestStemcellRefsReportTextNamesUntrackedCommand(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d stderr %q", code, stderr)
 	}
-	for _, want := range []string{"FREE WITH", "cpi stemcell-refs prune --vmid 110 --untracked",
-		"cpi stemcell-refs prune --vmid 103", "blocked by linked clones 201"} {
+	for _, want := range []string{"PRUNE --vmid CANDIDATES (untracked ones need --untracked)", "FREE WITH",
+		"cpi stemcell-refs prune --config " + cfgPath + " --vmid 110 --untracked",
+		"cpi stemcell-refs prune --config " + cfgPath + " --vmid 103", "blocked by linked clones 201"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("report lacks %q:\n%s", want, stdout)
 		}

@@ -1,6 +1,9 @@
 package handlers
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // ResetFirewallMasterSwitchProbeOnce drains the per-cluster probe state
 // guarding probeFirewallMasterSwitch, for use by handlers_test package tests
@@ -25,4 +28,13 @@ const TagRetainEphemeral = tagRetainEphemeral
 func SelfSignedCAPEMForTest(t *testing.T) string {
 	t.Helper()
 	return selfSignedCAPEMForCacheKeyTest(t)
+}
+
+// SetUntrackedCloneRescanTimeoutForTest shortens the deadline of the
+// untracked destroy's linked-clone rescan and returns a func that restores
+// it. A test that calls it must not run in parallel. Test-only.
+func SetUntrackedCloneRescanTimeoutForTest(d time.Duration) func() {
+	old := untrackedCloneRescanTimeout
+	untrackedCloneRescanTimeout = d
+	return func() { untrackedCloneRescanTimeout = old }
 }
