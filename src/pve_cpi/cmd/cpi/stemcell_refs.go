@@ -19,8 +19,8 @@ import (
 )
 
 const stemcellRefsUsage = "usage: cpi stemcell-refs report --config PATH [--json]\n" +
-	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N | --reconcile-tags) " +
-	"[--apply] [--json]\n" +
+	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N... [--untracked] | " +
+	"--reconcile-tags) [--apply] [--json]\n" +
 	"       cpi stemcell-refs adopt-owners --config PATH --director-uuid UUID --director-name NAME " +
 	"--deployment NAME[,NAME]... [--vmid N]... [--apply] [--json]"
 
@@ -54,11 +54,13 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 	configPath := fs.String("config", "", "CPI JSON configuration (required)")
 	jsonOut := fs.Bool("json", false, "print JSON instead of text")
 	var director *string
-	var vmid *int64
-	var apply, allowOwned, reconcile *bool
+	var vmids vmidListFlag
+	var apply, allowOwned, reconcile, untracked *bool
 	if action == "prune" {
 		director = fs.String("director", "", "director ref to remove from every stemcell cache template")
-		vmid = fs.Int64("vmid", 0, "VMID of one unreferenced stemcell cache template to destroy")
+		fs.Var(&vmids, "vmid", "VMID of an unreferenced stemcell cache template to destroy; repeat for more than one")
+		untracked = fs.Bool("untracked", false,
+			"with --vmid, destroy untracked templates (provenance JSON, no generation marker) that hold no ref")
 		reconcile = fs.Bool("reconcile-tags", false,
 			"remove every director-- tag that no description ref backs, on every stemcell cache template")
 		apply = fs.Bool("apply", false, "make the changes; without it the command prints the plan and changes nothing")
@@ -75,7 +77,8 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		fmt.Fprintln(stderr, stemcellRefsUsage)
 		return 2
 	}
-	if problem := stemcellRefsUsageProblem(action, fs, *configPath, director, vmid, allowOwned, reconcile); problem != "" {
+	flags := stemcellRefsPruneFlags{director: director, allowOwned: allowOwned, reconcile: reconcile, untracked: untracked}
+	if problem := stemcellRefsUsageProblem(action, fs, *configPath, flags); problem != "" {
 		fmt.Fprintln(stderr, problem)
 		fmt.Fprintln(stderr, stemcellRefsUsage)
 		return 2
@@ -92,7 +95,8 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 	}
 
 	req := handlers.StemcellRefsPruneRequest{
-		DirectorRef: strings.TrimSpace(*director), VMID: *vmid, AllowOwnedVMs: *allowOwned, ReconcileTags: *reconcile,
+		DirectorRef: strings.TrimSpace(*director), VMIDs: vmids, AllowOwnedVMs: *allowOwned, ReconcileTags: *reconcile,
+		Untracked: *untracked,
 	}
 	plan, err := handlers.PlanStemcellRefsPrune(scan, req)
 	if err != nil {
@@ -100,6 +104,10 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 2
 	}
 	warnStemcellRefsNoMatch(stderr, plan)
+	if req.Untracked {
+		// The dry run and the apply both show what each destroy frees.
+		handlers.MeasureStemcellRefsPlan(ctx, deps, &plan)
+	}
 	if !*apply {
 		return writeStemcellRefsPlan(stdout, stderr, plan, *jsonOut)
 	}
@@ -164,10 +172,15 @@ func warnStemcellRefsNoMatch(stderr io.Writer, plan handlers.StemcellRefsPlan) {
 	}
 }
 
+// stemcellRefsPruneFlags holds the prune-only flags; each is nil for report.
+type stemcellRefsPruneFlags struct {
+	director                         *string
+	allowOwned, reconcile, untracked *bool
+}
+
 // stemcellRefsUsageProblem returns the usage error in the parsed flags, or "".
-func stemcellRefsUsageProblem(
-	action string, fs *flag.FlagSet, configPath string, director *string, vmid *int64, allowOwned, reconcile *bool,
-) string {
+// A --vmid that is not a positive integer already failed the parse.
+func stemcellRefsUsageProblem(action string, fs *flag.FlagSet, configPath string, flags stemcellRefsPruneFlags) string {
 	if fs.NArg() > 0 {
 		return fmt.Sprintf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
@@ -187,21 +200,23 @@ func stemcellRefsUsageProblem(
 		}
 	})
 	switch {
-	case *reconcile && (directorSet || vmidSet):
+	case *flags.untracked && (directorSet || *flags.reconcile):
+		return "--untracked applies only to --vmid, not to --director or --reconcile-tags"
+	case *flags.untracked && !vmidSet:
+		return "--untracked needs --vmid"
+	case *flags.reconcile && (directorSet || vmidSet):
 		return "--reconcile-tags is mutually exclusive with --director and --vmid"
-	case *reconcile && *allowOwned:
+	case *flags.reconcile && *flags.allowOwned:
 		return "--allow-owned-vms applies only to --director"
-	case *reconcile:
+	case *flags.reconcile:
 		return ""
 	case directorSet && vmidSet:
 		return "--director and --vmid are mutually exclusive"
 	case !directorSet && !vmidSet:
 		return "prune needs --director, --vmid, or --reconcile-tags"
-	case directorSet && strings.TrimSpace(*director) == "":
+	case directorSet && strings.TrimSpace(*flags.director) == "":
 		return "--director must name a non-empty ref"
-	case vmidSet && *vmid <= 0:
-		return "--vmid must be a positive integer"
-	case vmidSet && *allowOwned:
+	case vmidSet && *flags.allowOwned:
 		return "--allow-owned-vms applies only to --director"
 	}
 	return ""
@@ -272,7 +287,7 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 	}
 	writeStemcellRefsUncovered(stdout, rep)
 	fmt.Fprintln(tw, "UNREFERENCED (prune --vmid)")
-	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tNOTES")
+	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tFREE WITH\tNOTES")
 	for _, u := range rep.Unreferenced {
 		var notes []string
 		if u.Replica {
@@ -290,7 +305,12 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 		if u.Reason != "" {
 			notes = append(notes, u.Reason)
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", u.Node, u.VMID, u.Name, yesNo(u.Freeable), dash(strings.Join(notes, " ")))
+		freeWith := u.FreeCommand
+		if freeWith == "" && len(u.BlockingClones) > 0 {
+			freeWith = "blocked by linked clones " + dashIDs(u.BlockingClones)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\n", u.Node, u.VMID, u.Name, yesNo(u.Freeable), dash(freeWith),
+			dash(strings.Join(notes, " ")))
 	}
 	if err := tw.Flush(); err != nil {
 		fmt.Fprintf(stderr, "stemcell-refs: output could not be written: %s\n", err)
@@ -347,6 +367,9 @@ func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellR
 		fmt.Fprintf(stdout, "  owned VMs: unknown, because no owner tag exists for %s\n", plan.DirectorRef)
 	}
 	writeStemcellRefsActions(stdout, plan.Actions)
+	if plan.Mode == "untracked" {
+		fmt.Fprintf(stdout, "  total freed: %s\n", stemcellRefsTotal(plan.TotalBytes, plan.SizesUnknown))
+	}
 	for _, e := range plan.ScanErrors {
 		fmt.Fprintln(stderr, "scan error: "+e)
 	}
@@ -395,7 +418,43 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		for _, k := range a.KeptReplicas {
 			fmt.Fprintln(w, "    "+keptReplicaText(k))
 		}
+		if a.Frees != nil {
+			for _, v := range a.Frees.Volumes {
+				size := "size unknown"
+				switch {
+				case v.SizeBytes != nil:
+					size = humanBytes(*v.SizeBytes)
+				case v.SizeError != "":
+					size = "size unknown: " + v.SizeError
+				}
+				fmt.Fprintf(w, "    frees %s %s on %s, %s\n", v.Slot, v.Volume, v.Storage, size)
+			}
+			fmt.Fprintf(w, "    frees %s in all\n", stemcellRefsTotal(a.Frees.TotalBytes, a.Frees.SizesUnknown))
+		}
 	}
+}
+
+// stemcellRefsTotal renders a freed total, noting the volumes whose size
+// could not be read.
+func stemcellRefsTotal(total int64, unknown int) string {
+	if unknown > 0 {
+		return fmt.Sprintf("at least %s (%d volume size(s) unknown)", humanBytes(total), unknown)
+	}
+	return humanBytes(total)
+}
+
+// humanBytes renders n bytes in binary units with the exact count.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit && exp < 4; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB (%d bytes)", float64(n)/float64(div), "KMGTP"[exp], n)
 }
 
 // keptReplicaText describes a replica a prune leaves in place.

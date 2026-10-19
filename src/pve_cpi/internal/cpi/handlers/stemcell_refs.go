@@ -584,14 +584,36 @@ func persistRemainingDirectorRefs(
 // outside the lock has no crash-safety net, so the caller must not proceed
 // to destroy.
 func stampDestroyPendingTagLocked(ctx context.Context, deps Deps, node string, vmid int64, currentTags []string) error {
+	return stampDestroyPendingTagGuarded(ctx, deps, node, vmid, currentTags, "")
+}
+
+// stampDestroyPendingTagGuarded is stampDestroyPendingTagLocked with the
+// write guarded by a config digest. A non-empty digest makes PVE refuse the
+// write when the config changed since the read that produced it, and that
+// refusal comes back as an error pve.IsConfigDigestStale recognizes. An empty
+// digest sends an unguarded write.
+func stampDestroyPendingTagGuarded(
+	ctx context.Context,
+	deps Deps,
+	node string,
+	vmid int64,
+	currentTags []string,
+	digest string,
+) error {
 	newTags, tagAdded := stringSliceEnsure(currentTags, stemcellDestroyPendingTag)
 	if !tagAdded {
 		return nil
 	}
 	joined := strings.Join(newTags, pveTagJoinSep)
 	vmidStr := strconv.FormatInt(vmid, 10)
-	if tagErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr,
-		&sdknodes.UpdateQemuConfigParams{Tags: &joined}); tagErr != nil {
+	params := &sdknodes.UpdateQemuConfigParams{Tags: &joined}
+	if digest != "" {
+		params.Digest = &digest
+	}
+	if tagErr := deps.PVE.Nodes().UpdateQemuConfig(ctx, node, vmidStr, params); tagErr != nil {
+		if pve.IsConfigDigestStale(tagErr) {
+			return tagErr
+		}
 		return cpierrors.Wrap(pve.WrapError(tagErr),
 			fmt.Sprintf("deregisterStemcellDirectorRef: stamp pending-destroy tag vmid %d node %q", vmid, node))
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
+	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi/handlers"
@@ -61,17 +63,30 @@ type pruneFake struct {
 	staleWrites map[int64]int
 	// noDigest leaves the digest out of a guest's config reads.
 	noDigest map[int64]bool
+	// running marks guests the listing and a status read report as running.
+	running map[int64]bool
+	// statusOverride, when set for a guest, is the status a status read
+	// reports for it, whatever the listing says.
+	statusOverride map[int64]string
+	// sizes holds the size a storage content read reports for each volid,
+	// and sizeErr the error it returns instead.
+	sizes   map[string]int64
+	sizeErr map[string]error
 }
 
 func newPruneFake() *pruneFake {
 	return &pruneFake{
-		guests:       map[int64]*pruneFakeGuest{},
-		configErr:    map[int64]error{},
-		deleteErr:    map[int64]error{},
-		tagsAtDelete: map[int64]string{},
-		pools:        &noopPoolService{},
-		staleWrites:  map[int64]int{},
-		noDigest:     map[int64]bool{},
+		guests:         map[int64]*pruneFakeGuest{},
+		configErr:      map[int64]error{},
+		deleteErr:      map[int64]error{},
+		tagsAtDelete:   map[int64]string{},
+		pools:          &noopPoolService{},
+		staleWrites:    map[int64]int{},
+		noDigest:       map[int64]bool{},
+		running:        map[int64]bool{},
+		statusOverride: map[int64]string{},
+		sizes:          map[string]int64{},
+		sizeErr:        map[string]error{},
 	}
 }
 
@@ -209,16 +224,68 @@ func (f *pruneFake) deps() handlers.Deps {
 				tmpl = 1
 			}
 			tags, _ := g.cfg["tags"].(string)
+			status := "stopped"
+			if f.running[vmid] {
+				status = "running"
+			}
 			raw, _ := json.Marshal(map[string]any{
 				"type": "qemu", "vmid": vmid, "node": g.node, "name": g.name, "tags": tags, "template": tmpl,
+				"status": status,
 			})
 			out = append(out, raw)
 		}
 		return &out, nil
 	}}
 	deps := buildDeleteStemcellDeps(deleteStemcellDepsOpts{qemuSvc: qemu, nodesSvc: nodes, clusterSvc: cluster})
-	deps.PVE.(*stemcellMockClient).poolsSvc = f.pools
+	mc := deps.PVE.(*stemcellMockClient)
+	mc.poolsSvc = f.pools
+	mc.qemuSvc = &pruneFakeQEMU{stemcellMockQEMU: qemu, f: f}
+	mc.nodesSvc = &pruneFakeNodes{stemcellMockNodes: nodes, f: f}
 	return deps
+}
+
+// pruneFakeQEMU adds the status read to the stemcell QEMU mock.
+type pruneFakeQEMU struct {
+	*stemcellMockQEMU
+	f *pruneFake
+}
+
+func (q *pruneFakeQEMU) Status(_ context.Context, _ string, vmid int) (map[string]any, error) {
+	q.f.mu.Lock()
+	defer q.f.mu.Unlock()
+	id := int64(vmid)
+	if _, ok := q.f.guests[id]; !ok {
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "not found"}
+	}
+	if s, ok := q.f.statusOverride[id]; ok {
+		return map[string]any{"status": s}, nil
+	}
+	if q.f.running[id] {
+		return map[string]any{"status": "running"}, nil
+	}
+	return map[string]any{"status": "stopped"}, nil
+}
+
+// pruneFakeNodes adds the storage content read to the stemcell nodes mock.
+type pruneFakeNodes struct {
+	*stemcellMockNodes
+	f *pruneFake
+}
+
+func (n *pruneFakeNodes) GetStorageContent(
+	_ context.Context, _, storage, volume string,
+) (*sdknodes.GetStorageContentResponse, error) {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	volid := storage + ":" + volume
+	if err := n.f.sizeErr[volid]; err != nil {
+		return nil, err
+	}
+	size, ok := n.f.sizes[volid]
+	if !ok {
+		return nil, &sdkerrors.APIError{HTTPCode: 404, Message: "volume not found"}
+	}
+	return &sdknodes.GetStorageContentResponse{Size: sdkclient.PVEInt(size)}, nil
 }
 
 func (f *pruneFake) writeCount() int {
@@ -1290,9 +1357,18 @@ func TestStemcellRefsPrune_UntrackedIsNeverDestroyed(t *testing.T) {
 	for _, u := range handlers.BuildStemcellRefsReport(scan).Unreferenced {
 		unref[u.VMID] = u
 	}
+	// No prune but --untracked frees an untracked template, so the report
+	// names that command for each one that holds no ref, and the reason for
+	// each one it refuses.
 	for _, vmid := range []int64{110, 155, 156} {
-		if u, ok := unref[vmid]; !ok || !u.Untracked || u.Freeable || !strings.Contains(u.Reason, "untracked") {
-			t.Errorf("report row for %d = %+v (present %v); want untracked, not freeable, with the reason", vmid, u, ok)
+		want := fmt.Sprintf("cpi stemcell-refs prune --vmid %d --untracked", vmid)
+		if u, ok := unref[vmid]; !ok || !u.Untracked || !u.Freeable || u.FreeCommand != want {
+			t.Errorf("report row for %d = %+v (present %v); want untracked and freeable with %q", vmid, u, ok, want)
+		}
+	}
+	for _, vmid := range []int64{120, 121} {
+		if u, ok := unref[vmid]; !ok || u.Freeable || u.FreeCommand != "" || !strings.Contains(u.Reason, "holds director_refs") {
+			t.Errorf("report row for %d = %+v (present %v); want refused for its ref", vmid, u, ok)
 		}
 	}
 }
