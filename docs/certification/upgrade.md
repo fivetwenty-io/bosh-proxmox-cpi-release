@@ -377,21 +377,21 @@ Expect 45 to 75 minutes: two `create-env` runs dominate, at roughly 8 to 15 minu
 
 Every Director we build registers its UUID in the `director_refs` of each light stemcell template it uses, and no CPI call removes that ref when the Director goes away. A run that builds two Directors, the certification Director and the bootstrap Director that BATS uses, would add two refs to the lab's templates each time, so the harness removes them again.
 
-As soon as a Director is up, `scripts/certify` reads its UUID with `bosh env` and appends it to `director-uuids` in the slot directory. The file holds one UUID per line, never repeats one, and ignores any line that isn't a UUID. `upgrade` records the certification Director after the first `create-env` and again after the upgrade, and `./scripts/certify record-director` records whatever Director the slot is running, which is how the workflow records the bootstrap Director.
+As soon as a Director is up, `scripts/certify` reads its UUID with `bosh env` and appends it to `director-uuids` in the slot directory. The file holds one UUID per line, never repeats one, and ignores any line that isn't a UUID. `upgrade` records the certification Director as soon as the first `create-env` finishes and again after the upgrade, and `./scripts/certify record-director` records whatever Director the slot is running, which is how the workflow records the bootstrap Director.
 
-`./scripts/certify cleanup-refs` then works through the recorded UUIDs, one at a time.
+`./scripts/certify cleanup-refs` then works through the recorded UUIDs. A failed `bosh env` probe never proves a Director is gone, so a UUID is pruned only in one of two cases. Either the slot holds no Director state, meaning no `state.json` or no current VM CID in it, or a probe succeeds and the live Director reports a different UUID. In every other case the record stays and the log says why, which includes a failed probe while the state shows a VM. The command reads those state keys itself and never prints the file.
 
-- If that Director is still reachable, it runs `bosh clean-up --all` against it and keeps the UUID in the record. We never prune a running Director's refs, because its templates are still in use.
+- The Directors that are gone come first. It runs `cpi stemcell-refs prune --director <uuid> --apply` and drops the UUID from the record once the prune succeeds. The prune keeps its owned-VM guard and we never pass `--allow-owned-vms`, so a Director whose VMs still exist is refused and its UUID stays for the next run.
 
-- If the Director is gone, it runs `cpi stemcell-refs prune --director <uuid> --apply` and drops the UUID from the record once the prune succeeds. The prune keeps its owned-VM guard and we never pass `--allow-owned-vms`, so a Director whose VMs still exist is refused and its UUID stays for the next run.
+- The live Director comes last. It runs `bosh clean-up --all` against it and keeps the UUID in the record. We never prune a running Director's refs, because its templates are still in use.
 
-- A failure is logged and the loop carries on with the next UUID. The command exits 1 when anything failed, and running it again is safe.
+- A failure is logged and the loop carries on with the next UUID. The command exits 1 when anything failed, and running it again is safe. The workflow turns that exit status into a warning annotation, so a hygiene failure never fails the certification job.
 
 With `--dry-run` it prints what it would do for each recorded UUID and runs nothing against the lab.
 
-The cpi binary is `CPI_BIN` when that is set, and otherwise `bin/cpi` in the checkout, which `make bin/cpi` builds when it is missing. The config comes from the same `ci/integration.yml` that `scripts/lifecycle` uses. The harness renders it with the same code, writes it to a private temporary directory, and removes it when the command ends. The prune acts on the one cluster that config names, so on a spanning run we prune the second cluster's refs by hand, as [Clearing a stale director ref](../operations.md#clearing-a-stale-director-ref) describes.
+The cpi binary is `CPI_BIN` when that is set, and otherwise `bin/cpi` in the checkout, which `make bin/cpi` builds when it is missing. The config comes from the same `ci/integration.yml` that `scripts/lifecycle` uses. The harness renders it with the same code, writes it to a private temporary directory, and removes it on every path, including a failed binary or an exception. The prune acts on the one cluster that config names, so on a spanning run we prune the second cluster's refs by hand, as [Clearing a stale director ref](../operations.md#clearing-a-stale-director-ref) describes.
 
-`upgrade --force` runs `cleanup-refs` before it tears down a standing Director, while that Director can still clean up, and again once the teardown has removed it. A run that died before its own cleanup is therefore cleaned up by the next one.
+Each `upgrade` runs `cleanup-refs` at the start, whether or not a Director is standing, so a run that died after its teardown is cleaned up by the next one. With `--force` and a standing Director it runs before the teardown, while that Director can still clean up, and again once the teardown has removed it.
 
 ## Results and reports
 

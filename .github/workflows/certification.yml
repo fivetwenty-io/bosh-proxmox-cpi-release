@@ -402,7 +402,15 @@ jobs:
 
       - name: Clean up stemcell refs (scripts/certify cleanup-refs)
         if: always()
-        timeout-minutes: 45
+        # Hygiene must never turn a certification result red, so a failure
+        # here becomes a warning annotation and the step exits 0.
+        continue-on-error: true
+        # The step bound covers the worst case of scripts/certify's own
+        # limits (REFS_WORST_CASE_S). With up to four recorded Directors that
+        # is 300 s for one liveness probe, 900 s for `make bin/cpi`, 4 x 900 s
+        # for prunes, and 2 x 1800 s for `bosh clean-up --all` with its one
+        # retry. That sums to 8400 s, which is 140 minutes, so we allow 150.
+        timeout-minutes: 150
         # Runs after BATS and before the secrets removal below, because it
         # still needs the lab credentials in vars.yml and ci/integration.yml.
         # The bootstrap Director is still standing, so it gets `bosh clean-up
@@ -410,10 +418,18 @@ jobs:
         # its UUID stays in the slot's record. The next run's `certify upgrade
         # --force` tears it down and prunes its UUID. The certify Director is
         # already gone, so its UUID is pruned here. A UUID whose prune failed
-        # also stays recorded for the next run.
+        # also stays recorded for the next run. The Directors that are gone
+        # are pruned first and the live clean-up runs last.
         run: |
-          set -euo pipefail
-          ./scripts/certify cleanup-refs --env cpitest --no-color
+          set -uo pipefail
+          log="${RUNNER_TEMP:-/tmp}/cleanup-refs.log"
+          rc=0
+          ./scripts/certify cleanup-refs --env cpitest --no-color 2>&1 | tee "${log}" || rc=$?
+          if [ "${rc}" -ne 0 ]; then
+            failed="$(sed -n 's/^cleanup-refs failures: //p' "${log}" | tail -1)"
+            echo "::warning title=Stemcell ref cleanup::cleanup-refs exited ${rc}; failed: ${failed:-unknown}. The affected UUIDs stay recorded and the next run retries them."
+          fi
+          exit 0
 
       - name: Commit run reports
         if: always()

@@ -57,7 +57,7 @@ The job creates two Directors, the certification Director in `scripts/certify up
 
 - The bootstrap step runs `./scripts/certify record-director` once the Director answers, so a later failure in that step doesn't lose the UUID.
 
-- The `Clean up stemcell refs` step runs under `if: always()` after BATS and before the secrets removal, because it still needs the lab credentials. It runs `./scripts/certify cleanup-refs`. The certify Director is already gone, so that command prunes its UUID. The bootstrap Director is still standing, so the command runs `bosh clean-up --all` against it, which deletes the BATS stemcell, and keeps its UUID in the record.
+- The `Clean up stemcell refs` step runs under `if: always()` after BATS and before the secrets removal, because it still needs the lab credentials. It runs `./scripts/certify cleanup-refs` and never fails the job. A failure becomes a `::warning::` annotation that names the failed UUIDs, the step exits 0, and the secrets removal still runs last. The step timeout is 150 minutes, which covers the worst case of the command's own limits for up to four recorded Directors. The certify Director is already gone, so that command prunes its UUID. The bootstrap Director is still standing, so the command runs `bosh clean-up --all` against it, which deletes the BATS stemcell, and keeps its UUID in the record.
 
 The run still ends with the bootstrap Director standing. The next run's `certify upgrade --force` tears it down and then prunes its UUID, and it also prunes the UUIDs of a runner that died before these steps. [Stemcell refs left by the Directors](upgrade.md#stemcell-refs-left-by-the-directors) describes the command.
 

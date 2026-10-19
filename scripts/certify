@@ -54,8 +54,12 @@ Commands:
                  against a CPI config rendered from ci/integration.yml. A UUID
                  whose prune succeeds leaves the record. Best-effort: a failure
                  is logged, the loop continues, and the exit status is 1 if
-                 anything failed. With --dry-run it prints the plan and runs
-                 nothing against the lab. `upgrade --force` runs it first.
+                 anything failed. A failed `bosh env` probe never proves a
+                 Director is gone, so a UUID is pruned only when the slot holds
+                 no Director state or the live Director reports a different
+                 UUID. With --dry-run it prints the plan and runs nothing
+                 against the lab. `upgrade` runs it at the start of a run,
+                 and `upgrade --force` also runs it after the teardown.
     help         Show this message.
 
 DESTRUCTIVE: the run takes over a Director slot, the directory BOSH_STATE_DIR
@@ -214,6 +218,19 @@ DEFAULT_TIMEOUT_S = 7200
 CREATE_ENV_TIMEOUT_S = 3600
 DEPLOY_TIMEOUT_S = 2400
 SHORT_TIMEOUT_S = 300
+# cleanup-refs bounds. The step timeout in certification.yml must cover
+# REFS_WORST_CASE_S: one liveness probe, one `make bin/cpi`, a prune for each
+# of REFS_MAX_DIRECTORS recorded Directors, and a `bosh clean-up --all` that
+# runs twice because it retries once. With the values below that is
+# 300 + 900 + 4*900 + 2*1800 = 8400 s, which is 140 minutes.
+REFS_CLEANUP_TIMEOUT_S = 1800
+REFS_PRUNE_TIMEOUT_S = 900
+REFS_BUILD_TIMEOUT_S = 900
+REFS_MAX_DIRECTORS = 4
+REFS_WORST_CASE_S = (
+    SHORT_TIMEOUT_S + REFS_BUILD_TIMEOUT_S + REFS_MAX_DIRECTORS * REFS_PRUNE_TIMEOUT_S
+    + 2 * REFS_CLEANUP_TIMEOUT_S
+)
 
 BOSH_IO_RELEASE = "https://bosh.io/d/github.com/cloudfoundry/bosh?v={version}"
 
@@ -999,6 +1016,25 @@ class Certify:
             "disk_cids": sorted(str(d.get("cid") or "") for d in disks if d.get("cid")),
         }
 
+    def _director_standing(self) -> str:
+        """What the slot's state says about a Director, read as keys only.
+
+        Returns "" when the slot holds no Director state, meaning there is no
+        state file or it names no current VM CID. Returns the VM CID when it
+        names one. Returns "?" when the file exists but cannot be read or
+        parsed, which proves nothing, so callers treat it as standing. The
+        file's contents are never printed or logged.
+        """
+        if not STATE.exists():
+            return ""
+        try:
+            state = json.loads(STATE.read_text())
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            return "?"
+        if not isinstance(state, dict):
+            return "?"
+        return str(state.get("current_vm_cid") or "")
+
     def _deployment_identity(self) -> dict:
         """VM and persistent-disk CIDs the Director holds for the deployment."""
         dep = self.ccfg["deployment_name"]
@@ -1560,7 +1596,8 @@ class Certify:
     def deploy_old(self) -> bool:
         self.rep.section("deploy-old")
 
-        if self.args.force and not self.dry_run and self._director_identity()["vm_cid"]:
+        standing = not self.dry_run and bool(self._director_identity()["vm_cid"])
+        if standing and self.args.force:
             if not self._guard_step("tear down the standing Director",
                                     "director:teardown-existing"):
                 return False
@@ -1574,6 +1611,10 @@ class Certify:
             )
             if not ok:
                 return False
+            self.cleanup_refs()
+        elif not standing and not self.dry_run:
+            # A run that died after its Director was torn down leaves recorded
+            # UUIDs and an empty slot, so the catch-up cannot depend on a VM.
             self.cleanup_refs()
 
         self._backup_state("pre-upgrade-test")
@@ -1597,13 +1638,13 @@ class Certify:
             return False
         self.director_up = True
         self.director_side = "old"
+        self._record_director_uuid()
 
         ok, _ = self.runner.step(
             "director:alias", [BOSH_SCRIPT, "alias-env"], timeout=SHORT_TIMEOUT_S,
         )
         if not ok:
             return False
-        self._record_director_uuid()
 
         if self.ccfg["cpi_id"]:
             ok, _ = self.runner.step(
@@ -1864,8 +1905,15 @@ class Certify:
                 "refs will not be cleaned up automatically"
             ), file=sys.stderr)
             return False
-        if _directorrefs.add(self.slot.dir, uuid):
-            print(f"    recorded Director {uuid} in {_directorrefs.record_path(self.slot.dir)}")
+        try:
+            if _directorrefs.add(self.slot.dir, uuid):
+                print(f"    recorded Director {uuid} in {_directorrefs.record_path(self.slot.dir)}")
+        except OSError as exc:
+            print(self.rep.color.yellow(
+                f"    warning: could not record Director {uuid} ({exc}), so its stemcell "
+                "refs will not be cleaned up automatically"
+            ), file=sys.stderr)
+            return False
         return True
 
     def _cpi_binary(self) -> str:
@@ -1876,7 +1924,7 @@ class Certify:
         """
         path = os.environ.get("CPI_BIN") or str(REPO_ROOT / "bin" / "cpi")
         if not os.access(path, os.X_OK):
-            built = self._cleanup_step("refs:build-cpi", ["make", "bin/cpi"], 900)
+            built = self._cleanup_step("refs:build-cpi", ["make", "bin/cpi"], REFS_BUILD_TIMEOUT_S)
             if not built or not os.access(path, os.X_OK):
                 raise RuntimeError(f"no executable cpi binary at {path}")
         return path
@@ -1884,18 +1932,23 @@ class Certify:
     def cleanup_refs(self) -> bool:
         """Clean up the stemcell refs of every Director the slot has recorded.
 
-        A recorded Director that is still reachable gets `bosh clean-up --all`
-        and keeps its record, because pruning a running Director's refs would
-        strip templates it still uses. Once the Director is gone, the CPI's
-        `stemcell-refs prune --director <uuid> --apply` removes its ref, and a
-        successful prune drops the UUID from the record. The prune keeps its
-        owned-VM guard, so a Director whose VMs are still there is refused, and
-        the UUID stays for the next run. One failure never stops the loop.
+        A failed `bosh env` probe never proves a Director is gone. A recorded
+        UUID is pruned only when the slot holds no Director state (no state
+        file, or no current VM CID in it), or when a probe succeeds and the
+        live Director reports a different UUID. While the state shows a VM and
+        the probe fails, the record stays and the log says why. A prune goes
+        through the CPI's `stemcell-refs prune --director <uuid> --apply`, and
+        a successful one drops the UUID. The prune keeps its owned-VM guard, so
+        a Director whose VMs remain is refused and the UUID stays. The Directors
+        that are gone are handled first, and `bosh clean-up --all` on the live
+        Director runs last. One failure never stops the loop.
         """
+        self.refs_failures: list[str] = []
         self.rep.section("cleanup-refs")
         refusal = self._slot_refusal("clean up stemcell refs")
         if refusal:
             self.rep.record("refs:slot-guard", FAIL, 0.0, refusal)
+            self.refs_failures.append("slot-guard")
             return False
         uuids = _directorrefs.load(self.slot.dir)
         if not uuids:
@@ -1909,45 +1962,79 @@ class Certify:
             self.rep.skip("refs:dry-run", f"{len(uuids)} recorded Director(s); nothing was run")
             return True
 
-        live = self._probe_director_uuid()
+        standing = self._director_standing()
+        live = self._probe_director_uuid().lower() if standing else ""
+        gone: list[str] = []
+        live_uuids: list[str] = []
+        for uuid in uuids:
+            short = uuid[:8]
+            if not standing:
+                gone.append(uuid)
+            elif live and live != uuid:
+                gone.append(uuid)
+            elif live:
+                live_uuids.append(uuid)
+            else:
+                self.rep.skip(
+                    f"refs:prune:{short}",
+                    "the slot's state shows a Director VM and bosh env did not answer, so the "
+                    "Director is not proven gone; the UUID stays recorded for the next run",
+                )
+
         ok = True
         config_dir: "Path | None" = None
         cpi: "tuple[str, str] | None" = None
+        cpi_error = ""
         try:
-            for uuid in uuids:
+            for uuid in gone:
                 short = uuid[:8]
-                if live and live.lower() == uuid:
-                    if not self._cleanup_step(
-                        f"refs:clean-up:{short}", ["bosh", "-n", "clean-up", "--all"],
-                        DEPLOY_TIMEOUT_S, env=self._director_env(), retries=1,
-                    ):
-                        ok = False
-                    self.rep.skip(f"refs:prune:{short}",
-                                  "the Director is still running; tear it down, then run cleanup-refs again")
-                    continue
-                try:
-                    if cpi is None:
-                        config_dir = Path(tempfile.mkdtemp(prefix="certify-cpi-"))
-                        config = config_dir / "cpi.json"
-                        fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                            json.dump(_integration.build_cpi_config(self.cfg), fh)
-                        cpi = (self._cpi_binary(), str(config))
-                except (RuntimeError, ValueError, OSError, SystemExit) as exc:
-                    self.rep.skip(f"refs:prune:{short}", f"no CPI config or binary: {exc}")
+                if cpi is None and not cpi_error:
+                    try:
+                        if config_dir is None:
+                            config_dir = Path(tempfile.mkdtemp(prefix="certify-cpi-"))
+                            config = config_dir / "cpi.json"
+                            fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                                json.dump(_integration.build_cpi_config(self.cfg), fh)
+                        cpi = (self._cpi_binary(), str(config_dir / "cpi.json"))
+                    except (RuntimeError, ValueError, OSError, SystemExit) as exc:
+                        cpi_error = f"no CPI config or binary: {exc}"
+                if cpi is None:
+                    self.rep.skip(f"refs:prune:{short}", cpi_error)
+                    self.refs_failures.append(f"prune:{short}")
                     ok = False
                     continue
                 pruned = self._cleanup_step(
                     f"refs:prune:{short}",
                     [cpi[0], "stemcell-refs", "prune", "--config", cpi[1],
                      "--director", uuid, "--apply"],
-                    900,
+                    REFS_PRUNE_TIMEOUT_S,
                 )
                 if pruned:
-                    _directorrefs.remove(self.slot.dir, uuid)
+                    try:
+                        _directorrefs.remove(self.slot.dir, uuid)
+                    except OSError as exc:
+                        print(self.rep.color.yellow(
+                            f"    warning: pruned {uuid} but could not drop it from the record ({exc}); "
+                            "the next run prunes it again"
+                        ), file=sys.stderr)
                 else:
+                    self.rep.skip(f"refs:kept:{short}", "the prune failed, so the UUID stays recorded for the next run")
+                    self.refs_failures.append(f"prune:{short}")
                     ok = False
+            for uuid in live_uuids:
+                short = uuid[:8]
+                if not self._cleanup_step(
+                    f"refs:clean-up:{short}", ["bosh", "-n", "clean-up", "--all"],
+                    REFS_CLEANUP_TIMEOUT_S, env=self._director_env(), retries=1,
+                ):
+                    self.refs_failures.append(f"clean-up:{short}")
+                    ok = False
+                self.rep.skip(f"refs:prune:{short}",
+                              "the Director is still running; tear it down, then run cleanup-refs again")
         finally:
+            # Every path removes the rendered config, which holds the PVE
+            # credentials: normal exit, a failed binary, and any exception.
             if config_dir is not None:
                 shutil.rmtree(config_dir, ignore_errors=True)
         return ok
@@ -2712,9 +2799,14 @@ def main(argv: list[str]) -> int:
         runner = Certify(args, rep)
         try:
             if args.command == "record-director":
+                if runner.dry_run:
+                    print("    PLAN: read the Director's UUID with bosh env and append it to "
+                          f"{_directorrefs.record_path(runner.slot.dir)}")
                 ok = runner._record_director_uuid()
             else:
                 ok = runner.cleanup_refs()
+                if runner.refs_failures:
+                    print("cleanup-refs failures: " + ", ".join(runner.refs_failures))
         finally:
             runner.close()
         rep.summary()

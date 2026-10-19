@@ -34,7 +34,7 @@ def load(slot_dir: "str | Path") -> list[str]:
     """The recorded UUIDs in file order, without duplicates or malformed lines."""
     try:
         lines = record_path(slot_dir).read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     seen: list[str] = []
     for line in lines:
@@ -53,8 +53,16 @@ def add(slot_dir: "str | Path", uuid: str) -> bool:
         return False
     path = record_path(slot_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # A record whose last line lost its newline would otherwise swallow the
+    # new UUID into that line, so we start a fresh line first.
+    try:
+        lead = "" if path.stat().st_size == 0 or path.read_bytes().endswith(b"\n") else "\n"
+    except OSError:
+        lead = ""
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(value + "\n")
+        fh.write(lead + value + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     return True
 
 

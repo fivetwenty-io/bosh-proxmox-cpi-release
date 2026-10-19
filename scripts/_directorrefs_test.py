@@ -52,5 +52,21 @@ class DirectorRecordTest(unittest.TestCase):
         self.assertFalse((self.slot / refs.RECORD_FILE).exists())
 
 
+    def test_add_starts_a_new_line_after_a_missing_newline(self) -> None:
+        (self.slot / refs.RECORD_FILE).write_text(A)
+        self.assertTrue(refs.add(self.slot, B))
+        self.assertEqual(refs.load(self.slot), [A, B])
+
+    def test_add_raises_oserror_for_an_unwritable_slot(self) -> None:
+        blocker = self.slot / "file"
+        blocker.write_text("x")
+        with self.assertRaises(OSError):
+            refs.add(blocker / "sub", A)
+
+    def test_a_non_utf8_record_loads_as_empty(self) -> None:
+        (self.slot / refs.RECORD_FILE).write_bytes(b"\xff\xfe\x00")
+        self.assertEqual(refs.load(self.slot), [])
+
+
 if __name__ == "__main__":
     unittest.main()
