@@ -38,4 +38,4 @@ artifacts_s3_port:        9000
 artifacts_console_port:   9001
 artifacts_tls_mode:       disabled        # disabled | self-signed
 artifacts_buckets:        "pve-cpi-bosh pve-cpi-cf"
-artifacts_rustfs_version: 1.0.0-beta.3
+artifacts_rustfs_version: 1.0.3

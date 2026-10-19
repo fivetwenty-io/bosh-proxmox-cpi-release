@@ -33,15 +33,15 @@ The stock `bosh/bosh-cli` image ships only the BOSH CLI and its runtime dependen
 
 ## Tool matrix
 
-`ci/Dockerfile` pins every version; this table records the floor each consumer needs. The `bosh` and `gh` downloads are sha256-verified with the same published checksums `.github/workflows/release.yml` verifies.
+`ci/Dockerfile` pins every version; this table records the version each consumer gets. The `bosh` and `gh` downloads are sha256-verified with the same published checksums `.github/workflows/release.yml` verifies.
 
-| Tool | Minimum version | Source |
-|------|----------------|--------|
-| `bosh` | 7.10.10 | https://github.com/cloudfoundry/bosh-cli/releases (sha256-pinned) |
-| `gh` | 2.99.0 | https://github.com/cli/cli/releases (sha256-pinned) |
+| Tool | Version | Source |
+|------|---------|--------|
+| `bosh` | 7.11.1 | https://github.com/cloudfoundry/bosh-cli/releases (sha256-pinned) |
+| `gh` | 2.102.0 | https://github.com/cli/cli/releases (sha256-pinned) |
 | `cf` | 8.19.0 | https://github.com/cloudfoundry/cli/releases |
-| `credhub` | 2.9.60 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
-| `uv` | 0.12.9 | https://github.com/astral-sh/uv/releases |
+| `credhub` | 2.9.62 | https://github.com/cloudfoundry-incubator/credhub-cli/releases |
+| `uv` | 0.13.1 | https://github.com/astral-sh/uv/releases |
 | `go` | 1.27.2 | golang official image (must satisfy `src/pve_cpi/go.mod`) |
 | `ruby` + `bundler` | 3.3 | ruby official slim image |
 | `python3` + PyYAML | 3.11 | Debian packages (`python3`, `python3-yaml`) |

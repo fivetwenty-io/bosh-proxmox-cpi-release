@@ -33,7 +33,7 @@ image_resource:
   source:
     repository: ubuntu
     tag: "24.04"
-    digest: "sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55"
+    digest: "sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac"
 
 inputs:
   - name: repo
@@ -66,14 +66,14 @@ run:
       # remove this block and update image_resource accordingly.
       #
       # Pinned versions:
-      #   bosh-cli   7.11.0  (same as ci/Dockerfile)
+      #   bosh-cli   7.11.1  (same as ci/Dockerfile)
       #   cf-cli     8.x     (CF Foundry maintained apt repo)
       #   credhub    2.9.62  (same as ci/Dockerfile)
       #   uv         0.4.x   (astral-sh installer; latest stable)
       #   jq         1.7.x   (ubuntu 24.04 repo)
       #   curl, make, ca-certificates shipped with ubuntu base layer
       # ---------------------------------------------------------------
-      BOSH_CLI_VERSION="7.11.0"
+      BOSH_CLI_VERSION="7.11.1"
       CREDHUB_CLI_VERSION="2.9.62"
 
       apt-get update -qq

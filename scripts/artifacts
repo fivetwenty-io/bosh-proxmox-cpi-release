@@ -34,7 +34,7 @@ Sizing + config (env var wins, then the env vars.yml key, then the default):
     ARTIFACTS_BUCKETS                      "pve-cpi-bosh pve-cpi-cf"
     ARTIFACTS_S3_ACCESS_KEY / _SECRET_KEY  generated hex pair when unset
     ARTIFACTS_DATA_DISK_GIB                unset (single root disk)
-    ARTIFACTS_RUSTFS_VERSION / _URL        1.0.0-beta.3 / musl zip
+    ARTIFACTS_RUSTFS_VERSION / _URL        1.0.3 / musl zip
     ARTIFACTS_IMAGE_URL                    Ubuntu 24.04 noble cloud image
 
 Exit codes (status/info for scripting): 0 online/ok, 3 VM up but S3 silent,

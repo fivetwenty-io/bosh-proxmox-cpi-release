@@ -16,15 +16,15 @@
 
 ARG GO_VERSION=1.27.2
 ARG RUBY_VERSION=3.3
-ARG BOSH_CLI_VERSION=7.11.0
-# sha256 of bosh-cli-7.11.0-linux-amd64 from cloudfoundry/bosh-cli releases
-ARG BOSH_CLI_SHA256=3ad84c3967672070b7f70f91f8da76abcbb604d588787b4f98457338cc9fc8d2
+ARG BOSH_CLI_VERSION=7.11.1
+# sha256 of bosh-cli-7.11.1-linux-amd64 from cloudfoundry/bosh-cli releases
+ARG BOSH_CLI_SHA256=91dfeff2b222eadadbd9a17bf074bf5ece36d39c9b4f592a3b4f3c1f57534df2
 ARG GH_CLI_VERSION=2.102.0
 # sha256 of gh_2.102.0_linux_amd64.tar.gz from cli/cli releases
 ARG GH_CLI_SHA256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
 ARG CF_CLI_VERSION=8.19.0
 ARG CREDHUB_CLI_VERSION=2.9.62
-ARG UV_VERSION=0.13.0
+ARG UV_VERSION=0.13.1
 
 # -- Stage 1: download CLI binaries -----------------------------------------
 FROM debian:bookworm-slim AS downloader

@@ -75,7 +75,7 @@ default.
 | Buckets | `ARTIFACTS_BUCKETS` | `artifacts_buckets` | `pve-cpi-bosh pve-cpi-cf` |
 | S3 access key | `ARTIFACTS_S3_ACCESS_KEY` | `artifacts_s3_access_key` | generated hex |
 | S3 secret key | `ARTIFACTS_S3_SECRET_KEY` | `artifacts_s3_secret_key` | generated hex |
-| RustFS version | `ARTIFACTS_RUSTFS_VERSION` | `artifacts_rustfs_version` | `1.0.0-beta.3` |
+| RustFS version | `ARTIFACTS_RUSTFS_VERSION` | `artifacts_rustfs_version` | `1.0.3` |
 | RustFS URL | `ARTIFACTS_RUSTFS_URL` | `artifacts_rustfs_url` | musl zip for the version |
 | Cloud image URL | `ARTIFACTS_IMAGE_URL` | `artifacts_image_url` | Ubuntu 24.04 noble |
 

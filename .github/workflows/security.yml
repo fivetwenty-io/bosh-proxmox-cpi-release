@@ -33,7 +33,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     container:
       # Digest-pinned golang:1.27 (self-hosted runner has no build tools on the host)
-      image: golang:1.27@sha256:e432b43af23a9328d56a7c499be0476810aa344acbcf65fc7c455d4ff5a40602
+      image: golang:1.27@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8
       # The container filesystem is fresh on every job, so the Go module and
       # build caches would start cold. These are host paths rather than the
       # Actions cache service: on a persistent self-hosted runner, restoring a
@@ -93,7 +93,7 @@ jobs:
         # SHA-pinned: upstream deletes old tags (v0.2.0 vanished and broke scheduled runs)
         uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
-          version: v0.75.0
+          version: v0.76.0
 
       - name: Run security scans
         # REQUIRE_TOOLS makes a missing scanner a failure rather than
