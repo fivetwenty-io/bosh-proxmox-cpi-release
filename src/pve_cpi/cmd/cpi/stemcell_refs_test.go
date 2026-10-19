@@ -372,6 +372,9 @@ func TestStemcellRefsPruneApplySucceeds(t *testing.T) {
 		!strings.Contains(stdout, "removed tag director--old-uuid") {
 		t.Fatalf("stdout %q", stdout)
 	}
+	if p, a := strings.Index(stdout, "plan:"), strings.Index(stdout, "applied:"); p < 0 || a < p {
+		t.Errorf("apply text does not print the plan before the results:\n%s", stdout)
+	}
 	g := client.guests[0]
 	if strings.Contains(g.desc, "old-uuid") || !strings.Contains(g.desc, "new-uuid") {
 		t.Errorf("description after apply = %s", g.desc)
@@ -384,5 +387,85 @@ func TestStemcellRefsPruneApplySucceeds(t *testing.T) {
 	}
 	if len(client.pools.claims) != 0 {
 		t.Errorf("lock pools left behind: %v", client.pools.claims)
+	}
+}
+
+func TestStemcellRefsPruneWarnsWhenRefMatchesNothing(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	for _, extra := range [][]string{nil, {"--apply"}} {
+		args := append([]string{"prune", "--config", cfgPath, "--director", "old-uuidd"}, extra...)
+		client := refsCLIFixture()
+		client.pools = &refsCLIPools{}
+		code, _, stderr := runStemcellRefsTest(t, client, args...)
+		if code != 0 || !strings.Contains(stderr, `warning: no stemcell cache template holds the ref "old-uuidd"`) {
+			t.Errorf("%v: exit %d stderr %q; want a no-match warning", extra, code, stderr)
+		}
+	}
+	_, _, stderr := runStemcellRefsTest(t, refsCLIFixture(), "prune", "--config", cfgPath, "--director", "old-uuid",
+		"--allow-owned-vms")
+	if strings.Contains(stderr, "warning: no stemcell") {
+		t.Errorf("matched ref warned: %q", stderr)
+	}
+}
+
+func TestStemcellRefsKeptReplicasAreListed(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	desc := func(refs string) string {
+		return `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy","director_refs":` + refs + `}`
+	}
+	client := &refsCLIClient{guests: []refsCLIGuest{
+		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--old-uuid", desc: desc(`["old-uuid"]`)},
+		// 155 is untracked, and 157 holds no ref but has its own remove-tag.
+		{vmid: 155, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-sha-aaaa1111;bosh-stemcell-node-pve-node2", desc: desc(`[]`)},
+		{vmid: 157, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;bosh-stemcell-node-pve-node2;director--old-uuid",
+			desc: desc(`[]`)},
+	}}
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--director", "old-uuid")
+	if code != 0 {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"keeps replica 155 (bosh-stemcell-a-1-aaaa1111 on pve), not freeable by --vmid: ",
+		"keeps replica 157 (bosh-stemcell-a-1-aaaa1111 on pve), freeable by --vmid afterwards: ",
+		"free it with prune --vmid 157",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, stdout)
+		}
+	}
+	code, stdout, stderr = runStemcellRefsTest(t, client, "report", "--config", cfgPath)
+	if code != 0 {
+		t.Fatalf("report: exit %d stderr %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "KEPT REPLICAS") || !strings.Contains(stdout, "a prune of old-uuid keeps replica 157") {
+		t.Errorf("report does not list the kept replicas:\n%s", stdout)
+	}
+}
+
+func TestStemcellRefsApplyTextShowsDowngradedReplica(t *testing.T) {
+	act := handlers.StemcellRefsAction{Kind: handlers.StemcellRefsActionRemoveRefAndDestroy, VMID: 150,
+		Node: "pve-node2", Name: "bosh-stemcell-a-1-aaaa1111", Replica: true}
+	result := handlers.StemcellRefsApplyResult{
+		Plan:     handlers.StemcellRefsPlan{Mode: "director", DirectorRef: "old-uuid", Actions: []handlers.StemcellRefsAction{act}},
+		Failures: 0,
+		Results: []handlers.StemcellRefsActionResult{{Action: act, AppliedKind: handlers.StemcellRefsActionRemoveRef,
+			Outcome: handlers.StemcellRefsOutcomeApplied, KeptReason: "replica 150 not destroyed: anchor kept",
+			TagRemoved: true, CacheMarkerAdded: true}},
+	}
+	var out, errOut bytes.Buffer
+	if code := writeStemcellRefsApply(&out, &errOut, result, false); code != 0 {
+		t.Fatalf("exit %d stderr %q", code, errOut.String())
+	}
+	want := "remove-ref vmid 150 (bosh-stemcell-a-1-aaaa1111 on pve-node2), replica: applied " +
+		"(planned remove-ref-and-destroy), kept: replica 150 not destroyed: anchor kept"
+	text := out.String()
+	if !strings.Contains(text, want) || !strings.Contains(text, "added tag bosh-stemcell-cache") {
+		t.Errorf("apply text lacks the downgrade:\n%s", text)
+	}
+	if strings.Contains(text, "remove-ref-and-destroy vmid 150 (bosh-stemcell-a-1-aaaa1111 on pve-node2), replica: applied") {
+		t.Errorf("apply text reports the planned destroy as applied:\n%s", text)
 	}
 }

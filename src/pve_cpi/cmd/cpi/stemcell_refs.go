@@ -110,6 +110,7 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		fmt.Fprintf(stderr, "stemcell-refs: %s\n", err)
 		return 2
 	}
+	warnStemcellRefsNoMatch(stderr, plan)
 	if !*apply {
 		return writeStemcellRefsPlan(stdout, stderr, plan, *jsonOut)
 	}
@@ -131,6 +132,15 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		return 1
 	}
 	return writeStemcellRefsApply(stdout, stderr, result, *jsonOut)
+}
+
+// warnStemcellRefsNoMatch warns on stderr when a --director prune matches no
+// template, which usually means the ref was mistyped.
+func warnStemcellRefsNoMatch(stderr io.Writer, plan handlers.StemcellRefsPlan) {
+	if plan.Mode == "director" && len(plan.Actions) == 0 {
+		fmt.Fprintf(stderr, "warning: no stemcell cache template holds the ref %q or carries the tag %s; "+
+			"check the spelling against the report\n", plan.DirectorRef, plan.DirectorTag)
+	}
 }
 
 // stemcellRefsUsageProblem returns the usage error in the parsed flags, or "".
@@ -200,13 +210,23 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 	}
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "REFS")
-	fmt.Fprintln(tw, "REF\tTEMPLATES\tTAG ONLY\tOWNED VMS\tWOULD FREE\tBLOCKED\tNOTES")
+	fmt.Fprintln(tw, "REF\tTEMPLATES\tTAG ONLY\tOWNED VMS\tWOULD FREE\tBLOCKED\tKEPT REPLICAS\tNOTES")
 	for i := range rep.Refs {
 		r := &rep.Refs[i]
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", refLabel(r.Ref), dashIDs(r.DescriptionTemplates),
-			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), dashIDs(r.WouldFree), dashIDs(r.Blocked), dash(r.Note))
+		kept := make([]int64, 0, len(r.KeptReplicas))
+		for _, k := range r.KeptReplicas {
+			kept = append(kept, k.VMID)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", refLabel(r.Ref), dashIDs(r.DescriptionTemplates),
+			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), dashIDs(r.WouldFree), dashIDs(r.Blocked),
+			dashIDs(kept), dash(r.Note))
 	}
 	fmt.Fprintln(tw, "WOULD FREE assumes --allow-owned-vms; without it a prune refuses while OWNED VMS is non-zero or unknown.")
+	for i := range rep.Refs {
+		for _, k := range rep.Refs[i].KeptReplicas {
+			fmt.Fprintf(tw, "a prune of %s %s\n", refLabel(rep.Refs[i].Ref), keptReplicaText(k))
+		}
+	}
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "UNREFERENCED (prune --vmid)")
 	fmt.Fprintln(tw, "NODE\tVMID\tNAME\tFREEABLE\tNOTES")
@@ -257,6 +277,17 @@ func writeStemcellRefsPlan(stdout, stderr io.Writer, plan handlers.StemcellRefsP
 		return code
 	}
 	fmt.Fprintln(stdout, "plan (dry run unless --apply):")
+	writeStemcellRefsPlanBody(stdout, stderr, plan)
+	if plan.Refused {
+		fmt.Fprintln(stderr, "refused: "+plan.RefusalReason)
+	}
+	return code
+}
+
+// writeStemcellRefsPlanBody prints the owned VMs, the actions, and the scan
+// errors of plan. The dry run and the text apply both print it, so the apply
+// shows the plan it executed before its results.
+func writeStemcellRefsPlanBody(stdout, stderr io.Writer, plan handlers.StemcellRefsPlan) {
 	if len(plan.OwnedVMs) > 0 {
 		ids := make([]int64, 0, len(plan.OwnedVMs))
 		for _, g := range plan.OwnedVMs {
@@ -271,10 +302,9 @@ func writeStemcellRefsPlan(stdout, stderr io.Writer, plan handlers.StemcellRefsP
 	for _, e := range plan.ScanErrors {
 		fmt.Fprintln(stderr, "scan error: "+e)
 	}
-	if plan.Refused {
-		fmt.Fprintln(stderr, "refused: "+plan.RefusalReason)
+	if !plan.CloneScanComplete {
+		fmt.Fprintln(stderr, "the linked-clone scan is incomplete, so every destroy is blocked")
 	}
-	return code
 }
 
 func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction) {
@@ -291,6 +321,9 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		if a.DropTag != "" {
 			line += ", removes tag " + a.DropTag
 		}
+		if a.AddsCacheMarker {
+			line += ", adds tag bosh-stemcell-cache"
+		}
 		if len(a.RemainingRefs) > 0 {
 			line += ", leaves refs " + strings.Join(a.RemainingRefs, ", ")
 		}
@@ -306,9 +339,18 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		}
 		fmt.Fprintln(w, line)
 		for _, k := range a.KeptReplicas {
-			fmt.Fprintf(w, "    keeps replica %d (%s on %s): %s\n", k.VMID, k.Name, k.Node, k.Reason)
+			fmt.Fprintln(w, "    "+keptReplicaText(k))
 		}
 	}
+}
+
+// keptReplicaText describes a replica a prune leaves in place.
+func keptReplicaText(k handlers.StemcellRefsKeptReplica) string {
+	freeable := "not freeable by --vmid"
+	if k.FreeableByVMID {
+		freeable = "freeable by --vmid afterwards"
+	}
+	return fmt.Sprintf("keeps replica %d (%s on %s), %s: %s", k.VMID, k.Name, k.Node, freeable, k.Reason)
 }
 
 func writeStemcellRefsApply(stdout, stderr io.Writer, result handlers.StemcellRefsApplyResult, jsonOut bool) int {
@@ -322,27 +364,15 @@ func writeStemcellRefsApply(stdout, stderr io.Writer, result handlers.StemcellRe
 		}
 		return code
 	}
+	fmt.Fprintln(stdout, "plan:")
+	writeStemcellRefsPlanBody(stdout, stderr, result.Plan)
 	fmt.Fprintln(stdout, "applied:")
 	if len(result.Results) == 0 {
 		fmt.Fprintln(stdout, "  nothing to do")
 	}
 	for i := range result.Results {
-		r := &result.Results[i]
-		line := fmt.Sprintf("  %s vmid %d (%s on %s): %s", r.Action.Kind, r.Action.VMID, r.Action.Name, r.Action.Node, r.Outcome)
-		if len(r.Destroyed) > 0 {
-			line += ", destroyed " + dashIDs(r.Destroyed)
-		}
-		if r.TagRemoved {
-			line += ", removed tag " + r.Action.DropTag
-		}
-		if r.Action.Reason != "" {
-			line += ": " + r.Action.Reason
-		}
-		if r.Error != "" {
-			line += ": " + r.Error
-		}
-		fmt.Fprintln(stdout, line)
-		for _, n := range r.Notes {
+		fmt.Fprintln(stdout, stemcellRefsResultLine(&result.Results[i]))
+		for _, n := range result.Results[i].Notes {
 			fmt.Fprintln(stdout, "    "+n)
 		}
 	}
@@ -350,6 +380,42 @@ func writeStemcellRefsApply(stdout, stderr io.Writer, result handlers.StemcellRe
 		fmt.Fprintf(stderr, "%d action(s) failed or were skipped\n", result.Failures)
 	}
 	return code
+}
+
+// stemcellRefsResultLine renders one apply result. It names the kind the
+// apply ran, so a replica whose planned destroy became a keep reads as kept.
+func stemcellRefsResultLine(r *handlers.StemcellRefsActionResult) string {
+	kind := r.AppliedKind
+	if kind == "" {
+		kind = r.Action.Kind
+	}
+	line := fmt.Sprintf("  %s vmid %d (%s on %s)", kind, r.Action.VMID, r.Action.Name, r.Action.Node)
+	if r.Action.Replica {
+		line += ", replica"
+	}
+	line += ": " + r.Outcome
+	if kind != r.Action.Kind {
+		line += " (planned " + r.Action.Kind + ")"
+	}
+	if r.KeptReason != "" {
+		line += ", kept: " + r.KeptReason
+	}
+	if len(r.Destroyed) > 0 {
+		line += ", destroyed " + dashIDs(r.Destroyed)
+	}
+	if r.TagRemoved {
+		line += ", removed tag " + r.Action.DropTag
+	}
+	if r.CacheMarkerAdded {
+		line += ", added tag bosh-stemcell-cache"
+	}
+	if r.Action.Reason != "" {
+		line += ": " + r.Action.Reason
+	}
+	if r.Error != "" {
+		line += ": " + r.Error
+	}
+	return line
 }
 
 func templateNotes(t *handlers.StemcellRefsTemplate) string {

@@ -625,3 +625,31 @@ func TestMergeProvenanceIntoDescription_EmptyDescription_StartsFresh(t *testing.
 		t.Errorf("got %+v", got)
 	}
 }
+
+// delete_stemcell passes zero-value deregisterOptions, so the pmxcfs "does
+// not exist" answer stays an error there. Only the operator prune, through
+// goneOnConfigMissing, treats it as an already-gone template.
+func TestDeregisterStemcellDirectorRef_PmxcfsConfigMissing_IsAnError(t *testing.T) {
+	t.Parallel()
+
+	missing := errors.New("500 Configuration file 'nodes/pve-node1/qemu-server/6042.conf' does not exist")
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return nil, missing
+	})
+	destroyCalled := false
+	destroy := func(_ context.Context) error { destroyCalled = true; return nil }
+
+	destroyed, remaining, err := deregisterStemcellDirectorRef(context.Background(), deps, deps.Logger, "pve-node1", 6042, "director-a", destroy)
+	if err == nil || !strings.Contains(err.Error(), "deregisterStemcellDirectorRef: read config vmid 6042") {
+		t.Fatalf("err = %v; want the config read error", err)
+	}
+	if destroyed || remaining != nil || destroyCalled || len(*calls) != 0 {
+		t.Errorf("destroyed=%v remaining=%v destroyCalled=%v calls=%v; want nothing done", destroyed, remaining, destroyCalled, *calls)
+	}
+
+	out, err := deregisterStemcellDirectorRefWith(context.Background(), deps, deps.Logger, "pve-node1", 6042, "director-a",
+		destroy, deregisterOptions{goneOnConfigMissing: true})
+	if err != nil || !out.destroyed || destroyCalled {
+		t.Errorf("goneOnConfigMissing: out=%+v err=%v destroyCalled=%v; want already gone", out, err, destroyCalled)
+	}
+}
