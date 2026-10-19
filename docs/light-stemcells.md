@@ -348,7 +348,7 @@ Putting `:heavy:` stemcells on storage only one entry can reach, or using `:ligh
 
 `bosh delete-stemcell` on a stemcell whose only remaining director reference is this director's destroys the cache template (and, for `:heavy:`, the qcow2). No manual `pvesm free` step is needed in that case. Verify with `bosh stemcells` before and after; the CID disappears once every director has released it.
 
-A rebuilt director leaves its old UUID behind as a reference that nothing will release, and `bosh delete-stemcell` then keeps the cache template. `cpi stemcell-refs report` shows those references, and `cpi stemcell-refs prune --director <old-uuid>` removes one. [Clearing a stale director ref](operations.md#clearing-a-stale-director-ref) walks through it.
+A rebuilt director leaves its old UUID behind as a reference that nothing will release, and `bosh delete-stemcell` then keeps the cache template. `cpi stemcell-refs report` shows those references, and `cpi stemcell-refs prune --director <old-uuid>` removes one. The prune refuses while any VM that BOSH manages carries no owner tag, which is true of VMs created before 0.9.4, and `cpi stemcell-refs adopt-owners` stamps those VMs with their Director's tag. [Clearing a stale director ref](operations.md#clearing-a-stale-director-ref) walks through it.
 
 For a `:light:` file, `pvesm free` (or the PVE UI's storage **Content** tab) is the *only* way to remove the qcow2 itself — the CPI will never do it:
 

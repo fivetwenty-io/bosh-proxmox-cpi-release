@@ -775,9 +775,19 @@ We start with the report, which only reads:
 sudo -u vcap /var/vcap/packages/pve_cpi/bin/cpi stemcell-refs report --config /var/vcap/jobs/pve_cpi/config/cpi.json
 ```
 
-The report has three tables. The first lists every stemcell cache template with its node, VMID, name, and sha8, the refs in its description, its `director--` tags, whether the refs and tags disagree, and the linked clones we found. The description's refs decide whether a template stays, and the tags name the directors that hold it now, so the two agree once `--reconcile-tags` has run and the CPI has touched the template since. A disagreement before that isn't an error, because releases before this one never removed a departing director's tag, and a template that one `delete_stemcell` touches still carries its other stale tags until `--reconcile-tags` clears them. A template whose description is within 1024 bytes of PVE's 8192-byte limit gets a note with its size, and a line under the table counts those templates. The CPI refuses to add a director's ref when the description would pass the limit, so an upload that reuses such a template fails until we prune its stale refs. The second table lists every distinct ref with the templates that hold it, how many VMs still carry that ref's `bosh-owner--` tag, and which templates a prune of that ref would free or leave blocked. Its free and blocked columns assume `--allow-owned-vms`, so they show what a prune would do once the owner check passes. A blank ref gets its own row with a note, because the prune can't name it. The third table lists the templates a `--vmid` prune could free, with the reason for each one it would refuse. A legacy template from before 0.9.2 is freeable there. It has a blank description and a legacy cache name, and it may carry sha8 or node tags, but it never carries a `director--` tag or the `bosh-stemcell-cache` tag. A template with a blank description that does carry a `director--` or `bosh-stemcell-cache` tag is marked "refs unknown" and is never freeable, because its ref record was lost and we can't tell who uses it. A template marked "untracked" has provenance JSON but no generation marker. It comes from a CPI generation that never recorded refs, so its empty ref set doesn't prove that nobody uses it. The report marks it as not freeable and gives that reason, and no prune ever destroys it, whether we name it with `--vmid`, it is the last holder of a ref, or it is a replica of a stemcell whose last main template goes. We remove an untracked template by hand once we know nothing uses it. The second table also lists, for each ref, the replicas a prune of that ref would keep with no ref, with the reason for each. With `--json` we get the same data as JSON. The report exits 1 when some guest's config couldn't be read, because the linked-clone column can't be trusted then.
+The report has three tables. The first lists every stemcell cache template with its node, VMID, name, and sha8, the refs in its description, its `director--` tags, whether the refs and tags disagree, and the linked clones we found. The description's refs decide whether a template stays, and the tags name the directors that hold it now, so the two agree once `--reconcile-tags` has run and the CPI has touched the template since. A disagreement before that isn't an error, because releases before this one never removed a departing director's tag, and a template that one `delete_stemcell` touches still carries its other stale tags until `--reconcile-tags` clears them. A template whose description is within 1024 bytes of PVE's 8192-byte limit gets a note with its size, and a line under the table counts those templates. The CPI refuses to add a director's ref when the description would pass the limit, so an upload that reuses such a template fails until we prune its stale refs. The second table lists every distinct ref with the templates that hold it, how many VMs that ref owns, and which templates a prune of that ref would free or leave blocked. A VM counts as owned when it carries the ref's `bosh-owner--` tag, and a disk parker counts when it carries the ref's `director--` tag, because parkers record their Director there instead. The free and blocked columns assume `--allow-owned-vms`, so they show what a prune would do once the owner check passes. While ownership is unknown, as the next paragraph describes, the owned count reads unknown and the free column reads blocked for every ref, because no prune can go ahead. A blank ref gets its own row with a note, because the prune can't name it. The third table lists the templates a `--vmid` prune could free, with the reason for each one it would refuse. A legacy template from before 0.9.2 is freeable there. It has a blank description and a legacy cache name, and it may carry sha8 or node tags, but it never carries a `director--` tag or the `bosh-stemcell-cache` tag. A template with a blank description that does carry a `director--` or `bosh-stemcell-cache` tag is marked "refs unknown" and is never freeable, because its ref record was lost and we can't tell who uses it. A template marked "untracked" has provenance JSON but no generation marker. It comes from a CPI generation that never recorded refs, so its empty ref set doesn't prove that nobody uses it. The report marks it as not freeable and gives that reason, and no prune ever destroys it, whether we name it with `--vmid`, it is the last holder of a ref, or it is a replica of a stemcell whose last main template goes. We remove an untracked template by hand once we know nothing uses it. The second table also lists, for each ref, the replicas a prune of that ref would keep with no ref, with the reason for each. With `--json` we get the same data as JSON. The report exits 1 when some guest's config couldn't be read, because the linked-clone column can't be trusted then.
 
-Before we prune a ref, we make sure its Director is gone. The owned VM count is the first check, because a live Director's VMs carry its owner tag. For the `unknown-director` ref the report shows that count as unknown, because a VM created without a Director UUID carries no owner tag, so no count can prove that such a caller has stopped. A VM created before 0.9.4 gets the owner tag only after the Director next sets its metadata, so on an older foundation a count of zero proves nothing, and we also compare the ref with `bosh -e <env> status` on every Director that shares the cluster.
+The owned count can only see VMs that carry an owner tag, and a VM created before 0.9.4 carries none until a later `set_vm_metadata` from its Director adds it. A live Director whose VMs all predate the tag would therefore count zero owned VMs, and its ref would look safe to prune. So the scan sorts every guest that isn't a template into one of three kinds:
+
+- A disk parker carries the `bosh-parker` tag. It never makes ownership unknown.
+
+- A BOSH guest carries `bosh-cpi`, a `director--` tag, a `deployment--` tag, or an owner tag. A guest that also carries a stemcell marker counts here too.
+
+- Any other guest is one that BOSH doesn't manage, and the owner check ignores it.
+
+When any BOSH guest carries no owner tag, the report marks ownership as unknown for every ref, and it adds an OWNERSHIP UNKNOWN section. That section explains why, then lists the guests without an owner tag grouped by director name and deployment. Under each group it prints the `cpi stemcell-refs adopt-owners` commands that would stamp those guests, with a note that says where to find the Director UUID the commands need. A group that adopt-owners can't stamp, such as a guest with a stemcell marker or one without `bosh-cpi`, gets the reason instead. A deploy by the owning Director on 0.9.4 or later adds the tag to those guests through `set_vm_metadata`, and otherwise we find out what each VM is and delete it, or remove the BOSH tags from a VM that BOSH doesn't manage. With `--json` the same groups come back in `uncovered`, next to `ownership_unknown` and its reason.
+
+Before we prune a ref, we make sure its Director is gone. The owned VM count is the first check, because a live Director's VMs carry its owner tag. For the `unknown-director` ref the report shows that count as unknown, because a VM created without a Director UUID carries no owner tag, so no count can prove that such a caller has stopped. We also compare the ref with `bosh -e <env> status` on every Director that shares the cluster.
 
 The prune is a dry run until we pass `--apply`:
 
@@ -790,7 +800,9 @@ The ref can be any non-empty string, so test refs such as `debug-repro` work too
 
 These rules keep the prune safe:
 
-- If any VM still carries the ref's owner tag, the command refuses and exits 1. We pass `--allow-owned-vms` only when we know those VMs are orphans.
+- If any BOSH guest in the cluster carries no owner tag, a `--director` prune refuses and exits 1, whatever ref it names. `--allow-owned-vms` doesn't override this, because we can't know which Director those guests belong to. We stamp them with `adopt-owners`, as [Stamping owner tags on older VMs](#stamping-owner-tags-on-older-vms) describes, and prune again.
+
+- If any VM still carries the ref's owner tag, or any disk parker carries its `director--` tag, the command refuses and exits 1. We pass `--allow-owned-vms` only when we know those VMs are orphans.
 
 - The command can't tell who still uses the `unknown-director` ref, because VMs created without a Director UUID carry no owner tag. It refuses to prune that ref unless we pass `--allow-owned-vms`, which we do only when we know no such caller still deploys from those templates.
 
@@ -828,6 +840,37 @@ The reconcile removes every `director--` tag that no ref in the template's descr
 The prune frees templates, not files. For a `:heavy:` stemcell the qcow2 under `import/` stays, because a Director that still lists the stemcell could build a new template from it. Once no Director lists the stemcell, `pve-cid stemcells --orphans` shows the file with no correlated template, and we remove it with `pvesm free`, as the example in [Operator caveats](light-stemcells.md#operator-caveats) shows.
 
 The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any template that failed, and 2 for a usage error. We pass exactly one of `--director`, `--vmid`, and `--reconcile-tags`, and `--allow-owned-vms` works only with `--director`. With `--json`, an `--apply` run always prints the apply result, and when the plan is refused that result has `refused` set and an empty `results` list.
+
+#### Stamping owner tags on older VMs
+
+`cpi stemcell-refs adopt-owners` stamps one live Director's owner tag on its VMs that predate owner tags, so the owner check can count them and a prune of some other ref can go ahead. We name the Director by its UUID and its name. The command picks the guests that carry `bosh-cpi` and the `director--` tag that `set_vm_metadata` renders from that name, and that have no owner tag yet. It never stamps a template, a disk parker, or a guest with a stemcell marker. Like the prune, it changes nothing until we pass `--apply`:
+
+```bash
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name>
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name> --apply
+```
+
+**A wrong pair takes VMs away from their real Director.** Once a VM carries an owner tag, the CPI treats every other Director as a stranger to it, so the real owner's `delete_vm` and `set_vm_metadata` refuse that VM. We copy the UUID and the name from `bosh -e <env> env` on the Director we mean, and we read the dry run before we pass `--apply`. If we stamp the wrong UUID anyway, we remove that `bosh-owner--` tag from each affected VM by hand, through the PVE web UI or API, before the real Director next touches it.
+
+The dry run lists the VMs it would stamp, grouped by deployment. It also lists the VMs that carry the name and already have the owner tag, and the VMs it skips, each with the reason. The command refuses the whole run and lists the conflicting guests when any guest it considers pairs the director name with a different UUID's owner tag, or pairs the UUID with a different director name, because the pair we gave then contradicts what the cluster already records.
+
+Two optional selectors narrow the guests it considers, and the conflict check looks only at the guests they keep:
+
+- `--deployment <name>` keeps the guests whose `deployment--` tag matches the deployment name, rendered the way `set_vm_metadata` renders it.
+
+- `--vmid <n>` keeps one guest, and we can repeat it. Each VMID must name a guest that carries the director tag, and the deployment tag too when we pass `--deployment`, or the command refuses.
+
+The apply handles each VM under the same per-VMID lock the other writes use. It reads the VM again and checks every condition the plan chose it on, and it writes the tags with that read's config digest, so a write that races another one is refused and retried. The owner tag goes right after `bosh-cpi`, where `set_vm_metadata` puts it. A VM that gained the right owner tag in the meantime is reported as already owned. A VM that changed in any other way is reported as changed since the plan and left alone. When one VM fails, the command reports it, carries on with the others, and exits 1.
+
+A Director that `bosh create-env` deployed needs more care. Every create-env Director VM carries `director--bosh-init`, because create-env names itself `bosh-init`, so the name alone can't tell two of them apart. The UUID that create-env sends is the `director_id` in the deployment's create-env state file, not the UUID that `bosh env` prints for the Director. For these VMs we pass `--director-name bosh-init`, that `director_id` as `--director-uuid`, and the deployment name from the create-env manifest as `--deployment`:
+
+```bash
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <director_id> --director-name bosh-init --deployment <name>
+```
+
+With `bosh-init` the command requires `--deployment` or `--vmid`, and it refuses unless the selection holds exactly one VM. When two create-env Directors share a deployment name, we pick each one with `--vmid`. The report's OWNERSHIP UNKNOWN section prints these commands with the right selector for each create-env VM.
+
+The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any VM that failed, and 2 for a usage error, which includes a UUID that isn't one and `bosh-init` without a selector. With `--json`, a dry run prints the plan and an `--apply` run prints the result with an outcome for each VM.
 
 ## Safe teardown ordering
 
@@ -869,7 +912,10 @@ Collect the following before opening an issue.
 ```bash
 # CPI version — on the Director VM
 /var/vcap/jobs/pve_cpi/bin/cpi --version
-# Output format: "bosh-proxmox-cpi <version> (<commit>, built <date>)"
+# Output format: "bosh-proxmox-cpi <release version> (package <fingerprint>, built <date>)"
+# A job config rendered without a release version prints the package line:
+# "bosh-proxmox-cpi <fingerprint> (<commit>, built <date>)"
+# The CPI also logs release_version and package_version once at startup.
 
 # proxmox-apiclient-go version — in the release source
 grep proxmox-apiclient-go /path/to/bosh-proxmox-cpi-release/src/pve_cpi/go.mod
