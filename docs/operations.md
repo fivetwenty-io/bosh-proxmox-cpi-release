@@ -781,11 +781,25 @@ The owned count can only see VMs that carry an owner tag, and a VM created befor
 
 - A disk parker carries the `bosh-parker` tag. It never makes ownership unknown.
 
-- A BOSH guest carries `bosh-cpi`, a `director--` tag, a `deployment--` tag, or an owner tag. A guest that also carries a stemcell marker counts here too.
+- A BOSH guest carries `bosh-cpi`, a `director--` tag, a `deployment--` tag, or an owner tag, or its notes hold the `director:`, `deployment:`, and `name:` lines that `set_vm_metadata` writes. These are the same marks the CPI's owner check accepts as proof that a VM is a BOSH VM. A guest that also carries a stemcell marker counts here too.
 
 - Any other guest is one that BOSH doesn't manage, and the owner check ignores it.
 
-When any BOSH guest carries no owner tag, the report marks ownership as unknown for every ref, and it adds an OWNERSHIP UNKNOWN section. That section explains why, then lists the guests without an owner tag grouped by director name and deployment. Under each group it prints the `cpi stemcell-refs adopt-owners` commands that would stamp those guests, with a note that says where to find the Director UUID the commands need. A group that adopt-owners can't stamp, such as a guest with a stemcell marker or one without `bosh-cpi`, gets the reason instead. A deploy by the owning Director on 0.9.4 or later adds the tag to those guests through `set_vm_metadata`, and otherwise we find out what each VM is and delete it, or remove the BOSH tags from a VM that BOSH doesn't manage. With `--json` the same groups come back in `uncovered`, next to `ownership_unknown` and its reason.
+When any BOSH guest carries no owner tag, the report marks ownership as unknown for every ref, and it adds an OWNERSHIP UNKNOWN section. A guest whose config the scan couldn't read counts the same way, whatever tags the guest listing shows for it, because we can't see what it carries. The owner check and this rule both cover only the cluster the `cpi.json` names, so a VM on another cluster neither counts as owned nor makes ownership unknown here. The section explains why ownership is unknown, then lists the guests grouped by director name and deployment. Under each group that adopt-owners can stamp, it prints the `cpi stemcell-refs adopt-owners` command that covers the group, with a note that says where to find the Director UUID the command needs. The command names every deployment whose uncovered VMs carry that director name, because adopt-owners requires the full list, and we compare it with `bosh -e <env> deployments` on that Director before we run it. When the name's VMs already carry one Director's owner tag, the command fills in that UUID. A group that adopt-owners can't stamp gets the reason and the way out instead:
+
+- A guest whose config couldn't be read needs the cause fixed, such as a node that is down or a permission the CPI's API token lacks, and then a fresh report.
+
+- A guest without `bosh-cpi`, without a `director--` or `deployment--` tag, or marked as a BOSH VM only by the Director lines in its notes, needs us to confirm which Director runs it. We then recreate the instance with `bosh -d <deployment> recreate <instance>` on CPI 0.9.4 or later, which writes the full tag set with the owner tag, or we add the missing `bosh-cpi`, `director--<name>`, and `deployment--<deployment>` tags in PVE and run adopt-owners. A VM that BOSH doesn't manage loses its BOSH tags and the Director lines in its notes, or we delete it.
+
+- A guest with two `director--` or two `deployment--` tags needs the tags that don't belong to it removed, and then adopt-owners or a recreate.
+
+- A guest with a stemcell marker is usually left over from a failed stemcell upload, and we delete it once we know no deployment uses it.
+
+- A guest whose `director--` tag holds a UUID looks like a disk parker that lost its `bosh-parker` tag, so we restore that tag or delete the VM.
+
+- A create-env Director VM that shares its deployment name with another create-env VM that already carries an owner tag can't be told apart from it, so we recreate that Director with `bosh create-env` on CPI 0.9.4 or later, or delete the VM if that Director is gone.
+
+With `--json` the same groups come back in `uncovered`, next to `ownership_unknown` and its reason.
 
 Before we prune a ref, we make sure its Director is gone. The owned VM count is the first check, because a live Director's VMs carry its owner tag. For the `unknown-director` ref the report shows that count as unknown, because a VM created without a Director UUID carries no owner tag, so no count can prove that such a caller has stopped. We also compare the ref with `bosh -e <env> status` on every Director that shares the cluster.
 
@@ -800,7 +814,7 @@ The ref can be any non-empty string, so test refs such as `debug-repro` work too
 
 These rules keep the prune safe:
 
-- If any BOSH guest in the cluster carries no owner tag, a `--director` prune refuses and exits 1, whatever ref it names. `--allow-owned-vms` doesn't override this, because we can't know which Director those guests belong to. We stamp them with `adopt-owners`, as [Stamping owner tags on older VMs](#stamping-owner-tags-on-older-vms) describes, and prune again.
+- If any BOSH guest in the cluster carries no owner tag, or any guest's config can't be read, a `--director` prune refuses and exits 1, whatever ref it names. `--allow-owned-vms` doesn't override this, because we can't know which Director those guests belong to. We stamp them with `adopt-owners`, as [Stamping owner tags on older VMs](#stamping-owner-tags-on-older-vms) describes, and prune again.
 
 - If any VM still carries the ref's owner tag, or any disk parker carries its `director--` tag, the command refuses and exits 1. We pass `--allow-owned-vms` only when we know those VMs are orphans.
 
@@ -843,34 +857,38 @@ The exit code is 0 for success, 1 for a runtime, config, or refusal error or for
 
 #### Stamping owner tags on older VMs
 
-`cpi stemcell-refs adopt-owners` stamps one live Director's owner tag on its VMs that predate owner tags, so the owner check can count them and a prune of some other ref can go ahead. We name the Director by its UUID and its name. The command picks the guests that carry `bosh-cpi` and the `director--` tag that `set_vm_metadata` renders from that name, and that have no owner tag yet. It never stamps a template, a disk parker, or a guest with a stemcell marker. Like the prune, it changes nothing until we pass `--apply`:
+`cpi stemcell-refs adopt-owners` stamps one live Director's owner tag on its VMs that predate owner tags, so the owner check can count them and a prune of some other ref can go ahead. We name the Director by its UUID and its name, and we name every one of its deployments with `--deployment`. The command picks the guests that carry `bosh-cpi`, the `director--` tag that `set_vm_metadata` renders from that name, and the `deployment--` tag of one of those deployments, and that have no owner tag yet. It never stamps a template, a disk parker, a guest with a stemcell marker, or a guest whose BOSH marks sit only in its notes. Like the prune, it changes nothing until we pass `--apply`:
 
 ```bash
-cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name>
-cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name> --apply
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name> --deployment <a>,<b>
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <uuid> --director-name <name> --deployment <a>,<b> --apply
 ```
 
-**A wrong pair takes VMs away from their real Director.** Once a VM carries an owner tag, the CPI treats every other Director as a stranger to it, so the real owner's `delete_vm` and `set_vm_metadata` refuse that VM, as [A call refuses a VM this Director does not own](troubleshooting.md#a-call-refuses-a-vm-this-director-does-not-own) describes. We copy the UUID and the name from `bosh -e <env> env` on the Director we mean, and we read the dry run before we pass `--apply`. If we stamp the wrong UUID anyway, we remove that `bosh-owner--` tag from each affected VM by hand, through the PVE web UI or API, before the real Director next touches it.
+**A wrong pair takes VMs away from their real Director.** Once a VM carries an owner tag, the CPI treats every other Director as a stranger to it, so the real owner's `delete_vm` and `set_vm_metadata` refuse that VM, as [A call refuses a VM this Director does not own](troubleshooting.md#a-call-refuses-a-vm-this-director-does-not-own) describes. We copy the UUID and the name from `bosh -e <env> env` on the Director we mean, and the deployment names from `bosh -e <env> deployments` on that same Director, and we read the dry run before we pass `--apply`. If we stamp the wrong UUID anyway, we remove that `bosh-owner--` tag from each affected VM by hand, through the PVE web UI or API, before the real Director next touches it.
 
-The dry run lists the VMs it would stamp, grouped by deployment. It also lists the VMs that carry the name and already have the owner tag, and the VMs it skips, each with the reason. The command refuses the whole run and lists the conflicting guests when any guest it considers pairs the director name with a different UUID's owner tag, or pairs the UUID with a different director name, because the pair we gave then contradicts what the cluster already records.
+`--deployment` is required on every run. We can repeat it or give a comma-separated list, and we copy the names from `bosh -e <env> deployments`, because that list is the one record of which deployments belong to the Director. Two Directors can share a name, so the `director--` tag alone never says which Director a VM belongs to. Each name must match at least one guest that carries the director tag, or the command refuses and names the deployment, which catches a typo or a deployment of another Director. `--vmid <n>` narrows the run further to the guests we list, and we can repeat it. Each VMID must name a guest that carries the director tag and the tag of one of the named deployments, or the command refuses.
 
-Two optional selectors narrow the guests it considers, and the conflict check looks only at the guests they keep:
+Before it stamps anything, the command checks the pair against every guest in the cluster, not only the ones it would stamp. It refuses the whole run and lists the conflicting guests in either of these cases:
 
-- `--deployment <name>` keeps the guests whose `deployment--` tag matches the deployment name, rendered the way `set_vm_metadata` renders it.
+- A guest anywhere carries the UUID's owner tag while its director name or its deployment falls outside the name and deployments we gave. That UUID then already belongs to another Director, or we left out one of this Director's deployments.
 
-- `--vmid <n>` keeps one guest, and we can repeat it. Each VMID must name a guest that carries the director tag, and the deployment tag too when we pass `--deployment`, or the command refuses.
+- A guest in one of the deployments we named, with the director name we gave, carries a different owner tag. A deployment belongs to one Director, so the pair we gave contradicts what the cluster records.
 
-The apply handles each VM under the same per-VMID lock the other writes use. It reads the VM again and checks every condition the plan chose it on, and it writes the tags with that read's config digest, so a write that races another one is refused and retried. The owner tag goes right after `bosh-cpi`, where `set_vm_metadata` puts it. A VM that gained the right owner tag in the meantime is reported as already owned. A VM that changed in any other way is reported as changed since the plan and left alone. When one VM fails, the command reports it, carries on with the others, and exits 1.
+A guest with the same director name in a deployment we didn't name may carry a different owner tag, because that is how two Directors that share a name look. The command leaves those guests alone, and the dry run lists their deployments so we can add any that `bosh -e <env> deployments` lists for our Director. The command also refuses when the scan couldn't read some guest's config, because a guest it can't see might hold a conflicting owner tag.
 
-A Director that `bosh create-env` deployed needs more care. Every create-env Director VM carries `director--bosh-init`, because create-env names itself `bosh-init`, so the name alone can't tell two of them apart. The UUID that create-env sends is the `director_id` in the deployment's create-env state file, not the UUID that `bosh env` prints for the Director. For these VMs we pass `--director-name bosh-init`, that `director_id` as `--director-uuid`, and the deployment name from the create-env manifest as `--deployment`:
+The dry run prints the pair, then a block for each deployment we named. Each block lists the VMs it would stamp, the VMs that already carry the owner tag, and the VMs it skips, each with the reason. Conflicts and the deployments it leaves alone follow the blocks.
+
+The apply handles each VM under the same per-VMID lock the other writes use. It reads the VM again and checks every condition the plan chose it on, and it writes the tags with that read's config digest, so a write that races another one is refused and retried. The owner tag joins the head of the tag list, behind `bosh-cpi` and next to the VM's CID and cluster stamps, which is where `set_vm_metadata` keeps it so that tag truncation can't reach it. A VM that gained the right owner tag in the meantime is reported as already owned. A VM that changed in any other way, including one that gained a conflicting owner tag, is reported as changed since the plan and left alone. When one VM fails, the command reports it, carries on with the others, and exits 1.
+
+A Director that `bosh create-env` deployed needs more care. Every create-env Director VM carries `director--bosh-init`, because create-env names itself `bosh-init`, so the name alone can't tell two of them apart. The UUID that create-env sends is the `director_id` in the deployment's create-env state file, not the UUID that `bosh env` prints for the Director. For these VMs we pass `--director-name bosh-init`, that `director_id` as `--director-uuid`, the deployment name from the create-env manifest as `--deployment`, and the VM's VMID as `--vmid`:
 
 ```bash
-cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <director_id> --director-name bosh-init --deployment <name>
+cpi stemcell-refs adopt-owners --config /path/to/cpi.json --director-uuid <director_id> --director-name bosh-init --deployment <name> --vmid <n>
 ```
 
-With `bosh-init` the command requires `--deployment` or `--vmid`, and it refuses unless the selection holds exactly one VM. When two create-env Directors share a deployment name, we pick each one with `--vmid`. The report's OWNERSHIP UNKNOWN section prints these commands with the right selector for each create-env VM.
+With `bosh-init` the command refuses unless the selection holds exactly one VM, and it refuses when the `director_id` already sits on another VM, because a create-env `director_id` owns exactly one VM. It also refuses while any other BOSH guest in the cluster still lacks an owner tag, so we adopt the deployed Directors first. Their VMs then carry the UUIDs that `bosh env` prints, and if we paste one of those UUIDs in place of the `director_id`, the cluster-wide check finds it on the deployed Director's VMs and refuses. That check has one gap. A Director with no deployments yet has no VMs that carry its UUID, so nothing in the cluster contradicts a create-env run that uses its `bosh env` UUID by mistake, and we rely on copying the `director_id` from the state file. The report's OWNERSHIP UNKNOWN section prints these commands with `--deployment` and `--vmid` for each create-env VM.
 
-The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any VM that failed, and 2 for a usage error, which includes a UUID that isn't one and `bosh-init` without a selector. With `--json`, a dry run prints the plan and an `--apply` run prints the result with an outcome for each VM.
+The exit code is 0 for success, 1 for a runtime, config, or refusal error or for any VM that failed, and 2 for a usage error, which includes a missing `--deployment`, an empty deployment name, and a UUID that isn't one. With `--json`, a dry run prints the plan and an `--apply` run prints the result with an outcome for each VM.
 
 ## Safe teardown ordering
 
