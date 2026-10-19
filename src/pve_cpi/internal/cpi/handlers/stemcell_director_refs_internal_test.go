@@ -207,6 +207,108 @@ func TestRegisterStemcellDirectorRef_EmptyUUID_UsesSentinelAndWarns(t *testing.T
 	}
 }
 
+// paddedProvenanceDesc returns a provenance description holding refs, padded
+// through a foreign key to n bytes.
+func paddedProvenanceDesc(t *testing.T, n int, refs ...string) string {
+	t.Helper()
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	base := `{"name":"test","version":"1.0","sha8":"ab12cd34","created":"2026-08-03T00:00:00Z","director_refs":` +
+		string(refsJSON) + `,"pad":"`
+	return base + strings.Repeat("x", n-len(base)-len(`"}`)) + `"}`
+}
+
+func TestRegisterStemcellDirectorRef_DescriptionNearLimit_WarnsAndWrites(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	logger, err := log.NewLogger("warn", &buf)
+	if err != nil {
+		t.Fatalf("log.NewLogger: %v", err)
+	}
+	desc := paddedProvenanceDesc(t, 7400, "director-b")
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc, "tags": "bosh-stemcell-cache;director--director-b"}, nil
+	})
+
+	if err := registerStemcellDirectorRef(context.Background(), deps, logger, "pve-node1", 6042, "director-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "near PVE's size limit") || !strings.Contains(buf.String(), "description_bytes") {
+		t.Errorf("expected a near-limit Warn naming the size, got: %s", buf.String())
+	}
+	if len(*calls) != 1 || (*calls)[0].description == nil {
+		t.Fatalf("expected the description write to go ahead, got %+v", *calls)
+	}
+	if n := len(*(*calls)[0].description); n <= 7400 || n > pveDescriptionMaxBytes {
+		t.Errorf("written description is %d bytes; want between 7400 and %d", n, pveDescriptionMaxBytes)
+	}
+}
+
+func TestRegisterStemcellDirectorRef_DescriptionFarFromLimit_NoWarn(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	logger, err := log.NewLogger("warn", &buf)
+	if err != nil {
+		t.Fatalf("log.NewLogger: %v", err)
+	}
+	desc := paddedProvenanceDesc(t, 2000, "director-b")
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc}, nil
+	})
+	if err := registerStemcellDirectorRef(context.Background(), deps, logger, "pve-node1", 6042, "director-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(buf.String(), "size limit") {
+		t.Errorf("unexpected size Warn: %s", buf.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected one write, got %+v", *calls)
+	}
+}
+
+func TestRegisterStemcellDirectorRef_DescriptionOverLimit_ErrorsWithoutWrite(t *testing.T) {
+	t.Parallel()
+
+	desc := paddedProvenanceDesc(t, pveDescriptionMaxBytes-4, "director-b")
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc, "tags": "bosh-stemcell-cache;bosh-destroy-pending"}, nil
+	})
+
+	err := registerStemcellDirectorRef(context.Background(), deps, deps.Logger, "pve-node1", 6042, "director-a")
+	if err == nil {
+		t.Fatal("expected an error when the description would pass PVE's limit")
+	}
+	for _, want := range []string{"8192-byte limit", "director-a", "stemcell-refs prune --director"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err.Error(), want)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("expected no write past the limit, got %+v", *calls)
+	}
+}
+
+func TestRegisterStemcellDirectorRef_RefAlreadyPresent_NoSizeCheck(t *testing.T) {
+	t.Parallel()
+
+	// A description already over the limit, written by hand, must not block a
+	// director that already holds a ref: nothing grows, so nothing is checked.
+	desc := paddedProvenanceDesc(t, pveDescriptionMaxBytes+100, "director-a")
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc, "tags": "bosh-stemcell-cache;director--director-a"}, nil
+	})
+	if err := registerStemcellDirectorRef(context.Background(), deps, deps.Logger, "pve-node1", 6042, "director-a"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("expected no write for an idempotent register, got %+v", *calls)
+	}
+}
+
 func TestRegisterStemcellDirectorRef_InvalidVMID(t *testing.T) {
 	t.Parallel()
 	deps, _ := buildDirectorRefsDeps(nil)
@@ -259,6 +361,178 @@ func TestDeregisterStemcellDirectorRef_RefsRemain_NoDestroy(t *testing.T) {
 	writtenProv, ok := parseStemcellProvenanceFromDescription(*(*calls)[0].description)
 	if !ok || len(writtenProv.DirectorRefs) != 1 || writtenProv.DirectorRefs[0] != "director-b" {
 		t.Errorf("written description DirectorRefs = %+v (ok=%v), want [director-b]", writtenProv.DirectorRefs, ok)
+	}
+}
+
+// deregisterTagsCase runs the delete_stemcell deregister wrapper against a
+// template with the given refs and tags and returns the single write it made.
+func deregisterTagsCase(t *testing.T, refs []string, tags, departing string) dirRefCall {
+	t.Helper()
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	desc := `{"name":"test","version":"1.0","sha8":"ab12cd34","created":"2026-08-03T00:00:00Z","director_refs":` +
+		string(refsJSON) + `}`
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc, "tags": tags}, nil
+	})
+	destroy := recordingDestroy(calls, nil)
+	destroyed, _, err := deregisterStemcellDirectorRef(context.Background(), deps, deps.Logger, "pve-node1", 6042,
+		departing, destroy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if destroyed {
+		t.Fatal("expected destroyed=false when refs remain")
+	}
+	if len(*calls) != 1 || (*calls)[0].kind != "update" {
+		t.Fatalf("expected exactly one update call, got %+v", *calls)
+	}
+	if (*calls)[0].description == nil {
+		t.Fatal("expected the ref removal and the tag change in one write")
+	}
+	return (*calls)[0]
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_DropsDepartingDirectorTag pins
+// that a director leaving a template other directors still hold takes its own
+// director tag with it, in the same write as the ref removal, and leaves the
+// remaining holders' tags alone.
+func TestDeregisterStemcellDirectorRef_RefsRemain_DropsDepartingDirectorTag(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"director-a", "director-b"},
+		"bosh-stemcell-cache;director--director-a;director--director-b", "director-a")
+	if got.tags == nil {
+		t.Fatal("expected a tags write dropping director--director-a")
+	}
+	tags := parseTagsField(*got.tags)
+	if stringSliceContains(tags, "director--director-a") {
+		t.Errorf("departing director tag still present: %q", *got.tags)
+	}
+	for _, want := range []string{"director--director-b", stemcellCacheTag} {
+		if !stringSliceContains(tags, want) {
+			t.Errorf("tag %q lost: %q", want, *got.tags)
+		}
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_LastMarker_AddsCacheTag pins
+// that dropping the departing tag never leaves the template without a
+// generation marker: when it was the only one, bosh-stemcell-cache is added in
+// the same write.
+func TestDeregisterStemcellDirectorRef_RefsRemain_LastMarker_AddsCacheTag(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"director-a", "director-b"},
+		"bosh-stemcell-sha-ab12cd34;director--director-a", "director-a")
+	if got.tags == nil {
+		t.Fatal("expected a tags write")
+	}
+	tags := parseTagsField(*got.tags)
+	if stringSliceContains(tags, "director--director-a") {
+		t.Errorf("departing director tag still present: %q", *got.tags)
+	}
+	if !stringSliceContains(tags, stemcellCacheTag) {
+		t.Errorf("expected %s added as the generation marker: %q", stemcellCacheTag, *got.tags)
+	}
+	if !pve.HasStemcellGenerationMarker(tags) {
+		t.Errorf("written tags carry no generation marker: %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_NoTag_DescriptionOnly pins that
+// a template which never carried the departing director's tag gets the ref
+// removal alone, with no tags field in the write.
+func TestDeregisterStemcellDirectorRef_RefsRemain_NoTag_DescriptionOnly(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"director-a", "director-b"},
+		"bosh-stemcell-cache;director--director-b", "director-a")
+	if got.tags != nil {
+		t.Errorf("expected no tags write, got %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_TagSharedByRemainingRef_Kept
+// pins that a tag which still maps to a remaining ref (two refs that sanitize
+// to the same tag) stays.
+func TestDeregisterStemcellDirectorRef_RefsRemain_TagSharedByRemainingRef_Kept(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"director.a", "director_a"},
+		"bosh-stemcell-cache;director--director-a", "director.a")
+	if got.tags != nil {
+		t.Errorf("expected no tags write while director_a still maps to the tag, got %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_RefsRemain_StaleTagWithoutRef_Dropped pins
+// that a departing director whose ref was already gone from the set still has
+// its leftover tag removed while other refs remain.
+func TestDeregisterStemcellDirectorRef_RefsRemain_StaleTagWithoutRef_Dropped(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{"director-b"},
+		"bosh-stemcell-cache;director--director-a;director--director-b", "director-a")
+	if got.tags == nil {
+		t.Fatal("expected a tags write dropping the stale director--director-a")
+	}
+	if stringSliceContains(parseTagsField(*got.tags), "director--director-a") {
+		t.Errorf("stale director tag still present: %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_EmptyUUID_RefsRemain_DropsSentinelTag pins
+// that the unknown-director sentinel follows the same rule as a real UUID.
+func TestDeregisterStemcellDirectorRef_EmptyUUID_RefsRemain_DropsSentinelTag(t *testing.T) {
+	t.Parallel()
+
+	got := deregisterTagsCase(t, []string{unknownDirectorRef, "director-b"},
+		"bosh-stemcell-cache;director--unknown-director;director--director-b", "")
+	if got.tags == nil {
+		t.Fatal("expected a tags write dropping director--unknown-director")
+	}
+	tags := parseTagsField(*got.tags)
+	if stringSliceContains(tags, "director--unknown-director") {
+		t.Errorf("sentinel director tag still present: %q", *got.tags)
+	}
+	if !stringSliceContains(tags, "director--director-b") {
+		t.Errorf("remaining holder's tag lost: %q", *got.tags)
+	}
+}
+
+// TestDeregisterStemcellDirectorRef_LastRef_KeepsDirectorTag pins that the
+// last holder's tag survives: branch (e) only stamps the pending marker, so a
+// template whose destroy fails stays reachable by this director's orphan
+// prune, which requires the director tag.
+func TestDeregisterStemcellDirectorRef_LastRef_KeepsDirectorTag(t *testing.T) {
+	t.Parallel()
+
+	desc := `{"name":"test","version":"1.0","sha8":"ab12cd34","created":"2026-08-03T00:00:00Z","director_refs":["director-a"]}`
+	deps, calls := buildDirectorRefsDeps(func(_ context.Context, _ string, _ int) (map[string]any, error) {
+		return map[string]any{"description": desc, "tags": "bosh-stemcell-cache;director--director-a"}, nil
+	})
+	destroy := recordingDestroy(calls, nil)
+
+	destroyed, _, err := deregisterStemcellDirectorRef(context.Background(), deps, deps.Logger, "pve-node1", 6042,
+		"director-a", destroy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !destroyed {
+		t.Fatal("expected destroyed=true on the last ref")
+	}
+	if len(*calls) != 2 || (*calls)[0].kind != "update" || (*calls)[0].tags == nil {
+		t.Fatalf("expected a pending-tag stamp then destroy, got %+v", *calls)
+	}
+	stamped := parseTagsField(*(*calls)[0].tags)
+	if !stringSliceContains(stamped, "director--director-a") {
+		t.Errorf("last holder's director tag dropped: %q", *(*calls)[0].tags)
+	}
+	if !stringSliceContains(stamped, stemcellDestroyPendingTag) {
+		t.Errorf("pending tag missing: %q", *(*calls)[0].tags)
 	}
 }
 

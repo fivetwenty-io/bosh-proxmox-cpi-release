@@ -82,7 +82,10 @@ import (
 //     semantics; see selectStemcellAnchor). Otherwise
 //     deregisterStemcellDirectorRef removes this request's director UUID
 //     from the anchor's ref set under a per-VMID cluster lock (held only for
-//     the fast read-modify-write); when that was the LAST ref, destroy runs
+//     the fast read-modify-write); while other refs remain, the same write
+//     drops this director's "director--" tag (adding bosh-stemcell-cache if
+//     that tag was the last generation marker); when that was the LAST ref,
+//     the tag stays and destroy runs
 //     after the lock releases, still BEFORE the ref set is ever rewritten as
 //     empty (the trapdoor fix — a failed destroy leaves the template's
 //     provenance untouched, retried next call via the bosh-destroy-pending
@@ -129,9 +132,11 @@ import (
 //     template for a different stemcell is healthy cache), and never when
 //     its VMID is one
 //     this call already handled above (excludeVMIDs); the marker tag alone
-//     is not sufficient (nothing ever removes it on deregistration) and an
-//     unfiltered destroy can hit a template this director still actively
-//     references for a DIFFERENT stemcell.
+//     is not sufficient (deregistration keeps it when the ref set empties,
+//     templates from earlier releases carry stale ones, and this director
+//     can hold a live ref on a template for a DIFFERENT stemcell), so an
+//     unfiltered destroy could hit a template this director still actively
+//     references.
 func HandleDeleteStemcell(deps Deps) cpi.Handler {
 	return cpi.HandlerFunc(func(ctx context.Context, args []json.RawMessage, reqCtx jsonrpc.Context) (any, error) {
 		deps, err := deps.WithRequestOverrides(ctx, reqCtx)
@@ -775,10 +780,12 @@ func extractSHA8FromPathCIDVolume(volumePath string) (sha8 string, ok bool) {
 
 // pruneOrphanStemcellTemplates scans cluster-wide for candidate template VMs
 // carrying both stemcellMarkerTag and "director--<sanitized directorUUID>" —
-// but the tag pair alone is NOT sufficient to prune: nothing ever removes
-// "director--<uuid>" on deregistration (it is a historical, write-only
-// marker), so a template this director actively references for a DIFFERENT
-// stemcell still carries it. Before destroying a candidate, its OWN
+// but the tag pair alone is NOT sufficient to prune. Deregistration drops
+// "director--<uuid>" only while other refs remain; it keeps the tag when the
+// ref set empties (so a template whose destroy failed stays reachable here),
+// templates from earlier releases still carry stale tags, and a template this
+// director actively references for a DIFFERENT stemcell carries it as a
+// current holder. Before destroying a candidate, its OWN
 // provenance director_refs is read and checked
 // (directorRefsAllowPrune): only a candidate whose live ref set is empty, or
 // whose sole ref is this director's UUID while its provenance sha8 matches

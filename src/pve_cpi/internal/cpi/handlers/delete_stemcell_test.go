@@ -1387,9 +1387,10 @@ func TestDeleteStemcell_OrphanPrune_DryRun_NoDeletion(t *testing.T) {
 // The marker+director tag pair alone is not sufficient to prune — a
 // candidate whose OWN provenance director_refs still names a director OTHER
 // than (or in addition to) this request's director UUID must be skipped,
-// because nothing ever removes the "director--<uuid>" tag on deregistration
-// and the candidate may still be a live cache for a DIFFERENT stemcell this
-// director (or another) actively references.
+// because the "director--<uuid>" tag stays when a deregister empties the set,
+// templates from earlier releases carry stale tags, and the candidate may
+// still be a live cache for a DIFFERENT stemcell this director (or another)
+// actively references.
 func TestDeleteStemcell_OrphanPrune_CandidateWithForeignRef_NotPruned(t *testing.T) {
 	t.Parallel()
 

@@ -196,17 +196,21 @@ func runStemcellRefsTest(t *testing.T, client pve.Client, args ...string) (int, 
 func TestStemcellRefsUsageErrors(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
 	cases := map[string][]string{
-		"no action":            {},
-		"unknown action":       {"purge", "--config", cfgPath},
-		"missing config":       {"report"},
-		"bad flag":             {"report", "--config", cfgPath, "--nope"},
-		"positional":           {"report", "--config", cfgPath, "extra"},
-		"both targets":         {"prune", "--config", cfgPath, "--director", "x", "--vmid", "5"},
-		"no target":            {"prune", "--config", cfgPath},
-		"blank director":       {"prune", "--config", cfgPath, "--director", "   "},
-		"zero vmid":            {"prune", "--config", cfgPath, "--vmid", "0"},
-		"allow-owned on vmid":  {"prune", "--config", cfgPath, "--vmid", "5", "--allow-owned-vms"},
-		"prune flag on report": {"report", "--config", cfgPath, "--apply"},
+		"no action":              {},
+		"unknown action":         {"purge", "--config", cfgPath},
+		"missing config":         {"report"},
+		"bad flag":               {"report", "--config", cfgPath, "--nope"},
+		"positional":             {"report", "--config", cfgPath, "extra"},
+		"both targets":           {"prune", "--config", cfgPath, "--director", "x", "--vmid", "5"},
+		"no target":              {"prune", "--config", cfgPath},
+		"blank director":         {"prune", "--config", cfgPath, "--director", "   "},
+		"zero vmid":              {"prune", "--config", cfgPath, "--vmid", "0"},
+		"allow-owned on vmid":    {"prune", "--config", cfgPath, "--vmid", "5", "--allow-owned-vms"},
+		"prune flag on report":   {"report", "--config", cfgPath, "--apply"},
+		"reconcile and director": {"prune", "--config", cfgPath, "--reconcile-tags", "--director", "x"},
+		"reconcile and vmid":     {"prune", "--config", cfgPath, "--reconcile-tags", "--vmid", "5"},
+		"reconcile allow-owned":  {"prune", "--config", cfgPath, "--reconcile-tags", "--allow-owned-vms"},
+		"reconcile on report":    {"report", "--config", cfgPath, "--reconcile-tags"},
 	}
 	for name, args := range cases {
 		code, _, stderr := runStemcellRefsTest(t, &refsCLIClient{}, args...)
@@ -467,5 +471,107 @@ func TestStemcellRefsApplyTextShowsDowngradedReplica(t *testing.T) {
 	}
 	if strings.Contains(text, "remove-ref-and-destroy vmid 150 (bosh-stemcell-a-1-aaaa1111 on pve-node2), replica: applied") {
 		t.Errorf("apply text reports the planned destroy as applied:\n%s", text)
+	}
+}
+
+// reconcileCLIClient holds 101 with a stale tag for old-uuid beside its own
+// tag for new-uuid, and 102 whose stale tag is its only marker.
+func reconcileCLIClient() *refsCLIClient {
+	desc := func(sha8, refs string) string {
+		return `{"name":"a","version":"1","sha8":"` + sha8 + `","kind":"heavy","director_refs":` + refs + `}`
+	}
+	return &refsCLIClient{pools: &refsCLIPools{}, guests: []refsCLIGuest{
+		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--old-uuid;director--new-uuid",
+			desc: desc("aaaa1111", `["new-uuid"]`)},
+		{vmid: 102, name: "bosh-stemcell-b-1-bbbb2222", template: true,
+			tags: "bosh-stemcell-sha-bbbb2222;director--old-uuid", desc: desc("bbbb2222", `["new-uuid"]`)},
+	}}
+}
+
+func TestStemcellRefsPruneReconcileTagsDryRun(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	client := reconcileCLIClient()
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--reconcile-tags")
+	if code != 0 {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"remove-tags vmid 101 (bosh-stemcell-a-1-aaaa1111 on pve), removes tags director--old-uuid, " +
+			"keeps tags director--new-uuid",
+		"remove-tags vmid 102 (bosh-stemcell-b-1-bbbb2222 on pve), removes tags director--old-uuid, " +
+			"adds tag bosh-stemcell-cache",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, stdout)
+		}
+	}
+	if client.writes != 0 {
+		t.Fatalf("dry run wrote %d times", client.writes)
+	}
+
+	code, stdout, stderr = runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--reconcile-tags", "--json")
+	if code != 0 {
+		t.Fatalf("JSON dry run: exit %d stderr %q", code, stderr)
+	}
+	var plan handlers.StemcellRefsPlan
+	if err := json.Unmarshal([]byte(stdout), &plan); err != nil {
+		t.Fatalf("plan JSON: %v\n%s", err, stdout)
+	}
+	if plan.Mode != "reconcile-tags" || len(plan.Actions) != 2 ||
+		plan.Actions[0].Kind != handlers.StemcellRefsActionRemoveTags {
+		t.Fatalf("plan = %+v", plan)
+	}
+}
+
+func TestStemcellRefsPruneReconcileTagsApply(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	client := reconcileCLIClient()
+	code, stdout, stderr := runStemcellRefsTest(t, client, "prune", "--config", cfgPath, "--reconcile-tags", "--apply")
+	if code != 0 {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "removed tags director--old-uuid") ||
+		!strings.Contains(stdout, "added tag bosh-stemcell-cache") {
+		t.Fatalf("stdout %q", stdout)
+	}
+	for _, g := range client.guests {
+		if strings.Contains(g.tags, "director--old-uuid") || !strings.Contains(g.desc, "new-uuid") {
+			t.Errorf("vmid %d after apply: tags %q desc %s", g.vmid, g.tags, g.desc)
+		}
+	}
+	if !strings.Contains(client.guests[0].tags, "director--new-uuid") {
+		t.Errorf("101 lost the tag its ref backs: %q", client.guests[0].tags)
+	}
+	if !strings.Contains(client.guests[1].tags, "bosh-stemcell-cache") {
+		t.Errorf("102 has no generation marker: %q", client.guests[1].tags)
+	}
+	if client.writes != 2 {
+		t.Errorf("writes = %d, want one tags write per template", client.writes)
+	}
+	if len(client.pools.claims) != 0 {
+		t.Errorf("lock pools left behind: %v", client.pools.claims)
+	}
+}
+
+func TestStemcellRefsReportTextFlagsDescriptionNearLimit(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	desc := `{"name":"a","version":"1","sha8":"aaaa1111","kind":"heavy","director_refs":["new-uuid"],"pad":"` +
+		strings.Repeat("x", 7300) + `"}`
+	client := &refsCLIClient{guests: []refsCLIGuest{
+		{vmid: 101, name: "bosh-stemcell-a-1-aaaa1111", template: true,
+			tags: "bosh-stemcell-cache;bosh-stemcell-sha-aaaa1111;director--new-uuid", desc: desc},
+	}}
+	code, stdout, stderr := runStemcellRefsTest(t, client, "report", "--config", cfgPath)
+	if code != 0 {
+		t.Fatalf("exit %d stderr %q", code, stderr)
+	}
+	for _, want := range []string{
+		"description " + strconv.Itoa(len(desc)) + " bytes, near the 8192-byte limit",
+		"1 template(s) have a description within 1024 bytes of PVE's 8192-byte limit",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("report lacks %q:\n%s", want, stdout)
+		}
 	}
 }

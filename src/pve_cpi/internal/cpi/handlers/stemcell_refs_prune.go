@@ -5,8 +5,9 @@ package handlers
 // A rebuilt director gets a new UUID, and its old UUID stays in director_refs
 // on every stemcell cache template it registered. No CPI call ever removes
 // it, so those templates can never be freed. `cpi stemcell-refs` reports the
-// refs on every cache template and prunes one named ref, or frees one
-// unreferenced template, on an operator's say-so.
+// refs on every cache template and prunes one named ref, frees one
+// unreferenced template, or drops the director tags no ref backs, on an
+// operator's say-so.
 //
 // The work splits into four exported pieces so cmd/cpi stays thin:
 //
@@ -42,7 +43,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 )
 
-// Action kinds a StemcellRefsPlan can hold. The first five mutate PVE on
+// Action kinds a StemcellRefsPlan can hold. The first six mutate PVE on
 // apply; blocked and skip never do.
 const (
 	// StemcellRefsActionRemoveRef removes the ref from a template that keeps
@@ -58,6 +59,10 @@ const (
 	// StemcellRefsActionRemoveTag removes a director tag from a template
 	// whose description does not hold the ref. It never destroys.
 	StemcellRefsActionRemoveTag = "remove-tag"
+	// StemcellRefsActionRemoveTags removes every director tag that no
+	// description ref maps to (--reconcile-tags). It never changes the
+	// description and never destroys.
+	StemcellRefsActionRemoveTags = "remove-tags"
 	// StemcellRefsActionDestroy destroys one unreferenced template (--vmid).
 	StemcellRefsActionDestroy = "destroy"
 	// StemcellRefsActionBlocked is a template the request names that the
@@ -126,13 +131,22 @@ type StemcellRefsTemplate struct {
 	// DescriptionRefs is the description's director_refs set, the only
 	// source of truth for whether the template stays.
 	DescriptionRefs []string `json:"description_refs"`
-	// DirectorTags is every director-- tag, which is write-only history.
+	// DirectorTags is every director-- tag. delete_stemcell drops a departing
+	// director's tag while other refs remain, so the tags name the directors
+	// that hold the template, but a template from an earlier release can
+	// still carry stale ones, which prune --reconcile-tags removes.
 	DirectorTags []string `json:"director_tags"`
 	// RefsTagsDisagree is true when the sanitized description refs and the
 	// director tag values are not the same set.
 	RefsTagsDisagree bool `json:"refs_tags_disagree"`
 	// DescriptionState is provenance, blank, unparseable, or unread.
 	DescriptionState string `json:"description_state"`
+	// DescriptionBytes is the description's length in bytes, which PVE caps
+	// at 8192. It is 0 when the config could not be read.
+	DescriptionBytes int `json:"description_bytes"`
+	// DescriptionNearLimit is true when the description is within 1024 bytes
+	// of that cap, so registering more refs may soon fail.
+	DescriptionNearLimit bool `json:"description_near_limit"`
 	// Replica is true for per-node and per-storage replicas, whose refs are
 	// a fossil of their creation.
 	Replica        bool `json:"replica"`
@@ -262,6 +276,8 @@ func scanStemcellTemplate(g pve.GuestRef, cfg map[string]any, cfgErr error) (Ste
 		t.Tags = parseTagsField(stringConfigField(cfg, jsonKeyTags))
 		t.description = stringConfigField(cfg, pveConfigKeyDescription)
 		t.cfgName = stringConfigField(cfg, pveConfigKeyName)
+		t.DescriptionBytes = len(t.description)
+		t.DescriptionNearLimit = stemcellDescriptionNearLimit(t.DescriptionBytes)
 		if t.cfgName != "" {
 			t.Name = t.cfgName
 		}
@@ -407,8 +423,12 @@ func linkedCloneBases(cfg map[string]any, self int64) []int64 {
 }
 
 // StemcellRefsPruneRequest names what a prune acts on. Exactly one of
-// DirectorRef and VMID is set.
+// DirectorRef, VMID, and ReconcileTags is set.
 type StemcellRefsPruneRequest struct {
+	// ReconcileTags plans the removal of every director tag that no
+	// description ref maps to, on every cache template the scan can read.
+	// It never removes a ref and never destroys anything.
+	ReconcileTags bool
 	// DirectorRef is trimmed, then matched against description refs by
 	// trimmed equality, and through directorTagFor against tags.
 	DirectorRef string
@@ -465,7 +485,12 @@ type StemcellRefsAction struct {
 	RemainingRefs []string `json:"remaining_refs,omitempty"`
 	// DropTag is the director tag the action removes.
 	DropTag string `json:"drop_tag,omitempty"`
-	// AddsCacheMarker is true when removing DropTag would leave the kept
+	// DropTags lists the director tags a remove-tags action removes.
+	DropTags []string `json:"drop_tags,omitempty"`
+	// KeptTags lists the director tags a remove-tags action keeps, because
+	// a description ref maps to each one.
+	KeptTags []string `json:"kept_tags,omitempty"`
+	// AddsCacheMarker is true when removing DropTag or DropTags would leave the kept
 	// template with no generation marker, so the same write adds
 	// bosh-stemcell-cache to keep it visible to delete_stemcell.
 	AddsCacheMarker bool `json:"adds_cache_marker,omitempty"`
@@ -492,8 +517,8 @@ type StemcellRefsAction struct {
 // Mutating reports whether applying the action changes PVE.
 func (a StemcellRefsAction) Mutating() bool {
 	switch a.Kind {
-	case StemcellRefsActionRemoveRef, StemcellRefsActionRemoveRefAndDestroy,
-		StemcellRefsActionResumeDestroy, StemcellRefsActionRemoveTag, StemcellRefsActionDestroy:
+	case StemcellRefsActionRemoveRef, StemcellRefsActionRemoveRefAndDestroy, StemcellRefsActionResumeDestroy,
+		StemcellRefsActionRemoveTag, StemcellRefsActionRemoveTags, StemcellRefsActionDestroy:
 		return true
 	}
 	return false
@@ -511,7 +536,7 @@ func (a StemcellRefsAction) destroys() bool {
 // StemcellRefsPlan is what a prune will do. The dry run prints it and the
 // apply executes it unchanged.
 type StemcellRefsPlan struct {
-	// Mode is "director" or "vmid".
+	// Mode is "director", "vmid", or "reconcile-tags".
 	Mode        string `json:"mode"`
 	DirectorRef string `json:"director_ref,omitempty"`
 	DirectorTag string `json:"director_tag,omitempty"`
@@ -552,6 +577,11 @@ func (p StemcellRefsPlan) HasFailures() bool {
 func PlanStemcellRefsPrune(scan StemcellRefsScan, req StemcellRefsPruneRequest) (StemcellRefsPlan, error) {
 	ref := strings.TrimSpace(req.DirectorRef)
 	switch {
+	case req.ReconcileTags && (ref != "" || req.VMID != 0):
+		return StemcellRefsPlan{}, cpierrors.Cloud("stemcell-refs: reconcile tags on its own, without a director ref or a VMID")
+	case req.ReconcileTags && req.AllowOwnedVMs:
+		return StemcellRefsPlan{}, cpierrors.Cloud("stemcell-refs: allowing owned VMs applies only to a director ref")
+	case req.ReconcileTags:
 	case ref != "" && req.VMID != 0:
 		return StemcellRefsPlan{}, cpierrors.Cloud("stemcell-refs: name a director ref or a VMID, not both")
 	case ref == "" && req.VMID <= 0:
@@ -562,13 +592,70 @@ func PlanStemcellRefsPrune(scan StemcellRefsScan, req StemcellRefsPruneRequest) 
 		CloneScanComplete: scan.CloneScanComplete,
 		ScanErrors:        scan.ScanErrors,
 	}
-	if ref != "" {
+	switch {
+	case req.ReconcileTags:
+		// Reconciling never destroys, so it has no replicas to sweep.
+		planReconcileTags(scan, &plan)
+		return plan, nil
+	case ref != "":
 		planDirectorPrune(scan, ref, req.AllowOwnedVMs, &plan)
-	} else {
+	default:
 		planVMIDPrune(scan, req.VMID, &plan)
 	}
 	attachReplicaSweeps(scan, &plan)
 	return plan, nil
+}
+
+// planReconcileTags plans prune --reconcile-tags. Every cache template whose
+// description refs are known gets one remove-tags action when it carries a
+// director tag that none of those refs maps to; the action keeps every tag a
+// ref maps to and adds bosh-stemcell-cache when the drops would leave no
+// generation marker. A template whose refs are unknown (unread, unparseable,
+// or a blank description that is not legacy) and that carries a director tag
+// gets a non-failing skip, and so does a template already marked
+// bosh-destroy-pending, whose tags the destroy is about to make moot.
+// Nothing here removes a ref or destroys a template, because the description
+// refs alone decide whether a template stays.
+func planReconcileTags(scan StemcellRefsScan, plan *StemcellRefsPlan) {
+	plan.Mode = stemcellRefsModeReconcileTags
+	for i := range scan.Templates {
+		t := &scan.Templates[i]
+		if len(t.DirectorTags) == 0 {
+			continue
+		}
+		switch {
+		case t.DescriptionState == stemcellRefsDescUnread:
+			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
+				"config could not be read, so its refs are unknown: "+t.ReadError, false))
+			continue
+		case t.DescriptionState == stemcellRefsDescUnparseable:
+			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
+				"description does not parse as provenance JSON, so its refs are unknown and its tags stay", false))
+			continue
+		case t.RefsUnknown:
+			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
+				"blank description on a template that carries director or cache tags, so its refs are unknown "+
+					"and its tags stay", false))
+			continue
+		case t.DestroyPending:
+			plan.Actions = append(plan.Actions, skipStemcellRefsAction(t,
+				"destroy already pending; its tags stay until the destroy finishes", false))
+			continue
+		}
+		kept, dropped, added := reconcileDirectorTags(t.Tags, t.DescriptionRefs)
+		if len(dropped) == 0 {
+			continue
+		}
+		act := newStemcellRefsAction(StemcellRefsActionRemoveTags, t)
+		act.DropTags = dropped
+		act.AddsCacheMarker = added
+		for _, tok := range kept {
+			if strings.HasPrefix(tok, directorTagPrefix) {
+				act.KeptTags = append(act.KeptTags, tok)
+			}
+		}
+		plan.Actions = append(plan.Actions, act)
+	}
 }
 
 // newStemcellRefsAction starts an action for template t.
@@ -701,7 +788,10 @@ func planDirectorOwnership(scan StemcellRefsScan, ref string, allowOwned bool, p
 }
 
 // stemcellRefsTagKept explains a director tag the plan keeps.
-const stemcellRefsTagKept = "kept: another ref maps to it, or it is the template's only generation marker"
+const stemcellRefsTagKept = "kept: another ref the template holds maps to it"
+
+// stemcellRefsModeReconcileTags is the plan mode of prune --reconcile-tags.
+const stemcellRefsModeReconcileTags = "reconcile-tags"
 
 // skipStemcellRefsAction is a skip on t with reason.
 func skipStemcellRefsAction(t *StemcellRefsTemplate, reason string, failure bool) StemcellRefsAction {
@@ -804,8 +894,9 @@ func planDirectorRemoveRef(scan StemcellRefsScan, t *StemcellRefsTemplate, match
 	act.MatchedRef = matched
 	act.RemainingRefs = remaining
 	if tagTok != "" {
-		if _, dropped := dropDirectorTag(t.Tags, tagTok, remaining); dropped {
+		if _, dropped, added := dropDirectorTagForKept(t.Tags, tagTok, remaining); dropped {
 			act.DropTag = tagTok
+			act.AddsCacheMarker = added
 		} else {
 			act.Reason = "tag " + tagTok + " " + stemcellRefsTagKept
 		}
@@ -1273,6 +1364,13 @@ func applyStemcellRefsAction(
 		if err == nil && gone {
 			r.Outcome = StemcellRefsOutcomeGone
 		}
+	case StemcellRefsActionRemoveTags:
+		var gone bool
+		gone, r.TagRemoved, r.CacheMarkerAdded, err = reconcileStemcellDirectorTagsLocked(ctx, deps, alog, act.Node,
+			act.VMID, verify)
+		if err == nil && gone {
+			r.Outcome = StemcellRefsOutcomeGone
+		}
 	case StemcellRefsActionDestroy:
 		var gone bool
 		gone, err = destroyUnreferencedTemplateLocked(ctx, deps, alog, act.Node, act.VMID, verify, destroy)
@@ -1417,8 +1515,58 @@ func removeStemcellDirectorTagLocked(
 	dropTag string,
 	verify func(cfg map[string]any) error,
 ) (gone, removed, markerAdded bool, err error) {
-	vmidInt := int(vmid) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
 	owner := fmt.Sprintf("stemcell/director_ref/prune_tag/%d", vmid)
+	return rewriteStemcellTagsLocked(ctx, deps, logger, node, vmid, owner, verify,
+		func(tags, refs []string, _ bool) ([]string, bool, bool) {
+			return dropDirectorTagForKept(tags, dropTag, refs)
+		})
+}
+
+// reconcileStemcellDirectorTagsLocked is the apply of a remove-tags action
+// (--reconcile-tags). Under the per-VMID lock it re-reads the template, calls
+// verify on that read, and drops every director tag no description ref maps
+// to, through reconcileDirectorTags, adding bosh-stemcell-cache in the same
+// write when no generation marker would be left. It never touches the
+// description and never destroys.
+func reconcileStemcellDirectorTagsLocked(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	vmid int64,
+	verify func(cfg map[string]any) error,
+) (gone, removed, markerAdded bool, err error) {
+	owner := fmt.Sprintf("stemcell/director_ref/reconcile_tags/%d", vmid)
+	return rewriteStemcellTagsLocked(ctx, deps, logger, node, vmid, owner, verify,
+		func(tags, refs []string, refsKnown bool) ([]string, bool, bool) {
+			if !refsKnown {
+				// The verifier already proved the description is the one
+				// the plan parsed; this keeps a description that does not
+				// parse from ever reading as an empty ref set.
+				return tags, false, false
+			}
+			kept, dropped, added := reconcileDirectorTags(tags, refs)
+			return kept, len(dropped) > 0, added
+		})
+}
+
+// rewriteStemcellTagsLocked is the locked tags-only write behind remove-tag
+// and remove-tags. Under the per-VMID lock it reads the template, reports gone
+// for a 404 or a missing pmxcfs config, calls verify, and passes the fresh
+// tags and description refs to compute. When compute reports a change, the
+// kept tags are written in one UpdateQemuConfig call, or the tags key is
+// deleted when none are left.
+func rewriteStemcellTagsLocked(
+	ctx context.Context,
+	deps Deps,
+	logger *log.Logger,
+	node string,
+	vmid int64,
+	owner string,
+	verify func(cfg map[string]any) error,
+	compute func(tags, refs []string, refsKnown bool) (kept []string, changed, markerAdded bool),
+) (gone, removed, markerAdded bool, err error) {
+	vmidInt := int(vmid) //nolint:gosec // VMID is bounded by PVE valid range (1–999999999)
 	err = withVMIDLock(ctx, deps.PVE.Pools(), vmidInt, owner, logger, func() error {
 		cfg, cfgErr := deps.PVE.QEMU().Config(ctx, node, vmidInt)
 		if cfgErr != nil {
@@ -1434,9 +1582,9 @@ func removeStemcellDirectorTagLocked(
 		}
 		description := stringConfigField(cfg, pveConfigKeyDescription)
 		tags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
-		prov, _ := parseStemcellProvenanceFromDescription(description)
-		kept, dropped, added := dropDirectorTagForKept(tags, dropTag, prov.DirectorRefs)
-		if !dropped {
+		prov, provOK := parseStemcellProvenanceFromDescription(description)
+		kept, changed, added := compute(tags, prov.DirectorRefs, provOK)
+		if !changed {
 			return nil
 		}
 		params := &sdknodes.UpdateQemuConfigParams{}
@@ -1544,11 +1692,14 @@ type StemcellRefsUnreferenced struct {
 
 // StemcellRefsReport is the read-only report.
 type StemcellRefsReport struct {
-	Templates         []StemcellRefsTemplate     `json:"templates"`
-	Refs              []StemcellRefsRefSummary   `json:"refs"`
-	Unreferenced      []StemcellRefsUnreferenced `json:"unreferenced"`
-	CloneScanComplete bool                       `json:"clone_scan_complete"`
-	ScanErrors        []string                   `json:"scan_errors,omitempty"`
+	Templates    []StemcellRefsTemplate     `json:"templates"`
+	Refs         []StemcellRefsRefSummary   `json:"refs"`
+	Unreferenced []StemcellRefsUnreferenced `json:"unreferenced"`
+	// DescriptionsNearLimit counts the templates whose description is within
+	// 1024 bytes of PVE's 8192-byte cap (DescriptionNearLimit).
+	DescriptionsNearLimit int      `json:"descriptions_near_limit"`
+	CloneScanComplete     bool     `json:"clone_scan_complete"`
+	ScanErrors            []string `json:"scan_errors,omitempty"`
 }
 
 // BuildStemcellRefsReport summarizes scan. Each ref's WouldFree and Blocked
@@ -1572,6 +1723,9 @@ func BuildStemcellRefsReport(scan StemcellRefsScan) StemcellRefsReport {
 	for i := range scan.Templates {
 		if u, ok := unreferencedStemcellTemplate(scan, &scan.Templates[i]); ok {
 			rep.Unreferenced = append(rep.Unreferenced, u)
+		}
+		if scan.Templates[i].DescriptionNearLimit {
+			rep.DescriptionsNearLimit++
 		}
 	}
 	return rep

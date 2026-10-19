@@ -371,15 +371,20 @@ func TestStemcellRefsPrune_TagOnly(t *testing.T) {
 	// 101 holds newRef in its description and only a stale tag for oldRef.
 	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, newRef),
 		cacheTemplateTags(shaA)+";director--"+oldRef+";director--"+newRef)
-	// 102's stale tag is its only generation marker, so the prune keeps it.
+	// 102's stale tag is its only generation marker, so the prune drops it
+	// and adds bosh-stemcell-cache in the same write.
 	f.addTemplate(102, "bosh-stemcell-b-1-"+shaB, provDesc(shaB, newRef), "bosh-stemcell-sha-"+shaB+";director--"+oldRef)
 
 	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
-	if a := actionFor(t, plan, 101); a.Kind != handlers.StemcellRefsActionRemoveTag || a.DropTag != "director--"+oldRef {
+	if a := actionFor(t, plan, 101); a.Kind != handlers.StemcellRefsActionRemoveTag || a.DropTag != "director--"+oldRef ||
+		a.AddsCacheMarker {
 		t.Fatalf("101 action = %+v", a)
 	}
-	if b := actionFor(t, plan, 102); b.Kind != handlers.StemcellRefsActionSkip || b.Failure {
-		t.Fatalf("102 action = %+v; want a non-failing skip that keeps the marker", b)
+	// Changed by design: 102 used to be a non-failing skip that kept the
+	// stale tag as its only marker. Tags now name current holders, so the
+	// stale tag goes and bosh-stemcell-cache takes over as the marker.
+	if b := actionFor(t, plan, 102); b.Kind != handlers.StemcellRefsActionRemoveTag || !b.AddsCacheMarker || b.Failure {
+		t.Fatalf("102 action = %+v; want a remove-tag that adds the cache marker", b)
 	}
 	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
 	if err != nil || res.Failures != 0 {
@@ -394,8 +399,14 @@ func TestStemcellRefsPrune_TagOnly(t *testing.T) {
 	if len(f.deleted) != 0 {
 		t.Errorf("tag-only prune destroyed %v", f.deleted)
 	}
-	if !strings.Contains(f.cfgString(102, "tags"), "director--"+oldRef) {
-		t.Error("102 lost its only generation marker")
+	// Changed by design, as above: 102 keeps a generation marker through
+	// bosh-stemcell-cache rather than through the stale director tag.
+	if tags := f.cfgString(102, "tags"); strings.Contains(tags, "director--"+oldRef) ||
+		!strings.Contains(tags, "bosh-stemcell-cache") {
+		t.Errorf("102 tags = %q; want the stale tag gone and bosh-stemcell-cache added", tags)
+	}
+	if got := descRefs(t, f.cfgString(102, "description")); !slices.Equal(got, []string{newRef}) {
+		t.Errorf("102 description refs changed to %v", got)
 	}
 }
 

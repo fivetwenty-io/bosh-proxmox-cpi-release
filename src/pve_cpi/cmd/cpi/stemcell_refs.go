@@ -18,7 +18,8 @@ import (
 )
 
 const stemcellRefsUsage = "usage: cpi stemcell-refs report --config PATH [--json]\n" +
-	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N) [--apply] [--json]"
+	"       cpi stemcell-refs prune --config PATH (--director REF [--allow-owned-vms] | --vmid N | --reconcile-tags) " +
+	"[--apply] [--json]"
 
 // stemcellRefsTimeout bounds one run. A scan reads every guest's config and
 // an apply can destroy several templates, each awaited, so the budget is
@@ -48,10 +49,12 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 	jsonOut := fs.Bool("json", false, "print JSON instead of text")
 	var director *string
 	var vmid *int64
-	var apply, allowOwned *bool
+	var apply, allowOwned, reconcile *bool
 	if action == "prune" {
 		director = fs.String("director", "", "director ref to remove from every stemcell cache template")
 		vmid = fs.Int64("vmid", 0, "VMID of one unreferenced stemcell cache template to destroy")
+		reconcile = fs.Bool("reconcile-tags", false,
+			"remove every director-- tag that no description ref backs, on every stemcell cache template")
 		apply = fs.Bool("apply", false, "make the changes; without it the command prints the plan and changes nothing")
 		allowOwned = fs.Bool("allow-owned-vms", false, "prune the ref even though non-template VMs still carry its owner tag")
 	}
@@ -66,7 +69,7 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 		fmt.Fprintln(stderr, stemcellRefsUsage)
 		return 2
 	}
-	if problem := stemcellRefsUsageProblem(action, fs, *configPath, director, vmid, allowOwned); problem != "" {
+	if problem := stemcellRefsUsageProblem(action, fs, *configPath, director, vmid, allowOwned, reconcile); problem != "" {
 		fmt.Fprintln(stderr, problem)
 		fmt.Fprintln(stderr, stemcellRefsUsage)
 		return 2
@@ -103,7 +106,7 @@ func runStemcellRefs(args []string, stdout, stderr io.Writer, opts runOptions) i
 	}
 
 	req := handlers.StemcellRefsPruneRequest{
-		DirectorRef: strings.TrimSpace(*director), VMID: *vmid, AllowOwnedVMs: *allowOwned,
+		DirectorRef: strings.TrimSpace(*director), VMID: *vmid, AllowOwnedVMs: *allowOwned, ReconcileTags: *reconcile,
 	}
 	plan, err := handlers.PlanStemcellRefsPrune(scan, req)
 	if err != nil {
@@ -144,7 +147,9 @@ func warnStemcellRefsNoMatch(stderr io.Writer, plan handlers.StemcellRefsPlan) {
 }
 
 // stemcellRefsUsageProblem returns the usage error in the parsed flags, or "".
-func stemcellRefsUsageProblem(action string, fs *flag.FlagSet, configPath string, director *string, vmid *int64, allowOwned *bool) string {
+func stemcellRefsUsageProblem(
+	action string, fs *flag.FlagSet, configPath string, director *string, vmid *int64, allowOwned, reconcile *bool,
+) string {
 	if fs.NArg() > 0 {
 		return fmt.Sprintf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
@@ -164,10 +169,16 @@ func stemcellRefsUsageProblem(action string, fs *flag.FlagSet, configPath string
 		}
 	})
 	switch {
+	case *reconcile && (directorSet || vmidSet):
+		return "--reconcile-tags is mutually exclusive with --director and --vmid"
+	case *reconcile && *allowOwned:
+		return "--allow-owned-vms applies only to --director"
+	case *reconcile:
+		return ""
 	case directorSet && vmidSet:
 		return "--director and --vmid are mutually exclusive"
 	case !directorSet && !vmidSet:
-		return "prune needs --director or --vmid"
+		return "prune needs --director, --vmid, or --reconcile-tags"
 	case directorSet && strings.TrimSpace(*director) == "":
 		return "--director must name a non-empty ref"
 	case vmidSet && *vmid <= 0:
@@ -207,6 +218,10 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			t.Node, t.VMID, t.Name, dash(t.SHA8), dashList(t.DescriptionRefs), dashList(t.DirectorTags),
 			yesNo(t.RefsTagsDisagree), dashIDs(t.LinkedClones), templateNotes(t))
+	}
+	if rep.DescriptionsNearLimit > 0 {
+		fmt.Fprintf(tw, "%d template(s) have a description within 1024 bytes of PVE's 8192-byte limit; "+
+			"prune their stale refs before a registration fails.\n", rep.DescriptionsNearLimit)
 	}
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "REFS")
@@ -321,6 +336,12 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		if a.DropTag != "" {
 			line += ", removes tag " + a.DropTag
 		}
+		if len(a.DropTags) > 0 {
+			line += ", removes tags " + strings.Join(a.DropTags, ", ")
+		}
+		if len(a.KeptTags) > 0 {
+			line += ", keeps tags " + strings.Join(a.KeptTags, ", ")
+		}
 		if a.AddsCacheMarker {
 			line += ", adds tag bosh-stemcell-cache"
 		}
@@ -403,7 +424,10 @@ func stemcellRefsResultLine(r *handlers.StemcellRefsActionResult) string {
 	if len(r.Destroyed) > 0 {
 		line += ", destroyed " + dashIDs(r.Destroyed)
 	}
-	if r.TagRemoved {
+	switch {
+	case r.TagRemoved && len(r.Action.DropTags) > 0:
+		line += ", removed tags " + strings.Join(r.Action.DropTags, ", ")
+	case r.TagRemoved:
 		line += ", removed tag " + r.Action.DropTag
 	}
 	if r.CacheMarkerAdded {
@@ -437,6 +461,9 @@ func templateNotes(t *handlers.StemcellRefsTemplate) string {
 	}
 	if t.Untracked {
 		notes = append(notes, "untracked")
+	}
+	if t.DescriptionNearLimit {
+		notes = append(notes, fmt.Sprintf("description %d bytes, near the 8192-byte limit", t.DescriptionBytes))
 	}
 	return dashList(notes)
 }
