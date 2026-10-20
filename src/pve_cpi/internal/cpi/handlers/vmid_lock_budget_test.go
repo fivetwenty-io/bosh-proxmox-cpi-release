@@ -129,7 +129,7 @@ func TestVMIDLockBodiesListTheUntrackedDestroy(t *testing.T) {
 		if body.operation != "stemcell-refs untracked destroy" {
 			continue
 		}
-		want := 3*vmidLockCallAllowance + untrackedCloneRescanTimeout
+		want := 4*vmidLockCallAllowance + untrackedCloneRescanTimeout
 		if got := body.budget(); got != want {
 			t.Fatalf("untracked destroy budget = %s, want %s", got, want)
 		}

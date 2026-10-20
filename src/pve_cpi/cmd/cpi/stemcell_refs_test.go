@@ -683,6 +683,27 @@ func TestStemcellRefsPruneUntrackedDryRunText(t *testing.T) {
 	}
 }
 
+func TestStemcellRefsPruneUntrackedShowsLegacyRef(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	c := refsCLIFixture()
+	c.guests = append(c.guests, refsCLIGuest{vmid: 30430, name: "bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364",
+		template: true, tags: "bosh-cpi;bosh-stemcell-sha-891b3b74",
+		desc:  `{"name":"","version":"","sha8":"","created":"","stemcell_refs":"template:30430"}`,
+		disks: map[string]string{"virtio0": "local-lvm:base-30430-disk-0,size=5G"}})
+	code, stdout, stderr := runStemcellRefsTest(t, c, "prune", "--config", cfgPath, "--vmid", "30430", "--untracked")
+	if code != 0 {
+		t.Fatalf("exit %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"destroy-untracked vmid 30430 (bosh-stemcell-bosh-openstack-kvm-ubuntu-noble-1-364 on pve)",
+		"    legacy ref template:30430 (retired ref count, self-reference that no released CPI resolves)",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, stdout)
+		}
+	}
+}
+
 func TestStemcellRefsPruneUntrackedResumesPendingDestroy(t *testing.T) {
 	cfgPath := writeStorageJournalConfig(t, minimalCfg())
 	c := refsCLIUntrackedFixture()

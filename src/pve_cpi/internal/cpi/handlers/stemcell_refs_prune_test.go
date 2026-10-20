@@ -1311,16 +1311,18 @@ func TestStemcellRefsPrune_UntrackedIsNeverDestroyed(t *testing.T) {
 	f := newPruneFake()
 	// 101 is the anchor of shaA and holds only oldRef.
 	f.addTemplate(101, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), cacheTemplateTags(shaA)+";director--"+oldRef)
+	// Untracked templates carry the name create_stemcell builds from
+	// provDesc's stemcell, so only their missing marker keeps them out.
 	// 155 is an untracked zero-ref replica of shaA, and 156 an untracked
 	// replica of shaA that holds only oldRef.
-	f.addTemplate(155, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), untrackedTags(shaA, true))
-	f.addTemplate(156, "bosh-stemcell-a-1-"+shaA, provDesc(shaA, oldRef), untrackedTags(shaA, true))
+	f.addTemplate(155, "bosh-stemcell-test-1-0-"+shaA, provDesc(shaA), untrackedTags(shaA, true))
+	f.addTemplate(156, "bosh-stemcell-test-1-0-"+shaA, provDesc(shaA, oldRef), untrackedTags(shaA, true))
 	// 110 is an untracked zero-ref main template.
-	f.addTemplate(110, "bosh-stemcell-u-1-abcd1111", provDesc("abcd1111"), untrackedTags("abcd1111", false))
+	f.addTemplate(110, "bosh-stemcell-test-1-0-abcd1111", provDesc("abcd1111"), untrackedTags("abcd1111", false))
 	// 120 is an untracked main template that holds only oldRef, and 121 one
 	// whose last-ref destroy is already pending.
-	f.addTemplate(120, "bosh-stemcell-c-1-cccc3333", provDesc("cccc3333", oldRef), untrackedTags("cccc3333", false))
-	f.addTemplate(121, "bosh-stemcell-d-1-dddd4444", provDesc("dddd4444", oldRef),
+	f.addTemplate(120, "bosh-stemcell-test-1-0-cccc3333", provDesc("cccc3333", oldRef), untrackedTags("cccc3333", false))
+	f.addTemplate(121, "bosh-stemcell-test-1-0-dddd4444", provDesc("dddd4444", oldRef),
 		untrackedTags("dddd4444", false)+";bosh-destroy-pending")
 	// 130 is legacy: a blank description with sha8 and node tags but no
 	// director-- or cache tag. It stays freeable.
@@ -1644,5 +1646,43 @@ func TestStemcellRefsPrune_VMIDAnchorAndReplicaTogether(t *testing.T) {
 	if r := actionFor(t, plan, 133); r.Kind != handlers.StemcellRefsActionBlocked || !r.Failure ||
 		!strings.Contains(r.Reason, "replica of live template 132") {
 		t.Fatalf("133 action = %+v; want blocked while its anchor 132 is kept", r)
+	}
+}
+
+func TestStemcellRefsPrune_VMIDReplicaRefusedWhenAnchorAlreadyGone(t *testing.T) {
+	t.Parallel()
+	for _, order := range [][]int64{{130, 131}, {131, 130}} {
+		f := newPruneFake()
+		f.addTemplate(130, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
+		f.addTemplate(131, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+		deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMIDs: order})
+		if plan.Refused || plan.HasFailures() {
+			t.Fatalf("order %v: plan = %+v; want no refusal", order, plan)
+		}
+		f.mu.Lock()
+		delete(f.guests, 130)
+		f.mu.Unlock()
+
+		res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+		if err != nil || res.Failures != 1 {
+			t.Fatalf("order %v: apply: err %v failures %d %+v; want the kept replica as one failure", order, err,
+				res.Failures, res.Results)
+		}
+		for _, r := range res.Results {
+			switch r.Action.VMID {
+			case 130:
+				if r.Outcome != handlers.StemcellRefsOutcomeGone || r.Failure {
+					t.Errorf("order %v: 130 result = %+v; want already-gone", order, r)
+				}
+			case 131:
+				if !r.Failure || !strings.Contains(r.KeptReason, "template 130 was already gone") ||
+					!strings.Contains(r.KeptReason, "cpi stemcell-refs prune --config <cpi.json> --vmid 131") {
+					t.Errorf("order %v: 131 result = %+v; want a failing keep that names the rerun", order, r)
+				}
+			}
+		}
+		if len(f.deleted) != 0 || f.guests[131] == nil {
+			t.Fatalf("order %v: deleted %v; want replica 131 left in place", order, f.deleted)
+		}
 	}
 }

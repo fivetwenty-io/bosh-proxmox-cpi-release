@@ -73,7 +73,8 @@ func (b vmidLockBody) budget() time.Duration {
 // counted.
 //
 // The stemcell-refs untracked destroy reads the config and the status, runs
-// the linked-clone rescan, and writes the destroy-pending stamp. The rescan
+// the linked-clone rescan, reads the config again to compare its digest,
+// and writes the destroy-pending stamp. The rescan
 // lists every guest and reads each config, so its call count grows with the
 // cluster; untrackedCloneRecheck runs it under untrackedCloneRescanTimeout,
 // which is counted as a bounded step.
@@ -92,7 +93,7 @@ func vmidLockBodies() []vmidLockBody {
 		{operation: "stemcell director reference", singleCalls: 2},
 		{operation: "delete_vm deleting tag", singleCalls: 2},
 		{operation: "create_vm failure tag", singleCalls: 2},
-		{operation: "stemcell-refs untracked destroy", singleCalls: 3, bounded: untrackedCloneRescanTimeout},
+		{operation: "stemcell-refs untracked destroy", singleCalls: 4, bounded: untrackedCloneRescanTimeout},
 	}
 }
 

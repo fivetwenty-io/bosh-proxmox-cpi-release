@@ -651,6 +651,12 @@ type StemcellRefsAction struct {
 	// already carries bosh-destroy-pending from an earlier apply whose
 	// destroy did not finish, so the apply resumes that destroy.
 	ResumesPending bool `json:"resumes_pending,omitempty"`
+	// LegacyRefs lists the entries of the retired stemcell_refs count that
+	// a destroy-untracked action's template carries in the minimal notes of
+	// a CPI that predates v0.1.0. Each one is template:<its own vmid>, the
+	// stemcell CID that CPI handed a Director, which no released CPI
+	// resolves.
+	LegacyRefs []string `json:"legacy_refs,omitempty"`
 	// Failure is true for a blocked or skipped action that makes the
 	// command exit 1.
 	Failure bool `json:"failure"`
@@ -1448,7 +1454,9 @@ func planUntrackedPrune(scan StemcellRefsScan, vmids []int64, plan *StemcellRefs
 		if reason != "" {
 			blockStemcellRefsAction(&act, t, reason)
 			act.ResumesPending = false
+			return act
 		}
+		act.LegacyRefs = untrackedLegacyRefs(t)
 		return act
 	})
 }
@@ -1675,12 +1683,53 @@ func ApplyStemcellRefsPrune(ctx context.Context, deps Deps, plan StemcellRefsPla
 			r.Outcome != StemcellRefsOutcomeGone {
 			sha8Unfinished[act.SHA8] = true
 		}
-		if r.Failure {
-			res.Failures++
-		}
 		res.Results = append(res.Results, r)
 	}
+	settleCoveredReplicas(plan, res.Results)
+	for i := range res.Results {
+		if res.Results[i].Failure {
+			res.Failures++
+		}
+	}
 	return res, nil
+}
+
+// settleCoveredReplicas checks each replica the plan said its anchor's
+// sweep frees, once every action has run. When that anchor was already gone,
+// no sweep ran, and when its action failed without destroying the replica,
+// the sweep did not free it either. Either way the replica is still in place,
+// so its result becomes a failing keep that names the --vmid rerun that
+// frees it on its own, and the run exits 1.
+func settleCoveredReplicas(plan StemcellRefsPlan, results []StemcellRefsActionResult) {
+	byVMID := map[int64]*StemcellRefsActionResult{}
+	for i := range results {
+		if results[i].Action.Mutating() {
+			byVMID[results[i].Action.VMID] = &results[i]
+		}
+	}
+	for i := range results {
+		r := &results[i]
+		carrierVMID := r.Action.sweptWith
+		if carrierVMID == 0 {
+			continue
+		}
+		rerun := stemcellRefsPruneCommand(plan.configPath, r.Action.VMID, false, false)
+		carrier, ok := byVMID[carrierVMID]
+		switch {
+		case !ok:
+			r.KeptReason = fmt.Sprintf("template %d had no action that ran, so no sweep freed this replica; "+
+				"rerun %s to free it on its own", carrierVMID, rerun)
+		case carrier.Outcome == StemcellRefsOutcomeGone:
+			r.KeptReason = fmt.Sprintf("template %d was already gone, so no sweep ran and this replica is still "+
+				"in place; rerun %s to free it on its own", carrierVMID, rerun)
+		case carrier.Failure && !slices.Contains(carrier.Destroyed, r.Action.VMID):
+			r.KeptReason = fmt.Sprintf("template %d did not finish its destroy and sweep, so this replica is "+
+				"still in place; see that template's result, then rerun %s", carrierVMID, rerun)
+		default:
+			continue
+		}
+		r.Failure = true
+	}
 }
 
 // stemcellRefsVerifier returns the check every locked apply step runs on its
@@ -1874,8 +1923,9 @@ func applyStemcellRefsAction(
 // --untracked --apply command, any other destroy on a plain rerun.
 func stemcellRefsBaseInUseError(kind, configPath string, vmid int64, err error) string {
 	if kind == StemcellRefsActionDestroyUntracked {
-		return fmt.Sprintf("template still backs one or more linked-clone VMs; delete or migrate them. %s: %s",
-			untrackedResumeNote(configPath, vmid), err.Error())
+		note := untrackedResumeNote(configPath, vmid)
+		return fmt.Sprintf("template still backs one or more linked-clone VMs; delete or migrate them. %s%s: %s",
+			strings.ToUpper(note[:1]), note[1:], err.Error())
 	}
 	return fmt.Sprintf("template still backs one or more linked-clone VMs; delete or migrate them, "+
 		"then rerun (the destroy is marked pending and resumes): %s", err.Error())
@@ -2185,6 +2235,9 @@ func destroyUntrackedTemplateLocked(
 		if cloneErr := untrackedCloneRecheck(ctx, deps, logger, act.VMID); cloneErr != nil {
 			return cloneErr
 		}
+		if digestErr := untrackedDigestRecheck(ctx, deps, act, digest); digestErr != nil {
+			return digestErr
+		}
 		tags := parseTagsField(stringConfigField(cfg, jsonKeyTags))
 		stampErr := stampDestroyPendingTagGuarded(ctx, deps, act.Node, act.VMID, tags, digest)
 		if pve.IsConfigDigestStale(stampErr) {
@@ -2216,6 +2269,30 @@ func destroyUntrackedTemplateLocked(
 				act.Node, untrackedResumeNote(configPath, act.VMID)))
 	}
 	return false, nil
+}
+
+// untrackedDigestRecheck re-reads the config of act's template after the
+// lock-held linked-clone rescan and refuses, wrapping ErrStemcellRefsChanged,
+// when its digest differs from digest, the locked read's. The rescan can run
+// for minutes, and an edit made outside the CPI in that time, such as one in
+// the PVE UI, takes no VMID lock. On a fresh destroy the digest-guarded stamp
+// would refuse it too, but a resumed destroy already carries the stamp and
+// writes nothing, so this check is what holds a resume to the locked read.
+func untrackedDigestRecheck(ctx context.Context, deps Deps, act StemcellRefsAction, digest string) error {
+	cfg, err := deps.PVE.QEMU().Config(ctx, act.Node, int(act.VMID)) //nolint:gosec // VMID is bounded by PVE valid range
+	if err != nil {
+		if stemcellRefsGone(err) {
+			return fmt.Errorf("%w: its config left node %s during the linked-clone check", ErrStemcellRefsChanged,
+				act.Node)
+		}
+		return cpierrors.Wrap(pve.WrapError(err), fmt.Sprintf("stemcell-refs: re-read config vmid %d node %q "+
+			"after the linked-clone check; nothing was written", act.VMID, act.Node))
+	}
+	if fresh, _ := pve.ConfigString(cfg, "digest"); fresh != digest {
+		return fmt.Errorf("%w: its config changed during the linked-clone check (digest %s, now %q)",
+			ErrStemcellRefsChanged, digest, fresh)
+	}
+	return nil
 }
 
 // untrackedResumeNote says that the untracked template vmid carries

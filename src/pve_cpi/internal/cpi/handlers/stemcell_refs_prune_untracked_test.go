@@ -17,15 +17,18 @@ import (
 
 const (
 	untrackedSha  = "abcd1111"
-	untrackedName = "bosh-stemcell-u-1-" + untrackedSha
-	gib           = int64(1) << 30
-	mib           = int64(1) << 20
+	untrackedName = untrackedNamePrefix + untrackedSha
+	// untrackedNamePrefix is the name create_stemcell builds for provDesc's
+	// stemcell, test version 1.0, before it appends the sha8.
+	untrackedNamePrefix = "bosh-stemcell-test-1-0-"
+	gib                 = int64(1) << 30
+	mib                 = int64(1) << 20
 )
 
 // addUntracked adds untracked template vmid with no ref and one owned disk.
 func addUntracked(f *pruneFake, vmid int64, sha8 string) {
 	vol := "local-lvm:base-" + strconv.FormatInt(vmid, 10) + "-disk-0"
-	f.addTemplate(vmid, "bosh-stemcell-u-1-"+sha8, provDesc(sha8), untrackedTags(sha8, false))
+	f.addTemplate(vmid, untrackedNamePrefix+sha8, provDesc(sha8), untrackedTags(sha8, false))
 	f.guests[vmid].cfg["scsi0"] = vol + ",size=4G"
 	f.sizes[vol] = 4 * gib
 }
@@ -188,7 +191,7 @@ func TestStemcellRefsPruneUntracked_TrackedAndUntrackedRefusals(t *testing.T) {
 func TestStemcellRefsPruneUntracked_RefsAndUnknownRefsRefuse(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
-	f.addTemplate(120, "bosh-stemcell-c-1-cccc3333", provDesc("cccc3333", oldRef, newRef),
+	f.addTemplate(120, untrackedNamePrefix+"cccc3333", provDesc("cccc3333", oldRef, newRef),
 		untrackedTags("cccc3333", false))
 	// 121 has a blank description and 122 one that does not parse.
 	f.addTemplate(121, "bosh-stemcell-d-1-dddd4444", "", untrackedTags("dddd4444", false))
@@ -263,46 +266,56 @@ func TestStemcellRefsPruneUntracked_RunningRefuses(t *testing.T) {
 
 func TestStemcellRefsPruneUntracked_LockedRecheck(t *testing.T) {
 	t.Parallel()
+	// olderDesc is provenance from before path identity, which the
+	// template may carry under its name with or without the sha8 suffix.
+	olderDesc := `{"name":"test","version":"1.0","sha8":"` + untrackedSha + `","created":"2026-05-01T00:00:00Z"}`
 	cases := []struct {
 		name   string
 		change func(f *pruneFake, g *pruneFakeGuest)
 		want   string
+		// desc, when set, replaces the template's description before the
+		// plan.
+		desc string
 	}{
 		{"marker", func(_ *pruneFake, g *pruneFakeGuest) {
 			g.cfg["tags"] = untrackedTags(untrackedSha, false) + ";bosh-stemcell-cache"
-		}, "generation marker bosh-stemcell-cache"},
+		}, "generation marker bosh-stemcell-cache", ""},
 		{"ref", func(_ *pruneFake, g *pruneFakeGuest) {
 			g.cfg["description"] = provDesc(untrackedSha, newRef)
-		}, "holds director_refs (" + newRef + ")"},
+		}, "holds director_refs (" + newRef + ")", ""},
 		{"pending", func(_ *pruneFake, g *pruneFakeGuest) {
 			g.cfg["tags"] = untrackedTags(untrackedSha, false) + ";bosh-destroy-pending"
-		}, "its tags changed"},
+		}, "its tags changed", ""},
 		{"renamed", func(_ *pruneFake, g *pruneFakeGuest) {
-			g.cfg["name"] = "bosh-stemcell-u-2-" + untrackedSha
-		}, "its name changed"},
+			g.cfg["name"] = "bosh-stemcell-test-1-0"
+		}, "its name changed", olderDesc},
 		{"other zero-ref provenance", func(_ *pruneFake, g *pruneFakeGuest) {
-			g.cfg["description"] = strings.Replace(provDesc(untrackedSha), `"version":"1.0"`, `"version":"1.1"`, 1)
-		}, "its description changed"},
+			g.cfg["description"] = strings.Replace(provDesc(untrackedSha), `"created":"2026-08-03T00:00:00Z"`,
+				`"created":"2026-08-04T00:00:00Z"`, 1)
+		}, "its description changed", ""},
 		{"extra tag", func(_ *pruneFake, g *pruneFakeGuest) {
 			g.cfg["tags"] = untrackedTags(untrackedSha, false) + ";keep-me"
-		}, "its tags changed"},
+		}, "its tags changed", ""},
 		{"not a template", func(_ *pruneFake, g *pruneFakeGuest) {
 			delete(g.cfg, "template")
-		}, "no longer a template"},
+		}, "no longer a template", ""},
 		{"clone", func(f *pruneFake, _ *pruneFakeGuest) {
 			f.guests[300] = &pruneFakeGuest{node: vmNode, name: "late-clone",
 				cfg: map[string]any{"scsi0": "local-lvm:base-110-disk-0/vm-300-disk-0,size=4G"}}
-		}, "linked clone(s) (300)"},
+		}, "linked clone(s) (300)", ""},
 		{"unreadable guest", func(f *pruneFake, _ *pruneFakeGuest) {
 			f.guests[301] = &pruneFakeGuest{node: vmNode, name: "late-vm", cfg: map[string]any{}}
 			f.configErr[301] = &sdkerrors.APIError{HTTPCode: 403, Message: "permission denied"}
-		}, "could not read the config of vmid 301"},
+		}, "could not read the config of vmid 301", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			f := newPruneFake()
 			addUntracked(f, 110, untrackedSha)
+			if tc.desc != "" {
+				f.guests[110].cfg["description"] = tc.desc
+			}
 			deps, plan := untrackedPlan(t, f, 110)
 			if plan.Refused {
 				t.Fatalf("plan refused: %s", plan.RefusalReason)
@@ -413,7 +426,7 @@ func TestStemcellRefsPruneUntracked_RepeatedVMIDsJudgedPerTemplate(t *testing.T)
 	// 155 is an untracked replica of live anchor 102. --untracked judges it
 	// on its own, because 102's destroy would never sweep it.
 	f.addTemplate(102, "bosh-stemcell-a-1-"+shaB, provDesc(shaB, oldRef), cacheTemplateTags(shaB)+";director--"+oldRef)
-	f.addTemplate(155, "bosh-stemcell-a-1-"+shaB, provDesc(shaB), untrackedTags(shaB, true))
+	f.addTemplate(155, untrackedNamePrefix+shaB, provDesc(shaB), untrackedTags(shaB, true))
 
 	deps, plan := untrackedPlan(t, f, 110, 101, 111, 999, 112, 110, 155)
 	if plan.Refused || !slices.Equal(plan.VMIDs, []int64{110, 101, 111, 999, 112, 155}) || plan.VMID != 0 {
@@ -544,6 +557,9 @@ func TestStemcellRefsPruneUntracked_LegacyMinimalProvenanceQualifies(t *testing.
 		plan.Actions[0].SHA8 != "891b3b74" {
 		t.Fatalf("plan = %+v; want one destroy-untracked action for sha8 891b3b74", plan)
 	}
+	if got := plan.Actions[0].LegacyRefs; !slices.Equal(got, []string{"template:30430"}) {
+		t.Errorf("legacy refs = %q; want the self-reference template:30430 shown", got)
+	}
 	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
 	if err != nil || res.Failures != 0 || !slices.Equal(f.deleted, []int64{30430}) {
 		t.Fatalf("apply: err %v deleted %v %+v; want 30430 destroyed", err, f.deleted, res.Results)
@@ -556,35 +572,64 @@ func TestStemcellRefsPruneUntracked_IdentityNeedsNameAndProvenance(t *testing.T)
 		hexA = "a1b2c3d4"
 		hexB = "0dcd8626"
 	)
+	nameA, nameB := untrackedNamePrefix+hexA, untrackedNamePrefix+hexB
+	tagA := "bosh-cpi;bosh-stemcell-sha-" + hexA
+	minimal := func(extra string) string {
+		return `{"name":"","version":"","sha8":"","created":""` + extra + `}`
+	}
 	cases := []struct {
 		label, name, desc, tags, want string
 	}{
 		{"golden image", "ubuntu-golden-image", `{"kind":"golden","owner":"team-x"}`, "",
 			`name "ubuntu-golden-image" does not follow stemcell cache naming`},
-		{"null description", "bosh-stemcell-u-1-" + hexA, "null", untrackedTags(hexA, false),
+		{"null description", nameA, "null", untrackedTags(hexA, false),
 			"lacks the string field(s) name, version, sha8, created"},
-		{"empty object", "bosh-stemcell-u-1-" + hexA, "{}", untrackedTags(hexA, false),
+		{"empty object", nameA, "{}", untrackedTags(hexA, false),
 			"lacks the string field(s) name, version, sha8, created"},
-		{"golden kind under a cache name", "bosh-stemcell-u-1-" + hexA, `{"kind":"golden"}`, untrackedTags(hexA, false),
+		{"golden kind under a cache name", nameA, `{"kind":"golden"}`, untrackedTags(hexA, false),
 			"is not stemcell provenance"},
-		{"description sha8 differs from the tag", "bosh-stemcell-u-1-" + hexA, provDesc(hexA), untrackedTags(hexB, false),
+		{"description sha8 differs from the tag", nameA, provDesc(hexA), untrackedTags(hexB, false),
 			"description sha8 " + hexA + " does not match its bosh-stemcell-sha-" + hexB + " tag"},
-		{"name suffix differs from the sha8", "bosh-stemcell-u-1-" + hexB, provDesc(hexA), untrackedTags(hexA, false),
+		{"name suffix differs from the sha8", nameB, provDesc(hexA), untrackedTags(hexA, false),
 			"name suffix " + hexB + " does not match sha8 " + hexA},
 		{"minimal notes name suffix differs from the tag", "bosh-stemcell-u-1-" + hexB, legacyMinimalDesc(140),
-			"bosh-cpi;bosh-stemcell-sha-" + hexA, "name suffix " + hexB + " does not match sha8 " + hexA},
-		{"two sha tags disagree", "bosh-stemcell-u-1-" + hexA, provDesc(hexA),
+			tagA, "name suffix " + hexB + " does not match sha8 " + hexA},
+		{"two sha tags disagree", nameA, provDesc(hexA),
 			untrackedTags(hexA, false) + ";bosh-stemcell-sha-" + hexB, "conflicting bosh-stemcell-sha- tags"},
 		{"provenance without a sha8", "bosh-stemcell-u-1",
 			`{"name":"u","version":"1","sha8":"","created":"2026-08-03T00:00:00Z"}`, "bosh-cpi",
 			"provenance records no sha8"},
 		{"minimal notes without a sha tag", "bosh-stemcell-u-1", legacyMinimalDesc(140), "bosh-cpi",
-			"no bosh-stemcell-sha- tag"},
-		{"minimal notes without stemcell_refs", "bosh-stemcell-u-1",
-			`{"name":"","version":"","sha8":"","created":""}`, "bosh-cpi;bosh-stemcell-sha-" + hexA,
-			"provenance records no sha8"},
-		{"path identity without a name suffix", "bosh-stemcell-u-1", provDesc(hexA), untrackedTags(hexA, false),
+			"carries no bosh-stemcell-sha- tag"},
+		{"full provenance without a sha tag", "bosh-stemcell-golden-1",
+			`{"name":"golden","version":"1","sha8":"deadbeef","created":""}`, "",
+			"carries no bosh-stemcell-sha- tag"},
+		{"suffix-free full provenance without a sha tag", "bosh-stemcell-golden",
+			`{"name":"golden","version":"1","sha8":"deadbeef","created":""}`, "bosh-cpi",
+			"carries no bosh-stemcell-sha- tag"},
+		{"name names another stemcell", "bosh-stemcell-other-9",
+			`{"name":"u","version":"1","sha8":"` + hexA + `","created":""}`, tagA,
+			`name "bosh-stemcell-other-9" does not match its provenance, stemcell u version 1`},
+		{"name names another version", "bosh-stemcell-u-2-" + hexA,
+			`{"name":"u","version":"1","sha8":"` + hexA + `","created":""}`, tagA,
+			`name "bosh-stemcell-u-2-` + hexA + `" does not match its provenance, stemcell u version 1`},
+		{"path identity without a name suffix", "bosh-stemcell-test-1-0", provDesc(hexA), untrackedTags(hexA, false),
 			"has no sha8 suffix"},
+		{"minimal notes without stemcell_refs", "bosh-stemcell-u-1", minimal(""), tagA,
+			"lacks the stemcell_refs field"},
+		{"minimal notes naming another template", "bosh-stemcell-u-1",
+			minimal(`,"stemcell_refs":"template:99999"`), tagA,
+			`stemcell_refs entry "template:99999" is not template:140`},
+		{"minimal notes with a garbage ref", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":"x"`), tagA,
+			`stemcell_refs entry "x" is not template:140`},
+		{"minimal notes with one foreign ref among its own", "bosh-stemcell-u-1",
+			minimal(`,"stemcell_refs":"template:140,template:7"`), tagA,
+			`stemcell_refs entry "template:7" is not template:140`},
+		{"minimal notes with extra fields", "bosh-stemcell-u-1",
+			minimal(`,"stemcell_refs":"template:140","purpose":"y","owner":"x"`), tagA,
+			"extra field(s) owner, purpose"},
+		{"minimal notes with a non-string ref", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":5`), tagA,
+			"stemcell_refs field is not a string"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
@@ -601,14 +646,32 @@ func TestStemcellRefsPruneUntracked_IdentityNeedsNameAndProvenance(t *testing.T)
 		})
 	}
 
-	// A provenance write from before the sha suffix keeps an older name, and
-	// its sha8 tag agrees, so it qualifies.
-	f := newPruneFake()
-	f.addTemplate(141, "bosh-stemcell-u-1-2",
-		`{"name":"u","version":"1.2","sha8":"`+hexA+`","created":"2026-05-01T00:00:00Z"}`,
-		"bosh-cpi;bosh-stemcell-sha-"+hexA+";bosh-stemcell")
-	if _, plan := untrackedPlan(t, f, 141); plan.Refused {
-		t.Fatalf("older provenance refused: %s", plan.RefusalReason)
+	qualifying := []struct {
+		label, name, desc, tags string
+		legacyRefs              []string
+	}{
+		// A provenance write from before the sha suffix keeps an older name,
+		// and its sha8 tag agrees.
+		{"older provenance under an older name", "bosh-stemcell-u-1-2",
+			`{"name":"u","version":"1.2","sha8":"` + hexA + `","created":"2026-05-01T00:00:00Z"}`,
+			"bosh-cpi;bosh-stemcell-sha-" + hexA + ";bosh-stemcell", nil},
+		{"older provenance under a suffixed name", "bosh-stemcell-u-1-2-" + hexA,
+			`{"name":"u","version":"1.2","sha8":"` + hexA + `","created":"2026-05-01T00:00:00Z"}`, tagA, nil},
+		{"minimal notes whose refs were emptied", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":""`), tagA, nil},
+		{"minimal notes naming the template", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":" template:140 "`), tagA,
+			[]string{"template:140"}},
+	}
+	for _, tc := range qualifying {
+		f := newPruneFake()
+		f.addTemplate(140, tc.name, tc.desc, tc.tags)
+		_, plan := untrackedPlan(t, f, 140)
+		if plan.Refused || len(plan.Actions) != 1 || plan.Actions[0].Kind != handlers.StemcellRefsActionDestroyUntracked {
+			t.Errorf("%s: refused %v reason %q; want it to qualify", tc.label, plan.Refused, plan.RefusalReason)
+			continue
+		}
+		if got := plan.Actions[0].LegacyRefs; !slices.Equal(got, tc.legacyRefs) {
+			t.Errorf("%s: legacy refs = %q; want %q", tc.label, got, tc.legacyRefs)
+		}
 	}
 }
 
@@ -652,5 +715,85 @@ func TestStemcellRefsPruneUntracked_ResumesPendingDestroy(t *testing.T) {
 	}
 	if !slices.Equal(f.deleted, []int64{110}) || f.writeCount() != writes {
 		t.Fatalf("deleted %v writes %v; want 110 destroyed with no second stamp", f.deleted, f.writes)
+	}
+}
+
+func TestStemcellRefsPruneUntracked_ChangeDuringCloneRescanIsCaught(t *testing.T) {
+	t.Parallel()
+	// markDuringRescan adds bosh-stemcell-cache to 110 when the lock-held
+	// clone rescan reads guest 200, the way an edit in the PVE UI would.
+	markDuringRescan := func(f *pruneFake) {
+		marked := false
+		f.onRead = func(vmid int64, _ *pruneFakeGuest) {
+			if vmid == 200 && !marked {
+				marked = true
+				g := f.guests[110]
+				g.cfg["tags"] = g.cfg["tags"].(string) + ";bosh-stemcell-cache"
+				g.gen++
+			}
+		}
+	}
+	setup := func() *pruneFake {
+		f := newPruneFake()
+		addUntracked(f, 110, untrackedSha)
+		f.addVM(200, "vm", "", map[string]string{"scsi0": "local-lvm:vm-200-disk-0,size=4G"})
+		return f
+	}
+	wantChanged := func(t *testing.T, label string, res handlers.StemcellRefsApplyResult, err error) {
+		t.Helper()
+		if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeChanged ||
+			!strings.Contains(res.Results[0].Error, "changed during the linked-clone check") {
+			t.Fatalf("%s: err %v %+v; want changed-since-plan for an edit during the rescan", label, err, res.Results)
+		}
+	}
+
+	// A fresh destroy.
+	f := setup()
+	deps, plan := untrackedPlan(t, f, 110)
+	markDuringRescan(f)
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	wantChanged(t, "fresh", res, err)
+	if len(f.deleted) != 0 || f.writeCount() != 0 {
+		t.Fatalf("fresh: deleted %v writes %v; want the template left alone", f.deleted, f.writes)
+	}
+
+	// A resumed destroy, whose stamp is already in place, so no
+	// digest-guarded write would notice the edit.
+	g := setup()
+	g.deleteErr[110] = &sdkerrors.APIError{HTTPCode: 500, Message: "storage busy"}
+	deps, plan = untrackedPlan(t, g, 110)
+	if res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan); err != nil || res.Failures != 1 {
+		t.Fatalf("first apply: err %v %+v; want a failed destroy that leaves the stamp", err, res.Results)
+	}
+	delete(g.deleteErr, 110)
+	deps, plan = untrackedPlan(t, g, 110)
+	if plan.Refused || !plan.Actions[0].ResumesPending {
+		t.Fatalf("rerun plan = %+v; want a resume", plan)
+	}
+	writes := g.writeCount()
+	markDuringRescan(g)
+	res, err = handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	wantChanged(t, "resume", res, err)
+	if len(g.deleted) != 0 || g.writeCount() != writes {
+		t.Fatalf("resume: deleted %v writes %v; want the now-tracked template left alone", g.deleted, g.writes)
+	}
+}
+
+func TestStemcellRefsPruneUntracked_BaseVolumeInUseNamesTheRerun(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	addUntracked(f, 110, untrackedSha)
+	f.deleteErr[110] = &sdkerrors.APIError{HTTPCode: 400,
+		Message: "base volume 'base-110-disk-0' is still in use by linked clone"}
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMID: 110, Untracked: true,
+		ConfigPath: "/x/cpi.json"})
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 1 || res.Results[0].Outcome != handlers.StemcellRefsOutcomeFailed {
+		t.Fatalf("apply: err %v %+v; want a failed destroy", err, res.Results)
+	}
+	want := "delete or migrate them. The template now carries bosh-destroy-pending, and rerunning " +
+		"cpi stemcell-refs prune --config /x/cpi.json --vmid 110 --untracked --apply resumes the destroy"
+	if e := res.Results[0].Error; !strings.Contains(e, want) {
+		t.Fatalf("error = %q; want it to contain %q", e, want)
 	}
 }

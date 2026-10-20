@@ -421,6 +421,9 @@ func writeStemcellRefsActions(w io.Writer, actions []handlers.StemcellRefsAction
 		for _, k := range a.KeptReplicas {
 			fmt.Fprintln(w, "    "+keptReplicaText(k))
 		}
+		for _, ref := range a.LegacyRefs {
+			fmt.Fprintf(w, "    legacy ref %s (retired ref count, self-reference that no released CPI resolves)\n", ref)
+		}
 		if a.Frees != nil {
 			for _, v := range a.Frees.Volumes {
 				size := "provisioned size unknown"
