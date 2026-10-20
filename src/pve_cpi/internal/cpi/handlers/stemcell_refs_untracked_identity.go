@@ -117,9 +117,8 @@ func untrackedProvenanceOf(desc string, vmid int64) (untrackedProvenance, string
 	fields := map[string]string{}
 	var missing []string
 	for _, k := range provenanceStringKeys {
-		var s string
-		v, ok := raw[k]
-		if !ok || json.Unmarshal(v, &s) != nil {
+		s, ok := jsonStringField(raw, k)
+		if !ok {
 			missing = append(missing, k)
 			continue
 		}
@@ -157,12 +156,28 @@ func untrackedProvenanceOf(desc string, vmid int64) (untrackedProvenance, string
 		"an older CPI, so nothing in it names its stemcell"
 }
 
+// jsonStringField returns raw[key] as a string, and false when the key is
+// absent or its value is not a JSON string. A JSON null is not a string here,
+// although json.Unmarshal decodes it into one without error.
+func jsonStringField(raw map[string]json.RawMessage, key string) (string, bool) {
+	v, ok := raw[key]
+	if !ok || !strings.HasPrefix(strings.TrimSpace(string(v)), `"`) {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
 // minimalNotesRefs holds raw, a description whose provenance string fields
 // are all empty, to the minimal notes an older CPI wrote on template vmid,
 // and returns the entries of its stemcell_refs, or the reason it is not
-// those notes. The notes hold exactly minimalNotesKeys, and every
-// stemcell_refs entry is template:<vmid>, the only value that CPI wrote
-// there; an empty stemcell_refs is accepted.
+// those notes. The notes hold exactly minimalNotesKeys, and stemcell_refs
+// holds at least one entry, each of them template:<vmid>, the only value
+// that CPI wrote there. That CPI dropped the field once the list was empty,
+// so an empty stemcell_refs is not a shape it wrote.
 func minimalNotesRefs(raw map[string]json.RawMessage, vmid int64) ([]string, string) {
 	const notMinimal = "its description records no sha8, name, or version, so it qualifies only as the minimal " +
 		"notes of an older CPI, but "
@@ -177,12 +192,11 @@ func minimalNotesRefs(raw map[string]json.RawMessage, vmid int64) ([]string, str
 		return nil, fmt.Sprintf(notMinimal+"it has the extra field(s) %s, which those notes never carry",
 			strings.Join(extra, ", "))
 	}
-	v, ok := raw[legacyRefsKey]
-	if !ok {
+	if _, ok := raw[legacyRefsKey]; !ok {
 		return nil, notMinimal + "it lacks the " + legacyRefsKey + " field that those notes always carry"
 	}
-	var csv string
-	if json.Unmarshal(v, &csv) != nil {
+	csv, ok := jsonStringField(raw, legacyRefsKey)
+	if !ok {
 		return nil, notMinimal + "its " + legacyRefsKey + " field is not a string"
 	}
 	own := fmt.Sprintf("template:%d", vmid)
@@ -197,6 +211,10 @@ func minimalNotesRefs(raw map[string]json.RawMessage, vmid int64) ([]string, str
 				"which is the only value those notes record", legacyRefsKey, entry, own)
 		}
 		refs = append(refs, entry)
+	}
+	if len(refs) == 0 {
+		return nil, notMinimal + "its " + legacyRefsKey + " field is empty, which those notes never record, " +
+			"because the CPI drops the field once the list is empty"
 	}
 	return refs, ""
 }

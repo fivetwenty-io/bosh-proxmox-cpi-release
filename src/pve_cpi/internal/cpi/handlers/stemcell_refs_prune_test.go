@@ -1679,10 +1679,138 @@ func TestStemcellRefsPrune_VMIDReplicaRefusedWhenAnchorAlreadyGone(t *testing.T)
 					!strings.Contains(r.KeptReason, "cpi stemcell-refs prune --config <cpi.json> --vmid 131") {
 					t.Errorf("order %v: 131 result = %+v; want a failing keep that names the rerun", order, r)
 				}
+				if strings.Contains(r.Action.Reason, "same sweep") {
+					t.Errorf("order %v: 131 reason = %q; want no claim that the sweep frees it", order, r.Action.Reason)
+				}
 			}
 		}
 		if len(f.deleted) != 0 || f.guests[131] == nil {
 			t.Fatalf("order %v: deleted %v; want replica 131 left in place", order, f.deleted)
 		}
+	}
+}
+
+// A replica named alongside its anchor is freed only by that anchor's sweep.
+// When the sweep does not free it, because the carrier failed or skipped the
+// sweep after another template of its sha8 failed, the replica is a failure
+// that names the carrier and its own rerun.
+func TestStemcellRefsPrune_VMIDReplicaRefusedWhenItsSweepDoesNotRun(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		label       string
+		anchors     []int64
+		failCarrier bool
+		want        string
+	}{
+		{"carrier destroy fails", []int64{130}, true, "did not finish its destroy and sweep"},
+		{"an earlier anchor of the sha8 fails", []int64{129, 130}, false, "did not free this replica"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			t.Parallel()
+			f := newPruneFake()
+			for _, id := range tc.anchors {
+				f.addTemplate(id, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
+			}
+			f.addTemplate(131, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+			deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMIDs: append(tc.anchors, 131)})
+			if plan.Refused || plan.HasFailures() {
+				t.Fatalf("plan = %+v; want no refusal", plan)
+			}
+			carrier := replicaSweepCarrier(t, plan, 131)
+			f.deleteErr[failingAnchor(t, tc.anchors, carrier, tc.failCarrier)] =
+				&sdkerrors.APIError{HTTPCode: 500, Message: "storage busy"}
+
+			res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+			if err != nil || res.Failures != 2 {
+				t.Fatalf("apply: err %v failures %d %+v; want the failed anchor and the kept replica", err,
+					res.Failures, res.Results)
+			}
+			assertReplicaKeptWithRerun(t, res, 131, fmt.Sprintf("template %d %s", carrier, tc.want))
+			if f.guests[131] == nil || slices.Contains(f.deleted, 131) {
+				t.Fatalf("deleted %v; want replica 131 left in place", f.deleted)
+			}
+		})
+	}
+}
+
+// replicaSweepCarrier returns the anchor whose destroy plan sweeps replica.
+func replicaSweepCarrier(t *testing.T, plan handlers.StemcellRefsPlan, replica int64) int64 {
+	t.Helper()
+	for i := range plan.Actions {
+		for j := range plan.Actions[i].SweepReplicas {
+			if plan.Actions[i].SweepReplicas[j].VMID == replica {
+				return plan.Actions[i].VMID
+			}
+		}
+	}
+	t.Fatalf("plan = %+v; want one anchor that sweeps replica %d", plan, replica)
+	return 0
+}
+
+// failingAnchor picks the anchor whose destroy the test fails: the carrier
+// itself, or another anchor of the same sha8.
+func failingAnchor(t *testing.T, anchors []int64, carrier int64, failCarrier bool) int64 {
+	t.Helper()
+	if failCarrier {
+		return carrier
+	}
+	for _, id := range anchors {
+		if id != carrier {
+			return id
+		}
+	}
+	t.Fatalf("anchors %v; want one besides carrier %d", anchors, carrier)
+	return 0
+}
+
+// assertReplicaKeptWithRerun checks that replica's result is a failing keep
+// whose reason holds want and the replica's own --vmid rerun, and that its
+// plan-time claim that the sweep frees it is gone.
+func assertReplicaKeptWithRerun(t *testing.T, res handlers.StemcellRefsApplyResult, replica int64, want string) {
+	t.Helper()
+	rerun := fmt.Sprintf("cpi stemcell-refs prune --config <cpi.json> --vmid %d", replica)
+	for i := range res.Results {
+		r := &res.Results[i]
+		if r.Action.VMID != replica {
+			continue
+		}
+		if !r.Failure || !strings.Contains(r.KeptReason, want) || !strings.Contains(r.KeptReason, rerun) {
+			t.Errorf("%d result = %+v; want a failing keep naming %q and %q", replica, r, want, rerun)
+		}
+		if strings.Contains(r.Action.Reason, "same sweep") {
+			t.Errorf("%d reason = %q; want no claim that the sweep frees it", replica, r.Action.Reason)
+		}
+		return
+	}
+	t.Errorf("results %+v; want one for replica %d", res.Results, replica)
+}
+
+// A replica the anchor's sweep finds already gone is no longer in place, so
+// it stays a quiet skip and the run succeeds.
+func TestStemcellRefsPrune_VMIDReplicaAlreadyGoneAtSweepIsNotAFailure(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	f.addTemplate(130, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), cacheTemplateTags(shaA))
+	f.addTemplate(131, "bosh-stemcell-a-1-"+shaA, provDesc(shaA), replicaTags(shaA))
+	deps, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{VMIDs: []int64{130, 131}})
+	if plan.Refused || plan.HasFailures() {
+		t.Fatalf("plan = %+v; want no refusal", plan)
+	}
+	f.mu.Lock()
+	delete(f.guests, 131)
+	f.mu.Unlock()
+
+	res, err := handlers.ApplyStemcellRefsPrune(context.Background(), deps, plan)
+	if err != nil || res.Failures != 0 {
+		t.Fatalf("apply: err %v failures %d %+v; want no failure", err, res.Failures, res.Results)
+	}
+	for _, r := range res.Results {
+		if r.Action.VMID == 131 && (r.Failure || r.KeptReason != "") {
+			t.Errorf("131 result = %+v; want a quiet skip", r)
+		}
+	}
+	if !slices.Equal(f.deleted, []int64{130}) {
+		t.Fatalf("deleted %v; want anchor 130 destroyed", f.deleted)
 	}
 }

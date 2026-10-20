@@ -1649,6 +1649,8 @@ type StemcellRefsActionResult struct {
 	Notes []string `json:"notes,omitempty"`
 	// Failure is true when the action counts against the exit code.
 	Failure bool `json:"failure"`
+	// replicasGone lists the replicas the sweep found already gone.
+	replicasGone []int64
 }
 
 // StemcellRefsApplyResult is the whole apply. A refused plan yields the same
@@ -1695,11 +1697,14 @@ func ApplyStemcellRefsPrune(ctx context.Context, deps Deps, plan StemcellRefsPla
 }
 
 // settleCoveredReplicas checks each replica the plan said its anchor's
-// sweep frees, once every action has run. When that anchor was already gone,
-// no sweep ran, and when its action failed without destroying the replica,
-// the sweep did not free it either. Either way the replica is still in place,
-// so its result becomes a failing keep that names the --vmid rerun that
-// frees it on its own, and the run exits 1.
+// sweep frees, once every action has run. The replica is freed only when
+// that anchor's result lists it as destroyed or its sweep found it already
+// gone. In every other case the replica is still in place: the anchor had no
+// action that ran, was already gone, failed, or skipped its sweep because
+// another template of its sha8 was not destroyed. Its result then becomes a
+// failing keep that names the anchor and the --vmid rerun that frees the
+// replica on its own, and the run exits 1. The plan-time reason, which says
+// the sweep frees the replica, is cleared from that result.
 func settleCoveredReplicas(plan StemcellRefsPlan, results []StemcellRefsActionResult) {
 	byVMID := map[int64]*StemcellRefsActionResult{}
 	for i := range results {
@@ -1713,8 +1718,12 @@ func settleCoveredReplicas(plan StemcellRefsPlan, results []StemcellRefsActionRe
 		if carrierVMID == 0 {
 			continue
 		}
-		rerun := stemcellRefsPruneCommand(plan.configPath, r.Action.VMID, false, false)
 		carrier, ok := byVMID[carrierVMID]
+		if ok && (slices.Contains(carrier.Destroyed, r.Action.VMID) ||
+			slices.Contains(carrier.replicasGone, r.Action.VMID)) {
+			continue
+		}
+		rerun := stemcellRefsPruneCommand(plan.configPath, r.Action.VMID, false, false)
 		switch {
 		case !ok:
 			r.KeptReason = fmt.Sprintf("template %d had no action that ran, so no sweep freed this replica; "+
@@ -1722,12 +1731,14 @@ func settleCoveredReplicas(plan StemcellRefsPlan, results []StemcellRefsActionRe
 		case carrier.Outcome == StemcellRefsOutcomeGone:
 			r.KeptReason = fmt.Sprintf("template %d was already gone, so no sweep ran and this replica is still "+
 				"in place; rerun %s to free it on its own", carrierVMID, rerun)
-		case carrier.Failure && !slices.Contains(carrier.Destroyed, r.Action.VMID):
+		case carrier.Failure:
 			r.KeptReason = fmt.Sprintf("template %d did not finish its destroy and sweep, so this replica is "+
 				"still in place; see that template's result, then rerun %s", carrierVMID, rerun)
 		default:
-			continue
+			r.KeptReason = fmt.Sprintf("template %d did not free this replica in its sweep, so it is still in "+
+				"place; see that template's notes, then rerun %s", carrierVMID, rerun)
 		}
+		r.Action.Reason = ""
 		r.Failure = true
 	}
 }
@@ -2000,6 +2011,7 @@ func sweepStemcellRefsReplicas(
 			r.Notes = append(r.Notes, fmt.Sprintf("replica %d destroy failed: %v", rep.VMID, err))
 		case gone:
 			r.Notes = append(r.Notes, fmt.Sprintf("replica %d was already gone", rep.VMID))
+			r.replicasGone = append(r.replicasGone, rep.VMID)
 		case destroyed:
 			r.Destroyed = append(r.Destroyed, rep.VMID)
 		}

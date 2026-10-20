@@ -630,6 +630,21 @@ func TestStemcellRefsPruneUntracked_IdentityNeedsNameAndProvenance(t *testing.T)
 			"extra field(s) owner, purpose"},
 		{"minimal notes with a non-string ref", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":5`), tagA,
 			"stemcell_refs field is not a string"},
+		{"minimal notes whose refs were emptied", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":""`), tagA,
+			"stemcell_refs field is empty"},
+		{"minimal notes with comma-only refs", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":" , "`), tagA,
+			"stemcell_refs field is empty"},
+		{"minimal notes with null refs", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":null`), tagA,
+			"stemcell_refs field is not a string"},
+		{"minimal notes with a null name", "bosh-stemcell-u-1",
+			`{"name":null,"version":"","sha8":"","created":"","stemcell_refs":"template:140"}`, tagA,
+			"lacks the string field(s) name"},
+		{"full provenance with a null sha8", nameA,
+			`{"name":"test","version":"1.0","sha8":null,"created":""}`, untrackedTags(hexA, false),
+			"lacks the string field(s) sha8"},
+		{"full provenance with a null created", nameA,
+			`{"name":"test","version":"1.0","sha8":"` + hexA + `","created":null}`, untrackedTags(hexA, false),
+			"lacks the string field(s) created"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
@@ -657,7 +672,6 @@ func TestStemcellRefsPruneUntracked_IdentityNeedsNameAndProvenance(t *testing.T)
 			"bosh-cpi;bosh-stemcell-sha-" + hexA + ";bosh-stemcell", nil},
 		{"older provenance under a suffixed name", "bosh-stemcell-u-1-2-" + hexA,
 			`{"name":"u","version":"1.2","sha8":"` + hexA + `","created":"2026-05-01T00:00:00Z"}`, tagA, nil},
-		{"minimal notes whose refs were emptied", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":""`), tagA, nil},
 		{"minimal notes naming the template", "bosh-stemcell-u-1", minimal(`,"stemcell_refs":" template:140 "`), tagA,
 			[]string{"template:140"}},
 	}

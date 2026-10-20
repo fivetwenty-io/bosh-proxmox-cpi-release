@@ -122,8 +122,9 @@ func TestWithVMIDLockClaimsTheFullTTL(t *testing.T) {
 }
 
 // TestVMIDLockBodiesListTheUntrackedDestroy checks that the untracked destroy's
-// lock body, a config read, a status read, the linked-clone rescan, and the
-// stamp, is in the table with the rescan counted at its own deadline.
+// lock body, four single calls (a config read, a status read, the digest
+// re-read after the linked-clone rescan, and the stamp) plus that rescan, is
+// in the table with the rescan counted at its own deadline.
 func TestVMIDLockBodiesListTheUntrackedDestroy(t *testing.T) {
 	for _, body := range vmidLockBodies() {
 		if body.operation != "stemcell-refs untracked destroy" {
