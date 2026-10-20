@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -24,8 +25,10 @@ func TestStemcellRefsReport_PairsRefWithCreateEnvDirectorVM(t *testing.T) {
 	f := newPruneFake()
 	twoRefTemplates(f)
 	// oldRef belongs to a create-env Director VM, newRef to a deployed Director's VM.
-	f.addVM(4441, "bosh-0", "bosh-cpi;bosh-owner--"+strings.ToLower(oldRef)+";director--BOSH-Init;deployment--lab-bosh", nil)
-	f.addVM(300, "router", "bosh-cpi;bosh-owner--"+strings.ToLower(newRef)+";director--prod-bosh;deployment--cf", nil)
+	f.addVM(4441, "bosh-0",
+		"bosh-cpi;bosh-owner--"+strings.ToLower(oldRef)+";director--BOSH-Init;deployment--lab-bosh", nil)
+	f.addVM(300, "router",
+		"bosh-cpi;bosh-owner--"+strings.ToLower(newRef)+";director--prod-bosh;deployment--cf", nil)
 
 	rep := handlers.BuildStemcellRefsReport(scanOnly(t, f))
 	old := refSummary(t, rep, oldRef)
@@ -33,7 +36,8 @@ func TestStemcellRefsReport_PairsRefWithCreateEnvDirectorVM(t *testing.T) {
 		{VMID: 4441, Node: "pve", Name: "bosh-0", Deployments: []string{"lab-bosh"}},
 	}
 	if len(old.CreateEnvDirectors) != 1 || old.CreateEnvDirectors[0].VMID != want[0].VMID ||
-		old.CreateEnvDirectors[0].Name != want[0].Name || !slices.Equal(old.CreateEnvDirectors[0].Deployments, want[0].Deployments) {
+		old.CreateEnvDirectors[0].Name != want[0].Name ||
+		!slices.Equal(old.CreateEnvDirectors[0].Deployments, want[0].Deployments) {
 		t.Fatalf("create-env directors = %+v, want %+v", old.CreateEnvDirectors, want)
 	}
 	if old.PossibleCreateEnvRef {
@@ -98,11 +102,16 @@ func TestStemcellRefsReport_FlagsRefsNoOwnerTagMatches(t *testing.T) {
 	if refSummary(t, rep, newRef).PossibleCreateEnvRef {
 		t.Error("a ref an owner tag matches must not be a possible create-env ref")
 	}
-	for _, want := range []string{"director_id", "create-env", "bosh env", "state file",
-		"adopt-owners --director-name bosh-init", "Stamping owner tags on older VMs", "stale"} {
+	for _, want := range []string{"director_id", "create-env", "bosh env", "state file", "another cluster",
+		"rebuilt", "stale", "compare it with the director_id in each create-env state file",
+		`see "Clearing a stale director ref" in docs/operations.md of bosh-proxmox-cpi-release`} {
 		if !strings.Contains(rep.PossibleCreateEnvRefNote, want) {
 			t.Errorf("note %q lacks %q", rep.PossibleCreateEnvRefNote, want)
 		}
+	}
+	if strings.Contains(rep.PossibleCreateEnvRefNote, "adopt-owners") {
+		t.Errorf("note %q advises adopt-owners, which has nothing to stamp once every guest has an owner tag",
+			rep.PossibleCreateEnvRefNote)
 	}
 }
 
@@ -148,14 +157,69 @@ func TestStemcellRefsReport_HintsDoNotChangePrunePlans(t *testing.T) {
 	t.Parallel()
 	f := newPruneFake()
 	twoRefTemplates(f)
-	f.addVM(4441, "bosh-0", "bosh-cpi;bosh-owner--"+strings.ToLower(oldRef)+";director--bosh-init;deployment--lab-bosh", nil)
+	f.addVM(4441, "bosh-0",
+		"bosh-cpi;bosh-owner--"+strings.ToLower(oldRef)+";director--bosh-init;deployment--lab-bosh", nil)
 
 	rep := handlers.BuildStemcellRefsReport(scanOnly(t, f))
 	_, plan := scanAndPlan(t, f, handlers.StemcellRefsPruneRequest{DirectorRef: oldRef})
 	if !plan.Refused || len(plan.OwnedVMs) != 1 || plan.OwnedVMs[0].VMID != 4441 {
-		t.Fatalf("plan refused %v owned %+v; the pairing must leave the owned-VM refusal alone", plan.Refused, plan.OwnedVMs)
+		t.Fatalf("plan refused %v owned %+v; the pairing must leave the owned-VM refusal alone",
+			plan.Refused, plan.OwnedVMs)
 	}
 	if n := refSummary(t, rep, oldRef).OwnedVMCount; n == nil || *n != 1 {
 		t.Errorf("owned count = %v, want 1", n)
+	}
+}
+
+func TestStemcellRefsReport_PairingDeploymentValues(t *testing.T) {
+	t.Parallel()
+	base := "bosh-cpi;bosh-owner--" + strings.ToLower(oldRef) + ";director--bosh-init"
+	cases := map[string]struct {
+		deployments string
+		want        []string
+	}{
+		"duplicate tag":          {";deployment--lab;deployment--lab", []string{"lab"}},
+		"spellings by case":      {";deployment--lab;deployment--Lab", []string{"lab"}},
+		"empty value is dropped": {";deployment--;deployment--b", []string{"b"}},
+		"only an empty value":    {";deployment--", nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newPruneFake()
+			twoRefTemplates(f)
+			f.addVM(4441, "bosh-0", base+tc.deployments, nil)
+
+			got := refSummary(t, handlers.BuildStemcellRefsReport(scanOnly(t, f)), oldRef).CreateEnvDirectors
+			if len(got) != 1 || !slices.Equal(got[0].Deployments, tc.want) {
+				t.Fatalf("pairings = %+v, want one with deployments %v", got, tc.want)
+			}
+			if tc.want == nil && got[0].Deployments != nil {
+				t.Errorf("deployments = %#v, want nil so JSON omits it", got[0].Deployments)
+			}
+		})
+	}
+}
+
+func TestStemcellRefsReport_PairsAGuestWhoseConfigCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+	f := newPruneFake()
+	twoRefTemplates(f)
+	f.addVM(4441, "bosh-0",
+		"bosh-cpi;bosh-owner--"+strings.ToLower(oldRef)+";director--bosh-init;deployment--lab-bosh", nil)
+	f.configErr[4441] = errors.New("node is down")
+
+	rep := handlers.BuildStemcellRefsReport(scanOnly(t, f))
+	if !rep.OwnershipUnknown {
+		t.Fatal("an unreadable guest must leave ownership unknown")
+	}
+	if rep.PossibleCreateEnvRefNote != "" {
+		t.Errorf("note = %q, want none while ownership is unknown", rep.PossibleCreateEnvRefNote)
+	}
+	// The listing's tags stand in for the unreadable config, and they still
+	// name the guest, so the pairing shows.
+	got := refSummary(t, rep, oldRef).CreateEnvDirectors
+	if len(got) != 1 || got[0].VMID != 4441 || !slices.Equal(got[0].Deployments, []string{"lab-bosh"}) {
+		t.Errorf("pairing for an unreadable guest = %+v, want vmid 4441 in lab-bosh", got)
 	}
 }

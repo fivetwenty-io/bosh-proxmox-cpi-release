@@ -639,15 +639,19 @@ func oxfordList(items []string) string {
 }
 
 // possibleCreateEnvRefs lists the refs the report flags as possible
-// create-env refs.
+// create-env refs, naming at most five and counting the rest.
 func possibleCreateEnvRefs(refs []handlers.StemcellRefsRefSummary) string {
+	const shown = 5
 	var flagged []string
 	for i := range refs {
 		if refs[i].PossibleCreateEnvRef {
 			flagged = append(flagged, refs[i].Ref)
 		}
 	}
-	return oxfordList(flagged)
+	if len(flagged) <= shown {
+		return oxfordList(flagged)
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(flagged[:shown], ", "), len(flagged)-shown)
 }
 
 // wouldFree renders a ref's WOULD FREE column, which reads blocked while

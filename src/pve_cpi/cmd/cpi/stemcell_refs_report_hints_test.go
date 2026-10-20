@@ -89,14 +89,38 @@ func TestStemcellRefsReportTextNotesAPossibleCreateEnvRefOnce(t *testing.T) {
 	}
 	for _, want := range []string{
 		"This applies to old-uuid and other-uuid.", "state file", "`bosh env` does not print",
-		"adopt-owners --director-name bosh-init", `"Stamping owner tags on older VMs"`,
+		"another cluster", "rebuilt", "compare it with the director_id in each create-env state file",
+		`see "Clearing a stale director ref" in docs/operations.md of bosh-proxmox-cpi-release`,
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("report lacks %q:\n%s", want, stdout)
 		}
 	}
+	if strings.Contains(stdout, "adopt-owners") {
+		t.Errorf("the note must not advise adopt-owners:\n%s", stdout)
+	}
 	if strings.Contains(stdout, "owned by create-env") {
 		t.Errorf("no pairing expected:\n%s", stdout)
+	}
+}
+
+func TestStemcellRefsReportTextCapsTheFlaggedRefList(t *testing.T) {
+	cfgPath := writeStorageJournalConfig(t, minimalCfg())
+	refs := []string{"ref-1", "ref-2", "ref-3", "ref-4", "ref-5", "ref-6", "ref-7"}
+	quoted := `"` + strings.Join(refs, `","`) + `"`
+	desc := `{"name":"b","version":"1","sha8":"bbbb2222","kind":"heavy","director_refs":[` + quoted + `]}`
+	client := &refsCLIClient{guests: []refsCLIGuest{{vmid: 102, name: "bosh-stemcell-b-1-bbbb2222",
+		template: true, tags: "bosh-stemcell-cache;bosh-stemcell-sha-bbbb2222", desc: desc}}}
+	code, stdout, stderr := runStemcellRefsTest(t, client, "report", "--config", cfgPath)
+	if code != 0 {
+		t.Fatalf("exit %d stderr %q", code, stderr)
+	}
+	want := "This applies to ref-1, ref-2, ref-3, ref-4, ref-5, and 2 more."
+	if !strings.Contains(stdout, want) {
+		t.Errorf("report lacks %q:\n%s", want, stdout)
+	}
+	if strings.Contains(stdout, "ref-6, ref-7") {
+		t.Errorf("the list names more than five refs:\n%s", stdout)
 	}
 }
 

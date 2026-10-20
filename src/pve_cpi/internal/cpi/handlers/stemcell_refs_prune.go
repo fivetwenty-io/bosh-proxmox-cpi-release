@@ -2579,13 +2579,16 @@ type StemcellRefsReport struct {
 	PossibleCreateEnvRefNote string `json:"possible_create_env_ref_note,omitempty"`
 }
 
-// possibleCreateEnvRefNote explains a ref that no owner tag matches. A
-// create-env Director registers its refs under the director_id in its state
-// file, which bosh env does not print, so such a ref is not necessarily stale.
-const possibleCreateEnvRefNote = "A ref that no owner tag matches may be the director_id from a create-env " +
-	"Director's state file, which `bosh env` does not print. Before we treat it as stale, we check the " +
-	"create-env state and adopt that VM with `adopt-owners --director-name bosh-init`, as " +
-	"docs/operations.md describes under \"Stamping owner tags on older VMs\"."
+// possibleCreateEnvRefNote explains a ref that no owner tag matches while
+// every guest in the cluster has one. A create-env Director registers its refs
+// under the director_id in its state file, which bosh env does not print, so
+// such a ref is not necessarily stale. adopt-owners has nothing to stamp in
+// this state, so the note sends us to the state files instead.
+const possibleCreateEnvRefNote = "A ref that no owner tag matches may be the director_id of a create-env " +
+	"Director, which `bosh env` does not print, and whose VM may live on another cluster. It may also be " +
+	"stale because that Director was rebuilt. Before we treat it as stale, we compare it with the " +
+	"director_id in each create-env state file. " +
+	`For the steps, see "Clearing a stale director ref" in docs/operations.md of bosh-proxmox-cpi-release.`
 
 // BuildStemcellRefsReport summarizes scan. Each ref's WouldFree and Blocked
 // columns come from PlanStemcellRefsPrune, and each unreferenced template's
@@ -2618,12 +2621,10 @@ func BuildStemcellRefsReportFor(scan StemcellRefsScan, configPath string) Stemce
 	for _, ref := range stemcellRefNames(scan) {
 		rep.Refs = append(rep.Refs, summarizeStemcellRef(scan, ref))
 	}
-	if !rep.OwnershipUnknown {
-		for i := range rep.Refs {
-			rep.Refs[i].PossibleCreateEnvRef = possibleCreateEnvRef(scan, &rep.Refs[i])
-			if rep.Refs[i].PossibleCreateEnvRef {
-				rep.PossibleCreateEnvRefNote = possibleCreateEnvRefNote
-			}
+	for i := range rep.Refs {
+		rep.Refs[i].PossibleCreateEnvRef = possibleCreateEnvRef(scan, &rep.Refs[i])
+		if rep.Refs[i].PossibleCreateEnvRef {
+			rep.PossibleCreateEnvRefNote = possibleCreateEnvRefNote
 		}
 	}
 	for i := range scan.Templates {
@@ -2695,6 +2696,9 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 	s.CreateEnvDirectors = createEnvDirectorsFor(scan.Guests, s.OwnerTag)
 	plan, err := PlanStemcellRefsPrune(scan, StemcellRefsPruneRequest{DirectorRef: ref, AllowOwnedVMs: true})
 	if err != nil {
+		// The planner refuses only a malformed request, which a non-blank ref
+		// is not. Should it ever refuse this one, ownership is unknown.
+		s.OwnershipUnknown = true
 		return s
 	}
 	for i := range plan.OwnedVMs {
@@ -2748,7 +2752,7 @@ func createEnvDirectorsFor(guests []StemcellRefsGuest, ownerTag string) []Stemce
 		}
 		deployments := []string{}
 		for _, tok := range g.DeploymentTags {
-			if v := tok[len(deploymentTagPrefix):]; v != "" && !slices.Contains(deployments, v) {
+			if v := tagValueKey(tok, deploymentTagPrefix); v != "" && !slices.Contains(deployments, v) {
 				deployments = append(deployments, v)
 			}
 		}
@@ -2765,9 +2769,9 @@ func createEnvDirectorsFor(guests []StemcellRefsGuest, ownerTag string) []Stemce
 
 // possibleCreateEnvRef reports whether ref may be a create-env Director's
 // director_id: it is a real ref that no guest's owner tag matches and no
-// parker holds. The blank ref and the unknown-director sentinel are ownership
-// unknown on their own, so they never qualify. The caller checks that ownership is
-// known cluster-wide.
+// parker holds. The blank ref, the unknown-director sentinel, and every ref
+// while some guest lacks an owner tag are already ownership unknown, so they
+// never qualify, and the OWNERSHIP UNKNOWN section covers them.
 func possibleCreateEnvRef(scan StemcellRefsScan, r *StemcellRefsRefSummary) bool {
 	if r.Ref == "" || r.OwnerTag == "" || r.OwnershipUnknown || len(r.OwnedVMs) > 0 {
 		return false
