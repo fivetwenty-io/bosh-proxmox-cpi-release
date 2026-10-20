@@ -2511,6 +2511,26 @@ type StemcellRefsRefSummary struct {
 	KeptReplicas []StemcellRefsKeptReplica `json:"kept_replicas"`
 	// Note flags a ref the prune cannot address, such as a blank one.
 	Note string `json:"note,omitempty"`
+	// CreateEnvDirectors lists the guests that carry the ref's owner tag and
+	// director--bosh-init, which is how a create-env Director VM records the
+	// director_id its refs are registered under. It is empty when no such
+	// guest exists. It is information for the report only.
+	CreateEnvDirectors []StemcellRefsCreateEnvDirector `json:"create_env_directors"`
+	// PossibleCreateEnvRef is true when no guest carries the ref's owner tag,
+	// no parker holds the ref, and ownership is known cluster-wide, so the ref
+	// may be the director_id from a create-env state file. It is information
+	// for the report only.
+	PossibleCreateEnvRef bool `json:"possible_create_env_ref"`
+}
+
+// StemcellRefsCreateEnvDirector is a guest paired with a ref: it carries the
+// ref's owner tag and director--bosh-init.
+type StemcellRefsCreateEnvDirector struct {
+	VMID int64  `json:"vmid"`
+	Node string `json:"node"`
+	Name string `json:"name"`
+	// Deployments holds the guest's deployment-- tag values, sorted.
+	Deployments []string `json:"deployments,omitempty"`
 }
 
 // StemcellRefsUnreferenced is a template a --vmid prune could free, or a
@@ -2552,7 +2572,20 @@ type StemcellRefsReport struct {
 	// Uncovered groups those guests by director name and deployment, with
 	// the adopt-owners commands that cover each group.
 	Uncovered []StemcellRefsUncoveredGroup `json:"uncovered"`
+	// PossibleCreateEnvRefNote is set once when some ref is a possible
+	// create-env ref (StemcellRefsRefSummary.PossibleCreateEnvRef). It is
+	// never set while ownership is unknown, because the OWNERSHIP UNKNOWN
+	// section covers that case.
+	PossibleCreateEnvRefNote string `json:"possible_create_env_ref_note,omitempty"`
 }
+
+// possibleCreateEnvRefNote explains a ref that no owner tag matches. A
+// create-env Director registers its refs under the director_id in its state
+// file, which bosh env does not print, so such a ref is not necessarily stale.
+const possibleCreateEnvRefNote = "A ref that no owner tag matches may be the director_id from a create-env " +
+	"Director's state file, which `bosh env` does not print. Before we treat it as stale, we check the " +
+	"create-env state and adopt that VM with `adopt-owners --director-name bosh-init`, as " +
+	"docs/operations.md describes under \"Stamping owner tags on older VMs\"."
 
 // BuildStemcellRefsReport summarizes scan. Each ref's WouldFree and Blocked
 // columns come from PlanStemcellRefsPrune, and each unreferenced template's
@@ -2584,6 +2617,14 @@ func BuildStemcellRefsReportFor(scan StemcellRefsScan, configPath string) Stemce
 	}
 	for _, ref := range stemcellRefNames(scan) {
 		rep.Refs = append(rep.Refs, summarizeStemcellRef(scan, ref))
+	}
+	if !rep.OwnershipUnknown {
+		for i := range rep.Refs {
+			rep.Refs[i].PossibleCreateEnvRef = possibleCreateEnvRef(scan, &rep.Refs[i])
+			if rep.Refs[i].PossibleCreateEnvRef {
+				rep.PossibleCreateEnvRefNote = possibleCreateEnvRefNote
+			}
+		}
 	}
 	for i := range scan.Templates {
 		if u, ok := unreferencedStemcellTemplate(scan, &scan.Templates[i], configPath); ok {
@@ -2636,6 +2677,7 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 		s.DirectorTag = directorTagFor(ref)
 		s.OwnerTag = ownerTagFor(ref)
 	}
+	s.CreateEnvDirectors = []StemcellRefsCreateEnvDirector{}
 	for i := range scan.Templates {
 		t := &scan.Templates[i]
 		switch {
@@ -2650,6 +2692,7 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 		s.Note = "blank ref: the prune cannot address it, so these templates stay until it is removed by hand"
 		return s
 	}
+	s.CreateEnvDirectors = createEnvDirectorsFor(scan.Guests, s.OwnerTag)
 	plan, err := PlanStemcellRefsPrune(scan, StemcellRefsPruneRequest{DirectorRef: ref, AllowOwnedVMs: true})
 	if err != nil {
 		return s
@@ -2686,6 +2729,55 @@ func summarizeStemcellRef(scan StemcellRefsScan, ref string) StemcellRefsRefSumm
 		s.KeptReplicas = append(s.KeptReplicas, a.KeptReplicas...)
 	}
 	return s
+}
+
+// createEnvDirectorsFor returns the guests that carry ownerTag and
+// director--bosh-init, in VMID order. A create-env Director VM carries
+// director--bosh-init whatever its director_id, so the owner tag is what ties
+// the guest to the ref.
+func createEnvDirectorsFor(guests []StemcellRefsGuest, ownerTag string) []StemcellRefsCreateEnvDirector {
+	out := []StemcellRefsCreateEnvDirector{}
+	if ownerTag == "" {
+		return out
+	}
+	for i := range guests {
+		g := &guests[i]
+		if g.Kind != StemcellRefsGuestBOSH || !stringSliceContains(g.OwnerTags, ownerTag) ||
+			!tagsContainFold(g.DirectorTags, directorTagPrefix+createEnvDirectorName) {
+			continue
+		}
+		deployments := []string{}
+		for _, tok := range g.DeploymentTags {
+			if v := tok[len(deploymentTagPrefix):]; v != "" && !slices.Contains(deployments, v) {
+				deployments = append(deployments, v)
+			}
+		}
+		sort.Strings(deployments)
+		d := StemcellRefsCreateEnvDirector{VMID: g.VMID, Node: g.Node, Name: g.Name}
+		if len(deployments) > 0 {
+			d.Deployments = deployments
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].VMID < out[b].VMID })
+	return out
+}
+
+// possibleCreateEnvRef reports whether ref may be a create-env Director's
+// director_id: it is a real ref that no guest's owner tag matches and no
+// parker holds. The blank ref and the unknown-director sentinel are ownership
+// unknown on their own, so they never qualify. The caller checks that ownership is
+// known cluster-wide.
+func possibleCreateEnvRef(scan StemcellRefsScan, r *StemcellRefsRefSummary) bool {
+	if r.Ref == "" || r.OwnerTag == "" || r.OwnershipUnknown || len(r.OwnedVMs) > 0 {
+		return false
+	}
+	for i := range scan.Guests {
+		if stringSliceContains(scan.Guests[i].OwnerTags, r.OwnerTag) {
+			return false
+		}
+	}
+	return true
 }
 
 // unreferencedStemcellTemplate returns t's unreferenced-table row with the

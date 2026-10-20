@@ -267,7 +267,7 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", refLabel(r.Ref), dashIDs(r.DescriptionTemplates),
 			dashIDs(r.TagOnlyTemplates), ownedCount(r.OwnedVMCount), wouldFree(r), dashIDs(r.Blocked),
-			dashIDs(kept), dash(r.Note))
+			dashIDs(kept), dash(refNotes(r)))
 	}
 	if rep.OwnershipUnknown {
 		fmt.Fprintln(tw, "WOULD FREE reads blocked because ownership is unknown; every --director prune refuses, "+
@@ -279,6 +279,9 @@ func writeStemcellRefsReport(stdout, stderr io.Writer, rep handlers.StemcellRefs
 		for _, k := range rep.Refs[i].KeptReplicas {
 			fmt.Fprintf(tw, "a prune of %s %s\n", refLabel(rep.Refs[i].Ref), keptReplicaText(k))
 		}
+	}
+	if rep.PossibleCreateEnvRefNote != "" {
+		fmt.Fprintf(tw, "%s This applies to %s.\n", rep.PossibleCreateEnvRefNote, possibleCreateEnvRefs(rep.Refs))
 	}
 	fmt.Fprintln(tw)
 	if err := tw.Flush(); err != nil {
@@ -585,6 +588,66 @@ func templateNotes(t *handlers.StemcellRefsTemplate) string {
 		notes = append(notes, fmt.Sprintf("description %d bytes, near the 8192-byte limit", t.DescriptionBytes))
 	}
 	return dashList(notes)
+}
+
+// refNotes renders a ref's NOTES column: the report's note for the ref, then
+// the create-env Director VMs that carry its owner tag.
+func refNotes(r *handlers.StemcellRefsRefSummary) string {
+	var parts []string
+	if r.Note != "" {
+		parts = append(parts, r.Note)
+	}
+	if len(r.CreateEnvDirectors) > 0 {
+		parts = append(parts, createEnvPairing(r.CreateEnvDirectors))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// createEnvPairing renders the create-env Director VMs a ref is paired with,
+// such as "owned by create-env Director VM 4441 (bosh-init, deployment lab)".
+func createEnvPairing(ds []handlers.StemcellRefsCreateEnvDirector) string {
+	vms := make([]string, 0, len(ds))
+	for _, d := range ds {
+		detail := "bosh-init"
+		switch len(d.Deployments) {
+		case 0:
+		case 1:
+			detail += ", deployment " + d.Deployments[0]
+		default:
+			detail += ", deployments " + oxfordList(d.Deployments)
+		}
+		vms = append(vms, fmt.Sprintf("%d (%s)", d.VMID, detail))
+	}
+	noun := "VM"
+	if len(ds) > 1 {
+		noun = "VMs"
+	}
+	return "owned by create-env Director " + noun + " " + strings.Join(vms, ", ")
+}
+
+// oxfordList joins items as "a", "a and b", or "a, b, and c".
+func oxfordList(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	}
+	return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+}
+
+// possibleCreateEnvRefs lists the refs the report flags as possible
+// create-env refs.
+func possibleCreateEnvRefs(refs []handlers.StemcellRefsRefSummary) string {
+	var flagged []string
+	for i := range refs {
+		if refs[i].PossibleCreateEnvRef {
+			flagged = append(flagged, refs[i].Ref)
+		}
+	}
+	return oxfordList(flagged)
 }
 
 // wouldFree renders a ref's WOULD FREE column, which reads blocked while
