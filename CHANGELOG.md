@@ -34,6 +34,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 - Every Go module is at its latest release, and so are the CI pins. That covers the golang:1.27 image digest, golangci-lint v2.15.0, staticcheck v0.8.2, trivy v0.76.0, the bosh CLI 7.11.1, and uv 0.13.1. The default RustFS version for the lab artifacts server moves from 1.0.0-beta.3 to the 1.0.3 stable release.
 
+- `cpi stemcell-refs report` now says more about a ref that matches no `bosh env` UUID, in text and in `--json`. A ref whose owner tag sits on a guest that also carries `director--bosh-init` shows that guest in its NOTES column, such as `owned by create-env Director VM 4441 (bosh-init, deployment lab-bosh)`. When no guest carries a ref's owner tag and ownership is known, the report adds one note that the ref may be the `director_id` from a create-env state file, which `bosh env` doesn't print, and that we check the create-env state and adopt that VM with `adopt-owners --director-name bosh-init` before we treat the ref as stale. The note never appears while the OWNERSHIP UNKNOWN section does, and neither addition changes what a prune does or refuses.
+
 ## [0.9.4] - 2026-10-14
 
 ### Added
