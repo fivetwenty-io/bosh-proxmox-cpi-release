@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -107,7 +108,7 @@ func TestAllocationDecisionAbsenceDoesNotSettleUnknownMutation(t *testing.T) {
 	}
 	_, err = ApplyStorageAllocationDecision(context.Background(), deps, journal, []string{"pve1"}, StorageAllocationDecision{Action: "finalize-cleanup", AllocationID: id, DecisionID: "operator-ticket-45"})
 	if err == nil || !strings.Contains(err.Error(), "unsettled") {
-		t.Fatalf("unknown mutation not blocked: %v", err)
+		t.Fatalf("unknown mutation not blocked: %s", describeErrorChain(err))
 	}
 	record, err := journal.Inspect(id)
 	if err != nil {
@@ -184,7 +185,7 @@ func TestAllocationDecisionDiskAdoptionScrubsReadFailure(t *testing.T) {
 	before := diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)
 	_, err := ApplyStorageAllocationDecision(t.Context(), deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "adopt", AllocationID: id, ExpectedCID: cid, DecisionID: "read-failure"})
 	if err == nil || strings.Contains(err.Error(), "SUPER-SECRET") {
-		t.Fatalf("unsafe error: %v", err)
+		t.Fatalf("unsafe error: %s", describeErrorChain(err))
 	}
 	if !reflect.DeepEqual(before, diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)) {
 		t.Fatal("read failure changed record")
@@ -201,7 +202,7 @@ func TestAllocationDecisionWaitsForRecordOwnership(t *testing.T) {
 	defer cancel()
 	_, err = ApplyStorageAllocationDecision(ctx, deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "adopt", AllocationID: id, ExpectedCID: cid, DecisionID: "contended"})
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("record lock bypassed or cancellation lost: %v", err)
+		t.Fatalf("record lock bypassed or cancellation lost: %s", describeErrorChain(err))
 	}
 	if !reflect.DeepEqual(before, diagnosticFiles(t, deps.Config.StorageAllocationJournalDir)) {
 		t.Fatal("lock failure changed journal")
@@ -223,7 +224,7 @@ func TestAllocationDecisionMalformedDiskSentinelBlocksAbsence(t *testing.T) {
 	}
 	current, err := journal.Inspect(record.ID)
 	if err != nil || current.State != record.State {
-		t.Fatalf("failed audit changed state %+v %v", current, err)
+		t.Fatalf("failed audit changed state %+v %s", current, describeErrorChain(err))
 	}
 }
 
@@ -350,7 +351,7 @@ func TestAllocationDecisionAdoptionHonorsSettledRetryWithoutHidingOldArtifacts(t
 					t.Fatal("old-artifact rejection changed evidence")
 				}
 			} else if err != nil || next.State != aj.Adopted {
-				t.Fatalf("verified no-submission retry permanently blocked: %+v %v", next, err)
+				t.Fatalf("verified no-submission retry permanently blocked: %+v %s", next, describeErrorChain(err))
 			}
 		})
 	}
@@ -398,7 +399,7 @@ func TestAllocationDecisionAdoptsFreeVolumeCIDWithoutStableToken(t *testing.T) {
 	client.state.volumes[volume] = &ns.GetStorageContentResponse{Size: 5 << 30, Format: "raw"}
 	next, err := ApplyStorageAllocationDecision(t.Context(), deps, journal, []string{"n1"}, StorageAllocationDecision{Action: "adopt", AllocationID: id, ExpectedCID: cid, DecisionID: "free-volume-adoption"})
 	if err != nil || next.State != aj.Adopted || next.CID != cid {
-		t.Fatalf("free-volume adoption changed CID or failed %+v %v", next, err)
+		t.Fatalf("free-volume adoption changed CID or failed %+v %s", next, describeErrorChain(err))
 	}
 	if len(client.state.configs) != 1 || client.state.parkMutations != 0 || len(client.state.created) != 0 {
 		t.Fatal("adoption parked or attached a free disk")
@@ -433,6 +434,32 @@ func TestAllocationDecisionFinalizesExplicitlyClosedNoSubmissionAttempt(t *testi
 	}
 	next, err := ApplyStorageAllocationDecision(t.Context(), deps, journal, []string{"pve1"}, StorageAllocationDecision{Action: "finalize-cleanup", AllocationID: id, DecisionID: "closed-attempt-cleanup"})
 	if err != nil || next.State != aj.Cleaned {
-		t.Fatalf("verified closed attempt could not be finalized %+v %v", next, err)
+		t.Fatalf("verified closed attempt could not be finalized %+v %s", next, describeErrorChain(err))
 	}
+}
+
+// describeErrorChain renders every link of err's wrap chain, one line each,
+// with its dynamic type and message. It follows Unwrap() error and Unwrap() []error.
+func describeErrorChain(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	var lines []string
+	var walk func(e error, depth int)
+	walk = func(e error, depth int) {
+		lines = append(lines, strings.Repeat("  ", depth)+fmt.Sprintf("%T: %s", e, e.Error()))
+		if multi, ok := e.(interface{ Unwrap() []error }); ok { //nolint:errorlint // walking the chain by hand
+			for _, child := range multi.Unwrap() {
+				if child != nil {
+					walk(child, depth+1)
+				}
+			}
+			return
+		}
+		if child := errors.Unwrap(e); child != nil {
+			walk(child, depth+1)
+		}
+	}
+	walk(err, 0)
+	return "\n" + strings.Join(lines, "\n")
 }
