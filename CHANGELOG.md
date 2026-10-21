@@ -12,6 +12,8 @@ work as it lands; cutting a release renames it to the new version and dates it. 
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-20
+
 ### Added
 
 - The new `cpi stemcell-refs` operator command clears the director refs that a rebuilt Director leaves on stemcell cache templates. `cpi stemcell-refs report --config <cpi.json>` lists every cache template with its description refs, `director--` tags, and linked clones, and for every ref it shows how many VMs still carry that ref's owner tag and which templates a prune would free. `cpi stemcell-refs prune --director <ref>` removes one ref from every template under the per-VMID lock, replicas included, and destroys a template once no ref remains. A replica left with no ref is destroyed only when its sha8 is known, it backs no linked clone, and no main template of its stemcell survives; otherwise it stays with an empty ref set. When the last main template of a stemcell goes, the prune also destroys the stemcell's replicas that held no ref and back no linked clone. `cpi stemcell-refs prune --vmid <n>` frees one template that provably holds no ref, including a legacy one from before 0.9.2, along with any of its stemcell's replicas that pass the same checks. A prune is a dry run until we pass `--apply`, and it acts on the one cluster that the given `cpi.json` names. It refuses while any VM still carries the ref's owner tag, and it refuses the `unknown-director` ref, whose VMs carry no owner tag, unless we pass `--allow-owned-vms`. It never changes a template whose description doesn't parse, a template whose blank description leaves its refs unknown, or a template that changed after the plan. It never destroys a template that backs a linked clone, a replica that still holds another ref, or an untracked template, which has provenance JSON but no generation marker, unless we name that template with `--vmid` and `--untracked`. When removing a ref's tag would leave a kept template with no generation marker, the same write adds the `bosh-stemcell-cache` tag. The plan lists a replica that holds no ref but has its own action as kept, along with whether `--vmid` can free it afterwards, and the result shows a replica the apply kept instead of destroying as kept, with the reason. The text output of `--apply` prints the plan before the results, and a `--director` ref that matches nothing prints a warning. It still removes a ref that isn't the last one, or a stale tag, from a main template that backs a linked clone, and it removes the ref and tag from a replica that backs one. [Clearing a stale director ref](docs/operations.md#clearing-a-stale-director-ref) has the procedure.
@@ -898,7 +900,8 @@ to end against a live cluster.
 
 - Initial PVE CPI spike: the JSON-RPC dispatcher, the first VM and disk methods, and the BOSH release skeleton.
 
-[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/fivetwenty-io/bosh-proxmox-cpi-release/compare/v0.9.1...v0.9.2
