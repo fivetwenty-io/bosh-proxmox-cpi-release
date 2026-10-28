@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -243,91 +246,199 @@ func managedFormatPlan(rootID, rootType, ephID, ephType string) *StorageAllocati
 	return plan
 }
 
-// A frozen managed plan (storage-set or tier placement) resolves the root and
-// ephemeral formats against the plan's own definitions, not vm_storage. The
-// plan carries EphemeralDiskFormat only when the ephemeral disk needs a
-// different preference from the root disk's.
+// A frozen managed plan (storage-set or tier placement) resolves the root
+// format against the plan's own definitions, not vm_storage. The plan freezes
+// one DiskFormat, and every release derives the ephemeral disk's format from
+// it and the ephemeral pool's type, so the fresh shape and the shape resumed
+// from the frozen plan must allocate the same ephemeral format.
 func TestBuildVMShape_ManagedPlanResolvesEachRolePerPool(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name                        string
-		plan                        *StorageAllocationPlan
-		job                         string
-		wantRoot, wantEphemeral     string
-		wantFrozenEph, wantEphAlloc string
+		name                 string
+		plan                 *StorageAllocationPlan
+		job                  string
+		call                 map[string]any
+		wantFrozen, wantEph  string
+		wantEphemeralWarning bool
 	}{
-		{"nfs set root with lvmthin vm_storage", managedFormatPlan("set-a", "nfs", "", ""), "", "qcow2", "", "", ""},
-		{"lvmthin root and nfs ephemeral", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "", "raw", "qcow2", "qcow2", "qcow2"},
-		{"nfs root and lvmthin ephemeral", managedFormatPlan("set-a", "nfs", "local-lvm", "lvmthin"), "", "qcow2", "qcow2", "", "raw"},
-		{"job qcow2 coerced on lvmthin root keeps nfs ephemeral qcow2", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "qcow2", "raw", "qcow2", "qcow2", "qcow2"},
-		{"job raw everywhere", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "raw", "raw", "raw", "", "raw"},
+		{"nfs set root with lvmthin vm_storage", managedFormatPlan("set-a", "nfs", "", ""), "", nil, "qcow2", "", false},
+		{"lvmthin root without ephemeral is raw", managedFormatPlan("local-lvm", "lvmthin", "", ""), "", nil, "raw", "", false},
+		{"job qcow2 coerced on lvmthin root without ephemeral", managedFormatPlan("local-lvm", "lvmthin", "", ""), "qcow2", nil, "raw", "", false},
+		{"lvmthin root and nfs ephemeral", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "", nil, "qcow2", "qcow2", false},
+		{"lvmthin root and dir ephemeral", managedFormatPlan("local-lvm", "lvmthin", "set-a", "dir"), "", nil, "qcow2", "qcow2", false},
+		{"nfs root and lvmthin ephemeral", managedFormatPlan("set-a", "nfs", "local-lvm", "lvmthin"), "", nil, "qcow2", "raw", false},
+		{"job qcow2 on lvmthin root keeps nfs ephemeral qcow2", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "qcow2", nil, "qcow2", "qcow2", false},
+		{"job raw everywhere", managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"), "raw", nil, "raw", "raw", false},
+		{"job qcow2 on lvmthin root and lvmthin ephemeral", managedFormatPlan("local-lvm", "lvmthin", "eph-lvm", "lvmthin"), "qcow2", nil, "raw", "raw", true},
+		{"zfspool ephemeral is raw", managedFormatPlan("set-a", "nfs", "tank", "zfspool"), "", nil, "qcow2", "raw", false},
+		{"thick lvm root keeps its raw for an nfs ephemeral", managedFormatPlan("thick", "lvm", "set-a", "nfs"), "", nil, "raw", "raw", false},
+		{"thick lvm root keeps an explicit qcow2", managedFormatPlan("thick", "lvm", "", ""), "", map[string]any{"vm_disk_format": "qcow2"}, "qcow2", "", false},
+		{"thick lvm root qcow2 with nfs ephemeral", managedFormatPlan("thick", "lvm", "set-a", "nfs"), "", map[string]any{"vm_disk_format": "qcow2"}, "qcow2", "qcow2", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			deps, _ := shapeDeps("local-lvm", tc.job, nil, nil)
-			parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+			deps, obs := shapeDeps("local-lvm", tc.job, nil, nil)
+			call := tc.call
+			if call == nil {
+				call = map[string]any{}
+			}
+			parsed := minimalParsedArgsWithCP("stemcell-store", call)
 			parsed.storagePlan = tc.plan
 			shape, err := buildVMShapeForNode(context.Background(), deps, parsed, "pve")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if shape.vmDiskFormat != tc.wantRoot {
-				t.Errorf("root format = %q; want %q", shape.vmDiskFormat, tc.wantRoot)
-			}
-			if shape.ephemeralDiskFormat != tc.wantEphemeral {
-				t.Errorf("ephemeral preference = %q; want %q", shape.ephemeralDiskFormat, tc.wantEphemeral)
-			}
 			execution, err := freezeManagedVMExecution(deps.Config, shape)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if execution.DiskFormat != tc.wantRoot || execution.EphemeralDiskFormat != tc.wantFrozenEph {
-				t.Errorf("frozen = (%q, %q); want (%q, %q)", execution.DiskFormat, execution.EphemeralDiskFormat, tc.wantRoot, tc.wantFrozenEph)
+			if execution.DiskFormat != tc.wantFrozen {
+				t.Errorf("frozen DiskFormat = %q; want %q", execution.DiskFormat, tc.wantFrozen)
 			}
 			resumed, err := execution.shape(deps.Config)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if resumed.vmDiskFormat != tc.wantRoot {
-				t.Errorf("resumed root format = %q; want %q", resumed.vmDiskFormat, tc.wantRoot)
+			if resumed.vmDiskFormat != shape.vmDiskFormat {
+				t.Errorf("resumed format = %q; fresh format = %q", resumed.vmDiskFormat, shape.vmDiskFormat)
 			}
 			if eph, ok := managedVMRoleTarget(tc.plan, storageRoleEphemeral); ok {
 				ephType := tc.plan.Definitions[eph.StorageID].Type
-				got, err := pve.EphemeralVolumeFormat(ephType, resumed.managedEphemeralFormat())
-				if err != nil || got != tc.wantEphAlloc {
-					t.Errorf("resumed ephemeral allocation format = (%q, %v); want %q", got, err, tc.wantEphAlloc)
+				got, err := pve.EphemeralVolumeFormat(ephType, resumed.vmDiskFormat)
+				if err != nil || got != tc.wantEph {
+					t.Errorf("resumed ephemeral allocation format = (%q, %v); want %q", got, err, tc.wantEph)
 				}
-				if fresh, _ := pve.EphemeralVolumeFormat(ephType, shape.managedEphemeralFormat()); fresh != got {
-					t.Errorf("fresh shape allocates %q but the resumed shape allocates %q", fresh, got)
+			}
+			ephWarnings := 0
+			for _, w := range formatWarnings(obs) {
+				if strings.Contains(w, "ephemeral") {
+					ephWarnings++
 				}
+			}
+			if (ephWarnings == 1) != tc.wantEphemeralWarning || ephWarnings > 1 {
+				t.Errorf("ephemeral format warnings = %v; want warning=%v", formatWarnings(obs), tc.wantEphemeralWarning)
 			}
 		})
 	}
 }
 
-// A plan written before the ephemeral preference was frozen separately has no
-// EphemeralDiskFormat key, and it still names and allocates its ephemeral disk
-// from DiskFormat. A plan that does not need the field never writes it.
-func TestStorageVMExecution_LegacyPlanWithoutEphemeralDiskFormat(t *testing.T) {
+// legacyStorageVMExecution is StorageVMExecution as 0.9.5 defined it. An
+// older CPI decodes frozen plans strictly, so every plan this release writes
+// must decode into it with unknown fields refused.
+type legacyStorageVMExecution struct {
+	Version           int
+	InputFingerprint  string
+	Node              string
+	Storage           string
+	StorageType       string
+	DiskFormat        string
+	RootGiB           int
+	MaxAttempts       int
+	Cores             int
+	Sockets           int
+	MemoryMiB         int
+	Hotplug           string
+	NUMA              bool
+	Tags              string
+	InitialName       string
+	RootOptions       map[string]string
+	RootDevice        string
+	SCSIController    string
+	EphemeralGiB      int
+	EphemeralStorage  string
+	CPUType           string
+	BalloonMiB        *int
+	Pool              string
+	PoolComment       string
+	PoolLayer         string
+	PoolDirector      string
+	PoolDeployment    string
+	PoolInstanceGroup string
+}
+
+// Every frozen VM execution this release writes keeps exactly the 0.9.5 keys
+// and decodes into the 0.9.5 struct with unknown fields refused, so an older
+// CPI can read, verify, and clean up the plans and journal records it finds.
+func TestFreezeManagedVMExecution_ReadableByOlderRelease(t *testing.T) {
 	t.Parallel()
-	raw, err := json.Marshal(&StorageVMExecution{Version: 1, DiskFormat: "qcow2"})
-	if err != nil {
-		t.Fatal(err)
+	want := reflectFieldNames(legacyStorageVMExecution{})
+	sort.Strings(want)
+	plans := []*StorageAllocationPlan{
+		managedFormatPlan("local-lvm", "lvmthin", "set-a", "nfs"),
+		managedFormatPlan("set-a", "nfs", "local-lvm", "lvmthin"),
+		managedFormatPlan("thick", "lvm", "", ""),
 	}
-	if strings.Contains(string(raw), "EphemeralDiskFormat") {
-		t.Fatalf("an empty EphemeralDiskFormat was written: %s", raw)
+	for _, job := range []string{"", "qcow2", "raw"} {
+		for _, plan := range plans {
+			deps, _ := shapeDeps("local-lvm", job, nil, nil)
+			parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+			parsed.storagePlan = plan
+			shape, err := buildVMShapeForNode(context.Background(), deps, parsed, "pve")
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err := freezeManagedVMExecution(deps.Config, shape)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(execution)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var keys map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &keys); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]string, 0, len(keys))
+			for k := range keys {
+				got = append(got, k)
+			}
+			sort.Strings(got)
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Errorf("job %q: frozen keys = %v; want the 0.9.5 keys %v", job, got, want)
+			}
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.DisallowUnknownFields()
+			var legacy legacyStorageVMExecution
+			if err := dec.Decode(&legacy); err != nil {
+				t.Errorf("job %q: the 0.9.5 strict decoder refused the plan: %v", job, err)
+			}
+			if legacy.DiskFormat != execution.DiskFormat {
+				t.Errorf("job %q: legacy DiskFormat = %q; want %q", job, legacy.DiskFormat, execution.DiskFormat)
+			}
+		}
 	}
-	var decoded StorageVMExecution
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatal(err)
+}
+
+func reflectFieldNames(v any) []string {
+	typ := reflect.TypeOf(v)
+	out := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		out = append(out, typ.Field(i).Name)
 	}
-	if decoded.ephemeralFormat() != "qcow2" {
-		t.Errorf("legacy ephemeral preference = %q; want the plan's DiskFormat", decoded.ephemeralFormat())
+	return out
+}
+
+func TestManagedPlanDiskFormat(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ rootType, rootFormat, ephType, requested, want string }{
+		{"nfs", "qcow2", "lvmthin", "", "qcow2"},
+		{"lvmthin", "raw", "nfs", "", "qcow2"},
+		{"lvmthin", "raw", "dir", "qcow2", "qcow2"},
+		{"lvmthin", "raw", "nfs", "raw", "raw"},
+		{"lvmthin", "raw", "nfs", "vmdk", "vmdk"},
+		{"lvmthin", "raw", "lvmthin", "qcow2", "raw"},
+		{"rbd", "raw", "nfs", "", "qcow2"},
+		{"lvm", "raw", "nfs", "", "raw"},
+		{"lvm", "qcow2", "lvmthin", "qcow2", "qcow2"},
+		{"lvmthin", "raw", "iscsi", "", "raw"},
+		{"lvmthin", "raw", "", "", "raw"},
 	}
-	withField := StorageVMExecution{Version: 1, DiskFormat: "raw", EphemeralDiskFormat: "qcow2"}
-	if withField.ephemeralFormat() != "qcow2" {
-		t.Errorf("ephemeral preference = %q; want qcow2", withField.ephemeralFormat())
+	for _, tc := range cases {
+		if got := managedPlanDiskFormat(tc.rootType, tc.rootFormat, tc.ephType, tc.requested); got != tc.want {
+			t.Errorf("managedPlanDiskFormat(%q, %q, %q, %q) = %q; want %q", tc.rootType, tc.rootFormat, tc.ephType, tc.requested, got, tc.want)
+		}
 	}
 }
 
@@ -355,26 +466,6 @@ func TestManagedVMExecutionFingerprint_UnsetDiskFormatMatchesLegacyQCOW2(t *test
 	}
 }
 
-func TestManagedEphemeralDiskFormat(t *testing.T) {
-	t.Parallel()
-	cases := []struct{ ephType, requested, root, want string }{
-		{"lvmthin", "", "raw", "raw"},
-		{"lvmthin", "", "qcow2", "qcow2"},
-		{"nfs", "", "qcow2", "qcow2"},
-		{"nfs", "", "raw", "qcow2"},
-		{"nfs", "qcow2", "raw", "qcow2"},
-		{"nfs", "raw", "raw", "raw"},
-		{"lvmthin", "qcow2", "raw", "raw"},
-		{"", "", "qcow2", "qcow2"},
-		{"nfs", "qed", "qed", "qed"},
-	}
-	for _, tc := range cases {
-		if got := managedEphemeralDiskFormat(tc.ephType, tc.requested, tc.root); got != tc.want {
-			t.Errorf("managedEphemeralDiskFormat(%q, %q, %q) = %q; want %q", tc.ephType, tc.requested, tc.root, got, tc.want)
-		}
-	}
-}
-
 func TestFinalizeCreateDiskFormat(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -390,7 +481,8 @@ func TestFinalizeCreateDiskFormat(t *testing.T) {
 		{"job qcow2 on lvmthin sends nothing and warns", "lvmthin", "qcow2", false, "", "", "raw", true, false},
 		{"job qcow2 on thick lvm sends nothing and warns", "lvm", "qcow2", false, "", "", "raw", true, false},
 		{"layer qcow2 on lvmthin sends raw and warns", "lvmthin", "qcow2", true, "raw", "", "raw", true, false},
-		{"layer qcow2 on thick lvm passes", "lvm", "qcow2", true, "qcow2", "", "qcow2", false, false},
+		{"layer qcow2 on thick lvm sends raw and warns", "lvm", "qcow2", true, "raw", "", "raw", true, false},
+		{"layer QCOW2 on nfs is lower-cased", "nfs", "QCOW2", true, "qcow2", ".qcow2", "qcow2", false, false},
 		{"layer raw on rbd", "rbd", "raw", true, "raw", "", "raw", false, false},
 		{"unset on unknown sends nothing", "", "", false, "", "", "qcow2", false, true},
 		{"layer raw on unknown is sent", "", "raw", true, "raw", "", "raw", false, false},
@@ -409,8 +501,9 @@ func TestFinalizeCreateDiskFormat(t *testing.T) {
 	}
 }
 
-// A managed persistent disk is file-backed, so its format is the request or
-// qcow2, and an empty or "auto" value at any layer counts as unset.
+// A managed persistent disk's request is the first explicit format, or ""
+// when the pool's type should decide, and an empty or "auto" value at any
+// layer counts as unset.
 func TestManagedDiskFormat_EmptyOrAutoIsUnset(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -420,8 +513,9 @@ func TestManagedDiskFormat_EmptyOrAutoIsUnset(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"nothing set is qcow2", nil, "", "qcow2", false},
-		{"call auto and job auto is qcow2", map[string]any{"disk_format": "auto"}, "auto", "qcow2", false},
+		{"nothing set is unset", nil, "", "", false},
+		{"call auto and job auto is unset", map[string]any{"disk_format": "auto"}, "auto", "", false},
+		{"call QCOW2 is lower-cased", map[string]any{"disk_format": "QCOW2"}, "", "qcow2", false},
 		{"call empty falls to job raw", map[string]any{"disk_format": ""}, "raw", "raw", false},
 		{"disk_type auto falls to job vmdk", map[string]any{"disk_type": "auto"}, "vmdk", "vmdk", false},
 		{"call raw wins", map[string]any{"disk_format": "raw"}, "qcow2", "raw", false},

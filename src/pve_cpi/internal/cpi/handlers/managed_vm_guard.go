@@ -156,7 +156,7 @@ func (m *managedVMAllocation) prepareIntendedVolume(target *aj.Target, role stri
 	switch role {
 	case storageRoleEphemeral:
 		definition := m.prepared.plan.Definitions[target.Storage]
-		_, suffix, err := pve.ManagedEphemeralVolumeName(definition.Type, m.shape.managedEphemeralFormat(), m.vmid, m.handle.Record().Namespace, m.handle.Record().ID)
+		_, suffix, err := pve.ManagedEphemeralVolumeName(definition.Type, m.shape.vmDiskFormat, m.vmid, m.handle.Record().Namespace, m.handle.Record().ID)
 		if err != nil {
 			return err
 		}

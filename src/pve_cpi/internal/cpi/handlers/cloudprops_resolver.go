@@ -131,8 +131,8 @@ func (r *layeredResolver) String(keys ...string) (string, bool) {
 // DiskFormat walks layers like String, but it also skips a value of "auto" in
 // any letter case, so an empty or "auto" disk_format or vm_disk_format on the
 // call, a disk_type profile, or a vm_type profile counts as unset and the next
-// key or layer decides. Returns ("", false) when no layer carries an explicit
-// format.
+// key or layer decides. An explicit format comes back trimmed and lower-cased.
+// Returns ("", false) when no layer carries an explicit format.
 func (r *layeredResolver) DiskFormat(keys ...string) (string, bool) {
 	for _, layer := range r.layers {
 		for _, key := range keys {
@@ -140,7 +140,7 @@ func (r *layeredResolver) DiskFormat(keys ...string) (string, bool) {
 			if !isStr || config.IsAutoDiskFormat(s) {
 				continue
 			}
-			return strings.TrimSpace(s), true
+			return strings.ToLower(strings.TrimSpace(s)), true
 		}
 	}
 	return "", false

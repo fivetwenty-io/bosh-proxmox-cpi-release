@@ -28,13 +28,18 @@ type managedDiskRequest struct {
 	plan                        *StorageAllocationPlan
 	ledger                      inv.Ledger
 	id, token, format, hint, az string
-	sizeGiB                     int
-	opts                        map[string]string
-	tags                        map[string]string
-	iterator                    *StoragePlanIterator
-	journal                     *aj.Journal
-	budget                      int
-	failedTargets               map[string]bool
+	// requested is the explicit format the request asked for, or "" when the
+	// planned pool's type decides. format is the result for the current plan.
+	requested     string
+	resolver      *layeredResolver
+	retain        *bool
+	sizeGiB       int
+	opts          map[string]string
+	tags          map[string]string
+	iterator      *StoragePlanIterator
+	journal       *aj.Journal
+	budget        int
+	failedTargets map[string]bool
 }
 
 func createManagedDisk(ctx context.Context, deps Deps, args []json.RawMessage, selection *StoragePlacementSelection, sizeMB int, cp createDiskCloudProperties, hint string, resolver *layeredResolver) (result any, retErr error) {
@@ -215,11 +220,11 @@ func prepareManagedDisk(ctx context.Context, deps Deps, selection *StoragePlacem
 				return nil, e
 			}
 		}
-		opts, e := managedDiskOptions(resolver, deps, format, cp.RetainOnDelete)
-		if e != nil {
+		managed := &managedDiskRequest{deps: deps, selection: selection, collector: collector, inventory: snapshot, plan: plan, ledger: ledger, id: id, token: token, requested: format, resolver: resolver, retain: cp.RetainOnDelete, hint: hint, az: cp.AvailabilityZone, sizeGiB: gib, tags: cp.Tags, iterator: iterator, budget: budget}
+		if e := managed.applyTargetFormat(ctx, plan); e != nil {
 			return nil, e
 		}
-		return &managedDiskRequest{deps: deps, selection: selection, collector: collector, inventory: snapshot, plan: plan, ledger: ledger, id: id, token: token, format: format, hint: hint, az: cp.AvailabilityZone, sizeGiB: gib, opts: opts, tags: cp.Tags, iterator: iterator, budget: budget}, nil
+		return managed, nil
 	}
 	return nil, cpierrors.Cloud("create_disk: hinted VM kept migrating; no allocation submitted")
 }
@@ -345,11 +350,10 @@ func (m *managedDiskRequest) executeAttempt(ctx context.Context, handle *aj.Hand
 	if err != nil {
 		return nil, cpierrors.Cloud("allocation %s: allocation VMID observation failed; no mutation submitted", m.id)
 	}
-	name, err := pve.AllocationVolumeName(vmid, m.plan.Namespace, m.id, m.format)
+	name, volume, err := pve.AllocationVolume(m.targetStorageType(), target.StorageID, vmid, m.plan.Namespace, m.id, m.format)
 	if err != nil {
 		return nil, err
 	}
-	volume := fmt.Sprintf("%s:%d/%s", target.StorageID, vmid, name)
 	cid, err := m.cid(volume)
 	if err != nil {
 		return nil, err
@@ -517,26 +521,68 @@ func managedDiskLegacyResolver(r *layeredResolver, selection *StoragePlacementSe
 	return &cloned
 }
 
-// managedDiskFormat returns the image format of a managed persistent disk. An
-// empty or "auto" disk_format at any layer, and an empty or "auto" job-level
-// pve.vm_disk_format, count as unset. An unset format is qcow2, which is what
-// pve.ResolveDiskFormat picks on file storage. A managed persistent disk is
-// always file-backed, because its allocation name carries the format as a file
-// extension and its ownership proof only parses file-backed volids, so the
-// format does not depend on which file pool the plan chooses. That keeps the
-// format we request, name, record, and verify the same across a retry that
-// moves the disk to another pool. A plan that lands on block storage keeps the
-// qcow2 it always requested there, so PVE rejects it before anything exists,
-// rather than allocating a raw volume the ownership proof cannot recognize.
+// managedDiskFormat returns the format a managed persistent disk's request
+// asks for. An empty or "auto" disk_format at any layer, and an empty or
+// "auto" job-level pve.vm_disk_format, count as unset, and the result is ""
+// so the planned pool's type decides (managedDiskTargetFormat). An explicit
+// format must be raw, qcow2, or vmdk, which we check before anything is
+// planned.
 func managedDiskFormat(deps Deps, resolver *layeredResolver) (string, error) {
 	format, _ := requestedDiskFormat(resolver, deps.Config, "disk_format")
-	if format == "" {
-		format = diskFormatQCOW2
-	}
-	if format != "raw" && format != "qcow2" && format != "vmdk" {
+	if format != "" && format != "raw" && format != "qcow2" && format != "vmdk" {
 		return "", cpierrors.Cloud("create_disk: unsupported managed disk format %q", format)
 	}
 	return format, nil
+}
+
+// managedDiskTargetFormat resolves a managed persistent disk's format against
+// the type of the pool its plan chose, with the same rule create_disk uses:
+// raw on block storage and qcow2 on file storage when the request is unset,
+// and an explicit qcow2 or vmdk on block storage, thick lvm included, coerced
+// to raw. iscsi and iscsidirect cannot allocate images, so a plan on them is
+// refused before any mutation. An unknown type keeps qcow2 and the file-style
+// name every managed persistent disk used before.
+func managedDiskTargetFormat(storageType, requested string) (pve.DiskFormatResolution, error) {
+	if !pve.StorageAllocatesImages(storageType) {
+		return pve.DiskFormatResolution{}, cpierrors.Cloud("create_disk: storage type %q cannot allocate disk images; no allocation submitted", storageType)
+	}
+	return pve.ResolveVolumeDiskFormat(storageType, requested), nil
+}
+
+// targetStorageType returns the type of the pool the current plan chose for
+// the persistent disk, or "" when the plan does not define it.
+func (m *managedDiskRequest) targetStorageType() string {
+	return planPersistentStorageType(m.plan)
+}
+
+func planPersistentStorageType(plan *StorageAllocationPlan) string {
+	if plan == nil || len(plan.Targets) == 0 {
+		return ""
+	}
+	return plan.Definitions[plan.Targets[0].StorageID].Type
+}
+
+// applyTargetFormat sets the format and the disk options for the pool plan
+// chose. It runs when the first plan is chosen and again when a retry moves
+// the disk to another pool, so the format we request, name, record in the
+// CID, and verify on readback always suits the pool we send it to.
+func (m *managedDiskRequest) applyTargetFormat(ctx context.Context, plan *StorageAllocationPlan) error {
+	storageType := planPersistentStorageType(plan)
+	res, err := managedDiskTargetFormat(storageType, m.requested)
+	if err != nil {
+		return err
+	}
+	storage := ""
+	if plan != nil && len(plan.Targets) > 0 {
+		storage = plan.Targets[0].StorageID
+	}
+	logDiskFormatResolution(m.deps.Log(ctx), "create_disk", storage, storageType, res, true)
+	opts, err := managedDiskOptionsFor(m.resolver, m.deps, storageType, res.Format, m.retain)
+	if err != nil {
+		return err
+	}
+	m.format, m.opts = res.Format, opts
+	return nil
 }
 
 func managedDiskDiscovery(r *StorageRoleSelection, nodes []string) inv.Request {
@@ -557,7 +603,18 @@ func managedDiskDiscovery(r *StorageRoleSelection, nodes []string) inv.Request {
 }
 
 func managedDiskOptions(resolver *layeredResolver, deps Deps, format string, retain *bool) (map[string]string, error) {
-	opts, e := resolveDiskPerfOptions(resolver, deps.Config, "nfs", format)
+	return managedDiskOptionsFor(resolver, deps, "", format, retain)
+}
+
+// managedDiskOptionsFor resolves a managed persistent disk's options. The TRIM
+// auto-resolution classifies a file pool as nfs, as it always has, and a block
+// pool by its own type.
+func managedDiskOptionsFor(resolver *layeredResolver, deps Deps, storageType, format string, retain *bool) (map[string]string, error) {
+	perfType := "nfs"
+	if pve.ClassifyStorageFormat(storageType) == pve.StorageFormatBlock {
+		perfType = storageType
+	}
+	opts, e := resolveDiskPerfOptions(resolver, deps.Config, perfType, format)
 	if e != nil {
 		return nil, e
 	}

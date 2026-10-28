@@ -160,6 +160,12 @@ func (m *managedDiskRequest) retryRejected(ctx context.Context, handle *aj.Handl
 	if plan.PolicyFingerprint != record.Intent.PolicyFingerprint {
 		return fmt.Errorf("retry changed original policy")
 	}
+	// The new pool may be of another type, so the format, name, and options
+	// follow it. This runs before the attempt begins, so a pool that cannot
+	// allocate images stops the retry with nothing recorded or submitted.
+	if err := m.applyTargetFormat(ctx, plan); err != nil {
+		return err
+	}
 	payload, err := json.Marshal(plan)
 	if err != nil {
 		return err

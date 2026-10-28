@@ -450,11 +450,11 @@ type createVMShape struct {
 	// ephemeralStorage is the PVE storage pool for the ephemeral disk.
 	// Only meaningful when ephemeralDiskGiB > 0.
 	ephemeralStorage string
-	// ephemeralDiskFormat is the format preference for the ephemeral disk. On
-	// the unmanaged path it is the explicit format the request carried, or ""
-	// when the ephemeral pool's type decides (pve.EphemeralVolumeFormat). On
-	// the managed path it is the preference frozen in the plan, which
-	// managedEphemeralFormat falls back to vmDiskFormat for when empty.
+	// ephemeralDiskFormat is the format preference for the unmanaged
+	// ephemeral disk: the explicit format the request carried, or "" when the
+	// ephemeral pool's type decides (pve.EphemeralVolumeFormat). The managed
+	// path never reads it; it derives the ephemeral format from vmDiskFormat
+	// and the planned pool's type, which is all a frozen plan records.
 	ephemeralDiskFormat string
 	// cpuType is the resolved emulated CPU type/model to write on the new VM
 	// (e.g. "host"). Resolved once via resolveVMShapeCPUType:

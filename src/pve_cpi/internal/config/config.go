@@ -2412,11 +2412,12 @@ func (c *CPIConfig) ApplyDefaults() {
 	}
 	// An unset vm_disk_format stays unset, and "auto" (any case, any
 	// surrounding whitespace) means the same thing, so we store both as empty.
-	// The format then comes from each target storage's type.
+	// The format then comes from each target storage's type. An explicit
+	// format is stored trimmed and lower-cased, so "QCOW2" means qcow2.
 	if IsAutoDiskFormat(c.VMDiskFormat) {
 		c.VMDiskFormat = ""
 	} else {
-		c.VMDiskFormat = strings.TrimSpace(c.VMDiskFormat)
+		c.VMDiskFormat = strings.ToLower(strings.TrimSpace(c.VMDiskFormat))
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"

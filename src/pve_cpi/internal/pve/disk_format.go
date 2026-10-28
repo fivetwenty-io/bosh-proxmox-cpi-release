@@ -90,9 +90,38 @@ type DiskFormatResolution struct {
 	Fallback bool
 }
 
-// ResolveDiskFormat picks the disk format for a volume on storage of the given
-// type. requested is the first explicit format the caller's layers produced;
-// an empty or "auto" value (config.IsAutoDiskFormat) leaves the choice to the
+// NormalizeDiskFormat trims an explicit format and lower-cases it, so "QCOW2"
+// and " raw " name the same formats as "qcow2" and "raw". Empty and "auto"
+// values come back as "".
+func NormalizeDiskFormat(v string) string {
+	if config.IsAutoDiskFormat(v) {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(v))
+}
+
+// StorageAllocatesImages reports whether the CPI can ask a storage type to
+// allocate a new disk image. iscsi and iscsidirect expose LUNs that already
+// exist, and PVE refuses to allocate on them, so the CPI refuses ephemeral
+// and persistent disks there before anything is created.
+func StorageAllocatesImages(storageType string) bool {
+	switch strings.ToLower(strings.TrimSpace(storageType)) {
+	case StorageTypeISCSI, StorageTypeISCSIDirect:
+		return false
+	}
+	return true
+}
+
+// IsThickLVMStorage reports whether the storage type is thick lvm, the one
+// block type where a root disk's explicit qcow2 reaches PVE unchanged.
+func IsThickLVMStorage(storageType string) bool {
+	return strings.EqualFold(strings.TrimSpace(storageType), StorageTypeLVM)
+}
+
+// ResolveDiskFormat picks the format for a root disk, which the CPI writes
+// through import-from or a full clone, on storage of the given type.
+// requested is the first explicit format the caller's layers produced; an
+// empty or "auto" value (config.IsAutoDiskFormat) leaves the choice to the
 // type.
 //
 // When the choice is automatic, file storage gets qcow2 and block storage gets
@@ -100,12 +129,24 @@ type DiskFormatResolution struct {
 // type was consulted, and Fallback is set so the caller can warn.
 //
 // An explicit format passes through on file storage and on an unknown type. On
-// block storage raw passes through, and so does qcow2 on thick lvm, because
-// PVE 9 can hold qcow2 there when the storage enables
-// snapshot-as-volume-chain. An explicit qcow2 or vmdk anywhere else on block
-// storage becomes raw with Coerced set. Any other explicit string passes
-// through untouched, so PVE rejects it exactly as it did before.
+// block storage raw passes through, and so does qcow2 on thick lvm, which is
+// sent to PVE unchanged so that PVE decides; PVE 9 holds it as a volume chain
+// when the storage enables snapshot-as-volume-chain. An explicit qcow2 or vmdk
+// anywhere else on block storage becomes raw with Coerced set. Any other
+// explicit string passes through, lower-cased, so PVE rejects it as before.
 func ResolveDiskFormat(storageType, requested string) DiskFormatResolution {
+	return resolveDiskFormat(storageType, requested, true)
+}
+
+// ResolveVolumeDiskFormat picks the format for a volume the CPI allocates
+// itself, which is a persistent or ephemeral disk. It follows
+// ResolveDiskFormat, except that thick lvm coerces an explicit qcow2 to raw
+// like every other block type.
+func ResolveVolumeDiskFormat(storageType, requested string) DiskFormatResolution {
+	return resolveDiskFormat(storageType, requested, false)
+}
+
+func resolveDiskFormat(storageType, requested string, lvmKeepsQCOW2 bool) DiskFormatResolution {
 	class := ClassifyStorageFormat(storageType)
 	if config.IsAutoDiskFormat(requested) {
 		res := DiskFormatResolution{Class: class, Auto: true}
@@ -120,14 +161,14 @@ func ResolveDiskFormat(storageType, requested string) DiskFormatResolution {
 		}
 		return res
 	}
-	explicit := strings.TrimSpace(requested)
+	explicit := NormalizeDiskFormat(requested)
 	res := DiskFormatResolution{Format: explicit, Requested: explicit, Class: class}
 	if class != StorageFormatBlock {
 		return res
 	}
 	switch explicit {
 	case DiskFormatQCOW2:
-		if strings.EqualFold(strings.TrimSpace(storageType), StorageTypeLVM) {
+		if lvmKeepsQCOW2 && IsThickLVMStorage(storageType) {
 			return res
 		}
 		res.Format, res.Coerced = DiskFormatRaw, true

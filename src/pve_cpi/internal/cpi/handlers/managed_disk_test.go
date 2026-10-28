@@ -253,7 +253,12 @@ func (s managedDiskTestStorage) Exists(_ context.Context, _ string, _ string, vo
 	return ok, nil
 }
 func (s managedDiskTestStorage) CreateVolume(_ context.Context, _ string, pool string, gib int, format string, vmid int, name string) (string, error) {
+	// PVE returns a path-form volid for a file-style name and a bare volid on
+	// block storage.
 	volume := fmt.Sprintf("%s:%d/%s", pool, vmid, name)
+	if !strings.Contains(name, ".") {
+		volume = pool + ":" + name
+	}
 	if s.state.before != nil {
 		s.state.before(volume)
 	}
@@ -279,6 +284,14 @@ func (s managedDiskTestStorage) DeleteVolumeAsync(context.Context, string, strin
 
 func managedDiskFixture(t *testing.T, strategy string, plural bool) (*managedDiskRequest, *aj.Handle, *managedDiskTestState) {
 	t.Helper()
+	m, h, state, _ := managedDiskCallFixture(t, strategy, plural, nil)
+	return m, h, state
+}
+
+// managedDiskCallFixture is managedDiskFixture with call as the
+// cloud_properties layer and an observed warning log.
+func managedDiskCallFixture(t *testing.T, strategy string, plural bool, call map[string]any) (*managedDiskRequest, *aj.Handle, *managedDiskTestState, *log.Observer) {
+	t.Helper()
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -289,12 +302,13 @@ func managedDiskFixture(t *testing.T, strategy string, plural bool) (*managedDis
 	}
 	cfg := &config.CPIConfig{Node: "n1", DiskStorage: "legacy-forbidden", DetachedDiskStrategy: "free", StoragePlacementNamespace: "namespace", StorageAllocationJournalDir: dir, PersistentStorageSet: "P", StorageSets: map[string]config.StorageSet{"P": {Names: names, Strategy: config.StoragePlacementStrategy{Name: strategy, Version: 1}}}}
 	state := &managedDiskTestState{volumes: map[string]*nodes.GetStorageContentResponse{}}
-	deps := Deps{Config: cfg, PVE: managedDiskTestPVE{state: state}, Logger: log.NewNopLogger()}
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	deps := Deps{Config: cfg, PVE: managedDiskTestPVE{state: state}, Logger: logger}
 	selection, err := ResolveStoragePlacementSelectors(cfg, "create_disk", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := newLayeredResolver(nil, cfg)
+	r, err := newLayeredResolver(call, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +345,7 @@ func managedDiskFixture(t *testing.T, strategy string, plural bool) (*managedDis
 			t.Fatal("mutation preceded exact durable intent")
 		}
 	}
-	return m, h, state
+	return m, h, state, obs
 }
 
 func TestManagedDiskSelectedTargetAndFreeCID(t *testing.T) {

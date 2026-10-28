@@ -483,13 +483,19 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		if err != nil {
 			return err
 		}
-		// An empty or "auto" override counts as unset, so the job-level
-		// pve.vm_disk_format still decides, and when that is unset too the
-		// target storage's type does.
-		if IsAutoDiskFormat(s) {
+		// An empty override is no override, so the job-level
+		// pve.vm_disk_format stands. An "auto" override (any case) clears the
+		// job value for this cluster, so each disk's format comes from its
+		// target storage's type even when the job sets an explicit format.
+		// An explicit override is stored trimmed and lower-cased.
+		switch {
+		case strings.TrimSpace(s) == "":
 			return nil
+		case IsAutoDiskFormat(s):
+			c.VMDiskFormat = ""
+		default:
+			c.VMDiskFormat = strings.ToLower(strings.TrimSpace(s))
 		}
-		c.VMDiskFormat = s
 		return nil
 	},
 	"pve_placement": func(c *CPIConfig, v any) error {

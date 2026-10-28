@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // sentVolume records the format and name create_disk passed to CreateVolume.
@@ -50,7 +51,8 @@ func TestHandleCreateDisk_FormatFromStorageType(t *testing.T) {
 		{"call qcow2 on lvmthin sends raw", "lvmthin", "", map[string]any{"disk_format": "qcow2"}, "raw", "", "raw"},
 		{"job qcow2 on lvmthin sends nothing", "lvmthin", "qcow2", nil, "", "", "raw"},
 		{"job qcow2 on thick lvm sends nothing", "lvm", "qcow2", nil, "", "", "raw"},
-		{"call qcow2 on thick lvm passes through", "lvm", "", map[string]any{"disk_format": "qcow2"}, "qcow2", "", "raw"},
+		{"call qcow2 on thick lvm sends raw", "lvm", "", map[string]any{"disk_format": "qcow2"}, "raw", "", "raw"},
+		{"call QCOW2 on nfs is lower-cased", "nfs", "", map[string]any{"disk_format": "QCOW2"}, "qcow2", ".qcow2", "qcow2"},
 		{"unset on nfs sends qcow2", "nfs", "", nil, "qcow2", ".qcow2", "qcow2"},
 		{"job auto on dir sends qcow2", "dir", "auto", nil, "qcow2", ".qcow2", "qcow2"},
 		{"call empty falls to job raw on nfs", "nfs", "raw", map[string]any{"disk_format": ""}, "raw", ".raw", "raw"},
@@ -83,5 +85,31 @@ func TestHandleCreateDisk_FormatFromStorageType(t *testing.T) {
 				t.Errorf("recorded format = %q; want %q", meta.Format, tc.wantRecord)
 			}
 		})
+	}
+}
+
+// On a storage type the CPI does not classify, create_disk sends no format
+// unless cloud_properties set one, so the warning says that PVE applies the
+// storage's own default rather than claiming a qcow2 fallback.
+func TestHandleCreateDisk_UnknownTypeWarnsThatPVEDecides(t *testing.T) {
+	t.Parallel()
+	sent := &sentVolume{}
+	deps := depsForCreateDiskFormatRecord(capturingFormatStorageSvc(sent), "esxi", "")
+	logger, obs := log.NewObservedLogger(log.LevelWarn)
+	deps.Logger = logger
+	createDiskMetaWith(t, deps, nil)
+	sent.mu.Lock()
+	defer sent.mu.Unlock()
+	if sent.format != "" {
+		t.Errorf("format sent to PVE = %q; want none", sent.format)
+	}
+	var warnings []string
+	for _, e := range obs.All() {
+		if strings.Contains(e.Message, "storage type is unknown") {
+			warnings = append(warnings, e.Message)
+		}
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "sends no disk format and PVE applies the storage's default") {
+		t.Errorf("unknown-type warnings = %v; want one saying PVE applies the storage's default", warnings)
 	}
 }

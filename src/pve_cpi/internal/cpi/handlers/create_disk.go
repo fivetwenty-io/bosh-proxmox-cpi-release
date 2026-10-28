@@ -315,7 +315,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		// provisional format, which only feeds the TRIM decision, uses
 		// whatever type is already known.
 		requestedFormat, formatFound := requestedDiskFormat(r, deps.Config, "disk_format")
-		format := pve.ResolveDiskFormat("", requestedFormat).Format
+		format := pve.ResolveVolumeDiskFormat("", requestedFormat).Format
 
 		// Disk-performance options are resolved after storage+format so the
 		// discard/ssd auto-resolution (see resolveDiskPerfOptions) can classify
@@ -329,7 +329,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		var storageType string
 		if needsDiskPerfStorageTypeLookup(r, deps.Config) {
 			storageType = lookupVMStorageType(ctx, deps, storage)
-			format = pve.ResolveDiskFormat(storageType, requestedFormat).Format
+			format = pve.ResolveVolumeDiskFormat(storageType, requestedFormat).Format
 		}
 
 		// Diagnostic only, never mutates storage config, never fails this
@@ -396,7 +396,7 @@ func HandleCreateDisk(deps Deps) Handler {
 			}
 		}
 		formatArg, volExt, resolution := finalizeCreateDiskFormat(storageType, requestedFormat, formatFound)
-		logDiskFormatResolution(deps.Log(ctx), "create_disk", storage, storageType, resolution)
+		logDiskFormatResolution(deps.Log(ctx), "create_disk", storage, storageType, resolution, formatArg != "")
 		// The recorded format is the format sent to PVE, or on block storage
 		// with no format sent, the raw PVE allocates there.
 		format = recordedDiskFormat(resolution.Format, storageType)

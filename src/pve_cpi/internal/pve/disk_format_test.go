@@ -74,6 +74,51 @@ func TestResolveDiskFormat(t *testing.T) {
 	}
 }
 
+// ResolveVolumeDiskFormat matches ResolveDiskFormat except that thick lvm
+// coerces an explicit qcow2 to raw like every other block type.
+func TestResolveVolumeDiskFormat(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		storageType, requested string
+		want                   DiskFormatResolution
+	}{
+		{"lvm", "qcow2", DiskFormatResolution{Format: "raw", Requested: "qcow2", Class: StorageFormatBlock, Coerced: true}},
+		{"lvm", "", DiskFormatResolution{Format: "raw", Class: StorageFormatBlock, Auto: true}},
+		{"lvmthin", "QCOW2", DiskFormatResolution{Format: "raw", Requested: "qcow2", Class: StorageFormatBlock, Coerced: true}},
+		{"nfs", "QCOW2", DiskFormatResolution{Format: "qcow2", Requested: "qcow2", Class: StorageFormatFile}},
+		{"nfs", "", DiskFormatResolution{Format: "qcow2", Class: StorageFormatFile, Auto: true}},
+		{"pbs", "", DiskFormatResolution{Format: "qcow2", Class: StorageFormatUnknown, Auto: true, Fallback: true}},
+	}
+	for _, tc := range cases {
+		if got := ResolveVolumeDiskFormat(tc.storageType, tc.requested); got != tc.want {
+			t.Errorf("ResolveVolumeDiskFormat(%q, %q) = %+v; want %+v", tc.storageType, tc.requested, got, tc.want)
+		}
+	}
+	if got := ResolveDiskFormat("LVM", " QCOW2 "); got.Format != "qcow2" || got.Coerced {
+		t.Errorf("ResolveDiskFormat(LVM, QCOW2) = %+v; want qcow2 kept for a root disk", got)
+	}
+}
+
+func TestNormalizeDiskFormatAndImageAllocation(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{"": "", "auto": "", "AUTO": "", "QCOW2": "qcow2", "raw": "raw", "Vmdk": "vmdk"} {
+		if got := NormalizeDiskFormat(in); got != want {
+			t.Errorf("NormalizeDiskFormat(%q) = %q; want %q", in, got, want)
+		}
+	}
+	if got := NormalizeDiskFormat("  Raw  "); got != "raw" {
+		t.Errorf("NormalizeDiskFormat with padding = %q; want raw", got)
+	}
+	for typ, want := range map[string]bool{"iscsi": false, "ISCSIDirect": false, "lvmthin": true, "zfs": true, "nfs": true, "": true} {
+		if got := StorageAllocatesImages(typ); got != want {
+			t.Errorf("StorageAllocatesImages(%q) = %v; want %v", typ, got, want)
+		}
+	}
+	if !IsThickLVMStorage("LVM") || IsThickLVMStorage("lvmthin") {
+		t.Error("IsThickLVMStorage misclassifies lvm or lvmthin")
+	}
+}
+
 func TestEphemeralVolumeFormat_UnsetPicksFromStorageType(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -88,9 +133,16 @@ func TestEphemeralVolumeFormat_UnsetPicksFromStorageType(t *testing.T) {
 		{"nfs", "raw", "raw", false},
 		{"lvmthin", "qcow2", "raw", false},
 		{"lvm", "qcow2", "raw", false},
+		{"nfs", "QCOW2", "qcow2", false},
+		{"dir", " Raw ", "raw", false},
 		{"", "", "", true},
 		{"cephfs", "", "", true},
 		{"nfs", "qed", "", true},
+		// iscsi and iscsidirect cannot allocate images, so the CPI refuses an
+		// ephemeral disk there before anything is created, as it always has.
+		{"iscsi", "", "", true},
+		{"iscsidirect", "raw", "", true},
+		{"esxi", "", "", true},
 	}
 	for _, tc := range cases {
 		got, err := EphemeralVolumeFormat(tc.storageType, tc.preferred)

@@ -162,13 +162,15 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// format we verify is the format we requested. Linked clones still
 	// inherit the template's format, because they send no format at all.
 	rootFormat := pve.ResolveDiskFormat(vmStorageType, requestedFormat)
-	logDiskFormatResolution(deps.Log(ctx), "create_vm: root disk", vmStorage, vmStorageType, rootFormat)
+	logDiskFormatResolution(deps.Log(ctx), "create_vm: root disk", vmStorage, vmStorageType, rootFormat, true)
 	vmDiskFormat := rootFormat.Format
 
 	// The ephemeral disk resolves its own format against its own pool. The
 	// unmanaged path carries the request through to attachEphemeralDisk,
-	// which learns the pool's type there. The managed path knows the type
-	// from the frozen plan's definitions, so we resolve it here.
+	// which learns the pool's type there. The managed path derives the
+	// ephemeral format from the plan's DiskFormat and the ephemeral pool's
+	// type, as every release has, so managedPlanDiskFormat below picks a
+	// DiskFormat that gives the ephemeral disk the format its pool calls for.
 	ephemeralDiskFormat := requestedFormat
 
 	// rootDiskKeyVal is the PVE VM config key the root disk lands on: virtio0
@@ -232,7 +234,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 			ephemeralDiskGiB, err = managedVMGiB(target.VirtualBytes)
 			ephemeralStorage = target.StorageID
 			ephemeralType := parsed.storagePlan.Definitions[ephemeralStorage].Type
-			ephemeralDiskFormat = managedEphemeralDiskFormat(ephemeralType, requestedFormat, vmDiskFormat)
+			vmDiskFormat = managedPlanDiskFormat(vmStorageType, vmDiskFormat, ephemeralType, requestedFormat)
 			warnEphemeralFormatCoercion(deps.Log(ctx), "create_vm: ephemeral disk", ephemeralStorage, ephemeralType, requestedFormat)
 		}
 	case parsed.storageSelection != nil && parsed.storageSelection.Ephemeral != nil && parsed.storageSelection.Ephemeral.Atomic:
@@ -398,9 +400,9 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 	case ok:
 		vmDiskFormat = df
 	case !config.IsAutoDiskFormat(cp.VMDiskFormat):
-		vmDiskFormat = strings.TrimSpace(cp.VMDiskFormat)
+		vmDiskFormat = pve.NormalizeDiskFormat(cp.VMDiskFormat)
 	case !config.IsAutoDiskFormat(cfg.VMDiskFormat):
-		vmDiskFormat = strings.TrimSpace(cfg.VMDiskFormat)
+		vmDiskFormat = pve.NormalizeDiskFormat(cfg.VMDiskFormat)
 	default:
 		vmDiskFormat = ""
 	}

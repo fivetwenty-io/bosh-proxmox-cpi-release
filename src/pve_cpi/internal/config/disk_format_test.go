@@ -25,7 +25,7 @@ func TestIsAutoDiskFormat(t *testing.T) {
 // unset, and an explicit format is kept.
 func TestApplyDefaults_VMDiskFormat(t *testing.T) {
 	t.Parallel()
-	cases := map[string]string{"": "", "auto": "", " AUTO ": "", "raw": "raw", "qcow2": "qcow2", " vmdk ": "vmdk"}
+	cases := map[string]string{"": "", "auto": "", " AUTO ": "", "raw": "raw", "qcow2": "qcow2", " vmdk ": "vmdk", "QCOW2": "qcow2", " Raw ": "raw"}
 	for in, want := range cases {
 		cfg := validBaseCfg()
 		cfg.VMDiskFormat = in
@@ -55,8 +55,10 @@ func TestValidate_VMDiskFormat(t *testing.T) {
 	}
 }
 
-// An empty or "auto" pve_vm_disk_format context override counts as unset, so
-// the job-level value still decides. An explicit override replaces it.
+// An empty pve_vm_disk_format context override is no override, so the
+// job-level value stands. An "auto" override clears the job value for that
+// cluster, so the storage type decides even when the job sets a format. An
+// explicit override replaces the job value.
 func TestApplyContextOverrides_VMDiskFormat(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -65,11 +67,14 @@ func TestApplyContextOverrides_VMDiskFormat(t *testing.T) {
 		want       string
 	}{
 		{"empty override keeps job raw", "raw", "", "raw"},
-		{"auto override keeps job raw", "raw", "auto", "raw"},
-		{"AUTO override keeps job unset", "", " AUTO ", ""},
+		{"blank override keeps job qcow2", "qcow2", "  ", "qcow2"},
 		{"empty override keeps job unset", "", "", ""},
+		{"auto override clears job raw", "raw", "auto", ""},
+		{"AUTO override clears job qcow2", "qcow2", " AUTO ", ""},
+		{"auto override keeps job unset", "", "auto", ""},
 		{"raw override replaces job unset", "", "raw", "raw"},
 		{"qcow2 override replaces job raw", "raw", "qcow2", "qcow2"},
+		{"QCOW2 override is lower-cased", "raw", " QCOW2 ", "qcow2"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

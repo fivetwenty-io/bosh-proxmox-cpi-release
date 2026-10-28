@@ -40,6 +40,44 @@ func TestAllocationVolumeProtocolGolden(t *testing.T) {
 	}
 }
 
+// On block storage the allocation volume is a bare name with no extension,
+// and the parser accepts that form while still refusing a bare name with an
+// extension and a path-form name without one.
+func TestAllocationVolumeFollowsStorageType(t *testing.T) {
+	t.Parallel()
+	const id = "12345678-1234-4234-8234-123456789abc"
+	const stem = "vm-9000-bosh-ba7816bf8f01cfea-alloc-12345678-1234-4234-8234-123456789abc"
+	cases := []struct {
+		storageType, format, wantName, wantVolid string
+	}{
+		{"lvmthin", "raw", stem, "pool:" + stem},
+		{"rbd", "raw", stem, "pool:" + stem},
+		{"zfspool", "raw", stem, "pool:" + stem},
+		{"nfs", "qcow2", stem + ".qcow2", "pool:9000/" + stem + ".qcow2"},
+		{"dir", "raw", stem + ".raw", "pool:9000/" + stem + ".raw"},
+		{"", "qcow2", stem + ".qcow2", "pool:9000/" + stem + ".qcow2"},
+	}
+	for _, tc := range cases {
+		name, volid, err := AllocationVolume(tc.storageType, "pool", 9000, "abc", id, tc.format)
+		if err != nil || name != tc.wantName || volid != tc.wantVolid {
+			t.Errorf("AllocationVolume(%q, %q) = (%q, %q, %v); want (%q, %q)", tc.storageType, tc.format, name, volid, err, tc.wantName, tc.wantVolid)
+			continue
+		}
+		locator, got, ok := ParseAllocationVolumeID(volid)
+		if !ok || got != id || locator != "ba7816bf8f01cfea" {
+			t.Errorf("ParseAllocationVolumeID(%q) = (%q, %q, %t)", volid, locator, got, ok)
+		}
+	}
+	if _, _, err := AllocationVolume("lvmthin", "pool", 9000, "abc", id, ""); err == nil {
+		t.Error("AllocationVolume accepted an empty format")
+	}
+	for _, bad := range []string{"pool:" + stem + ".raw", "pool:9000/" + stem, "pool:9000/" + stem + ".qed", "pool:" + stem + "x"} {
+		if _, _, ok := ParseAllocationVolumeID(bad); ok {
+			t.Errorf("accepted invalid provenance %q", bad)
+		}
+	}
+}
+
 type allocationScanClient struct {
 	Client
 	entries nodes.ListStorageContentResponse
