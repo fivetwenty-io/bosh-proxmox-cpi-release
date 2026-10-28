@@ -164,6 +164,6 @@ class: visual-right
 - Layered resolution will run global default → pool/profile → per-call, most-specific wins, so a pool overrides the global and a disk overrides the pool.
 - Storage tier will be matched on capability at call time, not by hardcoding a pool name — storage topology can change without breaking routing.
 - Concrete knobs to bake in: iothread, cache mode, discard, ssd, mbps_rd/wr, iops_rd/wr — applied automatically when the disk attaches.
-- Gotcha: disk_format must match the backend — raw is required for lvm/lvmthin/zfspool, qcow2 only on file storages; a mismatch is a hard error.
+- Gotcha: leave disk_format unset and the CPI picks raw on block storage and qcow2 on file storage. An explicit qcow2 on block storage becomes raw with a warning, so it never fails the deploy.
 -->
 

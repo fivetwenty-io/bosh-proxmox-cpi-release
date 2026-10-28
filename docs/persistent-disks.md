@@ -39,7 +39,7 @@ All keys are optional. Unset keys fall back to CPI defaults
 | Key                  | Type    | Effect                                                                                                                                                                                     |
 | -------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `storage`            | String  | Overrides the global `disk_storage` for this pool.                                                                                                                                         |
-| `disk_format`        | String  | PVE disk format: `qcow2`, `raw`, or `vmdk`. When the key is absent, empty, or `auto`, the CPI picks `qcow2` on file storage and `raw` on block storage. On block storage it also replaces an explicit `qcow2` or `vmdk` with `raw`, except that thick `lvm` keeps an explicit `qcow2`. This key outranks the `pve.vm_disk_format` job property, so a pool that holds raw volumes you did not ask for is almost always carrying a `disk_format: raw` here. [Operations, Where the format comes from](operations.md) walks the full resolution order. |
+| `disk_format`        | String  | PVE disk format: `qcow2`, `raw`, or `vmdk`. When the key is absent, empty, or `auto`, the CPI picks `qcow2` on file storage and `raw` on block storage. On block storage, thick `lvm` included, it also replaces an explicit `qcow2` or `vmdk` with `raw` and logs a warning. Format names ignore case, so `QCOW2` means `qcow2`. This key outranks the `pve.vm_disk_format` job property, so a pool that holds raw volumes you did not ask for is almost always carrying a `disk_format: raw` here. [Operations, Where the format comes from](operations.md) walks the full resolution order. |
 | `node`               | String  | Pins disks to a specific PVE node. Required when no `vm_cid` hint is available and the disk pool maps to a local-backend storage. Ignored by shared backends.                              |
 | `iothread`           | Boolean | Enables a dedicated I/O thread for the disk controller. Improves throughput on multi-core VMs. Overrides `pve.disk_performance.iothread`, which defaults to `true` — set `false` here to opt this disk out of the global default. |
 | `cache`              | String  | PVE cache mode for the disk. Accepted values: `none`, `writethrough`, `writeback`, `unsafe`, `directsync`. Omit to use PVE's default.                                                      |
@@ -240,7 +240,7 @@ disk_pools:
   disk_size: 10240
   cloud_properties:
     storage: ceph-rbd        # type=rbd → shared backend, any node attaches
-    disk_format: raw         # rbd does not support qcow2
+    disk_format: raw         # optional, rbd gets raw when the format is unset
 ```
 
 No `node` field is needed. The CPI uses `config.node` for the storage call; the disk

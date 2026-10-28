@@ -133,7 +133,7 @@ Specific topics:
   What surfaces in BOSH task output versus what stays in CPI logs, and the secrets-redaction contract.
 
 - [Persistent disks](docs/operations.md#persistent-disks-cloud_properties)
-  `disk_format` cloud-property requirements for LVM/ZFS pools (`raw`) versus directory/network-backed pools (`qcow2`).
+  How the CPI picks `raw` for block pools and `qcow2` for file pools when `disk_format` is unset, and what an explicit `disk_format` does on each.
 
 - [Persistent disk lifecycle strategy](docs/persistent-disk-strategy.md)
   The free-floating and parked detachment strategies, `scripts/disk-audit`, parker VM teardown, and provenance sentinel details.

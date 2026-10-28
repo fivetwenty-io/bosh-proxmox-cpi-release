@@ -122,9 +122,9 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Format selection per storage backend.**
 
-**Best practice.** Block-backed storages (LVM, LVM-thin, ZFS pool) reject the qcow2 format outright and only accept raw; file-backed storages (dir, NFS, CIFS) support qcow2's copy-on-write and snapshot capabilities that raw lacks.
+**Best practice.** Block-backed storages (LVM-thin, ZFS pool, and RBD) hold raw volumes, and thick LVM holds qcow2 only when PVE 9 stores it as a volume chain. File-backed storages (dir, NFS, and CIFS) support qcow2's copy-on-write and snapshot capabilities that raw lacks. Leaving the format unset lets each disk get the format its pool suits.
 
-**CPI behavior.** `pve.vm_disk_format` is empty by default, and an empty or `auto` value at any layer counts as unset. When no layer sets an explicit format, the CPI picks the format from the type of the storage each disk lands on, after it chooses that storage. File storage gets `qcow2` and block storage gets `raw`. An explicit `qcow2` or `vmdk` on block storage is replaced with `raw` and logged as a warning, except on thick `lvm`, where PVE accepts `qcow2` and allocates raw. An unknown storage type, or a failed type lookup, keeps the old `qcow2` default with a warning and never fails the deploy. [Operations, Where the format comes from](operations.md#where-the-format-comes-from-and-why-a-pool-can-hold-raw-volumes-you-did-not-ask-for) has the full rules.
+**CPI behavior.** `pve.vm_disk_format` is empty by default, and an empty or `auto` value at any layer counts as unset. When no layer sets an explicit format, the CPI picks the format from the type of the storage each disk lands on, after it chooses that storage. File storage gets `qcow2` and block storage gets `raw`. An explicit `qcow2` or `vmdk` on block storage is replaced with `raw` and logged as a warning. The one exception is a root disk on thick `lvm`, where the CPI sends an explicit `qcow2` unchanged and lets PVE decide. For a root disk, an unknown storage type or a failed type lookup keeps the old `qcow2` default with a warning and never fails the deploy. [Operations, Where the format comes from](operations.md#where-the-format-comes-from-and-why-a-pool-can-hold-raw-volumes-you-did-not-ask-for) has the full rules.
 
 **Status.** Meets.
 

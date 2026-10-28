@@ -318,12 +318,15 @@ properties:
       Disk image format for the disks the CPI creates. Accepts qcow2, raw,
       vmdk, auto, or empty. When it is empty or "auto", which is the default,
       the CPI picks the format from the type of the storage each disk lands
-      on. Block storage (lvm, lvmthin, zfspool, zfs, rbd, iscsi, and
-      iscsidirect) gets raw, and file storage (dir, nfs, cifs, glusterfs,
-      cephfs, and btrfs) gets qcow2. An unknown storage type keeps qcow2 and
-      logs a warning. An explicit qcow2 or vmdk on block storage becomes raw
-      with a warning, except that an explicit qcow2 on thick lvm is passed to
-      PVE as is. A disk_format or vm_disk_format in cloud_properties, a
+      on. Block storage (lvm, lvmthin, zfspool, zfs, and rbd) gets raw, and
+      file storage (dir, nfs, cifs, glusterfs, and btrfs) gets qcow2. For a
+      root disk, an unknown storage type keeps qcow2 and logs a warning. An
+      explicit qcow2 or vmdk on block storage becomes raw with a warning,
+      except that an explicit qcow2 for a root disk on thick lvm is passed to
+      PVE as is. Format names ignore case. A per-cluster pve_vm_disk_format
+      override that is empty leaves this property in force, and one set to
+      "auto" makes that cluster pick from the storage type. A disk_format
+      or vm_disk_format in cloud_properties, a
       disk_type, or a vm_type takes precedence, and an empty or "auto" value
       there counts as unset. Omitted from the rendered cpi.json when empty.
     default: ""

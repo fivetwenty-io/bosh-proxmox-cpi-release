@@ -1237,9 +1237,10 @@ We can set `disk_format` in the `cloud_properties` of a `persistent_disk_type`, 
 
 | Pool type | `disk_format` | Notes |
 |---|---|---|
-| `lvmthin`, `zfspool`, `zfs`, `rbd`, `iscsi`, `iscsidirect` | omit (the CPI picks `raw`) | These pools hold only raw volumes. An explicit `qcow2` or `vmdk` is replaced with `raw`, and the CPI logs a warning. |
-| `lvm` (thick) | omit (the CPI picks `raw`) | An explicit `qcow2` passes through to PVE, which allocates raw. An explicit `vmdk` is replaced with `raw`. |
-| `dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`, `btrfs` | omit (the CPI picks `qcow2`) | qcow2 keeps copy-on-write and snapshots. `raw` and `vmdk` are also valid and are used as given. |
+| `lvmthin`, `zfspool`, `zfs`, `rbd` | omit (the CPI picks `raw`) | These pools hold only raw volumes. An explicit `qcow2` or `vmdk` is replaced with `raw`, and the CPI logs a warning. |
+| `lvm` (thick) | omit (the CPI picks `raw`) | An explicit `qcow2` or `vmdk` is replaced with `raw` for a persistent disk, and the CPI logs a warning. |
+| `iscsi`, `iscsidirect` | not supported | These types expose LUNs that already exist, so the CPI refuses to create a persistent disk there. |
+| `dir`, `nfs`, `cifs`, `glusterfs`, `btrfs` | omit (the CPI picks `qcow2`) | qcow2 keeps copy-on-write and snapshots. `raw` and `vmdk` are also valid and are used as given. |
 
 ### Example manifest snippet
 
@@ -1266,23 +1267,27 @@ A `disk_format` or `vm_disk_format` that is empty or `auto` counts as unset, the
 
 ### Where the format comes from, and why a pool can hold raw volumes you did not ask for
 
-The CPI looks for a requested format in four places, and the first one that carries an explicit format wins. A `disk_format` in the call's own `cloud_properties` comes first, then a `disk_format` on a `disk_type` or `vm_type` profile declared in the CPI config, and then the `pve.vm_disk_format` job property, which a `cpi-config` entry may override per cluster as `pve_vm_disk_format`. VM root disks and ephemeral disks read `vm_disk_format` at the first two places and fall back to the same job property. An empty or `auto` value at any of the four places counts as unset, so the search moves on to the next place, and the CPI never sends an empty or `auto` format to PVE.
+The CPI looks for a requested format in four places, and the first one that carries an explicit format wins. A `disk_format` in the call's own `cloud_properties` comes first, then a `disk_format` on a `disk_type` or `vm_type` profile declared in the CPI config, and then the `pve.vm_disk_format` job property, which a `cpi-config` entry may override per cluster as `pve_vm_disk_format`. VM root disks and ephemeral disks read `vm_disk_format` at the first two places and fall back to the same job property. An empty or `auto` value at any of the four places counts as unset, so the search moves on to the next place, and the CPI never sends an empty or `auto` format to PVE. Format names ignore case, so `QCOW2` means `qcow2`.
+
+The `pve_vm_disk_format` override in a `cpi-config` entry works a little differently. An empty override means the entry does not override anything, so the job property stands for that cluster. An `auto` override clears the job property for that cluster, so its disks get the storage-type choice even when the job property names a format.
 
 When none of the four places carries an explicit format, the CPI picks one from the type of the storage the disk lands on. It resolves the format separately for each disk after the CPI chooses that disk's storage, so a root disk on `local-lvm` and an ephemeral disk on an NFS pool can end up with different formats. The CPI applies these rules:
 
-- File storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`, and `btrfs`) gets `qcow2`.
+- File storage (`dir`, `nfs`, `cifs`, `glusterfs`, and `btrfs`) gets `qcow2`.
 
-- Block storage (`lvm`, `lvmthin`, `zfspool`, `zfs`, `rbd`, `iscsi`, and `iscsidirect`) gets `raw`.
+- Block storage (`lvm`, `lvmthin`, `zfspool`, `zfs`, and `rbd`) gets `raw`.
 
-- Any other type, or a storage whose type lookup failed, keeps the old `qcow2` default, and the CPI logs a warning. A failed lookup never fails the deploy.
+- For a root disk, any other type, or a storage whose type lookup failed, keeps the old `qcow2` default, and the CPI logs a warning. A failed lookup never fails the deploy.
 
-Two rules apply on top of an explicit format. On file storage the CPI sends the format to PVE as given and bakes it into the volume filename, which is why a volume on such a pool is named `vm-<vmid>-disk-0.qcow2` or `vm-<vmid>-disk-0.raw`. On block storage the CPI replaces an explicit `qcow2` or `vmdk` with `raw` and logs a warning naming the storage, its type, and the requested format. Thick `lvm` is the one exception, because PVE accepts a `qcow2` request there and allocates raw, so the CPI passes it through as it always has. Either way, the disk CID records raw for a block-backed volume.
+- The CPI refuses ephemeral and persistent disks on `iscsi` and `iscsidirect` storage before it creates anything, because those types expose LUNs that already exist and cannot allocate new images.
+
+Two rules apply on top of an explicit format. On file storage the CPI sends the format to PVE as given and bakes it into the volume filename, which is why a volume on such a pool is named `vm-<vmid>-disk-0.qcow2` or `vm-<vmid>-disk-0.raw`. On block storage the CPI replaces an explicit `qcow2` or `vmdk` with `raw` and logs a warning naming the storage, its type, and the requested format. A root disk on thick `lvm` is the one exception. There the CPI sends an explicit `qcow2` to PVE unchanged and lets PVE decide, because PVE 9 can hold it as a volume chain when the storage enables snapshots as volume chains, and the CPI records the `qcow2` it sent. Persistent and ephemeral disks on thick `lvm` get `raw` with a warning, like every other block type, and a persistent disk's CID records raw for any block-backed volume.
 
 The CPI never downgrades a requested `qcow2` to `raw` on file storage. Proxmox supports qcow2 on NFS, and the CPI classifies NFS as file-backed everywhere it makes a format decision. So a raw volume on an NFS pool means an explicit raw reached the CPI from one of the four places above, and the volume's own `.raw` extension is the proof, because the extension always mirrors the format the CPI sent.
 
 When a pool holds raw volumes we did not expect, we read the four places from the top. The usual cause is a stale `disk_format` in the `cloud_properties` of the `disk_type` the deployment actually uses, because that value beats the `pve.vm_disk_format` job property and every Genesis kit generates its own cloud-config from its own environment file. Setting the format on the director's environment file does not reach a deployment whose kit builds its own `disk_types`. We check the format the director is really sending with `bosh cloud-config` and look at the `cloud_properties` of the named `disk_type`, not at the CPI job properties.
 
-Some disks keep the format they already have. Existing disks and their CIDs never change format, because the CPI resolves a format only when it creates a disk. A linked clone inherits its template's format, as PVE requires. Persistent disks that a `pve.storage` allocation plan places on a storage set stay file-backed, and they use `qcow2` unless a layer asks for another format.
+Some disks keep the format they already have. Existing disks and their CIDs never change format, because the CPI resolves a format only when it creates a disk. A linked clone inherits its template's format, as PVE requires. Persistent disks that a `pve.storage` allocation plan places on a storage set land on shared NFS, the only storage type a set admits, so they use `qcow2` unless a layer asks for another format. That allocator follows the same pool-type rule as `create_disk`, so the volume name, the format it requests, and the format it verifies always match the pool.
 
 Two cases leave the choice to PVE. When no layer sets an explicit format and the CPI cannot classify the target pool's type, `create_disk` omits the format parameter so PVE applies that storage plugin's own default. On block storage `create_disk` also omits the parameter when the only format came from the job property or from the storage type, and PVE allocates raw there. Neither case needs a new PVE privilege, because the CPI reads the storage type from the same storage lookup it already makes.
 
