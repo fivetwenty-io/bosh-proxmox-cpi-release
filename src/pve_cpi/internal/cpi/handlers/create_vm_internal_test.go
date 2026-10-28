@@ -2876,8 +2876,8 @@ func TestResolveVMShapeStorage_NoProfile_UsesConfigVMStorage(t *testing.T) {
 	if vmStorage != "local-lvm" {
 		t.Errorf("vmStorage = %q; want local-lvm (config)", vmStorage)
 	}
-	if vmDiskFormat != diskFormatQCOW2 {
-		t.Errorf("vmDiskFormat = %q; want %q (default)", vmDiskFormat, diskFormatQCOW2)
+	if vmDiskFormat != "" {
+		t.Errorf("vmDiskFormat = %q; want empty (the storage type decides)", vmDiskFormat)
 	}
 }
 
@@ -4271,11 +4271,10 @@ func TestResolveVMShapeStorage_DiskFormat_ProfileBeatsConfig(t *testing.T) {
 	}
 }
 
-// TestResolveVMShapeStorage_DiskFormat_EmptyConfigKeepsQCOW2 pins the tail of
-// the ladder: an unset job property still lands on the qcow2 built-in, which
-// is the correct default for the file-backed pools (dir, nfs, cifs) the CPI
-// is most often pointed at.
-func TestResolveVMShapeStorage_DiskFormat_EmptyConfigKeepsQCOW2(t *testing.T) {
+// TestResolveVMShapeStorage_DiskFormat_EmptyConfigLeavesItToStorageType pins
+// the tail of the ladder: with every rung unset, the request is empty, so
+// buildVMShapeForNode picks the format from the chosen pool's type.
+func TestResolveVMShapeStorage_DiskFormat_EmptyConfigLeavesItToStorageType(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.CPIConfig{VMStorage: "nfs-pool"}
@@ -4287,7 +4286,7 @@ func TestResolveVMShapeStorage_DiskFormat_EmptyConfigKeepsQCOW2(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if vmDiskFormat != diskFormatQCOW2 {
-		t.Errorf("vmDiskFormat = %q; want %q (built-in default)", vmDiskFormat, diskFormatQCOW2)
+	if vmDiskFormat != "" {
+		t.Errorf("vmDiskFormat = %q; want empty (the storage type decides)", vmDiskFormat)
 	}
 }

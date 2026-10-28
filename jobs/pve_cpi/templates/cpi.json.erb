@@ -17,7 +17,6 @@
     "sdn_auto_manage_zone"   => p("pve.sdn_auto_manage_zone"),
     "verify_ssl"             => p("pve.verify_ssl"),
     "agent_mode"       => p("pve.agent_mode"),
-    "vm_disk_format"   => p("pve.vm_disk_format"),
     "log_level"        => p("pve.log_level"),
     "vmid_range_start"              => p("pve.vmid_range_start"),
     "vmid_range_end"                => p("pve.vmid_range_end"),
@@ -84,6 +83,14 @@
   # Per-VM cloud_properties.balloon takes precedence over this global value.
   balloon = p("pve.balloon", "")
   config["balloon"] = balloon.to_s unless balloon.to_s.empty?
+
+  # Emit vm_disk_format only when the operator sets it. When it is absent or
+  # empty (the default), the key is omitted, and the CPI picks each disk's
+  # format from the type of the storage it lands on: raw on block storage and
+  # qcow2 on file storage. "auto" means the same as empty and is passed
+  # through for the Go config to treat as unset.
+  vm_disk_format = p("pve.vm_disk_format", "")
+  config["vm_disk_format"] = vm_disk_format unless vm_disk_format.to_s.strip.empty?
 
   # Emit stemcell-fetch transport timeouts only when the operator sets them.
   # When absent or 0 (the default), the key is omitted so the Go config

@@ -517,11 +517,19 @@ func managedDiskLegacyResolver(r *layeredResolver, selection *StoragePlacementSe
 	return &cloned
 }
 
+// managedDiskFormat returns the image format of a managed persistent disk. An
+// empty or "auto" disk_format at any layer, and an empty or "auto" job-level
+// pve.vm_disk_format, count as unset. An unset format is qcow2, which is what
+// pve.ResolveDiskFormat picks on file storage. A managed persistent disk is
+// always file-backed, because its allocation name carries the format as a file
+// extension and its ownership proof only parses file-backed volids, so the
+// format does not depend on which file pool the plan chooses. That keeps the
+// format we request, name, record, and verify the same across a retry that
+// moves the disk to another pool. A plan that lands on block storage keeps the
+// qcow2 it always requested there, so PVE rejects it before anything exists,
+// rather than allocating a raw volume the ownership proof cannot recognize.
 func managedDiskFormat(deps Deps, resolver *layeredResolver) (string, error) {
-	format, found := resolver.String("disk_format")
-	if !found {
-		format = deps.Config.VMDiskFormat
-	}
+	format, _ := requestedDiskFormat(resolver, deps.Config, "disk_format")
 	if format == "" {
 		format = diskFormatQCOW2
 	}

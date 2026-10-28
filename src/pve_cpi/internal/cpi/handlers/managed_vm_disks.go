@@ -50,11 +50,11 @@ func attachCreatedVMEphemeral(ctx context.Context, deps Deps, logger *log.Logger
 		if !ok {
 			return "", fmt.Errorf("ephemeral storage definition is absent from the frozen plan")
 		}
-		format, err := pve.EphemeralVolumeFormat(definition.Type, shape.vmDiskFormat)
+		format, err := pve.EphemeralVolumeFormat(definition.Type, shape.managedEphemeralFormat())
 		if err != nil {
 			return "", err
 		}
-		name, _, err := pve.ManagedEphemeralVolumeName(definition.Type, shape.vmDiskFormat, vmid, m.handle.Record().Namespace, m.handle.Record().ID)
+		name, _, err := pve.ManagedEphemeralVolumeName(definition.Type, shape.managedEphemeralFormat(), vmid, m.handle.Record().Namespace, m.handle.Record().ID)
 		if err != nil {
 			return "", err
 		}

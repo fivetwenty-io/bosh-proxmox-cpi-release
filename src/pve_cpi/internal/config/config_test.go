@@ -93,8 +93,8 @@ func TestLoad_Valid(t *testing.T) {
 	if cfg.AgentMode != "cloudinit" {
 		t.Errorf("AgentMode = %q, want %q", cfg.AgentMode, "cloudinit")
 	}
-	if cfg.VMDiskFormat != "qcow2" {
-		t.Errorf("VMDiskFormat = %q, want %q", cfg.VMDiskFormat, "qcow2")
+	if cfg.VMDiskFormat != "" {
+		t.Errorf("VMDiskFormat = %q, want empty (the storage type decides)", cfg.VMDiskFormat)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
@@ -1024,8 +1024,8 @@ func TestApplyDefaults_AllFields(t *testing.T) {
 	if cfg.AgentMode != "cloudinit" {
 		t.Errorf("AgentMode = %q, want %q", cfg.AgentMode, "cloudinit")
 	}
-	if cfg.VMDiskFormat != "qcow2" {
-		t.Errorf("VMDiskFormat = %q, want %q", cfg.VMDiskFormat, "qcow2")
+	if cfg.VMDiskFormat != "" {
+		t.Errorf("VMDiskFormat = %q, want empty (the storage type decides)", cfg.VMDiskFormat)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")

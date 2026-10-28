@@ -40,7 +40,7 @@ type vmCloudProperties struct {
 	Cores               int    `json:"cores"`
 	Sockets             int    `json:"sockets"`
 	Memory              int    `json:"memory"`
-	VMDiskFormat        string `json:"vm_disk_format"`
+	VMDiskFormat        string `json:"vm_disk_format,omitempty"`
 	TargetNode          string `json:"target_node"`
 	TargetStorage       string `json:"target_storage"`
 	EphemeralDiskSizeMB int    `json:"ephemeral_disk_size_mb,omitempty"`
@@ -316,7 +316,7 @@ func HandleCalculateVMCloudProperties(deps Deps) cpi.Handler {
 			Cores:               res.CPU,
 			Sockets:             1,
 			Memory:              res.RAM,
-			VMDiskFormat:        deps.Config.VMDiskFormat,
+			VMDiskFormat:        deps.Config.VMDiskFormat, // "" when unset, so the key is omitted and create_vm picks from the storage type
 			TargetNode:          bestNode,
 			TargetStorage:       effectiveStorage,
 			EphemeralDiskSizeMB: res.EphemeralDiskSize,

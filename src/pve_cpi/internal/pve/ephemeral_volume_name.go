@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // ephemeralVolumeInfix is the infix of the name EphemeralVolumeName gives a
@@ -12,17 +14,26 @@ import (
 const ephemeralVolumeInfix = "-ephemeral-"
 
 // EphemeralVolumeFormat keeps file formats and selects raw for block volumes.
+// An empty or "auto" preference picks from the storage type through
+// ResolveDiskFormat, which gives qcow2 on file storage and raw on block
+// storage. An explicit qcow2 or vmdk on block storage, thick lvm included,
+// becomes raw, as it always has for ephemeral volumes; callers that know the
+// preference was explicit log that coercion. A type that is neither a
+// file-volume type (StorageUsesFileVolumes) nor block storage is an error
+// whatever the preference, because the volume name depends on it.
 func EphemeralVolumeFormat(storageType, preferred string) (string, error) {
-	switch preferred {
-	case "raw", "qcow2", "vmdk":
-	default:
-		return "", fmt.Errorf("ephemeral volume format is unsupported")
+	if !config.IsAutoDiskFormat(preferred) {
+		switch preferred {
+		case DiskFormatRaw, DiskFormatQCOW2, DiskFormatVMDK:
+		default:
+			return "", fmt.Errorf("ephemeral volume format is unsupported")
+		}
 	}
 	if StorageUsesFileVolumes(storageType) {
-		return preferred, nil
+		return ResolveDiskFormat(storageType, preferred).Format, nil
 	}
-	if IsBlockNativeStorage(storageType) {
-		return "raw", nil
+	if ClassifyStorageFormat(storageType) == StorageFormatBlock {
+		return DiskFormatRaw, nil
 	}
 	return "", fmt.Errorf("ephemeral storage type is unavailable or unsupported")
 }

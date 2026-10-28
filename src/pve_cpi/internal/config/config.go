@@ -242,7 +242,12 @@ type CPIConfig struct {
 	ReleaseVersion string `json:"release_version,omitempty"`
 
 	// Agent
-	AgentMode    string `json:"agent_mode"`
+	AgentMode string `json:"agent_mode"`
+	// VMDiskFormat is the job-level disk image format (qcow2, raw, or vmdk).
+	// Empty and "auto" both leave the choice to the target storage's type,
+	// which gives qcow2 on file storage and raw on block storage (see
+	// pve.ResolveDiskFormat). ApplyDefaults stores both as empty, so an unset
+	// property and an explicit qcow2 stay distinguishable.
 	VMDiskFormat string `json:"vm_disk_format,omitempty"`
 	LogLevel     string `json:"log_level,omitempty"`
 
@@ -2405,8 +2410,13 @@ func (c *CPIConfig) ApplyDefaults() {
 	if c.AgentMode == "" {
 		c.AgentMode = AgentModeCloudInit
 	}
-	if c.VMDiskFormat == "" {
-		c.VMDiskFormat = "qcow2"
+	// An unset vm_disk_format stays unset, and "auto" (any case, any
+	// surrounding whitespace) means the same thing, so we store both as empty.
+	// The format then comes from each target storage's type.
+	if IsAutoDiskFormat(c.VMDiskFormat) {
+		c.VMDiskFormat = ""
+	} else {
+		c.VMDiskFormat = strings.TrimSpace(c.VMDiskFormat)
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
@@ -4508,15 +4518,35 @@ func (c *CPIConfig) validateAgentModeEnum(errs *[]string) {
 	}
 }
 
-// validateVMDiskFormatEnum appends an error when vm_disk_format is not one
-// of qcow2|raw|vmdk.
+// DiskFormatAuto is the vm_disk_format and disk_format value that asks the
+// CPI to pick the disk format from the target storage's type. An empty value
+// means the same thing.
+const DiskFormatAuto = "auto"
+
+// IsAutoDiskFormat reports whether a vm_disk_format or disk_format value
+// leaves the format to the storage type. Empty, whitespace-only, and "auto"
+// in any letter case all do, at every layer that carries a format: call
+// cloud_properties, disk_type and vm_type profiles, the job property, and the
+// pve_vm_disk_format context override. Such a value never counts as an
+// explicit format and is never sent to PVE.
+func IsAutoDiskFormat(v string) bool {
+	s := strings.TrimSpace(v)
+	return s == "" || strings.EqualFold(s, DiskFormatAuto)
+}
+
+// validateVMDiskFormatEnum appends an error when vm_disk_format is set and is
+// not one of qcow2|raw|vmdk. Empty and "auto" are valid and mean "pick from
+// the storage type".
 func (c *CPIConfig) validateVMDiskFormatEnum(errs *[]string) {
+	if IsAutoDiskFormat(c.VMDiskFormat) {
+		return
+	}
 	switch c.VMDiskFormat {
 	case "qcow2", "raw", "vmdk":
 		// valid
 	default:
 		*errs = append(*errs, fmt.Sprintf(
-			"vm_disk_format must be one of qcow2|raw|vmdk, got %q", c.VMDiskFormat,
+			"vm_disk_format must be one of qcow2|raw|vmdk|auto or empty, got %q", c.VMDiskFormat,
 		))
 	}
 }

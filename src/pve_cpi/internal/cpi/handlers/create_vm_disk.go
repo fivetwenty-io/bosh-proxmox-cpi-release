@@ -1124,10 +1124,15 @@ func attachEphemeralDisk(
 		}
 		storageType = info.Type
 	}
-	format, err := pve.EphemeralVolumeFormat(storageType, shape.vmDiskFormat)
+	// The ephemeral pool may differ from the root pool, so the format comes
+	// from this pool's type: an unset request gives raw on block storage and
+	// qcow2 on file storage, and an explicit non-raw format on block storage
+	// becomes raw, as it always has here.
+	format, err := pve.EphemeralVolumeFormat(storageType, shape.ephemeralDiskFormat)
 	if err != nil {
 		return "", err
 	}
+	warnEphemeralFormatCoercion(logger, "create_vm: ephemeral disk", shape.ephemeralStorage, storageType, shape.ephemeralDiskFormat)
 	volName, suffix, err := pve.EphemeralVolumeName(storageType, format, vmid)
 	if err != nil {
 		return "", err

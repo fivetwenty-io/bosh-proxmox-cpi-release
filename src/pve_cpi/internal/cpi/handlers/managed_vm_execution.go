@@ -42,6 +42,13 @@ type StorageVMExecution struct {
 	PoolDirector      string
 	PoolDeployment    string
 	PoolInstanceGroup string
+	// EphemeralDiskFormat is the format preference for the ephemeral disk when
+	// it differs from DiskFormat, which happens when the ephemeral pool's type
+	// picks a different format than the root pool's. Plans that leave it
+	// empty use DiskFormat, as every plan did before. The omitempty tag is
+	// load-bearing: an older release decoding a plan strictly fails only on
+	// the plans that carry the field, not on every plan.
+	EphemeralDiskFormat string `json:",omitempty"`
 }
 
 func freezeManagedVMExecution(cfg *config.CPIConfig, shape *createVMShape) (*StorageVMExecution, error) {
@@ -83,6 +90,9 @@ func freezeManagedVMExecution(cfg *config.CPIConfig, shape *createVMShape) (*Sto
 		PoolDeployment:    shape.vmPoolDeployment,
 		PoolInstanceGroup: shape.vmPoolInstanceGrp,
 	}
+	if shape.ephemeralDiskFormat != "" && shape.ephemeralDiskFormat != shape.vmDiskFormat {
+		execution.EphemeralDiskFormat = shape.ephemeralDiskFormat
+	}
 	execution.RootOptions = maps.Clone(shape.rootDiskPerfOpts)
 	if shape.balloonMiB != nil {
 		value := *shape.balloonMiB
@@ -90,6 +100,28 @@ func freezeManagedVMExecution(cfg *config.CPIConfig, shape *createVMShape) (*Sto
 	}
 	return execution, nil
 }
+
+// managedEphemeralFormat returns the format preference a managed VM's
+// ephemeral disk is named and allocated with: ephemeralDiskFormat when set,
+// and otherwise the root disk's vmDiskFormat, which every plan used before
+// the ephemeral pool's type was consulted separately.
+func (s *createVMShape) managedEphemeralFormat() string {
+	if s.ephemeralDiskFormat != "" {
+		return s.ephemeralDiskFormat
+	}
+	return s.vmDiskFormat
+}
+
+// ephemeralFormat returns the format preference the plan's ephemeral disk
+// was named and allocated with: EphemeralDiskFormat when the plan carries
+// one, and otherwise DiskFormat.
+func (e *StorageVMExecution) ephemeralFormat() string {
+	if e.EphemeralDiskFormat != "" {
+		return e.EphemeralDiskFormat
+	}
+	return e.DiskFormat
+}
+
 func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error) {
 	if e == nil || e.Version != 1 {
 		return nil, fmt.Errorf("recorded VM execution is unsupported")
@@ -128,6 +160,7 @@ func (e *StorageVMExecution) shape(cfg *config.CPIConfig) (*createVMShape, error
 		vmPoolDeployment:  e.PoolDeployment,
 		vmPoolInstanceGrp: e.PoolInstanceGroup,
 	}
+	shape.ephemeralDiskFormat = e.ephemeralFormat()
 	shape.rootDiskPerfOpts = maps.Clone(e.RootOptions)
 	if e.BalloonMiB != nil {
 		value := *e.BalloonMiB
@@ -150,7 +183,19 @@ func managedVMExecutionFingerprint(cfg *config.CPIConfig) (string, error) {
 		return "", err
 	}
 	managedVMRemovePlacementInputs(values)
+	managedVMNormalizeDiskFormatInput(values)
 	return aj.Fingerprint(log.RedactSecrets(values))
+}
+
+// managedVMNormalizeDiskFormatInput keeps the fingerprint of an unset
+// vm_disk_format equal to the qcow2 that ApplyDefaults used to store for it,
+// so a plan frozen before the format came from the storage type still resumes
+// after an upgrade. The plan carries its own resolved DiskFormat, so the
+// fingerprint does not need to tell an unset value from an explicit qcow2.
+func managedVMNormalizeDiskFormatInput(values map[string]any) {
+	if s, _ := values["vm_disk_format"].(string); config.IsAutoDiskFormat(s) {
+		values["vm_disk_format"] = diskFormatQCOW2
+	}
 }
 func managedVMRemovePlacementInputs(values map[string]any) {
 	for key, value := range values {

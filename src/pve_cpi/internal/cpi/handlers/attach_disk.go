@@ -590,7 +590,7 @@ func attachDiskGlobalPerfOpts(ctx context.Context, deps Deps, bareDiskCID string
 		}
 	}
 	format := diskFormatQCOW2
-	if deps.Config != nil && deps.Config.VMDiskFormat != "" {
+	if deps.Config != nil && !config.IsAutoDiskFormat(deps.Config.VMDiskFormat) {
 		format = deps.Config.VMDiskFormat
 	}
 	if meta != nil && meta.Format != "" {

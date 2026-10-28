@@ -306,18 +306,16 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, err
 		}
 
-		// Resolve disk_format through the resolver: per-call or profile wins;
-		// else global config; else the QCOW2 built-in default.
-		// found tracks whether an explicit value was supplied at any layer so
-		// formatArg is only set when the operator expressed a preference.
-		resolvedFormat, formatFound := r.String("disk_format")
-		format := resolvedFormat
-		if !formatFound {
-			format = deps.Config.VMDiskFormat
-			if format == "" {
-				format = diskFormatQCOW2
-			}
-		}
+		// Requested disk_format: per-call or profile wins, else the job-level
+		// pve.vm_disk_format. An empty or "auto" value at any layer counts as
+		// unset. formatFound tracks whether a cloud_properties layer supplied
+		// the value, because only those values have ever been sent to PVE on
+		// block storage. The final format comes from the pool's type once it
+		// is known (see finalizeCreateDiskFormat below). Until then the
+		// provisional format, which only feeds the TRIM decision, uses
+		// whatever type is already known.
+		requestedFormat, formatFound := requestedDiskFormat(r, deps.Config, "disk_format")
+		format := pve.ResolveDiskFormat("", requestedFormat).Format
 
 		// Disk-performance options are resolved after storage+format so the
 		// discard/ssd auto-resolution (see resolveDiskPerfOptions) can classify
@@ -331,6 +329,7 @@ func HandleCreateDisk(deps Deps) Handler {
 		var storageType string
 		if needsDiskPerfStorageTypeLookup(r, deps.Config) {
 			storageType = lookupVMStorageType(ctx, deps, storage)
+			format = pve.ResolveDiskFormat(storageType, requestedFormat).Format
 		}
 
 		// Diagnostic only, never mutates storage config, never fails this
@@ -386,43 +385,21 @@ func HandleCreateDisk(deps Deps) Handler {
 			return nil, gateErr
 		}
 
-		// Block storages (lvm/lvmthin/zfspool) reject qcow2 and only accept
-		// raw. The CPI's default disk_format is qcow2 which works for file
-		// storages (dir/nfs/cifs). Only pass the explicit format to CreateVolume
-		// when the operator expressed a preference at some layer (call or profile);
-		// when no layer supplied a value, omit the param so PVE auto-selects the
-		// right default for the target storage type.
-		formatArg := ""
-		if formatFound {
-			formatArg = format
-		}
-
-		// File-based storages (dir/nfs/cifs/glusterfs/btrfs) require the
-		// volume name to carry a format extension and reject bare names with
-		// "unable to parse volume filename"; block storages take bare names
-		// only. The storage type comes from the perf-options lookup when it
-		// ran, else from the backend's cached classification — never a second
-		// live /storage query (preserving the no-lookup contract when the
-		// operator opted out of auto-resolution). When file-based, append the
-		// extension and pin the format param so the two always agree. An
-		// unknown type ("") keeps the bare name — unchanged behavior on block
-		// storages.
+		// The storage type comes from the perf-options lookup when it ran,
+		// else from the backend's cached classification — never a second live
+		// /storage query (preserving the no-lookup contract when the operator
+		// opted out of auto-resolution). An unknown type ("") keeps today's
+		// behavior: the bare name, and the format only when a layer set one.
 		if storageType == "" {
 			if info, ok := pve.BackendStorageInfo(backend); ok {
 				storageType = info.Type
 			}
 		}
-		volExt := ""
-		if pve.StorageUsesFileVolumes(storageType) {
-			if formatArg == "" {
-				formatArg = format
-			}
-			volExt = "." + formatArg
-		}
-
-		// Recording only; formatArg (what is sent to PVE) is untouched, and
-		// an operator-set format at any layer still wins verbatim.
-		format = recordedDiskFormat(format, storageType)
+		formatArg, volExt, resolution := finalizeCreateDiskFormat(storageType, requestedFormat, formatFound)
+		logDiskFormatResolution(deps.Log(ctx), "create_disk", storage, storageType, resolution)
+		// The recorded format is the format sent to PVE, or on block storage
+		// with no format sent, the raw PVE allocates there.
+		format = recordedDiskFormat(resolution.Format, storageType)
 
 		maxAttempts, lockAttempts := createDiskAttemptBudgets(deps)
 

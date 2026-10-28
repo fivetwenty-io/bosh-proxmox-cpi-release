@@ -81,7 +81,7 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 			return resolveStorageTier(ctx, lister, cfg, tier, false)
 		}
 	}
-	vmStorage, vmDiskFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
+	vmStorage, requestedFormat, rootDiskGiB, err := resolveVMShapeStorage(deps.Config, parsed, tierFnForVM)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +151,26 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		vmStorageType = lookupVMStorageType(ctx, deps, vmStorage)
 	}
 
+	// The root disk's format comes from the pool the root disk actually lands
+	// on, whichever way it was chosen (pool, tier, storage set, or frozen
+	// plan). An unset request gives raw on block storage and qcow2 on file
+	// storage. An explicit qcow2 or vmdk on block storage becomes raw, which
+	// is what PVE already made of it on import-from and full clone; thick lvm
+	// keeps an explicit qcow2. A failed lookup or an unknown type keeps the
+	// qcow2 every create_vm used before, and we warn. The result also feeds
+	// the full-clone request and the managed plan's DiskFormat, so the
+	// format we verify is the format we requested. Linked clones still
+	// inherit the template's format, because they send no format at all.
+	rootFormat := pve.ResolveDiskFormat(vmStorageType, requestedFormat)
+	logDiskFormatResolution(deps.Log(ctx), "create_vm: root disk", vmStorage, vmStorageType, rootFormat)
+	vmDiskFormat := rootFormat.Format
+
+	// The ephemeral disk resolves its own format against its own pool. The
+	// unmanaged path carries the request through to attachEphemeralDisk,
+	// which learns the pool's type there. The managed path knows the type
+	// from the frozen plan's definitions, so we resolve it here.
+	ephemeralDiskFormat := requestedFormat
+
 	// rootDiskKeyVal is the PVE VM config key the root disk lands on: virtio0
 	// (default) or scsi0 (pve.root_disk_bus=scsi).
 	rootDiskKeyVal := rootDiskKey(deps.Config)
@@ -211,6 +231,9 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		if target, ok := managedVMRoleTarget(parsed.storagePlan, storageRoleEphemeral); ok {
 			ephemeralDiskGiB, err = managedVMGiB(target.VirtualBytes)
 			ephemeralStorage = target.StorageID
+			ephemeralType := parsed.storagePlan.Definitions[ephemeralStorage].Type
+			ephemeralDiskFormat = managedEphemeralDiskFormat(ephemeralType, requestedFormat, vmDiskFormat)
+			warnEphemeralFormatCoercion(deps.Log(ctx), "create_vm: ephemeral disk", ephemeralStorage, ephemeralType, requestedFormat)
 		}
 	case parsed.storageSelection != nil && parsed.storageSelection.Ephemeral != nil && parsed.storageSelection.Ephemeral.Atomic:
 		ephemeralDiskGiB, ephemeralStorage, err = resolveAtomicVMEphemeral(ctx, deps, cp, parsed.storageSelection.Ephemeral)
@@ -247,34 +270,35 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	}
 
 	return &createVMShape{
-		node:              node,
-		vmStorage:         vmStorage,
-		vmStorageType:     vmStorageType,
-		vmDiskFormat:      vmDiskFormat,
-		rootDiskGiB:       rootDiskGiB,
-		cores:             cores,
-		sockets:           sockets,
-		memMiB:            memMiB,
-		hotplug:           hotplug,
-		numaEnabled:       numaEnabled,
-		initialTags:       initialTags,
-		rangeStart:        rangeStart,
-		maxAttempts:       maxAttempts,
-		initialName:       initialName,
-		cloudPropsMap:     parsed.cloudPropsMap,
-		rootDiskPerfOpts:  rootDiskPerfOpts,
-		rootDiskKey:       rootDiskKeyVal,
-		scsihw:            scsihwVal,
-		ephemeralDiskGiB:  ephemeralDiskGiB,
-		ephemeralStorage:  ephemeralStorage,
-		cpuType:           cpuTypeVal,
-		balloonMiB:        balloonMiB,
-		vmPool:            resolvedPool,
-		vmPoolComment:     vmPoolComment,
-		vmPoolLayer:       resolvedPoolLayer,
-		vmPoolDirector:    poolDirector,
-		vmPoolDeployment:  poolDeployment,
-		vmPoolInstanceGrp: poolInstanceGroup,
+		node:                node,
+		vmStorage:           vmStorage,
+		vmStorageType:       vmStorageType,
+		vmDiskFormat:        vmDiskFormat,
+		rootDiskGiB:         rootDiskGiB,
+		cores:               cores,
+		sockets:             sockets,
+		memMiB:              memMiB,
+		hotplug:             hotplug,
+		numaEnabled:         numaEnabled,
+		initialTags:         initialTags,
+		rangeStart:          rangeStart,
+		maxAttempts:         maxAttempts,
+		initialName:         initialName,
+		cloudPropsMap:       parsed.cloudPropsMap,
+		rootDiskPerfOpts:    rootDiskPerfOpts,
+		rootDiskKey:         rootDiskKeyVal,
+		scsihw:              scsihwVal,
+		ephemeralDiskGiB:    ephemeralDiskGiB,
+		ephemeralStorage:    ephemeralStorage,
+		ephemeralDiskFormat: ephemeralDiskFormat,
+		cpuType:             cpuTypeVal,
+		balloonMiB:          balloonMiB,
+		vmPool:              resolvedPool,
+		vmPoolComment:       vmPoolComment,
+		vmPoolLayer:         resolvedPoolLayer,
+		vmPoolDirector:      poolDirector,
+		vmPoolDeployment:    poolDeployment,
+		vmPoolInstanceGrp:   poolInstanceGroup,
 	}, nil
 }
 
@@ -285,8 +309,9 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 // omit the parameter entirely (nil = tier resolution skipped).
 type vmStorageTierFn func(tier string) (string, error)
 
-// resolveVMShapeStorage returns the target VM storage, disk format, root disk
-// size in GiB, and an error. The resolver checks for storage_pool and
+// resolveVMShapeStorage returns the target VM storage, the requested disk
+// format ("" when the storage type should decide), the root disk size in GiB,
+// and an error. The resolver checks for storage_pool and
 // vm_disk_format through the layered resolver (call cloud_properties →
 // disk_type profile → vm_type profile), then falls back to existing config /
 // struct-field / default logic. Returns a CloudError if the vm_type or disk_type
@@ -352,33 +377,32 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 		}
 	}
 
-	// Disk format: resolver wins (handles both "vm_disk_format" key in call
-	// layer and profile layers) → struct field from JSON unmarshal → the
-	// job/cpi-config value → qcow2. The struct field cp.VMDiskFormat is
-	// already populated from args[2] by the standard unmarshal in
-	// parseCreateVMArgs, so we only consult it when the resolver finds
-	// nothing in any layer.
+	// Requested disk format: the resolver wins (vm_disk_format or disk_format
+	// in the call layer and the profile layers) → the struct field from the
+	// JSON unmarshal → the job/cpi-config value. The struct field
+	// cp.VMDiskFormat is already populated from args[2] by the standard
+	// unmarshal in parseCreateVMArgs, so we only consult it when the resolver
+	// finds nothing in any layer.
+	//
+	// An empty or "auto" value at any rung counts as unset, so the next rung
+	// decides. When every rung is unset the result is "", and
+	// buildVMShapeForNode picks the format from the chosen pool's storage type
+	// (pve.ResolveDiskFormat): raw on block storage and qcow2 on file
+	// storage. That is why this function returns the request, not the final
+	// format: the pool's type is only known once the pool is chosen.
 	//
 	// cfg.VMDiskFormat is the pve.vm_disk_format job property, which a
 	// cpi-config entry may also override per cluster (see the context
-	// override registry in internal/config/context_overrides.go). Skipping it
-	// here used to strand that setting: an operator whose vm_storage is
-	// block-native (lvm, lvmthin, zfspool, rbd) sets pve.vm_disk_format to
-	// raw because those pools reject qcow2, and with no vm_type
-	// cloud_property carrying the format, create_vm fell straight through to
-	// the qcow2 literal and asked PVE for a format the pool cannot hold.
-	// create_disk (create_disk.go) and attach_disk (attach_disk.go) have
-	// always read the same config field, so the root and ephemeral disks were
-	// the only two that ignored it.
-	switch df, ok := r.String("vm_disk_format", "disk_format"); {
+	// override registry in internal/config/context_overrides.go).
+	switch df, ok := r.DiskFormat("vm_disk_format", "disk_format"); {
 	case ok:
 		vmDiskFormat = df
-	case cp.VMDiskFormat != "":
-		vmDiskFormat = cp.VMDiskFormat
-	case cfg.VMDiskFormat != "":
-		vmDiskFormat = cfg.VMDiskFormat
+	case !config.IsAutoDiskFormat(cp.VMDiskFormat):
+		vmDiskFormat = strings.TrimSpace(cp.VMDiskFormat)
+	case !config.IsAutoDiskFormat(cfg.VMDiskFormat):
+		vmDiskFormat = strings.TrimSpace(cfg.VMDiskFormat)
 	default:
-		vmDiskFormat = diskFormatQCOW2
+		vmDiskFormat = ""
 	}
 
 	rootDiskGiB = defaultStemcellDiskGiB

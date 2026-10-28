@@ -128,6 +128,24 @@ func (r *layeredResolver) String(keys ...string) (string, bool) {
 	return "", false
 }
 
+// DiskFormat walks layers like String, but it also skips a value of "auto" in
+// any letter case, so an empty or "auto" disk_format or vm_disk_format on the
+// call, a disk_type profile, or a vm_type profile counts as unset and the next
+// key or layer decides. Returns ("", false) when no layer carries an explicit
+// format.
+func (r *layeredResolver) DiskFormat(keys ...string) (string, bool) {
+	for _, layer := range r.layers {
+		for _, key := range keys {
+			s, isStr := layer[key].(string)
+			if !isStr || config.IsAutoDiskFormat(s) {
+				continue
+			}
+			return strings.TrimSpace(s), true
+		}
+	}
+	return "", false
+}
+
 // Int walks layers in order, trying each key within each layer. Returns the first
 // parseable integer value. Accepted types: int, int64, float64 (JSON default number
 // type), json.Number, and numeric string (via strconv.Atoi). Returns (0, false) when

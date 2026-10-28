@@ -483,6 +483,12 @@ var contextOverrideFields = map[string]func(*CPIConfig, any) error{
 		if err != nil {
 			return err
 		}
+		// An empty or "auto" override counts as unset, so the job-level
+		// pve.vm_disk_format still decides, and when that is unset too the
+		// target storage's type does.
+		if IsAutoDiskFormat(s) {
+			return nil
+		}
 		c.VMDiskFormat = s
 		return nil
 	},

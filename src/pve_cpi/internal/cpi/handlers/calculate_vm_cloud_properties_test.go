@@ -185,6 +185,29 @@ func decodeCloudProps(t *testing.T, result any) map[string]json.RawMessage {
 // with nil listStorageFn that returns active+images by default).
 // ---------------------------------------------------------------------------
 
+// With no job-level vm_disk_format the CPI picks the format from the storage
+// type at create time, so the computed cloud properties leave the key out and
+// never pin a format the target pool might not hold.
+func TestHandleCalculateVMCloudProperties_UnsetDiskFormatOmitted(t *testing.T) {
+	t.Parallel()
+
+	resp := cluster.ListStatusResponse{
+		nodeJSON(testNode, 8, 8*1024*1024*1024, 2*1024*1024*1024, 1),
+	}
+	deps := makeCalcDeps(&mockClusterService{statusResp: &resp})
+	deps.Config.VMDiskFormat = ""
+	h := handlers.HandleCalculateVMCloudProperties(deps)
+
+	result, err := h.Handle(context.Background(), makeCalcArgs(2, 2048, 10240), jsonrpc.Context{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m := decodeCloudProps(t, result)
+	if raw, ok := m["vm_disk_format"]; ok {
+		t.Errorf("vm_disk_format = %s; want the key omitted", raw)
+	}
+}
+
 func TestHandleCalculateVMCloudProperties_SingleNodeFit(t *testing.T) {
 	t.Parallel()
 

@@ -168,7 +168,7 @@ BASE_PROPS='{
     "network_bridge" => "vmbr0", "network_mode" => "sdn",
     "sdn_zone" => "", "sdn_zone_type" => "vxlan", "sdn_auto_manage_zone" => true,
     "verify_ssl" => true, "agent_mode" => "cloudinit",
-    "vm_disk_format" => "qcow2", "log_level" => "info",
+    "vm_disk_format" => "", "log_level" => "info",
     "vmid_range_start" => 100, "vmid_range_end" => 5999,
     "allow_disk_ops_with_snapshots" => false,
     "require_snapshot_check_pass" => false,
@@ -415,6 +415,36 @@ JSON_10E="$(render "$PROPS_1" '{"name":"pve_cpi","release":{"name":"bosh-proxmox
 assert_json_valid     "case10-empty" "$JSON_10E"                 || FAILED=$((FAILED+1))
 assert_json_lacks_key "case10-empty" "$JSON_10E" release_version || FAILED=$((FAILED+1))
 assert_json_lacks_key "case10-no-spec" "$JSON_1" release_version || FAILED=$((FAILED+1))
+
+# vm_disk_format follows the omit-when-empty idiom. Empty (the BASE_PROPS
+# value and the spec default) leaves the key out so the CPI picks the format
+# from each storage's type, and a set value such as raw reaches cpi.json as is.
+echo "Case 11: vm_disk_format"
+assert_json_lacks_key "case11-empty" "$JSON_1" vm_disk_format || FAILED=$((FAILED+1))
+PROPS_11R="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"]["vm_disk_format"] = "raw"
+  print h.inspect
+')"
+JSON_11R="$(render "$PROPS_11R")"
+assert_json_valid      "case11-raw" "$JSON_11R"                    || FAILED=$((FAILED+1))
+assert_json_key_equals "case11-raw" "$JSON_11R" vm_disk_format raw || FAILED=$((FAILED+1))
+PROPS_11U="$(printf '%s' "$(build_props 'secret-pw' '')" | ruby -e '
+  h = eval(STDIN.read)
+  h["pve"].delete("vm_disk_format")
+  print h.inspect
+')"
+JSON_11U="$(render "$PROPS_11U")"
+assert_json_valid     "case11-unset" "$JSON_11U"                || FAILED=$((FAILED+1))
+assert_json_lacks_key "case11-unset" "$JSON_11U" vm_disk_format || FAILED=$((FAILED+1))
+SPEC_VM_DISK_FORMAT="$(ruby -ryaml -e '
+  spec = YAML.load_file(ARGV[0])
+  print spec.fetch("properties").fetch("pve.vm_disk_format").fetch("default")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ -n "$SPEC_VM_DISK_FORMAT" ]; then
+  echo "FAIL [case11-spec]: pve.vm_disk_format spec default is $(printf %q "$SPEC_VM_DISK_FORMAT"), expected empty" >&2
+  FAILED=$((FAILED+1))
+fi
 
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2

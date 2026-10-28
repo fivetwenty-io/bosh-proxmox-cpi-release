@@ -60,7 +60,7 @@ func cleanupPendingVMAllocation(step aj.Step, record aj.Record) bool {
 		if !ok {
 			return false
 		}
-		_, suffix, err := pve.ManagedEphemeralVolumeName(definition.Type, plan.VMExecution.DiskFormat, step.Target.VMID, record.Namespace, record.ID)
+		_, suffix, err := pve.ManagedEphemeralVolumeName(definition.Type, plan.VMExecution.ephemeralFormat(), step.Target.VMID, record.Namespace, record.ID)
 		if err != nil || step.Target.IntendedVolume != target.StorageID+":"+suffix {
 			return false
 		}

@@ -76,7 +76,7 @@ func (m *managedVMAllocation) validateStorageMutationTarget(call ManagedAllocati
 		}
 	case managedVMCallCreateVolume:
 		definition, found := m.prepared.plan.Definitions[target.StorageID]
-		format, err := pve.EphemeralVolumeFormat(definition.Type, m.shape.vmDiskFormat)
+		format, err := pve.EphemeralVolumeFormat(definition.Type, m.shape.managedEphemeralFormat())
 		if err != nil {
 			return err
 		}
