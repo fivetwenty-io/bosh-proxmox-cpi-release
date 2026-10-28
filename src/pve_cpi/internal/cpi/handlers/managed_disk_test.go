@@ -253,12 +253,7 @@ func (s managedDiskTestStorage) Exists(_ context.Context, _ string, _ string, vo
 	return ok, nil
 }
 func (s managedDiskTestStorage) CreateVolume(_ context.Context, _ string, pool string, gib int, format string, vmid int, name string) (string, error) {
-	// PVE returns a path-form volid for a file-style name and a bare volid on
-	// block storage.
 	volume := fmt.Sprintf("%s:%d/%s", pool, vmid, name)
-	if !strings.Contains(name, ".") {
-		volume = pool + ":" + name
-	}
 	if s.state.before != nil {
 		s.state.before(volume)
 	}

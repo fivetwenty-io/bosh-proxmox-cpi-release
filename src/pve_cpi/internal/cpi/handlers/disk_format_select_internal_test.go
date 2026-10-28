@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/qemu"
@@ -303,13 +305,7 @@ func TestBuildVMShape_ManagedPlanResolvesEachRolePerPool(t *testing.T) {
 			if resumed.vmDiskFormat != shape.vmDiskFormat {
 				t.Errorf("resumed format = %q; fresh format = %q", resumed.vmDiskFormat, shape.vmDiskFormat)
 			}
-			if eph, ok := managedVMRoleTarget(tc.plan, storageRoleEphemeral); ok {
-				ephType := tc.plan.Definitions[eph.StorageID].Type
-				got, err := pve.EphemeralVolumeFormat(ephType, resumed.vmDiskFormat)
-				if err != nil || got != tc.wantEph {
-					t.Errorf("resumed ephemeral allocation format = (%q, %v); want %q", got, err, tc.wantEph)
-				}
-			}
+			checkManagedEphemeralDerivation(t, tc.plan, execution.DiskFormat, resumed.vmDiskFormat, tc.wantEph)
 			ephWarnings := 0
 			for _, w := range formatWarnings(obs) {
 				if strings.Contains(w, "ephemeral") {
@@ -318,6 +314,102 @@ func TestBuildVMShape_ManagedPlanResolvesEachRolePerPool(t *testing.T) {
 			}
 			if (ephWarnings == 1) != tc.wantEphemeralWarning || ephWarnings > 1 {
 				t.Errorf("ephemeral format warnings = %v; want warning=%v", formatWarnings(obs), tc.wantEphemeralWarning)
+			}
+		})
+	}
+}
+
+// checkManagedEphemeralDerivation proves the ephemeral format this release
+// derives from a resumed plan is the one we want, and that 0.9.5 derives the
+// same format from the frozen DiskFormat. An older release builds the managed
+// ephemeral volume name from that format and the unchanged file-or-block
+// naming rule, so the same format means the same IntendedVolume.
+func checkManagedEphemeralDerivation(t *testing.T, plan *StorageAllocationPlan, frozen, resumed, want string) {
+	t.Helper()
+	eph, ok := managedVMRoleTarget(plan, storageRoleEphemeral)
+	if !ok {
+		return
+	}
+	ephType := plan.Definitions[eph.StorageID].Type
+	got, err := pve.EphemeralVolumeFormat(ephType, resumed)
+	if err != nil || got != want {
+		t.Errorf("resumed ephemeral allocation format = (%q, %v); want %q", got, err, want)
+	}
+	legacy, err := legacyEphemeralVolumeFormat(ephType, frozen)
+	if err != nil || legacy != got {
+		t.Errorf("0.9.5 derives ephemeral format (%q, %v) from the frozen plan; this release derives %q", legacy, err, got)
+	}
+}
+
+// legacyEphemeralVolumeFormat is pve.EphemeralVolumeFormat as 0.9.5 defined
+// it, copied verbatim apart from its name. An older CPI settles a managed
+// ephemeral step by deriving the volume from the frozen DiskFormat with it.
+func legacyEphemeralVolumeFormat(storageType, preferred string) (string, error) {
+	switch preferred {
+	case "raw", "qcow2", "vmdk":
+	default:
+		return "", fmt.Errorf("ephemeral volume format is unsupported")
+	}
+	if pve.StorageUsesFileVolumes(storageType) {
+		return preferred, nil
+	}
+	if pve.IsBlockNativeStorage(storageType) {
+		return "raw", nil
+	}
+	return "", fmt.Errorf("ephemeral storage type is unavailable or unsupported")
+}
+
+// A managed plan whose ephemeral pool is iscsi, iscsidirect, or ZFS over
+// iSCSI is refused while the shape is built, which is inside the journal's
+// planning callback and before the plan is frozen or the VM is cloned. The
+// test client panics on any QEMU, node, or storage call, so reaching a clone
+// or a config write would fail the test.
+func TestBuildVMShape_ManagedPlanRefusesEphemeralPoolBeforeTheVMExists(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"iscsi", "iscsidirect", "zfs"} {
+		t.Run(typ, func(t *testing.T) {
+			t.Parallel()
+			deps, _ := shapeDeps("local-lvm", "", nil, nil)
+			parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{})
+			parsed.storagePlan = managedFormatPlan("set-a", "nfs", "san", typ)
+			shape, err := buildVMShapeForNode(context.Background(), deps, parsed, "pve")
+			var cloud *cpierrors.Error
+			if shape != nil || !errors.As(err, &cloud) || cloud.OkToRetry() {
+				t.Fatalf("buildVMShapeForNode = (%v, %v); want a non-retriable refusal", shape, err)
+			}
+			for _, want := range []string{`"san"`, fmt.Sprintf("type %q", typ), "before the VM was created"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not mention %s", err, want)
+				}
+			}
+		})
+	}
+}
+
+// The unmanaged path refuses an iscsi ephemeral pool by its live type, and a
+// failed type lookup lets the shape through so the deploy goes on as before.
+func TestBuildVMShape_UnmanagedEphemeralPoolType(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		entries []map[string]any
+		listErr error
+		refuse  bool
+	}{
+		{"iscsi refused", []map[string]any{{"storage": "local-lvm", "type": "lvmthin"}, {"storage": "san", "type": "iscsi"}}, nil, true},
+		{"zfs allowed", []map[string]any{{"storage": "local-lvm", "type": "lvmthin"}, {"storage": "san", "type": "zfs"}}, nil, false},
+		{"failed lookup allowed", nil, fmt.Errorf("storage list failed"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			deps, _ := shapeDeps("local-lvm", "", tc.entries, tc.listErr)
+			parsed := minimalParsedArgsWithCP("stemcell-store", map[string]any{"ephemeral_disk_size_mb": 4096, "ephemeral_storage_pool": "san"})
+			parsed.cloudProps.EphemeralDiskSizeMB = 4096
+			parsed.cloudProps.EphemeralStoragePool = "san"
+			_, err := buildVMShapeForNode(context.Background(), deps, parsed, "pve")
+			if (err != nil) != tc.refuse {
+				t.Fatalf("buildVMShapeForNode error = %v; want refusal=%v", err, tc.refuse)
 			}
 		})
 	}
@@ -432,12 +524,40 @@ func TestManagedPlanDiskFormat(t *testing.T) {
 		{"rbd", "raw", "nfs", "", "qcow2"},
 		{"lvm", "raw", "nfs", "", "raw"},
 		{"lvm", "qcow2", "lvmthin", "qcow2", "qcow2"},
-		{"lvmthin", "raw", "iscsi", "", "raw"},
-		{"lvmthin", "raw", "", "", "raw"},
 	}
 	for _, tc := range cases {
-		if got := managedPlanDiskFormat(tc.rootType, tc.rootFormat, tc.ephType, tc.requested); got != tc.want {
-			t.Errorf("managedPlanDiskFormat(%q, %q, %q, %q) = %q; want %q", tc.rootType, tc.rootFormat, tc.ephType, tc.requested, got, tc.want)
+		got, err := managedPlanDiskFormat(tc.rootType, tc.rootFormat, "eph", tc.ephType, tc.requested)
+		if err != nil || got != tc.want {
+			t.Errorf("managedPlanDiskFormat(%q, %q, %q, %q) = (%q, %v); want %q", tc.rootType, tc.rootFormat, tc.ephType, tc.requested, got, err, tc.want)
+		}
+	}
+}
+
+// A managed plan refuses an ephemeral pool whose type an older release cannot
+// derive a managed ephemeral volume for, and an unsupported request, with a
+// non-retriable error that names the pool and its type.
+func TestManagedPlanDiskFormat_RefusesEphemeralPool(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ ephType, requested, want string }{
+		{"iscsi", "", "cannot allocate disk images"},
+		{"iscsidirect", "raw", "cannot allocate disk images"},
+		{"zfs", "", "storage-set placement cannot use"},
+		{"cephfs", "", "storage-set placement cannot use"},
+		{"", "", "storage-set placement cannot use"},
+		{"nfs", "qed", "is unsupported"},
+	}
+	for _, tc := range cases {
+		for _, root := range []string{"nfs", "lvmthin", "lvm"} {
+			got, err := managedPlanDiskFormat(root, "raw", "eph-pool", tc.ephType, tc.requested)
+			var cloud *cpierrors.Error
+			if !errors.As(err, &cloud) || cloud.OkToRetry() || got != "" {
+				t.Fatalf("managedPlanDiskFormat(root %s, %q, %q) = (%q, %v); want a non-retriable refusal", root, tc.ephType, tc.requested, got, err)
+			}
+			for _, want := range []string{`"eph-pool"`, fmt.Sprintf("type %q", tc.ephType), tc.want, "before the VM was created"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not mention %s", err, want)
+				}
+			}
 		}
 	}
 }

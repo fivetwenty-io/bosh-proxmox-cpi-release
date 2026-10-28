@@ -226,22 +226,8 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 		balloonMiB = &n
 	}
 
-	var ephemeralDiskGiB int
-	var ephemeralStorage string
-	switch {
-	case parsed.storagePlan != nil:
-		if target, ok := managedVMRoleTarget(parsed.storagePlan, storageRoleEphemeral); ok {
-			ephemeralDiskGiB, err = managedVMGiB(target.VirtualBytes)
-			ephemeralStorage = target.StorageID
-			ephemeralType := parsed.storagePlan.Definitions[ephemeralStorage].Type
-			vmDiskFormat = managedPlanDiskFormat(vmStorageType, vmDiskFormat, ephemeralType, requestedFormat)
-			warnEphemeralFormatCoercion(deps.Log(ctx), "create_vm: ephemeral disk", ephemeralStorage, ephemeralType, requestedFormat)
-		}
-	case parsed.storageSelection != nil && parsed.storageSelection.Ephemeral != nil && parsed.storageSelection.Ephemeral.Atomic:
-		ephemeralDiskGiB, ephemeralStorage, err = resolveAtomicVMEphemeral(ctx, deps, cp, parsed.storageSelection.Ephemeral)
-	default:
-		ephemeralDiskGiB, ephemeralStorage, err = resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
-	}
+	ephemeralDiskGiB, ephemeralStorage, vmDiskFormat, err := resolveShapeEphemeral(ctx, deps, parsed,
+		vmStorage, vmStorageType, vmDiskFormat, requestedFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -432,6 +418,48 @@ func resolveVMShapeStorage(cfg *config.CPIConfig, parsed *createVMParsedArgs, ti
 		}
 	}
 	return vmStorage, vmDiskFormat, rootDiskGiB, nil
+}
+
+// resolveShapeEphemeral resolves the ephemeral disk's size and pool, and on
+// the managed path the DiskFormat the plan freezes (managedPlanDiskFormat). It
+// refuses an ephemeral pool that cannot take the disk here, before the VM is
+// cloned or configured. The managed path checks the type the plan recorded,
+// and the unmanaged paths check the pool's live type, letting a failed lookup
+// through so the deploy goes on as before.
+func resolveShapeEphemeral(ctx context.Context, deps Deps, parsed *createVMParsedArgs,
+	vmStorage, vmStorageType, vmDiskFormat, requestedFormat string) (gib int, storage, diskFormat string, err error) {
+	cp := parsed.cloudProps
+	switch {
+	case parsed.storagePlan != nil:
+		target, ok := managedVMRoleTarget(parsed.storagePlan, storageRoleEphemeral)
+		if !ok {
+			return 0, "", vmDiskFormat, nil
+		}
+		if gib, err = managedVMGiB(target.VirtualBytes); err != nil {
+			return 0, "", "", err
+		}
+		storage = target.StorageID
+		storageType := parsed.storagePlan.Definitions[storage].Type
+		diskFormat, err = managedPlanDiskFormat(vmStorageType, vmDiskFormat, storage, storageType, requestedFormat)
+		if err != nil {
+			return 0, "", "", err
+		}
+		warnEphemeralFormatCoercion(deps.Log(ctx), "create_vm: ephemeral disk", storage, storageType, requestedFormat)
+		return gib, storage, diskFormat, nil
+	case parsed.storageSelection != nil && parsed.storageSelection.Ephemeral != nil && parsed.storageSelection.Ephemeral.Atomic:
+		gib, storage, err = resolveAtomicVMEphemeral(ctx, deps, cp, parsed.storageSelection.Ephemeral)
+	default:
+		gib, storage, err = resolveEphemeralShape(ctx, deps, cp, parsed.cloudPropsMap)
+	}
+	if err != nil {
+		return 0, "", "", err
+	}
+	if gib > 0 {
+		if refuse := checkUnmanagedEphemeralStorage(ctx, deps, storage, vmStorage, vmStorageType); refuse != nil {
+			return 0, "", "", refuse
+		}
+	}
+	return gib, storage, vmDiskFormat, nil
 }
 
 // resolveVMShapeCPUMem returns cores, sockets, and memory (MiB) honoring two

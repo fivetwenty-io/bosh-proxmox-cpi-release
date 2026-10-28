@@ -5,7 +5,10 @@
 package handlers
 
 import (
+	"context"
+
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
@@ -82,6 +85,13 @@ func warnEphemeralFormatCoercion(logger *log.Logger, op, storage, storageType, p
 // (pve.EphemeralVolumeFormat), which keeps every plan this release writes
 // readable, verifiable, and cleanable by an older CPI.
 //
+// The ephemeral pool must be a type every release can derive a managed
+// ephemeral volume for, which is file storage or lvm, lvmthin, zfspool, or
+// rbd. Any other type, iscsi, iscsidirect, and ZFS over iSCSI included, is
+// refused here with a non-retriable error that names the pool and its type,
+// before the plan is frozen or the VM is created. An unsupported request is
+// refused the same way.
+//
 // rootFormat is the root disk's resolved format. When the root lands on block
 // storage other than thick lvm, PVE stores the root as raw whatever format
 // the clone or import asks for, so the value we send there only matters for
@@ -92,18 +102,50 @@ func warnEphemeralFormatCoercion(logger *log.Logger, op, storage, storageType, p
 // Every other case returns rootFormat unchanged. On thick lvm an explicit
 // qcow2 root reaches PVE unchanged, so the root wins and the ephemeral disk
 // follows it.
-func managedPlanDiskFormat(rootType, rootFormat, ephemeralType, requested string) string {
-	if pve.ClassifyStorageFormat(rootType) != pve.StorageFormatBlock || pve.IsThickLVMStorage(rootType) {
-		return rootFormat
+func managedPlanDiskFormat(rootType, rootFormat, ephemeralStorage, ephemeralType, requested string) (string, error) {
+	if !pve.StorageUsesFileVolumes(ephemeralType) && !pve.IsBlockNativeStorage(ephemeralType) {
+		reason := "which a storage-set placement cannot use for an ephemeral disk"
+		if !pve.StorageAllocatesImages(ephemeralType) {
+			reason = "which cannot allocate disk images"
+		}
+		return "", refuseEphemeralStorage(ephemeralStorage, ephemeralType, reason)
 	}
 	want, err := pve.EphemeralVolumeFormat(ephemeralType, requested)
 	if err != nil {
-		return rootFormat
+		return "", cpierrors.Cloud("create_vm: ephemeral disk format %q on storage %q (type %q) is unsupported; refused before the VM was created",
+			requested, ephemeralStorage, ephemeralType)
+	}
+	if pve.ClassifyStorageFormat(rootType) != pve.StorageFormatBlock || pve.IsThickLVMStorage(rootType) {
+		return rootFormat, nil
 	}
 	if have, haveErr := pve.EphemeralVolumeFormat(ephemeralType, rootFormat); haveErr == nil && have == want {
-		return rootFormat
+		return rootFormat, nil
 	}
-	return want
+	return want, nil
+}
+
+// refuseEphemeralStorage is the non-retriable error create_vm returns, before
+// any VM exists, for an ephemeral pool whose type cannot take the disk.
+func refuseEphemeralStorage(storage, storageType, reason string) error {
+	return cpierrors.Cloud("create_vm: ephemeral storage %q has type %q, %s; refused before the VM was created",
+		storage, storageType, reason)
+}
+
+// checkUnmanagedEphemeralStorage refuses an iscsi or iscsidirect ephemeral
+// pool on the unmanaged create_vm path before the clone, where PVE would
+// otherwise refuse the volume only after the VM was cloned and configured. It
+// reuses the root pool's type when the ephemeral disk shares that pool. A
+// failed type lookup passes, so the deploy goes on as before and
+// attachEphemeralDisk decides once the pool can be read.
+func checkUnmanagedEphemeralStorage(ctx context.Context, deps Deps, storage, vmStorage, vmStorageType string) error {
+	storageType := vmStorageType
+	if storage != vmStorage || storageType == "" {
+		storageType = lookupVMStorageType(ctx, deps, storage)
+	}
+	if storageType == "" || pve.StorageAllocatesImages(storageType) {
+		return nil
+	}
+	return refuseEphemeralStorage(storage, storageType, "which cannot allocate disk images")
 }
 
 // finalizeCreateDiskFormat decides what create_disk sends to PVE once the

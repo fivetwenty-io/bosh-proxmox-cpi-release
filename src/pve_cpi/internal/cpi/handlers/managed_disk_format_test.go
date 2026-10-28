@@ -1,21 +1,23 @@
 package handlers
 
 import (
+	"errors"
+	"fmt"
 	"maps"
 	"strings"
 	"testing"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdk "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 )
 
 // retypedPlan returns a copy of plan whose persistent pool has another PVE
-// type. Inventory admits only shared NFS as a storage-set member today, so a
-// block pool cannot come out of the planner, and revalidation refuses a plan
-// whose recorded definition differs from inventory. The allocator still has to
-// handle a block pool if that gate ever widens, so these tests drive its
-// format, naming, CID, and readback steps directly.
+// type. Inventory admits only shared NFS as a storage-set member today, so the
+// planner never hands the allocator another type, and revalidation refuses a
+// plan whose recorded definition differs from inventory. These tests drive the
+// allocator's format step directly to prove what it does with each type.
 func retypedPlan(plan *StorageAllocationPlan, storageType string) *StorageAllocationPlan {
 	out := *plan
 	out.Definitions = maps.Clone(plan.Definitions)
@@ -26,25 +28,17 @@ func retypedPlan(plan *StorageAllocationPlan, storageType string) *StorageAlloca
 	return &out
 }
 
-// A journal-managed persistent disk follows the type of the pool its plan
-// chose: the format sent, the volume name and its extension, the CID record,
-// and the readback verification all agree with that pool.
-func TestManagedDiskFormatFollowsPoolType(t *testing.T) {
+// A journal-managed persistent disk on file storage takes its format from the
+// request, or qcow2 when the request is unset, and the volume name, the CID
+// record, and the readback all agree with that format.
+func TestManagedDiskFormatOnFileStorage(t *testing.T) {
 	cases := []struct {
-		name       string
-		poolType   string
-		requested  string
-		wantFormat string
-		wantBlock  bool
-		wantWarn   bool
+		name, poolType, requested, wantFormat string
 	}{
-		{"unset on lvmthin is raw with a bare name", "lvmthin", "", "raw", true, false},
-		{"explicit qcow2 on lvmthin is raw and warns", "lvmthin", "qcow2", "raw", true, true},
-		{"explicit qcow2 on thick lvm is raw and warns", "lvm", "qcow2", "raw", true, true},
-		{"unset on zfspool is raw", "zfspool", "", "raw", true, false},
-		{"unset on nfs is qcow2 with an extension", "nfs", "", "qcow2", false, false},
-		{"unset on dir is qcow2 with an extension", "dir", "", "qcow2", false, false},
-		{"explicit raw on nfs keeps raw", "nfs", "raw", "raw", false, false},
+		{"unset on nfs is qcow2", "nfs", "", "qcow2"},
+		{"unset on dir is qcow2", "dir", "", "qcow2"},
+		{"explicit raw on nfs keeps raw", "nfs", "raw", "raw"},
+		{"explicit vmdk on nfs keeps vmdk", "nfs", "vmdk", "vmdk"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,13 +52,13 @@ func TestManagedDiskFormatFollowsPoolType(t *testing.T) {
 				t.Fatalf("format = %q; want %q", m.format, tc.wantFormat)
 			}
 			target := m.plan.Targets[0]
-			name, volume, err := pve.AllocationVolume(m.targetStorageType(), target.StorageID, 9000, m.plan.Namespace, m.id, m.format)
+			name, err := pve.AllocationVolumeName(9000, m.plan.Namespace, m.id, m.format)
 			if err != nil {
 				t.Fatal(err)
 			}
-			checkAllocationVolumeShape(t, target.StorageID, name, volume, tc.wantFormat, tc.wantBlock)
-			if _, id, ok := pve.ParseAllocationVolumeID(volume); !ok || id != m.id {
-				t.Errorf("ParseAllocationVolumeID(%q) = (%q, %v); want the allocation ID", volume, id, ok)
+			volume := fmt.Sprintf("%s:9000/%s", target.StorageID, name)
+			if !strings.HasSuffix(name, "."+tc.wantFormat) {
+				t.Errorf("volume name %q lacks the .%s extension", name, tc.wantFormat)
 			}
 			checkManagedReadback(t, m, state, volume)
 			cid, err := m.cid(volume)
@@ -78,21 +72,10 @@ func TestManagedDiskFormatFollowsPoolType(t *testing.T) {
 			if cidVolume != volume || meta.Format != tc.wantFormat {
 				t.Errorf("CID = (%q, format %q); want (%q, format %q)", cidVolume, meta.Format, volume, tc.wantFormat)
 			}
-			if warned := len(formatWarnings(obs)); (warned == 1) != tc.wantWarn || warned > 1 {
-				t.Errorf("format warnings = %d; want warning=%v", warned, tc.wantWarn)
+			if warned := formatWarnings(obs); len(warned) != 0 {
+				t.Errorf("unexpected format warnings: %v", warned)
 			}
 		})
-	}
-}
-
-func checkAllocationVolumeShape(t *testing.T, storageID, name, volume, format string, block bool) {
-	t.Helper()
-	bare := strings.TrimPrefix(volume, storageID+":")
-	if block && (bare != name || strings.Contains(name, ".")) {
-		t.Errorf("block volume (%q, %q) has a file-style name", name, volume)
-	}
-	if !block && (bare != "9000/"+name || !strings.HasSuffix(name, "."+format)) {
-		t.Errorf("file volume (%q, %q) lacks the vmid directory or the .%s extension", name, volume, format)
 	}
 }
 
@@ -129,33 +112,42 @@ func TestManagedDiskUnsetRequestIsQCOW2OnNFS(t *testing.T) {
 	}
 }
 
-// iscsi and iscsidirect expose LUNs that already exist, so a plan that lands
-// a persistent disk there is refused before anything is recorded or sent.
-func TestManagedDiskRefusesPoolThatCannotAllocateImages(t *testing.T) {
-	for _, typ := range []string{"iscsi", "iscsidirect"} {
-		t.Run(typ, func(t *testing.T) {
+// The allocator fails closed. A plan whose persistent pool is not file storage
+// is refused with a non-retriable error that names the pool and its type,
+// before the format, the options, or anything in PVE changes.
+func TestManagedDiskRefusesPoolThatIsNotFileStorage(t *testing.T) {
+	for _, typ := range []string{"lvmthin", "lvm", "zfspool", "rbd", "iscsi", "iscsidirect", "esxi", ""} {
+		t.Run("type "+typ, func(t *testing.T) {
 			m, _, state, _ := managedDiskCallFixture(t, "spread", false, nil)
-			err := m.applyTargetFormat(t.Context(), retypedPlan(m.plan, typ))
-			if err == nil || !strings.Contains(err.Error(), "cannot allocate disk images; no allocation submitted") {
-				t.Fatalf("applyTargetFormat = %v; want a refusal", err)
+			before := m.format
+			plan := retypedPlan(m.plan, typ)
+			storage := plan.Targets[0].StorageID
+			err := m.applyTargetFormat(t.Context(), plan)
+			var cloud *cpierrors.Error
+			if !errors.As(err, &cloud) || cloud.OkToRetry() {
+				t.Fatalf("applyTargetFormat = %v; want a non-retriable cloud error", err)
 			}
-			if len(state.created) != 0 {
-				t.Fatalf("the refusal submitted an allocation: %v", state.created)
+			for _, want := range []string{fmt.Sprintf("%q", storage), fmt.Sprintf("type %q", typ), "no allocation submitted"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q does not mention %s", err, want)
+				}
+			}
+			if m.format != before || len(state.created) != 0 {
+				t.Fatalf("the refusal changed the request (format %q) or submitted %v", m.format, state.created)
 			}
 		})
 	}
 }
 
-// A retry that moves the disk to another pool resolves the format against the
-// plan it is handed, not the plan it is leaving, so the next attempt's name,
-// CID, and readback suit the new pool.
+// A retry resolves the format against the plan it is handed, not the plan it
+// is leaving, so a retry onto a pool that is not file storage stops there.
 func TestManagedDiskApplyTargetFormatFollowsTheNewPlan(t *testing.T) {
 	m, _, _, _ := managedDiskCallFixture(t, "spread", true, nil)
-	m.plan = retypedPlan(m.plan, "lvmthin")
-	if err := m.applyTargetFormat(t.Context(), m.plan); err != nil || m.format != "raw" {
-		t.Fatalf("block plan: format = %q, err = %v; want raw", m.format, err)
+	m.requested = "raw"
+	if err := m.applyTargetFormat(t.Context(), retypedPlan(m.plan, "nfs")); err != nil || m.format != "raw" {
+		t.Fatalf("file plan: format = %q, err = %v; want raw", m.format, err)
 	}
-	if err := m.applyTargetFormat(t.Context(), retypedPlan(m.plan, "nfs")); err != nil || m.format != "qcow2" {
-		t.Fatalf("file plan: format = %q, err = %v; want qcow2", m.format, err)
+	if err := m.applyTargetFormat(t.Context(), retypedPlan(m.plan, "lvmthin")); err == nil {
+		t.Fatal("block plan on retry was accepted")
 	}
 }
