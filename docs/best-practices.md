@@ -124,7 +124,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** Block-backed storages (LVM, LVM-thin, ZFS pool) reject the qcow2 format outright and only accept raw; file-backed storages (dir, NFS, CIFS) support qcow2's copy-on-write and snapshot capabilities that raw lacks.
 
-**CPI behavior.** `pve.vm_disk_format` defaults to `qcow2`, which is correct for file-backed pools. When no call- or profile-level layer expresses an explicit format preference, `create_disk` omits the format parameter entirely on block-backed storage so PVE selects the correct default for that storage type itself, rather than forcing qcow2 where PVE would reject it. (`create_vm`'s root disk is a separate path: its format is always carried in the import-from string.)
+**CPI behavior.** `pve.vm_disk_format` is empty by default, and an empty or `auto` value at any layer counts as unset. When no layer sets an explicit format, the CPI picks the format from the type of the storage each disk lands on, after it chooses that storage. File storage gets `qcow2` and block storage gets `raw`. An explicit `qcow2` or `vmdk` on block storage is replaced with `raw` and logged as a warning, except on thick `lvm`, where PVE accepts `qcow2` and allocates raw. An unknown storage type, or a failed type lookup, keeps the old `qcow2` default with a warning and never fails the deploy. [Operations, Where the format comes from](operations.md#where-the-format-comes-from-and-why-a-pool-can-hold-raw-volumes-you-did-not-ask-for) has the full rules.
 
 **Status.** Meets.
 

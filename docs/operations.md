@@ -1229,30 +1229,21 @@ bosh task <id> --debug 2>&1 | grep 'pve api error detail'
 
 ## Persistent disks: cloud_properties
 
-The CPI creates persistent disks as PVE storage volumes. The disk format and the storage pool type must be compatible. LVM and ZFS pools require raw volumes; directory-backed and network-backed pools default to `qcow2`.
+The CPI creates persistent disks as PVE storage volumes, and the disk format has to suit the storage pool's type. Block storage such as LVM, ZFS, and Ceph RBD holds raw volumes, while directory-backed and network-backed pools can hold qcow2. When nothing sets a format, the CPI picks it from the pool's type, so most deployments never need to set one.
 
 ### `disk_format` property
 
-Set `disk_format` in the `cloud_properties` of a `persistent_disk_type` when the target pool requires a specific format:
+We can set `disk_format` in the `cloud_properties` of a `persistent_disk_type`, but for most pools we leave it out and let the CPI choose:
 
-| Pool type | Required `disk_format` | Notes |
+| Pool type | `disk_format` | Notes |
 |---|---|---|
-| `lvm`, `lvmthin` | `raw` | LVM does not support qcow2 layers |
-| `zfspool` | `raw` | ZFS zvols are raw block devices |
-| `dir`, `nfs`, `cifs` | omit (defaults to `qcow2`) | qcow2 is the pool default; raw is also valid |
-| `rbd` (Ceph) | omit (defaults to `raw`) | RBD volumes are always raw; the field is ignored |
+| `lvmthin`, `zfspool`, `zfs`, `rbd`, `iscsi`, `iscsidirect` | omit (the CPI picks `raw`) | These pools hold only raw volumes. An explicit `qcow2` or `vmdk` is replaced with `raw`, and the CPI logs a warning. |
+| `lvm` (thick) | omit (the CPI picks `raw`) | An explicit `qcow2` passes through to PVE, which allocates raw. An explicit `vmdk` is replaced with `raw`. |
+| `dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`, `btrfs` | omit (the CPI picks `qcow2`) | qcow2 keeps copy-on-write and snapshots. `raw` and `vmdk` are also valid and are used as given. |
 
 ### Example manifest snippet
 
-```yaml
-disk_types:
-  - name: 50GB
-    disk_size: 51200
-    cloud_properties:
-      disk_format: raw   # required for lvm, lvmthin, and zfspool pools
-```
-
-For pools that do not require `raw`, omit `disk_format` entirely:
+On any pool we can leave the format out, and the CPI picks the one that suits the pool:
 
 ```yaml
 disk_types:
@@ -1261,17 +1252,39 @@ disk_types:
     cloud_properties: {}
 ```
 
+When we want a specific format on a file-backed pool, we set it explicitly:
+
+```yaml
+disk_types:
+  - name: 50GB
+    disk_size: 51200
+    cloud_properties:
+      disk_format: raw   # a raw file on dir, nfs, or cifs
+```
+
+A `disk_format` or `vm_disk_format` that is empty or `auto` counts as unset, the same as leaving the key out. That matters for Genesis kits and other generators that write `disk_format: ""` or `disk_format: auto` into every `disk_type` and `vm_type` instead of dropping the key.
+
 ### Where the format comes from, and why a pool can hold raw volumes you did not ask for
 
-The CPI resolves a disk format from four places, and the first one that carries a value wins. A `disk_format` in the call's own `cloud_properties` comes first, then a `disk_format` on a `disk_type` or `vm_type` profile declared in the CPI config, then the `pve.vm_disk_format` job property (which a `cpi-config` entry may override per cluster), and finally the built-in default `qcow2`. VM root disks and ephemeral disks read `vm_disk_format` at the first two rungs and fall back to the same job property and the same built-in default.
+The CPI looks for a requested format in four places, and the first one that carries an explicit format wins. A `disk_format` in the call's own `cloud_properties` comes first, then a `disk_format` on a `disk_type` or `vm_type` profile declared in the CPI config, and then the `pve.vm_disk_format` job property, which a `cpi-config` entry may override per cluster as `pve_vm_disk_format`. VM root disks and ephemeral disks read `vm_disk_format` at the first two places and fall back to the same job property. An empty or `auto` value at any of the four places counts as unset, so the search moves on to the next place, and the CPI never sends an empty or `auto` format to PVE.
 
-Two rules apply on top of that ladder. On a block-native pool (`lvm`, `lvmthin`, `zfspool`, `rbd`) PVE has no file format to choose and always allocates raw, so the CPI records raw in the disk CID no matter what the ladder resolved. On a file-backed pool (`dir`, `nfs`, `cifs`, `glusterfs`, `btrfs`) the resolved format is sent to PVE verbatim and is also baked into the volume filename, which is why a volume on such a pool is named `vm-<vmid>-disk-0.qcow2` or `vm-<vmid>-disk-0.raw`.
+When none of the four places carries an explicit format, the CPI picks one from the type of the storage the disk lands on. It resolves the format separately for each disk after the CPI chooses that disk's storage, so a root disk on `local-lvm` and an ephemeral disk on an NFS pool can end up with different formats. The CPI applies these rules:
 
-The CPI never downgrades a requested `qcow2` to `raw`. Proxmox supports qcow2 on NFS, and the CPI classifies NFS as file-backed everywhere it makes a format decision. So a raw volume on an NFS pool means raw reached the CPI from one of the four places above, and the volume's own `.raw` extension is the proof: the extension always mirrors the format the CPI sent.
+- File storage (`dir`, `nfs`, `cifs`, `glusterfs`, `cephfs`, and `btrfs`) gets `qcow2`.
 
-When a pool holds raw volumes you did not expect, read the ladder from the top. The usual cause is a stale or unset `disk_format` in the `cloud_properties` of the `disk_type` the deployment actually uses, because that value beats the `pve.vm_disk_format` job property and every Genesis kit generates its own cloud-config from its own environment file. Setting the format on the director's environment file does not reach a deployment whose kit builds its own `disk_types`. Check the format the director is really sending with `bosh cloud-config` and look at the `cloud_properties` of the named `disk_type`, not at the CPI job properties.
+- Block storage (`lvm`, `lvmthin`, `zfspool`, `zfs`, `rbd`, `iscsi`, and `iscsidirect`) gets `raw`.
 
-One case does leave the choice to PVE. When no layer expresses a format and the CPI cannot classify the target pool's type, `create_disk` omits the format parameter so PVE applies that storage plugin's own default, which is raw for the `dir` and `nfs` plugins. A file-backed pool rejects the resulting extension-less volume name outright, so this shows up as a failed `create_disk` rather than a silent raw volume. It happens only when the storage-type lookup fails, and the remedy is to fix the lookup, not the format.
+- Any other type, or a storage whose type lookup failed, keeps the old `qcow2` default, and the CPI logs a warning. A failed lookup never fails the deploy.
+
+Two rules apply on top of an explicit format. On file storage the CPI sends the format to PVE as given and bakes it into the volume filename, which is why a volume on such a pool is named `vm-<vmid>-disk-0.qcow2` or `vm-<vmid>-disk-0.raw`. On block storage the CPI replaces an explicit `qcow2` or `vmdk` with `raw` and logs a warning naming the storage, its type, and the requested format. Thick `lvm` is the one exception, because PVE accepts a `qcow2` request there and allocates raw, so the CPI passes it through as it always has. Either way, the disk CID records raw for a block-backed volume.
+
+The CPI never downgrades a requested `qcow2` to `raw` on file storage. Proxmox supports qcow2 on NFS, and the CPI classifies NFS as file-backed everywhere it makes a format decision. So a raw volume on an NFS pool means an explicit raw reached the CPI from one of the four places above, and the volume's own `.raw` extension is the proof, because the extension always mirrors the format the CPI sent.
+
+When a pool holds raw volumes we did not expect, we read the four places from the top. The usual cause is a stale `disk_format` in the `cloud_properties` of the `disk_type` the deployment actually uses, because that value beats the `pve.vm_disk_format` job property and every Genesis kit generates its own cloud-config from its own environment file. Setting the format on the director's environment file does not reach a deployment whose kit builds its own `disk_types`. We check the format the director is really sending with `bosh cloud-config` and look at the `cloud_properties` of the named `disk_type`, not at the CPI job properties.
+
+Some disks keep the format they already have. Existing disks and their CIDs never change format, because the CPI resolves a format only when it creates a disk. A linked clone inherits its template's format, as PVE requires. Persistent disks that a `pve.storage` allocation plan places on a storage set stay file-backed, and they use `qcow2` unless a layer asks for another format.
+
+Two cases leave the choice to PVE. When no layer sets an explicit format and the CPI cannot classify the target pool's type, `create_disk` omits the format parameter so PVE applies that storage plugin's own default. On block storage `create_disk` also omits the parameter when the only format came from the job property or from the storage type, and PVE allocates raw there. Neither case needs a new PVE privilege, because the CPI reads the storage type from the same storage lookup it already makes.
 
 See [Configuration — Storage properties](configuration.md) for the full set of `cloud_properties` fields and their defaults.
 
