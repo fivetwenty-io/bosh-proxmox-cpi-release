@@ -17,7 +17,7 @@ image_resource:
   source:
     repository: golang
     tag: "1.27"
-    digest: "sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8"
+    digest: "sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b"
 
 inputs:
   - name: repo
