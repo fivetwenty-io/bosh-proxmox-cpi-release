@@ -298,12 +298,15 @@ gosec: ## Run gosec security scanner
 
 # Gitignored local lab state that intentionally holds credentials (guarded by
 # .gitignore and the manifest script checks, not by rotation); the secret
-# scanner must not fail the build on it.
+# scanner must not fail the build on it. .deps/ holds gitignored upstream
+# checkouts (bosh-acceptance-tests, cf-deployment) that the BATS and CF lab
+# runners fetch; CI never has them, and their lockfiles are upstream's to fix.
 TRIVY_SKIP := --skip-files manifests/bosh/creds.yml \
 	--skip-files "manifests/bosh/creds.yml.*" \
 	--skip-files manifests/envs/cpitest/artifacts_ssh \
 	--skip-files config/private.yml \
 	--skip-dirs .e2e-results \
+	--skip-dirs .deps \
 	--skip-dirs '**/worktrees'
 
 .PHONY: trivy
