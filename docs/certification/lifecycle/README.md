@@ -11,7 +11,7 @@ The CPI lifecycle harness (`scripts/lifecycle`) exercises every CPI method a BOS
 | CPI release | v0.9.5-11-gb9ba4dd9 |
 | Proxmox VE | 9.2.4 |
 | Stemcell | bosh-stemcell-1.364-openstack-kvm-ubuntu-noble.tgz |
-| Config | /private/tmp/claude-501/-Users-wayneeseguin-w-proxmox-bosh-proxmox-cpi-release/69155e41-65e1-44b1-89da-016b3cbf63f3/scratchpad/integration-diskfmt.yml |
+| Config | local copy of ci/integration.yml with env_name pve-cpi and tier1.disk_storage_pools auto |
 
 ## Run history
 
