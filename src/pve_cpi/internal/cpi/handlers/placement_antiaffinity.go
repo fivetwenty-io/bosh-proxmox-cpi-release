@@ -551,6 +551,26 @@ func legacyRuleName(ident haIdentity) string {
 	return haRuleNamePrefix + ident.Group
 }
 
+// legacyRuleMigrationPermitKey keys the context value that carries a legacy
+// rule migration's permit. Only migrateLegacyAntiAffinityRule sets it.
+type legacyRuleMigrationPermitKey struct{}
+
+// withLegacyRuleMigrationPermit returns a context that permits a managed
+// allocation guard to admit an update or delete of the unmarked rule named
+// rule. The migration sets it after it has proved which of the rule's members
+// belong to this Director through their owner, deployment, and job tags, and
+// while it holds the lock an older CPI writes that rule under.
+func withLegacyRuleMigrationPermit(ctx context.Context, rule string) context.Context {
+	return context.WithValue(ctx, legacyRuleMigrationPermitKey{}, rule)
+}
+
+// legacyRuleMigrationPermitted reports whether ctx carries the legacy rule
+// migration's permit for exactly the rule named rule.
+func legacyRuleMigrationPermitted(ctx context.Context, rule string) bool {
+	permitted, ok := ctx.Value(legacyRuleMigrationPermitKey{}).(string)
+	return ok && permitted != "" && permitted == rule
+}
+
 // migrateLegacyAntiAffinityRule moves this Director's members out of the
 // group's unmarked rule from an older CPI. Two Directors may share that rule, so
 // the CPI never adopts it whole. It removes only the members in mine, which the
@@ -603,6 +623,9 @@ func migrateLegacyAntiAffinityRule(
 	}
 
 	aborted := false
+	// The permit tells a managed allocation guard that this write is the
+	// migration's own, so it admits an edit of this one unmarked rule.
+	ctx = withLegacyRuleMigrationPermit(ctx, name)
 	res, err := writer.Apply(ctx, "anti-affinity migration", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
 		fresh := set.Find(name)
 		switch {

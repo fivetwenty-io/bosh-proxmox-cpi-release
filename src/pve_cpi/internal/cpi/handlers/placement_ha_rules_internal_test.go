@@ -14,6 +14,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 )
 
 // aaModeDeps returns aaDeps over a cluster whose configured nodes are nodes, in
@@ -461,4 +462,163 @@ func TestManagedGuardAdmitsOnlyOurRuleEdits(t *testing.T) {
 	if err := del("bosh-aa-ours"); err == nil {
 		t.Fatal("a delete without a Director was admitted")
 	}
+}
+
+// TestManagedGuardRefusesUnmarkedRuleEditsOutsideTheMigration keeps the
+// migration's permit narrow. Only an edit that carries the permit for the very
+// rule it edits, of a bosh-aa- rule that reads unmarked, and that leaves the
+// comment as it reads, gets through. Every other edit of an unmarked rule is
+// refused as before.
+func TestManagedGuardRefusesUnmarkedRuleEditsOutsideTheMigration(t *testing.T) {
+	ours, other := haIdentity{Owner: aaDirector}.marker(), haIdentity{Owner: aaOtherDirector}.marker()
+	legacyComment := "BOSH anti-affinity for instance group web"
+	stub := newNAStub()
+	seed := func(name, comment string) {
+		p := cluster.CreateHaRulesParams{Rule: name, Type: ha.RuleTypeResourceAffinity, Resources: "vm:100,vm:101"}
+		if comment != "" {
+			p.Comment = &comment
+		}
+		stub.rules[name] = p
+	}
+	seed("bosh-aa-web", legacyComment)
+	seed("bosh-aa-bare", "")
+	seed("bosh-aa-api", legacyComment)
+	seed("bosh-aa-other", other)
+	seed("bosh-na-555", "")
+	m := &managedVMAllocation{vmid: 100, deps: Deps{PVE: &haRulesReadClient{svc: stub}, RequestDirectorUUID: aaDirector}}
+	resources := "vm:100"
+	update := func(ctx context.Context, rule string, comment, del *string) error {
+		_, err := m.infrastructureMutationParameters(ctx, ManagedAllocationMutation{
+			Service: "Cluster", Method: "UpdateHaRules", Args: map[string]any{"rule": rule,
+				managedArgumentParams: &cluster.UpdateHaRulesParams{Type: ha.RuleTypeResourceAffinity,
+					Resources: &resources, Comment: comment, Delete: del}}})
+		return err
+	}
+	remove := func(ctx context.Context, rule string) error {
+		_, err := m.infrastructureMutationParameters(ctx, ManagedAllocationMutation{
+			Service: "Cluster", Method: "DeleteHaRules", Args: map[string]any{"rule": rule}})
+		return err
+	}
+	bg := context.Background()
+	permit := func(rule string) context.Context { return withLegacyRuleMigrationPermit(bg, rule) }
+	deleteComment := "comment"
+
+	if err := update(permit("bosh-aa-web"), "bosh-aa-web", &legacyComment, nil); err != nil {
+		t.Fatalf("the migration's update was refused: %v", err)
+	}
+	if err := update(permit("bosh-aa-bare"), "bosh-aa-bare", nil, nil); err != nil {
+		t.Fatalf("the migration's update of a rule with no comment was refused: %v", err)
+	}
+	if err := remove(permit("bosh-aa-web"), "bosh-aa-web"); err != nil {
+		t.Fatalf("the migration's delete was refused: %v", err)
+	}
+	for name, err := range map[string]error{
+		"update without the permit":           update(bg, "bosh-aa-web", &legacyComment, nil),
+		"update claiming without the permit":  update(bg, "bosh-aa-web", &ours, nil),
+		"delete without the permit":           remove(bg, "bosh-aa-web"),
+		"update under another rule's permit":  update(permit("bosh-aa-web"), "bosh-aa-api", &legacyComment, nil),
+		"delete under another rule's permit":  remove(permit("bosh-aa-web"), "bosh-aa-api"),
+		"permitted update writing our marker": update(permit("bosh-aa-web"), "bosh-aa-web", &ours, nil),
+		"permitted update changing a comment": update(permit("bosh-aa-web"), "bosh-aa-web", new(string), nil),
+		"permitted update deleting a comment": update(permit("bosh-aa-web"), "bosh-aa-web", nil, &deleteComment),
+		"permitted update of another's rule":  update(permit("bosh-aa-other"), "bosh-aa-other", &other, nil),
+		"permitted delete of another's rule":  remove(permit("bosh-aa-other"), "bosh-aa-other"),
+		"permitted update of a pin rule":      update(permit("bosh-na-555"), "bosh-na-555", nil, nil),
+		"permitted delete of a pin rule":      remove(permit("bosh-na-555"), "bosh-na-555"),
+	} {
+		if err == nil {
+			t.Errorf("%s was admitted", name)
+		}
+	}
+}
+
+// TestManagedCreateVMMigratesALegacyRule runs create_vm's anti-affinity step on
+// a managed allocation, through the allocation's own guard and journal, while
+// an older CPI's unmarked bosh-aa-web rule holds two of this Director's
+// members. The create must succeed, move those members into the hashed rule
+// with the new VM, and delete the old rule, which no longer spreads anything.
+func TestManagedCreateVMMigratesALegacyRule(t *testing.T) {
+	m, fixture, _, _ := newManagedVMGuardCase(t, managedVMGuardCase{})
+	stub := newAAStub()
+	legacyComment := "BOSH anti-affinity for instance group web"
+	stub.seedRuleWithComment("bosh-aa-web", "vm:100,vm:103", legacyComment)
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, legacyTags(aaDirector)), aaQEMU(103, legacyTags(aaDirector)))
+	m.deps.PVE = legacyRuleManagedClient{managedVMGuardFixture: fixture,
+		cluster: &legacyRuleManagedCluster{aaClusterStub: stub, created: map[string]*cluster.CreateHaResourcesParams{}}}
+	m.deps.Config = aaMembershipConfig("off", false, 1)
+	m.deps.RequestDirectorUUID = aaDirector
+	m.deps.HAProfile = pve9Profile
+	m.guard = nil
+	if err := m.newGuard(); err != nil {
+		t.Fatal(err)
+	}
+	guarded := m.deps
+	guarded.PVE = m.guard.Client()
+
+	if err := applyAntiAffinityMembership(context.Background(), guarded, m.vmid, aaEnvForWebGroup(), log.NewNopLogger()); err != nil {
+		t.Fatalf("managed create_vm failed on a legacy rule: %v (guard: %v)", err, m.guard.Err())
+	}
+	if err := m.guard.Err(); err != nil {
+		t.Fatalf("the migration poisoned the allocation: %v", err)
+	}
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:103" {
+		t.Errorf("hashed rule = %q; want vm:100,vm:101,vm:103", got)
+	}
+	if _, ok := stub.rules["bosh-aa-web"]; ok {
+		t.Errorf("the legacy rule = %q; it must be deleted once every member has moved", stub.rules["bosh-aa-web"])
+	}
+}
+
+// legacyRuleManagedClient serves a managed VM fixture with the anti-affinity
+// cluster stub in place of the fixture's cluster service, and lists the
+// stub's guests as each node's QEMU guests.
+type legacyRuleManagedClient struct {
+	*managedVMGuardFixture
+	cluster *legacyRuleManagedCluster
+}
+
+func (c legacyRuleManagedClient) Cluster() cluster.Service { return c.cluster }
+
+func (c legacyRuleManagedClient) Nodes() nodes.Service {
+	return legacyRuleManagedNodes{Service: c.managedVMGuardFixture.Nodes(), guests: &icNodesService{listFn: c.cluster.ListResources}}
+}
+
+// legacyRuleManagedCluster reads an HA resource back with every field its
+// creation wrote, as PVE does, so the managed guard's readback can prove it.
+type legacyRuleManagedCluster struct {
+	*aaClusterStub
+	created map[string]*cluster.CreateHaResourcesParams
+}
+
+func (c *legacyRuleManagedCluster) CreateHaResources(ctx context.Context, p *cluster.CreateHaResourcesParams) error {
+	if err := c.aaClusterStub.CreateHaResources(ctx, p); err != nil {
+		return err
+	}
+	c.created[p.Sid] = p
+	return nil
+}
+
+func (c *legacyRuleManagedCluster) GetHaResources(ctx context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	p, ok := c.created[sid]
+	if !ok {
+		return c.aaClusterStub.GetHaResources(ctx, sid)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	var resp cluster.GetHaResourcesResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+type legacyRuleManagedNodes struct {
+	nodes.Service
+	guests *icNodesService
+}
+
+func (n legacyRuleManagedNodes) ListQemu(ctx context.Context, node string, params *nodes.ListQemuParams) (*nodes.ListQemuResponse, error) {
+	return n.guests.ListQemu(ctx, node, params)
 }
