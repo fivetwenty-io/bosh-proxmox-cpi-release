@@ -10,29 +10,21 @@ import (
 // ---------------------------------------------------------------------------
 // pve_placement per-request override.
 //
-// Placement was previously excluded from the override registry, which made the
-// three HA features (placement.dlb, anti_affinity.use_ha_rules,
-// pin_az_via_ha_rules) unreachable from a cpi-config entry — i.e. unreachable
-// in exactly the multi-cluster deployments that have more than one cluster to
-// fail over within. Worse, with cloud_properties.availability_zone set, a
-// request fell back to the job-level (usually empty) az_map and create_vm
-// hard-failed with "availability_zone %q is not defined in placement.az_map".
+// Placement was previously excluded from the override registry, which left a
+// cpi-config entry unable to carry its own az_map. With
+// cloud_properties.availability_zone set, a request fell back to the job-level
+// (usually empty) az_map and create_vm hard-failed with "availability_zone %q
+// is not defined in placement.az_map".
 // ---------------------------------------------------------------------------
 
 // placementOverrideMap is a representative cpi-config entry placement block:
-// an AZ map plus the two HA-registration knobs an entry would realistically set.
+// an AZ map plus the scheduler-soft anti-affinity switch an entry would set.
 func placementOverrideMap() map[string]any {
 	return map[string]any{
 		"az_map": map[string]any{
 			"z3": []any{"pve-az2-1", "pve-az2-2"},
 		},
-		"pin_az_via_ha_rules": true,
 		"anti_affinity": map[string]any{
-			"enabled":      true,
-			"use_ha_rules": true,
-			"strict":       false,
-		},
-		"dlb": map[string]any{
 			"enabled": true,
 		},
 	}
@@ -45,6 +37,7 @@ func TestApplyContextOverrides_Placement_FlatKey(t *testing.T) {
 
 	eff, applied, unknown, err := config.ApplyContextOverrides(base, map[string]any{
 		"pve_placement": placementOverrideMap(),
+		"pve_ha":        map[string]any{"mode": "auto", "anti_affinity": "on", "pin_az": "on", "dlb": map[string]any{"enabled": true}},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -52,8 +45,8 @@ func TestApplyContextOverrides_Placement_FlatKey(t *testing.T) {
 	if len(unknown) != 0 {
 		t.Errorf("unknown = %#v, want empty — pve_placement must be a supported override", unknown)
 	}
-	if len(applied) != 1 || applied[0] != "pve_placement" {
-		t.Fatalf("applied = %#v, want [pve_placement]", applied)
+	if len(applied) != 2 {
+		t.Fatalf("applied = %#v, want pve_ha and pve_placement", applied)
 	}
 	if eff == base {
 		t.Fatal("expected a distinct effective config")
@@ -65,13 +58,13 @@ func TestApplyContextOverrides_Placement_FlatKey(t *testing.T) {
 		t.Errorf("az_map[z3] = %#v, want the entry's node list", got)
 	}
 	if !eff.HANodeAffinityPinEnabled() {
-		t.Error("pin_az_via_ha_rules from the entry must be visible through the accessor")
+		t.Error("pve_ha.pin_az from the entry must be visible through the accessor")
 	}
-	if !eff.AntiAffinityUseHaRulesEnabled() {
-		t.Error("anti_affinity.use_ha_rules from the entry must be visible through the accessor")
+	if !eff.HAAntiAffinityRulesEnabled() {
+		t.Error("pve_ha.anti_affinity from the entry must be visible through the accessor")
 	}
 	if !eff.DLBExplicitlyEnabled() {
-		t.Error("dlb.enabled from the entry must be visible through the accessor")
+		t.Error("pve_ha.dlb.enabled from the entry must be visible through the accessor")
 	}
 }
 
@@ -241,15 +234,15 @@ func TestApplyContextOverrides_Placement_WrongType(t *testing.T) {
 
 // TestApplyContextOverrides_Placement_UnknownFieldRejected keeps a typo inside
 // the block from being silently dropped. An operator who writes
-// "pin_az_via_ha_rule" (singular) would otherwise get a block that parses
-// cleanly and pins nothing.
+// "az_maps" (plural) would otherwise get a block that parses cleanly and
+// constrains nothing.
 func TestApplyContextOverrides_Placement_UnknownFieldRejected(t *testing.T) {
 	t.Parallel()
 	base := validBaseCfg()
 	base.ApplyDefaults()
 
 	_, _, _, err := config.ApplyContextOverrides(base, map[string]any{
-		"pve_placement": map[string]any{"pin_az_via_ha_rule": true},
+		"pve_placement": map[string]any{"az_maps": true},
 	})
 	if err == nil {
 		t.Fatal("expected a typo'd placement field to be rejected")

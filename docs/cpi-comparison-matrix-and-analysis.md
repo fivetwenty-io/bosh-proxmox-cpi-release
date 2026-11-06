@@ -475,7 +475,7 @@ same "placed a workload where it must not live" class as the documented NATS inc
 
 **Build:** add per-node `Maintenance`/`Healthy` to the node facts, sourced from
 `GET /cluster/ha/status/current` and/or an operator node tag; add a hard rejection in
-`Filter()` behind `placement.exclude_maintenance_nodes` (default on). Fail-open per node
+`Filter()`; the node health check now always runs, because the `placement.exclude_maintenance_nodes` key was removed. Fail-open per node
 on a status-fetch error, exactly like the existing storage-facts gathering, so a
 diagnostics gap never fails `create_vm`.
 
@@ -1199,9 +1199,9 @@ requires a zone), and validate ranges (non-overlapping VMID ranges, weights ≥ 
 backoff bounds) were already enforced unconditionally. The remaining strictness is gated
 behind an opt-in `pve.strict_config_validation` flag so existing manifests keep loading
 unchanged by default. When enabled, the validator rejects unknown top-level keys and three
-documented cross-field contradictions: `use_ha_rules` without anti-affinity enabled,
-`network_mode: sdn` without a zone or `sdn_auto_manage_zone`, and a DLB
-`require_shared_storage` setting while the dynamic load balancer is disabled. Each rejection
+documented cross-field contradictions: `pve.ha.anti_affinity: on` without anti-affinity enabled and
+`network_mode: sdn` without a zone or `sdn_auto_manage_zone`. The earlier DLB
+`require_shared_storage` contradiction went away with that key. Each rejection
 names the offending key or combination so the failure is actionable at start-up rather than
 mid-deploy. Unknown-key checking is top-level only, matching the build scope.
 
@@ -1357,17 +1357,17 @@ scored into an AZ at birth can later migrate out. PVE 9.x HA also offers node-af
 (pin to a node set), unused by the CPI. Relevant for licensed-host or storage-tier
 locality deployments needing a durable AZ guarantee.
 
-**Build:** when the AZ map is set and `placement.pin_az_via_ha_rules` is enabled, after
+**Build:** when the AZ map is set and `pve.ha.pin_az` is `on`, after
 scoring create a PVE HA node-affinity rule binding the VM to the AZ node set, reusing the
 existing HA-rule plumbing; self-clean on delete; reject the node-affinity + DLB-sentinel-AZ
 combination at config-validate time (DLB intentionally un-pins).
 
-**Shipped.** When `placement.pin_az_via_ha_rules` is enabled and an AZ map is set, create_vm
+**Shipped.** When `pve.ha.pin_az` is `on` and an AZ map is set, create_vm
 writes a per-VM PVE HA node-affinity rule (`bosh-na-<vmid>`, distinct from the anti-affinity
 `bosh-aa-` rules) binding the VM to its AZ's node set after scoring, so the AZ placement
 survives HA failover and DLB rebalance. The pinned AZ is derived from the node the scorer
 actually chose, so it works for both the singular `availability_zone` and the plural
-`availability_zones` forms. Strictness is operator-selectable via `placement.pin_az_strict`
+`availability_zones` forms. Strictness is operator-selectable via `pve.ha.pin_az_strict`
 (default true — a hard AZ guarantee that keeps the VM on its node set even under total
 node-set failure; set false for a preferred pin that lets HA relocate off-AZ). The rule and
 its HA resource self-clean on delete and on any create_vm rollback. Config validation
@@ -1389,7 +1389,7 @@ scored into an AZ at birth can later migrate out under HA failover or a DLB reba
 deployments that depend on durable AZ locality, such as a licensed-host pool whose vendor terms
 bind software to specific nodes, or a storage-tier affinity where a guest must stay on nodes
 wired to its NVMe pool. The node-affinity rule (`placement_nodeaffinity.go:86-118`, written via
-PVE 9.x HA `node-affinity`) makes that AZ binding survive HA and DLB, and `pin_az_strict` lets
+PVE 9.x HA `node-affinity`) makes that AZ binding survive HA and DLB, and `pve.ha.pin_az_strict` lets
 the operator choose a hard guarantee (the VM stays on its node set even under total node-set
 failure) versus a preferred pin (HA may relocate off-AZ to keep the VM running). vSphere reaches
 the same locality goal through a different door: `vm_type.disable_drs` acquires a
@@ -1398,7 +1398,7 @@ booted on, complemented by explicit VM/host-affinity rules. vSphere's VM/Host gr
 also supports SHOULD (mandatory=false) versus MUST (mandatory=true) semantics — controlled by a
 config flag — and on `delete_vm` all empty VmGroups and their associated `VmHostRuleInfo` entries
 are atomically removed in a single `reconfigure_ex` call (`vm_creator.rb:165-188,370-374`,
-`drs_rules/vm_group.rb`). PVE's `pin_az_strict` flag maps to the same hard/soft distinction;
+`drs_rules/vm_group.rb`). PVE's `pve.ha.pin_az_strict` flag maps to the same hard/soft distinction;
 PVE's rule self-cleanup on delete is also present but implemented as a best-effort HA rule
 delete rather than an atomic group-and-rule sweep. PVE's node-affinity rule expresses
 the binding directly rather than disabling rebalancing wholesale. Because it reuses the existing
@@ -2387,7 +2387,7 @@ PCI VM is never created on a node lacking the device: device absent is a non-ret
 error, an inventory API fault is retriable. Hardware ids reported in domain-less short form
 (`01:00.0`) are normalized before comparison. The pin is removed unconditionally on create
 rollback and on `delete_vm` (sync and fast path) — removal is not gated by
-`placement.pin_az_via_ha_rules`, since the PCI pin is written regardless of that flag.
+`pve.ha.pin_az`, and the PCI pin is written whenever `pve.ha.mode` is `auto` or `managed`.
 Empty list is byte-identical (no filter, no device check, no hostpci config, no pin).
 `placement.Request` gains `RequiredPCIAddresses` and `PCIChecker` fields; the PCI filter
 pass in `placement.Filter` is fail-safe (API error → node rejected).

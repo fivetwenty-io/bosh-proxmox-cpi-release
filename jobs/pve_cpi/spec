@@ -101,9 +101,9 @@ properties:
       whole life, not only at boot: PVE refuses to live-migrate a VM whose
       CD-ROM volume sits on non-shared storage, and HA recovery on another
       node fails at start because the ISO file does not exist there. This
-      silently defeats placement.dlb, placement.pin_az_via_ha_rules, and
-      placement.anti_affinity.use_ha_rules. Use a shared pool (rbd, nfs, cifs,
-      glusterfs, cephfs) whenever any of those features is active; see
+      silently defeats pve.ha.dlb, pve.ha.pin_az, and pve.ha.anti_affinity. Use
+      a shared pool (rbd, nfs, cifs, glusterfs, cephfs) whenever any of those
+      features is active; see
       pve.require_shared_iso_for_ha and pve.iso_storage_follow_vm_storage.
     default: "local"
   pve.require_shared_iso_for_ha:
@@ -1051,16 +1051,11 @@ properties:
     default: false
   pve.placement.anti_affinity.use_ha_rules:
     description: |
-      When true (and anti_affinity.enabled is also true), the CPI additionally
-      registers each VM as a PVE HA resource and maintains a cluster-level
-      negative resource-affinity rule (POST /cluster/ha/rules,
-      type=resource-affinity, affinity=negative) keyed on the BOSH instance
-      group, so PVE enforces spreading at the hypervisor level rather than only
-      at create time. On delete the VM is removed from the rule and empty rules
-      are pruned. HA-managed resources interact with the BOSH resurrector;
-      enable only when PVE-level enforcement is desired. Has no effect unless
-      anti_affinity.enabled is true. Default false.
-    default: false
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: use pve.ha.anti_affinity: on with pve.ha.mode: auto.
+      The CPI registers a VM for HA and maintains a negative resource-affinity rule
+      only when pve.ha.anti_affinity is "on" and pve.ha.mode is "auto" or "managed".
   pve.vm_firewall:
     description: |
       When true, every NIC of newly created VMs is given PVE's per-NIC firewall
@@ -1282,73 +1277,50 @@ properties:
     default: false
   pve.placement.anti_affinity.strict:
     description: |
-      When true, the PVE HA negative resource-affinity rule created by
-      anti_affinity.use_ha_rules is set to strict mode (hard spread): PVE
-      refuses to place or failover a VM onto a node that already hosts another
-      member of the same instance group. Strict mode can block HA failover on
-      small clusters when no compliant node exists. Default false (advisory
-      spreading — PVE honors the rule as a soft preference, not an absolute
-      constraint). Has no effect unless anti_affinity.use_ha_rules is true.
-    default: false
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: delete it; resource-affinity rules are always strict and nothing
+      replaces this key.
+      The CPI always sends strict resource-affinity rules.
   pve.placement.dlb.enabled:
     description: |
-      Master switch for PVE 9.2+ Dynamic Load Balancer (CRS dynamic mode)
-      integration. When true, every VM created by this CPI is registered as a
-      PVE HA resource with auto-rebalance=1 and state=started, delegating
-      initial placement and continuous rebalancing to the DLB. Works alongside
-      operator-defined availability zones: master-flag-on VMs are still scored
-      within their AZ candidate set at create time; DLB then rebalances within
-      allowed nodes afterward. Default false (opt-in). See also
-      placement.dlb.az_name for per-workload sentinel-AZ opt-in.
-    default: false
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: use pve.ha.dlb.enabled with pve.ha.mode: auto.
+      The master switch now lives at pve.ha.dlb.enabled.
   pve.placement.dlb.az_name:
     description: |
-      Sentinel availability-zone name. When a VM is created with
-      cloud_properties.availability_zone equal to this value, the VM is treated
-      as DLB-delegated even when dlb.enabled is false: the CPI skips its own
-      AZ-map node restriction (any online node is a candidate) and registers the
-      VM as a PVE HA resource with auto-rebalance so the DLB places and balances
-      it. Default "dlb". Set to "" to disable the sentinel trigger entirely
-      (DLB opt-in via master flag only). When both dlb.enabled and the sentinel
-      AZ match, the master flag takes precedence (same registration path).
-    default: "dlb"
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: use pve.ha.dlb.az_name.
+      The sentinel AZ name now lives at pve.ha.dlb.az_name, and it defaults to "dlb".
   pve.placement.dlb.manage_cluster_crs:
     description: |
-      When true, the CPI ensures the cluster-wide CRS option is set to
-      ha=dynamic (auto-rebalance on) via POST /cluster/options before registering
-      a DLB VM, so CRS/DLB is active without manual `pvesh set /cluster/options`
-      steps. When false (default), the CPI only reads the cluster CRS setting and
-      logs a clear warning if a DLB workload is requested but the cluster is not
-      in dynamic mode; the operator is responsible for setting the option via
-      `pvesh set /cluster/options --crs ha=dynamic,...`. Writing the cluster CRS
-      option affects ALL HA guests cluster-wide; default false keeps blast radius
-      minimal.
-    default: false
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: delete it; the CPI no longer writes the cluster CRS mode, so set
+      the CRS mode in PVE.
+      The CPI only reads the cluster CRS mode and logs a warning when a DLB workload
+      is requested and the cluster is not in dynamic mode.
   pve.placement.dlb.require_shared_storage:
     description: |
-      When true (default), the CPI skips DLB/HA registration for VMs whose root
-      disk resides on local storage (dir, lvm, lvmthin, zfspool) that cannot be
-      live-migrated. Registering a non-shared VM as an HA resource would cause
-      PVE to attempt live-migration during rebalance and fail. Set to false to
-      register regardless — not recommended unless all storage is shared. When
-      the storage type cannot be determined at create time, the CPI fails open
-      (proceeds with registration) and logs a debug entry.
-    default: true
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: delete it; a VM with a node-local volume is never registered for DLB.
+      The check is always on.
   pve.placement.exclude_maintenance_nodes:
     description: |
-      When true (default), nodes in a PVE HA maintenance or error state, or carrying
-      any tag listed in placement.maintenance_node_tags, are excluded from placement
-      candidates at create_vm time. Set to false only when HA status is unavailable
-      or placing on maintenance nodes is intentional. The Go accessor defaults nil to
-      true — leave this property unset to accept the default.
-    default: true
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: delete it; the node health check always runs.
+      Placement always refuses a node that the health check marks unplaceable, and
+      placement.maintenance_node_tags still marks nodes by tag.
   pve.placement.maintenance_node_tags:
     description: |
       List of PVE node tags that mark a node as in maintenance. A node carrying any
-      tag in this list is excluded from placement when placement.exclude_maintenance_nodes
-      is true (or defaults true). Default ["maintenance"]. Set to [] to disable tag-based
-      detection while still honoring HA-status-based detection. Leave unset to accept
-      the default.
+      tag in this list is excluded from placement. Default ["maintenance"]. Set to []
+      to disable tag-based detection while still honoring the node health check, which
+      always runs. Leave unset to accept the default.
     default: []
   pve.placement.az_fallback_order:
     description: |
@@ -1367,32 +1339,16 @@ properties:
     default: false
   pve.placement.pin_az_via_ha_rules:
     description: |
-      When true and placement.az_map is set, create_vm writes a PVE HA
-      node-affinity rule binding each VM to its AZ's node set after scoring, so
-      the AZ placement is durable across HA failover and DLB rebalance (scoring
-      alone only pins the VM at creation). delete_vm removes the rule. Best-effort
-      and non-fatal. Incompatible with the DLB sentinel AZ (rejected at config
-      validation, since DLB intentionally un-pins guests). Default false (opt-in).
-    default: false
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: use pve.ha.pin_az: on with pve.ha.mode: auto.
+      The AZ pin is written only when pve.ha.pin_az is "on", pve.ha.mode is "auto" or "managed", and placement.az_map is set.
   pve.placement.pin_az_strict:
     description: |
-      Controls the strictness of the rule created by pin_az_via_ha_rules. Default
-      true: a strict rule is a hard AZ guarantee — HA will not relocate the VM off
-      its AZ node set even if every AZ node is down (durability of locality over
-      availability). Set false for a preferred pin that lets HA relocate off-AZ on
-      total AZ failure. Ignored when pin_az_via_ha_rules is false.
-
-      This default is deliberate — BOSH AZ placement is a contract, not a hint —
-      but it carries two operational hazards on an AZ mapped to a single node:
-      (1) if that node goes down, the VM cannot restart anywhere else, since HA
-      has no other in-AZ node to fail over to; (2) draining that node for
-      maintenance (reboot, upgrade) has nowhere legal to place the VM, which can
-      wedge the maintenance operation. Both hazards disappear once the AZ maps to
-      two or more nodes, since HA then has an in-AZ fallback target. Map every
-      strict AZ to >= 2 nodes. create_vm logs a Warn at pin time whenever a
-      strict pin targets a single-node AZ, naming the AZ and node, so this
-      condition is visible rather than silent.
-    default: true
+      REMOVED. Setting this property, to any value including false, fails the
+      job template render, and a cpi-config entry that carries it is rejected.
+      Replacement: use pve.ha.pin_az_strict.
+      The strictness of the AZ pin now lives at pve.ha.pin_az_strict, which defaults to true.
   pve.placement.az_enforcement:
     description: |
       What create_vm does when no node in the requested availability zone can
@@ -2131,9 +2087,9 @@ properties:
       a handful of contradictory option combinations are tolerated, preserving
       behavior identical to prior releases. When true the CPI fails fast at
       start-up, rejecting unknown top-level keys and these cross-field
-      contradictions: use_ha_rules without anti_affinity enabled; network_mode
-      sdn without an sdn_zone or sdn_auto_manage_zone; and a DLB
-      require_shared_storage setting while the dynamic load balancer is disabled.
+      contradictions: pve.ha.anti_affinity on without placement.anti_affinity
+      enabled; and network_mode sdn without an sdn_zone or
+      sdn_auto_manage_zone.
     default: false
 
   pve.operation_timeout.enabled:

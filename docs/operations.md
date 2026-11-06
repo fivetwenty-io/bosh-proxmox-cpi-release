@@ -1129,7 +1129,7 @@ Treat this warning as a deploy-time signal to move to a dedicated pool. The warn
 
 ### Migration and HA availability, not only credential exposure
 
-A node-local ISO pool has a second consequence beyond credential exposure: the ISO stays attached to the VM's CD-ROM slot for the VM's whole life, and PVE refuses to live-migrate — or HA-recover on another node — a VM whose CD-ROM volume sits on non-shared storage. If any of `pve.placement.dlb`, `pve.placement.pin_az_via_ha_rules`, or `pve.placement.anti_affinity.use_ha_rules` is enabled, `create_vm` separately logs a warning naming the non-shared `iso_storage` pool and the triggering feature, and `pve.require_shared_iso_for_ha: true` escalates that warning to a `create_vm` error. See [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction) for the full detail.
+A node-local ISO pool has a second consequence beyond credential exposure: the ISO stays attached to the VM's CD-ROM slot for the VM's whole life, and PVE refuses to live-migrate — or HA-recover on another node — a VM whose CD-ROM volume sits on non-shared storage. If any of `pve.ha.dlb`, `pve.ha.pin_az`, or `pve.ha.anti_affinity` is enabled, `create_vm` separately logs a warning naming the non-shared `iso_storage` pool and the triggering feature, and `pve.require_shared_iso_for_ha: true` escalates that warning to a `create_vm` error. See [ConfigDrive — Migration and HA interaction](configdrive.md#migration-and-ha-interaction) for the full detail.
 
 ### Recommended configuration
 

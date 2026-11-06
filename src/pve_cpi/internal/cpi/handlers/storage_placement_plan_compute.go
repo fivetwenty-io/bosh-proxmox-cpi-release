@@ -50,7 +50,7 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 		pin = constraints.requiredLocalNode
 	}
 	groupTag := antiAffinityGroupTag(cfg, parsed.env)
-	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{StorageName: "", GroupTag: groupTag, ExcludeMaintenanceNodes: cfg.ExcludeMaintenanceNodesEnabled(), MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue()})
+	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{StorageName: "", GroupTag: groupTag, MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue()})
 	if err != nil {
 		return nil, planError(StoragePlanObservation, "compute facts: %v", err)
 	}
@@ -166,7 +166,7 @@ func rankStorageComputeGroups(ctx context.Context, deps Deps, parsed *createVMPa
 			}
 			candidates = []string{pin}
 		}
-		pass, _ := placement.Filter(facts, placement.Request{CandidateNodes: candidates, RequiredCPU: int64(cores) * int64(sockets), RequiredMemBytes: int64(mem) * (1 << 20), ExcludeMaintenanceNodes: cfg.ExcludeMaintenanceNodesEnabled(), RequiredPCIAddresses: addresses, PCIChecker: checker})
+		pass, _ := placement.Filter(facts, placement.Request{CandidateNodes: candidates, RequiredCPU: int64(cores) * int64(sockets), RequiredMemBytes: int64(mem) * (1 << 20), RequiredPCIAddresses: addresses, PCIChecker: checker})
 		eligible := pass[:0]
 		for _, fact := range pass {
 			if networkEligible[fact.Node] {
@@ -195,7 +195,7 @@ func storageComputeHANodes(deps Deps, parsed *createVMParsedArgs, az string, nod
 			break
 		}
 	}
-	if len(haNodes) > 0 && cfg.HANodeAffinityPinEnabled() && cfg.PinAZStrict() {
+	if len(haNodes) > 0 && cfg.HANodeAffinityPinEnabled() && cfg.HAPinAZStrictValue() {
 		if permitted, ok := cfg.AZCandidates(az); ok && len(permitted) > 0 {
 			haNodes = permitted
 		}

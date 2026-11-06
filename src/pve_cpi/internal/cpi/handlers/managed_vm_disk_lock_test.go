@@ -115,12 +115,11 @@ func (n *createVMDiskNodes) CreateQemuMoveDisk(ctx context.Context, node, vmid s
 // receiving VM before it takes the parker lock.
 func createVMDiskFixture(t *testing.T, locks *lockContention, overrides bool) (Deps, *createVMDiskClient, *aj.Journal, string, int) {
 	t.Helper()
-	no := false
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.CPIConfig{Node: "n1", VMStorage: "a", EphemeralStorageSet: "E", PersistentStorageSet: "P", DetachedDiskStrategy: "parked", StoragePlacementNamespace: "namespace", StorageAllocationJournalDir: directory, AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport, Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &no}, StorageSets: map[string]config.StorageSet{
+	cfg := &config.CPIConfig{Node: "n1", VMStorage: "a", EphemeralStorageSet: "E", PersistentStorageSet: "P", DetachedDiskStrategy: "parked", StoragePlacementNamespace: "namespace", StorageAllocationJournalDir: directory, AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport, Placement: &config.PlacementConfig{}, StorageSets: map[string]config.StorageSet{
 		"E": {Names: []string{"a"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
 		"P": {Names: []string{"b"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}},
 	}}

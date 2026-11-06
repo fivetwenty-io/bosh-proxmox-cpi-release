@@ -231,14 +231,13 @@ func newRollbackFlow(t *testing.T) *rollbackFlow {
 	vms := &rollbackFlowVMs{created: map[int]bool{}, running: map[int]bool{}}
 	parked.deps.PVE = rollbackFlowPVE{contendedFlowPVE: parked.deps.PVE.(contendedFlowPVE), vms: vms}
 	parked.deps.Logger = log.NewNopLogger()
-	no := false
 	cfg := parked.deps.Config
 	cfg.VMStorage = "a"
 	cfg.EphemeralStorageSet = "E"
 	cfg.StorageSets = map[string]config.StorageSet{"E": {Names: []string{"a", "b"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}
 	cfg.AgentMode = config.AgentModeNoAgent
 	cfg.StemcellStrategy = config.StemcellStrategyImport
-	cfg.Placement = &config.PlacementConfig{ExcludeMaintenanceNodes: &no}
+	cfg.Placement = &config.PlacementConfig{}
 	parked.client.state.volumes["a:import/stemcell.qcow2"] = &nodes.GetStorageContentResponse{Size: sdk.PVEInt(1 << 30), Format: "qcow2"}
 	disks, err := json.Marshal([]string{free.cid, parked.cid})
 	if err != nil {

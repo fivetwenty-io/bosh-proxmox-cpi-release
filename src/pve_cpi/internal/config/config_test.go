@@ -3655,9 +3655,10 @@ func TestValidate_Placement_ValidFull(t *testing.T) {
 		"placement":{
 			"enabled":true,
 			"az_map":{"az1":["pve01","pve02"],"az2":["pve03"]},
-			"anti_affinity":{"enabled":true,"use_ha_rules":true},
+			"anti_affinity":{"enabled":true},
 			"weights":{"mem":2.0,"storage":1.0,"cpu":1.0,"guest_count":0.5}
-		}
+		},
+		"ha":{"mode":"auto","anti_affinity":"on"}
 	}`)
 	if err != nil {
 		t.Fatalf("valid full placement block: unexpected error: %v", err)
@@ -3668,8 +3669,8 @@ func TestValidate_Placement_ValidFull(t *testing.T) {
 	if !cfg.AntiAffinityEnabled() {
 		t.Error("AntiAffinityEnabled() = false, want true")
 	}
-	if !cfg.AntiAffinityUseHaRulesEnabled() {
-		t.Error("AntiAffinityUseHaRulesEnabled() = false, want true")
+	if !cfg.HAAntiAffinityRulesEnabled() {
+		t.Error("HAAntiAffinityRulesEnabled() = false, want true")
 	}
 	w := cfg.EffectiveWeights()
 	if w.Mem != 2.0 || w.Storage != 1.0 || w.CPU != 1.0 || w.GuestCount != 0.5 {
@@ -3725,32 +3726,6 @@ func TestAntiAffinityEnabled_ExplicitTrue(t *testing.T) {
 	}
 	if !cfg.AntiAffinityEnabled() {
 		t.Error("AntiAffinityEnabled() = false with explicit *true, want true")
-	}
-}
-
-// TestAntiAffinityUseHaRulesEnabled covers the two-flag gate: HA rules only
-// activate when both Enabled and UseHaRules are true.
-func TestAntiAffinityUseHaRulesEnabled(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name string
-		aa   *config.AntiAffinityConfig
-		want bool
-	}{
-		{"nil block", nil, false},
-		{"enabled only", &config.AntiAffinityConfig{Enabled: boolPtr(true)}, false},
-		{"ha without enabled", &config.AntiAffinityConfig{UseHaRules: boolPtr(true)}, false},
-		{"both true", &config.AntiAffinityConfig{Enabled: boolPtr(true), UseHaRules: boolPtr(true)}, true},
-		{"enabled true ha false", &config.AntiAffinityConfig{Enabled: boolPtr(true), UseHaRules: boolPtr(false)}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			cfg := config.CPIConfig{Placement: &config.PlacementConfig{AntiAffinity: tc.aa}}
-			if got := cfg.AntiAffinityUseHaRulesEnabled(); got != tc.want {
-				t.Errorf("AntiAffinityUseHaRulesEnabled() = %v, want %v", got, tc.want)
-			}
-		})
 	}
 }
 
@@ -3825,75 +3800,77 @@ func TestEnsureNoIPConflictsEnabled_ExplicitFalseFromJSON(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// DLB config accessor tests
+// DLB and HA-rule accessor tests
 // --------------------------------------------------------------------------
 
 // stringPtr returns a pointer to s, for constructing *string fields in test literals.
 func stringPtr(s string) *string { return &s }
 
+// haChoicePtr returns a pointer to the pve.ha enum value s.
+func haChoicePtr(s string) *config.HAChoice {
+	c := config.HAChoice(s)
+	return &c
+}
+
+// haCfg returns a config whose pve.ha block holds the given mode and dlb block.
+func haCfg(mode string, dlb *config.HADLBConfig) config.CPIConfig {
+	h := &config.HAConfig{DLB: dlb}
+	if mode != "" {
+		h.Mode = haChoicePtr(mode)
+	}
+	return config.CPIConfig{HA: h}
+}
+
 // TestDLB_NilEverything verifies all DLB accessors return safe defaults when
-// both Placement and DLB are nil. This is the zero-regression path: existing
-// configs with no placement block must behave identically to before.
+// there is no ha block. Without a mode that writes HA, nothing is eligible, and
+// only the sentinel name itself is reported, so create_vm can refuse it.
 func TestDLB_NilEverything(t *testing.T) {
 	t.Parallel()
 	var cfg config.CPIConfig
 
 	if cfg.DLBExplicitlyEnabled() {
-		t.Error("DLBExplicitlyEnabled() = true with nil Placement, want false")
+		t.Error("DLBExplicitlyEnabled() = true with no ha block, want false")
 	}
 	if got := cfg.DLBAZName(); got != "dlb" {
-		t.Errorf("DLBAZName() = %q with nil Placement, want %q", got, "dlb")
-	}
-	if cfg.DLBManageClusterCRS() {
-		t.Error("DLBManageClusterCRS() = true with nil Placement, want false")
-	}
-	if !cfg.DLBRequireSharedStorage() {
-		t.Error("DLBRequireSharedStorage() = false with nil Placement, want true (protective default)")
+		t.Errorf("DLBAZName() = %q with no ha block, want %q", got, "dlb")
 	}
 	if cfg.DLBConfigured() {
-		t.Error("DLBConfigured() = true with nil Placement, want false")
+		t.Error("DLBConfigured() = true with no ha block, want false")
 	}
-	// Sentinel default is "dlb", so DLBEligibleForAZ("dlb") must return true via sentinel.
-	if !cfg.DLBEligibleForAZ("dlb") {
-		t.Error("DLBEligibleForAZ(\"dlb\") = false with nil Placement, want true (sentinel default matches)")
+	if cfg.DLBEligibleForAZ("dlb") {
+		t.Error("DLBEligibleForAZ(\"dlb\") = true under mode off, want false")
 	}
-	// Non-sentinel AZ must not match.
 	if cfg.DLBEligibleForAZ("z1") {
-		t.Error("DLBEligibleForAZ(\"z1\") = true with nil Placement, want false")
+		t.Error("DLBEligibleForAZ(\"z1\") = true with no ha block, want false")
 	}
-	if cfg.AntiAffinityStrict() {
-		t.Error("AntiAffinityStrict() = true with nil Placement, want false")
+	if !cfg.DLBSentinelNeedsHAMode("dlb") {
+		t.Error("DLBSentinelNeedsHAMode(\"dlb\") = false under mode off, want true")
+	}
+	if cfg.DLBSentinelNeedsHAMode("z1") || cfg.DLBSentinelNeedsHAMode("") {
+		t.Error("DLBSentinelNeedsHAMode must be false for a non-sentinel AZ")
 	}
 }
 
-// TestDLB_NilDLBBlock verifies all DLB accessors return safe defaults when
-// Placement is present but DLB is nil.
-func TestDLB_NilDLBBlock(t *testing.T) {
+// TestDLB_ModeAutoSentinelDefault verifies that with a mode that writes HA and
+// no other key, the default sentinel makes only its own AZ eligible.
+func TestDLB_ModeAutoSentinelDefault(t *testing.T) {
 	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{},
-	}
+	cfg := haCfg("auto", nil)
 
 	if cfg.DLBExplicitlyEnabled() {
-		t.Error("DLBExplicitlyEnabled() = true with nil DLB, want false")
+		t.Error("DLBExplicitlyEnabled() = true without dlb.enabled, want false")
 	}
-	if got := cfg.DLBAZName(); got != "dlb" {
-		t.Errorf("DLBAZName() = %q with nil DLB, want %q (default sentinel)", got, "dlb")
-	}
-	if cfg.DLBManageClusterCRS() {
-		t.Error("DLBManageClusterCRS() = true with nil DLB, want false")
-	}
-	if !cfg.DLBRequireSharedStorage() {
-		t.Error("DLBRequireSharedStorage() = false with nil DLB, want true")
-	}
-	if cfg.DLBConfigured() {
-		t.Error("DLBConfigured() = true with nil DLB, want false")
+	if !cfg.DLBConfigured() {
+		t.Error("DLBConfigured() = false under mode auto with the default sentinel, want true")
 	}
 	if !cfg.DLBEligibleForAZ("dlb") {
-		t.Error("DLBEligibleForAZ(\"dlb\") = false with nil DLB and default sentinel, want true")
+		t.Error("DLBEligibleForAZ(\"dlb\") = false under mode auto, want true")
 	}
 	if cfg.DLBEligibleForAZ("z1") {
-		t.Error("DLBEligibleForAZ(\"z1\") = true with nil DLB, want false")
+		t.Error("DLBEligibleForAZ(\"z1\") = true under mode auto without dlb.enabled, want false")
+	}
+	if cfg.DLBSentinelNeedsHAMode("dlb") {
+		t.Error("DLBSentinelNeedsHAMode(\"dlb\") = true under mode auto, want false")
 	}
 }
 
@@ -3901,222 +3878,105 @@ func TestDLB_NilDLBBlock(t *testing.T) {
 // DLBEligibleForAZ true for ANY az, DLBConfigured true.
 func TestDLB_EnabledTrue(t *testing.T) {
 	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				Enabled: boolPtr(true),
-			},
-		},
-	}
+	cfg := haCfg("auto", &config.HADLBConfig{Enabled: boolPtr(true)})
 
 	if !cfg.DLBExplicitlyEnabled() {
 		t.Error("DLBExplicitlyEnabled() = false with *true, want true")
 	}
-	if !cfg.DLBEligibleForAZ("z1") {
-		t.Error("DLBEligibleForAZ(\"z1\") = false with master Enabled=true, want true (master overrides)")
-	}
-	if !cfg.DLBEligibleForAZ("dlb") {
-		t.Error("DLBEligibleForAZ(\"dlb\") = false with master Enabled=true, want true")
-	}
-	if !cfg.DLBEligibleForAZ("") {
-		t.Error("DLBEligibleForAZ(\"\") = false with master Enabled=true, want true (master catches all)")
+	for _, az := range []string{"z1", "dlb", ""} {
+		if !cfg.DLBEligibleForAZ(az) {
+			t.Errorf("DLBEligibleForAZ(%q) = false with master Enabled=true, want true", az)
+		}
 	}
 	if !cfg.DLBConfigured() {
-		t.Error("DLBConfigured() = false with DLB block present and Enabled=true, want true")
+		t.Error("DLBConfigured() = false with dlb.enabled true, want true")
 	}
 }
 
-// TestDLB_AZNameExplicitEmpty verifies that AZName="" (explicit pointer-to-empty)
+// TestDLB_EnabledNeedsMode verifies the master flag does nothing under mode off.
+// Validation rejects the combination at load, so this guards a hand-built config.
+func TestDLB_EnabledNeedsMode(t *testing.T) {
+	t.Parallel()
+	cfg := haCfg("off", &config.HADLBConfig{Enabled: boolPtr(true)})
+
+	if cfg.DLBExplicitlyEnabled() || cfg.DLBConfigured() || cfg.DLBEligibleForAZ("z1") {
+		t.Error("dlb.enabled must have no effect under mode off")
+	}
+}
+
+// TestDLB_AZNameExplicitEmpty verifies that az_name "" (explicit pointer-to-empty)
 // disables the sentinel: DLBAZName returns "", sentinel is disabled.
 func TestDLB_AZNameExplicitEmpty(t *testing.T) {
 	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				AZName: stringPtr(""),
-			},
-		},
-	}
+	cfg := haCfg("auto", &config.HADLBConfig{AZName: stringPtr("")})
 
 	if got := cfg.DLBAZName(); got != "" {
 		t.Errorf("DLBAZName() = %q with explicit empty string, want %q (sentinel disabled)", got, "")
 	}
-	// Sentinel disabled: DLBEligibleForAZ("dlb") must be false (not master-enabled either).
 	if cfg.DLBEligibleForAZ("dlb") {
-		t.Error("DLBEligibleForAZ(\"dlb\") = true with sentinel disabled (AZName=\"\"), want false")
+		t.Error("DLBEligibleForAZ(\"dlb\") = true with sentinel disabled (az_name=\"\"), want false")
 	}
 	if cfg.DLBEligibleForAZ("") {
 		t.Error("DLBEligibleForAZ(\"\") = true with sentinel disabled, want false")
 	}
-	// DLBConfigured: DLB block is present but Enabled is nil/false AND AZName is "".
-	// No VMs could have been registered — return false.
 	if cfg.DLBConfigured() {
-		t.Error("DLBConfigured() = true with DLB present but Enabled nil and AZName empty, want false")
+		t.Error("DLBConfigured() = true with the master flag off and the sentinel disabled, want false")
+	}
+	off := haCfg("off", &config.HADLBConfig{AZName: stringPtr("")})
+	if off.DLBSentinelNeedsHAMode("") {
+		t.Error("an empty sentinel must never trip the mode check")
 	}
 }
 
 // TestDLB_AZNameCustom verifies a custom sentinel AZ name matches correctly.
 func TestDLB_AZNameCustom(t *testing.T) {
 	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				AZName: stringPtr("dlbzone"),
-			},
-		},
-	}
+	cfg := haCfg("managed", &config.HADLBConfig{AZName: stringPtr("dlbzone")})
 
 	if got := cfg.DLBAZName(); got != "dlbzone" {
 		t.Errorf("DLBAZName() = %q, want %q", got, "dlbzone")
 	}
 	if !cfg.DLBEligibleForAZ("dlbzone") {
-		t.Error("DLBEligibleForAZ(\"dlbzone\") = false with AZName=dlbzone, want true")
+		t.Error("DLBEligibleForAZ(\"dlbzone\") = false with az_name=dlbzone, want true")
 	}
-	// Default sentinel name "dlb" must NOT match when overridden.
 	if cfg.DLBEligibleForAZ("dlb") {
-		t.Error("DLBEligibleForAZ(\"dlb\") = true with AZName=dlbzone, want false")
+		t.Error("DLBEligibleForAZ(\"dlb\") = true with az_name=dlbzone, want false")
 	}
 	if cfg.DLBEligibleForAZ("z1") {
-		t.Error("DLBEligibleForAZ(\"z1\") = true with AZName=dlbzone, want false")
+		t.Error("DLBEligibleForAZ(\"z1\") = true with az_name=dlbzone, want false")
 	}
 	if !cfg.DLBConfigured() {
-		t.Error("DLBConfigured() = false with DLB present and non-empty AZName, want true")
+		t.Error("DLBConfigured() = false with a non-empty az_name, want true")
+	}
+	off := haCfg("off", &config.HADLBConfig{AZName: stringPtr("dlbzone")})
+	if !off.DLBSentinelNeedsHAMode("dlbzone") || off.DLBSentinelNeedsHAMode("dlb") {
+		t.Error("under mode off only the configured sentinel name must trip the mode check")
 	}
 }
 
-// TestDLB_RequireSharedStorageFalse verifies the explicit false override.
-func TestDLB_RequireSharedStorageFalse(t *testing.T) {
-	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				RequireSharedStorage: boolPtr(false),
-			},
-		},
-	}
-
-	if cfg.DLBRequireSharedStorage() {
-		t.Error("DLBRequireSharedStorage() = true with explicit *false, want false")
-	}
-}
-
-// TestDLB_ManageClusterCRSTrue verifies the explicit true override.
-func TestDLB_ManageClusterCRSTrue(t *testing.T) {
-	t.Parallel()
-	cfg := config.CPIConfig{
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				ManageClusterCRS: boolPtr(true),
-			},
-		},
-	}
-
-	if !cfg.DLBManageClusterCRS() {
-		t.Error("DLBManageClusterCRS() = false with explicit *true, want true")
-	}
-}
-
-// TestDLB_AntiAffinityStrict verifies Strict accessor reads from AntiAffinityConfig.
-func TestDLB_AntiAffinityStrict(t *testing.T) {
-	t.Parallel()
-
-	t.Run("nil AntiAffinity → false", func(t *testing.T) {
-		var cfg config.CPIConfig
-		if cfg.AntiAffinityStrict() {
-			t.Error("AntiAffinityStrict() = true with nil everything, want false")
-		}
-	})
-
-	t.Run("Strict nil → false", func(t *testing.T) {
-		cfg := config.CPIConfig{
-			Placement: &config.PlacementConfig{
-				AntiAffinity: &config.AntiAffinityConfig{},
-			},
-		}
-		if cfg.AntiAffinityStrict() {
-			t.Error("AntiAffinityStrict() = true with nil Strict field, want false")
-		}
-	})
-
-	t.Run("Strict *true → true", func(t *testing.T) {
-		cfg := config.CPIConfig{
-			Placement: &config.PlacementConfig{
-				AntiAffinity: &config.AntiAffinityConfig{
-					Strict: boolPtr(true),
-				},
-			},
-		}
-		if !cfg.AntiAffinityStrict() {
-			t.Error("AntiAffinityStrict() = false with explicit *true, want true")
-		}
-	})
-
-	t.Run("Strict *false → false", func(t *testing.T) {
-		cfg := config.CPIConfig{
-			Placement: &config.PlacementConfig{
-				AntiAffinity: &config.AntiAffinityConfig{
-					Strict: boolPtr(false),
-				},
-			},
-		}
-		if cfg.AntiAffinityStrict() {
-			t.Error("AntiAffinityStrict() = true with explicit *false, want false")
-		}
-	})
-}
-
-// TestDLB_JSONRoundTrip verifies a placement.dlb JSON blob decodes into the
+// TestDLB_JSONRoundTrip verifies a pve.ha.dlb JSON blob decodes into the
 // correct struct fields and all accessors return the decoded values.
 func TestDLB_JSONRoundTrip(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"placement":{
-			"dlb":{
-				"enabled":true,
-				"az_name":"myzone",
-				"manage_cluster_crs":true,
-				"require_shared_storage":false
-			},
-			"anti_affinity":{
-				"strict":true
-			}
-		}
+		"ha":{"mode":"auto","dlb":{"enabled":true,"az_name":"myzone"}}
 	}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Placement == nil {
-		t.Fatal("Placement = nil, want non-nil")
-	}
-	if cfg.Placement.DLB == nil {
-		t.Fatal("Placement.DLB = nil, want non-nil")
-	}
-
 	if !cfg.DLBExplicitlyEnabled() {
 		t.Error("DLBExplicitlyEnabled() = false, want true")
 	}
 	if got := cfg.DLBAZName(); got != "myzone" {
 		t.Errorf("DLBAZName() = %q, want %q", got, "myzone")
 	}
-	if !cfg.DLBManageClusterCRS() {
-		t.Error("DLBManageClusterCRS() = false, want true")
-	}
-	if cfg.DLBRequireSharedStorage() {
-		t.Error("DLBRequireSharedStorage() = true, want false")
-	}
 	if !cfg.DLBConfigured() {
 		t.Error("DLBConfigured() = false, want true")
 	}
-	if !cfg.DLBEligibleForAZ("myzone") {
-		t.Error("DLBEligibleForAZ(\"myzone\") = false, want true")
-	}
-	if !cfg.DLBEligibleForAZ("z1") {
-		t.Error("DLBEligibleForAZ(\"z1\") = false with master enabled=true, want true")
-	}
-	if !cfg.AntiAffinityStrict() {
-		t.Error("AntiAffinityStrict() = false, want true")
+	if !cfg.DLBEligibleForAZ("myzone") || !cfg.DLBEligibleForAZ("z1") {
+		t.Error("DLBEligibleForAZ must be true for every AZ with master enabled=true")
 	}
 }
 
@@ -4125,48 +3985,27 @@ func TestDLB_ConfiguredGating(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name    string
-		dlb     *config.DLBConfig
+		mode    string
+		dlb     *config.HADLBConfig
 		wantCfg bool
 	}{
-		{
-			name:    "nil DLB block",
-			dlb:     nil,
-			wantCfg: false,
-		},
-		{
-			name:    "all-nil DLB fields",
-			dlb:     &config.DLBConfig{},
-			wantCfg: true, // AZName nil → default "dlb" → non-empty → true
-		},
-		{
-			name:    "Enabled false, AZName nil",
-			dlb:     &config.DLBConfig{Enabled: boolPtr(false)},
-			wantCfg: true, // AZName nil → "dlb" → non-empty
-		},
-		{
-			name:    "Enabled false, AZName empty string",
-			dlb:     &config.DLBConfig{Enabled: boolPtr(false), AZName: stringPtr("")},
-			wantCfg: false, // both off: sentinel disabled, master off
-		},
-		{
-			name:    "Enabled true, AZName empty string",
-			dlb:     &config.DLBConfig{Enabled: boolPtr(true), AZName: stringPtr("")},
-			wantCfg: true, // master on → configured
-		},
-		{
-			name:    "Enabled nil, AZName custom",
-			dlb:     &config.DLBConfig{AZName: stringPtr("dlbzone")},
-			wantCfg: true, // sentinel non-empty → configured
-		},
+		{"mode off, no dlb block", "off", nil, false},
+		{"mode unset, default sentinel", "", nil, false},
+		{"mode auto, no dlb block", "auto", nil, true},
+		{"mode auto, all-nil dlb fields", "auto", &config.HADLBConfig{}, true},
+		{"mode auto, enabled false, az_name nil", "auto", &config.HADLBConfig{Enabled: boolPtr(false)}, true},
+		{"mode auto, enabled false, az_name empty", "auto",
+			&config.HADLBConfig{Enabled: boolPtr(false), AZName: stringPtr("")}, false},
+		{"mode managed, enabled true, az_name empty", "managed",
+			&config.HADLBConfig{Enabled: boolPtr(true), AZName: stringPtr("")}, true},
+		{"mode managed, az_name custom", "managed", &config.HADLBConfig{AZName: stringPtr("dlbzone")}, true},
+		{"mode off, enabled true", "off", &config.HADLBConfig{Enabled: boolPtr(true)}, false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config.CPIConfig{
-				Placement: &config.PlacementConfig{
-					DLB: tc.dlb,
-				},
-			}
+			t.Parallel()
+			cfg := haCfg(tc.mode, tc.dlb)
 			if got := cfg.DLBConfigured(); got != tc.wantCfg {
 				t.Errorf("DLBConfigured() = %v, want %v", got, tc.wantCfg)
 			}
@@ -4174,31 +4013,92 @@ func TestDLB_ConfiguredGating(t *testing.T) {
 	}
 }
 
-// TestDLB_ValidateDLBBlock verifies that a placement block containing a DLB
-// sub-block passes validation without error (validate-only-when-set; no
-// enum or range constraints on DLB fields).
-func TestDLB_ValidateDLBBlock(t *testing.T) {
+// TestHAAntiAffinityRulesEnabled covers the gate: HA rules need a mode that
+// writes HA, pve.ha.anti_affinity set to "on", and scheduler-soft spreading on.
+// The default "auto" writes no rule until the cluster probe exists.
+func TestHAAntiAffinityRulesEnabled(t *testing.T) {
 	t.Parallel()
-	_, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"placement":{
-			"dlb":{
-				"enabled":true,
-				"az_name":"",
-				"manage_cluster_crs":false,
-				"require_shared_storage":false
+	enabled := &config.AntiAffinityConfig{Enabled: boolPtr(true)}
+	cases := []struct {
+		name string
+		mode string
+		aa   string
+		pl   *config.PlacementConfig
+		want bool
+	}{
+		{"nil placement", "auto", "on", nil, false},
+		{"spreading disabled", "auto", "on", &config.PlacementConfig{AntiAffinity: &config.AntiAffinityConfig{}}, false},
+		{"mode off", "off", "on", &config.PlacementConfig{AntiAffinity: enabled}, false},
+		{"mode unset", "", "on", &config.PlacementConfig{AntiAffinity: enabled}, false},
+		{"auto on", "auto", "on", &config.PlacementConfig{AntiAffinity: enabled}, true},
+		{"managed on", "managed", "on", &config.PlacementConfig{AntiAffinity: enabled}, true},
+		{"mode auto alone writes nothing", "auto", "", &config.PlacementConfig{AntiAffinity: enabled}, false},
+		{"mode auto, anti_affinity auto", "auto", "auto", &config.PlacementConfig{AntiAffinity: enabled}, false},
+		{"mode auto, anti_affinity off", "auto", "off", &config.PlacementConfig{AntiAffinity: enabled}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := haCfg(tc.mode, nil)
+			if tc.aa != "" {
+				cfg.HA.AntiAffinity = haChoicePtr(tc.aa)
 			}
-		}
-	}`)
-	if err != nil {
-		t.Fatalf("DLB block with all fields set: unexpected validation error: %v", err)
+			cfg.Placement = tc.pl
+			if got := cfg.HAAntiAffinityRulesEnabled(); got != tc.want {
+				t.Errorf("HAAntiAffinityRulesEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	var nilCfg *config.CPIConfig
+	if nilCfg.HAAntiAffinityRulesEnabled() {
+		t.Error("a nil config must not enable HA anti-affinity rules")
 	}
 }
 
-// TestDLB_AbsentDLBBlock_NoRegression verifies that a placement block without
-// a dlb key produces no error and leaves Placement.DLB nil.
-func TestDLB_AbsentDLBBlock_NoRegression(t *testing.T) {
+// TestHANodeAffinityPinEnabled covers the gate: the AZ pin needs a mode that
+// writes HA, pve.ha.pin_az set to "on", and a non-empty az_map. The default
+// "auto" writes no pin until the cluster probe exists.
+func TestHANodeAffinityPinEnabled(t *testing.T) {
+	t.Parallel()
+	azMap := map[string][]string{"az1": {"pve1", "pve2"}}
+	cases := []struct {
+		name string
+		mode string
+		pin  string
+		pl   *config.PlacementConfig
+		want bool
+	}{
+		{"nil placement", "auto", "on", nil, false},
+		{"empty az_map", "auto", "on", &config.PlacementConfig{}, false},
+		{"mode off", "off", "on", &config.PlacementConfig{AZMap: azMap}, false},
+		{"auto on", "auto", "on", &config.PlacementConfig{AZMap: azMap}, true},
+		{"managed on", "managed", "on", &config.PlacementConfig{AZMap: azMap}, true},
+		{"mode auto alone writes nothing", "auto", "", &config.PlacementConfig{AZMap: azMap}, false},
+		{"mode auto, pin_az auto", "auto", "auto", &config.PlacementConfig{AZMap: azMap}, false},
+		{"mode auto, pin_az off", "auto", "off", &config.PlacementConfig{AZMap: azMap}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := haCfg(tc.mode, nil)
+			if tc.pin != "" {
+				cfg.HA.PinAZ = haChoicePtr(tc.pin)
+			}
+			cfg.Placement = tc.pl
+			if got := cfg.HANodeAffinityPinEnabled(); got != tc.want {
+				t.Errorf("HANodeAffinityPinEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	var nilCfg *config.CPIConfig
+	if nilCfg.HANodeAffinityPinEnabled() {
+		t.Error("a nil config must not enable the AZ pin")
+	}
+}
+
+// TestDLB_AbsentHABlock_NoRegression verifies that a placement block without
+// an ha block produces no error and leaves HA nil.
+func TestDLB_AbsentHABlock_NoRegression(t *testing.T) {
 	t.Parallel()
 	cfg, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -4209,60 +4109,16 @@ func TestDLB_AbsentDLBBlock_NoRegression(t *testing.T) {
 		}
 	}`)
 	if err != nil {
-		t.Fatalf("placement without dlb: unexpected error: %v", err)
+		t.Fatalf("placement without ha: unexpected error: %v", err)
 	}
-	if cfg.Placement == nil {
-		t.Fatal("Placement = nil, want non-nil")
+	if cfg.HA != nil {
+		t.Error("HA = non-nil when key absent from JSON, want nil")
 	}
-	if cfg.Placement.DLB != nil {
-		t.Error("Placement.DLB = non-nil when key absent from JSON, want nil")
-	}
-	// Accessor defaults must still work.
 	if cfg.DLBExplicitlyEnabled() {
-		t.Error("DLBExplicitlyEnabled() = true with nil DLB block, want false")
+		t.Error("DLBExplicitlyEnabled() = true with no ha block, want false")
 	}
 	if got := cfg.DLBAZName(); got != "dlb" {
-		t.Errorf("DLBAZName() = %q with nil DLB block, want %q", got, "dlb")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ExcludeMaintenanceNodesEnabled
-// ---------------------------------------------------------------------------
-
-func TestExcludeMaintenanceNodesEnabled_NilPlacement(t *testing.T) {
-	t.Parallel()
-	cfg := &config.CPIConfig{}
-	// nil Placement → default true (protective).
-	if !cfg.ExcludeMaintenanceNodesEnabled() {
-		t.Error("ExcludeMaintenanceNodesEnabled() = false with nil Placement; want true")
-	}
-}
-
-func TestExcludeMaintenanceNodesEnabled_NilField(t *testing.T) {
-	t.Parallel()
-	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{}}
-	// Placement present, ExcludeMaintenanceNodes nil → default true.
-	if !cfg.ExcludeMaintenanceNodesEnabled() {
-		t.Error("ExcludeMaintenanceNodesEnabled() = false with nil field; want true")
-	}
-}
-
-func TestExcludeMaintenanceNodesEnabled_ExplicitFalse(t *testing.T) {
-	t.Parallel()
-	f := false
-	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &f}}
-	if cfg.ExcludeMaintenanceNodesEnabled() {
-		t.Error("ExcludeMaintenanceNodesEnabled() = true with *false; want false")
-	}
-}
-
-func TestExcludeMaintenanceNodesEnabled_ExplicitTrue(t *testing.T) {
-	t.Parallel()
-	tr := true
-	cfg := &config.CPIConfig{Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &tr}}
-	if !cfg.ExcludeMaintenanceNodesEnabled() {
-		t.Error("ExcludeMaintenanceNodesEnabled() = false with *true; want true")
+		t.Errorf("DLBAZName() = %q with no ha block, want %q", got, "dlb")
 	}
 }
 
@@ -5464,23 +5320,23 @@ func TestStrictConfigValidationEnabled_NilReceiver(t *testing.T) {
 // StrictConfigValidation — flag OFF: byte-identical guarantee
 // --------------------------------------------------------------------------
 
-// TestStrictOff_UseHaRulesWithoutAntiAffinityStillLoads confirms that with the
-// flag off, a config with use_ha_rules=true but anti_affinity.enabled=false
-// loads without error (current tolerated behavior preserved).
-func TestStrictOff_UseHaRulesWithoutAntiAffinityStillLoads(t *testing.T) {
+// TestStrictOff_HAAntiAffinityWithoutSpreadingStillLoads confirms that with the
+// flag off, a config with ha.anti_affinity=on but anti_affinity.enabled=false
+// loads without error; the rules are then simply not written.
+func TestStrictOff_HAAntiAffinityWithoutSpreadingStillLoads(t *testing.T) {
 	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
 		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
 		"placement": {
 			"anti_affinity": {
-				"enabled": false,
-				"use_ha_rules": true
+				"enabled": false
 			}
-		}
+		},
+		"ha": {"mode": "auto", "anti_affinity": "on"}
 	}`)
 	if err != nil {
-		t.Errorf("flag off: use_ha_rules without anti_affinity.enabled must not error; got: %v", err)
+		t.Errorf("flag off: ha.anti_affinity=on without anti_affinity.enabled must not error; got: %v", err)
 	}
 }
 
@@ -5520,9 +5376,9 @@ func TestStrictOn_UnknownKey(t *testing.T) {
 	}
 }
 
-// TestStrictOn_UseHaRulesWithoutAntiAffinity confirms that use_ha_rules=true
+// TestStrictOn_HAAntiAffinityWithoutSpreading confirms that ha.anti_affinity=on
 // without anti_affinity.enabled=true is a hard error under strict mode.
-func TestStrictOn_UseHaRulesWithoutAntiAffinity(t *testing.T) {
+func TestStrictOn_HAAntiAffinityWithoutSpreading(t *testing.T) {
 	t.Parallel()
 	_, err := mustLoad(t, `{
 		"host":"h","user":"u","password":"p",
@@ -5530,16 +5386,16 @@ func TestStrictOn_UseHaRulesWithoutAntiAffinity(t *testing.T) {
 		"strict_config_validation": true,
 		"placement": {
 			"anti_affinity": {
-				"enabled": false,
-				"use_ha_rules": true
+				"enabled": false
 			}
-		}
+		},
+		"ha": {"mode": "auto", "anti_affinity": "on"}
 	}`)
 	if err == nil {
-		t.Fatal("expected error for use_ha_rules without anti_affinity.enabled, got nil")
+		t.Fatal("expected error for ha.anti_affinity=on without anti_affinity.enabled, got nil")
 	}
-	if !strings.Contains(err.Error(), "use_ha_rules") {
-		t.Errorf("error must mention use_ha_rules; got: %v", err)
+	if !strings.Contains(err.Error(), "ha.anti_affinity") {
+		t.Errorf("error must mention ha.anti_affinity; got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "anti_affinity") {
 		t.Errorf("error must mention anti_affinity; got: %v", err)
@@ -5581,29 +5437,6 @@ func TestStrictOn_NetworkModeAutoZoneEmptyNoError(t *testing.T) {
 	}
 }
 
-// TestStrictOn_DlbRequireSharedStorageWithDlbDisabled confirms that setting
-// require_shared_storage when DLB is not enabled is a hard error under strict.
-func TestStrictOn_DlbRequireSharedStorageWithDlbDisabled(t *testing.T) {
-	t.Parallel()
-	_, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"strict_config_validation": true,
-		"placement": {
-			"dlb": {
-				"enabled": false,
-				"require_shared_storage": false
-			}
-		}
-	}`)
-	if err == nil {
-		t.Fatal("expected error for require_shared_storage with dlb disabled, got nil")
-	}
-	if !strings.Contains(err.Error(), "require_shared_storage") {
-		t.Errorf("error must mention require_shared_storage; got: %v", err)
-	}
-}
-
 // TestStrictOn_ValidStrictConfig confirms a fully consistent config loads
 // cleanly under strict mode.
 func TestStrictOn_ValidStrictConfig(t *testing.T) {
@@ -5616,12 +5449,14 @@ func TestStrictOn_ValidStrictConfig(t *testing.T) {
 		"sdn_zone": "myzone",
 		"placement": {
 			"anti_affinity": {
-				"enabled": true,
-				"use_ha_rules": true
-			},
+				"enabled": true
+			}
+		},
+		"ha": {
+			"mode": "auto",
+			"anti_affinity": "on",
 			"dlb": {
-				"enabled": true,
-				"require_shared_storage": false
+				"enabled": true
 			}
 		}
 	}`)
@@ -5643,26 +5478,6 @@ func TestStrictOn_NetworkModeSdnAutoManageZoneNoError(t *testing.T) {
 	}`)
 	if err != nil {
 		t.Errorf("network_mode=sdn with sdn_auto_manage_zone=true must not error; got: %v", err)
-	}
-}
-
-// TestStrictOff_DlbRequireSharedStorageWithDlbDisabled_NoError confirms that
-// with the flag off, require_shared_storage with DLB disabled still loads
-// without error (byte-identical behavior preserved).
-func TestStrictOff_DlbRequireSharedStorageWithDlbDisabled_NoError(t *testing.T) {
-	t.Parallel()
-	_, err := mustLoad(t, `{
-		"host":"h","user":"u","password":"p",
-		"vm_storage":"s","disk_storage":"s","network_bridge":"br",
-		"placement": {
-			"dlb": {
-				"enabled": false,
-				"require_shared_storage": false
-			}
-		}
-	}`)
-	if err != nil {
-		t.Errorf("flag off: require_shared_storage with dlb disabled must not error; got: %v", err)
 	}
 }
 

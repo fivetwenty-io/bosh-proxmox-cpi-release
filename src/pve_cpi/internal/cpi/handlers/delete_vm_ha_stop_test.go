@@ -42,8 +42,7 @@ func (m *orderRecordingCluster) DeleteHaRules(_ context.Context, rule string) er
 
 func dlbEnabledConfig() *config.CPIConfig {
 	cfg := *testConfig()
-	enabled := true
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	return &cfg
 }
 

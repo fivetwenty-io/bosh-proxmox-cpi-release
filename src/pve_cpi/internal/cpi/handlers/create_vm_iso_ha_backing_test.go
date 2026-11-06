@@ -10,8 +10,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 )
 
 // migrationSafetyWarnText is the leading fragment of the one Warn these tests
@@ -35,9 +33,8 @@ func countMigrationSafetyWarns(logged string) int {
 // checkISOStorageForHA treats iso-b as shared: no Warn, no error.
 func TestCheckISOStorageForHA_ConfigDriftBacking_TreatedAsShared(t *testing.T) {
 	t.Parallel()
-	enabled := true
 	cfg := isoHABaseConfig("iso-b")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
 		"iso-a": {storageType: "dir", shared: true, path: "/mnt/pve/iso-export"},
 		"iso-b": {storageType: "dir", shared: false, path: "/mnt/pve/iso-export"},
@@ -60,9 +57,8 @@ func TestCheckISOStorageForHA_ConfigDriftBacking_TreatedAsShared(t *testing.T) {
 // itself flagged shared, so the pre-existing Warn-only behavior is unchanged.
 func TestCheckISOStorageForHA_DistinctBacking_StillWarns(t *testing.T) {
 	t.Parallel()
-	enabled := true
 	cfg := isoHABaseConfig("iso-c")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	storageSvc := &dlbMultiStorageStub{entries: map[string]dlbStorageEntry{
 		"iso-a": {storageType: "dir", shared: true, path: "/mnt/pve/iso-export"},
 		"iso-c": {storageType: "dir", shared: false, path: "/mnt/pve/iso-c-distinct"},

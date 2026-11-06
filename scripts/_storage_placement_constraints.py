@@ -239,7 +239,8 @@ def ha_reachability(runner, options):
     fixture = _restricted_definition(runner, options)
     config = runner.configured_policy(e_members=[fixture["storage_id"]])
     placement = config.setdefault("placement", {})
-    placement.update(az_map={"cert-ha": [fixture["allowed_node"]]}, pin_az_via_ha_rules=True, pin_az_strict=True)
+    placement.update(az_map={"cert-ha": [fixture["allowed_node"]]})
+    config["ha"] = {"mode": "auto", "pin_az": "on", "pin_az_strict": True}
     args = runner.vm_arguments("ha-constraint", {"availability_zone": "cert-ha"})
     positive = _positive(runner, config, "create_vm", args, "ha-single-node")
     placement["az_map"]["cert-ha"].append(fixture["excluded_node"])

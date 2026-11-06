@@ -193,12 +193,14 @@ An entry may carry its own `placement` block. This matters most for `az_map`, wh
       placement:
         az_map:
           z3: [pve-az2-n1, pve-az2-n2, pve-az2-n3]
-        pin_az_via_ha_rules: true
+      ha:
+        mode: auto
+        pin_az: "on"
 ```
 
 An entry's `placement` block replaces the job-level one entirely rather than merging into it, so each entry states its own complete placement policy. Omit the key to inherit the job-level block, and send `null` to run with no placement policy at all. A typo inside the block is rejected rather than ignored, so a misspelled field fails the request instead of silently disabling the feature it was meant to enable. The `az_enforcement` and `bridge_check` keys live inside this block as well, so an entry that carries its own `placement` needs its own copy of each.
 
-The three HA features (`placement.dlb`, `placement.anti_affinity.use_ha_rules`, and `placement.pin_az_via_ha_rules`) are reachable only this way in a multi-cluster deployment. Enabling any of them also means disabling the BOSH resurrector for the affected deployment. The `pin_az_via_ha_rules` feature additionally needs a `cloud_properties.availability_zone` that matches an `az_map` key. BOSH does not hand the CPI the AZ's name, but it merges the AZ's own `cloud_properties` into what the CPI receives, so `availability_zone` belongs on the AZ in the cloud config, where every `vm_type` in that AZ inherits it. [HA and Resurrection](ha-and-resurrection.md) shows the cloud-config block and the warning the CPI logs when the property is missing.
+The three HA features (`pve.ha.dlb`, `pve.ha.anti_affinity`, and `pve.ha.pin_az`) live in the `pve.ha` block, not in `placement`. An entry carries its own `ha` block, and it merges with the job-level block one key at a time, so an entry can set only `mode` and inherit the rest. Enabling any of them also means disabling the BOSH resurrector for the affected deployment. The `pin_az` feature additionally needs a `cloud_properties.availability_zone` that matches an `az_map` key. BOSH does not hand the CPI the AZ's name, but it merges the AZ's own `cloud_properties` into what the CPI receives, so `availability_zone` belongs on the AZ in the cloud config, where every `vm_type` in that AZ inherits it. [HA and Resurrection](ha-and-resurrection.md) shows the cloud-config block and the warning the CPI logs when the property is missing.
 
 ### Never edit a live entry's host or repoint a live AZ
 
@@ -380,7 +382,7 @@ The same applies after a teardown. Once the last deployment is gone, every `:lig
 An AZ can be a standalone PVE host instead of a cluster. We bind it the same way, with an AZ that names an entry and an entry whose `pve.host` is the standalone host, but several things change because a lone host has no cluster around it.
 
 - No HA
-  A standalone host has no HA failover, so `placement.dlb`, `placement.anti_affinity.use_ha_rules`, and `placement.pin_az_via_ha_rules` have nothing to work with. The BOSH resurrector stays the only recovery mechanism, which is the zero-configuration default described in [HA and Resurrection](ha-and-resurrection.md).
+  A standalone host has no HA failover, so `pve.ha.dlb`, `pve.ha.anti_affinity`, and `pve.ha.pin_az` have nothing to work with. The BOSH resurrector stays the only recovery mechanism, which is the zero-configuration default described in [HA and Resurrection](ha-and-resurrection.md).
 
 - A per-entry placement block that disables the HA features
   An entry that omits `placement` inherits the job-level block, so a job that turns on an HA feature for its cluster would hand that feature to the standalone entry too. We give the standalone entry its own block that switches the features off, and we turn off node scoring so that the CPI falls back to `pve.node`, which the entry must set to the host's node name.
@@ -402,12 +404,8 @@ An AZ can be a standalone PVE host instead of a cluster. We bind it the same way
         stemcell_strategy: template
         placement:
           enabled: false
-          dlb:
-            enabled: false
-            az_name: ""
-          anti_affinity:
-            use_ha_rules: false
-          pin_az_via_ha_rules: false
+        ha:
+          mode: off
         # ... VMID bands disjoint from every other entry ...
   ```
 

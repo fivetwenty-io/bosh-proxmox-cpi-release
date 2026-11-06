@@ -90,15 +90,6 @@ type GatherOptions struct {
 	// SameGroupCount remains 0 for all nodes.
 	GroupTag string
 
-	// ExcludeMaintenanceNodes, when true, causes GatherNodeFacts to ask
-	// pve.NodeHealth about every node and mark each node that is not placeable
-	// as InMaintenance=true. That covers a node in maintenance, a fenced or
-	// unknown node, and every node when the entry node is not quorate. The
-	// per-node operator tag list (MaintenanceNodeTags) is an input to the same
-	// answer. A source that cannot be read is non-fatal: pve.NodeHealth falls
-	// back to the sources it can read, down to cluster status alone.
-	ExcludeMaintenanceNodes bool
-
 	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is
 	// in maintenance. A node carrying any of these tags has InMaintenance=true
 	// regardless of HA status. Empty list disables tag-based detection.
@@ -113,8 +104,10 @@ type GatherOptions struct {
 //     group tags, and committed guest memory (non-fatal on error).
 //  3. Per-node ListStorage provides available storage bytes (non-fatal on error).
 //  4. pve.NodeHealth provides node placeability from the CRM and LRM state,
-//     cluster status, and operator tags when opts.ExcludeMaintenanceNodes is
-//     true (non-fatal on error).
+//     cluster status, and operator tags (non-fatal on error). Every node that
+//     is not placeable is marked InMaintenance=true, which covers a node in
+//     maintenance, a fenced or unknown node, and every node when the entry node
+//     is not quorate.
 //
 // A ListResources error is non-fatal: GatherNodeFacts logs a warning and continues
 // with GuestCount=0, SameGroupCount=0, and CommittedMemBytes=0 for all nodes.
@@ -157,11 +150,8 @@ func GatherNodeFacts(
 		nodeItems = append(nodeItems, item)
 	}
 
-	// Phase 1b: node health (non-fatal, only when requested).
-	var health *pve.NodeHealthReport
-	if opts.ExcludeMaintenanceNodes {
-		health = gatherNodeHealth(ctx, clusterClient, nodesClient, logger, opts.MaintenanceNodeTags)
-	}
+	// Phase 1b: node health (non-fatal).
+	health := gatherNodeHealth(ctx, clusterClient, nodesClient, logger, opts.MaintenanceNodeTags)
 
 	// Phase 2: node compute counters, guest count, group tags, and committed
 	// memory from ListResources (non-fatal).

@@ -3351,9 +3351,9 @@ func TestCreateVM_DLBSentinelAZ_AllNodesCandidate(t *testing.T) {
 			AZMap: map[string][]string{
 				"zone-a": {"pve"},
 			},
-			// DLB block: AZName nil → accessor returns default "dlb".
-			DLB: &config.DLBConfig{},
 		}
+		// pve.ha mode auto with az_name unset → accessor returns default "dlb".
+		c.HA = haModeAuto()
 		c.EnsureNoIPConflicts = placementDisabled
 	})
 	h := handlers.HandleCreateVM(deps)
@@ -3389,9 +3389,9 @@ func TestCreateVM_UnknownAZ_NotSentinel_CloudError(t *testing.T) {
 			AZMap: map[string][]string{
 				"zone-a": {"pve"},
 			},
-			// DLB sentinel is "dlb"; "unknownzone" is not sentinel → must error.
-			DLB: &config.DLBConfig{},
 		}
+		// DLB sentinel is "dlb"; "unknownzone" is not sentinel → must error.
+		c.HA = haModeAuto()
 		c.EnsureNoIPConflicts = placementDisabled
 	})
 	h := handlers.HandleCreateVM(deps)
@@ -3674,8 +3674,8 @@ func TestCreateVM_RealAZMap_Restricted_WithDLBConfigured(t *testing.T) {
 			AZMap: map[string][]string{
 				"zone-b": {"pve2"},
 			},
-			DLB: &config.DLBConfig{},
 		}
+		c.HA = haModeAuto()
 		c.EnsureNoIPConflicts = placementDisabled
 	})
 	h := handlers.HandleCreateVM(deps)

@@ -330,7 +330,7 @@ func fastPathDeleteVM(ctx context.Context, deps Deps, node, vmCID string, vmid i
 	// restores plain qmstop semantics. Both calls are synchronous and bounded
 	// (no task await) — compatible with the fast path's bounded-time contract.
 	// Idempotent, not-found-tolerant, best-effort.
-	if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
+	if deps.Config.HAAntiAffinityRulesEnabled() || deps.Config.DLBConfigured() {
 		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
 			logger.Warn("delete_vm: fast-path HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
 		}
@@ -858,12 +858,12 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid i
 // and the subsequent destroy fails with "VM is running". Deregistering first
 // restores plain qmstop semantics for the stop that follows.
 //
-// The anti-affinity/DLB removal is gated on its opt-ins; it also covers
+// The anti-affinity/DLB removal is gated on the pve.ha opt-ins; it also covers
 // DLB-only VMs (removeAntiAffinityMembership purges the HA resource and
 // prunes any associated rules; for a DLB-only VM with no affinity rule it
 // simply deregisters the HA resource). The node-affinity pin removal is
 // unconditional because two writers create that rule: the AZ pin (gated by
-// placement.pin_az_via_ha_rules) and the PCI strict pin (applied whenever
+// pve.ha.pin_az) and the PCI strict pin (applied whenever
 // pci_passthroughs is set, regardless of that flag). delete_vm has no
 // cloud_properties, so it cannot know which writer ran; removing
 // unconditionally guarantees no orphan rule survives the VM. For a VM that
@@ -872,7 +872,7 @@ func refuseIfParkerVM(ctx context.Context, deps Deps, loc pve.VMLocation, vmid i
 // Everything here is best-effort: HA failures are logged and never block VM
 // deletion.
 func cleanupHAMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) {
-	if deps.Config.AntiAffinityUseHaRulesEnabled() || deps.Config.DLBConfigured() {
+	if deps.Config.HAAntiAffinityRulesEnabled() || deps.Config.DLBConfigured() {
 		if aaErr := removeAntiAffinityMembership(ctx, deps, vmid, logger); aaErr != nil {
 			logger.Warn("delete_vm: HA anti-affinity/DLB cleanup incomplete (non-fatal)", log.Err(aaErr))
 		}

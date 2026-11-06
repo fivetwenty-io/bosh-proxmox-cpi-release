@@ -133,8 +133,8 @@ func TestRequestOverrideCacheKey_CoversEveryOverridableField(t *testing.T) {
 		// which are meaningful only within one cluster, so two entries with
 		// different placement must not share a cached bundle.
 		"pve_placement": map[string]any{
-			"az_map":              map[string]any{"z3": []any{"pve-az2-1"}},
-			"pin_az_via_ha_rules": true,
+			"az_map":        map[string]any{"z3": []any{"pve-az2-1"}},
+			"anti_affinity": map[string]any{"enabled": true},
 		},
 		// The HA block is merged per entry, and two entries that differ only
 		// in their HA settings must not share a cached bundle.

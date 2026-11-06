@@ -50,12 +50,12 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 		// requested AZ (operator target_node override, local-disk pin, or
 		// config.node fallback). There is no AZ to make durable, so skip.
 		//
-		// Warn, not Debug: reaching here means pin_az_via_ha_rules is ON, so
+		// Warn, not Debug: reaching here means pve.ha.pin_az is "on", so
 		// the operator asked for every VM to be pinned and this one is not.
 		// BOSH never passes the cloud-config AZ name to create_vm (the AZ only
 		// selects the CPI and the subnet), so the CPI learns it solely from
 		// cloud_properties.availability_zone. An operator who sets
-		// pin_az_via_ha_rules and az_map but omits availability_zone from the
+		// pve.ha.pin_az and az_map but omits availability_zone from the
 		// AZ's cloud_properties gets a wholly inert feature, and at Debug the
 		// only evidence was a line nobody sees at the default log level. The
 		// message names the cloud-config prerequisite because that is the fix
@@ -72,7 +72,7 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 	if !ok {
 		return nil
 	}
-	strict := deps.Config.PinAZStrict()
+	strict := deps.Config.HAPinAZStrictValue()
 	warnSingleNodeAZPin(az, azNodes, strict, logger)
 	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, azNodes, strict, logger); pinErr != nil {
 		if cpierrors.IsType(pinErr, cpierrors.TypeRetriableCloud) {
@@ -134,7 +134,7 @@ func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.L
 	logger.Warn("create_vm: strict AZ node-affinity pin targets a small node set; "+
 		"if every pinned node is simultaneously down or drained for maintenance, PVE HA has "+
 		"nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns "+
-		"(map the AZ to >= 3 nodes to avoid this wedge risk, or set pve.placement.pin_az_strict=false "+
+		"(map the AZ to >= 3 nodes to avoid this wedge risk, or set pve.ha.pin_az_strict=false "+
 		"to allow HA to relocate off-AZ instead)",
 		log.String("az", az), log.String("nodes", nodesCSV), log.Int("pinned_node_count", len(nodes)))
 }

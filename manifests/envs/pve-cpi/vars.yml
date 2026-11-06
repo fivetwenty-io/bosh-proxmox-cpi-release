@@ -82,8 +82,8 @@ pve_stemcell_replicate_local: true
 # HA HAZARD: vm_storage and iso_storage above are node-local. A guest whose
 # root disk or ConfigDrive ISO lives on node-local storage cannot be started
 # on any other node, so PVE HA relocation always fails — which silently
-# defeats every HA feature (placement.dlb, anti_affinity.use_ha_rules,
-# pin_az_via_ha_rules). Before enabling any of them here, repoint
+# defeats every HA feature (pve.ha.dlb, pve.ha.anti_affinity,
+# pve.ha.pin_az). Before enabling any of them here, repoint
 # pve_vm_storage and pve_iso_storage at a pool every node mounts
 # (nfs-images serves both `images` and `iso` content on these clusters).
 # See docs/ha-and-resurrection.md.

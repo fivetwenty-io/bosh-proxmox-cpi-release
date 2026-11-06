@@ -163,10 +163,9 @@ func TestRemoveNodeAffinityPin_IdempotentWhenAbsent(t *testing.T) {
 func naPinConfig(azMap map[string][]string) *config.CPIConfig {
 	cfg := icMinConfig()
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: boolPtrHelper(true),
-		PinAZStrict:     boolPtrHelper(true),
-		AZMap:           azMap,
+		AZMap: azMap,
 	}
+	cfg.HA = haPinOn(boolPtrHelper(true))
 	return cfg
 }
 
@@ -453,7 +452,7 @@ func TestApplyAZNodeAffinityPin_NoResolvableAZ_Warns(t *testing.T) {
 func TestApplyAZNodeAffinityPin_Disabled_StaysSilent(t *testing.T) {
 	var buf bytes.Buffer
 	cfg := naPinConfig(map[string][]string{"z1": {"pve01"}})
-	cfg.Placement.PinAZViaHARules = nil // feature not enabled
+	cfg.HA.PinAZ = nil // feature not enabled
 	deps := Deps{
 		Config: cfg,
 		PVE:    &icPVEClient{clusterSvc: newNAStub()},

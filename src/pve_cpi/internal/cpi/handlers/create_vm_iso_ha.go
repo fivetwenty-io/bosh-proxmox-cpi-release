@@ -15,9 +15,9 @@ import (
 type haRegistrationFeature string
 
 const (
-	haFeatureDLB          haRegistrationFeature = "placement.dlb"
-	haFeatureAntiAffinity haRegistrationFeature = "placement.anti_affinity.use_ha_rules"
-	haFeatureAZPin        haRegistrationFeature = "placement.pin_az_via_ha_rules"
+	haFeatureDLB          haRegistrationFeature = "pve.ha.dlb"
+	haFeatureAntiAffinity haRegistrationFeature = "pve.ha.anti_affinity"
+	haFeatureAZPin        haRegistrationFeature = "pve.ha.pin_az"
 )
 
 // haRegistrationFeatures returns every HA-registration feature create_vm
@@ -27,7 +27,7 @@ const (
 //
 //   - DLB:            deps.Config.DLBEligibleForAZ (same predicate the step 10
 //     block in create_vm.go guards on).
-//   - Anti-affinity:  deps.Config.AntiAffinityUseHaRulesEnabled() and a
+//   - Anti-affinity:  deps.Config.HAAntiAffinityRulesEnabled() and a
 //     non-empty sanitized instance-group name (mirrors
 //     applyAntiAffinityMembership's early-return gate).
 //   - AZ node-affinity pin: deps.Config.HANodeAffinityPinEnabled() and a
@@ -45,7 +45,7 @@ func haRegistrationFeatures(deps Deps, cp createVMCloudProps, node string, env m
 		out = append(out, haFeatureDLB)
 	}
 
-	if deps.Config.AntiAffinityUseHaRulesEnabled() && sanitizeTagValue(instanceGroupName(env)) != "" {
+	if deps.Config.HAAntiAffinityRulesEnabled() && sanitizeTagValue(instanceGroupName(env)) != "" {
 		out = append(out, haFeatureAntiAffinity)
 	}
 
@@ -102,7 +102,7 @@ func warnHAResurrectorConflictOnce(vmid int, features []haRegistrationFeature, l
 			"try to recover the same failed guest independently, producing a duplicate VM that "+
 			"conflicts on IP, VMID, or agent credentials -- run `bosh update-resurrection off` "+
 			"(or set resurrector_enabled: false in the Director manifest) for any deployment using "+
-			"placement.dlb, placement.anti_affinity.use_ha_rules, or placement.pin_az_via_ha_rules; "+
+			"pve.ha.dlb, pve.ha.anti_affinity, or pve.ha.pin_az; "+
 			"see docs/ha-and-resurrection.md",
 			log.Int(metadataKeyVMID, vmid),
 			log.String("features", strings.Join(featureNames, ",")),

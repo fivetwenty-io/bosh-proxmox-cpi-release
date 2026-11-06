@@ -29,15 +29,13 @@ const crsModeDynamic = "dynamic"
 //  1. PVE version >= 9.2 (nodes.ListVersion); if older or undeterminable as
 //     older → log debug and return nil (skip).
 //  2. Cluster has >= 2 nodes (ListConfigNodes); single-node = DLB is inert.
-//  3. Shared-storage guard when DLBRequireSharedStorage() == true: if the VM
-//     storage pool, disk pool, or ConfigDrive ISO pool is local → skip
-//     registration. If undeterminable → proceed (fail-open) with a debug log.
+//  3. Shared-storage guard: if the VM storage pool, disk pool, or ConfigDrive
+//     ISO pool is local → skip registration. If undeterminable → proceed
+//     (fail-open) with a debug log.
 //  4. Register: CreateHaResources with State=started and AutoRebalance=true.
 //     If already registered → UpdateHaResources to ensure the flags are set.
-//  5. CRS: when DLBManageClusterCRS() == true, ensure the cluster crs option is
-//     set to ha=dynamic,ha-rebalance-on-start=1,ha-auto-rebalance=1 via
-//     UpdateOptions. When manage is false and crs is not dynamic, log a
-//     WARN with the corrective pvesh command.
+//  5. CRS: read the cluster crs option and, when it is not dynamic, log a WARN
+//     with the corrective pvesh command. The CPI never writes the CRS mode.
 func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, logger *log.Logger) error {
 	logger.Debug("DLB: evaluating membership", log.Int("vmid", vmid), log.String("az", az))
 
@@ -90,7 +88,7 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 	// internal/config/config.go), so any one of them being local disqualifies
 	// the VM from DLB registration. Check all distinct, non-empty pools;
 	// undeterminable shared-ness is fail-open (proceed).
-	if deps.Config != nil && deps.Config.DLBRequireSharedStorage() {
+	if deps.Config != nil {
 		checked := map[string]struct{}{}
 		for _, stg := range []string{deps.Config.VMStorage, deps.Config.DiskStorage, deps.EffectiveISOStorage(ctx)} {
 			if stg == "" {
@@ -139,19 +137,20 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 	}
 
 	// Guard 5: CRS option.
-	if err := ensureDLBClusterCRS(ctx, deps, svc, logger); err != nil {
+	if err := ensureDLBClusterCRS(ctx, svc, logger); err != nil {
 		return fmt.Errorf("DLB: cluster CRS check: %w", err)
 	}
 
 	return nil
 }
 
-// ensureDLBClusterCRS reads /cluster/options and either writes the required
-// crs setting (when DLBManageClusterCRS is true) or emits a WARN when not
-// dynamic and management is off. A crs value the CPI cannot decode is an error
-// in both modes: merging from an empty base would drop every sub-option the
-// operator configured, which is the loss the decode exists to prevent.
-func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, logger *log.Logger) error {
+// ensureDLBClusterCRS reads /cluster/options and emits a WARN when the crs
+// setting is not dynamic. It never writes the setting, because the CRS mode
+// affects every HA guest in the cluster and belongs to the operator. A crs
+// value the CPI cannot decode is an error: the corrective command below merges
+// into the decoded sub-options, and merging from an empty base would drop every
+// sub-option the operator configured.
+func ensureDLBClusterCRS(ctx context.Context, svc cluster.Service, logger *log.Logger) error {
 	opts, listErr := svc.ListOptions(ctx)
 	if listErr != nil {
 		return fmt.Errorf("read cluster options: %w", listErr)
@@ -167,37 +166,15 @@ func ensureDLBClusterCRS(ctx context.Context, deps Deps, svc cluster.Service, lo
 	}
 	isDynamic := crsHasDynamic(crsMap)
 
-	if deps.Config != nil && deps.Config.DLBManageClusterCRS() {
-		if crsHasRequired(crsMap) {
-			// Already correct: nothing to write.
-			return nil
-		}
-		newCRS := formatCRS(withRequiredCRS(crsMap))
-		if updErr := svc.UpdateOptions(ctx, &cluster.UpdateOptionsParams{
-			Crs: &newCRS,
-		}); updErr != nil {
-			return fmt.Errorf("set cluster crs=%q: %w", newCRS, updErr)
-		}
-		return nil
-	}
-
-	// manage_cluster_crs is false: read-only. Warn if not dynamic, and hand the
-	// operator the merged setting so the corrective command keeps whatever else
-	// they configured; pvesh set --crs replaces the whole property string.
+	// Warn if not dynamic, and hand the operator the merged setting so the
+	// corrective command keeps whatever else they configured; pvesh set --crs
+	// replaces the whole property string.
 	if !isDynamic {
 		logger.Warn("DLB: cluster crs is not dynamic; DLB rebalancing is inactive",
 			log.String("current_crs", formatCRS(crsMap)),
 			log.String("fix", "pvesh set /cluster/options --crs "+formatCRS(withRequiredCRS(crsMap))))
 	}
 	return nil
-}
-
-// crsHasRequired reports whether the parsed crs map already carries the three
-// sub-options DLB needs: ha=dynamic with both rebalance flags on.
-func crsHasRequired(m map[string]string) bool {
-	return crsHasDynamic(m) &&
-		m["ha-rebalance-on-start"] == "1" &&
-		m["ha-auto-rebalance"] == "1"
 }
 
 // withRequiredCRS returns a copy of m with the three sub-options DLB needs set,

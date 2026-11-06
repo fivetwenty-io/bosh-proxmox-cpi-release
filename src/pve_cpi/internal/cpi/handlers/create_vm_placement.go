@@ -105,8 +105,8 @@ func resolveTargetNodeWithRNG(
 //     a. Build AZ order: singular availability_zone → single-element list (backward
 //     compat). Plural availability_zones → iterate in operator order (shuffle if
 //     placement.az_shuffle is true). Append config.placement.az_fallback_order.
-//     b. GatherNodeFacts once (cluster-wide). ExcludeMaintenanceNodes wired from
-//     config default (true).
+//     b. GatherNodeFacts once (cluster-wide). The node health helper always runs,
+//     so a node that is not placeable never reaches the filter.
 //     c. For each AZ: resolve candidate set, Filter+Score+Pick. Advance to next
 //     AZ on empty-after-filter. Return chosen node on first viable AZ.
 //     d. No viable AZ: classify rejection causes. Transient causes →
@@ -224,16 +224,14 @@ func resolveTargetNodeWithBridges(
 		}
 
 		storageName := deps.Config.VMStorage
-		excludeMaintenance := deps.Config.ExcludeMaintenanceNodesEnabled()
 		facts, gatherErr := placement.GatherNodeFacts(ctx,
 			deps.PVE.Cluster(),
 			deps.PVE.Nodes(),
 			logger,
 			placement.GatherOptions{
-				StorageName:             storageName,
-				GroupTag:                groupTag,
-				ExcludeMaintenanceNodes: excludeMaintenance,
-				MaintenanceNodeTags:     deps.Config.MaintenanceNodeTagsValue(),
+				StorageName:         storageName,
+				GroupTag:            groupTag,
+				MaintenanceNodeTags: deps.Config.MaintenanceNodeTagsValue(),
 			},
 		)
 		if gatherErr != nil {
@@ -340,12 +338,11 @@ func resolveTargetNodeWithBridges(
 
 		if len(azOrder) == 0 {
 			req := placement.Request{
-				ExcludeMaintenanceNodes: excludeMaintenance,
-				RequiredPCIAddresses:    pciAddrsFB,
-				PCIChecker:              pciCheckerFnFB,
-				RequiredStorageBytes:    requiredStorageBytesFB,
-				MaxUtilizationPct:       utilCeilingPctFB,
-				PlannedAddBytes:         utilAddBytesFB,
+				RequiredPCIAddresses: pciAddrsFB,
+				PCIChecker:           pciCheckerFnFB,
+				RequiredStorageBytes: requiredStorageBytesFB,
+				MaxUtilizationPct:    utilCeilingPctFB,
+				PlannedAddBytes:      utilAddBytesFB,
 			}
 			bridges.apply(&req)
 			pass, rejections := placement.Filter(facts, req)
@@ -365,13 +362,12 @@ func resolveTargetNodeWithBridges(
 					continue
 				}
 				req := placement.Request{
-					CandidateNodes:          candidateSet,
-					ExcludeMaintenanceNodes: excludeMaintenance,
-					RequiredPCIAddresses:    pciAddrsFB,
-					PCIChecker:              pciCheckerFnFB,
-					RequiredStorageBytes:    requiredStorageBytesFB,
-					MaxUtilizationPct:       utilCeilingPctFB,
-					PlannedAddBytes:         utilAddBytesFB,
+					CandidateNodes:       candidateSet,
+					RequiredPCIAddresses: pciAddrsFB,
+					PCIChecker:           pciCheckerFnFB,
+					RequiredStorageBytes: requiredStorageBytesFB,
+					MaxUtilizationPct:    utilCeilingPctFB,
+					PlannedAddBytes:      utilAddBytesFB,
 				}
 				bridges.apply(&req)
 				pass, rejections := placement.Filter(facts, req)

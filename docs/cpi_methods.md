@@ -153,7 +153,7 @@ A VMID is allocated from `[vmid_range_start, vmid_range_end]` (default: `[100, 8
 - Each object has a single field: `address` (String) — the PCI device address in `DDDD:BB:SS.F` format (e.g. `"0000:01:00.0"`), matching the address the PVE node's hardware PCI list reports.
 - The CPI validates all addresses before creating any VM resource. An invalid or empty address is a non-retriable error.
 - At placement time, the CPI restricts candidate nodes to those that expose all requested addresses via `/nodes/{node}/hardware/pci`.
-- A strict single-node HA pin (`bosh-na-<vmid>`) is applied automatically to prevent live migration, which is incompatible with PCI passthrough. This pin is applied regardless of whether `pve.placement.pin_az_via_ha_rules` is set.
+- A strict single-node HA pin (`bosh-na-<vmid>`) is applied automatically to prevent live migration, which is incompatible with PCI passthrough. This pin is applied regardless of whether `pve.ha.pin_az` is set, and only when `pve.ha.mode` is `auto` or `managed`.
 - The host must have IOMMU enabled. IOMMU group isolation is the operator's responsibility; the CPI does not validate group boundaries.
 
 **Router/NAT VMs:** Two `cloud_properties` fields support VMs that forward traffic between networks:
@@ -183,7 +183,7 @@ Every VM is also created with `serial0=socket`, adding a virtual serial console.
 
 **Health gate:** When `pve.health_check.enabled` is `true`, `create_vm` polls for an agent response before returning. `pve.health_check.timeout_sec` controls the poll timeout. If the agent does not respond in time, the VM is destroyed via the standard rollback path.
 
-**Placement:** The CPI selects a node using AZ map, anti-affinity scoring, DLB integration, and post-selection fallback. When `pve.placement.pin_az_via_ha_rules` is enabled, a PVE HA node-affinity rule (`bosh-na-{vmid}`) pins the VM to its AZ node set, surviving DLB rebalance and HA failover. See [dlb-aware-placement.md](dlb-aware-placement.md) and [configuration.md](configuration.md) for tuning options.
+**Placement:** The CPI selects a node using AZ map, anti-affinity scoring, DLB integration, and post-selection fallback. When `pve.ha.pin_az` is `on`, a PVE HA node-affinity rule (`bosh-na-{vmid}`) pins the VM to its AZ node set, surviving DLB rebalance and HA failover. See [dlb-aware-placement.md](dlb-aware-placement.md) and [configuration.md](configuration.md) for tuning options.
 
 **Failure inspection:** `pve.debug.keep_failed_vms=true` preserves the VM and skips rollback on `create_vm` failure, for operator inspection.
 

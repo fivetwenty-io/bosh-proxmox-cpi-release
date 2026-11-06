@@ -887,8 +887,8 @@ func TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ(t *testing.T) 
 					"az_map": map[string]any{
 						"z3": []any{"pve-az2-1", "pve-az2-2", "pve-az2-3"},
 					},
-					"pin_az_via_ha_rules": true,
 				},
+				"ha": map[string]any{"mode": "auto", "pin_az": "on"},
 			},
 		},
 	})
@@ -905,7 +905,7 @@ func TestWithRequestOverrides_EntryPlacementAZMap_ResolvesEntryAZ(t *testing.T) 
 		t.Errorf(`AZ "z3" resolved to %#v, want the entry's node list`, nodes)
 	}
 	if !got.Config.HANodeAffinityPinEnabled() {
-		t.Error("the entry's pin_az_via_ha_rules must be in effect for this request")
+		t.Error("the entry's pve.ha.pin_az must be in effect for this request")
 	}
 
 	// The job-level cluster's own AZ is NOT inherited: an entry that defines

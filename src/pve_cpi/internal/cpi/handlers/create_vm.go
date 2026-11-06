@@ -583,6 +583,19 @@ func createVM(
 	warnIgnoredNodeKey(logger, parsed.cloudPropsMap)
 
 	// -----------------------------------------------------------------------
+	// 1a. DLB sentinel AZ under pve.ha.mode "off". Naming the sentinel AZ used
+	// to register the VM for HA with no other key, so with the mode off the
+	// request fails loudly instead of creating a VM that quietly lacks the
+	// registration the operator asked for. This runs before any PVE call.
+	// -----------------------------------------------------------------------
+	if deps.Config.DLBSentinelNeedsHAMode(parsed.cloudProps.AvailabilityZone) {
+		return nil, cpierrors.Cloud("create_vm: availability_zone %q is the DLB sentinel AZ, which needs "+
+			"pve.ha.mode set to \"auto\" or \"managed\"; set pve.ha.mode, or set pve.ha.dlb.az_name to "+
+			"another name, or to an empty string to disable the sentinel",
+			parsed.cloudProps.AvailabilityZone)
+	}
+
+	// -----------------------------------------------------------------------
 	// 1b. Early VIP validation — fail-fast before any VM mutation.
 	// Malformed allowed_address_pairs entries (bad IPs, non-string types) are
 	// operator errors that must be surfaced before the VM is created, consistent
@@ -897,7 +910,7 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 	}
 
 	// -----------------------------------------------------------------------
-	// 9. PVE HA anti-affinity membership (opt-in: anti_affinity.use_ha_rules).
+	// 9. PVE HA anti-affinity membership (opt-in: pve.ha.anti_affinity "on").
 	//
 	// Errors propagate: a TypeRetriableCloud error (e.g. lock-timeout) is
 	// returned so the director re-drives. A non-retriable failure (e.g. HA
@@ -910,7 +923,7 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 	}
 
 	// -----------------------------------------------------------------------
-	// 9b. AZ node-affinity HA pin (opt-in: placement.pin_az_via_ha_rules).
+	// 9b. AZ node-affinity HA pin (opt-in: pve.ha.pin_az "on").
 	//
 	// After scoring placed the VM on a node within its AZ, write a PVE HA
 	// node-affinity rule binding it to the AZ node set, so the AZ placement is
@@ -937,7 +950,7 @@ func finishCreatedVM(ctx context.Context, deps Deps, logger *log.Logger, parsed 
 	}
 
 	// -----------------------------------------------------------------------
-	// 10. PVE Dynamic Load Balancer membership (opt-in: placement.dlb).
+	// 10. PVE Dynamic Load Balancer membership (opt-in: pve.ha.dlb or the sentinel AZ).
 	//
 	// Best-effort and non-fatal. When the VM is DLB-eligible (master flag or
 	// sentinel AZ) it is registered as a PVE HA resource with auto-rebalance so

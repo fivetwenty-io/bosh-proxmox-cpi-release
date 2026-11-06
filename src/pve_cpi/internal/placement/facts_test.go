@@ -617,9 +617,7 @@ func TestGatherNodeFacts_HAMaintenanceNode(t *testing.T) {
 	}
 	ns := &stubNodes{now: now}
 
-	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		ExcludeMaintenanceNodes: true,
-	})
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -661,7 +659,7 @@ func TestGatherNodeFacts_ErroredServiceDoesNotMarkNode(t *testing.T) {
 		},
 	}
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{now: now}, nopLogger(),
-		placement.GatherOptions{ExcludeMaintenanceNodes: true})
+		placement.GatherOptions{})
 	if err != nil || len(facts) != 1 {
 		t.Fatalf("facts=%v err=%v", facts, err)
 	}
@@ -679,7 +677,7 @@ func TestGatherNodeFacts_NotQuorateEntryExcludesEveryNode(t *testing.T) {
 	}
 	cl := &stubCluster{statusResp: &resp, resResp: &cluster.ListResourcesResponse{}}
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{now: 1}, nopLogger(),
-		placement.GatherOptions{ExcludeMaintenanceNodes: true})
+		placement.GatherOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -715,8 +713,7 @@ func TestGatherNodeFacts_MaintenanceViaOperatorTag(t *testing.T) {
 	ns := &stubNodes{}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		ExcludeMaintenanceNodes: true,
-		MaintenanceNodeTags:     []string{"maintenance"},
+		MaintenanceNodeTags: []string{"maintenance"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -747,9 +744,7 @@ func TestGatherNodeFacts_HAStatusError_FailOpen(t *testing.T) {
 	ns := &stubNodes{}
 
 	// Must NOT return error; node must NOT be marked in maintenance (fail-open).
-	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		ExcludeMaintenanceNodes: true,
-	})
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{})
 	if err != nil {
 		t.Fatalf("expected no error on HA fetch failure; got: %v", err)
 	}
@@ -758,41 +753,6 @@ func TestGatherNodeFacts_HAStatusError_FailOpen(t *testing.T) {
 	}
 	if facts[0].InMaintenance {
 		t.Error("InMaintenance should be false when HA API errors (fail-open)")
-	}
-}
-
-func TestGatherNodeFacts_ExcludeDisabled_HANotCalled(t *testing.T) {
-	t.Parallel()
-	resp := cluster.ListStatusResponse{
-		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
-	}
-	cl := &stubCluster{
-		statusResp: &resp,
-		resResp:    &cluster.ListResourcesResponse{},
-		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
-			// Should not be called when ExcludeMaintenanceNodes is false.
-			return nil, errors.New("should not be called")
-		},
-		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
-			return nil, errors.New("should not be called")
-		},
-	}
-	ns := &stubNodes{}
-
-	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		ExcludeMaintenanceNodes: false,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(facts) != 1 {
-		t.Fatalf("expected 1 fact; got %d", len(facts))
-	}
-	if cl.haStatusCalled || cl.managerCalled {
-		t.Error("no HA source should be read when ExcludeMaintenanceNodes=false")
-	}
-	if facts[0].InMaintenance {
-		t.Error("InMaintenance should be false when exclusion is disabled")
 	}
 }
 
@@ -827,8 +787,7 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 	ns := &stubNodes{now: now}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
-		ExcludeMaintenanceNodes: true,
-		MaintenanceNodeTags:     []string{"maintenance"},
+		MaintenanceNodeTags: []string{"maintenance"},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -856,6 +815,7 @@ func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 // use these facts for CPU and free-memory admission.
 func TestGatherNodeFacts_RealMembershipAndNodeResources(t *testing.T) {
 	statuses := cluster.ListStatusResponse{
+		quorateRow(1),
 		json.RawMessage(`{"type":"node","name":"pve1","online":1}`),
 		json.RawMessage(`{"type":"node","name":"pve2","online":0}`),
 		json.RawMessage(`{"type":"node","name":"pve3","online":1}`),
@@ -883,7 +843,7 @@ func TestGatherNodeFacts_RealMembershipAndNodeResources(t *testing.T) {
 		t.Fatalf("admission did not preserve membership and missing-facts constraints: pass=%+v rejected=%v", pass, rejected)
 	}
 	// An old status counter cannot override a current resource observation.
-	statuses[0] = statusNode("pve1", 1, 1*gib, 1*gib, 1, 0.9)
+	statuses[1] = statusNode("pve1", 1, 1*gib, 1*gib, 1, 0.9)
 	facts, err = placement.GatherNodeFacts(t.Context(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{})
 	if err != nil || facts[0].MaxCPU != 8 || facts[0].FreeMemBytes != 6*gib {
 		t.Fatalf("resource observation was not authoritative: %+v %v", facts, err)

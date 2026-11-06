@@ -237,10 +237,11 @@ func applyPostCloneConfig(
 // PCI passthrough configured. PCI passthrough blocks live migration; a strict
 // node pin makes that constraint durable across HA failover and DLB rebalance.
 //
-// When pts is empty this is a no-op (byte-identical path). Errors follow the
-// same selective propagation as applyAZNodeAffinityPin: retriable errors
-// (lock-timeout, verify failure) propagate; generic HA-API failures are logged
-// as non-fatal warnings.
+// When pts is empty, or pve.ha.mode is "off", this is a no-op: the off mode
+// registers nothing and writes no rule, so a VM with PCI passthrough stays
+// outside HA. Errors follow the same selective propagation as
+// applyAZNodeAffinityPin: retriable errors (lock-timeout, verify failure)
+// propagate; generic HA-API failures are logged as non-fatal warnings.
 func applyPCINodeAffinityPin(
 	ctx context.Context,
 	deps Deps,
@@ -249,7 +250,7 @@ func applyPCINodeAffinityPin(
 	pts []PCIPassthrough,
 	logger *log.Logger,
 ) error {
-	if len(pts) == 0 {
+	if len(pts) == 0 || !deps.Config.HAWritesEnabled() {
 		return nil
 	}
 	// PCI passthrough requires a strict single-node pin so HA cannot relocate

@@ -177,14 +177,10 @@ func (c *dlbPVEClient) ClusterStorage() clusterstorage.Service { return c.cluste
 // helpers
 // --------------------------------------------------------------------------
 
-// dlbConfigWithDLB returns a minimal CPIConfig with the DLB block configured.
-// manage: whether manage_cluster_crs is true.
-// requireShared: whether require_shared_storage is true.
-func dlbConfigWithDLB(manage, requireShared bool) *config.CPIConfig {
+// dlbConfigWithDLB returns a minimal CPIConfig with pve.ha.mode auto and the
+// DLB master switch on.
+func dlbConfigWithDLB() *config.CPIConfig {
 	vFalse := false
-	manageCRS := manage
-	reqShared := requireShared
-	enabled := true
 	c := &config.CPIConfig{
 		Host:          "pve.test.local",
 		Port:          8006,
@@ -197,13 +193,7 @@ func dlbConfigWithDLB(manage, requireShared bool) *config.CPIConfig {
 		AgentMode:     "noagent",
 		VMDiskFormat:  "qcow2",
 		VerifySSL:     &vFalse,
-		Placement: &config.PlacementConfig{
-			DLB: &config.DLBConfig{
-				Enabled:              &enabled,
-				ManageClusterCRS:     &manageCRS,
-				RequireSharedStorage: &reqShared,
-			},
-		},
+		HA:            haDLBEnabled(),
 	}
 	return c
 }
@@ -229,7 +219,7 @@ func TestDLBMembership_EligibleAllGuardsPass_RegistersWithAutoRebalance(t *testi
 	clusterSvc := &dlbClusterStub{}
 	nodesSvc := &dlbNodesStub{} // default 9.2, multi-node
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(false, true)
+	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 100, "dlb", log.NewNopLogger()); err != nil {
@@ -258,7 +248,7 @@ func TestDLBMembership_SingleNode_SkipsRegistration(t *testing.T) {
 	clusterSvc := &dlbClusterStub{listConfigResp: &singleNode}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(false, false)
+	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 101, "dlb", log.NewNopLogger()); err != nil {
@@ -275,7 +265,7 @@ func TestDLBMembership_OldPVEVersion_Skips(t *testing.T) {
 		versionResp: &nodes.ListVersionResponse{Version: "9.1-3"},
 	}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(false, false)
+	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 102, "dlb", log.NewNopLogger()); err != nil {
@@ -291,7 +281,7 @@ func TestDLBMembership_LocalStorage_RequireSharedTrue_Skips(t *testing.T) {
 	nodesSvc := &dlbNodesStub{}
 	// dir-type is local (not shared by default flag).
 	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
-	cfg := dlbConfigWithDLB(false, true) // require_shared_storage=true
+	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 103, "dlb", log.NewNopLogger()); err != nil {
@@ -308,7 +298,7 @@ func TestDLBMembership_AlreadyExists_UpdatesFlags(t *testing.T) {
 	alreadyStub := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{}}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(false, false)
+	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(alreadyStub, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 104, "dlb", log.NewNopLogger()); err != nil {
@@ -339,57 +329,40 @@ func (s *dlbClusterStubAlreadyExists) CreateHaResources(_ context.Context, _ *cl
 	return fmt.Errorf("already defined")
 }
 
-func TestDLBMembership_ManageCRS_NotDynamic_CallsUpdateOptions(t *testing.T) {
-	// crs is not dynamic; manage_cluster_crs=true → UpdateOptions must be called.
-	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(true, false) // manage_cluster_crs=true
-
-	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 105, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(clusterSvc.updateOptsCRS) == 0 {
-		t.Error("manage_cluster_crs=true + non-dynamic: UpdateOptions must be called")
-	}
-	// Verify resulting CRS contains ha=dynamic.
-	merged := parseCRS(clusterSvc.updateOptsCRS[0])
-	if !crsHasDynamic(merged) {
-		t.Errorf("UpdateOptions CRS must include ha=dynamic, got %q", clusterSvc.updateOptsCRS[0])
-	}
-	if merged["ha-rebalance-on-start"] != "1" {
-		t.Errorf("UpdateOptions CRS must include ha-rebalance-on-start=1")
-	}
-	if merged["ha-auto-rebalance"] != "1" {
-		t.Errorf("UpdateOptions CRS must include ha-auto-rebalance=1")
-	}
-}
-
-func TestDLBMembership_ManageCRSFalse_NotDynamic_NoUpdateOptions(t *testing.T) {
-	svc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
-	nodesSvc := &dlbNodesStub{}
-	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(false, false) // manage_cluster_crs=false
-
-	deps := dlbDeps(svc, nodesSvc, storageSvc, cfg)
-	if err := ensureDLBMembership(context.Background(), deps, 106, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(svc.updateOptsCRS) != 0 {
-		t.Errorf("manage_cluster_crs=false: UpdateOptions must NOT be called, got %d calls", len(svc.updateOptsCRS))
-	}
-	// CreateHaResources should still have been called (registration proceeds).
-	if len(svc.createHACalls) != 1 {
-		t.Errorf("CreateHaResources should still be called; got %d calls", len(svc.createHACalls))
-	}
-}
-
 // --------------------------------------------------------------------------
 // parseCRS / formatCRS / crsHasDynamic unit tests
 // --------------------------------------------------------------------------
 
-func TestDLBMembership_ManageCRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
+func TestDLBMembership_CRS_NotDynamic_NeverWritesAndStillRegisters(t *testing.T) {
+	// The CPI reads the cluster CRS mode and warns. It never writes it, because
+	// the mode affects every HA guest in the cluster, and the VM still registers.
+	svc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`)}
+	nodesSvc := &dlbNodesStub{}
+	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
+
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	deps := dlbDeps(svc, nodesSvc, storageSvc, dlbConfigWithDLB())
+	if err := ensureDLBMembership(context.Background(), deps, 106, "dlb", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(svc.updateOptsCRS) != 0 {
+		t.Errorf("UpdateOptions must NOT be called, got %d calls", len(svc.updateOptsCRS))
+	}
+	if len(svc.createHACalls) != 1 {
+		t.Errorf("CreateHaResources should still be called; got %d calls", len(svc.createHACalls))
+	}
+	warned := false
+	for _, e := range obs.All() {
+		if e.Level == slog.LevelWarn && strings.Contains(e.Message, "cluster crs is not dynamic") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("a non-dynamic cluster must produce the CRS warning")
+	}
+}
+
+func TestDLBMembership_CRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
 	// PVE returns crs as an object of sub-options with the flags as unquoted
 	// integers. That is already the required setting, so nothing may be written.
 	clusterSvc := &dlbClusterStub{
@@ -397,7 +370,7 @@ func TestDLBMembership_ManageCRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
 	}
 	nodesSvc := &dlbNodesStub{}
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
-	cfg := dlbConfigWithDLB(true, false) // manage_cluster_crs=true
+	cfg := dlbConfigWithDLB()
 
 	deps := dlbDeps(clusterSvc, nodesSvc, storageSvc, cfg)
 	if err := ensureDLBMembership(context.Background(), deps, 107, "dlb", log.NewNopLogger()); err != nil {
@@ -408,59 +381,16 @@ func TestDLBMembership_ManageCRS_AlreadyDynamic_NoUpdateOptions(t *testing.T) {
 	}
 }
 
-func dlbSharedDeps(clusterSvc *dlbClusterStub, manageCRS bool) Deps {
-	return dlbDeps(clusterSvc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB(manageCRS, false))
+func dlbSharedDeps(clusterSvc *dlbClusterStub) Deps {
+	return dlbDeps(clusterSvc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB())
 }
 
-func TestDLBMembership_ManageCRS_PreservesOperatorSubOptions(t *testing.T) {
-	// The merge must keep every sub-option the operator configured and only
-	// set the three DLB needs; the flags come back as unquoted integers.
-	clusterSvc := &dlbClusterStub{
-		listOptionsRaw: dlbListOptions(`{"ha":"static","ha-auto-rebalance-margin":50,"ha-auto-rebalance-method":"topsis"}`),
-	}
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 108, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-auto-rebalance-margin=50,ha-auto-rebalance-method=topsis,ha-rebalance-on-start=1"}
-	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
-		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
-	}
-}
-
-func TestDLBMembership_ManageCRS_PartiallyCorrect_StillWrites(t *testing.T) {
-	// ha=dynamic alone is not enough: a flag that is off must still trigger the
-	// write, so the short-circuit cannot be widened to the mode alone.
-	clusterSvc := &dlbClusterStub{
-		listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-rebalance-on-start":1,"ha-auto-rebalance":0}`),
-	}
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 109, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1"}
-	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
-		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
-	}
-}
-
-func TestDLBMembership_ManageCRS_PropertyStringShape_Writes(t *testing.T) {
-	// A bare property string is the other shape the field has been seen to
-	// take; it must drive the same merge end to end.
-	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`"ha=static,ha-auto-rebalance-margin=20"`)}
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 110, "dlb", log.NewNopLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := []string{"ha=dynamic,ha-auto-rebalance=1,ha-auto-rebalance-margin=20,ha-rebalance-on-start=1"}
-	if fmt.Sprint(clusterSvc.updateOptsCRS) != fmt.Sprint(want) {
-		t.Errorf("UpdateOptions crs: want %v, got %v", want, clusterSvc.updateOptsCRS)
-	}
-}
-
-func TestDLBMembership_ManageCRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.T) {
+func TestDLBMembership_CRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.T) {
 	// A crs value the CPI cannot decode must never merge from an empty base:
 	// that write would drop every sub-option the operator configured.
 	for _, raw := range []string{`["ha=dynamic"]`, `{"ha":{"mode":"dynamic"}}`, `{`} {
 		clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(raw)}
-		err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 111, "dlb", log.NewNopLogger())
+		err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 111, "dlb", log.NewNopLogger())
 		if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
 			t.Errorf("crs %s: want a decode error, got %v", raw, err)
 		}
@@ -470,17 +400,17 @@ func TestDLBMembership_ManageCRS_UndecodableCRS_ErrorsWithoutWriting(t *testing.
 	}
 }
 
-func TestDLBMembership_ManageCRSFalse_UndecodableCRS_Errors(t *testing.T) {
+func TestDLBMembership_CRS_UndecodableCRS_Errors(t *testing.T) {
 	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`["ha=dynamic"]`)}
-	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 112, "dlb", log.NewNopLogger())
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 112, "dlb", log.NewNopLogger())
 	if err == nil || !strings.Contains(err.Error(), "decode cluster crs") {
 		t.Errorf("want a decode error, got %v", err)
 	}
 }
 
-func TestDLBMembership_ManageCRS_ListOptionsError_Wrapped(t *testing.T) {
+func TestDLBMembership_CRS_ListOptionsError_Wrapped(t *testing.T) {
 	clusterSvc := &dlbClusterStub{listOptionsErr: fmt.Errorf("boom")}
-	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 113, "dlb", log.NewNopLogger())
+	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 113, "dlb", log.NewNopLogger())
 	if err == nil || !strings.Contains(err.Error(), "read cluster options: boom") {
 		t.Errorf("want the wrapped ListOptions error, got %v", err)
 	}
@@ -489,22 +419,14 @@ func TestDLBMembership_ManageCRS_ListOptionsError_Wrapped(t *testing.T) {
 	}
 }
 
-func TestDLBMembership_ManageCRS_UpdateOptionsError_Wrapped(t *testing.T) {
-	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"static"}`), updateOptsErr: fmt.Errorf("denied")}
-	err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, true), 114, "dlb", log.NewNopLogger())
-	if err == nil || !strings.Contains(err.Error(), `set cluster crs="ha=dynamic,ha-auto-rebalance=1,ha-rebalance-on-start=1": denied`) {
-		t.Errorf("want the wrapped UpdateOptions error, got %v", err)
-	}
-}
-
-func TestDLBMembership_ManageCRSFalse_WarnHintPreservesOperatorSubOptions(t *testing.T) {
+func TestDLBMembership_CRS_WarnHintPreservesOperatorSubOptions(t *testing.T) {
 	// pvesh set --crs replaces the whole property string, so the corrective
 	// command in the WARN must carry the operator's other sub-options too.
 	clusterSvc := &dlbClusterStub{
 		listOptionsRaw: dlbListOptions(`{"ha":"static","ha-auto-rebalance-margin":50}`),
 	}
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 115, "dlb", logger); err != nil {
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 115, "dlb", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	var warn *log.Entry
@@ -526,12 +448,12 @@ func TestDLBMembership_ManageCRSFalse_WarnHintPreservesOperatorSubOptions(t *tes
 	}
 }
 
-func TestDLBMembership_ManageCRSFalse_Dynamic_NoWarn(t *testing.T) {
+func TestDLBMembership_CRS_Dynamic_NoWarn(t *testing.T) {
 	// A cluster already running ha=dynamic must not be warned about, whatever
 	// the rebalance flags say; that is the noise the object decode removes.
 	clusterSvc := &dlbClusterStub{listOptionsRaw: dlbListOptions(`{"ha":"dynamic","ha-auto-rebalance":0}`)}
 	logger, obs := log.NewObservedLogger(slog.LevelDebug)
-	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc, false), 116, "dlb", logger); err != nil {
+	if err := ensureDLBMembership(context.Background(), dlbSharedDeps(clusterSvc), 116, "dlb", logger); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, e := range obs.All() {
@@ -834,7 +756,7 @@ func TestDLBMembership_LocalPersistentDisk_RequireSharedTrue_Skips(t *testing.T)
 		"shared-root": {storageType: "rbd", shared: true},
 		"local-data":  {storageType: "lvm", shared: false},
 	}}
-	cfg := dlbConfigWithDLB(false, true) // require_shared_storage=true
+	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
 	cfg.VMStorage = "shared-root"
 	cfg.DiskStorage = "local-data"
 
@@ -856,7 +778,7 @@ func TestDLBMembership_SharedRootAndDisk_Registers(t *testing.T) {
 		"shared-root": {storageType: "rbd", shared: true},
 		"shared-data": {storageType: "nfs", shared: true},
 	}}
-	cfg := dlbConfigWithDLB(false, true)
+	cfg := dlbConfigWithDLB()
 	cfg.VMStorage = "shared-root"
 	cfg.DiskStorage = "shared-data"
 
@@ -882,7 +804,7 @@ func TestDLBMembership_LocalISOStorage_RequireSharedTrue_Skips(t *testing.T) {
 		"shared-data": {storageType: "nfs", shared: true},
 		"local":       {storageType: "dir", shared: false},
 	}}
-	cfg := dlbConfigWithDLB(false, true) // require_shared_storage=true
+	cfg := dlbConfigWithDLB() // the shared-storage guard is always on
 	cfg.VMStorage = "shared-root"
 	cfg.DiskStorage = "shared-data"
 	cfg.ISOStorage = "local"
@@ -907,7 +829,7 @@ func TestDLBMembership_SharedRootDiskAndISO_Registers(t *testing.T) {
 		"shared-data": {storageType: "nfs", shared: true},
 		"shared-iso":  {storageType: "nfs", shared: true},
 	}}
-	cfg := dlbConfigWithDLB(false, true)
+	cfg := dlbConfigWithDLB()
 	cfg.VMStorage = "shared-root"
 	cfg.DiskStorage = "shared-data"
 	cfg.ISOStorage = "shared-iso"

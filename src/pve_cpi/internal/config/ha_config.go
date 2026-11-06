@@ -329,6 +329,7 @@ func (c *CPIConfig) validateHA(errs *[]string) {
 	}
 	c.validateHAUnavailablePolicies(errs)
 	c.validateHAModeCombinations(errs)
+	c.validateHAPinAZ(errs)
 	c.validateHAMotionWait(errs)
 	c.validateHAReplication(errs)
 }
@@ -363,6 +364,29 @@ func (c *CPIConfig) validateHAModeCombinations(errs *[]string) {
 	}
 	if h.DLB != nil && h.DLB.Enabled != nil && *h.DLB.Enabled {
 		*errs = append(*errs, "ha.dlb.enabled requires pve.ha.mode to be \"auto\" or \"managed\"")
+	}
+}
+
+// validateHAPinAZ enforces the cross-field rules of pin_az "on". It needs a
+// non-empty placement.az_map to pin against, and it is incompatible with the
+// DLB sentinel AZ in that map, because DLB intentionally un-pins guests and a
+// durable pin would fight the rebalancer.
+func (c *CPIConfig) validateHAPinAZ(errs *[]string) {
+	if c.HA.PinAZ == nil || string(*c.HA.PinAZ) != HARuleOn {
+		return
+	}
+	if c.Placement == nil || len(c.Placement.AZMap) == 0 {
+		*errs = append(*errs, "ha.pin_az \"on\" requires a non-empty placement.az_map to pin against")
+		return
+	}
+	sentinel := c.DLBAZName()
+	if sentinel == "" {
+		return
+	}
+	if _, ok := c.Placement.AZMap[sentinel]; ok {
+		*errs = append(*errs, fmt.Sprintf(
+			"ha.pin_az \"on\" is incompatible with the DLB sentinel AZ %q in placement.az_map; "+
+				"DLB intentionally un-pins guests", sentinel))
 	}
 }
 

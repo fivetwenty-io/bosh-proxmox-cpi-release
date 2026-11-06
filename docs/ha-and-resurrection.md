@@ -9,19 +9,21 @@ Two independent systems can restart a BOSH-managed VM that has stopped respondin
 | **Default (zero-config)** | BOSH resurrector | No | Nothing, so leave the resurrector on (the Director default) |
 | **Opt-in (any HA-registration feature active)** | PVE HA | Yes | Disable the resurrector for that deployment: `bosh update-resurrection off` |
 
-With a stock configuration (no `placement.anti_affinity.use_ha_rules`, no `placement.pin_az_via_ha_rules`, no `placement.dlb`, and no `cloud_properties.pci_passthroughs`) the CPI never registers a VM as a PVE HA resource. Zero HA API calls are made. The BOSH resurrector is the sole recovery mechanism, and this is the correct, zero-configuration default: leave resurrection on.
+With a stock configuration (`pve.ha.mode` left at `off`, and no `cloud_properties.pci_passthroughs`) the CPI never registers a VM as a PVE HA resource. Zero HA API calls are made. The BOSH resurrector is the sole recovery mechanism, and this is the correct, zero-configuration default: leave resurrection on.
 
 Three configuration knobs opt a VM into PVE HA:
 
-- `placement.dlb` (Dynamic Load Balancer rebalancing); see [DLB-Aware Placement](dlb-aware-placement.md)
-- `placement.anti_affinity.enabled` with `use_ha_rules: true` (PVE-enforced negative affinity between instance-group members)
-- `placement.pin_az_via_ha_rules` with a non-empty `az_map` (a hard or preferred node-affinity pin keeping a VM's AZ durable across HA failover)
+- `pve.ha.dlb` (Dynamic Load Balancer rebalancing); see [DLB-Aware Placement](dlb-aware-placement.md)
+- `placement.anti_affinity.enabled` with `pve.ha.anti_affinity: on` (PVE-enforced negative affinity between instance-group members)
+- `pve.ha.pin_az: on` with a non-empty `placement.az_map` (a hard or preferred node-affinity pin keeping a VM's AZ durable across HA failover)
+
+Each one also needs `pve.ha.mode` set to `auto` or `managed`. Under `off` the CPI affects no VM through HA, and a `create_vm` in the DLB sentinel AZ fails instead of creating a VM that nothing manages. The release removed the earlier `pve.placement` keys for these features, and [Removed placement keys](configuration.md#removed-placement-keys) maps each one to its replacement.
 
 Any one of these registers the VM in `ha-manager`. The moment that happens, **you must disable the BOSH resurrector for that deployment**, via `bosh update-resurrection off` or `resurrector_enabled: false` in the Director manifest.
 
 ### Two prerequisites that are easy to miss
 
-**`pin_az_via_ha_rules` also needs `cloud_properties.availability_zone`, and `az_map` spreads VMs only across the nodes inside one AZ.** On Proxmox an AZ is a separate cluster or a standalone host, reached through its own cpi-config entry. The `az_map` in this document is secondary to that binding, because it spreads VMs across the nodes of one AZ's cluster. See [Multi-Cluster Deployments](multi-cluster.md#per-entry-placement-and-node-spreading) for the model and for the per-entry copy of the placement block. BOSH does not pass the cloud-config AZ *name* to `create_vm`, since an AZ block selects which CPI runs and which subnet the VM gets. The CPI therefore learns a VM's AZ only from `cloud_properties.availability_zone`, and it must name an AZ that appears in `placement.az_map`. We put that property on the AZ's `cloud_properties` so that every VM in the AZ receives it, and a `vm_type` can set it too. Setting `pin_az_via_ha_rules` and `az_map` without it yields an entirely inert feature, because every VM is created with no HA registration and no pin. The CPI warns once per unpinned VM:
+**`pve.ha.pin_az` also needs `cloud_properties.availability_zone`, and `az_map` spreads VMs only across the nodes inside one AZ.** On Proxmox an AZ is a separate cluster or a standalone host, reached through its own cpi-config entry. The `az_map` in this document is secondary to that binding, because it spreads VMs across the nodes of one AZ's cluster. See [Multi-Cluster Deployments](multi-cluster.md#per-entry-placement-and-node-spreading) for the model and for the per-entry copy of the placement block. BOSH does not pass the cloud-config AZ *name* to `create_vm`, since an AZ block selects which CPI runs and which subnet the VM gets. The CPI therefore learns a VM's AZ only from `cloud_properties.availability_zone`, and it must name an AZ that appears in `placement.az_map`. We put that property on the AZ's `cloud_properties` so that every VM in the AZ receives it, and a `vm_type` can set it too. Setting `pve.ha.pin_az` and `az_map` without it yields an entirely inert feature, because every VM is created with no HA registration and no pin. The CPI warns once per unpinned VM:
 
 > `create_vm: HA node-affinity pin is enabled but this VM was not pinned — no availability_zone resolved for the placed node; BOSH does not pass the cloud-config AZ name to the CPI, so each cloud-config AZ needs cloud_properties.availability_zone naming a key of placement.az_map, and BOSH merges an AZ's cloud_properties into every VM in that AZ ...`
 
@@ -64,7 +66,7 @@ The duplicate hazard requires both loops to be live. Director-only recovery cann
 
 The CPI cannot read or set the BOSH resurrector's state, because there is no PVE-API-only mechanism for that and the CPI has no shell access to the Director. What it can do is warn whenever it is about to make PVE HA a co-owner of recovery. `create_vm` logs this once per CPI process, the first time any HA-registration feature fires:
 
-> `create_vm: this VM is registered as a PVE HA resource; the BOSH resurrector must be disabled for HA-managed deployments, or PVE HA and the resurrector can both try to recover the same failed guest independently, producing a duplicate VM that conflicts on IP, VMID, or agent credentials -- run` `bosh update-resurrection off` `(or set` `resurrector_enabled: false` `in the Director manifest) for any deployment using` `placement.dlb, placement.anti_affinity.use_ha_rules, or placement.pin_az_via_ha_rules; see docs/ha-and-resurrection.md`
+> `create_vm: this VM is registered as a PVE HA resource; the BOSH resurrector must be disabled for HA-managed deployments, or PVE HA and the resurrector can both try to recover the same failed guest independently, producing a duplicate VM that conflicts on IP, VMID, or agent credentials -- run` `bosh update-resurrection off` `(or set` `resurrector_enabled: false` `in the Director manifest) for any deployment using` `pve.ha.dlb, pve.ha.anti_affinity, or pve.ha.pin_az; see docs/ha-and-resurrection.md`
 
 The warning fires once per process, not once per VM, so later HA-registered `create_vm` calls in the same CPI process do not repeat it, even under a different combination of features. It always fires when any HA-registration feature is active, because the CPI has no way to know whether the resurrector has actually been disabled; it only knows that HA registration is about to happen.
 
@@ -76,19 +78,19 @@ If the cluster loses quorum entirely, the scan itself fails, and that failure pr
 
 ## The small-node-set AZ pin wedge
 
-`pve.placement.pin_az_strict` defaults to `true` once `pin_az_via_ha_rules` is enabled: the resulting node-affinity pin is a hard guarantee, and PVE HA will not relocate the VM off its assigned AZ node set even if every node in that set is simultaneously down. This is a deliberate trade-off of durability of AZ locality over availability, but it carries a real wedge risk on a small node set. The CPI warns when a strict pin targets an AZ with two or fewer nodes:
+`pve.ha.pin_az_strict` defaults to `true` once `pve.ha.pin_az` is `on`: the resulting node-affinity pin is a hard guarantee, and PVE HA will not relocate the VM off its assigned AZ node set even if every node in that set is simultaneously down. This is a deliberate trade-off of durability of AZ locality over availability, but it carries a real wedge risk on a small node set. The CPI warns when a strict pin targets an AZ with two or fewer nodes:
 
-> `create_vm: strict AZ node-affinity pin targets a small node set; if every pinned node is simultaneously down or drained for maintenance, PVE HA has nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns (map the AZ to >= 3 nodes to avoid this wedge risk, or set` `pve.placement.pin_az_strict=false` `to allow HA to relocate off-AZ instead)`
+> `create_vm: strict AZ node-affinity pin targets a small node set; if every pinned node is simultaneously down or drained for maintenance, PVE HA has nowhere in the AZ left to fail over to and the VM stays down until a pinned node returns (map the AZ to >= 3 nodes to avoid this wedge risk, or set` `pve.ha.pin_az_strict=false` `to allow HA to relocate off-AZ instead)`
 
-Two concrete triggers: every node in a one- or two-node AZ going down simultaneously, or one node down while the other is drained for maintenance. Either case leaves PVE HA with no legal placement target in that AZ, and the VM stays down until a pinned node returns. Mitigate by mapping each `az_map` entry to at least three nodes, or by setting `pin_az_strict: false` so HA can relocate off-AZ instead of wedging.
+Two concrete triggers: every node in a one- or two-node AZ going down simultaneously, or one node down while the other is drained for maintenance. Either case leaves PVE HA with no legal placement target in that AZ, and the VM stays down until a pinned node returns. Mitigate by mapping each `az_map` entry to at least three nodes, or by setting `pve.ha.pin_az_strict: false` so HA can relocate off-AZ instead of wedging.
 
 ## DLB caveats
 
-The Dynamic Load Balancer (`placement.dlb`) is a third HA-registering feature and carries its own prerequisites beyond the resurrector conflict above. See [DLB-Aware Placement](dlb-aware-placement.md) for the full guard ladder. The parts most relevant to HA ownership:
+The Dynamic Load Balancer (`pve.ha.dlb`) is a third HA-registering feature and carries its own prerequisites beyond the resurrector conflict above. See [DLB-Aware Placement](dlb-aware-placement.md) for the full guard ladder. The parts most relevant to HA ownership:
 
 - **Shared storage required.** Live migration, which both DLB rebalancing and PVE HA recovery depend on, requires the VM's root disk, persistent disks, and its ConfigDrive ISO (which lives at `scsi30` for the VM's entire life, not just at boot) to all sit on storage reachable from every cluster node. `pve.iso_storage_follow_vm_storage` (see [Design Decisions, D7](design-decisions.md#d7-iso_storage-default-follow-vm_storage)) helps here by pointing the ISO pool at an already-shared `vm_storage` without a separate manifest edit. If any of the three pools resolves to node-local storage, the CPI silently skips DLB registration for that VM.
 - **Multi-node cluster required.** PVE HA requires quorum, with three nodes as the recommended minimum. On a single-node cluster, the CPI detects the node count and skips all DLB registration silently. The feature is entirely inert there, and no resurrector conflict can arise.
-- **The BOSH Director and bootstrap VMs must never be DLB- or HA-managed.** A `bosh create-env` Director VM that gets live-migrated mid-deploy loses its in-flight CPI RPC connections, and the deployment fails. Use a separate `cpi.json` for the `create-env` step that omits `placement.dlb` entirely, because the config accessors return safe off defaults when the block is absent.
+- **The BOSH Director and bootstrap VMs must never be DLB- or HA-managed.** A `bosh create-env` Director VM that gets live-migrated mid-deploy loses its in-flight CPI RPC connections, and the deployment fails. Use a separate `cpi.json` for the `create-env` step that omits the `pve.ha` block or sets `pve.ha.mode: off`, because the config accessors return safe off defaults when the block is absent.
 
 ## Observed timings
 

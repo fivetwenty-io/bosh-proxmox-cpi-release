@@ -1038,7 +1038,6 @@ func TestCreateVM_Fallback_DLBEnabled_SuccessPath(t *testing.T) {
 	n := &vmMockNodes{}
 	a := &vmMockAgent{}
 
-	dlbEnabled := true
 	fm := 2
 	cfg := &config.CPIConfig{
 		Node:           "pve1",
@@ -1048,9 +1047,9 @@ func TestCreateVM_Fallback_DLBEnabled_SuccessPath(t *testing.T) {
 		AgentMBus:      "nats://mbus.test:4222",
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
-			// DLBExplicitlyEnabled() returns true → DLBEligibleForAZ("") returns true.
-			DLB: &config.DLBConfig{Enabled: &dlbEnabled},
 		},
+		// DLBExplicitlyEnabled() returns true → DLBEligibleForAZ("") returns true.
+		HA: haDLBEnabled(),
 	}
 	c := &vmMockCluster{
 		listStatusFn:    listStatusTwoNodes(),
@@ -1161,16 +1160,16 @@ func TestCreateVM_Fallback_VirtioSCSISingle_SuccessPath(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Test: fallback with HA anti-affinity — covers AntiAffinityUseHaRulesEnabled branch
+// Test: fallback with HA anti-affinity — covers HAAntiAffinityRulesEnabled branch
 // --------------------------------------------------------------------------
 
 // TestCreateVM_Fallback_AntiAffinity_SuccessPath verifies that when
-// anti_affinity.use_ha_rules is true, createVMWithFallback enters the
+// pve.ha.anti_affinity is on, createVMWithFallback enters the
 // ensureAntiAffinityMembership branch (lines 731-736) after the winner is
 // established. The function is non-fatal: a failure is warned and success
 // is returned. With an empty env (no instance group), the groupKey is ""
 // so ensureAntiAffinityMembership is skipped, but the outer condition
-// (AntiAffinityUseHaRulesEnabled) IS entered.
+// (HAAntiAffinityRulesEnabled) IS entered.
 func TestCreateVM_Fallback_AntiAffinity_SuccessPath(t *testing.T) {
 	t.Parallel()
 
@@ -1188,7 +1187,6 @@ func TestCreateVM_Fallback_AntiAffinity_SuccessPath(t *testing.T) {
 	a := &vmMockAgent{}
 
 	aaEnabled := true
-	aaHaRules := true
 	fm := 2
 	cfg := &config.CPIConfig{
 		Node:           "pve1",
@@ -1199,10 +1197,10 @@ func TestCreateVM_Fallback_AntiAffinity_SuccessPath(t *testing.T) {
 		Placement: &config.PlacementConfig{
 			FallbackMax: &fm,
 			AntiAffinity: &config.AntiAffinityConfig{
-				Enabled:    &aaEnabled,
-				UseHaRules: &aaHaRules,
+				Enabled: &aaEnabled,
 			},
 		},
+		HA: haAntiAffinityOn(),
 	}
 	c := &vmMockCluster{
 		listStatusFn:    listStatusTwoNodes(),
@@ -1228,7 +1226,7 @@ func TestCreateVM_Fallback_AntiAffinity_SuccessPath(t *testing.T) {
 	// Use a minimal env (empty bosh group) so instanceGroupName returns "" →
 	// groupKey == "" → the inner `if groupKey != ""` branch is skipped, avoiding
 	// a call to ensureAntiAffinityMembership (which would need CreateHaResources
-	// mocked). The outer AntiAffinityUseHaRulesEnabled() block IS entered,
+	// mocked). The outer HAAntiAffinityRulesEnabled() block IS entered,
 	// covering the if-condition statement.
 	args := fallbackArgs()
 

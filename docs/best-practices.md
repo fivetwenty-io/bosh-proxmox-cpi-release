@@ -356,7 +356,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** A node an operator has explicitly put into HA maintenance state is being drained for a reason; placing a new VM there works against that intent.
 
-**CPI behavior.** `pve.placement.exclude_maintenance_nodes` defaults `true`: any node PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state is excluded from candidate scoring, as is any node carrying a tag listed in `pve.placement.maintenance_node_tags`.
+**CPI behavior.** The node health check always runs: any node PVE's HA subsystem reports in a `maintenance`, `error`, `fence`, or `recovery` state is excluded from candidate scoring, as is any node carrying a tag listed in `pve.placement.maintenance_node_tags`.
 
 **Status.** Meets.
 
@@ -396,7 +396,7 @@ Property names and defaults are cross-referenced to [Configuration reference](co
 
 **Best practice.** BOSH's AZ concept is a placement contract, not a preference. A strict pin should mean the VM stays in that AZ or does not run, and any fallback elsewhere should be loud and opt-in. The tradeoff: a strictly pinned VM whose entire AZ goes down cannot restart anywhere, and a strict pin can also block routine node maintenance if there is nowhere else legal for the VM to go.
 
-**CPI behavior.** `pve.placement.pin_az_strict` defaults `true`, creating a hard PVE HA node-affinity rule rather than a soft preference. The CPI logs a Warn naming the AZ whenever a strictly pinned AZ resolves to fewer than three nodes — one node has no failover target within the AZ at all, and two leaves no headroom for a node in maintenance.
+**CPI behavior.** `pve.ha.pin_az_strict` defaults `true`, creating a hard PVE HA node-affinity rule rather than a soft preference. The CPI logs a Warn naming the AZ whenever a strictly pinned AZ resolves to fewer than three nodes — one node has no failover target within the AZ at all, and two leaves no headroom for a node in maintenance.
 
 The HA pin only protects a VM once it exists. At creation, when no node in the requested AZ can host the VM, the CPI logs a Warn that names the AZ and each node's rejection reason and then places the VM on `pve.node`, outside the AZ. Set `pve.placement.az_enforcement: strict` to fail the create instead. Under `strict`, a one-node AZ in maintenance blocks every recreate in that AZ, which is when the resurrector runs, so map each AZ to at least two nodes first.
 

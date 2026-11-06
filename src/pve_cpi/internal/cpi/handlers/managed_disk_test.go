@@ -181,6 +181,17 @@ func (managedDiskTestCluster) ListStatus(context.Context) (*cluster.ListStatusRe
 	r := cluster.ListStatusResponse{json.RawMessage(`{"type":"cluster","quorate":1}`), json.RawMessage(`{"type":"node","name":"n1","online":1}`)}
 	return &r, nil
 }
+
+// ListHaStatusManagerStatus answers with an empty manager view, which the node
+// health helper reads as "no fresh CRM view" and settles from cluster status.
+func (managedDiskTestCluster) ListHaStatusManagerStatus(context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	r := cluster.ListHaStatusManagerStatusResponse(`{}`)
+	return &r, nil
+}
+func (managedDiskTestCluster) ListHaStatusCurrent(context.Context) (*cluster.ListHaStatusCurrentResponse, error) {
+	r := cluster.ListHaStatusCurrentResponse{}
+	return &r, nil
+}
 func (managedDiskTestDefinitions) ListStorage(context.Context, *clusterstorage.ListStorageParams) (*clusterstorage.ListStorageResponse, error) {
 	r := make(clusterstorage.ListStorageResponse, 0, 2)
 	for _, id := range []string{"a", "b"} {

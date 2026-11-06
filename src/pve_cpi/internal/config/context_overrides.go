@@ -28,13 +28,10 @@ const contextOverridePrefix = "pve_"
 //
 // pve_placement is in scope too, despite being a policy block rather than a
 // connection field: its az_map names PVE NODES, and node names are meaningful
-// only within one cluster. Excluding it made the three HA features
-// (placement.dlb, anti_affinity.use_ha_rules, pin_az_via_ha_rules)
-// unreachable from a cpi-config entry — that is, unreachable in exactly the
-// multi-cluster deployments that have more than one cluster to fail over
-// within — and, once cloud_properties.availability_zone was set, made every
-// create_vm on a non-job-level entry hard-fail against the job-level (empty)
-// az_map. See coerceOverridePlacement for the whole-block replace semantics.
+// only within one cluster. Excluding it made every create_vm on a
+// non-job-level entry hard-fail against the job-level (empty) az_map once
+// cloud_properties.availability_zone was set. The HA keys that used to live in
+// this block are removed (see checkRemovedContextKeys); pve_ha carries them. See coerceOverridePlacement for the whole-block replace semantics.
 //
 // pve_ha is in scope for the same reason, because each cluster can have a
 // different HA setup. It merges key by key instead of replacing the block (see
@@ -1115,6 +1112,9 @@ func ApplyContextOverrides(base *CPIConfig, extra map[string]any) (effective *CP
 		return base, nil, nil, nil
 	}
 	extra = flattenNestedContextOverrides(extra)
+	if err := checkRemovedContextKeys(extra); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := validateStoragePlacementContext(base, base, extra); err != nil {
 		return nil, nil, nil, err
 	}

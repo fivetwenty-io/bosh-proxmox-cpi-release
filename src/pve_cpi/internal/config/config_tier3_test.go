@@ -76,43 +76,31 @@ func TestKeepFailedVMs_JSONRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHANodeAffinityPinEnabled(t *testing.T) {
+func TestHAPinAZStrictValue_DefaultsTrue(t *testing.T) {
 	cfg := &config.CPIConfig{}
-	if cfg.HANodeAffinityPinEnabled() {
-		t.Error("nil Placement must be false")
+	if !cfg.HAPinAZStrictValue() {
+		t.Error("nil HA block must default strict=true")
 	}
-	cfg.Placement = &config.PlacementConfig{PinAZViaHARules: boolPtr(true)}
-	if cfg.HANodeAffinityPinEnabled() {
-		t.Error("pin without az_map must be false (nothing to pin against)")
+	cfg.HA = &config.HAConfig{}
+	if !cfg.HAPinAZStrictValue() {
+		t.Error("nil pin_az_strict must default true (durable AZ guarantee)")
 	}
-	cfg.Placement.AZMap = map[string][]string{"z1": {"pve01"}}
-	if !cfg.HANodeAffinityPinEnabled() {
-		t.Error("pin true + az_map must be enabled")
-	}
-	cfg.Placement.PinAZViaHARules = boolPtr(false)
-	if cfg.HANodeAffinityPinEnabled() {
-		t.Error("explicit false must be disabled")
-	}
-}
-
-func TestPinAZStrict_DefaultsTrue(t *testing.T) {
-	cfg := &config.CPIConfig{}
-	if !cfg.PinAZStrict() {
-		t.Error("nil Placement must default strict=true")
-	}
-	cfg.Placement = &config.PlacementConfig{}
-	if !cfg.PinAZStrict() {
-		t.Error("nil PinAZStrict must default true (durable AZ guarantee)")
-	}
-	cfg.Placement.PinAZStrict = boolPtr(false)
-	if cfg.PinAZStrict() {
+	cfg.HA.PinAZStrict = boolPtr(false)
+	if cfg.HAPinAZStrictValue() {
 		t.Error("explicit false must be non-strict")
 	}
 }
 
+// pinHA returns an ha block that turns the AZ pin on under mode auto.
+func pinHA() *config.HAConfig {
+	mode, pin := config.HAChoice("auto"), config.HAChoice("on")
+	return &config.HAConfig{Mode: &mode, PinAZ: &pin}
+}
+
 func TestValidate_Pin_RequiresAZMap(t *testing.T) {
 	cfg := tier3BaseCfg()
-	cfg.Placement = &config.PlacementConfig{PinAZViaHARules: boolPtr(true)}
+	cfg.HA = pinHA()
+	cfg.Placement = &config.PlacementConfig{}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "az_map") {
 		t.Fatalf("pin without az_map must fail naming az_map; got %v", err)
@@ -121,9 +109,9 @@ func TestValidate_Pin_RequiresAZMap(t *testing.T) {
 
 func TestValidate_Pin_RejectsDLBSentinelAZ(t *testing.T) {
 	cfg := tier3BaseCfg()
+	cfg.HA = pinHA()
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: boolPtr(true),
-		AZMap:           map[string][]string{"dlb": {"pve01"}, "z1": {"pve02"}},
+		AZMap: map[string][]string{"dlb": {"pve01"}, "z1": {"pve02"}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "DLB sentinel") {
@@ -133,12 +121,23 @@ func TestValidate_Pin_RejectsDLBSentinelAZ(t *testing.T) {
 
 func TestValidate_Pin_Valid(t *testing.T) {
 	cfg := tier3BaseCfg()
+	cfg.HA = pinHA()
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: boolPtr(true),
-		AZMap:           map[string][]string{"z1": {"pve01", "pve02"}},
+		AZMap: map[string][]string{"z1": {"pve01", "pve02"}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid pin config must pass; got %v", err)
+	}
+}
+
+// TestValidate_PinAuto_NeedsNoAZMap verifies only an explicit "on" demands an
+// az_map, so the default "auto" cannot break a deployment that has none.
+func TestValidate_PinAuto_NeedsNoAZMap(t *testing.T) {
+	cfg := tier3BaseCfg()
+	mode := config.HAChoice("auto")
+	cfg.HA = &config.HAConfig{Mode: &mode}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("pin_az auto without az_map must pass; got %v", err)
 	}
 }
 

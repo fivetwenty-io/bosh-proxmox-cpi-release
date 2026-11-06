@@ -9,10 +9,12 @@ import (
 )
 
 // haJSON returns a loadable cpi.json whose ha block is the given JSON object.
-// An empty block argument omits the key.
+// An empty block argument omits the key. The placement block gives pin_az "on" the
+// az_map it requires.
 func haJSON(block string) string {
 	base := `{"host":"pve.example.com","user":"root","password":"s3cr3t","vm_storage":"local-lvm",` +
-		`"disk_storage":"local-lvm","stemcell_storage":"local","network_bridge":"vmbr0","node":"pve1"`
+		`"disk_storage":"local-lvm","stemcell_storage":"local","network_bridge":"vmbr0","node":"pve1",` +
+		`"placement":{"az_map":{"z1":["pve1"]}}`
 	if block == "" {
 		return base + "}"
 	}

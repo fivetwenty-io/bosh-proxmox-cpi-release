@@ -122,8 +122,7 @@ func (c diagnosticVMCluster) ListStatus(context.Context) (*cluster.ListStatusRes
 	return &r, nil
 }
 func TestStoragePlanDiagnosticVMImportUsesProductionPlanner(t *testing.T) {
-	no := false
-	cfg := &config.CPIConfig{Node: "n1", EphemeralStorageSet: "E", StoragePlacementNamespace: "namespace", AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport, Placement: &config.PlacementConfig{ExcludeMaintenanceNodes: &no}, StorageSets: map[string]config.StorageSet{"E": {Names: []string{"a", "b"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
+	cfg := &config.CPIConfig{Node: "n1", EphemeralStorageSet: "E", StoragePlacementNamespace: "namespace", AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport, Placement: &config.PlacementConfig{}, StorageSets: map[string]config.StorageSet{"E": {Names: []string{"a", "b"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
 	state := &managedDiskTestState{volumes: map[string]*nodes.GetStorageContentResponse{"a:import/stemcell.qcow2": {Size: sdk.PVEInt(1 << 30), Format: "qcow2"}}}
 	deps := Deps{Config: cfg, PVE: diagnosticVMClient{managedDiskTestPVE{state: state}}, Logger: log.NewNopLogger()}
 	args := []json.RawMessage{json.RawMessage(`"agent"`), json.RawMessage(`":heavy:a:import/stemcell.qcow2"`), json.RawMessage(`{"cpu":1,"ram":1024,"ephemeral_disk_size_mb":1024}`), json.RawMessage(`{}`), json.RawMessage(`[]`), json.RawMessage(`{}`)}

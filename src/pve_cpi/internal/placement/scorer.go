@@ -191,11 +191,6 @@ type Request struct {
 	// Pass nil or an empty map when anti-affinity is not active.
 	AvoidNodes map[string]int
 
-	// ExcludeMaintenanceNodes, when true, causes Filter to hard-reject any node
-	// whose NodeFacts.InMaintenance is true. Zero value (false) preserves legacy
-	// behavior: maintenance nodes pass through Filter unchanged.
-	ExcludeMaintenanceNodes bool
-
 	// RequiredPCIAddresses lists PCI device addresses (e.g. "0000:01:00.0") that
 	// the target node must expose. When non-empty, PCIChecker is called for each
 	// candidate node; nodes that return (false, nil) or (_, non-nil error) are
@@ -267,7 +262,7 @@ func Filter(facts []NodeFacts, req Request) (pass []NodeFacts, rejections map[st
 			continue
 		}
 
-		if req.ExcludeMaintenanceNodes && f.InMaintenance {
+		if f.InMaintenance {
 			rejections[f.Node] = "node in maintenance"
 			continue
 		}

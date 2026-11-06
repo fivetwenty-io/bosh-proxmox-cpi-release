@@ -117,7 +117,7 @@ func TestFilter_MaintenanceNodeExcluded(t *testing.T) {
 		{Node: "pve1", Online: true, InMaintenance: true, TotalMemBytes: 8 * gib, FreeMemBytes: 4 * gib, MaxCPU: 8},
 		{Node: "pve2", Online: true, InMaintenance: false, TotalMemBytes: 8 * gib, FreeMemBytes: 4 * gib, MaxCPU: 8},
 	}
-	req := placement.Request{ExcludeMaintenanceNodes: true}
+	req := placement.Request{}
 	pass, rej := placement.Filter(facts, req)
 	if len(pass) != 1 || pass[0].Node != "pve2" {
 		t.Errorf("expected only pve2 in pass; got %v", nodeNames(pass))
@@ -131,22 +131,6 @@ func TestFilter_MaintenanceNodeExcluded(t *testing.T) {
 	}
 }
 
-func TestFilter_MaintenanceExcludeDisabled(t *testing.T) {
-	t.Parallel()
-	// When ExcludeMaintenanceNodes=false, InMaintenance nodes pass through.
-	facts := []placement.NodeFacts{
-		{Node: "pve1", Online: true, InMaintenance: true, TotalMemBytes: 8 * gib, FreeMemBytes: 4 * gib, MaxCPU: 8},
-	}
-	req := placement.Request{ExcludeMaintenanceNodes: false}
-	pass, rej := placement.Filter(facts, req)
-	if len(pass) != 1 || pass[0].Node != "pve1" {
-		t.Errorf("expected pve1 to pass when ExcludeMaintenanceNodes=false; got %v", nodeNames(pass))
-	}
-	if len(rej) != 0 {
-		t.Errorf("expected no rejections; got %v", rej)
-	}
-}
-
 func TestFilter_OnlineAndMaintenanceBothRejected(t *testing.T) {
 	t.Parallel()
 	// Offline check comes first; InMaintenance is secondary.
@@ -155,7 +139,7 @@ func TestFilter_OnlineAndMaintenanceBothRejected(t *testing.T) {
 		{Node: "online-maint", Online: true, InMaintenance: true, TotalMemBytes: gib, FreeMemBytes: gib, MaxCPU: 4},
 		{Node: "online-clean", Online: true, InMaintenance: false, TotalMemBytes: gib, FreeMemBytes: gib, MaxCPU: 4},
 	}
-	req := placement.Request{ExcludeMaintenanceNodes: true}
+	req := placement.Request{}
 	pass, rej := placement.Filter(facts, req)
 	if len(pass) != 1 || pass[0].Node != "online-clean" {
 		t.Errorf("expected only online-clean; got %v", nodeNames(pass))

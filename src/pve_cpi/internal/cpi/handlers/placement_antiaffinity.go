@@ -49,6 +49,12 @@ const (
 	haRuleAffinity = "negative"
 )
 
+// haRuleStrict is the strict flag sent with every negative rule. It is false
+// because that is what the CPI has always sent: the removed strict key
+// defaulted to false and no value of it changed what a resource-affinity rule
+// does.
+const haRuleStrict = false
+
 // haRuleEntry is the subset of a GET /cluster/ha/rules list entry the CPI reads.
 // Resources is decoded flexibly (see parseHaResources) because PVE may return
 // it as a CSV string, an array, or an object keyed by resource id.
@@ -71,14 +77,14 @@ func haRuleNameFor(groupKey string) string {
 }
 
 // applyAntiAffinityMembership is the create_vm entry point for opt-in HA
-// anti-affinity. It is a no-op unless anti_affinity.use_ha_rules is enabled and
-// the VM carries an instance-group name. Generic HA failures (HA unconfigured,
+// anti-affinity. It is a no-op unless pve.ha.anti_affinity is "on" in a mode
+// that writes HA and the VM carries an instance-group name. Generic HA failures (HA unconfigured,
 // a transient rule-write hiccup) are logged non-fatally, preserving the §7.21
 // best-effort intent; a TypeRetriableCloud error (cluster-lock timeout or
 // read-after-write verify failure) is returned so the director re-drives rather
 // than silently dropping the VM from its spread rule.
 func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
-	if !deps.Config.AntiAffinityUseHaRulesEnabled() {
+	if !deps.Config.HAAntiAffinityRulesEnabled() {
 		return nil
 	}
 	groupKey := sanitizeTagValue(instanceGroupName(env))
@@ -239,11 +245,10 @@ func ensureAntiAffinityMembershipLocked(
 	}
 
 	csv := sidsCSV(members)
-	strict := deps.Config.AntiAffinityStrict()
 
 	// 4a. No rule yet: create it.
 	if existing == nil {
-		if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict); err != nil {
+		if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey); err != nil {
 			return err
 		}
 		return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
@@ -257,7 +262,7 @@ func ensureAntiAffinityMembershipLocked(
 	if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
 		return fmt.Errorf("anti-affinity: delete rule %q for recreate: %w", ruleName, err)
 	}
-	if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey, strict); err != nil {
+	if err := createNegativeRule(ctx, svc, ruleName, csv, groupKey); err != nil {
 		return err
 	}
 	return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
@@ -341,7 +346,7 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 			}
 			continue
 		}
-		if err := createNegativeRule(ctx, svc, r.Rule, sidsCSV(sids), groupKey, deps.Config.AntiAffinityStrict()); err != nil && firstErr == nil {
+		if err := createNegativeRule(ctx, svc, r.Rule, sidsCSV(sids), groupKey); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -357,12 +362,11 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 	return firstErr
 }
 
-// createNegativeRule creates a negative resource-affinity rule. When strict is
-// true PVE enforces hard node-separation for the rule members; when false
-// (the default) the rule is advisory only. See AntiAffinityConfig.Strict for
-// the small-cluster hazard of enabling strict mode.
-func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, groupKey string, strict bool) error {
+// createNegativeRule creates a negative resource-affinity rule that keeps the
+// rule members on different nodes.
+func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, groupKey string) error {
 	affinity := haRuleAffinity
+	strict := haRuleStrict
 	comment := "BOSH anti-affinity for instance group " + groupKey
 	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
 		Rule:      ruleName,

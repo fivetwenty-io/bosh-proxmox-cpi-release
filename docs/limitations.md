@@ -61,7 +61,7 @@ This page collects every known limitation of the CPI in one place. Each entry is
 ## Cluster topology and multi-cluster
 
 - Strict AZ pins can wedge on small node sets
-  With `pin_az_via_ha_rules` and the default strict pin, an AZ mapped to one or two nodes can leave PVE HA with no legal failover target when those nodes are down together. See [HA and Resurrection](ha-and-resurrection.md#the-small-node-set-az-pin-wedge).
+  With `pve.ha.pin_az: on` and the default strict pin, an AZ mapped to one or two nodes can leave PVE HA with no legal failover target when those nodes are down together. See [HA and Resurrection](ha-and-resurrection.md#the-small-node-set-az-pin-wedge).
 
 - DLB placement has hard prerequisites
   DLB registration silently skips VMs on node-local storage or single-node clusters, and the Director itself must never be DLB- or HA-managed. See [HA and Resurrection](ha-and-resurrection.md#dlb-caveats).

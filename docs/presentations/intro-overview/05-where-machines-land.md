@@ -60,7 +60,7 @@ placement:
 - Shared caveat: **one healer at a time** — resurrector off for HA-managed deployments
 
 <!--
-- The CPI places once and exits; PVE HA or a rebalance can silently migrate a VM out of its zone later. pin_az_via_ha_rules records a node-affinity rule so the decision outlives the process.
+- The CPI places once and exits; PVE HA or a rebalance can silently migrate a VM out of its zone later. pve.ha.pin_az records a node-affinity rule so the decision outlives the process.
 - DLB (PVE 9.2+) is the opposite trade: continuous rebalancing instead of a fixed home. Needs shared storage and cluster-wide networking.
 - Foreshadow chapter 9: once PVE may restart/move machines, BOSH's resurrector must stand down for that deployment or the two healers race and produce duplicates.
 -->

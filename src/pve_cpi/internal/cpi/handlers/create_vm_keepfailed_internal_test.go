@@ -273,10 +273,10 @@ func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
 
 func TestCleanupVM_RemovesPinEvenWhenAZPinDisabled(t *testing.T) {
 	// The bosh-na-<vmid> rule has two writers: the AZ pin (gated by
-	// placement.pin_az_via_ha_rules) and the PCI strict pin (written whenever
-	// pci_passthroughs is set, regardless of that flag). Rollback removal is
-	// therefore unconditional — a flag-gated removal would orphan a PCI pin
-	// forever on a default (flag-off) deployment.
+	// pve.ha.pin_az) and the PCI strict pin (written whenever pci_passthroughs
+	// is set and pve.ha.mode is not off). Rollback removal is therefore
+	// unconditional — a flag-gated removal would orphan a pin when the mode is
+	// switched off between create and rollback.
 	cl := newNAStub()
 	cl.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100"}
 	deps := Deps{

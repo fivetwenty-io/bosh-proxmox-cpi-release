@@ -514,10 +514,10 @@ func TestApplyPCIPassthroughWithCleanup_ErrorDestroysCandidate(t *testing.T) {
 func TestCleanupVM_RemovesNodeAffinityPin_WithoutPinFlag(t *testing.T) {
 	t.Parallel()
 
-	// The PCI strict pin is written regardless of placement.pin_az_via_ha_rules,
-	// so rollback must remove the pin unconditionally — a flag-gated removal
-	// would orphan the bosh-na-<vmid> rule forever. nil Config mirrors a
-	// default, flag-off deployment.
+	// The PCI strict pin is written whatever pve.ha.pin_az says, and the mode
+	// can change between create and rollback, so rollback must remove the pin
+	// unconditionally — a flag-gated removal would orphan the bosh-na-<vmid>
+	// rule forever. nil Config mirrors a default deployment.
 	cl := newNAStub()
 	cl.rules["bosh-na-4242"] = sdkcluster.CreateHaRulesParams{Rule: "bosh-na-4242"}
 	cl.resources["vm:4242"] = true

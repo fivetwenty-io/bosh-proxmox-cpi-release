@@ -506,6 +506,84 @@ if [ "$(printf '%s' "$SPEC_HA_DEFAULTS" | sed -n 1p)" != "13" ] || [ -n "$(print
   FAILED=$((FAILED+1))
 fi
 
+# The removed placement properties stay in the spec with no default so that a
+# deployment which sets one is caught. Each one, set to true, false, or a
+# string, makes the render raise with the key and its replacement, and the Go
+# table in removed_keys.go carries the same text.
+echo "Case 13: removed placement properties"
+props_with_placement() {
+  printf '%s' "$(build_props 'secret-pw' '')" | ruby -rjson -e '
+    h = eval(STDIN.read)
+    h["pve"]["placement"] = JSON.parse(ARGV[0])
+    print h.inspect
+  ' "$1"
+}
+assert_render_raises() {
+  local label="$1"; local placement_json="$2"; shift 2
+  local out rc=0
+  out="$(render "$(props_with_placement "$placement_json")" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "FAIL [${label}]: expected the render to raise, it succeeded" >&2
+    FAILED=$((FAILED+1))
+    return
+  fi
+  local needle
+  for needle in "$@"; do
+    if ! printf '%s' "$out" | grep -qF -- "$needle"; then
+      echo "FAIL [${label}]: the error does not contain: ${needle}" >&2
+      echo "       output was: ${out}" >&2
+      FAILED=$((FAILED+1))
+    fi
+  done
+}
+REMOVED_KEYS_TSV="$(cat <<'KEYS'
+{"anti_affinity":{"use_ha_rules":VAL}}|pve.placement.anti_affinity.use_ha_rules|use pve.ha.anti_affinity: on with pve.ha.mode: auto
+{"anti_affinity":{"strict":VAL}}|pve.placement.anti_affinity.strict|delete it; resource-affinity rules are always strict and nothing replaces this key
+{"pin_az_via_ha_rules":VAL}|pve.placement.pin_az_via_ha_rules|use pve.ha.pin_az: on with pve.ha.mode: auto
+{"pin_az_strict":VAL}|pve.placement.pin_az_strict|use pve.ha.pin_az_strict
+{"dlb":{"enabled":VAL}}|pve.placement.dlb.enabled|use pve.ha.dlb.enabled with pve.ha.mode: auto
+{"dlb":{"az_name":VAL}}|pve.placement.dlb.az_name|use pve.ha.dlb.az_name
+{"dlb":{"manage_cluster_crs":VAL}}|pve.placement.dlb.manage_cluster_crs|delete it; the CPI no longer writes the cluster CRS mode, so set the CRS mode in PVE
+{"dlb":{"require_shared_storage":VAL}}|pve.placement.dlb.require_shared_storage|delete it; a VM with a node-local volume is never registered for DLB
+{"exclude_maintenance_nodes":VAL}|pve.placement.exclude_maintenance_nodes|delete it; the node health check always runs
+KEYS
+)"
+while IFS='|' read -r shape name replacement; do
+  for val in true false '"yes"'; do
+    assert_render_raises "case13-${name}-${val}" "${shape//VAL/$val}" "$name" "$replacement"
+  done
+done <<< "$REMOVED_KEYS_TSV"
+# Several keys at once produce one error that names all of them.
+assert_render_raises "case13-several" \
+  '{"exclude_maintenance_nodes":false,"pin_az_via_ha_rules":true,"dlb":{"enabled":true,"manage_cluster_crs":false}}' \
+  "pve.placement.exclude_maintenance_nodes" "pve.placement.pin_az_via_ha_rules" \
+  "pve.placement.dlb.enabled" "pve.placement.dlb.manage_cluster_crs"
+# None of the removed keys set: placement still renders its supported keys, and
+# the removed keys never appear in the output.
+JSON_13="$(render "$(props_with_placement '{"anti_affinity":{"enabled":true},"az_map":{"z1":["pve1"]}}')")"
+assert_json_valid "case13-clean" "$JSON_13" || FAILED=$((FAILED+1))
+if [ "$(printf '%s' "$JSON_13" | ruby -rjson -e 'print JSON.generate(JSON.parse(STDIN.read).fetch("placement"))')" != '{"az_map":{"z1":["pve1"]},"anti_affinity":{"enabled":true}}' ]; then
+  echo "FAIL [case13-clean]: placement block is not the supported keys only" >&2
+  FAILED=$((FAILED+1))
+fi
+assert_json_lacks_key "case13-unset" "$JSON_1" placement || FAILED=$((FAILED+1))
+# The spec keeps all nine with no default and a REMOVED description, and the
+# pve.ha count stays 13.
+SPEC_REMOVED="$(ruby -ryaml -e '
+  spec = YAML.load_file(ARGV[0])
+  names = %w[pve.placement.anti_affinity.use_ha_rules pve.placement.anti_affinity.strict
+    pve.placement.pin_az_via_ha_rules pve.placement.pin_az_strict pve.placement.dlb.enabled
+    pve.placement.dlb.az_name pve.placement.dlb.manage_cluster_crs
+    pve.placement.dlb.require_shared_storage pve.placement.exclude_maintenance_nodes]
+  props = spec.fetch("properties")
+  bad = names.reject { |n| props.key?(n) && !props[n].key?("default") && props[n]["description"].to_s.include?("REMOVED") }
+  print bad.join(",")
+' "${REPO_ROOT}/jobs/pve_cpi/spec")"
+if [ -n "$SPEC_REMOVED" ]; then
+  echo "FAIL [case13-spec]: removed keys missing, carrying a default, or not marked REMOVED: ${SPEC_REMOVED}" >&2
+  FAILED=$((FAILED+1))
+fi
+
 if [ "$FAILED" -ne 0 ]; then
   echo "RESULT: ${FAILED} assertion(s) FAILED" >&2
   exit 1

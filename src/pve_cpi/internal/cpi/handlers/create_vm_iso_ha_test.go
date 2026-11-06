@@ -86,9 +86,8 @@ func TestHARegistrationFeatures_NoneActive_Empty(t *testing.T) {
 }
 
 func TestHARegistrationFeatures_DLBEligible(t *testing.T) {
-	enabled := true
 	cfg := isoHABaseConfig("local")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	deps := Deps{Config: cfg}
 	cp := createVMCloudProps{AvailabilityZone: ""}
 	got := haRegistrationFeatures(deps, cp, "pve01", nil)
@@ -101,8 +100,9 @@ func TestHARegistrationFeatures_AntiAffinity(t *testing.T) {
 	trueVal := true
 	cfg := isoHABaseConfig("local")
 	cfg.Placement = &config.PlacementConfig{
-		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal, UseHaRules: &trueVal},
+		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal},
 	}
+	cfg.HA = haAntiAffinityOn()
 	deps := Deps{Config: cfg}
 	cp := createVMCloudProps{}
 	env := isoHAGroupEnv("web")
@@ -116,8 +116,9 @@ func TestHARegistrationFeatures_AntiAffinity_NoGroupName_Inactive(t *testing.T) 
 	trueVal := true
 	cfg := isoHABaseConfig("local")
 	cfg.Placement = &config.PlacementConfig{
-		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal, UseHaRules: &trueVal},
+		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal},
 	}
+	cfg.HA = haAntiAffinityOn()
 	deps := Deps{Config: cfg}
 	cp := createVMCloudProps{}
 	// No env.bosh.instance.name and no env.bosh.group -> instanceGroupName == "".
@@ -128,12 +129,11 @@ func TestHARegistrationFeatures_AntiAffinity_NoGroupName_Inactive(t *testing.T) 
 }
 
 func TestHARegistrationFeatures_AZPin(t *testing.T) {
-	trueVal := true
 	cfg := isoHABaseConfig("local")
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: &trueVal,
-		AZMap:           map[string][]string{"z1": {"pve01"}},
+		AZMap: map[string][]string{"z1": {"pve01"}},
 	}
+	cfg.HA = haPinOn(nil)
 	deps := Deps{Config: cfg}
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 	got := haRegistrationFeatures(deps, cp, "pve01", nil)
@@ -143,12 +143,11 @@ func TestHARegistrationFeatures_AZPin(t *testing.T) {
 }
 
 func TestHARegistrationFeatures_AZPin_NodeNotInAZ_Inactive(t *testing.T) {
-	trueVal := true
 	cfg := isoHABaseConfig("local")
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: &trueVal,
-		AZMap:           map[string][]string{"z1": {"pve01"}},
+		AZMap: map[string][]string{"z1": {"pve01"}},
 	}
+	cfg.HA = haPinOn(nil)
 	deps := Deps{Config: cfg}
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 	// Placed node "pve02" is not in z1's candidate set -> pinAZForNode returns "".
@@ -169,9 +168,8 @@ func TestCheckISOStorageForHA_NoFeatureActive_NoPVECallsNoError(t *testing.T) {
 }
 
 func TestCheckISOStorageForHA_DLBActive_LocalISO_WarnOnly(t *testing.T) {
-	enabled := true
 	cfg := isoHABaseConfig("local")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
@@ -187,9 +185,8 @@ func TestCheckISOStorageForHA_DLBActive_LocalISO_WarnOnly(t *testing.T) {
 }
 
 func TestCheckISOStorageForHA_DLBActive_SharedISO_NoWarnNoError(t *testing.T) {
-	enabled := true
 	cfg := isoHABaseConfig("vm-storage")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
@@ -201,9 +198,8 @@ func TestCheckISOStorageForHA_DLBActive_SharedISO_NoWarnNoError(t *testing.T) {
 }
 
 func TestCheckISOStorageForHA_UndeterminableSharedNess_FailsOpen(t *testing.T) {
-	enabled := true
 	cfg := isoHABaseConfig("does-not-exist")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	// dlbStorageStub's single entry is named "vm-storage"; "does-not-exist"
 	// is absent from the index, so dlbStorageIsShared returns a lookup error.
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
@@ -217,10 +213,9 @@ func TestCheckISOStorageForHA_UndeterminableSharedNess_FailsOpen(t *testing.T) {
 }
 
 func TestCheckISOStorageForHA_RequireSharedISOForHA_EscalatesToCloudError(t *testing.T) {
-	enabled := true
 	requireShared := true
 	cfg := isoHABaseConfig("vm-storage")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	cfg.RequireSharedISOForHA = &requireShared
 	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
@@ -246,8 +241,9 @@ func TestCheckISOStorageForHA_AntiAffinityActive_LocalISO_WarnOnly(t *testing.T)
 	trueVal := true
 	cfg := isoHABaseConfig("vm-storage")
 	cfg.Placement = &config.PlacementConfig{
-		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal, UseHaRules: &trueVal},
+		AntiAffinity: &config.AntiAffinityConfig{Enabled: &trueVal},
 	}
+	cfg.HA = haAntiAffinityOn()
 	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
@@ -371,9 +367,8 @@ func TestWarnHAResurrectorConflictOnce_FiresOncePerProcess(t *testing.T) {
 
 func TestCheckISOStorageForHA_DLBActive_SharedISO_StillWarnsHAResurrector(t *testing.T) {
 	resetHAResurrectorWarnOnce(t)
-	enabled := true
 	cfg := isoHABaseConfig("vm-storage")
-	cfg.Placement = &config.PlacementConfig{DLB: &config.DLBConfig{Enabled: &enabled}}
+	cfg.HA = haDLBEnabled()
 	storageSvc := &dlbStorageStub{storageType: "nfs", shared: true}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{}
@@ -410,12 +405,11 @@ func TestCheckISOStorageForHA_NoFeatureActive_NoHAResurrectorWarn(t *testing.T) 
 }
 
 func TestCheckISOStorageForHA_AZPinActive_LocalISO_WarnOnly(t *testing.T) {
-	trueVal := true
 	cfg := isoHABaseConfig("vm-storage")
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: &trueVal,
-		AZMap:           map[string][]string{"z1": {"pve01"}},
+		AZMap: map[string][]string{"z1": {"pve01"}},
 	}
+	cfg.HA = haPinOn(nil)
 	storageSvc := &dlbStorageStub{storageType: "dir", shared: false}
 	deps := dlbDeps(nil, nil, storageSvc, cfg)
 	cp := createVMCloudProps{AvailabilityZone: "z1"}

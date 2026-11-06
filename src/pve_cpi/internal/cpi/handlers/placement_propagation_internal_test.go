@@ -30,7 +30,7 @@ func aaEnvForGroup(group string) map[string]any {
 	}
 }
 
-// aaMembershipConfig extends aaLockConfig by enabling anti_affinity + use_ha_rules
+// aaMembershipConfig extends aaLockConfig by enabling anti_affinity + pve.ha.anti_affinity on
 // so the REAL applyAntiAffinityMembership entry gate opens (aaLockConfig alone
 // leaves it disabled, which is why the ensure-level tests bypass the gate).
 func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPIConfig {
@@ -39,7 +39,8 @@ func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPICon
 	if c.Placement == nil {
 		c.Placement = &config.PlacementConfig{}
 	}
-	c.Placement.AntiAffinity = &config.AntiAffinityConfig{Enabled: &on, UseHaRules: &on}
+	c.Placement.AntiAffinity = &config.AntiAffinityConfig{Enabled: &on}
+	c.HA = haAntiAffinityOn()
 	return c
 }
 
@@ -123,11 +124,11 @@ func naVerifyDeps(stub *aaClusterStub, verifyOn bool) Deps {
 	cfg := icMinConfig()
 	cfg.AntiAffinityVerify = &v
 	cfg.Placement = &config.PlacementConfig{
-		PinAZViaHARules: &pinEnabled,
 		AZMap: map[string][]string{
 			"z1": {"pve-node1"},
 		},
 	}
+	cfg.HA = haPinOn(&pinEnabled)
 	return aaDepsLock(cfg, stub, newAALockPools(nil))
 }
 
