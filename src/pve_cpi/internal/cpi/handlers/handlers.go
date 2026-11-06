@@ -6,6 +6,7 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/agent"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/cpi"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	stemcellfetch "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve/stemcell_fetch"
@@ -101,6 +102,10 @@ type Deps struct {
 	// owner. Audit-gated refusals end with it. Empty (the CLI and every
 	// test Deps literal) makes them name the command generically instead.
 	StorageAuditCommand string
+	// HAProfile supplies the HA cluster profile the HA rule writers check for
+	// the PVE 9 floor before they write. Nil (production and every existing
+	// test literal) makes the writer probe the cluster itself.
+	HAProfile func(ctx context.Context) (*ha.Profile, error)
 }
 
 // EffectiveISOStorage returns the pool config-drive ISOs live on for this

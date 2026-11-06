@@ -113,6 +113,13 @@ func buildVMShapeForNode(ctx context.Context, deps Deps, parsed *createVMParsedA
 	// with the VM on create rollback.
 	advrtTags := advertisedRouteTags(cp.AdvertisedRoutes)
 	baseRetainTags = append(baseRetainTags, advrtTags...)
+	// The instance group's member tag, bosh-aa-<hash12>, is written once here so
+	// the scorer and the anti-affinity rule can find the group's guests. It
+	// sits behind the advertised-route provenance for the same reason the
+	// stemcell tag does, and in front of it.
+	if tag := antiAffinityGroupTag(deps, parsed.env); tag != "" {
+		baseRetainTags = append(baseRetainTags, tag)
+	}
 	// The stemcell tag goes last, behind the advertised-route provenance in
 	// baseRetainTags. mergeTagList truncates from the tail, and an evicted
 	// advrt- tag is an SDN subnet delete_vm can no longer withdraw, while an

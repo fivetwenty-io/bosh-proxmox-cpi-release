@@ -961,6 +961,13 @@ func (m *mockSDNCluster) ListStatus(ctx context.Context) (*cluster.ListStatusRes
 func (m *mockSDNCluster) DeleteHaRules(_ context.Context, _ string) error {
 	return fmt.Errorf("no such rule (mock)")
 }
+
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (m *mockSDNCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource")
+}
+
 func (m *mockSDNCluster) DeleteHaResources(_ context.Context, _ string, _ *cluster.DeleteHaResourcesParams) error {
 	return fmt.Errorf("does not exist (mock)")
 }

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,6 +45,12 @@ type retainRerunCluster struct{ cluster.Service }
 
 func (retainRerunCluster) DeleteHaRules(context.Context, string) error {
 	return &sdkerrors.APIError{HTTPCode: 404}
+}
+
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (retainRerunCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource")
 }
 
 func (retainRerunCluster) DeleteHaResources(context.Context, string, *cluster.DeleteHaResourcesParams) error {

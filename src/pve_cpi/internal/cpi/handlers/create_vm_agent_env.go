@@ -256,19 +256,21 @@ func instanceGroupName(env map[string]any) string {
 }
 
 // antiAffinityGroupTag returns the PVE tag that marks membership in the VM's
-// BOSH instance group, formed to match the tag scheme set_vm_metadata stamps
-// ("job--<sanitized>"). It returns "" — disabling scheduler-soft spreading for
-// this create — when anti-affinity is not enabled or the instance group cannot
-// be derived from env.
-func antiAffinityGroupTag(cfg *config.CPIConfig, env map[string]any) string {
-	if !cfg.AntiAffinityEnabled() {
+// BOSH instance group, bosh-aa-<hash12>, the same string that names the group's
+// HA rule. The hash covers the Director UUID, the deployment, and the group, so
+// two deployments or two Directors with a group of the same name never share
+// it. It returns "" — disabling scheduler-soft spreading for this create —
+// when anti-affinity is not enabled, the request carries no director_uuid, or
+// the instance group cannot be derived from env.
+func antiAffinityGroupTag(deps Deps, env map[string]any) string {
+	if !deps.Config.AntiAffinityEnabled() {
 		return ""
 	}
-	group := sanitizeTagValue(instanceGroupName(env))
-	if group == "" {
+	ident := haIdentityFor(deps, env)
+	if !ident.valid() {
 		return ""
 	}
-	return "job--" + group
+	return ident.ruleName()
 }
 
 // --------------------------------------------------------------------------

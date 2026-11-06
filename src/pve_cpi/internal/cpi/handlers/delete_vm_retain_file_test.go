@@ -146,6 +146,13 @@ func (c legacyDestroyPVE) Cluster() cluster.Service {
 type legacyDestroyCluster struct{ cluster.Service }
 
 func (legacyDestroyCluster) DeleteHaRules(context.Context, string) error { return nil }
+
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (legacyDestroyCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource")
+}
+
 func (legacyDestroyCluster) DeleteHaResources(context.Context, string, *cluster.DeleteHaResourcesParams) error {
 	return nil
 }

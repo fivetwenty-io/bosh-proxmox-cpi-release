@@ -156,9 +156,19 @@ func ensureNodeAffinityPin(
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
 	ruleName := naRuleNameFor(vmid)
+	ident := haIdentity{Owner: deps.RequestDirectorUUID}
+	if ident.Owner == "" {
+		// A pin the CPI cannot mark as its own is one it could never edit or
+		// clean up safely, so a request without a director_uuid writes none.
+		return fmt.Errorf("node-affinity: the request carries no director_uuid to mark rule %q with", ruleName)
+	}
+	if err := haRuleWriteGate(ctx, deps); err != nil {
+		return fmt.Errorf("node-affinity: %w", err)
+	}
+	marker := ident.marker()
 
 	// Register the VM as an HA resource (idempotent; "already defined" is fine).
-	if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid}); err != nil {
+	if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
 		if !isHaAlreadyExists(err) {
 			logger.Warn("node-affinity: register HA resource failed (continuing best-effort)",
 				log.String("sid", sid), log.Err(err))
@@ -172,11 +182,18 @@ func ensureNodeAffinityPin(
 		return fmt.Errorf("node-affinity: list HA rules: %w", listErr)
 	}
 	if existing != nil {
+		// An unmarked pin is ours to refresh, because bosh-na-<vmid> is unique per
+		// cluster and gains its marker here. A pin that names another Director is
+		// not.
+		if haOwnershipOf(existing.Comment, ident.Owner) == haOwnedByOther {
+			return fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; leaving it alone",
+				ruleName)
+		}
 		if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
 			return fmt.Errorf("node-affinity: delete rule %q for refresh: %w", ruleName, err)
 		}
 	}
-	if err := createNodeAffinityRule(ctx, svc, ruleName, sid, nodesCSV, strict); err != nil {
+	if err := createNodeAffinityRule(ctx, svc, ruleName, sid, nodesCSV, marker, strict); err != nil {
 		return err
 	}
 
@@ -201,29 +218,34 @@ func removeNodeAffinityPin(ctx context.Context, deps Deps, vmid int, logger *log
 	sid := haResourceSid(vmid)
 
 	var firstErr error
-	if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
-		firstErr = fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
+	existing, listErr := findHaRule(ctx, svc, ruleName)
+	switch {
+	case listErr != nil:
+		firstErr = fmt.Errorf("node-affinity: list HA rules for cleanup: %w", listErr)
+	case existing == nil:
+	case haOwnershipOf(existing.Comment, deps.RequestDirectorUUID) == haOwnedByOther:
+		logger.Debug("node-affinity: rule belongs to another Director; leaving it", log.String("rule", ruleName))
+	default:
+		if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
+			firstErr = fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
+		}
 	}
 
 	// Deregister the HA resource (purge removes it from any remaining rules).
 	// Not-found is a no-op — anti-affinity cleanup may have purged it already.
-	purge := true
-	if err := svc.DeleteHaResources(ctx, sid, &cluster.DeleteHaResourcesParams{Purge: &purge}); err != nil {
-		if !isHaNotFound(err) {
-			logger.Debug("node-affinity: deregister HA resource (non-fatal)",
-				log.String("sid", sid), log.Err(err))
-		}
-	}
+	deregisterHaResource(ctx, svc, sid, deps.RequestDirectorUUID, logger)
 	return firstErr
 }
 
 // createNodeAffinityRule creates a node-affinity rule pinning sid to nodesCSV.
 // When strict is true PVE will not relocate the resource off the node set even
 // on total node-set failure (hard AZ guarantee); when false the pin is
-// preferred (HA may relocate off-set on failure).
-func createNodeAffinityRule(ctx context.Context, svc cluster.Service, ruleName, sid, nodesCSV string, strict bool) error {
+// preferred (HA may relocate off-set on failure). comment is the ownership
+// marker.
+func createNodeAffinityRule(
+	ctx context.Context, svc cluster.Service, ruleName, sid, nodesCSV, comment string, strict bool,
+) error {
 	nodes := nodesCSV
-	comment := "BOSH AZ node-affinity pin for " + sid
 	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
 		Rule:      ruleName,
 		Type:      naRuleType,

@@ -87,7 +87,9 @@ func aaLockConfig(mode string, verify bool, timeoutSec int) *config.CPIConfig {
 // onto a single fake client, with the given config.
 func aaDepsLock(cfg *config.CPIConfig, stub *aaClusterStub, pools *aaLockPools) Deps {
 	return Deps{
-		Config: cfg,
+		Config:              cfg,
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
 		PVE: &icPVEClient{
 			clusterSvc: stub,
 			poolsSvc:   pools,
@@ -108,11 +110,11 @@ func TestEnsureAntiAffinity_LockOffVerifyOff_NoPoolCalls(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("off", false, 0)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, ev := range events {
@@ -120,7 +122,7 @@ func TestEnsureAntiAffinity_LockOffVerifyOff_NoPoolCalls(t *testing.T) {
 			t.Fatalf("mode=off must issue zero pool/lock calls; saw %q in %v", ev, events)
 		}
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
 		t.Errorf("rule resources = %q; want vm:100,vm:101", got)
 	}
 }
@@ -133,25 +135,25 @@ func TestEnsureAntiAffinity_LockPool_AcquireBeforeReadReleaseAfter(t *testing.T)
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("pool", false, 30)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// First event must be the lock acquire; last must be the lock release.
-	if len(events) == 0 || events[0] != "lock-create:bosh-lock-aa-web" {
+	if len(events) == 0 || events[0] != "lock-create:"+aaLock {
 		t.Fatalf("first op must be lock acquire; got %v", events)
 	}
-	if events[len(events)-1] != "lock-delete:bosh-lock-aa-web" {
+	if events[len(events)-1] != "lock-delete:"+aaLock {
 		t.Fatalf("last op must be lock release; got %v", events)
 	}
 	// Acquire precedes the first cluster read (list-resources / list-rules).
 	acquireIdx, firstReadIdx := -1, -1
 	for i, ev := range events {
-		if ev == "lock-create:bosh-lock-aa-web" && acquireIdx == -1 {
+		if ev == "lock-create:"+aaLock && acquireIdx == -1 {
 			acquireIdx = i
 		}
 		if (ev == "list-resources" || ev == "list-rules") && firstReadIdx == -1 {
@@ -172,13 +174,13 @@ func TestEnsureAntiAffinity_LockPool_TakesTheGrace(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 	started := time.Now()
-	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(aaLockConfig("pool", false, 30), stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(aaLockConfig("pool", false, 30), stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"lock-create:bosh-lock-aa-web", "lock-get:bosh-lock-aa-web", "lock-get:bosh-lock-aa-web"}
+	want := []string{"lock-create:" + aaLock, "lock-get:" + aaLock, "lock-get:" + aaLock}
 	if len(events) <= len(want) || strings.Join(events[:len(want)], ",") != strings.Join(want, ",") || strings.HasPrefix(events[len(want)], "lock-") {
 		t.Fatalf("the acquire must confirm its claim twice before the RMW; events %v", events)
 	}
@@ -205,7 +207,7 @@ func TestEnsureAntiAffinity_LockPool_AcquireFailsRetriableNoRMW(t *testing.T) {
 	pools.createErr = func(_ string) error { return fmt.Errorf("pmxcfs unavailable") }
 
 	cfg := aaLockConfig("pool", false, 1)
-	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger())
+	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected retriable error when the lock cannot be acquired")
 	}
@@ -226,22 +228,22 @@ func TestEnsureAntiAffinity_LockPool_HeldExpiredSteals(t *testing.T) {
 	events := []string{}
 	stub := newAAStub()
 	stub.events = &events
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 	// Held by a dead owner: expiry of 1 (epoch) is always in the past.
-	pools.pools["bosh-lock-aa-web"] = encodeAALockComment("dead", 1)
+	pools.pools[aaLock] = encodeAALockComment("dead", 1)
 
 	cfg := aaLockConfig("pool", false, 30)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("steal acquire failed: %v", err)
 	}
 	// The steal must have happened: a lock-delete then a second lock-create before
 	// any RMW read.
 	joined := strings.Join(events, ",")
-	if !strings.Contains(joined, "lock-get:bosh-lock-aa-web,lock-delete:bosh-lock-aa-web,lock-create:bosh-lock-aa-web") {
+	if !strings.Contains(joined, "lock-get:"+aaLock+",lock-delete:"+aaLock+",lock-create:"+aaLock) {
 		t.Errorf("expected steal sequence get->delete->create; events=%v", events)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
 		t.Errorf("RMW should still produce the rule after steal; got %q", got)
 	}
 }
@@ -255,19 +257,19 @@ func TestEnsureAntiAffinity_LockPool_ReleaseOnRMWError(t *testing.T) {
 	stub := newAAStub()
 	stub.events = &events
 	stub.failListRules = true // RMW fails at the ListHaRules step
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	pools := newAALockPools(&events)
 
 	cfg := aaLockConfig("pool", false, 30)
-	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger())
+	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected the RMW error to propagate")
 	}
 	// The lock must have been released despite the error.
-	if events[len(events)-1] != "lock-delete:bosh-lock-aa-web" {
+	if events[len(events)-1] != "lock-delete:"+aaLock {
 		t.Errorf("lock must be released on RMW error; last event=%q events=%v", events[len(events)-1], events)
 	}
-	if _, held := pools.pools["bosh-lock-aa-web"]; held {
+	if _, held := pools.pools[aaLock]; held {
 		t.Error("sentinel pool should be gone after deferred release")
 	}
 }
@@ -278,22 +280,22 @@ func TestEnsureAntiAffinity_LockPool_ReleaseOnRMWError(t *testing.T) {
 
 func TestEnsureAntiAffinity_VerifyOn_MemberPresentOK(t *testing.T) {
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	cfg := aaLockConfig("off", true, 0)
 	pools := newAALockPools(nil)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("verify should pass when member present: %v", err)
 	}
 }
 
 func TestEnsureAntiAffinity_VerifyOn_MemberAbsentRetriable(t *testing.T) {
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	// Simulate a concurrent writer dropping the new member from the recreated rule.
 	stub.dropMemberOnRecreate = "vm:101"
 	cfg := aaLockConfig("off", true, 0)
 	pools := newAALockPools(nil)
-	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), "web", 101, log.NewNopLogger())
+	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected a retriable error when the verify member is absent")
 	}
@@ -349,13 +351,13 @@ func TestAntiAffinityLockTTLHasAFloor(t *testing.T) {
 			pools := newAALockPools(nil)
 			deps := aaDepsLock(aaLockConfig("pool", false, tc.sec), newAAStub(), pools)
 			before := time.Now()
-			handle, err := acquireAntiAffinityLock(t.Context(), deps, "web", 101)
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, aaIdent("web").hash(), 101)
 			after := time.Now()
 			if err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
 			t.Cleanup(func() { _ = handle.Release(context.Background()) })
-			exp := aaLockClaimExpiry(t, pools.pools["bosh-lock-aa-web"])
+			exp := aaLockClaimExpiry(t, pools.pools[aaLock])
 			if earliest, latest := before.Add(tc.ttl).Unix(), after.Add(tc.ttl).Unix(); exp < earliest || exp > latest {
 				t.Fatalf("the claim expires %ds after the acquire started, want a TTL of %v", exp-before.Unix(), tc.ttl)
 			}
@@ -388,7 +390,7 @@ func TestAntiAffinityLockOutlastsTheGraceAtShortTimeouts(t *testing.T) {
 		t.Run(fmt.Sprintf("cluster_lock_timeout_sec=%d", sec), func(t *testing.T) {
 			pools := newAALockPools(nil)
 			deps := aaDepsLock(aaLockConfig("pool", false, sec), newAAStub(), pools)
-			handle, err := acquireAntiAffinityLock(t.Context(), deps, "web", 101)
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, aaIdent("web").hash(), 101)
 			if err != nil {
 				t.Fatalf("first acquire: %v", err)
 			}

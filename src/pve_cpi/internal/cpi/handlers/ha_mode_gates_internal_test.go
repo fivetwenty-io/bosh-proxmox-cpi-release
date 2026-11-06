@@ -165,7 +165,8 @@ func TestApplyAZNodeAffinityPin_AutoAlone_WritesNothing(t *testing.T) {
 			stub := newNAStub()
 			cfg := naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}})
 			cfg.HA = tc.ha
-			deps := Deps{Config: cfg, PVE: &icPVEClient{clusterSvc: stub}, Agent: &icAgentStub{}, Logger: log.NewNopLogger()}
+			deps := Deps{Config: cfg, PVE: &icPVEClient{clusterSvc: stub}, Agent: &icAgentStub{}, Logger: log.NewNopLogger(),
+				RequestDirectorUUID: aaDirector, HAProfile: pve9Profile}
 			if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
 				createVMCloudProps{AvailabilityZone: "z1"}, "pve01", log.NewNopLogger()); err != nil {
 				t.Fatalf("unexpected error: %v", err)

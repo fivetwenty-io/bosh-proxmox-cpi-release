@@ -49,7 +49,7 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 		}
 		pin = constraints.requiredLocalNode
 	}
-	groupTag := antiAffinityGroupTag(cfg, parsed.env)
+	groupTag := antiAffinityGroupTag(deps, parsed.env)
 	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{StorageName: "", GroupTag: groupTag, MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue()})
 	if err != nil {
 		return nil, planError(StoragePlanObservation, "compute facts: %v", err)

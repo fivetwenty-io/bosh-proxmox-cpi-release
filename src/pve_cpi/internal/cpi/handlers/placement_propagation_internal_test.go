@@ -16,16 +16,16 @@ import (
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
-// aaEnvForGroup builds a BOSH env whose instanceGroupName resolves to group:
+// aaEnvForWebGroup builds a BOSH env whose instanceGroupName resolves to group:
 // the full group ("d-<group>") plus a groups list from which the shortest
 // "-<group>" suffix is selected. This drives the REAL applyAntiAffinityMembership
 // through its group-derivation path rather than calling ensureAntiAffinityMembership
 // with a pre-baked key.
-func aaEnvForGroup(group string) map[string]any {
+func aaEnvForWebGroup() map[string]any {
 	return map[string]any{
 		"bosh": map[string]any{
-			"group":  "d-" + group,
-			"groups": []any{"d", group, "d-" + group},
+			"group":  "director-d-web",
+			"groups": []any{"director", "d", "web", "director-d", "director-d-web"},
 		},
 	}
 }
@@ -56,7 +56,7 @@ func aaMembershipConfig(mode string, verify bool, timeoutSec int) *config.CPICon
 func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	events := []string{}
 	lockPools := newAALockPools(&events)
 	// A non-duplicate create failure (transport/pmxcfs fault) is classified
@@ -65,7 +65,7 @@ func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) 
 
 	cfg := aaMembershipConfig("pool", false, 1)
 	deps := aaDepsLock(cfg, stub, lockPools)
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForGroup("web"), log.NewNopLogger())
+	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err == nil {
 		t.Fatal("applyAntiAffinityMembership must propagate the lock-acquire retriable to the director")
 	}
@@ -81,12 +81,12 @@ func TestApplyAntiAffinityMembership_RetriableLockLost_Propagates(t *testing.T) 
 func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	stub.dropMemberOnRecreate = "vm:101" // concurrent drop → verify sees member absent
 
 	cfg := aaMembershipConfig("off", true, 0) // verify on, lock off
 	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForGroup("web"), log.NewNopLogger())
+	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err == nil {
 		t.Fatal("applyAntiAffinityMembership must propagate the verify-absent retriable to the director")
 	}
@@ -101,12 +101,12 @@ func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 func TestApplyAntiAffinityMembership_GenericFail_Swallowed(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 	stub.failListRules = true // generic HA blip, non-retriable
 
 	cfg := aaMembershipConfig("off", false, 0)
 	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
-	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForGroup("web"), log.NewNopLogger())
+	err := applyAntiAffinityMembership(context.Background(), deps, 101, aaEnvForWebGroup(), log.NewNopLogger())
 	if err != nil {
 		t.Fatalf("generic HA failure must be swallowed by applyAntiAffinityMembership; got %v", err)
 	}

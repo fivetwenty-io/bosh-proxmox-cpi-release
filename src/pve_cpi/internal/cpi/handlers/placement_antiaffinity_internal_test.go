@@ -19,6 +19,8 @@ type aaClusterStub struct {
 	cluster.Service
 	resources       map[string]bool   // sid -> registered
 	rules           map[string]string // ruleName -> resources CSV
+	ruleComments    map[string]string // ruleName -> comment
+	resComments     map[string]string // sid -> comment
 	listResourcesFn func() *cluster.ListResourcesResponse
 	createRuleCalls int
 	deleteRuleCalls int
@@ -47,7 +49,22 @@ func (s *aaClusterStub) record(ev string) {
 var _ cluster.Service = (*aaClusterStub)(nil)
 
 func newAAStub() *aaClusterStub {
-	return &aaClusterStub{resources: map[string]bool{}, rules: map[string]string{}}
+	return &aaClusterStub{
+		resources: map[string]bool{}, rules: map[string]string{},
+		ruleComments: map[string]string{}, resComments: map[string]string{},
+	}
+}
+
+// seedRule stores a rule owned by the test Director, the way the CPI writes it.
+func (s *aaClusterStub) seedRule(name, csv string) {
+	s.seedRuleWithComment(name, csv, aaIdent("web").marker())
+}
+
+// seedRuleWithComment stores a rule with an exact comment, such as an old
+// CPI's unmarked one or another Director's marker.
+func (s *aaClusterStub) seedRuleWithComment(name, csv, comment string) {
+	s.rules[name] = csv
+	s.ruleComments[name] = comment
 }
 
 func (s *aaClusterStub) ListResources(_ context.Context, _ *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
@@ -77,7 +94,21 @@ func (s *aaClusterStub) ListConfigNodes(_ context.Context) (*cluster.ListConfigN
 
 func (s *aaClusterStub) CreateHaResources(_ context.Context, p *cluster.CreateHaResourcesParams) error {
 	s.resources[p.Sid] = true
+	if p.Comment != nil {
+		s.resComments[p.Sid] = *p.Comment
+	}
 	return nil
+}
+
+func (s *aaClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if !s.resources[sid] {
+		return nil, fmt.Errorf("no such resource")
+	}
+	resp := &cluster.GetHaResourcesResponse{}
+	if c, ok := s.resComments[sid]; ok {
+		resp.Comment = &c
+	}
+	return resp, nil
 }
 
 func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
@@ -97,6 +128,7 @@ func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPar
 			"type":      haRuleType,
 			"affinity":  haRuleAffinity,
 			"resources": csv,
+			"comment":   s.ruleComments[name],
 		})
 		out = append(out, raw)
 	}
@@ -116,6 +148,9 @@ func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRule
 		s.dropMemberOnRecreate = ""
 	}
 	s.rules[p.Rule] = resources
+	if p.Comment != nil {
+		s.ruleComments[p.Rule] = *p.Comment
+	}
 	return nil
 }
 
@@ -123,6 +158,7 @@ func (s *aaClusterStub) DeleteHaRules(_ context.Context, rule string) error {
 	s.record("delete-rule:" + rule)
 	s.deleteRuleCalls++
 	delete(s.rules, rule)
+	delete(s.ruleComments, rule)
 	return nil
 }
 
@@ -152,7 +188,9 @@ func aaResourcesFn(entries ...json.RawMessage) func() *cluster.ListResourcesResp
 
 func aaDeps(stub *aaClusterStub) Deps {
 	return Deps{
-		Config: icMinConfig(),
+		Config:              icMinConfig(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
 		PVE: &icPVEClient{
 			clusterSvc: stub,
 			nodesSvc: &icNodesService{listFn: func(ctx context.Context, p *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error) {
@@ -171,12 +209,12 @@ func aaDeps(stub *aaClusterStub) Deps {
 func TestEnsureAntiAffinity_CreatesRuleWithTwoMembers(t *testing.T) {
 	stub := newAAStub()
 	// One existing same-group member already on the cluster.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "deployment--cf;job--web;index--0"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag+";index--0"))
 
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
 		t.Errorf("rule resources = %q; want %q", got, "vm:100,vm:101")
 	}
 	if !stub.resources["vm:101"] {
@@ -186,7 +224,7 @@ func TestEnsureAntiAffinity_CreatesRuleWithTwoMembers(t *testing.T) {
 
 func TestEnsureAntiAffinity_SingleMemberNoRule(t *testing.T) {
 	stub := newAAStub() // no existing same-group VMs
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 100, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 100, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stub.rules) != 0 {
@@ -199,12 +237,12 @@ func TestEnsureAntiAffinity_SingleMemberNoRule(t *testing.T) {
 
 func TestEnsureAntiAffinity_IdempotentNoRecreate(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:101"
+	stub.seedRule(aaRule, "vm:100,vm:101")
 	stub.listResourcesFn = aaResourcesFn(
-		aaQEMU(100, "job--web"),
-		aaQEMU(101, "job--web"),
+		aaQEMU(100, aaTag),
+		aaQEMU(101, aaTag),
 	)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if stub.createRuleCalls != 0 || stub.deleteRuleCalls != 0 {
@@ -215,16 +253,16 @@ func TestEnsureAntiAffinity_IdempotentNoRecreate(t *testing.T) {
 
 func TestEnsureAntiAffinity_AppendRecreatesRule(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:101"
+	stub.seedRule(aaRule, "vm:100,vm:101")
 	// A third member now exists; ensuring the newcomer must grow the rule.
 	stub.listResourcesFn = aaResourcesFn(
-		aaQEMU(100, "job--web"),
-		aaQEMU(101, "job--web"),
+		aaQEMU(100, aaTag),
+		aaQEMU(101, aaTag),
 	)
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 102, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 102, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:102" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:102" {
 		t.Errorf("rule resources = %q; want %q", got, "vm:100,vm:101,vm:102")
 	}
 	if stub.createRuleCalls != 1 || stub.deleteRuleCalls != 1 {
@@ -241,14 +279,14 @@ func TestEnsureAntiAffinity_AppendRecreatesRule(t *testing.T) {
 // shrink authority, so the rewritten rule keeps vm:200.
 func TestEnsureAntiAffinity_StaleScanNeverShrinksRule(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:200"
+	stub.seedRule(aaRule, "vm:100,vm:200")
 	// The scan sees vm:100 tagged; vm:200 is a live guest with no tag yet.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"), aaQEMU(200, ""))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag), aaQEMU(200, ""))
 
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:200" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:200" {
 		t.Errorf("rule resources = %q; want %q (vm:200 must survive the tag-stale scan)", got, "vm:100,vm:101,vm:200")
 	}
 }
@@ -260,14 +298,14 @@ func TestEnsureAntiAffinity_StaleScanNeverShrinksRule(t *testing.T) {
 // it would wedge every later create in the group.
 func TestEnsureAntiAffinity_DeadRuleMemberDropped(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:999"
+	stub.seedRule(aaRule, "vm:100,vm:999")
 	// vm:999 appears in no node's listing: its guest is gone.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101" {
 		t.Errorf("rule resources = %q; want %q (dead vm:999 must be dropped)", got, "vm:100,vm:101")
 	}
 }
@@ -279,7 +317,7 @@ func TestEnsureAntiAffinity_DeadRuleMemberDropped(t *testing.T) {
 // void the spread guarantee for the reboot window.
 func TestEnsureAntiAffinity_OfflineExcludedMemberKept(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:1042"
+	stub.seedRule(aaRule, "vm:100,vm:1042")
 	stub.memberNodes = []string{"pve1", "pve2"}
 	stub.statusFn = func() (*cluster.ListStatusResponse, error) {
 		resp := cluster.ListStatusResponse{
@@ -290,12 +328,12 @@ func TestEnsureAntiAffinity_OfflineExcludedMemberKept(t *testing.T) {
 		return &resp, nil
 	}
 	// vm:1042 lives on the offline pve2, so the tolerant scan cannot see it.
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
 
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:1042" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:1042" {
 		t.Errorf("rule resources = %q; want %q (vm:1042 is unenumerated, not gone, and must survive)",
 			got, "vm:100,vm:101,vm:1042")
 	}
@@ -303,7 +341,7 @@ func TestEnsureAntiAffinity_OfflineExcludedMemberKept(t *testing.T) {
 
 func TestEnsureAntiAffinity_EmptyGroupNoOp(t *testing.T) {
 	stub := newAAStub()
-	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "", 100, log.NewNopLogger()); err != nil {
+	if err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent(""), 100, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stub.resources) != 0 || len(stub.rules) != 0 {
@@ -314,8 +352,8 @@ func TestEnsureAntiAffinity_EmptyGroupNoOp(t *testing.T) {
 func TestEnsureAntiAffinity_ListRulesFailureReturnsError(t *testing.T) {
 	stub := newAAStub()
 	stub.failListRules = true
-	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, "job--web"))
-	err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), "web", 101, log.NewNopLogger())
+	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
+	err := ensureAntiAffinityMembership(context.Background(), aaDeps(stub), aaIdent("web"), 101, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected error when ListHaRules fails (caller logs it best-effort)")
 	}
@@ -327,33 +365,33 @@ func TestEnsureAntiAffinity_ListRulesFailureReturnsError(t *testing.T) {
 
 func TestRemoveAntiAffinity_RecreatesWithoutVMID(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:101,vm:102"
+	stub.seedRule(aaRule, "vm:100,vm:101,vm:102")
 	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:102" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
 		t.Errorf("rule resources = %q; want %q", got, "vm:100,vm:102")
 	}
 }
 
 func TestRemoveAntiAffinity_DeletesWhenSingleMemberRemains(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:101"
+	stub.seedRule(aaRule, "vm:100,vm:101")
 	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 101, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, ok := stub.rules["bosh-aa-web"]; ok {
+	if _, ok := stub.rules[aaRule]; ok {
 		t.Errorf("rule should be deleted when only one member remains; got %v", stub.rules)
 	}
 }
 
 func TestRemoveAntiAffinity_NonMemberNoOp(t *testing.T) {
 	stub := newAAStub()
-	stub.rules["bosh-aa-web"] = "vm:100,vm:102"
+	stub.seedRule(aaRule, "vm:100,vm:102")
 	if err := removeAntiAffinityMembership(context.Background(), aaDeps(stub), 999, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:102" {
+	if got := stub.rules[aaRule]; got != "vm:100,vm:102" {
 		t.Errorf("rule should be unchanged for a non-member; got %q", got)
 	}
 }
@@ -432,18 +470,24 @@ func TestAntiAffinityGroupTag(t *testing.T) {
 			"groups": []any{"director", "cf", "web", "director-cf", "director-cf-web"},
 		},
 	}
+	deps := Deps{Config: icMinConfig(), RequestDirectorUUID: aaDirector}
 	// Disabled config -> empty tag.
-	if got := antiAffinityGroupTag(icMinConfig(), env); got != "" {
+	if got := antiAffinityGroupTag(deps, env); got != "" {
 		t.Errorf("disabled anti-affinity should yield empty tag; got %q", got)
 	}
-	// Enabled -> job-derived tag.
-	cfg := icMinConfig()
+	// Enabled -> the hashed member tag, which is also the rule name.
 	enabled := true
-	cfg.Placement = &config.PlacementConfig{
+	deps.Config.Placement = &config.PlacementConfig{
 		AntiAffinity: &config.AntiAffinityConfig{Enabled: &enabled},
 	}
-	if got := antiAffinityGroupTag(cfg, env); got != "job--web" {
-		t.Errorf("antiAffinityGroupTag = %q; want %q", got, "job--web")
+	want := haIdentity{Owner: aaDirector, Deployment: "cf", Group: "web"}.ruleName()
+	if got := antiAffinityGroupTag(deps, env); got != want {
+		t.Errorf("antiAffinityGroupTag = %q; want %q", got, want)
+	}
+	// No Director UUID -> no tag, because no rule could be marked.
+	deps.RequestDirectorUUID = ""
+	if got := antiAffinityGroupTag(deps, env); got != "" {
+		t.Errorf("a request without a director_uuid should yield an empty tag; got %q", got)
 	}
 }
 

@@ -513,6 +513,13 @@ func (m *vmMockCluster) ListFirewallGroups(_ context.Context) (*sdkcluster.ListF
 func (m *vmMockCluster) DeleteHaRules(_ context.Context, _ string) error {
 	return fmt.Errorf("no such rule (mock)")
 }
+
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (m *vmMockCluster) GetHaResources(context.Context, string) (*sdkcluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource")
+}
+
 func (m *vmMockCluster) DeleteHaResources(_ context.Context, _ string, _ *sdkcluster.DeleteHaResourcesParams) error {
 	return fmt.Errorf("does not exist (mock)")
 }

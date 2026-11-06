@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -18,6 +19,7 @@ import (
 type naClusterStub struct {
 	cluster.Service
 	resources   map[string]bool
+	resComments map[string]string
 	rules       map[string]cluster.CreateHaRulesParams
 	createCalls int
 	deleteCalls int
@@ -55,12 +57,29 @@ func (s *naClusterStub) ListHaStatusCurrent(context.Context) (*cluster.ListHaSta
 }
 
 func newNAStub() *naClusterStub {
-	return &naClusterStub{resources: map[string]bool{}, rules: map[string]cluster.CreateHaRulesParams{}}
+	return &naClusterStub{
+		resources: map[string]bool{}, resComments: map[string]string{},
+		rules: map[string]cluster.CreateHaRulesParams{},
+	}
 }
 
 func (s *naClusterStub) CreateHaResources(_ context.Context, p *cluster.CreateHaResourcesParams) error {
 	s.resources[p.Sid] = true
+	if p.Comment != nil {
+		s.resComments[p.Sid] = *p.Comment
+	}
 	return nil
+}
+
+func (s *naClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if !s.resources[sid] {
+		return nil, fmt.Errorf("no such resource")
+	}
+	resp := &cluster.GetHaResourcesResponse{}
+	if c, ok := s.resComments[sid]; ok {
+		resp.Comment = &c
+	}
+	return resp, nil
 }
 
 func (s *naClusterStub) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
@@ -72,7 +91,11 @@ func (s *naClusterStub) DeleteHaResources(_ context.Context, sid string, _ *clus
 func (s *naClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
 	out := make(cluster.ListHaRulesResponse, 0, len(s.rules))
 	for name, p := range s.rules {
-		raw, _ := json.Marshal(map[string]any{"rule": name, "type": p.Type, "resources": p.Resources})
+		comment := ""
+		if p.Comment != nil {
+			comment = *p.Comment
+		}
+		raw, _ := json.Marshal(map[string]any{"rule": name, "type": p.Type, "resources": p.Resources, "comment": comment})
 		out = append(out, raw)
 	}
 	return &out, nil
@@ -92,10 +115,12 @@ func (s *naClusterStub) DeleteHaRules(_ context.Context, rule string) error {
 
 func naDeps(stub *naClusterStub) Deps {
 	return Deps{
-		Config: icMinConfig(),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		Config:              icMinConfig(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 }
 
@@ -293,10 +318,12 @@ func TestApplyAZNodeAffinityPin_SingleNodeAZ_WarnsEndToEnd(t *testing.T) {
 	var buf bytes.Buffer
 	stub := newNAStub()
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01"}}),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01"}}),
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
 	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
@@ -312,10 +339,12 @@ func TestApplyAZNodeAffinityPin_TwoNodeAZ_WarnsEndToEnd(t *testing.T) {
 	var buf bytes.Buffer
 	stub := newNAStub()
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}}),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01", "pve02"}}),
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
 	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
@@ -331,10 +360,12 @@ func TestApplyAZNodeAffinityPin_ThreeNodeAZ_NoSmallNodeSetWarn(t *testing.T) {
 	var buf bytes.Buffer
 	stub := newNAStub()
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	logger := warnLogger(t, &buf)
 	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
@@ -349,10 +380,12 @@ func TestApplyAZNodeAffinityPin_ThreeNodeAZ_NoSmallNodeSetWarn(t *testing.T) {
 func TestApplyAZNodeAffinityPin_PluralAZ_PinsChosenAZ(t *testing.T) {
 	stub := newNAStub()
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01"}, "z2": {"pve02", "pve03"}}),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01"}, "z2": {"pve02", "pve03"}}),
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	// Plural-AZ VM placed on pve03 (in z2). This is the regression the CRITICAL
 	// fix closes: the old code read the singular AvailabilityZone (empty here)
@@ -386,10 +419,12 @@ func TestApplyAZNodeAffinityPin_DisabledNoOp(t *testing.T) {
 func TestApplyAZNodeAffinityPin_FallbackNodeSkips(t *testing.T) {
 	stub := newNAStub()
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01"}}),
-		PVE:    &icPVEClient{clusterSvc: stub},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01"}}),
+		PVE:                 &icPVEClient{clusterSvc: stub},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	// VM requested z1 but landed on config.node "pve99" (fallback) → no AZ
 	// membership → no pin (skipped, not errored).
@@ -453,10 +488,12 @@ func TestApplyAZNodeAffinityPin_NoResolvableAZ_Warns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			deps := Deps{
-				Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
-				PVE:    &icPVEClient{clusterSvc: newNAStub()},
-				Agent:  &icAgentStub{},
-				Logger: log.NewNopLogger(),
+				RequestDirectorUUID: aaDirector,
+				HAProfile:           pve9Profile,
+				Config:              naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+				PVE:                 &icPVEClient{clusterSvc: newNAStub()},
+				Agent:               &icAgentStub{},
+				Logger:              log.NewNopLogger(),
 			}
 			if err := applyAZNodeAffinityPin(context.Background(), deps, 100, tc.cp, tc.node,
 				warnLogger(t, &buf)); err != nil {
@@ -483,10 +520,12 @@ func TestApplyAZNodeAffinityPin_Disabled_StaysSilent(t *testing.T) {
 	cfg := naPinConfig(map[string][]string{"z1": {"pve01"}})
 	cfg.HA.PinAZ = nil // feature not enabled
 	deps := Deps{
-		Config: cfg,
-		PVE:    &icPVEClient{clusterSvc: newNAStub()},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              cfg,
+		PVE:                 &icPVEClient{clusterSvc: newNAStub()},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
 		createVMCloudProps{}, "pve01", warnLogger(t, &buf)); err != nil {
@@ -502,10 +541,12 @@ func TestApplyAZNodeAffinityPin_Disabled_StaysSilent(t *testing.T) {
 func TestApplyAZNodeAffinityPin_ResolvableAZ_NoInertWarn(t *testing.T) {
 	var buf bytes.Buffer
 	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
-		PVE:    &icPVEClient{clusterSvc: newNAStub()},
-		Agent:  &icAgentStub{},
-		Logger: log.NewNopLogger(),
+		RequestDirectorUUID: aaDirector,
+		HAProfile:           pve9Profile,
+		Config:              naPinConfig(map[string][]string{"z1": {"pve01", "pve02", "pve03"}}),
+		PVE:                 &icPVEClient{clusterSvc: newNAStub()},
+		Agent:               &icAgentStub{},
+		Logger:              log.NewNopLogger(),
 	}
 	if err := applyAZNodeAffinityPin(context.Background(), deps, 100,
 		createVMCloudProps{AvailabilityZone: "z1"}, "pve01", warnLogger(t, &buf)); err != nil {

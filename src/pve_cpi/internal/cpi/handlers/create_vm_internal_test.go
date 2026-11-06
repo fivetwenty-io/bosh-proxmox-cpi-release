@@ -1353,6 +1353,18 @@ func (c *templateGapClusterSvc) ListHaStatusCurrent(_ context.Context) (*sdkclus
 // DeleteHaRules / DeleteHaResources are no-ops so cleanupVM's best-effort HA
 // pin removal (removeNodeAffinityPin) can run against this fixture.
 func (c *templateGapClusterSvc) DeleteHaRules(_ context.Context, _ string) error { return nil }
+
+// ListHaRules reports no rules, so the pin cleanup has nothing to delete.
+func (c *templateGapClusterSvc) ListHaRules(context.Context, *sdkcluster.ListHaRulesParams) (*sdkcluster.ListHaRulesResponse, error) {
+	return &sdkcluster.ListHaRulesResponse{}, nil
+}
+
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (c *templateGapClusterSvc) GetHaResources(context.Context, string) (*sdkcluster.GetHaResourcesResponse, error) {
+	return nil, fmt.Errorf("no such resource")
+}
+
 func (c *templateGapClusterSvc) DeleteHaResources(_ context.Context, _ string, _ *sdkcluster.DeleteHaResourcesParams) error {
 	return nil
 }

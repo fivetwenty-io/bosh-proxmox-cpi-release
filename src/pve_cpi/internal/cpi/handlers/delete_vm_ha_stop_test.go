@@ -30,6 +30,12 @@ type orderRecordingCluster struct {
 	events *[]string
 }
 
+// GetHaResources reports no resource, so the cleanup's ownership check finds
+// nothing to protect.
+func (m *orderRecordingCluster) GetHaResources(context.Context, string) (*cluster.GetHaResourcesResponse, error) {
+	return nil, errors.New("no such resource")
+}
+
 func (m *orderRecordingCluster) DeleteHaResources(_ context.Context, sid string, _ *cluster.DeleteHaResourcesParams) error {
 	*m.events = append(*m.events, "DeleteHaResources:"+sid)
 	return nil

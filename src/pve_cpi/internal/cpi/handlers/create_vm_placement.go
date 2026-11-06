@@ -29,7 +29,7 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed
 	// when anti-affinity is enabled; otherwise the scorer ignores group membership
 	// and behavior is identical to Tier 1.
-	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
+	groupTag := antiAffinityGroupTag(deps, parsed.env)
 
 	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
 		placementBridgePlan(ctx, deps, parsed))
@@ -54,7 +54,7 @@ func resolveVMShapeWithAlternates(
 	fallbackMax int,
 ) (shape *createVMShape, alternates []string, err error) {
 	cp := parsed.cloudProps
-	groupTag := antiAffinityGroupTag(deps.Config, parsed.env)
+	groupTag := antiAffinityGroupTag(deps, parsed.env)
 
 	winner, alts, nodeErr := resolveTargetNodeWithBridges(
 		ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
