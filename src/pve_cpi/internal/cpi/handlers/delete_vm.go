@@ -936,14 +936,25 @@ func destroyVMWithRecovery(
 	logger.Debug("delete_vm: deleting VM")
 	var deleteResp *sdknodes.DeleteQemuResponse
 	attemptDestroy := func() error {
-		return pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
+		// A config lock the loop does not wait out goes straight to the
+		// skiplock recovery below; see lockForRecovery.
+		var lockErr error
+		err := pve.RetryOnTransientOrLock(ctx, logger, "delete_vm", 0, func() error {
 			var innerErr error
 			deleteResp, innerErr = deps.PVE.Nodes().DeleteQemu(ctx, node, vmcid.PathOf(vmid), &sdknodes.DeleteQemuParams{
 				Purge:                    &purge,
 				DestroyUnreferencedDisks: &destroyDisks,
 			})
+			if lockForRecovery(innerErr) {
+				lockErr = innerErr
+				return nil
+			}
 			return innerErr
 		})
+		if lockErr != nil {
+			return lockErr
+		}
+		return err
 	}
 	deleteErr := attemptDestroy()
 	if deleteErr != nil && pve.IsVMRunningDestroyFailure(deleteErr) {

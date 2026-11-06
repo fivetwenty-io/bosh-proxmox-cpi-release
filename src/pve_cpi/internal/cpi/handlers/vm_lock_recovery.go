@@ -63,9 +63,23 @@ func retryDestroyWithSkiplock(
 		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
 			return nil
 		}
+		if lockForRecovery(delErr) {
+			return nil
+		}
 		return delErr
 	})
 	return resp, delErr
+}
+
+// lockForRecovery reports whether a destroy's retry closure hands err to the
+// caller's lock recovery at once instead of letting RetryOnTransientOrLock
+// back off on it. The loop waits out a config lock that PVE answers as a 5xx
+// on its lock curve, which gives a short lock time to clear before any
+// skiplock. A config lock that arrives any other way, such as in task text,
+// is not one the destroy loops ever retried, so it goes straight to the
+// skiplock and lock-clear recovery, which handle a lock themselves.
+func lockForRecovery(err error) bool {
+	return err != nil && pve.IsVMConfigLocked(err) && !pve.IsTransientTransport(err)
 }
 
 // retryStopWithSkiplock is the Stop analogue of retryDestroyWithSkiplock. The
@@ -206,6 +220,9 @@ func retryDestroyAfterLockClear(
 			DestroyUnreferencedDisks: &destroyUnref,
 		})
 		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+			return nil
+		}
+		if lockForRecovery(delErr) {
 			return nil
 		}
 		return delErr

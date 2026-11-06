@@ -158,7 +158,7 @@ func TestRetryOnTransientOrLock_QuorumIsRetried(t *testing.T) {
 // labeled.
 func TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient(t *testing.T) {
 	t.Parallel()
-	d, reason := retryOrLockCurve(false, false, true, 20)
+	d, reason := retryOrLockCurve(false, false, true, false, 20)
 	if reason != "cluster_not_quorate" {
 		t.Errorf("reason = %q; want %q", reason, "cluster_not_quorate")
 	}
@@ -179,13 +179,13 @@ func TestRetryOrLockCurve_QuorumUsesStorageLockCurveNotTransient(t *testing.T) {
 // pve.retry.storage_lock settings and mislabeling the retry-log reason.
 func TestRetryOrLockCurve_LockAndQuorumWinOverPushback(t *testing.T) {
 	t.Parallel()
-	if _, reason := retryOrLockCurve(true, false, true, 0); reason != "cluster_not_quorate" {
+	if _, reason := retryOrLockCurve(true, false, true, false, 0); reason != "cluster_not_quorate" {
 		t.Errorf("reason = %q; want %q (quorum must win over pushback)", reason, "cluster_not_quorate")
 	}
-	if _, reason := retryOrLockCurve(true, true, false, 0); reason != "storage_lock" {
+	if _, reason := retryOrLockCurve(true, true, false, false, 0); reason != "storage_lock" {
 		t.Errorf("reason = %q; want %q (lock must win over pushback)", reason, "storage_lock")
 	}
-	if _, reason := retryOrLockCurve(true, false, false, 0); reason != "pushback" {
+	if _, reason := retryOrLockCurve(true, false, false, false, 0); reason != "pushback" {
 		t.Errorf("reason = %q; want %q (pure pushback keeps its curve)", reason, "pushback")
 	}
 }
@@ -206,7 +206,7 @@ func TestRetryOrLockCurve_CanonicalStorageLockStrings(t *testing.T) {
 		if !isLock {
 			t.Fatalf("IsStorageLockTimeout(%q) = false; canonical shape must classify as lock", msg)
 		}
-		_, reason := retryOrLockCurve(IsPVEPushback(err), isLock, IsClusterNotQuorate(err), 0)
+		_, reason := retryOrLockCurve(IsPVEPushback(err), isLock, IsClusterNotQuorate(err), isSettlingVMConfigLock(err), 0)
 		if reason != "storage_lock" {
 			t.Errorf("reason for %q = %q; want storage_lock", msg, reason)
 		}
@@ -219,7 +219,7 @@ func TestRetryOrLockCurve_CanonicalStorageLockStrings(t *testing.T) {
 // scanning retry logs should be able to tell the two conditions apart.
 func TestRetryOrLockCurve_QuorumReasonDistinctFromLock(t *testing.T) {
 	t.Parallel()
-	_, reason := retryOrLockCurve(false, true, true, 0)
+	_, reason := retryOrLockCurve(false, true, true, false, 0)
 	if reason != "cluster_not_quorate" {
 		t.Errorf("reason = %q; want %q when both isLock and isQuorum are true", reason, "cluster_not_quorate")
 	}

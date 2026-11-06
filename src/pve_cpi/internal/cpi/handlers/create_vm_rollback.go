@@ -418,9 +418,11 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	// no caller ever retries a rollback). The budget is bounded
 	// (rollbackDestroyMaxAttempts) because this retry shares the detached
 	// rollback context with the task await, ISO removal, and HA pin removal
-	// that follow. Config-lock rejections ("lock: clone" and friends) are not
-	// in the retry union and fall through unchanged to the skiplock and
-	// lock-clear branches below; already-gone verdicts (404, pmxcfs
+	// that follow. A config lock that PVE answers as a 5xx rides the loop's
+	// lock curve, so a short lock clears before any skiplock. Any other
+	// config-lock rejection ("lock: clone" and friends in task text) is
+	// returned from the closure at once and falls through unchanged to the
+	// skiplock and lock-clear branches below; already-gone verdicts (404, pmxcfs
 	// config-missing 500) are short-circuited inside the closure so the
 	// blanket 5xx transient rule cannot spend the budget on a VM that no
 	// longer exists, and the switch below still sees them via delErr.
@@ -432,6 +434,9 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 			DestroyUnreferencedDisks: &destroyUnref,
 		})
 		if delErr != nil && (pve.IsNotFound(delErr) || pve.IsPmxcfsConfigMissing(delErr)) {
+			return nil
+		}
+		if lockForRecovery(delErr) {
 			return nil
 		}
 		return delErr

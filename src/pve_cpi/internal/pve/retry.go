@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	mrand "math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -438,27 +439,34 @@ func RetryOnTransient(
 }
 
 // retryOrLockCurve selects the backoff curve and reason label for a
-// RetryOnTransientOrLock retry iteration. Quorum loss and storage-lock
-// contention are checked BEFORE pushback: IsPVEPushback substring-matches
-// "got timeout", which is present in both canonical storage-lock error
-// shapes, so a pushback-first ordering routed every storage-lock error onto
-// the pushback curve — silently ignoring the operator's tuned
-// pve.retry.storage_lock settings and mislabeling the log reason as
-// "pushback" for a storage-subsystem condition. Quorum loss and storage-lock
-// contention share the StorageLockBackoff curve (2s→30s) — both are "wait
-// for someone else to finish/recover" conditions on a similar timescale;
-// isQuorum before isLock only gives the log line an accurate reason label.
-// Genuine pushback (worker-pool saturation, rate limiting) still gets the
-// most conservative PushbackBackoff curve when no lock/quorum signal matched.
+// RetryOnTransientOrLock retry iteration. Quorum loss, guest-config locks, and
+// storage-lock contention are checked BEFORE pushback: IsPVEPushback
+// substring-matches "got timeout", which is present in both canonical
+// storage-lock error shapes, so a pushback-first ordering routed every
+// storage-lock error onto the pushback curve — silently ignoring the
+// operator's tuned pve.retry.storage_lock settings and mislabeling the log
+// reason as "pushback" for a storage-subsystem condition. Quorum loss, a
+// guest-config lock, and storage-lock contention share the StorageLockBackoff
+// curve (2s→30s) — all three are "wait for someone else to finish/recover"
+// conditions on a similar timescale; the order among them only gives the log
+// line an accurate reason label. Genuine pushback (worker-pool saturation,
+// rate limiting) still gets the most conservative PushbackBackoff curve when
+// no lock/quorum signal matched.
+//
+// A guest-config lock most often arrives as a plain 500, which also satisfies
+// IsTransientTransport, so without the explicit case it rode the 1s→15s
+// worker-cycling curve, which a backup or snapshot lock routinely outlasts.
 //
 // The "storage_lock" reason label covers everything IsStorageLockTimeout
 // matches, which includes pmxcfs cfs-lock timeouts in every lock domain
 // (user_cfg, firewall, sdn, ha, replication), not only per-storage locks;
 // read the label as "lock contention", storage or not.
-func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Duration, reason string) {
+func retryOrLockCurve(isPushback, isLock, isQuorum, isConfigLock bool, attempt int) (d time.Duration, reason string) {
 	switch {
 	case isQuorum:
 		return StorageLockBackoff(attempt), "cluster_not_quorate"
+	case isConfigLock:
+		return StorageLockBackoff(attempt), "vm_config_lock"
 	case isLock:
 		return StorageLockBackoff(attempt), "storage_lock"
 	case isPushback:
@@ -468,24 +476,49 @@ func retryOrLockCurve(isPushback, isLock, isQuorum bool, attempt int) (d time.Du
 	}
 }
 
+// isSettlingVMConfigLock reports whether err is a guest-config lock rejection
+// (IsVMConfigLocked) for a lock that clears on its own once the task holding
+// it ends. Every lock PVE takes for a task does, such as backup, clone,
+// create, migrate, rollback, and snapshot. A suspended lock does not: it marks
+// a hibernated guest and stays until someone resumes the VM, so retrying it
+// only spends the budget.
+func isSettlingVMConfigLock(err error) bool {
+	return IsVMConfigLocked(err) && !strings.EqualFold(VMConfigLockType(err), vmLockSuspended)
+}
+
+// vmLockSuspended is the guest-config lock a hibernated VM carries.
+const vmLockSuspended = "suspended"
+
 // IsRetryableOrLockFault reports whether err belongs to any fault class that
 // RetryOnTransientOrLock retries: PVE pushback, per-storage lock timeout,
-// cluster quorum loss, or a transient transport fault. Ops composed of several
+// cluster quorum loss, a guest-config lock that clears on its own, or a
+// transient transport fault. Ops composed of several
 // PVE calls use it to route an inner step's failure (e.g. a pre-retry cleanup
 // sweep) back onto the loop's backoff curve instead of pressing on into a
 // call that is now guaranteed to fail.
 func IsRetryableOrLockFault(err error) bool {
-	return IsPVEPushback(err) || IsStorageLockTimeout(err) || IsClusterNotQuorate(err) || IsTransientTransport(err)
+	return IsPVEPushback(err) || IsStorageLockTimeout(err) || IsClusterNotQuorate(err) ||
+		isSettlingVMConfigLock(err) || IsTransientTransport(err)
 }
 
 // RetryOnTransientOrLock invokes op up to maxAttempts times, retrying when the
 // returned error is a per-storage lockfile timeout (IsStorageLockTimeout), a
-// cluster quorum-loss condition (IsClusterNotQuorate), a transient transport-
-// layer fault (IsTransientTransport), or a PVE rate-limit / worker-pool
-// exhaustion signal (IsPVEPushback). Backoff curve priority: quorum loss /
-// storage lock (StorageLockBackoff) > pushback (PushbackBackoff) > transient
-// (TransientBackoff) — lock/quorum first because IsPVEPushback is a textual
-// superset of the storage-lock shapes (see retryOrLockCurve).
+// cluster quorum-loss condition (IsClusterNotQuorate), a guest-config lock
+// that clears on its own (IsVMConfigLocked, except a suspended guest's lock),
+// a transient transport-layer fault (IsTransientTransport), or a PVE
+// rate-limit / worker-pool exhaustion signal (IsPVEPushback). Backoff curve
+// priority: quorum loss / config lock / storage lock (StorageLockBackoff) >
+// pushback (PushbackBackoff) > transient (TransientBackoff) — lock/quorum
+// first because IsPVEPushback is a textual superset of the storage-lock shapes
+// (see retryOrLockCurve).
+//
+// A guest-config lock is a refusal PVE gives before it writes anything, so
+// sending the op again after one is safe. This loop retries it only over the
+// storage-lock curve's minutes, against the same node. A migration can hold
+// its lock far longer and moves the config when it ends, so a VM-config
+// mutation that has to outlast one goes through MutateVMConfig, which waits
+// through AwaitVMSettled and re-resolves the node. A suspended guest's lock
+// returns at once, because only resuming the VM clears it.
 //
 // Quorum loss rides the storage-lock curve rather than the transient curve
 // deliberately: a quorum 5xx also satisfies IsTransientTransport (it is a
@@ -524,18 +557,22 @@ func RetryOnTransientOrLock(
 		if stopsRetry(err) {
 			return err
 		}
+		if IsVMConfigLocked(err) && !isSettlingVMConfigLock(err) {
+			return err
+		}
 		isPushback := IsPVEPushback(err)
 		isLock := IsStorageLockTimeout(err)
 		isQuorum := IsClusterNotQuorate(err)
+		isConfigLock := isSettlingVMConfigLock(err)
 		isTransient := IsTransientTransport(err)
-		if !isPushback && !isLock && !isQuorum && !isTransient {
+		if !isPushback && !isLock && !isQuorum && !isConfigLock && !isTransient {
 			return err
 		}
 		lastErr = err
 		if attempt == maxAttempts-1 {
 			break
 		}
-		d, reason := retryOrLockCurve(isPushback, isLock, isQuorum, attempt)
+		d, reason := retryOrLockCurve(isPushback, isLock, isQuorum, isConfigLock, attempt)
 		if override := backoffFromCtx(ctx); override != nil {
 			d = override(attempt)
 		}
