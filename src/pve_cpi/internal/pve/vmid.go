@@ -6,6 +6,8 @@ import (
 	"fmt"
 	mrand "math/rand/v2"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // Default VMID ranges. The three classes occupy disjoint, contiguous bands:
@@ -406,15 +409,22 @@ func NextVMID(ctx context.Context, c Client, opts ...AllocOption) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	storageOnly := make(map[int]struct{})
 	for _, target := range targets {
 		storageUsed, sErr := listStorageVMIDsFor(ctx, c, target)
 		if sErr != nil {
 			return 0, sErr
 		}
 		for id := range storageUsed {
-			used[id] = struct{}{}
+			if _, inCluster := used[id]; !inCluster {
+				storageOnly[id] = struct{}{}
+			}
 		}
 	}
+	for id := range storageOnly {
+		used[id] = struct{}{}
+	}
+	logStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
 
 	// Lock only for the pure in-memory scan so two goroutines with identical
 	// "used" snapshots cannot return the same VMID. The randomised start in
@@ -469,15 +479,58 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string, opts ...A
 		if sErr != nil {
 			return 0, sErr
 		}
+		storageOnly := make(map[int]struct{})
 		for id := range storageUsed {
+			if _, inCluster := used[id]; !inCluster {
+				storageOnly[id] = struct{}{}
+			}
+		}
+		for id := range storageOnly {
 			used[id] = struct{}{}
 		}
+		logStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
 	}
 
 	globalVMIDMu.Lock()
 	defer globalVMIDMu.Unlock()
 
 	return nextVMIDInRange(used, ao.rangeStart, ao.rangeEnd)
+}
+
+// storageOnlyLogSample caps how many reserved IDs the storage-only info line
+// lists.
+const storageOnlyLogSample = 5
+
+// logStorageOnlyReservations logs one info line when the storage scan reserved
+// IDs inside [start, end] that the cluster listing does not hold. Such IDs
+// belong to orphaned volumes or, on an export several clusters mount, to
+// another cluster's guests, and an operator chasing a shrinking band needs to
+// see which ones. The line gives the count and the lowest few IDs.
+func logStorageOnlyReservations(ctx context.Context, storageOnly map[int]struct{}, start, end int) {
+	inRange := make([]int, 0, len(storageOnly))
+	for id := range storageOnly {
+		if id >= start && id <= end {
+			inRange = append(inRange, id)
+		}
+	}
+	if len(inRange) == 0 {
+		return
+	}
+	sort.Ints(inRange)
+	sample := inRange
+	if len(sample) > storageOnlyLogSample {
+		sample = sample[:storageOnlyLogSample]
+	}
+	parts := make([]string, len(sample))
+	for i, id := range sample {
+		parts[i] = strconv.Itoa(id)
+	}
+	log.FromContext(ctx).Info("pve: VMID allocation skipped IDs that only storage holds; volumes named for them "+
+		"exist with no guest in this cluster, which on an export several clusters mount can mean another "+
+		"cluster's guests",
+		log.String("range", fmt.Sprintf("%d-%d", start, end)),
+		log.Int("count", len(inRange)),
+		log.String("ids", strings.Join(parts, ",")))
 }
 
 // volumeVMIDRegexp matches PVE volume names of the form "vm-NNN-disk-N"
@@ -504,6 +557,10 @@ func listStorageVMIDs(ctx context.Context, c Client, node, storage string) (map[
 // volume's last path segment: VM N owns any vm-<N>-* or base-<N>-* name,
 // whatever follows the VMID.
 var volumeOwnerRegexp = regexp.MustCompile(`^(?:vm|base)-([1-9]\d*)-`)
+
+// configDriveISOName matches the last segment of the config-drive ISO the CPI
+// writes for VM N (see agent.configDriveISOName).
+var configDriveISOName = regexp.MustCompile(`^vm-([1-9]\d*)-config\.iso$`)
 
 // volumeOwnerVMID returns the VMID PVE treats as the owner of an images
 // volume, and false for any other name.
@@ -605,8 +662,13 @@ func listNodeImageStorages(ctx context.Context, c Client, node string) ([]string
 // hasImagesContent reports whether a storage's comma-separated content list
 // includes images.
 func hasImagesContent(content string) bool {
-	for _, kind := range strings.Split(content, ",") {
-		if strings.TrimSpace(kind) == "images" {
+	return hasContentType(content, "images")
+}
+
+// hasContentType reports whether a comma-joined PVE content list holds kind.
+func hasContentType(content, kind string) bool {
+	for _, k := range strings.Split(content, ",") {
+		if strings.TrimSpace(k) == kind {
 			return true
 		}
 	}
@@ -677,6 +739,17 @@ func listStorageVMIDsFor(ctx context.Context, c Client, target storageScanTarget
 		if len(matches) < 2 && target.owner && (entry.Content == "" || entry.Content == "images" || entry.Content == "rootdir") {
 			if owner, ok := volumeOwnerVMID(volume); ok {
 				matches = []string{volume, owner}
+			}
+		}
+		// The CPI's config-drive ISO, vm-<N>-config.iso, has no owner in PVE,
+		// but the CPI itself writes and deletes it by name. On an export that
+		// several clusters mount, handing out N again would let this cluster
+		// overwrite, or later delete, another cluster's live config drive, so
+		// the name reserves N on every storage the scan reads, whatever the
+		// row's content type.
+		if len(matches) < 2 {
+			if m := configDriveISOName.FindStringSubmatch(volumeLastSegment(volume)); len(m) == 2 {
+				matches = m
 			}
 		}
 		if len(matches) < 2 {

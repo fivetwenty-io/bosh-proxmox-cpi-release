@@ -539,6 +539,11 @@ func newClient(cfg *config.CPIConfig, logger *log.Logger, tracer trace.Tracer) (
 	var nodesSvc nodes.Service = &strictStorageContentNodes{Service: nodes.New(raw), reader: raw}
 	var clusterSvc cluster.Service = &strictHAResourcesCluster{Service: cluster.New(raw), reader: raw}
 	clusterStorageSvc := clusterstorage.New(raw)
+	// The shared-volume guards sit beneath the tracing wrappers and every
+	// handler, so every destroy and every volume delete the CPI sends passes
+	// through them (see shared_volume_guard.go).
+	nodesSvc = &sharedVolumeGuardNodes{Service: nodesSvc, logger: logger}
+	storageSvc = newSharedVolumeGuardStorage(storageSvc, clusterStorageSvc, cfg)
 	var poolsSvc PoolService = &sdkPoolService{svc: pools.New(raw)}
 	// cloudInitSvc is never decorated: the call-surface audit (see tracing.go)
 	// found zero production call sites for Client.CloudInit(), so there is no

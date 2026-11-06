@@ -370,7 +370,8 @@ func (r *RequestOverrideRuntime) buildBundle(cfg *config.CPIConfig) (*overrideBu
 	if ttl <= 0 {
 		ttl = defaultOverrideStorageInfoTTL
 	}
-	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), ttl)
+	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), ttl,
+		pve.WithSharedExportAdvice(pve.VMIDBandsFromConfig(cfg)))
 	// The local backend's cluster sweep proves a volume absent from a content
 	// listing, so it gets the same second opinions the handlers apply: the
 	// allocation journal of this bundle's own configuration, and PVE's status

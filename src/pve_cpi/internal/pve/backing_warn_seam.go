@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
 
 // duplicateBackingWarnOnce gates the duplicate-backing warning to a single
@@ -53,5 +55,80 @@ func ResetDuplicateBackingWarnOnceForTest() func() {
 	prev := duplicateBackingWarnOnce.Swap(&sync.Once{})
 	return func() {
 		duplicateBackingWarnOnce.Store(prev)
+	}
+}
+
+// sharedExportAdviceGiven gates the shared-export advice line to one firing
+// per process. The gate is consumed only when the line actually fires, so a
+// refresh that finds no network file storage, or bands an operator already
+// set, leaves it armed for a later refresh. Held in an atomic.Pointer so
+// ResetSharedExportAdviceOnceForTest can swap in a fresh gate race-safely.
+var sharedExportAdviceGiven atomic.Pointer[atomic.Bool]
+
+func init() {
+	sharedExportAdviceGiven.Store(&atomic.Bool{})
+}
+
+// AdviseSharedExportBandsOnce logs, at most once per process, the advice that
+// a cluster with network file storage should give each cluster that mounts the
+// same export its own VMID bands. It fires only when infos holds an enabled
+// nfs, cifs, or shared dir storage that carries guest images or ISOs, and
+// every band in bands is at its built-in value. It is pure logging over the
+// caller's slice.
+func AdviseSharedExportBandsOnce(ctx context.Context, infos []StorageInfo, bands VMIDBands) {
+	if !bands.AllDefault() {
+		return
+	}
+	storageName := sharedExportCandidate(infos)
+	if storageName == "" {
+		return
+	}
+	if !sharedExportAdviceGiven.Load().CompareAndSwap(false, true) {
+		return
+	}
+	log.FromContext(ctx).Info("pve: this cluster has network file storage and every VMID band is at its default; "+
+		"if another cluster mounts the same export, give each cluster disjoint vm, disk, stemcell template, "+
+		"and parker bands and set the datacenter next-id range outside them, then run "+
+		"`pve-cid ha --cpi-config` to check the pair",
+		log.String("storage", storageName),
+		log.String("bands", bands.String()))
+}
+
+// sharedExportCandidate returns the name of the first enabled network file
+// storage in infos (by name, so the line is deterministic) that carries guest
+// images or ISOs, or "" when there is none.
+func sharedExportCandidate(infos []StorageInfo) string {
+	best := ""
+	for i := range infos {
+		info := &infos[i]
+		if info.Disabled {
+			continue
+		}
+		switch info.Type {
+		case "nfs", "cifs":
+		case "dir":
+			if !info.Shared {
+				continue
+			}
+		default:
+			continue
+		}
+		if !hasImagesContent(info.Content) && !hasContentType(info.Content, "iso") {
+			continue
+		}
+		if best == "" || info.Name < best {
+			best = info.Name
+		}
+	}
+	return best
+}
+
+// ResetSharedExportAdviceOnceForTest re-arms the process-wide gate for the
+// shared-export advice and returns a restore function. Tests using it must
+// not call t.Parallel.
+func ResetSharedExportAdviceOnceForTest() func() {
+	prev := sharedExportAdviceGiven.Swap(&atomic.Bool{})
+	return func() {
+		sharedExportAdviceGiven.Store(prev)
 	}
 }

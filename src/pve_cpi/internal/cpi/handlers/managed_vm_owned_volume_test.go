@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
@@ -154,5 +155,60 @@ func TestManagedVMAttachRefusesOwnedLegacyDiskBeforeItsStep(t *testing.T) {
 		if strings.HasPrefix(record.Steps[i].Kind, "vm.persistent.") {
 			t.Errorf("the refusal must come before the handoff step; found %s in %s", record.Steps[i].Kind, record.Steps[i].State)
 		}
+	}
+}
+
+// TestManagedVMSkipsVMIDNamedByConfigDriveISO pins the managed allocator's ISO
+// pool scan. The band is [8000, 8001], a live VM holds 8001, and the only
+// trace of 8000 is a config-drive ISO on the distinct ISO pool, which no
+// images-storage scan reads. On an export several clusters mount, that ISO
+// may be another cluster's live config drive, so the allocator must list the
+// ISO pool and refuse to hand out 8000.
+func TestManagedVMSkipsVMIDNamedByConfigDriveISO(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.CPIConfig{Node: "n1", VMStorage: "a", ISOStorage: "isopool", EphemeralStorageSet: "E", StoragePlacementNamespace: "namespace", StorageAllocationJournalDir: directory, AgentMode: config.AgentModeNoAgent, StemcellStrategy: config.StemcellStrategyImport, Placement: &config.PlacementConfig{}, StorageSets: map[string]config.StorageSet{"E": {Names: []string{"a", "b"}, Strategy: config.StoragePlacementStrategy{Name: "spread", Version: 1}}}}
+	cfg.VMIDRangeStart, cfg.VMIDRangeEnd = 8000, 8001
+	journal, err := aj.Initialize(t.Context(), directory, cfg.StoragePlacementNamespace, aj.Enrollment{ClusterID: "pve-root-ca-sha256:" + strings.Repeat("ab", 32), AuthorityID: "authority", AuditID: "audit", CompleteHistoricalAudit: true, PreviousWriterFenced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := journal.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	state := &managedDiskTestState{volumes: map[string]*nodes.GetStorageContentResponse{
+		"a:import/stemcell.qcow2":        {Size: sdk.PVEInt(1 << 30), Format: "qcow2"},
+		"isopool:iso/vm-8000-config.iso": {Size: sdk.PVEInt(1 << 20), Format: "iso"},
+	}}
+	state.configs = map[int]map[string]any{cfg.VMIDRangeEnd: {"name": "occupied-end"}}
+	var listedMu sync.Mutex
+	listed := map[string]int{}
+	state.beforeList = func(pool string) {
+		listedMu.Lock()
+		defer listedMu.Unlock()
+		listed[pool]++
+	}
+	entry := &managedVMEntryClient{diagnosticVMClient: diagnosticVMClient{managedDiskTestPVE{state: state}}, journal: journal}
+	deps := Deps{Config: cfg, PVE: entry, Logger: log.NewNopLogger()}
+	args := []json.RawMessage{json.RawMessage(`"iso-scan-agent"`), json.RawMessage(`":heavy:a:import/stemcell.qcow2"`), json.RawMessage(`{"cpu":1,"ram":1024,"root_disk_size":1024}`), json.RawMessage(`{}`), json.RawMessage(`[]`), json.RawMessage(`{}`)}
+
+	result, err := createVM(t.Context(), deps, args)
+	if err == nil {
+		t.Fatalf("the managed allocator handed out a VMID a config-drive ISO names; got result %v", result)
+	}
+	if entry.creates != 0 {
+		t.Fatalf("no VM may be created; got %d creates (err=%v)", entry.creates, err)
+	}
+	if !strings.Contains(err.Error(), "no free VMID") {
+		t.Errorf("want an error naming %q, got %v", "no free VMID", err)
+	}
+	listedMu.Lock()
+	defer listedMu.Unlock()
+	if listed["isopool"] == 0 {
+		t.Errorf("the ISO pool was never listed; listings = %v", listed)
 	}
 }

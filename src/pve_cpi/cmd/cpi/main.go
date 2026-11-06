@@ -387,7 +387,8 @@ func runWithArgs(args []string, stdin io.Reader, stdout, stderr io.Writer, opts 
 	// 60s TTL keeps the /storage index fresh enough to catch operator-driven
 	// storage.cfg edits between deploys while shielding a busy create_disk
 	// burst from per-call lookups.
-	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), 60*time.Second)
+	storageInfoCache := pve.NewStorageInfoCache(client.ClusterStorage(), 60*time.Second,
+		pve.WithSharedExportAdvice(pve.VMIDBandsFromConfig(cfg)))
 	// The local backend's cluster sweep reads a storage content listing to
 	// decide a volume is absent, and an export serving the wrong tree lists
 	// nothing on every node. The corroborators give that sweep the same

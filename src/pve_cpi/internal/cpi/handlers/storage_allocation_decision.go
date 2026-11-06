@@ -159,7 +159,12 @@ func ApplyStorageAllocationDecision(ctx context.Context, deps Deps, journal *aj.
 // adopt settled, whether in this decision or in an earlier attested adopt
 // that stopped before it saved the adoption.
 func observeAdoptOwnership(ctx context.Context, deps Deps, journal *aj.Journal, record, view aj.Record, decision StorageAllocationDecision, settlement *adoptSettlement) (aj.Verification, []adoptSettledConfigStep, error) {
-	if !adoptableRecord(view, decision) {
+	if volume, foreign := adoptForeignVolume(deps.Config, view); foreign {
+		return aj.Verification{}, nil, storageRefusalf("adoption refused: the record names volume %s, whose owner VMID lies "+
+			"outside every VMID band of this configuration or whose name carries another storage placement namespace's "+
+			"locator, so on storage that several clusters can mount it may belong to another cluster", volume)
+	}
+	if !adoptableRecord(deps.Config, view, decision) {
 		return aj.Verification{}, nil, storageRefusal("adoption requires a ready_to_return record, or a disk in reconciliation_required, with the exact CID")
 	}
 	observeCtx, settled, err := adoptOwnershipContext(ctx, deps, view, decision, settlement)

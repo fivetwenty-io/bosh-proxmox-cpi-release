@@ -484,8 +484,9 @@ func TestNextDiskVMID_EmptyStorageSkipsScan(t *testing.T) {
 	}
 }
 
-// Non-disk volumes on the storage (ISOs, backups) must NOT bleed into the
-// used set. Only names matching vm-NNN-disk-N count.
+// Backups on the storage must NOT bleed into the used set, while the CPI's
+// config-drive ISO does: vm-<N>-config.iso reserves N, because on an export
+// several clusters mount it may be another cluster's live config drive.
 func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
 	t.Parallel()
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -494,23 +495,19 @@ func TestNextDiskVMID_IgnoresNonDiskVolumes(t *testing.T) {
 	c.nodesSvc = &stubNodesService{
 		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 			return buildStorageContent(
-				"local:iso/vm-9000-config.iso",        // ISO — not vm-N-disk-N
-				"backups:backup/vzdump-qemu-9000.tar", // backup
-				"data:vm-9000-disk-0",                 // real disk → should be used
+				"local:iso/vm-9000-config.iso",        // config-drive ISO → reserves 9000
+				"backups:backup/vzdump-qemu-9002.tar", // backup → ignored
+				"data:vm-9001-disk-0",                 // real disk → reserves 9001
 			), nil
 		},
 	}
 
-	id, err := pve.NextDiskVMID(context.Background(), c, "pve", "data")
+	id, err := pve.NextDiskVMID(context.Background(), c, "pve", "data", pve.WithRange(9000, 9002))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 9000 is used (vm-9000-disk-0 matched); any other disk-range ID is valid.
-	if id == 9000 {
-		t.Error("returned 9000 but vm-9000-disk-0 volume marks it as used")
-	}
-	if id < pve.VMIDRangeDiskStart || id > pve.VMIDRangeDiskEnd {
-		t.Errorf("disk VMID %d outside [%d,%d]", id, pve.VMIDRangeDiskStart, pve.VMIDRangeDiskEnd)
+	if id != 9002 {
+		t.Errorf("NextDiskVMID = %d, want 9002 (9000 held by the config-drive ISO, 9001 by the disk, the backup ignored)", id)
 	}
 }
 
@@ -687,18 +684,23 @@ func TestNextVMID_WithStorageScan_APIFailurePropagates(t *testing.T) {
 }
 
 // TestNextVMID_WithStorageScan_IgnoresNonMatchingVolumes exercises the
-// widened volumeVMIDRegexp: ISO/backup/snippet volumes and anchoring edge
-// cases must never contribute a VMID to the used-set, for both the vm- and
-// base- forms.
+// widened volumeVMIDRegexp: backup/snippet volumes and anchoring edge cases
+// must never contribute a VMID to the used-set, for both the vm- and base-
+// forms. The config-drive ISO is the one non-disk name that does reserve its
+// VMID.
 func TestNextVMID_WithStorageScan_IgnoresNonMatchingVolumes(t *testing.T) {
 	t.Parallel()
+	// Every returned VMID is withheld from the next call by adding it to the
+	// cluster listing, so walking the band hands out exactly the IDs the scan
+	// left free.
+	var held []int
 	c := newVMIDClient(func(_ context.Context, _ *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
-		return buildResources(), nil
+		return buildResources(held...), nil
 	})
 	c.nodesSvc = &stubNodesService{
 		listStorageContentFn: func(_ context.Context, _, _ string, _ *sdknodes.ListStorageContentParams) (*sdknodes.ListStorageContentResponse, error) {
 			return buildStorageContent(
-				"local:iso/vm-200-config.iso",        // ISO — no "-disk-N" segment
+				"local:iso/vm-200-config.iso",        // config-drive ISO — reserves 200
 				"backups:backup/vzdump-qemu-201.tar", // backup — different naming entirely
 				"snippets:snippets/base-202-hook.pl", // snippet — no "-disk-N" segment
 				"data:notvm-203-disk-0.qcow2",        // anchoring: "vm-" not preceded by "^"/"/"/":"
@@ -710,17 +712,24 @@ func TestNextVMID_WithStorageScan_IgnoresNonMatchingVolumes(t *testing.T) {
 		},
 	}
 
-	id, err := pve.NextVMID(context.Background(), c, pve.WithRange(200, 210), pve.WithStorageScan("pve-a", "data"))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	got := map[int]bool{}
+	for range 11 {
+		id, err := pve.NextVMID(context.Background(), c, pve.WithRange(200, 210), pve.WithStorageScan("pve-a", "data"))
+		if err != nil {
+			break
+		}
+		got[id] = true
+		held = append(held, id)
 	}
-	if id == 206 || id == 207 {
-		t.Errorf("returned VMID %d, but 206 (vm-) and 207 (base-) are genuine matches and must be used", id)
+	for _, reserved := range []int{200, 206, 207} {
+		if got[reserved] {
+			t.Errorf("VMID %d was handed out, but its volume reserves it", reserved)
+		}
 	}
-	// 200-205 must all remain allocatable: none of those volumes are genuine
-	// vm-N-disk-N / base-N-disk-N matches.
-	if id < 200 || id > 210 {
-		t.Errorf("VMID %d outside range [200,210]", id)
+	for _, free := range []int{201, 202, 203, 204, 205, 208, 209, 210} {
+		if !got[free] {
+			t.Errorf("VMID %d was never handed out, but no genuine volume reserves it", free)
+		}
 	}
 }
 

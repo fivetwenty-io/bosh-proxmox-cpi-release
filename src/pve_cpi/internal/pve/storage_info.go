@@ -304,6 +304,10 @@ type StorageInfoCache struct {
 	// fake clock to drive TTL-expiry logic without wall-clock sleeps.
 	clock func() time.Time
 
+	// adviceBands, when set, are the bands the shared-export advice checks
+	// on each refresh (see WithSharedExportAdvice).
+	adviceBands *VMIDBands
+
 	mu       sync.Mutex
 	entries  map[string]storageInfoEntry
 	inflight map[string]chan struct{}
@@ -350,6 +354,17 @@ func WithNegativeCacheTTL(d time.Duration) StorageInfoCacheOption {
 func WithCacheClock(fn func() time.Time) StorageInfoCacheOption {
 	return func(c *StorageInfoCache) {
 		c.clock = fn
+	}
+}
+
+// WithSharedExportAdvice makes each refresh check the storage index against
+// bands, the effective VMID bands of the configuration that owns the cache,
+// and log one advice line per process when the cluster has network file
+// storage while every band is at its built-in value (see
+// AdviseSharedExportBandsOnce).
+func WithSharedExportAdvice(bands VMIDBands) StorageInfoCacheOption {
+	return func(c *StorageInfoCache) {
+		c.adviceBands = &bands
 	}
 }
 
@@ -551,6 +566,9 @@ func (c *StorageInfoCache) refresh(ctx context.Context) error {
 		infos = append(infos, c.entries[k].info)
 	}
 	WarnDuplicateBackingStoragesOnce(ctx, infos)
+	if c.adviceBands != nil {
+		AdviseSharedExportBandsOnce(ctx, infos, *c.adviceBands)
+	}
 	return nil
 }
 

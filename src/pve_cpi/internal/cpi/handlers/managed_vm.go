@@ -282,9 +282,14 @@ func (m *managedVMAllocation) execute(ctx context.Context, _ *managedVMObservati
 			rangeEnd = pve.VMIDRangeVMEnd
 		}
 		// The images scan leaves out any VMID that still names a volume the
-		// node can see, which PVE would count as the new VM's own disk. See
-		// allocateVM for the plain path's twin.
-		m.vmid, err = pve.NextVMID(ctx, m.deps.PVE, pve.WithRange(rangeStart, rangeEnd), pve.WithNodeImageStorageScan(m.shape.node))
+		// node can see, which PVE would count as the new VM's own disk. The
+		// ISO pool scan leaves out any VMID whose config-drive ISO is still
+		// there, which on an export several clusters mount may be another
+		// cluster's live config drive. See allocateVM for the plain path's
+		// twin.
+		m.vmid, err = pve.NextVMID(ctx, m.deps.PVE, pve.WithRange(rangeStart, rangeEnd),
+			pve.WithNodeImageStorageScan(m.shape.node),
+			pve.WithExtraStorageScan(m.shape.node, m.isoScanStorage(ctx)))
 		if err != nil {
 			return nil, err
 		}
@@ -401,4 +406,18 @@ func (m *managedVMAllocation) recordBindings(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// isoScanStorage returns the pool this VM's config-drive ISO will be written
+// to: the plan's ISO target when the plan places one, and the effective ISO
+// pool otherwise. VMID allocation scans it so a leftover vm-<N>-config.iso
+// keeps N out of reach.
+func (m *managedVMAllocation) isoScanStorage(ctx context.Context) string {
+	if iso, ok := managedVMRoleTarget(m.prepared.plan, storageRoleISO); ok && iso.StorageID != "" {
+		return iso.StorageID
+	}
+	if m.deps.Config == nil {
+		return ""
+	}
+	return m.deps.EffectiveISOStorage(ctx)
 }

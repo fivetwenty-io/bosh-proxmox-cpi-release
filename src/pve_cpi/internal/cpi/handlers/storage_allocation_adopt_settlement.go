@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	aj "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/allocationjournal"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -145,24 +146,73 @@ func proveSettledHolder(ctx context.Context, deps Deps, rd resolvedDisk, record 
 
 // adoptableRecord reports whether adopt accepts record for decision: a record
 // in ready_to_return, or a disk in reconciliation_required, whose CID is the
-// one the decision expects.
-func adoptableRecord(record aj.Record, decision StorageAllocationDecision) bool {
+// one the decision expects, and that names no volume the client's
+// shared-volume guard would call foreign under cfg (see
+// adoptForeignVolume).
+func adoptableRecord(cfg *config.CPIConfig, record aj.Record, decision StorageAllocationDecision) bool {
 	returned := record.State == aj.ReadyToReturn || record.Kind == allocationKindDisk && record.State == aj.ReconciliationRequired
-	return returned && record.CID != "" && record.CID == decision.ExpectedCID
+	if !returned || record.CID == "" || record.CID != decision.ExpectedCID {
+		return false
+	}
+	_, foreign := adoptForeignVolume(cfg, record)
+	return !foreign
+}
+
+// adoptForeignVolume returns the first volume record names that
+// pve.ForeignVolumeError calls foreign under cfg's bands and storage placement
+// namespace, and reports whether there is one. It reads the intended volume
+// and the observed volume IDs of every step that records ownership rather
+// than preservation work for another allocation, which include the volume a
+// disk record's CID was minted for. Adopt cannot classify a storage as the client's guard
+// does, so it treats every storage as one that several clusters may mount,
+// which refuses a superset of what the guard refuses: adopt must never take
+// ownership of a volume that the client would then refuse to delete.
+func adoptForeignVolume(cfg *config.CPIConfig, record aj.Record) (string, bool) {
+	bands := pve.VMIDBandsFromConfig(cfg)
+	namespace := ""
+	if cfg != nil {
+		namespace = cfg.StoragePlacementNamespace
+	}
+	volumes := make([]string, 0, 2*len(record.Steps))
+	for i := range record.Steps {
+		step := &record.Steps[i]
+		if step.Target.External {
+			continue
+		}
+		volumes = append(volumes, step.Target.IntendedVolume)
+		volumes = append(volumes, step.VolIDs...)
+	}
+	for _, volid := range volumes {
+		if volid == "" {
+			continue
+		}
+		storageName, volume, ok := strings.Cut(volid, ":")
+		if !ok {
+			storageName, volume = "", volid
+		}
+		if pve.ForeignVolumeError(storageName, volume, bands, namespace) != nil {
+			return volid, true
+		}
+	}
+	return "", false
 }
 
 // adoptSettleableRecord reports whether adopt can settle configuration writes
 // on record for decision. That takes a disk record with the CID the decision
 // expects that adopt accepts as it is, or one that a disk call left planned or
-// observed when it stopped, which stalled then names.
-func adoptSettleableRecord(record aj.Record, decision StorageAllocationDecision) (stalled string, ok bool) {
+// observed when it stopped, which stalled then names. A record that names a
+// foreign volume (see adoptForeignVolume) is never settleable.
+func adoptSettleableRecord(cfg *config.CPIConfig, record aj.Record, decision StorageAllocationDecision) (stalled string, ok bool) {
 	if record.Kind != allocationKindDisk {
 		return "", false
 	}
-	if adoptableRecord(record, decision) {
+	if adoptableRecord(cfg, record, decision) {
 		return "", true
 	}
 	if record.CID == "" || record.CID != decision.ExpectedCID || record.State != aj.Planned && record.State != aj.Observed {
+		return "", false
+	}
+	if _, foreign := adoptForeignVolume(cfg, record); foreign {
 		return "", false
 	}
 	return lifecycleOperation(record.Reason)
@@ -319,7 +369,7 @@ func planAdoptConfigSettlement(ctx context.Context, deps Deps, record aj.Record,
 	if missing := adoptMissingAttestations(decision); len(missing) > 0 {
 		return refuseAll("; adopt settles this write from a readback only when the decision attests that the previous writer is fenced and that its PVE tasks have settled, so rerun adopt with " + joinWithOxfordComma(missing) + " once both hold")
 	}
-	stalled, ok := adoptSettleableRecord(record, decision)
+	stalled, ok := adoptSettleableRecord(deps.Config, record, decision)
 	if !ok {
 		return refuseAll(adoptRecordStateClause)
 	}
