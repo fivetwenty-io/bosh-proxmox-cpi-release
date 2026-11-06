@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+	sdkerrors "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/errors"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
@@ -49,15 +50,21 @@ type haSim struct {
 	lrmStale  bool
 
 	// updateErrs fail successive resource writes, and landOnErr applies a
-	// failing write anyway. getErr fails every per-resource read. statusErr
-	// fails every power read.
+	// failing write anyway. listErr fails every read of the HA resource list.
+	// statusErr fails every power read. onWrite runs after every resource write
+	// and direct call is recorded, before it fails or lands.
 	updateErrs []error
 	landOnErr  bool
-	getErr     error
+	listErr    error
 	statusErr  error
+	onWrite    func(s *haSim)
 
-	// awaitErr is what the direct call's task wait returns.
-	awaitErr error
+	// awaitErr is what the direct call's task wait returns. directErrs fail
+	// successive direct calls. directRefused keeps a direct call whose task
+	// PVE refuses from changing the request.
+	awaitErr      error
+	directErrs    []error
+	directRefused bool
 
 	writes []string // states written through PUT /cluster/ha/resources/{sid}
 	direct []string // direct calls, start or stop, with the node they went to
@@ -110,6 +117,9 @@ func (s *haSim) ListHaResources(
 ) (*sdkcluster.ListHaResourcesResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	rows := []json.RawMessage{haResource("vm:200", "started")}
 	if s.requested != "" {
 		rows = append(rows, haResource("vm:100", s.requested))
@@ -122,9 +132,6 @@ func (s *haSim) ListHaResources(
 func (s *haSim) GetHaResources(_ context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.getErr != nil {
-		return nil, s.getErr
-	}
 	resp := &sdkcluster.GetHaResourcesResponse{Sid: sid}
 	if sid == "vm:100" && s.requested != "" {
 		state := s.requested
@@ -141,6 +148,9 @@ func (s *haSim) UpdateHaResources(_ context.Context, sid string, params *sdkclus
 	}
 	state := *params.State
 	s.writes = append(s.writes, state)
+	if s.onWrite != nil {
+		s.onWrite(s)
+	}
 	var failure error
 	if len(s.updateErrs) > 0 {
 		failure, s.updateErrs = s.updateErrs[0], s.updateErrs[1:]
@@ -208,23 +218,44 @@ func (s *haSim) Status(_ context.Context, node string, vmid int) (map[string]int
 func (s *haSim) Start(_ context.Context, node string, _ int) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.direct = append(s.direct, "start@"+node)
-	if s.raw == "error" {
-		return "", errors.New("500 service 'vm:100' in error state, must be disabled and fixed first")
+	if err := s.directCallLocked("start@" + node); err != nil {
+		return "", err
 	}
-	s.requestLocked("started")
+	if !s.directRefused {
+		s.requestLocked("started")
+	}
 	return "UPID:" + node + ":0001:hastart", nil
 }
 
 func (s *haSim) Stop(_ context.Context, node string, _ int) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.direct = append(s.direct, "stop@"+node)
-	if s.raw == "error" {
-		return "", errors.New("500 service 'vm:100' in error state, must be disabled and fixed first")
+	if err := s.directCallLocked("stop@" + node); err != nil {
+		return "", err
 	}
-	s.requestLocked("stopped")
+	if !s.directRefused {
+		s.requestLocked("stopped")
+	}
 	return "UPID:" + node + ":0002:hastop", nil
+}
+
+// directCallLocked records a direct call and returns its failure, if any.
+func (s *haSim) directCallLocked(call string) error {
+	s.direct = append(s.direct, call)
+	if s.onWrite != nil {
+		s.onWrite(s)
+	}
+	if len(s.directErrs) > 0 {
+		var failure error
+		failure, s.directErrs = s.directErrs[0], s.directErrs[1:]
+		if failure != nil {
+			return failure
+		}
+	}
+	if s.raw == "error" {
+		return errors.New("500 service 'vm:100' in error state, must be disabled and fixed first")
+	}
+	return nil
 }
 
 func (s *haSim) deps() pve.HAStateDeps {
@@ -414,9 +445,7 @@ func TestSetHAState_DirectTaskRefused(t *testing.T) {
 	s := newHASim("started", "started", "running")
 	s.frozen = true
 	s.awaitErr = errors.New("task UPID:pve2:0002:hastop failed: exit status \"permission denied\"")
-	// The sim records the request before the task fails, so make the re-read
-	// show the old request: the refused task changed nothing.
-	s.getErr = errors.New("403 permission check failed")
+	s.directRefused = true
 	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, false))
 	if err == nil || !strings.Contains(err.Error(), "refused the direct stopped request") {
 		t.Fatalf("err = %v; want the refusal", err)
@@ -473,16 +502,133 @@ func TestSetHAState_HeldTransportErrorThatDidNotLand(t *testing.T) {
 	wantWrites(t, s, "stopped", "stopped")
 }
 
-func TestSetHAState_HeldTransportErrorWithUnreadableResource(t *testing.T) {
+// A retry needs a read that can judge it, so an unreadable HA state after a
+// failed write ends the call with that one write.
+func TestSetHAState_HeldTransportErrorWithUnreadableState(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	s.updateErrs = []error{transportDrop(), transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.listErr = transportDrop() }
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	wantRetriable(t, err, "requesting stopped for vm:100 failed", "could not be read again", "not sent again")
+	wantWrites(t, s, "stopped")
+}
+
+// A write that keeps failing stops at the bounded four attempts.
+func TestSetHAState_HeldTransportErrorIsBounded(t *testing.T) {
 	t.Parallel()
 	s := newHASim("started", "started", "running")
 	s.updateErrs = []error{transportDrop(), transportDrop(), transportDrop(), transportDrop(), transportDrop()}
-	s.getErr = transportDrop()
 	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
 	wantRetriable(t, err, "requesting stopped for vm:100 failed")
-	writes, _ := s.seen()
-	if len(writes) != 4 {
-		t.Fatalf("writes = %v; want the bounded four attempts", writes)
+	wantWrites(t, s, "stopped", "stopped", "stopped", "stopped")
+}
+
+// PVE refuses a state transition with a 500, which reads as transient, but the
+// same request gets the same answer, so it is not sent again.
+func TestSetHAState_StateRefusalAsServerErrorIsNotRetried(t *testing.T) {
+	t.Parallel()
+	refusal := fmt.Errorf("cluster.UpdateHaResources: %w: service 'vm:100' in error state, "+
+		"must be disabled and fixed first", sdkerrors.ErrServer)
+	if !pve.IsTransientTransport(refusal) {
+		t.Fatal("the refusal must read as transient for this test to mean anything")
+	}
+	s := newHASim("started", "started", "running")
+	s.updateErrs = []error{refusal}
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	if err == nil || !strings.Contains(err.Error(), "must be disabled and fixed first") {
+		t.Fatalf("err = %v; want the refusal", err)
+	}
+	wantWrites(t, s, "stopped")
+}
+
+// A barrier that sets ignored during the backoff wins: the teardown gets the
+// not-managed outcome and the retry is never sent.
+func TestSetHAState_IgnoredDuringTheBackoffForTeardown(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	s.updateErrs = []error{transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.raw, sim.requested = "", "ignored" }
+	res, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	if err != nil {
+		t.Fatalf("SetHAState: %v", err)
+	}
+	if res.Outcome != pve.HAStateNotManaged || res.Node != "pve2" || res.State == nil ||
+		res.State.Requested != "ignored" {
+		t.Fatalf("result = %+v; want not managed", res)
+	}
+	wantWrites(t, s, "stopped")
+}
+
+func TestSetHAState_IgnoredDuringTheBackoffForKeep(t *testing.T) {
+	t.Parallel()
+	s := newHASim("stopped", "stopped", "stopped")
+	s.updateErrs = []error{transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.raw, sim.requested = "", "ignored" }
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStarted, pve.HACallerKeep, true))
+	wantRetriable(t, err, "is ignored")
+	if !errors.Is(err, pve.ErrHAResourceIgnored) {
+		t.Fatalf("err = %v; want ErrHAResourceIgnored in its chain", err)
+	}
+	wantWrites(t, s, "started")
+}
+
+// Another writer changed the request during the backoff, so the retry would
+// overwrite it.
+func TestSetHAState_CompetingWriterDuringTheBackoff(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	s.updateErrs = []error{transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.requested = "disabled" }
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	wantRetriable(t, err, "another writer", `"disabled"`)
+	wantWrites(t, s, "stopped")
+}
+
+// A kept VM's guest starts while a failed disabled write waits to be retried,
+// so disabled is never sent to the running guest.
+func TestSetHAState_KeptGuestStartsBeforeTheDisabledRetry(t *testing.T) {
+	t.Parallel()
+	s := newHASim("error", "started", "stopped")
+	s.updateErrs = []error{transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.power = "running" }
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStarted, pve.HACallerKeep, true))
+	wantRetriable(t, err, "is running on node pve2", "disabled, which would stop it, was not sent again")
+	wantWrites(t, s, "disabled")
+	if s.power != "running" {
+		t.Fatalf("the guest was stopped")
+	}
+}
+
+func TestSetHAState_KeptGuestPowerUnreadableBeforeTheDisabledRetry(t *testing.T) {
+	t.Parallel()
+	s := newHASim("error", "started", "stopped")
+	s.updateErrs = []error{transportDrop()}
+	s.onWrite = func(sim *haSim) { sim.statusErr = errors.New("500 node pve2 is busy") }
+	_, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStarted, pve.HACallerKeep, true))
+	if err == nil || !strings.Contains(err.Error(), "unreadable before a retry of disabled") {
+		t.Fatalf("err = %v; want the unreadable power refusal", err)
+	}
+	wantWrites(t, s, "disabled")
+}
+
+// The VM moved during the backoff, so the direct retry goes to its new node.
+func TestSetHAState_DirectRetryFollowsTheMove(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	s.directErrs = []error{fmt.Errorf("qemu.Stop: %w", io.ErrUnexpectedEOF)}
+	s.onWrite = func(sim *haSim) {
+		if len(sim.direct) == 1 {
+			sim.node = "pve3"
+		}
+	}
+	res, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, false))
+	if err != nil {
+		t.Fatalf("SetHAState: %v", err)
+	}
+	_, direct := s.seen()
+	if res.Outcome != pve.HAStateReached || res.Node != "pve3" || strings.Join(direct, ",") != "stop@pve2,stop@pve3" {
+		t.Fatalf("result %+v direct %v; want the retry on pve3", res, direct)
 	}
 }
 
@@ -654,7 +800,9 @@ func TestSetHAState_WritesNothingWhenItCannotAct(t *testing.T) {
 		{"fence state", func(s *haSim) { s.raw = "fence" }, "fenced"},
 		{"not an HA resource", func(s *haSim) { s.raw, s.requested = "", "" }, "not an HA resource"},
 		{"being removed", func(s *haSim) { s.requested = "" }, "being removed"},
-		{"ignored", func(s *haSim) { s.raw, s.requested = "", "ignored" }, "ignored"},
+		{"ignored and still in the CRM", func(s *haSim) { s.requested = "ignored" }, "CRM still lists it"},
+		{"ignored on a node with a stale LRM", func(s *haSim) { s.raw, s.requested, s.lrmStale = "", "ignored", true },
+			"cannot be torn down now"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -668,6 +816,77 @@ func TestSetHAState_WritesNothingWhenItCannotAct(t *testing.T) {
 			wantNoWrites(t, s)
 		})
 	}
+}
+
+// An ignored resource that the CRM has dropped gets no state request. The
+// teardown stops it directly, and a kept caller gets the typed refusal.
+func TestSetHAState_IgnoredResource(t *testing.T) {
+	t.Parallel()
+	for _, console := range []bool{true, false} {
+		t.Run(fmt.Sprintf("sys_console=%v", console), func(t *testing.T) {
+			t.Parallel()
+			s := newHASim("", "ignored", "running")
+			res, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, console))
+			if err != nil {
+				t.Fatalf("teardown: %v", err)
+			}
+			if res.Outcome != pve.HAStateNotManaged || res.SID != "vm:100" || res.Node != "pve2" || res.ClearedError ||
+				res.ReregistrationError() != nil {
+				t.Fatalf("teardown result = %+v; want not managed", res)
+			}
+			res, err = pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStarted, pve.HACallerKeep, console))
+			if res != nil || !errors.Is(err, pve.ErrHAResourceIgnored) {
+				t.Fatalf("keep: res %+v err %v; want ErrHAResourceIgnored", res, err)
+			}
+			wantRetriable(t, err, "is ignored")
+			wantNoWrites(t, s)
+		})
+	}
+}
+
+// A request that becomes ignored while SetHAState waits ends the wait.
+func TestSetHAState_IgnoredDuringTheWait(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	// The CRM's next round after the stop request finds the resource ignored.
+	s.delay = 2
+	s.nextRaw = []string{"started"}
+	s.onApply = func(sim *haSim) { sim.raw, sim.requested = "", "ignored" }
+	res, err := pve.SetHAState(haStateCtx(t), s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	if err != nil || res.Outcome != pve.HAStateNotManaged {
+		t.Fatalf("res %+v err %v; want not managed", res, err)
+	}
+}
+
+// The call ends five seconds before the context's deadline, not at the end
+// of a longer budget.
+func TestSetHAState_BudgetClampedToTheContextDeadline(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	s.frozen = true
+	ctx, cancel := context.WithTimeout(haStateCtx(t), 5*time.Second+100*time.Millisecond)
+	defer cancel()
+	in := haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true)
+	in.Budget = time.Hour
+	start := time.Now()
+	_, err := pve.SetHAState(ctx, s.deps(), in)
+	wantRetriable(t, err, "did not reach stopped")
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("the call took %s; want it to end at the clamped deadline", elapsed)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the call used up the reserve it must leave on the context")
+	}
+}
+
+func TestSetHAState_NoTimeLeftWritesNothing(t *testing.T) {
+	t.Parallel()
+	s := newHASim("started", "started", "running")
+	ctx, cancel := context.WithTimeout(haStateCtx(t), 2*time.Second)
+	defer cancel()
+	_, err := pve.SetHAState(ctx, s.deps(), haStateIn(pve.HATargetStopped, pve.HACallerTeardown, true))
+	wantRetriable(t, err, "deadline leaves no time")
+	wantNoWrites(t, s)
 }
 
 func TestSetHAState_WaitsThroughMotionBeforeWriting(t *testing.T) {
@@ -761,6 +980,7 @@ func TestSetHAState_WrongCalls(t *testing.T) {
 		{"no awaiter on the direct path", t.Context(), func() pve.HAStateDeps { d := s.deps(); d.AwaitTask = nil; return d },
 			func(in haIn) haIn { in.SysConsole = false; return in }, "awaiter"},
 		{"VM ID", t.Context(), s.deps, func(in haIn) haIn { in.VMID = 0; return in }, "VM ID"},
+		{"node", t.Context(), s.deps, func(in haIn) haIn { in.Node = " "; return in }, "node"},
 		{"target", t.Context(), s.deps,
 			func(in haIn) haIn { in.Target = "disabled"; return in }, "target"},
 		{"caller", t.Context(), s.deps, func(in haIn) haIn { in.Caller = 0; return in }, "caller"},

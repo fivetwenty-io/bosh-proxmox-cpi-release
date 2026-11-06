@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -42,7 +43,33 @@ const (
 	// attempt after a failure follows a re-read that proved the request did not
 	// land.
 	haStateWriteMaxAttempts = 4
+
+	// haStateDeadlineReserve is the time SetHAState leaves on a context that
+	// carries a deadline, so the caller still has time to act on the answer.
+	haStateDeadlineReserve = 5 * time.Second
 )
+
+// haStateRefusals are PVE's texts for a state request it refuses outright. PVE
+// answers them with a 500, which IsTransientTransport reads as transient, but
+// the same request gets the same answer until something else changes the
+// resource, so SetHAState does not send it again.
+var haStateRefusals = []string{
+	"must be disabled and fixed first",
+}
+
+// isHAStateRefusal reports whether err carries one of haStateRefusals.
+func isHAStateRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, text := range haStateRefusals {
+		if strings.Contains(msg, text) {
+			return true
+		}
+	}
+	return false
+}
 
 // HACaller says what the caller of SetHAState does with the VM afterwards,
 // because clearing an error stops the guest on one path and must never stop it
@@ -75,7 +102,29 @@ const (
 	// state again. A caller that cannot re-register returns
 	// SetHAStateResult.ReregistrationError.
 	HAStateNeedsReregistration HAStateOutcome = "needs_reregistration"
+
+	// HAStateNotManaged means the resource is ignored and the CRM has dropped
+	// it from its state, so the CRM neither moves nor fences the VM and no HA
+	// state request applies to it. SetHAState wrote nothing. Only the teardown
+	// caller gets this outcome. It stops the VM with the plain qemu stop and
+	// destroys it with purge, which also removes the resource. A kept caller
+	// gets an error that wraps ErrHAResourceIgnored instead.
+	HAStateNotManaged HAStateOutcome = "not_managed"
 )
+
+// ErrHAResourceIgnored is in the chain of the retriable error that SetHAState
+// returns to HACallerKeep when the resource is ignored, whether on the first
+// read, before a retry, or during the wait. Callers match it with errors.Is.
+// SetHAState wrote nothing after it saw the ignored request, because a state
+// request would hand the resource back to the CRM in the middle of whatever set
+// it ignored, such as a narrowing barrier or a staging.
+var ErrHAResourceIgnored = errors.New("the HA resource is ignored")
+
+// haIgnoredRead carries a read that shows an ignored request up to SetHAState,
+// which turns it into the caller's outcome.
+type haIgnoredRead struct{ st *HAServiceState }
+
+func (e *haIgnoredRead) Error() string { return e.st.SID + " is ignored" }
 
 // HAStateCluster is the subset of the PVE cluster API that SetHAState uses. It
 // is satisfied by the sdk cluster service.
@@ -121,8 +170,8 @@ type SetHAStateInput struct {
 	// VMID is the guest ID. It must be positive.
 	VMID int
 
-	// Node is the node the cluster scan names for the VM. The CRM's node wins
-	// once the CRM holds the service.
+	// Node is the node the cluster scan names for the VM. It must not be
+	// empty. The CRM's node wins once the CRM holds the service.
 	Node string
 
 	// Target is the state the caller wants. The teardown protocol may only ask
@@ -139,7 +188,8 @@ type SetHAStateInput struct {
 	SysConsole bool
 
 	// Budget bounds the whole call, every wait included. Callers pass
-	// pve.ha.motion_wait_sec. It must be positive.
+	// pve.ha.motion_wait_sec. It must be positive. When ctx carries a deadline,
+	// the call also ends five seconds before it.
 	Budget time.Duration
 
 	// PollInterval is the poll cadence, two seconds when zero.
@@ -195,8 +245,14 @@ func (r *SetHAStateResult) ReregistrationError() error {
 // and the owner node reports the matching power state.
 //
 // A held transport error leaves a write ambiguous, because the request may
-// have landed. SetHAState then re-reads the resource and compares its request
-// with what it meant to write before it retries anything.
+// have landed. SetHAState then re-reads the service and compares its request
+// with what it meant to write before it retries anything. Just before a retry
+// it reads the service again and sends nothing more when that read is
+// unknown, when the request became ignored, or when another writer changed the
+// request to something other than the value SetHAState found and its target.
+// A retry of disabled for a kept VM also needs a fresh power read that still
+// shows the guest stopped. The retry goes to the node of that read. PVE's
+// refusal of a state transition is not retried even when it arrives as a 500.
 //
 // PVE refuses every request except disabled for a resource in error. The
 // teardown caller, and a kept VM whose owner node reports it stopped, get the
@@ -206,12 +262,20 @@ func (r *SetHAStateResult) ReregistrationError() error {
 // Sys.Console, so without it the call returns a retriable error that names the
 // privilege and the command that fits the caller.
 //
+// An ignored resource gets no state request. For HACallerTeardown, once the
+// CRM has dropped the service and the node is online, the result is
+// HAStateNotManaged with no error, and the caller stops the VM directly and
+// destroys it with purge. While the CRM still lists the service, or the node
+// cannot be judged, the teardown caller gets a retriable error. For
+// HACallerKeep the call returns a retriable error that wraps
+// ErrHAResourceIgnored. Both apply whenever SetHAState sees the ignored
+// request: on the first read, before a retry, or during the wait.
+//
 // SetHAState writes nothing and returns a retriable error when the first read
-// is unknown, says to defer, shows a resource that is not configured or is
-// ignored, or stays in motion toward another state past the budget. A wrong
-// call returns a non-retriable error, and a request that PVE definitely
-// refused, such as a permission check or a failed task, keeps the class that
-// WrapError gives it.
+// is unknown, says to defer, shows a resource that is not configured, or stays
+// in motion toward another state past the budget. A wrong call returns a
+// non-retriable error, and a request that PVE definitely refused, such as a
+// permission check or a failed task, keeps the class that WrapError gives it.
 func SetHAState(ctx context.Context, deps HAStateDeps, in SetHAStateInput) (*SetHAStateResult, error) {
 	if err := validateSetHAState(ctx, deps, in); err != nil {
 		return nil, err
@@ -220,26 +284,31 @@ func SetHAState(ctx context.Context, deps HAStateDeps, in SetHAStateInput) (*Set
 	if interval <= 0 {
 		interval = haStateDefaultPollInterval
 	}
+	sid := HAServiceSID(in.VMID)
+	deadline, budget, err := haStateDeadline(ctx, sid, in.Budget)
+	if err != nil {
+		return nil, err
+	}
 	run := &haStateRun{
 		deps:     deps,
 		in:       in,
-		sid:      HAServiceSID(in.VMID),
-		deadline: time.Now().Add(in.Budget),
+		sid:      sid,
+		deadline: deadline,
+		budget:   budget,
 		interval: interval,
 		logger:   log.FromContext(ctx),
 	}
 
 	st, err := run.settle(ctx)
 	if err != nil {
-		return nil, err
+		return run.fail(err)
 	}
-	run.node = st.Node
 	res := &SetHAStateResult{SID: run.sid, VMID: in.VMID, Node: st.Node, State: st}
 
 	if st.Raw == haRawError {
 		cleared, needsReadd, clearErr := run.clearError(ctx, st)
 		if clearErr != nil {
-			return nil, clearErr
+			return run.fail(clearErr)
 		}
 		if needsReadd {
 			res.Outcome = HAStateNeedsReregistration
@@ -250,13 +319,13 @@ func SetHAState(ctx context.Context, deps HAStateDeps, in SetHAStateInput) (*Set
 	}
 
 	if st.Requested != string(in.Target) {
-		if err := run.request(ctx, string(in.Target)); err != nil {
-			return nil, err
+		if err := run.request(ctx, string(in.Target), st.Requested); err != nil {
+			return run.fail(err)
 		}
 	}
 	final, err := run.await(ctx, string(in.Target))
 	if err != nil {
-		return nil, err
+		return run.fail(err)
 	}
 	res.Outcome = HAStateReached
 	res.Node = final.Node
@@ -277,6 +346,8 @@ func validateSetHAState(ctx context.Context, deps HAStateDeps, in SetHAStateInpu
 		return cpierrors.Cloud("SetHAState: the direct path needs a task awaiter")
 	case in.VMID <= 0:
 		return cpierrors.Cloud("SetHAState: VM ID %d must be positive", in.VMID)
+	case strings.TrimSpace(in.Node) == "":
+		return cpierrors.Cloud("SetHAState: the node of VM %d must not be empty", in.VMID)
 	case in.Target != HATargetStarted && in.Target != HATargetStopped:
 		return cpierrors.Cloud("SetHAState: target %q is not started or stopped", in.Target)
 	case !in.Caller.valid():
@@ -289,25 +360,86 @@ func validateSetHAState(ctx context.Context, deps HAStateDeps, in SetHAStateInpu
 	return nil
 }
 
+// haStateDeadline returns the end of the call: the budget, or five seconds
+// before ctx's deadline when that comes first. It returns a retriable error
+// when no time is left.
+func haStateDeadline(ctx context.Context, sid string, budget time.Duration) (time.Time, time.Duration, error) {
+	now := time.Now()
+	deadline := now.Add(budget)
+	if dl, ok := ctx.Deadline(); ok && dl.Add(-haStateDeadlineReserve).Before(deadline) {
+		deadline = dl.Add(-haStateDeadlineReserve)
+	}
+	left := deadline.Sub(now)
+	if left <= 0 {
+		return time.Time{}, 0, cpierrors.Retriable("SetHAState: the call's deadline leaves no time to change the "+
+			"state of %s, so nothing was written; retry with more time", sid)
+	}
+	return deadline, left, nil
+}
+
 // haStateRun carries one SetHAState call.
 type haStateRun struct {
 	deps     HAStateDeps
 	in       SetHAStateInput
 	sid      string
 	deadline time.Time
+	budget   time.Duration
 	interval time.Duration
 	logger   *log.Logger
 
 	// node is the VM's node from the latest known read. The direct call goes
 	// there.
 	node string
+
+	// sentDisabled is true once a disabled request to clear an error was sent.
+	sentDisabled bool
 }
 
-// read takes one normalized read as a live-node decision.
+// read takes one normalized read as a live-node decision. A known read with a
+// node moves r.node there.
 func (r *haStateRun) read(ctx context.Context) (*HAServiceState, error) {
-	return ReadHAServiceState(ctx, r.deps.Cluster, r.deps.Nodes, HAServiceStateInput{
+	st, err := ReadHAServiceState(ctx, r.deps.Cluster, r.deps.Nodes, HAServiceStateInput{
 		VMID: r.in.VMID, VMNode: r.in.Node, Kind: HADecisionLive, HealthOptions: r.in.HealthOptions,
 	})
+	if err == nil && st.Known && st.Node != "" {
+		r.node = st.Node
+	}
+	return st, err
+}
+
+// fail turns an ignored read that SetHAState found on its way into the
+// caller's outcome, and returns every other error as it is.
+func (r *haStateRun) fail(err error) (*SetHAStateResult, error) {
+	var ignored *haIgnoredRead
+	if !errors.As(err, &ignored) {
+		return nil, err
+	}
+	return r.ignored(ignored.st)
+}
+
+// ignored is the outcome for a read that shows an ignored request. Nothing is
+// written after it.
+func (r *haStateRun) ignored(st *HAServiceState) (*SetHAStateResult, error) {
+	if r.in.Caller == HACallerKeep {
+		return nil, cpierrors.WrapAs(ErrHAResourceIgnored, cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"SetHAState: %s is ignored, so the CRM does not manage it and its state is not changed for a VM that "+
+				"BOSH keeps; finish or undo whatever set it ignored, then retry", r.sid))
+	}
+	if st.InCRM {
+		return nil, cpierrors.Retriable("SetHAState: %s is ignored but the CRM still lists it as %s on node %s, so "+
+			"the CRM has not let go of the VM yet and nothing was written; retry when the CRM drops it",
+			r.sid, st.Raw, st.Node)
+	}
+	if disp, why := st.Disposition(); disp != HAProceed {
+		return nil, cpierrors.Retriable("SetHAState: %s is ignored but cannot be torn down now (%s), so nothing "+
+			"was written", r.sid, why)
+	}
+	r.logger.Info("ha: resource is ignored, so the teardown stops the VM directly",
+		log.String("sid", r.sid), log.String("node", st.Node))
+	return &SetHAStateResult{
+		Outcome: HAStateNotManaged, SID: r.sid, VMID: r.in.VMID, Node: st.Node,
+		ClearedError: r.sentDisabled, State: st,
+	}, nil
 }
 
 // sleep waits one poll interval, or less when the deadline is nearer. It
@@ -360,8 +492,7 @@ func (r *haStateRun) settle(ctx context.Context) (*HAServiceState, error) {
 			return nil, cpierrors.Retriable("SetHAState: %s is not an HA resource, so there is no HA state to "+
 				"change", r.sid)
 		case st.Requested == haRequestedIgnored:
-			return nil, cpierrors.Retriable("SetHAState: %s is ignored, so the CRM does not manage it and its state "+
-				"is not changed here; finish or undo whatever set it ignored, then retry", r.sid)
+			return nil, &haIgnoredRead{st: st}
 		}
 		disp, why := st.Disposition()
 		switch disp {
@@ -378,7 +509,7 @@ func (r *haStateRun) settle(ctx context.Context) (*HAServiceState, error) {
 					return nil, err
 				}
 				return nil, cpierrors.Retriable("SetHAState: %s is still in motion after %s (%s), so nothing was "+
-					"written; retry when it settles", r.sid, r.in.Budget, why)
+					"written; retry when it settles", r.sid, r.budget, why)
 			}
 		default:
 			return nil, cpierrors.Retriable("SetHAState: %s cannot change state now (%s), so nothing was written",
@@ -416,9 +547,10 @@ func (r *haStateRun) clearError(
 	r.logger.Info("ha: clearing the error state with disabled",
 		log.String("sid", r.sid), log.String("node", st.Node), log.String("uid", st.UID),
 		log.Bool("teardown", r.in.Caller == HACallerTeardown), log.String("power", power))
-	if err := r.request(ctx, haStateDisabled); err != nil {
+	if err := r.request(ctx, haStateDisabled, st.Requested); err != nil {
 		return nil, false, err
 	}
+	r.sentDisabled = true
 	cleared, err = r.await(ctx, haStateDisabled)
 	if err != nil {
 		return nil, false, err
@@ -473,33 +605,33 @@ func (r *haStateRun) power(ctx context.Context, node string) (string, error) {
 }
 
 // request asks for state, through the HA resource with Sys.Console and through
-// the direct call without it. After a failed attempt it re-reads the resource,
-// and a request that landed counts as sent. Only a failure that the re-read
-// proved did not land, and that is transient, is tried again.
-func (r *haStateRun) request(ctx context.Context, state string) error {
-	var lastErr error
-	for attempt := 0; attempt < haStateWriteMaxAttempts; attempt++ {
+// the direct call without it. prev is the request the service carried when the
+// decision was made. After a failed attempt it re-reads the service, and a
+// request that landed counts as sent. Only a transient failure that the
+// re-read proved did not land is tried again, and only after a read taken just
+// before the retry passes mayResend.
+func (r *haStateRun) request(ctx context.Context, state, prev string) error {
+	for attempt := 0; ; attempt++ {
 		err := r.send(ctx, state)
 		if err == nil {
 			r.logger.Info("ha: state requested",
 				log.String("sid", r.sid), log.String("state", state), log.Bool("direct_call", !r.in.SysConsole))
 			return nil
 		}
-		if r.landed(ctx, state) {
+		if st, _ := r.read(ctx); landed(st, state) {
 			r.logger.Info("ha: state request landed despite its error",
 				log.String("sid", r.sid), log.String("state", state), log.Err(err))
 			return nil
 		}
-		lastErr = err
-		if !IsTransientTransport(err) && !IsPVEPushback(err) {
-			break
+		if (!IsTransientTransport(err) && !IsPVEPushback(err)) || isHAStateRefusal(err) {
+			return r.failed(state, err)
 		}
 		d := TransientBackoffFor(ctx, attempt)
 		if IsPVEPushback(err) && backoffFromCtx(ctx) == nil {
 			d = PushbackBackoff(attempt)
 		}
 		if attempt == haStateWriteMaxAttempts-1 || time.Until(r.deadline) <= d {
-			break
+			return r.failed(state, err)
 		}
 		r.logger.Info("ha: retrying a state request that did not land",
 			log.String("sid", r.sid), log.String("state", state), log.Int("attempt", attempt+1), log.Err(err))
@@ -509,8 +641,67 @@ func (r *haStateRun) request(ctx context.Context, state string) error {
 				fmt.Sprintf("SetHAState: requesting %s for %s ended with the call", state, r.sid))
 		case <-time.After(d):
 		}
+		st, readErr := r.read(ctx)
+		if readErr != nil {
+			return readErr
+		}
+		if landed(st, state) {
+			r.logger.Info("ha: state request landed during the backoff",
+				log.String("sid", r.sid), log.String("state", state), log.Err(err))
+			return nil
+		}
+		if stop := r.mayResend(ctx, st, state, prev, err); stop != nil {
+			return stop
+		}
 	}
-	return cpierrors.Wrap(WrapError(lastErr), fmt.Sprintf("SetHAState: requesting %s for %s failed", state, r.sid))
+}
+
+// failed is the error for a state request that is not tried again.
+func (r *haStateRun) failed(state string, err error) error {
+	return cpierrors.Wrap(WrapError(err), fmt.Sprintf("SetHAState: requesting %s for %s failed", state, r.sid))
+}
+
+// landed reports whether a read shows the request for state in the resource
+// configuration. A read that could not see the configuration proves nothing,
+// so it reports false.
+func landed(st *HAServiceState, state string) bool {
+	return st != nil && st.Configured && st.Requested == state
+}
+
+// mayResend judges the read taken just before a retry of state, whose last
+// attempt failed with cause. It returns nil only when the retry may be sent:
+// the read is known, the resource still requests prev, and for disabled on a
+// kept VM the owner node still reports the guest stopped. An ignored request
+// returns a haIgnoredRead for SetHAState to turn into the caller's outcome.
+func (r *haStateRun) mayResend(ctx context.Context, st *HAServiceState, state, prev string, cause error) error {
+	switch {
+	case !st.Known:
+		return cpierrors.Wrap(WrapError(cause), fmt.Sprintf("SetHAState: requesting %s for %s failed, and the HA "+
+			"state could not be read again before a retry (%s), so it was not sent again", state, r.sid, st.Reason))
+	case st.Configured && st.Requested == haRequestedIgnored:
+		return &haIgnoredRead{st: st}
+	case !st.Configured:
+		return cpierrors.Retriable("SetHAState: %s disappeared from HA while its request for %s was retried, so "+
+			"nothing more was sent", r.sid, state)
+	case st.Requested != prev:
+		return cpierrors.Retriable("SetHAState: %s now requests %q, which is neither %q nor %q, so another writer "+
+			"changed it while the request for %s was retried; nothing more was sent, retry when it settles",
+			r.sid, st.Requested, prev, state, state)
+	}
+	if state != haStateDisabled || r.in.Caller != HACallerKeep {
+		return nil
+	}
+	power, err := r.power(ctx, st.Node)
+	if err != nil {
+		return cpierrors.Wrap(err, fmt.Sprintf("SetHAState: the power state of the kept VM of %s on node %s is "+
+			"unreadable before a retry of disabled, so disabled was not sent again", r.sid, st.Node))
+	}
+	if power != haPowerStopped {
+		return cpierrors.Retriable("SetHAState: the kept VM of %s is %s on node %s, so disabled, which would stop "+
+			"it, was not sent again; retry, and the next attempt chooses again from the power state",
+			r.sid, power, st.Node)
+	}
+	return nil
 }
 
 // send makes one state request.
@@ -555,30 +746,10 @@ func (r *haStateRun) send(ctx context.Context, state string) error {
 	return nil
 }
 
-// landed reports whether a request for state reached the resource
-// configuration after its call failed. A re-read that fails proves nothing,
-// so it reports false.
-func (r *haStateRun) landed(ctx context.Context, state string) bool {
-	var resp *sdkcluster.GetHaResourcesResponse
-	err := RetryOnTransient(ctx, nil, "ha_state_reread", 0, func() error {
-		var inner error
-		resp, inner = r.deps.Cluster.GetHaResources(ctx, r.sid)
-		return inner
-	})
-	if err != nil || resp == nil || resp.State == nil {
-		return false
-	}
-	got := strings.TrimSpace(*resp.State)
-	if got == haRequestedEnabled {
-		got = haRequestedStarted
-	}
-	return got == state
-}
-
 // await polls until the service shows state. For disabled, the CRM shows
 // stopped. A read that is unknown, or a target the CRM has not reached yet,
 // keeps the poll going until the budget runs out. A fence, a recovery, a new
-// error, or a resource that disappears ends it at once.
+// error, an ignored request, or a resource that disappears ends it at once.
 func (r *haStateRun) await(ctx context.Context, state string) (*HAServiceState, error) {
 	wantRaw, wantPower := state, haPowerStopped
 	switch state {
@@ -592,9 +763,6 @@ func (r *haStateRun) await(ctx context.Context, state string) (*HAServiceState, 
 		if err != nil {
 			return nil, err
 		}
-		if st.Known && st.Node != "" {
-			r.node = st.Node
-		}
 		done, why, stop := r.check(ctx, st, state, wantRaw, wantPower)
 		if stop != nil {
 			return nil, stop
@@ -607,7 +775,7 @@ func (r *haStateRun) await(ctx context.Context, state string) (*HAServiceState, 
 				return nil, err
 			}
 			return nil, cpierrors.Retriable("SetHAState: %s did not reach %s within %s (last: %s); retry when "+
-				"it settles", r.sid, state, r.in.Budget, why)
+				"it settles", r.sid, state, r.budget, why)
 		}
 	}
 }
@@ -623,6 +791,9 @@ func (r *haStateRun) check(
 	if !st.Configured && !st.InCRM {
 		return false, "", cpierrors.Retriable("SetHAState: %s disappeared from HA while it was asked for %s",
 			r.sid, state)
+	}
+	if st.Configured && st.Requested == haRequestedIgnored {
+		return false, "", &haIgnoredRead{st: st}
 	}
 	if st.Raw == haRawError && state != haStateDisabled {
 		return false, "", cpierrors.Retriable("SetHAState: %s entered the HA error state on node %s while it "+
