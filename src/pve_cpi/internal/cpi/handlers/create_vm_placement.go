@@ -26,12 +26,12 @@ func resolveVMShape(ctx context.Context, deps Deps, parsed *createVMParsedArgs) 
 	}
 	cp := parsed.cloudProps
 
-	// Anti-affinity group tag (Tier 2, scheduler-soft spreading). Only computed
-	// when anti-affinity is enabled; otherwise the scorer ignores group membership
-	// and behavior is identical to Tier 1.
-	groupTag := antiAffinityGroupTag(deps, parsed.env)
+	// Anti-affinity group membership (Tier 2, scheduler-soft spreading). Only
+	// computed when anti-affinity is enabled; otherwise the scorer ignores group
+	// membership and behavior is identical to Tier 1.
+	group := antiAffinityScorerGroup(deps, parsed.env)
 
-	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
+	node, _, err := resolveTargetNodeWithBridges(ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
 		placementBridgePlan(ctx, deps, parsed))
 	if err != nil {
 		return nil, err
@@ -54,10 +54,10 @@ func resolveVMShapeWithAlternates(
 	fallbackMax int,
 ) (shape *createVMShape, alternates []string, err error) {
 	cp := parsed.cloudProps
-	groupTag := antiAffinityGroupTag(deps, parsed.env)
+	group := antiAffinityScorerGroup(deps, parsed.env)
 
 	winner, alts, nodeErr := resolveTargetNodeWithBridges(
-		ctx, deps, cp, groupTag, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
+		ctx, deps, cp, group, parsed.diskCIDs, nil, parsed.cloudPropsMap, fallbackMax,
 		placementBridgePlan(ctx, deps, parsed))
 	if nodeErr != nil {
 		return nil, nil, nodeErr
@@ -142,7 +142,7 @@ func resolveTargetNodeWithFallbacks(
 	cloudPropsMap map[string]any,
 	fallbackMax int,
 ) (winner string, alternates []string, err error) {
-	return resolveTargetNodeWithBridges(ctx, deps, cp, "", diskCIDs, rng, cloudPropsMap, fallbackMax, bridgePlan{})
+	return resolveTargetNodeWithBridges(ctx, deps, cp, scorerGroup{}, diskCIDs, rng, cloudPropsMap, fallbackMax, bridgePlan{})
 }
 
 // resolveTargetNodeWithBridges is resolveTargetNodeWithFallbacks plus the plain
@@ -155,7 +155,7 @@ func resolveTargetNodeWithBridges(
 	ctx context.Context,
 	deps Deps,
 	cp createVMCloudProps,
-	groupTag string,
+	group scorerGroup,
 	diskCIDs []string,
 	rng *rand.Rand,
 	cloudPropsMap map[string]any,
@@ -230,7 +230,8 @@ func resolveTargetNodeWithBridges(
 			logger,
 			placement.GatherOptions{
 				StorageName:         storageName,
-				GroupTag:            groupTag,
+				GroupTag:            group.tag,
+				LegacyGroupTags:     group.legacy,
 				MaintenanceNodeTags: deps.Config.MaintenanceNodeTagsValue(),
 			},
 		)
@@ -261,7 +262,7 @@ func resolveTargetNodeWithBridges(
 				weights.GuestCount = f
 			}
 		}
-		if groupTag != "" {
+		if group.enabled() {
 			weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
 		}
 

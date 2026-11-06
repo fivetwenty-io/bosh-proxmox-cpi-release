@@ -259,9 +259,10 @@ func instanceGroupName(env map[string]any) string {
 // BOSH instance group, bosh-aa-<hash12>, the same string that names the group's
 // HA rule. The hash covers the Director UUID, the deployment, and the group, so
 // two deployments or two Directors with a group of the same name never share
-// it. It returns "" — disabling scheduler-soft spreading for this create —
-// when anti-affinity is not enabled, the request carries no director_uuid, or
-// the instance group cannot be derived from env.
+// it. create_vm stamps it on the new VM. It returns "" when anti-affinity is
+// not enabled, the request carries no director_uuid, or the instance group
+// cannot be derived from env. The scorer reads antiAffinityScorerGroup, which
+// also recognizes guests from older CPIs.
 func antiAffinityGroupTag(deps Deps, env map[string]any) string {
 	if !deps.Config.AntiAffinityEnabled() {
 		return ""
@@ -271,6 +272,50 @@ func antiAffinityGroupTag(deps Deps, env map[string]any) string {
 		return ""
 	}
 	return ident.ruleName()
+}
+
+// scorerGroup names the existing guests the placement scorer counts as members
+// of the instance group being placed. A guest is a member when it carries tag,
+// or when it carries every tag in legacy.
+type scorerGroup struct {
+	tag    string
+	legacy []string
+}
+
+// enabled reports whether the scorer has any way to recognize a member, which
+// is what turns the anti-affinity axis on.
+func (g scorerGroup) enabled() bool {
+	return g.tag != "" || len(g.legacy) > 0
+}
+
+// antiAffinityScorerGroup returns how scheduler-soft spreading recognizes the
+// members of the VM's instance group. The member tag is the hashed one from
+// antiAffinityGroupTag. For one release a guest from an older CPI, which
+// carries only the older tags, also counts. The legacy proof is the one the
+// rule migration uses, job--<group>, deployment--<deployment>, and this
+// Director's owner tag, reduced to the parts the request can name. So a request
+// without a director_uuid still spreads on job-- and deployment-- instead of
+// switching spreading off. Both are empty when anti-affinity is off or the
+// group cannot be derived from env.
+func antiAffinityScorerGroup(deps Deps, env map[string]any) scorerGroup {
+	if !deps.Config.AntiAffinityEnabled() {
+		return scorerGroup{}
+	}
+	ident := haIdentityFor(deps, env)
+	if ident.Group == "" {
+		return scorerGroup{}
+	}
+	g := scorerGroup{legacy: []string{"job--" + ident.Group}}
+	if ident.valid() {
+		g.tag = ident.ruleName()
+	}
+	if ident.Deployment != "" {
+		g.legacy = append(g.legacy, "deployment--"+ident.Deployment)
+	}
+	if owner := ownerTagFor(ident.Owner); owner != "" {
+		g.legacy = append(g.legacy, owner)
+	}
+	return g
 }
 
 // --------------------------------------------------------------------------

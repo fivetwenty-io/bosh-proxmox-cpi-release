@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"sync"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 )
@@ -147,17 +148,46 @@ func haOwnershipOf(comment, owner string) haOwnership {
 // PVE 9 or later on every node. Deps.HAProfile supplies the profile when it is
 // wired, and otherwise the gate probes the cluster itself.
 func haRuleWriteGate(ctx context.Context, deps Deps) error {
-	var (
-		profile *ha.Profile
-		err     error
-	)
-	if deps.HAProfile != nil {
-		profile, err = deps.HAProfile(ctx)
-	} else {
-		profile, err = ha.Resolve(ctx, ha.DepsFromClient(deps.PVE, deps.Config, deps.Log(ctx)))
+	resolve := deps.HAProfile
+	if resolve == nil {
+		resolve = probeHAProfile(deps)
 	}
+	profile, err := resolve(ctx)
 	if err != nil {
 		return err
 	}
 	return profile.RuleWriteGate()
+}
+
+// probeHAProfile returns a resolver that probes the cluster deps targets for
+// its HA profile.
+func probeHAProfile(deps Deps) func(ctx context.Context) (*ha.Profile, error) {
+	return func(ctx context.Context) (*ha.Profile, error) {
+		return ha.Resolve(ctx, ha.DepsFromClient(deps.PVE, deps.Config, deps.Log(ctx)))
+	}
+}
+
+// withRequestHAProfile returns deps whose HAProfile resolves the profile at
+// most once, so every HA rule writer in one request shares one answer. It
+// wraps the wired HAProfile, or a cluster probe when none is wired, and keeps
+// the first result and error for the rest of the request. The probe reads
+// cluster status, every node's version, the rules, and more, so a request that
+// writes both an anti-affinity rule and a node-affinity pin pays for it once.
+// The resolve itself stays lazy, so a request that writes no rule never
+// probes.
+func withRequestHAProfile(deps Deps) Deps {
+	resolve := deps.HAProfile
+	if resolve == nil {
+		resolve = probeHAProfile(deps)
+	}
+	var (
+		once    sync.Once
+		profile *ha.Profile
+		err     error
+	)
+	deps.HAProfile = func(ctx context.Context) (*ha.Profile, error) {
+		once.Do(func() { profile, err = resolve(ctx) })
+		return profile, err
+	}
+	return deps
 }

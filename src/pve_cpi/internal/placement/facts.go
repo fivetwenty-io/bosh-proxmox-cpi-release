@@ -86,9 +86,15 @@ type GatherOptions struct {
 	// node, how many existing QEMU guests carry this tag and records the total
 	// in SameGroupCount, which the scorer's anti-affinity axis penalizes. The
 	// caller is responsible for forming the tag with the same sanitization the
-	// CPI uses when it stamps tags (see set_vm_metadata). When empty,
-	// SameGroupCount remains 0 for all nodes.
+	// CPI uses when it stamps tags (see set_vm_metadata). When it and
+	// LegacyGroupTags are both empty, SameGroupCount remains 0 for all nodes.
 	GroupTag string
+
+	// LegacyGroupTags, when non-empty, also counts a guest as a member of the
+	// group when it carries every one of these tags. It lets the scorer see
+	// group members created before GroupTag existed, which carry only the
+	// older tags. A guest that matches GroupTag or LegacyGroupTags counts once.
+	LegacyGroupTags []string
 
 	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is
 	// in maintenance. A node carrying any of these tags has InMaintenance=true
@@ -155,7 +161,7 @@ func GatherNodeFacts(
 
 	// Phase 2: node compute counters, guest count, group tags, and committed
 	// memory from ListResources (non-fatal).
-	guestCounts, sameGroupCounts, committedMem, nodeResources := gatherResourceFacts(ctx, clusterClient, logger, opts.GroupTag)
+	guestCounts, sameGroupCounts, committedMem, nodeResources := gatherResourceFacts(ctx, clusterClient, logger, opts)
 
 	// Phase 3: per-node storage query (non-fatal per node).
 	storageAvail, storageTotal := gatherStorageFacts(ctx, nodesClient, logger, nodeItems, opts.StorageName)
@@ -245,7 +251,7 @@ func gatherResourceFacts(
 	ctx context.Context,
 	clusterClient ClusterClient,
 	logger *log.Logger,
-	groupTag string,
+	opts GatherOptions,
 ) (guestCounts map[string]int, sameGroupCounts map[string]int, committedMem map[string]int64, nodeResources map[string]NodeResource) {
 	guestCounts = make(map[string]int)
 	sameGroupCounts = make(map[string]int)
@@ -277,7 +283,7 @@ func gatherResourceFacts(
 			continue
 		}
 		guestCounts[ri.Node]++
-		if groupTag != "" && hasTag(ri.Tags, groupTag) {
+		if inGroup(ri.Tags, opts) {
 			sameGroupCounts[ri.Node]++
 		}
 		committedMem[ri.Node] += ri.Maxmem.Int()
@@ -351,6 +357,23 @@ func hasTag(tags, want string) bool {
 		}
 	}
 	return false
+}
+
+// inGroup reports whether a guest with the given tags belongs to the instance
+// group opts describes: it carries GroupTag, or every tag in LegacyGroupTags.
+func inGroup(tags string, opts GatherOptions) bool {
+	if opts.GroupTag != "" && hasTag(tags, opts.GroupTag) {
+		return true
+	}
+	if len(opts.LegacyGroupTags) == 0 {
+		return false
+	}
+	for _, want := range opts.LegacyGroupTags {
+		if !hasTag(tags, want) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasImagesContent returns true when the comma-separated content string contains

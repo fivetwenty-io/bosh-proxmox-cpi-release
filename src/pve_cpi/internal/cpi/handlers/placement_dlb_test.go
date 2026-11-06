@@ -33,6 +33,11 @@ type dlbClusterStub struct {
 	listOptionsErr error
 	updateOptsCRS  []string // collected Crs values passed to UpdateOptions
 	updateOptsErr  error
+	// haComment is the comment GetHaResources reports for an existing
+	// resource; nil reports a resource with no comment.
+	haComment *string
+	// getHAErr, when non-nil, makes GetHaResources fail.
+	getHAErr error
 }
 
 type dlbUpdateHACall struct {
@@ -50,6 +55,13 @@ func (s *dlbClusterStub) CreateHaResources(_ context.Context, p *cluster.CreateH
 func (s *dlbClusterStub) UpdateHaResources(_ context.Context, sid string, p *cluster.UpdateHaResourcesParams) error {
 	s.updateHACalls = append(s.updateHACalls, dlbUpdateHACall{Sid: sid, Params: p})
 	return nil
+}
+
+func (s *dlbClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if s.getHAErr != nil {
+		return nil, s.getHAErr
+	}
+	return &cluster.GetHaResourcesResponse{Sid: sid, Comment: s.haComment}, nil
 }
 
 func (s *dlbClusterStub) ListConfigNodes(_ context.Context) (*cluster.ListConfigNodesResponse, error) {
@@ -847,4 +859,117 @@ func TestDLBMembership_SharedRootDiskAndISO_Registers(t *testing.T) {
 func (s *dlbClusterStub) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	empty := cluster.ListStatusResponse{}
 	return &empty, nil
+}
+
+// --------------------------------------------------------------------------
+// ownership marker on DLB-registered HA resources
+// --------------------------------------------------------------------------
+
+// dlbDepsForDirector is dlbDeps for a request from the fixture Director.
+func dlbDepsForDirector(clusterSvc cluster.Service) Deps {
+	deps := dlbDeps(clusterSvc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB())
+	deps.RequestDirectorUUID = aaDirector
+	return deps
+}
+
+func TestDLBMembership_RegistersWithOwnershipMarker(t *testing.T) {
+	t.Parallel()
+	svc := &dlbClusterStub{}
+	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 110, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(svc.createHACalls) != 1 {
+		t.Fatalf("expected 1 CreateHaResources call, got %d", len(svc.createHACalls))
+	}
+	want := haIdentity{Owner: aaDirector}.marker()
+	if c := svc.createHACalls[0].Comment; c == nil || *c != want {
+		t.Errorf("CreateHaResources comment = %v; want the ownership marker %q", c, want)
+	}
+	if got := haOwnershipOf(*svc.createHACalls[0].Comment, aaDirector); got != haOwnedByUs {
+		t.Errorf("the marker must read back as ours, got %v", got)
+	}
+}
+
+func TestDLBMembership_NoDirectorUUIDRegistersUnmarkedAndWarns(t *testing.T) {
+	t.Parallel()
+	svc := &dlbClusterStub{}
+	logger, obs := log.NewObservedLogger(slog.LevelDebug)
+	deps := dlbDeps(svc, &dlbNodesStub{}, &dlbStorageStub{storageType: "nfs", shared: true}, dlbConfigWithDLB())
+	if err := ensureDLBMembership(context.Background(), deps, 111, "dlb", logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(svc.createHACalls) != 1 {
+		t.Fatalf("expected 1 CreateHaResources call, got %d", len(svc.createHACalls))
+	}
+	if c := svc.createHACalls[0].Comment; c != nil {
+		t.Errorf("without a director_uuid no marker can be written, got comment %q", *c)
+	}
+	warned := false
+	for _, e := range obs.All() {
+		if e.Level == slog.LevelWarn && strings.Contains(e.Message, "no director_uuid") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("a request without a director_uuid must log that the marker is missing")
+	}
+}
+
+func TestDLBMembership_AlreadyExistsUnmarkedGainsMarker(t *testing.T) {
+	t.Parallel()
+	svc := &dlbClusterStubAlreadyExists{}
+	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 112, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(svc.updateHACalls) != 1 {
+		t.Fatalf("expected 1 UpdateHaResources call, got %d", len(svc.updateHACalls))
+	}
+	want := haIdentity{Owner: aaDirector}.marker()
+	u := svc.updateHACalls[0].Params
+	if u.Comment == nil || *u.Comment != want {
+		t.Errorf("update comment = %v; want the ownership marker %q", u.Comment, want)
+	}
+	if u.AutoRebalance == nil || !*u.AutoRebalance || u.State == nil || *u.State != "started" {
+		t.Error("the update must still set the DLB flags")
+	}
+}
+
+func TestDLBMembership_AlreadyExistsOwnedKeepsComment(t *testing.T) {
+	t.Parallel()
+	ours := aaIdent("web").marker()
+	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{haComment: &ours}}
+	if err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 113, "dlb", log.NewNopLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(svc.updateHACalls) != 1 {
+		t.Fatalf("expected 1 UpdateHaResources call, got %d", len(svc.updateHACalls))
+	}
+	if c := svc.updateHACalls[0].Params.Comment; c != nil {
+		t.Errorf("a resource already marked as ours must keep its comment, got %q", *c)
+	}
+}
+
+func TestDLBMembership_AlreadyExistsForeignLeftAlone(t *testing.T) {
+	t.Parallel()
+	foreign := haIdentity{Owner: aaOtherDirector}.marker()
+	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{haComment: &foreign}}
+	err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 114, "dlb", log.NewNopLogger())
+	if err == nil || !strings.Contains(err.Error(), "another Director") {
+		t.Fatalf("err = %v; want a refusal naming another Director", err)
+	}
+	if len(svc.updateHACalls) != 0 {
+		t.Errorf("a resource marked for another Director must not be updated, got %d updates", len(svc.updateHACalls))
+	}
+}
+
+func TestDLBMembership_AlreadyExistsUnreadableNotUpdated(t *testing.T) {
+	t.Parallel()
+	svc := &dlbClusterStubAlreadyExists{dlbClusterStub: dlbClusterStub{getHAErr: fmt.Errorf("connection reset")}}
+	err := ensureDLBMembership(context.Background(), dlbDepsForDirector(svc), 115, "dlb", log.NewNopLogger())
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("err = %v; want the read failure", err)
+	}
+	if len(svc.updateHACalls) != 0 {
+		t.Errorf("a resource whose owner is unknown must not be updated, got %d updates", len(svc.updateHACalls))
+	}
 }

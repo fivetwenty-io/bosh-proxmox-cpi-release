@@ -447,6 +447,63 @@ func TestGatherNodeFacts_SameGroupCount(t *testing.T) {
 	}
 }
 
+// TestGatherNodeFacts_SameGroupCountLegacyTags covers a group whose older
+// members carry only the tags from before the member tag existed. A guest
+// counts when it carries the member tag or every legacy tag, and counts once
+// when it carries both.
+func TestGatherNodeFacts_SameGroupCountLegacyTags(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+	}
+	resResp := cluster.ListResourcesResponse{
+		resourceQEMU("pve1", "web-0", "bosh-aa-0123456789ab;deployment--cf;job--web"),
+		resourceQEMU("pve1", "web-1", "deployment--cf;job--web;bosh-owner--dir-1"),
+		resourceQEMU("pve1", "web-2", "bosh-aa-0123456789ab"),
+		resourceQEMU("pve1", "web-3", "deployment--cf;job--web;bosh-owner--dir-2"),
+		resourceQEMU("pve1", "web-4", "deployment--other;job--web;bosh-owner--dir-1"),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{
+		GroupTag:        "bosh-aa-0123456789ab",
+		LegacyGroupTags: []string{"job--web", "deployment--cf", "bosh-owner--dir-1"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("expected 1 fact")
+	}
+	if facts[0].SameGroupCount != 3 {
+		t.Errorf("SameGroupCount = %d; want 3 (web-0, web-1, web-2)", facts[0].SameGroupCount)
+	}
+}
+
+// TestGatherNodeFacts_SameGroupCountLegacyTagsOnly covers a request with no
+// member tag, which still spreads on the legacy tags alone.
+func TestGatherNodeFacts_SameGroupCountLegacyTagsOnly(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+	}
+	resResp := cluster.ListResourcesResponse{
+		resourceQEMU("pve1", "web-0", "deployment--cf;job--web"),
+		resourceQEMU("pve1", "db-0", "deployment--cf;job--db"),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &resResp}
+
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{}, nopLogger(), placement.GatherOptions{
+		LegacyGroupTags: []string{"job--web", "deployment--cf"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if facts[0].SameGroupCount != 1 {
+		t.Errorf("SameGroupCount = %d; want 1", facts[0].SameGroupCount)
+	}
+}
+
 func TestGatherNodeFacts_StorageFactsFromNodes(t *testing.T) {
 	t.Parallel()
 	resp := cluster.ListStatusResponse{

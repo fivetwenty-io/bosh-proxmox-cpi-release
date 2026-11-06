@@ -392,12 +392,12 @@ func TestResolveTargetNode_BridgeMissingOnNode_SkipsToNextNode(t *testing.T) {
 			c.Placement.AZMap = map[string][]string{"z": {"pve1", "pve2"}}
 		})
 	cp := createVMCloudProps{AvailabilityZone: "z"}
-	node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, "", nil, nil, nil, 0, forceBridges(deps, "vmbr7"))
+	node, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, scorerGroup{}, nil, nil, nil, 0, forceBridges(deps, "vmbr7"))
 	if err != nil || node != "pve2" {
 		t.Fatalf("node=%q err=%v, want pve2 (pve1 lacks vmbr7)", node, err)
 	}
 	// Without the requirement the idle node wins, so the bridge filter is what moved the VM.
-	node, _, err = resolveTargetNodeWithBridges(context.Background(), deps, cp, "", nil, nil, nil, 0, bridgePlan{})
+	node, _, err = resolveTargetNodeWithBridges(context.Background(), deps, cp, scorerGroup{}, nil, nil, nil, 0, bridgePlan{})
 	if err != nil || node != "pve1" {
 		t.Fatalf("control: node=%q err=%v, want pve1", node, err)
 	}
@@ -411,7 +411,7 @@ func TestResolveTargetNode_BridgeMissingEverywhere_StrictExhaustionNamesBridge(t
 			c.Placement.AZEnforcement = "strict"
 		})
 	cp := createVMCloudProps{AvailabilityZone: "z"}
-	_, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, "", nil, nil, nil, 0, forceBridges(deps, "vmbr7"))
+	_, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, scorerGroup{}, nil, nil, nil, 0, forceBridges(deps, "vmbr7"))
 	if err == nil || !strings.Contains(err.Error(), "pve1: missing bridge vmbr7") {
 		t.Fatalf("want an exhaustion error naming the missing bridge, got %v", err)
 	}
@@ -428,7 +428,7 @@ func TestResolveTargetNode_BridgeLookupFailsEverywhere_StrictRetriable(t *testin
 	})
 	client.nodes.errs = map[string]error{"pve1": errors.New("503"), "pve2": errors.New("503")}
 	cp := createVMCloudProps{AvailabilityZone: "z"}
-	_, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, "", nil, nil, nil, 0, forceBridges(deps, "vmbr0"))
+	_, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, scorerGroup{}, nil, nil, nil, 0, forceBridges(deps, "vmbr0"))
 	if err == nil || !strings.Contains(err.Error(), "network lookup failed") || !asCPIError(t, err).OkToRetry() {
 		t.Fatalf("an AZ exhausted by lookup errors must be retriable and say so, got %v", err)
 	}
@@ -439,7 +439,7 @@ func TestResolveTargetNode_BridgeFilter_MemoizesListingPerNode(t *testing.T) {
 	deps, client, _ := bridgeDeps(t, []map[string]any{onlineNode("pve1")},
 		map[string][]string{"pve1": {"vmbr0", "vmbr2", "vmbr3"}}, "enforce", nil)
 	cp := createVMCloudProps{}
-	if _, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, "", nil, nil, nil, 0,
+	if _, _, err := resolveTargetNodeWithBridges(context.Background(), deps, cp, scorerGroup{}, nil, nil, nil, 0,
 		forceBridges(deps, "vmbr0", "vmbr2", "vmbr3")); err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +595,7 @@ func TestKeepEarlierAttemptError(t *testing.T) {
 // resolveVMShapeNodeOnly runs the placement step resolveVMShape runs, without
 // building the whole shape.
 func resolveVMShapeNodeOnly(ctx context.Context, deps Deps, parsed *createVMParsedArgs) (string, error) {
-	node, _, err := resolveTargetNodeWithBridges(ctx, deps, parsed.cloudProps, "", parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
+	node, _, err := resolveTargetNodeWithBridges(ctx, deps, parsed.cloudProps, scorerGroup{}, parsed.diskCIDs, nil, parsed.cloudPropsMap, 0,
 		placementBridgePlan(ctx, deps, parsed))
 	return node, err
 }

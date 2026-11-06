@@ -49,8 +49,10 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 		}
 		pin = constraints.requiredLocalNode
 	}
-	groupTag := antiAffinityGroupTag(deps, parsed.env)
-	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{StorageName: "", GroupTag: groupTag, MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue()})
+	group := antiAffinityScorerGroup(deps, parsed.env)
+	facts, err := placement.GatherNodeFacts(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), deps.Log(ctx), placement.GatherOptions{
+		StorageName: "", GroupTag: group.tag, LegacyGroupTags: group.legacy, MaintenanceNodeTags: cfg.MaintenanceNodeTagsValue(),
+	})
 	if err != nil {
 		return nil, planError(StoragePlanObservation, "compute facts: %v", err)
 	}
@@ -64,7 +66,7 @@ func ObserveStoragePlanCompute(ctx context.Context, deps Deps, parsed *createVMP
 			*override.value = v
 		}
 	}
-	if groupTag != "" {
+	if group.enabled() {
 		weights.AntiAffinity = placement.DefaultWeights().AntiAffinity
 	}
 	if err := validatePCIPassthroughs(cp.PCIPassthroughs); err != nil {

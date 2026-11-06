@@ -117,8 +117,15 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdenti
 	}
 	groupKey := ident.hash()
 
+	// The version gate resolves the HA profile, which probes the whole
+	// cluster when nothing has resolved it yet. That runs before the lock so
+	// the probe never eats into the lock's window.
+	if err := haRuleWriteGate(ctx, deps); err != nil {
+		return fmt.Errorf("anti-affinity: %w", err)
+	}
+
 	// When the cross-process cluster lock is enabled, serialize the entire
-	// read-modify-write on the shared bosh-aa-<group> rule against concurrent
+	// read-modify-write on the shared bosh-aa-<hash12> rule against concurrent
 	// create_vm invocations on other hosts. The lock is keyed on the group so
 	// different instance groups never block each other. Acquire failure/timeout
 	// surfaces as a retriable error (the caller logs it best-effort, the director
@@ -128,27 +135,31 @@ func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdenti
 		if lockErr != nil {
 			return lockErr
 		}
-		defer func() {
-			// Detached + bounded for the same reason as withVMIDLock's
-			// release: a cancelled request must not orphan the sentinel
-			// pool, and the anti-affinity lock's longer TTL makes an orphan
-			// proportionally more disruptive to concurrent create_vm calls.
-			relCtx, relCancel := detachedContext(ctx, lockReleaseTimeout)
-			defer relCancel()
-			if relErr := handle.Release(relCtx); relErr != nil {
-				logger.Warn("anti-affinity: release cluster lock failed (non-fatal)",
-					log.String("group", groupKey), log.Err(relErr))
-			}
-		}()
+		defer releaseAntiAffinityLock(ctx, handle, groupKey, logger)
 	}
 
 	return ensureAntiAffinityMembershipLocked(ctx, deps, ident, vmid, logger)
 }
 
+// releaseAntiAffinityLock releases an anti-affinity lock. The release is
+// detached and bounded for the same reason as withVMIDLock's: a cancelled
+// request must not orphan the sentinel pool, and the anti-affinity lock's
+// longer TTL makes an orphan proportionally more disruptive to concurrent
+// create_vm calls. A failure is only logged.
+func releaseAntiAffinityLock(ctx context.Context, handle *pve.ClusterLockHandle, key string, logger *log.Logger) {
+	relCtx, relCancel := detachedContext(ctx, lockReleaseTimeout)
+	defer relCancel()
+	if relErr := handle.Release(relCtx); relErr != nil {
+		logger.Warn("anti-affinity: release cluster lock failed (non-fatal)",
+			log.String("group", key), log.Err(relErr))
+	}
+}
+
 // acquireAntiAffinityLock acquires the per-group cross-process sentinel lock.
 // Separated so the lock plumbing (owner token, timeout/TTL from config) stays
-// out of the RMW body. The lock is keyed on the group's hash, which names the
-// rule the lock protects.
+// out of the RMW body. groupKey is the group's hash, which names the rule the
+// lock protects, or the bare group name, which is the key an older CPI locks
+// its bosh-aa-<group> rule under.
 func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vmid int) (*pve.ClusterLockHandle, error) {
 	poolSvc := deps.PVE.Pools()
 	if poolSvc == nil {
@@ -174,11 +185,11 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under
-// the cluster lock when enabled. It refuses to write unless the cluster is on
-// PVE 9 or later, registers the HA resource with the ownership marker,
-// recomputes the member set, and recreates the bosh-aa-<hash12> rule when
-// membership changed. It then moves this Director's members out of the group's
-// unmarked rule from an older CPI.
+// the cluster lock when enabled and after the PVE 9 gate has passed. It
+// registers the HA resource with the ownership marker, recomputes the member
+// set, and recreates the bosh-aa-<hash12> rule when membership changed. It then
+// moves this Director's members out of the group's unmarked rule from an older
+// CPI.
 func ensureAntiAffinityMembershipLocked(
 	ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger,
 ) error {
@@ -186,10 +197,6 @@ func ensureAntiAffinityMembershipLocked(
 	sid := haResourceSid(vmid)
 	ruleName := ident.ruleName()
 	marker := ident.marker()
-
-	if err := haRuleWriteGate(ctx, deps); err != nil {
-		return fmt.Errorf("anti-affinity: %w", err)
-	}
 
 	// 1. Register the VM as an HA resource (idempotent; "already defined" is fine).
 	if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
@@ -284,7 +291,7 @@ func ensureAntiAffinityMembershipLocked(
 
 	// 5. The hashed rule now holds every member, so the unmarked rule from an
 	// older CPI can give up the ones that are ours.
-	return migrateLegacyAntiAffinityRule(ctx, svc, rules, ident, scan.legacy, logger)
+	return migrateLegacyAntiAffinityRule(ctx, deps, rules, ident, scan.legacy, vmid, logger)
 }
 
 // ruleByName returns the entry named name, or nil.
@@ -305,13 +312,22 @@ func legacyRuleName(ident haIdentity) string {
 // migrateLegacyAntiAffinityRule moves this Director's members out of the
 // group's unmarked rule from an older CPI. Two Directors may share that rule, so
 // the CPI never adopts it whole. It removes only the members in mine, which the
-// scan proved belong to this Director and deployment, from the old rule, and it
-// deletes the old rule only when no member is left. A rule that carries a marker
-// is never touched. This migration runs for one release, and after that the CPI
-// ignores unmarked rules.
+// scan proved belong to this Director and deployment, from the old rule. A rule
+// that carries a marker is never touched. This migration runs for one release,
+// and after that the CPI ignores unmarked rules.
+//
+// The old rule is rewritten by delete and create, so a member another writer
+// adds in between would be lost. An older CPI guards the rule with the lock
+// keyed on the bare group name, not the hashed key this create holds, so when
+// the cluster lock is enabled the migration also holds that key for its whole
+// run. It then reads the old rule again and goes ahead only when its comment
+// and members still match the snapshot in rules. When they differ, or the lock
+// is busy, it writes nothing, and a later create of the group retries. When
+// fewer than two members would remain, the rule no longer spreads anything, so
+// it is deleted and nothing is created in its place.
 func migrateLegacyAntiAffinityRule(
-	ctx context.Context, svc cluster.Service, rules []haRuleEntry, ident haIdentity,
-	mine map[string]struct{}, logger *log.Logger,
+	ctx context.Context, deps Deps, rules []haRuleEntry, ident haIdentity,
+	mine map[string]struct{}, vmid int, logger *log.Logger,
 ) error {
 	if len(mine) == 0 {
 		return nil
@@ -324,9 +340,56 @@ func migrateLegacyAntiAffinityRule(
 	if old == nil || haOwnershipOf(old.Comment, ident.Owner) != haUnmarked {
 		return nil
 	}
-	have := parseHaResources(old.Resources)
-	remaining := make(map[string]struct{}, len(have))
-	moved := 0
+	snapshot := parseHaResources(old.Resources)
+	remaining, moved := splitLegacyMembers(snapshot, mine)
+	if moved == 0 {
+		return nil
+	}
+
+	if deps.Config.ClusterLockEnabled() {
+		handle, lockErr := acquireAntiAffinityLock(ctx, deps, ident.Group, vmid)
+		if lockErr != nil {
+			logger.Warn("anti-affinity: unmarked rule migration deferred because its lock is not available; "+
+				"a later create of the group retries", log.String("rule", name), log.Err(lockErr))
+			return nil
+		}
+		defer releaseAntiAffinityLock(ctx, handle, ident.Group, logger)
+	}
+
+	svc := deps.PVE.Cluster()
+	fresh, err := findHaRule(ctx, svc, name)
+	if err != nil {
+		return fmt.Errorf("anti-affinity: re-read unmarked rule %q for migration: %w", name, err)
+	}
+	if fresh == nil {
+		return nil
+	}
+	if fresh.Comment != old.Comment || !sameSidSet(fresh.Resources, snapshot) {
+		logger.Warn("anti-affinity: unmarked rule changed while this create read it; migration aborted, "+
+			"and a later create of the group retries",
+			log.String("rule", name), log.String("read", sidsCSV(snapshot)),
+			log.String("now", sidsCSV(parseHaResources(fresh.Resources))))
+		return nil
+	}
+
+	if err := svc.DeleteHaRules(ctx, name); err != nil && !isHaNotFound(err) {
+		return fmt.Errorf("anti-affinity: delete unmarked rule %q for migration: %w", name, err)
+	}
+	if len(remaining) >= 2 {
+		if err := createNegativeRule(ctx, svc, name, sidsCSV(remaining), old.Comment); err != nil {
+			return err
+		}
+	}
+	logger.Info("anti-affinity: moved this Director's members out of an unmarked rule",
+		log.String("from", name), log.String("to", ident.ruleName()),
+		log.Int("moved", moved), log.Int("left", len(remaining)), log.Bool("old_rule_kept", len(remaining) >= 2))
+	return nil
+}
+
+// splitLegacyMembers splits an old rule's members into the ones that stay,
+// which are every member not in mine, and a count of the ones that move.
+func splitLegacyMembers(have, mine map[string]struct{}) (remaining map[string]struct{}, moved int) {
+	remaining = make(map[string]struct{}, len(have))
 	for s := range have {
 		if _, ok := mine[s]; ok {
 			moved++
@@ -334,21 +397,7 @@ func migrateLegacyAntiAffinityRule(
 		}
 		remaining[s] = struct{}{}
 	}
-	if moved == 0 {
-		return nil
-	}
-	if err := svc.DeleteHaRules(ctx, name); err != nil && !isHaNotFound(err) {
-		return fmt.Errorf("anti-affinity: delete unmarked rule %q for migration: %w", name, err)
-	}
-	if len(remaining) > 0 {
-		if err := createNegativeRule(ctx, svc, name, sidsCSV(remaining), old.Comment); err != nil {
-			return err
-		}
-	}
-	logger.Info("anti-affinity: moved this Director's members out of an unmarked rule",
-		log.String("from", name), log.String("to", ident.ruleName()),
-		log.Int("moved", moved), log.Int("left", len(remaining)))
-	return nil
+	return remaining, moved
 }
 
 // verifyAntiAffinityMember performs the opt-in read-after-write check: it
@@ -445,11 +494,20 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 
 // deregisterHaResource purges the VM's HA resource, which also removes it from
 // any remaining rules. It leaves a resource whose marker names another
-// Director, and treats a missing resource as done. Failures are only logged,
-// because deregistering is best-effort cleanup.
+// Director, and treats a missing resource as done. A not-found read still sends
+// the not-found-tolerant purge. When the ownership read fails for any other
+// reason, it cannot tell whose the resource is, so it skips the purge rather
+// than guess. Failures are only logged,
+// because deregistering is best-effort cleanup and every caller logs and
+// carries on.
 func deregisterHaResource(ctx context.Context, svc cluster.Service, sid, owner string, logger *log.Logger) {
-	if got, err := svc.GetHaResources(ctx, sid); err == nil && got != nil && got.Comment != nil &&
-		haOwnershipOf(*got.Comment, owner) == haOwnedByOther {
+	got, readErr := svc.GetHaResources(ctx, sid)
+	switch {
+	case readErr != nil && !isHaNotFound(readErr) && !pve.IsNotFound(readErr):
+		logger.Warn("anti-affinity: HA resource purge skipped because its ownership could not be read",
+			log.String("sid", sid), log.Err(readErr))
+		return
+	case readErr == nil && got != nil && got.Comment != nil && haOwnershipOf(*got.Comment, owner) == haOwnedByOther:
 		logger.Debug("anti-affinity: HA resource belongs to another Director; leaving it", log.String("sid", sid))
 		return
 	}

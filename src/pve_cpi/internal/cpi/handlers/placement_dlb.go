@@ -32,8 +32,10 @@ const crsModeDynamic = "dynamic"
 //  3. Shared-storage guard: if the VM storage pool, disk pool, or ConfigDrive
 //     ISO pool is local → skip registration. If undeterminable → proceed
 //     (fail-open) with a debug log.
-//  4. Register: CreateHaResources with State=started and AutoRebalance=true.
-//     If already registered → UpdateHaResources to ensure the flags are set.
+//  4. Register: CreateHaResources with State=started, AutoRebalance=true, and
+//     the ownership marker when the request names its Director. If already
+//     registered → UpdateHaResources to ensure the flags are set, adding the
+//     marker to an unmarked resource and leaving another Director's alone.
 //  5. CRS: read the cluster crs option and, when it is not dynamic, log a WARN
 //     with the corrective pvesh command. The CPI never writes the CRS mode.
 func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, logger *log.Logger) error {
@@ -113,26 +115,33 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 		}
 	}
 
-	// Guard 4: register or update the HA resource.
+	// Guard 4: register or update the HA resource. The resource carries the
+	// ownership marker, the same one the anti-affinity and node-affinity
+	// writers stamp, so the cleanup paths can tell it is this Director's.
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
+	owner := deps.RequestDirectorUUID
 	stateVal := "started"
 	arVal := true
-	if createErr := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{
+	createParams := &cluster.CreateHaResourcesParams{
 		Sid:           sid,
 		State:         &stateVal,
 		AutoRebalance: &arVal,
-	}); createErr != nil {
-		if isHaAlreadyExists(createErr) {
-			// Resource exists (possibly from anti-affinity path); update flags.
-			if updErr := svc.UpdateHaResources(ctx, sid, &cluster.UpdateHaResourcesParams{
-				State:         &stateVal,
-				AutoRebalance: &arVal,
-			}); updErr != nil {
-				return fmt.Errorf("DLB: update HA resource %q flags: %w", sid, updErr)
-			}
-		} else {
+	}
+	if owner != "" {
+		marker := haIdentity{Owner: owner}.marker()
+		createParams.Comment = &marker
+	} else {
+		logger.Warn("DLB: the request carries no director_uuid, so the HA resource is registered without "+
+			"an ownership marker", log.String("sid", sid))
+	}
+	if createErr := svc.CreateHaResources(ctx, createParams); createErr != nil {
+		if !isHaAlreadyExists(createErr) {
 			return fmt.Errorf("DLB: register HA resource %q: %w", sid, createErr)
+		}
+		// Resource exists (possibly from anti-affinity path); update flags.
+		if updErr := updateDLBHaResource(ctx, svc, sid, owner, logger); updErr != nil {
+			return updErr
 		}
 	}
 
@@ -141,6 +150,45 @@ func ensureDLBMembership(ctx context.Context, deps Deps, vmid int, az string, lo
 		return fmt.Errorf("DLB: cluster CRS check: %w", err)
 	}
 
+	return nil
+}
+
+// updateDLBHaResource sets the DLB flags on an HA resource that already exists.
+// It reads the resource first so it can judge ownership by the marker. A
+// resource marked for another Director is left alone. An unmarked one, from an
+// older CPI or a writer that sent no marker, gains this Director's marker in
+// the same update, and a resource already marked as ours keeps its comment. An
+// unreadable resource is not written, because its owner is unknown.
+func updateDLBHaResource(ctx context.Context, svc cluster.Service, sid, owner string, logger *log.Logger) error {
+	got, readErr := svc.GetHaResources(ctx, sid)
+	if readErr != nil {
+		return fmt.Errorf("DLB: read HA resource %q before updating its flags: %w", sid, readErr)
+	}
+	comment := ""
+	if got != nil && got.Comment != nil {
+		comment = *got.Comment
+	}
+	stateVal := "started"
+	arVal := true
+	params := &cluster.UpdateHaResourcesParams{
+		State:         &stateVal,
+		AutoRebalance: &arVal,
+	}
+	switch haOwnershipOf(comment, owner) {
+	case haOwnedByOther:
+		return fmt.Errorf("DLB: HA resource %q carries another Director's ownership marker; leaving it alone", sid)
+	case haUnmarked:
+		if owner != "" {
+			marker := haIdentity{Owner: owner}.marker()
+			params.Comment = &marker
+			logger.Debug("DLB: adding the ownership marker to an unmarked HA resource",
+				log.String("sid", sid), log.String("previous_comment", comment))
+		}
+	case haOwnedByUs:
+	}
+	if updErr := svc.UpdateHaResources(ctx, sid, params); updErr != nil {
+		return fmt.Errorf("DLB: update HA resource %q flags: %w", sid, updErr)
+	}
 	return nil
 }
 

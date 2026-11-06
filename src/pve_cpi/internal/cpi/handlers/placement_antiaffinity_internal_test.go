@@ -38,6 +38,13 @@ type aaClusterStub struct {
 	memberNodes []string
 	// statusFn scripts the /cluster/status response; nil means fully online.
 	statusFn func() (*cluster.ListStatusResponse, error)
+	// listRulesCalls counts ListHaRules calls, and beforeListRules, when set,
+	// runs before each one with its 1-based number, so a test can change a
+	// rule between two reads the way a concurrent writer would.
+	listRulesCalls  int
+	beforeListRules func(call int)
+	// getResErr, when non-nil, makes GetHaResources fail with it.
+	getResErr error
 }
 
 func (s *aaClusterStub) record(ev string) {
@@ -101,6 +108,9 @@ func (s *aaClusterStub) CreateHaResources(_ context.Context, p *cluster.CreateHa
 }
 
 func (s *aaClusterStub) GetHaResources(_ context.Context, sid string) (*cluster.GetHaResourcesResponse, error) {
+	if s.getResErr != nil {
+		return nil, s.getResErr
+	}
 	if !s.resources[sid] {
 		return nil, fmt.Errorf("no such resource")
 	}
@@ -118,6 +128,10 @@ func (s *aaClusterStub) DeleteHaResources(_ context.Context, sid string, _ *clus
 
 func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
 	s.record("list-rules")
+	s.listRulesCalls++
+	if s.beforeListRules != nil {
+		s.beforeListRules(s.listRulesCalls)
+	}
 	if s.failListRules {
 		return nil, fmt.Errorf("ha not configured on this cluster")
 	}

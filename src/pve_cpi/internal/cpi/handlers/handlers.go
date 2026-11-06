@@ -104,7 +104,9 @@ type Deps struct {
 	StorageAuditCommand string
 	// HAProfile supplies the HA cluster profile the HA rule writers check for
 	// the PVE 9 floor before they write. Nil (production and every existing
-	// test literal) makes the writer probe the cluster itself.
+	// test literal) makes the writer probe the cluster itself. create_vm wraps
+	// it with withRequestHAProfile, so the profile is resolved at most once
+	// per request and every writer reuses it.
 	HAProfile func(ctx context.Context) (*ha.Profile, error)
 }
 

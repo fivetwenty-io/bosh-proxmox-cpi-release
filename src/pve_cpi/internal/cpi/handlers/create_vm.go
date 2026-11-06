@@ -572,6 +572,10 @@ func createVM(
 	args []json.RawMessage,
 ) (result any, retErr error) {
 	logger := deps.Log(ctx)
+	// Every HA rule writer below (anti-affinity, the AZ pin, the PCI pin)
+	// shares one HA profile, resolved on first use and before any cluster
+	// lock is taken.
+	deps = withRequestHAProfile(deps)
 
 	// -----------------------------------------------------------------------
 	// 1. Parse + validate arguments
