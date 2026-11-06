@@ -223,6 +223,31 @@ func ForeignVolumeError(storageName, volume string, bands VMIDBands, namespace s
 		volume, storageName, ownerText, ownerText, bands, ownerText)
 }
 
+// ownedConfigDriveISOKey carries the VMID whose config-drive ISO a caller has
+// proven it owns.
+type ownedConfigDriveISOKey struct{}
+
+// WithOwnedConfigDriveISO returns a context that lets the volume guard pass a
+// delete of exactly vm-<vmid>-config.iso, whatever band the VMID lies in. A
+// caller sets it only after proving the CPI owns that VM (the CID and owner
+// tag it just read, or a VMID it allocated itself), and before the destroy is
+// sent, because the cluster no longer holds the VM afterwards. The permit
+// covers no other VMID and no other volume name. A non-positive vmid leaves ctx
+// as it is.
+func WithOwnedConfigDriveISO(ctx context.Context, vmid int) context.Context {
+	if vmid <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ownedConfigDriveISOKey{}, vmid)
+}
+
+// OwnedConfigDriveISOPermits reports whether ctx carries a permit that covers
+// volume, which must end in exactly vm-<vmid>-config.iso for the permitted VMID.
+func OwnedConfigDriveISOPermits(ctx context.Context, volume string) bool {
+	vmid, ok := ctx.Value(ownedConfigDriveISOKey{}).(int)
+	return ok && vmid > 0 && volumeLastSegment(volume) == "vm-"+strconv.Itoa(vmid)+"-config.iso"
+}
+
 // storageClassifier answers whether a storage is shared. StorageInfoCache
 // satisfies it.
 type storageClassifier interface {
@@ -265,7 +290,7 @@ func newSharedVolumeGuardStorage(inner storage.Service, lister StorageLister, cf
 // extra. A storage the index cannot answer for counts as shared.
 func (s *sharedVolumeGuardStorage) refusal(ctx context.Context, storageName, volume string) error {
 	refused := ForeignVolumeError(storageName, volume, s.bands, s.namespace)
-	if refused == nil {
+	if refused == nil || OwnedConfigDriveISOPermits(ctx, volume) {
 		return nil
 	}
 	if s.classifier != nil && storageName != "" {

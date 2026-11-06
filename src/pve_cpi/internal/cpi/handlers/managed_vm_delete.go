@@ -183,7 +183,7 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 		return proof, err
 	}
 
-	if err := deleteManagedVMOrphanVolumes(ctx, deps, journal, handle, record, clusterNodes, owned, retainedTargets); err != nil {
+	if err := deleteManagedVMOrphanVolumes(pve.WithOwnedConfigDriveISO(ctx, vmid), deps, journal, handle, record, clusterNodes, owned, retainedTargets); err != nil {
 		return proof, err
 	}
 

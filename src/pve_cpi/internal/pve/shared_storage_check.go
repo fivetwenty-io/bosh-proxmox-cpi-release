@@ -113,7 +113,8 @@ func (f SharedExportFinding) String() string {
 // band of one cluster that overlaps any band of the other is an overlap, and
 // so is a next-id range that overlaps a band or the next-id range of the
 // other. A next-id range that overlaps a band of its own cluster is reported
-// for every cluster, shared backing or not.
+// only for a cluster that has a shared backing key which another checked
+// cluster also has, so a lone cluster or one on local storage reports nothing.
 func CheckSharedExports(clusters []ClusterVMIDLayout) []SharedExportFinding {
 	var findings []SharedExportFinding
 	keys := make([]map[string]bool, len(clusters))
@@ -129,12 +130,19 @@ func CheckSharedExports(clusters []ClusterVMIDLayout) []SharedExportFinding {
 			continue
 		}
 		keys[i], loose[i] = sharedBackingKeys(c.Storages)
+	}
+	for i := range clusters {
+		c := &clusters[i]
+		if c.Unchecked != "" || !sharesBackingWithPeer(keys, i) {
+			continue
+		}
 		if overlaps := nextIDOverlaps(c.NextID, c.Bands); len(overlaps) > 0 {
 			findings = append(findings, SharedExportFinding{
 				Kind:     FindingNextIDOverOwnBand,
 				Clusters: []string{c.Name},
-				Detail: fmt.Sprintf("the datacenter next-id range %s overlaps this cluster's %s; set next-id "+
-					"outside every band", c.NextID, strings.Join(overlaps, " and ")),
+				Detail: fmt.Sprintf("the datacenter next-id range %s overlaps this cluster's %s, and another "+
+					"cluster mounts one of its shared exports; set next-id outside every band", c.NextID,
+					strings.Join(overlaps, " and ")),
 			})
 		}
 	}
@@ -154,6 +162,17 @@ func CheckSharedExports(clusters []ClusterVMIDLayout) []SharedExportFinding {
 		return fa.Detail < fb.Detail
 	})
 	return findings
+}
+
+// sharesBackingWithPeer reports whether cluster i has a shared backing key that
+// another checked cluster also has. An unchecked cluster has no keys.
+func sharesBackingWithPeer(keys []map[string]bool, i int) bool {
+	for j := range keys {
+		if j != i && len(intersectKeys(keys[i], keys[j])) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // comparePair returns the findings for clusters a and b.

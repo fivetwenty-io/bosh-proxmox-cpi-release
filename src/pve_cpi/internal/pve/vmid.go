@@ -488,7 +488,7 @@ func NextDiskVMID(ctx context.Context, c Client, node, storage string, opts ...A
 		for id := range storageOnly {
 			used[id] = struct{}{}
 		}
-		logStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
+		logDiskStorageOnlyReservations(ctx, storageOnly, ao.rangeStart, ao.rangeEnd)
 	}
 
 	globalVMIDMu.Lock()
@@ -507,6 +507,29 @@ const storageOnlyLogSample = 5
 // another cluster's guests, and an operator chasing a shrinking band needs to
 // see which ones. The line gives the count and the lowest few IDs.
 func logStorageOnlyReservations(ctx context.Context, storageOnly map[int]struct{}, start, end int) {
+	fields := storageOnlyFields(storageOnly, start, end)
+	if fields == nil {
+		return
+	}
+	log.FromContext(ctx).Info("pve: VMID allocation skipped IDs that only storage holds; volumes named for them "+
+		"exist with no guest in this cluster, which on an export several clusters mount can mean another "+
+		"cluster's guests", fields...)
+}
+
+// logDiskStorageOnlyReservations is the disk allocator's counterpart. Persistent
+// disks take synthetic IDs from the disk band and no guest holds them, so
+// finding those IDs in storage alone is the normal case and logs at debug level.
+func logDiskStorageOnlyReservations(ctx context.Context, storageOnly map[int]struct{}, start, end int) {
+	fields := storageOnlyFields(storageOnly, start, end)
+	if fields == nil {
+		return
+	}
+	log.FromContext(ctx).Debug("pve: disk VMID allocation skipped IDs held by existing persistent disks", fields...)
+}
+
+// storageOnlyFields returns the log fields for the storage-only IDs inside
+// [start, end], or nil when there are none.
+func storageOnlyFields(storageOnly map[int]struct{}, start, end int) []log.Field {
 	inRange := make([]int, 0, len(storageOnly))
 	for id := range storageOnly {
 		if id >= start && id <= end {
@@ -514,7 +537,7 @@ func logStorageOnlyReservations(ctx context.Context, storageOnly map[int]struct{
 		}
 	}
 	if len(inRange) == 0 {
-		return
+		return nil
 	}
 	sort.Ints(inRange)
 	sample := inRange
@@ -525,12 +548,11 @@ func logStorageOnlyReservations(ctx context.Context, storageOnly map[int]struct{
 	for i, id := range sample {
 		parts[i] = strconv.Itoa(id)
 	}
-	log.FromContext(ctx).Info("pve: VMID allocation skipped IDs that only storage holds; volumes named for them "+
-		"exist with no guest in this cluster, which on an export several clusters mount can mean another "+
-		"cluster's guests",
+	return []log.Field{
 		log.String("range", fmt.Sprintf("%d-%d", start, end)),
 		log.Int("count", len(inRange)),
-		log.String("ids", strings.Join(parts, ",")))
+		log.String("ids", strings.Join(parts, ",")),
+	}
 }
 
 // volumeVMIDRegexp matches PVE volume names of the form "vm-NNN-disk-N"

@@ -137,7 +137,7 @@ func configureAgent(
 		return assertErr
 	}
 
-	if err := chosenAgent.Configure(ctx, shape.node, vmid, agentCfg); err != nil {
+	if err := chosenAgent.Configure(pve.WithOwnedConfigDriveISO(ctx, vmid), shape.node, vmid, agentCfg); err != nil {
 		return cpierrors.Wrap(err, fmt.Sprintf("create_vm: agent configure vmid=%d", vmid))
 	}
 	return nil

@@ -370,6 +370,9 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
 	vmCID := strconv.Itoa(vmid)
+	// This create allocated the VMID itself, so its config-drive ISO is ours to
+	// remove at the end of the rollback whatever band the VMID lies in.
+	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
 
 	stopVMForRollback(ctx, deps, node, vmid, logger)
 

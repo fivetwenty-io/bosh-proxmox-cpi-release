@@ -137,9 +137,26 @@ func TestCheckSharedExports(t *testing.T) {
 			want:     nil,
 		},
 		{
-			name:     "a next-id range over the cluster's own VM band",
+			name:     "a lone cluster with the default next-id range reports nothing",
 			clusters: []ClusterVMIDLayout{nextOverOwn},
-			want:     []SharedExportFindingKind{FindingNextIDOverOwnBand},
+			want:     nil,
+		},
+		{
+			name: "a cluster on local storage with the default next-id range reports nothing",
+			clusters: []ClusterVMIDLayout{
+				func() ClusterVMIDLayout {
+					c := disjointLayout("az1", 1000, StorageInfo{Name: "local", Type: "dir", Path: "/var/lib/vz"})
+					c.NextID = NextIDRange(0, 0)
+					return c
+				}(),
+				disjointLayout("az2", 10000, nfsStorage("nfs-b", "10.0.0.5", "/exports/pve")),
+			},
+			want: nil,
+		},
+		{
+			name:     "a next-id range over the own band of a cluster whose export another cluster mounts",
+			clusters: []ClusterVMIDLayout{nextOverOwn, disjointLayout("az2", 10000, sameExport)},
+			want:     []SharedExportFindingKind{FindingNextIDOverOwnBand, FindingNextIDOverPeer},
 		},
 		{
 			name:     "a next-id range over the other cluster's disk band",
@@ -163,6 +180,18 @@ func TestCheckSharedExports(t *testing.T) {
 				t.Fatalf("findings = %v, want kinds %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoneDefaultClusterDoesNotFailTheRun(t *testing.T) {
+	t.Parallel()
+	lone := disjointLayout("az1", 1000, nfsStorage("nfs-a", "10.0.0.5", "/exports/pve"))
+	lone.Bands = DefaultVMIDBands()
+	lone.NextID = NextIDRange(0, 0)
+	for _, f := range CheckSharedExports([]ClusterVMIDLayout{lone}) {
+		if f.Failing() {
+			t.Errorf("a lone default cluster fails the run: %s", f)
+		}
 	}
 }
 

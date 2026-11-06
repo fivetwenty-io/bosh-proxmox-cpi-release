@@ -445,3 +445,51 @@ func TestSharedVolumeGuardNodesWarnsOnce(t *testing.T) {
 		t.Errorf("the first suppressed sweep was not logged as a warning:\n%s", out)
 	}
 }
+
+func TestSharedVolumeGuardOwnedConfigDriveISOPermit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		vmid    int
+		volume  string
+		refused bool
+	}{
+		{name: "a legacy VM outside the bands deletes its own ISO", vmid: 50000, volume: "nfs-shared:iso/vm-50000-config.iso"},
+		{name: "a bare ISO name passes", vmid: 50000, volume: "vm-50000-config.iso"},
+		{name: "the permit does not cover a different VMID", vmid: 50001, volume: "nfs-shared:iso/vm-50000-config.iso", refused: true},
+		{name: "the permit does not cover a longer VMID", vmid: 5000, volume: "nfs-shared:iso/vm-50000-config.iso", refused: true},
+		{name: "the permit does not cover a disk of the same VMID", vmid: 50000, volume: "nfs-shared:50000/vm-50000-disk-0.qcow2", refused: true},
+		{name: "the permit does not cover another ISO name", vmid: 50000, volume: "nfs-shared:iso/vm-50000-config.iso.bak", refused: true},
+	}
+	for _, tc := range tests {
+		for variant, call := range deleteVariants() {
+			t.Run(tc.name+"/"+variant, func(t *testing.T) {
+				t.Parallel()
+				guard, inner := newGuardStorage(t, &fakeLister{entries: guardStorageIndex().entries})
+				err := call(guard, WithOwnedConfigDriveISO(context.Background(), tc.vmid), "nfs-shared", tc.volume)
+				if tc.refused {
+					if err == nil || !cpierrors.IsType(err, cpierrors.TypeCloud) || len(inner.deletes) != 0 {
+						t.Fatalf("delete of %q under the permit returned %v with deletes %v, want a refusal", tc.volume, err, inner.deletes)
+					}
+					return
+				}
+				if err != nil || len(inner.deletes) != 1 {
+					t.Fatalf("delete of %q under the permit returned %v with deletes %v, want one delete", tc.volume, err, inner.deletes)
+				}
+			})
+		}
+	}
+	t.Run("no permit still refuses", func(t *testing.T) {
+		t.Parallel()
+		guard, _ := newGuardStorage(t, guardStorageIndex())
+		if err := guard.DeleteVolume(context.Background(), "pve1", "nfs-shared", "nfs-shared:iso/vm-50000-config.iso"); err == nil {
+			t.Fatal("an out-of-band ISO was deleted without a permit")
+		}
+	})
+	t.Run("a non-positive VMID adds no permit", func(t *testing.T) {
+		t.Parallel()
+		if OwnedConfigDriveISOPermits(WithOwnedConfigDriveISO(context.Background(), 0), "vm-0-config.iso") {
+			t.Fatal("a zero VMID permitted a delete")
+		}
+	})
+}

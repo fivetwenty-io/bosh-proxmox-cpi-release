@@ -290,6 +290,46 @@ func (s *mirroredOrphanStorage) DeleteVolumeAsync(_ context.Context, _ string, _
 	s.c.nodesRead.content = remaining
 	return "UPID:pve1:shared-orphan-delete", nil
 }
+
+// permitCapturingStorage records whether the context of each volume delete
+// carries the config-drive ISO permit for the VM being torn down.
+type permitCapturingStorage struct {
+	mirroredOrphanStorage
+	ownPermit, otherPermit []bool
+}
+
+func (s *permitCapturingStorage) DeleteVolumeAsync(ctx context.Context, node, store, volume string) (string, error) {
+	s.ownPermit = append(s.ownPermit, pve.OwnedConfigDriveISOPermits(ctx, "a:iso/vm-123-config.iso"))
+	s.otherPermit = append(s.otherPermit, pve.OwnedConfigDriveISOPermits(ctx, "a:iso/vm-124-config.iso"))
+	return s.mirroredOrphanStorage.DeleteVolumeAsync(ctx, node, store, volume)
+}
+
+type permitCapturingClient struct {
+	*mirroredOrphanClient
+	storage *permitCapturingStorage
+}
+
+func (c *permitCapturingClient) Storage() storage.Service { return c.storage }
+
+func TestManagedVMDeletePermitsOwnConfigDriveISO(t *testing.T) {
+	deps, journal, base, record := deleteManagedFixture(t)
+	delete(base.configs, 123)
+	mirrored := &mirroredOrphanClient{deleteManagedClient: base, removed: map[string]bool{}}
+	captured := &permitCapturingStorage{mirroredOrphanStorage: mirroredOrphanStorage{c: mirrored}}
+	deps.PVE = &permitCapturingClient{mirroredOrphanClient: mirrored, storage: captured}
+	if _, err := CleanupStorageAllocation(t.Context(), deps, journal, []string{"pve1", "pve2"}, StorageAllocationDecision{Action: "cleanup", AllocationID: record.ID, DecisionID: "iso-permit"}); err != nil {
+		t.Fatalf("managed cleanup: %v", err)
+	}
+	if len(captured.ownPermit) == 0 {
+		t.Fatal("the managed teardown deleted no volume")
+	}
+	for i := range captured.ownPermit {
+		if !captured.ownPermit[i] || captured.otherPermit[i] {
+			t.Errorf("delete %d: own permit %v, other-VMID permit %v; want true and false", i, captured.ownPermit[i], captured.otherPermit[i])
+		}
+	}
+}
+
 func TestManagedVMSharedOrphanIsDeletedOnceAcrossNodeSightings(t *testing.T) {
 	deps, journal, base, record := deleteManagedFixture(t)
 	delete(base.configs, 123)

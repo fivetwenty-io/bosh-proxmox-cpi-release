@@ -608,6 +608,12 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 		return nil, ownErr
 	}
 
+	// The ownership guard above proved this VM is ours, so its config-drive ISO
+	// may go even when a band move left the VMID outside every band. The
+	// permit is set before any destroy, because the cluster stops holding the
+	// VM once the destroy lands.
+	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
+
 	if _, managed, markerErr := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(liveConfig)); markerErr != nil || managed {
 		return nil, cpierrors.Cloud("delete_vm: allocation provenance requires its original storage journal authority")
 	}

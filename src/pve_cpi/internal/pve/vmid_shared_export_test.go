@@ -145,10 +145,27 @@ func TestNextVMID_NoInfoLineWhenStorageAddsNothing(t *testing.T) {
 	}
 }
 
-func TestNextDiskVMID_LogsStorageOnlyReservations(t *testing.T) {
+func TestNextDiskVMID_LogsExistingDisksAtDebugOnly(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
 	logger, err := log.NewLogger("info", &buf)
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	ctx := log.IntoContext(context.Background(), logger)
+	client, _ := isoScanClient(map[string][]string{"nfs": {"nfs:vm-9000-disk-0"}})
+	if _, err := pve.NextDiskVMID(ctx, client, "pve1", "nfs", pve.WithRange(9000, 9001)); err != nil {
+		t.Fatalf("NextDiskVMID: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("the disk allocator logged at info level for its own persistent disks:\n%s", buf.String())
+	}
+}
+
+func TestNextDiskVMID_LogsStorageOnlyReservations(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger, err := log.NewLogger("debug", &buf)
 	if err != nil {
 		t.Fatalf("NewLogger: %v", err)
 	}
@@ -161,8 +178,13 @@ func TestNextDiskVMID_LogsStorageOnlyReservations(t *testing.T) {
 	if got != 9001 {
 		t.Fatalf("NextDiskVMID = %d, want 9001", got)
 	}
-	if !strings.Contains(buf.String(), `"ids":"9000"`) {
-		t.Errorf("disk allocator did not log the storage-only reservation:\n%s", buf.String())
+	for _, want := range []string{`"ids":"9000"`, "existing persistent disks"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("disk allocator debug line lacks %s:\n%s", want, buf.String())
+		}
+	}
+	if strings.Contains(buf.String(), "another cluster") {
+		t.Errorf("disk allocator line blames another cluster:\n%s", buf.String())
 	}
 }
 
