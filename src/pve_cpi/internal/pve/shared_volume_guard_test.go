@@ -275,6 +275,45 @@ func TestSharedVolumeGuardStorage(t *testing.T) {
 	}
 }
 
+// TestSharedVolumeGuardStorageBlockSharedTypes confirms that the guard treats
+// iscsi, ZFS over iSCSI, and drbd storage as shared with no shared flag set, so
+// a foreign VMID or another namespace's allocation volume is refused there.
+func TestSharedVolumeGuardStorageBlockSharedTypes(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"iscsi", "iscsidirect", "zfs", "drbd"} {
+		tests := []struct {
+			name    string
+			volume  string
+			refused bool
+		}{
+			{name: "foreign owner is refused", volume: "vm-50000-disk-0", refused: true},
+			{name: "another locator in the bands is refused", volume: guardAllocVolume("150", "other"), refused: true},
+			{name: "our locator outside the bands passes", volume: guardAllocVolume("50000", guardTestNamespace)},
+			{name: "in-band owner passes", volume: "vm-150-disk-0"},
+		}
+		for _, tc := range tests {
+			t.Run(typ+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				lister := &fakeLister{entries: []map[string]any{{"storage": "blk", "type": typ, "content": "images"}}}
+				guard, inner := newGuardStorage(t, lister)
+				err := guard.DeleteVolume(context.Background(), "pve1", "blk", tc.volume)
+				if tc.refused {
+					if err == nil || !cpierrors.IsType(err, cpierrors.TypeCloud) {
+						t.Fatalf("delete of %q on %s returned %v, want a permanent refusal", tc.volume, typ, err)
+					}
+					if len(inner.deletes) != 0 {
+						t.Fatalf("refused delete still reached PVE: %v", inner.deletes)
+					}
+					return
+				}
+				if err != nil || len(inner.deletes) != 1 {
+					t.Fatalf("delete of %q on %s = %v with %v sent, want it sent", tc.volume, typ, err, inner.deletes)
+				}
+			})
+		}
+	}
+}
+
 func TestSharedVolumeGuardStoragePassesOtherCalls(t *testing.T) {
 	t.Parallel()
 	guard, _ := newGuardStorage(t, guardStorageIndex())
@@ -339,6 +378,9 @@ func TestSharedVolumeGuardNodesDeleteQemu(t *testing.T) {
 	localRow := map[string]any{"storage": "local-lvm", "type": "lvmthin", "content": "images", "enabled": 1, "active": 1}
 	isoOnlyShared := map[string]any{"storage": "nfs-iso", "type": "nfs", "content": "iso", "shared": 1, "enabled": 1}
 	disabledShared := map[string]any{"storage": "nfs-off", "type": "nfs", "content": "images", "shared": 1, "enabled": 0}
+	iscsiRow := map[string]any{"storage": "san", "type": "iscsi", "content": "images", "enabled": 1}
+	zfsRow := map[string]any{"storage": "zsan", "type": "zfs", "content": "images", "enabled": 1}
+	drbdRow := map[string]any{"storage": "drbd1", "type": "drbd", "content": "images", "enabled": 1}
 	sharedDir := map[string]any{"storage": "dir-shared", "type": "dir", "content": "images", "shared": 1, "enabled": 1}
 
 	tests := []struct {
@@ -354,6 +396,15 @@ func TestSharedVolumeGuardNodesDeleteQemu(t *testing.T) {
 		}},
 		{name: "a shared dir turns it off", listing: func(t *testing.T) (*nodes.ListStorageResponse, error) {
 			return nodeStorageListing(t, sharedDir), nil
+		}},
+		{name: "iscsi with no shared flag turns it off", listing: func(t *testing.T) (*nodes.ListStorageResponse, error) {
+			return nodeStorageListing(t, localRow, iscsiRow), nil
+		}},
+		{name: "zfs over iscsi with no shared flag turns it off", listing: func(t *testing.T) (*nodes.ListStorageResponse, error) {
+			return nodeStorageListing(t, localRow, zfsRow), nil
+		}},
+		{name: "drbd with no shared flag turns it off", listing: func(t *testing.T) (*nodes.ListStorageResponse, error) {
+			return nodeStorageListing(t, localRow, drbdRow), nil
 		}},
 		{name: "local storage only keeps the sweep", wantSweep: true, listing: func(t *testing.T) (*nodes.ListStorageResponse, error) {
 			return nodeStorageListing(t, localRow, isoOnlyShared, disabledShared), nil

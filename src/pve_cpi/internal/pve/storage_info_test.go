@@ -647,3 +647,24 @@ func TestParseStorageEntry_IsMountpointUnexpectedValue(t *testing.T) {
 		})
 	}
 }
+
+// TestBackendResolver_RoutesBlockSharedTypesToSharedBackend confirms that the
+// types PVE treats as cluster-visible by definition reach the shared backend
+// even when storage.cfg carries no shared flag.
+func TestBackendResolver_RoutesBlockSharedTypesToSharedBackend(t *testing.T) {
+	t.Parallel()
+	for _, typ := range []string{"iscsi", "iscsidirect", "zfs", "drbd"} {
+		t.Run(typ, func(t *testing.T) {
+			t.Parallel()
+			lister := &fakeLister{entries: []map[string]any{{"storage": "blk", "type": typ}}}
+			r := NewBackendResolver(nil, NewStorageInfoCache(lister, time.Minute), "pve-default")
+			b, err := r.Resolve(context.Background(), "blk")
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if b.Kind() != BackendShared {
+				t.Fatalf("Kind()=%s, want shared for %s", b.Kind(), typ)
+			}
+		})
+	}
+}
