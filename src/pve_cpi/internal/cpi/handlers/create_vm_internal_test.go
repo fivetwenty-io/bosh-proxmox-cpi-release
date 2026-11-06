@@ -849,7 +849,12 @@ type placementInternalTestCluster struct {
 }
 
 func (c *placementInternalTestCluster) ListStatus(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
-	resp := make(sdkcluster.ListStatusResponse, 0, len(c.nodes))
+	resp := make(sdkcluster.ListStatusResponse, 0, len(c.nodes)+1)
+	if len(c.nodes) >= 2 {
+		// A real PVE cluster always reports a quorate cluster row.
+		raw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": len(c.nodes)})
+		resp = append(resp, raw)
+	}
 	for _, n := range c.nodes {
 		raw, _ := json.Marshal(n)
 		resp = append(resp, raw)
@@ -1212,7 +1217,8 @@ func TestResolveTargetNodeWithRNG_MaintenanceNodeExcluded(t *testing.T) {
 		Type: "node", Name: "pve2", Online: 1, Maxcpu: 4,
 		Maxmem: 8 * 1024 * 1024 * 1024, Mem: 2 * 1024 * 1024 * 1024, CPU: 0.1,
 	})
-	cluster := &rawNodeCluster{nodes: []json.RawMessage{n1raw, n2raw}}
+	clusterRaw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": 2})
+	cluster := &rawNodeCluster{nodes: []json.RawMessage{clusterRaw, n1raw, n2raw}}
 	cfg := &config.CPIConfig{
 		VMStorage:     "local-lvm",
 		NetworkBridge: "vmbr0",

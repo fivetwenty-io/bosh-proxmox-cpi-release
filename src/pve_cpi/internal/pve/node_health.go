@@ -431,11 +431,12 @@ func readClusterView(ctx context.Context, clusterAPI NodeHealthCluster) (*cluste
 		}
 	}
 	if !view.clustered {
-		// A standalone host reports no cluster row, and so does a response that
-		// omits it. Nothing says the entry node lost quorum, so the view is not
-		// marked non-quorate; QuorumReported stays false for callers that must
-		// have the flag before they act.
-		view.quorate = true
+		// A standalone host reports no cluster row, so a single node row with no
+		// cluster row counts as quorate; QuorumReported stays false for callers
+		// that must have the flag before they act. Two or more node rows without
+		// a cluster row is a response we cannot read quorum from, so the view
+		// fails closed as non-quorate.
+		view.quorate = len(view.nodes) <= 1
 	}
 	return view, nil
 }

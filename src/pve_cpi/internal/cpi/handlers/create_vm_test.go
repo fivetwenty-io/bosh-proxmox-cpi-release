@@ -2743,7 +2743,8 @@ func listStatusTwoNodes() func(context.Context) (*sdkcluster.ListStatusResponse,
 			"type": "node", "name": "pve2", "online": 1,
 			"maxcpu": int64(8), "maxmem": 16 * gib, "mem": 14 * gib, "cpu": 0.8,
 		})
-		resp := sdkcluster.ListStatusResponse{raw1, raw2}
+		rawCluster, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1, "nodes": 2})
+		resp := sdkcluster.ListStatusResponse{rawCluster, raw1, raw2}
 		return &resp, nil
 	}
 }

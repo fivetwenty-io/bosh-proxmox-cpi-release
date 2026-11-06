@@ -435,6 +435,20 @@ func TestNodeHealth_StandaloneHost(t *testing.T) {
 	}
 }
 
+func TestNodeHealth_MultiNodeWithoutClusterRowFailsClosed(t *testing.T) {
+	t.Parallel()
+	c := &nhCluster{rows: []json.RawMessage{nhNode("pve1", 1, true, ""), nhNode("pve2", 2, false, "")}}
+	r, _ := nhRun(t, c, pve.NodeHealthOptions{})
+	if r.Quorate || r.QuorumReported {
+		t.Fatalf("two node rows without a cluster row must not count as quorate: %+v", r)
+	}
+	for _, n := range []string{"pve1", "pve2"} {
+		if e := nhEntry(t, r, n); e.Placeable || e.Health != pve.NodeHealthUnknown {
+			t.Errorf("%s: %+v", n, e)
+		}
+	}
+}
+
 func TestNodeHealth_LRMEntries(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
