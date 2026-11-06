@@ -3,6 +3,7 @@ package pve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -13,6 +14,13 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 )
+
+// ErrHAManagerHoldsService marks the one absence-proof refusal that time cures
+// by itself. No HA resource is configured for the VMID, yet the CRM's
+// service_status still lists the service, and the CRM drops a service with no
+// configuration on its next round. A caller that has just removed the guest can
+// wait on it with errors.Is, and every other absence refusal stays final.
+var ErrHAManagerHoldsService = errors.New("the HA manager still holds the service")
 
 // OfflineMemberTie reports whether a record that the CPI keeps outside PVE ties
 // a guest to one of the members the quorate cluster reports offline. offline
@@ -98,7 +106,9 @@ func proveVMAbsent(
 		if member != "" {
 			return VMLocation{}, cpierrors.Retriable(
 				"%s: VM %d %s, but %s ties it to member %s, which the cluster reports offline; cannot prove absence "+
-					"until %s answers again", caller, vmid, why, detail, member, member)
+					"until %s answers again. Either bring %s back, or remove it from the cluster with pvecm delnode %s "+
+					"and retry; the journal record is then closed through the retained-authority delete",
+				caller, vmid, why, detail, member, member, member, member)
 		}
 	}
 	logger := log.FromContext(ctx)
@@ -159,9 +169,9 @@ func requireNoHAHold(ctx context.Context, c Client, vmid int, caller, why string
 	sort.Strings(sids)
 	for _, sid := range sids {
 		if haSIDNamesVMID(sid, vmid) {
-			return cpierrors.Retriable(
+			return cpierrors.WrapAs(ErrHAManagerHoldsService, cpierrors.TypeRetriableCloud, fmt.Sprintf(
 				"%s: VM %d %s, but the HA manager still holds service %s; cannot prove absence until the CRM drops it",
-				caller, vmid, why, sid)
+				caller, vmid, why, sid))
 		}
 	}
 	return nil

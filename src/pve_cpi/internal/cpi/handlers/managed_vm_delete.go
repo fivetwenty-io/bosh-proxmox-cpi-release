@@ -731,7 +731,7 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 		err = managedVMDeleteTask(ctx, deps, handle, "destroy", aj.Target{Node: node, VMID: vmid}, func() (any, error) {
 			return deps.PVE.Nodes().DeleteQemu(ctx, node, strconv.Itoa(vmid), &nodes.DeleteQemuParams{Purge: &purge, DestroyUnreferencedDisks: &sweep})
 		}, func() error {
-			location, e := findVMAuthoritative(ctx, deps, vmid)
+			location, e := awaitManagedVMDestroyAbsence(ctx, deps, vmid)
 			if e != nil {
 				return e
 			}

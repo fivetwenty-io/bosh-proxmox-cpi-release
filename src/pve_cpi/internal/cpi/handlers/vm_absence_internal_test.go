@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	sdknodes "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
@@ -17,6 +20,7 @@ import (
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/jsonrpc"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 )
 
 func TestJournalRecordOnOfflineMember(t *testing.T) {
@@ -234,8 +238,9 @@ func TestProtectForeignDisksOnRollback_NilConfigMovedVMIsRetriable(t *testing.T)
 // /cluster/status that cannot be read.
 type ownDownCluster struct {
 	ownTestCluster
-	down      string
-	statusErr error
+	down       string
+	statusErr  error
+	notQuorate bool
 }
 
 func (c ownDownCluster) ListStatus(context.Context) (*sdkcluster.ListStatusResponse, error) {
@@ -243,7 +248,11 @@ func (c ownDownCluster) ListStatus(context.Context) (*sdkcluster.ListStatusRespo
 		return nil, c.statusErr
 	}
 	resp := make(sdkcluster.ListStatusResponse, 0, 1+len(c.nodes))
-	resp = append(resp, json.RawMessage(`{"type":"cluster","name":"fixture","quorate":1}`))
+	quorate := 1
+	if c.notQuorate {
+		quorate = 0
+	}
+	resp = append(resp, json.RawMessage(fmt.Sprintf(`{"type":"cluster","name":"fixture","quorate":%d}`, quorate)))
 	for _, n := range c.nodes {
 		online := 1
 		if n == c.down {
@@ -269,6 +278,9 @@ func TestReadAtVMNode_ConfigMissingNeedsANodeThatCanAnswer(t *testing.T) {
 	}{
 		{name: "owner offline", cluster: ownDownCluster{ownTestCluster: ownTestCluster{nodes: []string{"n1", "n2"}}, down: "n1"},
 			want: "does not report that node able to answer"},
+		{name: "cluster not quorate",
+			cluster: ownDownCluster{ownTestCluster: ownTestCluster{nodes: []string{"n1", "n2"}}, notQuorate: true},
+			want:    "does not report that node able to answer"},
 		{name: "status unreadable",
 			cluster: ownDownCluster{ownTestCluster: ownTestCluster{nodes: []string{"n1", "n2"}}, statusErr: sdkerrors.ErrNotFound},
 			want:    "could not be read"},
@@ -317,5 +329,112 @@ func TestReadAtVMNode_StaleIndexRelocates(t *testing.T) {
 	}
 	if node != "n2" || got["tags"] != "moved" {
 		t.Fatalf("read (%v) on %s, want the config on n2", got, node)
+	}
+}
+
+// lingeringCRMCluster serves an index with no VM, no HA resource, and a CRM
+// whose service_status lists vm:<vmid> for the first lingering reads and then
+// drops it.
+type lingeringCRMCluster struct {
+	ownTestCluster
+	vmid      int
+	lingering int32
+	resources []string
+	reads     atomic.Int32
+}
+
+func (c *lingeringCRMCluster) ListResources(
+	context.Context, *sdkcluster.ListResourcesParams,
+) (*sdkcluster.ListResourcesResponse, error) {
+	resp := sdkcluster.ListResourcesResponse{}
+	return &resp, nil
+}
+
+func (c *lingeringCRMCluster) ListHaResources(
+	context.Context, *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	return AbsenceHAResources(c.resources...), nil
+}
+
+func (c *lingeringCRMCluster) ListHaStatusManagerStatus(
+	context.Context,
+) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	if c.reads.Add(1) > c.lingering {
+		return AbsenceIdleCRM(), nil
+	}
+	resp := sdkcluster.ListHaStatusManagerStatusResponse(
+		fmt.Sprintf(`{"manager_status":{"service_status":{"vm:%d":{"state":"started","node":"n1"}}}}`, c.vmid))
+	return &resp, nil
+}
+
+func lingeringDeps(c *lingeringCRMCluster) Deps {
+	q := &ownTestQEMU{err: sdkerrors.ErrNotFound}
+	deps := ownTestDeps(q)
+	deps.PVE = ownTestClient{qemu: q, cluster: c}
+	return deps
+}
+
+func lingeringFixture(lingering int32, resources ...string) *lingeringCRMCluster {
+	return &lingeringCRMCluster{
+		ownTestCluster: ownTestCluster{nodes: []string{"n1", "n2"}},
+		vmid:           701,
+		lingering:      lingering,
+		resources:      resources,
+	}
+}
+
+func TestPollManagedVMDestroyAbsence_WaitsForTheCRMToDropTheService(t *testing.T) {
+	t.Parallel()
+	c := lingeringFixture(2)
+	deps := lingeringDeps(c)
+
+	loc, err := pollManagedVMDestroyAbsence(context.Background(), 5*time.Second, time.Millisecond,
+		func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
+
+	if err != nil || loc.Found {
+		t.Fatalf("loc = %+v, err = %v; want absence proven once the CRM drops the service", loc, err)
+	}
+	if got := c.reads.Load(); got != 3 {
+		t.Errorf("CRM reads = %d, want 3 (two lingering answers, then the clear one)", got)
+	}
+}
+
+func TestPollManagedVMDestroyAbsence_StaysBoundedAndRetriableWhenTheCRMNeverDrops(t *testing.T) {
+	t.Parallel()
+	c := lingeringFixture(1 << 30)
+	deps := lingeringDeps(c)
+
+	start := time.Now()
+	_, err := pollManagedVMDestroyAbsence(context.Background(), 60*time.Millisecond, 5*time.Millisecond,
+		func() (pve.VMLocation, error) { return findVMAuthoritative(context.Background(), deps, c.vmid) })
+
+	if err == nil || !errors.Is(err, pve.ErrHAManagerHoldsService) || !cpierrors.IsType(err, cpierrors.TypeRetriableCloud) {
+		t.Fatalf("err = %v, want the retriable CRM-still-holds error", err)
+	}
+	if c.reads.Load() < 2 {
+		t.Errorf("CRM reads = %d, want the proof repeated before the wait ended", c.reads.Load())
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("poll took %s, want it bounded by the wait", elapsed)
+	}
+}
+
+func TestPollManagedVMDestroyAbsence_OtherRefusalsReturnAtOnce(t *testing.T) {
+	t.Parallel()
+	c := lingeringFixture(0, "vm:701")
+	deps := lingeringDeps(c)
+	calls := 0
+
+	_, err := pollManagedVMDestroyAbsence(context.Background(), 5*time.Second, time.Millisecond,
+		func() (pve.VMLocation, error) {
+			calls++
+			return findVMAuthoritative(context.Background(), deps, c.vmid)
+		})
+
+	if err == nil || errors.Is(err, pve.ErrHAManagerHoldsService) || !strings.Contains(err.Error(), "is still configured") {
+		t.Fatalf("err = %v, want the configured-resource refusal", err)
+	}
+	if calls != 1 {
+		t.Errorf("proof ran %d times, want 1 because a configured resource is not cured by waiting", calls)
 	}
 }

@@ -561,6 +561,12 @@ A timeout confirms the block; `200` means the API is reachable and the fault is 
 
 Permit the isolated subnet to reach the API. `BOSH_PVE_ENV=<env> ./scripts/bosh net-up` does this automatically (idempotent rules in `/etc/pve/nodes/<node>/host.fw` for the configured subnet → `8006` + ICMP, then a firewall reload); `net-status` shows them and `net-down` removes them. See [Networks, Host firewall for API access from the isolated subnet](networks.md#isolated-test-network-sdn).
 
+### delete_vm or has_vm refuses because a record ties the VM to an offline member
+
+When a VM has no index row and a cluster member is offline, the CPI cannot prove the VM is gone while an open allocation record names that member. The error says the record ties the VM to the member and that absence cannot be proven. This is the narrow case where a VM was created just before its node went dark, so the record is the only evidence we can still read.
+
+We have two ways out. We can bring the member back, and the next retry reads the member directly and settles the question. If the member will never return, we remove it from the cluster with `pvecm delnode <member>`, which drops it from the cluster member list, and then we retry the call. We close the open record afterwards through the retained-authority delete described in [Audit and recover storage allocations](storage-journal-operations.md#delete-an-allocation-through-its-retained-authority).
+
 ## VM ownership refusals
 
 ### A call refuses a VM this Director does not own

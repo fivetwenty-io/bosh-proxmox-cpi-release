@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -77,5 +78,46 @@ func managedVMVolumeAbsenceReason(present bool, err error) string {
 		return "visibility_unproven"
 	default:
 		return "observation_unavailable"
+	}
+}
+
+// managedVMDestroyCRMWait bounds how long the destroy observation waits for the
+// CRM to drop the service of a guest that no longer has an HA resource. The CRM
+// drops it on its next round, which is on the order of ten seconds.
+const (
+	managedVMDestroyCRMWait     = 30 * time.Second
+	managedVMDestroyCRMInterval = 500 * time.Millisecond
+)
+
+// awaitManagedVMDestroyAbsence proves the destroyed VM absent. It repeats the
+// proof only while the one outcome that time cures keeps coming back, the CRM
+// still listing the service, and returns every other result at once. When the
+// wait ends with the CRM still listing it, the last retriable error returns.
+func awaitManagedVMDestroyAbsence(ctx context.Context, deps Deps, vmid int) (pve.VMLocation, error) {
+	return pollManagedVMDestroyAbsence(ctx, managedVMDestroyCRMWait, managedVMDestroyCRMInterval, func() (pve.VMLocation, error) {
+		return findVMAuthoritative(ctx, deps, vmid)
+	})
+}
+
+func pollManagedVMDestroyAbsence(
+	ctx context.Context, wait, interval time.Duration, find func() (pve.VMLocation, error),
+) (pve.VMLocation, error) {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	for {
+		location, err := find()
+		if err == nil || !errors.Is(err, pve.ErrHAManagerHoldsService) {
+			return location, err
+		}
+		tick := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			tick.Stop()
+			return location, err
+		case <-deadline.C:
+			tick.Stop()
+			return location, err
+		case <-tick.C:
+		}
 	}
 }
