@@ -866,6 +866,10 @@ func (c *placementInternalTestCluster) ListHaStatusCurrent(_ context.Context) (*
 	empty := sdkcluster.ListHaStatusCurrentResponse{}
 	return &empty, nil
 }
+func (c *placementInternalTestCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	empty := sdkcluster.ListHaStatusManagerStatusResponse{}
+	return &empty, nil
+}
 
 var _ placement.ClusterClient = (*placementInternalTestCluster)(nil)
 
@@ -892,7 +896,7 @@ var _ pve.Client = (*placementInternalTestPVE)(nil)
 
 // fullClusterAdapter wraps a placement.ClusterClient subset as a full cluster.Service.
 // It embeds sdkcluster.Service (nil) to satisfy the full interface via nil-pointer panic
-// for any method not overridden. Only the three methods used by placement are forwarded.
+// for any method not overridden. Only the methods used by placement are forwarded.
 type fullClusterAdapter struct {
 	sdkcluster.Service // nil — panics on any non-overridden call
 	sub                placement.ClusterClient
@@ -906,6 +910,9 @@ func (a *fullClusterAdapter) ListResources(ctx context.Context, p *sdkcluster.Li
 }
 func (a *fullClusterAdapter) ListHaStatusCurrent(ctx context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
 	return a.sub.ListHaStatusCurrent(ctx)
+}
+func (a *fullClusterAdapter) ListHaStatusManagerStatus(ctx context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	return a.sub.ListHaStatusManagerStatus(ctx)
 }
 
 var _ sdkcluster.Service = (*fullClusterAdapter)(nil)
@@ -1240,6 +1247,10 @@ func (c *rawNodeCluster) ListResources(_ context.Context, _ *sdkcluster.ListReso
 }
 func (c *rawNodeCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.ListHaStatusCurrentResponse, error) {
 	empty := sdkcluster.ListHaStatusCurrentResponse{}
+	return &empty, nil
+}
+func (c *rawNodeCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	empty := sdkcluster.ListHaStatusManagerStatusResponse{}
 	return &empty, nil
 }
 

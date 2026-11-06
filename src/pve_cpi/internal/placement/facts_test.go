@@ -23,6 +23,8 @@ type stubCluster struct {
 	resErr         error
 	haStatusFn     func() (*cluster.ListHaStatusCurrentResponse, error)
 	haStatusCalled bool
+	managerFn      func() (*cluster.ListHaStatusManagerStatusResponse, error)
+	managerCalled  bool
 }
 
 func (s *stubCluster) ListStatus(_ context.Context) (*cluster.ListStatusResponse, error) {
@@ -43,8 +45,28 @@ func (s *stubCluster) ListHaStatusCurrent(_ context.Context) (*cluster.ListHaSta
 	return &empty, nil
 }
 
+func (s *stubCluster) ListHaStatusManagerStatus(_ context.Context) (*cluster.ListHaStatusManagerStatusResponse, error) {
+	s.managerCalled = true
+	if s.managerFn != nil {
+		return s.managerFn()
+	}
+	// Default: empty response (no HA view).
+	empty := cluster.ListHaStatusManagerStatusResponse{}
+	return &empty, nil
+}
+
 type stubNodes struct {
 	storageFn func(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
+	now       int64
+}
+
+func (s *stubNodes) ListTime(_ context.Context, _ string) (*nodes.ListTimeResponse, error) {
+	var resp nodes.ListTimeResponse
+	raw, _ := json.Marshal(map[string]any{"time": s.now, "localtime": s.now, "timezone": "UTC"})
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 func (s *stubNodes) ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error) {
@@ -85,6 +107,37 @@ func statusNode(name string, maxcpu, maxmem, mem int64, online int, cpuUsed floa
 	return raw
 }
 
+// localStatusNode is statusNode with the local flag the entry node carries.
+func localStatusNode() json.RawMessage {
+	const name = "pve1"
+	raw, _ := json.Marshal(map[string]any{
+		"type": "node", "name": name, "maxcpu": 8, "maxmem": 8 * gib, "mem": 4 * gib,
+		"online": 1, "local": 1, "cpu": 0.0,
+	})
+	return raw
+}
+
+// quorateRow is the cluster row of GET /cluster/status.
+func quorateRow(quorate int) json.RawMessage {
+	raw, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": quorate, "nodes": 3})
+	return raw
+}
+
+// managerStatusJSON builds the body of GET /cluster/ha/status/manager_status.
+func managerStatusJSON(now int64, nodeStatus map[string]string, lrm map[string]map[string]any) *cluster.ListHaStatusManagerStatusResponse {
+	raw, _ := json.Marshal(map[string]any{
+		"manager_status": map[string]any{"node_status": nodeStatus, "timestamp": now},
+		"lrm_status":     lrm,
+		"quorum":         map[string]any{"node": "pve1", "quorate": "1"},
+	})
+	resp := cluster.ListHaStatusManagerStatusResponse(raw)
+	return &resp
+}
+
+func freshLRM() map[string]any {
+	return map[string]any{"mode": "active", "state": "active", "timestamp": haTestNow}
+}
+
 func resourceQEMU(node, name, tags string) json.RawMessage {
 	raw, _ := json.Marshal(map[string]any{
 		"type": "qemu",
@@ -114,6 +167,9 @@ func resourceQEMUWithMem(node, name string, maxmem int64, status string) json.Ra
 	raw, _ := json.Marshal(m)
 	return raw
 }
+
+// haTestNow is the entry node clock in the node health tests.
+const haTestNow = 1_800_000_000
 
 func nopLogger() *log.Logger { return log.NewNopLogger() }
 
@@ -540,23 +596,26 @@ func TestGatherNodeFacts_MultipleNodes(t *testing.T) {
 
 func TestGatherNodeFacts_HAMaintenanceNode(t *testing.T) {
 	t.Parallel()
+	const now = haTestNow
 	resp := cluster.ListStatusResponse{
-		statusNode("pve1", 8, 8*gib, 4*gib, 1, 0),
+		quorateRow(1),
+		localStatusNode(),
 		statusNode("pve2", 8, 8*gib, 4*gib, 1, 0),
 	}
-	// pve1 is in HA maintenance state.
-	haResp := make(cluster.ListHaStatusCurrentResponse, 0, 1)
-	raw, _ := json.Marshal(map[string]any{"type": "manager_status", "node": "pve1", "state": "maintenance"})
-	haResp = append(haResp, json.RawMessage(raw))
-
+	// pve1 is healthy; pve2 is in HA maintenance.
 	cl := &stubCluster{
 		statusResp: &resp,
 		resResp:    &cluster.ListResourcesResponse{},
-		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
-			return &haResp, nil
+		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
+			return managerStatusJSON(now,
+				map[string]string{"pve1": "online", "pve2": "maintenance"},
+				map[string]map[string]any{
+					"pve1": freshLRM(),
+					"pve2": {"mode": "maintenance", "state": "maintenance", "timestamp": now},
+				}), nil
 		},
 	}
-	ns := &stubNodes{}
+	ns := &stubNodes{now: now}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
 		ExcludeMaintenanceNodes: true,
@@ -570,14 +629,67 @@ func TestGatherNodeFacts_HAMaintenanceNode(t *testing.T) {
 	for _, f := range facts {
 		switch f.Node {
 		case "pve1":
-			if !f.InMaintenance {
-				t.Error("pve1 should be InMaintenance=true (HA state)")
+			if f.InMaintenance {
+				t.Error("pve1 should be InMaintenance=false")
 			}
 		case "pve2":
-			if f.InMaintenance {
-				t.Error("pve2 should be InMaintenance=false")
+			if !f.InMaintenance {
+				t.Error("pve2 should be InMaintenance=true (HA maintenance)")
 			}
 		}
+	}
+}
+
+// One errored VM must not mark its healthy node. The old check read the state
+// of every status entry and condemned the node for it.
+func TestGatherNodeFacts_ErroredServiceDoesNotMarkNode(t *testing.T) {
+	t.Parallel()
+	const now = haTestNow
+	resp := cluster.ListStatusResponse{quorateRow(1), localStatusNode()}
+	cl := &stubCluster{
+		statusResp: &resp,
+		resResp:    &cluster.ListResourcesResponse{},
+		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
+			return managerStatusJSON(now, map[string]string{"pve1": "online"},
+				map[string]map[string]any{"pve1": freshLRM()}), nil
+		},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
+			raw, _ := json.Marshal(map[string]any{
+				"type": "service", "id": "vm:100", "node": "pve1", "state": "error",
+			})
+			return &cluster.ListHaStatusCurrentResponse{json.RawMessage(raw)}, nil
+		},
+	}
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{now: now}, nopLogger(),
+		placement.GatherOptions{ExcludeMaintenanceNodes: true})
+	if err != nil || len(facts) != 1 {
+		t.Fatalf("facts=%v err=%v", facts, err)
+	}
+	if facts[0].InMaintenance {
+		t.Error("an errored service must not mark its node")
+	}
+}
+
+func TestGatherNodeFacts_NotQuorateEntryExcludesEveryNode(t *testing.T) {
+	t.Parallel()
+	resp := cluster.ListStatusResponse{
+		quorateRow(0),
+		localStatusNode(),
+		statusNode("pve2", 8, 8*gib, 4*gib, 1, 0),
+	}
+	cl := &stubCluster{statusResp: &resp, resResp: &cluster.ListResourcesResponse{}}
+	facts, err := placement.GatherNodeFacts(context.Background(), cl, &stubNodes{now: 1}, nopLogger(),
+		placement.GatherOptions{ExcludeMaintenanceNodes: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, f := range facts {
+		if !f.InMaintenance {
+			t.Errorf("%s: a non-quorate entry node must leave no node placeable", f.Node)
+		}
+	}
+	if cl.managerCalled {
+		t.Error("no HA source is read through a non-quorate entry node")
 	}
 }
 
@@ -625,6 +737,9 @@ func TestGatherNodeFacts_HAStatusError_FailOpen(t *testing.T) {
 	cl := &stubCluster{
 		statusResp: &resp,
 		resResp:    &cluster.ListResourcesResponse{},
+		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
+			return nil, errors.New("HA API unavailable")
+		},
 		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
 			return nil, errors.New("HA API unavailable")
 		},
@@ -654,8 +769,11 @@ func TestGatherNodeFacts_ExcludeDisabled_HANotCalled(t *testing.T) {
 	cl := &stubCluster{
 		statusResp: &resp,
 		resResp:    &cluster.ListResourcesResponse{},
-		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
+		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
 			// Should not be called when ExcludeMaintenanceNodes is false.
+			return nil, errors.New("should not be called")
+		},
+		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) {
 			return nil, errors.New("should not be called")
 		},
 	}
@@ -670,8 +788,8 @@ func TestGatherNodeFacts_ExcludeDisabled_HANotCalled(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("expected 1 fact; got %d", len(facts))
 	}
-	if cl.haStatusCalled {
-		t.Error("ListHaStatusCurrent should NOT be called when ExcludeMaintenanceNodes=false")
+	if cl.haStatusCalled || cl.managerCalled {
+		t.Error("no HA source should be read when ExcludeMaintenanceNodes=false")
 	}
 	if facts[0].InMaintenance {
 		t.Error("InMaintenance should be false when exclusion is disabled")
@@ -680,27 +798,33 @@ func TestGatherNodeFacts_ExcludeDisabled_HANotCalled(t *testing.T) {
 
 func TestGatherNodeFacts_MaintenanceUnionHAAndTag(t *testing.T) {
 	t.Parallel()
+	const now = haTestNow
 	// pve1 has HA maintenance; pve2 has operator tag; pve3 is clean.
-	statusRaw1 := statusNode("pve1", 8, 8*gib, 4*gib, 1, 0)
 	taggedRaw, _ := json.Marshal(map[string]any{
 		"type": "node", "name": "pve2", "maxcpu": 8, "maxmem": 8 * gib,
 		"mem": 4 * gib, "online": 1, "cpu": 0.0, "tags": "maintenance;other",
 	})
-	statusRaw3 := statusNode("pve3", 8, 8*gib, 4*gib, 1, 0)
 	resp := cluster.ListStatusResponse{
-		statusRaw1, json.RawMessage(taggedRaw), statusRaw3,
+		quorateRow(1),
+		localStatusNode(),
+		json.RawMessage(taggedRaw),
+		statusNode("pve3", 8, 8*gib, 4*gib, 1, 0),
 	}
-
-	haResp := make(cluster.ListHaStatusCurrentResponse, 0, 1)
-	raw, _ := json.Marshal(map[string]any{"type": "manager_status", "node": "pve1", "state": "maintenance"})
-	haResp = append(haResp, json.RawMessage(raw))
 
 	cl := &stubCluster{
 		statusResp: &resp,
 		resResp:    &cluster.ListResourcesResponse{},
-		haStatusFn: func() (*cluster.ListHaStatusCurrentResponse, error) { return &haResp, nil },
+		managerFn: func() (*cluster.ListHaStatusManagerStatusResponse, error) {
+			return managerStatusJSON(now,
+				map[string]string{"pve1": "maintenance", "pve2": "online", "pve3": "online"},
+				map[string]map[string]any{
+					"pve1": {"mode": "maintenance", "state": "maintenance", "timestamp": now},
+					"pve2": freshLRM(),
+					"pve3": freshLRM(),
+				}), nil
+		},
 	}
-	ns := &stubNodes{}
+	ns := &stubNodes{now: now}
 
 	facts, err := placement.GatherNodeFacts(context.Background(), cl, ns, nopLogger(), placement.GatherOptions{
 		ExcludeMaintenanceNodes: true,

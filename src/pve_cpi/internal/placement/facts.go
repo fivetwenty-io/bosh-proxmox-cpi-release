@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/nodes"
 	sdkclient "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/client"
@@ -18,12 +19,14 @@ type ClusterClient interface {
 	ListStatus(ctx context.Context) (*cluster.ListStatusResponse, error)
 	ListResources(ctx context.Context, params *cluster.ListResourcesParams) (*cluster.ListResourcesResponse, error)
 	ListHaStatusCurrent(ctx context.Context) (*cluster.ListHaStatusCurrentResponse, error)
+	ListHaStatusManagerStatus(ctx context.Context) (*cluster.ListHaStatusManagerStatusResponse, error)
 }
 
 // NodesClient is the subset of the PVE nodes API used by GatherNodeFacts.
 // It is satisfied by the full pve.Client.Nodes() return value.
 type NodesClient interface {
 	ListStorage(ctx context.Context, node string, params *nodes.ListStorageParams) (*nodes.ListStorageResponse, error)
+	ListTime(ctx context.Context, node string) (*nodes.ListTimeResponse, error)
 }
 
 // clusterStatusItem carries membership from GET /cluster/status. Resource
@@ -62,16 +65,6 @@ type NodeResource struct {
 // within this package.
 type clusterResourceItem = NodeResource
 
-// haStatusEntry is the best-effort typed shape of one entry in
-// GET /cluster/ha/status/current. PVE returns an array of mixed-type objects;
-// the fields used here are the ones PVE 7+ documents. Unknown fields are
-// silently ignored via json.Unmarshal.
-type haStatusEntry struct {
-	Type  string `json:"type"`  // "manager_status", "resources", etc.
-	Node  string `json:"node"`  // node name; present on type=manager_status
-	State string `json:"state"` // "maintenance", "error", "fence", "online", etc.
-}
-
 // storageEntry is the typed shape of each entry in GET /nodes/{node}/storage.
 type storageEntry struct {
 	Storage string            `json:"storage"`
@@ -97,11 +90,13 @@ type GatherOptions struct {
 	// SameGroupCount remains 0 for all nodes.
 	GroupTag string
 
-	// ExcludeMaintenanceNodes, when true, causes GatherNodeFacts to query
-	// ListHaStatusCurrent and mark nodes that are in a maintenance or error HA
-	// state as InMaintenance=true. The per-node operator tag list
-	// (MaintenanceNodeTags) is also checked. Errors from ListHaStatusCurrent
-	// are non-fatal: affected nodes are left with InMaintenance=false (fail-open).
+	// ExcludeMaintenanceNodes, when true, causes GatherNodeFacts to ask
+	// pve.NodeHealth about every node and mark each node that is not placeable
+	// as InMaintenance=true. That covers a node in maintenance, a fenced or
+	// unknown node, and every node when the entry node is not quorate. The
+	// per-node operator tag list (MaintenanceNodeTags) is an input to the same
+	// answer. A source that cannot be read is non-fatal: pve.NodeHealth falls
+	// back to the sources it can read, down to cluster status alone.
 	ExcludeMaintenanceNodes bool
 
 	// MaintenanceNodeTags is the list of PVE node tags that indicate a node is
@@ -117,8 +112,9 @@ type GatherOptions struct {
 //  2. ListResources provides node CPU and memory counters, guest counts, BOSH
 //     group tags, and committed guest memory (non-fatal on error).
 //  3. Per-node ListStorage provides available storage bytes (non-fatal on error).
-//  4. ListHaStatusCurrent provides HA maintenance state when
-//     opts.ExcludeMaintenanceNodes is true (non-fatal on error).
+//  4. pve.NodeHealth provides node placeability from the CRM and LRM state,
+//     cluster status, and operator tags when opts.ExcludeMaintenanceNodes is
+//     true (non-fatal on error).
 //
 // A ListResources error is non-fatal: GatherNodeFacts logs a warning and continues
 // with GuestCount=0, SameGroupCount=0, and CommittedMemBytes=0 for all nodes.
@@ -127,9 +123,10 @@ type GatherOptions struct {
 // TotalStorageBytes remain 0, which causes the Storage scoring axis to be skipped
 // for that node.
 //
-// A ListHaStatusCurrent error is non-fatal: all nodes are left with
-// InMaintenance=false (fail-open) so a transient HA-API outage never blocks VM
-// creation.
+// A NodeHealth failure is non-fatal: all nodes are left with
+// InMaintenance=false (fail-open) so a transient API outage never blocks VM
+// creation. NodeHealth itself degrades past an unreadable HA source, so only
+// a failed cluster status read reaches this path.
 //
 // A ListStatus error is fatal — it is the primary data source.
 func GatherNodeFacts(
@@ -146,14 +143,9 @@ func GatherNodeFacts(
 	}
 
 	// Parse node entries from status response.
-	type nodeStatusItem struct {
-		clusterStatusItem
-		Tags string `json:"tags"` // space/semicolon-delimited PVE node tags
-	}
 	var nodeItems []clusterStatusItem
-	nodeTagMap := make(map[string]string) // node name → raw tags string
 	for i, raw := range *statusResp {
-		var item nodeStatusItem
+		var item clusterStatusItem
 		if parseErr := json.Unmarshal(raw, &item); parseErr != nil {
 			logger.Debug("placement: skip non-decodable cluster status entry",
 				log.Int("idx", i), log.Err(parseErr))
@@ -162,16 +154,13 @@ func GatherNodeFacts(
 		if item.Type != "node" {
 			continue
 		}
-		nodeItems = append(nodeItems, item.clusterStatusItem)
-		if item.Tags != "" {
-			nodeTagMap[item.Name] = item.Tags
-		}
+		nodeItems = append(nodeItems, item)
 	}
 
-	// Phase 1b: HA maintenance state (non-fatal, only when requested).
-	var maintenanceNodes map[string]bool
+	// Phase 1b: node health (non-fatal, only when requested).
+	var health *pve.NodeHealthReport
 	if opts.ExcludeMaintenanceNodes {
-		maintenanceNodes = gatherHAMaintenanceNodes(ctx, clusterClient, logger)
+		health = gatherNodeHealth(ctx, clusterClient, nodesClient, logger, opts.MaintenanceNodeTags)
 	}
 
 	// Phase 2: node compute counters, guest count, group tags, and committed
@@ -189,21 +178,12 @@ func GatherNodeFacts(
 			item.Maxcpu, item.Maxmem, item.Mem, item.CPU = resource.Maxcpu, resource.Maxmem, resource.Mem, resource.CPU
 		}
 
-		// Determine maintenance status: HA state OR operator node tag (union).
+		// A node that pve.NodeHealth does not call placeable is excluded. The
+		// report already folds the operator node tags into its answer. A node
+		// the report does not mention, or no report at all, leaves it included.
 		inMaintenance := false
-		if opts.ExcludeMaintenanceNodes {
-			if maintenanceNodes[nodeName] {
-				inMaintenance = true
-			}
-			if !inMaintenance && len(opts.MaintenanceNodeTags) > 0 {
-				nodeTags := nodeTagMap[nodeName]
-				for _, wantTag := range opts.MaintenanceNodeTags {
-					if hasTag(nodeTags, wantTag) {
-						inMaintenance = true
-						break
-					}
-				}
-			}
+		if entry, ok := health.Node(nodeName); ok {
+			inMaintenance = !entry.Placeable
 		}
 
 		// PVEFloat parses whatever string PVE sends, so a "nan" or "inf" cpu
@@ -234,47 +214,29 @@ func GatherNodeFacts(
 	return facts, nil
 }
 
-// gatherHAMaintenanceNodes calls ListHaStatusCurrent and returns the set of
-// node names currently in a maintenance or error HA state. Errors are
-// non-fatal: on any failure the returned map is empty (fail-open) and a
-// warning is logged. This mirrors the storage-facts fail-open pattern.
-func gatherHAMaintenanceNodes(
+// gatherNodeHealth asks pve.NodeHealth for the merged health of every node. A
+// failure is non-fatal: the returned report is nil (fail-open) and a warning is
+// logged. This mirrors the storage-facts fail-open pattern.
+func gatherNodeHealth(
 	ctx context.Context,
 	clusterClient ClusterClient,
+	nodesClient NodesClient,
 	logger *log.Logger,
-) map[string]bool {
-	result := make(map[string]bool)
-
-	resp, err := clusterClient.ListHaStatusCurrent(ctx)
+	maintenanceTags []string,
+) *pve.NodeHealthReport {
+	report, err := pve.NodeHealth(ctx, clusterClient, nodesClient, pve.NodeHealthOptions{
+		MaintenanceTags: maintenanceTags,
+	})
 	if err != nil {
-		logger.Warn("placement: ListHaStatusCurrent failed — maintenance detection via HA disabled (fail-open)",
+		logger.Warn("placement: node health unavailable — maintenance detection disabled (fail-open)",
 			log.Err(err))
-		return result
+		return nil
 	}
-	if resp == nil {
-		return result
+	if report.HA != pve.HAViewManagerStatus {
+		logger.Debug("placement: node health did not use a fresh CRM view",
+			log.String("view", string(report.HA)), log.String("reason", report.HAReason))
 	}
-
-	for _, raw := range *resp {
-		var entry haStatusEntry
-		if parseErr := json.Unmarshal(raw, &entry); parseErr != nil {
-			// Best-effort: skip malformed entries, never fail-hard.
-			continue
-		}
-		// PVE HA status entries include both manager_status and resource entries.
-		// The manager_status type carries the per-node state field.
-		// We conservatively accept any entry that has a node name and a known
-		// degraded-state value, regardless of the type field.
-		if entry.Node == "" {
-			continue
-		}
-		switch entry.State {
-		case "maintenance", "error", "fence", "recovery":
-			result[entry.Node] = true
-		}
-	}
-
-	return result
+	return report
 }
 
 // gatherResourceFacts reads node compute counters and tallies QEMU guest

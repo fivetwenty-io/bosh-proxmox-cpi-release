@@ -490,6 +490,12 @@ func (m *vmMockCluster) ListHaStatusCurrent(_ context.Context) (*sdkcluster.List
 	return &empty, nil
 }
 
+func (m *vmMockCluster) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	// Default: no HA view, so node health rests on cluster status alone.
+	empty := sdkcluster.ListHaStatusManagerStatusResponse{}
+	return &empty, nil
+}
+
 // listFirewallGroupsFn, when non-nil, is called by ListFirewallGroups. When nil,
 // returns an empty groups response so tests that do not exercise firewall group
 // attachment do not receive unexpected call panics.
