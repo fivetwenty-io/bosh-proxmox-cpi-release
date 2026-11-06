@@ -5240,7 +5240,9 @@ func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnAnotherNode_KeepsRefusal(t *testi
 
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
-	c := &vmMockCluster{}
+	c := &vmMockCluster{listStatusFn: func(context.Context) (*sdkcluster.ListStatusResponse, error) {
+		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk), nil
+	}}
 	deps := buildVMDeps(q, n, c, &vmMockAgent{})
 	deps.Config.Node = createVMCrossNodeVM
 	deps.Config.DetachedDiskStrategy = "parked"
@@ -5298,7 +5300,9 @@ func TestCreateVM_DiskCIDs_AnchorPromise_DiskOnNoNode_ReportsGone(t *testing.T) 
 
 	q := &vmMockQEMU{}
 	n := &vmMockNodes{}
-	c := &vmMockCluster{}
+	c := &vmMockCluster{listStatusFn: func(context.Context) (*sdkcluster.ListStatusResponse, error) {
+		return handlers.AbsenceOnlineStatus(createVMCrossNodeVM, createVMCrossNodeDisk), nil
+	}}
 	deps := buildVMDeps(q, n, c, &vmMockAgent{})
 	deps.Config.Node = createVMCrossNodeVM
 	deps.Config.DetachedDiskStrategy = "parked"

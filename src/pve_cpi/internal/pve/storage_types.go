@@ -18,6 +18,7 @@ const (
 	StorageTypeZFSPool   = "zfspool"
 	StorageTypePBS       = "pbs"
 	StorageTypeBTRFS     = "btrfs"
+	StorageTypeDRBD      = "drbd"
 )
 
 // StorageUsesFileVolumes reports whether the given PVE storage type stores VM

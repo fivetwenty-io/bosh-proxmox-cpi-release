@@ -67,7 +67,7 @@ func (l *localBackend) StorageInfo() StorageInfo { return l.info }
 //
 //  1. vmHint → owning VM's current node (co-location is mandatory for local).
 //  2. cloud_properties.node — operator override.
-//  3. defaultNode (config.node).
+//  3. defaultNode (config.node), when NodeHealth says it answers.
 //
 // vmHint comes first because a local-storage disk MUST live on the same node
 // as the VM that will attach it; any other choice produces an unattachable
@@ -85,7 +85,9 @@ func (l *localBackend) NodeForCreate(ctx context.Context, vmHint, cloudPropNode 
 		return cloudPropNode, nil
 	}
 	if l.defaultNode != "" {
-		return l.defaultNode, nil
+		// config.node is the last resort, so it must answer. A dead one
+		// would take the disk allocation with it; the error is retriable.
+		return requireProxyTarget(ctx, l.client, "create_disk on local storage "+l.info.Name, l.defaultNode)
 	}
 	return "", formatNodeResolveError(BackendLocal, "create_disk", vmHint, cloudPropNode, l.defaultNode)
 }

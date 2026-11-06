@@ -69,6 +69,17 @@ func reparkClusterSvc() *mockClusterSvc {
 	}
 }
 
+// fileAnchorCluster is reparkClusterSvc with the fixture's node reported online,
+// so the node health read that picks the node for a shared-storage call finds
+// the one node the storage is restricted to.
+func fileAnchorCluster() *mockClusterSvc {
+	svc := reparkClusterSvc()
+	svc.listStatusFn = func(context.Context) (*sdkclusterapi.ListStatusResponse, error) {
+		return handlers.AbsenceOnlineStatus(fileAnchorNode, "lab-ceph-2"), nil
+	}
+	return svc
+}
+
 // TestHandleDeleteDisk_ParkedOwned_SkipsRedundantStorageDelete is the primary
 // defect. The parker's detach IS the deallocation for an owner-named volume,
 // so issuing imgdel afterwards deletes nothing and can only fail.
@@ -304,7 +315,7 @@ func newFileAnchorProof(
 			storageSvc: storageSvc,
 			qemuSvc:    qemuSvc,
 			nodesSvc:   nodesSvc,
-			clusterSvc: reparkClusterSvc(),
+			clusterSvc: fileAnchorCluster(),
 			clusterStorageSvc: &mockClusterStorage{
 				storageName:  storageName,
 				storageType:  storageType,

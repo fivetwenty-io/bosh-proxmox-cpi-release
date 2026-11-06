@@ -52,12 +52,16 @@ type StorageInfo struct {
 // (single-node). PVE marks rbd/cephfs/nfs/cifs/glusterfs/pbs storages as shared
 // by definition; lvm/lvmthin/zfspool/dir/btrfs may be explicitly flagged shared
 // via storage.cfg even though they are inherently local — both signals count.
+// iscsi, iscsidirect, ZFS over iSCSI (type "zfs"), and drbd are shared by
+// definition too: PVE treats them as cluster-visible whether or not the flag
+// is set, so the type alone decides.
 func (s StorageInfo) IsShared() bool {
 	if s.Shared {
 		return true
 	}
 	switch strings.ToLower(s.Type) {
-	case StorageTypeRBD, StorageTypeCephFS, StorageTypeNFS, StorageTypeCIFS, StorageTypeGlusterFS, StorageTypePBS:
+	case StorageTypeRBD, StorageTypeCephFS, StorageTypeNFS, StorageTypeCIFS, StorageTypeGlusterFS, StorageTypePBS,
+		StorageTypeISCSI, StorageTypeISCSIDirect, StorageTypeZFSOverISCSI, StorageTypeDRBD:
 		return true
 	}
 	return false

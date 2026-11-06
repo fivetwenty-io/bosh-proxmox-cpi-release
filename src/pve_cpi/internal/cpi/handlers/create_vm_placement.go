@@ -402,6 +402,11 @@ func resolveTargetNodeWithBridges(
 				log.String("rejections", formatRejections(flattenAZRecords(azRecords))),
 			)
 		}
+		if fallback != "" {
+			if fallback, err = placeableConfigNode(ctx, deps, fallback); err != nil {
+				return "", nil, err
+			}
+		}
 		if fallback == "" {
 			allRejections := legacyRejections
 			if classifyFilterResult(allRejections) {
@@ -434,6 +439,9 @@ func resolveTargetNodeWithBridges(
 			"create_vm: target node not set in cloud_properties.target_node or config.node",
 		)
 	}
+	if node, err = placeableConfigNode(ctx, deps, node); err != nil {
+		return "", nil, err
+	}
 	if !deps.Config.PlacementEnabled() {
 		warnAZIgnoredPlacementDisabled(deps.Config, logger, buildAZOrder(cp, deps.Config, rng, cpResolver), node)
 	}
@@ -441,6 +449,36 @@ func resolveTargetNodeWithBridges(
 		log.String("node", node),
 	)
 	return node, nil, nil
+}
+
+// placeableConfigNode confirms config.node can receive a new VM before a
+// fallback hands it back. Both fallbacks reach for config.node without asking
+// whether it is up, so a dead or fenced node, or one in maintenance, would take
+// the create with it. pve.NodeHealth decides: only a placeable node qualifies,
+// and any other answer is a retriable error that names why, because the node
+// comes back. Without a cluster client there is nothing to ask, so the node
+// is returned as given.
+func placeableConfigNode(ctx context.Context, deps Deps, node string) (string, error) {
+	if deps.PVE == nil || deps.PVE.Cluster() == nil || deps.PVE.Nodes() == nil {
+		return node, nil
+	}
+	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.NodeHealthOptions{
+		MaintenanceTags: deps.Config.MaintenanceNodeTagsValue(),
+	})
+	if err != nil {
+		return "", cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud,
+			"create_vm: placement: could not read node health to confirm config.node "+node+" can receive a VM")
+	}
+	if report.Placeable(node) {
+		return node, nil
+	}
+	reason := "the cluster does not list it"
+	if entry, ok := report.Node(node); ok && entry.Reason != "" {
+		reason = entry.Reason
+	}
+	return "", cpierrors.Retriable(
+		"create_vm: placement: no node qualified and config.node %s cannot receive a VM (%s); "+
+			"retry once it is placeable or set cloud_properties.target_node", node, reason)
 }
 
 // buildAlternates extracts up to fallbackMax alternate node names from the ranked

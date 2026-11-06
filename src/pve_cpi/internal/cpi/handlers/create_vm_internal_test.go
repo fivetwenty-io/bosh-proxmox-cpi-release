@@ -1305,6 +1305,9 @@ type templateGapClusterSvc struct {
 	sdkcluster.Service // nil — panics on any non-overridden call
 
 	resourceRows []map[string]any
+
+	// offline names nodes that cluster status reports down.
+	offline map[string]bool
 }
 
 // ListConfigNodes derives corosync membership from the resourceRows fixture
@@ -1329,8 +1332,35 @@ func (c *templateGapClusterSvc) ListConfigNodes(_ context.Context) (*sdkcluster.
 	}
 	return &resp, nil
 }
+
+// ListStatus reports every node of the fixture online: the node the VM places
+// on and each node a template row names. The node health helper reads this to
+// decide which template nodes can answer a clone.
 func (c *templateGapClusterSvc) ListStatus(_ context.Context) (*sdkcluster.ListStatusResponse, error) {
-	empty := sdkcluster.ListStatusResponse{}
+	names := map[string]bool{"pve-vm": true}
+	for _, row := range c.resourceRows {
+		if node, _ := row["node"].(string); node != "" {
+			names[node] = true
+		}
+	}
+	cluster, _ := json.Marshal(map[string]any{"type": "cluster", "name": "lab", "quorate": 1})
+	resp := make(sdkcluster.ListStatusResponse, 0, 1+len(names))
+	resp = append(resp, cluster)
+	for name := range names {
+		online := 1
+		if c.offline[name] {
+			online = 0
+		}
+		raw, _ := json.Marshal(map[string]any{"type": "node", "name": name, "online": online})
+		resp = append(resp, raw)
+	}
+	return &resp, nil
+}
+
+// ListHaStatusManagerStatus answers with an empty manager view, which the node
+// health helper treats as a cluster without HA.
+func (c *templateGapClusterSvc) ListHaStatusManagerStatus(_ context.Context) (*sdkcluster.ListHaStatusManagerStatusResponse, error) {
+	empty := sdkcluster.ListHaStatusManagerStatusResponse{}
 	return &empty, nil
 }
 func (c *templateGapClusterSvc) ListResources(_ context.Context, params *sdkcluster.ListResourcesParams) (*sdkcluster.ListResourcesResponse, error) {
@@ -1414,6 +1444,12 @@ type templateGapNodesSvc struct {
 	cloneCapture     *struct{ node, vmidStr string }
 	cloneErr         error
 	deleteQemuFn     func(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error)
+}
+
+// ListTime fails, which the node health helper reads as an unreadable clock and
+// answers from cluster status alone.
+func (n *templateGapNodesSvc) ListTime(context.Context, string) (*sdknodes.ListTimeResponse, error) {
+	return nil, fmt.Errorf("clock not served by this fixture")
 }
 
 func (n *templateGapNodesSvc) DeleteQemu(ctx context.Context, node, vmidStr string, params *sdknodes.DeleteQemuParams) (*sdknodes.DeleteQemuResponse, error) {

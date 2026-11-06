@@ -63,3 +63,36 @@ func TestResolveTemplateCacheTarget_UsesStorageReplicaWhenPrimaryGone(t *testing
 		t.Fatalf("want replica 30009 as the fallback, got vmid=%d found=%v err=%v", vmid, found, err)
 	}
 }
+
+// A template whose only copy sits on a node the cluster reports down is no
+// clone source. The lookup reports a miss, so the caller imports instead of
+// addressing a clone to a dead node.
+func TestResolveTemplateCacheTarget_OnlyTemplateOnDeadNodeIsAMiss(t *testing.T) {
+	t.Parallel()
+	deps := legacyCloneDeps(
+		legacyTemplateRow(30010, stemcellCacheTag+";bosh-stemcell-sha-"+templateGapSHA8),
+	)
+	deps.PVE.(*templateGapPVE).cluster.offline = map[string]bool{templateGapTemplateNode: true}
+	shape := &createVMShape{node: "pve-vm", vmStorage: "local-lvm"}
+	vmid, node, found, err := resolveTemplateCacheTarget(context.Background(), deps, log.NewNopLogger(), shape, templateGapSHA8)
+	if err != nil || found {
+		t.Fatalf("a template on a dead node must be a miss, got vmid=%d node=%q found=%v err=%v", vmid, node, found, err)
+	}
+}
+
+// With two copies, the one on the live node is chosen even though the dead
+// node's copy has the lower VMID.
+func TestResolveTemplateCacheTarget_SkipsTemplateOnDeadNode(t *testing.T) {
+	t.Parallel()
+	dead := legacyTemplateRow(30001, stemcellCacheTag+";bosh-stemcell-sha-"+templateGapSHA8)
+	dead["node"] = "pve-dead"
+	live := legacyTemplateRow(30010, stemcellCacheTag+";bosh-stemcell-sha-"+templateGapSHA8)
+	deps := legacyCloneDeps(dead, live)
+	deps.PVE.(*templateGapPVE).cluster.offline = map[string]bool{"pve-dead": true}
+	shape := &createVMShape{node: "pve-vm", vmStorage: "local-lvm"}
+	vmid, node, found, err := resolveTemplateCacheTarget(context.Background(), deps, log.NewNopLogger(), shape, templateGapSHA8)
+	if err != nil || !found || vmid != 30010 || node != templateGapTemplateNode {
+		t.Fatalf("want the live node's 30010 on %q, got vmid=%d node=%q found=%v err=%v",
+			templateGapTemplateNode, vmid, node, found, err)
+	}
+}

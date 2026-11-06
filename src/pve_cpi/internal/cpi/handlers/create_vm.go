@@ -1937,6 +1937,14 @@ func resolveTemplateCacheTarget(
 		refs = primaries
 	}
 
+	// A template on a node that cannot answer is no clone source: the clone
+	// is addressed to that node and would fail. Drop those, and when nothing
+	// is left, report a miss so the caller imports instead.
+	refs = answeringTemplates(ctx, deps, logger, sha8, refs)
+	if len(refs) == 0 {
+		return 0, "", false, nil
+	}
+
 	// Prefer a template already on shape.node.
 	for _, ref := range refs {
 		if ref.Node == shape.node {
@@ -1989,6 +1997,41 @@ func resolveTemplateCacheTarget(
 	// configuration reached the clone attempt via the primary template.
 	primary := refs[0]
 	return primary.VMID, primary.Node, true, nil
+}
+
+// answeringTemplates keeps the templates whose node pve.NodeHealth reports able
+// to answer a call addressed to it. A template whose only copy sits on a dead
+// or fenced node is dropped, so the clone never targets that node. When the
+// health read fails the answer is empty, because cloning from a node that may
+// be down fails the create, while the import fallback is always safe. Without
+// a cluster client there is nothing to ask and the list is returned as given.
+func answeringTemplates(
+	ctx context.Context, deps Deps, logger *log.Logger, sha8 string, refs []pve.TemplateRef,
+) []pve.TemplateRef {
+	if deps.PVE == nil || deps.PVE.Cluster() == nil || deps.PVE.Nodes() == nil {
+		return refs
+	}
+	report, err := pve.NodeHealth(ctx, deps.PVE.Cluster(), deps.PVE.Nodes(), pve.NodeHealthOptions{})
+	if err != nil {
+		logger.Warn("create_vm: node health unavailable, not cloning from a cache template that may sit on a dead node",
+			log.String("sha8", sha8),
+			log.Err(err),
+		)
+		return nil
+	}
+	kept := refs[:0:0]
+	for _, ref := range refs {
+		if report.ProxyTarget(ref.Node) {
+			kept = append(kept, ref)
+			continue
+		}
+		logger.Warn("create_vm: stemcell cache template sits on a node that cannot answer, skipping it",
+			log.String("sha8", sha8),
+			log.String("node", ref.Node),
+			log.Int("template_vmid", int(ref.VMID)),
+		)
+	}
+	return kept
 }
 
 // attemptStemcellImport imports the stemcell qcow2 directly into the VM's

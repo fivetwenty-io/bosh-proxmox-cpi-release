@@ -1088,7 +1088,7 @@ func (m *mockClusterSvc) ListStatus(ctx context.Context) (*cluster.ListStatusRes
 	// read of the index that suites count.
 	if m.listConfigNodesFn == nil {
 		m.seenMu.Lock()
-		members := append([]string{"pve-node1"}, m.seenNodes...)
+		members := append([]string{"pve-node1", testNode}, m.seenNodes...)
 		m.seenMu.Unlock()
 		return handlers.AbsenceOnlineStatus(members...), nil
 	}

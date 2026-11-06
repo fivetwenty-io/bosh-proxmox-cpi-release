@@ -20,6 +20,14 @@ func offlineNodeFact(name string) map[string]any {
 	}
 }
 
+// maintenanceTaggedNode is an online node carrying the "maintenance" tag, which
+// the configs of these tests list as an operator maintenance tag.
+func maintenanceTaggedNode(name string) map[string]any {
+	n := onlineNode(name)
+	n["tags"] = "maintenance"
+	return n
+}
+
 // azEnforcementDeps builds placement deps with a capturing logger.
 func azEnforcementDeps(t *testing.T, nodes []map[string]any, cfgFn func(*config.CPIConfig)) (Deps, *bytes.Buffer) {
 	t.Helper()
@@ -167,24 +175,41 @@ func TestAZRecordsRetriable_PermanentReasonInOneAZ(t *testing.T) {
 	}
 }
 
-func TestResolveTargetNodeWithRNG_NoAZ_KeepsConfigNodeFallback(t *testing.T) {
+// A fallback to config.node is only as good as the node. When the cluster does
+// not list config.node, or reports it unable to take a VM, the create fails with
+// a retriable error naming it, and the rejection reasons still reach the log.
+func TestResolveTargetNodeWithRNG_NoAZ_DeadConfigNodeFallbackFails(t *testing.T) {
 	t.Parallel()
-	deps, buf := azEnforcementDeps(t,
-		[]map[string]any{offlineNodeFact("pve1")},
-		strictPlacement(map[string][]string{"z1": {"pve1"}}))
-	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{}, nil, nil, nil, 2)
-	if err != nil || node != "pve9" || alts != nil {
-		t.Fatalf("no AZ requested: node=%q alternates=%v err=%v, want config.node pve9 even under strict", node, alts, err)
-	}
-	if !strings.Contains(buf.String(), "pve1: node offline") {
-		t.Errorf("the no-AZ Warn should now carry the rejection reasons:\n%s", buf.String())
+	for name, nodes := range map[string][]map[string]any{
+		"unlisted":    {offlineNodeFact("pve1")},
+		"offline":     {offlineNodeFact("pve1"), offlineNodeFact("pve9")},
+		"maintenance": {offlineNodeFact("pve1"), maintenanceTaggedNode("pve9")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			deps, buf := azEnforcementDeps(t, nodes, func(c *config.CPIConfig) {
+				strictPlacement(map[string][]string{"z1": {"pve1"}})(c)
+				c.Placement.MaintenanceNodeTags = []string{"maintenance"}
+			})
+			node, alts, err := resolveTargetNodeWithFallbacks(
+				context.Background(), deps, createVMCloudProps{}, nil, nil, nil, 2)
+			if err == nil || node != "" || alts != nil {
+				t.Fatalf("a config.node that cannot take a VM must fail: node=%q alternates=%v err=%v", node, alts, err)
+			}
+			if !asCPIError(t, err).OkToRetry() || !strings.Contains(err.Error(), "pve9") {
+				t.Errorf("want a retriable error naming pve9, got %v", err)
+			}
+			if !strings.Contains(buf.String(), "pve1: node offline") {
+				t.Errorf("the no-AZ Warn should carry the rejection reasons:\n%s", buf.String())
+			}
+		})
 	}
 }
 
 func TestResolveTargetNodeWithRNG_OnlyDLBSentinel_KeepsConfigNodeFallback(t *testing.T) {
 	t.Parallel()
 	deps, buf := azEnforcementDeps(t,
-		[]map[string]any{offlineNodeFact("pve1")},
+		[]map[string]any{offlineNodeFact("pve1"), onlineNode("pve9")},
 		strictPlacement(map[string][]string{"z1": {"pve1"}}))
 	node, alts, err := resolveTargetNodeWithFallbacks(context.Background(), deps, createVMCloudProps{AvailabilityZone: "dlb"}, nil, nil, nil, 2)
 	if err != nil || node != "pve9" || alts != nil {
@@ -271,7 +296,7 @@ func TestResolveTargetNodeWithRNG_TargetNodeIgnoresBadVMType(t *testing.T) {
 func TestResolveTargetNodeWithRNG_PlacementDisabled_WarnsWhenAZRequested(t *testing.T) {
 	t.Parallel()
 	off := false
-	deps, buf := azEnforcementDeps(t, []map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+	deps, buf := azEnforcementDeps(t, []map[string]any{onlineNode("pve1"), onlineNode("pve9")}, func(c *config.CPIConfig) {
 		c.Node = "pve9"
 		c.Placement = &config.PlacementConfig{Enabled: &off, AZMap: map[string][]string{"z1": {"pve1"}}, AZEnforcement: "strict"}
 	})
@@ -283,7 +308,7 @@ func TestResolveTargetNodeWithRNG_PlacementDisabled_WarnsWhenAZRequested(t *test
 		t.Errorf("expected the ignored-AZ Warn naming z1:\n%s", buf.String())
 	}
 
-	quiet, quietBuf := azEnforcementDeps(t, []map[string]any{onlineNode("pve1")}, func(c *config.CPIConfig) {
+	quiet, quietBuf := azEnforcementDeps(t, []map[string]any{onlineNode("pve1"), onlineNode("pve9")}, func(c *config.CPIConfig) {
 		c.Node = "pve9"
 		c.Placement = &config.PlacementConfig{Enabled: &off, AZMap: map[string][]string{"z1": {"pve1"}}}
 	})
@@ -388,5 +413,29 @@ func TestObserveStoragePlanCompute_PlacementDisabled_NoWarnWithoutMappedAZOrWith
 	_, logs, _ = observeWithPlacementDisabled(t, createVMCloudProps{AvailabilityZone: "z1", TargetNode: "pve1"})
 	if strings.Contains(logs, "availability zone is ignored") {
 		t.Errorf("an operator target_node pin must not warn:\n%s", logs)
+	}
+}
+
+// With placement disabled, config.node is the whole answer, so a node that is
+// down or fenced must fail the create with a retriable error rather than hand
+// the VM to it.
+func TestResolveTargetNodeWithRNG_PlacementDisabled_DeadConfigNodeFails(t *testing.T) {
+	t.Parallel()
+	off := false
+	deps, _ := azEnforcementDeps(t, []map[string]any{onlineNode("pve1"), offlineNodeFact("pve9")}, func(c *config.CPIConfig) {
+		c.Node = "pve9"
+		c.Placement = &config.PlacementConfig{Enabled: &off}
+	})
+	node, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{}, nil, nil, nil)
+	if err == nil || node != "" {
+		t.Fatalf("a dead config.node must fail: node=%q err=%v", node, err)
+	}
+	if !asCPIError(t, err).OkToRetry() || !strings.Contains(err.Error(), "pve9") {
+		t.Errorf("want a retriable error naming pve9, got %v", err)
+	}
+
+	pinned, err := resolveTargetNodeWithRNG(context.Background(), deps, createVMCloudProps{TargetNode: "pve9"}, nil, nil, nil)
+	if err != nil || pinned != "pve9" {
+		t.Errorf("an operator target_node stays the operator's choice: node=%q err=%v", pinned, err)
 	}
 }
