@@ -266,7 +266,7 @@ func ruleBackoff(n int) time.Duration {
 	if d <= 0 || d > ruleBackoffMax {
 		d = ruleBackoffMax
 	}
-	return d + time.Duration(rand.Int64N(int64(d)/2+1))
+	return d + time.Duration(rand.Int64N(int64(d)/2+1)) // #nosec G404 -- retry jitter; non-cryptographic
 }
 
 // normalizeOp puts the rule in the shape a read returns, so a held write

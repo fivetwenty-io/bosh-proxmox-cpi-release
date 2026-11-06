@@ -168,7 +168,7 @@ func readEpisodeRecord(dir, path string) (episodeRecord, error) {
 	if err := checkPrivatePath(path, false); err != nil {
 		return episodeRecord{}, err
 	}
-	f, err := os.Open(path) //nolint:gosec // path is checked private to the effective user above
+	f, err := os.Open(path) // #nosec G304 -- path is checked private to the effective user above
 	if err != nil {
 		return episodeRecord{}, fmt.Errorf("ha episode: open %s: %w", path, err)
 	}
