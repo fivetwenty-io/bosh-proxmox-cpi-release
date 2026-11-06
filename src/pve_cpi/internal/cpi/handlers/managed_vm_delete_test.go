@@ -25,6 +25,11 @@ type deleteManagedClient struct {
 	stopped                 bool
 	// lostStop stops the VM but loses the stop task's response.
 	lostStop bool
+	// permsErr, when set, fails the token permission read.
+	permsErr error
+	// configErr, when set, fails every config read, the answer of a VM's
+	// dead node.
+	configErr error
 }
 
 func (c *deleteManagedClient) QEMU() qemu.Service {
@@ -37,6 +42,15 @@ func (c *deleteManagedClient) Cluster() cluster.Service {
 	return &deleteManagedCluster{Service: c.resumeVMClient.Cluster()}
 }
 func (c *deleteManagedClient) Tasks() tasks.Service { return &deleteManagedTasks{} }
+
+// EffectivePermissions reports a token that may stop VMs but lacks
+// Sys.Console, so the delete's HA stop never writes the HA resource.
+func (c *deleteManagedClient) EffectivePermissions(context.Context, string) (map[string]bool, error) {
+	if c.permsErr != nil {
+		return nil, c.permsErr
+	}
+	return map[string]bool{"VM.PowerMgmt": true, "VM.Allocate": true}, nil
+}
 
 type deleteManagedCluster struct{ cluster.Service }
 
@@ -55,6 +69,9 @@ type deleteManagedQEMU struct {
 }
 
 func (q *deleteManagedQEMU) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
+	if q.c.configErr != nil {
+		return nil, q.c.configErr
+	}
 	if _, ok := q.c.configs[vmid]; !ok {
 		return nil, ce.VMNotFound(strconv.Itoa(vmid))
 	}

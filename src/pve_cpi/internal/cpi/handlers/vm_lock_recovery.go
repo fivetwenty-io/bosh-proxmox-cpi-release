@@ -18,9 +18,11 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/vmcid"
@@ -44,6 +46,22 @@ func retryDestroyWithSkiplock(
 		return nil, origErr
 	}
 	lockType := pve.VMConfigLockType(origErr)
+	if lockType == "" {
+		// The refusal did not name the lock, so the config says which it is.
+		// A config that cannot be read sends no skiplock.
+		held, readErr := vmConfigLock(ctx, deps, node, vmid)
+		if readErr != nil {
+			logger.Warn("destroy rejected -- VM config is locked and its lock is unreadable; not retrying with skiplock",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(readErr))
+			return nil, origErr
+		}
+		lockType = held
+	}
+	if lockType == vmLockMigrate {
+		logger.Warn("destroy rejected -- VM holds a migrate lock; never retrying with skiplock during a migration",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node))
+		return nil, &skiplockMigrationRefusal{vmid: vmid, node: node, err: origErr}
+	}
 	logger.Warn("destroy rejected -- VM config is locked; retrying with skiplock (root@pam)",
 		log.Int(metadataKeyVMID, vmid), log.String("node", node), log.String("lock_type", lockType))
 	skiplock := true
@@ -69,6 +87,67 @@ func retryDestroyWithSkiplock(
 		return delErr
 	})
 	return resp, delErr
+}
+
+// vmLockMigrate is the config lock PVE holds on a VM while it migrates.
+const vmLockMigrate = "migrate"
+
+// skiplockMigrationRefusal is retryDestroyWithSkiplock's answer for a VM that
+// holds a migrate lock. A skiplock destroy there would destroy the VM while PVE
+// or PVE HA moves it, so the CPI never sends one. The refusal carries PVE's
+// lock rejection, so a caller that waits for a lock to clear still sees one.
+type skiplockMigrationRefusal struct {
+	vmid int
+	node string
+	err  error
+}
+
+func (e *skiplockMigrationRefusal) Error() string { return e.err.Error() }
+
+func (e *skiplockMigrationRefusal) Unwrap() error { return e.err }
+
+// deferral is the retriable error a delete returns for the refusal.
+func (e *skiplockMigrationRefusal) deferral(caller string) error {
+	return migrationLockDeferral(caller, e.vmid, e.node)
+}
+
+// migrationLockDeferral is the retriable error of a delete that met a VM
+// holding a migrate lock.
+func migrationLockDeferral(caller string, vmid int, node string) error {
+	return cpierrors.Retriable(
+		"%s: VM %d on node %s holds a migrate lock, and the CPI never destroys a VM with skiplock while it "+
+			"migrates; retry once the migration has finished", caller, vmid, node)
+}
+
+// vmConfigLock reads the lock field of the VM's config on node.
+func vmConfigLock(ctx context.Context, deps Deps, node string, vmid int) (string, error) {
+	cfg, err := deps.PVE.QEMU().Config(ctx, node, vmid)
+	if err != nil {
+		return "", err
+	}
+	lock, _ := pve.ConfigString(cfg, "lock")
+	return strings.TrimSpace(lock), nil
+}
+
+// refuseSkiplockDuringMigration reads the VM's config lock before a destroy
+// that sends skiplock unasked, and returns a retriable error when the VM
+// holds a migrate lock. A config that is already gone returns nil, and the
+// destroy's not-found handling decides. Any other read failure is a
+// retriable error, because the destroy cannot know what it would skip.
+func refuseSkiplockDuringMigration(ctx context.Context, deps Deps, caller, node string, vmid int, logger *log.Logger) error {
+	lock, err := vmConfigLock(ctx, deps, node, vmid)
+	switch {
+	case err != nil && (pve.IsNotFound(err) || pve.IsPmxcfsConfigMissing(err)):
+		return nil
+	case err != nil:
+		return cpierrors.WrapAs(pve.WrapError(err), cpierrors.TypeRetriableCloud, fmt.Sprintf(
+			"%s: read the config lock of VM %d on node %s before the skiplock destroy", caller, vmid, node))
+	case lock == vmLockMigrate:
+		logger.Warn(caller+": VM holds a migrate lock; deferring the skiplock destroy",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node))
+		return migrationLockDeferral(caller, vmid, node)
+	}
+	return nil
 }
 
 // lockForRecovery reports whether a destroy's retry closure hands err to the

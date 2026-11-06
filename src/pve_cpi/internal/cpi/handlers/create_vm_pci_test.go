@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
@@ -518,20 +519,21 @@ func TestCleanupVM_RemovesNodeAffinityPin_WithoutPinFlag(t *testing.T) {
 	// can change between create and rollback, so rollback must remove the pin
 	// unconditionally — a flag-gated removal would orphan the bosh-na-<vmid>
 	// rule forever. nil Config mirrors a default deployment.
-	cl := newNAStub()
-	cl.rules["bosh-na-4242"] = sdkcluster.CreateHaRulesParams{Rule: "bosh-na-4242"}
-	cl.resources["vm:4242"] = true
+	// The pinned VM is HA-managed, so the rollback stops it through PVE HA.
+	scene := NewHADeleteScene()
+	scene.Manage(4242, "pve-node1", "started", "started")
+	scene.Rules["bosh-na-4242"] = map[string]any{"type": "node-affinity", "resources": "vm:4242", "nodes": "pve-node1"}
 	deps := Deps{
-		PVE:    &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}, cluster: cl},
+		PVE:    &rollbackHAClient{kfClient: &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}}, scene: scene},
 		Logger: log.NewNopLogger(),
 	}
 
-	cleanupVM(context.Background(), deps, "pve1", 4242, nil, deps.Logger)
+	cleanupVM(context.Background(), deps, "pve-node1", 4242, nil, deps.Logger)
 
-	if _, ok := cl.rules["bosh-na-4242"]; ok {
+	if _, ok := scene.Rules["bosh-na-4242"]; ok {
 		t.Error("cleanupVM must delete the bosh-na-<vmid> HA rule even with the AZ-pin flag off")
 	}
-	if cl.resources["vm:4242"] {
+	if !slices.Contains(scene.EventsSnapshot(), "DeleteHaResources:vm:4242") {
 		t.Error("cleanupVM must deregister the VM's HA resource on rollback")
 	}
 }

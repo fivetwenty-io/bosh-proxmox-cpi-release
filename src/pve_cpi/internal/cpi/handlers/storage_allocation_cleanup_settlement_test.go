@@ -30,6 +30,16 @@ func (c *cleanupTaskClient) StorageAuditVisibility(ctx context.Context) error {
 	}
 	return c.Client.(pve.StorageAuditVisibilityReader).StorageAuditVisibility(ctx)
 }
+
+// EffectivePermissions forwards the token's privileges from the wrapped
+// client, as the production decorators do.
+func (c *cleanupTaskClient) EffectivePermissions(ctx context.Context, path string) (map[string]bool, error) {
+	reader, ok := c.Client.(pve.TokenPermissionReader)
+	if !ok {
+		return nil, errors.New("the wrapped client cannot read token permissions")
+	}
+	return reader.EffectivePermissions(ctx, path)
+}
 func (c *cleanupTaskClient) ObserveStorageTaskSettlement(_ context.Context, nodes []string, upids []string) (pve.StorageTaskSettlementEvidence, error) {
 	c.taskCalls++
 	if c.incomplete {

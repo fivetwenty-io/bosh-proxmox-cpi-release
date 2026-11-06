@@ -56,14 +56,14 @@ func TestHandleDeleteVM_HAManagedVMStopsThroughHABeforeTheDestroy(t *testing.T) 
 
 	deps := testDepsFoundVM(101, qemuSvc, nodesSvc, tasksSvc, agentSvc)
 	deps.Config = dlbEnabledConfig()
-	deps.PVE = &mockPVEClient{
+	deps.PVE = &handlers.HAScenePermsClient{Scene: scene, Client: &mockPVEClient{
 		qemuSvc:    &handlers.HASceneQEMU{Service: qemuSvc, Scene: scene},
 		nodesSvc:   &handlers.HASceneNodes{Service: nodesSvc, Scene: scene},
 		tasksSvc:   tasksSvc,
 		storageSvc: &mockStorageService{},
 		clusterSvc: &handlers.HASceneCluster{Service: defaultClusterSvc(101, "pve-node1"), Scene: scene},
 		poolsSvc:   &noopPoolService{},
-	}
+	}}
 
 	h := handlers.HandleDeleteVM(deps)
 	if _, err := h.Handle(context.Background(), marshalArgs("101"), jsonrpc.Context{}); err != nil {
@@ -74,7 +74,7 @@ func TestHandleDeleteVM_HAManagedVMStopsThroughHABeforeTheDestroy(t *testing.T) 
 	stopIdx, destroyIdx := -1, -1
 	for i, ev := range events {
 		switch {
-		case ev == "Stop:pve-node1/101" && stopIdx == -1:
+		case ev == "UpdateHaResources:vm:101=stopped" && stopIdx == -1:
 			stopIdx = i
 		case ev == "DeleteQemu" && destroyIdx == -1:
 			destroyIdx = i

@@ -370,6 +370,47 @@ func stopVMForRollback(ctx context.Context, deps Deps, node string, vmid int, lo
 	}
 }
 
+// stopVMForRollbackThroughHA stops the VM ahead of the rollback purge. A VM
+// that PVE HA's resource configuration does not list is stopped directly, as
+// the CRM manages only the services that configuration names. A VM it lists
+// passes the same HA gate as delete_vm and is stopped through PVE HA. It
+// returns false, after logging why, when the HA membership cannot be read or
+// the VM's HA state does not allow the destroy yet; the caller then preserves
+// the VM, and nothing is written to HA.
+func stopVMForRollbackThroughHA(ctx context.Context, deps Deps, node string, vmid int, logger *log.Logger) bool {
+	const caller = "create_vm: rollback"
+	preserve := func(err error) bool {
+		logger.Error(caller+": the VM's HA state does not allow the destroy yet; preserving the VM instead of "+
+			"purging it (remove it with delete_vm or qm destroy once PVE HA has settled it)",
+			log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(err))
+		return false
+	}
+	listed, err := managedVMHAResourcePresent(ctx, deps, haResourceSid(vmid))
+	if err != nil {
+		return preserve(err)
+	}
+	if !listed {
+		stopVMForRollback(ctx, deps, node, vmid, logger)
+		return true
+	}
+	haState, err := gateHADelete(ctx, deps, caller, vmid, node, logger)
+	if err != nil {
+		return preserve(err)
+	}
+	stopDirectly := !haState.Managed()
+	if haState.Managed() {
+		outcome, stopErr := stopHAManagedVMForDelete(ctx, deps, caller, haState, vmid, logger)
+		if stopErr != nil {
+			return preserve(stopErr)
+		}
+		stopDirectly = outcome == haStopNotManaged
+	}
+	if stopDirectly {
+		stopVMForRollback(ctx, deps, node, vmid, logger)
+	}
+	return true
+}
+
 //nolint:gocognit // Best-effort rollback chain: stop, purge, and per-step logging for each failure path. golangci-lint v2.15.0 scores it 43.
 func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[string]any, logger *log.Logger) {
 	logger.Warn("create_vm: rolling back, destroying created VM", log.Int(metadataKeyVMID, vmid))
@@ -378,7 +419,18 @@ func cleanupVM(ctx context.Context, deps Deps, node string, vmid int, env map[st
 	// remove at the end of the rollback whatever band the VMID lies in.
 	ctx = pve.WithOwnedConfigDriveISO(ctx, vmid)
 
-	stopVMForRollback(ctx, deps, node, vmid, logger)
+	// The create may already have put the VM under PVE HA. Such a VM passes
+	// the same HA gate as delete_vm: one in fence, in recovery, in motion, on
+	// a node that is not online, or in a state that cannot be read is tagged
+	// and LEFT, with nothing written to HA, because a direct stop or destroy
+	// there races the CRM. Otherwise it is stopped through PVE HA, and the
+	// destroy's purge removes its HA resource.
+	if !stopVMForRollbackThroughHA(ctx, deps, node, vmid, logger) {
+		if env != nil {
+			tagFailedVM(ctx, deps, node, vmid, env, logger)
+		}
+		return
+	}
 
 	// Protect persistent disks before the purge. The purge below destroys
 	// every disk the VM config references -- including a persistent disk

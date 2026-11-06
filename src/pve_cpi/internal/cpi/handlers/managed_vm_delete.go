@@ -119,15 +119,9 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 	if err := includePendingCleanupVolumes(ctx, deps, journal, record, owned); err != nil {
 		return proof, err
 	}
-	// An absent marker never authorizes destroying a guest at its old numeric ID.
-	if vmid > 0 {
-		location, e := findVMAuthoritative(ctx, deps, vmid)
-		if e != nil {
-			return proof, e
-		}
-		if location.Found && location.Node != node {
-			return proof, storageRefusal("VM cleanup identity lacks exact live provenance")
-		}
+	haState, err := locateAndGateManagedVM(ctx, deps, node, vmid)
+	if err != nil {
+		return proof, err
 	}
 	// A deletion keeps the ephemeral volume whenever delete_vm would have, and
 	// whenever the record shows the retention already started, even when the
@@ -173,6 +167,13 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 		return proof, err
 	}
 	defer func() { retErr = disposal.settle(handle, retErr) }()
+	// The HA stop comes before every other change, so an HA refusal there
+	// still leaves the routes and the guest as they were.
+	if node != "" {
+		if err := managedVMDeleteHA(ctx, deps, handle, haState, node, vmid); err != nil {
+			return proof, storageCleanupFailure("vm_ha", err)
+		}
+	}
 	if err := cleanupManagedVMInfrastructure(ctx, deps, journal, handle, node, vmid); err != nil {
 		return proof, storageCleanupFailure("vm_infrastructure", err)
 	}
@@ -193,6 +194,30 @@ func disposeManagedVMFor(ctx context.Context, deps Deps, journal *aj.Journal, ha
 		return proof, err
 	}
 	return managedVMDispositionProof(ctx, deps, audit, record, vmid, retainedTargets)
+}
+
+// locateAndGateManagedVM proves the recorded VM is where the record places
+// it, and reads its HA state through the delete's HA gate. An absent marker
+// never authorizes destroying a guest at its old numeric ID. The HA gate reads
+// only, so it runs before the disposal's config read, which fails on a dead or
+// fenced node, and before the admission, so a deferral leaves the record
+// exactly as it was and touches nothing in PVE. A record without a node has no
+// VM to gate and returns no state.
+func locateAndGateManagedVM(ctx context.Context, deps Deps, node string, vmid int) (*pve.HAServiceState, error) {
+	if vmid > 0 {
+		location, err := findVMAuthoritative(ctx, deps, vmid)
+		if err != nil {
+			return nil, err
+		}
+		if location.Found && location.Node != node {
+			return nil, storageRefusal("VM cleanup identity lacks exact live provenance")
+		}
+	}
+	if node == "" {
+		return nil, nil
+	}
+	logger := deps.Log(ctx).With(log.Int("vmid", vmid), log.String("node", node))
+	return gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
 }
 
 func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind string, target aj.Target, submit func() (any, error), observe func() error) error {
@@ -220,11 +245,11 @@ func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind
 	return storageMutationObserved(handle, step, nil, false)
 }
 
-// managedVMDeleteHA brings the VM's HA state to where the destroy can run. It
-// applies the delete's HA state table first, so a VM in fence, on a node that
-// is not online, in motion, in recovery, or in an unknown state defers before
-// anything is stopped, detached, or destroyed. HA membership comes from the
-// normalized HA state, not the pve.ha knobs.
+// managedVMDeleteHA brings the VM's HA state to where the destroy can run.
+// haState is the HA gate's answer, which disposeManagedVMFor read before the
+// admission, so a VM in fence, on a node that is not online, in motion, in
+// recovery, or in an unknown state never got this far. HA membership comes
+// from the normalized HA state, not the pve.ha knobs.
 //
 // An HA-managed VM is stopped through PVE HA first, so the CRM cannot start or
 // move it again. Only then is its HA resource purged, with the rule steps and
@@ -234,15 +259,14 @@ func managedVMDeleteTask(ctx context.Context, deps Deps, handle *aj.Handle, kind
 // stopped, gets no HA write at all, and the destroy's purge removes it; rule
 // membership that only an HA write could remove is then a retriable refusal.
 // A VM that is not HA-managed must have no rule membership left.
-func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node string, vmid int) error {
+//
+// Every error before the purge's first recorded step is an HA deferral,
+// because the stop records no step and the retry reads the HA state again.
+func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, haState *pve.HAServiceState, node string, vmid int) error {
 	if err := storageCleanupSettled(ctx, handle.Record()); err != nil {
 		return err
 	}
 	logger := deps.Log(ctx).With(log.Int("vmid", vmid), log.String("node", node))
-	haState, err := gateHADelete(ctx, deps, vmid, node, logger)
-	if err != nil {
-		return err
-	}
 	sid := haResourceSid(vmid)
 	if haState.Managed() {
 		outcome, stopErr := stopHAManagedVMForDelete(ctx, deps, "delete_vm", haState, vmid, logger)
@@ -255,10 +279,10 @@ func managedVMDeleteHA(ctx context.Context, deps Deps, handle *aj.Handle, node s
 				return rulesErr
 			}
 			if len(before) != 0 {
-				return cpierrors.Retriable(
+				return deferHA(cpierrors.Retriable(
 					"delete_vm: VM %d is stopped and %s is in error, but HA rules still name it and removing "+
 						"them needs Sys.Console on /, which the token lacks; run 'ha-manager set %s --state "+
-						"disabled' and retry", vmid, sid, sid)
+						"disabled' and retry", vmid, sid, sid))
 			}
 			return nil
 		}
@@ -290,9 +314,9 @@ func managedVMPurgeHAResource(ctx context.Context, deps Deps, handle *aj.Handle,
 		return nil
 	}
 	if !managed {
-		return cpierrors.Retriable(
+		return deferHA(cpierrors.Retriable(
 			"delete_vm: HA resource %s appeared after the HA state of VM %d was read; retry so the delete stops "+
-				"it through PVE HA", sid, vmid)
+				"it through PVE HA", sid, vmid))
 	}
 	resource, err := deps.PVE.Cluster().GetHaResources(ctx, sid)
 	if err != nil {
@@ -363,7 +387,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 		if location.Found {
 			cfg, e := deps.PVE.QEMU().Config(ctx, location.Node, vmid)
 			if e != nil {
-				return true, e
+				return true, managedVMConfigReadFailure(ctx, deps, vmid, location.Node, e)
 			}
 			_, found, e := pve.ParseStorageAllocationMarker(pve.DescriptionFromConfig(cfg))
 			if e != nil || found {
@@ -396,7 +420,7 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	if location.Found {
 		cfg, e := deps.PVE.QEMU().Config(ctx, location.Node, vmid)
 		if e != nil {
-			return true, e
+			return true, managedVMConfigReadFailure(ctx, deps, vmid, location.Node, e)
 		}
 		tags, _ := pve.ConfigString(cfg, "tags")
 		retain = tagsContain(tags, tagRetainEphemeral)
@@ -412,6 +436,21 @@ func deleteManagedVMIfRecorded(ctx context.Context, deps Deps, cid string, vmid 
 	// The current Agent may point at a different node or storage than the
 	// frozen allocation and cannot authorize another deletion here.
 	return true, nil
+}
+
+// managedVMConfigReadFailure is the answer to a config read that failed
+// before the HA gate ran. The config of a VM on a dead node does not read, so
+// the delete reads the VM's HA state once and returns its deferral, which
+// names the fence or recovery, when the state does not let the delete
+// proceed. Otherwise it returns the read's own error. Neither answer writes
+// anything.
+func managedVMConfigReadFailure(ctx context.Context, deps Deps, vmid int, node string, readErr error) error {
+	logger := deps.Log(ctx).With(log.Int("vmid", vmid), log.String("node", node))
+	if deferral := haDeferralForUnreadableConfig(ctx, deps, "delete_vm", vmid, node, logger); deferral != nil {
+		logger.Warn("delete_vm: the VM's config is unreadable and its HA state defers the delete", log.Err(readErr))
+		return deferral
+	}
+	return readErr
 }
 
 // closeDisposedManagedVM closes a generation whose VM a disposal has just
@@ -582,7 +621,9 @@ func disposeManagedRetainedVM(ctx context.Context, deps Deps, journal *aj.Journa
 // noteVMCleanupRefusal). A failed storage content listing is handed back the
 // same way, with an error and a saved reason that name the storage (see
 // noteVMListingStop), when it is the whole failure and every step this
-// cleanup wrote is observed. Anything else requires reconciliation.
+// cleanup wrote is observed. An HA deferral of the VM's stop is handed back
+// unchanged on the same terms (see haDeferral). Anything else requires
+// reconciliation.
 func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	if err == nil {
 		return nil
@@ -602,6 +643,14 @@ func managedVMCleanupFailure(handle *aj.Handle, err error) error {
 	}
 	if isWholePreservationRefusal(err) && handle.Record().State != aj.ReconciliationRequired && storageLifecycleSettled(handle.Record()) == nil {
 		return noteVMCleanupRefusal(handle, err)
+	}
+	// An HA deferral of the VM's stop wrote no journal step, so when every
+	// step this cleanup wrote is observed the record stays as it is, and the
+	// Director's retry reads the HA state again.
+	var deferral *haDeferral
+	if isWholeHADeferral(err) && errors.As(err, &deferral) && handle.Record().State != aj.ReconciliationRequired &&
+		storageLifecycleSettled(handle.Record()) == nil {
+		return deferral
 	}
 	return joinReconciliation(err, storageAllocationUncertain(handle, "VM cleanup"))
 }
@@ -746,9 +795,8 @@ func deleteManagedVMGuest(ctx context.Context, deps Deps, handle *aj.Handle, rec
 	var retainedTargets []aj.Target
 
 	if node != "" {
-		if err := managedVMDeleteHA(ctx, deps, handle, node, vmid); err != nil {
-			return nil, storageCleanupFailure("vm_ha", err)
-		}
+		// disposeManagedVMFor has already brought the VM's HA state to where
+		// the destroy can run (see managedVMDeleteHA).
 		status, e := deps.PVE.QEMU().Status(ctx, node, vmid)
 		if e != nil {
 			return nil, e

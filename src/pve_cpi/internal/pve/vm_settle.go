@@ -30,6 +30,11 @@ const (
 // cuts the call off.
 const settleDeadlineReserve = 5 * time.Second
 
+// SettleDeadlineReserve is the part of a context's deadline AwaitVMSettled
+// leaves unspent, so a caller that bounds the wait to a time of its own sets
+// the context's deadline this much later.
+const SettleDeadlineReserve = settleDeadlineReserve
+
 // The settle poll starts at two seconds and grows to ten, so a short lock
 // clears quickly and a long migration costs one cluster scan every ten
 // seconds.

@@ -53,7 +53,7 @@ func newHADeleteFixture(t *testing.T, scene *HADeleteScene, motionSec int) *haDe
 
 func (f *haDeleteFixture) gate(t *testing.T, node string) (*pve.HAServiceState, error) {
 	t.Helper()
-	return gateHADelete(t.Context(), f.deps, 101, node, f.logger)
+	return gateHADelete(t.Context(), f.deps, "delete_vm", 101, node, f.logger)
 }
 
 func (f *haDeleteFixture) logged(level slog.Level, message string) bool {
@@ -83,11 +83,7 @@ func requireHADeferral(t *testing.T, err error, want ...string) {
 
 // deadNode marks pve-node2 offline in cluster status and unknown to the CRM,
 // the view while the CRM waits to fence it. Its LRM stopped writing long ago.
-func deadNode(s *HADeleteScene) {
-	s.Offline["pve-node2"] = true
-	s.NodeState["pve-node2"] = "unknown"
-	s.LRMAge["pve-node2"] = 4 * 3600
-}
+func deadNode(s *HADeleteScene) { s.MarkNodeDead("pve-node2") }
 
 // TestGateHADeleteStateTable walks the delete's HA state table: which states
 // let the delete proceed, and which defer it with a retriable error that says
@@ -152,6 +148,11 @@ func TestGateHADeleteStateTable(t *testing.T) {
 				s.Manage(101, "pve-node1", "started", "started")
 				s.LRMAge["pve-node1"] = 3600
 			}},
+		{name: "node unknown to the CRM while the service is started", wantErr: []string{"deferred", "CRM reports the node unknown"},
+			setup: func(s *HADeleteScene) {
+				s.Manage(101, "pve-node1", "started", "started")
+				s.NodeState["pve-node1"] = "unknown"
+			}},
 		{name: "the CRM holds the VM on another node", wantErr: []string{"places vm:101 on node pve-node2"},
 			setup: func(s *HADeleteScene) {
 				s.Manage(101, "pve-node2", "started", "started")
@@ -191,13 +192,15 @@ func TestGateHADeleteStateTable(t *testing.T) {
 // TestGateHADeleteWaitsForMotionToSettle holds the service in each motion
 // state for a few reads, then lets it settle; the delete waits and proceeds.
 func TestGateHADeleteWaitsForMotionToSettle(t *testing.T) {
-	for _, raw := range []string{"request_stop", "request_start", "migrate", "relocate", "freeze"} {
+	for _, raw := range []string{"request_stop", "request_start", "request_start_balance", "migrate", "relocate", "freeze"} {
 		t.Run(raw, func(t *testing.T) {
 			scene := NewHADeleteScene()
 			scene.Manage(101, "pve-node1", "started", raw)
-			scene.OnRead = func(s *HADeleteScene, reads int) {
-				if reads == 5 {
+			// The motion ends while the settle wait polls the cluster index.
+			scene.OnIndexRead = func(s *HADeleteScene, reads int) {
+				if reads == 3 {
 					s.Services["vm:101"] = HASceneService{State: "started", Node: "pve-node1", UID: "uid-101"}
+					s.IndexHAState[101] = "started"
 				}
 			}
 			f := newHADeleteFixture(t, scene, 30)
@@ -205,7 +208,7 @@ func TestGateHADeleteWaitsForMotionToSettle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("gate: %v", err)
 			}
-			if st.Raw != "started" || scene.ManagerReads < 5 {
+			if st.Raw != "started" || scene.ManagerReads < 2 {
 				t.Fatalf("the gate proceeded on %q after %d reads, want started after the motion", st.Raw,
 					scene.ManagerReads)
 			}
@@ -235,9 +238,10 @@ func TestGateHADeleteWaitsForTheCRMToProcessANewResource(t *testing.T) {
 func TestGateHADeleteRefusesAVMThatMovedDuringTheWait(t *testing.T) {
 	scene := NewHADeleteScene()
 	scene.Manage(101, "pve-node1", "started", "migrate")
-	scene.OnRead = func(s *HADeleteScene, reads int) {
-		if reads == 2 {
+	scene.OnIndexRead = func(s *HADeleteScene, reads int) {
+		if reads == 3 {
 			s.IndexNode[101] = "pve-node2"
+			s.IndexHAState[101] = "started"
 		}
 	}
 	f := newHADeleteFixture(t, scene, 30)
@@ -250,12 +254,12 @@ func TestGateHADeleteMotionWaitEndsWithTheContext(t *testing.T) {
 	scene.Manage(101, "pve-node1", "started", "freeze")
 	f := newHADeleteFixture(t, scene, 30)
 	ctx, cancel := context.WithCancel(t.Context())
-	scene.OnRead = func(_ *HADeleteScene, reads int) {
-		if reads == 2 {
+	scene.OnIndexRead = func(_ *HADeleteScene, reads int) {
+		if reads == 3 {
 			cancel()
 		}
 	}
-	_, err := gateHADelete(ctx, f.deps, 101, "pve-node1", f.logger)
+	_, err := gateHADelete(ctx, f.deps, "delete_vm", 101, "pve-node1", f.logger)
 	if err == nil {
 		t.Fatal("a cancelled wait must fail")
 	}
@@ -286,8 +290,11 @@ func TestGateHADeleteRecoveryGraceWindow(t *testing.T) {
 
 	f.clock.t = f.clock.t.Add(7 * time.Minute)
 	_, err = f.gate(t, "pve-node2")
-	requireHADeferral(t, err, "grace window expired 1m0s ago", "Confirm that node pve-node2 is powered off",
-		"mv /etc/pve/nodes/pve-node2/qemu-server/101.conf /etc/pve/nodes/<live node>/qemu-server/")
+	requireHADeferral(t, err, "grace window expired 1m0s ago", "keeps deferring until PVE HA recovers the VM",
+		"'ha-manager status'")
+	if strings.Contains(err.Error(), "mv ") || strings.Contains(err.Error(), "back to BOSH") {
+		t.Fatalf("the expired grace window must not advise a config move or promise a handover: %v", err)
+	}
 	if !f.logged(slog.LevelWarn, "grace window expired") {
 		t.Fatal("the grace window's expiry was not logged")
 	}
@@ -413,23 +420,33 @@ func TestStopHAManagedVMWithSysConsoleWritesTheHAResource(t *testing.T) {
 // when the token holds VM.PowerMgmt and VM.Allocate but not Sys.Console, and
 // when the permissions cannot be read at all.
 func TestStopHAManagedVMWithAnObserveOnlyToken(t *testing.T) {
-	for name, perms := range map[string]map[string]bool{
-		"observe-only": {"VM.PowerMgmt": true, "VM.Allocate": true, "VM.Audit": true},
-		"unreadable":   nil,
-	} {
-		t.Run(name, func(t *testing.T) {
-			scene := NewHADeleteScene()
-			scene.Manage(101, "pve-node1", "started", "started")
-			scene.Perms = perms
-			f, st := stopFixture(t, scene, 30)
-			outcome, err := f.stop(t, st)
-			if err != nil || outcome != haStopReached {
-				t.Fatalf("stop: outcome %d err %v", outcome, err)
-			}
-			if events := scene.EventsSnapshot(); !slices.Equal(events, []string{"Stop:pve-node1/101"}) {
-				t.Fatalf("without Sys.Console the stop is the direct call alone, got %v", events)
-			}
-		})
+	scene := NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.Perms = map[string]bool{"VM.PowerMgmt": true, "VM.Allocate": true, "VM.Audit": true}
+	f, st := stopFixture(t, scene, 30)
+	outcome, err := f.stop(t, st)
+	if err != nil || outcome != haStopReached {
+		t.Fatalf("stop: outcome %d err %v", outcome, err)
+	}
+	if events := scene.EventsSnapshot(); !slices.Equal(events, []string{"Stop:pve-node1/101"}) {
+		t.Fatalf("without Sys.Console the stop is the direct call alone, got %v", events)
+	}
+}
+
+// TestStopHAManagedVMDefersWhenThePermissionsAreUnreadable never falls back
+// to the direct stop when the token's permissions cannot be read.
+func TestStopHAManagedVMDefersWhenThePermissionsAreUnreadable(t *testing.T) {
+	scene := NewHADeleteScene()
+	scene.Manage(101, "pve-node1", "started", "started")
+	scene.Perms = nil
+	f, st := stopFixture(t, scene, 30)
+	_, err := f.stop(t, st)
+	requireHADeferral(t, err, "permissions on / are unreadable")
+	if !isWholeHADeferral(err) {
+		t.Fatalf("the refusal must be an HA deferral: %v", err)
+	}
+	if events := scene.EventsSnapshot(); len(events) != 0 {
+		t.Fatalf("an unreadable permission set must write nothing, got %v", events)
 	}
 }
 
@@ -613,20 +630,32 @@ func TestLogHasVMHAState(t *testing.T) {
 	}
 }
 
-// TestHaDeleteSysConsoleFailsClosed answers false for a client that cannot
-// read permissions.
+// TestHaDeleteSysConsoleFailsClosed defers with a retriable error when the
+// client cannot read permissions or the read fails.
 func TestHaDeleteSysConsoleFailsClosed(t *testing.T) {
-	logger := log.NewNopLogger()
-	if haDeleteSysConsole(t.Context(), Deps{PVE: struct{ pve.Client }{}}, logger) {
-		t.Fatal("a client without a permission reader must answer false")
+	if _, err := haDeleteSysConsole(t.Context(), Deps{PVE: struct{ pve.Client }{}}, "delete_vm", 101); err == nil ||
+		!okToRetryCPIError(err) {
+		t.Fatalf("a client without a permission reader must defer, got %v", err)
 	}
 	scene := NewHADeleteScene()
-	if !haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, logger) {
-		t.Fatal("a held Sys.Console must answer true")
+	if held, err := haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, "delete_vm", 101); err != nil ||
+		!held {
+		t.Fatalf("a held Sys.Console must answer true, got %v, %v", held, err)
 	}
 	scene.Perms = map[string]bool{"Sys.Console": false}
-	if !haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, logger) {
-		t.Fatal("a privilege that does not propagate is still held on /")
+	if held, err := haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, "delete_vm", 101); err != nil ||
+		!held {
+		t.Fatalf("a privilege that does not propagate is still held on /, got %v, %v", held, err)
+	}
+	scene.Perms = map[string]bool{"VM.PowerMgmt": true}
+	if held, err := haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, "delete_vm", 101); err != nil ||
+		held {
+		t.Fatalf("a missing Sys.Console must answer false, got %v, %v", held, err)
+	}
+	scene.Perms = nil
+	if _, err := haDeleteSysConsole(t.Context(), Deps{PVE: newHASceneClient(scene)}, "delete_vm", 101); err == nil ||
+		!okToRetryCPIError(err) {
+		t.Fatalf("an unreadable permission set must defer, got %v", err)
 	}
 }
 

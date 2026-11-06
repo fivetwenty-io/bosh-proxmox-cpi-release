@@ -165,6 +165,12 @@ type infrastructureHACluster struct {
 	unknown       bool
 	nilResource   bool
 	wrongResource bool
+	// haState, when set, is the CRM's state for vm:123, which then requests
+	// started; otherwise the CRM holds it stopped.
+	haState string
+	// tune, when set, adjusts the CRM view before it is served, so a test
+	// can age an LRM timestamp or mark a node.
+	tune func(s *HADeleteScene)
 }
 
 func (c *infrastructureHACluster) ListHaRules(context.Context, *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
@@ -458,7 +464,11 @@ func TestManagedVMHAPurgeRejectsUnreadableResourceIdentity(t *testing.T) {
 
 func (c *infrastructureHACluster) ListHaResources(context.Context, *cluster.ListHaResourcesParams) (*cluster.ListHaResourcesResponse, error) {
 	rows := cluster.ListHaResourcesResponse{}
-	if !c.removed {
+	switch {
+	case c.removed:
+	case c.haState != "":
+		rows = append(rows, json.RawMessage(`{"sid":"vm:123","state":"started"}`))
+	default:
 		rows = append(rows, json.RawMessage(`{"sid":"vm:123","state":"stopped"}`))
 	}
 	return &rows, nil
@@ -471,7 +481,19 @@ func (c *infrastructureHACluster) ListHaStatusManagerStatus(
 ) (*cluster.ListHaStatusManagerStatusResponse, error) {
 	services := map[string]HASceneService{}
 	if !c.removed {
-		services["vm:123"] = HASceneService{State: "stopped", Node: "pve1", UID: "uid-123"}
+		state := "stopped"
+		if c.haState != "" {
+			state = c.haState
+		}
+		services["vm:123"] = HASceneService{State: state, Node: "pve1", UID: "uid-123"}
 	}
-	return HAFreshManagerStatus(time.Now().Unix(), "pve1", nil, services), nil
+	if c.tune == nil {
+		return HAFreshManagerStatus(time.Now().Unix(), "pve1", nil, services), nil
+	}
+	scene := &HADeleteScene{
+		Now: time.Now().Unix(), Members: []string{"pve1"}, CRMAge: 5, Services: services,
+		NodeState: map[string]string{}, LRMAge: map[string]int64{},
+	}
+	c.tune(scene)
+	return scene.managerBody(), nil
 }

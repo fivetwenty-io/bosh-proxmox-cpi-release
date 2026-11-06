@@ -308,7 +308,9 @@ func TestDeleteVM_StaleIndexRelocatesToTheMemberThatHoldsTheVM(t *testing.T) {
 // TestDeleteVM_ConfigMissingFromANodeThatCannotAnswerIsRetriable pins the
 // proxy-target rule: a config-missing answer routed through a member the
 // cluster does not report able to answer, or through a cluster whose status
-// cannot be read, never proves the VM gone.
+// cannot be read, never proves the VM gone. The HA gate reads the cluster
+// status before any config read, so it is the gate's retriable deferral that
+// answers here, and nothing is destroyed.
 func TestDeleteVM_ConfigMissingFromANodeThatCannotAnswerIsRetriable(t *testing.T) {
 	t.Parallel()
 
@@ -322,14 +324,14 @@ func TestDeleteVM_ConfigMissingFromANodeThatCannotAnswerIsRetriable(t *testing.T
 			status: func(context.Context) (*cluster.ListStatusResponse, error) {
 				return absenceStatus(map[string]bool{"pve-node1": false, "pve-node2": true}), nil
 			},
-			want: "does not report that node able to answer",
+			want: "deferred",
 		},
 		{
 			name: "status unreadable",
 			status: func(context.Context) (*cluster.ListStatusResponse, error) {
 				return nil, errors.New("cluster status unavailable")
 			},
-			want: "pve-node1",
+			want: "cluster status unavailable",
 		},
 	}
 	for i, tc := range cases {

@@ -251,26 +251,6 @@ func TestTagFailedVM_CreateEnvNoGroup_FallsBackToInstanceName(t *testing.T) {
 	}
 }
 
-func TestCleanupVM_RemovesNodeAffinityPinWhenEnabled(t *testing.T) {
-	cl := newNAStub()
-	cl.rules["bosh-na-100"] = cluster.CreateHaRulesParams{Rule: "bosh-na-100"}
-	cl.resources["vm:100"] = true
-	deps := Deps{
-		Config: naPinConfig(map[string][]string{"z1": {"pve01"}}),
-		PVE:    &kfClient{nodes: &kfNodes{}, qemu: &kfQEMU{}, cluster: cl},
-		Logger: log.NewNopLogger(),
-	}
-
-	cleanupVM(context.Background(), deps, "pve01", 100, nil, log.NewNopLogger())
-
-	if _, ok := cl.rules["bosh-na-100"]; ok {
-		t.Error("cleanupVM must remove the node-affinity pin rule on rollback")
-	}
-	if cl.resources["vm:100"] {
-		t.Error("cleanupVM must deregister the HA resource on rollback")
-	}
-}
-
 func TestCleanupVM_RemovesPinEvenWhenAZPinDisabled(t *testing.T) {
 	// The bosh-na-<vmid> rule has two writers: the AZ pin (gated by
 	// pve.ha.pin_az) and the PCI strict pin (written whenever pci_passthroughs

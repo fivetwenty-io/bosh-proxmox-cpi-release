@@ -520,6 +520,13 @@ func (m *vmMockCluster) GetHaResources(context.Context, string) (*sdkcluster.Get
 	return nil, fmt.Errorf("no such resource")
 }
 
+// ListHaResources lists no HA resource, so a rollback stops and destroys the
+// VM directly.
+func (m *vmMockCluster) ListHaResources(context.Context, *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error) {
+	empty := sdkcluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
 func (m *vmMockCluster) DeleteHaResources(_ context.Context, _ string, _ *sdkcluster.DeleteHaResourcesParams) error {
 	return fmt.Errorf("does not exist (mock)")
 }

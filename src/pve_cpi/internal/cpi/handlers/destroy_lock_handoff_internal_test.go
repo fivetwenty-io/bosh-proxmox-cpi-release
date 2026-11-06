@@ -24,7 +24,7 @@ func lock500(lock string) error {
 const (
 	lockWithStorageLockText = "unable to destroy VM 100: VM is locked (backup): " +
 		"cfs-lock 'storage-local' error: got lock request timeout"
-	lockWithPushbackText = "unable to destroy VM 100: VM is locked (migrate): unable to acquire lock"
+	lockWithPushbackText = "unable to destroy VM 100: VM is locked (clone): unable to acquire lock"
 )
 
 func TestLockForRecovery(t *testing.T) {
@@ -101,7 +101,7 @@ func TestDestroyVMWithRecovery_TaskTextLock_GoesStraightToSkiplock(t *testing.T)
 func TestDestroyVMWithRecovery_LockAs500_IsBoundedBeforeSkiplock(t *testing.T) {
 	errs := make([]error, 0, rollbackDestroyMaxAttempts+1)
 	for range rollbackDestroyMaxAttempts {
-		errs = append(errs, lock500("migrate"))
+		errs = append(errs, lock500("clone"))
 	}
 	nodes := &lrNodesStub{deleteErrs: append(errs, nil)}
 	q := &lrQEMUStub{}

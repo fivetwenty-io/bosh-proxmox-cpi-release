@@ -143,6 +143,38 @@ func stragglerOwned(ctx context.Context, deps Deps, vmid int, loc pve.VMLocation
 	return true
 }
 
+// stragglerHAAllowsSweep reports whether the sweep may reap a straggler. It
+// reads the straggler's HA state once, with no wait, and allows the reap only
+// when the state table lets a delete proceed and PVE HA does not manage the
+// VM, and the straggler's config holds no migrate lock. Every other answer,
+// including a state that cannot be read, defers the straggler.
+func stragglerHAAllowsSweep(
+	ctx context.Context, deps Deps, vmid int, node string, cfg map[string]any, sweepLogger *log.Logger,
+) bool {
+	if lock, _ := pve.ConfigString(cfg, "lock"); strings.TrimSpace(lock) == vmLockMigrate {
+		sweepLogger.Info("delete_vm: straggler sweep: the straggler holds a migrate lock; deferring it")
+		return false
+	}
+	st, err := readHADeleteState(ctx, deps, "delete_vm: straggler sweep", vmid, node)
+	if err != nil {
+		sweepLogger.Warn("delete_vm: straggler sweep: the straggler's HA state is unreadable; deferring it",
+			log.Err(err))
+		return false
+	}
+	disp, reason := st.Disposition()
+	switch {
+	case disp != pve.HAProceed || st.Node != node:
+		sweepLogger.Info("delete_vm: straggler sweep: the straggler's HA state does not allow the reap; deferring it",
+			log.String("disposition", string(disp)), log.String("reason", reason), log.String("ha_node", st.Node))
+		return false
+	case st.Managed():
+		sweepLogger.Info("delete_vm: straggler sweep: the straggler is HA-managed; leaving it for the delete_vm retry",
+			log.String("sid", st.SID), log.String("raw_state", st.Raw))
+		return false
+	}
+	return true
+}
+
 // sweepFastDeleteStragglers scans the cluster for VMs carrying tagDeletingVM
 // (bosh-deleting) and re-issues a skiplock+purge destroy for each one. This
 // makes fast-path deletes self-healing: a VM whose async destroy stalled is
@@ -208,6 +240,13 @@ func sweepFastDeleteStragglers(ctx context.Context, deps Deps, logger *log.Logge
 		}
 		sweepLoc := pve.VMLocation{Node: item.Node, Tags: authTags, Found: true, Type: item.Type}
 		if !stragglerOwned(ctx, deps, int(item.VMID.Int()), sweepLoc, strCfg, sweepLogger) {
+			continue
+		}
+		// The sweep's fire-and-forget stop and skiplock destroy suit only a VM
+		// that PVE HA does not manage, on an online node, that holds no
+		// migrate lock. Any other straggler is left for the Director's
+		// delete_vm retry, which runs the HA gate and stops it through PVE HA.
+		if !stragglerHAAllowsSweep(ctx, deps, int(item.VMID.Int()), item.Node, strCfg, sweepLogger) {
 			continue
 		}
 		// A straggler holding a legacy persistent disk named for it would lose
@@ -322,17 +361,18 @@ func fastPathDeleteVM(
 	// destroy. Best-effort; never blocks the current delete.
 	sweepFastDeleteStragglers(ctx, deps, logger)
 
-	// Stamp diagnostic tag — fail-open.
-	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
-
 	// Clear the VM's CPI-managed HA rules. Only a VM that is not HA-managed
 	// reaches the fast path, so this deregisters nothing a stop depends on,
 	// and the node-affinity pin it removes would otherwise outlive the VM,
 	// because the fast path returns before the sync path's cleanup. The calls
-	// are synchronous and bounded, with no task await.
+	// are synchronous and bounded, with no task await. It runs before the
+	// tag stamp, so a refusal leaves the VM untagged.
 	if err := cleanupHAMembership(ctx, deps, haState, vmid, logger); err != nil {
 		return err
 	}
+
+	// Stamp diagnostic tag — fail-open.
+	stampDeletingTag(ctx, deps, node, vmCID, vmid, logger)
 
 	// Fire-and-forget stop. The UPID is discarded; no await. PVE may not finish
 	// the stop before destroy arrives; the destroy task can still fail on a
@@ -399,6 +439,11 @@ func fastPathDeleteVM(
 	// has already transferred the ephemeral volume to a parker, which renames
 	// it for the parker's VMID, and so this destroy neither references nor
 	// owns it. Forcing the flag off on that path is a second guard.
+	// skiplock would let the destroy run through a migration's config lock,
+	// so a VM that holds one defers instead.
+	if lockErr := refuseSkiplockDuringMigration(ctx, deps, "delete_vm: fast-path", node, vmid, logger); lockErr != nil {
+		return lockErr
+	}
 	logger.Debug("delete_vm: fast-path: issuing skiplock destroy without await")
 	purge := true
 	destroyDisks := deps.Config.DestroyUnreferencedDisks && !retained
@@ -559,6 +604,21 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	}
 	logger.Debug("delete_vm: VM located", log.String("node", node))
 
+	// --- HA state gate ---
+	// The gate reads only, so it runs before any config read: a VM on a dead
+	// or fenced node answers its config read with a failure, and the HA state
+	// is what says why. HA membership comes from the normalized HA state,
+	// never from the pve.ha knobs, so a resource an operator registered by
+	// hand counts too. The state table defers a VM in fence, on a node that is
+	// not online, or in an unknown state, waits out HA motion, and runs the
+	// recovery grace window, all before anything below stops, detaches, or
+	// destroys it.
+	haState, haErr := gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
+	if haErr != nil {
+		return nil, haErr
+	}
+	gatedNode := node
+
 	// --- parker VM refusal (belt-and-braces PVE-level backstop) ---
 	parkerLoc, alreadyGone, parkerErr := refuseIfParkerVM(ctx, deps, loc, vmid)
 	if parkerErr != nil {
@@ -581,45 +641,24 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 		logger.Info("delete_vm: VM moved after the cluster scan, continuing on its current node",
 			log.String("scan_node", node), log.String("node", parkerLoc.Node))
 	}
-	loc = parkerLoc
-	node = loc.Node
-	vmTags := loc.Tags
-
 	// A removed placement configuration cannot turn an allocated VM into a
 	// legacy guest and bypass its durable cleanup authority. Both views count,
 	// so a slot whose delete is pending still decides what the destroy takes.
-	holding, configErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
-	if configErr != nil && (pve.IsNotFound(configErr) || pve.IsPmxcfsConfigMissing(configErr)) {
-		// The node the scan named holds no config for the VM now. It may
-		// have moved since the scan, or the index row may be the stale one,
-		// so locate it again before deciding anything.
-		moved, lookErr := locateAfterConfigMissing(ctx, deps, "delete_vm: verify allocation provenance", vmid, node)
-		if lookErr != nil {
-			return nil, lookErr
-		}
-		if !moved.Found {
-			if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
-				return nil, err
-			}
-			logger.Info("delete_vm: VM config gone from its node and absent from every member's config probe — already deleted, returning success")
-			return nil, nil
-		}
-		// The probe read the whole config on the node that holds the VM
-		// now, so its tags decide the parker check there.
-		if pve.TagsMarkParker(moved.Tags) {
-			return nil, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
-		}
-		logger.Info("delete_vm: VM moved after the cluster scan, continuing on its current node",
-			log.String("scan_node", node), log.String("node", moved.Node))
-		loc = moved
-		node = loc.Node
-		vmTags = loc.Tags
-		holding, configErr = pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	loc, holding, gone, holdErr := readLegacyDeleteHolding(ctx, deps, vmCID, cid, parkerLoc, logger)
+	if holdErr != nil || gone {
+		return nil, holdErr
 	}
-	if configErr != nil {
-		return nil, cpierrors.Retriable("delete_vm: cannot verify allocation provenance for VM %s", vmCID)
-	}
+	node = loc.Node
+	vmTags := loc.Tags
 	liveConfig := holding.Config
+	if node != gatedNode {
+		// The VM moved after the gate read its HA state, so that state is
+		// about the node it left. Read it again on the node that holds it now.
+		haState, haErr = gateHADelete(ctx, deps, "delete_vm", vmid, node, logger)
+		if haErr != nil {
+			return nil, haErr
+		}
+	}
 
 	// --- ownership guard ---
 	// Before anything that stops, tags, or destroys the VM. The config just
@@ -653,17 +692,6 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	}
 	if err := refuseOwnedLegacyDestroy(holding.WithReplacements(), vmCID, vmid); err != nil {
 		return nil, err
-	}
-
-	// --- HA state gate ---
-	// HA membership comes from the normalized HA state, never from the
-	// pve.ha knobs, so a resource an operator registered by hand counts too.
-	// The state table defers a VM in fence, on a node that is not online, or
-	// in an unknown state, waits out HA motion, and runs the recovery grace
-	// window, all before anything below stops, detaches, or destroys it.
-	haState, haErr := gateHADelete(ctx, deps, vmid, node, logger)
-	if haErr != nil {
-		return nil, haErr
 	}
 
 	// --- per-node in-flight gate (opt-in; limit=0 → unlimited, no gating) ---
@@ -718,6 +746,46 @@ func deleteLegacyVM(ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCI
 	}
 
 	return deleteLegacyVMAndArtifacts(ctx, deps, haState, node, vmCID, vmid, vmTags, logger)
+}
+
+// readLegacyDeleteHolding reads the holding of the VM that loc names. When the
+// node holds no config for it, the VM may have moved since the scan, or the
+// index row may be the stale one, so it locates the VM again before deciding
+// anything. It returns gone when the VM is proven absent from every member,
+// and the location of the VM it read otherwise.
+func readLegacyDeleteHolding(
+	ctx context.Context, deps Deps, vmCID string, cid vmcid.VMCID, loc pve.VMLocation, logger *log.Logger,
+) (pve.VMLocation, pve.QemuHolding, bool, error) {
+	vmid := cid.VMID
+	node := loc.Node
+	holding, configErr := pve.ReadQemuHolding(ctx, deps.PVE, node, vmid)
+	if configErr != nil && (pve.IsNotFound(configErr) || pve.IsPmxcfsConfigMissing(configErr)) {
+		moved, lookErr := locateAfterConfigMissing(ctx, deps, "delete_vm: verify allocation provenance", vmid, node)
+		if lookErr != nil {
+			return loc, holding, false, lookErr
+		}
+		if !moved.Found {
+			if err := refuseAbsentElsewhere(ctx, deps, "delete_vm", vmCID, cid, logger); err != nil {
+				return loc, holding, false, err
+			}
+			logger.Info("delete_vm: VM config gone from its node and absent from every member's config probe — already deleted, returning success")
+			return loc, holding, true, nil
+		}
+		// The probe read the whole config on the node that holds the VM
+		// now, so its tags decide the parker check there.
+		if pve.TagsMarkParker(moved.Tags) {
+			return loc, holding, false, cpierrors.Cloud("refusing to delete parker VM %d", vmid)
+		}
+		logger.Info("delete_vm: VM moved after the cluster scan, continuing on its current node",
+			log.String("scan_node", node), log.String("node", moved.Node))
+		loc = moved
+		holding, configErr = pve.ReadQemuHolding(ctx, deps.PVE, loc.Node, vmid)
+	}
+	if configErr != nil {
+		return loc, holding, false, cpierrors.Retriable(
+			"delete_vm: cannot verify allocation provenance for VM %s", vmCID)
+	}
+	return loc, holding, false, nil
 }
 
 // deleteLegacyVMAndArtifacts stops and destroys a legacy VM that the HA gate
@@ -1065,6 +1133,10 @@ func destroyVMWithRecovery(
 			// are logged but not fatal.
 			cleanupAgentForVM(ctx, deps, node, vmid, logger)
 			return nil, true, nil
+		}
+		var migrating *skiplockMigrationRefusal
+		if errors.As(deleteErr, &migrating) {
+			return nil, false, migrating.deferral("delete_vm")
 		}
 		if pve.IsVMConfigLocked(deleteErr) {
 			// Still locked after any skiplock attempt: surface an

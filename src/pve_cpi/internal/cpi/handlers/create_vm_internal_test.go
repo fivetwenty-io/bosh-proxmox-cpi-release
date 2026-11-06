@@ -1314,6 +1314,15 @@ type templateGapClusterSvc struct {
 // (the template's own node), so the authoritative template lookup lists the
 // node that actually holds the template. "name" is what
 // pve.ListClusterConfigNodes parses.
+// ListHaResources lists no HA resource, so a rollback stops and destroys the
+// VM directly.
+func (c *templateGapClusterSvc) ListHaResources(
+	context.Context, *sdkcluster.ListHaResourcesParams,
+) (*sdkcluster.ListHaResourcesResponse, error) {
+	empty := sdkcluster.ListHaResourcesResponse{}
+	return &empty, nil
+}
+
 func (c *templateGapClusterSvc) ListConfigNodes(_ context.Context) (*sdkcluster.ListConfigNodesResponse, error) {
 	seen := map[string]bool{}
 	resp := sdkcluster.ListConfigNodesResponse{}

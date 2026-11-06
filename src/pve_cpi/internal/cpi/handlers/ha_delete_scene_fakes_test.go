@@ -50,6 +50,9 @@ type HADeleteScene struct {
 	// NoCRM answers manager status with an empty body, the shape of a
 	// cluster that runs no HA.
 	NoCRM bool
+	// NoLocal leaves the local flag off every /cluster/status row, the shape
+	// of a cluster status that does not mark the node that answered.
+	NoLocal bool
 	// Services are the CRM's service_status entries by SID.
 	Services map[string]HASceneService
 	// Requested are the HA resources by SID and their requested state.
@@ -70,11 +73,17 @@ type HADeleteScene struct {
 	// OnRead runs under the lock at the start of every manager status read,
 	// so a test can move the CRM between reads.
 	OnRead func(s *HADeleteScene, reads int)
+	// OnIndexRead runs under the lock at the start of every cluster index
+	// read, which is what the settle wait polls, so a test can end the
+	// motion while the wait runs.
+	OnIndexRead func(s *HADeleteScene, reads int)
 
 	// Events records every mutation in order.
 	Events []string
 	// ManagerReads counts the manager status reads.
 	ManagerReads int
+	// IndexReads counts the cluster index reads.
+	IndexReads int
 }
 
 // NewHADeleteScene returns a three-member scene entered through pve-node1 in
@@ -111,10 +120,25 @@ func (s *HADeleteScene) Manage(vmid int, node, requested, raw string) {
 		s.Services[sid] = HASceneService{State: raw, Node: node, UID: "uid-" + strconv.Itoa(vmid)}
 	}
 	s.IndexNode[vmid] = node
+	// The index's hastate is the CRM's state when it holds one, as PVE
+	// reports it, and the configured request otherwise.
 	s.IndexHAState[vmid] = requested
+	if raw != "" {
+		s.IndexHAState[vmid] = raw
+	}
 	if raw == "stopped" || raw == "error" {
 		s.Power[vmid] = "stopped"
 	}
+}
+
+// MarkNodeDead reports node offline in cluster status, unknown to the CRM,
+// and with an LRM timestamp four hours old, the shape of a node that died.
+func (s *HADeleteScene) MarkNodeDead(node string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Offline[node] = true
+	s.NodeState[node] = "unknown"
+	s.LRMAge[node] = 4 * 3600
 }
 
 // Place puts vmid on node in the cluster index without any HA registration.
@@ -167,7 +191,7 @@ func (s *HADeleteScene) statusRows() *cluster.ListStatusResponse {
 			online = 0
 		}
 		row := map[string]any{"type": "node", "name": m, "online": online, "id": "node/" + m}
-		if i == 0 {
+		if i == 0 && !s.NoLocal {
 			row["local"] = 1
 		}
 		raw, _ := json.Marshal(row)
@@ -308,11 +332,14 @@ func (c *HASceneCluster) UpdateHaResources(_ context.Context, sid string, params
 	case "stopped":
 		c.Scene.applyStop(vmid)
 	case "disabled":
-		c.Scene.Requested[sid] = "disabled"
-		if svc, ok := c.Scene.Services[sid]; ok {
-			svc.State = "stopped"
-			c.Scene.Services[sid] = svc
+		// The CRM stops a disabled service, which clears an error, and
+		// keeps it stopped, as PVE does.
+		if !c.Scene.StopApplies {
+			c.Scene.Requested[sid] = "disabled"
+			break
 		}
+		c.Scene.applyStop(vmid)
+		c.Scene.Requested[sid] = "disabled"
 	default:
 		c.Scene.Requested[sid] = state
 	}
@@ -372,6 +399,45 @@ func (c *HASceneCluster) CreateHaRules(_ context.Context, params *cluster.Create
 	return nil
 }
 
+// UpdateHaRules records the write and applies the fields it sets to an
+// existing rule, as PVE's rule update does; delete names fields to clear.
+func (c *HASceneCluster) UpdateHaRules(_ context.Context, rule string, params *cluster.UpdateHaRulesParams) error {
+	c.Scene.mu.Lock()
+	defer c.Scene.mu.Unlock()
+	resources := ""
+	if params != nil && params.Resources != nil {
+		resources = *params.Resources
+	}
+	c.Scene.record("UpdateHaRules:" + rule + "=" + resources)
+	row, ok := c.Scene.Rules[rule]
+	if !ok {
+		return errors.New("no such rule '" + rule + "' (HTTP500)")
+	}
+	if params == nil {
+		return nil
+	}
+	if params.Delete != nil {
+		for _, field := range strings.Split(*params.Delete, ",") {
+			delete(row, strings.TrimSpace(field))
+		}
+	}
+	set := map[string]*string{
+		"resources": params.Resources, "affinity": params.Affinity, "comment": params.Comment, "nodes": params.Nodes,
+	}
+	for field, value := range set {
+		if value != nil {
+			row[field] = *value
+		}
+	}
+	if params.Disable != nil {
+		row["disable"] = *params.Disable
+	}
+	if params.Strict != nil {
+		row["strict"] = *params.Strict
+	}
+	return nil
+}
+
 func (c *HASceneCluster) ListResources(
 	ctx context.Context, params *cluster.ListResourcesParams,
 ) (*cluster.ListResourcesResponse, error) {
@@ -380,6 +446,10 @@ func (c *HASceneCluster) ListResources(
 	}
 	c.Scene.mu.Lock()
 	defer c.Scene.mu.Unlock()
+	c.Scene.IndexReads++
+	if c.Scene.OnIndexRead != nil {
+		c.Scene.OnIndexRead(c.Scene, c.Scene.IndexReads)
+	}
 	return c.Scene.indexRows(), nil
 }
 
@@ -469,14 +539,32 @@ func (c *haSceneClient) QEMU() qemu.Service   { return &HASceneQEMU{Scene: c.sce
 func (c *haSceneClient) Tasks() tasks.Service { return haSceneTasks{} }
 
 func (c *haSceneClient) EffectivePermissions(context.Context, string) (map[string]bool, error) {
-	c.scene.mu.Lock()
-	defer c.scene.mu.Unlock()
-	if c.scene.Perms == nil {
+	return c.scene.perms()
+}
+
+// perms is the token's privileges on /, or the refusal PVE answers when Perms
+// is nil.
+func (s *HADeleteScene) perms() (map[string]bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Perms == nil {
 		return nil, errors.New("permission denied - (HTTP403)")
 	}
-	out := make(map[string]bool, len(c.scene.Perms))
-	for k, v := range c.scene.Perms {
+	out := make(map[string]bool, len(s.Perms))
+	for k, v := range s.Perms {
 		out[k] = v
 	}
 	return out, nil
+}
+
+// HAScenePermsClient serves the token's privileges from Scene and every other
+// call from the wrapped client, for handler tests whose client has no
+// permission reader of its own.
+type HAScenePermsClient struct {
+	pve.Client
+	Scene *HADeleteScene
+}
+
+func (c *HAScenePermsClient) EffectivePermissions(context.Context, string) (map[string]bool, error) {
+	return c.Scene.perms()
 }

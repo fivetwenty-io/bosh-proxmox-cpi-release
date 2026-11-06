@@ -400,9 +400,16 @@ func ReadHAServiceState(
 	if err != nil {
 		return unknown("cluster status unreadable on the closing check: %v", err)
 	}
-	if after.entry != health.EntryNode || !after.quorate {
-		return unknown("the entry node changed from %s to %q or lost quorum during the read",
-			health.EntryNode, after.entry)
+	// NodeHealth falls back to the CRM's quorum node when no cluster-status
+	// row carries local, so an empty entry here means cluster status never
+	// marked the answering node, not that the entry moved.
+	switch {
+	case after.entry == "":
+		return unknown("cluster status marks no local node, so the node that answered cannot be confirmed")
+	case !after.quorate:
+		return unknown("the entry node %s lost quorum during the read", after.entry)
+	case after.entry != health.EntryNode:
+		return unknown("the entry node changed from %s to %s during the read", health.EntryNode, after.entry)
 	}
 
 	st.Known = true
