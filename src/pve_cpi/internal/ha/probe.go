@@ -24,6 +24,7 @@ import (
 type ClusterAPI interface {
 	pve.NodeHealthCluster
 	ListConfigNodes(ctx context.Context) (*sdkcluster.ListConfigNodesResponse, error)
+	ListHaResources(ctx context.Context, params *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error)
 	ListConfigQdevice(ctx context.Context) (*sdkcluster.ListConfigQdeviceResponse, error)
 	ListHaRules(ctx context.Context, params *sdkcluster.ListHaRulesParams) (*sdkcluster.ListHaRulesResponse, error)
 	ListOptions(ctx context.Context) (*sdkcluster.ListOptionsResponse, error)

@@ -1201,3 +1201,74 @@ func TestNodeProbedByTheSourceButMissingFromItsFacts(t *testing.T) {
 		t.Fatalf("node err = %q", p.Nodes[1].VersionErr)
 	}
 }
+
+func noMasterBody() json.RawMessage {
+	return mustJSON(map[string]any{
+		"manager_status": map[string]any{"node_status": map[string]string{"pve1": "online"}, "timestamp": now},
+	})
+}
+
+func TestIdleCRMOnAnEmptyResourceListIsNotAGap(t *testing.T) {
+	w := three()
+	w.managerBody = noMasterBody()
+	w.noResources = true
+	p := resolve(t, w, cfgMode(config.HAModeAuto))
+	if p.Effective != ha.EffectiveFull || len(p.Gaps) != 0 {
+		t.Fatalf("effective=%s gaps=%v", p.Effective, p.Gaps)
+	}
+	if !strings.Contains(p.Advice, "HA stack idle, no resources configured yet") {
+		t.Fatalf("advice = %q", p.Advice)
+	}
+}
+
+func TestIdleCRMWithResourcesKeepsTheGap(t *testing.T) {
+	w := three()
+	w.managerBody = noMasterBody()
+	p := resolve(t, w, cfgMode(config.HAModeAuto))
+	if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(p.Reason, "no CRM master") {
+		t.Fatalf("effective=%s reason=%q", p.Effective, p.Reason)
+	}
+	if strings.Contains(p.Advice, "idle") {
+		t.Fatalf("advice = %q", p.Advice)
+	}
+}
+
+func TestIdleCRMWithUnreadableResourcesKeepsTheGap(t *testing.T) {
+	w := three()
+	w.managerBody = noMasterBody()
+	w.noResources = true
+	w.resourcesErr = errors.New("500 resources")
+	p := resolve(t, w, cfgMode(config.HAModeAuto))
+	if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(p.Reason, "no CRM master") {
+		t.Fatalf("effective=%s reason=%q", p.Effective, p.Reason)
+	}
+}
+
+// movingEntryCluster reports a different local node on every status read after
+// the first, which models cluster status and node health disagreeing.
+type movingEntryCluster struct {
+	*fakeCluster
+	reads int
+}
+
+func (m *movingEntryCluster) ListStatus(ctx context.Context) (*sdkClusterStatusResponse, error) {
+	m.reads++
+	if m.reads == 1 {
+		return m.fakeCluster.ListStatus(ctx)
+	}
+	m.w.entry = "pve2"
+	return m.fakeCluster.ListStatus(ctx)
+}
+
+func TestDifferingEntryNodesAreAGap(t *testing.T) {
+	w := three()
+	d := w.deps(cfgMode(config.HAModeAuto))
+	d.Cluster = &movingEntryCluster{fakeCluster: w.cluster}
+	p, err := ha.Resolve(context.Background(), d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Effective != ha.EffectiveObserveOnly || !strings.Contains(strings.Join(p.Gaps, "|"), "entry node pve1 but node health from pve2") {
+		t.Fatalf("effective=%s gaps=%v", p.Effective, p.Gaps)
+	}
+}

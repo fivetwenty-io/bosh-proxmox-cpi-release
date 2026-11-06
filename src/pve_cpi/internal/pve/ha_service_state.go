@@ -69,7 +69,7 @@ const (
 
 func (k HADecisionKind) valid() bool { return k == HADecisionLive || k == HADecisionRecovery }
 
-// HADisposition is what the section 2 table says a caller does with a service.
+// HADisposition is what the disposition table says a caller does with a service.
 type HADisposition string
 
 const (
@@ -147,7 +147,7 @@ type HAServiceState struct {
 // or as a service in the CRM's state.
 func (s *HAServiceState) Managed() bool { return s != nil && (s.Configured || s.InCRM) }
 
-// Disposition applies the table from section 2 to the model and returns what a
+// Disposition applies the disposition table to the model and returns what a
 // caller does, with a short reason for the error text or the log.
 func (s *HAServiceState) Disposition() (HADisposition, string) {
 	switch {
@@ -236,6 +236,7 @@ func orUnset(v, fallback string) string {
 type HAServiceStateCluster interface {
 	NodeHealthCluster
 	ListHaResources(ctx context.Context, params *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error)
+	GetHaResources(ctx context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error)
 }
 
 // HAServiceStateInput names the VM and the decision.
@@ -457,6 +458,10 @@ func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServic
 			requested = haRequestedStarted
 		}
 		if requested == "" {
+			// The list does not guarantee a state, so ask for the resource itself.
+			requested = readConfiguredStateOf(ctx, clusterAPI, s.SID)
+		}
+		if requested == "" {
 			return fmt.Sprintf("the HA resource %s carries no requested state", s.SID)
 		}
 		found = true
@@ -464,6 +469,26 @@ func (s *HAServiceState) readConfigured(ctx context.Context, clusterAPI HAServic
 		s.Requested = requested
 	}
 	return ""
+}
+
+// readConfiguredStateOf reads the requested state of one HA resource from
+// GET /cluster/ha/resources/{sid}. It returns "" when the read fails or the
+// resource still carries no state, which leaves the caller's state unknown.
+func readConfiguredStateOf(ctx context.Context, clusterAPI HAServiceStateCluster, sid string) string {
+	var resp *sdkcluster.GetHaResourcesResponse
+	err := RetryOnTransient(ctx, nil, "ha_service_state_resource", 0, func() error {
+		var inner error
+		resp, inner = clusterAPI.GetHaResources(ctx, sid)
+		return inner
+	})
+	if err != nil || resp == nil || resp.State == nil {
+		return ""
+	}
+	requested := strings.TrimSpace(*resp.State)
+	if requested == haRequestedEnabled {
+		requested = haRequestedStarted
+	}
+	return requested
 }
 
 // readEntryTime reads the entry node's clock in Unix seconds.

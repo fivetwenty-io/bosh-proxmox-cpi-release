@@ -56,6 +56,8 @@ type world struct {
 	optionsErr      error
 	replicationErr  error
 	replication     []json.RawMessage
+	noResources     bool // the cluster has no HA resources, so the CRM is idle
+	resourcesErr    error
 	storageBody     []json.RawMessage
 	storageErr      error
 
@@ -245,6 +247,19 @@ func (c *fakeCluster) ListConfigQdevice(_ context.Context) (*sdkcluster.ListConf
 		body = json.RawMessage(`{}`)
 	}
 	return &body, nil
+}
+
+func (c *fakeCluster) ListHaResources(_ context.Context, _ *sdkcluster.ListHaResourcesParams) (*sdkcluster.ListHaResourcesResponse, error) {
+	c.hit("resources")
+	w := c.w
+	if w.resourcesErr != nil {
+		return nil, w.resourcesErr
+	}
+	resp := sdkcluster.ListHaResourcesResponse{}
+	if !w.noResources {
+		resp = append(resp, mustJSON(map[string]any{"sid": "vm:100", "state": "started"}))
+	}
+	return &resp, nil
 }
 
 func (c *fakeCluster) ListHaRules(_ context.Context, _ *sdkcluster.ListHaRulesParams) (*sdkcluster.ListHaRulesResponse, error) {

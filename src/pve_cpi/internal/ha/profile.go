@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 
+	sdkcluster "github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
+
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
@@ -151,6 +153,10 @@ type Profile struct {
 	// the gates after it have nothing to test.
 	partial bool
 
+	// crmNote is advice recorded when the CRM is idle because no HA resource
+	// exists yet. finish folds it into Advice.
+	crmNote string
+
 	// CPUDomains groups the nodes by CPU model and flags. UnknownCPUNodes lists
 	// the nodes whose CPU is unknown, which belong to no domain.
 	CPUDomains      []CPUDomain
@@ -271,9 +277,12 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 		p.HealthErr = herr.Error()
 	}
 	p.Health = report
+	if report != nil && report.EntryNode != "" && p.EntryNode != "" && report.EntryNode != p.EntryNode {
+		p.addGap(fmt.Sprintf("cluster status came from entry node %s but node health from %s", p.EntryNode, report.EntryNode))
+	}
 	master, merr := readCRMMaster(ctx, deps.Cluster)
 	p.CRMMaster = master
-	p.checkCRM(merr)
+	p.checkCRM(ctx, deps.Cluster, merr)
 
 	source := deps.Slow
 	if source == nil {
@@ -296,18 +305,36 @@ func (p *Profile) probe(ctx context.Context, deps Deps) {
 	p.Replication, p.ReplicationErr = readReplication(ctx, deps.Cluster)
 }
 
-// checkCRM records a gap unless a fresh CRM master exists.
-func (p *Profile) checkCRM(masterErr error) {
+// checkCRM records a gap unless a fresh CRM master exists. The one exception
+// is a quorate cluster whose HA resource list was read and is empty. PVE's CRM
+// stays idle and holds no manager lock until the first resource exists, so
+// registering that first resource is what starts it, and a gap there would
+// keep the profile from ever reaching full. A resource list that cannot be
+// read, or that is not empty, keeps the gap so the check fails closed.
+func (p *Profile) checkCRM(ctx context.Context, api ClusterAPI, masterErr error) {
 	switch {
 	case masterErr != nil:
 		p.addGap("HA manager status unreadable: " + masterErr.Error())
 	case p.Health == nil:
 		p.addGap("node health unreadable: " + p.HealthErr)
+	case p.CRMMaster == "" && p.crmIdle(ctx, api):
+		p.crmNote = "HA stack idle, no resources configured yet"
 	case p.Health.HA != pve.HAViewManagerStatus:
 		p.addGap(fmt.Sprintf("no CRM master with a fresh status (HA view %s: %s)", p.Health.HA, p.Health.HAReason))
 	case p.CRMMaster == "":
 		p.addGap("manager status names no CRM master")
 	}
+}
+
+// crmIdle reports whether the cluster has no HA resources, read successfully.
+func (p *Profile) crmIdle(ctx context.Context, api ClusterAPI) bool {
+	var resp *sdkcluster.ListHaResourcesResponse
+	err := pve.RetryOnTransient(ctx, nil, "ha_profile_resources", 0, func() error {
+		var inner error
+		resp, inner = api.ListHaResources(ctx, nil)
+		return inner
+	})
+	return err == nil && resp != nil && len(*resp) == 0
 }
 
 // applySlow copies the slow facts into the profile and runs the quorum math.
@@ -425,6 +452,12 @@ func (p *Profile) finish(cfg *config.CPIConfig) {
 	}
 	p.Topology, p.TopologySource = resolveTopology(cfg.HAStorageTopologyValue(), p.Storages, p.StoragesErr)
 	p.Advice = qdeviceAdvice(p.Quorum, p.QDevice)
+	if p.crmNote != "" {
+		if p.Advice != "" {
+			p.Advice += "; "
+		}
+		p.Advice += p.crmNote
+	}
 
 	switch {
 	case p.Mode == config.HAModeOff:
@@ -550,7 +583,7 @@ func holdsVMDisks(content string) bool {
 }
 
 // LogLine renders the profile as the single startup line. Headroom is not part
-// of the profile, so the unit that computes it appends its own field.
+// of the profile, so a caller that computes it appends its own field.
 func (p *Profile) LogLine() string {
 	yes := func(b bool) string {
 		if b {

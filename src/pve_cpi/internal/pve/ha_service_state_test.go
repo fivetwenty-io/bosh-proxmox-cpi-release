@@ -20,6 +20,12 @@ type haCluster struct {
 	resourcesErr error
 	nilResources bool
 
+	// perSid answers GET /cluster/ha/resources/{sid} with a requested state per
+	// sid, and perSidErr fails every such read. A sid absent from perSid and no
+	// error answers a resource with no state.
+	perSid    map[string]string
+	perSidErr error
+
 	statusCalls int
 	// laterRows, when set, replaces the cluster status rows from the second
 	// read on, which models an endpoint wrapper that moved to another node.
@@ -50,6 +56,17 @@ func (c *haCluster) ListHaResources(
 	}
 	resp := sdkcluster.ListHaResourcesResponse(c.resources)
 	return &resp, nil
+}
+
+func (c *haCluster) GetHaResources(_ context.Context, sid string) (*sdkcluster.GetHaResourcesResponse, error) {
+	if c.perSidErr != nil {
+		return nil, c.perSidErr
+	}
+	resp := &sdkcluster.GetHaResourcesResponse{Sid: sid}
+	if state, ok := c.perSid[sid]; ok {
+		resp.State = &state
+	}
+	return resp, nil
 }
 
 // haSvc is one service_status entry.
@@ -361,6 +378,39 @@ func TestHAServiceState_LRMFreshnessDependsOnTheDecision(t *testing.T) {
 	s.lrm["pve2"] = nhActive(nhNow + 60)
 	st, _ = haRead(t, s.cluster(), pve.HADecisionLive)
 	haWant(t, st, pve.HAUnknown)
+}
+
+func TestHAServiceState_ListWithoutStateFallsBackToTheResource(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		perSid     map[string]string
+		perSidErr  error
+		wantKnown  bool
+		wantReq    string
+		wantReason string
+	}{
+		"resource supplies the state":  {perSid: map[string]string{"vm:100": "started"}, wantKnown: true, wantReq: "started"},
+		"enabled maps to started":      {perSid: map[string]string{"vm:100": "enabled"}, wantKnown: true, wantReq: "started"},
+		"resource read fails":          {perSidErr: errors.New("500 boom"), wantReason: "no requested state"},
+		"resource has no state either": {wantReason: "no requested state"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c := newHAScene("started").cluster()
+			c.resources = []json.RawMessage{haResource("vm:100", "")}
+			c.perSid, c.perSidErr = tc.perSid, tc.perSidErr
+			st, _ := haRead(t, c, pve.HADecisionLive)
+			if st.Known != tc.wantKnown || st.Requested != tc.wantReq {
+				t.Fatalf("known=%v requested=%q reason=%q", st.Known, st.Requested, st.Reason)
+			}
+			if !tc.wantKnown {
+				haWant(t, st, pve.HAUnknown)
+				if !strings.Contains(st.Reason, tc.wantReason) {
+					t.Errorf("reason = %q", st.Reason)
+				}
+			}
+		})
+	}
 }
 
 func TestHAServiceState_FieldsThatMakeTheModelUnknown(t *testing.T) {

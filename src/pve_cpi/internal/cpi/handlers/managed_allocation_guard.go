@@ -326,3 +326,13 @@ func (c *managedAllocationClient) StorageAuditVisibility(ctx context.Context) er
 	}
 	return reader.StorageAuditVisibility(ctx)
 }
+
+// Token privilege reads survive the mutation decorator, so the HA profile can
+// see the privileges of the token behind a guarded client.
+func (c *managedAllocationClient) EffectivePermissions(ctx context.Context, path string) (map[string]bool, error) {
+	reader, ok := c.Client.(pve.TokenPermissionReader)
+	if !ok {
+		return nil, cpierrors.Cloud("EffectivePermissions: the wrapped client cannot read token permissions")
+	}
+	return reader.EffectivePermissions(ctx, path)
+}

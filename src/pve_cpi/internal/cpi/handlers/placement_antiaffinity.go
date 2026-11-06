@@ -49,12 +49,6 @@ const (
 	haRuleAffinity = "negative"
 )
 
-// haRuleStrict is the strict flag sent with every negative rule. It is false
-// because that is what the CPI has always sent: the removed strict key
-// defaulted to false and no value of it changed what a resource-affinity rule
-// does.
-const haRuleStrict = false
-
 // haRuleEntry is the subset of a GET /cluster/ha/rules list entry the CPI reads.
 // Resources is decoded flexibly (see parseHaResources) because PVE may return
 // it as a CSV string, an array, or an object keyed by resource id.
@@ -366,13 +360,11 @@ func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logg
 // rule members on different nodes.
 func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, groupKey string) error {
 	affinity := haRuleAffinity
-	strict := haRuleStrict
 	comment := "BOSH anti-affinity for instance group " + groupKey
 	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
 		Rule:      ruleName,
 		Type:      haRuleType,
 		Affinity:  &affinity,
-		Strict:    &strict,
 		Resources: csv,
 		Comment:   &comment,
 	}); err != nil {
