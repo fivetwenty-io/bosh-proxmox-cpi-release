@@ -91,8 +91,10 @@ func isLockStep(step aj.Step) bool {
 // operation or the record's kind, and a step that names none, such as an
 // attach's or a create_disk's parker lock, adds nothing. A lock step that was
 // already observed is never settled, so it adds no candidate. A VM record
-// adds its instance group's anti-affinity sentinel, rebuilt exactly as
-// acquireAntiAffinityLock names it, whenever the record froze a group.
+// whose plan reads back adds the rules lock sentinel every HA rule write holds
+// (haRulesLockKey), and its instance group's older-CPI sentinel, rebuilt
+// exactly as acquireAntiAffinityLock names it, whenever the record froze a
+// group.
 //
 // A VM record's pool step never touched its vm-<vmid> sentinel. That read is
 // kept as a probe that PVE is answering exactly, and for a record that froze
@@ -131,6 +133,8 @@ func lockStepSentinels(record aj.Record) []string {
 			return nil
 		}
 		if plan.VMExecution != nil {
+			// Every HA rule write of a create holds the one rules lock.
+			sentinels = append(sentinels, pve.ClusterLockPoolName(antiAffinityLockPrefix+haRulesLockKey))
 			if group := sanitizeTagValue(plan.VMExecution.PoolInstanceGroup); group != "" {
 				sentinels = append(sentinels, pve.ClusterLockPoolName(antiAffinityLockPrefix+group))
 			}

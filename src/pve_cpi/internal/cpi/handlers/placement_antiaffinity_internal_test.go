@@ -4,6 +4,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -17,22 +18,27 @@ import (
 // Non-overridden methods panic via the embedded nil interface.
 type aaClusterStub struct {
 	cluster.Service
-	resources       map[string]bool   // sid -> registered
-	rules           map[string]string // ruleName -> resources CSV
-	ruleComments    map[string]string // ruleName -> comment
+	resources    map[string]bool   // sid -> registered
+	rules        map[string]string // ruleName -> resources CSV
+	ruleComments map[string]string // ruleName -> comment
+	// ruleTypes, ruleNodes, and ruleStrict hold what a node-affinity rule
+	// adds; a rule absent from ruleTypes is a negative resource-affinity rule.
+	ruleTypes       map[string]string
+	ruleNodes       map[string]string
+	ruleStrict      map[string]bool
 	resComments     map[string]string // sid -> comment
 	listResourcesFn func() *cluster.ListResourcesResponse
 	createRuleCalls int
+	updateRuleCalls int
 	deleteRuleCalls int
 	failCreateRule  bool
-	failListRules   bool
+	failUpdateRule  bool
+	// digest changes on every rule write, the way PVE's config digest does.
+	digest        int
+	failListRules bool
 	// events, when non-nil, records an ordered op log shared with a fake pool
 	// service so lock/RMW ordering can be asserted across both services.
 	events *[]string
-	// dropMemberOnRecreate, when non-empty, simulates a concurrent writer: on the
-	// next CreateHaRules the named sid is removed from the persisted CSV, so a
-	// read-after-write verify observes the lost member.
-	dropMemberOnRecreate string
 	// memberNodes overrides the corosync membership reported by
 	// ListConfigNodes; nil means the single default node "pve1".
 	memberNodes []string
@@ -59,6 +65,7 @@ func newAAStub() *aaClusterStub {
 	return &aaClusterStub{
 		resources: map[string]bool{}, rules: map[string]string{},
 		ruleComments: map[string]string{}, resComments: map[string]string{},
+		ruleTypes: map[string]string{}, ruleNodes: map[string]string{}, ruleStrict: map[string]bool{},
 	}
 }
 
@@ -137,16 +144,41 @@ func (s *aaClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesPar
 	}
 	out := cluster.ListHaRulesResponse{}
 	for name, csv := range s.rules {
-		raw, _ := json.Marshal(map[string]any{
+		row := map[string]any{
 			"rule":      name,
 			"type":      haRuleType,
-			"affinity":  haRuleAffinity,
 			"resources": csv,
 			"comment":   s.ruleComments[name],
-		})
+			"digest":    fmt.Sprint(s.digest),
+		}
+		if typ, ok := s.ruleTypes[name]; ok {
+			row["type"] = typ
+		} else {
+			row["affinity"] = haRuleAffinity
+		}
+		if nodes, ok := s.ruleNodes[name]; ok {
+			row["nodes"] = nodes
+		}
+		if s.ruleStrict[name] {
+			row["strict"] = 1
+		}
+		raw, _ := json.Marshal(row)
 		out = append(out, raw)
 	}
 	return &out, nil
+}
+
+// dropOnRead makes every rule read from the call-th on lose sid, the way a
+// concurrent writer that removed it after this create's writes would.
+func (s *aaClusterStub) dropOnRead(call int, sid string) {
+	s.beforeListRules = func(n int) {
+		if n < call {
+			return
+		}
+		for name, csv := range s.rules {
+			s.rules[name] = dropSidFromCSV(csv, sid)
+		}
+	}
 }
 
 func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRulesParams) error {
@@ -155,16 +187,48 @@ func (s *aaClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRule
 	if s.failCreateRule {
 		return fmt.Errorf("create rule failed")
 	}
-	resources := p.Resources
-	if s.dropMemberOnRecreate != "" {
-		// Simulate a concurrent writer dropping a member from the persisted rule.
-		resources = dropSidFromCSV(resources, s.dropMemberOnRecreate)
-		s.dropMemberOnRecreate = ""
-	}
-	s.rules[p.Rule] = resources
+	s.rules[p.Rule] = p.Resources
 	if p.Comment != nil {
 		s.ruleComments[p.Rule] = *p.Comment
 	}
+	if p.Type != haRuleType {
+		s.ruleTypes[p.Rule] = p.Type
+	}
+	if p.Nodes != nil {
+		s.ruleNodes[p.Rule] = *p.Nodes
+	}
+	if p.Strict != nil {
+		s.ruleStrict[p.Rule] = *p.Strict
+	}
+	s.digest++
+	return nil
+}
+
+func (s *aaClusterStub) UpdateHaRules(_ context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	s.record("update-rule:" + rule)
+	s.updateRuleCalls++
+	if s.failUpdateRule {
+		return fmt.Errorf("update rule failed")
+	}
+	if _, ok := s.rules[rule]; !ok {
+		return fmt.Errorf("no such ha rule '%s'", rule)
+	}
+	if p.Digest != nil && *p.Digest != fmt.Sprint(s.digest) {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	if p.Resources != nil {
+		s.rules[rule] = *p.Resources
+	}
+	if p.Comment != nil {
+		s.ruleComments[rule] = *p.Comment
+	}
+	if p.Nodes != nil {
+		s.ruleNodes[rule] = *p.Nodes
+	}
+	if p.Strict != nil {
+		s.ruleStrict[rule] = *p.Strict
+	}
+	s.digest++
 	return nil
 }
 
@@ -173,11 +237,15 @@ func (s *aaClusterStub) DeleteHaRules(_ context.Context, rule string) error {
 	s.deleteRuleCalls++
 	delete(s.rules, rule)
 	delete(s.ruleComments, rule)
+	delete(s.ruleTypes, rule)
+	delete(s.ruleNodes, rule)
+	delete(s.ruleStrict, rule)
+	s.digest++
 	return nil
 }
 
 // dropSidFromCSV returns csv with sid removed, used to simulate a concurrent
-// lost-update in read-after-write verify tests.
+// lost update in read-after-write verify tests.
 func dropSidFromCSV(csv, sid string) string {
 	parts := strings.Split(csv, ",")
 	out := parts[:0]
@@ -265,7 +333,7 @@ func TestEnsureAntiAffinity_IdempotentNoRecreate(t *testing.T) {
 	}
 }
 
-func TestEnsureAntiAffinity_AppendRecreatesRule(t *testing.T) {
+func TestEnsureAntiAffinity_AppendUpdatesRuleInPlace(t *testing.T) {
 	stub := newAAStub()
 	stub.seedRule(aaRule, "vm:100,vm:101")
 	// A third member now exists; ensuring the newcomer must grow the rule.
@@ -279,9 +347,11 @@ func TestEnsureAntiAffinity_AppendRecreatesRule(t *testing.T) {
 	if got := stub.rules[aaRule]; got != "vm:100,vm:101,vm:102" {
 		t.Errorf("rule resources = %q; want %q", got, "vm:100,vm:101,vm:102")
 	}
-	if stub.createRuleCalls != 1 || stub.deleteRuleCalls != 1 {
-		t.Errorf("expected one delete+create recreate; create=%d delete=%d",
-			stub.createRuleCalls, stub.deleteRuleCalls)
+	// The rule changes with one PUT and is never deleted, so there is no
+	// window in which the group has no rule.
+	if stub.updateRuleCalls != 1 || stub.createRuleCalls != 0 || stub.deleteRuleCalls != 0 {
+		t.Errorf("expected one in-place update; update=%d create=%d delete=%d",
+			stub.updateRuleCalls, stub.createRuleCalls, stub.deleteRuleCalls)
 	}
 }
 

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -29,16 +30,28 @@ func aaIdent(group string) haIdentity {
 var (
 	aaRule = aaIdent("web").ruleName()
 	aaTag  = aaIdent("web").ruleName()
-	// aaLock is the name of the group's cluster lock sentinel.
-	aaLock = "bosh-lock-aa-" + aaIdent("web").hash()
+	// aaLock is the name of the rules lock sentinel every rule write holds.
+	aaLock = "bosh-lock-aa-" + haRulesLockKey
 )
 
-// pve9Profile is an HA profile on a cluster whose nodes all run PVE 9.2.
+// pve9Profile is an HA profile that confirms PVE 9 on every node but lists no
+// node, so the rule writer knows no configured node set. It then leaves the
+// feasibility checks to PVE, puts no cap on a negative rule's members, and
+// makes every hard pin strict.
 func pve9Profile(context.Context) (*ha.Profile, error) {
-	return &ha.Profile{
-		HAVersionOK: true,
-		Nodes:       []ha.NodeFacts{{Name: "pve1", Online: true, Version: "9.2.4"}, {Name: "pve2", Online: true, Version: "9.2.1"}},
-	}, nil
+	return &ha.Profile{HAVersionOK: true}, nil
+}
+
+// pve9ClusterProfile returns a resolver for a PVE 9.2 cluster whose configured
+// nodes are names, all online.
+func pve9ClusterProfile(names ...string) func(context.Context) (*ha.Profile, error) {
+	return func(context.Context) (*ha.Profile, error) {
+		p := &ha.Profile{HAVersionOK: true}
+		for _, n := range names {
+			p.Nodes = append(p.Nodes, ha.NodeFacts{Name: n, Online: true, Version: "9.2.4"})
+		}
+		return p, nil
+	}
 }
 
 func TestHAIdentityRuleNameIsHashed(t *testing.T) {
@@ -488,7 +501,15 @@ func TestNoResourceAffinityRuleSendsStrict(t *testing.T) {
 	t.Parallel()
 	var sent *cluster.CreateHaRulesParams
 	svc := &captureRuleService{capture: &sent}
-	if err := createNegativeRule(context.Background(), svc, "bosh-aa-x", "vm:1,vm:2", "bosh-cpi:v1 owner=o"); err != nil {
+	writer := &ha.RuleWriter{API: svc, Logger: log.NewNopLogger()}
+	rule := ha.Rule{ID: "bosh-aa-x", Type: haRuleType, Affinity: haRuleAffinity,
+		Resources: []string{"vm:1", "vm:2"}, Comment: "bosh-cpi:v1 owner=o"}
+	if _, err := writer.Apply(context.Background(), "test", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		if set.Find(rule.ID) != nil {
+			return nil, nil
+		}
+		return []ha.RuleOp{{Kind: ha.OpCreate, Rule: rule}}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if sent == nil || sent.Strict != nil {
@@ -497,15 +518,60 @@ func TestNoResourceAffinityRuleSendsStrict(t *testing.T) {
 	if sent.Type != "resource-affinity" || sent.Affinity == nil || *sent.Affinity != "negative" {
 		t.Errorf("unexpected rule %+v", sent)
 	}
+
+	// An update of the rule must not carry strict either.
+	if _, err := writer.Apply(context.Background(), "test", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		cur := set.Find(rule.ID)
+		if cur == nil || len(cur.Resources) == 3 {
+			return nil, nil
+		}
+		next := cur.Clone()
+		next.Resources = append(next.Resources, "vm:3")
+		return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: next}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if svc.updated == nil || svc.updated.Strict != nil || svc.updated.Type != haRuleType {
+		t.Fatalf("a resource-affinity update must not carry strict; sent %+v", svc.updated)
+	}
 }
 
 // captureRuleService records the CreateHaRules params it receives.
 type captureRuleService struct {
 	cluster.Service
 	capture **cluster.CreateHaRulesParams
+	updated *cluster.UpdateHaRulesParams
+	row     map[string]any
 }
 
 func (s *captureRuleService) CreateHaRules(_ context.Context, p *cluster.CreateHaRulesParams) error {
 	*s.capture = p
+	s.row = map[string]any{"rule": p.Rule, "type": p.Type, "resources": p.Resources, "digest": "d1"}
+	if p.Affinity != nil {
+		s.row["affinity"] = *p.Affinity
+	}
+	if p.Comment != nil {
+		s.row["comment"] = *p.Comment
+	}
 	return nil
+}
+
+func (s *captureRuleService) UpdateHaRules(_ context.Context, _ string, p *cluster.UpdateHaRulesParams) error {
+	s.updated = p
+	if p.Resources != nil {
+		s.row["resources"] = *p.Resources
+	}
+	s.row["digest"] = "d2"
+	return nil
+}
+
+func (s *captureRuleService) ListHaRules(
+	_ context.Context, _ *cluster.ListHaRulesParams,
+) (*cluster.ListHaRulesResponse, error) {
+	out := cluster.ListHaRulesResponse{}
+	if s.row != nil {
+		raw, _ := json.Marshal(s.row)
+		out = append(out, raw)
+	}
+	return &out, nil
 }

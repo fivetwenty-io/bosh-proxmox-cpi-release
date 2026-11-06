@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"strconv"
 	"strings"
+
+	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
 func applyCreatedVMRoutes(ctx context.Context, deps Deps, parsed *createVMParsedArgs, shape *createVMShape, vmid int, logger *log.Logger) error {
@@ -111,4 +114,71 @@ func (m *managedVMAllocation) observeDeletedHARule(ctx context.Context, call Man
 		}
 	}
 	return nil
+}
+
+// observeUpdatedHARule proves a rule update landed. It reads the rules back and
+// compares the updated rule, normalized the way the rule writer reads it, with
+// the rule the update describes: its type, its resources, its comment, whether
+// it is disabled, its affinity, and for a node-affinity rule its nodes, their
+// priorities, and strict. A field the update deletes must read back unset.
+func (m *managedVMAllocation) observeUpdatedHARule(ctx context.Context, call ManagedAllocationMutation) error {
+	rule, _ := call.Args["rule"].(string)
+	params, ok := call.Args[managedArgumentParams].(*cluster.UpdateHaRulesParams)
+	if rule == "" || !ok || params == nil || params.Resources == nil {
+		return fmt.Errorf("missing HA rule update identity")
+	}
+	want, err := expectedUpdatedHARule(rule, params)
+	if err != nil {
+		return err
+	}
+	response, err := m.deps.PVE.Cluster().ListHaRules(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if response == nil {
+		return fmt.Errorf("HA rule update unreadable")
+	}
+	set, err := ha.ParseRuleList(response)
+	if err != nil {
+		return err
+	}
+	got := set.Find(rule)
+	if got == nil {
+		return fmt.Errorf("HA rule absent after its update for VM %s", strconv.Itoa(m.vmid))
+	}
+	if diff := ha.RuleDiff(want, got); len(diff) > 0 {
+		return fmt.Errorf("HA rule update readback differs in %s", strings.Join(diff, ", "))
+	}
+	return nil
+}
+
+// expectedUpdatedHARule renders the rule an update describes as a list row and
+// reads it back through the rule parser, so the comparison uses one
+// normalization for both sides.
+func expectedUpdatedHARule(rule string, params *cluster.UpdateHaRulesParams) (*ha.Rule, error) {
+	row := map[string]any{"rule": rule, "type": params.Type, "resources": *params.Resources}
+	if params.Comment != nil {
+		row["comment"] = *params.Comment
+	}
+	if params.Affinity != nil {
+		row["affinity"] = *params.Affinity
+	}
+	if params.Nodes != nil {
+		row["nodes"] = *params.Nodes
+	}
+	if params.Strict != nil && *params.Strict {
+		row["strict"] = 1
+	}
+	if params.Disable != nil && *params.Disable {
+		row["disable"] = 1
+	}
+	raw, err := json.Marshal(row)
+	if err != nil {
+		return nil, fmt.Errorf("cannot encode the HA rule update")
+	}
+	set, err := ha.ParseRuleList(&cluster.ListHaRulesResponse{raw})
+	if err != nil {
+		return nil, err
+	}
+	return set.Find(rule), nil
 }

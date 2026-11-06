@@ -82,7 +82,7 @@ func TestApplyAntiAffinityMembership_RetriableVerify_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
 	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
-	stub.dropMemberOnRecreate = "vm:101" // concurrent drop → verify sees member absent
+	stub.dropOnRead(4, "vm:101") // concurrent drop after the writes → verify sees member absent
 
 	cfg := aaMembershipConfig("off", true, 0) // verify on, lock off
 	deps := aaDepsLock(cfg, stub, newAALockPools(nil))
@@ -135,14 +135,14 @@ func naVerifyDeps(stub *aaClusterStub, verifyOn bool) Deps {
 // TestApplyAZNodeAffinityPin_RetriableVerify_Propagates asserts that when
 // verifyAntiAffinityMember detects a member-absent (concurrent drop), the
 // returned TypeRetriableCloud propagates out of applyAZNodeAffinityPin.
-// The stub's dropMemberOnRecreate triggers the concurrent-drop simulation
-// (same mechanism as the anti-affinity verify test).
+// The stub's dropOnRead triggers the concurrent-drop simulation (same
+// mechanism as the anti-affinity verify test).
 func TestApplyAZNodeAffinityPin_RetriableVerify_Propagates(t *testing.T) {
 	t.Parallel()
 	stub := newAAStub()
-	// node-affinity: CreateHaRules for bosh-na-101 creates the rule, then
-	// dropMemberOnRecreate drops the sid so verify sees it absent.
-	stub.dropMemberOnRecreate = "vm:101"
+	// node-affinity: CreateHaRules for bosh-na-101 creates the rule, then a
+	// concurrent writer drops the sid so the verify read sees it absent.
+	stub.dropOnRead(4, "vm:101")
 	deps := naVerifyDeps(stub, true)
 	cp := createVMCloudProps{AvailabilityZone: "z1"}
 	err := applyAZNodeAffinityPin(context.Background(), deps, 101, cp, "pve-node1", log.NewNopLogger())

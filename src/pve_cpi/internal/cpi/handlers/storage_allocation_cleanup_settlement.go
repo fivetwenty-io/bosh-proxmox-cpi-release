@@ -172,7 +172,10 @@ func cleanupConfigStep(step aj.Step, record aj.Record) bool {
 			return false
 		}
 		switch step.Kind {
-		case "vm.Cluster.CreateHaResources", "vm.Cluster.UpdateHaResources":
+		case "vm.Cluster.CreateHaResources", "vm.Cluster.UpdateHaResources", "vm.Cluster.UpdateHaRules":
+			// A rule update records no parameters. The rule existed before
+			// it, so cleanup has nothing of its own to remove, and the VM's
+			// HA resource purge takes the VM out of the rule.
 			return len(step.Parameters) == 0
 		case "vm.Cluster.CreateHaRules":
 			var fields map[string]any

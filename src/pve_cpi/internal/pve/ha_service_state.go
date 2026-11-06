@@ -141,6 +141,17 @@ type HAServiceState struct {
 
 	// EntryNode is the entry node every read of this decision came through.
 	EntryNode string
+
+	// EntryTime is the entry node's clock at the read, CRMStamp is the CRM
+	// round's timestamp, and LRMStamp is the timestamp of Node's LRM entry, all
+	// in seconds since the epoch. Each is zero when the read had no CRM view or
+	// the entry carried none. A caller that waits for the CRM to act on a
+	// request compares them across reads: a CRM round newer than the request's
+	// EntryTime came after the request, and an LRM report newer than that
+	// round came after the CRM acted.
+	EntryTime int64
+	CRMStamp  int64
+	LRMStamp  int64
 }
 
 // Managed reports whether PVE HA holds the VM, either as a configured resource
@@ -351,6 +362,8 @@ func ReadHAServiceState(
 			return unknown("CRM timestamp is %s on the entry node's clock", describeAge(entryTime, mgr.crmStamp))
 		}
 		st.CRMPresent = true
+		st.EntryTime = entryTime
+		st.CRMStamp = mgr.crmStamp
 	}
 
 	serviceNode, reason := st.readService(mgr)
@@ -375,6 +388,9 @@ func ReadHAServiceState(
 	st.NodeHealth = entry
 	if st.CRMPresent {
 		lrm, has := mgr.lrm[st.Node]
+		if has {
+			st.LRMStamp = lrm.Timestamp.Int()
+		}
 		st.LRMFresh = has && lrm.Timestamp.Int() > 0 &&
 			timestampFresh(entryTime, lrm.Timestamp.Int(), NodeHealthLRMMaxAge)
 	}

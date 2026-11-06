@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -22,8 +23,11 @@ type naClusterStub struct {
 	resComments map[string]string
 	rules       map[string]cluster.CreateHaRulesParams
 	createCalls int
+	updateCalls int
 	deleteCalls int
 	resDelCalls int
+	// digest changes on every rule write, the way PVE's config digest does.
+	digest int
 	// members names the cluster's online members for the reads an absence
 	// proof makes; the HA resources it lists are the ones created through it.
 	members []string
@@ -91,25 +95,94 @@ func (s *naClusterStub) DeleteHaResources(_ context.Context, sid string, _ *clus
 func (s *naClusterStub) ListHaRules(_ context.Context, _ *cluster.ListHaRulesParams) (*cluster.ListHaRulesResponse, error) {
 	out := make(cluster.ListHaRulesResponse, 0, len(s.rules))
 	for name, p := range s.rules {
-		comment := ""
-		if p.Comment != nil {
-			comment = *p.Comment
-		}
-		raw, _ := json.Marshal(map[string]any{"rule": name, "type": p.Type, "resources": p.Resources, "comment": comment})
-		out = append(out, raw)
+		out = append(out, naRuleRow(name, p, s.digest))
 	}
 	return &out, nil
 }
 
+// naRuleRow renders a stored rule as a GET /cluster/ha/rules row.
+func naRuleRow(name string, p cluster.CreateHaRulesParams, digest int) json.RawMessage {
+	row := map[string]any{"rule": name, "type": p.Type, "resources": p.Resources, "digest": fmt.Sprint(digest)}
+	if p.Comment != nil {
+		row["comment"] = *p.Comment
+	}
+	if p.Nodes != nil {
+		row["nodes"] = *p.Nodes
+	}
+	if p.Strict != nil && *p.Strict {
+		row["strict"] = 1
+	}
+	if p.Affinity != nil {
+		row["affinity"] = *p.Affinity
+	}
+	if p.Disable != nil && *p.Disable {
+		row["disable"] = 1
+	}
+	raw, _ := json.Marshal(row)
+	return raw
+}
+
 func (s *naClusterStub) CreateHaRules(_ context.Context, p *cluster.CreateHaRulesParams) error {
 	s.createCalls++
+	if _, ok := s.rules[p.Rule]; ok {
+		return fmt.Errorf("rule '%s' already defined", p.Rule)
+	}
 	s.rules[p.Rule] = *p
+	s.digest++
 	return nil
+}
+
+func (s *naClusterStub) UpdateHaRules(_ context.Context, rule string, p *cluster.UpdateHaRulesParams) error {
+	s.updateCalls++
+	cur, ok := s.rules[rule]
+	if !ok {
+		return fmt.Errorf("no such ha rule '%s'", rule)
+	}
+	if p.Digest != nil && *p.Digest != fmt.Sprint(s.digest) {
+		return errors.New("detected modified configuration - file changed by other user")
+	}
+	s.rules[rule] = applyRuleUpdate(cur, p)
+	s.digest++
+	return nil
+}
+
+// applyRuleUpdate applies a PUT /cluster/ha/rules/{rule} to a stored rule.
+func applyRuleUpdate(cur cluster.CreateHaRulesParams, p *cluster.UpdateHaRulesParams) cluster.CreateHaRulesParams {
+	if p.Resources != nil {
+		cur.Resources = *p.Resources
+	}
+	if p.Nodes != nil {
+		cur.Nodes = p.Nodes
+	}
+	if p.Strict != nil {
+		cur.Strict = p.Strict
+	}
+	if p.Affinity != nil {
+		cur.Affinity = p.Affinity
+	}
+	if p.Comment != nil {
+		cur.Comment = p.Comment
+	}
+	if p.Disable != nil {
+		cur.Disable = p.Disable
+	}
+	if p.Delete != nil {
+		for _, k := range strings.Split(*p.Delete, ",") {
+			switch k {
+			case "comment":
+				cur.Comment = nil
+			case "disable":
+				cur.Disable = nil
+			}
+		}
+	}
+	return cur
 }
 
 func (s *naClusterStub) DeleteHaRules(_ context.Context, rule string) error {
 	s.deleteCalls++
 	delete(s.rules, rule)
+	s.digest++
 	return nil
 }
 
@@ -182,8 +255,9 @@ func TestEnsureNodeAffinityPin_RefreshesExisting(t *testing.T) {
 		[]string{"pve03"}, true, log.NewNopLogger()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stub.deleteCalls != 1 {
-		t.Errorf("stale rule must be deleted before recreate; deleteCalls=%d", stub.deleteCalls)
+	if stub.updateCalls != 1 || stub.deleteCalls != 0 || stub.createCalls != 0 {
+		t.Errorf("stale rule must be updated in place; update=%d delete=%d create=%d",
+			stub.updateCalls, stub.deleteCalls, stub.createCalls)
 	}
 	if got := stub.rules["bosh-na-100"]; got.Nodes == nil || *got.Nodes != "pve03" {
 		t.Errorf("refreshed rule Nodes = %v; want pve03", got.Nodes)
@@ -399,8 +473,9 @@ func TestApplyAZNodeAffinityPin_PluralAZ_PinsChosenAZ(t *testing.T) {
 	if !ok {
 		t.Fatal("plural-AZ VM must be pinned (bosh-na-100 missing)")
 	}
-	if rule.Nodes == nil || *rule.Nodes != "pve02,pve03" {
-		t.Errorf("pin Nodes = %v; want z2 node set pve02,pve03", rule.Nodes)
+	// The pin names the z2 node set, with the placed node first.
+	if rule.Nodes == nil || *rule.Nodes != "pve02,pve03:2" {
+		t.Errorf("pin Nodes = %v; want z2 node set pve02,pve03:2", ptrStr(rule.Nodes))
 	}
 }
 
@@ -555,4 +630,12 @@ func TestApplyAZNodeAffinityPin_ResolvableAZ_NoInertWarn(t *testing.T) {
 	if out := buf.String(); strings.Contains(out, "availability_zone") {
 		t.Errorf("a resolvable AZ must not emit the inert-pin warning, got %q", out)
 	}
+}
+
+// ptrStr renders an optional string for a failure message.
+func ptrStr(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
 }

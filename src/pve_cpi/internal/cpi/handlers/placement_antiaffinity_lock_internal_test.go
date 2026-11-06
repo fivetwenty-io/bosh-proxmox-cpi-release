@@ -291,8 +291,10 @@ func TestEnsureAntiAffinity_VerifyOn_MemberPresentOK(t *testing.T) {
 func TestEnsureAntiAffinity_VerifyOn_MemberAbsentRetriable(t *testing.T) {
 	stub := newAAStub()
 	stub.listResourcesFn = aaResourcesFn(aaQEMU(100, aaTag))
-	// Simulate a concurrent writer dropping the new member from the recreated rule.
-	stub.dropMemberOnRecreate = "vm:101"
+	// A concurrent writer drops the new member after this create's writes, so
+	// the read-after-write verify (the fourth read: plan, plan again, the
+	// writer's own check, and the verify) sees it absent.
+	stub.dropOnRead(4, "vm:101")
 	cfg := aaLockConfig("off", true, 0)
 	pools := newAALockPools(nil)
 	err := ensureAntiAffinityMembership(context.Background(), aaDepsLock(cfg, stub, pools), aaIdent("web"), 101, log.NewNopLogger())
@@ -351,7 +353,7 @@ func TestAntiAffinityLockTTLHasAFloor(t *testing.T) {
 			pools := newAALockPools(nil)
 			deps := aaDepsLock(aaLockConfig("pool", false, tc.sec), newAAStub(), pools)
 			before := time.Now()
-			handle, err := acquireAntiAffinityLock(t.Context(), deps, aaIdent("web").hash(), 101)
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, haRulesLockKey, 101)
 			after := time.Now()
 			if err != nil {
 				t.Fatalf("acquire: %v", err)
@@ -390,7 +392,7 @@ func TestAntiAffinityLockOutlastsTheGraceAtShortTimeouts(t *testing.T) {
 		t.Run(fmt.Sprintf("cluster_lock_timeout_sec=%d", sec), func(t *testing.T) {
 			pools := newAALockPools(nil)
 			deps := aaDepsLock(aaLockConfig("pool", false, sec), newAAStub(), pools)
-			handle, err := acquireAntiAffinityLock(t.Context(), deps, aaIdent("web").hash(), 101)
+			handle, err := acquireAntiAffinityLock(t.Context(), deps, haRulesLockKey, 101)
 			if err != nil {
 				t.Fatalf("first acquire: %v", err)
 			}

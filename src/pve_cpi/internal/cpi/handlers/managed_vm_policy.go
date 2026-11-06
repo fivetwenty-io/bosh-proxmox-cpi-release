@@ -49,6 +49,9 @@ func (m *managedVMAllocation) observePolicyMutation(ctx context.Context, call Ma
 	if method == "Cluster.DeleteHaRules" {
 		return m.observeDeletedHARule(ctx, call)
 	}
+	if method == "Cluster.UpdateHaRules" {
+		return m.observeUpdatedHARule(ctx, call)
+	}
 	if method == "Cluster.CreateSdnVnetsSubnets" || method == "Cluster.UpdateSdn" {
 		return m.observeSDNMutation(ctx, call, step, result)
 	}

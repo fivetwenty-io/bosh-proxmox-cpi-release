@@ -148,15 +148,23 @@ func haOwnershipOf(comment, owner string) haOwnership {
 // PVE 9 or later on every node. Deps.HAProfile supplies the profile when it is
 // wired, and otherwise the gate probes the cluster itself.
 func haRuleWriteGate(ctx context.Context, deps Deps) error {
-	resolve := deps.HAProfile
-	if resolve == nil {
-		resolve = probeHAProfile(deps)
-	}
-	profile, err := resolve(ctx)
+	_, err := haRuleWriteProfile(ctx, deps)
+	return err
+}
+
+// haRuleWriteProfile resolves the request's HA profile and applies the PVE 9
+// rule-write gate to it, returning the profile the rule writer then plans
+// against. It runs before the rules lock, so a cluster probe never eats into
+// the lock's window.
+func haRuleWriteProfile(ctx context.Context, deps Deps) (*ha.Profile, error) {
+	profile, err := resolveHAProfile(ctx, deps)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return profile.RuleWriteGate()
+	if err := profile.RuleWriteGate(); err != nil {
+		return nil, err
+	}
+	return profile, nil
 }
 
 // probeHAProfile returns a resolver that probes the cluster deps targets for

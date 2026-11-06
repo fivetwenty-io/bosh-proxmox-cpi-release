@@ -63,9 +63,11 @@ func TestMigrationAbortsWhenOldRuleChangesBetweenReads(t *testing.T) {
 		aaQEMU(201, legacyTags(aaOtherDirector)),
 	)
 	// An older Director adds vm:202 to the shared rule after this create took
-	// its snapshot and before the migration reads the rule again.
+	// its snapshot and before the migration reads the rule again. The reads
+	// are the membership plan, its re-plan, the writer's check, the
+	// migration's snapshot, and the migration's re-read.
 	stub.beforeListRules = func(call int) {
-		if call == 2 {
+		if call == 5 {
 			stub.rules["bosh-aa-web"] += ",vm:202"
 		}
 	}
@@ -78,8 +80,9 @@ func TestMigrationAbortsWhenOldRuleChangesBetweenReads(t *testing.T) {
 	if got := stub.rules["bosh-aa-web"]; got != "vm:100,vm:101,vm:200,vm:201,vm:202" {
 		t.Errorf("old rule = %q; a rule that changed since the snapshot must be left as the other writer left it", got)
 	}
-	if stub.listRulesCalls != 2 {
-		t.Errorf("ListHaRules calls = %d; want the snapshot and one re-read", stub.listRulesCalls)
+	if stub.listRulesCalls != 5 {
+		t.Errorf("ListHaRules calls = %d; want the membership write's three, the snapshot, and one re-read",
+			stub.listRulesCalls)
 	}
 
 	// The next create of the group sees a stable rule and migrates it.
@@ -127,12 +130,15 @@ func TestMigrationHoldsTheOlderCPIsLockKey(t *testing.T) {
 			break
 		}
 	}
-	del, create, release := idx("delete-rule:bosh-aa-web"), idx("create-rule:bosh-aa-web"), idx("lock-delete:"+aaLegacyLock)
-	if acquire < 0 || reread < 0 || del < 0 || create < 0 || release < 0 {
+	update, release := idx("update-rule:bosh-aa-web"), idx("lock-delete:"+aaLegacyLock)
+	if acquire < 0 || reread < 0 || update < 0 || release < 0 {
 		t.Fatalf("the migration must take %s, re-read, rewrite, and release; events %v", aaLegacyLock, events)
 	}
-	if acquire >= reread || reread >= del || del >= create || create >= release {
-		t.Errorf("want acquire < re-read < delete < create < release; events %v", events)
+	if acquire >= reread || reread >= update || update >= release {
+		t.Errorf("want acquire < re-read < update < release; events %v", events)
+	}
+	if slices.Contains(events, "delete-rule:bosh-aa-web") || slices.Contains(events, "create-rule:bosh-aa-web") {
+		t.Errorf("the old rule must change in place, never by delete and create; events %v", events)
 	}
 	if hashedRelease := idx("lock-delete:" + aaLock); hashedRelease < release {
 		t.Errorf("the hashed lock must be held for the whole migration; events %v", events)
@@ -253,8 +259,9 @@ type haProbeCluster struct {
 
 func (c *haProbeCluster) ListStatus(context.Context) (*cluster.ListStatusResponse, error) {
 	resp := cluster.ListStatusResponse{
-		[]byte(`{"type":"cluster","name":"lab","quorate":1,"nodes":1}`),
+		[]byte(`{"type":"cluster","name":"lab","quorate":1,"nodes":2}`),
 		[]byte(`{"type":"node","name":"pve1","online":1,"local":1}`),
+		[]byte(`{"type":"node","name":"pve2","online":1}`),
 	}
 	return &resp, nil
 }
@@ -359,8 +366,10 @@ func TestHAProfileResolvedOnceThroughTheProbeForBothWriters(t *testing.T) {
 	if got := stub.rules[naRuleNameFor(101)]; got != "vm:101" {
 		t.Errorf("node-affinity rule = %q; want vm:101", got)
 	}
-	if nodesSvc.versionCalls != 1 {
-		t.Errorf("the profile was probed %d times; want once for the whole request", nodesSvc.versionCalls)
+	// One version read per online node, which is one probe for the request.
+	if nodesSvc.versionCalls != 2 {
+		t.Errorf("the profile read node versions %d times; want one probe of both nodes for the whole request",
+			nodesSvc.versionCalls)
 	}
 }
 
@@ -381,8 +390,8 @@ func TestHAProfileProbeRefusesBelowPVE9OnceForBothWriters(t *testing.T) {
 	if len(stub.rules) != 0 || len(stub.resources) != 0 {
 		t.Errorf("nothing may be written below PVE 9: rules %v resources %v", stub.rules, stub.resources)
 	}
-	if nodesSvc.versionCalls != 1 {
-		t.Errorf("the profile was probed %d times; want once", nodesSvc.versionCalls)
+	if nodesSvc.versionCalls != 2 {
+		t.Errorf("the profile read node versions %d times; want one probe of both nodes", nodesSvc.versionCalls)
 	}
 }
 

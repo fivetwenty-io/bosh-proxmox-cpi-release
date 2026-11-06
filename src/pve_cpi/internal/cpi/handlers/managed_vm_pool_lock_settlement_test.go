@@ -218,8 +218,9 @@ func TestVMPoolLockReleaseFailureSettlesAndCleansUp(t *testing.T) {
 // TestVMPoolSentinelCreateFailureSettlesAndCleansUp covers the anti-affinity
 // sentinel create that lost its answer after the VM landed. The record holds
 // observed steps and one planned CreatePool, which could have been the
-// deployment pool's ensure or the sentinel. Cleanup reads both the rebuilt
-// sentinel and the VMID probe, settles the step, and closes the record.
+// deployment pool's ensure, the rules lock, or the group's sentinel. Cleanup
+// reads the rules lock, the rebuilt group sentinel, and the VMID probe, settles
+// the step, and closes the record.
 func TestVMPoolSentinelCreateFailureSettlesAndCleansUp(t *testing.T) {
 	var planned string
 	deps, j, client, record := vmPoolStepRecord(t, groupExecution(ensureTestPool, vmPoolLockGroup), true, func(h *aj.Handle) {
@@ -228,17 +229,16 @@ func TestVMPoolSentinelCreateFailureSettlesAndCleansUp(t *testing.T) {
 	cleanupVMPoolRecord(t, deps, j, client, record, planned, true)
 	reads := client.log.names()
 	slices.Sort(reads)
-	if want := []string{vmPoolLockSentinel, "bosh-lock-vm-123"}; !slices.Equal(reads, want) {
+	if want := []string{"bosh-lock-aa-_rules", vmPoolLockSentinel, "bosh-lock-vm-123"}; !slices.Equal(reads, want) {
 		t.Fatalf("settlement read %v, want %v", reads, want)
 	}
 }
 
 // TestVMPoolStepWithoutAPoolSettlesOnTheVMIDProbe covers a VM that landed
 // under a record that resolved no deployment pool, so the record froze no
-// group either. Its planned
-// DeletePool can only have meant the sentinel of a group the record never
-// stored, and the only read settlement can make is the VMID probe, which shows
-// that PVE is answering exactly.
+// group either. Its planned DeletePool meant the rules lock or the sentinel of
+// a group the record never stored, so settlement reads the rules lock and the
+// VMID probe, which shows that PVE is answering exactly.
 func TestVMPoolStepWithoutAPoolSettlesOnTheVMIDProbe(t *testing.T) {
 	var planned string
 	deps, j, client, record := vmPoolStepRecord(t, groupExecution("", ""), true, func(h *aj.Handle) {
@@ -246,8 +246,10 @@ func TestVMPoolStepWithoutAPoolSettlesOnTheVMIDProbe(t *testing.T) {
 		planned = vmPoolStep(t, h, "DeletePool", false)
 	})
 	cleanupVMPoolRecord(t, deps, j, client, record, planned, true)
-	if reads := client.log.names(); !slices.Equal(reads, []string{"bosh-lock-vm-123"}) {
-		t.Fatalf("settlement read %v, want only the VMID probe", reads)
+	reads := client.log.names()
+	slices.Sort(reads)
+	if want := []string{"bosh-lock-aa-_rules", "bosh-lock-vm-123"}; !slices.Equal(reads, want) {
+		t.Fatalf("settlement read %v, want the rules lock and the VMID probe", reads)
 	}
 }
 

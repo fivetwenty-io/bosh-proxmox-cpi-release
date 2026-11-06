@@ -77,7 +77,7 @@ func (m *managedVMAllocation) beforeMutation(ctx context.Context, call ManagedAl
 		role = storageRoleEphemeral
 	case managedVMCallUpload:
 		role = storageRoleISO
-	case "QEMU.ResizeDisk", managedVMCallResize, managedVMCallAttach, managedVMCallDetach, managedVMCallStart, managedVMCallUpdateConfig, "Nodes.CreateQemuAgentExec", "Nodes.CreateQemuFirewallIpset", "Nodes.CreateQemuFirewallIpset2", "Nodes.CreateQemuFirewallRules", "Nodes.UpdateQemuFirewallOptions", "Cluster.CreateHaResources", "Cluster.UpdateHaResources", "Cluster.CreateHaRules", "Cluster.DeleteHaRules", "Cluster.CreateSdnVnetsSubnets", "Cluster.UpdateSdn", "Pool.AddVM", "Pool.MoveVMToPool", "Pool.CreatePool":
+	case "QEMU.ResizeDisk", managedVMCallResize, managedVMCallAttach, managedVMCallDetach, managedVMCallStart, managedVMCallUpdateConfig, "Nodes.CreateQemuAgentExec", "Nodes.CreateQemuFirewallIpset", "Nodes.CreateQemuFirewallIpset2", "Nodes.CreateQemuFirewallRules", "Nodes.UpdateQemuFirewallOptions", "Cluster.CreateHaResources", "Cluster.UpdateHaResources", "Cluster.CreateHaRules", "Cluster.UpdateHaRules", "Cluster.DeleteHaRules", "Cluster.CreateSdnVnetsSubnets", "Cluster.UpdateSdn", "Pool.AddVM", "Pool.MoveVMToPool", "Pool.CreatePool":
 	case "Pool.DeletePool":
 		// The anti-affinity lock releases its sentinel through this guard. No
 		// other pool may be deleted during a VM allocation, and that includes

@@ -15,7 +15,7 @@ type unknownHACleanupClient struct {
 
 func (c *unknownHACleanupClient) Cluster() cluster.Service { return c.ha }
 func TestCleanupUnknownHAWritePreservesOtherMembers(t *testing.T) {
-	for _, kind := range []string{"vm.Cluster.CreateHaResources", "vm.Cluster.UpdateHaResources", "vm.Cluster.CreateHaRules"} {
+	for _, kind := range []string{"vm.Cluster.CreateHaResources", "vm.Cluster.UpdateHaResources", "vm.Cluster.UpdateHaRules", "vm.Cluster.CreateHaRules"} {
 		t.Run(kind, func(t *testing.T) {
 			deps, j, base, record := deleteManagedFixture(t)
 			h, err := j.Acquire(t.Context(), record.ID)

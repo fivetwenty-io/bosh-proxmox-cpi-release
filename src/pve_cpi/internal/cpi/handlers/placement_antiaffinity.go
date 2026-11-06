@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
 	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
@@ -70,11 +74,13 @@ func haResourceSid(vmid int) string {
 
 // applyAntiAffinityMembership is the create_vm entry point for opt-in HA
 // anti-affinity. It is a no-op unless pve.ha.anti_affinity is "on" in a mode
-// that writes HA and the VM carries an instance-group name. Generic HA failures (HA unconfigured,
-// a transient rule-write hiccup) are logged non-fatally, preserving the §7.21
-// best-effort intent; a TypeRetriableCloud error (cluster-lock timeout or
-// read-after-write verify failure) is returned so the director re-drives rather
-// than silently dropping the VM from its spread rule.
+// that writes HA and the VM carries an instance-group name. Generic HA failures
+// (HA unconfigured, a transient rule-write hiccup) are logged non-fatally,
+// preserving the best-effort intent. An error propagateHARuleError names is
+// returned so the director re-drives rather than silently dropping the VM from
+// its spread rule: a retriable error (cluster-lock timeout, read-after-write
+// verify failure, rules that kept changing), a rule PVE left out of effect in
+// managed mode, or in managed mode a membership the feasibility checks refused.
 func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env map[string]any, logger *log.Logger) error {
 	if !deps.Config.HAAntiAffinityRulesEnabled() {
 		return nil
@@ -91,8 +97,7 @@ func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env m
 		return nil
 	}
 	if aaErr := ensureAntiAffinityMembership(ctx, deps, ident, vmid, logger); aaErr != nil {
-		if cpierrors.IsType(aaErr, cpierrors.TypeRetriableCloud) {
-			// Lock-timeout or verify-failure: propagate so the director re-drives.
+		if propagateHARuleError(deps, aaErr) {
 			return aaErr
 		}
 		logger.Warn("create_vm: HA anti-affinity membership not fully applied (non-fatal)",
@@ -103,42 +108,35 @@ func applyAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, env m
 
 // ensureAntiAffinityMembership registers the VM as a PVE HA resource and adds it
 // to the cluster-level negative resource-affinity rule for its BOSH instance
-// group, so PVE enforces spreading at the hypervisor level. It is best-effort:
-// every PVE failure (including "HA not configured on this cluster") is returned
-// for the caller to log as a warning, never to fail create_vm.
+// group, so PVE enforces spreading at the hypervisor level. Every PVE failure
+// (including "HA not configured on this cluster") is returned for the caller,
+// which logs it unless it must fail the call (propagateHARuleError).
 //
 // A negative resource-affinity rule is only meaningful with two or more members,
 // so the rule is materialized from the live set of same-group guests plus this
 // VM. When fewer than two members exist the rule is not created (and a stale
 // single-member rule, if any, is removed).
+//
+// The whole read, check, and write runs under the one cluster-scoped rules lock
+// when the cluster lock is enabled, and the rule writer changes members with a
+// PUT that carries the read's digest, so there is never a window without the
+// rule.
 func ensureAntiAffinityMembership(ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger) error {
 	if !ident.valid() {
 		return nil
 	}
-	groupKey := ident.hash()
 
 	// The version gate resolves the HA profile, which probes the whole
 	// cluster when nothing has resolved it yet. That runs before the lock so
 	// the probe never eats into the lock's window.
-	if err := haRuleWriteGate(ctx, deps); err != nil {
+	profile, err := haRuleWriteProfile(ctx, deps)
+	if err != nil {
 		return fmt.Errorf("anti-affinity: %w", err)
 	}
 
-	// When the cross-process cluster lock is enabled, serialize the entire
-	// read-modify-write on the shared bosh-aa-<hash12> rule against concurrent
-	// create_vm invocations on other hosts. The lock is keyed on the group so
-	// different instance groups never block each other. Acquire failure/timeout
-	// surfaces as a retriable error (the caller logs it best-effort, the director
-	// re-drives); the lock is always released on return, including on RMW error.
-	if deps.Config.ClusterLockEnabled() {
-		handle, lockErr := acquireAntiAffinityLock(ctx, deps, groupKey, vmid)
-		if lockErr != nil {
-			return lockErr
-		}
-		defer releaseAntiAffinityLock(ctx, handle, groupKey, logger)
-	}
-
-	return ensureAntiAffinityMembershipLocked(ctx, deps, ident, vmid, logger)
+	return withHARulesLock(ctx, deps, vmid, logger, func() error {
+		return ensureAntiAffinityMembershipLocked(ctx, deps, profile, ident, vmid, logger)
+	})
 }
 
 // releaseAntiAffinityLock releases an anti-affinity lock. The release is
@@ -155,12 +153,12 @@ func releaseAntiAffinityLock(ctx context.Context, handle *pve.ClusterLockHandle,
 	}
 }
 
-// acquireAntiAffinityLock acquires the per-group cross-process sentinel lock.
-// Separated so the lock plumbing (owner token, timeout/TTL from config) stays
-// out of the RMW body. groupKey is the group's hash, which names the rule the
-// lock protects, or the bare group name, which is the key an older CPI locks
-// its bosh-aa-<group> rule under.
-func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vmid int) (*pve.ClusterLockHandle, error) {
+// acquireAntiAffinityLock acquires a cross-process sentinel lock. Separated so
+// the lock plumbing (owner token, timeout/TTL from config) stays out of the RMW
+// body. key is haRulesLockKey, the one lock every CPI rule write holds, or the
+// bare group name, which is the key an older CPI locks its bosh-aa-<group>
+// rule under.
+func acquireAntiAffinityLock(ctx context.Context, deps Deps, key string, vmid int) (*pve.ClusterLockHandle, error) {
 	poolSvc := deps.PVE.Pools()
 	if poolSvc == nil {
 		// No pool service wired: cannot lock. Treat as retriable so the operator
@@ -178,24 +176,22 @@ func acquireAntiAffinityLock(ctx context.Context, deps Deps, groupKey string, vm
 	// seconds, and the wait stays the setting either way.
 	timeout := time.Duration(deps.Config.ClusterLockTimeoutSecValue()) * time.Second
 	ttl := max(2*timeout, antiAffinityLockMinTTL)
-	owner := clusterLockOwner(groupKey, vmid)
+	owner := clusterLockOwner(key, vmid)
 	// Two holders at once would place two instances of a group on one node,
 	// so this lock pays the grace pause on every create to narrow that.
-	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+groupKey, owner, ttl, timeout, pve.WithCreateGrace())
+	return pve.AcquireClusterLock(ctx, poolSvc, antiAffinityLockPrefix+key, owner, ttl, timeout, pve.WithCreateGrace())
 }
 
 // ensureAntiAffinityMembershipLocked is the read-modify-write body, run under
-// the cluster lock when enabled and after the PVE 9 gate has passed. It
-// registers the HA resource with the ownership marker, recomputes the member
-// set, and recreates the bosh-aa-<hash12> rule when membership changed. It then
-// moves this Director's members out of the group's unmarked rule from an older
-// CPI.
+// the rules lock when enabled and after the PVE 9 gate has passed. It registers
+// the HA resource with the ownership marker, plans the group's rules from the
+// scan and a fresh read, and lets the rule writer apply the plan. It then moves
+// this Director's members out of the group's unmarked rule from an older CPI.
 func ensureAntiAffinityMembershipLocked(
-	ctx context.Context, deps Deps, ident haIdentity, vmid int, logger *log.Logger,
+	ctx context.Context, deps Deps, profile *ha.Profile, ident haIdentity, vmid int, logger *log.Logger,
 ) error {
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
-	ruleName := ident.ruleName()
 	marker := ident.marker()
 
 	// 1. Register the VM as an HA resource (idempotent; "already defined" is fine).
@@ -209,99 +205,339 @@ func ensureAntiAffinityMembershipLocked(
 	// 2. Compute the full member set: existing same-group guests + this VM.
 	scan, scanErr := collectGroupMemberSids(ctx, deps, ident)
 	if scanErr != nil {
-		// Without the member set we cannot safely recreate the rule. Warn and stop.
+		// Without the member set we cannot safely write the rule. Warn and stop.
 		return fmt.Errorf("anti-affinity: scan group members: %w", scanErr)
 	}
-	members, live, liveComplete := scan.members, scan.live, scan.liveComplete
-	members[sid] = struct{}{}
 
-	// 3. Locate any existing rule for this group. A rule under our hashed name
-	// that does not carry our marker is not ours to rewrite.
-	rules, listErr := listHaRules(ctx, svc)
-	if listErr != nil {
-		return fmt.Errorf("anti-affinity: list HA rules: %w", listErr)
+	// 3. Plan and write the group's rules.
+	planner := &aaPlanner{
+		ident: ident, sid: sid, scan: scan, logger: logger,
+		nodes:     len(profileNodeNames(profile)),
+		placeable: placeableNodeCount(profile),
+		split:     deps.Config.HAAntiAffinityOverflowValue() == config.HAOverflowSplit,
 	}
-	existing := ruleByName(rules, ruleName)
-	if existing != nil && haOwnershipOf(existing.Comment, ident.Owner) != haOwnedByUs {
-		return fmt.Errorf("anti-affinity: rule %q exists without this Director's ownership marker; leaving it alone", ruleName)
+	writer := newHARuleWriter(deps, profile, logger)
+	res, err := writer.Apply(ctx, "anti-affinity", planner.plan)
+	if err != nil {
+		return err
 	}
-
-	// This ensure path only ever grows a rule: union the existing rule's
-	// members into the freshly scanned set instead of replacing them. However
-	// authoritative the scan, its TAG view can still trail reality (a
-	// same-group twin mid-create has no tag yet), and the delete path
-	// (removeAntiAffinityMembership) is the sole authority for shrinking, so
-	// a smaller scan here must never drop members another create registered.
-	// The one exception is a sid whose GUEST no longer exists anywhere in the
-	// fleet (destroyed outside the CPI, or a failed delete_vm HA cleanup):
-	// the enumeration in hand is authoritative for existence, and recreating
-	// the rule around a dangling sid would name a resource PVE no longer
-	// has, wedging every later create in the group. That drop is gated on
-	// liveComplete: when the enumeration excluded offline members, a sid
-	// missing from live may simply sit on an unenumerated node, and dropping
-	// it would silently void the spread guarantee for the reboot window, so
-	// every inherited sid is kept instead.
-	if existing != nil {
-		for s := range parseHaResources(existing.Resources) {
-			if _, ok := live[s]; !ok && liveComplete {
-				logger.Info("anti-affinity: dropping rule member with no live guest",
-					log.String("rule", ruleName), log.String("sid", s))
-				continue
-			}
-			members[s] = struct{}{}
-		}
-	}
-
-	// Fewer than two members: a negative-affinity rule is meaningless. Remove a
-	// stale rule if one survived from an earlier larger membership.
-	if len(members) < 2 {
-		if existing != nil {
-			if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
-				return fmt.Errorf("anti-affinity: delete single-member rule %q: %w", ruleName, err)
-			}
-		}
-		logger.Debug("anti-affinity: fewer than two group members; no HA rule needed",
-			log.String("rule", ruleName), log.Int("members", len(members)))
-		return nil
-	}
-
-	csv := sidsCSV(members)
-
-	switch {
-	case existing == nil:
-		// 4a. No rule yet: create it.
-		if err := createNegativeRule(ctx, svc, ruleName, csv, marker); err != nil {
-			return err
-		}
-	case !sameSidSet(existing.Resources, members):
-		// 4b. Rule exists: recreate only when the membership actually changed
-		// (PVE has no partial-edit for rules; recreate = delete + create).
-		if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
-			return fmt.Errorf("anti-affinity: delete rule %q for recreate: %w", ruleName, err)
-		}
-		if err := createNegativeRule(ctx, svc, ruleName, csv, marker); err != nil {
-			return err
-		}
-	}
-	if existing == nil || !sameSidSet(existing.Resources, members) {
-		if err := verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger); err != nil {
+	if planner.placedIn != "" && len(res.Wrote) > 0 {
+		if err := verifyAntiAffinityMember(ctx, deps, planner.placedIn, sid, logger); err != nil {
 			return err
 		}
 	}
 
-	// 5. The hashed rule now holds every member, so the unmarked rule from an
-	// older CPI can give up the ones that are ours.
-	return migrateLegacyAntiAffinityRule(ctx, deps, rules, ident, scan.legacy, vmid, logger)
+	// 4. The unmarked rule from an older CPI gives up the members of ours that
+	// the hashed rules now hold. A member the overflow or the placeable cap left
+	// out keeps the old rule's protection.
+	return migrateLegacyAntiAffinityRule(ctx, deps, writer, ident, heldByChunks(res.Set, ident, scan.legacy), vmid,
+		logger)
 }
 
-// ruleByName returns the entry named name, or nil.
-func ruleByName(rules []haRuleEntry, name string) *haRuleEntry {
-	for i := range rules {
-		if rules[i].Rule == name {
-			return &rules[i]
+// aaPlanner plans a group's negative rules from the member scan and a read of
+// the rules. It is called again after every write with a fresh read, so it
+// returns no writes once the rules hold the plan.
+//
+// A group's rule is bosh-aa-<hash12>. With pve.ha.anti_affinity_overflow
+// split, a group with more members than the cluster's configured nodes spills
+// into bosh-aa-<hash12>-2, -3, and so on, because PVE disables a negative rule
+// with more members than configured nodes. With skip, the default, such a group
+// gets no rule written, and the reason is logged. Either way a member joins a
+// rule only while that rule has fewer members than placeable nodes, so a node in
+// maintenance never makes the CPI rewrite a rule, and a replacement member waits
+// until it can be placed apart. Existing members keep their rule.
+type aaPlanner struct {
+	ident     haIdentity
+	sid       string
+	scan      *groupScan
+	logger    *log.Logger
+	nodes     int
+	placeable int
+	split     bool
+
+	// placedIn is the rule this VM is in after the last plan, or "".
+	placedIn string
+	logged   bool
+}
+
+// aaChunkName names a group's n-th rule, the first being the bare name.
+func aaChunkName(base string, n int) string {
+	if n <= 1 {
+		return base
+	}
+	return base + "-" + strconv.Itoa(n)
+}
+
+// aaChunkIndex returns n when id is the group's n-th rule.
+func aaChunkIndex(base, id string) (int, bool) {
+	if id == base {
+		return 1, true
+	}
+	rest, ok := strings.CutPrefix(id, base+"-")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 2 || strconv.Itoa(n) != rest {
+		return 0, false
+	}
+	return n, true
+}
+
+func (p *aaPlanner) plan(set *ha.RuleSet) ([]ha.RuleOp, error) {
+	p.placedIn = ""
+	existing, maxIndex, err := p.existingChunks(set)
+	if err != nil {
+		return nil, err
+	}
+	desired, assigned := p.keptMembers(existing, maxIndex)
+	if p.skipOversized(assigned) {
+		return nil, nil
+	}
+	maxIndex = p.assignPending(desired, assigned, maxIndex)
+	return p.chunkOps(set, existing, desired, maxIndex), nil
+}
+
+// skipOversized reports whether skip mode leaves the group's rules alone,
+// because the group has more members than the cluster's configured nodes. PVE
+// disables a negative rule that large, so skip writes no rule: a new group gets
+// none, and an existing rule keeps the members it has. Split mode, and a cluster
+// whose configured nodes are unknown, never skip.
+func (p *aaPlanner) skipOversized(assigned map[string]bool) bool {
+	if p.split || p.nodes <= 0 {
+		return false
+	}
+	total := len(assigned)
+	if !assigned[p.sid] {
+		total++
+	}
+	for s := range p.scan.members {
+		if s != p.sid && !assigned[s] {
+			total++
 		}
 	}
-	return nil
+	if total <= p.nodes {
+		return false
+	}
+	if !p.logged {
+		p.logged = true
+		p.logger.Warn("anti-affinity: this group has more instances than the cluster has nodes, so no rule is "+
+			"written for it (pve.ha.anti_affinity_overflow is skip; split divides the group into rules that fit)",
+			log.String("rule", p.ident.ruleName()), log.String("sid", p.sid), log.Int("members", total),
+			log.Int("configured_nodes", p.nodes), log.String("overflow", config.HAOverflowSkip))
+	}
+	return true
+}
+
+// heldByChunks returns the sids of mine that one of the group's hashed rules
+// holds in set.
+func heldByChunks(set *ha.RuleSet, ident haIdentity, mine map[string]struct{}) map[string]struct{} {
+	if len(mine) == 0 || set == nil {
+		return nil
+	}
+	base := ident.ruleName()
+	out := map[string]struct{}{}
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		if _, ok := aaChunkIndex(base, r.ID); !ok || r.Disabled {
+			continue
+		}
+		for _, sid := range r.Resources {
+			if _, ok := mine[sid]; ok {
+				out[sid] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// existingChunks returns the group's rules keyed by chunk index, and the
+// highest index. A rule under our hashed name that does not carry our marker is
+// not ours to rewrite, so it fails the plan.
+func (p *aaPlanner) existingChunks(set *ha.RuleSet) (map[int]*ha.Rule, int, error) {
+	base := p.ident.ruleName()
+	existing := map[int]*ha.Rule{}
+	maxIndex := 0
+	for i := range set.Rules {
+		r := &set.Rules[i]
+		n, ok := aaChunkIndex(base, r.ID)
+		if !ok {
+			continue
+		}
+		if haOwnershipOf(r.Comment, p.ident.Owner) != haOwnedByUs || r.Type != haRuleType {
+			return nil, 0, fmt.Errorf("anti-affinity: rule %q exists without this Director's ownership marker; "+
+				"leaving it alone", r.ID)
+		}
+		existing[n] = r
+		maxIndex = max(maxIndex, n)
+	}
+	return existing, maxIndex, nil
+}
+
+// keptMembers returns the members each existing rule keeps.
+//
+// This ensure path only ever grows a rule: the existing members stay, whatever
+// the scan says. However authoritative the scan, its TAG view can still trail
+// reality (a same-group twin mid-create has no tag yet), and the delete path
+// (removeAntiAffinityMembership) is the sole authority for shrinking. The one
+// exception is a sid whose GUEST no longer exists anywhere in the fleet, which
+// is dropped only when the enumeration covered every member (liveComplete),
+// because a rule around a dangling sid would name a resource PVE no longer has
+// and wedge every later create.
+func (p *aaPlanner) keptMembers(existing map[int]*ha.Rule, maxIndex int) (map[int][]string, map[string]bool) {
+	desired := map[int][]string{}
+	assigned := map[string]bool{}
+	for n := 1; n <= maxIndex; n++ {
+		r := existing[n]
+		if r == nil {
+			continue
+		}
+		for _, s := range r.Resources {
+			if _, ok := p.scan.live[s]; !ok && p.scan.liveComplete {
+				p.logger.Info("anti-affinity: dropping rule member with no live guest",
+					log.String("rule", r.ID), log.String("sid", s))
+				continue
+			}
+			if assigned[s] {
+				continue
+			}
+			assigned[s] = true
+			desired[n] = append(desired[n], s)
+		}
+	}
+	return desired, assigned
+}
+
+// assignPending places this VM and every scanned member not yet in a rule into
+// the first rule with room, opening a new rule in split mode (or when the group
+// has none), and returns the new highest index. A rule has room while it holds
+// fewer members than the configured nodes and the placeable nodes.
+func (p *aaPlanner) assignPending(desired map[int][]string, assigned map[string]bool, maxIndex int) int {
+	pending := map[string]struct{}{p.sid: {}}
+	for s := range p.scan.members {
+		pending[s] = struct{}{}
+	}
+	room := p.nodes
+	if room <= 0 {
+		room = math.MaxInt
+	}
+	if p.placeable > 0 {
+		room = min(room, p.placeable)
+	}
+	for _, s := range strings.Split(sidsCSV(pending), ",") {
+		if s == "" || assigned[s] {
+			continue
+		}
+		target := 0
+		for n := 1; n <= maxIndex; n++ {
+			if len(desired[n]) < room {
+				target = n
+				break
+			}
+		}
+		if target == 0 && (p.split || maxIndex == 0) {
+			maxIndex++
+			target = maxIndex
+		}
+		if target == 0 || len(desired[target]) >= room {
+			p.logOverflow(s, len(desired[1]))
+			continue
+		}
+		assigned[s] = true
+		desired[target] = append(desired[target], s)
+	}
+	return maxIndex
+}
+
+// chunkOps returns the writes that make the group's rules hold desired, led by
+// the pin flattening their members need, or nil when the rules already do.
+func (p *aaPlanner) chunkOps(set *ha.RuleSet, existing map[int]*ha.Rule, desired map[int][]string,
+	maxIndex int) []ha.RuleOp {
+	base := p.ident.ruleName()
+	var pins, ops []ha.RuleOp
+	for n := 1; n <= maxIndex; n++ {
+		name := aaChunkName(base, n)
+		members := desired[n]
+		sort.Strings(members)
+		cur := existing[n]
+		if len(members) < 2 {
+			// A negative rule is meaningless below two members: remove a
+			// stale one left from an earlier, larger membership.
+			if cur != nil {
+				ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}})
+			}
+			continue
+		}
+		if slices.Contains(members, p.sid) {
+			p.placedIn = name
+		}
+		pins = append(pins, flattenMemberPins(set, members, p.ident.Owner)...)
+		want := ha.Rule{ID: name, Type: haRuleType, Affinity: haRuleAffinity, Resources: members,
+			Comment: p.ident.marker()}
+		switch {
+		case cur == nil:
+			ops = append(ops, ha.RuleOp{Kind: ha.OpCreate, Rule: want})
+		case !slices.Equal(cur.Resources, members) || cur.Affinity != haRuleAffinity:
+			next := cur.Clone()
+			next.Resources, next.Affinity, next.Errors = members, haRuleAffinity, nil
+			ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
+		}
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	return append(pins, ops...)
+}
+
+// logOverflow says once per plan why a member stays out of every rule: in
+// split mode, or when the configured nodes are unknown, only because the
+// cluster has fewer placeable nodes than the group has members.
+func (p *aaPlanner) logOverflow(sid string, size int) {
+	if p.logged {
+		return
+	}
+	p.logged = true
+	mode := config.HAOverflowSkip
+	if p.split {
+		mode = config.HAOverflowSplit
+	}
+	p.logger.Warn("anti-affinity: member left out of the group's rules, because the cluster has fewer placeable "+
+		"nodes than the group has members; a later create adds it once it can be placed apart from every other "+
+		"member",
+		log.String("sid", sid), log.String("rule", p.ident.ruleName()), log.Int("members", size),
+		log.Int("configured_nodes", p.nodes), log.Int("placeable_nodes", p.placeable),
+		log.String("overflow", mode))
+}
+
+// flattenMemberPins returns the writes that give every member's CPI pin a
+// single priority. PVE refuses a node-affinity rule with several priorities
+// for a resource that is in a resource-affinity rule, so the pins go flat
+// before the member joins. A pin that carries another Director's marker is
+// left, and the feasibility checks then refuse the membership.
+func flattenMemberPins(set *ha.RuleSet, members []string, owner string) []ha.RuleOp {
+	var ops []ha.RuleOp
+	for _, s := range members {
+		vmid, ok := vmidFromSid(s)
+		if !ok {
+			continue
+		}
+		pin := set.Find(naRuleNameFor(vmid))
+		if pin == nil || !pin.MultiplePriorities() || haOwnershipOf(pin.Comment, owner) == haOwnedByOther {
+			continue
+		}
+		ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: *ha.Flattened(pin)})
+	}
+	return ops
+}
+
+// vmidFromSid parses vm:<vmid>.
+func vmidFromSid(sid string) (int, bool) {
+	rest, ok := strings.CutPrefix(sid, "vm:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(rest)
+	return n, err == nil && n > 0
 }
 
 // legacyRuleName is the name an older CPI gave the group's rule, bosh-aa-<group>.
@@ -316,17 +552,17 @@ func legacyRuleName(ident haIdentity) string {
 // that carries a marker is never touched. This migration runs for one release,
 // and after that the CPI ignores unmarked rules.
 //
-// The old rule is rewritten by delete and create, so a member another writer
-// adds in between would be lost. An older CPI guards the rule with the lock
-// keyed on the bare group name, not the hashed key this create holds, so when
-// the cluster lock is enabled the migration also holds that key for its whole
-// run. It then reads the old rule again and goes ahead only when its comment
-// and members still match the snapshot in rules. When they differ, or the lock
-// is busy, it writes nothing, and a later create of the group retries. When
-// fewer than two members would remain, the rule no longer spreads anything, so
-// it is deleted and nothing is created in its place.
+// An older CPI rewrites the rule by delete and create under the lock keyed on
+// the bare group name, not the rules lock this create holds, so when the
+// cluster lock is enabled the migration also holds that key for its whole run,
+// inside the rules lock. It snapshots the old rule, takes the key, and writes
+// only when a fresh read still shows the snapshot's comment and members. When
+// they differ, or the lock is busy, it writes nothing, and a later create of
+// the group retries. The remaining members are written with a PUT under the
+// read's digest. When fewer than two would remain, the rule no longer spreads
+// anything, so it is deleted and nothing is created in its place.
 func migrateLegacyAntiAffinityRule(
-	ctx context.Context, deps Deps, rules []haRuleEntry, ident haIdentity,
+	ctx context.Context, deps Deps, writer *ha.RuleWriter, ident haIdentity,
 	mine map[string]struct{}, vmid int, logger *log.Logger,
 ) error {
 	if len(mine) == 0 {
@@ -336,7 +572,11 @@ func migrateLegacyAntiAffinityRule(
 	if name == ident.ruleName() {
 		return nil
 	}
-	old := ruleByName(rules, name)
+	svc := deps.PVE.Cluster()
+	old, err := findHaRule(ctx, svc, name)
+	if err != nil {
+		return fmt.Errorf("anti-affinity: read unmarked rule %q for migration: %w", name, err)
+	}
 	if old == nil || haOwnershipOf(old.Comment, ident.Owner) != haUnmarked {
 		return nil
 	}
@@ -356,34 +596,56 @@ func migrateLegacyAntiAffinityRule(
 		defer releaseAntiAffinityLock(ctx, handle, ident.Group, logger)
 	}
 
-	svc := deps.PVE.Cluster()
-	fresh, err := findHaRule(ctx, svc, name)
-	if err != nil {
-		return fmt.Errorf("anti-affinity: re-read unmarked rule %q for migration: %w", name, err)
-	}
-	if fresh == nil {
-		return nil
-	}
-	if fresh.Comment != old.Comment || !sameSidSet(fresh.Resources, snapshot) {
-		logger.Warn("anti-affinity: unmarked rule changed while this create read it; migration aborted, "+
-			"and a later create of the group retries",
-			log.String("rule", name), log.String("read", sidsCSV(snapshot)),
-			log.String("now", sidsCSV(parseHaResources(fresh.Resources))))
-		return nil
-	}
-
-	if err := svc.DeleteHaRules(ctx, name); err != nil && !isHaNotFound(err) {
-		return fmt.Errorf("anti-affinity: delete unmarked rule %q for migration: %w", name, err)
-	}
-	if len(remaining) >= 2 {
-		if err := createNegativeRule(ctx, svc, name, sidsCSV(remaining), old.Comment); err != nil {
-			return err
+	aborted := false
+	res, err := writer.Apply(ctx, "anti-affinity migration", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+		fresh := set.Find(name)
+		switch {
+		case fresh == nil:
+			// Gone: deleted by this migration's own write, or by someone else.
+			return nil, nil
+		case fresh.Comment == old.Comment && len(remaining) >= 2 && sameSidSlice(fresh.Resources, remaining):
+			// This migration's PUT has landed.
+			return nil, nil
+		case fresh.Comment != old.Comment || !sameSidSlice(fresh.Resources, snapshot):
+			aborted = true
+			return nil, nil
 		}
+		aborted = false
+		if len(remaining) < 2 {
+			return []ha.RuleOp{{Kind: ha.OpDelete, Rule: ha.Rule{ID: name}}}, nil
+		}
+		next := fresh.Clone()
+		next.Resources = strings.Split(sidsCSV(remaining), ",")
+		next.Errors = nil
+		return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: next}}, nil
+	})
+	if err != nil {
+		return fmt.Errorf("anti-affinity: migrate unmarked rule %q: %w", name, err)
+	}
+	if len(res.Wrote) == 0 {
+		if aborted {
+			logger.Warn("anti-affinity: unmarked rule changed while this create read it; migration aborted, "+
+				"and a later create of the group retries", log.String("rule", name), log.String("read", sidsCSV(snapshot)))
+		}
+		return nil
 	}
 	logger.Info("anti-affinity: moved this Director's members out of an unmarked rule",
 		log.String("from", name), log.String("to", ident.ruleName()),
 		log.Int("moved", moved), log.Int("left", len(remaining)), log.Bool("old_rule_kept", len(remaining) >= 2))
 	return nil
+}
+
+// sameSidSlice reports whether have holds exactly the sids in want.
+func sameSidSlice(have []string, want map[string]struct{}) bool {
+	if len(have) != len(want) {
+		return false
+	}
+	for _, s := range have {
+		if _, ok := want[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // splitLegacyMembers splits an old rule's members into the ones that stay,
@@ -443,53 +705,56 @@ func verifyAntiAffinityMember(ctx context.Context, deps Deps, ruleName, sid stri
 // delete_vm has no access to env.bosh (the group name is unknown at delete
 // time): it scans every bosh-aa-* rule for the VM's sid. It edits only a rule
 // that carries this Director's marker, or an unmarked rule from an older CPI,
-// and leaves a rule that names another Director alone. All failures are
-// returned for the caller to log; cleanup never blocks VM deletion.
+// and leaves a rule that names another Director alone. The rules change under
+// the rules lock, with a PUT that carries the read's digest, and a rule left
+// with fewer than two members is deleted. The HA resource is deregistered even
+// when the rule writes fail, because its purge also takes the sid out of every
+// rule. All failures are returned for the caller to log; cleanup never blocks
+// VM deletion.
 func removeAntiAffinityMembership(ctx context.Context, deps Deps, vmid int, logger *log.Logger) error {
 	svc := deps.PVE.Cluster()
 	sid := haResourceSid(vmid)
 	owner := deps.RequestDirectorUUID
 
-	rules, listErr := listHaRules(ctx, svc)
-	if listErr != nil {
-		return fmt.Errorf("anti-affinity: list HA rules for cleanup: %w", listErr)
-	}
-
-	var firstErr error
-	for i := range rules {
-		r := rules[i]
-		if !strings.HasPrefix(r.Rule, haRuleNamePrefix) || r.Type != "" && r.Type != haRuleType {
-			continue
-		}
-		if haOwnershipOf(r.Comment, owner) == haOwnedByOther {
-			continue
-		}
-		sids := parseHaResources(r.Resources)
-		if _, member := sids[sid]; !member {
-			continue
-		}
-		delete(sids, sid)
-		if len(sids) < 2 {
-			// Empty or now single-member: the rule no longer spreads anything.
-			if err := svc.DeleteHaRules(ctx, r.Rule); err != nil && !isHaNotFound(err) && firstErr == nil {
-				firstErr = fmt.Errorf("anti-affinity: delete rule %q: %w", r.Rule, err)
+	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+		// No profile: a removal only shrinks rules, so the writer leaves the
+		// feasibility checks to PVE and the cleanup never probes the cluster.
+		writer := newHARuleWriter(deps, nil, logger)
+		_, err := writer.Apply(ctx, "anti-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			var ops []ha.RuleOp
+			for i := range set.Rules {
+				r := &set.Rules[i]
+				if !strings.HasPrefix(r.ID, haRuleNamePrefix) || r.Type != "" && r.Type != haRuleType {
+					continue
+				}
+				if haOwnershipOf(r.Comment, owner) == haOwnedByOther || !r.HasResource(sid) {
+					continue
+				}
+				rest := make([]string, 0, len(r.Resources))
+				for _, s := range r.Resources {
+					if s != sid {
+						rest = append(rest, s)
+					}
+				}
+				if len(rest) < 2 {
+					// Empty or now single-member: the rule no longer spreads anything.
+					ops = append(ops, ha.RuleOp{Kind: ha.OpDelete, Rule: ha.Rule{ID: r.ID}})
+					continue
+				}
+				next := r.Clone()
+				next.Resources, next.Errors = rest, nil
+				ops = append(ops, ha.RuleOp{Kind: ha.OpUpdate, Rule: next})
 			}
-			continue
-		}
-		// Recreate with the remaining members and the same comment.
-		if err := svc.DeleteHaRules(ctx, r.Rule); err != nil && !isHaNotFound(err) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("anti-affinity: delete rule %q for recreate: %w", r.Rule, err)
-			}
-			continue
-		}
-		if err := createNegativeRule(ctx, svc, r.Rule, sidsCSV(sids), r.Comment); err != nil && firstErr == nil {
-			firstErr = err
-		}
+			return ops, nil
+		})
+		return err
+	})
+	if err != nil {
+		err = fmt.Errorf("anti-affinity: remove %s from its rules: %w", sid, err)
 	}
 
 	deregisterHaResource(ctx, svc, sid, owner, logger)
-	return firstErr
+	return err
 }
 
 // deregisterHaResource purges the VM's HA resource, which also removes it from
@@ -518,25 +783,6 @@ func deregisterHaResource(ctx context.Context, svc cluster.Service, sid, owner s
 				log.String("sid", sid), log.Err(err))
 		}
 	}
-}
-
-// createNegativeRule creates a negative resource-affinity rule that keeps the
-// rule members on different nodes. PVE 9 accepts only affinity, comment,
-// disable, and resources on a resource-affinity rule, so no strict flag is sent.
-// comment is the ownership marker, or the old comment when an unmarked rule is
-// rewritten.
-func createNegativeRule(ctx context.Context, svc cluster.Service, ruleName, csv, comment string) error {
-	affinity := haRuleAffinity
-	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
-		Rule:      ruleName,
-		Type:      haRuleType,
-		Affinity:  &affinity,
-		Resources: csv,
-		Comment:   &comment,
-	}); err != nil {
-		return fmt.Errorf("anti-affinity: create rule %q: %w", ruleName, err)
-	}
-	return nil
 }
 
 // groupScan is what collectGroupMemberSids learns from the fleet.
@@ -714,20 +960,6 @@ func sidsCSV(sids map[string]struct{}) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ",")
-}
-
-// sameSidSet reports whether the rule's existing resources equal want.
-func sameSidSet(existing json.RawMessage, want map[string]struct{}) bool {
-	have := parseHaResources(existing)
-	if len(have) != len(want) {
-		return false
-	}
-	for k := range want {
-		if _, ok := have[k]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // tagsContain reports whether the PVE tags field contains an exact match for

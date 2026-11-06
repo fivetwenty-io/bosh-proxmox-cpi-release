@@ -725,3 +725,17 @@ func TestHAServiceState_SourceFailuresAreUnknownNotErrors(t *testing.T) {
 		}
 	})
 }
+
+func TestHAServiceState_CarriesTheClockAndRoundStamps(t *testing.T) {
+	t.Parallel()
+	st, _ := haRead(t, newHAScene("started").cluster(), pve.HADecisionLive)
+	if st.EntryTime != nhNow || st.CRMStamp != nhNow-5 || st.LRMStamp != nhNow-2 {
+		t.Fatalf("stamps entry=%d crm=%d lrm=%d", st.EntryTime, st.CRMStamp, st.LRMStamp)
+	}
+	scene := newHAScene("started")
+	delete(scene.lrm, "pve2")
+	st, _ = haRead(t, scene.cluster(), pve.HADecisionLive)
+	if st.LRMStamp != 0 || st.LRMFresh {
+		t.Fatalf("a node without an LRM entry carries a stamp: %+v", st)
+	}
+}

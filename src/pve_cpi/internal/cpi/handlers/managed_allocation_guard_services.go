@@ -492,6 +492,17 @@ func (t *managedClusterService) CreateHaRules(ctx context.Context, params *clust
 	err = t.guard.finish(ctx, m, token, nil, err)
 	return
 }
+func (t *managedClusterService) UpdateHaRules(ctx context.Context, rule string, params *cluster.UpdateHaRulesParams) (err error) {
+	m := ManagedAllocationMutation{Service: managedServiceCluster, Method: "UpdateHaRules", Args: map[string]any{"rule": rule, managedArgumentParams: params}}
+	token, err := t.guard.begin(ctx, m)
+	if err != nil {
+		return
+	}
+	defer t.guard.end(ctx, m, token)
+	err = t.Service.UpdateHaRules(ctx, rule, params)
+	err = t.guard.finish(ctx, m, token, nil, err)
+	return
+}
 func (t *managedClusterService) DeleteHaRules(ctx context.Context, rule string) (err error) {
 	m := ManagedAllocationMutation{Service: managedServiceCluster, Method: "DeleteHaRules", Args: map[string]any{"rule": rule}}
 	token, err := t.guard.begin(ctx, m)

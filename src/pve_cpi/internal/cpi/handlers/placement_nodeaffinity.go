@@ -9,8 +9,9 @@ import (
 	"strings"
 
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/config"
-	cpierrors "github.com/fivetwenty-io/bosh-proxmox-cpi/internal/errors"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/ha"
 	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/log"
+	"github.com/fivetwenty-io/bosh-proxmox-cpi/internal/pve"
 	"github.com/fivetwenty-io/proxmox-apiclient-go/v3/pkg/api/cluster"
 )
 
@@ -35,10 +36,16 @@ func naRuleNameFor(vmid int) string {
 // strict pin targets a single-node AZ (see warnSingleNodeAZPin), and logs any
 // pin failure without failing create_vm. A no-op when pinning is disabled.
 //
-// Selective propagation: a TypeRetriableCloud error (lock-timeout, verify
-// failure) is returned so the director re-drives rather than silently losing the
-// AZ pin guarantee. Generic HA-API failures (HA unconfigured, rule-write hiccup)
-// are logged as warnings and do not fail create_vm, preserving the §7.21 intent.
+// Selective propagation: an error propagateHARuleError names (lock-timeout,
+// verify failure, and in managed mode a pin that is not in effect or that the
+// feasibility checks refused) is returned so the director re-drives rather than
+// silently losing the AZ pin guarantee. Generic HA-API failures (HA
+// unconfigured, rule-write hiccup) are logged as warnings and do not fail
+// create_vm, preserving the best-effort intent.
+//
+// The AZ pin is written into the VM's one merged pin, bosh-na-<vmid>, with the
+// placed node at the highest priority. When no AZ resolves, the VM still gets
+// the placed-node pin that ha-rebalance-on-start needs (ensureRebalancePin).
 func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger) error {
 	if !deps.Config.HANodeAffinityPinEnabled() {
 		return nil
@@ -66,6 +73,15 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 			"into every VM in that AZ (a VM pinned to a node "+
 			"outside its requested AZ by target_node, a local-disk pin, or the config.node fallback reaches here too)",
 			log.Int(metadataKeyVMID, vmid), log.String("node", node))
+		// A VM with no AZ still keeps the node the CPI chose when the CRM
+		// would otherwise rebalance it at start.
+		if pinErr := ensureRebalancePin(ctx, deps, vmid, cp, node, logger); pinErr != nil {
+			if propagateHARuleError(deps, pinErr) {
+				return pinErr
+			}
+			logger.Warn("create_vm: HA placed-node pin not applied (non-fatal)",
+				log.Int(metadataKeyVMID, vmid), log.String("node", node), log.Err(pinErr))
+		}
 		return nil
 	}
 	azNodes, ok := deps.Config.AZCandidates(az)
@@ -74,9 +90,16 @@ func applyAZNodeAffinityPin(ctx context.Context, deps Deps, vmid int, cp createV
 	}
 	strict := deps.Config.HAPinAZStrictValue()
 	warnSingleNodeAZPin(az, azNodes, strict, logger)
-	if pinErr := ensureNodeAffinityPin(ctx, deps, vmid, azNodes, strict, logger); pinErr != nil {
-		if cpierrors.IsType(pinErr, cpierrors.TypeRetriableCloud) {
-			// Lock-timeout or verify-failure: propagate so the director re-drives.
+	req := pinRequest{Placed: node, Register: true}
+	if strict {
+		req.Hard = azNodes
+	} else {
+		req.Preferred = azNodes
+	}
+	if pinErr := ensureMergedPin(ctx, deps, vmid, req, logger); pinErr != nil {
+		if propagateHARuleError(deps, pinErr) {
+			// Lock-timeout, verify failure, or a managed-mode pin that is not in
+			// effect: propagate so the director re-drives.
 			return pinErr
 		}
 		logger.Warn("create_vm: HA node-affinity pin not fully applied (non-fatal)",
@@ -139,13 +162,14 @@ func warnSingleNodeAZPin(az string, azNodes []string, strict bool, logger *log.L
 		log.String("az", az), log.String("nodes", nodesCSV), log.Int("pinned_node_count", len(nodes)))
 }
 
-// ensureNodeAffinityPin writes a PVE HA node-affinity rule binding the VM to the
-// AZ node set, so the AZ placement chosen at scoring survives HA failover and
-// DLB rebalance. It is per-VM (one rule named bosh-na-<vmid>), so no membership
-// scan is needed. strict selects a hard pin (HA will not relocate off the node
-// set) versus a preferred pin. It is best-effort: every PVE failure (including
-// "HA not configured") is returned for the caller to log, never to fail
-// create_vm. azNodes empty is a no-op.
+// ensureNodeAffinityPin writes the node constraint azNodes into the VM's merged
+// PVE HA node-affinity pin, bosh-na-<vmid>, so the placement chosen at scoring
+// survives HA failover and DLB rebalance. strict makes azNodes a hard
+// constraint, which confines the VM to them, and otherwise they are preferred
+// nodes, which only add priority. A single node is also taken as the placed
+// node. It is best-effort: every PVE failure (including "HA not configured") is
+// returned for the caller to log, never to fail create_vm. azNodes empty is a
+// no-op. See ensureMergedPin for how the pin merges with one already written.
 func ensureNodeAffinityPin(
 	ctx context.Context, deps Deps, vmid int, azNodes []string, strict bool, logger *log.Logger,
 ) error {
@@ -153,8 +177,57 @@ func ensureNodeAffinityPin(
 	if nodesCSV == "" {
 		return nil
 	}
-	svc := deps.PVE.Cluster()
-	sid := haResourceSid(vmid)
+	nodes := strings.Split(nodesCSV, ",")
+	req := pinRequest{Register: true}
+	if strict {
+		req.Hard = nodes
+	} else {
+		req.Preferred = nodes
+	}
+	if len(nodes) == 1 {
+		req.Placed = nodes[0]
+	}
+	return ensureMergedPin(ctx, deps, vmid, req, logger)
+}
+
+// pinRequest is one writer's contribution to a VM's merged pin.
+type pinRequest struct {
+	// Hard is a hard node constraint (a strict AZ, a PCI device), nil for none.
+	Hard []string
+
+	// Preferred holds the nodes of a non-strict AZ, which only add priority.
+	Preferred []string
+
+	// Placed is the node the CPI placed the VM on, or "" when the caller does
+	// not know it.
+	Placed string
+
+	// DLB says the VM is in the DLB AZ, so PVE chooses its node.
+	DLB bool
+
+	// Register registers the VM as an HA resource before the pin is written.
+	Register bool
+}
+
+// ensureMergedPin writes the VM's one merged node-affinity pin. The pin names
+// every node of the hard admissible set and is strict when that set is smaller
+// than the cluster's configured nodes. The placed node, the preferred nodes,
+// and the rest get priorities 2, 1, and 0, flattened to one value while the VM
+// is in a resource-affinity rule, because PVE refuses several priorities there.
+//
+// The writers of a VM's constraints run one after another (the AZ pin, then the
+// PCI pin), so a strict pin already written for the VM is a hard constraint the
+// new one must keep. Its nodes are intersected with the new hard set, and the
+// result replaces the new hard set when it is non-empty and holds the placed
+// node. An AZ pin of {a,b,c} and a PCI pin of {a} so give strict {a} in either
+// order. A strict pin that shares no node with the new constraint, or that does
+// not hold the placed node, is left from an earlier attempt and is replaced.
+//
+// The pin is written under the rules lock with a PUT that carries the read's
+// digest, so it changes in place and never disappears between a delete and a
+// create. A pin carrying another Director's marker is never touched. The PVE 9
+// gate runs before the lock.
+func ensureMergedPin(ctx context.Context, deps Deps, vmid int, req pinRequest, logger *log.Logger) error {
 	ruleName := naRuleNameFor(vmid)
 	ident := haIdentity{Owner: deps.RequestDirectorUUID}
 	if ident.Owner == "" {
@@ -162,101 +235,183 @@ func ensureNodeAffinityPin(
 		// clean up safely, so a request without a director_uuid writes none.
 		return fmt.Errorf("node-affinity: the request carries no director_uuid to mark rule %q with", ruleName)
 	}
-	if err := haRuleWriteGate(ctx, deps); err != nil {
+	profile, err := haRuleWriteProfile(ctx, deps)
+	if err != nil {
 		return fmt.Errorf("node-affinity: %w", err)
 	}
+	return writeMergedPin(ctx, deps, profile, vmid, req, logger)
+}
+
+// writeMergedPin is ensureMergedPin after the gate, for a caller that already
+// holds the gated profile.
+func writeMergedPin(
+	ctx context.Context, deps Deps, profile *ha.Profile, vmid int, req pinRequest, logger *log.Logger,
+) error {
+	svc := deps.PVE.Cluster()
+	sid := haResourceSid(vmid)
+	ruleName := naRuleNameFor(vmid)
+	ident := haIdentity{Owner: deps.RequestDirectorUUID}
 	marker := ident.marker()
 
-	// Register the VM as an HA resource (idempotent; "already defined" is fine).
-	if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
-		if !isHaAlreadyExists(err) {
-			logger.Warn("node-affinity: register HA resource failed (continuing best-effort)",
-				log.String("sid", sid), log.Err(err))
+	if req.Register {
+		// Register the VM as an HA resource (idempotent; "already defined" is fine).
+		if err := svc.CreateHaResources(ctx, &cluster.CreateHaResourcesParams{Sid: sid, Comment: &marker}); err != nil {
+			if !isHaAlreadyExists(err) {
+				logger.Warn("node-affinity: register HA resource failed (continuing best-effort)",
+					log.String("sid", sid), log.Err(err))
+			}
 		}
 	}
 
-	// A prior rule (e.g. a create_vm retry) is refreshed: PVE has no partial
-	// edit for rules, so delete-then-create to reflect the current node set.
-	existing, listErr := findHaRule(ctx, svc, ruleName)
-	if listErr != nil {
-		return fmt.Errorf("node-affinity: list HA rules: %w", listErr)
-	}
-	if existing != nil {
-		// An unmarked pin is ours to refresh, because bosh-na-<vmid> is unique per
-		// cluster and gains its marker here. A pin that names another Director is
-		// not.
-		if haOwnershipOf(existing.Comment, ident.Owner) == haOwnedByOther {
-			return fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; leaving it alone",
-				ruleName)
+	return withHARulesLock(ctx, deps, vmid, logger, func() error {
+		writer := newHARuleWriter(deps, profile, logger)
+		res, err := writer.Apply(ctx, "node-affinity", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			cur := set.Find(ruleName)
+			if cur != nil && haOwnershipOf(cur.Comment, ident.Owner) == haOwnedByOther {
+				return nil, fmt.Errorf("node-affinity: rule %q carries another Director's ownership marker; "+
+					"leaving it alone", ruleName)
+			}
+			if cur != nil && cur.Type != ha.RuleTypeNodeAffinity {
+				return nil, fmt.Errorf("node-affinity: rule %q is a %s rule, not a node-affinity pin; leaving it alone",
+					ruleName, cur.Type)
+			}
+			want, err := ha.BuildPin(mergedPinSpec(set, cur, profile, req, ruleName, marker, sid))
+			if err != nil {
+				return nil, fmt.Errorf("node-affinity: %w", err)
+			}
+			switch {
+			case want == nil:
+				// Nothing to pin. An existing pin stays: this path only ever
+				// writes constraints, and removeNodeAffinityPin removes them.
+				return nil, nil
+			case cur == nil:
+				return []ha.RuleOp{{Kind: ha.OpCreate, Rule: *want}}, nil
+			case ha.SameRule(want, cur):
+				return nil, nil
+			}
+			return []ha.RuleOp{{Kind: ha.OpUpdate, Rule: *want}}, nil
+		})
+		if err != nil {
+			return err
 		}
-		if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
-			return fmt.Errorf("node-affinity: delete rule %q for refresh: %w", ruleName, err)
+		if len(res.Wrote) == 0 {
+			return nil
 		}
-	}
-	if err := createNodeAffinityRule(ctx, svc, ruleName, sid, nodesCSV, marker, strict); err != nil {
-		return err
-	}
+		// A cheap re-read that the pin holds this VM, applied symmetrically with
+		// anti-affinity when antiaffinity_verify is on.
+		return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
+	})
+}
 
-	// The node-affinity rule is per-VM (bosh-na-<vmid>), so the only contention
-	// is a create_vm retry of the SAME vmid — there is no cross-group/cross-VM
-	// RMW hazard, and the dedicated per-VMID guest-VMID conflict model already
-	// serializes same-vmid retries. The coarse cluster pool lock is therefore
-	// intentionally NOT taken here. The read-after-write verify is cheap (one
-	// re-list) and applied symmetrically with anti-affinity when enabled, to
-	// catch a rule that a concurrent same-vmid retry left without this resource.
-	return verifyAntiAffinityMember(ctx, deps, ruleName, sid, logger)
+// mergedPinSpec builds the pin spec for req, keeping the hard constraint of a
+// strict pin already written for the VM (see ensureMergedPin).
+func mergedPinSpec(
+	set *ha.RuleSet, cur *ha.Rule, profile *ha.Profile, req pinRequest, ruleName, marker, sid string,
+) ha.PinSpec {
+	spec := ha.PinSpec{
+		ID:               ruleName,
+		Comment:          marker,
+		SID:              sid,
+		Hard:             req.Hard,
+		Configured:       profileNodeNames(profile),
+		Placed:           strings.TrimSpace(req.Placed),
+		Preferred:        req.Preferred,
+		RebalanceOnStart: profile != nil && profile.CRS.Known && profile.CRS.RebalanceOnStart,
+		DLB:              req.DLB,
+		SinglePriority:   inResourceAffinityRule(set, sid),
+	}
+	if cur == nil || !cur.Strict || cur.Disabled {
+		return spec
+	}
+	keep := cur.NodeNames()
+	if req.Hard != nil {
+		hard := map[string]bool{}
+		for _, n := range req.Hard {
+			hard[strings.TrimSpace(n)] = true
+		}
+		keep = slices.DeleteFunc(keep, func(n string) bool { return !hard[n] })
+	}
+	if len(keep) > 0 && (spec.Placed == "" || slices.Contains(keep, spec.Placed)) {
+		spec.Hard = keep
+	}
+	return spec
+}
+
+// ensureRebalancePin writes the placed-node pin a VM with no node constraint
+// needs while the cluster has ha-rebalance-on-start on, which would otherwise
+// let the CRM start the VM on a node the CPI did not choose. The pin is
+// non-strict and names only the placed node. It is written only for a VM that
+// is already an HA resource and is not in the DLB AZ, because DLB exists to let
+// PVE choose. Every other case is a no-op.
+func ensureRebalancePin(
+	ctx context.Context, deps Deps, vmid int, cp createVMCloudProps, node string, logger *log.Logger,
+) error {
+	if deps.RequestDirectorUUID == "" || strings.TrimSpace(node) == "" || vmInDLBAZ(cp, deps.Config) {
+		return nil
+	}
+	got, err := deps.PVE.Cluster().GetHaResources(ctx, haResourceSid(vmid))
+	switch {
+	case err != nil && (isHaNotFound(err) || pve.IsNotFound(err)):
+		return nil
+	case err != nil:
+		return fmt.Errorf("node-affinity: read HA resource for the placed-node pin: %w", err)
+	case got == nil:
+		return nil
+	}
+	profile, err := haRuleWriteProfile(ctx, deps)
+	if err != nil {
+		return fmt.Errorf("node-affinity: %w", err)
+	}
+	if !profile.CRS.Known || !profile.CRS.RebalanceOnStart {
+		return nil
+	}
+	return writeMergedPin(ctx, deps, profile, vmid, pinRequest{Placed: node}, logger)
+}
+
+// vmInDLBAZ reports whether the VM asked for the DLB sentinel AZ.
+func vmInDLBAZ(cp createVMCloudProps, cfg *config.CPIConfig) bool {
+	sentinel := cfg.DLBAZName()
+	return sentinel != "" && slices.Contains(buildAZOrder(cp, cfg, nil, nil), sentinel)
 }
 
 // removeNodeAffinityPin deletes a VM's node-affinity rule and deregisters its HA
 // resource. Keyed solely on vmid (delete_vm has no AZ context). Idempotent and
 // best-effort: a not-found rule/resource is a no-op, and it is safe to run
 // alongside anti-affinity cleanup (both deregister the same HA resource with a
-// not-found-tolerant purge).
+// not-found-tolerant purge). The delete runs under the rules lock, and a pin
+// that carries another Director's marker stays.
 func removeNodeAffinityPin(ctx context.Context, deps Deps, vmid int, logger *log.Logger) error {
 	svc := deps.PVE.Cluster()
 	ruleName := naRuleNameFor(vmid)
 	sid := haResourceSid(vmid)
 
-	var firstErr error
-	existing, listErr := findHaRule(ctx, svc, ruleName)
-	switch {
-	case listErr != nil:
-		firstErr = fmt.Errorf("node-affinity: list HA rules for cleanup: %w", listErr)
-	case existing == nil:
-	case haOwnershipOf(existing.Comment, deps.RequestDirectorUUID) == haOwnedByOther:
-		logger.Debug("node-affinity: rule belongs to another Director; leaving it", log.String("rule", ruleName))
-	default:
-		if err := svc.DeleteHaRules(ctx, ruleName); err != nil && !isHaNotFound(err) {
-			firstErr = fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
+	err := withHARulesLock(ctx, deps, vmid, logger, func() error {
+		writer := newHARuleWriter(deps, nil, logger)
+		foreign := false
+		_, err := writer.Apply(ctx, "node-affinity cleanup", func(set *ha.RuleSet) ([]ha.RuleOp, error) {
+			cur := set.Find(ruleName)
+			if cur == nil {
+				return nil, nil
+			}
+			if haOwnershipOf(cur.Comment, deps.RequestDirectorUUID) == haOwnedByOther {
+				foreign = true
+				return nil, nil
+			}
+			return []ha.RuleOp{{Kind: ha.OpDelete, Rule: ha.Rule{ID: ruleName}}}, nil
+		})
+		if foreign {
+			logger.Debug("node-affinity: rule belongs to another Director; leaving it", log.String("rule", ruleName))
 		}
+		return err
+	})
+	if err != nil {
+		err = fmt.Errorf("node-affinity: delete rule %q: %w", ruleName, err)
 	}
 
 	// Deregister the HA resource (purge removes it from any remaining rules).
 	// Not-found is a no-op — anti-affinity cleanup may have purged it already.
 	deregisterHaResource(ctx, svc, sid, deps.RequestDirectorUUID, logger)
-	return firstErr
-}
-
-// createNodeAffinityRule creates a node-affinity rule pinning sid to nodesCSV.
-// When strict is true PVE will not relocate the resource off the node set even
-// on total node-set failure (hard AZ guarantee); when false the pin is
-// preferred (HA may relocate off-set on failure). comment is the ownership
-// marker.
-func createNodeAffinityRule(
-	ctx context.Context, svc cluster.Service, ruleName, sid, nodesCSV, comment string, strict bool,
-) error {
-	nodes := nodesCSV
-	if err := svc.CreateHaRules(ctx, &cluster.CreateHaRulesParams{
-		Rule:      ruleName,
-		Type:      naRuleType,
-		Nodes:     &nodes,
-		Strict:    &strict,
-		Resources: sid,
-		Comment:   &comment,
-	}); err != nil {
-		return fmt.Errorf("node-affinity: create rule %q: %w", ruleName, err)
-	}
-	return nil
+	return err
 }
 
 // sortedNodesCSV renders a deduplicated, sorted, comma-separated node list,
